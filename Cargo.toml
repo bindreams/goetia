@@ -1,0 +1,25 @@
+[package]
+name = "goetia"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Install system daemons described in goetia.yaml as native Windows/SCM, macOS/launchd, and Linux/systemd services"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/bindreams/goetia"
+authors = ["bindreams"]
+
+[[bin]]
+name = "goetia"
+path = "src/main.rs"
+harness = false
+
+[lib]
+name = "goetia"
+path = "src/lib.rs"
+harness = false
+
+[dependencies]
+
+[dev-dependencies]
+skuld = "0.3"

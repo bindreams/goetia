@@ -1,0 +1,89 @@
+exclude = "^target/"
+default_install_hook_types = ["pre-commit"]
+
+# Local hooks ==========================================================================================================
+
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "no-std-test"
+name = "no stray #[test] attribute"
+# Every test in this crate is registered with the skuld harness via
+# `#[skuld::test]`. A bare `#[test]` is invisible to skuld's runner and
+# would silently not run — flag it.
+entry = '^\s*#\[test\]'
+language = "pygrep"
+types = ["rust"]
+# `_tests.rs` per the project convention and `tests/` integration files
+# are by design test sites; if a `#[test]` ever does sneak in there the
+# linker will complain about a test that the skuld harness doesn't see,
+# so excluding them here trades one signal for another (less noisy).
+exclude = '(_tests\.rs|(^|/)tests/)'
+
+[[repos.hooks]]
+id = "no-cargo-in-tests"
+name = "no runtime cargo invocations in test code"
+# Test code must locate prebuilt fixture binaries (CARGO_BIN_EXE_*), never
+# build them: a concurrent `cargo build`'s uplift deletes+recreates
+# `target/<profile>/<bin>`, racing sibling tests' spawns.
+entry = 'Command::new\("cargo"\)'
+language = "pygrep"
+types = ["rust"]
+files = '(^|/)tests/|_tests\.rs$'
+
+[[repos.hooks]]
+id = "cargo-fmt"
+name = "cargo fmt"
+entry = "cargo fmt"
+language = "system"
+types = ["rust"]
+pass_filenames = false
+
+[[repos.hooks]]
+id = "cargo-clippy"
+name = "cargo clippy"
+entry = "cargo clippy --all-targets --locked -- -D warnings"
+language = "system"
+types = ["rust"]
+pass_filenames = false
+
+[[repos.hooks]]
+id = "format-section-comments"
+name = "format section comments"
+entry = "python scripts/format-section-comments.py"
+language = "python"
+types_or = ["rust", "python", "toml", "javascript", "ts", "jsx", "tsx", "dockerfile"]
+
+# External hooks =======================================================================================================
+
+[[repos]]
+repo = "https://github.com/pre-commit/pre-commit-hooks"
+rev = "v5.0.0"
+hooks = [
+  { id = "check-executables-have-shebangs" },
+  # Rust inner attributes start with `#![...]`, which the shebang detector
+  # mistakes for `#!/...`. Exclude .rs.
+  { id = "check-shebang-scripts-are-executable", exclude_types = ["rust"] },
+  { id = "mixed-line-ending", args = ["--fix=lf"] },
+]
+
+[[repos]]
+repo = "https://github.com/editorconfig-checker/editorconfig-checker.python"
+rev = "3.2.1"
+hooks = [
+  # Rust gets `cargo fmt`; markdown gets prettier; both have stronger
+  # opinions than .editorconfig and conflict on trailing whitespace, so
+  # exclude them from this checker.
+  { id = "editorconfig-checker", exclude_types = ["rust", "markdown"] },
+]
+
+[[repos]]
+# Prettier (rather than mdformat) so LICENSE.md's two-space-trailing-line
+# break style is preserved verbatim — mdformat rewrites it to backslash
+# line breaks, drifting from the upstream Apache-2.0 byte identity.
+repo = "https://github.com/rbubley/mirrors-prettier"
+rev = "v3.8.2"
+hooks = [
+  { id = "prettier", types = ["markdown"] },
+]

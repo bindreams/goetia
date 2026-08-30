@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      # A plain `cargo test` leaves every elevation-gated test reported by
+      # skuld as *unavailable*, not failed — a silent skip, which this
+      # project forbids. Build unelevated, then run each produced test
+      # binary elevated (sudo on Linux/macOS; the Windows runner is already
+      # Administrator). Never `sudo -E cargo test`: `-E` preserves `HOME`,
+      # so root would write to `~/.cargo`/`target/` and the next unelevated
+      # build would fail with `EACCES`. Locating the binaries by hand (via
+      # `--message-format=json`) rather than shelling out to `cargo test`
+      # under `sudo` keeps `cargo` itself entirely unelevated.
+      - name: Build test binaries
+        run: cargo test --locked --no-run --message-format=json > cargo-test-artifacts.json
+
+      - name: Run tests, elevated
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY' > test-binaries.txt
+          import json
+
+          with open("cargo-test-artifacts.json") as f:
+              for line in f:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  msg = json.loads(line)
+                  if (
+                      msg.get("reason") == "compiler-artifact"
+                      and msg.get("profile", {}).get("test")
+                      and msg.get("executable")
+                  ):
+                      print(msg["executable"])
+          PY
+
+          status=0
+          while IFS= read -r bin; do
+            # Strip a trailing CR: on Windows, Python's text-mode stdout
+            # writes CRLF, and bash's `read` does not strip it — an
+            # unstripped `\r` makes the path unresolvable at exec time.
+            bin="${bin%$'\r'}"
+            if [ -z "$bin" ]; then
+              continue
+            fi
+            echo "::group::$bin"
+            if [ "$RUNNER_OS" = "Windows" ]; then
+              "$bin" || status=$?
+            else
+              sudo "$bin" || status=$?
+            fi
+            echo "::endgroup::"
+          done < test-binaries.txt
+
+          exit "$status"
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: lint
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+
+      - name: Install prek
+        run: uv tool install prek==0.3.6
+
+      # cargo-clippy is skipped here because it already runs per-platform in
+      # the `test` job above (the `#[cfg]` halves differ per platform, so a
+      # single-platform clippy run would miss them).
+      - name: Run linters
+        env:
+          SKIP: cargo-clippy
+        run: prek run --all-files
