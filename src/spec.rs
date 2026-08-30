@@ -15,6 +15,13 @@ pub use raw::{RawManifest, RawSpec};
 pub use resolve::{load, resolve};
 pub use user::{AccountId, User};
 
+// Re-exported so `blob::decode` can re-run the same injection-gate checks
+// `resolve` uses, against a spec deserialized from an untrusted artifact,
+// instead of duplicating the rules.
+pub(crate) use resolve::{
+    reject_control_chars, reject_empty_command, reject_env_key_with_equals, reject_relative_path,
+};
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;

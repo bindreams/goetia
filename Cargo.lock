@@ -233,6 +233,7 @@ dependencies = [
  "libc",
  "rand",
  "serde",
+ "serde_json",
  "serde_yaml_ng",
  "skuld",
  "tempfile",
