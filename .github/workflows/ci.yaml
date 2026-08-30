@@ -95,6 +95,15 @@ jobs:
 
           exit "$status"
 
+      # See `tests/support/mod.rs::record_probe`.
+      - name: Upload probe results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-results-${{ matrix.os }}
+          path: probe-results/
+          if-no-files-found: ignore
+
   lint:
     name: Lint
     runs-on: ubuntu-latest

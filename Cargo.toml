@@ -28,4 +28,18 @@ thiserror = "2"
 
 [dev-dependencies]
 skuld = "0.3"
+base64 = "0.22"
+rand = "0.9"
 tempfile = "3"
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-service = "0.8"
+winreg = "0.55"
+
+[[test]]
+name = "marker_inertness"
+path = "tests/marker_inertness.rs"
+harness = false
