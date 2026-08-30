@@ -10,8 +10,6 @@ use std::path::PathBuf;
 
 use crate::support::{self, ELEVATED, ServiceGuard, cmd};
 
-const UNIT_DIR: &str = "/etc/systemd/system";
-
 // Probes ==============================================================================================================
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -124,7 +122,7 @@ fn systemd_unknown_non_x_key_does_warn() {
 // Helpers -------------------------------------------------------------------------------------------------------------
 
 fn unit_path(id: &str) -> PathBuf {
-    PathBuf::from(UNIT_DIR).join(format!("{id}.service"))
+    PathBuf::from(support::SYSTEMD_UNIT_DIR).join(format!("{id}.service"))
 }
 
 fn write_unit(id: &str, text: &str) {

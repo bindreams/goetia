@@ -95,10 +95,7 @@ jobs:
 
           exit "$status"
 
-      # `tests/marker_inertness.rs` measures embed-site behaviour that no
-      # assertion can gate, because a "no" there is a design decision and
-      # not a build failure. Uploading the record is what keeps such a
-      # finding from decaying into one nobody looks at again.
+      # See `tests/support/mod.rs::record_probe`.
       - name: Upload probe results
         if: always()
         uses: actions/upload-artifact@v4

@@ -12,8 +12,6 @@ use std::path::PathBuf;
 
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard, cmd};
 
-const DAEMON_DIR: &str = "/Library/LaunchDaemons";
-
 // Probes ==============================================================================================================
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -122,19 +120,29 @@ fn launchd_unknown_top_level_keys_are_tolerated() {
     );
 }
 
-/// Must-verify #6. `install` writes the plist and does not enable at boot; on
-/// launchd that is seeded by `Disabled: true` being a *default* that the
-/// override database supersedes. If launchd ignores the key, or if
-/// `launchctl enable` does not survive a plist rewrite, macOS needs a
-/// different mechanism entirely.
+/// `install` writes the plist and does not enable at boot; on launchd that is
+/// seeded by `Disabled: true` being a *default* that the override database
+/// supersedes. If launchd ignores the key, or if `launchctl enable` does not
+/// survive a plist rewrite, macOS needs a different mechanism entirely.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn launchd_disabled_key_default_applies() {
     let label = support::random_test_id();
     let guard = ServiceGuard::new(&label);
 
+    // Control: the same plist minus the one key. It proves the plist, the
+    // program, and this runner's ability to bootstrap and run a system daemon
+    // all work — so a job that does not run in phase 1 can only be `Disabled`
+    // doing it, and phase 1 cannot pass because bootstrap happened to fail for
+    // some unrelated reason.
+    let control = ConnectBack::listen();
+    write_plist(guard.id(), &probe_job(guard.id(), control.port(), false));
+    bootstrap(guard.id()).expect_ok();
+    control.accept("the control job, which carries no `Disabled` key, to start");
+    bootout(guard.id()).expect_ok();
+
     // Phase 1: `Disabled: true`, no override entry. The job must not run.
     let first = ConnectBack::listen();
-    write_plist(guard.id(), &disabled_probe(guard.id(), first.port()));
+    write_plist(guard.id(), &probe_job(guard.id(), first.port(), true));
     let boot_disabled = bootstrap(guard.id());
     let state_before = disabled_state(guard.id());
     if boot_disabled.ok() {
@@ -164,14 +172,15 @@ fn launchd_disabled_key_default_applies() {
     // a routine operation and must never silently re-disable a service.
     let second = ConnectBack::listen();
     bootout(guard.id()).expect_ok();
-    write_plist(guard.id(), &disabled_probe(guard.id(), second.port()));
+    write_plist(guard.id(), &probe_job(guard.id(), second.port(), true));
     bootstrap(guard.id()).expect_ok();
     second.accept("the launchd job to start after the plist was rewritten");
 
     support::record_probe(
         "launchd-disabled-default",
         &format!(
-            "disabled_plist_key_honoured_as_default: yes\n\
+            "control_job_without_the_key_ran: yes\n\
+             disabled_plist_key_honoured_as_default: yes\n\
              bootstrap_of_disabled_job_exit: {:?}\n\
              bootstrap_of_disabled_job_stderr: {}\n\
              print_disabled_before_enable: {state_before:?}\n\
@@ -188,7 +197,7 @@ fn launchd_disabled_key_default_applies() {
 // Helpers -------------------------------------------------------------------------------------------------------------
 
 fn plist_path(label: &str) -> PathBuf {
-    PathBuf::from(DAEMON_DIR).join(format!("{label}.plist"))
+    PathBuf::from(support::LAUNCHD_DAEMON_DIR).join(format!("{label}.plist"))
 }
 
 /// launchd refuses plists that are group- or world-writable, so the mode is
@@ -223,15 +232,20 @@ fn comment_block(blob: &str) -> String {
     format!("<!-- goetia:begin\nMarker: goetia\nSchema: 1\nSpec: {blob}\ngoetia:end -->\n")
 }
 
-/// `Disabled: true` plus `RunAtLoad: true`: if launchd ignored the key it
-/// would start the daemon at bootstrap, and the daemon reports in over
-/// loopback. There is no way to observe "it did not run" without something
-/// that would unmistakably have been observed if it had.
-fn disabled_probe(label: &str, port: u16) -> String {
-    let extra = "\t<key>Disabled</key>\n\t<true/>\n\t<key>RunAtLoad</key>\n\t<true/>\n";
+/// `RunAtLoad: true`, so the daemon reports in over loopback the moment
+/// launchd is willing to run it. There is no way to observe "it did not run"
+/// without something that would unmistakably have been observed if it had.
+/// `disabled` is the only thing that varies between the control and phase 1.
+fn probe_job(label: &str, port: u16, disabled: bool) -> String {
+    let key = if disabled {
+        "\t<key>Disabled</key>\n\t<true/>\n"
+    } else {
+        ""
+    };
+    let extra = format!("{key}\t<key>RunAtLoad</key>\n\t<true/>\n");
     let exe = support::current_exe_str();
     let port = port.to_string();
-    plist(label, "", extra, &[&exe, support::sentinel::CONNECT_BACK, &port])
+    plist(label, "", &extra, &[&exe, support::sentinel::CONNECT_BACK, &port])
 }
 
 fn target(label: &str) -> String {

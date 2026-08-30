@@ -5,7 +5,7 @@
 //! reports nothing surfaces later only as a mysterious straggler in
 //! `systemctl` / `launchctl` / `services.msc`, long after the run that left it.
 
-use super::cmd;
+use super::{LAUNCHD_DAEMON_DIR, SYSTEMD_UNIT_DIR, cmd};
 
 pub struct ServiceGuard {
     id: String,
@@ -49,7 +49,7 @@ fn remove_path(path: &std::path::Path, dir: bool) -> Option<String> {
 fn cleanup(id: &str) -> Vec<String> {
     let mut problems = Vec::new();
     let unit = format!("{id}.service");
-    let path = std::path::PathBuf::from("/etc/systemd/system").join(&unit);
+    let path = std::path::PathBuf::from(SYSTEMD_UNIT_DIR).join(&unit);
 
     // Exit 5 is "unit not loaded", the one benign outcome.
     let stop = cmd::run("systemctl", &["stop", &unit]);
@@ -75,7 +75,7 @@ fn cleanup(id: &str) -> Vec<String> {
     if !bootout.ok() && !matches!(bootout.code, Some(3 | 113)) {
         problems.push(bootout.to_string());
     }
-    let path = std::path::PathBuf::from("/Library/LaunchDaemons").join(format!("{id}.plist"));
+    let path = std::path::PathBuf::from(LAUNCHD_DAEMON_DIR).join(format!("{id}.plist"));
     problems.extend(remove_path(&path, false));
 
     // launchd exposes no way to delete an override-database entry, so a label

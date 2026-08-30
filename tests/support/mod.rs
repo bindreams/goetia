@@ -22,6 +22,15 @@ use rand::Rng as _;
 pub use connect_back::ConnectBack;
 pub use service_guard::ServiceGuard;
 
+// Artifact locations --------------------------------------------------------------------------------------------------
+// Shared with `service_guard`, whose cleanup has to reach the very paths
+// the probes wrote to. A second copy desyncs on a one-sided edit, and the
+// symptom is a straggler left behind rather than an error.
+
+pub const SYSTEMD_UNIT_DIR: &str = "/etc/systemd/system";
+pub const LAUNCHD_DAEMON_DIR: &str = "/Library/LaunchDaemons";
+pub const SCM_SERVICES_KEY: &str = r"SYSTEM\CurrentControlSet\Services";
+
 /// Opt-out marker for the probes, all of which register real system services:
 /// `SKULD_LABELS='!elevated'`.
 #[skuld::label]
@@ -51,9 +60,8 @@ pub fn elevated() -> Result<(), String> {
     }
 }
 
-/// Global constraint: test ids are `goetia-test-<random>`. Random rather than
-/// derived from the pid so a straggler from a crashed run can never collide
-/// with a live one.
+/// Test ids are `goetia-test-<random>`. Random rather than derived from the
+/// pid so a straggler from a crashed run can never collide with a live one.
 pub fn random_test_id() -> String {
     format!("goetia-test-{:016x}", rand::rng().random::<u64>())
 }

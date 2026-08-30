@@ -17,9 +17,7 @@ use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
 
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard, cmd};
 
-const SERVICES: &str = r"SYSTEM\CurrentControlSet\Services";
-
-/// Byte-exact field names, per the global constraints.
+/// Byte-exact field names; renaming one changes every installed artifact.
 const PRIMARY: Names = Names {
     marker: "Marker",
     schema: "Schema",
@@ -66,8 +64,9 @@ fn scm_parameters_values_survive() {
     )
     .expect_ok();
 
-    let parameters = format!(r"{SERVICES}\{id}\Parameters");
-    let service = format!(r"{SERVICES}\{id}");
+    let services = support::SCM_SERVICES_KEY;
+    let parameters = format!(r"{services}\{id}\Parameters");
+    let service = format!(r"{services}\{id}");
     let expected = written(&blob);
     write(&parameters, PRIMARY, &expected);
     write(&service, FALLBACK, &expected);
@@ -128,7 +127,7 @@ fn scm_parameters_values_survive() {
     support::record_probe(
         "scm-parameters",
         &format!(
-            "site: HKLM\\{SERVICES}\\<name>\\Parameters\n\
+            "site: HKLM\\{services}\\<name>\\Parameters\n\
              survives_config_failure_description_and_start_stop: yes\n\
              blob_len: {} base64 chars\n\
              fallback (flat values on the service key):\n{fallback_report}",

@@ -25,10 +25,7 @@ mod scm;
 mod systemd;
 
 fn main() {
-    // The probes need a real daemon to observe, and the only binary they can
-    // be sure exists on the host is this one. Both sentinel modes must be
-    // dispatched before the harness starts, because in those modes the process
-    // was launched by launchd or the SCM, not by a test runner.
+    // Dispatched before the harness starts; see `support::sentinel`.
     if support::sentinel::run_if_requested() {
         return;
     }
