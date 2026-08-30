@@ -87,7 +87,7 @@ pub fn render_yaml(spec: &DaemonSpec) -> String {
     serde_yaml_ng::to_string(&Value::Mapping(mapping)).expect("a resolved DaemonSpec always renders to valid YAML")
 }
 
-// rendering helpers ====================================================================================================
+// rendering helpers ===================================================================================================
 
 /// `env`'s keys are already sorted (`DaemonSpec::env` is a `BTreeMap`), so
 /// this preserves that order rather than re-deriving it.
@@ -136,7 +136,7 @@ fn user_value(user: &User) -> Value {
     }
 }
 
-// diffing ===============================================================================================================
+// diffing =============================================================================================================
 
 fn unified_diff(old: &str, new: &str, old_label: &str, new_label: &str) -> String {
     if old == new {
