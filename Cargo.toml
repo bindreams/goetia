@@ -20,6 +20,12 @@ path = "src/lib.rs"
 harness = false
 
 [dependencies]
+humantime = "2"
+humantime-serde = "1"
+serde = { version = "1", features = ["derive"] }
+serde_yaml_ng = "0.10"
+thiserror = "2"
 
 [dev-dependencies]
 skuld = "0.3"
+tempfile = "3"
