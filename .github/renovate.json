@@ -1,0 +1,59 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "minimumReleaseAge": "7 days",
+  "platformAutomerge": true,
+  "customManagers": [
+    {
+      "description": "Version-pinned tools installed by CI via `uv tool install <name>==<version>`, annotated with a `# renovate:` comment on the preceding line.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+run:\\s*uv tool install \\S+==(?<currentValue>[^\\s\\\"']+)"
+      ]
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Group non-major GitHub Actions updates, including the digest bumps that `helpers:pinGitHubActionDigests` produces. Digest pinning is why a non-existent tag (astral-sh/setup-uv@v10) cannot reach a workflow again: a SHA either resolves or the pin PR fails, instead of the workflow failing to resolve at run time.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "digest"
+      ],
+      "groupName": "GitHub Actions",
+      "automerge": true
+    },
+    {
+      "description": "Group non-major Rust crate updates.",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "digest"
+      ],
+      "groupName": "Rust crates",
+      "automerge": true
+    },
+    {
+      "description": "Major updates: one PR per package, reviewed by a human. Deviates from ~/src/hole, which auto-merges majors on the strength of its CI. Goetia's three platform backends do not exist yet, so a major bump of e.g. windows-service would land with almost no behavioural coverage. Revisit once the backends and their integration tests are in.",
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "groupName": null,
+      "automerge": false
+    }
+  ]
+}
