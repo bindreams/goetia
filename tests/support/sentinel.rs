@@ -5,12 +5,32 @@
 //! one. `main` dispatches these modes before the harness starts, because in
 //! them the process was launched by launchd or the SCM, not by a test runner.
 
+use std::io::Write as _;
 use std::net::{Ipv4Addr, TcpStream};
 
 /// `<exe> --goetia-connect-back <port>`: connect to the test's listener and
 /// exit. Used to prove a launchd job ran — or, by its absence after a
 /// `bootout`, that it did not.
 pub const CONNECT_BACK: &str = "--goetia-connect-back";
+
+/// `<exe> --goetia-run-until-killed <port>`: connect to the test's listener
+/// (proving the process is genuinely up and running, not merely that
+/// `launchctl` returned success) and then block forever, so a test can go
+/// on to observe `Running` state/pid and rely on it staying that way until
+/// the manager stops it. Unlike `CONNECT_BACK`, which exits immediately
+/// after reporting in and so could already be gone by the time a test's
+/// next assertion runs.
+pub const RUN_UNTIL_KILLED: &str = "--goetia-run-until-killed";
+
+/// `<exe> --goetia-report-uid <port>`: connect to the test's listener and
+/// send the process's real uid as decimal text, then exit. Used to prove
+/// which account a job actually launched under — `UserName: root` in the
+/// plist is a claim; this is what confirms launchd honoured it, closing the
+/// plan's must-verify item on whether that key takes a name or a numeric
+/// uid (this backend always resolves to a name; see
+/// `backend::launchd::manager::resolve_account`'s doc comment).
+#[cfg(unix)]
+pub const REPORT_UID: &str = "--goetia-report-uid";
 
 /// `<exe> --goetia-service-host <service-name> <start-port> <stop-port>`:
 /// a minimal SCM-aware service. Without one, `sc start` would fail with
@@ -28,6 +48,17 @@ pub fn run_if_requested() -> bool {
             connect(args[2].parse().expect("port argument"));
             true
         }
+        Some(RUN_UNTIL_KILLED) => {
+            connect(args[2].parse().expect("port argument"));
+            loop {
+                std::thread::park();
+            }
+        }
+        #[cfg(unix)]
+        Some(REPORT_UID) => {
+            report_uid(args[2].parse().expect("port argument"));
+            true
+        }
         #[cfg(windows)]
         Some(SERVICE_HOST) => {
             windows::run(&args[2]);
@@ -42,6 +73,15 @@ pub fn run_if_requested() -> bool {
 /// holds the listener — that decides what that means.
 fn connect(port: u16) {
     drop(TcpStream::connect((Ipv4Addr::LOCALHOST, port)));
+}
+
+#[cfg(unix)]
+fn report_uid(port: u16) {
+    if let Ok(mut stream) = TcpStream::connect((Ipv4Addr::LOCALHOST, port)) {
+        // SAFETY: `getuid` takes no arguments, reads no memory, and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let _ = write!(stream, "{uid}");
+    }
 }
 
 #[cfg(windows)]
