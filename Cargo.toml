@@ -15,6 +15,20 @@ path = "src/main.rs"
 harness = false
 required-features = ["cli"]
 
+# Windows-only (the service host `type: simple` daemons run under), but not
+# `required-features`-gated the way `goetia` is `cli`-gated: there is no
+# platform-conditional feature in Cargo, so this target's own source is
+# `#[cfg(windows)]`-gated internally instead (see `src/bin/shim/main.rs`) and
+# reduces to an inert stub on every other target — it still needs to *build*
+# everywhere so `cargo test`/`cargo clippy --all-targets` stay green on
+# Linux/macOS CI, and so `CARGO_BIN_EXE_goetia-shim` resolves unconditionally
+# for `tests/shim_integration.rs`, whose own real assertions are themselves
+# `#[cfg(windows)]`-gated.
+[[bin]]
+name = "goetia-shim"
+path = "src/bin/shim/main.rs"
+harness = false
+
 [lib]
 name = "goetia"
 path = "src/lib.rs"
@@ -67,15 +81,30 @@ winreg = "0.56"
 # checkpoint/`Sleep` poll), `SeServiceLogonRight` provisioning
 # (`manager::identity`), and `CommandLineToArgvW` for readback (SCM stores
 # `executable`+`arguments` pre-joined into one command line).
+#
+# The shim (`src/bin/shim/`, same crate/dependency graph — see the
+# `goetia-shim` `[[bin]]` above) adds `Win32_System_EventLog`, the
+# version-skew/log-path-denied fallback channel — see
+# `src/bin/shim/logging.rs`. Process-tree containment (the Windows Job
+# Object a supervised daemon's whole descendant tree is killed through) is
+# `cosca`'s own dependency, not a windows-sys feature this crate needs to
+# request itself.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Authentication_Identity",
+    "Win32_System_EventLog",
     "Win32_System_Services",
     "Win32_System_Threading",
     "Win32_UI_Shell",
 ] }
+# The shim's process-tree containment, spawn, and waiting: `.contain()` is
+# a Windows Job Object with `KILL_ON_JOB_CLOSE`, and `wait()`/`wait_tree()`
+# are real, event-driven kernel waits — see `src/bin/shim/service.rs`.
+# 0.x with an explicitly unstable API; pinned to `"0.2"` rather than a
+# looser range since a minor bump may break this crate's own build.
+cosca = "0.2"
 
 [dev-dependencies]
 skuld = "0.3"
@@ -112,4 +141,9 @@ harness = false
 [[test]]
 name = "scm_integration"
 path = "tests/scm_integration.rs"
+harness = false
+
+[[test]]
+name = "shim_integration"
+path = "tests/shim_integration.rs"
 harness = false
