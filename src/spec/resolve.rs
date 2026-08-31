@@ -29,6 +29,15 @@ const MANIFEST_FILE_NAME: &str = "goetia.yaml";
 /// daemon; a valid manifest may still produce `Warning`s for properties
 /// that are accepted but cannot be faithfully honored on every platform.
 pub fn resolve(raw: RawManifest, base_dir: &Path) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
+    // `DaemonSpec` documents every path as absolute and `blob::decode`
+    // enforces it, so a relative `base_dir` would produce an artifact whose
+    // own embedded blob cannot be decoded — breaking the drift invariant for
+    // the entirely ordinary `goetia daemon install -f .`. Anchor it here, at
+    // the one place that makes the guarantee, rather than trusting every
+    // caller to pass an absolute path.
+    let base_dir = absolutize(base_dir)?;
+    let base_dir = base_dir.as_path();
+
     let mut specs = Vec::with_capacity(raw.daemons.len());
     let mut warnings = Vec::new();
 
@@ -133,7 +142,44 @@ fn resolve_path_string(raw: &str, base_dir: &Path) -> String {
     if p.is_absolute() {
         raw.to_string()
     } else {
-        base_dir.join(p).to_string_lossy().into_owned()
+        normalize(&base_dir.join(p)).to_string_lossy().into_owned()
+    }
+}
+
+/// Make `dir` absolute against the process's working directory.
+///
+/// Deliberately not `canonicalize()`: that requires the path to exist and
+/// resolves symlinks, neither of which is wanted here. A manifest may name a
+/// `cwd` or `logs` directory the installer is about to create, and resolving
+/// a symlink would bake the target into the artifact rather than the path the
+/// user wrote.
+fn absolutize(dir: &Path) -> Result<PathBuf, Error> {
+    if dir.is_absolute() {
+        return Ok(normalize(dir));
+    }
+    let cwd = std::env::current_dir().map_err(|source| Error::Io {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    Ok(normalize(&cwd.join(dir)))
+}
+
+/// Drop `.` components so a manifest loaded from `.` yields `<cwd>` rather
+/// than `<cwd>/.`, and joined segments read as one consistent path. `..` is
+/// left alone: removing it lexically is wrong in the presence of symlinks.
+fn normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
     }
 }
 

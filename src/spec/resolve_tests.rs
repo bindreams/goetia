@@ -147,11 +147,12 @@ daemons:
     let (specs, _warnings) = resolve_yaml(yaml).expect("valid manifest should resolve");
     let spec = &specs[0];
 
-    let expected_command0 = base_dir().join("bin/frpc.exe").to_string_lossy().into_owned();
+    let expected_command0 = base_dir().join("bin").join("frpc.exe").to_string_lossy().into_owned();
     assert_eq!(spec.command[0], expected_command0);
     assert_eq!(spec.command[1], "-c", "later argv entries are untouched");
-    assert_eq!(spec.cwd, Some(base_dir().join(".")));
-    assert_eq!(spec.logs, Some(base_dir().join("logs/frpc.log")));
+    // `cwd: .` normalizes to the base dir itself, not `<base>/.`.
+    assert_eq!(spec.cwd, Some(base_dir()));
+    assert_eq!(spec.logs, Some(base_dir().join("logs").join("frpc.log")));
 }
 
 #[skuld::test]
@@ -333,7 +334,7 @@ fn load_reads_a_file_path() {
     assert_eq!(specs[0].id.as_str(), "frpc");
     // Relative paths resolve against the manifest's own directory, not the
     // process's current directory.
-    let expected = dir.path().join("bin/frpc").to_string_lossy().into_owned();
+    let expected = dir.path().join("bin").join("frpc").to_string_lossy().into_owned();
     assert_eq!(specs[0].command[0], expected);
 }
 
@@ -444,4 +445,33 @@ fn huge_restart_delay_does_not_overflow() {
         u64::MAX
     );
     let _ = resolve_yaml(&yaml);
+}
+
+#[skuld::test]
+fn relative_base_dir_still_yields_absolute_paths() {
+    // `DaemonSpec` documents every path as absolute, and `blob::decode`
+    // enforces it with `reject_relative_path`. So a relative `base_dir`
+    // silently producing relative paths does not merely look untidy — it
+    // yields an artifact whose own embedded blob cannot be decoded, which
+    // breaks the drift invariant for the common case of `goetia daemon
+    // install -f .`.
+    let yaml = "daemons:\n  frpc:\n    command: [bin/frpc]\n    cwd: .\n    logs: logs/frpc.log\n";
+    let (specs, _) = resolve(parse_manifest(yaml), Path::new(".")).expect("resolves");
+    let spec = &specs[0];
+
+    assert!(
+        Path::new(&spec.command[0]).is_absolute(),
+        "command[0] must be absolute, got {:?}",
+        spec.command[0]
+    );
+    assert!(
+        spec.cwd.as_deref().is_some_and(Path::is_absolute),
+        "cwd must be absolute, got {:?}",
+        spec.cwd
+    );
+    assert!(
+        spec.logs.as_deref().is_some_and(Path::is_absolute),
+        "logs must be absolute, got {:?}",
+        spec.logs
+    );
 }
