@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer};
 
 use super::*;
 
-// Fixtures ==============================================================================================================
+// Fixtures ============================================================================================================
 
 #[cfg(windows)]
 fn abs(p: &str) -> PathBuf {
@@ -89,7 +89,7 @@ fn encode_wire_envelope(envelope: &WireEnvelope) -> String {
     BASE64.encode(serde_json::to_vec(envelope).expect("WireEnvelope should always serialize"))
 }
 
-// Round trip ============================================================================================================
+// Round trip ==========================================================================================================
 
 #[skuld::test]
 fn encode_decode_round_trips() {
@@ -116,7 +116,7 @@ fn encode_decode_round_trips() {
     }
 }
 
-// Determinism and canonical form =========================================================================================
+// Determinism and canonical form ======================================================================================
 
 #[skuld::test]
 fn encode_is_deterministic() {
@@ -155,7 +155,7 @@ fn blob_wire_names_are_pinned() {
     assert_eq!(encode_with_version(&golden_spec(), "0.1.0"), EXPECTED);
 }
 
-// Schema and invariant re-validation ======================================================================================
+// Schema and invariant re-validation ==================================================================================
 
 #[skuld::test]
 fn decode_rejects_unknown_schema() {
@@ -281,7 +281,7 @@ fn decode_rejects_malformed_json() {
     assert!(matches!(err, Error::Blob(_)), "expected Error::Blob, got {err:?}");
 }
 
-// Sortedness checker ======================================================================================================
+// Sortedness checker ==================================================================================================
 //
 // Deliberately does not use `serde_json::Value`: that type's default
 // `Map` is `BTreeMap`-backed, so re-parsing into it would force-sort on

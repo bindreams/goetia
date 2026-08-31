@@ -39,7 +39,7 @@ use serde_json::Value;
 use crate::error::Error;
 use crate::spec::{self, AccountId, DaemonSpec, Id, Kind, Restart, User};
 
-// Constants ============================================================================================================
+// Constants ===========================================================================================================
 
 /// The envelope shape `encode`/`decode` agree on. Bumped only when the
 /// JSON structure itself changes, never for a change in generator output
@@ -50,7 +50,7 @@ pub const SCHEMA: u32 = 1;
 /// per the Global Constraints (`Marker`, `Schema`, `Version`, `Spec`).
 pub const MARKER: &str = "goetia";
 
-// Blob ==================================================================================================================
+// Blob ================================================================================================================
 
 /// A decoded metadata blob: the schema it was written under, the crate
 /// version that generated it, and the fully re-validated `DaemonSpec`.
@@ -102,7 +102,7 @@ pub fn decode(encoded: &str) -> Result<Blob, Error> {
     })
 }
 
-// Canonical JSON ========================================================================================================
+// Canonical JSON ======================================================================================================
 
 /// Build the envelope and render it as compact, key-sorted-at-every-level
 /// JSON text.
@@ -134,7 +134,7 @@ fn canonicalize(value: Value) -> Value {
     }
 }
 
-// Wire types =============================================================================================================
+// Wire types ==========================================================================================================
 //
 // The wire representation of `DaemonSpec`, kept deliberately separate
 // from it: every field carries an explicit `#[serde(rename = ...)]`, so a
@@ -226,7 +226,7 @@ struct WireDuration {
     secs: u64,
 }
 
-// DaemonSpec <-> wire =====================================================================================================
+// DaemonSpec <-> wire =================================================================================================
 
 impl From<&DaemonSpec> for WireSpec {
     fn from(spec: &DaemonSpec) -> Self {
