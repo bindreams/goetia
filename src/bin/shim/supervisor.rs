@@ -1,6 +1,16 @@
 //! The shim's restart-policy decision, kept pure and free of every Win32
 //! dependency so it is unit-testable without a real service host — see
 //! `main.rs` for the SCM wiring and the real wait primitives that feed it.
+//!
+//! Deliberately compiled on every platform, not only `#[cfg(windows)]` (see
+//! `main.rs`'s own `mod supervisor;` line): the whole point of keeping this
+//! module Win32-free is that its unit tests run on every CI cell this
+//! workspace builds on, not only the Windows one. `service.rs` (the only
+//! non-test caller) is Windows-only, so on every other platform nothing
+//! outside `#[cfg(test)]` calls into this module at all — hence the
+//! blanket allow below, mirroring `src/main.rs`'s identical
+//! `#[cfg_attr(test, allow(dead_code))]` for the same shape of problem.
+#![cfg_attr(not(any(test, windows)), allow(dead_code))]
 
 use std::time::Duration;
 
