@@ -409,7 +409,20 @@ fn unelevated_list_works() {
         .parse()
         .expect("nobody's gid");
 
-    let out = Command::new(env!("CARGO_BIN_EXE_goetia"))
+    // Run a copy of the binary from `/tmp`, not `CARGO_BIN_EXE_goetia`
+    // directly: on CI the cargo target directory lives under the runner's
+    // own home directory, which is not guaranteed traversable by an
+    // arbitrary low-privilege account — a failure that would be about the
+    // runner's directory layout, not about Goetia's own file permissions,
+    // which are what this test needs to prove. `/tmp` (the literal path,
+    // not `std::env::temp_dir()` — macOS's per-user `$TMPDIR` is `0700`)
+    // is world-traversable on every supported platform.
+    let copy_path = Path::new("/tmp").join(format!("goetia-unelevated-test-{}", support::random_test_id()));
+    std::fs::copy(env!("CARGO_BIN_EXE_goetia"), &copy_path).expect("copy goetia binary to /tmp");
+    std::fs::set_permissions(&copy_path, std::fs::Permissions::from_mode(0o755)).expect("chmod copy");
+    let _cleanup = FileGuard(copy_path.clone());
+
+    let out = Command::new(&copy_path)
         .args(["daemon", "list"])
         .uid(uid)
         .gid(gid)
