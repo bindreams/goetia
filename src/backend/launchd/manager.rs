@@ -717,7 +717,8 @@ impl ServiceManager for LaunchdManager {
     }
 
     fn start(&self, id: &Id) -> Result<()> {
-        let (location, _text) = located_and_ours(id)?;
+        let (location, text) = located_and_ours(id)?;
+        let blob = generate::extract(&text)?.ok_or_else(|| foreign(id))?;
 
         if !is_loaded(id.as_str())? {
             if let Err(e) = bootstrap(&location.path) {
@@ -741,6 +742,37 @@ impl ServiceManager for LaunchdManager {
         let (state, _pid) = query_live_state(id.as_str());
         if state != State::Running {
             kickstart(id.as_str())?;
+        }
+
+        // Verify the outcome, do not assume it.
+        //
+        // `is_loaded` and `query_live_state` both key on the *label*
+        // (`system/<id>`) and cannot tell whose job answers to it. A job
+        // loaded from a different plist — one we just replaced, or one an
+        // external actor boot'ed out that has not finished tearing down —
+        // satisfies both, so each check above can be skipped on the strength
+        // of a job that is about to cease existing. That is not theoretical:
+        // it silently no-op'd `install --start` on a real migration, leaving
+        // the daemon stopped while `start` returned `Ok`, because the
+        // predecessor job with the same label was still shutting down.
+        //
+        // Only `KeepAlive: true` (`restart: always`) licenses this check:
+        // launchd guarantees such a job is running whenever it is loaded.
+        // Under `on-failure` or `never` a job may legitimately have run and
+        // exited by now, and demanding `Running` would fail a correct start.
+        if blob.spec.restart == Restart::Always && query_live_state(id.as_str()).0 != State::Running {
+            // One corrective cycle, not a retry loop: tear the stale job
+            // down by label and load ours from the path we just confirmed.
+            bootout(id.as_str())?;
+            bootstrap(&location.path)?;
+            if query_live_state(id.as_str()).0 != State::Running {
+                kickstart(id.as_str())?;
+            }
+            if query_live_state(id.as_str()).0 != State::Running {
+                return Err(Error::Other(format!(
+                    "`{id}` did not start: its plist is loaded but launchd reports no running process, and `restart: always` means it should have one"
+                )));
+            }
         }
         Ok(())
     }
