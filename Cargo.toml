@@ -29,7 +29,7 @@ default = ["cli"]
 cli = ["dep:clap", "dep:libc"]
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 clap = { version = "4.6.6", features = ["derive"], optional = true }
 humantime = "2"
 humantime-serde = "1"
@@ -50,7 +50,7 @@ libc = { version = "0.2", optional = true }
 # account and to hand cwd/logs directories to it, regardless of whether the
 # CLI's own optional deps are pulled in.
 libc = "0.2"
-nix = { version = "0.30", features = ["user", "fs"] }
+nix = { version = "0.31", features = ["user", "fs"] }
 
 [target.'cfg(windows)'.dependencies]
 # The real SCM backend (`src/backend/scm/manager.rs`) plus the CLI's
@@ -61,7 +61,7 @@ windows-service = "0.8"
 # `Services\<name>\Parameters` (the metadata blob) and `Services\<name>\Environment`
 # (see `manager::registry`) are read and written directly through the
 # registry: `windows-service`'s `ServiceConfig` exposes neither.
-winreg = "0.55"
+winreg = "0.56"
 # The handful of Win32 calls `windows-service` does not wrap: a real
 # `NotifyServiceStatusChangeW` wait (`manager::scm_wait`, replacing a
 # checkpoint/`Sleep` poll), `SeServiceLogonRight` provisioning
