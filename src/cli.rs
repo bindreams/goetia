@@ -4,14 +4,14 @@
 //! [`dispatch`] is wired to `goetia::manager::native()` by [`crate`'s bin
 //! target](../../src/main.rs) — never to [`crate::manager::fake::Fake`]. A
 //! CLI that secretly talked to the fake would pass every test here and do
-//! nothing on a real machine. Until Tasks 11-13 land, every mutating and
-//! every list/status subcommand therefore fails on a real host with `no
-//! backend for <platform> yet` — the message [`crate::manager::native`]
-//! returns. `install --dry-run` and `show -f <file>` are the exceptions:
-//! they need no backend at all (pure generation, or a spec read straight
-//! from a file), so they keep working today. `diff` always needs a
-//! manager, `-f` or not — comparing against installed state is its entire
-//! job.
+//! nothing on a real machine. On a platform without a backend yet (Tasks
+//! 11-13; Linux has had one since Task 11), every mutating and every
+//! list/status subcommand therefore fails on a real host with `no backend
+//! for <platform> yet` — the message [`crate::manager::native`] returns.
+//! `install --dry-run` and `show -f <file>` are the exceptions: they need
+//! no backend at all (pure generation, or a spec read straight from a
+//! file), so they keep working regardless. `diff` always needs a manager,
+//! `-f` or not — comparing against installed state is its entire job.
 //!
 //! `dispatch` takes `get_manager` and `is_elevated` as lazily-invoked
 //! closures for exactly this reason: a subcommand that does not need a

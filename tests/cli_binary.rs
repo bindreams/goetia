@@ -44,9 +44,12 @@ fn write_manifest(dir: &Path, yaml: &str) {
 
 /// `goetia daemon list` needs no elevation but does need a manager, so it is
 /// the cleanest proof that the real binary is wired to
-/// `goetia::manager::native()` and not to the fake: today, on every
-/// platform, that means it fails with `native()`'s exact message rather
-/// than panicking.
+/// `goetia::manager::native()` and not to the fake: on a platform with no
+/// backend yet, that means it fails with `native()`'s exact message rather
+/// than panicking. `#[cfg]`-gated off Linux since Task 11 gave it a real
+/// backend — see `linux_backend_wiring_reaches_a_real_manager_not_the_fake`
+/// below for that platform's equivalent proof.
+#[cfg(not(target_os = "linux"))]
 #[skuld::test]
 fn unimplemented_backend_names_the_platform_not_a_panic() {
     let dir = tempfile::tempdir().unwrap();
@@ -56,6 +59,22 @@ fn unimplemented_backend_names_the_platform_not_a_panic() {
     assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
     let expected = format!("no backend for {} yet", std::env::consts::OS);
     assert!(err.contains(&expected), "stderr should name the missing backend: {err}");
+}
+
+/// Linux's counterpart to `unimplemented_backend_names_the_platform_not_a_panic`: since Task 11,
+/// `native()` reaches a real `Systemd` manager here, so the proof of wiring is the *absence* of
+/// `native()`'s "no backend" message (which only a genuinely unwired manager would ever produce) —
+/// the fake would also exit 0 here, so this only rules out the one wrong wiring this module exists to
+/// catch, same as the other platforms' version of this test.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn linux_backend_wiring_reaches_a_real_manager_not_the_fake() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let (code, out, err) = run_cli(&["daemon", "list"], dir.path());
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(!err.contains("no backend for"), "stderr:\n{err}");
 }
 
 // Pure paths: no elevation, no manager ================================================================================

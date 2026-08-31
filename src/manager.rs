@@ -12,7 +12,9 @@
 pub mod conformance;
 pub mod fake;
 
-use crate::error::{Error, Result};
+#[cfg(not(target_os = "linux"))]
+use crate::error::Error;
+use crate::error::Result;
 use crate::spec::{DaemonSpec, Id};
 
 // ServiceManager ======================================================================================================
@@ -136,16 +138,14 @@ pub enum State {
 
 /// The platform's [`ServiceManager`] implementation.
 ///
-/// Tasks 11-13 build systemd/launchd/SCM backends; until each lands, its
+/// Tasks 11-13 build the systemd/launchd/SCM backends; until each lands, its
 /// platform's arm here returns [`Error::UnsupportedPlatform`] rather than
-/// panicking — a CLI user gets a diagnosable message ("no backend for linux
-/// yet"), not a crash. Each of those tasks replaces only its own arm.
+/// panicking — a CLI user gets a diagnosable message ("no backend for
+/// macos yet"), not a crash. Each of those tasks replaces only its own arm.
 pub fn native() -> Result<Box<dyn ServiceManager>> {
     #[cfg(target_os = "linux")]
     {
-        Err(Error::UnsupportedPlatform {
-            platform: "linux".to_string(),
-        })
+        Ok(Box::new(crate::backend::systemd::manager::Systemd::new()))
     }
     #[cfg(target_os = "macos")]
     {
