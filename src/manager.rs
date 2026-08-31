@@ -12,11 +12,12 @@
 pub mod conformance;
 pub mod fake;
 
-// `Error::UnsupportedPlatform` is still needed by `native()`'s non-Windows
-// arms; on a Windows build (see `native()`'s `#[cfg(target_os = "windows")]`
-// arm, which returns a real `ScmManager`) it would otherwise be an unused
-// import.
-#[cfg(not(target_os = "windows"))]
+// `Error::UnsupportedPlatform` is only referenced by the arms of `native()`
+// that still return it (Linux, and the catch-all "other" arm) — macOS and
+// Windows each return a real `ServiceManager` from their own arm now, so
+// gating keeps a macOS-only or Windows-only build from warning about an
+// unused import.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use crate::error::Error;
 use crate::error::Result;
 use crate::spec::{DaemonSpec, Id};
@@ -142,10 +143,13 @@ pub enum State {
 
 /// The platform's [`ServiceManager`] implementation.
 ///
-/// Tasks 11-13 build systemd/launchd/SCM backends; until each lands, its
-/// platform's arm here returns [`Error::UnsupportedPlatform`] rather than
-/// panicking — a CLI user gets a diagnosable message ("no backend for linux
-/// yet"), not a crash. Each of those tasks replaces only its own arm.
+/// macOS's arm returns
+/// [`backend::launchd::manager::LaunchdManager`](crate::backend::launchd::manager::LaunchdManager);
+/// Windows' returns
+/// [`backend::scm::manager::ScmManager`](crate::backend::scm::manager::ScmManager).
+/// Linux's arm (Task 11 not yet landed here) returns
+/// [`Error::UnsupportedPlatform`] rather than panicking — a CLI user gets a
+/// diagnosable message ("no backend for linux yet"), not a crash.
 pub fn native() -> Result<Box<dyn ServiceManager>> {
     #[cfg(target_os = "linux")]
     {
@@ -155,9 +159,7 @@ pub fn native() -> Result<Box<dyn ServiceManager>> {
     }
     #[cfg(target_os = "macos")]
     {
-        Err(Error::UnsupportedPlatform {
-            platform: "macos".to_string(),
-        })
+        Ok(Box::new(crate::backend::launchd::manager::LaunchdManager::new()))
     }
     #[cfg(target_os = "windows")]
     {

@@ -1,9 +1,10 @@
 use super::*;
 
-/// Linux/macOS have no backend yet (Tasks 11-12); Windows does, as of
-/// Task 13 — see [`native_returns_a_working_backend_on_windows`].
+/// Linux has no backend yet (Task 11); macOS and Windows do, as of Tasks 12
+/// and 13 — see [`native_returns_the_launchd_backend`]/
+/// [`native_returns_a_working_backend_on_windows`].
 #[skuld::test]
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn native_names_the_missing_backend() {
     let err = match native() {
         Ok(_) => panic!("no backend is implemented yet on this platform"),
@@ -20,6 +21,12 @@ fn native_names_the_missing_backend() {
         "message should name the running platform ({}): {message}",
         std::env::consts::OS
     );
+}
+
+#[skuld::test]
+#[cfg(target_os = "macos")]
+fn native_returns_the_launchd_backend() {
+    native().expect("macOS has a native() ServiceManager");
 }
 
 #[skuld::test]

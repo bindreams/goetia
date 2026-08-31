@@ -5,8 +5,9 @@
 //! Everything here is either pure (`install --dry-run`, `show -f`) or
 //! deliberately exercises `main.rs`'s real wiring to
 //! `goetia::manager::native()`, which errors on every platform until Tasks
-//! 11-13 land. Behavior that needs a *working* manager lives in
-//! `tests/cli_dispatch.rs` instead, dispatched in-process against the fake.
+//! 11-13 land (macOS excepted). Behavior that needs a
+//! *working* manager lives in `tests/cli_dispatch.rs` instead, dispatched
+//! in-process against the fake.
 
 use std::path::Path;
 use std::process::Command;
@@ -44,10 +45,11 @@ fn write_manifest(dir: &Path, yaml: &str) {
 
 /// `goetia daemon list` needs no elevation but does need a manager, so it is
 /// the cleanest proof that the real binary is wired to
-/// `goetia::manager::native()` and not to the fake: today, on every
-/// platform, that means it fails with `native()`'s exact message rather
-/// than panicking.
+/// `goetia::manager::native()` and not to the fake: on every platform but
+/// macOS, that means it fails with `native()`'s exact message rather than
+/// panicking.
 #[skuld::test]
+#[cfg(not(target_os = "macos"))]
 fn unimplemented_backend_names_the_platform_not_a_panic() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -56,6 +58,20 @@ fn unimplemented_backend_names_the_platform_not_a_panic() {
     assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
     let expected = format!("no backend for {} yet", std::env::consts::OS);
     assert!(err.contains(&expected), "stderr should name the missing backend: {err}");
+}
+
+/// macOS's counterpart: `goetia daemon list` is wired to a real
+/// `LaunchdManager`, so it must succeed (and needs no elevation — it only
+/// reads the filesystem) rather than report a missing backend.
+#[skuld::test]
+#[cfg(target_os = "macos")]
+fn native_backend_answers_list_unelevated() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let (code, out, err) = run_cli(&["daemon", "list"], dir.path());
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(!err.contains("no backend"), "stderr:\n{err}");
 }
 
 // Pure paths: no elevation, no manager ================================================================================
