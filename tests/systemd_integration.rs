@@ -1,6 +1,6 @@
 //! Elevated integration tests for the systemd backend (Linux only). Runs `manager::conformance`
-//! against a real `Systemd`, then the obligation-specific scenarios Task 11's review found missing
-//! from a naive implementation — see `src/backend/systemd/manager.rs`'s module doc comment.
+//! against a real `Systemd`, then the obligation-specific scenarios
+//! — see `src/backend/systemd/manager.rs`'s module doc comment.
 //!
 //! Structured like `tests/marker_inertness.rs`: `support` is declared once here, unconditionally, and
 //! the platform-gated test bodies live in their own file (`systemd_integration/linux.rs`) that reaches

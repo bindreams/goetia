@@ -138,10 +138,10 @@ pub enum State {
 
 /// The platform's [`ServiceManager`] implementation.
 ///
-/// Tasks 11-13 build the systemd/launchd/SCM backends; until each lands, its
-/// platform's arm here returns [`Error::UnsupportedPlatform`] rather than
-/// panicking — a CLI user gets a diagnosable message ("no backend for
-/// macos yet"), not a crash. Each of those tasks replaces only its own arm.
+/// Each of systemd/launchd/SCM has its own arm below. Until a platform's
+/// backend lands, its arm returns [`Error::UnsupportedPlatform`] rather
+/// than panicking — a CLI user gets a diagnosable message ("no backend
+/// for macos yet"), not a crash.
 pub fn native() -> Result<Box<dyn ServiceManager>> {
     #[cfg(target_os = "linux")]
     {

@@ -1,8 +1,8 @@
 //! CLI behavior tests that need a working `ServiceManager`.
 //!
 //! `native()` errors on every platform without a backend yet (see
-//! `goetia::cli`'s module doc comment; Linux has had one since Task 11), so
-//! these run `goetia::cli::dispatch` in-process against
+//! `goetia::cli`'s module doc comment — Linux has one), so these run
+//! `goetia::cli::dispatch` in-process against
 //! `goetia::manager::fake::Fake`, injected exactly the way `main.rs` injects
 //! `native()` — through `dispatch`'s `get_manager` parameter, so these tests
 //! stay platform-independent regardless of which real backends exist. Tests

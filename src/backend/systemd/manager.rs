@@ -1,36 +1,42 @@
 //! The effectful half of the systemd backend: writes `/etc/systemd/system/<id>.service` and talks
 //! to `systemctl`.
 //!
-//! Six obligations the review found missing from a naive classify-then-write implementation, each
-//! with its own test (see `tests/systemd_integration.rs` and this module's own `manager_tests.rs`):
+//! Six correctness obligations a systemd unit-file backend must uphold, each with its own test (see
+//! `tests/systemd_integration/linux.rs` and this module's own `manager_tests.rs`):
 //!
-//! 1. **Create must not clobber.** `rename(2)` unconditionally replaces its destination, so a plain
-//!    classify-then-rename is a TOCTOU window: a package postinst or a concurrent invocation can drop
-//!    a foreign unit into the gap and have it destroyed by the very code path that exists to refuse
-//!    that. [`create_unit`] uses [`tempfile::NamedTempFile::persist_noclobber`] (`linkat(2)` without
-//!    replace semantics) for the create case; [`replace_unit`] uses plain `persist`/`rename` only once
-//!    a path is already classified as ours.
+//! 1. **A write must not clobber something it did not classify.** `rename(2)` unconditionally
+//!    replaces its destination, so a plain classify-then-write is a TOCTOU window: a package
+//!    postinst or a concurrent invocation can drop a foreign unit into the gap and have it destroyed
+//!    by the very code path that exists to refuse that. [`create_unit`] uses
+//!    [`tempfile::NamedTempFile::persist_noclobber`] (`linkat(2)` without replace semantics) for the
+//!    create case; [`replace_unit_verified`] closes the same gap for the update/regenerate case by
+//!    quarantining the current occupant under a temporary name and verifying its identity before
+//!    committing to either direction.
 //! 2. **A masked unit is not absent.** `systemctl mask` replaces the fragment with a symlink to
 //!    `/dev/null`; reading it yields empty text, and a naive read-then-extract would see `Ok(None)`
-//!    and let `install` rename over it, silently unmasking a deliberately-masked service.
+//!    and let `install` write over it, silently unmasking a deliberately-masked service.
 //!    [`raw_state`] `lstat`s the path and classifies any non-regular file as [`RawState::NonRegular`]
 //!    — always `Ownership::Foreign` — without ever reading its contents.
 //! 3. **Drop-ins are drift.** `systemctl edit` — the officially recommended way to add exactly the
 //!    `MemoryMax=`/`After=` the design cites — writes `<id>.service.d/override.conf` and leaves the
 //!    fragment itself byte-identical, so drift detection over the fragment alone misses it entirely.
-//!    [`dropin_marker`] folds the drop-in directory's contents into the text handed to `decide` (never
-//!    into what is actually written), so any drop-in forces `Conflict` regardless of whether the
-//!    fragment changed. [`uninstall`] removes the directory, or it would poison the next install of
-//!    the same id.
+//!    [`dropin_marker`] folds the drop-in directory's `*.conf` contents into the text handed to
+//!    `decide` (never into what is actually written); `apply_dropin_override` closes the one branch
+//!    that miss doesn't reach — `decide`'s version-mismatch check fires before any text comparison at
+//!    all, so a drop-in alongside a stale artifact needs its own guard. Every successful write clears
+//!    the drop-in directory, so a resolved conflict cannot wedge the id in permanent drift, and a
+//!    drop-in directory with no fragment at all is refused rather than silently adopted as `Create`.
 //! 4. **Permissions.** `NamedTempFile` is created mode 0600; after persisting, the unit would be
-//!    root-only, breaking the promise that `list`/`show`/`diff` need no elevation. Both
-//!    [`create_unit`] and [`replace_unit`] `chmod` 0644 before persisting.
-//! 5. **Parent directories.** [`ensure_parent_dirs`] creates and, for a non-root account, `chown`s the
-//!    parents of `logs` and `cwd` while still elevated — otherwise `StandardOutput=append:` fails the
-//!    unit at start with an opaque status.
-//! 6. **Uninstall order** is stop -> `systemctl disable` -> remove -> `daemon-reload`. Disabling after
-//!    the fragment is gone is impossible (no `[Install]` section left to read), which would leave
-//!    exactly the `.wants` symlink `uninstall_leaves_nothing` checks for.
+//!    root-only, breaking the promise that `list`/`show`/`diff` need no elevation.
+//!    [`write_temp_unit`] `chmod`s 0644 before persisting.
+//! 5. **Parent directories.** [`ensure_parent_dirs`] creates and, for a non-root account, `chown`s
+//!    the parents of `logs` and `cwd` while still elevated — otherwise `StandardOutput=append:` fails
+//!    the unit at start with an opaque status. Only path components this call actually creates are
+//!    touched; an already-existing directory's mode and ownership are left alone, and verified
+//!    writable by the target account instead.
+//! 6. **Uninstall order** is stop -> `systemctl disable` -> remove -> `daemon-reload`. Disabling
+//!    after the fragment is gone is impossible (no `[Install]` section left to read), which would
+//!    leave exactly the `.wants` symlink `uninstall_leaves_nothing` checks for.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -65,20 +71,29 @@ impl Systemd {
 
 impl ServiceManager for Systemd {
     fn install(&self, spec: &DaemonSpec, force: bool) -> Result<Outcome> {
-        let identity = identity_for(&spec.user);
+        let identity = identity_for(&spec.user)?;
         let desired = generate::unit(spec, &identity);
 
-        // Looping rather than a single attempt: `create_unit`'s `AlreadyExists` means something
-        // appeared at this id between `discover` and the write below (obligation 1). That is a real,
-        // detected state change to react to — not a wait for time to pass — so re-classifying and
-        // trying again is bounded by actual system state, not a chosen number of attempts.
+        // Looping rather than a single attempt: a `Raced` result means something appeared at this id
+        // between classification and the write below (obligation 1). That is a real, detected state
+        // change to react to — not a wait for time to pass — so re-classifying and trying again is
+        // bounded by actual system state, not a chosen number of attempts.
         loop {
-            let (found, on_disk) = discover(spec.id.as_str())?;
-            let outcome = decide::decide(&found, on_disk.as_deref(), &desired, spec, crate::version(), force);
+            let d = discover(spec.id.as_str())?;
+            let outcome = decide::decide(
+                &d.ownership,
+                d.on_disk.as_deref(),
+                &desired,
+                spec,
+                crate::version(),
+                force,
+            );
+            let outcome = apply_dropin_override(outcome, &d, force);
 
             match &outcome {
                 Outcome::Create => {
                     ensure_parent_dirs(spec)?;
+                    remove_dir_if_present(&dropin_dir(spec.id.as_str()))?;
                     match create_unit(spec.id.as_str(), &desired)? {
                         CreateOutcome::Created => {
                             daemon_reload_or_report(spec.id.as_str())?;
@@ -88,12 +103,23 @@ impl ServiceManager for Systemd {
                     }
                 }
                 Outcome::Update { .. } | Outcome::Stale { .. } => {
-                    // Already classified `Ours` by `discover` above: a plain replace is safe here,
-                    // unlike the `Create` arm.
                     ensure_parent_dirs(spec)?;
-                    replace_unit(spec.id.as_str(), &desired)?;
-                    daemon_reload_or_report(spec.id.as_str())?;
-                    return Ok(outcome);
+                    // Clears any drop-in unconditionally: whatever led here — a forced conflict
+                    // resolution or a routine stale regenerate — makes the drop-in stale too, and
+                    // leaving it behind is exactly the permanent-wedge obligation 3 exists to rule
+                    // out.
+                    remove_dir_if_present(&dropin_dir(spec.id.as_str()))?;
+                    let expected_text = d
+                        .fragment_text
+                        .as_deref()
+                        .expect("Ownership::Ours implies discover classified a regular file");
+                    match replace_unit_verified(spec.id.as_str(), &desired, expected_text)? {
+                        ReplaceOutcome::Replaced => {
+                            daemon_reload_or_report(spec.id.as_str())?;
+                            return Ok(outcome);
+                        }
+                        ReplaceOutcome::Raced => continue,
+                    }
                 }
                 // `UpToDate` / `Conflict` (without force) / `RefuseForeign` / `RefuseUnreadable`:
                 // nothing to write.
@@ -103,23 +129,24 @@ impl ServiceManager for Systemd {
     }
 
     fn preview_install(&self, spec: &DaemonSpec) -> Result<Outcome> {
-        let identity = identity_for(&spec.user);
+        let identity = identity_for(&spec.user)?;
         let desired = generate::unit(spec, &identity);
-        let (found, on_disk) = discover(spec.id.as_str())?;
+        let d = discover(spec.id.as_str())?;
         // Always previewed without `force` — see the trait doc comment.
-        Ok(decide::decide(
-            &found,
-            on_disk.as_deref(),
+        let outcome = decide::decide(
+            &d.ownership,
+            d.on_disk.as_deref(),
             &desired,
             spec,
             crate::version(),
             false,
-        ))
+        );
+        Ok(apply_dropin_override(outcome, &d, false))
     }
 
     fn uninstall(&self, id: &Id) -> Result<()> {
         let id = id.as_str();
-        require_installed(id)?;
+        let expected_text = require_installed(id)?;
         let unit = unit_name(id);
 
         // Order matters: stop, then disable (needs the fragment's `[Install]` section to know which
@@ -134,10 +161,34 @@ impl ServiceManager for Systemd {
             )));
         }
 
-        remove_file_if_present(&unit_path(id))?;
-        remove_dir_if_present(&dropin_dir(id))?;
+        // Verified removal, mirroring `replace_unit_verified`: the gap since `require_installed`
+        // spans two full `systemctl` round-trips, wide enough for something else to have replaced
+        // the fragment in the meantime (obligation 1's TOCTOU class again).
+        match quarantine_if_still_ours(id, &expected_text)? {
+            Some(backup_path) => remove_file_if_present(&backup_path)?,
+            None => {
+                return Err(Error::Other(format!(
+                    "the service at `{id}` changed after being confirmed installed; nothing was \
+                     removed — re-run uninstall"
+                )));
+            }
+        }
 
-        daemon_reload()
+        // Both attempted regardless of whether the first failed, and both failures reported
+        // together: a partial failure here must not leave systemd's loaded view silently stale, the
+        // same reasoning `daemon_reload_or_report` documents on the `install` side.
+        let dropin_result = remove_dir_if_present(&dropin_dir(id));
+        let reload_result = daemon_reload();
+        match (dropin_result, reload_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(e), Ok(())) => Err(e),
+            (Ok(()), Err(e)) => Err(e),
+            (Err(e1), Err(e2)) => Err(Error::Other(format!(
+                "uninstall for `{id}` partially failed: removing the drop-in directory failed \
+                 ({e1}), and `systemctl daemon-reload` also failed ({e2}); the unit fragment is \
+                 already gone"
+            ))),
+        }
     }
 
     fn enable(&self, id: &Id) -> Result<()> {
@@ -220,8 +271,11 @@ impl ServiceManager for Systemd {
             // this check — neither is a fragment `list` should read, per obligations 2 and 3.
             let file_type = match entry.file_type() {
                 Ok(t) => t,
-                // A benign race with a concurrent uninstall between `read_dir` and this stat.
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                // `list` runs unelevated by design (obligation 4): a foreign unit shipped
+                // non-world-readable (units carrying `LoadCredential=` commonly are 0600) cannot
+                // carry a decodable goetia marker either way, so it is not ours to report — the same
+                // disposition as a concurrent-uninstall race.
+                Err(e) if is_benign_list_error(&e) => continue,
                 Err(e) => return Err(io_err("stat", &entry.path(), e)),
             };
             if !file_type.is_file() {
@@ -231,8 +285,7 @@ impl ServiceManager for Systemd {
             let path = entry.path();
             let text = match fs::read_to_string(&path) {
                 Ok(t) => t,
-                // A benign race with a concurrent uninstall between `read_dir` and this read.
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) if is_benign_list_error(&e) => continue,
                 Err(e) => return Err(io_err("read", &path, e)),
             };
 
@@ -256,21 +309,32 @@ impl ServiceManager for Systemd {
     }
 }
 
+fn is_benign_list_error(e: &io::Error) -> bool {
+    matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied)
+}
+
 // Identity ============================================================================================================
 
 /// Resolve `user` to the account name systemd's `User=` directive wants. Root becomes `"0"`, exactly
 /// as `cli::install`'s dry-run preview renders it, so a preview and a real install never disagree.
 /// Unlike launchd/SCM, systemd needs no OS lookup here — it resolves usernames itself via NSS at
-/// start time — so this is a pure formatting step rather than genuinely effectful I/O.
-fn identity_for(user: &User) -> Identity {
-    Identity {
-        user: match user {
-            User::Root => "0".to_string(),
-            User::Name(name) => name.clone(),
-            User::Id(AccountId::Uid(uid)) => uid.to_string(),
-            User::Id(AccountId::Sid(sid)) => sid.clone(),
-        },
-    }
+/// start time — so this is otherwise a pure formatting step. The one case rejected outright is a
+/// Windows account SID: `spec::resolve` only checks it for unemittable characters, never for
+/// platform applicability, so a manifest naming `user: {id: "S-1-5-..."}` would otherwise reach
+/// `generate::unit` and be written verbatim into `User=`, failing the unit at start with an opaque
+/// status — exactly what obligation 5 goes out of its way to avoid for directory permissions.
+fn identity_for(user: &User) -> Result<Identity> {
+    let name = match user {
+        User::Root => "0".to_string(),
+        User::Name(name) => name.clone(),
+        User::Id(AccountId::Uid(uid)) => uid.to_string(),
+        User::Id(AccountId::Sid(_)) => {
+            return Err(Error::Other(
+                "a Windows account id (SID) is not a valid user for the systemd backend".to_string(),
+            ));
+        }
+    };
+    Ok(Identity { user: name })
 }
 
 // Paths ===============================================================================================================
@@ -312,39 +376,114 @@ fn raw_state(id: &str) -> Result<RawState> {
     }
 }
 
-/// Classify what's at `id`, exactly as `install` needs to: an [`Ownership`] plus the on-disk text
-/// `decide` compares against. `None` iff `Ownership::Absent`.
-fn discover(id: &str) -> Result<(Ownership, Option<String>)> {
+/// What `install`/`preview_install` classified at `id`: an [`Ownership`] plus everything specific to
+/// this backend that `decide` cannot see on its own.
+struct Discovery {
+    ownership: Ownership,
+    /// `None` iff `ownership` is `Ownership::Absent`.
+    on_disk: Option<String>,
+    /// The fragment's own raw text — distinct from `on_disk`, which may have a drop-in marker folded
+    /// in — present iff `ownership` came from a regular file (`Ours` or `OursUnreadable`). Used to
+    /// verify identity before a later write/removal touches this exact fragment; see
+    /// `quarantine_if_still_ours`. Content, not inode, is the identity that matters here: an inode
+    /// number can be reused by the kernel moments after its file is unlinked, so two genuinely
+    /// different files can share one — verified empirically triggering the false-positive this would
+    /// otherwise cause.
+    fragment_text: Option<String>,
+    /// Whether `<id>.service.d/` currently holds any `*.conf` file — obligation 3. `decide` cannot
+    /// see this: its vocabulary is artifact *text*, and this is filesystem structure alongside it.
+    dropin_present: bool,
+}
+
+fn discover(id: &str) -> Result<Discovery> {
     match raw_state(id)? {
-        RawState::Absent => Ok((Ownership::Absent, None)),
-        RawState::NonRegular => Ok((Ownership::Foreign, Some(String::new()))),
+        RawState::Absent => match dropin_marker(id)? {
+            None => Ok(Discovery {
+                ownership: Ownership::Absent,
+                on_disk: None,
+                fragment_text: None,
+                dropin_present: false,
+            }),
+            // A drop-in directory with no fragment at all: never silently adopt it as `Create`, or
+            // the resulting unit inherits overrides goetia never wrote and cannot show — refuse it
+            // the same way any other pre-existing, unmarked artifact is refused.
+            Some(marker) => Ok(Discovery {
+                ownership: Ownership::Foreign,
+                on_disk: Some(marker),
+                fragment_text: None,
+                dropin_present: true,
+            }),
+        },
+        RawState::NonRegular => Ok(Discovery {
+            ownership: Ownership::Foreign,
+            on_disk: Some(String::new()),
+            fragment_text: None,
+            dropin_present: false,
+        }),
         RawState::Regular(text) => {
             // Obligation 3: fold any drop-in content into the text `decide` compares, without ever
             // writing that folded text back. Neither `desired` nor `regenerated` (both pure
             // `generate()` output) can ever contain this marker, so a non-empty drop-in forces
-            // `Conflict` unconditionally — exactly "drop-ins are drift".
-            let on_disk = match dropin_marker(id)? {
+            // `Conflict` whenever `decide` reaches a text comparison at all — the one branch that
+            // doesn't (a stale version, checked before any text comparison) is `apply_dropin_override`'s
+            // job.
+            let dropin = dropin_marker(id)?;
+            let dropin_present = dropin.is_some();
+            let on_disk = match &dropin {
                 Some(marker) => format!("{text}{marker}"),
                 None => text.clone(),
             };
 
-            let found = match generate::extract(&text) {
+            let ownership = match generate::extract(&text) {
                 Ok(None) => Ownership::Foreign,
-                Ok(Some(blob)) => {
-                    let identity = identity_for(&blob.spec.user);
-                    let regenerated = generate::unit(&blob.spec, &identity);
-                    Ownership::Ours { blob, regenerated }
-                }
+                Ok(Some(blob)) => match identity_for(&blob.spec.user) {
+                    Ok(identity) => {
+                        let regenerated = generate::unit(&blob.spec, &identity);
+                        Ownership::Ours { blob, regenerated }
+                    }
+                    // An embedded spec naming a SID user is not decodable into anything this backend
+                    // can regenerate — surfaced the same way any other blob invariant violation is.
+                    Err(e) => Ownership::OursUnreadable { reason: e.to_string() },
+                },
                 Err(e) => Ownership::OursUnreadable { reason: e.to_string() },
             };
-            Ok((found, Some(on_disk)))
+            Ok(Discovery {
+                ownership,
+                on_disk: Some(on_disk),
+                fragment_text: Some(text),
+                dropin_present,
+            })
         }
     }
 }
 
-/// A deterministic representation of `<id>.service.d`'s contents, or `None` if the directory does not
-/// exist or holds no regular files. Never `None` for a directory `systemctl edit` created — its
-/// `override.conf` is exactly the case obligation 3 exists for.
+/// Closes the one drop-in case `discover`'s on-disk folding cannot reach: `decide`'s version-mismatch
+/// check (`Outcome::Stale`) fires unconditionally, before it ever compares `on_disk` against anything
+/// — see `src/decide.rs`. Without this, a drop-in surviving a version bump is silently absorbed into
+/// a routine "regenerated" message instead of being reported as the drift obligation 3 exists to
+/// surface. Every other `decide` outcome already accounts for the drop-in correctly through the
+/// folded text, so this only ever touches `Stale`.
+fn apply_dropin_override(outcome: Outcome, discovery: &Discovery, force: bool) -> Outcome {
+    if !discovery.dropin_present {
+        return outcome;
+    }
+    match outcome {
+        Outcome::Stale { .. } if !force => {
+            let regenerated = match &discovery.ownership {
+                Ownership::Ours { regenerated, .. } => regenerated.as_str(),
+                _ => "",
+            };
+            let on_disk = discovery.on_disk.as_deref().unwrap_or("");
+            Outcome::Conflict {
+                artifact_diff: crate::diff::artifact_diff(regenerated, on_disk),
+            }
+        }
+        other => other,
+    }
+}
+
+/// A deterministic representation of `<id>.service.d`'s `*.conf` files — the only ones
+/// `systemd.unit(5)` reads as drop-ins — or `None` if the directory does not exist or holds none.
 fn dropin_marker(id: &str) -> Result<Option<String>> {
     let dir = dropin_dir(id);
     let mut entries = match fs::read_dir(&dir) {
@@ -358,15 +497,26 @@ fn dropin_marker(id: &str) -> Result<Option<String>> {
 
     let mut marker = String::new();
     for entry in &entries {
-        let file_type = entry.file_type().map_err(|e| io_err("stat", &entry.path(), e))?;
-        if !file_type.is_file() {
+        let file_name = entry.file_name();
+        if !file_name.to_string_lossy().ends_with(".conf") {
             continue;
         }
         let path = entry.path();
+        // `fs::metadata` follows symlinks, deliberately unlike `raw_state`'s `lstat` of the fragment
+        // itself: systemd follows a drop-in symlink exactly like a regular file when applying
+        // overrides (common under ansible/stow/nix-managed `/etc`), so drift detection must too.
+        let meta = match fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue, // dangling symlink
+            Err(e) => return Err(io_err("stat", &path, e)),
+        };
+        if !meta.is_file() {
+            continue;
+        }
         let content = fs::read_to_string(&path).map_err(|e| io_err("read", &path, e))?;
         marker.push_str(&format!(
             "\n# --- drop-in: {} ---\n{content}",
-            entry.file_name().to_string_lossy()
+            file_name.to_string_lossy()
         ));
     }
     Ok(if marker.is_empty() { None } else { Some(marker) })
@@ -374,8 +524,10 @@ fn dropin_marker(id: &str) -> Result<Option<String>> {
 
 /// The narrower "is this even ours" gate every verb but `install` needs: the marker alone is proof of
 /// ownership, matching [`crate::manager::fake::Fake`]'s `require_ours` (an undecodable blob still
-/// passes — `uninstall`'s recovery text names exactly that verb as the way out).
-fn require_installed(id: &str) -> Result<()> {
+/// passes — `uninstall`'s recovery text names exactly that verb as the way out). Returns the
+/// fragment's own text for a caller that goes on to remove or replace it — see
+/// `quarantine_if_still_ours`.
+fn require_installed(id: &str) -> Result<String> {
     match raw_state(id)? {
         RawState::Absent => Err(Error::NotInstalled { id: id.to_string() }),
         RawState::NonRegular => Err(Error::Foreign {
@@ -387,7 +539,7 @@ fn require_installed(id: &str) -> Result<()> {
                 id: id.to_string(),
                 recovery: decide::foreign_recovery(id),
             }),
-            Ok(Some(_)) | Err(_) => Ok(()),
+            Ok(Some(_)) | Err(_) => Ok(text),
         },
     }
 }
@@ -401,30 +553,108 @@ enum CreateOutcome {
     Raced,
 }
 
+enum ReplaceOutcome {
+    Replaced,
+    /// The fragment at `id` is no longer the one `install` classified — see
+    /// `quarantine_if_still_ours`. The caller re-discovers and re-decides.
+    Raced,
+}
+
 /// Write `text` as a brand-new unit at `id`, never replacing an existing file — see the module doc
 /// comment's obligation 1.
 fn create_unit(id: &str, text: &str) -> Result<CreateOutcome> {
     let final_path = unit_path(id);
     let tmp = write_temp_unit(id, text)?;
     match tmp.persist_noclobber(&final_path) {
-        Ok(_file) => Ok(CreateOutcome::Created),
+        Ok(_file) => {
+            fsync_unit_dir()?;
+            Ok(CreateOutcome::Created)
+        }
         Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => Ok(CreateOutcome::Raced),
         Err(e) => Err(io_err("create", &final_path, e.error)),
     }
 }
 
-/// Overwrite `id`'s unit with `text`. Only ever called once `id` has already been classified `Ours`
-/// by `discover` in the same `install` call — see the module doc comment's obligation 1.
-fn replace_unit(id: &str, text: &str) -> Result<()> {
+/// Overwrite `id`'s unit with `text`, but only if the fragment currently at `unit_path(id)` still has
+/// exactly the content `expected_text` names — closing the same TOCTOU obligation 1 already closes
+/// for `create_unit`, reached here from the `Update`/`Stale` arm instead: the gap between
+/// classification and this write spans `decide`, `ensure_parent_dirs` (which can spawn a `chown`
+/// subprocess), and building the replacement's contents, wide enough for something else to land at
+/// this exact path in between (e.g. a concurrent `systemctl mask` on this same, already-managed id).
+///
+/// There is no kernel-level "replace only if identity X" primitive, so this is done in two safe
+/// `rename`s: quarantine the current occupant under a private name and verify its content
+/// (`quarantine_if_still_ours`), then place the new content and either discard the quarantined file
+/// (verified match) or put it back (mismatch, reported as a race to retry).
+fn replace_unit_verified(id: &str, text: &str, expected_text: &str) -> Result<ReplaceOutcome> {
+    let Some(backup_path) = quarantine_if_still_ours(id, expected_text)? else {
+        return Ok(ReplaceOutcome::Raced);
+    };
+
     let final_path = unit_path(id);
     let tmp = write_temp_unit(id, text)?;
-    tmp.persist(&final_path)
-        .map_err(|e| io_err("replace", &final_path, e.error))?;
-    Ok(())
+    match tmp.persist_noclobber(&final_path) {
+        Ok(_file) => {
+            fsync_unit_dir()?;
+            remove_file_if_present(&backup_path)?;
+            Ok(ReplaceOutcome::Replaced)
+        }
+        Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => {
+            // Someone else placed a *third* file at `final_path` in the moment it was empty between
+            // the quarantine above and this write. Restoring the quarantined original here would
+            // clobber that third file — exactly the bug this function exists to prevent — so this
+            // reports the situation instead of guessing which side should win.
+            Err(Error::Other(format!(
+                "install for `{id}` raced twice: the original fragment is safely quarantined at {}, \
+                 but a different file has since appeared at {}; resolve manually and re-run install",
+                backup_path.display(),
+                final_path.display(),
+            )))
+        }
+        Err(e) => Err(io_err("replace", &final_path, e.error)),
+    }
+}
+
+/// Rename `unit_path(id)` to a private backup name, then confirm the moved file's content is still
+/// exactly `expected_text` — the same content `discover`/`require_installed` classified as ours. If
+/// it is not (or the path no longer exists at all), the backup is put back where it came from and
+/// this returns `Ok(None)`: something changed after classification, which the caller must treat as a
+/// race, not a license to keep going. On a match, `Ok(Some(backup_path))` — the verified former
+/// occupant, now safely out of the way for the caller to finish with (replace it with new content, or
+/// delete it outright).
+///
+/// Content, not inode, is the identity checked: a file's inode number can be reused by the kernel
+/// moments after it is unlinked (confirmed directly — a test using inode comparison here saw a freshly
+/// unlinked-and-recreated file reported as "unchanged"), so two genuinely different files can share
+/// one. Comparing the actual bytes is both simpler and immune to that, and it is what this whole
+/// system already treats as an artifact's identity everywhere else (`decide`'s entire vocabulary is
+/// text).
+fn quarantine_if_still_ours(id: &str, expected_text: &str) -> Result<Option<PathBuf>> {
+    let final_path = unit_path(id);
+    let backup_path = Path::new(UNIT_DIR).join(format!(".{id}.service.goetia-quarantine"));
+
+    match fs::rename(&final_path, &backup_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io_err("quarantine", &final_path, e)),
+    }
+
+    let actual = fs::read_to_string(&backup_path).map_err(|e| io_err("read", &backup_path, e))?;
+    if actual == expected_text {
+        Ok(Some(backup_path))
+    } else {
+        fs::rename(&backup_path, &final_path).map_err(|e| io_err("restore", &backup_path, e))?;
+        Ok(None)
+    }
 }
 
 /// A temp file in `UNIT_DIR` itself (so the later `persist`/`persist_noclobber` is a same-filesystem
-/// link, never a cross-device copy), containing `text`, already `chmod`ed 0644 — obligation 4.
+/// link, never a cross-device copy), containing `text`, already `chmod`ed 0644 (obligation 4) and
+/// `fsync`ed to stable storage — `NamedTempFile`'s `Write` impl forwards `flush()` straight to
+/// `std::fs::File`, whose `flush` is a documented no-op, so without a real `sync_all()` here a crash
+/// between this write and the later rename can leave the fragment on disk fully or partially
+/// zero-filled: no `[X-Goetia]` marker, `extract` returns `Ok(None)`, and every verb then refuses an
+/// id goetia itself created.
 fn write_temp_unit(id: &str, text: &str) -> Result<tempfile::NamedTempFile> {
     let dir = Path::new(UNIT_DIR);
     let mut tmp = tempfile::Builder::new()
@@ -434,11 +664,19 @@ fn write_temp_unit(id: &str, text: &str) -> Result<tempfile::NamedTempFile> {
         .map_err(|e| io_err("create a temp file in", dir, e))?;
     tmp.write_all(text.as_bytes())
         .map_err(|e| io_err("write", tmp.path(), e))?;
-    tmp.flush().map_err(|e| io_err("flush", tmp.path(), e))?;
+    tmp.as_file().sync_all().map_err(|e| io_err("fsync", tmp.path(), e))?;
     tmp.as_file()
         .set_permissions(fs::Permissions::from_mode(0o644))
         .map_err(|e| io_err("chmod", tmp.path(), e))?;
     Ok(tmp)
+}
+
+/// `fsync`s `UNIT_DIR` itself, so a just-completed rename's new directory entry is durable — a file's
+/// own `fsync` (see `write_temp_unit`) says nothing about the directory entry pointing to it.
+fn fsync_unit_dir() -> Result<()> {
+    let dir = Path::new(UNIT_DIR);
+    let f = fs::File::open(dir).map_err(|e| io_err("open", dir, e))?;
+    f.sync_all().map_err(|e| io_err("fsync", dir, e))
 }
 
 /// Create (and, for a non-root account, `chown`) the parent of `logs` and the `cwd` directory itself
@@ -458,23 +696,86 @@ fn ensure_parent_dirs(spec: &DaemonSpec) -> Result<()> {
     Ok(())
 }
 
+/// Create `dir` (and any missing parents), `chmod`ing and `chown`ing only the path components this
+/// call actually creates. `spec.cwd`/`logs` are user-supplied absolute paths with no restriction to a
+/// Goetia-owned root, so reassigning mode/ownership unconditionally — including when `dir` or an
+/// ancestor already existed — would let a manifest silently widen or reassign an arbitrary existing
+/// system directory (`/var/log`, `/etc`, another user's home). A directory that already existed is
+/// left exactly as it was; if the target account cannot write it, that is reported as an error
+/// instead.
 fn ensure_writable_dir(dir: &Path, user: &User) -> Result<()> {
-    fs::create_dir_all(dir).map_err(|e| io_err("create directory", dir, e))?;
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).map_err(|e| io_err("chmod", dir, e))?;
+    let dir_preexisted = fs::symlink_metadata(dir).is_ok();
 
-    if let Some(owner) = chown_target(user) {
-        let output = Command::new("chown")
-            .arg(format!("{owner}:"))
+    let mut missing = Vec::new();
+    let mut cursor = dir;
+    loop {
+        match fs::symlink_metadata(cursor) {
+            Ok(_) => break,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                missing.push(cursor);
+                match cursor.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => cursor = parent,
+                    _ => break,
+                }
+            }
+            Err(e) => return Err(io_err("stat", cursor, e)),
+        }
+    }
+
+    let owner = chown_target(user);
+    // Outermost-first, so each `create_dir` always has an existing parent.
+    for path in missing.into_iter().rev() {
+        fs::create_dir(path).map_err(|e| io_err("create directory", path, e))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).map_err(|e| io_err("chmod", path, e))?;
+        if let Some(owner) = &owner {
+            chown(path, owner)?;
+        }
+    }
+
+    if dir_preexisted {
+        verify_writable_by(dir, user)?;
+    }
+    Ok(())
+}
+
+/// Whether the account `user` names can write to the already-existing `dir`, checked by literally
+/// asking the OS as that account (`runuser`) rather than hand-rolling permission-bit/ACL math.
+/// `dir`'s mode/ownership is never touched here — see `ensure_writable_dir`'s doc comment for why —
+/// so this exists purely to surface the same opaque-status-at-start failure obligation 5 exists to
+/// avoid, at install time instead of discovered later by the daemon itself.
+fn verify_writable_by(dir: &Path, user: &User) -> Result<()> {
+    let User::Root = user else {
+        let account = chown_target(user).expect("a SID user is rejected by identity_for before this is reached");
+        let output = Command::new("runuser")
+            .args(["-u", &account, "--", "test", "-w"])
             .arg(dir)
             .output()
-            .map_err(|e| Error::Other(format!("failed to spawn chown for {}: {e}", dir.display())))?;
+            .map_err(|e| Error::Other(format!("failed to spawn runuser to verify {}: {e}", dir.display())))?;
         if !output.status.success() {
             return Err(Error::Other(format!(
-                "chown {owner}: {} failed: {}",
-                dir.display(),
-                String::from_utf8_lossy(&output.stderr)
+                "{} already exists and is not writable by `{account}`; goetia only creates and owns \
+                 directories it did not find already present, so fix its ownership/permissions \
+                 manually, or point `cwd`/`logs` elsewhere",
+                dir.display()
             )));
         }
+        return Ok(());
+    };
+    Ok(())
+}
+
+fn chown(path: &Path, owner: &str) -> Result<()> {
+    let output = Command::new("chown")
+        .arg(format!("{owner}:"))
+        .arg(path)
+        .output()
+        .map_err(|e| Error::Other(format!("failed to spawn chown for {}: {e}", path.display())))?;
+    if !output.status.success() {
+        return Err(Error::Other(format!(
+            "chown {owner}: {} failed: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        )));
     }
     Ok(())
 }
@@ -486,8 +787,10 @@ fn chown_target(user: &User) -> Option<String> {
         User::Root => None,
         User::Name(name) => Some(name.clone()),
         User::Id(AccountId::Uid(uid)) => Some(uid.to_string()),
-        // A SID is not a meaningful Linux account; nothing sensible to chown to.
-        User::Id(AccountId::Sid(_)) => None,
+        // `identity_for` rejects a SID user before `install`/`preview_install` ever reaches
+        // `ensure_parent_dirs`, so a validated `spec.user` reaching this arm is impossible — not a
+        // silently-skipped case.
+        User::Id(AccountId::Sid(_)) => unreachable!("a SID user must already have been rejected by identity_for"),
     }
 }
 

@@ -46,7 +46,7 @@ fn write_manifest(dir: &Path, yaml: &str) {
 /// the cleanest proof that the real binary is wired to
 /// `goetia::manager::native()` and not to the fake: on a platform with no
 /// backend yet, that means it fails with `native()`'s exact message rather
-/// than panicking. `#[cfg]`-gated off Linux since Task 11 gave it a real
+/// than panicking. `#[cfg]`-gated off Linux, which now has a real
 /// backend — see `linux_backend_wiring_reaches_a_real_manager_not_the_fake`
 /// below for that platform's equivalent proof.
 #[cfg(not(target_os = "linux"))]
@@ -61,7 +61,7 @@ fn unimplemented_backend_names_the_platform_not_a_panic() {
     assert!(err.contains(&expected), "stderr should name the missing backend: {err}");
 }
 
-/// Linux's counterpart to `unimplemented_backend_names_the_platform_not_a_panic`: since Task 11,
+/// Linux's counterpart to `unimplemented_backend_names_the_platform_not_a_panic`:
 /// `native()` reaches a real `Systemd` manager here, so the proof of wiring is the *absence* of
 /// `native()`'s "no backend" message (which only a genuinely unwired manager would ever produce) —
 /// the fake would also exit 0 here, so this only rules out the one wrong wiring this module exists to

@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -17,7 +18,7 @@ use goetia::spec::{DaemonSpec, Id, Kind, Restart, User};
 
 use crate::support::{self, ELEVATED, ServiceGuard, cmd};
 
-// Fixtures =============================================================================================================
+// Fixtures ============================================================================================================
 
 /// A minimal, real, long-running daemon: `sleep infinity` exists on every coreutils Ubuntu ships.
 fn mk(id: &str) -> DaemonSpec {
@@ -72,6 +73,8 @@ fn hand_edit(id: &str) {
     cmd::run("systemctl", &["daemon-reload"]).expect_ok();
 }
 
+/// The way `systemctl edit` creates a drop-in: `<id>.service.d/override.conf`. `systemd.unit(5)`
+/// only reads `*.conf` files there, which `write_dropin` exercises by using that exact extension.
 fn write_dropin(id: &str) {
     let dir = dropin_dir(id);
     fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
@@ -103,6 +106,24 @@ fn find_ours(installed: Vec<Installed>, id: &str) -> Option<DaemonSpec> {
     })
 }
 
+/// The numeric uid of a real local account, looked up rather than hardcoded — `nobody`'s uid is
+/// traditionally 65534 but is not guaranteed.
+fn uid_of(account: &str) -> u32 {
+    let run = cmd::run("id", &["-u", account]).expect_ok();
+    run.stdout
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("parse uid of {account}: {e}"))
+}
+
+struct RmDirAll(PathBuf);
+
+impl Drop for RmDirAll {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 // Step 1: conformance =================================================================================================
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -121,7 +142,7 @@ fn systemd_passes_conformance() {
     conformance::run(&mgr, &mk);
 }
 
-// Step 2: obligation-specific scenarios ================================================================================
+// Step 2: obligation-specific scenarios ===============================================================================
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn install_then_show_round_trips_without_the_source_file() {
@@ -175,6 +196,46 @@ fn drop_in_override_is_detected_as_drift() {
     // the fragment alone would say `UpToDate`. It must not.
     let outcome = mgr.install(&spec, false).expect("install with a drop-in present");
     assert!(matches!(outcome, Outcome::Conflict { .. }), "{outcome:?}");
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn forced_install_over_a_dropin_actually_clears_it() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let spec = mk(guard.id());
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+    write_dropin(guard.id());
+
+    let forced = mgr.install(&spec, true).expect("forced install over a drop-in");
+    assert!(matches!(forced, Outcome::Update { .. }), "{forced:?}");
+    assert!(
+        !dropin_dir(guard.id()).exists(),
+        "force must actually remove the drop-in directory, not just overwrite the fragment"
+    );
+
+    // The drift is really gone, not merely papered over: installing the same spec again, still
+    // without force, must now be a clean no-op — mirroring
+    // `manager::conformance::conflict_requires_force`'s own assertion for a hand-edited fragment.
+    let after = mgr.install(&spec, false).expect("install after force");
+    assert!(matches!(after, Outcome::UpToDate), "{after:?}");
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn install_refuses_a_stray_dropin_with_no_fragment() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    write_dropin(guard.id()); // no unit file installed at all
+
+    let mgr = Systemd::new();
+    let outcome = mgr
+        .install(&mk(guard.id()), false)
+        .expect("install over a stray drop-in");
+    assert!(
+        matches!(outcome, Outcome::RefuseForeign { .. }),
+        "a drop-in with no fragment must not be silently adopted as Create, got {outcome:?}"
+    );
+    assert!(!unit_path(guard.id()).exists(), "no fragment must be written");
 }
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -274,4 +335,64 @@ fn unelevated_list_works() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains(guard.id()), "stdout:\n{stdout}");
+}
+
+// Obligation 5: parent directories ====================================================================================
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn install_creates_and_owns_fresh_cwd_and_logs_dirs_for_a_named_user() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let base = std::env::temp_dir().join(format!("{}-parent-dirs", guard.id()));
+    let cwd = base.join("work");
+    let logs = base.join("logs").join("out.log");
+    let _rm = RmDirAll(base.clone());
+
+    let mut spec = mk(guard.id());
+    spec.user = User::Name("nobody".to_string());
+    spec.cwd = Some(cwd.clone());
+    spec.logs = Some(logs.clone());
+
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+
+    let nobody_uid = uid_of("nobody");
+    for dir in [cwd.as_path(), logs.parent().unwrap()] {
+        let meta = fs::metadata(dir).unwrap_or_else(|e| panic!("stat {}: {e}", dir.display()));
+        assert!(meta.is_dir(), "{} must exist and be a directory", dir.display());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o755, "{}: mode", dir.display());
+        assert_eq!(meta.uid(), nobody_uid, "{}: owner", dir.display());
+    }
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn install_refuses_a_preexisting_cwd_the_target_account_cannot_write() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let cwd = std::env::temp_dir().join(format!("{}-preexisting-cwd", guard.id()));
+    fs::create_dir(&cwd).unwrap_or_else(|e| panic!("mkdir {}: {e}", cwd.display()));
+    fs::set_permissions(&cwd, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    let _rm = RmDirAll(cwd.clone());
+
+    let mut spec = mk(guard.id());
+    spec.user = User::Name("nobody".to_string());
+    spec.cwd = Some(cwd.clone());
+
+    let mgr = Systemd::new();
+    let err = mgr
+        .install(&spec, false)
+        .expect_err("install must refuse a cwd the target account cannot write");
+    assert!(err.to_string().contains("not writable"), "{err}");
+
+    let meta = fs::metadata(&cwd).expect("stat");
+    assert_eq!(
+        meta.permissions().mode() & 0o777,
+        0o700,
+        "a pre-existing directory's mode must not be widened, even on refusal"
+    );
+    assert_eq!(
+        meta.uid(),
+        0,
+        "a pre-existing directory's owner must not be reassigned, even on refusal"
+    );
 }

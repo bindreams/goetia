@@ -1,6 +1,6 @@
 use super::*;
 
-/// `#[cfg]`-gated off Linux since Task 11 gave it a real backend — see
+/// `#[cfg]`-gated off Linux, which now has a real backend — see
 /// `native_succeeds_on_linux` below for that platform's equivalent.
 #[cfg(not(target_os = "linux"))]
 #[skuld::test]
