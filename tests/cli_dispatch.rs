@@ -1,11 +1,13 @@
 //! CLI behavior tests that need a working `ServiceManager`.
 //!
-//! `native()` errors on every platform until Tasks 11-13 land (see
-//! `goetia::cli`'s module doc comment), so these run `goetia::cli::dispatch`
-//! in-process against `goetia::manager::fake::Fake`, injected exactly the way
-//! `main.rs` injects `native()` — through `dispatch`'s `get_manager`
-//! parameter. Tests that need no manager at all run the real compiled binary
-//! instead; see `tests/cli_binary.rs`.
+//! `native()` errors on every platform without a backend yet (see
+//! `goetia::cli`'s module doc comment — Linux has one), so these run
+//! `goetia::cli::dispatch` in-process against
+//! `goetia::manager::fake::Fake`, injected exactly the way `main.rs` injects
+//! `native()` — through `dispatch`'s `get_manager` parameter, so these tests
+//! stay platform-independent regardless of which real backends exist. Tests
+//! that need no manager at all run the real compiled binary instead; see
+//! `tests/cli_binary.rs`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

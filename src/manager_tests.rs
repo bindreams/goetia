@@ -1,8 +1,9 @@
 use super::*;
 
-/// Linux has no backend yet (Task 11); macOS and Windows do, as of Tasks 12
-/// and 13 — see [`native_returns_the_launchd_backend`]/
-/// [`native_returns_a_working_backend_on_windows`].
+/// All three supported platforms now have a real backend, so this only has
+/// something to assert on other targets — see the three per-platform tests
+/// below for the supported ones.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 #[skuld::test]
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn native_names_the_missing_backend() {
@@ -21,6 +22,12 @@ fn native_names_the_missing_backend() {
         "message should name the running platform ({}): {message}",
         std::env::consts::OS
     );
+}
+
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn native_succeeds_on_linux() {
+    native().unwrap_or_else(|e| panic!("native() should return a real backend on linux, got: {e}"));
 }
 
 #[skuld::test]

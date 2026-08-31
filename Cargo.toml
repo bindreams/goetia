@@ -100,6 +100,11 @@ path = "tests/cli_binary.rs"
 harness = false
 
 [[test]]
+name = "systemd_integration"
+path = "tests/systemd_integration.rs"
+harness = false
+
+[[test]]
 name = "launchd_integration"
 path = "tests/launchd_integration.rs"
 harness = false

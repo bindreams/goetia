@@ -45,41 +45,35 @@ fn write_manifest(dir: &Path, yaml: &str) {
 
 /// `goetia daemon list` needs no elevation but does need a manager, so it is
 /// the cleanest proof that the real binary is wired to
-/// `goetia::manager::native()` and not to the fake: on every platform but
-/// macOS/Windows, that means it fails with `native()`'s exact message rather
-/// than panicking.
+/// `goetia::manager::native()` and not to the fake: on a platform with no
+/// backend, that means failing with `native()`'s exact message rather than
+/// panicking.
 #[skuld::test]
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn unimplemented_backend_names_the_platform_not_a_panic() {
     let dir = tempfile::tempdir().unwrap();
 
     let (code, out, err) = run_cli(&["daemon", "list"], dir.path());
 
-    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(
+        code, 1,
+        "stdout:
+{out}
+stderr:
+{err}"
+    );
     let expected = format!("no backend for {} yet", std::env::consts::OS);
     assert!(err.contains(&expected), "stderr should name the missing backend: {err}");
 }
 
-/// macOS's counterpart: `goetia daemon list` is wired to a real
-/// `LaunchdManager`, so it must succeed (and needs no elevation — it only
-/// reads the filesystem) rather than report a missing backend.
+/// On every supported platform, `goetia daemon list` reaches a real manager
+/// and needs no elevation. The proof of correct wiring is the *absence* of
+/// `native()`'s "no backend" message, which only a genuinely unwired manager
+/// produces — the fake would also exit 0 here, so this rules out exactly the
+/// one wrong wiring this module exists to catch.
 #[skuld::test]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn native_backend_answers_list_unelevated() {
-    let dir = tempfile::tempdir().unwrap();
-
-    let (code, out, err) = run_cli(&["daemon", "list"], dir.path());
-
-    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
-    assert!(!err.contains("no backend"), "stderr:\n{err}");
-}
-
-/// Windows' counterpart: `goetia daemon list` is wired to a real
-/// `ScmManager`, so it must succeed (and needs no elevation — it only reads
-/// the registry) rather than report a missing backend.
-#[skuld::test]
-#[cfg(target_os = "windows")]
-fn native_backend_answers_list_unelevated_on_windows() {
     let dir = tempfile::tempdir().unwrap();
 
     let (code, out, err) = run_cli(&["daemon", "list"], dir.path());

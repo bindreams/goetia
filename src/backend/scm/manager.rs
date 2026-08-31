@@ -126,6 +126,11 @@ impl ServiceManager for ScmManager {
             spec,
             crate::version(),
             force,
+            // SCM has no drop-in mechanism: everything Goetia writes lives
+            // under the service's own key. See `env_is_outside_the_compared
+            // _surface` in the module docs for the one value that is not yet
+            // in `render()`'s surface.
+            false,
         );
         match outcome {
             Outcome::Create | Outcome::Update { .. } | Outcome::Stale { .. } => {
@@ -146,6 +151,8 @@ impl ServiceManager for ScmManager {
             &d.desired,
             spec,
             crate::version(),
+            false,
+            // SCM has no drop-in mechanism; see the `install` call site.
             false,
         ))
     }

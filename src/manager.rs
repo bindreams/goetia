@@ -12,12 +12,10 @@
 pub mod conformance;
 pub mod fake;
 
-// `Error::UnsupportedPlatform` is only referenced by the arms of `native()`
-// that still return it (Linux, and the catch-all "other" arm) — macOS and
-// Windows each return a real `ServiceManager` from their own arm now, so
-// gating keeps a macOS-only or Windows-only build from warning about an
-// unused import.
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+// All three supported platforms now return a real `ServiceManager`, so
+// `Error::UnsupportedPlatform` is referenced only by the catch-all arm.
+// Gating the import keeps every supported target from warning about it.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 use crate::error::Error;
 use crate::error::Result;
 use crate::spec::{DaemonSpec, Id};
@@ -143,19 +141,15 @@ pub enum State {
 
 /// The platform's [`ServiceManager`] implementation.
 ///
-/// macOS's arm returns
-/// [`backend::launchd::manager::LaunchdManager`](crate::backend::launchd::manager::LaunchdManager);
-/// Windows' returns
-/// [`backend::scm::manager::ScmManager`](crate::backend::scm::manager::ScmManager).
-/// Linux's arm (Task 11 not yet landed here) returns
-/// [`Error::UnsupportedPlatform`] rather than panicking — a CLI user gets a
-/// diagnosable message ("no backend for linux yet"), not a crash.
+/// Linux returns [`Systemd`](crate::backend::systemd::manager::Systemd),
+/// macOS [`LaunchdManager`](crate::backend::launchd::manager::LaunchdManager),
+/// Windows [`ScmManager`](crate::backend::scm::manager::ScmManager). Any other
+/// target returns [`Error::UnsupportedPlatform`] rather than panicking, so a
+/// CLI user gets a diagnosable message instead of a crash.
 pub fn native() -> Result<Box<dyn ServiceManager>> {
     #[cfg(target_os = "linux")]
     {
-        Err(Error::UnsupportedPlatform {
-            platform: "linux".to_string(),
-        })
+        Ok(Box::new(crate::backend::systemd::manager::Systemd::new()))
     }
     #[cfg(target_os = "macos")]
     {

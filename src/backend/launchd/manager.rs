@@ -588,6 +588,10 @@ impl ServiceManager for LaunchdManager {
             spec,
             crate::version(),
             force,
+            // launchd has no drop-in or override mechanism that alters a job
+            // without touching its plist. Enablement lives in the plist's
+            // *directory*, which is deliberately outside the compared surface.
+            false,
         );
 
         match &outcome {
@@ -667,6 +671,8 @@ impl ServiceManager for LaunchdManager {
             &desired,
             spec,
             crate::version(),
+            false,
+            // launchd has no drop-in mechanism; see the `install` call site.
             false,
         ))
     }
