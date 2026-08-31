@@ -101,7 +101,7 @@ use crate::blob::Blob;
 use crate::decide::{self, Outcome, Ownership};
 use crate::error::{Error, Result};
 use crate::manager::{Installed, ServiceManager, State, Status};
-use crate::spec::{DaemonSpec, Id, User, Warning};
+use crate::spec::{DaemonSpec, Id, Kind, User, Warning};
 
 // ScmManager ==========================================================================================================
 
@@ -607,7 +607,26 @@ fn apply(
 /// way.)
 fn reapply_uncompared_effects(spec: &DaemonSpec, reg: &ScmRegistration) -> Result<()> {
     apply_failure_actions(&reg.name, reg.failure_actions.as_ref())?;
-    registry::write_environment(&reg.name, &spec.env)?;
+    // `Services\<name>\Environment` is applied by SCM to the *service host*
+    // process — the daemon itself for `Kind::Managed`, but `goetia-shim.exe`
+    // for `Kind::Simple` (see `generate::registration`'s `Kind::Simple` arm:
+    // SCM only ever launches the shim). Writing `spec.env` here for
+    // `Kind::Simple` would leak the daemon's configured environment into
+    // the SHIM's own process instead of the daemon's — pointless on its
+    // own (the shim already applies `spec.env` to the child it spawns, in
+    // `src/bin/shim/service.rs`'s `build_command`), and actively harmful if
+    // an `env:` key happens to collide with something the shim or its
+    // `cosca` dependency reads from its own environment (e.g. `cosca`'s
+    // reserved `__COSCA_GROUP_ROOT` nesting marker, which would silently
+    // downgrade the shim's own process-tree containment). An empty map for
+    // `Kind::Simple` makes `write_environment` delete any existing value
+    // rather than write one, so an id whose `type:` flips from `managed`
+    // to `simple` still converges.
+    let env_for_host = match spec.kind {
+        Kind::Managed => spec.env.clone(),
+        Kind::Simple => BTreeMap::new(),
+    };
+    registry::write_environment(&reg.name, &env_for_host)?;
     if let Some(account) = &reg.account {
         identity::grant_service_logon_right(account)?;
     }

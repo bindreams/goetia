@@ -56,8 +56,8 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
     assert!(matches!(outcome, WaitOutcome::Stopping));
 
     // The child must actually be dead by now (the whole point of the call
-    // returning `Stopping` only after `kill_tree`/`wait_tree` confirm it),
-    // not merely have unblocked the wait.
+    // returning `Stopping` only after `kill_tree` confirms it), not merely
+    // have unblocked the wait.
     let status = child
         .wait_timeout(Duration::ZERO)
         .expect("query the child's exit status");
@@ -65,4 +65,46 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
         status.is_some(),
         "child is still alive after wait_for_child_or_stop returned Stopping"
     );
+}
+
+#[skuld::test]
+fn wait_for_child_or_stop_returns_child_exited_when_the_child_exits_on_its_own() {
+    let mut cmd = cosca::run(["powershell", "-NoProfile", "-NonInteractive", "-Command", "exit 0"]);
+    cmd.contain();
+    let child = cmd.spawn().expect("spawn a short-lived child");
+    let bus = StopBus::new();
+
+    // No stop requested: the child exiting on its own is the only wakeup
+    // source, so this blocks only as long as the child itself takes to
+    // start and exit.
+    let outcome = bus.wait_for_child_or_stop(
+        &child,
+        "wait_for_child_or_stop_returns_child_exited_when_the_child_exits_on_its_own",
+    );
+    assert!(matches!(outcome, WaitOutcome::ChildExited));
+}
+
+#[skuld::test]
+fn wait_or_stop_returns_true_when_a_stop_is_requested_before_the_delay_elapses() {
+    let bus = StopBus::new();
+    // A 30s delay against an essentially-instant `request_stop()` call from
+    // another thread proves the composite `Condvar::wait_timeout_while`
+    // wakes on the stop rather than merely on the (much longer) timeout —
+    // the delay itself is not a synchronization mechanism this test relies
+    // on completing.
+    let stopped_early = std::thread::scope(|scope| {
+        scope.spawn(|| bus.request_stop());
+        bus.wait_or_stop(Duration::from_secs(30))
+    });
+    assert!(stopped_early, "wait_or_stop did not observe the stop request");
+}
+
+#[skuld::test]
+fn wait_or_stop_returns_false_when_the_delay_elapses_with_no_stop() {
+    let bus = StopBus::new();
+    // Real elapsed time here is the behavior under test — `wait_or_stop`'s
+    // whole contract is "wait up to `delay`" — not a stand-in for a missing
+    // signal.
+    let stopped = bus.wait_or_stop(Duration::from_millis(50));
+    assert!(!stopped, "wait_or_stop reported a stop that was never requested");
 }

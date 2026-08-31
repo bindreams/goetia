@@ -19,13 +19,9 @@ use goetia::spec::Restart;
 // Constants ===========================================================================================================
 
 /// The delay `goetia-shim` waits before respawning when `goetia.yaml` sets
-/// no `restart-delay`. Matches
-/// `backend::scm::generate::DEFAULT_RESTART_DELAY`, the identical knob for
-/// `type: managed`'s SCM recovery actions, and for the identical reason
-/// documented there: long enough that a child that dies instantly on start
-/// (a missing binary, a port already in use) does not spin at full CPU
-/// retrying every microsecond, short enough that a benign flap recovers
-/// quickly.
+/// no `restart-delay`. Matches `backend::scm::generate::DEFAULT_RESTART_DELAY`,
+/// the identical knob for `type: managed`'s SCM recovery actions, for the
+/// identical reason documented there.
 ///
 /// Reconciled against the two native defaults this project's other
 /// backends inherit rather than choose: systemd's `RestartSec=` defaults to

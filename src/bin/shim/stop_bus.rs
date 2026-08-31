@@ -64,10 +64,10 @@ impl StopBus {
         self.state.lock().expect("StopBus mutex poisoned").stopping
     }
 
-    /// Block until `child` exits or a stop is requested, returning which.
-    /// On a stop, also tears the whole contained tree down (`kill_tree` then
-    /// `wait_tree`, confirming via its real kernel drain edge that every
-    /// member — not only the direct child — has exited) before returning.
+    /// Block until `child` exits or a stop is requested, returning which. On
+    /// a stop, also tears the whole contained tree down (`kill_tree`, with
+    /// a fallback to killing just the direct child — see below) before
+    /// returning.
     ///
     /// **Why the teardown happens here, inside this call, rather than in the
     /// caller after it returns.** A background thread performs the real,
@@ -84,6 +84,29 @@ impl StopBus {
     /// Performing the kill from inside the scope, before the closure's
     /// return value is produced, is what lets the background thread's wait
     /// actually resolve.
+    ///
+    /// **`kill_tree` can itself fail to kill anything** — `Err(Unsupported)`
+    /// when this child holds no actionable containment mechanism (e.g. a
+    /// nested/`Delegated` child, or one whose containment setup failed
+    /// outright). That is exactly the same deadlock at one remove: if
+    /// nothing kills the child, the background thread's `wait()` still
+    /// never returns. `child.kill()` — the direct process handle, no
+    /// containment required — is the fallback that keeps this call
+    /// returning regardless; it cannot reach any of the child's own
+    /// descendants, so a `kill_tree` failure genuinely does mean a reduced
+    /// guarantee (root killed, tree possibly not), not merely a doc
+    /// footnote, but it is always logged, and it is never a hang.
+    ///
+    /// **No `wait_tree` call after `kill_tree` succeeds.** `cosca`'s Job
+    /// Object `hard_kill` (what `kill_tree` calls) closes the job handle as
+    /// part of terminating it, so a subsequent `wait_tree` always fails
+    /// with "the job handle was already closed" — not because anything is
+    /// still running. `TerminateJobObject`, which `hard_kill` issues, is
+    /// itself synchronous per its documented Win32 contract (every member
+    /// of the job is already terminated by the time the call returns), so
+    /// `kill_tree`'s own `Ok(())` already is the confirmation; a follow-up
+    /// `wait_tree` would only ever produce a spurious logged failure on
+    /// every ordinary successful stop.
     pub fn wait_for_child_or_stop(&self, child: &Child, id: &str) -> WaitOutcome {
         {
             let mut g = self.state.lock().expect("StopBus mutex poisoned");
@@ -91,14 +114,20 @@ impl StopBus {
         }
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                // Best-effort: a wait failure here still lets the outer
-                // `Condvar` wake on `stopping` if one was also requested: it
-                // will not spuriously look like a completed child.
-                if child.wait().is_ok() {
-                    let mut g = self.state.lock().expect("StopBus mutex poisoned");
-                    g.child_done = true;
-                    self.cvar.notify_all();
+                // Notified on *both* `Ok` and `Err`: an `Err` here means the
+                // wait mechanism itself failed, which says nothing about
+                // whether the child is still running — it is not evidence
+                // to keep waiting on, and staying silent would leave the
+                // outer `Condvar::wait_while` below with no further waker
+                // at all in the (ordinary, no-stop-requested) case, hanging
+                // the supervisor loop forever on a child that may already
+                // be gone.
+                if let Err(e) = child.wait() {
+                    logging::log_failure(id, &format!("background wait on child: {e}"));
                 }
+                let mut g = self.state.lock().expect("StopBus mutex poisoned");
+                g.child_done = true;
+                self.cvar.notify_all();
             });
             let g = self.state.lock().expect("StopBus mutex poisoned");
             let g = self
@@ -108,20 +137,26 @@ impl StopBus {
             if !g.stopping {
                 return WaitOutcome::ChildExited;
             }
-            // Release the lock before calling into `child` — neither
-            // `kill_tree` nor `wait_tree` needs it, and holding it across a
-            // kernel wait would block `is_stopping()`/`request_stop()`
-            // callers (e.g. a second, redundant SCM stop control) for no
-            // reason.
+            // Release the lock before calling into `child` — `kill_tree`/
+            // `kill` need it not, and holding it across a kernel call would
+            // block `is_stopping()`/`request_stop()` callers (e.g. a
+            // second, redundant SCM stop control) for no reason.
             drop(g);
             if let Err(e) = child.kill_tree() {
-                logging::log_failure(id, &format!("kill_tree on stop: {e}"));
-            }
-            if let Err(e) = child.wait_tree() {
-                logging::log_failure(id, &format!("wait_tree confirming stop: {e}"));
+                logging::log_failure(
+                    id,
+                    &format!(
+                        "kill_tree on stop: {e}; falling back to killing the direct child only (its own \
+                         descendants, if any, cannot be reached without a containment mechanism)"
+                    ),
+                );
+                if let Err(e2) = child.kill() {
+                    logging::log_failure(id, &format!("fallback kill on stop: {e2}"));
+                }
             }
             // The background thread's `child.wait()` above can now return
-            // (the tree is dead), so the scope below can join it.
+            // (the child is dead, or `kill_tree`/`kill` at least tried and
+            // logged why not), so the scope below can join it.
             WaitOutcome::Stopping
         })
     }
