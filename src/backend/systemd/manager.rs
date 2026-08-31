@@ -299,14 +299,21 @@ impl ServiceManager for Systemd {
 
             match generate::extract(&text) {
                 Ok(None) => {} // foreign: `list` reports only what Goetia owns.
-                Ok(Some(blob)) => {
-                    let status = status_from_unit(&unit_name(id))?;
-                    out.push(Installed::Ours {
+                // A `systemctl show` failure for this one unit must not take down the listing of
+                // every other Goetia-managed service on the host — the same per-entry fault
+                // tolerance the decode-failure arm just below already provides, extended to a
+                // status-query failure instead of a marker-decode failure.
+                Ok(Some(blob)) => match status_from_unit(&unit_name(id)) {
+                    Ok(status) => out.push(Installed::Ours {
                         spec: blob.spec,
                         state: status.state,
                         enabled: status.enabled,
-                    });
-                }
+                    }),
+                    Err(e) => out.push(Installed::OursUnreadable {
+                        name: id.to_string(),
+                        reason: format!("decoded, but its live state could not be queried: {e}"),
+                    }),
+                },
                 Err(e) => out.push(Installed::OursUnreadable {
                     name: id.to_string(),
                     reason: e.to_string(),

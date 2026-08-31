@@ -4,7 +4,7 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::Path;
 use std::process::Command;
 
@@ -34,12 +34,11 @@ pub(super) fn ensure_parent_dirs(spec: &DaemonSpec) -> Result<()> {
 /// call actually creates. `spec.cwd`/`logs` are user-supplied absolute paths with no restriction to a
 /// Goetia-owned root, so reassigning mode/ownership unconditionally — including when `dir` or an
 /// ancestor already existed — would let a manifest silently widen or reassign an arbitrary existing
-/// system directory (`/var/log`, `/etc`, another user's home). A directory that already existed is
-/// left exactly as it was; if the target account cannot write it, that is reported as an error
-/// instead.
+/// system directory (`/var/log`, `/etc`, another user's home). A directory that already existed (or
+/// that a concurrent, racing install created first — see the loop below) is left exactly as it was;
+/// it is verified to actually be a directory, and that the target account can write it, and either
+/// failure is reported as an error instead of silently accepted or silently widened.
 pub(super) fn ensure_writable_dir(dir: &Path, user: &User) -> Result<()> {
-    let dir_preexisted = fs::symlink_metadata(dir).is_ok();
-
     let mut missing = Vec::new();
     let mut cursor = dir;
     loop {
@@ -57,13 +56,30 @@ pub(super) fn ensure_writable_dir(dir: &Path, user: &User) -> Result<()> {
     }
 
     let owner = chown_target(user);
+    // Whether *this call* is the one that actually created `dir` itself (as opposed to every
+    // ancestor above it, or `dir` already existing, or a concurrent racing install creating it
+    // first — see the `AlreadyExists` arm below). Only then do the post-loop checks get skipped:
+    // anything else means this call did not create `dir`, which is exactly the condition the
+    // do-not-touch-an-existing-directory rule above is about.
+    let mut created_dir = false;
     // Outermost-first, so each `create_dir` always has an existing parent.
     for path in missing.into_iter().rev() {
-        match fs::create_dir(path) {
+        // The mode is set atomically with creation (`DirBuilder`, not a separate `set_permissions`
+        // after a default `mkdir`) so the directory is never briefly `0777`-minus-umask — under a
+        // permissive umask (e.g. `000`, common in some CI/root contexts) a plain `create_dir` +
+        // later `chmod` would leave it world-writable for the duration in between, letting any local
+        // user plant a file or symlink in what is about to become a daemon's `cwd`/log directory.
+        // `mkdir`'s mode argument is itself still umask-masked, so the explicit `chmod` after
+        // creation remains necessary to guarantee exactly 0755 regardless of umask — the ordering
+        // change here only ever narrows the window, from "up to 0777" down to "at most 0755".
+        match fs::DirBuilder::new().mode(0o755).create(path) {
             Ok(()) => {
                 fs::set_permissions(path, fs::Permissions::from_mode(0o755)).map_err(|e| io_err("chmod", path, e))?;
                 if let Some(owner) = &owner {
                     chown(path, owner)?;
+                }
+                if path == dir {
+                    created_dir = true;
                 }
             }
             // Two installs sharing a parent directory (e.g. two daemons both under `logs:
@@ -75,7 +91,15 @@ pub(super) fn ensure_writable_dir(dir: &Path, user: &User) -> Result<()> {
         }
     }
 
-    if dir_preexisted {
+    if !created_dir {
+        let meta = fs::metadata(dir).map_err(|e| io_err("stat", dir, e))?;
+        if !meta.is_dir() {
+            return Err(Error::Other(format!(
+                "{} already exists and is not a directory; goetia cannot use it as a daemon's cwd \
+                 or as its log directory",
+                dir.display()
+            )));
+        }
         verify_writable_by(dir, user)?;
     }
     Ok(())

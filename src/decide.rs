@@ -118,11 +118,7 @@ pub fn foreign_recovery(id: &str) -> String {
 ///   precedence question answered, and answering it here — once — is what
 ///   keeps that precedence from being reinvented per backend. It changes
 ///   only one thing: a stale artifact that also carries a foreign overlay is
-///   `Conflict`, not a silently-regenerated `Stale` — seeing `on_disk`
-///   requires a text comparison, and the version check below runs before
-///   any text comparison happens, so without this the overlay would be
-///   silently destroyed exactly the version-bump case obligation "drop-ins
-///   are drift" (systemd backend) exists to catch.
+///   `Conflict`, not a silently-regenerated `Stale`.
 ///
 /// For `Ownership::Ours`, the three-way comparison this needs is: does
 /// `on_disk` match `desired` (nothing to do), does it match

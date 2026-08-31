@@ -3,16 +3,17 @@
 
 use std::fs;
 use std::io;
+use std::path::Path;
 
 use crate::backend::systemd::generate;
 use crate::decide::Ownership;
 use crate::error::{Error, Result};
 
-use super::{dropin_dir, identity_for, io_err, unit_path};
+use super::{UNIT_DIR, identity_for, io_err, unit_path};
 
-// RawState / raw_state ================================================================================================
+// RawState / raw_state / classify_and_read ============================================================================
 
-/// What's physically present at `id`'s unit path, before any interpretation of its content.
+/// What's physically present at a path, before any interpretation of its content.
 pub(super) enum RawState {
     Absent,
     /// A symlink (a masked unit) or any other non-regular file — obligation 2. Its contents are never
@@ -25,42 +26,52 @@ pub(super) enum RawState {
 /// `O_NOFOLLOW`, hardcoded rather than pulled from a dependency: this file is already
 /// `#[cfg(target_os = "linux")]`-only (via its parent), and the value is part of the stable Linux
 /// syscall ABI (`asm-generic/fcntl.h`), identical across every architecture Rust supports for this
-/// target.
+/// target (confirmed: `0o400_000` == asm-generic's `00400000` == SPARC's `0x20000`).
 const O_NOFOLLOW: i32 = 0o400_000;
-/// `ELOOP`, the `errno` `open(2)` reports for `O_NOFOLLOW` against a symlink — likewise part of the
-/// stable Linux ABI (`asm-generic/errno.h`).
-const ELOOP: i32 = 40;
 
-/// Classify and read `id`'s unit path from a single open file handle, rather than a separate `lstat`
-/// followed by a separate open-and-read: two syscalls resolving the same path independently is its
-/// own TOCTOU gap (the file the `lstat` classified need not be the file the read later opens), and
-/// they disagreed on top of that — the read implicitly followed a symlink the `lstat` deliberately
-/// did not. `O_NOFOLLOW` makes the *open itself* the classification: it fails with `ELOOP` for a
-/// symlink (a masked unit — obligation 2) exactly where a plain open would have silently followed it
-/// through to `/dev/null`.
-pub(super) fn raw_state(id: &str) -> Result<RawState> {
+/// Classify and read `path` from a single open file handle, rather than a separate `lstat` followed
+/// by a separate open-and-read: two syscalls resolving the same path independently is its own TOCTOU
+/// gap (the file the `lstat` classified need not be the file the read later opens), and a plain
+/// second open would additionally disagree by silently following a symlink the `lstat` deliberately
+/// did not. `O_NOFOLLOW` makes the *open itself* the classification: it fails for a symlink (a masked
+/// unit — obligation 2) exactly where a plain open would have silently followed it through to
+/// `/dev/null`. Shared by `raw_state` (the fragment) and `super::write::quarantine_if_still_ours`
+/// (the quarantined former occupant), which both need this identical classify-before-read discipline.
+///
+/// The failure `open` reports for a symlink is deliberately *not* checked by its numeric `errno`
+/// value: `ELOOP` is 40 on the Linux ABI most architectures share, but not on MIPS, whose errno table
+/// is SysV-derived (40 is `EL3RST` there; `ELOOP` is 90) — trusting the wrong number there would
+/// treat a masked unit as an unclassifiable I/O error instead of `NonRegular`. `lstat`-ing the path in
+/// the catch-all arm instead is architecture-independent, and is the same rule this function already
+/// applies via `O_NOFOLLOW` for the case that succeeds.
+pub(super) fn classify_and_read(path: &Path) -> Result<RawState> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
-    let path = unit_path(id);
-    let file = match fs::OpenOptions::new().read(true).custom_flags(O_NOFOLLOW).open(&path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(RawState::Absent),
-        Err(e) if e.raw_os_error() == Some(ELOOP) => return Ok(RawState::NonRegular),
-        Err(e) => return Err(io_err("open", &path, e)),
-    };
-
-    let meta = file.metadata().map_err(|e| io_err("stat", &path, e))?;
-    if !meta.is_file() {
-        // Some other non-regular file `O_NOFOLLOW` still let through (a FIFO, a device node): never
-        // read through it, same as a masked unit.
-        return Ok(RawState::NonRegular);
+    match fs::OpenOptions::new().read(true).custom_flags(O_NOFOLLOW).open(path) {
+        Ok(file) => {
+            let meta = file.metadata().map_err(|e| io_err("stat", path, e))?;
+            if !meta.is_file() {
+                // Some other non-regular file `O_NOFOLLOW` still let through (a FIFO, a device
+                // node): never read through it, same as a masked unit.
+                return Ok(RawState::NonRegular);
+            }
+            let text = std::io::read_to_string(&file).map_err(|e| io_err("read", path, e))?;
+            Ok(RawState::Regular(text))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(RawState::Absent),
+        Err(_) => match fs::symlink_metadata(path) {
+            Ok(_) => Ok(RawState::NonRegular),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(RawState::Absent),
+            Err(e) => Err(io_err("stat", path, e)),
+        },
     }
-
-    let text = std::io::read_to_string(&file).map_err(|e| io_err("read", &path, e))?;
-    Ok(RawState::Regular(text))
 }
 
-// Discovery / discover =================================================================================================
+pub(super) fn raw_state(id: &str) -> Result<RawState> {
+    classify_and_read(&unit_path(id))
+}
+
+// Discovery / discover ================================================================================================
 
 /// What `install`/`preview_install` classified at `id`: an [`Ownership`] plus everything specific to
 /// this backend that `decide` cannot see on its own.
@@ -73,11 +84,11 @@ pub(super) struct Discovery {
     /// verify identity before a later write/removal touches this exact fragment; see
     /// `super::write::quarantine_if_still_ours`. Content, not inode, is the identity that matters
     /// here: an inode number can be reused by the kernel moments after its file is unlinked, so two
-    /// genuinely different files can share one — verified empirically triggering the false-positive
-    /// this would otherwise cause.
+    /// genuinely different files can share one.
     pub(super) fragment_text: Option<String>,
-    /// Whether `<id>.service.d/` currently holds any `*.conf` file — obligation 3. `decide` cannot
-    /// see this: its vocabulary is artifact *text*, and this is filesystem structure alongside it.
+    /// Whether any of systemd's drop-in search directories currently hold a `<id>.service.d/*.conf`
+    /// file for this id — obligation 3. `decide` cannot see this: its vocabulary is artifact *text*,
+    /// and this is filesystem structure alongside it.
     pub(super) dropin_present: bool,
 }
 
@@ -143,18 +154,35 @@ pub(super) fn discover(id: &str) -> Result<Discovery> {
     }
 }
 
-// dropin_marker ========================================================================================================
+// dropin_marker =======================================================================================================
+
+/// The three directories systemd's unit load path searches for `<id>.service.d/*.conf` drop-ins
+/// (`systemd.unit(5)`): `/etc` overrides `/run` overrides `/usr/lib`, but all three apply
+/// simultaneously — a unit's *effective* configuration is the merge of every one of them, regardless
+/// of which directory holds the fragment itself. `systemctl edit --runtime` — one flag away from the
+/// plain `systemctl edit` the design cites — writes into the `/run` copy, not `/etc`. Goetia only
+/// ever writes into the first of these (`UNIT_DIR`); the other two are read-only from this backend's
+/// point of view, so a drop-in found there is detected (folded into `on_disk`, so `decide` reports
+/// drift) but never removed by a successful write — only `UNIT_DIR`'s own copy is goetia's to clear.
+const DROPIN_SEARCH_DIRS: [&str; 3] = [UNIT_DIR, "/run/systemd/system", "/usr/lib/systemd/system"];
 
 /// A deterministic representation of `<id>.service.d`'s `*.conf` files — the only ones
-/// `systemd.unit(5)` reads as drop-ins — or `None` if the directory does not exist or holds none.
+/// `systemd.unit(5)` reads as drop-ins — across every directory systemd's unit load path searches, or
+/// `None` if none of them exist or hold any.
 pub(super) fn dropin_marker(id: &str) -> Result<Option<String>> {
-    let dir = dropin_dir(id);
-    let mut entries = match fs::read_dir(&dir) {
-        Ok(rd) => rd
-            .collect::<io::Result<Vec<_>>>()
-            .map_err(|e| io_err("read", &dir, e))?,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(io_err("read", &dir, e)),
+    let mut marker = String::new();
+    for search_dir in DROPIN_SEARCH_DIRS {
+        let dir = Path::new(search_dir).join(format!("{id}.service.d"));
+        marker.push_str(&dropin_marker_in(&dir)?);
+    }
+    Ok(if marker.is_empty() { None } else { Some(marker) })
+}
+
+fn dropin_marker_in(dir: &Path) -> Result<String> {
+    let mut entries = match fs::read_dir(dir) {
+        Ok(rd) => rd.collect::<io::Result<Vec<_>>>().map_err(|e| io_err("read", dir, e))?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(e) => return Err(io_err("read", dir, e)),
     };
     entries.sort_by_key(std::fs::DirEntry::file_name);
 
@@ -183,15 +211,12 @@ pub(super) fn dropin_marker(id: &str) -> Result<Option<String>> {
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => return Err(io_err("read", &path, e)),
         };
-        marker.push_str(&format!(
-            "\n# --- drop-in: {} ---\n{content}",
-            file_name.to_string_lossy()
-        ));
+        marker.push_str(&format!("\n# --- drop-in: {} ---\n{content}", path.display()));
     }
-    Ok(if marker.is_empty() { None } else { Some(marker) })
+    Ok(marker)
 }
 
-// require_installed ====================================================================================================
+// require_installed ===================================================================================================
 
 /// The narrower "is this even ours" gate every verb but `install` needs: the marker alone is proof of
 /// ownership, matching [`crate::manager::fake::Fake`]'s `require_ours` (an undecodable blob still

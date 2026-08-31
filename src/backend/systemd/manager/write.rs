@@ -10,9 +10,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, Result};
 
+use super::discover::{RawState, classify_and_read};
 use super::{UNIT_DIR, io_err, remove_file_if_present, unit_path};
 
-// CreateOutcome / create_unit ==========================================================================================
+// CreateOutcome / create_unit =========================================================================================
 
 pub(super) enum CreateOutcome {
     Created,
@@ -37,7 +38,7 @@ pub(super) fn create_unit(id: &str, text: &str) -> Result<CreateOutcome> {
     }
 }
 
-// ReplaceOutcome / replace_unit_verified ===============================================================================
+// ReplaceOutcome / replace_unit_verified ==============================================================================
 
 pub(super) enum ReplaceOutcome {
     Replaced,
@@ -69,10 +70,7 @@ pub(super) fn replace_unit_verified(id: &str, text: &str, expected_text: &str) -
     // already-installed service into a silent uninstall.
     let tmp = match write_temp_unit(id, text) {
         Ok(tmp) => tmp,
-        Err(e) => {
-            restore_quarantine(&backup_path, &final_path)?;
-            return Err(e);
-        }
+        Err(e) => return Err(restore_or_chain(&backup_path, &final_path, e)),
     };
 
     match tmp.persist_noclobber(&final_path) {
@@ -94,14 +92,29 @@ pub(super) fn replace_unit_verified(id: &str, text: &str, expected_text: &str) -
                 final_path.display(),
             )))
         }
-        Err(e) => {
-            restore_quarantine(&backup_path, &final_path)?;
-            Err(io_err("replace", &final_path, e.error))
-        }
+        Err(e) => Err(restore_or_chain(
+            &backup_path,
+            &final_path,
+            io_err("replace", &final_path, e.error),
+        )),
     }
 }
 
-// quarantine_if_still_ours / restore_quarantine ========================================================================
+/// Restore the quarantined original before reporting `primary` — unless the restore *itself* fails,
+/// in which case both failures are folded into one message rather than letting the restore's own
+/// error silently replace `primary` (a real, reachable double failure: an out-of-space device can
+/// fail both the original write and the subsequent `link`-based restore in the same call).
+fn restore_or_chain(backup_path: &Path, final_path: &Path, primary: Error) -> Error {
+    match restore_quarantine(backup_path, final_path) {
+        Ok(()) => primary,
+        Err(restore_err) => Error::Other(format!(
+            "{primary}; additionally, restoring the quarantined original at {} failed: {restore_err}",
+            backup_path.display()
+        )),
+    }
+}
+
+// quarantine_if_still_ours / restore_quarantine =======================================================================
 
 /// Rename `unit_path(id)` to a private, per-attempt-unique backup name, then confirm the moved file's
 /// content is still exactly `expected_text` — the same content `discover`/`require_installed`
@@ -112,11 +125,20 @@ pub(super) fn replace_unit_verified(id: &str, text: &str, expected_text: &str) -
 /// new content, or delete it outright).
 ///
 /// Content, not inode, is the identity checked: a file's inode number can be reused by the kernel
-/// moments after it is unlinked (confirmed directly — a test using inode comparison here saw a freshly
-/// unlinked-and-recreated file reported as "unchanged"), so two genuinely different files can share
-/// one. Comparing the actual bytes is both simpler and immune to that, and it is what this whole
-/// system already treats as an artifact's identity everywhere else (`decide`'s entire vocabulary is
-/// text).
+/// moments after it is unlinked, so two genuinely different files can share one. Comparing the actual
+/// bytes is both simpler and immune to that, and it is what this whole system already treats as an
+/// artifact's identity everywhere else (`decide`'s entire vocabulary is text).
+///
+/// The quarantined file is classified with the same `O_NOFOLLOW`-then-`fstat` discipline
+/// `discover::classify_and_read` uses for the fragment itself, not a plain `read_to_string` — the
+/// rename above can just as easily have moved a FIFO, a device node, a directory, or a symlink into
+/// quarantine as a regular file, and each of those would otherwise be mishandled by a bare read
+/// (a FIFO blocks forever waiting for a writer; a character device can grow the read buffer without
+/// bound; a directory fails with `EISDIR`, stranding it under the hidden quarantine name since
+/// `restore_quarantine`'s `link` then also fails; a symlink would be silently followed, unlike every
+/// other read in this module). None of those is something a fragment `discover` ever classified as
+/// `Ours` could have been, so any of them showing up here is itself proof of a race — treated exactly
+/// like a content mismatch.
 pub(super) fn quarantine_if_still_ours(id: &str, expected_text: &str) -> Result<Option<PathBuf>> {
     let final_path = unit_path(id);
     let backup_path = unique_quarantine_path(id);
@@ -127,14 +149,15 @@ pub(super) fn quarantine_if_still_ours(id: &str, expected_text: &str) -> Result<
         Err(e) => return Err(io_err("quarantine", &final_path, e)),
     }
 
-    let actual = match fs::read_to_string(&backup_path) {
-        Ok(t) => t,
+    let actual = match classify_and_read(&backup_path) {
+        Ok(RawState::Regular(text)) => text,
+        Ok(RawState::Absent | RawState::NonRegular) => {
+            restore_quarantine(&backup_path, &final_path)?;
+            return Ok(None);
+        }
         // Whatever went wrong reading it back, the file is real and must not be stranded under a
         // hidden name — restore it before reporting the read failure.
-        Err(e) => {
-            restore_quarantine(&backup_path, &final_path)?;
-            return Err(io_err("read", &backup_path, e));
-        }
+        Err(e) => return Err(restore_or_chain(&backup_path, &final_path, e)),
     };
     if actual == expected_text {
         Ok(Some(backup_path))
@@ -180,7 +203,7 @@ pub(super) fn restore_quarantine(backup_path: &Path, final_path: &Path) -> Resul
     }
 }
 
-// write_temp_unit / fsync_unit_dir =====================================================================================
+// write_temp_unit / fsync_unit_dir ====================================================================================
 
 /// A temp file in `UNIT_DIR` itself (so the later `persist`/`persist_noclobber` is a same-filesystem
 /// link, never a cross-device copy), containing `text`, already `chmod`ed 0644 (obligation 4) and

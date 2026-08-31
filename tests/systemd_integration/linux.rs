@@ -396,3 +396,74 @@ fn install_refuses_a_preexisting_cwd_the_target_account_cannot_write() {
         "a pre-existing directory's owner must not be reassigned, even on refusal"
     );
 }
+
+/// The mixed case `ensure_writable_dir`'s own doc comment is about: an ancestor that already exists
+/// must never be touched, even when a deeper, freshly-created component under it is.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn install_leaves_a_preexisting_ancestor_directory_untouched() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let base = std::env::temp_dir().join(format!("{}-ancestor", guard.id()));
+    fs::create_dir(&base).unwrap_or_else(|e| panic!("mkdir {}: {e}", base.display()));
+    fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).expect("chmod 0755");
+    let _rm = RmDirAll(base.clone());
+    let base_meta_before = fs::metadata(&base).expect("stat base before");
+
+    let cwd = base.join("work");
+    let mut spec = mk(guard.id());
+    spec.user = User::Name("nobody".to_string());
+    spec.cwd = Some(cwd.clone());
+
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+
+    let base_meta_after = fs::metadata(&base).expect("stat base after");
+    assert_eq!(
+        base_meta_after.permissions().mode() & 0o777,
+        base_meta_before.permissions().mode() & 0o777,
+        "the pre-existing ancestor's mode must be untouched"
+    );
+    assert_eq!(
+        base_meta_after.uid(),
+        base_meta_before.uid(),
+        "the pre-existing ancestor's owner must be untouched"
+    );
+
+    let cwd_meta = fs::metadata(&cwd).expect("stat cwd");
+    assert!(cwd_meta.is_dir());
+    assert_eq!(
+        cwd_meta.uid(),
+        uid_of("nobody"),
+        "the newly-created leaf must be chowned"
+    );
+}
+
+// Obligation 4/2: reading an unreadable foreign unit must not abort list() ============================================
+
+/// `list` runs unelevated by design; a foreign unit shipped non-world-readable (units carrying
+/// `LoadCredential=` commonly are 0600) must be silently skipped, not treated as an error that takes
+/// down the whole listing.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn list_skips_a_foreign_unit_unreadable_to_the_caller() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    seed_foreign(guard.id());
+    fs::set_permissions(unit_path(guard.id()), fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+
+    let output = Command::new("runuser")
+        .args(["-u", "nobody", "--", env!("CARGO_BIN_EXE_goetia"), "daemon", "list"])
+        .output()
+        .expect("spawn runuser -u nobody");
+    assert!(
+        output.status.success(),
+        "unelevated `daemon list` must still succeed with an unreadable foreign unit present:\n\
+         stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains(guard.id()),
+        "an unreadable foreign unit must not appear in the listing:\n{stdout}"
+    );
+}
