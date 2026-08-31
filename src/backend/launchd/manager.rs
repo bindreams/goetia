@@ -50,7 +50,7 @@ use crate::backend::launchd::generate;
 use crate::decide::{self, Outcome, Ownership};
 use crate::error::{Error, Result};
 use crate::manager::{Installed, ServiceManager, State, Status};
-use crate::spec::{AccountId, DaemonSpec, Id, User};
+use crate::spec::{AccountId, DaemonSpec, Id, Restart, User};
 
 /// Where `install` writes a plist that is not (yet, or any longer) enabled
 /// at boot. launchd never scans this directory, so a job living here is
