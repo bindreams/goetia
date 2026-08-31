@@ -14,8 +14,8 @@ pub mod fake;
 
 // `Error::UnsupportedPlatform` is still needed by `native()`'s non-Windows
 // arms; on a Windows build (see `native()`'s `#[cfg(target_os = "windows")]`
-// arm, which now returns a real `ScmManager` rather than that error) it
-// would otherwise be an unused import.
+// arm, which returns a real `ScmManager`) it would otherwise be an unused
+// import.
 #[cfg(not(target_os = "windows"))]
 use crate::error::Error;
 use crate::error::Result;
