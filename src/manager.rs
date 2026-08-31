@@ -30,6 +30,17 @@ pub trait ServiceManager {
     /// means and when `force` is honored.
     fn install(&self, spec: &DaemonSpec, force: bool) -> Result<crate::decide::Outcome>;
 
+    /// What [`Self::install`] would do for `spec`, without doing it —
+    /// always as if `force` were `false`, since showing the forced outcome
+    /// would hide the very conflict `--force` exists to let a user decide
+    /// about. Backs `goetia daemon diff`: routing through the exact same
+    /// [`crate::decide::decide`] call `install` uses (rather than `diff`
+    /// reimplementing a partial version of that policy against `list()`'s
+    /// output) is what keeps the two from being able to disagree — `diff`
+    /// saying "up to date" or "would be created" about something `install`
+    /// would actually refuse or conflict on.
+    fn preview_install(&self, spec: &DaemonSpec) -> Result<crate::decide::Outcome>;
+
     /// Stop the service if running, remove the artifact, and reload the
     /// manager. Operates by id alone — no manifest needed, so it still works
     /// on a machine where the original `goetia.yaml` clone is gone.
@@ -43,12 +54,25 @@ pub trait ServiceManager {
     fn disable(&self, id: &Id) -> Result<()>;
 
     /// Start the service now. Does not change its boot-enablement.
+    /// Idempotent: starting an already-running service is `Ok(())`, not an
+    /// error.
     fn start(&self, id: &Id) -> Result<()>;
 
     /// Stop the service now. Does not change its boot-enablement.
+    /// Idempotent: stopping an already-stopped service is `Ok(())`, not an
+    /// error — `daemon restart`'s `stop` then `start` depends on this
+    /// holding for a daemon that was never started, and real managers
+    /// disagree by default (`launchctl bootout`/`ControlService(STOP)` on
+    /// an inactive service both fail; `systemctl stop` does not), so an
+    /// implementation must paper over that difference itself, not leave it
+    /// for a caller to rediscover per platform.
     fn stop(&self, id: &Id) -> Result<()>;
 
-    /// The live state of one installed service.
+    /// The live state of one installed service. `Err` for an id whose blob
+    /// will not decode — this must not fabricate a plausible-looking
+    /// `Status` for state it cannot actually determine (see the crate-level
+    /// design notes on `Installed::OursUnreadable`, which exists for the
+    /// same reason on the `list` side).
     fn status(&self, id: &Id) -> Result<Status>;
 
     /// Every Goetia-managed service currently installed. A foreign

@@ -86,7 +86,14 @@ fn show_from_installed(
         ids.to_vec()
     };
 
-    let mut exit = 0;
+    // With no ids given, an unreadable entry never enters `wanted` at all
+    // (it has no spec to show), so the loop below can't be what flags it —
+    // unlike `list`/`status`, which escalate the same way.
+    let mut exit = if ids.is_empty() && !index.unreadable.is_empty() {
+        1
+    } else {
+        0
+    };
     let mut specs = Vec::new();
     for id in &wanted {
         if let Some((spec, _, _)) = index.ours.get(id) {

@@ -97,10 +97,8 @@ fn operations_on_an_unknown_id_error() {
 
 /// A foreign entry (present, but not Goetia's) must be refused by every
 /// verb, not just `install` — "goetia never touches a service it did not
-/// create" is not an install-only rule. Regression coverage for a defect
-/// review found: only `install` classified ownership, so `uninstall` could
-/// delete an unrelated stranger's service and every other verb could
-/// silently operate on one too.
+/// create" is not an install-only rule. Regression coverage: every verb,
+/// not just `install`, must classify ownership before acting.
 #[skuld::test]
 fn mutating_verbs_refuse_a_foreign_id() {
     let fake = Fake::new();

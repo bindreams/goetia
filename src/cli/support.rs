@@ -56,9 +56,7 @@ pub(crate) fn parse_id(s: &str) -> Result<crate::spec::Id> {
 /// `show`, and `diff` all need this same split — spec/state/enabled for
 /// what decoded cleanly, plus which names exist but did not — so it lives
 /// here rather than as four independently-maintained copies of the same
-/// `match`. A prior copy-per-subcommand version of this logic let `diff`
-/// silently diverge from the other three, dropping `OursUnreadable`
-/// entries instead of warning about them.
+/// `match`.
 pub(crate) struct InstalledIndex {
     pub ours: BTreeMap<String, (DaemonSpec, State, bool)>,
     pub unreadable: BTreeMap<String, String>,
@@ -133,10 +131,27 @@ pub(crate) struct IdVerbCall<'a> {
 }
 
 /// Shared shape for the id-list mutating verbs (`uninstall`, `start`,
-/// `stop`, `enable`, `disable`): check elevation once, obtain the manager
-/// once, then call `verb` per id, printing one result line per id and
-/// aggregating the exit code (`0` if every id succeeded, `1` otherwise).
+/// `stop`, `enable`, `disable`, `restart`): check elevation once, obtain
+/// the manager once, then call `verb` per id, printing one result line per
+/// id and aggregating the exit code (`0` if every id succeeded, `1`
+/// otherwise).
+///
+/// Every id is parsed *before* `verb` is called for any of them — the same
+/// all-or-nothing rule `select_by_ids` documents above. Parsing lazily,
+/// inside the loop, would mean a bad id at position N only surfaces after
+/// ids `1..N-1` have already been mutated (e.g. uninstalled): a partially
+/// executed, irreversible operation the caller never asked for and the
+/// nonzero exit code alone does not disclose.
 pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let ids: std::result::Result<Vec<Id>, Error> = call.ids.iter().map(|s| parse_id(s)).collect();
+    let ids = match ids {
+        Ok(ids) => ids,
+        Err(e) => {
+            let _ = writeln!(err, "error: {e}");
+            return 1;
+        }
+    };
+
     if let Err(code) = require_elevation(call.subcommand, call.is_elevated, err) {
         return code;
     }
@@ -149,16 +164,8 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
     };
 
     let mut exit = 0;
-    for id_str in call.ids {
-        let id = match parse_id(id_str) {
-            Ok(id) => id,
-            Err(e) => {
-                let _ = writeln!(err, "error: {e}");
-                exit = 1;
-                continue;
-            }
-        };
-        match (call.verb)(mgr.as_ref(), &id) {
+    for id in &ids {
+        match (call.verb)(mgr.as_ref(), id) {
             Ok(()) => {
                 let _ = writeln!(out, "{id}: {}", call.verb_past_tense);
             }

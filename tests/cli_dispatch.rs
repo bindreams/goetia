@@ -97,6 +97,9 @@ impl ServiceManager for FlakyManager {
     fn install(&self, spec: &DaemonSpec, force: bool) -> goetia::Result<goetia::decide::Outcome> {
         self.inner.install(spec, force)
     }
+    fn preview_install(&self, spec: &DaemonSpec) -> goetia::Result<goetia::decide::Outcome> {
+        self.inner.preview_install(spec)
+    }
     fn uninstall(&self, id: &Id) -> goetia::Result<()> {
         self.inner.uninstall(id)
     }
@@ -321,7 +324,7 @@ fn show_from_file_and_show_from_installed_agree() {
     assert!(out_file.contains("frpc"), "{out_file}");
 }
 
-// The per-verb wiring the previous plan omitted ========================================================================
+// Per-verb wiring: uninstall/start/stop/restart/enable/disable/status/diff/list ========================================================================
 
 #[skuld::test]
 fn uninstall_reaches_the_manager() {
@@ -455,12 +458,10 @@ fn list_reaches_the_manager() {
     assert!(out.contains("frpc"), "{out}");
 }
 
-// Regression coverage from the review round ============================================================================
+// Foreign-id refusal and unreadable-entry regression coverage ========================================================================
 
 /// "Goetia never touches a service it did not create" (§5) must hold for
-/// every verb reachable through the CLI, not just `install` — the review
-/// round found `uninstall`/`start`/`stop`/`enable`/`disable`/`status` all
-/// mutated or reported on a foreign entry unchecked.
+/// every verb reachable through the CLI, not just `install`.
 #[skuld::test]
 fn cli_refuses_a_foreign_id_for_every_verb() {
     let fake = Fake::new();
@@ -472,6 +473,7 @@ fn cli_refuses_a_foreign_id_for_every_verb() {
         vec!["goetia", "daemon", "disable", "stranger"],
         vec!["goetia", "daemon", "start", "stranger"],
         vec!["goetia", "daemon", "stop", "stranger"],
+        vec!["goetia", "daemon", "restart", "stranger"],
     ] {
         let (code, _out, err) = dispatch_elevated(&args, &fake);
         assert_eq!(code, 1, "{args:?}: {err}");
@@ -507,8 +509,7 @@ fn install_exit_code_does_not_mask_an_error_behind_a_conflict() {
 }
 
 /// `--dry-run`'s preview must not silently drop a `Warning` a generator
-/// produces (e.g. SCM clamping a too-large `restart-delay`) the way an
-/// earlier version of `preview_artifact` did on Windows.
+/// produces (e.g. SCM clamping a too-large `restart-delay`).
 #[skuld::test]
 fn install_dry_run_prints_generator_warnings() {
     let dir = tempfile::tempdir().unwrap();
@@ -544,8 +545,7 @@ fn install_dry_run_prints_generator_warnings() {
 
 /// The `list`/`status`/`show`/`diff` partitioning helper must warn about an
 /// `OursUnreadable` entry and escalate the exit code for every one of those
-/// subcommands, not just the ones a prior copy-pasted version happened to
-/// get right.
+/// subcommands.
 #[skuld::test]
 fn list_reports_an_unreadable_entry_and_exits_nonzero() {
     let fake = Fake::new();
@@ -584,11 +584,8 @@ fn show_unknown_id_is_not_installed() {
     assert!(err.contains("not installed"), "{err}");
 }
 
-/// The correctness/failure review round found this bug specifically: an
-/// unreadable id was reported by `diff` as `"not installed (would be
-/// created)"` — the opposite of the truth, and silently (exit 0, no
-/// warning) — because the partitioning logic dropped `OursUnreadable`
-/// entries instead of reporting them.
+/// An unreadable id must be reported as unreadable, never as "not installed
+/// (would be created)".
 #[skuld::test]
 fn diff_reports_an_unreadable_entry_instead_of_claiming_it_would_be_created() {
     let fake = Fake::new();
@@ -639,9 +636,8 @@ fn diff_reports_not_installed_for_an_id_absent_from_the_manager() {
     assert!(out.contains("not installed (would be created)"), "{out}");
 }
 
-/// Regression coverage for the review round's `enable`/`start` post-install
-/// error-reporting branches in `install::run`, otherwise unreachable from
-/// any test — see [`FlakyManager`].
+/// Exercises `install::run`'s `enable`/`start` post-install error-reporting
+/// branches, otherwise unreachable from any test — see [`FlakyManager`].
 #[skuld::test]
 fn install_reports_enable_and_start_failures_and_exits_nonzero() {
     let dir = tempfile::tempdir().unwrap();
@@ -699,4 +695,112 @@ fn cli_accepts_json_verbose_quiet_as_currently_inert() {
 
     assert_eq!(plain_code, flagged_code);
     assert_eq!(plain_out, flagged_out, "these flags must not be silently half-wired");
+}
+
+/// `status <id>` must not fabricate a `Stopped`/`enabled: false` answer for
+/// an id whose blob will not decode — the marker alone does not make its
+/// `state`/`enabled` trustworthy. `status` (no ids), `list`, and `diff` all
+/// already refuse to invent an answer for the same case.
+#[skuld::test]
+fn status_single_id_errors_on_an_unreadable_entry_instead_of_fabricating_state() {
+    let fake = Fake::new();
+    fake.seed_unreadable("corrupt");
+
+    let (code, _out, err) = dispatch_read_only(&["goetia", "daemon", "status", "corrupt"], &fake);
+
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("corrupt"), "{err}");
+}
+
+/// `diff` must predict what `install` would actually do: a hand-edited
+/// artifact is a conflict, never "up to date".
+#[skuld::test]
+fn diff_reports_would_conflict_for_a_hand_edited_artifact() {
+    let fake = Fake::new();
+    fake.install_then_hand_edit(&mk("frpc"), "# hand-added directive\n");
+
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+
+    let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
+
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(out.contains("would conflict"), "{out}");
+    assert!(!out.contains("up to date"), "{out}");
+}
+
+/// `diff` must distinguish "absent" from "occupied by a stranger's
+/// service": both used to render identically as "would be created", which
+/// `install` would then immediately contradict by refusing.
+#[skuld::test]
+fn diff_reports_would_be_refused_for_a_foreign_id() {
+    let fake = Fake::new();
+    fake.seed_foreign("frpc", "not a goetia artifact at all\n");
+
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [frpc]\n");
+
+    let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
+
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(out.contains("would be refused"), "{out}");
+    assert!(!out.contains("would be created"), "{out}");
+}
+
+/// `state_str`'s `Failed`/`Unknown` arms are otherwise unreachable from any
+/// test — `Fake::start`/`stop` can only ever produce `Running`/`Stopped` —
+/// so nothing would catch a wrong string or a swapped arm there.
+#[skuld::test]
+fn list_and_status_render_failed_and_unknown_states() {
+    let fake = Fake::new();
+    fake.install(&mk("flaky"), false).unwrap();
+    fake.seed_state("flaky", State::Failed);
+    fake.install(&mk("mystery"), false).unwrap();
+    fake.seed_state("mystery", State::Unknown);
+
+    let (list_code, list_out, _) = dispatch_read_only(&["goetia", "daemon", "list"], &fake);
+    assert_eq!(list_code, 0);
+    assert!(list_out.contains("failed"), "{list_out}");
+    assert!(list_out.contains("unknown"), "{list_out}");
+
+    let (status_code, status_out, _) = dispatch_read_only(&["goetia", "daemon", "status", "flaky"], &fake);
+    assert_eq!(status_code, 0);
+    assert!(status_out.contains("failed"), "{status_out}");
+}
+
+/// `run_id_verb` must validate every id before mutating any of them: a
+/// syntactically invalid id anywhere in the list must leave every id
+/// untouched, not partially execute up to the point where parsing failed.
+#[skuld::test]
+fn enable_with_an_invalid_id_touches_nothing() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+
+    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "enable", "frpc", "not/a/valid/id"], &fake);
+
+    assert_eq!(code, 1);
+    assert!(err.contains("not/a/valid/id"), "{err}");
+    assert!(
+        !fake.status(&Id::try_from("frpc").unwrap()).unwrap().enabled,
+        "frpc must not have been enabled: an earlier valid id must not run ahead of a later invalid one"
+    );
+}
+
+/// Multiple ids, one succeeding and one failing at the manager level (both
+/// syntactically valid, so `run_id_verb`'s upfront parse validation does not
+/// apply): both must still be attempted, and the failure must not be lost.
+#[skuld::test]
+fn enable_aggregates_across_multiple_ids() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "enable", "frpc", "never-installed"], &fake);
+
+    assert_eq!(code, 1);
+    assert!(out.contains("frpc: enabled"), "{out}");
+    assert!(err.contains("never-installed"), "{err}");
+    assert!(
+        fake.status(&Id::try_from("frpc").unwrap()).unwrap().enabled,
+        "frpc must still have been enabled despite the other id failing"
+    );
 }

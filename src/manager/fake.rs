@@ -32,7 +32,12 @@ struct Entry {
     /// (ours), or arbitrary seeded text (foreign).
     text: String,
     enabled: bool,
-    running: bool,
+    /// Not just running/stopped: test-only [`Fake::seed_state`] can force
+    /// `Failed`/`Unknown` too, so CLI rendering code that switches on all
+    /// four [`State`] variants (`support::state_str`) has a way to be
+    /// exercised for the two a normal install/start/stop sequence can never
+    /// produce.
+    state: State,
 }
 
 /// An in-memory [`ServiceManager`]. See the module doc comment.
@@ -64,7 +69,7 @@ impl Fake {
             Entry {
                 text: text.into(),
                 enabled: false,
-                running: false,
+                state: State::Stopped,
             },
         );
     }
@@ -96,6 +101,17 @@ impl Fake {
         if !entry.text.ends_with('\n') {
             entry.text.push('\n');
         }
+    }
+
+    /// Test-only: force `id`'s reported [`State`] directly, bypassing
+    /// `start`/`stop` (which can only produce `Running`/`Stopped`). `id`
+    /// must already be installed.
+    pub fn seed_state(&self, id: &str, new_state: State) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        let entry = state
+            .get_mut(id)
+            .unwrap_or_else(|| panic!("seed_state({id}, ..): not installed"));
+        entry.state = new_state;
     }
 }
 
@@ -136,9 +152,34 @@ fn not_installed(id: &Id) -> Error {
 /// other verb only needs this narrower "is this even ours" gate.
 fn require_ours(entry: &Entry, id: &Id) -> Result<()> {
     match extract(&entry.text) {
-        Ok(None) => Err(not_installed(id)),
+        Ok(None) => Err(Error::Foreign {
+            id: id.as_str().to_string(),
+            recovery: decide::foreign_recovery(id.as_str()),
+        }),
         Ok(Some(_)) | Err(_) => Ok(()),
     }
+}
+
+/// Classify what's at `id` in `state`, exactly as `install` would discover
+/// it, plus the raw on-disk text `decide` needs alongside the
+/// classification. Shared by `install` and `preview_install` so the two can
+/// never disagree about what `decide` sees — `preview_install` exists
+/// precisely so `diff` can ask "what would `install` do" without either
+/// duplicating this logic or being able to drift from it.
+fn discover(state: &BTreeMap<String, Entry>, id: &str) -> (Ownership, Option<String>) {
+    let existing = state.get(id).cloned();
+    let found = match &existing {
+        None => Ownership::Absent,
+        Some(entry) => match extract(&entry.text) {
+            Ok(Some(blob)) => Ownership::Ours {
+                regenerated: generate(&blob.spec),
+                blob,
+            },
+            Ok(None) => Ownership::Foreign,
+            Err(e) => Ownership::OursUnreadable { reason: e.to_string() },
+        },
+    };
+    (found, existing.map(|e| e.text))
 }
 
 // ServiceManager ======================================================================================================
@@ -147,22 +188,9 @@ impl ServiceManager for Fake {
     fn install(&self, spec: &DaemonSpec, force: bool) -> Result<Outcome> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         let desired = generate(spec);
-        let existing = state.get(spec.id.as_str()).cloned();
+        let (found, on_disk) = discover(&state, spec.id.as_str());
 
-        let found = match &existing {
-            None => Ownership::Absent,
-            Some(entry) => match extract(&entry.text) {
-                Ok(Some(blob)) => Ownership::Ours {
-                    regenerated: generate(&blob.spec),
-                    blob,
-                },
-                Ok(None) => Ownership::Foreign,
-                Err(e) => Ownership::OursUnreadable { reason: e.to_string() },
-            },
-        };
-        let on_disk = existing.as_ref().map(|e| e.text.as_str());
-
-        let outcome = decide::decide(&found, on_disk, &desired, spec, crate::version(), force);
+        let outcome = decide::decide(&found, on_disk.as_deref(), &desired, spec, crate::version(), force);
 
         // `Create`/`Update`/`Stale` are the outcomes `decide` recommends
         // actually writing for; every refusing variant (`Conflict` without
@@ -172,19 +200,38 @@ impl ServiceManager for Fake {
             outcome,
             Outcome::Create | Outcome::Update { .. } | Outcome::Stale { .. }
         ) {
-            let enabled = existing.as_ref().map(|e| e.enabled).unwrap_or(false);
-            let running = existing.as_ref().map(|e| e.running).unwrap_or(false);
+            let (enabled, run_state) = state
+                .get(spec.id.as_str())
+                .map(|e| (e.enabled, e.state))
+                .unwrap_or((false, State::Stopped));
             state.insert(
                 spec.id.as_str().to_string(),
                 Entry {
                     text: desired,
                     enabled,
-                    running,
+                    state: run_state,
                 },
             );
         }
 
         Ok(outcome)
+    }
+
+    fn preview_install(&self, spec: &DaemonSpec) -> Result<Outcome> {
+        let state = self.state.lock().expect("Fake mutex poisoned");
+        let desired = generate(spec);
+        let (found, on_disk) = discover(&state, spec.id.as_str());
+        // Always previewed without `force`: showing the forced outcome would
+        // hide the very conflict `--force` exists to let a user decide
+        // about, and `diff` has no `--force` flag of its own to justify it.
+        Ok(decide::decide(
+            &found,
+            on_disk.as_deref(),
+            &desired,
+            spec,
+            crate::version(),
+            false,
+        ))
     }
 
     fn uninstall(&self, id: &Id) -> Result<()> {
@@ -215,7 +262,7 @@ impl ServiceManager for Fake {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         let entry = state.get_mut(id.as_str()).ok_or_else(|| not_installed(id))?;
         require_ours(entry, id)?;
-        entry.running = true;
+        entry.state = State::Running;
         Ok(())
     }
 
@@ -223,19 +270,37 @@ impl ServiceManager for Fake {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         let entry = state.get_mut(id.as_str()).ok_or_else(|| not_installed(id))?;
         require_ours(entry, id)?;
-        entry.running = false;
+        // Idempotent: stopping an already-stopped (or failed, or unknown)
+        // service is `Ok(())` — see `ServiceManager::stop`'s doc comment for
+        // why every backend must agree on this.
+        entry.state = State::Stopped;
         Ok(())
     }
 
     fn status(&self, id: &Id) -> Result<Status> {
         let state = self.state.lock().expect("Fake mutex poisoned");
         let entry = state.get(id.as_str()).ok_or_else(|| not_installed(id))?;
-        require_ours(entry, id)?;
-        Ok(Status {
-            state: if entry.running { State::Running } else { State::Stopped },
-            pid: if entry.running { Some(FAKE_PID) } else { None },
-            enabled: entry.enabled,
-        })
+        // Unlike the mutating verbs, `status`'s only job is to report the
+        // truth: an unreadable entry has no trustworthy `enabled`/`state` to
+        // report, so this deliberately does not use `require_ours` (which
+        // would let it through) — it surfaces the decode failure instead of
+        // fabricating a `Stopped`/`enabled: false` answer for it.
+        match extract(&entry.text) {
+            Ok(None) => Err(Error::Foreign {
+                id: id.as_str().to_string(),
+                recovery: decide::foreign_recovery(id.as_str()),
+            }),
+            Err(e) => Err(e),
+            Ok(Some(_)) => Ok(Status {
+                state: entry.state,
+                pid: if entry.state == State::Running {
+                    Some(FAKE_PID)
+                } else {
+                    None
+                },
+                enabled: entry.enabled,
+            }),
+        }
     }
 
     fn list(&self) -> Result<Vec<Installed>> {
@@ -248,7 +313,7 @@ impl ServiceManager for Fake {
                 Ok(None) => {}
                 Ok(Some(blob)) => out.push(Installed::Ours {
                     spec: blob.spec,
-                    state: if entry.running { State::Running } else { State::Stopped },
+                    state: entry.state,
                     enabled: entry.enabled,
                 }),
                 Err(e) => out.push(Installed::OursUnreadable {

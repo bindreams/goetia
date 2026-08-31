@@ -1,15 +1,16 @@
 //! `goetia daemon restart <ID...>`
 //!
 //! Not a `ServiceManager` method of its own — `stop` then `start`, using the
-//! trait's own verbs. Does not change boot-enablement, same as either verb
-//! alone.
+//! trait's own verbs (both idempotent, per their doc comments: `stop` on an
+//! already-stopped daemon is not an error). Does not change boot-enablement,
+//! same as either verb alone.
 
 use std::io::Write;
 
 use clap::Args as ClapArgs;
 
-use super::support::{parse_id, require_elevation};
-use crate::error::Result;
+use super::support::{IdVerbCall, run_id_verb};
+use crate::error::{Error, Result};
 use crate::manager::ServiceManager;
 
 #[derive(ClapArgs, Debug)]
@@ -26,36 +27,25 @@ pub fn run(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
-    if let Err(code) = require_elevation("daemon restart", is_elevated, err) {
-        return code;
-    }
-    let mgr = match get_manager() {
-        Ok(mgr) => mgr,
-        Err(e) => {
-            let _ = writeln!(err, "error: {e}");
-            return 1;
-        }
-    };
-
-    let mut exit = 0;
-    for id_str in &args.ids {
-        let id = match parse_id(id_str) {
-            Ok(id) => id,
-            Err(e) => {
-                let _ = writeln!(err, "error: {e}");
-                exit = 1;
-                continue;
-            }
-        };
-        match mgr.stop(&id).and_then(|()| mgr.start(&id)) {
-            Ok(()) => {
-                let _ = writeln!(out, "{id}: restarted");
-            }
-            Err(e) => {
-                let _ = writeln!(err, "error: {id}: {e}");
-                exit = 1;
-            }
-        }
-    }
-    exit
+    run_id_verb(
+        IdVerbCall {
+            subcommand: "daemon restart",
+            ids: &args.ids,
+            get_manager,
+            is_elevated,
+            verb: &|mgr, id| {
+                mgr.stop(id)?;
+                // Distinguish "never stopped, restart failed outright" from
+                // "stopped, but did not come back up" — the two have
+                // opposite operational consequences (still running vs. now
+                // down), and `mgr.start`'s own error alone cannot tell them
+                // apart once relayed through this closure.
+                mgr.start(id)
+                    .map_err(|e| Error::Other(format!("stopped but failed to restart: {e}")))
+            },
+            verb_past_tense: "restarted",
+        },
+        out,
+        err,
+    )
 }

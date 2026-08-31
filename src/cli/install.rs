@@ -90,7 +90,7 @@ pub fn run(
     for spec in &selected {
         match mgr.install(spec, args.force) {
             Ok(outcome) => {
-                let class = report_outcome(&spec.id, &outcome, out);
+                let class = report_outcome(&spec.id, &outcome, out, err);
                 match class {
                     OutcomeClass::Ok => {}
                     OutcomeClass::Conflict => {
@@ -140,8 +140,14 @@ enum OutcomeClass {
     Conflict,
 }
 
-/// Print one outcome and classify it for the exit code.
-fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write) -> OutcomeClass {
+/// Print one outcome and classify it for the exit code. The full text
+/// (including any diff) always goes to `out`; a refusal or conflict
+/// additionally gets a concise one-line diagnostic on `err`, consistent
+/// with every other failure path in the CLI (`run_id_verb`, `list`,
+/// `status`, `diff` all put failures on stderr) — a script that only
+/// captures stderr for errors must still learn that this exit-1/2 run had
+/// one.
+fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn Write) -> OutcomeClass {
     match outcome {
         Outcome::Create => {
             let _ = writeln!(out, "{id}: created");
@@ -163,14 +169,17 @@ fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write) -> OutcomeCla
         Outcome::Conflict { artifact_diff } => {
             let _ = writeln!(out, "{id}: conflict (re-run with --force to overwrite)");
             let _ = write!(out, "{artifact_diff}");
+            let _ = writeln!(err, "error: {id}: conflict (re-run with --force to overwrite)");
             OutcomeClass::Conflict
         }
         Outcome::RefuseForeign { recovery } => {
             let _ = writeln!(out, "{id}: refused: not a goetia-managed service. {recovery}");
+            let _ = writeln!(err, "error: {id}: refused: not a goetia-managed service. {recovery}");
             OutcomeClass::Refused
         }
         Outcome::RefuseUnreadable { reason, recovery } => {
             let _ = writeln!(out, "{id}: refused: {reason}. {recovery}");
+            let _ = writeln!(err, "error: {id}: refused: {reason}. {recovery}");
             OutcomeClass::Refused
         }
     }
@@ -213,8 +222,7 @@ fn preview_root_account() -> String {
 
 /// `err` is unused on every platform but Windows today — the systemd and
 /// launchd generators never produce a [`crate::spec::Warning`] — but it is
-/// threaded through unconditionally so a future one cannot be dropped the
-/// way the SCM registration's clamp warning originally was here.
+/// threaded through unconditionally so a future one cannot be dropped.
 fn preview_artifact(spec: &DaemonSpec, err: &mut dyn Write) -> String {
     let identity = preview_identity(&spec.user);
 

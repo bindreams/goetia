@@ -1,19 +1,24 @@
 //! `goetia daemon diff [ID...] [-f FILE]`
 //!
-//! Read-only: never checks elevation. Compares each selected daemon's
-//! currently-installed spec against what `-f` (default `.`) would apply —
-//! the update-level diff [`crate::decide::Outcome::Update`] would show, not
-//! the artifact-level one only `install`'s `Conflict` can produce (that one
-//! needs the raw on-disk text, which `ServiceManager` does not expose).
-//! Always needs a manager (comparing against installed state is the whole
-//! point), `-f` or not.
+//! Read-only: never checks elevation. Always needs a manager (comparing
+//! against installed state is the whole point), `-f` or not.
+//!
+//! Renders [`ServiceManager::preview_install`] — the exact same
+//! [`crate::decide::decide`] call `install` itself uses — rather than
+//! reimplementing a partial version of that policy against `list()`'s
+//! output. That is deliberate, not merely tidy: `list()` excludes foreign
+//! services and never carries the raw on-disk artifact text, so a
+//! `list()`-based diff could not distinguish "absent" from "occupied by a
+//! stranger's service" or "up to date" from "hand-edited outside Goetia" —
+//! both real defects an earlier version of this module had.
 
 use std::io::Write;
 use std::path::PathBuf;
 
 use clap::Args as ClapArgs;
 
-use super::support::{load_and_warn, partition_installed, print_unreadable_warnings, select_by_ids};
+use super::support::{load_and_warn, select_by_ids};
+use crate::decide::Outcome;
 use crate::error::Result;
 use crate::manager::ServiceManager;
 
@@ -54,33 +59,56 @@ pub fn run(
             return 1;
         }
     };
-    let installed = match mgr.list() {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = writeln!(err, "error: {e}");
-            return 1;
-        }
-    };
-
-    let index = partition_installed(installed);
-    print_unreadable_warnings(&index.unreadable, err);
 
     let mut exit = 0;
-    for new_spec in selected {
-        let id_str = new_spec.id.as_str();
-        if let Some((old_spec, _, _)) = index.ours.get(id_str) {
-            let spec_diff = crate::diff::spec_diff(old_spec, new_spec);
-            if spec_diff.is_empty() {
-                let _ = writeln!(out, "{}: up to date", new_spec.id);
-            } else {
-                let _ = writeln!(out, "{}:", new_spec.id);
+    for spec in selected {
+        match mgr.preview_install(spec) {
+            Ok(Outcome::Create) => {
+                let _ = writeln!(out, "{}: not installed (would be created)", spec.id);
+            }
+            Ok(Outcome::UpToDate) => {
+                let _ = writeln!(out, "{}: up to date", spec.id);
+            }
+            Ok(Outcome::Update { spec_diff }) => {
+                let _ = writeln!(out, "{}:", spec.id);
                 let _ = write!(out, "{spec_diff}");
             }
-        } else if index.unreadable.contains_key(id_str) {
-            let _ = writeln!(out, "{}: installed but unreadable (see warning above)", new_spec.id);
-            exit = 1;
-        } else {
-            let _ = writeln!(out, "{}: not installed (would be created)", new_spec.id);
+            Ok(Outcome::Stale { from_version }) => {
+                let _ = writeln!(
+                    out,
+                    "{}: would be regenerated (built by goetia {from_version})",
+                    spec.id
+                );
+            }
+            Ok(Outcome::Conflict { artifact_diff }) => {
+                let line = format!(
+                    "{}: would conflict (hand-edited outside goetia; `install --force` would overwrite it)",
+                    spec.id
+                );
+                let _ = writeln!(out, "{line}");
+                let _ = write!(out, "{artifact_diff}");
+                let _ = writeln!(err, "error: {line}");
+                exit = 1;
+            }
+            Ok(Outcome::RefuseForeign { recovery }) => {
+                let line = format!(
+                    "{}: would be refused: not a goetia-managed service. {recovery}",
+                    spec.id
+                );
+                let _ = writeln!(out, "{line}");
+                let _ = writeln!(err, "error: {line}");
+                exit = 1;
+            }
+            Ok(Outcome::RefuseUnreadable { reason, recovery }) => {
+                let line = format!("{}: would be refused: {reason}. {recovery}", spec.id);
+                let _ = writeln!(out, "{line}");
+                let _ = writeln!(err, "error: {line}");
+                exit = 1;
+            }
+            Err(e) => {
+                let _ = writeln!(err, "error: {}: {e}", spec.id);
+                exit = 1;
+            }
         }
     }
     exit

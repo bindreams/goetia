@@ -91,14 +91,23 @@ impl Drop for Cleanup<'_> {
 /// for what `run` cleans up on its own.
 pub fn run(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
     let mut cleanup = Cleanup { mgr, ids: Vec::new() };
+    // Registered up front, not inside `conflict_requires_force`: the caller
+    // has already installed something at this id before calling `run` (see
+    // the module doc comment), so it needs cleanup regardless of which
+    // scenario panics first — including one that runs before
+    // `conflict_requires_force` ever gets to register it itself.
+    cleanup
+        .ids
+        .push(Id::try_from(HAND_EDITED_ID).expect("HAND_EDITED_ID is a valid Id by construction"));
 
     install_is_idempotent(mgr, mk, &mut cleanup.ids);
     install_does_not_start(mgr, mk, &mut cleanup.ids);
     install_does_not_enable(mgr, mk, &mut cleanup.ids);
     reinstall_preserves_enablement(mgr, mk, &mut cleanup.ids);
+    start_and_stop_are_idempotent(mgr, mk, &mut cleanup.ids);
     refuses_foreign_even_with_force(mgr, mk);
     foreign_refuses_every_verb(mgr, mk);
-    conflict_requires_force(mgr, mk, &mut cleanup.ids);
+    conflict_requires_force(mgr, mk);
 
     // `cleanup` drops here, uninstalling everything pushed above — including
     // on an early return via a panicking assertion, since `Drop` still runs
@@ -234,8 +243,9 @@ fn foreign_refuses_every_verb(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> Dae
 
 /// See the module doc comment: the caller must have already installed
 /// `mk(HAND_EDITED_ID)` through `mgr.install()` and then hand-edited the
-/// resulting artifact before calling [`run`].
-fn conflict_requires_force(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec, cleanup: &mut Vec<Id>) {
+/// resulting artifact before calling [`run`]. Cleanup for this id is
+/// registered by `run` itself, up front — see there.
+fn conflict_requires_force(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
     let spec = mk(HAND_EDITED_ID);
 
     let outcome = mgr
@@ -251,9 +261,6 @@ fn conflict_requires_force(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> Daemon
     let forced = mgr
         .install(&spec, true)
         .expect("install with force over a hand-edited artifact must not error");
-    // Force resolves the conflict by writing: from here on this id is ours
-    // to clean up, same as every id `run` created outright.
-    cleanup.push(spec.id.clone());
     assert!(
         !matches!(forced, crate::decide::Outcome::Conflict { .. }),
         "force must resolve the conflict, got {forced:?}"
@@ -266,4 +273,40 @@ fn conflict_requires_force(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> Daemon
         matches!(after, crate::decide::Outcome::UpToDate),
         "force must actually overwrite the hand-edit, got {after:?}"
     );
+}
+
+/// `daemon restart`'s `stop` then `start` depends on `stop` succeeding on a
+/// service that was never started, and real managers disagree by default
+/// (`launchctl bootout`/`ControlService(STOP)` on an inactive service both
+/// fail; `systemctl stop` does not) — see `ServiceManager::stop`'s doc
+/// comment. Every backend must paper over that difference the same way, or
+/// `restart` works on Linux and errors on macOS/Windows for the exact same
+/// installed-but-never-started daemon.
+fn start_and_stop_are_idempotent(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec, cleanup: &mut Vec<Id>) {
+    let spec = mk(&fresh_id("idempotent-start-stop"));
+    mgr.install(&spec, false).expect("install");
+    cleanup.push(spec.id.clone());
+
+    mgr.stop(&spec.id)
+        .expect("stop on a never-started service must be Ok, not an error");
+    mgr.start(&spec.id).expect("start");
+    assert_eq!(
+        mgr.status(&spec.id).expect("status after start").state,
+        State::Running,
+        "id {}",
+        spec.id
+    );
+
+    mgr.start(&spec.id)
+        .expect("start on an already-running service must be Ok, not an error");
+    mgr.stop(&spec.id).expect("stop");
+    assert_ne!(
+        mgr.status(&spec.id).expect("status after stop").state,
+        State::Running,
+        "id {}",
+        spec.id
+    );
+
+    mgr.stop(&spec.id)
+        .expect("stop on an already-stopped service must be Ok, not an error");
 }
