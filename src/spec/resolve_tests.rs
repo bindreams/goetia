@@ -147,11 +147,12 @@ daemons:
     let (specs, _warnings) = resolve_yaml(yaml).expect("valid manifest should resolve");
     let spec = &specs[0];
 
-    let expected_command0 = base_dir().join("bin/frpc.exe").to_string_lossy().into_owned();
+    let expected_command0 = base_dir().join("bin").join("frpc.exe").to_string_lossy().into_owned();
     assert_eq!(spec.command[0], expected_command0);
     assert_eq!(spec.command[1], "-c", "later argv entries are untouched");
-    assert_eq!(spec.cwd, Some(base_dir().join(".")));
-    assert_eq!(spec.logs, Some(base_dir().join("logs/frpc.log")));
+    // `cwd: .` normalizes to the base dir itself, not `<base>/.`.
+    assert_eq!(spec.cwd, Some(base_dir()));
+    assert_eq!(spec.logs, Some(base_dir().join("logs").join("frpc.log")));
 }
 
 #[skuld::test]
@@ -333,7 +334,7 @@ fn load_reads_a_file_path() {
     assert_eq!(specs[0].id.as_str(), "frpc");
     // Relative paths resolve against the manifest's own directory, not the
     // process's current directory.
-    let expected = dir.path().join("bin/frpc").to_string_lossy().into_owned();
+    let expected = dir.path().join("bin").join("frpc").to_string_lossy().into_owned();
     assert_eq!(specs[0].command[0], expected);
 }
 
@@ -444,4 +445,52 @@ fn huge_restart_delay_does_not_overflow() {
         u64::MAX
     );
     let _ = resolve_yaml(&yaml);
+}
+
+#[skuld::test]
+fn relative_base_dir_still_yields_absolute_paths() {
+    // Same invariant as `resolve`'s absolutize step: every emitted path must
+    // come out absolute even when `base_dir` (e.g. `-f .`) is not.
+    let yaml = "daemons:\n  frpc:\n    command: [bin/frpc]\n    cwd: .\n    logs: logs/frpc.log\n";
+    let (specs, _) = resolve(parse_manifest(yaml), Path::new(".")).expect("resolves");
+    let spec = &specs[0];
+
+    // Assert *which* directory was used, not merely that some absolute one
+    // was: an `absolutize` that ignored its argument and returned a constant
+    // would still satisfy `is_absolute()` on every field.
+    let cwd = std::env::current_dir().expect("cwd");
+    assert_eq!(spec.command[0], cwd.join("bin").join("frpc").to_string_lossy());
+    assert_eq!(spec.cwd.as_deref(), Some(cwd.as_path()));
+    assert_eq!(spec.logs, Some(cwd.join("logs").join("frpc.log")));
+}
+
+#[skuld::test]
+fn normalize_preserves_parent_dir_components() {
+    // `.` is dropped but `..` is deliberately kept: collapsing `..`
+    // lexically is wrong when a component is a symlink, since `a/b/..` is
+    // only `a` if `b` is a real directory. Pin the distinction so a future
+    // "completion" of the match arm cannot quietly change it.
+    let yaml = "daemons:\n  frpc:\n    command: [bin/frpc]\n    cwd: ../sibling\n";
+    let (specs, _) = resolve(parse_manifest(yaml), &base_dir()).expect("resolves");
+    let cwd = specs[0].cwd.as_deref().expect("cwd is set");
+
+    assert!(
+        cwd.components().any(|c| matches!(c, std::path::Component::ParentDir)),
+        "`..` must survive normalization, got {cwd:?}"
+    );
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn rejects_drive_relative_paths() {
+    // `C:bin` is neither absolute nor joinable: `PathBuf::push` truncates
+    // whenever the pushed path carries a prefix, so joining it against an
+    // absolute base silently discards the base and leaves a relative path.
+    // That would emit an artifact whose own blob `blob::decode` rejects.
+    let yaml = "daemons:\n  frpc:\n    command: [\"C:bin/frpc.exe\"]\n";
+    let err = resolve(parse_manifest(yaml), &base_dir()).expect_err("drive-relative must be rejected");
+    assert!(
+        err.to_string().contains("drive-relative"),
+        "message should name the cause: {err}"
+    );
 }
