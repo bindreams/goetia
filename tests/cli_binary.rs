@@ -55,10 +55,13 @@ fn unimplemented_backend_names_the_platform_not_a_panic() {
 
     let (code, out, err) = run_cli(&["daemon", "list"], dir.path());
 
-    assert_eq!(code, 1, "stdout:
+    assert_eq!(
+        code, 1,
+        "stdout:
 {out}
 stderr:
-{err}");
+{err}"
+    );
     let expected = format!("no backend for {} yet", std::env::consts::OS);
     assert!(err.contains(&expected), "stderr should name the missing backend: {err}");
 }
@@ -75,13 +78,8 @@ fn native_backend_answers_list_unelevated() {
 
     let (code, out, err) = run_cli(&["daemon", "list"], dir.path());
 
-    assert_eq!(code, 0, "stdout:
-{out}
-stderr:
-{err}");
-    assert!(!err.contains("no backend"), "stderr:
-{err}");
-}
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(!err.contains("no backend"), "stderr:\n{err}");
 }
 
 // Pure paths: no elevation, no manager ================================================================================
