@@ -16,8 +16,14 @@
 //!   directory it was loaded from.
 //! - `enable` moves the plist from [`STAGING_DIR`] into [`ENABLED_DIR`]
 //!   (`/Library/LaunchDaemons`). Does not start it.
-//! - `disable` `bootout`s the job if loaded, then moves the plist back to
-//!   [`STAGING_DIR`].
+//! - `disable` moves the plist back to [`STAGING_DIR`]. Does **not**
+//!   `bootout` it —
+//!   [`ServiceManager::disable`](crate::manager::ServiceManager::disable)'s
+//!   contract is "does not stop it if running", which boot-enrollment and
+//!   current run state being genuinely orthogonal here makes free: launchd
+//!   holds a bootstrapped job by label regardless of which directory its
+//!   plist currently lives in, so moving the file has no effect on a job
+//!   already loaded.
 //! - Discovery (`list`, and every verb's ownership check) scans both
 //!   directories directly — never `launchctl print`, whose textual format
 //!   Apple does not guarantee. `status`'s live run state is the one
@@ -101,10 +107,24 @@ struct Location {
     enabled: bool,
 }
 
+/// Whether *anything* occupies `path` — any directory entry at all, not
+/// just a regular file. `Path::is_file` is `false` for a directory, a
+/// symlink, a socket, or any other non-regular entry, which would let
+/// `locate` classify an occupied path as `Absent`; `write_new`'s
+/// underlying `link`(2) refuses to create over *any* of those the same as
+/// over a regular file (`EEXIST`), so that mismatch would send
+/// `install` into `Create` -> `write_new` -> `Raced` -> re-`install` ->
+/// the identical classification, forever. `symlink_metadata` (not
+/// `metadata`, which follows symlinks and would report a *dangling* one
+/// as absent) catches every case uniformly.
+fn occupied(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
 fn locate(id: &str) -> Result<Option<Location>> {
     let staging = staging_path(id);
     let enabled = enabled_path(id);
-    match (staging.is_file(), enabled.is_file()) {
+    match (occupied(&staging), occupied(&enabled)) {
         (false, false) => Ok(None),
         (true, false) => Ok(Some(Location {
             path: staging,
@@ -203,6 +223,17 @@ fn not_installed(id: &Id) -> Error {
     }
 }
 
+/// Shared preamble for every verb but `install`: locate `id`, read its
+/// artifact, and confirm it's ours. Factored out so the five call sites
+/// (`uninstall`/`enable`/`disable`/`start`/`stop`) cannot independently
+/// drift on what "found and ours" means.
+fn located_and_ours(id: &Id) -> Result<(Location, String)> {
+    let location = locate(id.as_str())?.ok_or_else(|| not_installed(id))?;
+    let text = read_to_string(&location.path)?;
+    require_ours(&text, id)?;
+    Ok((location, text))
+}
+
 // Account resolution ==================================================================================================
 
 /// A platform account, resolved from [`crate::spec::User`]: the
@@ -244,21 +275,29 @@ fn resolve_account(user: &User) -> Result<Account> {
     match user {
         User::Root => account_from_uid(0),
         User::Name(name) => nix::unistd::User::from_name(name)
-            .map_err(|e| Error::Other(format!("look up user `{name}`: {e}")))?
+            .map_err(|e| Error::AccountLookup {
+                detail: format!("look up user `{name}`: {e}"),
+            })?
             .map(Account::from)
-            .ok_or_else(|| Error::Other(format!("no such user `{name}` on this host"))),
+            .ok_or_else(|| Error::AccountLookup {
+                detail: format!("no such user `{name}` on this host"),
+            }),
         User::Id(AccountId::Uid(uid)) => account_from_uid(*uid),
-        User::Id(AccountId::Sid(sid)) => Err(Error::Other(format!(
-            "user `{{id: {sid}}}` names a Windows SID, which is not meaningful on macOS"
-        ))),
+        User::Id(AccountId::Sid(sid)) => Err(Error::AccountLookup {
+            detail: format!("user `{{id: {sid}}}` names a Windows SID, which is not meaningful on macOS"),
+        }),
     }
 }
 
 fn account_from_uid(uid: u32) -> Result<Account> {
     nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
-        .map_err(|e| Error::Other(format!("look up uid {uid}: {e}")))?
+        .map_err(|e| Error::AccountLookup {
+            detail: format!("look up uid {uid}: {e}"),
+        })?
         .map(Account::from)
-        .ok_or_else(|| Error::Other(format!("no such uid {uid} on this host")))
+        .ok_or_else(|| Error::AccountLookup {
+            detail: format!("no such uid {uid} on this host"),
+        })
 }
 
 // Writing the plist ===================================================================================================
@@ -298,7 +337,17 @@ fn prepare_parent_dirs(spec: &DaemonSpec, account: &Account) -> Result<()> {
     Ok(())
 }
 
+/// Only touches a directory this call itself creates. `dir` is an
+/// arbitrary absolute path a spec author supplied (`spec::resolve`
+/// guarantees only that it's absolute) — `chown`ing and `chmod 0755`ing it
+/// unconditionally would hand ownership of, and strip the mode from,
+/// whatever already happened to be there (`/var/log`, a user's home
+/// directory, ...) on every single `install`. A directory that already
+/// exists is therefore left completely untouched.
 fn ensure_dir_owned_by(dir: &Path, account: &Account) -> Result<()> {
+    if dir.exists() {
+        return Ok(());
+    }
     ensure_dir(dir)?;
     nix::unistd::chown(dir, Some(account.uid), Some(account.gid))
         .map_err(|e| Error::Other(format!("chown {} to {}: {e}", dir.display(), account.name)))
@@ -328,18 +377,7 @@ fn lint(path: &Path) -> Result<()> {
     let path_str = path
         .to_str()
         .expect("temp plist path is UTF-8 (see generate::path_str)");
-    let out = Command::new("plutil")
-        .args(["-lint", path_str])
-        .output()
-        .map_err(|e| Error::Other(format!("spawn `plutil -lint`: {e}")))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(Error::Other(format!(
-            "generated plist failed `plutil -lint`: {}",
-            String::from_utf8_lossy(&out.stderr)
-        )))
-    }
+    require_success("plutil", &["-lint", path_str])
 }
 
 enum WriteNew {
@@ -382,13 +420,69 @@ fn write_existing(target: &Path, content: &str) -> Result<()> {
     })
 }
 
+/// Move `src` to `dest` without ever replacing something already at
+/// `dest` — used by `enable`/`disable` to move the plist between
+/// [`STAGING_DIR`] and [`ENABLED_DIR`]. A plain `fs::rename` silently
+/// replaces an existing destination on POSIX, which would make a
+/// same-shape TOCTOU clobber possible here exactly as it is for `install`'s
+/// create path (see `write_new`'s doc comment) — a foreign plist, or a
+/// concurrent operation's, landing at `dest` between the caller's own
+/// checks and this call would otherwise be silently destroyed. Hard-link
+/// then unlink, the same portable non-clobbering primitive `write_new`
+/// uses via `persist_noclobber`: the link is the atomic step, so
+/// `AlreadyExists` means `dest` genuinely was already occupied.
+fn move_no_clobber(src: &Path, dest: &Path) -> Result<()> {
+    match fs::hard_link(src, dest) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(Error::AlreadyExists {
+                path: dest.to_path_buf(),
+            });
+        }
+        Err(e) => {
+            return Err(Error::Io {
+                path: dest.to_path_buf(),
+                source: e,
+            });
+        }
+    }
+    fs::remove_file(src).map_err(io_err(src))
+}
+
 // launchctl ===========================================================================================================
 
-fn launchctl(args: &[&str]) -> Result<std::process::Output> {
-    Command::new("launchctl")
+/// Spawn `command` with `args`, giving back the full `Output` for a caller
+/// that needs to inspect the exit code or streams itself (`is_loaded`,
+/// `bootout`, `query_live_state`). Only the spawn failure — the process
+/// could not be started at all — is an `Err` here; a non-zero exit is
+/// reported through the returned `Output`.
+fn run(command: &str, args: &[&str]) -> Result<std::process::Output> {
+    Command::new(command)
         .args(args)
         .output()
-        .map_err(|e| Error::Other(format!("spawn `launchctl {}`: {e}", args.join(" "))))
+        .map_err(|e| Error::CommandFailed {
+            command: format!("{command} {}", args.join(" ")),
+            stderr: e.to_string(),
+        })
+}
+
+/// [`run`], but for a caller that only cares whether it succeeded
+/// (`bootstrap`, `kickstart`, `plutil -lint`) — spawn failure and a
+/// non-zero exit both become the same [`Error::CommandFailed`].
+fn require_success(command: &str, args: &[&str]) -> Result<()> {
+    let out = run(command, args)?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(Error::CommandFailed {
+            command: format!("{command} {}", args.join(" ")),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
+    }
+}
+
+fn launchctl(args: &[&str]) -> Result<std::process::Output> {
+    run("launchctl", args)
 }
 
 fn is_loaded(id: &str) -> Result<bool> {
@@ -399,47 +493,41 @@ fn is_loaded(id: &str) -> Result<bool> {
 
 fn bootstrap(path: &Path) -> Result<()> {
     let path_str = path.to_str().expect("plist path is UTF-8 (see generate::path_str)");
-    let out = launchctl(&["bootstrap", "system", path_str])?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(Error::Other(format!(
-            "launchctl bootstrap system {}: {}",
-            path.display(),
-            String::from_utf8_lossy(&out.stderr)
-        )))
-    }
+    require_success("launchctl", &["bootstrap", "system", path_str])
 }
 
 fn kickstart(id: &str) -> Result<()> {
-    let out = launchctl(&["kickstart", &target(id)])?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(Error::Other(format!(
-            "launchctl kickstart {}: {}",
-            target(id),
-            String::from_utf8_lossy(&out.stderr)
-        )))
-    }
+    require_success("launchctl", &["kickstart", &target(id)])
 }
 
-/// Idempotent: a job that is not currently loaded is not a failure to stop.
-/// See `ServiceManager::stop`'s doc comment for why every backend must
-/// agree on this.
-fn bootout_if_loaded(id: &str) -> Result<()> {
-    if !is_loaded(id)? {
-        return Ok(());
-    }
+/// Exit codes `launchctl` uses for "no such job" — established empirically
+/// in `tests/support/service_guard.rs`'s cleanup, which needs the same
+/// distinction for the same underlying label lookup `bootout`/`print`
+/// perform: 3 is "no such process", 113 is "could not find specified
+/// service".
+fn is_not_found(code: Option<i32>) -> bool {
+    matches!(code, Some(3 | 113))
+}
+
+/// `bootout`, unconditionally — no `is_loaded` pre-check. A separate check
+/// then act would leave a window for the job to unload between the two
+/// (a concurrent `stop`, an operator's own `launchctl bootout`, ...), which
+/// would fail this call for a service that is, in fact, already stopped —
+/// breaking the idempotency [`ServiceManager::stop`] declares mandatory.
+/// Calling `bootout` directly and classifying *its own* result — success,
+/// or the "no such job" codes [`is_not_found`] names, both `Ok` — covers
+/// the already-gone case by construction instead of by timing.
+///
+/// [`ServiceManager::stop`]: crate::manager::ServiceManager::stop
+fn bootout(id: &str) -> Result<()> {
     let out = launchctl(&["bootout", &target(id)])?;
-    if out.status.success() {
+    if out.status.success() || is_not_found(out.status.code()) {
         Ok(())
     } else {
-        Err(Error::Other(format!(
-            "launchctl bootout {}: {}",
-            target(id),
-            String::from_utf8_lossy(&out.stderr)
-        )))
+        Err(Error::CommandFailed {
+            command: format!("launchctl bootout {}", target(id)),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
     }
 }
 
@@ -454,10 +542,21 @@ fn query_live_state(id: &str) -> (State, Option<u32>) {
         return (State::Unknown, None);
     };
     if !out.status.success() {
-        // Not loaded at all: a clean "not running", not "unknown" — this is
-        // the state a service left staged-but-never-started, or bootout'd,
-        // is expected to report.
-        return (State::Stopped, None);
+        // `is_not_found` (established for `bootout`'s use of the same
+        // label lookup): a clean "not running", the state a service left
+        // staged-but-never-started, or bootout'd, is expected to report.
+        // Anything else — most importantly an unprivileged caller's
+        // permission failure querying the system domain — must not be
+        // read as "stopped": `list`/`status` are required to work
+        // unelevated (the design spec's §4), and reporting a daemon that
+        // is in fact running as `Stopped` because the caller merely
+        // couldn't ask is exactly the confidently-wrong answer the lenient
+        // parse below exists to avoid.
+        return if is_not_found(out.status.code()) {
+            (State::Stopped, None)
+        } else {
+            (State::Unknown, None)
+        };
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let pid = find_field(&text, "pid").and_then(|s| s.trim().parse().ok());
@@ -511,12 +610,43 @@ impl ServiceManager for LaunchdManager {
             }
             Outcome::Update { .. } | Outcome::Stale { .. } => {
                 prepare_parent_dirs(spec, &account)?;
-                let target = &discovery
+                let target = discovery
                     .location
                     .as_ref()
                     .expect("Ownership::Ours implies discovery found a location")
-                    .path;
-                write_existing(target, &desired)?;
+                    .path
+                    .clone();
+                // `target` was captured by `discover`, before `decide` ran.
+                // If a concurrent `enable`/`disable`/`uninstall` has since
+                // moved or removed the artifact, writing here would
+                // recreate a plist at the now-vacated path — landing it in
+                // *both* directories, the exact ambiguous state `locate`
+                // hard-errors on. Re-checking immediately before the write
+                // narrows the race to the few instructions between this
+                // check and `write_existing`'s own open, and on a detected
+                // vanish, re-running `install` re-derives the correct
+                // outcome against whatever is actually there now (the same
+                // reclassify-via-recursion the `Create`/`Raced` case above
+                // uses).
+                if !occupied(&target) {
+                    return self.install(spec, force);
+                }
+                write_existing(&target, &desired)?;
+                if matches!(outcome, Outcome::Update { .. }) && is_loaded(spec.id.as_str())? {
+                    // launchd holds the plist content it read at bootstrap
+                    // time in memory; rewriting the file on disk does not
+                    // reach an already-loaded job. Without this, a job
+                    // that happens to still be loaded (its own process may
+                    // long since have exited, for a `restart: never`
+                    // daemon) would have `start` silently kickstart the
+                    // *pre-update* command/env/user/cwd/logs forever,
+                    // reporting `Ok` the whole time. Bootout is skipped for
+                    // `Stale`: that outcome only ever changes the embedded
+                    // metadata comment's `Version` field, never anything
+                    // `generate::plist` derives from `spec` itself, so a
+                    // loaded job is not stale in any way that affects it.
+                    bootout(spec.id.as_str())?;
+                }
             }
             Outcome::UpToDate
             | Outcome::Conflict { .. }
@@ -542,56 +672,46 @@ impl ServiceManager for LaunchdManager {
     }
 
     fn uninstall(&self, id: &Id) -> Result<()> {
-        let location = locate(id.as_str())?.ok_or_else(|| not_installed(id))?;
-        let text = read_to_string(&location.path)?;
-        require_ours(&text, id)?;
+        let (location, _text) = located_and_ours(id)?;
 
-        bootout_if_loaded(id.as_str())?;
+        bootout(id.as_str())?;
         fs::remove_file(&location.path).map_err(io_err(&location.path))
     }
 
     fn enable(&self, id: &Id) -> Result<()> {
-        let location = locate(id.as_str())?.ok_or_else(|| not_installed(id))?;
-        let text = read_to_string(&location.path)?;
-        require_ours(&text, id)?;
+        let (location, _text) = located_and_ours(id)?;
 
         if location.enabled {
             return Ok(());
         }
         let dest = enabled_path(id.as_str());
-        if dest.exists() {
-            return Err(Error::Other(format!(
-                "cannot enable `{id}`: {} already exists (this should never happen; remove it by hand)",
-                dest.display()
-            )));
-        }
-        fs::rename(&location.path, &dest).map_err(io_err(&dest))
+        move_no_clobber(&location.path, &dest)
     }
 
+    /// Does not stop the job if it is loaded — see
+    /// [`ServiceManager::disable`]'s doc comment ("Does not stop it if
+    /// running"), which [`crate::manager::fake::Fake::disable`] already
+    /// honours. launchd holds a bootstrapped job by label, independent of
+    /// which directory its plist currently lives in (`stop`'s own doc
+    /// comment: "works regardless of which directory it was loaded from"),
+    /// so moving the file back to staging has no effect on a job already
+    /// loaded — boot-enrollment and current run state are genuinely
+    /// orthogonal here, exactly as the trait contract requires.
+    ///
+    /// [`ServiceManager::disable`]: crate::manager::ServiceManager::disable
     fn disable(&self, id: &Id) -> Result<()> {
-        let location = locate(id.as_str())?.ok_or_else(|| not_installed(id))?;
-        let text = read_to_string(&location.path)?;
-        require_ours(&text, id)?;
+        let (location, _text) = located_and_ours(id)?;
 
         if !location.enabled {
             return Ok(());
         }
-        bootout_if_loaded(id.as_str())?;
         let dest = staging_path(id.as_str());
-        if dest.exists() {
-            return Err(Error::Other(format!(
-                "cannot disable `{id}`: {} already exists (this should never happen; remove it by hand)",
-                dest.display()
-            )));
-        }
         ensure_dir(Path::new(STAGING_DIR))?;
-        fs::rename(&location.path, &dest).map_err(io_err(&dest))
+        move_no_clobber(&location.path, &dest)
     }
 
     fn start(&self, id: &Id) -> Result<()> {
-        let location = locate(id.as_str())?.ok_or_else(|| not_installed(id))?;
-        let text = read_to_string(&location.path)?;
-        require_ours(&text, id)?;
+        let (location, _text) = located_and_ours(id)?;
 
         if !is_loaded(id.as_str())? {
             if let Err(e) = bootstrap(&location.path) {
@@ -620,11 +740,9 @@ impl ServiceManager for LaunchdManager {
     }
 
     fn stop(&self, id: &Id) -> Result<()> {
-        let location = locate(id.as_str())?.ok_or_else(|| not_installed(id))?;
-        let text = read_to_string(&location.path)?;
-        require_ours(&text, id)?;
+        located_and_ours(id)?;
 
-        bootout_if_loaded(id.as_str())
+        bootout(id.as_str())
     }
 
     fn status(&self, id: &Id) -> Result<Status> {
@@ -682,15 +800,18 @@ impl ServiceManager for LaunchdManager {
                 continue;
             }
             let (path, enabled) = &locations[0];
-            let text = match fs::read_to_string(path) {
-                Ok(t) => t,
-                Err(e) => {
-                    out.push(Installed::OursUnreadable {
-                        name: id,
-                        reason: format!("read {}: {e}", path.display()),
-                    });
-                    continue;
-                }
+            // A read failure (permission denied, the entry vanishing
+            // between the scan above and here, ...) leaves zero evidence
+            // of whether this plist ever carried a Goetia marker at all —
+            // unlike a decode failure below, which only happens *after*
+            // confirming the marker is present. Claiming `OursUnreadable`
+            // without that evidence would misreport an unreadable
+            // *foreign* plist (routine on `/Library/LaunchDaemons`, which
+            // holds every vendor's daemons, not just Goetia's) as one of
+            // ours; `list`'s contract is that a foreign entry is never
+            // included at all, so this is skipped exactly like one.
+            let Ok(text) = fs::read_to_string(path) else {
+                continue;
             };
             match generate::extract(&text) {
                 Ok(None) => {} // foreign: not Goetia-managed, omitted per the trait doc comment

@@ -11,7 +11,7 @@
 //! [`FileGuard`] instead, since `uninstall` would refuse to touch them.
 
 use std::collections::BTreeMap;
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -309,11 +309,15 @@ fn disable_returns_the_plist_to_staging() {
         !enabled_path(spec.id.as_str()).exists(),
         "plist must no longer be in LaunchDaemons"
     );
-    assert_ne!(
+    // `ServiceManager::disable`'s contract is "does not stop it if
+    // running" — a currently-loaded job must survive the plist moving back
+    // to staging untouched.
+    assert_eq!(
         mgr.status(&spec.id).unwrap().state,
         State::Running,
-        "disable must stop a job that was loaded"
+        "disable must not stop a job that was loaded"
     );
+    mgr.stop(&spec.id).expect("stop"); // tidy up before the guard's uninstall
 }
 
 // Runtime behavior ====================================================================================================
@@ -395,9 +399,18 @@ fn list_ignores_foreign_plists() {
 /// and every ancestor directory `install` creates is world-readable, so a
 /// completely unprivileged process must be able to run `goetia daemon
 /// list` — spawned here as the `nobody` account, exactly the account an
-/// everyday non-root invocation would run under.
+/// everyday non-root invocation would run under. Installs a real daemon
+/// first and asserts it actually appears in the unelevated output: exit
+/// code `0` alone proves nothing — `list()` treats a missing/empty
+/// `STAGING_DIR` and a per-entry read failure identically (silently
+/// omitted), so a command that ran against nothing would "succeed" even if
+/// every installed plist were `0600 root:wheel`.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn unelevated_list_works() {
+    let mgr = LaunchdManager::new();
+    let spec = sleepy(&support::random_test_id());
+    let _guard = Guard::install(&mgr, &spec);
+
     let uid: u32 = cmd::run("id", &["-u", "nobody"])
         .stdout
         .trim()
@@ -428,20 +441,19 @@ fn unelevated_list_works() {
         .gid(gid)
         .output()
         .expect("spawn goetia as `nobody`");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
-        out.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+        stdout.contains(spec.id.as_str()),
+        "the installed daemon must actually appear in the unelevated `list` output; stdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
 
-/// Closes the plan's must-verify item on whether launchd's `UserName` takes
-/// a numeric uid at all: this backend always resolves `user:` to a real
-/// account *name* (see `resolve_account`'s doc comment), sidestepping that
-/// question rather than answering it. What still has to be proven
-/// empirically is that doing so actually makes launchd run the job as the
-/// account it claims — this is that proof, for the most consequential case.
+/// Verifies that launchd's `UserName` honours the account this backend
+/// resolves `user:` to (always a real name, never a numeric uid — see
+/// `resolve_account`'s doc comment): this is the empirical proof that the
+/// resolved account actually runs the job, for the most consequential case.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn root_user_runs_as_uid_zero() {
     let mgr = LaunchdManager::new();
@@ -463,4 +475,101 @@ fn root_user_runs_as_uid_zero() {
         reported_uid, "0",
         "a `user: root` daemon must run as uid 0, got {reported_uid}"
     );
+}
+
+// Parent directories ==================================================================================================
+
+/// `install` `create_dir_all`s `cwd` and the parent of `logs`, then hands
+/// each to the daemon's own account — otherwise a non-root daemon whose
+/// `WorkingDirectory` or `StandardOutPath` names a directory only root can
+/// write into fails at launch with an opaque status.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn install_creates_and_owns_cwd_and_logs_parent_for_a_non_root_account() {
+    let nobody_uid: u32 = cmd::run("id", &["-u", "nobody"])
+        .stdout
+        .trim()
+        .parse()
+        .expect("nobody's uid");
+    let nobody_gid: u32 = cmd::run("id", &["-g", "nobody"])
+        .stdout
+        .trim()
+        .parse()
+        .expect("nobody's gid");
+
+    let mgr = LaunchdManager::new();
+    let id = support::random_test_id();
+    let cwd = Path::new("/tmp").join(format!("{id}-cwd"));
+    let logs = Path::new("/tmp").join(format!("{id}-logs")).join("out.log");
+    let _cleanup_cwd = DirGuard(cwd.clone());
+    let _cleanup_logs_parent = DirGuard(logs.parent().unwrap().to_path_buf());
+
+    let mut spec = base_spec(&id, vec!["/bin/true".to_string()]);
+    spec.user = User::Name("nobody".to_string());
+    spec.cwd = Some(cwd.clone());
+    spec.logs = Some(logs.clone());
+    let _guard = Guard::install(&mgr, &spec);
+
+    for (dir, what) in [(&cwd, "cwd"), (logs.parent().unwrap(), "logs' parent")] {
+        let meta = std::fs::metadata(dir).unwrap_or_else(|e| panic!("{what} ({}) must exist: {e}", dir.display()));
+        assert!(meta.is_dir(), "{what} ({}) must be a directory", dir.display());
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o755,
+            "{what} ({}) must be 0755",
+            dir.display()
+        );
+        assert_eq!(
+            meta.uid(),
+            nobody_uid,
+            "{what} ({}) must be owned by nobody",
+            dir.display()
+        );
+        assert_eq!(
+            meta.gid(),
+            nobody_gid,
+            "{what} ({}) must be grouped as nobody",
+            dir.display()
+        );
+    }
+}
+
+/// Removes a directory `install` created (bypassing the manager, which has
+/// no verb for it) on drop.
+struct DirGuard(PathBuf);
+
+impl Drop for DirGuard {
+    fn drop(&mut self) {
+        match std::fs::remove_dir_all(&self.0) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("DirGuard[{}]: cleanup failed: {e}", self.0.display()),
+        }
+    }
+}
+
+// Non-regular occupants ===============================================================================================
+
+/// Regression coverage for the `locate`/`write_new` classification
+/// mismatch: `Path::is_file` (what `locate` used to check) is `false` for
+/// a directory, while `link`(2) (what `persist_noclobber` uses) refuses to
+/// create over one exactly as it would over a regular file. That mismatch
+/// made a directory sitting at a fresh id's staging path classify as
+/// `Absent` -> `Create` -> `write_new` -> `Raced` -> re-`install` -> the
+/// identical classification, an unbounded recursion that would eventually
+/// abort the process. `locate` now uses `symlink_metadata`, so a directory
+/// is "occupied" like anything else, and `discover`'s subsequent read
+/// fails cleanly instead.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn install_over_a_directory_errors_instead_of_recursing() {
+    let mgr = LaunchdManager::new();
+    let id = support::random_test_id();
+    let path = staging_path(&id);
+    std::fs::create_dir_all(&path).expect("seed a directory at the staging path");
+    let _cleanup = DirGuard(path);
+
+    let spec = sleepy(&id);
+    // The mere fact this returns at all (rather than stack-overflowing)
+    // is most of what this test proves; asserting `Err` pins the rest.
+    mgr.install(&spec, false)
+        .expect_err("a directory occupying the target path must not be silently treated as absent");
 }

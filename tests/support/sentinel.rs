@@ -25,10 +25,10 @@ pub const RUN_UNTIL_KILLED: &str = "--goetia-run-until-killed";
 /// `<exe> --goetia-report-uid <port>`: connect to the test's listener and
 /// send the process's real uid as decimal text, then exit. Used to prove
 /// which account a job actually launched under — `UserName: root` in the
-/// plist is a claim; this is what confirms launchd honoured it, closing the
-/// plan's must-verify item on whether that key takes a name or a numeric
-/// uid (this backend always resolves to a name; see
-/// `backend::launchd::manager::resolve_account`'s doc comment).
+/// plist is a claim; this confirms launchd honoured it, proving whether
+/// that key takes a name or a numeric uid (this backend always resolves
+/// to a name; see `backend::launchd::manager::resolve_account`'s doc
+/// comment).
 #[cfg(unix)]
 pub const REPORT_UID: &str = "--goetia-report-uid";
 

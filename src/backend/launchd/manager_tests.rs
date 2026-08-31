@@ -97,6 +97,43 @@ fn staged_tempfile_accepts_a_generated_plist() {
     staged_tempfile(dir.path(), &sample_plist("lint-ok")).expect("a real generated plist must pass `plutil -lint`");
 }
 
+// move_no_clobber =====================================================================================================
+
+#[skuld::test]
+fn move_no_clobber_moves_when_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.plist");
+    let dest = dir.path().join("dest.plist");
+    std::fs::write(&src, "content").unwrap();
+
+    move_no_clobber(&src, &dest).expect("move over an absent destination");
+
+    assert!(!src.exists(), "source must be gone after a successful move");
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "content");
+}
+
+/// The same TOCTOU class `write_new` guards against for `install`'s create
+/// path, but for the move `enable`/`disable` perform: a plain `fs::rename`
+/// would silently replace whatever landed at `dest` between a caller's own
+/// checks and the move.
+#[skuld::test]
+fn move_no_clobber_does_not_clobber_existing_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.plist");
+    let dest = dir.path().join("dest.plist");
+    std::fs::write(&src, "mover content").unwrap();
+    std::fs::write(&dest, "already here").unwrap();
+
+    let err = move_no_clobber(&src, &dest).expect_err("must not clobber an occupied destination");
+    assert!(matches!(err, Error::AlreadyExists { .. }), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(&dest).unwrap(),
+        "already here",
+        "the occupant must survive a losing move"
+    );
+    assert!(src.exists(), "the source must not be consumed by a failed move");
+}
+
 // resolve_account =====================================================================================================
 
 #[skuld::test]

@@ -5,7 +5,7 @@
 //! Everything here is either pure (`install --dry-run`, `show -f`) or
 //! deliberately exercises `main.rs`'s real wiring to
 //! `goetia::manager::native()`, which errors on every platform until Tasks
-//! 11-13 land (macOS excepted, as of Task 12). Behavior that needs a
+//! 11-13 land (macOS excepted). Behavior that needs a
 //! *working* manager lives in `tests/cli_dispatch.rs` instead, dispatched
 //! in-process against the fake.
 
@@ -61,9 +61,8 @@ fn unimplemented_backend_names_the_platform_not_a_panic() {
 }
 
 /// macOS's counterpart: `goetia daemon list` is wired to a real
-/// `LaunchdManager` as of Task 12, so it must succeed (and needs no
-/// elevation — it only reads the filesystem) rather than report a missing
-/// backend.
+/// `LaunchdManager`, so it must succeed (and needs no elevation — it only
+/// reads the filesystem) rather than report a missing backend.
 #[skuld::test]
 #[cfg(target_os = "macos")]
 fn native_backend_answers_list_unelevated() {
