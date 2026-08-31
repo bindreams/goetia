@@ -13,14 +13,24 @@ authors = ["bindreams"]
 name = "goetia"
 path = "src/main.rs"
 harness = false
+required-features = ["cli"]
 
 [lib]
 name = "goetia"
 path = "src/lib.rs"
 harness = false
 
+[features]
+default = ["cli"]
+# CLI-only deps (clap, output formatting, and the elevation check) are
+# optional behind this feature, so
+# `goetia = { version = "0.1", default-features = false }` stays a clean
+# library dependency (see the design spec's crate table, §1).
+cli = ["dep:clap", "dep:libc", "dep:windows-service"]
+
 [dependencies]
 base64 = "0.22"
+clap = { version = "4.6.6", features = ["derive"], optional = true }
 humantime = "2"
 humantime-serde = "1"
 serde = { version = "1", features = ["derive"] }
@@ -28,6 +38,15 @@ serde_json = "1"
 serde_yaml_ng = "0.10"
 similar = "3"
 thiserror = "2"
+
+[target.'cfg(unix)'.dependencies]
+# Only `geteuid()`, for the CLI's elevation check.
+libc = { version = "0.2", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# Only to probe SCM access as an elevation check, the same technique
+# `tests/support/mod.rs`'s `elevated()` precondition already uses.
+windows-service = { version = "0.8", optional = true }
 
 [dev-dependencies]
 skuld = "0.3"
@@ -44,4 +63,14 @@ winreg = "0.55"
 [[test]]
 name = "marker_inertness"
 path = "tests/marker_inertness.rs"
+harness = false
+
+[[test]]
+name = "cli_dispatch"
+path = "tests/cli_dispatch.rs"
+harness = false
+
+[[test]]
+name = "cli_binary"
+path = "tests/cli_binary.rs"
 harness = false

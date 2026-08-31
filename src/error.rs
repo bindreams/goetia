@@ -35,4 +35,32 @@ pub enum Error {
     /// still trigger once its envelope decodes cleanly.
     #[error("blob: {0}")]
     Blob(String),
+
+    /// No daemon named `id` is managed by Goetia, per a [`ServiceManager`]
+    /// mutating or querying verb (`uninstall`/`start`/`stop`/`enable`/
+    /// `disable`/`status`/`show`) that needs one to already exist.
+    ///
+    /// [`ServiceManager`]: crate::manager::ServiceManager
+    #[error("daemon `{id}` is not installed")]
+    NotInstalled { id: String },
+
+    /// A mutating CLI subcommand was invoked without the elevation
+    /// (root/Administrator) it requires. Never returned for `list`,
+    /// `status`, `show`, `diff`, or `install --dry-run`, none of which
+    /// mutate anything.
+    #[error("`{subcommand}` requires elevation (root/Administrator): re-run as root or Administrator")]
+    ElevationRequired { subcommand: String },
+
+    /// [`crate::manager::native`] has no [`ServiceManager`] implementation
+    /// for the running platform yet — true for every platform until Tasks
+    /// 11-13 land. A message here, never a panic: a CLI user hitting this
+    /// gets a diagnosable error instead of a crash.
+    ///
+    /// [`ServiceManager`]: crate::manager::ServiceManager
+    #[error("no backend for {platform} yet")]
+    UnsupportedPlatform { platform: String },
 }
+
+/// This crate's `Result` alias, used throughout [`crate::manager`] and
+/// [`crate::cli`].
+pub type Result<T> = std::result::Result<T, Error>;

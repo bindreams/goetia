@@ -3,15 +3,18 @@
 
 pub mod backend;
 pub mod blob;
+#[cfg(feature = "cli")]
+pub mod cli;
 pub mod decide;
 pub mod diff;
 pub mod error;
+pub mod manager;
 pub mod spec;
 
 #[cfg(test)]
 mod version_tests;
 
-pub use error::Error;
+pub use error::{Error, Result};
 
 /// The running crate version, as declared in `Cargo.toml`.
 pub fn version() -> &'static str {
