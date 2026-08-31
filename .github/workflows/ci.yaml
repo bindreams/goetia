@@ -127,7 +127,7 @@ jobs:
 
       - name: Install prek
         # renovate: datasource=pypi depName=prek
-        run: uv tool install prek==0.3.6
+        run: uv tool install prek==0.4.14
 
       # cargo-clippy is skipped here because it already runs per-platform in
       # the `test` job above (the `#[cfg]` halves differ per platform, so a

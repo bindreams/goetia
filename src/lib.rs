@@ -1,7 +1,10 @@
 //! Goetia: install system daemons described in `goetia.yaml` as native
 //! Windows/SCM, macOS/launchd, and Linux/systemd services.
 
+pub mod backend;
 pub mod blob;
+pub mod decide;
+pub mod diff;
 pub mod error;
 pub mod spec;
 
