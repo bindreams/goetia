@@ -1,6 +1,6 @@
-//! Integration tests for `goetia-shim` and the `type: simple` SCM path
-//! (Task 14) — see `goetia::backend::scm::manager`'s own module doc comment
-//! for the five traps `tests/scm_integration.rs` covers for `type: managed`;
+//! Integration tests for `goetia-shim` and the `type: simple` SCM path — see
+//! `goetia::backend::scm::manager`'s own module doc comment for the five
+//! traps `tests/scm_integration.rs` covers for `type: managed`;
 //! this file is the `type: simple` analogue, plus the shim's own four
 //! failure paths (a commanded stop must not respawn, the restart-delay
 //! default, a logged-not-crashed spawn failure, and the version-skew

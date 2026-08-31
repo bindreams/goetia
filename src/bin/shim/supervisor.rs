@@ -84,13 +84,14 @@ pub enum RestartDecision {
 /// the now-terminated job while the caller goes on to report
 /// `SERVICE_STOPPED`, leaving an orphan daemon SCM believes is stopped.
 /// Checking `stopping` first, unconditionally, is what makes that
-/// structurally impossible rather than merely unlikely: see `main.rs`'s
-/// wait loop, which samples `stopping` from the same `AtomicBool` the stop
-/// control handler itself writes, read once and reused for both this
-/// decision and the exit-code interpretation above it — never from *which*
-/// handle a `WaitForMultipleObjects` call happened to report first, which
-/// (both handles can legitimately signal together) cannot disambiguate the
-/// two on its own.
+/// structurally impossible rather than merely unlikely: see
+/// `service.rs`'s `supervisor_loop`, which samples `stopping` from
+/// `stop_bus::StopBus`'s mutex-guarded flag (`is_stopping()`) once per
+/// iteration and reuses that single read for both this decision and the
+/// exit-code interpretation above it — never from which of `StopBus`'s two
+/// wake conditions (the child exiting, or a stop request) happened to be
+/// the one a given wake-up was for, which cannot disambiguate the two on
+/// its own when both become true at nearly the same instant.
 pub fn decide_restart(
     restart: Restart,
     outcome: ChildOutcome,

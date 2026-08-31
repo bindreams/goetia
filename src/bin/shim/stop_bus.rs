@@ -2,16 +2,19 @@
 //! supervisor loop, and the composition that lets the loop block on either
 //! "the current child exited" or "a stop was requested" without polling.
 //!
-//! Process-tree containment and waiting are `cosca::Child`'s job (see
-//! `main.rs`'s module doc comment for why nothing here hand-rolls a Job
-//! Object or a `WaitForMultipleObjects` call); this module only supplies
-//! the piece `cosca` does not: a way to interrupt a blocking `child.wait()`
-//! when SCM delivers `Stop`.
+//! Process-tree waiting is `cosca::Child`'s job (see `main.rs`'s module doc
+//! comment); this module supplies the piece `cosca` does not: a way to
+//! interrupt a blocking `child.wait()` when SCM delivers `Stop`. It also
+//! performs the actual tree teardown once a stop is observed — see
+//! [`StopBus::wait_for_child_or_stop`]'s doc comment for why that has to
+//! happen here rather than back in the caller.
 
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use cosca::Child;
+
+use crate::logging;
 
 #[derive(Default)]
 struct Gate {
@@ -41,7 +44,7 @@ impl StopBus {
     }
 
     /// Called from the SCM control-handler callback (a thread `windows-service`
-    /// itself owns, per `main.rs`'s `service_control_handler::register`).
+    /// itself owns, per `service.rs`'s `service_control_handler::register`).
     /// Only ever sets a flag and wakes waiters — it never acts on the child
     /// itself. Acting directly from this callback (calling `kill_tree()`
     /// here) would reopen exactly the race `supervisor::decide_restart`'s
@@ -61,14 +64,27 @@ impl StopBus {
         self.state.lock().expect("StopBus mutex poisoned").stopping
     }
 
-    /// Block until `child` exits or a stop is requested — real
-    /// condition-variable blocking, never a poll loop. A background thread
-    /// performs the actual (real, blocking, event-driven) `child.wait()`;
-    /// this call itself only waits for whichever of the two flags a
-    /// notifier sets first, so a stop that arrives while the child is
-    /// merely spawning (before this call is even entered) is not missed —
-    /// the `Condvar::wait_while` predicate is checked before ever blocking.
-    pub fn wait_for_child_or_stop(&self, child: &Child) -> WaitOutcome {
+    /// Block until `child` exits or a stop is requested, returning which.
+    /// On a stop, also tears the whole contained tree down (`kill_tree` then
+    /// `wait_tree`, confirming via its real kernel drain edge that every
+    /// member — not only the direct child — has exited) before returning.
+    ///
+    /// **Why the teardown happens here, inside this call, rather than in the
+    /// caller after it returns.** A background thread performs the real,
+    /// blocking `child.wait()`; `std::thread::scope` (below) does not
+    /// return until every thread it spawned has finished, so that
+    /// background thread's `child.wait()` must itself return before this
+    /// function can. For a daemon that does not exit on its own — the
+    /// ordinary `type: simple` case — nothing makes `child.wait()` return
+    /// except killing the child. If the kill happened only after this call
+    /// returned (the caller's job in an earlier version of this module),
+    /// the scope's own join would block forever waiting for a worker that
+    /// is parked on a process nothing has told it to kill yet — a deadlock
+    /// on every commanded stop of a running daemon, not a rare case.
+    /// Performing the kill from inside the scope, before the closure's
+    /// return value is produced, is what lets the background thread's wait
+    /// actually resolve.
+    pub fn wait_for_child_or_stop(&self, child: &Child, id: &str) -> WaitOutcome {
         {
             let mut g = self.state.lock().expect("StopBus mutex poisoned");
             g.child_done = false;
@@ -89,11 +105,24 @@ impl StopBus {
                 .cvar
                 .wait_while(g, |g| !g.stopping && !g.child_done)
                 .expect("StopBus mutex poisoned");
-            if g.stopping {
-                WaitOutcome::Stopping
-            } else {
-                WaitOutcome::ChildExited
+            if !g.stopping {
+                return WaitOutcome::ChildExited;
             }
+            // Release the lock before calling into `child` — neither
+            // `kill_tree` nor `wait_tree` needs it, and holding it across a
+            // kernel wait would block `is_stopping()`/`request_stop()`
+            // callers (e.g. a second, redundant SCM stop control) for no
+            // reason.
+            drop(g);
+            if let Err(e) = child.kill_tree() {
+                logging::log_failure(id, &format!("kill_tree on stop: {e}"));
+            }
+            if let Err(e) = child.wait_tree() {
+                logging::log_failure(id, &format!("wait_tree confirming stop: {e}"));
+            }
+            // The background thread's `child.wait()` above can now return
+            // (the tree is dead), so the scope below can join it.
+            WaitOutcome::Stopping
         })
     }
 
@@ -111,3 +140,7 @@ impl StopBus {
         g.stopping
     }
 }
+
+#[cfg(test)]
+#[path = "stop_bus_tests.rs"]
+mod stop_bus_tests;

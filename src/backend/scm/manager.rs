@@ -1,10 +1,8 @@
 //! The effectful SCM backend (`#[cfg(windows)]`).
 //!
 //! Handles both `Kind::Simple` (via `goetia-shim`, `src/bin/shim/`) and
-//! `Kind::Managed`. `discover` no longer refuses `Kind::Simple` — Task 13
-//! left that gate in place only because nothing had exercised a real shim
-//! yet; `generate::registration` already built a correct `ImagePath`/blob
-//! for it, unchanged by Task 14. Its own integration tests live in
+//! `Kind::Managed`; `generate::registration` builds the `ImagePath`/blob
+//! for both. `Kind::Simple`'s own integration tests live in
 //! `tests/shim_integration.rs`, not `tests/scm_integration.rs`, because they
 //! need `CARGO_BIN_EXE_goetia-shim`.
 //!
@@ -346,16 +344,9 @@ struct Discovery {
 /// through to the sibling-of-`current_exe` heuristic below — appropriate
 /// for the `cargo install`-style layout the design's "Windows shim path"
 /// open item describes, where both binaries land in the same directory.
-/// `tests/shim_integration.rs` sets it once, in its own `main`, before
-/// `skuld::run_all()` starts any test thread (a single write strictly
-/// before every read, not the per-test mutation
-/// `identity::service_password`'s doc comment explains
-/// `std::env::set_var` cannot safely do): `current_exe()` inside a test
-/// binary resolves to `target/<profile>/deps/<test>-<hash>.exe`, whose
-/// sibling directory never contains `goetia-shim.exe` (a plain `[[bin]]`
-/// artifact, written to `target/<profile>/` directly) — only
-/// `env!("CARGO_BIN_EXE_goetia-shim")`, resolvable solely from within that
-/// integration test's own crate root, finds the real thing.
+/// `tests/shim_integration.rs`'s own `main` sets it once, before any test
+/// runs — see that file's doc comment for why a plain `current_exe()`-based
+/// guess cannot find the shim binary from inside a test crate.
 fn shim_path() -> PathBuf {
     if let Some(overridden) = std::env::var_os("GOETIA_SHIM_PATH") {
         return PathBuf::from(overridden);

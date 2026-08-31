@@ -1,7 +1,7 @@
-//! Step 2 of Task 14: the shim's own behavior, exercised through a real,
-//! elevated SCM install/start/stop — the four failure paths the plan calls
-//! out are `stop_kills_the_whole_process_tree` (a commanded stop must not
-//! respawn, and must reach the whole tree) and
+//! The shim's own behavior, exercised through a real, elevated SCM
+//! install/start/stop — the two central failure paths this file covers are
+//! `stop_kills_the_whole_process_tree` (a commanded stop must not respawn,
+//! and must reach the whole tree) and
 //! `unreadable_blob_logs_to_fallback_path_and_event_log` (version skew);
 //! `shim_runs_child_with_cwd_and_env`/`shim_captures_stdout_to_logs_path`
 //! cover the ordinary spawn path these two failure tests assume works.
@@ -96,6 +96,12 @@ fn stop_kills_the_whole_process_tree() {
     let child_reported = ConnectBack::listen();
     let grandchild_reported = ConnectBack::listen();
 
+    // `restart: always`, not `never`: with `never`, `decide_restart` would
+    // return `Stop` for every input regardless of the `stopping` flag, so
+    // "no replacement child appears" would hold trivially even if the
+    // `stopping`-checked-first logic this test exists to guard were deleted
+    // outright. `always` is the policy that would actually respawn a
+    // replacement absent that check.
     let spec = mk_spec_full(
         &id,
         fixture_command(
@@ -107,14 +113,14 @@ fn stop_kills_the_whole_process_tree() {
         ),
         None,
         BTreeMap::new(),
-        goetia::spec::Restart::Never,
+        goetia::spec::Restart::Always,
         None,
         None,
     );
     mgr.install(&spec, false).expect("install");
     mgr.start(&spec.id).expect("start");
-    child_reported.accept("the direct child to start");
-    grandchild_reported.accept("the grandchild to start");
+    let child_pid = child_reported.accept_line("the direct child to start and report its pid");
+    let grandchild_pid = grandchild_reported.accept_line("the grandchild to start and report its pid");
 
     // The synchronous barrier `ConnectBack::connected_yet`'s own doc
     // comment requires: `stop` blocks (via a real `NotifyServiceStatusChangeW`
@@ -125,6 +131,19 @@ fn stop_kills_the_whole_process_tree() {
     // decision made before it returned.
     mgr.stop(&spec.id).expect("stop");
 
+    // The namesake claim: the stop reached the *whole* tree, not merely
+    // "no new connection arrived" (which a surviving-but-silent process
+    // would also satisfy, since both fixture modes only ever connect once,
+    // at startup).
+    assert!(
+        !pid_is_alive(&child_pid),
+        "direct child pid {child_pid} is still alive after the stop was confirmed"
+    );
+    assert!(
+        !pid_is_alive(&grandchild_pid),
+        "grandchild pid {grandchild_pid} is still alive after the stop was confirmed"
+    );
+
     assert!(
         !child_reported.connected_yet(),
         "a replacement direct child connected after the stop was confirmed — the naive respawn-outside-\
@@ -133,6 +152,56 @@ fn stop_kills_the_whole_process_tree() {
     assert!(
         !grandchild_reported.connected_yet(),
         "a replacement grandchild connected after the stop was confirmed"
+    );
+}
+
+/// `tasklist /FI "PID eq <pid>"` prints an informational "no tasks found"
+/// line (not a CSV row) when nothing matches, so a matching row is
+/// distinguished by the output actually containing `pid` as a field —
+/// `/FO CSV` quotes each field, so a literal `"<pid>"` substring is
+/// unambiguous for the range of pids a test process ever reports (never
+/// contained inside another field like an image name).
+fn pid_is_alive(pid: &str) -> bool {
+    let out = support::cmd::run("tasklist.exe", &["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);
+    out.ok() && out.stdout.contains(&format!("\"{pid}\""))
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn on_failure_respawns_after_a_nonzero_exit() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let reported = ConnectBack::listen();
+
+    // No `restart-delay` — exercises the real end-to-end wiring for
+    // `supervisor::DEFAULT_RESTART_DELAY`, not only the pure
+    // `missing_restart_delay_uses_the_documented_default` unit test.
+    let spec = mk_spec_full(
+        &id,
+        fixture_command("exit", &[&reported.port().to_string(), "1"]),
+        None,
+        BTreeMap::new(),
+        goetia::spec::Restart::OnFailure,
+        None,
+        None,
+    );
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.id).expect("start");
+
+    reported.accept("the first spawn to report in before exiting 1");
+    let before_respawn = std::time::Instant::now();
+    reported.accept("a respawned child to report in after the first one exited nonzero");
+    let elapsed = before_respawn.elapsed();
+
+    mgr.stop(&spec.id).expect("stop");
+
+    // A real, if generous (scheduling jitter, not a chosen synchronization
+    // bound), lower bound on `DEFAULT_RESTART_DELAY` (1s): proves the
+    // supervisor actually paced the respawn rather than looping
+    // immediately, without pinning it to an exact duration.
+    assert!(
+        elapsed >= std::time::Duration::from_millis(700),
+        "respawn happened after only {elapsed:?}, faster than the documented ~1s restart-delay default allows for"
     );
 }
 
@@ -169,10 +238,27 @@ fn unreadable_blob_logs_to_fallback_path_and_event_log() {
         fallback_path.display()
     );
 
-    let events = support::cmd::run("wevtutil.exe", &["qe", "Application", "/rd:true", "/c:200", "/f:text"]);
+    // Filtered server-side by provider, not by an arbitrary "most recent N"
+    // window: an unrelated process's own Application-log entries (of which
+    // there can be arbitrarily many between the shim's `ReportEventW` call
+    // and this query) can never push a `Goetia`-provider entry out of a
+    // fixed-size recent slice, because nothing else writes under that
+    // provider name. The `/c:` cap is still present as a sanity bound, not
+    // as the filter itself.
+    let events = support::cmd::run(
+        "wevtutil.exe",
+        &[
+            "qe",
+            "Application",
+            "/q:*[System[Provider[@Name='Goetia']]]",
+            "/rd:true",
+            "/c:1000",
+            "/f:text",
+        ],
+    );
     assert!(
         events.ok() && events.stdout.contains(&id),
-        "Windows Event Log (Application) has no entry naming `{id}`:\n{events}"
+        "Windows Event Log (Application, provider `Goetia`) has no entry naming `{id}`:\n{events}"
     );
 }
 

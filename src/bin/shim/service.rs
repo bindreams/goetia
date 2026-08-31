@@ -3,16 +3,13 @@
 //! describes.
 //!
 //! Everything that touches the child process tree — containment, waiting,
-//! stdio capture — is `cosca`'s job, not this module's. `cosca::Command`'s
-//! `.contain()` is a Windows Job Object with `KILL_ON_JOB_CLOSE`, the exact
-//! mechanism this task's own brief first asked to have ported by hand from
-//! `~/src/windows-service-manager/src/service/job_object.rs`; `cosca::Child::
-//! wait()`/`wait_tree()` are real, event-driven kernel waits (a job's
-//! membership-count edge for `wait_tree`), never the 50ms poll
-//! `wsm`'s `wrapper.rs` uses and disclaims with its own TODO. This module's
-//! own job is narrower: interrupting a blocking `child.wait()` when SCM
-//! delivers `Stop` — see `stop_bus`, the one piece `cosca` does not supply,
-//! since it has no notion of an external cancellation source.
+//! stdio capture — is `cosca`'s job, not this module's: `cosca::Command`'s
+//! `.contain()` is a Windows Job Object with `KILL_ON_JOB_CLOSE`, and
+//! `cosca::Child::wait()`/`wait_tree()` are real, event-driven kernel
+//! waits. This module's own job is narrower: interrupting a blocking
+//! `child.wait()` when SCM delivers `Stop` (see `stop_bus`, the one piece
+//! `cosca` does not supply, since it has no notion of an external
+//! cancellation source) and driving SCM's own status protocol.
 
 use std::ffi::OsString;
 use std::sync::Arc;
@@ -20,7 +17,7 @@ use std::time::Duration;
 
 use cosca::{Fd, Stdio};
 use goetia::backend::scm::manager::read_spec_blob;
-use goetia::spec::DaemonSpec;
+use goetia::spec::{DaemonSpec, Restart};
 use windows_service::service::{
     ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
 };
@@ -33,11 +30,11 @@ use crate::supervisor::{self, ChildOutcome, RestartDecision};
 
 // Exit codes ==========================================================================================================
 //
-// Distinguishable process exit codes (constraint 4 of this task's brief):
-// each failure class below both reports through `logging::log_failure`
-// (fallback log path + Windows Event Log) and exits with its own code, so
-// `sc.exe query`/Task Scheduler-style automation and a human reading
-// `%ProgramData%\Goetia\logs\<id>.log` agree on what happened.
+// Distinguishable process exit codes: each failure class below both reports
+// through `logging::log_failure` (fallback log path + Windows Event Log)
+// and exits with its own code, so `sc.exe query`/Task Scheduler-style
+// automation and a human reading `%ProgramData%\Goetia\logs\<id>.log`
+// agree on what happened.
 
 /// Commanded stop, or a `restart:` policy that does not respawn a clean
 /// exit — not a failure.
@@ -112,6 +109,7 @@ fn run_service(id: &str) {
                  not created by `goetia daemon install`",
             );
             report_stopped(
+                id,
                 &status_handle,
                 ServiceExitCode::ServiceSpecific(EXIT_DECODE_FAILURE as u32),
             );
@@ -120,6 +118,7 @@ fn run_service(id: &str) {
         Err(e) => {
             logging::log_failure(id, &format!("decode metadata blob: {e}"));
             report_stopped(
+                id,
                 &status_handle,
                 ServiceExitCode::ServiceSpecific(EXIT_DECODE_FAILURE as u32),
             );
@@ -128,15 +127,13 @@ fn run_service(id: &str) {
     };
     let spec = blob.spec;
 
-    report_running(&status_handle);
-
-    let code = supervisor_loop(&spec, &stop_bus, id);
+    let code = supervisor_loop(&spec, &stop_bus, id, &status_handle);
     let exit_code = if code == EXIT_OK {
         ServiceExitCode::Win32(0)
     } else {
         ServiceExitCode::ServiceSpecific(code as u32)
     };
-    report_stopped(&status_handle, exit_code);
+    report_stopped(id, &status_handle, exit_code);
     std::process::exit(code);
 }
 
@@ -153,8 +150,15 @@ fn register_control_handler(id: &str, stop_bus: &Arc<StopBus>) -> windows_servic
     service_control_handler::register(id, event_handler)
 }
 
-fn report_running(handle: &ServiceStatusHandle) {
-    let _ = handle.set_service_status(ServiceStatus {
+/// `set_service_status` is the only mechanism by which SCM learns this
+/// service's state; a failure here is logged like every other Win32/cosca
+/// failure in this file, not silently discarded — see `logging`'s module
+/// doc comment for why both the fallback log and the Windows Event Log
+/// need to carry it: SCM believing the service is still in whatever state
+/// it last confirmed is exactly the kind of thing a human debugging a
+/// stuck `stop`/`uninstall` needs to be able to find.
+fn report_running(id: &str, handle: &ServiceStatusHandle) {
+    if let Err(e) = handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::Running,
         controls_accepted: ServiceControlAccept::STOP,
@@ -162,11 +166,13 @@ fn report_running(handle: &ServiceStatusHandle) {
         checkpoint: 0,
         wait_hint: Duration::default(),
         process_id: None,
-    });
+    }) {
+        logging::log_failure(id, &format!("report SERVICE_RUNNING to SCM: {e}"));
+    }
 }
 
-fn report_stopped(handle: &ServiceStatusHandle, exit_code: ServiceExitCode) {
-    let _ = handle.set_service_status(ServiceStatus {
+fn report_stopped(id: &str, handle: &ServiceStatusHandle, exit_code: ServiceExitCode) {
+    if let Err(e) = handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::Stopped,
         controls_accepted: ServiceControlAccept::empty(),
@@ -174,7 +180,9 @@ fn report_stopped(handle: &ServiceStatusHandle, exit_code: ServiceExitCode) {
         checkpoint: 0,
         wait_hint: Duration::default(),
         process_id: None,
-    });
+    }) {
+        logging::log_failure(id, &format!("report SERVICE_STOPPED to SCM: {e}"));
+    }
 }
 
 // Supervisor loop =====================================================================================================
@@ -182,7 +190,25 @@ fn report_stopped(handle: &ServiceStatusHandle, exit_code: ServiceExitCode) {
 /// Spawn, wait, restart — until `supervisor::decide_restart` says stop.
 /// Returns the process exit code `run_service` reports both to SCM and via
 /// `std::process::exit`.
-fn supervisor_loop(spec: &DaemonSpec, stop_bus: &StopBus, id: &str) -> i32 {
+fn supervisor_loop(spec: &DaemonSpec, stop_bus: &StopBus, id: &str, status_handle: &ServiceStatusHandle) -> i32 {
+    // `restart: on-failure`/`always` retries indefinitely regardless of any
+    // one spawn's outcome, so for those policies `Running` means "the
+    // supervisor itself is alive and will keep trying" — reported up
+    // front, matching what `ScmManager::start`'s own real
+    // `NotifyServiceStatusChangeW` wait (`scm_wait::start_via_notify`)
+    // expects promptly. `restart: never` makes exactly one spawn attempt
+    // ever, so reporting `Running` before that attempt resolves would race
+    // an immediate `Stopped`: `start_via_notify`'s single-shot notify can
+    // observe either the transient `Running` or the subsequent `Stopped`
+    // depending purely on scheduling, so `goetia daemon start` could
+    // report success for a daemon whose command does not even exist.
+    // Deferring the report until the one attempt's outcome is known (below)
+    // makes that a deterministic failed start instead.
+    let defer_running_report = spec.restart == Restart::Never;
+    if !defer_running_report {
+        report_running(id, status_handle);
+    }
+
     loop {
         // Checked before every spawn, not only after a wait: a stop
         // requested during the *previous* iteration's restart-delay wait
@@ -195,7 +221,12 @@ fn supervisor_loop(spec: &DaemonSpec, stop_bus: &StopBus, id: &str) -> i32 {
 
         let mut cmd = build_command(spec, id);
         let child = match cmd.spawn() {
-            Ok(c) => c,
+            Ok(c) => {
+                if defer_running_report {
+                    report_running(id, status_handle);
+                }
+                c
+            }
             Err(e) => {
                 logging::log_failure(id, &format!("spawn {:?}: {e}", spec.command));
                 let stopping = stop_bus.is_stopping();
@@ -212,36 +243,28 @@ fn supervisor_loop(spec: &DaemonSpec, stop_bus: &StopBus, id: &str) -> i32 {
             }
         };
 
-        let outcome = match stop_bus.wait_for_child_or_stop(&child) {
+        // `wait_for_child_or_stop` also performs the kill-tree-and-confirm
+        // teardown on a stop (see its own doc comment for why that has to
+        // happen inside the call rather than out here) — by the time it
+        // returns `Stopping`, the whole tree is already confirmed dead.
+        let outcome = match stop_bus.wait_for_child_or_stop(&child, id) {
             WaitOutcome::ChildExited => {
                 // The child has already exited — `wait()` reaps and returns
                 // immediately rather than blocking.
-                let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
-                ChildOutcome::Exited(code)
-            }
-            WaitOutcome::Stopping => {
-                // Kill the whole tree (the direct child and every
-                // descendant it spawned — the Job Object's job, not this
-                // loop's), then confirm via `wait_tree`'s real kernel drain
-                // edge that every member has actually exited before this
-                // function's caller ever reports `SERVICE_STOPPED`. This
-                // ordering — confirm dead, THEN decide (below), THEN report
-                // stopped — is what makes "no new child appears after the
-                // stop completes" true by construction rather than by
-                // timing luck: nothing here can loop back to `Respawn`
-                // once `stopping` is observed.
-                if let Err(e) = child.kill_tree() {
-                    logging::log_failure(id, &format!("kill_tree on stop: {e}"));
+                match child.wait() {
+                    Ok(status) => ChildOutcome::Exited(status.code().unwrap_or_else(|| {
+                        logging::log_failure(id, "child exited with no reportable exit code; treating as failed");
+                        -1
+                    })),
+                    Err(e) => {
+                        logging::log_failure(id, &format!("re-query child exit status: {e}"));
+                        ChildOutcome::Exited(-1)
+                    }
                 }
-                if let Err(e) = child.wait_tree() {
-                    logging::log_failure(id, &format!("wait_tree confirming stop: {e}"));
-                }
-                let _ = child.wait();
-                // Unused by `decide_restart` below once `stopping` is true
-                // (checked first, unconditionally) — see its own doc
-                // comment.
-                ChildOutcome::Exited(-1)
             }
+            // Unused by `decide_restart` below once `stopping` is true
+            // (checked first, unconditionally) — see its own doc comment.
+            WaitOutcome::Stopping => ChildOutcome::Exited(-1),
         };
 
         let stopping = stop_bus.is_stopping();
@@ -273,9 +296,16 @@ fn build_command(spec: &DaemonSpec, id: &str) -> cosca::Command {
     let log_path = spec.logs.clone().unwrap_or_else(|| logging::default_log_path(id));
     match logging::open_append(&log_path) {
         Ok(file) => {
-            // `stderr` merges onto whatever `stdout` was just set to
-            // (`Command::fd`'s resolution reads `Fd::STDOUT`'s already
-            // -inserted target) — `stdout` must be set first.
+            // Merges are resolved in a second pass at spawn time (`cosca`'s
+            // `resolve_stdio`), not by `Command::fd` consulting whatever is
+            // already in its fd map — so the two calls below are order
+            // -independent. `Command::stdout`/`stderr` can fail only for a
+            // slot whose target is itself ambiguous or another merge
+            // (`Error::Unsupported`); neither applies to a concrete
+            // `Stdio::from_file`/`Stdio::merge(Fd::STDOUT)` pair on
+            // stdout/stderr, so the discarded `Result`s below are believed
+            // infallible for this exact shape, not merely convenient to
+            // ignore.
             let _ = cmd.stdout(Stdio::from_file(file));
             let _ = cmd.stderr(Stdio::merge(Fd::STDOUT));
         }
@@ -288,6 +318,7 @@ fn build_command(spec: &DaemonSpec, id: &str) -> cosca::Command {
                     log_path.display()
                 ),
             );
+            // Same infallibility reasoning as above, for `Stdio::null()`.
             let _ = cmd.stdout(Stdio::null());
             let _ = cmd.stderr(Stdio::null());
         }

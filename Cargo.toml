@@ -83,22 +83,27 @@ winreg = "0.56"
 # `executable`+`arguments` pre-joined into one command line).
 #
 # The shim (`src/bin/shim/`, same crate/dependency graph — see the
-# `goetia-shim` `[[bin]]` above) adds two more: `Win32_System_JobObjects`
-# (kill the supervised daemon's whole descendant tree on stop, ported from
-# `~/src/windows-service-manager/src/service/job_object.rs`) and
-# `Win32_System_EventLog` (the version-skew/log-path-denied fallback
-# channel — see `src/bin/shim/logging.rs`).
+# `goetia-shim` `[[bin]]` above) adds `Win32_System_EventLog`, the
+# version-skew/log-path-denied fallback channel — see
+# `src/bin/shim/logging.rs`. Process-tree containment (the Windows Job
+# Object a supervised daemon's whole descendant tree is killed through) is
+# `cosca`'s own dependency, not a windows-sys feature this crate needs to
+# request itself.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Authentication_Identity",
     "Win32_System_EventLog",
-    "Win32_System_JobObjects",
     "Win32_System_Services",
     "Win32_System_Threading",
     "Win32_UI_Shell",
 ] }
+# The shim's process-tree containment, spawn, and waiting: `.contain()` is
+# a Windows Job Object with `KILL_ON_JOB_CLOSE`, and `wait()`/`wait_tree()`
+# are real, event-driven kernel waits — see `src/bin/shim/service.rs`.
+# 0.x with an explicitly unstable API; pinned to `"0.2"` rather than a
+# looser range since a minor bump may break this crate's own build.
 cosca = "0.2"
 
 [dev-dependencies]

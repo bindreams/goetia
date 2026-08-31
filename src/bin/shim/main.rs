@@ -13,11 +13,8 @@
 //!
 //! **Process-tree management is `cosca`'s job, not hand-rolled here.**
 //! `cosca::Command::contain()` is a Windows Job Object with
-//! `KILL_ON_JOB_CLOSE` — the same mechanism
-//! `~/src/windows-service-manager/src/service/job_object.rs` implements by
-//! hand — and `cosca::Child::wait()`/`wait_tree()` are real, event-driven
-//! kernel waits, never the 50ms poll `wsm`'s own `wrapper.rs` uses (and
-//! marks with a TODO to fix). See `service.rs`'s own module doc comment for
+//! `KILL_ON_JOB_CLOSE`, and `cosca::Child::wait()`/`wait_tree()` are real,
+//! event-driven kernel waits. See `service.rs`'s own module doc comment for
 //! the one piece `cosca` does not supply: interrupting a blocking
 //! `child.wait()` when SCM delivers `Stop`, which `stop_bus` provides.
 //!

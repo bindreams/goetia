@@ -7,16 +7,20 @@
 //!
 //! `<exe> --goetia-shim-fixture <mode> <args...>`
 //!
-//! - `report <port>` — connect to `<port>`, then block forever (a channel
-//!   nobody sends to) until killed. The conformance suite's own
-//!   `start_and_stop_are_idempotent` scenario, and every test here that just
-//!   needs "a running daemon", use this.
-//! - `spawn-grandchild <own-port> <grandchild-port>` — connect to
-//!   `<own-port>`, spawn a *plain* (uncontained — this fixture has no
-//!   `cosca` dependency of its own) grandchild running `report
-//!   <grandchild-port>`, then block forever. `stop_kills_the_whole_process_tree`
-//!   uses this to prove the shim's Job Object reaches descendants, not only
-//!   the direct child.
+//! - `report <port>` — write this process's own pid to `<port>`, then block
+//!   forever (a channel nobody sends to) until killed. The conformance
+//!   suite's own `start_and_stop_are_idempotent` scenario, and every test
+//!   here that just needs "a running daemon" (via `ConnectBack::accept`,
+//!   which discards the payload), use this; tests that need the pid itself
+//!   use `accept_line`/`accept_value`.
+//! - `spawn-grandchild <own-port> <grandchild-port>` — write this
+//!   process's own pid to `<own-port>`, spawn a *plain* (uncontained — this
+//!   fixture has no `cosca` dependency of its own) grandchild running
+//!   `report <grandchild-port>`, then block forever.
+//!   `stop_kills_the_whole_process_tree` uses this to prove the shim's Job
+//!   Object reaches descendants, not only the direct child, confirming
+//!   both pids are actually dead afterward rather than merely inferring it
+//!   from the absence of a second connection.
 //! - `cwd-env <port> <var>` — connect to `<port>`, write one line
 //!   `cwd=<cwd>;env=<value-or-\0MISSING>`, then block forever.
 //! - `write-log <port> <text>` — connect to `<port>`, write `<text>` to
@@ -38,13 +42,13 @@ pub fn run_if_requested() -> bool {
     match mode {
         "report" => {
             let port: u16 = args[3].parse().expect("port");
-            connect(port);
+            send_line(port, &std::process::id().to_string());
             block_forever();
         }
         "spawn-grandchild" => {
             let own_port: u16 = args[3].parse().expect("own port");
             let grandchild_port = args[4].clone();
-            connect(own_port);
+            send_line(own_port, &std::process::id().to_string());
             let exe = std::env::current_exe().expect("current_exe");
             // Never waited on: this process (its parent) blocks forever
             // right below, until the Job Object the shim under test

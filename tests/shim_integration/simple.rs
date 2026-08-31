@@ -1,7 +1,6 @@
-//! Step 3 of Task 14: the `type: simple` conformance suite and round-trip
-//! tests that Task 13 deferred here because they need a built shim. See
-//! `tests/scm_integration/managed.rs` for the `type: managed` analogues
-//! these mirror.
+//! The `type: simple` conformance suite and round-trip tests, kept here
+//! because they need a built shim. See `tests/scm_integration/managed.rs`
+//! for the `type: managed` analogues these mirror.
 
 use goetia::decide::Outcome;
 use goetia::manager::conformance;
