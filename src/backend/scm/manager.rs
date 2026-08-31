@@ -611,6 +611,20 @@ fn service_info(
 /// actually clears whatever a previous install configured, rather than
 /// leaving it in place.
 fn apply_failure_actions(name: &str, fa: Option<&GenFailureActions>) -> Result<()> {
+    // `ChangeServiceConfig2W(SERVICE_CONFIG_FAILURE_ACTIONS)` requires
+    // `SeShutdownPrivilege` to be *enabled* in the calling token, regardless
+    // of whether any configured action actually reboots (Goetia's own
+    // actions are always `SC_ACTION_RESTART`, never `SC_ACTION_REBOOT`).
+    // Administrator tokens hold this privilege but start a non-interactive
+    // session with it disabled — confirmed on GitHub Actions' Windows
+    // runner, where every call below failed with `ERROR_ACCESS_DENIED`
+    // until this was added.
+    enable_shutdown_privilege().map_err(|e| {
+        Error::Other(format!(
+            "enable SeShutdownPrivilege to set failure actions for `{name}`: {e}"
+        ))
+    })?;
+
     let scm = open_scm(ServiceManagerAccess::CONNECT)?;
     let service = scm
         .open_service(name, ServiceAccess::CHANGE_CONFIG)
@@ -696,6 +710,62 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
 
 // shared helpers ======================================================================================================
 
+/// Enable `SeShutdownPrivilege` in the current process's own token. See
+/// `apply_failure_actions`'s call site for why this is needed at all.
+/// `AdjustTokenPrivileges` can report success (a non-zero return) while
+/// silently not enabling the privilege — MSDN's documented remedy is
+/// checking `GetLastError()` even then, for `ERROR_NOT_ALL_ASSIGNED`.
+fn enable_shutdown_privilege() -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_NOT_ALL_ASSIGNED, HANDLE};
+    use windows_sys::Win32::Security::{
+        AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED, SE_SHUTDOWN_NAME,
+        TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: `GetCurrentProcess` takes no arguments and cannot fail;
+    // `token` is a valid, aligned out-param.
+    let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mut luid = Default::default();
+    // SAFETY: `SE_SHUTDOWN_NAME` is a valid null-terminated wide string
+    // constant; `luid` is a valid out-param.
+    let lookup_ok = unsafe { LookupPrivilegeValueW(std::ptr::null(), SE_SHUTDOWN_NAME, &mut luid) };
+    if lookup_ok == 0 {
+        let err = std::io::Error::last_os_error();
+        // SAFETY: `token` was successfully opened above.
+        unsafe { CloseHandle(token) };
+        return Err(err);
+    }
+
+    let privileges = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: luid,
+            Attributes: SE_PRIVILEGE_ENABLED,
+        }],
+    };
+    // SAFETY: `token` was opened with `TOKEN_ADJUST_PRIVILEGES`; `privileges`
+    // describes exactly one `LUID_AND_ATTRIBUTES`, matching `PrivilegeCount`.
+    let adjust_ok =
+        unsafe { AdjustTokenPrivileges(token, 0, &privileges, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
+    let last_err = std::io::Error::last_os_error();
+    // SAFETY: `token` was successfully opened above and is closed exactly once.
+    unsafe { CloseHandle(token) };
+
+    if adjust_ok == 0 {
+        return Err(last_err);
+    }
+    if last_err.raw_os_error() == Some(ERROR_NOT_ALL_ASSIGNED as i32) {
+        return Err(last_err);
+    }
+    Ok(())
+}
+
 fn open_scm(access: ServiceManagerAccess) -> Result<WinServiceManager> {
     WinServiceManager::local_computer(None::<&str>, access).map_err(|e| to_error("open the Service Control Manager", e))
 }
@@ -707,8 +777,17 @@ fn is_not_found(e: &windows_service::Error) -> bool {
     )
 }
 
+/// `windows_service::Error`'s own `Display` for its `Winapi` variant is the
+/// literal string `"IO error in winapi call"` — it does not include the
+/// wrapped `io::Error`'s message at all (verified: every error surfaced
+/// through `to_error` read that and nothing else, useless for diagnosing an
+/// actual Win32 failure). Unwrap to the inner `io::Error` first, whose
+/// `Display` does carry `FormatMessage`'s real text.
 fn to_error(context: &str, e: windows_service::Error) -> Error {
-    Error::Other(format!("{context}: {e}"))
+    match e {
+        windows_service::Error::Winapi(io_err) => Error::Other(format!("{context}: {io_err}")),
+        other => Error::Other(format!("{context}: {other}")),
+    }
 }
 
 fn not_installed(id: &Id) -> Error {

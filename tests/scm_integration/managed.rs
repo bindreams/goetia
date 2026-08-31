@@ -361,7 +361,10 @@ fn real_account_gets_service_logon_right() {
     // Windows local (SAM) account names are capped at 20 characters.
     let suffix = format!("{:08x}", rand::random::<u32>());
     let account = format!("gt{suffix}");
-    let password = "Goetia!Test1234";
+    // <=14 chars: longer passwords make `net user ... /add` prompt
+    // interactively about pre-Windows-2000 compatibility, which hangs
+    // waiting on stdin in CI.
+    let password = "Goetia!Test12";
     let _user_guard = LocalUserGuard::create(&account, password);
 
     let id = support::random_test_id();
@@ -441,7 +444,10 @@ fn restart_on_failure_round_trips_failure_actions() {
 fn deleted_account_makes_the_service_oursunreadable() {
     let suffix = format!("{:08x}", rand::random::<u32>());
     let account = format!("gt{suffix}");
-    let password = "Goetia!Test1234";
+    // <=14 chars: longer passwords make `net user ... /add` prompt
+    // interactively about pre-Windows-2000 compatibility, which hangs
+    // waiting on stdin in CI.
+    let password = "Goetia!Test12";
     let user_guard = LocalUserGuard::create(&account, password);
     let sid = common::sid_string_for_account(&account);
 
