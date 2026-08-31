@@ -595,10 +595,10 @@ fn start_is_not_fooled_by_a_stale_job_holding_the_label() {
     // Ours: `restart: always`, so launchd guarantees it runs once loaded.
     let mut spec = sleepy(&id);
     spec.restart = Restart::Always;
-    let _guard = Guard::install(&mgr, &spec);
 
-    // A decoy holding the same label, loaded from somewhere else entirely.
-    // `install` does not bootstrap, so the label is free until we take it.
+    // The decoy takes the label *before* install, which is the real
+    // sequence: a predecessor job is still loaded when Goetia installs over
+    // the same id.
     let decoy_dir = std::env::temp_dir().join(format!("{id}-decoy"));
     std::fs::create_dir_all(&decoy_dir).expect("decoy dir");
     let decoy = decoy_dir.join(format!("{id}.plist"));
@@ -619,6 +619,8 @@ fn start_is_not_fooled_by_a_stale_job_holding_the_label() {
     .expect("write decoy plist");
     let _decoy_cleanup = FileGuard(decoy.clone());
     cmd::run("launchctl", &["bootstrap", "system", decoy.to_str().unwrap()]);
+
+    let _guard = Guard::install(&mgr, &spec);
 
     // The decoy now holds the label and is running, which is exactly the
     // state that used to make `start` a no-op.

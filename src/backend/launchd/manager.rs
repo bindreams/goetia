@@ -599,7 +599,26 @@ impl ServiceManager for LaunchdManager {
                 prepare_parent_dirs(spec, &account)?;
                 let target = staging_path(spec.id.as_str());
                 match write_new(&target, &desired)? {
-                    WriteNew::Written => {}
+                    WriteNew::Written => {
+                        // A job may already answer to this label even though
+                        // no artifact of ours existed a moment ago — a
+                        // predecessor installed by hand, or one an external
+                        // actor boot'ed out that has not finished tearing
+                        // down. It cannot be from the plist we just created,
+                        // so it is stale by construction.
+                        //
+                        // Leaving it loaded is what broke a real migration:
+                        // `start` then saw the label loaded *and running*,
+                        // concluded there was nothing to do, and returned
+                        // `Ok` while the daemon never ran. Every label-scoped
+                        // check has that blind spot — `is_loaded` and
+                        // `query_live_state` cannot tell whose job answers
+                        // to a label — so the fix has to be here, at the one
+                        // moment we know the artifact is new.
+                        if is_loaded(spec.id.as_str())? {
+                            bootout(spec.id.as_str())?;
+                        }
+                    }
                     WriteNew::Raced => {
                         // Something now exists where discovery saw nothing.
                         // Re-running `install` from scratch re-derives
