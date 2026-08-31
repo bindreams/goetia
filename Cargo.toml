@@ -26,7 +26,7 @@ default = ["cli"]
 # optional behind this feature, so
 # `goetia = { version = "0.1", default-features = false }` stays a clean
 # library dependency (see the design spec's crate table, §1).
-cli = ["dep:clap", "dep:libc", "dep:windows-service"]
+cli = ["dep:clap", "dep:libc"]
 
 [dependencies]
 base64 = "0.22"
@@ -44,9 +44,29 @@ thiserror = "2"
 libc = { version = "0.2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-# Only to probe SCM access as an elevation check, the same technique
-# `tests/support/mod.rs`'s `elevated()` precondition already uses.
-windows-service = { version = "0.8", optional = true }
+# The real SCM backend (`src/backend/scm/manager.rs`) plus the CLI's
+# elevation probe. Not `optional`/`cli`-gated: `manager::native()` needs it
+# on every Windows build regardless of the `cli` feature, since it is part
+# of the core library, not CLI-only output formatting.
+windows-service = "0.8"
+# `Services\<name>\Parameters` (the metadata blob) and `Services\<name>\Environment`
+# (see `manager::registry`) are read and written directly through the
+# registry: `windows-service`'s `ServiceConfig` exposes neither.
+winreg = "0.55"
+# The handful of Win32 calls `windows-service` does not wrap: a real
+# `NotifyServiceStatusChangeW` wait (`manager::scm_wait`, replacing a
+# checkpoint/`Sleep` poll), `SeServiceLogonRight` provisioning
+# (`manager::identity`), and `CommandLineToArgvW` for readback (SCM stores
+# `executable`+`arguments` pre-joined into one command line).
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Authentication_Identity",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
 
 [dev-dependencies]
 skuld = "0.3"
@@ -55,10 +75,6 @@ tempfile = "3"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
-
-[target.'cfg(windows)'.dev-dependencies]
-windows-service = "0.8"
-winreg = "0.55"
 
 [[test]]
 name = "marker_inertness"
@@ -73,4 +89,9 @@ harness = false
 [[test]]
 name = "cli_binary"
 path = "tests/cli_binary.rs"
+harness = false
+
+[[test]]
+name = "scm_integration"
+path = "tests/scm_integration.rs"
 harness = false

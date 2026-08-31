@@ -12,7 +12,13 @@
 pub mod conformance;
 pub mod fake;
 
-use crate::error::{Error, Result};
+// `Error::UnsupportedPlatform` is still needed by `native()`'s non-Windows
+// arms; on a Windows build (see `native()`'s `#[cfg(target_os = "windows")]`
+// arm, which now returns a real `ScmManager` rather than that error) it
+// would otherwise be an unused import.
+#[cfg(not(target_os = "windows"))]
+use crate::error::Error;
+use crate::error::Result;
 use crate::spec::{DaemonSpec, Id};
 
 // ServiceManager ======================================================================================================
@@ -155,9 +161,7 @@ pub fn native() -> Result<Box<dyn ServiceManager>> {
     }
     #[cfg(target_os = "windows")]
     {
-        Err(Error::UnsupportedPlatform {
-            platform: "windows".to_string(),
-        })
+        Ok(Box::new(crate::backend::scm::manager::ScmManager::new()))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
