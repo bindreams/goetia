@@ -324,7 +324,7 @@ fn show_from_file_and_show_from_installed_agree() {
     assert!(out_file.contains("frpc"), "{out_file}");
 }
 
-// Per-verb wiring: uninstall/start/stop/restart/enable/disable/status/diff/list ========================================================================
+// Per-verb wiring: uninstall/start/stop/restart/enable/disable/status/diff/list =======================================
 
 #[skuld::test]
 fn uninstall_reaches_the_manager() {
@@ -458,7 +458,7 @@ fn list_reaches_the_manager() {
     assert!(out.contains("frpc"), "{out}");
 }
 
-// Foreign-id refusal and unreadable-entry regression coverage ========================================================================
+// Foreign-id refusal and unreadable-entry regression coverage =========================================================
 
 /// "Goetia never touches a service it did not create" (§5) must hold for
 /// every verb reachable through the CLI, not just `install`.

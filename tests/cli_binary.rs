@@ -1,6 +1,6 @@
 //! CLI behavior tests that need no `ServiceManager` at all, run against the
-//! real compiled `goetia` binary (`CARGO_BIN_EXE_goetia` — never
-//! `Command::new("cargo")`, per the Global Constraints).
+//! real compiled `goetia` binary (`CARGO_BIN_EXE_goetia`, never a runtime
+//! `cargo` invocation, per the Global Constraints).
 //!
 //! Everything here is either pure (`install --dry-run`, `show -f`) or
 //! deliberately exercises `main.rs`'s real wiring to
@@ -40,7 +40,7 @@ fn write_manifest(dir: &Path, yaml: &str) {
     std::fs::write(dir.join("goetia.yaml"), yaml).expect("write goetia.yaml fixture");
 }
 
-// native() wiring ======================================================================================================
+// native() wiring =====================================================================================================
 
 /// `goetia daemon list` needs no elevation but does need a manager, so it is
 /// the cleanest proof that the real binary is wired to

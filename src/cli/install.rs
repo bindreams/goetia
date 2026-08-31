@@ -185,7 +185,7 @@ fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn
     }
 }
 
-// --dry-run preview ====================================================================================================
+// --dry-run preview ===================================================================================================
 //
 // Generation is pure and "nearly free" by design (see the CLI spec's §4), so
 // --dry-run deliberately never touches a manager or does any I/O of its
