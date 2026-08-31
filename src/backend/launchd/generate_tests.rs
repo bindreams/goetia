@@ -184,7 +184,7 @@ fn plist_snapshot_full() {
     assert_eq!(text, expected);
 }
 
-// Round trip and the generation invariant ============================================================================
+// Round trip and the generation invariant =============================================================================
 
 #[skuld::test]
 fn plist_round_trips_through_extract() {
@@ -586,7 +586,7 @@ fn base64_alphabet_cannot_produce_a_comment_terminator() {
     );
 }
 
-// Non-UTF-8 paths ======================================================================================================
+// Non-UTF-8 paths =====================================================================================================
 
 #[cfg(windows)]
 fn non_utf8_path() -> PathBuf {
