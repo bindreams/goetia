@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use clap::Args as ClapArgs;
 
-use super::support::{load_and_warn, require_elevation, select_by_ids};
+use super::support::{load_and_warn, print_warnings, require_elevation, select_by_ids};
 use crate::backend::Identity;
 use crate::decide::Outcome;
 use crate::error::Result;
@@ -63,7 +63,7 @@ pub fn run(
                 let _ = writeln!(out);
             }
             let _ = writeln!(out, "# {}", spec.id);
-            let _ = write!(out, "{}", preview_artifact(spec));
+            let _ = write!(out, "{}", preview_artifact(spec, err));
         }
         return 0;
     }
@@ -79,73 +79,99 @@ pub fn run(
         }
     };
 
-    let mut worst = 0;
+    // Errors/refusals (exit 1) and conflicts (exit 2) are disjoint classes,
+    // not a severity ladder: 2 specifically promises "every failure here is
+    // force-resolvable", which stops being true the moment even one daemon
+    // in the same run hard-failed. So a plain `max()` across per-daemon
+    // codes would let a real error hide behind a conflict; track the two
+    // classes separately instead and let an error always win.
+    let mut any_error = false;
+    let mut any_conflict = false;
     for spec in &selected {
         match mgr.install(spec, args.force) {
             Ok(outcome) => {
-                let code = report_outcome(&spec.id, &outcome, out);
-                worst = worst.max(code);
-                // Nothing was (re)written on a refusal or conflict: neither
-                // flag below has anything to act on.
-                if code != 0 {
-                    continue;
+                let class = report_outcome(&spec.id, &outcome, out);
+                match class {
+                    OutcomeClass::Ok => {}
+                    OutcomeClass::Conflict => {
+                        any_conflict = true;
+                        // Nothing was (re)written: neither flag below has
+                        // anything to act on.
+                        continue;
+                    }
+                    OutcomeClass::Refused => {
+                        any_error = true;
+                        continue;
+                    }
                 }
                 if args.enable {
                     if let Err(e) = mgr.enable(&spec.id) {
                         let _ = writeln!(err, "error: {}: enable: {e}", spec.id);
-                        worst = worst.max(1);
+                        any_error = true;
                     }
                 }
                 if args.start {
                     if let Err(e) = mgr.start(&spec.id) {
                         let _ = writeln!(err, "error: {}: start: {e}", spec.id);
-                        worst = worst.max(1);
+                        any_error = true;
                     }
                 }
             }
             Err(e) => {
                 let _ = writeln!(err, "error: {}: {e}", spec.id);
-                worst = worst.max(1);
+                any_error = true;
             }
         }
     }
-    worst
+
+    if any_error {
+        1
+    } else if any_conflict {
+        2
+    } else {
+        0
+    }
 }
 
-/// Print one outcome and return its exit-code contribution: `0` for
-/// anything that succeeded or was a no-op, `1` for a refusal, `2` for a
-/// conflict.
-fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write) -> i32 {
+/// Which of the three exit-code buckets an [`Outcome`] belongs to.
+enum OutcomeClass {
+    Ok,
+    Refused,
+    Conflict,
+}
+
+/// Print one outcome and classify it for the exit code.
+fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write) -> OutcomeClass {
     match outcome {
         Outcome::Create => {
             let _ = writeln!(out, "{id}: created");
-            0
+            OutcomeClass::Ok
         }
         Outcome::UpToDate => {
             let _ = writeln!(out, "{id}: up to date");
-            0
+            OutcomeClass::Ok
         }
         Outcome::Update { spec_diff } => {
             let _ = writeln!(out, "{id}: updated");
             let _ = write!(out, "{spec_diff}");
-            0
+            OutcomeClass::Ok
         }
         Outcome::Stale { from_version } => {
             let _ = writeln!(out, "{id}: regenerated (was built by goetia {from_version})");
-            0
+            OutcomeClass::Ok
         }
         Outcome::Conflict { artifact_diff } => {
             let _ = writeln!(out, "{id}: conflict (re-run with --force to overwrite)");
             let _ = write!(out, "{artifact_diff}");
-            2
+            OutcomeClass::Conflict
         }
         Outcome::RefuseForeign { recovery } => {
             let _ = writeln!(out, "{id}: refused: not a goetia-managed service. {recovery}");
-            1
+            OutcomeClass::Refused
         }
         Outcome::RefuseUnreadable { reason, recovery } => {
             let _ = writeln!(out, "{id}: refused: {reason}. {recovery}");
-            1
+            OutcomeClass::Refused
         }
     }
 }
@@ -185,15 +211,21 @@ fn preview_root_account() -> String {
     "root".to_string()
 }
 
-fn preview_artifact(spec: &DaemonSpec) -> String {
+/// `err` is unused on every platform but Windows today — the systemd and
+/// launchd generators never produce a [`crate::spec::Warning`] — but it is
+/// threaded through unconditionally so a future one cannot be dropped the
+/// way the SCM registration's clamp warning originally was here.
+fn preview_artifact(spec: &DaemonSpec, err: &mut dyn Write) -> String {
     let identity = preview_identity(&spec.user);
 
     #[cfg(target_os = "linux")]
     {
+        let _ = err;
         crate::backend::systemd::generate::unit(spec, &identity)
     }
     #[cfg(target_os = "macos")]
     {
+        let _ = err;
         crate::backend::launchd::generate::plist(spec, &identity)
     }
     #[cfg(windows)]
@@ -202,11 +234,13 @@ fn preview_artifact(spec: &DaemonSpec) -> String {
         // "Windows shim path" item) — this placeholder is only ever shown
         // in a preview, never installed.
         let shim_path = PathBuf::from("goetia-shim.exe");
-        let (registration, _warnings) = crate::backend::scm::generate::registration(spec, &identity, &shim_path);
+        let (registration, warnings) = crate::backend::scm::generate::registration(spec, &identity, &shim_path);
+        print_warnings(&warnings, err);
         crate::backend::scm::generate::render(&registration)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
+        let _ = err;
         "# no dry-run preview generator for this platform\n".to_string()
     }
 }

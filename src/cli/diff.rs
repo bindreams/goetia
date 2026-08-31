@@ -5,16 +5,17 @@
 //! the update-level diff [`crate::decide::Outcome::Update`] would show, not
 //! the artifact-level one only `install`'s `Conflict` can produce (that one
 //! needs the raw on-disk text, which `ServiceManager` does not expose).
+//! Always needs a manager (comparing against installed state is the whole
+//! point), `-f` or not.
 
-use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 
 use clap::Args as ClapArgs;
 
-use super::support::{load_and_warn, select_by_ids};
+use super::support::{load_and_warn, partition_installed, print_unreadable_warnings, select_by_ids};
 use crate::error::Result;
-use crate::manager::{Installed, ServiceManager};
+use crate::manager::ServiceManager;
 
 #[derive(ClapArgs, Debug)]
 pub struct Args {
@@ -61,28 +62,26 @@ pub fn run(
         }
     };
 
-    let mut by_id = BTreeMap::new();
-    for entry in &installed {
-        if let Installed::Ours { spec, .. } = entry {
-            by_id.insert(spec.id.as_str().to_string(), spec);
-        }
-    }
+    let index = partition_installed(installed);
+    print_unreadable_warnings(&index.unreadable, err);
 
+    let mut exit = 0;
     for new_spec in selected {
-        match by_id.get(new_spec.id.as_str()) {
-            Some(old_spec) => {
-                let spec_diff = crate::diff::spec_diff(old_spec, new_spec);
-                if spec_diff.is_empty() {
-                    let _ = writeln!(out, "{}: up to date", new_spec.id);
-                } else {
-                    let _ = writeln!(out, "{}:", new_spec.id);
-                    let _ = write!(out, "{spec_diff}");
-                }
+        let id_str = new_spec.id.as_str();
+        if let Some((old_spec, _, _)) = index.ours.get(id_str) {
+            let spec_diff = crate::diff::spec_diff(old_spec, new_spec);
+            if spec_diff.is_empty() {
+                let _ = writeln!(out, "{}: up to date", new_spec.id);
+            } else {
+                let _ = writeln!(out, "{}:", new_spec.id);
+                let _ = write!(out, "{spec_diff}");
             }
-            None => {
-                let _ = writeln!(out, "{}: not installed (would be created)", new_spec.id);
-            }
+        } else if index.unreadable.contains_key(id_str) {
+            let _ = writeln!(out, "{}: installed but unreadable (see warning above)", new_spec.id);
+            exit = 1;
+        } else {
+            let _ = writeln!(out, "{}: not installed (would be created)", new_spec.id);
         }
     }
-    0
+    exit
 }

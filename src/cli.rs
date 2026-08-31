@@ -7,9 +7,11 @@
 //! nothing on a real machine. Until Tasks 11-13 land, every mutating and
 //! every list/status subcommand therefore fails on a real host with `no
 //! backend for <platform> yet` — the message [`crate::manager::native`]
-//! returns. `install --dry-run` and `show`/`diff -f <file>` are the
-//! exceptions: they need no backend at all (pure generation, or a spec read
-//! straight from a file), so they keep working today.
+//! returns. `install --dry-run` and `show -f <file>` are the exceptions:
+//! they need no backend at all (pure generation, or a spec read straight
+//! from a file), so they keep working today. `diff` always needs a
+//! manager, `-f` or not — comparing against installed state is its entire
+//! job.
 //!
 //! `dispatch` takes `get_manager` and `is_elevated` as lazily-invoked
 //! closures for exactly this reason: a subcommand that does not need a
@@ -48,13 +50,20 @@ use crate::manager::ServiceManager;
     about = "Install system daemons described in goetia.yaml as native services."
 )]
 pub struct Cli {
-    /// Emit machine-readable JSON instead of text.
+    /// Reserved for machine-readable JSON output (design spec §4's global
+    /// flags). Accepted and parsed, but `dispatch` does not read it yet —
+    /// every subcommand still renders text regardless. Locked in
+    /// deliberately rather than half-wired to one subcommand's output:
+    /// `cli_accepts_json_verbose_quiet_as_currently_inert` pins this so a
+    /// silent behavior change (in either direction) fails a test.
     #[arg(long, global = true)]
     pub json: bool,
-    /// Increase output verbosity. Repeatable.
+    /// Reserved for increased output verbosity (repeatable). Accepted and
+    /// parsed; not read by `dispatch` yet. See `json`'s doc comment.
     #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
-    /// Suppress non-essential output.
+    /// Reserved to suppress non-essential output. Accepted and parsed; not
+    /// read by `dispatch` yet. See `json`'s doc comment.
     #[arg(short = 'q', long = "quiet", global = true)]
     pub quiet: bool,
     #[command(subcommand)]

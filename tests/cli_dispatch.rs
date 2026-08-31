@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use clap::Parser as _;
 use goetia::cli::{self, Cli};
 use goetia::manager::fake::Fake;
-use goetia::manager::{Installed, ServiceManager, State};
+use goetia::manager::{Installed, ServiceManager, State, Status};
 use goetia::spec::{DaemonSpec, Id, Kind, Restart, User};
 
 fn main() {
@@ -73,6 +73,57 @@ fn dispatch_read_only(args: &[&str], fake: &Fake) -> (i32, String, String) {
     dispatch(args, fake, &|| {
         panic!("a read-only subcommand must never check elevation")
     })
+}
+
+/// Wraps a `Fake`, forcing `enable`/`start` to fail for one specific id.
+/// Exists to exercise `install`'s post-`enable`/`start` error-reporting
+/// branches: a plain `Fake`'s own errors are always `NotInstalled`, which
+/// cannot happen immediately after a successful install, so those branches
+/// are otherwise unreachable from any test.
+#[derive(Clone)]
+struct FlakyManager {
+    inner: Fake,
+    fail_enable_for: Option<String>,
+    fail_start_for: Option<String>,
+}
+
+fn injected_failure(id: &Id) -> goetia::Error {
+    goetia::Error::NotInstalled {
+        id: format!("{id} (injected test failure)"),
+    }
+}
+
+impl ServiceManager for FlakyManager {
+    fn install(&self, spec: &DaemonSpec, force: bool) -> goetia::Result<goetia::decide::Outcome> {
+        self.inner.install(spec, force)
+    }
+    fn uninstall(&self, id: &Id) -> goetia::Result<()> {
+        self.inner.uninstall(id)
+    }
+    fn enable(&self, id: &Id) -> goetia::Result<()> {
+        if self.fail_enable_for.as_deref() == Some(id.as_str()) {
+            return Err(injected_failure(id));
+        }
+        self.inner.enable(id)
+    }
+    fn disable(&self, id: &Id) -> goetia::Result<()> {
+        self.inner.disable(id)
+    }
+    fn start(&self, id: &Id) -> goetia::Result<()> {
+        if self.fail_start_for.as_deref() == Some(id.as_str()) {
+            return Err(injected_failure(id));
+        }
+        self.inner.start(id)
+    }
+    fn stop(&self, id: &Id) -> goetia::Result<()> {
+        self.inner.stop(id)
+    }
+    fn status(&self, id: &Id) -> goetia::Result<Status> {
+        self.inner.status(id)
+    }
+    fn list(&self) -> goetia::Result<Vec<Installed>> {
+        self.inner.list()
+    }
 }
 
 fn installed_ids(fake: &Fake) -> Vec<String> {
@@ -402,4 +453,250 @@ fn list_reaches_the_manager() {
 
     assert_eq!(code, 0);
     assert!(out.contains("frpc"), "{out}");
+}
+
+// Regression coverage from the review round ============================================================================
+
+/// "Goetia never touches a service it did not create" (§5) must hold for
+/// every verb reachable through the CLI, not just `install` — the review
+/// round found `uninstall`/`start`/`stop`/`enable`/`disable`/`status` all
+/// mutated or reported on a foreign entry unchecked.
+#[skuld::test]
+fn cli_refuses_a_foreign_id_for_every_verb() {
+    let fake = Fake::new();
+    fake.seed_foreign("stranger", "not a goetia artifact at all\n");
+
+    for args in [
+        vec!["goetia", "daemon", "uninstall", "stranger"],
+        vec!["goetia", "daemon", "enable", "stranger"],
+        vec!["goetia", "daemon", "disable", "stranger"],
+        vec!["goetia", "daemon", "start", "stranger"],
+        vec!["goetia", "daemon", "stop", "stranger"],
+    ] {
+        let (code, _out, err) = dispatch_elevated(&args, &fake);
+        assert_eq!(code, 1, "{args:?}: {err}");
+    }
+    let (status_code, _out, status_err) = dispatch_read_only(&["goetia", "daemon", "status", "stranger"], &fake);
+    assert_eq!(status_code, 1, "{status_err}");
+}
+
+/// Exit code 2 must mean "every failure here is force-resolvable". A batch
+/// mixing a conflict (force-resolvable) with a foreign refusal (not) must
+/// not let the refusal hide behind the conflict's higher numeric code.
+#[skuld::test]
+fn install_exit_code_does_not_mask_an_error_behind_a_conflict() {
+    let fake = Fake::new();
+    fake.install_then_hand_edit(&mk("conflicted"), "# hand-added directive\n");
+    fake.seed_foreign("stranger", "not a goetia artifact at all\n");
+
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(
+        dir.path(),
+        "daemons:\n  conflicted:\n    command: [daemon]\n  stranger:\n    command: [daemon]\n",
+    );
+
+    let (code, out, _err) = dispatch_elevated(
+        &["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()],
+        &fake,
+    );
+
+    assert_eq!(
+        code, 1,
+        "an unresolvable refusal must win over a resolvable conflict:\n{out}"
+    );
+}
+
+/// `--dry-run`'s preview must not silently drop a `Warning` a generator
+/// produces (e.g. SCM clamping a too-large `restart-delay`) the way an
+/// earlier version of `preview_artifact` did on Windows.
+#[skuld::test]
+fn install_dry_run_prints_generator_warnings() {
+    let dir = tempfile::tempdir().unwrap();
+    // A restart-delay past SC_ACTION.Delay's ~49.71-day DWORD-milliseconds
+    // ceiling: only the Windows SCM preview warns about this, but the test
+    // must still pass (vacuously) on the other two platforms.
+    write_manifest(
+        dir.path(),
+        "daemons:\n  frpc:\n    command: [frpc]\n    type: managed\n    restart: on-failure\n    restart-delay: 60d\n",
+    );
+    let cli = Cli::try_parse_from([
+        "goetia",
+        "daemon",
+        "install",
+        "-f",
+        dir.path().to_str().unwrap(),
+        "--dry-run",
+    ])
+    .expect("parse");
+    let get_manager = || -> goetia::Result<Box<dyn ServiceManager>> { panic!("dry-run must never touch the manager") };
+    let is_elevated = || -> bool { panic!("dry-run must never check elevation") };
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+
+    let code = cli::dispatch(&cli, &get_manager, &is_elevated, &mut out, &mut err);
+
+    assert_eq!(code, 0);
+    if cfg!(windows) {
+        let err = String::from_utf8_lossy(&err);
+        assert!(err.contains("warning:"), "stderr:\n{err}");
+    }
+}
+
+/// The `list`/`status`/`show`/`diff` partitioning helper must warn about an
+/// `OursUnreadable` entry and escalate the exit code for every one of those
+/// subcommands, not just the ones a prior copy-pasted version happened to
+/// get right.
+#[skuld::test]
+fn list_reports_an_unreadable_entry_and_exits_nonzero() {
+    let fake = Fake::new();
+    fake.seed_unreadable("corrupt");
+    fake.install(&mk("readable"), false).unwrap();
+
+    let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "list"], &fake);
+
+    assert_eq!(code, 1);
+    assert!(err.contains("corrupt"), "{err}");
+    assert!(err.contains("unreadable"), "{err}");
+    assert!(out.contains("readable"), "{out}");
+}
+
+#[skuld::test]
+fn status_all_reports_an_unreadable_entry_and_exits_nonzero() {
+    let fake = Fake::new();
+    fake.seed_unreadable("corrupt");
+    fake.install(&mk("readable"), false).unwrap();
+
+    let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "status"], &fake);
+
+    assert_eq!(code, 1);
+    assert!(err.contains("corrupt"), "{err}");
+    assert!(out.contains("readable"), "{out}");
+}
+
+#[skuld::test]
+fn show_unknown_id_is_not_installed() {
+    let fake = Fake::new();
+
+    let (code, _out, err) = dispatch_read_only(&["goetia", "daemon", "show", "nonexistent"], &fake);
+
+    assert_eq!(code, 1);
+    assert!(err.contains("nonexistent"), "{err}");
+    assert!(err.contains("not installed"), "{err}");
+}
+
+/// The correctness/failure review round found this bug specifically: an
+/// unreadable id was reported by `diff` as `"not installed (would be
+/// created)"` — the opposite of the truth, and silently (exit 0, no
+/// warning) — because the partitioning logic dropped `OursUnreadable`
+/// entries instead of reporting them.
+#[skuld::test]
+fn diff_reports_an_unreadable_entry_instead_of_claiming_it_would_be_created() {
+    let fake = Fake::new();
+    fake.seed_unreadable("corrupt");
+
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "daemons:\n  corrupt:\n    command: [daemon]\n");
+
+    let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
+
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.contains("unreadable"), "{err}");
+    assert!(!out.contains("would be created"), "stdout:\n{out}");
+}
+
+#[skuld::test]
+fn diff_reports_up_to_date_when_the_spec_is_unchanged() {
+    let fake = Fake::new();
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(
+        dir.path(),
+        "daemons:\n  frpc:\n    command: [frpc]\n    restart: on-failure\n",
+    );
+
+    // Install the manifest's own resolved spec directly, rather than a
+    // hand-built one: `resolve()` makes `command[0]` absolute against the
+    // manifest's directory, which a literal `mk("frpc")` fixture would not
+    // match, making the diff always non-empty for the wrong reason.
+    let (specs, _warnings) = goetia::spec::load(&manifest).expect("load fixture manifest");
+    fake.install(&specs[0], false).expect("seed install");
+
+    let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(out.contains("up to date"), "{out}");
+}
+
+#[skuld::test]
+fn diff_reports_not_installed_for_an_id_absent_from_the_manager() {
+    let fake = Fake::new();
+
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [frpc]\n");
+
+    let (code, out, _err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
+
+    assert_eq!(code, 0);
+    assert!(out.contains("not installed (would be created)"), "{out}");
+}
+
+/// Regression coverage for the review round's `enable`/`start` post-install
+/// error-reporting branches in `install::run`, otherwise unreachable from
+/// any test — see [`FlakyManager`].
+#[skuld::test]
+fn install_reports_enable_and_start_failures_and_exits_nonzero() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [frpc]\n");
+    let mgr = FlakyManager {
+        inner: Fake::new(),
+        fail_enable_for: Some("frpc".to_string()),
+        fail_start_for: Some("frpc".to_string()),
+    };
+
+    let cli = Cli::try_parse_from([
+        "goetia",
+        "daemon",
+        "install",
+        "-f",
+        manifest.to_str().unwrap(),
+        "--enable",
+        "--start",
+    ])
+    .expect("parse");
+    let get_manager = {
+        let mgr = mgr.clone();
+        move || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(mgr.clone())) }
+    };
+    let is_elevated = || true;
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+
+    let code = cli::dispatch(&cli, &get_manager, &is_elevated, &mut out, &mut err);
+
+    assert_eq!(
+        code,
+        1,
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out),
+        String::from_utf8_lossy(&err)
+    );
+    let err = String::from_utf8_lossy(&err);
+    assert!(err.contains("enable"), "{err}");
+    assert!(err.contains("start"), "{err}");
+}
+
+/// `--json`/`-v`/`-q` are reserved (see `Cli`'s doc comments) rather than
+/// wired to per-subcommand output yet. Pinned here so that reservation is
+/// itself a tested, deliberate state: a change to `list`'s output with
+/// `--json` present would need to update this test, rather than silently
+/// landing unnoticed in either direction.
+#[skuld::test]
+fn cli_accepts_json_verbose_quiet_as_currently_inert() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+
+    let (plain_code, plain_out, _) = dispatch_read_only(&["goetia", "daemon", "list"], &fake);
+    let (flagged_code, flagged_out, _) = dispatch_read_only(&["goetia", "--json", "-v", "-q", "daemon", "list"], &fake);
+
+    assert_eq!(plain_code, flagged_code);
+    assert_eq!(plain_out, flagged_out, "these flags must not be silently half-wired");
 }

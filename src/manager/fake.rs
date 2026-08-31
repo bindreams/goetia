@@ -69,6 +69,19 @@ impl Fake {
         );
     }
 
+    /// Test-only seeding: place a Goetia-marked entry at `id` whose blob will
+    /// not decode — simulating a newer-schema artifact or one that bit-rotted.
+    /// `install_then_hand_edit` cannot produce this state: `extract` only
+    /// ever reads the marker and `Spec` line, so appending trailing text
+    /// never breaks decoding. This is the only way to reach
+    /// `Ownership::OursUnreadable`/[`Installed::OursUnreadable`] from outside
+    /// the crate — every CLI test that exercises that path needs it.
+    ///
+    /// [`Installed::OursUnreadable`]: crate::manager::Installed::OursUnreadable
+    pub fn seed_unreadable(&self, id: &str) {
+        self.seed_foreign(id, format!("{FAKE_MARKER}\nSpec: not-valid-base64!!!\n"));
+    }
+
     /// Test-only seeding: install `spec` normally, then append `extra_line`
     /// to the stored artifact so it no longer matches what regenerating its
     /// own embedded spec would produce — simulating a hand-edit made
@@ -110,6 +123,21 @@ fn extract(text: &str) -> Result<Option<Blob>> {
 fn not_installed(id: &Id) -> Error {
     Error::NotInstalled {
         id: id.as_str().to_string(),
+    }
+}
+
+/// Refuse an operation against a *foreign* (unmarked) entry — the same
+/// "goetia never touches a service it did not create" rule `install`
+/// enforces via `decide`. A marked-but-undecodable entry still passes:
+/// the marker alone is proof of ownership, and `uninstall` in particular
+/// documents this as the way out of `decide::Outcome::RefuseUnreadable`
+/// (its `recovery` text names exactly this verb). Only `install` itself
+/// needs the full three-way `Ownership` distinction (via `decide`); every
+/// other verb only needs this narrower "is this even ours" gate.
+fn require_ours(entry: &Entry, id: &Id) -> Result<()> {
+    match extract(&entry.text) {
+        Ok(None) => Err(not_installed(id)),
+        Ok(Some(_)) | Err(_) => Ok(()),
     }
 }
 
@@ -161,15 +189,16 @@ impl ServiceManager for Fake {
 
     fn uninstall(&self, id: &Id) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
-        if state.remove(id.as_str()).is_none() {
-            return Err(not_installed(id));
-        }
+        let entry = state.get(id.as_str()).ok_or_else(|| not_installed(id))?;
+        require_ours(entry, id)?;
+        state.remove(id.as_str());
         Ok(())
     }
 
     fn enable(&self, id: &Id) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         let entry = state.get_mut(id.as_str()).ok_or_else(|| not_installed(id))?;
+        require_ours(entry, id)?;
         entry.enabled = true;
         Ok(())
     }
@@ -177,6 +206,7 @@ impl ServiceManager for Fake {
     fn disable(&self, id: &Id) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         let entry = state.get_mut(id.as_str()).ok_or_else(|| not_installed(id))?;
+        require_ours(entry, id)?;
         entry.enabled = false;
         Ok(())
     }
@@ -184,6 +214,7 @@ impl ServiceManager for Fake {
     fn start(&self, id: &Id) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         let entry = state.get_mut(id.as_str()).ok_or_else(|| not_installed(id))?;
+        require_ours(entry, id)?;
         entry.running = true;
         Ok(())
     }
@@ -191,6 +222,7 @@ impl ServiceManager for Fake {
     fn stop(&self, id: &Id) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         let entry = state.get_mut(id.as_str()).ok_or_else(|| not_installed(id))?;
+        require_ours(entry, id)?;
         entry.running = false;
         Ok(())
     }
@@ -198,6 +230,7 @@ impl ServiceManager for Fake {
     fn status(&self, id: &Id) -> Result<Status> {
         let state = self.state.lock().expect("Fake mutex poisoned");
         let entry = state.get(id.as_str()).ok_or_else(|| not_installed(id))?;
+        require_ours(entry, id)?;
         Ok(Status {
             state: if entry.running { State::Running } else { State::Stopped },
             pid: if entry.running { Some(FAKE_PID) } else { None },

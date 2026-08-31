@@ -1,10 +1,11 @@
 //! Helpers shared by more than one subcommand module.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 
 use crate::error::{Error, Result};
-use crate::manager::ServiceManager;
+use crate::manager::{Installed, ServiceManager, State};
 use crate::spec::{DaemonSpec, Id, Warning};
 
 /// Load and resolve a manifest, printing every [`Warning`] it produced to
@@ -49,6 +50,54 @@ pub(crate) fn select_by_ids<'a>(
 /// `positional_is_always_an_id_never_a_path`.
 pub(crate) fn parse_id(s: &str) -> Result<crate::spec::Id> {
     crate::spec::Id::try_from(s.to_string())
+}
+
+/// One [`ServiceManager::list`] entry, indexed by id. `list`, `status`,
+/// `show`, and `diff` all need this same split — spec/state/enabled for
+/// what decoded cleanly, plus which names exist but did not — so it lives
+/// here rather than as four independently-maintained copies of the same
+/// `match`. A prior copy-per-subcommand version of this logic let `diff`
+/// silently diverge from the other three, dropping `OursUnreadable`
+/// entries instead of warning about them.
+pub(crate) struct InstalledIndex {
+    pub ours: BTreeMap<String, (DaemonSpec, State, bool)>,
+    pub unreadable: BTreeMap<String, String>,
+}
+
+/// Partition `installed` into [`InstalledIndex`]. Prints nothing — call
+/// [`print_unreadable_warnings`] to report the `unreadable` half, which
+/// every caller must do somewhere: an `OursUnreadable` entry silently
+/// vanishing is exactly the failure mode that variant exists to prevent
+/// (see [`Installed::OursUnreadable`]'s doc comment).
+pub(crate) fn partition_installed(installed: Vec<Installed>) -> InstalledIndex {
+    let mut ours = BTreeMap::new();
+    let mut unreadable = BTreeMap::new();
+    for entry in installed {
+        match entry {
+            Installed::Ours { spec, state, enabled } => {
+                ours.insert(spec.id.as_str().to_string(), (spec, state, enabled));
+            }
+            Installed::OursUnreadable { name, reason } => {
+                unreadable.insert(name, reason);
+            }
+        }
+    }
+    InstalledIndex { ours, unreadable }
+}
+
+pub(crate) fn print_unreadable_warnings(unreadable: &BTreeMap<String, String>, err: &mut dyn Write) {
+    for (name, reason) in unreadable {
+        let _ = writeln!(err, "warning: {name}: installed but unreadable: {reason}");
+    }
+}
+
+pub(crate) fn state_str(state: State) -> &'static str {
+    match state {
+        State::Running => "running",
+        State::Stopped => "stopped",
+        State::Failed => "failed",
+        State::Unknown => "unknown",
+    }
 }
 
 /// The message every mutating subcommand prints and the exit code (`1`) it

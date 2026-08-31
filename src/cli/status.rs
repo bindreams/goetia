@@ -6,23 +6,14 @@ use std::io::Write;
 
 use clap::Args as ClapArgs;
 
-use super::support::parse_id;
+use super::support::{parse_id, partition_installed, print_unreadable_warnings, state_str};
 use crate::error::Result;
-use crate::manager::{Installed, ServiceManager, State};
+use crate::manager::ServiceManager;
 
 #[derive(ClapArgs, Debug)]
 pub struct Args {
     /// Daemon ids to report on. With none, reports every installed daemon.
     pub ids: Vec<String>,
-}
-
-fn state_str(state: State) -> &'static str {
-    match state {
-        State::Running => "running",
-        State::Stopped => "stopped",
-        State::Failed => "failed",
-        State::Unknown => "unknown",
-    }
 }
 
 pub fn run(
@@ -81,17 +72,12 @@ fn status_all(mgr: &dyn ServiceManager, out: &mut dyn Write, err: &mut dyn Write
         }
     };
 
-    let mut exit = 0;
-    for entry in &installed {
-        match entry {
-            Installed::Ours { spec, state, enabled } => {
-                let _ = writeln!(out, "{}: {} (enabled={enabled})", spec.id, state_str(*state));
-            }
-            Installed::OursUnreadable { name, reason } => {
-                let _ = writeln!(err, "warning: {name}: installed but unreadable: {reason}");
-                exit = 1;
-            }
-        }
+    let index = partition_installed(installed);
+    print_unreadable_warnings(&index.unreadable, err);
+
+    for (id, (_spec, state, enabled)) in &index.ours {
+        let _ = writeln!(out, "{id}: {} (enabled={enabled})", state_str(*state));
     }
-    exit
+
+    if index.unreadable.is_empty() { 0 } else { 1 }
 }

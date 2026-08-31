@@ -94,3 +94,43 @@ fn operations_on_an_unknown_id_error() {
     assert!(fake.stop(&id).is_err());
     assert!(fake.status(&id).is_err());
 }
+
+/// A foreign entry (present, but not Goetia's) must be refused by every
+/// verb, not just `install` — "goetia never touches a service it did not
+/// create" is not an install-only rule. Regression coverage for a defect
+/// review found: only `install` classified ownership, so `uninstall` could
+/// delete an unrelated stranger's service and every other verb could
+/// silently operate on one too.
+#[skuld::test]
+fn mutating_verbs_refuse_a_foreign_id() {
+    let fake = Fake::new();
+    fake.seed_foreign("stranger", "not a goetia artifact at all\n");
+    let id = Id::try_from("stranger").unwrap();
+
+    assert!(fake.uninstall(&id).is_err(), "uninstall must refuse a foreign id");
+    assert!(fake.enable(&id).is_err(), "enable must refuse a foreign id");
+    assert!(fake.disable(&id).is_err(), "disable must refuse a foreign id");
+    assert!(fake.start(&id).is_err(), "start must refuse a foreign id");
+    assert!(fake.stop(&id).is_err(), "stop must refuse a foreign id");
+    assert!(fake.status(&id).is_err(), "status must refuse a foreign id");
+    // Refusing it must not have removed it either.
+    assert_eq!(
+        fake.list().unwrap().len(),
+        0,
+        "a foreign entry is excluded from list(), not deleted"
+    );
+}
+
+/// The marker alone is proof of ownership: an entry Goetia marked but can
+/// no longer decode is still *ours*, so `uninstall` — the documented
+/// recovery for `decide::Outcome::RefuseUnreadable` — must still work on
+/// it, unlike a truly foreign entry.
+#[skuld::test]
+fn uninstall_accepts_an_unreadable_entry() {
+    let fake = Fake::new();
+    fake.seed_foreign("corrupt", format!("{FAKE_MARKER}\nSpec: not-valid-base64!!!\n"));
+    let id = Id::try_from("corrupt").unwrap();
+
+    fake.uninstall(&id)
+        .expect("uninstall must accept a marked-but-undecodable entry");
+}
