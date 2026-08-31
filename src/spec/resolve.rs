@@ -81,7 +81,7 @@ fn resolve_one(id: Id, raw: RawSpec, base_dir: &Path, warnings: &mut Vec<Warning
         reject_unemittable(&id, "command", arg)?;
     }
     if let Some(first) = command.first_mut() {
-        *first = resolve_path_string(first, base_dir);
+        *first = resolve_path_string(&id, "command", first, base_dir)?;
     }
 
     let cwd = resolve_optional_path(&id, "cwd", raw.cwd, base_dir)?;
@@ -109,6 +109,21 @@ fn resolve_one(id: Id, raw: RawSpec, base_dir: &Path, warnings: &mut Vec<Warning
     let kind = raw.kind.unwrap_or(Kind::Simple);
     warn_on_windows_divergences(&id, kind, cwd.is_some(), logs.is_some(), restart, warnings);
 
+    // The absoluteness guarantee has exactly one runtime enforcement point
+    // today, inside `blob::decode` — which only fires when re-reading an
+    // artifact that was already written. On the direct resolve -> generate
+    // path that `install`/`show` take, a regression here would be baked into
+    // a unit file before anything noticed. Catch it at the source instead.
+    debug_assert!(
+        Path::new(&command[0]).is_absolute()
+            && cwd.as_deref().is_none_or(Path::is_absolute)
+            && logs.as_deref().is_none_or(Path::is_absolute),
+        "resolve must return absolute paths; got command[0]={:?} cwd={:?} logs={:?}",
+        command[0],
+        cwd,
+        logs,
+    );
+
     Ok(DaemonSpec {
         id,
         name,
@@ -127,7 +142,7 @@ fn resolve_optional_path(id: &Id, field: &str, raw: Option<String>, base_dir: &P
     match raw {
         Some(s) => {
             reject_unemittable(id, field, &s)?;
-            Ok(Some(PathBuf::from(resolve_path_string(&s, base_dir))))
+            Ok(Some(PathBuf::from(resolve_path_string(id, field, &s, base_dir)?)))
         }
         None => Ok(None),
     }
@@ -137,13 +152,30 @@ fn resolve_optional_path(id: &Id, field: &str, raw: Option<String>, base_dir: &P
 /// `Path::is_absolute` (not a string prefix check) so this behaves
 /// correctly on both a POSIX host (`/opt/rt`) and a Windows host
 /// (`C:\base`), whose absoluteness rules differ.
-fn resolve_path_string(raw: &str, base_dir: &Path) -> String {
+fn resolve_path_string(id: &Id, field: &str, raw: &str, base_dir: &Path) -> Result<String, Error> {
     let p = Path::new(raw);
-    if p.is_absolute() {
-        raw.to_string()
+    let joined = if p.is_absolute() {
+        p.to_path_buf()
     } else {
-        normalize(&base_dir.join(p)).to_string_lossy().into_owned()
+        normalize(&base_dir.join(p))
+    };
+    // Assert the post-condition rather than assume the join achieved it.
+    // A Windows drive-relative path (`C:bin/frpc.exe`) is neither absolute
+    // nor joinable: `PathBuf::push` truncates the buffer whenever the pushed
+    // path carries a prefix, so `base_dir.join("C:bin")` silently discards
+    // `base_dir` and yields `C:bin` — still relative. Resolving it for real
+    // would mean reading the per-drive current directory, which Rust exposes
+    // no portable way to do, and which would anchor the artifact to whatever
+    // that happened to be in the *installing* shell. Reject it instead.
+    if !joined.is_absolute() {
+        return Err(invalid(
+            id,
+            &format!(
+                "field `{field}` is `{raw}`, which cannot be resolved to an absolute path; drive-relative paths like `C:dir` are not supported - write a full path"
+            ),
+        ));
     }
+    Ok(joined.to_string_lossy().into_owned())
 }
 
 /// Make `dir` absolute against the process's working directory.
@@ -157,11 +189,24 @@ fn absolutize(dir: &Path) -> Result<PathBuf, Error> {
     if dir.is_absolute() {
         return Ok(normalize(dir));
     }
-    let cwd = std::env::current_dir().map_err(|source| Error::Io {
-        path: dir.to_path_buf(),
-        source,
+    // Not `Error::Io`: that variant means "reading `path` from disk failed",
+    // and nothing was read from `dir` here. Reporting `failed to read
+    // <manifest dir>` would send someone chasing permissions on a directory
+    // that is fine, when the real fault is the process's own cwd being gone.
+    let cwd = std::env::current_dir().map_err(|source| {
+        Error::Other(format!(
+            "failed to read the current directory while resolving `{}`: {source}",
+            dir.display()
+        ))
     })?;
-    Ok(normalize(&cwd.join(dir)))
+    let joined = normalize(&cwd.join(dir));
+    if !joined.is_absolute() {
+        return Err(Error::Other(format!(
+            "manifest directory `{}` cannot be resolved to an absolute path; drive-relative paths like `C:dir` are not supported — pass a full path to `-f`",
+            dir.display()
+        )));
+    }
+    Ok(joined)
 }
 
 /// Drop `.` components so a manifest loaded from `.` yields `<cwd>` rather
