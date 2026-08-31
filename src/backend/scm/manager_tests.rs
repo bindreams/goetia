@@ -108,3 +108,26 @@ fn is_not_found_matches_only_error_service_does_not_exist() {
     let access_denied = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(5));
     assert!(!is_not_found(&access_denied));
 }
+
+#[skuld::test]
+fn unreadable_notice_is_one_line_and_agrees_in_number() {
+    // The wording carries the honest part of this diagnostic — that ownership
+    // is *unknown*, not that the services are foreign — so pin it rather than
+    // let a later reword quietly turn it into a reassuring lie.
+    let one = unreadable_notice(1);
+    assert!(one.contains("1 service "), "singular noun: {one}");
+    assert!(one.contains("unknown for it"), "singular pronoun: {one}");
+
+    let many = unreadable_notice(3);
+    assert!(many.contains("3 services "), "plural noun: {many}");
+    assert!(many.contains("unknown for them"), "plural pronoun: {many}");
+
+    for text in [&one, &many] {
+        assert!(!text.contains('\n'), "must stay one line: {text}");
+        assert!(
+            text.contains("may be missing"),
+            "must not claim the list is complete: {text}"
+        );
+        assert!(text.contains("re-run elevated"), "must name the remedy: {text}");
+    }
+}

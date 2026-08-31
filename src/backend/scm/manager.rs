@@ -218,6 +218,7 @@ impl ServiceManager for ScmManager {
 
     fn list(&self) -> Result<Vec<Installed>> {
         let mut out = Vec::new();
+        let mut unreadable = 0usize;
         for name in registry::list_service_names()? {
             // A registry read failure for one unrelated service (e.g. a
             // driver whose `Parameters` key carries a restrictive ACL) must
@@ -229,7 +230,15 @@ impl ServiceManager for ScmManager {
             let params = match registry::read_parameters(&name) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("warning: list: could not read Parameters for `{name}`, skipping: {e}");
+                    // Most services on a Windows box carry an ACL that denies
+                    // a non-elevated read of their `Parameters`, so warning per
+                    // service turns `goetia daemon list` into a wall of noise
+                    // about services that were never ours. But staying silent
+                    // would be a lie in the other direction: a denied read
+                    // means ownership is *unknown*, so one of ours could be
+                    // missing from the listing. Count them and say so once.
+                    unreadable += 1;
+                    let _ = e;
                     continue;
                 }
             };
@@ -268,6 +277,9 @@ impl ServiceManager for ScmManager {
                     reason: format!("marked ours, but its live status could not be read: {e}"),
                 }),
             }
+        }
+        if unreadable > 0 {
+            eprintln!("warning: {}", unreadable_notice(unreadable));
         }
         Ok(out)
     }
@@ -863,3 +875,18 @@ fn set_start_type(service: &Service, start_type: ServiceStartType) -> std::io::R
 #[cfg(test)]
 #[path = "manager_tests.rs"]
 mod manager_tests;
+
+/// One line, not one per service.
+///
+/// Most services on a Windows box carry an ACL that denies a non-elevated read
+/// of their `Parameters`, so warning per service buries `goetia daemon list` in
+/// noise about services that were never ours. Staying silent would be the
+/// opposite lie: a denied read means ownership is *unknown*, so one of ours
+/// could be missing from the listing.
+fn unreadable_notice(count: usize) -> String {
+    let s = if count == 1 { "" } else { "s" };
+    format!(
+        "{count} service{s} could not be inspected (access denied reading registry Parameters). Ownership is unknown for {}, so a Goetia daemon may be missing from this list; re-run elevated.",
+        if count == 1 { "it" } else { "them" }
+    )
+}
