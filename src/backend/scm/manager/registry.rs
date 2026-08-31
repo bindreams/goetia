@@ -65,18 +65,33 @@ pub fn read_parameters(name: &str) -> Result<BTreeMap<String, String>> {
     Ok(out)
 }
 
-/// Write every entry in `params` under `Services\<name>\Parameters`,
-/// creating the subkey if this is the first write for `name`. Does not
-/// remove pre-existing values not in `params` — Goetia's own four fields are
-/// the only ones it ever writes or reads here.
+/// Write `params` under `Services\<name>\Parameters` as the subkey's
+/// *entire* contents: any pre-existing value not in `params` is removed
+/// first, not merely left alone. A hand-edit that adds a stray value under
+/// `Parameters` must still be overwritable by `install --force` — leaving
+/// it behind would mean `on_disk` (via [`read_parameters`], which reads
+/// everything present) never converges with `desired`/`regenerated` (which
+/// only ever have Goetia's own four fields), and `--force` would report
+/// success while the very artifact it was asked to fix keeps reporting
+/// `Conflict` on every subsequent `install`.
 pub fn write_parameters(name: &str, params: &BTreeMap<String, String>) -> Result<()> {
-    let path = parameters_key_path(name);
-    let (key, _) = RegKey::predef(HKEY_LOCAL_MACHINE)
-        .create_subkey(&path)
-        .map_err(|e| registry_error("create", &path, e))?;
+    let service_path = service_key_path(name);
+    let service_key = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(&service_path, KEY_WRITE)
+        .map_err(|e| registry_error("open", &service_path, e))?;
+
+    match service_key.delete_subkey_all("Parameters") {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(registry_error("delete", &parameters_key_path(name), e)),
+    }
+
+    let (key, _) = service_key
+        .create_subkey("Parameters")
+        .map_err(|e| registry_error("create", &parameters_key_path(name), e))?;
     for (field, value) in params {
         key.set_value(field, value)
-            .map_err(|e| registry_error(&format!("write {field} under"), &path, e))?;
+            .map_err(|e| registry_error(&format!("write {field} under"), &parameters_key_path(name), e))?;
     }
     Ok(())
 }

@@ -4,14 +4,15 @@
 
 use std::collections::BTreeMap;
 use std::process::Command;
+use std::time::Duration;
 
 use goetia::backend::scm::manager::ScmManager;
 use goetia::decide::Outcome;
 use goetia::manager::conformance;
 use goetia::manager::{Installed, ServiceManager as _, State};
-use goetia::spec::Id;
+use goetia::spec::{Id, Restart, User};
 
-use crate::common::{conformance_mk, fixture_command, mk_spec};
+use crate::common::{self, conformance_mk, fixture_command, mk_spec};
 use crate::install_helper::INSTALL_AS;
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
 
@@ -395,4 +396,94 @@ fn real_account_gets_service_logon_right() {
     let status = mgr.status(&target).expect("status");
     assert_eq!(status.state, State::Running);
     let _ = mgr.stop(&target);
+}
+
+// Round-tripping restart: on-failure (the Some(fa) branch of apply_failure_actions/read_failure_actions) ==============
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn restart_on_failure_round_trips_failure_actions() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = common::mk_spec_full(
+        &id,
+        fixture_command(&id, 1, 1, "plain"),
+        BTreeMap::new(),
+        User::Root,
+        Restart::OnFailure,
+        Some(Duration::from_secs(3)),
+    );
+
+    let outcome = mgr.install(&spec, false).expect("install");
+    assert!(matches!(outcome, Outcome::Create), "{outcome:?}");
+
+    // A second, unchanged install must read back exactly what was written —
+    // proving `read_failure_actions`'s reconstruction agrees with
+    // `apply_failure_actions`'s write, not merely that both compile.
+    let second = mgr.install(&spec, false).expect("reinstall, unchanged spec");
+    assert!(matches!(second, Outcome::UpToDate), "{second:?}");
+
+    let installed = mgr.list().expect("list");
+    let found = installed
+        .into_iter()
+        .find_map(|entry| match entry {
+            Installed::Ours { spec: s, .. } if s.id.as_str() == id => Some(s),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{id} did not appear in list"));
+    assert_eq!(found.restart, Restart::OnFailure);
+    assert_eq!(found.restart_delay, Some(Duration::from_secs(3)));
+}
+
+// Ownership::OursUnreadable: a blob that decodes but whose account can no longer be resolved =========================
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn deleted_account_makes_the_service_oursunreadable() {
+    let suffix = format!("{:08x}", rand::random::<u32>());
+    let account = format!("gt{suffix}");
+    let password = "Goetia!Test1234";
+    let user_guard = LocalUserGuard::create(&account, password);
+    let sid = common::sid_string_for_account(&account);
+
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+
+    // `user: {id: <sid>}` — a `User::Name` account never fails to
+    // re-resolve (`identity::resolve` does no lookup for it at all), so
+    // only the SID path can reach `Ownership::OursUnreadable` once the
+    // account is gone.
+    let output = Command::new(support::current_exe_str())
+        .arg(INSTALL_AS)
+        .arg(guard.id())
+        .arg(&account)
+        .arg(&sid)
+        .env("GOETIA_SERVICE_PASSWORD", password)
+        .output()
+        .expect("spawn the install-as-account helper");
+    assert!(
+        output.status.success(),
+        "install as a real account (by SID) failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Delete the account out from under the already-installed service, then
+    // drop the guard's own cleanup obligation for it (nothing left to
+    // delete).
+    drop(user_guard);
+
+    let installed = ScmManager::new().list().expect("list after the account is gone");
+    let entry = installed
+        .into_iter()
+        .find(|entry| match entry {
+            Installed::Ours { spec, .. } => spec.id.as_str() == id,
+            Installed::OursUnreadable { name, .. } => name == &id,
+        })
+        .unwrap_or_else(|| panic!("{id} disappeared from list entirely instead of becoming OursUnreadable"));
+    match entry {
+        Installed::OursUnreadable { reason, .. } => {
+            assert!(!reason.is_empty());
+        }
+        Installed::Ours { .. } => panic!("expected OursUnreadable once the account backing `user.id` is deleted"),
+    }
 }

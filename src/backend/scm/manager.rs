@@ -100,7 +100,7 @@ use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, S
 use crate::decide::{self, Outcome, Ownership};
 use crate::error::{Error, Result};
 use crate::manager::{Installed, ServiceManager, State, Status};
-use crate::spec::{DaemonSpec, Id, User, Warning};
+use crate::spec::{DaemonSpec, Id, Kind, User, Warning};
 
 // ScmManager ===========================================================================================================
 
@@ -127,11 +127,13 @@ impl ServiceManager for ScmManager {
             crate::version(),
             force,
         );
-        if matches!(
-            outcome,
-            Outcome::Create | Outcome::Update { .. } | Outcome::Stale { .. }
-        ) {
-            apply(spec, &d.reg, matches!(d.found, Ownership::Absent))?;
+        match outcome {
+            Outcome::Create | Outcome::Update { .. } | Outcome::Stale { .. } => {
+                apply(spec, &d.reg, matches!(d.found, Ownership::Absent), d.current_start_type)?;
+            }
+            // See `reapply_uncompared_effects`'s own doc comment.
+            Outcome::UpToDate => reapply_uncompared_effects(spec, &d.reg)?,
+            _ => {}
         }
         Ok(outcome)
     }
@@ -173,19 +175,19 @@ impl ServiceManager for ScmManager {
     }
 
     fn start(&self, id: &Id) -> Result<()> {
-        let (scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
+        let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
         require_ours(id)?;
         drop(service);
-        let mut actor = scm_wait::SystemScmActor::open(&scm, id.as_str())
+        let mut actor = scm_wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to start it: {e}")))?;
         scm_wait::start_via_notify(&mut actor).map_err(|e| Error::Other(format!("start `{id}`: {e}")))
     }
 
     fn stop(&self, id: &Id) -> Result<()> {
-        let (scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
+        let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
         require_ours(id)?;
         drop(service);
-        let mut actor = scm_wait::SystemScmActor::open(&scm, id.as_str())
+        let mut actor = scm_wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to stop it: {e}")))?;
         scm_wait::stop_via_notify(&mut actor).map_err(|e| Error::Other(format!("stop `{id}`: {e}")))
     }
@@ -265,6 +267,12 @@ struct Discovery {
     desired: String,
     found: Ownership,
     on_disk: Option<String>,
+    /// `Some(dwStartType)` when the service already exists — threaded into
+    /// `apply`'s update path so a routine spec-driven `ChangeServiceConfigW`
+    /// preserves whatever `enable`/`disable` last set, rather than
+    /// resetting it. `None` when absent (a fresh `Create` always uses
+    /// `SERVICE_DEMAND_START`; see trap 5).
+    current_start_type: Option<ServiceStartType>,
 }
 
 /// The shim's expected location: a sibling of the currently running
@@ -288,6 +296,21 @@ fn print_warnings(warnings: &[Warning]) {
 }
 
 fn discover(spec: &DaemonSpec) -> Result<Discovery> {
+    // `type: simple` needs `goetia-shim` (Task 14); `generate::registration`
+    // already builds a (never-exercised) `ImagePath`/blob for it, so without
+    // this gate `install`/`diff` would create a real, broken service
+    // pointing at a shim binary that does not exist yet. `type: simple` is
+    // the *default* kind (unset `type:`), so this is the primary path for
+    // any Windows user who does not write `type: managed` explicitly, not a
+    // rare opt-in.
+    if spec.kind == Kind::Simple {
+        return Err(Error::Other(format!(
+            "daemon `{}`: type: simple is not supported on Windows yet (needs goetia-shim, Task 14); use \
+             `type: managed` instead",
+            spec.id
+        )));
+    }
+
     let identity = identity::resolve(&spec.user)?;
     let (reg, warnings) = generate::registration(spec, &identity, &shim_path());
     print_warnings(&warnings);
@@ -295,14 +318,14 @@ fn discover(spec: &DaemonSpec) -> Result<Discovery> {
 
     let scm = open_scm(ServiceManagerAccess::CONNECT)?;
     let existing = scm.open_service(spec.id.as_str(), ServiceAccess::QUERY_CONFIG);
-    let (found, on_disk) = match existing {
-        Err(e) if is_not_found(&e) => (Ownership::Absent, None),
+    let (found, on_disk, current_start_type) = match existing {
+        Err(e) if is_not_found(&e) => (Ownership::Absent, None, None),
         Err(e) => return Err(to_error(&format!("open service `{}` for discovery", spec.id), e)),
         Ok(service) => {
             let params = registry::read_parameters(spec.id.as_str())?;
             let found = classify(&params);
-            let live = read_live_registration(&service, spec.id.as_str(), &params)?;
-            (found, Some(generate::render(&live)))
+            let (live, start_type) = read_live_registration(&service, spec.id.as_str(), &params)?;
+            (found, Some(generate::render(&live)), Some(start_type))
         }
     };
 
@@ -311,6 +334,7 @@ fn discover(spec: &DaemonSpec) -> Result<Discovery> {
         desired,
         found,
         on_disk,
+        current_start_type,
     })
 }
 
@@ -348,7 +372,7 @@ fn read_live_registration(
     service: &Service,
     name: &str,
     live_params: &BTreeMap<String, String>,
-) -> Result<ScmRegistration> {
+) -> Result<(ScmRegistration, ServiceStartType)> {
     let cfg = service
         .query_config()
         .map_err(|e| to_error(&format!("query configuration for `{name}`"), e))?;
@@ -366,15 +390,18 @@ fn read_live_registration(
         .filter(|a| !a.eq_ignore_ascii_case("LocalSystem"));
     let failure_actions = read_failure_actions(service, name)?;
 
-    Ok(ScmRegistration {
-        name: name.to_string(),
-        display_name: cfg.display_name.to_string_lossy().into_owned(),
-        executable,
-        arguments,
-        account,
-        failure_actions,
-        parameters: live_params.clone(),
-    })
+    Ok((
+        ScmRegistration {
+            name: name.to_string(),
+            display_name: cfg.display_name.to_string_lossy().into_owned(),
+            executable,
+            arguments,
+            account,
+            failure_actions,
+            parameters: live_params.clone(),
+        },
+        cfg.start_type,
+    ))
 }
 
 fn read_failure_actions(service: &Service, name: &str) -> Result<Option<GenFailureActions>> {
@@ -454,18 +481,44 @@ fn split_command_line(cmdline: &str) -> (PathBuf, Vec<String>) {
 // apply (write path) ===================================================================================================
 
 /// Write `reg` (create or update), then everything outside `ScmRegistration`
-/// itself: the metadata blob, `env`, and — for a real account —
-/// `SeServiceLogonRight`. The blob write comes immediately after
-/// create/update, minimizing trap 1's crash window.
-fn apply(spec: &DaemonSpec, reg: &ScmRegistration, create: bool) -> Result<()> {
+/// itself: the metadata blob, failure actions, `env`, and — for a real
+/// account — `SeServiceLogonRight`. The blob write comes immediately after
+/// create/update, minimizing trap 1's crash window. `current_start_type` is
+/// `Discovery::current_start_type` — `None` for a fresh create, `Some(_)`
+/// (preserved rather than reset) for an update; see `service_info`.
+fn apply(
+    spec: &DaemonSpec,
+    reg: &ScmRegistration,
+    create: bool,
+    current_start_type: Option<ServiceStartType>,
+) -> Result<()> {
     let password = match spec.user {
         User::Root => None,
-        _ => identity::service_password(),
+        _ => {
+            let pw = identity::service_password()?;
+            let account = reg
+                .account
+                .as_deref()
+                .expect("a non-Root User always resolves to Some(account) in generate::registration");
+            if pw.is_none() && identity::account_needs_password(account) {
+                // Trap 4's own failure shape, one step earlier: install
+                // would otherwise report success and the service would
+                // fail every future start with error 1069. Refuse instead
+                // of creating a service that cannot start.
+                return Err(Error::Other(format!(
+                    "service account `{account}` needs a password (it is not LocalSystem/LocalService/\
+                     NetworkService, nor an `NT SERVICE\\`/`NT AUTHORITY\\` account); set \
+                     GOETIA_SERVICE_PASSWORD before installing `{}`",
+                    spec.id
+                )));
+            }
+            pw
+        }
     };
 
     if create {
         let scm = open_scm(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
-        let info = service_info(reg, password, false);
+        let info = service_info(reg, password, None);
         scm.create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG)
             .map_err(|e| to_error(&format!("create service `{}`", reg.name), e))?;
     } else {
@@ -473,7 +526,7 @@ fn apply(spec: &DaemonSpec, reg: &ScmRegistration, create: bool) -> Result<()> {
         let service = scm
             .open_service(&reg.name, ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG)
             .map_err(|e| to_error(&format!("open service `{}` to update it", reg.name), e))?;
-        let info = service_info(reg, password, true);
+        let info = service_info(reg, password, current_start_type);
         service
             .change_config(&info)
             .map_err(|e| to_error(&format!("update service `{}`", reg.name), e))?;
@@ -481,13 +534,30 @@ fn apply(spec: &DaemonSpec, reg: &ScmRegistration, create: bool) -> Result<()> {
 
     registry::write_parameters(&reg.name, &reg.parameters)?;
 
+    reapply_uncompared_effects(spec, reg)?;
+
+    Ok(())
+}
+
+/// Failure actions, `env`, and `SeServiceLogonRight` — everything `apply`
+/// writes that is not part of `ScmRegistration`/`render()`, so none of it
+/// is covered by `decide::decide`'s comparison (see the module doc
+/// comment). A caller that only reaches this via `apply` (i.e. only on
+/// `Create`/`Update`/`Stale`) would leave a partial failure of any of these
+/// permanently invisible to a retry: once the *compared* surface matches,
+/// `decide` reports `UpToDate` forever after, regardless of `--force`.
+/// `ServiceManager::install`'s `UpToDate` arm calls this too, so a plain
+/// re-`install` converges even without a spec change to force `apply` to
+/// run again. (Failure actions ride along here as well: a fresh service's
+/// default "no actions" state can coincidentally already match a
+/// `None`-desired one, hiding a failed `apply_failure_actions` the same
+/// way.)
+fn reapply_uncompared_effects(spec: &DaemonSpec, reg: &ScmRegistration) -> Result<()> {
     apply_failure_actions(&reg.name, reg.failure_actions.as_ref())?;
     registry::write_environment(&reg.name, &spec.env)?;
-
     if let Some(account) = &reg.account {
         identity::grant_service_logon_right(account)?;
     }
-
     Ok(())
 }
 
@@ -502,7 +572,21 @@ fn apply(spec: &DaemonSpec, reg: &ScmRegistration, create: bool) -> Result<()> {
 /// so on the update path a desired `LocalSystem` must be spelled out as the
 /// literal string, or a service whose spec changes from a real account back
 /// to `user: root` would silently keep running as the old account.
-fn service_info(reg: &ScmRegistration, password: Option<String>, for_update: bool) -> ServiceInfo {
+///
+/// **`current_start_type` matters for `start_type`.** `windows-service`'s
+/// `change_config` always sends `dwStartType` as a real value, never
+/// `SERVICE_NO_CHANGE` — so a create always uses `SERVICE_DEMAND_START`
+/// (trap 5: never `SERVICE_DISABLED`/`SERVICE_AUTO_START`), but an update
+/// must restate whatever is *already there* (`current_start_type`), or a
+/// routine spec-driven `install` would silently reset a `SERVICE_AUTO_START`
+/// `enable` had set. `enable`/`disable` themselves go through
+/// `set_start_type`'s raw `SERVICE_NO_CHANGE` call instead of this function.
+fn service_info(
+    reg: &ScmRegistration,
+    password: Option<String>,
+    current_start_type: Option<ServiceStartType>,
+) -> ServiceInfo {
+    let for_update = current_start_type.is_some();
     let account_name = match &reg.account {
         Some(a) => Some(OsString::from(a)),
         None if for_update => Some(OsString::from("LocalSystem")),
@@ -512,18 +596,7 @@ fn service_info(reg: &ScmRegistration, password: Option<String>, for_update: boo
         name: OsString::from(&reg.name),
         display_name: OsString::from(&reg.display_name),
         service_type: ServiceType::OWN_PROCESS,
-        // SERVICE_DEMAND_START, never SERVICE_DISABLED (would block an
-        // explicit `start`) or SERVICE_AUTO_START (boot-enablement is
-        // `enable`'s job alone — see trap 5). Left alone on the update path
-        // too: `ChangeServiceConfigW`'s `dwStartType` here is real (not
-        // `SERVICE_NO_CHANGE`), matching `windows-service`'s `change_config`,
-        // but `install` never runs for boot-enablement reasons in the first
-        // place (`decide` only recommends `Update`/`Stale` for a spec/version
-        // change), so this never silently un-enables a service `enable` had
-        // flipped to `SERVICE_AUTO_START` — `enable`/`disable` themselves are
-        // the only callers of `set_start_type`; nothing else in this module
-        // ever runs `ChangeServiceConfigW` with an explicit start type.
-        start_type: ServiceStartType::OnDemand,
+        start_type: current_start_type.unwrap_or(ServiceStartType::OnDemand),
         error_control: ServiceErrorControl::Normal,
         executable_path: reg.executable.clone(),
         launch_arguments: reg.arguments.iter().map(OsString::from).collect(),
@@ -597,7 +670,7 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
     };
 
     if needs_stop {
-        let mut actor = scm_wait::SystemScmActor::open(scm, id.as_str())
+        let mut actor = scm_wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to stop it before uninstall: {e}")))?;
         scm_wait::stop_via_notify(&mut actor).map_err(|e| {
             Error::Other(format!(

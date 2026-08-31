@@ -11,11 +11,17 @@
 //! with `Command::env` instead scopes the variable to a process nobody else
 //! shares.
 //!
-//! `<exe> --goetia-install-as <id> <account-name>`
+//! `<exe> --goetia-install-as <id> <account-name> [<sid-string>]`
+//!
+//! With a trailing `<sid-string>`, installs `user: {id: <sid-string>}`
+//! (`User::Id(AccountId::Sid)`) instead of `user: {name: <account-name>}` —
+//! `deleted_account_makes_the_service_oursunreadable` needs this: a
+//! `User::Name` account never fails to re-resolve (no lookup at all), so
+//! only the SID path can actually exercise `Ownership::OursUnreadable`.
 
 use goetia::backend::scm::manager::ScmManager;
 use goetia::manager::ServiceManager as _;
-use goetia::spec::User;
+use goetia::spec::{AccountId, User};
 
 use crate::common;
 
@@ -28,11 +34,15 @@ pub fn run_if_requested() -> bool {
     }
     let id = args[2].clone();
     let account = args[3].clone();
+    let user = match args.get(4) {
+        Some(sid) => User::Id(AccountId::Sid(sid.clone())),
+        None => User::Name(account),
+    };
     let spec = common::mk_spec_as(
         &id,
         common::fixture_command(&id, 1, 1, "plain"),
         Default::default(),
-        User::Name(account),
+        user,
     );
 
     match ScmManager::new().install(&spec, false) {

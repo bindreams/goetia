@@ -58,8 +58,54 @@ pub fn resolve(user: &User) -> Result<Identity> {
 /// variable when installing one of those. Never read from `goetia.yaml`
 /// itself — the design spec is explicit that a password never appears
 /// there.
-pub fn service_password() -> Option<String> {
-    std::env::var("GOETIA_SERVICE_PASSWORD").ok()
+///
+/// Unset is `Ok(None)`. Set-but-not-valid-Unicode (env vars on Windows are
+/// UTF-16 and can carry unpaired surrogates) is `Err`, not `Ok(None)`:
+/// silently downgrading a malformed password to "no password" would install
+/// a real account that cannot log on, with a message that has nothing to do
+/// with the actual cause.
+pub fn service_password() -> Result<Option<String>> {
+    parse_password_var(std::env::var("GOETIA_SERVICE_PASSWORD"))
+}
+
+/// The decision [`service_password`] makes, pulled out as a pure function of
+/// the lookup result so it is unit-testable without mutating the process's
+/// real environment (which — shared mutable state across every concurrently
+/// running `#[skuld::test]` — `std::env::set_var` cannot safely do; see
+/// `tests/scm_integration/install_helper.rs`'s doc comment for the same
+/// reasoning applied at the integration-test level).
+fn parse_password_var(var: std::result::Result<String, std::env::VarError>) -> Result<Option<String>> {
+    match var {
+        Ok(v) => Ok(Some(v)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(Error::Other(
+            "GOETIA_SERVICE_PASSWORD is set but is not valid Unicode".to_string(),
+        )),
+    }
+}
+
+/// Whether `account` is one Windows will start without a password: the
+/// built-in `LocalSystem`/`LocalService`/`NetworkService` accounts (bare, or
+/// `NT AUTHORITY\`-qualified), or a virtual per-service account
+/// (`NT SERVICE\<name>`) — the exact vocabulary the design spec's "Windows
+/// accounts" section names. Any other resolved account name is assumed to be
+/// a real user account, which does.
+///
+/// A heuristic on the account *name* rather than a `LookupAccountSid`-based
+/// well-known-SID check: `ServiceInfo`/`ChangeServiceConfigW` only ever see
+/// the name (`reg.account`, from `generate::registration`/`Identity`), and
+/// every one of these accounts is required to be named as such by SCM's own
+/// conventions — there is no other spelling a caller could use for them.
+pub fn account_needs_password(account: &str) -> bool {
+    let lower = account.to_ascii_lowercase();
+    let unqualified = lower.strip_prefix(r"nt authority\").unwrap_or(&lower);
+    !(lower.starts_with(r"nt service\")
+        // "system" alongside "localsystem": `LookupAccountSidW` resolves
+        // LocalSystem's well-known SID (S-1-5-18) to `NT AUTHORITY\SYSTEM`,
+        // not the literal string "LocalSystem" `CreateServiceW` also
+        // accepts — `user.id`'s SID path (`account_name_from_sid_string`)
+        // produces the former.
+        || matches!(unqualified, "localsystem" | "localservice" | "networkservice" | "system"))
 }
 
 fn wide_null(s: &str) -> Vec<u16> {
@@ -156,7 +202,16 @@ fn lookup_account_sid(psid: PSID, sid_str: &str) -> Result<String> {
 /// needed because [`LsaAddAccountRights`] takes a `PSID`, not a name.
 /// Returns the raw SID bytes — the pointer `LsaAddAccountRights` needs is
 /// `sid_buf.as_mut_ptr()`, valid exactly as long as the returned `Vec` is.
+///
+/// Strips a leading `.\` (SCM's shorthand for "an account on this
+/// machine", accepted by `CreateServiceW`/`ChangeServiceConfigW`) before
+/// looking up: `LookupAccountNameW` does not understand it and fails the
+/// sizing call with `ERROR_NONE_MAPPED` — confirmed empirically (`.\<local
+/// user>` fails, the bare name and a fully domain-qualified name both
+/// succeed). A bare local account name resolves against the local machine
+/// on its own, so dropping the prefix loses nothing.
 fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
+    let account_name = account_name.strip_prefix(r".\").unwrap_or(account_name);
     let wide_name = wide_null(account_name);
     let mut sid_len: u32 = 0;
     let mut domain_len: u32 = 0;

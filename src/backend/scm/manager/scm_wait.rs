@@ -106,7 +106,7 @@ pub mod system {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use windows_service::service::{Service, ServiceAccess};
-    use windows_service::service_manager::ServiceManager as WinServiceManager;
+    use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
     use windows_sys::Win32::Foundation::{ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_NOT_ACTIVE};
     use windows_sys::Win32::System::Services::{
         ControlService, NotifyServiceStatusChangeW, SERVICE_CONTROL_STOP, SERVICE_NOTIFY, SERVICE_NOTIFY_2W,
@@ -180,12 +180,20 @@ pub mod system {
         }
     }
 
-    /// Owns the already-open [`Service`] handle (its `Drop` closes the
-    /// `SC_HANDLE`) plus the notify buffer. The `LastStatus` slot and the
-    /// `SERVICE_NOTIFY_2W` buffer are heap-pinned (`Box`) so their addresses
-    /// stay stable across `arm` -> `SleepEx` -> callback.
-    pub struct SystemScmActor<'a> {
-        scm: &'a WinServiceManager,
+    /// Owns both its `WinServiceManager` (SCM) connection and its per-service
+    /// [`Service`] handle (each `Drop` closes its own `SC_HANDLE`), plus the
+    /// notify buffer. The `LastStatus` slot and the `SERVICE_NOTIFY_2W`
+    /// buffer are heap-pinned (`Box`) so their addresses stay stable across
+    /// `arm` -> `SleepEx` -> callback.
+    ///
+    /// Owning the SCM connection (rather than borrowing the caller's) is
+    /// what makes [`Self::reopen`] able to follow `NotifyServiceStatusChangeW`'s
+    /// documented `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING` remedy exactly: "close
+    /// the handle to the SCM, open a new handle, and call this function
+    /// again" — the lag condition is tracked against the SCM connection, not
+    /// the per-service handle alone.
+    pub struct SystemScmActor {
+        scm: WinServiceManager,
         name: String,
         service: Service,
         status: Box<LastStatus>,
@@ -194,14 +202,18 @@ pub mod system {
         awaiting: WantState,
         /// Whether `start()` has been issued. Gates the two-phase arm mask.
         started: bool,
+        /// Whether the most recent `arm()` succeeded and has not yet been
+        /// drained by `wait_callback`. See `Drop`.
+        registration_outstanding: bool,
     }
 
-    impl<'a> SystemScmActor<'a> {
+    impl SystemScmActor {
         /// Open `name` with `QUERY_STATUS | STOP | START` — everything both
         /// [`super::stop_via_notify`] and [`super::start_via_notify`] need,
         /// so one actor serves either wait without reopening.
-        pub fn open(scm: &'a WinServiceManager, name: &str) -> io::Result<Self> {
-            let service = open_handle(scm, name)?;
+        pub fn open(name: &str) -> io::Result<Self> {
+            let scm = open_scm()?;
+            let service = open_handle(&scm, name)?;
             Ok(Self {
                 scm,
                 name: name.to_string(),
@@ -213,18 +225,25 @@ pub mod system {
                 notify: Box::default(),
                 awaiting: WantState::Stopped,
                 started: false,
+                registration_outstanding: false,
             })
         }
 
-        /// Reopen the handle. Used on `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING`,
-        /// which the SCM raises when the client missed a notification: the
-        /// handle's notify queue must be dropped and re-established. The old
-        /// `Service` is replaced (and, via `Drop`, its `SC_HANDLE` closed)
-        /// only once the new one has been successfully opened.
+        /// Reopen both handles. Used on `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING`
+        /// — see the struct's own doc comment for why the SCM handle, not
+        /// only the service handle, must be replaced. Assigning `self.scm`/
+        /// `self.service` only after each `open_*` call succeeds means the
+        /// old handles (closed via `Drop` when replaced) stay valid until
+        /// their replacements are confirmed open.
         fn reopen(&mut self) -> io::Result<()> {
-            self.service = open_handle(self.scm, &self.name)?;
+            self.scm = open_scm()?;
+            self.service = open_handle(&self.scm, &self.name)?;
             Ok(())
         }
+    }
+
+    fn open_scm() -> io::Result<WinServiceManager> {
+        WinServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).map_err(to_io_error)
     }
 
     fn open_handle(scm: &WinServiceManager, name: &str) -> io::Result<Service> {
@@ -235,7 +254,31 @@ pub mod system {
         .map_err(to_io_error)
     }
 
-    impl super::ScmActor for SystemScmActor<'_> {
+    impl Drop for SystemScmActor {
+        fn drop(&mut self) {
+            // An `arm()` that immediate-fired (the service already matched
+            // the requested mask at the moment of the call) queues an APC to
+            // THIS thread regardless of what happens next — closing the
+            // service handle only stops *future* notifications from being
+            // queued (per `NotifyServiceStatusChangeW`'s documented
+            // remarks), it does not un-queue one already pending. If a later
+            // step (`control_stop`/`start`) then errors before
+            // `wait_callback`'s own alertable wait ever runs and drains it,
+            // that APC is still outstanding — and would otherwise fire
+            // later, on some future alertable wait elsewhere in the process,
+            // against the `LastStatus`/`SERVICE_NOTIFY_2W` boxes this drop
+            // is about to free. Drain it here, while they are still valid.
+            if self.registration_outstanding {
+                // SAFETY: a zero-duration alertable wait; no pointers
+                // involved. `self.status`/`self.notify` are still live at
+                // this point in `drop` (Rust drops fields only after this
+                // method returns).
+                unsafe { SleepEx(0, 1) };
+            }
+        }
+    }
+
+    impl super::ScmActor for SystemScmActor {
         fn arm(&mut self, want: WantState) -> io::Result<()> {
             self.awaiting = want;
             self.status.fired.store(false, Ordering::Release);
@@ -253,6 +296,9 @@ pub mod system {
                 // arm can precede.
                 let rc = unsafe { NotifyServiceStatusChangeW(self.service.raw_handle(), mask, &*self.notify) };
                 if rc == 0 {
+                    // A notification may now be queued (immediately, if the
+                    // service already matched `mask`) — see `Drop`.
+                    self.registration_outstanding = true;
                     return Ok(());
                 }
                 const ERROR_SERVICE_NOTIFY_CLIENT_LAGGING: u32 = 1294;
@@ -287,15 +333,27 @@ pub mod system {
             self.started = true;
             match self.service.start::<&std::ffi::OsStr>(&[]) {
                 Ok(()) => Ok(()),
-                // Idempotent start (`ServiceManager::start`'s contract): the
-                // `RUNNING` arm above already immediate-fires on the current
-                // state when the service was already running, so the wait
-                // still completes correctly — only `StartServiceW` itself
-                // needs to stop treating this as an error.
+                // Per [MS-SCMR]'s `RStartServiceW` error table, 1056 means
+                // only "`dwCurrentState` is not `SERVICE_STOPPED`" — it also
+                // covers StopPending/Paused/etc., none of which the
+                // `RUNNING`/`START_PENDING` arm above would have
+                // immediate-fired for (`NotifyServiceStatusChangeW` only
+                // immediate-fires when the service already matches the
+                // requested mask). Blindly treating 1056 as "already
+                // running, the wait will complete" would hang forever in
+                // those other cases. Confirm the real state before deciding.
                 Err(windows_service::Error::Winapi(e))
                     if e.raw_os_error() == Some(ERROR_SERVICE_ALREADY_RUNNING as i32) =>
                 {
-                    Ok(())
+                    match self.service.query_status() {
+                        Ok(status) if status.current_state == windows_service::service::ServiceState::Running => Ok(()),
+                        Ok(status) => Err(io::Error::other(format!(
+                            "StartServiceW reported ERROR_SERVICE_ALREADY_RUNNING, but the service is actually \
+                             {:?}, not Running — this wait cannot resolve from that state",
+                            status.current_state
+                        ))),
+                        Err(query_err) => Err(to_io_error(query_err)),
+                    }
                 }
                 Err(e) => Err(to_io_error(e)),
             }
@@ -310,6 +368,10 @@ pub mod system {
                 // it alertable, which is the entire point of this wait.
                 unsafe { SleepEx(u32::MAX, 1) };
             }
+            // The APC that `arm()` may have queued has now been delivered
+            // and processed (that is what set `fired`) — nothing from this
+            // registration remains outstanding. See `Drop`.
+            self.registration_outstanding = false;
             let state = self.status.current_state.load(Ordering::Acquire);
             Ok(if state == SERVICE_RUNNING {
                 Observed::Running
