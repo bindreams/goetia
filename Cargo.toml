@@ -79,7 +79,7 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 skuld = "0.3"
-rand = "0.9"
+rand = "0.10"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
