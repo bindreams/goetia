@@ -173,7 +173,15 @@ pub fn decide(
                 }
             } else {
                 Outcome::Conflict {
-                    artifact_diff: diff::artifact_diff(on_disk, desired),
+                    // `regenerated` -> `on_disk`, deliberately, not
+                    // `on_disk` -> `desired`. The question a conflict must
+                    // answer is "what did you change outside goetia that is
+                    // about to be lost?", and only this direction isolates
+                    // it. Diffing against `desired` would blend the
+                    // hand-edit together with the legitimate spec change,
+                    // which is exactly the conflation the two-level diff
+                    // design exists to avoid.
+                    artifact_diff: diff::artifact_diff(regenerated, on_disk),
                 }
             }
         }

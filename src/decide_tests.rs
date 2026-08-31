@@ -116,9 +116,14 @@ fn hand_edit_conflicts() {
 
     match outcome {
         Outcome::Conflict { artifact_diff } => {
+            // Direction matters, so assert it: the diff runs from what
+            // goetia last wrote to what is on disk now, so the admin's
+            // hand-edit reads as an ADDITION. Merely asserting the line
+            // appears somewhere would pass in either direction and would
+            // not pin the behaviour.
             assert!(
-                artifact_diff.contains("MemoryMax=8G"),
-                "conflict diff should show the hand-edit: {artifact_diff}"
+                artifact_diff.contains("+MemoryMax=8G"),
+                "conflict diff should show the hand-edit as an addition: {artifact_diff}"
             );
         }
         other => panic!("expected Conflict, got {other:?}"),
