@@ -509,7 +509,7 @@ fn install_creates_and_owns_cwd_and_logs_parent_for_a_non_root_account() {
     spec.logs = Some(logs.clone());
     let _guard = Guard::install(&mgr, &spec);
 
-    for (dir, what) in [(&cwd, "cwd"), (logs.parent().unwrap(), "logs' parent")] {
+    for (dir, what) in [(cwd.as_path(), "cwd"), (logs.parent().unwrap(), "logs' parent")] {
         let meta = std::fs::metadata(dir).unwrap_or_else(|e| panic!("{what} ({}) must exist: {e}", dir.display()));
         assert!(meta.is_dir(), "{what} ({}) must be a directory", dir.display());
         assert_eq!(
