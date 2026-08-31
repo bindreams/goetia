@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use clap::Args as ClapArgs;
 
-use super::support::{load_and_warn, print_warnings, require_elevation, select_by_ids};
+use super::support::{load_and_warn, require_elevation, select_by_ids};
 use crate::backend::Identity;
 use crate::decide::Outcome;
 use crate::error::Result;
@@ -243,7 +243,7 @@ fn preview_artifact(spec: &DaemonSpec, err: &mut dyn Write) -> String {
         // in a preview, never installed.
         let shim_path = PathBuf::from("goetia-shim.exe");
         let (registration, warnings) = crate::backend::scm::generate::registration(spec, &identity, &shim_path);
-        print_warnings(&warnings, err);
+        super::support::print_warnings(&warnings, err);
         crate::backend::scm::generate::render(&registration)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
