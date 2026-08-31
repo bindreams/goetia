@@ -74,6 +74,28 @@ pub enum Error {
     #[error("no backend for {platform} yet")]
     UnsupportedPlatform { platform: String },
 
+    /// An external tool a backend shells out to (`launchctl`, `plutil`,
+    /// `systemctl`, `sc.exe`, ...) either could not be spawned at all or
+    /// exited non-zero. `stderr` carries whatever diagnostic text it
+    /// produced (or the spawn error itself, for the "could not run it at
+    /// all" case) — one variant for both, since neither backend nor caller
+    /// needs to tell them apart.
+    #[error("`{command}` failed: {stderr}")]
+    CommandFailed { command: String, stderr: String },
+
+    /// Resolving a [`crate::spec::User`] to a real platform account failed:
+    /// no such user/uid, or the lookup itself errored.
+    #[error("account lookup failed: {detail}")]
+    AccountLookup { detail: String },
+
+    /// A backend tried to create or move an artifact to `path`, but
+    /// something already occupies it — a state none of that backend's own
+    /// operations should be able to produce, so this always carries a
+    /// "this should never happen" flavor rather than being a normal,
+    /// expected outcome.
+    #[error("{path} already exists (this should never happen)", path = path.display())]
+    AlreadyExists { path: PathBuf },
+
     /// A lower-level failure, annotated with context a call site adds
     /// rather than a dedicated variant of its own — e.g. `daemon restart`
     /// disclosing that a daemon is now stopped, not merely that starting it

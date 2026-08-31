@@ -53,14 +53,57 @@ impl ConnectBack {
     /// on, because the only way this returns without a connection is a failure
     /// report to whoever reads the CI log.
     pub fn accept(&self, what: &str) {
+        self.accept_value(what);
+    }
+
+    /// Like [`Self::accept`], but returns whatever bytes the daemon wrote
+    /// after connecting (as UTF-8), for a sentinel mode that reports more
+    /// than just "I ran" — e.g. `--goetia-report-uid`'s decimal uid.
+    pub fn accept_value(&self, what: &str) -> String {
+        use std::io::Read as _;
+
         let listener = self.listener.try_clone().expect("clone listener");
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(listener.accept().map(drop));
+            let result = listener.accept().map(|(mut stream, _addr)| {
+                let mut buf = String::new();
+                let _ = stream.read_to_string(&mut buf);
+                buf
+            });
+            let _ = tx.send(result);
         });
         match rx.recv_timeout(START_DEADLINE) {
-            Ok(Ok(())) => {}
+            Ok(Ok(value)) => value,
             Ok(Err(e)) => panic!("accept while waiting for {what}: {e}"),
+            Err(_) => panic!(
+                "waited {}s for {what} on 127.0.0.1:{}; it never connected",
+                START_DEADLINE.as_secs(),
+                self.port
+            ),
+        }
+    }
+
+    /// Like [`Self::accept`], but returns whatever the daemon wrote before
+    /// closing its end — used to carry a value out of the daemon's own
+    /// process (its own environment, for instance) rather than a bare
+    /// presence signal. Still bounded by [`START_DEADLINE`] for the same
+    /// reason `accept` is: the daemon may never connect at all.
+    pub fn accept_line(&self, what: &str) -> String {
+        let listener = self.listener.try_clone().expect("clone listener");
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| -> io::Result<String> {
+                use std::io::Read as _;
+                let (mut stream, _) = listener.accept()?;
+                let mut buf = String::new();
+                stream.read_to_string(&mut buf)?;
+                Ok(buf)
+            })();
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(START_DEADLINE) {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => panic!("accept/read while waiting for {what}: {e}"),
             Err(_) => panic!(
                 "waited {}s for {what} on 127.0.0.1:{}; it never connected",
                 START_DEADLINE.as_secs(),
