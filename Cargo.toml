@@ -37,11 +37,20 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
 similar = "3"
+tempfile = "3"
 thiserror = "2"
 
 [target.'cfg(unix)'.dependencies]
 # Only `geteuid()`, for the CLI's elevation check.
 libc = { version = "0.2", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Unconditional (not behind the `cli` feature): the launchd backend itself
+# needs `getpwnam`/`getpwuid`/`chown` to resolve `spec::User` to a real
+# account and to hand cwd/logs directories to it, regardless of whether the
+# CLI's own optional deps are pulled in.
+libc = "0.2"
+nix = { version = "0.30", features = ["user", "fs"] }
 
 [target.'cfg(windows)'.dependencies]
 # Only to probe SCM access as an elevation check, the same technique
@@ -51,7 +60,6 @@ windows-service = { version = "0.8", optional = true }
 [dev-dependencies]
 skuld = "0.3"
 rand = "0.9"
-tempfile = "3"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
@@ -73,4 +81,9 @@ harness = false
 [[test]]
 name = "cli_binary"
 path = "tests/cli_binary.rs"
+harness = false
+
+[[test]]
+name = "launchd_integration"
+path = "tests/launchd_integration.rs"
 harness = false

@@ -12,7 +12,12 @@
 pub mod conformance;
 pub mod fake;
 
-use crate::error::{Error, Result};
+// `Error` itself is only referenced by the arms of `native()` that still
+// return `UnsupportedPlatform` (every platform but macOS) — gated so a
+// macOS-only build doesn't warn about an unused import.
+#[cfg(not(target_os = "macos"))]
+use crate::error::Error;
+use crate::error::Result;
 use crate::spec::{DaemonSpec, Id};
 
 // ServiceManager ======================================================================================================
@@ -136,10 +141,11 @@ pub enum State {
 
 /// The platform's [`ServiceManager`] implementation.
 ///
-/// Tasks 11-13 build systemd/launchd/SCM backends; until each lands, its
-/// platform's arm here returns [`Error::UnsupportedPlatform`] rather than
-/// panicking — a CLI user gets a diagnosable message ("no backend for linux
-/// yet"), not a crash. Each of those tasks replaces only its own arm.
+/// macOS's arm returns
+/// [`backend::launchd::manager::LaunchdManager`](crate::backend::launchd::manager::LaunchdManager).
+/// Linux's and windows' arms return [`Error::UnsupportedPlatform`] rather
+/// than panicking — a CLI user gets a diagnosable message ("no backend for
+/// linux yet"), not a crash.
 pub fn native() -> Result<Box<dyn ServiceManager>> {
     #[cfg(target_os = "linux")]
     {
@@ -149,9 +155,7 @@ pub fn native() -> Result<Box<dyn ServiceManager>> {
     }
     #[cfg(target_os = "macos")]
     {
-        Err(Error::UnsupportedPlatform {
-            platform: "macos".to_string(),
-        })
+        Ok(Box::new(crate::backend::launchd::manager::LaunchdManager::new()))
     }
     #[cfg(target_os = "windows")]
     {
