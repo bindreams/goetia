@@ -88,8 +88,8 @@ use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::PathBuf;
 
 use windows_service::service::{
-    Service, ServiceAccess, ServiceAction, ServiceActionType, ServiceErrorControl, ServiceFailureActions,
-    ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState as WinState, ServiceType,
+    Service, ServiceAccess, ServiceActionType, ServiceErrorControl, ServiceFailureResetPeriod, ServiceInfo,
+    ServiceStartType, ServiceState as WinState, ServiceType,
 };
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{ERROR_SERVICE_DOES_NOT_EXIST, LocalFree};
@@ -194,11 +194,14 @@ impl ServiceManager for ScmManager {
 
     fn status(&self, id: &Id) -> Result<Status> {
         let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG)?;
-        // Stricter than `require_ours`: an undecodable blob must not
+        // Stricter than `require_ours`: an undecodable blob (or one whose
+        // account can no longer be resolved — see `classify`) must not
         // fabricate a plausible-looking `Status` — see the trait doc
         // comment on `ServiceManager::status`.
         let params = registry::read_parameters(id.as_str())?;
-        generate::extract(&params)?.ok_or_else(|| foreign(id))?;
+        let blob = generate::extract(&params)?.ok_or_else(|| foreign(id))?;
+        identity::resolve(&blob.spec.user)
+            .map_err(|e| Error::Other(format!("`{id}`'s account could not be resolved: {e}")))?;
 
         let st = service
             .query_status()
@@ -241,6 +244,19 @@ impl ServiceManager for ScmManager {
                     continue;
                 }
             };
+            // A blob can decode perfectly and still name an account (e.g. a
+            // `user.id` SID) that no longer exists on this host — see
+            // `classify`'s identical check on the `install`/`diff` side.
+            // `list`/`status` must agree with `install` about which ids are
+            // "genuinely ours and readable", or a daemon `list` reports
+            // healthy could refuse the very next `install`.
+            if let Err(e) = identity::resolve(&blob.spec.user) {
+                out.push(Installed::OursUnreadable {
+                    name,
+                    reason: format!("marked ours, but its account could not be resolved: {e}"),
+                });
+                continue;
+            }
             match query_live(&name) {
                 Ok((state, enabled)) => out.push(Installed::Ours {
                     spec: blob.spec,
@@ -610,61 +626,63 @@ fn service_info(
 /// spec change from `restart: on-failure`/`always` back to `restart: never`
 /// actually clears whatever a previous install configured, rather than
 /// leaving it in place.
+/// Writes failure actions via `sc.exe failure`/`sc.exe failureflag`, not the
+/// `ChangeServiceConfig2W(SERVICE_CONFIG_FAILURE_ACTIONS[_FLAG])` WinAPI
+/// `windows-service`'s `Service::update_failure_actions`/
+/// `set_failure_actions_on_non_crash_failures` wrap.
+///
+/// **Why not the WinAPI call.** `ChangeServiceConfig2W(SERVICE_CONFIG_FAILURE_ACTIONS)`
+/// returned `ERROR_ACCESS_DENIED` from this process on GitHub Actions'
+/// Windows runner even with `SeShutdownPrivilege` explicitly enabled via
+/// `AdjustTokenPrivileges` beforehand — confirmed empirically; an
+/// unresolved upstream report from a mature Windows service tool
+/// (winsw#893) hits the identical failure in the identical environment.
+/// `sc.exe` — a *separate* process, with its own freshly-derived token —
+/// does not: `tests/marker_inertness/scm.rs`'s `scm_parameters_values_survive`
+/// probe already calls `sc.exe failure` successfully on this same CI.
+/// Shelling out here is the same choice the systemd/launchd backends make
+/// for operations only their platform's own CLI tool reliably performs
+/// (`systemctl daemon-reload`, `launchctl bootstrap`).
+///
+/// Read-only queries (`read_failure_actions`) are unaffected — only a
+/// *write* can configure `SC_ACTION_REBOOT`, which is the operation the
+/// privilege actually exists to gate, and stay on the WinAPI via
+/// `windows-service`.
 fn apply_failure_actions(name: &str, fa: Option<&GenFailureActions>) -> Result<()> {
-    // `ChangeServiceConfig2W(SERVICE_CONFIG_FAILURE_ACTIONS)` requires
-    // `SeShutdownPrivilege` to be *enabled* in the calling token, regardless
-    // of whether any configured action actually reboots (Goetia's own
-    // actions are always `SC_ACTION_RESTART`, never `SC_ACTION_REBOOT`).
-    // Administrator tokens hold this privilege but start a non-interactive
-    // session with it disabled — confirmed on GitHub Actions' Windows
-    // runner, where every call below failed with `ERROR_ACCESS_DENIED`
-    // until this was added.
-    enable_shutdown_privilege().map_err(|e| {
-        Error::Other(format!(
-            "enable SeShutdownPrivilege to set failure actions for `{name}`: {e}"
-        ))
-    })?;
-
-    let scm = open_scm(ServiceManagerAccess::CONNECT)?;
-    let service = scm
-        .open_service(name, ServiceAccess::CHANGE_CONFIG)
-        .map_err(|e| to_error(&format!("open service `{name}` to set failure actions"), e))?;
-
     match fa {
         None => {
-            service
-                .set_failure_actions_on_non_crash_failures(false)
-                .map_err(|e| to_error(&format!("clear the failure-actions flag for `{name}`"), e))?;
-            service
-                .update_failure_actions(ServiceFailureActions {
-                    reset_period: ServiceFailureResetPeriod::Never,
-                    reboot_msg: None,
-                    command: None,
-                    actions: Some(vec![]),
-                })
-                .map_err(|e| to_error(&format!("clear failure actions for `{name}`"), e))?;
+            run_sc(&["failureflag", name, "0"])?;
+            run_sc(&["failure", name, "reset=", "0", "actions=", ""])?;
         }
         Some(fa) => {
-            service
-                .update_failure_actions(ServiceFailureActions {
-                    reset_period: ServiceFailureResetPeriod::After(fa.reset_period),
-                    reboot_msg: None,
-                    command: None,
-                    actions: Some(vec![ServiceAction {
-                        action_type: ServiceActionType::Restart,
-                        delay: fa.delay,
-                    }]),
-                })
-                .map_err(|e| to_error(&format!("set failure actions for `{name}`"), e))?;
+            let reset = fa.reset_period.as_secs().to_string();
+            let action = format!("restart/{}", fa.delay.as_millis());
+            run_sc(&["failure", name, "reset=", &reset, "actions=", &action])?;
             // `SERVICE_CONFIG_FAILURE_ACTIONS_FLAG` — see
             // `GenFailureActions::on_non_crash_failures`'s doc comment for
             // why this must be set, not merely the actions themselves.
-            service
-                .set_failure_actions_on_non_crash_failures(fa.on_non_crash_failures)
-                .map_err(|e| to_error(&format!("set the failure-actions flag for `{name}`"), e))?;
+            run_sc(&["failureflag", name, if fa.on_non_crash_failures { "1" } else { "0" }])?;
         }
     }
     Ok(())
+}
+
+fn run_sc(args: &[&str]) -> Result<()> {
+    let output = std::process::Command::new("sc.exe")
+        .args(args)
+        .output()
+        .map_err(|e| Error::Other(format!("spawn `sc.exe {}`: {e}", args.join(" "))))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Error::Other(format!(
+            "`sc.exe {}` failed ({:?}): {}{}",
+            args.join(" "),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        )))
+    }
 }
 
 // uninstall ===========================================================================================================
@@ -709,62 +727,6 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
 }
 
 // shared helpers ======================================================================================================
-
-/// Enable `SeShutdownPrivilege` in the current process's own token. See
-/// `apply_failure_actions`'s call site for why this is needed at all.
-/// `AdjustTokenPrivileges` can report success (a non-zero return) while
-/// silently not enabling the privilege — MSDN's documented remedy is
-/// checking `GetLastError()` even then, for `ERROR_NOT_ALL_ASSIGNED`.
-fn enable_shutdown_privilege() -> std::io::Result<()> {
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_NOT_ALL_ASSIGNED, HANDLE};
-    use windows_sys::Win32::Security::{
-        AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED, SE_SHUTDOWN_NAME,
-        TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
-    };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-    let mut token: HANDLE = std::ptr::null_mut();
-    // SAFETY: `GetCurrentProcess` takes no arguments and cannot fail;
-    // `token` is a valid, aligned out-param.
-    let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token) };
-    if ok == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    let mut luid = Default::default();
-    // SAFETY: `SE_SHUTDOWN_NAME` is a valid null-terminated wide string
-    // constant; `luid` is a valid out-param.
-    let lookup_ok = unsafe { LookupPrivilegeValueW(std::ptr::null(), SE_SHUTDOWN_NAME, &mut luid) };
-    if lookup_ok == 0 {
-        let err = std::io::Error::last_os_error();
-        // SAFETY: `token` was successfully opened above.
-        unsafe { CloseHandle(token) };
-        return Err(err);
-    }
-
-    let privileges = TOKEN_PRIVILEGES {
-        PrivilegeCount: 1,
-        Privileges: [LUID_AND_ATTRIBUTES {
-            Luid: luid,
-            Attributes: SE_PRIVILEGE_ENABLED,
-        }],
-    };
-    // SAFETY: `token` was opened with `TOKEN_ADJUST_PRIVILEGES`; `privileges`
-    // describes exactly one `LUID_AND_ATTRIBUTES`, matching `PrivilegeCount`.
-    let adjust_ok =
-        unsafe { AdjustTokenPrivileges(token, 0, &privileges, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
-    let last_err = std::io::Error::last_os_error();
-    // SAFETY: `token` was successfully opened above and is closed exactly once.
-    unsafe { CloseHandle(token) };
-
-    if adjust_ok == 0 {
-        return Err(last_err);
-    }
-    if last_err.raw_os_error() == Some(ERROR_NOT_ALL_ASSIGNED as i32) {
-        return Err(last_err);
-    }
-    Ok(())
-}
 
 fn open_scm(access: ServiceManagerAccess) -> Result<WinServiceManager> {
     WinServiceManager::local_computer(None::<&str>, access).map_err(|e| to_error("open the Service Control Manager", e))
