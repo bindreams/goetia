@@ -1,10 +1,12 @@
 //! The effectful SCM backend (`#[cfg(windows)]`).
 //!
-//! **Scope: `type: managed` only.** `type: simple` needs `goetia-shim`
-//! (Task 14); this module still *builds* an `ImagePath`/blob for
-//! `Kind::Simple` (nothing here special-cases it away — `generate::registration`
-//! already handles both kinds), but nothing here has been exercised against
-//! a real shim, and its tests belong to Task 14.
+//! Handles both `Kind::Simple` (via `goetia-shim`, `src/bin/shim/`) and
+//! `Kind::Managed`. `discover` no longer refuses `Kind::Simple` — Task 13
+//! left that gate in place only because nothing had exercised a real shim
+//! yet; `generate::registration` already built a correct `ImagePath`/blob
+//! for it, unchanged by Task 14. Its own integration tests live in
+//! `tests/shim_integration.rs`, not `tests/scm_integration.rs`, because they
+//! need `CARGO_BIN_EXE_goetia-shim`.
 //!
 //! ## The five traps this module addresses
 //!
@@ -97,10 +99,11 @@ use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHAN
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
+use crate::blob::Blob;
 use crate::decide::{self, Outcome, Ownership};
 use crate::error::{Error, Result};
 use crate::manager::{Installed, ServiceManager, State, Status};
-use crate::spec::{DaemonSpec, Id, Kind, User, Warning};
+use crate::spec::{DaemonSpec, Id, User, Warning};
 
 // ScmManager ==========================================================================================================
 
@@ -292,6 +295,30 @@ impl ServiceManager for ScmManager {
     }
 }
 
+// shim support ========================================================================================================
+
+/// Read and decode the metadata blob for `id` directly from
+/// `Services\<id>\Parameters`. `goetia-shim` (`src/bin/shim/`, a separate
+/// `[[bin]]` target and therefore a separate crate that only ever sees this
+/// module's `pub` surface) calls this: it knows only its service id
+/// (`argv[1]`), not a `DaemonSpec` to hand to [`discover`], and must not
+/// pull in `ServiceManager`'s effectful install path just to read one
+/// value. `registry` itself stays private — this is the one read the shim
+/// needs, not the whole module.
+///
+/// `Ok(None)` means no `Marker` at all: unreachable in practice (SCM only
+/// ever launches the shim against a service *this backend itself* created
+/// with `ImagePath` naming the shim, and `apply` always writes `Parameters`
+/// immediately after), but returned rather than folded into `Err` so a
+/// caller can still tell "no marker" apart from "a marker that fails to
+/// decode" — the shim's own version-skew handling (see
+/// `src/bin/shim/logging.rs`) needs exactly that distinction to phrase its
+/// failure message.
+pub fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
+    let params = registry::read_parameters(id)?;
+    generate::extract(&params)
+}
+
 // discover ============================================================================================================
 
 /// What `install`/`preview_install` need from a fresh read of the world:
@@ -312,12 +339,27 @@ struct Discovery {
 
 /// The shim's expected location: a sibling of the currently running
 /// `goetia` binary. Only consulted for `Kind::Simple` — `generate::registration`
-/// ignores it entirely for `Kind::Managed`, this task's whole scope. Where a
-/// `cargo install`ed shim actually lives is an open packaging question (see
-/// the plan's "Windows shim path" item); this is a reasonable placeholder
-/// until Task 14 settles it, never installed against on this task's own
-/// tests.
+/// ignores it entirely for `Kind::Managed`.
+///
+/// `GOETIA_SHIM_PATH` overrides this, read fresh on every call rather than
+/// cached. Production `goetia.exe` never sets it, so it always falls
+/// through to the sibling-of-`current_exe` heuristic below — appropriate
+/// for the `cargo install`-style layout the design's "Windows shim path"
+/// open item describes, where both binaries land in the same directory.
+/// `tests/shim_integration.rs` sets it once, in its own `main`, before
+/// `skuld::run_all()` starts any test thread (a single write strictly
+/// before every read, not the per-test mutation
+/// `identity::service_password`'s doc comment explains
+/// `std::env::set_var` cannot safely do): `current_exe()` inside a test
+/// binary resolves to `target/<profile>/deps/<test>-<hash>.exe`, whose
+/// sibling directory never contains `goetia-shim.exe` (a plain `[[bin]]`
+/// artifact, written to `target/<profile>/` directly) — only
+/// `env!("CARGO_BIN_EXE_goetia-shim")`, resolvable solely from within that
+/// integration test's own crate root, finds the real thing.
 fn shim_path() -> PathBuf {
+    if let Some(overridden) = std::env::var_os("GOETIA_SHIM_PATH") {
+        return PathBuf::from(overridden);
+    }
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|dir| dir.join("goetia-shim.exe")))
@@ -331,21 +373,6 @@ fn print_warnings(warnings: &[Warning]) {
 }
 
 fn discover(spec: &DaemonSpec) -> Result<Discovery> {
-    // `type: simple` needs `goetia-shim` (Task 14); `generate::registration`
-    // already builds a (never-exercised) `ImagePath`/blob for it, so without
-    // this gate `install`/`diff` would create a real, broken service
-    // pointing at a shim binary that does not exist yet. `type: simple` is
-    // the *default* kind (unset `type:`), so this is the primary path for
-    // any Windows user who does not write `type: managed` explicitly, not a
-    // rare opt-in.
-    if spec.kind == Kind::Simple {
-        return Err(Error::Other(format!(
-            "daemon `{}`: type: simple is not supported on Windows yet (needs goetia-shim, Task 14); use \
-             `type: managed` instead",
-            spec.id
-        )));
-    }
-
     let identity = identity::resolve(&spec.user)?;
     let (reg, warnings) = generate::registration(spec, &identity, &shim_path());
     print_warnings(&warnings);
