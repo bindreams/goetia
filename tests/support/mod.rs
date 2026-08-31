@@ -17,7 +17,8 @@ use std::path::PathBuf;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use rand::Rng as _;
+// rand 0.10 moved `random` off `Rng` onto `RngExt`.
+use rand::RngExt as _;
 
 pub use connect_back::ConnectBack;
 pub use service_guard::ServiceGuard;
