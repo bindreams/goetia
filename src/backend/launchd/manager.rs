@@ -208,6 +208,7 @@ fn not_installed(id: &Id) -> Error {
 /// A platform account, resolved from [`crate::spec::User`]: the
 /// [`Identity`] a generator needs, plus the uid/gid `install` needs to hand
 /// a `cwd`/`logs` directory to its owner.
+#[derive(Debug)]
 struct Account {
     name: String,
     uid: nix::unistd::Uid,

@@ -12,6 +12,7 @@
 mod support;
 
 #[cfg(target_os = "macos")]
+#[path = "launchd_integration/launchd.rs"]
 mod launchd;
 
 fn main() {
