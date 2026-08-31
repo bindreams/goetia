@@ -82,4 +82,33 @@ impl ConnectBack {
             ),
         }
     }
+
+    /// Like [`Self::accept`], but returns whatever the daemon wrote before
+    /// closing its end — used to carry a value out of the daemon's own
+    /// process (its own environment, for instance) rather than a bare
+    /// presence signal. Still bounded by [`START_DEADLINE`] for the same
+    /// reason `accept` is: the daemon may never connect at all.
+    pub fn accept_line(&self, what: &str) -> String {
+        let listener = self.listener.try_clone().expect("clone listener");
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| -> io::Result<String> {
+                use std::io::Read as _;
+                let (mut stream, _) = listener.accept()?;
+                let mut buf = String::new();
+                stream.read_to_string(&mut buf)?;
+                Ok(buf)
+            })();
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(START_DEADLINE) {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => panic!("accept/read while waiting for {what}: {e}"),
+            Err(_) => panic!(
+                "waited {}s for {what} on 127.0.0.1:{}; it never connected",
+                START_DEADLINE.as_secs(),
+                self.port
+            ),
+        }
+    }
 }
