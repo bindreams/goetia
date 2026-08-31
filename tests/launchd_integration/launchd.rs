@@ -573,3 +573,73 @@ fn install_over_a_directory_errors_instead_of_recursing() {
     mgr.install(&spec, false)
         .expect_err("a directory occupying the target path must not be silently treated as absent");
 }
+
+/// A job loaded under our label from a *different* plist must not be
+/// mistaken for our own.
+///
+/// `start` used to ask two label-scoped questions — "is `system/<label>`
+/// loaded?" and "is it running?" — and skip both bootstrap and kickstart
+/// when both said yes. Neither can tell *whose* job answers to that label.
+/// A predecessor job, or one an external actor booted out that has not
+/// finished tearing down, satisfies both, so `start` returned `Ok` having
+/// done nothing and the daemon never ran.
+///
+/// This is not hypothetical: it silently no-op'd `install --start` during a
+/// real migration off hand-written LaunchDaemons, leaving the daemon
+/// stopped while the command reported success.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn start_is_not_fooled_by_a_stale_job_holding_the_label() {
+    let mgr = LaunchdManager::new();
+    let id = support::random_test_id();
+
+    // Ours: `restart: always`, so launchd guarantees it runs once loaded.
+    let mut spec = sleepy(&id);
+    spec.restart = Restart::Always;
+    let _guard = Guard::install(&mgr, &spec);
+
+    // A decoy holding the same label, loaded from somewhere else entirely.
+    // `install` does not bootstrap, so the label is free until we take it.
+    let decoy_dir = std::env::temp_dir().join(format!("{id}-decoy"));
+    std::fs::create_dir_all(&decoy_dir).expect("decoy dir");
+    let decoy = decoy_dir.join(format!("{id}.plist"));
+    std::fs::write(
+        &decoy,
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>{id}</string>
+  <key>ProgramArguments</key><array><string>/bin/sleep</string><string>600</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict></plist>
+"#
+        ),
+    )
+    .expect("write decoy plist");
+    let _decoy_cleanup = FileGuard(decoy.clone());
+    cmd::run("launchctl", &["bootstrap", "system", decoy.to_str().unwrap()]);
+
+    // The decoy now holds the label and is running, which is exactly the
+    // state that used to make `start` a no-op.
+    mgr.start(&spec.id)
+        .expect("start must recover the label, not report a false success");
+
+    let status = mgr.status(&spec.id).expect("status");
+    assert_eq!(
+        status.state,
+        State::Running,
+        "our daemon must be running after start; a stale job holding the label must not          be mistaken for it"
+    );
+
+    // And it must be *ours*: the decoy sleeps 600, ours sleeps 300.
+    let running = cmd::run("pgrep", &["-fl", "sleep"]);
+    assert!(
+        running.stdout.contains("sleep 300"),
+        "the running process should be our daemon (`sleep 300`), not the decoy (`sleep 600`):\n{}",
+        running.stdout
+    );
+
+    let _ = cmd::run("launchctl", &["bootout", &format!("system/{id}")]);
+    let _ = std::fs::remove_dir_all(&decoy_dir);
+}
