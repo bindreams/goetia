@@ -35,4 +35,54 @@ pub enum Error {
     /// still trigger once its envelope decodes cleanly.
     #[error("blob: {0}")]
     Blob(String),
+
+    /// No daemon named `id` is managed by Goetia, per a [`ServiceManager`]
+    /// mutating or querying verb (`uninstall`/`start`/`stop`/`enable`/
+    /// `disable`/`status`/`show`) that needs one to already exist.
+    ///
+    /// [`ServiceManager`]: crate::manager::ServiceManager
+    #[error("daemon `{id}` is not installed")]
+    NotInstalled { id: String },
+
+    /// Something exists at `id`, but it carries no Goetia marker at all —
+    /// distinct from [`NotInstalled`](Error::NotInstalled), which means
+    /// nothing is there. Every [`ServiceManager`] verb other than `install`
+    /// refuses a foreign id with this, never `NotInstalled`: reporting a
+    /// service that demonstrably exists on the machine as merely "not
+    /// installed" sends the user looking for a missing service instead of
+    /// to the actual remedy in `recovery` (identical wording to
+    /// `decide::Outcome::RefuseForeign`'s, via
+    /// [`crate::decide::foreign_recovery`]).
+    ///
+    /// [`ServiceManager`]: crate::manager::ServiceManager
+    #[error("daemon `{id}` exists but is not managed by goetia: {recovery}")]
+    Foreign { id: String, recovery: String },
+
+    /// A mutating CLI subcommand was invoked without the elevation
+    /// (root/Administrator) it requires. Never returned for `list`,
+    /// `status`, `show`, `diff`, or `install --dry-run`, none of which
+    /// mutate anything.
+    #[error("`{subcommand}` requires elevation (root/Administrator): re-run as root or Administrator")]
+    ElevationRequired { subcommand: String },
+
+    /// [`crate::manager::native`] has no [`ServiceManager`] implementation
+    /// for the running platform yet — true for every platform until Tasks
+    /// 11-13 land. A message here, never a panic: a CLI user hitting this
+    /// gets a diagnosable error instead of a crash.
+    ///
+    /// [`ServiceManager`]: crate::manager::ServiceManager
+    #[error("no backend for {platform} yet")]
+    UnsupportedPlatform { platform: String },
+
+    /// A lower-level failure, annotated with context a call site adds
+    /// rather than a dedicated variant of its own — e.g. `daemon restart`
+    /// disclosing that a daemon is now stopped, not merely that starting it
+    /// back up failed. Not a catch-all for new call sites to reach for by
+    /// default: prefer a real variant when the failure recurs anywhere else.
+    #[error("{0}")]
+    Other(String),
 }
+
+/// This crate's `Result` alias, used throughout [`crate::manager`] and
+/// [`crate::cli`].
+pub type Result<T> = std::result::Result<T, Error>;

@@ -80,6 +80,21 @@ pub enum Outcome {
 
 // decide ==============================================================================================================
 
+/// The recovery text for a foreign (unmarked) id. Its own function, not
+/// inlined into `decide`, so a [`ServiceManager`] can give the identical
+/// wording when refusing a *non*-`install` verb (`uninstall`/`start`/etc.)
+/// against the same foreign id — one string template, not two that can
+/// drift apart.
+///
+/// [`ServiceManager`]: crate::manager::ServiceManager
+pub fn foreign_recovery(id: &str) -> String {
+    format!(
+        "remove or rename the existing `{id}` service through your platform's native service \
+         manager (systemctl / launchctl / services.msc), then re-run install — goetia never \
+         takes over a service it did not create",
+    )
+}
+
 /// The install policy, in one place.
 ///
 /// - `found` is what discovery saw at the target id.
@@ -117,12 +132,7 @@ pub fn decide(
         Ownership::Absent => Outcome::Create,
 
         Ownership::Foreign => Outcome::RefuseForeign {
-            recovery: format!(
-                "remove or rename the existing `{id}` service through your platform's native service \
-                 manager (systemctl / launchctl / services.msc), then re-run install — goetia never \
-                 takes over a service it did not create",
-                id = new_spec.id.as_str(),
-            ),
+            recovery: foreign_recovery(new_spec.id.as_str()),
         },
 
         Ownership::OursUnreadable { reason } => Outcome::RefuseUnreadable {
