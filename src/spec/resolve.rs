@@ -64,12 +64,12 @@ pub fn load(path: &Path) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
 
 fn resolve_one(id: Id, raw: RawSpec, base_dir: &Path, warnings: &mut Vec<Warning>) -> Result<DaemonSpec, Error> {
     let name = raw.name.unwrap_or_else(|| id.as_str().to_string());
-    reject_control_chars(&id, "name", &name)?;
+    reject_unemittable(&id, "name", &name)?;
 
     reject_empty_command(&id, &raw.command)?;
     let mut command = raw.command;
     for arg in &command {
-        reject_control_chars(&id, "command", arg)?;
+        reject_unemittable(&id, "command", arg)?;
     }
     if let Some(first) = command.first_mut() {
         *first = resolve_path_string(first, base_dir);
@@ -81,16 +81,16 @@ fn resolve_one(id: Id, raw: RawSpec, base_dir: &Path, warnings: &mut Vec<Warning
     let mut env = BTreeMap::new();
     for (key, value) in raw.env {
         reject_env_key_with_equals(&id, &key)?;
-        reject_control_chars(&id, "env key", &key)?;
-        reject_control_chars(&id, &format!("env[{key}]"), &value)?;
+        reject_unemittable(&id, "env key", &key)?;
+        reject_unemittable(&id, &format!("env[{key}]"), &value)?;
         env.insert(key, value);
     }
 
     let user = raw.user.unwrap_or(User::Root);
     match &user {
         User::Root => {}
-        User::Name(n) => reject_control_chars(&id, "user.name", n)?,
-        User::Id(AccountId::Sid(s)) => reject_control_chars(&id, "user.id", s)?,
+        User::Name(n) => reject_unemittable(&id, "user.name", n)?,
+        User::Id(AccountId::Sid(s)) => reject_unemittable(&id, "user.id", s)?,
         User::Id(AccountId::Uid(_)) => {}
     }
 
@@ -117,7 +117,7 @@ fn resolve_one(id: Id, raw: RawSpec, base_dir: &Path, warnings: &mut Vec<Warning
 fn resolve_optional_path(id: &Id, field: &str, raw: Option<String>, base_dir: &Path) -> Result<Option<PathBuf>, Error> {
     match raw {
         Some(s) => {
-            reject_control_chars(id, field, &s)?;
+            reject_unemittable(id, field, &s)?;
             Ok(Some(PathBuf::from(resolve_path_string(&s, base_dir))))
         }
         None => Ok(None),
@@ -147,11 +147,65 @@ fn resolve_path_string(raw: &str, base_dir: &Path) -> String {
 /// `pub(crate)`: also called by `blob::decode`, which must re-run this
 /// same check against a spec deserialized from an untrusted artifact
 /// rather than trust that `DaemonSpec`'s `pub` fields still satisfy it.
+/// Every gate a user-supplied string must pass before it can be emitted
+/// into any artifact. One entry point rather than two, so a field added
+/// later cannot pick up half the checks: each of these was a real defect
+/// found in review, and both are silent when they fail.
+///
+/// `pub(crate)`: also called by `blob::decode`, which re-runs these against
+/// a spec deserialized from an untrusted artifact rather than trusting that
+/// `DaemonSpec`'s `pub` fields still satisfy them.
+pub(crate) fn reject_unemittable(id: &Id, field: &str, value: &str) -> Result<(), Error> {
+    reject_control_chars(id, field, value)?;
+    reject_trailing_backslash(id, field, value)?;
+    Ok(())
+}
+
 pub(crate) fn reject_control_chars(id: &Id, field: &str, value: &str) -> Result<(), Error> {
     if value.chars().any(|c| c.is_control()) {
         return Err(invalid(
             id,
             &format!("field `{field}` contains a control character, which is forbidden"),
+        ));
+    }
+    if let Some(c) = value.chars().find(|c| is_xml_noncharacter(*c)) {
+        // Not control characters, so `char::is_control()` misses them, but
+        // XML 1.0 cannot represent a noncharacter at all — not even as a
+        // numeric entity — so one reaching the launchd generator produces an
+        // unparseable plist and a daemon that refuses to load.
+        return Err(invalid(
+            id,
+            &format!(
+                "field `{field}` contains U+{:04X}, a Unicode noncharacter that XML cannot represent",
+                c as u32
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The Unicode noncharacters: `U+FDD0..=U+FDEF`, and the last two code
+/// points of every plane.
+fn is_xml_noncharacter(c: char) -> bool {
+    let n = c as u32;
+    (0xFDD0..=0xFDEF).contains(&n) || (n & 0xFFFE) == 0xFFFE
+}
+
+/// A value ending in a backslash is a line continuation to systemd, which
+/// merges its directive with the following line. That is not a formatting
+/// nuisance but a privilege boundary: a `name` ending in `\` swallows
+/// whatever comes next, which can be the `[Service]` section header or the
+/// `User=` directive — and a swallowed `User=` silently runs the daemon as
+/// root instead of the requested account. Interior backslashes are fine and
+/// must stay allowed, or ordinary Windows paths become unexpressible.
+///
+/// `pub(crate)`: see `reject_control_chars`.
+pub(crate) fn reject_trailing_backslash(id: &Id, field: &str, value: &str) -> Result<(), Error> {
+    let trailing = value.len() - value.trim_end_matches('\\').len();
+    if trailing % 2 == 1 {
+        return Err(invalid(
+            id,
+            &format!("field `{field}` ends in a backslash, which systemd reads as a line continuation"),
         ));
     }
     Ok(())
@@ -207,7 +261,7 @@ fn warn_on_sub_second_restart_delay(id: &Id, restart_delay: Option<std::time::Du
     if delay.subsec_nanos() == 0 {
         return;
     }
-    let rounded = delay.as_secs() + 1;
+    let rounded = delay.as_secs().saturating_add(1);
     warnings.push(Warning {
         id: id.clone(),
         message: format!(

@@ -358,3 +358,90 @@ fn load_reports_io_error_for_missing_path() {
     let err = load(&missing).unwrap_err();
     assert!(matches!(err, Error::Io { .. }), "expected an Io error, got: {err:?}");
 }
+
+// Emission hardening ==================================================================================================
+
+/// A manifest whose `name` is `value`, resolved. Drives the validation gate
+/// from one field without repeating the YAML in every test.
+fn resolve_with_name(value: &str) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
+    let yaml = format!("daemons:\n  frpc:\n    name: {value:?}\n    command: [/bin/frpc]\n");
+    resolve_yaml(&yaml)
+}
+
+/// The same for an env value, which reaches `Environment=` on systemd and
+/// `EnvironmentVariables` on launchd.
+fn resolve_with_env_value(value: &str) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
+    let yaml = format!("daemons:\n  frpc:\n    command: [/bin/frpc]\n    env:\n      FOO: {value:?}\n");
+    resolve_yaml(&yaml)
+}
+
+#[skuld::test]
+fn rejects_trailing_backslash_in_name() {
+    // systemd reads a backslash at end of line as a line continuation, so a
+    // `name` ending in one merges `Description=` with whatever follows — which
+    // can be the `[Service]` section header, or the `User=` directive. A
+    // swallowed `User=` silently runs the daemon as root instead of the
+    // requested account, so this is a privilege boundary, not formatting.
+    let err = resolve_with_name("FRP client\\").expect_err("trailing backslash must be rejected");
+    assert!(
+        err.to_string().contains("backslash"),
+        "message should name the cause: {err}"
+    );
+}
+
+#[skuld::test]
+fn rejects_trailing_backslash_in_env_value() {
+    let err = resolve_with_env_value("C:\\opt\\rt\\").expect_err("trailing backslash must be rejected");
+    assert!(
+        err.to_string().contains("backslash"),
+        "message should name the cause: {err}"
+    );
+}
+
+#[skuld::test]
+fn accepts_interior_backslashes() {
+    // Only a *trailing* backslash continues a line. Rejecting interior ones
+    // would make ordinary Windows paths unexpressible.
+    resolve_with_env_value("C:\\opt\\rt").expect("interior backslashes are fine");
+}
+
+#[skuld::test]
+fn rejects_xml_noncharacters() {
+    // U+FFFE/U+FFFF are not control characters, so `char::is_control()` lets
+    // them through — but XML 1.0 cannot represent a noncharacter at all, not
+    // even as a numeric entity, so one reaching the launchd generator yields
+    // an unparseable plist and a daemon that refuses to load.
+    //
+    // Driven straight at the gate rather than through YAML: serde's debug
+    // form of these code points is `\u{fffe}`, which YAML rejects (it wants
+    // four bare hex digits), so a round-trip would fail for the wrong reason.
+    let id = Id::try_from("frpc").expect("valid id");
+    for bad in ['\u{FFFE}', '\u{FFFF}', '\u{FDD0}', '\u{1FFFE}'] {
+        let value = format!("frp{bad}");
+        let err = reject_unemittable(&id, "name", &value).expect_err("noncharacter must be rejected");
+        assert!(
+            err.to_string().contains("noncharacter"),
+            "message should name the cause for U+{:04X}: {err}",
+            bad as u32
+        );
+    }
+}
+
+#[skuld::test]
+fn accepts_ordinary_text() {
+    // Guards the noncharacter check against over-rejecting: it must not
+    // catch ordinary non-ASCII, which is legitimate in a display name.
+    let id = Id::try_from("frpc").expect("valid id");
+    reject_unemittable(&id, "name", "FRP — клиент 日本語").expect("ordinary text is fine");
+}
+
+#[skuld::test]
+fn huge_restart_delay_does_not_overflow() {
+    // `as_secs() + 1` on a near-`Duration::MAX` value panics in debug and
+    // wraps to a false "rounds to 0s" warning in release.
+    let yaml = format!(
+        "daemons:\n  frpc:\n    command: [/bin/frpc]\n    restart-delay: {}s 1ns\n",
+        u64::MAX
+    );
+    let _ = resolve_yaml(&yaml);
+}
