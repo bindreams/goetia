@@ -190,7 +190,18 @@ impl ServiceManager for Fake {
         let desired = generate(spec);
         let (found, on_disk) = discover(&state, spec.id.as_str());
 
-        let outcome = decide::decide(&found, on_disk.as_deref(), &desired, spec, crate::version(), force);
+        // The fake has no concept of a foreign overlay (systemd's drop-in
+        // directory, or an analogous future backend's equivalent), so it
+        // always passes `false` for `decide`'s `foreign_overlay` parameter.
+        let outcome = decide::decide(
+            &found,
+            on_disk.as_deref(),
+            &desired,
+            spec,
+            crate::version(),
+            force,
+            false,
+        );
 
         // `Create`/`Update`/`Stale` are the outcomes `decide` recommends
         // actually writing for; every refusing variant (`Conflict` without
@@ -230,6 +241,7 @@ impl ServiceManager for Fake {
             &desired,
             spec,
             crate::version(),
+            false,
             false,
         ))
     }

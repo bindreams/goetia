@@ -53,7 +53,15 @@ const RUNNING_VERSION: &str = "1.2.3";
 fn absent_creates() {
     let spec = spec_fixture();
 
-    let outcome = decide(&Ownership::Absent, None, "GENERATED", &spec, RUNNING_VERSION, false);
+    let outcome = decide(
+        &Ownership::Absent,
+        None,
+        "GENERATED",
+        &spec,
+        RUNNING_VERSION,
+        false,
+        false,
+    );
 
     assert_eq!(outcome, Outcome::Create);
 }
@@ -64,7 +72,7 @@ fn identical_is_up_to_date() {
     let artifact = "GENERATED ARTIFACT TEXT";
     let found = ours(&spec, RUNNING_VERSION, artifact);
 
-    let outcome = decide(&found, Some(artifact), artifact, &spec, RUNNING_VERSION, false);
+    let outcome = decide(&found, Some(artifact), artifact, &spec, RUNNING_VERSION, false, false);
 
     assert_eq!(outcome, Outcome::UpToDate);
 }
@@ -89,6 +97,7 @@ fn spec_change_updates() {
         &new_spec,
         RUNNING_VERSION,
         false,
+        false,
     );
 
     match outcome {
@@ -112,7 +121,7 @@ fn hand_edit_conflicts() {
     let on_disk = "GENERATED\nMemoryMax=8G\n";
     let desired = "GENERATED\n";
 
-    let outcome = decide(&found, Some(on_disk), desired, &spec, RUNNING_VERSION, false);
+    let outcome = decide(&found, Some(on_disk), desired, &spec, RUNNING_VERSION, false, false);
 
     match outcome {
         Outcome::Conflict { artifact_diff } => {
@@ -138,7 +147,7 @@ fn hand_edit_with_force_updates() {
     let on_disk = "GENERATED\nMemoryMax=8G\n";
     let desired = "GENERATED\n";
 
-    let outcome = decide(&found, Some(on_disk), desired, &spec, RUNNING_VERSION, true);
+    let outcome = decide(&found, Some(on_disk), desired, &spec, RUNNING_VERSION, true, false);
 
     assert!(
         matches!(outcome, Outcome::Update { .. }),
@@ -163,7 +172,7 @@ fn spec_change_with_hand_edit_conflicts() {
     let on_disk = "ARTIFACT FROM EMBEDDED SPEC\nMemoryMax=8G\n";
     let desired = "ARTIFACT FROM NEW SPEC\n";
 
-    let outcome = decide(&found, Some(on_disk), desired, &new_spec, RUNNING_VERSION, false);
+    let outcome = decide(&found, Some(on_disk), desired, &new_spec, RUNNING_VERSION, false, false);
 
     match outcome {
         Outcome::Conflict { artifact_diff } => {
@@ -186,7 +195,7 @@ fn spec_change_with_hand_edit_and_force_updates() {
     let on_disk = "ARTIFACT FROM EMBEDDED SPEC\nMemoryMax=8G\n";
     let desired = "ARTIFACT FROM NEW SPEC\n";
 
-    let outcome = decide(&found, Some(on_disk), desired, &new_spec, RUNNING_VERSION, true);
+    let outcome = decide(&found, Some(on_disk), desired, &new_spec, RUNNING_VERSION, true, false);
 
     assert!(
         matches!(outcome, Outcome::Update { .. }),
@@ -206,6 +215,7 @@ fn foreign_refuses_even_with_force() {
             &spec,
             RUNNING_VERSION,
             force,
+            false,
         );
 
         match outcome {
@@ -233,6 +243,7 @@ fn unreadable_refuses_with_recovery() {
             &spec,
             RUNNING_VERSION,
             force,
+            false,
         );
 
         match outcome {
@@ -255,7 +266,55 @@ fn older_version_is_stale_not_conflict() {
     let desired = "ARTIFACT AS 1.2.3 WOULD WRITE IT";
     let found = ours(&spec, "0.1.0", on_disk);
 
-    let outcome = decide(&found, Some(on_disk), desired, &spec, RUNNING_VERSION, false);
+    let outcome = decide(&found, Some(on_disk), desired, &spec, RUNNING_VERSION, false, false);
+
+    assert_eq!(
+        outcome,
+        Outcome::Stale {
+            from_version: "0.1.0".to_owned()
+        }
+    );
+}
+
+/// A stale artifact that also carries a foreign overlay (systemd's drop-in
+/// directory, or any future backend's equivalent) must not be silently
+/// regenerated: the overlay is exactly as much "not solely goetia's doing"
+/// as a hand-edited fragment is, and `decide`'s version check runs before
+/// any text comparison, so without this the overlay would be destroyed
+/// without ever being reported.
+#[skuld::test]
+fn stale_with_foreign_overlay_conflicts_not_stale() {
+    let spec = spec_fixture();
+    // `regenerated` and `on_disk` deliberately differ, mirroring how a real backend's `discover`
+    // folds an overlay marker onto `on_disk` without ever including it in `regenerated`: an
+    // identical pair here would make the conflict diff trivially (and wrongly) empty.
+    let regenerated = "ARTIFACT WRITTEN BY 0.1.0";
+    let on_disk = "ARTIFACT WRITTEN BY 0.1.0\n# --- overlay marker ---\n";
+    let desired = "ARTIFACT AS 1.2.3 WOULD WRITE IT";
+    let found = ours(&spec, "0.1.0", regenerated);
+
+    let outcome = decide(&found, Some(on_disk), desired, &spec, RUNNING_VERSION, false, true);
+
+    match outcome {
+        Outcome::Conflict { artifact_diff } => {
+            assert!(!artifact_diff.is_empty(), "conflict must carry a non-empty diff");
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+}
+
+/// `force` still lets a stale-plus-overlay artifact regenerate, exactly as
+/// it does for a plain hand-edit conflict — `foreign_overlay` only changes
+/// what happens when nothing overrides the refusal.
+#[skuld::test]
+fn stale_with_foreign_overlay_and_force_is_stale() {
+    let spec = spec_fixture();
+    let regenerated = "ARTIFACT WRITTEN BY 0.1.0";
+    let on_disk = "ARTIFACT WRITTEN BY 0.1.0\n# --- overlay marker ---\n";
+    let desired = "ARTIFACT AS 1.2.3 WOULD WRITE IT";
+    let found = ours(&spec, "0.1.0", regenerated);
+
+    let outcome = decide(&found, Some(on_disk), desired, &spec, RUNNING_VERSION, true, true);
 
     assert_eq!(
         outcome,
@@ -276,6 +335,7 @@ fn every_refusal_names_a_recovery_command() {
             &spec,
             RUNNING_VERSION,
             false,
+            false,
         ),
         decide(
             &Ownership::OursUnreadable {
@@ -285,6 +345,7 @@ fn every_refusal_names_a_recovery_command() {
             "GENERATED",
             &spec,
             RUNNING_VERSION,
+            false,
             false,
         ),
     ];

@@ -109,6 +109,20 @@ pub fn foreign_recovery(id: &str) -> String {
 ///   artifact (regenerate silently) from a hand-edited one (conflict).
 /// - `force` allows overwriting a genuine hand-edit. It never overrides a
 ///   `Foreign` or `OursUnreadable` refusal.
+/// - `foreign_overlay` is whether the platform's manager has attached extra
+///   configuration to this artifact through a channel outside the artifact
+///   text itself — systemd's `.d/` drop-in directory is the only one that
+///   exists today, but the parameter is named generically because it is not
+///   architecturally systemd-specific: any future backend that grows an
+///   analogous side-channel (a launchd override, say) needs the exact same
+///   precedence question answered, and answering it here — once — is what
+///   keeps that precedence from being reinvented per backend. It changes
+///   only one thing: a stale artifact that also carries a foreign overlay is
+///   `Conflict`, not a silently-regenerated `Stale` — seeing `on_disk`
+///   requires a text comparison, and the version check below runs before
+///   any text comparison happens, so without this the overlay would be
+///   silently destroyed exactly the version-bump case obligation "drop-ins
+///   are drift" (systemd backend) exists to catch.
 ///
 /// For `Ownership::Ours`, the three-way comparison this needs is: does
 /// `on_disk` match `desired` (nothing to do), does it match
@@ -121,6 +135,7 @@ pub fn decide(
     new_spec: &DaemonSpec,
     running_version: &str,
     force: bool,
+    foreign_overlay: bool,
 ) -> Outcome {
     debug_assert_eq!(
         matches!(found, Ownership::Absent),
@@ -148,11 +163,21 @@ pub fn decide(
             let on_disk = on_disk.expect("Ownership::Ours implies discovery read the artifact's text");
 
             // A version mismatch always means "stale, regenerate" — checked
-            // before anything else, and never subject to `force`. Without
-            // this priority, a release that changes generator output by a
-            // single byte would present itself as a hand-edit on every
-            // already-installed service.
+            // before anything else, and never subject to `force` — *unless*
+            // a foreign overlay is present and unforced, in which case it is
+            // exactly as much a conflict as a hand-edited fragment is: the
+            // artifact was not solely goetia's own doing, so silently
+            // regenerating it would destroy something outside goetia without
+            // ever telling anyone. Without the version-mismatch priority at
+            // all, a release that changes generator output by a single byte
+            // would present itself as a hand-edit on every already-installed
+            // service — that half of the rule is unconditional.
             if blob.version != running_version {
+                if foreign_overlay && !force {
+                    return Outcome::Conflict {
+                        artifact_diff: diff::artifact_diff(regenerated, on_disk),
+                    };
+                }
                 return Outcome::Stale {
                     from_version: blob.version.clone(),
                 };
