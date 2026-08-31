@@ -320,13 +320,7 @@ fn unelevated_list_works() {
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
 
-    // `runuser` (util-linux), not `sudo`: it never asks for a password when invoked by root, and
-    // unlike `sudo` it has no `requiretty`/PAM-session pitfalls to trip over when spawned from a
-    // test process with no controlling terminal.
-    let output = Command::new("runuser")
-        .args(["-u", "nobody", "--", env!("CARGO_BIN_EXE_goetia"), "daemon", "list"])
-        .output()
-        .expect("spawn runuser -u nobody");
+    let output = run_unelevated(&["daemon", "list"]);
     assert!(
         output.status.success(),
         "unelevated `daemon list` failed:\nstdout: {}\nstderr: {}",
@@ -450,10 +444,7 @@ fn list_skips_a_foreign_unit_unreadable_to_the_caller() {
     seed_foreign(guard.id());
     fs::set_permissions(unit_path(guard.id()), fs::Permissions::from_mode(0o600)).expect("chmod 0600");
 
-    let output = Command::new("runuser")
-        .args(["-u", "nobody", "--", env!("CARGO_BIN_EXE_goetia"), "daemon", "list"])
-        .output()
-        .expect("spawn runuser -u nobody");
+    let output = run_unelevated(&["daemon", "list"]);
     assert!(
         output.status.success(),
         "unelevated `daemon list` must still succeed with an unreadable foreign unit present:\n\
@@ -466,4 +457,30 @@ fn list_skips_a_foreign_unit_unreadable_to_the_caller() {
         !stdout.contains(guard.id()),
         "an unreadable foreign unit must not appear in the listing:\n{stdout}"
     );
+}
+
+/// Run `goetia <args>` as an unprivileged user.
+///
+/// The binary is copied to a world-readable temp path first. Running it in
+/// place fails on CI with `runuser: failed to execute ...: Permission denied`,
+/// because `nobody` cannot traverse the runner's `/home/runner/work/...`
+/// checkout — a directory-permission problem several levels above the binary,
+/// not something `chmod` on the binary alone fixes.
+///
+/// `runuser` (util-linux), not `sudo`: invoked by root it never prompts, and
+/// it has none of `sudo`'s `requiretty`/PAM-session pitfalls when spawned from
+/// a test process with no controlling terminal.
+fn run_unelevated(args: &[&str]) -> std::process::Output {
+    let staged = std::env::temp_dir().join(format!("goetia-unelevated-{}", std::process::id()));
+    fs::copy(env!("CARGO_BIN_EXE_goetia"), &staged).expect("stage the binary somewhere traversable");
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).expect("chmod 0755");
+
+    let mut argv = vec!["-u", "nobody", "--", staged.to_str().expect("utf-8 temp path")];
+    argv.extend_from_slice(args);
+    let output = Command::new("runuser")
+        .args(&argv)
+        .output()
+        .expect("spawn runuser -u nobody");
+    let _ = fs::remove_file(&staged);
+    output
 }
