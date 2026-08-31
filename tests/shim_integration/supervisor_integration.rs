@@ -260,6 +260,15 @@ fn unreadable_blob_logs_to_fallback_path_and_event_log() {
         events.ok() && events.stdout.contains(&id),
         "Windows Event Log (Application, provider `Goetia`) has no entry naming `{id}`:\n{events}"
     );
+    // An unregistered source still records the insertion string, but Event
+    // Viewer renders this system fallback instead of it — which is what an
+    // administrator actually sees when asking why the daemon died. Asserting
+    // only that the id appears somewhere would pass against that useless
+    // entry, so pin the rendering too.
+    assert!(
+        !events.stdout.contains("The operation completed successfully"),
+        "event rendered with no message resource, so an admin sees nothing useful; \n         install must register the `Goetia` source:\n{events}"
+    );
 }
 
 fn programdata_dir() -> std::path::PathBuf {

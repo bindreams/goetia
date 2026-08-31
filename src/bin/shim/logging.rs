@@ -55,15 +55,26 @@ pub mod eventlog {
 
     const SOURCE: &str = "Goetia";
 
+    /// `EventCreate.exe`'s message 1 is `%1` — a verbatim passthrough of the
+    /// single insertion string, which is what lets Event Viewer render our
+    /// message without Goetia shipping a compiled message catalogue.
+    const EVENT_ID: u32 = 1;
+
     /// Best-effort: nothing here panics or bubbles an error, because this is
     /// itself a failure-reporting path — an event log write that could fail
     /// the caller would just relocate the "cannot report why" problem
-    /// rather than solve it. No source registration
-    /// (`HKLM\...\EventLog\Application\Goetia`) is performed: `ReportEventW`
-    /// still logs the message text without one, Event Viewer just cannot
-    /// look up a message-table description for it — an acceptable
-    /// trade against the extra install-time step a registered source would
-    /// need.
+    /// rather than solve it.
+    ///
+    /// Source registration happens at install time (see the SCM backend's
+    /// `register_event_source`), because it writes under `HKLM` and the shim
+    /// may be running as an unprivileged account. Without it, `ReportEventW`
+    /// still records the insertion string, but Event Viewer renders
+    /// "The operation completed successfully." instead of the message — which
+    /// defeats the whole purpose of this path, since its only reader is an
+    /// administrator asking why a daemon died at boot.
+    ///
+    /// `EVENT_ID` is 1 because registration points `EventMessageFile` at
+    /// `EventCreate.exe`, whose message 1 is a bare `%1` passthrough.
     pub fn report_error(message: &str) {
         let wide_source = wide_null(SOURCE);
         // SAFETY: `wide_source` is a valid, null-terminated UTF-16 string,
@@ -84,7 +95,7 @@ pub mod eventlog {
                 handle,
                 EVENTLOG_ERROR_TYPE,
                 0,
-                0,
+                EVENT_ID,
                 std::ptr::null_mut(),
                 1,
                 0,

@@ -153,3 +153,39 @@ pub fn list_service_names() -> Result<Vec<String>> {
 #[cfg(test)]
 #[path = "registry_tests.rs"]
 mod registry_tests;
+
+/// Register the `Goetia` Event Log source so Event Viewer can render what the
+/// shim writes.
+///
+/// Without this, `ReportEventW` still records the insertion string, but Event
+/// Viewer shows "The operation completed successfully." — the fallback for a
+/// source with no message resource. That string is the *only* thing an
+/// administrator sees when asking why a daemon died at boot, so an unreadable
+/// entry is barely better than no entry.
+///
+/// `EventCreate.exe` is used as the message file because its message 1 is a
+/// bare `%1` passthrough of the single insertion string. That is the standard
+/// trick for emitting readable events without shipping a compiled `.mc`
+/// catalogue (which is what `~/src/windows-service-manager` does instead, at
+/// the cost of a build-time `mc.exe` step).
+///
+/// Idempotent, and best-effort by contract: a failure here must not fail an
+/// install, since the daemon itself is fine either way.
+pub fn register_event_source() {
+    const KEY: &str = r"SYSTEM\CurrentControlSet\Services\EventLog\Application\Goetia";
+    const TYPES_SUPPORTED: u32 = 7; // ERROR | WARNING | INFORMATION
+
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let Ok((key, _)) = hklm.create_subkey(KEY) else {
+        return;
+    };
+    // Expanded here rather than stored as `%SystemRoot%\...`: that form needs
+    // `REG_EXPAND_SZ`, and `winreg`'s `set_value` for `&str` writes `REG_SZ`,
+    // which nothing would expand — leaving a message file that never resolves.
+    let Ok(system_root) = std::env::var("SystemRoot") else {
+        return;
+    };
+    let message_file = format!(r"{system_root}\System32\EventCreate.exe");
+    let _ = key.set_value("EventMessageFile", &message_file);
+    let _ = key.set_value("TypesSupported", &TYPES_SUPPORTED);
+}

@@ -587,6 +587,10 @@ fn apply(
 
     registry::write_parameters(&reg.name, &reg.parameters)?;
 
+    // Best-effort, and deliberately here rather than in the shim: it writes
+    // under HKLM, and the shim may run as an unprivileged account.
+    registry::register_event_source();
+
     reapply_uncompared_effects(spec, reg)?;
 
     Ok(())
