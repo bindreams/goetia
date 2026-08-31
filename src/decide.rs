@@ -14,18 +14,22 @@ use crate::spec::DaemonSpec;
 /// What discovery found at the id an install targets, before any decision
 /// about what to do with it.
 // `Blob` embeds a full `DaemonSpec` (command/env/paths), so `Ours` is much
-// larger than `Foreign`/`Absent`. The plan's Interfaces block specifies
-// `Ours(Blob)` verbatim as the shape every caller matches on; boxing it
-// would ripple into every future backend's match arms for no behavioral
-// benefit, since `decide` is called on the order of once per daemon per
-// install, never in a hot loop.
+// larger than `Foreign`/`Absent`. Boxing it would ripple into every future
+// backend's match arms for no behavioral benefit, since `decide` is called
+// on the order of once per daemon per install, never in a hot loop.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ownership {
     /// Nothing exists at this id.
     Absent,
     /// A Goetia-marked artifact exists and its blob decoded successfully.
-    Ours(Blob),
+    /// `regenerated` is `generate(blob.spec)` — the caller's own generator
+    /// applied to the *embedded* spec, not the new one. Bundling it into
+    /// this variant, rather than passing it as a separate parameter,
+    /// means a caller cannot forget to compute it: the three-way
+    /// comparison against `on_disk`/`desired` this module needs is always
+    /// available.
+    Ours { blob: Blob, regenerated: String },
     /// A Goetia-marked artifact exists but its blob will not decode — a
     /// future schema, or corruption. Still *ours*: the marker was written
     /// by some Goetia. Treating this as `Foreign` would mean downgrading
@@ -90,6 +94,11 @@ pub enum Outcome {
 ///   artifact (regenerate silently) from a hand-edited one (conflict).
 /// - `force` allows overwriting a genuine hand-edit. It never overrides a
 ///   `Foreign` or `OursUnreadable` refusal.
+///
+/// For `Ownership::Ours`, the three-way comparison this needs is: does
+/// `on_disk` match `desired` (nothing to do), does it match
+/// `regenerated` (a clean, un-hand-edited spec change), or does it match
+/// neither (a hand-edit, present whether or not the spec also changed)?
 pub fn decide(
     found: &Ownership,
     on_disk: Option<&str>,
@@ -125,7 +134,7 @@ pub fn decide(
             ),
         },
 
-        Ownership::Ours(blob) => {
+        Ownership::Ours { blob, regenerated } => {
             let on_disk = on_disk.expect("Ownership::Ours implies discovery read the artifact's text");
 
             // A version mismatch always means "stale, regenerate" — checked
@@ -143,23 +152,28 @@ pub fn decide(
                 return Outcome::UpToDate;
             }
 
-            // The embedded spec is unchanged, so `desired` (generated from
-            // `new_spec`, under the same version as the blob) is exactly
-            // what the embedded spec itself would generate. Any remaining
-            // difference from `on_disk` can only be a hand-edit.
-            if blob.spec == *new_spec {
-                if force {
-                    Outcome::Update {
-                        spec_diff: diff::spec_diff(&blob.spec, new_spec),
-                    }
-                } else {
-                    Outcome::Conflict {
-                        artifact_diff: diff::artifact_diff(on_disk, desired),
-                    }
-                }
-            } else {
+            if on_disk == regenerated {
+                // The artifact is exactly what the embedded spec itself
+                // would regenerate — no hand-edit — so the only reason it
+                // differs from `desired` is that the spec changed.
+                return Outcome::Update {
+                    spec_diff: diff::spec_diff(&blob.spec, new_spec),
+                };
+            }
+
+            // `on_disk` matches neither `desired` nor `regenerated`: a
+            // hand-edit, regardless of whether the spec also changed. A
+            // spec change alone cannot explain this difference — a clean
+            // one would have matched `regenerated` above — so collapsing
+            // this into `Update` would silently discard the hand-edit
+            // riding along with the spec change.
+            if force {
                 Outcome::Update {
                     spec_diff: diff::spec_diff(&blob.spec, new_spec),
+                }
+            } else {
+                Outcome::Conflict {
+                    artifact_diff: diff::artifact_diff(on_disk, desired),
                 }
             }
         }

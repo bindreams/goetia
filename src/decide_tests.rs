@@ -34,6 +34,17 @@ fn blob_for(spec: &DaemonSpec, version: &str) -> Blob {
     }
 }
 
+/// Builds the `Ours` ownership a real backend would report: the decoded
+/// blob, plus `regenerated` -- what that backend's own generator produces
+/// from the *embedded* spec (`generate(blob.spec)`), computed by the
+/// caller, never by `decide` itself.
+fn ours(spec: &DaemonSpec, version: &str, regenerated: &str) -> Ownership {
+    Ownership::Ours {
+        blob: blob_for(spec, version),
+        regenerated: regenerated.to_owned(),
+    }
+}
+
 const RUNNING_VERSION: &str = "1.2.3";
 
 // decide ==============================================================================================================
@@ -50,32 +61,31 @@ fn absent_creates() {
 #[skuld::test]
 fn identical_is_up_to_date() {
     let spec = spec_fixture();
-    let blob = blob_for(&spec, RUNNING_VERSION);
     let artifact = "GENERATED ARTIFACT TEXT";
+    let found = ours(&spec, RUNNING_VERSION, artifact);
 
-    let outcome = decide(
-        &Ownership::Ours(blob),
-        Some(artifact),
-        artifact,
-        &spec,
-        RUNNING_VERSION,
-        false,
-    );
+    let outcome = decide(&found, Some(artifact), artifact, &spec, RUNNING_VERSION, false);
 
     assert_eq!(outcome, Outcome::UpToDate);
 }
 
+/// A clean spec change: the artifact on disk is exactly what the embedded
+/// spec regenerates to (no hand-edit), but `new_spec` differs from the
+/// embedded spec. Pinned apart from `spec_change_with_hand_edit_conflicts`
+/// below, which looks identical except `on_disk` is *not*
+/// `regenerated` -- that's the row `decide` could not previously reach.
 #[skuld::test]
 fn spec_change_updates() {
     let embedded = spec_fixture();
     let mut new_spec = spec_fixture();
     new_spec.restart = Restart::Always;
-    let blob = blob_for(&embedded, RUNNING_VERSION);
+    let regenerated = "ARTIFACT FROM EMBEDDED SPEC";
+    let found = ours(&embedded, RUNNING_VERSION, regenerated);
 
     let outcome = decide(
-        &Ownership::Ours(blob),
-        Some("OLD ARTIFACT TEXT"),
-        "NEW ARTIFACT TEXT",
+        &found,
+        Some(regenerated),
+        "ARTIFACT FROM NEW SPEC",
         &new_spec,
         RUNNING_VERSION,
         false,
@@ -95,20 +105,14 @@ fn spec_change_updates() {
 #[skuld::test]
 fn hand_edit_conflicts() {
     let spec = spec_fixture();
-    let blob = blob_for(&spec, RUNNING_VERSION);
+    let regenerated = "GENERATED\n";
+    let found = ours(&spec, RUNNING_VERSION, regenerated);
     // A hand-added directive the spec cannot express: the embedded spec is
     // unchanged, so this can only be a hand-edit, not a spec change.
     let on_disk = "GENERATED\nMemoryMax=8G\n";
     let desired = "GENERATED\n";
 
-    let outcome = decide(
-        &Ownership::Ours(blob),
-        Some(on_disk),
-        desired,
-        &spec,
-        RUNNING_VERSION,
-        false,
-    );
+    let outcome = decide(&found, Some(on_disk), desired, &spec, RUNNING_VERSION, false);
 
     match outcome {
         Outcome::Conflict { artifact_diff } => {
@@ -124,22 +128,64 @@ fn hand_edit_conflicts() {
 #[skuld::test]
 fn hand_edit_with_force_updates() {
     let spec = spec_fixture();
-    let blob = blob_for(&spec, RUNNING_VERSION);
+    let regenerated = "GENERATED\n";
+    let found = ours(&spec, RUNNING_VERSION, regenerated);
     let on_disk = "GENERATED\nMemoryMax=8G\n";
     let desired = "GENERATED\n";
 
-    let outcome = decide(
-        &Ownership::Ours(blob),
-        Some(on_disk),
-        desired,
-        &spec,
-        RUNNING_VERSION,
-        true,
-    );
+    let outcome = decide(&found, Some(on_disk), desired, &spec, RUNNING_VERSION, true);
 
     assert!(
         matches!(outcome, Outcome::Update { .. }),
         "force should overwrite a hand-edit rather than refuse: {outcome:?}"
+    );
+}
+
+/// The row `decide` previously could not reach: the spec changed *and* the
+/// artifact was hand-edited on top of the old spec. `on_disk` matches
+/// neither `desired` (generated from the new spec) nor `regenerated`
+/// (generated from the embedded spec) -- it must be a conflict, not a
+/// silent overwrite of the hand-edit riding along with the spec change.
+#[skuld::test]
+fn spec_change_with_hand_edit_conflicts() {
+    let embedded = spec_fixture();
+    let mut new_spec = spec_fixture();
+    new_spec.restart = Restart::Always;
+    let regenerated = "ARTIFACT FROM EMBEDDED SPEC\n";
+    let found = ours(&embedded, RUNNING_VERSION, regenerated);
+    // Hand-edited on top of the old (embedded-spec) artifact: differs from
+    // both `regenerated` and `desired`.
+    let on_disk = "ARTIFACT FROM EMBEDDED SPEC\nMemoryMax=8G\n";
+    let desired = "ARTIFACT FROM NEW SPEC\n";
+
+    let outcome = decide(&found, Some(on_disk), desired, &new_spec, RUNNING_VERSION, false);
+
+    match outcome {
+        Outcome::Conflict { artifact_diff } => {
+            assert!(
+                artifact_diff.contains("MemoryMax=8G"),
+                "conflict diff should show the hand-edit: {artifact_diff}"
+            );
+        }
+        other => panic!("expected Conflict even though the spec also changed, got {other:?}"),
+    }
+}
+
+#[skuld::test]
+fn spec_change_with_hand_edit_and_force_updates() {
+    let embedded = spec_fixture();
+    let mut new_spec = spec_fixture();
+    new_spec.restart = Restart::Always;
+    let regenerated = "ARTIFACT FROM EMBEDDED SPEC\n";
+    let found = ours(&embedded, RUNNING_VERSION, regenerated);
+    let on_disk = "ARTIFACT FROM EMBEDDED SPEC\nMemoryMax=8G\n";
+    let desired = "ARTIFACT FROM NEW SPEC\n";
+
+    let outcome = decide(&found, Some(on_disk), desired, &new_spec, RUNNING_VERSION, true);
+
+    assert!(
+        matches!(outcome, Outcome::Update { .. }),
+        "force should overwrite even a hand-edit-plus-spec-change conflict: {outcome:?}"
     );
 }
 
@@ -200,18 +246,11 @@ fn older_version_is_stale_not_conflict() {
     // The spec is unchanged: on its own, that would route into the
     // hand-edit/conflict check. The version mismatch must be checked
     // first and win outright.
-    let blob = blob_for(&spec, "0.1.0");
     let on_disk = "ARTIFACT WRITTEN BY 0.1.0";
     let desired = "ARTIFACT AS 1.2.3 WOULD WRITE IT";
+    let found = ours(&spec, "0.1.0", on_disk);
 
-    let outcome = decide(
-        &Ownership::Ours(blob),
-        Some(on_disk),
-        desired,
-        &spec,
-        RUNNING_VERSION,
-        false,
-    );
+    let outcome = decide(&found, Some(on_disk), desired, &spec, RUNNING_VERSION, false);
 
     assert_eq!(
         outcome,
