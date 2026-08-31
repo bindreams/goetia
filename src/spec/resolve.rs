@@ -66,9 +66,7 @@ fn resolve_one(id: Id, raw: RawSpec, base_dir: &Path, warnings: &mut Vec<Warning
     let name = raw.name.unwrap_or_else(|| id.as_str().to_string());
     reject_control_chars(&id, "name", &name)?;
 
-    if raw.command.is_empty() {
-        return Err(invalid(&id, "command must not be empty"));
-    }
+    reject_empty_command(&id, &raw.command)?;
     let mut command = raw.command;
     for arg in &command {
         reject_control_chars(&id, "command", arg)?;
@@ -82,9 +80,7 @@ fn resolve_one(id: Id, raw: RawSpec, base_dir: &Path, warnings: &mut Vec<Warning
 
     let mut env = BTreeMap::new();
     for (key, value) in raw.env {
-        if key.contains('=') {
-            return Err(invalid(&id, &format!("env key `{key}` must not contain `=`")));
-        }
+        reject_env_key_with_equals(&id, &key)?;
         reject_control_chars(&id, "env key", &key)?;
         reject_control_chars(&id, &format!("env[{key}]"), &value)?;
         env.insert(key, value);
@@ -147,11 +143,48 @@ fn resolve_path_string(raw: &str, base_dir: &Path) -> String {
 /// and start another. XML 1.0 cannot represent a control character at all,
 /// not even as an entity, so this same check also keeps the launchd
 /// generator from emitting an unparseable plist.
-fn reject_control_chars(id: &Id, field: &str, value: &str) -> Result<(), Error> {
+///
+/// `pub(crate)`: also called by `blob::decode`, which must re-run this
+/// same check against a spec deserialized from an untrusted artifact
+/// rather than trust that `DaemonSpec`'s `pub` fields still satisfy it.
+pub(crate) fn reject_control_chars(id: &Id, field: &str, value: &str) -> Result<(), Error> {
     if value.chars().any(|c| c.is_control()) {
         return Err(invalid(
             id,
             &format!("field `{field}` contains a control character, which is forbidden"),
+        ));
+    }
+    Ok(())
+}
+
+/// `command` must name at least one argv entry. `pub(crate)`: see
+/// `reject_control_chars`.
+pub(crate) fn reject_empty_command(id: &Id, command: &[String]) -> Result<(), Error> {
+    if command.is_empty() {
+        return Err(invalid(id, "command must not be empty"));
+    }
+    Ok(())
+}
+
+/// An env key containing `=` would make a `KEY=VALUE` env-file line or a
+/// systemd `Environment=` directive ambiguous about where the key ends.
+/// `pub(crate)`: see `reject_control_chars`.
+pub(crate) fn reject_env_key_with_equals(id: &Id, key: &str) -> Result<(), Error> {
+    if key.contains('=') {
+        return Err(invalid(id, &format!("env key `{key}` must not contain `=`")));
+    }
+    Ok(())
+}
+
+/// `cwd` and `logs` are always resolved to absolute paths here (joined
+/// against `base_dir` when relative), so a `DaemonSpec` field carrying a
+/// relative path can only be an already-corrupt one. `pub(crate)`: see
+/// `reject_control_chars`.
+pub(crate) fn reject_relative_path(id: &Id, field: &str, path: &Path) -> Result<(), Error> {
+    if !path.is_absolute() {
+        return Err(invalid(
+            id,
+            &format!("field `{field}` must be an absolute path, got `{}`", path.display()),
         ));
     }
     Ok(())

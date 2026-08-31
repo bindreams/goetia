@@ -23,7 +23,16 @@ pub enum Error {
 
     /// A `resolve()`-time validation failure: an invalid id, a control
     /// character in a user-supplied string, an `=` in an env key, or an
-    /// empty command.
+    /// empty command. Also produced by `blob::decode`, which re-runs
+    /// these same checks against a spec deserialized from an untrusted
+    /// artifact.
     #[error("daemon `{daemon}`: {message}")]
     Invalid { daemon: String, message: String },
+
+    /// A metadata blob (`blob::decode`) is not usable: malformed base64,
+    /// malformed JSON, or a schema this build does not understand.
+    /// Distinct from `Invalid`, which a *structurally valid* blob can
+    /// still trigger once its envelope decodes cleanly.
+    #[error("blob: {0}")]
+    Blob(String),
 }

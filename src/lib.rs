@@ -2,6 +2,7 @@
 //! Windows/SCM, macOS/launchd, and Linux/systemd services.
 
 pub mod backend;
+pub mod blob;
 pub mod decide;
 pub mod diff;
 pub mod error;
