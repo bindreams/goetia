@@ -102,7 +102,7 @@ use crate::error::{Error, Result};
 use crate::manager::{Installed, ServiceManager, State, Status};
 use crate::spec::{DaemonSpec, Id, Kind, User, Warning};
 
-// ScmManager ===========================================================================================================
+// ScmManager ==========================================================================================================
 
 /// The Windows `ServiceManager` implementation. Holds no state of its own —
 /// every operation opens exactly the SCM/registry handles it needs and
@@ -257,7 +257,7 @@ impl ServiceManager for ScmManager {
     }
 }
 
-// discover =============================================================================================================
+// discover ============================================================================================================
 
 /// What `install`/`preview_install` need from a fresh read of the world:
 /// the registration this run would write, its canonical text, and how the
@@ -478,7 +478,7 @@ fn split_command_line(cmdline: &str) -> (PathBuf, Vec<String>) {
     (executable, it.collect())
 }
 
-// apply (write path) ===================================================================================================
+// apply (write path) ==================================================================================================
 
 /// Write `reg` (create or update), then everything outside `ScmRegistration`
 /// itself: the metadata blob, failure actions, `env`, and — for a real
@@ -653,7 +653,7 @@ fn apply_failure_actions(name: &str, fa: Option<&GenFailureActions>) -> Result<(
     Ok(())
 }
 
-// uninstall =============================================================================================================
+// uninstall ===========================================================================================================
 
 /// Stop (waiting for a confirmed `STOPPED`, closing that handle), then
 /// delete via a fresh handle. See trap 3.
@@ -694,7 +694,7 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
         .map_err(|e| to_error(&format!("delete service `{id}`"), e))
 }
 
-// shared helpers ========================================================================================================
+// shared helpers ======================================================================================================
 
 fn open_scm(access: ServiceManagerAccess) -> Result<WinServiceManager> {
     WinServiceManager::local_computer(None::<&str>, access).map_err(|e| to_error("open the Service Control Manager", e))

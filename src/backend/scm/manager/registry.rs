@@ -96,7 +96,7 @@ pub fn write_parameters(name: &str, params: &BTreeMap<String, String>) -> Result
     Ok(())
 }
 
-// Environment ==========================================================================================================
+// Environment =========================================================================================================
 
 /// `env` as the `REG_MULTI_SZ` lines `Services\<name>\Environment` needs —
 /// the format SCM itself reads when starting the service process (see the
@@ -129,7 +129,7 @@ pub fn write_environment(name: &str, env: &BTreeMap<String, String>) -> Result<(
     }
 }
 
-// Discovery for `list` =================================================================================================
+// Discovery for `list` ================================================================================================
 
 /// Every service currently registered with SCM, paired with its
 /// `Parameters` map (empty when absent — see [`read_parameters`]). The

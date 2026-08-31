@@ -28,7 +28,7 @@ use crate::backend::Identity;
 use crate::error::{Error, Result};
 use crate::spec::{AccountId, User};
 
-// resolve ==============================================================================================================
+// resolve =============================================================================================================
 
 /// `spec::User -> backend::Identity`, per the design spec's "Windows
 /// accounts" section. `User::Root` resolves to an empty (unused) `user`:
@@ -119,7 +119,7 @@ fn last_error(context: &str) -> Error {
     Error::Other(format!("{context}: {}", std::io::Error::last_os_error()))
 }
 
-// SID <-> account name =================================================================================================
+// SID <-> account name ================================================================================================
 
 /// `ConvertStringSidToSidW` + `LookupAccountSidW`: turn a `user.id` SID
 /// string into `DOMAIN\Name` (or bare `Name` for an unqualified/well-known
@@ -259,7 +259,7 @@ fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
     Ok(sid_buf)
 }
 
-// SeServiceLogonRight ==================================================================================================
+// SeServiceLogonRight =================================================================================================
 
 fn nt_error(context: &str, status: i32) -> Error {
     // SAFETY: `LsaNtStatusToWinError` takes a plain `NTSTATUS` value and

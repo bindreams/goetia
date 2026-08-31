@@ -44,7 +44,7 @@ fn hand_edit(id: &str) {
     support::cmd::run("sc.exe", &["config", id, "binPath=", &mutated]).expect_ok();
 }
 
-// Step 1: conformance ==================================================================================================
+// Step 1: conformance =================================================================================================
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn scm_passes_conformance() {
@@ -187,7 +187,7 @@ fn list_ignores_foreign_services() {
     );
 }
 
-// Step 3: uninstall then immediate reinstall ===========================================================================
+// Step 3: uninstall then immediate reinstall ==========================================================================
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn uninstall_then_immediate_reinstall_succeeds() {
@@ -296,7 +296,7 @@ fn interrupted_install_is_recoverable() {
     assert!(matches!(recovered, Outcome::Create), "{recovered:?}");
 }
 
-// Step 6: env on type: managed (spec §8 must-verify #5) ================================================================
+// Step 6: env on type: managed (spec §8 must-verify #5) ===============================================================
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn managed_kind_environment_availability() {
@@ -334,7 +334,7 @@ fn managed_kind_environment_availability() {
     );
 }
 
-// Step 7: a real account gets SeServiceLogonRight ======================================================================
+// Step 7: a real account gets SeServiceLogonRight =====================================================================
 
 struct LocalUserGuard {
     name: String,
@@ -435,7 +435,7 @@ fn restart_on_failure_round_trips_failure_actions() {
     assert_eq!(found.restart_delay, Some(Duration::from_secs(3)));
 }
 
-// Ownership::OursUnreadable: a blob that decodes but whose account can no longer be resolved =========================
+// Ownership::OursUnreadable: a blob that decodes but whose account can no longer be resolved ==========================
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn deleted_account_makes_the_service_oursunreadable() {

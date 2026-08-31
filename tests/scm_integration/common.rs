@@ -63,7 +63,7 @@ pub fn conformance_mk(id: &str) -> DaemonSpec {
     mk_spec(id, fixture_command(id, 1, 1, "plain"), BTreeMap::new())
 }
 
-// Account SID lookup ====================================================================================================
+// Account SID lookup ==================================================================================================
 //
 // `deleted_account_makes_the_service_oursunreadable` needs the SID string of
 // a real (temporary) local account, so it can install `user: {id: <sid>}`,
