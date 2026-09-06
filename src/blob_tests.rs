@@ -288,6 +288,40 @@ fn decode_rejects_an_empty_user_name() {
 }
 
 #[skuld::test]
+fn decode_rejects_a_whitespace_only_user_name() {
+    // Mirrors `decode_rejects_an_empty_user_name`: a tampered blob carrying
+    // a whitespace-only `user.name` is exactly as dangerous as an empty
+    // one (see `reject_blank`'s doc comment), so it must not decode
+    // cleanly either.
+    let mut wire = base_wire_spec();
+    wire.user = WireUser::Name { name: "  ".to_string() };
+    let envelope = WireEnvelope {
+        schema: SCHEMA,
+        version: "0.1.0".to_string(),
+        spec: wire,
+    };
+    let err = decode(&encode_wire_envelope(&envelope)).expect_err("a whitespace-only user.name must be rejected");
+    let message = err.to_string();
+    assert!(message.contains("user.name"), "error should name the field: {message}");
+    assert!(message.contains("empty"), "error should say why: {message}");
+}
+
+#[skuld::test]
+fn decode_rejects_a_whitespace_only_user_id() {
+    let mut wire = base_wire_spec();
+    wire.user = WireUser::Sid { sid: "  ".to_string() };
+    let envelope = WireEnvelope {
+        schema: SCHEMA,
+        version: "0.1.0".to_string(),
+        spec: wire,
+    };
+    let err = decode(&encode_wire_envelope(&envelope)).expect_err("a whitespace-only user.id must be rejected");
+    let message = err.to_string();
+    assert!(message.contains("user.id"), "error should name the field: {message}");
+    assert!(message.contains("empty"), "error should say why: {message}");
+}
+
+#[skuld::test]
 fn decode_rejects_an_empty_command_executable() {
     let mut wire = base_wire_spec();
     wire.command = vec![String::new()];

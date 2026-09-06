@@ -102,11 +102,11 @@ fn resolve_one(id: Id, raw: RawSpec, base_dir: &Path, warnings: &mut Vec<Warning
         User::Root => {}
         User::Name(n) => {
             reject_unemittable(&id, "user.name", n)?;
-            reject_empty(&id, "user.name", n)?;
+            reject_blank(&id, "user.name", n)?;
         }
         User::Id(AccountId::Sid(s)) => {
             reject_unemittable(&id, "user.id", s)?;
-            reject_empty(&id, "user.id", s)?;
+            reject_blank(&id, "user.id", s)?;
         }
         User::Id(AccountId::Uid(_)) => {}
     }
@@ -323,22 +323,53 @@ pub(crate) fn reject_empty_command(id: &Id, command: &[String]) -> Result<(), Er
 /// Fields where the empty string is never meaningful and is silently
 /// dangerous. `pub(crate)`: also called by `blob::decode`.
 ///
-/// Applied to `user.name`, `user.id` (the `Sid` arm only), `command[0]`,
-/// `cwd` when present, `logs` when present, and every `env` key. An empty
-/// `user.name`/`user.id` reads to systemd as an empty `User=` (root), to
-/// launchd as an empty `UserName` (root), and to SCM as an empty
-/// `lpServiceStartName` (LocalSystem) — so accepting it here would let a
-/// one-character typo (or, once `${VAR}` interpolation lands, an unset or
-/// blank environment variable) silently escalate to the platform's
-/// superuser account. Deliberately **not** applied to `name` (an empty
-/// systemd `Description=` is harmless), to `env` values (`FOO=` is a
+/// Applied to `command[0]`, `cwd` when present, `logs` when present, and
+/// every `env` key — an empty one of these has no dangerous default, it
+/// simply fails to resolve or, for `command[0]`, would silently resolve to
+/// the manifest directory. `user.name` and `user.id` are *not* checked
+/// here: an account identifier needs the stronger [`reject_blank`], since
+/// a value that is empty only after trimming is exactly as dangerous as
+/// one that is empty outright. Deliberately **not** applied to `name` (an
+/// empty systemd `Description=` is harmless), to `env` values (`FOO=` is a
 /// normal assignment), or to `command[1..]` (an empty argv element is
 /// legitimate on POSIX and every generator quotes it).
+pub(crate) fn reject_empty(id: &Id, field: &str, value: &str) -> Result<(), Error> {
+    if value.is_empty() {
+        return Err(invalid(id, &format!("field `{field}` must not be empty")));
+    }
+    Ok(())
+}
+
+/// Like [`reject_empty`], but also rejects a value that is nothing but
+/// whitespace. Applied only to `user.name` and `user.id` (the `Sid` arm) —
+/// never to a path or an `env` key, and that asymmetry is deliberate, not
+/// an oversight to "complete":
 ///
-/// An already-installed artifact whose blob carries an empty `user.name`
-/// now decodes as `Installed::OursUnreadable` rather than silently as
-/// root — the correct disclosure, and goetia has no release yet whose
-/// compatibility that would break.
+/// - An account identifier has a dangerous default on every backend if the
+///   whitespace is trimmed away downstream: `User=` (a bare space or
+///   several) verifies and starts cleanly under `systemd-analyze verify`
+///   on every platform tested, exactly like `User=` with nothing after
+///   it — systemd does not reject either, so goetia is the only gate. A
+///   whitespace-only value is therefore either the same reset-to-root
+///   silently reached through a value [`reject_empty`] does not catch, or
+///   it names an account that cannot exist (a loud start failure) — both
+///   outcomes this task exists to close off.
+/// - A path has no such default: a file literally named `" "` is legal on
+///   Unix, so refusing it would be defending goetia's own implementation
+///   rather than serving the user, and an all-whitespace `cwd`/`logs`/
+///   `command[0]` simply fails to resolve like any other bad path — it
+///   does not fall back to anything.
+/// - An `env` key made of whitespace is a distinct, broader question
+///   (whether an environment-variable name may contain a space at all)
+///   that this task does not own; only its *emptiness* does, via
+///   [`reject_empty`].
+///
+/// `pub(crate)`: also called by `blob::decode`.
+///
+/// An already-installed artifact whose blob carries an empty or
+/// whitespace-only `user.name` now decodes as `Installed::OursUnreadable`
+/// rather than silently as root — the correct disclosure, and goetia has
+/// no release yet whose compatibility that would break.
 ///
 /// A second, independent rejection of an empty `user.name` and empty
 /// `user.id` SID lives in the per-backend-override validation
@@ -347,8 +378,8 @@ pub(crate) fn reject_empty_command(id: &Id, command: &[String]) -> Result<(), Er
 /// stays scoped to the `User::Root` path it was written for. The two
 /// checks have different reachability and neither is redundant with the
 /// other — do not remove one as a "duplicate" of the other.
-pub(crate) fn reject_empty(id: &Id, field: &str, value: &str) -> Result<(), Error> {
-    if value.is_empty() {
+pub(crate) fn reject_blank(id: &Id, field: &str, value: &str) -> Result<(), Error> {
+    if value.trim().is_empty() {
         return Err(invalid(id, &format!("field `{field}` must not be empty")));
     }
     Ok(())

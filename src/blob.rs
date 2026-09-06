@@ -360,13 +360,13 @@ fn user_from_wire(id: &Id, wire: WireUser) -> Result<User, Error> {
         WireUser::Root => User::Root,
         WireUser::Name { name } => {
             spec::reject_unemittable(id, "user.name", &name)?;
-            spec::reject_empty(id, "user.name", &name)?;
+            spec::reject_blank(id, "user.name", &name)?;
             User::Name(name)
         }
         WireUser::Uid { uid } => User::Id(AccountId::Uid(uid)),
         WireUser::Sid { sid } => {
             spec::reject_unemittable(id, "user.id", &sid)?;
-            spec::reject_empty(id, "user.id", &sid)?;
+            spec::reject_blank(id, "user.id", &sid)?;
             User::Id(AccountId::Sid(sid))
         }
     })

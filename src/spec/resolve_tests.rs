@@ -501,6 +501,30 @@ fn rejects_an_empty_user_id() {
 }
 
 #[skuld::test]
+fn rejects_a_whitespace_only_user_name() {
+    // `systemd-analyze verify` accepts `User=` with a bare space exactly as
+    // silently as it accepts `User=` with nothing after it — systemd is not
+    // the gate here, goetia is. A whitespace-only name is either trimmed to
+    // empty downstream (the same reset-to-root `reject_empty` exists to
+    // close) or names an account that cannot exist, so `reject_empty`
+    // alone (a byte-length check) must not be the only gate.
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user: \"  \"\n";
+    let err = resolve_yaml(yaml).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("user.name"), "error should name the field: {msg}");
+    assert!(msg.contains("empty"), "error should say why: {msg}");
+}
+
+#[skuld::test]
+fn rejects_a_whitespace_only_user_id() {
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user:\n      id: \"  \"\n";
+    let err = resolve_yaml(yaml).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("user.id"), "error should name the field: {msg}");
+    assert!(msg.contains("empty"), "error should say why: {msg}");
+}
+
+#[skuld::test]
 fn rejects_an_empty_command_executable() {
     // Left unresolved, an empty `command[0]` would join against `base_dir`
     // and resolve to the manifest directory itself — silently, and with no
@@ -518,6 +542,19 @@ fn rejects_an_empty_cwd() {
     let msg = err.to_string();
     assert!(msg.contains("cwd"), "error should name the field: {msg}");
     assert!(msg.contains("empty"), "error should say why: {msg}");
+}
+
+#[skuld::test]
+fn accepts_a_whitespace_only_cwd() {
+    // The boundary that stops a later reader from "completing" the
+    // asymmetry by widening `reject_blank` (or its whitespace check) to
+    // paths: a file named `" "` is legal on Unix, and an all-whitespace
+    // path has no dangerous default the way an all-whitespace account
+    // does — it simply fails to resolve like any other bad path, so it
+    // must not be rejected here.
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    cwd: \"  \"\n";
+    let (specs, _warnings) = resolve_yaml(yaml).expect("a whitespace-only path is not empty and has no unsafe default");
+    assert_eq!(specs[0].cwd, Some(base_dir().join("  ")));
 }
 
 #[skuld::test]
