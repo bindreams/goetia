@@ -111,6 +111,39 @@ impl std::io::Write for FailingWriter {
     }
 }
 
+/// Accepts every write and fails only on `flush`, the way a buffered writer does when the pipe
+/// closes after the last `write` call returned `Ok`. This is the case the flush in [`emit`] exists
+/// for: without it a document that never left the buffer would be certified as delivered.
+struct FailingFlush;
+
+impl std::io::Write for FailingFlush {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "injected flush failure",
+        ))
+    }
+}
+
+/// A buffered write that succeeds and then fails to reach the far end is still an undelivered
+/// document. Without this the flush in [`emit`] would be justified only by its doc comment.
+#[skuld::test]
+fn emit_exits_one_when_only_the_flush_fails() {
+    let report = report(&[]);
+    assert_eq!(exit_code(&report), 0, "the report's own code, before the flush fails");
+
+    let mut err = Vec::new();
+    let code = emit(&report, &mut FailingFlush, &mut err);
+
+    assert_eq!(code, 1);
+    let text = String::from_utf8(err).expect("stderr is UTF-8");
+    assert!(text.contains("injected flush failure"), "{text}");
+}
+
 /// The exit code certifies that the document was delivered, so an undelivered one cannot exit `0`.
 /// Deliberately built from a report whose own [`exit_code`] *is* `0`: that is the case a consumer
 /// following "parse stdout first, then read `errors`" would meet as `json.loads("")`.

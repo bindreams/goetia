@@ -157,15 +157,24 @@ pub(super) fn discover(id: &str) -> Result<Discovery> {
 
 // dropin_marker =======================================================================================================
 
-/// The three directories systemd's unit load path searches for `<id>.service.d/*.conf` drop-ins
-/// (`systemd.unit(5)`): `/etc` overrides `/run` overrides `/usr/lib`, but all three apply
-/// simultaneously — a unit's *effective* configuration is the merge of every one of them, regardless
-/// of which directory holds the fragment itself. `systemctl edit --runtime` — one flag away from the
-/// plain `systemctl edit` the design cites — writes into the `/run` copy, not `/etc`. Goetia only
-/// ever writes into the first of these (`UNIT_DIR`); the other two are read-only from this backend's
-/// point of view, so a drop-in found there is detected (folded into `on_disk`, so `decide` reports
-/// drift) but never removed by a successful write — only `UNIT_DIR`'s own copy is goetia's to clear.
-const DROPIN_SEARCH_DIRS: [&str; 3] = [UNIT_DIR, "/run/systemd/system", "/usr/lib/systemd/system"];
+/// The directories systemd's unit load path searches for `<id>.service.d/*.conf` drop-ins
+/// (`systemd.unit(5)`), in precedence order: `/etc` overrides `/run` overrides `/usr/local/lib`
+/// overrides `/usr/lib`, but all of them apply simultaneously — a unit's *effective* configuration
+/// is the merge of every one, regardless of which directory holds the fragment itself.
+/// `systemctl edit --runtime` — one flag away from the plain `systemctl edit` the design cites —
+/// writes into the `/run` copy, not `/etc`. `/usr/local/lib` is the one a locally built package
+/// installs into; omitting it made a drop-in there invisible, which is a false *negative*: goetia
+/// would have reported an id clean while systemd was still applying configuration to it.
+/// Goetia only ever writes into the first of these (`UNIT_DIR`); the rest are read-only from this
+/// backend's point of view, so a drop-in found there is detected (folded into `on_disk`, so
+/// `decide` reports drift) but never removed by a successful write — only `UNIT_DIR`'s own copy is
+/// goetia's to clear.
+const DROPIN_SEARCH_DIRS: [&str; 4] = [
+    UNIT_DIR,
+    "/run/systemd/system",
+    "/usr/local/lib/systemd/system",
+    "/usr/lib/systemd/system",
+];
 
 /// A deterministic representation of `<id>.service.d`'s `*.conf` files — the only ones
 /// `systemd.unit(5)` reads as drop-ins — across every directory systemd's unit load path searches, or
