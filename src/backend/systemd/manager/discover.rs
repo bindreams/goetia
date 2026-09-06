@@ -1,5 +1,27 @@
 //! Classifying what's currently at an id: reading the fragment, folding in any drop-in drift, and
 //! turning that into the [`Ownership`] `decide` needs.
+//!
+//! # What counts as this id's artifact
+//!
+//! `<id>.service` and `<id>.service.d`, and nothing else. The drop-in directory counts under *every*
+//! root of systemd's system unit search path ([`DROPIN_SEARCH_DIRS`]) — one under
+//! `/etc/systemd/system.control`, where `systemctl set-property` writes, is as much this id's as one
+//! under `/etc/systemd/system`.
+//!
+//! `systemd.unit(5)` reads a strict superset. For `my-daemon.service` it also reads the
+//! dash-truncated `my-.service.d`, and for every service unit it reads the top-level `service.d`.
+//! Those are deliberately **not** scanned, and the omission is a stated limitation rather than an
+//! oversight: they are named for a family of units rather than for this id, they exist whether or
+//! not this id does, and folding them into the text `decide` compares makes `Outcome::Conflict` —
+//! whose published meaning is "an installed artifact was modified outside goetia; re-run with
+//! `--force` to overwrite" — both untrue and unfixable. A host-wide policy modified nothing, and
+//! `--force` rewrites the fragment without touching a directory that governs unrelated units, so the
+//! operator is told to force, forces, and is told to force again.
+//!
+//! The cost is a real false negative: an administrator deliberately aiming `my-.service.d` at
+//! goetia's `my-daemon` is not reported. Closing it takes a different question than drift detection
+//! asks — "what will actually run here", resolved the way systemd resolves it and reported with no
+//! notion of an artifact goetia owns. That is a `doctor`-style check goetia does not have.
 
 use std::fs;
 use std::io;
@@ -291,8 +313,8 @@ fn undetermined(id: &str, op: &str, path: &Path, source: &io::Error) -> Error {
 
 /// Every directory systemd's system unit load path searches, in the precedence order
 /// `systemd.unit(5)`'s "System Unit Search Path" gives (its Table 1 is the same list annotated). All
-/// of them apply simultaneously: a unit's *effective* configuration is the merge of every drop-in
-/// found under any of them, regardless of which directory holds the fragment itself.
+/// of them applies simultaneously: a `<id>.service.d` under any one of them is applied to this id,
+/// regardless of which directory holds the fragment itself.
 ///
 /// The two `.control` roots outrank `/etc/systemd/system`, and are where `systemctl set-property
 /// UNIT PROPERTY=VALUE` writes its `<id>.service.d/50-<Property>.conf` (verified on systemd 257:
@@ -321,45 +343,13 @@ const DROPIN_SEARCH_DIRS: [&str; 12] = [
     "/run/systemd/generator.late",
 ];
 
-/// Every drop-in directory name `systemd.unit(5)` reads for `<id>.service`, most specific first.
-/// Three kinds, and a goetia id can produce all three — `^[A-Za-z0-9._-]{1,80}$` allows dashes, and
-/// forbids the `@` that would add a template's and an instance's directories on top:
-///
-/// - `<id>.service.d`, the one `systemctl edit` writes;
-/// - one per dash in the id, the unit name truncated after that dash: for `foo-bar-baz.service`,
-///   `foo-bar-.service.d` and `foo-.service.d` (verified: a `.conf` under
-///   `goetia-probe-trunc-.service.d` reached `goetia-probe-trunc-x.service`'s `Documentation=`);
-/// - `service.d`, the top-level per-type drop-in, which applies to *every* `.service` unit on the
-///   host (verified: the same file under `/etc/systemd/system/service.d` also reached
-///   `cron.service`).
-///
-/// Only the first is attributable to this id — the other two exist independently of it and apply to
-/// a whole family of units — which is why [`residue`], whose question is "is this *id* occupied",
-/// asks for that one alone while drift detection asks for all of them.
-fn dropin_dir_names(id: &str) -> Vec<String> {
-    let mut names = vec![format!("{id}.service.d")];
-    // Longest prefix first, the order the man page's "drop-in files further down the prefix
-    // hierarchy override those further up" describes. A prefix equal to the whole id (an id ending
-    // in a dash) is dropped rather than naming one directory twice.
-    let mut truncations: Vec<String> = id
-        .match_indices('-')
-        .map(|(i, _)| &id[..=i])
-        .filter(|prefix| *prefix != id)
-        .map(|prefix| format!("{prefix}.service.d"))
-        .collect();
-    truncations.reverse();
-    names.append(&mut truncations);
-    names.push("service.d".to_string());
-    names
-}
-
 // dropin_marker =======================================================================================================
 
-/// A deterministic representation of every `*.conf` file `systemd.unit(5)` reads as a drop-in for
-/// `id` — across every directory name in [`dropin_dir_names`] and every root in
-/// [`DROPIN_SEARCH_DIRS`] — or `None` if none of them exist or hold any.
+/// A deterministic representation of `<id>.service.d`'s `*.conf` files across every root in
+/// [`DROPIN_SEARCH_DIRS`], or `None` if none of them exist or hold any. Only that directory: see the
+/// module doc comment for the family-wide ones systemd also reads and this deliberately does not.
 pub(super) fn dropin_marker(id: &str) -> ReadResult<Option<String>> {
-    let dirs = dropin_dirs(&dropin_dir_names(id))?;
+    let dirs = dropin_dirs(id)?;
     if dirs.is_empty() {
         return Ok(None);
     }
@@ -368,18 +358,16 @@ pub(super) fn dropin_marker(id: &str) -> ReadResult<Option<String>> {
 
 /// The same scan [`dropin_marker`] concatenates, kept per-directory so a caller that has to *name*
 /// the drop-ins for a human ([`residue`]) and one that has to *compare their content*
-/// ([`dropin_marker`]) cannot drift on which *files* count as drop-ins. `names` is the one thing the
-/// two deliberately differ on, and it is passed in rather than derived here so that difference is
-/// visible at both call sites.
-fn dropin_dirs(names: &[String]) -> ReadResult<Vec<(PathBuf, String)>> {
+/// ([`dropin_marker`]) cannot drift on which files count as drop-ins. One scan for both: what is
+/// this id's artifact and what occupies this id are the same set of directories, which is what keeps
+/// `install` and `uninstall` from describing one filesystem state differently.
+fn dropin_dirs(id: &str) -> ReadResult<Vec<(PathBuf, String)>> {
     let mut found = Vec::new();
     for search_dir in DROPIN_SEARCH_DIRS {
-        for name in names {
-            let dir = Path::new(search_dir).join(name);
-            let text = dropin_marker_in(&dir)?;
-            if !text.is_empty() {
-                found.push((dir, text));
-            }
+        let dir = Path::new(search_dir).join(format!("{id}.service.d"));
+        let text = dropin_marker_in(&dir)?;
+        if !text.is_empty() {
+            found.push((dir, text));
         }
     }
     Ok(found)
@@ -479,13 +467,6 @@ impl Residue {
 /// What is left at `id` besides the fragment, `None` when the id is genuinely unoccupied, or
 /// [`Error::Undetermined`] when a read this answer depends on failed — see [`undetermined`].
 ///
-/// `<id>.service.d` alone of [`dropin_dir_names`]'s three kinds: the truncated-prefix and top-level
-/// `service.d` directories are named for a *family* of units rather than for this id, exist whether
-/// or not this id ever does, and are applied to every sibling that shares the prefix or the type. So
-/// they are drift on an installed unit but not occupancy of an empty id — and [`residue_recovery`],
-/// which tells a human to delete what it names, would otherwise point at a directory that is not
-/// this id's to delete and whose removal changes unrelated units.
-///
 /// The single source of "is this id really empty" for both [`discover`] (so `install` never
 /// silently adopts what it did not write) and [`require_installed`] (so `uninstall` never reports
 /// [`Error::NotInstalled`] — which the CLI renders as success, exit `0` — for an id that still has
@@ -493,7 +474,7 @@ impl Residue {
 /// `uninstall x && echo "confirmed gone"` came to print for a unit still loaded, still running and
 /// still `.wants`-linked.
 fn residue(id: &str) -> Result<Option<Residue>> {
-    let dropin = dropin_dirs(&[format!("{id}.service.d")]).map_err(|failure| failure.undetermined(id))?;
+    let dropin = dropin_dirs(id).map_err(|failure| failure.undetermined(id))?;
     let mut links = Vec::new();
     for search_dir in WANTS_SEARCH_DIRS {
         let link = Path::new(search_dir).join(WANTS_DIR).join(format!("{id}.service"));

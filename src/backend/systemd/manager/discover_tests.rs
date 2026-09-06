@@ -206,43 +206,29 @@ fn the_wants_sweep_skips_the_roots_that_cannot_hold_a_link() {
     }
 }
 
-/// The three kinds of drop-in directory `systemd.unit(5)` reads for one unit name. The truncations
-/// go longest-first, matching the man page's "further down the prefix hierarchy overrides further
-/// up".
+/// The one directory name both the drift scan and the occupancy scan ask for. Systemd reads more —
+/// `my-.service.d` for `my-daemon.service`, and the top-level `service.d` for every service unit —
+/// and the module doc comment says why goetia deliberately does not. Pinned here because the cheap
+/// mistake is to "complete" that list without noticing that `Outcome::Conflict` is what the extra
+/// directories would produce, and that `--force` cannot clear one.
 #[skuld::test]
-fn every_drop_in_directory_name_systemd_reads_is_generated() {
-    assert_eq!(
-        dropin_dir_names("foo-bar-baz"),
-        [
-            "foo-bar-baz.service.d",
-            "foo-bar-.service.d",
-            "foo-.service.d",
-            "service.d"
-        ]
-    );
-    assert_eq!(dropin_dir_names("frpc"), ["frpc.service.d", "service.d"]);
-}
+fn the_scan_asks_for_this_ids_own_directory_and_no_family_wide_one() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for name in ["my-.service.d", "service.d"] {
+        let dir = tmp.path().join(name);
+        fs::create_dir(&dir).expect("seed a family-wide drop-in directory");
+        fs::write(dir.join("50-x.conf"), "[Service]\nMemoryMax=8G\n").expect("write drop-in");
+    }
+    let own = tmp.path().join("my-daemon.service.d");
+    fs::create_dir(&own).expect("seed this id's own drop-in directory");
+    fs::write(own.join("override.conf"), "[Service]\nMemoryMax=1G\n").expect("write drop-in");
 
-/// An id may both start and end with a dash (`^[A-Za-z0-9._-]{1,80}$`), and truncating after the
-/// final one reproduces the id itself — which must name one directory, not two.
-#[skuld::test]
-fn a_trailing_dash_does_not_name_the_same_directory_twice() {
-    let names = dropin_dir_names("foo-");
-    assert_eq!(names, ["foo-.service.d", "service.d"]);
-
-    let names = dropin_dir_names("-foo-");
-    assert_eq!(names, ["-foo-.service.d", "-.service.d", "service.d"]);
-}
-
-/// [`residue`] asks for `<id>.service.d` alone: the other two kinds are named for a family of units
-/// rather than for this id, so they are drift on an installed unit but never occupancy of an empty
-/// one — and [`residue_recovery`] tells a human to delete what it names.
-#[skuld::test]
-fn only_the_id_specific_directory_counts_as_this_ids_occupancy() {
-    let names = dropin_dir_names("goetia-daemon");
-    assert_eq!(names[0], "goetia-daemon.service.d");
+    // `dropin_dirs` sweeps absolute roots, so the name-building rule is exercised through the one
+    // reader both it and `residue` share.
+    let marker = dropin_marker_in(&own).expect("read this id's drop-in directory");
+    assert!(marker.contains("MemoryMax=1G"), "{marker}");
     assert!(
-        names[1..].iter().all(|name| !name.starts_with("goetia-daemon.")),
-        "everything past the first is a family name, not this id's: {names:?}"
+        !marker.contains("MemoryMax=8G"),
+        "a family-wide directory is a sibling of this id's, never part of it: {marker}"
     );
 }

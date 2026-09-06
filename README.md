@@ -350,14 +350,21 @@ naming what is left, exactly as `install` refuses the same state. Goetia
 removes neither — a drop-in is as plausibly an administrator's override of a
 unit shipped in `/usr/lib` as it is goetia's own leftover.
 
-Drop-ins are looked for wherever `systemd.unit(5)`'s System Unit Search Path
-says systemd reads them, `/etc/systemd/system.control` (where `systemctl
-set-property` writes) through `/usr/lib/systemd/system` — and under each, in
-`<id>.service.d`, in every dash-truncated prefix of it, and in the top-level
-`service.d`. Anything found there is drift, whichever directory holds it.
-Only `<id>.service.d` counts as the id's own occupancy, since the other two
-are named for a family of units rather than for this id; and only goetia's
-own `/etc/systemd/system/<id>.service.d` is ever removed by a write.
+`<id>.service.d` is looked for under every root of `systemd.unit(5)`'s System
+Unit Search Path — `/etc/systemd/system.control`, where `systemctl
+set-property` writes, through `/usr/lib/systemd/system`. A drop-in under any
+of them is drift; only goetia's own `/etc/systemd/system/<id>.service.d` is
+ever removed by a write.
+
+The artifact is `<id>.service` plus `<id>.service.d`, and nothing else.
+Systemd reads more — `my-.service.d` for `my-daemon.service`, and a top-level
+`service.d` for every service unit on the host — and goetia deliberately does
+not scan those: they are named for a family of units rather than for one id,
+so calling them a conflict would be untrue, and `--force` cannot clear a
+directory that governs unrelated units. The cost is that an override
+deliberately aimed at a goetia daemon through one of those directories is not
+reported; seeing it takes a "what will actually run here" check, which is a
+different question from drift.
 
 | Verb                         | Absent artifact | Why                                                                                                                            |
 | ---------------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------ |

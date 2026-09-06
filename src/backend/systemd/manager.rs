@@ -22,9 +22,8 @@
 //! 3. **Drop-ins are drift.** `systemctl edit` — the officially recommended way to add exactly the
 //!    `MemoryMax=`/`After=` the design cites — writes `<id>.service.d/override.conf` and leaves the
 //!    fragment itself byte-identical, so drift detection over the fragment alone misses it entirely.
-//!    [`discover::dropin_marker`] folds every drop-in `systemd.unit(5)` reads — across the whole
-//!    system unit search path, and including the dash-truncated and top-level `service.d`
-//!    directories — into the text
+//!    [`discover::dropin_marker`] folds `<id>.service.d`'s `*.conf` contents — across every root of
+//!    systemd's system unit search path, `/etc/systemd/system.control` included — into the text
 //!    handed to `decide` (never into what is actually written); `decide::decide`'s own
 //!    `foreign_overlay` parameter — never a backend-local override of its `Outcome` — closes the one
 //!    branch the folded text can't reach on its own (a stale artifact, whose version-mismatch check
@@ -32,7 +31,9 @@
 //!    `UNIT_DIR/<id>.service.d`, so a resolved conflict there cannot wedge the id in permanent
 //!    drift; a drop-in under any other search root is reported but never removed, since goetia
 //!    cannot write it and cannot tell an administrator's override from a leftover. A drop-in
-//!    directory with no fragment at all is refused rather than silently adopted as `Create`.
+//!    directory with no fragment at all is refused rather than silently adopted as `Create`. The
+//!    family-wide directories `systemd.unit(5)` also reads (`my-.service.d`, the top-level
+//!    `service.d`) are deliberately outside this — see `discover`'s module doc comment.
 //! 4. **Permissions.** `NamedTempFile` is created mode 0600; after persisting, the unit would be
 //!    root-only, breaking the promise that `list`/`show`/`diff` need no elevation.
 //!    [`write::write_temp_unit`] `chmod`s 0644 before persisting.

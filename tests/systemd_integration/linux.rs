@@ -702,30 +702,78 @@ fn uninstall_refuses_an_id_whose_only_artifact_is_a_control_dropin() {
     );
 }
 
-/// `systemd.unit(5)`: "for a unit name foo-bar-baz.service not only the regular drop-in directory
-/// foo-bar-baz.service.d/ is searched but also both foo-bar-.service.d/ and foo-.service.d/". The id
-/// carries its own random component *before* the truncation point, so the directory this seeds
-/// belongs to this test alone and cannot reach a concurrently running one.
+/// The stated limitation, pinned so it stays deliberate. `systemd.unit(5)` does read
+/// `foo-.service.d` for `foo-bar.service`, and goetia does not scan it: it is named for a family of
+/// units rather than for this id, so reporting it as this id's `Conflict` would be untrue, and
+/// `--force` — the published remedy — rewrites the fragment without touching a directory that
+/// governs unrelated units. The id carries its own random component *before* the truncation point,
+/// so the directory this seeds belongs to this test alone.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_dash_truncated_dropin_is_drift() {
+fn a_dash_truncated_dropin_is_not_this_ids_conflict() {
     let id = format!("{}-leaf", support::random_test_id());
     let guard = ServiceGuard::new(&id);
     let mgr = Systemd::new();
     mgr.install(&mk(guard.id()), false).expect("install");
-    assert_eq!(
-        mgr.preview_install(&mk(guard.id())).expect("preview"),
-        Outcome::UpToDate
-    );
 
     let truncated = guard.id().rsplit_once('-').expect("the id has a dash").0.to_string();
     let dir = PathBuf::from(support::SYSTEMD_UNIT_DIR).join(format!("{truncated}-.service.d"));
     let _cleanup = seed_dropin(&dir);
 
     let outcome = mgr.preview_install(&mk(guard.id())).expect("preview");
+    assert_eq!(
+        outcome,
+        Outcome::UpToDate,
+        "{} is a sibling of this id's artifact, not part of it",
+        dir.display()
+    );
+
+    // And the same id's *own* drop-in still is drift, so this is a boundary, not a hole.
+    let _own = seed_dropin(&dropin_dir(guard.id()));
+    let outcome = mgr.preview_install(&mk(guard.id())).expect("preview");
     assert!(
         matches!(outcome, Outcome::Conflict { .. }),
-        "systemd applies {} to this unit, so it is not up to date, got {outcome:?}",
+        "`<id>.service.d` is this id's artifact, got {outcome:?}"
+    );
+}
+
+/// The regression this boundary exists to prevent. A top-level `service.d` applies to *every*
+/// service unit on the host (verified: one `.conf` there reached `cron.service`'s `Documentation=`),
+/// so scanning it put every goetia daemon on such a host into a permanent `Conflict` that `--force`
+/// rewrote the fragment for and never cleared — force, be told to force again, forever.
+///
+/// Seeded with an inert `[Unit] Documentation=` rather than the `MemoryMax=` the other drop-in tests
+/// use: for as long as this file exists, systemd really is applying it to every service on the
+/// machine, including the ones other tests are running.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_top_level_service_d_dropin_is_not_this_ids_conflict() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let mgr = Systemd::new();
+    mgr.install(&mk(guard.id()), false).expect("install");
+
+    let dir = PathBuf::from(support::SYSTEMD_UNIT_DIR).join("service.d");
+    assert!(
+        !dir.exists(),
+        "{} already exists on this host; this test would remove an administrator's directory",
         dir.display()
+    );
+    fs::create_dir(&dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
+    let _cleanup = RmDropin {
+        leaf: dir.clone(),
+        root: None,
+    };
+    fs::write(
+        dir.join("50-goetia-test.conf"),
+        "[Unit]\nDocumentation=https://example.invalid/goetia-test\n",
+    )
+    .expect("write the host-wide drop-in");
+    cmd::run("systemctl", &["daemon-reload"]).expect_ok();
+
+    let outcome = mgr.preview_install(&mk(guard.id())).expect("preview");
+    assert_eq!(
+        outcome,
+        Outcome::UpToDate,
+        "a host-wide policy modified no artifact of goetia's, and `--force` could not clear it"
     );
 }
 
