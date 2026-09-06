@@ -430,6 +430,27 @@ fn status_reaches_the_manager() {
     assert!(out.contains("running"), "{out}");
 }
 
+/// `status` with no ids must render each entry through the exact same line
+/// shape as `status <id>` — `pid` included — not a second, `pid`-less shape
+/// of its own.
+#[skuld::test]
+fn status_with_no_ids_prints_the_pid_like_the_per_id_form() {
+    let fake = Fake::new();
+    let spec = mk("frpc");
+    fake.install(&spec, false).unwrap();
+    fake.start(&spec.id).unwrap();
+
+    let (_, per_id, _) = dispatch_read_only(&["goetia", "daemon", "status", "frpc"], &fake);
+    let (_, no_ids, _) = dispatch_read_only(&["goetia", "daemon", "status"], &fake);
+
+    assert!(per_id.contains("pid="), "{per_id}");
+    assert_eq!(
+        per_id.trim(),
+        no_ids.trim(),
+        "status with no ids must print the same line as status <id>"
+    );
+}
+
 #[skuld::test]
 fn diff_reaches_the_manager() {
     let fake = Fake::new();

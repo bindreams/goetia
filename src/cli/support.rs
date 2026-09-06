@@ -52,13 +52,23 @@ pub(crate) fn parse_id(s: &str) -> Result<crate::spec::Id> {
     crate::spec::Id::try_from(s.to_string())
 }
 
+/// One decoded [`Installed::Ours`] entry, as held by [`InstalledIndex`].
+/// Named rather than a tuple: a four-tuple at three call sites is exactly
+/// where a field gets read back in the wrong position.
+pub(crate) struct InstalledEntry {
+    pub spec: DaemonSpec,
+    pub state: State,
+    pub pid: Option<u32>,
+    pub enabled: bool,
+}
+
 /// One [`ServiceManager::list`] entry, indexed by id. `list`, `status`,
-/// `show`, and `diff` all need this same split — spec/state/enabled for
+/// `show`, and `diff` all need this same split — spec/state/pid/enabled for
 /// what decoded cleanly, plus which names exist but did not — so it lives
 /// here rather than as four independently-maintained copies of the same
 /// `match`.
 pub(crate) struct InstalledIndex {
-    pub ours: BTreeMap<String, (DaemonSpec, State, bool)>,
+    pub ours: BTreeMap<String, InstalledEntry>,
     pub unreadable: BTreeMap<String, String>,
 }
 
@@ -72,8 +82,21 @@ pub(crate) fn partition_installed(installed: Vec<Installed>) -> InstalledIndex {
     let mut unreadable = BTreeMap::new();
     for entry in installed {
         match entry {
-            Installed::Ours { spec, state, enabled } => {
-                ours.insert(spec.id.as_str().to_string(), (spec, state, enabled));
+            Installed::Ours {
+                spec,
+                state,
+                pid,
+                enabled,
+            } => {
+                ours.insert(
+                    spec.id.as_str().to_string(),
+                    InstalledEntry {
+                        spec,
+                        state,
+                        pid,
+                        enabled,
+                    },
+                );
             }
             Installed::OursUnreadable { name, reason } => {
                 unreadable.insert(name, reason);

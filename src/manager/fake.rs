@@ -326,6 +326,14 @@ impl ServiceManager for Fake {
                 Ok(Some(blob)) => out.push(Installed::Ours {
                     spec: blob.spec,
                     state: entry.state,
+                    // Mirrors `status`'s own rule just above: `Some(FAKE_PID)`
+                    // iff `Running`, so `list` and `status` can never
+                    // disagree about the same entry.
+                    pid: if entry.state == State::Running {
+                        Some(FAKE_PID)
+                    } else {
+                        None
+                    },
                     enabled: entry.enabled,
                 }),
                 Err(e) => out.push(Installed::OursUnreadable {

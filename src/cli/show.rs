@@ -96,8 +96,8 @@ fn show_from_installed(
     };
     let mut specs = Vec::new();
     for id in &wanted {
-        if let Some((spec, _, _)) = index.ours.get(id) {
-            specs.push(spec.clone());
+        if let Some(entry) = index.ours.get(id) {
+            specs.push(entry.spec.clone());
         } else if index.unreadable.contains_key(id) {
             let _ = writeln!(err, "error: daemon `{id}` is installed but unreadable");
             exit = 1;

@@ -28,8 +28,14 @@ pub fn run(get_manager: &dyn Fn() -> Result<Box<dyn ServiceManager>>, out: &mut 
     let index = partition_installed(installed);
     print_unreadable_warnings(&index.unreadable, err);
 
-    for (id, (spec, state, enabled)) in &index.ours {
-        let _ = writeln!(out, "{id}\t{}\t{}\tenabled={enabled}", spec.name, state_str(*state));
+    for (id, entry) in &index.ours {
+        let _ = writeln!(
+            out,
+            "{id}\t{}\t{}\tenabled={}",
+            entry.spec.name,
+            state_str(entry.state),
+            entry.enabled
+        );
     }
 
     if index.unreadable.is_empty() { 0 } else { 1 }

@@ -275,9 +275,10 @@ impl ServiceManager for ScmManager {
                 continue;
             }
             match query_live(&name) {
-                Ok((state, enabled)) => out.push(Installed::Ours {
+                Ok((state, pid, enabled)) => out.push(Installed::Ours {
                     spec: blob.spec,
                     state,
+                    pid,
                     enabled,
                 }),
                 Err(e) => out.push(Installed::OursUnreadable {
@@ -873,7 +874,7 @@ fn map_state(s: WinState) -> State {
     }
 }
 
-fn query_live(name: &str) -> Result<(State, bool)> {
+fn query_live(name: &str) -> Result<(State, Option<u32>, bool)> {
     let scm = open_scm(ServiceManagerAccess::CONNECT)?;
     let service = scm
         .open_service(name, ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG)
@@ -886,6 +887,7 @@ fn query_live(name: &str) -> Result<(State, bool)> {
         .map_err(|e| to_error(&format!("query configuration for `{name}`"), e))?;
     Ok((
         map_state(status.current_state),
+        status.process_id,
         cfg.start_type == ServiceStartType::AutoStart,
     ))
 }

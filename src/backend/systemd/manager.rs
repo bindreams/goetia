@@ -307,6 +307,7 @@ impl ServiceManager for Systemd {
                     Ok(status) => out.push(Installed::Ours {
                         spec: blob.spec,
                         state: status.state,
+                        pid: status.pid,
                         enabled: status.enabled,
                     }),
                     Err(e) => out.push(Installed::OursUnreadable {

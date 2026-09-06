@@ -46,6 +46,49 @@ fn list_excludes_foreign_entries() {
     );
 }
 
+/// `pid` must mean the same thing in `list` as in `status`: the number
+/// `status` would report for this id at this moment, not an independently
+/// derived value. Checked both while running (both `Some`, and equal) and
+/// once stopped (both `None`).
+#[skuld::test]
+fn list_reports_the_same_pid_as_status() {
+    let fake = Fake::new();
+    let spec = mk("pid-agreement");
+    fake.install(&spec, false).unwrap();
+    fake.start(&spec.id).unwrap();
+
+    let status = fake.status(&spec.id).unwrap();
+    let listed = fake.list().unwrap();
+    let entry = listed
+        .iter()
+        .find_map(|e| match e {
+            Installed::Ours { spec: s, pid, .. } if s.id == spec.id => Some(*pid),
+            _ => None,
+        })
+        .expect("just-installed entry must be present and readable");
+    assert!(status.pid.is_some(), "a running daemon must report a pid");
+    assert_eq!(
+        entry, status.pid,
+        "list's pid must agree with status's pid while running"
+    );
+
+    fake.stop(&spec.id).unwrap();
+    let status = fake.status(&spec.id).unwrap();
+    let listed = fake.list().unwrap();
+    let entry = listed
+        .iter()
+        .find_map(|e| match e {
+            Installed::Ours { spec: s, pid, .. } if s.id == spec.id => Some(*pid),
+            _ => None,
+        })
+        .expect("just-stopped entry must be present and readable");
+    assert!(status.pid.is_none(), "a stopped daemon must report no pid");
+    assert_eq!(
+        entry, status.pid,
+        "list's pid must agree with status's pid once stopped"
+    );
+}
+
 #[skuld::test]
 fn list_reports_unreadable_entries_without_erroring() {
     let fake = Fake::new();

@@ -50,7 +50,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{ServiceManager, State};
+use super::{Installed, ServiceManager, State};
 use crate::spec::{DaemonSpec, Id};
 
 /// See the module doc comment. Reserved: no other scenario in `run` uses
@@ -105,6 +105,7 @@ pub fn run(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
     install_does_not_enable(mgr, mk, &mut cleanup.ids);
     reinstall_preserves_enablement(mgr, mk, &mut cleanup.ids);
     start_and_stop_are_idempotent(mgr, mk, &mut cleanup.ids);
+    list_and_status_agree_on_pid(mgr, mk, &mut cleanup.ids);
     refuses_foreign_even_with_force(mgr, mk);
     foreign_refuses_every_verb(mgr, mk);
     conflict_requires_force(mgr, mk);
@@ -309,4 +310,46 @@ fn start_and_stop_are_idempotent(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> 
 
     mgr.stop(&spec.id)
         .expect("stop on an already-stopped service must be Ok, not an error");
+}
+
+/// `pid` must mean the same thing in `list` as in `status` — the number
+/// that backend's own `status()` would report for this id at this moment —
+/// on every real backend, not just the fake. Checked while stopped, while
+/// running, and after stopping again, so a backend that only agrees at one
+/// of those three moments (e.g. a `list` that caches a value from install
+/// time) still fails this.
+fn list_and_status_agree_on_pid(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec, cleanup: &mut Vec<Id>) {
+    let spec = mk(&fresh_id("pid-agreement"));
+    mgr.install(&spec, false).expect("install");
+    cleanup.push(spec.id.clone());
+
+    assert_pid_agrees(mgr, &spec.id);
+
+    mgr.start(&spec.id).expect("start");
+    assert_eq!(
+        mgr.status(&spec.id).expect("status after start").state,
+        State::Running,
+        "id {}",
+        spec.id
+    );
+    assert_pid_agrees(mgr, &spec.id);
+
+    mgr.stop(&spec.id).expect("stop");
+    assert_pid_agrees(mgr, &spec.id);
+}
+
+fn assert_pid_agrees(mgr: &dyn ServiceManager, id: &Id) {
+    let status_pid = mgr.status(id).expect("status").pid;
+    let listed = mgr.list().expect("list");
+    let list_pid = listed
+        .iter()
+        .find_map(|entry| match entry {
+            Installed::Ours { spec, pid, .. } if spec.id == *id => Some(*pid),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("id {id} must appear in list()"));
+    assert_eq!(
+        list_pid, status_pid,
+        "list's pid must agree with status's pid for id {id}"
+    );
 }

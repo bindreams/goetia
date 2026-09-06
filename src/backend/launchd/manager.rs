@@ -873,10 +873,11 @@ impl ServiceManager for LaunchdManager {
             match generate::extract(&text) {
                 Ok(None) => {} // foreign: not Goetia-managed, omitted per the trait doc comment
                 Ok(Some(blob)) => {
-                    let (state, _pid) = query_live_state(&id);
+                    let (state, pid) = query_live_state(&id);
                     out.push(Installed::Ours {
                         spec: blob.spec,
                         state,
+                        pid,
                         enabled: *enabled,
                     });
                 }
