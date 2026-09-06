@@ -468,14 +468,178 @@ fn uninstall_reaches_the_manager() {
     assert!(installed_ids(&fake).is_empty());
 }
 
+// Absence and `uninstall`'s exemption =================================================================================
+//
+// `Error::NotInstalled` says the artifact is absent; it says nothing about
+// the process. Only `uninstall` treats that as success — see
+// `IdVerbCall::absent_is_success`'s doc comment for the full table this
+// section pins one row of at a time.
+
 #[skuld::test]
-fn uninstall_unknown_id_exits_nonzero() {
+fn uninstall_exits_zero_when_the_daemon_was_already_absent() {
     let fake = Fake::new();
 
-    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "uninstall", "nonexistent"], &fake);
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "uninstall", "ghost"], &fake);
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(out, "ghost: not installed (nothing to do)\n");
+    assert_eq!(err, "");
+}
+
+#[skuld::test]
+fn stop_exits_one_when_the_daemon_is_absent() {
+    let fake = Fake::new();
+
+    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "stop", "ghost"], &fake);
 
     assert_eq!(code, 1);
-    assert!(err.contains("nonexistent"), "{err}");
+    assert!(err.contains("ghost"), "{err}");
+}
+
+#[skuld::test]
+fn disable_exits_one_when_the_daemon_is_absent() {
+    let fake = Fake::new();
+
+    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "disable", "ghost"], &fake);
+
+    assert_eq!(code, 1);
+    assert!(err.contains("ghost"), "{err}");
+}
+
+#[skuld::test]
+fn start_exits_one_when_the_daemon_is_absent() {
+    let fake = Fake::new();
+
+    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "start", "ghost"], &fake);
+
+    assert_eq!(code, 1);
+    assert!(err.contains("ghost"), "{err}");
+}
+
+#[skuld::test]
+fn enable_exits_one_when_the_daemon_is_absent() {
+    let fake = Fake::new();
+
+    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "enable", "ghost"], &fake);
+
+    assert_eq!(code, 1);
+    assert!(err.contains("ghost"), "{err}");
+}
+
+#[skuld::test]
+fn restart_exits_one_when_the_daemon_is_absent() {
+    let fake = Fake::new();
+
+    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "restart", "ghost"], &fake);
+
+    assert_eq!(code, 1);
+    assert!(err.contains("ghost"), "{err}");
+}
+
+/// A manager whose `start` panics if called: proof that `restart`'s
+/// closure short-circuits on `mgr.stop(id)?` and never falls through to
+/// `start` for an id `stop` could not act on. If the absence tolerance
+/// were ever implemented inside `stop` itself rather than on
+/// `IdVerbCall`, `restart` on an absent id would reach this `start` and
+/// panic.
+#[derive(Clone, Default)]
+struct PanicsOnStart(Fake);
+
+impl ServiceManager for PanicsOnStart {
+    fn install(&self, spec: &DaemonSpec, force: bool) -> goetia::Result<goetia::decide::Outcome> {
+        self.0.install(spec, force)
+    }
+    fn preview_install(&self, spec: &DaemonSpec) -> goetia::Result<goetia::decide::Outcome> {
+        self.0.preview_install(spec)
+    }
+    fn uninstall(&self, id: &Id) -> goetia::Result<()> {
+        self.0.uninstall(id)
+    }
+    fn enable(&self, id: &Id) -> goetia::Result<()> {
+        self.0.enable(id)
+    }
+    fn disable(&self, id: &Id) -> goetia::Result<()> {
+        self.0.disable(id)
+    }
+    fn start(&self, _id: &Id) -> goetia::Result<()> {
+        panic!("restart on an absent id must never reach start")
+    }
+    fn stop(&self, id: &Id) -> goetia::Result<()> {
+        self.0.stop(id)
+    }
+    fn status(&self, id: &Id) -> goetia::Result<Status> {
+        self.0.status(id)
+    }
+    fn list(&self) -> goetia::Result<Vec<Installed>> {
+        self.0.list()
+    }
+}
+
+#[skuld::test]
+fn restart_on_an_absent_id_never_reaches_start() {
+    let mgr = PanicsOnStart::default();
+
+    let (code, _out, err) = dispatch_with(&["goetia", "daemon", "restart", "ghost"], &mgr, &|| true);
+
+    assert_eq!(code, 1, "{err}");
+}
+
+#[skuld::test]
+fn an_absent_id_is_reported_on_stdout_not_stderr() {
+    let fake = Fake::new();
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "uninstall", "ghost"], &fake);
+
+    assert_eq!(code, 0);
+    assert!(out.contains("ghost"), "{out}");
+    assert!(out.contains("not installed"), "{out}");
+    assert_eq!(err, "", "nothing goes to stderr for an absent id: {err}");
+    assert!(!out.contains("uninstalled"), "{out}");
+    assert!(!err.contains("uninstalled"), "{err}");
+}
+
+#[skuld::test]
+fn uninstall_exits_one_for_a_foreign_id() {
+    let fake = Fake::new();
+    fake.seed_foreign("stranger", "not a goetia artifact at all\n");
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "uninstall", "stranger"], &fake);
+
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.contains("stranger"), "{err}");
+    assert!(!out.contains("not installed (nothing to do)"), "{out}");
+}
+
+#[skuld::test]
+fn uninstall_exits_one_when_a_real_failure_accompanies_an_absent_id() {
+    let fake = Fake::new();
+    fake.seed_foreign("stranger", "not a goetia artifact at all\n");
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "uninstall", "ghost", "stranger"], &fake);
+
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(
+        out, "ghost: not installed (nothing to do)\n",
+        "the absent id must still be reported as satisfied"
+    );
+    assert!(
+        err.contains("stranger"),
+        "the foreign id's failure must still be reported: {err}"
+    );
+}
+
+#[skuld::test]
+fn uninstall_still_exits_zero_when_every_id_was_removed() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "uninstall", "frpc", "ghost"], &fake);
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(out.contains("frpc: uninstalled"), "{out}");
+    assert!(out.contains("ghost: not installed (nothing to do)"), "{out}");
+    assert_eq!(err, "");
+    assert!(installed_ids(&fake).is_empty());
 }
 
 #[skuld::test]

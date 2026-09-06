@@ -116,7 +116,11 @@ pub enum DaemonCommand {
 /// code. This doc comment is the one place the whole exit-code vocabulary
 /// is written down; nothing else in the crate should re-derive it.
 ///
-/// - `0` success.
+/// - `0` success. `uninstall` alone also counts an already-absent artifact
+///   as success — `Error::NotInstalled` says nothing about the *process*,
+///   only the artifact, which is why every other id-verb keeps that same
+///   error at `1` instead; see `IdVerbCall::absent_is_success`'s doc
+///   comment for the full six-row table.
 /// - `1` error: an operation was attempted and failed, or was refused
 ///   outright.
 /// - `2` usage: clap rejected the command line before `dispatch` ever ran,

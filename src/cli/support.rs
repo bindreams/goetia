@@ -151,13 +151,31 @@ pub(crate) struct IdVerbCall<'a> {
     pub is_elevated: &'a dyn Fn() -> bool,
     pub verb: &'a dyn Fn(&dyn ServiceManager, &Id) -> Result<()>,
     pub verb_past_tense: &'a str,
+    /// Whether an absent *artifact* already satisfies this verb's goal.
+    /// True for `uninstall` alone; every other id-verb keeps `Error::
+    /// NotInstalled` as a plain failure:
+    ///
+    /// | verb | absent artifact | why |
+    /// |---|---|---|
+    /// | `uninstall` | **0** | artifact absence is exactly what it asks for |
+    /// | `stop` | 1 | a running unit whose fragment was deleted keeps running, so `stop x && echo "confirmed down"` would print that with `x` alive |
+    /// | `disable` | 1 | disabling after the fragment is gone is impossible, leaving a dangling `.wants` symlink: exit 0 while still enabled at boot |
+    /// | `start`, `restart`, `enable` | 1 | cannot act on what is not there |
+    ///
+    /// Lives here, never inside the trait: `restart`'s closure calls
+    /// `mgr.stop(id)?` before `mgr.start(id)`, and tolerating absence
+    /// inside `stop` itself would let `restart` on an absent id fall
+    /// through to `start`.
+    pub absent_is_success: bool,
 }
 
 /// Shared shape for the id-list mutating verbs (`uninstall`, `start`,
 /// `stop`, `enable`, `disable`, `restart`): check elevation once, obtain
 /// the manager once, then call `verb` per id, printing one result line per
 /// id and aggregating the exit code (`0` if every id succeeded, `1`
-/// otherwise).
+/// otherwise) — except that when `call.absent_is_success` and `verb`
+/// returns `Error::NotInstalled`, the id counts as succeeded rather than
+/// failed; see [`IdVerbCall::absent_is_success`].
 ///
 /// Every id is parsed *before* `verb` is called for any of them — the same
 /// all-or-nothing rule `select_by_ids` documents above. Parsing lazily,
@@ -191,6 +209,14 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
         match (call.verb)(mgr.as_ref(), id) {
             Ok(()) => {
                 let _ = writeln!(out, "{id}: {}", call.verb_past_tense);
+            }
+            // Absence already satisfies this verb's goal (`uninstall`
+            // alone — see `absent_is_success`'s doc comment). Stdout only,
+            // never the past-tense line: claiming e.g. "uninstalled" for a
+            // daemon that was never there trades one wrong report for
+            // another. Does not affect the aggregated exit code.
+            Err(Error::NotInstalled { .. }) if call.absent_is_success => {
+                let _ = writeln!(out, "{id}: not installed (nothing to do)");
             }
             Err(e) => {
                 let _ = writeln!(err, "error: {id}: {e}");

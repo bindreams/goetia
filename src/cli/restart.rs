@@ -44,6 +44,7 @@ pub fn run(
                     .map_err(|e| Error::Other(format!("stopped but failed to restart: {e}")))
             },
             verb_past_tense: "restarted",
+            absent_is_success: false,
         },
         out,
         err,
