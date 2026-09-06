@@ -14,6 +14,15 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    /// A `.env` file beside the manifest could not be parsed. Distinct from
+    /// `Io`, which means the file could not be read at all.
+    #[error("{path}:{line}: {message}", path = path.display())]
+    EnvFile {
+        path: PathBuf,
+        line: usize,
+        message: String,
+    },
+
     /// The document is not valid YAML, or fails a shape-level constraint
     /// checked during deserialization: a duplicate or case-insensitively
     /// colliding daemon id, or a malformed `user` field. `serde_yaml_ng`

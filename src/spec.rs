@@ -10,6 +10,7 @@
 mod raw;
 mod resolve;
 mod user;
+mod vars;
 
 pub use raw::{RawManifest, RawSpec};
 pub use resolve::{load, resolve};
