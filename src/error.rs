@@ -84,6 +84,31 @@ pub enum Error {
     #[error("daemon `{id}` exists but is not managed by goetia: {recovery}")]
     Foreign { id: String, recovery: String },
 
+    /// A read that would have said whether anything is installed at `id`
+    /// failed, so goetia does not know. `reason` names the path and the
+    /// failure; `recovery` says what would make that read succeed.
+    ///
+    /// The distinguishing property is what this variant does **not** claim.
+    /// [`NotInstalled`](Error::NotInstalled) is proof that nothing
+    /// goetia-attributable is at the id; [`Foreign`](Error::Foreign) — and
+    /// `cli::report::Kind::Unreadable`, whose published meaning is "goetia
+    /// owns the id but cannot report on it" — is proof that something is.
+    /// A failed read is the absence of both proofs, so reporting either one
+    /// invents evidence: "installed but unreadable" over an
+    /// `/etc/systemd/system/<id>.service.d` an unelevated caller merely
+    /// could not open puts goetia's name, and `uninstall`'s recovery
+    /// advice, on what may be a stranger's override. Choose between the
+    /// three by what was established, never by which is closest to hand.
+    ///
+    /// Exit `4` (indeterminate), like `Unreadable`: the code is about
+    /// whether the question was answered, and this one was not.
+    #[error("cannot determine whether daemon `{id}` is installed: {reason}. {recovery}")]
+    Undetermined {
+        id: String,
+        reason: String,
+        recovery: String,
+    },
+
     /// A mutating CLI subcommand was invoked without the elevation
     /// (root/Administrator) it requires. Never returned for `list`,
     /// `status`, `show`, `diff`, or `install --dry-run`, none of which

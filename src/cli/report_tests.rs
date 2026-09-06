@@ -55,6 +55,7 @@ fn exit_code_is_the_precedence_max_over_error_kinds() {
     for (kinds, expected) in [
         (&[][..], 0),
         (&[Kind::Unreadable][..], 4),
+        (&[Kind::Undetermined][..], 4),
         (&[Kind::NotInstalled][..], 1),
         (&[Kind::Foreign][..], 1),
         (&[Kind::Other][..], 1),
@@ -79,6 +80,7 @@ fn every_kind_serializes_to_its_documented_wire_spelling() {
         (Kind::NotInstalled, "not-installed"),
         (Kind::Foreign, "foreign"),
         (Kind::Unreadable, "unreadable"),
+        (Kind::Undetermined, "undetermined"),
         (Kind::InvalidId, "invalid-id"),
         (Kind::Unavailable, "unavailable"),
         (Kind::Unsupported, "unsupported"),
@@ -90,6 +92,29 @@ fn every_kind_serializes_to_its_documented_wire_spelling() {
             format!("\"{spelling}\"")
         );
     }
+}
+
+/// The defect this kind exists for: `status_error`'s catch-all sent every non-`NotInstalled`,
+/// non-`Foreign` error to `unreadable`, whose published meaning is "goetia owns the id but cannot
+/// report on it" and whose remedy is `uninstall`. A read that never completed establishes no
+/// ownership, so it must not borrow that claim — nor the advice attached to it.
+#[skuld::test]
+fn an_undetermined_error_is_not_reported_as_unreadable() {
+    let e = Error::Undetermined {
+        id: "frpc".to_string(),
+        reason: "failed to read /run/systemd/system/frpc.service.d: Permission denied".to_string(),
+        recovery: "re-run as root".to_string(),
+    };
+
+    let report = status_error("frpc", &e);
+
+    assert_eq!(report.kind, Kind::Undetermined);
+    assert_eq!(
+        report.kind.code(),
+        4,
+        "still indeterminate, just not an ownership claim"
+    );
+    assert!(!report.message.contains("uninstall"), "{}", report.message);
 }
 
 // emit ================================================================================================================

@@ -137,12 +137,19 @@ pub enum DaemonCommand {
 ///   "drift is present" signal on its
 ///   own: one `Create` plus one `Conflict` returns `5`, not `3`, since `5`
 ///   outranks `3` in the precedence rule below.
-/// - `4` indeterminate: an id Goetia owns whose state could not be
-///   determined. `list`/`status` compute theirs via [`report::exit_code`]
-///   (see the design spec's §4), in *both* output modes; `diff` returns it
-///   for `Outcome::RefuseUnreadable` (`cli::diff::run`) — the one row
+/// - `4` indeterminate: a question Goetia could not answer about an id.
+///   Two producers, and the difference between them is what was
+///   established: an id Goetia owns whose *state* it could not determine,
+///   or — [`Error::Undetermined`](crate::error::Error::Undetermined) — an
+///   id where the read that would have said whether anything is installed
+///   at all failed, leaving even ownership unestablished.
+///   `list`/`status` compute theirs via [`report::exit_code`]
+///   (see the design spec's §4), in *both* output modes, the second
+///   producer reaching them as `report::Kind::Undetermined`; `diff` returns
+///   it for `Outcome::RefuseUnreadable` and for `Error::Undetermined`
+///   (`cli::diff::run`) — the one row
 ///   where `diff` deliberately disagrees with `install`, which exits `1`
-///   there instead because it genuinely failed to install. `show` returns
+///   for both because it genuinely failed to install. `show` returns
 ///   it too (`cli::show::run`), for the same "installed but unreadable"
 ///   case, in both its per-id and no-ids forms — but only when it can see
 ///   the id is installed at all: `show` without `-f` reads `list()`, which

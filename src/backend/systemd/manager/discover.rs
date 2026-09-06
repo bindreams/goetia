@@ -155,6 +155,37 @@ pub(super) fn discover(id: &str) -> Result<Discovery> {
     }
 }
 
+// undetermined ========================================================================================================
+
+/// The error for a failed read that was supposed to tell this backend whether anything is at `id` —
+/// the drop-in scan and the `.wants` link stat, both of which run on the path where no fragment was
+/// found.
+///
+/// [`Error::Undetermined`], never [`io_err`]'s `Error::Other`: `Other` reaches
+/// `cli::report::status_error`'s catch-all as `Kind::Unreadable`, which *asserts* that goetia owns
+/// the id — the one thing a read that never completed cannot establish. See
+/// [`Error::Undetermined`]'s doc comment for why that claim is worth a variant of its own.
+///
+/// Every failure but `NotFound` lands here, not `PermissionDenied` alone. An `EIO` on the drop-in
+/// directory leaves goetia exactly as ignorant of the id as an `EACCES` does, so a variant chosen by
+/// errno would restore the false ownership claim for the narrower input while the fix looked
+/// complete. What the errno does choose is `recovery`: re-running elevated is advice only a
+/// permission boundary earns, and offering it for a failing disk sends the user somewhere useless.
+fn undetermined(id: &str, op: &str, path: &Path, source: &io::Error) -> Error {
+    let recovery = if source.kind() == io::ErrorKind::PermissionDenied {
+        "re-run as root (or under sudo): that read is what tells goetia whether anything is \
+         installed at this id"
+    } else {
+        "resolve that failure and re-run: that read is what tells goetia whether anything is \
+         installed at this id"
+    };
+    Error::Undetermined {
+        id: id.to_string(),
+        reason: format!("failed to {op} {}: {source}", path.display()),
+        recovery: recovery.to_string(),
+    }
+}
+
 // dropin_marker =======================================================================================================
 
 /// The directories systemd's unit load path searches for `<id>.service.d/*.conf` drop-ins
@@ -194,7 +225,7 @@ fn dropin_dirs(id: &str) -> Result<Vec<(PathBuf, String)>> {
     let mut found = Vec::new();
     for search_dir in DROPIN_SEARCH_DIRS {
         let dir = Path::new(search_dir).join(format!("{id}.service.d"));
-        let text = dropin_marker_in(&dir)?;
+        let text = dropin_marker_in(id, &dir)?;
         if !text.is_empty() {
             found.push((dir, text));
         }
@@ -202,11 +233,13 @@ fn dropin_dirs(id: &str) -> Result<Vec<(PathBuf, String)>> {
     Ok(found)
 }
 
-fn dropin_marker_in(dir: &Path) -> Result<String> {
+fn dropin_marker_in(id: &str, dir: &Path) -> Result<String> {
     let mut entries = match fs::read_dir(dir) {
-        Ok(rd) => rd.collect::<io::Result<Vec<_>>>().map_err(|e| io_err("read", dir, e))?,
+        Ok(rd) => rd
+            .collect::<io::Result<Vec<_>>>()
+            .map_err(|e| undetermined(id, "read", dir, &e))?,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(String::new()),
-        Err(e) => return Err(io_err("read", dir, e)),
+        Err(e) => return Err(undetermined(id, "read", dir, &e)),
     };
     entries.sort_by_key(std::fs::DirEntry::file_name);
 
@@ -223,7 +256,7 @@ fn dropin_marker_in(dir: &Path) -> Result<String> {
         let meta = match fs::metadata(&path) {
             Ok(m) => m,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue, // dangling symlink
-            Err(e) => return Err(io_err("stat", &path, e)),
+            Err(e) => return Err(undetermined(id, "stat", &path, &e)),
         };
         if !meta.is_file() {
             continue;
@@ -233,7 +266,7 @@ fn dropin_marker_in(dir: &Path) -> Result<String> {
             // Removed between the stat above and this read — the same benign race the stat itself
             // already tolerates.
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(io_err("read", &path, e)),
+            Err(e) => return Err(undetermined(id, "read", &path, &e)),
         };
         marker.push_str(&format!("\n# --- drop-in: {} ---\n{content}", path.display()));
     }
@@ -278,7 +311,8 @@ impl Residue {
     }
 }
 
-/// What is left at `id` besides the fragment, or `None` when the id is genuinely unoccupied.
+/// What is left at `id` besides the fragment, `None` when the id is genuinely unoccupied, or
+/// [`Error::Undetermined`] when a read this answer depends on failed — see [`undetermined`].
 ///
 /// The single source of "is this id really empty" for both [`discover`] (so `install` never
 /// silently adopts what it did not write) and [`require_installed`] (so `uninstall` never reports
@@ -296,7 +330,7 @@ fn residue(id: &str) -> Result<Option<Residue>> {
         match fs::symlink_metadata(&link) {
             Ok(_) => links.push(link),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(io_err("stat", &link, e)),
+            Err(e) => return Err(undetermined(id, "stat", &link, &e)),
         }
     }
     if dropin.is_empty() && links.is_empty() {
@@ -306,7 +340,9 @@ fn residue(id: &str) -> Result<Option<Residue>> {
 }
 
 /// The error for an id whose fragment [`raw_state`] found absent: [`Error::NotInstalled`] only when
-/// nothing goetia-attributable is there at all, [`Error::Foreign`] otherwise. Every verb that has to
+/// nothing goetia-attributable is there at all, [`Error::Foreign`] otherwise — or, when the scan
+/// itself could not be completed, [`residue`]'s own [`Error::Undetermined`], which claims neither.
+/// Every verb that has to
 /// answer "is anything at this id" — [`require_installed`] for the mutating ones, `Systemd::status`
 /// for the read-only one — goes through here, so none of them can disagree with [`discover`] about
 /// one filesystem state.
@@ -368,3 +404,7 @@ pub(super) fn require_installed(id: &str) -> Result<String> {
         },
     }
 }
+
+#[cfg(test)]
+#[path = "discover_tests.rs"]
+mod discover_tests;

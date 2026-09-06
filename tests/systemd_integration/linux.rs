@@ -82,6 +82,29 @@ fn write_dropin(id: &str) {
     cmd::run("systemctl", &["daemon-reload"]).expect_ok();
 }
 
+/// The same drop-in, in a directory no unprivileged process can open. Mode `000` on a directory the
+/// (root) test process owns is enough: `EACCES` applies to every uid but root's, and root is exactly
+/// the uid the reader in these tests is not.
+fn write_unreadable_dropin(id: &str) {
+    write_dropin(id);
+    fs::set_permissions(dropin_dir(id), fs::Permissions::from_mode(0o000)).expect("chmod 0000");
+}
+
+/// A manifest at a path an unprivileged process can actually reach: `tempfile`'s own directory is
+/// 0700, which `runuser -u nobody` cannot traverse.
+fn world_readable_manifest(id: &str) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).expect("chmod the tempdir 0755");
+    let path = dir.path().join("goetia.yaml");
+    fs::write(
+        &path,
+        format!("daemons:\n  {id}:\n    command: [\"/bin/sleep\", \"infinity\"]\n"),
+    )
+    .expect("write manifest");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod the manifest 0644");
+    (dir, path)
+}
+
 fn load_from_temp_manifest(id: &str) -> DaemonSpec {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("goetia.yaml");
@@ -406,6 +429,71 @@ fn status_does_not_call_an_id_with_a_stray_dropin_not_installed() {
     );
 }
 
+// Obligation 7: a read that failed establishes no ownership ===========================================================
+
+/// A drop-in directory the caller cannot open leaves goetia unable to say whether *anything* is
+/// installed at the id. Reporting `unreadable` for it — "goetia owns the id but cannot report on
+/// it", whose published remedy is `uninstall` — would put goetia's name and destructive advice on
+/// what is just as plausibly an administrator's override of a unit shipped elsewhere.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn status_reports_undetermined_for_a_dropin_directory_it_cannot_read() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    write_unreadable_dropin(guard.id());
+    assert!(!unit_path(guard.id()).exists(), "no fragment: this is the absence path");
+
+    let output = run_unelevated(&["daemon", "status", guard.id(), "--json"]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let context = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    // Doubles as proof that the denial actually happened: root reads that directory fine and finds
+    // one `.conf`, which reports `foreign`. So a run whose reader was not unprivileged fails here
+    // instead of passing vacuously.
+    assert!(stdout.contains(r#""kind":"undetermined""#), "{context}");
+    assert_eq!(output.status.code(), Some(4), "{context}");
+    assert!(
+        stdout.contains(&format!("{}.service.d", guard.id())),
+        "the message must name the path that could not be read: {context}"
+    );
+    assert!(
+        stdout.contains("re-run as root"),
+        "and say what would make it readable: {context}"
+    );
+    assert!(
+        !stdout.contains("uninstall"),
+        "nothing here establishes that the drop-in is goetia's to remove: {context}"
+    );
+}
+
+/// `dropin_marker_in` is shared with `dropin_marker`, which feeds `discover` and therefore drift
+/// detection, so `diff` meets this error too. `4`, not the `1` its catch-all `Err` arm gives: `diff`
+/// was asked a question and could not determine the answer — the same reasoning that already puts
+/// `Outcome::RefuseUnreadable` at `4` there.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn diff_reports_a_dropin_directory_it_cannot_read_as_indeterminate() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    write_unreadable_dropin(guard.id());
+    let (_tempdir, manifest) = world_readable_manifest(guard.id());
+
+    let output = run_unelevated(&[
+        "daemon",
+        "diff",
+        "-f",
+        manifest.to_str().expect("a UTF-8 temp path"),
+        guard.id(),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let context = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    // Root would read the drop-in and report a conflict (`5`), so this cannot pass vacuously either.
+    assert_eq!(output.status.code(), Some(4), "{context}");
+    assert!(stderr.contains("cannot determine"), "{context}");
+    assert!(!stderr.contains("uninstall"), "{context}");
+}
+
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn list_ignores_foreign_units() {
     let id = support::random_test_id();
@@ -580,7 +668,11 @@ fn list_skips_a_foreign_unit_unreadable_to_the_caller() {
 /// it has none of `sudo`'s `requiretty`/PAM-session pitfalls when spawned from
 /// a test process with no controlling terminal.
 fn run_unelevated(args: &[&str]) -> std::process::Output {
-    let staged = std::env::temp_dir().join(format!("goetia-unelevated-{}", std::process::id()));
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // Per call, not per process: three tests stage a binary now, and skuld runs them concurrently —
+    // two sharing one path would have each `remove_file` the copy the other was still executing.
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let staged = std::env::temp_dir().join(format!("goetia-unelevated-{}-{n}", std::process::id()));
     fs::copy(env!("CARGO_BIN_EXE_goetia"), &staged).expect("stage the binary somewhere traversable");
     fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).expect("chmod 0755");
 

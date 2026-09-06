@@ -248,17 +248,18 @@ A daemon's display `name` is deliberately absent: `status` has no spec to
 read it from, and one field differing between the two subcommands would be
 worse than sending you to `goetia daemon show`.
 
-`errors[].kind` is one of seven values:
+`errors[].kind` is one of eight values:
 
-| `kind`          | Exit code | Meaning                                                                                                                                                    |
-| --------------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `not-installed` | 1         | Nothing is installed at that id. Only from `status <id>`.                                                                                                  |
-| `foreign`       | 1         | Something exists there that goetia does not own, or that this privilege level cannot read. Only from `status <id>`.                                        |
-| `unreadable`    | 4         | Goetia owns the id but cannot report on it — a blob it cannot decode, a live state it could not query, or an ambiguous installation. `message` says which. |
-| `invalid-id`    | 1         | A command-line argument was not a valid daemon id. Fix the argument.                                                                                       |
-| `unavailable`   | 1         | Obtaining the manager, or listing, failed, so **no** answer was obtained for any daemon.                                                                   |
-| `unsupported`   | 2         | `--json` was given to a subcommand that does not implement it.                                                                                             |
-| `other`         | 1         | Unreachable today; reserved so an unclassified failure has a home rather than being silently dropped.                                                      |
+| `kind`          | Exit code | Meaning                                                                                                                                                                                                                           |
+| --------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `not-installed` | 1         | Nothing is installed at that id. Only from `status <id>`.                                                                                                                                                                         |
+| `foreign`       | 1         | Something exists there that goetia does not own, or that this privilege level cannot read. Only from `status <id>`.                                                                                                               |
+| `unreadable`    | 4         | Goetia read enough to know the id is its own, but cannot report on it — a blob it cannot decode, or a live state it could not query. `message` says which.                                                                        |
+| `undetermined`  | 4         | Goetia could not determine **whether** anything is installed at that id: a read it needed failed. Claims no ownership — that is the whole difference from `unreadable`. `message` names the path and what would make it readable. |
+| `invalid-id`    | 1         | A command-line argument was not a valid daemon id. Fix the argument.                                                                                                                                                              |
+| `unavailable`   | 1         | Obtaining the manager, or listing, failed, so **no** answer was obtained for any daemon.                                                                                                                                          |
+| `unsupported`   | 2         | `--json` was given to a subcommand that does not implement it.                                                                                                                                                                    |
+| `other`         | 1         | Unreachable today; reserved so an unclassified failure has a home rather than being silently dropped.                                                                                                                             |
 
 ### Exit code
 
@@ -293,14 +294,14 @@ Two rules come before the numbers:
    `grep` has distinguished "no match" from "could not read the file" since
    v7 Unix.
 
-| Code | Name          | Meaning                                                                                   | Anchored to                                                                                               |
-| ---- | ------------- | ----------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `0`  | success       | The state is as asked, or the question was fully answered.                                | —                                                                                                         |
-| `1`  | error         | An operation was attempted and failed, or was refused outright.                           | —                                                                                                         |
-| `2`  | usage         | The command line was rejected before anything ran — by clap, or by the `--json` refusal.  | clap's own default: the same code bash and argparse use for "the parser, not the program, rejected this". |
-| `3`  | drift         | A determinate "installed state differs from the manifest" answer. Only `diff` returns it. | Nothing; app-specific.                                                                                    |
-| `4`  | indeterminate | An id goetia owns whose state could not be determined.                                    | The LSB init-script convention's "service status unknown".                                                |
-| `5`  | conflict      | An installed artifact was modified outside goetia and `--force` was not given.            | Nothing; app-specific — which is why `5` is the code that moved rather than usage errors.                 |
+| Code | Name          | Meaning                                                                                      | Anchored to                                                                                               |
+| ---- | ------------- | -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `0`  | success       | The state is as asked, or the question was fully answered.                                   | —                                                                                                         |
+| `1`  | error         | An operation was attempted and failed, or was refused outright.                              | —                                                                                                         |
+| `2`  | usage         | The command line was rejected before anything ran — by clap, or by the `--json` refusal.     | clap's own default: the same code bash and argparse use for "the parser, not the program, rejected this". |
+| `3`  | drift         | A determinate "installed state differs from the manifest" answer. Only `diff` returns it.    | Nothing; app-specific.                                                                                    |
+| `4`  | indeterminate | A question goetia could not answer about an id: its state, or whether it is occupied at all. | The LSB init-script convention's "service status unknown".                                                |
+| `5`  | conflict      | An installed artifact was modified outside goetia and `--force` was not given.               | Nothing; app-specific — which is why `5` is the code that moved rather than usage errors.                 |
 
 `2` and `4` are the two that must not be renumbered for tidiness: both are
 tied to a convention outside goetia.
@@ -358,7 +359,13 @@ unit shipped in `/usr/lib` as it is goetia's own leftover.
 
 **`4` is returned by** `status` on an id it owns but cannot read, by `list`
 for an entry goetia owns but cannot decode, and by `diff` and `show` when
-the installed artifact cannot be read.
+the installed artifact cannot be read. `status` and `diff` also return it —
+as the `undetermined` kind — when a read that would have said whether
+anything is installed at that id failed at all, typically an
+`<id>.service.d` drop-in directory an unelevated caller cannot open. Goetia
+claims no ownership of such an id, and does not suggest uninstalling it.
+`install` keeps that same case at `1`: there the operation is the install,
+and it genuinely did not happen.
 
 The three classes are **disjoint**: a permission denial and a foreign
 service are never reported as absence, and absence is never reported as

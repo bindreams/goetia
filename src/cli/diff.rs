@@ -20,7 +20,7 @@ use clap::Args as ClapArgs;
 use super::report;
 use super::support::{load_and_warn, select_by_ids};
 use crate::decide::Outcome;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::manager::ServiceManager;
 
 #[derive(ClapArgs, Debug)]
@@ -118,6 +118,17 @@ pub fn run(
                 let line = format!("{}: would be refused: {reason}. {recovery}", spec.id);
                 let _ = writeln!(out, "{line}");
                 let _ = writeln!(err, "error: {line}");
+                codes.push(4);
+            }
+            // `4`, for the same reason `RefuseUnreadable` above is `4`:
+            // nothing was attempted and nothing refused — a read
+            // `preview_install` needed in order to answer failed, so the
+            // question stands unanswered. `1` would claim an operation ran
+            // and failed. `install` keeps this at `1` on purpose: there the
+            // operation is the install, and it genuinely did not happen —
+            // the same row the two verbs already disagree on.
+            Err(e @ Error::Undetermined { .. }) => {
+                let _ = writeln!(err, "error: {}: {e}", spec.id);
                 codes.push(4);
             }
             Err(e) => {

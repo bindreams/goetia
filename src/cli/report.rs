@@ -79,6 +79,12 @@ pub(crate) enum Kind {
     ///
     /// [`Installed::OursUnreadable`]: crate::manager::Installed::OursUnreadable
     Unreadable,
+    /// Goetia could not determine *whether* anything is installed at that
+    /// id: a read the answer depends on failed. Claims no ownership, which
+    /// is the whole difference from [`Kind::Unreadable`] — see
+    /// [`Error::Undetermined`], which is the only thing that produces it.
+    /// Only from `status(&id)`.
+    Undetermined,
     /// `support::parse_id` rejected a CLI argument: fix the argument.
     InvalidId,
     /// `get_manager()` or `mgr.list()` failed, so no answer was obtained for
@@ -102,6 +108,7 @@ impl Kind {
             Kind::NotInstalled => "not-installed",
             Kind::Foreign => "foreign",
             Kind::Unreadable => "unreadable",
+            Kind::Undetermined => "undetermined",
             Kind::InvalidId => "invalid-id",
             Kind::Unavailable => "unavailable",
             Kind::Unsupported => "unsupported",
@@ -119,9 +126,11 @@ impl Kind {
     /// does happen before anything runs.
     fn code(self) -> i32 {
         match self {
-            // Goetia owns the id and could not determine its state: the
-            // partial-answer case `4` exists for.
-            Kind::Unreadable => 4,
+            // The question was not answered: the partial-answer case `4`
+            // exists for. Whether goetia owns the id (`unreadable`) or
+            // could not even find that out (`undetermined`) changes the
+            // remedy, not the code.
+            Kind::Unreadable | Kind::Undetermined => 4,
             Kind::Unsupported => 2,
             // A determinate answer that the command failed, or
             // (`unavailable`) no answer at all — nothing partial about
@@ -181,17 +190,24 @@ pub(crate) fn daemon(id: &str, status: &Status) -> DaemonReport {
 }
 
 /// Classify a failure of `ServiceManager::status(&id)` — and of nothing
-/// else. `NotInstalled` and `Foreign` are two determinate answers; every
+/// else. `NotInstalled` and `Foreign` are two determinate answers, and
+/// `Undetermined` is the backend saying it established neither; every
 /// remaining error means goetia owns the id and could not report on it,
 /// which is precisely what `list` calls `OursUnreadable`. Routing the
 /// remainder to `unreadable` is what makes the two subcommands agree about
 /// one machine: a unit that decodes but whose live state cannot be queried
 /// reaches `list` as `Installed::OursUnreadable` and `status` as
 /// [`Error::CommandFailed`].
+///
+/// The three named arms are still the operation's own vocabulary, not a
+/// classification by error variant: `status(&id)` is the one operation that
+/// answers "what is at this id", so its three answers — absent, present and
+/// foreign, unestablished — are exactly what its failures can mean.
 pub(crate) fn status_error(id: &str, e: &Error) -> ErrorReport {
     let kind = match e {
         Error::NotInstalled { .. } => Kind::NotInstalled,
         Error::Foreign { .. } => Kind::Foreign,
+        Error::Undetermined { .. } => Kind::Undetermined,
         _ => Kind::Unreadable,
     };
     ErrorReport {
