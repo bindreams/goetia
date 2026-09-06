@@ -96,6 +96,10 @@ pub enum Installed {
     Ours {
         spec: DaemonSpec,
         state: State,
+        /// The same number [`ServiceManager::status`] would report for
+        /// this id at this moment — not a cached or independently derived
+        /// value. See each backend's `list` for how it obtains this.
+        pid: Option<u32>,
         enabled: bool,
     },
     /// Ours by marker, but the blob will not decode — a newer schema, or

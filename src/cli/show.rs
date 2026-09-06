@@ -2,14 +2,41 @@
 //!
 //! Read-only: never checks elevation. With `-f`, renders straight from a
 //! manifest and touches no manager at all. Without it, reads the spec back
-//! out of what is actually installed — both paths render through the same
-//! [`crate::diff::render_yaml`], so they agree by construction.
+//! out of what is actually installed. Four guarantees, declared here as a
+//! contract so a future change to either path is checked against them
+//! rather than merely inherited by accident:
+//!
+//! 1. **When both paths can see the daemon**, `show <id>` and
+//!    `show -f <file> <id>` render the same resolved spec identically,
+//!    byte for byte, because both go through [`crate::diff::render_yaml`]
+//!    and neither may grow a renderer of its own. Conditional, not
+//!    unconditional agreement: without `-f`, `show` reads
+//!    [`ServiceManager::list`], which silently skips a unit this privilege
+//!    level cannot enumerate (see
+//!    [`crate::manager::Installed::OursUnreadable`]'s doc comment). For a
+//!    daemon installed but unreadable unelevated, `show <id>` therefore
+//!    reports "not installed" and exits `1`, while `show -f <file> <id>`
+//!    still renders it straight from the manifest.
+//! 2. Neither path ever checks elevation.
+//! 3. `show -f` touches no manager; `show` without `-f` touches no
+//!    manifest.
+//! 4. Output is YAML, one `# <id>` header per daemon, blank-line
+//!    separated.
+//!
+//! A daemon this privilege level *can* see, but whose blob will not decode,
+//! is a different case from "not installed": `show` returns `4` for it —
+//! both per id, and, via `index.unreadable`'s escalation, for the no-ids
+//! form — the same "goetia owns this id and could not determine its
+//! state" code `list`/`status`/`diff` use. "Not installed" stays `1`, a
+//! determinate answer, and outranks `4` when a single call names both
+//! kinds of id (see `show_from_installed`).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use clap::Args as ClapArgs;
 
+use super::report;
 use super::support::{load_and_warn, partition_installed, print_unreadable_warnings, select_by_ids};
 use crate::error::Result;
 use crate::manager::ServiceManager;
@@ -86,28 +113,39 @@ fn show_from_installed(
         ids.to_vec()
     };
 
+    // Each id contributes at most one exit-code class, combined by
+    // `report::precedence` — the same rule and function `list`/`status`
+    // and `diff` use, reused rather than re-derived here (see `dispatch`'s
+    // doc comment for the vocabulary and the precedence order itself).
+    // Never `max()` on the codes themselves: `1` must outrank `4` even
+    // though it is the smaller number, so a later unreadable id cannot
+    // downgrade an already-seen absent one.
+    let mut codes: Vec<i32> = Vec::new();
+
     // With no ids given, an unreadable entry never enters `wanted` at all
     // (it has no spec to show), so the loop below can't be what flags it —
     // unlike `list`/`status`, which escalate the same way.
-    let mut exit = if ids.is_empty() && !index.unreadable.is_empty() {
-        1
-    } else {
-        0
-    };
+    if ids.is_empty() && !index.unreadable.is_empty() {
+        codes.push(4);
+    }
+
     let mut specs = Vec::new();
     for id in &wanted {
-        if let Some((spec, _, _)) = index.ours.get(id) {
-            specs.push(spec.clone());
+        if let Some(entry) = index.ours.get(id) {
+            specs.push(entry.spec.clone());
         } else if index.unreadable.contains_key(id) {
             let _ = writeln!(err, "error: daemon `{id}` is installed but unreadable");
-            exit = 1;
+            codes.push(4);
         } else {
             let _ = writeln!(err, "error: daemon `{id}` is not installed");
-            exit = 1;
+            codes.push(1);
         }
     }
     print_specs(specs.iter(), out);
-    exit
+    codes
+        .into_iter()
+        .max_by_key(|code| report::precedence(*code))
+        .unwrap_or(0)
 }
 
 fn print_specs<'a>(specs: impl Iterator<Item = &'a DaemonSpec>, out: &mut dyn Write) {

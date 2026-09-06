@@ -7,7 +7,7 @@
 //! systemd/launchd/SCM format) exists only so `decide` has something to
 //! compare, the same role each real backend's own generator plays.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use crate::blob::{self, Blob};
@@ -25,6 +25,20 @@ const FAKE_MARKER: &str = "FAKE-GOETIA-ARTIFACT";
 /// A fake "PID" reported by [`ServiceManager::status`] while an entry is
 /// running. Never a real process.
 const FAKE_PID: u32 = 1;
+
+/// The `on_disk` text `decide` is handed for an id carrying only a residual
+/// artifact — see [`Fake::seed_residual_artifact`]. Deliberately carries no
+/// [`FAKE_MARKER`]: residue is exactly what goetia cannot attribute, and
+/// `decide` must reach `RefuseForeign` from it.
+const RESIDUAL_TEXT: &str = "residual artifact, no primary artifact\n";
+
+/// The pid `Fake` reports for a given state. `status` and `list` must never
+/// disagree about the same entry, so they share this rule rather than each
+/// spelling it out — the three real backends get that guarantee from calling
+/// one query function, and nothing but this helper would give it to `Fake`.
+fn pid_for(state: State) -> Option<u32> {
+    if state == State::Running { Some(FAKE_PID) } else { None }
+}
 
 #[derive(Debug, Clone)]
 struct Entry {
@@ -50,7 +64,56 @@ struct Entry {
 /// not a fresh empty one.
 #[derive(Debug, Default, Clone)]
 pub struct Fake {
-    state: Arc<Mutex<BTreeMap<String, Entry>>>,
+    state: Arc<Mutex<Store>>,
+}
+
+/// [`Fake`]'s whole world: the artifacts, plus the ids that carry only a
+/// *residual* one. The two are separate maps because a residual artifact is
+/// defined by the primary one being gone — an id cannot be in `entries` and
+/// still be residue-only.
+#[derive(Debug, Default)]
+struct Store {
+    entries: BTreeMap<String, Entry>,
+    /// Ids with no artifact of their own but some goetia-attributable trace
+    /// the platform still applies — see [`Fake::seed_residual_artifact`].
+    residual: BTreeSet<String>,
+}
+
+impl Store {
+    /// The artifact at `id`, or the error its absence means *there* — never
+    /// a bare [`Error::NotInstalled`] read off the map lookup alone. Every
+    /// verb goes through this or [`Store::get_mut`], so none of them can
+    /// disagree with [`discover`] about one id.
+    fn get(&self, id: &Id) -> Result<&Entry> {
+        match self.entries.get(id.as_str()) {
+            Some(entry) => Ok(entry),
+            None => Err(self.absent_error(id)),
+        }
+    }
+
+    fn get_mut(&mut self, id: &Id) -> Result<&mut Entry> {
+        if !self.entries.contains_key(id.as_str()) {
+            return Err(self.absent_error(id));
+        }
+        Ok(self.entries.get_mut(id.as_str()).expect("present, checked just above"))
+    }
+
+    /// [`Error::NotInstalled`] only when nothing at all is at `id`. A
+    /// residual artifact makes it [`Error::Foreign`] instead: `cli::
+    /// uninstall` maps `NotInstalled` — and only that variant — to exit `0`
+    /// and "nothing to do", which must not be the answer for an id the
+    /// platform is still acting on.
+    fn absent_error(&self, id: &Id) -> Error {
+        if self.residual.contains(id.as_str()) {
+            return Error::Foreign {
+                id: id.as_str().to_string(),
+                recovery: decide::foreign_recovery(id.as_str()),
+            };
+        }
+        Error::NotInstalled {
+            id: id.as_str().to_string(),
+        }
+    }
 }
 
 impl Fake {
@@ -64,7 +127,7 @@ impl Fake {
     /// `manager::conformance`'s module doc comment.
     pub fn seed_foreign(&self, id: &str, text: impl Into<String>) {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
-        state.insert(
+        state.entries.insert(
             id.to_string(),
             Entry {
                 text: text.into(),
@@ -87,6 +150,48 @@ impl Fake {
         self.seed_foreign(id, format!("{FAKE_MARKER}\nSpec: not-valid-base64!!!\n"));
     }
 
+    /// Test-only seeding: place a Goetia-marked entry at `id` whose blob's
+    /// *envelope* decodes cleanly but whose spec content is out of range, so
+    /// [`blob::decode`] rejects it with [`Error::Invalid`] rather than
+    /// [`Error::Blob`].
+    ///
+    /// [`Fake::seed_unreadable`] cannot reach this: malformed base64 fails
+    /// at the envelope and yields `Error::Blob`. `Error::Invalid` is the
+    /// variant `spec::Id::try_from` *also* produces, so it is the one a CLI
+    /// classifying failures by error variant instead of by which operation
+    /// failed would misroute to `invalid-id`. Nothing else in the crate can
+    /// produce it from a manager.
+    ///
+    /// The out-of-range value is `restart_delay.nanos == 1_000_000_000`,
+    /// which `blob::duration_from_wire` checks precisely because
+    /// `Duration::new` would otherwise panic on it.
+    pub fn seed_invalid_content(&self, id: &str) {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+
+        let spec = DaemonSpec {
+            id: Id::try_from(id).expect("seed_invalid_content needs a valid id"),
+            name: id.to_string(),
+            command: vec!["daemon".to_string()],
+            cwd: None,
+            env: std::collections::BTreeMap::new(),
+            user: crate::spec::User::Root,
+            restart: crate::spec::Restart::OnFailure,
+            // Replaced with the out-of-range value below; only its presence
+            // matters here, so that the field is on the wire at all.
+            restart_delay: Some(std::time::Duration::from_secs(1)),
+            logs: None,
+            kind: crate::spec::Kind::Simple,
+        };
+        let encoded = blob::encode(&spec);
+        let bytes = BASE64.decode(&encoded).expect("blob::encode emits valid base64");
+        let mut envelope: serde_json::Value = serde_json::from_slice(&bytes).expect("blob::encode emits valid JSON");
+        envelope["spec"]["restart_delay"]["nanos"] = serde_json::json!(1_000_000_000u32);
+        let tampered = BASE64.encode(serde_json::to_vec(&envelope).expect("a Value re-serializes"));
+
+        self.seed_foreign(id, format!("{FAKE_MARKER}\nSpec: {tampered}\n"));
+    }
+
     /// Test-only seeding: install `spec` normally, then append `extra_line`
     /// to the stored artifact so it no longer matches what regenerating its
     /// own embedded spec would produce — simulating a hand-edit made
@@ -95,6 +200,7 @@ impl Fake {
         self.install(spec, false).expect("seed install must succeed");
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         let entry = state
+            .entries
             .get_mut(spec.id.as_str())
             .expect("just installed by the line above");
         entry.text.push_str(extra_line);
@@ -103,12 +209,56 @@ impl Fake {
         }
     }
 
+    /// Test-only seeding: place a Goetia-marked entry at `id` whose blob
+    /// decodes cleanly but carries `version` instead of the currently
+    /// running crate's own — simulating an artifact written by a different
+    /// Goetia release, so `decide` reports [`Outcome::Stale`] rather than
+    /// [`Outcome::Conflict`]. Tampers the same way [`Fake::seed_invalid_content`]
+    /// does: encode a real blob, then patch just the field under test,
+    /// since [`blob::encode`] always embeds [`crate::version()`] and has no
+    /// parameter to override it.
+    pub fn seed_stale(&self, spec: &DaemonSpec, version: &str) {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+
+        let encoded = blob::encode(spec);
+        let bytes = BASE64.decode(&encoded).expect("blob::encode emits valid base64");
+        let mut envelope: serde_json::Value = serde_json::from_slice(&bytes).expect("blob::encode emits valid JSON");
+        envelope["version"] = serde_json::json!(version);
+        let tampered = BASE64.encode(serde_json::to_vec(&envelope).expect("a Value re-serializes"));
+
+        self.seed_foreign(spec.id.as_str(), format!("{FAKE_MARKER}\nSpec: {tampered}\n"));
+    }
+
+    /// Test-only seeding: leave `id` with no artifact of its own, but with a
+    /// goetia-attributable trace the platform still applies — the class
+    /// systemd's fragmentless `<id>.service.d/*.conf` drop-in and its
+    /// leftover `multi-user.target.wants/<id>.service` enablement link both
+    /// belong to. Both outlive the unit fragment, and the second keeps the
+    /// id enrolled at boot.
+    ///
+    /// No other seeder reaches it, because it is defined by what is *not*
+    /// there: an id whose primary artifact is gone looks identical to an
+    /// empty one to any verb that only ever looks the id up. That matters
+    /// because `cli::uninstall` maps [`Error::NotInstalled`] — and only that
+    /// variant — to exit `0` and "nothing to do", so a manager answering
+    /// `NotInstalled` here certifies "confirmed gone" for an id the platform
+    /// is still acting on, while `install` on that same id refuses it as
+    /// foreign. `Fake` answers [`Error::Foreign`] instead, and `list` omits
+    /// the id entirely — residue is not a daemon to report on.
+    pub fn seed_residual_artifact(&self, id: &str) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.entries.remove(id);
+        state.residual.insert(id.to_string());
+    }
+
     /// Test-only: force `id`'s reported [`State`] directly, bypassing
     /// `start`/`stop` (which can only produce `Running`/`Stopped`). `id`
     /// must already be installed.
     pub fn seed_state(&self, id: &str, new_state: State) {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         let entry = state
+            .entries
             .get_mut(id)
             .unwrap_or_else(|| panic!("seed_state({id}, ..): not installed"));
         entry.state = new_state;
@@ -136,12 +286,6 @@ fn extract(text: &str) -> Result<Option<Blob>> {
     Ok(Some(blob))
 }
 
-fn not_installed(id: &Id) -> Error {
-    Error::NotInstalled {
-        id: id.as_str().to_string(),
-    }
-}
-
 /// Refuse an operation against a *foreign* (unmarked) entry — the same
 /// "goetia never touches a service it did not create" rule `install`
 /// enforces via `decide`. A marked-but-undecodable entry still passes:
@@ -166,9 +310,16 @@ fn require_ours(entry: &Entry, id: &Id) -> Result<()> {
 /// never disagree about what `decide` sees — `preview_install` exists
 /// precisely so `diff` can ask "what would `install` do" without either
 /// duplicating this logic or being able to drift from it.
-fn discover(state: &BTreeMap<String, Entry>, id: &str) -> (Ownership, Option<String>) {
-    let existing = state.get(id).cloned();
+fn discover(state: &Store, id: &str) -> (Ownership, Option<String>) {
+    let existing = state.entries.get(id).cloned();
     let found = match &existing {
+        // Never silently adopted as `Create`: whatever the platform still
+        // applies here is configuration goetia did not write and cannot
+        // show — the same refusal systemd's own `discover` gives a
+        // fragmentless `<id>.service.d` drop-in.
+        None if state.residual.contains(id) => {
+            return (Ownership::Foreign, Some(RESIDUAL_TEXT.to_string()));
+        }
         None => Ownership::Absent,
         Some(entry) => match extract(&entry.text) {
             Ok(Some(blob)) => Ownership::Ours {
@@ -190,9 +341,9 @@ impl ServiceManager for Fake {
         let desired = generate(spec);
         let (found, on_disk) = discover(&state, spec.id.as_str());
 
-        // The fake has no concept of a foreign overlay (systemd's drop-in
+        // The fake has no concept of an overlay (systemd's drop-in
         // directory, or an analogous future backend's equivalent), so it
-        // always passes `false` for `decide`'s `foreign_overlay` parameter.
+        // always passes `decide` the empty one.
         let outcome = decide::decide(
             &found,
             on_disk.as_deref(),
@@ -200,7 +351,7 @@ impl ServiceManager for Fake {
             spec,
             crate::version(),
             force,
-            false,
+            &decide::Overlay::default(),
         );
 
         // `Create`/`Update`/`Stale` are the outcomes `decide` recommends
@@ -212,10 +363,11 @@ impl ServiceManager for Fake {
             Outcome::Create | Outcome::Update { .. } | Outcome::Stale { .. }
         ) {
             let (enabled, run_state) = state
+                .entries
                 .get(spec.id.as_str())
                 .map(|e| (e.enabled, e.state))
                 .unwrap_or((false, State::Stopped));
-            state.insert(
+            state.entries.insert(
                 spec.id.as_str().to_string(),
                 Entry {
                     text: desired,
@@ -242,21 +394,21 @@ impl ServiceManager for Fake {
             spec,
             crate::version(),
             false,
-            false,
+            &decide::Overlay::default(),
         ))
     }
 
     fn uninstall(&self, id: &Id) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
-        let entry = state.get(id.as_str()).ok_or_else(|| not_installed(id))?;
+        let entry = state.get(id)?;
         require_ours(entry, id)?;
-        state.remove(id.as_str());
+        state.entries.remove(id.as_str());
         Ok(())
     }
 
     fn enable(&self, id: &Id) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
-        let entry = state.get_mut(id.as_str()).ok_or_else(|| not_installed(id))?;
+        let entry = state.get_mut(id)?;
         require_ours(entry, id)?;
         entry.enabled = true;
         Ok(())
@@ -264,7 +416,7 @@ impl ServiceManager for Fake {
 
     fn disable(&self, id: &Id) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
-        let entry = state.get_mut(id.as_str()).ok_or_else(|| not_installed(id))?;
+        let entry = state.get_mut(id)?;
         require_ours(entry, id)?;
         entry.enabled = false;
         Ok(())
@@ -272,7 +424,7 @@ impl ServiceManager for Fake {
 
     fn start(&self, id: &Id) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
-        let entry = state.get_mut(id.as_str()).ok_or_else(|| not_installed(id))?;
+        let entry = state.get_mut(id)?;
         require_ours(entry, id)?;
         entry.state = State::Running;
         Ok(())
@@ -280,7 +432,7 @@ impl ServiceManager for Fake {
 
     fn stop(&self, id: &Id) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
-        let entry = state.get_mut(id.as_str()).ok_or_else(|| not_installed(id))?;
+        let entry = state.get_mut(id)?;
         require_ours(entry, id)?;
         // Idempotent: stopping an already-stopped (or failed, or unknown)
         // service is `Ok(())` — see `ServiceManager::stop`'s doc comment for
@@ -291,7 +443,7 @@ impl ServiceManager for Fake {
 
     fn status(&self, id: &Id) -> Result<Status> {
         let state = self.state.lock().expect("Fake mutex poisoned");
-        let entry = state.get(id.as_str()).ok_or_else(|| not_installed(id))?;
+        let entry = state.get(id)?;
         // Unlike the mutating verbs, `status`'s only job is to report the
         // truth: an unreadable entry has no trustworthy `enabled`/`state` to
         // report, so this deliberately does not use `require_ours` (which
@@ -305,11 +457,7 @@ impl ServiceManager for Fake {
             Err(e) => Err(e),
             Ok(Some(_)) => Ok(Status {
                 state: entry.state,
-                pid: if entry.state == State::Running {
-                    Some(FAKE_PID)
-                } else {
-                    None
-                },
+                pid: pid_for(entry.state),
                 enabled: entry.enabled,
             }),
         }
@@ -318,7 +466,7 @@ impl ServiceManager for Fake {
     fn list(&self) -> Result<Vec<Installed>> {
         let state = self.state.lock().expect("Fake mutex poisoned");
         let mut out = Vec::new();
-        for (name, entry) in state.iter() {
+        for (name, entry) in state.entries.iter() {
             match extract(&entry.text) {
                 // A foreign entry is not Goetia-managed at all: `list`
                 // reports only what Goetia owns, per the trait doc comment.
@@ -326,6 +474,7 @@ impl ServiceManager for Fake {
                 Ok(Some(blob)) => out.push(Installed::Ours {
                     spec: blob.spec,
                     state: entry.state,
+                    pid: pid_for(entry.state),
                     enabled: entry.enabled,
                 }),
                 Err(e) => out.push(Installed::OursUnreadable {

@@ -30,6 +30,7 @@ pub fn run(
             is_elevated,
             verb: &|mgr, id| mgr.disable(id),
             verb_past_tense: "disabled",
+            absent_is_success: false,
         },
         out,
         err,

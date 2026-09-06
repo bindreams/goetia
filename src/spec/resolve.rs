@@ -10,13 +10,51 @@
 //! user-supplied string that ends up in a generated artifact — `name`,
 //! `command`, `cwd`, `logs`, every `env` key and value, and `user`'s
 //! `name`/`id` — is rejected here if it contains one.
+//!
+//! **Why `command[0]` is absolutized here and `command[1..]` is not.**
+//! `execve`, `posix_spawn` and `CreateProcess` all take an argument vector
+//! as opaque bytes — no launcher on any platform resolves a path *inside*
+//! an argument. A relative path in `command[1..]` is therefore resolved by
+//! the program being launched, against whatever working directory that
+//! program sees at the time; goetia has no say in it, and this is not a
+//! goetia policy to begin with.
+//!
+//! `command[0]` is different because, unlike an argument, it is a field
+//! with a defined role, and the three platforms disagree about that role
+//! for a relative value. systemd requires "either an absolute path to an
+//! executable or a simple file name without any slashes", resolving a bare
+//! name against a fixed compile-time search path and **never** against
+//! `WorkingDirectory=` — so a manifest's `bin/frpc` (a name with a slash
+//! that is not absolute) is rejected outright there. A Windows service has
+//! no working directory of its own at all, and resolves a relative binary
+//! against `System32`. launchd does neither: it resolves
+//! `ProgramArguments[0]` against the job's working directory, which
+//! `generate` emits only when `cwd` is set, so a relative binary there
+//! silently resolves against the default rather than being refused.
+//! Absolutizing `command[0]` against the manifest's directory before any
+//! backend sees it collapses those three disagreeing rules into one that
+//! always holds — and it is the only one of the three that does not depend
+//! on where the daemon happens to start.
+//!
+//! **The dragon is in the default.** Because only `command[0]` is
+//! absolutized, a manifest that passes a relative path as an *argument* —
+//! `command: ["bin/frpc", "-c", "host/frpc.toml"]` — and does not set
+//! `cwd` inherits whatever working directory the platform defaults to.
+//! systemd documents that default, for system instances, as the **root
+//! directory**: `-c host/frpc.toml` then resolves against `/`, and the
+//! daemon starts, cannot find its own config, and exits with no
+//! indication that a working directory was ever the problem. Set `cwd`, or
+//! write the argument absolute.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use super::interpolate;
 use super::raw::RawManifest;
-use super::user::{AccountId, User};
+use super::user::{AccountId, RawUser, User};
+use super::vars::Vars;
 use super::{DaemonSpec, Id, Kind, RawSpec, Restart, Warning};
 use crate::error::Error;
 
@@ -24,11 +62,20 @@ const MANIFEST_FILE_NAME: &str = "goetia.yaml";
 
 /// Turn a parsed manifest into resolved daemon specs.
 ///
-/// Relative `command[0]`, `cwd`, and `logs` paths are resolved against
-/// `base_dir` and written back absolute. Fails on the first invalid
-/// daemon; a valid manifest may still produce `Warning`s for properties
-/// that are accepted but cannot be faithfully honored on every platform.
-pub fn resolve(raw: RawManifest, base_dir: &Path) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
+/// Every `${VAR}` is substituted first, against the `.env` file beside
+/// `base_dir`. That step lives here rather than in [`load`] because this
+/// function is public and takes a public [`RawManifest`]: were it a
+/// separate step a caller had to remember, a manifest reaching this one
+/// directly would resolve with its references intact, and systemd applies
+/// its *own* `${...}` expansion to `ExecStart=` — turning an unsubstituted
+/// reference into an empty string inside a privileged unit.
+///
+/// Relative `command[0]`, `cwd`, and `logs` paths are then resolved
+/// against `base_dir` and written back absolute. Fails on the first
+/// invalid daemon; a valid manifest may still produce `Warning`s for
+/// properties that are accepted but cannot be faithfully honored on every
+/// platform.
+pub fn resolve(mut raw: RawManifest, base_dir: &Path) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
     // `DaemonSpec` documents every path as absolute and `blob::decode`
     // enforces it, so a relative `base_dir` would produce an artifact whose
     // own embedded blob cannot be decoded — breaking the drift invariant for
@@ -37,6 +84,16 @@ pub fn resolve(raw: RawManifest, base_dir: &Path) -> Result<(Vec<DaemonSpec>, Ve
     // caller to pass an absolute path.
     let base_dir = absolutize(base_dir)?;
     let base_dir = base_dir.as_path();
+
+    // A manifest with no `$` in it never reads `.env`, so an unrelated or
+    // root-only-readable file beside the manifest cannot break `install`,
+    // `show` or `diff`.
+    let vars = if interpolate::manifest_would_change(&raw) {
+        Vars::load(base_dir)?
+    } else {
+        Vars::empty()
+    };
+    interpolate::manifest(&mut raw, &vars)?;
 
     let mut specs = Vec::with_capacity(raw.daemons.len());
     let mut warnings = Vec::new();
@@ -67,7 +124,12 @@ pub fn load(path: &Path) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
         path: file_path.clone(),
         source,
     })?;
+    // The one and only parse: every diagnostic a manifest can produce —
+    // line, column, duplicate key, unknown field — comes from here, on the
+    // file exactly as written. `resolve` interpolates after it, on the typed
+    // result, so a `${VAR}` cannot move a position or change a message.
     let raw: RawManifest = serde_yaml_ng::from_str(&text)?;
+
     resolve(raw, &base_dir)
 }
 
@@ -81,6 +143,7 @@ fn resolve_one(id: Id, raw: RawSpec, base_dir: &Path, warnings: &mut Vec<Warning
         reject_unemittable(&id, "command", arg)?;
     }
     if let Some(first) = command.first_mut() {
+        reject_empty(&id, "command[0]", first)?;
         *first = resolve_path_string(&id, "command", first, base_dir)?;
     }
 
@@ -91,22 +154,40 @@ fn resolve_one(id: Id, raw: RawSpec, base_dir: &Path, warnings: &mut Vec<Warning
     for (key, value) in raw.env {
         reject_env_key_with_equals(&id, &key)?;
         reject_unemittable(&id, "env key", &key)?;
+        reject_empty(&id, "env key", &key)?;
         reject_unemittable(&id, &format!("env[{key}]"), &value)?;
         env.insert(key, value);
     }
 
-    let user = raw.user.unwrap_or(User::Root);
+    let user = resolve_user(raw.user);
     match &user {
         User::Root => {}
-        User::Name(n) => reject_unemittable(&id, "user.name", n)?,
-        User::Id(AccountId::Sid(s)) => reject_unemittable(&id, "user.id", s)?,
+        User::Name(n) => {
+            reject_unemittable(&id, "user.name", n)?;
+            reject_blank(&id, "user.name", n)?;
+        }
+        User::Id(AccountId::Sid(s)) => {
+            reject_unemittable(&id, "user.id", s)?;
+            reject_blank(&id, "user.id", s)?;
+        }
         User::Id(AccountId::Uid(_)) => {}
     }
 
-    let restart = raw.restart.unwrap_or(Restart::Never);
-    warn_on_sub_second_restart_delay(&id, raw.restart_delay, warnings);
+    let restart = match raw.restart {
+        Some(raw_restart) => parse_restart(&id, &raw_restart)?,
+        None => Restart::Never,
+    };
 
-    let kind = raw.kind.unwrap_or(Kind::Simple);
+    let restart_delay = match raw.restart_delay {
+        Some(raw_delay) => Some(parse_restart_delay(&id, &raw_delay)?),
+        None => None,
+    };
+    warn_on_sub_second_restart_delay(&id, restart_delay, warnings);
+
+    let kind = match raw.kind {
+        Some(raw_kind) => parse_kind(&id, &raw_kind)?,
+        None => Kind::Simple,
+    };
     warn_on_windows_divergences(&id, kind, cwd.is_some(), logs.is_some(), restart, warnings);
 
     // The absoluteness guarantee has exactly one runtime enforcement point
@@ -132,9 +213,79 @@ fn resolve_one(id: Id, raw: RawSpec, base_dir: &Path, warnings: &mut Vec<Warning
         env,
         user,
         restart,
-        restart_delay: raw.restart_delay,
+        restart_delay,
         logs,
         kind,
+    })
+}
+
+/// Apply the `root` reserved word to an authored [`RawUser`], and default
+/// an absent `user:` to [`User::Root`].
+///
+/// The rule is the bare string form's alone: `user: root` is the
+/// superuser, while `{name: root}` is the literal account called `root`,
+/// which is that form's whole purpose. Applying it here rather than in
+/// `RawUser`'s visitor is what lets `user: ${U}` with `U=root` mean
+/// exactly what a typed `user: root` means, without `{name: ${U}}` also
+/// collapsing to the superuser — a `User::Name` carries no record of
+/// which syntax produced it, so a post-substitution re-normalisation
+/// cannot tell the two apart. Same reasoning as [`parse_restart`], on the
+/// one field whose *deserialization* was value-dependent.
+pub(crate) fn resolve_user(raw: Option<RawUser>) -> User {
+    match raw {
+        None => User::Root,
+        Some(RawUser::Scalar(s)) if s == "root" => User::Root,
+        Some(RawUser::Scalar(s)) => User::Name(s),
+        Some(RawUser::Name(s)) => User::Name(s),
+        Some(RawUser::Id(id)) => User::Id(id),
+    }
+}
+
+/// Parse an authored `restart:` string into a [`Restart`]. `pub(crate)`
+/// rather than private: the backend-specific-override item's two-phase
+/// resolution needs to call this from whichever phase can honestly run it,
+/// once a field can also arrive from a per-backend override rather than
+/// only from here.
+///
+/// A `String` field parsed here, rather than a derived `Deserialize` on
+/// `Restart` itself, is what lets `restart: ${R}` be interpolated before
+/// this ever runs — a derived `Deserialize` would reject `${R}` as an
+/// unknown variant at YAML-parse time, before interpolation gets a chance.
+pub(crate) fn parse_restart(id: &Id, raw: &str) -> Result<Restart, Error> {
+    match raw {
+        "never" => Ok(Restart::Never),
+        "on-failure" => Ok(Restart::OnFailure),
+        "always" => Ok(Restart::Always),
+        other => Err(invalid(
+            id,
+            &format!("field `restart` is `{other}`; expected one of `never`, `on-failure`, `always`"),
+        )),
+    }
+}
+
+/// Parse an authored `type:` string into a [`Kind`]. `pub(crate)`: see
+/// [`parse_restart`].
+pub(crate) fn parse_kind(id: &Id, raw: &str) -> Result<Kind, Error> {
+    match raw {
+        "simple" => Ok(Kind::Simple),
+        "managed" => Ok(Kind::Managed),
+        other => Err(invalid(
+            id,
+            &format!("field `type` is `{other}`; expected one of `simple`, `managed`"),
+        )),
+    }
+}
+
+/// Parse an authored `restart-delay:` string into a [`Duration`], replacing
+/// `humantime_serde`'s serde-time parse (accepted syntax is unchanged:
+/// `humantime_serde` was itself a thin wrapper over
+/// `humantime::parse_duration`). `pub(crate)`: see [`parse_restart`].
+pub(crate) fn parse_restart_delay(id: &Id, raw: &str) -> Result<Duration, Error> {
+    humantime::parse_duration(raw).map_err(|source| {
+        invalid(
+            id,
+            &format!("field `restart-delay` is `{raw}`, which is not a duration (e.g. `30s`, `1m 30s`): {source}"),
+        )
     })
 }
 
@@ -142,6 +293,7 @@ fn resolve_optional_path(id: &Id, field: &str, raw: Option<String>, base_dir: &P
     match raw {
         Some(s) => {
             reject_unemittable(id, field, &s)?;
+            reject_empty(id, field, &s)?;
             Ok(Some(PathBuf::from(resolve_path_string(id, field, &s, base_dir)?)))
         }
         None => Ok(None),
@@ -311,6 +463,71 @@ pub(crate) fn reject_empty_command(id: &Id, command: &[String]) -> Result<(), Er
     Ok(())
 }
 
+/// Fields where the empty string is never meaningful and is silently
+/// dangerous. `pub(crate)`: also called by `blob::decode`.
+///
+/// Applied to `command[0]`, `cwd` when present, `logs` when present, and
+/// every `env` key — an empty one of these has no dangerous default, it
+/// simply fails to resolve or, for `command[0]`, would silently resolve to
+/// the manifest directory. `user.name` and `user.id` are *not* checked
+/// here: an account identifier needs the stronger [`reject_blank`], since
+/// a value that is empty only after trimming is exactly as dangerous as
+/// one that is empty outright. Deliberately **not** applied to `name` (an
+/// empty systemd `Description=` is harmless), to `env` values (`FOO=` is a
+/// normal assignment), or to `command[1..]` (an empty argv element is
+/// legitimate on POSIX and every generator quotes it).
+pub(crate) fn reject_empty(id: &Id, field: &str, value: &str) -> Result<(), Error> {
+    if value.is_empty() {
+        return Err(invalid(id, &format!("field `{field}` must not be empty")));
+    }
+    Ok(())
+}
+
+/// Like [`reject_empty`], but also rejects a value that is nothing but
+/// whitespace. Applied only to `user.name` and `user.id` (the `Sid` arm) —
+/// never to a path or an `env` key, and that asymmetry is deliberate, not
+/// an oversight to "complete":
+///
+/// - An account identifier has a dangerous default on every backend if the
+///   whitespace is trimmed away downstream: `User=` (a bare space or
+///   several) verifies and starts cleanly under `systemd-analyze verify`
+///   on every platform tested, exactly like `User=` with nothing after
+///   it — systemd does not reject either, so goetia is the only gate. A
+///   whitespace-only value is therefore either the same reset-to-root
+///   silently reached through a value [`reject_empty`] does not catch, or
+///   it names an account that cannot exist (a loud start failure) — both
+///   outcomes this task exists to close off.
+/// - A path has no such default: a file literally named `" "` is legal on
+///   Unix, so refusing it would be defending goetia's own implementation
+///   rather than serving the user, and an all-whitespace `cwd`/`logs`/
+///   `command[0]` simply fails to resolve like any other bad path — it
+///   does not fall back to anything.
+/// - An `env` key made of whitespace is a distinct, broader question
+///   (whether an environment-variable name may contain a space at all)
+///   that this task does not own; only its *emptiness* does, via
+///   [`reject_empty`].
+///
+/// `pub(crate)`: also called by `blob::decode`.
+///
+/// An already-installed artifact whose blob carries an empty or
+/// whitespace-only `user.name` now decodes as `Installed::OursUnreadable`
+/// rather than silently as root — the correct disclosure, and goetia has
+/// no release yet whose compatibility that would break.
+///
+/// A second, independent rejection of an empty `user.name` and empty
+/// `user.id` SID lives in the per-backend-override validation
+/// (`resolve_shape`): it found that `canonical_account("")` maps an empty
+/// authored name to `LocalSystem` on Windows by a different route, and
+/// stays scoped to the `User::Root` path it was written for. The two
+/// checks have different reachability and neither is redundant with the
+/// other — do not remove one as a "duplicate" of the other.
+pub(crate) fn reject_blank(id: &Id, field: &str, value: &str) -> Result<(), Error> {
+    if value.trim().is_empty() {
+        return Err(invalid(id, &format!("field `{field}` must not be empty")));
+    }
+    Ok(())
+}
+
 /// An env key containing `=` would make a `KEY=VALUE` env-file line or a
 /// systemd `Environment=` directive ambiguous about where the key ends.
 /// `pub(crate)`: see `reject_control_chars`.
@@ -347,7 +564,7 @@ fn invalid(id: &Id, message: &str) -> Error {
 /// integer seconds: `500ms` would truncate to `0`, which *disables*
 /// throttling and yields an unbounded respawn storm. Warn here so the
 /// rounding is not a silent surprise at install time.
-fn warn_on_sub_second_restart_delay(id: &Id, restart_delay: Option<std::time::Duration>, warnings: &mut Vec<Warning>) {
+fn warn_on_sub_second_restart_delay(id: &Id, restart_delay: Option<Duration>, warnings: &mut Vec<Warning>) {
     let Some(delay) = restart_delay else { return };
     if delay.subsec_nanos() == 0 {
         return;
@@ -382,7 +599,8 @@ fn warn_on_windows_divergences(
         warnings.push(Warning {
             id: id.clone(),
             message: "type: managed has no working-directory or stdout-capture field on Windows SCM; \
-                      `cwd`/`logs` are silently unavailable there"
+                      `cwd`/`logs` are silently unavailable there, and with no working directory, \
+                      every relative path in an argument resolves against System32"
                 .to_string(),
         });
     }

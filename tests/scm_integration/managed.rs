@@ -105,7 +105,7 @@ fn sc_config_binpath_change_is_detected_as_conflict() {
         .install(&spec, false)
         .expect("install over a hand-edited artifact must not error");
     match outcome {
-        Outcome::Conflict { artifact_diff } => assert!(!artifact_diff.is_empty(), "conflict must carry a diff"),
+        Outcome::Conflict { artifact_diff, .. } => assert!(!artifact_diff.is_empty(), "conflict must carry a diff"),
         other => panic!("expected Conflict, got {other:?}"),
     }
 

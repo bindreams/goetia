@@ -14,6 +14,20 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    /// A `.env` file beside the manifest could not be parsed. Distinct from
+    /// `Io`, which means the file could not be read at all.
+    #[error("{path}:{line}: {message}", path = path.display())]
+    EnvFile {
+        path: PathBuf,
+        line: usize,
+        message: String,
+    },
+
+    /// A `${VAR}` reference in the manifest could not be resolved, or a `$`
+    /// appeared where the interpolation grammar forbids one.
+    #[error("{path}: {message}")]
+    Interpolate { path: String, message: String },
+
     /// The document is not valid YAML, or fails a shape-level constraint
     /// checked during deserialization: a duplicate or case-insensitively
     /// colliding daemon id, or a malformed `user` field. `serde_yaml_ng`
@@ -22,8 +36,9 @@ pub enum Error {
     Yaml(#[from] serde_yaml_ng::Error),
 
     /// A `resolve()`-time validation failure: an invalid id, a control
-    /// character in a user-supplied string, an `=` in an env key, or an
-    /// empty command. Also produced by `blob::decode`, which re-runs
+    /// character in a user-supplied string, an `=` in an env key, an
+    /// empty command, an unrecognized `restart` or `type`, or a malformed
+    /// `restart-delay`. Also produced by `blob::decode`, which re-runs
     /// these same checks against a spec deserialized from an untrusted
     /// artifact.
     #[error("daemon `{daemon}`: {message}")]
@@ -39,6 +54,17 @@ pub enum Error {
     /// No daemon named `id` is managed by Goetia, per a [`ServiceManager`]
     /// mutating or querying verb (`uninstall`/`start`/`stop`/`enable`/
     /// `disable`/`status`/`show`) that needs one to already exist.
+    ///
+    /// The strong reading, and the only correct one: **nothing
+    /// goetia-attributable is at this id**, not merely that the backend's
+    /// primary artifact file is missing. `cli::uninstall` maps this variant
+    /// — and only this variant — to exit `0` and "nothing to do", so a
+    /// backend that reports it while the platform still applies a leftover
+    /// (systemd's fragmentless `<id>.service.d` drop-in, or its
+    /// `multi-user.target.wants` enablement link) certifies "confirmed
+    /// gone" for a service still loaded, still running and still enrolled at
+    /// boot — and contradicts its own `install`, which refuses that same
+    /// state as [`Foreign`](Error::Foreign).
     ///
     /// [`ServiceManager`]: crate::manager::ServiceManager
     #[error("daemon `{id}` is not installed")]
@@ -57,6 +83,31 @@ pub enum Error {
     /// [`ServiceManager`]: crate::manager::ServiceManager
     #[error("daemon `{id}` exists but is not managed by goetia: {recovery}")]
     Foreign { id: String, recovery: String },
+
+    /// A read that would have said whether anything is installed at `id`
+    /// failed, so goetia does not know. `reason` names the path and the
+    /// failure; `recovery` says what would make that read succeed.
+    ///
+    /// The distinguishing property is what this variant does **not** claim.
+    /// [`NotInstalled`](Error::NotInstalled) is proof that nothing
+    /// goetia-attributable is at the id; [`Foreign`](Error::Foreign) — and
+    /// `cli::report::Kind::Unreadable`, whose published meaning is "goetia
+    /// owns the id but cannot report on it" — is proof that something is.
+    /// A failed read is the absence of both proofs, so reporting either one
+    /// invents evidence: "installed but unreadable" over an
+    /// `/etc/systemd/system/<id>.service.d` an unelevated caller merely
+    /// could not open puts goetia's name, and `uninstall`'s recovery
+    /// advice, on what may be a stranger's override. Choose between the
+    /// three by what was established, never by which is closest to hand.
+    ///
+    /// Exit `4` (indeterminate), like `Unreadable`: the code is about
+    /// whether the question was answered, and this one was not.
+    #[error("cannot determine whether daemon `{id}` is installed: {reason}. {recovery}")]
+    Undetermined {
+        id: String,
+        reason: String,
+        recovery: String,
+    },
 
     /// A mutating CLI subcommand was invoked without the elevation
     /// (root/Administrator) it requires. Never returned for `list`,

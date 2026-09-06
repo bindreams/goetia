@@ -13,13 +13,11 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::time::Duration;
 
 use serde::de::{self, DeserializeSeed, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
-use super::user::User;
-use super::{Kind, Restart};
+use super::user::RawUser;
 
 /// The whole `goetia.yaml` document.
 #[derive(Debug, Clone, Default)]
@@ -38,13 +36,13 @@ pub struct RawSpec {
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-    pub user: Option<User>,
-    pub restart: Option<Restart>,
-    #[serde(rename = "restart-delay", default, with = "humantime_serde::option")]
-    pub restart_delay: Option<Duration>,
+    pub user: Option<RawUser>,
+    pub restart: Option<String>,
+    #[serde(rename = "restart-delay")]
+    pub restart_delay: Option<String>,
     pub logs: Option<String>,
     #[serde(rename = "type")]
-    pub kind: Option<Kind>,
+    pub kind: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for RawManifest {

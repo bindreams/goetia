@@ -7,25 +7,28 @@
 //! re-derive them. There is no separate `validate()` function anywhere in
 //! the crate; `resolve` is both parse and validate.
 
+mod interpolate;
 mod raw;
 mod resolve;
 mod user;
+mod vars;
 
 pub use raw::{RawManifest, RawSpec};
 pub use resolve::{load, resolve};
-pub use user::{AccountId, User};
+pub use user::{AccountId, RawUser, User};
 
 // Re-exported so `blob::decode` can re-run the same injection-gate checks
 // `resolve` uses, against a spec deserialized from an untrusted artifact,
 // instead of duplicating the rules.
-pub(crate) use resolve::{reject_empty_command, reject_env_key_with_equals, reject_relative_path, reject_unemittable};
+pub(crate) use resolve::{
+    reject_blank, reject_empty, reject_empty_command, reject_env_key_with_equals, reject_relative_path,
+    reject_unemittable,
+};
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
-
-use serde::Deserialize;
 
 use crate::error::Error;
 
@@ -113,8 +116,13 @@ pub struct DaemonSpec {
 
 /// Restart policy. Corresponds to systemd's `Restart=`, launchd's
 /// `KeepAlive`, and (for `Kind::Managed`) SCM recovery actions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+///
+/// Parsed from its authored kebab-case string by `resolve::parse_restart`,
+/// not derived `Deserialize`: `RawSpec::restart` is a `String` so that a
+/// `${VAR}` reference can be interpolated into it before this type is ever
+/// produced — a derived `Deserialize` would fail at YAML-parse time on an
+/// unresolved placeholder, before interpolation gets a chance to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Restart {
     Never,
     OnFailure,
@@ -125,8 +133,10 @@ pub enum Restart {
 /// or the command is itself expected to behave as a native service. See
 /// the design spec's §2 mapping table for what each `Kind` can and cannot
 /// express per platform.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+///
+/// Parsed from its authored kebab-case string by `resolve::parse_kind`; see
+/// [`Restart`]'s doc comment for why this is not a derived `Deserialize`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Simple,
     Managed,

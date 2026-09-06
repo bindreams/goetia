@@ -24,6 +24,7 @@ mod elevation;
 pub mod enable;
 pub mod install;
 pub mod list;
+mod report;
 pub mod restart;
 pub mod show;
 pub mod start;
@@ -50,20 +51,24 @@ use crate::manager::ServiceManager;
     about = "Install system daemons described in goetia.yaml as native services."
 )]
 pub struct Cli {
-    /// Reserved for machine-readable JSON output (design spec §4's global
-    /// flags). Accepted and parsed, but `dispatch` does not read it yet —
-    /// every subcommand still renders text regardless. Locked in
-    /// deliberately rather than half-wired to one subcommand's output:
-    /// `cli_accepts_json_verbose_quiet_as_currently_inert` pins this so a
-    /// silent behavior change (in either direction) fails a test.
+    /// Emit one machine-readable JSON document on stdout instead of text
+    /// (design spec §4's global flags). Implemented by `daemon list` and
+    /// `daemon status`; every other subcommand refuses it with an
+    /// `unsupported` error document and exit `2`, before running anything.
+    /// `global` so both `goetia --json daemon list` and
+    /// `goetia daemon list --json` work. See [`dispatch`] for the exact
+    /// invariant and its clap-level carve-outs.
     #[arg(long, global = true)]
     pub json: bool,
     /// Reserved for increased output verbosity (repeatable). Accepted and
-    /// parsed; not read by `dispatch` yet. See `json`'s doc comment.
+    /// parsed; not read by `dispatch` yet. Locked in deliberately rather
+    /// than half-wired to one subcommand's output:
+    /// `cli_accepts_verbose_and_quiet_as_currently_inert` pins this so a
+    /// silent behavior change (in either direction) fails a test.
     #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
     /// Reserved to suppress non-essential output. Accepted and parsed; not
-    /// read by `dispatch` yet. See `json`'s doc comment.
+    /// read by `dispatch` yet. See `verbose`'s doc comment.
     #[arg(short = 'q', long = "quiet", global = true)]
     pub quiet: bool,
     #[command(subcommand)]
@@ -108,9 +113,86 @@ pub enum DaemonCommand {
 // dispatch ============================================================================================================
 
 /// Dispatch a parsed [`Cli`] to its subcommand, returning the process exit
-/// code: `0` success, `1` error, `2` conflict (an installed artifact was
-/// modified outside Goetia and `--force` was not given) — see the design
-/// spec's §4.
+/// code. This doc comment is the one place the whole exit-code vocabulary
+/// is written down; nothing else in the crate should re-derive it.
+///
+/// - `0` success. `uninstall` alone also counts an already-absent artifact
+///   as success — `Error::NotInstalled` says nothing about the *process*,
+///   only the artifact, which is why every other id-verb keeps that same
+///   error at `1` instead; see `IdVerbCall::absent_is_success`'s doc
+///   comment for the full six-row table.
+/// - `1` error: an operation was attempted and failed, or was refused
+///   outright.
+/// - `2` usage: clap rejected the command line before `dispatch` ever ran,
+///   or (`--json` on a subcommand that does not implement it) `dispatch`
+///   refused to run anything. Anchored to clap's own default for a
+///   rejected command line — the same code bash and argparse both use for
+///   "the parser, not the program, rejected this" — so `main.rs`
+///   deliberately keeps calling `Cli::parse()` un-overridden and lets clap
+///   return `2` on its own; the absence of an override *is* the decision.
+/// - `3` drift: a determinate "installed state differs from the manifest"
+///   answer — `diff` returns it whenever at least one selected daemon would
+///   change and nothing was indeterminate, conflicting or errored
+///   (`cli::diff::run`, the only place this code is returned). Not a
+///   "drift is present" signal on its
+///   own: one `Create` plus one `Conflict` returns `5`, not `3`, since `5`
+///   outranks `3` in the precedence rule below.
+/// - `4` indeterminate: a question Goetia could not answer about an id.
+///   Two producers, and the difference between them is what was
+///   established: an id Goetia owns whose *state* it could not determine,
+///   or — [`Error::Undetermined`](crate::error::Error::Undetermined) — an
+///   id where the read that would have said whether anything is installed
+///   at all failed, leaving even ownership unestablished.
+///   `list`/`status` compute theirs via [`report::exit_code`]
+///   (see the design spec's §4), in *both* output modes, the second
+///   producer reaching them as `report::Kind::Undetermined`; `diff` returns
+///   it for `Outcome::RefuseUnreadable` and for `Error::Undetermined`
+///   (`cli::diff::run`) — the one row
+///   where `diff` deliberately disagrees with `install`, which exits `1`
+///   for both because it genuinely failed to install. `show` returns
+///   it too (`cli::show::run`), for the same "installed but unreadable"
+///   case, in both its per-id and no-ids forms — but only when it can see
+///   the id is installed at all: `show` without `-f` reads `list()`, which
+///   silently skips a unit this privilege level cannot enumerate, so that
+///   case still reports `1` instead (`show.rs`'s module doc comment has
+///   the caveat). Anchored to the LSB init-script convention's "service
+///   status unknown", the one other exit-code vocabulary this one
+///   deliberately agrees with.
+/// - `5` conflict: an installed artifact was modified outside Goetia and
+///   `--force` was not given. Returned by `cli::install::run` and by
+///   `cli::diff::run` for the identical `Outcome::Conflict` — the two places
+///   this code is returned. App-specific,
+///   anchored to nothing, which is why it is the one that moved: `2` is
+///   anchored to three conventions at once (clap, bash, argparse), so
+///   moving *usage* errors off it instead would have stayed internally
+///   consistent while giving up all three to preserve one number nothing
+///   outside Goetia agrees on.
+///
+/// `list` and `status` compute their code as the precedence-max over every
+/// error kind their `Report` collected: `1 > 4 > 5 > 3 > 0`. `diff`,
+/// `show` and `install` apply the same rule over the classes each selected
+/// daemon contributes, through the same [`report::precedence`] function — no
+/// verb re-derives the ordering, not even for the two codes `show` can
+/// produce.
+/// That is a rule about which outcome wins when more than one applies at
+/// once, not an ordering of the integers — `5` outranks `3` despite being
+/// the larger number. `2` never enters that ladder: the one thing that produces it
+/// there (`--json` on a subcommand that does not implement it) always
+/// happens alone, before any other kind could exist in the same report.
+///
+/// Whenever `--json` is given together with a subcommand **that clap
+/// accepted**, stdout is exactly one JSON document: `list` and `status`
+/// render one, and every other subcommand is refused with one below, before
+/// it runs.
+///
+/// Anything clap short-circuits on is a deliberate carve-out, because it
+/// happens before `dispatch` is ever called: `--help`/`--version` print
+/// their own text and exit `0`, and a usage error (`goetia --json daemon
+/// uninstall`, with `<IDS>` missing) prints clap's message to stderr, leaves
+/// stdout empty, and exits `2`. Rendering those as JSON would mean
+/// pre-scanning `std::env::args()` before parsing, or intercepting
+/// `try_parse` and re-rendering clap's own diagnostics — both worse than the
+/// carve-out. `tests/cli_binary.rs` pins all three cases.
 pub fn dispatch(
     cli: &Cli,
     get_manager: &dyn Fn() -> Result<Box<dyn ServiceManager>>,
@@ -119,6 +201,14 @@ pub fn dispatch(
     err: &mut dyn Write,
 ) -> i32 {
     let Command::Daemon(cmd) = &cli.command;
+
+    // Checked before the match, so a refused `--json` runs nothing at all —
+    // which is also why `unsupported` can never combine with another kind.
+    if cli.json && !matches!(cmd, DaemonCommand::List | DaemonCommand::Status(_)) {
+        let report = report::unsupported(subcommand_name(cmd));
+        return report::emit(&report, out, err);
+    }
+
     match cmd {
         DaemonCommand::Install(args) => install::run(args, get_manager, is_elevated, out, err),
         DaemonCommand::Uninstall(args) => uninstall::run(args, get_manager, is_elevated, out, err),
@@ -127,9 +217,28 @@ pub fn dispatch(
         DaemonCommand::Restart(args) => restart::run(args, get_manager, is_elevated, out, err),
         DaemonCommand::Enable(args) => enable::run(args, get_manager, is_elevated, out, err),
         DaemonCommand::Disable(args) => disable::run(args, get_manager, is_elevated, out, err),
-        DaemonCommand::Status(args) => status::run(args, get_manager, out, err),
-        DaemonCommand::List => list::run(get_manager, out, err),
+        DaemonCommand::Status(args) => status::run(args, cli.json, get_manager, out, err),
+        DaemonCommand::List => list::run(cli.json, get_manager, out, err),
         DaemonCommand::Show(args) => show::run(args, get_manager, out, err),
         DaemonCommand::Diff(args) => diff::run(args, get_manager, out, err),
+    }
+}
+
+/// How each subcommand is spelled on the command line, for the `--json`
+/// refusal's message. Derived from the enum rather than from clap so a new
+/// variant cannot silently be refused as something else.
+fn subcommand_name(cmd: &DaemonCommand) -> &'static str {
+    match cmd {
+        DaemonCommand::Install(_) => "install",
+        DaemonCommand::Uninstall(_) => "uninstall",
+        DaemonCommand::Start(_) => "start",
+        DaemonCommand::Stop(_) => "stop",
+        DaemonCommand::Restart(_) => "restart",
+        DaemonCommand::Enable(_) => "enable",
+        DaemonCommand::Disable(_) => "disable",
+        DaemonCommand::Status(_) => "status",
+        DaemonCommand::List => "list",
+        DaemonCommand::Show(_) => "show",
+        DaemonCommand::Diff(_) => "diff",
     }
 }

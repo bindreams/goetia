@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use clap::Args as ClapArgs;
 
+use super::report;
 use super::support::{load_and_warn, require_elevation, select_by_ids};
 use crate::backend::Identity;
 use crate::decide::Outcome;
@@ -79,58 +80,55 @@ pub fn run(
         }
     };
 
-    // Errors/refusals (exit 1) and conflicts (exit 2) are disjoint classes,
-    // not a severity ladder: 2 specifically promises "every failure here is
-    // force-resolvable", which stops being true the moment even one daemon
-    // in the same run hard-failed. So a plain `max()` across per-daemon
-    // codes would let a real error hide behind a conflict; track the two
-    // classes separately instead and let an error always win.
-    let mut any_error = false;
-    let mut any_conflict = false;
+    // Each daemon contributes at most one exit-code class per step, combined
+    // by `report::precedence` — the same rule and function `list`/`status`,
+    // `diff` and `show` use, reused rather than re-derived here (see
+    // `dispatch`'s doc comment for the vocabulary and the ordering itself).
+    // Never `max()` on the codes themselves: `1` (a refusal or a hard
+    // failure) must outrank `5` even though it is the smaller number, or a
+    // real error hides behind a conflict — and `5` specifically promises
+    // "every failure here is force-resolvable", which stops being true the
+    // moment one daemon in the same run hard-failed.
+    let mut codes: Vec<i32> = Vec::new();
     for spec in &selected {
         match mgr.install(spec, args.force) {
             Ok(outcome) => {
-                let class = report_outcome(&spec.id, &outcome, out, err);
-                match class {
-                    OutcomeClass::Ok => {}
+                match report_outcome(&spec.id, &outcome, out, err) {
+                    OutcomeClass::Ok => codes.push(0),
                     OutcomeClass::Conflict => {
-                        any_conflict = true;
                         // Nothing was (re)written: neither flag below has
                         // anything to act on.
+                        codes.push(5);
                         continue;
                     }
                     OutcomeClass::Refused => {
-                        any_error = true;
+                        codes.push(1);
                         continue;
                     }
                 }
                 if args.enable {
                     if let Err(e) = mgr.enable(&spec.id) {
                         let _ = writeln!(err, "error: {}: enable: {e}", spec.id);
-                        any_error = true;
+                        codes.push(1);
                     }
                 }
                 if args.start {
                     if let Err(e) = mgr.start(&spec.id) {
                         let _ = writeln!(err, "error: {}: start: {e}", spec.id);
-                        any_error = true;
+                        codes.push(1);
                     }
                 }
             }
             Err(e) => {
                 let _ = writeln!(err, "error: {}: {e}", spec.id);
-                any_error = true;
+                codes.push(1);
             }
         }
     }
-
-    if any_error {
-        1
-    } else if any_conflict {
-        2
-    } else {
-        0
-    }
+    codes
+        .into_iter()
+        .max_by_key(|code| report::precedence(*code))
+        .unwrap_or(0)
 }
 
 /// Which of the three exit-code buckets an [`Outcome`] belongs to.
@@ -145,7 +143,7 @@ enum OutcomeClass {
 /// additionally gets a concise one-line diagnostic on `err`, consistent
 /// with every other failure path in the CLI (`run_id_verb`, `list`,
 /// `status`, `diff` all put failures on stderr) — a script that only
-/// captures stderr for errors must still learn that this exit-1/2 run had
+/// captures stderr for errors must still learn that this exit-1/5 run had
 /// one.
 fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn Write) -> OutcomeClass {
     match outcome {
@@ -166,10 +164,23 @@ fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn
             let _ = writeln!(out, "{id}: regenerated (was built by goetia {from_version})");
             OutcomeClass::Ok
         }
-        Outcome::Conflict { artifact_diff } => {
-            let _ = writeln!(out, "{id}: conflict (re-run with --force to overwrite)");
+        Outcome::Conflict {
+            artifact_diff,
+            unclearable_recovery,
+        } => {
+            // `--force` is published as the way out of a conflict, so it is
+            // offered only where it is one. When part of the cause is
+            // outside the directory this backend writes, forcing rewrites
+            // the artifact, leaves that part in place, and the next run
+            // reports the identical conflict — `decide` says which case this
+            // is (see `Outcome::Conflict`), and nothing here re-derives it.
+            let line = match unclearable_recovery {
+                None => format!("{id}: conflict (re-run with --force to overwrite)"),
+                Some(recovery) => format!("{id}: conflict. {recovery}"),
+            };
+            let _ = writeln!(out, "{line}");
             let _ = write!(out, "{artifact_diff}");
-            let _ = writeln!(err, "error: {id}: conflict (re-run with --force to overwrite)");
+            let _ = writeln!(err, "error: {line}");
             OutcomeClass::Conflict
         }
         Outcome::RefuseForeign { recovery } => {

@@ -591,7 +591,7 @@ impl ServiceManager for LaunchdManager {
             // launchd has no drop-in or override mechanism that alters a job
             // without touching its plist. Enablement lives in the plist's
             // *directory*, which is deliberately outside the compared surface.
-            false,
+            &decide::Overlay::default(),
         );
 
         match &outcome {
@@ -692,7 +692,7 @@ impl ServiceManager for LaunchdManager {
             crate::version(),
             false,
             // launchd has no drop-in mechanism; see the `install` call site.
-            false,
+            &decide::Overlay::default(),
         ))
     }
 
@@ -873,10 +873,11 @@ impl ServiceManager for LaunchdManager {
             match generate::extract(&text) {
                 Ok(None) => {} // foreign: not Goetia-managed, omitted per the trait doc comment
                 Ok(Some(blob)) => {
-                    let (state, _pid) = query_live_state(&id);
+                    let (state, pid) = query_live_state(&id);
                     out.push(Installed::Ours {
                         spec: blob.spec,
                         state,
+                        pid,
                         enabled: *enabled,
                     });
                 }

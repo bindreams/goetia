@@ -45,17 +45,89 @@ fn write_manifest(dir: &Path, yaml: &str) -> PathBuf {
     path
 }
 
-/// Parse `args` and dispatch against `fake`, capturing stdout/stderr as
-/// strings. `is_elevated` is passed straight through, so a test can hand in
-/// a closure that panics if called — proof a read-only subcommand never
-/// checks elevation.
-fn dispatch(args: &[&str], fake: &Fake, is_elevated: &dyn Fn() -> bool) -> (i32, String, String) {
+// One `(Fake, manifest)` builder per `decide::Outcome` class `diff` can see,
+// shared by every test that only needs that one outcome for a single
+// daemon — the tests that mix several outcomes in one run build their own
+// manifest instead, since what they exercise is precisely the combination.
+
+/// `id` absent from the store: `diff` reports `Outcome::Create`.
+fn absent_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
+    let fake = Fake::new();
+    let manifest = write_manifest(dir, &format!("daemons:\n  {id}:\n    command: [daemon]\n"));
+    (fake, manifest)
+}
+
+/// `id` installed with `restart: never`, against a manifest asking for
+/// `restart: on-failure`: `diff` reports `Outcome::Update`, a clean spec
+/// change with no hand-edit.
+fn update_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
+    let fake = Fake::new();
+    let mut old = mk(id);
+    old.restart = Restart::Never;
+    fake.install(&old, false).unwrap();
+    let manifest = write_manifest(
+        dir,
+        &format!("daemons:\n  {id}:\n    command: [daemon]\n    restart: on-failure\n"),
+    );
+    (fake, manifest)
+}
+
+/// `id` installed then hand-edited outside Goetia: `diff` reports
+/// `Outcome::Conflict`.
+fn hand_edited_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
+    let fake = Fake::new();
+    fake.install_then_hand_edit(&mk(id), "# hand-added directive\n");
+    let manifest = write_manifest(dir, &format!("daemons:\n  {id}:\n    command: [daemon]\n"));
+    (fake, manifest)
+}
+
+/// An unmarked entry at `id`: `diff` reports `Outcome::RefuseForeign`.
+fn foreign_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
+    let fake = Fake::new();
+    fake.seed_foreign(id, "not a goetia artifact at all\n");
+    let manifest = write_manifest(dir, &format!("daemons:\n  {id}:\n    command: [daemon]\n"));
+    (fake, manifest)
+}
+
+/// An undecodable Goetia-marked entry at `id`: `diff` reports
+/// `Outcome::RefuseUnreadable`.
+fn unreadable_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
+    let fake = Fake::new();
+    fake.seed_unreadable(id);
+    let manifest = write_manifest(dir, &format!("daemons:\n  {id}:\n    command: [daemon]\n"));
+    (fake, manifest)
+}
+
+/// `id` installed with exactly `resolve()`'s own output for the manifest
+/// below: `diff` reports `Outcome::UpToDate`. Installing a literal `mk(id)`
+/// instead would never match: `resolve()` makes `command[0]` absolute
+/// against the manifest's directory.
+fn up_to_date_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
+    let fake = Fake::new();
+    let manifest = write_manifest(
+        dir,
+        &format!("daemons:\n  {id}:\n    command: [{id}]\n    restart: on-failure\n"),
+    );
+    let (specs, _warnings) = goetia::spec::load(&manifest).expect("load fixture manifest");
+    fake.install(&specs[0], false).expect("seed install");
+    (fake, manifest)
+}
+
+/// Parse `args` and dispatch against an arbitrary `get_manager` closure,
+/// capturing stdout/stderr as strings. The lowest of the three layers here,
+/// for the paths where obtaining a manager is itself what fails, and for
+/// proving a subcommand never asks for one. `is_elevated` is passed
+/// straight through, so a test can hand in a closure that panics if called
+/// — proof a read-only subcommand never checks elevation.
+fn dispatch_get_manager(
+    args: &[&str],
+    get_manager: &dyn Fn() -> goetia::Result<Box<dyn ServiceManager>>,
+    is_elevated: &dyn Fn() -> bool,
+) -> (i32, String, String) {
     let cli = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("parse {args:?}: {e}"));
-    let fake = fake.clone();
-    let get_manager = move || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(fake.clone())) };
     let mut out = Vec::new();
     let mut err = Vec::new();
-    let code = cli::dispatch(&cli, &get_manager, is_elevated, &mut out, &mut err);
+    let code = cli::dispatch(&cli, get_manager, is_elevated, &mut out, &mut err);
     (
         code,
         String::from_utf8(out).expect("stdout is UTF-8"),
@@ -63,30 +135,83 @@ fn dispatch(args: &[&str], fake: &Fake, is_elevated: &dyn Fn() -> bool) -> (i32,
     )
 }
 
-/// [`dispatch`] with elevation granted — the common case for mutating
+/// [`dispatch_get_manager`] against any cloneable manager — [`FlakyManager`]
+/// as well as [`Fake`].
+fn dispatch_with<M: ServiceManager + Clone + 'static>(
+    args: &[&str],
+    mgr: &M,
+    is_elevated: &dyn Fn() -> bool,
+) -> (i32, String, String) {
+    let mgr = mgr.clone();
+    let get_manager = move || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(mgr.clone())) };
+    dispatch_get_manager(args, &get_manager, is_elevated)
+}
+
+/// The `is_elevated` a read-only subcommand must never call.
+fn never_elevated() -> bool {
+    panic!("a read-only subcommand must never check elevation")
+}
+
+/// [`dispatch_with`] with elevation granted — the common case for mutating
 /// subcommands under test.
 fn dispatch_elevated(args: &[&str], fake: &Fake) -> (i32, String, String) {
-    dispatch(args, fake, &|| true)
+    dispatch_with(args, fake, &|| true)
 }
 
-/// [`dispatch`] proving elevation is never checked — for the read-only
+/// [`dispatch_with`] proving elevation is never checked — for the read-only
 /// subcommands.
 fn dispatch_read_only(args: &[&str], fake: &Fake) -> (i32, String, String) {
-    dispatch(args, fake, &|| {
-        panic!("a read-only subcommand must never check elevation")
-    })
+    dispatch_with(args, fake, &never_elevated)
 }
 
-/// Wraps a `Fake`, forcing `enable`/`start` to fail for one specific id.
-/// Exists to exercise `install`'s post-`enable`/`start` error-reporting
-/// branches: a plain `Fake`'s own errors are always `NotInstalled`, which
-/// cannot happen immediately after a successful install, so those branches
-/// are otherwise unreachable from any test.
-#[derive(Clone)]
+/// Wraps a `Fake` with failures no `Fake` state can produce on its own.
+///
+/// - `fail_enable_for`/`fail_start_for` exercise `install`'s
+///   post-`enable`/`start` error-reporting branches: a plain `Fake`'s own
+///   errors are always `NotInstalled`, which cannot happen immediately after
+///   a successful install, so those branches are otherwise unreachable.
+/// - `fail_list` is the "the manager answered, but the listing did not"
+///   path.
+/// - `unqueryable` models a unit that decodes but whose *live state* cannot
+///   be read: `list` reports it as `OursUnreadable` while `status` fails
+///   with `CommandFailed`, exactly as a real backend does. That asymmetry is
+///   the one the JSON envelope's `unreadable` kind exists to close.
+/// - `fail_preview_for` is the "the manager could not even answer whether
+///   this daemon would change" path — `Fake` itself can never fail
+///   `preview_install`, so this is the only way to put a genuine `Err(_)`
+///   in the same `diff` run as a `Conflict`/drift outcome.
+/// - `hidden_from_list` models the opposite asymmetry from `unqueryable`:
+///   an id `list()` cannot enumerate at all (as if this privilege level
+///   lacked the read access needed to see it in a directory listing —
+///   real backends can hit exactly this, e.g. an ACL denying an
+///   unprivileged registry read), while `status(&id)` — a direct query by
+///   name — still finds it. `Fake` itself has no such gap: its `list` and
+///   `status` always agree, so this is the only way to open one.
+#[derive(Clone, Default)]
 struct FlakyManager {
     inner: Fake,
     fail_enable_for: Option<String>,
     fail_start_for: Option<String>,
+    fail_list: bool,
+    unqueryable: Option<String>,
+    fail_preview_for: Option<String>,
+    hidden_from_list: Option<String>,
+    /// Makes `install`/`preview_install` return the `Conflict` flavour whose
+    /// cause lies outside the directory the backend writes — systemd's
+    /// `<id>.service.d` under `/usr/lib` or `.control`. `Fake` has no
+    /// overlay of its own (see its `decide` call site), so this is the only
+    /// way to reach the branch where `--force` is not the remedy.
+    unclearable_conflict: Option<String>,
+}
+
+/// The failure [`FlakyManager`] injects for `fail_list`/`unqueryable`: the
+/// shape a real backend produces when the tool it shells out to cannot
+/// answer.
+fn unqueryable_failure() -> goetia::Error {
+    goetia::Error::CommandFailed {
+        command: "query-live-state".to_string(),
+        stderr: "live state unavailable (injected test failure)".to_string(),
+    }
 }
 
 fn injected_failure(id: &Id) -> goetia::Error {
@@ -95,11 +220,28 @@ fn injected_failure(id: &Id) -> goetia::Error {
     }
 }
 
+/// The `Conflict` [`FlakyManager::unclearable_conflict`] injects.
+fn unclearable_conflict(recovery: &str) -> goetia::decide::Outcome {
+    goetia::decide::Outcome::Conflict {
+        artifact_diff: "- desired\n+ on disk\n".to_string(),
+        unclearable_recovery: Some(recovery.to_string()),
+    }
+}
+
 impl ServiceManager for FlakyManager {
     fn install(&self, spec: &DaemonSpec, force: bool) -> goetia::Result<goetia::decide::Outcome> {
+        if let Some(recovery) = &self.unclearable_conflict {
+            return Ok(unclearable_conflict(recovery));
+        }
         self.inner.install(spec, force)
     }
     fn preview_install(&self, spec: &DaemonSpec) -> goetia::Result<goetia::decide::Outcome> {
+        if self.fail_preview_for.as_deref() == Some(spec.id.as_str()) {
+            return Err(injected_failure(&spec.id));
+        }
+        if let Some(recovery) = &self.unclearable_conflict {
+            return Ok(unclearable_conflict(recovery));
+        }
         self.inner.preview_install(spec)
     }
     fn uninstall(&self, id: &Id) -> goetia::Result<()> {
@@ -124,10 +266,31 @@ impl ServiceManager for FlakyManager {
         self.inner.stop(id)
     }
     fn status(&self, id: &Id) -> goetia::Result<Status> {
+        if self.unqueryable.as_deref() == Some(id.as_str()) {
+            return Err(unqueryable_failure());
+        }
         self.inner.status(id)
     }
     fn list(&self) -> goetia::Result<Vec<Installed>> {
-        self.inner.list()
+        if self.fail_list {
+            return Err(unqueryable_failure());
+        }
+        let mut installed = self.inner.list()?;
+        for entry in &mut installed {
+            if matches!(entry, Installed::Ours { spec, .. } if Some(spec.id.as_str()) == self.unqueryable.as_deref()) {
+                *entry = Installed::OursUnreadable {
+                    name: self.unqueryable.clone().expect("matched against Some just above"),
+                    reason: unqueryable_failure().to_string(),
+                };
+            }
+        }
+        if let Some(hidden) = &self.hidden_from_list {
+            installed.retain(|entry| match entry {
+                Installed::Ours { spec, .. } => spec.id.as_str() != hidden,
+                Installed::OursUnreadable { name, .. } => name != hidden,
+            });
+        }
+        Ok(installed)
     }
 }
 
@@ -206,8 +369,73 @@ fn install_unknown_named_id_installs_nothing() {
     assert!(installed_ids(&fake).is_empty(), "a bad selection must install nothing");
 }
 
+/// The remedy `--force` is published as has to be one that works. When part of what makes the
+/// artifact differ is outside the directory the backend writes, forcing rewrites the artifact,
+/// leaves that part in place, and the next run reports the identical conflict — so the message must
+/// name what to remove instead of sending the operator back around that loop. Exit `5` either way:
+/// it is a conflict in both, and the distinction is the remedy, not the code.
 #[skuld::test]
-fn conflict_exits_two() {
+fn install_offers_force_only_for_a_conflict_force_can_resolve() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let args = ["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()];
+
+    let fake = Fake::new();
+    fake.install_then_hand_edit(&mk("frpc"), "# hand-added directive\n");
+    let (code, out, err) = dispatch_with(&args, &fake, &|| true);
+    assert_eq!(code, 5, "stdout:\n{out}");
+    assert!(out.contains("conflict (re-run with --force to overwrite)"), "{out}");
+    assert!(err.contains("conflict (re-run with --force to overwrite)"), "{err}");
+
+    let recovery = "remove /usr/lib/systemd/system/frpc.service.d by hand and re-run";
+    let mgr = FlakyManager {
+        unclearable_conflict: Some(recovery.to_string()),
+        ..Default::default()
+    };
+    let (code, out, err) = dispatch_with(&args, &mgr, &|| true);
+    assert_eq!(
+        code, 5,
+        "still a conflict, and still force-resolvable-looking to a script:\n{out}"
+    );
+    assert!(out.contains(recovery), "{out}");
+    assert!(err.contains(recovery), "{err}");
+    assert!(
+        !out.contains("re-run with --force to overwrite"),
+        "`--force` rewrites the artifact and leaves the cause, so offering it wedges the operator:\n{out}"
+    );
+}
+
+/// `diff` renders the same two flavours in the subjunctive, and must not offer what `install` will
+/// not honour.
+#[skuld::test]
+fn diff_offers_force_only_for_a_conflict_force_can_resolve() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let args = ["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()];
+
+    let fake = Fake::new();
+    fake.install_then_hand_edit(&mk("frpc"), "# hand-added directive\n");
+    let (code, out, _err) = dispatch_read_only(&args, &fake);
+    assert_eq!(code, 5, "stdout:\n{out}");
+    assert!(out.contains("`install --force` would overwrite it"), "{out}");
+
+    let recovery = "remove /etc/systemd/system.control/frpc.service.d by hand and re-run";
+    let mgr = FlakyManager {
+        unclearable_conflict: Some(recovery.to_string()),
+        ..Default::default()
+    };
+    let (code, out, err) = dispatch_with(&args, &mgr, &never_elevated);
+    assert_eq!(code, 5, "stdout:\n{out}");
+    assert!(out.contains(recovery), "{out}");
+    assert!(err.contains(recovery), "{err}");
+    assert!(
+        !out.contains("would overwrite it"),
+        "diff must not promise an overwrite that resolves nothing:\n{out}"
+    );
+}
+
+#[skuld::test]
+fn conflict_exits_five() {
     let fake = Fake::new();
     fake.install_then_hand_edit(&mk("frpc"), "# hand-added directive\n");
 
@@ -219,7 +447,7 @@ fn conflict_exits_two() {
         &fake,
     );
 
-    assert_eq!(code, 2, "stdout:\n{out}");
+    assert_eq!(code, 5, "stdout:\n{out}");
     assert!(out.contains("conflict"), "{out}");
 }
 
@@ -326,6 +554,130 @@ fn show_from_file_and_show_from_installed_agree() {
     assert!(out_file.contains("frpc"), "{out_file}");
 }
 
+/// The per-id counterpart to `show_from_file_and_show_from_installed_agree`
+/// above: with two daemons installed from one manifest, naming each one
+/// individually still renders byte-identical output through either path,
+/// and neither path checks elevation. This is a commitment test over
+/// already-correct behaviour — both paths render through the same
+/// `crate::diff::render_yaml` today — so it is expected to pass on first
+/// write; its job is to make that agreement a declared contract rather than
+/// an accident, so a renderer added to only one path in the future fails
+/// it.
+#[skuld::test]
+fn show_per_id_from_file_and_from_installed_agree() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(
+        dir.path(),
+        "daemons:\n  frpc:\n    command: [frpc, -c, frpc.toml]\n    restart: on-failure\n  websocat:\n    command: [websocat]\n",
+    );
+    let fake = Fake::new();
+    let (install_code, _, install_err) = dispatch_elevated(
+        &["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()],
+        &fake,
+    );
+    assert_eq!(install_code, 0, "{install_err}");
+
+    for id in ["frpc", "websocat"] {
+        let (code_file, out_file, _) = dispatch_read_only(
+            &["goetia", "daemon", "show", "-f", manifest.to_str().unwrap(), id],
+            &fake,
+        );
+        let (code_installed, out_installed, _) = dispatch_read_only(&["goetia", "daemon", "show", id], &fake);
+
+        assert_eq!(code_file, 0);
+        assert_eq!(code_installed, 0);
+        assert_eq!(
+            out_file, out_installed,
+            "show -f {id} and show {id} (from installed) must render identically"
+        );
+    }
+}
+
+/// `show` without `-f` only ever consults `list()` — never `status(&id)`
+/// directly, unlike `status` itself — so a daemon this privilege level
+/// cannot enumerate is invisible to it even though a direct query would
+/// find it. Pins `show.rs`'s documented caveat on guarantee 1 as a tested
+/// fact rather than an unchecked claim.
+#[skuld::test]
+fn show_reports_not_installed_for_a_daemon_list_cannot_see() {
+    let inner = Fake::new();
+    inner.install(&mk("ghost"), false).unwrap();
+    let mgr = FlakyManager {
+        inner,
+        hidden_from_list: Some("ghost".to_string()),
+        ..Default::default()
+    };
+
+    // `status()` can see it directly...
+    assert!(mgr.status(&Id::try_from("ghost").unwrap()).is_ok());
+
+    // ...but `show`, which only calls `list()`, cannot.
+    let (code, out, err) = dispatch_with(&["goetia", "daemon", "show", "ghost"], &mgr, &never_elevated);
+
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(out, "");
+    assert_eq!(err, "error: daemon `ghost` is not installed\n");
+}
+
+/// Both of `show`'s "installed but unreadable" paths — naming the id
+/// directly, and asking for everything with none named — must return `4`
+/// (indeterminate: goetia owns this id and could not determine its state),
+/// distinguished from the `1` a genuinely absent id returns rather than
+/// merely being non-zero.
+#[skuld::test]
+fn show_exits_four_for_an_installed_but_unreadable_daemon() {
+    let fake = Fake::new();
+    fake.seed_unreadable("corrupt");
+    fake.install(&mk("readable"), false).unwrap();
+
+    // Per-id form. `err` also carries the unconditional unreadable-entry
+    // warning `print_unreadable_warnings` prints for every form (see
+    // `list_reports_an_unreadable_entry_and_exits_nonzero`), so this checks
+    // for the per-id error line rather than asserting `err` in full.
+    let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "show", "corrupt"], &fake);
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(out, "", "nothing to render for an id with no decodable spec: {out}");
+    assert!(
+        err.contains("error: daemon `corrupt` is installed but unreadable"),
+        "{err}"
+    );
+
+    // No-ids form: still escalates from `index.unreadable`, and still
+    // renders the one daemon it *can* read.
+    let (code_all, out_all, err_all) = dispatch_read_only(&["goetia", "daemon", "show"], &fake);
+    assert_eq!(code_all, 4, "stdout:\n{out_all}\nstderr:\n{err_all}");
+    assert!(out_all.contains("# readable"), "{out_all}");
+    assert!(
+        !out_all.contains("corrupt"),
+        "an unreadable entry has no spec to show: {out_all}"
+    );
+    assert!(err_all.contains("corrupt"), "{err_all}");
+    assert!(err_all.contains("unreadable"), "{err_all}");
+
+    // Distinguished from a genuinely absent id, which stays at `1` — a
+    // determinate answer, not an indeterminate one.
+    let (code_absent, _, err_absent) = dispatch_read_only(&["goetia", "daemon", "show", "nonexistent"], &fake);
+    assert_eq!(code_absent, 1, "{err_absent}");
+    assert_ne!(code, code_absent, "unreadable (4) must not collapse into absent (1)");
+}
+
+/// Splitting the "unreadable" and "not installed" branches onto different
+/// codes (`4` vs `1`) means a `show` call naming both must pick one
+/// consistently — not whichever happened to run last. `1` outranks `4`
+/// here, matching `cli::dispatch`'s published precedence rule
+/// (`1 > 4 > 5 > 3 > 0`), regardless of which id was named first.
+#[skuld::test]
+fn show_absent_id_outranks_unreadable_id_regardless_of_argument_order() {
+    let fake = Fake::new();
+    fake.seed_unreadable("corrupt");
+
+    let (code_a, _, _) = dispatch_read_only(&["goetia", "daemon", "show", "corrupt", "nonexistent"], &fake);
+    let (code_b, _, _) = dispatch_read_only(&["goetia", "daemon", "show", "nonexistent", "corrupt"], &fake);
+
+    assert_eq!(code_a, 1);
+    assert_eq!(code_b, 1);
+}
+
 // Per-verb wiring: uninstall/start/stop/restart/enable/disable/status/diff/list =======================================
 
 #[skuld::test]
@@ -339,14 +691,178 @@ fn uninstall_reaches_the_manager() {
     assert!(installed_ids(&fake).is_empty());
 }
 
+// Absence and `uninstall`'s exemption =================================================================================
+//
+// `Error::NotInstalled` says the artifact is absent; it says nothing about
+// the process. Only `uninstall` treats that as success — see
+// `IdVerbCall::absent_is_success`'s doc comment for the full table this
+// section pins one row of at a time.
+
 #[skuld::test]
-fn uninstall_unknown_id_exits_nonzero() {
+fn uninstall_exits_zero_when_the_daemon_was_already_absent() {
     let fake = Fake::new();
 
-    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "uninstall", "nonexistent"], &fake);
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "uninstall", "ghost"], &fake);
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(out, "ghost: not installed (nothing to do)\n");
+    assert_eq!(err, "");
+}
+
+#[skuld::test]
+fn stop_exits_one_when_the_daemon_is_absent() {
+    let fake = Fake::new();
+
+    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "stop", "ghost"], &fake);
 
     assert_eq!(code, 1);
-    assert!(err.contains("nonexistent"), "{err}");
+    assert!(err.contains("ghost"), "{err}");
+}
+
+#[skuld::test]
+fn disable_exits_one_when_the_daemon_is_absent() {
+    let fake = Fake::new();
+
+    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "disable", "ghost"], &fake);
+
+    assert_eq!(code, 1);
+    assert!(err.contains("ghost"), "{err}");
+}
+
+#[skuld::test]
+fn start_exits_one_when_the_daemon_is_absent() {
+    let fake = Fake::new();
+
+    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "start", "ghost"], &fake);
+
+    assert_eq!(code, 1);
+    assert!(err.contains("ghost"), "{err}");
+}
+
+#[skuld::test]
+fn enable_exits_one_when_the_daemon_is_absent() {
+    let fake = Fake::new();
+
+    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "enable", "ghost"], &fake);
+
+    assert_eq!(code, 1);
+    assert!(err.contains("ghost"), "{err}");
+}
+
+#[skuld::test]
+fn restart_exits_one_when_the_daemon_is_absent() {
+    let fake = Fake::new();
+
+    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "restart", "ghost"], &fake);
+
+    assert_eq!(code, 1);
+    assert!(err.contains("ghost"), "{err}");
+}
+
+/// A manager whose `start` panics if called: proof that `restart`'s
+/// closure short-circuits on `mgr.stop(id)?` and never falls through to
+/// `start` for an id `stop` could not act on. If the absence tolerance
+/// were ever implemented inside `stop` itself rather than on
+/// `IdVerbCall`, `restart` on an absent id would reach this `start` and
+/// panic.
+#[derive(Clone, Default)]
+struct PanicsOnStart(Fake);
+
+impl ServiceManager for PanicsOnStart {
+    fn install(&self, spec: &DaemonSpec, force: bool) -> goetia::Result<goetia::decide::Outcome> {
+        self.0.install(spec, force)
+    }
+    fn preview_install(&self, spec: &DaemonSpec) -> goetia::Result<goetia::decide::Outcome> {
+        self.0.preview_install(spec)
+    }
+    fn uninstall(&self, id: &Id) -> goetia::Result<()> {
+        self.0.uninstall(id)
+    }
+    fn enable(&self, id: &Id) -> goetia::Result<()> {
+        self.0.enable(id)
+    }
+    fn disable(&self, id: &Id) -> goetia::Result<()> {
+        self.0.disable(id)
+    }
+    fn start(&self, _id: &Id) -> goetia::Result<()> {
+        panic!("restart on an absent id must never reach start")
+    }
+    fn stop(&self, id: &Id) -> goetia::Result<()> {
+        self.0.stop(id)
+    }
+    fn status(&self, id: &Id) -> goetia::Result<Status> {
+        self.0.status(id)
+    }
+    fn list(&self) -> goetia::Result<Vec<Installed>> {
+        self.0.list()
+    }
+}
+
+#[skuld::test]
+fn restart_on_an_absent_id_never_reaches_start() {
+    let mgr = PanicsOnStart::default();
+
+    let (code, _out, err) = dispatch_with(&["goetia", "daemon", "restart", "ghost"], &mgr, &|| true);
+
+    assert_eq!(code, 1, "{err}");
+}
+
+#[skuld::test]
+fn an_absent_id_is_reported_on_stdout_not_stderr() {
+    let fake = Fake::new();
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "uninstall", "ghost"], &fake);
+
+    assert_eq!(code, 0);
+    assert!(out.contains("ghost"), "{out}");
+    assert!(out.contains("not installed"), "{out}");
+    assert_eq!(err, "", "nothing goes to stderr for an absent id: {err}");
+    assert!(!out.contains("uninstalled"), "{out}");
+    assert!(!err.contains("uninstalled"), "{err}");
+}
+
+#[skuld::test]
+fn uninstall_exits_one_for_a_foreign_id() {
+    let fake = Fake::new();
+    fake.seed_foreign("stranger", "not a goetia artifact at all\n");
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "uninstall", "stranger"], &fake);
+
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.contains("stranger"), "{err}");
+    assert!(!out.contains("not installed (nothing to do)"), "{out}");
+}
+
+#[skuld::test]
+fn uninstall_exits_one_when_a_real_failure_accompanies_an_absent_id() {
+    let fake = Fake::new();
+    fake.seed_foreign("stranger", "not a goetia artifact at all\n");
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "uninstall", "ghost", "stranger"], &fake);
+
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(
+        out, "ghost: not installed (nothing to do)\n",
+        "the absent id must still be reported as satisfied"
+    );
+    assert!(
+        err.contains("stranger"),
+        "the foreign id's failure must still be reported: {err}"
+    );
+}
+
+#[skuld::test]
+fn uninstall_still_exits_zero_when_every_id_was_removed() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "uninstall", "frpc", "ghost"], &fake);
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(out.contains("frpc: uninstalled"), "{out}");
+    assert!(out.contains("ghost: not installed (nothing to do)"), "{out}");
+    assert_eq!(err, "");
+    assert!(installed_ids(&fake).is_empty());
 }
 
 #[skuld::test]
@@ -430,22 +946,37 @@ fn status_reaches_the_manager() {
     assert!(out.contains("running"), "{out}");
 }
 
+/// `status` with no ids must render each entry through the exact same line
+/// shape as `status <id>` — `pid` included — not a second, `pid`-less shape
+/// of its own.
+#[skuld::test]
+fn status_with_no_ids_prints_the_pid_like_the_per_id_form() {
+    let fake = Fake::new();
+    let spec = mk("frpc");
+    fake.install(&spec, false).unwrap();
+    fake.start(&spec.id).unwrap();
+
+    let (_, per_id, _) = dispatch_read_only(&["goetia", "daemon", "status", "frpc"], &fake);
+    let (_, no_ids, _) = dispatch_read_only(&["goetia", "daemon", "status"], &fake);
+
+    assert!(per_id.contains("pid="), "{per_id}");
+    assert_eq!(
+        per_id.trim(),
+        no_ids.trim(),
+        "status with no ids must print the same line as status <id>"
+    );
+}
+
 #[skuld::test]
 fn diff_reaches_the_manager() {
-    let fake = Fake::new();
-    let mut old = mk("frpc");
-    old.restart = Restart::Never;
-    fake.install(&old, false).unwrap();
-
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(
-        dir.path(),
-        "daemons:\n  frpc:\n    command: [daemon]\n    restart: on-failure\n",
-    );
+    let (fake, manifest) = update_fixture(dir.path(), "frpc");
 
     let (code, out, _err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
 
-    assert_eq!(code, 0);
+    // 3, not 0: an `Update` outcome is drift, matching `install`'s own
+    // exit-code vocabulary (see `dispatch`'s doc comment).
+    assert_eq!(code, 3);
     assert!(out.contains("restart"), "{out}");
 }
 
@@ -484,7 +1015,7 @@ fn cli_refuses_a_foreign_id_for_every_verb() {
     assert_eq!(status_code, 1, "{status_err}");
 }
 
-/// Exit code 2 must mean "every failure here is force-resolvable". A batch
+/// Exit code 5 must mean "every failure here is force-resolvable". A batch
 /// mixing a conflict (force-resolvable) with a foreign refusal (not) must
 /// not let the refusal hide behind the conflict's higher numeric code.
 #[skuld::test]
@@ -556,7 +1087,10 @@ fn list_reports_an_unreadable_entry_and_exits_nonzero() {
 
     let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "list"], &fake);
 
-    assert_eq!(code, 1);
+    // `4`, not `1`: an id goetia owns but cannot report on is the
+    // partial-answer case, and the code is the same with or without
+    // `--json` — see `cli::report::exit_code`.
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
     assert!(err.contains("corrupt"), "{err}");
     assert!(err.contains("unreadable"), "{err}");
     assert!(out.contains("readable"), "{out}");
@@ -570,7 +1104,7 @@ fn status_all_reports_an_unreadable_entry_and_exits_nonzero() {
 
     let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "status"], &fake);
 
-    assert_eq!(code, 1);
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
     assert!(err.contains("corrupt"), "{err}");
     assert!(out.contains("readable"), "{out}");
 }
@@ -587,37 +1121,25 @@ fn show_unknown_id_is_not_installed() {
 }
 
 /// An unreadable id must be reported as unreadable, never as "not installed
-/// (would be created)".
+/// (would be created)". `4`, not `1`: `RefuseUnreadable` is indeterminate —
+/// `diff` was asked a question and could not determine the answer — unlike
+/// `install`, which exits `1` here because it genuinely failed to install.
 #[skuld::test]
-fn diff_reports_an_unreadable_entry_instead_of_claiming_it_would_be_created() {
-    let fake = Fake::new();
-    fake.seed_unreadable("corrupt");
-
+fn diff_exits_four_when_the_installed_artifact_cannot_be_read() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  corrupt:\n    command: [daemon]\n");
+    let (fake, manifest) = unreadable_fixture(dir.path(), "corrupt");
 
     let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
 
-    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
     assert!(err.contains("unreadable"), "{err}");
     assert!(!out.contains("would be created"), "stdout:\n{out}");
 }
 
 #[skuld::test]
 fn diff_reports_up_to_date_when_the_spec_is_unchanged() {
-    let fake = Fake::new();
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(
-        dir.path(),
-        "daemons:\n  frpc:\n    command: [frpc]\n    restart: on-failure\n",
-    );
-
-    // Install the manifest's own resolved spec directly, rather than a
-    // hand-built one: `resolve()` makes `command[0]` absolute against the
-    // manifest's directory, which a literal `mk("frpc")` fixture would not
-    // match, making the diff always non-empty for the wrong reason.
-    let (specs, _warnings) = goetia::spec::load(&manifest).expect("load fixture manifest");
-    fake.install(&specs[0], false).expect("seed install");
+    let (fake, manifest) = up_to_date_fixture(dir.path(), "frpc");
 
     let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
 
@@ -627,14 +1149,13 @@ fn diff_reports_up_to_date_when_the_spec_is_unchanged() {
 
 #[skuld::test]
 fn diff_reports_not_installed_for_an_id_absent_from_the_manager() {
-    let fake = Fake::new();
-
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [frpc]\n");
+    let (fake, manifest) = absent_fixture(dir.path(), "frpc");
 
     let (code, out, _err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
 
-    assert_eq!(code, 0);
+    // 3, not 0: a `Create` outcome is drift.
+    assert_eq!(code, 3);
     assert!(out.contains("not installed (would be created)"), "{out}");
 }
 
@@ -645,55 +1166,42 @@ fn install_reports_enable_and_start_failures_and_exits_nonzero() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [frpc]\n");
     let mgr = FlakyManager {
-        inner: Fake::new(),
         fail_enable_for: Some("frpc".to_string()),
         fail_start_for: Some("frpc".to_string()),
+        ..Default::default()
     };
 
-    let cli = Cli::try_parse_from([
-        "goetia",
-        "daemon",
-        "install",
-        "-f",
-        manifest.to_str().unwrap(),
-        "--enable",
-        "--start",
-    ])
-    .expect("parse");
-    let get_manager = {
-        let mgr = mgr.clone();
-        move || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(mgr.clone())) }
-    };
-    let is_elevated = || true;
-    let mut out = Vec::new();
-    let mut err = Vec::new();
-
-    let code = cli::dispatch(&cli, &get_manager, &is_elevated, &mut out, &mut err);
-
-    assert_eq!(
-        code,
-        1,
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&out),
-        String::from_utf8_lossy(&err)
+    let (code, out, err) = dispatch_with(
+        &[
+            "goetia",
+            "daemon",
+            "install",
+            "-f",
+            manifest.to_str().unwrap(),
+            "--enable",
+            "--start",
+        ],
+        &mgr,
+        &|| true,
     );
-    let err = String::from_utf8_lossy(&err);
+
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
     assert!(err.contains("enable"), "{err}");
     assert!(err.contains("start"), "{err}");
 }
 
-/// `--json`/`-v`/`-q` are reserved (see `Cli`'s doc comments) rather than
-/// wired to per-subcommand output yet. Pinned here so that reservation is
-/// itself a tested, deliberate state: a change to `list`'s output with
-/// `--json` present would need to update this test, rather than silently
-/// landing unnoticed in either direction.
+/// `-v`/`-q` are still reserved (see `Cli`'s doc comments) rather than wired
+/// to per-subcommand output — unlike `--json`, which the tests below cover.
+/// Pinned here so that reservation is itself a tested, deliberate state: a
+/// change to `list`'s output with either flag present would need to update
+/// this test, rather than silently landing unnoticed in either direction.
 #[skuld::test]
-fn cli_accepts_json_verbose_quiet_as_currently_inert() {
+fn cli_accepts_verbose_and_quiet_as_currently_inert() {
     let fake = Fake::new();
     fake.install(&mk("frpc"), false).unwrap();
 
     let (plain_code, plain_out, _) = dispatch_read_only(&["goetia", "daemon", "list"], &fake);
-    let (flagged_code, flagged_out, _) = dispatch_read_only(&["goetia", "--json", "-v", "-q", "daemon", "list"], &fake);
+    let (flagged_code, flagged_out, _) = dispatch_read_only(&["goetia", "-v", "-q", "daemon", "list"], &fake);
 
     assert_eq!(plain_code, flagged_code);
     assert_eq!(plain_out, flagged_out, "these flags must not be silently half-wired");
@@ -710,43 +1218,51 @@ fn status_single_id_errors_on_an_unreadable_entry_instead_of_fabricating_state()
 
     let (code, _out, err) = dispatch_read_only(&["goetia", "daemon", "status", "corrupt"], &fake);
 
-    assert_eq!(code, 1, "{err}");
+    assert_eq!(code, 4, "{err}");
     assert!(err.contains("corrupt"), "{err}");
 }
 
 /// `diff` must predict what `install` would actually do: a hand-edited
-/// artifact is a conflict, never "up to date".
+/// artifact is a conflict, never "up to date". `5`, matching `install`'s
+/// code for the identical outcome (Task 8 moved conflict off `2`).
 #[skuld::test]
-fn diff_reports_would_conflict_for_a_hand_edited_artifact() {
-    let fake = Fake::new();
-    fake.install_then_hand_edit(&mk("frpc"), "# hand-added directive\n");
-
+fn diff_exits_five_for_a_hand_edited_artifact() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let (fake, manifest) = hand_edited_fixture(dir.path(), "frpc");
 
     let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
 
-    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(code, 5, "stdout:\n{out}\nstderr:\n{err}");
     assert!(out.contains("would conflict"), "{out}");
     assert!(!out.contains("up to date"), "{out}");
 }
 
 /// `diff` must distinguish "absent" from "occupied by a stranger's
 /// service": both used to render identically as "would be created", which
-/// `install` would then immediately contradict by refusing.
+/// `install` would then immediately contradict by refusing. A second,
+/// drifting daemon in the same run must not lower the code to 3: `1`
+/// outranks `3` in the precedence rule.
 #[skuld::test]
-fn diff_reports_would_be_refused_for_a_foreign_id() {
+fn diff_exits_one_for_a_foreign_id() {
     let fake = Fake::new();
     fake.seed_foreign("frpc", "not a goetia artifact at all\n");
 
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [frpc]\n");
+    let manifest = write_manifest(
+        dir.path(),
+        "daemons:\n  frpc:\n    command: [frpc]\n  drifting:\n    command: [daemon]\n",
+    );
 
     let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
 
     assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
-    assert!(out.contains("would be refused"), "{out}");
-    assert!(!out.contains("would be created"), "{out}");
+    let frpc_line = out.lines().find(|l| l.starts_with("frpc:")).expect("frpc's own line");
+    assert!(frpc_line.contains("would be refused"), "{frpc_line}");
+    assert!(!frpc_line.contains("would be created"), "{frpc_line}");
+    assert!(
+        out.contains("drifting: not installed (would be created)"),
+        "the drifting daemon must still be reported:\n{out}"
+    );
 }
 
 /// `state_str`'s `Failed`/`Unknown` arms are otherwise unreachable from any
@@ -805,4 +1321,909 @@ fn enable_aggregates_across_multiple_ids() {
         fake.status(&Id::try_from("frpc").unwrap()).unwrap().enabled,
         "frpc must still have been enabled despite the other id failing"
     );
+}
+
+// diff exit-code precedence ===========================================================================================
+//
+// `diff`'s exit code is not one severity ladder over a single number: `0`
+// success, `1` error, `3` drift, `4` indeterminate, `5` conflict, combined
+// by the `1 > 4 > 5 > 3 > 0` precedence rule (see `dispatch`'s doc comment
+// and `cli::report::precedence`) — never `max()`. The tests below pin each
+// class in isolation and every precedence-relevant pairing.
+
+#[skuld::test]
+fn diff_exits_three_when_a_daemon_would_be_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fake, manifest) = absent_fixture(dir.path(), "frpc");
+
+    let (code, out, _err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
+
+    assert_eq!(code, 3, "{out}");
+}
+
+#[skuld::test]
+fn diff_exits_three_when_a_daemon_would_be_updated() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fake, manifest) = update_fixture(dir.path(), "frpc");
+
+    let (code, out, _err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
+
+    assert_eq!(code, 3, "{out}");
+}
+
+/// Two up-to-date daemons in the same run: neither alone contributes a
+/// code, so the combined result must still be 0 — not "0 unless the list
+/// is empty" or some other accidental default.
+#[skuld::test]
+fn diff_exits_zero_only_when_everything_is_up_to_date() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(
+        dir.path(),
+        "daemons:\n  frpc:\n    command: [frpc]\n    restart: on-failure\n  websocat:\n    command: [websocat]\n    restart: on-failure\n",
+    );
+    let (specs, _warnings) = goetia::spec::load(&manifest).expect("load fixture manifest");
+    let fake = Fake::new();
+    for spec in &specs {
+        fake.install(spec, false).expect("seed install");
+    }
+
+    let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    // `UpToDate` pushes nothing to the codes vec, so the assertion above
+    // holds just as well when zero daemons were diffed at all. Pin that
+    // both were actually reached.
+    assert!(out.contains("frpc"), "frpc should appear in stdout:\n{out}");
+    assert!(out.contains("websocat"), "websocat should appear in stdout:\n{out}");
+}
+
+/// An unreadable artifact alongside a hand-edited one returns 4: the
+/// precedence rule's most surprising step, since `5` is the larger number.
+/// A script branching on "conflict" (5) would otherwise run `--force` on an
+/// incomplete picture, having missed that some other daemon in the same
+/// run could not even be classified.
+#[skuld::test]
+fn diff_indeterminate_beats_conflict() {
+    let fake = Fake::new();
+    fake.seed_unreadable("corrupt");
+    fake.install_then_hand_edit(&mk("conflicted"), "# hand-added directive\n");
+
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(
+        dir.path(),
+        "daemons:\n  corrupt:\n    command: [daemon]\n  conflicted:\n    command: [daemon]\n",
+    );
+
+    let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
+
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
+    // Both outcomes must actually have been diffed — the point of this test
+    // is the *mixing*, not just the arithmetic 4 beating 5 in the abstract.
+    assert!(
+        out.contains("corrupt: would be refused"),
+        "unreadable outcome missing:\n{out}"
+    );
+    assert!(
+        out.contains("conflicted: would conflict"),
+        "conflict outcome missing:\n{out}"
+    );
+}
+
+/// A `Create` plus a `Conflict` returns 5, not 3: `3` is not a "drift is
+/// present" signal, since a conflicting daemon can ride along with it and
+/// outrank it.
+#[skuld::test]
+fn diff_conflict_beats_drift() {
+    let fake = Fake::new();
+    fake.install_then_hand_edit(&mk("conflicted"), "# hand-added directive\n");
+
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(
+        dir.path(),
+        "daemons:\n  created:\n    command: [daemon]\n  conflicted:\n    command: [daemon]\n",
+    );
+
+    let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
+
+    assert_eq!(code, 5, "stdout:\n{out}\nstderr:\n{err}");
+    // Both outcomes must actually have been diffed — the point of this test
+    // is the *mixing*, not just the arithmetic 5 beating 3 in the abstract.
+    assert!(
+        out.contains("created: not installed (would be created)"),
+        "drift outcome missing:\n{out}"
+    );
+    assert!(
+        out.contains("conflicted: would conflict"),
+        "conflict outcome missing:\n{out}"
+    );
+}
+
+/// All three non-zero classes in one run — drift, conflict, and a hard
+/// `Err(_)` from the manager — must return 1: an error always wins.
+#[skuld::test]
+fn diff_error_beats_conflict_beats_drift() {
+    let inner = Fake::new();
+    inner.install_then_hand_edit(&mk("conflicted"), "# hand-added directive\n");
+    let mgr = FlakyManager {
+        inner,
+        fail_preview_for: Some("errored".to_string()),
+        ..Default::default()
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(
+        dir.path(),
+        "daemons:\n  created:\n    command: [daemon]\n  conflicted:\n    command: [daemon]\n  errored:\n    command: [daemon]\n",
+    );
+
+    let (code, out, err) = dispatch_with(
+        &["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()],
+        &mgr,
+        &never_elevated,
+    );
+
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    // All three outcomes must actually have been diffed, not just the
+    // `errored` one that alone would already force 1.
+    assert!(
+        out.contains("created: not installed (would be created)"),
+        "drift outcome missing:\n{out}"
+    );
+    assert!(
+        out.contains("conflicted: would conflict"),
+        "conflict outcome missing:\n{out}"
+    );
+    assert!(err.contains("errored"), "error outcome missing:\n{err}");
+}
+
+/// The only biconditional the contract makes: over one fixture per
+/// `decide::Outcome` variant, `diff` exits 0 exactly when the daemon is
+/// already up to date. The reverse direction of `3` is deliberately *not*
+/// under test here — `diff_conflict_beats_drift` above is what pins that
+/// `3` alone does not mean "drift is present".
+#[skuld::test]
+fn diff_exits_zero_iff_install_would_report_up_to_date() {
+    // For each fixture: run `diff`, then ask `install` itself (through the
+    // `ServiceManager` trait, directly against the same `Fake`) whether it
+    // would report `UpToDate` too, and compare. `preview_install` never
+    // mutates the store, so calling `install` afterwards on the same `Fake`
+    // is safe — nothing before this point depended on it staying
+    // unchanged. No hand-written `bool` per row: if `diff` and `install`
+    // ever disagreed about one fixture, this observes the disagreement
+    // instead of asserting past it.
+    let check = |fake: &Fake, manifest: &Path, label: &str| -> i32 {
+        let (code, out, err) =
+            dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], fake);
+        let (specs, _warnings) = goetia::spec::load(manifest).expect("reload fixture manifest");
+        let install_outcome = fake
+            .install(&specs[0], false)
+            .expect("install must not error for a diff fixture");
+        let install_up_to_date = matches!(install_outcome, goetia::decide::Outcome::UpToDate);
+        assert_eq!(
+            code == 0,
+            install_up_to_date,
+            "{label}: diff exit {code}, install outcome {install_outcome:?}\nstdout:\n{out}\nstderr:\n{err}"
+        );
+        code
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let (fake, manifest) = up_to_date_fixture(dir.path(), "frpc");
+    check(&fake, &manifest, "UpToDate");
+
+    let dir = tempfile::tempdir().unwrap();
+    let (fake, manifest) = absent_fixture(dir.path(), "frpc");
+    check(&fake, &manifest, "Create");
+
+    let dir = tempfile::tempdir().unwrap();
+    let (fake, manifest) = update_fixture(dir.path(), "frpc");
+    check(&fake, &manifest, "Update");
+
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::new();
+    fake.seed_stale(&mk("frpc"), "0.0.0-stale");
+    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let code = check(&fake, &manifest, "Stale");
+    // Pinned exactly, not just `!= 0`: `Stale` is drift like `Create`/
+    // `Update`, so it must be 3, not (say) a `Conflict`'s 5 — nothing else
+    // in this file asserts the exact code for this outcome.
+    assert_eq!(code, 3, "Stale must exit 3");
+
+    let dir = tempfile::tempdir().unwrap();
+    let (fake, manifest) = hand_edited_fixture(dir.path(), "frpc");
+    check(&fake, &manifest, "Conflict");
+
+    let dir = tempfile::tempdir().unwrap();
+    let (fake, manifest) = foreign_fixture(dir.path(), "frpc");
+    check(&fake, &manifest, "RefuseForeign");
+
+    let dir = tempfile::tempdir().unwrap();
+    let (fake, manifest) = unreadable_fixture(dir.path(), "frpc");
+    check(&fake, &manifest, "RefuseUnreadable");
+}
+
+// --json ==============================================================================================================
+
+/// Parse the one document `--json` promises: exactly one line on stdout,
+/// newline-terminated, and nothing else. Every assertion below is made
+/// against the parsed value, never against the raw text.
+fn parse_json(stdout: &str) -> serde_json::Value {
+    assert!(
+        stdout.ends_with('\n'),
+        "the document must be newline-terminated: {stdout:?}"
+    );
+    assert_eq!(
+        stdout.lines().count(),
+        1,
+        "stdout must carry exactly one document: {stdout:?}"
+    );
+    serde_json::from_str(stdout).unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {stdout:?}"))
+}
+
+fn daemons(doc: &serde_json::Value) -> &[serde_json::Value] {
+    doc["daemons"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`daemons` must always be present, as an array: {doc}"))
+}
+
+fn errors(doc: &serde_json::Value) -> &[serde_json::Value] {
+    doc["errors"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`errors` must always be present, as an array: {doc}"))
+}
+
+fn daemon_ids(doc: &serde_json::Value) -> Vec<String> {
+    field_strings(daemons(doc), "id")
+}
+
+fn error_kinds(doc: &serde_json::Value) -> Vec<String> {
+    field_strings(errors(doc), "kind")
+}
+
+fn field_strings(entries: &[serde_json::Value], field: &str) -> Vec<String> {
+    entries
+        .iter()
+        .map(|entry| {
+            entry[field]
+                .as_str()
+                .unwrap_or_else(|| panic!("`{field}` must be a string: {entry}"))
+                .to_string()
+        })
+        .collect()
+}
+
+/// `--json` is `global = true`, so it is accepted on either side of the
+/// subcommand and means the same thing in both places.
+#[skuld::test]
+fn json_is_accepted_before_or_after_the_subcommand() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+
+    let (before_code, before_out, _) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
+    let (after_code, after_out, _) = dispatch_read_only(&["goetia", "daemon", "list", "--json"], &fake);
+
+    assert_eq!(before_code, after_code);
+    assert_eq!(parse_json(&before_out), parse_json(&after_out));
+}
+
+#[skuld::test]
+fn list_json_emits_every_managed_daemon() {
+    let fake = Fake::new();
+    fake.install(&mk("websocat"), false).unwrap();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.start(&Id::try_from("frpc").unwrap()).unwrap();
+    fake.enable(&Id::try_from("frpc").unwrap()).unwrap();
+
+    let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
+
+    assert_eq!(code, 0, "{out}");
+    let doc = parse_json(&out);
+    assert_eq!(daemon_ids(&doc), ["frpc", "websocat"], "entries must be sorted by id");
+    assert_eq!(daemons(&doc)[0]["state"], "running");
+    assert_eq!(daemons(&doc)[0]["enabled"], true);
+    assert_eq!(daemons(&doc)[0]["pid"], 1);
+    assert_eq!(daemons(&doc)[1]["state"], "stopped");
+    assert_eq!(daemons(&doc)[1]["enabled"], false);
+    assert_eq!(daemons(&doc)[1]["pid"], serde_json::Value::Null);
+    assert!(errors(&doc).is_empty(), "{doc}");
+}
+
+#[skuld::test]
+fn list_json_with_no_daemons_emits_empty_arrays() {
+    let fake = Fake::new();
+
+    let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
+
+    assert_eq!(code, 0, "{out}");
+    let doc = parse_json(&out);
+    assert!(daemons(&doc).is_empty(), "{doc}");
+    assert!(errors(&doc).is_empty(), "{doc}");
+}
+
+#[skuld::test]
+fn list_json_reports_an_unreadable_entry_as_kind_unreadable() {
+    let fake = Fake::new();
+    fake.seed_unreadable("corrupt");
+    fake.install(&mk("readable"), false).unwrap();
+
+    let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
+
+    assert_eq!(
+        code, 4,
+        "an id goetia owns but cannot report on is the partial-answer case: {out}"
+    );
+    let doc = parse_json(&out);
+    assert_eq!(
+        daemon_ids(&doc),
+        ["readable"],
+        "the readable entry must still be reported"
+    );
+    assert_eq!(error_kinds(&doc), ["unreadable"]);
+    assert_eq!(errors(&doc)[0]["id"], "corrupt");
+}
+
+/// A verb whose exit code depends on its output format is exactly the split
+/// the envelope exists to remove.
+#[skuld::test]
+fn list_exit_code_is_the_same_with_and_without_json() {
+    let clean = Fake::new();
+    clean.install(&mk("frpc"), false).unwrap();
+    let unreadable = Fake::new();
+    unreadable.seed_unreadable("corrupt");
+
+    for (fake, expected) in [(&clean, 0), (&unreadable, 4)] {
+        let (plain, _, _) = dispatch_read_only(&["goetia", "daemon", "list"], fake);
+        let (json, _, _) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], fake);
+
+        assert_eq!(plain, json, "the exit code must not depend on the output format");
+        assert_eq!(plain, expected);
+    }
+}
+
+/// Without `--json`, a manager that cannot be obtained leaves stdout empty,
+/// which `json.loads` would choke on. `--json` emits a well-formed document
+/// carrying one `unavailable` error instead.
+#[skuld::test]
+fn list_json_emits_a_document_when_the_manager_is_unavailable() {
+    let (code, out, err) = dispatch_get_manager(
+        &["goetia", "--json", "daemon", "list"],
+        &|| {
+            Err(goetia::Error::UnsupportedPlatform {
+                platform: "hal9000".to_string(),
+            })
+        },
+        &never_elevated,
+    );
+
+    assert_eq!(
+        code, 1,
+        "no answer was obtained for any daemon: nothing partial about it: {out}"
+    );
+    let doc = parse_json(&out);
+    assert!(daemons(&doc).is_empty(), "{doc}");
+    assert_eq!(error_kinds(&doc), ["unavailable"]);
+    assert_eq!(errors(&doc)[0]["id"], serde_json::Value::Null);
+    assert!(
+        errors(&doc)[0]["message"].as_str().unwrap().contains("hal9000"),
+        "the message must carry the underlying failure: {doc}"
+    );
+    assert!(err.is_empty(), "stderr:\n{err}");
+}
+
+#[skuld::test]
+fn list_json_emits_a_document_when_list_fails() {
+    let mgr = FlakyManager {
+        fail_list: true,
+        ..Default::default()
+    };
+
+    let (code, out, _err) = dispatch_with(&["goetia", "--json", "daemon", "list"], &mgr, &never_elevated);
+
+    assert_eq!(code, 1, "{out}");
+    let doc = parse_json(&out);
+    assert!(daemons(&doc).is_empty(), "{doc}");
+    assert_eq!(error_kinds(&doc), ["unavailable"]);
+    assert_eq!(errors(&doc)[0]["id"], serde_json::Value::Null);
+}
+
+/// The channel rule: with `--json`, the document is all of stdout and the
+/// subcommand writes no diagnostics of its own to stderr — not even the
+/// unreadable-entry warning its text mode prints.
+#[skuld::test]
+fn list_json_is_the_only_thing_on_stdout_and_stderr_stays_empty() {
+    let fake = Fake::new();
+    fake.seed_unreadable("corrupt");
+    fake.install(&mk("readable"), false).unwrap();
+
+    let (code, out, err) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
+
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
+    parse_json(&out);
+    assert!(err.is_empty(), "stderr:\n{err}");
+}
+
+#[skuld::test]
+fn status_json_reports_state_enabled_and_pid_for_a_named_id() {
+    let fake = Fake::new();
+    let spec = mk("frpc");
+    fake.install(&spec, false).unwrap();
+    fake.start(&spec.id).unwrap();
+    fake.enable(&spec.id).unwrap();
+
+    let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "status", "frpc"], &fake);
+
+    assert_eq!(code, 0, "{out}");
+    let doc = parse_json(&out);
+    assert_eq!(daemon_ids(&doc), ["frpc"]);
+    assert_eq!(daemons(&doc)[0]["state"], "running");
+    assert_eq!(daemons(&doc)[0]["enabled"], true);
+    assert_eq!(daemons(&doc)[0]["pid"], 1);
+    assert!(errors(&doc).is_empty(), "{doc}");
+}
+
+/// A null `pid` means the manager reports no main process — never "this
+/// command could not find out", which is an `errors` entry instead.
+#[skuld::test]
+fn status_json_reports_a_null_pid_for_a_stopped_daemon() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+
+    let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "status", "frpc"], &fake);
+
+    assert_eq!(code, 0, "{out}");
+    let doc = parse_json(&out);
+    assert_eq!(daemons(&doc)[0]["state"], "stopped");
+    assert_eq!(daemons(&doc)[0]["pid"], serde_json::Value::Null);
+}
+
+/// The two subcommands must describe one machine identically, or a consumer
+/// has to know which verb produced the document it is reading.
+#[skuld::test]
+fn status_json_with_no_ids_equals_list_json() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.start(&Id::try_from("frpc").unwrap()).unwrap();
+    fake.install(&mk("websocat"), false).unwrap();
+    fake.seed_unreadable("corrupt");
+
+    let (list_code, list_out, _) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
+    let (status_code, status_out, _) = dispatch_read_only(&["goetia", "--json", "daemon", "status"], &fake);
+
+    assert_eq!(list_code, status_code);
+    assert_eq!(parse_json(&list_out), parse_json(&status_out));
+}
+
+/// Three states with opposite remedies, which text mode renders as one
+/// undifferentiated `error:` line each. The `unreadable` here comes from a
+/// blob that fails to decode at all (`Error::Blob`); the
+/// `Error::Invalid`-producing case is
+/// `status_json_reports_invalid_blob_content_as_unreadable_not_invalid_id`.
+#[skuld::test]
+fn status_json_distinguishes_not_installed_foreign_and_unreadable() {
+    let fake = Fake::new();
+    fake.seed_foreign("stranger", "not a goetia artifact at all\n");
+    fake.seed_unreadable("corrupt");
+
+    let (code, out, _err) = dispatch_read_only(
+        &["goetia", "--json", "daemon", "status", "missing", "stranger", "corrupt"],
+        &fake,
+    );
+
+    let doc = parse_json(&out);
+    assert_eq!(
+        error_kinds(&doc),
+        ["not-installed", "foreign", "unreadable"],
+        "in argument order"
+    );
+    assert_eq!(field_strings(errors(&doc), "id"), ["missing", "stranger", "corrupt"]);
+    assert!(daemons(&doc).is_empty(), "{doc}");
+    assert_eq!(code, 1, "`not-installed`'s 1 outranks `unreadable`'s 4: {out}");
+}
+
+/// The disagreement this task exists to close: for a unit that decodes but
+/// whose live state cannot be queried, `list` sees `Installed::OursUnreadable`
+/// and `status` sees `Error::CommandFailed`. Both must report `unreadable`.
+#[skuld::test]
+fn list_and_status_report_the_same_kind_for_an_unqueryable_daemon() {
+    let inner = Fake::new();
+    inner.install(&mk("frpc"), false).unwrap();
+    let mgr = FlakyManager {
+        inner,
+        unqueryable: Some("frpc".to_string()),
+        ..Default::default()
+    };
+
+    let (list_code, list_out, _) = dispatch_with(&["goetia", "--json", "daemon", "list"], &mgr, &never_elevated);
+    let (status_code, status_out, _) =
+        dispatch_with(&["goetia", "--json", "daemon", "status", "frpc"], &mgr, &never_elevated);
+
+    assert_eq!(error_kinds(&parse_json(&list_out)), ["unreadable"], "{list_out}");
+    assert_eq!(error_kinds(&parse_json(&status_out)), ["unreadable"], "{status_out}");
+    assert_eq!(list_code, 4);
+    assert_eq!(status_code, 4);
+}
+
+/// `parse_id` rejecting an argument and blob-content validation both produce
+/// `Error::Invalid`, so the kind comes from which operation failed, not from
+/// the variant: this one is `invalid-id`, and the one in
+/// `status_json_distinguishes_not_installed_foreign_and_unreadable` is not.
+#[skuld::test]
+fn status_json_reports_an_invalid_id_as_kind_invalid_id() {
+    let fake = Fake::new();
+
+    let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "status", "not/a/valid/id"], &fake);
+
+    assert_eq!(code, 1, "something ran, so this is not the parser's `2`: {out}");
+    let doc = parse_json(&out);
+    assert_eq!(error_kinds(&doc), ["invalid-id"]);
+    assert_eq!(errors(&doc)[0]["id"], "not/a/valid/id");
+}
+
+#[skuld::test]
+fn status_json_mixes_good_and_bad_ids() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+
+    let (code, out, _err) = dispatch_read_only(
+        &["goetia", "--json", "daemon", "status", "frpc", "not/a/valid/id"],
+        &fake,
+    );
+
+    assert_eq!(code, 1, "{out}");
+    let doc = parse_json(&out);
+    assert_eq!(daemon_ids(&doc), ["frpc"], "the good id must still be answered");
+    assert_eq!(error_kinds(&doc), ["invalid-id"]);
+}
+
+/// The exit code is the precedence-max over `errors[].kind`, not "1 if
+/// non-empty".
+#[skuld::test]
+fn json_exit_code_follows_the_precedence_rule() {
+    let fake = Fake::new();
+    fake.seed_unreadable("corrupt");
+
+    let (alone, alone_out, _) = dispatch_read_only(&["goetia", "--json", "daemon", "status", "corrupt"], &fake);
+    assert_eq!(error_kinds(&parse_json(&alone_out)), ["unreadable"]);
+    assert_eq!(alone, 4, "an unreadable entry alone is 4, neither 1 nor 0: {alone_out}");
+
+    let (combined, combined_out, _) =
+        dispatch_read_only(&["goetia", "--json", "daemon", "status", "corrupt", "missing"], &fake);
+    assert_eq!(error_kinds(&parse_json(&combined_out)), ["unreadable", "not-installed"]);
+    assert_eq!(combined, 1, "1 outranks 4: {combined_out}");
+}
+
+#[skuld::test]
+fn json_exit_code_is_zero_exactly_when_errors_is_empty() {
+    let clean = Fake::new();
+    clean.install(&mk("frpc"), false).unwrap();
+    let dirty = Fake::new();
+    dirty.seed_unreadable("corrupt");
+
+    for fake in [&clean, &dirty] {
+        for args in [
+            ["goetia", "--json", "daemon", "list"].as_slice(),
+            ["goetia", "--json", "daemon", "status"].as_slice(),
+        ] {
+            let (code, out, _) = dispatch_read_only(args, fake);
+            let doc = parse_json(&out);
+
+            assert_eq!(code == 0, errors(&doc).is_empty(), "{args:?} exited {code}: {doc}");
+        }
+    }
+}
+
+/// `--json` on a subcommand that does not implement it is a refusal, not
+/// silence: the invariant is that `--json` plus a subcommand always yields
+/// one JSON document on stdout.
+#[skuld::test]
+fn json_on_an_unsupported_subcommand_is_refused_as_json() {
+    let fake = Fake::new();
+
+    let (code, out, err) = dispatch_read_only(&["goetia", "--json", "daemon", "install"], &fake);
+
+    assert_eq!(code, 2, "a usage error, and nothing ran: {out}");
+    let doc = parse_json(&out);
+    assert!(daemons(&doc).is_empty(), "{doc}");
+    assert_eq!(error_kinds(&doc), ["unsupported"]);
+    assert_eq!(errors(&doc)[0]["id"], serde_json::Value::Null);
+    assert!(
+        errors(&doc)[0]["message"].as_str().unwrap().contains("install"),
+        "the refusal must name the subcommand: {doc}"
+    );
+    assert!(err.is_empty(), "stderr:\n{err}");
+}
+
+#[skuld::test]
+fn json_on_an_unsupported_subcommand_runs_nothing() {
+    let (code, out, _err) = dispatch_get_manager(
+        &["goetia", "--json", "daemon", "uninstall", "frpc"],
+        &|| panic!("a refused --json subcommand must never obtain a manager"),
+        &|| panic!("a refused --json subcommand must never check elevation"),
+    );
+
+    assert_eq!(code, 2, "{out}");
+    assert_eq!(error_kinds(&parse_json(&out)), ["unsupported"]);
+}
+
+/// The rule the whole wire format rests on: a `kind` comes from **which
+/// operation failed**, never from the `Error` variant. `Error::Invalid` is
+/// produced by `support::parse_id` *and* by blob-content validation, so a
+/// classifier keyed on the variant would report an id goetia owns but cannot
+/// decode as `invalid-id` with exit 1 — telling the user to fix a command
+/// line that is perfectly correct — instead of `unreadable` with exit 4.
+#[skuld::test]
+fn status_json_reports_invalid_blob_content_as_unreadable_not_invalid_id() {
+    let fake = Fake::new();
+    fake.seed_invalid_content("frpc");
+
+    let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "status", "frpc"], &fake);
+
+    let doc = parse_json(&out);
+    assert_eq!(
+        error_kinds(&doc),
+        ["unreadable"],
+        "the argument was a valid id; the *artifact* is what goetia cannot read: {doc}"
+    );
+    assert_eq!(errors(&doc)[0]["id"], "frpc");
+    assert_eq!(code, 4, "{out}");
+}
+
+/// `list` must classify the same artifact the same way — it reaches
+/// `Installed::OursUnreadable` rather than an `Error` at all.
+#[skuld::test]
+fn list_json_reports_invalid_blob_content_as_unreadable() {
+    let fake = Fake::new();
+    fake.seed_invalid_content("frpc");
+
+    let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
+
+    assert_eq!(error_kinds(&parse_json(&out)), ["unreadable"], "{out}");
+    assert_eq!(code, 4, "{out}");
+}
+
+/// Ids are reported in argument order, and a repeated argument yields a
+/// repeated entry — `status` never silently deduplicates what was asked for.
+#[skuld::test]
+fn status_json_repeats_an_id_given_twice() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.install(&mk("websocat"), false).unwrap();
+
+    let (code, out, _err) = dispatch_read_only(
+        &["goetia", "--json", "daemon", "status", "websocat", "frpc", "websocat"],
+        &fake,
+    );
+
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(daemon_ids(&parse_json(&out)), ["websocat", "frpc", "websocat"]);
+}
+
+/// The channel rule holds for `status` too, on a fixture whose text mode
+/// writes both a `warning:` (the unreadable entry) and an `error:` line.
+#[skuld::test]
+fn status_json_is_the_only_thing_on_stdout_and_stderr_stays_empty() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_unreadable("corrupt");
+
+    for args in [
+        ["goetia", "--json", "daemon", "status"].as_slice(),
+        [
+            "goetia",
+            "--json",
+            "daemon",
+            "status",
+            "frpc",
+            "corrupt",
+            "not/a/valid/id",
+        ]
+        .as_slice(),
+    ] {
+        let (code, out, err) = dispatch_read_only(args, &fake);
+
+        parse_json(&out);
+        assert!(err.is_empty(), "{args:?} wrote to stderr:\n{err}");
+        assert_ne!(code, 0, "{args:?} must still report the failures it found");
+    }
+}
+
+/// `Error::Invalid`'s own `Display` prefixes ``daemon `X`: ``, and the text
+/// renderer prefixes the id as well, so carrying `Display` into `message`
+/// would name the same id three times on one line.
+#[skuld::test]
+fn status_names_a_rejected_id_once_per_channel() {
+    let fake = Fake::new();
+
+    let (_, out, _) = dispatch_read_only(&["goetia", "--json", "daemon", "status", "not/a/valid/id"], &fake);
+    let (_, _, text_err) = dispatch_read_only(&["goetia", "daemon", "status", "not/a/valid/id"], &fake);
+
+    let message = errors(&parse_json(&out))[0]["message"].as_str().unwrap().to_string();
+    assert!(
+        !message.contains("not/a/valid/id:"),
+        "`id` is the attribution; `message` must not repeat it as a prefix: {message}"
+    );
+    assert_eq!(
+        text_err.matches("not/a/valid/id").count(),
+        2,
+        "once as the line's prefix and once inside the pattern message: {text_err}"
+    );
+}
+
+// Residual artifacts ==================================================================================================
+
+/// The one error `uninstall` renders as success is `NotInstalled`, so a manager must reserve it for
+/// an id that is genuinely empty. `Fake::seed_residual_artifact` models the state that broke this
+/// on systemd: `/etc/systemd/system/<id>.service` gone, but a `<id>.service.d/*.conf` drop-in or a
+/// `multi-user.target.wants/<id>.service` link still there and still being applied. Reachable from
+/// `uninstall`'s own partial-failure path — the retry it tells you to run must not then print
+/// "nothing to do".
+#[skuld::test]
+fn uninstall_does_not_report_success_over_a_residual_artifact() {
+    let fake = Fake::new();
+    fake.seed_residual_artifact("leftover");
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "uninstall", "leftover"], &fake);
+
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(out, "", "`uninstall x && echo \"confirmed gone\"` must not print");
+    assert!(err.contains("leftover"), "{err}");
+}
+
+/// `install` refuses the id as foreign; `uninstall` must not call the same id empty. Two verbs
+/// disagreeing about one state is the defect, not either answer on its own.
+#[skuld::test]
+fn install_and_uninstall_agree_about_an_id_with_only_a_residual_artifact() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "daemons:\n  leftover:\n    command: [leftover]\n");
+    let fake = Fake::new();
+    fake.seed_residual_artifact("leftover");
+
+    let (install_code, _, install_err) = dispatch_elevated(
+        &["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()],
+        &fake,
+    );
+    let (uninstall_code, _, _) = dispatch_elevated(&["goetia", "daemon", "uninstall", "leftover"], &fake);
+
+    assert_ne!(install_code, 0, "install refuses it: {install_err}");
+    assert!(
+        install_err.contains("not a goetia-managed service"),
+        "refused as foreign, not for some unrelated reason: {install_err}"
+    );
+    assert_ne!(uninstall_code, 0, "so uninstall cannot report it gone");
+}
+
+// Known gap: daemons this privilege level cannot enumerate ============================================================
+//
+// `list`, `status` with no ids, and `show` with no ids all answer from `list()` alone, which cannot
+// report an id it could not enumerate — no warning, no `errors[]` entry, nothing. An unelevated
+// `goetia daemon list` therefore returns an empty document and exit `0` on a host that does have
+// goetia daemons installed. The README documents it.
+//
+// The tests below record *today's* behaviour, not desired behaviour. Closing the gap needs a
+// `ServiceManager` trait change (a `list()` that can report what it could not see) and is a
+// separate work item; when it lands, these two tests are the ones that must change.
+
+#[skuld::test]
+fn known_gap_list_silently_omits_a_daemon_it_cannot_enumerate() {
+    let inner = Fake::new();
+    inner.install(&mk("ghost"), false).unwrap();
+    let mgr = FlakyManager {
+        inner,
+        hidden_from_list: Some("ghost".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        mgr.status(&Id::try_from("ghost").unwrap()).is_ok(),
+        "a direct query finds it"
+    );
+
+    let (code, out, err) = dispatch_with(&["goetia", "--json", "daemon", "list"], &mgr, &never_elevated);
+
+    let doc = parse_json(&out);
+    assert!(daemons(&doc).is_empty(), "the installed daemon is missing: {doc}");
+    assert!(errors(&doc).is_empty(), "and nothing says so: {doc}");
+    assert_eq!(code, 0, "which is indistinguishable from a host with no daemons");
+    assert_eq!(err, "", "not even a warning");
+}
+
+#[skuld::test]
+fn known_gap_status_with_no_ids_silently_omits_a_daemon_it_cannot_enumerate() {
+    let inner = Fake::new();
+    inner.install(&mk("ghost"), false).unwrap();
+    let mgr = FlakyManager {
+        inner,
+        hidden_from_list: Some("ghost".to_string()),
+        ..Default::default()
+    };
+
+    let (all_code, all_out, all_err) = dispatch_with(&["goetia", "--json", "daemon", "status"], &mgr, &never_elevated);
+    let (one_code, one_out, _) = dispatch_with(
+        &["goetia", "--json", "daemon", "status", "ghost"],
+        &mgr,
+        &never_elevated,
+    );
+
+    let all = parse_json(&all_out);
+    assert!(daemons(&all).is_empty(), "{all}");
+    assert!(errors(&all).is_empty(), "{all}");
+    assert_eq!(all_code, 0);
+    assert_eq!(all_err, "");
+
+    // The asymmetry, stated as one assertion: naming the id finds exactly the daemon the no-ids
+    // form could not see.
+    assert_eq!(daemon_ids(&parse_json(&one_out)), ["ghost"], "{one_out}");
+    assert_eq!(one_code, 0);
+}
+
+// --json write failures ===============================================================================================
+
+/// Refuses every write, the way a broken pipe (`goetia --json daemon list | head -1`) or a full
+/// disk does.
+struct FailingStdout;
+
+impl std::io::Write for FailingStdout {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "injected write failure",
+        ))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// [`dispatch_with`] against a caller-supplied `out` — the one thing a `Vec<u8>` cannot model is a
+/// stdout that refuses the document.
+fn dispatch_to(args: &[&str], mgr: &Fake, out: &mut dyn std::io::Write) -> (i32, String) {
+    let cli = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("parse {args:?}: {e}"));
+    let mgr = mgr.clone();
+    let get_manager = move || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(mgr.clone())) };
+    let mut err = Vec::new();
+    let code = cli::dispatch(&cli, &get_manager, &never_elevated, out, &mut err);
+    (code, String::from_utf8(err).expect("stderr is UTF-8"))
+}
+
+/// `--json`'s published contract is "stdout is exactly one JSON document; parse it, then read
+/// `errors`". A consumer honouring that would meet `json.loads("")` if an undelivered document
+/// could still exit `0` — which is the failure `--json` was built to remove.
+#[skuld::test]
+fn json_exits_one_when_stdout_refuses_the_document() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+
+    // Every `--json` path, including the `unsupported` refusal, whose own code is `2`.
+    for args in [
+        &["goetia", "--json", "daemon", "list"][..],
+        &["goetia", "--json", "daemon", "status"][..],
+        &["goetia", "--json", "daemon", "status", "frpc"][..],
+        &["goetia", "--json", "daemon", "show", "frpc"][..],
+    ] {
+        let (code, err) = dispatch_to(args, &fake, &mut FailingStdout);
+
+        assert_eq!(code, 1, "{args:?}");
+        assert!(err.contains("injected write failure"), "{args:?}: {err}");
+    }
+}
+
+/// The same runs against a stdout that accepts the write: `1` above is the write failure talking,
+/// not a code these invocations return anyway.
+#[skuld::test]
+fn json_returns_its_own_code_when_stdout_accepts_the_document() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+
+    for (args, expected) in [
+        (&["goetia", "--json", "daemon", "list"][..], 0),
+        (&["goetia", "--json", "daemon", "status"][..], 0),
+        (&["goetia", "--json", "daemon", "status", "frpc"][..], 0),
+        (&["goetia", "--json", "daemon", "show", "frpc"][..], 2),
+    ] {
+        let mut out = Vec::new();
+        let (code, err) = dispatch_to(args, &fake, &mut out);
+
+        assert_eq!(code, expected, "{args:?}: {err}");
+        assert!(!out.is_empty(), "{args:?} still emits a document");
+    }
 }

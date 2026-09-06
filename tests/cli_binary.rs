@@ -155,3 +155,103 @@ fn warnings_are_printed_to_stderr() {
     assert!(err.contains("restart-delay"), "stderr:\n{err}");
     assert!(out.contains("frpc"), "stdout:\n{out}");
 }
+
+// --json's clap-level carve-out =======================================================================================
+
+/// The published `--json` invariant is over *subcommands*: whenever `--json`
+/// is given together with one, stdout is exactly one JSON document.
+/// `--help`/`--version` are clap-level — clap short-circuits before
+/// `dispatch` is ever called — so they keep printing their own text.
+/// Rendering them as JSON would mean pre-scanning `std::env::args()` before
+/// parsing; the carve-out is pinned here so it stays deliberate.
+#[skuld::test]
+fn json_with_version_and_help_is_carved_out() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let (version_code, version_out, version_err) = run_cli(&["--json", "--version"], dir.path());
+    assert_eq!(version_code, 0, "stdout:\n{version_out}\nstderr:\n{version_err}");
+    assert!(version_out.starts_with("goetia "), "stdout:\n{version_out}");
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&version_out).is_err(),
+        "--version must stay plain text:\n{version_out}"
+    );
+
+    let (help_code, help_out, help_err) = run_cli(&["--json", "--help"], dir.path());
+    assert_eq!(help_code, 0, "stdout:\n{help_out}\nstderr:\n{help_err}");
+    assert!(help_out.contains("Usage:"), "stdout:\n{help_out}");
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&help_out).is_err(),
+        "--help must stay plain text:\n{help_out}"
+    );
+}
+
+/// The third clap-level carve-out, and the one that would otherwise be
+/// discovered by a user: `daemon uninstall` requires an id, so clap rejects
+/// the command line before `dispatch` exists and stdout stays empty —
+/// exactly the empty-string-to-`json.loads` case `--json` exists to remove.
+/// Intercepting it would mean re-rendering clap's own diagnostics, so the
+/// published invariant is narrowed to subcommands clap accepted (see
+/// `cli::dispatch`) and pinned here instead.
+#[skuld::test]
+fn json_with_a_clap_rejected_command_line_is_carved_out() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let (code, out, err) = run_cli(&["--json", "daemon", "uninstall"], dir.path());
+
+    assert_eq!(code, 2, "clap's own usage-error code: stdout:\n{out}\nstderr:\n{err}");
+    assert!(out.is_empty(), "stdout:\n{out}");
+    assert!(err.contains("Usage:"), "clap must still explain itself: stderr:\n{err}");
+}
+
+// Exit-code vocabulary: usage vs. conflict ============================================================================
+//
+// Task 8 moved goetia's own conflict code off `2` onto `5` precisely so a
+// wrapper script that typos a flag or a subcommand cannot mistake clap's
+// usage-error code for goetia's conflict code and re-run `install --force`.
+// These tests pin both halves of that: `2` stays clap's, unclaimed by
+// anything else, and `5` never shows up on a malformed command line.
+
+/// `goetia daemon bogus` (an unknown subcommand) and an unknown global flag
+/// both go through clap's own rejection path and exit `2` — clap's default,
+/// deliberately left un-overridden by `main.rs`. Pinned so this stays a
+/// choice, not an accident nobody checked.
+#[skuld::test]
+fn a_usage_error_exits_two() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let (bogus_code, bogus_out, bogus_err) = run_cli(&["daemon", "bogus"], dir.path());
+    assert_eq!(bogus_code, 2, "stdout:\n{bogus_out}\nstderr:\n{bogus_err}");
+
+    let (flag_code, flag_out, flag_err) = run_cli(&["--nosuchflag"], dir.path());
+    assert_eq!(flag_code, 2, "stdout:\n{flag_out}\nstderr:\n{flag_err}");
+}
+
+/// The collision this task exists to remove: neither malformed invocation
+/// above may ever produce `5`, goetia's own conflict code, even though a
+/// wrapper script could otherwise mistake one for the other.
+#[skuld::test]
+fn no_subcommand_returns_the_conflict_code_for_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let (bogus_code, bogus_out, bogus_err) = run_cli(&["daemon", "bogus"], dir.path());
+    assert_ne!(bogus_code, 5, "stdout:\n{bogus_out}\nstderr:\n{bogus_err}");
+
+    let (flag_code, flag_out, flag_err) = run_cli(&["--nosuchflag"], dir.path());
+    assert_ne!(flag_code, 5, "stdout:\n{flag_out}\nstderr:\n{flag_err}");
+}
+
+/// `--help`/`--version` (without `--json`, unlike
+/// `json_with_version_and_help_is_carved_out`) still exit `0` with their
+/// own text on stdout, unaffected by the conflict code's move.
+#[skuld::test]
+fn help_and_version_still_exit_zero_on_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let (version_code, version_out, version_err) = run_cli(&["--version"], dir.path());
+    assert_eq!(version_code, 0, "stdout:\n{version_out}\nstderr:\n{version_err}");
+    assert!(version_out.starts_with("goetia "), "stdout:\n{version_out}");
+
+    let (help_code, help_out, help_err) = run_cli(&["--help"], dir.path());
+    assert_eq!(help_code, 0, "stdout:\n{help_out}\nstderr:\n{help_err}");
+    assert!(help_out.contains("Usage:"), "stdout:\n{help_out}");
+}
