@@ -27,9 +27,14 @@
 //! `WorkingDirectory=` — so a manifest's `bin/frpc` (a name with a slash
 //! that is not absolute) is rejected outright there. A Windows service has
 //! no working directory of its own at all, and resolves a relative binary
-//! against `System32`. Absolutizing `command[0]` against the manifest's
-//! directory before any backend sees it collapses those three disagreeing
-//! rules into one that always holds.
+//! against `System32`. launchd does neither: it resolves
+//! `ProgramArguments[0]` against the job's working directory, which
+//! `generate` emits only when `cwd` is set, so a relative binary there
+//! silently resolves against the default rather than being refused.
+//! Absolutizing `command[0]` against the manifest's directory before any
+//! backend sees it collapses those three disagreeing rules into one that
+//! always holds — and it is the only one of the three that does not depend
+//! on where the daemon happens to start.
 //!
 //! **The dragon is in the default.** Because only `command[0]` is
 //! absolutized, a manifest that passes a relative path as an *argument* —
