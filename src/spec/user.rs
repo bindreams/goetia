@@ -42,9 +42,10 @@ pub enum RawUser {
 /// A resolved account identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum User {
-    /// The bare string `root`: the platform's superuser, emitted
-    /// explicitly (`User=0`, `LocalSystem`, `UserName: root`). Reached
-    /// only from `RawUser::Scalar`, never from `{name: root}`.
+    /// The bare string `root`, or an absent `user:` field: the platform's
+    /// superuser, emitted explicitly (`User=0`, `LocalSystem`,
+    /// `UserName: root`). Never reached from `{name: root}`, which is the
+    /// literal account named root.
     Root,
     /// Any other bare string, or `{name: ...}` — including `{name: root}`,
     /// which is the literal username `"root"` with no special-casing.

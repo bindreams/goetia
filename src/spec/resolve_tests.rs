@@ -852,13 +852,22 @@ fn interpolated_values_pass_through_the_injection_gate() {
     // `.env` cannot express a newline at all (`vars.rs` rejects both the
     // `\n` escape and a multi-line value), so this uses the worst control
     // character it *can* carry.
+    // Each row names the field the error must blame. Asserting only
+    // "control character" would let a row pass on a *different* leaf's
+    // rejection than the one it claims to exercise.
     let leaves = [
         ("name", "    name: ${EVIL}\n    command: [/bin/frpc]\n"),
         ("command", "    command: [/bin/frpc, \"${EVIL}\"]\n"),
         ("cwd", "    command: [/bin/frpc]\n    cwd: ${EVIL}\n"),
         ("logs", "    command: [/bin/frpc]\n    logs: ${EVIL}\n"),
-        ("env value", "    command: [/bin/frpc]\n    env:\n      LOG: ${EVIL}\n"),
-        ("user", "    command: [/bin/frpc]\n    user: ${EVIL}\n"),
+        ("env[LOG]", "    command: [/bin/frpc]\n    env:\n      LOG: ${EVIL}\n"),
+        ("user.name", "    command: [/bin/frpc]\n    user: ${EVIL}\n"),
+        // The struct form too: it is the syntax the `RawUser` split
+        // introduced, and it reaches the gate by a different arm.
+        (
+            "user.name",
+            "    command: [/bin/frpc]\n    user:\n      name: ${EVIL}\n",
+        ),
     ];
 
     for (leaf, body) in leaves {
@@ -875,6 +884,10 @@ fn interpolated_values_pass_through_the_injection_gate() {
         assert!(
             err.to_string().contains("control character"),
             "{leaf}: expected the control-character gate, got: {err}"
+        );
+        assert!(
+            err.to_string().contains(&format!("field `{leaf}`")),
+            "{leaf}: the gate should blame this leaf, got: {err}"
         );
     }
 }
