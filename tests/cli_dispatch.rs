@@ -180,6 +180,13 @@ fn dispatch_read_only(args: &[&str], fake: &Fake) -> (i32, String, String) {
 ///   this daemon would change" path — `Fake` itself can never fail
 ///   `preview_install`, so this is the only way to put a genuine `Err(_)`
 ///   in the same `diff` run as a `Conflict`/drift outcome.
+/// - `hidden_from_list` models the opposite asymmetry from `unqueryable`:
+///   an id `list()` cannot enumerate at all (as if this privilege level
+///   lacked the read access needed to see it in a directory listing —
+///   real backends can hit exactly this, e.g. an ACL denying an
+///   unprivileged registry read), while `status(&id)` — a direct query by
+///   name — still finds it. `Fake` itself has no such gap: its `list` and
+///   `status` always agree, so this is the only way to open one.
 #[derive(Clone, Default)]
 struct FlakyManager {
     inner: Fake,
@@ -188,6 +195,7 @@ struct FlakyManager {
     fail_list: bool,
     unqueryable: Option<String>,
     fail_preview_for: Option<String>,
+    hidden_from_list: Option<String>,
 }
 
 /// The failure [`FlakyManager`] injects for `fail_list`/`unqueryable`: the
@@ -255,6 +263,12 @@ impl ServiceManager for FlakyManager {
                     reason: unqueryable_failure().to_string(),
                 };
             }
+        }
+        if let Some(hidden) = &self.hidden_from_list {
+            installed.retain(|entry| match entry {
+                Installed::Ours { spec, .. } => spec.id.as_str() != hidden,
+                Installed::OursUnreadable { name, .. } => name != hidden,
+            });
         }
         Ok(installed)
     }
@@ -453,6 +467,130 @@ fn show_from_file_and_show_from_installed_agree() {
         "show -f and show (from installed) must render identically"
     );
     assert!(out_file.contains("frpc"), "{out_file}");
+}
+
+/// The per-id counterpart to `show_from_file_and_show_from_installed_agree`
+/// above: with two daemons installed from one manifest, naming each one
+/// individually still renders byte-identical output through either path,
+/// and neither path checks elevation. This is a commitment test over
+/// already-correct behaviour — both paths render through the same
+/// `crate::diff::render_yaml` today — so it is expected to pass on first
+/// write; its job is to make that agreement a declared contract rather than
+/// an accident, so a renderer added to only one path in the future fails
+/// it.
+#[skuld::test]
+fn show_per_id_from_file_and_from_installed_agree() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(
+        dir.path(),
+        "daemons:\n  frpc:\n    command: [frpc, -c, frpc.toml]\n    restart: on-failure\n  websocat:\n    command: [websocat]\n",
+    );
+    let fake = Fake::new();
+    let (install_code, _, install_err) = dispatch_elevated(
+        &["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()],
+        &fake,
+    );
+    assert_eq!(install_code, 0, "{install_err}");
+
+    for id in ["frpc", "websocat"] {
+        let (code_file, out_file, _) = dispatch_read_only(
+            &["goetia", "daemon", "show", "-f", manifest.to_str().unwrap(), id],
+            &fake,
+        );
+        let (code_installed, out_installed, _) = dispatch_read_only(&["goetia", "daemon", "show", id], &fake);
+
+        assert_eq!(code_file, 0);
+        assert_eq!(code_installed, 0);
+        assert_eq!(
+            out_file, out_installed,
+            "show -f {id} and show {id} (from installed) must render identically"
+        );
+    }
+}
+
+/// `show` without `-f` only ever consults `list()` — never `status(&id)`
+/// directly, unlike `status` itself — so a daemon this privilege level
+/// cannot enumerate is invisible to it even though a direct query would
+/// find it. Pins `show.rs`'s documented caveat on guarantee 1 as a tested
+/// fact rather than an unchecked claim.
+#[skuld::test]
+fn show_reports_not_installed_for_a_daemon_list_cannot_see() {
+    let inner = Fake::new();
+    inner.install(&mk("ghost"), false).unwrap();
+    let mgr = FlakyManager {
+        inner,
+        hidden_from_list: Some("ghost".to_string()),
+        ..Default::default()
+    };
+
+    // `status()` can see it directly...
+    assert!(mgr.status(&Id::try_from("ghost").unwrap()).is_ok());
+
+    // ...but `show`, which only calls `list()`, cannot.
+    let (code, out, err) = dispatch_with(&["goetia", "daemon", "show", "ghost"], &mgr, &never_elevated);
+
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(out, "");
+    assert_eq!(err, "error: daemon `ghost` is not installed\n");
+}
+
+/// Both of `show`'s "installed but unreadable" paths — naming the id
+/// directly, and asking for everything with none named — must return `4`
+/// (indeterminate: goetia owns this id and could not determine its state),
+/// distinguished from the `1` a genuinely absent id returns rather than
+/// merely being non-zero.
+#[skuld::test]
+fn show_exits_four_for_an_installed_but_unreadable_daemon() {
+    let fake = Fake::new();
+    fake.seed_unreadable("corrupt");
+    fake.install(&mk("readable"), false).unwrap();
+
+    // Per-id form. `err` also carries the unconditional unreadable-entry
+    // warning `print_unreadable_warnings` prints for every form (see
+    // `list_reports_an_unreadable_entry_and_exits_nonzero`), so this checks
+    // for the per-id error line rather than asserting `err` in full.
+    let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "show", "corrupt"], &fake);
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(out, "", "nothing to render for an id with no decodable spec: {out}");
+    assert!(
+        err.contains("error: daemon `corrupt` is installed but unreadable"),
+        "{err}"
+    );
+
+    // No-ids form: still escalates from `index.unreadable`, and still
+    // renders the one daemon it *can* read.
+    let (code_all, out_all, err_all) = dispatch_read_only(&["goetia", "daemon", "show"], &fake);
+    assert_eq!(code_all, 4, "stdout:\n{out_all}\nstderr:\n{err_all}");
+    assert!(out_all.contains("# readable"), "{out_all}");
+    assert!(
+        !out_all.contains("corrupt"),
+        "an unreadable entry has no spec to show: {out_all}"
+    );
+    assert!(err_all.contains("corrupt"), "{err_all}");
+    assert!(err_all.contains("unreadable"), "{err_all}");
+
+    // Distinguished from a genuinely absent id, which stays at `1` — a
+    // determinate answer, not an indeterminate one.
+    let (code_absent, _, err_absent) = dispatch_read_only(&["goetia", "daemon", "show", "nonexistent"], &fake);
+    assert_eq!(code_absent, 1, "{err_absent}");
+    assert_ne!(code, code_absent, "unreadable (4) must not collapse into absent (1)");
+}
+
+/// Splitting the "unreadable" and "not installed" branches onto different
+/// codes (`4` vs `1`) means a `show` call naming both must pick one
+/// consistently — not whichever happened to run last. `1` outranks `4`
+/// here, matching `cli::dispatch`'s published precedence rule
+/// (`1 > 4 > 5 > 3 > 0`), regardless of which id was named first.
+#[skuld::test]
+fn show_absent_id_outranks_unreadable_id_regardless_of_argument_order() {
+    let fake = Fake::new();
+    fake.seed_unreadable("corrupt");
+
+    let (code_a, _, _) = dispatch_read_only(&["goetia", "daemon", "show", "corrupt", "nonexistent"], &fake);
+    let (code_b, _, _) = dispatch_read_only(&["goetia", "daemon", "show", "nonexistent", "corrupt"], &fake);
+
+    assert_eq!(code_a, 1);
+    assert_eq!(code_b, 1);
 }
 
 // Per-verb wiring: uninstall/start/stop/restart/enable/disable/status/diff/list =======================================

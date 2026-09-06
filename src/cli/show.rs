@@ -2,8 +2,34 @@
 //!
 //! Read-only: never checks elevation. With `-f`, renders straight from a
 //! manifest and touches no manager at all. Without it, reads the spec back
-//! out of what is actually installed — both paths render through the same
-//! [`crate::diff::render_yaml`], so they agree by construction.
+//! out of what is actually installed. Four guarantees, declared here as a
+//! contract so a future change to either path is checked against them
+//! rather than merely inherited by accident:
+//!
+//! 1. **When both paths can see the daemon**, `show <id>` and
+//!    `show -f <file> <id>` render the same resolved spec identically,
+//!    byte for byte, because both go through [`crate::diff::render_yaml`]
+//!    and neither may grow a renderer of its own. Conditional, not
+//!    unconditional agreement: without `-f`, `show` reads
+//!    [`ServiceManager::list`], which silently skips a unit this privilege
+//!    level cannot enumerate (see
+//!    [`crate::manager::Installed::OursUnreadable`]'s doc comment). For a
+//!    daemon installed but unreadable unelevated, `show <id>` therefore
+//!    reports "not installed" and exits `1`, while `show -f <file> <id>`
+//!    still renders it straight from the manifest.
+//! 2. Neither path ever checks elevation.
+//! 3. `show -f` touches no manager; `show` without `-f` touches no
+//!    manifest.
+//! 4. Output is YAML, one `# <id>` header per daemon, blank-line
+//!    separated.
+//!
+//! A daemon this privilege level *can* see, but whose blob will not decode,
+//! is a different case from "not installed": `show` returns `4` for it —
+//! both per id, and, via `index.unreadable`'s escalation, for the no-ids
+//! form — the same "goetia owns this id and could not determine its
+//! state" code `list`/`status`/`diff` use. "Not installed" stays `1`, a
+//! determinate answer, and outranks `4` when a single call names both
+//! kinds of id (see `show_from_installed`).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -90,7 +116,7 @@ fn show_from_installed(
     // (it has no spec to show), so the loop below can't be what flags it —
     // unlike `list`/`status`, which escalate the same way.
     let mut exit = if ids.is_empty() && !index.unreadable.is_empty() {
-        1
+        4
     } else {
         0
     };
@@ -100,7 +126,14 @@ fn show_from_installed(
             specs.push(entry.spec.clone());
         } else if index.unreadable.contains_key(id) {
             let _ = writeln!(err, "error: daemon `{id}` is installed but unreadable");
-            exit = 1;
+            // `1` (a genuinely absent id, below) outranks `4` here,
+            // matching `cli::dispatch`'s published precedence rule
+            // (`1 > 4 > 5 > 3 > 0`) — a later unreadable id in the same
+            // call must never downgrade an already-seen absent one back
+            // from `1` to `4`.
+            if exit != 1 {
+                exit = 4;
+            }
         } else {
             let _ = writeln!(err, "error: daemon `{id}` is not installed");
             exit = 1;

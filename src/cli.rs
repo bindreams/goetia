@@ -141,9 +141,15 @@ pub enum DaemonCommand {
 ///   (see the design spec's §4), in *both* output modes; `diff` returns it
 ///   for `Outcome::RefuseUnreadable` (`cli::diff::run`) — the one row
 ///   where `diff` deliberately disagrees with `install`, which exits `1`
-///   there instead because it genuinely failed to install. Anchored to the
-///   LSB init-script convention's "service status unknown", the one other
-///   exit-code vocabulary this one deliberately agrees with.
+///   there instead because it genuinely failed to install. `show` returns
+///   it too (`cli::show::run`), for the same "installed but unreadable"
+///   case, in both its per-id and no-ids forms — but only when it can see
+///   the id is installed at all: `show` without `-f` reads `list()`, which
+///   silently skips a unit this privilege level cannot enumerate, so that
+///   case still reports `1` instead (`show.rs`'s module doc comment has
+///   the caveat). Anchored to the LSB init-script convention's "service
+///   status unknown", the one other exit-code vocabulary this one
+///   deliberately agrees with.
 /// - `5` conflict: an installed artifact was modified outside Goetia and
 ///   `--force` was not given. Returned by `cli::install::run`'s
 ///   `any_conflict` check and by `cli::diff::run` for the identical
