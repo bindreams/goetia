@@ -81,6 +81,7 @@ fn resolve_one(id: Id, raw: RawSpec, base_dir: &Path, warnings: &mut Vec<Warning
         reject_unemittable(&id, "command", arg)?;
     }
     if let Some(first) = command.first_mut() {
+        reject_empty(&id, "command[0]", first)?;
         *first = resolve_path_string(&id, "command", first, base_dir)?;
     }
 
@@ -91,6 +92,7 @@ fn resolve_one(id: Id, raw: RawSpec, base_dir: &Path, warnings: &mut Vec<Warning
     for (key, value) in raw.env {
         reject_env_key_with_equals(&id, &key)?;
         reject_unemittable(&id, "env key", &key)?;
+        reject_empty(&id, "env key", &key)?;
         reject_unemittable(&id, &format!("env[{key}]"), &value)?;
         env.insert(key, value);
     }
@@ -98,8 +100,14 @@ fn resolve_one(id: Id, raw: RawSpec, base_dir: &Path, warnings: &mut Vec<Warning
     let user = raw.user.unwrap_or(User::Root);
     match &user {
         User::Root => {}
-        User::Name(n) => reject_unemittable(&id, "user.name", n)?,
-        User::Id(AccountId::Sid(s)) => reject_unemittable(&id, "user.id", s)?,
+        User::Name(n) => {
+            reject_unemittable(&id, "user.name", n)?;
+            reject_empty(&id, "user.name", n)?;
+        }
+        User::Id(AccountId::Sid(s)) => {
+            reject_unemittable(&id, "user.id", s)?;
+            reject_empty(&id, "user.id", s)?;
+        }
         User::Id(AccountId::Uid(_)) => {}
     }
 
@@ -142,6 +150,7 @@ fn resolve_optional_path(id: &Id, field: &str, raw: Option<String>, base_dir: &P
     match raw {
         Some(s) => {
             reject_unemittable(id, field, &s)?;
+            reject_empty(id, field, &s)?;
             Ok(Some(PathBuf::from(resolve_path_string(id, field, &s, base_dir)?)))
         }
         None => Ok(None),
@@ -307,6 +316,40 @@ pub(crate) fn reject_trailing_backslash(id: &Id, field: &str, value: &str) -> Re
 pub(crate) fn reject_empty_command(id: &Id, command: &[String]) -> Result<(), Error> {
     if command.is_empty() {
         return Err(invalid(id, "command must not be empty"));
+    }
+    Ok(())
+}
+
+/// Fields where the empty string is never meaningful and is silently
+/// dangerous. `pub(crate)`: also called by `blob::decode`.
+///
+/// Applied to `user.name`, `user.id` (the `Sid` arm only), `command[0]`,
+/// `cwd` when present, `logs` when present, and every `env` key. An empty
+/// `user.name`/`user.id` reads to systemd as an empty `User=` (root), to
+/// launchd as an empty `UserName` (root), and to SCM as an empty
+/// `lpServiceStartName` (LocalSystem) — so accepting it here would let a
+/// one-character typo (or, once `${VAR}` interpolation lands, an unset or
+/// blank environment variable) silently escalate to the platform's
+/// superuser account. Deliberately **not** applied to `name` (an empty
+/// systemd `Description=` is harmless), to `env` values (`FOO=` is a
+/// normal assignment), or to `command[1..]` (an empty argv element is
+/// legitimate on POSIX and every generator quotes it).
+///
+/// An already-installed artifact whose blob carries an empty `user.name`
+/// now decodes as `Installed::OursUnreadable` rather than silently as
+/// root — the correct disclosure, and goetia has no release yet whose
+/// compatibility that would break.
+///
+/// A second, independent rejection of an empty `user.name` and empty
+/// `user.id` SID lives in the per-backend-override validation
+/// (`resolve_shape`): it found that `canonical_account("")` maps an empty
+/// authored name to `LocalSystem` on Windows by a different route, and
+/// stays scoped to the `User::Root` path it was written for. The two
+/// checks have different reachability and neither is redundant with the
+/// other — do not remove one as a "duplicate" of the other.
+pub(crate) fn reject_empty(id: &Id, field: &str, value: &str) -> Result<(), Error> {
+    if value.is_empty() {
+        return Err(invalid(id, &format!("field `{field}` must not be empty")));
     }
     Ok(())
 }

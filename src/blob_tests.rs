@@ -269,6 +269,40 @@ fn decode_rejects_invariant_violations() {
 }
 
 #[skuld::test]
+fn decode_rejects_an_empty_user_name() {
+    // A tampered blob carrying an empty `user.name` must not decode into
+    // a spec whose backend generators would emit an empty `User=`/
+    // `UserName`/`lpServiceStartName` and silently run as the platform's
+    // superuser.
+    let mut wire = base_wire_spec();
+    wire.user = WireUser::Name { name: String::new() };
+    let envelope = WireEnvelope {
+        schema: SCHEMA,
+        version: "0.1.0".to_string(),
+        spec: wire,
+    };
+    let err = decode(&encode_wire_envelope(&envelope)).expect_err("an empty user.name must be rejected");
+    let message = err.to_string();
+    assert!(message.contains("user.name"), "error should name the field: {message}");
+    assert!(message.contains("empty"), "error should say why: {message}");
+}
+
+#[skuld::test]
+fn decode_rejects_an_empty_command_executable() {
+    let mut wire = base_wire_spec();
+    wire.command = vec![String::new()];
+    let envelope = WireEnvelope {
+        schema: SCHEMA,
+        version: "0.1.0".to_string(),
+        spec: wire,
+    };
+    let err = decode(&encode_wire_envelope(&envelope)).expect_err("an empty command[0] must be rejected");
+    let message = err.to_string();
+    assert!(message.contains("command"), "error should name the field: {message}");
+    assert!(message.contains("empty"), "error should say why: {message}");
+}
+
+#[skuld::test]
 fn decode_rejects_malformed_base64() {
     let err = decode("not valid base64 !!!").unwrap_err();
     assert!(matches!(err, Error::Blob(_)), "expected Error::Blob, got {err:?}");

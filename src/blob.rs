@@ -290,10 +290,12 @@ fn daemon_spec_from_wire(wire: WireSpec) -> Result<DaemonSpec, Error> {
     for arg in &wire.command {
         spec::reject_unemittable(&id, "command", arg)?;
     }
+    spec::reject_empty(&id, "command[0]", &wire.command[0])?;
 
     let cwd = match wire.cwd {
         Some(raw) => {
             spec::reject_unemittable(&id, "cwd", &raw)?;
+            spec::reject_empty(&id, "cwd", &raw)?;
             let path = PathBuf::from(raw);
             spec::reject_relative_path(&id, "cwd", &path)?;
             Some(path)
@@ -304,6 +306,7 @@ fn daemon_spec_from_wire(wire: WireSpec) -> Result<DaemonSpec, Error> {
     let logs = match wire.logs {
         Some(raw) => {
             spec::reject_unemittable(&id, "logs", &raw)?;
+            spec::reject_empty(&id, "logs", &raw)?;
             let path = PathBuf::from(raw);
             spec::reject_relative_path(&id, "logs", &path)?;
             Some(path)
@@ -315,6 +318,7 @@ fn daemon_spec_from_wire(wire: WireSpec) -> Result<DaemonSpec, Error> {
     for (key, value) in wire.env {
         spec::reject_env_key_with_equals(&id, &key)?;
         spec::reject_unemittable(&id, "env key", &key)?;
+        spec::reject_empty(&id, "env key", &key)?;
         spec::reject_unemittable(&id, &format!("env[{key}]"), &value)?;
         env.insert(key, value);
     }
@@ -356,11 +360,13 @@ fn user_from_wire(id: &Id, wire: WireUser) -> Result<User, Error> {
         WireUser::Root => User::Root,
         WireUser::Name { name } => {
             spec::reject_unemittable(id, "user.name", &name)?;
+            spec::reject_empty(id, "user.name", &name)?;
             User::Name(name)
         }
         WireUser::Uid { uid } => User::Id(AccountId::Uid(uid)),
         WireUser::Sid { sid } => {
             spec::reject_unemittable(id, "user.id", &sid)?;
+            spec::reject_empty(id, "user.id", &sid)?;
             User::Id(AccountId::Sid(sid))
         }
     })

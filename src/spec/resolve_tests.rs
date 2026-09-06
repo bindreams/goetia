@@ -480,6 +480,84 @@ fn normalize_preserves_parent_dir_components() {
     );
 }
 
+// The emptiness gate ==================================================================================================
+
+#[skuld::test]
+fn rejects_an_empty_user_name() {
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user: \"\"\n";
+    let err = resolve_yaml(yaml).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("user.name"), "error should name the field: {msg}");
+    assert!(msg.contains("empty"), "error should say why: {msg}");
+}
+
+#[skuld::test]
+fn rejects_an_empty_user_id() {
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user:\n      id: \"\"\n";
+    let err = resolve_yaml(yaml).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("user.id"), "error should name the field: {msg}");
+    assert!(msg.contains("empty"), "error should say why: {msg}");
+}
+
+#[skuld::test]
+fn rejects_an_empty_command_executable() {
+    // Left unresolved, an empty `command[0]` would join against `base_dir`
+    // and resolve to the manifest directory itself — silently, and with no
+    // trace that the executable name was ever missing.
+    let err = resolve_yaml("daemons:\n  frpc:\n    command: [\"\"]\n").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("command"), "error should name the field: {msg}");
+    assert!(msg.contains("empty"), "error should say why: {msg}");
+}
+
+#[skuld::test]
+fn rejects_an_empty_cwd() {
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    cwd: \"\"\n";
+    let err = resolve_yaml(yaml).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("cwd"), "error should name the field: {msg}");
+    assert!(msg.contains("empty"), "error should say why: {msg}");
+}
+
+#[skuld::test]
+fn rejects_an_empty_logs() {
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    logs: \"\"\n";
+    let err = resolve_yaml(yaml).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("logs"), "error should name the field: {msg}");
+    assert!(msg.contains("empty"), "error should say why: {msg}");
+}
+
+#[skuld::test]
+fn rejects_an_empty_env_key() {
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    env:\n      \"\": \"value\"\n";
+    let err = resolve_yaml(yaml).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("env"), "error should name the field: {msg}");
+    assert!(msg.contains("empty"), "error should say why: {msg}");
+}
+
+#[skuld::test]
+fn accepts_an_empty_env_value() {
+    // `FOO:` with nothing after it is a normal, meaningful assignment
+    // (`FOO=`) — the boundary of the new rule, pinned in the other
+    // direction from `rejects_an_empty_env_key`.
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    env:\n      FOO: \"\"\n";
+    let (specs, _warnings) = resolve_yaml(yaml).expect("an empty env value is an ordinary assignment");
+    assert_eq!(specs[0].env.get("FOO"), Some(&String::new()));
+}
+
+#[skuld::test]
+fn accepts_an_empty_name() {
+    // An empty systemd `Description=` is harmless — the boundary of the
+    // new rule, pinned in the other direction from `rejects_an_empty_cwd`
+    // and friends.
+    let yaml = "daemons:\n  frpc:\n    name: \"\"\n    command: [/bin/frpc]\n";
+    let (specs, _warnings) = resolve_yaml(yaml).expect("an empty name is a harmless empty Description=");
+    assert_eq!(specs[0].name, "");
+}
+
 #[cfg(windows)]
 #[skuld::test]
 fn rejects_drive_relative_paths() {
