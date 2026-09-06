@@ -10,7 +10,8 @@ Early development. No release yet.
 
 Everything documented below — the manifest's interpolation syntax, the
 `.env` grammar, the `--json` document, and the exit codes — is **pre-1.0 and
-may still change**. Pin a version if you script against it.
+may still change**. There is no release to pin yet; until there is, script
+against a specific commit.
 
 ## Interpolation
 
@@ -32,7 +33,10 @@ another `$` is rejected, naming its byte offset — a typo like `$HOME` cannot
 silently become the literal text `$HOME` in a generated service artifact.
 This is the one place a manifest that was previously accepted can now fail:
 **a literal `$` must be written `$$`**, so a `command` argument written
-`$ARGS` becomes `$$ARGS`.
+`$ARGS` becomes `$$ARGS`. Text that already looked like a reference breaks
+differently but needs the same fix: a literal `${A}` now fails with
+``no value for `A` `` rather than being passed through, and must be written
+`$${A}`.
 
 Further rules:
 
@@ -65,8 +69,9 @@ spurious drift on an artifact nobody touched, depending only on who ran the
 command.
 
 The same elevation split has a file-permission consequence: a `.env`
-readable only by root makes `diff` and `show` fail on a manifest that
-`install` handles. A manifest containing **no `$` at all never reads
+readable only by root makes `diff` and `show -f` fail on a manifest that
+`install` handles. Plain `show` is unaffected — it reads no manifest at all,
+so it never opens `.env` (guarantee 3 below). A manifest containing **no `$` at all never reads
 `.env`**, so an unrelated (or root-only) `.env` beside such a manifest is
 harmless.
 
@@ -245,20 +250,26 @@ worse than sending you to `goetia daemon show`.
 
 `errors[].kind` is one of seven values:
 
-| `kind`          | Meaning                                                                                                                                                    |
-| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `not-installed` | Nothing is installed at that id. Only from `status <id>`.                                                                                                  |
-| `foreign`       | Something exists there that goetia does not own, or that this privilege level cannot read. Only from `status <id>`.                                        |
-| `unreadable`    | Goetia owns the id but cannot report on it — a blob it cannot decode, a live state it could not query, or an ambiguous installation. `message` says which. |
-| `invalid-id`    | A command-line argument was not a valid daemon id. Fix the argument.                                                                                       |
-| `unavailable`   | Obtaining the manager, or listing, failed, so **no** answer was obtained for any daemon.                                                                   |
-| `unsupported`   | `--json` was given to a subcommand that does not implement it.                                                                                             |
-| `other`         | Unreachable today; reserved so an unclassified failure has a home rather than being silently dropped.                                                      |
+| `kind`          | Exit code | Meaning                                                                                                                                                    |
+| --------------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `not-installed` | 1         | Nothing is installed at that id. Only from `status <id>`.                                                                                                  |
+| `foreign`       | 1         | Something exists there that goetia does not own, or that this privilege level cannot read. Only from `status <id>`.                                        |
+| `unreadable`    | 4         | Goetia owns the id but cannot report on it — a blob it cannot decode, a live state it could not query, or an ambiguous installation. `message` says which. |
+| `invalid-id`    | 1         | A command-line argument was not a valid daemon id. Fix the argument.                                                                                       |
+| `unavailable`   | 1         | Obtaining the manager, or listing, failed, so **no** answer was obtained for any daemon.                                                                   |
+| `unsupported`   | 2         | `--json` was given to a subcommand that does not implement it.                                                                                             |
+| `other`         | 1         | Unreachable today; reserved so an unclassified failure has a home rather than being silently dropped.                                                      |
 
 ### Exit code
 
 The exit code is **zero exactly when `errors` is empty**, and otherwise the
-precedence-max of the codes its kinds map to (see [Exit codes](#exit-codes)).
+precedence-max of the codes in the table above (see
+[Exit codes](#exit-codes) for the precedence rule).
+
+Note `invalid-id` is `1`, not `2`. `2` means the parser rejected the command
+line and nothing ran, but `goetia daemon status good bad` queries and prints
+`good` before rejecting `bad` — claiming `2` for a partially executed run
+would mislead exactly the consumer the code exists for.
 
 So the exit status is not a "did I get JSON" test. A `4` still carries a
 complete, well-formed document describing what could and could not be

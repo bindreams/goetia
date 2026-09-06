@@ -132,8 +132,9 @@ pub enum DaemonCommand {
 ///   return `2` on its own; the absence of an override *is* the decision.
 /// - `3` drift: a determinate "installed state differs from the manifest"
 ///   answer — `diff` returns it whenever at least one selected daemon would
-///   change and nothing conflicted or errored (`cli::diff::run`, the only
-///   place this code is returned). Not a "drift is present" signal on its
+///   change and nothing was indeterminate, conflicting or errored
+///   (`cli::diff::run`, the only place this code is returned). Not a
+///   "drift is present" signal on its
 ///   own: one `Create` plus one `Conflict` returns `5`, not `3`, since `5`
 ///   outranks `3` in the precedence rule below.
 /// - `4` indeterminate: an id Goetia owns whose state could not be
