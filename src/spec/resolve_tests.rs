@@ -742,6 +742,24 @@ fn fixture_dir(yaml: &str, env: Option<&str>) -> tempfile::TempDir {
 }
 
 #[skuld::test]
+fn a_dollar_inside_a_substituted_value_survives_resolve_unchanged() {
+    // A `.env` value is fully literal, so a `$` in one is ordinary content —
+    // passwords and connection strings carry them routinely. Substituted
+    // text is never rescanned, so that `$` must reach the resolved spec
+    // exactly as written. Pinning it here because the scanner rejects a
+    // bare `$` in *manifest* text: anything that interpolated a second time
+    // would turn a legal secret into
+    // "`$` at byte N is not part of `${...}`" and fail the whole load.
+    let dir = fixture_dir(
+        "daemons:\n  frpc:\n    command: [/bin/frpc]\n    env:\n      PASSWORD: ${SECRET}\n",
+        Some("SECRET=abc$def\n"),
+    );
+    let manifest = dir.path().join("goetia.yaml");
+    let (specs, _warnings) = load(&manifest).expect("a literal `$` in a .env value is legal");
+    assert_eq!(specs[0].env.get("PASSWORD").map(String::as_str), Some("abc$def"));
+}
+
+#[skuld::test]
 fn resolve_substitutes_rather_than_letting_a_reference_through() {
     // `resolve` is public and takes a public `RawManifest`, so it is
     // reachable without `load`. Interpolation therefore lives inside it,
