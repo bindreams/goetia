@@ -16,7 +16,7 @@ fn load_bytes(bytes: &[u8]) -> Result<Vars, Error> {
     Vars::load(dir.path())
 }
 
-// Plain assignments ====================================================================================================
+// Plain assignments ===================================================================================================
 
 #[skuld::test]
 fn reads_plain_assignments() {
@@ -31,7 +31,7 @@ fn an_empty_value_is_the_empty_string() {
     assert_eq!(vars.get("A"), Some(""));
 }
 
-// Missing / unreadable file ============================================================================================
+// Missing / unreadable file ===========================================================================================
 
 #[skuld::test]
 fn missing_env_file_yields_no_variables() {
@@ -48,7 +48,7 @@ fn a_directory_at_the_env_path_is_an_error() {
     assert!(matches!(err, Error::Io { .. }), "expected Io, got: {err:?}");
 }
 
-// Blank lines, comments, whitespace ====================================================================================
+// Blank lines, comments, whitespace ===================================================================================
 
 #[skuld::test]
 fn skips_blank_lines_and_comments() {
@@ -81,7 +81,7 @@ fn whitespace_around_the_equals_sign_is_an_error() {
     assert!(err.to_string().contains("A=1"), "message should show `A=1`: {err}");
 }
 
-// Encoding =============================================================================================================
+// Encoding ============================================================================================================
 
 #[skuld::test]
 fn strips_a_utf8_bom_from_the_first_key() {
@@ -108,7 +108,7 @@ fn a_utf16_env_file_is_rejected_by_name() {
     assert!(msg.contains(".env"), "message should name the file: {msg}");
 }
 
-// Quoting ==============================================================================================================
+// Quoting =============================================================================================================
 
 #[skuld::test]
 fn single_quoted_values_are_literal() {
@@ -152,7 +152,7 @@ fn trailing_text_after_a_closing_quote_is_an_error() {
     assert!(matches!(err, Error::EnvFile { .. }));
 }
 
-// Unquoted values ======================================================================================================
+// Unquoted values =====================================================================================================
 
 #[skuld::test]
 fn an_unquoted_value_drops_a_trailing_comment_and_whitespace() {
@@ -174,7 +174,7 @@ fn dollar_signs_in_values_are_literal() {
     assert_eq!(vars.get("A"), Some("$$"));
 }
 
-// Malformed lines ======================================================================================================
+// Malformed lines =====================================================================================================
 
 #[skuld::test]
 fn a_line_without_an_equals_sign_is_an_error() {

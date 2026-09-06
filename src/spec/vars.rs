@@ -186,7 +186,7 @@ impl Vars {
     }
 }
 
-// BOM and decoding =====================================================================================================
+// BOM and decoding ====================================================================================================
 
 /// Strip a UTF-8 BOM, or reject a UTF-16 BOM by name. `line` 1 is used for
 /// every error here since the problem is with the file's encoding, not
@@ -211,7 +211,7 @@ fn strip_bom<'a>(bytes: &'a [u8], path: &Path) -> Result<&'a [u8]> {
     }
 }
 
-// Line parsing =========================================================================================================
+// Line parsing ========================================================================================================
 
 /// Whitespace, for every purpose in this grammar: leading trim, the
 /// `export`-prefix boundary, and the ban on whitespace around `=`. ASCII
@@ -279,7 +279,7 @@ fn is_valid_name(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-// Value parsing ========================================================================================================
+// Value parsing =======================================================================================================
 
 /// Parse the text after `=` to the end of the line.
 fn parse_value(s: &str, path: &Path, line: usize) -> Result<String> {
