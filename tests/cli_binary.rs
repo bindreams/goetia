@@ -155,3 +155,32 @@ fn warnings_are_printed_to_stderr() {
     assert!(err.contains("restart-delay"), "stderr:\n{err}");
     assert!(out.contains("frpc"), "stdout:\n{out}");
 }
+
+// --json's clap-level carve-out =======================================================================================
+
+/// The published `--json` invariant is over *subcommands*: whenever `--json`
+/// is given together with one, stdout is exactly one JSON document.
+/// `--help`/`--version` are clap-level — clap short-circuits before
+/// `dispatch` is ever called — so they keep printing their own text.
+/// Rendering them as JSON would mean pre-scanning `std::env::args()` before
+/// parsing; the carve-out is pinned here so it stays deliberate.
+#[skuld::test]
+fn json_with_version_and_help_is_carved_out() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let (version_code, version_out, version_err) = run_cli(&["--json", "--version"], dir.path());
+    assert_eq!(version_code, 0, "stdout:\n{version_out}\nstderr:\n{version_err}");
+    assert!(version_out.starts_with("goetia "), "stdout:\n{version_out}");
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&version_out).is_err(),
+        "--version must stay plain text:\n{version_out}"
+    );
+
+    let (help_code, help_out, help_err) = run_cli(&["--json", "--help"], dir.path());
+    assert_eq!(help_code, 0, "stdout:\n{help_out}\nstderr:\n{help_err}");
+    assert!(help_out.contains("Usage:"), "stdout:\n{help_out}");
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&help_out).is_err(),
+        "--help must stay plain text:\n{help_out}"
+    );
+}

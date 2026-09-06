@@ -24,6 +24,7 @@ mod elevation;
 pub mod enable;
 pub mod install;
 pub mod list;
+mod report;
 pub mod restart;
 pub mod show;
 pub mod start;
@@ -50,20 +51,23 @@ use crate::manager::ServiceManager;
     about = "Install system daemons described in goetia.yaml as native services."
 )]
 pub struct Cli {
-    /// Reserved for machine-readable JSON output (design spec §4's global
-    /// flags). Accepted and parsed, but `dispatch` does not read it yet —
-    /// every subcommand still renders text regardless. Locked in
-    /// deliberately rather than half-wired to one subcommand's output:
-    /// `cli_accepts_json_verbose_quiet_as_currently_inert` pins this so a
-    /// silent behavior change (in either direction) fails a test.
+    /// Emit one machine-readable JSON document on stdout instead of text
+    /// (design spec §4's global flags). Implemented by `daemon list` and
+    /// `daemon status`; every other subcommand refuses it with an
+    /// `unsupported` error document and exit `2`, before running anything.
+    /// `global` so both `goetia --json daemon list` and
+    /// `goetia daemon list --json` work.
     #[arg(long, global = true)]
     pub json: bool,
     /// Reserved for increased output verbosity (repeatable). Accepted and
-    /// parsed; not read by `dispatch` yet. See `json`'s doc comment.
+    /// parsed; not read by `dispatch` yet. Locked in deliberately rather
+    /// than half-wired to one subcommand's output:
+    /// `cli_accepts_verbose_and_quiet_as_currently_inert` pins this so a
+    /// silent behavior change (in either direction) fails a test.
     #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
     /// Reserved to suppress non-essential output. Accepted and parsed; not
-    /// read by `dispatch` yet. See `json`'s doc comment.
+    /// read by `dispatch` yet. See `verbose`'s doc comment.
     #[arg(short = 'q', long = "quiet", global = true)]
     pub quiet: bool,
     #[command(subcommand)]
@@ -108,9 +112,19 @@ pub enum DaemonCommand {
 // dispatch ============================================================================================================
 
 /// Dispatch a parsed [`Cli`] to its subcommand, returning the process exit
-/// code: `0` success, `1` error, `2` conflict (an installed artifact was
-/// modified outside Goetia and `--force` was not given) — see the design
-/// spec's §4.
+/// code: `0` success, `1` error, `2` either a conflict (an installed
+/// artifact was modified outside Goetia and `--force` was not given) or
+/// `--json` on a subcommand that does not implement it, `4` a partial
+/// answer (`list`/`status` could not determine the state of an id Goetia
+/// owns) — see the design spec's §4 and [`report::exit_code`], which is
+/// where `list` and `status` get theirs in *both* output modes.
+///
+/// Whenever `--json` is given together with a subcommand, stdout is exactly
+/// one JSON document: `list` and `status` render one, and every other
+/// subcommand is refused with one below, before it runs. `--help` and
+/// `--version` are a deliberate carve-out — clap short-circuits on them
+/// before `dispatch` is ever called, so the invariant is over subcommands,
+/// not over the binary.
 pub fn dispatch(
     cli: &Cli,
     get_manager: &dyn Fn() -> Result<Box<dyn ServiceManager>>,
@@ -119,6 +133,15 @@ pub fn dispatch(
     err: &mut dyn Write,
 ) -> i32 {
     let Command::Daemon(cmd) = &cli.command;
+
+    // Checked before the match, so a refused `--json` runs nothing at all —
+    // which is also why `unsupported` can never combine with another kind.
+    if cli.json && !matches!(cmd, DaemonCommand::List | DaemonCommand::Status(_)) {
+        let report = report::unsupported(subcommand_name(cmd));
+        report::write(&report, out);
+        return report::exit_code(&report);
+    }
+
     match cmd {
         DaemonCommand::Install(args) => install::run(args, get_manager, is_elevated, out, err),
         DaemonCommand::Uninstall(args) => uninstall::run(args, get_manager, is_elevated, out, err),
@@ -127,9 +150,28 @@ pub fn dispatch(
         DaemonCommand::Restart(args) => restart::run(args, get_manager, is_elevated, out, err),
         DaemonCommand::Enable(args) => enable::run(args, get_manager, is_elevated, out, err),
         DaemonCommand::Disable(args) => disable::run(args, get_manager, is_elevated, out, err),
-        DaemonCommand::Status(args) => status::run(args, get_manager, out, err),
-        DaemonCommand::List => list::run(get_manager, out, err),
+        DaemonCommand::Status(args) => status::run(args, cli.json, get_manager, out, err),
+        DaemonCommand::List => list::run(cli.json, get_manager, out, err),
         DaemonCommand::Show(args) => show::run(args, get_manager, out, err),
         DaemonCommand::Diff(args) => diff::run(args, get_manager, out, err),
+    }
+}
+
+/// How each subcommand is spelled on the command line, for the `--json`
+/// refusal's message. Derived from the enum rather than from clap so a new
+/// variant cannot silently be refused as something else.
+fn subcommand_name(cmd: &DaemonCommand) -> &'static str {
+    match cmd {
+        DaemonCommand::Install(_) => "install",
+        DaemonCommand::Uninstall(_) => "uninstall",
+        DaemonCommand::Start(_) => "start",
+        DaemonCommand::Stop(_) => "stop",
+        DaemonCommand::Restart(_) => "restart",
+        DaemonCommand::Enable(_) => "enable",
+        DaemonCommand::Disable(_) => "disable",
+        DaemonCommand::Status(_) => "status",
+        DaemonCommand::List => "list",
+        DaemonCommand::Show(_) => "show",
+        DaemonCommand::Diff(_) => "diff",
     }
 }
