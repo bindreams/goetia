@@ -28,7 +28,7 @@ use similar::{ChangeTag, TextDiff};
 
 use crate::spec::{AccountId, DaemonSpec, Kind, Restart, User};
 
-/// Renders the artifact-level diff shown on `Conflict`/exit code 2: a
+/// Renders the artifact-level diff shown on `Conflict`/exit code 5: a
 /// unified text diff between the artifact installed on disk (`was`) and
 /// the artifact Goetia would generate (`now`). Identical input renders as
 /// the empty string.

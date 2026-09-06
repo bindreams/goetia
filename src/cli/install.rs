@@ -79,8 +79,8 @@ pub fn run(
         }
     };
 
-    // Errors/refusals (exit 1) and conflicts (exit 2) are disjoint classes,
-    // not a severity ladder: 2 specifically promises "every failure here is
+    // Errors/refusals (exit 1) and conflicts (exit 5) are disjoint classes,
+    // not a severity ladder: 5 specifically promises "every failure here is
     // force-resolvable", which stops being true the moment even one daemon
     // in the same run hard-failed. So a plain `max()` across per-daemon
     // codes would let a real error hide behind a conflict; track the two
@@ -127,7 +127,7 @@ pub fn run(
     if any_error {
         1
     } else if any_conflict {
-        2
+        5
     } else {
         0
     }
@@ -145,7 +145,7 @@ enum OutcomeClass {
 /// additionally gets a concise one-line diagnostic on `err`, consistent
 /// with every other failure path in the CLI (`run_id_verb`, `list`,
 /// `status`, `diff` all put failures on stderr) — a script that only
-/// captures stderr for errors must still learn that this exit-1/2 run had
+/// captures stderr for errors must still learn that this exit-1/5 run had
 /// one.
 fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn Write) -> OutcomeClass {
     match outcome {

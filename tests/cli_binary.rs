@@ -202,3 +202,56 @@ fn json_with_a_clap_rejected_command_line_is_carved_out() {
     assert!(out.is_empty(), "stdout:\n{out}");
     assert!(err.contains("Usage:"), "clap must still explain itself: stderr:\n{err}");
 }
+
+// Exit-code vocabulary: usage vs. conflict ============================================================================
+//
+// Task 8 moved goetia's own conflict code off `2` onto `5` precisely so a
+// wrapper script that typos a flag or a subcommand cannot mistake clap's
+// usage-error code for goetia's conflict code and re-run `install --force`.
+// These tests pin both halves of that: `2` stays clap's, unclaimed by
+// anything else, and `5` never shows up on a malformed command line.
+
+/// `goetia daemon bogus` (an unknown subcommand) and an unknown global flag
+/// both go through clap's own rejection path and exit `2` — clap's default,
+/// deliberately left un-overridden by `main.rs`. Pinned so this stays a
+/// choice, not an accident nobody checked.
+#[skuld::test]
+fn a_usage_error_exits_two() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let (bogus_code, bogus_out, bogus_err) = run_cli(&["daemon", "bogus"], dir.path());
+    assert_eq!(bogus_code, 2, "stdout:\n{bogus_out}\nstderr:\n{bogus_err}");
+
+    let (flag_code, flag_out, flag_err) = run_cli(&["--nosuchflag"], dir.path());
+    assert_eq!(flag_code, 2, "stdout:\n{flag_out}\nstderr:\n{flag_err}");
+}
+
+/// The collision this task exists to remove: neither malformed invocation
+/// above may ever produce `5`, goetia's own conflict code, even though a
+/// wrapper script could otherwise mistake one for the other.
+#[skuld::test]
+fn no_subcommand_returns_the_conflict_code_for_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let (bogus_code, bogus_out, bogus_err) = run_cli(&["daemon", "bogus"], dir.path());
+    assert_ne!(bogus_code, 5, "stdout:\n{bogus_out}\nstderr:\n{bogus_err}");
+
+    let (flag_code, flag_out, flag_err) = run_cli(&["--nosuchflag"], dir.path());
+    assert_ne!(flag_code, 5, "stdout:\n{flag_out}\nstderr:\n{flag_err}");
+}
+
+/// `--help`/`--version` (without `--json`, unlike
+/// `json_with_version_and_help_is_carved_out`) still exit `0` with their
+/// own text on stdout, unaffected by the conflict code's move.
+#[skuld::test]
+fn help_and_version_still_exit_zero_on_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let (version_code, version_out, version_err) = run_cli(&["--version"], dir.path());
+    assert_eq!(version_code, 0, "stdout:\n{version_out}\nstderr:\n{version_err}");
+    assert!(version_out.starts_with("goetia "), "stdout:\n{version_out}");
+
+    let (help_code, help_out, help_err) = run_cli(&["--help"], dir.path());
+    assert_eq!(help_code, 0, "stdout:\n{help_out}\nstderr:\n{help_err}");
+    assert!(help_out.contains("Usage:"), "stdout:\n{help_out}");
+}

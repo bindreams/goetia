@@ -113,12 +113,42 @@ pub enum DaemonCommand {
 // dispatch ============================================================================================================
 
 /// Dispatch a parsed [`Cli`] to its subcommand, returning the process exit
-/// code: `0` success, `1` error, `2` either a conflict (an installed
-/// artifact was modified outside Goetia and `--force` was not given) or
-/// `--json` on a subcommand that does not implement it, `4` a partial
-/// answer (`list`/`status` could not determine the state of an id Goetia
-/// owns) — see the design spec's §4 and [`report::exit_code`], which is
-/// where `list` and `status` get theirs in *both* output modes.
+/// code. This doc comment is the one place the whole exit-code vocabulary
+/// is written down; nothing else in the crate should re-derive it.
+///
+/// - `0` success.
+/// - `1` error: an operation was attempted and failed, or was refused
+///   outright.
+/// - `2` usage: clap rejected the command line before `dispatch` ever ran,
+///   or (`--json` on a subcommand that does not implement it) `dispatch`
+///   refused to run anything. Anchored to clap's own default for a
+///   rejected command line — the same code bash and argparse both use for
+///   "the parser, not the program, rejected this" — so `main.rs`
+///   deliberately keeps calling `Cli::parse()` un-overridden and lets clap
+///   return `2` on its own; the absence of an override *is* the decision.
+/// - `3` drift: reserved for a determinate "installed state differs from
+///   the manifest" answer. Nothing produces it yet.
+/// - `4` indeterminate: `list`/`status` could not determine the state of
+///   an id Goetia owns — see the design spec's §4 and [`report::exit_code`],
+///   which is where `list` and `status` get theirs in *both* output modes.
+///   Anchored to the LSB init-script convention's "service status unknown",
+///   the one other exit-code vocabulary this one deliberately agrees with.
+/// - `5` conflict: an installed artifact was modified outside Goetia and
+///   `--force` was not given (`cli::install::run`'s `any_conflict` check —
+///   the only place this code is returned). App-specific, anchored to
+///   nothing, which is why it is the one that moved: `2` is anchored to
+///   three conventions at once (clap, bash, argparse), so moving *usage*
+///   errors off it instead would have stayed internally consistent while
+///   giving up all three to preserve one number nothing outside Goetia
+///   agrees on.
+///
+/// `list` and `status` compute their code as the precedence-max over every
+/// error kind their `Report` collected: `1 > 4 > 5 > 3 > 0`. That is a rule
+/// about which outcome wins when more than one applies at once, not an
+/// ordering of the integers — `5` outranks `3` despite being the larger
+/// number. `2` never enters that ladder: the one thing that produces it
+/// there (`--json` on a subcommand that does not implement it) always
+/// happens alone, before any other kind could exist in the same report.
 ///
 /// Whenever `--json` is given together with a subcommand **that clap
 /// accepted**, stdout is exactly one JSON document: `list` and `status`

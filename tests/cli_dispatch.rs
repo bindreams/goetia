@@ -260,7 +260,7 @@ fn install_unknown_named_id_installs_nothing() {
 }
 
 #[skuld::test]
-fn conflict_exits_two() {
+fn conflict_exits_five() {
     let fake = Fake::new();
     fake.install_then_hand_edit(&mk("frpc"), "# hand-added directive\n");
 
@@ -272,7 +272,7 @@ fn conflict_exits_two() {
         &fake,
     );
 
-    assert_eq!(code, 2, "stdout:\n{out}");
+    assert_eq!(code, 5, "stdout:\n{out}");
     assert!(out.contains("conflict"), "{out}");
 }
 
@@ -558,7 +558,7 @@ fn cli_refuses_a_foreign_id_for_every_verb() {
     assert_eq!(status_code, 1, "{status_err}");
 }
 
-/// Exit code 2 must mean "every failure here is force-resolvable". A batch
+/// Exit code 5 must mean "every failure here is force-resolvable". A batch
 /// mixing a conflict (force-resolvable) with a foreign refusal (not) must
 /// not let the refusal hide behind the conflict's higher numeric code.
 #[skuld::test]
