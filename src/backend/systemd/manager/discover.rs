@@ -28,7 +28,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::backend::systemd::generate;
-use crate::decide::Ownership;
+use crate::decide::{Overlay, Ownership};
 use crate::error::{Error, Result};
 
 use super::{UNIT_DIR, identity_for, io_err, unit_path};
@@ -178,10 +178,10 @@ pub(super) struct Discovery {
     /// here: an inode number can be reused by the kernel moments after its file is unlinked, so two
     /// genuinely different files can share one.
     pub(super) fragment_text: Option<String>,
-    /// Whether any of systemd's drop-in search directories currently hold a `*.conf` drop-in for
-    /// this id — obligation 3. `decide` cannot see this: its vocabulary is artifact *text*, and this
-    /// is filesystem structure alongside it.
-    pub(super) dropin_present: bool,
+    /// What systemd's drop-in search directories currently hold for this id — obligation 3.
+    /// `decide` cannot see this: its vocabulary is artifact *text*, and this is filesystem structure
+    /// alongside it.
+    pub(super) overlay: Overlay,
 }
 
 pub(super) fn discover(id: &str) -> Result<Discovery> {
@@ -191,7 +191,7 @@ pub(super) fn discover(id: &str) -> Result<Discovery> {
                 ownership: Ownership::Absent,
                 on_disk: None,
                 fragment_text: None,
-                dropin_present: false,
+                overlay: Overlay::default(),
             }),
             // A drop-in directory or an enablement link with no fragment at all: never silently
             // adopt it as `Create`, or the resulting unit inherits overrides and boot-enrollment
@@ -201,14 +201,14 @@ pub(super) fn discover(id: &str) -> Result<Discovery> {
                 ownership: Ownership::Foreign,
                 on_disk: Some(residue.text()),
                 fragment_text: None,
-                dropin_present: !residue.dropin.is_empty(),
+                overlay: dropin_overlay(id, &residue.dropin),
             }),
         },
         RawState::NonRegular => Ok(Discovery {
             ownership: Ownership::Foreign,
             on_disk: Some(String::new()),
             fragment_text: None,
-            dropin_present: false,
+            overlay: Overlay::default(),
         }),
         RawState::Regular(text) => {
             // Ownership comes from the fragment alone, and is settled before any drop-in is
@@ -233,17 +233,14 @@ pub(super) fn discover(id: &str) -> Result<Discovery> {
             // `Conflict` whenever `decide` reaches a text comparison at all — the one branch that
             // doesn't (a stale version, checked before any text comparison) is `decide::decide`'s own
             // `foreign_overlay` parameter's job.
-            match dropin_marker(id) {
-                Ok(dropin) => {
-                    let on_disk = match &dropin {
-                        Some(marker) => format!("{text}{marker}"),
-                        None => text.clone(),
-                    };
+            match dropin_dirs(id) {
+                Ok(dirs) => {
+                    let marker: String = dirs.iter().map(|(_, text)| text.as_str()).collect();
                     Ok(Discovery {
                         ownership,
-                        on_disk: Some(on_disk),
+                        on_disk: Some(format!("{text}{marker}")),
+                        overlay: dropin_overlay(id, &dirs),
                         fragment_text: Some(text),
-                        dropin_present: dropin.is_some(),
                     })
                 }
                 // Installation is established (the fragment is open and read) and so is ownership
@@ -267,9 +264,9 @@ pub(super) fn discover(id: &str) -> Result<Discovery> {
                     },
                     on_disk: Some(text.clone()),
                     fragment_text: Some(text),
-                    // Unknown, and unread: `decide` consults `foreign_overlay` only on the `Ours`
-                    // path, which neither arm above can reach.
-                    dropin_present: false,
+                    // Unknown, and unread: `decide` consults the overlay only on the `Ours` path,
+                    // which neither arm above can reach.
+                    overlay: Overlay::default(),
                 }),
             }
         }
@@ -343,24 +340,50 @@ const DROPIN_SEARCH_DIRS: [&str; 12] = [
     "/run/systemd/generator.late",
 ];
 
-// dropin_marker =======================================================================================================
+// Drop-in scan ========================================================================================================
 
-/// A deterministic representation of `<id>.service.d`'s `*.conf` files across every root in
-/// [`DROPIN_SEARCH_DIRS`], or `None` if none of them exist or hold any. Only that directory: see the
-/// module doc comment for the family-wide ones systemd also reads and this deliberately does not.
-pub(super) fn dropin_marker(id: &str) -> ReadResult<Option<String>> {
-    let dirs = dropin_dirs(id)?;
-    if dirs.is_empty() {
-        return Ok(None);
+/// What a set of drop-in directories amounts to for [`crate::decide::decide`].
+///
+/// Goetia writes exactly one of them — `UNIT_DIR/<id>.service.d`, which every successful
+/// `Update`/`Stale` write clears (see `Systemd::install`) — so a drop-in under any other search root
+/// survives a `--force` overwrite untouched, and the run after it reports the identical conflict.
+/// Naming those directories here, where the scan already has them, is what keeps the CLI from
+/// re-reading the filesystem to find out whether its own published remedy applies.
+fn dropin_overlay(id: &str, dirs: &[(PathBuf, String)]) -> Overlay {
+    let ours = Path::new(UNIT_DIR).join(format!("{id}.service.d"));
+    let unclearable: Vec<&Path> = dirs
+        .iter()
+        .map(|(dir, _)| dir.as_path())
+        .filter(|dir| *dir != ours)
+        .collect();
+    Overlay {
+        present: !dirs.is_empty(),
+        unclearable_recovery: (!unclearable.is_empty()).then(|| dropin_recovery(&unclearable)),
     }
-    Ok(Some(dirs.iter().map(|(_, text)| text.as_str()).collect()))
 }
 
-/// The same scan [`dropin_marker`] concatenates, kept per-directory so a caller that has to *name*
-/// the drop-ins for a human ([`residue`]) and one that has to *compare their content*
-/// ([`dropin_marker`]) cannot drift on which files count as drop-ins. One scan for both: what is
-/// this id's artifact and what occupies this id are the same set of directories, which is what keeps
-/// `install` and `uninstall` from describing one filesystem state differently.
+/// How to resolve a conflict `--force` cannot. Deliberately parallel to [`residue_recovery`], which
+/// says the same thing about the same directories on the path where the fragment is already gone.
+fn dropin_recovery(unclearable: &[&Path]) -> String {
+    let paths = unclearable
+        .iter()
+        .map(|p| format!("\n  {}", p.display()))
+        .collect::<String>();
+    format!(
+        "systemd applies configuration goetia did not write, from outside `{UNIT_DIR}`:{paths}\n\
+         `--force` rewrites `{UNIT_DIR}/<id>.service` and clears only `{UNIT_DIR}`'s own drop-in, so \
+         it cannot resolve this — remove the directories above by hand, run `systemctl \
+         daemon-reload`, and re-run."
+    )
+}
+
+/// `<id>.service.d`'s `*.conf` files under every root in [`DROPIN_SEARCH_DIRS`], per directory so a
+/// caller that has to *name* them for a human ([`residue`], [`dropin_recovery`]) and one that has to
+/// *compare their content* ([`discover`]) cannot drift on which files count as drop-ins. One scan
+/// for all of them: what is this id's artifact and what occupies this id are the same set of
+/// directories, which is what keeps `install` and `uninstall` from describing one filesystem state
+/// differently. Only that directory name: see the module doc comment for the family-wide ones
+/// systemd also reads and this deliberately does not.
 fn dropin_dirs(id: &str) -> ReadResult<Vec<(PathBuf, String)>> {
     let mut found = Vec::new();
     for search_dir in DROPIN_SEARCH_DIRS {

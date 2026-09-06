@@ -164,10 +164,23 @@ fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn
             let _ = writeln!(out, "{id}: regenerated (was built by goetia {from_version})");
             OutcomeClass::Ok
         }
-        Outcome::Conflict { artifact_diff } => {
-            let _ = writeln!(out, "{id}: conflict (re-run with --force to overwrite)");
+        Outcome::Conflict {
+            artifact_diff,
+            unclearable_recovery,
+        } => {
+            // `--force` is published as the way out of a conflict, so it is
+            // offered only where it is one. When part of the cause is
+            // outside the directory this backend writes, forcing rewrites
+            // the artifact, leaves that part in place, and the next run
+            // reports the identical conflict — `decide` says which case this
+            // is (see `Outcome::Conflict`), and nothing here re-derives it.
+            let line = match unclearable_recovery {
+                None => format!("{id}: conflict (re-run with --force to overwrite)"),
+                Some(recovery) => format!("{id}: conflict. {recovery}"),
+            };
+            let _ = writeln!(out, "{line}");
             let _ = write!(out, "{artifact_diff}");
-            let _ = writeln!(err, "error: {id}: conflict (re-run with --force to overwrite)");
+            let _ = writeln!(err, "error: {line}");
             OutcomeClass::Conflict
         }
         Outcome::RefuseForeign { recovery } => {

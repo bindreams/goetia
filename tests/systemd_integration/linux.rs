@@ -266,8 +266,15 @@ fn hand_edit_is_detected_as_conflict() {
 
     let outcome = mgr.install(&spec, false).expect("install over a hand edit");
     match outcome {
-        Outcome::Conflict { artifact_diff } => {
+        Outcome::Conflict {
+            artifact_diff,
+            unclearable_recovery,
+        } => {
             assert!(artifact_diff.contains("MemoryMax=8G"), "{artifact_diff}");
+            // The whole cause is the fragment goetia itself writes, so `--force` — which the CLI
+            // offers for exactly this `None` — really does resolve it, as the forced install below
+            // then demonstrates.
+            assert_eq!(unclearable_recovery, None);
         }
         other => panic!("expected Conflict, got {other:?}"),
     }
@@ -661,11 +668,27 @@ fn a_control_dropin_is_drift() {
     let (dir, _cleanup) = seed_control_dropin("/etc/systemd/system.control", guard.id());
 
     let outcome = mgr.preview_install(&mk(guard.id())).expect("preview");
+    let Outcome::Conflict {
+        unclearable_recovery, ..
+    } = &outcome
+    else {
+        panic!(
+            "systemd applies {} to this unit, so it is not up to date, got {outcome:?}",
+            dir.display()
+        );
+    };
+
+    // And `--force` cannot resolve it: goetia clears only its own `/etc/systemd/system` drop-in, so
+    // forcing would rewrite the fragment, leave this directory, and report the identical conflict
+    // next run. The message has to say so and name the directory.
+    let recovery = unclearable_recovery
+        .as_deref()
+        .unwrap_or_else(|| panic!("`--force` is not the remedy here, got {outcome:?}"));
     assert!(
-        matches!(outcome, Outcome::Conflict { .. }),
-        "systemd applies {} to this unit, so it is not up to date, got {outcome:?}",
-        dir.display()
+        recovery.contains(&dir.display().to_string()),
+        "the operator needs the path to remove: {recovery}"
     );
+    assert!(recovery.contains("daemon-reload"), "{recovery}");
 }
 
 /// The occupancy half of the same omission: with the fragment gone, `residue` found nothing under
@@ -727,12 +750,19 @@ fn a_dash_truncated_dropin_is_not_this_ids_conflict() {
         dir.display()
     );
 
-    // And the same id's *own* drop-in still is drift, so this is a boundary, not a hole.
+    // And the same id's *own* drop-in still is drift, so this is a boundary, not a hole — and one
+    // `--force` does resolve, since `/etc/systemd/system/<id>.service.d` is goetia's to clear.
     let _own = seed_dropin(&dropin_dir(guard.id()));
     let outcome = mgr.preview_install(&mk(guard.id())).expect("preview");
     assert!(
-        matches!(outcome, Outcome::Conflict { .. }),
-        "`<id>.service.d` is this id's artifact, got {outcome:?}"
+        matches!(
+            outcome,
+            Outcome::Conflict {
+                unclearable_recovery: None,
+                ..
+            }
+        ),
+        "`<id>.service.d` is this id's artifact, and goetia's own to clear, got {outcome:?}"
     );
 }
 

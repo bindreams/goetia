@@ -294,14 +294,14 @@ Two rules come before the numbers:
    `grep` has distinguished "no match" from "could not read the file" since
    v7 Unix.
 
-| Code | Name          | Meaning                                                                                      | Anchored to                                                                                               |
-| ---- | ------------- | -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `0`  | success       | The state is as asked, or the question was fully answered.                                   | —                                                                                                         |
-| `1`  | error         | An operation was attempted and failed, or was refused outright.                              | —                                                                                                         |
-| `2`  | usage         | The command line was rejected before anything ran — by clap, or by the `--json` refusal.     | clap's own default: the same code bash and argparse use for "the parser, not the program, rejected this". |
-| `3`  | drift         | A determinate "installed state differs from the manifest" answer. Only `diff` returns it.    | Nothing; app-specific.                                                                                    |
-| `4`  | indeterminate | A question goetia could not answer about an id: its state, or whether it is occupied at all. | The LSB init-script convention's "service status unknown".                                                |
-| `5`  | conflict      | An installed artifact was modified outside goetia and `--force` was not given.               | Nothing; app-specific — which is why `5` is the code that moved rather than usage errors.                 |
+| Code | Name          | Meaning                                                                                                                       | Anchored to                                                                                               |
+| ---- | ------------- | ----------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `0`  | success       | The state is as asked, or the question was fully answered.                                                                    | —                                                                                                         |
+| `1`  | error         | An operation was attempted and failed, or was refused outright.                                                               | —                                                                                                         |
+| `2`  | usage         | The command line was rejected before anything ran — by clap, or by the `--json` refusal.                                      | clap's own default: the same code bash and argparse use for "the parser, not the program, rejected this". |
+| `3`  | drift         | A determinate "installed state differs from the manifest" answer. Only `diff` returns it.                                     | Nothing; app-specific.                                                                                    |
+| `4`  | indeterminate | A question goetia could not answer about an id: its state, or whether it is occupied at all.                                  | The LSB init-script convention's "service status unknown".                                                |
+| `5`  | conflict      | An installed artifact was modified outside goetia and `--force` was not given. See below: `--force` is not always the remedy. | Nothing; app-specific — which is why `5` is the code that moved rather than usage errors.                 |
 
 `2` and `4` are the two that must not be renumbered for tidiness: both are
 tied to a convention outside goetia.
@@ -324,6 +324,17 @@ happens alone, before anything else could occur in the same run.
 conflict re-runs with `--force`, and forcing on an incomplete picture is
 worse than being told to re-run elevated. **Branch on `4` before you branch
 on `5`.**
+
+**`--force` is offered only where `--force` resolves it.** Goetia rewrites
+`<id>.service` and clears its own `/etc/systemd/system/<id>.service.d`, and
+nothing else — so a drop-in under another search root (`/usr/lib`,
+`/etc/systemd/system.control`, where `systemctl set-property` writes) survives
+the overwrite, and the run after it reports the identical conflict. Both
+`install` and `diff` say which case a conflict is: either "re-run with
+`--force` to overwrite", or the paths to remove by hand followed by
+`systemctl daemon-reload`. The exit code is `5` for both — it is a conflict
+either way, and only the remedy differs — so a script that branches on `5`
+alone and forces unconditionally can loop. Read the message.
 
 ### What a consumer can rely on
 

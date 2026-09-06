@@ -196,6 +196,12 @@ struct FlakyManager {
     unqueryable: Option<String>,
     fail_preview_for: Option<String>,
     hidden_from_list: Option<String>,
+    /// Makes `install`/`preview_install` return the `Conflict` flavour whose
+    /// cause lies outside the directory the backend writes — systemd's
+    /// `<id>.service.d` under `/usr/lib` or `.control`. `Fake` has no
+    /// overlay of its own (see its `decide` call site), so this is the only
+    /// way to reach the branch where `--force` is not the remedy.
+    unclearable_conflict: Option<String>,
 }
 
 /// The failure [`FlakyManager`] injects for `fail_list`/`unqueryable`: the
@@ -214,13 +220,27 @@ fn injected_failure(id: &Id) -> goetia::Error {
     }
 }
 
+/// The `Conflict` [`FlakyManager::unclearable_conflict`] injects.
+fn unclearable_conflict(recovery: &str) -> goetia::decide::Outcome {
+    goetia::decide::Outcome::Conflict {
+        artifact_diff: "- desired\n+ on disk\n".to_string(),
+        unclearable_recovery: Some(recovery.to_string()),
+    }
+}
+
 impl ServiceManager for FlakyManager {
     fn install(&self, spec: &DaemonSpec, force: bool) -> goetia::Result<goetia::decide::Outcome> {
+        if let Some(recovery) = &self.unclearable_conflict {
+            return Ok(unclearable_conflict(recovery));
+        }
         self.inner.install(spec, force)
     }
     fn preview_install(&self, spec: &DaemonSpec) -> goetia::Result<goetia::decide::Outcome> {
         if self.fail_preview_for.as_deref() == Some(spec.id.as_str()) {
             return Err(injected_failure(&spec.id));
+        }
+        if let Some(recovery) = &self.unclearable_conflict {
+            return Ok(unclearable_conflict(recovery));
         }
         self.inner.preview_install(spec)
     }
@@ -347,6 +367,71 @@ fn install_unknown_named_id_installs_nothing() {
     assert_eq!(code, 1);
     assert!(err.contains("nonexistent"), "{err}");
     assert!(installed_ids(&fake).is_empty(), "a bad selection must install nothing");
+}
+
+/// The remedy `--force` is published as has to be one that works. When part of what makes the
+/// artifact differ is outside the directory the backend writes, forcing rewrites the artifact,
+/// leaves that part in place, and the next run reports the identical conflict — so the message must
+/// name what to remove instead of sending the operator back around that loop. Exit `5` either way:
+/// it is a conflict in both, and the distinction is the remedy, not the code.
+#[skuld::test]
+fn install_offers_force_only_for_a_conflict_force_can_resolve() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let args = ["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()];
+
+    let fake = Fake::new();
+    fake.install_then_hand_edit(&mk("frpc"), "# hand-added directive\n");
+    let (code, out, err) = dispatch_with(&args, &fake, &|| true);
+    assert_eq!(code, 5, "stdout:\n{out}");
+    assert!(out.contains("conflict (re-run with --force to overwrite)"), "{out}");
+    assert!(err.contains("conflict (re-run with --force to overwrite)"), "{err}");
+
+    let recovery = "remove /usr/lib/systemd/system/frpc.service.d by hand and re-run";
+    let mgr = FlakyManager {
+        unclearable_conflict: Some(recovery.to_string()),
+        ..Default::default()
+    };
+    let (code, out, err) = dispatch_with(&args, &mgr, &|| true);
+    assert_eq!(
+        code, 5,
+        "still a conflict, and still force-resolvable-looking to a script:\n{out}"
+    );
+    assert!(out.contains(recovery), "{out}");
+    assert!(err.contains(recovery), "{err}");
+    assert!(
+        !out.contains("re-run with --force to overwrite"),
+        "`--force` rewrites the artifact and leaves the cause, so offering it wedges the operator:\n{out}"
+    );
+}
+
+/// `diff` renders the same two flavours in the subjunctive, and must not offer what `install` will
+/// not honour.
+#[skuld::test]
+fn diff_offers_force_only_for_a_conflict_force_can_resolve() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let args = ["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()];
+
+    let fake = Fake::new();
+    fake.install_then_hand_edit(&mk("frpc"), "# hand-added directive\n");
+    let (code, out, _err) = dispatch_read_only(&args, &fake);
+    assert_eq!(code, 5, "stdout:\n{out}");
+    assert!(out.contains("`install --force` would overwrite it"), "{out}");
+
+    let recovery = "remove /etc/systemd/system.control/frpc.service.d by hand and re-run";
+    let mgr = FlakyManager {
+        unclearable_conflict: Some(recovery.to_string()),
+        ..Default::default()
+    };
+    let (code, out, err) = dispatch_with(&args, &mgr, &never_elevated);
+    assert_eq!(code, 5, "stdout:\n{out}");
+    assert!(out.contains(recovery), "{out}");
+    assert!(err.contains(recovery), "{err}");
+    assert!(
+        !out.contains("would overwrite it"),
+        "diff must not promise an overwrite that resolves nothing:\n{out}"
+    );
 }
 
 #[skuld::test]

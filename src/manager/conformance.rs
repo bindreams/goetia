@@ -253,7 +253,7 @@ fn conflict_requires_force(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> Daemon
         .install(&spec, false)
         .expect("install over a hand-edited artifact must not error");
     match outcome {
-        crate::decide::Outcome::Conflict { artifact_diff } => {
+        crate::decide::Outcome::Conflict { artifact_diff, .. } => {
             assert!(!artifact_diff.is_empty(), "conflict must carry a non-empty diff");
         }
         other => panic!("expected Conflict without force, got {other:?}"),

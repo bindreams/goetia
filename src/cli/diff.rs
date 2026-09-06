@@ -91,11 +91,19 @@ pub fn run(
                 );
                 codes.push(3);
             }
-            Ok(Outcome::Conflict { artifact_diff }) => {
-                let line = format!(
-                    "{}: would conflict (hand-edited outside goetia; `install --force` would overwrite it)",
-                    spec.id
-                );
+            // The same two flavours `install` renders, in the subjunctive:
+            // `--force` is named only where it would actually resolve this.
+            Ok(Outcome::Conflict {
+                artifact_diff,
+                unclearable_recovery,
+            }) => {
+                let line = match &unclearable_recovery {
+                    None => format!(
+                        "{}: would conflict (hand-edited outside goetia; `install --force` would overwrite it)",
+                        spec.id
+                    ),
+                    Some(recovery) => format!("{}: would conflict. {recovery}", spec.id),
+                };
                 let _ = writeln!(out, "{line}");
                 let _ = write!(out, "{artifact_diff}");
                 let _ = writeln!(err, "error: {line}");

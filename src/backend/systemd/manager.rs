@@ -22,7 +22,7 @@
 //! 3. **Drop-ins are drift.** `systemctl edit` — the officially recommended way to add exactly the
 //!    `MemoryMax=`/`After=` the design cites — writes `<id>.service.d/override.conf` and leaves the
 //!    fragment itself byte-identical, so drift detection over the fragment alone misses it entirely.
-//!    [`discover::dropin_marker`] folds `<id>.service.d`'s `*.conf` contents — across every root of
+//!    [`discover::dropin_dirs`] folds `<id>.service.d`'s `*.conf` contents — across every root of
 //!    systemd's system unit search path, `/etc/systemd/system.control` included — into the text
 //!    handed to `decide` (never into what is actually written); `decide::decide`'s own
 //!    `foreign_overlay` parameter — never a backend-local override of its `Outcome` — closes the one
@@ -108,7 +108,7 @@ impl ServiceManager for Systemd {
                 spec,
                 crate::version(),
                 force,
-                d.dropin_present,
+                &d.overlay,
             );
 
             match &outcome {
@@ -161,7 +161,7 @@ impl ServiceManager for Systemd {
             spec,
             crate::version(),
             false,
-            d.dropin_present,
+            &d.overlay,
         ))
     }
 
