@@ -266,6 +266,12 @@ The exit code is **zero exactly when `errors` is empty**, and otherwise the
 precedence-max of the codes in the table above (see
 [Exit codes](#exit-codes) for the precedence rule).
 
+The one thing that overrides that: if stdout refuses the write — a broken
+pipe (`goetia --json daemon list | head -1`), a full disk — the document was
+not delivered, so the exit code is `1` and the reason goes to stderr,
+whatever the report's own code would have been. Exit `0` never accompanies an
+empty or truncated stdout, which is what makes "parse stdout first" safe.
+
 Note `invalid-id` is `1`, not `2`. `2` means the parser rejected the command
 line and nothing ran, but `goetia daemon status good bad` queries and prints
 `good` before rejecting `bad` — claiming `2` for a partially executed run
@@ -334,6 +340,14 @@ skips the conflicting daemon.
 
 **Id verbs.** `uninstall` alone treats an already-absent artifact as
 success; the other five keep it as a plain failure.
+
+"Absent" means the **id** is empty, not that one file is missing. A systemd
+unit whose fragment is gone but which still has a `<id>.service.d/*.conf`
+drop-in, or a `multi-user.target.wants/<id>.service` link keeping it enrolled
+at boot, is not absent: `uninstall` reports it as foreign and exits `1`,
+naming what is left, exactly as `install` refuses the same state. Goetia
+removes neither — a drop-in is as plausibly an administrator's override of a
+unit shipped in `/usr/lib` as it is goetia's own leftover.
 
 | Verb                         | Absent artifact | Why                                                                                                                            |
 | ---------------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------ |

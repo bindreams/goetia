@@ -175,3 +175,63 @@ fn uninstall_accepts_an_unreadable_entry() {
     fake.uninstall(&id)
         .expect("uninstall must accept a marked-but-undecodable entry");
 }
+
+// Residual artifacts ==================================================================================================
+
+/// The class `seed_residual_artifact` exists for: an id whose primary artifact is gone but which
+/// the platform still acts on. `NotInstalled` is the one error `cli::uninstall` renders as success,
+/// so it must be reserved for an id that is genuinely empty.
+#[skuld::test]
+fn absence_over_a_residual_artifact_is_not_not_installed() {
+    let fake = Fake::new();
+    fake.seed_residual_artifact("leftover");
+    let id = Id::try_from("leftover").unwrap();
+
+    for (verb, result) in [
+        ("uninstall", fake.uninstall(&id)),
+        ("enable", fake.enable(&id)),
+        ("disable", fake.disable(&id)),
+        ("start", fake.start(&id)),
+        ("stop", fake.stop(&id)),
+        ("status", fake.status(&id).map(drop)),
+    ] {
+        match result {
+            Err(Error::Foreign { .. }) => {}
+            other => panic!("{verb} on a residual artifact must be Foreign, got {other:?}"),
+        }
+    }
+}
+
+/// The contradiction the class is really about: `uninstall` reporting the id empty while `install`
+/// on that same id refuses it as foreign. Both verbs must describe one state the same way.
+#[skuld::test]
+fn install_and_uninstall_agree_about_a_residual_artifact() {
+    let fake = Fake::new();
+    let spec = mk("leftover");
+    fake.seed_residual_artifact(spec.id.as_str());
+
+    let outcome = fake
+        .install(&spec, false)
+        .expect("install classifies rather than errors");
+    assert!(matches!(outcome, Outcome::RefuseForeign { .. }), "{outcome:?}");
+    assert!(
+        matches!(fake.uninstall(&spec.id), Err(Error::Foreign { .. })),
+        "uninstall must not call the id empty when install calls it foreign"
+    );
+
+    // Not even under `--force`: adopting what goetia did not write is what `RefuseForeign` refuses.
+    let forced = fake
+        .install(&spec, true)
+        .expect("forced install classifies rather than errors");
+    assert!(matches!(forced, Outcome::RefuseForeign { .. }), "{forced:?}");
+}
+
+/// Residue is not a daemon, so `list` reports nothing for it — matching systemd's `list`, which
+/// skips a `<id>.service.d` directory because it is not a fragment.
+#[skuld::test]
+fn list_omits_an_id_that_has_only_a_residual_artifact() {
+    let fake = Fake::new();
+    fake.seed_residual_artifact("leftover");
+
+    assert!(fake.list().unwrap().is_empty());
+}

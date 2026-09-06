@@ -55,6 +55,17 @@ pub enum Error {
     /// mutating or querying verb (`uninstall`/`start`/`stop`/`enable`/
     /// `disable`/`status`/`show`) that needs one to already exist.
     ///
+    /// The strong reading, and the only correct one: **nothing
+    /// goetia-attributable is at this id**, not merely that the backend's
+    /// primary artifact file is missing. `cli::uninstall` maps this variant
+    /// — and only this variant — to exit `0` and "nothing to do", so a
+    /// backend that reports it while the platform still applies a leftover
+    /// (systemd's fragmentless `<id>.service.d` drop-in, or its
+    /// `multi-user.target.wants` enablement link) certifies "confirmed
+    /// gone" for a service still loaded, still running and still enrolled at
+    /// boot — and contradicts its own `install`, which refuses that same
+    /// state as [`Foreign`](Error::Foreign).
+    ///
     /// [`ServiceManager`]: crate::manager::ServiceManager
     #[error("daemon `{id}` is not installed")]
     NotInstalled { id: String },

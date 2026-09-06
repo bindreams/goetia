@@ -124,6 +124,35 @@ impl Drop for RmDirAll {
     }
 }
 
+/// RAII removal of a single path, symlink included — `remove_file` unlinks a symlink rather than
+/// following it, which is what the dangling `.wants` link the residue tests plant needs.
+struct RmPath(PathBuf);
+
+impl Drop for RmPath {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Drive `daemon uninstall` through the CLI rather than calling `Systemd::uninstall` directly: the
+/// thing under test is the exit code a shell sees, and `IdVerbCall::absent_is_success` turns
+/// `Error::NotInstalled` — and only that variant — into `0` and "nothing to do" on the way there.
+fn uninstall_via_cli(id: &str) -> (i32, String, String) {
+    let args = goetia::cli::uninstall::Args {
+        ids: vec![id.to_string()],
+    };
+    let get_manager = || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(Systemd::new())) };
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    // Truthful, not a stub: `support::elevated` is this test's own precondition.
+    let code = goetia::cli::uninstall::run(&args, &get_manager, &|| true, &mut out, &mut err);
+    (
+        code,
+        String::from_utf8(out).expect("stdout is UTF-8"),
+        String::from_utf8(err).expect("stderr is UTF-8"),
+    )
+}
+
 // Step 1: conformance =================================================================================================
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -294,6 +323,86 @@ fn uninstall_leaves_nothing() {
     assert!(
         fs::symlink_metadata(wants_symlink(&id)).is_err(),
         "the `.wants` symlink must be gone"
+    );
+}
+
+// Residual artifacts: absence is about the id, not about the fragment file — obligation 7 =============================
+
+/// The state `uninstall`'s own partial-failure path leaves behind when removing the drop-in
+/// directory fails after the fragment is already gone: the retry it tells you to run must not then
+/// exit `0` and print "nothing to do". `install` on this exact state is
+/// `install_refuses_a_stray_dropin_with_no_fragment`'s `RefuseForeign`, and two verbs must not
+/// describe one filesystem state differently.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn uninstall_refuses_an_id_whose_fragment_is_gone_but_whose_dropin_remains() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id); // removes the drop-in directory
+    write_dropin(guard.id()); // no fragment ever written
+    assert!(!unit_path(guard.id()).exists(), "the fragment is what this state lacks");
+
+    let (code, out, err) = uninstall_via_cli(guard.id());
+
+    assert_ne!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(!out.contains("not installed (nothing to do)"), "{out}");
+    assert!(
+        dropin_dir(guard.id()).exists(),
+        "and the drop-in survives: goetia cannot tell its own leftover from an administrator's \
+         override of a unit shipped in /usr/lib, so it removes neither"
+    );
+}
+
+/// The same for the other artifact that outlives the fragment. `systemctl disable` is impossible
+/// once the `[Install]` section is gone (obligation 6), so this link keeps the id enrolled at boot
+/// — the very reason the exit-code table gives for `disable` returning `1` here.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn uninstall_refuses_an_id_whose_fragment_is_gone_but_whose_enablement_link_remains() {
+    let id = support::random_test_id();
+    let link = wants_symlink(&id);
+    fs::create_dir_all(link.parent().expect("the link has a parent")).expect("mkdir *.target.wants");
+    std::os::unix::fs::symlink(unit_path(&id), &link).expect("plant a dangling .wants link");
+    let _cleanup = RmPath(link.clone());
+
+    let (code, out, err) = uninstall_via_cli(&id);
+
+    assert_ne!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(!out.contains("not installed (nothing to do)"), "{out}");
+    assert!(fs::symlink_metadata(&link).is_ok(), "and the link survives, unremoved");
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn install_refuses_a_stray_enablement_link_with_no_fragment() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let link = wants_symlink(guard.id());
+    fs::create_dir_all(link.parent().expect("the link has a parent")).expect("mkdir *.target.wants");
+    std::os::unix::fs::symlink(unit_path(guard.id()), &link).expect("plant a dangling .wants link");
+    let _cleanup = RmPath(link.clone());
+
+    let mgr = Systemd::new();
+    let outcome = mgr
+        .install(&mk(guard.id()), false)
+        .expect("install over a stray enablement link");
+    assert!(
+        matches!(outcome, Outcome::RefuseForeign { .. }),
+        "adopting it would enroll the new daemon at boot without anyone asking, got {outcome:?}"
+    );
+    assert!(!unit_path(guard.id()).exists(), "no fragment must be written");
+}
+
+/// The read-only verb has to agree too, or `status` calls the id empty while `install` calls it
+/// foreign — the same disagreement one step removed.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn status_does_not_call_an_id_with_a_stray_dropin_not_installed() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    write_dropin(guard.id());
+
+    let err = Systemd::new()
+        .status(&Id::try_from(guard.id().to_string()).expect("valid id"))
+        .expect_err("a stray drop-in is not a reportable daemon");
+    assert!(
+        matches!(err, goetia::Error::Foreign { .. }),
+        "must not be NotInstalled: {err:?}"
     );
 }
 

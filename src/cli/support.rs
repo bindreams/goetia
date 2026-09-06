@@ -166,6 +166,14 @@ pub(crate) struct IdVerbCall<'a> {
     /// `mgr.stop(id)?` before `mgr.start(id)`, and tolerating absence
     /// inside `stop` itself would let `restart` on an absent id fall
     /// through to `start`.
+    ///
+    /// The obligation this places on a [`ServiceManager`]: `Error::
+    /// NotInstalled` must mean *nothing goetia-attributable is at this id*,
+    /// not "one particular file is missing". This layer cannot check that —
+    /// it sees an error variant, never the backend's own evidence — so a
+    /// backend reporting it too eagerly makes `uninstall x && echo
+    /// "confirmed gone"` print for an id its own `install` would refuse as
+    /// foreign. See `backend::systemd::manager`'s obligation 7.
     pub absent_is_success: bool,
 }
 

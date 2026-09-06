@@ -198,8 +198,7 @@ pub fn dispatch(
     // which is also why `unsupported` can never combine with another kind.
     if cli.json && !matches!(cmd, DaemonCommand::List | DaemonCommand::Status(_)) {
         let report = report::unsupported(subcommand_name(cmd));
-        report::write(&report, out);
-        return report::exit_code(&report);
+        return report::emit(&report, out, err);
     }
 
     match cmd {

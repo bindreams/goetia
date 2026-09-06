@@ -39,6 +39,13 @@
 //! 6. **Uninstall order** is stop -> `systemctl disable` -> remove -> `daemon-reload`. Disabling
 //!    after the fragment is gone is impossible (no `[Install]` section left to read), which would
 //!    leave exactly the `.wants` symlink `uninstall_leaves_nothing` checks for.
+//! 7. **Absence is about the id, not about the fragment file.** `cli::uninstall` maps
+//!    [`Error::NotInstalled`] — and only that variant — to exit `0` and "nothing to do", so a
+//!    backend reporting it off `<id>.service`'s absence alone would certify "confirmed gone" for an
+//!    id systemd still applies a drop-in to, or still enrolls at boot through a
+//!    `multi-user.target.wants` link. `discover::residue` is the one predicate both `install`'s
+//!    `discover` and every other verb's `require_installed`/`status` ask, so no two verbs can
+//!    describe one filesystem state differently.
 
 mod dirs;
 mod discover;
@@ -49,7 +56,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use discover::{RawState, discover, raw_state, require_installed};
+use discover::{RawState, absent_error, discover, raw_state, require_installed};
 use systemctl::{daemon_reload, daemon_reload_or_report, run_systemctl, start_impl, status_from_unit, stop_impl};
 use write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 
@@ -244,7 +251,7 @@ impl ServiceManager for Systemd {
     fn status(&self, id: &Id) -> Result<Status> {
         let id = id.as_str();
         match raw_state(id)? {
-            RawState::Absent => Err(Error::NotInstalled { id: id.to_string() }),
+            RawState::Absent => Err(absent_error(id)?),
             RawState::NonRegular => Err(Error::Foreign {
                 id: id.to_string(),
                 recovery: decide::foreign_recovery(id),

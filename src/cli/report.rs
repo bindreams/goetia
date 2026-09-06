@@ -253,12 +253,43 @@ pub(crate) fn unsupported(subcommand: &str) -> Report {
 
 // Rendering ===========================================================================================================
 
-/// Write `report` as one compact line terminated by a newline.
-pub(crate) fn write(report: &Report, out: &mut dyn Write) {
+/// Write `report` as one compact line terminated by a newline, and flush.
+///
+/// Unlike every other `write!` in the CLI, this one's failure is not
+/// best-effort: it is the document [`exit_code`] certifies. See [`emit`].
+pub(crate) fn write(report: &Report, out: &mut dyn Write) -> std::io::Result<()> {
     // Infallible: every field is a string, bool, or integer — no map key
     // and no float that could fail to serialize.
     let json = serde_json::to_string(report).expect("a Report serializes infallibly");
-    let _ = writeln!(out, "{json}");
+    writeln!(out, "{json}")?;
+    // A buffered `out` reports a broken pipe or a full disk here rather
+    // than at the `writeln!` above; without the flush, "the document was
+    // delivered" would mean only "it was accepted into a buffer nobody has
+    // checked yet".
+    out.flush()
+}
+
+/// Write `report` as the `--json` document and return the process exit code
+/// for it: [`exit_code`] when the document actually reached `out`, or `1`
+/// — with a diagnostic on `err` — when it did not.
+///
+/// The single funnel every `--json` call site goes through, so none of them
+/// can render the document and compute the exit code independently. A
+/// consumer told "stdout is exactly one JSON document; parse it, then read
+/// `errors`" would otherwise meet an empty stdout beside exit `0` on a
+/// broken pipe or a full disk, and `json.loads` would raise on the empty
+/// string — the exact failure `--json` exists to remove. The write failure
+/// bypasses the precedence computation entirely rather than joining it as
+/// another kind: the kinds describe daemons, and there is no document left
+/// to carry one.
+pub(crate) fn emit(report: &Report, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    match write(report, out) {
+        Ok(()) => exit_code(report),
+        Err(e) => {
+            let _ = writeln!(err, "error: failed to write the --json document to stdout: {e}");
+            1
+        }
+    }
 }
 
 /// The process exit code for `report`: the precedence-max over its

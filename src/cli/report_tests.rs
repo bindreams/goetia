@@ -31,7 +31,7 @@ fn write_emits_one_compact_line_terminated_by_a_newline() {
     };
 
     let mut out = Vec::new();
-    write(&report, &mut out);
+    write(&report, &mut out).expect("a Vec never fails to accept a write");
 
     let text = String::from_utf8(out).expect("the document is UTF-8");
     assert_eq!(
@@ -90,4 +90,68 @@ fn every_kind_serializes_to_its_documented_wire_spelling() {
             format!("\"{spelling}\"")
         );
     }
+}
+
+// emit ================================================================================================================
+
+/// Refuses every write, the way a broken pipe (`goetia --json daemon list | head -1`) or a full
+/// disk does.
+struct FailingWriter;
+
+impl std::io::Write for FailingWriter {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "injected write failure",
+        ))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The exit code certifies that the document was delivered, so an undelivered one cannot exit `0`.
+/// Deliberately built from a report whose own [`exit_code`] *is* `0`: that is the case a consumer
+/// following "parse stdout first, then read `errors`" would meet as `json.loads("")`.
+#[skuld::test]
+fn emit_exits_one_when_the_document_cannot_be_written() {
+    let report = report(&[]);
+    assert_eq!(exit_code(&report), 0, "the report's own code, before the write fails");
+
+    let mut err = Vec::new();
+    let code = emit(&report, &mut FailingWriter, &mut err);
+
+    assert_eq!(code, 1);
+    let text = String::from_utf8(err).expect("stderr is UTF-8");
+    assert!(text.contains("injected write failure"), "{text}");
+}
+
+/// A write failure outranks whatever the report would have said on its own — including `2`, which
+/// [`precedence`] otherwise ranks above everything.
+#[skuld::test]
+fn a_write_failure_replaces_the_reports_own_code_whatever_it_was() {
+    for kinds in [
+        &[Kind::Unsupported][..],
+        &[Kind::Unreadable][..],
+        &[Kind::NotInstalled][..],
+    ] {
+        let report = report(kinds);
+        let code = emit(&report, &mut FailingWriter, &mut Vec::new());
+        assert_eq!(code, 1, "{:?}", kinds[0]);
+    }
+}
+
+#[skuld::test]
+fn emit_returns_the_reports_own_code_when_the_write_succeeds() {
+    let report = report(&[Kind::Unreadable]);
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+
+    let code = emit(&report, &mut out, &mut err);
+
+    assert_eq!(code, exit_code(&report));
+    assert_eq!(code, 4);
+    assert!(!out.is_empty(), "the document is on stdout");
+    assert!(err.is_empty(), "nothing is said about a write that worked");
 }

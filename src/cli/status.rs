@@ -31,10 +31,9 @@ pub fn run(
         Err(e) => {
             let report = report::unavailable(&e);
             if json {
-                report::write(&report, out);
-            } else {
-                let _ = writeln!(err, "error: {e}");
+                return report::emit(&report, out, err);
             }
+            let _ = writeln!(err, "error: {e}");
             return report::exit_code(&report);
         }
     };
@@ -61,11 +60,10 @@ pub fn run(
     }
 
     if json {
-        report::write(&report, out);
-    } else {
-        print_text(&report, out, err);
+        return report::emit(&report, out, err);
     }
 
+    print_text(&report, out, err);
     report::exit_code(&report)
 }
 
@@ -77,19 +75,19 @@ fn status_all(mgr: &dyn ServiceManager, json: bool, out: &mut dyn Write, err: &m
     };
 
     if json {
-        report::write(&report, out);
-    } else {
-        match &index {
-            Ok(index) => {
-                // An unreadable entry is a `warning:` here rather than an
-                // `error:` line, as it has been since `list` and `status`
-                // first shared `partition_installed`.
-                print_unreadable_warnings(&index.unreadable, err);
-                print_daemons(&report, out);
-            }
-            Err(e) => {
-                let _ = writeln!(err, "error: {e}");
-            }
+        return report::emit(&report, out, err);
+    }
+
+    match &index {
+        Ok(index) => {
+            // An unreadable entry is a `warning:` here rather than an
+            // `error:` line, as it has been since `list` and `status` first
+            // shared `partition_installed`.
+            print_unreadable_warnings(&index.unreadable, err);
+            print_daemons(&report, out);
+        }
+        Err(e) => {
+            let _ = writeln!(err, "error: {e}");
         }
     }
 

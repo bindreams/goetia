@@ -1963,3 +1963,182 @@ fn status_names_a_rejected_id_once_per_channel() {
         "once as the line's prefix and once inside the pattern message: {text_err}"
     );
 }
+
+// Residual artifacts ==================================================================================================
+
+/// The one error `uninstall` renders as success is `NotInstalled`, so a manager must reserve it for
+/// an id that is genuinely empty. `Fake::seed_residual_artifact` models the state that broke this
+/// on systemd: `/etc/systemd/system/<id>.service` gone, but a `<id>.service.d/*.conf` drop-in or a
+/// `multi-user.target.wants/<id>.service` link still there and still being applied. Reachable from
+/// `uninstall`'s own partial-failure path — the retry it tells you to run must not then print
+/// "nothing to do".
+#[skuld::test]
+fn uninstall_does_not_report_success_over_a_residual_artifact() {
+    let fake = Fake::new();
+    fake.seed_residual_artifact("leftover");
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "uninstall", "leftover"], &fake);
+
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(out, "", "`uninstall x && echo \"confirmed gone\"` must not print");
+    assert!(err.contains("leftover"), "{err}");
+}
+
+/// `install` refuses the id as foreign; `uninstall` must not call the same id empty. Two verbs
+/// disagreeing about one state is the defect, not either answer on its own.
+#[skuld::test]
+fn install_and_uninstall_agree_about_an_id_with_only_a_residual_artifact() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "daemons:\n  leftover:\n    command: [leftover]\n");
+    let fake = Fake::new();
+    fake.seed_residual_artifact("leftover");
+
+    let (install_code, _, install_err) = dispatch_elevated(
+        &["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()],
+        &fake,
+    );
+    let (uninstall_code, _, _) = dispatch_elevated(&["goetia", "daemon", "uninstall", "leftover"], &fake);
+
+    assert_ne!(install_code, 0, "install refuses it: {install_err}");
+    assert!(
+        install_err.contains("not a goetia-managed service"),
+        "refused as foreign, not for some unrelated reason: {install_err}"
+    );
+    assert_ne!(uninstall_code, 0, "so uninstall cannot report it gone");
+}
+
+// Known gap: daemons this privilege level cannot enumerate ============================================================
+//
+// `list`, `status` with no ids, and `show` with no ids all answer from `list()` alone, which cannot
+// report an id it could not enumerate — no warning, no `errors[]` entry, nothing. An unelevated
+// `goetia daemon list` therefore returns an empty document and exit `0` on a host that does have
+// goetia daemons installed. The README documents it.
+//
+// The tests below record *today's* behaviour, not desired behaviour. Closing the gap needs a
+// `ServiceManager` trait change (a `list()` that can report what it could not see) and is a
+// separate work item; when it lands, these two tests are the ones that must change.
+
+#[skuld::test]
+fn known_gap_list_silently_omits_a_daemon_it_cannot_enumerate() {
+    let inner = Fake::new();
+    inner.install(&mk("ghost"), false).unwrap();
+    let mgr = FlakyManager {
+        inner,
+        hidden_from_list: Some("ghost".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        mgr.status(&Id::try_from("ghost").unwrap()).is_ok(),
+        "a direct query finds it"
+    );
+
+    let (code, out, err) = dispatch_with(&["goetia", "--json", "daemon", "list"], &mgr, &never_elevated);
+
+    let doc = parse_json(&out);
+    assert!(daemons(&doc).is_empty(), "the installed daemon is missing: {doc}");
+    assert!(errors(&doc).is_empty(), "and nothing says so: {doc}");
+    assert_eq!(code, 0, "which is indistinguishable from a host with no daemons");
+    assert_eq!(err, "", "not even a warning");
+}
+
+#[skuld::test]
+fn known_gap_status_with_no_ids_silently_omits_a_daemon_it_cannot_enumerate() {
+    let inner = Fake::new();
+    inner.install(&mk("ghost"), false).unwrap();
+    let mgr = FlakyManager {
+        inner,
+        hidden_from_list: Some("ghost".to_string()),
+        ..Default::default()
+    };
+
+    let (all_code, all_out, all_err) = dispatch_with(&["goetia", "--json", "daemon", "status"], &mgr, &never_elevated);
+    let (one_code, one_out, _) = dispatch_with(
+        &["goetia", "--json", "daemon", "status", "ghost"],
+        &mgr,
+        &never_elevated,
+    );
+
+    let all = parse_json(&all_out);
+    assert!(daemons(&all).is_empty(), "{all}");
+    assert!(errors(&all).is_empty(), "{all}");
+    assert_eq!(all_code, 0);
+    assert_eq!(all_err, "");
+
+    // The asymmetry, stated as one assertion: naming the id finds exactly the daemon the no-ids
+    // form could not see.
+    assert_eq!(daemon_ids(&parse_json(&one_out)), ["ghost"], "{one_out}");
+    assert_eq!(one_code, 0);
+}
+
+// --json write failures ===============================================================================================
+
+/// Refuses every write, the way a broken pipe (`goetia --json daemon list | head -1`) or a full
+/// disk does.
+struct FailingStdout;
+
+impl std::io::Write for FailingStdout {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "injected write failure",
+        ))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// [`dispatch_with`] against a caller-supplied `out` — the one thing a `Vec<u8>` cannot model is a
+/// stdout that refuses the document.
+fn dispatch_to(args: &[&str], mgr: &Fake, out: &mut dyn std::io::Write) -> (i32, String) {
+    let cli = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("parse {args:?}: {e}"));
+    let mgr = mgr.clone();
+    let get_manager = move || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(mgr.clone())) };
+    let mut err = Vec::new();
+    let code = cli::dispatch(&cli, &get_manager, &never_elevated, out, &mut err);
+    (code, String::from_utf8(err).expect("stderr is UTF-8"))
+}
+
+/// `--json`'s published contract is "stdout is exactly one JSON document; parse it, then read
+/// `errors`". A consumer honouring that would meet `json.loads("")` if an undelivered document
+/// could still exit `0` — which is the failure `--json` was built to remove.
+#[skuld::test]
+fn json_exits_one_when_stdout_refuses_the_document() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+
+    // Every `--json` path, including the `unsupported` refusal, whose own code is `2`.
+    for args in [
+        &["goetia", "--json", "daemon", "list"][..],
+        &["goetia", "--json", "daemon", "status"][..],
+        &["goetia", "--json", "daemon", "status", "frpc"][..],
+        &["goetia", "--json", "daemon", "show", "frpc"][..],
+    ] {
+        let (code, err) = dispatch_to(args, &fake, &mut FailingStdout);
+
+        assert_eq!(code, 1, "{args:?}");
+        assert!(err.contains("injected write failure"), "{args:?}: {err}");
+    }
+}
+
+/// The same runs against a stdout that accepts the write: `1` above is the write failure talking,
+/// not a code these invocations return anyway.
+#[skuld::test]
+fn json_returns_its_own_code_when_stdout_accepts_the_document() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+
+    for (args, expected) in [
+        (&["goetia", "--json", "daemon", "list"][..], 0),
+        (&["goetia", "--json", "daemon", "status"][..], 0),
+        (&["goetia", "--json", "daemon", "status", "frpc"][..], 0),
+        (&["goetia", "--json", "daemon", "show", "frpc"][..], 2),
+    ] {
+        let mut out = Vec::new();
+        let (code, err) = dispatch_to(args, &fake, &mut out);
+
+        assert_eq!(code, expected, "{args:?}: {err}");
+        assert!(!out.is_empty(), "{args:?} still emits a document");
+    }
+}

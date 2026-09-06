@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::backend::systemd::generate;
 use crate::decide::Ownership;
@@ -94,21 +94,22 @@ pub(super) struct Discovery {
 
 pub(super) fn discover(id: &str) -> Result<Discovery> {
     match raw_state(id)? {
-        RawState::Absent => match dropin_marker(id)? {
+        RawState::Absent => match residue(id)? {
             None => Ok(Discovery {
                 ownership: Ownership::Absent,
                 on_disk: None,
                 fragment_text: None,
                 dropin_present: false,
             }),
-            // A drop-in directory with no fragment at all: never silently adopt it as `Create`, or
-            // the resulting unit inherits overrides goetia never wrote and cannot show — refuse it
-            // the same way any other pre-existing, unmarked artifact is refused.
-            Some(marker) => Ok(Discovery {
+            // A drop-in directory or an enablement link with no fragment at all: never silently
+            // adopt it as `Create`, or the resulting unit inherits overrides and boot-enrollment
+            // goetia never wrote and cannot show — refuse it the same way any other pre-existing,
+            // unmarked artifact is refused.
+            Some(residue) => Ok(Discovery {
                 ownership: Ownership::Foreign,
-                on_disk: Some(marker),
+                on_disk: Some(residue.text()),
                 fragment_text: None,
-                dropin_present: true,
+                dropin_present: !residue.dropin.is_empty(),
             }),
         },
         RawState::NonRegular => Ok(Discovery {
@@ -170,12 +171,26 @@ const DROPIN_SEARCH_DIRS: [&str; 3] = [UNIT_DIR, "/run/systemd/system", "/usr/li
 /// `systemd.unit(5)` reads as drop-ins — across every directory systemd's unit load path searches, or
 /// `None` if none of them exist or hold any.
 pub(super) fn dropin_marker(id: &str) -> Result<Option<String>> {
-    let mut marker = String::new();
+    let dirs = dropin_dirs(id)?;
+    if dirs.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(dirs.iter().map(|(_, text)| text.as_str()).collect()))
+}
+
+/// The same scan [`dropin_marker`] concatenates, kept per-directory so a caller that has to *name*
+/// the drop-ins for a human (`residue`) and one that has to *compare their content*
+/// (`dropin_marker`) cannot drift on which files count as drop-ins.
+fn dropin_dirs(id: &str) -> Result<Vec<(PathBuf, String)>> {
+    let mut found = Vec::new();
     for search_dir in DROPIN_SEARCH_DIRS {
         let dir = Path::new(search_dir).join(format!("{id}.service.d"));
-        marker.push_str(&dropin_marker_in(&dir)?);
+        let text = dropin_marker_in(&dir)?;
+        if !text.is_empty() {
+            found.push((dir, text));
+        }
     }
-    Ok(if marker.is_empty() { None } else { Some(marker) })
+    Ok(found)
 }
 
 fn dropin_marker_in(dir: &Path) -> Result<String> {
@@ -216,6 +231,105 @@ fn dropin_marker_in(dir: &Path) -> Result<String> {
     Ok(marker)
 }
 
+// Residue =============================================================================================================
+
+/// The one `*.target.wants` directory `systemctl enable` can link this id into: `generate::unit`'s
+/// `[Install]` section is always exactly `WantedBy=multi-user.target`, and goetia emits no
+/// `RequiredBy=`, so there is no `.requires` counterpart.
+const WANTS_DIR: &str = "multi-user.target.wants";
+
+/// Everything goetia-attributable that systemd keeps applying at `id` after the fragment itself is
+/// gone: a `<id>.service.d/*.conf` drop-in, and a `multi-user.target.wants/<id>.service` link that
+/// still enrolls the id at boot. Consulted only where [`raw_state`] found no fragment.
+struct Residue {
+    /// Each drop-in directory holding at least one `*.conf`, with that directory's marker text.
+    dropin: Vec<(PathBuf, String)>,
+    links: Vec<PathBuf>,
+}
+
+impl Residue {
+    /// The `on_disk` text `decide` is handed for this id. Never empty — [`residue`] returns `None`
+    /// rather than an empty `Residue` — which is what keeps [`Discovery::on_disk`]'s "`None` iff
+    /// `Ownership::Absent`" invariant true.
+    fn text(&self) -> String {
+        let mut text: String = self.dropin.iter().map(|(_, marker)| marker.as_str()).collect();
+        for link in &self.links {
+            text.push_str(&format!("\n# --- enablement link: {} ---\n", link.display()));
+        }
+        text
+    }
+
+    /// Every path a human has to deal with to empty this id, for the refusal message.
+    fn paths(&self) -> Vec<&Path> {
+        self.dropin
+            .iter()
+            .map(|(dir, _)| dir.as_path())
+            .chain(self.links.iter().map(PathBuf::as_path))
+            .collect()
+    }
+}
+
+/// What is left at `id` besides the fragment, or `None` when the id is genuinely unoccupied.
+///
+/// The single source of "is this id really empty" for both [`discover`] (so `install` never
+/// silently adopts what it did not write) and [`require_installed`] (so `uninstall` never reports
+/// [`Error::NotInstalled`] — which the CLI renders as success, exit `0` — for an id that still has
+/// something on it). Two verbs answering that question from different evidence is exactly how
+/// `uninstall x && echo "confirmed gone"` came to print for a unit still loaded, still running and
+/// still `.wants`-linked.
+fn residue(id: &str) -> Result<Option<Residue>> {
+    let dropin = dropin_dirs(id)?;
+    let mut links = Vec::new();
+    for search_dir in DROPIN_SEARCH_DIRS {
+        let link = Path::new(search_dir).join(WANTS_DIR).join(format!("{id}.service"));
+        // `symlink_metadata`, never `metadata`: the leftover this exists to catch is precisely a
+        // symlink whose target — the fragment — is already gone, which `metadata` reports as absent.
+        match fs::symlink_metadata(&link) {
+            Ok(_) => links.push(link),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_err("stat", &link, e)),
+        }
+    }
+    if dropin.is_empty() && links.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Residue { dropin, links }))
+}
+
+/// The error for an id whose fragment [`raw_state`] found absent: [`Error::NotInstalled`] only when
+/// nothing goetia-attributable is there at all, [`Error::Foreign`] otherwise. Every verb that has to
+/// answer "is anything at this id" — [`require_installed`] for the mutating ones, `Systemd::status`
+/// for the read-only one — goes through here, so none of them can disagree with [`discover`] about
+/// one filesystem state.
+pub(super) fn absent_error(id: &str) -> Result<Error> {
+    Ok(match residue(id)? {
+        None => Error::NotInstalled { id: id.to_string() },
+        Some(residue) => Error::Foreign {
+            id: id.to_string(),
+            recovery: residue_recovery(id, &residue),
+        },
+    })
+}
+
+/// How to empty an id whose fragment is gone but whose [`Residue`] is not. Goetia removes none of
+/// it itself: `<id>.service.d` in `/run` or `/usr/lib` — and, for that matter, in `/etc` — is just
+/// as plausibly an administrator's override of a unit *shipped elsewhere* as it is goetia's own
+/// leftover, and there is nothing on disk that distinguishes the two.
+fn residue_recovery(id: &str, residue: &Residue) -> String {
+    let paths = residue
+        .paths()
+        .iter()
+        .map(|p| format!("\n  {}", p.display()))
+        .collect::<String>();
+    format!(
+        "no `{UNIT_DIR}/{id}.service`, but systemd still applies configuration attached to `{id}`:\
+         {paths}\ngoetia cannot tell its own leftovers from an administrator's overrides of a unit \
+         shipped elsewhere, so it removes neither — `systemctl disable {id}.service` drops the \
+         enablement link and a drop-in directory has to go by hand. Then run `systemctl \
+         daemon-reload` and re-run."
+    )
+}
+
 // require_installed ===================================================================================================
 
 /// The narrower "is this even ours" gate every verb but `install` needs: the marker alone is proof of
@@ -223,9 +337,15 @@ fn dropin_marker_in(dir: &Path) -> Result<String> {
 /// passes — `uninstall`'s recovery text names exactly that verb as the way out). Returns the
 /// fragment's own text for a caller that goes on to remove or replace it — see
 /// `super::write::quarantine_if_still_ours`.
+///
+/// [`Error::NotInstalled`] means *nothing goetia-attributable is at this id*, not merely "the
+/// fragment file is missing": `cli::uninstall` maps that one variant to exit `0` and "nothing to
+/// do", so anything narrower would report success over a residual artifact — and would disagree
+/// with [`discover`], which refuses the identical filesystem state as `Ownership::Foreign`. See
+/// [`residue`].
 pub(super) fn require_installed(id: &str) -> Result<String> {
     match raw_state(id)? {
-        RawState::Absent => Err(Error::NotInstalled { id: id.to_string() }),
+        RawState::Absent => Err(absent_error(id)?),
         RawState::NonRegular => Err(Error::Foreign {
             id: id.to_string(),
             recovery: crate::decide::foreign_recovery(id),

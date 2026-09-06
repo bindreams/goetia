@@ -24,13 +24,13 @@ pub fn run(
     };
 
     if json {
-        report::write(&report, out);
-    } else {
-        match &index {
-            Ok(index) => print_text(index, out, err),
-            Err(e) => {
-                let _ = writeln!(err, "error: {e}");
-            }
+        return report::emit(&report, out, err);
+    }
+
+    match &index {
+        Ok(index) => print_text(index, out, err),
+        Err(e) => {
+            let _ = writeln!(err, "error: {e}");
         }
     }
 
