@@ -81,6 +81,24 @@ fn whitespace_around_the_equals_sign_is_an_error() {
     assert!(err.to_string().contains("A=1"), "message should show `A=1`: {err}");
 }
 
+#[skuld::test]
+fn trailing_whitespace_at_the_end_of_the_line_yields_an_empty_value() {
+    // `A= ` is not `A =` or `A= 1`: its only whitespace is at the very end
+    // of the line, where an unquoted value's trailing whitespace is
+    // trimmed regardless — so it means `A=`, not an error.
+    let vars = load_str("A= \n").unwrap();
+    assert_eq!(vars.get("A"), Some(""));
+}
+
+#[skuld::test]
+fn trailing_whitespace_after_a_closing_quote_does_not_leak_into_the_value() {
+    // Pins the line-end trim to running on the *line*, not the quoted
+    // value: the trailing space outside the quotes is stripped, but the
+    // one inside them survives.
+    let vars = load_str("A=\"x \" \n").unwrap();
+    assert_eq!(vars.get("A"), Some("x "));
+}
+
 // Encoding ============================================================================================================
 
 #[skuld::test]
@@ -106,6 +124,23 @@ fn a_utf16_env_file_is_rejected_by_name() {
         "message should not be the generic decode error: {msg}"
     );
     assert!(msg.contains(".env"), "message should name the file: {msg}");
+}
+
+#[skuld::test]
+fn a_utf32_bom_is_not_misreported_as_utf16() {
+    // The UTF-32LE BOM (`FF FE 00 00`) shares its first two bytes with the
+    // UTF-16LE BOM (`FF FE`); the 4-byte pattern must be checked first.
+    let mut bytes = vec![0xFF, 0xFE, 0x00, 0x00];
+    for c in "A=1\n".chars() {
+        bytes.extend_from_slice(&(c as u32).to_le_bytes());
+    }
+    let err = load_bytes(&bytes).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("UTF-32"), "message should name the encoding: {msg}");
+    assert!(
+        !msg.contains("UTF-16"),
+        "message should not be misreported as UTF-16: {msg}"
+    );
 }
 
 // Quoting =============================================================================================================
@@ -229,16 +264,21 @@ fn parse_errors_name_the_file_and_the_line() {
 // Isolation from the process environment ==============================================================================
 
 #[skuld::test]
-fn load_never_reads_the_process_environment() {
+fn get_does_not_fall_back_to_an_ambient_variable() {
     // Pick a name the *ambient* process environment already defines,
     // without this test setting one itself (setting a process variable
     // from a test is a data race across the suite and is forbidden here).
     // A `.env` that never mentions this name must not leak it into
-    // `Vars`, proving `load` never falls back to `std::env`.
+    // `Vars`, proving `get` never falls back to `std::env`. (The
+    // no-`$`-expansion property is a separate one, pinned by
+    // `dollar_signs_in_values_are_literal`.)
     let ambient_name = std::env::vars()
         .map(|(name, _)| name)
         .find(|name| name != "GOETIA_TEST_OTHER")
-        .expect("the process environment should define at least one variable");
+        .expect(
+            "test fixture could not be built: the process environment defines no variable to \
+             use as the ambient name this test checks `Vars::get` does not fall back to",
+        );
 
     let vars = load_str("GOETIA_TEST_OTHER=1\n").unwrap();
     assert_eq!(vars.get(&ambient_name), None);

@@ -49,12 +49,13 @@
 //! rule below is pinned by a test in `vars_tests.rs`:
 //!
 //! - The file is read as bytes first. A leading UTF-8 BOM (`EF BB BF`) is
-//!   stripped. A UTF-16 BOM (`FF FE` or `FE FF`) is rejected with a
-//!   dedicated error naming the encoding, because `String::from_utf8`
-//!   would otherwise report only that the bytes are not valid UTF-8,
-//!   naming neither the file's real problem nor the fix. Anything else
-//!   is decoded as UTF-8, and a decode failure produces that same
-//!   dedicated error rather than a bare `Error::Io`.
+//!   stripped. A UTF-16 or UTF-32 BOM (`FF FE`, `FE FF`, `FF FE 00 00`, or
+//!   `00 00 FE FF`) is rejected with a dedicated error naming the
+//!   encoding, because `String::from_utf8` would otherwise report only
+//!   that the bytes are not valid UTF-8, naming neither the file's real
+//!   problem nor the fix. Anything else is decoded as UTF-8, and a decode
+//!   failure produces that same dedicated error rather than a bare
+//!   `Error::Io`.
 //! - Line terminators are `\n` and `\r\n`.
 //! - A line that is entirely whitespace, or whose first non-whitespace
 //!   character is `#`, is ignored.
@@ -68,7 +69,14 @@
 //!   unreferenceable name is an error rather than silent dead weight.
 //! - Whitespace around `=` is an error, not trimmed. python-dotenv
 //!   accepts `A = 1` and a shell does not, so accepting it would let one
-//!   file mean two different things to two readers of it.
+//!   file mean two different things to two readers of it. This rule and
+//!   "an unquoted value has its trailing whitespace trimmed" collide on
+//!   exactly one input: `A= ` (an `=` followed only by whitespace to end
+//!   of line). There, trimming wins: the line's trailing whitespace is
+//!   stripped before the adjacency check runs, so `A= ` means `A=` — an
+//!   empty value, not an error — while `A= 1`, `A =1`, and `A = 1` still
+//!   error, since none of their offending whitespace is at the end of the
+//!   line.
 //! - `VALUE` is one of: single-quoted (literal up to the closing `'`, no
 //!   escapes); double-quoted (only `\\` and `\"` are decoded); or
 //!   unquoted (trailing whitespace trimmed; a `#` preceded by whitespace
@@ -116,7 +124,7 @@ pub(crate) const ENV_FILE_NAME: &str = ".env";
 /// literal text after `=` (quoting aside), with no `$` expansion and no
 /// contribution from or to the process environment. See the module doc
 /// comment for the full grammar and the rationale for both properties.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct Vars(BTreeMap<String, String>);
 
 impl Vars {
@@ -136,25 +144,26 @@ impl Vars {
         let text =
             std::str::from_utf8(bytes).map_err(|_| env_error(&path, 1, "file is not valid UTF-8".to_string()))?;
 
-        let mut vars = BTreeMap::new();
-        let mut first_line: BTreeMap<String, usize> = BTreeMap::new();
+        // Keyed by name to `(line it was first defined on, its value)`, so
+        // a duplicate can be reported without a second map tracking the
+        // same keys.
+        let mut vars: BTreeMap<String, (usize, String)> = BTreeMap::new();
         for (index, raw_line) in text.split('\n').enumerate() {
             let line = index + 1;
             let Some((name, value)) = parse_line(raw_line, line, &path)? else {
                 continue;
             };
-            if let Some(&first) = first_line.get(&name) {
+            if let Some((first, _)) = vars.get(&name) {
                 return Err(env_error(
                     &path,
                     line,
                     format!("duplicate variable `{name}` (first defined on line {first})"),
                 ));
             }
-            first_line.insert(name.clone(), line);
-            vars.insert(name, value);
+            vars.insert(name, (line, value));
         }
 
-        Ok(Self(vars))
+        Ok(Self(vars.into_iter().map(|(name, (_, value))| (name, value)).collect()))
     }
 
     /// A `.env`-less set: what `load` returns for a missing file, and what
@@ -188,12 +197,28 @@ impl Vars {
 
 // BOM and decoding ====================================================================================================
 
-/// Strip a UTF-8 BOM, or reject a UTF-16 BOM by name. `line` 1 is used for
-/// every error here since the problem is with the file's encoding, not
-/// with any one line of text within it.
+/// Strip a UTF-8 BOM, or reject a UTF-16/UTF-32 BOM by name. `line` 1 is
+/// used for every error here since the problem is with the file's
+/// encoding, not with any one line of text within it.
+///
+/// The 4-byte UTF-32LE BOM (`FF FE 00 00`) starts with the same two bytes
+/// as the UTF-16LE BOM (`FF FE`), so the 4-byte patterns are checked
+/// first — otherwise a UTF-32LE file would be misreported as UTF-16LE.
 fn strip_bom<'a>(bytes: &'a [u8], path: &Path) -> Result<&'a [u8]> {
     if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
         Ok(rest)
+    } else if bytes.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) {
+        Err(env_error(
+            path,
+            1,
+            "file starts with a UTF-32LE byte-order mark; goetia .env files must be UTF-8".to_string(),
+        ))
+    } else if bytes.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) {
+        Err(env_error(
+            path,
+            1,
+            "file starts with a UTF-32BE byte-order mark; goetia .env files must be UTF-8".to_string(),
+        ))
     } else if bytes.starts_with(&[0xFF, 0xFE]) {
         Err(env_error(
             path,
@@ -232,6 +257,11 @@ fn parse_line(raw_line: &str, line: usize, path: &Path) -> Result<Option<(String
     }
 
     let rest = strip_export_prefix(trimmed);
+    // An unquoted value's trailing whitespace is trimmed regardless, so
+    // strip it before the whitespace-around-`=` check runs: `A= ` must
+    // mean `A=`, not an error. A quoted value is unaffected, since any
+    // whitespace inside its quotes is never at the very end of the line.
+    let rest = rest.trim_end_matches(is_ws);
 
     let Some(eq) = rest.find('=') else {
         return Err(env_error(path, line, format!("expected `NAME=VALUE`, found `{rest}`")));
