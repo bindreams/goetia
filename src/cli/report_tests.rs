@@ -1,17 +1,16 @@
 use super::*;
 
-fn error(kind: &'static str) -> ErrorReport {
-    ErrorReport {
-        id: None,
-        kind,
-        message: "why".to_string(),
-    }
-}
-
-fn report(kinds: &[&'static str]) -> Report {
+fn report(kinds: &[Kind]) -> Report {
     Report {
         daemons: Vec::new(),
-        errors: kinds.iter().map(|kind| error(kind)).collect(),
+        errors: kinds
+            .iter()
+            .map(|kind| ErrorReport {
+                id: None,
+                kind: *kind,
+                message: "why".to_string(),
+            })
+            .collect(),
     }
 }
 
@@ -26,7 +25,7 @@ fn write_emits_one_compact_line_terminated_by_a_newline() {
         }],
         errors: vec![ErrorReport {
             id: Some("corrupt".to_string()),
-            kind: kind::UNREADABLE,
+            kind: Kind::Unreadable,
             message: "why".to_string(),
         }],
     };
@@ -51,38 +50,44 @@ fn write_emits_one_compact_line_terminated_by_a_newline() {
 /// (`4`) into the same code as an outright failure.
 #[skuld::test]
 fn exit_code_is_the_precedence_max_over_error_kinds() {
+    // Not a hand-list standing in for completeness: `Kind::code` is an
+    // exhaustive match, so a kind added without a code does not compile.
     for (kinds, expected) in [
         (&[][..], 0),
-        (&[kind::UNREADABLE][..], 4),
-        (&[kind::NOT_INSTALLED][..], 1),
-        (&[kind::FOREIGN][..], 1),
-        (&[kind::OTHER][..], 1),
-        (&[kind::UNAVAILABLE][..], 1),
-        (&[kind::INVALID_ID][..], 1),
-        (&[kind::UNSUPPORTED][..], 2),
+        (&[Kind::Unreadable][..], 4),
+        (&[Kind::NotInstalled][..], 1),
+        (&[Kind::Foreign][..], 1),
+        (&[Kind::Other][..], 1),
+        (&[Kind::Unavailable][..], 1),
+        (&[Kind::InvalidId][..], 1),
+        (&[Kind::Unsupported][..], 2),
         // 1 outranks 4, in either order.
-        (&[kind::UNREADABLE, kind::NOT_INSTALLED][..], 1),
-        (&[kind::NOT_INSTALLED, kind::UNREADABLE][..], 1),
+        (&[Kind::Unreadable, Kind::NotInstalled][..], 1),
+        (&[Kind::NotInstalled, Kind::Unreadable][..], 1),
         // Repeats of the same kind stay that kind's code.
-        (&[kind::UNREADABLE, kind::UNREADABLE][..], 4),
+        (&[Kind::Unreadable, Kind::Unreadable][..], 4),
     ] {
         assert_eq!(exit_code(&report(kinds)), expected, "for {kinds:?}");
     }
 }
 
-/// Every kind must have a code: `code_for`'s fallback arm is a `debug_assert`
-/// that this test would trip on a kind added without one.
+/// The wire spelling is the stable contract, and `Serialize` goes through
+/// `as_str`, so pinning `as_str` pins the JSON.
 #[skuld::test]
-fn every_kind_has_a_code() {
-    for kind in [
-        kind::NOT_INSTALLED,
-        kind::FOREIGN,
-        kind::UNREADABLE,
-        kind::INVALID_ID,
-        kind::UNAVAILABLE,
-        kind::UNSUPPORTED,
-        kind::OTHER,
+fn every_kind_serializes_to_its_documented_wire_spelling() {
+    for (kind, spelling) in [
+        (Kind::NotInstalled, "not-installed"),
+        (Kind::Foreign, "foreign"),
+        (Kind::Unreadable, "unreadable"),
+        (Kind::InvalidId, "invalid-id"),
+        (Kind::Unavailable, "unavailable"),
+        (Kind::Unsupported, "unsupported"),
+        (Kind::Other, "other"),
     ] {
-        assert_ne!(exit_code(&report(&[kind])), 0, "`{kind}` must not exit 0");
+        assert_eq!(kind.as_str(), spelling);
+        assert_eq!(
+            serde_json::to_string(&kind).expect("a Kind serializes infallibly"),
+            format!("\"{spelling}\"")
+        );
     }
 }

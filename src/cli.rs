@@ -56,7 +56,8 @@ pub struct Cli {
     /// `daemon status`; every other subcommand refuses it with an
     /// `unsupported` error document and exit `2`, before running anything.
     /// `global` so both `goetia --json daemon list` and
-    /// `goetia daemon list --json` work.
+    /// `goetia daemon list --json` work. See [`dispatch`] for the exact
+    /// invariant and its clap-level carve-outs.
     #[arg(long, global = true)]
     pub json: bool,
     /// Reserved for increased output verbosity (repeatable). Accepted and
@@ -119,12 +120,19 @@ pub enum DaemonCommand {
 /// owns) — see the design spec's §4 and [`report::exit_code`], which is
 /// where `list` and `status` get theirs in *both* output modes.
 ///
-/// Whenever `--json` is given together with a subcommand, stdout is exactly
-/// one JSON document: `list` and `status` render one, and every other
-/// subcommand is refused with one below, before it runs. `--help` and
-/// `--version` are a deliberate carve-out — clap short-circuits on them
-/// before `dispatch` is ever called, so the invariant is over subcommands,
-/// not over the binary.
+/// Whenever `--json` is given together with a subcommand **that clap
+/// accepted**, stdout is exactly one JSON document: `list` and `status`
+/// render one, and every other subcommand is refused with one below, before
+/// it runs.
+///
+/// Anything clap short-circuits on is a deliberate carve-out, because it
+/// happens before `dispatch` is ever called: `--help`/`--version` print
+/// their own text and exit `0`, and a usage error (`goetia --json daemon
+/// uninstall`, with `<IDS>` missing) prints clap's message to stderr, leaves
+/// stdout empty, and exits `2`. Rendering those as JSON would mean
+/// pre-scanning `std::env::args()` before parsing, or intercepting
+/// `try_parse` and re-rendering clap's own diagnostics — both worse than the
+/// carve-out. `tests/cli_binary.rs` pins all three cases.
 pub fn dispatch(
     cli: &Cli,
     get_manager: &dyn Fn() -> Result<Box<dyn ServiceManager>>,

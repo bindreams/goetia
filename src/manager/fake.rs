@@ -95,6 +95,48 @@ impl Fake {
         self.seed_foreign(id, format!("{FAKE_MARKER}\nSpec: not-valid-base64!!!\n"));
     }
 
+    /// Test-only seeding: place a Goetia-marked entry at `id` whose blob's
+    /// *envelope* decodes cleanly but whose spec content is out of range, so
+    /// [`blob::decode`] rejects it with [`Error::Invalid`] rather than
+    /// [`Error::Blob`].
+    ///
+    /// [`Fake::seed_unreadable`] cannot reach this: malformed base64 fails
+    /// at the envelope and yields `Error::Blob`. `Error::Invalid` is the
+    /// variant `spec::Id::try_from` *also* produces, so it is the one a CLI
+    /// classifying failures by error variant instead of by which operation
+    /// failed would misroute to `invalid-id`. Nothing else in the crate can
+    /// produce it from a manager.
+    ///
+    /// The out-of-range value is `restart_delay.nanos == 1_000_000_000`,
+    /// which `blob::duration_from_wire` checks precisely because
+    /// `Duration::new` would otherwise panic on it.
+    pub fn seed_invalid_content(&self, id: &str) {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+
+        let spec = DaemonSpec {
+            id: Id::try_from(id).expect("seed_invalid_content needs a valid id"),
+            name: id.to_string(),
+            command: vec!["daemon".to_string()],
+            cwd: None,
+            env: std::collections::BTreeMap::new(),
+            user: crate::spec::User::Root,
+            restart: crate::spec::Restart::OnFailure,
+            // Replaced with the out-of-range value below; only its presence
+            // matters here, so that the field is on the wire at all.
+            restart_delay: Some(std::time::Duration::from_secs(1)),
+            logs: None,
+            kind: crate::spec::Kind::Simple,
+        };
+        let encoded = blob::encode(&spec);
+        let bytes = BASE64.decode(&encoded).expect("blob::encode emits valid base64");
+        let mut envelope: serde_json::Value = serde_json::from_slice(&bytes).expect("blob::encode emits valid JSON");
+        envelope["spec"]["restart_delay"]["nanos"] = serde_json::json!(1_000_000_000u32);
+        let tampered = BASE64.encode(serde_json::to_vec(&envelope).expect("a Value re-serializes"));
+
+        self.seed_foreign(id, format!("{FAKE_MARKER}\nSpec: {tampered}\n"));
+    }
+
     /// Test-only seeding: install `spec` normally, then append `extra_line`
     /// to the stored artifact so it no longer matches what regenerating its
     /// own embedded spec would produce — simulating a hand-edit made

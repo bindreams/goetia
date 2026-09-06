@@ -184,3 +184,21 @@ fn json_with_version_and_help_is_carved_out() {
         "--help must stay plain text:\n{help_out}"
     );
 }
+
+/// The third clap-level carve-out, and the one that would otherwise be
+/// discovered by a user: `daemon uninstall` requires an id, so clap rejects
+/// the command line before `dispatch` exists and stdout stays empty —
+/// exactly the empty-string-to-`json.loads` case `--json` exists to remove.
+/// Intercepting it would mean re-rendering clap's own diagnostics, so the
+/// published invariant is narrowed to subcommands clap accepted (see
+/// `cli::dispatch`) and pinned here instead.
+#[skuld::test]
+fn json_with_a_clap_rejected_command_line_is_carved_out() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let (code, out, err) = run_cli(&["--json", "daemon", "uninstall"], dir.path());
+
+    assert_eq!(code, 2, "clap's own usage-error code: stdout:\n{out}\nstderr:\n{err}");
+    assert!(out.is_empty(), "stdout:\n{out}");
+    assert!(err.contains("Usage:"), "clap must still explain itself: stderr:\n{err}");
+}

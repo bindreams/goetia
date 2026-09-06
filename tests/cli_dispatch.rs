@@ -1123,7 +1123,10 @@ fn status_json_with_no_ids_equals_list_json() {
 }
 
 /// Three states with opposite remedies, which text mode renders as one
-/// undifferentiated `error:` line each.
+/// undifferentiated `error:` line each. The `unreadable` here comes from a
+/// blob that fails to decode at all (`Error::Blob`); the
+/// `Error::Invalid`-producing case is
+/// `status_json_reports_invalid_blob_content_as_unreadable_not_invalid_id`.
 #[skuld::test]
 fn status_json_distinguishes_not_installed_foreign_and_unreadable() {
     let fake = Fake::new();
@@ -1269,4 +1272,108 @@ fn json_on_an_unsupported_subcommand_runs_nothing() {
 
     assert_eq!(code, 2, "{out}");
     assert_eq!(error_kinds(&parse_json(&out)), ["unsupported"]);
+}
+
+/// The rule the whole wire format rests on: a `kind` comes from **which
+/// operation failed**, never from the `Error` variant. `Error::Invalid` is
+/// produced by `support::parse_id` *and* by blob-content validation, so a
+/// classifier keyed on the variant would report an id goetia owns but cannot
+/// decode as `invalid-id` with exit 1 — telling the user to fix a command
+/// line that is perfectly correct — instead of `unreadable` with exit 4.
+#[skuld::test]
+fn status_json_reports_invalid_blob_content_as_unreadable_not_invalid_id() {
+    let fake = Fake::new();
+    fake.seed_invalid_content("frpc");
+
+    let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "status", "frpc"], &fake);
+
+    let doc = parse_json(&out);
+    assert_eq!(
+        error_kinds(&doc),
+        ["unreadable"],
+        "the argument was a valid id; the *artifact* is what goetia cannot read: {doc}"
+    );
+    assert_eq!(errors(&doc)[0]["id"], "frpc");
+    assert_eq!(code, 4, "{out}");
+}
+
+/// `list` must classify the same artifact the same way — it reaches
+/// `Installed::OursUnreadable` rather than an `Error` at all.
+#[skuld::test]
+fn list_json_reports_invalid_blob_content_as_unreadable() {
+    let fake = Fake::new();
+    fake.seed_invalid_content("frpc");
+
+    let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
+
+    assert_eq!(error_kinds(&parse_json(&out)), ["unreadable"], "{out}");
+    assert_eq!(code, 4, "{out}");
+}
+
+/// Ids are reported in argument order, and a repeated argument yields a
+/// repeated entry — `status` never silently deduplicates what was asked for.
+#[skuld::test]
+fn status_json_repeats_an_id_given_twice() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.install(&mk("websocat"), false).unwrap();
+
+    let (code, out, _err) = dispatch_read_only(
+        &["goetia", "--json", "daemon", "status", "websocat", "frpc", "websocat"],
+        &fake,
+    );
+
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(daemon_ids(&parse_json(&out)), ["websocat", "frpc", "websocat"]);
+}
+
+/// The channel rule holds for `status` too, on a fixture whose text mode
+/// writes both a `warning:` (the unreadable entry) and an `error:` line.
+#[skuld::test]
+fn status_json_is_the_only_thing_on_stdout_and_stderr_stays_empty() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_unreadable("corrupt");
+
+    for args in [
+        ["goetia", "--json", "daemon", "status"].as_slice(),
+        [
+            "goetia",
+            "--json",
+            "daemon",
+            "status",
+            "frpc",
+            "corrupt",
+            "not/a/valid/id",
+        ]
+        .as_slice(),
+    ] {
+        let (code, out, err) = dispatch_read_only(args, &fake);
+
+        parse_json(&out);
+        assert!(err.is_empty(), "{args:?} wrote to stderr:\n{err}");
+        assert_ne!(code, 0, "{args:?} must still report the failures it found");
+    }
+}
+
+/// `Error::Invalid`'s own `Display` prefixes ``daemon `X`: ``, and the text
+/// renderer prefixes the id as well, so carrying `Display` into `message`
+/// would name the same id three times on one line.
+#[skuld::test]
+fn status_names_a_rejected_id_once_per_channel() {
+    let fake = Fake::new();
+
+    let (_, out, _) = dispatch_read_only(&["goetia", "--json", "daemon", "status", "not/a/valid/id"], &fake);
+    let (_, _, text_err) = dispatch_read_only(&["goetia", "daemon", "status", "not/a/valid/id"], &fake);
+
+    let message = errors(&parse_json(&out))[0]["message"].as_str().unwrap().to_string();
+    assert!(
+        !message.contains("not/a/valid/id:"),
+        "`id` is the attribution; `message` must not repeat it as a prefix: {message}"
+    );
+    assert_eq!(
+        text_err.matches("not/a/valid/id").count(),
+        2,
+        "once as the line's prefix and once inside the pattern message: {text_err}"
+    );
 }

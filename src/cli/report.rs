@@ -47,7 +47,7 @@ pub(crate) struct ErrorReport {
     /// `None` when it is not — exactly the `unavailable` and `unsupported`
     /// cases.
     pub id: Option<String>,
-    pub kind: &'static str,
+    pub kind: Kind,
     pub message: String,
 }
 
@@ -59,29 +59,82 @@ pub(crate) struct ErrorReport {
 /// the variant does not determine the remedy. The constructors below are
 /// therefore named for the operation whose failure they classify, not for
 /// the error they receive.
-pub(crate) mod kind {
+///
+/// An enum rather than a set of `&'static str` constants so that
+/// [`Kind::code`] is an exhaustive `match`: a kind added without a code
+/// stops compiling. A test that hand-listed the kinds instead could never
+/// be complete, since it would list exactly what it was checking for
+/// completeness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
     /// Nothing is installed at that id. Only from `status(&id)`.
-    pub(crate) const NOT_INSTALLED: &str = "not-installed";
+    NotInstalled,
     /// Something exists there that goetia does not own, or that this
     /// privilege level cannot read. Only from `status(&id)`.
-    pub(crate) const FOREIGN: &str = "foreign";
+    Foreign,
     /// Goetia owns the id but cannot report on it; `message` says why — a
     /// blob it cannot decode, a live state it could not query, or an
     /// ambiguous installation. From [`Installed::OursUnreadable`] out of
     /// `list()`, and from every other `status(&id)` error.
     ///
     /// [`Installed::OursUnreadable`]: crate::manager::Installed::OursUnreadable
-    pub(crate) const UNREADABLE: &str = "unreadable";
+    Unreadable,
     /// `support::parse_id` rejected a CLI argument: fix the argument.
-    pub(crate) const INVALID_ID: &str = "invalid-id";
+    InvalidId,
     /// `get_manager()` or `mgr.list()` failed, so no answer was obtained for
     /// any daemon.
-    pub(crate) const UNAVAILABLE: &str = "unavailable";
+    Unavailable,
     /// `--json` was given to a subcommand that does not implement it.
-    pub(crate) const UNSUPPORTED: &str = "unsupported";
+    Unsupported,
     /// Unreachable today; kept so an unclassified failure has a home rather
-    /// than being silently dropped. Not a placeholder for a future concept.
-    pub(crate) const OTHER: &str = "other";
+    /// than being silently dropped, and never constructed for that reason.
+    /// Not a placeholder for a future concept.
+    #[allow(dead_code)]
+    Other,
+}
+
+impl Kind {
+    /// The wire spelling. The JSON is the stable contract, not the variant
+    /// names, and [`Serialize`](serde::Serialize) goes through here so the
+    /// two cannot drift.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Kind::NotInstalled => "not-installed",
+            Kind::Foreign => "foreign",
+            Kind::Unreadable => "unreadable",
+            Kind::InvalidId => "invalid-id",
+            Kind::Unavailable => "unavailable",
+            Kind::Unsupported => "unsupported",
+            Kind::Other => "other",
+        }
+    }
+
+    /// The exit code this kind alone would produce.
+    ///
+    /// `invalid-id` is `1` rather than `2` deliberately: `2` is anchored to
+    /// "the parser rejected the command line and nothing ran", but
+    /// `goetia daemon status good bad` queries and prints `good` before
+    /// rejecting `bad`, so `2` would mislead exactly the consumer that
+    /// anchor is for. `unsupported` is `2` because there the refusal really
+    /// does happen before anything runs.
+    fn code(self) -> i32 {
+        match self {
+            // Goetia owns the id and could not determine its state: the
+            // partial-answer case `4` exists for.
+            Kind::Unreadable => 4,
+            Kind::Unsupported => 2,
+            // A determinate answer that the command failed, or
+            // (`unavailable`) no answer at all — nothing partial about
+            // either.
+            Kind::NotInstalled | Kind::Foreign | Kind::Other | Kind::Unavailable | Kind::InvalidId => 1,
+        }
+    }
+}
+
+impl serde::Serialize for Kind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
 }
 
 // Constructors ========================================================================================================
@@ -110,7 +163,7 @@ pub(crate) fn from_index(index: &InstalledIndex) -> Report {
             .iter()
             .map(|(name, reason)| ErrorReport {
                 id: Some(name.clone()),
-                kind: kind::UNREADABLE,
+                kind: Kind::Unreadable,
                 message: format!("installed but unreadable: {reason}"),
             })
             .collect(),
@@ -137,9 +190,9 @@ pub(crate) fn daemon(id: &str, status: &Status) -> DaemonReport {
 /// [`Error::CommandFailed`].
 pub(crate) fn status_error(id: &str, e: &Error) -> ErrorReport {
     let kind = match e {
-        Error::NotInstalled { .. } => kind::NOT_INSTALLED,
-        Error::Foreign { .. } => kind::FOREIGN,
-        _ => kind::UNREADABLE,
+        Error::NotInstalled { .. } => Kind::NotInstalled,
+        Error::Foreign { .. } => Kind::Foreign,
+        _ => Kind::Unreadable,
     };
     ErrorReport {
         id: Some(id.to_string()),
@@ -150,11 +203,20 @@ pub(crate) fn status_error(id: &str, e: &Error) -> ErrorReport {
 
 /// A CLI argument `support::parse_id` rejected. Attributable to the id it
 /// was given, even though that id never became an [`crate::spec::Id`].
+///
+/// Carries [`Error::Invalid`]'s `message` field rather than its `Display`,
+/// which prefixes ``daemon `X`: ``. The `id` field is the attribution, and
+/// the text renderer prefixes the id too, so `Display` would put the same
+/// id on one line three times.
 pub(crate) fn invalid_id(id: &str, e: &Error) -> ErrorReport {
+    let message = match e {
+        Error::Invalid { message, .. } => message.clone(),
+        other => other.to_string(),
+    };
     ErrorReport {
         id: Some(id.to_string()),
-        kind: kind::INVALID_ID,
-        message: e.to_string(),
+        kind: Kind::InvalidId,
+        message,
     }
 }
 
@@ -167,7 +229,7 @@ pub(crate) fn unavailable(e: &Error) -> Report {
         daemons: Vec::new(),
         errors: vec![ErrorReport {
             id: None,
-            kind: kind::UNAVAILABLE,
+            kind: Kind::Unavailable,
             message: e.to_string(),
         }],
     }
@@ -181,7 +243,7 @@ pub(crate) fn unsupported(subcommand: &str) -> Report {
         daemons: Vec::new(),
         errors: vec![ErrorReport {
             id: None,
-            kind: kind::UNSUPPORTED,
+            kind: Kind::Unsupported,
             message: format!(
                 "`daemon {subcommand}` does not support --json: drop --json, or use `daemon list` or `daemon status`"
             ),
@@ -206,33 +268,9 @@ pub(crate) fn exit_code(report: &Report) -> i32 {
     report
         .errors
         .iter()
-        .map(|e| code_for(e.kind))
+        .map(|e| e.kind.code())
         .max_by_key(|code| precedence(*code))
         .unwrap_or(0)
-}
-
-/// The exit code one `kind` alone would produce.
-///
-/// `invalid-id` is `1` rather than `2` deliberately: `2` is anchored to "the
-/// parser rejected the command line and nothing ran", but
-/// `goetia daemon status good bad` queries and prints `good` before
-/// rejecting `bad`, so `2` would mislead exactly the consumer that anchor is
-/// for. `unsupported` is `2` because there the refusal really does happen
-/// before anything runs.
-fn code_for(kind: &str) -> i32 {
-    match kind {
-        // Goetia owns the id and could not determine its state: the
-        // partial-answer case `4` exists for.
-        kind::UNREADABLE => 4,
-        kind::UNSUPPORTED => 2,
-        // A determinate answer that the command failed, or (`unavailable`)
-        // no answer at all — nothing partial about either.
-        kind::NOT_INSTALLED | kind::FOREIGN | kind::OTHER | kind::UNAVAILABLE | kind::INVALID_ID => 1,
-        _ => {
-            debug_assert!(false, "unknown error kind `{kind}`: give it a code in `code_for`");
-            1
-        }
-    }
 }
 
 /// Where an exit code sits in the design spec's `1 > 4 > 5 > 3 > 0`
@@ -244,10 +282,11 @@ fn precedence(code: i32) -> u8 {
         5 => 2,
         3 => 1,
         0 => 0,
-        // `2` is the only other code [`code_for`] produces, and the refusal
-        // that yields it happens before any subcommand runs, so it is always
-        // alone in its report. Ranking it top anyway means a hypothetical
-        // combination could never silently demote a usage error.
+        // `2` is the only other code [`Kind::code`] produces, and the
+        // refusal that yields it happens before any subcommand runs, so it
+        // is always alone in its report. Ranking it top anyway means a
+        // hypothetical combination could never silently demote a usage
+        // error.
         _ => u8::MAX,
     }
 }
