@@ -412,3 +412,29 @@ fn start_limit_disabled_when_restart_enabled() {
         );
     }
 }
+
+// Manifest escapes composing with generator escapes ===================================================================
+
+#[skuld::test]
+fn manifest_dollar_escape_survives_into_exec_start() {
+    // Two independent `$` escape layers meet here: the manifest's `$$` ->
+    // `$`, and `render_exec_arg`'s `$` -> `$$` for systemd's own
+    // environment substitution. A user who writes `$$ARGS` must get the
+    // literal argv element `$ARGS` and a unit that still says `$$ARGS`.
+    let dir = tempfile::tempdir().expect("tempdir should be creatable");
+    std::fs::write(
+        dir.path().join("goetia.yaml"),
+        "daemons:\n  frpc:\n    command: [/bin/frpc, $$ARGS]\n",
+    )
+    .expect("fixture manifest should be writable");
+
+    let (specs, _warnings) = crate::spec::load(dir.path()).expect("manifest should load");
+    assert_eq!(specs[0].command[1], "$ARGS");
+
+    let text = unit(&specs[0], &minimal_identity());
+    let exec_start = text.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
+    assert!(
+        exec_start.ends_with(" $$ARGS"),
+        "ExecStart should re-double the escaped dollar: {exec_start}"
+    );
+}

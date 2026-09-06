@@ -2,6 +2,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::*;
+use crate::spec::interpolate;
+use crate::spec::vars::Vars;
 
 // `Path::new("/opt/rt").is_absolute()` is `false` on Windows, and
 // `PathBuf::from(r"C:\base").join("/opt/rt")` yields `C:/opt/rt` — so every
@@ -695,5 +697,192 @@ fn rejects_drive_relative_paths() {
     assert!(
         err.to_string().contains("drive-relative"),
         "message should name the cause: {err}"
+    );
+}
+
+// Interpolation =======================================================================================================
+
+/// A fresh directory holding `goetia.yaml`, and `.env` when `env` is given.
+fn fixture_dir(yaml: &str, env: Option<&str>) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir should be creatable");
+    std::fs::write(dir.path().join("goetia.yaml"), yaml).expect("fixture manifest should be writable");
+    if let Some(env) = env {
+        std::fs::write(dir.path().join(".env"), env).expect("fixture .env should be writable");
+    }
+    dir
+}
+
+#[skuld::test]
+fn load_substitutes_from_the_env_file_beside_the_manifest() {
+    let dir = fixture_dir(
+        "daemons:\n  frpc:\n    name: ${NAME}\n    command: [/bin/frpc]\n",
+        Some("NAME=Frpc Tunnel\n"),
+    );
+
+    let (specs, _warnings) = load(&dir.path().join("goetia.yaml")).expect("manifest should load");
+    assert_eq!(specs[0].name, "Frpc Tunnel");
+}
+
+#[skuld::test]
+fn load_substitutes_when_the_path_names_a_directory() {
+    // The `.env` is found beside the manifest, not beside the *argument* —
+    // the two differ for a directory path.
+    let dir = fixture_dir(
+        "daemons:\n  frpc:\n    name: ${NAME}\n    command: [/bin/frpc]\n",
+        Some("NAME=Frpc Tunnel\n"),
+    );
+
+    let (specs, _warnings) = load(dir.path()).expect("directory should load");
+    assert_eq!(specs[0].name, "Frpc Tunnel");
+}
+
+#[skuld::test]
+fn load_reports_an_unset_variable_naming_it() {
+    let dir = fixture_dir(
+        "daemons:\n  frpc:\n    name: ${NAME}\n    command: [/bin/frpc]\n",
+        Some("OTHER=1\n"),
+    );
+
+    let err = load(dir.path()).unwrap_err();
+    assert!(
+        matches!(err, Error::Interpolate { .. }),
+        "expected Interpolate, got: {err:?}"
+    );
+    let text = err.to_string();
+    assert!(text.contains("NAME"), "error should name the variable: {text}");
+    assert!(
+        text.contains("daemons.frpc.name"),
+        "error should name the field: {text}"
+    );
+}
+
+#[skuld::test]
+fn load_does_not_read_the_env_file_when_the_manifest_has_no_dollar() {
+    // A directory at the `.env` path makes `Vars::load` fail with `Io`, so a
+    // manifest that loads anyway demonstrably never read it: an unrelated or
+    // root-only-readable `.env` cannot break a manifest that references no
+    // variable.
+    let dir = fixture_dir("daemons:\n  frpc:\n    command: [/bin/frpc]\n", None);
+    std::fs::create_dir(dir.path().join(".env")).expect("fixture directory should be creatable");
+
+    let (specs, _warnings) = load(dir.path()).expect("a dollarless manifest should not read .env");
+    assert_eq!(specs.len(), 1);
+}
+
+#[skuld::test]
+fn load_reads_the_env_file_for_an_escaped_dollar_only() {
+    // The same fixture whose only `$` is a `$$` escape *does* read `.env`,
+    // pinning `would_substitution_change`'s over-approximation rather than
+    // leaving it to drift: one predicate serves this decision and the
+    // shape-phase carve-out, and it must stay the safe, wide one.
+    let dir = fixture_dir("daemons:\n  frpc:\n    command: [/bin/frpc, $$ARGS]\n", None);
+    std::fs::create_dir(dir.path().join(".env")).expect("fixture directory should be creatable");
+
+    let err = load(dir.path()).unwrap_err();
+    assert!(matches!(err, Error::Io { .. }), "expected Io, got: {err:?}");
+}
+
+#[skuld::test]
+fn a_dollar_in_a_comment_is_ignored() {
+    // The walk runs over the parsed manifest, not the file's text, so a `$`
+    // the YAML parser discards never reaches it.
+    let dir = fixture_dir(
+        "daemons:\n  frpc:\n    # ${NOPE} is a comment, not a reference\n    command: [/bin/frpc]\n",
+        None,
+    );
+    std::fs::create_dir(dir.path().join(".env")).expect("fixture directory should be creatable");
+
+    let (specs, _warnings) = load(dir.path()).expect("a commented-out reference should not read .env");
+    assert_eq!(specs.len(), 1);
+}
+
+#[skuld::test]
+fn load_preserves_authored_scalar_text_alongside_interpolation() {
+    // Every leaf stays the text the user wrote, all the way through
+    // interpolation: nothing round-trips through a YAML value, so no scalar
+    // is renormalised by a number/bool parse it never asked for.
+    let dir = fixture_dir(
+        "daemons:\n  frpc:\n    name: +5\n    command: [/bin/frpc]\n    env:\n      A: 0.10\n      B: 1e3\n      \
+         C: 0x10\n      D: 0o22\n      E: True\n      F: 1.\n      G: 18446744073709551616\n      1.50: plain\n      \
+         H: ${TOKEN}\n",
+        Some("TOKEN=s3cret\n"),
+    );
+
+    let (specs, _warnings) = load(dir.path()).expect("manifest should load");
+    let env = &specs[0].env;
+    assert_eq!(specs[0].name, "+5");
+    assert_eq!(env["A"], "0.10");
+    assert_eq!(env["B"], "1e3");
+    assert_eq!(env["C"], "0x10");
+    assert_eq!(env["D"], "0o22");
+    assert_eq!(env["E"], "True");
+    assert_eq!(env["F"], "1.");
+    assert_eq!(env["G"], "18446744073709551616");
+    assert_eq!(env["1.50"], "plain");
+    assert_eq!(env["H"], "s3cret");
+}
+
+#[skuld::test]
+fn load_reports_original_positions() {
+    // Interpolation runs on the parsed manifest, after the one and only
+    // parse, so a syntax or shape diagnostic still points at the file as
+    // written — with or without a `${VAR}` in it.
+    let plain = fixture_dir(
+        "daemons:\n  frpc:\n    name: literal\n    command: [/bin/frpc]\n    bogus: 1\n",
+        None,
+    );
+    let interpolated = fixture_dir(
+        "daemons:\n  frpc:\n    name: ${NAME}\n    command: [/bin/frpc]\n    bogus: 1\n",
+        Some("NAME=x\n"),
+    );
+
+    let plain_err = load(plain.path()).unwrap_err().to_string();
+    let interpolated_err = load(interpolated.path()).unwrap_err().to_string();
+
+    assert!(plain_err.contains("bogus"), "should name the field: {plain_err}");
+    assert!(plain_err.contains("line 5"), "should name the line: {plain_err}");
+    assert_eq!(plain_err, interpolated_err);
+}
+
+#[skuld::test]
+fn interpolated_values_pass_through_the_injection_gate() {
+    // Substitution happens before `resolve`, so a `.env` value carrying a
+    // control character is rejected by the same gate a literal one hits.
+    // `.env` cannot express a newline at all (`vars.rs` rejects both the
+    // `\n` escape and a multi-line value), so this uses the worst control
+    // character it *can* carry.
+    let dir = fixture_dir(
+        "daemons:\n  frpc:\n    name: ${NAME}\n    command: [/bin/frpc]\n",
+        Some("NAME='evil\u{1b}[2Jclear'\n"),
+    );
+
+    let err = load(dir.path()).unwrap_err();
+    assert!(matches!(err, Error::Invalid { .. }), "expected Invalid, got: {err:?}");
+    assert!(
+        err.to_string().contains("control character"),
+        "expected the control-character gate, got: {err}"
+    );
+}
+
+#[skuld::test]
+fn an_interpolated_value_cannot_create_a_daemon_or_a_field() {
+    // A substituted value is one scalar and is never re-parsed as YAML: it
+    // cannot add a daemon, rewrite `command`, or introduce a field. Driven
+    // through `Vars::from_pairs` rather than a `.env` file because `vars.rs`
+    // refuses to produce a newline-bearing value in the first place — this
+    // pins the second line of defence behind that refusal.
+    let yaml = "daemons:\n  frpc:\n    name: ${EVIL}\n    command: [/bin/frpc]\n";
+    let evil = "x\ncommand: [/bin/evil]\nbogus: 1";
+    let mut raw = parse_manifest(yaml);
+    interpolate::manifest(&mut raw, &Vars::from_pairs(&[("EVIL", evil)])).expect("substitution should succeed");
+
+    assert_eq!(raw.daemons.len(), 1);
+    assert_eq!(raw.daemons["frpc"].command, vec!["/bin/frpc"]);
+    assert_eq!(raw.daemons["frpc"].name.as_deref(), Some(evil));
+
+    let err = resolve(raw, &base_dir()).unwrap_err();
+    assert!(
+        err.to_string().contains("control character"),
+        "expected the control-character gate, got: {err}"
     );
 }

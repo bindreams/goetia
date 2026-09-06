@@ -105,12 +105,6 @@
 //!   (for example a directory sitting at the `.env` path) propagates as
 //!   `Error::Io`, so a real failure is never mistaken for a benign
 //!   absence.
-//!
-//! `Vars`'s only non-test caller is the manifest-side `${VAR}`
-//! interpolation a later task adds; until it lands, nothing outside
-//! `#[cfg(test)]` constructs a `Vars` at all — the same shape of problem
-//! `src/bin/shim/supervisor.rs` documents for its own blanket allow below.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -180,11 +174,8 @@ impl Vars {
 
 #[cfg(test)]
 impl Vars {
-    /// Build a `Vars` directly from pairs, bypassing the parser. For tests
-    /// that exercise a consumer of `Vars` rather than `Vars` itself — none
-    /// exist yet in this crate, so this is unused (and allowed to be)
-    /// until the interpolation task that needs it lands.
-    #[allow(dead_code)]
+    /// Build a `Vars` directly from pairs, bypassing the parser, for tests
+    /// that exercise a consumer of `Vars` rather than `Vars` itself.
     pub(crate) fn from_pairs(pairs: &[(&str, &str)]) -> Self {
         Self(
             pairs

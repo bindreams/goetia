@@ -16,8 +16,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use super::interpolate;
 use super::raw::RawManifest;
 use super::user::{AccountId, User};
+use super::vars::Vars;
 use super::{DaemonSpec, Id, Kind, RawSpec, Restart, Warning};
 use crate::error::Error;
 
@@ -68,7 +70,22 @@ pub fn load(path: &Path) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
         path: file_path.clone(),
         source,
     })?;
-    let raw: RawManifest = serde_yaml_ng::from_str(&text)?;
+    // The one and only parse: every diagnostic a manifest can produce —
+    // line, column, duplicate key, unknown field — comes from here, on the
+    // file exactly as written. Interpolation runs after it, on the typed
+    // result, so a `${VAR}` cannot move a position or change a message.
+    let mut raw: RawManifest = serde_yaml_ng::from_str(&text)?;
+
+    // A manifest with no `$` in it never reads `.env`, so an unrelated or
+    // root-only-readable file beside the manifest cannot break `install`,
+    // `show` or `diff`.
+    let vars = if interpolate::manifest_would_change(&raw) {
+        Vars::load(&base_dir)?
+    } else {
+        Vars::empty()
+    };
+    interpolate::manifest(&mut raw, &vars)?;
+
     resolve(raw, &base_dir)
 }
 

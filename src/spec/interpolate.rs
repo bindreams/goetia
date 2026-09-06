@@ -1,9 +1,9 @@
-//! Strict, non-shell `${VAR}` substitution for one manifest scalar.
+//! Strict, non-shell `${VAR}` substitution for a parsed manifest.
 //!
-//! [`scalar`] takes one string and [`Vars`] and returns one string; there is
-//! no document walker here. A later task walks the typed *raw* manifest
-//! field by field and calls [`scalar`] on each string it finds, before that
-//! raw manifest is turned into a [`super::DaemonSpec`] by `resolve_one`.
+//! [`scalar`] substitutes one string; [`manifest`] and [`spec`] walk a
+//! parsed [`RawManifest`] and call [`scalar`] on every string leaf, in
+//! place, before that raw manifest is turned into a
+//! [`super::DaemonSpec`] by `resolve_one`.
 //!
 //! # This must run before `resolve_one`, never after
 //!
@@ -76,8 +76,9 @@
 //! deferring costs one check running slightly later; parsing text that
 //! substitution is about to change parses the wrong string outright. Do
 //! not narrow this function to make that later check fire more often.
-#![cfg_attr(not(test), allow(dead_code))]
 
+use super::raw::{RawManifest, RawSpec};
+use super::user::{AccountId, User};
 use super::vars::Vars;
 use crate::error::{Error, Result};
 
@@ -222,6 +223,167 @@ fn interpolate_error(path: &str, message: String) -> Error {
         path: path.to_string(),
         message,
     }
+}
+
+// The manifest walk ===================================================================================================
+
+/// The `user.id` rejection, byte-exact: a test pins it.
+const USER_ID_MESSAGE: &str = "`user.id` cannot be interpolated: a substituted value is always a string, so it \
+                               would be read as a Windows SID; write the uid literally, or use `user: <name>`";
+
+/// Substitute every `String` leaf of `raw` in place.
+pub(crate) fn manifest(raw: &mut RawManifest, vars: &Vars) -> Result<()> {
+    let RawManifest { daemons } = raw;
+
+    for (id, entry) in daemons.iter_mut() {
+        let path = format!("daemons.{id}");
+        if would_substitution_change(id) {
+            return Err(interpolate_error(
+                &path,
+                "a daemon id cannot be interpolated: ids are map keys, so an interpolated one could collide with \
+                 another daemon or change which installed service an artifact belongs to; write the id literally"
+                    .to_string(),
+            ));
+        }
+        spec(entry, &path, vars)?;
+    }
+
+    Ok(())
+}
+
+/// Substitute every `String` leaf of one daemon entry in place. `path` is
+/// that entry's manifest path (`daemons.<id>`), prefixed onto every error.
+pub(crate) fn spec(raw: &mut RawSpec, path: &str, vars: &Vars) -> Result<()> {
+    // Destructured rather than field-accessed on purpose: a field added to
+    // `RawSpec` stops compiling here until someone decides whether it
+    // interpolates. A walk that reads fields by name would silently skip
+    // the new one, and a silently skipped field is a literal `${VAR}` in a
+    // generated service artifact.
+    let RawSpec {
+        name,
+        command,
+        cwd,
+        env,
+        user,
+        restart,
+        restart_delay,
+        logs,
+        kind,
+    } = raw;
+
+    substitute_option(name, &format!("{path}.name"), vars)?;
+    for (index, arg) in command.iter_mut().enumerate() {
+        *arg = scalar(arg, &format!("{path}.command[{index}]"), vars)?;
+    }
+    substitute_option(cwd, &format!("{path}.cwd"), vars)?;
+    substitute_option(logs, &format!("{path}.logs"), vars)?;
+
+    for (key, value) in env.iter_mut() {
+        let key_path = format!("{path}.env[{key:?}]");
+        if would_substitution_change(key) {
+            return Err(interpolate_error(
+                &key_path,
+                "an `env` name cannot be interpolated: names are map keys, so an interpolated one could silently \
+                 overwrite another entry; write the name literally"
+                    .to_string(),
+            ));
+        }
+        *value = scalar(value, &key_path, vars)?;
+    }
+
+    substitute_user(user, path, vars)?;
+
+    substitute_option(restart, &format!("{path}.restart"), vars)?;
+    substitute_option(restart_delay, &format!("{path}.restart-delay"), vars)?;
+    substitute_option(kind, &format!("{path}.type"), vars)?;
+
+    Ok(())
+}
+
+/// Whether any substitutable leaf of `raw` contains a `$`. Deliberately an
+/// over-approximation of "contains a reference", inherited from
+/// [`would_substitution_change`] — see the module doc comment.
+///
+/// A `$` in a daemon id, an `env` name, or a `user.id` does *not* count: it
+/// is an error [`manifest`] reports by itself, with a message naming the
+/// reason, and answering `true` here would make `load` read `.env` first
+/// and possibly replace that message with an unrelated IO failure.
+pub(crate) fn manifest_would_change(raw: &RawManifest) -> bool {
+    let RawManifest { daemons } = raw;
+    daemons.values().any(spec_would_change)
+}
+
+fn spec_would_change(raw: &RawSpec) -> bool {
+    // Exhaustive for the same reason `spec` is: a new field must be
+    // considered here too, or `load` decides whether to read `.env` from a
+    // stale view of the manifest.
+    let RawSpec {
+        name,
+        command,
+        cwd,
+        env,
+        user,
+        restart,
+        restart_delay,
+        logs,
+        kind,
+    } = raw;
+
+    [name, cwd, logs, restart, restart_delay, kind]
+        .iter()
+        .any(|field| field.as_deref().is_some_and(would_substitution_change))
+        || command.iter().any(|arg| would_substitution_change(arg))
+        || env.values().any(|value| would_substitution_change(value))
+        || user_would_change(user)
+}
+
+/// `user` is the one field whose *deserialization* depends on its value:
+/// `UserVisitor` maps the literal string `root` to `User::Root` and every
+/// other string to `User::Name`, and `"${U}"` is not `root`, so a reference
+/// always arrives as a `Name`. The visitor's rule is therefore re-applied
+/// after substituting, or `user: ${U}` with `U=root` would mean something
+/// different from a literal `user: root`: systemd emits `User=root` instead
+/// of `User=0`, and Windows resolves `Root` to LocalSystem but
+/// `Name("root")` to an account that does not exist, failing the install.
+fn substitute_user(user: &mut Option<User>, path: &str, vars: &Vars) -> Result<()> {
+    match user {
+        // `Root` carries no text, and a `Uid` is a number the YAML parser
+        // already produced — nothing a string could be substituted into.
+        None | Some(User::Root) | Some(User::Id(AccountId::Uid(_))) => Ok(()),
+        Some(User::Id(AccountId::Sid(sid))) => {
+            if would_substitution_change(sid) {
+                return Err(interpolate_error(
+                    &format!("{path}.user.id"),
+                    USER_ID_MESSAGE.to_string(),
+                ));
+            }
+            Ok(())
+        }
+        Some(User::Name(name)) => {
+            let substituted = scalar(name, &format!("{path}.user"), vars)?;
+            *user = Some(if substituted == "root" {
+                User::Root
+            } else {
+                User::Name(substituted)
+            });
+            Ok(())
+        }
+    }
+}
+
+fn user_would_change(user: &Option<User>) -> bool {
+    match user {
+        Some(User::Name(name)) => would_substitution_change(name),
+        None | Some(User::Root) | Some(User::Id(_)) => false,
+    }
+}
+
+/// Substitute an optional field in place; `None` has nothing to substitute.
+fn substitute_option(field: &mut Option<String>, path: &str, vars: &Vars) -> Result<()> {
+    if let Some(value) = field {
+        *value = scalar(value, path, vars)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

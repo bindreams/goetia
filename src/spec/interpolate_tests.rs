@@ -1,6 +1,7 @@
-use super::{scalar, would_substitution_change};
+use super::{manifest, manifest_would_change, scalar, would_substitution_change};
 use crate::error::Error;
 use crate::spec::vars::Vars;
+use crate::spec::{AccountId, RawManifest, User};
 
 /// Substitute `input` against `vars` at a fixed test path.
 fn sub(input: &str, vars: &Vars) -> Result<String, Error> {
@@ -223,4 +224,136 @@ fn errors_carry_the_supplied_path() {
         Error::Interpolate { path, .. } => assert_eq!(path, "daemons.example.name"),
         other => panic!("expected Error::Interpolate, got: {other:?}"),
     }
+}
+
+// The manifest walk ===================================================================================================
+
+/// Parse a manifest fixture, substitute it against `pairs`, and hand back
+/// the mutated manifest.
+fn interpolate_yaml(yaml: &str, pairs: &[(&str, &str)]) -> Result<RawManifest, Error> {
+    let mut raw: RawManifest = serde_yaml_ng::from_str(yaml).expect("fixture yaml should parse");
+    manifest(&mut raw, &Vars::from_pairs(pairs))?;
+    Ok(raw)
+}
+
+#[skuld::test]
+fn substitutes_every_string_leaf() {
+    let yaml = r#"
+daemons:
+  frpc:
+    name: ${NAME}
+    command: ["${BIN}", "--flag=${FLAG}"]
+    cwd: ${CWD}
+    logs: ${LOGS}
+    env:
+      LOG: ${LEVEL}
+    user: ${USER_NAME}
+    restart: ${RESTART}
+    restart-delay: ${DELAY}
+    type: ${TYPE}
+"#;
+    let raw = interpolate_yaml(
+        yaml,
+        &[
+            ("NAME", "Frpc Tunnel"),
+            ("BIN", "/usr/bin/frpc"),
+            ("FLAG", "on"),
+            ("CWD", "/opt/frpc"),
+            ("LOGS", "/var/log/frpc.log"),
+            ("LEVEL", "info"),
+            ("USER_NAME", "svc-frpc"),
+            ("RESTART", "always"),
+            ("DELAY", "2s"),
+            ("TYPE", "managed"),
+        ],
+    )
+    .unwrap();
+
+    let spec = &raw.daemons["frpc"];
+    assert_eq!(spec.name.as_deref(), Some("Frpc Tunnel"));
+    assert_eq!(spec.command, vec!["/usr/bin/frpc", "--flag=on"]);
+    assert_eq!(spec.cwd.as_deref(), Some("/opt/frpc"));
+    assert_eq!(spec.logs.as_deref(), Some("/var/log/frpc.log"));
+    assert_eq!(spec.env["LOG"], "info");
+    assert_eq!(spec.user, Some(User::Name("svc-frpc".to_string())));
+    assert_eq!(spec.restart.as_deref(), Some("always"));
+    assert_eq!(spec.restart_delay.as_deref(), Some("2s"));
+    assert_eq!(spec.kind.as_deref(), Some("managed"));
+}
+
+#[skuld::test]
+fn a_dollar_in_a_daemon_id_is_an_error() {
+    let yaml = "daemons:\n  ${ID}:\n    command: [/bin/frpc]\n";
+    let err = interpolate_yaml(yaml, &[("ID", "frpc")]).unwrap_err();
+    assert!(
+        err.to_string().contains("a daemon id cannot be interpolated"),
+        "expected an id-is-a-key rejection, got: {err}"
+    );
+}
+
+#[skuld::test]
+fn a_dollar_in_an_env_name_is_an_error() {
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    env:\n      ${KEY}: value\n";
+    let err = interpolate_yaml(yaml, &[("KEY", "LOG")]).unwrap_err();
+    assert!(
+        err.to_string().contains("an `env` name cannot be interpolated"),
+        "expected an env-name-is-a-key rejection, got: {err}"
+    );
+}
+
+#[skuld::test]
+fn an_env_name_containing_a_dot_is_not_mistaken_for_user_id() {
+    // The walk dispatches on the struct, never on a rendered field path, so
+    // an `env` key that happens to spell one cannot pick up that field's
+    // rule.
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    env:\n      MY_user.id: ${TOKEN}\n";
+    let raw = interpolate_yaml(yaml, &[("TOKEN", "s3cret")]).unwrap();
+    assert_eq!(raw.daemons["frpc"].env["MY_user.id"], "s3cret");
+}
+
+#[skuld::test]
+fn a_dollar_under_user_id_is_an_error() {
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user:\n      id: \"${SID}\"\n";
+    let err = interpolate_yaml(yaml, &[("SID", "S-1-5-21-1")]).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "daemons.frpc.user.id: `user.id` cannot be interpolated: a substituted value is always a string, \
+         so it would be read as a Windows SID; write the uid literally, or use `user: <name>`"
+    );
+}
+
+#[skuld::test]
+fn a_numeric_user_id_is_untouched() {
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user:\n      id: 1001\n";
+    let raw = interpolate_yaml(yaml, &[]).unwrap();
+    assert_eq!(raw.daemons["frpc"].user, Some(User::Id(AccountId::Uid(1001))));
+}
+
+#[skuld::test]
+fn an_interpolated_user_of_root_normalises_to_the_root_variant() {
+    // `UserVisitor` maps the literal string `root` to `User::Root`, and
+    // `"${U}" != "root"`, so without re-normalisation this would be
+    // `User::Name("root")` — which systemd emits as `User=root` rather than
+    // `User=0`, and which Windows resolves to a nonexistent account.
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user: ${U}\n";
+    let raw = interpolate_yaml(yaml, &[("U", "root")]).unwrap();
+
+    let literal: RawManifest =
+        serde_yaml_ng::from_str("daemons:\n  frpc:\n    command: [/bin/frpc]\n    user: root\n").unwrap();
+    assert_eq!(raw.daemons["frpc"].user, Some(User::Root));
+    assert_eq!(raw.daemons["frpc"].user, literal.daemons["frpc"].user);
+}
+
+#[skuld::test]
+fn manifest_would_change_is_true_for_an_escaped_dollar_only() {
+    // The over-approximation, pinned at manifest level: a `$$` escape has
+    // no reference to resolve, yet still reports `true`. See the module doc
+    // comment — narrowing this is a defect, not an optimisation.
+    let escaped: RawManifest =
+        serde_yaml_ng::from_str("daemons:\n  frpc:\n    command: [/bin/frpc, $$ARGS]\n").unwrap();
+    assert!(manifest_would_change(&escaped));
+
+    let dollarless: RawManifest =
+        serde_yaml_ng::from_str("daemons:\n  frpc:\n    command: [/bin/frpc, --flag]\n").unwrap();
+    assert!(!manifest_would_change(&dollarless));
 }
