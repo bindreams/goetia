@@ -14,6 +14,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use super::raw::RawManifest;
 use super::user::{AccountId, User};
@@ -111,10 +112,21 @@ fn resolve_one(id: Id, raw: RawSpec, base_dir: &Path, warnings: &mut Vec<Warning
         User::Id(AccountId::Uid(_)) => {}
     }
 
-    let restart = raw.restart.unwrap_or(Restart::Never);
-    warn_on_sub_second_restart_delay(&id, raw.restart_delay, warnings);
+    let restart = match raw.restart {
+        Some(raw_restart) => parse_restart(&id, &raw_restart)?,
+        None => Restart::Never,
+    };
 
-    let kind = raw.kind.unwrap_or(Kind::Simple);
+    let restart_delay = match raw.restart_delay {
+        Some(raw_delay) => Some(parse_restart_delay(&id, &raw_delay)?),
+        None => None,
+    };
+    warn_on_sub_second_restart_delay(&id, restart_delay, warnings);
+
+    let kind = match raw.kind {
+        Some(raw_kind) => parse_kind(&id, &raw_kind)?,
+        None => Kind::Simple,
+    };
     warn_on_windows_divergences(&id, kind, cwd.is_some(), logs.is_some(), restart, warnings);
 
     // The absoluteness guarantee has exactly one runtime enforcement point
@@ -140,9 +152,57 @@ fn resolve_one(id: Id, raw: RawSpec, base_dir: &Path, warnings: &mut Vec<Warning
         env,
         user,
         restart,
-        restart_delay: raw.restart_delay,
+        restart_delay,
         logs,
         kind,
+    })
+}
+
+/// Parse an authored `restart:` string into a [`Restart`]. `pub(crate)`
+/// rather than private: the backend-specific-override item's two-phase
+/// resolution needs to call this from whichever phase can honestly run it,
+/// once a field can also arrive from a per-backend override rather than
+/// only from here.
+///
+/// A `String` field parsed here, rather than a derived `Deserialize` on
+/// `Restart` itself, is what lets `restart: ${R}` be interpolated before
+/// this ever runs — a derived `Deserialize` would reject `${R}` as an
+/// unknown variant at YAML-parse time, before interpolation gets a chance.
+pub(crate) fn parse_restart(id: &Id, raw: &str) -> Result<Restart, Error> {
+    match raw {
+        "never" => Ok(Restart::Never),
+        "on-failure" => Ok(Restart::OnFailure),
+        "always" => Ok(Restart::Always),
+        other => Err(invalid(
+            id,
+            &format!("field `restart` is `{other}`; expected one of `never`, `on-failure`, `always`"),
+        )),
+    }
+}
+
+/// Parse an authored `type:` string into a [`Kind`]. `pub(crate)`: see
+/// [`parse_restart`].
+pub(crate) fn parse_kind(id: &Id, raw: &str) -> Result<Kind, Error> {
+    match raw {
+        "simple" => Ok(Kind::Simple),
+        "managed" => Ok(Kind::Managed),
+        other => Err(invalid(
+            id,
+            &format!("field `type` is `{other}`; expected one of `simple`, `managed`"),
+        )),
+    }
+}
+
+/// Parse an authored `restart-delay:` string into a [`Duration`], replacing
+/// `humantime_serde`'s serde-time parse (accepted syntax is unchanged:
+/// `humantime_serde` was itself a thin wrapper over
+/// `humantime::parse_duration`). `pub(crate)`: see [`parse_restart`].
+pub(crate) fn parse_restart_delay(id: &Id, raw: &str) -> Result<Duration, Error> {
+    humantime::parse_duration(raw).map_err(|source| {
+        invalid(
+            id,
+            &format!("field `restart-delay` is `{raw}`, which is not a duration (e.g. `30s`, `1m 30s`): {source}"),
+        )
     })
 }
 
@@ -421,7 +481,7 @@ fn invalid(id: &Id, message: &str) -> Error {
 /// integer seconds: `500ms` would truncate to `0`, which *disables*
 /// throttling and yields an unbounded respawn storm. Warn here so the
 /// rounding is not a silent surprise at install time.
-fn warn_on_sub_second_restart_delay(id: &Id, restart_delay: Option<std::time::Duration>, warnings: &mut Vec<Warning>) {
+fn warn_on_sub_second_restart_delay(id: &Id, restart_delay: Option<Duration>, warnings: &mut Vec<Warning>) {
     let Some(delay) = restart_delay else { return };
     if delay.subsec_nanos() == 0 {
         return;

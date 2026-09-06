@@ -196,6 +196,61 @@ fn resolve_rejects_empty_command() {
     assert!(err.to_string().contains("command"));
 }
 
+// Field parsing (restart, type, restart-delay) ========================================================================
+
+#[skuld::test]
+fn resolve_parses_each_restart_policy() {
+    for (raw, expected) in [
+        ("never", Restart::Never),
+        ("on-failure", Restart::OnFailure),
+        ("always", Restart::Always),
+    ] {
+        let yaml = format!("daemons:\n  frpc:\n    command: [bin/frpc]\n    restart: {raw}\n");
+        let (specs, _) = resolve_yaml(&yaml).unwrap_or_else(|e| panic!("`restart: {raw}` should resolve: {e}"));
+        assert_eq!(specs[0].restart, expected, "restart: {raw}");
+    }
+}
+
+#[skuld::test]
+fn resolve_parses_each_type() {
+    for (raw, expected) in [("simple", Kind::Simple), ("managed", Kind::Managed)] {
+        let yaml = format!("daemons:\n  frpc:\n    command: [bin/frpc]\n    type: {raw}\n");
+        let (specs, _) = resolve_yaml(&yaml).unwrap_or_else(|e| panic!("`type: {raw}` should resolve: {e}"));
+        assert_eq!(specs[0].kind, expected, "type: {raw}");
+    }
+}
+
+#[skuld::test]
+fn an_unknown_restart_policy_names_the_daemon_and_the_valid_values() {
+    let yaml = "daemons:\n  frpc:\n    command: [bin/frpc]\n    restart: sometimes\n";
+    let err = resolve_yaml(yaml).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "daemon `frpc`: field `restart` is `sometimes`; expected one of `never`, `on-failure`, `always`"
+    );
+}
+
+#[skuld::test]
+fn an_unknown_type_names_the_daemon_and_the_valid_values() {
+    let yaml = "daemons:\n  frpc:\n    command: [bin/frpc]\n    type: complicated\n";
+    let err = resolve_yaml(yaml).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "daemon `frpc`: field `type` is `complicated`; expected one of `simple`, `managed`"
+    );
+}
+
+#[skuld::test]
+fn a_malformed_restart_delay_names_the_daemon_and_shows_an_example() {
+    let yaml = "daemons:\n  frpc:\n    command: [bin/frpc]\n    restart-delay: not-a-duration\n";
+    let err = resolve_yaml(yaml).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "daemon `frpc`: field `restart-delay` is `not-a-duration`, which is not a duration \
+         (e.g. `30s`, `1m 30s`): expected number at 0"
+    );
+}
+
 // Warnings ============================================================================================================
 
 #[skuld::test]
@@ -288,6 +343,25 @@ daemons:
 "#;
     let (specs, warnings) = resolve_yaml(yaml).unwrap();
     assert_eq!(specs[0].restart_delay, Some(Duration::from_secs(2)));
+    assert!(warnings.is_empty());
+}
+
+/// The warning above now runs on a `Duration` parsed by `parse_restart_delay`
+/// rather than one `humantime_serde` produced during deserialization — pin
+/// that moving the parse did not move the threshold too.
+#[skuld::test]
+fn a_sub_second_restart_delay_still_warns() {
+    let yaml = "daemons:\n  frpc:\n    command: [bin/frpc]\n    restart-delay: 500ms\n";
+    let (specs, warnings) = resolve_yaml(yaml).expect("accepted with a warning, not rejected");
+    assert_eq!(specs[0].restart_delay, Some(Duration::from_millis(500)));
+    assert_eq!(warnings.len(), 1);
+}
+
+#[skuld::test]
+fn a_whole_second_restart_delay_still_does_not_warn() {
+    let yaml = "daemons:\n  frpc:\n    command: [bin/frpc]\n    restart-delay: 3s\n";
+    let (specs, warnings) = resolve_yaml(yaml).unwrap();
+    assert_eq!(specs[0].restart_delay, Some(Duration::from_secs(3)));
     assert!(warnings.is_empty());
 }
 
