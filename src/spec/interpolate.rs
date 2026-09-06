@@ -78,7 +78,7 @@
 //! not narrow this function to make that later check fire more often.
 
 use super::raw::{RawManifest, RawSpec};
-use super::user::{AccountId, User};
+use super::user::{AccountId, RawUser};
 use super::vars::Vars;
 use crate::error::{Error, Result};
 
@@ -337,20 +337,18 @@ fn spec_would_change(raw: &RawSpec) -> bool {
         || user_would_change(user)
 }
 
-/// `user` is the one field whose *deserialization* depends on its value:
-/// `UserVisitor` maps the literal string `root` to `User::Root` and every
-/// other string to `User::Name`, and `"${U}"` is not `root`, so a reference
-/// always arrives as a `Name`. The visitor's rule is therefore re-applied
-/// after substituting, or `user: ${U}` with `U=root` would mean something
-/// different from a literal `user: root`: systemd emits `User=root` instead
-/// of `User=0`, and Windows resolves `Root` to LocalSystem but
-/// `Name("root")` to an account that does not exist, failing the install.
-fn substitute_user(user: &mut Option<User>, path: &str, vars: &Vars) -> Result<()> {
+/// Substitute the authored `user:` text, whichever form it was written
+/// in. No reserved-word mapping happens here: `resolve::resolve_user`
+/// applies the `root` rule to the substituted text exactly as it does to
+/// authored text, so `user: ${U}` with `U=root` means what `user: root`
+/// means, and `{name: ${U}}` means what `{name: root}` means — a literal
+/// account named `root`, which is that form's entire purpose.
+fn substitute_user(user: &mut Option<RawUser>, path: &str, vars: &Vars) -> Result<()> {
     match user {
-        // `Root` carries no text, and a `Uid` is a number the YAML parser
-        // already produced — nothing a string could be substituted into.
-        None | Some(User::Root) | Some(User::Id(AccountId::Uid(_))) => Ok(()),
-        Some(User::Id(AccountId::Sid(sid))) => {
+        // A `Uid` is a number the YAML parser already produced — nothing a
+        // string could be substituted into.
+        None | Some(RawUser::Id(AccountId::Uid(_))) => Ok(()),
+        Some(RawUser::Id(AccountId::Sid(sid))) => {
             if would_substitution_change(sid) {
                 return Err(interpolate_error(
                     &format!("{path}.user.id"),
@@ -359,22 +357,22 @@ fn substitute_user(user: &mut Option<User>, path: &str, vars: &Vars) -> Result<(
             }
             Ok(())
         }
-        Some(User::Name(name)) => {
-            let substituted = scalar(name, &format!("{path}.user"), vars)?;
-            *user = Some(if substituted == "root" {
-                User::Root
-            } else {
-                User::Name(substituted)
-            });
+        Some(RawUser::Scalar(text)) => {
+            *text = scalar(text, &format!("{path}.user"), vars)?;
+            Ok(())
+        }
+        Some(RawUser::Name(name)) => {
+            *name = scalar(name, &format!("{path}.user.name"), vars)?;
             Ok(())
         }
     }
 }
 
-fn user_would_change(user: &Option<User>) -> bool {
+fn user_would_change(user: &Option<RawUser>) -> bool {
     match user {
-        Some(User::Name(name)) => would_substitution_change(name),
-        None | Some(User::Root) | Some(User::Id(_)) => false,
+        Some(RawUser::Scalar(text)) => would_substitution_change(text),
+        Some(RawUser::Name(name)) => would_substitution_change(name),
+        None | Some(RawUser::Id(_)) => false,
     }
 }
 

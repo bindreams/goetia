@@ -1,24 +1,50 @@
 //! The `user:` field: a bare string, or a struct with exactly one of `name`
 //! or `id`.
 //!
+//! [`RawUser`] is what deserializes; [`User`] is what `resolve` produces
+//! from it. They are separate types because the `root` reserved word
+//! applies to the bare string form *only* — see [`RawUser`] — and once a
+//! bare `root` has become `User::Root`, nothing records which syntax it
+//! came from, so the rule cannot be re-applied to a substituted value
+//! without also mis-applying it to the struct form.
+//!
 //! `#[derive(Deserialize)]` with `#[serde(untagged)]` was tried and
-//! rejected for `User` itself: serde's untagged deserializer buffers the
-//! whole value, tries every variant in turn, and on failure reports every
-//! attempt squashed into one message — for a struct with a typo'd field
-//! name, nothing in that message names the offending field. `User`'s
-//! `Deserialize` is hand-written instead, so a bad value still does.
+//! rejected for the deserialized type: serde's untagged deserializer
+//! buffers the whole value, tries every variant in turn, and on failure
+//! reports every attempt squashed into one message — for a struct with a
+//! typo'd field name, nothing in that message names the offending field.
+//! `RawUser`'s `Deserialize` is hand-written instead, so a bad value still
+//! does.
 
 use std::fmt;
 
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
+/// The `user:` field exactly as authored, before the `root` reserved word
+/// is applied. `RawSpec` holds one of these so that interpolation can
+/// substitute the text and `resolve` can then apply that rule to the
+/// result, exactly as it would to text the author typed — see the module
+/// doc comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawUser {
+    /// A bare string: `user: root` or `user: bindreams`. The only form the
+    /// `root` reserved word applies to.
+    Scalar(String),
+    /// `{name: ...}`: always a literal username, with no special-casing —
+    /// this form is the escape hatch for an account genuinely called
+    /// `root`.
+    Name(String),
+    /// `{id: ...}`: a numeric UID, or a Windows SID string.
+    Id(AccountId),
+}
+
 /// A resolved account identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum User {
-    /// The bare string `root`, or `{name: root}`: the platform's
-    /// superuser, emitted explicitly (`User=0`, `LocalSystem`,
-    /// `UserName: root`).
+    /// The bare string `root`: the platform's superuser, emitted
+    /// explicitly (`User=0`, `LocalSystem`, `UserName: root`). Reached
+    /// only from `RawUser::Scalar`, never from `{name: root}`.
     Root,
     /// Any other bare string, or `{name: ...}` — including `{name: root}`,
     /// which is the literal username `"root"` with no special-casing.
@@ -36,7 +62,7 @@ pub enum AccountId {
     Sid(String),
 }
 
-impl<'de> Deserialize<'de> for User {
+impl<'de> Deserialize<'de> for RawUser {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -48,31 +74,30 @@ impl<'de> Deserialize<'de> for User {
 struct UserVisitor;
 
 impl<'de> Visitor<'de> for UserVisitor {
-    type Value = User;
+    type Value = RawUser;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("a username string, `root`, or a struct with exactly one of `name` or `id`")
     }
 
-    fn visit_str<E>(self, v: &str) -> Result<User, E>
+    /// The bare string is carried through verbatim: `root` is a reserved
+    /// word here, but applying it is `resolve`'s job, after interpolation
+    /// has had its turn at the text.
+    fn visit_str<E>(self, v: &str) -> Result<RawUser, E>
     where
         E: de::Error,
     {
-        Ok(if v == "root" {
-            User::Root
-        } else {
-            User::Name(v.to_owned())
-        })
+        Ok(RawUser::Scalar(v.to_owned()))
     }
 
-    fn visit_string<E>(self, v: String) -> Result<User, E>
+    fn visit_string<E>(self, v: String) -> Result<RawUser, E>
     where
         E: de::Error,
     {
-        self.visit_str(&v)
+        Ok(RawUser::Scalar(v))
     }
 
-    fn visit_map<A>(self, mut map: A) -> Result<User, A::Error>
+    fn visit_map<A>(self, mut map: A) -> Result<RawUser, A::Error>
     where
         A: MapAccess<'de>,
     {
@@ -98,8 +123,8 @@ impl<'de> Visitor<'de> for UserVisitor {
         }
 
         match (name, id) {
-            (Some(name), None) => Ok(User::Name(name)),
-            (None, Some(id)) => Ok(User::Id(id)),
+            (Some(name), None) => Ok(RawUser::Name(name)),
+            (None, Some(id)) => Ok(RawUser::Id(id)),
             (Some(_), Some(_)) => Err(de::Error::custom(
                 "user struct must set exactly one of `name` or `id`, not both",
             )),

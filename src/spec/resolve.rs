@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use super::interpolate;
 use super::raw::RawManifest;
-use super::user::{AccountId, User};
+use super::user::{AccountId, RawUser, User};
 use super::vars::Vars;
 use super::{DaemonSpec, Id, Kind, RawSpec, Restart, Warning};
 use crate::error::Error;
@@ -115,7 +115,7 @@ fn resolve_one(id: Id, raw: RawSpec, base_dir: &Path, warnings: &mut Vec<Warning
         env.insert(key, value);
     }
 
-    let user = raw.user.unwrap_or(User::Root);
+    let user = resolve_user(raw.user);
     match &user {
         User::Root => {}
         User::Name(n) => {
@@ -173,6 +173,28 @@ fn resolve_one(id: Id, raw: RawSpec, base_dir: &Path, warnings: &mut Vec<Warning
         logs,
         kind,
     })
+}
+
+/// Apply the `root` reserved word to an authored [`RawUser`], and default
+/// an absent `user:` to [`User::Root`].
+///
+/// The rule is the bare string form's alone: `user: root` is the
+/// superuser, while `{name: root}` is the literal account called `root`,
+/// which is that form's whole purpose. Applying it here rather than in
+/// `RawUser`'s visitor is what lets `user: ${U}` with `U=root` mean
+/// exactly what a typed `user: root` means, without `{name: ${U}}` also
+/// collapsing to the superuser — a `User::Name` carries no record of
+/// which syntax produced it, so a post-substitution re-normalisation
+/// cannot tell the two apart. Same reasoning as [`parse_restart`], on the
+/// one field whose *deserialization* was value-dependent.
+pub(crate) fn resolve_user(raw: Option<RawUser>) -> User {
+    match raw {
+        None => User::Root,
+        Some(RawUser::Scalar(s)) if s == "root" => User::Root,
+        Some(RawUser::Scalar(s)) => User::Name(s),
+        Some(RawUser::Name(s)) => User::Name(s),
+        Some(RawUser::Id(id)) => User::Id(id),
+    }
 }
 
 /// Parse an authored `restart:` string into a [`Restart`]. `pub(crate)`

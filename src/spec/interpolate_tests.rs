@@ -1,7 +1,8 @@
 use super::{manifest, manifest_would_change, scalar, would_substitution_change};
 use crate::error::Error;
+use crate::spec::resolve::resolve_user;
 use crate::spec::vars::Vars;
-use crate::spec::{AccountId, RawManifest, User};
+use crate::spec::{AccountId, RawManifest, RawUser, User};
 
 /// Substitute `input` against `vars` at a fixed test path.
 fn sub(input: &str, vars: &Vars) -> Result<String, Error> {
@@ -275,7 +276,7 @@ daemons:
     assert_eq!(spec.cwd.as_deref(), Some("/opt/frpc"));
     assert_eq!(spec.logs.as_deref(), Some("/var/log/frpc.log"));
     assert_eq!(spec.env["LOG"], "info");
-    assert_eq!(spec.user, Some(User::Name("svc-frpc".to_string())));
+    assert_eq!(spec.user, Some(RawUser::Scalar("svc-frpc".to_string())));
     assert_eq!(spec.restart.as_deref(), Some("always"));
     assert_eq!(spec.restart_delay.as_deref(), Some("2s"));
     assert_eq!(spec.kind.as_deref(), Some("managed"));
@@ -326,22 +327,43 @@ fn a_dollar_under_user_id_is_an_error() {
 fn a_numeric_user_id_is_untouched() {
     let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user:\n      id: 1001\n";
     let raw = interpolate_yaml(yaml, &[]).unwrap();
-    assert_eq!(raw.daemons["frpc"].user, Some(User::Id(AccountId::Uid(1001))));
+    assert_eq!(raw.daemons["frpc"].user, Some(RawUser::Id(AccountId::Uid(1001))));
+}
+
+/// The `user:` of the single daemon in `yaml`, substituted and then
+/// resolved — the two halves `load` runs back to back.
+fn interpolated_user(yaml: &str, pairs: &[(&str, &str)]) -> User {
+    let raw = interpolate_yaml(yaml, pairs).unwrap();
+    resolve_user(raw.daemons["frpc"].user.clone())
 }
 
 #[skuld::test]
 fn an_interpolated_user_of_root_normalises_to_the_root_variant() {
-    // `UserVisitor` maps the literal string `root` to `User::Root`, and
-    // `"${U}" != "root"`, so without re-normalisation this would be
-    // `User::Name("root")` — which systemd emits as `User=root` rather than
-    // `User=0`, and which Windows resolves to a nonexistent account.
-    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user: ${U}\n";
-    let raw = interpolate_yaml(yaml, &[("U", "root")]).unwrap();
+    // The bare string form is the one the `root` reserved word applies to,
+    // and a substituted value must mean what the same text typed by hand
+    // means: `User::Name("root")` would make systemd emit `User=root`
+    // rather than `User=0`, and Windows resolve a nonexistent account.
+    let interpolated = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user: ${U}\n";
+    let literal = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user: root\n";
 
-    let literal: RawManifest =
-        serde_yaml_ng::from_str("daemons:\n  frpc:\n    command: [/bin/frpc]\n    user: root\n").unwrap();
-    assert_eq!(raw.daemons["frpc"].user, Some(User::Root));
-    assert_eq!(raw.daemons["frpc"].user, literal.daemons["frpc"].user);
+    assert_eq!(interpolated_user(interpolated, &[("U", "root")]), User::Root);
+    assert_eq!(interpolated_user(literal, &[]), User::Root);
+}
+
+#[skuld::test]
+fn an_interpolated_user_name_of_root_stays_a_literal_account() {
+    // The mirror image, and the reason the reserved word is `resolve`'s to
+    // apply rather than something re-applied to a substituted `User::Name`:
+    // `{name: ...}` is the escape hatch for an account genuinely called
+    // `root`, so `{name: ${U}}` with `U=root` must mean exactly what
+    // `{name: root}` means. Collapsing it to `Root` would silently install
+    // as LocalSystem on Windows where the authored form fails closed.
+    let interpolated = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user:\n      name: ${U}\n";
+    let literal = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user:\n      name: root\n";
+    let expected = User::Name("root".to_string());
+
+    assert_eq!(interpolated_user(interpolated, &[("U", "root")]), expected);
+    assert_eq!(interpolated_user(literal, &[]), expected);
 }
 
 #[skuld::test]

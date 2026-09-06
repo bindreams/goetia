@@ -847,21 +847,36 @@ fn load_reports_original_positions() {
 #[skuld::test]
 fn interpolated_values_pass_through_the_injection_gate() {
     // Substitution happens before `resolve`, so a `.env` value carrying a
-    // control character is rejected by the same gate a literal one hits.
+    // control character is rejected by the same gate a literal one hits —
+    // on every leaf that reaches a generated artifact, not just `name`.
     // `.env` cannot express a newline at all (`vars.rs` rejects both the
     // `\n` escape and a multi-line value), so this uses the worst control
     // character it *can* carry.
-    let dir = fixture_dir(
-        "daemons:\n  frpc:\n    name: ${NAME}\n    command: [/bin/frpc]\n",
-        Some("NAME='evil\u{1b}[2Jclear'\n"),
-    );
+    let leaves = [
+        ("name", "    name: ${EVIL}\n    command: [/bin/frpc]\n"),
+        ("command", "    command: [/bin/frpc, \"${EVIL}\"]\n"),
+        ("cwd", "    command: [/bin/frpc]\n    cwd: ${EVIL}\n"),
+        ("logs", "    command: [/bin/frpc]\n    logs: ${EVIL}\n"),
+        ("env value", "    command: [/bin/frpc]\n    env:\n      LOG: ${EVIL}\n"),
+        ("user", "    command: [/bin/frpc]\n    user: ${EVIL}\n"),
+    ];
 
-    let err = load(dir.path()).unwrap_err();
-    assert!(matches!(err, Error::Invalid { .. }), "expected Invalid, got: {err:?}");
-    assert!(
-        err.to_string().contains("control character"),
-        "expected the control-character gate, got: {err}"
-    );
+    for (leaf, body) in leaves {
+        let dir = fixture_dir(
+            &format!("daemons:\n  frpc:\n{body}"),
+            Some("EVIL='evil\u{1b}[2Jclear'\n"),
+        );
+
+        let err = load(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, Error::Invalid { .. }),
+            "{leaf}: expected Invalid, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("control character"),
+            "{leaf}: expected the control-character gate, got: {err}"
+        );
+    }
 }
 
 #[skuld::test]
