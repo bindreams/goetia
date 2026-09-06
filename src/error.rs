@@ -23,6 +23,11 @@ pub enum Error {
         message: String,
     },
 
+    /// A `${VAR}` reference in the manifest could not be resolved, or a `$`
+    /// appeared where the interpolation grammar forbids one.
+    #[error("{path}: {message}")]
+    Interpolate { path: String, message: String },
+
     /// The document is not valid YAML, or fails a shape-level constraint
     /// checked during deserialization: a duplicate or case-insensitively
     /// colliding daemon id, or a malformed `user` field. `serde_yaml_ng`

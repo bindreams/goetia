@@ -7,6 +7,7 @@
 //! re-derive them. There is no separate `validate()` function anywhere in
 //! the crate; `resolve` is both parse and validate.
 
+mod interpolate;
 mod raw;
 mod resolve;
 mod user;
