@@ -45,6 +45,74 @@ fn write_manifest(dir: &Path, yaml: &str) -> PathBuf {
     path
 }
 
+// One `(Fake, manifest)` builder per `decide::Outcome` class `diff` can see,
+// shared by every test that only needs that one outcome for a single
+// daemon — the tests that mix several outcomes in one run build their own
+// manifest instead, since what they exercise is precisely the combination.
+
+/// `id` absent from the store: `diff` reports `Outcome::Create`.
+fn absent_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
+    let fake = Fake::new();
+    let manifest = write_manifest(dir, &format!("daemons:\n  {id}:\n    command: [daemon]\n"));
+    (fake, manifest)
+}
+
+/// `id` installed with `restart: never`, against a manifest asking for
+/// `restart: on-failure`: `diff` reports `Outcome::Update`, a clean spec
+/// change with no hand-edit.
+fn update_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
+    let fake = Fake::new();
+    let mut old = mk(id);
+    old.restart = Restart::Never;
+    fake.install(&old, false).unwrap();
+    let manifest = write_manifest(
+        dir,
+        &format!("daemons:\n  {id}:\n    command: [daemon]\n    restart: on-failure\n"),
+    );
+    (fake, manifest)
+}
+
+/// `id` installed then hand-edited outside Goetia: `diff` reports
+/// `Outcome::Conflict`.
+fn hand_edited_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
+    let fake = Fake::new();
+    fake.install_then_hand_edit(&mk(id), "# hand-added directive\n");
+    let manifest = write_manifest(dir, &format!("daemons:\n  {id}:\n    command: [daemon]\n"));
+    (fake, manifest)
+}
+
+/// An unmarked entry at `id`: `diff` reports `Outcome::RefuseForeign`.
+fn foreign_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
+    let fake = Fake::new();
+    fake.seed_foreign(id, "not a goetia artifact at all\n");
+    let manifest = write_manifest(dir, &format!("daemons:\n  {id}:\n    command: [daemon]\n"));
+    (fake, manifest)
+}
+
+/// An undecodable Goetia-marked entry at `id`: `diff` reports
+/// `Outcome::RefuseUnreadable`.
+fn unreadable_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
+    let fake = Fake::new();
+    fake.seed_unreadable(id);
+    let manifest = write_manifest(dir, &format!("daemons:\n  {id}:\n    command: [daemon]\n"));
+    (fake, manifest)
+}
+
+/// `id` installed with exactly `resolve()`'s own output for the manifest
+/// below: `diff` reports `Outcome::UpToDate`. Installing a literal `mk(id)`
+/// instead would never match: `resolve()` makes `command[0]` absolute
+/// against the manifest's directory.
+fn up_to_date_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
+    let fake = Fake::new();
+    let manifest = write_manifest(
+        dir,
+        &format!("daemons:\n  {id}:\n    command: [{id}]\n    restart: on-failure\n"),
+    );
+    let (specs, _warnings) = goetia::spec::load(&manifest).expect("load fixture manifest");
+    fake.install(&specs[0], false).expect("seed install");
+    (fake, manifest)
+}
+
 /// Parse `args` and dispatch against an arbitrary `get_manager` closure,
 /// capturing stdout/stderr as strings. The lowest of the three layers here,
 /// for the paths where obtaining a manager is itself what fails, and for
@@ -514,16 +582,8 @@ fn status_with_no_ids_prints_the_pid_like_the_per_id_form() {
 
 #[skuld::test]
 fn diff_reaches_the_manager() {
-    let fake = Fake::new();
-    let mut old = mk("frpc");
-    old.restart = Restart::Never;
-    fake.install(&old, false).unwrap();
-
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(
-        dir.path(),
-        "daemons:\n  frpc:\n    command: [daemon]\n    restart: on-failure\n",
-    );
+    let (fake, manifest) = update_fixture(dir.path(), "frpc");
 
     let (code, out, _err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
 
@@ -679,11 +739,8 @@ fn show_unknown_id_is_not_installed() {
 /// `install`, which exits `1` here because it genuinely failed to install.
 #[skuld::test]
 fn diff_exits_four_when_the_installed_artifact_cannot_be_read() {
-    let fake = Fake::new();
-    fake.seed_unreadable("corrupt");
-
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  corrupt:\n    command: [daemon]\n");
+    let (fake, manifest) = unreadable_fixture(dir.path(), "corrupt");
 
     let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
 
@@ -694,19 +751,8 @@ fn diff_exits_four_when_the_installed_artifact_cannot_be_read() {
 
 #[skuld::test]
 fn diff_reports_up_to_date_when_the_spec_is_unchanged() {
-    let fake = Fake::new();
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(
-        dir.path(),
-        "daemons:\n  frpc:\n    command: [frpc]\n    restart: on-failure\n",
-    );
-
-    // Install the manifest's own resolved spec directly, rather than a
-    // hand-built one: `resolve()` makes `command[0]` absolute against the
-    // manifest's directory, which a literal `mk("frpc")` fixture would not
-    // match, making the diff always non-empty for the wrong reason.
-    let (specs, _warnings) = goetia::spec::load(&manifest).expect("load fixture manifest");
-    fake.install(&specs[0], false).expect("seed install");
+    let (fake, manifest) = up_to_date_fixture(dir.path(), "frpc");
 
     let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
 
@@ -716,10 +762,8 @@ fn diff_reports_up_to_date_when_the_spec_is_unchanged() {
 
 #[skuld::test]
 fn diff_reports_not_installed_for_an_id_absent_from_the_manager() {
-    let fake = Fake::new();
-
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [frpc]\n");
+    let (fake, manifest) = absent_fixture(dir.path(), "frpc");
 
     let (code, out, _err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
 
@@ -796,11 +840,8 @@ fn status_single_id_errors_on_an_unreadable_entry_instead_of_fabricating_state()
 /// code for the identical outcome (Task 8 moved conflict off `2`).
 #[skuld::test]
 fn diff_exits_five_for_a_hand_edited_artifact() {
-    let fake = Fake::new();
-    fake.install_then_hand_edit(&mk("frpc"), "# hand-added directive\n");
-
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let (fake, manifest) = hand_edited_fixture(dir.path(), "frpc");
 
     let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
 
@@ -903,26 +944,10 @@ fn enable_aggregates_across_multiple_ids() {
 // and `cli::report::precedence`) — never `max()`. The tests below pin each
 // class in isolation and every precedence-relevant pairing.
 
-/// Seed `dir` with a one-daemon manifest and a `Fake` whose installed spec
-/// is exactly `resolve()`'s own output for it, so `diff` reports `UpToDate`.
-/// Installing a literal `mk(id)` instead would never match: `resolve()`
-/// makes `command[0]` absolute against the manifest's directory.
-fn up_to_date_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
-    let fake = Fake::new();
-    let manifest = write_manifest(
-        dir,
-        &format!("daemons:\n  {id}:\n    command: [{id}]\n    restart: on-failure\n"),
-    );
-    let (specs, _warnings) = goetia::spec::load(&manifest).expect("load fixture manifest");
-    fake.install(&specs[0], false).expect("seed install");
-    (fake, manifest)
-}
-
 #[skuld::test]
 fn diff_exits_three_when_a_daemon_would_be_created() {
-    let fake = Fake::new();
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [frpc]\n");
+    let (fake, manifest) = absent_fixture(dir.path(), "frpc");
 
     let (code, out, _err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
 
@@ -931,16 +956,8 @@ fn diff_exits_three_when_a_daemon_would_be_created() {
 
 #[skuld::test]
 fn diff_exits_three_when_a_daemon_would_be_updated() {
-    let fake = Fake::new();
-    let mut old = mk("frpc");
-    old.restart = Restart::Never;
-    fake.install(&old, false).unwrap();
-
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(
-        dir.path(),
-        "daemons:\n  frpc:\n    command: [daemon]\n    restart: on-failure\n",
-    );
+    let (fake, manifest) = update_fixture(dir.path(), "frpc");
 
     let (code, out, _err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
 
@@ -988,6 +1005,16 @@ fn diff_indeterminate_beats_conflict() {
     let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
 
     assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
+    // Both outcomes must actually have been diffed — the point of this test
+    // is the *mixing*, not just the arithmetic 4 beating 5 in the abstract.
+    assert!(
+        out.contains("corrupt: would be refused"),
+        "unreadable outcome missing:\n{out}"
+    );
+    assert!(
+        out.contains("conflicted: would conflict"),
+        "conflict outcome missing:\n{out}"
+    );
 }
 
 /// A `Create` plus a `Conflict` returns 5, not 3: `3` is not a "drift is
@@ -1007,6 +1034,16 @@ fn diff_conflict_beats_drift() {
     let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
 
     assert_eq!(code, 5, "stdout:\n{out}\nstderr:\n{err}");
+    // Both outcomes must actually have been diffed — the point of this test
+    // is the *mixing*, not just the arithmetic 5 beating 3 in the abstract.
+    assert!(
+        out.contains("created: not installed (would be created)"),
+        "drift outcome missing:\n{out}"
+    );
+    assert!(
+        out.contains("conflicted: would conflict"),
+        "conflict outcome missing:\n{out}"
+    );
 }
 
 /// All three non-zero classes in one run — drift, conflict, and a hard
@@ -1034,6 +1071,17 @@ fn diff_error_beats_conflict_beats_drift() {
     );
 
     assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    // All three outcomes must actually have been diffed, not just the
+    // `errored` one that alone would already force 1.
+    assert!(
+        out.contains("created: not installed (would be created)"),
+        "drift outcome missing:\n{out}"
+    );
+    assert!(
+        out.contains("conflicted: would conflict"),
+        "conflict outcome missing:\n{out}"
+    );
+    assert!(err.contains("errored"), "error outcome missing:\n{err}");
 }
 
 /// The only biconditional the contract makes: over one fixture per
@@ -1043,82 +1091,63 @@ fn diff_error_beats_conflict_beats_drift() {
 /// `3` alone does not mean "drift is present".
 #[skuld::test]
 fn diff_exits_zero_iff_install_would_report_up_to_date() {
-    let check = |code: i32, up_to_date: bool, label: &str| {
-        assert_eq!(code == 0, up_to_date, "{label}: exit code {code}");
+    // For each fixture: run `diff`, then ask `install` itself (through the
+    // `ServiceManager` trait, directly against the same `Fake`) whether it
+    // would report `UpToDate` too, and compare. `preview_install` never
+    // mutates the store, so calling `install` afterwards on the same `Fake`
+    // is safe — nothing before this point depended on it staying
+    // unchanged. No hand-written `bool` per row: if `diff` and `install`
+    // ever disagreed about one fixture, this observes the disagreement
+    // instead of asserting past it.
+    let check = |fake: &Fake, manifest: &Path, label: &str| -> i32 {
+        let (code, out, err) =
+            dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], fake);
+        let (specs, _warnings) = goetia::spec::load(manifest).expect("reload fixture manifest");
+        let install_outcome = fake
+            .install(&specs[0], false)
+            .expect("install must not error for a diff fixture");
+        let install_up_to_date = matches!(install_outcome, goetia::decide::Outcome::UpToDate);
+        assert_eq!(
+            code == 0,
+            install_up_to_date,
+            "{label}: diff exit {code}, install outcome {install_outcome:?}\nstdout:\n{out}\nstderr:\n{err}"
+        );
+        code
     };
 
-    // UpToDate
-    {
-        let dir = tempfile::tempdir().unwrap();
-        let (fake, manifest) = up_to_date_fixture(dir.path(), "frpc");
-        let (code, out, err) =
-            dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
-        check(code, true, &format!("UpToDate:\n{out}\n{err}"));
-    }
-    // Create
-    {
-        let fake = Fake::new();
-        let dir = tempfile::tempdir().unwrap();
-        let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [frpc]\n");
-        let (code, out, err) =
-            dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
-        check(code, false, &format!("Create:\n{out}\n{err}"));
-    }
-    // Update
-    {
-        let fake = Fake::new();
-        let mut old = mk("frpc");
-        old.restart = Restart::Never;
-        fake.install(&old, false).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let manifest = write_manifest(
-            dir.path(),
-            "daemons:\n  frpc:\n    command: [daemon]\n    restart: on-failure\n",
-        );
-        let (code, out, err) =
-            dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
-        check(code, false, &format!("Update:\n{out}\n{err}"));
-    }
-    // Stale
-    {
-        let fake = Fake::new();
-        fake.seed_stale(&mk("frpc"), "0.0.0-stale");
-        let dir = tempfile::tempdir().unwrap();
-        let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
-        let (code, out, err) =
-            dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
-        check(code, false, &format!("Stale:\n{out}\n{err}"));
-    }
-    // Conflict
-    {
-        let fake = Fake::new();
-        fake.install_then_hand_edit(&mk("frpc"), "# hand-added directive\n");
-        let dir = tempfile::tempdir().unwrap();
-        let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
-        let (code, out, err) =
-            dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
-        check(code, false, &format!("Conflict:\n{out}\n{err}"));
-    }
-    // RefuseForeign
-    {
-        let fake = Fake::new();
-        fake.seed_foreign("frpc", "not a goetia artifact at all\n");
-        let dir = tempfile::tempdir().unwrap();
-        let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [frpc]\n");
-        let (code, out, err) =
-            dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
-        check(code, false, &format!("RefuseForeign:\n{out}\n{err}"));
-    }
-    // RefuseUnreadable
-    {
-        let fake = Fake::new();
-        fake.seed_unreadable("frpc");
-        let dir = tempfile::tempdir().unwrap();
-        let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [frpc]\n");
-        let (code, out, err) =
-            dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
-        check(code, false, &format!("RefuseUnreadable:\n{out}\n{err}"));
-    }
+    let dir = tempfile::tempdir().unwrap();
+    let (fake, manifest) = up_to_date_fixture(dir.path(), "frpc");
+    check(&fake, &manifest, "UpToDate");
+
+    let dir = tempfile::tempdir().unwrap();
+    let (fake, manifest) = absent_fixture(dir.path(), "frpc");
+    check(&fake, &manifest, "Create");
+
+    let dir = tempfile::tempdir().unwrap();
+    let (fake, manifest) = update_fixture(dir.path(), "frpc");
+    check(&fake, &manifest, "Update");
+
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::new();
+    fake.seed_stale(&mk("frpc"), "0.0.0-stale");
+    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let code = check(&fake, &manifest, "Stale");
+    // Pinned exactly, not just `!= 0`: `Stale` is drift like `Create`/
+    // `Update`, so it must be 3, not (say) a `Conflict`'s 5 — nothing else
+    // in this file asserts the exact code for this outcome.
+    assert_eq!(code, 3, "Stale must exit 3");
+
+    let dir = tempfile::tempdir().unwrap();
+    let (fake, manifest) = hand_edited_fixture(dir.path(), "frpc");
+    check(&fake, &manifest, "Conflict");
+
+    let dir = tempfile::tempdir().unwrap();
+    let (fake, manifest) = foreign_fixture(dir.path(), "frpc");
+    check(&fake, &manifest, "RefuseForeign");
+
+    let dir = tempfile::tempdir().unwrap();
+    let (fake, manifest) = unreadable_fixture(dir.path(), "frpc");
+    check(&fake, &manifest, "RefuseUnreadable");
 }
 
 // --json ==============================================================================================================

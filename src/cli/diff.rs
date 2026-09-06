@@ -61,11 +61,13 @@ pub fn run(
         }
     };
 
-    // Each outcome contributes at most one exit-code class, never combined
-    // by `max()`: `5` outranks `3` despite being the larger number, so a
-    // `Create` sitting next to a `Conflict` must not read back as `3`
-    // (drift only) — see `report::precedence`, the same `1 > 4 > 5 > 3 > 0`
-    // rule `list`/`status` use, reused rather than re-derived here.
+    // Each outcome contributes at most one exit-code class, combined by
+    // `report::precedence` — the same rule and function `list`/`status`
+    // use, reused rather than re-derived here (see `dispatch`'s doc
+    // comment for the vocabulary and the precedence order itself). Never
+    // `max()` on the codes themselves: a `Create` sitting next to a
+    // `Conflict` must not read back as `3` (drift only), even though `3`
+    // is the smaller number.
     let mut codes: Vec<i32> = Vec::new();
     for spec in selected {
         match mgr.preview_install(spec) {

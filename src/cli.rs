@@ -132,19 +132,23 @@ pub enum DaemonCommand {
 ///   place this code is returned). Not a "drift is present" signal on its
 ///   own: one `Create` plus one `Conflict` returns `5`, not `3`, since `5`
 ///   outranks `3` in the precedence rule below.
-/// - `4` indeterminate: `list`/`status` could not determine the state of
-///   an id Goetia owns — see the design spec's §4 and [`report::exit_code`],
-///   which is where `list` and `status` get theirs in *both* output modes.
-///   Anchored to the LSB init-script convention's "service status unknown",
-///   the one other exit-code vocabulary this one deliberately agrees with.
+/// - `4` indeterminate: an id Goetia owns whose state could not be
+///   determined. `list`/`status` compute theirs via [`report::exit_code`]
+///   (see the design spec's §4), in *both* output modes; `diff` returns it
+///   for `Outcome::RefuseUnreadable` (`cli::diff::run`) — the one row
+///   where `diff` deliberately disagrees with `install`, which exits `1`
+///   there instead because it genuinely failed to install. Anchored to the
+///   LSB init-script convention's "service status unknown", the one other
+///   exit-code vocabulary this one deliberately agrees with.
 /// - `5` conflict: an installed artifact was modified outside Goetia and
-///   `--force` was not given (`cli::install::run`'s `any_conflict` check —
-///   the only place this code is returned). App-specific, anchored to
-///   nothing, which is why it is the one that moved: `2` is anchored to
-///   three conventions at once (clap, bash, argparse), so moving *usage*
-///   errors off it instead would have stayed internally consistent while
-///   giving up all three to preserve one number nothing outside Goetia
-///   agrees on.
+///   `--force` was not given. Returned by `cli::install::run`'s
+///   `any_conflict` check and by `cli::diff::run` for the identical
+///   `Outcome::Conflict` — the two places this code is returned. App-specific,
+///   anchored to nothing, which is why it is the one that moved: `2` is
+///   anchored to three conventions at once (clap, bash, argparse), so
+///   moving *usage* errors off it instead would have stayed internally
+///   consistent while giving up all three to preserve one number nothing
+///   outside Goetia agrees on.
 ///
 /// `list` and `status` compute their code as the precedence-max over every
 /// error kind their `Report` collected: `1 > 4 > 5 > 3 > 0`. That is a rule
