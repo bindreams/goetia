@@ -20,9 +20,7 @@ fn substitutes_a_braced_reference() {
 #[skuld::test]
 fn substitutes_several_references_in_one_scalar() {
     let vars = Vars::from_pairs(&[("A", "1"), ("B", "2")]);
-    // Adjacent.
     assert_eq!(sub("${A}${B}", &vars).unwrap(), "12");
-    // Separated by literal text.
     assert_eq!(sub("x-${A}-y-${B}-z", &vars).unwrap(), "x-1-y-2-z");
 }
 

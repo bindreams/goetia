@@ -62,11 +62,20 @@ const MANIFEST_FILE_NAME: &str = "goetia.yaml";
 
 /// Turn a parsed manifest into resolved daemon specs.
 ///
-/// Relative `command[0]`, `cwd`, and `logs` paths are resolved against
-/// `base_dir` and written back absolute. Fails on the first invalid
-/// daemon; a valid manifest may still produce `Warning`s for properties
-/// that are accepted but cannot be faithfully honored on every platform.
-pub fn resolve(raw: RawManifest, base_dir: &Path) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
+/// Every `${VAR}` is substituted first, against the `.env` file beside
+/// `base_dir`. That step lives here rather than in [`load`] because this
+/// function is public and takes a public [`RawManifest`]: were it a
+/// separate step a caller had to remember, a manifest reaching this one
+/// directly would resolve with its references intact, and systemd applies
+/// its *own* `${...}` expansion to `ExecStart=` — turning an unsubstituted
+/// reference into an empty string inside a privileged unit.
+///
+/// Relative `command[0]`, `cwd`, and `logs` paths are then resolved
+/// against `base_dir` and written back absolute. Fails on the first
+/// invalid daemon; a valid manifest may still produce `Warning`s for
+/// properties that are accepted but cannot be faithfully honored on every
+/// platform.
+pub fn resolve(mut raw: RawManifest, base_dir: &Path) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
     // `DaemonSpec` documents every path as absolute and `blob::decode`
     // enforces it, so a relative `base_dir` would produce an artifact whose
     // own embedded blob cannot be decoded — breaking the drift invariant for
@@ -75,6 +84,16 @@ pub fn resolve(raw: RawManifest, base_dir: &Path) -> Result<(Vec<DaemonSpec>, Ve
     // caller to pass an absolute path.
     let base_dir = absolutize(base_dir)?;
     let base_dir = base_dir.as_path();
+
+    // A manifest with no `$` in it never reads `.env`, so an unrelated or
+    // root-only-readable file beside the manifest cannot break `install`,
+    // `show` or `diff`.
+    let vars = if interpolate::manifest_would_change(&raw) {
+        Vars::load(base_dir)?
+    } else {
+        Vars::empty()
+    };
+    interpolate::manifest(&mut raw, &vars)?;
 
     let mut specs = Vec::with_capacity(raw.daemons.len());
     let mut warnings = Vec::new();
@@ -107,19 +126,9 @@ pub fn load(path: &Path) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
     })?;
     // The one and only parse: every diagnostic a manifest can produce —
     // line, column, duplicate key, unknown field — comes from here, on the
-    // file exactly as written. Interpolation runs after it, on the typed
+    // file exactly as written. `resolve` interpolates after it, on the typed
     // result, so a `${VAR}` cannot move a position or change a message.
-    let mut raw: RawManifest = serde_yaml_ng::from_str(&text)?;
-
-    // A manifest with no `$` in it never reads `.env`, so an unrelated or
-    // root-only-readable file beside the manifest cannot break `install`,
-    // `show` or `diff`.
-    let vars = if interpolate::manifest_would_change(&raw) {
-        Vars::load(&base_dir)?
-    } else {
-        Vars::empty()
-    };
-    interpolate::manifest(&mut raw, &vars)?;
+    let raw: RawManifest = serde_yaml_ng::from_str(&text)?;
 
     resolve(raw, &base_dir)
 }

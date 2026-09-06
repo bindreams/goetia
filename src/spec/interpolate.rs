@@ -97,12 +97,12 @@ pub(crate) fn scalar(input: &str, path: &str, vars: &Vars) -> Result<String> {
 
         match chars.peek().map(|&(_, c)| c) {
             Some('{') => {
-                chars.next(); // consume '{'
+                chars.next();
                 let value = scan_braced(&mut chars, path, vars)?;
                 out.push_str(&value);
             }
             Some('$') => {
-                chars.next(); // consume the second '$'
+                chars.next();
                 out.push('$');
             }
             _ => {
@@ -157,7 +157,7 @@ fn scan_braced(chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>, path:
         if c == ':' {
             match chars.peek().map(|&(_, c)| c) {
                 Some('-') => {
-                    chars.next(); // consume '-'
+                    chars.next();
                     let default = scan_default(chars, path)?;
                     return resolve_name(path, vars, &name, Some(default));
                 }
@@ -306,7 +306,7 @@ pub(crate) fn spec(raw: &mut RawSpec, path: &str, vars: &Vars) -> Result<()> {
 ///
 /// A `$` in a daemon id, an `env` name, or a `user.id` does *not* count: it
 /// is an error [`manifest`] reports by itself, with a message naming the
-/// reason, and answering `true` here would make `load` read `.env` first
+/// reason, and answering `true` here would make `resolve` read `.env` first
 /// and possibly replace that message with an unrelated IO failure.
 pub(crate) fn manifest_would_change(raw: &RawManifest) -> bool {
     let RawManifest { daemons } = raw;
@@ -315,8 +315,8 @@ pub(crate) fn manifest_would_change(raw: &RawManifest) -> bool {
 
 fn spec_would_change(raw: &RawSpec) -> bool {
     // Exhaustive for the same reason `spec` is: a new field must be
-    // considered here too, or `load` decides whether to read `.env` from a
-    // stale view of the manifest.
+    // considered here too, or `resolve` decides whether to read `.env` from
+    // a stale view of the manifest.
     let RawSpec {
         name,
         command,

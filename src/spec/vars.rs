@@ -69,14 +69,14 @@
 //!   unreferenceable name is an error rather than silent dead weight.
 //! - Whitespace around `=` is an error, not trimmed. python-dotenv
 //!   accepts `A = 1` and a shell does not, so accepting it would let one
-//!   file mean two different things to two readers of it. This rule and
-//!   "an unquoted value has its trailing whitespace trimmed" collide on
-//!   exactly one input: `A= ` (an `=` followed only by whitespace to end
-//!   of line). There, trimming wins: the line's trailing whitespace is
-//!   stripped before the adjacency check runs, so `A= ` means `A=` — an
-//!   empty value, not an error — while `A= 1`, `A =1`, and `A = 1` still
-//!   error, since none of their offending whitespace is at the end of the
-//!   line.
+//!   file mean two different things to two readers of it. The check runs
+//!   on what an unquoted value reduces to once its comment and trailing
+//!   whitespace are removed, because those are removed whatever else the
+//!   line turns out to mean: `A= `, `A= # c` and `A=\t#c` are all `A=`,
+//!   an empty value. `A= 1`, `A =1`, `A = 1` and `A= 1 # c` still error,
+//!   since each still has whitespace against the `=` after the reduction.
+//!   A value opening with a quote is left whole, so `A= "x"` — whose
+//!   whitespace is before the quote, not inside it — errors too.
 //! - `VALUE` is one of: single-quoted (literal up to the closing `'`, no
 //!   escapes); double-quoted (only `\\` and `\"` are decoded); or
 //!   unquoted (trailing whitespace trimmed; a `#` preceded by whitespace
@@ -248,18 +248,24 @@ fn parse_line(raw_line: &str, line: usize, path: &Path) -> Result<Option<(String
     }
 
     let rest = strip_export_prefix(trimmed);
-    // An unquoted value's trailing whitespace is trimmed regardless, so
-    // strip it before the whitespace-around-`=` check runs: `A= ` must
-    // mean `A=`, not an error. A quoted value is unaffected, since any
-    // whitespace inside its quotes is never at the very end of the line.
-    let rest = rest.trim_end_matches(is_ws);
 
     let Some(eq) = rest.find('=') else {
+        let rest = rest.trim_end_matches(is_ws);
         return Err(env_error(path, line, format!("expected `NAME=VALUE`, found `{rest}`")));
     };
 
     let name = &rest[..eq];
+    // Reduce an unquoted value before checking for whitespace against the
+    // `=`, since its comment and trailing whitespace are dropped whatever
+    // the line turns out to mean: `A= # c` must reduce to `A=` exactly as
+    // `A= ` does, rather than be reported as `A = 1`, an error it does not
+    // have and whose suggested fix does not apply. A quoted value is left
+    // whole; `check_trailing` handles what follows its closing quote.
     let value_text = &rest[eq + 1..];
+    let value_text = match value_text.as_bytes().first() {
+        Some(b'\'' | b'"') => value_text,
+        _ => reduce_unquoted(value_text),
+    };
     if name.ends_with(is_ws) || value_text.starts_with(is_ws) {
         return Err(env_error(
             path,
@@ -307,7 +313,7 @@ fn parse_value(s: &str, path: &Path, line: usize) -> Result<String> {
     match s.as_bytes().first() {
         Some(b'\'') => parse_single_quoted(s, path, line),
         Some(b'"') => parse_double_quoted(s, path, line),
-        _ => Ok(parse_unquoted(s)),
+        _ => Ok(reduce_unquoted(s).to_string()),
     }
 }
 
@@ -371,8 +377,9 @@ fn check_trailing(after: &str, path: &Path, line: usize) -> Result<()> {
 
 /// Unquoted: trailing whitespace trimmed; a `#` preceded by whitespace
 /// starts a comment, a `#` not preceded by whitespace is part of the
-/// value, matching compose.
-fn parse_unquoted(s: &str) -> String {
+/// value, matching compose. Idempotent, so `parse_line` can apply it
+/// early to decide whether whitespace really abuts the `=`.
+fn reduce_unquoted(s: &str) -> &str {
     let mut prev_ws = false;
     let mut comment_start = None;
     for (i, c) in s.char_indices() {
@@ -386,7 +393,7 @@ fn parse_unquoted(s: &str) -> String {
         Some(i) => &s[..i],
         None => s,
     };
-    value.trim_end_matches(is_ws).to_string()
+    value.trim_end_matches(is_ws)
 }
 
 fn env_error(path: &Path, line: usize, message: String) -> Error {

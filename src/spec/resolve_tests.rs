@@ -543,14 +543,27 @@ fn accepts_ordinary_text() {
 }
 
 #[skuld::test]
-fn huge_restart_delay_does_not_overflow() {
+fn huge_restart_delay_saturates_instead_of_overflowing() {
     // `as_secs() + 1` on a near-`Duration::MAX` value panics in debug and
-    // wraps to a false "rounds to 0s" warning in release.
+    // wraps to a false "rounds to 0s" warning in release. Assert the
+    // saturated outcome, not merely the absence of a panic: a wrap is
+    // silent in release, and a debug panic is the only half a
+    // result-discarding test could ever catch.
     let yaml = format!(
         "daemons:\n  frpc:\n    command: [/bin/frpc]\n    restart-delay: {}s 1ns\n",
         u64::MAX
     );
-    let _ = resolve_yaml(&yaml);
+    let (specs, warnings) = resolve_yaml(&yaml).expect("a near-`Duration::MAX` delay is accepted, with a warning");
+
+    assert_eq!(specs[0].restart_delay, Some(Duration::new(u64::MAX, 1)));
+    let [warning] = warnings.as_slice() else {
+        panic!("expected exactly one warning, got {warnings:?}");
+    };
+    assert!(
+        warning.message.contains(&format!("round it up to {}s", u64::MAX)),
+        "the warning must name the saturated value, not a wrapped one: {}",
+        warning.message
+    );
 }
 
 #[skuld::test]
@@ -726,6 +739,51 @@ fn fixture_dir(yaml: &str, env: Option<&str>) -> tempfile::TempDir {
         std::fs::write(dir.path().join(".env"), env).expect("fixture .env should be writable");
     }
     dir
+}
+
+#[skuld::test]
+fn resolve_substitutes_rather_than_letting_a_reference_through() {
+    // `resolve` is public and takes a public `RawManifest`, so it is
+    // reachable without `load`. Interpolation therefore lives inside it,
+    // not beside it: a literal `${MISSING}` reaching a generated unit would
+    // be expanded by systemd itself, silently, to an empty string.
+    let yaml = "daemons:\n  frpc:\n    name: ${ALSO_MISSING}\n    command: [/bin/frpc, \"--flag=${MISSING}\"]\n";
+
+    let err = resolve_yaml(yaml).expect_err("an undefined reference must not resolve");
+    assert!(
+        matches!(err, Error::Interpolate { .. }),
+        "expected Interpolate, got: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("ALSO_MISSING"),
+        "error should name the variable: {err}"
+    );
+}
+
+#[skuld::test]
+fn resolve_reads_the_env_file_beside_its_base_dir() {
+    let dir = fixture_dir(
+        "daemons:\n  frpc:\n    name: ${NAME}\n    command: [/bin/frpc]\n",
+        Some("NAME=Frpc Tunnel\n"),
+    );
+    let yaml = "daemons:\n  frpc:\n    name: ${NAME}\n    command: [/bin/frpc]\n";
+
+    let (specs, _warnings) = resolve(parse_manifest(yaml), dir.path()).expect("manifest should resolve");
+    assert_eq!(specs[0].name, "Frpc Tunnel");
+}
+
+#[skuld::test]
+fn resolve_does_not_read_the_env_file_when_the_manifest_has_no_dollar() {
+    // The gate moved with the substitution step, so it is `resolve`'s to
+    // hold now: a directory at the `.env` path would make `Vars::load` fail
+    // with `Io`, and a dollarless manifest resolving anyway proves it was
+    // never read.
+    let dir = fixture_dir("daemons:\n  frpc:\n    command: [/bin/frpc]\n", None);
+    std::fs::create_dir(dir.path().join(".env")).expect("fixture directory should be creatable");
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n";
+
+    let (specs, _warnings) = resolve(parse_manifest(yaml), dir.path()).expect("a dollarless manifest should resolve");
+    assert_eq!(specs.len(), 1);
 }
 
 #[skuld::test]
@@ -924,6 +982,8 @@ fn an_interpolated_value_cannot_create_a_daemon_or_a_field() {
     assert_eq!(raw.daemons["frpc"].command, vec!["/bin/frpc"]);
     assert_eq!(raw.daemons["frpc"].name.as_deref(), Some(evil));
 
+    // `resolve` substitutes again, which is a no-op on this fixture: `evil`
+    // holds no `$`, so the manifest reaches the injection gate as it stands.
     let err = resolve(raw, &base_dir()).unwrap_err();
     assert!(
         err.to_string().contains("control character"),

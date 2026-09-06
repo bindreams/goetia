@@ -85,6 +85,12 @@ fn whitespace_around_the_equals_sign_is_an_error() {
     let err = load_str("A = 1\n").unwrap_err();
     assert!(matches!(err, Error::EnvFile { .. }));
     assert!(err.to_string().contains("A=1"), "message should show `A=1`: {err}");
+
+    // Removing a comment must not rescue a value whose leading whitespace
+    // survives the removal.
+    let err = load_str("A= 1 # c\n").unwrap_err();
+    assert!(matches!(err, Error::EnvFile { .. }));
+    assert!(err.to_string().contains("A=1"), "message should show `A=1`: {err}");
 }
 
 #[skuld::test]
@@ -94,6 +100,18 @@ fn trailing_whitespace_at_the_end_of_the_line_yields_an_empty_value() {
     // trimmed regardless — so it means `A=`, not an error.
     let vars = load_str("A= \n").unwrap();
     assert_eq!(vars.get("A"), Some(""));
+}
+
+#[skuld::test]
+fn a_comment_after_an_empty_unquoted_value_yields_an_empty_value() {
+    // An unquoted value's comment is removed before the trim, so each of
+    // these reduces to `A=` exactly as `A= ` does. A to-be-filled-in
+    // variable is one of the commonest shapes in a hand-edited `.env`; it
+    // must not be misdiagnosed as whitespace around `=`.
+    for line in ["A= # c\n", "A=\t#c\n", "A=  #x\n"] {
+        let vars = load_str(line).unwrap_or_else(|e| panic!("`{}` should load: {e}", line.escape_debug()));
+        assert_eq!(vars.get("A"), Some(""), "for `{}`", line.escape_debug());
+    }
 }
 
 #[skuld::test]
@@ -203,8 +221,11 @@ fn an_unquoted_value_drops_a_trailing_comment_and_whitespace() {
 
 #[skuld::test]
 fn a_hash_not_preceded_by_whitespace_stays_in_an_unquoted_value() {
-    let vars = load_str("A=1#nothash\n").unwrap();
+    let vars = load_str("A=1#nothash\nB=#nothash\n").unwrap();
     assert_eq!(vars.get("A"), Some("1#nothash"));
+    // The `=` is not whitespace, so a `#` directly against it opens no
+    // comment either — `B` is `#nothash`, not empty.
+    assert_eq!(vars.get("B"), Some("#nothash"));
 }
 
 #[skuld::test]
