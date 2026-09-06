@@ -26,6 +26,14 @@ const FAKE_MARKER: &str = "FAKE-GOETIA-ARTIFACT";
 /// running. Never a real process.
 const FAKE_PID: u32 = 1;
 
+/// The pid `Fake` reports for a given state. `status` and `list` must never
+/// disagree about the same entry, so they share this rule rather than each
+/// spelling it out — the three real backends get that guarantee from calling
+/// one query function, and nothing but this helper would give it to `Fake`.
+fn pid_for(state: State) -> Option<u32> {
+    if state == State::Running { Some(FAKE_PID) } else { None }
+}
+
 #[derive(Debug, Clone)]
 struct Entry {
     /// The fake's own "artifact" text: either what `generate` produced
@@ -305,11 +313,7 @@ impl ServiceManager for Fake {
             Err(e) => Err(e),
             Ok(Some(_)) => Ok(Status {
                 state: entry.state,
-                pid: if entry.state == State::Running {
-                    Some(FAKE_PID)
-                } else {
-                    None
-                },
+                pid: pid_for(entry.state),
                 enabled: entry.enabled,
             }),
         }
@@ -326,14 +330,7 @@ impl ServiceManager for Fake {
                 Ok(Some(blob)) => out.push(Installed::Ours {
                     spec: blob.spec,
                     state: entry.state,
-                    // Mirrors `status`'s own rule just above: `Some(FAKE_PID)`
-                    // iff `Running`, so `list` and `status` can never
-                    // disagree about the same entry.
-                    pid: if entry.state == State::Running {
-                        Some(FAKE_PID)
-                    } else {
-                        None
-                    },
+                    pid: pid_for(entry.state),
                     enabled: entry.enabled,
                 }),
                 Err(e) => out.push(Installed::OursUnreadable {
