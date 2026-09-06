@@ -25,6 +25,15 @@ fn substitutes_several_references_in_one_scalar() {
 }
 
 #[skuld::test]
+fn a_defined_but_empty_variable_without_a_default_is_the_empty_string() {
+    // Distinct from `an_unset_variable_without_a_default_names_the_variable`:
+    // an empty value is still a value, so no default is needed and no error
+    // is raised — only a truly unset variable errors.
+    let vars = Vars::from_pairs(&[("NAME", "")]);
+    assert_eq!(sub("${NAME}", &vars).unwrap(), "");
+}
+
+#[skuld::test]
 fn text_without_a_dollar_is_returned_unchanged() {
     let vars = Vars::empty();
     assert_eq!(
@@ -60,9 +69,32 @@ fn an_empty_default_yields_an_empty_string() {
 }
 
 #[skuld::test]
+fn a_closing_brace_inside_a_default_truncates_it() {
+    // Deliberate, documented truncation, not a bug: a default has no escape
+    // for a literal `}`, so it ends at the first one. `A` is set (its
+    // default is discarded), leaving `default = "{x"` unused and the
+    // second `}` copied through as ordinary trailing text.
+    let vars = Vars::from_pairs(&[("A", "a")]);
+    assert_eq!(sub("${A:-{x}}", &vars).unwrap(), "a}");
+}
+
+#[skuld::test]
 fn a_dollar_in_a_default_is_an_error() {
     let vars = Vars::from_pairs(&[("X", "x")]);
     let err = sub("${NAME:-$X}", &vars).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "daemons.frpc.env[\"LOG\"]: `$` is not allowed inside a `:-` default"
+    );
+}
+
+#[skuld::test]
+fn a_dollar_in_a_discarded_default_is_still_an_error() {
+    // The default is never used here (`SET` is defined and non-empty), but
+    // its grammar is checked unconditionally: a future short-circuit that
+    // skips scanning an unused default must not make this pass.
+    let vars = Vars::from_pairs(&[("SET", "value"), ("X", "x")]);
+    let err = sub("${SET:-$X}", &vars).unwrap_err();
     assert_eq!(
         err.to_string(),
         "daemons.frpc.env[\"LOG\"]: `$` is not allowed inside a `:-` default"
@@ -130,7 +162,17 @@ fn an_unterminated_brace_is_an_error() {
 #[skuld::test]
 fn an_empty_variable_name_is_an_error() {
     let vars = Vars::empty();
+
     let err = sub("${}", &vars).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "daemons.frpc.env[\"LOG\"]: empty variable name in `${}`"
+    );
+
+    // `:` here opens a `:-` default, not an invalid character — the real
+    // defect is the empty name preceding it, so this must report the same
+    // message as `${}`, not `invalid character `:``.
+    let err = sub("${:-fallback}", &vars).unwrap_err();
     assert_eq!(
         err.to_string(),
         "daemons.frpc.env[\"LOG\"]: empty variable name in `${}`"

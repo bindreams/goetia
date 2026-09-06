@@ -40,7 +40,15 @@
 //! - `${NAME:-default}` substitutes `NAME`'s value if it is defined and
 //!   non-empty; otherwise (undefined, or defined as the empty string) it
 //!   substitutes `default`. `default` itself may not contain a `$` of any
-//!   form — no nested substitution, no escape.
+//!   form — no nested substitution, no escape. This is checked
+//!   unconditionally, even when `NAME` is set and `default` is never
+//!   used, since grammar validity does not depend on which branch wins.
+//! - `default` ends at the first `}`, with no escape for a literal `}`
+//!   inside it: `${A:-{x}}` reads as `default = "{x"`, substitutes it,
+//!   and leaves the second `}` to be copied through as ordinary text —
+//!   so a default containing a closing brace cannot be written at all.
+//!   Deliberate: fixing it needs either a seventh error message or new
+//!   escape syntax, and this grammar's contract is exactly six.
 //! - `NAME` matches `^[A-Za-z_][A-Za-z0-9_]*$`, the same charset `.env`
 //!   names must match (see `vars.rs`), so a name that can be assigned can
 //!   always be referenced and vice versa.
@@ -127,6 +135,12 @@ fn scan_braced(chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>, path:
 
         if name.is_empty() {
             if c == '}' {
+                return Err(interpolate_error(path, "empty variable name in `${}`".to_string()));
+            }
+            // `:` here is legal syntax opening a `:-` default (`${:-fallback}`),
+            // not an invalid character — the real defect is the empty name
+            // that precedes it, so report that, not the `:`.
+            if c == ':' && chars.peek().map(|&(_, c)| c) == Some('-') {
                 return Err(interpolate_error(path, "empty variable name in `${}`".to_string()));
             }
             if c.is_ascii_alphabetic() || c == '_' {
