@@ -189,7 +189,7 @@ fn hand_edit_is_detected_as_conflict() {
         .install(&spec, false)
         .expect("install over a hand-edited artifact must not error");
     match outcome {
-        Outcome::Conflict { artifact_diff } => assert!(!artifact_diff.is_empty(), "diff must be non-empty"),
+        Outcome::Conflict { artifact_diff, .. } => assert!(!artifact_diff.is_empty(), "diff must be non-empty"),
         other => panic!("expected Conflict, got {other:?}"),
     }
 }
