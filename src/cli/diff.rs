@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 use clap::Args as ClapArgs;
 
+use super::report;
 use super::support::{load_and_warn, select_by_ids};
 use crate::decide::Outcome;
 use crate::error::Result;
@@ -60,11 +61,17 @@ pub fn run(
         }
     };
 
-    let mut exit = 0;
+    // Each outcome contributes at most one exit-code class, never combined
+    // by `max()`: `5` outranks `3` despite being the larger number, so a
+    // `Create` sitting next to a `Conflict` must not read back as `3`
+    // (drift only) — see `report::precedence`, the same `1 > 4 > 5 > 3 > 0`
+    // rule `list`/`status` use, reused rather than re-derived here.
+    let mut codes: Vec<i32> = Vec::new();
     for spec in selected {
         match mgr.preview_install(spec) {
             Ok(Outcome::Create) => {
                 let _ = writeln!(out, "{}: not installed (would be created)", spec.id);
+                codes.push(3);
             }
             Ok(Outcome::UpToDate) => {
                 let _ = writeln!(out, "{}: up to date", spec.id);
@@ -72,6 +79,7 @@ pub fn run(
             Ok(Outcome::Update { spec_diff }) => {
                 let _ = writeln!(out, "{}:", spec.id);
                 let _ = write!(out, "{spec_diff}");
+                codes.push(3);
             }
             Ok(Outcome::Stale { from_version }) => {
                 let _ = writeln!(
@@ -79,6 +87,7 @@ pub fn run(
                     "{}: would be regenerated (built by goetia {from_version})",
                     spec.id
                 );
+                codes.push(3);
             }
             Ok(Outcome::Conflict { artifact_diff }) => {
                 let line = format!(
@@ -88,7 +97,7 @@ pub fn run(
                 let _ = writeln!(out, "{line}");
                 let _ = write!(out, "{artifact_diff}");
                 let _ = writeln!(err, "error: {line}");
-                exit = 1;
+                codes.push(5);
             }
             Ok(Outcome::RefuseForeign { recovery }) => {
                 let line = format!(
@@ -97,19 +106,26 @@ pub fn run(
                 );
                 let _ = writeln!(out, "{line}");
                 let _ = writeln!(err, "error: {line}");
-                exit = 1;
+                codes.push(1);
             }
             Ok(Outcome::RefuseUnreadable { reason, recovery }) => {
+                // `4`, not `1`: `diff` was asked a question and could not
+                // determine the answer — indeterminate, not a failure.
+                // `install` genuinely fails to install here instead, which
+                // is the one row this deliberately differs from `install`.
                 let line = format!("{}: would be refused: {reason}. {recovery}", spec.id);
                 let _ = writeln!(out, "{line}");
                 let _ = writeln!(err, "error: {line}");
-                exit = 1;
+                codes.push(4);
             }
             Err(e) => {
                 let _ = writeln!(err, "error: {}: {e}", spec.id);
-                exit = 1;
+                codes.push(1);
             }
         }
     }
-    exit
+    codes
+        .into_iter()
+        .max_by_key(|code| report::precedence(*code))
+        .unwrap_or(0)
 }

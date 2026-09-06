@@ -126,8 +126,12 @@ pub enum DaemonCommand {
 ///   "the parser, not the program, rejected this" — so `main.rs`
 ///   deliberately keeps calling `Cli::parse()` un-overridden and lets clap
 ///   return `2` on its own; the absence of an override *is* the decision.
-/// - `3` drift: reserved for a determinate "installed state differs from
-///   the manifest" answer. Nothing produces it yet.
+/// - `3` drift: a determinate "installed state differs from the manifest"
+///   answer — `diff` returns it whenever at least one selected daemon would
+///   change and nothing conflicted or errored (`cli::diff::run`, the only
+///   place this code is returned). Not a "drift is present" signal on its
+///   own: one `Create` plus one `Conflict` returns `5`, not `3`, since `5`
+///   outranks `3` in the precedence rule below.
 /// - `4` indeterminate: `list`/`status` could not determine the state of
 ///   an id Goetia owns — see the design spec's §4 and [`report::exit_code`],
 ///   which is where `list` and `status` get theirs in *both* output modes.

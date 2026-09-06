@@ -153,6 +153,27 @@ impl Fake {
         }
     }
 
+    /// Test-only seeding: place a Goetia-marked entry at `id` whose blob
+    /// decodes cleanly but carries `version` instead of the currently
+    /// running crate's own — simulating an artifact written by a different
+    /// Goetia release, so `decide` reports [`Outcome::Stale`] rather than
+    /// [`Outcome::Conflict`]. Tampers the same way [`Fake::seed_invalid_content`]
+    /// does: encode a real blob, then patch just the field under test,
+    /// since [`blob::encode`] always embeds [`crate::version()`] and has no
+    /// parameter to override it.
+    pub fn seed_stale(&self, spec: &DaemonSpec, version: &str) {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+
+        let encoded = blob::encode(spec);
+        let bytes = BASE64.decode(&encoded).expect("blob::encode emits valid base64");
+        let mut envelope: serde_json::Value = serde_json::from_slice(&bytes).expect("blob::encode emits valid JSON");
+        envelope["version"] = serde_json::json!(version);
+        let tampered = BASE64.encode(serde_json::to_vec(&envelope).expect("a Value re-serializes"));
+
+        self.seed_foreign(spec.id.as_str(), format!("{FAKE_MARKER}\nSpec: {tampered}\n"));
+    }
+
     /// Test-only: force `id`'s reported [`State`] directly, bypassing
     /// `start`/`stop` (which can only produce `Running`/`Stopped`). `id`
     /// must already be installed.
