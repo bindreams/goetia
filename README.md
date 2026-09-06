@@ -253,7 +253,7 @@ worse than sending you to `goetia daemon show`.
 | `kind`          | Exit code | Meaning                                                                                                                                                                                                                           |
 | --------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `not-installed` | 1         | Nothing is installed at that id. Only from `status <id>`.                                                                                                                                                                         |
-| `foreign`       | 1         | Something exists there that goetia does not own, or that this privilege level cannot read. Only from `status <id>`.                                                                                                               |
+| `foreign`       | 1         | Something goetia does not own is demonstrably there — including a file whose _contents_ this privilege level cannot read, where the file itself is still proven to exist. Only from `status <id>`.                                |
 | `unreadable`    | 4         | Goetia read enough to know the id is its own, but cannot report on it — a blob it cannot decode, or a live state it could not query. `message` says which.                                                                        |
 | `undetermined`  | 4         | Goetia could not determine **whether** anything is installed at that id: a read it needed failed. Claims no ownership — that is the whole difference from `unreadable`. `message` names the path and what would make it readable. |
 | `invalid-id`    | 1         | A command-line argument was not a valid daemon id. Fix the argument.                                                                                                                                                              |
@@ -367,10 +367,15 @@ claims no ownership of such an id, and does not suggest uninstalling it.
 `install` keeps that same case at `1`: there the operation is the install,
 and it genuinely did not happen.
 
-The three classes are **disjoint**: a permission denial and a foreign
-service are never reported as absence, and absence is never reported as
-either. And an error always wins — a run naming both an absent id and an
-unreadable one exits `1`, not `4`.
+These classes are **disjoint, and they are separated by what goetia
+_established_, not by what went wrong.** `not-installed` means absence was
+proven; `foreign` and `unreadable` mean presence was proven; `undetermined`
+means neither was — the read that would have settled it did not complete, so
+goetia claims nothing either way. A permission denial is therefore not one
+class: denied _contents_ of a file that is provably there is `foreign`,
+while a denied directory that would have told goetia whether anything is
+there at all is `undetermined`. And an error always wins — a run naming both
+an absent id and an unreadable one exits `1`, not `4`.
 
 ### Compatibility note
 
