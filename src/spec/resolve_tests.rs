@@ -191,6 +191,12 @@ fn resolve_defaults_restart_to_never() {
 }
 
 #[skuld::test]
+fn resolve_defaults_restart_delay_to_none() {
+    let (specs, _) = resolve_yaml("daemons:\n  frpc:\n    command: [bin/frpc]\n").unwrap();
+    assert_eq!(specs[0].restart_delay, None);
+}
+
+#[skuld::test]
 fn resolve_rejects_empty_command() {
     let err = resolve_yaml("daemons:\n  frpc:\n    command: []\n").unwrap_err();
     assert!(err.to_string().contains("command"));
@@ -355,6 +361,14 @@ fn a_sub_second_restart_delay_still_warns() {
     let (specs, warnings) = resolve_yaml(yaml).expect("accepted with a warning, not rejected");
     assert_eq!(specs[0].restart_delay, Some(Duration::from_millis(500)));
     assert_eq!(warnings.len(), 1);
+    // Not just "some warning fired": pin that it is *this* warning, not an
+    // unrelated one (e.g. a Windows-divergence warning) that happens to be
+    // the only one present.
+    assert!(
+        warnings[0].message.contains("not a whole number of seconds") && warnings[0].message.contains("500ms"),
+        "warning should identify the sub-second restart-delay: {}",
+        warnings[0].message
+    );
 }
 
 #[skuld::test]

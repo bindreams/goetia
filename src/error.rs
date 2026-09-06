@@ -36,8 +36,9 @@ pub enum Error {
     Yaml(#[from] serde_yaml_ng::Error),
 
     /// A `resolve()`-time validation failure: an invalid id, a control
-    /// character in a user-supplied string, an `=` in an env key, or an
-    /// empty command. Also produced by `blob::decode`, which re-runs
+    /// character in a user-supplied string, an `=` in an env key, an
+    /// empty command, an unrecognized `restart` or `type`, or a malformed
+    /// `restart-delay`. Also produced by `blob::decode`, which re-runs
     /// these same checks against a spec deserialized from an untrusted
     /// artifact.
     #[error("daemon `{daemon}`: {message}")]
