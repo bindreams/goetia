@@ -159,9 +159,9 @@ pub enum DaemonCommand {
 ///   status unknown", the one other exit-code vocabulary this one
 ///   deliberately agrees with.
 /// - `5` conflict: an installed artifact was modified outside Goetia and
-///   `--force` was not given. Returned by `cli::install::run`'s
-///   `any_conflict` check and by `cli::diff::run` for the identical
-///   `Outcome::Conflict` — the two places this code is returned. App-specific,
+///   `--force` was not given. Returned by `cli::install::run` and by
+///   `cli::diff::run` for the identical `Outcome::Conflict` — the two places
+///   this code is returned. App-specific,
 ///   anchored to nothing, which is why it is the one that moved: `2` is
 ///   anchored to three conventions at once (clap, bash, argparse), so
 ///   moving *usage* errors off it instead would have stayed internally
@@ -169,10 +169,11 @@ pub enum DaemonCommand {
 ///   outside Goetia agrees on.
 ///
 /// `list` and `status` compute their code as the precedence-max over every
-/// error kind their `Report` collected: `1 > 4 > 5 > 3 > 0`. `diff` and
-/// `show` apply the same rule over the classes each selected daemon
-/// contributes, through the same [`report::precedence`] function — no verb
-/// re-derives the ordering, not even for the two codes `show` can produce.
+/// error kind their `Report` collected: `1 > 4 > 5 > 3 > 0`. `diff`,
+/// `show` and `install` apply the same rule over the classes each selected
+/// daemon contributes, through the same [`report::precedence`] function — no
+/// verb re-derives the ordering, not even for the two codes `show` can
+/// produce.
 /// That is a rule about which outcome wins when more than one applies at
 /// once, not an ordering of the integers — `5` outranks `3` despite being
 /// the larger number. `2` never enters that ladder: the one thing that produces it
