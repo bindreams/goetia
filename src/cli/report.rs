@@ -69,8 +69,10 @@ pub(crate) struct ErrorReport {
 pub(crate) enum Kind {
     /// Nothing is installed at that id. Only from `status(&id)`.
     NotInstalled,
-    /// Something exists there that goetia does not own, or that this
-    /// privilege level cannot read. Only from `status(&id)`.
+    /// Something exists there and demonstrably carries no goetia marker —
+    /// established by a read that completed, never inferred from one that
+    /// failed, which is [`Kind::Undetermined`]'s case. Only from
+    /// `status(&id)`.
     Foreign,
     /// Goetia owns the id but cannot report on it; `message` says why — a
     /// blob it cannot decode, a live state it could not query, or an

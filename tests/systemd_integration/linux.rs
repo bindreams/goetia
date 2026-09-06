@@ -90,6 +90,34 @@ fn write_unreadable_dropin(id: &str) {
     fs::set_permissions(dropin_dir(id), fs::Permissions::from_mode(0o000)).expect("chmod 0000");
 }
 
+/// Seed one `*.conf` into an arbitrary drop-in directory and hand back the RAII removal of it. The
+/// parent search root is left exactly as found: `/etc/systemd/system` is shared with every other
+/// test running concurrently.
+fn seed_dropin(dir: &Path) -> RmDropin {
+    fs::create_dir_all(dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
+    fs::write(dir.join("50-x.conf"), "[Service]\nMemoryMax=8G\n").expect("write drop-in");
+    cmd::run("systemctl", &["daemon-reload"]).expect_ok();
+    RmDropin {
+        leaf: dir.to_path_buf(),
+        root: None,
+    }
+}
+
+/// The same, under one of the two `.control` roots — where `systemctl set-property UNIT
+/// PROPERTY=VALUE` writes, and the two highest-precedence entries on the system unit search path,
+/// both above `/etc/systemd/system`.
+///
+/// The root is removed along with the drop-in. Each test that seeds one takes a *different* root, so
+/// no concurrently running test can be inside the one this removes — and the removal is
+/// `remove_dir`, so a root systemd itself populated for some other unit fails to go and is left as
+/// it was found.
+fn seed_control_dropin(root: &str, id: &str) -> (PathBuf, RmDropin) {
+    let leaf = PathBuf::from(root).join(format!("{id}.service.d"));
+    let mut guard = seed_dropin(&leaf);
+    guard.root = Some(PathBuf::from(root));
+    (leaf, guard)
+}
+
 /// A manifest at a path an unprivileged process can actually reach: `tempfile`'s own directory is
 /// 0700, which `runuser -u nobody` cannot traverse.
 fn world_readable_manifest(id: &str) -> (tempfile::TempDir, PathBuf) {
@@ -144,6 +172,24 @@ struct RmDirAll(PathBuf);
 impl Drop for RmDirAll {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// RAII removal of a seeded drop-in directory, and of the search root itself where the test created
+/// that root — see [`seed_control_dropin`].
+struct RmDropin {
+    leaf: PathBuf,
+    root: Option<PathBuf>,
+}
+
+impl Drop for RmDropin {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.leaf);
+        if let Some(root) = &self.root {
+            let _ = fs::remove_dir(root);
+        }
+        // No `daemon-reload` here: every test that seeds one of these also holds a `ServiceGuard`,
+        // whose own cleanup reloads after this one has run.
     }
 }
 
@@ -466,10 +512,11 @@ fn status_reports_undetermined_for_a_dropin_directory_it_cannot_read() {
     );
 }
 
-/// `dropin_marker_in` is shared with `dropin_marker`, which feeds `discover` and therefore drift
-/// detection, so `diff` meets this error too. `4`, not the `1` its catch-all `Err` arm gives: `diff`
-/// was asked a question and could not determine the answer — the same reasoning that already puts
-/// `Outcome::RefuseUnreadable` at `4` there.
+/// The same absence path `status` takes above, reached through `discover` instead: with no fragment,
+/// `residue`'s drop-in scan is what would have answered "is anything at this id", and it did not
+/// complete. `4`, not the `1` `diff`'s catch-all `Err` arm gives: it was asked a question and could
+/// not determine the answer — the same reasoning that already puts `Outcome::RefuseUnreadable` at
+/// `4` there.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn diff_reports_a_dropin_directory_it_cannot_read_as_indeterminate() {
     let id = support::random_test_id();
@@ -492,6 +539,194 @@ fn diff_reports_a_dropin_directory_it_cannot_read_as_indeterminate() {
     assert_eq!(output.status.code(), Some(4), "{context}");
     assert!(stderr.contains("cannot determine"), "{context}");
     assert!(!stderr.contains("uninstall"), "{context}");
+}
+
+/// The fragment is open, read and decoded, so goetia's ownership of this id is an established fact
+/// — and `Error::Undetermined` ("cannot determine whether daemon `X` is installed") would deny it
+/// about an id goetia just decoded. What the unreadable drop-in directory actually costs is the
+/// ability to report on the id, which is `Outcome::RefuseUnreadable`.
+///
+/// `ENOTDIR` rather than `EACCES`, so this runs as root without a second uid: a regular file where
+/// `<id>.service.d` has to be fails `read_dir` identically for everyone, and is exactly the shape an
+/// elevated `install` meets when the drop-in directory fails for a reason no privilege fixes.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn install_refuses_an_unreadable_dropin_over_our_own_fragment() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let mgr = Systemd::new();
+    mgr.install(&mk(guard.id()), false).expect("install");
+
+    let blocker = dropin_dir(guard.id());
+    fs::write(&blocker, "").expect("plant a regular file where the drop-in directory would be");
+    let _cleanup = RmPath(blocker.clone());
+
+    let outcome = mgr
+        .install(&mk(guard.id()), false)
+        .expect("a drop-in read that failed is not a failure to determine whether the id is installed");
+    let Outcome::RefuseUnreadable { reason, .. } = &outcome else {
+        panic!("goetia owns this id and cannot report on it, got {outcome:?}");
+    };
+    assert!(
+        reason.contains(&blocker.display().to_string()),
+        "the refusal must name the path that could not be read: {reason}"
+    );
+    assert!(
+        !reason.contains("cannot determine"),
+        "installation and ownership are both established here: {reason}"
+    );
+    assert!(
+        unit_path(guard.id()).exists(),
+        "nothing was rewritten, and nothing was removed"
+    );
+}
+
+/// The same state seen by an unprivileged reader, through the CLI: `diff` must refuse it as an id
+/// goetia owns (exit `4`), never report that it cannot tell whether the id is installed.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn diff_refuses_our_own_fragment_with_an_unreadable_dropin() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    Systemd::new().install(&mk(guard.id()), false).expect("install");
+    write_unreadable_dropin(guard.id());
+    let (_tempdir, manifest) = world_readable_manifest(guard.id());
+
+    let output = run_unelevated(&[
+        "daemon",
+        "diff",
+        "-f",
+        manifest.to_str().expect("a UTF-8 temp path"),
+        guard.id(),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let context = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    // Root reads the drop-in and reports a conflict (`5`), so a run whose reader was not
+    // unprivileged fails here instead of passing vacuously.
+    assert_eq!(output.status.code(), Some(4), "{context}");
+    assert!(stdout.contains("would be refused"), "{context}");
+    assert!(
+        !stdout.contains("cannot determine") && !stderr.contains("cannot determine"),
+        "the fragment was read and its marker decoded, so this id's installation is not in doubt: \
+         {context}"
+    );
+}
+
+/// The first read of the path, and the one where a plain `EACCES` is most likely: a drop-in
+/// directory is usually world-searchable, while the fragment's own mode governs its readability.
+/// `lstat` succeeds for an unreadable regular file on directory-search permission alone, so
+/// classifying it from "the open failed and the `lstat` did not" reported `foreign` — "demonstrably
+/// not managed by goetia" — about a file whose contents nobody had looked at.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn status_reports_undetermined_for_a_fragment_it_cannot_read() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    seed_foreign(guard.id());
+    fs::set_permissions(unit_path(guard.id()), fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+
+    let output = run_unelevated(&["daemon", "status", guard.id(), "--json"]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let context = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    // Doubles as proof that the denial actually happened: root reads this fragment fine and reports
+    // `foreign`, exit `1`.
+    assert!(stdout.contains(r#""kind":"undetermined""#), "{context}");
+    assert_eq!(output.status.code(), Some(4), "{context}");
+    assert!(
+        stdout.contains(&format!("{}.service", guard.id())),
+        "the message must name the path that could not be read: {context}"
+    );
+    assert!(stdout.contains("re-run as root"), "{context}");
+}
+
+// Obligation 3: every drop-in systemd reads is drift ==================================================================
+
+/// `/etc/systemd/system.control` is where `systemctl set-property UNIT PROPERTY=VALUE` writes, and
+/// `systemd.unit(5)`'s System Unit Search Path puts it *above* `/etc/systemd/system`. Leaving it
+/// unscanned reported an id "up to date" while systemd applied a memory cap goetia never wrote.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_control_dropin_is_drift() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let mgr = Systemd::new();
+    mgr.install(&mk(guard.id()), false).expect("install");
+
+    // Non-vacuity: the same id is clean until the drop-in lands.
+    assert_eq!(
+        mgr.preview_install(&mk(guard.id())).expect("preview"),
+        Outcome::UpToDate
+    );
+
+    let (dir, _cleanup) = seed_control_dropin("/etc/systemd/system.control", guard.id());
+
+    let outcome = mgr.preview_install(&mk(guard.id())).expect("preview");
+    assert!(
+        matches!(outcome, Outcome::Conflict { .. }),
+        "systemd applies {} to this unit, so it is not up to date, got {outcome:?}",
+        dir.display()
+    );
+}
+
+/// The occupancy half of the same omission: with the fragment gone, `residue` found nothing under
+/// the `.control` root, so `uninstall` certified "nothing to do" (exit `0`) for an id systemd still
+/// holds configuration for — while `install` on that same state refuses it as foreign.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn uninstall_refuses_an_id_whose_only_artifact_is_a_control_dropin() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+
+    // Non-vacuity: with nothing at the id at all, this is the `0` the assertion below rejects.
+    let (code, _out, _err) = uninstall_via_cli(guard.id());
+    assert_eq!(code, 0, "an empty id is `nothing to do`");
+
+    // The `/run` root this time, so the two `.control` tests never share a directory to clean up.
+    let (dir, _cleanup) = seed_control_dropin("/run/systemd/system.control", guard.id());
+
+    let (code, out, err) = uninstall_via_cli(guard.id());
+    let context = format!("stdout:\n{out}\nstderr:\n{err}");
+    assert_ne!(
+        code, 0,
+        "`uninstall && echo confirmed gone` must not print here: {context}"
+    );
+    assert!(
+        err.contains(&dir.display().to_string()),
+        "and the refusal must name what is still there: {context}"
+    );
+
+    // The two verbs must describe one filesystem state the same way.
+    let outcome = Systemd::new().preview_install(&mk(guard.id())).expect("preview");
+    assert!(
+        matches!(outcome, Outcome::RefuseForeign { .. }),
+        "install refuses this state, so uninstall cannot call it empty, got {outcome:?}"
+    );
+}
+
+/// `systemd.unit(5)`: "for a unit name foo-bar-baz.service not only the regular drop-in directory
+/// foo-bar-baz.service.d/ is searched but also both foo-bar-.service.d/ and foo-.service.d/". The id
+/// carries its own random component *before* the truncation point, so the directory this seeds
+/// belongs to this test alone and cannot reach a concurrently running one.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_dash_truncated_dropin_is_drift() {
+    let id = format!("{}-leaf", support::random_test_id());
+    let guard = ServiceGuard::new(&id);
+    let mgr = Systemd::new();
+    mgr.install(&mk(guard.id()), false).expect("install");
+    assert_eq!(
+        mgr.preview_install(&mk(guard.id())).expect("preview"),
+        Outcome::UpToDate
+    );
+
+    let truncated = guard.id().rsplit_once('-').expect("the id has a dash").0.to_string();
+    let dir = PathBuf::from(support::SYSTEMD_UNIT_DIR).join(format!("{truncated}-.service.d"));
+    let _cleanup = seed_dropin(&dir);
+
+    let outcome = mgr.preview_install(&mk(guard.id())).expect("preview");
+    assert!(
+        matches!(outcome, Outcome::Conflict { .. }),
+        "systemd applies {} to this unit, so it is not up to date, got {outcome:?}",
+        dir.display()
+    );
 }
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]

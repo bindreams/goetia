@@ -253,7 +253,7 @@ worse than sending you to `goetia daemon show`.
 | `kind`          | Exit code | Meaning                                                                                                                                                                                                                           |
 | --------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `not-installed` | 1         | Nothing is installed at that id. Only from `status <id>`.                                                                                                                                                                         |
-| `foreign`       | 1         | Something goetia does not own is demonstrably there — including a file whose _contents_ this privilege level cannot read, where the file itself is still proven to exist. Only from `status <id>`.                                |
+| `foreign`       | 1         | A read that _completed_ established that what is there is not goetia's: an artifact carrying no marker, or a masked unit's symlink. Never inferred from a read that failed. Only from `status <id>`.                              |
 | `unreadable`    | 4         | Goetia read enough to know the id is its own, but cannot report on it — a blob it cannot decode, or a live state it could not query. `message` says which.                                                                        |
 | `undetermined`  | 4         | Goetia could not determine **whether** anything is installed at that id: a read it needed failed. Claims no ownership — that is the whole difference from `unreadable`. `message` names the path and what would make it readable. |
 | `invalid-id`    | 1         | A command-line argument was not a valid daemon id. Fix the argument.                                                                                                                                                              |
@@ -350,6 +350,15 @@ naming what is left, exactly as `install` refuses the same state. Goetia
 removes neither — a drop-in is as plausibly an administrator's override of a
 unit shipped in `/usr/lib` as it is goetia's own leftover.
 
+Drop-ins are looked for wherever `systemd.unit(5)`'s System Unit Search Path
+says systemd reads them, `/etc/systemd/system.control` (where `systemctl
+set-property` writes) through `/usr/lib/systemd/system` — and under each, in
+`<id>.service.d`, in every dash-truncated prefix of it, and in the top-level
+`service.d`. Anything found there is drift, whichever directory holds it.
+Only `<id>.service.d` counts as the id's own occupancy, since the other two
+are named for a family of units rather than for this id; and only goetia's
+own `/etc/systemd/system/<id>.service.d` is ever removed by a write.
+
 | Verb                         | Absent artifact | Why                                                                                                                            |
 | ---------------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | `uninstall`                  | **0**           | Artifact absence is exactly what it asks for.                                                                                  |
@@ -361,8 +370,8 @@ unit shipped in `/usr/lib` as it is goetia's own leftover.
 for an entry goetia owns but cannot decode, and by `diff` and `show` when
 the installed artifact cannot be read. `status` and `diff` also return it —
 as the `undetermined` kind — when a read that would have said whether
-anything is installed at that id failed at all, typically an
-`<id>.service.d` drop-in directory an unelevated caller cannot open. Goetia
+anything is installed at that id failed at all: the `<id>.service` fragment
+or an `<id>.service.d` drop-in directory an unelevated caller cannot open. Goetia
 claims no ownership of such an id, and does not suggest uninstalling it.
 `install` keeps that same case at `1`: there the operation is the install,
 and it genuinely did not happen.
@@ -371,10 +380,10 @@ These classes are **disjoint, and they are separated by what goetia
 _established_, not by what went wrong.** `not-installed` means absence was
 proven; `foreign` and `unreadable` mean presence was proven; `undetermined`
 means neither was — the read that would have settled it did not complete, so
-goetia claims nothing either way. A permission denial is therefore not one
-class: denied _contents_ of a file that is provably there is `foreign`,
-while a denied directory that would have told goetia whether anything is
-there at all is `undetermined`. And an error always wins — a run naming both
+goetia claims nothing either way. A permission denial is therefore never
+`foreign`: proving that a file exists is not proving whose it is, and the
+read that would have said — the fragment's own, or a drop-in directory's —
+is the one that did not complete. `foreign` needs a read that finished. And an error always wins — a run naming both
 an absent id and an unreadable one exits `1`, not `4`.
 
 ### Compatibility note

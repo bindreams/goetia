@@ -15,19 +15,24 @@
 //! 2. **A masked unit is not absent.** `systemctl mask` replaces the fragment with a symlink to
 //!    `/dev/null`; reading it yields empty text, and a naive read-then-extract would see `Ok(None)`
 //!    and let `install` write over it, silently unmasking a deliberately-masked service.
-//!    [`discover::raw_state`] `lstat`s the path and classifies any non-regular file as
-//!    [`discover::RawState::NonRegular`] — always `Ownership::Foreign` — without ever reading its
-//!    contents.
+//!    [`discover::raw_state`] opens the path `O_NOFOLLOW` and confirms any non-regular file by
+//!    `lstat` as [`discover::RawState::NonRegular`] — always `Ownership::Foreign` — without ever
+//!    reading its contents. A *regular* file the open could not read is neither: it is
+//!    [`Error::Undetermined`], since nothing about its content was established.
 //! 3. **Drop-ins are drift.** `systemctl edit` — the officially recommended way to add exactly the
 //!    `MemoryMax=`/`After=` the design cites — writes `<id>.service.d/override.conf` and leaves the
 //!    fragment itself byte-identical, so drift detection over the fragment alone misses it entirely.
-//!    [`discover::dropin_marker`] folds the drop-in directory's `*.conf` contents into the text
+//!    [`discover::dropin_marker`] folds every drop-in `systemd.unit(5)` reads — across the whole
+//!    system unit search path, and including the dash-truncated and top-level `service.d`
+//!    directories — into the text
 //!    handed to `decide` (never into what is actually written); `decide::decide`'s own
 //!    `foreign_overlay` parameter — never a backend-local override of its `Outcome` — closes the one
 //!    branch the folded text can't reach on its own (a stale artifact, whose version-mismatch check
-//!    fires before any text comparison at all). Every successful write clears the drop-in directory,
-//!    so a resolved conflict cannot wedge the id in permanent drift, and a drop-in directory with no
-//!    fragment at all is refused rather than silently adopted as `Create`.
+//!    fires before any text comparison at all). Every successful write clears goetia's own
+//!    `UNIT_DIR/<id>.service.d`, so a resolved conflict there cannot wedge the id in permanent
+//!    drift; a drop-in under any other search root is reported but never removed, since goetia
+//!    cannot write it and cannot tell an administrator's override from a leftover. A drop-in
+//!    directory with no fragment at all is refused rather than silently adopted as `Create`.
 //! 4. **Permissions.** `NamedTempFile` is created mode 0600; after persisting, the unit would be
 //!    root-only, breaking the promise that `list`/`show`/`diff` need no elevation.
 //!    [`write::write_temp_unit`] `chmod`s 0644 before persisting.

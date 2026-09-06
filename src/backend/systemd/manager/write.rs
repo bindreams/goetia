@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, Result};
 
-use super::discover::{RawState, classify_and_read};
+use super::discover::{RawState, ReadFailure, classify_and_read};
 use super::{UNIT_DIR, io_err, remove_file_if_present, unit_path};
 
 // CreateOutcome / create_unit =========================================================================================
@@ -149,7 +149,7 @@ pub(super) fn quarantine_if_still_ours(id: &str, expected_text: &str) -> Result<
         Err(e) => return Err(io_err("quarantine", &final_path, e)),
     }
 
-    let actual = match classify_and_read(&backup_path) {
+    let actual = match classify_and_read(&backup_path).map_err(ReadFailure::into_io_error) {
         Ok(RawState::Regular(text)) => text,
         Ok(RawState::Absent | RawState::NonRegular) => {
             restore_quarantine(&backup_path, &final_path)?;
