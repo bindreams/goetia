@@ -161,10 +161,13 @@ pub enum DaemonCommand {
 ///   outside Goetia agrees on.
 ///
 /// `list` and `status` compute their code as the precedence-max over every
-/// error kind their `Report` collected: `1 > 4 > 5 > 3 > 0`. That is a rule
-/// about which outcome wins when more than one applies at once, not an
-/// ordering of the integers — `5` outranks `3` despite being the larger
-/// number. `2` never enters that ladder: the one thing that produces it
+/// error kind their `Report` collected: `1 > 4 > 5 > 3 > 0`. `diff` and
+/// `show` apply the same rule over the classes each selected daemon
+/// contributes, through the same [`report::precedence`] function — no verb
+/// re-derives the ordering, not even for the two codes `show` can produce.
+/// That is a rule about which outcome wins when more than one applies at
+/// once, not an ordering of the integers — `5` outranks `3` despite being
+/// the larger number. `2` never enters that ladder: the one thing that produces it
 /// there (`--json` on a subcommand that does not implement it) always
 /// happens alone, before any other kind could exist in the same report.
 ///

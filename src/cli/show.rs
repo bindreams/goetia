@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Args as ClapArgs;
 
+use super::report;
 use super::support::{load_and_warn, partition_installed, print_unreadable_warnings, select_by_ids};
 use crate::error::Result;
 use crate::manager::ServiceManager;
@@ -112,35 +113,39 @@ fn show_from_installed(
         ids.to_vec()
     };
 
+    // Each id contributes at most one exit-code class, combined by
+    // `report::precedence` — the same rule and function `list`/`status`
+    // and `diff` use, reused rather than re-derived here (see `dispatch`'s
+    // doc comment for the vocabulary and the precedence order itself).
+    // Never `max()` on the codes themselves: `1` must outrank `4` even
+    // though it is the smaller number, so a later unreadable id cannot
+    // downgrade an already-seen absent one.
+    let mut codes: Vec<i32> = Vec::new();
+
     // With no ids given, an unreadable entry never enters `wanted` at all
     // (it has no spec to show), so the loop below can't be what flags it —
     // unlike `list`/`status`, which escalate the same way.
-    let mut exit = if ids.is_empty() && !index.unreadable.is_empty() {
-        4
-    } else {
-        0
-    };
+    if ids.is_empty() && !index.unreadable.is_empty() {
+        codes.push(4);
+    }
+
     let mut specs = Vec::new();
     for id in &wanted {
         if let Some(entry) = index.ours.get(id) {
             specs.push(entry.spec.clone());
         } else if index.unreadable.contains_key(id) {
             let _ = writeln!(err, "error: daemon `{id}` is installed but unreadable");
-            // `1` (a genuinely absent id, below) outranks `4` here,
-            // matching `cli::dispatch`'s published precedence rule
-            // (`1 > 4 > 5 > 3 > 0`) — a later unreadable id in the same
-            // call must never downgrade an already-seen absent one back
-            // from `1` to `4`.
-            if exit != 1 {
-                exit = 4;
-            }
+            codes.push(4);
         } else {
             let _ = writeln!(err, "error: daemon `{id}` is not installed");
-            exit = 1;
+            codes.push(1);
         }
     }
     print_specs(specs.iter(), out);
-    exit
+    codes
+        .into_iter()
+        .max_by_key(|code| report::precedence(*code))
+        .unwrap_or(0)
 }
 
 fn print_specs<'a>(specs: impl Iterator<Item = &'a DaemonSpec>, out: &mut dyn Write) {
