@@ -983,6 +983,11 @@ fn diff_exits_zero_only_when_everything_is_up_to_date() {
     let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
 
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    // `UpToDate` pushes nothing to the codes vec, so the assertion above
+    // holds just as well when zero daemons were diffed at all. Pin that
+    // both were actually reached.
+    assert!(out.contains("frpc"), "frpc should appear in stdout:\n{out}");
+    assert!(out.contains("websocat"), "websocat should appear in stdout:\n{out}");
 }
 
 /// An unreadable artifact alongside a hand-edited one returns 4: the
