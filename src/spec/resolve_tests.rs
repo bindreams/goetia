@@ -279,6 +279,22 @@ daemons:
 }
 
 #[skuld::test]
+fn managed_on_windows_warning_names_the_argument_consequence() {
+    let yaml = r#"
+daemons:
+  svc:
+    command: ["bin/svc.exe"]
+    cwd: "."
+    logs: "logs/svc.log"
+    type: managed
+"#;
+    let (_specs, warnings) = resolve_yaml(yaml).expect("accepted with a warning, not rejected");
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].message.contains("System32"));
+    assert!(warnings[0].message.contains("argument"));
+}
+
+#[skuld::test]
 fn simple_on_windows_does_not_warn_for_cwd_and_logs() {
     let yaml = r#"
 daemons:

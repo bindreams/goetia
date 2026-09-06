@@ -10,6 +10,36 @@
 //! user-supplied string that ends up in a generated artifact — `name`,
 //! `command`, `cwd`, `logs`, every `env` key and value, and `user`'s
 //! `name`/`id` — is rejected here if it contains one.
+//!
+//! **Why `command[0]` is absolutized here and `command[1..]` is not.**
+//! `execve`, `posix_spawn` and `CreateProcess` all take an argument vector
+//! as opaque bytes — no launcher on any platform resolves a path *inside*
+//! an argument. A relative path in `command[1..]` is therefore resolved by
+//! the program being launched, against whatever working directory that
+//! program sees at the time; goetia has no say in it, and this is not a
+//! goetia policy to begin with.
+//!
+//! `command[0]` is different because, unlike an argument, it is a field
+//! with a defined role, and the three platforms disagree about that role
+//! for a relative value. systemd requires "either an absolute path to an
+//! executable or a simple file name without any slashes", resolving a bare
+//! name against a fixed compile-time search path and **never** against
+//! `WorkingDirectory=` — so a manifest's `bin/frpc` (a name with a slash
+//! that is not absolute) is rejected outright there. A Windows service has
+//! no working directory of its own at all, and resolves a relative binary
+//! against `System32`. Absolutizing `command[0]` against the manifest's
+//! directory before any backend sees it collapses those three disagreeing
+//! rules into one that always holds.
+//!
+//! **The dragon is in the default.** Because only `command[0]` is
+//! absolutized, a manifest that passes a relative path as an *argument* —
+//! `command: ["bin/frpc", "-c", "host/frpc.toml"]` — and does not set
+//! `cwd` inherits whatever working directory the platform defaults to.
+//! systemd documents that default, for system instances, as the **root
+//! directory**: `-c host/frpc.toml` then resolves against `/`, and the
+//! daemon starts, cannot find its own config, and exits with no
+//! indication that a working directory was ever the problem. Set `cwd`, or
+//! write the argument absolute.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -555,7 +585,8 @@ fn warn_on_windows_divergences(
         warnings.push(Warning {
             id: id.clone(),
             message: "type: managed has no working-directory or stdout-capture field on Windows SCM; \
-                      `cwd`/`logs` are silently unavailable there"
+                      `cwd`/`logs` are silently unavailable there, and with no working directory, \
+                      every relative path in an argument resolves against System32"
                 .to_string(),
         });
     }
