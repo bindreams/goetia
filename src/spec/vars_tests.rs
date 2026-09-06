@@ -79,6 +79,12 @@ fn whitespace_around_the_equals_sign_is_an_error() {
     let err = load_str("A= 1\n").unwrap_err();
     assert!(matches!(err, Error::EnvFile { .. }));
     assert!(err.to_string().contains("A=1"), "message should show `A=1`: {err}");
+
+    // Both sides at once. The single-sided cases above can each be rejected
+    // by one half of the check, so neither pins this one.
+    let err = load_str("A = 1\n").unwrap_err();
+    assert!(matches!(err, Error::EnvFile { .. }));
+    assert!(err.to_string().contains("A=1"), "message should show `A=1`: {err}");
 }
 
 #[skuld::test]
