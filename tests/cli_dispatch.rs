@@ -339,9 +339,14 @@ fn installed_ids(fake: &Fake) -> Vec<String> {
         .list()
         .unwrap()
         .into_iter()
-        .filter_map(|entry| match entry {
-            Installed::Ours { spec, .. } => Some(spec.id.as_str().to_string()),
-            Installed::OursUnreadable { .. } => None,
+        .map(|entry| match entry {
+            Installed::Ours { spec, .. } => spec.id.as_str().to_string(),
+            // Present, and goetia's — only its blob would not decode. Three
+            // callers read `is_empty()` as "nothing is installed", and
+            // dropping this made that flatly false rather than merely
+            // unsound: the id demonstrably *is* installed. `Fake` keys the
+            // entry by the id it was seeded with, so the name is the answer.
+            Installed::OursUnreadable { name, .. } => name,
             // Three callers ask this `is_empty()` and read the answer as
             // "nothing is installed". That conclusion is unsound while an
             // undetermined entry is present — it may stand for the very id
