@@ -730,13 +730,11 @@ impl Unsettled {
 /// — exit `0`, and the id in neither `errors` nor `undetermined` — and how `uninstall` came to
 /// answer "nothing to do" for it.
 ///
-/// So the re-ask is one `read_dir` of [`UNIT_DIR`], covering both names at once, before [`residue`]
-/// is consulted at all. Its own residual, stated exactly: a replace whose *entire* cycle — the
-/// quarantine rename, the write, and the re-creation — falls inside that one pass can leave neither
-/// name present for the whole of it, and `readdir` promises only the entries that were. Closing
-/// that needs the writers and the readers to share a lock, which this backend does not have.
+/// So both names are asked about before [`residue`] is consulted at all — see
+/// [`occupant_in_unit_dir`] for how each of them is asked, which is the whole of what this
+/// predicate is worth.
 pub(super) fn fragmentless(id: &str) -> Fragmentless {
-    match occupant_named_in_unit_dir(id) {
+    match occupant_in_unit_dir(id) {
         Ok(Some(path)) => return Fragmentless::Unsettled(Unsettled::Occupied(path)),
         Ok(None) => {}
         Err(failure) => return Fragmentless::Unsettled(Unsettled::Read(failure)),
@@ -751,23 +749,65 @@ pub(super) fn fragmentless(id: &str) -> Fragmentless {
 /// The re-ask itself: whichever of `<id>.service` and its quarantine siblings [`UNIT_DIR`] holds
 /// now. A name, never a classification — what is under it is exactly what this call did not
 /// establish.
-fn occupant_named_in_unit_dir(id: &str) -> ReadResult<Option<PathBuf>> {
+///
+/// # Asked of an instant, never of a cursor
+///
+/// Both names live in [`UNIT_DIR`], and the rename that moves the fragment between them is a rename
+/// *within that directory*. A `read_dir` over it is a cursor, not an observation: `readdir(3)`
+/// promises only the entries present for the whole walk, and on ext4 a rename re-hashes the name
+/// into a slot the cursor may already have passed — so one pass that crossed the quarantine slot
+/// before the rename and reached the fragment slot after it names **neither**, from one rename. That
+/// is not a claim about the id; it is a claim about a walk. Measured: with `/etc/systemd/system`
+/// padded to 1521 entries, one `read_dir` here answered "nothing at this id" for an installed daemon
+/// in 402 of 3000 `Systemd::status` calls, and [`Error::NotInstalled`] is the one variant
+/// `cli::uninstall` renders as exit `0`, "nothing to do".
+///
+/// So neither name is asked of a cursor:
+///
+/// - **The fragment** is `stat`ed at the name this backend computes for it, which is exact.
+///   `symlink_metadata`, so a name occupied by a dangling symlink counts as occupied: what is
+///   *under* the name is the caller's next question, not this one's.
+/// - **A quarantine sibling** cannot be named exactly — `super::write::unique_quarantine_path` puts
+///   the writer's pid and a per-attempt counter in it, and a reader knows neither. What a reader can
+///   establish is what the *whole directory* held at one instant, which is
+///   [`super::snapshot::names`]: one `getdents64`, taken under the same lock a rename needs, so
+///   every name in it was there together. `super::write::quarantined_id` — the same reader
+///   `super::collect_units` uses, so the scan and this cannot drift on what counts as one — turns
+///   such a name into the id it stands for.
+///
+/// The snapshot is searched for *both* names, and the `stat` above it is only a fast path: the
+/// fragment can perfectly well come back between the two, and a snapshot asked about one name would
+/// then answer "no quarantine here" for an id whose fragment is sitting in the very set it is
+/// looking at.
+///
+/// What that leaves: absence is concluded only from a snapshot in which the id held no name at all,
+/// and `replace_unit_verified` holds one of the two at every instant. So no concurrent replace —
+/// one, or a storm of them — can make this answer "nothing at this id". A `create_unit` that lands
+/// *after* the snapshot leaves the id absent as of the instant asked about, which is a true answer to
+/// a question about that instant and one the caller's next call answers the other way.
+fn occupant_in_unit_dir(id: &str) -> ReadResult<Option<PathBuf>> {
     let dir = Path::new(UNIT_DIR);
-    let fragment = super::unit_name(id);
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
+    let fragment = unit_path(id);
+    match fs::symlink_metadata(&fragment) {
+        Ok(_) => return Ok(Some(fragment)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(ReadFailure::new("stat", &fragment, e)),
+    }
+
+    let unit_name = super::unit_name(id);
+    let names = match super::snapshot::names(dir) {
+        Ok(names) => names,
         // Nothing can be at a path whose directory is not there.
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(ReadFailure::new("enumerate", dir, e)),
     };
-    for entry in entries {
-        let name = entry.map_err(|e| ReadFailure::new("enumerate", dir, e))?.file_name();
-        let name = name.to_string_lossy();
-        if name == fragment || super::write::quarantined_id(&name) == Some(id) {
-            return Ok(Some(dir.join(name.as_ref())));
-        }
-    }
-    Ok(None)
+    Ok(names
+        .into_iter()
+        .find(|name| {
+            let name = name.to_string_lossy();
+            name == unit_name || super::write::quarantined_id(&name) == Some(id)
+        })
+        .map(|name| dir.join(name)))
 }
 
 /// The error for an id whose fragment [`raw_state`] found absent: [`Error::NotInstalled`] only when

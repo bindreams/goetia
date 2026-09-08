@@ -326,40 +326,32 @@ fn quarantine_used_by_uninstall_reports_a_race_instead_of_removing_the_wrong_fil
 
 // Enumeration: a scan that did not finish =============================================================================
 
-/// The mid-pass fault, and the reason `list` no longer propagates one: a dirent that could not be
-/// read must not take down the ids the very same pass already named. Injected through
-/// `collect_units`' iterator because no real `readdir` fails on request.
+/// A unit file name is bytes, not text. The id is rendered lossily — it has to be reported
+/// somehow — but the path the classification then reads through is the name's own bytes, not that
+/// rendering, which no `\u{FFFD}` in a file name resolves to.
 #[skuld::test]
-fn a_dirent_that_cannot_be_read_keeps_what_the_scan_already_named() {
+fn a_fragment_whose_name_is_not_utf8_is_named_and_read_through_its_bytes() {
+    use std::os::unix::ffi::OsStringExt as _;
+
     let dir = Path::new(UNIT_DIR);
-    let entries = vec![
-        Ok(dir.join("named-before-the-fault.service")),
-        Err(io::Error::other("injected mid-scan failure")),
-        Ok(dir.join("never-reached.service")),
-    ];
+    let name = std::ffi::OsString::from_vec(b"not-\xff-utf8.service".to_vec());
 
-    let scan = collect_units(dir, entries.into_iter());
+    let scan = collect_units(dir, std::iter::once(name.clone()));
 
+    let [(id, path)] = scan.units.as_slice() else {
+        panic!("a fragment is a fragment whatever its name decodes to: {scan:?}");
+    };
+    assert!(id.contains('\u{FFFD}'), "the id is the lossy rendering: {id}");
     assert_eq!(
-        scan.units.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
-        ["named-before-the-fault"],
-        "what the pass named before the fault survives it, and the pass stops there: {scan:?}"
+        path.file_name().expect("a file name"),
+        name,
+        "the path must carry the bytes, or every read of it resolves a name that is not there"
     );
-    match &scan.incomplete {
-        Some(Installed::Undetermined { name, reason }) => {
-            assert_eq!(*name, None, "the pass cannot name what it never reached");
-            assert!(reason.contains("injected mid-scan failure"), "{reason}");
-            assert!(
-                reason.contains(UNIT_DIR),
-                "the reason must name what was being scanned: {reason}"
-            );
-        }
-        other => panic!("a pass that stopped early must say so: {other:?}"),
-    }
 }
 
-/// The same fault one syscall earlier. An `Err` here reaches the CLI as `Kind::Unavailable` — exit
-/// `1` over an empty document, which is `list` reporting a populated host as having nothing on it.
+/// A snapshot that cannot be taken at all. An `Err` here reaches the CLI as `Kind::Unavailable` —
+/// exit `1` over an empty document, which is `list` reporting a populated host as having nothing on
+/// it.
 #[skuld::test]
 fn a_unit_directory_that_cannot_be_opened_is_reported_not_propagated() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -497,4 +489,42 @@ fn a_drop_in_name_that_is_not_a_directory_still_names_its_id() {
 
     assert!(scan.units.is_empty(), "there is no fragment here: {scan:?}");
     assert_eq!(scan.dropins, ["blocked"], "{scan:?}");
+}
+
+// TEMPORARY PROBE — remove before commit ==============================================================================
+
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn probe_scan_blindness_under_a_requarantiner() {
+    let id = test_id();
+    let fragment = unit_path(&id);
+    std::fs::write(&fragment, "[Unit]\n").expect("seed a fragment");
+    let _cleanup = Cleanup(fragment.clone());
+    let quarantine = super::write::unique_quarantine_path(&id);
+
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let stopped = std::sync::Arc::clone(&stop);
+    let (f, q) = (fragment.clone(), quarantine.clone());
+    let racer = std::thread::spawn(move || {
+        let mut cycles = 0u64;
+        while !stopped.load(Ordering::Relaxed) {
+            std::fs::rename(&f, &q).expect("quarantine");
+            std::fs::rename(&q, &f).expect("restore");
+            cycles += 1;
+        }
+        cycles
+    });
+
+    let (mut named, mut blind) = (0, 0);
+    for _ in 0..2000 {
+        let scan = scan_host();
+        let seen = scan.units.iter().any(|(u, _)| *u == id) || scan.fragmentless.iter().any(|u| *u == id);
+        if seen {
+            named += 1;
+        } else {
+            blind += 1;
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    let cycles = racer.join().expect("racer");
+    panic!("PROBE scan: named={named} blind={blind} cycles={cycles}");
 }

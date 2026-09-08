@@ -62,10 +62,15 @@
 //!    down: `write::replace_unit_verified` renames the fragment to a quarantine sibling and only
 //!    re-creates it after the replacement is written and fsync'd, so `<id>.service` is genuinely
 //!    missing for the length of every routine update. `discover::fragmentless` re-asks
-//!    [`UNIT_DIR`] for both names before anything concludes absence from one of them.
+//!    [`UNIT_DIR`] for both names before anything concludes absence from one of them — by `stat`
+//!    for the fragment, whose name it knows exactly, and by one `getdents64` snapshot
+//!    ([`snapshot::names`]) for the quarantine sibling, whose per-attempt suffix it does not. Both
+//!    answer for an instant. A `read_dir` cursor does not, and this is the same directory the
+//!    rename moves the name *within*, so a cursor is exactly what can see neither name.
 
 mod dirs;
 mod discover;
+mod snapshot;
 mod systemctl;
 mod write;
 
@@ -427,7 +432,7 @@ struct HostScan {
     incomplete: Vec<Installed>,
 }
 
-/// The enumeration behind [`HostScan`], one `read_dir` per root.
+/// The enumeration behind [`HostScan`], one [`snapshot::names`] per root.
 fn scan_host() -> HostScan {
     let unit_dir = scan_unit_dir(Path::new(UNIT_DIR));
     let mut incomplete: Vec<Installed> = unit_dir.incomplete.into_iter().collect();
@@ -495,9 +500,9 @@ fn wants_probe(dirs: impl Iterator<Item = PathBuf>) -> Vec<Installed> {
 /// strace.
 const PROBE_LINK: &str = ".goetia-probe.service";
 
-/// What one pass over one directory found: the `<id>.service` fragments and `<id>.service.d`
-/// drop-in directories it reached, and — when the pass stopped early — the entry standing for
-/// whatever it never did.
+/// What one snapshot of one directory held: the `<id>.service` fragments and `<id>.service.d`
+/// drop-in directories in it, and — when the snapshot could not be taken at all — the entry
+/// standing for everything it would have named.
 #[derive(Debug)]
 struct UnitScan {
     units: Vec<(String, PathBuf)>,
@@ -509,17 +514,23 @@ struct UnitScan {
     incomplete: Option<Installed>,
 }
 
-/// Enumerate `dir`. A pass that cannot start, or cannot finish, is *reported* rather than
-/// propagated: an `Err` out of `list` would throw away every id this same call already classified
-/// and reach the CLI as an empty document on exit `1`, which is `list` saying the host has no
-/// daemons — the one claim a scan that did not finish cannot support.
+/// Snapshot `dir`. A snapshot that cannot be taken is *reported* rather than propagated: an `Err`
+/// out of `list` would throw away every id this same call already classified and reach the CLI as
+/// an empty document on exit `1`, which is `list` saying the host has no daemons — the one claim a
+/// scan that did not finish cannot support.
 ///
 /// `dir` not existing is neither: absence is *established* there, so it is an empty scan with
 /// nothing outstanding — the answer [`ServiceManager::list`]'s doc comment requires of every
 /// backend, and the one launchd already gave for its own missing staging directory.
+///
+/// [`snapshot::names`] rather than [`fs::read_dir`], for the reason that module's own doc comment
+/// gives: this is the directory `write::replace_unit_verified` renames a fragment *within*, and a
+/// cursor walking it can pass the quarantine name's slot before the rename and the fragment's after
+/// it — naming neither, which hands `list` no id to ask about and leaves an installed daemon out of
+/// a listing that claims to be complete.
 fn scan_unit_dir(dir: &Path) -> UnitScan {
-    match fs::read_dir(dir) {
-        Ok(entries) => collect_units(dir, entries.map(|entry| entry.map(|entry| entry.path()))),
+    match snapshot::names(dir) {
+        Ok(names) => collect_units(dir, names.into_iter()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => UnitScan {
             units: Vec::new(),
             dropins: Vec::new(),
@@ -538,34 +549,18 @@ fn scan_unit_dir(dir: &Path) -> UnitScan {
     }
 }
 
-/// The pass itself, over an iterator of paths rather than [`fs::read_dir`] directly — which is what
-/// makes the mid-pass fault reachable from a test, since no `readdir` fails on demand. That fault
-/// is the half that matters: everything already collected comes back alongside the aggregate,
-/// rather than being discarded because a *later* dirent could not be read.
-fn collect_units(dir: &Path, entries: impl Iterator<Item = io::Result<PathBuf>>) -> UnitScan {
+/// What the snapshot's names amount to, over an iterator of them rather than over
+/// [`snapshot::names`] directly so the classification is reachable from a test without a directory
+/// to seed.
+fn collect_units(dir: &Path, names: impl Iterator<Item = std::ffi::OsString>) -> UnitScan {
     let mut units = Vec::new();
     let mut dropins = Vec::new();
     let mut quarantined = Vec::new();
-    for entry in entries {
-        let path = match entry {
-            Ok(path) => path,
-            Err(e) => {
-                return UnitScan {
-                    units,
-                    dropins,
-                    quarantined,
-                    incomplete: Some(Installed::scan_incomplete(
-                        &dir.display().to_string(),
-                        &format!("failed to read a directory entry: {e}"),
-                    )),
-                };
-            }
-        };
+    for name in names {
+        let path = dir.join(&name);
         // Lossy, exactly as before: a non-UTF-8 unit name still has to be reported, and every read
         // below goes through `path` itself rather than through this rendering of it.
-        let Some(file_name) = path.file_name().map(|name| name.to_string_lossy().into_owned()) else {
-            continue;
-        };
+        let file_name = name.to_string_lossy().into_owned();
         // The name alone, with nothing stat'd: a drop-in directory that is not one — the regular
         // file `install_refuses_an_unreadable_dropin_over_our_own_fragment` seeds, whose `read_dir`
         // answers `ENOTDIR` for every uid — is exactly an id this pass must not drop.

@@ -1495,3 +1495,30 @@ fn run_unelevated(args: &[&str]) -> std::process::Output {
     let _ = fs::remove_file(&staged);
     output
 }
+
+// TEMPORARY PROBE — remove before commit ==============================================================================
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn probe_status_rate_under_a_requarantiner() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    Systemd::new().install(&mk(guard.id()), false).expect("install");
+
+    let cycles = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let updater = Requarantiner::spawn(guard.id(), std::sync::Arc::clone(&cycles));
+
+    let (mut ok, mut not_installed, mut undetermined, mut other) = (0, 0, 0, 0);
+    for _ in 0..3000 {
+        match Systemd::new().status(&Id::try_from(id.clone()).expect("valid id")) {
+            Ok(_) => ok += 1,
+            Err(goetia::Error::NotInstalled { .. }) => not_installed += 1,
+            Err(goetia::Error::Undetermined { .. }) => undetermined += 1,
+            Err(_) => other += 1,
+        }
+    }
+    drop(updater);
+    panic!(
+        "PROBE: ok={ok} not_installed={not_installed} undetermined={undetermined} other={other} cycles={}",
+        cycles.load(std::sync::atomic::Ordering::Relaxed)
+    );
+}
