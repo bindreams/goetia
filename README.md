@@ -516,9 +516,9 @@ Two cases fall outside it, and both omit the id with no signal at all — no
   recorded a name and then found it vacated leaves the id out. Measured, not
   theoretical: against a large unit directory, 402 of 3000 concurrent
   `status` calls reported an installed daemon as not installed. Closing it is
-  follow-up work (branch `feat/list-undetermined-races`). Until it lands, a
-  listing you intend to draw a negative conclusion from must not overlap a
-  goetia verb running against the same host.
+  known follow-up work, tracked separately. Until it ships, a listing you
+  intend to draw a negative conclusion from must not overlap a goetia verb
+  running against the same host.
 - **An id whose only trace is an enablement link.** The systemd scan
   enumerates `<id>.service` and `<id>.service.d` and never
   `multi-user.target.wants`. Where a `.wants` directory is not searchable,
