@@ -347,7 +347,7 @@ fn list_and_status_agree_on_pid(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> D
     mgr.install(&spec, false).expect("install");
     cleanup.push(spec.id.clone());
 
-    assert_pid_agrees(mgr, &spec.id, cleanup);
+    assert_list_is_complete_and_pid_agrees(mgr, &spec.id, cleanup);
 
     mgr.start(&spec.id).expect("start");
     assert_eq!(
@@ -356,10 +356,10 @@ fn list_and_status_agree_on_pid(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> D
         "id {}",
         spec.id
     );
-    assert_pid_agrees(mgr, &spec.id, cleanup);
+    assert_list_is_complete_and_pid_agrees(mgr, &spec.id, cleanup);
 
     mgr.stop(&spec.id).expect("stop");
-    assert_pid_agrees(mgr, &spec.id, cleanup);
+    assert_list_is_complete_and_pid_agrees(mgr, &spec.id, cleanup);
 }
 
 /// The silent-skip regression [`Installed::Undetermined`] exists to prevent,
@@ -368,8 +368,10 @@ fn list_and_status_agree_on_pid(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> D
 /// as goetia's — and no verb acts on it.
 ///
 /// See the module doc comment: the caller must have already put an artifact
-/// whose bytes this process cannot obtain at [`UNDETERMINED_ID`]. Never
-/// writes — every verb refuses — so nothing here needs cleanup.
+/// whose bytes this process cannot obtain at [`UNDETERMINED_ID`]. That every
+/// verb refuses — `install --force` included — is what this asserts rather
+/// than assumes, so it registers no cleanup of its own; the caller's own
+/// cleanup for [`UNDETERMINED_ID`] covers a backend that writes anyway.
 ///
 /// A backend satisfies the `list` half by naming the id in an
 /// [`Installed::Undetermined`] entry *or* by emitting any aggregate one. The
@@ -420,13 +422,36 @@ fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, mk: &
             "{verb} on an id goetia cannot classify must be Undetermined, got {result:?}"
         );
     }
+
+    // The two verbs that *write*, `--force` included.
+    // [`refuses_foreign_even_with_force`] makes this point one epistemic step
+    // further in: refusing to clobber what goetia has *proved* is a
+    // stranger's is worth little if it will clobber what it could not read at
+    // all. `force` must not even be consulted here — the read that would have
+    // supplied `decide`'s inputs never completed, so there is no classified
+    // artifact for it to override.
+    for (verb, result) in [
+        ("install", mgr.install(&spec, false).map(drop)),
+        ("install with force", mgr.install(&spec, true).map(drop)),
+        ("preview_install", mgr.preview_install(&spec).map(drop)),
+    ] {
+        assert!(
+            matches!(&result, Err(Error::Undetermined { .. })),
+            "{verb} over an id goetia cannot classify must be Undetermined, got {result:?}"
+        );
+    }
 }
 
-/// `installed` is every id `run` has installed so far. Each must be in
-/// `list()` as `Ours`, not just `id`: an enumeration that drops one it could
-/// read is indistinguishable from one where that daemon does not exist, and
-/// the `list()` this already takes answers for all of them at once.
-fn assert_pid_agrees(mgr: &dyn ServiceManager, id: &Id, installed: &[Id]) {
+/// Two assertions off one `list()`, which is why they share a function: SCM's
+/// enumerates every service on the host, so a second call to make the split
+/// look tidier would cost a real sweep.
+///
+/// `installed` is every id installed through `mgr` so far — `run`'s own, plus
+/// the [`HAND_EDITED_ID`] the *caller* installed before `run` was called.
+/// Each must be in `list()` as `Ours`, not just `id`: an enumeration that
+/// drops one it could read is indistinguishable from one where that daemon
+/// does not exist.
+fn assert_list_is_complete_and_pid_agrees(mgr: &dyn ServiceManager, id: &Id, installed: &[Id]) {
     let status_pid = mgr.status(id).expect("status").pid;
     let listed = mgr.list().expect("list");
     for other in installed {

@@ -295,11 +295,11 @@ impl Fake {
     /// a field on `Entry` because an opaque id must also refuse `install`,
     /// which never looks an `Entry` up.
     ///
-    /// Takes effect over an already-installed `id`, which is what a
-    /// permission change on a live artifact looks like.
-    ///
-    /// Also the fake's seeder for `manager::conformance`'s `UNDETERMINED_ID`
-    /// — see that module's doc comment.
+    /// Independent of whether anything is installed at `id`. Over an
+    /// existing entry it is a permission change on a live artifact; over a
+    /// bare id it is the state `manager::conformance` seeds at
+    /// `UNDETERMINED_ID` — a read that failed before it could establish even
+    /// that much. Both are the same claim, which is the point.
     ///
     /// [`Installed::Undetermined`]: crate::manager::Installed::Undetermined
     pub fn seed_opaque(&self, id: &str) {

@@ -338,10 +338,11 @@ fn an_opaque_id_shadows_an_entry_at_the_same_id() {
 
 /// `list` must agree with `Store::get` about a shadowed id: exactly one
 /// entry, and not the `Ours` the failed read would have found. Nothing else
-/// here checks it — the shadowing test above never calls `list`, and the
-/// two `list` tests use ids that are opaque *or* installed, never both — so
-/// without this, `list` can report one id twice, as unclassifiable and as
-/// goetia's at once.
+/// reaches it — the shadowing test above never calls `list`, and every other
+/// test that does (the two opaque-`list` tests, and `fake_passes_conformance`
+/// through `conformance::run`) uses ids that are opaque *or* installed, never
+/// both — so without this, `list` can report one id twice, as unclassifiable
+/// and as goetia's at once.
 #[skuld::test]
 fn an_opaque_id_is_listed_once_and_not_as_ours() {
     let fake = Fake::new();
