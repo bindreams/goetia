@@ -226,7 +226,7 @@ impl ServiceManager for ScmManager {
 
     fn list(&self) -> Result<Vec<Installed>> {
         let mut out = Vec::new();
-        let mut unreadable = 0usize;
+        let mut unreadable: Vec<String> = Vec::new();
         let scan = registry::list_service_names();
         for name in scan.names {
             // A registry read failure for one unrelated service (e.g. a
@@ -240,7 +240,9 @@ impl ServiceManager for ScmManager {
             let params = match registry::read_parameters(&name) {
                 Ok(p) => p,
                 Err(_) => {
-                    unreadable += 1;
+                    // Kept, not counted: `unreadable_aggregate` names the id when it turns out to
+                    // be the only one, and a count cannot be un-summed afterwards.
+                    unreadable.push(name);
                     continue;
                 }
             };
@@ -1063,14 +1065,22 @@ mod manager_tests;
 /// unread thing. Aggregating belongs in the backend because only the backend
 /// knows the denominator.
 ///
-/// The name is dropped because one entry cannot carry hundreds — one of the
-/// two things [`Installed::Undetermined`]'s `None` covers, and not the one a
-/// caller should assume. That is not a
-/// weaker report: while such an entry is present **no negative conclusion about
-/// any id is sound**, since it may stand for the very id being asked about.
-fn unreadable_aggregate(count: usize) -> Option<Installed> {
-    (count > 0).then(|| Installed::Undetermined {
-        name: None,
+/// **A single name is still carried.** Dropping the name is what one entry
+/// standing for hundreds costs; it costs nothing when the entry stands for one,
+/// and [`Installed::Undetermined`] states the invariant directly — *an entry for
+/// exactly one known id always names it*. The difference is not cosmetic. A
+/// null name forbids every negative conclusion about **every** id on the host,
+/// so one Defender-protected `Parameters` key would make
+/// `goetia daemon show <anything-not-installed>` answer "could not be
+/// determined" (exit `4`) instead of "not installed" (exit `1`), permanently,
+/// for ids that have nothing to do with it. Naming the one service it stands
+/// for confines that to the one id it is actually true of.
+fn unreadable_aggregate(names: Vec<String>) -> Option<Installed> {
+    let mut names = names.into_iter();
+    let (first, count) = (names.next()?, 1 + names.count());
+    Some(Installed::Undetermined {
+        // Exactly one, so the entry can be about it rather than about the host.
+        name: (count == 1).then_some(first),
         reason: unreadable_notice(count),
     })
 }

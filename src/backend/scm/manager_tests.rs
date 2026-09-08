@@ -200,11 +200,15 @@ fn is_access_denied_matches_only_error_access_denied() {
 
 // list's aggregate ====================================================================================================
 
+fn names(items: &[&str]) -> Vec<String> {
+    items.iter().map(|name| (*name).to_string()).collect()
+}
+
 /// The count is data, not a diagnostic: it reaches the caller as an entry, whose null name is what
 /// obliges every consumer to stop concluding absence (see `Installed::Undetermined`).
 #[skuld::test]
 fn an_aggregate_undetermined_entry_has_a_null_name_and_names_its_count() {
-    match unreadable_aggregate(3) {
+    match unreadable_aggregate(names(&["alpha", "bravo", "charlie"])) {
         Some(Installed::Undetermined { name, reason }) => {
             assert_eq!(
                 name, None,
@@ -216,12 +220,27 @@ fn an_aggregate_undetermined_entry_has_a_null_name_and_names_its_count() {
     }
 }
 
+/// The invariant `Installed::Undetermined` states and the aggregate used to break: *an entry for
+/// exactly one known id always names it*. The name is in hand at the call site, and a null one is
+/// not a stricter report but a wrong one — it withholds every negative answer about every other id
+/// on the host, when the only thing goetia failed to read was this service.
+#[skuld::test]
+fn an_aggregate_standing_for_one_service_names_it() {
+    match unreadable_aggregate(names(&["MsSecFlt"])) {
+        Some(Installed::Undetermined { name, reason }) => {
+            assert_eq!(name.as_deref(), Some("MsSecFlt"));
+            assert_eq!(reason, unreadable_notice(1), "the entry carries the notice verbatim");
+        }
+        other => panic!("one unreadable service is still undetermined, named: {other:?}"),
+    }
+}
+
 /// The other half, and the one an over-eager fix would break: a host every one of whose services
 /// goetia read leaves nothing undetermined, so `list` must add no entry and `daemon list` must not
 /// exit `4` forever.
 #[skuld::test]
-fn no_aggregate_entry_is_emitted_for_a_zero_count() {
-    assert!(unreadable_aggregate(0).is_none());
+fn no_aggregate_entry_is_emitted_when_nothing_was_unreadable() {
+    assert!(unreadable_aggregate(Vec::new()).is_none());
 }
 
 #[skuld::test]
