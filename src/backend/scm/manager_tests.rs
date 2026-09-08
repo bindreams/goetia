@@ -229,10 +229,36 @@ fn an_aggregate_standing_for_one_service_names_it() {
     match unreadable_aggregate(names(&["MsSecFlt"])) {
         Some(Installed::Undetermined { name, reason }) => {
             assert_eq!(name.as_deref(), Some("MsSecFlt"));
-            assert_eq!(reason, unreadable_notice(1), "the entry carries the notice verbatim");
+            assert_eq!(
+                reason,
+                named_unreadable_notice(),
+                "the entry carries the notice verbatim"
+            );
         }
         other => panic!("one unreadable service is still undetermined, named: {other:?}"),
     }
+}
+
+/// The other half of naming it: the *text* has to be about the service the entry names. The
+/// aggregate wording says a daemon may be missing from the list, which is exactly what a named
+/// entry has ruled out — nothing is missing, it is right there — and `cli::support` prints this
+/// after the name, so the two would contradict each other in one line.
+#[skuld::test]
+fn a_named_entry_does_not_carry_the_aggregate_claim() {
+    let Some(Installed::Undetermined { reason, .. }) = unreadable_aggregate(names(&["MsSecFlt"])) else {
+        panic!("one unreadable service is undetermined");
+    };
+    assert!(
+        !reason.contains("may be missing"),
+        "the entry names the one service it stands for, so nothing is missing from the list: {reason}"
+    );
+    assert!(
+        !reason.contains('\n') && !reason.contains("1 service"),
+        "a named entry states its own case rather than counting: {reason}"
+    );
+    // What it does still have to say: ownership is unknown, not refused, and how to clear it.
+    assert!(reason.contains("unknown"), "{reason}");
+    assert!(reason.contains("re-running elevated"), "{reason}");
 }
 
 /// The other half, and the one an over-eager fix would break: a host every one of whose services
@@ -244,24 +270,26 @@ fn no_aggregate_entry_is_emitted_when_nothing_was_unreadable() {
 }
 
 #[skuld::test]
-fn unreadable_notice_is_one_line_and_agrees_in_number() {
+fn unreadable_notice_is_one_line_and_says_what_it_stands_for() {
     // The wording carries the honest part of this diagnostic — that ownership
     // is *unknown*, not that the services are foreign — so pin it rather than
     // let a later reword quietly turn it into a reassuring lie.
-    let one = unreadable_notice(1);
-    assert!(one.contains("1 service "), "singular noun: {one}");
-    assert!(one.contains("unknown for it"), "singular pronoun: {one}");
+    let one = named_unreadable_notice();
+    assert!(
+        !one.contains("could not be inspected"),
+        "a named entry is about its own service, not about a count of them: {one}"
+    );
 
     let many = unreadable_notice(3);
     assert!(many.contains("3 services "), "plural noun: {many}");
     assert!(many.contains("unknown for them"), "plural pronoun: {many}");
+    assert!(
+        many.contains("may be missing"),
+        "an entry that names nobody cannot say the list is complete: {many}"
+    );
 
     for text in [&one, &many] {
         assert!(!text.contains('\n'), "must stay one line: {text}");
-        assert!(
-            text.contains("may be missing"),
-            "must not claim the list is complete: {text}"
-        );
         assert!(
             text.contains("re-running elevated"),
             "must offer the usual remedy: {text}"

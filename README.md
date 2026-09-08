@@ -535,12 +535,17 @@ Per platform:
   question identically.
 - **SCM** — an unelevated read of a service's `Parameters` is commonly denied, which goetia's Windows design assumes is the usual case rather than a measured one, so
   an unelevated `goetia daemon list` on Windows is **expected** to carry one
-  aggregate entry — `name: null`, carrying a count rather than a name — and
+  `undetermined` entry standing for every service it could not inspect, and
   to exit `4`. That is the designed behavior, not a defect to report:
-  re-running elevated is what empties it. One aggregate rather than hundreds
-  of named entries is deliberate, and it is why the `null`-name rule above
-  exists at all. An entry standing for exactly one service still names it:
-  aggregating is what many ids cost, and it costs nothing for one.
+  re-running elevated is what empties it. How that one entry is shaped
+  depends on how many services it stands for. For more than one — the usual
+  unelevated case — it is an aggregate: `name: null`, carrying a count
+  rather than a name, deliberately, since a listing can deny hundreds of
+  reads and one entry cannot carry their names; that is why the `null`-name
+  rule above exists at all. For exactly one it **names that service**, and
+  its `reason` is about that service rather than about the host, so a
+  `name == null` assertion written from the aggregate case is wrong on a
+  host where exactly one read was denied.
 
 A standing non-empty `undetermined` is not unique to Windows. An unelevated
 `goetia daemon list` on Linux carries one named entry per unit it cannot open,

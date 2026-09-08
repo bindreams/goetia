@@ -235,7 +235,7 @@ impl ServiceManager for ScmManager {
             // per-entry fault tolerance `Installed::OursUnreadable` exists
             // for on the decode side. And since it leaves us unable to tell
             // whether `name` carries Goetia's marker at all, it is neither
-            // omitted nor claimed: counted here, reported by
+            // omitted nor claimed: collected here, reported by
             // `unreadable_aggregate` below.
             let params = match registry::read_parameters(&name) {
                 Ok(p) => p,
@@ -1078,15 +1078,39 @@ mod manager_tests;
 fn unreadable_aggregate(names: Vec<String>) -> Option<Installed> {
     let mut names = names.into_iter();
     let (first, count) = (names.next()?, 1 + names.count());
-    Some(Installed::Undetermined {
-        // Exactly one, so the entry can be about it rather than about the host.
-        name: (count == 1).then_some(first),
-        reason: unreadable_notice(count),
+    // Exactly one, so the entry can be about it rather than about the host — and so must its text.
+    // The name and the reason are one report: an entry that names its service and then says a
+    // daemon may be missing from the list contradicts itself in a single rendered line.
+    Some(match count {
+        1 => Installed::Undetermined {
+            name: Some(first),
+            reason: named_unreadable_notice(),
+        },
+        _ => Installed::Undetermined {
+            name: None,
+            reason: unreadable_notice(count),
+        },
     })
 }
 
-/// The text [`unreadable_aggregate`]'s entry carries: what could not be
-/// inspected, that ownership is therefore *unknown*, and the remedy.
+/// The text an entry that *names* its one service carries, rendered by `cli::support` after that
+/// name: `warning: MsSecFlt: installation state could not be determined: <this>`.
+///
+/// Nothing here is missing from the list, and saying so is the whole difference the name makes —
+/// what is unknown is whether the service goetia just named is one of its own. The remedy stays,
+/// conditioned as [`unreadable_notice`] conditions it: elevation is the usual way a denied read
+/// clears, not a diagnosis of why this one failed.
+fn named_unreadable_notice() -> String {
+    "its registry Parameters could not be read, so whether this service is one of goetia's is \
+     unknown; on an unelevated run, re-running elevated is the usual remedy."
+        .to_string()
+}
+
+/// The text [`unreadable_aggregate`]'s *unnamed* entry carries: how many
+/// services could not be inspected, that ownership is therefore *unknown*,
+/// and the remedy. An entry standing for exactly one names it and carries
+/// [`named_unreadable_notice`] instead, so nothing here has to hold for a
+/// count of one.
 ///
 /// It deliberately does **not** say *why* the read failed. `list` counts
 /// every non-`NotFound` failure here, and access denial is only the common
@@ -1097,14 +1121,8 @@ fn unreadable_aggregate(names: Vec<String>) -> Option<Installed> {
 /// recoveries. Elevation is offered as the usual remedy, not as the
 /// diagnosis.
 fn unreadable_notice(count: usize) -> String {
-    // The count decides all three words together: a fourth string added
-    // later has nowhere to hide.
-    let (s, them, their) = if count == 1 {
-        ("", "it", "its")
-    } else {
-        ("s", "them", "their")
-    };
+    debug_assert!(count > 1, "one service is named, not counted: see unreadable_aggregate");
     format!(
-        "{count} service{s} could not be inspected ({their} registry Parameters could not be read). Ownership is unknown for {them}, so a Goetia daemon may be missing from this list; on an unelevated run, re-running elevated is the usual remedy."
+        "{count} services could not be inspected (their registry Parameters could not be read). Ownership is unknown for them, so a Goetia daemon may be missing from this list; on an unelevated run, re-running elevated is the usual remedy."
     )
 }
