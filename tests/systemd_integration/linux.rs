@@ -117,6 +117,24 @@ fn seed_unreadable_dropin_enotdir(id: &str) -> RmPath {
     RmPath(path)
 }
 
+/// [`seed_unreadable_dropin_enotdir`] under an arbitrary search root, creating that root where it is
+/// missing. `scan_host` reaches any root but `UNIT_DIR` through its cross-root pass alone, and only
+/// for the drop-in half — a *fragment* outside `UNIT_DIR` deliberately names no id (see `HostScan`).
+///
+/// The root is removed only when this call created it, and with `remove_dir`, so a root systemd
+/// itself populated is left exactly as it was found.
+fn seed_unreadable_dropin_in_root(root: &str, id: &str) -> RmFileInRoot {
+    let root_path = PathBuf::from(root);
+    let created_root = !root_path.exists();
+    fs::create_dir_all(&root_path).unwrap_or_else(|e| panic!("mkdir {root}: {e}"));
+    let leaf = root_path.join(format!("{id}.service.d"));
+    fs::write(&leaf, b"").unwrap_or_else(|e| panic!("seed {}: {e}", leaf.display()));
+    RmFileInRoot {
+        leaf,
+        root: created_root.then_some(root_path),
+    }
+}
+
 /// Seed one `*.conf` into an arbitrary drop-in directory and hand back the RAII removal of it. The
 /// parent search root is left exactly as found: `/etc/systemd/system` is shared with every other
 /// test running concurrently.
@@ -285,6 +303,22 @@ impl Drop for RmDropin {
         }
         // No `daemon-reload` here: every test that seeds one of these also holds a `ServiceGuard`,
         // whose own cleanup reloads after this one has run.
+    }
+}
+
+/// RAII removal of a seeded regular file and, where the seeding call created it, the search root
+/// holding it — [`RmDropin`]'s twin for a leaf that is a file rather than a directory.
+struct RmFileInRoot {
+    leaf: PathBuf,
+    root: Option<PathBuf>,
+}
+
+impl Drop for RmFileInRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.leaf);
+        if let Some(root) = &self.root {
+            let _ = fs::remove_dir(root);
+        }
     }
 }
 
@@ -1154,6 +1188,71 @@ fn list_reports_an_id_whose_dropin_it_cannot_read_with_no_fragment_at_all() {
         .status(&Id::try_from(id.clone()).expect("valid id"))
         .expect_err("a drop-in that could not be read leaves the id unclassified");
     assert!(matches!(err, goetia::Error::Undetermined { .. }), "{err:?}");
+}
+
+/// `scan_host`'s cross-root pass, and the dedup that pass makes necessary — both through a real
+/// `list()`.
+///
+/// `residue` counts an `<id>.service.d` under **any** of the twelve search roots, so an id whose
+/// only trace is one there is an id `status` already answers `4` for. A scan that enumerated
+/// `UNIT_DIR` alone never named that id, and `list` therefore omitted it — the negative conclusion
+/// `Installed::Undetermined` exists to forbid, and the exact divergence between the two verbs this
+/// branch removes. `list_reports_an_id_whose_dropin_it_cannot_read_with_no_fragment_at_all` seeds
+/// under `UNIT_DIR`, so it passes with the cross-root pass deleted; this one does not.
+///
+/// The second half is what the first makes possible: once two roots can name one id, the
+/// `BTreeSet` is all that keeps it to a single entry, and `cli::support::partition_installed`
+/// debug-asserts one entry per id.
+///
+/// `/etc/systemd/system.attached` because the two `.control` roots are already taken by
+/// `a_control_dropin_is_drift` and `uninstall_refuses_an_id_whose_only_artifact_is_a_control_dropin`
+/// — no two tests share a root to clean up. A regular *file* where the directory belongs, so
+/// `read_dir` answers `ENOTDIR`: no privilege dissolves that, which is what leaves the id
+/// unclassifiable to the elevated binary CI runs.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn list_names_an_id_whose_only_dropin_is_under_another_search_root() {
+    let id = support::random_test_id();
+    let mgr = Systemd::new();
+
+    // Non-vacuity: nothing is seeded yet, so this id is absent from the listing and no aggregate
+    // stands for it either.
+    assert!(
+        !may_account_for(&mgr.list().expect("list"), &id),
+        "the id must start out unaccounted for, or the assertion below proves nothing"
+    );
+
+    let elsewhere = seed_unreadable_dropin_in_root("/etc/systemd/system.attached", &id);
+    assert!(!unit_path(&id).exists(), "the fragment must really be absent");
+    assert!(
+        !dropin_dir(&id).exists(),
+        "and so must anything under the unit directory itself"
+    );
+
+    let entries = undetermined_for(&mgr.list().expect("list"), &id);
+    match entries.as_slice() {
+        [reason] => assert!(
+            reason.contains(&elsewhere.leaf.display().to_string()),
+            "the entry must name the read that did not complete: {reason}"
+        ),
+        other => panic!("an id named only outside `UNIT_DIR` is one undetermined entry, not {other:?}"),
+    }
+
+    // The same id, now named by two roots at once: still one entry.
+    let _own = seed_unreadable_dropin_enotdir(&id);
+
+    let entries = undetermined_for(&mgr.list().expect("list"), &id);
+    assert_eq!(entries.len(), 1, "two roots naming one id is still one id: {entries:?}");
+}
+
+/// The `reason` of every named `undetermined` entry `listed` carries for `id`.
+fn undetermined_for(listed: &[Installed], id: &str) -> Vec<String> {
+    listed
+        .iter()
+        .filter_map(|entry| match entry {
+            Installed::Undetermined { name, reason } if name.as_deref() == Some(id) => Some(reason.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The same defect at the privilege boundary where it is routine — an administrator's drop-in

@@ -2361,6 +2361,30 @@ fn list_exit_code_is_the_same_with_and_without_json_for_an_undetermined_entry() 
     );
 }
 
+/// The aggregate's *text* rendering. An entry with no name has no name to prefix it with, so its
+/// reason — a complete sentence, unlike a named entry's fragment — stands alone after `warning: `.
+/// The two existing aggregate tests read `--json` or discard stderr, which left this arm of
+/// `cli::support::print_undetermined_warnings` wired into `list` and never once rendered.
+#[skuld::test]
+fn list_text_renders_an_aggregate_entry_with_no_name_to_prefix() {
+    let fake = Fake::new();
+    let reason = "2 services could not be enumerated at this privilege level";
+    fake.seed_aggregate_undetermined(reason);
+
+    let (code, _out, err) = dispatch_read_only(&["goetia", "daemon", "list"], &fake);
+
+    assert_eq!(code, 4, "{err}");
+    assert!(
+        err.contains(&format!("warning: {reason}\n")),
+        "the reason stands alone, with nothing between it and `warning: `: {err}"
+    );
+    assert!(
+        !err.contains("installation state could not be determined"),
+        "that phrasing is the *named* arm's, and prefixing a name that does not exist is what \
+         this arm exists to avoid: {err}"
+    );
+}
+
 /// Named entries by name, then the aggregates that name nobody — one ordering, applied where the
 /// index is built so the text renderer (which reads the index, not the `Report`) cannot drift from
 /// the document. The manager deliberately emits them in the opposite order.

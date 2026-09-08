@@ -181,7 +181,15 @@ pub struct ServiceScan {
 /// No `Services` key at all is neither a failure nor an unfinished pass: absence is *established*
 /// there, so it is an empty scan with nothing outstanding — see [`crate::manager::ServiceManager::list`].
 pub fn list_service_names() -> ServiceScan {
-    let key = match RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(SERVICES_KEY, KEY_READ) {
+    scan_names_under(SERVICES_KEY)
+}
+
+/// The pass over one named key rather than over [`SERVICES_KEY`] directly — the seam
+/// [`collect_service_names`] is for the mid-pass fault, applied to the *open*. `Services` exists and
+/// opens on every host that boots, so pointing the same code at another key is the only way a test
+/// reaches the two outcomes that are not "it opened": see `registry_tests.rs`.
+fn scan_names_under(path: &str) -> ServiceScan {
+    let key = match RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(path, KEY_READ) {
         Ok(key) => key,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return ServiceScan {
@@ -192,11 +200,11 @@ pub fn list_service_names() -> ServiceScan {
         Err(e) => {
             return ServiceScan {
                 names: Vec::new(),
-                incomplete: Some(registry_detail("open", SERVICES_KEY, &e)),
+                incomplete: Some(registry_detail("open", path, &e)),
             };
         }
     };
-    collect_service_names(key.enum_keys())
+    collect_service_names(path, key.enum_keys())
 }
 
 /// The pass itself, over an iterator rather than the `RegKey` directly — which is what makes the
@@ -204,7 +212,7 @@ pub fn list_service_names() -> ServiceScan {
 /// half that matters: stop, keep, report. Collecting into a `Result` instead discards every name
 /// already enumerated because a *later* one faulted, leaving `list` nothing to return but an error
 /// — an empty document on exit `1`, which says this host runs no daemons.
-fn collect_service_names(keys: impl Iterator<Item = std::io::Result<String>>) -> ServiceScan {
+fn collect_service_names(path: &str, keys: impl Iterator<Item = std::io::Result<String>>) -> ServiceScan {
     let mut names = Vec::new();
     for key in keys {
         match key {
@@ -212,7 +220,7 @@ fn collect_service_names(keys: impl Iterator<Item = std::io::Result<String>>) ->
             Err(e) => {
                 return ServiceScan {
                     names,
-                    incomplete: Some(registry_detail("enumerate", SERVICES_KEY, &e)),
+                    incomplete: Some(registry_detail("enumerate", path, &e)),
                 };
             }
         }

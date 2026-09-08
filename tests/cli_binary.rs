@@ -67,31 +67,47 @@ stderr:
 }
 
 /// On every supported platform, `goetia daemon list` reaches a real manager
-/// and needs no elevation. The proof of correct wiring is the *absence* of
-/// `native()`'s "no backend" message, which only a genuinely unwired manager
-/// produces — the fake would also exit 0 here, so this rules out exactly the
-/// one wrong wiring this module exists to catch.
+/// and needs no elevation. The proof of correct wiring is an empty `errors`:
+/// a genuinely unwired manager reports `native()`'s "no backend" there, as
+/// `unavailable` at exit `1` — the fake would also answer cleanly here, so
+/// this rules out exactly the one wrong wiring this module exists to catch.
 /// Labelled `UNIT_DIR_EXCLUSIVE`: this runs a real `daemon list` over the
 /// host's own artifact directories, and `list`'s exit code is host-wide now,
 /// so a concurrently-running test that seeds an unreadable artifact would
 /// turn this `0` into a `4`. The label is the same cross-process lock the
 /// systemd and launchd integration tests take for that reason.
+///
+/// `--json` rather than the text form, and the code tied to the document
+/// rather than merely allowed to be `0` or `4`: the exit code is host-wide,
+/// so one vendor artifact this caller cannot read legitimately makes it `4`
+/// — but only *with an entry that accounts for it*. A `4` over an empty
+/// `undetermined` is an exit code nothing in the document explains, which
+/// `matches!(code, 0 | 4)` alone accepted.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn native_backend_answers_list_unelevated() {
     let dir = tempfile::tempdir().unwrap();
 
-    let (code, out, err) = run_cli(&["daemon", "list"], dir.path());
+    let (code, out, err) = run_cli(&["daemon", "list", "--json"], dir.path());
 
-    // Not `code == 0`: the exit code is host-wide now, so one vendor
-    // artifact this caller cannot read makes it `4` — a fact about the
-    // runner, not about the wiring under test. `0 | 4` and nothing wider:
-    // an unwired or failing manager exits `1` (see
-    // `unimplemented_backend_names_the_platform_not_a_panic`), which is
-    // exactly the failure this module exists to catch, so `1` must stay
-    // excluded.
-    assert!(matches!(code, 0 | 4), "stdout:\n{out}\nstderr:\n{err}");
-    assert!(!err.contains("no backend"), "stderr:\n{err}");
+    let context = format!("stdout:\n{out}\nstderr:\n{err}");
+    let doc: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {context}"));
+    let array = |key: &str| {
+        doc[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("`{key}` must always be present, as an array: {context}"))
+    };
+
+    assert!(
+        array("errors").is_empty(),
+        "a real manager answers `list` on this platform: {context}"
+    );
+    assert_eq!(
+        code,
+        if array("undetermined").is_empty() { 0 } else { 4 },
+        "exit `4` is exactly what an `undetermined` entry reports, and nothing else here reports it: {context}"
+    );
 }
 
 /// Shared with the systemd and launchd integration binaries: any test that

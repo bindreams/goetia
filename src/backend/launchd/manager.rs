@@ -905,6 +905,20 @@ impl ServiceManager for LaunchdManager {
                     // `discover` has already opened, read and decoded this
                     // artifact, so "is anything installed at this id" is not
                     // the question this stat left open.
+                    //
+                    // Deliberately untested, and stated rather than
+                    // contrived: reaching it needs a stat that fails
+                    // *between* `discover`'s own read of this very path and
+                    // this one. Every fixture that would deny this stat —
+                    // an unsearchable parent, a parent replaced by a file —
+                    // denies `discover`'s first, so `install` never gets
+                    // here. `manager_tests.rs::
+                    // occupied_distinguishes_a_denied_stat_from_absence`
+                    // covers `occupied`'s three-way answer, and
+                    // `tests/launchd_integration/launchd.rs::
+                    // an_unsearchable_plist_directory_is_undetermined_rather_than_absent`
+                    // covers `locate`'s use of it end to end; what is only
+                    // here is the choice of class, and it is one line.
                     Presence::Undetermined { source } => return Err(Error::Io { path: target, source }),
                 }
                 write_existing(&target, &desired)?;

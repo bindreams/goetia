@@ -629,6 +629,53 @@ fn status_of_a_service_whose_parameters_deny_reading_is_undetermined() {
     );
 }
 
+/// The same boundary on the `list` side, and what the entry standing for it is allowed to say. One
+/// denied `Parameters` read is one entry that names its service — and carries the *rendered cause*
+/// `registry::read_parameters` built: the key, the operation and the Win32 message. `list` used to
+/// match `Err(_)` and hand the entry a static sentence instead, which `service_detail`'s own doc
+/// comment calls useless for diagnosing a real Win32 failure.
+///
+/// `an_elevated_list_leaves_nothing_undetermined` is what makes the count exactly one here: this
+/// denial is the only unreadable `Parameters` on the host, so the aggregate takes its named form.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn list_reports_a_denied_parameters_read_with_the_cause_it_established() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    install_plain(&mgr, guard.id());
+
+    // Non-vacuity: before the denial this service is one of goetia's own, decoded and listed.
+    assert!(
+        mgr.list()
+            .expect("list before the denial")
+            .iter()
+            .any(|entry| matches!(entry, Installed::Ours { spec, .. } if spec.id.as_str() == id)),
+        "the service must be readable before the denial, or the assertion below proves nothing"
+    );
+
+    let _denied = Denied::parameters(&id);
+
+    let listed = mgr.list().expect("one denied read must not take down the listing");
+
+    let reason = listed
+        .iter()
+        .find_map(|entry| match entry {
+            Installed::Undetermined { name, reason } if name.as_deref() == Some(id.as_str()) => Some(reason),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("a service whose marker was never read is neither claimed nor omitted: {listed:?}"));
+    assert!(
+        reason.contains(&format!(r"{}\{id}\Parameters", support::SCM_SERVICES_KEY)),
+        "the entry must name the key whose read did not complete: {reason}"
+    );
+    assert!(
+        !listed
+            .iter()
+            .any(|entry| matches!(entry, Installed::Ours { spec, .. } if spec.id.as_str() == id)),
+        "the marker went unread, so ownership may not be claimed: {listed:?}"
+    );
+}
+
 /// The service-object boundary, which the `Parameters` test cannot reach: every verb but `install`
 /// opens the service object first, so a DACL denying `SERVICE_QUERY_CONFIG`/`SERVICE_QUERY_STATUS`
 /// stops goetia before it ever looks at the metadata. Fixing `read_parameters` alone would leave

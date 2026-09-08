@@ -647,8 +647,79 @@ fn preview_install_over_a_non_utf8_plist_refuses_it_as_foreign() {
     assert!(matches!(status, goetia::Error::Foreign { .. }), "{status:?}");
 }
 
-/// Run `goetia <args>` as the `nobody` account and parse `--json`'s
-/// document.
+/// [`locate`]'s two unresolved-probe arms, at the privilege boundary that produces them — the one
+/// call site that decides between reporting an id and dropping it. A stat that could not be
+/// performed establishes no absence, so an id under an unsearchable plist directory is exit `4` and
+/// a named path; `symlink_metadata(..).is_ok()` used to answer "nothing is there", which made every
+/// verb report a daemon that is right there as `NotInstalled`.
+///
+/// One iteration per arm. `locate` probes both directories and each answers for the *pair*, so
+/// denying the staging directory reaches the first arm, and denying `/Library/LaunchDaemons` alone
+/// — staging searchable, and this id absent from it — reaches the second. Each arm names its own
+/// directory in the message, which is what tells them apart here.
+///
+/// `manager_tests.rs::occupied_distinguishes_a_denied_stat_from_absence` covers the `Presence`
+/// mapping itself, with an `ENOTDIR` that holds under both uids. What only this test reaches is
+/// `locate`'s use of it: a fixture whose parent is a regular file cannot be planted on either of
+/// these two real directories without taking every other test's artifacts with it.
+///
+/// The staging half denies the *parent* of [`STAGING_DIR`] rather than that directory: `install`
+/// and `disable` both call `ensure_dir(STAGING_DIR)`, which chmods it `0755` unconditionally, so a
+/// concurrently running test that installs anything would lift the denial mid-run. Nothing goetia
+/// does chmods either that parent or [`ENABLED_DIR`], so both denials hold for as long as the guard
+/// does.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn an_unsearchable_plist_directory_is_undetermined_rather_than_absent() {
+    let id = support::random_test_id();
+    // `install` creates these on first use; nothing guarantees this host has installed anything yet.
+    // The modes are restated rather than left to the umask, since the baseline below is exactly the
+    // claim that an unprivileged reader can traverse them — `ensure_dir` restates `0755` too.
+    std::fs::create_dir_all(staging_dir()).expect("create the staging directory");
+    let staging_parent = staging_dir()
+        .parent()
+        .expect("the staging directory is not a filesystem root")
+        .to_path_buf();
+    for dir in [&staging_parent, &staging_dir()] {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|e| panic!("chmod 0755 {}: {e}", dir.display()));
+    }
+
+    // Non-vacuity: with both directories searchable, this id is *determinately* absent — exit `1`,
+    // the answer the assertions below reject.
+    let baseline = run_unelevated(&["daemon", "status", &id]);
+    assert_eq!(
+        baseline.status.code(),
+        Some(1),
+        "an id with no plist in either directory is established absent: stderr:\n{}",
+        String::from_utf8_lossy(&baseline.stderr)
+    );
+
+    for (denied, probed) in [(staging_parent, staging_path(&id)), (enabled_dir(), enabled_path(&id))] {
+        let _mode = ModeGuard::deny_traversal(&denied);
+
+        let output = run_unelevated(&["daemon", "status", &id]);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+        assert_eq!(
+            output.status.code(),
+            Some(4),
+            "{}: a stat that never completed settles nothing: {stderr}",
+            denied.display()
+        );
+        assert!(
+            !stderr.contains("not installed"),
+            "{}: no absence was established: {stderr}",
+            denied.display()
+        );
+        assert!(
+            stderr.contains(&probed.display().to_string()),
+            "{}: the message must name the probe that did not complete: {stderr}",
+            denied.display()
+        );
+    }
+}
+
+/// Run `goetia <args>` as the `nobody` account.
 ///
 /// The binary is copied to `/tmp` first, rather than run from
 /// `CARGO_BIN_EXE_goetia` in place: on CI the cargo target directory lives
@@ -658,7 +729,7 @@ fn preview_install_over_a_non_utf8_plist_refuses_it_as_foreign() {
 /// permissions, which are what these tests need to prove. `/tmp` (the
 /// literal path, not `std::env::temp_dir()` — macOS's per-user `$TMPDIR` is
 /// `0700`) is world-traversable.
-fn unelevated_list_json() -> ListJson {
+fn run_unelevated(args: &[&str]) -> std::process::Output {
     let uid: u32 = cmd::run("id", &["-u", "nobody"])
         .stdout
         .trim()
@@ -675,12 +746,17 @@ fn unelevated_list_json() -> ListJson {
     std::fs::set_permissions(&copy_path, std::fs::Permissions::from_mode(0o755)).expect("chmod copy");
     let _cleanup = FileGuard(copy_path.clone());
 
-    let output = Command::new(&copy_path)
-        .args(["daemon", "list", "--json"])
+    Command::new(&copy_path)
+        .args(args)
         .uid(uid)
         .gid(gid)
         .output()
-        .expect("spawn goetia as `nobody`");
+        .expect("spawn goetia as `nobody`")
+}
+
+/// [`run_unelevated`] for `daemon list --json`, parsed.
+fn unelevated_list_json() -> ListJson {
+    let output = run_unelevated(&["daemon", "list", "--json"]);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let context = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
@@ -689,6 +765,39 @@ fn unelevated_list_json() -> ListJson {
         doc,
         code: output.status.code(),
         context,
+    }
+}
+
+/// `dir`'s mode, restored when this value drops.
+///
+/// Held by the one test that has to make a plist directory unsearchable to an unprivileged reader.
+/// Mode `0700` and a second uid, rather than mode `000` in-process: CI runs this binary as root, and
+/// root's DAC override turns a mode-`000` directory into an ordinary `NotFound` — a fixture that
+/// would report absence and pass vacuously.
+struct ModeGuard {
+    dir: PathBuf,
+    mode: u32,
+}
+
+impl ModeGuard {
+    fn deny_traversal(dir: &Path) -> Self {
+        let mode = std::fs::metadata(dir)
+            .unwrap_or_else(|e| panic!("stat {}: {e}", dir.display()))
+            .permissions()
+            .mode()
+            & 0o7777;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .unwrap_or_else(|e| panic!("chmod 0700 {}: {e}", dir.display()));
+        ModeGuard {
+            dir: dir.to_path_buf(),
+            mode,
+        }
+    }
+}
+
+impl Drop for ModeGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(self.mode));
     }
 }
 

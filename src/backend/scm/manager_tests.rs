@@ -200,8 +200,18 @@ fn is_access_denied_matches_only_error_access_denied() {
 
 // list's aggregate ====================================================================================================
 
-fn names(items: &[&str]) -> Vec<String> {
-    items.iter().map(|name| (*name).to_string()).collect()
+/// `list` collects `(name, reason)` pairs; only the name matters to a caller that is about to
+/// assert on the count, so the reason is stock.
+fn names(items: &[&str]) -> Vec<(String, String)> {
+    items
+        .iter()
+        .map(|name| {
+            (
+                (*name).to_string(),
+                format!("registry open HKLM\\...\\{name}\\Parameters: denied"),
+            )
+        })
+        .collect()
 }
 
 /// The count is data, not a diagnostic: it reaches the caller as an entry, whose null name is what
@@ -231,7 +241,7 @@ fn an_aggregate_standing_for_one_service_names_it() {
             assert_eq!(name.as_deref(), Some("MsSecFlt"));
             assert_eq!(
                 reason,
-                named_unreadable_notice(),
+                named_unreadable_notice(r"registry open HKLM\...\MsSecFlt\Parameters: denied"),
                 "the entry carries the notice verbatim"
             );
         }
@@ -248,6 +258,12 @@ fn a_named_entry_does_not_carry_the_aggregate_claim() {
     let Some(Installed::Undetermined { reason, .. }) = unreadable_aggregate(names(&["MsSecFlt"])) else {
         panic!("one unreadable service is undetermined");
     };
+    // `Err(_)` used to throw the cause away here and hand the entry a static sentence — the one
+    // thing `service_detail`'s own doc comment calls useless for diagnosing a real Win32 failure.
+    assert!(
+        reason.contains(r"registry open HKLM\...\MsSecFlt\Parameters: denied"),
+        "the read that failed is the diagnosable part, and one entry has room for it: {reason}"
+    );
     assert!(
         !reason.contains("may be missing"),
         "the entry names the one service it stands for, so nothing is missing from the list: {reason}"
@@ -259,6 +275,25 @@ fn a_named_entry_does_not_carry_the_aggregate_claim() {
     // What it does still have to say: ownership is unknown, not refused, and how to clear it.
     assert!(reason.contains("unknown"), "{reason}");
     assert!(reason.contains("re-running elevated"), "{reason}");
+}
+
+/// Both arms of the unwrapping that keeps the cause: the `Undetermined` `read_parameters` actually
+/// builds is carried verbatim, without the variant's own `id`/`recovery` prose — which
+/// `cli::support` would render a second time after the name it already prints — and anything else
+/// still says what it was rather than nothing.
+#[skuld::test]
+fn a_failed_parameters_read_keeps_its_rendered_cause() {
+    let carried = undetermined_reason(undetermined(
+        "MsSecFlt",
+        r"registry open HKLM\SYSTEM\CurrentControlSet\Services\MsSecFlt\Parameters: denied".to_string(),
+        true,
+    ));
+    assert_eq!(
+        carried,
+        r"registry open HKLM\SYSTEM\CurrentControlSet\Services\MsSecFlt\Parameters: denied"
+    );
+
+    assert!(undetermined_reason(Error::Other("the hive is corrupt".to_string())).contains("the hive is corrupt"));
 }
 
 /// The other half, and the one an over-eager fix would break: a host every one of whose services
@@ -274,7 +309,7 @@ fn unreadable_notice_is_one_line_and_says_what_it_stands_for() {
     // The wording carries the honest part of this diagnostic — that ownership
     // is *unknown*, not that the services are foreign — so pin it rather than
     // let a later reword quietly turn it into a reassuring lie.
-    let one = named_unreadable_notice();
+    let one = named_unreadable_notice(r"registry open HKLM\...\MsSecFlt\Parameters: denied");
     assert!(
         !one.contains("could not be inspected"),
         "a named entry is about its own service, not about a count of them: {one}"
@@ -301,4 +336,45 @@ fn unreadable_notice_is_one_line_and_says_what_it_stands_for() {
             "the count covers failures that were not denials: {text}"
         );
     }
+}
+
+/// The wiring that turns "the enumeration stopped early" into the entry a caller sees. Distinct
+/// from `unreadable_aggregate`'s entry above — that one stands for services this pass *reached* and
+/// could not read, this one for services it never reached — and both have to appear, since only
+/// reporting them separately keeps each count honest.
+///
+/// Handed a scan rather than reading one: the `Services` key opens and enumerates on every host
+/// that boots (`registry_tests.rs::the_services_key_enumerates_and_finishes`), so `list` itself
+/// cannot be made to produce this without breaking the machine under the test.
+#[skuld::test]
+fn a_scan_that_stopped_early_becomes_an_unnamed_entry_in_the_listing() {
+    let scan = registry::ServiceScan {
+        names: Vec::new(),
+        incomplete: Some("registry enumerate HKLM\\...: injected".to_string()),
+    };
+
+    let listed = classify_scan(scan).expect("a pass that stopped early reports, it does not fail");
+
+    match listed.as_slice() {
+        [Installed::Undetermined { name: None, reason }] => {
+            assert!(reason.contains("injected"), "the detail must survive: {reason}");
+            assert!(
+                reason.contains(registry::SERVICES_KEY),
+                "the entry must name what was being scanned: {reason}"
+            );
+        }
+        other => panic!("what a pass never reached is one unnamed entry, not {other:?}"),
+    }
+}
+
+/// The other half: a pass that finished over an empty host adds nothing at all, so an ordinary
+/// `daemon list` is an empty document at exit `0` rather than a permanent `4`.
+#[skuld::test]
+fn a_scan_that_finished_over_nothing_adds_no_entry() {
+    let scan = registry::ServiceScan {
+        names: Vec::new(),
+        incomplete: None,
+    };
+
+    assert!(classify_scan(scan).expect("list").is_empty());
 }

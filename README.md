@@ -283,7 +283,9 @@ exists instead of hundreds of named ones. `undetermined` being empty is _necessa
 missing id as uninstalled, and not sufficient: `errors` must be empty too.
 A `list()` that failed outright yields an empty `undetermined` alongside one
 `unavailable` error, and an id is missing from that document because nothing
-was enumerated at all.
+was enumerated at all. Two further conditions defeat even both being empty —
+a concurrent goetia verb, and systemd's unscanned `multi-user.target.wants`;
+see [what the guarantee covers](#the-boundary-that-is-guaranteed-and-the-two-that-are-not).
 
 Named entries come first, sorted by name; aggregates last.
 
@@ -485,24 +487,64 @@ is present, since such an entry may stand for that very id.
 
 `list`, `status`, and `show` report only what the **current privilege level
 can read** — and where a read that would have classified an id did not
-complete, they **say so and exit `4`** rather than leaving the id out. No
-backend omits one silently. An enumeration that drops an id it could not
-read is indistinguishable from one where that id does not exist, which is
-how an unelevated `goetia daemon list` could once exit `0` with an empty
-document on a host that did have goetia daemons installed.
+complete, they **say so and exit `4`** rather than leaving the id out. An
+enumeration that drops an id it could not read is indistinguishable from one
+where that id does not exist, which is how an unelevated `goetia daemon list`
+could once exit `0` with an empty document on a host that did have goetia
+daemons installed.
 
 The same holds one level up, for the enumeration itself: a directory or
 registry scan that stops part-way keeps everything it had already classified
 and adds one unnamed `undetermined` entry for whatever it never reached,
 instead of failing the whole listing.
 
-**The rule that follows, and it is the whole point:** while an entry is
-present in `undetermined`, no negative conclusion about any id is sound. An
-entry with a `null` name is one entry standing for many ids, so it may stand
-for the very id you are asking about — you may not conclude that any
-particular id is absent. The claim is not the vague "goetia might have
-missed something" — it is that one. See [`undetermined`](#undetermined) for
-the document shape.
+### The boundary that is guaranteed, and the two that are not
+
+What is guaranteed is **one boundary: an artifact goetia reached and could
+not read.** A unit file, plist, drop-in directory, registry key or service
+object that the scan named and a denial — or an `EIO`, or a corrupt hive —
+refused is reported under that id's name at exit `4`, never omitted. All
+three backends hold that line, and `manager::conformance` asserts it on each.
+
+It is **not** a guarantee that every installed id appears in every listing.
+Two cases fall outside it, and both omit the id with no signal at all — no
+`undetermined` entry, no exit `4`:
+
+- **An artifact that moves while the scan reads it.** goetia's own verbs move
+  artifacts: `enable`/`disable` move a launchd plist between two directories,
+  and `install` renames a systemd fragment aside mid-write. A scan that
+  recorded a name and then found it vacated leaves the id out. Measured, not
+  theoretical: against a large unit directory, 402 of 3000 concurrent
+  `status` calls reported an installed daemon as not installed. Closing it is
+  follow-up work (branch `feat/list-undetermined-races`). Until it lands, a
+  listing you intend to draw a negative conclusion from must not overlap a
+  goetia verb running against the same host.
+- **An id whose only trace is an enablement link.** The systemd scan
+  enumerates `<id>.service` and `<id>.service.d` and never
+  `multi-user.target.wants`. Where a `.wants` directory is not searchable,
+  the three verbs disagree: `status <absent-id>` answers `undetermined` at
+  exit `4`, `show <absent-id>` says "is not installed" at exit `1`, and
+  `list --json` exits `0` with `daemons` and `undetermined` both empty. An id
+  whose sole trace is a link there is omitted from that listing with nothing
+  to mark it. Deliberate and bounded — the argument for why both ways of
+  closing it cost more than the hole is on `HostScan` in
+  `src/backend/systemd/manager.rs`.
+
+**So the rule to script against, with its exception stated:** an empty
+`errors` plus an empty `undetermined` licenses reading an id missing from
+`daemons` as uninstalled — **unless** a goetia verb ran concurrently against
+this host, or the id could be traced only through an unsearchable
+`multi-user.target.wants`. Neither is a condition a listing can detect, which
+is why they are published here rather than reported there.
+
+**And the rule that holds unconditionally:** while an entry is present in
+`undetermined`, no negative conclusion about any id is sound. An entry with a
+`null` name is one entry standing for many ids, so it may stand for the very
+id you are asking about — you may not conclude that any particular id is
+absent. The claim is not the vague "goetia might have missed something" — it
+is that one. See [`undetermined`](#undetermined) for the document shape.
+
+### Which reads count, per platform
 
 **Bytes that were obtained are never `undetermined`.** goetia writes UTF-8
 and nothing else — ini on systemd, XML on launchd — so an artifact whose

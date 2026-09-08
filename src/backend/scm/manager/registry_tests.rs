@@ -83,7 +83,7 @@ fn a_key_that_cannot_be_enumerated_keeps_what_the_scan_already_named() {
         Ok("never-reached".to_string()),
     ];
 
-    let scan = collect_service_names(keys.into_iter());
+    let scan = collect_service_names(SERVICES_KEY, keys.into_iter());
 
     assert_eq!(
         scan.names,
@@ -102,11 +102,89 @@ fn a_key_that_cannot_be_enumerated_keeps_what_the_scan_already_named() {
 fn a_pass_that_finishes_reports_nothing_undetermined() {
     let keys = vec![Ok("a".to_string()), Ok("b".to_string())];
 
-    let scan = collect_service_names(keys.into_iter());
+    let scan = collect_service_names(SERVICES_KEY, keys.into_iter());
 
     assert_eq!(scan.names, ["a", "b"]);
     assert!(
         scan.incomplete.is_none(),
         "a pass that finished has nothing to report: {scan:?}"
+    );
+}
+
+// The open, through the real `RegKey` =================================================================================
+//
+// `collect_service_names` above covers the mid-pass fault with a hand-built iterator. These three
+// cover the outcome *before* it — what `scan_names_under` makes of the open itself — through the
+// real `RegOpenKeyEx`, because the arm that decides "empty and settled" against "empty and
+// unfinished" is exactly the one this branch exists to get right, and a hand-built value cannot
+// reach it.
+
+/// The production call, against the production key. Every Windows host that boots has `Services`,
+/// with services under it, readable at any privilege level — so a pass over it names some and
+/// reports nothing outstanding. Without this, no test opens that key at all.
+#[skuld::test]
+fn the_services_key_enumerates_and_finishes() {
+    let scan = list_service_names();
+
+    assert!(
+        !scan.names.is_empty(),
+        "every Windows host runs services: {:?}",
+        scan.names
+    );
+    assert!(
+        scan.incomplete.is_none(),
+        "the `Services` key opens and enumerates for any caller: {:?}",
+        scan.incomplete
+    );
+}
+
+/// A key that is not there is *absence, established* — an empty scan with nothing outstanding, so
+/// `list` returns an empty document at exit `0` rather than one aggregate entry and a permanent
+/// exit `4`. `ServiceManager::list`'s doc comment requires this of every backend's absent container.
+#[skuld::test]
+fn a_services_key_that_does_not_exist_is_an_empty_settled_scan() {
+    let scan = scan_names_under(&format!(r"{SERVICES_KEY}\goetia-no-such-key-b6f0a1c2"));
+
+    assert!(scan.names.is_empty(), "{:?}", scan.names);
+    assert!(
+        scan.incomplete.is_none(),
+        "nothing is registered under a key that does not exist, and that is an answer: {:?}",
+        scan.incomplete
+    );
+}
+
+/// The other outcome, and the one that must never be confused with it: a key that *is* there and
+/// will not open leaves the pass unfinished, so the scan carries the entry that forbids concluding
+/// any id absent.
+///
+/// `HKLM\SECURITY` is the probe because its DACL grants `LocalSystem` alone — an elevated
+/// Administrator is refused, which is the token CI runs these under, and an unelevated one is
+/// refused too, so this holds under both. A runner whose token really is `LocalSystem` opens it and
+/// fails here loudly rather than skipping, which is this repo's rule for a missing precondition.
+#[skuld::test]
+fn a_services_key_that_will_not_open_leaves_the_pass_unfinished() {
+    // The probe really is refused. Stated separately so a runner whose token *does* open it says
+    // so, rather than surfacing as a confusing failure about the scan.
+    let refusal = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags("SECURITY", KEY_READ)
+        .err()
+        .unwrap_or_else(|| {
+            panic!(r"this runner's token opens HKLM\SECURITY, so it is LocalSystem; this probe needs any other token")
+        });
+    assert_ne!(
+        refusal.kind(),
+        std::io::ErrorKind::NotFound,
+        r"HKLM\SECURITY exists on every Windows host: {refusal}"
+    );
+
+    let scan = scan_names_under("SECURITY");
+
+    assert!(scan.names.is_empty(), "{:?}", scan.names);
+    let detail = scan
+        .incomplete
+        .expect("a key that exists and would not open established no absence");
+    assert!(
+        detail.contains("SECURITY"),
+        "the detail must name what was being scanned: {detail}"
     );
 }

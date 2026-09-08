@@ -225,75 +225,84 @@ impl ServiceManager for ScmManager {
     }
 
     fn list(&self) -> Result<Vec<Installed>> {
-        let mut out = Vec::new();
-        let mut unreadable: Vec<String> = Vec::new();
-        let scan = registry::list_service_names();
-        for name in scan.names {
-            // A registry read failure for one unrelated service (e.g. a
-            // driver whose `Parameters` key carries a restrictive ACL) must
-            // not take `list` down for every other daemon — the same
-            // per-entry fault tolerance `Installed::OursUnreadable` exists
-            // for on the decode side. And since it leaves us unable to tell
-            // whether `name` carries Goetia's marker at all, it is neither
-            // omitted nor claimed: collected here, reported by
-            // `unreadable_aggregate` below.
-            let params = match registry::read_parameters(&name) {
-                Ok(p) => p,
-                Err(_) => {
-                    // Kept, not counted: `unreadable_aggregate` names the id when it turns out to
-                    // be the only one, and a count cannot be un-summed afterwards.
-                    unreadable.push(name);
-                    continue;
-                }
-            };
-            let blob = match generate::extract(&params) {
-                Ok(None) => continue,
-                Ok(Some(blob)) => blob,
-                Err(e) => {
-                    out.push(Installed::OursUnreadable {
-                        name,
-                        reason: e.to_string(),
-                    });
-                    continue;
-                }
-            };
-            // A blob can decode perfectly and still name an account (e.g. a
-            // `user.id` SID) that no longer exists on this host — see
-            // `classify`'s identical check on the `install`/`diff` side.
-            // `list`/`status` must agree with `install` about which ids are
-            // "genuinely ours and readable", or a daemon `list` reports
-            // healthy could refuse the very next `install`.
-            if let Err(e) = identity::resolve(&blob.spec.user) {
+        classify_scan(registry::list_service_names())
+    }
+}
+
+/// [`ScmManager::list`]'s body, over a [`registry::ServiceScan`] rather than reading one — the seam
+/// `registry::collect_service_names` is for the mid-pass fault, one level up. The `Services` key
+/// opens and enumerates on every host that boots (`registry_tests.rs` pins that), so a scan that
+/// stopped early cannot be produced here; handing one in is what reaches the wiring below, which is
+/// where "the enumeration stopped" becomes the entry a caller sees.
+fn classify_scan(scan: registry::ServiceScan) -> Result<Vec<Installed>> {
+    let mut out = Vec::new();
+    let mut unreadable: Vec<(String, String)> = Vec::new();
+    for name in scan.names {
+        // A registry read failure for one unrelated service (e.g. a
+        // driver whose `Parameters` key carries a restrictive ACL) must
+        // not take `list` down for every other daemon — the same
+        // per-entry fault tolerance `Installed::OursUnreadable` exists
+        // for on the decode side. And since it leaves us unable to tell
+        // whether `name` carries Goetia's marker at all, it is neither
+        // omitted nor claimed: collected here, reported by
+        // `unreadable_aggregate` below.
+        let params = match registry::read_parameters(&name) {
+            Ok(p) => p,
+            Err(e) => {
+                // Kept with its cause, not counted: `unreadable_aggregate` names the id — and
+                // says what failed — when it turns out to be the only one, and neither a count
+                // nor a discarded error can be recovered afterwards.
+                unreadable.push((name, undetermined_reason(e)));
+                continue;
+            }
+        };
+        let blob = match generate::extract(&params) {
+            Ok(None) => continue,
+            Ok(Some(blob)) => blob,
+            Err(e) => {
                 out.push(Installed::OursUnreadable {
                     name,
-                    reason: format!("marked ours, but its account could not be resolved: {e}"),
+                    reason: e.to_string(),
                 });
                 continue;
             }
-            match query_live(&name) {
-                Ok((state, pid, enabled)) => out.push(Installed::Ours {
-                    spec: blob.spec,
-                    state,
-                    pid,
-                    enabled,
-                }),
-                Err(e) => out.push(Installed::OursUnreadable {
-                    name,
-                    reason: format!("marked ours, but its live status could not be read: {e}"),
-                }),
-            }
+        };
+        // A blob can decode perfectly and still name an account (e.g. a
+        // `user.id` SID) that no longer exists on this host — see
+        // `classify`'s identical check on the `install`/`diff` side.
+        // `list`/`status` must agree with `install` about which ids are
+        // "genuinely ours and readable", or a daemon `list` reports
+        // healthy could refuse the very next `install`.
+        if let Err(e) = identity::resolve(&blob.spec.user) {
+            out.push(Installed::OursUnreadable {
+                name,
+                reason: format!("marked ours, but its account could not be resolved: {e}"),
+            });
+            continue;
         }
-        out.extend(unreadable_aggregate(unreadable));
-        // A second aggregate, and distinct from the one above: that one stands for services this
-        // pass reached and could not read, this one for services it never reached at all. Both
-        // carry no name, so either alone already forbids concluding any id absent; reporting them
-        // separately is what keeps each one's count honest.
-        out.extend(
-            scan.incomplete
-                .map(|detail| Installed::scan_incomplete(registry::SERVICES_KEY, &detail)),
-        );
-        Ok(out)
+        match query_live(&name) {
+            Ok((state, pid, enabled)) => out.push(Installed::Ours {
+                spec: blob.spec,
+                state,
+                pid,
+                enabled,
+            }),
+            Err(e) => out.push(Installed::OursUnreadable {
+                name,
+                reason: format!("marked ours, but its live status could not be read: {e}"),
+            }),
+        }
     }
+    out.extend(unreadable_aggregate(unreadable));
+    // A second aggregate, and distinct from the one above: that one stands for services this
+    // pass reached and could not read, this one for services it never reached at all. Both
+    // carry no name, so either alone already forbids concluding any id absent; reporting them
+    // separately is what keeps each one's count honest.
+    out.extend(
+        scan.incomplete
+            .map(|detail| Installed::scan_incomplete(registry::SERVICES_KEY, &detail)),
+    );
+    Ok(out)
 }
 
 // shim support ========================================================================================================
@@ -841,6 +850,17 @@ fn open_scm(access: ServiceManagerAccess) -> Result<WinServiceManager> {
 /// goetia owns an id it never got as far as looking at. Every other caller
 /// reaches [`open_scm`] only after ownership is settled, where `Other` is the
 /// true statement.
+///
+/// Deliberately untested, and stated rather than contrived: `SC_MANAGER_CONNECT` is granted to every
+/// token on a working host, and the only way to withhold it is to rewrite the SCM database's own
+/// security descriptor — which stops `services.msc`, the test harness's own `ServiceGuard` cleanup
+/// and every other service operation on the runner, and is not restorable by a `Drop` that may not
+/// run. What is covered instead is the mapping this line performs, in full: the same
+/// [`service_undetermined`] over the same [`service_detail`] text, at
+/// `manager_tests.rs::the_scm_undetermined_recovery_names_both_causes_and_not_uninstall` for both
+/// causes, and end to end against a real denial at
+/// `tests/scm_integration/managed.rs::status_of_a_service_whose_object_denies_querying_is_undetermined`,
+/// which reaches it through [`open_existing`]'s service-object open instead.
 fn open_scm_to_classify(id: &str) -> Result<WinServiceManager> {
     WinServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(|e| service_undetermined(id, "open the Service Control Manager", &e))
@@ -1074,17 +1094,18 @@ mod manager_tests;
 /// `goetia daemon show <anything-not-installed>` answer "could not be
 /// determined" (exit `4`) instead of "not installed" (exit `1`), permanently,
 /// for ids that have nothing to do with it. Naming the one service it stands
-/// for confines that to the one id it is actually true of.
-fn unreadable_aggregate(names: Vec<String>) -> Option<Installed> {
-    let mut names = names.into_iter();
-    let (first, count) = (names.next()?, 1 + names.count());
+/// for confines that to the one id it is actually true of. Its cause travels with it, for the same
+/// reason and at the same cost — see [`named_unreadable_notice`].
+fn unreadable_aggregate(unreadable: Vec<(String, String)>) -> Option<Installed> {
+    let mut unreadable = unreadable.into_iter();
+    let (first, count) = (unreadable.next()?, 1 + unreadable.count());
     // Exactly one, so the entry can be about it rather than about the host — and so must its text.
     // The name and the reason are one report: an entry that names its service and then says a
     // daemon may be missing from the list contradicts itself in a single rendered line.
     Some(match count {
         1 => Installed::Undetermined {
-            name: Some(first),
-            reason: named_unreadable_notice(),
+            name: Some(first.0),
+            reason: named_unreadable_notice(&first.1),
         },
         _ => Installed::Undetermined {
             name: None,
@@ -1093,17 +1114,35 @@ fn unreadable_aggregate(names: Vec<String>) -> Option<Installed> {
     })
 }
 
+/// The `reason` [`registry::read_parameters`] rendered — the key, the operation and the OS error —
+/// kept for the entry that stands for that one read. `read_parameters` builds every failure it has
+/// through `registry_undetermined`, so the first arm is the whole story; the second exists because
+/// the `Result` type does not say so, and renders the same facts with the variant's own prefix.
+fn undetermined_reason(e: Error) -> String {
+    match e {
+        Error::Undetermined { reason, .. } => reason,
+        other => other.to_string(),
+    }
+}
+
 /// The text an entry that *names* its one service carries, rendered by `cli::support` after that
 /// name: `warning: MsSecFlt: installation state could not be determined: <this>`.
+///
+/// `detail` is [`registry::read_parameters`]'s own rendering of what failed, carried through rather
+/// than replaced by a static sentence: it names the key, the operation and the Win32 error, which is
+/// the only part of this that can distinguish a denied read from a corrupt hive. A count of more
+/// than one has a reason to drop it ([`unreadable_notice`] — hundreds of causes, one entry); a count
+/// of one has none.
 ///
 /// Nothing here is missing from the list, and saying so is the whole difference the name makes —
 /// what is unknown is whether the service goetia just named is one of its own. The remedy stays,
 /// conditioned as [`unreadable_notice`] conditions it: elevation is the usual way a denied read
 /// clears, not a diagnosis of why this one failed.
-fn named_unreadable_notice() -> String {
-    "its registry Parameters could not be read, so whether this service is one of goetia's is \
-     unknown; on an unelevated run, re-running elevated is the usual remedy."
-        .to_string()
+fn named_unreadable_notice(detail: &str) -> String {
+    format!(
+        "{detail} — so whether this service is one of goetia's is unknown; on an unelevated run, \
+         re-running elevated is the usual remedy."
+    )
 }
 
 /// The text [`unreadable_aggregate`]'s *unnamed* entry carries: how many
