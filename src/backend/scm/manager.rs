@@ -236,7 +236,7 @@ impl ServiceManager for ScmManager {
 /// where "the enumeration stopped" becomes the entry a caller sees.
 fn classify_scan(scan: registry::ServiceScan) -> Result<Vec<Installed>> {
     let mut out = Vec::new();
-    let mut unreadable: Vec<(String, String)> = Vec::new();
+    let mut unreadable: Vec<Unreadable> = Vec::new();
     for name in scan.names {
         // A registry read failure for one unrelated service (e.g. a
         // driver whose `Parameters` key carries a restrictive ACL) must
@@ -249,10 +249,10 @@ fn classify_scan(scan: registry::ServiceScan) -> Result<Vec<Installed>> {
         let params = match registry::read_parameters(&name) {
             Ok(p) => p,
             Err(e) => {
-                // Kept with its cause, not counted: `unreadable_aggregate` names the id — and
-                // says what failed — when it turns out to be the only one, and neither a count
-                // nor a discarded error can be recovered afterwards.
-                unreadable.push((name, undetermined_reason(e)));
+                // Kept whole, not counted: `unreadable_aggregate` names the id — and says what
+                // failed, and how that failure clears — when it turns out to be the only one, and
+                // neither a count nor a discarded error can be recovered afterwards.
+                unreadable.push(unreadable_parts(name, e));
                 continue;
             }
         };
@@ -1094,19 +1094,23 @@ mod manager_tests;
 /// `goetia daemon show <anything-not-installed>` answer "could not be
 /// determined" (exit `4`) instead of "not installed" (exit `1`), permanently,
 /// for ids that have nothing to do with it. Naming the one service it stands
-/// for confines that to the one id it is actually true of. Its cause travels with it, for the same
-/// reason and at the same cost — see [`named_unreadable_notice`].
-fn unreadable_aggregate(unreadable: Vec<(String, String)>) -> Option<Installed> {
+/// for confines that to the one id it is actually true of. Its cause travels with it, and so does
+/// the remedy that cause earned, for the same reason and at the same cost — see
+/// [`named_unreadable_notice`].
+fn unreadable_aggregate(unreadable: Vec<Unreadable>) -> Option<Installed> {
     let mut unreadable = unreadable.into_iter();
     let (first, count) = (unreadable.next()?, 1 + unreadable.count());
     // Exactly one, so the entry can be about it rather than about the host — and so must its text.
     // The name and the reason are one report: an entry that names its service and then says a
     // daemon may be missing from the list contradicts itself in a single rendered line.
     Some(match count {
-        1 => Installed::Undetermined {
-            name: Some(first.0),
-            reason: named_unreadable_notice(&first.1),
-        },
+        1 => {
+            let reason = named_unreadable_notice(&first.detail, first.recovery.as_deref());
+            Installed::Undetermined {
+                name: Some(first.name),
+                reason,
+            }
+        }
         _ => Installed::Undetermined {
             name: None,
             reason: unreadable_notice(count),
@@ -1114,14 +1118,40 @@ fn unreadable_aggregate(unreadable: Vec<(String, String)>) -> Option<Installed> 
     })
 }
 
-/// The `reason` [`registry::read_parameters`] rendered — the key, the operation and the OS error —
-/// kept for the entry that stands for that one read. `read_parameters` builds every failure it has
-/// through `registry_undetermined`, so the first arm is the whole story; the second exists because
-/// the `Result` type does not say so, and renders the same facts with the variant's own prefix.
-fn undetermined_reason(e: Error) -> String {
+/// One service `list` reached and could not read, kept whole because
+/// [`unreadable_aggregate`] cannot recover any of it afterwards: a count knows
+/// neither the name, nor the cause, nor which remedy that cause earned.
+struct Unreadable {
+    name: String,
+    /// [`registry::read_parameters`]'s own rendering of what failed: the key,
+    /// the operation and the OS error.
+    detail: String,
+    /// The remedy [`undetermined`] chose from that failure's errno, or `None`
+    /// for one that arrived without a conditioned remedy to carry.
+    recovery: Option<String>,
+}
+
+/// Split the failure [`registry::read_parameters`] returned into the parts an entry standing for
+/// that one read can carry, dropping only the variant's `id` — which `cli::support` renders itself,
+/// from the name, before this text.
+///
+/// The remedy travels for the reason the cause does: at a count of one this entry and
+/// `status <same-id>` report the same single failed read, so answering it twice, differently, would
+/// put two answers on one condition. `read_parameters` builds every failure it has through
+/// `registry_undetermined`, so the first arm is the whole story; the second exists because the
+/// `Result` type does not say so, and has no conditioned remedy to offer rather than a default one.
+fn unreadable_parts(name: String, e: Error) -> Unreadable {
     match e {
-        Error::Undetermined { reason, .. } => reason,
-        other => other.to_string(),
+        Error::Undetermined { reason, recovery, .. } => Unreadable {
+            name,
+            detail: reason,
+            recovery: Some(recovery),
+        },
+        other => Unreadable {
+            name,
+            detail: other.to_string(),
+            recovery: None,
+        },
     }
 }
 
@@ -1135,14 +1165,22 @@ fn undetermined_reason(e: Error) -> String {
 /// of one has none.
 ///
 /// Nothing here is missing from the list, and saying so is the whole difference the name makes —
-/// what is unknown is whether the service goetia just named is one of its own. The remedy stays,
-/// conditioned as [`unreadable_notice`] conditions it: elevation is the usual way a denied read
-/// clears, not a diagnosis of why this one failed.
-fn named_unreadable_notice(detail: &str) -> String {
-    format!(
-        "{detail} — so whether this service is one of goetia's is unknown; on an unelevated run, \
-         re-running elevated is the usual remedy."
-    )
+/// what is unknown is whether the service goetia just named is one of its own.
+///
+/// `recovery` is [`undetermined`]'s own choice, carried rather than re-worded: that function
+/// conditions the remedy on whether the failure was a denial precisely because "elevation is advice
+/// only a permission boundary earns", and an entry standing for one read has the same errno in hand
+/// that `status` does. Offering elevation unconditionally here told an already-elevated host to
+/// re-run elevated over a corrupt hive, while `status <same-id>` told it to fix the hive.
+/// [`unreadable_notice`]'s hedge is reasoning about a *count* — hundreds of causes, one entry — and
+/// does not reach a count of one.
+fn named_unreadable_notice(detail: &str, recovery: Option<&str>) -> String {
+    match recovery {
+        Some(recovery) => {
+            format!("{detail} — so whether this service is one of goetia's is unknown; {recovery}.")
+        }
+        None => format!("{detail} — so whether this service is one of goetia's is unknown."),
+    }
 }
 
 /// The text [`unreadable_aggregate`]'s *unnamed* entry carries: how many
