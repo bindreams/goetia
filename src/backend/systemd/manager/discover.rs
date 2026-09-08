@@ -118,7 +118,8 @@ pub(super) enum RawState {
 /// blocks until a writer arrives, and one `mkfifo x.service` would wedge the listing for every
 /// daemon on the host.
 ///
-/// Step 2 re-opens a regular file for reading and compares `(st_dev, st_ino)` against step 1's, so
+/// Step 2 ([`read_verified`]) re-opens a regular file for reading and compares `(st_dev, st_ino)`
+/// against step 1's, so
 /// no verdict is ever derived from a classification of some other file that briefly held the name.
 /// It is the only step a *readable-type* artifact can fail at, and unambiguous there: a regular
 /// file whose bytes could not be obtained.
@@ -128,7 +129,7 @@ pub(super) enum RawState {
 /// Every failure is a [`ReadFailure`], which states what did not complete and leaves what that
 /// means about the id to the caller.
 pub(super) fn classify_and_read(path: &Path) -> ReadResult<RawState> {
-    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::os::unix::fs::OpenOptionsExt as _;
 
     // `OpenOptions` insists on an access mode even where `O_PATH` makes the kernel ignore it.
     let classified = match fs::OpenOptions::new()
@@ -145,6 +146,19 @@ pub(super) fn classify_and_read(path: &Path) -> ReadResult<RawState> {
     if !classified.is_file() {
         return Ok(RawState::NonRegular);
     }
+    read_verified(path, &classified)
+}
+
+/// Step 2 on its own: re-open `path` for reading and refuse to read it unless it is still the file
+/// `classified` describes.
+///
+/// `classified` is a parameter rather than something this reads for itself, and that is what makes
+/// the mismatch reachable from a test. Forcing it in place needs a swap landing between two
+/// adjacent syscalls, which nothing can schedule; handing this function another file's metadata is
+/// indistinguishable to it from the swap it guards against, since the check compares two
+/// `(st_dev, st_ino)` pairs and cannot see where either came from.
+fn read_verified(path: &Path, classified: &fs::Metadata) -> ReadResult<RawState> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
     let file = fs::OpenOptions::new()
         .read(true)
