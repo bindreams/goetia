@@ -236,15 +236,17 @@ shown pretty-printed here for readability:
 `daemons`, `errors` and `undetermined` are **always present**, as arrays,
 possibly empty.
 
-| Key                 | Type            | Notes                                                                                                                                              |
-| ------------------- | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `daemons[].id`      | string          | The daemon id.                                                                                                                                     |
-| `daemons[].state`   | string          | One of `running`, `stopped`, `failed`, `unknown`.                                                                                                  |
-| `daemons[].enabled` | bool            | Whether the service is enabled at boot.                                                                                                            |
-| `daemons[].pid`     | integer or null | `null` means the manager reports **no main process** — never "goetia could not find out", which is an `errors` entry instead.                      |
-| `errors[].id`       | string or null  | The daemon id or service name the failure is attributable to; `null` for exactly the `unavailable` and `unsupported` kinds, which belong to no id. |
-| `errors[].kind`     | string          | See below.                                                                                                                                         |
-| `errors[].message`  | string          | Human-readable detail.                                                                                                                             |
+| Key                     | Type            | Notes                                                                                                                                                                                                               |
+| ----------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `daemons[].id`          | string          | The daemon id.                                                                                                                                                                                                      |
+| `daemons[].state`       | string          | One of `running`, `stopped`, `failed`, `unknown`.                                                                                                                                                                   |
+| `daemons[].enabled`     | bool            | Whether the service is enabled at boot.                                                                                                                                                                             |
+| `daemons[].pid`         | integer or null | `null` means the manager reports **no main process** — never "goetia could not find out", which is an `errors` entry instead.                                                                                       |
+| `errors[].id`           | string or null  | The daemon id or service name the failure is attributable to; `null` for exactly the `unavailable` and `unsupported` kinds, which belong to no id.                                                                  |
+| `errors[].kind`         | string          | See below.                                                                                                                                                                                                          |
+| `errors[].message`      | string          | Human-readable detail.                                                                                                                                                                                              |
+| `undetermined[].name`   | string or null  | The id the entry stands for. **`null` is one entry standing for many ids** — see below.                                                                                                                             |
+| `undetermined[].reason` | string          | What did not complete, as facts: the operation, what it was on, and the failure. An aggregate's stands alone and names a count rather than an id. Carries no remedy — that text is the per-id `errors[].message`'s. |
 
 A daemon's display `name` is deliberately absent: `status` has no spec to
 read it from, and one field differing between the two subcommands would be
@@ -252,22 +254,48 @@ worse than sending you to `goetia daemon show`.
 
 `errors[].kind` is one of eight values:
 
-| `kind`          | Exit code | Meaning                                                                                                                                                                                                                           |
-| --------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `not-installed` | 1         | Nothing is installed at that id. Only from `status <id>`.                                                                                                                                                                         |
-| `foreign`       | 1         | A read that _completed_ established that what is there is not goetia's: an artifact carrying no marker, or a masked unit's symlink. Never inferred from a read that failed. Only from `status <id>`.                              |
-| `unreadable`    | 4         | Goetia read enough to know the id is its own, but cannot report on it — a blob it cannot decode, or a live state it could not query. `message` says which.                                                                        |
-| `undetermined`  | 4         | Goetia could not determine **whether** anything is installed at that id: a read it needed failed. Claims no ownership — that is the whole difference from `unreadable`. `message` names the path and what would make it readable. |
-| `invalid-id`    | 1         | A command-line argument was not a valid daemon id. Fix the argument.                                                                                                                                                              |
-| `unavailable`   | 1         | Obtaining the manager, or listing, failed, so **no** answer was obtained for any daemon.                                                                                                                                          |
-| `unsupported`   | 2         | `--json` was given to a subcommand that does not implement it.                                                                                                                                                                    |
-| `other`         | 1         | Unreachable today; reserved so an unclassified failure has a home rather than being silently dropped.                                                                                                                             |
+| `kind`          | Exit code | Meaning                                                                                                                                                                                                                                                                                                                                                                                         |
+| --------------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `not-installed` | 1         | Nothing is installed at that id. Only from `status <id>`.                                                                                                                                                                                                                                                                                                                                       |
+| `foreign`       | 1         | A read that _completed_ established that what is there is not goetia's: an artifact carrying no marker, or a masked unit's symlink. Never inferred from a read that failed. Only from `status <id>`.                                                                                                                                                                                            |
+| `unreadable`    | 4         | Goetia read enough to know the id is its own, but cannot report on it — a blob it cannot decode, or a live state it could not query. `message` says which.                                                                                                                                                                                                                                      |
+| `undetermined`  | 4         | Goetia could not determine **whether** anything is installed at that id: a read it needed failed. Claims no ownership — that is the whole difference from `unreadable`. `message` names what would not read — a path, or on Windows a registry key or service object — and what would make it readable. Only from `status <id>`; out of `list()` the same fact is the `undetermined` key below. |
+| `invalid-id`    | 1         | A command-line argument was not a valid daemon id. Fix the argument.                                                                                                                                                                                                                                                                                                                            |
+| `unavailable`   | 1         | Obtaining the manager, or listing, failed, so **no** answer was obtained for any daemon.                                                                                                                                                                                                                                                                                                        |
+| `unsupported`   | 2         | `--json` was given to a subcommand that does not implement it.                                                                                                                                                                                                                                                                                                                                  |
+| `other`         | 1         | Unreachable today; reserved so an unclassified failure has a home rather than being silently dropped.                                                                                                                                                                                                                                                                                           |
+
+### `undetermined`
+
+`undetermined` carries what `list()` could not classify: an id whose read
+never completed, so goetia established neither that something is installed
+there nor that nothing is. A third key rather than an `errors[].kind`
+because the command did not fail — it reported everything it could see, and
+this is a stated limit on that answer's completeness, which a consumer must
+be able to read without parsing `kind` strings.
+
+**While `undetermined` is non-empty, "absent from `daemons`" does not mean
+"not installed".** An entry whose `name` is `null` is **one entry standing
+for many ids**, so while one is present you may not conclude that any
+particular id is absent — not for rendering, not for a branch, not for a
+test assertion. Standing for an unnamed set is the whole reason that entry
+exists instead of hundreds of named ones. `undetermined` being empty is the
+precondition for reading a missing id as uninstalled.
+
+Named entries come first, sorted by name; aggregates last.
+
+Only the `list()`-derived forms ever populate it: `goetia daemon list`, and
+`goetia daemon status` with no ids. `status <id>` asks about one named id,
+so the same fact arrives as that id's own `errors[].kind: "undetermined"`
+instead. Both exit `4`, so a consumer branching on the exit code sees no
+difference between them — the split is about attribution, not severity.
 
 ### Exit code
 
-The exit code is **zero exactly when `errors` is empty**, and otherwise the
-precedence-max of the codes in the table above (see
-[Exit codes](#exit-codes) for the precedence rule).
+The exit code is **zero exactly when both `errors` and `undetermined` are
+empty**, and otherwise the precedence-max of the codes in the table above,
+an `undetermined` entry contributing the same `4` the `undetermined` kind
+does (see [Exit codes](#exit-codes) for the precedence rule).
 
 The one thing that overrides that: if stdout refuses the write — a broken
 pipe (`goetia --json daemon list | head -1`), a full disk — the document was
@@ -282,7 +310,7 @@ would mislead exactly the consumer the code exists for.
 
 So the exit status is not a "did I get JSON" test. A `4` still carries a
 complete, well-formed document describing what could and could not be
-determined: parse stdout first, then read `errors`.
+determined: parse stdout first, then read `errors` and `undetermined`.
 
 ## Exit codes
 
@@ -386,16 +414,29 @@ different question from drift.
 | `disable`                    | 1               | Disabling after the fragment is gone is impossible, leaving a dangling `.wants` symlink: exit 0 while still enabled at boot.   |
 | `start`, `restart`, `enable` | 1               | Cannot act on what is not there.                                                                                               |
 
+That table is about an absence goetia **established**. An id whose absence
+it could not establish is `4` for all six verbs, `uninstall` included:
+nothing was done and nothing was learned, which is one condition with one
+remedy for every one of them.
+
 **`4` is returned by** `status` on an id it owns but cannot read, by `list`
 for an entry goetia owns but cannot decode, and by `diff` and `show` when
-the installed artifact cannot be read. `status`, `diff`, `list` and `show`
-also return it — as the `undetermined` kind — when a read that would have
-said whether anything is installed at that id failed at all: the
-`<id>.service` fragment or an `<id>.service.d` drop-in directory an
-unelevated caller cannot open. Goetia
+the installed artifact cannot be read.
+
+**Every subcommand returns it** for the other case — a read that would have
+said whether anything is installed at that id did not complete at all: on
+systemd, an `<id>.service` fragment an unelevated caller cannot open, or,
+where no fragment is there to read, the `<id>.service.d` and
+`multi-user.target.wants` scan that decides whether the id is empty. Goetia
 claims no ownership of such an id, and does not suggest uninstalling it.
-`install` keeps that same case at `1`: there the operation is the install,
-and it genuinely did not happen.
+`status <id>` reports it as that id's own `undetermined` kind; `list` and
+`status` with no ids report it in the document's
+[third key](#undetermined); `diff`, `show`, `install` and all six id verbs
+have no `--json` document and say it on stderr.
+`install` therefore agrees with `diff` about an id neither could classify,
+and the two differ only over an artifact that _was_ read and would not
+decode, which `install` reports as `1` because the install genuinely did not
+happen.
 
 These classes are **disjoint, and they are separated by what goetia
 _established_, not by what went wrong.** `not-installed` means absence was
@@ -417,6 +458,13 @@ without `--json`, because a verb whose exit code depends on its output
 format is exactly the split this work removed. It is still a change to a
 non-`--json` path, so a script that treated `1` from `list` as "some entry
 was unreadable" needs to accept `4` as well.
+
+**`list` also returns `4` where it used to return `0`.** An id it could not
+read was silently left out; it is now an `undetermined` entry, and an
+unelevated `list` that used to look like a clean empty answer is one of the
+runs that changes. That is the point of the change, not a side effect — but
+a script that reads a non-zero `list` as fatal will now see one where it
+previously saw `0`.
 
 ## `show`
 
@@ -442,20 +490,69 @@ decode is a different case from "not installed": `show` exits `4` for it —
 both per id and in the no-ids form. "Not installed" stays `1`, a determinate
 answer, and outranks `4` when a single call names both kinds of id.
 
+What `show` never does is call an id absent on a listing that did not
+establish absence. An id `list()` reported as undetermined is `4`, and so is
+**any** id `show` cannot find while an aggregate entry — one with no name —
+is present, since such an entry may stand for that very id.
+
 ## What goetia can and cannot see
 
 `list`, `status`, and `show` report only what the **current privilege level
-can read**.
+can read** — and where a read that would have classified an id did not
+complete, they **say so and exit `4`** rather than leaving the id out. No
+backend omits one silently. An enumeration that drops an id it could not
+read is indistinguishable from one where that id does not exist, which is
+how an unelevated `goetia daemon list` could once exit `0` with an empty
+document on a host that did have goetia daemons installed.
 
-Where goetia knows it could not determine something, it says so and exits
-`4`. On systemd that covers a unit file the caller could not open: it is
-reported as `undetermined`, named, rather than dropped from the listing.
+**The rule that follows, and it is the whole point:** while an entry is
+present in `undetermined`, no negative conclusion about any id is sound. An
+entry with a `null` name is one entry standing for many ids, so it may stand
+for the very id you are asking about — you may not conclude that any
+particular id is absent. The claim is not the vague "goetia might have
+missed something" — it is that one. See [`undetermined`](#undetermined) for
+the document shape.
 
-launchd and SCM still **leave such an artifact out of the document**, so an
-unelevated `goetia daemon list` can still return an empty document with exit
-`0` on a macOS or Windows host that does have goetia daemons installed.
-Closing that is known work, planned separately; until it lands, **run
-elevated on those platforms to get a complete answer.**
+Per platform:
+
+- **systemd** — an `<id>.service` fragment the caller could not open is
+  reported as `undetermined`, named.
+- **launchd** — a plist whose bytes could not be obtained, or that is
+  neither UTF-8 nor a binary plist, is reported as `undetermined`, named. A
+  **binary plist is not**: `bplist00` is a positive identification of a
+  format goetia never writes, so it is foreign and omitted exactly as an
+  unmarked XML plist is. `plutil -convert binary1` and `defaults write`
+  produce that format by default, so a `/Library/LaunchDaemons` full of them
+  is the normal state of a macOS host; calling them undetermined would give
+  macOS a permanent, unclearable exit `4` for services that are in no way
+  goetia's business. systemd has no counterpart to this rule — a unit file
+  is text or it is not goetia's.
+- **SCM** — most services deny an unelevated read of their `Parameters`, so
+  an unelevated `goetia daemon list` on Windows is **expected** to carry one
+  aggregate entry — `name: null`, carrying a count rather than a name — and
+  to exit `4`. That is the designed behavior, not a defect to report:
+  re-running elevated is what empties it. One aggregate rather than hundreds
+  of named entries is deliberate, and it is why the `null`-name rule above
+  exists at all. No other platform carries a standing non-empty
+  `undetermined`.
+
+### The two sources of `4`
+
+They are not interchangeable, and the remedies do not transfer:
+
+- **`unreadable`** — goetia's own daemon that goetia cannot use. The marker
+  was read; the blob would not decode. Remedy:
+  `goetia daemon uninstall <id>`, which does not need to decode it.
+- **`undetermined`** — a name goetia could not classify at all. The read
+  that would have said whose it is never completed, so ownership is
+  unestablished. Remedy: read it with more privilege.
+
+Offering the first remedy for the second case would send someone to
+uninstall what may be a stranger's service —
+`HKLM\SYSTEM\CurrentControlSet\Services` and `/Library/LaunchDaemons` hold
+every vendor's, not just goetia's. That is why goetia never claims ownership
+of what it could not read, and why the two are separated by what was
+_established_ rather than by what went wrong.
 
 ## License
 
