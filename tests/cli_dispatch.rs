@@ -203,8 +203,15 @@ struct FlakyManager {
     /// `stop` succeeds and `start` then fails with `Error::Undetermined`.
     /// The only order in which `restart`'s closure re-wraps the start leg's
     /// failure, and so the only way to reach that re-wrap with a variant
-    /// that has to survive it.
+    /// that has to survive it. Also `install --start`'s own leg, which
+    /// classifies its failure itself rather than inheriting anything from
+    /// the `install` that preceded it.
     undetermined_start_for: Option<String>,
+    /// `enable` fails with `Error::Undetermined` — the `--enable` twin of
+    /// `undetermined_start_for`, and a third independent decision:
+    /// `install`'s three `failure_code` call sites each classify their own
+    /// step.
+    undetermined_enable_for: Option<String>,
     /// Makes `install`/`preview_install` return the `Conflict` flavour whose
     /// cause lies outside the directory the backend writes — systemd's
     /// `<id>.service.d` under `/usr/lib` or `.control`. `Fake` has no
@@ -273,6 +280,9 @@ impl ServiceManager for FlakyManager {
     fn enable(&self, id: &Id) -> goetia::Result<()> {
         if self.fail_enable_for.as_deref() == Some(id.as_str()) {
             return Err(injected_failure(id));
+        }
+        if self.undetermined_enable_for.as_deref() == Some(id.as_str()) {
+            return Err(injected_indeterminacy(id));
         }
         self.inner.enable(id)
     }
@@ -2526,6 +2536,64 @@ fn install_exits_four_for_an_undetermined_id() {
 
     assert_eq!(code, 4, "{err}");
     assert!(err.contains("opaque"), "{err}");
+}
+
+/// The artifact was written and the id is goetia's beyond doubt, and then the *enable* could not be
+/// answered — a distinct call site from the `mgr.install` failure above, classifying its own step.
+/// Reporting `1` here would say the enable determinately failed, which is what nobody established.
+#[skuld::test]
+fn install_exits_four_when_the_enable_leg_cannot_be_determined() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let mgr = FlakyManager {
+        undetermined_enable_for: Some("frpc".to_string()),
+        ..Default::default()
+    };
+
+    let (code, out, err) = dispatch_with(
+        &[
+            "goetia",
+            "daemon",
+            "install",
+            "--enable",
+            "-f",
+            manifest.to_str().unwrap(),
+        ],
+        &mgr,
+        &|| true,
+    );
+
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.contains("enable"), "the failing step is named: {err}");
+}
+
+/// The third call site, and the same rule: `install --start` classifies its own step. Every other
+/// test that reaches an undetermined `start` goes through `restart`, which is a different path
+/// entirely.
+#[skuld::test]
+fn install_exits_four_when_the_start_leg_cannot_be_determined() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let mgr = FlakyManager {
+        undetermined_start_for: Some("frpc".to_string()),
+        ..Default::default()
+    };
+
+    let (code, out, err) = dispatch_with(
+        &[
+            "goetia",
+            "daemon",
+            "install",
+            "--start",
+            "-f",
+            manifest.to_str().unwrap(),
+        ],
+        &mgr,
+        &|| true,
+    );
+
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.contains("start"), "the failing step is named: {err}");
 }
 
 /// `install`'s three classes through the one precedence rule: a refusal outranks an unanswered
