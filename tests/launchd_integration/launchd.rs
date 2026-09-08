@@ -524,11 +524,10 @@ fn unelevated_list_works() {
 }
 
 /// The motivating defect, end to end and at the privilege boundary that
-/// produces it: an unelevated `daemon list` on a populated host used to exit
-/// `0` with the daemon simply missing from its document. A plist the caller
-/// cannot open must be named as `undetermined` instead — and must *not* be
-/// listed as one of goetia's own, since the marker that would have said so
-/// is precisely what went unread.
+/// produces it. A plist the caller cannot open must be named as
+/// `undetermined` — never left out of the document, which says it is not
+/// there — and must *not* be listed as one of goetia's own, since the marker
+/// that would have said so is precisely what went unread.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn unelevated_list_reports_a_root_only_plist_as_undetermined() {
     let mgr = LaunchdManager::new();

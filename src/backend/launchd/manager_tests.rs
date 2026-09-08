@@ -324,9 +324,9 @@ fn obtain_reads_a_regular_file_and_reports_a_missing_one_absent() {
     }
 }
 
-/// A symlink to a regular plist still resolves and is still read — unchanged from before this
-/// classification step existed, and deliberately unlike the systemd backend, where `systemctl mask`
-/// makes the symlink itself the meaningful artifact. See [`obtain`]'s doc comment.
+/// A symlink to a regular plist still resolves and is still read — deliberately unlike the systemd
+/// backend, where `systemctl mask` makes the symlink itself the meaningful artifact. See
+/// [`obtain`]'s doc comment.
 #[skuld::test]
 fn a_symlink_to_a_plist_is_still_followed() {
     let tmp = tempfile::tempdir().expect("tempdir");

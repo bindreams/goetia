@@ -2,10 +2,10 @@
 //! what goetia does when a read it needs does not complete.
 //!
 //! An explicit `Deny` ACE stops an elevated reader: administrators do not
-//! bypass one. Measured on a real Windows host before this was written — an
-//! `HKLM` key given a `Deny`/`ReadKey` ACE for `Everyone`, read back from the
-//! same elevated session that set it, was blocked. CI runs every test binary
-//! elevated, which is exactly the condition that probe simulated.
+//! bypass one. An `HKLM` key given a `Deny`/`ReadKey` ACE for `Everyone`,
+//! read back from the same elevated session that set it, is blocked on a real
+//! Windows host. CI runs every test binary elevated, which is exactly the
+//! condition that probe simulated.
 //!
 //! Raw `windows-sys` FFI, sanctioned here the same way `common.rs`'s SID lookup
 //! and `fixture.rs`'s SCM dispatch already are: neither `windows-service` nor

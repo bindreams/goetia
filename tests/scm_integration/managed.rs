@@ -591,8 +591,8 @@ fn an_elevated_list_leaves_nothing_undetermined() {
 
 /// The `Parameters` boundary. A service whose metadata key denies reading is a service whose marker
 /// was never read, so goetia established neither that it owns the id nor that it does not — and
-/// `Kind::Unreadable`, which used to be the answer, would put goetia's name and `uninstall`'s advice
-/// on what may be a stranger's service.
+/// `Kind::Unreadable` would put goetia's name and `uninstall`'s advice on what may be a stranger's
+/// service.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn status_of_a_service_whose_parameters_deny_reading_is_undetermined() {
     let mgr = ScmManager::new();

@@ -452,24 +452,6 @@ read that would have said — the fragment's own, or a drop-in directory's —
 is the one that did not complete. `foreign` needs a read that finished. And an error always wins — a run naming both
 an absent id and an unreadable one exits `1`, not `4`.
 
-### Compatibility note
-
-**`4` is now reachable in text mode**, not only under `--json`. An
-unreadable entry previously exited `1` from `list`, `status`, and `show`.
-
-This is deliberate: the exit code is now computed identically with and
-without `--json`, because a verb whose exit code depends on its output
-format is exactly the split this work removed. It is still a change to a
-non-`--json` path, so a script that treated `1` from `list` as "some entry
-was unreadable" needs to accept `4` as well.
-
-**`list` also returns `4` where it used to return `0`.** An id it could not
-read was silently left out; it is now an `undetermined` entry, and an
-unelevated `list` that used to look like a clean empty answer is one of the
-runs that changes. That is the point of the change, not a side effect — but
-a script that reads a non-zero `list` as fatal will now see one where it
-previously saw `0`.
-
 ## `show`
 
 `goetia daemon show [ID...] [-f FILE]` renders a daemon's resolved spec as

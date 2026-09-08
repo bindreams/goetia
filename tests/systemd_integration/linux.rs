@@ -1125,7 +1125,7 @@ fn unelevated_list_stays_clean_for_a_normal_install() {
     assert_eq!(listed.code, Some(0), "{}", listed.context);
 }
 
-/// One `*.service` whose bytes are not UTF-8 used to make `list` return `Err` — taking down the
+/// One `*.service` whose bytes are not UTF-8 must not make `list` return `Err` — taking down the
 /// listing of every daemon on the host over a file that belongs to none of them.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_reports_a_non_utf8_unit_as_undetermined_instead_of_failing() {
