@@ -70,6 +70,16 @@ pub(crate) struct InstalledEntry {
 pub(crate) struct InstalledIndex {
     pub ours: BTreeMap<String, InstalledEntry>,
     pub unreadable: BTreeMap<String, String>,
+    /// Ids goetia could not classify at all, in `list()` order. Not a map:
+    /// an entry may stand for more than one id and so carry no name (see
+    /// [`Installed::Undetermined`]), which leaves nothing to key on.
+    ///
+    /// Collected but not yet rendered — dropping it in `partition_installed`
+    /// would recreate, one layer up, the silent skip the variant exists to
+    /// end. `expect` rather than `allow`: the first reader makes this
+    /// attribute itself a lint failure, so it cannot outlive its reason.
+    #[expect(dead_code, reason = "rendered by the CLI once list/status/show consume it")]
+    pub undetermined: Vec<(Option<String>, String)>,
 }
 
 /// Partition `installed` into [`InstalledIndex`]. Prints nothing — call
@@ -80,6 +90,7 @@ pub(crate) struct InstalledIndex {
 pub(crate) fn partition_installed(installed: Vec<Installed>) -> InstalledIndex {
     let mut ours = BTreeMap::new();
     let mut unreadable = BTreeMap::new();
+    let mut undetermined = Vec::new();
     for entry in installed {
         match entry {
             Installed::Ours {
@@ -101,9 +112,16 @@ pub(crate) fn partition_installed(installed: Vec<Installed>) -> InstalledIndex {
             Installed::OursUnreadable { name, reason } => {
                 unreadable.insert(name, reason);
             }
+            Installed::Undetermined { name, reason } => {
+                undetermined.push((name, reason));
+            }
         }
     }
-    InstalledIndex { ours, unreadable }
+    InstalledIndex {
+        ours,
+        unreadable,
+        undetermined,
+    }
 }
 
 pub(crate) fn print_unreadable_warnings(unreadable: &BTreeMap<String, String>, err: &mut dyn Write) {

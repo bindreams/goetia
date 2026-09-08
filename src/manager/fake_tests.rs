@@ -235,3 +235,126 @@ fn list_omits_an_id_that_has_only_a_residual_artifact() {
 
     assert!(fake.list().unwrap().is_empty());
 }
+
+// Opaque artifacts ====================================================================================================
+
+/// Every verb's answer for `spec`'s id, labelled — including `install` and
+/// `preview_install`, the two that never reach `Store::get` and so are
+/// exactly the ones a partial implementation leaves disagreeing with the
+/// other six.
+fn every_verb(fake: &Fake, spec: &DaemonSpec) -> Vec<(&'static str, Result<()>)> {
+    vec![
+        ("status", fake.status(&spec.id).map(drop)),
+        ("uninstall", fake.uninstall(&spec.id)),
+        ("enable", fake.enable(&spec.id)),
+        ("disable", fake.disable(&spec.id)),
+        ("start", fake.start(&spec.id)),
+        ("stop", fake.stop(&spec.id)),
+        ("install", fake.install(spec, false).map(drop)),
+        ("preview_install", fake.preview_install(spec).map(drop)),
+    ]
+}
+
+/// An artifact whose bytes could not be read proves neither presence nor
+/// absence, so it is neither `Ours` nor `OursUnreadable` — the latter would
+/// put goetia's name on what may be a stranger's service.
+#[skuld::test]
+fn list_reports_an_opaque_entry_as_undetermined() {
+    let fake = Fake::new();
+    fake.seed_opaque("opaque");
+
+    let listed = fake.list().unwrap();
+
+    let reason = listed
+        .iter()
+        .find_map(|entry| match entry {
+            Installed::Undetermined { name, reason } if name.as_deref() == Some("opaque") => Some(reason),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("an unreadable artifact must appear as Undetermined: {listed:?}"));
+    assert!(!reason.is_empty(), "Undetermined must say why: {listed:?}");
+    assert!(
+        !listed
+            .iter()
+            .any(|entry| matches!(entry, Installed::Ours { .. } | Installed::OursUnreadable { .. })),
+        "an unread artifact must not be claimed as goetia's: {listed:?}"
+    );
+}
+
+/// The silent-skip regression this variant exists to prevent: one entry
+/// goetia could not read must not remove itself, nor anything else, from
+/// the enumeration.
+#[skuld::test]
+fn an_opaque_entry_is_never_omitted_from_list() {
+    let fake = Fake::new();
+    fake.install(&mk("healthy"), false).unwrap();
+    fake.seed_opaque("opaque");
+
+    let listed = fake.list().unwrap();
+
+    assert_eq!(listed.len(), 2, "both entries must be reported: {listed:?}");
+}
+
+/// `NotInstalled` certifies absence and `Foreign` certifies someone else's
+/// presence; a failed read establishes neither, so every verb must say so
+/// rather than pick the nearest.
+#[skuld::test]
+fn every_verb_refuses_an_opaque_id_as_undetermined() {
+    let fake = Fake::new();
+    let spec = mk("opaque");
+    fake.seed_opaque(spec.id.as_str());
+
+    for (verb, result) in every_verb(&fake, &spec) {
+        match result {
+            Err(Error::Undetermined { id, reason, .. }) => {
+                assert_eq!(id, "opaque", "{verb} must name the id it could not read");
+                assert!(!reason.is_empty(), "{verb} must say why");
+            }
+            other => panic!("{verb} on an unreadable artifact must be Undetermined, got {other:?}"),
+        }
+    }
+}
+
+/// The failed read is what happened *first*: it is the read that would have
+/// found the entry, so a stale entry at the same id cannot answer for it.
+#[skuld::test]
+fn an_opaque_id_shadows_an_entry_at_the_same_id() {
+    let fake = Fake::new();
+    let spec = mk("shadowed");
+    fake.install(&spec, false).unwrap();
+    fake.seed_opaque(spec.id.as_str());
+
+    for (verb, result) in every_verb(&fake, &spec) {
+        assert!(
+            matches!(result, Err(Error::Undetermined { .. })),
+            "{verb} must not answer from the entry the failed read would have found, got {result:?}"
+        );
+    }
+}
+
+/// Both ways out, and not the third: `uninstall` is `RefuseUnreadable`'s
+/// remedy and certifies ownership, which is precisely what was not
+/// established here.
+#[skuld::test]
+fn the_opaque_recovery_names_both_causes_and_not_uninstall() {
+    let fake = Fake::new();
+    let id = Id::try_from("opaque").unwrap();
+    fake.seed_opaque(id.as_str());
+
+    let Err(Error::Undetermined { recovery, .. }) = fake.status(&id) else {
+        panic!("status on an unreadable artifact must be Undetermined");
+    };
+
+    assert!(
+        recovery.contains("re-run") && recovery.contains("enough privilege"),
+        "recovery must offer re-running with more privilege: {recovery}"
+    );
+    assert!(
+        recovery.contains("any privilege level"),
+        "recovery must also cover an artifact no privilege level can read: {recovery}"
+    );
+    assert!(
+        !recovery.contains("uninstall"),
+        "uninstall certifies ownership this read never established: {recovery}"
+    );
+}

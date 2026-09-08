@@ -77,13 +77,21 @@ pub trait ServiceManager {
     /// will not decode — this must not fabricate a plausible-looking
     /// `Status` for state it cannot actually determine (see the crate-level
     /// design notes on `Installed::OursUnreadable`, which exists for the
-    /// same reason on the `list` side).
+    /// same reason on the `list` side) — and [`Error::Undetermined`] for an
+    /// id whose artifact could not be read at all, where not even ownership
+    /// was established.
+    ///
+    /// [`Error::Undetermined`]: crate::Error::Undetermined
     fn status(&self, id: &Id) -> Result<Status>;
 
-    /// Every Goetia-managed service currently installed. A foreign
-    /// (unmarked) service at some id is never included; see [`Installed`]
-    /// for what happens when a marked one exists but its blob will not
-    /// decode.
+    /// Every id this backend could account for. A foreign (unmarked)
+    /// service at some id is never included; see [`Installed`] for what
+    /// happens when a marked one exists but its blob will not decode, and
+    /// for the entry an id goetia could not read at all produces. Skipping
+    /// such an id is not an implementation's choice to make: an unread id
+    /// must appear as [`Installed::Undetermined`], because an enumeration
+    /// that silently drops it is indistinguishable from one where it does
+    /// not exist.
     fn list(&self) -> Result<Vec<Installed>>;
 }
 
@@ -108,6 +116,26 @@ pub enum Installed {
     /// every other daemon, which is exactly what dropping this entry
     /// silently would do.
     OursUnreadable { name: String, reason: String },
+    /// Neither proof: the read that would have classified this id did not
+    /// complete, so goetia established neither its absence nor its
+    /// presence. The `list`-side counterpart of [`Error::Undetermined`],
+    /// and separated from the two variants above by the same rule — what
+    /// goetia *established*, never what went wrong. Reporting
+    /// `OursUnreadable` for a unit file an unelevated caller merely could
+    /// not open claims ownership of what may be a stranger's service;
+    /// omitting it claims it does not exist.
+    ///
+    /// `name` is `None` only for an entry standing for more than one id —
+    /// a backend that could not enumerate a whole directory knows a count,
+    /// not names. An entry for exactly one known id always names it.
+    ///
+    /// Carries no `recovery`: that text belongs to [`Error::Undetermined`],
+    /// which each backend builds through its own constructor, and a second
+    /// independently worded remedy per `list` entry would put two answers
+    /// on one condition.
+    ///
+    /// [`Error::Undetermined`]: crate::Error::Undetermined
+    Undetermined { name: Option<String>, reason: String },
 }
 
 /// The live state of one installed service, as [`ServiceManager::status`]

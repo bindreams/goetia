@@ -165,6 +165,7 @@ fn uninstall_leaves_nothing() {
         installed.iter().all(|entry| match entry {
             Installed::Ours { spec: s, .. } => s.id.as_str() != id,
             Installed::OursUnreadable { name, .. } => name != &id,
+            Installed::Undetermined { name, .. } => name.as_deref() != Some(id.as_str()),
         }),
         "uninstalled id must not appear in list"
     );
@@ -182,6 +183,7 @@ fn list_ignores_foreign_services() {
         installed.iter().all(|entry| match entry {
             Installed::Ours { spec, .. } => spec.id.as_str() != id,
             Installed::OursUnreadable { name, .. } => name != &id,
+            Installed::Undetermined { name, .. } => name.as_deref() != Some(id.as_str()),
         }),
         "a foreign service must never appear in list"
     );
@@ -484,12 +486,15 @@ fn deleted_account_makes_the_service_oursunreadable() {
         .find(|entry| match entry {
             Installed::Ours { spec, .. } => spec.id.as_str() == id,
             Installed::OursUnreadable { name, .. } => name == &id,
+            Installed::Undetermined { name, .. } => name.as_deref() == Some(id.as_str()),
         })
         .unwrap_or_else(|| panic!("{id} disappeared from list entirely instead of becoming OursUnreadable"));
     match entry {
         Installed::OursUnreadable { reason, .. } => {
             assert!(!reason.is_empty());
         }
-        Installed::Ours { .. } => panic!("expected OursUnreadable once the account backing `user.id` is deleted"),
+        Installed::Ours { .. } | Installed::Undetermined { .. } => {
+            panic!("expected OursUnreadable once the account backing `user.id` is deleted")
+        }
     }
 }

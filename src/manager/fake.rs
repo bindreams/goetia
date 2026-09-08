@@ -32,6 +32,11 @@ const FAKE_PID: u32 = 1;
 /// `decide` must reach `RefuseForeign` from it.
 const RESIDUAL_TEXT: &str = "residual artifact, no primary artifact\n";
 
+/// Why an opaque id could not be classified — see [`Fake::seed_opaque`].
+/// Shared by [`Store::undetermined`] and [`Fake::list`] so the error and the
+/// `list` entry cannot describe the same condition differently.
+const OPAQUE_REASON: &str = "the artifact could not be read (seeded opaque by Fake::seed_opaque)";
+
 /// The pid `Fake` reports for a given state. `status` and `list` must never
 /// disagree about the same entry, so they share this rule rather than each
 /// spelling it out — the three real backends get that guarantee from calling
@@ -77,6 +82,10 @@ struct Store {
     /// Ids with no artifact of their own but some goetia-attributable trace
     /// the platform still applies — see [`Fake::seed_residual_artifact`].
     residual: BTreeSet<String>,
+    /// Ids whose artifact this process cannot read at all — see
+    /// [`Fake::seed_opaque`]. Consulted before `entries`, because the read
+    /// that would have found an entry is the one that failed.
+    opaque: BTreeSet<String>,
 }
 
 impl Store {
@@ -85,6 +94,9 @@ impl Store {
     /// verb goes through this or [`Store::get_mut`], so none of them can
     /// disagree with [`discover`] about one id.
     fn get(&self, id: &Id) -> Result<&Entry> {
+        if self.opaque.contains(id.as_str()) {
+            return Err(Self::undetermined(id));
+        }
         match self.entries.get(id.as_str()) {
             Some(entry) => Ok(entry),
             None => Err(self.absent_error(id)),
@@ -92,10 +104,25 @@ impl Store {
     }
 
     fn get_mut(&mut self, id: &Id) -> Result<&mut Entry> {
+        if self.opaque.contains(id.as_str()) {
+            return Err(Self::undetermined(id));
+        }
         if !self.entries.contains_key(id.as_str()) {
             return Err(self.absent_error(id));
         }
         Ok(self.entries.get_mut(id.as_str()).expect("present, checked just above"))
+    }
+
+    /// The fake's single [`Error::Undetermined`] constructor: one wording
+    /// for one condition, however many verbs reach it.
+    fn undetermined(id: &Id) -> Error {
+        Error::Undetermined {
+            id: id.as_str().to_string(),
+            reason: OPAQUE_REASON.to_string(),
+            recovery: "re-run with enough privilege to read the artifact; if it is unreadable at \
+                       any privilege level, repair or remove it out of band"
+                .to_string(),
+        }
     }
 
     /// [`Error::NotInstalled`] only when nothing at all is at `id`. A
@@ -252,6 +279,27 @@ impl Fake {
         state.residual.insert(id.to_string());
     }
 
+    /// Test-only seeding: make `id`'s artifact unreadable to this process —
+    /// the class a root-only unit file under an unelevated `list` belongs
+    /// to. Every verb then answers [`Error::Undetermined`] and `list`
+    /// reports [`Installed::Undetermined`], because a read that did not
+    /// complete establishes neither the id's absence nor its ownership.
+    ///
+    /// The only way to reach that state in-crate: the fake's artifacts are
+    /// in-memory strings and are always readable, so the failure has to be
+    /// modelled rather than provoked. It is a dimension of its own and not
+    /// a field on `Entry` because an opaque id must also refuse `install`,
+    /// which never looks an `Entry` up.
+    ///
+    /// Takes effect over an already-installed `id`, which is what a
+    /// permission change on a live artifact looks like.
+    ///
+    /// [`Installed::Undetermined`]: crate::manager::Installed::Undetermined
+    pub fn seed_opaque(&self, id: &str) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.opaque.insert(id.to_string());
+    }
+
     /// Test-only: force `id`'s reported [`State`] directly, bypassing
     /// `start`/`stop` (which can only produce `Running`/`Stopped`). `id`
     /// must already be installed.
@@ -338,6 +386,12 @@ fn discover(state: &Store, id: &str) -> (Ownership, Option<String>) {
 impl ServiceManager for Fake {
     fn install(&self, spec: &DaemonSpec, force: bool) -> Result<Outcome> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
+        // Before `discover`, which has no error channel: an artifact whose
+        // bytes were never read supplies none of `decide`'s inputs, so this
+        // is an input failure ahead of policy, not a fifth `Ownership`.
+        if state.opaque.contains(spec.id.as_str()) {
+            return Err(Store::undetermined(&spec.id));
+        }
         let desired = generate(spec);
         let (found, on_disk) = discover(&state, spec.id.as_str());
 
@@ -382,6 +436,11 @@ impl ServiceManager for Fake {
 
     fn preview_install(&self, spec: &DaemonSpec) -> Result<Outcome> {
         let state = self.state.lock().expect("Fake mutex poisoned");
+        // Same pre-check as `install`, for the same reason: `diff` must not
+        // predict an outcome from an artifact nobody read.
+        if state.opaque.contains(spec.id.as_str()) {
+            return Err(Store::undetermined(&spec.id));
+        }
         let desired = generate(spec);
         let (found, on_disk) = discover(&state, spec.id.as_str());
         // Always previewed without `force`: showing the forced outcome would
@@ -466,7 +525,18 @@ impl ServiceManager for Fake {
     fn list(&self) -> Result<Vec<Installed>> {
         let state = self.state.lock().expect("Fake mutex poisoned");
         let mut out = Vec::new();
+        for name in state.opaque.iter() {
+            out.push(Installed::Undetermined {
+                name: Some(name.clone()),
+                reason: OPAQUE_REASON.to_string(),
+            });
+        }
         for (name, entry) in state.entries.iter() {
+            // An id whose read failed is not classifiable from the entry
+            // that read would have found — `Store::get` refuses it too.
+            if state.opaque.contains(name) {
+                continue;
+            }
             match extract(&entry.text) {
                 // A foreign entry is not Goetia-managed at all: `list`
                 // reports only what Goetia owns, per the trait doc comment.

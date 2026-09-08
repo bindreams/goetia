@@ -288,6 +288,7 @@ impl ServiceManager for FlakyManager {
             installed.retain(|entry| match entry {
                 Installed::Ours { spec, .. } => spec.id.as_str() != hidden,
                 Installed::OursUnreadable { name, .. } => name != hidden,
+                Installed::Undetermined { name, .. } => name.as_deref() != Some(hidden.as_str()),
             });
         }
         Ok(installed)
@@ -302,6 +303,7 @@ fn installed_ids(fake: &Fake) -> Vec<String> {
         .filter_map(|entry| match entry {
             Installed::Ours { spec, .. } => Some(spec.id.as_str().to_string()),
             Installed::OursUnreadable { .. } => None,
+            Installed::Undetermined { .. } => None,
         })
         .collect();
     ids.sort();

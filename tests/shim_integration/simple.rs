@@ -127,6 +127,7 @@ fn uninstall_leaves_nothing() {
         installed.iter().all(|entry| match entry {
             Installed::Ours { spec: s, .. } => s.id.as_str() != id,
             Installed::OursUnreadable { name, .. } => name != &id,
+            Installed::Undetermined { name, .. } => name.as_deref() != Some(id.as_str()),
         }),
         "uninstalled id must not appear in list"
     );
@@ -144,6 +145,7 @@ fn list_ignores_foreign_services() {
         installed.iter().all(|entry| match entry {
             Installed::Ours { spec, .. } => spec.id.as_str() != id,
             Installed::OursUnreadable { name, .. } => name != &id,
+            Installed::Undetermined { name, .. } => name.as_deref() != Some(id.as_str()),
         }),
         "a foreign service must never appear in list"
     );
