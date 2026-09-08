@@ -342,7 +342,16 @@ fn installed_ids(fake: &Fake) -> Vec<String> {
         .filter_map(|entry| match entry {
             Installed::Ours { spec, .. } => Some(spec.id.as_str().to_string()),
             Installed::OursUnreadable { .. } => None,
-            Installed::Undetermined { .. } => None,
+            // Three callers ask this `is_empty()` and read the answer as
+            // "nothing is installed". That conclusion is unsound while an
+            // undetermined entry is present — it may stand for the very id
+            // being asked about — so the question is refused rather than
+            // answered wrongly. No fixture produces one today; this exists so
+            // that one cannot arrive silently.
+            Installed::Undetermined { name, reason } => panic!(
+                "installed_ids cannot answer while an entry is undetermined \
+                 (name: {name:?}): {reason}"
+            ),
         })
         .collect();
     ids.sort();
