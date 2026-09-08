@@ -227,7 +227,7 @@ impl ServiceManager for ScmManager {
     fn list(&self) -> Result<Vec<Installed>> {
         let mut out = Vec::new();
         let mut unreadable = 0usize;
-        let scan = registry::list_service_names()?;
+        let scan = registry::list_service_names();
         for name in scan.names {
             // A registry read failure for one unrelated service (e.g. a
             // driver whose `Parameters` key carries a restrictive ACL) must

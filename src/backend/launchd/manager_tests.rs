@@ -524,11 +524,11 @@ fn a_plist_directory_that_cannot_be_opened_is_reported_not_propagated() {
     );
 }
 
-/// The case that is deliberately *not* this one: the staging directory does not exist until the
-/// first `install` ever creates it, which establishes that nothing is staged rather than leaving it
-/// unread.
+/// The case that is deliberately *not* this one: an absent directory — the staging one does not
+/// exist until the first `install` ever creates it — establishes that nothing is there. A
+/// determinate answer is reported as one, on every backend; see [`crate::manager::ServiceManager::list`].
 #[skuld::test]
-fn an_absent_directory_is_not_an_unfinished_scan() {
+fn an_absent_directory_is_an_empty_scan_not_a_failure() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
     let scan = scan_plists(&tmp.path().join("nowhere").to_string_lossy());

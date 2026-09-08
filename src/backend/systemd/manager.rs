@@ -277,7 +277,7 @@ impl ServiceManager for Systemd {
     }
 
     fn list(&self) -> Result<Vec<Installed>> {
-        let scan = scan_unit_dir(Path::new(UNIT_DIR))?;
+        let scan = scan_unit_dir(Path::new(UNIT_DIR));
 
         let mut out = Vec::new();
         for (id, path) in &scan.units {
@@ -347,19 +347,23 @@ struct UnitScan {
 /// and reach the CLI as an empty document on exit `1`, which is `list` saying the host has no
 /// daemons — the one claim a scan that did not finish cannot support.
 ///
-/// `dir` not existing is left as it was, an `Err`: it is a determinate fact about the host rather
-/// than a scan that came up short, and nothing about it is undetermined.
-fn scan_unit_dir(dir: &Path) -> Result<UnitScan> {
+/// `dir` not existing is neither: absence is *established* there, so it is an empty scan with
+/// nothing outstanding — the answer [`ServiceManager::list`]'s doc comment requires of every
+/// backend, and the one launchd already gave for its own missing staging directory.
+fn scan_unit_dir(dir: &Path) -> UnitScan {
     match fs::read_dir(dir) {
-        Ok(entries) => Ok(collect_units(dir, entries.map(|entry| entry.map(|entry| entry.path())))),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(io_err("read directory", dir, e)),
-        Err(e) => Ok(UnitScan {
+        Ok(entries) => collect_units(dir, entries.map(|entry| entry.map(|entry| entry.path()))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => UnitScan {
+            units: Vec::new(),
+            incomplete: None,
+        },
+        Err(e) => UnitScan {
             units: Vec::new(),
             incomplete: Some(Installed::scan_incomplete(
                 &dir.display().to_string(),
                 &format!("failed to read directory: {e}"),
             )),
-        }),
+        },
     }
 }
 

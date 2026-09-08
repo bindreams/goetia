@@ -178,22 +178,25 @@ pub struct ServiceScan {
 /// need no more privilege than reading this key does, and going through the
 /// registry once here avoids an `OpenService` round trip per candidate on a
 /// host with hundreds of unrelated services.
-pub fn list_service_names() -> Result<ServiceScan> {
+/// No `Services` key at all is neither a failure nor an unfinished pass: absence is *established*
+/// there, so it is an empty scan with nothing outstanding — see [`crate::manager::ServiceManager::list`].
+pub fn list_service_names() -> ServiceScan {
     let key = match RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(SERVICES_KEY, KEY_READ) {
         Ok(key) => key,
-        // No `Services` key at all: a determinate fact about the hive rather than a pass that came
-        // up short, and left answering exactly as it always has.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(registry_error("open", SERVICES_KEY, e));
+            return ServiceScan {
+                names: Vec::new(),
+                incomplete: None,
+            };
         }
         Err(e) => {
-            return Ok(ServiceScan {
+            return ServiceScan {
                 names: Vec::new(),
                 incomplete: Some(registry_detail("open", SERVICES_KEY, &e)),
-            });
+            };
         }
     };
-    Ok(collect_service_names(key.enum_keys()))
+    collect_service_names(key.enum_keys())
 }
 
 /// The pass itself, over an iterator rather than the `RegKey` directly — which is what makes the

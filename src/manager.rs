@@ -92,6 +92,16 @@ pub trait ServiceManager {
     /// must appear as [`Installed::Undetermined`], because an enumeration
     /// that silently drops it is indistinguishable from one where it does
     /// not exist.
+    ///
+    /// **An absent container — no unit directory, no `Services` key — is
+    /// `Ok(vec![])`, never `Err`.** Absence is established there: nothing is
+    /// installed, which is a determinate answer and is reported as one. An
+    /// `Err` reaches the CLI as `Kind::Unavailable`, exit `1` over an empty
+    /// document — the rendering that says goetia could not answer — and
+    /// putting a settled answer behind it is the same conflation
+    /// [`Installed::Undetermined`] exists to end, arrived at from the other
+    /// side. A scan that *started* and did not finish is the opposite case
+    /// and does report (see `Installed::scan_incomplete`).
     fn list(&self) -> Result<Vec<Installed>>;
 }
 

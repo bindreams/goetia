@@ -1079,6 +1079,15 @@ impl ServiceManager for LaunchdManager {
 
         let mut out = Vec::new();
         for (id, locations) in by_id {
+            // `locations` is what the two passes *reached*, which is what an aggregate above costs
+            // this branch. If one pass stopped before this id and the other found it, the id is
+            // reported as an ordinary `Ours` carrying the `enabled` of the directory that was
+            // reached — itself established, since the plist really is there — while the
+            // both-directories anomaly goes unreported. A positive claim narrowed by an incomplete
+            // scan, and the aggregate in the same listing is precisely the signal that says so:
+            // while one is present, this listing is not a complete account of any id's locations.
+            // No negative conclusion is affected either way, which is the property that has to
+            // hold. Deliberately untested — forcing it needs a real mid-`readdir` fault on macOS.
             if locations.len() > 1 {
                 out.push(Installed::OursUnreadable {
                     name: id,

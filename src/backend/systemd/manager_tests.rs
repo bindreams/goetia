@@ -369,7 +369,7 @@ fn a_unit_directory_that_cannot_be_opened_is_reported_not_propagated() {
     // the right probe in a binary CI runs elevated.
     let dir = blocking_file.join("system");
 
-    let scan = scan_unit_dir(&dir).expect("a directory that could not be opened is data, not an error");
+    let scan = scan_unit_dir(&dir);
 
     assert!(scan.units.is_empty(), "nothing was enumerated: {scan:?}");
     assert!(
@@ -379,17 +379,18 @@ fn a_unit_directory_that_cannot_be_opened_is_reported_not_propagated() {
 }
 
 /// The case that is deliberately *not* this one: an absent unit directory establishes that nothing
-/// is installed, so it keeps answering exactly as it always has rather than becoming an unanswered
-/// question about ids that do not exist.
+/// is installed. A determinate answer is reported as one — an empty listing on exit `0`, never an
+/// `Err` that renders as "goetia could not answer".
 #[skuld::test]
-fn an_absent_unit_directory_is_not_an_unfinished_scan() {
+fn an_absent_unit_directory_is_an_empty_listing_not_a_failure() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
-    let err = scan_unit_dir(&tmp.path().join("nowhere")).expect_err("an absent directory is not a scan result");
+    let scan = scan_unit_dir(&tmp.path().join("nowhere"));
 
+    assert!(scan.units.is_empty(), "{scan:?}");
     assert!(
-        !matches!(err, Error::Undetermined { .. }),
-        "nothing here is undetermined: {err}"
+        scan.incomplete.is_none(),
+        "an absent directory answers the question rather than leaving it open: {scan:?}"
     );
 }
 
@@ -400,7 +401,7 @@ fn a_pass_that_finishes_names_every_fragment_and_nothing_else() {
     std::fs::write(tmp.path().join("ignored.conf"), "").expect("write the non-fragment");
     std::fs::create_dir(tmp.path().join("kept.service.d")).expect("create the drop-in directory");
 
-    let scan = scan_unit_dir(tmp.path()).expect("a readable directory");
+    let scan = scan_unit_dir(tmp.path());
 
     assert_eq!(
         scan.units.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
