@@ -193,12 +193,6 @@ impl Drop for FileGuard {
 /// `UNIT_DIR_EXCLUSIVE`: the run installs, forces and uninstalls a dozen daemons in the shared
 /// [`STAGING_DIR`] for its whole length, which is exactly what the host-wide listing assertions
 /// elsewhere in this file (and `tests/cli_binary.rs`'s real `daemon list`) are about.
-///
-/// `conformance::an_unclassifiable_id_is_never_silently_absent` is deliberately not called here: an
-/// elevated caller on this backend can classify every artifact on the host, so `UNDETERMINED_ID`
-/// cannot be seeded from a test that has to be root to install anything at all. The state is
-/// asserted below through an unprivileged reader, where it is real — see that scenario's own doc
-/// comment.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn launchd_passes_conformance() {
     let mgr = LaunchdManager::new();
@@ -219,6 +213,21 @@ fn launchd_passes_conformance() {
     let mut text = std::fs::read_to_string(&path).expect("read seeded artifact");
     text.push_str("<!-- a hand-added directive -->\n");
     write_plist(&path, &text);
+
+    // Seed `UNDETERMINED_ID`: a symlink to itself. `stat` answers `ELOOP` for every uid — root
+    // included, which is what a suite that has to be root to install anything at all needs — so
+    // `obtain` gets no bytes, while `locate`'s `symlink_metadata` still sees the entry. Something is
+    // at the id and nothing about it was established. Bytes that *arrive* and will not decode are
+    // the other state (`Foreign`, and `list_omits_a_non_utf8_plist_as_foreign` covers it), which is
+    // why this is not `NON_UTF8_PLIST`. Cleaned up here, like `FOREIGN_ID`.
+    let undetermined_path = staging_path(manager::conformance::UNDETERMINED_ID);
+    let _ = std::fs::remove_file(&undetermined_path);
+    std::os::unix::fs::symlink(
+        format!("{}.plist", manager::conformance::UNDETERMINED_ID),
+        &undetermined_path,
+    )
+    .expect("plant the self-referential symlink");
+    let _undetermined_cleanup = FileGuard(undetermined_path);
 
     manager::conformance::run(&mgr, &sleepy);
 }

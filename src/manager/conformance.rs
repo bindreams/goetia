@@ -20,12 +20,14 @@
 //!
 //! ## The seeded ids
 //!
-//! Three of the scenarios ([`refuses_foreign_even_with_force`],
-//! [`foreign_refuses_every_verb`] and [`conflict_requires_force`]) need state
-//! that cannot be produced through [`ServiceManager`]'s own methods: a foreign
-//! (unmarked) service and a hand-edited Goetia artifact. `run` therefore does
-//! *not* create these itself — it requires the **caller** to have already put
-//! `mgr` into that state at two fixed, reserved ids before calling `run`:
+//! Four of the scenarios ([`refuses_foreign_even_with_force`],
+//! [`foreign_refuses_every_verb`], [`conflict_requires_force`] and
+//! [`an_unclassifiable_id_is_never_silently_absent`]) need state that cannot be
+//! produced through [`ServiceManager`]'s own methods: a foreign (unmarked)
+//! service, a hand-edited Goetia artifact, and an artifact no read can obtain.
+//! `run` therefore does *not* create these itself — it requires the **caller**
+//! to have already put `mgr` into that state at three fixed, reserved ids
+//! before calling `run`:
 //!
 //! - [`FOREIGN_ID`]: `mgr` already has *something* installed at this id,
 //!   through means entirely outside Goetia (a hand-written unit file /
@@ -39,13 +41,14 @@
 //!   `run`'s own `conflict_requires_force` scenario forces an overwrite
 //!   here, so this one *is* included in `run`'s own cleanup — the caller
 //!   only needs to seed it once per call to `run`.
-//!
-//! [`an_unclassifiable_id_is_never_silently_absent`] needs a third state — an
-//! artifact whose bytes this process cannot obtain, at [`UNDETERMINED_ID`] —
-//! and is exported separately rather than run from `run`, because whether a
-//! backend can be *put* in that state depends on the privilege the caller
-//! holds. See its own doc comment for which backends can, and for what covers
-//! the ones that cannot.
+//! - [`UNDETERMINED_ID`]: an artifact whose bytes this process cannot
+//!   obtain is already at this id, for
+//!   [`an_unclassifiable_id_is_never_silently_absent`]. That scenario
+//!   asserts every verb *refuses* the id, so `run` never writes to or
+//!   removes it either — cleanup is the caller's, as for [`FOREIGN_ID`].
+//!   Which artifact seeds it is per platform and stated in that scenario's
+//!   own doc comment; every backend can seed it from the same elevated
+//!   context it installs from.
 //!
 //! [`fake::Fake`] exposes
 //! `seed_foreign`/`install_then_hand_edit`/`seed_opaque` for exactly this; a
@@ -98,13 +101,10 @@ impl Drop for Cleanup<'_> {
 ///
 /// `mk(id)` must build a valid, installable [`DaemonSpec`] with `id` as its
 /// id. Every id `run` uses is either freshly generated (never installed
-/// before) or one of [`FOREIGN_ID`]/[`HAND_EDITED_ID`] — see the module doc
-/// comment for what the caller must have already arranged at those two, and
-/// for what `run` cleans up on its own.
-///
-/// [`an_unclassifiable_id_is_never_silently_absent`] is deliberately not among
-/// the scenarios below; a caller that can seed [`UNDETERMINED_ID`] calls it
-/// itself.
+/// before) or one of
+/// [`FOREIGN_ID`]/[`HAND_EDITED_ID`]/[`UNDETERMINED_ID`] — see the module
+/// doc comment for what the caller must have already arranged at those
+/// three, and for what `run` cleans up on its own.
 pub fn run(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
     let mut cleanup = Cleanup { mgr, ids: Vec::new() };
     // Registered up front, not inside `conflict_requires_force`: the caller
@@ -125,6 +125,7 @@ pub fn run(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
     refuses_foreign_even_with_force(mgr, mk);
     foreign_refuses_every_verb(mgr, mk);
     conflict_requires_force(mgr, mk);
+    an_unclassifiable_id_is_never_silently_absent(mgr, mk);
 
     // `cleanup` drops here, uninstalling everything pushed above — including
     // on an early return via a panicking assertion, since `Drop` still runs
@@ -364,25 +365,30 @@ fn list_and_status_agree_on_pid(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> D
 /// registers no cleanup of its own; the caller's own cleanup for
 /// [`UNDETERMINED_ID`] covers a backend that writes anyway.
 ///
-/// # Why this is not one of [`run`]'s scenarios
+/// # The state, and why every caller can seed it
 ///
-/// Because seeding it is not something every caller can do. The state is a
-/// read that *did not complete*, and on Windows an elevated reader can still
-/// be denied one — a `Deny`/`ReadKey` ACE over `Parameters` stops an
-/// Administrator, which `tests/scm_integration/deny.rs` proves — so
-/// `scm_passes_conformance` seeds it and calls this directly. On systemd and
-/// launchd every read is DAC-gated and root has `CAP_DAC_OVERRIDE`: an
-/// elevated caller can read every artifact on the host, and classify each one
-/// (a symlink, a FIFO and a device node are foreign by type; bytes that are
-/// not UTF-8 are foreign by format). The state exists there only *below* the
-/// privilege boundary, so those suites assert it end to end through an
-/// unprivileged reader instead — `tests/systemd_integration/linux.rs`'s
-/// `unelevated_*_undetermined` tests, which cover the same two halves this
-/// does: the id is reported by `list`, and every verb refuses it.
+/// A read that *did not complete* — which is not the same as a read that was
+/// denied, and the difference is what lets this be one of [`run`]'s scenarios
+/// rather than an assertion each suite restates below its own privilege
+/// boundary. Elevation dissolves a denial: on systemd and launchd every read
+/// is DAC-gated and root holds `CAP_DAC_OVERRIDE`, so a mode seeds nothing in
+/// a suite that has to be root to install anything at all. An errno that is
+/// not about permission dissolves for nobody:
 ///
-/// Calling it unconditionally from `run` would therefore have forced those two
-/// suites to seed a state their backends cannot reach, which is how a scenario
-/// ends up asserting something weaker than it reads.
+/// - **systemd** — a regular file where `<id>.service.d` belongs. `read_dir`
+///   answers `ENOTDIR`, and `residue` — the predicate every verb asks — is
+///   left unable to say whether anything occupies the id.
+/// - **launchd** — a self-referential symlink at the plist path. `stat`
+///   answers `ELOOP`, so `obtain` gets no bytes, while `symlink_metadata`
+///   still sees the entry, which is exactly "something is there and nothing
+///   about it was established".
+/// - **SCM** — a `Deny`/`ReadKey` ACE over `Parameters`, which stops an
+///   Administrator too (`tests/scm_integration/deny.rs`).
+///
+/// A seed whose *bytes arrive* is not this state and never was: a non-UTF-8
+/// fragment or plist is `Foreign` — established, omitted from `list`, refused
+/// by every verb with a different error — so seeding one here asserts the
+/// wrong contract while looking correct.
 ///
 /// Seeding [`UNDETERMINED_ID`] changes `list`'s answer for the whole host, not
 /// only for that id: it raises `daemon list`'s exit code, and on Windows it

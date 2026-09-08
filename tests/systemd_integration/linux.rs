@@ -322,24 +322,26 @@ fn uninstall_via_cli(id: &str) -> (i32, String, String) {
 /// `UNIT_DIR_EXCLUSIVE`: the run installs, forces and uninstalls a dozen units in the shared
 /// `/etc/systemd/system` for its whole length, which is exactly what the host-wide listing
 /// assertions elsewhere in this file (and `tests/cli_binary.rs`'s real `daemon list`) are about.
-///
-/// `conformance::an_unclassifiable_id_is_never_silently_absent` is deliberately not called here: an
-/// elevated caller on this backend can classify every artifact on the host, so `UNDETERMINED_ID`
-/// cannot be seeded from a test that has to be root to install anything at all. The state is
-/// asserted end to end below through `runuser -u nobody`, at the privilege boundary where it is
-/// real — see that scenario's own doc comment.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn systemd_passes_conformance() {
     let mgr = Systemd::new();
 
-    // The two ids `conformance::run` cannot produce through the trait's own methods - see its
-    // module doc comment. `run` cleans up `HAND_EDITED_ID` itself; `FOREIGN_ID` is ours.
+    // The three ids `conformance::run` cannot produce through the trait's own methods - see its
+    // module doc comment. `run` cleans up `HAND_EDITED_ID` itself; the other two are ours.
     let foreign_guard = ServiceGuard::new(conformance::FOREIGN_ID);
     seed_foreign(foreign_guard.id());
 
     mgr.install(&mk(conformance::HAND_EDITED_ID), false)
         .expect("seed hand-edited install");
     hand_edit(conformance::HAND_EDITED_ID);
+
+    // Seed `UNDETERMINED_ID`: `ENOTDIR`, the one unreadable artifact elevation does not dissolve —
+    // see the scenario's own doc comment. `run` never writes to or removes this id, so both guards
+    // are ours: the `ServiceGuard` covers a backend that writes anyway, which is the regression the
+    // scenario exists to catch, and it is declared first so the seed's own removal runs before its
+    // `remove_dir_all` reaches the same name.
+    let _undetermined_guard = ServiceGuard::new(conformance::UNDETERMINED_ID);
+    let _undetermined_seed = seed_unreadable_dropin_enotdir(conformance::UNDETERMINED_ID);
 
     conformance::run(&mgr, &mk);
 }
