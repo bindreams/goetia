@@ -540,12 +540,17 @@ fn deleted_account_makes_the_service_oursunreadable() {
 
 // A read that did not complete: the aggregate, and the two objects that produce it ====================================
 
-/// The aggregate is a privilege artifact, not a permanent fixture. An elevated caller reads every
-/// service's `Parameters`, so `list` must add no `undetermined` entry at all — otherwise
-/// `goetia daemon list` would exit `4` on every Windows host forever, and the code would stop
-/// meaning anything.
+/// Whether the aggregate is a privilege artifact or a permanent fixture, asserted rather than
+/// assumed: on an elevated run this host must leave nothing undetermined at all, or
+/// `goetia daemon list` exits `4` on every Windows machine forever and the code stops meaning
+/// anything. That every service's `Parameters` is readable to an Administrator is the *claim*, not
+/// the precondition — if some service denies even that, this reddens and the finding is real: the
+/// notice's remedy would then not be the whole remedy.
+///
+/// `no_aggregate_entry_is_emitted_for_a_zero_count` already covers the code-only half (an aggregate
+/// emitted unconditionally); what this uniquely pins is the claim about the runner.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn list_emits_no_aggregate_entry_when_every_service_is_readable() {
+fn an_elevated_list_leaves_nothing_undetermined() {
     let mgr = ScmManager::new();
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -567,8 +572,8 @@ fn list_emits_no_aggregate_entry_when_every_service_is_readable() {
         .collect();
     assert!(
         undetermined.is_empty(),
-        "an elevated caller read every service's Parameters, so nothing on this host was left \
-         undetermined: {undetermined:?}"
+        "an elevated caller was expected to read every service's Parameters; something on this host \
+         was not read, which makes `daemon list` exit 4 here for every caller: {undetermined:?}"
     );
 }
 

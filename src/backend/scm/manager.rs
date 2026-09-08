@@ -378,7 +378,8 @@ fn discover(spec: &DaemonSpec) -> Result<Discovery> {
         Ok(service) => {
             let params = registry::read_parameters(spec.id.as_str())?;
             let found = classify(&params);
-            let (live, start_type) = read_live_registration(&service, spec.id.as_str(), &params)?;
+            let (live, start_type) = read_live_registration(&service, spec.id.as_str(), &params)
+                .map_err(|e| drift_read_failure(&found, &spec.id, e))?;
             (found, Some(generate::render(&live)), Some(start_type))
         }
     };
@@ -415,6 +416,34 @@ fn classify(params: &BTreeMap<String, String>) -> Ownership {
             },
         },
         Err(e) => Ownership::OursUnreadable { reason: e.to_string() },
+    }
+}
+
+/// How a failure to read the drift text is classified, given what [`classify`]
+/// has already established about the id.
+///
+/// `discover` reads the live registration for every ownership, but
+/// [`decide::decide`] consults `on_disk` only for [`Ownership::Ours`]:
+/// `Foreign` and `OursUnreadable` are answered from the marker alone. So on the
+/// `Foreign` path this read can only ever *lose* an answer goetia already has,
+/// and [`to_error`] loses it in the worst available way — `Error::Other`
+/// reaches `cli::report::status_error`'s catch-all as `Kind::Unreadable`,
+/// "goetia owns the id but cannot report on it", about an id whose missing
+/// marker just **disproved** exactly that. Not merely a claim goetia has not
+/// established: one it has refuted.
+///
+/// [`Error::Foreign`] instead, which states what *was* established — something
+/// is here, it is not goetia's — and carries the identical remedy
+/// [`Outcome::RefuseForeign`] would have. Same exit code (`1`), same advice,
+/// no invented ownership.
+///
+/// Every other ownership keeps the error unchanged: the marker is present,
+/// decoded or not, so ownership *is* established and `Kind::Unreadable` is a
+/// true statement about the id.
+fn drift_read_failure(found: &Ownership, id: &Id, e: Error) -> Error {
+    match found {
+        Ownership::Foreign => foreign(id),
+        _ => e,
     }
 }
 
@@ -1025,8 +1054,9 @@ mod manager_tests;
 /// unread thing. Aggregating belongs in the backend because only the backend
 /// knows the denominator.
 ///
-/// The name is dropped because one entry cannot carry hundreds, which is
-/// exactly what [`Installed::Undetermined`]'s `None` is for. That is not a
+/// The name is dropped because one entry cannot carry hundreds — one of the
+/// two things [`Installed::Undetermined`]'s `None` covers, and not the one a
+/// caller should assume. That is not a
 /// weaker report: while such an entry is present **no negative conclusion about
 /// any id is sound**, since it may stand for the very id being asked about.
 fn unreadable_aggregate(count: usize) -> Option<Installed> {

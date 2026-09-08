@@ -109,6 +109,49 @@ fn is_not_found_matches_only_error_service_does_not_exist() {
     assert!(!is_not_found(&access_denied));
 }
 
+// discover ============================================================================================================
+
+/// `discover` reads the drift text for every ownership, but [`decide::decide`] consults it only for
+/// `Ours`. So when the marker's demonstrable *absence* has already settled the answer, a failure to
+/// read that text must not overwrite the refusal with a claim of ownership goetia has just
+/// disproved — which is what `to_error`'s `Error::Other` does, via
+/// `cli::report::status_error`'s catch-all `Kind::Unreadable` ("goetia owns this and cannot report
+/// on it").
+#[skuld::test]
+fn a_failed_drift_read_over_a_foreign_service_stays_foreign() {
+    let id = Id::try_from("x").expect("valid id");
+    let failure = || {
+        to_error(
+            "query configuration for `x`",
+            windows_service::Error::Winapi(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)),
+        )
+    };
+
+    let over_foreign = drift_read_failure(&Ownership::Foreign, &id, failure());
+    let Error::Foreign { id: reported, recovery } = &over_foreign else {
+        panic!(
+            "a missing marker proves the id is not goetia's, and a failed read does not un-prove it: {over_foreign:?}"
+        );
+    };
+    assert_eq!(reported, "x");
+    assert_eq!(
+        recovery,
+        &decide::foreign_recovery("x"),
+        "the identical remedy `Outcome::RefuseForeign` would have carried"
+    );
+
+    // Ownership *is* established here — the marker is present, merely undecodable — so
+    // `Kind::Unreadable` is a true statement about the id and the original error stands.
+    let over_ours = drift_read_failure(
+        &Ownership::OursUnreadable {
+            reason: "a newer schema".to_string(),
+        },
+        &id,
+        failure(),
+    );
+    assert!(matches!(over_ours, Error::Other(_)), "{over_ours:?}");
+}
+
 // undetermined ========================================================================================================
 
 /// The substance `manager::fake`'s own `Error::Undetermined` carries, asserted of this backend's
@@ -200,6 +243,15 @@ fn unreadable_notice_is_one_line_and_agrees_in_number() {
             text.contains("may be missing"),
             "must not claim the list is complete: {text}"
         );
-        assert!(text.contains("re-run elevated"), "must name the remedy: {text}");
+        assert!(
+            text.contains("re-running elevated"),
+            "must offer the usual remedy: {text}"
+        );
+        // `list` counts every non-`NotFound` failure, so naming denial as *the* cause would assert
+        // something this never established — see `unreadable_notice`'s own doc comment.
+        assert!(
+            !text.contains("access denied"),
+            "the count covers failures that were not denials: {text}"
+        );
     }
 }

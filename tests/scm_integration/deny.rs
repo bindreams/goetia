@@ -36,18 +36,19 @@ use crate::support;
 /// the nine service-specific ones.
 const SERVICE_ALL: &str = "CCDCLCSWRPWPDTLOCRSDRCWDWO";
 
-/// Administrators and `LocalSystem` keep full access under both of a pair:
-/// `SetNamedSecurityInfoW` itself needs `WRITE_DAC` to put the object back,
-/// and SCM — which runs as `LocalSystem` — needs `DELETE` to remove the
-/// service the test installed.
+/// Administrators and `LocalSystem` keep full access under both of a pair, so
+/// the deny never locks out the two things that still have to happen:
+/// `SetNamedSecurityInfoW` needs `WRITE_DAC` to write the second string, and
+/// SCM — which runs as `LocalSystem` — needs `DELETE` to remove the service the
+/// test installed.
 fn service_dacl(deny: Option<&str>) -> String {
     let deny = deny.map(|rights| format!("(D;;{rights};;;WD)")).unwrap_or_default();
     format!("D:{deny}(A;;{SERVICE_ALL};;;BA)(A;;{SERVICE_ALL};;;SY)")
 }
 
 /// The registry twin of [`service_dacl`]. `KA` (`KEY_ALL_ACCESS`) subsumes
-/// `DELETE` and `WRITE_DAC`; `KR` (`KEY_READ`) does not, which is what lets a
-/// key whose reads are denied still be restored and still be removed with the
+/// `DELETE` and `WRITE_DAC`; `KR` (`KEY_READ`) does not, which is why denying
+/// reads still leaves the key rewritable and still leaves it deletable with the
 /// service.
 fn key_dacl(deny: Option<&str>) -> String {
     let deny = deny.map(|rights| format!("(D;;{rights};;;WD)")).unwrap_or_default();
@@ -140,17 +141,30 @@ fn set_dacl(object: &str, object_type: SE_OBJECT_TYPE, sddl: &str) -> Result<(),
 
 // Denied ==============================================================================================================
 
-/// One object whose DACL denies an access for as long as this value lives, put
-/// back when it drops.
+/// One object whose DACL denies an access for as long as this value lives.
 ///
-/// Restoring rather than leaving the deny in place: `ServiceGuard` removes the
-/// service afterwards, and a `Drop` that reported nothing would surface only as
-/// a straggler in `services.msc` long after the run that left it — the same
-/// discipline `ServiceGuard` itself follows.
+/// **`Drop` does not restore the original DACL.** It writes a fresh one
+/// granting Administrators and `LocalSystem` full access and denying nothing —
+/// the same string the deny was built from, minus the deny ACE. The original is
+/// never captured, and capturing it would not help: `GetNamedSecurityInfoW`
+/// returns the *effective* DACL, inherited ACEs included, so writing that back
+/// as an explicit one converts inheritance into explicit ACEs and calls the
+/// result a restore.
+///
+/// Sufficient here, and only here, because every caller deletes the object
+/// moments later: both live under a `goetia-test-<random>` service that
+/// `ServiceGuard` removes at the end of the same test, so all the written DACL
+/// has to do is stay out of that cleanup's way. A caller that needs the object
+/// to survive needs a real save-and-restore, which this is not.
+///
+/// Writing *something* rather than leaving the deny in place: a `Drop` that
+/// reported nothing would surface only as a straggler in `services.msc` long
+/// after the run that left it — the discipline `ServiceGuard` itself follows,
+/// which is also why a failure here is logged rather than panicked.
 pub struct Denied {
     object: String,
     object_type: SE_OBJECT_TYPE,
-    restore: String,
+    on_drop: String,
 }
 
 impl Denied {
@@ -175,19 +189,19 @@ impl Denied {
         )
     }
 
-    fn seal(object: String, object_type: SE_OBJECT_TYPE, deny: String, restore: String) -> Self {
+    fn seal(object: String, object_type: SE_OBJECT_TYPE, deny: String, on_drop: String) -> Self {
         set_dacl(&object, object_type, &deny).unwrap_or_else(|e| panic!("{e}"));
         Self {
             object,
             object_type,
-            restore,
+            on_drop,
         }
     }
 }
 
 impl Drop for Denied {
     fn drop(&mut self) {
-        if let Err(e) = set_dacl(&self.object, self.object_type, &self.restore) {
+        if let Err(e) = set_dacl(&self.object, self.object_type, &self.on_drop) {
             eprintln!("Denied[{}]: cleanup failed: {e}", self.object);
         }
     }
