@@ -18,6 +18,14 @@ use goetia::spec::{DaemonSpec, Id, Kind, Restart, User};
 
 use crate::support::{self, ELEVATED, ServiceGuard, cmd};
 
+/// Held by every test whose assertion is about `list`'s answer for the *whole host* — its exit code,
+/// or the absence of any `undetermined` entry — and by every test that seeds an unreadable
+/// `*.service` into the shared `/etc/systemd/system`, which changes that answer. The two groups are
+/// the same group precisely because either one invalidates the other, so they take turns rather than
+/// race.
+#[skuld::label]
+const UNIT_DIR_EXCLUSIVE: skuld::Label;
+
 // Fixtures ============================================================================================================
 
 /// A minimal, real, long-running daemon: `sleep infinity` exists on every coreutils Ubuntu ships.
@@ -155,6 +163,81 @@ fn find_ours(installed: Vec<Installed>, id: &str) -> Option<DaemonSpec> {
         Installed::Ours { spec, .. } if spec.id.as_str() == id => Some(spec),
         _ => None,
     })
+}
+
+/// Whether `listed` leaves `id` possible — the basis for every negative assertion below. An
+/// aggregate `Undetermined` entry counts even though it names nothing: it may stand for `id` itself,
+/// so an assertion that treated it as silence would certify what the listing cannot establish (see
+/// [`Installed::Undetermined`]'s null-name rule).
+fn may_account_for(listed: &[Installed], id: &str) -> bool {
+    listed.iter().any(|entry| match entry {
+        Installed::Ours { spec, .. } => spec.id.as_str() == id,
+        Installed::OursUnreadable { name, .. } => name == id,
+        Installed::Undetermined { name, .. } => name.is_none() || name.as_deref() == Some(id),
+    })
+}
+
+fn undetermined_named(listed: &[Installed], id: &str) -> Option<String> {
+    listed.iter().find_map(|entry| match entry {
+        Installed::Undetermined { name, reason } if name.as_deref() == Some(id) => Some(reason.clone()),
+        _ => None,
+    })
+}
+
+fn mkfifo(path: &Path) {
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("a unit path with no NUL");
+    // SAFETY: `c_path` is a NUL-terminated pointer valid for the call.
+    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+    assert_eq!(rc, 0, "mkfifo {}: {}", path.display(), std::io::Error::last_os_error());
+}
+
+/// Run `f` on its own thread and report — rather than hang — if it never returns.
+///
+/// The bound is a failure bound on a kernel wait that may genuinely never end: `open(2)` on a FIFO
+/// with `O_RDONLY` blocks until a writer arrives, and nothing here ever creates one. It synchronizes
+/// nothing, and no passing run's outcome depends on its value — only how long a regression takes to
+/// be *reported* instead of wedging the whole suite, which is what an unguarded call would do.
+fn without_blocking<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || drop(tx.send(f())));
+    rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap_or_else(|_| {
+        panic!("{what} never returned: it opened the FIFO for reading, which blocks until a writer arrives")
+    })
+}
+
+/// The one document `--json` promises, plus the raw streams for a failure message.
+struct ListJson {
+    doc: serde_json::Value,
+    code: Option<i32>,
+    context: String,
+}
+
+impl ListJson {
+    fn ids(&self, key: &str) -> Vec<Option<String>> {
+        self.doc[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("`{key}` must always be present, as an array: {}", self.context))
+            .iter()
+            .map(|entry| match &entry[if key == "daemons" { "id" } else { "name" }] {
+                serde_json::Value::Null => None,
+                serde_json::Value::String(name) => Some(name.clone()),
+                other => panic!("a name must be a string or null: {other}"),
+            })
+            .collect()
+    }
+}
+
+fn list_json() -> ListJson {
+    let output = run_unelevated(&["daemon", "list", "--json"]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let context = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
+    let doc = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {context}"));
+    ListJson {
+        doc,
+        code: output.status.code(),
+        context,
+    }
 }
 
 /// The numeric uid of a real local account, looked up rather than hardcoded — `nobody`'s uid is
@@ -624,7 +707,7 @@ fn diff_refuses_our_own_fragment_with_an_unreadable_dropin() {
 /// `lstat` succeeds for an unreadable regular file on directory-search permission alone, so
 /// classifying it from "the open failed and the `lstat` did not" reported `foreign` — "demonstrably
 /// not managed by goetia" — about a file whose contents nobody had looked at.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn status_reports_undetermined_for_a_fragment_it_cannot_read() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -813,20 +896,14 @@ fn list_ignores_foreign_units() {
     let guard = ServiceGuard::new(&id);
     seed_foreign(guard.id());
 
-    let mgr = Systemd::new();
-    let listed = mgr.list().expect("list");
-    let present = listed.into_iter().any(|entry| match entry {
-        Installed::Ours { spec, .. } => spec.id.as_str() == guard.id(),
-        Installed::OursUnreadable { name, .. } => name == guard.id(),
-        // An aggregate may stand for this id: `present` stays the basis for
-        // a negative assertion, so an entry that cannot rule the id out must
-        // fail it rather than pass by going unnamed.
-        Installed::Undetermined { name, .. } => name.is_none() || name.as_deref() == Some(guard.id()),
-    });
-    assert!(!present, "a foreign unit must not appear in list()");
+    let listed = Systemd::new().list().expect("list");
+    assert!(
+        !may_account_for(&listed, guard.id()),
+        "a foreign unit goetia read in full must not appear in list()"
+    );
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn unelevated_list_works() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -946,30 +1023,140 @@ fn install_leaves_a_preexisting_ancestor_directory_untouched() {
     );
 }
 
-// Obligation 4/2: reading an unreadable foreign unit must not abort list() ============================================
+// Obligation 4/2: a unit `list` could not read is reported, never omitted =============================================
 
-/// `list` runs unelevated by design; a foreign unit shipped non-world-readable (units carrying
-/// `LoadCredential=` commonly are 0600) must be silently skipped, not treated as an error that takes
-/// down the whole listing.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn list_skips_a_foreign_unit_unreadable_to_the_caller() {
+/// `list` runs unelevated by design, and a unit shipped non-world-readable (those carrying
+/// `LoadCredential=` commonly are 0600) is what it meets. Skipping it certifies "no such daemon" off
+/// a read that never happened — the id may be a stranger's *or* goetia's own, and the listing cannot
+/// tell which. One unreadable unit still must not take down the listing of every other daemon.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn unelevated_list_reports_a_unit_it_cannot_read_as_undetermined() {
+    let readable = support::random_test_id();
+    let readable_guard = ServiceGuard::new(&readable);
+    Systemd::new()
+        .install(&mk(readable_guard.id()), false)
+        .expect("install");
+
+    let denied = support::random_test_id();
+    let denied_guard = ServiceGuard::new(&denied);
+    seed_foreign(denied_guard.id());
+    fs::set_permissions(unit_path(denied_guard.id()), fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+
+    let listed = list_json();
+
+    // Root reads this fragment fine and finds no marker, which reports nothing at all and exits `0`
+    // — so a run whose reader was not unprivileged fails here instead of passing vacuously.
+    assert_eq!(listed.code, Some(4), "{}", listed.context);
+    assert!(
+        listed.ids("undetermined").contains(&Some(denied.clone())),
+        "{}",
+        listed.context
+    );
+    assert!(
+        !listed.ids("daemons").contains(&Some(denied.clone())),
+        "goetia never read the marker, so it cannot list the id as one of its own: {}",
+        listed.context
+    );
+    assert!(
+        listed.ids("daemons").contains(&Some(readable.clone())),
+        "one unreadable unit must not take down the listing: {}",
+        listed.context
+    );
+}
+
+/// The same denial at the same privilege boundary, over a unit goetia *does* own. The end-to-end
+/// proof that an unelevated `daemon list` on a populated host stops exiting `0` with the daemon
+/// missing from its document.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn unelevated_list_reports_a_root_only_unit_as_undetermined() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
-    seed_foreign(guard.id());
+    Systemd::new().install(&mk(guard.id()), false).expect("install");
     fs::set_permissions(unit_path(guard.id()), fs::Permissions::from_mode(0o600)).expect("chmod 0600");
 
-    let output = run_unelevated(&["daemon", "list"]);
+    let listed = list_json();
+
+    // Root reads it, decodes the marker and lists it under `daemons` at exit `0`, so this cannot
+    // pass vacuously either.
+    assert_eq!(listed.code, Some(4), "{}", listed.context);
     assert!(
-        output.status.success(),
-        "unelevated `daemon list` must still succeed with an unreadable foreign unit present:\n\
-         stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        listed.ids("undetermined").contains(&Some(id.clone())),
+        "{}",
+        listed.context
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        !stdout.contains(guard.id()),
-        "an unreadable foreign unit must not appear in the listing:\n{stdout}"
+        !listed.ids("daemons").contains(&Some(id.clone())),
+        "a fragment goetia could not open is not a daemon it can report the state of: {}",
+        listed.context
+    );
+}
+
+/// The other half of the same boundary, and the one that would catch an over-eager fix: an install
+/// an unprivileged caller *can* read is reported as a daemon, with nothing in the third key and
+/// exit `0`.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn unelevated_list_stays_clean_for_a_normal_install() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    Systemd::new().install(&mk(guard.id()), false).expect("install");
+
+    let listed = list_json();
+
+    assert!(listed.ids("daemons").contains(&Some(id.clone())), "{}", listed.context);
+    assert_eq!(
+        listed.ids("undetermined"),
+        Vec::<Option<String>>::new(),
+        "a unit goetia read in full determines the id: {}",
+        listed.context
+    );
+    assert_eq!(listed.code, Some(0), "{}", listed.context);
+}
+
+/// One `*.service` whose bytes are not UTF-8 used to make `list` return `Err` — taking down the
+/// listing of every daemon on the host over a file that belongs to none of them.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn list_reports_a_non_utf8_unit_as_undetermined_instead_of_failing() {
+    let readable = support::random_test_id();
+    let readable_guard = ServiceGuard::new(&readable);
+    Systemd::new()
+        .install(&mk(readable_guard.id()), false)
+        .expect("install");
+
+    let undecodable = support::random_test_id();
+    let undecodable_guard = ServiceGuard::new(&undecodable);
+    fs::write(unit_path(undecodable_guard.id()), [b'[', 0xff, 0xfe, b']']).expect("seed a non-UTF-8 unit");
+
+    let listed = Systemd::new()
+        .list()
+        .expect("one undecodable file must not take down the whole listing");
+
+    let reason = undetermined_named(&listed, undecodable_guard.id())
+        .unwrap_or_else(|| panic!("bytes goetia could not decode settle nothing about the id: {listed:?}"));
+    assert!(
+        reason.contains(&unit_path(undecodable_guard.id()).display().to_string()),
+        "the reason must name the path that could not be read: {reason}"
+    );
+    assert!(
+        find_ours(listed, readable_guard.id()).is_some(),
+        "every other daemon is still listed"
+    );
+}
+
+/// `open(2)` on a FIFO with `O_RDONLY` blocks until a writer arrives. `list` opens every
+/// `*.service` name in the unit directory, so classifying by type before opening for reading is
+/// what keeps one `mkfifo` from wedging the listing for the whole host.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn list_does_not_hang_on_a_fifo_in_the_unit_directory() {
+    let id = support::random_test_id();
+    let path = unit_path(&id);
+    mkfifo(&path);
+    let _cleanup = RmPath(path);
+
+    let listed = without_blocking("Systemd::list", || Systemd::new().list()).expect("list");
+
+    assert!(
+        !may_account_for(&listed, &id),
+        "a FIFO is not a fragment, and nothing about it was left undetermined: {listed:?}"
     );
 }
 

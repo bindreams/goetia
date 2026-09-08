@@ -865,8 +865,10 @@ impl ServiceManager for LaunchdManager {
             // without that evidence would misreport an unreadable
             // *foreign* plist (routine on `/Library/LaunchDaemons`, which
             // holds every vendor's daemons, not just Goetia's) as one of
-            // ours; `list`'s contract is that a foreign entry is never
-            // included at all, so this is skipped exactly like one.
+            // ours. Skipping it is a known gap rather than the contract —
+            // `ServiceManager::list` requires an unread id to appear as
+            // `Installed::Undetermined`, which the systemd backend does and
+            // this one does not yet.
             let Ok(text) = fs::read_to_string(path) else {
                 continue;
             };

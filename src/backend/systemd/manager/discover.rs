@@ -98,65 +98,62 @@ pub(super) enum RawState {
     Regular(String),
 }
 
-/// `O_NOFOLLOW`, hardcoded rather than pulled from a dependency: this file is already
-/// `#[cfg(target_os = "linux")]`-only (via its parent), and the value is part of the stable Linux
-/// syscall ABI (`asm-generic/fcntl.h`), identical across every architecture Rust supports for this
-/// target (confirmed: `0o400_000` == asm-generic's `00400000` == SPARC's `0x20000`).
-const O_NOFOLLOW: i32 = 0o400_000;
-
-/// Classify and read `path` from a single open file handle, rather than a separate `lstat` followed
-/// by a separate open-and-read: two syscalls resolving the same path independently is its own TOCTOU
-/// gap (the file the `lstat` classified need not be the file the read later opens), and a plain
-/// second open would additionally disagree by silently following a symlink the `lstat` deliberately
-/// did not. `O_NOFOLLOW` makes the *open itself* the classification: it fails for a symlink (a masked
-/// unit — obligation 2) exactly where a plain open would have silently followed it through to
-/// `/dev/null`. Shared by `raw_state` (the fragment) and `super::write::quarantine_if_still_ours`
-/// (the quarantined former occupant), which both need this identical classify-before-read discipline.
+/// Classify `path`, and read it only once it is known to be a regular file. Two opens of one
+/// pathname, each answered by `fstat` on the descriptor that open returned rather than by a second
+/// name lookup — a separate `lstat` is its own TOCTOU gap, since the file it classified need not be
+/// the file a later open resolves the same name to.
 ///
-/// The failure `open` reports for a symlink is deliberately *not* checked by its numeric `errno`
-/// value: `ELOOP` is 40 on the Linux ABI most architectures share, but not on MIPS, whose errno table
-/// is SysV-derived (40 is `EL3RST` there; `ELOOP` is 90) — trusting the wrong number there would
-/// treat a masked unit as an unclassifiable I/O error instead of `NonRegular`. `lstat`-ing the path in
-/// the catch-all arm instead is architecture-independent, and is the same rule this function already
-/// applies via `O_NOFOLLOW` for the case that succeeds.
+/// Step 1 opens `O_PATH | O_NOFOLLOW`. That needs no read permission, never blocks, and is the
+/// documented case that yields a descriptor for the *symlink itself*, so a masked unit (`systemctl
+/// mask` points the fragment at `/dev/null`), a FIFO, a device node and a `.d` directory are all
+/// classified [`RawState::NonRegular`] without ever being opened for reading — obligation 2. It is
+/// also what keeps `list` answerable at all: opening for reading first means `open(FIFO, O_RDONLY)`
+/// blocks until a writer arrives, and one `mkfifo x.service` would wedge the listing for every
+/// daemon on the host.
 ///
-/// That `lstat` has to *confirm* what it found, never merely succeed: it needs only search permission
-/// on the parent directory, so it succeeds for an ordinary regular file whose own mode denied the
-/// open. Treating "the open failed and the `lstat` did not" as proof of a masked unit therefore
-/// returned `NonRegular` — and so `Ownership::Foreign`, "demonstrably not managed by goetia" — for a
-/// 0600 fragment nobody had looked inside, which is the one verdict a read that never happened
-/// cannot support. Each arm below states which syscall established its answer.
+/// Step 2 re-opens a regular file for reading and compares `(st_dev, st_ino)` against step 1's, so
+/// no verdict is ever derived from a classification of some other file that briefly held the name.
+/// It is the only step a *readable-type* artifact can fail at, and unambiguous there: a regular
+/// file whose bytes could not be obtained.
+///
+/// Shared by `raw_state` (the fragment) and `super::write::quarantine_if_still_ours` (the
+/// quarantined former occupant), which both need this identical classify-before-read discipline.
+/// Every failure is a [`ReadFailure`], which states what did not complete and leaves what that
+/// means about the id to the caller.
 pub(super) fn classify_and_read(path: &Path) -> ReadResult<RawState> {
-    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
-    match fs::OpenOptions::new().read(true).custom_flags(O_NOFOLLOW).open(path) {
-        Ok(file) => {
-            let meta = file.metadata().map_err(|e| ReadFailure::new("stat", path, e))?;
-            if !meta.is_file() {
-                // Some other non-regular file `O_NOFOLLOW` still let through (a FIFO, a device
-                // node): never read through it, same as a masked unit.
-                return Ok(RawState::NonRegular);
-            }
-            let text = std::io::read_to_string(&file).map_err(|e| ReadFailure::new("read", path, e))?;
-            Ok(RawState::Regular(text))
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(RawState::Absent),
-        Err(e) => match fs::symlink_metadata(path) {
-            // The masked unit, confirmed as a symlink rather than inferred from the open having
-            // failed for some reason or other.
-            Ok(meta) if meta.is_symlink() => Ok(RawState::NonRegular),
-            // Any other non-regular file, e.g. a FIFO whose open blocks or a device node whose open
-            // fails outright. Same claim as above and the same evidence for it: `lstat` reports the
-            // type without following and without reading, which is all `NonRegular` asserts.
-            Ok(meta) if !meta.is_file() => Ok(RawState::NonRegular),
-            // A regular file the open could not read — `EACCES` on a 0600 fragment is the common
-            // one, and the fragment is where it is most likely, since a drop-in directory is
-            // usually world-searchable while a fragment's own mode governs its readability.
-            Ok(_) => Err(ReadFailure::new("open", path, e)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(RawState::Absent),
-            Err(e) => Err(ReadFailure::new("stat", path, e)),
-        },
+    // `OpenOptions` insists on an access mode even where `O_PATH` makes the kernel ignore it.
+    let classified = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(handle) => handle.metadata().map_err(|e| ReadFailure::new("stat", path, e))?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(RawState::Absent),
+        // `ENOTDIR` on a parent component, `EACCES` on a parent directory, `EIO`: presence itself
+        // was not established, so neither `Absent` nor `NonRegular` is a claim this can make.
+        Err(e) => return Err(ReadFailure::new("classify", path, e)),
+    };
+    if !classified.is_file() {
+        return Ok(RawState::NonRegular);
     }
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| ReadFailure::new("open", path, e))?;
+    let opened = file.metadata().map_err(|e| ReadFailure::new("stat", path, e))?;
+    if (opened.dev(), opened.ino()) != (classified.dev(), classified.ino()) {
+        return Err(ReadFailure::new(
+            "re-read",
+            path,
+            io::Error::other("the path was replaced between classification and read"),
+        ));
+    }
+    let text = io::read_to_string(&file).map_err(|e| ReadFailure::new("read", path, e))?;
+    Ok(RawState::Regular(text))
 }
 
 pub(super) fn raw_state(id: &str) -> Result<RawState> {
@@ -413,9 +410,10 @@ fn dropin_marker_in(dir: &Path) -> ReadResult<String> {
             continue;
         }
         let path = entry.path();
-        // `fs::metadata` follows symlinks, deliberately unlike `raw_state`'s `lstat` of the fragment
-        // itself: systemd follows a drop-in symlink exactly like a regular file when applying
-        // overrides (common under ansible/stow/nix-managed `/etc`), so drift detection must too.
+        // `fs::metadata` follows symlinks, deliberately unlike `classify_and_read`'s `O_NOFOLLOW`
+        // view of the fragment itself: systemd follows a drop-in symlink exactly like a regular file
+        // when applying overrides (common under ansible/stow/nix-managed `/etc`), so drift detection
+        // must too.
         let meta = match fs::metadata(&path) {
             Ok(m) => m,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue, // dangling symlink

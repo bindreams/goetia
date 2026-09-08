@@ -15,10 +15,11 @@
 //! 2. **A masked unit is not absent.** `systemctl mask` replaces the fragment with a symlink to
 //!    `/dev/null`; reading it yields empty text, and a naive read-then-extract would see `Ok(None)`
 //!    and let `install` write over it, silently unmasking a deliberately-masked service.
-//!    [`discover::raw_state`] opens the path `O_NOFOLLOW` and confirms any non-regular file by
-//!    `lstat` as [`discover::RawState::NonRegular`] — always `Ownership::Foreign` — without ever
-//!    reading its contents. A *regular* file the open could not read is neither: it is
-//!    [`Error::Undetermined`], since nothing about its content was established.
+//!    [`discover::classify_and_read`] opens the path `O_PATH | O_NOFOLLOW` and classifies the
+//!    descriptor by `fstat`, reporting any non-regular file as [`discover::RawState::NonRegular`] —
+//!    always `Ownership::Foreign` — without ever opening it for reading. A *regular* file whose
+//!    bytes could not be obtained is neither: it is [`Error::Undetermined`] for `status` and
+//!    [`Installed::Undetermined`] for `list`, since nothing about its content was established.
 //! 3. **Drop-ins are drift.** `systemctl edit` — the officially recommended way to add exactly the
 //!    `MemoryMax=`/`After=` the design cites — writes `<id>.service.d/override.conf` and leaves the
 //!    fragment itself byte-identical, so drift detection over the fragment alone misses it entirely.
@@ -62,7 +63,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use discover::{RawState, absent_error, discover, raw_state, require_installed};
+use discover::{RawState, absent_error, classify_and_read, discover, raw_state, require_installed};
 use systemctl::{daemon_reload, daemon_reload_or_report, run_systemctl, start_impl, status_from_unit, stop_impl};
 use write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 
@@ -288,26 +289,22 @@ impl ServiceManager for Systemd {
                 continue;
             };
 
-            // A masked unit (symlink to /dev/null) or a `<id>.service.d` drop-in directory both fail
-            // this check — neither is a fragment `list` should read, per obligations 2 and 3.
-            let file_type = match entry.file_type() {
-                Ok(t) => t,
-                // `list` runs unelevated by design (obligation 4): a foreign unit shipped
-                // non-world-readable (units carrying `LoadCredential=` commonly are 0600) cannot
-                // carry a decodable goetia marker either way, so it is not ours to report — the same
-                // disposition as a concurrent-uninstall race.
-                Err(e) if is_benign_list_error(&e) => continue,
-                Err(e) => return Err(io_err("stat", &entry.path(), e)),
-            };
-            if !file_type.is_file() {
-                continue;
-            }
-
-            let path = entry.path();
-            let text = match fs::read_to_string(&path) {
-                Ok(t) => t,
-                Err(e) if is_benign_list_error(&e) => continue,
-                Err(e) => return Err(io_err("read", &path, e)),
+            // The same classification `status` performs, so the two cannot describe one machine
+            // differently.
+            let text = match classify_and_read(&entry.path()) {
+                Ok(RawState::Regular(text)) => text,
+                // Gone between the scan and the open, or never a fragment to read (a masked unit's
+                // symlink, a FIFO, a `.d` directory): obligations 2 and 3.
+                Ok(RawState::Absent | RawState::NonRegular) => continue,
+                // A read that did not complete establishes nothing about the id — least of all that
+                // it is absent, which is what omitting it from the enumeration would say.
+                Err(failure) => {
+                    out.push(Installed::Undetermined {
+                        name: Some(id.to_string()),
+                        reason: failure.detail(),
+                    });
+                    continue;
+                }
             };
 
             match generate::extract(&text) {
@@ -336,10 +333,6 @@ impl ServiceManager for Systemd {
         }
         Ok(out)
     }
-}
-
-fn is_benign_list_error(e: &io::Error) -> bool {
-    matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied)
 }
 
 // Identity ============================================================================================================

@@ -6,9 +6,9 @@
 //! a silent skip. `tests/systemd_integration/linux.rs` seeds those as root and reads them back
 //! through `runuser -u nobody`, which is correct under both uids:
 //! `status_reports_undetermined_for_a_dropin_directory_it_cannot_read` for the absence path,
-//! `status_reports_undetermined_for_a_fragment_it_cannot_read` for the fragment itself, and
-//! `diff_refuses_our_own_fragment_with_an_unreadable_dropin_without_denying_ownership` for the
-//! presence path.
+//! `status_reports_undetermined_for_a_fragment_it_cannot_read` and
+//! `unelevated_list_reports_a_root_only_unit_as_undetermined` for the fragment itself, and
+//! `diff_refuses_our_own_fragment_with_an_unreadable_dropin` for the presence path.
 
 use std::io;
 
@@ -21,6 +21,28 @@ fn unreadable_dir(tmp: &Path) -> PathBuf {
     let file = tmp.join("not-a-directory");
     fs::write(&file, "").expect("write the blocking file");
     file.join("x.service.d")
+}
+
+fn mkfifo(path: &Path) {
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("a temp path with no NUL");
+    // SAFETY: `c_path` is a NUL-terminated pointer valid for the call.
+    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+    assert_eq!(rc, 0, "mkfifo {}: {}", path.display(), io::Error::last_os_error());
+}
+
+/// Run `f` on its own thread and report — rather than hang — if it never returns.
+///
+/// The bound is a failure bound on a kernel wait that may genuinely never end: `open(2)` on a FIFO
+/// with `O_RDONLY` blocks until a writer arrives, and the tests below never create one. It
+/// synchronizes nothing. A correct classification is one `openat` and a send, so no passing run's
+/// outcome depends on the bound's value — only how long a regression takes to be *reported* instead
+/// of wedging the whole suite, which is what an unguarded call would do.
+fn without_blocking<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || drop(tx.send(f())));
+    rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap_or_else(|_| {
+        panic!("{what} never returned: it opened the FIFO for reading, which blocks until a writer arrives")
+    })
 }
 
 // The error class a failed read earns ---------------------------------------------------------------------------------
@@ -110,9 +132,10 @@ fn the_error_names_the_id_that_could_not_be_determined() {
 
 // classify_and_read ---------------------------------------------------------------------------------------------------
 
-/// The masked-unit case, confirmed by `is_symlink` rather than inferred from "the open failed and
-/// the `lstat` did not". The target deliberately does not exist: `systemctl mask` points the link at
-/// `/dev/null`, and either way the link itself is never followed.
+/// The masked-unit case. `O_PATH | O_NOFOLLOW` is the documented combination that returns a
+/// descriptor for the *symlink itself* rather than failing, so the link is classified without being
+/// followed. One target exists and one does not: `systemctl mask` points the link at `/dev/null`,
+/// and either way what the link points at is never opened.
 #[skuld::test]
 fn a_symlink_is_non_regular_whether_or_not_its_target_exists() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -143,6 +166,75 @@ fn a_missing_path_is_absent_and_a_regular_file_is_read() {
         RawState::Regular(text) => assert_eq!(text, "[Unit]\n"),
         _ => panic!("a regular file is read, not classified away"),
     }
+}
+
+#[skuld::test]
+fn a_directory_is_non_regular() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().join("x.service.d");
+    fs::create_dir(&dir).expect("seed the drop-in directory");
+
+    let state = classify_and_read(&dir).unwrap_or_else(|e| panic!("{}", e.detail()));
+    assert!(
+        matches!(state, RawState::NonRegular),
+        "a directory is classified, never opened for reading"
+    );
+}
+
+/// A FIFO is the case that makes classifying before opening for reading mandatory rather than
+/// tidy: `open(2)` on one with `O_RDONLY` blocks until a writer arrives, and none ever will here.
+/// `list` sweeps every `*.service` name in `/etc/systemd/system`, so a single `mkfifo x.service`
+/// would otherwise wedge the listing for the whole host.
+#[skuld::test]
+fn a_fifo_is_non_regular_without_blocking() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fifo = tmp.path().join("x.service");
+    mkfifo(&fifo);
+
+    let state = without_blocking("classify_and_read", move || classify_and_read(&fifo))
+        .unwrap_or_else(|e| panic!("{}", e.detail()));
+    assert!(
+        matches!(state, RawState::NonRegular),
+        "a FIFO is classified, never opened for reading"
+    );
+}
+
+/// The bytes of a regular file could not be obtained — the only shape of failure a *readable-type*
+/// artifact can produce, and the one arm of it that is identical for root and everyone else. The
+/// permission-denied shape needs a second uid and is exercised end to end in
+/// `tests/systemd_integration/linux.rs`; see this module's own doc comment.
+#[skuld::test]
+fn invalid_utf8_in_a_regular_file_is_a_read_failure() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("x.service");
+    fs::write(&path, [b'[', 0xff, 0xfe, b']']).expect("write the undecodable fragment");
+
+    let Err(failure) = classify_and_read(&path) else {
+        panic!("bytes that are not UTF-8 are not text goetia read, so this settles nothing about the id");
+    };
+    let detail = failure.detail();
+    assert!(
+        detail.contains(&path.display().to_string()),
+        "the detail must name the path that could not be read: {detail}"
+    );
+}
+
+/// `ENOTDIR` on a parent component: presence itself was never established, so neither
+/// [`RawState::Absent`] ("nothing is here") nor [`RawState::NonRegular`] ("something is, and it is
+/// not a fragment") is a claim this arm may make.
+#[skuld::test]
+fn a_path_that_cannot_be_resolved_is_a_read_failure() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = unreadable_dir(tmp.path()).join("x.service");
+
+    let Err(failure) = classify_and_read(&path) else {
+        panic!("`ENOTDIR` establishes neither that something is at the path nor that nothing is");
+    };
+    assert!(
+        failure.detail().contains(&path.display().to_string()),
+        "{}",
+        failure.detail()
+    );
 }
 
 // The drop-in search path ---------------------------------------------------------------------------------------------

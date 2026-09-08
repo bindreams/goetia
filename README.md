@@ -386,10 +386,11 @@ different question from drift.
 
 **`4` is returned by** `status` on an id it owns but cannot read, by `list`
 for an entry goetia owns but cannot decode, and by `diff` and `show` when
-the installed artifact cannot be read. `status` and `diff` also return it —
-as the `undetermined` kind — when a read that would have said whether
-anything is installed at that id failed at all: the `<id>.service` fragment
-or an `<id>.service.d` drop-in directory an unelevated caller cannot open. Goetia
+the installed artifact cannot be read. `status`, `diff`, `list` and `show`
+also return it — as the `undetermined` kind — when a read that would have
+said whether anything is installed at that id failed at all: the
+`<id>.service` fragment or an `<id>.service.d` drop-in directory an
+unelevated caller cannot open. Goetia
 claims no ownership of such an id, and does not suggest uninstalling it.
 `install` keeps that same case at `1`: there the operation is the install,
 and it genuinely did not happen.
@@ -424,11 +425,11 @@ what is actually installed. Four guarantees:
 1. **When both paths can see the daemon**, `show <id>` and
    `show -f <file> <id>` render the same resolved spec identically, byte for
    byte. The agreement is conditional, not unconditional: without `-f`,
-   `show` enumerates installed services, which silently skips a unit this
-   privilege level cannot enumerate. For a daemon that is installed but
-   unreadable unelevated, `show <id>` therefore reports "not installed" and
-   exits `1`, while `show -f <file> <id>` still renders it from the
-   manifest.
+   `show` enumerates installed services, which cannot describe a unit this
+   privilege level could not read. Such a unit reaches `show` as an
+   `undetermined` entry, so `show <id>` reports that it could not determine
+   the id's state and exits `4`, while `show -f <file> <id>` still renders
+   it from the manifest.
 2. Neither path ever checks elevation.
 3. `show -f` touches no service manager; `show` without `-f` touches no
    manifest.
@@ -445,14 +446,14 @@ answer, and outranks `4` when a single call names both kinds of id.
 can read**.
 
 Where goetia knows it could not determine something, it says so and exits
-`4`. Where it cannot even tell that something was missed, it currently
-**omits it silently**: an unelevated `goetia daemon list` can return an
-empty document with exit `0` on a host that does have goetia daemons
-installed.
+`4`. On systemd that covers a unit file the caller could not open: it is
+reported as `undetermined`, named, rather than dropped from the listing.
 
-Closing that gap is known work, planned separately. When it lands, those
-entries will report `4` like every other indeterminate answer. Until then,
-**run elevated to get a complete answer.**
+launchd and SCM still **leave such an artifact out of the document**, so an
+unelevated `goetia daemon list` can still return an empty document with exit
+`0` on a macOS or Windows host that does have goetia daemons installed.
+Closing that is known work, planned separately; until it lands, **run
+elevated on those platforms to get a complete answer.**
 
 ## License
 

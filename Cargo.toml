@@ -57,6 +57,15 @@ thiserror = "2"
 # Only `geteuid()`, for the CLI's elevation check.
 libc = { version = "0.2", optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Unconditional (not behind the `cli` feature): the systemd backend itself
+# classifies a unit path with `O_PATH | O_NOFOLLOW` before opening it for
+# reading (see `manager::discover::classify_and_read`), and `O_PATH` is not
+# uniform across the architectures this target covers — `0x1000000` on sparc,
+# `0o10000000` everywhere else — so unlike the flags beside it, it cannot be
+# hardcoded.
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # Unconditional (not behind the `cli` feature): the launchd backend itself
 # needs `getpwnam`/`getpwuid`/`chown` to resolve `spec::User` to a real
