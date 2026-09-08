@@ -298,6 +298,9 @@ impl Fake {
     /// Takes effect over an already-installed `id`, which is what a
     /// permission change on a live artifact looks like.
     ///
+    /// Also the fake's seeder for `manager::conformance`'s `UNDETERMINED_ID`
+    /// — see that module's doc comment.
+    ///
     /// [`Installed::Undetermined`]: crate::manager::Installed::Undetermined
     pub fn seed_opaque(&self, id: &str) {
         let mut state = self.state.lock().expect("Fake mutex poisoned");

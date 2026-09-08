@@ -196,7 +196,10 @@ impl Drop for FileGuard {
 
 // The deliverable: conformance ========================================================================================
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+/// `UNIT_DIR_EXCLUSIVE`: seeding `UNDETERMINED_ID` puts a plist nothing can decode into the shared
+/// [`STAGING_DIR`] for the length of the run, which is exactly what the host-wide listing assertions
+/// elsewhere in this file (and `tests/cli_binary.rs`'s real `daemon list`) are about.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn launchd_passes_conformance() {
     let mgr = LaunchdManager::new();
 
@@ -216,6 +219,12 @@ fn launchd_passes_conformance() {
     let mut text = std::fs::read_to_string(&path).expect("read seeded artifact");
     text.push_str("<!-- a hand-added directive -->\n");
     write_plist(&path, &text);
+
+    // Seed `UNDETERMINED_ID`: bytes that are neither UTF-8 nor a binary plist, so nothing about
+    // the file — its marker included — is ever established. Cleaned up here, like `FOREIGN_ID`.
+    let undetermined_path = staging_path(manager::conformance::UNDETERMINED_ID);
+    write_bytes(&undetermined_path, &UNDECODABLE_PLIST);
+    let _undetermined_cleanup = FileGuard(undetermined_path);
 
     manager::conformance::run(&mgr, &sleepy);
 }

@@ -44,6 +44,12 @@ fn mk(id: &str) -> DaemonSpec {
     }
 }
 
+/// Bytes that are not UTF-8, so `classify_and_read` reaches the read and stops there: nothing about
+/// the fragment is identified, and — unlike a permission denial — root meets exactly the same wall
+/// an unprivileged caller does, which is what lets a test seed this and read it back in one elevated
+/// process. The systemd twin of `tests/launchd_integration/launchd.rs`'s `UNDECODABLE_PLIST`.
+const NON_UTF8_UNIT: [u8; 4] = [b'[', 0xff, 0xfe, b']'];
+
 fn unit_path(id: &str) -> PathBuf {
     PathBuf::from(support::SYSTEMD_UNIT_DIR).join(format!("{id}.service"))
 }
@@ -307,18 +313,25 @@ fn uninstall_via_cli(id: &str) -> (i32, String, String) {
 
 // Step 1: conformance =================================================================================================
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+/// `UNIT_DIR_EXCLUSIVE`: seeding `UNDETERMINED_ID` puts a fragment nothing can decode into the
+/// shared `/etc/systemd/system` for the length of the run, which is exactly what the host-wide
+/// listing assertions elsewhere in this file (and `tests/cli_binary.rs`'s real `daemon list`) are
+/// about.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn systemd_passes_conformance() {
     let mgr = Systemd::new();
 
-    // The two ids `conformance::run` cannot produce through the trait's own methods - see its
-    // module doc comment. `run` cleans up `HAND_EDITED_ID` itself; `FOREIGN_ID` is ours.
+    // The three ids `conformance::run` cannot produce through the trait's own methods - see its
+    // module doc comment. `run` cleans up `HAND_EDITED_ID` itself; the other two are ours.
     let foreign_guard = ServiceGuard::new(conformance::FOREIGN_ID);
     seed_foreign(foreign_guard.id());
 
     mgr.install(&mk(conformance::HAND_EDITED_ID), false)
         .expect("seed hand-edited install");
     hand_edit(conformance::HAND_EDITED_ID);
+
+    let undetermined_guard = ServiceGuard::new(conformance::UNDETERMINED_ID);
+    fs::write(unit_path(undetermined_guard.id()), NON_UTF8_UNIT).expect("seed a non-UTF-8 unit");
 
     conformance::run(&mgr, &mk);
 }
@@ -1124,7 +1137,7 @@ fn list_reports_a_non_utf8_unit_as_undetermined_instead_of_failing() {
 
     let undecodable = support::random_test_id();
     let undecodable_guard = ServiceGuard::new(&undecodable);
-    fs::write(unit_path(undecodable_guard.id()), [b'[', 0xff, 0xfe, b']']).expect("seed a non-UTF-8 unit");
+    fs::write(unit_path(undecodable_guard.id()), NON_UTF8_UNIT).expect("seed a non-UTF-8 unit");
 
     let listed = Systemd::new()
         .list()

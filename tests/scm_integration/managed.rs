@@ -73,7 +73,10 @@ fn hand_edit(id: &str) {
 
 // Step 1: conformance =================================================================================================
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+/// `UNIT_DIR_EXCLUSIVE`: seeding `UNDETERMINED_ID` denies an elevated reader one service's
+/// `Parameters` for the length of the run, which puts an aggregate entry in every concurrent
+/// `list()` — the very answer this file's host-wide assertions are about.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn scm_passes_conformance() {
     seed_foreign(conformance::FOREIGN_ID);
     let _foreign_guard = ServiceGuard::new(conformance::FOREIGN_ID);
@@ -82,6 +85,15 @@ fn scm_passes_conformance() {
     mgr.install(&conformance_mk(conformance::HAND_EDITED_ID), false)
         .expect("seed install for the hand-edit scenario");
     hand_edit(conformance::HAND_EDITED_ID);
+
+    // Seed `UNDETERMINED_ID`: install normally, then deny reading the one key that carries the
+    // marker. An explicit `Deny` ACE stops the elevated reader too (see `deny.rs`), so the read
+    // that would classify this id never completes. The deny is declared last so it is lifted
+    // before `sc delete` runs; cleanup is ours, not `run`'s.
+    let _undetermined_guard = ServiceGuard::new(conformance::UNDETERMINED_ID);
+    mgr.install(&conformance_mk(conformance::UNDETERMINED_ID), false)
+        .expect("seed install for the undetermined scenario");
+    let _undetermined_denied = Denied::parameters(conformance::UNDETERMINED_ID);
 
     conformance::run(&mgr, &conformance_mk);
 }

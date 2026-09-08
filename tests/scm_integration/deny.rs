@@ -10,6 +10,14 @@
 //! Raw `windows-sys` FFI, sanctioned here the same way `common.rs`'s SID lookup
 //! and `fixture.rs`'s SCM dispatch already are: neither `windows-service` nor
 //! `winreg` exposes any security-descriptor surface.
+//!
+//! Compiled into both `tests/scm_integration.rs` and `tests/shim_integration.rs`
+//! (by `#[path]`, as `support/mod.rs` already is), which is why the
+//! `dead_code` allow below is needed: `type: simple`'s suite denies only a
+//! `Parameters` read, so [`Denied::service_query`] and the DACL string it
+//! builds are unreferenced in that binary.
+
+#![allow(dead_code)]
 
 use std::os::windows::ffi::OsStrExt as _;
 

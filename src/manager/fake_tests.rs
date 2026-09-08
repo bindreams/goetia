@@ -28,11 +28,15 @@ fn fake_passes_conformance() {
     let fake = Fake::new();
     fake.seed_foreign(conformance::FOREIGN_ID, "some pre-existing, unrelated service\n");
     fake.install_then_hand_edit(&mk(conformance::HAND_EDITED_ID), "# hand-added directive\n");
+    // The fake's artifacts are in-memory strings and are always readable, so
+    // an unobtainable one has to be modelled rather than provoked — see
+    // `Fake::seed_opaque`.
+    fake.seed_opaque(conformance::UNDETERMINED_ID);
 
     conformance::run(&fake, &mk);
 }
 
-// Behavior the six conformance scenarios do not exercise ==============================================================
+// Behavior the conformance scenarios do not exercise ==================================================================
 
 #[skuld::test]
 fn list_excludes_foreign_entries() {
