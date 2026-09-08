@@ -63,6 +63,13 @@ impl ReadFailure {
         }
     }
 
+    /// Whether the underlying failure was the path not existing. Step 2 of
+    /// [`classify_and_read`] uses it to tell the uninstall race apart from a
+    /// genuine failure to read a file that is still there.
+    fn is_not_found(&self) -> bool {
+        self.source.kind() == io::ErrorKind::NotFound
+    }
+
     /// The operation and the path it failed on, with no claim about the id attached.
     pub(super) fn detail(&self) -> String {
         format!(
@@ -143,7 +150,17 @@ pub(super) fn classify_and_read(path: &Path) -> ReadResult<RawState> {
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
-        .map_err(|e| ReadFailure::new("open", path, e))?;
+        .map_err(|e| ReadFailure::new("open", path, e));
+    let file = match file {
+        Ok(file) => file,
+        // Gone between step 1 and step 2: the same uninstall race step 1
+        // tolerates, observed one syscall later. Absence is established, so
+        // this is `Absent` rather than a failure to determine — reporting it
+        // as undetermined would make a benign concurrent uninstall raise
+        // `list`'s host-wide exit code.
+        Err(failure) if failure.is_not_found() => return Ok(RawState::Absent),
+        Err(failure) => return Err(failure),
+    };
     let opened = file.metadata().map_err(|e| ReadFailure::new("stat", path, e))?;
     if (opened.dev(), opened.ino()) != (classified.dev(), classified.ino()) {
         return Err(ReadFailure::new(

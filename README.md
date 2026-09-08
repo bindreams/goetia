@@ -228,11 +228,13 @@ shown pretty-printed here for readability:
   "daemons": [
     { "id": "frpc", "state": "running", "enabled": true, "pid": 1234 }
   ],
-  "errors": []
+  "errors": [],
+  "undetermined": []
 }
 ```
 
-`daemons` and `errors` are **always present**, as arrays, possibly empty.
+`daemons`, `errors` and `undetermined` are **always present**, as arrays,
+possibly empty.
 
 | Key                 | Type            | Notes                                                                                                                                              |
 | ------------------- | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |

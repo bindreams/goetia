@@ -1,7 +1,7 @@
 //! The effectful half of the systemd backend: writes `/etc/systemd/system/<id>.service` and talks
 //! to `systemctl`.
 //!
-//! Six correctness obligations a systemd unit-file backend must uphold, each with its own test (see
+//! Seven correctness obligations a systemd unit-file backend must uphold, each with its own test (see
 //! `tests/systemd_integration/linux.rs` and this module's own `manager_tests.rs`):
 //!
 //! 1. **A write must not clobber something it did not classify.** `rename(2)` unconditionally

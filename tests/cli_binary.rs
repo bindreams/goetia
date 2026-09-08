@@ -71,7 +71,12 @@ stderr:
 /// `native()`'s "no backend" message, which only a genuinely unwired manager
 /// produces — the fake would also exit 0 here, so this rules out exactly the
 /// one wrong wiring this module exists to catch.
-#[skuld::test]
+/// Labelled `UNIT_DIR_EXCLUSIVE`: this runs a real `daemon list` over the
+/// host's own unit directory, and `list`'s exit code is host-wide now, so a
+/// concurrently-running test that seeds an unreadable unit would turn this
+/// `0` into a `4`. The label is the same cross-process lock the systemd
+/// integration tests take for that reason.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn native_backend_answers_list_unelevated() {
     let dir = tempfile::tempdir().unwrap();
@@ -81,6 +86,12 @@ fn native_backend_answers_list_unelevated() {
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
     assert!(!err.contains("no backend"), "stderr:\n{err}");
 }
+
+/// Shared with the systemd integration binary: any test that reads or writes
+/// the host's real unit directory takes this, because `list`'s exit code is
+/// host-wide and one unreadable unit changes it for every concurrent reader.
+#[skuld::label]
+const UNIT_DIR_EXCLUSIVE: skuld::Label;
 
 // Pure paths: no elevation, no manager ================================================================================
 
