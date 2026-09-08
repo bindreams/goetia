@@ -125,9 +125,13 @@ pub enum Installed {
     /// not open claims ownership of what may be a stranger's service;
     /// omitting it claims it does not exist.
     ///
-    /// `name` is `None` only for an entry standing for more than one id —
-    /// a backend that could not enumerate a whole directory knows a count,
-    /// not names. An entry for exactly one known id always names it.
+    /// `name` is `None` only for an entry standing for more than one id.
+    /// That happens for either of two reasons, and a caller must not assume
+    /// the first: a backend that could not enumerate at all knows a count
+    /// and no names, *or* one that enumerated fine drops the names because
+    /// one entry cannot usefully carry hundreds — which is what Windows SCM
+    /// does on an unelevated `list`, where most services deny a `Parameters`
+    /// read at once. An entry for exactly one known id always names it.
     ///
     /// What a `None` obliges of every caller: **while such an entry is
     /// present, no negative conclusion about any id is sound.** It may

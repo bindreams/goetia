@@ -305,9 +305,11 @@ impl Fake {
     }
 
     /// Test-only seeding: make `list` report one [`Installed::Undetermined`]
-    /// entry that names nobody — the shape a backend produces when one
-    /// denied read hid an unknown set of ids at once (an unelevated Windows
-    /// service enumeration, say), so it knows a count and no names.
+    /// entry that names nobody — the shape a backend produces when it cannot
+    /// usefully name what the entry stands for. Windows SCM produces it on an
+    /// unelevated `list` not because enumeration failed (it succeeds, and the
+    /// names are known) but because hundreds of services deny a `Parameters`
+    /// read at once and one entry cannot carry them all.
     ///
     /// `reason` is a complete sentence, because that is how it is rendered:
     /// there is no name to prefix it with.

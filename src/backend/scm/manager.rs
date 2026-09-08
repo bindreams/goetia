@@ -1037,11 +1037,20 @@ fn unreadable_aggregate(count: usize) -> Option<Installed> {
 }
 
 /// The text [`unreadable_aggregate`]'s entry carries: what could not be
-/// inspected, that ownership is therefore *unknown*, and the one remedy.
+/// inspected, that ownership is therefore *unknown*, and the remedy.
+///
+/// It deliberately does **not** say *why* the read failed. `list` counts
+/// every non-`NotFound` failure here, and access denial is only the common
+/// one — a corrupt hive or an `ERROR_IO_DEVICE` lands in the same count.
+/// Naming denial as the cause would assert something this never
+/// established and hand over a remedy that cannot work for the others,
+/// which is exactly what the per-id path avoids by carrying two separate
+/// recoveries. Elevation is offered as the usual remedy, not as the
+/// diagnosis.
 fn unreadable_notice(count: usize) -> String {
     let s = if count == 1 { "" } else { "s" };
     format!(
-        "{count} service{s} could not be inspected (access denied reading registry Parameters). Ownership is unknown for {}, so a Goetia daemon may be missing from this list; re-run elevated.",
+        "{count} service{s} could not be inspected (its registry Parameters could not be read). Ownership is unknown for {}, so a Goetia daemon may be missing from this list; on an unelevated run, re-running elevated is the usual remedy.",
         if count == 1 { "it" } else { "them" }
     )
 }
