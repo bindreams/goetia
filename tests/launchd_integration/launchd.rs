@@ -15,6 +15,8 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use goetia::backend::launchd::manager::{ENABLED_DIR, LaunchdManager, STAGING_DIR};
 use goetia::decide::Outcome;
@@ -169,6 +171,47 @@ impl Drop for Guard {
         match LaunchdManager::new().uninstall(&self.0) {
             Ok(()) | Err(goetia::Error::NotInstalled { .. }) => {}
             Err(e) => eprintln!("Guard[{}]: cleanup failed: {e}", self.0),
+        }
+    }
+}
+
+/// A thread `enable`ing and `disable`ing `id` — moving its plist between the two directories — for
+/// as long as this guard is held. Stopping and joining on drop is what keeps the mover from
+/// outliving the [`Guard`] that uninstalls the daemon underneath it, including when an assertion
+/// unwinds: a flag and a `join`, never a deadline.
+struct Mover {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Mover {
+    fn spawn(id: &str, moves: Arc<AtomicU64>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (id, stopped) = (id.to_string(), Arc::clone(&stop));
+        let handle = std::thread::spawn(move || {
+            let mgr = LaunchdManager::new();
+            let id = Id::try_from(id.as_str()).expect("valid id");
+            while !stopped.load(Ordering::Relaxed) {
+                mgr.enable(&id).expect("enable");
+                mgr.disable(&id).expect("disable");
+                moves.fetch_add(2, Ordering::Relaxed);
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for Mover {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take()
+            && handle.join().is_err()
+            && !std::thread::panicking()
+        {
+            panic!("the mover thread panicked");
         }
     }
 }
@@ -450,6 +493,46 @@ fn uninstall_leaves_nothing() {
     assert!(!staging_path(&id).exists(), "no plist should remain in staging");
     assert!(!enabled_path(&id).exists(), "no plist should remain in LaunchDaemons");
     assert!(!is_loaded(&id), "job must not still be loaded after uninstall");
+}
+
+/// `enable`/`disable` *move* the plist between the two directories, and `list` reads them one after
+/// the other — so a move that lands between the two passes leaves the id in neither, and a move
+/// that lands after both leaves the path a pass recorded vacant. Either one used to drop the id
+/// from the listing entirely: exit `0`, absent from `daemons`, `errors` and `undetermined` alike,
+/// for a daemon that is installed the whole time.
+///
+/// `move_no_clobber` links the destination before unlinking the source, so the plist is at one of
+/// the two paths at every instant and no single move can make the id unfindable. This asserts
+/// exactly that: whatever the mover is doing, every listing accounts for the id somehow —
+/// installed, unreadable, or undetermined — and never by omission.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn list_accounts_for_an_id_while_enable_and_disable_move_its_plist() {
+    let mgr = LaunchdManager::new();
+    let id = support::random_test_id();
+    let _guard = Guard::install(&mgr, &sleepy(&id));
+
+    let moves = Arc::new(AtomicU64::new(0));
+    let mover = Mover::spawn(&id, Arc::clone(&moves));
+
+    // A workload, not a wait: every pass checks the listing's own answer, and the mover is stopped
+    // by a flag rather than by any deadline.
+    let listings = 500;
+    for _ in 0..listings {
+        let listed = LaunchdManager::new().list().expect("list");
+        assert!(
+            may_account_for(&listed, &id),
+            "a plist being moved between {STAGING_DIR} and {ENABLED_DIR} is still installed, so \
+             leaving it out of the listing says something no scan established: {listed:?}"
+        );
+    }
+    drop(mover);
+
+    let moves = moves.load(Ordering::Relaxed);
+    assert!(
+        moves > 0,
+        "the mover has to have moved something for this to prove anything"
+    );
+    eprintln!("{listings} listings against {moves} moves");
 }
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]

@@ -288,6 +288,61 @@ impl Drop for RmDropin {
     }
 }
 
+/// The name `write::unique_quarantine_path` gives a fragment while it is being replaced. Spelled
+/// out rather than called, because it is private to the backend — production's own writer and
+/// reader are tied together by
+/// `src/backend/systemd/manager_tests.rs::a_quarantined_fragment_names_the_id_whose_fragment_it_is`,
+/// and this is the shape both of them agree on.
+fn quarantine_path(id: &str) -> PathBuf {
+    PathBuf::from(support::SYSTEMD_UNIT_DIR).join(format!(
+        ".{id}.service.goetia-quarantine.{pid:x}-0",
+        pid = std::process::id()
+    ))
+}
+
+/// A thread moving `id`'s fragment to its quarantine name and back for as long as this guard is
+/// held — `write::replace_unit_verified`'s own two `rename`s, and the only part of an `install` the
+/// racing reader can tell apart. Stopping and joining on drop is what keeps it from outliving the
+/// [`ServiceGuard`] that uninstalls the daemon underneath it, including when an assertion unwinds:
+/// a flag and a `join`, never a deadline.
+struct Requarantiner {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Requarantiner {
+    fn spawn(id: &str, cycles: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+        use std::sync::atomic::Ordering;
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (fragment, quarantine) = (unit_path(id), quarantine_path(id));
+        let stopped = std::sync::Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            while !stopped.load(Ordering::Relaxed) {
+                fs::rename(&fragment, &quarantine).expect("quarantine the fragment");
+                fs::rename(&quarantine, &fragment).expect("put the fragment back");
+                cycles.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for Requarantiner {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take()
+            && handle.join().is_err()
+            && !std::thread::panicking()
+        {
+            panic!("the writer thread panicked");
+        }
+    }
+}
+
 /// RAII removal of a single path, symlink included — `remove_file` unlinks a symlink rather than
 /// following it, which is what the dangling `.wants` link the residue tests plant needs.
 struct RmPath(PathBuf);
@@ -569,6 +624,95 @@ fn install_refuses_a_stray_enablement_link_with_no_fragment() {
         "adopting it would enroll the new daemon at boot without anyone asking, got {outcome:?}"
     );
     assert!(!unit_path(guard.id()).exists(), "no fragment must be written");
+}
+
+/// The name an installed fragment has for the whole of a routine update: `replace_unit_verified`
+/// renames `<id>.service` out of the way and re-creates it only after the replacement is written,
+/// chmod'd and fsync'd. For that stretch the id has no `<id>.service` — and reading that as "not
+/// installed" is what made `list` omit the id (exit `0`, in neither `errors` nor `undetermined`),
+/// `show` call it absent, and `uninstall` answer "nothing to do" for a daemon whose content is
+/// sitting right there under the quarantine name.
+///
+/// Seeded directly rather than raced, so the state is the one under test on every run; the race
+/// that produces it is `list_accounts_for_an_id_whose_fragment_install_is_replacing`.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_quarantined_fragment_is_not_an_absent_id() {
+    let id = support::random_test_id();
+    let quarantine = quarantine_path(&id);
+    fs::write(&quarantine, "[Unit]\n").expect("seed a quarantined fragment");
+    let _cleanup = RmPath(quarantine.clone());
+    assert!(!unit_path(&id).exists(), "the fragment is what this state lacks");
+
+    let listed = Systemd::new().list().expect("list");
+    match listed
+        .iter()
+        .find(|e| matches!(e, Installed::Undetermined { name: Some(name), .. } if name == &id))
+    {
+        Some(Installed::Undetermined { reason, .. }) => assert!(
+            reason.contains(&quarantine.display().to_string()),
+            "the entry must name what it found: {reason}"
+        ),
+        _ => panic!("an id whose fragment is mid-replacement is not one this listing settled: {listed:?}"),
+    }
+
+    // The verbs answer the same state the same way, or the listing says one thing while `status`
+    // says another about one host.
+    let err = Systemd::new()
+        .status(&Id::try_from(id.clone()).expect("valid id"))
+        .expect_err("nothing about this id was classified");
+    assert!(matches!(err, goetia::Error::Undetermined { .. }), "{err:?}");
+
+    let (code, out, err) = uninstall_via_cli(&id);
+    assert_ne!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(!out.contains("not installed (nothing to do)"), "{out}");
+}
+
+/// The same state, produced by a racing writer rather than seeded: whatever is happening to the
+/// fragment, every listing has to account for the id — installed, unreadable or undetermined — and
+/// never by leaving it out.
+///
+/// The writer here is the pair of `rename`s `write::replace_unit_verified` performs, not a whole
+/// `install`. A real `install` was measured first and is useless as a probe: 60 listings against 60
+/// real fragment replacements landed inside the quarantine window *zero* times, because a
+/// `daemon-reload` and a `systemctl show` per unit dwarf the window itself. The two renames put the
+/// unit directory into exactly the states that window has, at a rate a listing can actually sample.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn list_accounts_for_an_id_whose_fragment_a_writer_is_replacing() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    Systemd::new().install(&mk(guard.id()), false).expect("install");
+
+    let updates = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let updater = Requarantiner::spawn(guard.id(), std::sync::Arc::clone(&updates));
+
+    // A workload, not a wait: every pass checks the listing's own answer, and the updater is
+    // stopped by a flag rather than by any deadline.
+    let listings = 60;
+    let mut caught_mid_update = 0;
+    for _ in 0..listings {
+        let listed = Systemd::new().list().expect("list");
+        assert!(
+            may_account_for(&listed, guard.id()),
+            "a fragment being replaced is still installed, so leaving the id out of the listing \
+             says something no scan established: {listed:?}"
+        );
+        if listed
+            .iter()
+            .any(|e| matches!(e, Installed::Undetermined { name: Some(name), .. } if name == guard.id()))
+        {
+            caught_mid_update += 1;
+        }
+    }
+    drop(updater);
+
+    let updates = updates.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        updates > 0,
+        "the writer has to have moved the fragment for this to prove anything"
+    );
+    eprintln!(
+        "{listings} listings against {updates} quarantine cycles, {caught_mid_update} of them landing inside one"
+    );
 }
 
 /// The read-only verb has to agree too, or `status` calls the id empty while `install` calls it

@@ -52,12 +52,17 @@
 //!    [`Error::NotInstalled`] — and only that variant — to exit `0` and "nothing to do", so a
 //!    backend reporting it off `<id>.service`'s absence alone would certify "confirmed gone" for an
 //!    id systemd still applies a drop-in to, or still enrolls at boot through a
-//!    `multi-user.target.wants` link. `discover::residue` is the one predicate both `install`'s
-//!    `discover` and every other verb's `require_installed`/`status` ask, so no two verbs can
-//!    describe one filesystem state differently — `list` included, which asks it (through
-//!    `discover::residue_read`) of every id it enumerates with no readable fragment. A listing that
-//!    asked less would leave out an id `status` answers `Error::Undetermined` for, and leaving an
-//!    id out is how a listing says nothing is there.
+//!    `multi-user.target.wants` link. `discover::fragmentless` is the one predicate every reporting
+//!    verb's `require_installed`/`status` asks, so no two of them can describe one filesystem state
+//!    differently — `list` included, which asks it of every id it enumerates with no readable
+//!    fragment. A listing that asked less would leave out an id `status` answers
+//!    `Error::Undetermined` for, and leaving an id out is how a listing says nothing is there.
+//!
+//!    A *vacant* fragment path is not an absent id either, which is the same obligation one race
+//!    down: `write::replace_unit_verified` renames the fragment to a quarantine sibling and only
+//!    re-creates it after the replacement is written and fsync'd, so `<id>.service` is genuinely
+//!    missing for the length of every routine update. `discover::fragmentless` re-asks
+//!    [`UNIT_DIR`] for both names before anything concludes absence from one of them.
 
 mod dirs;
 mod discover;
@@ -297,10 +302,10 @@ impl ServiceManager for Systemd {
                 // directory, bytes that are not UTF-8): obligations 2 and 3, and foreign entries
                 // are what `list` omits.
                 Ok(RawState::NotOurs) => continue,
-                // Gone between the scan and the open. That settles the *fragment*, not the id —
-                // obligation 7 — so it takes the same question every other fragmentless id gets.
+                // Vacant between the scan and the open. That settles the *path*, not the id —
+                // obligation 7 — so it takes the same re-ask every other fragmentless id gets.
                 Ok(RawState::Absent) => {
-                    out.extend(residue_entry(id));
+                    out.extend(fragmentless_entry(id));
                     continue;
                 }
                 // A read that did not complete establishes nothing about the id — least of all that
@@ -339,10 +344,11 @@ impl ServiceManager for Systemd {
             }
         }
         // The ids with no fragment of their own. Obligation 7 again: what occupies an id is not the
-        // fragment file, so an id whose *drop-in* could not be read is exactly as unclassified as
-        // one whose fragment could not be — and `status` says so for both.
-        for id in &scan.dropin_only {
-            out.extend(residue_entry(id));
+        // fragment file, so an id whose *drop-in* could not be read — or whose fragment the scan
+        // caught mid-replacement, under its quarantine name — is exactly as unclassified as one
+        // whose fragment could not be, and `status` says so for all three.
+        for id in &scan.fragmentless {
+            out.extend(fragmentless_entry(id));
         }
         // Last, so a scan that got some way in still reports what it named before what it could
         // not — the order `cli::support::partition_installed` imposes on the rendered output too.
@@ -351,15 +357,19 @@ impl ServiceManager for Systemd {
     }
 }
 
-/// What `list` reports for an id with no readable fragment. Both determinate outcomes are reported
-/// by omission, which is why what the scan found is discarded: no residue is an unoccupied id, and
+/// What `list` reports for an id with no readable fragment, from the re-ask `status` answers off:
+/// both determinate outcomes are reported by omission — nothing at the id is an unoccupied one, and
 /// residue under an absent fragment is `Ownership::Foreign`, which `list` leaves out like any other
-/// foreign id. Only a read that did not complete gets an entry, because omission would claim it.
-fn residue_entry(id: &str) -> Option<Installed> {
-    discover::residue_read(id).err().map(|failure| Installed::Undetermined {
-        name: Some(id.to_string()),
-        reason: failure.detail(),
-    })
+/// foreign id — and only an id that stayed unclassified gets an entry, because omission would claim
+/// it absent.
+fn fragmentless_entry(id: &str) -> Option<Installed> {
+    match discover::fragmentless(id) {
+        discover::Fragmentless::Unoccupied | discover::Fragmentless::Residue(_) => None,
+        discover::Fragmentless::Unsettled(unsettled) => Some(Installed::Undetermined {
+            name: Some(id.to_string()),
+            reason: unsettled.detail(),
+        }),
+    }
 }
 
 // Enumeration =========================================================================================================
@@ -369,43 +379,49 @@ fn residue_entry(id: &str) -> Option<Installed> {
 ///
 /// # Which ids those are
 ///
-/// The same two names `discover` calls this id's artifact, asked of the same directories `discover`
+/// The same names `discover` calls this id's artifact, asked of the same directories `discover`
 /// asks: `<id>.service` in [`UNIT_DIR`] alone, the only fragment path this backend ever reads or
 /// writes, and `<id>.service.d` under every root of [`DROPIN_SEARCH_DIRS`], since
-/// `discover::residue` counts one there as much as one in `/etc`.
+/// `discover::residue` counts one there as much as one in `/etc`. Plus the name that *is* the
+/// fragment while it is being replaced: a `write::quarantine_prefix` sibling in `UNIT_DIR`. An id
+/// caught mid-`install` has no `<id>.service` for this pass to see, and naming nothing for it is
+/// how the listing would say it is not installed.
 ///
-/// Reaching exactly as far as `residue` is the point. An id whose drop-in could not be read is
-/// `Error::Undetermined` to `status`; a listing that never enumerated it says, by leaving it out,
-/// that nothing is installed there — the negative conclusion [`Installed::Undetermined`] exists to
-/// forbid. That still bounds the scan well short of the unit load path: only directory *names* come
-/// out of each root, and only the ids they name are asked about.
+/// Reaching exactly as far as `discover::fragmentless` is the point. An id whose drop-in could not
+/// be read is `Error::Undetermined` to `status`; a listing that never enumerated it says, by
+/// leaving it out, that nothing is installed there — the negative conclusion
+/// [`Installed::Undetermined`] exists to forbid. That still bounds the scan well short of the unit
+/// load path: only directory *names* come out of each root, and only the ids they name are asked
+/// about.
 ///
 /// A fragment under a root other than `UNIT_DIR` deliberately names no id here. `raw_state` looks
 /// for `<id>.service` in `UNIT_DIR` and nowhere else, so a unit shipped in `/usr/lib` is already
 /// `NotInstalled` to every verb goetia has.
 ///
-/// # The half of `residue` this does not name: enablement links
+/// # The half of `residue` this cannot name: enablement links
 ///
 /// `residue` also stats `multi-user.target.wants/<id>.service` under four roots, and an id whose
-/// *only* trace is such a link is not named here. A stated limitation: an unsearchable wants
-/// directory makes `status` answer `Error::Undetermined` for every fragmentless id, this scan has
-/// no name for one whose sole trace was a link there, and `show` would call that id absent.
+/// *only* trace is such a link is still not named here. Enumerating those directories would ask
+/// `residue` about every unit enabled on the host, all foreign by construction, which is the sweep
+/// this bound exists to avoid — and where the stats succeed, an id with a link and nothing else is
+/// `Ownership::Foreign`, which `list` omits by design anyway.
 ///
-/// Both ways of closing it are worse than the hole. A readability probe of each wants directory
-/// answers a *different* question than `residue` asks — mode `0111` denies `read_dir` while every
-/// stat `residue` performs succeeds — so it would stand a permanent aggregate entry, and a
-/// permanent exit `4`, on a host where nothing goetia reads fails. Enumerating their contents
-/// instead asks `residue` about every unit enabled on the host, all foreign by construction, which
-/// is the sweep this bound exists to avoid. The drop-in half needs neither: a handful of directories
-/// name themselves in their own parent's listing, rather than one per enabled unit.
+/// What is not left to that argument is the case where the stats *do not* succeed. There, `status`
+/// answers `Error::Undetermined` for every fragmentless id while a listing that never stat'd
+/// anything reports a clean, empty `undetermined` — and a consumer following the documented rule
+/// (an empty `undetermined` is what licenses reading a missing id as uninstalled) draws exactly the
+/// negative the code cannot support. [`probe_wants_dirs`] closes that: one stat per root, of the
+/// same kind `residue` performs, standing an aggregate entry only when the read `residue` itself
+/// depends on is the one that fails.
 #[derive(Debug)]
 struct HostScan {
     /// Ids with a fragment in [`UNIT_DIR`], with its path.
     units: Vec<(String, PathBuf)>,
-    /// Ids named only by a `<id>.service.d` directory. Disjoint from `units` by construction: an id
-    /// with a fragment is classified through that, and one entry per id is what
+    /// Ids named by something other than a fragment: a `<id>.service.d` directory under any search
+    /// root, or a quarantined fragment in [`UNIT_DIR`]. Disjoint from `units` by construction: an
+    /// id with a fragment is classified through that, and one entry per id is what
     /// `cli::support::partition_installed` asserts.
-    dropin_only: Vec<String>,
+    fragmentless: Vec<String>,
     /// One per pass that started and did not finish — a root each, since a root that could not be
     /// enumerated says nothing about the next one.
     incomplete: Vec<Installed>,
@@ -415,26 +431,69 @@ struct HostScan {
 fn scan_host() -> HostScan {
     let unit_dir = scan_unit_dir(Path::new(UNIT_DIR));
     let mut incomplete: Vec<Installed> = unit_dir.incomplete.into_iter().collect();
-    let mut dropin_ids: BTreeSet<String> = unit_dir.dropins.into_iter().collect();
+    let mut named: BTreeSet<String> = unit_dir.dropins.into_iter().chain(unit_dir.quarantined).collect();
     for root in DROPIN_SEARCH_DIRS.iter().filter(|root| **root != UNIT_DIR) {
         let scan = scan_unit_dir(Path::new(root));
-        // Fragments outside `UNIT_DIR` are not this backend's — see [`HostScan`].
-        dropin_ids.extend(scan.dropins);
+        // Fragments outside `UNIT_DIR` are not this backend's, and a quarantine is only ever
+        // written into `UNIT_DIR` — see [`HostScan`].
+        named.extend(scan.dropins);
         incomplete.extend(scan.incomplete);
     }
-    let dropin_only = {
+    let fragmentless = {
         let with_fragment: BTreeSet<&str> = unit_dir.units.iter().map(|(id, _)| id.as_str()).collect();
-        dropin_ids
+        named
             .into_iter()
             .filter(|id| !with_fragment.contains(id.as_str()))
             .collect()
     };
+    incomplete.extend(probe_wants_dirs());
     HostScan {
         units: unit_dir.units,
-        dropin_only,
+        fragmentless,
         incomplete,
     }
 }
+
+/// One stat per enablement-link root, of a name that is not there: `residue`'s own question, asked
+/// once for the whole host instead of once per id, and answered by the same syscall.
+///
+/// This is the [`HostScan`] doc comment's last gap. It is deliberately *not* a readability probe —
+/// a `read_dir` would answer a different question than `residue` asks, denying a mode-`0111`
+/// directory that every stat `residue` performs succeeds in, and would stand a permanent aggregate
+/// entry and a permanent exit `4` on a host where nothing goetia reads fails. `ENOENT` (the usual
+/// answer, and the one an absent root gives) establishes that this root holds no link for the
+/// probed name and would have answered for any other; only a stat that did not *complete* leaves
+/// every id's enablement link unread, and that is what gets an entry.
+fn probe_wants_dirs() -> Vec<Installed> {
+    wants_probe(discover::wants_dirs())
+}
+
+/// The probe itself, over the directories rather than [`discover::wants_dirs`] directly — which is
+/// what makes the failing half reachable from a test, since the real roots answer for the host the
+/// tests run on.
+fn wants_probe(dirs: impl Iterator<Item = PathBuf>) -> Vec<Installed> {
+    dirs.filter_map(|dir| {
+        let probe = dir.join(PROBE_LINK);
+        match fs::symlink_metadata(&probe) {
+            Ok(_) => None,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => Some(Installed::scan_incomplete(
+                &dir.display().to_string(),
+                &format!(
+                    "the stat every id's enablement link there needs did not complete: failed to \
+                     stat {probe}: {e}",
+                    probe = probe.display()
+                ),
+            )),
+        }
+    })
+    .collect()
+}
+
+/// The name [`probe_wants_dirs`] stats. Which name it is does not matter — every answer but a
+/// failure means the stat completed — so it is one that says what it is if it ever shows up in a
+/// strace.
+const PROBE_LINK: &str = ".goetia-probe.service";
 
 /// What one pass over one directory found: the `<id>.service` fragments and `<id>.service.d`
 /// drop-in directories it reached, and — when the pass stopped early — the entry standing for
@@ -443,6 +502,10 @@ fn scan_host() -> HostScan {
 struct UnitScan {
     units: Vec<(String, PathBuf)>,
     dropins: Vec<String>,
+    /// Ids named by a `write::quarantine_prefix` sibling: an `install` replacing this id's fragment
+    /// has it renamed out of the way right now, or an interrupted one left it there. Meaningful in
+    /// [`UNIT_DIR`] only, which is the sole directory goetia writes one into.
+    quarantined: Vec<String>,
     incomplete: Option<Installed>,
 }
 
@@ -460,11 +523,13 @@ fn scan_unit_dir(dir: &Path) -> UnitScan {
         Err(e) if e.kind() == io::ErrorKind::NotFound => UnitScan {
             units: Vec::new(),
             dropins: Vec::new(),
+            quarantined: Vec::new(),
             incomplete: None,
         },
         Err(e) => UnitScan {
             units: Vec::new(),
             dropins: Vec::new(),
+            quarantined: Vec::new(),
             incomplete: Some(Installed::scan_incomplete(
                 &dir.display().to_string(),
                 &format!("failed to read directory: {e}"),
@@ -480,6 +545,7 @@ fn scan_unit_dir(dir: &Path) -> UnitScan {
 fn collect_units(dir: &Path, entries: impl Iterator<Item = io::Result<PathBuf>>) -> UnitScan {
     let mut units = Vec::new();
     let mut dropins = Vec::new();
+    let mut quarantined = Vec::new();
     for entry in entries {
         let path = match entry {
             Ok(path) => path,
@@ -487,6 +553,7 @@ fn collect_units(dir: &Path, entries: impl Iterator<Item = io::Result<PathBuf>>)
                 return UnitScan {
                     units,
                     dropins,
+                    quarantined,
                     incomplete: Some(Installed::scan_incomplete(
                         &dir.display().to_string(),
                         &format!("failed to read a directory entry: {e}"),
@@ -506,6 +573,12 @@ fn collect_units(dir: &Path, entries: impl Iterator<Item = io::Result<PathBuf>>)
             dropins.push(id.to_string());
             continue;
         }
+        // A quarantine name ends in neither suffix: it is the fragment's own name with a private
+        // prefix and a per-attempt suffix around it, and the id it stands for is in the middle.
+        if let Some(id) = write::quarantined_id(&file_name) {
+            quarantined.push(id.to_string());
+            continue;
+        }
         let Some(id) = file_name.strip_suffix(".service") else {
             continue;
         };
@@ -514,6 +587,7 @@ fn collect_units(dir: &Path, entries: impl Iterator<Item = io::Result<PathBuf>>)
     UnitScan {
         units,
         dropins,
+        quarantined,
         incomplete: None,
     }
 }

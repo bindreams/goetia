@@ -363,14 +363,15 @@ fn a_dangling_symlink_is_not_absence() {
 
 // read_artifact =======================================================================================================
 
+/// A vacant path is not an absent id, so `NotInstalled` here is the *re-ask*'s answer, not this
+/// path's: the id is one no `install` ever ran for, so `located` finds it in neither directory.
 #[skuld::test]
 fn read_artifact_maps_a_vanished_plist_to_not_installed() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = tmp.path().join("gone.plist");
+    let id = format!("goetia-manager-unit-test-vanished-{}", std::process::id());
 
-    // `locate` stat'd it and the read no longer finds it: an uninstall that completed between the
-    // two syscalls. Absence is the truth about the id, so this is not a failure to determine.
-    let err = read_artifact(&path, "gone").expect_err("a missing artifact is not readable");
+    let err = read_artifact(&path, &id).expect_err("a missing artifact is not readable");
     assert!(matches!(err, Error::NotInstalled { .. }), "{err}");
 }
 
@@ -491,7 +492,7 @@ fn a_dirent_that_cannot_be_read_keeps_what_the_scan_already_named() {
     let scan = collect_plists(ENABLED_DIR, entries.into_iter());
 
     assert_eq!(
-        scan.plists.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        scan.ids,
         ["named-before-the-fault"],
         "what the pass named before the fault survives it, and the pass stops there: {scan:?}"
     );
@@ -521,7 +522,7 @@ fn a_plist_directory_that_cannot_be_opened_is_reported_not_propagated() {
 
     let scan = scan_plists(&dir.to_string_lossy());
 
-    assert!(scan.plists.is_empty(), "nothing was enumerated: {scan:?}");
+    assert!(scan.ids.is_empty(), "nothing was enumerated: {scan:?}");
     assert!(
         matches!(&scan.incomplete, Some(Installed::Undetermined { name: None, .. })),
         "{scan:?}"
@@ -537,7 +538,7 @@ fn an_absent_directory_is_an_empty_scan_not_a_failure() {
 
     let scan = scan_plists(&tmp.path().join("nowhere").to_string_lossy());
 
-    assert!(scan.plists.is_empty(), "{scan:?}");
+    assert!(scan.ids.is_empty(), "{scan:?}");
     assert!(
         scan.incomplete.is_none(),
         "an absent directory answers the question rather than leaving it open: {scan:?}"
@@ -552,11 +553,7 @@ fn a_pass_that_finishes_names_every_plist_and_nothing_else() {
 
     let scan = scan_plists(&tmp.path().to_string_lossy());
 
-    assert_eq!(
-        scan.plists.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
-        ["kept"],
-        "{scan:?}"
-    );
+    assert_eq!(scan.ids, ["kept"], "{scan:?}");
     assert!(
         scan.incomplete.is_none(),
         "a pass that finished has nothing to report: {scan:?}"

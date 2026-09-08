@@ -319,6 +319,14 @@ pub(super) struct Discovery {
 
 pub(super) fn discover(id: &str) -> Result<Discovery> {
     match raw_state(id)? {
+        // [`residue`], deliberately, and not the [`fragmentless`] re-ask every *reporting* verb
+        // takes. This one is not a report but the question "what may this write land on", and
+        // `super::write::create_unit`'s `persist_noclobber` answers a concurrent write by refusing
+        // and re-discovering (`CreateOutcome::Raced`) rather than by claiming anything — so
+        // refusing here instead would replace a self-correcting retry with an exit `4`, and would
+        // make an install permanently impossible at an id where an interrupted one left a
+        // quarantined fragment behind. Nothing negative is concluded either way: an `install` that
+        // creates the fragment makes every verb agree again on its next call.
         RawState::Absent => match residue(id).map_err(|failure| failure.undetermined(id))? {
             None => Ok(Discovery {
                 ownership: Ownership::Absent,
@@ -590,10 +598,18 @@ const WANTS_SEARCH_DIRS: [&str; 4] = [
     "/usr/lib/systemd/system",
 ];
 
+/// Every `multi-user.target.wants` directory [`residue`] stats a link in — for it, and for the one
+/// caller that has to ask about those directories with no id in hand:
+/// `super::probe_wants_dirs`, which stands `Systemd::list`'s aggregate for them. One list, so the
+/// per-id stat and the host-wide probe cannot end up asking about different directories.
+pub(super) fn wants_dirs() -> impl Iterator<Item = PathBuf> {
+    WANTS_SEARCH_DIRS.iter().map(|root| Path::new(root).join(WANTS_DIR))
+}
+
 /// Everything goetia-attributable that systemd keeps applying at `id` after the fragment itself is
 /// gone: a `<id>.service.d/*.conf` drop-in, and a `multi-user.target.wants/<id>.service` link that
 /// still enrolls the id at boot. Consulted only where [`raw_state`] found no fragment.
-struct Residue {
+pub(super) struct Residue {
     /// Each drop-in directory holding at least one `*.conf`, with that directory's marker text.
     dropin: Vec<(PathBuf, String)>,
     links: Vec<PathBuf>,
@@ -625,7 +641,7 @@ impl Residue {
 /// [`ReadFailure`] when a read this answer depends on did not complete. What that failure *means*
 /// stays the caller's, as everywhere else in this module: [`Error::Undetermined`] for the verbs
 /// (see [`undetermined`]), a named `Installed::Undetermined` entry for `Systemd::list` (see
-/// [`residue_read`]).
+/// [`fragmentless`]).
 ///
 /// The single source of "is this id really empty" for both [`discover`] (so `install` never
 /// silently adopts what it did not write) and [`require_installed`] (so `uninstall` never reports
@@ -636,8 +652,8 @@ impl Residue {
 fn residue(id: &str) -> ReadResult<Option<Residue>> {
     let dropin = dropin_dirs(id)?;
     let mut links = Vec::new();
-    for search_dir in WANTS_SEARCH_DIRS {
-        let link = Path::new(search_dir).join(WANTS_DIR).join(format!("{id}.service"));
+    for wants_dir in wants_dirs() {
+        let link = wants_dir.join(format!("{id}.service"));
         // `symlink_metadata`, never `metadata`: the leftover this exists to catch is precisely a
         // symlink whose target — the fragment — is already gone, which `metadata` reports as absent.
         match fs::symlink_metadata(&link) {
@@ -652,33 +668,123 @@ fn residue(id: &str) -> ReadResult<Option<Residue>> {
     Ok(Some(Residue { dropin, links }))
 }
 
-/// The [`residue`] reads on their own, for `Systemd::list`: `Err` exactly when what would have
-/// settled whether anything occupies `id` did not complete.
+// Fragmentless / fragmentless_entry ===================================================================================
+
+/// What is at an id whose `<id>.service` came up absent — the one answer `status`, `uninstall` and
+/// `list` all take, so none of them can call an id absent that another calls occupied.
+pub(super) enum Fragmentless {
+    /// Nothing goetia-attributable anywhere: absence of the *id*, established.
+    Unoccupied,
+    /// Residue with no fragment. `Ownership::Foreign` to every verb, and omitted by `list` like any
+    /// other foreign id.
+    Residue(Residue),
+    /// Neither: the id is occupied by something this call did not classify, or a read that would
+    /// have settled it did not complete. See [`Unsettled`].
+    Unsettled(Unsettled),
+}
+
+/// Why a fragmentless id went unclassified, in the two forms that are not a claim about it.
+pub(super) enum Unsettled {
+    /// A read did not complete.
+    Read(ReadFailure),
+    /// The re-ask below found the id occupied after all — `<id>.service` at its own path, or
+    /// goetia's own replace holding it under a quarantine name — and did not classify what it
+    /// found, which is what a name alone cannot do.
+    Occupied(PathBuf),
+}
+
+impl Unsettled {
+    /// The facts, with no claim about the id attached — `Systemd::list`'s entry text.
+    pub(super) fn detail(&self) -> String {
+        match self {
+            Unsettled::Read(failure) => failure.detail(),
+            Unsettled::Occupied(path) => format!(
+                "{path} occupies this id in {UNIT_DIR}, and no read classified it",
+                path = path.display()
+            ),
+        }
+    }
+
+    /// The same, as the error the verbs answer with.
+    fn into_error(self, id: &str) -> Error {
+        match self {
+            Unsettled::Read(failure) => failure.undetermined(id),
+            Unsettled::Occupied(_) => Error::Undetermined {
+                id: id.to_string(),
+                reason: self.detail(),
+                recovery: format!(
+                    "re-run: `{id}` was being written when goetia looked. If that persists, the \
+                     quarantined fragment named above is one an interrupted install left behind — \
+                     move it back to {UNIT_DIR}/{id}.service, or remove it, by hand"
+                ),
+            },
+        }
+    }
+}
+
+/// **Ask the id, not a path.** `<id>.service` being vacant settles that path at that instant and
+/// nothing more: `super::write::replace_unit_verified` *renames* the fragment to a quarantine
+/// sibling and only re-creates it once the replacement is written, chmod'd and fsync'd, so the
+/// fragment is at one of those two names at every instant of a routine `install` over an installed
+/// daemon. Reading a vacant fragment path as an absent id is how `list` came to omit one mid-update
+/// — exit `0`, and the id in neither `errors` nor `undetermined` — and how `uninstall` came to
+/// answer "nothing to do" for it.
 ///
-/// What the scan *found* is not `list`'s business — residue under an absent fragment is
-/// `Ownership::Foreign` (see [`discover`]), and `list` omits foreign ids the same as it omits an
-/// unoccupied one. The *failure* is, and for the reason the whole class exists: leaving the id out
-/// of the enumeration is how a listing says it is not there, and this read established no such
-/// thing. `Systemd::status` answers [`Error::Undetermined`] off the identical failure, so this is
-/// also what keeps the two from describing one filesystem state differently.
-pub(super) fn residue_read(id: &str) -> ReadResult<()> {
-    residue(id).map(drop)
+/// So the re-ask is one `read_dir` of [`UNIT_DIR`], covering both names at once, before [`residue`]
+/// is consulted at all. Its own residual, stated exactly: a replace whose *entire* cycle — the
+/// quarantine rename, the write, and the re-creation — falls inside that one pass can leave neither
+/// name present for the whole of it, and `readdir` promises only the entries that were. Closing
+/// that needs the writers and the readers to share a lock, which this backend does not have.
+pub(super) fn fragmentless(id: &str) -> Fragmentless {
+    match occupant_named_in_unit_dir(id) {
+        Ok(Some(path)) => return Fragmentless::Unsettled(Unsettled::Occupied(path)),
+        Ok(None) => {}
+        Err(failure) => return Fragmentless::Unsettled(Unsettled::Read(failure)),
+    }
+    match residue(id) {
+        Ok(None) => Fragmentless::Unoccupied,
+        Ok(Some(residue)) => Fragmentless::Residue(residue),
+        Err(failure) => Fragmentless::Unsettled(Unsettled::Read(failure)),
+    }
+}
+
+/// The re-ask itself: whichever of `<id>.service` and its quarantine siblings [`UNIT_DIR`] holds
+/// now. A name, never a classification — what is under it is exactly what this call did not
+/// establish.
+fn occupant_named_in_unit_dir(id: &str) -> ReadResult<Option<PathBuf>> {
+    let dir = Path::new(UNIT_DIR);
+    let fragment = super::unit_name(id);
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // Nothing can be at a path whose directory is not there.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(ReadFailure::new("enumerate", dir, e)),
+    };
+    for entry in entries {
+        let name = entry.map_err(|e| ReadFailure::new("enumerate", dir, e))?.file_name();
+        let name = name.to_string_lossy();
+        if name == fragment || super::write::quarantined_id(&name) == Some(id) {
+            return Ok(Some(dir.join(name.as_ref())));
+        }
+    }
+    Ok(None)
 }
 
 /// The error for an id whose fragment [`raw_state`] found absent: [`Error::NotInstalled`] only when
-/// nothing goetia-attributable is there at all, [`Error::Foreign`] otherwise — or, when the scan
-/// itself could not be completed, [`residue`]'s own [`Error::Undetermined`], which claims neither.
-/// Every verb that has to
+/// nothing goetia-attributable is there at all, [`Error::Foreign`] otherwise — or, when what would
+/// have settled that did not complete or was still moving, [`Error::Undetermined`], which claims
+/// neither. Every verb that has to
 /// answer "is anything at this id" — [`require_installed`] for the mutating ones, `Systemd::status`
-/// for the read-only one — goes through here, so none of them can disagree with [`discover`] about
-/// one filesystem state.
+/// for the read-only one — goes through here, so none of them can disagree with [`fragmentless`]
+/// about one filesystem state.
 pub(super) fn absent_error(id: &str) -> Result<Error> {
-    Ok(match residue(id).map_err(|failure| failure.undetermined(id))? {
-        None => Error::NotInstalled { id: id.to_string() },
-        Some(residue) => Error::Foreign {
+    Ok(match fragmentless(id) {
+        Fragmentless::Unoccupied => Error::NotInstalled { id: id.to_string() },
+        Fragmentless::Residue(residue) => Error::Foreign {
             id: id.to_string(),
             recovery: residue_recovery(id, &residue),
         },
+        Fragmentless::Unsettled(unsettled) => unsettled.into_error(id),
     })
 }
 

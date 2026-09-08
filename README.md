@@ -496,6 +496,18 @@ registry scan that stops part-way keeps everything it had already classified
 and adds one unnamed `undetermined` entry for whatever it never reached,
 instead of failing the whole listing.
 
+**A vacant path is not an absent id.** goetia's own writes move artifacts:
+`enable`/`disable` move a launchd plist between two directories, and an
+`install` over an installed systemd daemon renames the fragment aside while
+it writes the replacement. Each keeps the artifact at one of its two names at
+every instant, so a name a scan recorded and a read then found empty is
+**asked again** — over every name the id can occupy — and only a re-ask that
+finds nothing anywhere omits it. The residual, stated rather than implied:
+against _two_ complete moves straddling one re-ask, no finite number of stats
+settles the question, because goetia's readers and its writers share no lock.
+A single concurrent operation cannot hide an id; a sustained storm of them
+can, and each backend's own doc comment says where.
+
 **The rule that follows, and it is the whole point:** while an entry is
 present in `undetermined`, no negative conclusion about any id is sound. An
 entry with a `null` name is one entry standing for many ids, so it may stand
@@ -525,7 +537,13 @@ Per platform:
   named, **with no fragment at all** — that read is what would have told
   goetia whether anything occupies the id, so `status` and `list` answer it
   identically instead of one saying "cannot determine" while the other
-  leaves the id out.
+  leaves the id out. A fragment that is absent only because an `install` has
+  it renamed aside mid-update is the same answer again: named, and
+  `undetermined` rather than omitted. And a
+  `multi-user.target.wants` directory those same reads cannot stat in stands
+  one unnamed entry for the whole host, since it is exactly the read that
+  would have told goetia whether an id it has no other name for is enrolled
+  at boot.
 - **launchd** — a plist whose bytes could not be **obtained** is reported as
   `undetermined`, named. Bytes that were obtained and are not UTF-8 XML are
   foreign and omitted, per the same rule — a binary plist (`bplist00`, what
@@ -543,7 +561,9 @@ Per platform:
   rather than a name, deliberately, since a listing can deny hundreds of
   reads and one entry cannot carry their names; that is why the `null`-name
   rule above exists at all. For exactly one it **names that service**, and
-  its `reason` is about that service rather than about the host, so a
+  its `reason` is about that service rather than about the host — the
+  registry path, the operation and the OS error that read failed with, the
+  same facts `status` would report for it — so a
   `name == null` assertion written from the aggregate case is wrong on a
   host where exactly one read was denied.
 

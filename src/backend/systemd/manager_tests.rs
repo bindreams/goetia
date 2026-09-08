@@ -409,9 +409,78 @@ fn a_pass_that_finishes_names_every_fragment_and_drop_in_and_nothing_else() {
         "{scan:?}"
     );
     assert_eq!(scan.dropins, ["kept"], "{scan:?}");
+    assert!(scan.quarantined.is_empty(), "{scan:?}");
     assert!(
         scan.incomplete.is_none(),
         "a pass that finished has nothing to report: {scan:?}"
+    );
+}
+
+/// The name a fragment has *while `install` is replacing it*, which is the only name it has for the
+/// length of a write and an `fsync`. A pass that named nothing for it hands `list` no id to ask
+/// about, and an id `list` never asks about is one it reports as not installed.
+#[skuld::test]
+fn a_quarantined_fragment_names_the_id_whose_fragment_it_is() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // The writer's own name for it, so this cannot pass against a name production never emits.
+    let quarantine = super::write::unique_quarantine_path("mid-update");
+    let quarantine = quarantine.file_name().expect("a quarantine name");
+    std::fs::write(tmp.path().join(quarantine), "").expect("write the quarantined fragment");
+
+    let scan = scan_unit_dir(tmp.path());
+
+    assert!(
+        scan.units.is_empty(),
+        "there is no fragment at its own name yet: {scan:?}"
+    );
+    assert_eq!(scan.quarantined, ["mid-update"], "{quarantine:?}: {scan:?}");
+}
+
+// Enumeration: the enablement-link probe ==============================================================================
+
+/// The gap this closes: `residue` stats `multi-user.target.wants/<id>.service` for every
+/// fragmentless id, so a root those stats cannot complete in makes `status` answer `Undetermined`
+/// for *any* absent id — while a listing that never stat'd anything reported an empty
+/// `undetermined` and exit `0`, which is what licenses a consumer to read a missing id as
+/// uninstalled.
+#[skuld::test]
+fn a_wants_root_whose_stats_cannot_complete_stands_an_aggregate() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let blocking_file = tmp.path().join("not-a-directory");
+    std::fs::write(&blocking_file, "").expect("write the blocking file");
+
+    let probed = wants_probe(std::iter::once(blocking_file.join("multi-user.target.wants")));
+
+    match probed.as_slice() {
+        [Installed::Undetermined { name: None, reason }] => {
+            assert!(reason.contains("multi-user.target.wants"), "{reason}");
+        }
+        other => panic!("a stat that did not complete leaves every id's link unread: {other:?}"),
+    }
+}
+
+/// The case that is deliberately *not* that one, and the reason this is a stat rather than a
+/// readability probe: an absent root — `/run/systemd/system/multi-user.target.wants` on most hosts
+/// — answers `residue`'s question in full. A probe that reported it would stand a permanent
+/// aggregate, and a permanent exit `4`, on a host where nothing goetia reads fails.
+#[skuld::test]
+fn a_wants_root_that_answers_stands_nothing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let probed = wants_probe(std::iter::once(tmp.path().join("multi-user.target.wants")));
+
+    assert!(probed.is_empty(), "{probed:?}");
+}
+
+/// The same, against the roots `list` actually probes on the host these tests run on: a normal
+/// systemd host must not carry a standing aggregate.
+#[skuld::test]
+fn the_real_wants_roots_answer_on_this_host() {
+    let probed = probe_wants_dirs();
+
+    assert!(
+        probed.is_empty(),
+        "every root either holds the directory and can be stat'd in, or does not exist: {probed:?}"
     );
 }
 

@@ -200,15 +200,24 @@ fn is_access_denied_matches_only_error_access_denied() {
 
 // list's aggregate ====================================================================================================
 
-fn names(items: &[&str]) -> Vec<String> {
-    items.iter().map(|name| (*name).to_string()).collect()
+/// The shape `list` collects: each service it could not read, with that read's own facts.
+fn failures(items: &[&str]) -> Vec<(String, String)> {
+    items
+        .iter()
+        .map(|name| {
+            (
+                (*name).to_string(),
+                format!(r"registry open HKLM\SYSTEM\CurrentControlSet\Services\{name}\Parameters: Access is denied. (os error 5)"),
+            )
+        })
+        .collect()
 }
 
 /// The count is data, not a diagnostic: it reaches the caller as an entry, whose null name is what
 /// obliges every consumer to stop concluding absence (see `Installed::Undetermined`).
 #[skuld::test]
 fn an_aggregate_undetermined_entry_has_a_null_name_and_names_its_count() {
-    match unreadable_aggregate(names(&["alpha", "bravo", "charlie"])) {
+    match unreadable_aggregate(failures(&["alpha", "bravo", "charlie"])) {
         Some(Installed::Undetermined { name, reason }) => {
             assert_eq!(
                 name, None,
@@ -226,17 +235,58 @@ fn an_aggregate_undetermined_entry_has_a_null_name_and_names_its_count() {
 /// on the host, when the only thing goetia failed to read was this service.
 #[skuld::test]
 fn an_aggregate_standing_for_one_service_names_it() {
-    match unreadable_aggregate(names(&["MsSecFlt"])) {
+    let [(_, detail)] = failures(&["MsSecFlt"]).try_into().expect("one failure");
+    match unreadable_aggregate(failures(&["MsSecFlt"])) {
         Some(Installed::Undetermined { name, reason }) => {
             assert_eq!(name.as_deref(), Some("MsSecFlt"));
             assert_eq!(
                 reason,
-                named_unreadable_notice(),
+                named_unreadable_notice(&detail),
                 "the entry carries the notice verbatim"
             );
         }
         other => panic!("one unreadable service is still undetermined, named: {other:?}"),
     }
+}
+
+/// The entry stands for one failure and names the service it happened to, so it carries that
+/// failure's own facts — the registry path, the operation and the OS error `read_parameters`
+/// already built. A static sentence in their place describes an `ERROR_ACCESS_DENIED`, an
+/// `ERROR_IO_DEVICE` and a corrupt hive identically, which is the diagnostic
+/// [`service_detail`]'s doc comment calls useless. The count case is the one with a reason to drop
+/// them: one entry cannot carry hundreds.
+#[skuld::test]
+fn a_named_entry_carries_the_read_failure_it_stands_for() {
+    let [(_, detail)] = failures(&["MsSecFlt"]).try_into().expect("one failure");
+
+    let Some(Installed::Undetermined { reason, .. }) = unreadable_aggregate(failures(&["MsSecFlt"])) else {
+        panic!("one unreadable service is undetermined");
+    };
+
+    assert!(reason.starts_with(&detail), "{reason}");
+    assert!(reason.contains(r"Services\MsSecFlt\Parameters"), "the path: {reason}");
+    assert!(reason.contains("os error 5"), "the failure itself: {reason}");
+}
+
+/// And those facts are the same ones `Error::Undetermined` carries for the identical failure, so
+/// the entry and the error cannot describe one denied read differently — which is the whole reason
+/// `registry_detail` exists.
+#[skuld::test]
+fn the_entry_and_the_error_describe_one_failure_identically() {
+    let error = Error::Undetermined {
+        id: "MsSecFlt".to_string(),
+        reason:
+            r"registry open HKLM\SYSTEM\CurrentControlSet\Services\MsSecFlt\Parameters: Access is denied. (os error 5)"
+                .to_string(),
+        recovery: "re-run as Administrator".to_string(),
+    };
+    let Error::Undetermined { reason, .. } = &error else {
+        unreachable!()
+    };
+    let reason = reason.clone();
+
+    assert_eq!(undetermined_reason(error), reason);
+    assert!(named_unreadable_notice(&reason).starts_with(&reason));
 }
 
 /// The other half of naming it: the *text* has to be about the service the entry names. The
@@ -245,7 +295,7 @@ fn an_aggregate_standing_for_one_service_names_it() {
 /// after the name, so the two would contradict each other in one line.
 #[skuld::test]
 fn a_named_entry_does_not_carry_the_aggregate_claim() {
-    let Some(Installed::Undetermined { reason, .. }) = unreadable_aggregate(names(&["MsSecFlt"])) else {
+    let Some(Installed::Undetermined { reason, .. }) = unreadable_aggregate(failures(&["MsSecFlt"])) else {
         panic!("one unreadable service is undetermined");
     };
     assert!(
@@ -274,7 +324,7 @@ fn unreadable_notice_is_one_line_and_says_what_it_stands_for() {
     // The wording carries the honest part of this diagnostic — that ownership
     // is *unknown*, not that the services are foreign — so pin it rather than
     // let a later reword quietly turn it into a reassuring lie.
-    let one = named_unreadable_notice();
+    let one = named_unreadable_notice("registry open HKLM\\x: Access is denied. (os error 5)");
     assert!(
         !one.contains("could not be inspected"),
         "a named entry is about its own service, not about a count of them: {one}"
@@ -294,11 +344,10 @@ fn unreadable_notice_is_one_line_and_says_what_it_stands_for() {
             text.contains("re-running elevated"),
             "must offer the usual remedy: {text}"
         );
-        // `list` counts every non-`NotFound` failure, so naming denial as *the* cause would assert
-        // something this never established — see `unreadable_notice`'s own doc comment.
-        assert!(
-            !text.contains("access denied"),
-            "the count covers failures that were not denials: {text}"
-        );
     }
+    // The count covers every non-`NotFound` failure, and denial is only the common one, so naming
+    // it as *the* cause would assert something the aggregate never established — see
+    // `unreadable_notice`'s own doc comment. The named entry is the opposite case: it stands for
+    // one read, and that read's own errno is established.
+    assert!(!many.to_lowercase().contains("denied"), "{many}");
 }

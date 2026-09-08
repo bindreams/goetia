@@ -147,7 +147,39 @@ fn occupied(path: &Path) -> Presence {
     }
 }
 
-fn locate(id: &str) -> Result<Option<Location>> {
+/// What the pair of stats established about an id, before a caller collapses it into a `Result`.
+///
+/// [`locate`]'s own answer is this, and `list` needs the two `Err` cases as *entries* rather than
+/// as an error that would discard every other id in the same listing.
+enum Located {
+    /// Neither directory holds a plist for this id — the only answer that establishes the id is
+    /// absent, as opposed to one path being vacant.
+    Nowhere,
+    At(Location),
+    /// Both directories hold one. See [`locate`] for how that state is reachable at all.
+    Both,
+    /// A stat did not complete, so the pair says nothing: neither location nor absence.
+    Unsettled {
+        path: PathBuf,
+        source: io::Error,
+    },
+}
+
+/// **Ask the id, not a path.** The one place this backend answers "what is at this id", and the
+/// re-ask every caller that would otherwise conclude absence from a single vacant path owes it:
+/// `enable`/`disable` *move* the plist between the two directories with [`move_no_clobber`]
+/// (`hard_link` then `remove_file`), which keeps it linked at one of them at every instant, so a
+/// path that is vacant now is a completed move exactly as readily as a completed uninstall. Only
+/// [`Located::Nowhere`] is absence.
+///
+/// Two stats are not enough to conclude it, and that is why the staging one is repeated. The pair
+/// is sequential, not simultaneous: a `disable` landing between them leaves staging vacant when
+/// staging was read (the plist was still enabled) *and* enabled vacant when enabled was read (the
+/// plist is now staged), and the id is installed the whole time. The third stat is what rules that
+/// out — the move's `hard_link` precedes its `remove_file`, so a plist that left `ENABLED_DIR`
+/// before the second stat was already in `STAGING_DIR` before it, and is still there at the third
+/// unless a *second* move has since taken it back.
+fn located(id: &str) -> Located {
     let staging = staging_path(id);
     let enabled = enabled_path(id);
     match (occupied(&staging), occupied(&enabled)) {
@@ -155,22 +187,44 @@ fn locate(id: &str) -> Result<Option<Location>> {
         // location is a fact about both directories at once, and the
         // remaining three answers — absent, staged, enabled — each claim
         // something about the directory that was never read.
-        (Presence::Undetermined { source }, _) => Err(undetermined(id, "stat", &staging, &source)),
-        (_, Presence::Undetermined { source }) => Err(undetermined(id, "stat", &enabled, &source)),
-        (Presence::Absent, Presence::Absent) => Ok(None),
-        (Presence::Present, Presence::Absent) => Ok(Some(Location {
+        (Presence::Undetermined { source }, _) => Located::Unsettled { path: staging, source },
+        (_, Presence::Undetermined { source }) => Located::Unsettled { path: enabled, source },
+        (Presence::Present, Presence::Absent) => Located::At(Location {
             path: staging,
             enabled: false,
-        })),
-        (Presence::Absent, Presence::Present) => Ok(Some(Location {
+        }),
+        (Presence::Absent, Presence::Present) => Located::At(Location {
             path: enabled,
             enabled: true,
-        })),
-        (Presence::Present, Presence::Present) => Err(Error::Other(format!(
-            "daemon `{id}` has a plist in both {STAGING_DIR} and {ENABLED_DIR}; remove one by hand \
-             (they should never both exist) before retrying"
-        ))),
+        }),
+        (Presence::Present, Presence::Present) => Located::Both,
+        (Presence::Absent, Presence::Absent) => match occupied(&staging) {
+            Presence::Absent => Located::Nowhere,
+            Presence::Present => Located::At(Location {
+                path: staging,
+                enabled: false,
+            }),
+            Presence::Undetermined { source } => Located::Unsettled { path: staging, source },
+        },
     }
+}
+
+fn locate(id: &str) -> Result<Option<Location>> {
+    match located(id) {
+        Located::Nowhere => Ok(None),
+        Located::At(location) => Ok(Some(location)),
+        Located::Both => Err(both_dirs_error(id)),
+        Located::Unsettled { path, source } => Err(undetermined(id, "stat", &path, &source)),
+    }
+}
+
+/// The refusal for a plist at both paths, so [`locate`] and the same discovery reached through a
+/// re-ask cannot word one state two ways.
+fn both_dirs_error(id: &str) -> Error {
+    Error::Other(format!(
+        "daemon `{id}` has a plist in both {STAGING_DIR} and {ENABLED_DIR}; remove one by hand \
+         (they should never both exist) before retrying"
+    ))
 }
 
 // Reading a plist =====================================================================================================
@@ -191,7 +245,18 @@ fn locate(id: &str) -> Result<Option<Location>> {
 /// only a permission boundary earns, and offering it for a failing disk
 /// sends the user somewhere useless.
 fn undetermined(id: &str, op: &str, path: &Path, source: &io::Error) -> Error {
-    let recovery = if source.kind() == io::ErrorKind::PermissionDenied {
+    undetermined_reason(
+        id,
+        read_detail(op, path, source),
+        source.kind() == io::ErrorKind::PermissionDenied,
+    )
+}
+
+/// The same error over a `reason` already rendered — for the one condition that has no errno of its
+/// own to render, a path occupied when goetia stat'd it and vacant when it read it (see
+/// [`vacated_detail`]).
+fn undetermined_reason(id: &str, reason: String, access_denied: bool) -> Error {
+    let recovery = if access_denied {
         "re-run as root (or under sudo): that read is what tells goetia whether anything is \
          installed at this id"
     } else {
@@ -200,7 +265,7 @@ fn undetermined(id: &str, op: &str, path: &Path, source: &io::Error) -> Error {
     };
     Error::Undetermined {
         id: id.to_string(),
-        reason: read_detail(op, path, source),
+        reason,
         recovery: recovery.to_string(),
     }
 }
@@ -211,6 +276,18 @@ fn undetermined(id: &str, op: &str, path: &Path, source: &io::Error) -> Error {
 /// entry cannot describe one failure differently.
 fn read_detail(op: &str, path: &Path, source: &dyn std::fmt::Display) -> String {
     format!("failed to {op} {path}: {source}", path = path.display())
+}
+
+/// The same, for the one failure with no errno behind it: a re-ask ([`located`]) found the plist at
+/// `path` and the read that immediately followed found nothing there. A second move, or an
+/// uninstall, landed between the two syscalls — and the pair establishes neither, which is the
+/// whole reason it is reported rather than resolved by asking a third time. Asking again is only
+/// worth anything against a *finite* number of moves, and nothing on this host promises that.
+fn vacated_detail(path: &Path) -> String {
+    format!(
+        "{path} was occupied when goetia stat'd it and vacant when it read it",
+        path = path.display()
+    )
 }
 
 /// The magic every binary property list begins with. `plutil -convert
@@ -365,10 +442,11 @@ fn classify(bytes: Vec<u8>) -> Classified {
 /// Read the artifact `locate` found for `id`, for the three callers that go
 /// on to look for a marker in it (`discover`, `located_and_ours`, `status`).
 ///
-/// An absent path is [`Error::NotInstalled`], not a failure to determine:
-/// the plist was there when `locate` stat'd it and is gone now, which is an
-/// uninstall that completed between the two syscalls, and absence is the
-/// truth about the id. Every read that did not complete is [`undetermined`].
+/// A vacant path is *re-asked*, never read as absence: the plist was there when `locate` stat'd it,
+/// and an `enable`/`disable` moving it to the other directory in between leaves this exact path
+/// vacant with the id still installed. [`located`] stats both, so it is what separates a move from
+/// an uninstall — and [`Error::NotInstalled`] is claimed only for its `Nowhere`. Every read that
+/// did not complete is [`undetermined`].
 ///
 /// Bytes that are not goetia's ([`Classified::NotOurs`]), and anything that is
 /// not a regular file at all, read as the empty string. That is a statement,
@@ -381,15 +459,37 @@ fn classify(bytes: Vec<u8>) -> Classified {
 /// from erroring: `decide` reaches `Outcome::RefuseForeign`, which names the
 /// remedy, instead of a bare `Err`.
 fn read_artifact(path: &Path, id: &str) -> Result<String> {
-    let bytes = match obtain(path) {
-        Obtained::Bytes(bytes) => bytes,
-        Obtained::Absent => return Err(Error::NotInstalled { id: id.to_string() }),
-        Obtained::NonRegular => return Ok(String::new()),
-        Obtained::Failed(e) => return Err(undetermined(id, "read", path, &e)),
-    };
+    match obtain(path) {
+        Obtained::Bytes(bytes) => Ok(marker_text(bytes)),
+        Obtained::Absent => reread_after_vacancy(id),
+        Obtained::NonRegular => Ok(String::new()),
+        Obtained::Failed(e) => Err(undetermined(id, "read", path, &e)),
+    }
+}
+
+/// The re-ask [`read_artifact`] owes a vacant path, and the error half of the one `list` performs:
+/// ask the id over both directories, then read whatever that found, once.
+fn reread_after_vacancy(id: &str) -> Result<String> {
+    match located(id) {
+        Located::Nowhere => Err(Error::NotInstalled { id: id.to_string() }),
+        Located::Both => Err(both_dirs_error(id)),
+        Located::Unsettled { path, source } => Err(undetermined(id, "stat", &path, &source)),
+        Located::At(location) => match obtain(&location.path) {
+            Obtained::Bytes(bytes) => Ok(marker_text(bytes)),
+            Obtained::NonRegular => Ok(String::new()),
+            Obtained::Failed(e) => Err(undetermined(id, "read", &location.path, &e)),
+            Obtained::Absent => Err(undetermined_reason(id, vacated_detail(&location.path), false)),
+        },
+    }
+}
+
+/// Obtained bytes as the text every caller looks for a marker in: their own if they decode,
+/// otherwise the empty string, which carries no marker and so is the [`Classified::NotOurs`]
+/// verdict stated in the vocabulary `extract` speaks.
+fn marker_text(bytes: Vec<u8>) -> String {
     match classify(bytes) {
-        Classified::Text(text) => Ok(text),
-        Classified::NotOurs => Ok(String::new()),
+        Classified::Text(text) => text,
+        Classified::NotOurs => String::new(),
     }
 }
 
@@ -1073,110 +1173,144 @@ impl ServiceManager for LaunchdManager {
     }
 
     fn list(&self) -> Result<Vec<Installed>> {
-        let mut by_id: std::collections::BTreeMap<String, Vec<(PathBuf, bool)>> = std::collections::BTreeMap::new();
-        let mut incomplete = Vec::new();
-        for (dir, enabled) in [(STAGING_DIR, false), (ENABLED_DIR, true)] {
-            // A pass that stopped in one directory does not stop the other. They are two separate
-            // locations, and what the staging directory refused to yield establishes nothing about
-            // `/Library/LaunchDaemons` — so scanning on can only add ids goetia has actually
-            // established, while the aggregate below already forbids concluding absence for
-            // anything either pass missed. Two aggregates is the honest report when both stop.
-            let scan = scan_plists(dir);
-            for (id, path) in scan.plists {
-                by_id.entry(id).or_default().push((path, enabled));
-            }
-            incomplete.extend(scan.incomplete);
-        }
+        let scan = scan_ids();
 
         let mut out = Vec::new();
-        for (id, locations) in by_id {
-            // `locations` is what the two passes *reached*, which is what an aggregate above costs
-            // this branch. If one pass stopped before this id and the other found it, the id is
-            // reported as an ordinary `Ours` carrying the `enabled` of the directory that was
-            // reached — itself established, since the plist really is there — while the
-            // both-directories anomaly goes unreported. A positive claim narrowed by an incomplete
-            // scan, and the aggregate in the same listing is precisely the signal that says so:
-            // while one is present, this listing is not a complete account of any id's locations.
-            // No negative conclusion is affected either way, which is the property that has to
-            // hold. Deliberately untested — forcing it needs a real mid-`readdir` fault on macOS.
-            if locations.len() > 1 {
-                out.push(Installed::OursUnreadable {
-                    name: id,
+        for id in &scan.ids {
+            // The scan named this id; where it is, and whether it still is, is asked *now* — the
+            // same `located` + `obtain` pair `status` goes through, so the two verbs cannot
+            // describe one host differently, and no answer here rests on a path a pass recorded
+            // before the other directory was even read.
+            match located(id) {
+                // Both directories are vacant now, which is what makes this an absent id rather
+                // than a vacated path. Reporting it would let a benign concurrent uninstall raise
+                // `list`'s host-wide exit code.
+                Located::Nowhere => continue,
+                // The same anomaly `locate` refuses for every other verb. `OursUnreadable`, not
+                // `Undetermined`: presence is established at both paths, and it is which of them
+                // enrolls the id at boot that this listing cannot state.
+                Located::Both => out.push(Installed::OursUnreadable {
+                    name: id.clone(),
                     reason: format!("present in both {STAGING_DIR} and {ENABLED_DIR}"),
-                });
-                continue;
-            }
-            let (path, enabled) = &locations[0];
-            // A failed read leaves zero evidence of whether this plist ever
-            // carried a Goetia marker at all — unlike a decode failure
-            // below, which only happens *after* confirming the marker is
-            // present. Claiming `OursUnreadable` without that evidence would
-            // misreport an unreadable *foreign* plist (routine on
-            // `/Library/LaunchDaemons`, which holds every vendor's daemons,
-            // not just Goetia's) as one of ours. `Installed::Undetermined`
-            // is the state that reasoning was missing: it claims neither,
-            // which is exactly what was established. Omitting the id instead
-            // claims the other thing goetia does not know — that nothing is
-            // there.
-            let classified = match obtain(path) {
-                Obtained::Bytes(bytes) => classify(bytes),
-                // Gone between the scan above and this read: an uninstall
-                // that completed, observed one syscall later — now the only
-                // cause, since a dangling symlink is classified `NonRegular`
-                // rather than absent. Absence is established, so this is a
-                // skip rather than a blind spot: reporting it would let a
-                // benign concurrent uninstall raise `list`'s host-wide exit
-                // code.
-                Obtained::Absent => continue,
-                // A FIFO, a directory, a socket: nothing goetia ever wrote,
-                // and established as such rather than merely unread — so it
-                // is omitted like any other foreign entry, not reported.
-                Obtained::NonRegular => continue,
-                Obtained::Failed(e) => {
-                    out.push(Installed::Undetermined {
-                        name: Some(id),
-                        reason: read_detail("read", path, &e),
-                    });
-                    continue;
-                }
-            };
-            let text = match classified {
-                Classified::Text(text) => text,
-                // Foreign by positive identification, so omitted exactly as
-                // an unmarked XML plist is — see `Classified::NotOurs`.
-                Classified::NotOurs => continue,
-            };
-            match generate::extract(&text) {
-                Ok(None) => {} // foreign: not Goetia-managed, omitted per the trait doc comment
-                Ok(Some(blob)) => {
-                    let (state, pid) = query_live_state(&id);
-                    out.push(Installed::Ours {
-                        spec: blob.spec,
-                        state,
-                        pid,
-                        enabled: *enabled,
-                    });
-                }
-                Err(e) => out.push(Installed::OursUnreadable {
-                    name: id,
-                    reason: e.to_string(),
                 }),
+                Located::Unsettled { path, source } => out.push(Installed::Undetermined {
+                    name: Some(id.clone()),
+                    reason: read_detail("stat", &path, &source),
+                }),
+                Located::At(location) => match obtain(&location.path) {
+                    Obtained::Bytes(bytes) => out.extend(entry_from_bytes(id, bytes, location.enabled)),
+                    // A FIFO, a directory, a socket: nothing goetia ever wrote, and established as
+                    // such rather than merely unread — so it is omitted like any other foreign
+                    // entry, not reported.
+                    Obtained::NonRegular => continue,
+                    // A failed read leaves zero evidence of whether this plist ever carried a
+                    // Goetia marker at all — unlike a decode failure in `entry_from_bytes`, which
+                    // only happens *after* confirming the marker is present. Claiming
+                    // `OursUnreadable` without that evidence would misreport an unreadable
+                    // *foreign* plist (routine on `/Library/LaunchDaemons`, which holds every
+                    // vendor's daemons, not just Goetia's) as one of ours. Omitting it claims the
+                    // other thing goetia does not know — that nothing is there.
+                    Obtained::Failed(e) => out.push(Installed::Undetermined {
+                        name: Some(id.clone()),
+                        reason: read_detail("read", &location.path, &e),
+                    }),
+                    Obtained::Absent => out.push(Installed::Undetermined {
+                        name: Some(id.clone()),
+                        reason: vacated_detail(&location.path),
+                    }),
+                },
             }
         }
         // Last, so a pass that got some way in still reports what it named before what it could
         // not — the order `cli::support::partition_installed` imposes on the rendered output too.
-        out.extend(incomplete);
+        out.extend(scan.incomplete);
         Ok(out)
+    }
+}
+
+// Classification ======================================================================================================
+
+/// One id's entry, from bytes already obtained for it — `None` where the answer is to omit it.
+/// Shared by every arm of `list` that has bytes, so a plist read from the staging directory and one
+/// read from `/Library/LaunchDaemons` cannot be classified differently.
+fn entry_from_bytes(id: &str, bytes: Vec<u8>, enabled: bool) -> Option<Installed> {
+    // Foreign by positive identification, so omitted exactly as an unmarked XML plist is — see
+    // `Classified::NotOurs`.
+    let text = marker_text(bytes);
+    match generate::extract(&text) {
+        Ok(None) => None, // foreign: not Goetia-managed, omitted per the trait doc comment
+        Ok(Some(blob)) => {
+            let (state, pid) = query_live_state(id);
+            Some(Installed::Ours {
+                spec: blob.spec,
+                state,
+                pid,
+                enabled,
+            })
+        }
+        Err(e) => Some(Installed::OursUnreadable {
+            name: id.to_string(),
+            reason: e.to_string(),
+        }),
     }
 }
 
 // Enumeration =========================================================================================================
 
-/// What one pass over one of `list`'s two directories found: the `<id>.plist` files it reached,
-/// and — when the pass stopped early — the entry standing for whatever it never did.
+/// Every id `LaunchdManager::list` has to answer for, and the entries standing for whatever the
+/// passes that produced it never reached.
+///
+/// Names only. Where each id *is* — and whether it still is — is [`located`]'s answer at the moment
+/// the id is classified, never the directory a pass happened to find it in: the passes are
+/// sequential, so the pair of them is not a simultaneous observation of the two directories and
+/// cannot be read as one.
+///
+/// # Why the staging directory is passed twice
+///
+/// A `disable` moves the plist `ENABLED_DIR` -> `STAGING_DIR`. One that completes *between* the
+/// staging pass and the enabled pass is in neither of them — staged too late for the first,
+/// unlinked too early for the second — and an id no pass names is an id `list` omits, which is
+/// `list` saying it is not installed. [`move_no_clobber`] leaves it linked at one of the two at
+/// every instant, so a third pass over the (small, goetia-only) staging directory after the enabled
+/// one names it: a move in either direction is now seen by at least one pass whenever it happens.
+/// What is left is two *complete* moves straddling the three passes, which is the same residual the
+/// per-id re-ask carries and is stated there.
+#[derive(Debug)]
+struct IdScan {
+    ids: std::collections::BTreeSet<String>,
+    incomplete: Vec<Installed>,
+}
+
+fn scan_ids() -> IdScan {
+    // A pass that stopped in one directory does not stop the other. They are two separate
+    // locations, and what the staging directory refused to yield establishes nothing about
+    // `/Library/LaunchDaemons` — so scanning on can only add ids goetia has actually established,
+    // while the aggregate below already forbids concluding absence for anything any pass missed.
+    let staging = scan_plists(STAGING_DIR);
+    let enabled = scan_plists(ENABLED_DIR);
+    let restaged = scan_plists(STAGING_DIR);
+
+    let mut ids = std::collections::BTreeSet::new();
+    for scan in [&staging, &enabled, &restaged] {
+        ids.extend(scan.ids.iter().cloned());
+    }
+    IdScan {
+        ids,
+        // One aggregate per directory, not per pass: the first staging aggregate already says that
+        // directory was not enumerated to the end, and a second entry repeating it would double the
+        // count a reader takes for "how much of this host went unread".
+        incomplete: [staging.incomplete.or(restaged.incomplete), enabled.incomplete]
+            .into_iter()
+            .flatten()
+            .collect(),
+    }
+}
+
+/// What one pass over one of `list`'s two directories found: the ids the `<id>.plist` files it
+/// reached name, and — when the pass stopped early — the entry standing for whatever it never did.
 #[derive(Debug)]
 struct PlistScan {
-    plists: Vec<(String, PathBuf)>,
+    ids: Vec<String>,
     incomplete: Option<Installed>,
 }
 
@@ -1192,11 +1326,11 @@ fn scan_plists(dir: &str) -> PlistScan {
     match fs::read_dir(dir) {
         Ok(entries) => collect_plists(dir, entries.map(|entry| entry.map(|entry| entry.path()))),
         Err(e) if e.kind() == io::ErrorKind::NotFound => PlistScan {
-            plists: Vec::new(),
+            ids: Vec::new(),
             incomplete: None,
         },
         Err(e) => PlistScan {
-            plists: Vec::new(),
+            ids: Vec::new(),
             incomplete: Some(Installed::scan_incomplete(
                 dir,
                 &format!("failed to read directory: {e}"),
@@ -1210,13 +1344,13 @@ fn scan_plists(dir: &str) -> PlistScan {
 /// is the half that matters: everything already collected comes back alongside the aggregate,
 /// rather than being discarded because a *later* dirent could not be read.
 fn collect_plists(dir: &str, entries: impl Iterator<Item = io::Result<PathBuf>>) -> PlistScan {
-    let mut plists = Vec::new();
+    let mut ids = Vec::new();
     for entry in entries {
         let path = match entry {
             Ok(path) => path,
             Err(e) => {
                 return PlistScan {
-                    plists,
+                    ids,
                     incomplete: Some(Installed::scan_incomplete(
                         dir,
                         &format!("failed to read a directory entry: {e}"),
@@ -1230,12 +1364,9 @@ fn collect_plists(dir: &str, entries: impl Iterator<Item = io::Result<PathBuf>>)
         let Some(id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else {
             continue;
         };
-        plists.push((id, path));
+        ids.push(id);
     }
-    PlistScan {
-        plists,
-        incomplete: None,
-    }
+    PlistScan { ids, incomplete: None }
 }
 
 #[cfg(test)]

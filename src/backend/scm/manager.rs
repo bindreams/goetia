@@ -226,7 +226,7 @@ impl ServiceManager for ScmManager {
 
     fn list(&self) -> Result<Vec<Installed>> {
         let mut out = Vec::new();
-        let mut unreadable: Vec<String> = Vec::new();
+        let mut unreadable: Vec<(String, String)> = Vec::new();
         let scan = registry::list_service_names();
         for name in scan.names {
             // A registry read failure for one unrelated service (e.g. a
@@ -239,10 +239,12 @@ impl ServiceManager for ScmManager {
             // `unreadable_aggregate` below.
             let params = match registry::read_parameters(&name) {
                 Ok(p) => p,
-                Err(_) => {
-                    // Kept, not counted: `unreadable_aggregate` names the id when it turns out to
-                    // be the only one, and a count cannot be un-summed afterwards.
-                    unreadable.push(name);
+                Err(e) => {
+                    // Kept whole, not counted: `unreadable_aggregate` names the service when it
+                    // turns out to be the only one, and neither a count nor a static sentence can
+                    // be un-summed afterwards into the registry path, operation and OS error this
+                    // failure already carries.
+                    unreadable.push((name, undetermined_reason(e)));
                     continue;
                 }
             };
@@ -1075,16 +1077,16 @@ mod manager_tests;
 /// determined" (exit `4`) instead of "not installed" (exit `1`), permanently,
 /// for ids that have nothing to do with it. Naming the one service it stands
 /// for confines that to the one id it is actually true of.
-fn unreadable_aggregate(names: Vec<String>) -> Option<Installed> {
-    let mut names = names.into_iter();
-    let (first, count) = (names.next()?, 1 + names.count());
+fn unreadable_aggregate(failures: Vec<(String, String)>) -> Option<Installed> {
+    let mut failures = failures.into_iter();
+    let ((first, detail), count) = (failures.next()?, 1 + failures.count());
     // Exactly one, so the entry can be about it rather than about the host — and so must its text.
     // The name and the reason are one report: an entry that names its service and then says a
     // daemon may be missing from the list contradicts itself in a single rendered line.
     Some(match count {
         1 => Installed::Undetermined {
             name: Some(first),
-            reason: named_unreadable_notice(),
+            reason: named_unreadable_notice(&detail),
         },
         _ => Installed::Undetermined {
             name: None,
@@ -1100,10 +1102,31 @@ fn unreadable_aggregate(names: Vec<String>) -> Option<Installed> {
 /// what is unknown is whether the service goetia just named is one of its own. The remedy stays,
 /// conditioned as [`unreadable_notice`] conditions it: elevation is the usual way a denied read
 /// clears, not a diagnosis of why this one failed.
-fn named_unreadable_notice() -> String {
-    "its registry Parameters could not be read, so whether this service is one of goetia's is \
-     unknown; on an unelevated run, re-running elevated is the usual remedy."
-        .to_string()
+///
+/// `detail` is `registry::read_parameters`' own — the registry path, the operation and the OS error
+/// — kept rather than replaced by a sentence that describes any of the failures equally badly. The
+/// aggregate has a reason to drop it (one entry, hundreds of causes); an entry standing for exactly
+/// one service has none, and every other backend's named entry carries the same facts. See
+/// [`service_detail`], whose own doc comment is about this.
+fn named_unreadable_notice(detail: &str) -> String {
+    format!(
+        "{detail}; whether this service is one of goetia's is therefore unknown, and on an \
+         unelevated run, re-running elevated is the usual remedy."
+    )
+}
+
+/// The facts out of a failure that establishes nothing about the id. Every
+/// `registry::read_parameters` failure is [`Error::Undetermined`] by construction (its own doc
+/// comment says why), whose `reason` is exactly `registry::registry_detail`'s text; the fallback
+/// keeps a future caller's other variant readable instead of dropping it.
+fn undetermined_reason(e: Error) -> String {
+    match e {
+        Error::Undetermined { reason, .. } => reason,
+        other => {
+            debug_assert!(false, "read_parameters answers Undetermined or nothing: {other}");
+            other.to_string()
+        }
+    }
 }
 
 /// The text [`unreadable_aggregate`]'s *unnamed* entry carries: how many

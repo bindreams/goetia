@@ -173,13 +173,32 @@ pub(super) fn quarantine_if_still_ours(id: &str, expected_text: &str) -> Result<
 /// left one behind, or a genuinely concurrent one — never collide. A monotonic per-process counter
 /// combined with the PID is unique across both this process's own repeated attempts and any other
 /// process running concurrently.
-fn unique_quarantine_path(id: &str) -> PathBuf {
+pub(super) fn unique_quarantine_path(id: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     Path::new(UNIT_DIR).join(format!(
-        ".{id}.service.goetia-quarantine.{pid:x}-{n:x}",
+        "{prefix}{pid:x}-{n:x}",
+        prefix = quarantine_prefix(id),
         pid = std::process::id()
     ))
+}
+
+/// What every quarantine name for `id` begins with; the per-attempt suffix is what makes the rest of
+/// it unique.
+fn quarantine_prefix(id: &str) -> String {
+    format!(".{id}.service.goetia-quarantine.")
+}
+
+/// The id a quarantine name stands for, `None` for any other file name — [`quarantine_prefix`] read
+/// backwards, and kept beside it so the writer's naming and its readers' search cannot drift apart.
+///
+/// A fragment renamed out from under a reader is still that id's fragment, which is why the readers
+/// exist at all: `super::discover::fragmentless` asks whether one of these is what a vacant
+/// `<id>.service` means, and `super::collect_units` lets one *name* an id the scan would otherwise
+/// have no name for.
+pub(super) fn quarantined_id(file_name: &str) -> Option<&str> {
+    let (id, attempt) = file_name.strip_prefix('.')?.split_once(".service.goetia-quarantine.")?;
+    (!id.is_empty() && !attempt.is_empty()).then_some(id)
 }
 
 /// Move the quarantined `backup_path` back to `final_path`, without clobbering anything that might

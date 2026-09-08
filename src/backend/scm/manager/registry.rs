@@ -91,32 +91,69 @@ pub fn read_parameters(name: &str) -> Result<BTreeMap<String, String>> {
 }
 
 /// Write `params` under `Services\<name>\Parameters` as the subkey's
-/// *entire* contents: any pre-existing value not in `params` is removed
-/// first, not merely left alone. A hand-edit that adds a stray value under
-/// `Parameters` must still be overwritable by `install --force` — leaving
-/// it behind would mean `on_disk` (via [`read_parameters`], which reads
-/// everything present) never converges with `desired`/`regenerated` (which
-/// only ever have Goetia's own four fields), and `--force` would report
-/// success while the very artifact it was asked to fix keeps reporting
-/// `Conflict` on every subsequent `install`.
+/// *entire* contents: any pre-existing value or subkey not in `params` is
+/// gone when this returns, not merely left alone. A hand-edit that adds a
+/// stray value under `Parameters` must still be overwritable by
+/// `install --force` — leaving it behind would mean `on_disk` (via
+/// [`read_parameters`], which reads everything present) never converges with
+/// `desired`/`regenerated` (which only ever have Goetia's own four fields),
+/// and `--force` would report success while the very artifact it was asked
+/// to fix keeps reporting `Conflict` on every subsequent `install`.
+///
+/// Written over, then pruned — never deleted and re-created, which is what
+/// this used to do. `Marker` is the only proof of ownership a `type: managed`
+/// service has, and deleting the key first takes it away for the length of
+/// the rewrite: a concurrent `list` reads no marker, classifies a service
+/// goetia is *in the middle of updating* as a stranger's, and omits it —
+/// exit `0`, and the daemon missing from a listing that claims to be
+/// complete. The launchd and systemd backends keep their artifact at one of
+/// two names at every instant precisely so a reader can re-ask; here there is
+/// one name and no second place to look, so the writer is what has to hold
+/// the marker in place. Overwriting a value is atomic per value, and every
+/// update writes the same `Marker` that is already there.
 pub fn write_parameters(name: &str, params: &BTreeMap<String, String>) -> Result<()> {
     let service_path = service_key_path(name);
     let service_key = RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(&service_path, KEY_WRITE)
         .map_err(|e| registry_error("open", &service_path, e))?;
 
-    match service_key.delete_subkey_all("Parameters") {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(registry_error("delete", &parameters_key_path(name), e)),
-    }
+    write_parameters_under(&service_key, &parameters_key_path(name), params)
+}
 
+/// The write itself, under an already-opened service key rather than under `HKLM` directly — which
+/// is what makes it reachable from a test, since a test that had to own a real
+/// `HKLM\SYSTEM\CurrentControlSet\Services\<name>` would have to register a real service to get
+/// one. `path` names the key only for the error text.
+fn write_parameters_under(service_key: &RegKey, path: &str, params: &BTreeMap<String, String>) -> Result<()> {
     let (key, _) = service_key
         .create_subkey("Parameters")
-        .map_err(|e| registry_error("create", &parameters_key_path(name), e))?;
+        .map_err(|e| registry_error("create", path, e))?;
     for (field, value) in params {
         key.set_value(field, value)
-            .map_err(|e| registry_error(&format!("write {field} under"), &parameters_key_path(name), e))?;
+            .map_err(|e| registry_error(&format!("write {field} under"), path, e))?;
+    }
+
+    // The pruning half. Names are collected before anything is deleted: `enum_values`/`enum_keys`
+    // walk by index, and removing an entry mid-walk renumbers the rest past the cursor.
+    let stray_values: Vec<String> = key
+        .enum_values()
+        .map(|entry| entry.map(|(field, _)| field))
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|e| registry_error("enumerate", path, e))?
+        .into_iter()
+        .filter(|field| !params.contains_key(field))
+        .collect();
+    for field in stray_values {
+        key.delete_value(&field)
+            .map_err(|e| registry_error(&format!("delete {field} under"), path, e))?;
+    }
+    let stray_keys: Vec<String> = key
+        .enum_keys()
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|e| registry_error("enumerate", path, e))?;
+    for subkey in stray_keys {
+        key.delete_subkey_all(&subkey)
+            .map_err(|e| registry_error(&format!("delete {subkey} under"), path, e))?;
     }
     Ok(())
 }
