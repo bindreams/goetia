@@ -236,17 +236,17 @@ shown pretty-printed here for readability:
 `daemons`, `errors` and `undetermined` are **always present**, as arrays,
 possibly empty.
 
-| Key                     | Type            | Notes                                                                                                                                                                                                               |
-| ----------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `daemons[].id`          | string          | The daemon id.                                                                                                                                                                                                      |
-| `daemons[].state`       | string          | One of `running`, `stopped`, `failed`, `unknown`.                                                                                                                                                                   |
-| `daemons[].enabled`     | bool            | Whether the service is enabled at boot.                                                                                                                                                                             |
-| `daemons[].pid`         | integer or null | `null` means the manager reports **no main process** — never "goetia could not find out", which is an `errors` entry instead.                                                                                       |
-| `errors[].id`           | string or null  | The daemon id or service name the failure is attributable to; `null` for exactly the `unavailable` and `unsupported` kinds, which belong to no id.                                                                  |
-| `errors[].kind`         | string          | See below.                                                                                                                                                                                                          |
-| `errors[].message`      | string          | Human-readable detail.                                                                                                                                                                                              |
-| `undetermined[].name`   | string or null  | The id the entry stands for. **`null` is one entry standing for many ids** — see below.                                                                                                                             |
-| `undetermined[].reason` | string          | What did not complete, as facts: the operation, what it was on, and the failure. An aggregate's stands alone and names a count rather than an id. Carries no remedy — that text is the per-id `errors[].message`'s. |
+| Key                     | Type            | Notes                                                                                                                                                                                                                                                                                                             |
+| ----------------------- | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `daemons[].id`          | string          | The daemon id.                                                                                                                                                                                                                                                                                                    |
+| `daemons[].state`       | string          | One of `running`, `stopped`, `failed`, `unknown`.                                                                                                                                                                                                                                                                 |
+| `daemons[].enabled`     | bool            | Whether the service is enabled at boot.                                                                                                                                                                                                                                                                           |
+| `daemons[].pid`         | integer or null | `null` means the manager reports **no main process** — never "goetia could not find out", which is an `errors` entry instead.                                                                                                                                                                                     |
+| `errors[].id`           | string or null  | The daemon id or service name the failure is attributable to; `null` for exactly the `unavailable` and `unsupported` kinds, which belong to no id.                                                                                                                                                                |
+| `errors[].kind`         | string          | See below.                                                                                                                                                                                                                                                                                                        |
+| `errors[].message`      | string          | Human-readable detail.                                                                                                                                                                                                                                                                                            |
+| `undetermined[].name`   | string or null  | The id the entry stands for. **`null` is one entry standing for many ids** — see below.                                                                                                                                                                                                                           |
+| `undetermined[].reason` | string          | What did not complete, as facts: the operation, what it was on, and the failure. An aggregate's stands alone and names a count rather than an id. On systemd and launchd it is facts only, with any remedy left to the per-id `errors[].message`; SCM's aggregate is the exception and names re-running elevated. |
 
 A daemon's display `name` is deliberately absent: `status` has no spec to
 read it from, and one field differing between the two subcommands would be
@@ -279,8 +279,11 @@ be able to read without parsing `kind` strings.
 for many ids**, so while one is present you may not conclude that any
 particular id is absent — not for rendering, not for a branch, not for a
 test assertion. Standing for an unnamed set is the whole reason that entry
-exists instead of hundreds of named ones. `undetermined` being empty is the
-precondition for reading a missing id as uninstalled.
+exists instead of hundreds of named ones. `undetermined` being empty is _necessary_ for reading a
+missing id as uninstalled, and not sufficient: `errors` must be empty too.
+A `list()` that failed outright yields an empty `undetermined` alongside one
+`unavailable` error, and an id is missing from that document because nothing
+was enumerated at all.
 
 Named entries come first, sorted by name; aggregates last.
 
@@ -419,20 +422,21 @@ it could not establish is `4` for all six verbs, `uninstall` included:
 nothing was done and nothing was learned, which is one condition with one
 remedy for every one of them.
 
-**`4` is returned by** `status` on an id it owns but cannot read, by `list`
-for an entry goetia owns but cannot decode, and by `diff` and `show` when
-the installed artifact cannot be read.
-
-**Every subcommand returns it** for the other case — a read that would have
-said whether anything is installed at that id did not complete at all: on
-systemd, an `<id>.service` fragment an unelevated caller cannot open, or,
-where no fragment is there to read, the `<id>.service.d` and
+`4` covers two distinct states, and the difference is what goetia
+established. **Ownership proven, contents not:** an artifact goetia owns
+whose bytes it cannot read or decode. **Neither proven:** the read that
+would have said whether anything is installed at that id did not complete at
+all — on systemd, an `<id>.service` fragment an unelevated caller cannot
+open, or, where no fragment is there to read, the `<id>.service.d` and
 `multi-user.target.wants` scan that decides whether the id is empty. Goetia
-claims no ownership of such an id, and does not suggest uninstalling it.
-`status <id>` reports it as that id's own `undetermined` kind; `list` and
-`status` with no ids report it in the document's
+claims no ownership in the second case, and does not suggest uninstalling.
+
+Where each verb surfaces it: `status <id>` as that id's own `undetermined`
+kind; `list` and `status` with no ids in the document's
 [third key](#undetermined); `diff`, `show`, `install` and all six id verbs
-have no `--json` document and say it on stderr.
+on stderr, having no `--json` document. Which verb returns which code for
+which outcome is `dispatch`'s doc comment in `src/cli.rs` — the one place
+the vocabulary is written down, and the authority this chapter summarises.
 `install` therefore agrees with `diff` about an id neither could classify,
 and the two differ only over an artifact that _was_ read and would not
 decode, which `install` reports as `1` because the install genuinely did not
@@ -527,7 +531,7 @@ Per platform:
   macOS a permanent, unclearable exit `4` for services that are in no way
   goetia's business. systemd has no counterpart to this rule — a unit file
   is text or it is not goetia's.
-- **SCM** — most services deny an unelevated read of their `Parameters`, so
+- **SCM** — an unelevated read of a service's `Parameters` is commonly denied, which goetia's Windows design assumes is the usual case rather than a measured one, so
   an unelevated `goetia daemon list` on Windows is **expected** to carry one
   aggregate entry — `name: null`, carrying a count rather than a name — and
   to exit `4`. That is the designed behavior, not a defect to report:
