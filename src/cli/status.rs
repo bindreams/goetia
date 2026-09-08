@@ -9,7 +9,7 @@ use std::io::Write;
 use clap::Args as ClapArgs;
 
 use super::report::{self, DaemonReport, Report};
-use super::support::{parse_id, partition_installed, print_unreadable_warnings};
+use super::support::{parse_id, partition_installed, print_undetermined_warnings, print_unreadable_warnings};
 use crate::error::Result;
 use crate::manager::ServiceManager;
 
@@ -48,6 +48,10 @@ pub fn run(
     let mut report = Report {
         daemons: Vec::new(),
         errors: Vec::new(),
+        // Never populated here: this form asks `status(&id)` about each
+        // named id, and an id it could not classify is that id's own
+        // failure, in `errors`. The third key is the `list()` path's.
+        undetermined: Vec::new(),
     };
     for id_str in &args.ids {
         match parse_id(id_str) {
@@ -84,6 +88,7 @@ fn status_all(mgr: &dyn ServiceManager, json: bool, out: &mut dyn Write, err: &m
             // `error:` line, as it has been since `list` and `status` first
             // shared `partition_installed`.
             print_unreadable_warnings(&index.unreadable, err);
+            print_undetermined_warnings(&index.undetermined, err);
             print_daemons(&report, out);
         }
         Err(e) => {

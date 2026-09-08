@@ -40,8 +40,18 @@ pub fn run(
                 // opposite operational consequences (still running vs. now
                 // down), and `mgr.start`'s own error alone cannot tell them
                 // apart once relayed through this closure.
-                mgr.start(id)
-                    .map_err(|e| Error::Other(format!("stopped but failed to restart: {e}")))
+                // Re-wrapped variant by variant rather than flattened to
+                // `Other`: `run_id_verb` reads the variant, and an
+                // `Undetermined` start leg erased here would exit `1` in the
+                // one state where the distinction matters most.
+                mgr.start(id).map_err(|e| match e {
+                    Error::Undetermined { id, reason, recovery } => Error::Undetermined {
+                        id,
+                        reason: format!("stopped but failed to restart: {reason}"),
+                        recovery,
+                    },
+                    other => Error::Other(format!("stopped but failed to restart: {other}")),
+                })
             },
             verb_past_tense: "restarted",
             absent_is_success: false,

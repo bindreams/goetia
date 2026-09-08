@@ -86,6 +86,10 @@ struct Store {
     /// [`Fake::seed_opaque`]. Consulted before `entries`, because the read
     /// that would have found an entry is the one that failed.
     opaque: BTreeSet<String>,
+    /// One reason per seeded aggregate — see
+    /// [`Fake::seed_aggregate_undetermined`]. Not a set of ids: an
+    /// aggregate is precisely the case where the ids are not known.
+    aggregates: Vec<String>,
 }
 
 impl Store {
@@ -298,6 +302,20 @@ impl Fake {
     pub fn seed_opaque(&self, id: &str) {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.opaque.insert(id.to_string());
+    }
+
+    /// Test-only seeding: make `list` report one [`Installed::Undetermined`]
+    /// entry that names nobody — the shape a backend produces when one
+    /// denied read hid an unknown set of ids at once (an unelevated Windows
+    /// service enumeration, say), so it knows a count and no names.
+    ///
+    /// `reason` is a complete sentence, because that is how it is rendered:
+    /// there is no name to prefix it with.
+    ///
+    /// [`Installed::Undetermined`]: crate::manager::Installed::Undetermined
+    pub fn seed_aggregate_undetermined(&self, reason: impl Into<String>) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.aggregates.push(reason.into());
     }
 
     /// Test-only: force `id`'s reported [`State`] directly, bypassing
@@ -525,7 +543,17 @@ impl ServiceManager for Fake {
     fn list(&self) -> Result<Vec<Installed>> {
         let state = self.state.lock().expect("Fake mutex poisoned");
         let mut out = Vec::new();
-        for name in state.opaque.iter() {
+        // Aggregates first, and the named entries last-to-first:
+        // `ServiceManager::list` promises no ordering at all, so a caller
+        // that renders this order instead of imposing its own must fail a
+        // test rather than pass by luck.
+        for reason in state.aggregates.iter() {
+            out.push(Installed::Undetermined {
+                name: None,
+                reason: reason.clone(),
+            });
+        }
+        for name in state.opaque.iter().rev() {
             out.push(Installed::Undetermined {
                 name: Some(name.clone()),
                 reason: OPAQUE_REASON.to_string(),

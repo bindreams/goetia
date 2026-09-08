@@ -196,6 +196,15 @@ struct FlakyManager {
     unqueryable: Option<String>,
     fail_preview_for: Option<String>,
     hidden_from_list: Option<String>,
+    /// The same id as `hidden_from_list`, reported honestly: `list()` emits
+    /// `Installed::Undetermined` for it instead of dropping it. The pair is
+    /// what lets one fixture show both the old silence and the new answer.
+    undetermined_in_list: Option<String>,
+    /// `stop` succeeds and `start` then fails with `Error::Undetermined`.
+    /// The only order in which `restart`'s closure re-wraps the start leg's
+    /// failure, and so the only way to reach that re-wrap with a variant
+    /// that has to survive it.
+    undetermined_start_for: Option<String>,
     /// Makes `install`/`preview_install` return the `Conflict` flavour whose
     /// cause lies outside the directory the backend writes — systemd's
     /// `<id>.service.d` under `/usr/lib` or `.control`. `Fake` has no
@@ -219,6 +228,20 @@ fn injected_failure(id: &Id) -> goetia::Error {
         id: format!("{id} (injected test failure)"),
     }
 }
+
+/// The failure a backend produces when the read that would have said what
+/// is at `id` did not complete: neither absence nor presence established.
+fn injected_indeterminacy(id: &Id) -> goetia::Error {
+    goetia::Error::Undetermined {
+        id: id.as_str().to_string(),
+        reason: "the artifact could not be read (injected test failure)".to_string(),
+        recovery: "re-run with enough privilege to read the artifact".to_string(),
+    }
+}
+
+/// What [`FlakyManager::undetermined_in_list`] reports for the id `list()`
+/// could not enumerate.
+const UNDETERMINED_IN_LIST_REASON: &str = "could not be enumerated at this privilege level (injected test failure)";
 
 /// The `Conflict` [`FlakyManager::unclearable_conflict`] injects.
 fn unclearable_conflict(recovery: &str) -> goetia::decide::Outcome {
@@ -260,6 +283,9 @@ impl ServiceManager for FlakyManager {
         if self.fail_start_for.as_deref() == Some(id.as_str()) {
             return Err(injected_failure(id));
         }
+        if self.undetermined_start_for.as_deref() == Some(id.as_str()) {
+            return Err(injected_indeterminacy(id));
+        }
         self.inner.start(id)
     }
     fn stop(&self, id: &Id) -> goetia::Result<()> {
@@ -288,7 +314,20 @@ impl ServiceManager for FlakyManager {
             installed.retain(|entry| match entry {
                 Installed::Ours { spec, .. } => spec.id.as_str() != hidden,
                 Installed::OursUnreadable { name, .. } => name != hidden,
+                // A `None` name stands for ids this entry could not
+                // separate, so it says nothing about `hidden` and is kept.
+                // Dropping it here would be the fixture concluding the very
+                // absence the entry exists to deny.
                 Installed::Undetermined { name, .. } => name.as_deref() != Some(hidden.as_str()),
+            });
+        }
+        // After the `retain`, deliberately: this is the same id reported
+        // rather than dropped, so the filter above must not take it back
+        // out.
+        if let Some(name) = &self.undetermined_in_list {
+            installed.push(Installed::Undetermined {
+                name: Some(name.clone()),
+                reason: UNDETERMINED_IN_LIST_REASON.to_string(),
             });
         }
         Ok(installed)
@@ -597,16 +636,16 @@ fn show_per_id_from_file_and_from_installed_agree() {
 
 /// `show` without `-f` only ever consults `list()` — never `status(&id)`
 /// directly, unlike `status` itself — so a daemon this privilege level
-/// cannot enumerate is invisible to it even though a direct query would
-/// find it. Pins `show.rs`'s documented caveat on guarantee 1 as a tested
-/// fact rather than an unchecked claim.
+/// cannot enumerate is one `show` cannot render even though a direct query
+/// would find it. What it may not do is call that daemon absent.
 #[skuld::test]
-fn show_reports_not_installed_for_a_daemon_list_cannot_see() {
+fn show_reports_indeterminacy_for_a_daemon_list_cannot_see() {
     let inner = Fake::new();
     inner.install(&mk("ghost"), false).unwrap();
     let mgr = FlakyManager {
         inner,
         hidden_from_list: Some("ghost".to_string()),
+        undetermined_in_list: Some("ghost".to_string()),
         ..Default::default()
     };
 
@@ -616,9 +655,17 @@ fn show_reports_not_installed_for_a_daemon_list_cannot_see() {
     // ...but `show`, which only calls `list()`, cannot.
     let (code, out, err) = dispatch_with(&["goetia", "daemon", "show", "ghost"], &mgr, &never_elevated);
 
-    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
     assert_eq!(out, "");
-    assert_eq!(err, "error: daemon `ghost` is not installed\n");
+    assert!(
+        !err.contains("not installed"),
+        "the listing establishes no absence: {err}"
+    );
+    assert!(
+        !err.contains("not managed by goetia"),
+        "nor anyone else's ownership: {err}"
+    );
+    assert!(err.contains("ghost"), "{err}");
 }
 
 /// Both of `show`'s "installed but unreadable" paths — naming the id
@@ -1574,6 +1621,25 @@ fn errors(doc: &serde_json::Value) -> &[serde_json::Value] {
         .unwrap_or_else(|| panic!("`errors` must always be present, as an array: {doc}"))
 }
 
+fn undetermined(doc: &serde_json::Value) -> &[serde_json::Value] {
+    doc["undetermined"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`undetermined` must always be present, as an array: {doc}"))
+}
+
+/// The `name` of each `undetermined` entry, `None` for an aggregate — the
+/// one field of the third key whose *order* is contractual.
+fn undetermined_names(doc: &serde_json::Value) -> Vec<Option<String>> {
+    undetermined(doc)
+        .iter()
+        .map(|entry| match &entry["name"] {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(name) => Some(name.clone()),
+            other => panic!("`name` must be a string or null: {other}"),
+        })
+        .collect()
+}
+
 fn daemon_ids(doc: &serde_json::Value) -> Vec<String> {
     field_strings(daemons(doc), "id")
 }
@@ -1779,7 +1845,9 @@ fn status_json_reports_a_null_pid_for_a_stopped_daemon() {
 }
 
 /// The two subcommands must describe one machine identically, or a consumer
-/// has to know which verb produced the document it is reading.
+/// has to know which verb produced the document it is reading. The fixture
+/// populates all three keys, so the equality covers the third rather than
+/// holding only where it is empty.
 #[skuld::test]
 fn status_json_with_no_ids_equals_list_json() {
     let fake = Fake::new();
@@ -1787,12 +1855,18 @@ fn status_json_with_no_ids_equals_list_json() {
     fake.start(&Id::try_from("frpc").unwrap()).unwrap();
     fake.install(&mk("websocat"), false).unwrap();
     fake.seed_unreadable("corrupt");
+    fake.seed_opaque("opaque");
 
     let (list_code, list_out, _) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
     let (status_code, status_out, _) = dispatch_read_only(&["goetia", "--json", "daemon", "status"], &fake);
 
     assert_eq!(list_code, status_code);
     assert_eq!(parse_json(&list_out), parse_json(&status_out));
+    assert_eq!(
+        undetermined_names(&parse_json(&list_out)),
+        [Some("opaque".to_string())],
+        "the third key is populated, not vacuously equal"
+    );
 }
 
 /// Three states with opposite remedies, which text mode renders as one
@@ -2094,24 +2168,26 @@ fn install_and_uninstall_agree_about_an_id_with_only_a_residual_artifact() {
     assert_ne!(uninstall_code, 0, "so uninstall cannot report it gone");
 }
 
-// Known gap: daemons this privilege level cannot enumerate ============================================================
+// Ids goetia could not classify =======================================================================================
 //
-// `list`, `status` with no ids, and `show` with no ids all answer from `list()` alone, which cannot
-// report an id it could not enumerate — no warning, no `errors[]` entry, nothing. An unelevated
-// `goetia daemon list` therefore returns an empty document and exit `0` on a host that does have
-// goetia daemons installed. The README documents it.
-//
-// The tests below record *today's* behaviour, not desired behaviour. Closing the gap needs a
-// `ServiceManager` trait change (a `list()` that can report what it could not see) and is a
-// separate work item; when it lands, these two tests are the ones that must change.
+// `list`, `status` with no ids, and `show` with no ids all answer from `list()`, which reports an id
+// it could not classify at all as one `undetermined` entry — naming that id, or, for a read that
+// denied many at once, naming nobody. It is not an `errors[]` entry on that path: the command
+// succeeded and reported everything it could see, and the entry is a stated limit on the answer's
+// completeness. `status <id>` reports the same fact about one named id as `errors[].kind:
+// "undetermined"` instead; both are exit `4`.
 
+/// An id `list()` cannot enumerate is reported rather than dropped — the silence the third key
+/// exists to end. Keeps its fixture's asymmetry: a direct `status(&id)` still finds the daemon the
+/// listing could not describe.
 #[skuld::test]
-fn known_gap_list_silently_omits_a_daemon_it_cannot_enumerate() {
+fn list_reports_a_daemon_it_cannot_enumerate_as_undetermined() {
     let inner = Fake::new();
     inner.install(&mk("ghost"), false).unwrap();
     let mgr = FlakyManager {
         inner,
         hidden_from_list: Some("ghost".to_string()),
+        undetermined_in_list: Some("ghost".to_string()),
         ..Default::default()
     };
     assert!(
@@ -2122,23 +2198,33 @@ fn known_gap_list_silently_omits_a_daemon_it_cannot_enumerate() {
     let (code, out, err) = dispatch_with(&["goetia", "--json", "daemon", "list"], &mgr, &never_elevated);
 
     let doc = parse_json(&out);
-    assert!(daemons(&doc).is_empty(), "the installed daemon is missing: {doc}");
-    assert!(errors(&doc).is_empty(), "and nothing says so: {doc}");
-    assert_eq!(code, 0, "which is indistinguishable from a host with no daemons");
-    assert_eq!(err, "", "not even a warning");
+    assert!(daemons(&doc).is_empty(), "the listing still cannot describe it: {doc}");
+    assert!(errors(&doc).is_empty(), "and it is not a failure of the command: {doc}");
+    assert_eq!(undetermined_names(&doc), [Some("ghost".to_string())], "{doc}");
+    assert_eq!(code, 4, "no longer indistinguishable from a host with no daemons");
+    assert_eq!(err, "", "--json puts everything in the document");
+
+    let (text_code, _, text_err) = dispatch_with(&["goetia", "daemon", "list"], &mgr, &never_elevated);
+
+    assert_eq!(text_code, 4, "{text_err}");
+    assert!(
+        text_err.contains("ghost") && text_err.contains("could not be determined"),
+        "text mode warns about it too: {text_err}"
+    );
 }
 
 #[skuld::test]
-fn known_gap_status_with_no_ids_silently_omits_a_daemon_it_cannot_enumerate() {
+fn status_with_no_ids_reports_a_daemon_it_cannot_enumerate() {
     let inner = Fake::new();
     inner.install(&mk("ghost"), false).unwrap();
     let mgr = FlakyManager {
         inner,
         hidden_from_list: Some("ghost".to_string()),
+        undetermined_in_list: Some("ghost".to_string()),
         ..Default::default()
     };
 
-    let (all_code, all_out, all_err) = dispatch_with(&["goetia", "--json", "daemon", "status"], &mgr, &never_elevated);
+    let (all_code, all_out, _) = dispatch_with(&["goetia", "--json", "daemon", "status"], &mgr, &never_elevated);
     let (one_code, one_out, _) = dispatch_with(
         &["goetia", "--json", "daemon", "status", "ghost"],
         &mgr,
@@ -2148,13 +2234,314 @@ fn known_gap_status_with_no_ids_silently_omits_a_daemon_it_cannot_enumerate() {
     let all = parse_json(&all_out);
     assert!(daemons(&all).is_empty(), "{all}");
     assert!(errors(&all).is_empty(), "{all}");
-    assert_eq!(all_code, 0);
-    assert_eq!(all_err, "");
+    assert_eq!(undetermined_names(&all), [Some("ghost".to_string())], "{all}");
+    assert_eq!(all_code, 4);
 
-    // The asymmetry, stated as one assertion: naming the id finds exactly the daemon the no-ids
-    // form could not see.
+    // The asymmetry, unchanged: naming the id finds exactly the daemon the no-ids form could not
+    // describe.
     assert_eq!(daemon_ids(&parse_json(&one_out)), ["ghost"], "{one_out}");
     assert_eq!(one_code, 0);
+}
+
+/// The key belongs to the envelope, not to the cases that populate it: a consumer reading
+/// `doc["undetermined"]` must never meet a missing key, which is what an accidental
+/// `skip_serializing_if` would produce.
+#[skuld::test]
+fn list_json_always_has_an_undetermined_key() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+
+    let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
+
+    let doc = parse_json(&out);
+    assert!(undetermined(&doc).is_empty(), "{doc}");
+    assert_eq!(code, 0, "{out}");
+}
+
+#[skuld::test]
+fn list_json_reports_an_opaque_daemon_as_undetermined() {
+    let fake = Fake::new();
+    fake.seed_opaque("opaque");
+
+    let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
+
+    let doc = parse_json(&out);
+    assert_eq!(undetermined_names(&doc), [Some("opaque".to_string())], "{doc}");
+    assert!(
+        !undetermined(&doc)[0]["reason"]
+            .as_str()
+            .expect("`reason` must be a string")
+            .is_empty(),
+        "an undetermined entry must say why: {doc}"
+    );
+    assert!(daemons(&doc).is_empty(), "no ownership was established: {doc}");
+    assert!(errors(&doc).is_empty(), "{doc}");
+    assert_eq!(code, 4, "{out}");
+}
+
+/// The decided split, pinned so a later change cannot quietly move it: on the `list()` path
+/// indeterminacy is the third key and never an `errors[]` entry, so a consumer can read it without
+/// parsing `kind` strings. `status <id>` is the other half
+/// (`status_json_for_a_named_undetermined_id_is_an_errors_entry`).
+#[skuld::test]
+fn list_json_undetermined_is_not_an_errors_entry() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_opaque("opaque");
+
+    let (_code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
+
+    let doc = parse_json(&out);
+    assert!(errors(&doc).is_empty(), "{doc}");
+    assert_eq!(undetermined_names(&doc), [Some("opaque".to_string())], "{doc}");
+    assert_eq!(
+        daemon_ids(&doc),
+        ["frpc"],
+        "what it could read is still reported: {doc}"
+    );
+}
+
+/// The exit code folds over both keys at once. Two partial answers of different shapes — an id
+/// goetia owns and cannot report on, and an id it could not classify at all — still combine to the
+/// one partial-answer code.
+#[skuld::test]
+fn list_exits_four_when_an_unreadable_entry_accompanies_an_undetermined_one() {
+    let fake = Fake::new();
+    fake.seed_unreadable("corrupt");
+    fake.seed_opaque("opaque");
+
+    let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
+
+    let doc = parse_json(&out);
+    assert_eq!(error_kinds(&doc), ["unreadable"], "{doc}");
+    assert_eq!(undetermined_names(&doc), [Some("opaque".to_string())], "{doc}");
+    assert_eq!(code, 4, "{out}");
+}
+
+/// The sibling assertion for `list_exit_code_is_the_same_with_and_without_json`, extended to the
+/// third key: a verb whose exit code depends on its output format is the split the envelope exists
+/// to remove.
+#[skuld::test]
+fn list_exit_code_is_the_same_with_and_without_json_for_an_undetermined_entry() {
+    let fake = Fake::new();
+    fake.seed_opaque("opaque");
+
+    let (plain, _, plain_err) = dispatch_read_only(&["goetia", "daemon", "list"], &fake);
+    let (json, _, _) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
+
+    assert_eq!(plain, json, "the exit code must not depend on the output format");
+    assert_eq!(plain, 4);
+    assert!(
+        plain_err.contains("opaque"),
+        "text mode names what it could not determine: {plain_err}"
+    );
+}
+
+/// Named entries by name, then the aggregates that name nobody — one ordering, applied where the
+/// index is built so the text renderer (which reads the index, not the `Report`) cannot drift from
+/// the document. The manager deliberately emits them in the opposite order.
+#[skuld::test]
+fn list_json_orders_named_entries_before_aggregates() {
+    let fake = Fake::new();
+    fake.seed_opaque("zulu");
+    fake.seed_opaque("alpha");
+    fake.seed_aggregate_undetermined("3 services could not be enumerated at this privilege level");
+
+    let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
+
+    let doc = parse_json(&out);
+    assert_eq!(
+        undetermined_names(&doc),
+        [Some("alpha".to_string()), Some("zulu".to_string()), None],
+        "{doc}"
+    );
+    assert_eq!(code, 4, "{out}");
+}
+
+/// The other half of the split: asked about one named id, `status` answers with that id's own
+/// failure, in `errors`, where every other per-id answer of its lives.
+#[skuld::test]
+fn status_json_for_a_named_undetermined_id_is_an_errors_entry() {
+    let fake = Fake::new();
+    fake.seed_opaque("opaque");
+
+    let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "status", "opaque"], &fake);
+
+    let doc = parse_json(&out);
+    assert_eq!(error_kinds(&doc), ["undetermined"], "{doc}");
+    assert_eq!(errors(&doc)[0]["id"], "opaque");
+    assert!(
+        undetermined(&doc).is_empty(),
+        "the third key is the `list()` path's: {doc}"
+    );
+    assert_eq!(code, 4, "{out}");
+}
+
+#[skuld::test]
+fn status_text_for_an_undetermined_id_does_not_say_not_installed() {
+    let fake = Fake::new();
+    fake.seed_opaque("opaque");
+
+    let (code, _out, err) = dispatch_read_only(&["goetia", "daemon", "status", "opaque"], &fake);
+
+    assert_eq!(code, 4, "{err}");
+    assert!(!err.contains("not installed"), "no absence was established: {err}");
+    assert!(
+        !err.contains("not managed by goetia"),
+        "nor anyone else's ownership: {err}"
+    );
+}
+
+#[skuld::test]
+fn show_reports_indeterminacy_rather_than_absence_for_an_opaque_id() {
+    let fake = Fake::new();
+    fake.seed_opaque("opaque");
+
+    let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "show", "opaque"], &fake);
+
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(out, "", "there is no spec to render");
+    assert!(!err.contains("not installed"), "{err}");
+    assert!(err.contains("opaque"), "{err}");
+}
+
+/// With no ids, an undetermined entry never enters the loop — it has no spec to show — so only the
+/// pre-loop escalation can flag it. Without that, `show` prints a complete-looking dump and exits
+/// `0` on a host where it could not read half the daemons.
+#[skuld::test]
+fn show_with_no_ids_exits_four_when_something_could_not_be_read() {
+    let fake = Fake::new();
+    fake.install(&mk("readable"), false).unwrap();
+    fake.seed_opaque("opaque");
+
+    let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "show"], &fake);
+
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(out.contains("# readable"), "what it could read is still shown: {out}");
+    assert!(err.contains("opaque"), "{err}");
+}
+
+/// The null-name rule at its one call site: an aggregate entry may stand for the very id being
+/// asked about, so "not installed" does not follow from that id going unnamed — not for the
+/// message, and not for the exit code.
+#[skuld::test]
+fn show_refuses_to_call_an_id_absent_while_an_aggregate_is_present() {
+    let fake = Fake::new();
+    fake.seed_aggregate_undetermined("2 services could not be enumerated at this privilege level");
+
+    let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "show", "nowhere"], &fake);
+
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        !err.contains("not installed"),
+        "the listing establishes no absence: {err}"
+    );
+}
+
+/// `uninstall` is the one verb an absent artifact satisfies — and an undetermined id is not absent,
+/// so `absent_is_success` must not swallow it. "Confirmed gone" for an id nobody could read is the
+/// same false certificate the flag's own doc comment forbids.
+#[skuld::test]
+fn uninstall_exits_four_for_an_undetermined_id() {
+    let fake = Fake::new();
+    fake.seed_opaque("opaque");
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "uninstall", "opaque"], &fake);
+
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(!out.contains("nothing to do"), "{out}");
+    assert!(err.contains("opaque"), "{err}");
+}
+
+#[skuld::test]
+fn start_exits_four_for_an_undetermined_id() {
+    let fake = Fake::new();
+    fake.seed_opaque("opaque");
+
+    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "start", "opaque"], &fake);
+
+    assert_eq!(code, 4, "{err}");
+    assert!(err.contains("opaque"), "{err}");
+}
+
+/// `restart` re-wraps the start leg's failure to say the daemon is now down. The wrap must preserve
+/// the variant, or the state where the distinction matters most — stopped, and not back up — is the
+/// one that reports a plain failure.
+#[skuld::test]
+fn restart_exits_four_for_an_undetermined_id() {
+    let inner = Fake::new();
+    inner.install(&mk("frpc"), false).unwrap();
+    let mgr = FlakyManager {
+        inner,
+        undetermined_start_for: Some("frpc".to_string()),
+        ..Default::default()
+    };
+
+    let (code, _out, err) = dispatch_with(&["goetia", "daemon", "restart", "frpc"], &mgr, &|| true);
+
+    assert_eq!(code, 4, "{err}");
+    assert!(
+        err.contains("stopped but failed to restart"),
+        "the context the wrap exists for survives it: {err}"
+    );
+}
+
+/// The combination a scalar exit flag could not express: one id that failed determinately and one
+/// goetia could not answer for at all.
+#[skuld::test]
+fn an_id_verb_reports_error_over_indeterminate() {
+    let fake = Fake::new();
+    fake.seed_opaque("opaque");
+
+    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "start", "opaque", "missing"], &fake);
+
+    assert_eq!(code, 1, "a determinate failure outranks an unanswered question: {err}");
+}
+
+#[skuld::test]
+fn install_exits_four_for_an_undetermined_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "daemons:\n  opaque:\n    command: [daemon]\n");
+    let fake = Fake::new();
+    fake.seed_opaque("opaque");
+
+    let (code, _out, err) = dispatch_elevated(
+        &["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()],
+        &fake,
+    );
+
+    assert_eq!(code, 4, "{err}");
+    assert!(err.contains("opaque"), "{err}");
+}
+
+/// `install`'s three classes through the one precedence rule: a refusal outranks an unanswered
+/// question, which outranks a conflict. The middle rank is the one this task adds — `install` used
+/// to report the unanswered question as a plain failure, disagreeing with `diff` about one
+/// artifact.
+#[skuld::test]
+fn install_error_beats_indeterminate_beats_conflict() {
+    let two_dir = tempfile::tempdir().unwrap();
+    let three_dir = tempfile::tempdir().unwrap();
+    let two = write_manifest(
+        two_dir.path(),
+        "daemons:\n  opaque:\n    command: [daemon]\n  edited:\n    command: [daemon]\n",
+    );
+    let three = write_manifest(
+        three_dir.path(),
+        "daemons:\n  opaque:\n    command: [daemon]\n  edited:\n    command: [daemon]\n  stranger:\n    command: [daemon]\n",
+    );
+    let fake = Fake::new();
+    fake.seed_opaque("opaque");
+    fake.install_then_hand_edit(&mk("edited"), "# hand-added directive\n");
+    fake.seed_foreign("stranger", "not a goetia artifact at all\n");
+
+    let (two_code, _, two_err) =
+        dispatch_elevated(&["goetia", "daemon", "install", "-f", two.to_str().unwrap()], &fake);
+    let (three_code, _, three_err) =
+        dispatch_elevated(&["goetia", "daemon", "install", "-f", three.to_str().unwrap()], &fake);
+
+    assert_eq!(two_code, 4, "indeterminate outranks conflict: {two_err}");
+    assert_eq!(three_code, 1, "a refusal outranks both: {three_err}");
 }
 
 // --json write failures ===============================================================================================
