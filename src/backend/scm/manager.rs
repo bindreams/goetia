@@ -1078,9 +1078,15 @@ fn unreadable_aggregate(count: usize) -> Option<Installed> {
 /// recoveries. Elevation is offered as the usual remedy, not as the
 /// diagnosis.
 fn unreadable_notice(count: usize) -> String {
-    let s = if count == 1 { "" } else { "s" };
+    // All three agreements bound together: a fourth added later has nowhere
+    // to hide, which is how the possessive came to disagree with its own
+    // subject in the plural branch.
+    let (s, them, their) = if count == 1 {
+        ("", "it", "its")
+    } else {
+        ("s", "them", "their")
+    };
     format!(
-        "{count} service{s} could not be inspected (its registry Parameters could not be read). Ownership is unknown for {}, so a Goetia daemon may be missing from this list; on an unelevated run, re-running elevated is the usual remedy.",
-        if count == 1 { "it" } else { "them" }
+        "{count} service{s} could not be inspected ({their} registry Parameters could not be read). Ownership is unknown for {them}, so a Goetia daemon may be missing from this list; on an unelevated run, re-running elevated is the usual remedy."
     )
 }
