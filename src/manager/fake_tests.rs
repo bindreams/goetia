@@ -332,6 +332,28 @@ fn an_opaque_id_shadows_an_entry_at_the_same_id() {
     }
 }
 
+/// `list` must agree with `Store::get` about a shadowed id: exactly one
+/// entry, and not the `Ours` the failed read would have found. Nothing else
+/// here checks it — the shadowing test above never calls `list`, and the
+/// two `list` tests use ids that are opaque *or* installed, never both — so
+/// without this, `list` can report one id twice, as unclassifiable and as
+/// goetia's at once.
+#[skuld::test]
+fn an_opaque_id_is_listed_once_and_not_as_ours() {
+    let fake = Fake::new();
+    let spec = mk("shadowed");
+    fake.install(&spec, false).unwrap();
+    fake.seed_opaque(spec.id.as_str());
+
+    let listed = fake.list().unwrap();
+
+    assert_eq!(listed.len(), 1, "a shadowed id must be reported once: {listed:?}");
+    assert!(
+        matches!(&listed[0], Installed::Undetermined { name, .. } if name.as_deref() == Some("shadowed")),
+        "list must report the failed read, not the entry that read would have found: {listed:?}"
+    );
+}
+
 /// Both ways out, and not the third: `uninstall` is `RefuseUnreadable`'s
 /// remedy and certifies ownership, which is precisely what was not
 /// established here.

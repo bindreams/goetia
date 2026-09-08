@@ -818,7 +818,10 @@ fn list_ignores_foreign_units() {
     let present = listed.into_iter().any(|entry| match entry {
         Installed::Ours { spec, .. } => spec.id.as_str() == guard.id(),
         Installed::OursUnreadable { name, .. } => name == guard.id(),
-        Installed::Undetermined { name, .. } => name.as_deref() == Some(guard.id()),
+        // An aggregate may stand for this id: `present` stays the basis for
+        // a negative assertion, so an entry that cannot rule the id out must
+        // fail it rather than pass by going unnamed.
+        Installed::Undetermined { name, .. } => name.is_none() || name.as_deref() == Some(guard.id()),
     });
     assert!(!present, "a foreign unit must not appear in list()");
 }

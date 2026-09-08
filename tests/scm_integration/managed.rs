@@ -165,7 +165,13 @@ fn uninstall_leaves_nothing() {
         installed.iter().all(|entry| match entry {
             Installed::Ours { spec: s, .. } => s.id.as_str() != id,
             Installed::OursUnreadable { name, .. } => name != &id,
-            Installed::Undetermined { name, .. } => name.as_deref() != Some(id.as_str()),
+            Installed::Undetermined { name, .. } => match name {
+                Some(n) => n != &id,
+                // An aggregate may stand for this id, so its absence cannot
+                // be concluded: fail rather than certify what list cannot
+                // establish. See `Installed::Undetermined`.
+                None => false,
+            },
         }),
         "uninstalled id must not appear in list"
     );
@@ -183,7 +189,13 @@ fn list_ignores_foreign_services() {
         installed.iter().all(|entry| match entry {
             Installed::Ours { spec, .. } => spec.id.as_str() != id,
             Installed::OursUnreadable { name, .. } => name != &id,
-            Installed::Undetermined { name, .. } => name.as_deref() != Some(id.as_str()),
+            Installed::Undetermined { name, .. } => match name {
+                Some(n) => n != &id,
+                // An aggregate may stand for this id, so its absence cannot
+                // be concluded: fail rather than certify what list cannot
+                // establish. See `Installed::Undetermined`.
+                None => false,
+            },
         }),
         "a foreign service must never appear in list"
     );

@@ -129,6 +129,13 @@ pub enum Installed {
     /// a backend that could not enumerate a whole directory knows a count,
     /// not names. An entry for exactly one known id always names it.
     ///
+    /// What a `None` obliges of every caller: **while such an entry is
+    /// present, no negative conclusion about any id is sound.** It may
+    /// stand for the very id being asked about, so "`x` is absent" does not
+    /// follow from `x` going unnamed in the list — not for rendering, not
+    /// for an exit code, and not for a test assertion, which must fail
+    /// rather than certify what the list cannot establish.
+    ///
     /// Carries no `recovery`: that text belongs to [`Error::Undetermined`],
     /// which each backend builds through its own constructor, and a second
     /// independently worded remedy per `list` entry would put two answers
