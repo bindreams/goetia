@@ -520,7 +520,12 @@ Per platform:
   reported as `undetermined`, named. A fragment that _was_ read and is not
   UTF-8 is foreign and omitted, per the rule above; so is a symlink (what
   `systemctl mask` leaves), a FIFO, a device node or a directory, none of
-  which is a unit file goetia wrote.
+  which is a unit file goetia wrote. The fragment is not the id: an
+  `<id>.service.d` drop-in that could not be read is reported the same way,
+  named, **with no fragment at all** — that read is what would have told
+  goetia whether anything occupies the id, so `status` and `list` answer it
+  identically instead of one saying "cannot determine" while the other
+  leaves the id out.
 - **launchd** — a plist whose bytes could not be **obtained** is reported as
   `undetermined`, named. Bytes that were obtained and are not UTF-8 XML are
   foreign and omitted, per the same rule — a binary plist (`bplist00`, what

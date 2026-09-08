@@ -395,7 +395,7 @@ fn an_absent_unit_directory_is_an_empty_listing_not_a_failure() {
 }
 
 #[skuld::test]
-fn a_pass_that_finishes_names_every_fragment_and_nothing_else() {
+fn a_pass_that_finishes_names_every_fragment_and_drop_in_and_nothing_else() {
     let tmp = tempfile::tempdir().expect("tempdir");
     std::fs::write(tmp.path().join("kept.service"), "").expect("write the fragment");
     std::fs::write(tmp.path().join("ignored.conf"), "").expect("write the non-fragment");
@@ -408,8 +408,24 @@ fn a_pass_that_finishes_names_every_fragment_and_nothing_else() {
         ["kept"],
         "{scan:?}"
     );
+    assert_eq!(scan.dropins, ["kept"], "{scan:?}");
     assert!(
         scan.incomplete.is_none(),
         "a pass that finished has nothing to report: {scan:?}"
     );
+}
+
+/// The name is what the pass reports, and nothing about it is stat'd: a *regular file* named
+/// `<id>.service.d` is the shape `read_dir` answers `ENOTDIR` for under every uid, root's included,
+/// and it is precisely the id `list` used to drop. A pass that classified the name by type would
+/// leave it out again at exactly the privilege level where the state is real.
+#[skuld::test]
+fn a_drop_in_name_that_is_not_a_directory_still_names_its_id() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("blocked.service.d"), "").expect("write the blocking file");
+
+    let scan = scan_unit_dir(tmp.path());
+
+    assert!(scan.units.is_empty(), "there is no fragment here: {scan:?}");
+    assert_eq!(scan.dropins, ["blocked"], "{scan:?}");
 }

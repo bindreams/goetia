@@ -308,7 +308,7 @@ pub(super) struct Discovery {
 
 pub(super) fn discover(id: &str) -> Result<Discovery> {
     match raw_state(id)? {
-        RawState::Absent => match residue(id)? {
+        RawState::Absent => match residue(id).map_err(|failure| failure.undetermined(id))? {
             None => Ok(Discovery {
                 ownership: Ownership::Absent,
                 on_disk: None,
@@ -447,7 +447,7 @@ fn undetermined(id: &str, op: &str, path: &Path, source: &io::Error) -> Error {
 /// Goetia only ever writes into the first `/etc/systemd/system` entry (`UNIT_DIR`); every other root
 /// is read-only from this backend's point of view, so a drop-in found there is detected (folded into
 /// `on_disk`, so `decide` reports drift) but never removed by a successful write.
-const DROPIN_SEARCH_DIRS: [&str; 12] = [
+pub(super) const DROPIN_SEARCH_DIRS: [&str; 12] = [
     "/etc/systemd/system.control",
     "/run/systemd/system.control",
     "/run/systemd/transient",
@@ -610,8 +610,11 @@ impl Residue {
     }
 }
 
-/// What is left at `id` besides the fragment, `None` when the id is genuinely unoccupied, or
-/// [`Error::Undetermined`] when a read this answer depends on failed — see [`undetermined`].
+/// What is left at `id` besides the fragment, `None` when the id is genuinely unoccupied, or a
+/// [`ReadFailure`] when a read this answer depends on did not complete. What that failure *means*
+/// stays the caller's, as everywhere else in this module: [`Error::Undetermined`] for the verbs
+/// (see [`undetermined`]), a named `Installed::Undetermined` entry for `Systemd::list` (see
+/// [`residue_read`]).
 ///
 /// The single source of "is this id really empty" for both [`discover`] (so `install` never
 /// silently adopts what it did not write) and [`require_installed`] (so `uninstall` never reports
@@ -619,8 +622,8 @@ impl Residue {
 /// something on it). Two verbs answering that question from different evidence is exactly how
 /// `uninstall x && echo "confirmed gone"` came to print for a unit still loaded, still running and
 /// still `.wants`-linked.
-fn residue(id: &str) -> Result<Option<Residue>> {
-    let dropin = dropin_dirs(id).map_err(|failure| failure.undetermined(id))?;
+fn residue(id: &str) -> ReadResult<Option<Residue>> {
+    let dropin = dropin_dirs(id)?;
     let mut links = Vec::new();
     for search_dir in WANTS_SEARCH_DIRS {
         let link = Path::new(search_dir).join(WANTS_DIR).join(format!("{id}.service"));
@@ -629,13 +632,26 @@ fn residue(id: &str) -> Result<Option<Residue>> {
         match fs::symlink_metadata(&link) {
             Ok(_) => links.push(link),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(undetermined(id, "stat", &link, &e)),
+            Err(e) => return Err(ReadFailure::new("stat", &link, e)),
         }
     }
     if dropin.is_empty() && links.is_empty() {
         return Ok(None);
     }
     Ok(Some(Residue { dropin, links }))
+}
+
+/// The [`residue`] reads on their own, for `Systemd::list`: `Err` exactly when what would have
+/// settled whether anything occupies `id` did not complete.
+///
+/// What the scan *found* is not `list`'s business — residue under an absent fragment is
+/// `Ownership::Foreign` (see [`discover`]), and `list` omits foreign ids the same as it omits an
+/// unoccupied one. The *failure* is, and for the reason the whole class exists: leaving the id out
+/// of the enumeration is how a listing says it is not there, and this read established no such
+/// thing. `Systemd::status` answers [`Error::Undetermined`] off the identical failure, so this is
+/// also what keeps the two from describing one filesystem state differently.
+pub(super) fn residue_read(id: &str) -> ReadResult<()> {
+    residue(id).map(drop)
 }
 
 /// The error for an id whose fragment [`raw_state`] found absent: [`Error::NotInstalled`] only when
@@ -646,7 +662,7 @@ fn residue(id: &str) -> Result<Option<Residue>> {
 /// for the read-only one — goes through here, so none of them can disagree with [`discover`] about
 /// one filesystem state.
 pub(super) fn absent_error(id: &str) -> Result<Error> {
-    Ok(match residue(id)? {
+    Ok(match residue(id).map_err(|failure| failure.undetermined(id))? {
         None => Error::NotInstalled { id: id.to_string() },
         Some(residue) => Error::Foreign {
             id: id.to_string(),

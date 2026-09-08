@@ -104,6 +104,19 @@ fn write_unreadable_dropin(id: &str) {
     fs::set_permissions(dropin_dir(id), fs::Permissions::from_mode(0o000)).expect("chmod 0000");
 }
 
+/// A regular file where `<id>.service.d` belongs. `read_dir` on it answers `ENOTDIR`, which no
+/// privilege dissolves — `CAP_DAC_OVERRIDE` overrides permission bits, not the fact that a file is
+/// not a directory — so this is the one artifact an *elevated* suite can leave unclassifiable, and
+/// the seed both this file's own drop-in tests and `systemd_passes_conformance` use.
+///
+/// Its own removal, not `ServiceGuard`'s: that cleans a drop-in with `remove_dir_all`, which cannot
+/// remove a file.
+fn seed_unreadable_dropin_enotdir(id: &str) -> RmPath {
+    let path = dropin_dir(id);
+    fs::write(&path, b"").unwrap_or_else(|e| panic!("seed {}: {e}", path.display()));
+    RmPath(path)
+}
+
 /// Seed one `*.conf` into an arbitrary drop-in directory and hand back the RAII removal of it. The
 /// parent search root is left exactly as found: `/etc/systemd/system` is shared with every other
 /// test running concurrently.
@@ -1096,6 +1109,80 @@ fn unelevated_list_reports_a_root_only_unit_as_undetermined() {
         !listed.ids("daemons").contains(&Some(id.clone())),
         "a fragment goetia could not open is not a daemon it can report the state of: {}",
         listed.context
+    );
+}
+
+/// The sibling half of the same obligation, on the path `residue` exists for: **the fragment is not
+/// the id**. An `<id>.service.d` goetia cannot read, with no `<id>.service` at all, is an id whose
+/// classification never completed — `status` says exactly that, exit `4` — so a listing that
+/// enumerates fragments alone leaves it out and lets `show` answer "is not installed", a negative
+/// drawn from a read that established nothing.
+///
+/// Seeded as a *regular file* where the directory belongs: `read_dir` answers `ENOTDIR` for every
+/// uid, root's included, so this holds in an elevated binary rather than only below the privilege
+/// boundary.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn list_reports_an_id_whose_dropin_it_cannot_read_with_no_fragment_at_all() {
+    let id = support::random_test_id();
+    let _cleanup = seed_unreadable_dropin_enotdir(&id);
+    assert!(!unit_path(&id).exists(), "the fragment must really be absent");
+
+    let listed = Systemd::new()
+        .list()
+        .expect("one unreadable drop-in must not take down the whole listing");
+
+    assert!(
+        listed.iter().any(|entry| matches!(
+            entry,
+            Installed::Undetermined { name: Some(name), .. } if name == &id
+        )),
+        "the read that would have classified {id} never completed, so omitting it from the \
+         enumeration would say it is not there: {listed:?}"
+    );
+    assert!(
+        !listed
+            .iter()
+            .any(|entry| matches!(entry, Installed::Ours { spec, .. } if spec.id.as_str() == id)),
+        "nothing was read, so nothing may be claimed: {listed:?}"
+    );
+
+    // The two must describe one filesystem state identically — the divergence this closes was
+    // `status` answering `4` for the same id `list` left out entirely.
+    let err = Systemd::new()
+        .status(&Id::try_from(id.clone()).expect("valid id"))
+        .expect_err("a drop-in that could not be read leaves the id unclassified");
+    assert!(matches!(err, goetia::Error::Undetermined { .. }), "{err:?}");
+}
+
+/// The same defect at the privilege boundary where it is routine — an administrator's drop-in
+/// shipped `0700` for a unit that lives in `/usr/lib`, met by an unelevated `list` — and stated as
+/// the CLI answers it: `show` may never call an id absent on a listing that did not establish
+/// absence.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn unelevated_show_cannot_call_absent_an_id_whose_dropin_it_could_not_read() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    write_unreadable_dropin(guard.id());
+    assert!(!unit_path(guard.id()).exists(), "the fragment must really be absent");
+
+    let listed = list_json();
+
+    // Root reads this drop-in fine and reports nothing at all at exit `0`, so a run whose reader was
+    // not unprivileged fails here instead of passing vacuously.
+    assert_eq!(listed.code, Some(4), "{}", listed.context);
+    assert!(
+        listed.ids("undetermined").contains(&Some(id.clone())),
+        "{}",
+        listed.context
+    );
+
+    let shown = run_unelevated(&["daemon", "show", &id]);
+    assert_eq!(
+        shown.status.code(),
+        Some(4),
+        "`not installed` (exit 1) is the negative this listing cannot support: stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&shown.stdout),
+        String::from_utf8_lossy(&shown.stderr)
     );
 }
 

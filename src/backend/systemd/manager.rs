@@ -54,18 +54,22 @@
 //!    id systemd still applies a drop-in to, or still enrolls at boot through a
 //!    `multi-user.target.wants` link. `discover::residue` is the one predicate both `install`'s
 //!    `discover` and every other verb's `require_installed`/`status` ask, so no two verbs can
-//!    describe one filesystem state differently.
+//!    describe one filesystem state differently — `list` included, which asks it (through
+//!    `discover::residue_read`) of every id it enumerates with no readable fragment. A listing that
+//!    asked less would leave out an id `status` answers `Error::Undetermined` for, and leaving an
+//!    id out is how a listing says nothing is there.
 
 mod dirs;
 mod discover;
 mod systemctl;
 mod write;
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use discover::{RawState, absent_error, classify_and_read, discover, raw_state, require_installed};
+use discover::{DROPIN_SEARCH_DIRS, RawState, absent_error, classify_and_read, discover, raw_state, require_installed};
 use systemctl::{daemon_reload, daemon_reload_or_report, run_systemctl, start_impl, status_from_unit, stop_impl};
 use write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 
@@ -279,7 +283,7 @@ impl ServiceManager for Systemd {
     }
 
     fn list(&self) -> Result<Vec<Installed>> {
-        let scan = scan_unit_dir(Path::new(UNIT_DIR));
+        let scan = scan_host();
 
         let mut out = Vec::new();
         for (id, path) in &scan.units {
@@ -289,10 +293,16 @@ impl ServiceManager for Systemd {
             // differently.
             let text = match classify_and_read(path) {
                 Ok(RawState::Regular(text)) => text,
-                // Gone between the scan and the open, or established as nothing goetia wrote (a
-                // masked unit's symlink, a FIFO, a `.d` directory, bytes that are not UTF-8):
-                // obligations 2 and 3, and foreign entries are what `list` omits.
-                Ok(RawState::Absent | RawState::NotOurs) => continue,
+                // Established as nothing goetia wrote (a masked unit's symlink, a FIFO, a `.d`
+                // directory, bytes that are not UTF-8): obligations 2 and 3, and foreign entries
+                // are what `list` omits.
+                Ok(RawState::NotOurs) => continue,
+                // Gone between the scan and the open. That settles the *fragment*, not the id —
+                // obligation 7 — so it takes the same question every other fragmentless id gets.
+                Ok(RawState::Absent) => {
+                    out.extend(residue_entry(id));
+                    continue;
+                }
                 // A read that did not complete establishes nothing about the id — least of all that
                 // it is absent, which is what omitting it from the enumeration would say.
                 Err(failure) => {
@@ -328,6 +338,12 @@ impl ServiceManager for Systemd {
                 }),
             }
         }
+        // The ids with no fragment of their own. Obligation 7 again: what occupies an id is not the
+        // fragment file, so an id whose *drop-in* could not be read is exactly as unclassified as
+        // one whose fragment could not be — and `status` says so for both.
+        for id in &scan.dropin_only {
+            out.extend(residue_entry(id));
+        }
         // Last, so a scan that got some way in still reports what it named before what it could
         // not — the order `cli::support::partition_installed` imposes on the rendered output too.
         out.extend(scan.incomplete);
@@ -335,13 +351,98 @@ impl ServiceManager for Systemd {
     }
 }
 
+/// What `list` reports for an id with no readable fragment. Both determinate outcomes are reported
+/// by omission, which is why what the scan found is discarded: no residue is an unoccupied id, and
+/// residue under an absent fragment is `Ownership::Foreign`, which `list` leaves out like any other
+/// foreign id. Only a read that did not complete gets an entry, because omission would claim it.
+fn residue_entry(id: &str) -> Option<Installed> {
+    discover::residue_read(id).err().map(|failure| Installed::Undetermined {
+        name: Some(id.to_string()),
+        reason: failure.detail(),
+    })
+}
+
 // Enumeration =========================================================================================================
 
-/// What one pass over a unit directory found: the `<id>.service` fragments it reached, and — when
-/// the pass stopped early — the entry standing for whatever it never did.
+/// Every id `Systemd::list` has to answer for, and the entries standing for whatever the passes
+/// that produced it never reached.
+///
+/// # Which ids those are
+///
+/// The same two names `discover` calls this id's artifact, asked of the same directories `discover`
+/// asks: `<id>.service` in [`UNIT_DIR`] alone, the only fragment path this backend ever reads or
+/// writes, and `<id>.service.d` under every root of [`DROPIN_SEARCH_DIRS`], since
+/// `discover::residue` counts one there as much as one in `/etc`.
+///
+/// Reaching exactly as far as `residue` is the point. An id whose drop-in could not be read is
+/// `Error::Undetermined` to `status`; a listing that never enumerated it says, by leaving it out,
+/// that nothing is installed there — the negative conclusion [`Installed::Undetermined`] exists to
+/// forbid. That still bounds the scan well short of the unit load path: only directory *names* come
+/// out of each root, and only the ids they name are asked about.
+///
+/// A fragment under a root other than `UNIT_DIR` deliberately names no id here. `raw_state` looks
+/// for `<id>.service` in `UNIT_DIR` and nowhere else, so a unit shipped in `/usr/lib` is already
+/// `NotInstalled` to every verb goetia has.
+///
+/// # The half of `residue` this does not name: enablement links
+///
+/// `residue` also stats `multi-user.target.wants/<id>.service` under four roots, and an id whose
+/// *only* trace is such a link is not named here. A stated limitation: an unsearchable wants
+/// directory makes `status` answer `Error::Undetermined` for every fragmentless id, this scan has
+/// no name for one whose sole trace was a link there, and `show` would call that id absent.
+///
+/// Both ways of closing it are worse than the hole. A readability probe of each wants directory
+/// answers a *different* question than `residue` asks — mode `0111` denies `read_dir` while every
+/// stat `residue` performs succeeds — so it would stand a permanent aggregate entry, and a
+/// permanent exit `4`, on a host where nothing goetia reads fails. Enumerating their contents
+/// instead asks `residue` about every unit enabled on the host, all foreign by construction, which
+/// is the sweep this bound exists to avoid. The drop-in half needs neither: a handful of directories
+/// name themselves in their own parent's listing, rather than one per enabled unit.
+#[derive(Debug)]
+struct HostScan {
+    /// Ids with a fragment in [`UNIT_DIR`], with its path.
+    units: Vec<(String, PathBuf)>,
+    /// Ids named only by a `<id>.service.d` directory. Disjoint from `units` by construction: an id
+    /// with a fragment is classified through that, and one entry per id is what
+    /// `cli::support::partition_installed` asserts.
+    dropin_only: Vec<String>,
+    /// One per pass that started and did not finish — a root each, since a root that could not be
+    /// enumerated says nothing about the next one.
+    incomplete: Vec<Installed>,
+}
+
+/// The enumeration behind [`HostScan`], one `read_dir` per root.
+fn scan_host() -> HostScan {
+    let unit_dir = scan_unit_dir(Path::new(UNIT_DIR));
+    let mut incomplete: Vec<Installed> = unit_dir.incomplete.into_iter().collect();
+    let mut dropin_ids: BTreeSet<String> = unit_dir.dropins.into_iter().collect();
+    for root in DROPIN_SEARCH_DIRS.iter().filter(|root| **root != UNIT_DIR) {
+        let scan = scan_unit_dir(Path::new(root));
+        // Fragments outside `UNIT_DIR` are not this backend's — see [`HostScan`].
+        dropin_ids.extend(scan.dropins);
+        incomplete.extend(scan.incomplete);
+    }
+    let dropin_only = {
+        let with_fragment: BTreeSet<&str> = unit_dir.units.iter().map(|(id, _)| id.as_str()).collect();
+        dropin_ids
+            .into_iter()
+            .filter(|id| !with_fragment.contains(id.as_str()))
+            .collect()
+    };
+    HostScan {
+        units: unit_dir.units,
+        dropin_only,
+        incomplete,
+    }
+}
+
+/// What one pass over one directory found: the `<id>.service` fragments and `<id>.service.d`
+/// drop-in directories it reached, and — when the pass stopped early — the entry standing for
+/// whatever it never did.
 #[derive(Debug)]
 struct UnitScan {
     units: Vec<(String, PathBuf)>,
+    dropins: Vec<String>,
     incomplete: Option<Installed>,
 }
 
@@ -358,10 +459,12 @@ fn scan_unit_dir(dir: &Path) -> UnitScan {
         Ok(entries) => collect_units(dir, entries.map(|entry| entry.map(|entry| entry.path()))),
         Err(e) if e.kind() == io::ErrorKind::NotFound => UnitScan {
             units: Vec::new(),
+            dropins: Vec::new(),
             incomplete: None,
         },
         Err(e) => UnitScan {
             units: Vec::new(),
+            dropins: Vec::new(),
             incomplete: Some(Installed::scan_incomplete(
                 &dir.display().to_string(),
                 &format!("failed to read directory: {e}"),
@@ -376,12 +479,14 @@ fn scan_unit_dir(dir: &Path) -> UnitScan {
 /// rather than being discarded because a *later* dirent could not be read.
 fn collect_units(dir: &Path, entries: impl Iterator<Item = io::Result<PathBuf>>) -> UnitScan {
     let mut units = Vec::new();
+    let mut dropins = Vec::new();
     for entry in entries {
         let path = match entry {
             Ok(path) => path,
             Err(e) => {
                 return UnitScan {
                     units,
+                    dropins,
                     incomplete: Some(Installed::scan_incomplete(
                         &dir.display().to_string(),
                         &format!("failed to read a directory entry: {e}"),
@@ -394,6 +499,13 @@ fn collect_units(dir: &Path, entries: impl Iterator<Item = io::Result<PathBuf>>)
         let Some(file_name) = path.file_name().map(|name| name.to_string_lossy().into_owned()) else {
             continue;
         };
+        // The name alone, with nothing stat'd: a drop-in directory that is not one — the regular
+        // file `install_refuses_an_unreadable_dropin_over_our_own_fragment` seeds, whose `read_dir`
+        // answers `ENOTDIR` for every uid — is exactly an id this pass must not drop.
+        if let Some(id) = file_name.strip_suffix(".service.d") {
+            dropins.push(id.to_string());
+            continue;
+        }
         let Some(id) = file_name.strip_suffix(".service") else {
             continue;
         };
@@ -401,6 +513,7 @@ fn collect_units(dir: &Path, entries: impl Iterator<Item = io::Result<PathBuf>>)
     }
     UnitScan {
         units,
+        dropins,
         incomplete: None,
     }
 }
