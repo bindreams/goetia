@@ -398,7 +398,14 @@ fn a_symlink_swapped_in_is_classified_not_a_failed_read() {
 }
 
 /// The contract from the other side: an errno that identifies nothing about the artifact stays a
-/// failure, and does not get quietly folded into `NotOurs` because it happened at the same call.
+/// failure, and does not get quietly folded into `NotOurs` because it arrived at the same call that
+/// answers `ELOOP` and `ENXIO` with a verdict.
+///
+/// Asserted at both steps, because each has a catch-all of its own and the folding under test is in
+/// step 2's. Reaching it takes [`step_two`] directly: step 1's `openat` refuses this name first, so
+/// `classify_and_read` alone leaves `read_regular` unentered and would pass with its catch-all
+/// replaced by `Ok(RawState::NotOurs)`.
+///
 /// `ENAMETOOLONG` rather than `EACCES`, so this holds under both uids — this binary runs as root in
 /// CI, where `CAP_DAC_OVERRIDE` reads any mode; `EACCES` is covered end to end under `runuser -u
 /// nobody` in `tests/systemd_integration/linux.rs`.
@@ -407,14 +414,16 @@ fn an_errno_that_identifies_nothing_stays_a_failure() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = tmp.path().join(format!("{}.service", "x".repeat(300)));
 
-    let Err(failure) = classify_and_read(&path) else {
-        panic!("a name the filesystem will not resolve establishes neither presence nor absence");
-    };
-    let detail = failure.detail();
-    assert!(
-        detail.contains("File name too long"),
-        "the errno reaches the caller intact rather than as a generic failure: {detail}"
-    );
+    for (step, result) in [("step 2", step_two(&path)), ("step 1", classify_and_read(&path))] {
+        let Err(failure) = result else {
+            panic!("{step}: a name the filesystem will not resolve establishes neither presence nor absence");
+        };
+        let detail = failure.detail();
+        assert!(
+            detail.contains("File name too long"),
+            "{step}: the errno reaches the caller intact rather than as a generic failure: {detail}"
+        );
+    }
 }
 
 /// The other errno that identifies rather than fails: `open(2)` on a UNIX socket answers `ENXIO`,

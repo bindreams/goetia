@@ -127,8 +127,19 @@ pub(super) enum RawState {
 /// The directory is opened once and both steps `openat` through it. That is not a micro-optimisation
 /// but what makes step 2's errnos readable: a name with no `/` in it, resolved under a descriptor,
 /// cannot fail for anything above the artifact itself, so `ELOOP` there means "this component is a
-/// symlink" and nothing else. Opening the pathname twice instead leaves `ELOOP` ambiguous between
-/// that and a parent turned into a symlink loop, and the two need opposite answers.
+/// symlink" and nothing else.
+///
+/// What that is worth, and what it costs, stated exactly rather than as a general claim about
+/// ambiguity. A parent that is *already* a symlink loop is refused by step 1's own open — measured,
+/// and true of the pathname-twice shape as well, since that open resolves the whole pathname too —
+/// so step 2's map is never reached and no unit is misreported as foreign either way. The case this
+/// closes is the narrow one: a parent turned into a loop *between* the two opens, where a second
+/// resolution of the pathname would answer `ELOOP` about something above the artifact and the map
+/// would read it as the artifact being a symlink. The cost is the mirror image — a parent
+/// *replaced* between the two opens is resolved in the old inode, so step 2 reads what was there
+/// rather than observing the swap. That is a file that really was at this path, the same benign
+/// content race [`read_regular`] documents for the artifact itself, and it is untested: forcing it
+/// takes a rename landing between two adjacent syscalls.
 ///
 /// Step 1 opens `O_PATH | O_NOFOLLOW`. That needs no read permission, never blocks, and is the
 /// documented case that yields a descriptor for the *symlink itself*, so a masked unit (`systemctl

@@ -46,7 +46,7 @@ fn mk(id: &str) -> DaemonSpec {
 
 /// Bytes goetia never writes: `generate::unit` emits UTF-8 ini and nothing else, so a fragment that
 /// will not decode is positively not goetia's — foreign, and omitted from `list` exactly like an
-/// unmarked one. The systemd twin of `tests/launchd_integration/launchd.rs`'s `FOREIGN_ENCODINGS`,
+/// unmarked one. The systemd twin of `tests/launchd_integration/launchd.rs`'s `NON_UTF8_PLIST`,
 /// and the reason those two backends now answer one question one way.
 const NON_UTF8_UNIT: [u8; 4] = [b'[', 0xff, 0xfe, b']'];
 
