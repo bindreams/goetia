@@ -294,6 +294,17 @@ fn obtain(path: &Path) -> Obtained {
     match fs::metadata(path) {
         Ok(meta) if !meta.is_file() => return Obtained::NonRegular,
         Ok(_) => {}
+        // `metadata` follows, so it reports a *dangling* symlink as absent —
+        // but `link`(2) still refuses to create over one (`EEXIST`), and
+        // `locate`'s `symlink_metadata` sees it. Left as `Absent`, the two
+        // classifiers disagree permanently: every verb answers "not
+        // installed" while no write can ever succeed, an unclearable dead
+        // end whose only message says nothing is there. The link itself is
+        // positively not a plist, which is the same presence fact a FIFO
+        // is, so it gets the same answer.
+        Err(e) if e.kind() == io::ErrorKind::NotFound && path.symlink_metadata().is_ok() => {
+            return Obtained::NonRegular;
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Obtained::Absent,
         Err(e) => return Obtained::Failed(e),
     }
@@ -305,7 +316,8 @@ fn obtain(path: &Path) -> Obtained {
     {
         Ok(file) => file,
         // Gone between the two steps: the same uninstall race step 1
-        // tolerates, observed one syscall later.
+        // tolerates, observed one syscall later. A dangling symlink cannot
+        // reach here — step 1 already classified it `NonRegular`.
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Obtained::Absent,
         Err(e) => return Obtained::Failed(e),
     };
@@ -1101,10 +1113,12 @@ impl ServiceManager for LaunchdManager {
             let classified = match obtain(path) {
                 Obtained::Bytes(bytes) => classify(bytes),
                 // Gone between the scan above and this read: an uninstall
-                // that completed, observed one syscall later. Absence is
-                // established, so this is a skip rather than a blind spot —
-                // reporting it would let a benign concurrent uninstall raise
-                // `list`'s host-wide exit code.
+                // that completed, observed one syscall later — now the only
+                // cause, since a dangling symlink is classified `NonRegular`
+                // rather than absent. Absence is established, so this is a
+                // skip rather than a blind spot: reporting it would let a
+                // benign concurrent uninstall raise `list`'s host-wide exit
+                // code.
                 Obtained::Absent => continue,
                 // A FIFO, a directory, a socket: nothing goetia ever wrote,
                 // and established as such rather than merely unread — so it

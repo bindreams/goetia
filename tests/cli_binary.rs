@@ -83,7 +83,12 @@ fn native_backend_answers_list_unelevated() {
 
     let (code, out, err) = run_cli(&["daemon", "list"], dir.path());
 
-    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    // Deliberately not `code == 0`: the exit code is host-wide now, so one
+    // vendor artifact this caller cannot read makes it `4` — a fact about
+    // the runner, not about the wiring under test. `2` is what a missing
+    // backend would produce, and the absent "no backend" line is the real
+    // proof, since the fake would also have exited 0 here.
+    assert_ne!(code, 2, "stdout:\n{out}\nstderr:\n{err}");
     assert!(!err.contains("no backend"), "stderr:\n{err}");
 }
 

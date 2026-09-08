@@ -341,6 +341,26 @@ fn a_symlink_to_a_plist_is_still_followed() {
     }
 }
 
+/// A dangling symlink is the one path where `metadata` (follows) and
+/// `locate`'s `symlink_metadata` (does not) disagree. Left as `Absent`, the
+/// two classifiers never reconcile: every verb answers "not installed" while
+/// `link`(2) refuses to create over the link with `EEXIST`, so the id becomes
+/// an unclearable dead end whose only message says nothing is there.
+/// `NonRegular` is the honest answer — the link is positively not a plist,
+/// the same presence fact a FIFO is.
+#[skuld::test]
+fn a_dangling_symlink_is_not_absence() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let link = tmp.path().join("x.plist");
+    std::os::unix::fs::symlink(tmp.path().join("nothing-here.plist"), &link).expect("plant the symlink");
+
+    assert!(
+        fs::metadata(&link).is_err(),
+        "the fixture must actually dangle, or this pins nothing"
+    );
+    assert!(matches!(obtain(&link), Obtained::NonRegular));
+}
+
 // read_artifact =======================================================================================================
 
 #[skuld::test]
