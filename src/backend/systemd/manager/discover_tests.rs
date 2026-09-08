@@ -325,49 +325,35 @@ fn the_scan_asks_for_this_ids_own_directory_and_no_family_wide_one() {
     );
 }
 
-// Obligation 7: the file read is the file classified ------------------------------------------------------------------
+// classify_and_read: the verdict comes from the descriptor read -------------------------------------------------------
 
-/// A regular file that is not the one step 1 classified is never read as if it were. The swap this
-/// guards against lands between two adjacent syscalls and cannot be scheduled from a test, so the
-/// classification is handed in instead — which the check cannot tell apart from the real thing, as
-/// [`read_verified`]'s own doc comment explains.
+/// Something non-regular taking the fragment's name after step 1 classified a regular file there is
+/// *classified*, never read — `read_regular` settles what it got from `fstat` on the descriptor it
+/// is about to read, so it needs no memory of what step 1 saw. Reached directly, since step 1 sees
+/// a regular file only when the swap lands between two adjacent syscalls, which nothing can
+/// schedule.
+///
+/// A benign replacement by another *regular* file is deliberately not a failure: it is read as the
+/// file that is now there. `rename` over the fragment is goetia's own update path, and reporting it
+/// as unanswerable would raise `list`'s host-wide exit code over a routine update.
 #[skuld::test]
-fn a_file_that_is_not_the_one_classified_is_a_re_read_failure() {
+fn a_non_regular_file_swapped_in_is_classified_not_read() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let classified_path = tmp.path().join("classified.service");
-    let swapped_in = tmp.path().join("swapped-in.service");
-    fs::write(&classified_path, "[Unit]\nDescription=the file that was classified\n").expect("write");
-    fs::write(&swapped_in, "[Unit]\nDescription=whatever took the name afterwards\n").expect("write");
-    let classified = fs::metadata(&classified_path).expect("stat the classified file");
+    let fifo = tmp.path().join("fifo.service");
+    mkfifo(&fifo);
+    let dir = tmp.path().join("directory.service");
+    fs::create_dir(&dir).expect("create the directory");
 
-    let Err(failure) = read_verified(&swapped_in, &classified) else {
-        panic!("a file that is not the one classified must never be read as if it were");
-    };
-
-    let detail = failure.detail();
-    assert!(
-        detail.contains("replaced between classification and read"),
-        "the failure must say the identity check is what refused it: {detail}"
-    );
-    assert!(
-        detail.contains(&swapped_in.display().to_string()),
-        "the failure must name the path it refused: {detail}"
-    );
-}
-
-/// The other half of the same check: an unchanged file is read, so the guard cannot be satisfied by
-/// refusing everything.
-#[skuld::test]
-fn the_file_that_was_classified_is_read() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let path = tmp.path().join("unchanged.service");
-    fs::write(&path, "[Unit]\nDescription=unchanged\n").expect("write");
-    let classified = fs::metadata(&path).expect("stat");
-
-    match read_verified(&path, &classified) {
-        Ok(RawState::Regular(text)) => assert!(text.contains("unchanged"), "{text}"),
-        Ok(RawState::Absent) => panic!("the file is right there"),
-        Ok(RawState::NonRegular) => panic!("a regular file"),
-        Err(failure) => panic!("{}", failure.detail()),
+    for path in [fifo, dir] {
+        // `read_regular` opens for reading, so a FIFO would wedge every caller if `O_NONBLOCK` were
+        // ever dropped — the same guard `classify_and_read`'s own FIFO tests use.
+        let rendered = path.display().to_string();
+        let probed = path.clone();
+        match without_blocking(&rendered.clone(), move || read_regular(&probed)) {
+            Ok(RawState::NonRegular) => {}
+            Ok(RawState::Absent) => panic!("{rendered} is right there"),
+            Ok(RawState::Regular(_)) => panic!("{rendered} is not a regular file and its bytes are not a unit"),
+            Err(failure) => panic!("{rendered}: {}", failure.detail()),
+        }
     }
 }

@@ -118,11 +118,10 @@ pub(super) enum RawState {
 /// blocks until a writer arrives, and one `mkfifo x.service` would wedge the listing for every
 /// daemon on the host.
 ///
-/// Step 2 ([`read_verified`]) re-opens a regular file for reading and compares `(st_dev, st_ino)`
-/// against step 1's, so
-/// no verdict is ever derived from a classification of some other file that briefly held the name.
-/// It is the only step a *readable-type* artifact can fail at, and unambiguous there: a regular
-/// file whose bytes could not be obtained.
+/// Step 2 ([`read_regular`]) re-opens for reading and settles what it got from `fstat` on *that*
+/// descriptor, so no verdict is ever derived from a name looked up twice. It is the only step a
+/// *readable-type* artifact can fail at, and unambiguous there: a regular file whose bytes could
+/// not be obtained.
 ///
 /// Shared by `raw_state` (the fragment) and `super::write::quarantine_if_still_ours` (the
 /// quarantined former occupant), which both need this identical classify-before-read discipline.
@@ -146,19 +145,29 @@ pub(super) fn classify_and_read(path: &Path) -> ReadResult<RawState> {
     if !classified.is_file() {
         return Ok(RawState::NonRegular);
     }
-    read_verified(path, &classified)
+    read_regular(path)
 }
 
-/// Step 2 on its own: re-open `path` for reading and refuse to read it unless it is still the file
-/// `classified` describes.
+/// Step 2 on its own: open `path` for reading and settle what it is from the descriptor open
+/// returned — never from what step 1 saw.
 ///
-/// `classified` is a parameter rather than something this reads for itself, and that is what makes
-/// the mismatch reachable from a test. Forcing it in place needs a swap landing between two
-/// adjacent syscalls, which nothing can schedule; handing this function another file's metadata is
-/// indistinguishable to it from the swap it guards against, since the check compares two
-/// `(st_dev, st_ino)` pairs and cannot see where either came from.
-fn read_verified(path: &Path, classified: &fs::Metadata) -> ReadResult<RawState> {
-    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+/// A replacement landing between the two opens is therefore *read*, as the file that is now there.
+/// That is the honest answer: the question is "what is at this path", and something readable is one.
+/// Comparing `(st_dev, st_ino)` against step 1's instead would report goetia's own update path as
+/// an unanswerable question — `super::write::replace_unit_verified` replaces a fragment by
+/// `rename`, as do `systemctl edit`, dpkg and ansible — and would raise `list`'s host-wide exit
+/// code over a benign concurrent update, exactly as the `NotFound` arm below refuses to do for a
+/// benign concurrent uninstall. It would also abort `Systemd::install`'s race-retry loop, which
+/// exists to re-classify this very state change rather than to bail out of it.
+///
+/// Every property step 1 establishes survives being read this way. `O_NOFOLLOW` rejects a symlink
+/// swapped in afterwards (`ELOOP` — a read that did not complete, never a followed link);
+/// `O_NONBLOCK` keeps a swapped-in FIFO from blocking the listing of every daemon on the host; and
+/// `is_file()` on the opened descriptor is what makes the bytes below provably a regular file's.
+/// Step 1 is still needed for the case this cannot cover: its `O_PATH | O_NOFOLLOW` classifies a
+/// masked unit's symlink as [`RawState::NonRegular`] without ever opening its `/dev/null` target.
+fn read_regular(path: &Path) -> ReadResult<RawState> {
+    use std::os::unix::fs::OpenOptionsExt as _;
 
     let file = fs::OpenOptions::new()
         .read(true)
@@ -175,13 +184,12 @@ fn read_verified(path: &Path, classified: &fs::Metadata) -> ReadResult<RawState>
         Err(failure) if failure.is_not_found() => return Ok(RawState::Absent),
         Err(failure) => return Err(failure),
     };
+    // The verdict comes from the descriptor about to be read, so a non-regular file swapped in
+    // after step 1 is classified rather than read — the property the identity comparison this
+    // replaced was reaching for, and the only one worth keeping.
     let opened = file.metadata().map_err(|e| ReadFailure::new("stat", path, e))?;
-    if (opened.dev(), opened.ino()) != (classified.dev(), classified.ino()) {
-        return Err(ReadFailure::new(
-            "re-read",
-            path,
-            io::Error::other("the path was replaced between classification and read"),
-        ));
+    if !opened.is_file() {
+        return Ok(RawState::NonRegular);
     }
     let text = io::read_to_string(&file).map_err(|e| ReadFailure::new("read", path, e))?;
     Ok(RawState::Regular(text))

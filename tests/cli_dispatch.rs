@@ -2597,9 +2597,7 @@ fn install_exits_four_when_the_start_leg_cannot_be_determined() {
 }
 
 /// `install`'s three classes through the one precedence rule: a refusal outranks an unanswered
-/// question, which outranks a conflict. The middle rank is the one this task adds — `install` used
-/// to report the unanswered question as a plain failure, disagreeing with `diff` about one
-/// artifact.
+/// question, which outranks a conflict.
 #[skuld::test]
 fn install_error_beats_indeterminate_beats_conflict() {
     let two_dir = tempfile::tempdir().unwrap();
