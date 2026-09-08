@@ -137,7 +137,7 @@ fn the_error_names_the_id_that_could_not_be_determined() {
 /// followed. One target exists and one does not: `systemctl mask` points the link at `/dev/null`,
 /// and either way what the link points at is never opened.
 #[skuld::test]
-fn a_symlink_is_non_regular_whether_or_not_its_target_exists() {
+fn a_symlink_is_not_ours_whether_or_not_its_target_exists() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
     for (name, target) in [("masked", "/dev/null"), ("dangling", "/nonexistent/goetia-target")] {
@@ -146,7 +146,7 @@ fn a_symlink_is_non_regular_whether_or_not_its_target_exists() {
 
         let state = classify_and_read(&link).unwrap_or_else(|e| panic!("{name}: {}", e.detail()));
         assert!(
-            matches!(state, RawState::NonRegular),
+            matches!(state, RawState::NotOurs),
             "{name}: a symlink is never read through"
         );
     }
@@ -169,14 +169,14 @@ fn a_missing_path_is_absent_and_a_regular_file_is_read() {
 }
 
 #[skuld::test]
-fn a_directory_is_non_regular() {
+fn a_directory_is_not_ours() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path().join("x.service.d");
     fs::create_dir(&dir).expect("seed the drop-in directory");
 
     let state = classify_and_read(&dir).unwrap_or_else(|e| panic!("{}", e.detail()));
     assert!(
-        matches!(state, RawState::NonRegular),
+        matches!(state, RawState::NotOurs),
         "a directory is classified, never opened for reading"
     );
 }
@@ -186,7 +186,7 @@ fn a_directory_is_non_regular() {
 /// `list` sweeps every `*.service` name in `/etc/systemd/system`, so a single `mkfifo x.service`
 /// would otherwise wedge the listing for the whole host.
 #[skuld::test]
-fn a_fifo_is_non_regular_without_blocking() {
+fn a_fifo_is_not_ours_without_blocking() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let fifo = tmp.path().join("x.service");
     mkfifo(&fifo);
@@ -194,34 +194,43 @@ fn a_fifo_is_non_regular_without_blocking() {
     let state = without_blocking("classify_and_read", move || classify_and_read(&fifo))
         .unwrap_or_else(|e| panic!("{}", e.detail()));
     assert!(
-        matches!(state, RawState::NonRegular),
+        matches!(state, RawState::NotOurs),
         "a FIFO is classified, never opened for reading"
     );
 }
 
-/// The bytes of a regular file could not be obtained — the only shape of failure a *readable-type*
-/// artifact can produce, and the one arm of it that is identical for root and everyone else. The
-/// permission-denied shape needs a second uid and is exercised end to end in
-/// `tests/systemd_integration/linux.rs`; see this module's own doc comment.
+/// The bytes were obtained and will not decode. `generate::unit` emits UTF-8 ini and nothing else,
+/// so that is a positive identification of a file goetia did not write — the same answer step 1
+/// gives a symlink, and the same one launchd gives a plist that is not UTF-8. Calling it a read
+/// that did not complete would hand every host carrying one foreign `Description=Café` in Latin-1 a
+/// standing `undetermined` entry and a permanent host-wide exit `4`.
 #[skuld::test]
-fn invalid_utf8_in_a_regular_file_is_a_read_failure() {
+fn invalid_utf8_in_a_regular_file_is_not_ours() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = tmp.path().join("x.service");
     fs::write(&path, [b'[', 0xff, 0xfe, b']']).expect("write the undecodable fragment");
 
-    let Err(failure) = classify_and_read(&path) else {
-        panic!("bytes that are not UTF-8 are not text goetia read, so this settles nothing about the id");
-    };
-    let detail = failure.detail();
-    assert!(
-        detail.contains(&path.display().to_string()),
-        "the detail must name the path that could not be read: {detail}"
-    );
+    match classify_and_read(&path) {
+        Ok(RawState::NotOurs) => {}
+        Ok(RawState::Regular(text)) => panic!("these bytes are not UTF-8: {text:?}"),
+        Ok(RawState::Absent) => panic!("the file is right there"),
+        Err(failure) => panic!(
+            "the bytes were obtained, so presence is established and `Undetermined` is not \
+             available: {}",
+            failure.detail()
+        ),
+    }
 }
 
 /// `ENOTDIR` on a parent component: presence itself was never established, so neither
-/// [`RawState::Absent`] ("nothing is here") nor [`RawState::NonRegular`] ("something is, and it is
-/// not a fragment") is a claim this arm may make.
+/// [`RawState::Absent`] ("nothing is here") nor [`RawState::NotOurs`] ("something is, and it is
+/// not a fragment") is a claim this arm may make. It fails at [`open_parent`], which is where every
+/// errno about something *above* the artifact is meant to land — the separation that lets step 2
+/// read `ELOOP` as "this component is a symlink" with nothing else it could mean.
+///
+/// The failure still names the artifact, not just the component that blocked it: `raw_state` turns
+/// this into an [`Error::Undetermined`] about an id, and a reader handed only `/tmp/x` has to work
+/// out which unit that was about.
 #[skuld::test]
 fn a_path_that_cannot_be_resolved_is_a_read_failure() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -327,11 +336,18 @@ fn the_scan_asks_for_this_ids_own_directory_and_no_family_wide_one() {
 
 // classify_and_read: the verdict comes from the descriptor read -------------------------------------------------------
 
+/// [`read_regular`] reached on its own, the way a swap landing between step 1 and step 2 reaches it
+/// — which nothing can schedule, so the two are called apart here instead.
+fn step_two(path: &Path) -> ReadResult<RawState> {
+    let dir = open_parent(path)
+        .unwrap_or_else(|e| panic!("open the temp directory: {}", e.detail()))
+        .expect("the temp directory exists");
+    read_regular(&dir, path.file_name().expect("an artifact path"), path)
+}
+
 /// Something non-regular taking the fragment's name after step 1 classified a regular file there is
 /// *classified*, never read — `read_regular` settles what it got from `fstat` on the descriptor it
-/// is about to read, so it needs no memory of what step 1 saw. Reached directly, since step 1 sees
-/// a regular file only when the swap lands between two adjacent syscalls, which nothing can
-/// schedule.
+/// is about to read, so it needs no memory of what step 1 saw.
 ///
 /// A benign replacement by another *regular* file is deliberately not a failure: it is read as the
 /// file that is now there. `rename` over the fragment is goetia's own update path, and reporting it
@@ -349,11 +365,77 @@ fn a_non_regular_file_swapped_in_is_classified_not_read() {
         // ever dropped — the same guard `classify_and_read`'s own FIFO tests use.
         let rendered = path.display().to_string();
         let probed = path.clone();
-        match without_blocking(&rendered.clone(), move || read_regular(&probed)) {
-            Ok(RawState::NonRegular) => {}
+        match without_blocking(&rendered.clone(), move || step_two(&probed)) {
+            Ok(RawState::NotOurs) => {}
             Ok(RawState::Absent) => panic!("{rendered} is right there"),
             Ok(RawState::Regular(_)) => panic!("{rendered} is not a regular file and its bytes are not a unit"),
             Err(failure) => panic!("{rendered}: {}", failure.detail()),
         }
+    }
+}
+
+/// The one type step 2 cannot classify by `fstat`, because `O_NOFOLLOW` refuses to open it at all.
+/// `ELOOP` under `O_NOFOLLOW` *establishes* a symlink, and a symlink at the fragment path is
+/// `systemctl mask`'s own artifact — which systemd's `symlink_atomic()`, `ln -sfn`, ansible and nix
+/// all install by symlink-then-`rename`, so it lands here whenever one of those runs during a
+/// `list`. Reporting it undetermined would raise the host-wide exit code to `4`, and tell `status`
+/// it could not determine an installation that is masked in plain sight.
+#[skuld::test]
+fn a_symlink_swapped_in_is_classified_not_a_failed_read() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("masked.service");
+    std::os::unix::fs::symlink("/dev/null", &path).expect("plant the mask symlink");
+
+    match step_two(&path) {
+        Ok(RawState::NotOurs) => {}
+        Ok(RawState::Absent) => panic!("the symlink is right there"),
+        Ok(RawState::Regular(_)) => panic!("`O_NOFOLLOW` must never read a symlink's target"),
+        Err(failure) => panic!(
+            "`ELOOP` under `O_NOFOLLOW` identifies a symlink rather than failing to: {}",
+            failure.detail()
+        ),
+    }
+}
+
+/// The contract from the other side: an errno that identifies nothing about the artifact stays a
+/// failure, and does not get quietly folded into `NotOurs` because it happened at the same call.
+/// `ENAMETOOLONG` rather than `EACCES`, so this holds under both uids — this binary runs as root in
+/// CI, where `CAP_DAC_OVERRIDE` reads any mode; `EACCES` is covered end to end under `runuser -u
+/// nobody` in `tests/systemd_integration/linux.rs`.
+#[skuld::test]
+fn an_errno_that_identifies_nothing_stays_a_failure() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join(format!("{}.service", "x".repeat(300)));
+
+    let Err(failure) = classify_and_read(&path) else {
+        panic!("a name the filesystem will not resolve establishes neither presence nor absence");
+    };
+    let detail = failure.detail();
+    assert!(
+        detail.contains("File name too long"),
+        "the errno reaches the caller intact rather than as a generic failure: {detail}"
+    );
+}
+
+/// The other errno that identifies rather than fails: `open(2)` on a UNIX socket answers `ENXIO`,
+/// never a descriptor, so `fstat` never gets the chance to classify it. Same claim as the symlink —
+/// something is at the path and goetia did not write it.
+#[skuld::test]
+fn a_socket_swapped_in_is_classified_not_a_failed_read() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("socket.service");
+    let _listener = std::os::unix::net::UnixListener::bind(&path).expect("bind the socket");
+
+    match step_two(&path) {
+        Ok(RawState::NotOurs) => {}
+        other => panic!(
+            "a socket is established as present and not goetia's: {}",
+            match other {
+                Ok(RawState::Absent) => "reported absent".to_string(),
+                Ok(RawState::Regular(_)) => "read as a unit".to_string(),
+                Ok(RawState::NotOurs) => unreachable!(),
+                Err(failure) => failure.detail(),
+            }
+        ),
     }
 }

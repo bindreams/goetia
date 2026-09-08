@@ -504,28 +504,46 @@ particular id is absent. The claim is not the vague "goetia might have
 missed something" — it is that one. See [`undetermined`](#undetermined) for
 the document shape.
 
+**Bytes that were obtained are never `undetermined`.** goetia writes UTF-8
+and nothing else — ini on systemd, XML on launchd — so an artifact whose
+bytes will not decode is positively _not_ one of goetia's. That is a fact
+about presence, so it is answered `foreign` and omitted, exactly as an
+unmarked artifact is. The cost is accepted deliberately: one of goetia's own,
+corrupted after the fact, now reads as a stranger's. Ownership lives in the
+marker and the marker is in the bytes that would not decode — and the
+alternative is a permanent, unclearable exit `4` for every vendor artifact on
+the host that is not UTF-8.
+
 Per platform:
 
-- **systemd** — an `<id>.service` fragment the caller could not open is
-  reported as `undetermined`, named.
-- **launchd** — a plist whose bytes could not be obtained, or that is
-  neither UTF-8 nor a binary plist, is reported as `undetermined`, named. A
-  **binary plist is not**: `bplist00` is a positive identification of a
-  format goetia never writes, so it is foreign and omitted exactly as an
-  unmarked XML plist is. `plutil -convert binary1` and `defaults write`
-  produce that format by default, so a `/Library/LaunchDaemons` full of them
-  is the normal state of a macOS host; calling them undetermined would give
-  macOS a permanent, unclearable exit `4` for services that are in no way
-  goetia's business. systemd has no counterpart to this rule — a unit file
-  is text or it is not goetia's.
+- **systemd** — an `<id>.service` fragment the caller could not **open** is
+  reported as `undetermined`, named. A fragment that _was_ read and is not
+  UTF-8 is foreign and omitted, per the rule above; so is a symlink (what
+  `systemctl mask` leaves), a FIFO, a device node or a directory, none of
+  which is a unit file goetia wrote.
+- **launchd** — a plist whose bytes could not be **obtained** is reported as
+  `undetermined`, named. Bytes that were obtained and are not UTF-8 XML are
+  foreign and omitted, per the same rule — a binary plist (`bplist00`, what
+  `plutil -convert binary1` and `defaults write` produce by default, so a
+  `/Library/LaunchDaemons` full of them is the normal state of a macOS host),
+  a UTF-16 plist, or one stray Latin-1 byte. systemd and launchd answer this
+  question identically.
 - **SCM** — an unelevated read of a service's `Parameters` is commonly denied, which goetia's Windows design assumes is the usual case rather than a measured one, so
   an unelevated `goetia daemon list` on Windows is **expected** to carry one
   aggregate entry — `name: null`, carrying a count rather than a name — and
   to exit `4`. That is the designed behavior, not a defect to report:
   re-running elevated is what empties it. One aggregate rather than hundreds
   of named entries is deliberate, and it is why the `null`-name rule above
-  exists at all. No other platform carries a standing non-empty
-  `undetermined`.
+  exists at all. An entry standing for exactly one service still names it:
+  aggregating is what many ids cost, and it costs nothing for one.
+
+A standing non-empty `undetermined` is not unique to Windows. An unelevated
+`goetia daemon list` on Linux carries one named entry per unit it cannot open,
+and units shipped `0600` (those carrying `LoadCredential=`, for instance) are
+common; the same holds on macOS for a plist an unprivileged reader cannot
+open. What is unique to Windows is the _aggregate_ form — one entry with a
+`null` name standing for many ids — and the elevation-clears-it expectation
+that comes with it.
 
 ### The two sources of `4`
 

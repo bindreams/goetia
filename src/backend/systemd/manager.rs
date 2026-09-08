@@ -16,10 +16,12 @@
 //!    `/dev/null`; reading it yields empty text, and a naive read-then-extract would see `Ok(None)`
 //!    and let `install` write over it, silently unmasking a deliberately-masked service.
 //!    [`discover::classify_and_read`] opens the path `O_PATH | O_NOFOLLOW` and classifies the
-//!    descriptor by `fstat`, reporting any non-regular file as [`discover::RawState::NonRegular`] —
-//!    always `Ownership::Foreign` — without ever opening it for reading. A *regular* file whose
-//!    bytes could not be obtained is neither: it is [`Error::Undetermined`] for `status` and
-//!    [`Installed::Undetermined`] for `list`, since nothing about its content was established.
+//!    descriptor by `fstat`, reporting any non-regular file as [`discover::RawState::NotOurs`] —
+//!    always `Ownership::Foreign` — without ever opening it for reading. It answers the same for a
+//!    regular file whose bytes turn out not to be UTF-8, which is the same claim by a different
+//!    proof: goetia writes UTF-8 ini and nothing else. Only a read that *did not complete* is
+//!    neither, and that is [`Error::Undetermined`] for `status` and [`Installed::Undetermined`] for
+//!    `list`, since nothing at all about the artifact was established.
 //! 3. **Drop-ins are drift.** `systemctl edit` — the officially recommended way to add exactly the
 //!    `MemoryMax=`/`After=` the design cites — writes `<id>.service.d/override.conf` and leaves the
 //!    fragment itself byte-identical, so drift detection over the fragment alone misses it entirely.
@@ -259,7 +261,7 @@ impl ServiceManager for Systemd {
         let id = id.as_str();
         match raw_state(id)? {
             RawState::Absent => Err(absent_error(id)?),
-            RawState::NonRegular => Err(Error::Foreign {
+            RawState::NotOurs => Err(Error::Foreign {
                 id: id.to_string(),
                 recovery: decide::foreign_recovery(id),
             }),
@@ -287,9 +289,10 @@ impl ServiceManager for Systemd {
             // differently.
             let text = match classify_and_read(path) {
                 Ok(RawState::Regular(text)) => text,
-                // Gone between the scan and the open, or never a fragment to read (a masked unit's
-                // symlink, a FIFO, a `.d` directory): obligations 2 and 3.
-                Ok(RawState::Absent | RawState::NonRegular) => continue,
+                // Gone between the scan and the open, or established as nothing goetia wrote (a
+                // masked unit's symlink, a FIFO, a `.d` directory, bytes that are not UTF-8):
+                // obligations 2 and 3, and foreign entries are what `list` omits.
+                Ok(RawState::Absent | RawState::NotOurs) => continue,
                 // A read that did not complete establishes nothing about the id — least of all that
                 // it is absent, which is what omitting it from the enumeration would say.
                 Err(failure) => {

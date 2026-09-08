@@ -23,9 +23,16 @@
 //! asks — "what will actually run here", resolved the way systemd resolves it and reported with no
 //! notion of an artifact goetia owns. That is a `doctor`-style check goetia does not have.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
+use std::io::Read as _;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
+
+use nix::errno::Errno;
+use nix::fcntl::{OFlag, openat};
+use nix::sys::stat::Mode;
 
 use crate::backend::systemd::generate;
 use crate::decide::{Overlay, Ownership};
@@ -63,13 +70,6 @@ impl ReadFailure {
         }
     }
 
-    /// Whether the underlying failure was the path not existing. Step 2 of
-    /// [`classify_and_read`] uses it to tell the uninstall race apart from a
-    /// genuine failure to read a file that is still there.
-    fn is_not_found(&self) -> bool {
-        self.source.kind() == io::ErrorKind::NotFound
-    }
-
     /// The operation and the path it failed on, with no claim about the id attached.
     pub(super) fn detail(&self) -> String {
         format!(
@@ -95,104 +95,190 @@ impl ReadFailure {
 
 // RawState / raw_state / classify_and_read ============================================================================
 
-/// What's physically present at a path, before any interpretation of its content.
+/// What's at a path, in the only two terms that settle ownership: bytes goetia can look for its
+/// marker in, or a positive identification that there is no point looking.
 pub(super) enum RawState {
     Absent,
-    /// A symlink (a masked unit) or any other non-regular file — obligation 2. Its contents are never
-    /// read: a masked unit's target is `/dev/null`, and reading through it would look identical to
-    /// "nothing here".
-    NonRegular,
+    /// Present, and positively **not** an artifact goetia wrote. Two ways to establish that, one
+    /// class because it is one claim — and `Ownership::Foreign` is the answer to both:
+    ///
+    /// - Not a regular file: a symlink (`systemctl mask` points the fragment at `/dev/null`), a
+    ///   FIFO, a device node, a directory — obligation 2. Contents are never read; reading through
+    ///   a masked unit's target would look identical to "nothing here".
+    /// - A regular file whose bytes are not UTF-8. `generate::unit` writes UTF-8 ini and nothing
+    ///   else, so bytes that will not decode are a positive identification of a format goetia never
+    ///   emits — the same claim launchd's `Classified::NotOurs` makes about a plist, and it gets the
+    ///   same answer.
+    ///
+    /// The accepted cost of the second: a fragment goetia *did* write, corrupted after the fact,
+    /// now reads as a stranger's rather than as ours-but-broken. Ownership cannot be established
+    /// without reading the marker, and the marker is in the bytes that would not decode. The
+    /// alternative is a permanent, unclearable `undetermined` entry — and a host-wide exit `4` —
+    /// for every non-UTF-8 unit file on the host that was never goetia's business.
+    NotOurs,
     Regular(String),
 }
 
-/// Classify `path`, and read it only once it is known to be a regular file. Two opens of one
-/// pathname, each answered by `fstat` on the descriptor that open returned rather than by a second
-/// name lookup — a separate `lstat` is its own TOCTOU gap, since the file it classified need not be
-/// the file a later open resolves the same name to.
+/// Classify `path`, and read it only once it is known to be a regular file. Two opens of one final
+/// component *under one directory descriptor*, each answered by `fstat` on the descriptor that open
+/// returned rather than by a second name lookup — a separate `lstat` is its own TOCTOU gap, since
+/// the file it classified need not be the file a later open resolves the same name to.
+///
+/// The directory is opened once and both steps `openat` through it. That is not a micro-optimisation
+/// but what makes step 2's errnos readable: a name with no `/` in it, resolved under a descriptor,
+/// cannot fail for anything above the artifact itself, so `ELOOP` there means "this component is a
+/// symlink" and nothing else. Opening the pathname twice instead leaves `ELOOP` ambiguous between
+/// that and a parent turned into a symlink loop, and the two need opposite answers.
 ///
 /// Step 1 opens `O_PATH | O_NOFOLLOW`. That needs no read permission, never blocks, and is the
 /// documented case that yields a descriptor for the *symlink itself*, so a masked unit (`systemctl
 /// mask` points the fragment at `/dev/null`), a FIFO, a device node and a `.d` directory are all
-/// classified [`RawState::NonRegular`] without ever being opened for reading — obligation 2. It is
+/// classified [`RawState::NotOurs`] without ever being opened for reading — obligation 2. It is
 /// also what keeps `list` answerable at all: opening for reading first means `open(FIFO, O_RDONLY)`
 /// blocks until a writer arrives, and one `mkfifo x.service` would wedge the listing for every
 /// daemon on the host.
 ///
 /// Step 2 ([`read_regular`]) re-opens for reading and settles what it got from `fstat` on *that*
-/// descriptor, so no verdict is ever derived from a name looked up twice. It is the only step a
-/// *readable-type* artifact can fail at, and unambiguous there: a regular file whose bytes could
-/// not be obtained.
+/// descriptor, so no verdict is ever derived from a name looked up twice.
 ///
 /// Shared by `raw_state` (the fragment) and `super::write::quarantine_if_still_ours` (the
 /// quarantined former occupant), which both need this identical classify-before-read discipline.
 /// Every failure is a [`ReadFailure`], which states what did not complete and leaves what that
 /// means about the id to the caller.
 pub(super) fn classify_and_read(path: &Path) -> ReadResult<RawState> {
-    use std::os::unix::fs::OpenOptionsExt as _;
+    let Some(name) = path.file_name() else {
+        debug_assert!(
+            false,
+            "classify_and_read needs an artifact path, got {}",
+            path.display()
+        );
+        return Err(ReadFailure::new(
+            "classify",
+            path,
+            io::Error::from(io::ErrorKind::InvalidInput),
+        ));
+    };
+    let Some(dir) = open_parent(path)? else {
+        return Ok(RawState::Absent);
+    };
 
-    // `OpenOptions` insists on an access mode even where `O_PATH` makes the kernel ignore it.
-    let classified = match fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
-        .open(path)
-    {
-        Ok(handle) => handle.metadata().map_err(|e| ReadFailure::new("stat", path, e))?,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(RawState::Absent),
-        // `ENOTDIR` on a parent component, `EACCES` on a parent directory, `EIO`: presence itself
-        // was not established, so neither `Absent` nor `NonRegular` is a claim this can make.
-        Err(e) => return Err(ReadFailure::new("classify", path, e)),
+    let classified = match openat(&dir, name, OFlag::O_PATH | OFlag::O_NOFOLLOW, Mode::empty()) {
+        Ok(fd) => fs::File::from(fd)
+            .metadata()
+            .map_err(|e| ReadFailure::new("stat", path, e))?,
+        Err(Errno::ENOENT) => return Ok(RawState::Absent),
+        // `O_PATH | O_NOFOLLOW` is the one open that yields a descriptor for a symlink instead of
+        // refusing it, so nothing reaching here has established a type: `EACCES` on the fragment's
+        // own directory entry, `EIO`. Presence itself is unsettled, which is neither `Absent` nor
+        // `NotOurs`.
+        Err(e) => return Err(ReadFailure::new("classify", path, errno_io(e))),
     };
     if !classified.is_file() {
-        return Ok(RawState::NonRegular);
+        return Ok(RawState::NotOurs);
     }
-    read_regular(path)
+    read_regular(&dir, name, path)
 }
 
-/// Step 2 on its own: open `path` for reading and settle what it is from the descriptor open
-/// returned — never from what step 1 saw.
+/// The directory holding `path`, opened `O_PATH | O_DIRECTORY` so both steps resolve their final
+/// component under it. `Ok(None)` for a parent that does not exist: nothing can be at a path whose
+/// directory is not there, which is absence, not a failure to determine it.
+///
+/// Every other failure is the caller's, unchanged from resolving the whole pathname at once:
+/// `ENOTDIR` for a non-directory component, `EACCES` for a directory this caller may not search,
+/// `ELOOP` for a symlink loop above the artifact. Each leaves presence itself unestablished — which
+/// is exactly why they must not reach step 2, where the same errnos mean something specific about
+/// the artifact.
+fn open_parent(path: &Path) -> ReadResult<Option<OwnedFd>> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    // `OpenOptions` insists on an access mode even where `O_PATH` makes the kernel ignore it.
+    match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
+        .open(dir)
+    {
+        Ok(handle) => Ok(Some(OwnedFd::from(handle))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(ReadFailure::new("open the directory holding", path, e)),
+    }
+}
+
+/// Step 2 on its own: open `name` under `dir` for reading and settle what it is from the descriptor
+/// open returned — never from what step 1 saw. `path` is `dir/name`, carried only so a failure names
+/// the artifact the way every other message here does.
 ///
 /// A replacement landing between the two opens is therefore *read*, as the file that is now there.
 /// That is the honest answer: the question is "what is at this path", and something readable is one.
 /// Comparing `(st_dev, st_ino)` against step 1's instead would report goetia's own update path as
 /// an unanswerable question — `super::write::replace_unit_verified` replaces a fragment by
 /// `rename`, as do `systemctl edit`, dpkg and ansible — and would raise `list`'s host-wide exit
-/// code over a benign concurrent update, exactly as the `NotFound` arm below refuses to do for a
+/// code over a benign concurrent update, exactly as the `ENOENT` arm below refuses to do for a
 /// benign concurrent uninstall. It would also abort `Systemd::install`'s race-retry loop, which
 /// exists to re-classify this very state change rather than to bail out of it.
 ///
-/// Every property step 1 establishes survives being read this way. `O_NOFOLLOW` rejects a symlink
-/// swapped in afterwards (`ELOOP` — a read that did not complete, never a followed link);
-/// `O_NONBLOCK` keeps a swapped-in FIFO from blocking the listing of every daemon on the host; and
-/// `is_file()` on the opened descriptor is what makes the bytes below provably a regular file's.
-/// Step 1 is still needed for the case this cannot cover: its `O_PATH | O_NOFOLLOW` classifies a
-/// masked unit's symlink as [`RawState::NonRegular`] without ever opening its `/dev/null` target.
-fn read_regular(path: &Path) -> ReadResult<RawState> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|e| ReadFailure::new("open", path, e));
-    let file = match file {
-        Ok(file) => file,
-        // Gone between step 1 and step 2: the same uninstall race step 1
-        // tolerates, observed one syscall later. Absence is established, so
-        // this is `Absent` rather than a failure to determine — reporting it
-        // as undetermined would make a benign concurrent uninstall raise
-        // `list`'s host-wide exit code.
-        Err(failure) if failure.is_not_found() => return Ok(RawState::Absent),
-        Err(failure) => return Err(failure),
+/// # Which errno classifies, and which is a genuine failure
+///
+/// The distinction this function turns on, stated once so the next change to it does not have to
+/// rediscover it: **an errno that establishes what is at the path is a verdict, not a failure.**
+/// `O_NOFOLLOW | O_NONBLOCK` is chosen so that the type of the thing there decides the errno, and
+/// resolving `name` under `dir` is what keeps every one of them about the artifact:
+///
+/// - `ENOENT` — nothing is there. [`RawState::Absent`]; the uninstall race step 1 already tolerates,
+///   observed one syscall later.
+/// - `ELOOP` — `O_NOFOLLOW` refuses a symlink, and refusing it is how it *identifies* it. This is
+///   `systemctl mask`'s own artifact arriving between the two opens, which systemd's
+///   `symlink_atomic()`, `ln -sfn`, ansible and nix all install by symlink-then-`rename`.
+///   [`RawState::NotOurs`], exactly as step 1 answers for the identical file with no race involved.
+/// - `ENXIO`, and `ENODEV` for the kernels that return it in the same case — a socket, or a device
+///   node with no device behind it. Both identify a non-regular file. [`RawState::NotOurs`].
+/// - everything else — `EACCES` on a fragment that is right there but this caller may not read,
+///   `EIO`, `EOVERFLOW`. These establish nothing about *whose* the artifact is, which is the whole
+///   question, so they stay [`ReadFailure`] and the caller decides what that costs.
+///
+/// `EACCES` is the one worth naming explicitly, because it is the tempting mistake: it does prove
+/// something is there, but not what wrote it — and a 0600 unit is as easily goetia's own as a
+/// stranger's. That is the state an unelevated `list` meets constantly, and calling it `NotOurs`
+/// would answer "not goetia's" off a read that never happened.
+fn read_regular(dir: &OwnedFd, name: &OsStr, path: &Path) -> ReadResult<RawState> {
+    let file = match openat(
+        dir,
+        name,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fs::File::from(fd),
+        Err(Errno::ENOENT) => return Ok(RawState::Absent),
+        Err(Errno::ELOOP | Errno::ENXIO | Errno::ENODEV) => return Ok(RawState::NotOurs),
+        Err(e) => return Err(ReadFailure::new("open", path, errno_io(e))),
     };
     // The verdict comes from the descriptor about to be read, so a non-regular file swapped in
     // after step 1 is classified rather than read — the property the identity comparison this
     // replaced was reaching for, and the only one worth keeping.
     let opened = file.metadata().map_err(|e| ReadFailure::new("stat", path, e))?;
     if !opened.is_file() {
-        return Ok(RawState::NonRegular);
+        return Ok(RawState::NotOurs);
     }
-    let text = io::read_to_string(&file).map_err(|e| ReadFailure::new("read", path, e))?;
-    Ok(RawState::Regular(text))
+    let mut bytes = Vec::new();
+    (&file)
+        .read_to_end(&mut bytes)
+        .map_err(|e| ReadFailure::new("read", path, e))?;
+    // Obtained, and they will not decode: see [`RawState::NotOurs`]. Distinct from every arm above
+    // it — those never got bytes — and the reason this reads to a `Vec` rather than to a `String`,
+    // which would fold "not UTF-8" into the same `io::Error` an `EIO` arrives as.
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(RawState::Regular(text)),
+        Err(_) => Ok(RawState::NotOurs),
+    }
+}
+
+/// The `io::Error` a `nix` errno stands for, so one [`ReadFailure`] type carries both this module's
+/// `openat` failures and its `std::fs` ones.
+fn errno_io(errno: Errno) -> io::Error {
+    io::Error::from_raw_os_error(errno as i32)
 }
 
 pub(super) fn raw_state(id: &str) -> Result<RawState> {
@@ -240,7 +326,7 @@ pub(super) fn discover(id: &str) -> Result<Discovery> {
                 overlay: dropin_overlay(id, &residue.dropin),
             }),
         },
-        RawState::NonRegular => Ok(Discovery {
+        RawState::NotOurs => Ok(Discovery {
             ownership: Ownership::Foreign,
             on_disk: Some(String::new()),
             fragment_text: None,
@@ -604,7 +690,7 @@ fn residue_recovery(id: &str, residue: &Residue) -> String {
 pub(super) fn require_installed(id: &str) -> Result<String> {
     match raw_state(id)? {
         RawState::Absent => Err(absent_error(id)?),
-        RawState::NonRegular => Err(Error::Foreign {
+        RawState::NotOurs => Err(Error::Foreign {
             id: id.to_string(),
             recovery: crate::decide::foreign_recovery(id),
         }),

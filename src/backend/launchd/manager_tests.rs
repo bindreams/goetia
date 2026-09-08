@@ -391,46 +391,50 @@ fn read_artifact_maps_an_unreadable_plist_to_undetermined() {
     );
 }
 
-/// `ENABLED_DIR` is `/Library/LaunchDaemons` — every vendor's daemons, not goetia's — and
-/// `plutil -convert binary1` and `defaults write` produce a binary plist by default. Treating those
-/// bytes as undetermined would give a macOS host a permanent, unclearable `undetermined` entry, and
-/// a permanent exit `4`, for a service goetia has no business reporting on at all.
+/// `ENABLED_DIR` is `/Library/LaunchDaemons` — every vendor's daemons, not goetia's — and every
+/// encoding below is one a vendor legitimately ships there: `plutil -convert binary1` and `defaults
+/// write` produce a binary plist by default, UTF-16 is a legal property-list encoding whose `FF FE`
+/// BOM is not UTF-8, and a Latin-1 byte in a description is an ordinary accident. None of them is
+/// UTF-8 XML, which is the only thing `generate::plist` writes, so each is a positive
+/// identification of a file goetia did not write — foreign, exactly like an unmarked XML plist.
+///
+/// Answering any of them `undetermined` would give a macOS host a permanent, unclearable
+/// `undetermined` entry and a permanent exit `4` for a service goetia has no business reporting on
+/// at all. Pinned as one table because the whole defect was these three getting two different
+/// answers.
 ///
 /// `list` reaches the same verdict through the same [`classify`], which is what keeps the two from
 /// describing one file differently; its own end is
 /// `tests/launchd_integration/launchd.rs::list_stays_clean_on_a_host_carrying_binary_plists`.
 #[skuld::test]
-fn a_binary_plist_is_treated_as_foreign_not_undetermined() {
+fn bytes_that_are_not_utf8_xml_are_foreign_not_undetermined() {
+    let mut binary = b"bplist00".to_vec();
+    binary.extend_from_slice(&[0xd1, 0x01, 0x02, 0x5f, 0x10, 0x00, 0xff]);
+    let utf16 = b"\xff\xfe<\x00?\x00x\x00m\x00l\x00".to_vec();
+    let latin1 = b"<!-- Caf\xe9 -->".to_vec();
+
     let tmp = tempfile::tempdir().expect("tempdir");
-    let path = tmp.path().join("vendor.plist");
-    let mut bytes = b"bplist00".to_vec();
-    bytes.extend_from_slice(&[0xd1, 0x01, 0x02, 0x5f, 0x10, 0x00, 0xff]);
-    fs::write(&path, &bytes).expect("write the binary plist");
+    for (label, bytes) in [
+        ("a binary plist", binary),
+        ("a UTF-16 XML plist", utf16),
+        ("one Latin-1 byte", latin1),
+    ] {
+        let path = tmp.path().join(format!("{label}.plist"));
+        fs::write(&path, &bytes).expect("write the vendor plist");
 
-    assert!(matches!(classify(bytes), Classified::BinaryPlist));
+        assert!(
+            matches!(classify(bytes), Classified::NotOurs),
+            "{label}: not the UTF-8 XML goetia writes, so not goetia's"
+        );
 
-    let text = read_artifact(&path, "vendor").expect("a binary plist is identified, not a read that failed");
-    assert!(
-        generate::extract(&text).expect("empty text decodes cleanly").is_none(),
-        "a format goetia never emits carries no goetia marker, so every caller must refuse it as foreign"
-    );
-}
-
-#[skuld::test]
-fn non_utf8_bytes_that_are_not_a_binary_plist_are_undetermined() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let path = tmp.path().join("corrupt.plist");
-    fs::write(&path, [b'<', 0xff, 0xfe, b'>']).expect("write the undecodable plist");
-
-    let err = read_artifact(&path, "corrupt").expect_err("nothing was identified in these bytes");
-
-    let Error::Undetermined { reason, .. } = &err else {
-        panic!("corruption of one of goetia's own cannot be ruled out, so nothing may be claimed: {err:?}");
-    };
-    assert!(
-        reason.contains(&path.display().to_string()),
-        "the reason must name the path: {reason}"
-    );
+        let text = read_artifact(&path, "vendor")
+            .unwrap_or_else(|e| panic!("{label}: the bytes were obtained, so nothing here is undetermined: {e:?}"));
+        assert!(
+            generate::extract(&text).expect("empty text decodes cleanly").is_none(),
+            "{label}: a format goetia never emits carries no goetia marker, so every caller must \
+             refuse it as foreign"
+        );
+    }
 }
 
 // undetermined ========================================================================================================

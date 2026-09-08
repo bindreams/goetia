@@ -96,6 +96,9 @@ fn scm_passes_conformance() {
     let _undetermined_denied = Denied::parameters(conformance::UNDETERMINED_ID);
 
     conformance::run(&mgr, &conformance_mk);
+    // Not one of `run`'s scenarios, because not every backend can be put in
+    // this state — SCM can, and does, right above. See its doc comment.
+    conformance::an_unclassifiable_id_is_never_silently_absent(&mgr, &conformance_mk);
 }
 
 // Step 2: round trip, conflict, start/stop/status, uninstall, list ====================================================

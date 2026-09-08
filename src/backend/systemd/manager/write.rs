@@ -138,7 +138,9 @@ fn restore_or_chain(backup_path: &Path, final_path: &Path, primary: Error) -> Er
 /// hidden quarantine name since `restore_quarantine`'s `link` then also fails; a symlink would be
 /// silently followed, unlike every other read in this module). None of those is something a fragment
 /// `discover` ever classified as `Ours` could have been, so any of them showing up here is itself
-/// proof of a race — treated exactly like a content mismatch.
+/// proof of a race — treated exactly like a content mismatch. Bytes that will not decode arrive in
+/// the same arm and get the same answer: `expected_text` is UTF-8 by construction, so they cannot be
+/// the file this was asked to verify.
 pub(super) fn quarantine_if_still_ours(id: &str, expected_text: &str) -> Result<Option<PathBuf>> {
     let final_path = unit_path(id);
     let backup_path = unique_quarantine_path(id);
@@ -151,7 +153,7 @@ pub(super) fn quarantine_if_still_ours(id: &str, expected_text: &str) -> Result<
 
     let actual = match classify_and_read(&backup_path).map_err(ReadFailure::into_io_error) {
         Ok(RawState::Regular(text)) => text,
-        Ok(RawState::Absent | RawState::NonRegular) => {
+        Ok(RawState::Absent | RawState::NotOurs) => {
             restore_quarantine(&backup_path, &final_path)?;
             return Ok(None);
         }

@@ -44,10 +44,10 @@ fn mk(id: &str) -> DaemonSpec {
     }
 }
 
-/// Bytes that are not UTF-8, so `classify_and_read` reaches the read and stops there: nothing about
-/// the fragment is identified, and — unlike a permission denial — root meets exactly the same wall
-/// an unprivileged caller does, which is what lets a test seed this and read it back in one elevated
-/// process. The systemd twin of `tests/launchd_integration/launchd.rs`'s `UNDECODABLE_PLIST`.
+/// Bytes goetia never writes: `generate::unit` emits UTF-8 ini and nothing else, so a fragment that
+/// will not decode is positively not goetia's — foreign, and omitted from `list` exactly like an
+/// unmarked one. The systemd twin of `tests/launchd_integration/launchd.rs`'s `FOREIGN_ENCODINGS`,
+/// and the reason those two backends now answer one question one way.
 const NON_UTF8_UNIT: [u8; 4] = [b'[', 0xff, 0xfe, b']'];
 
 fn unit_path(id: &str) -> PathBuf {
@@ -183,13 +183,6 @@ fn may_account_for(listed: &[Installed], id: &str) -> bool {
     })
 }
 
-fn undetermined_named(listed: &[Installed], id: &str) -> Option<String> {
-    listed.iter().find_map(|entry| match entry {
-        Installed::Undetermined { name, reason } if name.as_deref() == Some(id) => Some(reason.clone()),
-        _ => None,
-    })
-}
-
 fn mkfifo(path: &Path) {
     let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("a unit path with no NUL");
     // SAFETY: `c_path` is a NUL-terminated pointer valid for the call.
@@ -313,25 +306,27 @@ fn uninstall_via_cli(id: &str) -> (i32, String, String) {
 
 // Step 1: conformance =================================================================================================
 
-/// `UNIT_DIR_EXCLUSIVE`: seeding `UNDETERMINED_ID` puts a fragment nothing can decode into the
-/// shared `/etc/systemd/system` for the length of the run, which is exactly what the host-wide
-/// listing assertions elsewhere in this file (and `tests/cli_binary.rs`'s real `daemon list`) are
-/// about.
+/// `UNIT_DIR_EXCLUSIVE`: the run installs, forces and uninstalls a dozen units in the shared
+/// `/etc/systemd/system` for its whole length, which is exactly what the host-wide listing
+/// assertions elsewhere in this file (and `tests/cli_binary.rs`'s real `daemon list`) are about.
+///
+/// `conformance::an_unclassifiable_id_is_never_silently_absent` is deliberately not called here: an
+/// elevated caller on this backend can classify every artifact on the host, so `UNDETERMINED_ID`
+/// cannot be seeded from a test that has to be root to install anything at all. The state is
+/// asserted end to end below through `runuser -u nobody`, at the privilege boundary where it is
+/// real — see that scenario's own doc comment.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn systemd_passes_conformance() {
     let mgr = Systemd::new();
 
-    // The three ids `conformance::run` cannot produce through the trait's own methods - see its
-    // module doc comment. `run` cleans up `HAND_EDITED_ID` itself; the other two are ours.
+    // The two ids `conformance::run` cannot produce through the trait's own methods - see its
+    // module doc comment. `run` cleans up `HAND_EDITED_ID` itself; `FOREIGN_ID` is ours.
     let foreign_guard = ServiceGuard::new(conformance::FOREIGN_ID);
     seed_foreign(foreign_guard.id());
 
     mgr.install(&mk(conformance::HAND_EDITED_ID), false)
         .expect("seed hand-edited install");
     hand_edit(conformance::HAND_EDITED_ID);
-
-    let undetermined_guard = ServiceGuard::new(conformance::UNDETERMINED_ID);
-    fs::write(unit_path(undetermined_guard.id()), NON_UTF8_UNIT).expect("seed a non-UTF-8 unit");
 
     conformance::run(&mgr, &mk);
 }
@@ -1104,6 +1099,54 @@ fn unelevated_list_reports_a_root_only_unit_as_undetermined() {
     );
 }
 
+/// A *named* `undetermined` entry blocks exactly one negative answer: the one about the id it
+/// names. `Installed::Undetermined`'s null-name rule forbids concluding absence while an entry
+/// stands for ids it could not separate — and an entry that names its id separates it, so every
+/// other id on the host is still answerable.
+///
+/// The runnable half of the same defect this branch fixes on Windows, where an aggregate entry
+/// standing for one denied service dropped the name it was holding and made `show` answer "could
+/// not be determined" for every id on the host, permanently, over one stranger's ACL.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn a_named_undetermined_entry_blocks_only_its_own_id() {
+    let denied = support::random_test_id();
+    let denied_guard = ServiceGuard::new(&denied);
+    seed_foreign(denied_guard.id());
+    fs::set_permissions(unit_path(denied_guard.id()), fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+
+    // Never installed, and nothing on this host is at it.
+    let absent = support::random_test_id();
+    assert!(!unit_path(&absent).exists(), "the absent id must really be absent");
+
+    // Non-vacuity: the unreadable unit really does reach this reader as a named entry. Without it
+    // the assertion below would pass on a host with no `undetermined` entry at all.
+    let listed = list_json();
+    assert!(
+        listed.ids("undetermined").contains(&Some(denied.clone())),
+        "{}",
+        listed.context
+    );
+
+    let blocked = run_unelevated(&["daemon", "show", &denied]);
+    assert_eq!(
+        blocked.status.code(),
+        Some(4),
+        "the id the entry names is the one that cannot be answered: stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&blocked.stdout),
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+
+    let answerable = run_unelevated(&["daemon", "show", &absent]);
+    assert_eq!(
+        answerable.status.code(),
+        Some(1),
+        "a named entry stands for its own id and no other, so `not installed` is still sound here: \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&answerable.stdout),
+        String::from_utf8_lossy(&answerable.stderr)
+    );
+}
+
 /// The other half of the same boundary, and the one that would catch an over-eager fix: an install
 /// an unprivileged caller *can* read is reported as a daemon, with nothing in the third key and
 /// exit `0`.
@@ -1125,10 +1168,18 @@ fn unelevated_list_stays_clean_for_a_normal_install() {
     assert_eq!(listed.code, Some(0), "{}", listed.context);
 }
 
-/// One `*.service` whose bytes are not UTF-8 must not make `list` return `Err` — taking down the
-/// listing of every daemon on the host over a file that belongs to none of them.
+/// One `*.service` whose bytes are not UTF-8 must neither make `list` return `Err` — taking down
+/// the listing of every daemon on the host over a file that belongs to none of them — nor leave a
+/// standing `undetermined` entry, which is the same regression one exit code further on. The bytes
+/// were obtained: goetia writes UTF-8 ini and nothing else, so this file is positively not goetia's
+/// and is omitted exactly like an unmarked one. A foreign `Description=Café` saved as Latin-1
+/// otherwise gives the whole host a permanent exit `4`.
+///
+/// The accepted cost, stated where it is paid: a fragment goetia *did* write and something later
+/// corrupted now reads as a stranger's. Ownership lives in the marker, and the marker is in the
+/// bytes that would not decode.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn list_reports_a_non_utf8_unit_as_undetermined_instead_of_failing() {
+fn list_omits_a_non_utf8_unit_as_foreign_instead_of_reporting_it() {
     let readable = support::random_test_id();
     let readable_guard = ServiceGuard::new(&readable);
     Systemd::new()
@@ -1143,15 +1194,24 @@ fn list_reports_a_non_utf8_unit_as_undetermined_instead_of_failing() {
         .list()
         .expect("one undecodable file must not take down the whole listing");
 
-    let reason = undetermined_named(&listed, undecodable_guard.id())
-        .unwrap_or_else(|| panic!("bytes goetia could not decode settle nothing about the id: {listed:?}"));
     assert!(
-        reason.contains(&unit_path(undecodable_guard.id()).display().to_string()),
-        "the reason must name the path that could not be read: {reason}"
+        !may_account_for(&listed, undecodable_guard.id()),
+        "bytes that are not the UTF-8 goetia writes are foreign, so the id is neither claimed nor \
+         left undetermined: {listed:?}"
     );
     assert!(
         find_ours(listed, readable_guard.id()).is_some(),
         "every other daemon is still listed"
+    );
+
+    // The same file through `status`, so the two cannot describe one machine differently. `Foreign`
+    // and not `NotInstalled`: something is demonstrably there.
+    let err = Systemd::new()
+        .status(&Id::try_from(undecodable.clone()).expect("valid id"))
+        .expect_err("a fragment goetia did not write is not a daemon it can report the state of");
+    assert!(
+        matches!(err, goetia::Error::Foreign { .. }),
+        "presence is established and ownership is refused: {err:?}"
     );
 }
 

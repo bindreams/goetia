@@ -65,6 +65,11 @@ libc = { version = "0.2", optional = true }
 # `0o10000000` everywhere else — so unlike the flags beside it, it cannot be
 # hardcoded.
 libc = "0.2"
+# `openat`, for the same classifier: both of its opens resolve one final
+# component under one directory descriptor, which is what makes `ELOOP` mean
+# "that component is a symlink" and nothing else. Also unconditional, and the
+# same version the launchd backend already takes.
+nix = { version = "0.31", features = ["fs"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Unconditional (not behind the `cli` feature): the launchd backend itself

@@ -119,11 +119,12 @@ fn binary_plist(label: &str) -> Vec<u8> {
     bytes
 }
 
-/// Bytes that are neither UTF-8 nor a binary plist: nothing about them is
-/// identified, and — unlike a permission denial — root meets exactly the
-/// same wall an unprivileged caller does, which is what lets a test seed
-/// this and read it back in one elevated process.
-const UNDECODABLE_PLIST: [u8; 4] = [b'<', 0xff, 0xfe, b'>'];
+/// Bytes that are not UTF-8 and do not begin `bplist00`: still not the UTF-8 XML
+/// `generate::plist` writes, so still a positive identification of a plist
+/// goetia did not write. `FF FE` is also a UTF-16LE BOM, which is what a legal
+/// UTF-16 property list starts with — the exact file that used to hand a macOS
+/// host a permanent exit `4` for a vendor's service.
+const NON_UTF8_PLIST: [u8; 4] = [b'<', 0xff, 0xfe, b'>'];
 
 fn write_plist(path: &Path, content: &str) {
     write_bytes(path, content.as_bytes());
@@ -145,13 +146,6 @@ fn may_account_for(listed: &[Installed], id: &str) -> bool {
         Installed::Ours { spec, .. } => spec.id.as_str() == id,
         Installed::OursUnreadable { name, .. } => name == id,
         Installed::Undetermined { name, .. } => name.is_none() || name.as_deref() == Some(id),
-    })
-}
-
-fn undetermined_named(listed: &[Installed], id: &str) -> Option<String> {
-    listed.iter().find_map(|entry| match entry {
-        Installed::Undetermined { name, reason } if name.as_deref() == Some(id) => Some(reason.clone()),
-        _ => None,
     })
 }
 
@@ -196,9 +190,15 @@ impl Drop for FileGuard {
 
 // The deliverable: conformance ========================================================================================
 
-/// `UNIT_DIR_EXCLUSIVE`: seeding `UNDETERMINED_ID` puts a plist nothing can decode into the shared
-/// [`STAGING_DIR`] for the length of the run, which is exactly what the host-wide listing assertions
+/// `UNIT_DIR_EXCLUSIVE`: the run installs, forces and uninstalls a dozen daemons in the shared
+/// [`STAGING_DIR`] for its whole length, which is exactly what the host-wide listing assertions
 /// elsewhere in this file (and `tests/cli_binary.rs`'s real `daemon list`) are about.
+///
+/// `conformance::an_unclassifiable_id_is_never_silently_absent` is deliberately not called here: an
+/// elevated caller on this backend can classify every artifact on the host, so `UNDETERMINED_ID`
+/// cannot be seeded from a test that has to be root to install anything at all. The state is
+/// asserted below through an unprivileged reader, where it is real — see that scenario's own doc
+/// comment.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn launchd_passes_conformance() {
     let mgr = LaunchdManager::new();
@@ -219,12 +219,6 @@ fn launchd_passes_conformance() {
     let mut text = std::fs::read_to_string(&path).expect("read seeded artifact");
     text.push_str("<!-- a hand-added directive -->\n");
     write_plist(&path, &text);
-
-    // Seed `UNDETERMINED_ID`: bytes that are neither UTF-8 nor a binary plist, so nothing about
-    // the file — its marker included — is ever established. Cleaned up here, like `FOREIGN_ID`.
-    let undetermined_path = staging_path(manager::conformance::UNDETERMINED_ID);
-    write_bytes(&undetermined_path, &UNDECODABLE_PLIST);
-    let _undetermined_cleanup = FileGuard(undetermined_path);
 
     manager::conformance::run(&mgr, &sleepy);
 }
@@ -550,29 +544,33 @@ fn unelevated_list_reports_a_root_only_plist_as_undetermined() {
     );
 }
 
-/// Bytes that are neither UTF-8 nor a binary plist settle nothing about the
-/// id, so it is reported rather than dropped — and one such plist must not
-/// take down the listing of every other daemon on the host.
+/// Bytes that are not the UTF-8 XML goetia writes are foreign by positive identification, so the id
+/// is omitted exactly as an unmarked XML plist's is — never reported, and never claimed. One such
+/// plist must also not take down the listing of every other daemon on the host.
+///
+/// This is the `bplist00` rule applied to the negative it always belonged to. `/Library/
+/// LaunchDaemons` is every vendor's directory; answering `undetermined` here hands a normal macOS
+/// host a standing, unclearable entry and a permanent exit `4` for one vendor plist saved as
+/// UTF-16.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn list_reports_an_unreadable_plist_as_undetermined() {
+fn list_omits_a_non_utf8_plist_as_foreign() {
     let mgr = LaunchdManager::new();
     let readable = sleepy(&support::random_test_id());
     let _guard = Guard::install(&mgr, &readable);
 
     let id = support::random_test_id();
     let path = enabled_path(&id);
-    write_bytes(&path, &UNDECODABLE_PLIST);
+    write_bytes(&path, &NON_UTF8_PLIST);
     let _cleanup = FileGuard(path.clone());
 
     let listed = mgr
         .list()
         .expect("one undecodable plist must not take down the whole listing");
 
-    let reason = undetermined_named(&listed, &id)
-        .unwrap_or_else(|| panic!("bytes goetia could not decode settle nothing about the id: {listed:?}"));
     assert!(
-        reason.contains(&path.display().to_string()),
-        "the reason must name the path that could not be read: {reason}"
+        !may_account_for(&listed, &id),
+        "bytes that are not goetia's format leave the id neither claimed nor undetermined: \
+         {listed:?}"
     );
     assert!(
         listed
@@ -614,30 +612,30 @@ fn list_stays_clean_on_a_host_carrying_binary_plists() {
     );
 }
 
-/// The `discover` path — the one `install`/`preview_install` reads through,
-/// and therefore what `goetia daemon diff` answers from. Leaving it on a
-/// bare `read_to_string` would have `diff` report `Error::Io` (exit `1`)
-/// while `status` reports `Error::Undetermined` (exit `4`) for the very same
-/// file: two subcommands disagreeing about one machine.
+/// The `discover` path — the one `install`/`preview_install` reads through, and therefore what
+/// `goetia daemon diff` answers from — reaching the same verdict as `status` and `list` about one
+/// file. A plist that is not goetia's format is a stranger's artifact at this id, so `install`
+/// refuses it with the remedy `Outcome::RefuseForeign` names, rather than erroring.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn preview_install_over_an_unreadable_plist_is_undetermined() {
+fn preview_install_over_a_non_utf8_plist_refuses_it_as_foreign() {
     let mgr = LaunchdManager::new();
     let id = support::random_test_id();
     let path = staging_path(&id);
-    write_bytes(&path, &UNDECODABLE_PLIST);
+    write_bytes(&path, &NON_UTF8_PLIST);
     let _cleanup = FileGuard(path);
 
     let spec = sleepy(&id);
 
     let preview = mgr
         .preview_install(&spec)
-        .expect_err("bytes goetia could not decode settle nothing about the id");
-    assert!(matches!(preview, goetia::Error::Undetermined { .. }), "{preview:?}");
+        .expect("bytes that were obtained settle the id, so this is a refusal and not an error");
+    assert!(matches!(preview, Outcome::RefuseForeign { .. }), "{preview:?}");
 
+    // Never `NotInstalled`: something is demonstrably there.
     let status = mgr
         .status(&spec.id)
         .expect_err("status must reach the same verdict as diff about one file");
-    assert!(matches!(status, goetia::Error::Undetermined { .. }), "{status:?}");
+    assert!(matches!(status, goetia::Error::Foreign { .. }), "{status:?}");
 }
 
 /// Run `goetia <args>` as the `nobody` account and parse `--json`'s

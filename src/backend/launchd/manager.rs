@@ -221,24 +221,35 @@ const BINARY_PLIST_MAGIC: &[u8] = b"bplist00";
 
 /// What a plist's bytes turned out to be, once they were obtained.
 ///
-/// Obtaining bytes and understanding them are different questions, and only
-/// the first one being answered is what separates the last variant from the
-/// middle one.
+/// Obtaining bytes and understanding them are different questions, and this
+/// enum answers only the second: reaching it at all means the file was opened,
+/// `fstat`'d as regular and read to the end, so presence is established
+/// whichever variant comes out. That is why neither of them is
+/// [`Error::Undetermined`], which means presence was *not* established.
 enum Classified {
     /// Valid UTF-8 — the only form `generate::plist` ever writes, and the
     /// only one `generate::extract`'s `goetia:begin` comment can be looked
     /// for in.
     Text(String),
-    /// A binary plist: a **positive** identification of a format goetia
-    /// never emits, not an inference from a failure. Treated as foreign,
-    /// exactly like an XML plist carrying no marker. Calling it undetermined
-    /// instead would give a macOS host a permanent, unclearable
-    /// `undetermined` entry — and a permanent exit `4` — for a vendor's
-    /// service that is in no way goetia's business.
-    BinaryPlist,
-    /// Neither UTF-8 nor a binary plist: nothing was identified, and
-    /// corruption of one of goetia's own cannot be ruled out.
-    Undecodable(std::string::FromUtf8Error),
+    /// Bytes that are not something goetia wrote, as a **positive**
+    /// identification rather than an inference from a failure: `generate::plist`
+    /// emits UTF-8 XML and nothing else, so a binary plist and a UTF-16 one are
+    /// each as certainly not goetia's as an XML plist carrying no marker — and
+    /// they get that same answer, foreign and omitted.
+    ///
+    /// One negative, one answer. Splitting it — `bplist00` foreign, every other
+    /// non-UTF-8 byte undetermined — gave a macOS host a permanent, unclearable
+    /// `undetermined` entry and a permanent exit `4` for a vendor's service that
+    /// is in no way goetia's business, over a plist saved as UTF-16 (legal, and
+    /// its `FF FE` BOM is not UTF-8) or carrying one Latin-1 byte. The
+    /// `bplist00` arm already refused that outcome; there was never a reason the
+    /// other arm should accept it.
+    ///
+    /// The accepted cost: a plist goetia *did* write, corrupted after the fact,
+    /// now reads as a stranger's rather than as ours-but-broken. Ownership
+    /// cannot be established without reading the marker, and the marker is in
+    /// the bytes that would not decode.
+    NotOurs,
 }
 
 /// What trying to obtain a plist's bytes ran into.
@@ -336,13 +347,18 @@ fn obtain(path: &Path) -> Obtained {
 
 /// The one place bytes obtained from a plist become a verdict, so `list` and
 /// [`read_artifact`] cannot classify the same file differently.
+///
+/// The magic is checked ahead of the UTF-8 decode rather than left to it: a
+/// small binary plist can be valid UTF-8 (its trailer is mostly NUL bytes), and
+/// identifying it by the eight bytes Apple's format begins with does not depend
+/// on which of its object markers happen to fall outside ASCII.
 fn classify(bytes: Vec<u8>) -> Classified {
     if bytes.starts_with(BINARY_PLIST_MAGIC) {
-        return Classified::BinaryPlist;
+        return Classified::NotOurs;
     }
     match String::from_utf8(bytes) {
         Ok(text) => Classified::Text(text),
-        Err(e) => Classified::Undecodable(e),
+        Err(_) => Classified::NotOurs,
     }
 }
 
@@ -354,15 +370,16 @@ fn classify(bytes: Vec<u8>) -> Classified {
 /// uninstall that completed between the two syscalls, and absence is the
 /// truth about the id. Every read that did not complete is [`undetermined`].
 ///
-/// A binary plist, and anything that is not a regular file at all, read as
-/// the empty string. That is a statement, not a fallback: the marker lives
-/// in an XML comment, a binary plist has no comments, a FIFO is not a plist
-/// in the first place, and goetia emits only regular XML files — so "text
-/// carrying no marker" is precisely what has been established in each case,
-/// and every caller's `extract` turns it into the `Foreign` refusal that is
-/// the right answer for all three. It is also what keeps `install` over one
-/// of these from erroring: `decide` reaches `Outcome::RefuseForeign`, which
-/// names the remedy, instead of a bare `Err`.
+/// Bytes that are not goetia's ([`Classified::NotOurs`]), and anything that is
+/// not a regular file at all, read as the empty string. That is a statement,
+/// not a fallback: the marker lives in an XML comment, a binary plist has no
+/// comments, bytes that are not UTF-8 are not the UTF-8 XML `generate::plist`
+/// writes, a FIFO is not a plist in the first place — so "text carrying no
+/// marker" is precisely what has been established in each case, and every
+/// caller's `extract` turns it into the `Foreign` refusal that is the right
+/// answer for all of them. It is also what keeps `install` over one of these
+/// from erroring: `decide` reaches `Outcome::RefuseForeign`, which names the
+/// remedy, instead of a bare `Err`.
 fn read_artifact(path: &Path, id: &str) -> Result<String> {
     let bytes = match obtain(path) {
         Obtained::Bytes(bytes) => bytes,
@@ -372,13 +389,7 @@ fn read_artifact(path: &Path, id: &str) -> Result<String> {
     };
     match classify(bytes) {
         Classified::Text(text) => Ok(text),
-        Classified::BinaryPlist => Ok(String::new()),
-        Classified::Undecodable(e) => Err(undetermined(
-            id,
-            "read",
-            path,
-            &io::Error::new(io::ErrorKind::InvalidData, e),
-        )),
+        Classified::NotOurs => Ok(String::new()),
     }
 }
 
@@ -1132,15 +1143,8 @@ impl ServiceManager for LaunchdManager {
             let text = match classified {
                 Classified::Text(text) => text,
                 // Foreign by positive identification, so omitted exactly as
-                // an unmarked XML plist is — see `Classified::BinaryPlist`.
-                Classified::BinaryPlist => continue,
-                Classified::Undecodable(e) => {
-                    out.push(Installed::Undetermined {
-                        name: Some(id),
-                        reason: read_detail("read", path, &e),
-                    });
-                    continue;
-                }
+                // an unmarked XML plist is — see `Classified::NotOurs`.
+                Classified::NotOurs => continue,
             };
             match generate::extract(&text) {
                 Ok(None) => {} // foreign: not Goetia-managed, omitted per the trait doc comment

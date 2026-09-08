@@ -18,16 +18,14 @@
 //! call-unique (a pid plus a monotonic counter), not cryptographically
 //! random — sufficient given cleanup runs every time, including on panic.
 //!
-//! ## The three seeded ids
+//! ## The seeded ids
 //!
-//! Four of the ten scenarios ([`refuses_foreign_even_with_force`],
-//! [`foreign_refuses_every_verb`], [`conflict_requires_force`] and
-//! [`an_unclassifiable_id_is_never_silently_absent`]) need state that cannot
-//! be produced through [`ServiceManager`]'s own methods: a foreign
-//! (unmarked) service, a hand-edited Goetia artifact, and an artifact whose
-//! bytes this process cannot obtain. `run` therefore does *not* create these
-//! itself — it requires the **caller** to have already put `mgr` into that
-//! state at three fixed, reserved ids before calling `run`:
+//! Three of the scenarios ([`refuses_foreign_even_with_force`],
+//! [`foreign_refuses_every_verb`] and [`conflict_requires_force`]) need state
+//! that cannot be produced through [`ServiceManager`]'s own methods: a foreign
+//! (unmarked) service and a hand-edited Goetia artifact. `run` therefore does
+//! *not* create these itself — it requires the **caller** to have already put
+//! `mgr` into that state at two fixed, reserved ids before calling `run`:
 //!
 //! - [`FOREIGN_ID`]: `mgr` already has *something* installed at this id,
 //!   through means entirely outside Goetia (a hand-written unit file /
@@ -41,21 +39,13 @@
 //!   `run`'s own `conflict_requires_force` scenario forces an overwrite
 //!   here, so this one *is* included in `run`'s own cleanup — the caller
 //!   only needs to seed it once per call to `run`.
-//! - [`UNDETERMINED_ID`]: something is at this id whose bytes this process
-//!   cannot obtain, so the read that would classify it never completes and
-//!   establishes nothing — ownership least of all. Non-UTF-8, non-`bplist00`
-//!   bytes in the fragment/plist on systemd and launchd; a `Deny`/`ReadKey`
-//!   ACE over `Parameters` on SCM, which an elevated reader does not bypass
-//!   either. Distinct from [`HAND_EDITED_ID`], whose artifact reads back
-//!   fine and is merely *wrong*. `run` never writes to or removes this id —
-//!   cleanup is the caller's, the same as [`FOREIGN_ID`]'s.
 //!
-//! Seeding [`UNDETERMINED_ID`] changes `list`'s answer for the whole host,
-//! not only for that id: it raises `daemon list`'s exit code, and on Windows
-//! it collapses into an aggregate entry that names nothing. A caller whose
-//! suite also asserts a *clean* host-wide listing has to serialize the two
-//! against each other — the `UNIT_DIR_EXCLUSIVE` label all four integration
-//! suites share by name.
+//! [`an_unclassifiable_id_is_never_silently_absent`] needs a third state — an
+//! artifact whose bytes this process cannot obtain, at [`UNDETERMINED_ID`] —
+//! and is exported separately rather than run from `run`, because whether a
+//! backend can be *put* in that state depends on the privilege the caller
+//! holds. See its own doc comment for which backends can, and for what covers
+//! the ones that cannot.
 //!
 //! [`fake::Fake`] exposes
 //! `seed_foreign`/`install_then_hand_edit`/`seed_opaque` for exactly this; a
@@ -79,8 +69,8 @@ pub const FOREIGN_ID: &str = "goetia-conformance-foreign";
 /// this id.
 pub const HAND_EDITED_ID: &str = "goetia-conformance-hand-edited";
 
-/// See the module doc comment. Reserved: no other scenario in `run` uses
-/// this id.
+/// See [`an_unclassifiable_id_is_never_silently_absent`], the one scenario
+/// that reads this id. Reserved: no other scenario uses it.
 pub const UNDETERMINED_ID: &str = "goetia-conformance-undetermined";
 
 /// RAII cleanup for every id `run`'s scenarios install. `Drop` cannot
@@ -108,10 +98,13 @@ impl Drop for Cleanup<'_> {
 ///
 /// `mk(id)` must build a valid, installable [`DaemonSpec`] with `id` as its
 /// id. Every id `run` uses is either freshly generated (never installed
-/// before) or one of
-/// [`FOREIGN_ID`]/[`HAND_EDITED_ID`]/[`UNDETERMINED_ID`] — see the module
-/// doc comment for what the caller must have already arranged at those
-/// three, and for what `run` cleans up on its own.
+/// before) or one of [`FOREIGN_ID`]/[`HAND_EDITED_ID`] — see the module doc
+/// comment for what the caller must have already arranged at those two, and
+/// for what `run` cleans up on its own.
+///
+/// [`an_unclassifiable_id_is_never_silently_absent`] is deliberately not among
+/// the scenarios below; a caller that can seed [`UNDETERMINED_ID`] calls it
+/// itself.
 pub fn run(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
     let mut cleanup = Cleanup { mgr, ids: Vec::new() };
     // Registered up front, not inside `conflict_requires_force`: the caller
@@ -132,7 +125,6 @@ pub fn run(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
     refuses_foreign_even_with_force(mgr, mk);
     foreign_refuses_every_verb(mgr, mk);
     conflict_requires_force(mgr, mk);
-    an_unclassifiable_id_is_never_silently_absent(mgr, mk);
 
     // `cleanup` drops here, uninstalling everything pushed above — including
     // on an early return via a panicking assertion, since `Drop` still runs
@@ -362,16 +354,41 @@ fn list_and_status_agree_on_pid(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> D
     assert_list_is_complete_and_pid_agrees(mgr, &spec.id, cleanup);
 }
 
-/// The silent-skip regression [`Installed::Undetermined`] exists to prevent,
-/// asserted of every backend at once: an id goetia could not classify is
-/// reported as unclassified — never dropped from the listing, never claimed
-/// as goetia's — and no verb acts on it.
+/// The silent-skip regression [`Installed::Undetermined`] exists to prevent:
+/// an id goetia could not classify is reported as unclassified — never dropped
+/// from the listing, never claimed as goetia's — and no verb acts on it.
 ///
-/// See the module doc comment: the caller must have already put an artifact
-/// whose bytes this process cannot obtain at [`UNDETERMINED_ID`]. That every
-/// verb refuses — `install --force` included — is what this asserts rather
-/// than assumes, so it registers no cleanup of its own; the caller's own
-/// cleanup for [`UNDETERMINED_ID`] covers a backend that writes anyway.
+/// The caller must have already put an artifact whose bytes this process
+/// cannot obtain at [`UNDETERMINED_ID`]. That every verb refuses — `install
+/// --force` included — is what this asserts rather than assumes, so it
+/// registers no cleanup of its own; the caller's own cleanup for
+/// [`UNDETERMINED_ID`] covers a backend that writes anyway.
+///
+/// # Why this is not one of [`run`]'s scenarios
+///
+/// Because seeding it is not something every caller can do. The state is a
+/// read that *did not complete*, and on Windows an elevated reader can still
+/// be denied one — a `Deny`/`ReadKey` ACE over `Parameters` stops an
+/// Administrator, which `tests/scm_integration/deny.rs` proves — so
+/// `scm_passes_conformance` seeds it and calls this directly. On systemd and
+/// launchd every read is DAC-gated and root has `CAP_DAC_OVERRIDE`: an
+/// elevated caller can read every artifact on the host, and classify each one
+/// (a symlink, a FIFO and a device node are foreign by type; bytes that are
+/// not UTF-8 are foreign by format). The state exists there only *below* the
+/// privilege boundary, so those suites assert it end to end through an
+/// unprivileged reader instead — `tests/systemd_integration/linux.rs`'s
+/// `unelevated_*_undetermined` tests, which cover the same two halves this
+/// does: the id is reported by `list`, and every verb refuses it.
+///
+/// Calling it unconditionally from `run` would therefore have forced those two
+/// suites to seed a state their backends cannot reach, which is how a scenario
+/// ends up asserting something weaker than it reads.
+///
+/// Seeding [`UNDETERMINED_ID`] changes `list`'s answer for the whole host, not
+/// only for that id: it raises `daemon list`'s exit code, and on Windows it
+/// collapses into an aggregate entry. A caller whose suite also asserts a
+/// *clean* host-wide listing has to serialize the two against each other — the
+/// `UNIT_DIR_EXCLUSIVE` label the integration suites share by name.
 ///
 /// A backend satisfies the `list` half by naming the id in an
 /// [`Installed::Undetermined`] entry *or* by emitting any aggregate one. The
@@ -381,7 +398,7 @@ fn list_and_status_agree_on_pid(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> D
 /// have hundreds of denied services and one entry cannot carry their names.
 /// The per-id half below is exact on every backend, so accepting the
 /// aggregate does not weaken the scenario to nothing.
-fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
+pub fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
     let spec = mk(UNDETERMINED_ID);
     let id = &spec.id;
 
