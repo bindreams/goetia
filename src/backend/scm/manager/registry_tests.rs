@@ -36,6 +36,35 @@ fn format_environment_lines_is_empty_for_empty_env() {
     assert!(format_environment_lines(&BTreeMap::new()).is_empty());
 }
 
+/// The `Parameters` half of this backend's [`Error::Undetermined`] keying. `winreg` surfaces
+/// `ERROR_ACCESS_DENIED` as `ErrorKind::PermissionDenied`, and that chooses the *recovery* alone —
+/// the class is the same either way, because a corrupt hive leaves goetia exactly as ignorant of
+/// the id as a denial does.
+#[skuld::test]
+fn a_parameters_read_that_did_not_complete_is_undetermined() {
+    let path = parameters_key_path("x");
+    for (source, wants_elevation) in [
+        (std::io::Error::from(std::io::ErrorKind::PermissionDenied), true),
+        (std::io::Error::other("the hive is corrupt"), false),
+    ] {
+        let rendered = format!("{source:?}");
+        let Error::Undetermined { id, reason, recovery } = registry_undetermined("x", "open", &path, &source) else {
+            panic!("{rendered}: a read that did not complete establishes nothing about the id");
+        };
+
+        assert_eq!(id, "x");
+        assert!(
+            reason.contains(&path),
+            "{rendered}: the reason must name the key: {reason}"
+        );
+        assert_eq!(
+            recovery.contains("re-run as Administrator"),
+            wants_elevation,
+            "{rendered}: {recovery}"
+        );
+    }
+}
+
 #[skuld::test]
 fn format_environment_lines_preserves_equals_signs_in_the_value() {
     let mut env = BTreeMap::new();

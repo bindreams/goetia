@@ -109,6 +109,78 @@ fn is_not_found_matches_only_error_service_does_not_exist() {
     assert!(!is_not_found(&access_denied));
 }
 
+// undetermined ========================================================================================================
+
+/// The substance `manager::fake`'s own `Error::Undetermined` carries, asserted of this backend's
+/// constructor — as `the_launchd_undetermined_recovery_names_both_causes_and_not_uninstall` asserts
+/// it of launchd's. The three describe one condition and must agree about it without sharing a
+/// function. Split across the cause rather than crammed into one sentence — elevation is advice only
+/// a permission boundary earns, and offering it for a failing disk sends the reader somewhere
+/// useless — so "both causes" means the pair covers both, one each. Never `uninstall`, in any of
+/// them: that is `Outcome::RefuseUnreadable`'s remedy, and it certifies the ownership this read
+/// never established.
+#[skuld::test]
+fn the_scm_undetermined_recovery_names_both_causes_and_not_uninstall() {
+    // 1117 is ERROR_IO_DEVICE: a read that did not complete for a reason no amount of privilege
+    // fixes, so the class must not be keyed on the denial even though the advice is.
+    for (raw, wants_elevation) in [(ERROR_ACCESS_DENIED as i32, true), (1117, false)] {
+        let e = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(raw));
+        let Error::Undetermined { id, reason, recovery } = service_undetermined("x", "open service `x`", &e) else {
+            panic!("{raw}: every non-`is_not_found` failure is undetermined, not just a denial");
+        };
+
+        assert_eq!(id, "x");
+        assert!(reason.contains("open service `x`"), "{raw}: {reason}");
+        assert!(recovery.contains("re-run"), "{raw}: {recovery}");
+        assert_eq!(
+            recovery.contains("re-run as Administrator"),
+            wants_elevation,
+            "{raw}: {recovery}"
+        );
+        assert!(
+            !recovery.contains("uninstall"),
+            "{raw}: uninstall certifies ownership this read never established: {recovery}"
+        );
+    }
+}
+
+#[skuld::test]
+fn is_access_denied_matches_only_error_access_denied() {
+    let denied = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
+    assert!(is_access_denied(&denied));
+
+    let not_found = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(1060));
+    assert!(!is_access_denied(&not_found));
+
+    assert!(!is_access_denied(&windows_service::Error::LaunchArgumentsNotSupported));
+}
+
+// list's aggregate ====================================================================================================
+
+/// The count is data, not a diagnostic: it reaches the caller as an entry, whose null name is what
+/// obliges every consumer to stop concluding absence (see `Installed::Undetermined`).
+#[skuld::test]
+fn an_aggregate_undetermined_entry_has_a_null_name_and_names_its_count() {
+    match unreadable_aggregate(3) {
+        Some(Installed::Undetermined { name, reason }) => {
+            assert_eq!(
+                name, None,
+                "one entry stands for 3 ids, so there is no single id to name"
+            );
+            assert_eq!(reason, unreadable_notice(3), "the entry carries the notice verbatim");
+        }
+        other => panic!("services goetia could not classify establish neither presence nor absence: {other:?}"),
+    }
+}
+
+/// The other half, and the one an over-eager fix would break: a host every one of whose services
+/// goetia read leaves nothing undetermined, so `list` must add no entry and `daemon list` must not
+/// exit `4` forever.
+#[skuld::test]
+fn no_aggregate_entry_is_emitted_for_a_zero_count() {
+    assert!(unreadable_aggregate(0).is_none());
+}
+
 #[skuld::test]
 fn unreadable_notice_is_one_line_and_agrees_in_number() {
     // The wording carries the honest part of this diagnostic — that ownership

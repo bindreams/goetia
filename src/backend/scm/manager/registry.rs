@@ -28,8 +28,27 @@ fn parameters_key_path(name: &str) -> String {
     format!(r"{SERVICES_KEY}\{name}\Parameters")
 }
 
+/// What did not complete, as facts, with no claim about any id attached.
+/// Shared by [`registry_error`] and [`registry_undetermined`], so one failure
+/// cannot be described two ways depending on which class it lands in.
+fn registry_detail(op: &str, path: &str, source: &std::io::Error) -> String {
+    format!(r"registry {op} HKLM\{path}: {source}")
+}
+
 fn registry_error(op: &str, path: &str, source: std::io::Error) -> Error {
-    Error::Other(format!(r"registry {op} HKLM\{path}: {source}"))
+    Error::Other(registry_detail(op, path, &source))
+}
+
+/// The same failure, for a read that was supposed to say whether `name` is
+/// goetia's at all — see [`super::undetermined`], whose doc comment carries the
+/// whole argument, including why the class is not keyed on the denial while the
+/// recovery is.
+fn registry_undetermined(name: &str, op: &str, path: &str, source: &std::io::Error) -> Error {
+    super::undetermined(
+        name,
+        registry_detail(op, path, source),
+        source.kind() == std::io::ErrorKind::PermissionDenied,
+    )
 }
 
 // Parameters (the metadata blob) ======================================================================================
@@ -47,19 +66,23 @@ fn registry_error(op: &str, path: &str, source: std::io::Error) -> Error {
 /// `manager`) — reads back as an empty map, not an error: to
 /// `generate::extract`, that is indistinguishable from "no Goetia marker at
 /// all", which is exactly the correct classification (`Ownership::Foreign`).
+/// Absence is *established* there; every other failure establishes nothing,
+/// and is [`registry_undetermined`] — this key holds the only proof of
+/// ownership a `type: managed` service has, so a read of it that did not
+/// complete leaves goetia unable to say even that much.
 pub fn read_parameters(name: &str) -> Result<BTreeMap<String, String>> {
     let path = parameters_key_path(name);
     let key = match RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(&path, KEY_READ) {
         Ok(k) => k,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(e) => return Err(registry_error("open", &path, e)),
+        Err(e) => return Err(registry_undetermined(name, "open", &path, &e)),
     };
 
     let mut out = BTreeMap::new();
     for entry in key.enum_values() {
-        let (name, value) = entry.map_err(|e| registry_error("enumerate", &path, e))?;
+        let (field, value) = entry.map_err(|e| registry_undetermined(name, "enumerate", &path, &e))?;
         if let Ok(s) = String::from_reg_value(&value) {
-            out.insert(name, s);
+            out.insert(field, s);
         }
     }
     Ok(out)

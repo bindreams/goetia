@@ -15,6 +15,9 @@ mod support;
 #[path = "scm_integration/common.rs"]
 mod common;
 #[cfg(windows)]
+#[path = "scm_integration/deny.rs"]
+mod deny;
+#[cfg(windows)]
 #[path = "scm_integration/fixture.rs"]
 mod fixture;
 #[cfg(windows)]

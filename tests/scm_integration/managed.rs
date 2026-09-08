@@ -10,14 +10,41 @@ use goetia::backend::scm::manager::ScmManager;
 use goetia::decide::Outcome;
 use goetia::manager::conformance;
 use goetia::manager::{Installed, ServiceManager as _, State};
-use goetia::spec::{Id, Restart, User};
+use goetia::spec::{DaemonSpec, Id, Restart, User};
+use windows_service::service::ServiceAccess;
+use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
+use winreg::RegKey;
+use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
 
 use crate::common::{self, conformance_mk, fixture_command, mk_spec};
+use crate::deny::Denied;
 use crate::install_helper::INSTALL_AS;
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
 
+/// Held by every test whose assertion is about `list`'s answer for the *whole
+/// host* — its exit code, or the absence of any `undetermined` entry — and by
+/// every test that denies an elevated reader something under
+/// `HKLM\SYSTEM\CurrentControlSet\Services`, which changes that answer. The two
+/// groups are the same group precisely because either one invalidates the
+/// other, so they take turns rather than race.
+///
+/// Named for systemd's unit directory rather than for SCM's service tree
+/// deliberately: skuld coordinates serialization across processes by label
+/// *name*, and `tests/cli_binary.rs::native_backend_answers_list_unelevated`
+/// runs a real `daemon list` — on Windows, through this backend — holding that
+/// same name.
+#[skuld::label]
+const UNIT_DIR_EXCLUSIVE: skuld::Label;
+
 fn id_of(s: &str) -> Id {
     Id::try_from(s).expect("random_test_id/short local ids are valid Ids")
+}
+
+/// A fresh, installed `type: managed` service at `id`, with no ports wired up.
+fn install_plain(mgr: &ScmManager, id: &str) -> DaemonSpec {
+    let spec = mk_spec(id, fixture_command(id, 1, 1, "plain"), BTreeMap::new());
+    mgr.install(&spec, false).expect("install");
+    spec
 }
 
 fn seed_foreign(id: &str) {
@@ -145,7 +172,7 @@ fn start_stop_status_reflect_reality() {
     assert_eq!(status.state, State::Stopped);
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn uninstall_leaves_nothing() {
     let mgr = ScmManager::new();
     let id = support::random_test_id();
@@ -177,7 +204,7 @@ fn uninstall_leaves_nothing() {
     );
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_ignores_foreign_services() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -509,4 +536,119 @@ fn deleted_account_makes_the_service_oursunreadable() {
             panic!("expected OursUnreadable once the account backing `user.id` is deleted")
         }
     }
+}
+
+// A read that did not complete: the aggregate, and the two objects that produce it ====================================
+
+/// The aggregate is a privilege artifact, not a permanent fixture. An elevated caller reads every
+/// service's `Parameters`, so `list` must add no `undetermined` entry at all — otherwise
+/// `goetia daemon list` would exit `4` on every Windows host forever, and the code would stop
+/// meaning anything.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn list_emits_no_aggregate_entry_when_every_service_is_readable() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    install_plain(&mgr, guard.id());
+
+    let listed = mgr.list().expect("list");
+
+    // Non-vacuous: an elevated reader decodes this service's own marker and lists it, so a run whose
+    // reader could in fact read nothing fails here instead of passing on an empty listing.
+    assert!(
+        listed
+            .iter()
+            .any(|entry| matches!(entry, Installed::Ours { spec, .. } if spec.id.as_str() == id)),
+        "the installed daemon must actually appear: {listed:?}"
+    );
+    let undetermined: Vec<&Installed> = listed
+        .iter()
+        .filter(|entry| matches!(entry, Installed::Undetermined { .. }))
+        .collect();
+    assert!(
+        undetermined.is_empty(),
+        "an elevated caller read every service's Parameters, so nothing on this host was left \
+         undetermined: {undetermined:?}"
+    );
+}
+
+/// The `Parameters` boundary. A service whose metadata key denies reading is a service whose marker
+/// was never read, so goetia established neither that it owns the id nor that it does not — and
+/// `Kind::Unreadable`, which used to be the answer, would put goetia's name and `uninstall`'s advice
+/// on what may be a stranger's service.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn status_of_a_service_whose_parameters_deny_reading_is_undetermined() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let spec = install_plain(&mgr, guard.id());
+    mgr.status(&spec.id)
+        .expect("status before the denial: the marker reads back fine");
+
+    let _denied = Denied::parameters(&id);
+
+    // The deny ACE really took. Administrators do not bypass an explicit deny, but a test that
+    // passed because the ACE never applied would certify nothing at all.
+    let path = format!(r"{}\{id}\Parameters", support::SCM_SERVICES_KEY);
+    let blocked = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(&path, KEY_READ)
+        .err()
+        .unwrap_or_else(|| panic!(r"the deny ACE did not apply: HKLM\{path} is still readable"));
+    assert_eq!(blocked.kind(), std::io::ErrorKind::PermissionDenied, "{blocked}");
+
+    let err = mgr
+        .status(&spec.id)
+        .expect_err("a marker that was never read settles nothing about the id");
+    let goetia::Error::Undetermined {
+        id: reported, recovery, ..
+    } = &err
+    else {
+        panic!("neither ownership nor absence was established, so neither may be claimed: {err:?}");
+    };
+    assert_eq!(reported, &id);
+    assert!(
+        recovery.contains("re-run as Administrator"),
+        "a denial is the one cause elevation fixes: {recovery}"
+    );
+}
+
+/// The service-object boundary, which the `Parameters` test cannot reach: every verb but `install`
+/// opens the service object first, so a DACL denying `SERVICE_QUERY_CONFIG`/`SERVICE_QUERY_STATUS`
+/// stops goetia before it ever looks at the metadata. Fixing `read_parameters` alone would leave
+/// this path — and therefore `status` and `discover` — still claiming ownership it never proved.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn status_of_a_service_whose_object_denies_querying_is_undetermined() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let spec = install_plain(&mgr, guard.id());
+
+    let _denied = Denied::service_query(&id);
+
+    // The deny ACE really took, and as `ERROR_ACCESS_DENIED` specifically — the code the recovery
+    // text is keyed on.
+    let scm = WinServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).expect("open SCM");
+    let blocked = scm
+        .open_service(&id, ServiceAccess::QUERY_STATUS)
+        .err()
+        .unwrap_or_else(|| panic!("the deny ACE did not apply: `{id}` is still queryable"));
+    assert!(
+        matches!(&blocked, windows_service::Error::Winapi(io) if io.raw_os_error() == Some(5)),
+        "{blocked:?}"
+    );
+
+    let err = mgr
+        .status(&spec.id)
+        .expect_err("a service object goetia could not open settles nothing about the id");
+    let goetia::Error::Undetermined {
+        id: reported, recovery, ..
+    } = &err
+    else {
+        panic!("`NotInstalled` would claim absence, `Unreadable` ownership; neither was established: {err:?}");
+    };
+    assert_eq!(reported, &id);
+    assert!(
+        recovery.contains("re-run as Administrator"),
+        "a denial is the one cause elevation fixes: {recovery}"
+    );
 }

@@ -9,6 +9,14 @@ use goetia::manager::{Installed, ServiceManager as _, State};
 use crate::common::{conformance_mk, fixture_command, mk_spec};
 use crate::support::{self, ELEVATED, ServiceGuard};
 
+/// The same cross-process lock `tests/scm_integration/managed.rs` declares,
+/// shared with it by label *name*: both binaries drive the one SCM on the host,
+/// and `list`'s aggregate `undetermined` entry is an answer about all of it. A
+/// negative assertion here is unsound while any test anywhere denies a
+/// `Parameters` read, so they take turns rather than race.
+#[skuld::label]
+const UNIT_DIR_EXCLUSIVE: skuld::Label;
+
 fn seed_foreign(id: &str) {
     support::cmd::run(
         "sc.exe",
@@ -108,7 +116,7 @@ fn start_stop_status_reflect_reality() {
     assert_eq!(status.state, State::Stopped);
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn uninstall_leaves_nothing() {
     let mgr = goetia::backend::scm::manager::ScmManager::new();
     let id = support::random_test_id();
@@ -139,7 +147,7 @@ fn uninstall_leaves_nothing() {
     );
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_ignores_foreign_services() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
