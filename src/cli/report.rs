@@ -105,7 +105,12 @@ pub(crate) enum Kind {
     /// Goetia could not determine *whether* anything is installed at that
     /// id: a read the answer depends on failed. Claims no ownership, which
     /// is the whole difference from [`Kind::Unreadable`] — see
-    /// [`Error::Undetermined`], which is the only thing that produces it.
+    /// [`Error::Undetermined`], which is the only thing that produces an
+    /// `errors[]` entry of this kind. The `undetermined[]` key is fed
+    /// separately, from [`Installed::Undetermined`] out of `list()`; both
+    /// exit `4` through [`Kind::code`], which owns that mapping.
+    ///
+    /// [`Installed::Undetermined`]: crate::manager::Installed::Undetermined
     /// Only from `status(&id)`.
     Undetermined,
     /// `support::parse_id` rejected a CLI argument: fix the argument.
