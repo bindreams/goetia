@@ -1063,30 +1063,18 @@ impl ServiceManager for LaunchdManager {
 
     fn list(&self) -> Result<Vec<Installed>> {
         let mut by_id: std::collections::BTreeMap<String, Vec<(PathBuf, bool)>> = std::collections::BTreeMap::new();
+        let mut incomplete = Vec::new();
         for (dir, enabled) in [(STAGING_DIR, false), (ENABLED_DIR, true)] {
-            let entries = match fs::read_dir(dir) {
-                Ok(e) => e,
-                // The staging directory does not exist until the first
-                // `install` ever creates it.
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => {
-                    return Err(Error::Io {
-                        path: PathBuf::from(dir),
-                        source: e,
-                    });
-                }
-            };
-            for entry in entries {
-                let entry = entry.map_err(io_err(dir))?;
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("plist") {
-                    continue;
-                }
-                let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                by_id.entry(id.to_string()).or_default().push((path, enabled));
+            // A pass that stopped in one directory does not stop the other. They are two separate
+            // locations, and what the staging directory refused to yield establishes nothing about
+            // `/Library/LaunchDaemons` — so scanning on can only add ids goetia has actually
+            // established, while the aggregate below already forbids concluding absence for
+            // anything either pass missed. Two aggregates is the honest report when both stop.
+            let scan = scan_plists(dir);
+            for (id, path) in scan.plists {
+                by_id.entry(id).or_default().push((path, enabled));
             }
+            incomplete.extend(scan.incomplete);
         }
 
         let mut out = Vec::new();
@@ -1162,7 +1150,78 @@ impl ServiceManager for LaunchdManager {
                 }),
             }
         }
+        // Last, so a pass that got some way in still reports what it named before what it could
+        // not — the order `cli::support::partition_installed` imposes on the rendered output too.
+        out.extend(incomplete);
         Ok(out)
+    }
+}
+
+// Enumeration =========================================================================================================
+
+/// What one pass over one of `list`'s two directories found: the `<id>.plist` files it reached,
+/// and — when the pass stopped early — the entry standing for whatever it never did.
+#[derive(Debug)]
+struct PlistScan {
+    plists: Vec<(String, PathBuf)>,
+    incomplete: Option<Installed>,
+}
+
+/// Enumerate `dir`. A pass that cannot start, or cannot finish, is *reported* rather than
+/// propagated: an `Err` out of `list` throws away everything the same call already classified —
+/// including, here, a whole other directory that was scanned successfully — and reaches the CLI as
+/// an empty document on exit `1`, which is `list` saying the host has no daemons.
+///
+/// `dir` not existing is left as it was, a silent skip: the staging directory does not exist until
+/// the first `install` ever creates it, and that establishes that nothing is staged rather than
+/// leaving it unread.
+fn scan_plists(dir: &str) -> PlistScan {
+    match fs::read_dir(dir) {
+        Ok(entries) => collect_plists(dir, entries.map(|entry| entry.map(|entry| entry.path()))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => PlistScan {
+            plists: Vec::new(),
+            incomplete: None,
+        },
+        Err(e) => PlistScan {
+            plists: Vec::new(),
+            incomplete: Some(Installed::scan_incomplete(
+                dir,
+                &format!("failed to read directory: {e}"),
+            )),
+        },
+    }
+}
+
+/// The pass itself, over an iterator of paths rather than [`fs::read_dir`] directly — which is what
+/// makes the mid-pass fault reachable from a test, since no `readdir` fails on request. That fault
+/// is the half that matters: everything already collected comes back alongside the aggregate,
+/// rather than being discarded because a *later* dirent could not be read.
+fn collect_plists(dir: &str, entries: impl Iterator<Item = io::Result<PathBuf>>) -> PlistScan {
+    let mut plists = Vec::new();
+    for entry in entries {
+        let path = match entry {
+            Ok(path) => path,
+            Err(e) => {
+                return PlistScan {
+                    plists,
+                    incomplete: Some(Installed::scan_incomplete(
+                        dir,
+                        &format!("failed to read a directory entry: {e}"),
+                    )),
+                };
+            }
+        };
+        if path.extension().and_then(|e| e.to_str()) != Some("plist") {
+            continue;
+        }
+        let Some(id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else {
+            continue;
+        };
+        plists.push((id, path));
+    }
+    PlistScan {
+        plists,
+        incomplete: None,
     }
 }
 

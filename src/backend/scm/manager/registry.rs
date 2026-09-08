@@ -17,7 +17,9 @@ use winreg::types::FromRegValue as _;
 
 use crate::error::{Error, Result};
 
-const SERVICES_KEY: &str = r"SYSTEM\CurrentControlSet\Services";
+/// Also the `location` `manager::list` names in its aggregate entry when a pass over this key
+/// stops early.
+pub const SERVICES_KEY: &str = r"SYSTEM\CurrentControlSet\Services";
 const ENVIRONMENT_VALUE: &str = "Environment";
 
 fn service_key_path(name: &str) -> String {
@@ -154,6 +156,18 @@ pub fn write_environment(name: &str, env: &BTreeMap<String, String>) -> Result<(
 
 // Discovery for `list` ================================================================================================
 
+/// What one pass over the `Services` key found: the names it reached, and — when the pass stopped
+/// early — what did not complete there. `manager::list` turns the latter into the aggregate entry
+/// standing for every service the pass never got to.
+#[derive(Debug)]
+pub struct ServiceScan {
+    pub names: Vec<String>,
+    /// `Some` when the enumeration stopped before the end. The names collected up to that point
+    /// stay in `names`: dropping them reports every one of them as absent, which is precisely what
+    /// a pass that did not finish cannot establish.
+    pub incomplete: Option<String>,
+}
+
 /// Every service currently registered with SCM, paired with its
 /// `Parameters` map (empty when absent — see [`read_parameters`]). The
 /// caller (`manager::list`) runs `generate::extract` over each to decide
@@ -164,13 +178,46 @@ pub fn write_environment(name: &str, env: &BTreeMap<String, String>) -> Result<(
 /// need no more privilege than reading this key does, and going through the
 /// registry once here avoids an `OpenService` round trip per candidate on a
 /// host with hundreds of unrelated services.
-pub fn list_service_names() -> Result<Vec<String>> {
-    let key = RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey_with_flags(SERVICES_KEY, KEY_READ)
-        .map_err(|e| registry_error("open", SERVICES_KEY, e))?;
-    key.enum_keys()
-        .collect::<std::result::Result<Vec<String>, _>>()
-        .map_err(|e| registry_error("enumerate", SERVICES_KEY, e))
+pub fn list_service_names() -> Result<ServiceScan> {
+    let key = match RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(SERVICES_KEY, KEY_READ) {
+        Ok(key) => key,
+        // No `Services` key at all: a determinate fact about the hive rather than a pass that came
+        // up short, and left answering exactly as it always has.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(registry_error("open", SERVICES_KEY, e));
+        }
+        Err(e) => {
+            return Ok(ServiceScan {
+                names: Vec::new(),
+                incomplete: Some(registry_detail("open", SERVICES_KEY, &e)),
+            });
+        }
+    };
+    Ok(collect_service_names(key.enum_keys()))
+}
+
+/// The pass itself, over an iterator rather than the `RegKey` directly — which is what makes the
+/// mid-pass fault reachable from a test, since no `enum_keys` fails on request. That fault is the
+/// half that matters: stop, keep, report. Collecting into a `Result` instead discards every name
+/// already enumerated because a *later* one faulted, leaving `list` nothing to return but an error
+/// — an empty document on exit `1`, which says this host runs no daemons.
+fn collect_service_names(keys: impl Iterator<Item = std::io::Result<String>>) -> ServiceScan {
+    let mut names = Vec::new();
+    for key in keys {
+        match key {
+            Ok(name) => names.push(name),
+            Err(e) => {
+                return ServiceScan {
+                    names,
+                    incomplete: Some(registry_detail("enumerate", SERVICES_KEY, &e)),
+                };
+            }
+        }
+    }
+    ServiceScan {
+        names,
+        incomplete: None,
+    }
 }
 
 #[cfg(test)]

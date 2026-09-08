@@ -127,8 +127,9 @@ pub enum Installed {
     ///
     /// `name` is `None` only for an entry standing for more than one id.
     /// That happens for either of two reasons, and a caller must not assume
-    /// the first: a backend that could not enumerate at all knows a count
-    /// and no names, *or* one that enumerated fine drops the names because
+    /// the first: an enumeration that did not finish knows neither the names
+    /// it never reached nor how many there were (see `Installed::scan_incomplete`),
+    /// *or* one that enumerated fine drops the names because
     /// one entry cannot usefully carry hundreds — which is what Windows SCM
     /// does on an unelevated `list`, where most services deny a `Parameters`
     /// read at once. An entry for exactly one known id always names it.
@@ -147,6 +148,28 @@ pub enum Installed {
     ///
     /// [`Error::Undetermined`]: crate::Error::Undetermined
     Undetermined { name: Option<String>, reason: String },
+}
+
+impl Installed {
+    /// The aggregate entry an enumeration that stopped early leaves behind: `location` is what
+    /// was being scanned, `detail` what did not complete there. Every backend builds it here, so
+    /// a scan cut short in a unit directory, a `LaunchDaemons` directory or the SCM registry key
+    /// says one thing rather than three.
+    ///
+    /// Two rules it exists to keep. Whatever the scan *did* classify stays in the listing —
+    /// dropping it, which is what returning `Err` from `list` amounts to, reports every one of
+    /// those ids as absent. And the wording names no cause: a scan stops on a denial, a corrupt
+    /// directory or an I/O fault alike, and only the `detail` handed in was established.
+    pub(crate) fn scan_incomplete(location: &str, detail: &str) -> Self {
+        Installed::Undetermined {
+            name: None,
+            reason: format!(
+                "{location} could not be enumerated to the end ({detail}). Ownership is unknown \
+                 for whatever the scan did not reach, so a Goetia daemon may be missing from this \
+                 list."
+            ),
+        }
+    }
 }
 
 /// The live state of one installed service, as [`ServiceManager::status`]

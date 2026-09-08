@@ -509,6 +509,11 @@ read is indistinguishable from one where that id does not exist, which is
 how an unelevated `goetia daemon list` could once exit `0` with an empty
 document on a host that did have goetia daemons installed.
 
+The same holds one level up, for the enumeration itself: a directory or
+registry scan that stops part-way keeps everything it had already classified
+and adds one unnamed `undetermined` entry for whatever it never reached,
+instead of failing the whole listing.
+
 **The rule that follows, and it is the whole point:** while an entry is
 present in `undetermined`, no negative conclusion about any id is sound. An
 entry with a `null` name is one entry standing for many ids, so it may stand

@@ -227,7 +227,8 @@ impl ServiceManager for ScmManager {
     fn list(&self) -> Result<Vec<Installed>> {
         let mut out = Vec::new();
         let mut unreadable = 0usize;
-        for name in registry::list_service_names()? {
+        let scan = registry::list_service_names()?;
+        for name in scan.names {
             // A registry read failure for one unrelated service (e.g. a
             // driver whose `Parameters` key carries a restrictive ACL) must
             // not take `list` down for every other daemon — the same
@@ -281,6 +282,14 @@ impl ServiceManager for ScmManager {
             }
         }
         out.extend(unreadable_aggregate(unreadable));
+        // A second aggregate, and distinct from the one above: that one stands for services this
+        // pass reached and could not read, this one for services it never reached at all. Both
+        // carry no name, so either alone already forbids concluding any id absent; reporting them
+        // separately is what keeps each one's count honest.
+        out.extend(
+            scan.incomplete
+                .map(|detail| Installed::scan_incomplete(registry::SERVICES_KEY, &detail)),
+        );
         Ok(out)
     }
 }

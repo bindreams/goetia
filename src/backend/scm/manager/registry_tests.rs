@@ -71,3 +71,42 @@ fn format_environment_lines_preserves_equals_signs_in_the_value() {
     env.insert("URL".to_string(), "http://x/a=b".to_string());
     assert_eq!(format_environment_lines(&env), vec!["URL=http://x/a=b".to_string()]);
 }
+
+/// The mid-pass fault, and the reason `list` no longer propagates one: a key that could not be
+/// enumerated must not take down the services the very same pass already named. Injected through
+/// `collect_service_names`' iterator because no real `enum_keys` fails on request.
+#[skuld::test]
+fn a_key_that_cannot_be_enumerated_keeps_what_the_scan_already_named() {
+    let keys = vec![
+        Ok("named-before-the-fault".to_string()),
+        Err(std::io::Error::other("injected mid-scan failure")),
+        Ok("never-reached".to_string()),
+    ];
+
+    let scan = collect_service_names(keys.into_iter());
+
+    assert_eq!(
+        scan.names,
+        ["named-before-the-fault"],
+        "what the pass named before the fault survives it, and the pass stops there: {scan:?}"
+    );
+    let detail = scan.incomplete.expect("a pass that stopped early must say so");
+    assert!(detail.contains("injected mid-scan failure"), "{detail}");
+    assert!(
+        detail.contains(SERVICES_KEY),
+        "the detail must name what was being scanned: {detail}"
+    );
+}
+
+#[skuld::test]
+fn a_pass_that_finishes_reports_nothing_undetermined() {
+    let keys = vec![Ok("a".to_string()), Ok("b".to_string())];
+
+    let scan = collect_service_names(keys.into_iter());
+
+    assert_eq!(scan.names, ["a", "b"]);
+    assert!(
+        scan.incomplete.is_none(),
+        "a pass that finished has nothing to report: {scan:?}"
+    );
+}

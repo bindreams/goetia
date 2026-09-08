@@ -468,3 +468,93 @@ fn the_launchd_undetermined_recovery_names_both_causes_and_not_uninstall() {
         );
     }
 }
+
+// Enumeration: a scan that did not finish =============================================================================
+
+/// The mid-pass fault, and the reason `list` no longer propagates one: a dirent that could not be
+/// read must not take down the ids the very same pass already named — nor, since the two
+/// directories are scanned in one call, a directory that was read to the end before it. Injected
+/// through `collect_plists`' iterator because no real `readdir` fails on request.
+#[skuld::test]
+fn a_dirent_that_cannot_be_read_keeps_what_the_scan_already_named() {
+    let dir = Path::new(ENABLED_DIR);
+    let entries = vec![
+        Ok(dir.join("named-before-the-fault.plist")),
+        Err(io::Error::other("injected mid-scan failure")),
+        Ok(dir.join("never-reached.plist")),
+    ];
+
+    let scan = collect_plists(ENABLED_DIR, entries.into_iter());
+
+    assert_eq!(
+        scan.plists.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        ["named-before-the-fault"],
+        "what the pass named before the fault survives it, and the pass stops there: {scan:?}"
+    );
+    match &scan.incomplete {
+        Some(Installed::Undetermined { name, reason }) => {
+            assert_eq!(*name, None, "the pass cannot name what it never reached");
+            assert!(reason.contains("injected mid-scan failure"), "{reason}");
+            assert!(
+                reason.contains(ENABLED_DIR),
+                "the reason must name what was being scanned: {reason}"
+            );
+        }
+        other => panic!("a pass that stopped early must say so: {other:?}"),
+    }
+}
+
+/// The same fault one syscall earlier. An `Err` here reaches the CLI as `Kind::Unavailable` — exit
+/// `1` over an empty document, which is `list` reporting a populated host as having nothing on it.
+#[skuld::test]
+fn a_plist_directory_that_cannot_be_opened_is_reported_not_propagated() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let blocking_file = tmp.path().join("not-a-directory");
+    fs::write(&blocking_file, "").expect("write the blocking file");
+    // `ENOTDIR`: not `NotFound`, and identical for root and everyone else — which is what makes it
+    // the right probe in a binary CI runs elevated.
+    let dir = blocking_file.join("LaunchDaemons");
+
+    let scan = scan_plists(&dir.to_string_lossy());
+
+    assert!(scan.plists.is_empty(), "nothing was enumerated: {scan:?}");
+    assert!(
+        matches!(&scan.incomplete, Some(Installed::Undetermined { name: None, .. })),
+        "{scan:?}"
+    );
+}
+
+/// The case that is deliberately *not* this one: the staging directory does not exist until the
+/// first `install` ever creates it, which establishes that nothing is staged rather than leaving it
+/// unread.
+#[skuld::test]
+fn an_absent_directory_is_not_an_unfinished_scan() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let scan = scan_plists(&tmp.path().join("nowhere").to_string_lossy());
+
+    assert!(scan.plists.is_empty(), "{scan:?}");
+    assert!(
+        scan.incomplete.is_none(),
+        "an absent directory answers the question rather than leaving it open: {scan:?}"
+    );
+}
+
+#[skuld::test]
+fn a_pass_that_finishes_names_every_plist_and_nothing_else() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::write(tmp.path().join("kept.plist"), "").expect("write the plist");
+    fs::write(tmp.path().join("ignored.txt"), "").expect("write the non-plist");
+
+    let scan = scan_plists(&tmp.path().to_string_lossy());
+
+    assert_eq!(
+        scan.plists.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        ["kept"],
+        "{scan:?}"
+    );
+    assert!(
+        scan.incomplete.is_none(),
+        "a pass that finished has nothing to report: {scan:?}"
+    );
+}

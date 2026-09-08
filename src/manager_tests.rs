@@ -46,3 +46,26 @@ fn native_returns_a_working_backend_on_windows() {
     // calls it.
     mgr.list().expect("list needs no elevation and no installed services");
 }
+
+/// The aggregate every backend leaves behind when an enumeration stops early: it names what was
+/// being scanned and what did not complete there, and nothing else. Claiming a cause would hand
+/// over a remedy that cannot work for the other causes — the discipline SCM's `unreadable_notice`
+/// already follows for its own aggregate.
+#[skuld::test]
+fn a_scan_that_stopped_early_reports_an_aggregate_that_claims_no_cause() {
+    let entry = Installed::scan_incomplete(
+        "/etc/systemd/system",
+        "failed to read a directory entry: Input/output error (os error 5)",
+    );
+
+    let Installed::Undetermined { name, reason } = entry else {
+        panic!("a scan that did not finish established neither absence nor ownership");
+    };
+    assert_eq!(name, None, "a scan cannot name what it never reached");
+    assert!(reason.contains("/etc/systemd/system"), "{reason}");
+    assert!(reason.contains("Input/output error"), "{reason}");
+    assert!(
+        !reason.contains("denied") && !reason.contains("elevat") && !reason.contains("privilege"),
+        "the cause was never established, so it may not be named: {reason}"
+    );
+}

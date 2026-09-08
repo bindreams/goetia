@@ -277,21 +277,15 @@ impl ServiceManager for Systemd {
     }
 
     fn list(&self) -> Result<Vec<Installed>> {
-        let dir = Path::new(UNIT_DIR);
-        let entries = fs::read_dir(dir).map_err(|e| io_err("read directory", dir, e))?;
+        let scan = scan_unit_dir(Path::new(UNIT_DIR))?;
 
         let mut out = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|e| io_err("read a directory entry in", dir, e))?;
-            let file_name = entry.file_name();
-            let name = file_name.to_string_lossy();
-            let Some(id) = name.strip_suffix(".service") else {
-                continue;
-            };
+        for (id, path) in &scan.units {
+            let id = id.as_str();
 
             // The same classification `status` performs, so the two cannot describe one machine
             // differently.
-            let text = match classify_and_read(&entry.path()) {
+            let text = match classify_and_read(path) {
                 Ok(RawState::Regular(text)) => text,
                 // Gone between the scan and the open, or never a fragment to read (a masked unit's
                 // symlink, a FIFO, a `.d` directory): obligations 2 and 3.
@@ -331,7 +325,76 @@ impl ServiceManager for Systemd {
                 }),
             }
         }
+        // Last, so a scan that got some way in still reports what it named before what it could
+        // not — the order `cli::support::partition_installed` imposes on the rendered output too.
+        out.extend(scan.incomplete);
         Ok(out)
+    }
+}
+
+// Enumeration =========================================================================================================
+
+/// What one pass over a unit directory found: the `<id>.service` fragments it reached, and — when
+/// the pass stopped early — the entry standing for whatever it never did.
+#[derive(Debug)]
+struct UnitScan {
+    units: Vec<(String, PathBuf)>,
+    incomplete: Option<Installed>,
+}
+
+/// Enumerate `dir`. A pass that cannot start, or cannot finish, is *reported* rather than
+/// propagated: an `Err` out of `list` would throw away every id this same call already classified
+/// and reach the CLI as an empty document on exit `1`, which is `list` saying the host has no
+/// daemons — the one claim a scan that did not finish cannot support.
+///
+/// `dir` not existing is left as it was, an `Err`: it is a determinate fact about the host rather
+/// than a scan that came up short, and nothing about it is undetermined.
+fn scan_unit_dir(dir: &Path) -> Result<UnitScan> {
+    match fs::read_dir(dir) {
+        Ok(entries) => Ok(collect_units(dir, entries.map(|entry| entry.map(|entry| entry.path())))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(io_err("read directory", dir, e)),
+        Err(e) => Ok(UnitScan {
+            units: Vec::new(),
+            incomplete: Some(Installed::scan_incomplete(
+                &dir.display().to_string(),
+                &format!("failed to read directory: {e}"),
+            )),
+        }),
+    }
+}
+
+/// The pass itself, over an iterator of paths rather than [`fs::read_dir`] directly — which is what
+/// makes the mid-pass fault reachable from a test, since no `readdir` fails on demand. That fault
+/// is the half that matters: everything already collected comes back alongside the aggregate,
+/// rather than being discarded because a *later* dirent could not be read.
+fn collect_units(dir: &Path, entries: impl Iterator<Item = io::Result<PathBuf>>) -> UnitScan {
+    let mut units = Vec::new();
+    for entry in entries {
+        let path = match entry {
+            Ok(path) => path,
+            Err(e) => {
+                return UnitScan {
+                    units,
+                    incomplete: Some(Installed::scan_incomplete(
+                        &dir.display().to_string(),
+                        &format!("failed to read a directory entry: {e}"),
+                    )),
+                };
+            }
+        };
+        // Lossy, exactly as before: a non-UTF-8 unit name still has to be reported, and every read
+        // below goes through `path` itself rather than through this rendering of it.
+        let Some(file_name) = path.file_name().map(|name| name.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        let Some(id) = file_name.strip_suffix(".service") else {
+            continue;
+        };
+        units.push((id.to_string(), path));
+    }
+    UnitScan {
+        units,
+        incomplete: None,
     }
 }
 
