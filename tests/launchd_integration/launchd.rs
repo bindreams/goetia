@@ -807,14 +807,15 @@ impl Drop for DirGuard {
 /// `Absent` -> `Create` -> `write_new` -> `Raced` -> re-`install` -> the
 /// identical classification, an unbounded recursion that would eventually
 /// abort the process. `locate` now uses `symlink_metadata`, so a directory
-/// is "occupied" like anything else, and `discover`'s subsequent read
-/// fails cleanly instead.
+/// is "occupied" like anything else, and `discover`'s read classifies it
+/// before opening it.
 ///
-/// Holds `UNIT_DIR_EXCLUSIVE`: a directory where a plist should be reads as
-/// `EISDIR`, which `list` reports as an `Undetermined` entry for the whole
-/// host to see.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn install_over_a_directory_errors_instead_of_recursing() {
+/// The refusal is `RefuseForeign`, not an `Err`: a directory at a plist path
+/// is not something goetia failed to read, it is positively not a plist, and
+/// naming the remedy beats a bare error. That is the same verdict the
+/// systemd backend reaches for a non-regular file at a fragment path.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn install_over_a_directory_refuses_instead_of_recursing() {
     let mgr = LaunchdManager::new();
     let id = support::random_test_id();
     let path = staging_path(&id);
@@ -822,10 +823,63 @@ fn install_over_a_directory_errors_instead_of_recursing() {
     let _cleanup = DirGuard(path);
 
     let spec = sleepy(&id);
-    // The mere fact this returns at all (rather than stack-overflowing)
-    // is most of what this test proves; asserting `Err` pins the rest.
-    mgr.install(&spec, false)
-        .expect_err("a directory occupying the target path must not be silently treated as absent");
+    // The mere fact this returns at all (rather than stack-overflowing) is
+    // most of what this test proves; asserting the outcome pins the rest.
+    let outcome = mgr
+        .install(&spec, false)
+        .expect("a directory at the target path is a refusal, not a failure");
+    assert!(
+        matches!(outcome, Outcome::RefuseForeign { .. }),
+        "a directory occupying the target path must not be silently treated as absent: {outcome:?}"
+    );
+}
+
+/// `open(2)` on a FIFO with `O_RDONLY` blocks until a writer arrives, and
+/// `list` reads every `*.plist` name in `/Library/LaunchDaemons` — so one
+/// `mkfifo` there would wedge the listing for the whole host. Classifying
+/// the path before opening it is what keeps that from happening.
+///
+/// No `UNIT_DIR_EXCLUSIVE`: a FIFO is omitted rather than reported, so it
+/// moves neither the host's `undetermined` set nor `list`'s exit code, and
+/// this asserts about its own id alone.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn list_does_not_hang_on_a_fifo_in_the_plist_directory() {
+    let id = support::random_test_id();
+    let path = enabled_path(&id);
+    mkfifo(&path);
+    let _cleanup = FileGuard(path);
+
+    let listed = without_blocking("LaunchdManager::list", || LaunchdManager::new().list()).expect("list");
+
+    assert!(
+        !may_account_for(&listed, &id),
+        "a FIFO is not a plist, and nothing about it was left undetermined: {listed:?}"
+    );
+}
+
+fn mkfifo(path: &Path) {
+    std::fs::create_dir_all(path.parent().unwrap()).expect("create parent dir");
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("a plist path with no NUL");
+    // SAFETY: `c_path` is a NUL-terminated pointer valid for the call.
+    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+    assert_eq!(rc, 0, "mkfifo {}: {}", path.display(), std::io::Error::last_os_error());
+}
+
+/// Run `f` on its own thread and report — rather than hang — if it never
+/// returns.
+///
+/// The bound is a failure bound on a kernel wait that may genuinely never
+/// end: `open(2)` on a FIFO with `O_RDONLY` blocks until a writer arrives,
+/// and nothing here ever creates one. It synchronizes nothing, and no
+/// passing run's outcome depends on its value — only how long a regression
+/// takes to be *reported* instead of wedging the whole suite, which is what
+/// an unguarded call would do.
+fn without_blocking<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || drop(tx.send(f())));
+    rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap_or_else(|_| {
+        panic!("{what} never returned: it opened the FIFO for reading, which blocks until a writer arrives")
+    })
 }
 
 /// A job loaded under our label from a *different* plist must not be

@@ -39,7 +39,7 @@
 //! database entries the former creates cannot be removed, and `bootstrap`
 //! refuses a `Disabled` plist outright (see the crate-level design notes).
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -241,6 +241,87 @@ enum Classified {
     Undecodable(std::string::FromUtf8Error),
 }
 
+/// What trying to obtain a plist's bytes ran into.
+enum Obtained {
+    Bytes(Vec<u8>),
+    /// Nothing is at the path.
+    Absent,
+    /// Something is at the path and it is positively **not** a plist: a
+    /// FIFO, a directory, a socket, a device node. A different claim from
+    /// [`Obtained::Failed`] — not "goetia could not read this", but "goetia
+    /// read nothing because there is nothing here to read" — and so it is
+    /// treated exactly like a binary plist: foreign, omitted.
+    NonRegular,
+    /// The read did not complete.
+    Failed(io::Error),
+}
+
+/// Classify `path` before opening it, and again on the descriptor actually
+/// opened.
+///
+/// `open(2)` on a FIFO with `O_RDONLY` blocks until a writer arrives, and
+/// `list` reads every `*.plist` name in `/Library/LaunchDaemons` — so one
+/// `mkfifo` there would otherwise wedge the listing for the whole host, and
+/// wedge `install`/`status` for that id forever. The step-1 `fs::metadata`
+/// never opens anything, so it cannot block, and it keeps a device node from
+/// being opened at all.
+///
+/// [`fs::metadata`], which **follows symlinks**, deliberately unlike
+/// `super::super::systemd::manager::discover::classify_and_read`'s
+/// `O_PATH | O_NOFOLLOW` view of a unit fragment. The two differ because the
+/// platforms do: `systemctl mask` points a fragment at `/dev/null`, so on
+/// systemd the symlink itself is the meaningful artifact and reading through
+/// it would look identical to "nothing here". launchd has no masking and no
+/// equivalent — a symlink at a plist path is just an indirection to the
+/// plist — and following it is what this backend has always done. Do not
+/// unify the two.
+///
+/// Step 2 re-checks the *descriptor*, not the name, so the verdict is about
+/// the exact object whose bytes are read: the file `fs::metadata` classified
+/// need not be the file a later `open` resolves the same name to. That
+/// leaves no residual for this hazard, and needs no `(st_dev, st_ino)`
+/// comparison against step 1 to say so — an `fstat` on the open descriptor
+/// is a stronger statement than agreement between two name lookups. What it
+/// does not rule out is reading a *different regular file* than step 1
+/// stat'd, which is the same benign content race a plain `fs::read` has and
+/// no verdict here depends on.
+///
+/// `O_NONBLOCK` covers the window between the two steps: a FIFO swapped in
+/// after step 1 cannot block the open, so step 2 gets to reject it.
+fn obtain(path: &Path) -> Obtained {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    match fs::metadata(path) {
+        Ok(meta) if !meta.is_file() => return Obtained::NonRegular,
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Obtained::Absent,
+        Err(e) => return Obtained::Failed(e),
+    }
+
+    let mut file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        // Gone between the two steps: the same uninstall race step 1
+        // tolerates, observed one syscall later.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Obtained::Absent,
+        Err(e) => return Obtained::Failed(e),
+    };
+    match file.metadata() {
+        Ok(meta) if !meta.is_file() => return Obtained::NonRegular,
+        Ok(_) => {}
+        Err(e) => return Obtained::Failed(e),
+    }
+
+    let mut bytes = Vec::new();
+    match file.read_to_end(&mut bytes) {
+        Ok(_) => Obtained::Bytes(bytes),
+        Err(e) => Obtained::Failed(e),
+    }
+}
+
 /// The one place bytes obtained from a plist become a verdict, so `list` and
 /// [`read_artifact`] cannot classify the same file differently.
 fn classify(bytes: Vec<u8>) -> Classified {
@@ -256,24 +337,27 @@ fn classify(bytes: Vec<u8>) -> Classified {
 /// Read the artifact `locate` found for `id`, for the three callers that go
 /// on to look for a marker in it (`discover`, `located_and_ours`, `status`).
 ///
-/// `NotFound` is [`Error::NotInstalled`], not a failure to determine: the
-/// plist was there when `locate` stat'd it and is gone now, which is an
+/// An absent path is [`Error::NotInstalled`], not a failure to determine:
+/// the plist was there when `locate` stat'd it and is gone now, which is an
 /// uninstall that completed between the two syscalls, and absence is the
-/// truth about the id. Every other read failure is [`undetermined`].
+/// truth about the id. Every read that did not complete is [`undetermined`].
 ///
-/// A binary plist reads as the empty string. That is a statement, not a
-/// fallback: the marker lives in an XML comment, a binary plist has no
-/// comments, and goetia emits only XML — so text carrying no marker is
-/// precisely what has been established, and every caller's `extract` turns
-/// it into the `Foreign` refusal that is the right answer for all three.
+/// A binary plist, and anything that is not a regular file at all, read as
+/// the empty string. That is a statement, not a fallback: the marker lives
+/// in an XML comment, a binary plist has no comments, a FIFO is not a plist
+/// in the first place, and goetia emits only regular XML files — so "text
+/// carrying no marker" is precisely what has been established in each case,
+/// and every caller's `extract` turns it into the `Foreign` refusal that is
+/// the right answer for all three. It is also what keeps `install` over one
+/// of these from erroring: `decide` reaches `Outcome::RefuseForeign`, which
+/// names the remedy, instead of a bare `Err`.
 fn read_artifact(path: &Path, id: &str) -> Result<String> {
-    let bytes = fs::read(path).map_err(|e| {
-        if e.kind() == io::ErrorKind::NotFound {
-            Error::NotInstalled { id: id.to_string() }
-        } else {
-            undetermined(id, "read", path, &e)
-        }
-    })?;
+    let bytes = match obtain(path) {
+        Obtained::Bytes(bytes) => bytes,
+        Obtained::Absent => return Err(Error::NotInstalled { id: id.to_string() }),
+        Obtained::NonRegular => return Ok(String::new()),
+        Obtained::Failed(e) => return Err(undetermined(id, "read", path, &e)),
+    };
     match classify(bytes) {
         Classified::Text(text) => Ok(text),
         Classified::BinaryPlist => Ok(String::new()),
@@ -1014,15 +1098,19 @@ impl ServiceManager for LaunchdManager {
             // which is exactly what was established. Omitting the id instead
             // claims the other thing goetia does not know — that nothing is
             // there.
-            let classified = match fs::read(path) {
-                Ok(bytes) => classify(bytes),
+            let classified = match obtain(path) {
+                Obtained::Bytes(bytes) => classify(bytes),
                 // Gone between the scan above and this read: an uninstall
                 // that completed, observed one syscall later. Absence is
                 // established, so this is a skip rather than a blind spot —
                 // reporting it would let a benign concurrent uninstall raise
                 // `list`'s host-wide exit code.
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => {
+                Obtained::Absent => continue,
+                // A FIFO, a directory, a socket: nothing goetia ever wrote,
+                // and established as such rather than merely unread — so it
+                // is omitted like any other foreign entry, not reported.
+                Obtained::NonRegular => continue,
+                Obtained::Failed(e) => {
                     out.push(Installed::Undetermined {
                         name: Some(id),
                         reason: read_detail("read", path, &e),

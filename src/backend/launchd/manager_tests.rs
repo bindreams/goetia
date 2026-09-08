@@ -240,6 +240,107 @@ fn occupied_reports_absence_and_presence_when_the_stat_completes() {
     assert!(matches!(occupied(&path), Presence::Present));
 }
 
+// obtain ==============================================================================================================
+
+fn mkfifo(path: &Path) {
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("a temp path with no NUL");
+    // SAFETY: `c_path` is a NUL-terminated pointer valid for the call.
+    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+    assert_eq!(rc, 0, "mkfifo {}: {}", path.display(), io::Error::last_os_error());
+}
+
+/// Run `f` on its own thread and report — rather than hang — if it never returns.
+///
+/// The bound is a failure bound on a kernel wait that may genuinely never end: `open(2)` on a FIFO
+/// with `O_RDONLY` blocks until a writer arrives, and these tests never create one. It synchronizes
+/// nothing. A correct classification is one `stat` and a send, so no passing run's outcome depends
+/// on the bound's value — only how long a regression takes to be *reported* instead of wedging the
+/// whole suite, which is what an unguarded call would do.
+fn without_blocking<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || drop(tx.send(f())));
+    rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap_or_else(|_| {
+        panic!("{what} never returned: it opened the FIFO for reading, which blocks until a writer arrives")
+    })
+}
+
+/// The case that makes classifying before opening mandatory rather than tidy. `list` reads every
+/// `*.plist` name in `/Library/LaunchDaemons`, so one `mkfifo` there would otherwise wedge the
+/// listing for the whole host — and `install`/`status` for that id forever.
+#[skuld::test]
+fn a_fifo_is_non_regular_without_blocking() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fifo = tmp.path().join("x.plist");
+    mkfifo(&fifo);
+
+    let obtained = without_blocking("obtain", move || obtain(&fifo));
+
+    assert!(
+        matches!(obtained, Obtained::NonRegular),
+        "a FIFO is classified, never opened for reading"
+    );
+}
+
+/// The same path through the reader every verb but `list` goes down. A FIFO is not a plist goetia
+/// failed to read — it is positively not a plist — so the answer is foreign, which is what empty
+/// text means here, and never [`Error::Undetermined`].
+#[skuld::test]
+fn read_artifact_treats_a_fifo_as_foreign_without_blocking() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fifo = tmp.path().join("x.plist");
+    mkfifo(&fifo);
+
+    let text = without_blocking("read_artifact", move || {
+        read_artifact(&fifo, "x").map_err(|e| e.to_string())
+    })
+    .expect("a FIFO is identified, not a read that did not complete");
+
+    assert!(
+        generate::extract(&text).expect("empty text decodes cleanly").is_none(),
+        "nothing goetia wrote is at this path, so every caller must refuse it as foreign"
+    );
+}
+
+#[skuld::test]
+fn a_directory_where_a_plist_should_be_is_non_regular() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().join("x.plist");
+    fs::create_dir(&dir).expect("seed a directory where a plist should be");
+
+    assert!(matches!(obtain(&dir), Obtained::NonRegular));
+}
+
+#[skuld::test]
+fn obtain_reads_a_regular_file_and_reports_a_missing_one_absent() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("x.plist");
+
+    assert!(matches!(obtain(&path), Obtained::Absent));
+
+    fs::write(&path, b"<plist/>\n").expect("write the plist");
+    match obtain(&path) {
+        Obtained::Bytes(bytes) => assert_eq!(bytes, b"<plist/>\n".to_vec()),
+        _ => panic!("a regular file is read, not classified away"),
+    }
+}
+
+/// A symlink to a regular plist still resolves and is still read — unchanged from before this
+/// classification step existed, and deliberately unlike the systemd backend, where `systemctl mask`
+/// makes the symlink itself the meaningful artifact. See [`obtain`]'s doc comment.
+#[skuld::test]
+fn a_symlink_to_a_plist_is_still_followed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = tmp.path().join("real.plist");
+    let link = tmp.path().join("x.plist");
+    fs::write(&target, b"<plist/>\n").expect("write the plist");
+    std::os::unix::fs::symlink(&target, &link).expect("plant the symlink");
+
+    match obtain(&link) {
+        Obtained::Bytes(bytes) => assert_eq!(bytes, b"<plist/>\n".to_vec()),
+        _ => panic!("launchd has no masking, so a symlinked plist is just an indirection to a plist"),
+    }
+}
+
 // read_artifact =======================================================================================================
 
 #[skuld::test]
