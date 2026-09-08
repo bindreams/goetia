@@ -23,6 +23,21 @@ use goetia::spec::{DaemonSpec, Id, Kind, Restart, User};
 
 use crate::support::{self, ConnectBack, ELEVATED, cmd};
 
+/// Held by every test whose assertion is about `list`'s answer for the
+/// *whole host* — its exit code, or the absence of any `undetermined` entry
+/// — and by every test that seeds something unreadable into the shared
+/// [`ENABLED_DIR`]/[`STAGING_DIR`], which changes that answer. The two
+/// groups are the same group precisely because either invalidates the other,
+/// so they take turns rather than race.
+///
+/// Named for systemd's unit directory rather than for launchd's plist ones
+/// deliberately: skuld coordinates serialization across processes by label
+/// *name*, and `tests/cli_binary.rs::native_backend_answers_list_unelevated`
+/// runs a real `daemon list` — on macOS, through this backend — holding that
+/// same name.
+#[skuld::label]
+const UNIT_DIR_EXCLUSIVE: skuld::Label;
+
 // Fixtures ============================================================================================================
 
 fn base_spec(id: &str, command: Vec<String>) -> DaemonSpec {
@@ -81,10 +96,63 @@ fn foreign_plist(label: &str) -> String {
     )
 }
 
+/// A real binary plist, produced the way a macOS host produces them rather
+/// than hand-assembled: `plutil -convert binary1` is what `defaults write`
+/// and countless vendor build scripts leave behind in `/Library/
+/// LaunchDaemons`, and goetia must read that directory without tripping
+/// over them.
+fn binary_plist(label: &str) -> Vec<u8> {
+    let source = std::env::temp_dir().join(format!("{label}-binary.plist"));
+    write_bytes(&source, foreign_plist(label).as_bytes());
+    cmd::run(
+        "plutil",
+        &["-convert", "binary1", source.to_str().expect("a UTF-8 temp path")],
+    )
+    .expect_ok();
+    let bytes = std::fs::read(&source).unwrap_or_else(|e| panic!("read {}: {e}", source.display()));
+    let _ = std::fs::remove_file(&source);
+    assert!(
+        bytes.starts_with(b"bplist00"),
+        "`plutil -convert binary1` must produce a binary plist, got {:?}",
+        &bytes[..bytes.len().min(16)]
+    );
+    bytes
+}
+
+/// Bytes that are neither UTF-8 nor a binary plist: nothing about them is
+/// identified, and — unlike a permission denial — root meets exactly the
+/// same wall an unprivileged caller does, which is what lets a test seed
+/// this and read it back in one elevated process.
+const UNDECODABLE_PLIST: [u8; 4] = [b'<', 0xff, 0xfe, b'>'];
+
 fn write_plist(path: &Path, content: &str) {
+    write_bytes(path, content.as_bytes());
+}
+
+fn write_bytes(path: &Path, bytes: &[u8]) {
     std::fs::create_dir_all(path.parent().unwrap()).expect("create parent dir");
-    std::fs::write(path, content).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    std::fs::write(path, bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).expect("chmod plist");
+}
+
+/// Whether `listed` leaves `id` possible — the basis for every negative
+/// assertion below. An aggregate `Undetermined` entry counts even though it
+/// names nothing: it may stand for `id` itself, so an assertion that treated
+/// it as silence would certify what the listing cannot establish (see
+/// [`Installed::Undetermined`]'s null-name rule).
+fn may_account_for(listed: &[Installed], id: &str) -> bool {
+    listed.iter().any(|entry| match entry {
+        Installed::Ours { spec, .. } => spec.id.as_str() == id,
+        Installed::OursUnreadable { name, .. } => name == id,
+        Installed::Undetermined { name, .. } => name.is_none() || name.as_deref() == Some(id),
+    })
+}
+
+fn undetermined_named(listed: &[Installed], id: &str) -> Option<String> {
+    listed.iter().find_map(|entry| match entry {
+        Installed::Undetermined { name, reason } if name.as_deref() == Some(id) => Some(reason.clone()),
+        _ => None,
+    })
 }
 
 // Guards ==============================================================================================================
@@ -400,17 +468,182 @@ fn list_ignores_foreign_plists() {
 /// completely unprivileged process must be able to run `goetia daemon
 /// list` — spawned here as the `nobody` account, exactly the account an
 /// everyday non-root invocation would run under. Installs a real daemon
-/// first and asserts it actually appears in the unelevated output: exit
-/// code `0` alone proves nothing — `list()` treats a missing/empty
-/// `STAGING_DIR` and a per-entry read failure identically (silently
-/// omitted), so a command that ran against nothing would "succeed" even if
-/// every installed plist were `0600 root:wheel`.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+/// first and asserts it actually appears in the unelevated output: an exit
+/// code alone proves nothing, since a command that ran against nothing
+/// produces the same one.
+///
+/// The exit code is a claim about the *whole host*: `/Library/LaunchDaemons`
+/// holds every vendor's daemons, and any one of them `nobody` cannot open is
+/// now an `undetermined` entry and a `4`. So this asserts the invariant that
+/// is actually this test's — our daemon is listed, and is not what the
+/// caller failed to determine — plus the tie between the third key and the
+/// code, and leaves an unrelated vendor plist free to move that code without
+/// failing a test that is not about it.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn unelevated_list_works() {
     let mgr = LaunchdManager::new();
     let spec = sleepy(&support::random_test_id());
     let _guard = Guard::install(&mgr, &spec);
 
+    let listed = unelevated_list_json();
+
+    let id = Some(spec.id.as_str().to_string());
+    assert!(
+        listed.ids("daemons").contains(&id),
+        "the installed daemon must actually appear in the unelevated `list` output: {}",
+        listed.context
+    );
+    assert!(
+        !listed.ids("undetermined").contains(&id),
+        "`install` writes an 0644 plist under world-searchable directories, so an unprivileged \
+         caller reads it: {}",
+        listed.context
+    );
+    assert!(
+        matches!(listed.code, Some(0 | 4)),
+        "an unelevated `list` must not fail: {}",
+        listed.context
+    );
+    if !listed.ids("undetermined").is_empty() {
+        assert_eq!(
+            listed.code,
+            Some(4),
+            "an entry goetia could not determine is exactly what exit `4` reports: {}",
+            listed.context
+        );
+    }
+}
+
+/// The motivating defect, end to end and at the privilege boundary that
+/// produces it: an unelevated `daemon list` on a populated host used to exit
+/// `0` with the daemon simply missing from its document. A plist the caller
+/// cannot open must be named as `undetermined` instead — and must *not* be
+/// listed as one of goetia's own, since the marker that would have said so
+/// is precisely what went unread.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn unelevated_list_reports_a_root_only_plist_as_undetermined() {
+    let mgr = LaunchdManager::new();
+    let spec = sleepy(&support::random_test_id());
+    let _guard = Guard::install(&mgr, &spec);
+    std::fs::set_permissions(staging_path(spec.id.as_str()), std::fs::Permissions::from_mode(0o600))
+        .expect("chmod 0600");
+
+    let listed = unelevated_list_json();
+
+    // Root opens this plist, decodes its marker and lists it under `daemons` at exit `0`, so a run
+    // whose reader was not in fact unprivileged fails here instead of passing vacuously.
+    let id = Some(spec.id.as_str().to_string());
+    assert_eq!(listed.code, Some(4), "{}", listed.context);
+    assert!(listed.ids("undetermined").contains(&id), "{}", listed.context);
+    assert!(
+        !listed.ids("daemons").contains(&id),
+        "a plist goetia could not open is not a daemon it can report the state of: {}",
+        listed.context
+    );
+}
+
+/// Bytes that are neither UTF-8 nor a binary plist settle nothing about the
+/// id, so it is reported rather than dropped — and one such plist must not
+/// take down the listing of every other daemon on the host.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn list_reports_an_unreadable_plist_as_undetermined() {
+    let mgr = LaunchdManager::new();
+    let readable = sleepy(&support::random_test_id());
+    let _guard = Guard::install(&mgr, &readable);
+
+    let id = support::random_test_id();
+    let path = enabled_path(&id);
+    write_bytes(&path, &UNDECODABLE_PLIST);
+    let _cleanup = FileGuard(path.clone());
+
+    let listed = mgr
+        .list()
+        .expect("one undecodable plist must not take down the whole listing");
+
+    let reason = undetermined_named(&listed, &id)
+        .unwrap_or_else(|| panic!("bytes goetia could not decode settle nothing about the id: {listed:?}"));
+    assert!(
+        reason.contains(&path.display().to_string()),
+        "the reason must name the path that could not be read: {reason}"
+    );
+    assert!(
+        listed
+            .iter()
+            .any(|e| matches!(e, Installed::Ours { spec, .. } if spec.id == readable.id)),
+        "every other daemon is still listed: {listed:?}"
+    );
+}
+
+/// The macOS-wide regression the binary-plist rule prevents. `/Library/
+/// LaunchDaemons` is every vendor's directory, and a `bplist00` plist is a
+/// fully valid launchd artifact that `plutil`/`defaults` produce by default
+/// — so treating "not UTF-8" as undetermined would hand a normal macOS host
+/// a standing, unclearable `undetermined` entry and a permanent exit `4` for
+/// a service that is in no way goetia's business.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn list_stays_clean_on_a_host_carrying_binary_plists() {
+    let mgr = LaunchdManager::new();
+    let id = support::random_test_id();
+    let path = enabled_path(&id);
+    write_bytes(&path, &binary_plist(&id));
+    let _cleanup = FileGuard(path);
+
+    let listed = mgr.list().expect("list");
+
+    assert!(
+        !may_account_for(&listed, &id),
+        "a binary plist carries no goetia marker by construction, so it is foreign and omitted \
+         exactly like an unmarked XML one: {listed:?}"
+    );
+    let undetermined: Vec<&Installed> = listed
+        .iter()
+        .filter(|e| matches!(e, Installed::Undetermined { .. }))
+        .collect();
+    assert!(
+        undetermined.is_empty(),
+        "nothing on this host was left undetermined, so `list` must report nothing under that key: \
+         {undetermined:?}"
+    );
+}
+
+/// The `discover` path — the one `install`/`preview_install` reads through,
+/// and therefore what `goetia daemon diff` answers from. Leaving it on a
+/// bare `read_to_string` would have `diff` report `Error::Io` (exit `1`)
+/// while `status` reports `Error::Undetermined` (exit `4`) for the very same
+/// file: two subcommands disagreeing about one machine.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn preview_install_over_an_unreadable_plist_is_undetermined() {
+    let mgr = LaunchdManager::new();
+    let id = support::random_test_id();
+    let path = staging_path(&id);
+    write_bytes(&path, &UNDECODABLE_PLIST);
+    let _cleanup = FileGuard(path);
+
+    let spec = sleepy(&id);
+
+    let preview = mgr
+        .preview_install(&spec)
+        .expect_err("bytes goetia could not decode settle nothing about the id");
+    assert!(matches!(preview, goetia::Error::Undetermined { .. }), "{preview:?}");
+
+    let status = mgr
+        .status(&spec.id)
+        .expect_err("status must reach the same verdict as diff about one file");
+    assert!(matches!(status, goetia::Error::Undetermined { .. }), "{status:?}");
+}
+
+/// Run `goetia <args>` as the `nobody` account and parse `--json`'s
+/// document.
+///
+/// The binary is copied to `/tmp` first, rather than run from
+/// `CARGO_BIN_EXE_goetia` in place: on CI the cargo target directory lives
+/// under the runner's own home directory, which is not guaranteed
+/// traversable by an arbitrary low-privilege account — a failure that would
+/// be about the runner's directory layout, not about goetia's own file
+/// permissions, which are what these tests need to prove. `/tmp` (the
+/// literal path, not `std::env::temp_dir()` — macOS's per-user `$TMPDIR` is
+/// `0700`) is world-traversable.
+fn unelevated_list_json() -> ListJson {
     let uid: u32 = cmd::run("id", &["-u", "nobody"])
         .stdout
         .trim()
@@ -422,32 +655,49 @@ fn unelevated_list_works() {
         .parse()
         .expect("nobody's gid");
 
-    // Run a copy of the binary from `/tmp`, not `CARGO_BIN_EXE_goetia`
-    // directly: on CI the cargo target directory lives under the runner's
-    // own home directory, which is not guaranteed traversable by an
-    // arbitrary low-privilege account — a failure that would be about the
-    // runner's directory layout, not about Goetia's own file permissions,
-    // which are what this test needs to prove. `/tmp` (the literal path,
-    // not `std::env::temp_dir()` — macOS's per-user `$TMPDIR` is `0700`)
-    // is world-traversable on every supported platform.
     let copy_path = Path::new("/tmp").join(format!("goetia-unelevated-test-{}", support::random_test_id()));
     std::fs::copy(env!("CARGO_BIN_EXE_goetia"), &copy_path).expect("copy goetia binary to /tmp");
     std::fs::set_permissions(&copy_path, std::fs::Permissions::from_mode(0o755)).expect("chmod copy");
     let _cleanup = FileGuard(copy_path.clone());
 
-    let out = Command::new(&copy_path)
-        .args(["daemon", "list"])
+    let output = Command::new(&copy_path)
+        .args(["daemon", "list", "--json"])
         .uid(uid)
         .gid(gid)
         .output()
         .expect("spawn goetia as `nobody`");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(
-        stdout.contains(spec.id.as_str()),
-        "the installed daemon must actually appear in the unelevated `list` output; stdout:\n{stdout}\nstderr:\n{stderr}"
-    );
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let context = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
+    let doc = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {context}"));
+    ListJson {
+        doc,
+        code: output.status.code(),
+        context,
+    }
+}
+
+/// The one document `--json` promises, plus the raw streams for a failure
+/// message.
+struct ListJson {
+    doc: serde_json::Value,
+    code: Option<i32>,
+    context: String,
+}
+
+impl ListJson {
+    fn ids(&self, key: &str) -> Vec<Option<String>> {
+        self.doc[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("`{key}` must always be present, as an array: {}", self.context))
+            .iter()
+            .map(|entry| match &entry[if key == "daemons" { "id" } else { "name" }] {
+                serde_json::Value::Null => None,
+                serde_json::Value::String(name) => Some(name.clone()),
+                other => panic!("a name must be a string or null: {other}"),
+            })
+            .collect()
+    }
 }
 
 /// Verifies that launchd's `UserName` honours the account this backend
@@ -559,7 +809,11 @@ impl Drop for DirGuard {
 /// abort the process. `locate` now uses `symlink_metadata`, so a directory
 /// is "occupied" like anything else, and `discover`'s subsequent read
 /// fails cleanly instead.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+///
+/// Holds `UNIT_DIR_EXCLUSIVE`: a directory where a plist should be reads as
+/// `EISDIR`, which `list` reports as an `Undetermined` entry for the whole
+/// host to see.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn install_over_a_directory_errors_instead_of_recursing() {
     let mgr = LaunchdManager::new();
     let id = support::random_test_id();

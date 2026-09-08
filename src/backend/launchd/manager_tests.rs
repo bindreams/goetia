@@ -194,3 +194,156 @@ fn locate_reports_absent_for_an_unknown_id() {
     let location = locate(&id).expect("locate should not error for an absent id");
     assert!(location.is_none());
 }
+
+// occupied ============================================================================================================
+
+/// A path whose parent component is a regular file: `ENOTDIR`. Not `NotFound`, not
+/// `PermissionDenied`, and — the reason it is the probe used here rather than a mode-`000`
+/// directory — identical for root and everyone else. CI runs every test binary under `sudo`
+/// (`.github/workflows/ci.yaml`), which traverses a mode-`000` directory to a plain `NotFound`, so a
+/// permission fixture in this binary would report absence and fail there for a reason that is about
+/// the runner's uid rather than about the code. The permission shape this whole class exists for
+/// needs a second uid and is exercised end to end by
+/// `tests/launchd_integration/launchd.rs::unelevated_list_reports_a_root_only_plist_as_undetermined`.
+/// `src/backend/systemd/manager/discover_tests.rs` splits its own coverage on the same line.
+fn unreachable_path(tmp: &Path) -> PathBuf {
+    let file = tmp.join("not-a-directory");
+    fs::write(&file, "").expect("write the blocking file");
+    file.join("x.plist")
+}
+
+/// The defect this type exists to remove: `symlink_metadata(path).is_ok()` answered "I could not
+/// look" as "nothing is there", so `locate` returned `Ok(None)` and every verb reported
+/// `NotInstalled` for a daemon that is right there.
+#[skuld::test]
+fn occupied_distinguishes_a_denied_stat_from_absence() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    match occupied(&unreachable_path(tmp.path())) {
+        Presence::Undetermined { source } => assert_ne!(
+            source.kind(),
+            io::ErrorKind::NotFound,
+            "a `NotFound` belongs in `Absent`, not here: {source}"
+        ),
+        other => panic!("a stat that never completed established no absence: {other:?}"),
+    }
+}
+
+#[skuld::test]
+fn occupied_reports_absence_and_presence_when_the_stat_completes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("x.plist");
+
+    assert!(matches!(occupied(&path), Presence::Absent));
+
+    fs::write(&path, "anything at all").expect("write the plist");
+    assert!(matches!(occupied(&path), Presence::Present));
+}
+
+// read_artifact =======================================================================================================
+
+#[skuld::test]
+fn read_artifact_maps_a_vanished_plist_to_not_installed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("gone.plist");
+
+    // `locate` stat'd it and the read no longer finds it: an uninstall that completed between the
+    // two syscalls. Absence is the truth about the id, so this is not a failure to determine.
+    let err = read_artifact(&path, "gone").expect_err("a missing artifact is not readable");
+    assert!(matches!(err, Error::NotInstalled { .. }), "{err}");
+}
+
+#[skuld::test]
+fn read_artifact_maps_an_unreadable_plist_to_undetermined() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = unreachable_path(tmp.path());
+
+    let err = read_artifact(&path, "opaque").expect_err("`ENOTDIR` is not a readable artifact");
+
+    let Error::Undetermined { id, reason, .. } = &err else {
+        panic!("`Error::Io` reaches `status` as `unreadable`, which claims goetia owns the id: {err:?}");
+    };
+    assert_eq!(id, "opaque");
+    assert!(
+        reason.contains(&path.display().to_string()),
+        "the reason must name the path that could not be read: {reason}"
+    );
+}
+
+/// `ENABLED_DIR` is `/Library/LaunchDaemons` — every vendor's daemons, not goetia's — and
+/// `plutil -convert binary1` and `defaults write` produce a binary plist by default. Treating those
+/// bytes as undetermined would give a macOS host a permanent, unclearable `undetermined` entry, and
+/// a permanent exit `4`, for a service goetia has no business reporting on at all.
+///
+/// `list` reaches the same verdict through the same [`classify`], which is what keeps the two from
+/// describing one file differently; its own end is
+/// `tests/launchd_integration/launchd.rs::list_stays_clean_on_a_host_carrying_binary_plists`.
+#[skuld::test]
+fn a_binary_plist_is_treated_as_foreign_not_undetermined() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("vendor.plist");
+    let mut bytes = b"bplist00".to_vec();
+    bytes.extend_from_slice(&[0xd1, 0x01, 0x02, 0x5f, 0x10, 0x00, 0xff]);
+    fs::write(&path, &bytes).expect("write the binary plist");
+
+    assert!(matches!(classify(bytes), Classified::BinaryPlist));
+
+    let text = read_artifact(&path, "vendor").expect("a binary plist is identified, not a read that failed");
+    assert!(
+        generate::extract(&text).expect("empty text decodes cleanly").is_none(),
+        "a format goetia never emits carries no goetia marker, so every caller must refuse it as foreign"
+    );
+}
+
+#[skuld::test]
+fn non_utf8_bytes_that_are_not_a_binary_plist_are_undetermined() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("corrupt.plist");
+    fs::write(&path, [b'<', 0xff, 0xfe, b'>']).expect("write the undecodable plist");
+
+    let err = read_artifact(&path, "corrupt").expect_err("nothing was identified in these bytes");
+
+    let Error::Undetermined { reason, .. } = &err else {
+        panic!("corruption of one of goetia's own cannot be ruled out, so nothing may be claimed: {err:?}");
+    };
+    assert!(
+        reason.contains(&path.display().to_string()),
+        "the reason must name the path: {reason}"
+    );
+}
+
+// undetermined ========================================================================================================
+
+/// The substance `manager::fake`'s own `Error::Undetermined` carries, asserted of this backend's
+/// constructor: the two describe one condition and must agree about it without sharing a function.
+/// Split across the errno rather than crammed into a single sentence — elevation is advice only a
+/// permission boundary earns, and offering it for a failing disk sends the reader somewhere useless
+/// — so "both causes" means the pair covers both, one each. Never `uninstall`, in either: that is
+/// `Outcome::RefuseUnreadable`'s remedy and it certifies the ownership this read never established.
+#[skuld::test]
+fn the_launchd_undetermined_recovery_names_both_causes_and_not_uninstall() {
+    let path = Path::new(ENABLED_DIR).join("x.plist");
+
+    for (source, wants_elevation) in [
+        (io::Error::from(io::ErrorKind::PermissionDenied), true),
+        (io::Error::from(io::ErrorKind::Other), false),
+    ] {
+        let rendered = format!("{source:?}");
+        let Error::Undetermined { id, reason, recovery } = undetermined("x", "read", &path, &source) else {
+            panic!("{rendered}: every non-`NotFound` failure is undetermined, not just a permission denial");
+        };
+
+        assert_eq!(id, "x");
+        assert!(reason.contains(&path.display().to_string()), "{rendered}: {reason}");
+        assert!(recovery.contains("re-run"), "{rendered}: {recovery}");
+        assert_eq!(
+            recovery.contains("re-run as root"),
+            wants_elevation,
+            "{rendered}: {recovery}"
+        );
+        assert!(
+            !recovery.contains("uninstall"),
+            "{rendered}: uninstall certifies ownership this read never established: {recovery}"
+        );
+    }
+}

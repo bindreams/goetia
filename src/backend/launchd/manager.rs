@@ -107,8 +107,27 @@ struct Location {
     enabled: bool,
 }
 
+/// What a stat established about a path — absence, presence, or neither.
+///
+/// The three are separated by what goetia *established*, never by what went
+/// wrong. A `bool` can only say the first two, so it had to answer "I could
+/// not look" as "nothing is there": a search-permission failure on either
+/// directory made [`locate`] return `Ok(None)` and every verb report
+/// [`Error::NotInstalled`] for a daemon that is right there.
+///
+/// [`Presence::Undetermined`] carries the [`io::Error`] itself rather than a
+/// rendered reason, because [`undetermined`]'s `recovery` is keyed on the
+/// errno and a `String` has already thrown that away.
+#[derive(Debug)]
+enum Presence {
+    Absent,
+    Present,
+    Undetermined { source: io::Error },
+}
+
 /// Whether *anything* occupies `path` — any directory entry at all, not
-/// just a regular file. `Path::is_file` is `false` for a directory, a
+/// just a regular file, and not a claim at all when the stat could not be
+/// performed. `Path::is_file` is `false` for a directory, a
 /// symlink, a socket, or any other non-regular entry, which would let
 /// `locate` classify an occupied path as `Absent`; `write_new`'s
 /// underlying `link`(2) refuses to create over *any* of those the same as
@@ -117,35 +136,154 @@ struct Location {
 /// the identical classification, forever. `symlink_metadata` (not
 /// `metadata`, which follows symlinks and would report a *dangling* one
 /// as absent) catches every case uniformly.
-fn occupied(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok()
+fn occupied(path: &Path) -> Presence {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Presence::Present,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Presence::Absent,
+        // `EACCES` on a parent directory, `ENOTDIR` on a parent component,
+        // `EIO`: the stat never completed, so absence is not one of the
+        // things it established.
+        Err(source) => Presence::Undetermined { source },
+    }
 }
 
 fn locate(id: &str) -> Result<Option<Location>> {
     let staging = staging_path(id);
     let enabled = enabled_path(id);
     match (occupied(&staging), occupied(&enabled)) {
-        (false, false) => Ok(None),
-        (true, false) => Ok(Some(Location {
+        // One unresolved probe leaves the *pair* unresolved: the id's
+        // location is a fact about both directories at once, and the
+        // remaining three answers — absent, staged, enabled — each claim
+        // something about the directory that was never read.
+        (Presence::Undetermined { source }, _) => Err(undetermined(id, "stat", &staging, &source)),
+        (_, Presence::Undetermined { source }) => Err(undetermined(id, "stat", &enabled, &source)),
+        (Presence::Absent, Presence::Absent) => Ok(None),
+        (Presence::Present, Presence::Absent) => Ok(Some(Location {
             path: staging,
             enabled: false,
         })),
-        (false, true) => Ok(Some(Location {
+        (Presence::Absent, Presence::Present) => Ok(Some(Location {
             path: enabled,
             enabled: true,
         })),
-        (true, true) => Err(Error::Other(format!(
+        (Presence::Present, Presence::Present) => Err(Error::Other(format!(
             "daemon `{id}` has a plist in both {STAGING_DIR} and {ENABLED_DIR}; remove one by hand \
              (they should never both exist) before retrying"
         ))),
     }
 }
 
-fn read_to_string(path: &Path) -> Result<String> {
-    fs::read_to_string(path).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+// Reading a plist =====================================================================================================
+
+/// This backend's single [`Error::Undetermined`] constructor — the launchd
+/// twin of `backend::systemd::manager::discover::undetermined`, and worded
+/// identically, since the two describe one condition on two platforms.
+///
+/// [`Error::Undetermined`], never [`Error::Io`]: `Io` reaches
+/// `cli::report::status_error`'s catch-all as `Kind::Unreadable`, which
+/// *asserts* that goetia owns the id — the one thing a read that never
+/// completed cannot establish. `/Library/LaunchDaemons` holds every vendor's
+/// daemons, so that claim is routinely about a stranger's service.
+///
+/// Every failure but `NotFound` lands here, not `PermissionDenied` alone: an
+/// `EIO` leaves goetia exactly as ignorant of the id as an `EACCES` does.
+/// What the errno does choose is `recovery` — re-running elevated is advice
+/// only a permission boundary earns, and offering it for a failing disk
+/// sends the user somewhere useless.
+fn undetermined(id: &str, op: &str, path: &Path, source: &io::Error) -> Error {
+    let recovery = if source.kind() == io::ErrorKind::PermissionDenied {
+        "re-run as root (or under sudo): that read is what tells goetia whether anything is \
+         installed at this id"
+    } else {
+        "resolve that failure and re-run: that read is what tells goetia whether anything is \
+         installed at this id"
+    };
+    Error::Undetermined {
+        id: id.to_string(),
+        reason: read_detail(op, path, source),
+        recovery: recovery.to_string(),
+    }
+}
+
+/// What did not complete, as facts — which operation, which path, which
+/// failure — with no claim about the id attached. Shared by [`undetermined`]
+/// and by `list`'s [`Installed::Undetermined`] entry, so the error and the
+/// entry cannot describe one failure differently.
+fn read_detail(op: &str, path: &Path, source: &dyn std::fmt::Display) -> String {
+    format!("failed to {op} {path}: {source}", path = path.display())
+}
+
+/// The magic every binary property list begins with. `plutil -convert
+/// binary1` and `defaults write` emit that format by default, so a
+/// `/Library/LaunchDaemons` full of them is the normal state of a macOS
+/// host, not a defect.
+const BINARY_PLIST_MAGIC: &[u8] = b"bplist00";
+
+/// What a plist's bytes turned out to be, once they were obtained.
+///
+/// Obtaining bytes and understanding them are different questions, and only
+/// the first one being answered is what separates the last variant from the
+/// middle one.
+enum Classified {
+    /// Valid UTF-8 — the only form `generate::plist` ever writes, and the
+    /// only one `generate::extract`'s `goetia:begin` comment can be looked
+    /// for in.
+    Text(String),
+    /// A binary plist: a **positive** identification of a format goetia
+    /// never emits, not an inference from a failure. Treated as foreign,
+    /// exactly like an XML plist carrying no marker. Calling it undetermined
+    /// instead would give a macOS host a permanent, unclearable
+    /// `undetermined` entry — and a permanent exit `4` — for a vendor's
+    /// service that is in no way goetia's business.
+    BinaryPlist,
+    /// Neither UTF-8 nor a binary plist: nothing was identified, and
+    /// corruption of one of goetia's own cannot be ruled out.
+    Undecodable(std::string::FromUtf8Error),
+}
+
+/// The one place bytes obtained from a plist become a verdict, so `list` and
+/// [`read_artifact`] cannot classify the same file differently.
+fn classify(bytes: Vec<u8>) -> Classified {
+    if bytes.starts_with(BINARY_PLIST_MAGIC) {
+        return Classified::BinaryPlist;
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => Classified::Text(text),
+        Err(e) => Classified::Undecodable(e),
+    }
+}
+
+/// Read the artifact `locate` found for `id`, for the three callers that go
+/// on to look for a marker in it (`discover`, `located_and_ours`, `status`).
+///
+/// `NotFound` is [`Error::NotInstalled`], not a failure to determine: the
+/// plist was there when `locate` stat'd it and is gone now, which is an
+/// uninstall that completed between the two syscalls, and absence is the
+/// truth about the id. Every other read failure is [`undetermined`].
+///
+/// A binary plist reads as the empty string. That is a statement, not a
+/// fallback: the marker lives in an XML comment, a binary plist has no
+/// comments, and goetia emits only XML — so text carrying no marker is
+/// precisely what has been established, and every caller's `extract` turns
+/// it into the `Foreign` refusal that is the right answer for all three.
+fn read_artifact(path: &Path, id: &str) -> Result<String> {
+    let bytes = fs::read(path).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            Error::NotInstalled { id: id.to_string() }
+        } else {
+            undetermined(id, "read", path, &e)
+        }
+    })?;
+    match classify(bytes) {
+        Classified::Text(text) => Ok(text),
+        Classified::BinaryPlist => Ok(String::new()),
+        Classified::Undecodable(e) => Err(undetermined(
+            id,
+            "read",
+            path,
+            &io::Error::new(io::ErrorKind::InvalidData, e),
+        )),
+    }
 }
 
 /// What [`install`](ServiceManager::install) needs to decide anything:
@@ -179,7 +317,7 @@ fn discover(id: &str) -> Result<Discovery> {
             location: None,
         });
     };
-    let text = read_to_string(&location.path)?;
+    let text = read_artifact(&location.path, id)?;
     let found = match generate::extract(&text) {
         Ok(None) => Ownership::Foreign,
         Ok(Some(blob)) => match resolve_account(&blob.spec.user) {
@@ -229,7 +367,7 @@ fn not_installed(id: &Id) -> Error {
 /// drift on what "found and ours" means.
 fn located_and_ours(id: &Id) -> Result<(Location, String)> {
     let location = locate(id.as_str())?.ok_or_else(|| not_installed(id))?;
-    let text = read_to_string(&location.path)?;
+    let text = read_artifact(&location.path, id.as_str())?;
     require_ours(&text, id)?;
     Ok((location, text))
 }
@@ -651,8 +789,16 @@ impl ServiceManager for LaunchdManager {
                 // outcome against whatever is actually there now (the same
                 // reclassify-via-recursion the `Create`/`Raced` case above
                 // uses).
-                if !occupied(&target) {
-                    return self.install(spec, force);
+                match occupied(&target) {
+                    Presence::Present => {}
+                    Presence::Absent => return self.install(spec, force),
+                    // The re-check established neither the vanish that would
+                    // license re-deriving nor the presence that would
+                    // license the write. [`Error::Io`], not [`undetermined`]:
+                    // `discover` has already opened, read and decoded this
+                    // artifact, so "is anything installed at this id" is not
+                    // the question this stat left open.
+                    Presence::Undetermined { source } => return Err(Error::Io { path: target, source }),
                 }
                 write_existing(&target, &desired)?;
                 if matches!(outcome, Outcome::Update { .. }) && is_loaded(spec.id.as_str())? {
@@ -804,7 +950,7 @@ impl ServiceManager for LaunchdManager {
 
     fn status(&self, id: &Id) -> Result<Status> {
         let location = locate(id.as_str())?.ok_or_else(|| not_installed(id))?;
-        let text = read_to_string(&location.path)?;
+        let text = read_artifact(&location.path, id.as_str())?;
         match generate::extract(&text) {
             Ok(None) => Err(foreign(id)),
             Err(e) => Err(e),
@@ -857,20 +1003,45 @@ impl ServiceManager for LaunchdManager {
                 continue;
             }
             let (path, enabled) = &locations[0];
-            // A read failure (permission denied, the entry vanishing
-            // between the scan above and here, ...) leaves zero evidence
-            // of whether this plist ever carried a Goetia marker at all —
-            // unlike a decode failure below, which only happens *after*
-            // confirming the marker is present. Claiming `OursUnreadable`
-            // without that evidence would misreport an unreadable
-            // *foreign* plist (routine on `/Library/LaunchDaemons`, which
-            // holds every vendor's daemons, not just Goetia's) as one of
-            // ours. Skipping it is a known gap rather than the contract —
-            // `ServiceManager::list` requires an unread id to appear as
-            // `Installed::Undetermined`, which the systemd backend does and
-            // this one does not yet.
-            let Ok(text) = fs::read_to_string(path) else {
-                continue;
+            // A failed read leaves zero evidence of whether this plist ever
+            // carried a Goetia marker at all — unlike a decode failure
+            // below, which only happens *after* confirming the marker is
+            // present. Claiming `OursUnreadable` without that evidence would
+            // misreport an unreadable *foreign* plist (routine on
+            // `/Library/LaunchDaemons`, which holds every vendor's daemons,
+            // not just Goetia's) as one of ours. `Installed::Undetermined`
+            // is the state that reasoning was missing: it claims neither,
+            // which is exactly what was established. Omitting the id instead
+            // claims the other thing goetia does not know — that nothing is
+            // there.
+            let classified = match fs::read(path) {
+                Ok(bytes) => classify(bytes),
+                // Gone between the scan above and this read: an uninstall
+                // that completed, observed one syscall later. Absence is
+                // established, so this is a skip rather than a blind spot —
+                // reporting it would let a benign concurrent uninstall raise
+                // `list`'s host-wide exit code.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    out.push(Installed::Undetermined {
+                        name: Some(id),
+                        reason: read_detail("read", path, &e),
+                    });
+                    continue;
+                }
+            };
+            let text = match classified {
+                Classified::Text(text) => text,
+                // Foreign by positive identification, so omitted exactly as
+                // an unmarked XML plist is — see `Classified::BinaryPlist`.
+                Classified::BinaryPlist => continue,
+                Classified::Undecodable(e) => {
+                    out.push(Installed::Undetermined {
+                        name: Some(id),
+                        reason: read_detail("read", path, &e),
+                    });
+                    continue;
+                }
             };
             match generate::extract(&text) {
                 Ok(None) => {} // foreign: not Goetia-managed, omitted per the trait doc comment
