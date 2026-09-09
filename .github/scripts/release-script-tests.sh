@@ -235,6 +235,22 @@ with zipfile.ZipFile(out, "w") as archive:
 PY
 }
 
+# make_zip_dir_only <output> <dirname>
+# Writes a zip whose only entry is the directory `<dirname>/` — a readable,
+# well-formed archive with zero file members, which is what a staging step
+# that created the target directory and then copied nothing into it
+# produces.
+make_zip_dir_only() {
+    python3 - "$1" "$2" <<'PY'
+import sys
+import zipfile
+
+out, dirname = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(out, "w") as archive:
+    archive.writestr(zipfile.ZipInfo(dirname + "/"), b"")
+PY
+}
+
 # make_zip_archive <output> <target> <goetia-content> <shim-content> [omit...]
 # A well-formed Windows archive: forward-slash separators, `.exe` on both
 # binaries.
@@ -371,6 +387,56 @@ write_members "$flat_staged" "goetia bytes" "shim bytes"
 archive="${root}/goetia-x86_64-unknown-linux-musl.tar.xz"
 tar -cJf "$archive" -C "$flat_staged" goetia goetia-shim README.md LICENSE.md
 assert_archives_rejects "rejects a flat archive with no goetia-<target>/ prefix" 1 "$archive"
+
+# The same five member-set rejections against the `.zip` branch. It runs
+# different listing and extraction commands (`unzip -Z1`/`unzip -p`) and
+# interpolates `.exe` into the expected set, so nothing above covers it —
+# and Windows is the row most likely to diverge.
+for omitted in goetia-shim goetia README.md LICENSE.md; do
+    root="$(mktemp -d -p "$archive_root")"
+    archive="${root}/goetia-${windows_target}.zip"
+    make_zip_archive "$archive" "$windows_target" "goetia bytes" "shim bytes" "$omitted"
+    assert_archives_rejects_matching "rejects a zip missing ${omitted}" 1 "member set mismatch" "$archive"
+done
+
+root="$(mktemp -d -p "$archive_root")"
+staged="${root}/flat"
+write_members "$staged" "goetia bytes" "shim bytes"
+archive="${root}/goetia-${windows_target}.zip"
+make_zip_entries "$archive" \
+    "goetia.exe=${staged}/goetia" \
+    "goetia-shim.exe=${staged}/goetia-shim" \
+    "README.md=${staged}/README.md" \
+    "LICENSE.md=${staged}/LICENSE.md"
+assert_archives_rejects_matching "rejects a flat zip with no goetia-<target>/ prefix" 1 \
+    "member set mismatch" "$archive"
+
+# An archive holding nothing but its own `goetia-<target>/` directory entry
+# is valid and readable — it is what a staging step that created the
+# directory and copied nothing into it produces. That must be reported as
+# the member-set mismatch it is, naming what is missing, not as a corrupt
+# or unreadable archive, which would send an operator hunting for the wrong
+# bug.
+root="$(mktemp -d -p "$archive_root")"
+mkdir -p "${root}/stage/goetia-x86_64-unknown-linux-musl"
+archive="${root}/goetia-x86_64-unknown-linux-musl.tar.xz"
+tar -cJf "$archive" -C "${root}/stage" goetia-x86_64-unknown-linux-musl
+assert_archives_rejects_matching "diagnoses a directory-only tar as a member set mismatch" 1 \
+    "member set mismatch" "$archive"
+
+root="$(mktemp -d -p "$archive_root")"
+archive="${root}/goetia-${windows_target}.zip"
+make_zip_dir_only "$archive" "goetia-${windows_target}"
+assert_archives_rejects_matching "diagnoses a directory-only zip as a member set mismatch" 1 \
+    "member set mismatch" "$archive"
+
+# A tar with no entries at all: same requirement, and the path where the
+# member listing is empty rather than filtered down to empty.
+root="$(mktemp -d -p "$archive_root")"
+archive="${root}/goetia-x86_64-unknown-linux-musl.tar.xz"
+tar -cJf "$archive" --files-from /dev/null
+assert_archives_rejects_matching "diagnoses an entirely empty tar as a member set mismatch" 1 \
+    "member set mismatch" "$archive"
 
 assert_archives_rejects "rejects a named archive that does not exist" 1 \
     "${archive_root}/goetia-x86_64-unknown-linux-musl.tar.xz"

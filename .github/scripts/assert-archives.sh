@@ -38,13 +38,32 @@ fi
 # entries are excluded: both `tar` and a directory-based `zip` emit a
 # `goetia-<target>/` entry alongside the four files, and it is not part of
 # the member set this script checks.
+#
+# Listing and filtering are separate steps, and only the listing decides
+# failure. Piping `tar`/`unzip` straight into `grep -v` would make an
+# archive whose entries are ALL directories (a staging step that created
+# `goetia-<target>/` and copied nothing into it) exit 1 from `grep`'s
+# no-matches, which under `pipefail` reads as an unreadable archive. That
+# archive is perfectly readable and has zero members, which the caller's
+# member-set comparison reports far more usefully.
 list_members() {
-    local kind="$1" archive="$2"
+    local kind="$1" archive="$2" listing filtered grep_status=0
     if [[ "$kind" == tar ]]; then
-        tar -tf "$archive"
+        listing="$(tar -tf "$archive")" || return $?
     else
-        unzip -Z1 "$archive"
-    fi | grep -v '/$'
+        listing="$(unzip -Z1 "$archive")" || return $?
+    fi
+
+    [[ -n "$listing" ]] || return 0
+
+    filtered="$(grep -v '/$' <<<"$listing")" || grep_status=$?
+    # 1 is "no lines left"; anything above it is grep itself failing.
+    if [[ "$grep_status" -gt 1 ]]; then
+        return "$grep_status"
+    fi
+
+    [[ -n "$filtered" ]] || return 0
+    printf '%s\n' "$filtered"
 }
 
 # extract_member <kind> <archive> <member> — streams the member's bytes to stdout.
