@@ -1459,20 +1459,20 @@ fn a_numeric_uid_under_scm_is_rejected_on_every_host() {
 
 #[skuld::test]
 fn a_windows_builtin_account_under_a_posix_backend_is_rejected_on_every_host() {
-    assert!(
-        resolve_yaml(
-            "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      systemd:\n        \
-             user: LocalService\n"
-        )
-        .is_err()
-    );
-    assert!(
-        resolve_yaml(
-            "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      launchd:\n        \
-             user: LocalService\n"
-        )
-        .is_err()
-    );
+    // `NT AUTHORITY\LocalSystem` alongside the bare name: it is the row
+    // `windows_builtin` was missing, and the one that made a backend accept
+    // an account under `systemd` while rejecting its own sibling
+    // `NT AUTHORITY\SYSTEM`.
+    for user in ["LocalService", r"NT AUTHORITY\LocalSystem", r"NT AUTHORITY\SYSTEM"] {
+        for backend in ["systemd", "launchd"] {
+            let yaml = format!(
+                "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      {backend}:\n        \
+                 user: \"{}\"\n",
+                user.replace('\\', "\\\\")
+            );
+            assert!(resolve_yaml(&yaml).is_err(), "`{user}` under `{backend}`");
+        }
+    }
 }
 
 #[skuld::test]

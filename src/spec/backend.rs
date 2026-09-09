@@ -343,22 +343,25 @@ impl Builtin {
 }
 
 /// Recognise a Windows built-in account by every spelling Windows accepts:
-/// bare (`LocalSystem`, `LocalService`, `NetworkService`, `SYSTEM`), or
-/// `NT AUTHORITY\`-qualified, case-insensitively. Matches
-/// `identity::account_needs_password`'s table exactly, plus the empty
-/// string — see the note below.
+/// bare (`LocalSystem`, `LocalService`, `NetworkService`, `SYSTEM`) or
+/// `NT AUTHORITY\`-qualified, case-insensitively. Covers every row
+/// `identity::account_needs_password` had before this table replaced it —
+/// which strips the prefix and so accepts all four names qualified,
+/// `NT AUTHORITY\LocalSystem` included — plus the two spaced spellings
+/// `LookupAccountSidW` returns for the well-known SIDs
+/// (`NT AUTHORITY\LOCAL SERVICE`, `NT AUTHORITY\NETWORK SERVICE`), plus the
+/// empty string, see the note below.
 ///
-/// The fold: lowercase the whole string, then strip a leading
-/// `nt authority\` if present, and — **only if that prefix was present** —
-/// remove ASCII spaces from what remains. Space-folding is scoped to the
-/// prefixed form because `LookupAccountSidW` resolves the well-known SIDs
-/// to spaced names (`NT AUTHORITY\LOCAL SERVICE`,
-/// `NT AUTHORITY\NETWORK SERVICE`) while an unprefixed name never arrives
-/// that way — `identity::resolve` passes `User::Name` through without a
-/// lookup — so folding spaces there too would wrongly swallow a genuine
-/// local account named `Local Service`. See
-/// `windows_builtin_folds_spaces_only_under_the_nt_authority_prefix` and
-/// `an_unprefixed_spaced_name_is_not_folded`.
+/// Enumerated rather than folded. A fold that stripped spaces after the
+/// prefix would also accept `NT AUTHORITY\S Y S T E M` and
+/// `NT AUTHORITY\LO CAL SERVICE`, silently promoting a typo to a privileged
+/// account instead of failing as the nonexistent account it names. The two
+/// spaced rows are the only spellings the fold existed for, and they are
+/// qualified: an unprefixed `Local Service` never arrives from a SID lookup
+/// — `identity::resolve` passes `User::Name` through without one — and is a
+/// legal name for a genuine local account, so it stays an ordinary one. See
+/// `every_nt_authority_spelling_is_recognised` and
+/// `a_spelling_that_is_not_in_the_table_is_an_ordinary_account`.
 ///
 /// `windows_builtin("")` is `Some(Builtin::LocalSystem)`: Task 7's
 /// `canonical_account` maps an empty authored account to `LocalSystem`, and
@@ -367,15 +370,14 @@ impl Builtin {
 /// unreachable from that direction; do not "simplify" it away, or
 /// `User::Root`'s behaviour on Windows changes.
 pub(crate) fn windows_builtin(name: &str) -> Option<Builtin> {
-    let lower = name.to_ascii_lowercase();
-    let folded = match lower.strip_prefix(r"nt authority\") {
-        Some(rest) => format!(r"nt authority\{}", rest.replace(' ', "")),
-        None => lower,
-    };
-    match folded.as_str() {
-        "" | "system" | "localsystem" | r"nt authority\system" => Some(Builtin::LocalSystem),
-        "localservice" | r"nt authority\localservice" => Some(Builtin::LocalService),
-        "networkservice" | r"nt authority\networkservice" => Some(Builtin::NetworkService),
+    match name.to_ascii_lowercase().as_str() {
+        "" | "system" | "localsystem" | r"nt authority\system" | r"nt authority\localsystem" => {
+            Some(Builtin::LocalSystem)
+        }
+        "localservice" | r"nt authority\localservice" | r"nt authority\local service" => Some(Builtin::LocalService),
+        "networkservice" | r"nt authority\networkservice" | r"nt authority\network service" => {
+            Some(Builtin::NetworkService)
+        }
         _ => None,
     }
 }

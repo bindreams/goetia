@@ -197,30 +197,49 @@ fn windows_only_account_keys_the_system_carveout_on_the_original_string() {
 
 // `windows_builtin` ===================================================================================================
 
+/// Every qualified spelling, enumerated. The row this test exists for —
+/// `NT AUTHORITY\LocalSystem` — went missing precisely because nothing
+/// enumerated them: `origin/main`'s `identity::account_needs_password`
+/// stripped the prefix before matching, so it had that row, and the table
+/// that replaced it silently did not.
 #[skuld::test]
-fn windows_builtin_folds_spaces_only_under_the_nt_authority_prefix() {
-    assert_eq!(
-        windows_builtin(r"NT AUTHORITY\LOCAL SERVICE"),
-        Some(Builtin::LocalService)
-    );
-    assert_eq!(
-        windows_builtin(r"NT AUTHORITY\NETWORK SERVICE"),
-        Some(Builtin::NetworkService)
-    );
-    // Case-insensitive, same as the rest of the table.
-    assert_eq!(
-        windows_builtin(r"nt authority\local service"),
-        Some(Builtin::LocalService)
-    );
+fn every_nt_authority_spelling_is_recognised() {
+    for (name, builtin) in [
+        (r"NT AUTHORITY\SYSTEM", Builtin::LocalSystem),
+        (r"NT AUTHORITY\LocalSystem", Builtin::LocalSystem),
+        (r"NT AUTHORITY\LocalService", Builtin::LocalService),
+        (r"NT AUTHORITY\NetworkService", Builtin::NetworkService),
+        // The spellings `LookupAccountSidW` returns for the well-known SIDs.
+        (r"NT AUTHORITY\LOCAL SERVICE", Builtin::LocalService),
+        (r"NT AUTHORITY\NETWORK SERVICE", Builtin::NetworkService),
+    ] {
+        assert_eq!(windows_builtin(name), Some(builtin), "`{name}`");
+        // Case-insensitive, and qualified: unlike the bare `system`
+        // carve-out, every one of these can only ever name a Windows
+        // account.
+        assert_eq!(windows_builtin(&name.to_ascii_lowercase()), Some(builtin), "`{name}` lowercased");
+        assert_eq!(windows_only_account(name), Some(builtin), "`{name}` is Windows-only");
+    }
 }
 
 #[skuld::test]
-fn an_unprefixed_spaced_name_is_not_folded() {
-    // No `NT AUTHORITY\` prefix, so no space-fold applies: a real local
-    // account genuinely named `Local Service` must pass through as an
-    // ordinary account name, not be swept up as the built-in.
-    assert_eq!(windows_builtin("Local Service"), None);
-    assert_eq!(windows_builtin("Network Service"), None);
+fn a_spelling_that_is_not_in_the_table_is_an_ordinary_account() {
+    // The table is enumerated, not folded: interior spacing is not a way to
+    // spell a built-in, so a typo fails as a nonexistent account instead of
+    // silently becoming LocalSystem. `Local Service` unqualified is the
+    // case the enumeration exists to protect — a real local account with
+    // that name — and it is why the two spaced rows above are qualified.
+    for name in [
+        r"NT AUTHORITY\S Y S T E M",
+        r"NT AUTHORITY\LO CAL SERVICE",
+        r"NT AUTHORITY\ localservice",
+        "nt authority\\localservice ",
+        r"NT AUTHORITY\LOCAL SYSTEM",
+        "Local Service",
+        "Network Service",
+    ] {
+        assert_eq!(windows_builtin(name), None, "`{name}`");
+    }
 }
 
 // `Backend::error` ====================================================================================================
