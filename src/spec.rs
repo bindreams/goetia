@@ -7,6 +7,7 @@
 //! re-derive them. There is no separate `validate()` function anywhere in
 //! the crate; `resolve` is both parse and validate.
 
+mod backend;
 mod interpolate;
 mod no_null;
 mod raw;
@@ -14,6 +15,7 @@ mod resolve;
 mod user;
 mod vars;
 
+pub use backend::Backend;
 pub use raw::{RawManifest, RawSpec};
 pub use resolve::{load, resolve};
 pub use user::{AccountId, RawUser, User};
