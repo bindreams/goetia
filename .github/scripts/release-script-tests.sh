@@ -5,6 +5,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 normalize="${script_dir}/normalize-version.sh"
 assert_tag="${script_dir}/assert-tag-absent.sh"
 assert_archives="${script_dir}/assert-archives.sh"
+assert_package_list="${script_dir}/assert-package-list.sh"
 failures=0
 
 # Asserts BOTH stdout and exit status. Checking stdout alone would pass a
@@ -63,7 +64,8 @@ assert_rejects "rejects an inner leading zero" "1.02.3"
 
 stub_dir="$(mktemp -d)"
 archive_root="$(mktemp -d)"
-trap 'rm -rf "$stub_dir" "$archive_root"' EXIT
+pkg_list_root="$(mktemp -d)"
+trap 'rm -rf "$stub_dir" "$archive_root" "$pkg_list_root"' EXIT
 
 make_git_stub() {
     local exit_code="$1" expected_ref="$2"
@@ -412,6 +414,140 @@ archive5="${root}/goetia-${windows_target}.zip"
 make_zip_archive "$archive5" "$windows_target" "goetia bytes for e" "shim bytes for e"
 assert_archives_rejects "rejects two archives holding identical binaries" 5 \
     "$archive1" "$archive2" "$archive3" "$archive4" "$archive5"
+
+# assert-package-list.sh -----------------------------------------------------
+#
+# Fixture listings live under $pkg_list_root, cleaned up by the trap above.
+
+# write_package_listing <name> <line>... — writes one `cargo package --list`
+# fixture, one path per line, and prints its path.
+write_package_listing() {
+    local name="$1"
+    shift
+    local file="${pkg_list_root}/${name}"
+    printf '%s\n' "$@" > "$file"
+    printf '%s\n' "$file"
+}
+
+# A well-formed listing: both required-present paths, both [[bin]] sources,
+# a few ordinary source files, and nothing from an excluded prefix.
+complete_listing_lines=(
+    "Cargo.toml"
+    "Cargo.lock"
+    "LICENSE.md"
+    "README.md"
+    "src/lib.rs"
+    "src/main.rs"
+    "src/bin/shim/main.rs"
+    "src/backend/launchd.rs"
+)
+
+assert_package_list_ok() {
+    local description="$1" listing="$2"
+    if bash "$assert_package_list" "$listing" >/dev/null 2>&1; then
+        echo "ok   - ${description}"
+    else
+        echo "FAIL - ${description} (expected success, got failure)"
+        failures=$((failures + 1))
+    fi
+}
+
+# assert_package_list_rejects_matching <description> <listing> <message-substring>
+# Requires both rejection and that stderr names the real reason — a
+# rejection for the wrong reason (e.g. reporting a leaked path when a
+# required path was actually the one missing) still fails the test.
+assert_package_list_rejects_matching() {
+    local description="$1" listing="$2" message="$3"
+    local output
+    if output="$(bash "$assert_package_list" "$listing" 2>&1)"; then
+        echo "FAIL - ${description} (expected rejection, got success)"
+        failures=$((failures + 1))
+    elif [[ "$output" == *"$message"* ]]; then
+        echo "ok   - ${description}"
+    else
+        echo "FAIL - ${description} (expected message containing '${message}', got: ${output})"
+        failures=$((failures + 1))
+    fi
+}
+
+listing="$(write_package_listing complete "${complete_listing_lines[@]}")"
+assert_package_list_ok "accepts a well-formed listing" "$listing"
+
+# Positive control: each required-present path missing must be caught on its
+# own terms, not misreported as a leaked exclusion.
+listing="$(write_package_listing missing-cargo-toml Cargo.lock LICENSE.md README.md src/lib.rs src/main.rs src/bin/shim/main.rs)"
+assert_package_list_rejects_matching "rejects a listing missing Cargo.toml" "$listing" "Cargo.toml"
+
+listing="$(write_package_listing missing-lib-rs Cargo.toml Cargo.lock LICENSE.md README.md src/main.rs src/bin/shim/main.rs)"
+assert_package_list_rejects_matching "rejects a listing missing src/lib.rs" "$listing" "src/lib.rs"
+
+listing="$(write_package_listing missing-main-rs Cargo.toml Cargo.lock LICENSE.md README.md src/lib.rs src/bin/shim/main.rs)"
+assert_package_list_rejects_matching "rejects a listing missing the goetia bin source (src/main.rs)" "$listing" "src/main.rs"
+
+listing="$(write_package_listing missing-shim-main-rs Cargo.toml Cargo.lock LICENSE.md README.md src/lib.rs src/main.rs)"
+assert_package_list_rejects_matching "rejects a listing missing the goetia-shim bin source (src/bin/shim/main.rs)" "$listing" "src/bin/shim/main.rs"
+
+# An empty (or otherwise truncated) listing must be caught by the positive
+# control, never mistaken for "nothing leaked".
+listing="$(write_package_listing empty)"
+assert_package_list_rejects_matching "rejects an empty listing" "$listing" "Cargo.toml"
+
+# Negative check: one leaked path per excluded prefix in goetia's exclude
+# list (Cargo.toml's `exclude`, Task 2 step 3) — directory prefixes and
+# single-file entries alike.
+listing="$(write_package_listing leaks-github "${complete_listing_lines[@]}" .github/workflows/ci.yaml)"
+assert_package_list_rejects_matching "rejects a leaked .github/ path" "$listing" ".github/workflows/ci.yaml"
+
+listing="$(write_package_listing leaks-claude "${complete_listing_lines[@]}" .claude/settings.json)"
+assert_package_list_rejects_matching "rejects a leaked .claude/ path" "$listing" ".claude/settings.json"
+
+listing="$(write_package_listing leaks-scripts "${complete_listing_lines[@]}" scripts/format-section-comments.py)"
+assert_package_list_rejects_matching "rejects a leaked scripts/ path" "$listing" "scripts/format-section-comments.py"
+
+listing="$(write_package_listing leaks-prek-toml "${complete_listing_lines[@]}" prek.toml)"
+assert_package_list_rejects_matching "rejects a leaked prek.toml" "$listing" "prek.toml"
+
+listing="$(write_package_listing leaks-editorconfig "${complete_listing_lines[@]}" .editorconfig)"
+assert_package_list_rejects_matching "rejects a leaked .editorconfig" "$listing" ".editorconfig"
+
+listing="$(write_package_listing leaks-gitattributes "${complete_listing_lines[@]}" .gitattributes)"
+assert_package_list_rejects_matching "rejects a leaked .gitattributes" "$listing" ".gitattributes"
+
+listing="$(write_package_listing leaks-rustfmt-toml "${complete_listing_lines[@]}" .rustfmt.toml)"
+assert_package_list_rejects_matching "rejects a leaked .rustfmt.toml" "$listing" ".rustfmt.toml"
+
+assert_package_list_rejects_matching "rejects a listing file that does not exist" \
+    "${pkg_list_root}/nonexistent" "not found"
+
+if bash "$assert_package_list" >/dev/null 2>&1; then
+    echo "FAIL - rejects being called with no arguments at all (expected rejection, got success)"
+    failures=$((failures + 1))
+else
+    echo "ok   - rejects being called with no arguments at all"
+fi
+
+# grep itself failing (not "found" / "not found", but an actual error) must
+# be distinguished from a clean exclusion result — a stub that answers -E
+# calls with an error and otherwise defers to the real grep exercises that
+# third branch without needing to break grep systemwide.
+real_grep="$(command -v grep)"
+cat > "${stub_dir}/grep" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "-E" ]]; then
+    exit 2
+fi
+exec "${real_grep}" "\$@"
+EOF
+chmod +x "${stub_dir}/grep"
+
+listing="$(write_package_listing grep-error "${complete_listing_lines[@]}")"
+output="$(PATH="${stub_dir}:${PATH}" bash "$assert_package_list" "$listing" 2>&1)" && grep_error_status=0 || grep_error_status=$?
+if [[ "$grep_error_status" -ne 0 && "$output" == *"exclusion unverified"* ]]; then
+    echo "ok   - treats a grep failure as unverified, not clean"
+else
+    echo "FAIL - treats a grep failure as unverified, not clean (status ${grep_error_status}, output: ${output})"
+    failures=$((failures + 1))
+fi
 
 # --------------------------------------------------------------------------
 
