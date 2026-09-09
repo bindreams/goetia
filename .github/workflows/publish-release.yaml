@@ -76,27 +76,7 @@ jobs:
         env:
           TAG: ${{ steps.version.outputs.tag }}
         shell: bash
-        run: |
-          set -euo pipefail
-          if ! release_json="$(gh release view "$TAG" --json isDraft,targetCommitish)"; then
-            echo "::error::gh release view failed for $TAG. Does the draft release exist?"
-            exit 1
-          fi
-
-          is_draft="$(jq -r '.isDraft' <<<"$release_json")"
-          if [ "$is_draft" != "true" ]; then
-            echo "::error::Release $TAG is not a draft (isDraft=$is_draft). This workflow only publishes drafts created by Draft Release."
-            exit 1
-          fi
-
-          # A draft created any other way, or edited by hand, is not the
-          # object this workflow publishes.
-          sha="$(jq -r '.targetCommitish' <<<"$release_json")"
-          if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::Draft $TAG targets '$sha', not a 40-character commit SHA. Recreate it via Draft Release."
-            exit 1
-          fi
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+        run: .github/scripts/resolve-draft-release.sh "$TAG" >> "$GITHUB_OUTPUT"
 
       # actions/checkout deletes a non-empty workspace, so this must run
       # before the asset download below, not after. Checks out the draft's
@@ -277,29 +257,12 @@ jobs:
           set -euo pipefail
           gh release edit "$TAG" --draft=false --latest=true
 
-      # `targetCommitish` is NOT usable here: it is the stored creation
-      # input, which GitHub never recomputes when a draft is published, so
-      # it would just echo back the original commit and this guard would
-      # never fire. Resolve the tag itself instead.
       - name: Read the published tag back
         env:
           TAG: ${{ steps.version.outputs.tag }}
           SHA: ${{ steps.release.outputs.sha }}
         shell: bash
-        run: |
-          set -euo pipefail
-          if ! published="$(gh api "repos/${GH_REPO}/commits/${TAG}" --jq '.sha')"; then
-            echo "::error::Could not resolve tag $TAG after publishing."
-            echo "::error::The crate is on crates.io and the GitHub release is published; both are irreversible."
-            echo "::error::Verify by hand that $TAG points at $SHA. Do NOT delete the release or the tag on the strength of this error alone."
-            exit 1
-          fi
-
-          if [ "$published" != "$SHA" ]; then
-            echo "::error::Release $TAG points at $published, not the published commit $SHA. The release is already published."
-            echo "::error::Fix by hand. Do NOT delete the release or the tag on the strength of this error alone."
-            exit 1
-          fi
+        run: .github/scripts/assert-tag-points-at.sh "$TAG" "$SHA"
 
       # The only automated check of immutability the pipeline can make. The
       # repository SETTING is unreadable here (see the precondition at the

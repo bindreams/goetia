@@ -13,6 +13,8 @@ assert_commit_on_main="${script_dir}/assert-commit-on-main.sh"
 assert_checksums="${script_dir}/assert-checksums.sh"
 check_crates="${script_dir}/check-crates-io-version.sh"
 create_tag="${script_dir}/create-release-tag.sh"
+resolve_draft="${script_dir}/resolve-draft-release.sh"
+assert_tag_points_at="${script_dir}/assert-tag-points-at.sh"
 failures=0
 
 # Asserts BOTH stdout and exit status. Checking stdout alone would pass a
@@ -919,6 +921,122 @@ if bash "$assert_asset_count" >/dev/null 2>&1; then
 else
     echo "ok   - rejects being called with no arguments at all"
 fi
+
+# resolve-draft-release.sh / assert-tag-points-at.sh --------------------------
+#
+# The two other gh-driven decisions in the publish job: what commit the
+# draft names (read before anything irreversible) and what commit the tag
+# resolves to afterwards (read when nothing can be undone). Both take `gh`
+# from GOETIA_GH, like create-release-tag.sh.
+
+draft_invocations="${tag_root}/gh.draft-invocations"
+
+# make_draft_gh_stub <exit-code> <stdout>
+make_draft_gh_stub() {
+    local exit_code="$1" output="$2"
+    cat > "${stub_dir}/gh" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "${draft_invocations}"
+printf '%s\n' '${output}'
+exit ${exit_code}
+EOF
+    chmod +x "${stub_dir}/gh"
+    : > "$draft_invocations"
+}
+
+# run_draft_script <script> <gh-exit> <gh-stdout> <arg>...
+run_draft_script() {
+    local script="$1" gh_exit="$2" gh_output="$3"
+    shift 3
+    make_draft_gh_stub "$gh_exit" "$gh_output"
+    draft_status=0
+    draft_output="$(GOETIA_GH="${stub_dir}/gh" GH_REPO=bindreams/goetia bash "$script" "$@" 2>&1)" \
+        || draft_status=$?
+}
+
+assert_draft_script() {
+    local description="$1" want_success="$2" message="$3"
+    local succeeded=no
+    if [[ "$draft_status" -eq 0 ]]; then
+        succeeded=yes
+    fi
+    if [[ "$succeeded" != "$want_success" ]]; then
+        echo "FAIL - ${description} (wanted success=${want_success}, got status ${draft_status}: ${draft_output})"
+        failures=$((failures + 1))
+    elif [[ -n "$message" && "$draft_output" != *"$message"* ]]; then
+        echo "FAIL - ${description} (expected output containing '${message}', got: ${draft_output})"
+        failures=$((failures + 1))
+    else
+        echo "ok   - ${description}"
+    fi
+}
+
+draft_sha="1234567890abcdef1234567890abcdef12345678"
+
+run_draft_script "$resolve_draft" 0 "{\"isDraft\":true,\"targetCommitish\":\"${draft_sha}\"}" v0.1.0
+assert_draft_script "resolves a draft to its target commit" yes "sha=${draft_sha}"
+
+if [[ "$(cat "$draft_invocations")" == "release view v0.1.0 --json isDraft,targetCommitish" ]]; then
+    echo "ok   - asks about the release it was given"
+else
+    echo "FAIL - asks about the release it was given (invoked as: $(cat "$draft_invocations"))"
+    failures=$((failures + 1))
+fi
+
+# A published release, or one created any other way, is not the object this
+# workflow publishes.
+run_draft_script "$resolve_draft" 0 "{\"isDraft\":false,\"targetCommitish\":\"${draft_sha}\"}" v0.1.0
+assert_draft_script "refuses a release that is not a draft" no "not a draft"
+
+# `targetCommitish` holds whatever the release was created with — a branch
+# name for a hand-made draft, which would make every later commit check
+# compare against a moving target.
+run_draft_script "$resolve_draft" 0 '{"isDraft":true,"targetCommitish":"main"}' v0.1.0
+assert_draft_script "refuses a draft that targets a branch instead of a commit" no "40-character"
+
+run_draft_script "$resolve_draft" 1 'release not found' v0.1.0
+assert_draft_script "refuses when the release cannot be read" no "Does the draft release exist"
+
+if GH_REPO=bindreams/goetia bash "$resolve_draft" >/dev/null 2>&1; then
+    echo "FAIL - rejects being called with no arguments at all (expected rejection, got success)"
+    failures=$((failures + 1))
+else
+    echo "ok   - rejects being called with no arguments at all"
+fi
+
+run_draft_script "$assert_tag_points_at" 0 "$draft_sha" v0.1.0 "$draft_sha"
+assert_draft_script "accepts a tag that resolves to the published commit" yes ""
+
+if [[ "$(cat "$draft_invocations")" == "api repos/bindreams/goetia/commits/v0.1.0 --jq .sha" ]]; then
+    echo "ok   - resolves the tag itself rather than the release's stored input"
+else
+    echo "FAIL - resolves the tag itself rather than the release's stored input (invoked as: $(cat "$draft_invocations"))"
+    failures=$((failures + 1))
+fi
+
+run_draft_script "$assert_tag_points_at" 0 "fedcba9876543210fedcba9876543210fedcba98" v0.1.0 "$draft_sha"
+assert_draft_script "refuses a tag that resolves to another commit" no "points at"
+
+run_draft_script "$assert_tag_points_at" 1 'not found' v0.1.0 "$draft_sha"
+assert_draft_script "refuses when the tag cannot be resolved" no "Could not resolve"
+
+# Both failures happen after the release is public and the crate is
+# published, so neither may suggest deleting anything.
+if [[ "$draft_output" == *"Do NOT delete"* ]]; then
+    echo "ok   - does not suggest deleting an already-published release"
+else
+    echo "FAIL - does not suggest deleting an already-published release (got: ${draft_output})"
+    failures=$((failures + 1))
+fi
+
+if GH_REPO=bindreams/goetia bash "$assert_tag_points_at" v0.1.0 >/dev/null 2>&1; then
+    echo "FAIL - rejects being called with one argument (expected rejection, got success)"
+    failures=$((failures + 1))
+else
+    echo "ok   - rejects being called with one argument"
+fi
+
+rm -f "${stub_dir}/gh"
 
 # create-release-tag.sh ------------------------------------------------------
 #
