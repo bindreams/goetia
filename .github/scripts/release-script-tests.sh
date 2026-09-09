@@ -52,37 +52,84 @@ assert_rejects "rejects an inner leading zero" "1.02.3"
 
 # assert-tag-absent.sh -----------------------------------------------------
 # Drives the script against a stub `git` that exits with a chosen status, so
-# all three branches are exercised without touching a real remote.
+# all three branches are exercised without touching a real remote. The stub
+# also records its own argv and only honors the configured exit code when
+# invoked with the exact `ls-remote --exit-code --tags origin refs/tags/<ref>`
+# shape assert-tag-absent.sh is supposed to use — any other invocation is
+# treated as a stub-usage bug (exit 97, a code the script's own case
+# statement can't confuse with a real git outcome). Without this, a stub
+# that answers regardless of its arguments only pins exit-code mapping, and
+# would keep passing even if the script queried the wrong ref or none at all.
 
 stub_dir="$(mktemp -d)"
 archive_root="$(mktemp -d)"
 trap 'rm -rf "$stub_dir" "$archive_root"' EXIT
 
 make_git_stub() {
-    local exit_code="$1"
+    local exit_code="$1" expected_ref="$2"
     cat > "${stub_dir}/git" <<EOF
 #!/usr/bin/env bash
-exit ${exit_code}
+echo "\$@" > "${stub_dir}/git.invocation"
+if [[ "\$*" == "ls-remote --exit-code --tags origin ${expected_ref}" ]]; then
+    exit ${exit_code}
+else
+    exit 97
+fi
 EOF
     chmod +x "${stub_dir}/git"
 }
 
+# assert_git_invocation <expected-argv> — fails the current test unless the
+# stub was actually invoked with exactly <expected-argv>. Returns 0 (matched)
+# or 1 (mismatch, and already recorded the failure).
+assert_git_invocation() {
+    local description="$1" expected="$2"
+    local actual
+    actual="$(cat "${stub_dir}/git.invocation" 2>/dev/null || true)"
+    if [[ -z "$actual" ]]; then
+        actual="<git never invoked>"
+    fi
+    if [[ "$actual" != "$expected" ]]; then
+        echo "FAIL - ${description} (expected git invoked as '${expected}', got '${actual}')"
+        failures=$((failures + 1))
+        return 1
+    fi
+    return 0
+}
+
 assert_tag_result() {
     local description="$1" git_exit="$2" want_success="$3"
-    make_git_stub "$git_exit"
+    make_git_stub "$git_exit" "refs/tags/v0.1.0"
+    local succeeded=no
     if PATH="${stub_dir}:${PATH}" bash "$assert_tag" v0.1.0 >/dev/null 2>&1; then
-        [[ "$want_success" == "yes" ]] && echo "ok   - ${description}" && return 0
-    else
-        [[ "$want_success" == "no" ]] && echo "ok   - ${description}" && return 0
+        succeeded=yes
     fi
-    echo "FAIL - ${description} (git exit ${git_exit}, wanted success=${want_success})"
-    failures=$((failures + 1))
+    assert_git_invocation "$description" "ls-remote --exit-code --tags origin refs/tags/v0.1.0" || return
+    if [[ "$succeeded" == "$want_success" ]]; then
+        echo "ok   - ${description}"
+    else
+        echo "FAIL - ${description} (git exit ${git_exit}, wanted success=${want_success})"
+        failures=$((failures + 1))
+    fi
 }
 
 assert_tag_result "tag present (git exit 0) is refused"        0   no
 assert_tag_result "tag absent (git exit 2) is accepted"        2   yes
 assert_tag_result "transient failure (git exit 1) is refused"  1   no
 assert_tag_result "auth failure (git exit 128) is refused"     128 no
+
+# The stub only recognizes refs/tags/v0.1.0; asking assert-tag-absent.sh
+# about a different tag must make it query that tag's own ref, not a
+# hardcoded one — a script that ignored $1 and always asked about v0.1.0
+# would get treated as "absent" here and wrongly succeed.
+make_git_stub 2 "refs/tags/v0.1.0"
+if PATH="${stub_dir}:${PATH}" bash "$assert_tag" v9.9.9 >/dev/null 2>&1; then
+    echo "FAIL - queries the tag it was given, not a hardcoded one (stub only recognizes refs/tags/v0.1.0; script asked about v9.9.9 and still succeeded)"
+    failures=$((failures + 1))
+else
+    assert_git_invocation "queries the tag it was given, not a hardcoded one" "ls-remote --exit-code --tags origin refs/tags/v9.9.9" \
+        && echo "ok   - queries the tag it was given, not a hardcoded one"
+fi
 
 # assert-archives.sh ---------------------------------------------------------
 #
@@ -207,6 +254,26 @@ assert_archives_rejects() {
     fi
 }
 
+# assert_archives_rejects_matching <description> <expected-count> <message-substring> <archive>...
+# Like assert_archives_rejects, but also requires the script's stderr to
+# contain <message-substring> — so a rejection for the wrong reason (e.g. a
+# misleading "member set mismatch" masking a real listing failure) still
+# fails the test.
+assert_archives_rejects_matching() {
+    local description="$1" expected_count="$2" message="$3"
+    shift 3
+    local output
+    if output="$(bash "$assert_archives" "$expected_count" "$@" 2>&1)"; then
+        echo "FAIL - ${description} (expected rejection, got success)"
+        failures=$((failures + 1))
+    elif [[ "$output" == *"$message"* ]]; then
+        echo "ok   - ${description}"
+    else
+        echo "FAIL - ${description} (expected message containing '${message}', got: ${output})"
+        failures=$((failures + 1))
+    fi
+}
+
 unix_targets=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-apple-darwin aarch64-apple-darwin)
 windows_target=x86_64-pc-windows-msvc
 
@@ -232,6 +299,20 @@ mapfile -t complete_set < <(build_complete_set)
 assert_archives_ok "accepts a complete set" 5 "${complete_set[@]}"
 
 assert_archives_rejects "rejects a wrong count" 3 "${complete_set[@]}"
+
+# A zero (or otherwise non-positive) expected-count must never be treated as
+# "zero archives to check, trivially satisfied" — that turns a workflow's
+# empty/miscomputed count variable into a guard that always reports success.
+assert_archives_rejects "rejects a zero count" 0
+assert_archives_rejects "rejects a non-numeric count" abc
+assert_archives_rejects "rejects an empty count" ""
+
+if bash "$assert_archives" >/dev/null 2>&1; then
+    echo "FAIL - rejects being called with no arguments at all (expected rejection, got success)"
+    failures=$((failures + 1))
+else
+    echo "ok   - rejects being called with no arguments at all"
+fi
 
 root="$(mktemp -d -p "$archive_root")"
 archive="${root}/goetia-x86_64-unknown-linux-musl.tar.xz"
@@ -260,6 +341,32 @@ archive="${root}/goetia-x86_64-unknown-linux-musl.tar.xz"
 tar -cJf "$archive" -C "$flat_staged" goetia goetia-shim README.md LICENSE.md
 assert_archives_rejects "rejects a flat archive with no goetia-<target>/ prefix" 1 "$archive"
 
+assert_archives_rejects "rejects a named archive that does not exist" 1 \
+    "${archive_root}/goetia-x86_64-unknown-linux-musl.tar.xz"
+
+root="$(mktemp -d -p "$archive_root")"
+archive="${root}/goetia-x86_64-unknown-linux-musl.tar.gz"
+printf 'irrelevant content' > "$archive"
+assert_archives_rejects "rejects an archive with an unrecognized extension" 1 "$archive"
+
+root="$(mktemp -d -p "$archive_root")"
+archive="${root}/not-goetia-x86_64-unknown-linux-musl.tar.xz"
+make_tar_archive "$archive" x86_64-unknown-linux-musl "goetia bytes" "shim bytes"
+assert_archives_rejects "rejects a filename that doesn't start with goetia-" 1 "$archive"
+
+# A corrupt archive must fail with the real listing error, not a misleading
+# "member set mismatch" — `list_members` runs under `mapfile < <(...)`, and a
+# failure inside that process substitution is otherwise swallowed.
+root="$(mktemp -d -p "$archive_root")"
+archive="${root}/goetia-x86_64-unknown-linux-musl.tar.xz"
+printf 'not a real tar.xz stream' > "$archive"
+assert_archives_rejects_matching "surfaces the real listing failure for a corrupt archive" 1 "failed to list members" "$archive"
+
+root="$(mktemp -d -p "$archive_root")"
+archive="${root}/goetia-${windows_target}.zip"
+printf 'not a real zip stream' > "$archive"
+assert_archives_rejects_matching "surfaces the real listing failure for a corrupt zip" 1 "failed to list members" "$archive"
+
 root="$(mktemp -d -p "$archive_root")"
 staged="${root}/goetia-${windows_target}"
 write_members "$staged" "goetia bytes" "shim bytes"
@@ -282,6 +389,14 @@ make_zip_entries "$archive" \
     "${win_prefix}\\README.md=${staged}/README.md" \
     "${win_prefix}\\LICENSE.md=${staged}/LICENSE.md"
 assert_archives_rejects "rejects backslash separators in the zip" 1 "$archive"
+
+# Distinctness must also hold *within* one archive: if goetia and
+# goetia-shim are byte-identical, the staging step copied one program over
+# the other, even though only a single archive is involved.
+root="$(mktemp -d -p "$archive_root")"
+archive="${root}/goetia-x86_64-unknown-linux-musl.tar.xz"
+make_tar_archive "$archive" x86_64-unknown-linux-musl "same bytes" "same bytes"
+assert_archives_rejects "rejects an archive whose own goetia and goetia-shim are byte-identical" 1 "$archive"
 
 root="$(mktemp -d -p "$archive_root")"
 shared_content="identical goetia bytes"

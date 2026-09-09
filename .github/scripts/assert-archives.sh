@@ -4,14 +4,16 @@
 # Exits 0 only when: the count matches; every archive's member set is exactly
 # `goetia-<target>/{goetia,goetia-shim,README.md,LICENSE.md}`, with `.exe` on
 # the two binaries and `/` as the only separator inside a `.zip`; and no two
-# archives carry a byte-identical binary.
+# binaries anywhere in the call — whether in the same archive or different
+# ones — carry byte-identical content.
 #
 # The member set is checked per archive, derived from that archive's own
-# filename — but the binary bytes are compared across every archive in the
+# filename — but the binary bytes are tracked across every archive in the
 # call. That is what catches a staging step that lost its `--target` and
-# copied one host's binary into every row: each archive's filename would
+# copied one host's binary into every row (each archive's filename would
 # still look right, and a per-archive check alone would pass every one of
-# them.
+# them), as well as a staging step that copied `goetia` over `goetia-shim`
+# (or vice versa) within a single archive.
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
@@ -22,8 +24,8 @@ fi
 expected_count="$1"
 shift
 
-if [[ ! "$expected_count" =~ ^[0-9]+$ ]]; then
-    echo "::error::expected-count must be a non-negative integer, got '${expected_count}'" >&2
+if [[ ! "$expected_count" =~ ^[1-9][0-9]*$ ]]; then
+    echo "::error::expected-count must be a positive integer, got '${expected_count}'" >&2
     exit 1
 fi
 
@@ -94,7 +96,22 @@ for archive in "$@"; do
         ext=".exe"
     fi
 
-    mapfile -t members < <(list_members "$kind" "$archive")
+    # A plain `mapfile -t members < <(list_members ...)` would swallow a
+    # failure inside the process substitution: `mapfile`'s own exit status
+    # only reflects reading from the pipe, not the command that fed it, so a
+    # corrupt archive would silently yield a truncated member list instead
+    # of surfacing the real `tar`/`unzip` error. Capture the listing via a
+    # command substitution instead, whose exit status *is* the pipeline's
+    # (thanks to the script-wide `pipefail`), and fail loudly on it.
+    members_listing=""
+    if ! members_listing="$(list_members "$kind" "$archive")"; then
+        echo "::error::${archive}: failed to list members (corrupt or unreadable archive?)" >&2
+        exit 1
+    fi
+    members=()
+    if [[ -n "$members_listing" ]]; then
+        mapfile -t members <<< "$members_listing"
+    fi
 
     if [[ "$kind" == zip ]]; then
         for member in "${members[@]}"; do
@@ -128,8 +145,12 @@ for archive in "$@"; do
         member="${prefix}/${name}${ext}"
         hash="$(extract_member "$kind" "$archive" "$member" | sha256sum | cut -d' ' -f1)"
         owner="${binary_owner[$hash]-}"
-        if [[ -n "$owner" && "${owner%%:*}" != "$archive" ]]; then
-            echo "::error::${archive}:${member} is byte-identical to ${owner} — two archives should never ship the same binary; check the staging step's --target" >&2
+        if [[ -n "$owner" ]]; then
+            if [[ "${owner%%:*}" == "$archive" ]]; then
+                echo "::error::${archive}:${member} is byte-identical to ${owner#*:} in the same archive — goetia and goetia-shim must be different programs; check the staging step" >&2
+            else
+                echo "::error::${archive}:${member} is byte-identical to ${owner} — two archives should never ship the same binary; check the staging step's --target" >&2
+            fi
             exit 1
         fi
         binary_owner["$hash"]="${archive}:${member}"
