@@ -1,5 +1,17 @@
 name: Publish Release
 
+# PRECONDITION THE OPERATOR MUST CONFIRM BEFORE DISPATCHING: the
+# repository's immutable-releases setting is on. This workflow cannot read
+# it — `repos/{owner}/{repo}/immutable-releases` needs repository
+# `administration: read`, which is not a grantable `GITHUB_TOKEN`
+# permission — so confirm it by hand, from an account with admin access:
+#
+#     gh api -X GET repos/bindreams/goetia/immutable-releases
+#
+# with the setting on, that answers `{"enabled":true,...}`. The
+# `Assert immutability` step below is the automated backstop, and it can
+# only fire after both irreversible actions have already happened.
+
 on:
   workflow_dispatch:
     inputs:
@@ -85,27 +97,6 @@ jobs:
             exit 1
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
-
-      # PREFLIGHT, before anything irreversible: the immutability setting is
-      # queryable up front (`gh api repos/{owner}/{repo}/immutable-releases`),
-      # so there is no reason to discover it is off only after crates.io and
-      # the GitHub release have both already been published — the state the
-      # post-publish "Assert immutability" check below used to be the first
-      # thing to notice, with its own remedy text conceding a burnt version
-      # number ("cut v0.1.1"). Nothing has happened yet at this point in the
-      # job, so failing here costs nothing.
-      - name: Assert immutable releases are enabled (preflight)
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          enabled="$(gh api "repos/${GH_REPO}/immutable-releases" --jq '.enabled')"
-          if [ "$enabled" != "true" ]; then
-            echo "::error::Immutable releases are not enabled for ${GH_REPO}. Nothing has been published yet by this run — enable the immutable-releases repository setting and re-dispatch."
-            exit 1
-          fi
 
       # actions/checkout deletes a non-empty workspace, so this must run
       # before the asset download below, not after. Checks out the draft's
@@ -321,11 +312,11 @@ jobs:
             exit 1
           fi
 
-      # Kept alongside the preflight above deliberately: the preflight checks
-      # the repository SETTING before anything is published; this checks the
-      # actual OUTCOME on the release that just got published. They can
-      # diverge — the setting could be flipped off in the window between the
-      # preflight and the flip above — so this is not redundant with it.
+      # The only automated check of immutability the pipeline can make. The
+      # repository SETTING is unreadable here (see the precondition at the
+      # top of this file), but the OUTCOME on a published release is a plain
+      # release read, which `contents` covers. It necessarily runs after the
+      # flip, so its remedy text has to assume a burnt version number.
       #
       # `gh release view --json` exposes `isImmutable`; the REST object
       # (`gh api repos/{owner}/{repo}/releases/...`) exposes `immutable`

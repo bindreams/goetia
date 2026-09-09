@@ -1,5 +1,21 @@
 name: Draft Release
 
+# PRECONDITION THE OPERATOR MUST CONFIRM BEFORE DISPATCHING: the
+# repository's immutable-releases setting is on. Everything downstream —
+# including the reasoning that a published release cannot be tampered with
+# afterwards — depends on it, and neither release workflow can check it.
+# Reading `repos/{owner}/{repo}/immutable-releases` needs repository
+# `administration: read`, which is not a grantable `GITHUB_TOKEN`
+# permission: it is not in the workflow `permissions:` schema at all, so
+# the call cannot succeed with any token these workflows can hold. Confirm
+# it by hand, from an account with admin access:
+#
+#     gh api -X GET repos/bindreams/goetia/immutable-releases
+#
+# with the setting on, that answers `{"enabled":true,...}`. Publish
+# Release's `Assert immutability` step is the automated backstop, but it
+# can only observe the OUTCOME, after the release is already public.
+
 on:
   workflow_dispatch:
     inputs:
@@ -112,24 +128,6 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         shell: bash
         run: .github/scripts/assert-tag-absent.sh "v${VERSION}"
-
-      # Queryable up front, and this is the point in the whole pipeline
-      # where it is cheapest to fail: nothing has been built, drafted, or
-      # published yet. Re-checked immediately before the crates.io publish
-      # in Publish Release, since that is the actual point of no return —
-      # this is an early warning, not the enforcement point.
-      - name: Assert immutable releases are enabled
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          enabled="$(gh api "repos/${GH_REPO}/immutable-releases" --jq '.enabled')"
-          if [ "$enabled" != "true" ]; then
-            echo "::error::Immutable releases are not enabled for ${GH_REPO}. Enable the immutable-releases repository setting before drafting a release."
-            exit 1
-          fi
 
       # workflow_dispatch accepts a `ref`, so without this a draft can be
       # pinned to unmerged code while every later check still passes.
