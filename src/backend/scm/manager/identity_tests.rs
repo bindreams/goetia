@@ -51,7 +51,7 @@ fn sid_rejects_a_malformed_sid_string() {
     assert!(err.to_string().contains("not-a-sid"));
 }
 
-// service_password / account_needs_password ===========================================================================
+// service_password ====================================================================================================
 
 #[skuld::test]
 fn password_var_absent_is_none() {
@@ -75,29 +75,4 @@ fn password_var_not_unicode_errs_rather_than_downgrading_to_none() {
     let err = parse_password_var(Err(std::env::VarError::NotUnicode(not_unicode)))
         .expect_err("malformed password must not silently become \"no password\"");
     assert!(err.to_string().contains("GOETIA_SERVICE_PASSWORD"));
-}
-
-#[skuld::test]
-fn account_needs_password_is_false_for_builtin_and_virtual_accounts() {
-    for account in [
-        "LocalSystem",
-        "LocalService",
-        "NetworkService",
-        r"NT AUTHORITY\LocalService",
-        r"NT AUTHORITY\NetworkService",
-        r"NT AUTHORITY\SYSTEM",
-        r"NT SERVICE\my-daemon",
-        // Case-insensitive.
-        "localsystem",
-        r"nt service\my-daemon",
-    ] {
-        assert!(!account_needs_password(account), "{account} should not need a password");
-    }
-}
-
-#[skuld::test]
-fn account_needs_password_is_true_for_a_real_account() {
-    for account in [r".\svc-account", "svc-account", r"CORP\svc-account"] {
-        assert!(account_needs_password(account), "{account} should need a password");
-    }
 }

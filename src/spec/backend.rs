@@ -318,10 +318,7 @@ pub(crate) enum Builtin {
 impl Builtin {
     /// The spelling `CreateServiceW` accepts. `None` for `LocalSystem`,
     /// which is `ServiceInfo`'s default and is expressed by absence.
-    ///
-    /// Unread until Task 7's `canonical_account` lands and calls it — not a
-    /// placeholder for a future concept, this task's own produced interface.
-    #[allow(dead_code)]
+    /// Read by `backend::scm::generate::canonical_account`.
     pub(crate) const fn canonical(self) -> Option<&'static str> {
         match self {
             Builtin::LocalSystem => None,
@@ -337,6 +334,18 @@ impl Builtin {
 /// `identity::account_needs_password`'s table exactly, plus the empty
 /// string — see the note below.
 ///
+/// The fold: lowercase the whole string, then strip a leading
+/// `nt authority\` if present, and — **only if that prefix was present** —
+/// remove ASCII spaces from what remains. Space-folding is scoped to the
+/// prefixed form because `LookupAccountSidW` resolves the well-known SIDs
+/// to spaced names (`NT AUTHORITY\LOCAL SERVICE`,
+/// `NT AUTHORITY\NETWORK SERVICE`) while an unprefixed name never arrives
+/// that way — `identity::resolve` passes `User::Name` through without a
+/// lookup — so folding spaces there too would wrongly swallow a genuine
+/// local account named `Local Service`. See
+/// `windows_builtin_folds_spaces_only_under_the_nt_authority_prefix` and
+/// `an_unprefixed_spaced_name_is_not_folded`.
+///
 /// `windows_builtin("")` is `Some(Builtin::LocalSystem)`: Task 7's
 /// `canonical_account` maps an empty authored account to `LocalSystem`, and
 /// both halves must agree. `Backend::error` never sees an empty name —
@@ -344,7 +353,11 @@ impl Builtin {
 /// unreachable from that direction; do not "simplify" it away, or
 /// `User::Root`'s behaviour on Windows changes.
 pub(crate) fn windows_builtin(name: &str) -> Option<Builtin> {
-    let folded = name.to_ascii_lowercase();
+    let lower = name.to_ascii_lowercase();
+    let folded = match lower.strip_prefix(r"nt authority\") {
+        Some(rest) => format!(r"nt authority\{}", rest.replace(' ', "")),
+        None => lower,
+    };
     match folded.as_str() {
         "" | "system" | "localsystem" | r"nt authority\system" => Some(Builtin::LocalSystem),
         "localservice" | r"nt authority\localservice" => Some(Builtin::LocalService),

@@ -1,5 +1,5 @@
 use super::*;
-use crate::spec::Id;
+use crate::spec::{Builtin, Id};
 
 // Fixtures ============================================================================================================
 
@@ -108,6 +108,208 @@ fn named_user_account_uses_resolved_identity() {
         Some(id.user.clone()),
         "a non-root user must use the pre-resolved Identity, not re-derive one"
     );
+}
+
+// `canonical_account` / `account_needs_password` ======================================================================
+
+#[skuld::test]
+fn local_service_canonicalizes_to_the_nt_authority_form() {
+    assert_eq!(
+        canonical_account("LocalService"),
+        Some(r"NT AUTHORITY\LocalService".to_string())
+    );
+}
+
+#[skuld::test]
+fn network_service_canonicalizes_to_the_nt_authority_form() {
+    assert_eq!(
+        canonical_account("NetworkService"),
+        Some(r"NT AUTHORITY\NetworkService".to_string())
+    );
+}
+
+#[skuld::test]
+fn spaced_builtin_spellings_canonicalize() {
+    // What `LookupAccountSidW` actually produces for S-1-5-19/S-1-5-20.
+    assert_eq!(
+        canonical_account(r"NT AUTHORITY\LOCAL SERVICE"),
+        canonical_account("LocalService")
+    );
+    assert_eq!(
+        canonical_account(r"NT AUTHORITY\NETWORK SERVICE"),
+        canonical_account("NetworkService")
+    );
+}
+
+#[skuld::test]
+fn an_already_qualified_builtin_is_left_in_canonical_form() {
+    assert_eq!(
+        canonical_account(r"NT AUTHORITY\LocalService"),
+        Some(r"NT AUTHORITY\LocalService".to_string()),
+        "canonicalisation must be idempotent"
+    );
+}
+
+#[skuld::test]
+fn local_system_spellings_resolve_to_the_default_account() {
+    for spelling in ["LocalSystem", "SYSTEM", r"NT AUTHORITY\SYSTEM", ""] {
+        assert_eq!(
+            canonical_account(spelling),
+            None,
+            "`{spelling}` should map to the default account"
+        );
+    }
+}
+
+#[skuld::test]
+fn an_unprefixed_account_named_like_a_builtin_is_left_alone() {
+    assert_eq!(canonical_account("Local Service"), Some("Local Service".to_string()));
+}
+
+#[skuld::test]
+fn an_ordinary_account_name_is_left_alone() {
+    assert_eq!(canonical_account("bindreams"), Some("bindreams".to_string()));
+}
+
+#[skuld::test]
+fn an_nt_service_account_is_left_alone() {
+    assert_eq!(
+        canonical_account(r"NT SERVICE\frpc"),
+        Some(r"NT SERVICE\frpc".to_string())
+    );
+}
+
+#[skuld::test]
+fn a_localised_builtin_name_is_not_folded() {
+    // German Windows' `LookupAccountSidW` spelling of S-1-5-19. The name
+    // fold cannot be localisation-proof (see the module doc comment on
+    // `windows_builtin`) — this pins that the gap is left as an ordinary
+    // account name rather than silently mishandled.
+    let localised = r"NT-AUTORITÄT\LOKALER DIENST";
+    assert_eq!(canonical_account(localised), Some(localised.to_string()));
+}
+
+#[skuld::test]
+fn every_canonical_builtin_needs_no_password() {
+    for spelling in [
+        "LocalSystem",
+        "LocalService",
+        "NetworkService",
+        r"NT AUTHORITY\LocalService",
+        r"NT AUTHORITY\NetworkService",
+        r"NT AUTHORITY\LOCAL SERVICE",
+        r"NT AUTHORITY\NETWORK SERVICE",
+    ] {
+        let account = canonical_account(spelling);
+        assert!(
+            !account_needs_password(account.as_deref()),
+            "`{spelling}` canonicalizes to {account:?}, which must not need a password"
+        );
+    }
+}
+
+#[skuld::test]
+fn registration_canonicalizes_a_builtin_account() {
+    let mut spec = managed_spec();
+    spec.user = User::Name("LocalService".to_string());
+    let id = Identity {
+        user: "LocalService".to_string(),
+    };
+    let reg = registration(&spec, &id, &shim_path());
+
+    assert_eq!(reg.account, Some(r"NT AUTHORITY\LocalService".to_string()));
+}
+
+#[skuld::test]
+fn registration_for_root_uses_the_default_account_with_an_empty_identity() {
+    let mut spec = managed_spec();
+    spec.user = User::Root;
+    // The value `identity::resolve` actually returns for `User::Root`, not
+    // a hand-written non-empty one — `root_user_maps_to_local_system`
+    // (above) uses `identity()`'s non-empty fixture and so cannot catch
+    // the empty-string path an unguarded `canonical_account` would map to
+    // `Some("")` (see `windows_builtin("")`'s doc comment).
+    let id = Identity { user: String::new() };
+    let reg = registration(&spec, &id, &shim_path());
+
+    assert_eq!(reg.account, None);
+}
+
+/// The recognition half (`windows_builtin`, in `spec`) and the spelling
+/// half (`canonical_account`, here) are two modules reading one table —
+/// this is the assertion that they agree on every row of it, not just the
+/// two rows an easier assertion would vacuously cover for `LocalService`/
+/// `NetworkService`.
+#[skuld::test]
+fn canonical_account_agrees_with_the_recognition_half() {
+    for spelling in [
+        "",
+        "localsystem",
+        "system",
+        r"nt authority\system",
+        "localservice",
+        "networkservice",
+        r"NT SERVICE\frpc",
+    ] {
+        let recognised = windows_builtin(spelling);
+        let canonical = canonical_account(spelling);
+
+        assert_eq!(
+            recognised.is_none(),
+            canonical == Some(spelling.to_string()),
+            "`{spelling}`: unrecognised iff passed through verbatim (recognised: {recognised:?}, canonical: \
+             {canonical:?})"
+        );
+        assert_eq!(
+            recognised == Some(Builtin::LocalSystem),
+            canonical.is_none(),
+            "`{spelling}`: LocalSystem iff canonical is None (recognised: {recognised:?}, canonical: {canonical:?})"
+        );
+        for builtin in [Builtin::LocalService, Builtin::NetworkService] {
+            assert_eq!(
+                recognised == Some(builtin),
+                canonical == builtin.canonical().map(str::to_string),
+                "`{spelling}` vs {builtin:?} (recognised: {recognised:?}, canonical: {canonical:?})"
+            );
+        }
+    }
+}
+
+#[skuld::test]
+fn account_needs_password_is_false_for_builtin_and_virtual_accounts() {
+    for account in [
+        "LocalSystem",
+        "LocalService",
+        "NetworkService",
+        r"NT AUTHORITY\LocalService",
+        r"NT AUTHORITY\NetworkService",
+        r"NT AUTHORITY\SYSTEM",
+        r"NT AUTHORITY\LOCAL SERVICE",
+        r"NT AUTHORITY\NETWORK SERVICE",
+        r"NT SERVICE\my-daemon",
+        // Case-insensitive.
+        "localsystem",
+        r"nt service\my-daemon",
+    ] {
+        assert!(
+            !account_needs_password(Some(account)),
+            "{account} should not need a password"
+        );
+    }
+    assert!(
+        !account_needs_password(None),
+        "None (LocalSystem) should not need a password"
+    );
+}
+
+#[skuld::test]
+fn account_needs_password_is_true_for_a_real_account() {
+    for account in [r".\svc-account", "svc-account", r"CORP\svc-account"] {
+        assert!(
+            account_needs_password(Some(account)),
+            "{account} should need a password"
+        );
+    }
 }
 
 // argv escaping and round trip ========================================================================================

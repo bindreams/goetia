@@ -48,7 +48,7 @@ use std::time::Duration;
 use crate::backend::Identity;
 use crate::blob::{self, Blob};
 use crate::error::Error;
-use crate::spec::{DaemonSpec, Kind, MAX_SC_ACTION_DELAY, Restart, User};
+use crate::spec::{DaemonSpec, Kind, MAX_SC_ACTION_DELAY, Restart, User, windows_builtin};
 
 // Metadata field names ================================================================================================
 
@@ -176,10 +176,16 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> ScmRe
     // string, so `render` controls its own spelling. Every other variant
     // was already resolved to a platform account name upstream (a
     // `LookupAccountSid` call for `User::Id(Sid)` is I/O, which this
-    // function must not do) — `id.user` carries that resolved name.
+    // function must not do) — `id.user` carries that resolved name, which
+    // `canonical_account` then canonicalises. `User::Root` must never
+    // reach `canonical_account`: `identity::resolve(&User::Root)` returns
+    // an empty `Identity::user`, and `canonical_account("")` is
+    // deliberately `Some(LocalSystem)` (`None`) too — see its doc comment
+    // — so this arm keeps that row unreachable from an authored spec
+    // rather than merely coincidentally correct.
     let account = match &spec.user {
         User::Root => None,
-        _ => Some(id.user.clone()),
+        _ => canonical_account(&id.user),
     };
 
     let mut parameters = BTreeMap::new();
@@ -205,6 +211,67 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> ScmRe
 /// validation.
 fn bounded_restart_delay(delay: Duration) -> Duration {
     delay.min(MAX_SC_ACTION_DELAY)
+}
+
+// Account canonicalisation ============================================================================================
+
+/// The account SCM should be given for `resolved`, canonicalised.
+/// `None` means LocalSystem: the `ServiceInfo` default, and how
+/// `User::Root` already renders.
+///
+/// Reads `spec::backend::windows_builtin` — the recognition half of this
+/// table, which lives in `spec` because `Backend::error` must apply it
+/// from every host (see that module's doc comment). This is the spelling
+/// half: `Builtin::canonical` supplies the byte-exact output
+/// `CreateServiceW` accepts, and this function is the whole of the
+/// composition between the two — not a second copy of the fold.
+///
+/// `resolved` is expected to be the account a non-Root `User` already
+/// resolved to (`Identity::user`); an empty string canonicalises to
+/// `None` (LocalSystem), which is correct only for `User::Root`'s
+/// legitimately empty identity — see `windows_builtin("")`'s doc comment.
+/// Callers must apply this only to the non-Root branch, keeping the
+/// existing `User::Root => None` arm untouched, so an *authored* empty
+/// name (already rejected earlier by `reject_blank`) can never reach this
+/// row.
+pub fn canonical_account(resolved: &str) -> Option<String> {
+    match windows_builtin(resolved) {
+        Some(builtin) => builtin.canonical().map(str::to_string),
+        None => Some(resolved.to_string()),
+    }
+}
+
+/// Whether Windows will refuse to start this account without a password.
+/// `None` (LocalSystem) never does; a recognised built-in or virtual
+/// per-service account (`NT SERVICE\<id>`) never does either. Any other
+/// resolved account name is assumed to be a real user account, which
+/// does.
+///
+/// Reads `windows_builtin` for the built-in half, the same table
+/// `canonical_account` reads — so a spaced spelling
+/// (`NT AUTHORITY\LOCAL SERVICE`) is recognised here too, not only after
+/// `canonical_account` has already run. `every_canonical_builtin_needs_no_password`
+/// additionally pins that composing the two always answers `false` for
+/// every built-in spelling, which is what `manager::apply`'s password gate
+/// and Task 8's `grant_service_logon_right` skip both depend on.
+///
+/// `NT SERVICE\<id>` accounts are not in `windows_builtin`'s table — they
+/// are virtual per-service accounts, not built-ins — so they are checked
+/// separately, by prefix.
+///
+/// A heuristic on the account *name* rather than a `LookupAccountSid`-based
+/// well-known-SID check: `ServiceInfo`/`ChangeServiceConfigW` only ever see
+/// the name, and every one of these accounts is required to be named as
+/// such by SCM's own conventions — there is no other spelling a caller
+/// could use for them.
+pub fn account_needs_password(account: Option<&str>) -> bool {
+    let Some(account) = account else {
+        return false;
+    };
+    if windows_builtin(account).is_some() {
+        return false;
+    }
+    !account.to_ascii_lowercase().starts_with(r"nt service\")
 }
 
 // Extraction ==========================================================================================================

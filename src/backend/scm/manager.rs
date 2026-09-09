@@ -101,7 +101,7 @@ use crate::blob::Blob;
 use crate::decide::{self, Outcome, Ownership};
 use crate::error::{Error, Result};
 use crate::manager::{Installed, ServiceManager, State, Status};
-use crate::spec::{DaemonSpec, Id, Kind, User};
+use crate::spec::{DaemonSpec, Id, Kind};
 
 // ScmManager ==========================================================================================================
 
@@ -479,11 +479,13 @@ fn read_live_registration(
         .map(|a| a.to_string_lossy().into_owned())
         // `ChangeServiceConfigW`'s NULL-means-"unchanged" quirk (see `apply`'s
         // doc comment) forces a live `LocalSystem` account to be written back
-        // as the literal string "LocalSystem", not `None` — normalize it back
-        // to `None` here so it renders identically to `generate::registration`'s
-        // own `User::Root` mapping and a `LocalSystem` service reads as
-        // up-to-date rather than a permanent phantom diff.
-        .filter(|a| !a.eq_ignore_ascii_case("LocalSystem"));
+        // as some spelling of it, not `None` — canonicalise it through the
+        // same table `generate::registration` uses so a `LocalSystem`
+        // service (whatever spelling SCM's own readback happens to use)
+        // reads as up-to-date rather than a permanent phantom diff. This is
+        // the `LocalSystem` row of that same table, folded in rather than a
+        // one-off `LocalSystem`-only filter.
+        .and_then(|a| generate::canonical_account(&a));
     let failure_actions = read_failure_actions(service, name)?;
 
     Ok((
@@ -588,15 +590,19 @@ fn apply(
     create: bool,
     current_start_type: Option<ServiceStartType>,
 ) -> Result<()> {
-    let password = match spec.user {
-        User::Root => None,
-        _ => {
+    // Matched on `&reg.account`, not `spec.user`: `generate::registration`
+    // now canonicalises a non-Root user too, and a name that folds to
+    // LocalSystem (e.g. `user: {name: system}`, a legal POSIX-looking name
+    // Task 5's `Backend::error` does not reject for `Scm`) makes
+    // `reg.account == None` even though `spec.user` is not `User::Root`.
+    // `reapply_uncompared_effects` below already keys its
+    // `grant_service_logon_right` skip off `&reg.account` the same way, so
+    // this keeps the two in agreement.
+    let password = match &reg.account {
+        None => None,
+        Some(account) => {
             let pw = identity::service_password()?;
-            let account = reg
-                .account
-                .as_deref()
-                .expect("a non-Root User always resolves to Some(account) in generate::registration");
-            if pw.is_none() && identity::account_needs_password(account) {
+            if pw.is_none() && generate::account_needs_password(Some(account)) {
                 // Trap 4's own failure shape, one step earlier: install
                 // would otherwise report success and the service would
                 // fail every future start with error 1069. Refuse instead

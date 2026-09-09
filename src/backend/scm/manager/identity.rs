@@ -84,30 +84,6 @@ fn parse_password_var(var: std::result::Result<String, std::env::VarError>) -> R
     }
 }
 
-/// Whether `account` is one Windows will start without a password: the
-/// built-in `LocalSystem`/`LocalService`/`NetworkService` accounts (bare, or
-/// `NT AUTHORITY\`-qualified), or a virtual per-service account
-/// (`NT SERVICE\<name>`) — the exact vocabulary the design spec's "Windows
-/// accounts" section names. Any other resolved account name is assumed to be
-/// a real user account, which does.
-///
-/// A heuristic on the account *name* rather than a `LookupAccountSid`-based
-/// well-known-SID check: `ServiceInfo`/`ChangeServiceConfigW` only ever see
-/// the name (`reg.account`, from `generate::registration`/`Identity`), and
-/// every one of these accounts is required to be named as such by SCM's own
-/// conventions — there is no other spelling a caller could use for them.
-pub fn account_needs_password(account: &str) -> bool {
-    let lower = account.to_ascii_lowercase();
-    let unqualified = lower.strip_prefix(r"nt authority\").unwrap_or(&lower);
-    !(lower.starts_with(r"nt service\")
-        // "system" alongside "localsystem": `LookupAccountSidW` resolves
-        // LocalSystem's well-known SID (S-1-5-18) to `NT AUTHORITY\SYSTEM`,
-        // not the literal string "LocalSystem" `CreateServiceW` also
-        // accepts — `user.id`'s SID path (`account_name_from_sid_string`)
-        // produces the former.
-        || matches!(unqualified, "localsystem" | "localservice" | "networkservice" | "system"))
-}
-
 fn wide_null(s: &str) -> Vec<u16> {
     std::ffi::OsStr::new(s)
         .encode_wide()

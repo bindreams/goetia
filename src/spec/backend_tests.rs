@@ -182,6 +182,47 @@ fn a_bare_system_name_is_not_a_windows_only_account() {
     assert_eq!(windows_builtin("LocalService"), Some(Builtin::LocalService));
 }
 
+/// Guards the carve-out's keying: a future refactor that makes
+/// `windows_only_account` filter the *folded* form (instead of the
+/// original `name`) would make `NT AUTHORITY\SYSTEM` fold toward `system`
+/// and get carved out too, silently stopping it from being rejected under
+/// `systemd`/`launchd`. Written as direct literal assertions rather than
+/// transitively through `windows_builtin`, so it cannot pass by both sides
+/// drifting together.
+#[skuld::test]
+fn windows_only_account_keys_the_system_carveout_on_the_original_string() {
+    assert_eq!(windows_only_account(r"NT AUTHORITY\SYSTEM"), Some(Builtin::LocalSystem));
+    assert_eq!(windows_only_account("system"), None);
+}
+
+// `windows_builtin` ===================================================================================================
+
+#[skuld::test]
+fn windows_builtin_folds_spaces_only_under_the_nt_authority_prefix() {
+    assert_eq!(
+        windows_builtin(r"NT AUTHORITY\LOCAL SERVICE"),
+        Some(Builtin::LocalService)
+    );
+    assert_eq!(
+        windows_builtin(r"NT AUTHORITY\NETWORK SERVICE"),
+        Some(Builtin::NetworkService)
+    );
+    // Case-insensitive, same as the rest of the table.
+    assert_eq!(
+        windows_builtin(r"nt authority\local service"),
+        Some(Builtin::LocalService)
+    );
+}
+
+#[skuld::test]
+fn an_unprefixed_spaced_name_is_not_folded() {
+    // No `NT AUTHORITY\` prefix, so no space-fold applies: a real local
+    // account genuinely named `Local Service` must pass through as an
+    // ordinary account name, not be swept up as the built-in.
+    assert_eq!(windows_builtin("Local Service"), None);
+    assert_eq!(windows_builtin("Network Service"), None);
+}
+
 // `Backend::error` ====================================================================================================
 
 #[skuld::test]
