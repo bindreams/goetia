@@ -118,6 +118,23 @@ enum Phase {
 /// produce `Warning`s for properties that are accepted but cannot be
 /// faithfully honored on every platform.
 pub fn resolve(raw: RawManifest, base_dir: &Path) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
+    resolve_as(raw, base_dir, Backend::native())
+}
+
+/// [`resolve`], with the native backend named rather than detected.
+///
+/// Production has exactly one caller, [`resolve`], which passes
+/// [`Backend::native`]. Tests pass any of the three, because the native arm
+/// of steps 4 and 5 — the skip, the verdict, the advisory — is otherwise
+/// only reachable from the one platform that runs it, and this repository's
+/// `#[cfg(windows)]` and macOS paths are exactly where the defects have
+/// been. A test that names a non-native backend as `native` exercises the
+/// same code an install on that platform would.
+fn resolve_as(
+    raw: RawManifest,
+    base_dir: &Path,
+    native: Option<Backend>,
+) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
     // Declared before `absolutize` runs, not after: `absolutize` itself can
     // now push a manifest-level advisory (a drive-relative `-f`), and
     // `Vec::new()` reads nothing, so hoisting the declaration up is safe by
@@ -151,7 +168,6 @@ pub fn resolve(raw: RawManifest, base_dir: &Path) -> Result<(Vec<DaemonSpec>, Ve
     // native override (it currently fails "no value for X" while `.env`
     // defines it) or lets an unrelated/unreadable `.env` break a host whose
     // native backend has no `$` anywhere.
-    let native = Backend::native();
     let merged_native: Vec<(RawSpec, Supplied)> = entries
         .iter()
         .map(|(_, raw)| match native {
@@ -222,16 +238,24 @@ pub fn resolve(raw: RawManifest, base_dir: &Path) -> Result<(Vec<DaemonSpec>, Ve
         // `check_spec_grammar` here — the text is substituted, and a
         // `.env` value may legally carry a literal `$`.
         let native_entry = native.filter(|b| raw.backend_specific.contains_key(b));
-        let step5: Result<(ShapedSpec, Vec<Warning>), Error> = (|| {
+        let substituted: Result<(ShapedSpec, Vec<Warning>), Error> = (|| {
             interpolate::spec(&mut native_merged, &path, &vars)?;
-            let (shaped, mut pass_warnings) = resolve_shape(&id, native_merged, base_dir, Phase::Substituted)?;
-            if let Some(b) = native {
-                b.error(&shaped, native_supplied)?;
-                b.warn(&shaped, &mut pass_warnings);
-            }
-            Ok((shaped, pass_warnings))
+            resolve_shape(&id, native_merged, base_dir, Phase::Substituted)
         })();
-        let (shaped, pass_warnings) = step5.map_err(|e| annotate_step5_error(e, native_entry))?;
+        let (shaped, mut pass_warnings) = substituted.map_err(|e| annotate_step5_error(e, native_entry))?;
+
+        // The native backend's own verdict, annotated like step 4's rather
+        // than like the substitution above it: step 4 skipped this backend,
+        // so this is the *first* pass to apply a per-backend rule to the
+        // native spec, and "after substituting from .env" would be a claim
+        // about a pass that never ran — naming a `.env` that need not exist.
+        // `Backend::error` reads only fields `native_supplied` marks, so
+        // `backend-specific.<native>` is where the value was written, the
+        // same attribution its non-native twin gets.
+        if let Some(b) = native {
+            b.error(&shaped, native_supplied).map_err(|e| attribute_to(e, b))?;
+            b.warn(&shaped, &mut pass_warnings);
+        }
         daemon_warnings.extend(pass_warnings);
 
         // Step 6: dedup and complete.
@@ -282,13 +306,22 @@ pub fn load(path: &Path) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
 /// ungated case unreachable.
 fn annotate_sweep_error(err: Error, backend: Backend, has_entry: bool) -> Error {
     match err {
-        Error::Invalid { daemon, message } => Error::Invalid {
-            daemon,
-            message: format!("backend-specific.{backend}: {message}"),
-        },
         Error::Interpolate { path, message } if has_entry => Error::Interpolate {
             path: format!("{path} (backend-specific.{backend})"),
             message,
+        },
+        other => attribute_to(other, backend),
+    }
+}
+
+/// `backend-specific.<backend>: ` on an `Error::Invalid`, and nothing on any
+/// other variant. Shared by step 4's sweep and step 5's native verdict so
+/// the two spell one attribution one way.
+fn attribute_to(err: Error, backend: Backend) -> Error {
+    match err {
+        Error::Invalid { daemon, message } => Error::Invalid {
+            daemon,
+            message: format!("backend-specific.{backend}: {message}"),
         },
         other => other,
     }
@@ -302,12 +335,17 @@ fn annotate_sweep_error(err: Error, backend: Backend, has_entry: bool) -> Error 
 /// all" and gates this annotation; the two are not interchangeable, since
 /// `scm: {}` is an entry that sets no field and its `Supplied` is
 /// byte-identical to a missing entry's. `Error::Invalid` (from
-/// `resolve_shape`'s injection gate, or from `Backend::error`/`warn`) gains
-/// an "after substituting from .env" message prefix instead: the
-/// uninterpolated pass over the same merged spec (step 4's native arm)
-/// already passed, so the only thing that changed is substitution, and the
-/// error must say so rather than pointing a reader at the manifest line
-/// that merely referenced the variable.
+/// `resolve_shape`'s injection gate) gains an "after substituting from .env"
+/// message prefix instead: the uninterpolated pass over the same merged spec
+/// (step 4's native arm) already ran `resolve_shape` and passed, so the only
+/// thing that changed is substitution, and the error must say so rather than
+/// pointing a reader at the manifest line that merely referenced the
+/// variable.
+///
+/// Applied to the substitution and shape half of step 5 only. The native
+/// `Backend::error` verdict is annotated by `attribute_to` at its own call
+/// site: step 4 never ran it, so the premise this prefix rests on does not
+/// hold for it.
 fn annotate_step5_error(err: Error, native_entry: Option<Backend>) -> Error {
     match err {
         Error::Interpolate { path, message } => {

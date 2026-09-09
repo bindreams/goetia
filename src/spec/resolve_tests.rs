@@ -1210,6 +1210,48 @@ fn non_native_backend() -> Backend {
         .expect("ALL has 3 entries; native() names at most 1")
 }
 
+/// A `user:` value `Backend::error` rejects for `backend`, on any host — so
+/// a test can aim a per-backend verdict at whichever backend it is naming
+/// as native.
+fn user_rejected_by(backend: Backend) -> &'static str {
+    match backend {
+        // A numeric uid is never a Windows account.
+        Backend::Scm => "{id: 1000}",
+        // A SID is never a POSIX account.
+        Backend::Systemd | Backend::Launchd => "{id: \"S-1-5-18\"}",
+    }
+}
+
+/// `resolve`, with `native` named rather than detected — the seam that puts
+/// every host's native arm within reach of every other host's test runner.
+fn resolve_yaml_as(native: Backend, yaml: &str) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
+    resolve_as(parse_manifest(yaml), &base_dir(), Some(native))
+}
+
+#[skuld::test]
+fn a_native_backend_verdict_names_the_override_that_caused_it() {
+    // Not `.env`: step 4 skips the native backend, so step 5 is the first
+    // pass to apply a per-backend rule to the native spec — there is no
+    // earlier pass whose success would make substitution the only suspect,
+    // and this manifest carries no `$` and sits beside no `.env` file.
+    for native in Backend::ALL {
+        let yaml = format!(
+            "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      {native}:\n        user: {}\n",
+            user_rejected_by(native)
+        );
+        let err = resolve_yaml_as(native, &yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("backend-specific.{native}")),
+            "native `{native}` must be attributed like its non-native twin: {msg}"
+        );
+        assert!(
+            !msg.contains("after substituting"),
+            "native `{native}`: nothing was substituted and no `.env` exists: {msg}"
+        );
+    }
+}
+
 #[skuld::test]
 fn resolve_applies_the_native_backends_override() {
     let Some(native) = Backend::native() else {
@@ -1447,14 +1489,11 @@ fn a_numeric_uid_under_scm_is_rejected_on_every_host() {
     let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      scm:\n        \
                 user:\n          id: 1000\n";
     let err = resolve_yaml(yaml).unwrap_err();
-    if Backend::native() != Some(Backend::Scm) {
-        // On a host where `scm` is non-native, the rejection runs in the
-        // sweep (step 4) and is attributed to the backend. Where `scm` is
-        // native (Windows), the same rule runs in the native pass (step 5),
-        // which is not backend-attributed — see `resolve`'s error
-        // annotation section — but must still fail.
-        assert!(err.to_string().contains("backend-specific.scm"), "{err}");
-    }
+    // Attributed on every host, from either pass: where `scm` is non-native
+    // the rejection runs in the sweep (step 4), and where it is native
+    // (Windows) the same rule runs in the native pass (step 5) — see
+    // `a_native_backend_verdict_names_the_override_that_caused_it`.
+    assert!(err.to_string().contains("backend-specific.scm"), "{err}");
 }
 
 #[skuld::test]
