@@ -104,6 +104,8 @@ enum Slot {
     Daemons,
     DaemonId,
     Daemon,
+    BackendSpecific,
+    Override,
     Field,
     Key,
     Env,
@@ -130,6 +132,12 @@ impl Slot {
             Slot::Daemons => "an explicit `null` is not a set of daemons; write at least one `<id>:` entry under it",
             Slot::DaemonId => "an explicit `null` is not a daemon id; quote the key to use its literal text",
             Slot::Daemon => "an explicit `null` is not a daemon; give it at least a `command:`",
+            Slot::BackendSpecific => {
+                "an explicit `null` is not a set of backend overrides; write at least one `<backend>:` entry under it"
+            }
+            Slot::Override => {
+                "an explicit `null` is not a backend override; give it at least one field to override"
+            }
             Slot::Field => "an explicit `null` is not a way to unset this field; omit the key instead",
             Slot::Key => "an explicit `null` is not a field name; quote the key to use its literal text",
             Slot::Env => {
@@ -156,9 +164,11 @@ impl Slot {
         match (self, key) {
             (Slot::Document, "daemons") => Slot::Daemons,
             (Slot::Daemons, _) => Slot::Daemon,
-            (Slot::Daemon, "env") => Slot::Env,
-            (Slot::Daemon, "command") => Slot::Command,
-            (Slot::Daemon, "user") => Slot::User,
+            (Slot::Daemon, "backend-specific") => Slot::BackendSpecific,
+            (Slot::BackendSpecific, _) => Slot::Override,
+            (Slot::Daemon | Slot::Override, "env") => Slot::Env,
+            (Slot::Daemon | Slot::Override, "command") => Slot::Command,
+            (Slot::Daemon | Slot::Override, "user") => Slot::User,
             (Slot::Env, _) => Slot::EnvValue,
             (Slot::User, "name") => Slot::UserName,
             (Slot::User, "id") => Slot::UserId,

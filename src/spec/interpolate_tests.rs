@@ -270,7 +270,10 @@ daemons:
 
     let spec = &raw.daemons["frpc"];
     assert_eq!(spec.name.as_deref(), Some("Frpc Tunnel"));
-    assert_eq!(spec.command, vec!["/usr/bin/frpc", "--flag=on"]);
+    assert_eq!(
+        spec.command.as_deref(),
+        Some(&["/usr/bin/frpc".to_string(), "--flag=on".to_string()][..])
+    );
     assert_eq!(spec.cwd.as_deref(), Some("/opt/frpc"));
     assert_eq!(spec.logs.as_deref(), Some("/var/log/frpc.log"));
     assert_eq!(spec.env["LOG"], "info");

@@ -138,8 +138,8 @@ fn resolve_one(id: Id, raw: RawSpec, base_dir: &Path, warnings: &mut Vec<Warning
     let name = raw.name.unwrap_or_else(|| id.as_str().to_string());
     reject_unemittable(&id, "name", &name)?;
 
-    reject_empty_command(&id, &raw.command)?;
-    let mut command = raw.command;
+    reject_empty_command(&id, raw.command.as_deref().unwrap_or_default())?;
+    let mut command = raw.command.unwrap_or_default();
     for arg in &command {
         reject_unemittable(&id, "command", arg)?;
     }

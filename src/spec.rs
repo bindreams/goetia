@@ -10,12 +10,14 @@
 mod backend;
 mod interpolate;
 mod no_null;
+mod overrides;
 mod raw;
 mod resolve;
 mod user;
 mod vars;
 
 pub use backend::Backend;
+pub use overrides::{BackendOverrides, RawOverride};
 pub use raw::{RawManifest, RawSpec};
 pub use resolve::{load, resolve};
 pub use user::{AccountId, RawUser, User};

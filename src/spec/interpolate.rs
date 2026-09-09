@@ -269,10 +269,17 @@ pub(crate) fn spec(raw: &mut RawSpec, path: &str, vars: &Vars) -> Result<()> {
         restart_delay,
         logs,
         kind,
+        // Task 5 turns this into `debug_assert!(backend_specific.is_empty(), …)`
+        // once `merged_for` is the only thing that feeds `spec`/`spec_would_change`.
+        // Writing that assert now would panic in every debug build until
+        // then: `resolve` still calls this on the *unmerged* manifest, and
+        // a manifest carrying a `backend-specific:` block is exactly what
+        // this task adds the ability to write.
+        backend_specific: _,
     } = raw;
 
     substitute_option(name, &format!("{path}.name"), vars)?;
-    for (index, arg) in command.iter_mut().enumerate() {
+    for (index, arg) in command.iter_mut().flatten().enumerate() {
         *arg = scalar(arg, &format!("{path}.command[{index}]"), vars)?;
     }
     substitute_option(cwd, &format!("{path}.cwd"), vars)?;
@@ -327,12 +334,14 @@ fn spec_would_change(raw: &RawSpec) -> bool {
         restart_delay,
         logs,
         kind,
+        // See the matching arm in `spec` above for why this is `_` here.
+        backend_specific: _,
     } = raw;
 
     [name, cwd, logs, restart, restart_delay, kind]
         .iter()
         .any(|field| field.as_deref().is_some_and(would_substitution_change))
-        || command.iter().any(|arg| would_substitution_change(arg))
+        || command.iter().flatten().any(|arg| would_substitution_change(arg))
         || env.values().any(|value| would_substitution_change(value))
         || user_would_change(user)
 }

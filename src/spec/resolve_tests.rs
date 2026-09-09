@@ -997,7 +997,10 @@ fn an_interpolated_value_cannot_create_a_daemon_or_a_field() {
     interpolate::manifest(&mut raw, &Vars::from_pairs(&[("EVIL", evil)])).expect("substitution should succeed");
 
     assert_eq!(raw.daemons.len(), 1);
-    assert_eq!(raw.daemons["frpc"].command, vec!["/bin/frpc"]);
+    assert_eq!(
+        raw.daemons["frpc"].command.as_deref(),
+        Some(&["/bin/frpc".to_string()][..])
+    );
     assert_eq!(raw.daemons["frpc"].name.as_deref(), Some(evil));
 
     // `resolve` substitutes again, which is a no-op on this fixture: `evil`
