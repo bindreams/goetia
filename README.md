@@ -338,7 +338,12 @@ daemons:
       launchd:
         user: frpc
       scm:
-        command: ['C:\Program Files\frpc\frpc.exe', -c, 'C:\ProgramData\frpc\frpc.toml']
+        command:
+          [
+            'C:\Program Files\frpc\frpc.exe',
+            -c,
+            'C:\ProgramData\frpc\frpc.toml',
+          ]
         cwd: 'C:\ProgramData\frpc'
         user: 'NT AUTHORITY\LocalService'
         env:

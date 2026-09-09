@@ -1248,7 +1248,10 @@ fn a_templated_user_is_judged_under_the_native_backend_and_nowhere_else() {
         let err = resolve_as(parse_manifest(yaml), dir.path(), Some(native)).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("Windows built-in"), "native `{native}`: {msg}");
-        assert!(msg.contains(&format!("backend-specific.{native}")), "native `{native}`: {msg}");
+        assert!(
+            msg.contains(&format!("backend-specific.{native}")),
+            "native `{native}`: {msg}"
+        );
     }
 
     // The other direction, and the one the doc used to get backwards: with

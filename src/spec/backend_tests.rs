@@ -217,7 +217,11 @@ fn every_nt_authority_spelling_is_recognised() {
         // Case-insensitive, and qualified: unlike the bare `system`
         // carve-out, every one of these can only ever name a Windows
         // account.
-        assert_eq!(windows_builtin(&name.to_ascii_lowercase()), Some(builtin), "`{name}` lowercased");
+        assert_eq!(
+            windows_builtin(&name.to_ascii_lowercase()),
+            Some(builtin),
+            "`{name}` lowercased"
+        );
         assert_eq!(windows_only_account(name), Some(builtin), "`{name}` is Windows-only");
     }
 }
