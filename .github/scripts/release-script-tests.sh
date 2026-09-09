@@ -8,6 +8,7 @@ assert_archives="${script_dir}/assert-archives.sh"
 assert_package_list="${script_dir}/assert-package-list.sh"
 assert_asset_count="${script_dir}/assert-asset-count.sh"
 assert_test_binaries="${script_dir}/assert-test-binaries.sh"
+verify_sigstore="${script_dir}/verify-sigstore-bundle.sh"
 failures=0
 
 # Asserts BOTH stdout and exit status. Checking stdout alone would pass a
@@ -69,7 +70,8 @@ archive_root="$(mktemp -d)"
 pkg_list_root="$(mktemp -d)"
 asset_count_root="$(mktemp -d)"
 test_binaries_root="$(mktemp -d)"
-trap 'rm -rf "$stub_dir" "$archive_root" "$pkg_list_root" "$asset_count_root" "$test_binaries_root"' EXIT
+sigstore_root="$(mktemp -d)"
+trap 'rm -rf "$stub_dir" "$archive_root" "$pkg_list_root" "$asset_count_root" "$test_binaries_root" "$sigstore_root"' EXIT
 
 make_git_stub() {
     local exit_code="$1" expected_ref="$2"
@@ -771,6 +773,167 @@ if bash "$assert_asset_count" >/dev/null 2>&1; then
 else
     echo "ok   - rejects being called with no arguments at all"
 fi
+
+# verify-sigstore-bundle.sh --------------------------------------------------
+#
+# Driven against a stub `sigstore`, passed via `SIGSTORE_BIN`, that records
+# every invocation and can be told to fail for a chosen archive. The pins the real command is given are
+# the whole point of this script, so the tests assert the recorded argv, not
+# just the exit status: a verification that dropped `--sha` still exits 0 on
+# a bundle from a different commit.
+
+sigstore_invocations="${sigstore_root}/invocations"
+
+# make_sigstore_stub [failing-archive-basename]
+make_sigstore_stub() {
+    local failing="${1-}"
+    cat > "${stub_dir}/sigstore" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "${sigstore_invocations}"
+subject="\${*: -1}"
+if [[ -n "${failing}" && "\$(basename "\$subject")" == "${failing}" ]]; then
+    echo "sigstore: verification failed" >&2
+    exit 1
+fi
+exit 0
+EOF
+    chmod +x "${stub_dir}/sigstore"
+    : > "$sigstore_invocations"
+}
+
+bundle="${sigstore_root}/goetia.sigstore.json"
+: > "$bundle"
+sig_sha="0123456789abcdef0123456789abcdef01234567"
+sig_archives=()
+for target in linux macos windows; do
+    f="${sigstore_root}/goetia-${target}.tar.xz"
+    : > "$f"
+    sig_archives+=("$f")
+done
+
+# run_verify_sigstore <failing-archive-basename> <arg>... — runs the script
+# under the stub and leaves its exit status in $sigstore_status and its
+# output in $sigstore_output.
+run_verify_sigstore() {
+    local failing="$1"
+    shift
+    make_sigstore_stub "$failing"
+    sigstore_status=0
+    sigstore_output="$(SIGSTORE_BIN="${stub_dir}/sigstore" bash "$verify_sigstore" "$@" 2>&1)" || sigstore_status=$?
+}
+
+assert_verify_sigstore_ok() {
+    local description="$1"
+    shift
+    run_verify_sigstore "" "$@"
+    if [[ "$sigstore_status" -eq 0 ]]; then
+        echo "ok   - ${description}"
+    else
+        echo "FAIL - ${description} (expected success, got status ${sigstore_status}: ${sigstore_output})"
+        failures=$((failures + 1))
+    fi
+}
+
+assert_verify_sigstore_rejects_matching() {
+    local description="$1" failing="$2" message="$3"
+    shift 3
+    run_verify_sigstore "$failing" "$@"
+    if [[ "$sigstore_status" -eq 0 ]]; then
+        echo "FAIL - ${description} (expected rejection, got success)"
+        failures=$((failures + 1))
+    elif [[ "$sigstore_output" == *"$message"* ]]; then
+        echo "ok   - ${description}"
+    else
+        echo "FAIL - ${description} (expected message containing '${message}', got: ${sigstore_output})"
+        failures=$((failures + 1))
+    fi
+}
+
+assert_verify_sigstore_ok "accepts a bundle that verifies against every archive" \
+    "$bundle" "$sig_sha" "${sig_archives[@]}"
+
+# Every pin the release's integrity rests on, asserted individually. `--sha`
+# is the only one of them that is commit-specific: without it, a bundle and
+# archive set lifted wholesale from a previous release satisfies all the
+# others and verifies green.
+sigstore_first_invocation="$(head -1 "$sigstore_invocations")"
+for pin in \
+    "--bundle ${bundle}" \
+    "--cert-identity https://github.com/bindreams/goetia/.github/workflows/draft-release.yaml@refs/heads/main" \
+    "--repository bindreams/goetia" \
+    "--ref refs/heads/main" \
+    "--name Draft Release" \
+    "--trigger workflow_dispatch" \
+    "--sha ${sig_sha}"; do
+    if [[ "$sigstore_first_invocation" == *"$pin"* ]]; then
+        echo "ok   - pins '${pin%% *} ${pin#* }'"
+    else
+        echo "FAIL - pins '${pin}' (invoked as: ${sigstore_first_invocation})"
+        failures=$((failures + 1))
+    fi
+done
+
+if [[ "$sigstore_first_invocation" == "verify github "* ]]; then
+    echo "ok   - calls the github verification subcommand"
+else
+    echo "FAIL - calls the github verification subcommand (invoked as: ${sigstore_first_invocation})"
+    failures=$((failures + 1))
+fi
+
+# A bundle verifies against one input at a time, so this is a loop — and a
+# loop that stops early, or that lets a later success reset an earlier
+# failure, is exactly the bug this coverage exists to catch.
+invocation_count="$(wc -l < "$sigstore_invocations")"
+if [[ "$invocation_count" -eq "${#sig_archives[@]}" ]]; then
+    echo "ok   - verifies every archive it is given"
+else
+    echo "FAIL - verifies every archive it is given (expected ${#sig_archives[@]} invocations, got ${invocation_count})"
+    failures=$((failures + 1))
+fi
+
+assert_verify_sigstore_rejects_matching "refuses when the first archive fails to verify" \
+    "goetia-linux.tar.xz" "goetia-linux.tar.xz" \
+    "$bundle" "$sig_sha" "${sig_archives[@]}"
+
+invocation_count="$(wc -l < "$sigstore_invocations")"
+if [[ "$invocation_count" -eq "${#sig_archives[@]}" ]]; then
+    echo "ok   - keeps checking the remaining archives after a failure"
+else
+    echo "FAIL - keeps checking the remaining archives after a failure (expected ${#sig_archives[@]} invocations, got ${invocation_count})"
+    failures=$((failures + 1))
+fi
+
+assert_verify_sigstore_rejects_matching "refuses when the last archive fails to verify" \
+    "goetia-windows.tar.xz" "goetia-windows.tar.xz" \
+    "$bundle" "$sig_sha" "${sig_archives[@]}"
+
+# Zero archives is the vacuous-guard shape: a loop over an empty nullglob
+# expansion exits 0 having verified nothing.
+assert_verify_sigstore_rejects_matching "refuses to verify zero archives" "" "usage" \
+    "$bundle" "$sig_sha"
+
+assert_verify_sigstore_rejects_matching "refuses a bundle file that does not exist" "" "bundle not found" \
+    "${sigstore_root}/absent.sigstore.json" "$sig_sha" "${sig_archives[@]}"
+
+assert_verify_sigstore_rejects_matching "refuses an archive that does not exist" "" "archive not found" \
+    "$bundle" "$sig_sha" "${sigstore_root}/absent.tar.xz"
+
+# An empty or short SHA would be interpolated into `--sha` unnoticed and
+# pin nothing.
+assert_verify_sigstore_rejects_matching "refuses a commit that is not a 40-character SHA" "" "40-character" \
+    "$bundle" "main" "${sig_archives[@]}"
+
+assert_verify_sigstore_rejects_matching "refuses an empty commit SHA" "" "40-character" \
+    "$bundle" "" "${sig_archives[@]}"
+
+if bash "$verify_sigstore" >/dev/null 2>&1; then
+    echo "FAIL - rejects being called with no arguments at all (expected rejection, got success)"
+    failures=$((failures + 1))
+else
+    echo "ok   - rejects being called with no arguments at all"
+fi
+
+rm -f "${stub_dir}/sigstore"
 
 # assert-test-binaries.sh -----------------------------------------------------
 #

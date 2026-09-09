@@ -195,50 +195,22 @@ jobs:
         # renovate: datasource=pypi depName=sigstore
         run: uv tool install sigstore==4.5.0
 
-      # Re-verifies the same bundle Draft Release attested, so the
-      # cert-identity parameters describe THAT workflow, not this one. A
-      # Sigstore bundle verifies against exactly one input at a time
-      # (`--bundle` with multiple file arguments exits non-zero with
-      # "--certificate, --signature, or --bundle can only be used with a
-      # single input file or digest"), so this is a loop, not one command.
-      # Decided by exit status, not output: on success `sigstore` writes
-      # `OK: <file>` to stderr and the in-toto statement to stdout, so
-      # grepping stdout for OK would never match and the step would pass
-      # vacuously.
-      #
-      # The glob is collected into an array and its length asserted before
-      # the loop: `nullglob` + zero matches means zero iterations, and a
-      # `for` loop that never runs exits 0 having verified nothing — the
-      # same vacuous-guard shape `assert-archives.sh 0` was fixed for. The
-      # archive-set assertion above already guards this in practice, but
-      # this step must not rely on step order elsewhere in the job to stay
-      # non-vacuous.
+      # The same script Draft Release runs, so the two can never drift, and
+      # the pins it applies describe the workflow that MINTED the bundle
+      # (Draft Release), not this one. `$SHA` is the draft's own commit: it
+      # is what makes this check version-specific, and without it a whole
+      # archive set plus bundle taken from a previous release satisfies
+      # every other pin — the swap this step exists to catch.
       - name: Verify the attestation bundle
         working-directory: ${{ runner.temp }}/source
+        env:
+          SHA: ${{ steps.release.outputs.sha }}
         shell: bash
         run: |
           set -euo pipefail
           shopt -s nullglob
-          archives=(goetia-*.tar.xz goetia-*.zip)
-          if [[ "${#archives[@]}" -eq 0 ]]; then
-            echo "::error::no archives found to verify; the sigstore verification loop would run zero iterations and report success" >&2
-            exit 1
-          fi
-          status=0
-          for archive in "${archives[@]}"; do
-            if ! sigstore verify github \
-              --bundle goetia.sigstore.json \
-              --cert-identity https://github.com/bindreams/goetia/.github/workflows/draft-release.yaml@refs/heads/main \
-              --repository bindreams/goetia \
-              --ref refs/heads/main \
-              --name "Draft Release" \
-              --trigger workflow_dispatch \
-              "$archive"; then
-              echo "::error::sigstore verification failed for ${archive}" >&2
-              status=1
-            fi
-          done
-          exit "$status"
+          "${GITHUB_WORKSPACE}/.github/scripts/verify-sigstore-bundle.sh" \
+            goetia.sigstore.json "$SHA" goetia-*.tar.xz goetia-*.zip
 
       # This is what makes the crates.io publish below idempotent, which is
       # what makes this whole job re-runnable. A second `cargo publish` of an
