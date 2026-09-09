@@ -10,7 +10,7 @@ use goetia::backend::scm::manager::ScmManager;
 use goetia::decide::Outcome;
 use goetia::manager::conformance;
 use goetia::manager::{Installed, ServiceManager as _, State};
-use goetia::spec::{DaemonSpec, Id, Restart, User};
+use goetia::spec::{AccountId, DaemonSpec, Id, Restart, User};
 use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use winreg::RegKey;
@@ -448,6 +448,173 @@ fn real_account_gets_service_logon_right() {
     let target = id_of(&id);
     mgr.start(&target).unwrap_or_else(|e| {
         panic!("service under a real account failed to start (SeServiceLogonRight likely not granted): {e}")
+    });
+    let status = mgr.status(&target).expect("status");
+    assert_eq!(status.state, State::Running);
+    let _ = mgr.stop(&target);
+}
+
+// Step 8: built-in service accounts install and run without a password or a logon-right grant =========================
+
+/// `S-1-5-19` is `LocalService`'s well-known SID. `LookupAccountSidW` on an
+/// English runner resolves it to `NT AUTHORITY\LOCAL SERVICE` — a space,
+/// not the `LocalService` an author writes — so this passes both with and
+/// without `windows_builtin`'s space-folding. Its real value is as a
+/// regression marker for a *localised* host, where the name lookup would
+/// return something in another language the fold cannot match at all: do
+/// not delete this as redundant with `local_service_account_installs_and_
+/// round_trips` below, which never goes through `LookupAccountSidW` at
+/// all.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_well_known_sid_resolves_without_a_name_lookup() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = common::mk_spec_as(
+        &id,
+        fixture_command(&id, 1, 1, "plain"),
+        BTreeMap::new(),
+        User::Id(AccountId::Sid("S-1-5-19".to_string())),
+    );
+
+    let outcome = mgr
+        .install(&spec, false)
+        .expect("a well-known SID resolving to a built-in account must not need a password");
+    assert!(matches!(outcome, Outcome::Create), "{outcome:?}");
+    assert_eq!(
+        common::query_account_name(&id).as_deref(),
+        Some(r"NT AUTHORITY\LocalService"),
+        "SCM must store the canonical spelling, not whatever LookupAccountSidW happened to return"
+    );
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn local_service_account_installs_and_round_trips() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = common::mk_spec_as(
+        &id,
+        fixture_command(&id, 1, 1, "plain"),
+        BTreeMap::new(),
+        User::Name("LocalService".to_string()),
+    );
+
+    let outcome = mgr
+        .install(&spec, false)
+        .expect("installing as LocalService must not require GOETIA_SERVICE_PASSWORD");
+    assert!(matches!(outcome, Outcome::Create), "{outcome:?}");
+    assert_eq!(
+        common::query_account_name(&id).as_deref(),
+        Some(r"NT AUTHORITY\LocalService")
+    );
+
+    // The real proof: a second, unchanged install must see no drift at
+    // all — if SCM had stored a different spelling than it was given, this
+    // would be a permanent phantom diff on every future install of this id.
+    let second = mgr.install(&spec, false).expect("reinstall, unchanged spec");
+    assert!(matches!(second, Outcome::UpToDate), "{second:?}");
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_local_service_daemon_actually_runs() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    // Held past the `install`/`start`/`stop` calls below and dropped (which
+    // deletes the copy) only once nothing further needs to launch it.
+    let exe = common::WorldReadableExe::new(&id);
+    let started = ConnectBack::listen();
+    let stopped = ConnectBack::listen();
+    let spec = common::mk_spec_as(
+        &id,
+        common::fixture_command_with_exe(&exe.path_str(), &id, started.port(), stopped.port(), "plain"),
+        BTreeMap::new(),
+        User::Name("LocalService".to_string()),
+    );
+
+    mgr.install(&spec, false).expect("install as LocalService");
+    // The real claim this feature makes: not just that the account string
+    // is syntactically acceptable to `CreateServiceW` (`install` already
+    // proves that), but that it is an identity Windows can actually launch
+    // a process under.
+    mgr.start(&spec.id).expect("start as LocalService");
+    started.accept("the fixture to report SERVICE_RUNNING under LocalService");
+    let status = mgr.status(&spec.id).expect("status while running");
+    assert_eq!(status.state, State::Running);
+
+    mgr.stop(&spec.id).expect("stop");
+    stopped.accept("the fixture to handle SERVICE_CONTROL_STOP under LocalService");
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn local_system_by_name_installs_like_root() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let by_name = common::mk_spec_as(
+        &id,
+        fixture_command(&id, 1, 1, "plain"),
+        BTreeMap::new(),
+        User::Name("LocalSystem".to_string()),
+    );
+    let outcome = mgr.install(&by_name, false).expect("install as LocalSystem by name");
+    assert!(matches!(outcome, Outcome::Create), "{outcome:?}");
+
+    // Not an equality check on the whole `ScmRegistration`: `generate::
+    // registration` embeds the whole spec in the registration's parameters
+    // (`FIELD_SPEC`, `src/backend/scm/generate.rs:199`), and `spec.user` is
+    // `User::Name("LocalSystem")` here but `User::Root` for the comparison
+    // install below (`src/spec.rs:104-115`), so the two blobs always
+    // differ. What must agree is the live account SCM reports — the same
+    // account `User::Root` produces.
+    let root_id = support::random_test_id();
+    let _root_guard = ServiceGuard::new(&root_id);
+    let by_root = mk_spec(&root_id, fixture_command(&root_id, 1, 1, "plain"), BTreeMap::new());
+    mgr.install(&by_root, false).expect("install as User::Root");
+
+    let by_name_account = common::query_account_name(&id);
+    let by_root_account = common::query_account_name(&root_id);
+    assert!(
+        by_name_account.is_some(),
+        "a LocalSystem service always reports *some* spelling of its account, never nothing"
+    );
+    assert_eq!(
+        by_name_account, by_root_account,
+        "user: {{name: LocalSystem}} must read back identically to user: root"
+    );
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_builtin_account_is_never_given_a_stale_password() {
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+
+    // `GOETIA_SERVICE_PASSWORD` is scoped to this one child process — see
+    // `install_helper.rs`'s module doc comment for why that matters.
+    // Windows rejects a real password for a built-in account outright, so
+    // a *successful start* afterwards is the only observable proof this
+    // value never reached `CreateServiceW`: `install` succeeding alone
+    // would not distinguish "never read" from "read, and happened not to
+    // be rejected".
+    let output = Command::new(support::current_exe_str())
+        .arg(INSTALL_AS)
+        .arg(&id)
+        .arg("LocalService")
+        .env("GOETIA_SERVICE_PASSWORD", "not-a-real-password")
+        .output()
+        .expect("spawn the install-as-account helper");
+    assert!(
+        output.status.success(),
+        "install as LocalService with a stale password set failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mgr = ScmManager::new();
+    let target = id_of(&id);
+    mgr.start(&target).unwrap_or_else(|e| {
+        panic!("service under LocalService failed to start (a stale password likely reached CreateServiceW): {e}")
     });
     let status = mgr.status(&target).expect("status");
     assert_eq!(status.state, State::Running);
