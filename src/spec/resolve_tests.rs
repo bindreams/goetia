@@ -1229,6 +1229,23 @@ fn resolve_yaml_as(native: Backend, yaml: &str) -> Result<(Vec<DaemonSpec>, Vec<
 }
 
 #[skuld::test]
+fn a_value_that_only_substitution_made_invalid_says_so() {
+    // The other half of step 5's annotation, and the half whose premise
+    // does hold: step 4 shape-checked this same merged spec and passed, so
+    // substitution is provably what changed. Pinned here because the
+    // verdict path no longer carries this prefix, and nothing else would
+    // notice if it stopped carrying it altogether.
+    let dir = fixture_dir(
+        "daemons:\n  frpc:\n    command: [/bin/frpc]\n    name: ${N}\n",
+        Some("N=frpc\\\n"),
+    );
+    let err = load(&dir.path().join("goetia.yaml")).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("after substituting from .env"), "{msg}");
+    assert!(msg.contains("backslash"), "{msg}");
+}
+
+#[skuld::test]
 fn a_templated_user_is_judged_under_the_native_backend_and_nowhere_else() {
     // `spec::backend`'s module doc, made executable. Substitution runs for
     // the native backend only, so `${ACCT}` is unresolvable — and therefore
