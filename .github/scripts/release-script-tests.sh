@@ -1229,6 +1229,9 @@ assert_crates_rejects_matching "refuses a response with no checksum" 0 200 \
 assert_crates_rejects_matching "refuses an unexpected HTTP status" 0 500 '{}' \
     "Unexpected HTTP 500"
 
+assert_crates_rejects_matching "refuses a 200 whose body is not JSON" 0 200 'gateway timeout' \
+    "not valid JSON"
+
 assert_crates_rejects_matching "refuses when the API call itself fails" 7 200 '{}' \
     "crates.io API request failed"
 

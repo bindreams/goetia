@@ -69,7 +69,10 @@ case "$code" in
         echo "already_published=false"
         ;;
     200)
-        yanked="$(jq -r '.version.yanked' <<<"$body")"
+        if ! yanked="$(jq -r '.version.yanked' <<<"$body" 2>/dev/null)"; then
+            echo "::error::crates.io answered 200 for ${version} but its body is not valid JSON; cannot tell what is published." >&2
+            exit 1
+        fi
         case "$yanked" in
             true)
                 echo "::error::Version ${version} exists on crates.io but is YANKED. This pipeline never yanks, so this was not its own prior run — investigate by hand before re-dispatching." >&2
