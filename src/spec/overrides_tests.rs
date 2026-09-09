@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use super::RawOverride;
+use super::{RawOverride, Supplied};
 use crate::spec::{Backend, RawManifest, RawUser};
 
 fn parse(yaml: &str) -> Result<RawManifest, serde_yaml_ng::Error> {
@@ -354,4 +354,194 @@ fn raw_override_default_is_empty() {
     assert_eq!(ovr.name, None);
     assert_eq!(ovr.command, None);
     assert_eq!(ovr.env, None);
+}
+
+// Merge ===============================================================================================================
+
+#[skuld::test]
+fn merge_replaces_scalar_fields() {
+    let yaml = "
+daemons:
+  frpc:
+    name: base-name
+    command: [/bin/frpc]
+    user: base-user
+    backend-specific:
+      scm:
+        name: scm-name
+        user: scm-user
+";
+    let manifest = parse(yaml).expect("valid manifest should parse");
+    let spec = &manifest.daemons["frpc"];
+    let (merged, _supplied) = spec.merged_for(Backend::Scm);
+    assert_eq!(merged.name.as_deref(), Some("scm-name"));
+    assert_eq!(merged.user, Some(RawUser::Scalar("scm-user".to_string())));
+}
+
+#[skuld::test]
+fn merge_replaces_the_whole_command_vector() {
+    let yaml = "
+daemons:
+  frpc:
+    command: [/bin/frpc, --base]
+    backend-specific:
+      scm:
+        command: [/bin/frpc-scm]
+";
+    let manifest = parse(yaml).expect("valid manifest should parse");
+    let spec = &manifest.daemons["frpc"];
+    let (merged, _supplied) = spec.merged_for(Backend::Scm);
+    assert_eq!(merged.command.as_deref(), Some(&["/bin/frpc-scm".to_string()][..]));
+}
+
+#[skuld::test]
+fn merge_unions_env_with_the_override_winning() {
+    let yaml = "
+daemons:
+  frpc:
+    command: [/bin/frpc]
+    env:
+      A: \"1\"
+      B: \"2\"
+    backend-specific:
+      scm:
+        env:
+          B: \"3\"
+          C: \"4\"
+";
+    let manifest = parse(yaml).expect("valid manifest should parse");
+    let spec = &manifest.daemons["frpc"];
+    let (merged, _supplied) = spec.merged_for(Backend::Scm);
+    let expected: BTreeMap<String, String> = [("A", "1"), ("B", "3"), ("C", "4")]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    assert_eq!(merged.env, expected);
+}
+
+#[skuld::test]
+fn merge_leaves_fields_the_override_does_not_mention() {
+    let yaml = "
+daemons:
+  frpc:
+    command: [/bin/frpc]
+    cwd: /opt/frpc
+    backend-specific:
+      scm:
+        user: svc-frpc
+";
+    let manifest = parse(yaml).expect("valid manifest should parse");
+    let spec = &manifest.daemons["frpc"];
+    let (merged, _supplied) = spec.merged_for(Backend::Scm);
+    assert_eq!(merged.cwd.as_deref(), Some("/opt/frpc"));
+}
+
+#[skuld::test]
+fn merge_of_a_backend_with_no_override_returns_the_base() {
+    let yaml = "
+daemons:
+  frpc:
+    command: [/bin/frpc]
+    backend-specific:
+      scm:
+        user: svc-frpc
+";
+    let manifest = parse(yaml).expect("valid manifest should parse");
+    let spec = &manifest.daemons["frpc"];
+    let (merged, supplied) = spec.merged_for(Backend::Systemd);
+    assert_eq!(merged, spec.without_overrides());
+    assert_eq!(supplied, Supplied::NONE);
+}
+
+#[skuld::test]
+fn a_merged_spec_carries_no_overrides() {
+    let yaml = "
+daemons:
+  frpc:
+    command: [/bin/frpc]
+    backend-specific:
+      scm:
+        user: svc-frpc
+";
+    let manifest = parse(yaml).expect("valid manifest should parse");
+    let spec = &manifest.daemons["frpc"];
+    let (merged, _supplied) = spec.merged_for(Backend::Scm);
+    assert!(merged.backend_specific.is_empty());
+    assert!(spec.without_overrides().backend_specific.is_empty());
+}
+
+#[skuld::test]
+fn supplied_names_exactly_the_fields_the_override_wrote() {
+    let yaml = "
+daemons:
+  frpc:
+    name: base-name
+    command: [/bin/frpc]
+    cwd: /opt/frpc
+    env:
+      A: \"1\"
+    logs: /var/log/frpc.log
+    type: simple
+    backend-specific:
+      scm:
+        user: svc-frpc
+        restart: always
+";
+    let manifest = parse(yaml).expect("valid manifest should parse");
+    let spec = &manifest.daemons["frpc"];
+    let (_merged, supplied) = spec.merged_for(Backend::Scm);
+    assert_eq!(
+        supplied,
+        Supplied {
+            user: true,
+            restart: true,
+            ..Supplied::NONE
+        }
+    );
+}
+
+// The direct guard on the defect `Supplied` exists to prevent: without it,
+// every field of this base spec — including `user: {id: 1000}`, the
+// published-interface example from `README.md` — would be handed to
+// `Backend::Systemd.error` as if `systemd:` had written it.
+#[skuld::test]
+fn supplied_is_none_for_a_backend_with_no_block() {
+    let yaml = "
+daemons:
+  frpc:
+    name: base-name
+    command: [/bin/frpc]
+    cwd: /opt/frpc
+    env:
+      A: \"1\"
+    user:
+      id: 1000
+    restart: always
+    restart-delay: 2s
+    logs: /var/log/frpc.log
+    type: simple
+    backend-specific:
+      scm:
+        user: svc-frpc
+";
+    let manifest = parse(yaml).expect("valid manifest should parse");
+    let spec = &manifest.daemons["frpc"];
+    let (_merged, supplied) = spec.merged_for(Backend::Systemd);
+    assert_eq!(supplied, Supplied::NONE);
+}
+
+#[skuld::test]
+fn an_empty_env_block_counts_as_supplied() {
+    let yaml = "
+daemons:
+  frpc:
+    command: [/bin/frpc]
+    backend-specific:
+      scm:
+        env: {}
+";
+    let manifest = parse(yaml).expect("valid manifest should parse");
+    let spec = &manifest.daemons["frpc"];
+    let (_merged, supplied) = spec.merged_for(Backend::Scm);
+    assert!(supplied.env);
 }

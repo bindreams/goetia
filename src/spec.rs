@@ -17,7 +17,7 @@ mod user;
 mod vars;
 
 pub use backend::Backend;
-pub use overrides::{BackendOverrides, RawOverride};
+pub use overrides::{BackendOverrides, RawOverride, Supplied};
 pub use raw::{RawManifest, RawSpec};
 pub use resolve::{load, resolve};
 pub use user::{AccountId, RawUser, User};

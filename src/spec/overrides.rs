@@ -14,6 +14,7 @@ use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 use super::Backend;
+use super::raw::RawSpec;
 use super::user::RawUser;
 
 pub type BackendOverrides = BTreeMap<Backend, RawOverride>;
@@ -43,6 +44,111 @@ pub struct RawOverride {
     pub logs: Option<String>,
     #[serde(rename = "type", default)]
     pub kind: Option<String>,
+}
+
+/// Which of the nine fields a backend's override actually supplied.
+/// Provenance the merged spec cannot carry: after the merge a `restart`
+/// value is just a value, and `Backend::error` must not reject a base
+/// value for a backend the author never wrote a line for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Supplied {
+    pub name: bool,
+    pub command: bool,
+    pub cwd: bool,
+    pub env: bool,
+    pub user: bool,
+    pub restart: bool,
+    pub restart_delay: bool,
+    pub logs: bool,
+    pub kind: bool,
+}
+
+impl Supplied {
+    /// No override at all: every field is a base value.
+    pub const NONE: Supplied = Supplied {
+        name: false,
+        command: false,
+        cwd: false,
+        env: false,
+        user: false,
+        restart: false,
+        restart_delay: false,
+        logs: false,
+        kind: false,
+    };
+}
+
+impl RawOverride {
+    /// Which of the nine fields this override sets. One `is_some()` per
+    /// field, and `env` counts as supplied when the key is present even
+    /// if the map it holds is empty — an empty `env:` under a backend is
+    /// still something the author wrote.
+    pub fn supplied(&self) -> Supplied {
+        Supplied {
+            name: self.name.is_some(),
+            command: self.command.is_some(),
+            cwd: self.cwd.is_some(),
+            env: self.env.is_some(),
+            user: self.user.is_some(),
+            restart: self.restart.is_some(),
+            restart_delay: self.restart_delay.is_some(),
+            logs: self.logs.is_some(),
+            kind: self.kind.is_some(),
+        }
+    }
+}
+
+impl RawSpec {
+    /// `self` with `backend`'s override applied and no overrides left,
+    /// plus which fields that override supplied.
+    ///
+    /// A scalar/vector field wholesale-replaces when the override sets it;
+    /// `env` unions instead, the override winning per key. On a backend
+    /// with no override entry this is exactly `self.without_overrides()`,
+    /// paired with `Supplied::NONE` — see the module-level guard this
+    /// exists to hold: a per-backend rejection may only ever be applied to
+    /// a field the returned `Supplied` marks `true`.
+    pub fn merged_for(&self, backend: Backend) -> (RawSpec, Supplied) {
+        let Some(ovr) = self.backend_specific.get(&backend) else {
+            return (self.without_overrides(), Supplied::NONE);
+        };
+
+        let mut env = self.env.clone();
+        if let Some(ovr_env) = &ovr.env {
+            env.extend(ovr_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+
+        let merged = RawSpec {
+            name: ovr.name.clone().or_else(|| self.name.clone()),
+            command: ovr.command.clone().or_else(|| self.command.clone()),
+            cwd: ovr.cwd.clone().or_else(|| self.cwd.clone()),
+            env,
+            user: ovr.user.clone().or_else(|| self.user.clone()),
+            restart: ovr.restart.clone().or_else(|| self.restart.clone()),
+            restart_delay: ovr.restart_delay.clone().or_else(|| self.restart_delay.clone()),
+            logs: ovr.logs.clone().or_else(|| self.logs.clone()),
+            kind: ovr.kind.clone().or_else(|| self.kind.clone()),
+            backend_specific: BackendOverrides::new(),
+        };
+
+        (merged, ovr.supplied())
+    }
+
+    /// `self` with every override stripped and nothing else changed.
+    pub fn without_overrides(&self) -> RawSpec {
+        RawSpec {
+            name: self.name.clone(),
+            command: self.command.clone(),
+            cwd: self.cwd.clone(),
+            env: self.env.clone(),
+            user: self.user.clone(),
+            restart: self.restart.clone(),
+            restart_delay: self.restart_delay.clone(),
+            logs: self.logs.clone(),
+            kind: self.kind.clone(),
+            backend_specific: BackendOverrides::new(),
+        }
+    }
 }
 
 /// `RawSpec::backend_specific`: a hand-written `Visitor` over `MapAccess`,
