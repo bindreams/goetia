@@ -138,11 +138,10 @@ jobs:
       # The ancestry check above is not sufficient on its own: it is
       # satisfied by dispatching from any branch or tag whose head is
       # already merged (a stale release branch, a maintenance tag,
-      # anything). The OIDC certificate minted in Task 5 carries
-      # `github.ref` verbatim, while other tasks in this plan publish
-      # `refs/heads/main` to `ctl` as a version-independent constant — a
-      # dispatch from any other merged ref would produce a release no
-      # consumer can verify.
+      # anything). The attestation certificate and the sigstore
+      # verification both pin `refs/heads/main` verbatim — a dispatch from
+      # any other merged ref would produce a release no consumer can
+      # verify.
       - name: Refuse dispatches that are not from main
         env:
           REF: ${{ github.ref }}
@@ -256,10 +255,10 @@ jobs:
       # Compress-Archive is reported to write `dir\file` entry names on
       # some hosts, which would leave Python's zipfile extracting a file
       # literally called `goetia-...\goetia.exe` on the consumer's
-      # machine. Task 1's fixture covers the same ground offline; this
-      # covers the runner actually in use. If this ever fails for real,
-      # switch this row to `tar -a -cf` or `7z`, both present on the
-      # runner.
+      # machine. `release-script-tests.sh`'s zip-backslash fixture covers
+      # the same ground offline; this step covers the runner actually in
+      # use. If this ever fails for real, switch this row to `tar -a -cf`
+      # or `7z`, both present on the runner.
       - name: Assert zip entry separators (Windows)
         if: runner.os == 'Windows'
         env:

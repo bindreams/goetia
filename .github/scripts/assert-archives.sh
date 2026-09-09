@@ -158,11 +158,9 @@ for archive in "$@"; do
     # elements where one member's name happens to contain a space can join
     # to the exact same string as a different-length set — ("a b") and ("a"
     # "b") compare equal as strings even though they are different sets.
-    # Reproduced: a 3-member archive whose third member is literally named
+    # A 3-member archive whose third member is literally named
     # "<prefix>/LICENSE.md <prefix>/README.md" (one member, embedded space)
-    # joins byte-for-byte identical to the real 4-member expected set and
-    # the old string comparison accepted it — verifying an archive that was
-    # actually missing LICENSE.md and README.md as their own members.
+    # joins byte-for-byte identical to the real 4-member expected set.
     mismatch=0
     if [[ "${#actual_sorted[@]}" -ne "${#expected_sorted[@]}" ]]; then
         mismatch=1

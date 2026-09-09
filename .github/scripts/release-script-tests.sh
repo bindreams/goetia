@@ -565,9 +565,8 @@ assert_archives_rejects_matching "surfaces the real listing failure for a corrup
 # A member can pass LISTING (which only reads zip central-directory headers)
 # and still fail to EXTRACT (a corrupted entry fails its CRC check on
 # `unzip -p`, not on `unzip -Z1`) — a different failure mode than the
-# corrupt-archive cases above, and one `extract_member`'s call site did not
-# annotate before this fix (measured against the unpatched script: bare
-# `unzip` CRC diagnostic, exit 2, no `::error::` line).
+# corrupt-archive cases above, and one that must be annotated as such rather
+# than left as a bare `unzip` CRC diagnostic.
 root="$(mktemp -d -p "$archive_root")"
 archive="${root}/goetia-${windows_target}.zip"
 make_zip_archive "$archive" "$windows_target" "goetia bytes" "shim bytes"
@@ -635,9 +634,7 @@ assert_archives_rejects "rejects two archives holding identical binaries" 5 \
 # "<prefix>/LICENSE.md <prefix>/README.md" with an embedded space) is
 # missing LICENSE.md and README.md as their own members, but its sorted
 # member list joins via "${arr[*]}" to the exact same string as the real
-# 4-member expected set. Before the element-by-element comparison, this
-# archive verified successfully — measured directly against the unpatched
-# script: `all 1 archive(s) verified`, exit 0.
+# 4-member expected set.
 root="$(mktemp -d -p "$archive_root")"
 archive="${root}/goetia-x86_64-unknown-linux-musl.tar.xz"
 prefix="goetia-x86_64-unknown-linux-musl"
@@ -726,8 +723,8 @@ listing="$(write_package_listing empty)"
 assert_package_list_rejects_matching "rejects an empty listing" "$listing" "Cargo.toml"
 
 # Negative check: one leaked path per excluded prefix in goetia's exclude
-# list (Cargo.toml's `exclude`, Task 2 step 3) — directory prefixes and
-# single-file entries alike.
+# list (Cargo.toml's `exclude`) — directory prefixes and single-file entries
+# alike.
 listing="$(write_package_listing leaks-github "${complete_listing_lines[@]}" .github/workflows/ci.yaml)"
 assert_package_list_rejects_matching "rejects a leaked .github/ path" "$listing" ".github/workflows/ci.yaml"
 
