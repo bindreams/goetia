@@ -591,7 +591,13 @@ what is actually installed. Four guarantees:
    privilege level could not read. Such a unit reaches `show` as an
    `undetermined` entry, so `show <id>` reports that it could not determine
    the id's state and exits `4`, while `show -f <file> <id>` still renders
-   it from the manifest.
+   it from the manifest. On a manifest with a `backend-specific:` block,
+   the spec `show` renders is the merged, host-effective one — `show -f`
+   is deliberately not a transcription of the file, because it renders
+   what would be installed _here_. Guarantee 1 survives that unchanged:
+   both paths merge for the same host's native backend, so `show <id>`
+   and `show -f <file> <id>` still agree byte for byte, which is exactly
+   what it claims and all it ever claimed.
 2. Neither path ever checks elevation.
 3. `show -f` touches no service manager; `show` without `-f` touches no
    manifest.

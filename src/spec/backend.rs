@@ -1,5 +1,7 @@
 //! The `backend-specific:` manifest key's namespace: which service-manager
-//! backend a set of overrides applies to.
+//! backend a set of overrides applies to. For the manifest-facing
+//! reference to `backend-specific:` itself, see `overrides`'s module doc;
+//! this module is the validation machinery it drives.
 //!
 //! Lives under `spec` rather than `crate::backend` because its job is
 //! parsing a manifest key, not artifact generation — `crate::backend` is
@@ -12,6 +14,18 @@
 //! [`Backend::warn`]/[`Backend::error`] (the advisory and rejection rules),
 //! and the Windows built-in account vocabulary (`windows_builtin`) both
 //! read.
+//!
+//! [`Backend::error`] rejects only a field the override actually supplied
+//! (`Supplied`, from `overrides.rs`) — a base value is never a per-backend
+//! verdict, since nobody wrote it for that backend. [`Backend::warn`] is
+//! not scoped that way: an advisory is information this host may give
+//! about any value it can read, base or overridden, which is what lets a
+//! Linux host warn about a Windows-only divergence in a manifest with no
+//! `backend-specific:` block at all. Both are computed on uninterpolated
+//! text for a non-native backend, so `scm: {user: {id: 1000}}` is caught
+//! from any host — a uid is never a substituted string — while
+//! `systemd: {user: "${ACCT}"}` is not checkable from Linux: goetia does
+//! not claim to check what it cannot resolve.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

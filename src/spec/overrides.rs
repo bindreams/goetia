@@ -1,6 +1,22 @@
 //! The `backend-specific:` manifest key: a per-[`Backend`] set of field
 //! overrides.
 //!
+//! A manifest author's reference:
+//!
+//! - Keyed by `systemd`, `launchd`, or `scm`. An unknown key is an error
+//!   naming it; a repeated key is too.
+//! - Every field but the daemon's id is overridable: `name`, `command`,
+//!   `cwd`, `env`, `user`, `restart`, `restart-delay`, `logs`, `type`.
+//! - A scalar or list field replaces the base value outright; `env` merges
+//!   key by key instead, the override winning where both set the same key.
+//! - An explicit YAML `null` is an error for all nine fields, and for both
+//!   the keys and the values of `env`. `env: {A: ""}` stays a legal empty
+//!   assignment — only `null` is refused, not emptiness.
+//! - `${VAR}` is substituted only in the override for the backend actually
+//!   being installed to; the other two are checked as authored, never
+//!   substituted. Every backend's merged spec is validated on every host,
+//!   but only the native one is completed and installed.
+//!
 //! Every field here is copied from `RawSpec` (`raw.rs`), not from
 //! `DaemonSpec`: `user`, `restart`, `restart-delay` and `type` stay the
 //! authored-text types (`RawUser`, `String`) so that `${VAR}` can still be

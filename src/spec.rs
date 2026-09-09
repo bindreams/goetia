@@ -6,6 +6,10 @@
 //! below, so nothing downstream — a generator, the metadata blob — needs to
 //! re-derive them. There is no separate `validate()` function anywhere in
 //! the crate; `resolve` is both parse and validate.
+//!
+//! A daemon may also carry a `backend-specific:` block overriding its
+//! fields per [`Backend`]; see `overrides`'s module doc for the
+//! manifest-facing reference.
 
 mod backend;
 mod interpolate;
