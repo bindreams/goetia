@@ -9,6 +9,7 @@ assert_package_list="${script_dir}/assert-package-list.sh"
 assert_asset_count="${script_dir}/assert-asset-count.sh"
 assert_test_binaries="${script_dir}/assert-test-binaries.sh"
 verify_sigstore="${script_dir}/verify-sigstore-bundle.sh"
+assert_commit_on_main="${script_dir}/assert-commit-on-main.sh"
 failures=0
 
 # Asserts BOTH stdout and exit status. Checking stdout alone would pass a
@@ -138,6 +139,93 @@ else
     assert_git_invocation "queries the tag it was given, not a hardcoded one" "ls-remote --exit-code --tags origin refs/tags/v9.9.9" \
         && echo "ok   - queries the tag it was given, not a hardcoded one"
 fi
+
+# assert-commit-on-main.sh ---------------------------------------------------
+#
+# Same shape as the assert-tag-absent.sh coverage above: a stub `git` that
+# records every invocation and answers each subcommand with a chosen exit
+# status, so all three ancestry outcomes — and a fetch that fails before the
+# question is even asked — are exercised without a remote.
+
+git_invocations="${stub_dir}/git.invocations"
+
+make_main_git_stub() {
+    local fetch_exit="$1" merge_base_exit="$2"
+    cat > "${stub_dir}/git" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "${git_invocations}"
+case "\$1" in
+    fetch) exit ${fetch_exit} ;;
+    merge-base) exit ${merge_base_exit} ;;
+    *) exit 97 ;;
+esac
+EOF
+    chmod +x "${stub_dir}/git"
+    : > "$git_invocations"
+}
+
+# run_commit_on_main <fetch-exit> <merge-base-exit> <sha>
+run_commit_on_main() {
+    make_main_git_stub "$1" "$2"
+    commit_on_main_status=0
+    commit_on_main_output="$(PATH="${stub_dir}:${PATH}" bash "$assert_commit_on_main" "$3" 2>&1)" \
+        || commit_on_main_status=$?
+}
+
+assert_commit_on_main_result() {
+    local description="$1" fetch_exit="$2" merge_base_exit="$3" want_success="$4" message="${5-}"
+    run_commit_on_main "$fetch_exit" "$merge_base_exit" "$main_sha"
+    local succeeded=no
+    if [[ "$commit_on_main_status" -eq 0 ]]; then
+        succeeded=yes
+    fi
+    if [[ "$succeeded" != "$want_success" ]]; then
+        echo "FAIL - ${description} (fetch exit ${fetch_exit}, merge-base exit ${merge_base_exit}, wanted success=${want_success}, got status ${commit_on_main_status}: ${commit_on_main_output})"
+        failures=$((failures + 1))
+    elif [[ -n "$message" && "$commit_on_main_output" != *"$message"* ]]; then
+        echo "FAIL - ${description} (expected message containing '${message}', got: ${commit_on_main_output})"
+        failures=$((failures + 1))
+    else
+        echo "ok   - ${description}"
+    fi
+}
+
+main_sha="1234567890abcdef1234567890abcdef12345678"
+
+assert_commit_on_main_result "accepts a commit that is an ancestor of origin/main" 0 0 yes
+assert_commit_on_main_result "refuses a commit that is not an ancestor of origin/main" 0 1 no "not an ancestor"
+# The branch that matters most: a transport or auth failure must not be read
+# as an answer to the ancestry question in either direction.
+assert_commit_on_main_result "refuses when git merge-base itself fails" 0 128 no "cannot confirm"
+assert_commit_on_main_result "refuses when the fetch fails" 1 0 no "cannot confirm"
+
+# Asked after the fetch-failure case above: the ancestry question must not be
+# put to a stale origin/main.
+if [[ "$(wc -l < "$git_invocations")" -eq 1 ]]; then
+    echo "ok   - does not ask about ancestry when the fetch failed"
+else
+    echo "FAIL - does not ask about ancestry when the fetch failed (invocations: $(tr '\n' ';' < "$git_invocations"))"
+    failures=$((failures + 1))
+fi
+
+run_commit_on_main 0 0 "$main_sha"
+expected_invocations="fetch --quiet origin main
+merge-base --is-ancestor ${main_sha} origin/main"
+if [[ "$(cat "$git_invocations")" == "$expected_invocations" ]]; then
+    echo "ok   - fetches main and asks about the commit it was given"
+else
+    echo "FAIL - fetches main and asks about the commit it was given (invoked as: $(tr '\n' ';' < "$git_invocations"))"
+    failures=$((failures + 1))
+fi
+
+if bash "$assert_commit_on_main" >/dev/null 2>&1; then
+    echo "FAIL - rejects being called with no arguments at all (expected rejection, got success)"
+    failures=$((failures + 1))
+else
+    echo "ok   - rejects being called with no arguments at all"
+fi
+
+rm -f "${stub_dir}/git" "$git_invocations"
 
 # assert-archives.sh ---------------------------------------------------------
 #

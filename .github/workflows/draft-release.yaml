@@ -129,32 +129,11 @@ jobs:
         shell: bash
         run: .github/scripts/assert-tag-absent.sh "v${VERSION}"
 
-      # workflow_dispatch accepts a `ref`, so without this a draft can be
-      # pinned to unmerged code while every later check still passes.
       - name: Verify the release commit is on main
         env:
           SHA: ${{ github.sha }}
         shell: bash
-        run: |
-          set -euo pipefail
-          git fetch --quiet origin main
-
-          set +e
-          git merge-base --is-ancestor "$SHA" origin/main
-          status=$?
-          set -e
-
-          case "$status" in
-            0) echo "$SHA is an ancestor of origin/main" ;;
-            1)
-              echo "::error::$SHA is not an ancestor of origin/main. Release only from merged commits."
-              exit 1
-              ;;
-            *)
-              echo "::error::git merge-base failed (exit $status); cannot confirm $SHA is on main"
-              exit 1
-              ;;
-          esac
+        run: .github/scripts/assert-commit-on-main.sh "$SHA"
 
       # The ancestry check above is not sufficient on its own: it is
       # satisfied by dispatching from any branch or tag whose head is
