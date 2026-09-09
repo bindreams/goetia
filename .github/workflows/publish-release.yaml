@@ -158,7 +158,7 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          "${GITHUB_WORKSPACE}/.github/scripts/assert-asset-count.sh" 7 \
+          "${GITHUB_WORKSPACE}/.github/scripts/assert-asset-count.sh" . 7 \
             goetia-*.tar.xz goetia-*.zip SHA256SUMS goetia.sigstore.json
 
       - name: Assert the release contains the full archive set
@@ -173,11 +173,18 @@ jobs:
       # "Compute SHA256SUMS" step) and is mutable between the stages exactly
       # like the archives are, so it gets the same "verify the bytes about
       # to be published, not a separately downloaded copy" treatment: recompute
-      # and compare here, not trust the file's own claims.
+      # and compare here, not trust the file's own claims. The archive names
+      # are passed in so the file has to cover all five — `sha256sum -c`
+      # verifies only the lines it is given, and a SHA256SUMS truncated to a
+      # subset passes it cleanly.
       - name: Verify SHA256SUMS against the downloaded archives
         working-directory: ${{ runner.temp }}/source
         shell: bash
-        run: sha256sum -c --strict SHA256SUMS
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          "${GITHUB_WORKSPACE}/.github/scripts/assert-checksums.sh" \
+            SHA256SUMS goetia-*.tar.xz goetia-*.zip
 
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1

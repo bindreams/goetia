@@ -379,7 +379,7 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          ../.github/scripts/assert-asset-count.sh 7 \
+          ../.github/scripts/assert-asset-count.sh . 7 \
             goetia-*.tar.xz goetia-*.zip SHA256SUMS goetia.sigstore.json
 
       - name: Install uv

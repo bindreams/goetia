@@ -10,6 +10,7 @@ assert_asset_count="${script_dir}/assert-asset-count.sh"
 assert_test_binaries="${script_dir}/assert-test-binaries.sh"
 verify_sigstore="${script_dir}/verify-sigstore-bundle.sh"
 assert_commit_on_main="${script_dir}/assert-commit-on-main.sh"
+assert_checksums="${script_dir}/assert-checksums.sh"
 failures=0
 
 # Asserts BOTH stdout and exit status. Checking stdout alone would pass a
@@ -72,7 +73,8 @@ pkg_list_root="$(mktemp -d)"
 asset_count_root="$(mktemp -d)"
 test_binaries_root="$(mktemp -d)"
 sigstore_root="$(mktemp -d)"
-trap 'rm -rf "$stub_dir" "$archive_root" "$pkg_list_root" "$asset_count_root" "$test_binaries_root" "$sigstore_root"' EXIT
+checksums_root="$(mktemp -d)"
+trap 'rm -rf "$stub_dir" "$archive_root" "$pkg_list_root" "$asset_count_root" "$test_binaries_root" "$sigstore_root" "$checksums_root"' EXIT
 
 make_git_stub() {
     local exit_code="$1" expected_ref="$2"
@@ -807,11 +809,28 @@ else
 fi
 
 # assert-asset-count.sh ------------------------------------------------------
+#
+# Every fixture directory here is built fresh, because what the script now
+# asserts is the whole content of a directory, not just the names it was
+# handed.
+
+# make_asset_dir <name> <file>... — creates $asset_count_root/<name>
+# holding <file>..., and prints its path.
+make_asset_dir() {
+    local dir="${asset_count_root}/$1"
+    shift
+    mkdir -p "$dir"
+    local name
+    for name in "$@"; do
+        : > "${dir}/${name}"
+    done
+    printf '%s\n' "$dir"
+}
 
 assert_asset_count_ok() {
-    local description="$1" expected_count="$2"
-    shift 2
-    if bash "$assert_asset_count" "$expected_count" "$@" >/dev/null 2>&1; then
+    local description="$1" directory="$2" expected_count="$3"
+    shift 3
+    if bash "$assert_asset_count" "$directory" "$expected_count" "$@" >/dev/null 2>&1; then
         echo "ok   - ${description}"
     else
         echo "FAIL - ${description} (expected success, got failure)"
@@ -820,10 +839,10 @@ assert_asset_count_ok() {
 }
 
 assert_asset_count_rejects_matching() {
-    local description="$1" expected_count="$2" message="$3"
-    shift 3
+    local description="$1" directory="$2" expected_count="$3" message="$4"
+    shift 4
     local output
-    if output="$(bash "$assert_asset_count" "$expected_count" "$@" 2>&1)"; then
+    if output="$(bash "$assert_asset_count" "$directory" "$expected_count" "$@" 2>&1)"; then
         echo "FAIL - ${description} (expected rejection, got success)"
         failures=$((failures + 1))
     elif [[ "$output" == *"$message"* ]]; then
@@ -834,28 +853,185 @@ assert_asset_count_rejects_matching() {
     fi
 }
 
+release_assets=(
+    goetia-x86_64-unknown-linux-musl.tar.xz
+    goetia-aarch64-unknown-linux-musl.tar.xz
+    goetia-x86_64-apple-darwin.tar.xz
+    goetia-aarch64-apple-darwin.tar.xz
+    goetia-x86_64-pc-windows-msvc.zip
+    SHA256SUMS
+    goetia.sigstore.json
+)
+
+seven_dir="$(make_asset_dir seven "${release_assets[@]}")"
 seven_assets=()
-for i in 1 2 3 4 5 6 7; do
-    f="${asset_count_root}/asset-${i}"
-    : > "$f"
-    seven_assets+=("$f")
+for name in "${release_assets[@]}"; do
+    seven_assets+=("${seven_dir}/${name}")
 done
 
-assert_asset_count_ok "accepts exactly the expected count" 7 "${seven_assets[@]}"
+assert_asset_count_ok "accepts exactly the expected count" "$seven_dir" 7 "${seven_assets[@]}"
 
-assert_asset_count_rejects_matching "rejects too few assets" 7 "expected 7 asset(s), got 6" \
+assert_asset_count_rejects_matching "rejects too few assets" "$seven_dir" 7 "expected 7 asset(s), got 6" \
     "${seven_assets[@]:0:6}"
+
+# The reproduction from the review. In the publish stage the directory is
+# whatever `gh release download` pulled off the draft, so an eighth asset
+# added to the draft lands here — and used to pass, because the check only
+# ever looked at the names it was handed. Passing it would freeze that asset
+# into the immutable release, attested by nothing.
+extra_dir="$(make_asset_dir extra "${release_assets[@]}" install.sh)"
+extra_assets=()
+for name in "${release_assets[@]}"; do
+    extra_assets+=("${extra_dir}/${name}")
+done
+assert_asset_count_rejects_matching "rejects an unexpected extra file in the asset directory" \
+    "$extra_dir" 7 "install.sh" "${extra_assets[@]}"
 
 # The exact vacuous-guard shape this script exists to close off: an empty
 # `nullglob` expansion must never read as "0 assets to check, trivially
 # satisfied".
-assert_asset_count_rejects_matching "rejects a zero count" 0 "positive integer"
-assert_asset_count_rejects_matching "rejects a non-numeric count" abc "positive integer"
+assert_asset_count_rejects_matching "rejects a zero count" "$seven_dir" 0 "positive integer" \
+    "${seven_assets[0]}"
+assert_asset_count_rejects_matching "rejects a non-numeric count" "$seven_dir" abc "positive integer" \
+    "${seven_assets[0]}"
+assert_asset_count_rejects_matching "refuses when the asset glob expanded to nothing" "$seven_dir" 7 \
+    "usage"
 
-assert_asset_count_rejects_matching "rejects a named asset that does not exist" 1 "asset not found" \
-    "${asset_count_root}/does-not-exist"
+one_dir="$(make_asset_dir one present)"
+assert_asset_count_rejects_matching "rejects a named asset that does not exist" "$one_dir" 1 \
+    "asset not found" "${one_dir}/does-not-exist"
+
+# A directory the assets do not live in would make the content check
+# meaningless while still reporting success.
+assert_asset_count_rejects_matching "rejects an asset from outside the directory" "$one_dir" 1 \
+    "is not in" "${seven_dir}/SHA256SUMS"
+
+assert_asset_count_rejects_matching "rejects a directory that does not exist" \
+    "${asset_count_root}/absent" 1 "directory not found" "${one_dir}/present"
 
 if bash "$assert_asset_count" >/dev/null 2>&1; then
+    echo "FAIL - rejects being called with no arguments at all (expected rejection, got success)"
+    failures=$((failures + 1))
+else
+    echo "ok   - rejects being called with no arguments at all"
+fi
+
+# assert-checksums.sh --------------------------------------------------------
+#
+# `sha256sum -c --strict` only ever checks the lines the file happens to
+# contain, so the coverage assertion is the whole point of this script:
+# SHA256SUMS is unattested and mutable between the release stages, and a
+# subset of it verifies just as green as the whole.
+
+# make_sums_fixture <name> — builds $checksums_root/<name> holding five
+# archives, prints the directory. SHA256SUMS is left to the caller.
+make_sums_fixture() {
+    local dir="${checksums_root}/$1"
+    mkdir -p "$dir"
+    local target
+    for target in linux-musl linux-arm darwin-x86 darwin-arm; do
+        printf 'bytes for %s\n' "$target" > "${dir}/goetia-${target}.tar.xz"
+    done
+    printf 'bytes for windows\n' > "${dir}/goetia-windows.zip"
+    printf '%s\n' "$dir"
+}
+
+sums_archives=(goetia-linux-musl.tar.xz goetia-linux-arm.tar.xz goetia-darwin-x86.tar.xz goetia-darwin-arm.tar.xz goetia-windows.zip)
+
+# run_assert_checksums <dir> <sums-file> <archive>... — runs the script from
+# inside <dir>, the way the workflow does.
+run_assert_checksums() {
+    local dir="$1"
+    shift
+    checksums_status=0
+    checksums_output="$(cd "$dir" && bash "$assert_checksums" "$@" 2>&1)" || checksums_status=$?
+}
+
+assert_checksums_ok() {
+    local description="$1" dir="$2"
+    shift 2
+    run_assert_checksums "$dir" "$@"
+    if [[ "$checksums_status" -eq 0 ]]; then
+        echo "ok   - ${description}"
+    else
+        echo "FAIL - ${description} (expected success, got status ${checksums_status}: ${checksums_output})"
+        failures=$((failures + 1))
+    fi
+}
+
+assert_checksums_rejects_matching() {
+    local description="$1" dir="$2" message="$3"
+    shift 3
+    run_assert_checksums "$dir" "$@"
+    if [[ "$checksums_status" -eq 0 ]]; then
+        echo "FAIL - ${description} (expected rejection, got success)"
+        failures=$((failures + 1))
+    elif [[ "$checksums_output" == *"$message"* ]]; then
+        echo "ok   - ${description}"
+    else
+        echo "FAIL - ${description} (expected message containing '${message}', got: ${checksums_output})"
+        failures=$((failures + 1))
+    fi
+}
+
+sums_dir="$(make_sums_fixture complete)"
+(cd "$sums_dir" && sha256sum "${sums_archives[@]}" > SHA256SUMS)
+assert_checksums_ok "accepts a SHA256SUMS covering exactly the archives" "$sums_dir" \
+    SHA256SUMS "${sums_archives[@]}"
+
+# The reproduction from the review: `sha256sum -c --strict` passes on this
+# file, having checked one archive out of five.
+sums_dir="$(make_sums_fixture truncated)"
+(cd "$sums_dir" && sha256sum "${sums_archives[@]}" | head -1 > SHA256SUMS)
+assert_checksums_rejects_matching "rejects a SHA256SUMS that lists only some of the archives" \
+    "$sums_dir" "does not name" SHA256SUMS "${sums_archives[@]}"
+
+# The other direction: a line for a file that exists but is not part of the
+# release. `sha256sum -c` is perfectly happy with it.
+sums_dir="$(make_sums_fixture extra_line)"
+printf 'installer\n' > "${sums_dir}/install.sh"
+(cd "$sums_dir" && sha256sum "${sums_archives[@]}" install.sh > SHA256SUMS)
+assert_checksums_rejects_matching "rejects a SHA256SUMS naming a file outside the archive set" \
+    "$sums_dir" "install.sh" SHA256SUMS "${sums_archives[@]}"
+
+sums_dir="$(make_sums_fixture wrong_hash)"
+(cd "$sums_dir" && sha256sum "${sums_archives[@]}" > SHA256SUMS)
+printf 'tampered\n' > "${sums_dir}/goetia-windows.zip"
+assert_checksums_rejects_matching "rejects an archive whose bytes do not match its recorded hash" \
+    "$sums_dir" "does not match" SHA256SUMS "${sums_archives[@]}"
+
+# A listed archive that is missing from disk fails on its own terms rather
+# than as a coverage mismatch.
+sums_dir="$(make_sums_fixture missing_archive)"
+(cd "$sums_dir" && sha256sum "${sums_archives[@]}" > SHA256SUMS)
+rm "${sums_dir}/goetia-windows.zip"
+assert_checksums_rejects_matching "rejects a listed archive that is missing from disk" \
+    "$sums_dir" "does not match" SHA256SUMS "${sums_archives[@]}"
+
+sums_dir="$(make_sums_fixture malformed)"
+(cd "$sums_dir" && sha256sum "${sums_archives[@]}" > SHA256SUMS && printf 'not a checksum line\n' >> SHA256SUMS)
+assert_checksums_rejects_matching "rejects a malformed SHA256SUMS line" \
+    "$sums_dir" "unparseable line" SHA256SUMS "${sums_archives[@]}"
+
+# Filenames are read at a fixed offset rather than by splitting on
+# whitespace, so a name containing a space is covered rather than silently
+# truncated to its first word.
+sums_dir="$(make_sums_fixture spaced_name)"
+printf 'bytes\n' > "${sums_dir}/goetia release.tar.xz"
+(cd "$sums_dir" && sha256sum "${sums_archives[@]}" "goetia release.tar.xz" > SHA256SUMS)
+assert_checksums_ok "accepts an archive name containing a space" "$sums_dir" \
+    SHA256SUMS "${sums_archives[@]}" "goetia release.tar.xz"
+
+sums_dir="$(make_sums_fixture missing_file)"
+assert_checksums_rejects_matching "rejects a SHA256SUMS file that does not exist" \
+    "$sums_dir" "not found" SHA256SUMS "${sums_archives[@]}"
+
+sums_dir="$(make_sums_fixture no_archives)"
+(cd "$sums_dir" && sha256sum "${sums_archives[@]}" > SHA256SUMS)
+assert_checksums_rejects_matching "refuses when the archive glob expanded to nothing" \
+    "$sums_dir" "usage" SHA256SUMS
+
+if bash "$assert_checksums" >/dev/null 2>&1; then
     echo "FAIL - rejects being called with no arguments at all (expected rejection, got success)"
     failures=$((failures + 1))
 else
