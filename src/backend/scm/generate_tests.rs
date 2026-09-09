@@ -548,7 +548,7 @@ fn managed_kind_clamps_absurdly_long_restart_delay_and_warns() {
     assert!(
         warnings
             .iter()
-            .any(|w| w.id == spec.id && w.message.contains("restart-delay")),
+            .any(|w| w.id.as_ref() == Some(&spec.id) && w.message.contains("restart-delay")),
         "clamping must be reported as a Warning, not done silently: {warnings:?}"
     );
 }

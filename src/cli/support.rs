@@ -20,7 +20,10 @@ pub(crate) fn load_and_warn(file: &Path, err: &mut dyn Write) -> Result<Vec<Daem
 
 pub(crate) fn print_warnings(warnings: &[Warning], err: &mut dyn Write) {
     for warning in warnings {
-        let _ = writeln!(err, "warning: {}: {}", warning.id, warning.message);
+        let _ = match &warning.id {
+            Some(id) => writeln!(err, "warning: {id}: {}", warning.message),
+            None => writeln!(err, "warning: {}", warning.message),
+        };
     }
 }
 

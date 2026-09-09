@@ -151,8 +151,14 @@ pub enum Kind {
 /// cannot be faithfully honored on some platform, or will be silently
 /// transformed (e.g. a sub-second `restart-delay` rounded up for launchd).
 /// Every CLI command that parses a manifest prints these to stderr.
+///
+/// `id` is `None` for a manifest-level advisory that belongs to no single
+/// daemon — e.g. a drive-relative `-f` argument, resolved once by
+/// `resolve::absolutize` before the daemon loop even starts. Attributing it
+/// to an arbitrary daemon would be a lie, and repeating it under every
+/// daemon would say the same manifest-level thing N times.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Warning {
-    pub id: Id,
+    pub id: Option<Id>,
     pub message: String,
 }

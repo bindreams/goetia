@@ -371,7 +371,10 @@ fn shim_path() -> PathBuf {
 
 fn print_warnings(warnings: &[Warning]) {
     for w in warnings {
-        eprintln!("warning: {}: {}", w.id, w.message);
+        match &w.id {
+            Some(id) => eprintln!("warning: {id}: {}", w.message),
+            None => eprintln!("warning: {}", w.message),
+        }
     }
 }
 

@@ -76,13 +76,20 @@ const MANIFEST_FILE_NAME: &str = "goetia.yaml";
 /// properties that are accepted but cannot be faithfully honored on every
 /// platform.
 pub fn resolve(mut raw: RawManifest, base_dir: &Path) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
+    // Declared before `absolutize` runs, not after: `absolutize` itself can
+    // now push a manifest-level advisory (a drive-relative `-f`), and
+    // `Vec::new()` reads nothing, so hoisting the declaration up is safe by
+    // inspection. The alternative — a second vector concatenated in after
+    // the daemon loop — would get the asserted warning order wrong.
+    let mut warnings = Vec::new();
+
     // `DaemonSpec` documents every path as absolute and `blob::decode`
     // enforces it, so a relative `base_dir` would produce an artifact whose
     // own embedded blob cannot be decoded — breaking the drift invariant for
     // the entirely ordinary `goetia daemon install -f .`. Anchor it here, at
     // the one place that makes the guarantee, rather than trusting every
     // caller to pass an absolute path.
-    let base_dir = absolutize(base_dir)?;
+    let base_dir = absolutize(base_dir, &mut warnings)?;
     let base_dir = base_dir.as_path();
 
     // A manifest with no `$` in it never reads `.env`, so an unrelated or
@@ -96,7 +103,6 @@ pub fn resolve(mut raw: RawManifest, base_dir: &Path) -> Result<(Vec<DaemonSpec>
     interpolate::manifest(&mut raw, &vars)?;
 
     let mut specs = Vec::with_capacity(raw.daemons.len());
-    let mut warnings = Vec::new();
 
     for (key, entry) in raw.daemons {
         let id = Id::try_from(key)?;
@@ -145,11 +151,11 @@ fn resolve_one(id: Id, raw: RawSpec, base_dir: &Path, warnings: &mut Vec<Warning
     }
     if let Some(first) = command.first_mut() {
         reject_empty(&id, "command[0]", first)?;
-        *first = resolve_path_string(&id, "command", first, base_dir)?;
+        *first = resolve_path_string(&id, "command", first, base_dir, warnings)?;
     }
 
-    let cwd = resolve_optional_path(&id, "cwd", raw.cwd, base_dir)?;
-    let logs = resolve_optional_path(&id, "logs", raw.logs, base_dir)?;
+    let cwd = resolve_optional_path(&id, "cwd", raw.cwd, base_dir, warnings)?;
+    let logs = resolve_optional_path(&id, "logs", raw.logs, base_dir, warnings)?;
 
     let mut env = BTreeMap::new();
     for (key, value) in raw.env {
@@ -290,12 +296,20 @@ pub(crate) fn parse_restart_delay(id: &Id, raw: &str) -> Result<Duration, Error>
     })
 }
 
-fn resolve_optional_path(id: &Id, field: &str, raw: Option<String>, base_dir: &Path) -> Result<Option<PathBuf>, Error> {
+fn resolve_optional_path(
+    id: &Id,
+    field: &str,
+    raw: Option<String>,
+    base_dir: &Path,
+    warnings: &mut Vec<Warning>,
+) -> Result<Option<PathBuf>, Error> {
     match raw {
         Some(s) => {
             reject_unemittable(id, field, &s)?;
             reject_empty(id, field, &s)?;
-            Ok(Some(PathBuf::from(resolve_path_string(id, field, &s, base_dir)?)))
+            Ok(Some(PathBuf::from(resolve_path_string(
+                id, field, &s, base_dir, warnings,
+            )?)))
         }
         None => Ok(None),
     }
@@ -305,27 +319,69 @@ fn resolve_optional_path(id: &Id, field: &str, raw: Option<String>, base_dir: &P
 /// `Path::is_absolute` (not a string prefix check) so this behaves
 /// correctly on both a POSIX host (`/opt/rt`) and a Windows host
 /// (`C:\base`), whose absoluteness rules differ.
-fn resolve_path_string(id: &Id, field: &str, raw: &str, base_dir: &Path) -> Result<String, Error> {
+fn resolve_path_string(
+    id: &Id,
+    field: &str,
+    raw: &str,
+    base_dir: &Path,
+    warnings: &mut Vec<Warning>,
+) -> Result<String, Error> {
     let p = Path::new(raw);
     let joined = if p.is_absolute() {
         p.to_path_buf()
     } else {
         normalize(&base_dir.join(p))
     };
-    // Assert the post-condition rather than assume the join achieved it.
-    // A Windows drive-relative path (`C:bin/frpc.exe`) is neither absolute
-    // nor joinable: `PathBuf::push` truncates the buffer whenever the pushed
-    // path carries a prefix, so `base_dir.join("C:bin")` silently discards
-    // `base_dir` and yields `C:bin` — still relative. Resolving it for real
-    // would mean reading the per-drive current directory, which Rust exposes
-    // no portable way to do, and which would anchor the artifact to whatever
-    // that happened to be in the *installing* shell. Reject it instead.
+    // `base_dir` is absolute, so a join can fail to yield an absolute result
+    // only in one shape: a Windows drive-relative path (`C:bin/frpc.exe`),
+    // which carries a prefix but no root. `PathBuf::push` replaces the
+    // buffer whenever the pushed path carries a prefix, so
+    // `base_dir.join("C:bin")` silently discards `base_dir` and yields
+    // `C:bin` — still relative. Every currently-accepted input resolves
+    // above and never reaches here.
+    let joined = if joined.is_absolute() {
+        joined
+    } else {
+        // `std::path::absolute` — not the still-unstable `Path::absolute`
+        // method, and not `fs::canonicalize`, which requires the path to
+        // exist, resolves symlinks, and returns a verbatim `\\?\` path on
+        // Windows — resolves the drive-relative case the way
+        // `GetFullPathNameW` does: against the per-drive current directory
+        // of *this* process.
+        let resolved = std::path::absolute(&joined).map_err(|source| {
+            invalid(
+                id,
+                &format!("field `{field}` is `{raw}`, which cannot be resolved to an absolute path: {source}"),
+            )
+        })?;
+        if resolved.is_absolute() {
+            // `GetFullPathNameW` resolves against process state — the
+            // current directory on that drive in whichever process ran
+            // goetia — not against the manifest. An `install` run from one
+            // directory and a `diff` run from another can resolve this
+            // differently and disagree, reporting drift on an artifact
+            // nobody touched.
+            warnings.push(Warning {
+                id: Some(id.clone()),
+                message: format!(
+                    "field `{field}` is `{raw}`, a drive-relative path; it is anchored to the \
+                     current directory on that drive in whichever process runs goetia, not to \
+                     the manifest directory. Write a full path (e.g. `C:\\bin\\frpc.exe`) or a \
+                     manifest-relative one (e.g. `.\\bin\\frpc.exe`) instead."
+                ),
+            });
+        }
+        resolved
+    };
+    // Assert the post-condition rather than assume the fallback achieved it.
+    // A prefix with no root (`\\?\C:`, `\\.\COM1`) survives
+    // `std::path::absolute` unchanged — it has an explicit early return for
+    // verbatim paths — so this branch is still live, just no longer for the
+    // drive-relative reason.
     if !joined.is_absolute() {
         return Err(invalid(
             id,
-            &format!(
-                "field `{field}` is `{raw}`, which cannot be resolved to an absolute path; drive-relative paths like `C:dir` are not supported - write a full path"
-            ),
+            &format!("field `{field}` is `{raw}`, which cannot be resolved to an absolute path"),
         ));
     }
     Ok(joined.to_string_lossy().into_owned())
@@ -333,12 +389,22 @@ fn resolve_path_string(id: &Id, field: &str, raw: &str, base_dir: &Path) -> Resu
 
 /// Make `dir` absolute against the process's working directory.
 ///
-/// Deliberately not `canonicalize()`: that requires the path to exist and
-/// resolves symlinks, neither of which is wanted here. A manifest may name a
-/// `cwd` or `logs` directory the installer is about to create, and resolving
-/// a symlink would bake the target into the artifact rather than the path the
-/// user wrote.
-fn absolutize(dir: &Path) -> Result<PathBuf, Error> {
+/// **Deduced values may be canonicalised; authored ones are honoured as
+/// written.** `dir` is the manifest directory the user passed to `-f`, so it
+/// is deliberately not `canonicalize()`d: that requires the path to exist
+/// (a manifest may name a `cwd`/`logs` directory the installer is about to
+/// create) and resolves symlinks, which would bake a deliberately
+/// symlinked deployment path's target into the artifact instead of the path
+/// the user wrote, so a service would stop following a repointed symlink.
+/// One consequence: `-f .` cannot preserve a symlinked spelling — `getcwd`
+/// already resolved it before goetia ever saw it, so there is nothing left
+/// to honour. Anyone who wants a symlinked deployment path kept must pass it
+/// explicitly to `-f`.
+///
+/// The process's own working directory, read below when `dir` is relative,
+/// is the opposite case: nobody typed it, so it carries no intent to
+/// preserve, and it always exists, so it *is* canonicalised.
+fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error> {
     if dir.is_absolute() {
         return Ok(normalize(dir));
     }
@@ -352,14 +418,111 @@ fn absolutize(dir: &Path) -> Result<PathBuf, Error> {
             dir.display()
         ))
     })?;
+    let cwd = canonicalize_cwd(&cwd)?;
     let joined = normalize(&cwd.join(dir));
+    // The fallback below resolves `..` lexically, on this path only.
+    // `normalize` leaves `..` alone everywhere else — removing it lexically
+    // is wrong in the presence of symlinks — but `GetFullPathNameW`
+    // collapses `..` lexically before the filesystem ever sees the path, so
+    // a drive-relative path goetia resolved differently from every other
+    // Windows tool would be the bug, not the other way around.
+    let joined = if joined.is_absolute() {
+        joined
+    } else {
+        let resolved = std::path::absolute(&joined).map_err(|source| {
+            Error::Other(format!(
+                "manifest directory `{}` cannot be resolved to an absolute path: {source}",
+                dir.display()
+            ))
+        })?;
+        if resolved.is_absolute() {
+            warnings.push(Warning {
+                id: None,
+                message: format!(
+                    "manifest directory `-f {}` is a drive-relative path; it is anchored to the \
+                     current directory on that drive in whichever process runs goetia, not to a \
+                     fixed location. Pass a full path (e.g. `C:\\repo`) or a `.`-relative one to \
+                     `-f` instead.",
+                    dir.display()
+                ),
+            });
+        }
+        resolved
+    };
     if !joined.is_absolute() {
         return Err(Error::Other(format!(
-            "manifest directory `{}` cannot be resolved to an absolute path; drive-relative paths like `C:dir` are not supported — pass a full path to `-f`",
+            "manifest directory `{}` cannot be resolved to an absolute path",
             dir.display()
         )));
     }
     Ok(joined)
+}
+
+/// Canonicalise the process's current working directory. **Deduced values
+/// may be canonicalised; authored ones are honoured as written** — see
+/// [`absolutize`]'s doc comment for the other half of that line. The
+/// working directory is the one value in the chain nobody typed, so it
+/// carries no intent to preserve, and it always exists, so
+/// `canonicalize`'s existence requirement is satisfied by construction.
+///
+/// What this buys, per platform: on Unix, nearly nothing — `getcwd`
+/// already returns a symlink-free path. On Windows it gains canonical
+/// capitalisation, which fixes phantom drift at its source: installing from
+/// `C:\App` and diffing from `C:\app` would otherwise store two different
+/// strings for one directory and report drift on an artifact nobody
+/// touched.
+///
+/// A working directory on a filesystem that does not support
+/// canonicalisation (some network redirectors, WebDAV mounts) is a known
+/// limitation, accepted rather than worked around.
+fn canonicalize_cwd(cwd: &Path) -> Result<PathBuf, Error> {
+    let canonical = fs::canonicalize(cwd).map_err(|source| {
+        Error::Other(format!(
+            "canonicalising the current directory {} failed; it may have been removed, or it may \
+             be on a filesystem that does not support canonicalisation: {source}",
+            cwd.display()
+        ))
+    })?;
+    Ok(strip_verbatim_prefix(canonical))
+}
+
+/// Strip Windows' `\\?\` verbatim prefix from a `canonicalize`d path, so it
+/// compares equal to every other spelling goetia or SCM produces for the
+/// same directory. `canonicalize` only ever returns the two shapes matched
+/// below; any other prefix is left untouched. Stripped unconditionally, even
+/// past `MAX_PATH` (260): keeping the verbatim prefix instead would put a
+/// `\\?\` string into the metadata blob — a spelling nothing else in the
+/// system produces — guaranteeing permanent phantom drift, which is worse
+/// than the length limit that already applies to every authored absolute
+/// path. A no-op on every other platform, where `canonicalize` never
+/// produces a `Prefix` component to begin with.
+#[cfg(windows)]
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    use std::path::{Component, Prefix};
+    match path.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::VerbatimDisk(letter) => {
+                let mut out = PathBuf::from(format!("{}:\\", letter as char));
+                out.extend(path.components().skip(1));
+                out
+            }
+            // Not `UNC\server\share` — building the drive form by simply
+            // dropping the leading `\\?\` would produce exactly that trap
+            // for this variant.
+            Prefix::VerbatimUNC(server, share) => {
+                let mut out = PathBuf::from(format!("\\\\{}\\{}", server.to_string_lossy(), share.to_string_lossy()));
+                out.extend(path.components().skip(1));
+                out
+            }
+            _ => path,
+        },
+        _ => path,
+    }
+}
+
+#[cfg(not(windows))]
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    path
 }
 
 /// Drop `.` components so a manifest loaded from `.` yields `<cwd>` rather
@@ -572,7 +735,7 @@ fn warn_on_sub_second_restart_delay(id: &Id, restart_delay: Option<Duration>, wa
     }
     let rounded = delay.as_secs().saturating_add(1);
     warnings.push(Warning {
-        id: id.clone(),
+        id: Some(id.clone()),
         message: format!(
             "restart-delay {delay:?} is not a whole number of seconds; launchd's ThrottleInterval \
              will round it up to {rounded}s"
@@ -598,7 +761,7 @@ fn warn_on_windows_divergences(
     }
     if has_cwd || has_logs {
         warnings.push(Warning {
-            id: id.clone(),
+            id: Some(id.clone()),
             message: "type: managed has no working-directory or stdout-capture field on Windows SCM; \
                       `cwd`/`logs` are silently unavailable there, and with no working directory, \
                       every relative path in an argument resolves against System32"
@@ -607,7 +770,7 @@ fn warn_on_windows_divergences(
     }
     if restart == Restart::Always {
         warnings.push(Warning {
-            id: id.clone(),
+            id: Some(id.clone()),
             message: "restart: always is not faithfully expressible for type: managed on Windows: SCM \
                       recovery actions only fire on failure, never after a clean exit"
                 .to_string(),

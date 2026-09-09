@@ -221,7 +221,7 @@ fn bounded_restart_delay(id: &Id, delay: Duration, warnings: &mut Vec<Warning>) 
         return delay;
     }
     warnings.push(Warning {
-        id: id.clone(),
+        id: Some(id.clone()),
         message: format!(
             "restart-delay {delay:?} exceeds the ~49.71 days SC_ACTION.Delay (a DWORD of milliseconds) can \
              express; clamped to {MAX_SC_ACTION_DELAY:?}"

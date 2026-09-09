@@ -274,7 +274,7 @@ daemons:
     let (specs, warnings) = resolve_yaml(yaml).expect("accepted with a warning, not rejected");
     assert_eq!(specs[0].kind, Kind::Managed);
     assert_eq!(warnings.len(), 1);
-    assert_eq!(warnings[0].id.as_str(), "svc");
+    assert_eq!(warnings[0].id.as_ref().map(Id::as_str), Some("svc"));
     assert!(warnings[0].message.contains("cwd") || warnings[0].message.contains("logs"));
 }
 
@@ -566,6 +566,13 @@ fn huge_restart_delay_saturates_instead_of_overflowing() {
     );
 }
 
+/// The canonicalised, verbatim-prefix-stripped process working directory —
+/// the same helper `absolutize` itself uses to turn a relative `-f` into an
+/// absolute `base_dir`.
+fn canonical_cwd() -> PathBuf {
+    strip_verbatim_prefix(std::fs::canonicalize(std::env::current_dir().expect("cwd")).expect("cwd canonicalizes"))
+}
+
 #[skuld::test]
 fn relative_base_dir_still_yields_absolute_paths() {
     // Same invariant as `resolve`'s absolutize step: every emitted path must
@@ -576,11 +583,52 @@ fn relative_base_dir_still_yields_absolute_paths() {
 
     // Assert *which* directory was used, not merely that some absolute one
     // was: an `absolutize` that ignored its argument and returned a constant
-    // would still satisfy `is_absolute()` on every field.
-    let cwd = std::env::current_dir().expect("cwd");
+    // would still satisfy `is_absolute()` on every field. The working
+    // directory is canonicalised (see `canonicalize_cwd`), so this compares
+    // against the same canonical, prefix-stripped form `absolutize` itself
+    // produces rather than the raw `current_dir()` value.
+    let cwd = canonical_cwd();
     assert_eq!(spec.command[0], cwd.join("bin").join("frpc").to_string_lossy());
     assert_eq!(spec.cwd.as_deref(), Some(cwd.as_path()));
     assert_eq!(spec.logs, Some(cwd.join("logs").join("frpc.log")));
+}
+
+#[skuld::test]
+fn a_relative_manifest_directory_resolves_against_the_canonical_working_directory() {
+    // Runs everywhere; on Unix it is close to a no-op, which is the point —
+    // it pins that the canonicalisation did not change Unix behaviour.
+    let mut warnings = Vec::new();
+    let resolved = absolutize(Path::new("sub"), &mut warnings).expect("resolves");
+    assert_eq!(resolved, canonical_cwd().join("sub"));
+}
+
+#[skuld::test]
+fn an_authored_base_dir_is_not_canonicalised() {
+    // The guard on the deduced/authored line: an absolute `-f` pointing
+    // through a symlinked directory must resolve to the path as written,
+    // not to the link target. No fallback, no conditional assertion — if
+    // the symlink cannot be created, this must fail loudly rather than
+    // quietly assert something else.
+    let dir = tempfile::tempdir().expect("tempdir should be creatable");
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).expect("real dir should be creatable");
+    let link = dir.path().join("link");
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real, &link).expect("symlink should be creatable");
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&real, &link).expect("symlink should be creatable");
+
+    let mut warnings = Vec::new();
+    let resolved = absolutize(&link, &mut warnings).expect("resolves");
+    assert_eq!(
+        resolved, link,
+        "an authored base_dir must be honoured as written, not resolved through its symlink"
+    );
+    assert_ne!(
+        resolved, real,
+        "resolving through the symlink would defeat the point of this test"
+    );
 }
 
 #[skuld::test]
@@ -588,7 +636,9 @@ fn normalize_preserves_parent_dir_components() {
     // `.` is dropped but `..` is deliberately kept: collapsing `..`
     // lexically is wrong when a component is a symlink, since `a/b/..` is
     // only `a` if `b` is a real directory. Pin the distinction so a future
-    // "completion" of the match arm cannot quietly change it.
+    // "completion" of the match arm cannot quietly change it. The one
+    // deliberate exception to this rule lives in
+    // `drive_relative_resolution_collapses_dot_dot_the_windows_way` below.
     let yaml = "daemons:\n  frpc:\n    command: [bin/frpc]\n    cwd: ../sibling\n";
     let (specs, _) = resolve(parse_manifest(yaml), &base_dir()).expect("resolves");
     let cwd = specs[0].cwd.as_deref().expect("cwd is set");
@@ -714,18 +764,141 @@ fn accepts_an_empty_name() {
     assert_eq!(specs[0].name, "");
 }
 
+// Drive-relative paths ================================================================================================
+
+// `C:bin` is neither absolute nor joinable: `PathBuf::push` truncates
+// whenever the pushed path carries a prefix, so joining it against an
+// absolute base silently discards the base and leaves a relative path. It is
+// nonetheless a *valid* Windows path — drive-relative syntax, resolved
+// against the current directory on that drive — so goetia must support it
+// rather than reject it to protect its own join-based resolution strategy.
+
 #[cfg(windows)]
 #[skuld::test]
-fn rejects_drive_relative_paths() {
-    // `C:bin` is neither absolute nor joinable: `PathBuf::push` truncates
-    // whenever the pushed path carries a prefix, so joining it against an
-    // absolute base silently discards the base and leaves a relative path.
-    // That would emit an artifact whose own blob `blob::decode` rejects.
+fn drive_relative_path_resolves_against_the_drives_current_directory_and_warns() {
+    // `base_dir()` is the literal `C:\base`, and the test process never runs
+    // there, so a result that differs from `base_dir().join("bin/frpc.exe")`
+    // is safe to read as "anchored to the process's cwd, not the manifest".
     let yaml = "daemons:\n  frpc:\n    command: [\"C:bin/frpc.exe\"]\n";
-    let err = resolve(parse_manifest(yaml), &base_dir()).expect_err("drive-relative must be rejected");
+    let (specs, warnings) = resolve(parse_manifest(yaml), &base_dir()).expect("drive-relative command resolves");
+
+    assert!(Path::new(&specs[0].command[0]).is_absolute());
+    assert_ne!(
+        specs[0].command[0],
+        base_dir().join("bin").join("frpc.exe").to_string_lossy(),
+        "a drive-relative path must anchor to the process's cwd on that drive, not to base_dir"
+    );
+
+    assert_eq!(warnings.len(), 1);
     assert!(
-        err.to_string().contains("drive-relative"),
-        "message should name the cause: {err}"
+        warnings[0].message.contains("command"),
+        "warning should name the field: {}",
+        warnings[0].message
+    );
+    assert!(
+        warnings[0].message.contains("C:bin/frpc.exe"),
+        "warning should quote the raw path: {}",
+        warnings[0].message
+    );
+}
+
+#[cfg(not(windows))]
+#[skuld::test]
+fn a_colon_bearing_name_is_an_ordinary_relative_filename() {
+    // A colon is a legal Unix filename character, so on Linux/macOS
+    // `C:bin/frpc.exe` is nothing but a relative path with an odd name —
+    // joined against `base_dir` exactly like any other, with no warning.
+    let yaml = "daemons:\n  frpc:\n    command: [\"C:bin/frpc.exe\"]\n";
+    let (specs, warnings) = resolve(parse_manifest(yaml), &base_dir()).expect("resolves as an ordinary filename");
+    assert_eq!(specs[0].command[0], base_dir().join("C:bin/frpc.exe").to_string_lossy());
+    assert!(warnings.is_empty());
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn a_manifest_relative_path_beside_a_drive_relative_one_still_anchors_to_the_manifest() {
+    // Pins that the fallback fires per path and does not capture the
+    // ordinary relative `cwd` sitting next to a drive-relative `command`.
+    let yaml = "daemons:\n  frpc:\n    command: [\"C:bin/frpc.exe\"]\n    cwd: data\n";
+    let (specs, _warnings) = resolve(parse_manifest(yaml), &base_dir()).expect("resolves");
+    assert_eq!(specs[0].cwd, Some(base_dir().join("data")));
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn drive_relative_resolution_collapses_dot_dot_the_windows_way() {
+    // The one exception to `normalize_preserves_parent_dir_components`:
+    // `GetFullPathNameW` collapses `..` lexically before the filesystem ever
+    // sees the path, so a drive-relative path goetia resolved differently
+    // from every other Windows tool would be the bug, not the other way
+    // around.
+    let yaml = r"daemons:
+  frpc:
+    command: ['C:a\..\b']
+";
+    let (specs, warnings) = resolve(parse_manifest(yaml), &base_dir()).expect("drive-relative path resolves");
+    let resolved = Path::new(&specs[0].command[0]);
+
+    assert!(
+        !resolved
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir)),
+        "`..` must be collapsed on the drive-relative fallback path, got {resolved:?}"
+    );
+    assert_eq!(resolved.file_name(), Some(std::ffi::OsStr::new("b")));
+    assert_eq!(warnings.len(), 1);
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn a_drive_relative_manifest_directory_resolves_and_warns() {
+    let yaml = "daemons:\n  frpc:\n    command: [bin/frpc.exe]\n";
+    let (_specs, warnings) = resolve(parse_manifest(yaml), Path::new("C:proj")).expect("-f C:proj resolves");
+    assert_eq!(warnings.len(), 1);
+    // A manifest-level advisory belongs to no daemon.
+    assert_eq!(warnings[0].id, None);
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn a_canonicalised_working_directory_carries_no_verbatim_prefix() {
+    let mut warnings = Vec::new();
+    let resolved = absolutize(Path::new("."), &mut warnings).expect("resolves");
+    assert!(
+        !resolved.to_string_lossy().starts_with(r"\\?\"),
+        "resolved base_dir must not carry the verbatim prefix: {resolved:?}"
+    );
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn verbatim_unc_strips_to_the_double_backslash_form() {
+    // Not `UNC\server\share\repo` — the trap this helper exists to avoid.
+    let verbatim = PathBuf::from(r"\\?\UNC\server\share\repo");
+    assert_eq!(strip_verbatim_prefix(verbatim), PathBuf::from(r"\\server\share\repo"));
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn verbatim_disk_strips_to_the_drive_form() {
+    let verbatim = PathBuf::from(r"\\?\C:\repo");
+    assert_eq!(strip_verbatim_prefix(verbatim), PathBuf::from(r"C:\repo"));
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn a_prefix_without_a_root_still_fails_to_resolve() {
+    // `\\?\C:` is a `VerbatimDisk` prefix with no root, which survives
+    // `std::path::absolute` unchanged and so is still rejected — the live
+    // branch of the reworded, no-longer-drive-relative-specific error.
+    let yaml = r"daemons:
+  frpc:
+    command: ['\\?\C:']
+";
+    let err = resolve(parse_manifest(yaml), &base_dir()).expect_err("a rootless prefix cannot resolve");
+    assert!(
+        !err.to_string().contains("drive-relative"),
+        "the live cause here is a rootless verbatim prefix, not a drive-relative path: {err}"
     );
 }
 
