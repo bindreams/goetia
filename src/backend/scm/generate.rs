@@ -48,7 +48,7 @@ use std::time::Duration;
 use crate::backend::Identity;
 use crate::blob::{self, Blob};
 use crate::error::Error;
-use crate::spec::{DaemonSpec, Id, Kind, Restart, User, Warning};
+use crate::spec::{DaemonSpec, Kind, MAX_SC_ACTION_DELAY, Restart, User};
 
 // Metadata field names ================================================================================================
 
@@ -78,14 +78,6 @@ const DEFAULT_RESTART_DELAY: Duration = Duration::from_secs(1);
 /// climbing across restarts within a day, but a service that has been
 /// healthy for a day gets a fresh budget.
 const FAILURE_RESET_PERIOD: Duration = Duration::from_secs(86_400);
-
-/// `SC_ACTION.Delay` is `dwDelay`, a `DWORD` of milliseconds: `windows-service`'s
-/// `ServiceAction::to_raw` converts a `Duration` into one with
-/// `u32::try_from(delay.as_millis()).expect("Too long delay")`, which
-/// **panics** — not a recoverable `Error` — for anything past this. `goetia.yaml`'s
-/// `restart-delay` has no upper bound of its own, so `registration` clamps to
-/// this rather than letting that panic reach an install; see `bounded_restart_delay`.
-const MAX_SC_ACTION_DELAY: Duration = Duration::from_millis(u32::MAX as u64);
 
 // ScmRegistration =====================================================================================================
 
@@ -133,19 +125,17 @@ pub struct FailureActions {
 
 // Building ============================================================================================================
 
-/// Build the [`ScmRegistration`] for `spec`, plus any non-fatal advisories
-/// produced along the way (currently: a `restart-delay` too large for
-/// `SC_ACTION.Delay` to express, clamped rather than left to panic at
-/// install time — see `MAX_SC_ACTION_DELAY`). Mirrors `spec::resolve`'s own
-/// `Warning` mechanism rather than truncating silently.
+/// Build the [`ScmRegistration`] for `spec`. A `restart-delay` too large
+/// for `SC_ACTION.Delay` to express is clamped rather than left to panic at
+/// install time — see `MAX_SC_ACTION_DELAY`; the advisory for that now
+/// fires at resolve time, from `Backend::Scm.warn`, on every host, rather
+/// than only when this effectful-install-time generator happens to run.
 ///
 /// `id` is the account already resolved by the effectful install path (see
 /// [`Identity`]) — this function does no lookup of its own. `shim_path` is
 /// only used for `Kind::Simple`, where the shim (not the spec's own command)
 /// is what SCM launches.
-pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> (ScmRegistration, Vec<Warning>) {
-    let mut warnings = Vec::new();
-
+pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> ScmRegistration {
     let (executable, arguments) = match spec.kind {
         // The shim supervises the child itself; SCM only ever launches the
         // shim, with the daemon id as its sole argument. The spec's own
@@ -172,7 +162,7 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> (ScmR
             Restart::OnFailure | Restart::Always => {
                 let delay = spec.restart_delay.unwrap_or(DEFAULT_RESTART_DELAY);
                 Some(FailureActions {
-                    delay: bounded_restart_delay(&spec.id, delay, &mut warnings),
+                    delay: bounded_restart_delay(delay),
                     reset_period: FAILURE_RESET_PERIOD,
                     on_non_crash_failures: true,
                 })
@@ -198,7 +188,7 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> (ScmR
     parameters.insert(FIELD_VERSION.to_string(), crate::version().to_string());
     parameters.insert(FIELD_SPEC.to_string(), blob::encode(spec));
 
-    let reg = ScmRegistration {
+    ScmRegistration {
         name: spec.id.as_str().to_string(),
         display_name: spec.name.clone(),
         executable,
@@ -206,28 +196,15 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> (ScmR
         account,
         failure_actions,
         parameters,
-    };
-
-    (reg, warnings)
+    }
 }
 
 /// Clamp `delay` to what `SC_ACTION.Delay` (a `DWORD` of milliseconds) can
-/// express, recording a [`Warning`] when clamping actually changes the
-/// value — silently truncating it is exactly the "does nothing and says
-/// nothing" failure mode this project's other duration handling
-/// (`spec::resolve`'s `warn_on_sub_second_restart_delay`) already rejects.
-fn bounded_restart_delay(id: &Id, delay: Duration, warnings: &mut Vec<Warning>) -> Duration {
-    if delay <= MAX_SC_ACTION_DELAY {
-        return delay;
-    }
-    warnings.push(Warning {
-        id: Some(id.clone()),
-        message: format!(
-            "restart-delay {delay:?} exceeds the ~49.71 days SC_ACTION.Delay (a DWORD of milliseconds) can \
-             express; clamped to {MAX_SC_ACTION_DELAY:?}"
-        ),
-    });
-    MAX_SC_ACTION_DELAY
+/// express. The advisory for when this actually changes the value lives in
+/// `Backend::Scm.warn` now (`spec/backend.rs`), not here — generation, not
+/// validation.
+fn bounded_restart_delay(delay: Duration) -> Duration {
+    delay.min(MAX_SC_ACTION_DELAY)
 }
 
 // Extraction ==========================================================================================================

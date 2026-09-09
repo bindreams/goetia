@@ -1114,14 +1114,16 @@ fn install_exit_code_does_not_mask_an_error_behind_a_conflict() {
     );
 }
 
-/// `--dry-run`'s preview must not silently drop a `Warning` a generator
-/// produces (e.g. SCM clamping a too-large `restart-delay`).
+/// `--dry-run`'s preview must not silently drop a `Warning` (e.g. SCM
+/// clamping a too-large `restart-delay`). This advisory now fires at
+/// resolve time, from `Backend::Scm.warn`, through `load_and_warn` — on
+/// every host, not only from an effectful Windows install preview — which
+/// is the property this test now pins.
 #[skuld::test]
 fn install_dry_run_prints_generator_warnings() {
     let dir = tempfile::tempdir().unwrap();
     // A restart-delay past SC_ACTION.Delay's ~49.71-day DWORD-milliseconds
-    // ceiling: only the Windows SCM preview warns about this, but the test
-    // must still pass (vacuously) on the other two platforms.
+    // ceiling.
     write_manifest(
         dir.path(),
         "daemons:\n  frpc:\n    command: [frpc]\n    type: managed\n    restart: on-failure\n    restart-delay: 60d\n",
@@ -1143,10 +1145,8 @@ fn install_dry_run_prints_generator_warnings() {
     let code = cli::dispatch(&cli, &get_manager, &is_elevated, &mut out, &mut err);
 
     assert_eq!(code, 0);
-    if cfg!(windows) {
-        let err = String::from_utf8_lossy(&err);
-        assert!(err.contains("warning:"), "stderr:\n{err}");
-    }
+    let err = String::from_utf8_lossy(&err);
+    assert!(err.contains("warning:"), "stderr:\n{err}");
 }
 
 /// The `list`/`status`/`show`/`diff` partitioning helper must warn about an

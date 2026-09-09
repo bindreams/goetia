@@ -1167,7 +1167,9 @@ fn an_interpolated_value_cannot_create_a_daemon_or_a_field() {
     let yaml = "daemons:\n  frpc:\n    name: ${EVIL}\n    command: [/bin/frpc]\n";
     let evil = "x\ncommand: [/bin/evil]\nbogus: 1";
     let mut raw = parse_manifest(yaml);
-    interpolate::manifest(&mut raw, &Vars::from_pairs(&[("EVIL", evil)])).expect("substitution should succeed");
+    let entry = raw.daemons.get_mut("frpc").expect("fixture declares frpc");
+    interpolate::spec(entry, "daemons.frpc", &Vars::from_pairs(&[("EVIL", evil)]))
+        .expect("substitution should succeed");
 
     assert_eq!(raw.daemons.len(), 1);
     assert_eq!(
@@ -1176,11 +1178,562 @@ fn an_interpolated_value_cannot_create_a_daemon_or_a_field() {
     );
     assert_eq!(raw.daemons["frpc"].name.as_deref(), Some(evil));
 
-    // `resolve` substitutes again, which is a no-op on this fixture: `evil`
-    // holds no `$`, so the manifest reaches the injection gate as it stands.
+    // `resolve` runs the injection gate on the substituted value once, not
+    // that a second substitution is a no-op, inside `resolve`, per daemon,
+    // on the merged native spec: `evil` holds no `$`, so `resolve`'s own
+    // substitution pass leaves it untouched and the injection gate is what
+    // actually rejects it.
     let err = resolve(raw, &base_dir()).unwrap_err();
     assert!(
         err.to_string().contains("control character"),
         "expected the control-character gate, got: {err}"
     );
+}
+
+// backend-specific overrides ==========================================================================================
+
+/// A backend that is not this host's native one. `Backend::ALL` always has
+/// at least two such entries (`Backend::native()` names at most one), so the
+/// first match is deterministic and always exists.
+fn non_native_backend() -> Backend {
+    Backend::ALL
+        .into_iter()
+        .find(|&b| Some(b) != Backend::native())
+        .expect("ALL has 3 entries; native() names at most 1")
+}
+
+#[skuld::test]
+fn resolve_applies_the_native_backends_override() {
+    let Some(native) = Backend::native() else {
+        return; // No native backend on this host: nothing to assert.
+    };
+    let yaml = format!(
+        "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user: root\n    backend-specific:\n      {native}:\n        \
+         user: bindreams\n"
+    );
+    let (specs, _warnings) = resolve_yaml(&yaml).expect("resolves");
+    assert_eq!(specs[0].user, User::Name("bindreams".to_string()));
+}
+
+#[skuld::test]
+fn resolve_ignores_a_non_native_backends_override() {
+    let backend = non_native_backend();
+    let yaml = format!(
+        "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user: root\n    backend-specific:\n      {backend}:\n        \
+         user: bindreams\n"
+    );
+    let (specs, _warnings) = resolve_yaml(&yaml).expect("resolves");
+    assert_eq!(
+        specs[0].user,
+        User::Root,
+        "a non-native override must not change the resolved spec"
+    );
+}
+
+#[skuld::test]
+fn an_invalid_non_native_override_fails_the_whole_manifest() {
+    let backend = non_native_backend();
+    let yaml = format!(
+        "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      {backend}:\n        \
+         user: \"evil\\nUser=0\"\n"
+    );
+    assert!(resolve_yaml(&yaml).is_err());
+}
+
+#[skuld::test]
+fn an_invalid_native_override_fails_the_whole_manifest() {
+    let Some(native) = Backend::native() else {
+        return;
+    };
+    // The pass whose spec is actually installed, and the one whose failure
+    // has a production consequence.
+    let yaml = format!(
+        "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      {native}:\n        \
+         user: \"evil\\nUser=0\"\n"
+    );
+    assert!(resolve_yaml(&yaml).is_err());
+}
+
+#[skuld::test]
+fn an_override_error_names_the_backend_that_caused_it() {
+    let non_native = non_native_backend();
+    let yaml = format!(
+        "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      {non_native}:\n        \
+         user: \"evil\\nUser=0\"\n"
+    );
+    let err = resolve_yaml(&yaml).unwrap_err();
+    assert!(
+        err.to_string().contains(&format!("backend-specific.{non_native}")),
+        "non-native: {err}"
+    );
+
+    if let Some(native) = Backend::native() {
+        let yaml = format!(
+            "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      {native}:\n        \
+             user: \"evil\\nUser=0\"\n"
+        );
+        let err = resolve_yaml(&yaml).unwrap_err();
+        assert!(
+            err.to_string().contains(&format!("backend-specific.{native}")),
+            "native: {err}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_base_spec_error_is_not_attributed_to_a_backend() {
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    name: \"evil\\nExecStart=/bin/evil\"\n";
+    let err = resolve_yaml(yaml).unwrap_err();
+    assert!(
+        !err.to_string().contains("backend-specific"),
+        "a base-spec error must not be attributed to a backend: {err}"
+    );
+}
+
+#[skuld::test]
+fn windows_style_absolute_paths_in_an_scm_override_are_accepted_on_any_host() {
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      scm:\n        \
+                command: [\"C:\\\\Program Files\\\\frpc\\\\frpc.exe\"]\n";
+    resolve_yaml(yaml).expect("a Windows-style absolute path under a non-native `scm:` override must resolve");
+}
+
+#[skuld::test]
+fn dedup_keeps_first_occurrence_and_preserves_order() {
+    let id = Id::try_from("frpc").unwrap();
+    let a = Warning {
+        id: Some(id.clone()),
+        message: "a".to_string(),
+    };
+    let b = Warning {
+        id: Some(id.clone()),
+        message: "b".to_string(),
+    };
+    let warnings = vec![a.clone(), b.clone(), a.clone()];
+    assert_eq!(dedup_warnings(warnings), vec![a, b]);
+}
+
+#[skuld::test]
+fn dedup_does_not_merge_warnings_differing_only_by_id() {
+    let a = Id::try_from("frpc").unwrap();
+    let b = Id::try_from("websocat").unwrap();
+    let w1 = Warning {
+        id: Some(a),
+        message: "same text".to_string(),
+    };
+    let w2 = Warning {
+        id: Some(b),
+        message: "same text".to_string(),
+    };
+    let warnings = vec![w1.clone(), w2.clone()];
+    assert_eq!(dedup_warnings(warnings), vec![w1, w2]);
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn a_base_drive_relative_path_warns_once_not_once_per_backend_pass() {
+    let yaml = "daemons:\n  frpc:\n    command: [\"C:bin/frpc.exe\"]\n";
+    let (_specs, warnings) = resolve(parse_manifest(yaml), &base_dir()).expect("resolves");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+}
+
+#[skuld::test]
+fn windows_divergence_warning_follows_the_scm_merged_spec() {
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    type: managed\n    cwd: .\n    backend-specific:\n      \
+                scm:\n        type: simple\n";
+    let (_specs, warnings) = resolve_yaml(yaml).expect("resolves");
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[skuld::test]
+fn windows_divergence_warning_fires_for_an_scm_only_managed_type() {
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    type: simple\n    cwd: .\n    backend-specific:\n      \
+                scm:\n        type: managed\n";
+    let (_specs, warnings) = resolve_yaml(yaml).expect("resolves");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+}
+
+#[skuld::test]
+fn sub_second_delay_warning_follows_the_launchd_merged_spec() {
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    restart-delay: 500ms\n    backend-specific:\n      \
+                launchd:\n        restart-delay: 2s\n";
+    let (_specs, warnings) = resolve_yaml(yaml).expect("resolves");
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[skuld::test]
+fn each_warning_fires_exactly_once_across_every_backend_pass() {
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    restart-delay: 500ms\n";
+    let (_specs, warnings) = resolve_yaml(yaml).expect("resolves");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+}
+
+#[skuld::test]
+fn an_override_on_every_backend_resolves() {
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      launchd:\n        \
+                user: bindreams\n      scm:\n        user: bindreams\n      systemd:\n        user: bindreams\n";
+    resolve_yaml(yaml).expect("resolves");
+}
+
+#[skuld::test]
+fn a_command_only_under_the_native_backend_installs() {
+    let Some(native) = Backend::native() else {
+        return;
+    };
+    let yaml = format!("daemons:\n  frpc:\n    backend-specific:\n      {native}:\n        command: [/bin/frpc]\n");
+    let (specs, _warnings) = resolve_yaml(&yaml).expect("resolves");
+    assert!(!specs[0].command.is_empty());
+}
+
+#[skuld::test]
+fn a_command_missing_for_the_native_backend_is_an_error() {
+    let Some(native) = Backend::native() else {
+        return;
+    };
+    let yaml = "daemons:\n  frpc:\n    name: frpc\n";
+    let err = resolve_yaml(yaml).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains(&native.to_string()), "should name the backend: {msg}");
+    assert!(msg.contains("command"), "should name the remedy: {msg}");
+    assert!(
+        msg.contains("backend-specific"),
+        "should name the override remedy: {msg}"
+    );
+}
+
+#[skuld::test]
+fn a_command_missing_for_a_non_native_backend_resolves() {
+    let Some(native) = Backend::native() else {
+        return;
+    };
+    // A command present only for the native backend: completeness is
+    // per-install, not per-backend, and a Windows-less manifest is usable
+    // on Linux.
+    let yaml = format!("daemons:\n  frpc:\n    backend-specific:\n      {native}:\n        command: [/bin/frpc]\n");
+    resolve_yaml(&yaml).expect("resolves");
+}
+
+#[skuld::test]
+fn an_empty_command_is_rejected_like_a_missing_one() {
+    let Some(native) = Backend::native() else {
+        return;
+    };
+    let yaml = format!("daemons:\n  frpc:\n    backend-specific:\n      {native}:\n        command: []\n");
+    let err = resolve_yaml(&yaml).unwrap_err();
+    assert!(err.to_string().contains("command"));
+}
+
+#[skuld::test]
+fn an_empty_user_name_is_rejected_on_every_backend() {
+    // Guards the seam: `resolve_shape` must carry `reject_blank` across from
+    // `resolve_one`. See `reject_blank`'s doc comment (`resolve.rs`) for why
+    // an empty account name is dangerous rather than merely odd.
+    assert!(resolve_yaml("daemons:\n  frpc:\n    command: [/bin/frpc]\n    user: \"\"\n").is_err());
+    assert!(resolve_yaml("daemons:\n  frpc:\n    command: [/bin/frpc]\n    user:\n      id: \"\"\n").is_err());
+}
+
+#[skuld::test]
+fn a_numeric_uid_under_scm_is_rejected_on_every_host() {
+    // The finding that showed the architecture claim was false as first
+    // written: a per-backend rejection applied to `merged_for` unmasked by
+    // `Supplied` would reject far more than this.
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      scm:\n        \
+                user:\n          id: 1000\n";
+    let err = resolve_yaml(yaml).unwrap_err();
+    if Backend::native() != Some(Backend::Scm) {
+        // On a host where `scm` is non-native, the rejection runs in the
+        // sweep (step 4) and is attributed to the backend. Where `scm` is
+        // native (Windows), the same rule runs in the native pass (step 5),
+        // which is not backend-attributed — see `resolve`'s error
+        // annotation section — but must still fail.
+        assert!(err.to_string().contains("backend-specific.scm"), "{err}");
+    }
+}
+
+#[skuld::test]
+fn a_windows_builtin_account_under_a_posix_backend_is_rejected_on_every_host() {
+    assert!(
+        resolve_yaml(
+            "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      systemd:\n        \
+             user: LocalService\n"
+        )
+        .is_err()
+    );
+    assert!(
+        resolve_yaml(
+            "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      launchd:\n        \
+             user: LocalService\n"
+        )
+        .is_err()
+    );
+}
+
+#[skuld::test]
+fn a_sid_under_a_posix_backend_is_rejected_at_resolve_time() {
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      systemd:\n        \
+                user:\n          id: \"S-1-5-19\"\n";
+    let err = resolve_yaml(yaml).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("unquoted"),
+        "message should tell a user who meant a uid to write it unquoted: {err}"
+    );
+}
+
+#[skuld::test]
+fn a_base_uid_resolves_on_every_host() {
+    // The regression guard on `Supplied`. `merged_for(Scm)` on this manifest
+    // *is* the base spec (there is no `backend-specific` block at all), so
+    // an unmasked `Scm.error` would reject a plain Linux manifest —
+    // published interface, `README.md` — on Linux and macOS. No `cfg`: "on
+    // every host" is the claim.
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user:\n      id: 1000\n";
+    let (specs, _warnings) = resolve_yaml(yaml).expect("a base numeric uid must resolve on every host");
+    assert_eq!(specs[0].user, User::Id(AccountId::Uid(1000)));
+}
+
+#[skuld::test]
+fn a_base_windows_account_resolves_on_every_host() {
+    // The symmetric direction: without `Supplied`, these fail on Windows,
+    // where `Systemd.error`/`Launchd.error` sweep the base spec. Neither
+    // half is reachable from a Linux runner, which is exactly why it is
+    // written here rather than left to be discovered on CI.
+    let yaml_sid = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user:\n      id: \"S-1-5-19\"\n";
+    resolve_yaml(yaml_sid).expect("a base SID must resolve on every host");
+
+    let yaml_name = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user: LocalService\n";
+    resolve_yaml(yaml_name).expect("a base Windows built-in name must resolve on every host");
+}
+
+#[skuld::test]
+fn a_base_named_system_account_resolves_under_every_backend() {
+    // `system` is a legal POSIX username, so `windows_only_account` must not
+    // recognise it as Windows-only.
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user: system\n";
+    resolve_yaml(yaml).expect("a base `system` account must resolve under every backend");
+
+    let yaml_override = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      systemd:\n        \
+                         user: system\n";
+    resolve_yaml(yaml_override).expect("`system` under a systemd override must resolve: it is a legal POSIX username");
+}
+
+#[skuld::test]
+fn an_over_long_restart_delay_warns_on_every_host() {
+    // All three keys are load-bearing: the advisory is unreachable for
+    // `Kind::Simple` and for `Restart::Never`.
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    type: managed\n    restart: on-failure\n    restart-delay: 100d\n";
+    let (_specs, warnings) = resolve_yaml(yaml).expect("resolves, with a warning");
+    assert!(
+        warnings.iter().any(|w| w.message.contains("restart-delay")),
+        "expected the SCM clamp advisory on every host: {warnings:?}"
+    );
+}
+
+#[skuld::test]
+fn an_over_long_restart_delay_with_no_type_does_not_warn() {
+    // The unit-level twin of `huge_restart_delay_saturates_instead_of_overflowing`,
+    // which asserts exactly one warning (the sub-second one) for a
+    // near-`Duration::MAX` delay written the same way.
+    let yaml = format!(
+        "daemons:\n  frpc:\n    command: [/bin/frpc]\n    restart-delay: {}s 1ns\n",
+        u64::MAX
+    );
+    let (_specs, warnings) = resolve_yaml(&yaml).expect("resolves");
+    assert!(
+        !warnings.iter().any(|w| w.message.contains("SC_ACTION")),
+        "the SCM clamp advisory is unreachable with no `type:`/`restart:`: {warnings:?}"
+    );
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn a_templated_drive_relative_path_warns_once_quoting_the_substituted_path() {
+    let dir = fixture_dir(
+        "daemons:\n  frpc:\n    command: [\"C:${SUB}\"]\n",
+        Some("SUB=bin/frpc.exe\n"),
+    );
+    let (_specs, warnings) = load(&dir.path().join("goetia.yaml")).expect("resolves");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].message.contains("C:bin/frpc.exe"),
+        "warning should quote the substituted spelling: {}",
+        warnings[0].message
+    );
+    assert!(
+        !warnings[0].message.contains("${SUB}"),
+        "warning must not quote the unresolved template: {}",
+        warnings[0].message
+    );
+}
+
+#[skuld::test]
+fn an_interpolation_grammar_error_in_a_non_native_override_is_rejected_on_this_host() {
+    let backend = non_native_backend();
+    let yaml = format!(
+        "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      {backend}:\n        name: \"$HOME\"\n"
+    );
+    let err = resolve_yaml(&yaml).unwrap_err();
+    assert!(err.to_string().contains("not part of"), "{err}");
+}
+
+#[skuld::test]
+fn a_base_grammar_error_is_rejected_even_when_every_backend_overrides_the_field() {
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    name: \"a$b\"\n    backend-specific:\n      \
+                launchd:\n        name: ok1\n      scm:\n        name: ok2\n      systemd:\n        name: ok3\n";
+    let err = resolve_yaml(yaml).unwrap_err();
+    assert!(err.to_string().contains("not part of"), "{err}");
+}
+
+#[skuld::test]
+fn a_bare_dollar_in_an_env_value_survives_a_substituted_pass() {
+    let dir = fixture_dir(
+        "daemons:\n  frpc:\n    command: [/bin/frpc]\n    env:\n      X: ${S}\n",
+        Some("S=ab$cd\n"),
+    );
+    let (specs, _warnings) = load(&dir.path().join("goetia.yaml")).expect("resolves");
+    assert_eq!(specs[0].env["X"], "ab$cd");
+}
+
+#[skuld::test]
+fn a_base_value_must_pass_the_shape_gate_even_when_every_backend_overrides_it() {
+    // Deliberate: the base pass shape-checks every authored value, even one
+    // no backend ends up using, so a dead value cannot sit in the manifest
+    // as a trap for whoever later deletes an override. `C:\ProgramData\frpc`
+    // names the same directory as `C:\ProgramData\frpc\`, so the remedy is
+    // lossless: write the value under the backends that need it instead.
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    cwd: \"C:\\\\ProgramData\\\\frpc\\\\\"\n    \
+                backend-specific:\n      launchd:\n        cwd: /var/frpc\n      scm:\n        cwd: /var/frpc\n      \
+                systemd:\n        cwd: /var/frpc\n";
+    let err = resolve_yaml(yaml).unwrap_err();
+    assert!(err.to_string().contains("backslash"), "{err}");
+}
+
+// The `$`-skip rule for `restart`/`type`/`restart-delay` ==============================================================
+
+#[skuld::test]
+fn a_templated_restart_resolves() {
+    let dir = fixture_dir(
+        "daemons:\n  frpc:\n    command: [/bin/frpc]\n    restart: ${R}\n",
+        Some("R=always\n"),
+    );
+    let (specs, _warnings) = load(&dir.path().join("goetia.yaml")).expect("resolves");
+    assert_eq!(specs[0].restart, Restart::Always);
+}
+
+#[skuld::test]
+fn a_templated_type_resolves() {
+    let dir = fixture_dir(
+        "daemons:\n  frpc:\n    command: [/bin/frpc]\n    type: ${T}\n",
+        Some("T=managed\n"),
+    );
+    let (specs, _warnings) = load(&dir.path().join("goetia.yaml")).expect("resolves");
+    assert_eq!(specs[0].kind, Kind::Managed);
+}
+
+#[skuld::test]
+fn a_templated_restart_delay_resolves() {
+    let dir = fixture_dir(
+        "daemons:\n  frpc:\n    command: [/bin/frpc]\n    restart-delay: ${D}\n",
+        Some("D=2s\n"),
+    );
+    let (specs, _warnings) = load(&dir.path().join("goetia.yaml")).expect("resolves");
+    assert_eq!(specs[0].restart_delay, Some(Duration::from_secs(2)));
+}
+
+#[skuld::test]
+fn a_templated_restart_in_the_native_override_resolves() {
+    let Some(native) = Backend::native() else {
+        return;
+    };
+    let yaml = format!(
+        "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      {native}:\n        restart: ${{R}}\n"
+    );
+    let dir = fixture_dir(&yaml, Some("R=always\n"));
+    let (specs, _warnings) = load(&dir.path().join("goetia.yaml")).expect("resolves");
+    assert_eq!(specs[0].restart, Restart::Always);
+}
+
+#[skuld::test]
+fn a_literal_bad_restart_in_a_non_native_override_is_still_rejected() {
+    let backend = non_native_backend();
+    let yaml = format!(
+        "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      {backend}:\n        restart: bogus\n"
+    );
+    let err = resolve_yaml(&yaml).unwrap_err();
+    assert!(
+        err.to_string().contains(&format!("backend-specific.{backend}")),
+        "{err}"
+    );
+}
+
+#[skuld::test]
+fn a_templated_restart_in_a_non_native_override_is_not_parsed_here() {
+    let backend = non_native_backend();
+    let yaml = format!(
+        "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      {backend}:\n        restart: ${{R}}\n"
+    );
+    resolve_yaml(&yaml)
+        .expect("an unresolvable templated value under a non-native backend must be unchecked, not guessed at");
+}
+
+#[skuld::test]
+fn an_escaped_dollar_in_an_enum_field_is_deferred_and_then_rejected() {
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    restart: $$never\n";
+    let err = resolve_yaml(yaml).unwrap_err();
+    assert!(
+        err.to_string().contains("field `restart` is `$never`"),
+        "the value must be deferred (it carries a `$`) and then rejected once substitution changes nothing: {err}"
+    );
+}
+
+#[skuld::test]
+fn a_variable_used_only_in_a_non_native_override_does_not_read_the_env_file() {
+    let backend = non_native_backend();
+    let yaml = format!(
+        "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      {backend}:\n        restart: ${{R}}\n"
+    );
+    let dir = fixture_dir(&yaml, None);
+    std::fs::create_dir(dir.path().join(".env")).expect("fixture directory should be creatable");
+    let (specs, _warnings) =
+        load(&dir.path().join("goetia.yaml")).expect("must not read .env for a value it will never substitute");
+    assert_eq!(specs.len(), 1);
+}
+
+// The relocated key-position rules ====================================================================================
+
+#[skuld::test]
+fn a_dollar_in_a_daemon_id_is_rejected_by_resolve() {
+    let yaml = "daemons:\n  ${ID}:\n    command: [/bin/frpc]\n";
+    let err = resolve_yaml(yaml).unwrap_err();
+    assert!(
+        err.to_string().contains("a daemon id cannot be interpolated"),
+        "expected the id-is-a-key rejection, not the id-pattern one: {err}"
+    );
+    assert!(
+        !err.to_string().contains("does not match the required pattern"),
+        "the id-is-a-key rejection must run first: {err}"
+    );
+}
+
+#[skuld::test]
+fn a_dollar_in_an_env_name_is_rejected_under_every_backend() {
+    let backend = non_native_backend();
+    let yaml = format!(
+        "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      {backend}:\n        \
+         env:\n          ${{K}}: v\n"
+    );
+    let err = resolve_yaml(&yaml).unwrap_err();
+    assert!(
+        err.to_string().contains("an `env` name cannot be interpolated"),
+        "{err}"
+    );
+}
+
+#[skuld::test]
+fn a_dollar_in_a_user_id_is_rejected_under_every_backend() {
+    let backend = non_native_backend();
+    let yaml = format!(
+        "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      {backend}:\n        \
+         user:\n          id: \"${{S}}\"\n"
+    );
+    let err = resolve_yaml(&yaml).unwrap_err();
+    assert!(err.to_string().contains(interpolate::USER_ID_MESSAGE), "{err}");
 }

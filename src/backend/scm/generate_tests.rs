@@ -56,10 +56,8 @@ fn shim_path() -> PathBuf {
     abs("Program Files/Goetia/goetia-shim.exe")
 }
 
-/// `registration` returns `(ScmRegistration, Vec<Warning>)`; most tests
-/// only care about the registration, so this drops the warnings for them.
 fn build(spec: &DaemonSpec) -> ScmRegistration {
-    registration(spec, &identity(), &shim_path()).0
+    registration(spec, &identity(), &shim_path())
 }
 
 // executable/arguments per Kind =======================================================================================
@@ -103,7 +101,7 @@ fn named_user_account_uses_resolved_identity() {
     let mut spec = managed_spec();
     spec.user = User::Name("bindreams".to_string());
     let id = identity();
-    let reg = registration(&spec, &id, &shim_path()).0;
+    let reg = registration(&spec, &id, &shim_path());
 
     assert_eq!(
         reg.account,
@@ -530,12 +528,12 @@ fn managed_kind_restart_always_also_sets_failure_actions() {
 }
 
 #[skuld::test]
-fn managed_kind_clamps_absurdly_long_restart_delay_and_warns() {
+fn managed_kind_clamps_absurdly_long_restart_delay() {
     let mut spec = managed_spec();
     // One millisecond past what a DWORD of milliseconds (SC_ACTION.Delay)
     // can express.
     spec.restart_delay = Some(MAX_SC_ACTION_DELAY + Duration::from_millis(1));
-    let (reg, warnings) = registration(&spec, &identity(), &shim_path());
+    let reg = registration(&spec, &identity(), &shim_path());
 
     let fa = reg
         .failure_actions
@@ -545,23 +543,25 @@ fn managed_kind_clamps_absurdly_long_restart_delay_and_warns() {
         "an out-of-range delay must be clamped, not passed through to a value that panics \
          inside windows-service's ServiceAction::to_raw"
     );
-    assert!(
-        warnings
-            .iter()
-            .any(|w| w.id.as_ref() == Some(&spec.id) && w.message.contains("restart-delay")),
-        "clamping must be reported as a Warning, not done silently: {warnings:?}"
-    );
+    // The advisory for this half moved to `Backend::Scm.warn`
+    // (`spec/backend_tests.rs`'s `an_over_long_delay_warns_from_the_scm_arm`)
+    // so it fires at resolve time on every host, not only when this
+    // effectful-install-time generator happens to run.
 }
 
 #[skuld::test]
-fn managed_kind_restart_delay_within_bound_does_not_warn() {
+fn managed_kind_restart_delay_within_bound_does_not_clamp() {
     let mut spec = managed_spec();
     spec.restart_delay = Some(Duration::from_secs(42));
-    let (_, warnings) = registration(&spec, &identity(), &shim_path());
+    let reg = registration(&spec, &identity(), &shim_path());
 
-    assert!(
-        warnings.is_empty(),
-        "a restart-delay well within SC_ACTION.Delay's range must not warn: {warnings:?}"
+    let fa = reg
+        .failure_actions
+        .expect("restart: on-failure must configure recovery actions");
+    assert_eq!(
+        fa.delay,
+        Duration::from_secs(42),
+        "a restart-delay well within SC_ACTION.Delay's range must pass through unclamped"
     );
 }
 
@@ -586,9 +586,9 @@ fn render_is_the_generation_invariant() {
     let id = identity();
     let shim = shim_path();
 
-    let original = registration(&spec, &id, &shim).0;
+    let original = registration(&spec, &id, &shim);
     let recovered_spec = extract(&original.parameters).unwrap().unwrap().spec;
-    let regenerated = registration(&recovered_spec, &id, &shim).0;
+    let regenerated = registration(&recovered_spec, &id, &shim);
 
     assert_eq!(
         render(&original),

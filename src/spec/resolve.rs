@@ -45,13 +45,36 @@
 //! daemon starts, cannot find its own config, and exits with no
 //! indication that a working directory was ever the problem. Set `cwd`, or
 //! write the argument absolute.
+//!
+//! # Why the grammar check exists, and why it is not just `scalar` with an
+//! empty `Vars`
+//!
+//! `interpolate::scalar` rejects a `$` that is not part of `${...}` or `$$`,
+//! rejects an unterminated `${`, an empty name, an invalid name character,
+//! and a `$` inside a `:-` default. Every one of those is `str` grammar over
+//! authored text — no `.env`, no substitution, no target machine — which is
+//! shape. But `interpolate::spec` runs **only on the native merged spec**,
+//! so without a separate check `scm: {name: "$HOME"}` would resolve cleanly
+//! on Linux and fail only at install on Windows, and a bad `$` in a base
+//! value that the native override replaces would never be diagnosed at all.
+//! Running `scalar` with `Vars::empty()` is not the check: it would fail on
+//! `${VAR}` for the missing variable, which is precisely the thing a
+//! non-native backend is not entitled to decide. `interpolate::check_grammar`/
+//! `check_spec_grammar` are that separate check.
+//!
+//! `check_spec_grammar` runs in [`Phase::Authored`] only: a `.env` value
+//! carrying a literal `$` (`SECRET=abc$def`) is legal, survives the one
+//! substitution, and would fail a grammar check applied to substituted
+//! text.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use super::backend::{Backend, Shaped, ShapedSpec};
 use super::interpolate;
+use super::overrides::Supplied;
 use super::raw::RawManifest;
 use super::user::{AccountId, RawUser, User};
 use super::vars::Vars;
@@ -60,22 +83,41 @@ use crate::error::Error;
 
 const MANIFEST_FILE_NAME: &str = "goetia.yaml";
 
+/// Which of the five passes this is. Only the path advisories read it: they
+/// quote the value as written, so a pass over authored text must stay
+/// silent about a path a substitution is going to rewrite, or one path
+/// produces two differently-worded warnings the dedup cannot collapse. See
+/// `resolve_path_string`.
+#[derive(Clone, Copy)]
+enum Phase {
+    /// Steps 3 and 4: uninterpolated, authored text.
+    Authored,
+    /// Step 5: the one substituted pass.
+    Substituted,
+}
+
 /// Turn a parsed manifest into resolved daemon specs.
 ///
-/// Every `${VAR}` is substituted first, against the `.env` file beside
-/// `base_dir`. That step lives here rather than in [`load`] because this
-/// function is public and takes a public [`RawManifest`]: were it a
-/// separate step a caller had to remember, a manifest reaching this one
-/// directly would resolve with its references intact, and systemd applies
-/// its *own* `${...}` expansion to `ExecStart=` — turning an unsubstituted
-/// reference into an empty string inside a privileged unit.
+/// Substitution happens inside `resolve`, per daemon, on the merged native
+/// spec — see step 5 below. That is what lets `resolve` promise that no
+/// `${VAR}` survives into a returned spec: were it a separate step a caller
+/// had to remember, a manifest reaching this one directly would resolve
+/// with its references intact, and systemd applies its *own* `${...}`
+/// expansion to `ExecStart=` — turning an unsubstituted reference into an
+/// empty string inside a privileged unit. That guarantee holds of every
+/// spec `resolve` *returns*; it does not hold of a non-native backend's
+/// override, which is validated as written (uninterpolated) and then
+/// discarded — the best any host can honestly do for a backend it cannot
+/// install.
 ///
-/// Relative `command[0]`, `cwd`, and `logs` paths are then resolved
-/// against `base_dir` and written back absolute. Fails on the first
-/// invalid daemon; a valid manifest may still produce `Warning`s for
-/// properties that are accepted but cannot be faithfully honored on every
-/// platform.
-pub fn resolve(mut raw: RawManifest, base_dir: &Path) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
+/// Every backend's override is validated, on every host: see steps 3-5.
+/// Only the native backend's merged spec — substituted, shaped, and
+/// completed — becomes the returned `DaemonSpec`. Relative `command[0]`,
+/// `cwd`, and `logs` paths are resolved against `base_dir` and written back
+/// absolute. Fails on the first invalid daemon; a valid manifest may still
+/// produce `Warning`s for properties that are accepted but cannot be
+/// faithfully honored on every platform.
+pub fn resolve(raw: RawManifest, base_dir: &Path) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
     // Declared before `absolutize` runs, not after: `absolutize` itself can
     // now push a manifest-level advisory (a drive-relative `-f`), and
     // `Vec::new()` reads nothing, so hoisting the declaration up is safe by
@@ -92,22 +134,111 @@ pub fn resolve(mut raw: RawManifest, base_dir: &Path) -> Result<(Vec<DaemonSpec>
     let base_dir = absolutize(base_dir, &mut warnings)?;
     let base_dir = base_dir.as_path();
 
-    // A manifest with no `$` in it never reads `.env`, so an unrelated or
-    // root-only-readable file beside the manifest cannot break `install`,
-    // `show` or `diff`.
-    let vars = if interpolate::manifest_would_change(&raw) {
+    // Step 1: ids, and the guard that used to live in `interpolate::manifest`.
+    // Must run before `Id::try_from`, or the id-pattern check (whose
+    // charset already excludes `$`) answers first with its generic
+    // message. The id is not overridable, so this runs once per daemon.
+    let mut entries: Vec<(Id, RawSpec)> = Vec::with_capacity(raw.daemons.len());
+    for (key, raw_spec) in raw.daemons {
+        interpolate::reject_interpolated_id(&key)?;
+        let id = Id::try_from(key)?;
+        entries.push((id, raw_spec));
+    }
+
+    // Step 2: the `.env` gate, computed from the specs substitution will
+    // actually run on (step 5), not from every backend's override. Reading
+    // it from anything else either misses a `${VAR}` written only in the
+    // native override (it currently fails "no value for X" while `.env`
+    // defines it) or lets an unrelated/unreadable `.env` break a host whose
+    // native backend has no `$` anywhere.
+    let native = Backend::native();
+    let merged_native: Vec<(RawSpec, Supplied)> = entries
+        .iter()
+        .map(|(_, raw)| match native {
+            Some(b) => raw.merged_for(b),
+            None => (raw.without_overrides(), Supplied::NONE),
+        })
+        .collect();
+    let vars = if merged_native
+        .iter()
+        .any(|(spec, _)| interpolate::spec_would_change(spec))
+    {
         Vars::load(base_dir)?
     } else {
         Vars::empty()
     };
-    interpolate::manifest(&mut raw, &vars)?;
 
-    let mut specs = Vec::with_capacity(raw.daemons.len());
+    let mut specs = Vec::with_capacity(entries.len());
 
-    for (key, entry) in raw.daemons {
-        let id = Id::try_from(key)?;
-        let spec = resolve_one(id, entry, base_dir, &mut warnings)?;
+    for ((id, raw), (mut native_merged, native_supplied)) in entries.into_iter().zip(merged_native) {
+        let path = format!("daemons.{id}");
+        let mut daemon_warnings = Vec::new();
+
+        // Step 3: the base pass. Reported verbatim — no backend
+        // attribution, because a base-spec error is not any backend's
+        // fault, and base errors therefore always win on precedence. Its
+        // warnings are dropped: a later pass re-derives every one of them
+        // from the same authored values. No `Backend` verdict runs here:
+        // the base spec is nobody's override.
+        let base = raw.without_overrides();
+        interpolate::check_spec_grammar(&base, &path)?;
+        resolve_shape(&id, base, base_dir, Phase::Authored)?;
+
+        // Step 4: the all-backends sweep. Backend annotation covers the
+        // whole iteration, not just `resolve_shape`: every `Error` raised
+        // anywhere in this pass — from shape or from `Backend::error` — is
+        // annotated with `backend` before it propagates.
+        for backend in Backend::ALL {
+            let (merged, supplied) = raw.merged_for(backend);
+            let has_entry = raw.backend_specific.contains_key(&backend);
+            let sweep: Result<(), Error> = (|| {
+                interpolate::check_spec_grammar(&merged, &path)?;
+                let (shaped, pass_warnings) = resolve_shape(&id, merged, base_dir, Phase::Authored)?;
+                if Some(backend) != native {
+                    // This is the only pass that will ever see this
+                    // backend's spec, so it is where its advisories come
+                    // from — computed from uninterpolated text, the best
+                    // this host can honestly do.
+                    backend.error(&shaped, supplied)?;
+                    let mut backend_warnings = pass_warnings;
+                    backend.warn(&shaped, &mut backend_warnings);
+                    daemon_warnings.extend(backend_warnings);
+                }
+                // `supplied` is read by the non-native arm only; the native
+                // arm keeps neither warnings nor verdicts — `error`/`warn`
+                // run in step 5 instead, on the substituted text they are
+                // entitled to. This pass is not redundant even so: it is
+                // what makes step 5's failures provably substitution's
+                // fault, and it is where a *literal* control character in
+                // the native override is caught and attributed here.
+                Ok(())
+            })();
+            sweep.map_err(|e| annotate_sweep_error(e, backend, has_entry))?;
+        }
+
+        // Step 5: the native pass, and the one substitution. Authoritative:
+        // it is where the injection gate inspects final values, and its
+        // `ShapedSpec` is the one that becomes a `DaemonSpec`. No
+        // `check_spec_grammar` here — the text is substituted, and a
+        // `.env` value may legally carry a literal `$`.
+        let native_entry = native.filter(|b| raw.backend_specific.contains_key(b));
+        let step5: Result<(ShapedSpec, Vec<Warning>), Error> = (|| {
+            interpolate::spec(&mut native_merged, &path, &vars)?;
+            let (shaped, mut pass_warnings) = resolve_shape(&id, native_merged, base_dir, Phase::Substituted)?;
+            if let Some(b) = native {
+                b.error(&shaped, native_supplied)?;
+                b.warn(&shaped, &mut pass_warnings);
+            }
+            Ok((shaped, pass_warnings))
+        })();
+        let (shaped, pass_warnings) = step5.map_err(|e| annotate_step5_error(e, native_entry))?;
+        daemon_warnings.extend(pass_warnings);
+
+        // Step 6: dedup and complete.
+        let daemon_warnings = dedup_warnings(daemon_warnings);
+        let spec = require_complete(shaped, native)?;
         specs.push(spec);
+        warnings.extend(daemon_warnings);
     }
 
     Ok((specs, warnings))
@@ -140,29 +271,126 @@ pub fn load(path: &Path) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
     resolve(raw, &base_dir)
 }
 
-fn resolve_one(id: Id, raw: RawSpec, base_dir: &Path, warnings: &mut Vec<Warning>) -> Result<DaemonSpec, Error> {
+/// Backend annotation for step 4. `Error::Invalid` (from `resolve_shape` or
+/// `Backend::error`) always gains the `backend-specific.<backend>: `
+/// message prefix: this pass's spec is `merged_for(backend)`, and the base
+/// pass (step 3) already validated the value's base form, so a failure here
+/// can only be attributable to this backend's override — `has_entry` is
+/// true whenever this actually fires. `Error::Interpolate` (from
+/// `check_spec_grammar`) gets a path suffix instead, gated on `has_entry`
+/// explicitly rather than relying on that same reasoning to make the
+/// ungated case unreachable.
+fn annotate_sweep_error(err: Error, backend: Backend, has_entry: bool) -> Error {
+    match err {
+        Error::Invalid { daemon, message } => Error::Invalid {
+            daemon,
+            message: format!("backend-specific.{backend}: {message}"),
+        },
+        Error::Interpolate { path, message } if has_entry => Error::Interpolate {
+            path: format!("{path} (backend-specific.{backend})"),
+            message,
+        },
+        other => other,
+    }
+}
+
+/// Backend annotation for step 5. `Error::Interpolate` (from
+/// `interpolate::spec`'s substitution) gains a "merged with" path suffix,
+/// gated on `native_entry` — `Supplied` answers "which fields did this
+/// override write" and gates `Backend::error`; `native_entry` (`raw`'s
+/// `backend_specific.contains_key`) answers "was this backend mentioned at
+/// all" and gates this annotation; the two are not interchangeable, since
+/// `scm: {}` is an entry that sets no field and its `Supplied` is
+/// byte-identical to a missing entry's. `Error::Invalid` (from
+/// `resolve_shape`'s injection gate, or from `Backend::error`/`warn`) gains
+/// an "after substituting from .env" message prefix instead: the
+/// uninterpolated pass over the same merged spec (step 4's native arm)
+/// already passed, so the only thing that changed is substitution, and the
+/// error must say so rather than pointing a reader at the manifest line
+/// that merely referenced the variable.
+fn annotate_step5_error(err: Error, native_entry: Option<Backend>) -> Error {
+    match err {
+        Error::Interpolate { path, message } => {
+            let path = match native_entry {
+                Some(b) => format!("{path} (merged with backend-specific.{b})"),
+                None => path,
+            };
+            Error::Interpolate { path, message }
+        }
+        Error::Invalid { daemon, message } => Error::Invalid {
+            daemon,
+            message: format!("after substituting from .env: {message}"),
+        },
+        other => other,
+    }
+}
+
+/// Deduplicate `warnings` on the whole [`Warning`] (`id` plus `message`),
+/// keeping the first occurrence and preserving order. Task 4's
+/// drive-relative advisory is a property of an authored path value, not of
+/// a backend, so a path written in the *base* spec produces the identical
+/// warning in every pass that keeps warnings — collapsing those duplicates
+/// to one is this function's whole job.
+///
+/// **This depends on the warning text quoting the raw path.** Two
+/// advisories about two *different* paths stay distinct only because the
+/// message contains the path; if that text is ever shortened to drop the
+/// path, this begins silently merging warnings about different paths, and
+/// no test catches it — the existing tests assert counts only for cases
+/// where the messages genuinely are identical.
+fn dedup_warnings(warnings: Vec<Warning>) -> Vec<Warning> {
+    let mut out: Vec<Warning> = Vec::with_capacity(warnings.len());
+    for w in warnings {
+        if !out.contains(&w) {
+            out.push(w);
+        }
+    }
+    out
+}
+
+/// Shape only: injection gate, path resolution, the three `$`-aware
+/// parses. Requires no particular field to be present — completeness is
+/// [`require_complete`]'s job.
+fn resolve_shape(id: &Id, raw: RawSpec, base_dir: &Path, phase: Phase) -> Result<(ShapedSpec, Vec<Warning>), Error> {
+    debug_assert!(
+        raw.backend_specific.is_empty(),
+        "resolve_shape must be handed a merged spec, never one still carrying overrides"
+    );
+
+    let mut warnings = Vec::new();
+
     let name = raw.name.unwrap_or_else(|| id.as_str().to_string());
-    reject_unemittable(&id, "name", &name)?;
+    reject_unemittable(id, "name", &name)?;
 
-    reject_empty_command(&id, raw.command.as_deref().unwrap_or_default())?;
-    let mut command = raw.command.unwrap_or_default();
-    for arg in &command {
-        reject_unemittable(&id, "command", arg)?;
+    let mut command = raw.command;
+    if let Some(cmd) = &command {
+        for arg in cmd {
+            reject_unemittable(id, "command", arg)?;
+        }
     }
-    if let Some(first) = command.first_mut() {
-        reject_empty(&id, "command[0]", first)?;
-        *first = resolve_path_string(&id, "command", first, base_dir, warnings)?;
+    if let Some(first) = command.as_mut().and_then(|c| c.first_mut()) {
+        reject_empty(id, "command[0]", first)?;
+        *first = resolve_path_string(id, "command", first, base_dir, phase, &mut warnings)?;
     }
 
-    let cwd = resolve_optional_path(&id, "cwd", raw.cwd, base_dir, warnings)?;
-    let logs = resolve_optional_path(&id, "logs", raw.logs, base_dir, warnings)?;
+    let cwd = resolve_optional_path(id, "cwd", raw.cwd, base_dir, phase, &mut warnings)?;
+    let logs = resolve_optional_path(id, "logs", raw.logs, base_dir, phase, &mut warnings)?;
 
     let mut env = BTreeMap::new();
     for (key, value) in raw.env {
-        reject_env_key_with_equals(&id, &key)?;
-        reject_unemittable(&id, "env key", &key)?;
-        reject_empty(&id, "env key", &key)?;
-        reject_unemittable(&id, &format!("env[{key}]"), &value)?;
+        // The `$`-in-a-key rule, moved here from `interpolate::spec` so it
+        // runs for every backend, not just the native merged spec: `scm:
+        // {env: {"${K}": v}}` must be caught from Linux too. Comment
+        // deliberately duplicated with `interpolate.rs`'s copy — see
+        // `USER_ID_MESSAGE`'s note on `reject_blank` for why this is not a
+        // duplicate to be collapsed.
+        if interpolate::would_substitution_change(&key) {
+            return Err(invalid(id, interpolate::ENV_NAME_MESSAGE));
+        }
+        reject_env_key_with_equals(id, &key)?;
+        reject_unemittable(id, "env key", &key)?;
+        reject_empty(id, "env key", &key)?;
+        reject_unemittable(id, &format!("env[{key}]"), &value)?;
         env.insert(key, value);
     }
 
@@ -170,47 +398,121 @@ fn resolve_one(id: Id, raw: RawSpec, base_dir: &Path, warnings: &mut Vec<Warning
     match &user {
         User::Root => {}
         User::Name(n) => {
-            reject_unemittable(&id, "user.name", n)?;
-            reject_blank(&id, "user.name", n)?;
+            reject_unemittable(id, "user.name", n)?;
+            reject_blank(id, "user.name", n)?;
         }
         User::Id(AccountId::Sid(s)) => {
-            reject_unemittable(&id, "user.id", s)?;
-            reject_blank(&id, "user.id", s)?;
+            // The `user.id` `$` rule, moved here for the same reason as the
+            // `env`-name one above. Ordering against `reject_blank` below
+            // does not matter: `${S}` trims to `${S}`, never empty, so the
+            // two can never both fire on one value.
+            if interpolate::would_substitution_change(s) {
+                return Err(invalid(id, interpolate::USER_ID_MESSAGE));
+            }
+            reject_unemittable(id, "user.id", s)?;
+            reject_blank(id, "user.id", s)?;
         }
         User::Id(AccountId::Uid(_)) => {}
     }
 
-    let restart = match raw.restart {
-        Some(raw_restart) => parse_restart(&id, &raw_restart)?,
-        None => Restart::Never,
-    };
+    let restart = shape(id, raw.restart, parse_restart)?;
+    let restart_delay = shape(id, raw.restart_delay, parse_restart_delay)?;
+    let kind = shape(id, raw.kind, parse_kind)?;
 
-    let restart_delay = match raw.restart_delay {
-        Some(raw_delay) => Some(parse_restart_delay(&id, &raw_delay)?),
-        None => None,
-    };
-    warn_on_sub_second_restart_delay(&id, restart_delay, warnings);
-
-    let kind = match raw.kind {
-        Some(raw_kind) => parse_kind(&id, &raw_kind)?,
-        None => Kind::Simple,
-    };
-    warn_on_windows_divergences(&id, kind, cwd.is_some(), logs.is_some(), restart, warnings);
-
-    // The absoluteness guarantee has exactly one runtime enforcement point
-    // today, inside `blob::decode` — which only fires when re-reading an
+    // The absoluteness guarantee has exactly one other runtime enforcement
+    // point, inside `blob::decode` — which only fires when re-reading an
     // artifact that was already written. On the direct resolve -> generate
     // path that `install`/`show` take, a regression here would be baked into
     // a unit file before anything noticed. Catch it at the source instead.
+    // The `command[0]` half of this guarantee moved to `require_complete`,
+    // the first point at which a `command` is known to exist at all.
     debug_assert!(
-        Path::new(&command[0]).is_absolute()
-            && cwd.as_deref().is_none_or(Path::is_absolute)
-            && logs.as_deref().is_none_or(Path::is_absolute),
-        "resolve must return absolute paths; got command[0]={:?} cwd={:?} logs={:?}",
-        command[0],
-        cwd,
-        logs,
+        cwd.as_deref().is_none_or(Path::is_absolute) && logs.as_deref().is_none_or(Path::is_absolute),
+        "resolve_shape must return absolute paths; got cwd={cwd:?} logs={logs:?}",
     );
+
+    Ok((
+        ShapedSpec {
+            id: id.clone(),
+            name,
+            command,
+            cwd,
+            env,
+            user,
+            restart,
+            restart_delay,
+            logs,
+            kind,
+        },
+        warnings,
+    ))
+}
+
+/// Keep the parse in the shape phase, and skip exactly the values a
+/// substitution would change. Not `contains("${")`: `would_substitution_change`
+/// is deliberately `contains('$')`, so a `$$` escape is deferred too, even
+/// though it needed no `.env` — see that function's doc comment. Deferring
+/// a value that didn't strictly need deferring costs one check running
+/// slightly later; parsing text that substitution is about to change
+/// parses the wrong string outright.
+fn shape<T>(id: &Id, raw: Option<String>, parse: fn(&Id, &str) -> Result<T, Error>) -> Result<Shaped<T>, Error> {
+    match raw {
+        None => Ok(Shaped::Absent),
+        Some(text) if interpolate::would_substitution_change(&text) => Ok(Shaped::Deferred(text)),
+        Some(text) => Ok(Shaped::Parsed(parse(id, &text)?)),
+    }
+}
+
+/// Completeness: every field the installed spec must actually have, plus
+/// the deferred parses and the defaults. Errors name `backend` — except a
+/// deferred parse that fails here, which carries post-substitution text and
+/// is not provably anyone's fault in particular, so it is reported
+/// verbatim.
+fn require_complete(shaped: ShapedSpec, backend: Option<Backend>) -> Result<DaemonSpec, Error> {
+    let ShapedSpec {
+        id,
+        name,
+        command,
+        cwd,
+        env,
+        user,
+        restart,
+        restart_delay,
+        logs,
+        kind,
+    } = shaped;
+
+    // Both "absent" and "present but empty" go through the one
+    // `reject_empty_command` check, so the two spellings of "no command"
+    // cannot diverge and produce one message each.
+    let command = command.unwrap_or_default();
+    reject_empty_command(&id, &command).map_err(|_| missing_command_error(&id, backend))?;
+
+    // The `command[0]` half of the absoluteness guarantee — see
+    // `resolve_shape`'s matching comment. This is the first point at which
+    // a `command` is known to exist; indexing `command[0]` any earlier is
+    // exactly the assumption `Option<Vec<String>>` exists to remove.
+    debug_assert!(
+        Path::new(&command[0]).is_absolute(),
+        "resolve must return an absolute command[0]; got {:?}",
+        command[0],
+    );
+
+    let restart = match restart {
+        Shaped::Parsed(r) => r,
+        Shaped::Deferred(text) => parse_restart(&id, &text)?,
+        Shaped::Absent => Restart::Never,
+    };
+    let restart_delay = match restart_delay {
+        Shaped::Parsed(d) => Some(d),
+        Shaped::Deferred(text) => Some(parse_restart_delay(&id, &text)?),
+        Shaped::Absent => None,
+    };
+    let kind = match kind {
+        Shaped::Parsed(k) => k,
+        Shaped::Deferred(text) => parse_kind(&id, &text)?,
+        Shaped::Absent => Kind::Simple,
+    };
 
     Ok(DaemonSpec {
         id,
@@ -224,6 +526,16 @@ fn resolve_one(id: Id, raw: RawSpec, base_dir: &Path, warnings: &mut Vec<Warning
         logs,
         kind,
     })
+}
+
+fn missing_command_error(id: &Id, backend: Option<Backend>) -> Error {
+    match backend {
+        Some(b) => invalid(
+            id,
+            &format!("no command is set for `{b}`: set the top-level `command`, or `backend-specific.{b}.command`"),
+        ),
+        None => invalid(id, "command must not be empty: set the top-level `command`"),
+    }
 }
 
 /// Apply the `root` reserved word to an authored [`RawUser`], and default
@@ -301,6 +613,7 @@ fn resolve_optional_path(
     field: &str,
     raw: Option<String>,
     base_dir: &Path,
+    phase: Phase,
     warnings: &mut Vec<Warning>,
 ) -> Result<Option<PathBuf>, Error> {
     match raw {
@@ -308,7 +621,7 @@ fn resolve_optional_path(
             reject_unemittable(id, field, &s)?;
             reject_empty(id, field, &s)?;
             Ok(Some(PathBuf::from(resolve_path_string(
-                id, field, &s, base_dir, warnings,
+                id, field, &s, base_dir, phase, warnings,
             )?)))
         }
         None => Ok(None),
@@ -319,11 +632,20 @@ fn resolve_optional_path(
 /// `Path::is_absolute` (not a string prefix check) so this behaves
 /// correctly on both a POSIX host (`/opt/rt`) and a Windows host
 /// (`C:\base`), whose absoluteness rules differ.
+///
+/// Every check here is deterministic given `(value, base_dir, process
+/// state)` — `std::path::absolute`'s drive-relative fallback reads the
+/// per-drive current directory, so this is not a pure function of `(value,
+/// base_dir)` alone — but all five passes `resolve` runs per daemon run in
+/// one process against one unchanging process state, so identical values
+/// get identical verdicts across passes. That is what makes "the base pass
+/// passed, therefore this failure is the override's" sound.
 fn resolve_path_string(
     id: &Id,
     field: &str,
     raw: &str,
     base_dir: &Path,
+    phase: Phase,
     warnings: &mut Vec<Warning>,
 ) -> Result<String, Error> {
     let p = Path::new(raw);
@@ -361,15 +683,37 @@ fn resolve_path_string(
             // directory and a `diff` run from another can resolve this
             // differently and disagree, reporting drift on an artifact
             // nobody touched.
-            warnings.push(Warning {
-                id: Some(id.clone()),
-                message: format!(
-                    "field `{field}` is `{raw}`, a drive-relative path; it is anchored to the \
-                     current directory on that drive in whichever process runs goetia, not to \
-                     the manifest directory. Write a full path (e.g. `C:\\bin\\frpc.exe`) or a \
-                     manifest-relative one (e.g. `.\\bin\\frpc.exe`) instead."
-                ),
-            });
+            //
+            // `Phase::Authored` runs on uninterpolated text, so a base path
+            // written as a `${VAR}` template is suppressed here: two of the
+            // three passes that keep warnings (the two non-native sweep
+            // passes) would otherwise each emit an identical warning
+            // quoting the raw template, and dedup cannot merge that with
+            // the differently-worded one `Phase::Substituted` produces once
+            // the template resolves. Four cases, all Windows-only (this
+            // advisory only ever fires where `std::path::absolute` leaves a
+            // path non-absolute — a Windows prefix-without-root property):
+            // a base literal collapses three identical warnings to one; a
+            // base template warns once, from the native pass, quoting the
+            // substituted spelling; an `scm:`-only literal warns once, from
+            // the native pass; a `systemd:`-only template warns zero times
+            // — unavailable, not wrong, the same line as `systemd: {user:
+            // "${ACCT}"}`.
+            let should_warn = match phase {
+                Phase::Substituted => true,
+                Phase::Authored => !interpolate::would_substitution_change(raw),
+            };
+            if should_warn {
+                warnings.push(Warning {
+                    id: Some(id.clone()),
+                    message: format!(
+                        "field `{field}` is `{raw}`, a drive-relative path; it is anchored to the \
+                         current directory on that drive in whichever process runs goetia, not to \
+                         the manifest directory. Write a full path (e.g. `C:\\bin\\frpc.exe`) or a \
+                         manifest-relative one (e.g. `.\\bin\\frpc.exe`) instead."
+                    ),
+                });
+            }
         }
         resolved
     };
@@ -716,65 +1060,14 @@ pub(crate) fn reject_relative_path(id: &Id, field: &str, path: &Path) -> Result<
     Ok(())
 }
 
-fn invalid(id: &Id, message: &str) -> Error {
+/// `pub(super)`: `spec::backend` (a sibling module, not a descendant of
+/// `resolve`) constructs the same `Error::Invalid` shape for its own
+/// rejections (`Backend::error`), and this is the one place that shape is
+/// spelled.
+pub(super) fn invalid(id: &Id, message: &str) -> Error {
     Error::Invalid {
         daemon: id.as_str().to_string(),
         message: message.to_string(),
-    }
-}
-
-/// `restart-delay` is stored as authored so the metadata blob stays
-/// deterministic across platforms, but launchd's `ThrottleInterval` is
-/// integer seconds: `500ms` would truncate to `0`, which *disables*
-/// throttling and yields an unbounded respawn storm. Warn here so the
-/// rounding is not a silent surprise at install time.
-fn warn_on_sub_second_restart_delay(id: &Id, restart_delay: Option<Duration>, warnings: &mut Vec<Warning>) {
-    let Some(delay) = restart_delay else { return };
-    if delay.subsec_nanos() == 0 {
-        return;
-    }
-    let rounded = delay.as_secs().saturating_add(1);
-    warnings.push(Warning {
-        id: Some(id.clone()),
-        message: format!(
-            "restart-delay {delay:?} is not a whole number of seconds; launchd's ThrottleInterval \
-             will round it up to {rounded}s"
-        ),
-    });
-}
-
-/// `type: managed` on Windows has no working-directory or stdout-capture
-/// field, and SCM recovery actions never fire after a clean exit — so
-/// `cwd`/`logs` and `restart: always` are accepted, not rejected, but
-/// silently unavailable there. See the design spec's accepted divergences
-/// (a) and (b).
-fn warn_on_windows_divergences(
-    id: &Id,
-    kind: Kind,
-    has_cwd: bool,
-    has_logs: bool,
-    restart: Restart,
-    warnings: &mut Vec<Warning>,
-) {
-    if kind != Kind::Managed {
-        return;
-    }
-    if has_cwd || has_logs {
-        warnings.push(Warning {
-            id: Some(id.clone()),
-            message: "type: managed has no working-directory or stdout-capture field on Windows SCM; \
-                      `cwd`/`logs` are silently unavailable there, and with no working directory, \
-                      every relative path in an argument resolves against System32"
-                .to_string(),
-        });
-    }
-    if restart == Restart::Always {
-        warnings.push(Warning {
-            id: Some(id.clone()),
-            message: "restart: always is not faithfully expressible for type: managed on Windows: SCM \
-                      recovery actions only fire on failure, never after a clean exit"
-                .to_string(),
-        });
     }
 }
 

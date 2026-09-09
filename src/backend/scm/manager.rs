@@ -101,7 +101,7 @@ use crate::blob::Blob;
 use crate::decide::{self, Outcome, Ownership};
 use crate::error::{Error, Result};
 use crate::manager::{Installed, ServiceManager, State, Status};
-use crate::spec::{DaemonSpec, Id, Kind, User, Warning};
+use crate::spec::{DaemonSpec, Id, Kind, User};
 
 // ScmManager ==========================================================================================================
 
@@ -369,19 +369,9 @@ fn shim_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("goetia-shim.exe"))
 }
 
-fn print_warnings(warnings: &[Warning]) {
-    for w in warnings {
-        match &w.id {
-            Some(id) => eprintln!("warning: {id}: {}", w.message),
-            None => eprintln!("warning: {}", w.message),
-        }
-    }
-}
-
 fn discover(spec: &DaemonSpec) -> Result<Discovery> {
     let identity = identity::resolve(&spec.user)?;
-    let (reg, warnings) = generate::registration(spec, &identity, &shim_path());
-    print_warnings(&warnings);
+    let reg = generate::registration(spec, &identity, &shim_path());
     let desired = generate::render(&reg);
 
     let scm = open_scm_to_classify(spec.id.as_str())?;
@@ -428,7 +418,7 @@ fn classify(params: &BTreeMap<String, String>) -> Ownership {
         Ok(None) => Ownership::Foreign,
         Ok(Some(blob)) => match identity::resolve(&blob.spec.user) {
             Ok(blob_identity) => {
-                let (blob_reg, _warnings) = generate::registration(&blob.spec, &blob_identity, &shim_path());
+                let blob_reg = generate::registration(&blob.spec, &blob_identity, &shim_path());
                 Ownership::Ours {
                     regenerated: generate::render(&blob_reg),
                     blob,
