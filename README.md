@@ -317,6 +317,80 @@ was ever the problem. Set `cwd`, or write the argument absolute.
 
 (`cwd` and `logs` are resolved against the manifest's directory too.)
 
+## Per-backend overrides
+
+One manifest describes a daemon on all three platforms, but a path, an
+account or a service name is rarely the same on all three. A daemon's
+`backend-specific:` block holds a set of field overrides per backend, keyed
+by `systemd`, `launchd` or `scm`:
+
+```yaml
+daemons:
+  frpc:
+    command: [/opt/frpc/bin/frpc, -c, /opt/frpc/host/frpc.toml]
+    cwd: /opt/frpc
+    env:
+      RUST_LOG: info
+    restart: on-failure
+    backend-specific:
+      systemd:
+        user: frpc
+      launchd:
+        user: frpc
+      scm:
+        command: ['C:\Program Files\frpc\frpc.exe', -c, 'C:\ProgramData\frpc\frpc.toml']
+        cwd: 'C:\ProgramData\frpc'
+        user: 'NT AUTHORITY\LocalService'
+        env:
+          RUST_LOG: debug
+```
+
+Every field but the daemon's id is overridable: `name`, `command`, `cwd`,
+`env`, `user`, `restart`, `restart-delay`, `logs`, `type`. A scalar or list
+field replaces the base value outright; `env` merges key by key, the
+override winning where both set the same key. An unknown backend key is an
+error naming it, as is a repeated one, and an explicit `null` is an error
+anywhere in the block — omit the key instead.
+
+**Only the backend native to this host is installed, but every backend's
+merged spec is validated on every host.** So the manifest above renders on
+Linux as the systemd-effective spec, with the `scm:` block validated and
+then discarded:
+
+```console
+$ goetia daemon show -f goetia.yaml
+# frpc
+command:
+- /opt/frpc/bin/frpc
+- -c
+- /opt/frpc/host/frpc.toml
+cwd: /opt/frpc
+env:
+  RUST_LOG: info
+id: frpc
+name: frpc
+restart: on-failure
+type: simple
+user: frpc
+```
+
+A value that is wrong for a backend by construction fails the whole manifest
+from any host, naming the block it came from. Replace that `scm:` block's
+account with a numeric uid — `user: {id: 1000}` — and the same Linux runner
+rejects the Windows-only mistake:
+
+```console
+$ goetia daemon show -f goetia.yaml
+error: daemon `frpc`: backend-specific.scm: `1000` is a numeric uid, which is never a Windows account
+```
+
+`${VAR}` is substituted only in the override for the backend being
+installed. The other two are validated as authored, never substituted, so a
+check that would need a resolved value is skipped rather than guessed at:
+from Linux, `scm: {user: "${ACCT}"}` is unresolvable and therefore
+unchecked, while `systemd: {user: "${ACCT}"}` is substituted and checked
+like any other native value.
+
 ## Machine-readable output
 
 `--json` is implemented by `goetia daemon list` and `goetia daemon status`.
