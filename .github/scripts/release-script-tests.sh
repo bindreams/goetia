@@ -651,6 +651,38 @@ assert_package_list_rejects_matching "rejects a leaked .gitattributes" "$listing
 listing="$(write_package_listing leaks-rustfmt-toml "${complete_listing_lines[@]}" .rustfmt.toml)"
 assert_package_list_rejects_matching "rejects a leaked .rustfmt.toml" "$listing" ".rustfmt.toml"
 
+# Drift guard. The exclusion check is only as good as its list, which is a
+# second encoding of Cargo.toml's `exclude` — and `cargo metadata` does not
+# expose that field, so it cannot be read at check time. Compare the two
+# lists here instead, so an `exclude` entry added, dropped or renamed
+# without updating the script fails CI rather than silently narrowing what
+# the guard checks.
+repo_root="$(cd "${script_dir}/../.." && pwd)"
+manifest_excludes="$(python3 - "${repo_root}/Cargo.toml" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    manifest = tomllib.load(handle)
+for entry in sorted(manifest["package"]["exclude"]):
+    print(entry.strip("/"))
+PY
+)"
+printed_excludes=""
+if ! printed_excludes="$(bash "$assert_package_list" --print-excluded 2>&1)"; then
+    printed_excludes="<--print-excluded failed: ${printed_excludes}>"
+fi
+# LC_ALL=C: python's `sorted` is byte-ordered, and a locale-aware `sort`
+# ignores the leading dots, which would make the two lists differ by order
+# alone.
+script_excludes="$(printf '%s\n' "$printed_excludes" | sed 's:/*$::' | LC_ALL=C sort)"
+if [[ "$manifest_excludes" == "$script_excludes" ]]; then
+    echo "ok   - the exclusion list matches Cargo.toml's exclude"
+else
+    echo "FAIL - the exclusion list matches Cargo.toml's exclude (Cargo.toml has [${manifest_excludes//$'\n'/, }], the script has [${script_excludes//$'\n'/, }])"
+    failures=$((failures + 1))
+fi
+
 assert_package_list_rejects_matching "rejects a listing file that does not exist" \
     "${pkg_list_root}/nonexistent" "not found"
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # assert-package-list.sh <listing-file>
+# assert-package-list.sh --print-excluded
 #
 # Exits 0 only when a `cargo package --list` listing (one path per line, as
 # produced by the `package` job's own step) both ships what a consumer
@@ -20,7 +21,34 @@
 # fail), 1 means clean, anything else means grep itself errored and the
 # exclusion is unverified (also fail) — a failed check and a passing check
 # are different outcomes.
+#
+# `--print-excluded` prints the exclusion list, one entry per line, so the
+# test suite can compare it against Cargo.toml's `exclude` and fail on
+# drift. It has to be checked that way rather than derived here: `cargo
+# metadata` does not expose `exclude` at all (its package object carries
+# name, version, targets, features and so on, but no include/exclude), and
+# this script runs on all three CI hosts, where a TOML parser is not
+# something to depend on.
 set -euo pipefail
+
+# goetia's exclude list (Cargo.toml's `exclude`, with the leading `/` that
+# anchors each entry to the package root dropped). A trailing `/` marks a
+# directory prefix, which matches any path under it; every other entry is a
+# single file, anchored at both ends.
+excluded_paths=(
+    ".github/"
+    ".claude/"
+    "scripts/"
+    "prek.toml"
+    ".editorconfig"
+    ".gitattributes"
+    ".rustfmt.toml"
+)
+
+if [[ "${1-}" == "--print-excluded" ]]; then
+    printf '%s\n' "${excluded_paths[@]}"
+    exit 0
+fi
 
 listing="${1:?listing file required}"
 
@@ -43,10 +71,16 @@ for required in "${required_paths[@]}"; do
     fi
 done
 
-# goetia's exclude list (Cargo.toml, Task 2 step 3): directory prefixes
-# match any path under them; the four single files are anchored at both
-# ends.
-excluded_pattern='^(\.github/|\.claude/|scripts/|prek\.toml$|\.editorconfig$|\.gitattributes$|\.rustfmt\.toml$)'
+alternatives=()
+for excluded in "${excluded_paths[@]}"; do
+    escaped="${excluded//./\\.}"
+    if [[ "$excluded" == */ ]]; then
+        alternatives+=("$escaped")
+    else
+        alternatives+=("${escaped}\$")
+    fi
+done
+excluded_pattern="^($(IFS='|'; printf '%s' "${alternatives[*]}"))"
 
 status=0
 grep -E "$excluded_pattern" "$listing" >/dev/null 2>&1 || status=$?
