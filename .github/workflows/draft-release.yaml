@@ -299,3 +299,151 @@ jobs:
           name: goetia-${{ matrix.target }}
           path: goetia-${{ matrix.target }}.zip
           if-no-files-found: error
+
+  release:
+    name: Draft release
+    needs: [validate, ci, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      # actions/checkout deletes a non-empty workspace, so it must run
+      # before the archives are downloaded, not after.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # `pattern:` keeps this to the build job's five `goetia-*` artifacts,
+      # not the `ci` job's `probe-results-*` uploads sharing this run.
+      # `merge-multiple: true` lands the five archives flat in `source/`
+      # instead of nested one-per-artifact-name — without it, the SHA256SUMS
+      # below would record directory-prefixed paths and the globs in every
+      # later step would match nothing at the workspace root.
+      - name: Download archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: goetia-*
+          merge-multiple: true
+          path: source
+
+      # nullglob matters here: without it, a missing archive leaves the
+      # literal glob string as one argument, the script still receives five
+      # words, and the count check passes while an archive does not exist.
+      - name: Assert the build matrix is complete
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          ../.github/scripts/assert-archives.sh 5 goetia-*.tar.xz goetia-*.zip
+
+      # Hashed once, here, rather than per build runner: Git-Bash's
+      # sha256sum defaults to binary mode on Windows and text mode on
+      # macOS, so a row hashed on each runner would produce a SHA256SUMS
+      # whose format varies by line.
+      - name: Compute SHA256SUMS
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          sha256sum goetia-*.tar.xz goetia-*.zip > SHA256SUMS
+
+      # One call, one bundle covering all five archives. SHA256SUMS is
+      # deliberately not a subject: it is written after the archives and
+      # before the bundle, and attesting it would mean a second attestation
+      # or an ordering knot. It stays a convenience for humans; the bundle
+      # is what a consumer verifies against.
+      - name: Attest archives
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: |
+            source/goetia-*.tar.xz
+            source/goetia-*.zip
+
+      - name: Copy the attestation bundle into the release payload
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "$BUNDLE_PATH" source/goetia.sigstore.json
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: Install sigstore
+        # renovate: datasource=pypi depName=sigstore
+        run: uv tool install sigstore==4.5.0
+
+      # A Sigstore bundle verifies against exactly one input at a time
+      # (measured: `--bundle` with two file arguments exits non-zero with
+      # "can only be used with a single input file or digest"), so this is
+      # a loop, not one command. Decided by exit status, not output: on
+      # success `sigstore` writes `OK: <file>` to stderr and the in-toto
+      # statement to stdout, so grepping stdout for OK would never match
+      # and the step would pass vacuously.
+      - name: Verify the attestation bundle
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          status=0
+          for archive in goetia-*.tar.xz goetia-*.zip; do
+            if ! sigstore verify github \
+              --bundle goetia.sigstore.json \
+              --cert-identity https://github.com/bindreams/goetia/.github/workflows/draft-release.yaml@refs/heads/main \
+              --repository bindreams/goetia \
+              --ref refs/heads/main \
+              --name "Draft Release" \
+              --trigger workflow_dispatch \
+              "$archive"; then
+              echo "::error::sigstore verification failed for ${archive}" >&2
+              status=1
+            fi
+          done
+          exit "$status"
+
+      # The tag and release-existence checks are re-run here, immediately
+      # above `gh release create`, rather than trusted from the `validate`
+      # job: that job's checks ran before the CI matrix and the build
+      # matrix, tens of minutes earlier. Re-running here narrows the race
+      # window to seconds instead of leaving it open for the whole job.
+      - name: Re-check for a race, then draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+
+          set +e
+          output="$(gh release view "$tag" --json tagName 2>&1)"
+          status=$?
+          set -e
+
+          if [ "$status" -eq 0 ]; then
+            echo "::error::Release $tag already exists (draft or published). Delete it or pick a new version."
+            exit 1
+          fi
+          if ! grep -qi 'release not found' <<<"$output"; then
+            echo "::error::Cannot confirm whether $tag exists: $output"
+            exit 1
+          fi
+
+          .github/scripts/assert-tag-absent.sh "$tag"
+
+          shopt -s nullglob
+          gh release create "$tag" \
+            --draft \
+            --latest=true \
+            --title "$tag" \
+            --generate-notes \
+            --target "$GITHUB_SHA" \
+            source/goetia-*.tar.xz source/goetia-*.zip source/SHA256SUMS source/goetia.sigstore.json
