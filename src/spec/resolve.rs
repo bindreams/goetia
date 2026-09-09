@@ -718,10 +718,17 @@ fn resolve_path_string(
         resolved
     };
     // Assert the post-condition rather than assume the fallback achieved it.
-    // A prefix with no root (`\\?\C:`, `\\.\COM1`) survives
-    // `std::path::absolute` unchanged — it has an explicit early return for
-    // verbatim paths — so this branch is still live, just no longer for the
-    // drive-relative reason.
+    // Provably unreachable under every current `Prefix` variant, not merely
+    // untested: `std`'s own `Prefix::has_implicit_root` is `true` for every
+    // prefix except `Disk`, so a verbatim prefix (`Verbatim`, `VerbatimDisk`,
+    // `VerbatimUNC`) is already absolute before `p.is_absolute()` above ever
+    // reaches this fallback — `\\?\C:` included, despite reading as rootless.
+    // The one prefix that genuinely lacks a root, plain `Disk` (`C:bin`), is
+    // not verbatim, so `std::path::absolute` never returns it unchanged; it
+    // always resolves it via `GetFullPathNameW` into an absolute path (the
+    // drive-relative branch above). No known input reaches here; the check
+    // stays as a defensive invariant in case a future `std` changes that
+    // mapping.
     if !joined.is_absolute() {
         return Err(invalid(
             id,

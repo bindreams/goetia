@@ -887,18 +887,26 @@ fn verbatim_disk_strips_to_the_drive_form() {
 
 #[cfg(windows)]
 #[skuld::test]
-fn a_prefix_without_a_root_still_fails_to_resolve() {
-    // `\\?\C:` is a `VerbatimDisk` prefix with no root, which survives
-    // `std::path::absolute` unchanged and so is still rejected — the live
-    // branch of the reworded, no-longer-drive-relative-specific error.
+fn a_verbatim_disk_prefix_resolves_unchanged_because_it_carries_an_implicit_root() {
+    // `\\?\C:` parses as a `VerbatimDisk` prefix, not a bare `Disk` — and
+    // `std`'s own `Prefix::has_implicit_root` is `true` for every prefix
+    // except `Disk`. So, unlike the drive-relative `C:bin` case above,
+    // `\\?\C:` is already absolute before `resolve_path_string`'s
+    // `std::path::absolute` fallback ever runs: it passes through
+    // unchanged, with no error and no drive-relative warning.
     let yaml = r"daemons:
   frpc:
     command: ['\\?\C:']
 ";
-    let err = resolve(parse_manifest(yaml), &base_dir()).expect_err("a rootless prefix cannot resolve");
+    let (specs, warnings) = resolve(parse_manifest(yaml), &base_dir())
+        .expect("a VerbatimDisk prefix carries an implicit root and resolves");
+    assert_eq!(
+        specs[0].command[0], r"\\?\C:",
+        "a verbatim prefix must pass through resolve unchanged"
+    );
     assert!(
-        !err.to_string().contains("drive-relative"),
-        "the live cause here is a rootless verbatim prefix, not a drive-relative path: {err}"
+        warnings.is_empty(),
+        "a VerbatimDisk prefix is not drive-relative and must not warn: {warnings:?}"
     );
 }
 
