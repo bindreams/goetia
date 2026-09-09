@@ -6,6 +6,8 @@ normalize="${script_dir}/normalize-version.sh"
 assert_tag="${script_dir}/assert-tag-absent.sh"
 assert_archives="${script_dir}/assert-archives.sh"
 assert_package_list="${script_dir}/assert-package-list.sh"
+assert_asset_count="${script_dir}/assert-asset-count.sh"
+assert_test_binaries="${script_dir}/assert-test-binaries.sh"
 failures=0
 
 # Asserts BOTH stdout and exit status. Checking stdout alone would pass a
@@ -65,7 +67,9 @@ assert_rejects "rejects an inner leading zero" "1.02.3"
 stub_dir="$(mktemp -d)"
 archive_root="$(mktemp -d)"
 pkg_list_root="$(mktemp -d)"
-trap 'rm -rf "$stub_dir" "$archive_root" "$pkg_list_root"' EXIT
+asset_count_root="$(mktemp -d)"
+test_binaries_root="$(mktemp -d)"
+trap 'rm -rf "$stub_dir" "$archive_root" "$pkg_list_root" "$asset_count_root" "$test_binaries_root"' EXIT
 
 make_git_stub() {
     local exit_code="$1" expected_ref="$2"
@@ -184,6 +188,31 @@ make_tar_archive() {
     local root; root="$(mktemp -d -p "$archive_root")"
     write_members "${root}/goetia-${target}" "$goetia_content" "$shim_content" "$@"
     tar -cJf "$out" -C "$root" "goetia-${target}"
+}
+
+# make_tar_with_raw_members <output> <name>=<content> ...
+# Writes a `.tar.xz` with each entry's name exactly as given, including a
+# literal space or slash inside a single entry — no filesystem staging, so
+# the name never has to survive being a real path on disk. Python's
+# tarfile takes the member name verbatim, the same way make_zip_entries
+# uses zipfile.
+make_tar_with_raw_members() {
+    local out="$1"
+    shift
+    python3 - "$out" "$@" <<'PY'
+import io
+import sys
+import tarfile
+
+out = sys.argv[1]
+with tarfile.open(out, "w:xz") as archive:
+    for pair in sys.argv[2:]:
+        name, content = pair.split("=", 1)
+        data = content.encode()
+        info = tarfile.TarInfo(name=name)
+        info.size = len(data)
+        archive.addfile(info, io.BytesIO(data))
+PY
 }
 
 # make_zip_entries <output> <arcname>=<source-file> ...
@@ -369,6 +398,28 @@ archive="${root}/goetia-${windows_target}.zip"
 printf 'not a real zip stream' > "$archive"
 assert_archives_rejects_matching "surfaces the real listing failure for a corrupt zip" 1 "failed to list members" "$archive"
 
+# A member can pass LISTING (which only reads zip central-directory headers)
+# and still fail to EXTRACT (a corrupted entry fails its CRC check on
+# `unzip -p`, not on `unzip -Z1`) — a different failure mode than the
+# corrupt-archive cases above, and one `extract_member`'s call site did not
+# annotate before this fix (measured against the unpatched script: bare
+# `unzip` CRC diagnostic, exit 2, no `::error::` line).
+root="$(mktemp -d -p "$archive_root")"
+archive="${root}/goetia-${windows_target}.zip"
+make_zip_archive "$archive" "$windows_target" "goetia bytes" "shim bytes"
+python3 - "$archive" <<'PY'
+import sys
+
+path = sys.argv[1]
+with open(path, "rb") as f:
+    data = bytearray(f.read())
+idx = data.find(b"PK\x03\x04")
+data[idx + 80] ^= 0xFF
+with open(path, "wb") as f:
+    f.write(data)
+PY
+assert_archives_rejects_matching "surfaces the real extraction failure for a CRC-corrupted zip entry" 1 "failed to extract member" "$archive"
+
 root="$(mktemp -d -p "$archive_root")"
 staged="${root}/goetia-${windows_target}"
 write_members "$staged" "goetia bytes" "shim bytes"
@@ -414,6 +465,24 @@ archive5="${root}/goetia-${windows_target}.zip"
 make_zip_archive "$archive5" "$windows_target" "goetia bytes for e" "shim bytes for e"
 assert_archives_rejects "rejects two archives holding identical binaries" 5 \
     "$archive1" "$archive2" "$archive3" "$archive4" "$archive5"
+
+# Reproduces the IFS-joined-string collision directly: a 3-member archive
+# (goetia, goetia-shim, and ONE member literally named
+# "<prefix>/LICENSE.md <prefix>/README.md" with an embedded space) is
+# missing LICENSE.md and README.md as their own members, but its sorted
+# member list joins via "${arr[*]}" to the exact same string as the real
+# 4-member expected set. Before the element-by-element comparison, this
+# archive verified successfully — measured directly against the unpatched
+# script: `all 1 archive(s) verified`, exit 0.
+root="$(mktemp -d -p "$archive_root")"
+archive="${root}/goetia-x86_64-unknown-linux-musl.tar.xz"
+prefix="goetia-x86_64-unknown-linux-musl"
+make_tar_with_raw_members "$archive" \
+    "${prefix}/goetia=goetia bytes" \
+    "${prefix}/goetia-shim=shim bytes" \
+    "${prefix}/LICENSE.md ${prefix}/README.md=combined bytes"
+assert_archives_rejects_matching "rejects a member set whose IFS-joined string collides with the expected set" 1 \
+    "member set mismatch" "$archive"
 
 # assert-package-list.sh -----------------------------------------------------
 #
@@ -547,6 +616,134 @@ if [[ "$grep_error_status" -ne 0 && "$output" == *"exclusion unverified"* ]]; th
 else
     echo "FAIL - treats a grep failure as unverified, not clean (status ${grep_error_status}, output: ${output})"
     failures=$((failures + 1))
+fi
+
+# assert-asset-count.sh ------------------------------------------------------
+
+assert_asset_count_ok() {
+    local description="$1" expected_count="$2"
+    shift 2
+    if bash "$assert_asset_count" "$expected_count" "$@" >/dev/null 2>&1; then
+        echo "ok   - ${description}"
+    else
+        echo "FAIL - ${description} (expected success, got failure)"
+        failures=$((failures + 1))
+    fi
+}
+
+assert_asset_count_rejects_matching() {
+    local description="$1" expected_count="$2" message="$3"
+    shift 3
+    local output
+    if output="$(bash "$assert_asset_count" "$expected_count" "$@" 2>&1)"; then
+        echo "FAIL - ${description} (expected rejection, got success)"
+        failures=$((failures + 1))
+    elif [[ "$output" == *"$message"* ]]; then
+        echo "ok   - ${description}"
+    else
+        echo "FAIL - ${description} (expected message containing '${message}', got: ${output})"
+        failures=$((failures + 1))
+    fi
+}
+
+seven_assets=()
+for i in 1 2 3 4 5 6 7; do
+    f="${asset_count_root}/asset-${i}"
+    : > "$f"
+    seven_assets+=("$f")
+done
+
+assert_asset_count_ok "accepts exactly the expected count" 7 "${seven_assets[@]}"
+
+assert_asset_count_rejects_matching "rejects too few assets" 7 "expected 7 asset(s), got 6" \
+    "${seven_assets[@]:0:6}"
+
+# The exact vacuous-guard shape this script exists to close off: an empty
+# `nullglob` expansion must never read as "0 assets to check, trivially
+# satisfied".
+assert_asset_count_rejects_matching "rejects a zero count" 0 "positive integer"
+assert_asset_count_rejects_matching "rejects a non-numeric count" abc "positive integer"
+
+assert_asset_count_rejects_matching "rejects a named asset that does not exist" 1 "asset not found" \
+    "${asset_count_root}/does-not-exist"
+
+if bash "$assert_asset_count" >/dev/null 2>&1; then
+    echo "FAIL - rejects being called with no arguments at all (expected rejection, got success)"
+    failures=$((failures + 1))
+else
+    echo "ok   - rejects being called with no arguments at all"
+fi
+
+# assert-test-binaries.sh -----------------------------------------------------
+#
+# The step this guards (`ci.yaml`'s "Run tests, elevated") drives a
+# `while IFS= read -r bin; do ...; done < test-binaries.txt` loop: an empty
+# file makes that loop iterate zero times and exit 0, having run nothing.
+# This is the release-gate promotion of the same vacuous-guard shape
+# `assert-archives.sh 0` was fixed for.
+
+assert_test_binaries_ok() {
+    local description="$1" listing="$2"
+    if bash "$assert_test_binaries" "$listing" >/dev/null 2>&1; then
+        echo "ok   - ${description}"
+    else
+        echo "FAIL - ${description} (expected success, got failure)"
+        failures=$((failures + 1))
+    fi
+}
+
+assert_test_binaries_rejects_matching() {
+    local description="$1" listing="$2" message="$3"
+    local output
+    if output="$(bash "$assert_test_binaries" "$listing" 2>&1)"; then
+        echo "FAIL - ${description} (expected rejection, got success)"
+        failures=$((failures + 1))
+    elif [[ "$output" == *"$message"* ]]; then
+        echo "ok   - ${description}"
+    else
+        echo "FAIL - ${description} (expected message containing '${message}', got: ${output})"
+        failures=$((failures + 1))
+    fi
+}
+
+listing="${test_binaries_root}/one-binary"
+printf '/path/to/some-test-bin\n' > "$listing"
+assert_test_binaries_ok "accepts a listing with one binary" "$listing"
+
+listing="${test_binaries_root}/multiple-binaries"
+printf '/path/to/bin-a\n/path/to/bin-b\n' > "$listing"
+assert_test_binaries_ok "accepts a listing with multiple binaries" "$listing"
+
+# CRLF is how the workflow's own filter emits this file on Windows (Python's
+# text-mode stdout), and the loop strips it — this script must count the
+# line as present, not blank.
+listing="${test_binaries_root}/crlf-binary"
+printf '/path/to/bin\r\n' > "$listing"
+assert_test_binaries_ok "accepts a CRLF-terminated listing" "$listing"
+
+listing="${test_binaries_root}/truly-empty"
+: > "$listing"
+assert_test_binaries_rejects_matching "rejects a completely empty listing" "$listing" "no test binaries found"
+
+# The exact reproduction from the hunt: a listing that is non-empty in bytes
+# (blank lines, or CRLF-only lines) but names zero binaries once the
+# workflow's own stripping rules are applied.
+listing="${test_binaries_root}/blank-lines-only"
+printf '\n\n' > "$listing"
+assert_test_binaries_rejects_matching "rejects a listing of blank lines only" "$listing" "no test binaries found"
+
+listing="${test_binaries_root}/crlf-blank-only"
+printf '\r\n\r\n' > "$listing"
+assert_test_binaries_rejects_matching "rejects a listing of CRLF-blank lines only" "$listing" "no test binaries found"
+
+assert_test_binaries_rejects_matching "rejects a listing file that does not exist" \
+    "${test_binaries_root}/nonexistent" "not found"
+
+if bash "$assert_test_binaries" >/dev/null 2>&1; then
+    echo "FAIL - rejects being called with no arguments at all (expected rejection, got success)"
+    failures=$((failures + 1))
+else
+    echo "ok   - rejects being called with no arguments at all"
 fi
 
 # --------------------------------------------------------------------------

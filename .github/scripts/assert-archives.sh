@@ -134,7 +134,29 @@ for archive in "$@"; do
     mapfile -t actual_sorted < <(printf '%s\n' "${members[@]}" | sort)
     mapfile -t expected_sorted < <(printf '%s\n' "${expected_members[@]}" | sort)
 
-    if [[ "${actual_sorted[*]}" != "${expected_sorted[*]}" ]]; then
+    # Compared element by element, not via "${arr[*]}" IFS-joined strings:
+    # `${arr[*]}` joins on IFS's first character (a space), so a set of N
+    # elements where one member's name happens to contain a space can join
+    # to the exact same string as a different-length set — ("a b") and ("a"
+    # "b") compare equal as strings even though they are different sets.
+    # Reproduced: a 3-member archive whose third member is literally named
+    # "<prefix>/LICENSE.md <prefix>/README.md" (one member, embedded space)
+    # joins byte-for-byte identical to the real 4-member expected set and
+    # the old string comparison accepted it — verifying an archive that was
+    # actually missing LICENSE.md and README.md as their own members.
+    mismatch=0
+    if [[ "${#actual_sorted[@]}" -ne "${#expected_sorted[@]}" ]]; then
+        mismatch=1
+    else
+        for ((i = 0; i < ${#actual_sorted[@]}; i++)); do
+            if [[ "${actual_sorted[$i]}" != "${expected_sorted[$i]}" ]]; then
+                mismatch=1
+                break
+            fi
+        done
+    fi
+
+    if [[ "$mismatch" -eq 1 ]]; then
         echo "::error::${archive}: member set mismatch" >&2
         echo "  expected: ${expected_sorted[*]}" >&2
         echo "  actual:   ${actual_sorted[*]}" >&2
@@ -143,7 +165,18 @@ for archive in "$@"; do
 
     for name in goetia goetia-shim; do
         member="${prefix}/${name}${ext}"
-        hash="$(extract_member "$kind" "$archive" "$member" | sha256sum | cut -d' ' -f1)"
+        # Guarded the same way the `list_members` call above is: a member
+        # can pass listing (which reads only the central directory / tar
+        # headers) and still fail to extract (e.g. a corrupted zip entry
+        # fails its CRC check on `unzip -p`, but not on `unzip -Z1`).
+        # `set -e` + `pipefail` already fails the script closed on that —
+        # correct — but with no annotation, so the log shows only the raw
+        # `tar`/`unzip` diagnostic and no `::error::` line.
+        hash=""
+        if ! hash="$(extract_member "$kind" "$archive" "$member" | sha256sum | cut -d' ' -f1)"; then
+            echo "::error::${archive}: failed to extract member '${member}' (corrupt or unreadable archive?)" >&2
+            exit 1
+        fi
         owner="${binary_owner[$hash]-}"
         if [[ -n "$owner" ]]; then
             if [[ "${owner%%:*}" == "$archive" ]]; then

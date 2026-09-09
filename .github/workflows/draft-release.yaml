@@ -113,6 +113,24 @@ jobs:
         shell: bash
         run: .github/scripts/assert-tag-absent.sh "v${VERSION}"
 
+      # Queryable up front, and this is the point in the whole pipeline
+      # where it is cheapest to fail: nothing has been built, drafted, or
+      # published yet. Re-checked immediately before the crates.io publish
+      # in Publish Release, since that is the actual point of no return —
+      # this is an early warning, not the enforcement point.
+      - name: Assert immutable releases are enabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          enabled="$(gh api "repos/${GH_REPO}/immutable-releases" --jq '.enabled')"
+          if [ "$enabled" != "true" ]; then
+            echo "::error::Immutable releases are not enabled for ${GH_REPO}. Enable the immutable-releases repository setting before drafting a release."
+            exit 1
+          fi
+
       # workflow_dispatch accepts a `ref`, so without this a draft can be
       # pinned to unmerged code while every later check still passes.
       - name: Verify the release commit is on main
@@ -372,6 +390,21 @@ jobs:
           set -euo pipefail
           cp "$BUNDLE_PATH" source/goetia.sigstore.json
 
+      # nullglob matters here for the same reason as the build-matrix check
+      # above: without it, a missing asset leaves the literal glob string as
+      # one argument instead of expanding to nothing. Stage 1 uploads seven
+      # assets under nullglob (below) with nothing else asserting the count,
+      # so a glob that silently went empty would upload fewer than seven and
+      # nothing would notice.
+      - name: Assert exactly the expected 7 release assets are ready to upload
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          ../.github/scripts/assert-asset-count.sh 7 \
+            goetia-*.tar.xz goetia-*.zip SHA256SUMS goetia.sigstore.json
+
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
 
@@ -386,14 +419,27 @@ jobs:
       # success `sigstore` writes `OK: <file>` to stderr and the in-toto
       # statement to stdout, so grepping stdout for OK would never match
       # and the step would pass vacuously.
+      #
+      # The glob is collected into an array and its length asserted before
+      # the loop: `nullglob` + zero matches means zero iterations, and a
+      # `for` loop that never runs exits 0 having verified nothing — the
+      # same vacuous-guard shape `assert-archives.sh 0` was fixed for. The
+      # build-matrix assertion above already guards this in practice, but
+      # this step must not rely on step order elsewhere in the job to stay
+      # non-vacuous.
       - name: Verify the attestation bundle
         working-directory: source
         shell: bash
         run: |
           set -euo pipefail
           shopt -s nullglob
+          archives=(goetia-*.tar.xz goetia-*.zip)
+          if [[ "${#archives[@]}" -eq 0 ]]; then
+            echo "::error::no archives found to verify; the sigstore verification loop would run zero iterations and report success" >&2
+            exit 1
+          fi
           status=0
-          for archive in goetia-*.tar.xz goetia-*.zip; do
+          for archive in "${archives[@]}"; do
             if ! sigstore verify github \
               --bundle goetia.sigstore.json \
               --cert-identity https://github.com/bindreams/goetia/.github/workflows/draft-release.yaml@refs/heads/main \

@@ -49,13 +49,29 @@ ones. Check `$?` (or your shell's equivalent), not the output.
 Two flags are easy to get wrong:
 
 - `--cert-identity-regexp` is cosign's flag. `sigstore` (the PyPI package
-  used here) does not have it; passing it aborts with "unrecognized
-  arguments" before anything is verified.
+  used here) does not have it, and passing it aborts before anything is
+  verified — but the exact error depends on where you put it. Placed before
+  the file argument, as every flag is in the example above, argparse
+  consumes the pattern as the file argument instead and aborts with
+  `argument FILE_OR_DIGEST: invalid file_or_digest value: '<pattern>'`;
+  placed after the file argument, it aborts with `unrecognized arguments`.
+  Either way, nothing is verified.
 - `--repository` alone is not a pin on which workflow produced the bundle —
   it accepts a bundle minted by any workflow, on any ref, in that
   repository. Passing `--name`, `--ref`, `--trigger`, and `--cert-identity`
   alongside it, as in the example above, is what actually pins the bundle
   to this project's release pipeline.
+
+This command also only proves the archive's bytes came from goetia's release
+pipeline — not that it's the platform its filename claims. Sigstore matches
+the bundle against the file's digest alone; it does not check the file's
+name against the bundle's subjects. Renaming one verified archive to another
+archive's filename (e.g. `goetia-aarch64-apple-darwin.tar.xz` renamed to
+`goetia-x86_64-unknown-linux-musl.tar.xz`) still verifies successfully. If
+that distinction matters to you, also confirm the archive's top-level
+directory matches its filename, for example with `tar tf
+goetia-x86_64-unknown-linux-musl.tar.xz | head -1` (or `unzip -l` for the
+`.zip`), and check it reads `goetia-x86_64-unknown-linux-musl/`.
 
 ## Interpolation
 
