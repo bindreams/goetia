@@ -8,6 +8,12 @@ license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/bindreams/goetia"
 authors = ["bindreams"]
+keywords = ["daemon", "service", "systemd", "launchd", "windows-service"]
+categories = ["command-line-utilities", "os"]
+exclude = ["/.github", "/.claude", "/scripts", "/prek.toml", "/.editorconfig", "/.gitattributes", "/.rustfmt.toml"]
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]
 
 [[bin]]
 name = "goetia"

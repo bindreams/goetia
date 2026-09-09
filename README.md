@@ -6,12 +6,85 @@ macOS, and the Service Control Manager on Windows.
 
 ## Status
 
-Early development. No release yet.
+Pre-1.0. See the [releases page](https://github.com/bindreams/goetia/releases)
+for what has actually shipped.
 
 Everything documented below — the manifest's interpolation syntax, the
 `.env` grammar, the `--json` document, and the exit codes — is **pre-1.0 and
-may still change**. There is no release to pin yet; until there is, script
-against a specific commit.
+may still change** between releases. Pin a specific released version, or a
+specific commit if working ahead of one.
+
+## Verifying a download
+
+Every release ships `SHA256SUMS` and one `goetia.sigstore.json` — a Sigstore
+bundle attesting GitHub build provenance for **the five archives and nothing
+else**. `goetia.sigstore.json` is the thing to verify against; `SHA256SUMS`
+is a convenience for comparing a download by hand and carries no attestation
+of its own. A `SHA256SUMS` match is a sanity check, not a substitute for the
+steps below.
+
+Verification needs only [`sigstore`](https://pypi.org/project/sigstore/)
+from PyPI (`pip install sigstore`) — no `gh` CLI required. A bundle verifies
+against exactly one file at a time, so checking all five archives is a loop,
+one invocation per archive, for example:
+
+```
+python -m sigstore verify github --bundle goetia.sigstore.json \
+  --repository bindreams/goetia --ref refs/heads/main \
+  --name "Draft Release" --trigger workflow_dispatch \
+  --cert-identity https://github.com/bindreams/goetia/.github/workflows/draft-release.yaml@refs/heads/main \
+  goetia-x86_64-unknown-linux-musl.tar.xz
+```
+
+Repeat with each of the other four archive names in place of the last
+argument. None of the five pinned values above embeds the release version,
+so this command does not need updating between releases.
+
+`sigstore` decides success or failure by **exit status**, not by anything it
+prints: on success it writes `OK: <file>` to **stderr** and the verified
+in-toto statement to **stdout**, so a script that greps stdout for `OK`
+never matches and silently reports success on every run, including failed
+ones. Check `$?` (or your shell's equivalent), not the output.
+
+Two flags are easy to get wrong:
+
+- `--cert-identity-regexp` is cosign's flag. `sigstore` (the PyPI package
+  used here) does not have it, and passing it aborts before anything is
+  verified — but the exact error depends on where you put it. Placed before
+  the file argument, as every flag is in the example above, argparse
+  consumes the pattern as the file argument instead and aborts with
+  `argument FILE_OR_DIGEST: invalid file_or_digest value: '<pattern>'`;
+  placed after the file argument, it aborts with `unrecognized arguments`.
+  Either way, nothing is verified.
+- `--repository` alone is not a pin on which workflow produced the bundle —
+  it accepts a bundle minted by any workflow, on any ref, in that
+  repository. Passing `--name`, `--ref`, `--trigger`, and `--cert-identity`
+  alongside it, as in the example above, is what actually pins the bundle
+  to this project's release pipeline.
+
+This command also only proves the archive's bytes came from goetia's release
+pipeline — not that it's the platform its filename claims. Sigstore matches
+the bundle against the file's digest alone; it does not check the file's
+name against the bundle's subjects. Renaming one verified archive to another
+archive's filename (e.g. `goetia-aarch64-apple-darwin.tar.xz` renamed to
+`goetia-x86_64-unknown-linux-musl.tar.xz`) still verifies successfully. If
+that distinction matters to you, also confirm the archive's top-level
+directory matches its filename:
+
+```
+tar tf goetia-x86_64-unknown-linux-musl.tar.xz | head -1
+unzip -Z1 goetia-x86_64-pc-windows-msvc.zip | head -1
+```
+
+Each prints a path that must start with `goetia-<target>/` for the target
+the filename claims — either that directory entry on its own
+(`goetia-x86_64-pc-windows-msvc/`) or the first file inside it
+(`goetia-x86_64-pc-windows-msvc/goetia.exe`), depending on how the archive
+was written, so check the prefix rather than an exact match.
+
+Use `unzip -Z1`, not `unzip -l`: `-l` starts with a banner reading
+`Archive:  <filename>`, which echoes back the name you typed. That name is
+the untrusted claim being checked, so a check that reads it proves nothing.
 
 ## Interpolation
 

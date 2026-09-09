@@ -1,0 +1,444 @@
+name: Draft Release
+
+# PRECONDITION THE OPERATOR MUST CONFIRM BEFORE DISPATCHING: the
+# repository's immutable-releases setting is on. Everything downstream —
+# including the reasoning that a published release cannot be tampered with
+# afterwards — depends on it, and neither release workflow can check it.
+# Reading `repos/{owner}/{repo}/immutable-releases` needs repository
+# `administration: read`, which is not a grantable `GITHUB_TOKEN`
+# permission: it is not in the workflow `permissions:` schema at all, so
+# the call cannot succeed with any token these workflows can hold. Confirm
+# it by hand, from an account with admin access:
+#
+#     gh api -X GET repos/bindreams/goetia/immutable-releases
+#
+# with the setting on, that answers `{"enabled":true,...}`. Publish
+# Release's `Assert immutability` step is the automated backstop, but it
+# can only observe the OUTCOME, after the release is already public.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 0.1.0)"
+        required: true
+        type: string
+
+concurrency:
+  # Keyed on the version NORMALIZED to its `v`-prefixed form, not the raw
+  # input. `0.1.0` and `v0.1.0` are the only two spellings
+  # normalize-version.sh accepts, and both must land in one group: goetia's
+  # stage 2 publishes to crates.io, where two concurrent runs on the raw
+  # input could both see no release, both 404 on the crates.io check, and
+  # both publish. The expression language has no substring/replace
+  # function, so this normalizes upward (startsWith + format) rather than
+  # stripping a prefix. The authoritative normalization stays in
+  # normalize-version.sh; this is only a bucketing key.
+  group: draft-release-${{ startsWith(inputs.version, 'v') && inputs.version || format('v{0}', inputs.version) }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate version
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # `write`, not `read`: GitHub returns draft releases only to callers
+      # with push access, so a read-scoped token reports every existing
+      # draft as absent, and the existence check below would pass while a
+      # draft already sits there.
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Full history: the ancestry check below needs origin/main.
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        # `cargo metadata` below works on today's hosted image by
+        # accident; nothing here is entitled to whatever toolchain the
+        # image happens to ship.
+
+      - name: Normalize and validate version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(.github/scripts/normalize-version.sh "$INPUT_VERSION")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Verify manifest version matches
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest="$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[0].version')"
+          if [ "$manifest" != "$VERSION" ]; then
+            echo "::error::Cargo.toml declares $manifest but this dispatch asked for $VERSION"
+            exit 1
+          fi
+
+      - name: Fail if the release already exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+
+          # `gh release view` exits non-zero for a missing release AND for
+          # every transient failure. Discarding the reason would make an
+          # outage or a rate limit read as "no such release" — and since
+          # GitHub does not enforce tag_name uniqueness across drafts, the
+          # run would then create a SECOND draft for the same tag rather
+          # than being rejected.
+          set +e
+          output="$(gh release view "$tag" --json tagName 2>&1)"
+          status=$?
+          set -e
+
+          if [ "$status" -eq 0 ]; then
+            echo "::error::Release $tag already exists (draft or published). Delete it or pick a new version."
+            exit 1
+          fi
+          if ! grep -qi 'release not found' <<<"$output"; then
+            echo "::error::Cannot confirm whether $tag exists: $output"
+            exit 1
+          fi
+          echo "no existing release $tag"
+
+      # A tag with no release attached is the dangerous case:
+      # `gh release create --target` is silently ignored when the tag
+      # exists, binding the release to the old tag's commit, and
+      # `gh release delete` leaves tags behind.
+      - name: Fail if the tag already exists
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: .github/scripts/assert-tag-absent.sh "v${VERSION}"
+
+      - name: Verify the release commit is on main
+        env:
+          SHA: ${{ github.sha }}
+        shell: bash
+        run: .github/scripts/assert-commit-on-main.sh "$SHA"
+
+      # The ancestry check above is not sufficient on its own: it is
+      # satisfied by dispatching from any branch or tag whose head is
+      # already merged (a stale release branch, a maintenance tag,
+      # anything). The attestation certificate and the sigstore
+      # verification both pin `refs/heads/main` verbatim — a dispatch from
+      # any other merged ref would produce a release no consumer can
+      # verify.
+      - name: Refuse dispatches that are not from main
+        env:
+          REF: ${{ github.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::Releases must be dispatched from refs/heads/main, got $REF"
+            exit 1
+          fi
+
+  ci:
+    name: CI
+    needs: validate
+    # Main's last green run does not imply THIS commit is green, and
+    # goetia's CI is the only thing running its elevation-gated tests
+    # across the three host OSes.
+    uses: ./.github/workflows/ci.yaml
+    permissions:
+      contents: read
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: [validate, ci]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      # Five platforms; seeing all failures in one run beats rediscovering
+      # them one dispatch at a time. Nothing is published from a partial
+      # matrix, so there is no hazard in letting the others finish.
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install musl-tools
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Statically link musl's libc: the two musl targets otherwise
+          # dynamically link a musl libc that is not guaranteed present on
+          # the consumer's machine.
+          if [[ "$TARGET" == *musl* ]]; then
+            export RUSTFLAGS="-Ctarget-feature=+crt-static -Clink-self-contained=yes"
+          fi
+          cargo build --release --locked --target "$TARGET"
+
+      - name: Stage and archive (Unix)
+        if: runner.os != 'Windows'
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="goetia-${TARGET}"
+          mkdir -p "$dir"
+          # target/<target>/release/, never target/release/ — the latter
+          # holds the same host binaries on every native row and would
+          # silently produce five archives of one host's binaries.
+          cp "target/${TARGET}/release/goetia" "target/${TARGET}/release/goetia-shim" "$dir/"
+          cp README.md LICENSE.md "$dir/"
+          tar -cJf "${dir}.tar.xz" "$dir/"
+
+      - name: Stage and archive (Windows)
+        if: runner.os == 'Windows'
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dir = "goetia-$env:TARGET"
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          Copy-Item "target/$env:TARGET/release/goetia.exe" "$dir/"
+          Copy-Item "target/$env:TARGET/release/goetia-shim.exe" "$dir/"
+          Copy-Item README.md, LICENSE.md "$dir/"
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+
+      # Compress-Archive is reported to write `dir\file` entry names on
+      # some hosts, which would leave Python's zipfile extracting a file
+      # literally called `goetia-...\goetia.exe` on the consumer's
+      # machine. `release-script-tests.sh`'s zip-backslash fixture covers
+      # the same ground offline; this step covers the runner actually in
+      # use. If this ever fails for real, switch this row to `tar -a -cf`
+      # or `7z`, both present on the runner.
+      - name: Assert zip entry separators (Windows)
+        if: runner.os == 'Windows'
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead("goetia-$env:TARGET.zip")
+          try {
+            $bad = $zip.Entries | Where-Object { $_.FullName -match '\\' }
+          } finally {
+            $zip.Dispose()
+          }
+          if ($bad) {
+            Write-Error "zip entries use backslash separators: $($bad.FullName -join ', ')"
+            exit 1
+          }
+
+      - name: Upload archive (Unix)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: goetia-${{ matrix.target }}
+          path: goetia-${{ matrix.target }}.tar.xz
+          if-no-files-found: error
+
+      - name: Upload archive (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: goetia-${{ matrix.target }}
+          path: goetia-${{ matrix.target }}.zip
+          if-no-files-found: error
+
+  release:
+    name: Draft release
+    needs: [validate, ci, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      # actions/checkout deletes a non-empty workspace, so it must run
+      # before the archives are downloaded, not after.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # `pattern:` keeps this to the build job's five `goetia-*` artifacts,
+      # not the `ci` job's `probe-results-*` uploads sharing this run.
+      # `merge-multiple: true` lands the five archives flat in `source/`
+      # instead of nested one-per-artifact-name — without it, the SHA256SUMS
+      # below would record directory-prefixed paths and the globs in every
+      # later step would match nothing at the workspace root.
+      - name: Download archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: goetia-*
+          merge-multiple: true
+          path: source
+
+      # nullglob matters here: without it, a missing archive leaves the
+      # literal glob string as one argument, the script still receives five
+      # words, and the count check passes while an archive does not exist.
+      - name: Assert the build matrix is complete
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          ../.github/scripts/assert-archives.sh 5 goetia-*.tar.xz goetia-*.zip
+
+      # Hashed once, here, rather than per build runner: Git-Bash's
+      # sha256sum defaults to binary mode on Windows and text mode on
+      # macOS, so a row hashed on each runner would produce a SHA256SUMS
+      # whose format varies by line.
+      - name: Compute SHA256SUMS
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          sha256sum goetia-*.tar.xz goetia-*.zip > SHA256SUMS
+
+      # One call, one bundle covering all five archives. SHA256SUMS is
+      # deliberately not a subject: it is written after the archives and
+      # before the bundle, and attesting it would mean a second attestation
+      # or an ordering knot. It stays a convenience for humans; the bundle
+      # is what a consumer verifies against.
+      - name: Attest archives
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: |
+            source/goetia-*.tar.xz
+            source/goetia-*.zip
+
+      - name: Copy the attestation bundle into the release payload
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "$BUNDLE_PATH" source/goetia.sigstore.json
+
+      # nullglob matters here for the same reason as the build-matrix check
+      # above: without it, a missing asset leaves the literal glob string as
+      # one argument instead of expanding to nothing. Stage 1 uploads seven
+      # assets under nullglob (below) with nothing else asserting the count,
+      # so a glob that silently went empty would upload fewer than seven and
+      # nothing would notice.
+      - name: Assert exactly the expected 7 release assets are ready to upload
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          ../.github/scripts/assert-asset-count.sh . 7 \
+            goetia-*.tar.xz goetia-*.zip SHA256SUMS goetia.sigstore.json
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: Install sigstore
+        # renovate: datasource=pypi depName=sigstore
+        run: uv tool install sigstore==4.5.0
+
+      # The pins, the loop and the zero-archive guard live in
+      # verify-sigstore-bundle.sh, which Publish Release calls identically
+      # before the irreversible publish, and which release-script-tests.sh
+      # covers against a stubbed `sigstore`. nullglob is still set here so a
+      # missing archive reaches the script as a missing argument rather than
+      # an unexpanded glob.
+      - name: Verify the attestation bundle
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          ../.github/scripts/verify-sigstore-bundle.sh \
+            goetia.sigstore.json "$GITHUB_SHA" goetia-*.tar.xz goetia-*.zip
+
+      # The tag and release-existence checks are re-run here, immediately
+      # above `gh release create`, rather than trusted from the `validate`
+      # job: that job's checks ran before the CI matrix and the build
+      # matrix, tens of minutes earlier. Re-running here narrows the race
+      # window to seconds instead of leaving it open for the whole job.
+      - name: Re-check for a race, then draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+
+          set +e
+          output="$(gh release view "$tag" --json tagName 2>&1)"
+          status=$?
+          set -e
+
+          if [ "$status" -eq 0 ]; then
+            echo "::error::Release $tag already exists (draft or published). Delete it or pick a new version."
+            exit 1
+          fi
+          if ! grep -qi 'release not found' <<<"$output"; then
+            echo "::error::Cannot confirm whether $tag exists: $output"
+            exit 1
+          fi
+
+          .github/scripts/assert-tag-absent.sh "$tag"
+
+          shopt -s nullglob
+          gh release create "$tag" \
+            --draft \
+            --latest=true \
+            --title "$tag" \
+            --generate-notes \
+            --target "$GITHUB_SHA" \
+            source/goetia-*.tar.xz source/goetia-*.zip source/SHA256SUMS source/goetia.sigstore.json

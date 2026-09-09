@@ -4,10 +4,16 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel superseded runs on PRs; let main / dispatch runs finish. Under
+  # workflow_call the `github` context is the CALLER's, so without this,
+  # two Draft Release dispatches on main would land in the same
+  # concurrency group and the second would silently cancel the first's CI
+  # job — the gate that is supposed to prove the release commit is green.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -31,12 +37,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: clippy
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
@@ -74,6 +80,8 @@ jobs:
                   ):
                       print(msg["executable"])
           PY
+
+          .github/scripts/assert-test-binaries.sh test-binaries.txt
 
           status=0
           while IFS= read -r bin; do
@@ -113,17 +121,17 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: rustfmt
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: lint
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v10.0.1
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
 
       - name: Install prek
         # renovate: datasource=pypi depName=prek
@@ -136,3 +144,54 @@ jobs:
         env:
           SKIP: cargo-clippy
         run: prek run --all-files
+
+      - name: Test release helper scripts
+        shell: bash
+        run: bash .github/scripts/release-script-tests.sh
+
+  # A separate job (rather than a step inside `test`, which already takes
+  # twenty minutes) so it runs in parallel. All three hosts: the dry-run
+  # only ever compiles for its own host, and `test` builds the *repository*
+  # rather than the *tarball*, so nothing else here would catch an
+  # `exclude` that breaks a non-Linux build — goetia is more exposed to
+  # this than most crates, since `src/bin/shim` is `#[cfg(windows)]`-gated
+  # internally and the three backends have disjoint dependency sets.
+  package:
+    name: Package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: package
+
+      - name: Dry-run cargo publish
+        run: cargo publish --dry-run --locked
+
+      # Proves the package *builds*, which the dry-run above already does —
+      # not that an `exclude` entry in Cargo.toml is still doing anything.
+      # The listing is written outside the workspace: a listing file
+      # created in the package root becomes an uncommitted, non-excluded
+      # file that cargo sees as a dirty worktree, and the guard would abort
+      # before it ever ran.
+      - name: Assert the package excludes stayed excluded
+        shell: bash
+        run: |
+          set -euo pipefail
+          list="${RUNNER_TEMP}/pkg-list.txt"
+          cargo package --list --locked > "$list"
+          bash .github/scripts/assert-package-list.sh "$list"

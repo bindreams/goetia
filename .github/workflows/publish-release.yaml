@@ -1,0 +1,295 @@
+name: Publish Release
+
+# PRECONDITION THE OPERATOR MUST CONFIRM BEFORE DISPATCHING: the
+# repository's immutable-releases setting is on. This workflow cannot read
+# it — `repos/{owner}/{repo}/immutable-releases` needs repository
+# `administration: read`, which is not a grantable `GITHUB_TOKEN`
+# permission — so confirm it by hand, from an account with admin access:
+#
+#     gh api -X GET repos/bindreams/goetia/immutable-releases
+#
+# with the setting on, that answers `{"enabled":true,...}`. The
+# `Assert immutability` step below is the automated backstop, and it can
+# only fire after both irreversible actions have already happened.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 0.1.0)"
+        required: true
+        type: string
+
+concurrency:
+  # Keyed on the version NORMALIZED to its `v`-prefixed form, not the raw
+  # input, for the same reason as Draft Release's group — and more urgently
+  # here: this workflow publishes to crates.io. A `0.1.0`/`v0.1.0` split
+  # would put two runs in different groups, both seeing the same draft, both
+  # 404-ing on the crates.io check below, and both publishing. The
+  # expression language has no substring/replace function, so this
+  # normalizes upward (startsWith + format) rather than stripping a prefix.
+  # The authoritative normalization stays in normalize-version.sh; this is
+  # only a bucketing key.
+  group: publish-release-${{ startsWith(inputs.version, 'v') && inputs.version || format('v{0}', inputs.version) }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Verify and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The real preflight — version validation, the CI matrix, the packaging
+    # dry-run, the archive checks, the attestation — already happened in
+    # Draft Release before a draft could exist. The draft's existence is the
+    # evidence it passed, and the operator dispatching this has reviewed it.
+    # This job re-verifies only what could have changed BETWEEN the stages:
+    # the draft's bytes, its target commit, and crates.io's own state.
+    environment: Deploy
+    permissions:
+      # `write`, not `read`: GitHub returns draft releases only to callers
+      # with push access, so a read-scoped token would report an existing
+      # draft as absent.
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Normalize and validate version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(.github/scripts/normalize-version.sh "$INPUT_VERSION")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve the draft release
+        id: release
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: .github/scripts/resolve-draft-release.sh "$TAG" >> "$GITHUB_OUTPUT"
+
+      # actions/checkout deletes a non-empty workspace, so this must run
+      # before the asset download below, not after. Checks out the draft's
+      # own commit, not `main`, which may have moved since the draft was
+      # created.
+      - name: Checkout the draft's commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ steps.release.outputs.sha }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Verify manifest version matches the release
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA: ${{ steps.release.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest="$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[0].version')"
+          if [ "$manifest" != "$VERSION" ]; then
+            echo "::error::Checked-out commit $SHA declares $manifest but this dispatch asked for $VERSION"
+            exit 1
+          fi
+
+      # The model's whole premise is that a draft is mutable between the
+      # stages. An archive swapped, or the bundle replaced, survives any
+      # check that compares only asset names — and is then frozen by
+      # immutability. Verification must happen in the job that flips the
+      # draft, on the bytes it is about to publish, not on a separately
+      # downloaded copy.
+      #
+      # Downloaded to $RUNNER_TEMP, deliberately OUTSIDE the checkout: a
+      # directory populated inside $GITHUB_WORKSPACE becomes seven
+      # untracked, non-excluded files, and `cargo publish --locked` below
+      # refuses to run against a dirty working tree (reproduced: `error: 7
+      # files in the working directory contain changes that were not yet
+      # committed into git`). Passing `--allow-dirty` to work around that
+      # would package the release archives into the crate tarball itself.
+      # `ci.yaml`'s package job writes its own listing file to
+      # `$RUNNER_TEMP` for the identical reason — see the comment there.
+      - name: Download the draft's assets
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/source"
+          gh release download "$TAG" --dir "${RUNNER_TEMP}/source"
+
+      # nullglob matters here: without it, a missing asset leaves the
+      # literal glob string as one argument, the script still receives the
+      # expected word count, and the check passes while an asset does not
+      # exist.
+      - name: Assert exactly the expected 7 release assets were downloaded
+        working-directory: ${{ runner.temp }}/source
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          "${GITHUB_WORKSPACE}/.github/scripts/assert-asset-count.sh" . 7 \
+            goetia-*.tar.xz goetia-*.zip SHA256SUMS goetia.sigstore.json
+
+      - name: Assert the release contains the full archive set
+        working-directory: ${{ runner.temp }}/source
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          "${GITHUB_WORKSPACE}/.github/scripts/assert-archives.sh" 5 goetia-*.tar.xz goetia-*.zip
+
+      # SHA256SUMS itself is unattested (see the comment on Draft Release's
+      # "Compute SHA256SUMS" step) and is mutable between the stages exactly
+      # like the archives are, so it gets the same "verify the bytes about
+      # to be published, not a separately downloaded copy" treatment: recompute
+      # and compare here, not trust the file's own claims. The archive names
+      # are passed in so the file has to cover all five — `sha256sum -c`
+      # verifies only the lines it is given, and a SHA256SUMS truncated to a
+      # subset passes it cleanly.
+      - name: Verify SHA256SUMS against the downloaded archives
+        working-directory: ${{ runner.temp }}/source
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          "${GITHUB_WORKSPACE}/.github/scripts/assert-checksums.sh" \
+            SHA256SUMS goetia-*.tar.xz goetia-*.zip
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: Install sigstore
+        # renovate: datasource=pypi depName=sigstore
+        run: uv tool install sigstore==4.5.0
+
+      # The same script Draft Release runs, so the two can never drift, and
+      # the pins it applies describe the workflow that MINTED the bundle
+      # (Draft Release), not this one. `$SHA` is the draft's own commit: it
+      # is what makes this check version-specific, and without it a whole
+      # archive set plus bundle taken from a previous release satisfies
+      # every other pin — the swap this step exists to catch.
+      - name: Verify the attestation bundle
+        working-directory: ${{ runner.temp }}/source
+        env:
+          SHA: ${{ steps.release.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          "${GITHUB_WORKSPACE}/.github/scripts/verify-sigstore-bundle.sh" \
+            goetia.sigstore.json "$SHA" goetia-*.tar.xz goetia-*.zip
+
+      # Packaged here, before the crates.io check, because the check needs
+      # it: an existing version on crates.io is only this pipeline's own
+      # prior run if what is published is byte-identical to what this commit
+      # packages, and `.crate`'s sha256 is what crates.io publishes as
+      # `.version.checksum`. `cargo publish` below packages again itself;
+      # this run of it also proves the crate builds before anything
+      # irreversible happens.
+      - name: Package the crate
+        shell: bash
+        run: cargo package --locked
+
+      # Decides whether the irreversible publish below runs at all. Every
+      # branch of that decision — and the reasoning for treating a
+      # non-yanked 200 as something to prove rather than assume — lives in
+      # the script, with stub-driven coverage in release-script-tests.sh.
+      - name: Check crates.io for an existing version
+        id: crates_check
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          .github/scripts/check-crates-io-version.sh \
+            goetia "$VERSION" "target/package/goetia-${VERSION}.crate" >> "$GITHUB_OUTPUT"
+
+      # THE POINT OF NO RETURN. A version can be yanked but never
+      # unpublished, and the crate name can never be released. This runs
+      # BEFORE the GitHub flip below, not after: this step is re-runnable
+      # (guarded by the check above), the flip is not (once `draft=false`, a
+      # re-dispatch aborts at the isDraft assertion above). The door that
+      # can be re-entered has to be the one walked through first — reversed,
+      # a crates.io failure after a successful flip would leave no automated
+      # path to finish.
+      - name: Publish to crates.io
+        if: steps.crates_check.outputs.already_published == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
+
+      # Creating the tag here, rather than letting the publish below create
+      # it, is what removes the race: the create is atomic and refuses an
+      # existing ref, so the release can only be published onto a tag this
+      # run put at this commit.
+      - name: Create the release tag
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          SHA: ${{ steps.release.outputs.sha }}
+        shell: bash
+        run: .github/scripts/create-release-tag.sh "$TAG" "$SHA"
+
+      # If this step fails after crates.io publish succeeded above, nothing
+      # is lost: the crate is on crates.io, the GitHub release is still a
+      # draft, and the tag now exists at the right commit — the three are
+      # simply not yet in sync. Re-dispatching needs that tag deleted first,
+      # since the create above refuses to reuse it; no release is published
+      # against it, so deleting it is safe. On the re-run, the crates.io
+      # check returns 200 and proves the published crate is this commit's,
+      # the publish step skips, and this step onward retries. The one case
+      # that is NOT self-healing is the read-back below disagreeing.
+      - name: Publish the GitHub release
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --draft=false --latest=true
+
+      - name: Read the published tag back
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          SHA: ${{ steps.release.outputs.sha }}
+        shell: bash
+        run: .github/scripts/assert-tag-points-at.sh "$TAG" "$SHA"
+
+      # The only automated check of immutability the pipeline can make. The
+      # repository SETTING is unreadable here (see the precondition at the
+      # top of this file), but the OUTCOME on a published release is a plain
+      # release read, which `contents` covers. It necessarily runs after the
+      # flip, so its remedy text has to assume a burnt version number.
+      #
+      # `gh release view --json` exposes `isImmutable`; the REST object
+      # (`gh api repos/{owner}/{repo}/releases/...`) exposes `immutable`
+      # instead. This call site uses `isImmutable`.
+      - name: Assert immutability
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          is_immutable="$(gh release view "$TAG" --json isImmutable --jq '.isImmutable')"
+          if [ "$is_immutable" != "true" ]; then
+            echo "::error::Release $TAG is published but NOT immutable. It is already public and mutable, and cannot be un-published."
+            echo "::error::Do not delete it: deleting a published release permanently reserves the tag name."
+            echo "::error::The remedy is to turn on the immutable-releases repository setting and cut v0.1.1 through both stages."
+            exit 1
+          fi
+
+      - name: Print the release URL
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          echo "Release published: https://github.com/${GH_REPO}/releases/tag/${TAG}"
