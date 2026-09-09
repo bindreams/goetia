@@ -117,7 +117,7 @@ windows-sys = { version = "0.61", features = [
 # are real, event-driven kernel waits — see `src/bin/shim/service.rs`.
 # 0.x with an explicitly unstable API; pinned to `"0.2"` rather than a
 # looser range since a minor bump may break this crate's own build.
-cosca = "0.2"
+cosca = "0.3"
 
 [dev-dependencies]
 skuld = "0.3"
