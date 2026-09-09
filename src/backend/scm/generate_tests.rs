@@ -237,41 +237,59 @@ fn registration_for_root_uses_the_default_account_with_an_empty_identity() {
 
 /// The recognition half (`windows_builtin`, in `spec`) and the spelling
 /// half (`canonical_account`, here) are two modules reading one table —
-/// this is the assertion that they agree on every row of it, not just the
-/// two rows an easier assertion would vacuously cover for `LocalService`/
-/// `NetworkService`.
+/// this is every row of it, written out. The expected values are literals
+/// rather than expressions over `windows_builtin`: `canonical_account` *is*
+/// `windows_builtin(x).map(Builtin::canonical)` with a verbatim fallback,
+/// so any assertion phrased in terms of that composition holds even when
+/// the table is empty, and would pass with `windows_builtin` stubbed to
+/// `None` — which is what an earlier version of this test did.
 #[skuld::test]
-fn canonical_account_agrees_with_the_recognition_half() {
-    for spelling in [
-        "",
-        "localsystem",
-        "system",
-        r"nt authority\system",
-        "localservice",
-        "networkservice",
-        r"NT SERVICE\frpc",
+fn canonical_account_maps_every_table_row_to_its_createservicew_spelling() {
+    for (spelling, recognised, canonical) in [
+        ("", Some(Builtin::LocalSystem), None),
+        ("localsystem", Some(Builtin::LocalSystem), None),
+        ("system", Some(Builtin::LocalSystem), None),
+        (r"nt authority\system", Some(Builtin::LocalSystem), None),
+        (r"NT AUTHORITY\LocalSystem", Some(Builtin::LocalSystem), None),
+        (
+            "localservice",
+            Some(Builtin::LocalService),
+            Some(r"NT AUTHORITY\LocalService"),
+        ),
+        // Idempotent: canonicalising the canonical spelling is a no-op.
+        (
+            r"NT AUTHORITY\LocalService",
+            Some(Builtin::LocalService),
+            Some(r"NT AUTHORITY\LocalService"),
+        ),
+        (
+            r"NT AUTHORITY\LOCAL SERVICE",
+            Some(Builtin::LocalService),
+            Some(r"NT AUTHORITY\LocalService"),
+        ),
+        (
+            "networkservice",
+            Some(Builtin::NetworkService),
+            Some(r"NT AUTHORITY\NetworkService"),
+        ),
+        (
+            r"NT AUTHORITY\NetworkService",
+            Some(Builtin::NetworkService),
+            Some(r"NT AUTHORITY\NetworkService"),
+        ),
+        (
+            r"NT AUTHORITY\NETWORK SERVICE",
+            Some(Builtin::NetworkService),
+            Some(r"NT AUTHORITY\NetworkService"),
+        ),
+        (r"NT SERVICE\frpc", None, Some(r"NT SERVICE\frpc")),
     ] {
-        let recognised = windows_builtin(spelling);
-        let canonical = canonical_account(spelling);
-
+        assert_eq!(windows_builtin(spelling), recognised, "recognising `{spelling}`");
         assert_eq!(
-            recognised.is_none(),
-            canonical == Some(spelling.to_string()),
-            "`{spelling}`: unrecognised iff passed through verbatim (recognised: {recognised:?}, canonical: \
-             {canonical:?})"
+            canonical_account(spelling),
+            canonical.map(str::to_string),
+            "canonicalising `{spelling}`"
         );
-        assert_eq!(
-            recognised == Some(Builtin::LocalSystem),
-            canonical.is_none(),
-            "`{spelling}`: LocalSystem iff canonical is None (recognised: {recognised:?}, canonical: {canonical:?})"
-        );
-        for builtin in [Builtin::LocalService, Builtin::NetworkService] {
-            assert_eq!(
-                recognised == Some(builtin),
-                canonical == builtin.canonical().map(str::to_string),
-                "`{spelling}` vs {builtin:?} (recognised: {recognised:?}, canonical: {canonical:?})"
-            );
-        }
     }
 }
 
