@@ -370,6 +370,11 @@ fn annotate_step5_error(err: Error, native_entry: Option<Backend>) -> Error {
 /// warning in every pass that keeps warnings — collapsing those duplicates
 /// to one is this function's whole job.
 ///
+/// Only that advisory ever reaches here twice: a `Backend::warn` advisory
+/// belongs to one backend, which exactly one pass owns. So this call site
+/// is exercised only on Windows, by
+/// `a_base_drive_relative_path_warns_once_not_once_per_backend_pass`.
+///
 /// **This depends on the warning text quoting the raw path.** Two
 /// advisories about two *different* paths stay distinct only because the
 /// message contains the path; if that text is ever shortened to drop the

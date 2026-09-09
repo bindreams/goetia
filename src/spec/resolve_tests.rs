@@ -1381,6 +1381,14 @@ fn dedup_does_not_merge_warnings_differing_only_by_id() {
 #[cfg(windows)]
 #[skuld::test]
 fn a_base_drive_relative_path_warns_once_not_once_per_backend_pass() {
+    // The guard on `dedup_warnings`'s call site, and the only one there can
+    // be: three passes keep warnings (step 4's two non-native sweeps and
+    // step 5), `resolve_shape` emits this advisory in each of them for a
+    // base path, and it is the sole warning any two passes ever produce
+    // identically. Deleting the `dedup_warnings` call leaves three. It
+    // cannot fire off Windows — `std::path::absolute` leaves a path
+    // relative only for a Windows prefix without a root — so this stays a
+    // `cfg(windows)` assertion rather than a portable one.
     let yaml = "daemons:\n  frpc:\n    command: [\"C:bin/frpc.exe\"]\n";
     let (_specs, warnings) = resolve(parse_manifest(yaml), &base_dir()).expect("resolves");
     assert_eq!(warnings.len(), 1, "{warnings:?}");
@@ -1411,10 +1419,67 @@ fn sub_second_delay_warning_follows_the_launchd_merged_spec() {
 }
 
 #[skuld::test]
-fn each_warning_fires_exactly_once_across_every_backend_pass() {
+fn a_backend_advisory_is_emitted_by_exactly_one_pass() {
+    // Named for what it can actually catch: the launchd advisory is emitted
+    // by whichever single pass owns launchd (step 4 where it is non-native,
+    // step 5 where it is), so this fails if some pass emits it twice — but
+    // it is *not* the guard on `dedup_warnings`'s call site. Collapsing
+    // duplicates is only ever exercised by the drive-relative advisory,
+    // which `resolve_shape` emits in every pass that keeps warnings and
+    // which can only fire on Windows: see
+    // `a_base_drive_relative_path_warns_once_not_once_per_backend_pass`.
     let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    restart-delay: 500ms\n";
     let (_specs, warnings) = resolve_yaml(yaml).expect("resolves");
     assert_eq!(warnings.len(), 1, "{warnings:?}");
+}
+
+#[skuld::test]
+fn the_native_backend_advisory_comes_from_the_substituted_pass() {
+    // Step 4 skips the native backend entirely, so step 5's `warn` is the
+    // only thing that can produce a native advisory. Driven through
+    // `resolve_as` for every backend in turn, because on any one host two
+    // of the three arms are otherwise unreachable — and the Systemd arm
+    // emits nothing at all, which is why the assertion is keyed on the
+    // advisory each backend actually has.
+    let cases = [
+        (Backend::Launchd, "restart-delay: 500ms", "ThrottleInterval"),
+        (Backend::Scm, "type: managed\n    cwd: .", "silently unavailable"),
+    ];
+    for (native, fields, expected) in cases {
+        let yaml = format!("daemons:\n  frpc:\n    command: [/bin/frpc]\n    {fields}\n");
+        let (_specs, warnings) = resolve_yaml_as(native, &yaml).expect("resolves");
+        assert_eq!(warnings.len(), 1, "native `{native}`: {warnings:?}");
+        assert!(
+            warnings[0].message.contains(expected),
+            "native `{native}`: {warnings:?}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_native_backends_verdict_does_not_pre_empt_the_sweep() {
+    // The native skip in step 4, asserted through its one observable
+    // consequence: with two invalid overrides, the sweep's verdict is
+    // reported and the native backend's is not, because the native one is
+    // deferred to step 5 — where it judges the values that will actually be
+    // installed, substituted, rather than the text they were written as.
+    //
+    // The native backend must come *first* in `Backend::ALL` for this to
+    // distinguish anything: were it swept, its verdict would be raised
+    // before the other's. `ALL[0]`/`ALL[1]` rather than two names, so the
+    // pairing cannot rot if that order changes.
+    let native = Backend::ALL[0];
+    let swept = Backend::ALL[1];
+    let yaml = format!(
+        "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      {native}:\n        user: {}\n      \
+         {swept}:\n        user: {}\n",
+        user_rejected_by(native),
+        user_rejected_by(swept)
+    );
+    let err = resolve_yaml_as(native, &yaml).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains(&format!("backend-specific.{swept}")), "{msg}");
+    assert!(!msg.contains(&format!("backend-specific.{native}")), "{msg}");
 }
 
 #[skuld::test]
