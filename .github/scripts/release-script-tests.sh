@@ -12,6 +12,7 @@ verify_sigstore="${script_dir}/verify-sigstore-bundle.sh"
 assert_commit_on_main="${script_dir}/assert-commit-on-main.sh"
 assert_checksums="${script_dir}/assert-checksums.sh"
 check_crates="${script_dir}/check-crates-io-version.sh"
+create_tag="${script_dir}/create-release-tag.sh"
 failures=0
 
 # Asserts BOTH stdout and exit status. Checking stdout alone would pass a
@@ -76,7 +77,8 @@ test_binaries_root="$(mktemp -d)"
 sigstore_root="$(mktemp -d)"
 checksums_root="$(mktemp -d)"
 crates_root="$(mktemp -d)"
-trap 'rm -rf "$stub_dir" "$archive_root" "$pkg_list_root" "$asset_count_root" "$test_binaries_root" "$sigstore_root" "$checksums_root" "$crates_root"' EXIT
+tag_root="$(mktemp -d)"
+trap 'rm -rf "$stub_dir" "$archive_root" "$pkg_list_root" "$asset_count_root" "$test_binaries_root" "$sigstore_root" "$checksums_root" "$crates_root" "$tag_root"' EXIT
 
 make_git_stub() {
     local exit_code="$1" expected_ref="$2"
@@ -917,6 +919,100 @@ if bash "$assert_asset_count" >/dev/null 2>&1; then
 else
     echo "ok   - rejects being called with no arguments at all"
 fi
+
+# create-release-tag.sh ------------------------------------------------------
+#
+# `gh` is reached through GOETIA_GH rather than PATH: this script's whole job
+# is to create a ref, and a stub that lost to a real `gh` would do it for
+# real.
+
+tag_invocations="${tag_root}/gh.invocations"
+
+# make_gh_stub <exit-code> <output>
+make_gh_stub() {
+    local exit_code="$1" output="$2"
+    cat > "${stub_dir}/gh" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "${tag_invocations}"
+printf '%s\n' '${output}'
+exit ${exit_code}
+EOF
+    chmod +x "${stub_dir}/gh"
+    : > "$tag_invocations"
+}
+
+tag_sha="1234567890abcdef1234567890abcdef12345678"
+
+# run_create_tag <gh-exit> <gh-output> <tag> <sha> [repo]
+run_create_tag() {
+    local gh_exit="$1" gh_output="$2" tag="$3" sha="$4" repo="${5-bindreams/goetia}"
+    make_gh_stub "$gh_exit" "$gh_output"
+    create_tag_status=0
+    create_tag_output="$(GOETIA_GH="${stub_dir}/gh" GH_REPO="$repo" bash "$create_tag" "$tag" "$sha" 2>&1)" \
+        || create_tag_status=$?
+}
+
+run_create_tag 0 '{"ref":"refs/tags/v0.1.0"}' v0.1.0 "$tag_sha"
+if [[ "$create_tag_status" -eq 0 ]]; then
+    echo "ok   - creates the tag when the ref does not exist"
+else
+    echo "FAIL - creates the tag when the ref does not exist (status ${create_tag_status}: ${create_tag_output})"
+    failures=$((failures + 1))
+fi
+
+# The create is the compare-and-swap: it names the ref and the commit in one
+# request, so there is no window between checking and acting.
+expected_tag_invocation="api -X POST repos/bindreams/goetia/git/refs -f ref=refs/tags/v0.1.0 -f sha=${tag_sha}"
+if [[ "$(cat "$tag_invocations")" == "$expected_tag_invocation" ]]; then
+    echo "ok   - creates the ref and its commit in one request"
+else
+    echo "FAIL - creates the ref and its commit in one request (invoked as: $(cat "$tag_invocations"))"
+    failures=$((failures + 1))
+fi
+
+# GitHub's 422 for an existing ref. The refusal has to be unconditional: a
+# tag that appeared in the meantime points somewhere this run did not choose.
+run_create_tag 1 'HTTP 422: Reference already exists (https://api.github.com/repos/bindreams/goetia/git/refs)' \
+    v0.1.0 "$tag_sha"
+if [[ "$create_tag_status" -ne 0 && "$create_tag_output" == *"already exists"* ]]; then
+    echo "ok   - refuses when the tag already exists"
+else
+    echo "FAIL - refuses when the tag already exists (status ${create_tag_status}: ${create_tag_output})"
+    failures=$((failures + 1))
+fi
+
+run_create_tag 1 'HTTP 503: Service unavailable' v0.1.0 "$tag_sha"
+if [[ "$create_tag_status" -ne 0 && "$create_tag_output" == *"could not create"* ]]; then
+    echo "ok   - refuses when the create fails for any other reason"
+else
+    echo "FAIL - refuses when the create fails for any other reason (status ${create_tag_status}: ${create_tag_output})"
+    failures=$((failures + 1))
+fi
+
+run_create_tag 0 '{}' v0.1.0 main
+if [[ "$create_tag_status" -ne 0 && "$create_tag_output" == *"40-character"* ]]; then
+    echo "ok   - refuses a commit that is not a 40-character SHA"
+else
+    echo "FAIL - refuses a commit that is not a 40-character SHA (status ${create_tag_status}: ${create_tag_output})"
+    failures=$((failures + 1))
+fi
+
+run_create_tag 0 '{}' v0.1.0 "$tag_sha" ""
+if [[ "$create_tag_status" -ne 0 && "$create_tag_output" == *"GH_REPO"* ]]; then
+    echo "ok   - refuses when the repository is not set"
+else
+    echo "FAIL - refuses when the repository is not set (status ${create_tag_status}: ${create_tag_output})"
+    failures=$((failures + 1))
+fi
+
+if GH_REPO=bindreams/goetia bash "$create_tag" >/dev/null 2>&1; then
+    echo "FAIL - rejects being called with no arguments at all (expected rejection, got success)"
+    failures=$((failures + 1))
+else
+    echo "ok   - rejects being called with no arguments at all"
+fi
+
+rm -f "${stub_dir}/gh"
 
 # check-crates-io-version.sh -------------------------------------------------
 #

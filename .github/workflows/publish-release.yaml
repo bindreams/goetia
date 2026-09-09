@@ -249,21 +249,26 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --locked
 
-      # Un-drafting is what creates the tag; this turns a race into an
-      # explicit refusal rather than a silent mis-binding.
-      - name: Assert the tag is still absent
+      # Creating the tag here, rather than letting the publish below create
+      # it, is what removes the race: the create is atomic and refuses an
+      # existing ref, so the release can only be published onto a tag this
+      # run put at this commit.
+      - name: Create the release tag
         env:
           TAG: ${{ steps.version.outputs.tag }}
+          SHA: ${{ steps.release.outputs.sha }}
         shell: bash
-        run: .github/scripts/assert-tag-absent.sh "$TAG"
+        run: .github/scripts/create-release-tag.sh "$TAG" "$SHA"
 
       # If this step fails after crates.io publish succeeded above, nothing
-      # is lost: re-dispatch this workflow with the same version. The crate
-      # is on crates.io, the GitHub release is still a draft — the two are
-      # simply not yet in sync. On the re-run, the crates.io check above
-      # returns 200, the publish step skips, and this step onward retries.
-      # The one case that is NOT self-healing is the read-back below
-      # disagreeing.
+      # is lost: the crate is on crates.io, the GitHub release is still a
+      # draft, and the tag now exists at the right commit — the three are
+      # simply not yet in sync. Re-dispatching needs that tag deleted first,
+      # since the create above refuses to reuse it; no release is published
+      # against it, so deleting it is safe. On the re-run, the crates.io
+      # check returns 200 and proves the published crate is this commit's,
+      # the publish step skips, and this step onward retries. The one case
+      # that is NOT self-healing is the read-back below disagreeing.
       - name: Publish the GitHub release
         env:
           TAG: ${{ steps.version.outputs.tag }}
