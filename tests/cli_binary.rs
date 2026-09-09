@@ -191,6 +191,72 @@ fn warnings_are_printed_to_stderr() {
     assert!(out.contains("frpc"), "stdout:\n{out}");
 }
 
+// backend-specific overrides ==========================================================================================
+
+/// An unknown key under `backend-specific:` is a manifest error, not a
+/// silently-ignored typo — `daemon show` fails outright and names the
+/// offending key.
+#[skuld::test]
+fn an_unknown_backend_key_is_a_manifest_error() {
+    let dir = tempfile::tempdir().unwrap();
+    write_manifest(
+        dir.path(),
+        "daemons:\n  frpc:\n    command: [frpc]\n    backend-specific:\n      windwos:\n        user: svc\n",
+    );
+
+    let (code, out, err) = run_cli(&["daemon", "show", "-f", "goetia.yaml"], dir.path());
+
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.contains("windwos"), "stderr should name the unknown key: {err}");
+}
+
+/// The same shape as `warnings_are_printed_to_stderr`, with an unrelated
+/// backend override present: a `backend-specific:` block that touches a
+/// field the sub-second-restart-delay advisory does not read must not
+/// duplicate that warning across the all-backends sweep (see
+/// `spec::resolve`'s step 4) — stderr still carries exactly one
+/// `warning:` line.
+#[skuld::test]
+fn warnings_still_fire_once_with_backend_overrides_present() {
+    let dir = tempfile::tempdir().unwrap();
+    write_manifest(
+        dir.path(),
+        "daemons:\n  frpc:\n    command: [frpc]\n    restart-delay: 500ms\n    backend-specific:\n      systemd:\n        \
+         cwd: /var/lib/frpc\n",
+    );
+
+    let (code, out, err) = run_cli(&["daemon", "show", "-f", "goetia.yaml"], dir.path());
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let warning_lines = err.lines().filter(|line| line.contains("warning:")).count();
+    assert_eq!(warning_lines, 1, "stderr:\n{err}");
+    assert!(err.contains("restart-delay"), "stderr:\n{err}");
+    assert!(out.contains("frpc"), "stdout:\n{out}");
+}
+
+/// The `.env` gate (Task 5, step 2) end to end: a `${VAR}` written only
+/// inside `backend-specific.<native>` still resolves from a `.env` beside
+/// the manifest. Before the fix, `spec::resolve`'s `.env` gate was computed
+/// from the wrong spec and this exited `1` with "no value for" even though
+/// the file defining the variable sat in the very directory `-f` named.
+#[skuld::test]
+fn a_variable_used_only_in_the_native_override_resolves_through_the_cli() {
+    let dir = tempfile::tempdir().unwrap();
+    let native = goetia::spec::Backend::native().expect("native() is Some on every CI platform");
+    write_manifest(
+        dir.path(),
+        &format!(
+            "daemons:\n  frpc:\n    command: [frpc]\n    backend-specific:\n      {native}:\n        restart: ${{R}}\n"
+        ),
+    );
+    std::fs::write(dir.path().join(".env"), "R=always\n").expect("write .env fixture");
+
+    let (code, out, err) = run_cli(&["daemon", "show", "-f", "goetia.yaml"], dir.path());
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(out.contains("restart: always"), "stdout:\n{out}");
+}
+
 // --json's clap-level carve-out =======================================================================================
 
 /// The published `--json` invariant is over *subcommands*: whenever `--json`
