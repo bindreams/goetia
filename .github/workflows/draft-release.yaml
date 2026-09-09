@@ -1,0 +1,301 @@
+name: Draft Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 0.1.0)"
+        required: true
+        type: string
+
+concurrency:
+  # Keyed on the version NORMALIZED to its `v`-prefixed form, not the raw
+  # input. `0.1.0` and `v0.1.0` are the only two spellings
+  # normalize-version.sh accepts, and both must land in one group: goetia's
+  # stage 2 publishes to crates.io, where two concurrent runs on the raw
+  # input could both see no release, both 404 on the crates.io check, and
+  # both publish. The expression language has no substring/replace
+  # function, so this normalizes upward (startsWith + format) rather than
+  # stripping a prefix. The authoritative normalization stays in
+  # normalize-version.sh; this is only a bucketing key.
+  group: draft-release-${{ startsWith(inputs.version, 'v') && inputs.version || format('v{0}', inputs.version) }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate version
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # `write`, not `read`: GitHub returns draft releases only to callers
+      # with push access, so a read-scoped token reports every existing
+      # draft as absent, and the existence check below would pass while a
+      # draft already sits there.
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Full history: the ancestry check below needs origin/main.
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        # `cargo metadata` below works on today's hosted image by
+        # accident; nothing here is entitled to whatever toolchain the
+        # image happens to ship.
+
+      - name: Normalize and validate version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(.github/scripts/normalize-version.sh "$INPUT_VERSION")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Verify manifest version matches
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest="$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[0].version')"
+          if [ "$manifest" != "$VERSION" ]; then
+            echo "::error::Cargo.toml declares $manifest but this dispatch asked for $VERSION"
+            exit 1
+          fi
+
+      - name: Fail if the release already exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+
+          # `gh release view` exits non-zero for a missing release AND for
+          # every transient failure. Discarding the reason would make an
+          # outage or a rate limit read as "no such release" — and since
+          # GitHub does not enforce tag_name uniqueness across drafts, the
+          # run would then create a SECOND draft for the same tag rather
+          # than being rejected.
+          set +e
+          output="$(gh release view "$tag" --json tagName 2>&1)"
+          status=$?
+          set -e
+
+          if [ "$status" -eq 0 ]; then
+            echo "::error::Release $tag already exists (draft or published). Delete it or pick a new version."
+            exit 1
+          fi
+          if ! grep -qi 'release not found' <<<"$output"; then
+            echo "::error::Cannot confirm whether $tag exists: $output"
+            exit 1
+          fi
+          echo "no existing release $tag"
+
+      # A tag with no release attached is the dangerous case:
+      # `gh release create --target` is silently ignored when the tag
+      # exists, binding the release to the old tag's commit, and
+      # `gh release delete` leaves tags behind.
+      - name: Fail if the tag already exists
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: .github/scripts/assert-tag-absent.sh "v${VERSION}"
+
+      # workflow_dispatch accepts a `ref`, so without this a draft can be
+      # pinned to unmerged code while every later check still passes.
+      - name: Verify the release commit is on main
+        env:
+          SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin main
+
+          set +e
+          git merge-base --is-ancestor "$SHA" origin/main
+          status=$?
+          set -e
+
+          case "$status" in
+            0) echo "$SHA is an ancestor of origin/main" ;;
+            1)
+              echo "::error::$SHA is not an ancestor of origin/main. Release only from merged commits."
+              exit 1
+              ;;
+            *)
+              echo "::error::git merge-base failed (exit $status); cannot confirm $SHA is on main"
+              exit 1
+              ;;
+          esac
+
+      # The ancestry check above is not sufficient on its own: it is
+      # satisfied by dispatching from any branch or tag whose head is
+      # already merged (a stale release branch, a maintenance tag,
+      # anything). The OIDC certificate minted in Task 5 carries
+      # `github.ref` verbatim, while other tasks in this plan publish
+      # `refs/heads/main` to `ctl` as a version-independent constant — a
+      # dispatch from any other merged ref would produce a release no
+      # consumer can verify.
+      - name: Refuse dispatches that are not from main
+        env:
+          REF: ${{ github.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::Releases must be dispatched from refs/heads/main, got $REF"
+            exit 1
+          fi
+
+  ci:
+    name: CI
+    needs: validate
+    # Main's last green run does not imply THIS commit is green, and
+    # goetia's CI is the only thing running its elevation-gated tests
+    # across the three host OSes.
+    uses: ./.github/workflows/ci.yaml
+    permissions:
+      contents: read
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: [validate, ci]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      # Five platforms; seeing all failures in one run beats rediscovering
+      # them one dispatch at a time. Nothing is published from a partial
+      # matrix, so there is no hazard in letting the others finish.
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install musl-tools
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Statically link musl's libc: the two musl targets otherwise
+          # dynamically link a musl libc that is not guaranteed present on
+          # the consumer's machine.
+          if [[ "$TARGET" == *musl* ]]; then
+            export RUSTFLAGS="-Ctarget-feature=+crt-static -Clink-self-contained=yes"
+          fi
+          cargo build --release --locked --target "$TARGET"
+
+      - name: Stage and archive (Unix)
+        if: runner.os != 'Windows'
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="goetia-${TARGET}"
+          mkdir -p "$dir"
+          # target/<target>/release/, never target/release/ — the latter
+          # holds the same host binaries on every native row and would
+          # silently produce five archives of one host's binaries.
+          cp "target/${TARGET}/release/goetia" "target/${TARGET}/release/goetia-shim" "$dir/"
+          cp README.md LICENSE.md "$dir/"
+          tar -cJf "${dir}.tar.xz" "$dir/"
+
+      - name: Stage and archive (Windows)
+        if: runner.os == 'Windows'
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dir = "goetia-$env:TARGET"
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          Copy-Item "target/$env:TARGET/release/goetia.exe" "$dir/"
+          Copy-Item "target/$env:TARGET/release/goetia-shim.exe" "$dir/"
+          Copy-Item README.md, LICENSE.md "$dir/"
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+
+      # Compress-Archive is reported to write `dir\file` entry names on
+      # some hosts, which would leave Python's zipfile extracting a file
+      # literally called `goetia-...\goetia.exe` on the consumer's
+      # machine. Task 1's fixture covers the same ground offline; this
+      # covers the runner actually in use. If this ever fails for real,
+      # switch this row to `tar -a -cf` or `7z`, both present on the
+      # runner.
+      - name: Assert zip entry separators (Windows)
+        if: runner.os == 'Windows'
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead("goetia-$env:TARGET.zip")
+          try {
+            $bad = $zip.Entries | Where-Object { $_.FullName -match '\\' }
+          } finally {
+            $zip.Dispose()
+          }
+          if ($bad) {
+            Write-Error "zip entries use backslash separators: $($bad.FullName -join ', ')"
+            exit 1
+          }
+
+      - name: Upload archive (Unix)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: goetia-${{ matrix.target }}
+          path: goetia-${{ matrix.target }}.tar.xz
+          if-no-files-found: error
+
+      - name: Upload archive (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: goetia-${{ matrix.target }}
+          path: goetia-${{ matrix.target }}.zip
+          if-no-files-found: error
