@@ -181,9 +181,9 @@ dependencies = [
 
 [[package]]
 name = "cosca"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4282a5bdea4d4046610229d6f904151de204b6f901af907ed44e588854b7abb1"
+checksum = "437af5a5e9e0cf2ad0919adfcc8d316cde02e9f83e493b21222e1c1a80359986"
 dependencies = [
  "command-fds",
  "getrandom",
