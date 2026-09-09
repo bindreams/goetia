@@ -5,7 +5,9 @@
 use std::io::Write;
 
 use super::report;
-use super::support::{InstalledIndex, partition_installed, print_unreadable_warnings, state_str};
+use super::support::{
+    InstalledIndex, partition_installed, print_undetermined_warnings, print_unreadable_warnings, state_str,
+};
 use crate::error::Result;
 use crate::manager::ServiceManager;
 
@@ -42,6 +44,7 @@ pub fn run(
 /// and this is the column that carries it.
 fn print_text(index: &InstalledIndex, out: &mut dyn Write, err: &mut dyn Write) {
     print_unreadable_warnings(&index.unreadable, err);
+    print_undetermined_warnings(&index.undetermined, err);
     for (id, entry) in &index.ours {
         let _ = writeln!(
             out,

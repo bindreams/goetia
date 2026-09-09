@@ -77,13 +77,31 @@ pub trait ServiceManager {
     /// will not decode — this must not fabricate a plausible-looking
     /// `Status` for state it cannot actually determine (see the crate-level
     /// design notes on `Installed::OursUnreadable`, which exists for the
-    /// same reason on the `list` side).
+    /// same reason on the `list` side) — and [`Error::Undetermined`] for an
+    /// id whose artifact could not be read at all, where not even ownership
+    /// was established.
+    ///
+    /// [`Error::Undetermined`]: crate::Error::Undetermined
     fn status(&self, id: &Id) -> Result<Status>;
 
-    /// Every Goetia-managed service currently installed. A foreign
-    /// (unmarked) service at some id is never included; see [`Installed`]
-    /// for what happens when a marked one exists but its blob will not
-    /// decode.
+    /// Every id this backend could account for. A foreign (unmarked)
+    /// service at some id is never included; see [`Installed`] for what
+    /// happens when a marked one exists but its blob will not decode, and
+    /// for the entry an id goetia could not read at all produces. Skipping
+    /// such an id is not an implementation's choice to make: an unread id
+    /// must appear as [`Installed::Undetermined`], because an enumeration
+    /// that silently drops it is indistinguishable from one where it does
+    /// not exist.
+    ///
+    /// **An absent container — no unit directory, no `Services` key — is
+    /// `Ok(vec![])`, never `Err`.** Absence is established there: nothing is
+    /// installed, which is a determinate answer and is reported as one. An
+    /// `Err` reaches the CLI as `Kind::Unavailable`, exit `1` over an empty
+    /// document — the rendering that says goetia could not answer — and
+    /// putting a settled answer behind it is the same conflation
+    /// [`Installed::Undetermined`] exists to end, arrived at from the other
+    /// side. A scan that *started* and did not finish is the opposite case
+    /// and does report (see `Installed::scan_incomplete`).
     fn list(&self) -> Result<Vec<Installed>>;
 }
 
@@ -108,6 +126,60 @@ pub enum Installed {
     /// every other daemon, which is exactly what dropping this entry
     /// silently would do.
     OursUnreadable { name: String, reason: String },
+    /// Neither proof: the read that would have classified this id did not
+    /// complete, so goetia established neither its absence nor its
+    /// presence. The `list`-side counterpart of [`Error::Undetermined`],
+    /// and separated from the two variants above by the same rule — what
+    /// goetia *established*, never what went wrong. Reporting
+    /// `OursUnreadable` for a unit file an unelevated caller merely could
+    /// not open claims ownership of what may be a stranger's service;
+    /// omitting it claims it does not exist.
+    ///
+    /// `name` is `None` only for an entry standing for more than one id.
+    /// That happens for either of two reasons, and a caller must not assume
+    /// the first: an enumeration that did not finish knows neither the names
+    /// it never reached nor how many there were (see `Installed::scan_incomplete`),
+    /// *or* one that enumerated fine drops the names because
+    /// one entry cannot usefully carry hundreds — which is what Windows SCM
+    /// does on an unelevated `list`, where most services deny a `Parameters`
+    /// read at once. An entry for exactly one known id always names it.
+    ///
+    /// What a `None` obliges of every caller: **while such an entry is
+    /// present, no negative conclusion about any id is sound.** It may
+    /// stand for the very id being asked about, so "`x` is absent" does not
+    /// follow from `x` going unnamed in the list — not for rendering, not
+    /// for an exit code, and not for a test assertion, which must fail
+    /// rather than certify what the list cannot establish.
+    ///
+    /// Carries no `recovery`: that text belongs to [`Error::Undetermined`],
+    /// which each backend builds through its own constructor, and a second
+    /// independently worded remedy per `list` entry would put two answers
+    /// on one condition.
+    ///
+    /// [`Error::Undetermined`]: crate::Error::Undetermined
+    Undetermined { name: Option<String>, reason: String },
+}
+
+impl Installed {
+    /// The aggregate entry an enumeration that stopped early leaves behind: `location` is what
+    /// was being scanned, `detail` what did not complete there. Every backend builds it here, so
+    /// a scan cut short in a unit directory, a `LaunchDaemons` directory or the SCM registry key
+    /// says one thing rather than three.
+    ///
+    /// Two rules it exists to keep. Whatever the scan *did* classify stays in the listing —
+    /// dropping it, which is what returning `Err` from `list` amounts to, reports every one of
+    /// those ids as absent. And the wording names no cause: a scan stops on a denial, a corrupt
+    /// directory or an I/O fault alike, and only the `detail` handed in was established.
+    pub(crate) fn scan_incomplete(location: &str, detail: &str) -> Self {
+        Installed::Undetermined {
+            name: None,
+            reason: format!(
+                "{location} could not be enumerated to the end ({detail}). Ownership is unknown \
+                 for whatever the scan did not reach, so a Goetia daemon may be missing from this \
+                 list."
+            ),
+        }
+    }
 }
 
 /// The live state of one installed service, as [`ServiceManager::status`]

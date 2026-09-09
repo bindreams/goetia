@@ -120,7 +120,9 @@ pub enum DaemonCommand {
 ///   as success — `Error::NotInstalled` says nothing about the *process*,
 ///   only the artifact, which is why every other id-verb keeps that same
 ///   error at `1` instead; see `IdVerbCall::absent_is_success`'s doc
-///   comment for the full six-row table.
+///   comment for the full six-row table. That table is about an absent
+///   artifact, so it never reaches an id whose absence was not established:
+///   that is `4` for all six verbs, `uninstall` included.
 /// - `1` error: an operation was attempted and failed, or was refused
 ///   outright.
 /// - `2` usage: clap rejected the command line before `dispatch` ever ran,
@@ -144,20 +146,26 @@ pub enum DaemonCommand {
 ///   id where the read that would have said whether anything is installed
 ///   at all failed, leaving even ownership unestablished.
 ///   `list`/`status` compute theirs via [`report::exit_code`]
-///   (see the design spec's §4), in *both* output modes, the second
-///   producer reaching them as `report::Kind::Undetermined`; `diff` returns
-///   it for `Outcome::RefuseUnreadable` and for `Error::Undetermined`
-///   (`cli::diff::run`) — the one row
-///   where `diff` deliberately disagrees with `install`, which exits `1`
-///   for both because it genuinely failed to install. `show` returns
-///   it too (`cli::show::run`), for the same "installed but unreadable"
-///   case, in both its per-id and no-ids forms — but only when it can see
-///   the id is installed at all: `show` without `-f` reads `list()`, which
-///   silently skips a unit this privilege level cannot enumerate, so that
-///   case still reports `1` instead (`show.rs`'s module doc comment has
-///   the caveat). Anchored to the LSB init-script convention's "service
-///   status unknown", the one other exit-code vocabulary this one
-///   deliberately agrees with.
+///   (see the design spec's §4), in *both* output modes: out of
+///   `status(&id)` the second producer reaches them as
+///   `report::Kind::Undetermined`, and out of `list()` through the
+///   document's third key, `undetermined`, rather than as an
+///   `errors[].kind` — both codes come from `report::Kind::code`, the one
+///   kind-to-code map. `diff` returns it for `Outcome::RefuseUnreadable`
+///   and for `Error::Undetermined` (`cli::diff::run`); `install` returns it
+///   for `Error::Undetermined` from `mgr.install`/`enable`/`start`, so the
+///   two verbs agree about that error and disagree only about
+///   `Outcome::RefuseUnreadable`, which `install` reports as `1` because it
+///   genuinely failed to install. All six id verbs return it through
+///   `support::run_id_verb`: "could not determine the state and therefore
+///   did nothing" is one condition with one remedy for every one of them.
+///   `show` returns it too (`cli::show::run`), in both its per-id and
+///   no-ids forms — for an "installed but unreadable" id, for an id
+///   `list()` reported as undetermined, and for *any* id it cannot find
+///   while an aggregate undetermined entry is present, since a null-named
+///   entry makes "not installed" unsound for every id at once. Anchored to
+///   the LSB init-script convention's "service status unknown", the one
+///   other exit-code vocabulary this one deliberately agrees with.
 /// - `5` conflict: an installed artifact was modified outside Goetia and
 ///   `--force` was not given. Returned by `cli::install::run` and by
 ///   `cli::diff::run` for the identical `Outcome::Conflict` — the two places
@@ -169,11 +177,12 @@ pub enum DaemonCommand {
 ///   outside Goetia agrees on.
 ///
 /// `list` and `status` compute their code as the precedence-max over every
-/// error kind their `Report` collected: `1 > 4 > 5 > 3 > 0`. `diff`,
-/// `show` and `install` apply the same rule over the classes each selected
-/// daemon contributes, through the same [`report::precedence`] function — no
-/// verb re-derives the ordering, not even for the two codes `show` can
-/// produce.
+/// error kind their `Report` collected, and over its `undetermined`
+/// entries: `1 > 4 > 5 > 3 > 0`. `diff`, `show`, `install` and every id verb
+/// (`support::run_id_verb`) apply the same rule over the classes each
+/// selected daemon contributes, through the same [`report::precedence`]
+/// function — no verb re-derives the ordering, not even for the two codes
+/// `show` can produce.
 /// That is a rule about which outcome wins when more than one applies at
 /// once, not an ordering of the integers — `5` outranks `3` despite being
 /// the larger number. `2` never enters that ladder: the one thing that produces it

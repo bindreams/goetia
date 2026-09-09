@@ -194,3 +194,371 @@ fn locate_reports_absent_for_an_unknown_id() {
     let location = locate(&id).expect("locate should not error for an absent id");
     assert!(location.is_none());
 }
+
+// occupied ============================================================================================================
+
+/// A path whose parent component is a regular file: `ENOTDIR`. Not `NotFound`, not
+/// `PermissionDenied`, and — the reason it is the probe used here rather than a mode-`000`
+/// directory — identical for root and everyone else. CI runs every test binary under `sudo`
+/// (`.github/workflows/ci.yaml`), which traverses a mode-`000` directory to a plain `NotFound`, so a
+/// permission fixture in this binary would report absence and fail there for a reason that is about
+/// the runner's uid rather than about the code. The permission shape this whole class exists for
+/// needs a second uid and is exercised end to end by
+/// `tests/launchd_integration/launchd.rs::unelevated_list_reports_a_root_only_plist_as_undetermined`.
+/// `src/backend/systemd/manager/discover_tests.rs` splits its own coverage on the same line.
+fn unreachable_path(tmp: &Path) -> PathBuf {
+    let file = tmp.join("not-a-directory");
+    fs::write(&file, "").expect("write the blocking file");
+    file.join("x.plist")
+}
+
+/// The defect this type exists to remove: `symlink_metadata(path).is_ok()` answered "I could not
+/// look" as "nothing is there", so `locate` returned `Ok(None)` and every verb reported
+/// `NotInstalled` for a daemon that is right there.
+#[skuld::test]
+fn occupied_distinguishes_a_denied_stat_from_absence() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    match occupied(&unreachable_path(tmp.path())) {
+        Presence::Undetermined { source } => assert_ne!(
+            source.kind(),
+            io::ErrorKind::NotFound,
+            "a `NotFound` belongs in `Absent`, not here: {source}"
+        ),
+        other => panic!("a stat that never completed established no absence: {other:?}"),
+    }
+}
+
+#[skuld::test]
+fn occupied_reports_absence_and_presence_when_the_stat_completes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("x.plist");
+
+    assert!(matches!(occupied(&path), Presence::Absent));
+
+    fs::write(&path, "anything at all").expect("write the plist");
+    assert!(matches!(occupied(&path), Presence::Present));
+}
+
+// obtain ==============================================================================================================
+
+fn mkfifo(path: &Path) {
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("a temp path with no NUL");
+    // SAFETY: `c_path` is a NUL-terminated pointer valid for the call.
+    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+    assert_eq!(rc, 0, "mkfifo {}: {}", path.display(), io::Error::last_os_error());
+}
+
+/// Run `f` on its own thread and report — rather than hang — if it never returns.
+///
+/// The bound is a failure bound on a kernel wait that may genuinely never end: `open(2)` on a FIFO
+/// with `O_RDONLY` blocks until a writer arrives, and these tests never create one. It synchronizes
+/// nothing. A correct classification is one `stat` and a send, so no passing run's outcome depends
+/// on the bound's value — only how long a regression takes to be *reported* instead of wedging the
+/// whole suite, which is what an unguarded call would do.
+fn without_blocking<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || drop(tx.send(f())));
+    rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap_or_else(|_| {
+        panic!("{what} never returned: it opened the FIFO for reading, which blocks until a writer arrives")
+    })
+}
+
+/// The case that makes classifying before opening mandatory rather than tidy. `list` reads every
+/// `*.plist` name in `/Library/LaunchDaemons`, so one `mkfifo` there would otherwise wedge the
+/// listing for the whole host — and `install`/`status` for that id forever.
+#[skuld::test]
+fn a_fifo_is_non_regular_without_blocking() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fifo = tmp.path().join("x.plist");
+    mkfifo(&fifo);
+
+    let obtained = without_blocking("obtain", move || obtain(&fifo));
+
+    assert!(
+        matches!(obtained, Obtained::NonRegular),
+        "a FIFO is classified, never opened for reading"
+    );
+}
+
+/// The same path through the reader every verb but `list` goes down. A FIFO is not a plist goetia
+/// failed to read — it is positively not a plist — so the answer is foreign, which is what empty
+/// text means here, and never [`Error::Undetermined`].
+#[skuld::test]
+fn read_artifact_treats_a_fifo_as_foreign_without_blocking() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fifo = tmp.path().join("x.plist");
+    mkfifo(&fifo);
+
+    let text = without_blocking("read_artifact", move || {
+        read_artifact(&fifo, "x").map_err(|e| e.to_string())
+    })
+    .expect("a FIFO is identified, not a read that did not complete");
+
+    assert!(
+        generate::extract(&text).expect("empty text decodes cleanly").is_none(),
+        "nothing goetia wrote is at this path, so every caller must refuse it as foreign"
+    );
+}
+
+#[skuld::test]
+fn a_directory_where_a_plist_should_be_is_non_regular() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().join("x.plist");
+    fs::create_dir(&dir).expect("seed a directory where a plist should be");
+
+    assert!(matches!(obtain(&dir), Obtained::NonRegular));
+}
+
+#[skuld::test]
+fn obtain_reads_a_regular_file_and_reports_a_missing_one_absent() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("x.plist");
+
+    assert!(matches!(obtain(&path), Obtained::Absent));
+
+    fs::write(&path, b"<plist/>\n").expect("write the plist");
+    match obtain(&path) {
+        Obtained::Bytes(bytes) => assert_eq!(bytes, b"<plist/>\n".to_vec()),
+        _ => panic!("a regular file is read, not classified away"),
+    }
+}
+
+/// A symlink to a regular plist still resolves and is still read — deliberately unlike the systemd
+/// backend, where `systemctl mask` makes the symlink itself the meaningful artifact. See
+/// [`obtain`]'s doc comment.
+#[skuld::test]
+fn a_symlink_to_a_plist_is_still_followed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = tmp.path().join("real.plist");
+    let link = tmp.path().join("x.plist");
+    fs::write(&target, b"<plist/>\n").expect("write the plist");
+    std::os::unix::fs::symlink(&target, &link).expect("plant the symlink");
+
+    match obtain(&link) {
+        Obtained::Bytes(bytes) => assert_eq!(bytes, b"<plist/>\n".to_vec()),
+        _ => panic!("launchd has no masking, so a symlinked plist is just an indirection to a plist"),
+    }
+}
+
+/// A dangling symlink is the one path where `metadata` (follows) and
+/// `locate`'s `symlink_metadata` (does not) disagree. Left as `Absent`, the
+/// two classifiers never reconcile: every verb answers "not installed" while
+/// `link`(2) refuses to create over the link with `EEXIST`, so the id becomes
+/// an unclearable dead end whose only message says nothing is there.
+/// `NonRegular` is the honest answer — the link is positively not a plist,
+/// the same presence fact a FIFO is.
+#[skuld::test]
+fn a_dangling_symlink_is_not_absence() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let link = tmp.path().join("x.plist");
+    std::os::unix::fs::symlink(tmp.path().join("nothing-here.plist"), &link).expect("plant the symlink");
+
+    assert!(
+        fs::metadata(&link).is_err(),
+        "the fixture must actually dangle, or this pins nothing"
+    );
+    assert!(matches!(obtain(&link), Obtained::NonRegular));
+}
+
+// read_artifact =======================================================================================================
+
+#[skuld::test]
+fn read_artifact_maps_a_vanished_plist_to_not_installed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("gone.plist");
+
+    // `locate` stat'd it and the read no longer finds it: an uninstall that completed between the
+    // two syscalls. Absence is the truth about the id, so this is not a failure to determine.
+    let err = read_artifact(&path, "gone").expect_err("a missing artifact is not readable");
+    assert!(matches!(err, Error::NotInstalled { .. }), "{err}");
+}
+
+#[skuld::test]
+fn read_artifact_maps_an_unreadable_plist_to_undetermined() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = unreachable_path(tmp.path());
+
+    let err = read_artifact(&path, "opaque").expect_err("`ENOTDIR` is not a readable artifact");
+
+    let Error::Undetermined { id, reason, .. } = &err else {
+        panic!("`Error::Io` reaches `status` as `unreadable`, which claims goetia owns the id: {err:?}");
+    };
+    assert_eq!(id, "opaque");
+    assert!(
+        reason.contains(&path.display().to_string()),
+        "the reason must name the path that could not be read: {reason}"
+    );
+}
+
+/// `ENABLED_DIR` is `/Library/LaunchDaemons` — every vendor's daemons, not goetia's — and every
+/// encoding below is one a vendor legitimately ships there: `plutil -convert binary1` and `defaults
+/// write` produce a binary plist by default, UTF-16 is a legal property-list encoding whose `FF FE`
+/// BOM is not UTF-8, and a Latin-1 byte in a description is an ordinary accident. None of them is
+/// UTF-8 XML, which is the only thing `generate::plist` writes, so each is a positive
+/// identification of a file goetia did not write — foreign, exactly like an unmarked XML plist.
+///
+/// Answering any of them `undetermined` would give a macOS host a permanent, unclearable
+/// `undetermined` entry and a permanent exit `4` for a service goetia has no business reporting on
+/// at all. Pinned as one table because the whole defect was these three getting two different
+/// answers.
+///
+/// `list` reaches the same verdict through the same [`classify`], which is what keeps the two from
+/// describing one file differently; its own end is
+/// `tests/launchd_integration/launchd.rs::list_stays_clean_on_a_host_carrying_binary_plists`.
+#[skuld::test]
+fn bytes_that_are_not_utf8_xml_are_foreign_not_undetermined() {
+    let mut binary = b"bplist00".to_vec();
+    binary.extend_from_slice(&[0xd1, 0x01, 0x02, 0x5f, 0x10, 0x00, 0xff]);
+    let utf16 = b"\xff\xfe<\x00?\x00x\x00m\x00l\x00".to_vec();
+    let latin1 = b"<!-- Caf\xe9 -->".to_vec();
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for (label, bytes) in [
+        ("a binary plist", binary),
+        ("a UTF-16 XML plist", utf16),
+        ("one Latin-1 byte", latin1),
+    ] {
+        let path = tmp.path().join(format!("{label}.plist"));
+        fs::write(&path, &bytes).expect("write the vendor plist");
+
+        assert!(
+            matches!(classify(bytes), Classified::NotOurs),
+            "{label}: not the UTF-8 XML goetia writes, so not goetia's"
+        );
+
+        let text = read_artifact(&path, "vendor")
+            .unwrap_or_else(|e| panic!("{label}: the bytes were obtained, so nothing here is undetermined: {e:?}"));
+        assert!(
+            generate::extract(&text).expect("empty text decodes cleanly").is_none(),
+            "{label}: a format goetia never emits carries no goetia marker, so every caller must \
+             refuse it as foreign"
+        );
+    }
+}
+
+// undetermined ========================================================================================================
+
+/// The substance `manager::fake`'s own `Error::Undetermined` carries, asserted of this backend's
+/// constructor: the two describe one condition and must agree about it without sharing a function.
+/// Split across the errno rather than crammed into a single sentence — elevation is advice only a
+/// permission boundary earns, and offering it for a failing disk sends the reader somewhere useless
+/// — so "both causes" means the pair covers both, one each. Never `uninstall`, in either: that is
+/// `Outcome::RefuseUnreadable`'s remedy and it certifies the ownership this read never established.
+#[skuld::test]
+fn the_launchd_undetermined_recovery_names_both_causes_and_not_uninstall() {
+    let path = Path::new(ENABLED_DIR).join("x.plist");
+
+    for (source, wants_elevation) in [
+        (io::Error::from(io::ErrorKind::PermissionDenied), true),
+        (io::Error::from(io::ErrorKind::Other), false),
+    ] {
+        let rendered = format!("{source:?}");
+        let Error::Undetermined { id, reason, recovery } = undetermined("x", "read", &path, &source) else {
+            panic!("{rendered}: every non-`NotFound` failure is undetermined, not just a permission denial");
+        };
+
+        assert_eq!(id, "x");
+        assert!(reason.contains(&path.display().to_string()), "{rendered}: {reason}");
+        assert!(recovery.contains("re-run"), "{rendered}: {recovery}");
+        assert_eq!(
+            recovery.contains("re-run as root"),
+            wants_elevation,
+            "{rendered}: {recovery}"
+        );
+        assert!(
+            !recovery.contains("uninstall"),
+            "{rendered}: uninstall certifies ownership this read never established: {recovery}"
+        );
+    }
+}
+
+// Enumeration: a scan that did not finish =============================================================================
+
+/// The mid-pass fault, and the reason `list` no longer propagates one: a dirent that could not be
+/// read must not take down the ids the very same pass already named — nor, since the two
+/// directories are scanned in one call, a directory that was read to the end before it. Injected
+/// through `collect_plists`' iterator because no real `readdir` fails on request.
+#[skuld::test]
+fn a_dirent_that_cannot_be_read_keeps_what_the_scan_already_named() {
+    let dir = Path::new(ENABLED_DIR);
+    let entries = vec![
+        Ok(dir.join("named-before-the-fault.plist")),
+        Err(io::Error::other("injected mid-scan failure")),
+        Ok(dir.join("never-reached.plist")),
+    ];
+
+    let scan = collect_plists(ENABLED_DIR, entries.into_iter());
+
+    assert_eq!(
+        scan.plists.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        ["named-before-the-fault"],
+        "what the pass named before the fault survives it, and the pass stops there: {scan:?}"
+    );
+    match &scan.incomplete {
+        Some(Installed::Undetermined { name, reason }) => {
+            assert_eq!(*name, None, "the pass cannot name what it never reached");
+            assert!(reason.contains("injected mid-scan failure"), "{reason}");
+            assert!(
+                reason.contains(ENABLED_DIR),
+                "the reason must name what was being scanned: {reason}"
+            );
+        }
+        other => panic!("a pass that stopped early must say so: {other:?}"),
+    }
+}
+
+/// The same fault one syscall earlier. An `Err` here reaches the CLI as `Kind::Unavailable` — exit
+/// `1` over an empty document, which is `list` reporting a populated host as having nothing on it.
+#[skuld::test]
+fn a_plist_directory_that_cannot_be_opened_is_reported_not_propagated() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let blocking_file = tmp.path().join("not-a-directory");
+    fs::write(&blocking_file, "").expect("write the blocking file");
+    // `ENOTDIR`: not `NotFound`, and identical for root and everyone else — which is what makes it
+    // the right probe in a binary CI runs elevated.
+    let dir = blocking_file.join("LaunchDaemons");
+
+    let scan = scan_plists(&dir.to_string_lossy());
+
+    assert!(scan.plists.is_empty(), "nothing was enumerated: {scan:?}");
+    assert!(
+        matches!(&scan.incomplete, Some(Installed::Undetermined { name: None, .. })),
+        "{scan:?}"
+    );
+}
+
+/// The case that is deliberately *not* this one: an absent directory — the staging one does not
+/// exist until the first `install` ever creates it — establishes that nothing is there. A
+/// determinate answer is reported as one, on every backend; see [`crate::manager::ServiceManager::list`].
+#[skuld::test]
+fn an_absent_directory_is_an_empty_scan_not_a_failure() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let scan = scan_plists(&tmp.path().join("nowhere").to_string_lossy());
+
+    assert!(scan.plists.is_empty(), "{scan:?}");
+    assert!(
+        scan.incomplete.is_none(),
+        "an absent directory answers the question rather than leaving it open: {scan:?}"
+    );
+}
+
+#[skuld::test]
+fn a_pass_that_finishes_names_every_plist_and_nothing_else() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::write(tmp.path().join("kept.plist"), "").expect("write the plist");
+    fs::write(tmp.path().join("ignored.txt"), "").expect("write the non-plist");
+
+    let scan = scan_plists(&tmp.path().to_string_lossy());
+
+    assert_eq!(
+        scan.plists.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        ["kept"],
+        "{scan:?}"
+    );
+    assert!(
+        scan.incomplete.is_none(),
+        "a pass that finished has nothing to report: {scan:?}"
+    );
+}

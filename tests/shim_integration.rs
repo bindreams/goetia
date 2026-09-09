@@ -19,6 +19,12 @@ mod support;
 #[cfg(windows)]
 #[path = "shim_integration/common.rs"]
 mod common;
+// Shared with `tests/scm_integration.rs` by path, the same way both binaries
+// share `support/mod.rs`: denying a read is one mechanism, and a second copy
+// of it here would desync on a one-sided edit.
+#[cfg(windows)]
+#[path = "scm_integration/deny.rs"]
+mod deny;
 #[cfg(windows)]
 #[path = "shim_integration/fixture.rs"]
 mod fixture;

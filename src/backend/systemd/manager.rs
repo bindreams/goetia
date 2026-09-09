@@ -1,7 +1,7 @@
 //! The effectful half of the systemd backend: writes `/etc/systemd/system/<id>.service` and talks
 //! to `systemctl`.
 //!
-//! Six correctness obligations a systemd unit-file backend must uphold, each with its own test (see
+//! Seven correctness obligations a systemd unit-file backend must uphold, each with its own test (see
 //! `tests/systemd_integration/linux.rs` and this module's own `manager_tests.rs`):
 //!
 //! 1. **A write must not clobber something it did not classify.** `rename(2)` unconditionally
@@ -15,10 +15,13 @@
 //! 2. **A masked unit is not absent.** `systemctl mask` replaces the fragment with a symlink to
 //!    `/dev/null`; reading it yields empty text, and a naive read-then-extract would see `Ok(None)`
 //!    and let `install` write over it, silently unmasking a deliberately-masked service.
-//!    [`discover::raw_state`] opens the path `O_NOFOLLOW` and confirms any non-regular file by
-//!    `lstat` as [`discover::RawState::NonRegular`] — always `Ownership::Foreign` — without ever
-//!    reading its contents. A *regular* file the open could not read is neither: it is
-//!    [`Error::Undetermined`], since nothing about its content was established.
+//!    [`discover::classify_and_read`] opens the path `O_PATH | O_NOFOLLOW` and classifies the
+//!    descriptor by `fstat`, reporting any non-regular file as [`discover::RawState::NotOurs`] —
+//!    always `Ownership::Foreign` — without ever opening it for reading. It answers the same for a
+//!    regular file whose bytes turn out not to be UTF-8, which is the same claim by a different
+//!    proof: goetia writes UTF-8 ini and nothing else. Only a read that *did not complete* is
+//!    neither, and that is [`Error::Undetermined`] for `status` and [`Installed::Undetermined`] for
+//!    `list`, since nothing at all about the artifact was established.
 //! 3. **Drop-ins are drift.** `systemctl edit` — the officially recommended way to add exactly the
 //!    `MemoryMax=`/`After=` the design cites — writes `<id>.service.d/override.conf` and leaves the
 //!    fragment itself byte-identical, so drift detection over the fragment alone misses it entirely.
@@ -51,18 +54,22 @@
 //!    id systemd still applies a drop-in to, or still enrolls at boot through a
 //!    `multi-user.target.wants` link. `discover::residue` is the one predicate both `install`'s
 //!    `discover` and every other verb's `require_installed`/`status` ask, so no two verbs can
-//!    describe one filesystem state differently.
+//!    describe one filesystem state differently — `list` included, which asks it (through
+//!    `discover::residue_read`) of every id it enumerates with no readable fragment. A listing that
+//!    asked less would leave out an id `status` answers `Error::Undetermined` for, and leaving an
+//!    id out is how a listing says nothing is there.
 
 mod dirs;
 mod discover;
 mod systemctl;
 mod write;
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use discover::{RawState, absent_error, discover, raw_state, require_installed};
+use discover::{DROPIN_SEARCH_DIRS, RawState, absent_error, classify_and_read, discover, raw_state, require_installed};
 use systemctl::{daemon_reload, daemon_reload_or_report, run_systemctl, start_impl, status_from_unit, stop_impl};
 use write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 
@@ -258,7 +265,7 @@ impl ServiceManager for Systemd {
         let id = id.as_str();
         match raw_state(id)? {
             RawState::Absent => Err(absent_error(id)?),
-            RawState::NonRegular => Err(Error::Foreign {
+            RawState::NotOurs => Err(Error::Foreign {
                 id: id.to_string(),
                 recovery: decide::foreign_recovery(id),
             }),
@@ -276,38 +283,35 @@ impl ServiceManager for Systemd {
     }
 
     fn list(&self) -> Result<Vec<Installed>> {
-        let dir = Path::new(UNIT_DIR);
-        let entries = fs::read_dir(dir).map_err(|e| io_err("read directory", dir, e))?;
+        let scan = scan_host();
 
         let mut out = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|e| io_err("read a directory entry in", dir, e))?;
-            let file_name = entry.file_name();
-            let name = file_name.to_string_lossy();
-            let Some(id) = name.strip_suffix(".service") else {
-                continue;
-            };
+        for (id, path) in &scan.units {
+            let id = id.as_str();
 
-            // A masked unit (symlink to /dev/null) or a `<id>.service.d` drop-in directory both fail
-            // this check — neither is a fragment `list` should read, per obligations 2 and 3.
-            let file_type = match entry.file_type() {
-                Ok(t) => t,
-                // `list` runs unelevated by design (obligation 4): a foreign unit shipped
-                // non-world-readable (units carrying `LoadCredential=` commonly are 0600) cannot
-                // carry a decodable goetia marker either way, so it is not ours to report — the same
-                // disposition as a concurrent-uninstall race.
-                Err(e) if is_benign_list_error(&e) => continue,
-                Err(e) => return Err(io_err("stat", &entry.path(), e)),
-            };
-            if !file_type.is_file() {
-                continue;
-            }
-
-            let path = entry.path();
-            let text = match fs::read_to_string(&path) {
-                Ok(t) => t,
-                Err(e) if is_benign_list_error(&e) => continue,
-                Err(e) => return Err(io_err("read", &path, e)),
+            // The same classification `status` performs, so the two cannot describe one machine
+            // differently.
+            let text = match classify_and_read(path) {
+                Ok(RawState::Regular(text)) => text,
+                // Established as nothing goetia wrote (a masked unit's symlink, a FIFO, a `.d`
+                // directory, bytes that are not UTF-8): obligations 2 and 3, and foreign entries
+                // are what `list` omits.
+                Ok(RawState::NotOurs) => continue,
+                // Gone between the scan and the open. That settles the *fragment*, not the id —
+                // obligation 7 — so it takes the same question every other fragmentless id gets.
+                Ok(RawState::Absent) => {
+                    out.extend(residue_entry(id));
+                    continue;
+                }
+                // A read that did not complete establishes nothing about the id — least of all that
+                // it is absent, which is what omitting it from the enumeration would say.
+                Err(failure) => {
+                    out.push(Installed::Undetermined {
+                        name: Some(id.to_string()),
+                        reason: failure.detail(),
+                    });
+                    continue;
+                }
             };
 
             match generate::extract(&text) {
@@ -334,12 +338,184 @@ impl ServiceManager for Systemd {
                 }),
             }
         }
+        // The ids with no fragment of their own. Obligation 7 again: what occupies an id is not the
+        // fragment file, so an id whose *drop-in* could not be read is exactly as unclassified as
+        // one whose fragment could not be — and `status` says so for both.
+        for id in &scan.dropin_only {
+            out.extend(residue_entry(id));
+        }
+        // Last, so a scan that got some way in still reports what it named before what it could
+        // not — the order `cli::support::partition_installed` imposes on the rendered output too.
+        out.extend(scan.incomplete);
         Ok(out)
     }
 }
 
-fn is_benign_list_error(e: &io::Error) -> bool {
-    matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied)
+/// What `list` reports for an id with no readable fragment. Both determinate outcomes are reported
+/// by omission, which is why what the scan found is discarded: no residue is an unoccupied id, and
+/// residue under an absent fragment is `Ownership::Foreign`, which `list` leaves out like any other
+/// foreign id. Only a read that did not complete gets an entry, because omission would claim it.
+fn residue_entry(id: &str) -> Option<Installed> {
+    discover::residue_read(id).err().map(|failure| Installed::Undetermined {
+        name: Some(id.to_string()),
+        reason: failure.detail(),
+    })
+}
+
+// Enumeration =========================================================================================================
+
+/// Every id `Systemd::list` has to answer for, and the entries standing for whatever the passes
+/// that produced it never reached.
+///
+/// # Which ids those are
+///
+/// The same two names `discover` calls this id's artifact, asked of the same directories `discover`
+/// asks: `<id>.service` in [`UNIT_DIR`] alone, the only fragment path this backend ever reads or
+/// writes, and `<id>.service.d` under every root of [`DROPIN_SEARCH_DIRS`], since
+/// `discover::residue` counts one there as much as one in `/etc`.
+///
+/// Reaching exactly as far as `residue` is the point. An id whose drop-in could not be read is
+/// `Error::Undetermined` to `status`; a listing that never enumerated it says, by leaving it out,
+/// that nothing is installed there — the negative conclusion [`Installed::Undetermined`] exists to
+/// forbid. That still bounds the scan well short of the unit load path: only directory *names* come
+/// out of each root, and only the ids they name are asked about.
+///
+/// A fragment under a root other than `UNIT_DIR` deliberately names no id here. `raw_state` looks
+/// for `<id>.service` in `UNIT_DIR` and nowhere else, so a unit shipped in `/usr/lib` is already
+/// `NotInstalled` to every verb goetia has.
+///
+/// # The half of `residue` this does not name: enablement links
+///
+/// `residue` also stats `multi-user.target.wants/<id>.service` under four roots, and an id whose
+/// *only* trace is such a link is not named here. A stated limitation: an unsearchable wants
+/// directory makes `status` answer `Error::Undetermined` for every fragmentless id, this scan has
+/// no name for one whose sole trace was a link there, and `show` would call that id absent.
+///
+/// Both ways of closing it are worse than the hole. A readability probe of each wants directory
+/// answers a *different* question than `residue` asks — mode `0111` denies `read_dir` while every
+/// stat `residue` performs succeeds — so it would stand a permanent aggregate entry, and a
+/// permanent exit `4`, on a host where nothing goetia reads fails. Enumerating their contents
+/// instead asks `residue` about every unit enabled on the host, all foreign by construction, which
+/// is the sweep this bound exists to avoid. The drop-in half needs neither: a handful of directories
+/// name themselves in their own parent's listing, rather than one per enabled unit.
+#[derive(Debug)]
+struct HostScan {
+    /// Ids with a fragment in [`UNIT_DIR`], with its path.
+    units: Vec<(String, PathBuf)>,
+    /// Ids named only by a `<id>.service.d` directory. Disjoint from `units` by construction: an id
+    /// with a fragment is classified through that, and one entry per id is what
+    /// `cli::support::partition_installed` asserts.
+    dropin_only: Vec<String>,
+    /// One per pass that started and did not finish — a root each, since a root that could not be
+    /// enumerated says nothing about the next one.
+    incomplete: Vec<Installed>,
+}
+
+/// The enumeration behind [`HostScan`], one `read_dir` per root.
+fn scan_host() -> HostScan {
+    let unit_dir = scan_unit_dir(Path::new(UNIT_DIR));
+    let mut incomplete: Vec<Installed> = unit_dir.incomplete.into_iter().collect();
+    let mut dropin_ids: BTreeSet<String> = unit_dir.dropins.into_iter().collect();
+    for root in DROPIN_SEARCH_DIRS.iter().filter(|root| **root != UNIT_DIR) {
+        let scan = scan_unit_dir(Path::new(root));
+        // Fragments outside `UNIT_DIR` are not this backend's — see [`HostScan`].
+        dropin_ids.extend(scan.dropins);
+        incomplete.extend(scan.incomplete);
+    }
+    let dropin_only = {
+        let with_fragment: BTreeSet<&str> = unit_dir.units.iter().map(|(id, _)| id.as_str()).collect();
+        dropin_ids
+            .into_iter()
+            .filter(|id| !with_fragment.contains(id.as_str()))
+            .collect()
+    };
+    HostScan {
+        units: unit_dir.units,
+        dropin_only,
+        incomplete,
+    }
+}
+
+/// What one pass over one directory found: the `<id>.service` fragments and `<id>.service.d`
+/// drop-in directories it reached, and — when the pass stopped early — the entry standing for
+/// whatever it never did.
+#[derive(Debug)]
+struct UnitScan {
+    units: Vec<(String, PathBuf)>,
+    dropins: Vec<String>,
+    incomplete: Option<Installed>,
+}
+
+/// Enumerate `dir`. A pass that cannot start, or cannot finish, is *reported* rather than
+/// propagated: an `Err` out of `list` would throw away every id this same call already classified
+/// and reach the CLI as an empty document on exit `1`, which is `list` saying the host has no
+/// daemons — the one claim a scan that did not finish cannot support.
+///
+/// `dir` not existing is neither: absence is *established* there, so it is an empty scan with
+/// nothing outstanding — the answer [`ServiceManager::list`]'s doc comment requires of every
+/// backend, and the one launchd already gave for its own missing staging directory.
+fn scan_unit_dir(dir: &Path) -> UnitScan {
+    match fs::read_dir(dir) {
+        Ok(entries) => collect_units(dir, entries.map(|entry| entry.map(|entry| entry.path()))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => UnitScan {
+            units: Vec::new(),
+            dropins: Vec::new(),
+            incomplete: None,
+        },
+        Err(e) => UnitScan {
+            units: Vec::new(),
+            dropins: Vec::new(),
+            incomplete: Some(Installed::scan_incomplete(
+                &dir.display().to_string(),
+                &format!("failed to read directory: {e}"),
+            )),
+        },
+    }
+}
+
+/// The pass itself, over an iterator of paths rather than [`fs::read_dir`] directly — which is what
+/// makes the mid-pass fault reachable from a test, since no `readdir` fails on demand. That fault
+/// is the half that matters: everything already collected comes back alongside the aggregate,
+/// rather than being discarded because a *later* dirent could not be read.
+fn collect_units(dir: &Path, entries: impl Iterator<Item = io::Result<PathBuf>>) -> UnitScan {
+    let mut units = Vec::new();
+    let mut dropins = Vec::new();
+    for entry in entries {
+        let path = match entry {
+            Ok(path) => path,
+            Err(e) => {
+                return UnitScan {
+                    units,
+                    dropins,
+                    incomplete: Some(Installed::scan_incomplete(
+                        &dir.display().to_string(),
+                        &format!("failed to read a directory entry: {e}"),
+                    )),
+                };
+            }
+        };
+        // Lossy, exactly as before: a non-UTF-8 unit name still has to be reported, and every read
+        // below goes through `path` itself rather than through this rendering of it.
+        let Some(file_name) = path.file_name().map(|name| name.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        // The name alone, with nothing stat'd: a drop-in directory that is not one — the regular
+        // file `install_refuses_an_unreadable_dropin_over_our_own_fragment` seeds, whose `read_dir`
+        // answers `ENOTDIR` for every uid — is exactly an id this pass must not drop.
+        if let Some(id) = file_name.strip_suffix(".service.d") {
+            dropins.push(id.to_string());
+            continue;
+        }
+        let Some(id) = file_name.strip_suffix(".service") else {
+            continue;
+        };
+        units.push((id.to_string(), path));
+    }
+    UnitScan {
+        units,
+        dropins,
+        incomplete: None,
+    }
 }
 
 // Identity ============================================================================================================

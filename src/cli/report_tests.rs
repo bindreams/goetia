@@ -11,9 +11,22 @@ fn report(kinds: &[Kind]) -> Report {
                 message: "why".to_string(),
             })
             .collect(),
+        undetermined: Vec::new(),
     }
 }
 
+/// One entry of the third key. Named, since the name is the only thing an
+/// aggregate changes and nothing here depends on it.
+fn undetermined_entry() -> UndeterminedReport {
+    UndeterminedReport {
+        name: Some("opaque".to_string()),
+        reason: "why".to_string(),
+    }
+}
+
+/// Also pins that an empty `undetermined` is still emitted: a key that
+/// disappears when empty (a `skip_serializing_if` away) is exactly what a
+/// consumer reading `doc["undetermined"]` cannot tolerate.
 #[skuld::test]
 fn write_emits_one_compact_line_terminated_by_a_newline() {
     let report = Report {
@@ -28,6 +41,7 @@ fn write_emits_one_compact_line_terminated_by_a_newline() {
             kind: Kind::Unreadable,
             message: "why".to_string(),
         }],
+        undetermined: Vec::new(),
     };
 
     let mut out = Vec::new();
@@ -38,7 +52,8 @@ fn write_emits_one_compact_line_terminated_by_a_newline() {
         text,
         concat!(
             r#"{"daemons":[{"id":"frpc","state":"running","enabled":true,"pid":1234}],"#,
-            r#""errors":[{"id":"corrupt","kind":"unreadable","message":"why"}]}"#,
+            r#""errors":[{"id":"corrupt","kind":"unreadable","message":"why"}],"#,
+            r#""undetermined":[]}"#,
             "\n"
         ),
         "compact (no spaces or indentation), one line, newline-terminated"
@@ -70,6 +85,27 @@ fn exit_code_is_the_precedence_max_over_error_kinds() {
     ] {
         assert_eq!(exit_code(&report(kinds)), expected, "for {kinds:?}");
     }
+}
+
+/// A `list()`-derived undetermined entry is not an `errors[]` entry, so
+/// without folding the third key in there is nothing for the code to come
+/// from — and `list` exits `0` on the partial answer it just reported.
+#[skuld::test]
+fn an_undetermined_entry_alone_yields_four() {
+    let mut report = report(&[]);
+    report.undetermined.push(undetermined_entry());
+
+    assert_eq!(exit_code(&report), 4);
+}
+
+/// The precedence rule spans both keys: a determinate failure outranks an
+/// unanswered question wherever each was carried.
+#[skuld::test]
+fn an_error_beside_an_undetermined_entry_yields_one() {
+    let mut report = report(&[Kind::NotInstalled]);
+    report.undetermined.push(undetermined_entry());
+
+    assert_eq!(exit_code(&report), 1);
 }
 
 /// The wire spelling is the stable contract, and `Serialize` goes through

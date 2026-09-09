@@ -9,7 +9,7 @@ use super::report;
 use super::support::{load_and_warn, require_elevation, select_by_ids};
 use crate::backend::Identity;
 use crate::decide::Outcome;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::manager::ServiceManager;
 use crate::spec::{AccountId, DaemonSpec, Id, User};
 
@@ -109,19 +109,19 @@ pub fn run(
                 if args.enable {
                     if let Err(e) = mgr.enable(&spec.id) {
                         let _ = writeln!(err, "error: {}: enable: {e}", spec.id);
-                        codes.push(1);
+                        codes.push(failure_code(&e));
                     }
                 }
                 if args.start {
                     if let Err(e) = mgr.start(&spec.id) {
                         let _ = writeln!(err, "error: {}: start: {e}", spec.id);
-                        codes.push(1);
+                        codes.push(failure_code(&e));
                     }
                 }
             }
             Err(e) => {
                 let _ = writeln!(err, "error: {}: {e}", spec.id);
-                codes.push(1);
+                codes.push(failure_code(&e));
             }
         }
     }
@@ -129,6 +129,17 @@ pub fn run(
         .into_iter()
         .max_by_key(|code| report::precedence(*code))
         .unwrap_or(0)
+}
+
+/// The class a failed step contributes: `4` when goetia could not
+/// determine what is at the id, `1` when the step determinately failed.
+/// This is what makes `install` agree with `diff` about one artifact — see
+/// `dispatch`'s doc comment for the vocabulary.
+fn failure_code(e: &Error) -> i32 {
+    match e {
+        Error::Undetermined { .. } => 4,
+        _ => 1,
+    }
 }
 
 /// Which of the three exit-code buckets an [`Outcome`] belongs to.

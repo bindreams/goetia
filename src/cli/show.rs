@@ -11,12 +11,11 @@
 //!    byte for byte, because both go through [`crate::diff::render_yaml`]
 //!    and neither may grow a renderer of its own. Conditional, not
 //!    unconditional agreement: without `-f`, `show` reads
-//!    [`ServiceManager::list`], which silently skips a unit this privilege
-//!    level cannot enumerate (see
-//!    [`crate::manager::Installed::OursUnreadable`]'s doc comment). For a
-//!    daemon installed but unreadable unelevated, `show <id>` therefore
-//!    reports "not installed" and exits `1`, while `show -f <file> <id>`
-//!    still renders it straight from the manifest.
+//!    [`ServiceManager::list`], which cannot describe a unit this privilege
+//!    level could not read. Such a unit reaches `show` as
+//!    [`crate::manager::Installed::Undetermined`], so `show <id>` reports
+//!    that it could not determine the id's state and exits `4`, while
+//!    `show -f <file> <id>` still renders it straight from the manifest.
 //! 2. Neither path ever checks elevation.
 //! 3. `show -f` touches no manager; `show` without `-f` touches no
 //!    manifest.
@@ -25,11 +24,16 @@
 //!
 //! A daemon this privilege level *can* see, but whose blob will not decode,
 //! is a different case from "not installed": `show` returns `4` for it —
-//! both per id, and, via `index.unreadable`'s escalation, for the no-ids
-//! form — the same "goetia owns this id and could not determine its
+//! both per id, and, via the no-ids form's escalation, for that form too
+//! — the same "goetia owns this id and could not determine its
 //! state" code `list`/`status`/`diff` use. "Not installed" stays `1`, a
 //! determinate answer, and outranks `4` when a single call names both
 //! kinds of id (see `show_from_installed`).
+//!
+//! What `show` may never do is call an id absent on a listing that did not
+//! establish absence. An id `list()` reported as undetermined is `4`, and so
+//! is *any* id `show` cannot find while an aggregate entry — one with no
+//! name — is present, since such an entry may stand for that very id.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -37,7 +41,9 @@ use std::path::{Path, PathBuf};
 use clap::Args as ClapArgs;
 
 use super::report;
-use super::support::{load_and_warn, partition_installed, print_unreadable_warnings, select_by_ids};
+use super::support::{
+    load_and_warn, partition_installed, print_undetermined_warnings, print_unreadable_warnings, select_by_ids,
+};
 use crate::error::Result;
 use crate::manager::ServiceManager;
 use crate::spec::DaemonSpec;
@@ -106,6 +112,7 @@ fn show_from_installed(
 
     let index = partition_installed(installed);
     print_unreadable_warnings(&index.unreadable, err);
+    print_undetermined_warnings(&index.undetermined, err);
 
     let wanted: Vec<String> = if ids.is_empty() {
         index.ours.keys().cloned().collect()
@@ -122,10 +129,12 @@ fn show_from_installed(
     // downgrade an already-seen absent one.
     let mut codes: Vec<i32> = Vec::new();
 
-    // With no ids given, an unreadable entry never enters `wanted` at all
-    // (it has no spec to show), so the loop below can't be what flags it —
-    // unlike `list`/`status`, which escalate the same way.
-    if ids.is_empty() && !index.unreadable.is_empty() {
+    // With no ids given, neither an unreadable nor an undetermined entry
+    // enters `wanted` at all (neither has a spec to show), so the loop below
+    // can't be what flags it — unlike `list`/`status`, which escalate the
+    // same way. Without this, `show` prints a complete-looking dump and
+    // exits `0` on a host where it could not read half the daemons.
+    if ids.is_empty() && (!index.unreadable.is_empty() || !index.undetermined.is_empty()) {
         codes.push(4);
     }
 
@@ -135,6 +144,16 @@ fn show_from_installed(
             specs.push(entry.spec.clone());
         } else if index.unreadable.contains_key(id) {
             let _ = writeln!(err, "error: daemon `{id}` is installed but unreadable");
+            codes.push(4);
+        } else if let Some(entry) = index.undetermined_for(id) {
+            // Either the listing named this id as one it could not classify,
+            // or it carries an aggregate entry that may stand for it. Both
+            // leave absence unestablished, so neither may be reported as it.
+            let _ = writeln!(
+                err,
+                "error: daemon `{id}`: installation state could not be determined: {}",
+                entry.reason
+            );
             codes.push(4);
         } else {
             let _ = writeln!(err, "error: daemon `{id}` is not installed");

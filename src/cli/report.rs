@@ -3,16 +3,24 @@
 //! One compact JSON object, newline-terminated, on stdout:
 //!
 //! ```json
-//! {"daemons":[{"id":"frpc","state":"running","enabled":true,"pid":1234}],"errors":[]}
+//! {"daemons":[{"id":"frpc","state":"running","enabled":true,"pid":1234}],"errors":[],"undetermined":[]}
 //! ```
 //!
-//! `daemons` and `errors` are always present, as arrays, possibly empty.
-//! `name` is deliberately absent: [`crate::manager::ServiceManager::status`]
-//! returns a [`Status`] with no spec, so only `list` could supply it, and one
-//! field differing between the two subcommands is worse than sending users to
-//! `goetia daemon show`. `pid` is an integer or `null`, and `null` means the
+//! `daemons`, `errors` and `undetermined` are always present, as arrays,
+//! possibly empty. A `daemons` entry carries no `name`:
+//! [`crate::manager::ServiceManager::status`] returns a [`Status`] with no
+//! spec, so only `list` could supply it, and one field differing between the
+//! two subcommands is worse than sending users to `goetia daemon show`. `pid` is an integer or `null`, and `null` means the
 //! manager reports no main process — never "this command could not find out",
 //! which is an `errors` entry instead.
+//!
+//! `undetermined` carries what `list()` could not classify at all, and an
+//! entry whose `name` is `null` stands for more than one id. It is a third
+//! key rather than an `errors[].kind` because the command did not fail: it
+//! reported everything it could see, and this is a stated limit on the
+//! answer's completeness, which a consumer must be able to read without
+//! parsing `kind` strings. `status <id>`, asked about one named id, reports
+//! the same fact as that id's own `errors[].kind: "undetermined"`.
 //!
 //! [`exit_code`] is the *only* exit-code computation `list` and `status` have,
 //! with or without `--json`: both build a [`Report`] first and only then pick
@@ -31,6 +39,19 @@ use crate::manager::Status;
 pub(crate) struct Report {
     pub daemons: Vec<DaemonReport>,
     pub errors: Vec<ErrorReport>,
+    pub undetermined: Vec<UndeterminedReport>,
+}
+
+/// One thing `list()` could not classify. A `Vec` and not a map: an
+/// aggregate entry has no name to key on, and nothing limits a backend to
+/// one aggregate.
+#[derive(serde::Serialize)]
+pub(crate) struct UndeterminedReport {
+    /// `null` for an entry standing for more than one id — while one is
+    /// present, no negative conclusion about any id is sound (see
+    /// [`Installed::Undetermined`](crate::manager::Installed::Undetermined)).
+    pub name: Option<String>,
+    pub reason: String,
 }
 
 #[derive(serde::Serialize)]
@@ -84,7 +105,12 @@ pub(crate) enum Kind {
     /// Goetia could not determine *whether* anything is installed at that
     /// id: a read the answer depends on failed. Claims no ownership, which
     /// is the whole difference from [`Kind::Unreadable`] — see
-    /// [`Error::Undetermined`], which is the only thing that produces it.
+    /// [`Error::Undetermined`], which is the only thing that produces an
+    /// `errors[]` entry of this kind. The `undetermined[]` key is fed
+    /// separately, from [`Installed::Undetermined`] out of `list()`; both
+    /// exit `4` through [`Kind::code`], which owns that mapping.
+    ///
+    /// [`Installed::Undetermined`]: crate::manager::Installed::Undetermined
     /// Only from `status(&id)`.
     Undetermined,
     /// `support::parse_id` rejected a CLI argument: fix the argument.
@@ -151,7 +177,8 @@ impl serde::Serialize for Kind {
 // Constructors ========================================================================================================
 
 /// The report for a whole-host listing: every decoded entry a daemon, every
-/// [`Installed::OursUnreadable`] an `unreadable` error. `list` and `status`
+/// [`Installed::OursUnreadable`] an `unreadable` error, and everything
+/// goetia could not classify an entry in the third key. `list` and `status`
 /// with no ids both build their report through here, which is what makes the
 /// two emit the identical document for the same machine. Both of
 /// [`InstalledIndex`]'s maps are `BTreeMap`s, so the ordering is by id.
@@ -176,6 +203,16 @@ pub(crate) fn from_index(index: &InstalledIndex) -> Report {
                 id: Some(name.clone()),
                 kind: Kind::Unreadable,
                 message: format!("installed but unreadable: {reason}"),
+            })
+            .collect(),
+        // Already ordered: `partition_installed` sorts as it builds, so the
+        // document and the text renderer cannot disagree.
+        undetermined: index
+            .undetermined
+            .iter()
+            .map(|entry| UndeterminedReport {
+                name: entry.name.clone(),
+                reason: entry.reason.clone(),
             })
             .collect(),
     }
@@ -250,6 +287,7 @@ pub(crate) fn unavailable(e: &Error) -> Report {
             kind: Kind::Unavailable,
             message: e.to_string(),
         }],
+        undetermined: Vec::new(),
     }
 }
 
@@ -266,6 +304,7 @@ pub(crate) fn unsupported(subcommand: &str) -> Report {
                 "`daemon {subcommand}` does not support --json: drop --json, or use `daemon list` or `daemon status`"
             ),
         }],
+        undetermined: Vec::new(),
     }
 }
 
@@ -311,13 +350,19 @@ pub(crate) fn emit(report: &Report, out: &mut dyn Write, err: &mut dyn Write) ->
 }
 
 /// The process exit code for `report`: the precedence-max over its
-/// `errors[].kind`, never "1 if non-empty". Called with the same `Report` in
-/// both output modes — see the module doc comment.
+/// `errors[].kind` *and* its `undetermined` entries, never "1 if non-empty".
+/// Called with the same `Report` in both output modes — see the module doc
+/// comment.
 pub(crate) fn exit_code(report: &Report) -> i32 {
     report
         .errors
         .iter()
         .map(|e| e.kind.code())
+        // The third key's code comes from `Kind::code` like every other,
+        // never a literal: that exhaustive match is the only reason a kind
+        // cannot exist without a code (see `Kind`'s doc comment), and a
+        // second assignment site here would quietly retire the guarantee.
+        .chain(report.undetermined.iter().map(|_| Kind::Undetermined.code()))
         .max_by_key(|code| precedence(*code))
         .unwrap_or(0)
 }

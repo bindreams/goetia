@@ -18,14 +18,16 @@
 //! call-unique (a pid plus a monotonic counter), not cryptographically
 //! random — sufficient given cleanup runs every time, including on panic.
 //!
-//! ## The two seeded ids
+//! ## The seeded ids
 //!
-//! Two of the six scenarios ([`refuses_foreign_even_with_force`] and
-//! [`conflict_requires_force`]) need state that cannot be produced through
-//! [`ServiceManager`]'s own methods: a foreign (unmarked) service, and a
-//! hand-edited Goetia artifact. `run` therefore does *not* create these
-//! itself — it requires the **caller** to have already put `mgr` into that
-//! state at two fixed, reserved ids before calling `run`:
+//! Four of the scenarios ([`refuses_foreign_even_with_force`],
+//! [`foreign_refuses_every_verb`], [`conflict_requires_force`] and
+//! [`an_unclassifiable_id_is_never_silently_absent`]) need state that cannot be
+//! produced through [`ServiceManager`]'s own methods: a foreign (unmarked)
+//! service, a hand-edited Goetia artifact, and an artifact no read can obtain.
+//! `run` therefore does *not* create these itself — it requires the **caller**
+//! to have already put `mgr` into that state at three fixed, reserved ids
+//! before calling `run`:
 //!
 //! - [`FOREIGN_ID`]: `mgr` already has *something* installed at this id,
 //!   through means entirely outside Goetia (a hand-written unit file /
@@ -39,11 +41,19 @@
 //!   `run`'s own `conflict_requires_force` scenario forces an overwrite
 //!   here, so this one *is* included in `run`'s own cleanup — the caller
 //!   only needs to seed it once per call to `run`.
+//! - [`UNDETERMINED_ID`]: an artifact whose bytes this process cannot
+//!   obtain is already at this id, for
+//!   [`an_unclassifiable_id_is_never_silently_absent`]. That scenario
+//!   asserts every verb *refuses* the id, so `run` never writes to or
+//!   removes it either — cleanup is the caller's, as for [`FOREIGN_ID`].
+//!   Which artifact seeds it is per platform and stated in that scenario's
+//!   own doc comment; every backend can seed it from the same elevated
+//!   context it installs from.
 //!
-//! [`fake::Fake`] exposes `seed_foreign`/`install_then_hand_edit` for
-//! exactly this; a real backend's integration test does the equivalent with
-//! direct filesystem/registry access, which it already has as elevated test
-//! code.
+//! [`fake::Fake`] exposes
+//! `seed_foreign`/`install_then_hand_edit`/`seed_opaque` for exactly this; a
+//! real backend's integration test does the equivalent with direct
+//! filesystem/registry access, which it already has as elevated test code.
 //!
 //! [`ServiceManager`]: super::ServiceManager
 //! [`fake::Fake`]: super::fake::Fake
@@ -51,6 +61,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{Installed, ServiceManager, State};
+use crate::error::Error;
 use crate::spec::{DaemonSpec, Id};
 
 /// See the module doc comment. Reserved: no other scenario in `run` uses
@@ -60,6 +71,10 @@ pub const FOREIGN_ID: &str = "goetia-conformance-foreign";
 /// See the module doc comment. Reserved: no other scenario in `run` uses
 /// this id.
 pub const HAND_EDITED_ID: &str = "goetia-conformance-hand-edited";
+
+/// See [`an_unclassifiable_id_is_never_silently_absent`], the one scenario
+/// that reads this id. Reserved: no other scenario uses it.
+pub const UNDETERMINED_ID: &str = "goetia-conformance-undetermined";
 
 /// RAII cleanup for every id `run`'s scenarios install. `Drop` cannot
 /// return a `Result`, so an uninstall failure during cleanup is logged to
@@ -86,9 +101,10 @@ impl Drop for Cleanup<'_> {
 ///
 /// `mk(id)` must build a valid, installable [`DaemonSpec`] with `id` as its
 /// id. Every id `run` uses is either freshly generated (never installed
-/// before) or one of [`FOREIGN_ID`]/[`HAND_EDITED_ID`] — see the module doc
-/// comment for what the caller must have already arranged at those two, and
-/// for what `run` cleans up on its own.
+/// before) or one of
+/// [`FOREIGN_ID`]/[`HAND_EDITED_ID`]/[`UNDETERMINED_ID`] — see the module
+/// doc comment for what the caller must have already arranged at those
+/// three, and for what `run` cleans up on its own.
 pub fn run(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
     let mut cleanup = Cleanup { mgr, ids: Vec::new() };
     // Registered up front, not inside `conflict_requires_force`: the caller
@@ -109,6 +125,7 @@ pub fn run(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
     refuses_foreign_even_with_force(mgr, mk);
     foreign_refuses_every_verb(mgr, mk);
     conflict_requires_force(mgr, mk);
+    an_unclassifiable_id_is_never_silently_absent(mgr, mk);
 
     // `cleanup` drops here, uninstalling everything pushed above — including
     // on an early return via a panicking assertion, since `Drop` still runs
@@ -323,7 +340,7 @@ fn list_and_status_agree_on_pid(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> D
     mgr.install(&spec, false).expect("install");
     cleanup.push(spec.id.clone());
 
-    assert_pid_agrees(mgr, &spec.id);
+    assert_list_is_complete_and_pid_agrees(mgr, &spec.id, cleanup);
 
     mgr.start(&spec.id).expect("start");
     assert_eq!(
@@ -332,15 +349,142 @@ fn list_and_status_agree_on_pid(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> D
         "id {}",
         spec.id
     );
-    assert_pid_agrees(mgr, &spec.id);
+    assert_list_is_complete_and_pid_agrees(mgr, &spec.id, cleanup);
 
     mgr.stop(&spec.id).expect("stop");
-    assert_pid_agrees(mgr, &spec.id);
+    assert_list_is_complete_and_pid_agrees(mgr, &spec.id, cleanup);
 }
 
-fn assert_pid_agrees(mgr: &dyn ServiceManager, id: &Id) {
+/// The silent-skip regression [`Installed::Undetermined`] exists to prevent:
+/// an id goetia could not classify is reported as unclassified — never dropped
+/// from the listing, never claimed as goetia's — and no verb acts on it.
+///
+/// The caller must have already put an artifact whose bytes this process
+/// cannot obtain at [`UNDETERMINED_ID`]. That every verb refuses — `install
+/// --force` included — is what this asserts rather than assumes, so it
+/// registers no cleanup of its own; the caller's own cleanup for
+/// [`UNDETERMINED_ID`] covers a backend that writes anyway.
+///
+/// # The state, and why every caller can seed it
+///
+/// A read that *did not complete* — which is not the same as a read that was
+/// denied, and the difference is what lets this be one of [`run`]'s scenarios
+/// rather than an assertion each suite restates below its own privilege
+/// boundary. Elevation dissolves a denial: on systemd and launchd every read
+/// is DAC-gated and root holds `CAP_DAC_OVERRIDE`, so a mode seeds nothing in
+/// a suite that has to be root to install anything at all. An errno that is
+/// not about permission dissolves for nobody:
+///
+/// - **systemd** — a regular file where `<id>.service.d` belongs. `read_dir`
+///   answers `ENOTDIR`, and `residue` — the predicate every verb asks — is
+///   left unable to say whether anything occupies the id.
+/// - **launchd** — a self-referential symlink at the plist path. `stat`
+///   answers `ELOOP`, so `obtain` gets no bytes, while `symlink_metadata`
+///   still sees the entry, which is exactly "something is there and nothing
+///   about it was established".
+/// - **SCM** — a `Deny`/`ReadKey` ACE over `Parameters`, which stops an
+///   Administrator too (`tests/scm_integration/deny.rs`).
+///
+/// A seed whose *bytes arrive* is not this state and never was: a non-UTF-8
+/// fragment or plist is `Foreign` — established, omitted from `list`, refused
+/// by every verb with a different error — so seeding one here asserts the
+/// wrong contract while looking correct.
+///
+/// Seeding [`UNDETERMINED_ID`] changes `list`'s answer for the whole host, not
+/// only for that id: it raises `daemon list`'s exit code, and on Windows it
+/// collapses into an aggregate entry. A caller whose suite also asserts a
+/// *clean* host-wide listing has to serialize the two against each other — the
+/// `UNIT_DIR_EXCLUSIVE` label the integration suites share by name.
+///
+/// A backend satisfies the `list` half by naming the id in an
+/// [`Installed::Undetermined`] entry *or* by emitting any aggregate one. The
+/// aggregate counts because a null name stands for ids the entry could not
+/// separate, so it may stand for this one — the same rule that forbids
+/// concluding absence from it. SCM emits only that form, since a listing can
+/// have hundreds of denied services and one entry cannot carry their names.
+/// The per-id half below is exact on every backend, so accepting the
+/// aggregate does not weaken the scenario to nothing.
+pub fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
+    let spec = mk(UNDETERMINED_ID);
+    let id = &spec.id;
+
+    let listed = mgr
+        .list()
+        .expect("one id goetia cannot classify must not take the whole listing down");
+    assert!(
+        listed.iter().any(|entry| match entry {
+            Installed::Undetermined { name, .. } => name.is_none() || name.as_deref() == Some(id.as_str()),
+            Installed::Ours { .. } | Installed::OursUnreadable { .. } => false,
+        }),
+        "id {id} is neither reported undetermined nor covered by an aggregate entry, so list() \
+         silently says it does not exist: {listed:?}"
+    );
+    assert!(
+        !listed.iter().any(|entry| match entry {
+            Installed::Ours { spec, .. } => spec.id == *id,
+            Installed::OursUnreadable { name, .. } => name == id.as_str(),
+            Installed::Undetermined { .. } => false,
+        }),
+        "the read that would have classified id {id} never completed, so no ownership was \
+         established and none may be claimed: {listed:?}"
+    );
+
+    // `NotInstalled` would certify absence and `Foreign` a stranger's
+    // presence; this read established neither, and a verb answering either
+    // would write off — or act on — an id goetia cannot classify.
+    for (verb, result) in [
+        ("status", mgr.status(id).map(drop)),
+        ("uninstall", mgr.uninstall(id)),
+        ("enable", mgr.enable(id)),
+        ("disable", mgr.disable(id)),
+        ("start", mgr.start(id)),
+        ("stop", mgr.stop(id)),
+    ] {
+        assert!(
+            matches!(&result, Err(Error::Undetermined { .. })),
+            "{verb} on an id goetia cannot classify must be Undetermined, got {result:?}"
+        );
+    }
+
+    // The two verbs that *write*, `--force` included.
+    // [`refuses_foreign_even_with_force`] makes this point one epistemic step
+    // further in: refusing to clobber what goetia has *proved* is a
+    // stranger's is worth little if it will clobber what it could not read at
+    // all. `force` must not even be consulted here — the read that would have
+    // supplied `decide`'s inputs never completed, so there is no classified
+    // artifact for it to override.
+    for (verb, result) in [
+        ("install", mgr.install(&spec, false).map(drop)),
+        ("install with force", mgr.install(&spec, true).map(drop)),
+        ("preview_install", mgr.preview_install(&spec).map(drop)),
+    ] {
+        assert!(
+            matches!(&result, Err(Error::Undetermined { .. })),
+            "{verb} over an id goetia cannot classify must be Undetermined, got {result:?}"
+        );
+    }
+}
+
+/// Two assertions off one `list()`, which is why they share a function: SCM's
+/// enumerates every service on the host, so a second call to make the split
+/// look tidier would cost a real sweep.
+///
+/// `installed` is every id installed through `mgr` so far — `run`'s own, plus
+/// the [`HAND_EDITED_ID`] the *caller* installed before `run` was called.
+/// Each must be in `list()` as `Ours`, not just `id`: an enumeration that
+/// drops one it could read is indistinguishable from one where that daemon
+/// does not exist.
+fn assert_list_is_complete_and_pid_agrees(mgr: &dyn ServiceManager, id: &Id, installed: &[Id]) {
     let status_pid = mgr.status(id).expect("status").pid;
     let listed = mgr.list().expect("list");
+    for other in installed {
+        assert!(
+            listed
+                .iter()
+                .any(|entry| matches!(entry, Installed::Ours { spec, .. } if spec.id == *other)),
+            "id {other} was installed through mgr and must appear in list() as Ours: {listed:?}"
+        );
+    }
     let list_pid = listed
         .iter()
         .find_map(|entry| match entry {

@@ -129,16 +129,18 @@ fn restore_or_chain(backup_path: &Path, final_path: &Path, primary: Error) -> Er
 /// bytes is both simpler and immune to that, and it is what this whole system already treats as an
 /// artifact's identity everywhere else (`decide`'s entire vocabulary is text).
 ///
-/// The quarantined file is classified with the same `O_NOFOLLOW`-then-`fstat` discipline
-/// `discover::classify_and_read` uses for the fragment itself, not a plain `read_to_string` — the
-/// rename above can just as easily have moved a FIFO, a device node, a directory, or a symlink into
-/// quarantine as a regular file, and each of those would otherwise be mishandled by a bare read
-/// (a FIFO blocks forever waiting for a writer; a character device can grow the read buffer without
-/// bound; a directory fails with `EISDIR`, stranding it under the hidden quarantine name since
-/// `restore_quarantine`'s `link` then also fails; a symlink would be silently followed, unlike every
-/// other read in this module). None of those is something a fragment `discover` ever classified as
-/// `Ours` could have been, so any of them showing up here is itself proof of a race — treated exactly
-/// like a content mismatch.
+/// The quarantined file goes through `discover::classify_and_read`, which settles its type from an
+/// `O_PATH | O_NOFOLLOW` descriptor before anything is opened for reading, rather than a plain
+/// `read_to_string` — the rename above can just as easily have moved a FIFO, a device node, a
+/// directory, or a symlink into quarantine as a regular file, and each of those would otherwise be
+/// mishandled by a bare read (a FIFO blocks forever waiting for a writer; a character device can
+/// grow the read buffer without bound; a directory fails with `EISDIR`, stranding it under the
+/// hidden quarantine name since `restore_quarantine`'s `link` then also fails; a symlink would be
+/// silently followed, unlike every other read in this module). None of those is something a fragment
+/// `discover` ever classified as `Ours` could have been, so any of them showing up here is itself
+/// proof of a race — treated exactly like a content mismatch. Bytes that will not decode arrive in
+/// the same arm and get the same answer: `expected_text` is UTF-8 by construction, so they cannot be
+/// the file this was asked to verify.
 pub(super) fn quarantine_if_still_ours(id: &str, expected_text: &str) -> Result<Option<PathBuf>> {
     let final_path = unit_path(id);
     let backup_path = unique_quarantine_path(id);
@@ -151,7 +153,7 @@ pub(super) fn quarantine_if_still_ours(id: &str, expected_text: &str) -> Result<
 
     let actual = match classify_and_read(&backup_path).map_err(ReadFailure::into_io_error) {
         Ok(RawState::Regular(text)) => text,
-        Ok(RawState::Absent | RawState::NonRegular) => {
+        Ok(RawState::Absent | RawState::NotOurs) => {
             restore_quarantine(&backup_path, &final_path)?;
             return Ok(None);
         }

@@ -62,6 +62,15 @@ pub(crate) struct InstalledEntry {
     pub enabled: bool,
 }
 
+/// One [`Installed::Undetermined`] entry, as held by [`InstalledIndex`].
+pub(crate) struct UndeterminedEntry {
+    /// `None` for an entry standing for more than one id — see
+    /// [`Installed::Undetermined`], whose doc comment carries the rule
+    /// every caller owes such an entry.
+    pub name: Option<String>,
+    pub reason: String,
+}
+
 /// One [`ServiceManager::list`] entry, indexed by id. `list`, `status`,
 /// `show`, and `diff` all need this same split — spec/state/pid/enabled for
 /// what decoded cleanly, plus which names exist but did not — so it lives
@@ -70,6 +79,25 @@ pub(crate) struct InstalledEntry {
 pub(crate) struct InstalledIndex {
     pub ours: BTreeMap<String, InstalledEntry>,
     pub unreadable: BTreeMap<String, String>,
+    /// What goetia could not classify at all: named entries first, sorted
+    /// by name, then any aggregate. Not a map — an entry may stand for more
+    /// than one id and so carry no name (see [`Installed::Undetermined`]),
+    /// which leaves nothing to key on.
+    pub undetermined: Vec<UndeterminedEntry>,
+}
+
+impl InstalledIndex {
+    /// The entry that makes "`id` is not installed" an unsound conclusion,
+    /// if there is one: the entry naming `id`, or *any* aggregate — which
+    /// may stand for `id` itself. The null-name rule on
+    /// [`Installed::Undetermined`] applied once, so no caller has to know
+    /// which backend produced the listing.
+    pub fn undetermined_for(&self, id: &str) -> Option<&UndeterminedEntry> {
+        self.undetermined
+            .iter()
+            .find(|entry| entry.name.as_deref() == Some(id))
+            .or_else(|| self.undetermined.iter().find(|entry| entry.name.is_none()))
+    }
 }
 
 /// Partition `installed` into [`InstalledIndex`]. Prints nothing — call
@@ -80,6 +108,7 @@ pub(crate) struct InstalledIndex {
 pub(crate) fn partition_installed(installed: Vec<Installed>) -> InstalledIndex {
     let mut ours = BTreeMap::new();
     let mut unreadable = BTreeMap::new();
+    let mut undetermined = Vec::new();
     for entry in installed {
         match entry {
             Installed::Ours {
@@ -101,14 +130,55 @@ pub(crate) fn partition_installed(installed: Vec<Installed>) -> InstalledIndex {
             Installed::OursUnreadable { name, reason } => {
                 unreadable.insert(name, reason);
             }
+            Installed::Undetermined { name, reason } => {
+                undetermined.push(UndeterminedEntry { name, reason });
+            }
         }
     }
-    InstalledIndex { ours, unreadable }
+    // Named entries by name, then the aggregates. Sorted here rather than in
+    // `report::write`, because `list`'s text renderer reads this index
+    // directly and never goes through the `Report`: two sort sites could
+    // drift, and the ordering is what makes either output stable.
+    undetermined.sort_by(|a, b| (a.name.is_none(), a.name.as_deref()).cmp(&(b.name.is_none(), b.name.as_deref())));
+    // The three classes are mutually exclusive claims about one id —
+    // decoded, ours-but-unreadable, unclassifiable — so a backend reporting
+    // an id in two of them has answered its own question twice. Nothing else
+    // checks it, and without this the winner would be whichever branch a
+    // caller happens to test first.
+    debug_assert!(
+        ours.keys().all(|id| !unreadable.contains_key(id))
+            && undetermined
+                .iter()
+                .filter_map(|entry| entry.name.as_deref())
+                .all(|name| !ours.contains_key(name) && !unreadable.contains_key(name)),
+        "a backend put one id in two of list()'s classes"
+    );
+    InstalledIndex {
+        ours,
+        unreadable,
+        undetermined,
+    }
 }
 
 pub(crate) fn print_unreadable_warnings(unreadable: &BTreeMap<String, String>, err: &mut dyn Write) {
     for (name, reason) in unreadable {
         let _ = writeln!(err, "warning: {name}: installed but unreadable: {reason}");
+    }
+}
+
+/// Report the `undetermined` half, as [`print_unreadable_warnings`] does
+/// the other. An aggregate's `reason` is a complete sentence and stands
+/// alone: there is no name to prefix it with.
+pub(crate) fn print_undetermined_warnings(undetermined: &[UndeterminedEntry], err: &mut dyn Write) {
+    for entry in undetermined {
+        let _ = match &entry.name {
+            Some(name) => writeln!(
+                err,
+                "warning: {name}: installation state could not be determined: {}",
+                entry.reason
+            ),
+            None => writeln!(err, "warning: {}", entry.reason),
+        };
     }
 }
 
@@ -162,6 +232,10 @@ pub(crate) struct IdVerbCall<'a> {
     /// | `disable` | 1 | disabling after the fragment is gone is impossible, leaving a dangling `.wants` symlink: exit 0 while still enabled at boot |
     /// | `start`, `restart`, `enable` | 1 | cannot act on what is not there |
     ///
+    /// The table is about an *absent* artifact, so it never reaches an id
+    /// whose absence was not established: an undetermined id is `4` for all
+    /// six verbs, this flag included.
+    ///
     /// Lives here, never inside the trait: `restart`'s closure calls
     /// `mgr.stop(id)?` before `mgr.start(id)`, and tolerating absence
     /// inside `stop` itself would let `restart` on an absent id fall
@@ -180,10 +254,11 @@ pub(crate) struct IdVerbCall<'a> {
 /// Shared shape for the id-list mutating verbs (`uninstall`, `start`,
 /// `stop`, `enable`, `disable`, `restart`): check elevation once, obtain
 /// the manager once, then call `verb` per id, printing one result line per
-/// id and aggregating the exit code (`0` if every id succeeded, `1`
-/// otherwise) — except that when `call.absent_is_success` and `verb`
-/// returns `Error::NotInstalled`, the id counts as succeeded rather than
-/// failed; see [`IdVerbCall::absent_is_success`].
+/// id and combining what each id contributed by [`super::report::precedence`] —
+/// the same rule `install`, `diff` and `show` use — except that when
+/// `call.absent_is_success` and `verb` returns `Error::NotInstalled`, the
+/// id counts as succeeded rather than failed; see
+/// [`IdVerbCall::absent_is_success`].
 ///
 /// Every id is parsed *before* `verb` is called for any of them — the same
 /// all-or-nothing rule `select_by_ids` documents above. Parsing lazily,
@@ -212,11 +287,12 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
         }
     };
 
-    let mut exit = 0;
+    let mut codes: Vec<i32> = Vec::new();
     for id in &ids {
         match (call.verb)(mgr.as_ref(), id) {
             Ok(()) => {
                 let _ = writeln!(out, "{id}: {}", call.verb_past_tense);
+                codes.push(0);
             }
             // Absence already satisfies this verb's goal (`uninstall`
             // alone — see `absent_is_success`'s doc comment). Stdout only,
@@ -225,12 +301,24 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
             // another. Does not affect the aggregated exit code.
             Err(Error::NotInstalled { .. }) if call.absent_is_success => {
                 let _ = writeln!(out, "{id}: not installed (nothing to do)");
+                codes.push(0);
+            }
+            // Nothing was done and nothing was established, which is one
+            // condition with one remedy for every verb here — including
+            // `uninstall`, whose exemption is about absence, not about the
+            // question going unanswered.
+            Err(e @ Error::Undetermined { .. }) => {
+                let _ = writeln!(err, "error: {id}: {e}");
+                codes.push(4);
             }
             Err(e) => {
                 let _ = writeln!(err, "error: {id}: {e}");
-                exit = 1;
+                codes.push(1);
             }
         }
     }
-    exit
+    codes
+        .into_iter()
+        .max_by_key(|code| super::report::precedence(*code))
+        .unwrap_or(0)
 }

@@ -92,7 +92,7 @@ use windows_service::service::{
     ServiceStartType, ServiceState as WinState, ServiceType,
 };
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
-use windows_sys::Win32::Foundation::{ERROR_SERVICE_DOES_NOT_EXIST, LocalFree};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SERVICE_DOES_NOT_EXIST, LocalFree};
 use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHANGE};
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
@@ -225,73 +225,84 @@ impl ServiceManager for ScmManager {
     }
 
     fn list(&self) -> Result<Vec<Installed>> {
-        let mut out = Vec::new();
-        let mut unreadable = 0usize;
-        for name in registry::list_service_names()? {
-            // A registry read failure for one unrelated service (e.g. a
-            // driver whose `Parameters` key carries a restrictive ACL) must
-            // not take `list` down for every other daemon — the same
-            // per-entry fault tolerance `Installed::OursUnreadable` exists
-            // for on the decode side. Since a read failure here means we
-            // cannot even tell whether `name` carries Goetia's marker, this
-            // is reported and skipped rather than guessed at either way.
-            let params = match registry::read_parameters(&name) {
-                Ok(p) => p,
-                Err(e) => {
-                    // Most services on a Windows box carry an ACL that denies
-                    // a non-elevated read of their `Parameters`, so warning per
-                    // service turns `goetia daemon list` into a wall of noise
-                    // about services that were never ours. But staying silent
-                    // would be a lie in the other direction: a denied read
-                    // means ownership is *unknown*, so one of ours could be
-                    // missing from the listing. Count them and say so once.
-                    unreadable += 1;
-                    let _ = e;
-                    continue;
-                }
-            };
-            let blob = match generate::extract(&params) {
-                Ok(None) => continue,
-                Ok(Some(blob)) => blob,
-                Err(e) => {
-                    out.push(Installed::OursUnreadable {
-                        name,
-                        reason: e.to_string(),
-                    });
-                    continue;
-                }
-            };
-            // A blob can decode perfectly and still name an account (e.g. a
-            // `user.id` SID) that no longer exists on this host — see
-            // `classify`'s identical check on the `install`/`diff` side.
-            // `list`/`status` must agree with `install` about which ids are
-            // "genuinely ours and readable", or a daemon `list` reports
-            // healthy could refuse the very next `install`.
-            if let Err(e) = identity::resolve(&blob.spec.user) {
+        classify_scan(registry::list_service_names())
+    }
+}
+
+/// [`ScmManager::list`]'s body, over a [`registry::ServiceScan`] rather than reading one — the seam
+/// `registry::collect_service_names` is for the mid-pass fault, one level up. The `Services` key
+/// opens and enumerates on every host that boots (`registry_tests.rs` pins that), so a scan that
+/// stopped early cannot be produced here; handing one in is what reaches the wiring below, which is
+/// where "the enumeration stopped" becomes the entry a caller sees.
+fn classify_scan(scan: registry::ServiceScan) -> Result<Vec<Installed>> {
+    let mut out = Vec::new();
+    let mut unreadable: Vec<Unreadable> = Vec::new();
+    for name in scan.names {
+        // A registry read failure for one unrelated service (e.g. a
+        // driver whose `Parameters` key carries a restrictive ACL) must
+        // not take `list` down for every other daemon — the same
+        // per-entry fault tolerance `Installed::OursUnreadable` exists
+        // for on the decode side. And since it leaves us unable to tell
+        // whether `name` carries Goetia's marker at all, it is neither
+        // omitted nor claimed: collected here, reported by
+        // `unreadable_aggregate` below.
+        let params = match registry::read_parameters(&name) {
+            Ok(p) => p,
+            Err(e) => {
+                // Kept whole, not counted: `unreadable_aggregate` names the id — and says what
+                // failed, and how that failure clears — when it turns out to be the only one, and
+                // neither a count nor a discarded error can be recovered afterwards.
+                unreadable.push(unreadable_parts(name, e));
+                continue;
+            }
+        };
+        let blob = match generate::extract(&params) {
+            Ok(None) => continue,
+            Ok(Some(blob)) => blob,
+            Err(e) => {
                 out.push(Installed::OursUnreadable {
                     name,
-                    reason: format!("marked ours, but its account could not be resolved: {e}"),
+                    reason: e.to_string(),
                 });
                 continue;
             }
-            match query_live(&name) {
-                Ok((state, pid, enabled)) => out.push(Installed::Ours {
-                    spec: blob.spec,
-                    state,
-                    pid,
-                    enabled,
-                }),
-                Err(e) => out.push(Installed::OursUnreadable {
-                    name,
-                    reason: format!("marked ours, but its live status could not be read: {e}"),
-                }),
-            }
+        };
+        // A blob can decode perfectly and still name an account (e.g. a
+        // `user.id` SID) that no longer exists on this host — see
+        // `classify`'s identical check on the `install`/`diff` side.
+        // `list`/`status` must agree with `install` about which ids are
+        // "genuinely ours and readable", or a daemon `list` reports
+        // healthy could refuse the very next `install`.
+        if let Err(e) = identity::resolve(&blob.spec.user) {
+            out.push(Installed::OursUnreadable {
+                name,
+                reason: format!("marked ours, but its account could not be resolved: {e}"),
+            });
+            continue;
         }
-        if unreadable > 0 {
-            eprintln!("warning: {}", unreadable_notice(unreadable));
+        match query_live(&name) {
+            Ok((state, pid, enabled)) => out.push(Installed::Ours {
+                spec: blob.spec,
+                state,
+                pid,
+                enabled,
+            }),
+            Err(e) => out.push(Installed::OursUnreadable {
+                name,
+                reason: format!("marked ours, but its live status could not be read: {e}"),
+            }),
         }
-        Ok(out)
     }
+    out.extend(unreadable_aggregate(unreadable));
+    // A second aggregate, and distinct from the one above: that one stands for services this
+    // pass reached and could not read, this one for services it never reached at all. Both
+    // carry no name, so either alone already forbids concluding any id absent; reporting them
+    // separately is what keeps each one's count honest.
+    out.extend(
+        scan.incomplete
+            .map(|detail| Installed::scan_incomplete(registry::SERVICES_KEY, &detail)),
+    );
+    Ok(out)
 }
 
 // shim support ========================================================================================================
@@ -370,15 +381,25 @@ fn discover(spec: &DaemonSpec) -> Result<Discovery> {
     print_warnings(&warnings);
     let desired = generate::render(&reg);
 
-    let scm = open_scm(ServiceManagerAccess::CONNECT)?;
+    let scm = open_scm_to_classify(spec.id.as_str())?;
     let existing = scm.open_service(spec.id.as_str(), ServiceAccess::QUERY_CONFIG);
     let (found, on_disk, current_start_type) = match existing {
         Err(e) if is_not_found(&e) => (Ownership::Absent, None, None),
-        Err(e) => return Err(to_error(&format!("open service `{}` for discovery", spec.id), e)),
+        // Upstream of the marker, exactly as in `open_existing`: `install` and
+        // `diff` must reach the same verdict about one service as `status`
+        // does, or two subcommands disagree about one machine.
+        Err(e) => {
+            return Err(service_undetermined(
+                spec.id.as_str(),
+                &format!("open service `{}` for discovery", spec.id),
+                &e,
+            ));
+        }
         Ok(service) => {
             let params = registry::read_parameters(spec.id.as_str())?;
             let found = classify(&params);
-            let (live, start_type) = read_live_registration(&service, spec.id.as_str(), &params)?;
+            let (live, start_type) = read_live_registration(&service, spec.id.as_str(), &params)
+                .map_err(|e| drift_read_failure(&found, &spec.id, e))?;
             (found, Some(generate::render(&live)), Some(start_type))
         }
     };
@@ -415,6 +436,34 @@ fn classify(params: &BTreeMap<String, String>) -> Ownership {
             },
         },
         Err(e) => Ownership::OursUnreadable { reason: e.to_string() },
+    }
+}
+
+/// How a failure to read the drift text is classified, given what [`classify`]
+/// has already established about the id.
+///
+/// `discover` reads the live registration for every ownership, but
+/// [`decide::decide`] consults `on_disk` only for [`Ownership::Ours`]:
+/// `Foreign` and `OursUnreadable` are answered from the marker alone. So on the
+/// `Foreign` path this read can only ever *lose* an answer goetia already has,
+/// and [`to_error`] loses it in the worst available way — `Error::Other`
+/// reaches `cli::report::status_error`'s catch-all as `Kind::Unreadable`,
+/// "goetia owns the id but cannot report on it", about an id whose missing
+/// marker just **disproved** exactly that. Not merely a claim goetia has not
+/// established: one it has refuted.
+///
+/// [`Error::Foreign`] instead, which states what *was* established — something
+/// is here, it is not goetia's — and carries the identical remedy
+/// [`Outcome::RefuseForeign`] would have. Same exit code (`1`), same advice,
+/// no invented ownership.
+///
+/// Every other ownership keeps the error unchanged: the marker is present,
+/// decoded or not, so ownership *is* established and `Kind::Unreadable` is a
+/// true statement about the id.
+fn drift_read_failure(found: &Ownership, id: &Id, e: Error) -> Error {
+    match found {
+        Ownership::Foreign => foreign(id),
+        _ => e,
     }
 }
 
@@ -793,6 +842,30 @@ fn open_scm(access: ServiceManagerAccess) -> Result<WinServiceManager> {
     WinServiceManager::local_computer(None::<&str>, access).map_err(|e| to_error("open the Service Control Manager", e))
 }
 
+/// [`open_scm`] for the two callers that are about to *classify* `id`
+/// ([`open_existing`], [`discover`]). A manager that would not open leaves that
+/// id exactly as unclassified as a service object that would not open does, so
+/// it takes the same class — `Error::Other` here would reach
+/// `cli::report::status_error`'s catch-all as `Kind::Unreadable` and claim
+/// goetia owns an id it never got as far as looking at. Every other caller
+/// reaches [`open_scm`] only after ownership is settled, where `Other` is the
+/// true statement.
+///
+/// Deliberately untested, and stated rather than contrived: `SC_MANAGER_CONNECT` is granted to every
+/// token on a working host, and the only way to withhold it is to rewrite the SCM database's own
+/// security descriptor — which stops `services.msc`, the test harness's own `ServiceGuard` cleanup
+/// and every other service operation on the runner, and is not restorable by a `Drop` that may not
+/// run. What is covered instead is the mapping this line performs, in full: the same
+/// [`service_undetermined`] over the same [`service_detail`] text, at
+/// `manager_tests.rs::the_scm_undetermined_recovery_names_both_causes_and_not_uninstall` for both
+/// causes, and end to end against a real denial at
+/// `tests/scm_integration/managed.rs::status_of_a_service_whose_object_denies_querying_is_undetermined`,
+/// which reaches it through [`open_existing`]'s service-object open instead.
+fn open_scm_to_classify(id: &str) -> Result<WinServiceManager> {
+    WinServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|e| service_undetermined(id, "open the Service Control Manager", &e))
+}
+
 fn is_not_found(e: &windows_service::Error) -> bool {
     matches!(
         e,
@@ -800,17 +873,34 @@ fn is_not_found(e: &windows_service::Error) -> bool {
     )
 }
 
+/// Whether `e` is `ERROR_ACCESS_DENIED` — the one thing the error code decides,
+/// and it decides only which of [`undetermined`]'s two `recovery` texts applies.
+fn is_access_denied(e: &windows_service::Error) -> bool {
+    matches!(
+        e,
+        windows_service::Error::Winapi(io) if io.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32)
+    )
+}
+
+/// What a `windows_service` failure was, as facts, with no claim about the id
+/// attached. Shared by [`to_error`] and [`service_undetermined`], so one
+/// failure cannot be described two ways depending on which class it lands in.
+///
 /// `windows_service::Error`'s own `Display` for its `Winapi` variant is the
 /// literal string `"IO error in winapi call"` — it does not include the
 /// wrapped `io::Error`'s message at all (verified: every error surfaced
 /// through `to_error` read that and nothing else, useless for diagnosing an
 /// actual Win32 failure). Unwrap to the inner `io::Error` first, whose
 /// `Display` does carry `FormatMessage`'s real text.
-fn to_error(context: &str, e: windows_service::Error) -> Error {
+fn service_detail(context: &str, e: &windows_service::Error) -> String {
     match e {
-        windows_service::Error::Winapi(io_err) => Error::Other(format!("{context}: {io_err}")),
-        other => Error::Other(format!("{context}: {other}")),
+        windows_service::Error::Winapi(io_err) => format!("{context}: {io_err}"),
+        other => format!("{context}: {other}"),
     }
+}
+
+fn to_error(context: &str, e: windows_service::Error) -> Error {
+    Error::Other(service_detail(context, &e))
 }
 
 fn not_installed(id: &Id) -> Error {
@@ -826,17 +916,73 @@ fn foreign(id: &Id) -> Error {
     }
 }
 
+// undetermined ========================================================================================================
+
+/// This backend's single [`Error::Undetermined`] constructor — the SCM twin of
+/// `backend::systemd::manager::discover::undetermined` and
+/// `backend::launchd::manager::undetermined`, worded to match them, differing
+/// only where the platform names its own privilege boundary.
+///
+/// Neither read that reaches it is a file, and the two are not even the same
+/// kind of object: one is the `Services\<id>\Parameters` registry key
+/// ([`registry::read_parameters`]), the other an SCM service object
+/// ([`open_existing`], [`discover`]). Only the caller knows which, so `reason`
+/// arrives already rendered and this decides the class and the remedy.
+///
+/// [`Error::Undetermined`], never the `Error::Other` [`to_error`] and
+/// `registry`'s own `registry_error` produce: `Other` reaches
+/// `cli::report::status_error`'s catch-all as `Kind::Unreadable`, which
+/// *asserts* that goetia owns the id — the one thing a read that never
+/// completed cannot establish. `HKLM\SYSTEM\CurrentControlSet\Services` holds
+/// every vendor's service, so on this platform that claim is routinely about a
+/// stranger's, and it publishes `uninstall` as the remedy for one.
+///
+/// Every failure but "no such service"/"no such key" lands here, not
+/// `ERROR_ACCESS_DENIED` alone: a hive that will not read leaves goetia exactly
+/// as ignorant of the id as a denial does, so a class chosen by error code
+/// would restore the false ownership claim for the narrower input while the fix
+/// looked complete. What `access_denied` does choose is `recovery` — elevation
+/// is advice only a permission boundary earns, and offering it for a failing
+/// disk sends the reader somewhere useless.
+fn undetermined(id: &str, reason: String, access_denied: bool) -> Error {
+    let recovery = if access_denied {
+        "re-run as Administrator: that read is what tells goetia whether anything is installed at \
+         this id"
+    } else {
+        "resolve that failure and re-run: that read is what tells goetia whether anything is \
+         installed at this id"
+    };
+    Error::Undetermined {
+        id: id.to_string(),
+        reason,
+        recovery: recovery.to_string(),
+    }
+}
+
+/// [`undetermined`] for a service object goetia could not open: [`to_error`]'s
+/// twin, over the same [`service_detail`] text, for the reads that establish
+/// nothing rather than the ones that fail after ownership is known.
+fn service_undetermined(id: &str, context: &str, e: &windows_service::Error) -> Error {
+    undetermined(id, service_detail(context, e), is_access_denied(e))
+}
+
 /// Open `id` with `access`, translating "no such service" into
 /// [`Error::NotInstalled`] rather than a raw Win32 message — every verb but
 /// `install` needs this before it can even ask whether `id` is *ours* (see
 /// [`require_ours`]).
+///
+/// Every other failure is [`undetermined`], because this open is upstream of
+/// the marker: a service object whose DACL denies `QUERY_CONFIG`/`QUERY_STATUS`
+/// is a service whose marker was never read, so neither `NotInstalled`
+/// (absence) nor `Error::Other`'s downstream `Kind::Unreadable` (ownership) is
+/// a claim goetia is entitled to make about it.
 fn open_existing(id: &Id, access: ServiceAccess) -> Result<(WinServiceManager, Service)> {
-    let scm = open_scm(ServiceManagerAccess::CONNECT)?;
+    let scm = open_scm_to_classify(id.as_str())?;
     let service = scm.open_service(id.as_str(), access).map_err(|e| {
         if is_not_found(&e) {
             not_installed(id)
         } else {
-            to_error(&format!("open service `{id}`"), e)
+            service_undetermined(id.as_str(), &format!("open service `{id}`"), &e)
         }
     })?;
     Ok((scm, service))
@@ -926,17 +1072,134 @@ fn set_start_type(service: &Service, start_type: ServiceStartType) -> std::io::R
 #[path = "manager_tests.rs"]
 mod manager_tests;
 
-/// One line, not one per service.
+/// The `list` entry standing for every service goetia could not classify, and
+/// `None` when there were none — an ordinary listing must carry nothing under
+/// the third key rather than exit `4` forever.
 ///
-/// Most services on a Windows box carry an ACL that denies a non-elevated read
-/// of their `Parameters`, so warning per service buries `goetia daemon list` in
-/// noise about services that were never ours. Staying silent would be the
-/// opposite lie: a denied read means ownership is *unknown*, so one of ours
-/// could be missing from the listing.
+/// **One entry, not one per service.** Most services on a Windows box carry an
+/// ACL that denies a non-elevated read of their `Parameters`, so an entry each
+/// would bury `goetia daemon list` under hundreds of them, about services that
+/// were never goetia's. Nor is there a sound pre-filter: a `type: managed`
+/// service's `ImagePath` is the user's own binary, so the marker under
+/// `Parameters` is the only thing that tells goetia's apart — and it is the
+/// unread thing. Aggregating belongs in the backend because only the backend
+/// knows the denominator.
+///
+/// **A single name is still carried.** Dropping the name is what one entry
+/// standing for hundreds costs; it costs nothing when the entry stands for one,
+/// and [`Installed::Undetermined`] states the invariant directly — *an entry for
+/// exactly one known id always names it*. The difference is not cosmetic. A
+/// null name forbids every negative conclusion about **every** id on the host,
+/// so one Defender-protected `Parameters` key would make
+/// `goetia daemon show <anything-not-installed>` answer "could not be
+/// determined" (exit `4`) instead of "not installed" (exit `1`), permanently,
+/// for ids that have nothing to do with it. Naming the one service it stands
+/// for confines that to the one id it is actually true of. Its cause travels with it, and so does
+/// the remedy that cause earned, for the same reason and at the same cost — see
+/// [`named_unreadable_notice`].
+fn unreadable_aggregate(unreadable: Vec<Unreadable>) -> Option<Installed> {
+    let mut unreadable = unreadable.into_iter();
+    let (first, count) = (unreadable.next()?, 1 + unreadable.count());
+    // Exactly one, so the entry can be about it rather than about the host — and so must its text.
+    // The name and the reason are one report: an entry that names its service and then says a
+    // daemon may be missing from the list contradicts itself in a single rendered line.
+    Some(match count {
+        1 => {
+            let reason = named_unreadable_notice(&first.detail, first.recovery.as_deref());
+            Installed::Undetermined {
+                name: Some(first.name),
+                reason,
+            }
+        }
+        _ => Installed::Undetermined {
+            name: None,
+            reason: unreadable_notice(count),
+        },
+    })
+}
+
+/// One service `list` reached and could not read, kept whole because
+/// [`unreadable_aggregate`] cannot recover any of it afterwards: a count knows
+/// neither the name, nor the cause, nor which remedy that cause earned.
+struct Unreadable {
+    name: String,
+    /// [`registry::read_parameters`]'s own rendering of what failed: the key,
+    /// the operation and the OS error.
+    detail: String,
+    /// The remedy [`undetermined`] chose from that failure's errno, or `None`
+    /// for one that arrived without a conditioned remedy to carry.
+    recovery: Option<String>,
+}
+
+/// Split the failure [`registry::read_parameters`] returned into the parts an entry standing for
+/// that one read can carry, dropping only the variant's `id` — which `cli::support` renders itself,
+/// from the name, before this text.
+///
+/// The remedy travels for the reason the cause does: at a count of one this entry and
+/// `status <same-id>` report the same single failed read, so answering it twice, differently, would
+/// put two answers on one condition. `read_parameters` builds every failure it has through
+/// `registry_undetermined`, so the first arm is the whole story; the second exists because the
+/// `Result` type does not say so, and has no conditioned remedy to offer rather than a default one.
+fn unreadable_parts(name: String, e: Error) -> Unreadable {
+    match e {
+        Error::Undetermined { reason, recovery, .. } => Unreadable {
+            name,
+            detail: reason,
+            recovery: Some(recovery),
+        },
+        other => Unreadable {
+            name,
+            detail: other.to_string(),
+            recovery: None,
+        },
+    }
+}
+
+/// The text an entry that *names* its one service carries, rendered by `cli::support` after that
+/// name: `warning: MsSecFlt: installation state could not be determined: <this>`.
+///
+/// `detail` is [`registry::read_parameters`]'s own rendering of what failed, carried through rather
+/// than replaced by a static sentence: it names the key, the operation and the Win32 error, which is
+/// the only part of this that can distinguish a denied read from a corrupt hive. A count of more
+/// than one has a reason to drop it ([`unreadable_notice`] — hundreds of causes, one entry); a count
+/// of one has none.
+///
+/// Nothing here is missing from the list, and saying so is the whole difference the name makes —
+/// what is unknown is whether the service goetia just named is one of its own.
+///
+/// `recovery` is [`undetermined`]'s own choice, carried rather than re-worded: that function
+/// conditions the remedy on whether the failure was a denial precisely because "elevation is advice
+/// only a permission boundary earns", and an entry standing for one read has the same errno in hand
+/// that `status` does. Offering elevation unconditionally here told an already-elevated host to
+/// re-run elevated over a corrupt hive, while `status <same-id>` told it to fix the hive.
+/// [`unreadable_notice`]'s hedge is reasoning about a *count* — hundreds of causes, one entry — and
+/// does not reach a count of one.
+fn named_unreadable_notice(detail: &str, recovery: Option<&str>) -> String {
+    match recovery {
+        Some(recovery) => {
+            format!("{detail} — so whether this service is one of goetia's is unknown; {recovery}.")
+        }
+        None => format!("{detail} — so whether this service is one of goetia's is unknown."),
+    }
+}
+
+/// The text [`unreadable_aggregate`]'s *unnamed* entry carries: how many
+/// services could not be inspected, that ownership is therefore *unknown*,
+/// and the remedy. An entry standing for exactly one names it and carries
+/// [`named_unreadable_notice`] instead, so nothing here has to hold for a
+/// count of one.
+///
+/// It deliberately does **not** say *why* the read failed. `list` counts
+/// every non-`NotFound` failure here, and access denial is only the common
+/// one — a corrupt hive or an `ERROR_IO_DEVICE` lands in the same count.
+/// Naming denial as the cause would assert something this never
+/// established and hand over a remedy that cannot work for the others,
+/// which is exactly what the per-id path avoids by carrying two separate
+/// recoveries. Elevation is offered as the usual remedy, not as the
+/// diagnosis.
 fn unreadable_notice(count: usize) -> String {
-    let s = if count == 1 { "" } else { "s" };
+    debug_assert!(count > 1, "one service is named, not counted: see unreadable_aggregate");
     format!(
-        "{count} service{s} could not be inspected (access denied reading registry Parameters). Ownership is unknown for {}, so a Goetia daemon may be missing from this list; re-run elevated.",
-        if count == 1 { "it" } else { "them" }
+        "{count} services could not be inspected (their registry Parameters could not be read). Ownership is unknown for them, so a Goetia daemon may be missing from this list; on an unelevated run, re-running elevated is the usual remedy."
     )
 }

@@ -323,3 +323,109 @@ fn quarantine_used_by_uninstall_reports_a_race_instead_of_removing_the_wrong_fil
     let on_disk = std::fs::read_to_string(&path).expect("read back");
     assert_eq!(on_disk, changed_text, "the changed fragment must survive untouched");
 }
+
+// Enumeration: a scan that did not finish =============================================================================
+
+/// The mid-pass fault, and the reason `list` no longer propagates one: a dirent that could not be
+/// read must not take down the ids the very same pass already named. Injected through
+/// `collect_units`' iterator because no real `readdir` fails on request.
+#[skuld::test]
+fn a_dirent_that_cannot_be_read_keeps_what_the_scan_already_named() {
+    let dir = Path::new(UNIT_DIR);
+    let entries = vec![
+        Ok(dir.join("named-before-the-fault.service")),
+        Err(io::Error::other("injected mid-scan failure")),
+        Ok(dir.join("never-reached.service")),
+    ];
+
+    let scan = collect_units(dir, entries.into_iter());
+
+    assert_eq!(
+        scan.units.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        ["named-before-the-fault"],
+        "what the pass named before the fault survives it, and the pass stops there: {scan:?}"
+    );
+    match &scan.incomplete {
+        Some(Installed::Undetermined { name, reason }) => {
+            assert_eq!(*name, None, "the pass cannot name what it never reached");
+            assert!(reason.contains("injected mid-scan failure"), "{reason}");
+            assert!(
+                reason.contains(UNIT_DIR),
+                "the reason must name what was being scanned: {reason}"
+            );
+        }
+        other => panic!("a pass that stopped early must say so: {other:?}"),
+    }
+}
+
+/// The same fault one syscall earlier. An `Err` here reaches the CLI as `Kind::Unavailable` — exit
+/// `1` over an empty document, which is `list` reporting a populated host as having nothing on it.
+#[skuld::test]
+fn a_unit_directory_that_cannot_be_opened_is_reported_not_propagated() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let blocking_file = tmp.path().join("not-a-directory");
+    std::fs::write(&blocking_file, "").expect("write the blocking file");
+    // `ENOTDIR`: not `NotFound`, and identical for root and everyone else — which is what makes it
+    // the right probe in a binary CI runs elevated.
+    let dir = blocking_file.join("system");
+
+    let scan = scan_unit_dir(&dir);
+
+    assert!(scan.units.is_empty(), "nothing was enumerated: {scan:?}");
+    assert!(
+        matches!(&scan.incomplete, Some(Installed::Undetermined { name: None, .. })),
+        "{scan:?}"
+    );
+}
+
+/// The case that is deliberately *not* this one: an absent unit directory establishes that nothing
+/// is installed. A determinate answer is reported as one — an empty listing on exit `0`, never an
+/// `Err` that renders as "goetia could not answer".
+#[skuld::test]
+fn an_absent_unit_directory_is_an_empty_listing_not_a_failure() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let scan = scan_unit_dir(&tmp.path().join("nowhere"));
+
+    assert!(scan.units.is_empty(), "{scan:?}");
+    assert!(
+        scan.incomplete.is_none(),
+        "an absent directory answers the question rather than leaving it open: {scan:?}"
+    );
+}
+
+#[skuld::test]
+fn a_pass_that_finishes_names_every_fragment_and_drop_in_and_nothing_else() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("kept.service"), "").expect("write the fragment");
+    std::fs::write(tmp.path().join("ignored.conf"), "").expect("write the non-fragment");
+    std::fs::create_dir(tmp.path().join("kept.service.d")).expect("create the drop-in directory");
+
+    let scan = scan_unit_dir(tmp.path());
+
+    assert_eq!(
+        scan.units.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        ["kept"],
+        "{scan:?}"
+    );
+    assert_eq!(scan.dropins, ["kept"], "{scan:?}");
+    assert!(
+        scan.incomplete.is_none(),
+        "a pass that finished has nothing to report: {scan:?}"
+    );
+}
+
+/// The name is what the pass reports, and nothing about it is stat'd: a *regular file* named
+/// `<id>.service.d` is the shape `read_dir` answers `ENOTDIR` for under every uid, root's included,
+/// and it is precisely the id `list` used to drop. A pass that classified the name by type would
+/// leave it out again at exactly the privilege level where the state is real.
+#[skuld::test]
+fn a_drop_in_name_that_is_not_a_directory_still_names_its_id() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("blocked.service.d"), "").expect("write the blocking file");
+
+    let scan = scan_unit_dir(tmp.path());
+
+    assert!(scan.units.is_empty(), "there is no fragment here: {scan:?}");
+    assert_eq!(scan.dropins, ["blocked"], "{scan:?}");
+}

@@ -132,9 +132,11 @@ pub fn run(
             // nothing was attempted and nothing refused — a read
             // `preview_install` needed in order to answer failed, so the
             // question stands unanswered. `1` would claim an operation ran
-            // and failed. `install` keeps this at `1` on purpose: there the
-            // operation is the install, and it genuinely did not happen —
-            // the same row the two verbs already disagree on.
+            // and failed. `install` returns `4` here too, through its own
+            // `failure_code`: the two verbs agree about *this* error and
+            // disagree only about `Outcome::RefuseUnreadable`, where
+            // `install` genuinely did fail to install. See `dispatch`'s doc
+            // comment, which owns the vocabulary.
             Err(e @ Error::Undetermined { .. }) => {
                 let _ = writeln!(err, "error: {}: {e}", spec.id);
                 codes.push(4);
