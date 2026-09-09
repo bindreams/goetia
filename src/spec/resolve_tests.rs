@@ -1229,6 +1229,36 @@ fn resolve_yaml_as(native: Backend, yaml: &str) -> Result<(Vec<DaemonSpec>, Vec<
 }
 
 #[skuld::test]
+fn a_templated_user_is_judged_under_the_native_backend_and_nowhere_else() {
+    // `spec::backend`'s module doc, made executable. Substitution runs for
+    // the native backend only, so `${ACCT}` is unresolvable — and therefore
+    // unchecked — under the other two, while the native one is substituted
+    // in step 5 and judged there. Whichever backend is native, both halves
+    // of the sentence are asserted on this host.
+    //
+    // Only the two POSIX backends can be named native here: `Scm.error`
+    // rejects a numeric uid, and `user.id` refuses substitution outright
+    // (`interpolate::substitute_user`), so no templated value can ever
+    // reach it.
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      systemd:\n        \
+                user: ${ACCT}\n      launchd:\n        user: ${ACCT}\n";
+    let dir = fixture_dir(yaml, Some("ACCT=NT AUTHORITY\\SYSTEM\n"));
+
+    for native in [Backend::Systemd, Backend::Launchd] {
+        let err = resolve_as(parse_manifest(yaml), dir.path(), Some(native)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Windows built-in"), "native `{native}`: {msg}");
+        assert!(msg.contains(&format!("backend-specific.{native}")), "native `{native}`: {msg}");
+    }
+
+    // The other direction, and the one the doc used to get backwards: with
+    // `scm` native, neither `${ACCT}` is substituted, so neither is judged
+    // — and `.env` is not read at all.
+    resolve_as(parse_manifest(yaml), dir.path(), Some(Backend::Scm))
+        .expect("a template under a non-native backend is unresolvable, and so unchecked");
+}
+
+#[skuld::test]
 fn a_native_backend_verdict_names_the_override_that_caused_it() {
     // Not `.env`: step 4 skips the native backend, so step 5 is the first
     // pass to apply a per-backend rule to the native spec — there is no

@@ -24,8 +24,12 @@
 //! `backend-specific:` block at all. Both are computed on uninterpolated
 //! text for a non-native backend, so `scm: {user: {id: 1000}}` is caught
 //! from any host — a uid is never a substituted string — while
-//! `systemd: {user: "${ACCT}"}` is not checkable from Linux: goetia does
-//! not claim to check what it cannot resolve.
+//! `scm: {user: "${ACCT}"}` is not checkable from Linux: substitution runs
+//! for the native backend only, and goetia does not claim to check what it
+//! cannot resolve. The native backend's own override is the exception, and
+//! the reason the example above names `scm` rather than `systemd`: on Linux
+//! `systemd: {user: "${ACCT}"}` *is* substituted, in step 5, and *is*
+//! checked.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

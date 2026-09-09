@@ -740,8 +740,10 @@ fn resolve_path_string(
             // base template warns once, from the native pass, quoting the
             // substituted spelling; an `scm:`-only literal warns once, from
             // the native pass; a `systemd:`-only template warns zero times
-            // — unavailable, not wrong, the same line as `systemd: {user:
-            // "${ACCT}"}`.
+            // — unavailable, not wrong. All four are Windows-native cases,
+            // where `systemd` is a backend nothing substitutes for: the
+            // same line as a non-native `{user: "${ACCT}"}` override, in
+            // `spec::backend`'s module doc.
             let should_warn = match phase {
                 Phase::Substituted => true,
                 Phase::Authored => !interpolate::would_substitution_change(raw),
