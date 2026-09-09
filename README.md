@@ -69,9 +69,22 @@ name against the bundle's subjects. Renaming one verified archive to another
 archive's filename (e.g. `goetia-aarch64-apple-darwin.tar.xz` renamed to
 `goetia-x86_64-unknown-linux-musl.tar.xz`) still verifies successfully. If
 that distinction matters to you, also confirm the archive's top-level
-directory matches its filename, for example with `tar tf
-goetia-x86_64-unknown-linux-musl.tar.xz | head -1` (or `unzip -l` for the
-`.zip`), and check it reads `goetia-x86_64-unknown-linux-musl/`.
+directory matches its filename:
+
+```
+tar tf goetia-x86_64-unknown-linux-musl.tar.xz | head -1
+unzip -Z1 goetia-x86_64-pc-windows-msvc.zip | head -1
+```
+
+Each prints a path that must start with `goetia-<target>/` for the target
+the filename claims — either that directory entry on its own
+(`goetia-x86_64-pc-windows-msvc/`) or the first file inside it
+(`goetia-x86_64-pc-windows-msvc/goetia.exe`), depending on how the archive
+was written, so check the prefix rather than an exact match.
+
+Use `unzip -Z1`, not `unzip -l`: `-l` starts with a banner reading
+`Archive:  <filename>`, which echoes back the name you typed. That name is
+the untrusted claim being checked, so a check that reads it proves nothing.
 
 ## Interpolation
 
