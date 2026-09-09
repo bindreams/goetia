@@ -1333,7 +1333,15 @@ assert_checksums_ok "accepts a SHA256SUMS covering exactly the archives" "$sums_
 # The reproduction from the review: `sha256sum -c --strict` passes on this
 # file, having checked one archive out of five.
 sums_dir="$(make_sums_fixture truncated)"
-(cd "$sums_dir" && sha256sum "${sums_archives[@]}" | head -1 > SHA256SUMS)
+# Written in full and then truncated, rather than `sha256sum ... | head -1`.
+# `head` closes the pipe after one line, so `sha256sum` takes SIGPIPE writing
+# the second — which `pipefail` turns into a failure of the whole test script.
+# Whether it loses that race depends on how fast the hashes are produced, so
+# it passes on a small fixture locally and fails on a CI runner. Measured:
+# `sha256sum f*.bin | head -1` over five 2 MiB files exits 141.
+(cd "$sums_dir" && sha256sum "${sums_archives[@]}" > SHA256SUMS.full \
+    && head -1 SHA256SUMS.full > SHA256SUMS \
+    && rm -f SHA256SUMS.full)
 assert_checksums_rejects_matching "rejects a SHA256SUMS that lists only some of the archives" \
     "$sums_dir" "does not name" SHA256SUMS "${sums_archives[@]}"
 
