@@ -28,11 +28,11 @@
 # success on every run, including failed ones.
 set -euo pipefail
 
-# The verifier is resolved through `SIGSTORE_BIN` so the test suite can point
+# The verifier is resolved through `GOETIA_SIGSTORE` so the test suite can point
 # it at a stub. PATH is not a reliable hook for this one: `uv tool install
 # sigstore` puts the real binary in `~/.local/bin`, which shell profiles
 # prepend, so a stub directory prepended by the caller can silently lose.
-sigstore_bin="${SIGSTORE_BIN:-sigstore}"
+sigstore_bin="${GOETIA_SIGSTORE:-sigstore}"
 
 cert_identity="https://github.com/bindreams/goetia/.github/workflows/draft-release.yaml@refs/heads/main"
 repository="bindreams/goetia"

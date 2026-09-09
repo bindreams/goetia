@@ -210,53 +210,30 @@ jobs:
           "${GITHUB_WORKSPACE}/.github/scripts/verify-sigstore-bundle.sh" \
             goetia.sigstore.json "$SHA" goetia-*.tar.xz goetia-*.zip
 
-      # This is what makes the crates.io publish below idempotent, which is
-      # what makes this whole job re-runnable. A second `cargo publish` of an
-      # existing version fails, and relying on that failure being benign
-      # would mean parsing cargo's message to decide whether a red run is
-      # really red. Ask first instead.
-      #
-      # A yanked version also answers HTTP 200 here (measured: crates.io's
-      # own `time` crate has yanked versions that 200 with
-      # `.version.yanked == true`), and yanking is something ONLY a human
-      # does — this pipeline never yanks. A 200 therefore does not mean "my
-      # own prior run of this job already published it"; it could equally
-      # mean someone published this version by hand, or a yanked slot from
-      # an unrelated attempt occupies it. Treating a yanked version as an
-      # ordinary already-published skip would silently proceed to flip the
-      # GitHub release for a crates.io artifact this pipeline never built or
-      # verified, so that case fails loudly instead.
+      # Packaged here, before the crates.io check, because the check needs
+      # it: an existing version on crates.io is only this pipeline's own
+      # prior run if what is published is byte-identical to what this commit
+      # packages, and `.crate`'s sha256 is what crates.io publishes as
+      # `.version.checksum`. `cargo publish` below packages again itself;
+      # this run of it also proves the crate builds before anything
+      # irreversible happens.
+      - name: Package the crate
+        shell: bash
+        run: cargo package --locked
+
+      # Decides whether the irreversible publish below runs at all. Every
+      # branch of that decision — and the reasoning for treating a
+      # non-yanked 200 as something to prove rather than assume — lives in
+      # the script, with stub-driven coverage in release-script-tests.sh.
       - name: Check crates.io for an existing version
         id: crates_check
         env:
           VERSION: ${{ steps.version.outputs.version }}
-          # crates.io answers 403 to a request with no User-Agent.
-          CRATES_UA: "goetia-release-pipeline (https://github.com/bindreams/goetia)"
         shell: bash
         run: |
           set -euo pipefail
-          response="$(curl -sL -A "$CRATES_UA" -w '\n%{http_code}' \
-            "https://crates.io/api/v1/crates/goetia/${VERSION}")"
-          code="${response##*$'\n'}"
-          body="${response%$'\n'*}"
-          case "$code" in
-            200)
-              yanked="$(jq -r '.version.yanked' <<<"$body")"
-              if [ "$yanked" = "true" ]; then
-                echo "::error::Version ${VERSION} exists on crates.io but is YANKED. This pipeline never yanks, so this was not its own prior run — investigate by hand before re-dispatching."
-                exit 1
-              fi
-              echo "already_published=true" >> "$GITHUB_OUTPUT"
-              echo "Version ${VERSION} is already on crates.io (not yanked); skipping publish."
-              ;;
-            404)
-              echo "already_published=false" >> "$GITHUB_OUTPUT"
-              ;;
-            *)
-              echo "::error::Unexpected HTTP $code from the crates.io API; cannot confirm whether ${VERSION} is already published."
-              exit 1
-              ;;
-          esac
+          .github/scripts/check-crates-io-version.sh \
+            goetia "$VERSION" "target/package/goetia-${VERSION}.crate" >> "$GITHUB_OUTPUT"
 
       # THE POINT OF NO RETURN. A version can be yanked but never
       # unpublished, and the crate name can never be released. This runs

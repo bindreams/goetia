@@ -11,6 +11,7 @@ assert_test_binaries="${script_dir}/assert-test-binaries.sh"
 verify_sigstore="${script_dir}/verify-sigstore-bundle.sh"
 assert_commit_on_main="${script_dir}/assert-commit-on-main.sh"
 assert_checksums="${script_dir}/assert-checksums.sh"
+check_crates="${script_dir}/check-crates-io-version.sh"
 failures=0
 
 # Asserts BOTH stdout and exit status. Checking stdout alone would pass a
@@ -74,7 +75,8 @@ asset_count_root="$(mktemp -d)"
 test_binaries_root="$(mktemp -d)"
 sigstore_root="$(mktemp -d)"
 checksums_root="$(mktemp -d)"
-trap 'rm -rf "$stub_dir" "$archive_root" "$pkg_list_root" "$asset_count_root" "$test_binaries_root" "$sigstore_root" "$checksums_root"' EXIT
+crates_root="$(mktemp -d)"
+trap 'rm -rf "$stub_dir" "$archive_root" "$pkg_list_root" "$asset_count_root" "$test_binaries_root" "$sigstore_root" "$checksums_root" "$crates_root"' EXIT
 
 make_git_stub() {
     local exit_code="$1" expected_ref="$2"
@@ -916,6 +918,141 @@ else
     echo "ok   - rejects being called with no arguments at all"
 fi
 
+# check-crates-io-version.sh -------------------------------------------------
+#
+# Guards the point of no return, so every branch of it is exercised here: a
+# 404, a 200 for a yanked version, a 200 whose published bytes are this
+# commit's, a 200 whose bytes are somebody else's, an unexpected status, and
+# the API call itself failing.
+#
+# `curl` is reached through GOETIA_CURL rather than PATH so a stub cannot
+# lose to a real curl on the host and quietly turn these into live requests
+# against crates.io.
+
+crate_file="${crates_root}/goetia-0.1.0.crate"
+printf 'the crate this commit packages\n' > "$crate_file"
+crate_file_sha="$(sha256sum "$crate_file" | cut -d' ' -f1)"
+other_sha="0000000000000000000000000000000000000000000000000000000000000000"
+crates_invocations="${crates_root}/curl.invocations"
+
+# make_curl_stub <exit-code> <http-code> <body>
+make_curl_stub() {
+    local exit_code="$1" http_code="$2" body="$3"
+    cat > "${stub_dir}/curl" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "${crates_invocations}"
+if [[ ${exit_code} -ne 0 ]]; then
+    exit ${exit_code}
+fi
+printf '%s\n%s' '${body}' '${http_code}'
+EOF
+    chmod +x "${stub_dir}/curl"
+    : > "$crates_invocations"
+}
+
+# run_crates_check <curl-exit> <http-code> <body> [crate-file]
+run_crates_check() {
+    local curl_exit="$1" http_code="$2" body="$3" file="${4-$crate_file}"
+    make_curl_stub "$curl_exit" "$http_code" "$body"
+    crates_status=0
+    crates_stdout="$(GOETIA_CURL="${stub_dir}/curl" bash "$check_crates" goetia 0.1.0 "$file" 2>"${crates_root}/stderr")" \
+        || crates_status=$?
+    crates_stderr="$(cat "${crates_root}/stderr")"
+}
+
+assert_crates_decision() {
+    local description="$1" curl_exit="$2" http_code="$3" body="$4" expected="$5"
+    run_crates_check "$curl_exit" "$http_code" "$body"
+    if [[ "$crates_status" -ne 0 ]]; then
+        echo "FAIL - ${description} (expected success, got status ${crates_status}: ${crates_stderr})"
+        failures=$((failures + 1))
+    elif [[ "$crates_stdout" == "$expected" ]]; then
+        echo "ok   - ${description}"
+    else
+        echo "FAIL - ${description} (expected stdout '${expected}', got '${crates_stdout}')"
+        failures=$((failures + 1))
+    fi
+}
+
+assert_crates_rejects_matching() {
+    local description="$1" curl_exit="$2" http_code="$3" body="$4" message="$5" file="${6-$crate_file}"
+    run_crates_check "$curl_exit" "$http_code" "$body" "$file"
+    if [[ "$crates_status" -eq 0 ]]; then
+        echo "FAIL - ${description} (expected rejection, got success: ${crates_stdout})"
+        failures=$((failures + 1))
+    elif [[ "$crates_stderr" == *"$message"* ]]; then
+        echo "ok   - ${description}"
+    else
+        echo "FAIL - ${description} (expected message containing '${message}', got: ${crates_stderr})"
+        failures=$((failures + 1))
+    fi
+}
+
+assert_crates_decision "reports an unpublished version as not published" 0 404 '{"errors":[]}' \
+    "already_published=false"
+
+assert_crates_decision "skips the publish when the published crate is byte-identical" 0 200 \
+    "{\"version\":{\"yanked\":false,\"checksum\":\"${crate_file_sha}\"}}" \
+    "already_published=true"
+
+# The reproduction from the review: a version published from a different
+# commit answers 200/not-yanked exactly like this pipeline's own prior run
+# would. Skipping on that alone leaves crates.io on one commit and the
+# immutable GitHub release on another, permanently.
+assert_crates_rejects_matching "refuses a published version whose bytes are not this commit's" 0 200 \
+    "{\"version\":{\"yanked\":false,\"checksum\":\"${other_sha}\"}}" \
+    "does not match"
+
+assert_crates_rejects_matching "refuses a yanked version" 0 200 \
+    '{"version":{"yanked":true,"checksum":"'"${crate_file_sha}"'"}}' \
+    "YANKED"
+
+assert_crates_rejects_matching "refuses a response with no yanked field" 0 200 \
+    '{"version":{"checksum":"'"${crate_file_sha}"'"}}' \
+    "yanked"
+
+assert_crates_rejects_matching "refuses a response with no checksum" 0 200 \
+    '{"version":{"yanked":false}}' \
+    "checksum"
+
+assert_crates_rejects_matching "refuses an unexpected HTTP status" 0 500 '{}' \
+    "Unexpected HTTP 500"
+
+assert_crates_rejects_matching "refuses when the API call itself fails" 7 200 '{}' \
+    "crates.io API request failed"
+
+assert_crates_rejects_matching "refuses when the packaged crate is missing" 0 200 \
+    "{\"version\":{\"yanked\":false,\"checksum\":\"${crate_file_sha}\"}}" \
+    "packaged crate not found" "${crates_root}/absent.crate"
+
+# The version in the URL is what makes the answer relevant; a script that
+# asked about the wrong one would decide the publish on another release's
+# state.
+run_crates_check 0 404 '{}'
+if [[ "$(cat "$crates_invocations")" == *"https://crates.io/api/v1/crates/goetia/0.1.0"* ]]; then
+    echo "ok   - asks crates.io about the crate and version it was given"
+else
+    echo "FAIL - asks crates.io about the crate and version it was given (invoked as: $(cat "$crates_invocations"))"
+    failures=$((failures + 1))
+fi
+
+# crates.io answers 403 to a request with no User-Agent.
+if [[ "$(cat "$crates_invocations")" == *"goetia-release-pipeline"* ]]; then
+    echo "ok   - identifies itself with a User-Agent"
+else
+    echo "FAIL - identifies itself with a User-Agent (invoked as: $(cat "$crates_invocations"))"
+    failures=$((failures + 1))
+fi
+
+if bash "$check_crates" >/dev/null 2>&1; then
+    echo "FAIL - rejects being called with no arguments at all (expected rejection, got success)"
+    failures=$((failures + 1))
+else
+    echo "ok   - rejects being called with no arguments at all"
+fi
+
+rm -f "${stub_dir}/curl"
+
 # assert-checksums.sh --------------------------------------------------------
 #
 # `sha256sum -c --strict` only ever checks the lines the file happens to
@@ -1040,7 +1177,7 @@ fi
 
 # verify-sigstore-bundle.sh --------------------------------------------------
 #
-# Driven against a stub `sigstore`, passed via `SIGSTORE_BIN`, that records
+# Driven against a stub `sigstore`, passed via `GOETIA_SIGSTORE`, that records
 # every invocation and can be told to fail for a chosen archive. The pins the real command is given are
 # the whole point of this script, so the tests assert the recorded argv, not
 # just the exit status: a verification that dropped `--sha` still exits 0 on
@@ -1083,7 +1220,7 @@ run_verify_sigstore() {
     shift
     make_sigstore_stub "$failing"
     sigstore_status=0
-    sigstore_output="$(SIGSTORE_BIN="${stub_dir}/sigstore" bash "$verify_sigstore" "$@" 2>&1)" || sigstore_status=$?
+    sigstore_output="$(GOETIA_SIGSTORE="${stub_dir}/sigstore" bash "$verify_sigstore" "$@" 2>&1)" || sigstore_status=$?
 }
 
 assert_verify_sigstore_ok() {
