@@ -1370,6 +1370,16 @@ printf 'bytes\n' > "${sums_dir}/goetia release.tar.xz"
 assert_checksums_ok "accepts an archive name containing a space" "$sums_dir" \
     SHA256SUMS "${sums_archives[@]}" "goetia release.tar.xz"
 
+# A final line with no trailing newline still has to be read: a naive
+# read-loop drops it, and an extra entry hidden there would slip past the
+# coverage check while `sha256sum -c` happily verified it.
+sums_dir="$(make_sums_fixture unterminated)"
+(cd "$sums_dir" && sha256sum "${sums_archives[@]}" > SHA256SUMS)
+printf 'installer\n' > "${sums_dir}/install.sh"
+(cd "$sums_dir" && sha256sum install.sh | tr -d '\n' >> SHA256SUMS)
+assert_checksums_rejects_matching "rejects an unterminated extra line" \
+    "$sums_dir" "install.sh" SHA256SUMS "${sums_archives[@]}"
+
 sums_dir="$(make_sums_fixture missing_file)"
 assert_checksums_rejects_matching "rejects a SHA256SUMS file that does not exist" \
     "$sums_dir" "not found" SHA256SUMS "${sums_archives[@]}"

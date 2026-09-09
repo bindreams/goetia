@@ -33,8 +33,12 @@ fi
 # word. A leading backslash is sha256sum's escaping marker for a name
 # containing a backslash or a newline; nothing in a release is named that,
 # and guessing at the unescaping would be worse than refusing.
+#
+# `|| [[ -n "$line" ]]` keeps the last line when the file does not end in a
+# newline: `read` returns non-zero there, and dropping that line would hide
+# whatever it names from the coverage check below.
 listed=()
-while IFS= read -r line; do
+while IFS= read -r line || [[ -n "$line" ]]; do
     if [[ ! "$line" =~ ^[0-9a-f]{64}\ [\ *] ]]; then
         echo "::error::${sums}: unparseable line: ${line}" >&2
         exit 1
