@@ -1254,9 +1254,7 @@ fn a_native_backend_verdict_names_the_override_that_caused_it() {
 
 #[skuld::test]
 fn resolve_applies_the_native_backends_override() {
-    let Some(native) = Backend::native() else {
-        return; // No native backend on this host: nothing to assert.
-    };
+    let native = Backend::native().expect("native() is Some on every CI platform");
     let yaml = format!(
         "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user: root\n    backend-specific:\n      {native}:\n        \
          user: bindreams\n"
@@ -1292,9 +1290,7 @@ fn an_invalid_non_native_override_fails_the_whole_manifest() {
 
 #[skuld::test]
 fn an_invalid_native_override_fails_the_whole_manifest() {
-    let Some(native) = Backend::native() else {
-        return;
-    };
+    let native = Backend::native().expect("native() is Some on every CI platform");
     // The pass whose spec is actually installed, and the one whose failure
     // has a production consequence.
     let yaml = format!(
@@ -1317,17 +1313,16 @@ fn an_override_error_names_the_backend_that_caused_it() {
         "non-native: {err}"
     );
 
-    if let Some(native) = Backend::native() {
-        let yaml = format!(
-            "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      {native}:\n        \
-             user: \"evil\\nUser=0\"\n"
-        );
-        let err = resolve_yaml(&yaml).unwrap_err();
-        assert!(
-            err.to_string().contains(&format!("backend-specific.{native}")),
-            "native: {err}"
-        );
-    }
+    let native = Backend::native().expect("native() is Some on every CI platform");
+    let yaml = format!(
+        "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      {native}:\n        \
+         user: \"evil\\nUser=0\"\n"
+    );
+    let err = resolve_yaml(&yaml).unwrap_err();
+    assert!(
+        err.to_string().contains(&format!("backend-specific.{native}")),
+        "native: {err}"
+    );
 }
 
 #[skuld::test]
@@ -1491,9 +1486,7 @@ fn an_override_on_every_backend_resolves() {
 
 #[skuld::test]
 fn a_command_only_under_the_native_backend_installs() {
-    let Some(native) = Backend::native() else {
-        return;
-    };
+    let native = Backend::native().expect("native() is Some on every CI platform");
     let yaml = format!("daemons:\n  frpc:\n    backend-specific:\n      {native}:\n        command: [/bin/frpc]\n");
     let (specs, _warnings) = resolve_yaml(&yaml).expect("resolves");
     assert!(!specs[0].command.is_empty());
@@ -1501,9 +1494,7 @@ fn a_command_only_under_the_native_backend_installs() {
 
 #[skuld::test]
 fn a_command_missing_for_the_native_backend_is_an_error() {
-    let Some(native) = Backend::native() else {
-        return;
-    };
+    let native = Backend::native().expect("native() is Some on every CI platform");
     let yaml = "daemons:\n  frpc:\n    name: frpc\n";
     let err = resolve_yaml(yaml).unwrap_err();
     let msg = err.to_string();
@@ -1517,9 +1508,7 @@ fn a_command_missing_for_the_native_backend_is_an_error() {
 
 #[skuld::test]
 fn a_command_missing_for_a_non_native_backend_resolves() {
-    let Some(native) = Backend::native() else {
-        return;
-    };
+    let native = Backend::native().expect("native() is Some on every CI platform");
     // A command present only for the native backend: completeness is
     // per-install, not per-backend, and a Windows-less manifest is usable
     // on Linux.
@@ -1529,9 +1518,7 @@ fn a_command_missing_for_a_non_native_backend_resolves() {
 
 #[skuld::test]
 fn an_empty_command_is_rejected_like_a_missing_one() {
-    let Some(native) = Backend::native() else {
-        return;
-    };
+    let native = Backend::native().expect("native() is Some on every CI platform");
     let yaml = format!("daemons:\n  frpc:\n    backend-specific:\n      {native}:\n        command: []\n");
     let err = resolve_yaml(&yaml).unwrap_err();
     assert!(err.to_string().contains("command"));
@@ -1752,9 +1739,7 @@ fn a_templated_restart_delay_resolves() {
 
 #[skuld::test]
 fn a_templated_restart_in_the_native_override_resolves() {
-    let Some(native) = Backend::native() else {
-        return;
-    };
+    let native = Backend::native().expect("native() is Some on every CI platform");
     let yaml = format!(
         "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      {native}:\n        restart: ${{R}}\n"
     );
