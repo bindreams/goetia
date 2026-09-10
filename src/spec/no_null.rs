@@ -135,9 +135,7 @@ impl Slot {
             Slot::BackendSpecific => {
                 "an explicit `null` is not a set of backend overrides; write at least one `<backend>:` entry under it"
             }
-            Slot::Override => {
-                "an explicit `null` is not a backend override; give it at least one field to override"
-            }
+            Slot::Override => "an explicit `null` is not a backend override; give it at least one field to override",
             Slot::Field => "an explicit `null` is not a way to unset this field; omit the key instead",
             Slot::Key => "an explicit `null` is not a field name; quote the key to use its literal text",
             Slot::Env => {

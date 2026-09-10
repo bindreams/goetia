@@ -353,10 +353,16 @@ daemons:
 Every field but the daemon's id is overridable: `name`, `command`, `cwd`,
 `env`, `user`, `restart`, `restart-delay`, `logs`, `type`. A scalar or list
 field replaces the base value outright; `env` merges key by key, the
-override winning where both set the same key. A key repeated _within_ one
-`env` map, base or override, is an error naming it. An unknown backend key
-is an error naming it, as is a repeated one, and an explicit `null` is an
-error anywhere in the block — omit the key instead.
+override winning where both set the same key. An unknown backend key is an
+error naming it, as is a repeated one.
+
+The two document-wide rules reach in here unchanged, and mean the same thing
+they do in the base spec:
+[an explicit `null`](#an-explicit-null-is-not-a-way-to-unset-a-field) is an
+error anywhere in the block, and
+[an `env` key may not repeat](#an-env-key-may-not-repeat) within one
+override's `env`. A base key and an override of the same key are not a
+repeat — that is the merge, and it is the point.
 
 **Only the backend native to this host is installed, but every backend's
 merged spec is validated on every host.** So the manifest above renders on

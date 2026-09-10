@@ -94,8 +94,8 @@ daemons:
 
 #[skuld::test]
 fn duplicate_env_key_is_rejected_in_an_override() {
-    // One visitor serves `no_null_env` and `no_null_env_option` alike, so
-    // base and override cannot diverge on this.
+    // `raw.rs`'s `EnvVisitor` serves both positions, so base and override
+    // cannot diverge on what counts as a duplicate.
     let yaml = "
 daemons:
   frpc:
@@ -248,6 +248,74 @@ daemons:
             "field `{field}`: expected `{expected}`, got: {err}"
         );
     }
+}
+
+/// The scan is schema-blind, so it reaches an override's containers and its
+/// `user.id` too — positions no test could reach before `backend-specific`
+/// existed, because the typed parse refused the key as unknown first. Each
+/// row names what that position is, not "this field".
+#[skuld::test]
+fn a_null_container_or_account_id_in_an_override_is_rejected() {
+    let cases = [
+        ("        command:\n", "an explicit `null` is not a command"),
+        (
+            "        env: null\n",
+            "invalid type: unit value, expected a mapping of environment variable name to value",
+        ),
+        ("        env:\n", "an explicit `null` is not an environment block"),
+        ("        user:\n", "an explicit `null` is not a user"),
+        (
+            "        user:\n          id: null\n",
+            "an explicit `null` is not an account id",
+        ),
+    ];
+    for (block, expected) in cases {
+        let yaml = format!("daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      scm:\n{block}");
+        let err = parse(&yaml).unwrap_err().to_string();
+        assert!(err.contains(expected), "`{block}`: expected `{expected}`, got: {err}");
+    }
+}
+
+/// An override block written with no body at all, at either level. Both are
+/// YAML nulls, and neither is the empty override the author might have
+/// meant — `scm: {}` is how that is written.
+#[skuld::test]
+fn an_empty_backend_specific_body_is_rejected() {
+    for (yaml, expected) in [
+        (
+            "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n",
+            "an explicit `null` is not a set of backend overrides",
+        ),
+        (
+            "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      scm:\n",
+            "an explicit `null` is not a backend override",
+        ),
+    ] {
+        let err = parse(yaml).unwrap_err().to_string();
+        assert!(err.contains(expected), "expected `{expected}`, got: {err}");
+    }
+}
+
+/// A refusal inside an override has to name the override, not the daemon:
+/// the key path is the only thing telling an author which of three blocks
+/// to look in.
+#[skuld::test]
+fn a_refusal_inside_an_override_names_the_backend_and_the_line() {
+    let yaml = "\
+daemons:
+  frpc:
+    command: [/bin/frpc]
+    backend-specific:
+      scm:
+        env:
+          A: null
+";
+    let err = parse(yaml).unwrap_err().to_string();
+    assert!(
+        err.contains("daemons.frpc.backend-specific.scm.env.A"),
+        "should name the path: {err}"
+    );
+    assert!(err.contains("line 7"), "should name the line: {err}");
 }
 
 #[skuld::test]
