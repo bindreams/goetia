@@ -53,7 +53,7 @@
 //! rejects an unterminated `${`, an empty name, an invalid name character,
 //! and a `$` inside a `:-` default. Every one of those is `str` grammar over
 //! authored text — no `.env`, no substitution, no target machine — which is
-//! shape. But `interpolate::spec` runs **only on the native merged spec**,
+//! shape. But `interpolate::spec` **never runs on a non-native override**,
 //! so without a separate check `scm: {name: "$HOME"}` would resolve cleanly
 //! on Linux and fail only at install on Windows, and a bad `$` in a base
 //! value that the native override replaces would never be diagnosed at all.
@@ -63,7 +63,7 @@
 //! `check_spec_grammar` are that separate check.
 //!
 //! `check_spec_grammar` runs in [`Phase::Authored`] only: a `.env` value
-//! carrying a literal `$` (`SECRET=abc$def`) is legal, survives the one
+//! carrying a literal `$` (`SECRET=abc$def`) is legal, survives
 //! substitution, and would fail a grammar check applied to substituted
 //! text.
 
@@ -259,9 +259,10 @@ fn resolve_as(
             );
         }
 
-        // Step 5b: the native pass, and the one substitution. Authoritative:
-        // it is where the injection gate inspects final values, and its
-        // `ShapedSpec` is the one that becomes a `DaemonSpec`. No
+        // Step 5b: the native pass, and the substitution whose result is
+        // kept. Authoritative: it is where the injection gate inspects
+        // final values, and its `ShapedSpec` is the one that becomes a
+        // `DaemonSpec`. No
         // `check_spec_grammar` here — the text is substituted, and a
         // `.env` value may legally carry a literal `$`.
         let native_entry = native.filter(|b| raw.backend_specific.contains_key(b));

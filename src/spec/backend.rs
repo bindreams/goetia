@@ -28,15 +28,14 @@
 //! caught from any host — a uid is never a substituted string — while
 //! `scm: {user: "${ACCT}"}` is not checkable from Linux: substitution runs
 //! for the native backend only, and goetia does not claim to check what it
-//! cannot resolve. The base underneath it is read substituted by
-//! [`Backend::warn`] (`resolve`'s step 5a) and authored by
-//! [`Backend::error`] (step 4): a base field is substituted for the
-//! returned spec from the same `.env`, so moving one there must not delete
-//! an advisory about the value that gets installed, while a *rejection*
-//! stays a verdict on text somebody wrote for that backend. The native
-//! backend's override is substituted too, in step 5b, and is both warned on
-//! and checked there — which is why the example above names `scm` rather
-//! than `systemd`.
+//! cannot resolve. The base underneath it concerns [`Backend::warn`]
+//! alone, since `Supplied` masks a base field out of [`Backend::error`]
+//! entirely, and `warn` reads it *substituted* (`resolve`'s step 5a): a
+//! base field is substituted for the returned spec from the same `.env`, so
+//! moving one there must not delete an advisory about the value that
+//! actually gets installed. The native backend's override is substituted
+//! too, in step 5b, and is both warned on and checked there — which is why
+//! the example above names `scm` rather than `systemd`.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
