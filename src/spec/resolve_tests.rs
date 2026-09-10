@@ -1583,6 +1583,50 @@ fn a_native_backends_verdict_does_not_pre_empt_the_sweep() {
 }
 
 #[skuld::test]
+fn a_host_with_no_native_backend_resolves_the_base_spec_alone() {
+    // `resolve_as`'s fourth legal `native`, and the one no platform this
+    // crate builds for produces — `Backend::native()` is `Some` on all
+    // three, which is exactly why the seam has to be driven here. With no
+    // backend to merge for, `merged_native` falls back to
+    // `without_overrides` and every override is ignored.
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    name: base\n    backend-specific:\n      \
+                systemd:\n        name: from-systemd\n      launchd:\n        name: from-launchd\n      \
+                scm:\n        name: from-scm\n";
+    let (specs, _warnings) = resolve_as(parse_manifest(yaml), &base_dir(), None).expect("resolves");
+    assert_eq!(specs[0].name, "base");
+
+    // No backend is native, so none is skipped: every advisory still fires.
+    let advisory = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    cwd: .\n    type: managed\n    \
+                    restart: always\n    restart-delay: 60d\n";
+    let (_specs, warnings) = resolve_as(parse_manifest(advisory), &base_dir(), None).expect("resolves");
+    assert_eq!(warnings.len(), 3, "{warnings:?}");
+}
+
+#[skuld::test]
+fn a_missing_command_with_no_native_backend_names_no_backend() {
+    // `missing_command_error`'s `None` arm. There is no backend to install
+    // to, so `backend-specific.<backend>.command` is not a remedy and the
+    // message must not offer it — including when a `command` was written
+    // under an override, which is the same "not this host's" value.
+    let manifests = [
+        "daemons:\n  frpc:\n    name: frpc\n".to_string(),
+        "daemons:\n  frpc:\n    backend-specific:\n      systemd:\n        command: [/bin/frpc]\n".to_string(),
+    ];
+    for yaml in manifests {
+        let err = resolve_as(parse_manifest(&yaml), &base_dir(), None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("command must not be empty"), "{msg}");
+        assert!(
+            !msg.contains("backend-specific"),
+            "no backend to offer as a remedy: {msg}"
+        );
+        for backend in Backend::ALL {
+            assert!(!msg.contains(&backend.to_string()), "no backend to name: {msg}");
+        }
+    }
+}
+
+#[skuld::test]
 fn an_override_on_every_backend_resolves() {
     let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      launchd:\n        \
                 user: bindreams\n      scm:\n        user: bindreams\n      systemd:\n        user: bindreams\n";

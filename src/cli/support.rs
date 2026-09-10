@@ -18,6 +18,11 @@ pub(crate) fn load_and_warn(file: &Path, err: &mut dyn Write) -> Result<Vec<Daem
     Ok(specs)
 }
 
+/// Renders `warning: <id>: <message>` for a daemon's advisory and
+/// `warning: <message>` for a manifest-level one. Only the drive-relative
+/// `-f` advisory (`spec::resolve`'s `absolutize`) ever takes the second
+/// arm: it belongs to no daemon, so prefixing it with one would name a
+/// daemon the warning is not about.
 pub(crate) fn print_warnings(warnings: &[Warning], err: &mut dyn Write) {
     for warning in warnings {
         let _ = match &warning.id {
@@ -325,3 +330,7 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
         .max_by_key(|code| super::report::precedence(*code))
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+#[path = "support_tests.rs"]
+mod support_tests;

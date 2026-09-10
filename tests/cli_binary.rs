@@ -4,8 +4,8 @@
 //!
 //! Everything here is either pure (`install --dry-run`, `show -f`) or
 //! deliberately exercises `main.rs`'s real wiring to
-//! `goetia::manager::native()`, which errors on every platform until Tasks
-//! 11-13 land (macOS and Windows excepted). Behavior that needs a
+//! `goetia::manager::native()`, which errors on any platform but Linux,
+//! macOS and Windows. Behavior that needs a
 //! *working* manager lives in `tests/cli_dispatch.rs` instead, dispatched
 //! in-process against the fake.
 
@@ -189,6 +189,50 @@ fn warnings_are_printed_to_stderr() {
     assert!(err.contains("warning:"), "stderr:\n{err}");
     assert!(err.contains("restart-delay"), "stderr:\n{err}");
     assert!(out.contains("frpc"), "stdout:\n{out}");
+}
+
+/// The drive letter `path` sits on — the prefix a drive-relative spelling
+/// of something under it has to carry. Read from the temp directory rather
+/// than hardcoded to `C`, so a runner whose `TEMP` is on another drive
+/// still resolves against the directory this test actually wrote to.
+#[cfg(windows)]
+fn drive_letter(path: &Path) -> char {
+    use std::path::{Component, Prefix};
+    match path.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => letter as char,
+            other => panic!("the temp directory must sit on a lettered drive: {other:?}"),
+        },
+        other => panic!("an absolute temp directory must start with a prefix: {other:?}"),
+    }
+}
+
+/// `print_warnings`' id-less arm, end to end. A drive-relative `-f` is the
+/// only advisory that belongs to no daemon, so its stderr line must carry
+/// no `<id>: ` between `warning: ` and the message. Windows-only: this
+/// advisory fires only where `std::path::absolute` leaves a path
+/// non-absolute, which is a Windows prefix-without-root property.
+#[cfg(windows)]
+#[skuld::test]
+fn a_manifest_level_warning_prints_with_no_daemon_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("proj");
+    std::fs::create_dir(&project).expect("create the manifest directory");
+    write_manifest(&project, "daemons:\n  frpc:\n    command: [frpc.exe]\n");
+
+    // `<drive>:proj`, which `GetFullPathNameW` anchors to that drive's
+    // current directory — `dir`, since that is where the child runs.
+    let relative = format!("{}:proj", drive_letter(dir.path()));
+    let (code, out, err) = run_cli(&["daemon", "show", "-f", &relative], dir.path());
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let lines: Vec<&str> = err.lines().filter(|l| l.starts_with("warning: ")).collect();
+    assert_eq!(lines.len(), 1, "stderr:\n{err}");
+    assert!(
+        lines[0].starts_with("warning: manifest directory "),
+        "a manifest-level warning must not be prefixed with a daemon id: {}",
+        lines[0]
+    );
 }
 
 // backend-specific overrides ==========================================================================================
