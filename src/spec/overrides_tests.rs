@@ -190,6 +190,23 @@ daemons:
 }
 
 #[skuld::test]
+fn a_null_command_element_in_an_override_is_rejected() {
+    let yaml = "
+daemons:
+  frpc:
+    command: [/bin/frpc]
+    backend-specific:
+      scm:
+        command: [null]
+";
+    let err = parse(yaml).unwrap_err();
+    assert!(
+        err.to_string().contains("an explicit `null` is not a command element"),
+        "{err}"
+    );
+}
+
+#[skuld::test]
 fn a_null_user_name_in_an_override_is_rejected() {
     // The override twin of `raw_tests.rs`'s base-position test: both fields
     // hold a `RawUser`, so one guard covers both, and this is the assertion
