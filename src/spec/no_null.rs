@@ -14,7 +14,7 @@
 //! Two properties are wanted from one rejection, and no single
 //! `Deserializer` call gives both.
 //!
-//! - **Position.** `serde_yaml_ng` attaches the offending node's line and
+//! - **Position.** `yaml_serde` attaches the offending node's line and
 //!   its key path in `error::fix_mark`, which each `deserialize_*` method
 //!   applies to whatever error came out of it, filling a position in only
 //!   if one is not set already — so the innermost one wins.
@@ -56,7 +56,7 @@
 //! only a structurally valid document reaches the scan. Anything the scan
 //! can still object to other than a `null` is therefore something the
 //! typed parse has already accepted, and is discarded — the tag check
-//! happens inside `serde_yaml_ng` before the visitor is reached, so the
+//! happens inside `yaml_serde` before the visitor is reached, so the
 //! scan cannot decline to see it, only decline to report it. Discarding
 //! means *keep walking*: a `null` sitting after a tag the scan could not
 //! read must still be found, so each container skips the node it could not
@@ -80,10 +80,10 @@ use serde::de::{self, DeserializeSeed, EnumAccess, IgnoredAny, MapAccess, SeqAcc
 /// `yaml` must be a document the typed parse has accepted: every other
 /// complaint this walk can raise belongs to that parse and is discarded
 /// here — see the module doc comment.
-pub(super) fn reject_nulls(yaml: &str) -> Result<(), serde_yaml_ng::Error> {
+pub(super) fn reject_nulls(yaml: &str) -> Result<(), yaml_serde::Error> {
     let found = Cell::new(false);
     let scan = Scan(Slot::Document, &found);
-    match scan.deserialize(serde_yaml_ng::Deserializer::from_str(yaml)) {
+    match scan.deserialize(yaml_serde::Deserializer::from_str(yaml)) {
         Err(error) if found.get() => Err(error),
         _ => Ok(()),
     }
@@ -239,7 +239,7 @@ impl<'de> Visitor<'de> for Scan<'_> {
         }
     }
 
-    /// An empty document, which `serde_yaml_ng` reports as `Event::Void`.
+    /// An empty document, which `yaml_serde` reports as `Event::Void`.
     /// The typed parse's `missing field \`daemons\`` says more about it
     /// than this scan could.
     fn visit_none<E: de::Error>(self) -> Result<(), E> {
@@ -309,7 +309,7 @@ impl<'de> Visitor<'de> for Scan<'_> {
     }
 
     /// A node carrying a local tag (`name: !mine text`) arrives as an
-    /// enum, since that is how `serde_yaml_ng` offers `!Tag` syntax.
+    /// enum, since that is how `yaml_serde` offers `!Tag` syntax.
     /// Recursing into the content rather than ignoring it keeps
     /// `!mine null` refused.
     fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<(), A::Error> {

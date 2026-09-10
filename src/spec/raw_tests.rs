@@ -1,6 +1,6 @@
 use super::RawManifest;
 
-fn parse(yaml: &str) -> Result<RawManifest, serde_yaml_ng::Error> {
+fn parse(yaml: &str) -> Result<RawManifest, yaml_serde::Error> {
     RawManifest::parse(yaml)
 }
 
@@ -474,7 +474,7 @@ daemons:
 /// Every guarded position, with the offence deliberately placed on a line
 /// of its own that is *not* the first line of its enclosing container —
 /// the case a rejection built after `Option::<T>::deserialize` has already
-/// returned gets wrong, because `serde_yaml_ng` has by then stamped the
+/// returned gets wrong, because `yaml_serde` has by then stamped the
 /// container's own start position onto it.
 #[skuld::test]
 fn a_rejection_points_at_the_offending_node_and_names_it() {
@@ -564,7 +564,7 @@ daemons:
     }
 }
 
-/// `serde_yaml_ng` decides null-ness from a scalar's *style*, so a
+/// `yaml_serde` decides null-ness from a scalar's *style*, so a
 /// `!!null`-tagged **quoted** scalar arrives as ordinary text unless the
 /// guard reads the resolved node instead. `!!null "null"` is the one
 /// spelling YAML defines as unambiguously a null, so it must not be the
@@ -604,7 +604,7 @@ fn a_tag_resolved_null_is_rejected_wherever_a_plain_one_is() {
             );
         }
         // `!!null ""` is a null per the YAML spec but not per
-        // `serde_yaml_ng`'s `parse_null`, which accepts only
+        // `yaml_serde`'s `parse_null`, which accepts only
         // `null`/`Null`/`NULL`/`~`: it refuses the *tag* rather than
         // reaching this crate's visitor. That refusal is the typed parse's
         // to make or not — it reads the scalar as a string and ignores the
@@ -618,7 +618,7 @@ fn a_tag_resolved_null_is_rejected_wherever_a_plain_one_is() {
 
 /// An empty value is a YAML null, and `null` is refused *wherever a
 /// manifest value is expected* — including where the expected value is a
-/// container. `serde_yaml_ng` maps an empty plain scalar onto an empty map
+/// container. `yaml_serde` maps an empty plain scalar onto an empty map
 /// or sequence when asked for one, so without a guard `daemons:` with no
 /// body installs nothing and exits 0. Written out as `null`, a container
 /// the typed parse insists on — `daemons`, `env` — is a type error it

@@ -87,8 +87,7 @@ fn render_yaml_is_key_sorted_and_deterministic() {
     let second = render_yaml(&spec);
     assert_eq!(first, second, "rendering the same spec twice should be byte-identical");
 
-    let parsed: serde_yaml_ng::Mapping =
-        serde_yaml_ng::from_str(&first).expect("render_yaml output should parse as YAML");
+    let parsed: yaml_serde::Mapping = yaml_serde::from_str(&first).expect("render_yaml output should parse as YAML");
     let keys: Vec<&str> = parsed
         .keys()
         .map(|k| k.as_str().expect("every key is a string"))

@@ -249,7 +249,7 @@ fn check_grammar_rejects_a_bare_dollar() {
 /// Parse a manifest fixture, substitute its one `frpc` daemon, and hand back
 /// the mutated `RawSpec` — the same walk `resolve` now does per daemon.
 fn interpolate_yaml(yaml: &str, pairs: &[(&str, &str)]) -> Result<RawSpec, Error> {
-    let mut raw: RawManifest = serde_yaml_ng::from_str(yaml).expect("fixture yaml should parse");
+    let mut raw: RawManifest = yaml_serde::from_str(yaml).expect("fixture yaml should parse");
     let mut entry = raw.daemons.remove("frpc").expect("fixture must declare `frpc`");
     spec(&mut entry, "daemons.frpc", &Vars::from_pairs(pairs))?;
     Ok(entry)
@@ -393,12 +393,11 @@ fn spec_would_change_is_true_for_an_escaped_dollar_only() {
     // The over-approximation, pinned at spec level: a `$$` escape has no
     // reference to resolve, yet still reports `true`. See the module doc
     // comment — narrowing this is a defect, not an optimisation.
-    let escaped: RawManifest =
-        serde_yaml_ng::from_str("daemons:\n  frpc:\n    command: [/bin/frpc, $$ARGS]\n").unwrap();
+    let escaped: RawManifest = yaml_serde::from_str("daemons:\n  frpc:\n    command: [/bin/frpc, $$ARGS]\n").unwrap();
     assert!(spec_would_change(&escaped.daemons["frpc"]));
 
     let dollarless: RawManifest =
-        serde_yaml_ng::from_str("daemons:\n  frpc:\n    command: [/bin/frpc, --flag]\n").unwrap();
+        yaml_serde::from_str("daemons:\n  frpc:\n    command: [/bin/frpc, --flag]\n").unwrap();
     assert!(!spec_would_change(&dollarless.daemons["frpc"]));
 }
 
@@ -407,7 +406,7 @@ fn spec_would_change_is_true_for_an_escaped_dollar_only() {
 #[skuld::test]
 fn check_spec_grammar_accepts_a_well_formed_manifest() {
     let raw: RawManifest =
-        serde_yaml_ng::from_str("daemons:\n  frpc:\n    name: ${NAME}\n    command: [\"${BIN}\"]\n    restart: ${R}\n")
+        yaml_serde::from_str("daemons:\n  frpc:\n    name: ${NAME}\n    command: [\"${BIN}\"]\n    restart: ${R}\n")
             .unwrap();
     assert!(check_spec_grammar(&raw.daemons["frpc"], "daemons.frpc").is_ok());
 }
@@ -415,7 +414,7 @@ fn check_spec_grammar_accepts_a_well_formed_manifest() {
 #[skuld::test]
 fn check_spec_grammar_rejects_a_bare_dollar_in_name() {
     let raw: RawManifest =
-        serde_yaml_ng::from_str("daemons:\n  frpc:\n    name: a$b\n    command: [/bin/frpc]\n").unwrap();
+        yaml_serde::from_str("daemons:\n  frpc:\n    name: a$b\n    command: [/bin/frpc]\n").unwrap();
     let err = check_spec_grammar(&raw.daemons["frpc"], "daemons.frpc").unwrap_err();
     assert!(
         err.to_string().contains("not part of"),
@@ -429,6 +428,6 @@ fn check_spec_grammar_does_not_require_a_defined_variable() {
     // fail here; that is `interpolate::spec`'s job, once `.env` is actually
     // consulted.
     let raw: RawManifest =
-        serde_yaml_ng::from_str("daemons:\n  frpc:\n    name: ${UNDEFINED}\n    command: [/bin/frpc]\n").unwrap();
+        yaml_serde::from_str("daemons:\n  frpc:\n    name: ${UNDEFINED}\n    command: [/bin/frpc]\n").unwrap();
     assert!(check_spec_grammar(&raw.daemons["frpc"], "daemons.frpc").is_ok());
 }

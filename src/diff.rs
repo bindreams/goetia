@@ -18,13 +18,13 @@
 //!
 //! `DaemonSpec` deliberately does not derive `Serialize` — the metadata
 //! blob embedded in each artifact has its own wire type and its own
-//! naming rules. `render_yaml` builds its own `serde_yaml_ng::Value` tree
+//! naming rules. `render_yaml` builds its own `yaml_serde::Value` tree
 //! instead of piggybacking on a derive, on purpose.
 
 use std::collections::BTreeMap;
 
-use serde_yaml_ng::{Mapping, Value};
 use similar::{ChangeTag, TextDiff};
+use yaml_serde::{Mapping, Value};
 
 use crate::spec::{AccountId, DaemonSpec, Kind, Restart, User};
 
@@ -84,7 +84,7 @@ pub fn render_yaml(spec: &DaemonSpec) -> String {
         .map(|(key, value)| (Value::from(key), value))
         .collect();
 
-    serde_yaml_ng::to_string(&Value::Mapping(mapping)).expect("a resolved DaemonSpec always renders to valid YAML")
+    yaml_serde::to_string(&Value::Mapping(mapping)).expect("a resolved DaemonSpec always renders to valid YAML")
 }
 
 // rendering helpers ===================================================================================================

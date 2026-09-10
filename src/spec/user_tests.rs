@@ -1,8 +1,8 @@
 use super::{AccountId, RawUser, User};
 use crate::spec::resolve::resolve_user;
 
-fn parse(yaml: &str) -> Result<RawUser, serde_yaml_ng::Error> {
-    serde_yaml_ng::from_str(yaml)
+fn parse(yaml: &str) -> Result<RawUser, yaml_serde::Error> {
+    yaml_serde::from_str(yaml)
 }
 
 /// Parse and resolve, the way `spec::load` does.

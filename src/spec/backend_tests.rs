@@ -5,8 +5,8 @@ use super::{Backend, Builtin, MAX_SC_ACTION_DELAY, Shaped, ShapedSpec, windows_b
 use crate::spec::overrides::Supplied;
 use crate::spec::{AccountId, Id, Kind, Restart, User};
 
-fn parse(yaml: &str) -> Result<Backend, serde_yaml_ng::Error> {
-    serde_yaml_ng::from_str(yaml)
+fn parse(yaml: &str) -> Result<Backend, yaml_serde::Error> {
+    yaml_serde::from_str(yaml)
 }
 
 #[skuld::test]
