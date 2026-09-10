@@ -1,7 +1,7 @@
 use super::RawManifest;
 
-fn parse(yaml: &str) -> Result<RawManifest, serde_yaml_ng::Error> {
-    serde_yaml_ng::from_str(yaml)
+fn parse(yaml: &str) -> Result<RawManifest, yaml_serde::Error> {
+    yaml_serde::from_str(yaml)
 }
 
 #[skuld::test]

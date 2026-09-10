@@ -4,7 +4,7 @@
 //! `RawManifest`'s `Deserialize` is hand-written rather than derived. A
 //! typed `BTreeMap<String, RawSpec>` field cannot detect a duplicate YAML
 //! key: serde's map deserializer inserts and overwrites, and
-//! `serde_yaml_ng`'s own duplicate-key check lives only in its `Mapping`
+//! `yaml_serde`'s own duplicate-key check lives only in its `Mapping`
 //! deserializer, which a typed map never reaches — a manifest declaring
 //! `frpc` twice would silently deserialize to one entry holding the
 //! *second* command. So this module walks the `daemons` mapping's

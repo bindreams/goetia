@@ -128,7 +128,7 @@ pub fn load(path: &Path) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
     // line, column, duplicate key, unknown field — comes from here, on the
     // file exactly as written. `resolve` interpolates after it, on the typed
     // result, so a `${VAR}` cannot move a position or change a message.
-    let raw: RawManifest = serde_yaml_ng::from_str(&text)?;
+    let raw: RawManifest = yaml_serde::from_str(&text)?;
 
     resolve(raw, &base_dir)
 }

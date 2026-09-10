@@ -230,7 +230,7 @@ fn errors_carry_the_supplied_path() {
 /// Parse a manifest fixture, substitute it against `pairs`, and hand back
 /// the mutated manifest.
 fn interpolate_yaml(yaml: &str, pairs: &[(&str, &str)]) -> Result<RawManifest, Error> {
-    let mut raw: RawManifest = serde_yaml_ng::from_str(yaml).expect("fixture yaml should parse");
+    let mut raw: RawManifest = yaml_serde::from_str(yaml).expect("fixture yaml should parse");
     manifest(&mut raw, &Vars::from_pairs(pairs))?;
     Ok(raw)
 }
@@ -369,11 +369,10 @@ fn manifest_would_change_is_true_for_an_escaped_dollar_only() {
     // The over-approximation, pinned at manifest level: a `$$` escape has
     // no reference to resolve, yet still reports `true`. See the module doc
     // comment — narrowing this is a defect, not an optimisation.
-    let escaped: RawManifest =
-        serde_yaml_ng::from_str("daemons:\n  frpc:\n    command: [/bin/frpc, $$ARGS]\n").unwrap();
+    let escaped: RawManifest = yaml_serde::from_str("daemons:\n  frpc:\n    command: [/bin/frpc, $$ARGS]\n").unwrap();
     assert!(manifest_would_change(&escaped));
 
     let dollarless: RawManifest =
-        serde_yaml_ng::from_str("daemons:\n  frpc:\n    command: [/bin/frpc, --flag]\n").unwrap();
+        yaml_serde::from_str("daemons:\n  frpc:\n    command: [/bin/frpc, --flag]\n").unwrap();
     assert!(!manifest_would_change(&dollarless));
 }
