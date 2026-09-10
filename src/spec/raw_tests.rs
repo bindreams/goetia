@@ -81,10 +81,10 @@ daemons:
 
 #[skuld::test]
 fn explicit_null_is_rejected_for_every_base_field() {
-    // One message per field kind, all of them naming `null`: the scan
-    // walks the document before any type is imposed on it, so `command`
-    // and `env` are refused as themselves rather than as an `invalid
-    // type` against the sequence or map they were about to become.
+    // Every field refuses it, and each says what that position is. The two
+    // whose type is a container are the typed parse's to refuse, because it
+    // runs first and a `null` is not the map or sequence it asked for; the
+    // rest reach the scan, because `Option` and `String` both accept one.
     let fields = [
         "name",
         "command",
@@ -107,8 +107,9 @@ fn explicit_null_is_rejected_for_every_base_field() {
         let err = parse(&yaml).unwrap_err();
         let msg = err.to_string();
         let expected = match field {
-            "command" => "an explicit `null` is not a command",
-            "env" => "an explicit `null` is not an environment block",
+            "command" => "invalid type: unit value, expected a sequence",
+            "env" => "invalid type: unit value, expected a mapping of environment variable name to value",
+            "user" => "an explicit `null` is not a user",
             _ => "an explicit `null` is not a way to unset this field",
         };
         assert!(
@@ -603,34 +604,45 @@ fn a_tag_resolved_null_is_rejected_wherever_a_plain_one_is() {
         }
         // `!!null ""` is a null per the YAML spec but not per
         // `serde_yaml_ng`'s `parse_null`, which accepts only
-        // `null`/`Null`/`NULL`/`~`. It refuses the tag itself rather than
-        // reaching this crate's visitor, so only the refusal is asserted.
+        // `null`/`Null`/`NULL`/`~`: it refuses the *tag* rather than
+        // reaching this crate's visitor. That refusal is the typed parse's
+        // to make or not — it reads the scalar as a string and ignores the
+        // tag, so the value is the empty string — and the scan may not
+        // report an error the typed parse did not raise. So the empty
+        // string is what this spelling means here.
         let yaml = template.replace("{null}", "!!null \"\"");
-        let err = parse(&yaml).unwrap_err().to_string();
-        assert!(err.contains("expected null"), "`!!null \"\"`: got: {err}");
+        parse(&yaml).unwrap_or_else(|err| panic!("`!!null \"\"` is the empty string here: {err}"));
     }
 }
 
 /// An empty value is a YAML null, and `null` is refused *wherever a
 /// manifest value is expected* — including where the expected value is a
-/// container. `serde_yaml_ng` maps an empty plain scalar onto an empty
-/// map or sequence when asked for one, so without a guard `daemons:` with
-/// no body installs nothing and exits 0.
+/// container. `serde_yaml_ng` maps an empty plain scalar onto an empty map
+/// or sequence when asked for one, so without a guard `daemons:` with no
+/// body installs nothing and exits 0. That is the half the scan answers;
+/// written out as `null`, the same position is a type error the typed
+/// parse refuses first, naming the field and the container it wanted.
 #[skuld::test]
 fn an_empty_container_body_is_rejected() {
     let cases: [(&str, &str); 6] = [
         ("daemons:\n", "not a set of daemons"),
-        ("daemons: null\n", "not a set of daemons"),
+        (
+            "daemons: null\n",
+            "invalid type: unit value, expected a mapping of daemon id to daemon spec",
+        ),
         (
             "daemons:\n  frpc:\n    command: [bin/frpc]\n    env:\n",
             "not an environment block",
         ),
         (
             "daemons:\n  frpc:\n    command: [bin/frpc]\n    env: null\n",
-            "not an environment block",
+            "invalid type: unit value, expected a mapping of environment variable name to value",
         ),
         ("daemons:\n  frpc:\n    command:\n", "not a command"),
-        ("daemons:\n  frpc:\n    command: null\n", "not a command"),
+        (
+            "daemons:\n  frpc:\n    command: null\n",
+            "invalid type: unit value, expected a sequence",
+        ),
     ];
     for (yaml, expected) in cases {
         let err = parse(yaml).unwrap_err().to_string();
@@ -647,4 +659,114 @@ fn an_explicitly_empty_container_is_accepted() {
 
     let manifest = parse("daemons:\n  frpc:\n    command: [bin/frpc]\n    env: {}\n").expect("`env: {}` should parse");
     assert!(manifest.daemons["frpc"].env.is_empty());
+}
+
+// What the typed parse owns ===========================================================================================
+
+/// The scan is schema-blind, so it must not be the one to answer a
+/// structural mistake: it walks subtrees `deny_unknown_fields` would have
+/// thrown away whole, and a `null` in one of them is not what the author
+/// got wrong.
+#[skuld::test]
+fn a_typo_is_named_as_a_typo_even_when_its_value_is_null() {
+    for value in ["null", "~", "{a: {b: null}}", "[null]"] {
+        let yaml = format!("daemons:\n  frpc:\n    command: [bin/frpc]\n    bogus: {value}\n");
+        let err = parse(&yaml).unwrap_err().to_string();
+        assert!(err.contains("unknown field `bogus`"), "`bogus: {value}`: {err}");
+    }
+}
+
+#[skuld::test]
+fn a_null_key_is_named_as_an_unknown_field() {
+    // The degenerate case of the above, and the one position the scan
+    // could not give a line or a column: a `null` key as the document's
+    // very first node.
+    let err = parse("~: 1\n").unwrap_err().to_string();
+    assert!(err.contains("unknown field `~`"), "{err}");
+
+    let err = parse("daemons:\n  frpc:\n    command: [bin/frpc]\n    ~: 1\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unknown field `~`"), "{err}");
+    assert!(err.contains("line 4"), "should name the position: {err}");
+}
+
+#[skuld::test]
+fn a_duplicate_field_whose_repeat_is_null_is_named_as_a_duplicate() {
+    let err = parse("daemons:\n  frpc:\n    command: [bin/frpc]\n    logs: /a\n    logs: null\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("duplicate field `logs`"), "{err}");
+}
+
+#[skuld::test]
+fn a_container_of_the_wrong_type_is_named_as_a_type_error() {
+    for (yaml, expected) in [
+        ("daemons: [null]\n", "invalid type: sequence"),
+        (
+            "daemons:\n  frpc:\n    command: [bin/frpc]\n    env: [null]\n",
+            "invalid type: sequence",
+        ),
+        ("daemons:\n  frpc:\n    command: {a: null}\n", "invalid type: map"),
+    ] {
+        let err = parse(yaml).unwrap_err().to_string();
+        assert!(err.contains(expected), "expected `{expected}`, got: {err}");
+    }
+}
+
+/// A tag the typed parse ignores must not become a parse error, and the
+/// authored text has to survive it: `deserialize_any` checks a standard
+/// tag's content against the tag, and the scan reads every node with
+/// `deserialize_any`, but the typed parse asks for a string and gets the
+/// characters whatever the tag said.
+#[skuld::test]
+fn a_standard_tag_the_typed_parse_ignores_is_not_a_parse_error() {
+    for (value, text) in [
+        ("!!int abc", "abc"),
+        ("!!float abc", "abc"),
+        ("!!bool yes", "yes"),
+        ("!!bool maybe", "maybe"),
+        ("!!null \"\"", ""),
+        ("!!null \"x\"", "x"),
+        ("!!str 5", "5"),
+    ] {
+        let yaml = format!("daemons:\n  frpc:\n    command: [bin/frpc]\n    env:\n      V: {value}\n");
+        let manifest = parse(&yaml).unwrap_or_else(|err| panic!("`{value}` holds no null: {err}"));
+        assert_eq!(manifest.daemons["frpc"].env["V"], text, "`{value}`");
+    }
+}
+
+#[skuld::test]
+fn a_null_behind_a_tag_the_scan_cannot_read_is_still_refused() {
+    let yaml = "
+daemons:
+  frpc:
+    command: [bin/frpc]
+    env: {V: !!int abc}
+    restart: null
+";
+    let err = parse(yaml).unwrap_err().to_string();
+    assert!(err.contains("an explicit `null`"), "{err}");
+    assert!(err.contains("daemons.frpc.restart"), "should name the position: {err}");
+}
+
+#[skuld::test]
+fn a_locally_tagged_key_is_the_field_it_names() {
+    // The typed parse resolves the tag away and honours `!mine env` as
+    // `env`; the scan has to agree, or its message contradicts its own key
+    // path.
+    let err = parse("daemons:\n  frpc:\n    command: [bin/frpc]\n    !mine env:\n      A: null\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("is not an environment value"), "{err}");
+    assert!(err.contains("daemons.frpc.env.A"), "should name the position: {err}");
+}
+
+#[skuld::test]
+fn a_null_user_is_refused_as_a_user() {
+    for spelling in ["null", "~", ""] {
+        let yaml = format!("daemons:\n  frpc:\n    command: [bin/frpc]\n    user: {spelling}\n");
+        let err = parse(&yaml).unwrap_err().to_string();
+        assert!(err.contains("an explicit `null` is not a user"), "`{spelling}`: {err}");
+    }
 }

@@ -1,9 +1,10 @@
 //! The literal shape of `goetia.yaml`: what deserializes directly from
 //! YAML, before `resolve` turns it into `DaemonSpec`s.
 //!
-//! [`RawManifest::parse`] is the entry point: it refuses every explicit
-//! `null` first (see `no_null` for why that is a separate walk of the same
-//! text) and then deserializes.
+//! [`RawManifest::parse`] is the entry point: it deserializes, and then
+//! refuses every explicit `null` the deserialization accepted (see
+//! `no_null` for why that is a separate walk of the same text, and why it
+//! goes second).
 //!
 //! `RawManifest`'s `Deserialize` is hand-written rather than derived, and
 //! `env` gets a `deserialize_with`, for the same reason: a typed
@@ -28,9 +29,9 @@ use super::user::RawUser;
 /// The whole `goetia.yaml` document.
 ///
 /// **Construct one with [`RawManifest::parse`], not with `Deserialize`.**
-/// The null rule is enforced by a pre-parse scan that `parse` runs, because
-/// it needs the manifest *text* to report a position — a `Deserializer` no
-/// longer has one by the time a field could object. So
+/// The null rule is enforced by a second walk that `parse` runs over the
+/// same text, because it needs that text to report a position — a
+/// `Deserializer` no longer has one by the time a field could object. So
 /// `serde_yaml_ng::from_str::<RawManifest>` compiles, and silently accepts
 /// every explicit `null` this module exists to refuse.
 ///
@@ -46,13 +47,16 @@ pub struct RawManifest {
 }
 
 impl RawManifest {
-    /// A manifest's parse entry point, and the only one: `reject_nulls`
-    /// runs first so that an explicit `null` is refused with its own line
-    /// and key path, which `RawSpec`'s `Option` fields could not do — see
-    /// `no_null`. Both walks read the same unmodified text.
+    /// A manifest's parse entry point, and the only one. The typed parse
+    /// runs first and owns every structural diagnostic — unknown field,
+    /// duplicate key, wrong type — and `reject_nulls` then walks the same
+    /// unmodified text for the one thing that parse cannot refuse with a
+    /// position of its own: an explicit `null`. See `no_null` for both
+    /// halves of that split.
     pub fn parse(yaml: &str) -> Result<Self, serde_yaml_ng::Error> {
+        let manifest = serde_yaml_ng::from_str(yaml)?;
         reject_nulls(yaml)?;
-        serde_yaml_ng::from_str(yaml)
+        Ok(manifest)
     }
 }
 

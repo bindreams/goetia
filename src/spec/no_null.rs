@@ -1,5 +1,5 @@
-//! A pre-parse scan that refuses an explicit YAML `null` anywhere in a
-//! manifest.
+//! A scan that refuses an explicit YAML `null` anywhere in a manifest the
+//! typed parse has already accepted.
 //!
 //! An explicit `null` is an error wherever a manifest value is expected:
 //! the `daemons` mapping and every daemon under it, all nine
@@ -33,22 +33,66 @@
 //!   the opposite, and it is right to: an environment variable must carry
 //!   what the author wrote.
 //!
-//! So the two jobs are split across two walks of the same text. This scan
-//! runs first and reads every node with `deserialize_any`, which sees
-//! nulls and tags exactly and reports them from the right place — and
-//! throws every value away, so its coercion costs nothing. The typed parse
-//! then runs on a document already known to hold no `null`, and reads each
-//! scalar as a string, so the authored text survives. Both walk the same
-//! unmodified text, so neither can move a position or change a message.
+//! So the two jobs are split across two walks of the same text. The typed
+//! parse reads each scalar as a string, so the authored text survives;
+//! this scan reads every node with `deserialize_any`, which sees a null
+//! exactly and reports it from the right place — and throws every value
+//! away, so its coercion costs nothing. Both walk the same unmodified
+//! text, so neither can move a position or change a message.
+//!
+//! # Why it runs second, and may only ever report a `null`
+//!
+//! The scan is schema-blind: it walks whatever YAML is written and knows
+//! nothing about which keys are fields. Running it first therefore handed
+//! it errors that are not its business. `bogus: null` was refused as a
+//! null rather than as ``unknown field `bogus` ``, and the author's actual
+//! mistake was never named; so were a wrong container type and a duplicate
+//! key. And `env: {V: !!int abc}`, which the typed parse accepts as the
+//! text `abc`, became a hard parse error, because `deserialize_any` checks
+//! a standard tag's content against the tag.
+//!
+//! So the typed parse goes first and owns unknown fields, duplicate keys
+//! and type errors, with the positions and messages it always had, and
+//! only a structurally valid document reaches the scan. Anything the scan
+//! can still object to other than a `null` is therefore something the
+//! typed parse has already accepted, and is discarded — the tag check
+//! happens inside `serde_yaml_ng` before the visitor is reached, so the
+//! scan cannot decline to see it, only decline to report it. Discarding
+//! means *keep walking*: a `null` sitting after a tag the scan could not
+//! read must still be found, so each container skips the node it could not
+//! read and carries on with the next one.
+//!
+//! One consequence is deliberate. A `null` in a position the typed parse
+//! rejects for its own reasons now reports that reason — `command: null`
+//! is `invalid type: unit value, expected a sequence` — which names the
+//! field and is what `goetia` said before this rule existed. The positions
+//! the typed parse *accepts* are the ones this module answers: every
+//! `Option` field, `env` keys and values, `command` elements, a daemon id,
+//! `user`, `user.name`, and a container written empty rather than `null`
+//! (`daemons:` with no body deserializes to an empty mapping).
 
+use std::cell::Cell;
 use std::fmt;
 
 use serde::de::{self, DeserializeSeed, EnumAccess, IgnoredAny, MapAccess, SeqAccess, VariantAccess, Visitor};
 
 /// Refuse every explicit `null` in `yaml`, naming the first one found.
+/// `yaml` must be a document the typed parse has accepted: every other
+/// complaint this walk can raise belongs to that parse and is discarded
+/// here — see the module doc comment.
 pub(super) fn reject_nulls(yaml: &str) -> Result<(), serde_yaml_ng::Error> {
-    Scan(Slot::Document).deserialize(serde_yaml_ng::Deserializer::from_str(yaml))
+    let found = Cell::new(false);
+    let scan = Scan(Slot::Document, &found);
+    match scan.deserialize(serde_yaml_ng::Deserializer::from_str(yaml)) {
+        Err(error) if found.get() => Err(error),
+        _ => Ok(()),
+    }
 }
+
+/// What a `null` `user.id` is refused with. It is `user`'s own
+/// `Deserialize` that raises it, not this scan: the typed parse rejects a
+/// `null` there, so the scan never sees one — see [`AccountId`](super::user::AccountId).
+pub(super) const NULL_ACCOUNT_ID: &str = "an explicit `null` is not an account id; omit the `user:` key instead";
 
 /// Where in a manifest a node sits. It decides what a refusal says, and
 /// nothing else — a slot this table does not know becomes [`Slot::Field`],
@@ -61,6 +105,7 @@ enum Slot {
     DaemonId,
     Daemon,
     Field,
+    Key,
     Env,
     EnvKey,
     EnvValue,
@@ -86,6 +131,7 @@ impl Slot {
             Slot::DaemonId => "an explicit `null` is not a daemon id; quote the key to use its literal text",
             Slot::Daemon => "an explicit `null` is not a daemon; give it at least a `command:`",
             Slot::Field => "an explicit `null` is not a way to unset this field; omit the key instead",
+            Slot::Key => "an explicit `null` is not a field name; quote the key to use its literal text",
             Slot::Env => {
                 "an explicit `null` is not an environment block; omit the `env:` key, or write `{}` for no variables"
             }
@@ -99,9 +145,9 @@ impl Slot {
             Slot::CommandElement => {
                 "an explicit `null` is not a command element; remove it, or write `\"\"` for an empty argument"
             }
-            Slot::User => "an explicit `null` is not a way to unset this field; omit the key instead",
+            Slot::User => "an explicit `null` is not a user; omit the `user:` key instead",
             Slot::UserName => "an explicit `null` is not a username; omit the `user:` key instead",
-            Slot::UserId => "an explicit `null` is not an account id; omit the `user:` key instead",
+            Slot::UserId => NULL_ACCOUNT_ID,
         })
     }
 
@@ -120,12 +166,14 @@ impl Slot {
         }
     }
 
-    /// The slot of a key of this mapping.
+    /// The slot of a key of this mapping. Only `daemons` and `env` name
+    /// their keys; everywhere else a key is a field name, and a `null` one
+    /// has no field to unset.
     fn key(self) -> Slot {
         match self {
             Slot::Daemons => Slot::DaemonId,
             Slot::Env => Slot::EnvKey,
-            _ => Slot::Field,
+            _ => Slot::Key,
         }
     }
 
@@ -143,9 +191,22 @@ impl Slot {
 /// needs, and what resolves `!!null "null"` — `deserialize_option` decides
 /// null-ness from the scalar's *style*, so it sees a tagged null only when
 /// the scalar is unquoted.
-struct Scan(Slot);
+///
+/// The flag says whether the error currently travelling up the stack is
+/// this scan's own refusal. Any other one belongs to the typed parse,
+/// which has already accepted this document, so it is dropped and the walk
+/// carries on — see the module doc comment.
+#[derive(Clone, Copy)]
+struct Scan<'a>(Slot, &'a Cell<bool>);
 
-impl<'de> DeserializeSeed<'de> for Scan {
+impl Scan<'_> {
+    /// Whether an error from the node below is one this scan may report.
+    fn refused_a_null(self) -> bool {
+        self.1.get()
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for Scan<'_> {
     type Value = ();
 
     fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
@@ -153,7 +214,7 @@ impl<'de> DeserializeSeed<'de> for Scan {
     }
 }
 
-impl<'de> Visitor<'de> for Scan {
+impl<'de> Visitor<'de> for Scan<'_> {
     type Value = ();
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -162,7 +223,10 @@ impl<'de> Visitor<'de> for Scan {
 
     fn visit_unit<E: de::Error>(self) -> Result<(), E> {
         match self.0.message() {
-            Some(message) => Err(E::custom(message)),
+            Some(message) => {
+                self.1.set(true);
+                Err(E::custom(message))
+            }
             None => Ok(()),
         }
     }
@@ -203,15 +267,37 @@ impl<'de> Visitor<'de> for Scan {
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
-        while seq.next_element_seed(Scan(self.0.element()))?.is_some() {}
-        Ok(())
+        loop {
+            match seq.next_element_seed(Scan(self.0.element(), self.1)) {
+                Ok(Some(())) => {}
+                Ok(None) => return Ok(()),
+                Err(error) if self.refused_a_null() => return Err(error),
+                Err(_) => {}
+            }
+        }
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
-        while let Some(key) = map.next_key_seed(ScanKey(self.0.key()))? {
-            map.next_value_seed(Scan(self.0.value(&key)))?;
+        loop {
+            let key = match map.next_key_seed(ScanKey(Scan(self.0.key(), self.1))) {
+                Ok(Some(key)) => key,
+                Ok(None) => return Ok(()),
+                Err(error) if self.refused_a_null() => return Err(error),
+                // The key is consumed even when it cannot be read, so
+                // the value beside it must still be taken, or the walk
+                // falls out of step and starts reading values as keys.
+                // It is taken as a *value*, not skipped: the typed parse
+                // read that key as a field, so a `null` under it is part
+                // of the manifest. Only the key's own text is lost, and
+                // with it the slot that text would have chosen.
+                Err(_) => String::new(),
+            };
+            match map.next_value_seed(Scan(self.0.value(&key), self.1)) {
+                Ok(()) => {}
+                Err(error) if self.refused_a_null() => return Err(error),
+                Err(_) => {}
+            }
         }
-        Ok(())
     }
 
     /// A node carrying a local tag (`name: !mine text`) arrives as an
@@ -229,9 +315,9 @@ impl<'de> Visitor<'de> for Scan {
 /// discarded, so the coercion `deserialize_any` performs on a plain
 /// numeric key is invisible: `env`'s keys reach `RawSpec` from the typed
 /// parse, not from here.
-struct ScanKey(Slot);
+struct ScanKey<'a>(Scan<'a>);
 
-impl<'de> DeserializeSeed<'de> for ScanKey {
+impl<'de> DeserializeSeed<'de> for ScanKey<'_> {
     type Value = String;
 
     fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<String, D::Error> {
@@ -239,7 +325,7 @@ impl<'de> DeserializeSeed<'de> for ScanKey {
     }
 }
 
-impl<'de> Visitor<'de> for ScanKey {
+impl<'de> Visitor<'de> for ScanKey<'_> {
     type Value = String;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -247,7 +333,7 @@ impl<'de> Visitor<'de> for ScanKey {
     }
 
     fn visit_unit<E: de::Error>(self) -> Result<String, E> {
-        Scan(self.0).visit_unit().map(|()| String::new())
+        self.0.visit_unit().map(|()| String::new())
     }
 
     fn visit_bool<E: de::Error>(self, v: bool) -> Result<String, E> {
@@ -279,14 +365,24 @@ impl<'de> Visitor<'de> for ScanKey {
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<String, A::Error> {
-        Scan(self.0).visit_seq(seq).map(|()| String::new())
+        self.0.visit_seq(seq).map(|()| String::new())
     }
 
     fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<String, A::Error> {
-        Scan(self.0).visit_map(map).map(|()| String::new())
+        self.0.visit_map(map).map(|()| String::new())
     }
 
+    /// A key carrying a local tag (`!mine env:`) arrives as an enum. The
+    /// typed parse resolves the tag away and honours it as the field it
+    /// names, so this has to hand back the same text: dropping it puts the
+    /// value beside it in the wrong slot, and the refusal then contradicts
+    /// its own key path.
     fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<String, A::Error> {
-        Scan(self.0).visit_enum(data).map(|()| String::new())
+        let (_tag, variant) = data.variant::<IgnoredAny>()?;
+        variant.newtype_variant_seed(self)
     }
 }
+
+#[cfg(test)]
+#[path = "no_null_tests.rs"]
+mod no_null_tests;

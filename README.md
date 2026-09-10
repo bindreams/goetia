@@ -104,8 +104,10 @@ Exactly three forms are accepted:
 **Every other `$` is an error.** A `$` not immediately followed by `{` or by
 another `$` is rejected, naming its byte offset — a typo like `$HOME` cannot
 silently become the literal text `$HOME` in a generated service artifact.
-This is one of two places a manifest that was previously accepted can now
-fail — the other is [an explicit `null`](#an-explicit-null-is-not-a-way-to-unset-a-field):
+This is one of three places a manifest that was previously accepted can now
+fail — the others are
+[an explicit `null`](#an-explicit-null-is-not-a-way-to-unset-a-field) and
+[an `env` key written twice](#an-env-key-may-not-repeat):
 **a literal `$` must be written `$$`**, so a `command` argument written
 `$ARGS` becomes `$$ARGS`. Text that already looked like a reference breaks
 differently but needs the same fix: a literal `${A}` now fails with
@@ -252,7 +254,9 @@ and stays legal. The same distinction makes `env: {A: }` an error and
 `env: {A: ""}` a normal assignment — `FOO=` is a normal thing to write.
 Quoting is what tells the two apart, and it is the same rule that keeps a
 quoted `"null"` a legal name, key, value and daemon id: it is a string the
-author chose, not a YAML null.
+author chose, not a YAML null. It is why `!!null ""` is the empty string
+too — the tag says null, but the content is a quoted empty string, and the
+content is what the value is.
 
 The rejection exists because YAML's `null` was not reaching the manifest as
 "absent". It arrived three different wrong ways, depending on the position:
@@ -268,6 +272,8 @@ The rejection exists because YAML's `null` was not reaching the manifest as
 - **A container** — `daemons:`, `env:` or `command:` with nothing under it —
   became an _empty_ container. A manifest whose `daemons:` key had lost its
   body installed nothing and exited 0.
+
+## An `env` key may not repeat
 
 An `env` key that repeats, or that differs from another only in case, is
 rejected rather than silently keeping one of the two. Case counts because

@@ -18,8 +18,10 @@
 
 use std::fmt;
 
-use serde::de::{self, MapAccess, Visitor};
+use serde::de::{self, MapAccess, Unexpected, Visitor};
 use serde::{Deserialize, Deserializer};
+
+use super::no_null::NULL_ACCOUNT_ID;
 
 /// The `user:` field exactly as authored, before the `root` reserved word
 /// is applied. `RawSpec` holds one of these so that interpolation can
@@ -56,11 +58,68 @@ pub enum User {
 
 /// The value of a `user.id` struct field: numeric YAML values become
 /// `Uid`, everything else (including a quoted digit string) becomes `Sid`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccountId {
     Uid(u32),
     Sid(String),
+}
+
+impl<'de> Deserialize<'de> for AccountId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(AccountIdVisitor)
+    }
+}
+
+/// Hand-written rather than `#[serde(untagged)]` for the reason the module
+/// doc comment gives, and for one more: an untagged enum buffers the value
+/// and reports every failed variant as a single message naming the Rust
+/// type, so an explicit `null` here read `data did not match any variant of
+/// untagged enum AccountId`. This is the position that decides a service's
+/// security principal, and `no_null`'s scan cannot answer it — that scan
+/// only ever runs on a document this parse has already accepted.
+struct AccountIdVisitor;
+
+impl<'de> Visitor<'de> for AccountIdVisitor {
+    type Value = AccountId;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a numeric account id, or a SID string")
+    }
+
+    fn visit_unit<E>(self) -> Result<AccountId, E>
+    where
+        E: de::Error,
+    {
+        Err(E::custom(NULL_ACCOUNT_ID))
+    }
+
+    fn visit_u64<E>(self, v: u64) -> Result<AccountId, E>
+    where
+        E: de::Error,
+    {
+        u32::try_from(v)
+            .map(AccountId::Uid)
+            .map_err(|_| E::invalid_value(Unexpected::Unsigned(v), &self))
+    }
+
+    fn visit_i64<E>(self, v: i64) -> Result<AccountId, E>
+    where
+        E: de::Error,
+    {
+        u32::try_from(v)
+            .map(AccountId::Uid)
+            .map_err(|_| E::invalid_value(Unexpected::Signed(v), &self))
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<AccountId, E>
+    where
+        E: de::Error,
+    {
+        Ok(AccountId::Sid(v.to_owned()))
+    }
 }
 
 impl<'de> Deserialize<'de> for RawUser {
