@@ -117,9 +117,9 @@ pub enum Error {
     ElevationRequired { subcommand: String },
 
     /// [`crate::manager::native`] has no [`ServiceManager`] implementation
-    /// for the running platform yet — true for every platform until Tasks
-    /// 11-13 land. A message here, never a panic: a CLI user hitting this
-    /// gets a diagnosable error instead of a crash.
+    /// for the running platform — anything but Linux, macOS or Windows. A
+    /// message here, never a panic: a CLI user hitting this gets a
+    /// diagnosable error instead of a crash.
     ///
     /// [`ServiceManager`]: crate::manager::ServiceManager
     #[error("no backend for {platform} yet")]

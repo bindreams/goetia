@@ -1,5 +1,5 @@
 //! The `ServiceManager` seam: one trait implemented by each real backend
-//! (Tasks 11-13) and by [`fake::Fake`], the in-memory test double every CLI
+//! and by [`fake::Fake`], the in-memory test double every CLI
 //! and policy test in this crate runs against instead of a real
 //! systemd/launchd/SCM.
 //!

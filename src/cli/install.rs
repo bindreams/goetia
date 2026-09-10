@@ -218,8 +218,8 @@ fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn
 // lookup too), which a *preview* has no business doing. What follows is
 // therefore a literal, lookup-free rendering: correct for the common
 // `root`/`name`/numeric-`uid` cases, and clearly a preview — never what a
-// real install's own effectful identity resolution (Tasks 11-13) would
-// write byte-for-byte in every case.
+// real install's own effectful identity resolution would write
+// byte-for-byte in every case.
 
 fn preview_identity(user: &User) -> Identity {
     Identity {
