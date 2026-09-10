@@ -203,7 +203,7 @@ where
     d.deserialize_map(EnvVisitor)
 }
 
-struct EnvVisitor;
+pub(super) struct EnvVisitor;
 
 impl<'de> Visitor<'de> for EnvVisitor {
     type Value = BTreeMap<String, String>;

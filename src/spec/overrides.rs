@@ -9,9 +9,12 @@
 //!   `cwd`, `env`, `user`, `restart`, `restart-delay`, `logs`, `type`.
 //! - A scalar or list field replaces the base value outright; `env` merges
 //!   key by key instead, the override winning where both set the same key.
-//! - An explicit YAML `null` is an error for all nine fields, and for both
-//!   the keys and the values of `env`. `env: {A: ""}` stays a legal empty
-//!   assignment — only `null` is refused, not emptiness.
+//!   A key repeated *within* one `env` map, or colliding with another by
+//!   case alone, is an error naming it — `raw.rs`'s check, reused here.
+//! - An explicit YAML `null` is an error for all nine fields and for every
+//!   leaf under them. That is `no_null`'s scan, not this module: the scan
+//!   is schema-blind, so it walks an override like any other subtree, and
+//!   `Slot` routes one exactly like the daemon it overrides.
 //! - `${VAR}` is substituted only in the override for the backend actually
 //!   being installed to; the other two are checked as authored, never
 //!   substituted. Every backend's merged spec is validated on every host,
@@ -30,7 +33,7 @@ use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 use super::Backend;
-use super::raw::RawSpec;
+use super::raw::{EnvVisitor, RawSpec};
 use super::user::RawUser;
 
 pub type BackendOverrides = BTreeMap<Backend, RawOverride>;
@@ -48,7 +51,7 @@ pub struct RawOverride {
     pub command: Option<Vec<String>>,
     #[serde(default)]
     pub cwd: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "no_duplicate_env")]
     pub env: Option<BTreeMap<String, String>>,
     #[serde(default)]
     pub user: Option<RawUser>,
@@ -203,6 +206,18 @@ impl<'de> Visitor<'de> for OverridesVisitor {
 
         Ok(overrides)
     }
+}
+
+/// `RawOverride::env`, checked for a duplicate key by the same visitor
+/// `RawSpec::env` uses, so base and override cannot disagree about what a
+/// duplicate is. The `Option` is always `Some` here: a missing key never
+/// reaches this function, and a `null` one is a type error the map visitor
+/// raises, exactly as it does for the base field.
+fn no_duplicate_env<'de, D>(d: D) -> Result<Option<BTreeMap<String, String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    d.deserialize_map(EnvVisitor).map(Some)
 }
 
 #[cfg(test)]

@@ -353,9 +353,10 @@ daemons:
 Every field but the daemon's id is overridable: `name`, `command`, `cwd`,
 `env`, `user`, `restart`, `restart-delay`, `logs`, `type`. A scalar or list
 field replaces the base value outright; `env` merges key by key, the
-override winning where both set the same key. An unknown backend key is an
-error naming it, as is a repeated one, and an explicit `null` is an error
-anywhere in the block — omit the key instead.
+override winning where both set the same key. A key repeated _within_ one
+`env` map, base or override, is an error naming it. An unknown backend key
+is an error naming it, as is a repeated one, and an explicit `null` is an
+error anywhere in the block — omit the key instead.
 
 **Only the backend native to this host is installed, but every backend's
 merged spec is validated on every host.** So the manifest above renders on
@@ -395,6 +396,11 @@ check that would need a resolved value is skipped rather than guessed at:
 from Linux, `scm: {user: "${ACCT}"}` is unresolvable and therefore
 unchecked, while `systemd: {user: "${ACCT}"}` is substituted and checked
 like any other native value.
+
+A _base_ field is the other case: it is substituted for the backend being
+installed, so it is the resolved value every backend's advisories read.
+Moving `type` or `restart-delay` into `.env` does not silence a warning the
+literal would have produced.
 
 ## Machine-readable output
 

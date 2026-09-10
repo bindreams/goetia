@@ -75,6 +75,65 @@ daemons:
 }
 
 #[skuld::test]
+fn duplicate_env_key_is_rejected_in_a_base_spec() {
+    // `env`'s values become a privileged service's environment, so the
+    // insert-and-overwrite a typed `BTreeMap` would do is the one silent
+    // loss this manifest surface cannot afford: the daemon would run with
+    // an environment the author never wrote and cannot see they lost.
+    let yaml = "
+daemons:
+  frpc:
+    command: [/bin/frpc]
+    env:
+      PORT: \"8080\"
+      PORT: \"9090\"
+";
+    let err = parse(yaml).unwrap_err();
+    assert!(err.to_string().contains("PORT"), "error should name `PORT`: {err}");
+}
+
+#[skuld::test]
+fn duplicate_env_key_is_rejected_in_an_override() {
+    // One visitor serves `no_null_env` and `no_null_env_option` alike, so
+    // base and override cannot diverge on this.
+    let yaml = "
+daemons:
+  frpc:
+    command: [/bin/frpc]
+    backend-specific:
+      scm:
+        env:
+          PORT: \"8080\"
+          PORT: \"9090\"
+";
+    let err = parse(yaml).unwrap_err();
+    assert!(err.to_string().contains("PORT"), "error should name `PORT`: {err}");
+}
+
+#[skuld::test]
+fn a_base_env_key_and_an_override_of_it_are_not_a_duplicate() {
+    // The check is per-map, not across the merge: an override winning over
+    // the base key by key is `merged_for`'s documented job.
+    let yaml = "
+daemons:
+  frpc:
+    command: [/bin/frpc]
+    env:
+      PORT: \"8080\"
+    backend-specific:
+      scm:
+        env:
+          PORT: \"9090\"
+";
+    let manifest = parse(yaml).expect("an override of a base env key is not a duplicate");
+    let scm = manifest.daemons["frpc"].backend_specific[&Backend::Scm]
+        .env
+        .as_ref()
+        .expect("the override sets `env`");
+    assert_eq!(scm["PORT"], "9090");
+}
+
+#[skuld::test]
 fn unknown_backend_key_is_rejected() {
     let yaml = "
 daemons:
@@ -163,7 +222,9 @@ fn explicit_null_is_rejected_for_every_overridable_field() {
     // a row here. The refusal comes from `no_null`'s scan, which is
     // schema-blind and so walks this subtree like any other; the wording
     // differs per field because `Slot` routes an override exactly like the
-    // daemon it overrides — see `no_null`'s `Slot::value`.
+    // daemon it overrides — see `no_null`'s `Slot::value`. `env` is the one
+    // row the typed parse answers first, for the reason it does in the base
+    // position: a `null` is not the mapping its visitor asked for.
     for field in OVERRIDABLE_FIELDS {
         let yaml = format!(
             "
@@ -178,7 +239,7 @@ daemons:
         let err = parse(&yaml).unwrap_err();
         let expected = match field {
             "command" => "an explicit `null` is not a command",
-            "env" => "an explicit `null` is not an environment block",
+            "env" => "invalid type: unit value, expected a mapping of environment variable name to value",
             "user" => "an explicit `null` is not a user",
             _ => "an explicit `null` is not a way to unset this field",
         };
