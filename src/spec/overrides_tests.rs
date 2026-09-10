@@ -190,6 +190,27 @@ daemons:
 }
 
 #[skuld::test]
+fn a_null_user_name_in_an_override_is_rejected() {
+    // The override twin of `raw_tests.rs`'s base-position test: both fields
+    // hold a `RawUser`, so one guard covers both, and this is the assertion
+    // that it does.
+    let yaml = "
+daemons:
+  frpc:
+    command: [/bin/frpc]
+    backend-specific:
+      scm:
+        user:
+          name: null
+";
+    let err = parse(yaml).unwrap_err();
+    assert!(
+        err.to_string().contains("an explicit `null` is not a username"),
+        "{err}"
+    );
+}
+
+#[skuld::test]
 fn null_env_values_in_an_override_are_rejected() {
     for spelling in ["null", "~", ""] {
         let yaml = format!(
