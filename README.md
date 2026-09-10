@@ -240,12 +240,22 @@ permissions protect the secret.
 
 ## An explicit `null` is not a way to unset a field
 
-Writing `null` — or its YAML spellings `~` and an empty value — is an error
-wherever a manifest value is expected. Omit the key instead; that is what
+Writing `null` is an error wherever a manifest value is expected — as the
+word itself, as `~`, as an empty value (`name:` with nothing after it), or
+with an explicit tag (`!!null "null"`). Omit the key instead; that is what
 selects the default.
 
+An empty _value_ and an empty _string_ are different things, and only the
+first is a `null`. `name:` with nothing after it is YAML's null and is
+rejected; `name: ""` is the empty string, which is a value the author wrote
+and stays legal. The same distinction makes `env: {A: }` an error and
+`env: {A: ""}` a normal assignment — `FOO=` is a normal thing to write.
+Quoting is what tells the two apart, and it is the same rule that keeps a
+quoted `"null"` a legal name, key, value and daemon id: it is a string the
+author chose, not a YAML null.
+
 The rejection exists because YAML's `null` was not reaching the manifest as
-"absent". It arrived two different wrong ways, depending on the position:
+"absent". It arrived three different wrong ways, depending on the position:
 
 - **A field that has a default** read `restart: null` as _unset_ and quietly
   applied the default. What the author explicitly wrote was discarded with
@@ -255,15 +265,15 @@ The rejection exists because YAML's `null` was not reaching the manifest as
   `null`. `env: {DEBUG: null}` installed a service whose `DEBUG` was the
   string `null`; `daemons: {null: …}` produced a daemon installed as
   `null.service`.
+- **A container** — `daemons:`, `env:` or `command:` with nothing under it —
+  became an _empty_ container. A manifest whose `daemons:` key had lost its
+  body installed nothing and exited 0.
 
-A **quoted** `"null"` is untouched and remains a legal name, key and value —
-it is a string the author chose, not a YAML null.
-
-`env: {A: ""}` also stays legal: an empty value is a normal assignment, and
-`FOO=` is a normal thing to write.
-
-A **duplicate** `env` key is rejected for the same reason rather than
-silently keeping the last one, matching what daemon ids already did.
+An `env` key that repeats, or that differs from another only in case, is
+rejected rather than silently keeping one of the two. Case counts because
+Windows looks an environment variable up case-insensitively, so
+`{Path: a, PATH: b}` would reach the daemon as one variable — daemon ids
+have been compared the same way, for the same reason, since before this.
 
 ## Paths in `command`
 
