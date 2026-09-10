@@ -82,3 +82,29 @@ fn user_struct_rejects_unknown_field() {
     let err = parse("bogus: true").unwrap_err();
     assert!(err.to_string().contains("bogus"));
 }
+
+#[skuld::test]
+fn user_struct_name_rejects_an_explicit_null() {
+    // The guard on the `user:` field sits one level above this one and does
+    // not reach it: without a guard here too, `serde_yaml_ng` renders the
+    // plain scalar's text for a `String` and the username becomes the
+    // literal `"null"` — a service installed under an account nobody named.
+    // `{id: null}` is refused by `AccountId`'s untagged deserializer; both
+    // halves of the field must agree.
+    for spelling in ["null", "~", ""] {
+        let err = parse(&format!("name: {spelling}\n")).unwrap_err();
+        assert!(
+            err.to_string().contains("an explicit `null` is not a username"),
+            "`name: {spelling}`: expected the null rejection, got: {err}"
+        );
+        assert!(parse(&format!("id: {spelling}\n")).is_err(), "`id: {spelling}`");
+    }
+}
+
+#[skuld::test]
+fn user_struct_name_still_coerces_an_unquoted_scalar() {
+    // Refusing `null` must not cost the unquoted-scalar coercion, and must
+    // not touch the four characters when they are quoted.
+    assert_eq!(parse("name: 42").unwrap(), RawUser::Name("42".to_string()));
+    assert_eq!(parse("name: \"null\"").unwrap(), RawUser::Name("null".to_string()));
+}

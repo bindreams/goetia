@@ -17,6 +17,7 @@ use std::fmt;
 use serde::de::{self, DeserializeSeed, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
+use super::no_null::{no_null, no_null_command, no_null_env, string_or_null};
 use super::user::RawUser;
 
 /// The whole `goetia.yaml` document.
@@ -31,17 +32,23 @@ pub struct RawManifest {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawSpec {
+    #[serde(default, deserialize_with = "no_null")]
     pub name: Option<String>,
+    #[serde(deserialize_with = "no_null_command")]
     pub command: Vec<String>,
+    #[serde(default, deserialize_with = "no_null")]
     pub cwd: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "no_null_env")]
     pub env: BTreeMap<String, String>,
+    #[serde(default, deserialize_with = "no_null")]
     pub user: Option<RawUser>,
+    #[serde(default, deserialize_with = "no_null")]
     pub restart: Option<String>,
-    #[serde(rename = "restart-delay")]
+    #[serde(rename = "restart-delay", default, deserialize_with = "no_null")]
     pub restart_delay: Option<String>,
+    #[serde(default, deserialize_with = "no_null")]
     pub logs: Option<String>,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default, deserialize_with = "no_null")]
     pub kind: Option<String>,
 }
 
@@ -101,6 +108,24 @@ impl<'de> DeserializeSeed<'de> for DaemonsSeed {
     }
 }
 
+/// A daemon id that refuses an explicit YAML `null`. Local to this module
+/// because `DaemonsVisitor` is its only user; the rejection itself is
+/// shared with `env`'s keys and values.
+struct NoNullDaemonId(String);
+
+impl<'de> Deserialize<'de> for NoNullDaemonId {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        string_or_null(
+            d,
+            "an explicit `null` is not a daemon id; quote the key to use its literal text",
+        )
+        .map(NoNullDaemonId)
+    }
+}
+
 struct DaemonsVisitor;
 
 impl<'de> Visitor<'de> for DaemonsVisitor {
@@ -120,7 +145,7 @@ impl<'de> Visitor<'de> for DaemonsVisitor {
         // messages.
         let mut seen: BTreeMap<String, String> = BTreeMap::new();
 
-        while let Some(key) = map.next_key::<String>()? {
+        while let Some(NoNullDaemonId(key)) = map.next_key::<NoNullDaemonId>()? {
             let lower = key.to_lowercase();
             if let Some(first) = seen.get(&lower) {
                 return Err(if *first == key {
