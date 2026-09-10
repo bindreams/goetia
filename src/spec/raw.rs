@@ -26,6 +26,20 @@ use super::no_null::reject_nulls;
 use super::user::RawUser;
 
 /// The whole `goetia.yaml` document.
+///
+/// **Construct one with [`RawManifest::parse`], not with `Deserialize`.**
+/// The null rule is enforced by a pre-parse scan that `parse` runs, because
+/// it needs the manifest *text* to report a position — a `Deserializer` no
+/// longer has one by the time a field could object. So
+/// `serde_yaml_ng::from_str::<RawManifest>` compiles, and silently accepts
+/// every explicit `null` this module exists to refuse.
+///
+/// That is a real gap in the public surface, not a theoretical one: this
+/// type is exported, so a library consumer can reach the unguarded path.
+/// It is stated here rather than left to be discovered. Narrowing it means
+/// deciding whether [`resolve`](super::resolve) — the only reason this type
+/// is public at all — belongs in the public API beside
+/// [`load`](super::load), which takes a path and is always safe.
 #[derive(Debug, Clone, Default)]
 pub struct RawManifest {
     pub daemons: BTreeMap<String, RawSpec>,
