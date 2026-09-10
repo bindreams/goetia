@@ -21,8 +21,8 @@
 //!   by one byte reports the installed service as stale-and-regeneratable
 //!   (see `decide::Outcome::Stale`) rather than as a user hand-edit.
 //!
-//! `decode` re-runs `DaemonSpec`'s injection-gate validation (Task 3's
-//! `spec::resolve` checks, reused here rather than duplicated) against
+//! `decode` re-runs `DaemonSpec`'s injection-gate validation (`spec::resolve`'s
+//! own checks, reused here rather than duplicated) against
 //! the deserialized content: `DaemonSpec`'s fields are `pub`, and a
 //! tampered or bit-rotted artifact can carry structurally valid JSON that
 //! violates them.

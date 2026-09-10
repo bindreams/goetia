@@ -1,8 +1,8 @@
-use super::{manifest, manifest_would_change, scalar, would_substitution_change};
+use super::{check_spec_grammar, reject_interpolated_id, scalar, spec, spec_would_change, would_substitution_change};
 use crate::error::Error;
 use crate::spec::resolve::resolve_user;
 use crate::spec::vars::Vars;
-use crate::spec::{AccountId, RawManifest, RawUser, User};
+use crate::spec::{AccountId, RawManifest, RawSpec, RawUser, User};
 
 /// Substitute `input` against `vars` at a fixed test path.
 fn sub(input: &str, vars: &Vars) -> Result<String, Error> {
@@ -225,14 +225,34 @@ fn errors_carry_the_supplied_path() {
     }
 }
 
-// The manifest walk ===================================================================================================
+// `check_grammar` =====================================================================================================
 
-/// Parse a manifest fixture, substitute it against `pairs`, and hand back
-/// the mutated manifest.
-fn interpolate_yaml(yaml: &str, pairs: &[(&str, &str)]) -> Result<RawManifest, Error> {
+#[skuld::test]
+fn check_grammar_accepts_a_well_formed_reference_without_resolving_it() {
+    // Grammar only: no variable is resolved, so an undefined name is not an
+    // error here — the whole reason `check_grammar` exists rather than
+    // reusing `scalar` with an empty `Vars`.
+    assert!(super::check_grammar("${UNDEFINED}", "daemons.frpc.name").is_ok());
+}
+
+#[skuld::test]
+fn check_grammar_rejects_a_bare_dollar() {
+    let err = super::check_grammar("$HOME", "daemons.frpc.name").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "daemons.frpc.name: `$` at byte 0 is not part of `${...}`; write `$$` for a literal `$`"
+    );
+}
+
+// The `spec` walk =====================================================================================================
+
+/// Parse a manifest fixture, substitute its one `frpc` daemon, and hand back
+/// the mutated `RawSpec` — the same walk `resolve` now does per daemon.
+fn interpolate_yaml(yaml: &str, pairs: &[(&str, &str)]) -> Result<RawSpec, Error> {
     let mut raw: RawManifest = serde_yaml_ng::from_str(yaml).expect("fixture yaml should parse");
-    manifest(&mut raw, &Vars::from_pairs(pairs))?;
-    Ok(raw)
+    let mut entry = raw.daemons.remove("frpc").expect("fixture must declare `frpc`");
+    spec(&mut entry, "daemons.frpc", &Vars::from_pairs(pairs))?;
+    Ok(entry)
 }
 
 #[skuld::test]
@@ -251,7 +271,7 @@ daemons:
     restart-delay: ${DELAY}
     type: ${TYPE}
 "#;
-    let raw = interpolate_yaml(
+    let spec = interpolate_yaml(
         yaml,
         &[
             ("NAME", "Frpc Tunnel"),
@@ -268,9 +288,11 @@ daemons:
     )
     .unwrap();
 
-    let spec = &raw.daemons["frpc"];
     assert_eq!(spec.name.as_deref(), Some("Frpc Tunnel"));
-    assert_eq!(spec.command, vec!["/usr/bin/frpc", "--flag=on"]);
+    assert_eq!(
+        spec.command.as_deref(),
+        Some(&["/usr/bin/frpc".to_string(), "--flag=on".to_string()][..])
+    );
     assert_eq!(spec.cwd.as_deref(), Some("/opt/frpc"));
     assert_eq!(spec.logs.as_deref(), Some("/var/log/frpc.log"));
     assert_eq!(spec.env["LOG"], "info");
@@ -282,8 +304,10 @@ daemons:
 
 #[skuld::test]
 fn a_dollar_in_a_daemon_id_is_an_error() {
-    let yaml = "daemons:\n  ${ID}:\n    command: [/bin/frpc]\n";
-    let err = interpolate_yaml(yaml, &[("ID", "frpc")]).unwrap_err();
+    // `spec`/`interpolate_yaml` no longer see the daemon id at all — the
+    // rejection is `reject_interpolated_id`'s alone now. The end-to-end
+    // half (through `resolve`) lives in `resolve_tests.rs`.
+    let err = reject_interpolated_id("${ID}").unwrap_err();
     assert!(
         err.to_string().contains("a daemon id cannot be interpolated"),
         "expected an id-is-a-key rejection, got: {err}"
@@ -306,8 +330,8 @@ fn an_env_name_containing_a_dot_is_not_mistaken_for_user_id() {
     // an `env` key that happens to spell one cannot pick up that field's
     // rule.
     let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    env:\n      MY_user.id: ${TOKEN}\n";
-    let raw = interpolate_yaml(yaml, &[("TOKEN", "s3cret")]).unwrap();
-    assert_eq!(raw.daemons["frpc"].env["MY_user.id"], "s3cret");
+    let spec = interpolate_yaml(yaml, &[("TOKEN", "s3cret")]).unwrap();
+    assert_eq!(spec.env["MY_user.id"], "s3cret");
 }
 
 #[skuld::test]
@@ -324,15 +348,15 @@ fn a_dollar_under_user_id_is_an_error() {
 #[skuld::test]
 fn a_numeric_user_id_is_untouched() {
     let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user:\n      id: 1001\n";
-    let raw = interpolate_yaml(yaml, &[]).unwrap();
-    assert_eq!(raw.daemons["frpc"].user, Some(RawUser::Id(AccountId::Uid(1001))));
+    let spec = interpolate_yaml(yaml, &[]).unwrap();
+    assert_eq!(spec.user, Some(RawUser::Id(AccountId::Uid(1001))));
 }
 
-/// The `user:` of the single daemon in `yaml`, substituted and then
+/// The `user:` of `yaml`'s single `frpc` daemon, substituted and then
 /// resolved — the two halves `load` runs back to back.
 fn interpolated_user(yaml: &str, pairs: &[(&str, &str)]) -> User {
-    let raw = interpolate_yaml(yaml, pairs).unwrap();
-    resolve_user(raw.daemons["frpc"].user.clone())
+    let spec = interpolate_yaml(yaml, pairs).unwrap();
+    resolve_user(spec.user)
 }
 
 #[skuld::test]
@@ -365,15 +389,46 @@ fn an_interpolated_user_name_of_root_stays_a_literal_account() {
 }
 
 #[skuld::test]
-fn manifest_would_change_is_true_for_an_escaped_dollar_only() {
-    // The over-approximation, pinned at manifest level: a `$$` escape has
-    // no reference to resolve, yet still reports `true`. See the module doc
+fn spec_would_change_is_true_for_an_escaped_dollar_only() {
+    // The over-approximation, pinned at spec level: a `$$` escape has no
+    // reference to resolve, yet still reports `true`. See the module doc
     // comment — narrowing this is a defect, not an optimisation.
     let escaped: RawManifest =
         serde_yaml_ng::from_str("daemons:\n  frpc:\n    command: [/bin/frpc, $$ARGS]\n").unwrap();
-    assert!(manifest_would_change(&escaped));
+    assert!(spec_would_change(&escaped.daemons["frpc"]));
 
     let dollarless: RawManifest =
         serde_yaml_ng::from_str("daemons:\n  frpc:\n    command: [/bin/frpc, --flag]\n").unwrap();
-    assert!(!manifest_would_change(&dollarless));
+    assert!(!spec_would_change(&dollarless.daemons["frpc"]));
+}
+
+// `check_spec_grammar` ================================================================================================
+
+#[skuld::test]
+fn check_spec_grammar_accepts_a_well_formed_manifest() {
+    let raw: RawManifest =
+        serde_yaml_ng::from_str("daemons:\n  frpc:\n    name: ${NAME}\n    command: [\"${BIN}\"]\n    restart: ${R}\n")
+            .unwrap();
+    assert!(check_spec_grammar(&raw.daemons["frpc"], "daemons.frpc").is_ok());
+}
+
+#[skuld::test]
+fn check_spec_grammar_rejects_a_bare_dollar_in_name() {
+    let raw: RawManifest =
+        serde_yaml_ng::from_str("daemons:\n  frpc:\n    name: a$b\n    command: [/bin/frpc]\n").unwrap();
+    let err = check_spec_grammar(&raw.daemons["frpc"], "daemons.frpc").unwrap_err();
+    assert!(
+        err.to_string().contains("not part of"),
+        "expected the bare-`$` grammar rejection, got: {err}"
+    );
+}
+
+#[skuld::test]
+fn check_spec_grammar_does_not_require_a_defined_variable() {
+    // Grammar only, never resolution — an undefined `${UNDEFINED}` must not
+    // fail here; that is `interpolate::spec`'s job, once `.env` is actually
+    // consulted.
+    let raw: RawManifest =
+        serde_yaml_ng::from_str("daemons:\n  frpc:\n    name: ${UNDEFINED}\n    command: [/bin/frpc]\n").unwrap();
+    assert!(check_spec_grammar(&raw.daemons["frpc"], "daemons.frpc").is_ok());
 }

@@ -6,14 +6,22 @@
 //! below, so nothing downstream — a generator, the metadata blob — needs to
 //! re-derive them. There is no separate `validate()` function anywhere in
 //! the crate; `resolve` is both parse and validate.
+//!
+//! A daemon may also carry a `backend-specific:` block overriding its
+//! fields per [`Backend`]; see `overrides`'s module doc for the
+//! manifest-facing reference.
 
+mod backend;
 mod interpolate;
 mod no_null;
+mod overrides;
 mod raw;
 mod resolve;
 mod user;
 mod vars;
 
+pub use backend::Backend;
+pub use overrides::{BackendOverrides, RawOverride, Supplied};
 pub use raw::{RawManifest, RawSpec};
 pub use resolve::{load, resolve};
 pub use user::{AccountId, RawUser, User};
@@ -25,6 +33,17 @@ pub(crate) use resolve::{
     reject_blank, reject_empty, reject_empty_command, reject_env_key_with_equals, reject_relative_path,
     reject_unemittable,
 };
+// Read by `crate::backend::scm::generate`, which is not a descendant of
+// `spec` and so cannot see through a private `mod backend;`:
+// `windows_builtin` from `canonical_account` and `account_needs_password`,
+// `MAX_SC_ACTION_DELAY` from `registration`'s clamp. `windows_only_account`
+// stays out of this line — only `Backend::error` reads it, inside
+// `spec::backend` itself.
+pub(crate) use backend::{MAX_SC_ACTION_DELAY, windows_builtin};
+// `Builtin` is named through this path from `generate_tests.rs` alone;
+// production code only ever infers it, from `windows_builtin`'s return.
+#[allow(unused_imports)]
+pub(crate) use backend::Builtin;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -147,8 +166,14 @@ pub enum Kind {
 /// cannot be faithfully honored on some platform, or will be silently
 /// transformed (e.g. a sub-second `restart-delay` rounded up for launchd).
 /// Every CLI command that parses a manifest prints these to stderr.
+///
+/// `id` is `None` for a manifest-level advisory that belongs to no single
+/// daemon — e.g. a drive-relative `-f` argument, resolved once by
+/// `resolve::absolutize` before the daemon loop even starts. Attributing it
+/// to an arbitrary daemon would be a lie, and repeating it under every
+/// daemon would say the same manifest-level thing N times.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Warning {
-    pub id: Id,
+    pub id: Option<Id>,
     pub message: String,
 }

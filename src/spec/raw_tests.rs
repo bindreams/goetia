@@ -81,10 +81,10 @@ daemons:
 
 #[skuld::test]
 fn explicit_null_is_rejected_for_every_base_field() {
-    // Every field refuses it, and each says what that position is. The two
-    // whose type is a container are the typed parse's to refuse, because it
-    // runs first and a `null` is not the map or sequence it asked for; the
-    // rest reach the scan, because `Option` and `String` both accept one.
+    // Every field refuses it, and each says what that position is. `env` is
+    // the typed parse's to refuse, because it runs first and a `null` is not
+    // the mapping it asked for; the rest reach the scan, because `Option`
+    // and `String` both accept one.
     let fields = [
         "name",
         "command",
@@ -97,17 +97,15 @@ fn explicit_null_is_rejected_for_every_base_field() {
         "type",
     ];
     for field in fields {
-        // `command` is required, so every row but its own has to supply it.
-        let mut yaml = String::from("daemons:\n  frpc:\n");
-        if field != "command" {
-            yaml.push_str("    command: [bin/frpc]\n");
-        }
-        yaml.push_str(&format!("    {field}: null\n"));
+        // `command` is `Option` here — a missing one is a backend's problem,
+        // not the document's — so no row needs a fixed `command:` line, and
+        // the `command` row would collide with one as a duplicate field.
+        let yaml = format!("daemons:\n  frpc:\n    {field}: null\n");
 
         let err = parse(&yaml).unwrap_err();
         let msg = err.to_string();
         let expected = match field {
-            "command" => "invalid type: unit value, expected a sequence",
+            "command" => "an explicit `null` is not a command",
             "env" => "invalid type: unit value, expected a mapping of environment variable name to value",
             "user" => "an explicit `null` is not a user",
             _ => "an explicit `null` is not a way to unset this field",
@@ -204,8 +202,8 @@ daemons:
 ";
     let manifest = parse(yaml).expect("an empty argv element should parse");
     assert_eq!(
-        manifest.daemons["frpc"].command,
-        ["bin/frpc".to_string(), String::new()]
+        manifest.daemons["frpc"].command.as_deref(),
+        Some(["bin/frpc".to_string(), String::new()].as_slice())
     );
 }
 
@@ -464,7 +462,10 @@ daemons:
     let spec = &manifest.daemons["frpc"];
 
     assert_eq!(spec.name.as_deref(), Some("42"));
-    assert_eq!(spec.command, ["/bin/sleep".to_string(), "30".to_string()]);
+    assert_eq!(
+        spec.command.as_deref(),
+        Some(["/bin/sleep".to_string(), "30".to_string()].as_slice())
+    );
     assert_eq!(spec.env.get("PORT"), Some(&"8080".to_string()));
 }
 
@@ -619,9 +620,10 @@ fn a_tag_resolved_null_is_rejected_wherever_a_plain_one_is() {
 /// manifest value is expected* — including where the expected value is a
 /// container. `serde_yaml_ng` maps an empty plain scalar onto an empty map
 /// or sequence when asked for one, so without a guard `daemons:` with no
-/// body installs nothing and exits 0. That is the half the scan answers;
-/// written out as `null`, the same position is a type error the typed
-/// parse refuses first, naming the field and the container it wanted.
+/// body installs nothing and exits 0. Written out as `null`, a container
+/// the typed parse insists on — `daemons`, `env` — is a type error it
+/// refuses first, naming the field and the container it wanted; `command`
+/// is an `Option` here, so both spellings reach the scan.
 #[skuld::test]
 fn an_empty_container_body_is_rejected() {
     let cases: [(&str, &str); 6] = [
@@ -639,10 +641,7 @@ fn an_empty_container_body_is_rejected() {
             "invalid type: unit value, expected a mapping of environment variable name to value",
         ),
         ("daemons:\n  frpc:\n    command:\n", "not a command"),
-        (
-            "daemons:\n  frpc:\n    command: null\n",
-            "invalid type: unit value, expected a sequence",
-        ),
+        ("daemons:\n  frpc:\n    command: null\n", "not a command"),
     ];
     for (yaml, expected) in cases {
         let err = parse(yaml).unwrap_err().to_string();

@@ -1,7 +1,7 @@
 //! Integration tests for the effectful SCM backend
 //! (`goetia::backend::scm::manager`), `type: managed` only — see that
 //! module's own doc comment for the traps this covers. `type: simple` needs
-//! `goetia-shim` (Task 14); its tests live there.
+//! `goetia-shim`; its tests live there.
 //!
 //! Every test here registers and removes real Windows services, so it needs
 //! elevation exactly like `tests/marker_inertness.rs`'s `scm.rs` probe (see

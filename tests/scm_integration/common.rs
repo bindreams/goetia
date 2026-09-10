@@ -1,22 +1,101 @@
 //! Shared `DaemonSpec` construction for the SCM integration tests.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use goetia::spec::{DaemonSpec, Id, Kind, Restart, User};
+use windows_service::service::ServiceAccess;
+use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 
 use crate::{fixture, support};
 
-/// The argv `type: managed` should run: this test binary itself, dispatched
-/// into `fixture::service_main` — see `fixture.rs`'s module doc comment.
-pub fn fixture_command(id: &str, start_port: u16, stop_port: u16, mode: &str) -> Vec<String> {
+/// [`fixture_command`], parameterized on the executable path. Needed by
+/// `a_local_service_daemon_actually_runs` (`managed.rs`), which runs the
+/// fixture from a copy under `%ProgramData%` (see [`WorldReadableExe`])
+/// rather than the ordinary `target/` one — `LocalService` cannot be
+/// assumed to have execute access to the repo's own build tree.
+pub fn fixture_command_with_exe(exe: &str, id: &str, start_port: u16, stop_port: u16, mode: &str) -> Vec<String> {
     vec![
-        support::current_exe_str(),
+        exe.to_string(),
         fixture::FIXTURE.to_string(),
         id.to_string(),
         start_port.to_string(),
         stop_port.to_string(),
         mode.to_string(),
     ]
+}
+
+/// The argv `type: managed` should run: this test binary itself, dispatched
+/// into `fixture::service_main` — see `fixture.rs`'s module doc comment.
+pub fn fixture_command(id: &str, start_port: u16, stop_port: u16, mode: &str) -> Vec<String> {
+    fixture_command_with_exe(&support::current_exe_str(), id, start_port, stop_port, mode)
+}
+
+/// The live `account_name` SCM reports for `id`, exactly as
+/// `windows-service`'s `ServiceConfig` returns it — the *literal* spelling
+/// SCM stored, not what `generate::canonical_account` would fold it back
+/// to. `local_service_account_installs_and_round_trips` needs this raw
+/// value to prove SCM itself stores the canonical spelling `install` wrote,
+/// rather than merely that this backend's own readback path canonicalises
+/// whatever comes back.
+pub fn query_account_name(id: &str) -> Option<String> {
+    let scm = WinServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .unwrap_or_else(|e| panic!("open SCM to query `{id}`'s config: {e}"));
+    let service = scm
+        .open_service(id, ServiceAccess::QUERY_CONFIG)
+        .unwrap_or_else(|e| panic!("open `{id}` to query its config: {e}"));
+    let cfg = service
+        .query_config()
+        .unwrap_or_else(|e| panic!("query config for `{id}`: {e}"));
+    cfg.account_name.map(|a| a.to_string_lossy().into_owned())
+}
+
+/// A copy of the current test executable, placed under `%ProgramData%` with
+/// an explicit grant of read+execute to `Everyone` (by well-known SID
+/// `S-1-1-0`, not by localized name), removed again on drop.
+///
+/// `LocalService` cannot be assumed to have execute access to the repo's
+/// own `target/` tree — CI checks that out under an ACL scoped to the
+/// runner's own (interactive/build) account, not to every built-in service
+/// identity. A plain copy is not enough on its own either: it inherits
+/// `%ProgramData%`'s own ACL, which does not grant `Everyone` execute
+/// either, hence the explicit `icacls` grant.
+pub struct WorldReadableExe {
+    path: PathBuf,
+}
+
+impl WorldReadableExe {
+    pub fn new(id: &str) -> Self {
+        let program_data =
+            std::env::var_os("ProgramData").unwrap_or_else(|| panic!("%ProgramData% is not set on this host"));
+        let path = PathBuf::from(program_data).join(format!("{id}.exe"));
+        let exe = std::env::current_exe().expect("locate the test binary");
+        std::fs::copy(&exe, &path).unwrap_or_else(|e| panic!("copy {} to {}: {e}", exe.display(), path.display()));
+
+        let path_str = path
+            .to_str()
+            .unwrap_or_else(|| panic!("{} is not UTF-8", path.display()));
+        support::cmd::run("icacls", &[path_str, "/grant", "*S-1-1-0:(RX)"]).expect_ok();
+
+        Self { path }
+    }
+
+    pub fn path_str(&self) -> String {
+        self.path
+            .to_str()
+            .unwrap_or_else(|| panic!("{} is not UTF-8", self.path.display()))
+            .to_string()
+    }
+}
+
+impl Drop for WorldReadableExe {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("WorldReadableExe[{}]: cleanup failed: {e}", self.path.display());
+            }
+        }
+    }
 }
 
 /// A `type: managed` `DaemonSpec`, every field spelled out. Built literally

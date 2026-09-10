@@ -751,6 +751,129 @@ fn show_absent_id_outranks_unreadable_id_regardless_of_argument_order() {
     assert_eq!(code_b, 1);
 }
 
+// backend-specific overrides through the CLI ==========================================================================
+//
+// `native()` is `Some` on every CI platform
+// (`native_backend_agrees_with_the_platforms_that_have_a_service_manager`
+// guarantees it), so these fixtures read the native backend at test time
+// rather than special-casing per platform, and skipping is neither needed
+// nor permitted.
+
+/// A backend that is not this host's native one. `Backend::ALL` always has
+/// at least two such entries (`Backend::native()` names at most one), so
+/// the first match is deterministic and always exists. Mirrors
+/// `non_native_backend` in `src/spec/resolve_tests.rs`.
+fn non_native_backend() -> goetia::spec::Backend {
+    goetia::spec::Backend::ALL
+        .into_iter()
+        .find(|&b| Some(b) != goetia::spec::Backend::native())
+        .expect("ALL has 3 entries; native() names at most 1")
+}
+
+/// The blob install writes stores the *merged* spec, not the base one:
+/// `restart` changes only under the native backend's override, and `show`
+/// with no `-f` — reading only the installed metadata blob, never the
+/// manifest — reports the overridden value.
+#[skuld::test]
+fn install_applies_the_native_backend_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let native = goetia::spec::Backend::native().expect("native() is Some on every CI platform");
+    let fake = Fake::new();
+    let manifest = write_manifest(
+        dir.path(),
+        &format!(
+            "daemons:\n  frpc:\n    command: [frpc]\n    restart: never\n    backend-specific:\n      {native}:\n        \
+             restart: always\n"
+        ),
+    );
+
+    let (install_code, install_out, install_err) = dispatch_elevated(
+        &["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()],
+        &fake,
+    );
+    assert_eq!(install_code, 0, "stdout:\n{install_out}\nstderr:\n{install_err}");
+
+    let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "show"], &fake);
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains("restart: always"),
+        "show (no -f) must read the merged spec back out of the installed blob:\n{out}"
+    );
+}
+
+/// Editing only a non-native backend's override between two installs is
+/// inert for drift: the second `install` reports `up to date`, because
+/// `merged_for` never reads a non-native override into the spec that gets
+/// installed.
+#[skuld::test]
+fn changing_only_a_non_native_override_leaves_the_install_up_to_date() {
+    let dir = tempfile::tempdir().unwrap();
+    let native = goetia::spec::Backend::native().expect("native() is Some on every CI platform");
+    let non_native = non_native_backend();
+    let fake = Fake::new();
+    let manifest_text = |non_native_delay: &str| {
+        format!(
+            "daemons:\n  frpc:\n    command: [frpc]\n    backend-specific:\n      {native}:\n        restart: always\n      \
+             {non_native}:\n        restart-delay: {non_native_delay}\n"
+        )
+    };
+    let manifest = write_manifest(dir.path(), &manifest_text("2s"));
+
+    let (first_code, first_out, first_err) = dispatch_elevated(
+        &["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()],
+        &fake,
+    );
+    assert_eq!(first_code, 0, "stdout:\n{first_out}\nstderr:\n{first_err}");
+
+    write_manifest(dir.path(), &manifest_text("3s"));
+    let (code, out, err) = dispatch_elevated(
+        &["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()],
+        &fake,
+    );
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains("up to date"),
+        "a non-native override's edit must not be seen as drift:\n{out}"
+    );
+}
+
+/// The same shape as
+/// `changing_only_a_non_native_override_leaves_the_install_up_to_date`, but
+/// editing the *native* override between the two installs: the second
+/// `install` reports `updated`.
+#[skuld::test]
+fn changing_the_native_override_is_an_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let native = goetia::spec::Backend::native().expect("native() is Some on every CI platform");
+    let fake = Fake::new();
+    let manifest_text = |restart: &str| {
+        format!(
+            "daemons:\n  frpc:\n    command: [frpc]\n    backend-specific:\n      {native}:\n        restart: {restart}\n"
+        )
+    };
+    let manifest = write_manifest(dir.path(), &manifest_text("always"));
+
+    let (first_code, first_out, first_err) = dispatch_elevated(
+        &["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()],
+        &fake,
+    );
+    assert_eq!(first_code, 0, "stdout:\n{first_out}\nstderr:\n{first_err}");
+
+    write_manifest(dir.path(), &manifest_text("on-failure"));
+    let (code, out, err) = dispatch_elevated(
+        &["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()],
+        &fake,
+    );
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains("updated"),
+        "a native override's edit must be seen as drift:\n{out}"
+    );
+}
+
 // Per-verb wiring: uninstall/start/stop/restart/enable/disable/status/diff/list =======================================
 
 #[skuld::test]
@@ -1114,14 +1237,16 @@ fn install_exit_code_does_not_mask_an_error_behind_a_conflict() {
     );
 }
 
-/// `--dry-run`'s preview must not silently drop a `Warning` a generator
-/// produces (e.g. SCM clamping a too-large `restart-delay`).
+/// `--dry-run`'s preview must not silently drop a `Warning` (e.g. SCM
+/// clamping a too-large `restart-delay`). This advisory now fires at
+/// resolve time, from `Backend::Scm.warn`, through `load_and_warn` — on
+/// every host, not only from an effectful Windows install preview — which
+/// is the property this test now pins.
 #[skuld::test]
 fn install_dry_run_prints_generator_warnings() {
     let dir = tempfile::tempdir().unwrap();
     // A restart-delay past SC_ACTION.Delay's ~49.71-day DWORD-milliseconds
-    // ceiling: only the Windows SCM preview warns about this, but the test
-    // must still pass (vacuously) on the other two platforms.
+    // ceiling.
     write_manifest(
         dir.path(),
         "daemons:\n  frpc:\n    command: [frpc]\n    type: managed\n    restart: on-failure\n    restart-delay: 60d\n",
@@ -1143,10 +1268,8 @@ fn install_dry_run_prints_generator_warnings() {
     let code = cli::dispatch(&cli, &get_manager, &is_elevated, &mut out, &mut err);
 
     assert_eq!(code, 0);
-    if cfg!(windows) {
-        let err = String::from_utf8_lossy(&err);
-        assert!(err.contains("warning:"), "stderr:\n{err}");
-    }
+    let err = String::from_utf8_lossy(&err);
+    assert!(err.contains("warning:"), "stderr:\n{err}");
 }
 
 /// The `list`/`status`/`show`/`diff` partitioning helper must warn about an
@@ -1297,7 +1420,7 @@ fn status_single_id_errors_on_an_unreadable_entry_instead_of_fabricating_state()
 
 /// `diff` must predict what `install` would actually do: a hand-edited
 /// artifact is a conflict, never "up to date". `5`, matching `install`'s
-/// code for the identical outcome (Task 8 moved conflict off `2`).
+/// code for the identical outcome (conflict lives on `5`, never clap's `2`).
 #[skuld::test]
 fn diff_exits_five_for_a_hand_edited_artifact() {
     let dir = tempfile::tempdir().unwrap();

@@ -24,6 +24,7 @@ use serde::de::{self, DeserializeSeed, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 use super::no_null::reject_nulls;
+use super::overrides::BackendOverrides;
 use super::user::RawUser;
 
 /// The whole `goetia.yaml` document.
@@ -63,12 +64,16 @@ impl RawManifest {
 /// One `daemons.<id>` entry, exactly as written in YAML. No defaults are
 /// materialized and no cross-field or injection-gate validation runs here
 /// — see `resolve`, the parse-don't-validate boundary.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawSpec {
     #[serde(default)]
     pub name: Option<String>,
-    pub command: Vec<String>,
+    // `Option`, not `Vec`: a missing `command` is legal at parse time, and
+    // becomes one backend's problem instead of the document's — see
+    // `overrides.rs` and `resolve_one`'s `reject_empty_command` call.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
     #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default, deserialize_with = "no_duplicate_env")]
@@ -83,6 +88,12 @@ pub struct RawSpec {
     pub logs: Option<String>,
     #[serde(rename = "type", default)]
     pub kind: Option<String>,
+    #[serde(
+        rename = "backend-specific",
+        default,
+        deserialize_with = "crate::spec::overrides::deserialize_overrides"
+    )]
+    pub backend_specific: BackendOverrides,
 }
 
 impl<'de> Deserialize<'de> for RawManifest {
@@ -192,7 +203,7 @@ where
     d.deserialize_map(EnvVisitor)
 }
 
-struct EnvVisitor;
+pub(super) struct EnvVisitor;
 
 impl<'de> Visitor<'de> for EnvVisitor {
     type Value = BTreeMap<String, String>;

@@ -1,5 +1,5 @@
 use super::*;
-use crate::spec::Id;
+use crate::spec::{Builtin, Id};
 
 // Fixtures ============================================================================================================
 
@@ -56,10 +56,8 @@ fn shim_path() -> PathBuf {
     abs("Program Files/Goetia/goetia-shim.exe")
 }
 
-/// `registration` returns `(ScmRegistration, Vec<Warning>)`; most tests
-/// only care about the registration, so this drops the warnings for them.
 fn build(spec: &DaemonSpec) -> ScmRegistration {
-    registration(spec, &identity(), &shim_path()).0
+    registration(spec, &identity(), &shim_path())
 }
 
 // executable/arguments per Kind =======================================================================================
@@ -103,13 +101,233 @@ fn named_user_account_uses_resolved_identity() {
     let mut spec = managed_spec();
     spec.user = User::Name("bindreams".to_string());
     let id = identity();
-    let reg = registration(&spec, &id, &shim_path()).0;
+    let reg = registration(&spec, &id, &shim_path());
 
     assert_eq!(
         reg.account,
         Some(id.user.clone()),
         "a non-root user must use the pre-resolved Identity, not re-derive one"
     );
+}
+
+// `canonical_account` / `account_needs_password` ======================================================================
+
+#[skuld::test]
+fn local_service_canonicalizes_to_the_nt_authority_form() {
+    assert_eq!(
+        canonical_account("LocalService"),
+        Some(r"NT AUTHORITY\LocalService".to_string())
+    );
+}
+
+#[skuld::test]
+fn network_service_canonicalizes_to_the_nt_authority_form() {
+    assert_eq!(
+        canonical_account("NetworkService"),
+        Some(r"NT AUTHORITY\NetworkService".to_string())
+    );
+}
+
+#[skuld::test]
+fn spaced_builtin_spellings_canonicalize() {
+    // What `LookupAccountSidW` actually produces for S-1-5-19/S-1-5-20.
+    assert_eq!(
+        canonical_account(r"NT AUTHORITY\LOCAL SERVICE"),
+        canonical_account("LocalService")
+    );
+    assert_eq!(
+        canonical_account(r"NT AUTHORITY\NETWORK SERVICE"),
+        canonical_account("NetworkService")
+    );
+}
+
+#[skuld::test]
+fn an_already_qualified_builtin_is_left_in_canonical_form() {
+    assert_eq!(
+        canonical_account(r"NT AUTHORITY\LocalService"),
+        Some(r"NT AUTHORITY\LocalService".to_string()),
+        "canonicalisation must be idempotent"
+    );
+}
+
+#[skuld::test]
+fn local_system_spellings_resolve_to_the_default_account() {
+    for spelling in ["LocalSystem", "SYSTEM", r"NT AUTHORITY\SYSTEM", ""] {
+        assert_eq!(
+            canonical_account(spelling),
+            None,
+            "`{spelling}` should map to the default account"
+        );
+    }
+}
+
+#[skuld::test]
+fn an_unprefixed_account_named_like_a_builtin_is_left_alone() {
+    assert_eq!(canonical_account("Local Service"), Some("Local Service".to_string()));
+}
+
+#[skuld::test]
+fn an_ordinary_account_name_is_left_alone() {
+    assert_eq!(canonical_account("bindreams"), Some("bindreams".to_string()));
+}
+
+#[skuld::test]
+fn an_nt_service_account_is_left_alone() {
+    assert_eq!(
+        canonical_account(r"NT SERVICE\frpc"),
+        Some(r"NT SERVICE\frpc".to_string())
+    );
+}
+
+#[skuld::test]
+fn a_localised_builtin_name_is_not_folded() {
+    // German Windows' `LookupAccountSidW` spelling of S-1-5-19. The name
+    // fold cannot be localisation-proof (see the module doc comment on
+    // `windows_builtin`) — this pins that the gap is left as an ordinary
+    // account name rather than silently mishandled.
+    let localised = r"NT-AUTORITÄT\LOKALER DIENST";
+    assert_eq!(canonical_account(localised), Some(localised.to_string()));
+}
+
+#[skuld::test]
+fn every_canonical_builtin_needs_no_password() {
+    for spelling in [
+        "LocalSystem",
+        "LocalService",
+        "NetworkService",
+        r"NT AUTHORITY\LocalService",
+        r"NT AUTHORITY\NetworkService",
+        r"NT AUTHORITY\LOCAL SERVICE",
+        r"NT AUTHORITY\NETWORK SERVICE",
+    ] {
+        let account = canonical_account(spelling);
+        assert!(
+            !account_needs_password(account.as_deref()),
+            "`{spelling}` canonicalizes to {account:?}, which must not need a password"
+        );
+    }
+}
+
+#[skuld::test]
+fn registration_canonicalizes_a_builtin_account() {
+    let mut spec = managed_spec();
+    spec.user = User::Name("LocalService".to_string());
+    let id = Identity {
+        user: "LocalService".to_string(),
+    };
+    let reg = registration(&spec, &id, &shim_path());
+
+    assert_eq!(reg.account, Some(r"NT AUTHORITY\LocalService".to_string()));
+}
+
+#[skuld::test]
+fn registration_for_root_uses_the_default_account_with_an_empty_identity() {
+    let mut spec = managed_spec();
+    spec.user = User::Root;
+    // The value `identity::resolve` actually returns for `User::Root`, not
+    // a hand-written non-empty one — `root_user_maps_to_local_system`
+    // (above) uses `identity()`'s non-empty fixture and so cannot catch
+    // the empty-string path an unguarded `canonical_account` would map to
+    // `Some("")` (see `windows_builtin("")`'s doc comment).
+    let id = Identity { user: String::new() };
+    let reg = registration(&spec, &id, &shim_path());
+
+    assert_eq!(reg.account, None);
+}
+
+/// The recognition half (`windows_builtin`, in `spec`) and the spelling
+/// half (`canonical_account`, here) are two modules reading one table —
+/// this is every row of it, written out. The expected values are literals
+/// rather than expressions over `windows_builtin`: `canonical_account` *is*
+/// `windows_builtin(x).map(Builtin::canonical)` with a verbatim fallback,
+/// so any assertion phrased in terms of that composition holds even when
+/// the table is empty, and would pass with `windows_builtin` stubbed to
+/// `None` — which is what an earlier version of this test did.
+#[skuld::test]
+fn canonical_account_maps_every_table_row_to_its_createservicew_spelling() {
+    for (spelling, recognised, canonical) in [
+        ("", Some(Builtin::LocalSystem), None),
+        ("localsystem", Some(Builtin::LocalSystem), None),
+        ("system", Some(Builtin::LocalSystem), None),
+        (r"nt authority\system", Some(Builtin::LocalSystem), None),
+        (r"NT AUTHORITY\LocalSystem", Some(Builtin::LocalSystem), None),
+        (
+            "localservice",
+            Some(Builtin::LocalService),
+            Some(r"NT AUTHORITY\LocalService"),
+        ),
+        // Idempotent: canonicalising the canonical spelling is a no-op.
+        (
+            r"NT AUTHORITY\LocalService",
+            Some(Builtin::LocalService),
+            Some(r"NT AUTHORITY\LocalService"),
+        ),
+        (
+            r"NT AUTHORITY\LOCAL SERVICE",
+            Some(Builtin::LocalService),
+            Some(r"NT AUTHORITY\LocalService"),
+        ),
+        (
+            "networkservice",
+            Some(Builtin::NetworkService),
+            Some(r"NT AUTHORITY\NetworkService"),
+        ),
+        (
+            r"NT AUTHORITY\NetworkService",
+            Some(Builtin::NetworkService),
+            Some(r"NT AUTHORITY\NetworkService"),
+        ),
+        (
+            r"NT AUTHORITY\NETWORK SERVICE",
+            Some(Builtin::NetworkService),
+            Some(r"NT AUTHORITY\NetworkService"),
+        ),
+        (r"NT SERVICE\frpc", None, Some(r"NT SERVICE\frpc")),
+    ] {
+        assert_eq!(windows_builtin(spelling), recognised, "recognising `{spelling}`");
+        assert_eq!(
+            canonical_account(spelling),
+            canonical.map(str::to_string),
+            "canonicalising `{spelling}`"
+        );
+    }
+}
+
+#[skuld::test]
+fn account_needs_password_is_false_for_builtin_and_virtual_accounts() {
+    for account in [
+        "LocalSystem",
+        "LocalService",
+        "NetworkService",
+        r"NT AUTHORITY\LocalService",
+        r"NT AUTHORITY\NetworkService",
+        r"NT AUTHORITY\SYSTEM",
+        r"NT AUTHORITY\LOCAL SERVICE",
+        r"NT AUTHORITY\NETWORK SERVICE",
+        r"NT SERVICE\my-daemon",
+        // Case-insensitive.
+        "localsystem",
+        r"nt service\my-daemon",
+    ] {
+        assert!(
+            !account_needs_password(Some(account)),
+            "{account} should not need a password"
+        );
+    }
+    assert!(
+        !account_needs_password(None),
+        "None (LocalSystem) should not need a password"
+    );
+}
+
+#[skuld::test]
+fn account_needs_password_is_true_for_a_real_account() {
+    for account in [r".\svc-account", "svc-account", r"CORP\svc-account"] {
+        assert!(
+            account_needs_password(Some(account)),
+            "{account} should need a password"
+        );
+    }
 }
 
 // argv escaping and round trip ========================================================================================
@@ -530,12 +748,12 @@ fn managed_kind_restart_always_also_sets_failure_actions() {
 }
 
 #[skuld::test]
-fn managed_kind_clamps_absurdly_long_restart_delay_and_warns() {
+fn managed_kind_clamps_absurdly_long_restart_delay() {
     let mut spec = managed_spec();
     // One millisecond past what a DWORD of milliseconds (SC_ACTION.Delay)
     // can express.
     spec.restart_delay = Some(MAX_SC_ACTION_DELAY + Duration::from_millis(1));
-    let (reg, warnings) = registration(&spec, &identity(), &shim_path());
+    let reg = registration(&spec, &identity(), &shim_path());
 
     let fa = reg
         .failure_actions
@@ -545,23 +763,23 @@ fn managed_kind_clamps_absurdly_long_restart_delay_and_warns() {
         "an out-of-range delay must be clamped, not passed through to a value that panics \
          inside windows-service's ServiceAction::to_raw"
     );
-    assert!(
-        warnings
-            .iter()
-            .any(|w| w.id == spec.id && w.message.contains("restart-delay")),
-        "clamping must be reported as a Warning, not done silently: {warnings:?}"
-    );
+    // Warning coverage for an over-long delay lives in `spec::backend`'s
+    // tests, gated by `Backend::Scm.warn` rather than by this generator.
 }
 
 #[skuld::test]
-fn managed_kind_restart_delay_within_bound_does_not_warn() {
+fn managed_kind_restart_delay_within_bound_does_not_clamp() {
     let mut spec = managed_spec();
     spec.restart_delay = Some(Duration::from_secs(42));
-    let (_, warnings) = registration(&spec, &identity(), &shim_path());
+    let reg = registration(&spec, &identity(), &shim_path());
 
-    assert!(
-        warnings.is_empty(),
-        "a restart-delay well within SC_ACTION.Delay's range must not warn: {warnings:?}"
+    let fa = reg
+        .failure_actions
+        .expect("restart: on-failure must configure recovery actions");
+    assert_eq!(
+        fa.delay,
+        Duration::from_secs(42),
+        "a restart-delay well within SC_ACTION.Delay's range must pass through unclamped"
     );
 }
 
@@ -586,9 +804,9 @@ fn render_is_the_generation_invariant() {
     let id = identity();
     let shim = shim_path();
 
-    let original = registration(&spec, &id, &shim).0;
+    let original = registration(&spec, &id, &shim);
     let recovered_spec = extract(&original.parameters).unwrap().unwrap().spec;
-    let regenerated = registration(&recovered_spec, &id, &shim).0;
+    let regenerated = registration(&recovered_spec, &id, &shim);
 
     assert_eq!(
         render(&original),

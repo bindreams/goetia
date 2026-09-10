@@ -317,6 +317,97 @@ was ever the problem. Set `cwd`, or write the argument absolute.
 
 (`cwd` and `logs` are resolved against the manifest's directory too.)
 
+## Per-backend overrides
+
+One manifest describes a daemon on all three platforms, but a path, an
+account or a service name is rarely the same on all three. A daemon's
+`backend-specific:` block holds a set of field overrides per backend, keyed
+by `systemd`, `launchd` or `scm`:
+
+```yaml
+daemons:
+  frpc:
+    command: [/opt/frpc/bin/frpc, -c, /opt/frpc/host/frpc.toml]
+    cwd: /opt/frpc
+    env:
+      RUST_LOG: info
+    restart: on-failure
+    backend-specific:
+      systemd:
+        user: frpc
+      launchd:
+        user: frpc
+      scm:
+        command:
+          [
+            'C:\Program Files\frpc\frpc.exe',
+            -c,
+            'C:\ProgramData\frpc\frpc.toml',
+          ]
+        cwd: 'C:\ProgramData\frpc'
+        user: 'NT AUTHORITY\LocalService'
+        env:
+          RUST_LOG: debug
+```
+
+Every field but the daemon's id is overridable: `name`, `command`, `cwd`,
+`env`, `user`, `restart`, `restart-delay`, `logs`, `type`. A scalar or list
+field replaces the base value outright; `env` merges key by key, the
+override winning where both set the same key. An unknown backend key is an
+error naming it, as is a repeated one.
+
+The two document-wide rules reach in here unchanged, and mean the same thing
+they do in the base spec:
+[an explicit `null`](#an-explicit-null-is-not-a-way-to-unset-a-field) is an
+error anywhere in the block, and
+[an `env` key may not repeat](#an-env-key-may-not-repeat) within one
+override's `env`. A base key and an override of the same key are not a
+repeat — that is the merge, and it is the point.
+
+**Only the backend native to this host is installed, but every backend's
+merged spec is validated on every host.** So the manifest above renders on
+Linux as the systemd-effective spec, with the `scm:` block validated and
+then discarded:
+
+```console
+$ goetia daemon show -f goetia.yaml
+# frpc
+command:
+- /opt/frpc/bin/frpc
+- -c
+- /opt/frpc/host/frpc.toml
+cwd: /opt/frpc
+env:
+  RUST_LOG: info
+id: frpc
+name: frpc
+restart: on-failure
+type: simple
+user: frpc
+```
+
+A value that is wrong for a backend by construction fails the whole manifest
+from any host, naming the block it came from. Replace that `scm:` block's
+account with a numeric uid — `user: {id: 1000}` — and the same Linux runner
+rejects the Windows-only mistake:
+
+```console
+$ goetia daemon show -f goetia.yaml
+error: daemon `frpc`: backend-specific.scm: `1000` is a numeric uid, which is never a Windows account
+```
+
+`${VAR}` is substituted only in the override for the backend being
+installed. The other two are validated as authored, never substituted, so a
+check that would need a resolved value is skipped rather than guessed at:
+from Linux, `scm: {user: "${ACCT}"}` is unresolvable and therefore
+unchecked, while `systemd: {user: "${ACCT}"}` is substituted and checked
+like any other native value.
+
+A _base_ field is the other case: it is substituted for the backend being
+installed, so it is the resolved value every backend's advisories read.
+Moving `type` or `restart-delay` into `.env` does not silence a warning the
+literal would have produced.
+
 ## Machine-readable output
 
 `--json` is implemented by `goetia daemon list` and `goetia daemon status`.
@@ -591,7 +682,12 @@ what is actually installed. Four guarantees:
    privilege level could not read. Such a unit reaches `show` as an
    `undetermined` entry, so `show <id>` reports that it could not determine
    the id's state and exits `4`, while `show -f <file> <id>` still renders
-   it from the manifest.
+   it from the manifest. On a manifest with a `backend-specific:` block,
+   the spec `show` renders is the merged, host-effective one — `show -f`
+   is deliberately not a transcription of the file, because it renders
+   what would be installed _here_. Guarantee 1 survives that unchanged:
+   both paths merge for the same host's native backend, so `show <id>`
+   and `show -f <file> <id>` still agree byte for byte.
 2. Neither path ever checks elevation.
 3. `show -f` touches no service manager; `show` without `-f` touches no
    manifest.

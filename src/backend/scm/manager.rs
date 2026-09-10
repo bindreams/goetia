@@ -43,8 +43,12 @@
 //! **4. A real account needs `SeServiceLogonRight`.** `CreateServiceW`
 //! succeeds without it; the first start then fails with error 1069
 //! (`ERROR_LOGON_FAILURE`) while `install` has already reported success. See
-//! `identity::grant_service_logon_right`, called for every non-`LocalSystem`
-//! account on every `install`.
+//! `identity::grant_service_logon_right`, called on every `install` for
+//! every account [`generate::account_needs_password`] says needs a
+//! password — every other account (`LocalSystem`, a built-in, or an
+//! `NT SERVICE\<id>` virtual account) already holds the right, and
+//! `LookupAccountNameW` (which the grant goes through) does not even
+//! resolve the first three by those spellings.
 //!
 //! **5. Create with `SERVICE_DEMAND_START`, write `Parameters` immediately
 //! after.** Not `SERVICE_DISABLED` (which would block an explicit `start`),
@@ -76,7 +80,11 @@
 //! Per the design spec's "Windows accounts" section, a real (non-built-in,
 //! non-virtual) account needs a password, supplied via the
 //! `GOETIA_SERVICE_PASSWORD` environment variable — never `goetia.yaml`. See
-//! `identity::service_password`.
+//! `identity::service_password`. `apply` never even reads that variable for
+//! a built-in or virtual account (see `generate::account_needs_password`):
+//! a value left over from installing a different daemon must not silently
+//! reach `CreateServiceW`/`ChangeServiceConfigW` for one that needs none —
+//! Windows rejects a password outright for those accounts.
 
 mod identity;
 mod registry;
@@ -101,7 +109,7 @@ use crate::blob::Blob;
 use crate::decide::{self, Outcome, Ownership};
 use crate::error::{Error, Result};
 use crate::manager::{Installed, ServiceManager, State, Status};
-use crate::spec::{DaemonSpec, Id, Kind, User, Warning};
+use crate::spec::{DaemonSpec, Id, Kind};
 
 // ScmManager ==========================================================================================================
 
@@ -369,16 +377,9 @@ fn shim_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("goetia-shim.exe"))
 }
 
-fn print_warnings(warnings: &[Warning]) {
-    for w in warnings {
-        eprintln!("warning: {}: {}", w.id, w.message);
-    }
-}
-
 fn discover(spec: &DaemonSpec) -> Result<Discovery> {
     let identity = identity::resolve(&spec.user)?;
-    let (reg, warnings) = generate::registration(spec, &identity, &shim_path());
-    print_warnings(&warnings);
+    let reg = generate::registration(spec, &identity, &shim_path());
     let desired = generate::render(&reg);
 
     let scm = open_scm_to_classify(spec.id.as_str())?;
@@ -425,7 +426,7 @@ fn classify(params: &BTreeMap<String, String>) -> Ownership {
         Ok(None) => Ownership::Foreign,
         Ok(Some(blob)) => match identity::resolve(&blob.spec.user) {
             Ok(blob_identity) => {
-                let (blob_reg, _warnings) = generate::registration(&blob.spec, &blob_identity, &shim_path());
+                let blob_reg = generate::registration(&blob.spec, &blob_identity, &shim_path());
                 Ownership::Ours {
                     regenerated: generate::render(&blob_reg),
                     blob,
@@ -486,11 +487,13 @@ fn read_live_registration(
         .map(|a| a.to_string_lossy().into_owned())
         // `ChangeServiceConfigW`'s NULL-means-"unchanged" quirk (see `apply`'s
         // doc comment) forces a live `LocalSystem` account to be written back
-        // as the literal string "LocalSystem", not `None` — normalize it back
-        // to `None` here so it renders identically to `generate::registration`'s
-        // own `User::Root` mapping and a `LocalSystem` service reads as
-        // up-to-date rather than a permanent phantom diff.
-        .filter(|a| !a.eq_ignore_ascii_case("LocalSystem"));
+        // as some spelling of it, not `None` — canonicalise it through the
+        // same table `generate::registration` uses so a `LocalSystem`
+        // service (whatever spelling SCM's own readback happens to use)
+        // reads as up-to-date rather than a permanent phantom diff. This is
+        // the `LocalSystem` row of that same table, folded in rather than a
+        // one-off `LocalSystem`-only filter.
+        .and_then(|a| generate::canonical_account(&a));
     let failure_actions = read_failure_actions(service, name)?;
 
     Ok((
@@ -595,28 +598,47 @@ fn apply(
     create: bool,
     current_start_type: Option<ServiceStartType>,
 ) -> Result<()> {
-    let password = match spec.user {
-        User::Root => None,
-        _ => {
-            let pw = identity::service_password()?;
-            let account = reg
-                .account
-                .as_deref()
-                .expect("a non-Root User always resolves to Some(account) in generate::registration");
-            if pw.is_none() && identity::account_needs_password(account) {
-                // Trap 4's own failure shape, one step earlier: install
-                // would otherwise report success and the service would
-                // fail every future start with error 1069. Refuse instead
-                // of creating a service that cannot start.
-                return Err(Error::Other(format!(
-                    "service account `{account}` needs a password (it is not LocalSystem/LocalService/\
-                     NetworkService, nor an `NT SERVICE\\`/`NT AUTHORITY\\` account); set \
-                     GOETIA_SERVICE_PASSWORD before installing `{}`",
-                    spec.id
-                )));
-            }
-            pw
+    // Driven by `generate::account_needs_password`, not merely whether
+    // `reg.account` is `Some`: a canonicalised built-in
+    // (`NT AUTHORITY\LocalService`) or virtual (`NT SERVICE\<id>`) account
+    // is `Some`, yet needs no password at all — see that function's own
+    // doc comment for the exact table. `reapply_uncompared_effects` below
+    // keys its `grant_service_logon_right` skip off the same predicate, so
+    // the two can no longer disagree about which accounts are
+    // password-free.
+    //
+    // The `false` arm must never call `identity::service_password()`:
+    // `service_password` is a bare read of `GOETIA_SERVICE_PASSWORD` with
+    // no knowledge of which account is being installed, so it returns
+    // `Some(pw)` whenever that variable happens to be set for any reason —
+    // a value left over from installing a different daemon in the same
+    // shell or CI job. That stale value has no other diff to catch it
+    // (`ScmRegistration` has no password field), so it would otherwise
+    // ride silently into `CreateServiceW`/`ChangeServiceConfigW`, which
+    // Windows rejects outright for a built-in/virtual account — a live
+    // Win32 failure being the only way it would ever surface. "Needs no
+    // password" must mean "is never given one", not merely "is not
+    // required to have one".
+    let password = if generate::account_needs_password(reg.account.as_deref()) {
+        let account = reg.account.as_deref().expect(
+            "account_needs_password(None) is always false (LocalSystem), so this branch is only reached for Some",
+        );
+        let pw = identity::service_password()?;
+        if pw.is_none() {
+            // Trap 4's own failure shape, one step earlier: install
+            // would otherwise report success and the service would
+            // fail every future start with error 1069. Refuse instead
+            // of creating a service that cannot start.
+            return Err(Error::Other(format!(
+                "service account `{account}` needs a password (it is not LocalSystem/LocalService/\
+                 NetworkService, nor an `NT SERVICE\\`/`NT AUTHORITY\\` account); set \
+                 GOETIA_SERVICE_PASSWORD before installing `{}`",
+                spec.id
+            )));
         }
+        pw
+    } else {
+        None
     };
 
     if create {
@@ -681,7 +703,16 @@ fn reapply_uncompared_effects(spec: &DaemonSpec, reg: &ScmRegistration) -> Resul
         Kind::Simple => BTreeMap::new(),
     };
     registry::write_environment(&reg.name, &env_for_host)?;
-    if let Some(account) = &reg.account {
+    // Only for an account that actually needs it (see `apply`'s identical
+    // predicate above): `LookupAccountNameW`, which the grant goes
+    // through, does not resolve `LocalSystem`, `LocalService`, or
+    // `NetworkService` by those spellings at all, and every built-in or
+    // virtual (`NT SERVICE\<id>`) account already holds
+    // `SeServiceLogonRight` on the merits.
+    if generate::account_needs_password(reg.account.as_deref()) {
+        let account = reg.account.as_deref().expect(
+            "account_needs_password(None) is always false (LocalSystem), so this branch is only reached for Some",
+        );
         identity::grant_service_logon_right(account)?;
     }
     Ok(())
