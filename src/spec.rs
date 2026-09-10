@@ -8,6 +8,7 @@
 //! the crate; `resolve` is both parse and validate.
 
 mod interpolate;
+mod no_null;
 mod raw;
 mod resolve;
 mod user;

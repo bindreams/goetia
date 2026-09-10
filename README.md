@@ -104,7 +104,10 @@ Exactly three forms are accepted:
 **Every other `$` is an error.** A `$` not immediately followed by `{` or by
 another `$` is rejected, naming its byte offset — a typo like `$HOME` cannot
 silently become the literal text `$HOME` in a generated service artifact.
-This is the one place a manifest that was previously accepted can now fail:
+This is one of three places a manifest that was previously accepted can now
+fail — the others are
+[an explicit `null`](#an-explicit-null-is-not-a-way-to-unset-a-field) and
+[an `env` key written twice](#an-env-key-may-not-repeat):
 **a literal `$` must be written `$$`**, so a `command` argument written
 `$ARGS` becomes `$$ARGS`. Text that already looked like a reference breaks
 differently but needs the same fix: a literal `${A}` now fails with
@@ -236,6 +239,47 @@ into world-readable artifacts and log output.
 **Do not put a secret in `.env` for use in `env:`.** Give the daemon a
 _path_ to a credential file it reads at runtime, and let the file system's
 permissions protect the secret.
+
+## An explicit `null` is not a way to unset a field
+
+Writing `null` is an error wherever a manifest value is expected — as the
+word itself, as `~`, as an empty value (`name:` with nothing after it), or
+with an explicit tag (`!!null "null"`). Omit the key instead; that is what
+selects the default.
+
+An empty _value_ and an empty _string_ are different things, and only the
+first is a `null`. `name:` with nothing after it is YAML's null and is
+rejected; `name: ""` is the empty string, which is a value the author wrote
+and stays legal. The same distinction makes `env: {A: }` an error and
+`env: {A: ""}` a normal assignment — `FOO=` is a normal thing to write.
+Quoting is what tells the two apart, and it is the same rule that keeps a
+quoted `"null"` a legal name, key, value and daemon id: it is a string the
+author chose, not a YAML null. It is why `!!null ""` is the empty string
+too — the tag says null, but the content is a quoted empty string, and the
+content is what the value is.
+
+The rejection exists because YAML's `null` was not reaching the manifest as
+"absent". It arrived three different wrong ways, depending on the position:
+
+- **A field that has a default** read `restart: null` as _unset_ and quietly
+  applied the default. What the author explicitly wrote was discarded with
+  no diagnostic.
+- **A string that is not a field** — an `env` key or value, a `command`
+  element, `user.name`, a daemon id — became the four-character text
+  `null`. `env: {DEBUG: null}` installed a service whose `DEBUG` was the
+  string `null`; `daemons: {null: …}` produced a daemon installed as
+  `null.service`.
+- **A container** — `daemons:`, `env:` or `command:` with nothing under it —
+  became an _empty_ container. A manifest whose `daemons:` key had lost its
+  body installed nothing and exited 0.
+
+## An `env` key may not repeat
+
+An `env` key that repeats, or that differs from another only in case, is
+rejected rather than silently keeping one of the two. Case counts because
+Windows looks an environment variable up case-insensitively, so
+`{Path: a, PATH: b}` would reach the daemon as one variable — daemon ids
+have been compared the same way, for the same reason, since before this.
 
 ## Paths in `command`
 

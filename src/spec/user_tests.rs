@@ -82,3 +82,13 @@ fn user_struct_rejects_unknown_field() {
     let err = parse("bogus: true").unwrap_err();
     assert!(err.to_string().contains("bogus"));
 }
+
+#[skuld::test]
+fn user_struct_name_still_coerces_an_unquoted_scalar() {
+    // A `null` in either half of `user:` is refused before this type is
+    // reached at all — see `raw_tests`' `a_null_user_name_or_id_is_rejected`
+    // — and refusing it must not cost the unquoted-scalar coercion, nor
+    // touch the four characters when they are quoted.
+    assert_eq!(parse("name: 42").unwrap(), RawUser::Name("42".to_string()));
+    assert_eq!(parse("name: \"null\"").unwrap(), RawUser::Name("null".to_string()));
+}
