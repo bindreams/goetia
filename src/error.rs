@@ -30,10 +30,10 @@ pub enum Error {
 
     /// The document is not valid YAML, or fails a shape-level constraint
     /// checked during deserialization: a duplicate or case-insensitively
-    /// colliding daemon id, or a malformed `user` field. `serde_yaml_ng`
+    /// colliding daemon id, or a malformed `user` field. `yaml_serde`
     /// attaches a line/column to the message.
     #[error(transparent)]
-    Yaml(#[from] serde_yaml_ng::Error),
+    Yaml(#[from] yaml_serde::Error),
 
     /// A `resolve()`-time validation failure: an invalid id, a control
     /// character in a user-supplied string, an `=` in an env key, an

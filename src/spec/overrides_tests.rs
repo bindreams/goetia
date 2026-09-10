@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use super::{RawOverride, Supplied};
 use crate::spec::{Backend, RawManifest, RawUser};
 
-fn parse(yaml: &str) -> Result<RawManifest, serde_yaml_ng::Error> {
+fn parse(yaml: &str) -> Result<RawManifest, yaml_serde::Error> {
     RawManifest::parse(yaml)
 }
 

@@ -9,7 +9,7 @@
 //! `RawManifest`'s `Deserialize` is hand-written rather than derived, and
 //! `env` gets a `deserialize_with`, for the same reason: a typed
 //! `BTreeMap` field cannot detect a duplicate YAML key, because serde's map
-//! deserializer inserts and overwrites and `serde_yaml_ng`'s own
+//! deserializer inserts and overwrites and `yaml_serde`'s own
 //! duplicate-key check lives only in its `Mapping` deserializer, which a
 //! typed map never reaches — a manifest declaring `frpc` twice would
 //! silently deserialize to one entry holding the *second* command. So this
@@ -33,7 +33,7 @@ use super::user::RawUser;
 /// The null rule is enforced by a second walk that `parse` runs over the
 /// same text, because it needs that text to report a position — a
 /// `Deserializer` no longer has one by the time a field could object. So
-/// `serde_yaml_ng::from_str::<RawManifest>` compiles, and silently accepts
+/// `yaml_serde::from_str::<RawManifest>` compiles, and silently accepts
 /// every explicit `null` this module exists to refuse.
 ///
 /// That is a real gap in the public surface, not a theoretical one: this
@@ -54,8 +54,8 @@ impl RawManifest {
     /// unmodified text for the one thing that parse cannot refuse with a
     /// position of its own: an explicit `null`. See `no_null` for both
     /// halves of that split.
-    pub fn parse(yaml: &str) -> Result<Self, serde_yaml_ng::Error> {
-        let manifest = serde_yaml_ng::from_str(yaml)?;
+    pub fn parse(yaml: &str) -> Result<Self, yaml_serde::Error> {
+        let manifest = yaml_serde::from_str(yaml)?;
         reject_nulls(yaml)?;
         Ok(manifest)
     }
@@ -191,7 +191,7 @@ impl<'de> Visitor<'de> for DaemonsVisitor {
 
 /// `RawSpec::env`, walked one entry at a time for the same reason
 /// [`DaemonsVisitor`] exists: a typed `BTreeMap<String, String>` field
-/// inserts and overwrites, and `serde_yaml_ng`'s own duplicate-key check
+/// inserts and overwrites, and `yaml_serde`'s own duplicate-key check
 /// lives only in its `Mapping` deserializer, which a typed map never
 /// reaches. These values become a privileged service's environment, so a
 /// key lost that way means the daemon runs with an environment the author
