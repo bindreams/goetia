@@ -912,15 +912,35 @@ fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error>
 /// strings for one directory and report drift on an artifact nobody
 /// touched.
 ///
-/// From a working directory on a filesystem that does not support
-/// canonicalisation (some network redirectors, WebDAV mounts), this errors
-/// — so every subcommand that loads a manifest by a relative `-f`,
-/// including the default `-f .`, fails from such a directory.
+/// When this fails, every subcommand that loads a manifest by a relative
+/// `-f` — including the default `-f .` — fails from that directory. That is
+/// an **accepted limitation**, decided by the owner: the reachable causes
+/// are narrow, and a fallback to the uncanonicalised directory would trade a
+/// loud refusal for silent phantom drift on exactly the platform this
+/// function exists to protect. Revisit if one of them shows up in use.
+///
+/// The reachable causes, measured rather than assumed:
+///
+/// - **Unix:** a path component the process cannot traverse (`EACCES`) —
+///   the cwd is under a directory whose permissions changed after the
+///   process entered it, or which it inherited and cannot re-walk.
+/// - **Windows:** `canonicalize` is `CreateFileW` with
+///   `FILE_FLAG_BACKUP_SEMANTICS` followed by `GetFinalPathNameByHandleW`
+///   with `VOLUME_NAME_DOS`, so it fails when the open is refused (access
+///   denied, sharing violation) *and* when the volume has no drive letter or
+///   mount point for a DOS path to name — a volume mounted only under a GUID
+///   path, or a VSS snapshot. Filesystem drivers that do not implement the
+///   information classes that call needs fail here too.
+///
+/// A **deleted** working directory is not among them, despite being the
+/// intuitive guess: it fails earlier, in `std::env::current_dir`, and never
+/// reaches this function. Do not put it back in the message below.
 fn canonicalize_cwd(cwd: &Path) -> Result<PathBuf, Error> {
     let canonical = fs::canonicalize(cwd).map_err(|source| {
         Error::Other(format!(
-            "canonicalising the current directory {} failed; it may have been removed, or it may \
-             be on a filesystem that does not support canonicalisation: {source}",
+            "canonicalising the current directory {} failed; it may be unreadable, or on a volume \
+             with no drive letter or mount point: {source}. Pass `-f` with an absolute path to \
+             skip resolving it",
             cwd.display()
         ))
     })?;
