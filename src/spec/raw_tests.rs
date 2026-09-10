@@ -1,7 +1,7 @@
 use super::RawManifest;
 
 fn parse(yaml: &str) -> Result<RawManifest, serde_yaml_ng::Error> {
-    serde_yaml_ng::from_str(yaml)
+    RawManifest::parse(yaml)
 }
 
 #[skuld::test]
@@ -81,11 +81,10 @@ daemons:
 
 #[skuld::test]
 fn explicit_null_is_rejected_for_every_base_field() {
-    // Two expected messages, not one: `command` and `env` are not
-    // `Option`s, so their own deserializers raise `invalid type` before
-    // `no_null` is ever reached. The refusal is what is asserted, not the
-    // field name — `daemons.frpc` is the whole path serde_yaml_ng attaches
-    // to a custom error raised inside a `deserialize_with`.
+    // One message per field kind, all of them naming `null`: the scan
+    // walks the document before any type is imposed on it, so `command`
+    // and `env` are refused as themselves rather than as an `invalid
+    // type` against the sequence or map they were about to become.
     let fields = [
         "name",
         "command",
@@ -108,8 +107,8 @@ fn explicit_null_is_rejected_for_every_base_field() {
         let err = parse(&yaml).unwrap_err();
         let msg = err.to_string();
         let expected = match field {
-            "command" => "invalid type: unit value, expected a sequence",
-            "env" => "invalid type: unit value, expected a map",
+            "command" => "an explicit `null` is not a command",
+            "env" => "an explicit `null` is not an environment block",
             _ => "an explicit `null` is not a way to unset this field",
         };
         assert!(
@@ -323,23 +322,79 @@ daemons:
 }
 
 #[skuld::test]
-fn a_null_user_name_is_rejected() {
-    // The `user:` field's own guard does not reach this leaf — see
-    // `RawUser`'s `NoNullName`. Asserted from a whole manifest, not just
-    // from `RawUser`, because this is the position that decides a service's
-    // security principal.
+fn env_keys_that_differ_only_in_case_are_rejected() {
+    // The same loss, one platform along: `std::process::Command` stores
+    // its environment under a case-folding `EnvKey` on Windows, and the
+    // SCM's registry block is read back through `GetEnvironmentVariable`,
+    // which is case-insensitive too — so `{Path: a, PATH: b}` reaches the
+    // child as one variable, exactly the outcome the byte-exact check was
+    // written to stop. Refused on every platform, because a manifest is
+    // portable and the author gets no warning on the host where it bites.
+    // `DaemonsVisitor` has refused a case collision in daemon ids for the
+    // same reason since before this check existed.
     let yaml = "
 daemons:
   frpc:
     command: [bin/frpc]
-    user:
-      name: null
+    env:
+      Path: a
+      PATH: b
 ";
-    let err = parse(yaml).unwrap_err();
+    let err = parse(yaml).unwrap_err().to_string();
     assert!(
-        err.to_string().contains("an explicit `null` is not a username"),
-        "{err}"
+        err.contains("Path") && err.contains("PATH"),
+        "error should name both keys: {err}"
     );
+    assert!(
+        err.contains("case-insensitively"),
+        "error should say the comparison folds case, and why: {err}"
+    );
+}
+
+#[skuld::test]
+fn env_keys_that_differ_by_more_than_case_are_accepted() {
+    // The other half of the rule: nothing but a case fold is collapsed.
+    let yaml = "
+daemons:
+  frpc:
+    command: [bin/frpc]
+    env:
+      A: \"1\"
+      AB: \"2\"
+      A_: \"3\"
+      B: \"4\"
+";
+    let manifest = parse(yaml).expect("distinct keys should parse");
+    assert_eq!(manifest.daemons["frpc"].env.len(), 4);
+}
+
+#[skuld::test]
+fn a_null_user_name_or_id_is_rejected() {
+    // Both halves of `user:`, and both by name: this is the position that
+    // decides a service's security principal, and an unrefused `null` here
+    // installs it under the literal account `null` (for `name`) or under
+    // whatever the untagged `AccountId` made of a unit (for `id`, whose
+    // message used to be `data did not match any variant of untagged enum
+    // AccountId` — a Rust type name, no `null`, and no remedy).
+    for (field, expected) in [
+        ("name", "an explicit `null` is not a username"),
+        ("id", "an explicit `null` is not an account id"),
+    ] {
+        for spelling in ["null", "~", ""] {
+            let yaml = format!(
+                "
+daemons:
+  frpc:
+    command: [bin/frpc]
+    user:
+      {field}: {spelling}
+"
+            );
+            let err = parse(&yaml).unwrap_err().to_string();
+            assert!(err.contains(expected), "`{field}: {spelling}`: {err}");
+            assert!(err.contains("daemons.frpc.user"), "should name the position: {err}");
+        }
+    }
 }
 
 #[skuld::test]
@@ -410,4 +465,186 @@ daemons:
     assert_eq!(spec.name.as_deref(), Some("42"));
     assert_eq!(spec.command, ["/bin/sleep".to_string(), "30".to_string()]);
     assert_eq!(spec.env.get("PORT"), Some(&"8080".to_string()));
+}
+
+// Rejection position and identity =====================================================================================
+
+/// Every guarded position, with the offence deliberately placed on a line
+/// of its own that is *not* the first line of its enclosing container —
+/// the case a rejection built after `Option::<T>::deserialize` has already
+/// returned gets wrong, because `serde_yaml_ng` has by then stamped the
+/// container's own start position onto it.
+#[skuld::test]
+fn a_rejection_points_at_the_offending_node_and_names_it() {
+    let cases: [(&str, &str, &str); 6] = [
+        (
+            "\
+daemons:
+  frpc:
+    command: [bin/frpc]
+    cwd: /tmp
+    logs: /tmp/l.log
+    name: hello
+    type: simple
+    restart-delay: 5s
+    restart: null
+",
+            "daemons.frpc.restart",
+            "line 9",
+        ),
+        (
+            "\
+daemons:
+  frpc:
+    command: [bin/frpc]
+    env:
+      A: \"1\"
+      B: \"2\"
+      C: null
+      D: \"4\"
+",
+            "daemons.frpc.env.C",
+            "line 7",
+        ),
+        (
+            "\
+daemons:
+  frpc:
+    command: [bin/frpc]
+    env:
+      A: \"1\"
+      B: \"2\"
+      ~: \"3\"
+",
+            "daemons.frpc.env",
+            "line 7",
+        ),
+        (
+            "\
+daemons:
+  frpc:
+    command:
+      - bin/frpc
+      - --config
+      - null
+",
+            "daemons.frpc.command[2]",
+            "line 6",
+        ),
+        (
+            "\
+daemons:
+  frpc:
+    command: [bin/frpc]
+    user:
+      name: null
+",
+            "daemons.frpc.user.name",
+            "line 5",
+        ),
+        (
+            "\
+daemons:
+  frpc:
+    command: [bin/frpc]
+  ~:
+    command: [bin/other]
+",
+            "daemons",
+            "line 4",
+        ),
+    ];
+
+    for (yaml, path, line) in cases {
+        let err = parse(yaml).unwrap_err().to_string();
+        assert!(err.contains(path), "expected path `{path}` in: {err}");
+        assert!(err.contains(line), "expected `{line}` in: {err}");
+    }
+}
+
+/// `serde_yaml_ng` decides null-ness from a scalar's *style*, so a
+/// `!!null`-tagged **quoted** scalar arrives as ordinary text unless the
+/// guard reads the resolved node instead. `!!null "null"` is the one
+/// spelling YAML defines as unambiguously a null, so it must not be the
+/// one spelling that gets through.
+#[skuld::test]
+fn a_tag_resolved_null_is_rejected_wherever_a_plain_one_is() {
+    let positions: [(&str, &str); 6] = [
+        (
+            "daemons:\n  frpc:\n    command: [bin/frpc]\n    name: {null}\n",
+            "not a way to unset this field",
+        ),
+        (
+            "daemons:\n  frpc:\n    command: [bin/frpc]\n    env:\n      {null}: v\n",
+            "not an environment variable name",
+        ),
+        (
+            "daemons:\n  frpc:\n    command: [bin/frpc]\n    env:\n      A: {null}\n",
+            "not an environment value",
+        ),
+        (
+            "daemons:\n  frpc:\n    command: [bin/frpc, {null}]\n",
+            "not a command element",
+        ),
+        ("daemons:\n  {null}:\n    command: [bin/frpc]\n", "not a daemon id"),
+        (
+            "daemons:\n  frpc:\n    command: [bin/frpc]\n    user:\n      name: {null}\n",
+            "not a username",
+        ),
+    ];
+    for (template, expected) in positions {
+        for spelling in ["!!null null", "!!null ~", "!!null \"null\"", "!!null \"~\""] {
+            let yaml = template.replace("{null}", spelling);
+            let err = parse(&yaml).unwrap_err().to_string();
+            assert!(
+                err.contains(expected),
+                "`{spelling}`: expected `{expected}`, got: {err}"
+            );
+        }
+        // `!!null ""` is a null per the YAML spec but not per
+        // `serde_yaml_ng`'s `parse_null`, which accepts only
+        // `null`/`Null`/`NULL`/`~`. It refuses the tag itself rather than
+        // reaching this crate's visitor, so only the refusal is asserted.
+        let yaml = template.replace("{null}", "!!null \"\"");
+        let err = parse(&yaml).unwrap_err().to_string();
+        assert!(err.contains("expected null"), "`!!null \"\"`: got: {err}");
+    }
+}
+
+/// An empty value is a YAML null, and `null` is refused *wherever a
+/// manifest value is expected* — including where the expected value is a
+/// container. `serde_yaml_ng` maps an empty plain scalar onto an empty
+/// map or sequence when asked for one, so without a guard `daemons:` with
+/// no body installs nothing and exits 0.
+#[skuld::test]
+fn an_empty_container_body_is_rejected() {
+    let cases: [(&str, &str); 6] = [
+        ("daemons:\n", "not a set of daemons"),
+        ("daemons: null\n", "not a set of daemons"),
+        (
+            "daemons:\n  frpc:\n    command: [bin/frpc]\n    env:\n",
+            "not an environment block",
+        ),
+        (
+            "daemons:\n  frpc:\n    command: [bin/frpc]\n    env: null\n",
+            "not an environment block",
+        ),
+        ("daemons:\n  frpc:\n    command:\n", "not a command"),
+        ("daemons:\n  frpc:\n    command: null\n", "not a command"),
+    ];
+    for (yaml, expected) in cases {
+        let err = parse(yaml).unwrap_err().to_string();
+        assert!(err.contains(expected), "expected `{expected}`, got: {err}");
+    }
+}
+
+/// The other half of the rule above: an explicitly *written* empty
+/// container is a value the author chose, and stays legal.
+#[skuld::test]
+fn an_explicitly_empty_container_is_accepted() {
+    let manifest = parse("daemons: {}\n").expect("`daemons: {}` should parse");
+    assert!(manifest.daemons.is_empty());
+
+    let manifest = parse("daemons:\n  frpc:\n    command: [bin/frpc]\n    env: {}\n").expect("`env: {}` should parse");
+    assert!(manifest.daemons["frpc"].env.is_empty());
 }

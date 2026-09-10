@@ -1,15 +1,20 @@
 //! The literal shape of `goetia.yaml`: what deserializes directly from
 //! YAML, before `resolve` turns it into `DaemonSpec`s.
 //!
-//! `RawManifest`'s `Deserialize` is hand-written rather than derived. A
-//! typed `BTreeMap<String, RawSpec>` field cannot detect a duplicate YAML
-//! key: serde's map deserializer inserts and overwrites, and
-//! `serde_yaml_ng`'s own duplicate-key check lives only in its `Mapping`
-//! deserializer, which a typed map never reaches — a manifest declaring
-//! `frpc` twice would silently deserialize to one entry holding the
-//! *second* command. So this module walks the `daemons` mapping's
-//! key/value pairs itself, one entry at a time, and rejects a repeated or
-//! case-insensitively colliding id before it ever reaches a `BTreeMap`.
+//! [`RawManifest::parse`] is the entry point: it refuses every explicit
+//! `null` first (see `no_null` for why that is a separate walk of the same
+//! text) and then deserializes.
+//!
+//! `RawManifest`'s `Deserialize` is hand-written rather than derived, and
+//! `env` gets a `deserialize_with`, for the same reason: a typed
+//! `BTreeMap` field cannot detect a duplicate YAML key, because serde's map
+//! deserializer inserts and overwrites and `serde_yaml_ng`'s own
+//! duplicate-key check lives only in its `Mapping` deserializer, which a
+//! typed map never reaches — a manifest declaring `frpc` twice would
+//! silently deserialize to one entry holding the *second* command. So this
+//! module walks both mappings' key/value pairs itself, one entry at a
+//! time, and rejects a repeat, or a collision that differs only in case,
+//! before it ever reaches a `BTreeMap`.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -17,7 +22,7 @@ use std::fmt;
 use serde::de::{self, DeserializeSeed, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
-use super::no_null::{no_null, no_null_command, no_null_env, string_or_null};
+use super::no_null::reject_nulls;
 use super::user::RawUser;
 
 /// The whole `goetia.yaml` document.
@@ -26,29 +31,39 @@ pub struct RawManifest {
     pub daemons: BTreeMap<String, RawSpec>,
 }
 
+impl RawManifest {
+    /// A manifest's parse entry point, and the only one: `reject_nulls`
+    /// runs first so that an explicit `null` is refused with its own line
+    /// and key path, which `RawSpec`'s `Option` fields could not do — see
+    /// `no_null`. Both walks read the same unmodified text.
+    pub fn parse(yaml: &str) -> Result<Self, serde_yaml_ng::Error> {
+        reject_nulls(yaml)?;
+        serde_yaml_ng::from_str(yaml)
+    }
+}
+
 /// One `daemons.<id>` entry, exactly as written in YAML. No defaults are
 /// materialized and no cross-field or injection-gate validation runs here
 /// — see `resolve`, the parse-don't-validate boundary.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawSpec {
-    #[serde(default, deserialize_with = "no_null")]
+    #[serde(default)]
     pub name: Option<String>,
-    #[serde(deserialize_with = "no_null_command")]
     pub command: Vec<String>,
-    #[serde(default, deserialize_with = "no_null")]
+    #[serde(default)]
     pub cwd: Option<String>,
-    #[serde(default, deserialize_with = "no_null_env")]
+    #[serde(default, deserialize_with = "no_duplicate_env")]
     pub env: BTreeMap<String, String>,
-    #[serde(default, deserialize_with = "no_null")]
+    #[serde(default)]
     pub user: Option<RawUser>,
-    #[serde(default, deserialize_with = "no_null")]
+    #[serde(default)]
     pub restart: Option<String>,
-    #[serde(rename = "restart-delay", default, deserialize_with = "no_null")]
+    #[serde(rename = "restart-delay", default)]
     pub restart_delay: Option<String>,
-    #[serde(default, deserialize_with = "no_null")]
+    #[serde(default)]
     pub logs: Option<String>,
-    #[serde(rename = "type", default, deserialize_with = "no_null")]
+    #[serde(rename = "type", default)]
     pub kind: Option<String>,
 }
 
@@ -108,24 +123,6 @@ impl<'de> DeserializeSeed<'de> for DaemonsSeed {
     }
 }
 
-/// A daemon id that refuses an explicit YAML `null`. Local to this module
-/// because `DaemonsVisitor` is its only user; the rejection itself is
-/// shared with `env`'s keys and values.
-struct NoNullDaemonId(String);
-
-impl<'de> Deserialize<'de> for NoNullDaemonId {
-    fn deserialize<D>(d: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        string_or_null(
-            d,
-            "an explicit `null` is not a daemon id; quote the key to use its literal text",
-        )
-        .map(NoNullDaemonId)
-    }
-}
-
 struct DaemonsVisitor;
 
 impl<'de> Visitor<'de> for DaemonsVisitor {
@@ -145,7 +142,7 @@ impl<'de> Visitor<'de> for DaemonsVisitor {
         // messages.
         let mut seen: BTreeMap<String, String> = BTreeMap::new();
 
-        while let Some(NoNullDaemonId(key)) = map.next_key::<NoNullDaemonId>()? {
+        while let Some(key) = map.next_key::<String>()? {
             let lower = key.to_lowercase();
             if let Some(first) = seen.get(&lower) {
                 return Err(if *first == key {
@@ -160,6 +157,60 @@ impl<'de> Visitor<'de> for DaemonsVisitor {
         }
 
         Ok(daemons)
+    }
+}
+
+/// `RawSpec::env`, walked one entry at a time for the same reason
+/// [`DaemonsVisitor`] exists: a typed `BTreeMap<String, String>` field
+/// inserts and overwrites, and `serde_yaml_ng`'s own duplicate-key check
+/// lives only in its `Mapping` deserializer, which a typed map never
+/// reaches. These values become a privileged service's environment, so a
+/// key lost that way means the daemon runs with an environment the author
+/// never wrote and cannot see they lost.
+fn no_duplicate_env<'de, D>(d: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    d.deserialize_map(EnvVisitor)
+}
+
+struct EnvVisitor;
+
+impl<'de> Visitor<'de> for EnvVisitor {
+    type Value = BTreeMap<String, String>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a mapping of environment variable name to value")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut env = BTreeMap::new();
+        // Folded key -> the original-case key it was first seen as, so an
+        // exact repeat and a differently-cased collision get distinct
+        // messages.
+        let mut seen: BTreeMap<String, String> = BTreeMap::new();
+
+        while let Some(key) = map.next_key::<String>()? {
+            let folded = key.to_lowercase();
+            if let Some(first) = seen.get(&folded) {
+                return Err(if *first == key {
+                    de::Error::custom(format!("duplicate env key `{key}`"))
+                } else {
+                    de::Error::custom(format!(
+                        "env keys `{first}` and `{key}` differ only in case, and Windows looks an \
+                         environment variable up case-insensitively, so one of the two would be lost"
+                    ))
+                });
+            }
+            let value = map.next_value::<String>()?;
+            seen.insert(folded, key.clone());
+            env.insert(key, value);
+        }
+
+        Ok(env)
     }
 }
 

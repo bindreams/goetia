@@ -72,25 +72,6 @@ impl<'de> Deserialize<'de> for RawUser {
     }
 }
 
-/// A `user.name` that refuses an explicit YAML `null`. `no_null` guards the
-/// `user:` field one level above, which does not reach this one: a plain
-/// `String` here would render the scalar's *text* and install a service
-/// under the literal account `"null"` — see `no_null`'s doc comment for why
-/// only `Option::<String>::deserialize` sees a `null` at all. `user.id`
-/// needs no such wrapper: `AccountId` is `#[serde(untagged)]` and buffers
-/// through `Value`, which refuses a unit outright.
-struct NoNullName(String);
-
-impl<'de> Deserialize<'de> for NoNullName {
-    fn deserialize<D>(d: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        super::no_null::string_or_null(d, "an explicit `null` is not a username; omit the `user:` key instead")
-            .map(NoNullName)
-    }
-}
-
 struct UserVisitor;
 
 impl<'de> Visitor<'de> for UserVisitor {
@@ -130,7 +111,7 @@ impl<'de> Visitor<'de> for UserVisitor {
                     if name.is_some() {
                         return Err(de::Error::duplicate_field("name"));
                     }
-                    name = Some(map.next_value::<NoNullName>()?.0);
+                    name = Some(map.next_value()?);
                 }
                 "id" => {
                     if id.is_some() {

@@ -1,155 +1,292 @@
-//! Deserializers that refuse an explicit YAML `null`, for `raw.rs`'s
-//! fields and for every leaf under them.
+//! A pre-parse scan that refuses an explicit YAML `null` anywhere in a
+//! manifest.
 //!
-//! An explicit `null` is an error for all nine `daemons.<id>` fields, for
-//! the daemon id itself, for the keys and the values of `env`, for the
-//! elements of `command`, and for `user`'s `name`. `env: {A: ""}` and
-//! `command: [/bin/frpc, ""]` stay legal — only `null` is refused, not
-//! emptiness, and a *quoted* `"null"` is ordinary text everywhere.
+//! An explicit `null` is an error wherever a manifest value is expected:
+//! the `daemons` mapping and every daemon under it, all nine
+//! `daemons.<id>` fields, the daemon id itself, the keys and the values of
+//! `env`, the elements of `command`, and `user`'s `name` and `id`.
+//! `env: {A: ""}`, `env: {}` and `command: [/bin/frpc, ""]` stay legal —
+//! only `null` is refused, not emptiness — and a *quoted* `"null"` is
+//! ordinary text everywhere.
+//!
+//! # Why a scan, and not a `deserialize_with` on each field
+//!
+//! Two properties are wanted from one rejection, and no single
+//! `Deserializer` call gives both.
+//!
+//! - **Position.** `serde_yaml_ng` attaches the offending node's line and
+//!   its key path in `error::fix_mark`, which each `deserialize_*` method
+//!   applies to whatever error came out of it, filling a position in only
+//!   if one is not set already — so the innermost one wins.
+//!   `deserialize_option` is one of the two methods that never calls it.
+//!   A refusal built after `Option::<T>::deserialize` has returned
+//!   `Ok(None)` has therefore already left the deserializer that knew the
+//!   position, and the enclosing container stamps its *own* start line on
+//!   it instead: `restart: null` on line 9 reported the `command:` line
+//!   six lines above it. Only `deserialize_any`, whose `visit_unit` is
+//!   reached from inside `fix_mark`'s reach, can report the real one.
+//! - **Authored text.** `deserialize_any` resolves a *plain* scalar
+//!   through `visit_untagged_scalar` and hands the visitor the resulting
+//!   bool or number, not the characters: `env: {C: 0x10}` arrives as
+//!   `16`, `name: +5` as `5`, `env: {E: True}` as `true`. `resolve_tests`'
+//!   `load_preserves_authored_scalar_text_alongside_interpolation` pins
+//!   the opposite, and it is right to: an environment variable must carry
+//!   what the author wrote.
+//!
+//! So the two jobs are split across two walks of the same text. This scan
+//! runs first and reads every node with `deserialize_any`, which sees
+//! nulls and tags exactly and reports them from the right place — and
+//! throws every value away, so its coercion costs nothing. The typed parse
+//! then runs on a document already known to hold no `null`, and reads each
+//! scalar as a string, so the authored text survives. Both walk the same
+//! unmodified text, so neither can move a position or change a message.
 
-use std::collections::BTreeMap;
 use std::fmt;
 
-use serde::de::{self, MapAccess, Visitor};
-use serde::{Deserialize, Deserializer};
+use serde::de::{self, DeserializeSeed, EnumAccess, IgnoredAny, MapAccess, SeqAccess, VariantAccess, Visitor};
 
-/// The one place an `Option<T>`-shaped field refuses an explicit YAML
-/// `null`, instead of silently reading it as "unset".
-///
-/// **Do not write the variant that deserializes `T` and wraps it in
-/// `Some`.** It does not work, and the failure is silent:
-/// `serde_yaml_ng` renders a *plain scalar's text* when asked for a
-/// `String`, and `null`, `~` and an empty value are all plain scalars, so
-/// `String::deserialize` succeeds on them and yields `"null"`, `"~"` and
-/// `""` respectively. Only `Option::<T>::deserialize` reaches
-/// `visit_none`/`visit_some`, and there is no tension with the
-/// unquoted-scalar-coercion requirement: `visit_some` hands the inner
-/// `String::deserialize` the same plain scalar it would have got
-/// directly, so `name: 42` still coerces to `Some("42")` here.
-pub(super) fn no_null<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    match Option::<T>::deserialize(d)? {
-        Some(value) => Ok(Some(value)),
-        None => Err(de::Error::custom(
-            "an explicit `null` is not a way to unset this field; omit the key instead",
-        )),
+/// Refuse every explicit `null` in `yaml`, naming the first one found.
+pub(super) fn reject_nulls(yaml: &str) -> Result<(), serde_yaml_ng::Error> {
+    Scan(Slot::Document).deserialize(serde_yaml_ng::Deserializer::from_str(yaml))
+}
+
+/// Where in a manifest a node sits. It decides what a refusal says, and
+/// nothing else — a slot this table does not know becomes [`Slot::Field`],
+/// so a field added to `RawSpec` without a line here is still refused,
+/// just with the generic wording.
+#[derive(Clone, Copy)]
+enum Slot {
+    Document,
+    Daemons,
+    DaemonId,
+    Daemon,
+    Field,
+    Env,
+    EnvKey,
+    EnvValue,
+    Command,
+    CommandElement,
+    User,
+    UserName,
+    UserId,
+}
+
+impl Slot {
+    /// What a `null` in this slot is refused with, if this scan is the one
+    /// to refuse it. Each names what the author meant to write instead,
+    /// because "omit the key" is the right remedy for a field with a
+    /// default and the wrong one for a required key or a map entry.
+    fn message(self) -> Option<&'static str> {
+        Some(match self {
+            // A `null` *document* is not this scan's to diagnose: the typed
+            // parse answers it with `expected a mapping with a \`daemons\`
+            // key`, which is more use than anything about `null` would be.
+            Slot::Document => return None,
+            Slot::Daemons => "an explicit `null` is not a set of daemons; write at least one `<id>:` entry under it",
+            Slot::DaemonId => "an explicit `null` is not a daemon id; quote the key to use its literal text",
+            Slot::Daemon => "an explicit `null` is not a daemon; give it at least a `command:`",
+            Slot::Field => "an explicit `null` is not a way to unset this field; omit the key instead",
+            Slot::Env => {
+                "an explicit `null` is not an environment block; omit the `env:` key, or write `{}` for no variables"
+            }
+            Slot::EnvKey => {
+                "an explicit `null` is not an environment variable name; quote the key to use its literal text"
+            }
+            Slot::EnvValue => {
+                "an explicit `null` is not an environment value; omit the key, or write `\"\"` to set it empty"
+            }
+            Slot::Command => "an explicit `null` is not a command; write the program and its arguments as a sequence",
+            Slot::CommandElement => {
+                "an explicit `null` is not a command element; remove it, or write `\"\"` for an empty argument"
+            }
+            Slot::User => "an explicit `null` is not a way to unset this field; omit the key instead",
+            Slot::UserName => "an explicit `null` is not a username; omit the `user:` key instead",
+            Slot::UserId => "an explicit `null` is not an account id; omit the `user:` key instead",
+        })
+    }
+
+    /// The slot of the value stored under `key` in this mapping.
+    fn value(self, key: &str) -> Slot {
+        match (self, key) {
+            (Slot::Document, "daemons") => Slot::Daemons,
+            (Slot::Daemons, _) => Slot::Daemon,
+            (Slot::Daemon, "env") => Slot::Env,
+            (Slot::Daemon, "command") => Slot::Command,
+            (Slot::Daemon, "user") => Slot::User,
+            (Slot::Env, _) => Slot::EnvValue,
+            (Slot::User, "name") => Slot::UserName,
+            (Slot::User, "id") => Slot::UserId,
+            _ => Slot::Field,
+        }
+    }
+
+    /// The slot of a key of this mapping.
+    fn key(self) -> Slot {
+        match self {
+            Slot::Daemons => Slot::DaemonId,
+            Slot::Env => Slot::EnvKey,
+            _ => Slot::Field,
+        }
+    }
+
+    /// The slot of an element of this sequence.
+    fn element(self) -> Slot {
+        match self {
+            Slot::Command => Slot::CommandElement,
+            _ => Slot::Field,
+        }
     }
 }
 
-/// The one place a `String` position refuses an explicit YAML `null`.
-/// `Option::<String>::deserialize` is the only form that sees one: see
-/// `no_null` above, same reason.
-pub(super) fn string_or_null<'de, D>(d: D, message: &'static str) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Option::<String>::deserialize(d)?.ok_or_else(|| de::Error::custom(message))
-}
+/// One node of the scan. `deserialize_any` is the whole point: it is what
+/// reaches `visit_unit` for a `null`, from inside the position the error
+/// needs, and what resolves `!!null "null"` — `deserialize_option` decides
+/// null-ness from the scalar's *style*, so it sees a tagged null only when
+/// the scalar is unquoted.
+struct Scan(Slot);
 
-/// A `command` element. `command[0]` is the executable path — a `null`
-/// there is absolutized into `<manifest dir>/null`, which `reject_empty`
-/// cannot catch because it is not empty — and a `null` in any later
-/// position is a literal argv string. `""` stays a legal argv element,
-/// which is why the message names it.
-struct NoNullArg(String);
+impl<'de> DeserializeSeed<'de> for Scan {
+    type Value = ();
 
-impl<'de> Deserialize<'de> for NoNullArg {
-    fn deserialize<D>(d: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        string_or_null(
-            d,
-            "an explicit `null` is not a command element; remove it, or write `\"\"` for an empty argument",
-        )
-        .map(NoNullArg)
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_any(self)
     }
 }
 
-/// `RawSpec::command`: still a required sequence, with no element of it
-/// allowed to be `null`.
-pub(super) fn no_null_command<'de, D>(d: D) -> Result<Vec<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Ok(Vec::<NoNullArg>::deserialize(d)?.into_iter().map(|arg| arg.0).collect())
-}
-
-/// An `env` key.
-struct NoNullEnvKey(String);
-
-impl<'de> Deserialize<'de> for NoNullEnvKey {
-    fn deserialize<D>(d: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        string_or_null(
-            d,
-            "an explicit `null` is not an environment variable name; quote the key to use its literal text",
-        )
-        .map(NoNullEnvKey)
-    }
-}
-
-/// An `env` value. `""` is a legal empty assignment and stays legal; only
-/// a `null` is refused, which is why the message names `""`.
-struct NoNullEnvValue(String);
-
-impl<'de> Deserialize<'de> for NoNullEnvValue {
-    fn deserialize<D>(d: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        string_or_null(
-            d,
-            "an explicit `null` is not an environment value; omit the key, or write `\"\"` to set it empty",
-        )
-        .map(NoNullEnvValue)
-    }
-}
-
-/// `RawSpec::env`: the map is required to be a map, and neither its keys
-/// nor its values may be `null` or repeated.
-pub(super) fn no_null_env<'de, D>(d: D) -> Result<BTreeMap<String, String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    d.deserialize_map(EnvVisitor)
-}
-
-/// A hand-written `Visitor` rather than a `BTreeMap<NoNullEnvKey,
-/// NoNullEnvValue>`, for the reason `raw.rs`'s `DaemonsVisitor` exists:
-/// serde's map deserializer inserts and overwrites, and `serde_yaml_ng`'s
-/// own duplicate-key check lives only in its `Mapping` deserializer, which
-/// a typed map never reaches. These values become a privileged service's
-/// environment, so a key lost that way means the daemon runs with an
-/// environment the author never wrote and cannot see they lost.
-struct EnvVisitor;
-
-impl<'de> Visitor<'de> for EnvVisitor {
-    type Value = BTreeMap<String, String>;
+impl<'de> Visitor<'de> for Scan {
+    type Value = ();
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("a mapping of environment variable name to value")
+        f.write_str("a manifest value")
     }
 
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut env = BTreeMap::new();
-
-        while let Some(NoNullEnvKey(key)) = map.next_key::<NoNullEnvKey>()? {
-            if env.contains_key(&key) {
-                return Err(de::Error::custom(format!("duplicate env key `{key}`")));
-            }
-            let NoNullEnvValue(value) = map.next_value()?;
-            env.insert(key, value);
+    fn visit_unit<E: de::Error>(self) -> Result<(), E> {
+        match self.0.message() {
+            Some(message) => Err(E::custom(message)),
+            None => Ok(()),
         }
+    }
 
-        Ok(env)
+    /// An empty document, which `serde_yaml_ng` reports as `Event::Void`.
+    /// The typed parse's `missing field \`daemons\`` says more about it
+    /// than this scan could.
+    fn visit_none<E: de::Error>(self) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_bool<E: de::Error>(self, _v: bool) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_i64<E: de::Error>(self, _v: i64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_u64<E: de::Error>(self, _v: u64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_i128<E: de::Error>(self, _v: i128) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_u128<E: de::Error>(self, _v: u128) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_f64<E: de::Error>(self, _v: f64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_str<E: de::Error>(self, _v: &str) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        while seq.next_element_seed(Scan(self.0.element()))?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while let Some(key) = map.next_key_seed(ScanKey(self.0.key()))? {
+            map.next_value_seed(Scan(self.0.value(&key)))?;
+        }
+        Ok(())
+    }
+
+    /// A node carrying a local tag (`name: !mine text`) arrives as an
+    /// enum, since that is how `serde_yaml_ng` offers `!Tag` syntax.
+    /// Recursing into the content rather than ignoring it keeps
+    /// `!mine null` refused.
+    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<(), A::Error> {
+        let (_tag, variant) = data.variant::<IgnoredAny>()?;
+        variant.newtype_variant_seed(self)
+    }
+}
+
+/// A mapping key. Same refusal as [`Scan`], plus the key's text, which
+/// picks the slot of the value beside it. The text is used for that and
+/// discarded, so the coercion `deserialize_any` performs on a plain
+/// numeric key is invisible: `env`'s keys reach `RawSpec` from the typed
+/// parse, not from here.
+struct ScanKey(Slot);
+
+impl<'de> DeserializeSeed<'de> for ScanKey {
+    type Value = String;
+
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<String, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for ScanKey {
+    type Value = String;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a mapping key")
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<String, E> {
+        Scan(self.0).visit_unit().map(|()| String::new())
+    }
+
+    fn visit_bool<E: de::Error>(self, v: bool) -> Result<String, E> {
+        Ok(v.to_string())
+    }
+
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<String, E> {
+        Ok(v.to_string())
+    }
+
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<String, E> {
+        Ok(v.to_string())
+    }
+
+    fn visit_i128<E: de::Error>(self, v: i128) -> Result<String, E> {
+        Ok(v.to_string())
+    }
+
+    fn visit_u128<E: de::Error>(self, v: u128) -> Result<String, E> {
+        Ok(v.to_string())
+    }
+
+    fn visit_f64<E: de::Error>(self, v: f64) -> Result<String, E> {
+        Ok(v.to_string())
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<String, E> {
+        Ok(v.to_owned())
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<String, A::Error> {
+        Scan(self.0).visit_seq(seq).map(|()| String::new())
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<String, A::Error> {
+        Scan(self.0).visit_map(map).map(|()| String::new())
+    }
+
+    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<String, A::Error> {
+        Scan(self.0).visit_enum(data).map(|()| String::new())
     }
 }
