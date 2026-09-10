@@ -477,7 +477,7 @@ fn restart_variants_map_to_keepalive() {
 #[skuld::test]
 fn throttle_interval_rounds_up() {
     let cases = [
-        (Duration::new(1, 500_000_000), 2), // 1.5s -> 2, per the plan's own example
+        (Duration::new(1, 500_000_000), 2), // 1.5s -> 2: a fraction rounds up, never down
         (Duration::from_millis(500), 1),    // 500ms would truncate to 0, which disables throttling
         (Duration::from_secs(2), 2),        // already whole: unchanged
         (Duration::ZERO, 0),                // explicit opt-out is left alone, not "rounded"

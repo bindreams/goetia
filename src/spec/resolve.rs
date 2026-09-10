@@ -127,10 +127,9 @@ pub fn resolve(raw: RawManifest, base_dir: &Path) -> Result<(Vec<DaemonSpec>, Ve
 /// Production has exactly one caller, [`resolve`], which passes
 /// [`Backend::native`]. Tests pass any of the three, because the native arm
 /// of steps 4 and 5 — the skip, the verdict, the advisory — is otherwise
-/// only reachable from the one platform that runs it, and this repository's
-/// `#[cfg(windows)]` and macOS paths are exactly where the defects have
-/// been. A test that names a non-native backend as `native` exercises the
-/// same code an install on that platform would.
+/// only reachable from the one platform that runs it. A test that names a
+/// non-native backend as `native` exercises the same code an install on
+/// that platform would.
 fn resolve_as(
     raw: RawManifest,
     base_dir: &Path,
@@ -152,9 +151,8 @@ fn resolve_as(
     let base_dir = absolutize(base_dir, &mut warnings)?;
     let base_dir = base_dir.as_path();
 
-    // Step 1: ids, and the guard that used to live in `interpolate::manifest`.
-    // Must run before `Id::try_from`, or the id-pattern check (whose
-    // charset already excludes `$`) answers first with its generic
+    // Step 1: ids. Must run before `Id::try_from`, or the id-pattern check
+    // (whose charset already excludes `$`) answers first with its generic
     // message. The id is not overridable, so this runs once per daemon.
     let mut entries: Vec<(Id, RawSpec)> = Vec::with_capacity(raw.daemons.len());
     for (key, raw_spec) in raw.daemons {
@@ -164,11 +162,12 @@ fn resolve_as(
     }
 
     // Step 2: the `.env` gate, computed from the specs substitution will
-    // actually run on (step 5), not from every backend's override. Reading
-    // it from anything else either misses a `${VAR}` written only in the
-    // native override (it currently fails "no value for X" while `.env`
-    // defines it) or lets an unrelated/unreadable `.env` break a host whose
-    // native backend has no `$` anywhere.
+    // actually run on — *both* of them, since step 5b substitutes the merged
+    // native spec and step 5a substitutes the base spec. Reading it from
+    // anything else either misses a `${VAR}` written only in the native
+    // override (it currently fails "no value for X" while `.env` defines it)
+    // or lets an unrelated/unreadable `.env` break a host whose native
+    // backend has no `$` anywhere.
     let merged_native: Vec<(RawSpec, Supplied)> = entries
         .iter()
         .map(|(_, raw)| match native {
@@ -176,11 +175,24 @@ fn resolve_as(
             None => (raw.without_overrides(), Supplied::NONE),
         })
         .collect();
-    let vars = if merged_native
+    let native_needs_vars = merged_native
         .iter()
-        .any(|(spec, _)| interpolate::spec_would_change(spec))
-    {
+        .any(|(spec, _)| interpolate::spec_would_change(spec));
+    // A separate predicate, not folded into the one above, because the two
+    // owe different things to a `.env` that fails to read: step 5b's
+    // substitution is what gets installed, so an unreadable `.env` there is
+    // fatal, while step 5a's only feeds advisories, and an advisory this host
+    // cannot compute is silent. Both must be asked even so — a native
+    // override replacing every `$`-bearing base field leaves the merged spec
+    // literal, and a gate reading only that skips `.env`, deleting advisories
+    // the same manifest emits when written without variables.
+    let base_needs_vars = entries
+        .iter()
+        .any(|(_, raw)| interpolate::spec_would_change(&raw.without_overrides()));
+    let vars = if native_needs_vars {
         Vars::load(base_dir)?
+    } else if base_needs_vars {
+        Vars::load(base_dir).unwrap_or_else(|_| Vars::empty())
     } else {
         Vars::empty()
     };
@@ -328,10 +340,10 @@ pub fn load(path: &Path) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
 /// the spec step 5a's advisories read.
 ///
 /// `None` when substitution fails, and the caller then falls back to the
-/// authored spec step 4 shaped. `vars` is loaded for the *native* merged
-/// spec (step 2), which need not name a variable only a base field the
-/// native override replaces refers to; an advisory this host cannot compute
-/// is silent, never an error.
+/// authored spec step 4 shaped. Step 2 gates `vars` on this spec as well as
+/// on the merged native one, so the ordinary reasons to fail are a `.env`
+/// that could not be read and a variable it does not define — neither an
+/// error here, because an advisory this host cannot compute is silent.
 fn substituted_base(raw: &RawSpec, path: &str, vars: &Vars) -> Option<RawSpec> {
     let mut base = raw.without_overrides();
     interpolate::spec(&mut base, path, vars).ok()?;
@@ -465,12 +477,11 @@ fn resolve_shape(id: &Id, raw: RawSpec, base_dir: &Path, phase: Phase) -> Result
 
     let mut env = BTreeMap::new();
     for (key, value) in raw.env {
-        // The `$`-in-a-key rule, moved here from `interpolate::spec` so it
-        // runs for every backend, not just the native merged spec: `scm:
-        // {env: {"${K}": v}}` must be caught from Linux too. Comment
-        // deliberately duplicated with `interpolate.rs`'s copy — see
-        // `USER_ID_MESSAGE`'s note on `reject_blank` for why this is not a
-        // duplicate to be collapsed.
+        // The `$`-in-a-key rule, checked here so it runs for every backend,
+        // not just the native merged spec: `scm: {env: {"${K}": v}}` must be
+        // caught from Linux too. Comment deliberately duplicated with
+        // `interpolate.rs`'s copy — see `USER_ID_MESSAGE`'s note on
+        // `reject_blank` for why this is not a duplicate to be collapsed.
         if interpolate::would_substitution_change(&key) {
             return Err(invalid(id, interpolate::ENV_NAME_MESSAGE));
         }
@@ -489,8 +500,8 @@ fn resolve_shape(id: &Id, raw: RawSpec, base_dir: &Path, phase: Phase) -> Result
             reject_blank(id, "user.name", n)?;
         }
         User::Id(AccountId::Sid(s)) => {
-            // The `user.id` `$` rule, moved here for the same reason as the
-            // `env`-name one above. Ordering against `reject_blank` below
+            // The `user.id` `$` rule, checked here for the same reason as
+            // the `env`-name one above. Ordering against `reject_blank` below
             // does not matter: `${S}` trims to `${S}`, never empty, so the
             // two can never both fire on one value.
             if interpolate::would_substitution_change(s) {

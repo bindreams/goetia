@@ -267,8 +267,7 @@ fn interpolate_error(path: &str, message: String) -> Error {
 
 /// The `user.id` rejection, byte-exact: a test pins it. `pub(super)` (not
 /// private) so `resolve_shape` can raise the identical message when it
-/// carries this same rejection for a non-native backend — see
-/// "the three `$`-in-a-key rejections become shape checks" in the plan.
+/// carries this same rejection for a non-native backend.
 pub(super) const USER_ID_MESSAGE: &str = "`user.id` cannot be interpolated: a substituted value is always a string, so it \
                                would be read as a Windows SID; write the uid literally, or use `user: <name>`";
 

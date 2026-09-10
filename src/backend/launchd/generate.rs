@@ -262,10 +262,10 @@ fn push_run_at_load(out: &mut String, indent: &str) {
 
 /// `restart: never` omits `KeepAlive` (and, with it, `RunAtLoad`) entirely,
 /// so such a job never starts on its own — not at load, not at boot once
-/// enabled. This is deliberate, not an oversight: the plan's settled
-/// launchd semantics name `launchctl kickstart` as the mechanism for
-/// starting "a job with no `KeepAlive`/`RunAtLoad`", which only makes
-/// sense if `restart: never` is exactly that job shape. `on-failure`
+/// enabled. This is deliberate, not an oversight: `launchctl kickstart` is
+/// goetia's settled mechanism for starting "a job with no
+/// `KeepAlive`/`RunAtLoad`", which only makes sense if `restart: never` is
+/// exactly that job shape. `on-failure`
 /// emits a dict with `SuccessfulExit: false`; `always` emits the bare
 /// `true` form. Both non-`never` variants also emit `RunAtLoad: true`
 /// explicitly: harmless alongside the implication `KeepAlive` already

@@ -108,7 +108,7 @@ daemons:
     assert!(msg.contains('='), "error should call out the `=`: {msg}");
 }
 
-/// Beyond the four gate tests the plan names by name: the same directive
+/// Beyond the four gate tests named explicitly elsewhere: the same directive
 /// injection is possible through `user`'s bare-string form (it lands in
 /// `User=`/`UserName` unescaped, exactly like `name`), so it goes through
 /// the same gate.
@@ -1043,6 +1043,32 @@ fn load_does_not_read_the_env_file_when_the_manifest_has_no_dollar() {
 }
 
 #[skuld::test]
+fn an_unreadable_env_file_silences_advisories_rather_than_failing_the_manifest() {
+    // The step-2 gate's two halves, and the reason they are two predicates
+    // rather than one. `.env` is a directory in both manifests below, so
+    // `Vars::load` fails in both.
+    //
+    // Here only the *base* half wants it — the native override replaces the
+    // one `${VAR}` the base writes — and what the base half feeds is
+    // advisories about backends this host cannot install. An advisory it
+    // cannot compute is silent, so the manifest still resolves.
+    let dir = fixture_dir("", None);
+    std::fs::create_dir(dir.path().join(".env")).expect("fixture directory should be creatable");
+    let overridden = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    restart-delay: ${DELAY}\n    \
+                      backend-specific:\n      systemd:\n        restart-delay: 1s\n";
+    let (specs, warnings) = resolve_as(parse_manifest(overridden), dir.path(), Some(Backend::Systemd))
+        .expect("an unreadable `.env` must not fail a manifest whose native spec has no `$`");
+    assert_eq!(specs[0].restart_delay, Some(Duration::from_secs(1)));
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    // Drop the override and the *native* half wants it too — and that half
+    // decides what gets installed, so an unreadable `.env` there is fatal.
+    let bare = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    restart-delay: ${DELAY}\n";
+    let err = resolve_as(parse_manifest(bare), dir.path(), Some(Backend::Systemd)).unwrap_err();
+    assert!(matches!(err, Error::Io { .. }), "expected Io, got: {err:?}");
+}
+
+#[skuld::test]
 fn load_reads_the_env_file_for_an_escaped_dollar_only() {
     // The same fixture whose only `$` is a `$$` escape *does* read `.env`,
     // pinning `would_substitution_change`'s over-approximation rather than
@@ -1511,32 +1537,97 @@ fn a_templated_base_field_reaches_every_backends_advisories() {
     // installed either way, so the two manifests are asserted equal rather
     // than counted: they resolve to the same spec, so they owe the same
     // advisories.
+    //
+    // Both halves of that line are driven: a base whose `${VAR}` fields the
+    // native override leaves alone, and one whose every `${VAR}` field it
+    // replaces. The second is why the step-2 `.env` gate must ask the base
+    // spec too — with the merged native spec left literal, a gate reading
+    // only that skips `.env`, and every advisory computed from the
+    // substituted base falls back to the deferred authored spec and vanishes.
+    let dir = fixture_dir("", Some("KIND=managed\nRESTART=always\nDELAY=60d\nSUB=500ms\n"));
+
+    // `systemd` native, so every warning below comes from the two
+    // non-native backends: `Systemd.warn` has no advisories of its own —
+    // which is also why the `systemd:` override below cannot be what
+    // silences anything.
+    let native = Some(Backend::Systemd);
+    let owed_alike = |literal: &str, templated: &str, expected: usize| {
+        let (_specs, from_literal) =
+            resolve_as(parse_manifest(literal), dir.path(), native).expect("resolves, with advisories");
+        let (_specs, from_env) =
+            resolve_as(parse_manifest(templated), dir.path(), native).expect("resolves, with advisories");
+        assert_eq!(
+            from_literal.len(),
+            expected,
+            "the literal manifest owes {expected}: {from_literal:?}"
+        );
+        assert_eq!(
+            from_env, from_literal,
+            "a base field moved into `.env` must keep every advisory it had as a literal"
+        );
+    };
+
     let fields = |kind: &str, restart: &str, delay: &str| {
         format!(
             "daemons:\n  frpc:\n    command: [/bin/frpc]\n    cwd: .\n    type: {kind}\n    \
              restart: {restart}\n    restart-delay: {delay}\n"
         )
     };
-    let literal = fields("managed", "always", "60d");
-    let templated = fields("${KIND}", "${RESTART}", "${DELAY}");
-    let dir = fixture_dir(&templated, Some("KIND=managed\nRESTART=always\nDELAY=60d\n"));
-
-    // `systemd` native, so every warning below comes from the two
-    // non-native backends: `Systemd.warn` has no advisories of its own.
-    let native = Some(Backend::Systemd);
-    let (_specs, from_literal) =
-        resolve_as(parse_manifest(&literal), dir.path(), native).expect("resolves, with advisories");
-    let (_specs, from_env) =
-        resolve_as(parse_manifest(&templated), dir.path(), native).expect("resolves, with advisories");
-
-    assert_eq!(
-        from_literal.len(),
+    owed_alike(
+        &fields("managed", "always", "60d"),
+        &fields("${KIND}", "${RESTART}", "${DELAY}"),
         3,
-        "the literal manifest owes three: {from_literal:?}"
     );
+
+    // The same pair, with a `systemd:` override replacing every field the
+    // templated base writes a `${VAR}` in, so the merged native spec is
+    // `$`-free. `500ms` rather than `60d` so the third advisory comes from
+    // launchd's `ThrottleInterval` rounding: two backends, not one.
+    let overridden = |kind: &str, restart: &str, delay: &str| {
+        format!(
+            "{}    backend-specific:\n      systemd:\n        type: simple\n        restart: never\n        \
+             restart-delay: 1s\n",
+            fields(kind, restart, delay)
+        )
+    };
+    owed_alike(
+        &overridden("managed", "always", "500ms"),
+        &overridden("${KIND}", "${RESTART}", "${SUB}"),
+        3,
+    );
+}
+
+#[skuld::test]
+fn an_unrelated_daemon_cannot_change_a_daemons_advisories() {
+    // Action at a distance, asserted directly: `.env` is read once per
+    // manifest, so a gate that decides to read it from the wrong specs makes
+    // one daemon's advisories depend on what some *other* daemon happens to
+    // write. `frpc` below is byte-identical in both manifests and resolves
+    // to the same spec in both, so its warnings must be too — whether or not
+    // `other` is there, and whether or not `other` is the daemon whose
+    // `${VAR}` forces `.env` to be read.
+    let frpc = "  frpc:\n    command: [/bin/frpc]\n    restart-delay: ${DELAY}\n    backend-specific:\n      \
+                systemd:\n        restart-delay: 1s\n";
+    let other = "  other:\n    command: [/bin/other]\n    name: ${DELAY}\n";
+    let alone = format!("daemons:\n{frpc}");
+    let with_sibling = format!("daemons:\n{frpc}{other}");
+    let dir = fixture_dir("", Some("DELAY=500ms\n"));
+
+    let owed_by_frpc = |yaml: &str| {
+        let (_specs, warnings) =
+            resolve_as(parse_manifest(yaml), dir.path(), Some(Backend::Systemd)).expect("resolves, with advisories");
+        warnings
+            .into_iter()
+            .filter(|w| w.id.as_ref().is_some_and(|id| id.as_str() == "frpc"))
+            .collect::<Vec<_>>()
+    };
+
+    let solo = owed_by_frpc(&alone);
+    assert_eq!(solo.len(), 1, "launchd's ThrottleInterval advisory is owed: {solo:?}");
     assert_eq!(
-        from_env, from_literal,
-        "a base field moved into `.env` must keep every advisory it had as a literal"
+        owed_by_frpc(&with_sibling),
+        solo,
+        "adding an unrelated daemon must not change what `frpc` is owed"
     );
 }
 
