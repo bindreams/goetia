@@ -33,19 +33,17 @@ pub(crate) use resolve::{
     reject_blank, reject_empty, reject_empty_command, reject_env_key_with_equals, reject_relative_path,
     reject_unemittable,
 };
-// `windows_builtin`/`MAX_SC_ACTION_DELAY` are read from
-// `crate::backend::scm::generate` (Task 7, and the clamp), which is not a
-// descendant of `spec`, so `mod backend;` being private to `spec` hides
-// them from it. `windows_only_account` stays out of this line: it is read
-// only by `Backend::error`, inside `spec::backend` itself.
-//
-// `Builtin`/`windows_builtin` have no caller through this path yet —
-// `MAX_SC_ACTION_DELAY` does (`backend::scm::generate`'s clamp) — because
-// their consumer, Task 7's `canonical_account`, has not landed. Not a
-// placeholder for a future concept: the two names and this re-export are
-// this task's own produced interface, just not yet called through it.
+// Read by `crate::backend::scm::generate`, which is not a descendant of
+// `spec` and so cannot see through a private `mod backend;`:
+// `windows_builtin` from `canonical_account` and `account_needs_password`,
+// `MAX_SC_ACTION_DELAY` from `registration`'s clamp. `windows_only_account`
+// stays out of this line — only `Backend::error` reads it, inside
+// `spec::backend` itself.
+pub(crate) use backend::{MAX_SC_ACTION_DELAY, windows_builtin};
+// `Builtin` is named through this path from `generate_tests.rs` alone;
+// production code only ever infers it, from `windows_builtin`'s return.
 #[allow(unused_imports)]
-pub(crate) use backend::{Builtin, MAX_SC_ACTION_DELAY, windows_builtin};
+pub(crate) use backend::Builtin;
 
 use std::collections::BTreeMap;
 use std::fmt;

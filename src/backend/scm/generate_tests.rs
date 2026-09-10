@@ -763,10 +763,8 @@ fn managed_kind_clamps_absurdly_long_restart_delay() {
         "an out-of-range delay must be clamped, not passed through to a value that panics \
          inside windows-service's ServiceAction::to_raw"
     );
-    // The advisory for this half moved to `Backend::Scm.warn`
-    // (`spec/backend_tests.rs`'s `an_over_long_delay_warns_from_the_scm_arm`)
-    // so it fires at resolve time on every host, not only when this
-    // effectful-install-time generator happens to run.
+    // Warning coverage for an over-long delay lives in `spec::backend`'s
+    // tests, gated by `Backend::Scm.warn` rather than by this generator.
 }
 
 #[skuld::test]

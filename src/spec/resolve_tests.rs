@@ -347,7 +347,7 @@ daemons:
     let (specs, warnings) = resolve_yaml(yaml).expect("accepted with a warning, not rejected");
 
     // The blob keeps the authored value unrounded, so generation stays
-    // deterministic; only the launchd generator (Task 7) rounds up.
+    // deterministic; only `backend::launchd::generate` rounds up.
     assert_eq!(specs[0].restart_delay, Some(Duration::from_millis(1500)));
     assert_eq!(warnings.len(), 1);
     assert!(
@@ -1499,6 +1499,61 @@ fn the_native_backend_advisory_comes_from_the_substituted_pass() {
             "native `{native}`: {warnings:?}"
         );
     }
+}
+
+#[skuld::test]
+fn a_templated_base_field_reaches_every_backends_advisories() {
+    // A base `type`/`restart`/`restart-delay` written as `${VAR}` is
+    // `Shaped::Deferred` in the authored sweep, so an advisory computed
+    // there reads `None` and stays silent — while step 5 substitutes that
+    // same base value and returns it in the resolved spec. Moving one field
+    // into `.env` must not delete a warning about the value that is
+    // installed either way, so the two manifests are asserted equal rather
+    // than counted: they resolve to the same spec, so they owe the same
+    // advisories.
+    let fields = |kind: &str, restart: &str, delay: &str| {
+        format!(
+            "daemons:\n  frpc:\n    command: [/bin/frpc]\n    cwd: .\n    type: {kind}\n    \
+             restart: {restart}\n    restart-delay: {delay}\n"
+        )
+    };
+    let literal = fields("managed", "always", "60d");
+    let templated = fields("${KIND}", "${RESTART}", "${DELAY}");
+    let dir = fixture_dir(&templated, Some("KIND=managed\nRESTART=always\nDELAY=60d\n"));
+
+    // `systemd` native, so every warning below comes from the two
+    // non-native backends: `Systemd.warn` has no advisories of its own.
+    let native = Some(Backend::Systemd);
+    let (_specs, from_literal) =
+        resolve_as(parse_manifest(&literal), dir.path(), native).expect("resolves, with advisories");
+    let (_specs, from_env) =
+        resolve_as(parse_manifest(&templated), dir.path(), native).expect("resolves, with advisories");
+
+    assert_eq!(
+        from_literal.len(),
+        3,
+        "the literal manifest owes three: {from_literal:?}"
+    );
+    assert_eq!(
+        from_env, from_literal,
+        "a base field moved into `.env` must keep every advisory it had as a literal"
+    );
+}
+
+#[skuld::test]
+fn a_templated_override_field_stays_unchecked_on_a_backend_that_cannot_resolve_it() {
+    // The other half of the line above, and the one that must stay silent:
+    // a value the *override itself* supplied is never substituted for a
+    // non-native backend, so it is genuinely unresolvable from here — the
+    // honest "cannot resolve" case `spec::backend`'s module doc names.
+    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    cwd: .\n    backend-specific:\n      scm:\n        \
+                type: ${KIND}\n";
+    let dir = fixture_dir(yaml, Some("KIND=managed\n"));
+    let (_specs, warnings) = resolve_as(parse_manifest(yaml), dir.path(), Some(Backend::Systemd)).expect("resolves");
+    assert!(
+        warnings.is_empty(),
+        "`scm` is not substituted for from a systemd host: {warnings:?}"
+    );
 }
 
 #[skuld::test]

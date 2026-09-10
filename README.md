@@ -675,8 +675,7 @@ what is actually installed. Four guarantees:
    is deliberately not a transcription of the file, because it renders
    what would be installed _here_. Guarantee 1 survives that unchanged:
    both paths merge for the same host's native backend, so `show <id>`
-   and `show -f <file> <id>` still agree byte for byte, which is exactly
-   what it claims and all it ever claimed.
+   and `show -f <file> <id>` still agree byte for byte.
 2. Neither path ever checks elevation.
 3. `show -f` touches no service manager; `show` without `-f` touches no
    manifest.

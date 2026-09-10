@@ -83,7 +83,7 @@ use crate::error::Error;
 
 const MANIFEST_FILE_NAME: &str = "goetia.yaml";
 
-/// Which of the five passes this is. Only the path advisories read it: they
+/// Which kind of pass this is. Only the path advisories read it: they
 /// quote the value as written, so a pass over authored text must stay
 /// silent about a path a substitution is going to rewrite, or one path
 /// produces two differently-worded warnings the dedup cannot collapse. See
@@ -92,14 +92,15 @@ const MANIFEST_FILE_NAME: &str = "goetia.yaml";
 enum Phase {
     /// Steps 3 and 4: uninterpolated, authored text.
     Authored,
-    /// Step 5: the one substituted pass.
+    /// Step 5: substituted text — 5a's advisory derivations, 5b's native
+    /// pass.
     Substituted,
 }
 
 /// Turn a parsed manifest into resolved daemon specs.
 ///
 /// Substitution happens inside `resolve`, per daemon, on the merged native
-/// spec — see step 5 below. That is what lets `resolve` promise that no
+/// spec — see step 5b below. That is what lets `resolve` promise that no
 /// `${VAR}` survives into a returned spec: were it a separate step a caller
 /// had to remember, a manifest reaching this one directly would resolve
 /// with its references intact, and systemd applies its *own* `${...}`
@@ -200,26 +201,20 @@ fn resolve_as(
         interpolate::check_spec_grammar(&base, &path)?;
         resolve_shape(&id, base, base_dir, Phase::Authored)?;
 
-        // Step 4: the all-backends sweep. Backend annotation covers the
-        // whole iteration, not just `resolve_shape`: every `Error` raised
-        // anywhere in this pass — from shape or from `Backend::error` — is
-        // annotated with `backend` before it propagates.
+        // Step 4: the all-backends sweep, and errors only. Backend
+        // annotation covers the whole iteration, not just `resolve_shape`:
+        // every `Error` raised anywhere in this pass — from shape or from
+        // `Backend::error` — is annotated with `backend` before it
+        // propagates. Each non-native backend's shaped spec is kept for
+        // step 5, which owns every advisory and is the fallback when the
+        // substituted derivation there is unavailable.
+        let mut swept: Vec<(Backend, ShapedSpec)> = Vec::with_capacity(Backend::ALL.len());
         for backend in Backend::ALL {
             let (merged, supplied) = raw.merged_for(backend);
             let has_entry = raw.backend_specific.contains_key(&backend);
-            let sweep: Result<(), Error> = (|| {
+            let sweep: Result<Option<ShapedSpec>, Error> = (|| {
                 interpolate::check_spec_grammar(&merged, &path)?;
                 let (shaped, pass_warnings) = resolve_shape(&id, merged, base_dir, Phase::Authored)?;
-                if Some(backend) != native {
-                    // This is the only pass that will ever see this
-                    // backend's spec, so it is where its advisories come
-                    // from — computed from uninterpolated text, the best
-                    // this host can honestly do.
-                    backend.error(&shaped, supplied)?;
-                    let mut backend_warnings = pass_warnings;
-                    backend.warn(&shaped, &mut backend_warnings);
-                    daemon_warnings.extend(backend_warnings);
-                }
                 // `supplied` is read by the non-native arm only; the native
                 // arm keeps neither warnings nor verdicts — `error`/`warn`
                 // run in step 5 instead, on the substituted text they are
@@ -227,12 +222,44 @@ fn resolve_as(
                 // what makes step 5's failures provably substitution's
                 // fault, and it is where a *literal* control character in
                 // the native override is caught and attributed here.
-                Ok(())
+                if Some(backend) == native {
+                    return Ok(None);
+                }
+                backend.error(&shaped, supplied)?;
+                daemon_warnings.extend(pass_warnings);
+                Ok(Some(shaped))
             })();
-            sweep.map_err(|e| annotate_sweep_error(e, backend, has_entry))?;
+            if let Some(shaped) = sweep.map_err(|e| annotate_sweep_error(e, backend, has_entry))? {
+                swept.push((backend, shaped));
+            }
         }
 
-        // Step 5: the native pass, and the one substitution. Authoritative:
+        // Step 5a: every non-native backend's advisories, computed on the
+        // substituted base plus that backend's authored override. The base
+        // half is text step 5b substitutes anyway, from the same `vars`, so
+        // a `${VAR}` there resolves to the value the returned spec carries
+        // and must be judged as that value — computing it from authored
+        // text instead loses the advisory the moment a field moves into
+        // `.env`. The override half is never substituted for a backend this
+        // host cannot install, so a `$`-bearing value there stays
+        // `Shaped::Deferred` and stays silent: the honest "cannot resolve"
+        // case. Shape warnings from this derivation are dropped —
+        // `resolve_path_string`'s advisory is keyed to the four cases its
+        // doc enumerates, and a fifth pass would say nothing step 5b does
+        // not already say.
+        let advisory_base = substituted_base(&raw, &path, &vars);
+        for (backend, authored) in &swept {
+            let substituted = advisory_base
+                .as_ref()
+                .map(|base| base.merged_for(*backend).0)
+                .and_then(|merged| resolve_shape(&id, merged, base_dir, Phase::Substituted).ok());
+            backend.warn(
+                substituted.as_ref().map_or(authored, |(shaped, _)| shaped),
+                &mut daemon_warnings,
+            );
+        }
+
+        // Step 5b: the native pass, and the one substitution. Authoritative:
         // it is where the injection gate inspects final values, and its
         // `ShapedSpec` is the one that becomes a `DaemonSpec`. No
         // `check_spec_grammar` here — the text is substituted, and a
@@ -293,6 +320,22 @@ pub fn load(path: &Path) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
     let raw = RawManifest::parse(&text)?;
 
     resolve(raw, &base_dir)
+}
+
+/// `raw`'s base spec, substituted, carrying `raw`'s overrides back so
+/// [`RawSpec::merged_for`] can layer an authored override on top of it —
+/// the spec step 5a's advisories read.
+///
+/// `None` when substitution fails, and the caller then falls back to the
+/// authored spec step 4 shaped. `vars` is loaded for the *native* merged
+/// spec (step 2), which need not name a variable only a base field the
+/// native override replaces refers to; an advisory this host cannot compute
+/// is silent, never an error.
+fn substituted_base(raw: &RawSpec, path: &str, vars: &Vars) -> Option<RawSpec> {
+    let mut base = raw.without_overrides();
+    interpolate::spec(&mut base, path, vars).ok()?;
+    base.backend_specific = raw.backend_specific.clone();
+    Some(base)
 }
 
 /// Backend annotation for step 4. `Error::Invalid` (from `resolve_shape` or
@@ -364,11 +407,11 @@ fn annotate_step5_error(err: Error, native_entry: Option<Backend>) -> Error {
 }
 
 /// Deduplicate `warnings` on the whole [`Warning`] (`id` plus `message`),
-/// keeping the first occurrence and preserving order. Task 4's
-/// drive-relative advisory is a property of an authored path value, not of
-/// a backend, so a path written in the *base* spec produces the identical
-/// warning in every pass that keeps warnings — collapsing those duplicates
-/// to one is this function's whole job.
+/// keeping the first occurrence and preserving order.
+/// `resolve_path_string`'s drive-relative advisory is a property of an
+/// authored path value, not of a backend, so a path written in the *base*
+/// spec produces the identical warning in every pass that keeps warnings —
+/// collapsing those duplicates to one is this function's whole job.
 ///
 /// Only that advisory ever reaches here twice: a `Backend::warn` advisory
 /// belongs to one backend, which exactly one pass owns. So this call site
@@ -679,9 +722,9 @@ fn resolve_optional_path(
 /// Every check here is deterministic given `(value, base_dir, process
 /// state)` — `std::path::absolute`'s drive-relative fallback reads the
 /// per-drive current directory, so this is not a pure function of `(value,
-/// base_dir)` alone — but all five passes `resolve` runs per daemon run in
-/// one process against one unchanging process state, so identical values
-/// get identical verdicts across passes. That is what makes "the base pass
+/// base_dir)` alone — but every pass `resolve` runs per daemon runs in one
+/// process against one unchanging process state, so identical values get
+/// identical verdicts across passes. That is what makes "the base pass
 /// passed, therefore this failure is the override's" sound.
 fn resolve_path_string(
     id: &Id,

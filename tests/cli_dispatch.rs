@@ -753,8 +753,8 @@ fn show_absent_id_outranks_unreadable_id_regardless_of_argument_order() {
 
 // backend-specific overrides through the CLI ==========================================================================
 //
-// `native()` is `Some` on every CI platform (Task 1's
-// `native_backend_agrees_with_the_platforms_that_have_a_service_manager`
+// `native()` is `Some` on every CI platform
+// (`native_backend_agrees_with_the_platforms_that_have_a_service_manager`
 // guarantees it), so these fixtures read the native backend at test time
 // rather than special-casing per platform, and skipping is neither needed
 // nor permitted.
@@ -1420,7 +1420,7 @@ fn status_single_id_errors_on_an_unreadable_entry_instead_of_fabricating_state()
 
 /// `diff` must predict what `install` would actually do: a hand-edited
 /// artifact is a conflict, never "up to date". `5`, matching `install`'s
-/// code for the identical outcome (Task 8 moved conflict off `2`).
+/// code for the identical outcome (conflict lives on `5`, never clap's `2`).
 #[skuld::test]
 fn diff_exits_five_for_a_hand_edited_artifact() {
     let dir = tempfile::tempdir().unwrap();

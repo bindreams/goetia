@@ -307,8 +307,9 @@ pub(crate) fn reject_interpolated_id(id: &str) -> Result<()> {
 
 /// Substitute every `String` leaf of one daemon entry in place. `path` is
 /// that entry's manifest path (`daemons.<id>`), prefixed onto every error.
-/// Runs only on a merged spec — `resolve` calls this once per daemon, on
-/// the native backend's `merged_for` result (Task 5).
+/// Runs only on a spec carrying no overrides: `resolve` calls it on the
+/// native backend's `merged_for` result, which becomes the returned spec,
+/// and on the base spec the non-native backends' advisories read.
 pub(crate) fn spec(raw: &mut RawSpec, path: &str, vars: &Vars) -> Result<()> {
     // Destructured rather than field-accessed on purpose: a field added to
     // `RawSpec` stops compiling here until someone decides whether it

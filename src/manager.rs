@@ -189,8 +189,7 @@ pub struct Status {
     pub state: State,
     /// For `type: simple` on Windows this is `goetia-shim.exe`'s pid, not
     /// the supervised child's — SCM knows no other process for that
-    /// service. Documented here rather than left as a surprise once Task 14
-    /// lands.
+    /// service. Documented here rather than left as a surprise.
     pub pid: Option<u32>,
     /// Whether the service is enabled at boot: systemd's `.wants` symlink,
     /// the launchd plist's directory, or SCM's `SERVICE_AUTO_START`. Not

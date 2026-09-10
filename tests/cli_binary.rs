@@ -234,7 +234,7 @@ fn warnings_still_fire_once_with_backend_overrides_present() {
     assert!(out.contains("frpc"), "stdout:\n{out}");
 }
 
-/// The `.env` gate (Task 5, step 2) end to end: a `${VAR}` written only
+/// The `.env` gate (`spec::resolve`'s step 2) end to end: a `${VAR}` written only
 /// inside `backend-specific.<native>` still resolves from a `.env` beside
 /// the manifest. Before the fix, `spec::resolve`'s `.env` gate was computed
 /// from the wrong spec and this exited `1` with "no value for" even though
@@ -306,7 +306,7 @@ fn json_with_a_clap_rejected_command_line_is_carved_out() {
 
 // Exit-code vocabulary: usage vs. conflict ============================================================================
 //
-// Task 8 moved goetia's own conflict code off `2` onto `5` precisely so a
+// goetia's own conflict code sits on `5`, never on `2`, precisely so a
 // wrapper script that typos a flag or a subcommand cannot mistake clap's
 // usage-error code for goetia's conflict code and re-run `install --force`.
 // These tests pin both halves of that: `2` stays clap's, unclaimed by

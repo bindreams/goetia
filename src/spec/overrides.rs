@@ -37,7 +37,7 @@ pub type BackendOverrides = BTreeMap<Backend, RawOverride>;
 
 /// One `backend-specific.<backend>` entry: every field optional, since an
 /// override only needs to name the fields it actually overrides. Merging
-/// an override into a base `RawSpec` is Task 3's job.
+/// an override into a base `RawSpec` is [`RawSpec::merged_for`]'s job.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawOverride {

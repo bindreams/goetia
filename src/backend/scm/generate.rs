@@ -253,7 +253,7 @@ pub fn canonical_account(resolved: &str) -> Option<String> {
 /// `canonical_account` has already run. `every_canonical_builtin_needs_no_password`
 /// additionally pins that composing the two always answers `false` for
 /// every built-in spelling, which is what `manager::apply`'s password gate
-/// and Task 8's `grant_service_logon_right` skip both depend on.
+/// and `grant_service_logon_right`'s skip both depend on.
 ///
 /// `NT SERVICE\<id>` accounts are not in `windows_builtin`'s table — they
 /// are virtual per-service accounts, not built-ins — so they are checked

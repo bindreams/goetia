@@ -9,7 +9,7 @@
 //! systemd unit, launchd plist, or SCM registration.
 //!
 //! Also home to the per-backend cross-validation `resolve` runs over every
-//! backend's merged spec (Task 5): [`ShapedSpec`]/[`Shaped`] (a spec that
+//! backend's merged spec: [`ShapedSpec`]/[`Shaped`] (a spec that
 //! has passed the shape gate but may not yet be complete),
 //! [`Backend::warn`]/[`Backend::error`] (the advisory and rejection rules),
 //! and the Windows built-in account vocabulary (`windows_builtin`) both
@@ -21,15 +21,22 @@
 //! not scoped that way: an advisory is information this host may give
 //! about any value it can read, base or overridden, which is what lets a
 //! Linux host warn about a Windows-only divergence in a manifest with no
-//! `backend-specific:` block at all. Both are computed on uninterpolated
-//! text for a non-native backend, so `scm: {user: {id: 1000}}` is caught
-//! from any host — a uid is never a substituted string — while
+//! `backend-specific:` block at all.
+//!
+//! What a non-native backend is judged *on* splits along one seam. Its
+//! override is read as authored by both, so `scm: {user: {id: 1000}}` is
+//! caught from any host — a uid is never a substituted string — while
 //! `scm: {user: "${ACCT}"}` is not checkable from Linux: substitution runs
 //! for the native backend only, and goetia does not claim to check what it
-//! cannot resolve. The native backend's own override is the exception, and
-//! the reason the example above names `scm` rather than `systemd`: on Linux
-//! `systemd: {user: "${ACCT}"}` *is* substituted, in step 5, and *is*
-//! checked.
+//! cannot resolve. The base underneath it is read substituted by
+//! [`Backend::warn`] (`resolve`'s step 5a) and authored by
+//! [`Backend::error`] (step 4): a base field is substituted for the
+//! returned spec from the same `.env`, so moving one there must not delete
+//! an advisory about the value that gets installed, while a *rejection*
+//! stays a verdict on text somebody wrote for that backend. The native
+//! backend's override is substituted too, in step 5b, and is both warned on
+//! and checked there — which is why the example above names `scm` rather
+//! than `systemd`.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -173,7 +180,7 @@ impl Backend {
     /// Values that are wrong for this backend by construction, on any
     /// host. Reads **only** the fields `supplied` marks: a rejection is a
     /// verdict this host is entitled to make about a value written for
-    /// this backend, and about nothing else. See Task 3's `Supplied`.
+    /// this backend, and about nothing else. See `Supplied`.
     pub(crate) fn error(self, spec: &ShapedSpec, supplied: Supplied) -> Result<(), Error> {
         if !supplied.user {
             return Ok(());
@@ -288,17 +295,12 @@ fn warn_on_sub_second_restart_delay(spec: &ShapedSpec, out: &mut Vec<Warning>) {
 /// that can drift; `backend::scm` depends on `spec`, never the reverse.
 pub(crate) const MAX_SC_ACTION_DELAY: Duration = Duration::from_millis(u32::MAX as u64);
 
-/// The SCM clamp advisory, moved here from `backend::scm::generate` so it
-/// fires at resolve time on every host — through `Backend::Scm.warn` and
-/// `resolve`'s dedup — rather than only when an effectful Windows install
-/// happens to run the generator. The clamping itself stays in `generate.rs`
-/// (generation, not validation); only the warning moved.
-///
-/// Reproduces both of the generator's original gates, which the plan that
-/// first proposed this move omitted: `Kind::Simple` builds no
-/// `FailureActions` at all, and `Restart::Never` builds none either, so a
-/// `restart-delay` with neither `type: managed` nor `restart: on-failure`/
-/// `always` warns about nothing.
+/// The advisory for `generate::registration`'s restart-delay clamp, fired at
+/// resolve time on every host rather than only when an effectful Windows
+/// install runs the generator. Gated identically to the clamp itself:
+/// `Kind::Simple` builds no `FailureActions` at all and `Restart::Never`
+/// builds none either, so a `restart-delay` with neither `type: managed` nor
+/// `restart: on-failure`/`always` warns about nothing.
 fn warn_on_over_long_restart_delay(spec: &ShapedSpec, out: &mut Vec<Warning>) {
     if spec.kind.parsed() != Some(Kind::Managed) {
         return;
@@ -323,9 +325,9 @@ fn warn_on_over_long_restart_delay(spec: &ShapedSpec, out: &mut Vec<Warning>) {
 // Windows built-in accounts ===========================================================================================
 
 /// A Windows built-in service account, recognised from a name a manifest
-/// author typed. `None` is an ordinary account name. Used for
-/// canonicalisation (Task 7), where every spelling Windows accepts must
-/// be recognised.
+/// author typed. `None` is an ordinary account name. Read by
+/// `backend::scm::generate::canonical_account`, which must recognise every
+/// spelling Windows accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Builtin {
     LocalSystem,
@@ -367,9 +369,9 @@ impl Builtin {
 /// `every_nt_authority_spelling_is_recognised` and
 /// `a_spelling_that_is_not_in_the_table_is_an_ordinary_account`.
 ///
-/// `windows_builtin("")` is `Some(Builtin::LocalSystem)`: Task 7's
-/// `canonical_account` maps an empty authored account to `LocalSystem`, and
-/// both halves must agree. `Backend::error` never sees an empty name —
+/// `windows_builtin("")` is `Some(Builtin::LocalSystem)`: `canonical_account`
+/// maps an empty authored account to `LocalSystem`, and both halves must
+/// agree. `Backend::error` never sees an empty name —
 /// `reject_blank` fails first in `resolve_shape` — so this row is
 /// unreachable from that direction; do not "simplify" it away, or
 /// `User::Root`'s behaviour on Windows changes.

@@ -384,8 +384,8 @@ daemons:
     assert_eq!(env.get("PORT"), Some(&"8080".to_string()));
 }
 
-// Sanity: `RawOverride`'s `Default` is the empty override, used by the
-// no-op-merge path in Task 3.
+// Sanity: `RawOverride`'s `Default` is the empty override — every field
+// `None`, so merging one changes nothing.
 #[skuld::test]
 fn raw_override_default_is_empty() {
     let ovr = RawOverride::default();
