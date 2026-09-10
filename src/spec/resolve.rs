@@ -911,9 +911,10 @@ fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error>
 /// strings for one directory and report drift on an artifact nobody
 /// touched.
 ///
-/// A working directory on a filesystem that does not support
-/// canonicalisation (some network redirectors, WebDAV mounts) is a known
-/// limitation, accepted rather than worked around.
+/// From a working directory on a filesystem that does not support
+/// canonicalisation (some network redirectors, WebDAV mounts), this errors
+/// — so every subcommand that loads a manifest by a relative `-f`,
+/// including the default `-f .`, fails from such a directory.
 fn canonicalize_cwd(cwd: &Path) -> Result<PathBuf, Error> {
     let canonical = fs::canonicalize(cwd).map_err(|source| {
         Error::Other(format!(
