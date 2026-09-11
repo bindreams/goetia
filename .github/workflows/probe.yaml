@@ -1,0 +1,52 @@
+name: launchd probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: Q1 iterations
+        default: "250"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Build unelevated, run elevated. Never `sudo -E`: `-E` preserves
+      # `HOME`, so root would write into `~/.cargo`.
+      - name: Build probe
+        working-directory: probe
+        run: cargo build --release
+
+      - name: whoami
+        run: |
+          id
+          sw_vers
+          echo "runner user: $USER"
+
+      - name: Q2 kickstart -p
+        if: always()
+        run: sudo /usr/bin/env PROBE_USER="$USER" ./probe/target/release/launchd-probe q2
+
+      - name: Q3 kqueue EVFILT_PROC
+        if: always()
+        run: sudo /usr/bin/env PROBE_USER="$USER" ./probe/target/release/launchd-probe q3
+
+      - name: Q4 notify(3)
+        if: always()
+        run: sudo /usr/bin/env PROBE_USER="$USER" ./probe/target/release/launchd-probe q4
+
+      - name: Q5 other mechanisms
+        if: always()
+        run: sudo /usr/bin/env PROBE_USER="$USER" ./probe/target/release/launchd-probe q5
+
+      - name: Q1 timing
+        if: always()
+        run: sudo /usr/bin/env PROBE_USER="$USER" ./probe/target/release/launchd-probe q1 ${{ inputs.iterations }}

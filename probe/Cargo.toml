@@ -1,0 +1,14 @@
+[workspace]
+
+[package]
+name = "launchd-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "launchd-probe"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"

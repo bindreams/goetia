@@ -6,3 +6,5 @@
 *.swp
 *~
 probe-results/
+probe/target/
+probe/Cargo.lock
