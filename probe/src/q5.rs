@@ -23,6 +23,31 @@ pub fn run_q5() {
     let m = run("sh", &["-c", "man 1 launchctl 2>/dev/null | col -b | grep -n -i 'wait\\|block\\|synchron\\|notif\\|-p ' | head -40"]);
     println!("{}{}", m.out, m.err);
 
+    println!("\n-- man launchctl: the kickstart section, verbatim --");
+    let mk = run("sh", &["-c", "man 1 launchctl 2>/dev/null | col -b | sed -n '/^     kickstart/,/^     attach/p'"]);
+    println!("{}{}", mk.out, mk.err);
+    println!("-- man launchctl: the `start` (legacy) section, verbatim --");
+    let ms = run("sh", &["-c", "man 1 launchctl 2>/dev/null | col -b | sed -n '/^     start service-name/,/^     setenv/p'"]);
+    println!("{}{}", ms.out, ms.err);
+
+    // What is the full vocabulary of `launchctl print`'s `state = ` field?
+    // The real fix has to classify every *starting* state, not just the one
+    // this probe happened to catch.
+    println!("\n-- `state = ` vocabulary: strings in /sbin/launchd near \"xpcproxy\" --");
+    let all = strings_of("/sbin/launchd");
+    if let Some(i) = all.iter().position(|s| s == "xpcproxy") {
+        let lo = i.saturating_sub(60);
+        let hi = (i + 60).min(all.len());
+        for (j, s) in all[lo..hi].iter().enumerate() {
+            println!("  [{}]{} {s:?}", lo + j, if lo + j == i { " <<<" } else { "" });
+        }
+    } else {
+        println!("  \"xpcproxy\" not found as a standalone literal");
+    }
+    for probe in ["running", "not running", "waiting", "spawn scheduled", "exited", "stopping", "trampoline"] {
+        println!("  literal {probe:?} present in /sbin/launchd: {}", all.iter().any(|s| s == probe));
+    }
+
     println!("\n-- ServiceManagement / SMAppService availability in the SDK --");
     let sdk = run("xcrun", &["--show-sdk-path"]);
     println!("sdk: {}", sdk.out.trim());

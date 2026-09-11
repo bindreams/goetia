@@ -30,9 +30,13 @@ jobs:
           sw_vers
           echo "runner user: $USER"
 
+      - name: Q5 other mechanisms
+        if: always()
+        run: sudo /usr/bin/env PROBE_USER="$USER" ./probe/target/release/launchd-probe q5
+
       - name: Q1 timing
         if: always()
-        run: sudo /usr/bin/env PROBE_USER="$USER" ./probe/target/release/launchd-probe q1 150
+        run: sudo /usr/bin/env PROBE_USER="$USER" ./probe/target/release/launchd-probe q1 40
 
       - name: Q2 kickstart -p
         if: always()
@@ -46,7 +50,4 @@ jobs:
         if: always()
         run: sudo /usr/bin/env PROBE_USER="$USER" ./probe/target/release/launchd-probe q4
 
-      - name: Q5 other mechanisms
-        if: always()
-        run: sudo /usr/bin/env PROBE_USER="$USER" ./probe/target/release/launchd-probe q5
 
