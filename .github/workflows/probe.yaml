@@ -1,11 +1,10 @@
 name: launchd probe
 
+# `workflow_dispatch` only works for a workflow that already exists on the
+# default branch, which this one deliberately never will. Push is the trigger.
 on:
-  workflow_dispatch:
-    inputs:
-      iterations:
-        description: Q1 iterations
-        default: "250"
+  push:
+    branches: ["probe/**"]
 
 permissions:
   contents: read
@@ -49,4 +48,4 @@ jobs:
 
       - name: Q1 timing
         if: always()
-        run: sudo /usr/bin/env PROBE_USER="$USER" ./probe/target/release/launchd-probe q1 ${{ inputs.iterations }}
+        run: sudo /usr/bin/env PROBE_USER="$USER" ./probe/target/release/launchd-probe q1 250
