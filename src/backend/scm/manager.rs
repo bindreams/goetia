@@ -1043,6 +1043,12 @@ fn map_state(s: WinState) -> State {
         // not `dwCurrentState`. Recovery actions may already have restarted
         // it by the time this is read, in any case.
         WinState::Stopped => State::Stopped,
+        // One of three places a `State::Starting` would be produced if
+        // goetia grows one (routed post-0.1.0) — the other two are
+        // `state::classify` in `src/backend/launchd/state.rs` and
+        // `status_from_unit` in `src/backend/systemd/manager/systemctl.rs`.
+        // This match is exhaustive over `WinState`, so adding that variant
+        // to `State` will not silently leave this arm behind.
         WinState::StartPending
         | WinState::StopPending
         | WinState::ContinuePending

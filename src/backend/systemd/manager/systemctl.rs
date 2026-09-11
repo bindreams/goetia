@@ -93,6 +93,11 @@ pub(super) fn status_from_unit(unit: &str) -> Result<Status> {
         Some("active") => State::Running,
         Some("inactive") => State::Stopped,
         Some("failed") => State::Failed,
+        // `activating`/`deactivating` land here, along with anything else
+        // systemd reports. One of three places a `State::Starting` would be
+        // produced if goetia grows one (routed post-0.1.0) — the other two
+        // are `state::classify` in `src/backend/launchd/state.rs` and
+        // `map_state` in `src/backend/scm/manager.rs`.
         _ => State::Unknown,
     };
     let pid = props

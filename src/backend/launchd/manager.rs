@@ -46,7 +46,7 @@ use std::process::Command;
 use std::{fs, io};
 
 use crate::backend::Identity;
-use crate::backend::launchd::generate;
+use crate::backend::launchd::{generate, state};
 use crate::decide::{self, Outcome, Ownership};
 use crate::error::{Error, Result};
 use crate::manager::{Installed, ServiceManager, State, Status};
@@ -804,19 +804,7 @@ fn query_live_state(id: &str) -> (State, Option<u32>) {
         };
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let pid = find_field(&text, "pid").and_then(|s| s.trim().parse().ok());
-    let state = match find_field(&text, "state").map(str::trim) {
-        Some("running") => State::Running,
-        Some(_) => State::Stopped,
-        None => State::Unknown,
-    };
-    (state, pid)
-}
-
-fn find_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
-    let prefix = format!("{key} = ");
-    text.lines()
-        .find_map(|line| line.trim_start().strip_prefix(prefix.as_str()))
+    state::classify(&text)
 }
 
 // ServiceManager ======================================================================================================
