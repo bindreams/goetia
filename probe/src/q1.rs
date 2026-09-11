@@ -126,7 +126,7 @@ pub fn run_q1(n: usize, full_cycle: bool) {
         if running {
             t_lag.push(p1 - t1);
         } else {
-            let deadline = t1 + Duration::from_secs(10);
+            let deadline = t1 + Duration::from_secs(3);
             let mut settled = None;
             while Instant::now() < deadline {
                 attempts += 1;
@@ -141,11 +141,20 @@ pub fn run_q1(n: usize, full_cycle: bool) {
                 Some(s) => t_lag.push(s - t1),
                 None => {
                     timeouts += 1;
-                    println!("iter {i}: never reported running within 10s");
+                    println!("iter {i}: never reported running within 3s");
                 }
             }
         }
         attempts_hist.push(attempts);
+        // Streamed, not buffered to the end: a step killed by the job
+        // timeout must still leave usable data in the log.
+        println!(
+            "iter {i} kick={:.1}ms kpid={kpid:?} alive={alive} first_print_running={running} attempts={attempts} lag={:.1}ms",
+            (t1 - t0).as_secs_f64() * 1e3,
+            t_lag.last().map(|d: &Duration| d.as_secs_f64() * 1e3).unwrap_or(f64::NAN)
+        );
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
     }
 
     run("launchctl", &["bootout", &target]);
