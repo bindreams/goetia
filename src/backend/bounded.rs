@@ -22,7 +22,7 @@ use std::process::ExitStatus;
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError, Sender, TryRecvError};
 
 use crate::manager::budget::Deadline;
 
@@ -30,7 +30,8 @@ use crate::manager::budget::Deadline;
 
 /// `program` with `args`: stdin from `/dev/null`, stdout and stderr piped, and the
 /// process tree **contained**, so a descendant that inherited the pipe dies with the
-/// child instead of holding its write end open (`kill_tree`, in [`wait_bounded`]).
+/// child instead of holding its write end open: [`wait_bounded`] tears the contained
+/// tree down with `kill_tree` on expiry, and by dropping the child on every path.
 pub(crate) fn command(program: &str, args: &[&str]) -> Result<cosca::Command, cosca::error::Error> {
     let mut cmd = cosca::run(std::iter::once(program).chain(args.iter().copied()));
     cmd.stdin(cosca::Stdio::null())?;
@@ -168,6 +169,33 @@ fn drain<R: Read>(mut src: R, which: Which, tx: Sender<Chunk>) {
     }
 }
 
+/// What [`collect`] needs from its channel: a seam, so a test can hand it a
+/// source that never runs dry.
+trait ChunkSource {
+    fn len(&self) -> usize;
+    fn try_recv(&self) -> Result<Chunk, TryRecvError>;
+    fn recv(&self) -> Result<Chunk, RecvError>;
+    fn recv_timeout(&self, timeout: Duration) -> Result<Chunk, RecvTimeoutError>;
+}
+
+impl ChunkSource for Receiver<Chunk> {
+    fn len(&self) -> usize {
+        Receiver::len(self)
+    }
+
+    fn try_recv(&self) -> Result<Chunk, TryRecvError> {
+        Receiver::try_recv(self)
+    }
+
+    fn recv(&self) -> Result<Chunk, RecvError> {
+        Receiver::recv(self)
+    }
+
+    fn recv_timeout(&self, timeout: Duration) -> Result<Chunk, RecvTimeoutError> {
+        Receiver::recv_timeout(self, timeout)
+    }
+}
+
 /// Collect until every sender is dropped (both readers finished) or `deadline`
 /// expires. `Ok((stdout, stderr, complete))`; `Err` iff a `Chunk::Failed`
 /// arrived. Always drains what is already queued before consulting the
@@ -177,7 +205,7 @@ fn drain<R: Read>(mut src: R, which: Which, tx: Sender<Chunk>) {
 /// deadline cannot keep this loop fed forever (`recv_timeout(ZERO)` returns
 /// a queued item rather than timing out, which is why that snapshot, not a
 /// zero-duration `recv_timeout`, is what expiry drains through).
-fn collect(rx: Receiver<Chunk>, deadline: Deadline) -> std::io::Result<(Vec<u8>, Vec<u8>, bool)> {
+fn collect(rx: impl ChunkSource, deadline: Deadline) -> std::io::Result<(Vec<u8>, Vec<u8>, bool)> {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
 
@@ -189,9 +217,9 @@ fn collect(rx: Receiver<Chunk>, deadline: Deadline) -> std::io::Result<(Vec<u8>,
             },
             Some(Duration::ZERO) => {
                 // Expired. `len()` is a race-free snapshot of the channel at
-                // this instant; every one of those `n` chunks is already
-                // queued, so `try_recv` cannot block or come up empty.
-                // Anything sent after this snapshot is not waited for.
+                // this instant, counting every chunk whose send has begun, so
+                // `try_recv` cannot come up empty for any of them. Anything
+                // sent after this snapshot is not waited for.
                 for _ in 0..rx.len() {
                     let chunk = rx
                         .try_recv()

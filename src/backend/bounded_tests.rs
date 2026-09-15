@@ -1,8 +1,6 @@
 use std::io::{self, BufRead, ErrorKind, Read};
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use super::*;
@@ -264,37 +262,34 @@ fn a_complete_drain_reports_complete() {
     assert!(complete);
 }
 
+/// A channel that never runs dry: every receive yields a chunk at once, and
+/// `len()` always reports [`QUEUED`] of them.
+struct Bottomless;
+
+const QUEUED: usize = 3;
+
+impl ChunkSource for Bottomless {
+    fn len(&self) -> usize {
+        QUEUED
+    }
+
+    fn try_recv(&self) -> Result<Chunk, TryRecvError> {
+        Ok(Chunk::Bytes(Which::Stdout, b"x".to_vec()))
+    }
+
+    fn recv(&self) -> Result<Chunk, RecvError> {
+        Ok(Chunk::Bytes(Which::Stdout, b"x".to_vec()))
+    }
+
+    fn recv_timeout(&self, _timeout: Duration) -> Result<Chunk, RecvTimeoutError> {
+        Ok(Chunk::Bytes(Which::Stdout, b"x".to_vec()))
+    }
+}
+
 #[skuld::test]
 fn collect_stops_at_the_deadline_even_while_a_reader_keeps_producing() {
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let (ready_tx, ready_rx) = mpsc::channel::<()>();
-
-    // A producer that never stops on its own, and that has already queued a
-    // large backlog by the time `collect` is called: the queue is never
-    // empty, which is exactly the condition that makes today's `collect`
-    // loop forever. No timing is involved anywhere — `ready_rx.recv()` is a
-    // real event wait that unblocks the instant the backlog's last send
-    // happens, not a poll against a chosen duration.
-    const PREFILL: usize = 200_000;
-    let keep_sending = Arc::new(AtomicBool::new(true));
-    let keep_sending_producer = Arc::clone(&keep_sending);
-    let producer = std::thread::spawn(move || {
-        let mut sent = 0usize;
-        while keep_sending_producer.load(Ordering::Relaxed) {
-            if tx.send(Chunk::Bytes(Which::Stdout, vec![0u8; 8])).is_err() {
-                break;
-            }
-            sent += 1;
-            if sent == PREFILL {
-                let _ = ready_tx.send(());
-            }
-        }
-    });
-    ready_rx.recv().unwrap();
-
-    let (_stdout, _stderr, complete) = collect(rx, Budget::Immediate.start()).unwrap();
+    // A `collect` that drains until the channel is empty never returns here.
+    let (stdout, _stderr, complete) = collect(Bottomless, Budget::Immediate.start()).unwrap();
+    assert_eq!(stdout, b"x".repeat(QUEUED), "exactly the chunks queued at expiry");
     assert!(!complete);
-
-    keep_sending.store(false, Ordering::Relaxed);
-    producer.join().unwrap();
 }
