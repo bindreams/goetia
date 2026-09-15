@@ -7,10 +7,13 @@ kill path the same way.
 
 The first case runs the whole script under a real bound and checks its exit
 code, where a bound that fires early cannot hide a defect. The second builds
-a launcher and its grandchild, blocks until the launcher reports the
-grandchild's pid, and only then calls `kill_tree_windows` directly, so nothing
-races the watchdog's timer. Every process here sleeps for 2**31 seconds and
-cannot exit on its own.
+a launcher and its grandchild, blocks until the GRANDCHILD reports its own
+pid over the stdout handle it was launched with, and only then calls
+`kill_tree_windows` directly, so nothing races the watchdog's timer. The
+grandchild reporting itself, rather than the launcher relaying it, means a
+launcher that dies at any point after spawning the grandchild still cannot
+lose the pid. Every process here sleeps for 2**31 seconds and cannot exit on
+its own.
 
 Run directly: `python3 -B run-with-timeout-windows-tests.py`.
 """
@@ -28,13 +31,16 @@ HERE = Path(__file__).resolve().parent
 WATCHDOG = HERE / "run-with-timeout.py"
 
 SLEEP_CODE = "import time; time.sleep(2**31)"
+# The grandchild reports its OWN pid, over the stdout handle it inherits
+# explicitly from the launcher (not implicit fd/handle inheritance) -- so the
+# pid reaches the test even if the launcher dies right after spawning it.
+GRANDCHILD_CODE = f"import os; print(os.getpid(), flush=True); {SLEEP_CODE}"
 # Joined with `;` rather than newlines, and built without any embedded
 # double quotes, so `subprocess.list2cmdline` never needs to escape
 # anything inside this single argv token.
 LAUNCHER_CODE = (
     "import subprocess, sys; "
-    f"gc = subprocess.Popen([sys.executable, '-c', '{SLEEP_CODE}']); "
-    "print(gc.pid, flush=True); "
+    f"gc = subprocess.Popen([sys.executable, '-c', '{GRANDCHILD_CODE}'], stdout=sys.stdout); "
     "gc.wait()"
 )
 
@@ -132,8 +138,8 @@ def test_timeout_exit_code():
 def test_kills_the_process_tree(kernel32, run_with_timeout):
     launcher = subprocess.Popen([sys.executable, "-c", LAUNCHER_CODE], stdout=subprocess.PIPE, text=True)
     try:
-        # A blocking read: it returns once the launcher has created the
-        # grandchild and printed its pid.
+        # A blocking read: it returns once the grandchild itself has printed
+        # its pid, which it does before it can be torn down by anything.
         grandchild_pid = int(launcher.stdout.readline())
         handle = _open_grandchild_handle(kernel32, grandchild_pid)
         try:
