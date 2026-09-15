@@ -7,21 +7,15 @@ of this touches a real process or `taskkill`, so it runs on every OS
 end-to-end kill against an actual process tree is covered separately, on
 the Windows CI leg only, by `run-with-timeout-windows-tests.py`.
 
-Run directly: `python3 -m unittest run-with-timeout-unit-tests.py -v`.
+Run from this directory: `python3 -B -m unittest run-with-timeout-unit-tests -v`.
 """
 
 import importlib.util
 import io
-import sys
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-
-# Loading the script under test through importlib would otherwise compile it
-# into .github/scripts/__pycache__/, an untracked directory a local run leaves
-# behind for someone to commit.
-sys.dont_write_bytecode = True
 
 SCRIPT_PATH = Path(__file__).resolve().parent / "run-with-timeout.py"
 

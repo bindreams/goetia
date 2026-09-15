@@ -6,3 +6,4 @@
 *.swp
 *~
 probe-results/
+__pycache__/
