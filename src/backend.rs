@@ -9,6 +9,8 @@
 //!
 //! [`DaemonSpec`]: crate::spec::DaemonSpec
 
+#[cfg(unix)]
+pub(crate) mod bounded;
 pub mod launchd;
 pub mod scm;
 pub mod systemd;

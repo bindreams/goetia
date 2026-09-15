@@ -93,10 +93,15 @@ jobs:
               continue
             fi
             echo "::group::$bin"
+            # The watchdog runs INSIDE the elevation: one outside `sudo`
+            # cannot signal the root process it started. The interpreter is
+            # resolved before `sudo`, not by it — `sudo` resets `PATH` to
+            # its own `secure_path`, which the macOS runner's toolcache
+            # `python3` is not on.
             if [ "$RUNNER_OS" = "Windows" ]; then
-              "$bin" || status=$?
+              python3 .github/scripts/run-with-timeout.py 600 "$bin" || status=$?
             else
-              sudo "$bin" || status=$?
+              sudo "$(command -v python3)" .github/scripts/run-with-timeout.py 600 "$bin" || status=$?
             fi
             echo "::endgroup::"
           done < test-binaries.txt

@@ -117,7 +117,7 @@ fn millis_ceil(d: Duration) -> u32 {
     // `as_millis` truncates; add one back iff anything was truncated. Whole
     // seconds contribute exact milliseconds, so the remainder is entirely
     // in the sub-second part.
-    let ceil = d.as_millis() + u128::from(d.subsec_nanos() % 1_000_000 != 0);
+    let ceil = d.as_millis() + u128::from(!d.subsec_nanos().is_multiple_of(1_000_000));
     u32::try_from(ceil).unwrap_or(u32::MAX).min(u32::MAX - 1)
 }
 
