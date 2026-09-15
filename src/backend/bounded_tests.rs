@@ -69,8 +69,13 @@ fn an_already_expired_deadline_does_not_wait() {
     assert!(matches!(finished, Finished::Expired { .. }));
 }
 
+/// Smoke test, not a truncation guard: `echo late` is a single write well
+/// under `PIPE_BUF`, so the child can never yield a genuine split prefix,
+/// and this assertion holds under any implementation of `collect`. The real
+/// guard against a truncated prefix is
+/// `collect_keeps_what_already_arrived_when_the_deadline_expires`.
 #[skuld::test]
-fn an_expiry_path_capture_is_never_a_truncated_prefix() {
+fn an_expiry_path_smoke_test() {
     let child = command("/bin/sh", &["-c", "echo late; exit 0"])
         .unwrap()
         .spawn()
@@ -118,7 +123,7 @@ fn a_child_whose_descendant_holds_the_pipe_still_returns_on_expiry() {
 }
 
 #[skuld::test]
-fn a_contained_childs_descendant_is_killed_so_the_pipe_closes() {
+fn a_contained_childs_descendant_dies_with_it() {
     // Same script, same fd-3 handshake, but spawned through `bounded::command`
     // so the tree IS contained.
     let mut cmd = command(
@@ -140,10 +145,12 @@ fn a_contained_childs_descendant_is_killed_so_the_pipe_closes() {
 
     // A real event-driven death-watch (pidfd on Linux, EVFILT_PROC |
     // NOTE_EXIT on macOS), with no timeout to choose: it returns when the
-    // descendant dies, and hangs if `kill_tree` never reached it.
-    // `capture.complete` is deliberately not asserted here — the kill is
-    // asynchronous and `collect` runs under an already-spent deadline, so
-    // whether the readers observe EOF within that instant varies run to run.
+    // descendant dies, and hangs if the descendant is not in the child's
+    // contained tree (e.g. `command()` without `.contain()`) — then neither
+    // `kill_tree` nor `Drop` can reach it. `capture.complete` is
+    // deliberately not asserted here — the kill is asynchronous and
+    // `collect` runs under an already-spent deadline, so whether the
+    // readers observe EOF within that instant varies run to run.
     match cosca::Process::from_pid(descendant) {
         cosca::identity::Resolved::Found(p) => p.wait().unwrap(),
         cosca::identity::Resolved::Gone => {}

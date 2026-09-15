@@ -85,10 +85,16 @@ pub(crate) fn wait_bounded(mut child: cosca::Child, deadline: Deadline) -> Resul
         None => {
             // The root first, and its `Ok` is what makes the reap below unable to block.
             child.kill()?;
-            // Then the tree, best-effort: an uncontained child (the descendant test spawns
-            // one) reports `Unsupported`, and a contained tree whose member refused SIGKILL
-            // reports `Containment`. Neither can hang this call — the root is already dead —
-            // and neither is silenced: a descendant still holding the pipe is exactly what
+            // Then the tree, best-effort. What this achieves that `Drop` (at the end of
+            // this function) does not: it runs BEFORE the reap below, while the killed
+            // root is still a zombie pinning its pid and pgid. `Drop` tears a contained
+            // tree down too, but only after the reap — for a group-based containment
+            // mechanism (macOS's `FdMarker` first pass, Linux's `ProcessGroup` fallback)
+            // that is the reap-then-recycle hazard cosca's own `kill_tree` precondition
+            // documents. An uncontained child (the descendant test spawns one) reports
+            // `Unsupported` here, and a contained tree whose member refused SIGKILL
+            // reports `Containment`; the `Result` is discarded either way, so nothing
+            // surfaces it, and a descendant still holding the pipe is exactly what
             // `collect` reports as `complete == false`.
             let _tree_teardown = child.kill_tree();
             let reaped = child.wait()?;
@@ -117,13 +123,13 @@ pub(crate) fn wait_bounded(mut child: cosca::Child, deadline: Deadline) -> Resul
 // drain / collect =====================================================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Which {
+enum Which {
     Stdout,
     Stderr,
 }
 
 #[derive(Debug)]
-pub(crate) enum Chunk {
+enum Chunk {
     Bytes(Which, Vec<u8>),
     /// The reader stopped early: a read error, or a panic caught at the thread
     /// boundary. Never silence.
@@ -215,7 +221,7 @@ fn absorb(chunk: Chunk, stdout: &mut Vec<u8>, stderr: &mut Vec<u8>) -> std::io::
 // expiry_disposition ==================================================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Disposition {
+enum Disposition {
     WeKilledIt,
     ItExitedOnItsOwn,
 }
