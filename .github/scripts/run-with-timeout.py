@@ -12,26 +12,48 @@ import sys
 WINDOWS = os.name == "nt"
 
 
+def _is_live(pid):
+    """True if `pid` names a process that is not a zombie. `ps -o stat=`
+    prints just the STAT column (`=` as the header suppresses it, a form
+    both GNU/procps and BSD `ps` accept); a zombie's state starts with `Z`
+    on both. A zombie already exited and released everything it held
+    (including any pipe the watched command's descendants might have kept
+    open) -- it persists only because its parent has not reaped it, which is
+    not something a signal can change. `pid` having already been reaped
+    entirely (no `ps` output at all) counts as not live too."""
+    result = subprocess.run(
+        ["ps", "-o", "stat=", "-p", str(pid)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+    )
+    stat = result.stdout.strip()
+    return bool(stat) and not stat.startswith("Z")
+
+
 def kill_tree_posix(proc):
-    """SIGKILL every process in the session `start_new_session=True` made
-    `proc` the leader of. `killpg` alone would reach only `proc`'s own
+    """SIGKILL every LIVE process in the session `start_new_session=True`
+    made `proc` the leader of. `killpg` alone would reach only `proc`'s own
     process group, missing a descendant that moved itself into a group of
     its own -- exactly what cosca's `.contain()` does to a contained child --
     so this goes by session (`pkill -s`) instead, both procps and BSD
-    `pkill` support it. Repeated until `pgrep -s` confirms no OTHER member of
-    the session is left: a single pass can race a process that forks between
-    `pkill`'s snapshot and the signal actually landing, but the loop still
-    terminates, because a process that has been SIGKILLed cannot fork
-    another one. `proc.pid` itself is excluded from that check -- once
-    killed it sits as a zombie, still matched by `pgrep -s`, until the
-    caller's own `proc.wait()` reaps it; that reap happens right after this
-    call returns, so waiting on it here would deadlock against itself."""
+    `pkill` support it. Repeated until `pgrep -s` confirms no OTHER LIVE
+    member of the session is left: a single pass can race a process that
+    forks between `pkill`'s snapshot and the signal actually landing, but
+    the loop still terminates, because a process that has been SIGKILLed
+    cannot fork another one. Liveness (not just identity) is what the loop
+    waits on, because a session member other than `proc.pid` that gets
+    SIGKILLed also becomes a zombie -- held open until *its own* parent
+    reaps it, which this process has no way to force -- and looping on
+    `pgrep -s` alone, which still lists zombies, would spin forever waiting
+    for a reap that may never come. `proc.pid` itself is excluded by
+    identity rather than liveness: once killed it sits as a zombie, live or
+    not, until the caller's own `proc.wait()` reaps it; that reap happens
+    right after this call returns, so waiting on it here would deadlock
+    against itself."""
     sid = str(proc.pid)
     while True:
         subprocess.run(["pkill", "-KILL", "-s", sid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         found = subprocess.run(["pgrep", "-s", sid], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        members = {int(pid) for pid in found.stdout.split()} - {proc.pid}
-        if not members:
+        candidates = {int(pid) for pid in found.stdout.split()} - {proc.pid}
+        if not any(_is_live(pid) for pid in candidates):
             return
 
 

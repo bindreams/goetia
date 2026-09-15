@@ -36,6 +36,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      # run-with-timeout.py's POSIX path kills by session with `pgrep -s`/
+      # `pkill -s` — procps on Linux, BSD on macOS — so it needs both to
+      # cover it; this matrix is the only job that runs on both. Windows
+      # skips it: the script's own POSIX-vs-Windows branch means none of
+      # these tests would exercise kill_tree_windows anyway, and the
+      # `pgrep`/`pkill`/`mkfifo` tooling they're built on has no Windows
+      # equivalent to substitute in.
+      - name: Test run-with-timeout.py
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash .github/scripts/run-with-timeout-tests.sh
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
