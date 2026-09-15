@@ -63,6 +63,12 @@ clap = { version = "4.6.6", features = ["derive"], optional = true }
 # and `Child::kill_tree` bound and reap the `systemctl`/`launchctl` calls
 # `daemon start --timeout` waits on. 0.x with an explicitly unstable API.
 cosca = "0.4"
+# `backend::bounded::collect`'s reader channel: `Receiver::len()` is a
+# race-free snapshot of what is already queued, which is what lets `collect`
+# stop exactly at the deadline instead of draining however long a reader
+# keeps producing (`std::sync::mpsc` has no equivalent — `recv_timeout(ZERO)`
+# still returns a queued item rather than timing out).
+crossbeam-channel = "0.5.17"
 humantime = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

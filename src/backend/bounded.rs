@@ -19,8 +19,10 @@ use std::io::Read;
 use std::os::unix::process::ExitStatusExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::process::ExitStatus;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
+use std::time::Duration;
+
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use crate::manager::budget::Deadline;
 
@@ -63,7 +65,7 @@ pub(crate) enum Finished {
 /// its tree down and reap it. Its pipes are drained by up to two **detached** threads
 /// reporting over a channel, so the return value never waits on a reader.
 pub(crate) fn wait_bounded(mut child: cosca::Child, deadline: Deadline) -> Result<Finished, cosca::error::Error> {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
     if let Some(r) = child.stdout() {
         let tx = tx.clone();
         thread::spawn(move || drain(r, Which::Stdout, tx));
@@ -163,14 +165,15 @@ fn drain<R: Read>(mut src: R, which: Which, tx: Sender<Chunk>) {
 /// Collect until every sender is dropped (both readers finished) or `deadline`
 /// expires. `Ok((stdout, stderr, complete))`; `Err` iff a `Chunk::Failed`
 /// arrived. Always drains what is already queued before consulting the
-/// deadline, so an expiry never discards bytes that had already arrived.
+/// deadline, so an expiry never discards bytes that had already arrived —
+/// but once expired, drains exactly what `Receiver::len()` snapshots as
+/// already queued and stops there, so a reader that keeps producing past the
+/// deadline cannot keep this loop fed forever (`recv_timeout(ZERO)` returns
+/// a queued item rather than timing out, which is why that snapshot, not a
+/// zero-duration `recv_timeout`, is what expiry drains through).
 fn collect(rx: Receiver<Chunk>, deadline: Deadline) -> std::io::Result<(Vec<u8>, Vec<u8>, bool)> {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-
-    while let Ok(chunk) = rx.try_recv() {
-        absorb(chunk, &mut stdout, &mut stderr)?;
-    }
 
     loop {
         match deadline.remaining() {
@@ -178,10 +181,23 @@ fn collect(rx: Receiver<Chunk>, deadline: Deadline) -> std::io::Result<(Vec<u8>,
                 Ok(chunk) => absorb(chunk, &mut stdout, &mut stderr)?,
                 Err(_) => return Ok((stdout, stderr, true)), // both senders dropped
             },
+            Some(Duration::ZERO) => {
+                // Expired. `len()` is a race-free snapshot of the channel at
+                // this instant; every one of those `n` chunks is already
+                // queued, so `try_recv` cannot block or come up empty.
+                // Anything sent after this snapshot is not waited for.
+                for _ in 0..rx.len() {
+                    let chunk = rx
+                        .try_recv()
+                        .expect("snapshotted length guarantees this chunk is queued");
+                    absorb(chunk, &mut stdout, &mut stderr)?;
+                }
+                return Ok((stdout, stderr, false));
+            }
             Some(remaining) => match rx.recv_timeout(remaining) {
                 Ok(chunk) => absorb(chunk, &mut stdout, &mut stderr)?,
                 Err(RecvTimeoutError::Disconnected) => return Ok((stdout, stderr, true)),
-                Err(RecvTimeoutError::Timeout) => return Ok((stdout, stderr, false)),
+                Err(RecvTimeoutError::Timeout) => {} // re-check: the deadline has now expired
             },
         }
     }
