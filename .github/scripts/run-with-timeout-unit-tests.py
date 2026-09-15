@@ -18,6 +18,11 @@ from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+# Loading the script under test through importlib would otherwise compile it
+# into .github/scripts/__pycache__/, an untracked directory a local run leaves
+# behind for someone to commit.
+sys.dont_write_bytecode = True
+
 SCRIPT_PATH = Path(__file__).resolve().parent / "run-with-timeout.py"
 
 
