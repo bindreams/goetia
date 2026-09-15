@@ -3,7 +3,7 @@
 and REAL `taskkill` -- what `run-with-timeout-unit-tests.py` fakes out.
 Windows-only: `taskkill` and the Win32 process APIs this uses have no
 POSIX equivalent, and `run-with-timeout-tests.sh` already covers the
-POSIX kill path the same way, against real `pkill`/`pgrep`. Not merged
+POSIX kill path the same way, against real processes. Not merged
 into that suite because bash has no way to call `OpenProcess` /
 `WaitForSingleObject`.
 

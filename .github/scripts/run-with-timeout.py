@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Run a command under a wall-clock bound, killing its descendants on expiry.
-
-Exits with the command's own status, or 124 if the bound expired. The bound is
-a failure bound surfaced to a human -- no test's correctness depends on it.
+"""Run a command under a wall-clock bound. On expiry, kill every process in
+the watched command's session (POSIX) or its process tree (Windows), and exit
+124; otherwise exit with the command's own status. The bound is a failure
+bound surfaced to a human -- no test's correctness depends on it.
 """
 
 import os
+import shutil
+import signal
 import subprocess
 import sys
 
@@ -21,40 +23,73 @@ def _is_live(pid):
     open) -- it persists only because its parent has not reaped it, which is
     not something a signal can change. `pid` having already been reaped
     entirely (no `ps` output at all) counts as not live too."""
-    result = subprocess.run(
-        ["ps", "-o", "stat=", "-p", str(pid)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
-    )
+    result = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], stdout=subprocess.PIPE, text=True, check=False)
     stat = result.stdout.strip()
     return bool(stat) and not stat.startswith("Z")
 
 
+def _sigkill(pid):
+    """SIGKILL `pid`, skipping one already gone. One this process may not
+    signal ends the watchdog, reported: the kill loop would otherwise spin on
+    it forever, and `main` would wait on it forever."""
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError as e:
+        sys.exit(f"run-with-timeout: cannot SIGKILL pid {pid}: {e}")
+
+
+def _session_members(sid):
+    """Every pid `ps -A` lists whose session is `sid`. The session is read
+    with `getsid`, because macOS's `pgrep`/`pkill` have no `-s` and its
+    `ps -o sess` prints 0 for every process. A failing `ps` is reported and
+    yields no members."""
+    result = subprocess.run(
+        ["ps", "-A", "-o", "pid="], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False
+    )
+    if result.returncode != 0:
+        print(f"run-with-timeout: `ps -A` failed (exit {result.returncode}): {result.stderr.strip()}", file=sys.stderr)
+        return []
+    members = []
+    for pid in map(int, result.stdout.split()):
+        try:
+            if os.getsid(pid) == sid:
+                members.append(pid)
+        except ProcessLookupError:
+            pass  # exited since `ps` listed it
+        except PermissionError as e:
+            # POSIX lets `getsid` refuse a process outside the caller's own
+            # session; neither Linux (short of an LSM policy) nor macOS
+            # (measured on CI) does. Whether it is in the watched session is
+            # then unknowable, so it is skipped, and said so.
+            print(f"run-with-timeout: cannot read pid {pid}'s session, skipping it: {e}", file=sys.stderr)
+    return members
+
+
 def kill_tree_posix(proc):
-    """SIGKILL every LIVE process in the session `start_new_session=True`
-    made `proc` the leader of. `killpg` alone would reach only `proc`'s own
-    process group, missing a descendant that moved itself into a group of
-    its own -- exactly what cosca's `.contain()` does to a contained child --
-    so this goes by session (`pkill -s`) instead, both procps and BSD
-    `pkill` support it. Repeated until `pgrep -s` confirms no OTHER LIVE
-    member of the session is left: a single pass can race a process that
-    forks between `pkill`'s snapshot and the signal actually landing, but
-    the loop still terminates, because a process that has been SIGKILLed
-    cannot fork another one. Liveness (not just identity) is what the loop
-    waits on, because a session member other than `proc.pid` that gets
-    SIGKILLed also becomes a zombie -- held open until *its own* parent
-    reaps it, which this process has no way to force -- and looping on
-    `pgrep -s` alone, which still lists zombies, would spin forever waiting
-    for a reap that may never come. `proc.pid` itself is excluded by
-    identity rather than liveness: once killed it sits as a zombie, live or
-    not, until the caller's own `proc.wait()` reaps it; that reap happens
-    right after this call returns, so waiting on it here would deadlock
-    against itself."""
-    sid = str(proc.pid)
+    """SIGKILL every process in the watched command's session, which
+    `start_new_session=True` made `proc` the leader of. A session, unlike the
+    process group `killpg` reaches, still holds a descendant that moved into
+    a group of its own, as cosca's `.contain()` does; one that called
+    `setsid()` itself has left it, and is not killed.
+
+    The root goes first, directly by pid, so the caller's `proc.wait()` is
+    bounded whatever the enumeration finds or fails to find; the loop skips
+    it, since that `proc.wait()` is its reap. The loop repeats until no LIVE
+    member is left, which catches one forked before its parent's SIGKILL
+    landed. A zombie counts as gone: every SIGKILLed member becomes one until
+    its own parent reaps it, which may be never. The loop ends because a
+    SIGKILLed process cannot fork; a member in uninterruptible sleep (`D`)
+    delays that until it wakes, and the CI job's `timeout-minutes` backstops
+    one that never does."""
+    _sigkill(proc.pid)
     while True:
-        subprocess.run(["pkill", "-KILL", "-s", sid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        found = subprocess.run(["pgrep", "-s", sid], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        candidates = {int(pid) for pid in found.stdout.split()} - {proc.pid}
-        if not any(_is_live(pid) for pid in candidates):
+        live = [pid for pid in _session_members(proc.pid) if pid != proc.pid and _is_live(pid)]
+        if not live:
             return
+        for pid in live:
+            _sigkill(pid)
 
 
 def kill_tree_windows(proc):
@@ -80,9 +115,11 @@ def main(argv):
         sys.exit(f"usage: {argv[0]} <seconds> <command> [args...]")
     seconds = float(argv[1])
     command = argv[2:]
+    if not WINDOWS and shutil.which("ps") is None:
+        sys.exit("run-with-timeout: `ps` is not on PATH, and expiry needs it to find the session to kill")
 
-    # POSIX: a new session, so `pkill -s` reaches descendants. Windows has no
-    # equivalent -- CPython's `Popen` silently ignores the keyword there
+    # POSIX: a new session, which is what the kill on expiry goes by. Windows
+    # has no equivalent -- CPython's `Popen` silently ignores the keyword there
     # rather than rejecting it, but it is left out anyway, since the kill on
     # that platform goes by process tree instead.
     kwargs = {} if WINDOWS else {"start_new_session": True}

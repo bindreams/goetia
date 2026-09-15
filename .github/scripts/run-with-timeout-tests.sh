@@ -59,7 +59,7 @@ fi
 # the CURRENT script's behavior. `set -m` (job control) reproduces the same
 # process-group split without needing cosca or Rust: a backgrounded job
 # gets a process group of its own but stays in the launching root's
-# session, which is exactly what `pkill -s`/`pgrep -s` key on.
+# session, which is exactly what the watchdog kills by.
 
 f2_script="$(mktemp)"
 cat > "$f2_script" <<'SCRIPT'

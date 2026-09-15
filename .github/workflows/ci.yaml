@@ -43,9 +43,9 @@ jobs:
         shell: bash
         run: cd .github/scripts && python3 -B -m unittest run-with-timeout-unit-tests -v
 
-      # run-with-timeout.py's POSIX path kills by session with `pgrep -s`/
-      # `pkill -s` — procps on Linux, BSD on macOS — so it needs both to
-      # cover it; this matrix is the only job that runs on both.
+      # run-with-timeout.py's POSIX path kills by session through `ps` and
+      # `getsid`, whose behaviour differs between Linux and macOS, so it needs
+      # both to cover it; this matrix is the only job that runs on both.
       - name: Test run-with-timeout.py (POSIX)
         if: runner.os != 'Windows'
         shell: bash
