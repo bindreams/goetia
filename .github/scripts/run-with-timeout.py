@@ -3,6 +3,12 @@
 the watched command's session (POSIX) or its process tree (Windows), and exit
 124; otherwise exit with the command's own status. The bound is a failure
 bound surfaced to a human -- no test's correctness depends on it.
+
+Exit status (the coreutils `timeout` convention):
+    124  the bound fired and the tree was torn down
+    125  the watchdog itself failed (`ps` missing, a kill refused, ...)
+      1  usage error (too few arguments)
+      N  otherwise, the watched command's own exit status
 """
 
 import os
@@ -12,6 +18,13 @@ import subprocess
 import sys
 
 WINDOWS = os.name == "nt"
+
+
+def _die(message):
+    """Report a watchdog failure and exit 125 -- distinct from 124 (the bound
+    fired) and from the usage-error exit 1."""
+    print(f"run-with-timeout: {message}", file=sys.stderr)
+    sys.exit(125)
 
 
 def _is_live(pid):
@@ -37,7 +50,7 @@ def _sigkill(pid):
     except ProcessLookupError:
         pass
     except PermissionError as e:
-        sys.exit(f"run-with-timeout: cannot SIGKILL pid {pid}: {e}")
+        _die(f"cannot SIGKILL pid {pid}: {e}")
 
 
 def _session_members(sid):
@@ -116,7 +129,7 @@ def main(argv):
     seconds = float(argv[1])
     command = argv[2:]
     if not WINDOWS and shutil.which("ps") is None:
-        sys.exit("run-with-timeout: `ps` is not on PATH, and expiry needs it to find the session to kill")
+        _die("`ps` is not on PATH, and expiry needs it to find the session to kill")
 
     # POSIX: a new session, which is what the kill on expiry goes by. Windows
     # has no equivalent -- CPython's `Popen` silently ignores the keyword there

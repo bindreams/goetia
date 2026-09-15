@@ -168,6 +168,7 @@ class FakePopen:
 
 class MainPosixTests(unittest.TestCase):
     def run_main(self, popen, ps_path, host=None):
+        self.stderr = io.StringIO()
         with ExitStack() as stack:
             if host is not None:
                 stack.enter_context(host.installed())
@@ -175,14 +176,15 @@ class MainPosixTests(unittest.TestCase):
             stack.enter_context(patch.object(run_with_timeout.subprocess, "Popen", popen))
             which = SimpleNamespace(which=lambda _name: ps_path)
             stack.enter_context(patch.object(run_with_timeout, "shutil", which, create=True))
-            stack.enter_context(redirect_stderr(io.StringIO()))
+            stack.enter_context(redirect_stderr(self.stderr))
             return run_with_timeout.main(["run-with-timeout.py", str(SECONDS), "command"])
 
     def test_a_missing_ps_fails_before_the_command_starts(self):
         popen = MagicMock(side_effect=AssertionError("the command was started"))
         with self.assertRaises(SystemExit) as raised:
             self.run_main(popen, ps_path=None)
-        self.assertRegex(str(raised.exception.code), r"^run-with-timeout: .*\bps\b")
+        self.assertEqual(raised.exception.code, 125)
+        self.assertRegex(self.stderr.getvalue(), r"^run-with-timeout: .*\bps\b")
         popen.assert_not_called()
 
     def test_a_process_it_cannot_kill_is_reported_and_the_root_is_not_waited_on(self):
@@ -193,7 +195,8 @@ class MainPosixTests(unittest.TestCase):
                 proc = FakePopen(ROOT)
                 with self.assertRaises(SystemExit) as raised:
                     self.run_main(lambda *_args, **_kwargs: proc, ps_path="/bin/ps", host=host)
-                self.assertRegex(str(raised.exception.code), rf"^run-with-timeout: .*\b{refuser}\b")
+                self.assertEqual(raised.exception.code, 125)
+                self.assertRegex(self.stderr.getvalue(), rf"(?m)^run-with-timeout: .*\b{refuser}\b")
                 self.assertEqual(proc.waits, [SECONDS])
 
 
