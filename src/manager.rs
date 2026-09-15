@@ -9,8 +9,11 @@
 //! of its policy table itself; see [`conformance::run`], which asserts that
 //! contract against any `&dyn ServiceManager`.
 
+pub mod budget;
 pub mod conformance;
 pub mod fake;
+
+pub use budget::Budget;
 
 // All three supported platforms now return a real `ServiceManager`, so
 // `Error::UnsupportedPlatform` is referenced only by the catch-all arm.
