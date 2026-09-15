@@ -6,7 +6,10 @@ bound surfaced to a human -- no test's correctness depends on it.
 
 Exit status (the coreutils `timeout` convention):
     124  the bound fired and the tree was torn down
-    125  the watchdog itself failed (`ps` missing, a kill refused, ...)
+    125  the watchdog itself failed (`ps` missing, a kill refused, the bound
+         not a number, ...)
+    126  the command was found but could not be executed
+    127  the command was not found
       1  usage error (too few arguments)
       N  otherwise, the watched command's own exit status
 """
@@ -20,11 +23,12 @@ import sys
 WINDOWS = os.name == "nt"
 
 
-def _die(message):
-    """Report a watchdog failure and exit 125 -- distinct from 124 (the bound
-    fired) and from the usage-error exit 1."""
+def _die(message, code=125):
+    """Report a watchdog failure and exit `code` -- 125 by default, distinct
+    from 124 (the bound fired) and from the usage-error exit 1. The command's
+    own failures to start take 127/126, as a shell reports them."""
     print(f"run-with-timeout: {message}", file=sys.stderr)
-    sys.exit(125)
+    sys.exit(code)
 
 
 def _is_live(pid):
@@ -126,7 +130,10 @@ def kill_tree_windows(proc):
 def main(argv):
     if len(argv) < 3:
         sys.exit(f"usage: {argv[0]} <seconds> <command> [args...]")
-    seconds = float(argv[1])
+    try:
+        seconds = float(argv[1])
+    except ValueError:
+        _die(f"the bound must be a number of seconds, not {argv[1]!r}")
     command = argv[2:]
     if not WINDOWS and shutil.which("ps") is None:
         _die("`ps` is not on PATH, and expiry needs it to find the session to kill")
@@ -136,7 +143,15 @@ def main(argv):
     # rather than rejecting it, but it is left out anyway, since the kill on
     # that platform goes by process tree instead.
     kwargs = {} if WINDOWS else {"start_new_session": True}
-    proc = subprocess.Popen(command, **kwargs)
+    # A command that never starts is not the watched command's exit status --
+    # it has none -- so report it the way a shell does rather than letting the
+    # OSError escape as a traceback on exit 1.
+    try:
+        proc = subprocess.Popen(command, **kwargs)
+    except FileNotFoundError as e:
+        _die(f"cannot run {command[0]}: {e.strerror}", 127)
+    except PermissionError as e:
+        _die(f"cannot run {command[0]}: {e.strerror}", 126)
     try:
         code = proc.wait(timeout=seconds)
     except subprocess.TimeoutExpired:

@@ -199,6 +199,39 @@ class MainPosixTests(unittest.TestCase):
                 self.assertRegex(self.stderr.getvalue(), rf"(?m)^run-with-timeout: .*\b{refuser}\b")
                 self.assertEqual(proc.waits, [SECONDS])
 
+    def run_main_argv(self, popen, argv, ps_path="/bin/ps"):
+        """`run_main`, but for the argv-level failures that never reach a host."""
+        self.stderr = io.StringIO()
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(run_with_timeout, "WINDOWS", False))
+            stack.enter_context(patch.object(run_with_timeout.subprocess, "Popen", popen))
+            which = SimpleNamespace(which=lambda _name: ps_path)
+            stack.enter_context(patch.object(run_with_timeout, "shutil", which, create=True))
+            stack.enter_context(redirect_stderr(self.stderr))
+            return run_with_timeout.main(argv)
+
+    def test_a_bound_that_is_not_a_number_is_a_watchdog_failure(self):
+        popen = MagicMock(side_effect=AssertionError("the command was started"))
+        with self.assertRaises(SystemExit) as raised:
+            self.run_main_argv(popen, ["run-with-timeout.py", "abc", "command"])
+        self.assertEqual(raised.exception.code, 125)
+        self.assertRegex(self.stderr.getvalue(), r"^run-with-timeout: .*abc")
+        popen.assert_not_called()
+
+    def test_a_command_that_does_not_exist_reports_127(self):
+        popen = MagicMock(side_effect=FileNotFoundError(2, "No such file or directory"))
+        with self.assertRaises(SystemExit) as raised:
+            self.run_main_argv(popen, ["run-with-timeout.py", str(SECONDS), "no-such-cmd"])
+        self.assertEqual(raised.exception.code, 127)
+        self.assertRegex(self.stderr.getvalue(), r"^run-with-timeout: .*no-such-cmd")
+
+    def test_a_command_that_is_not_executable_reports_126(self):
+        popen = MagicMock(side_effect=PermissionError(13, "Permission denied"))
+        with self.assertRaises(SystemExit) as raised:
+            self.run_main_argv(popen, ["run-with-timeout.py", str(SECONDS), "not-executable"])
+        self.assertEqual(raised.exception.code, 126)
+        self.assertRegex(self.stderr.getvalue(), r"^run-with-timeout: .*not-executable")
+
 
 class FakeProc:
     """Stands in for the `Popen` handle `kill_tree_windows` receives: only
