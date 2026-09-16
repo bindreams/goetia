@@ -8,6 +8,7 @@
 //! stdout fallback and both truncation messages shipped with no test at all.
 
 use super::*;
+use std::time::Duration;
 
 fn capture(stdout: &str, stderr: &str, complete: bool) -> Capture {
     Capture {
@@ -75,6 +76,36 @@ fn an_empty_diagnostic_is_explained_rather_than_trailing_off_after_a_colon() {
         assert!(
             msg.contains("systemctl start x.service failed"),
             "complete={complete}: {msg}"
+        );
+    }
+}
+
+// verb_args ===========================================================================================================
+
+/// `--no-block` is the whole of what a non-waiting budget means to systemd, and no elevated test
+/// can see it: `start` returns either way, so dropping the flag leaves that suite green (measured —
+/// the review's mutation 2b kept 37/37). The argv is observable with no timing bet at all, which is
+/// why the mechanism is pinned here rather than through a live `systemctl`.
+#[skuld::test]
+fn a_budget_that_does_not_wait_asks_systemd_not_to_block() {
+    for budget in [Budget::Immediate, Budget::Bounded(Duration::ZERO)] {
+        assert_eq!(
+            verb_args("start", "x.service", budget),
+            ["start", "--no-block", "x.service"],
+            "{budget:?}"
+        );
+    }
+}
+
+/// A budget that waits must not pass `--no-block`: `systemctl` blocking until its job completes is
+/// the confirmation the budget exists to wait for.
+#[skuld::test]
+fn a_budget_that_waits_lets_systemctl_block() {
+    for budget in [Budget::Unbounded, Budget::Bounded(Duration::from_secs(10))] {
+        assert_eq!(
+            verb_args("stop", "x.service", budget),
+            ["stop", "x.service"],
+            "{budget:?}"
         );
     }
 }

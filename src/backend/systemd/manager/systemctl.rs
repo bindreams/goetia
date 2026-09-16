@@ -39,6 +39,19 @@ pub(super) fn daemon_reload_or_report(id: &str) -> Result<()> {
     })
 }
 
+/// The argv for one `systemctl <verb> <unit>` under `budget`.
+///
+/// Its own function so that `--no-block` is observable without a timing bet. No elevated test can
+/// see the flag — `start` returns either way — so asserting the argv is the only way this choice
+/// can fail a test at all; `systemctl_tests.rs` does exactly that.
+fn verb_args<'a>(verb: &'a str, unit: &'a str, budget: Budget) -> Vec<&'a str> {
+    if budget.waits() {
+        vec![verb, unit]
+    } else {
+        vec![verb, "--no-block", unit]
+    }
+}
+
 /// One `systemctl <verb> <unit>` under `budget`, as three deliberately different paths.
 ///
 /// A budget that does not wait becomes `systemctl <verb> --no-block`, the exact native expression
@@ -57,15 +70,16 @@ fn run_verb(verb: &str, unit: &str, budget: Budget) -> Result<Finished> {
             complete: true,
         },
     };
+    let args = verb_args(verb, unit, budget);
     if !budget.waits() {
-        return Ok(whole(run_systemctl(&[verb, "--no-block", unit])?));
+        return Ok(whole(run_systemctl(&args)?));
     }
     if budget == Budget::Unbounded {
-        return Ok(whole(run_systemctl(&[verb, unit])?));
+        return Ok(whole(run_systemctl(&args)?));
     }
 
     let failed = |e: cosca::error::Error| Error::Other(format!("failed to run `systemctl {verb} {unit}`: {e}"));
-    let mut cmd = bounded::command("systemctl", &[verb, unit]).map_err(failed)?;
+    let mut cmd = bounded::command("systemctl", &args).map_err(failed)?;
     let child = cmd.spawn().map_err(failed)?;
     bounded::wait_bounded(child, budget.start()).map_err(failed)
 }

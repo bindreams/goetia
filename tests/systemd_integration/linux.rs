@@ -528,8 +528,12 @@ fn start_stop_status_reflect_reality() {
 /// while the job is still queued, so asserting `Running` — or `Stopped` — would be asserting a
 /// race. What `Immediate` promises is that the request was accepted and goetia came back, and that
 /// is exactly and only what is checked here.
+///
+/// Named for what it observes rather than for the mechanism: a `start` that dropped `--no-block`
+/// entirely would still pass this, so the flag itself is pinned on the argv, in
+/// `src/backend/systemd/manager/systemctl_tests.rs`.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_start_with_no_budget_uses_no_block() {
+fn a_start_with_no_budget_is_accepted_and_returns() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let spec = mk(guard.id());
