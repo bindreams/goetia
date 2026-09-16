@@ -109,6 +109,29 @@ pub enum Error {
         recovery: String,
     },
 
+    /// A wait for `id` to reach `awaited` ran out of budget. Produced only
+    /// through [`crate::manager::budget::timed_out`], so all three backends
+    /// word one condition identically.
+    ///
+    /// What this variant does **not** claim, and what separates it from
+    /// [`Undetermined`](Error::Undetermined): nothing here is in doubt about
+    /// what is *installed* at the id — that question was answered before the
+    /// wait ever began. The request was issued and accepted, and goetia
+    /// stopped watching for its outcome; it was not cancelled, and the
+    /// service may still arrive. A backend must never report an expiry as
+    /// `Ok(())`, and never as `Undetermined` (D3).
+    ///
+    /// Exit `4` (indeterminate), like `Undetermined`: the code is about
+    /// whether the question was answered, and this one was not.
+    #[error("`{id}` did not report {awaited} within {waited}: {recovery}", waited = humantime::format_duration(*waited))]
+    WaitTimeout {
+        id: String,
+        /// `"running"` or `"stopped"`, and nothing else.
+        awaited: &'static str,
+        waited: std::time::Duration,
+        recovery: String,
+    },
+
     /// A mutating CLI subcommand was invoked without the elevation
     /// (root/Administrator) it requires. Never returned for `list`,
     /// `status`, `show`, `diff`, or `install --dry-run`, none of which

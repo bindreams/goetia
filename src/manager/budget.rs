@@ -66,6 +66,46 @@ pub fn budget_for(deadline: Deadline) -> Budget {
     }
 }
 
+// timed_out ===========================================================================================================
+
+/// The one [`crate::Error::WaitTimeout`] constructor, so all three backends
+/// word an expiry identically rather than three times — the analogue of
+/// `decide::foreign_recovery`, and for the same reason: one condition, one
+/// remedy, no drift.
+///
+/// `awaited` is `"running"` or `"stopped"`, and nothing else.
+///
+/// Takes the `Budget` rather than a bare `Duration` because a backend holds
+/// the budget, not the original duration, and because only a **non-zero**
+/// `Bounded` budget can expire at all: `Immediate` and `Bounded(ZERO)` never
+/// waited (see [`Budget::waits`]), and `Unbounded` never ends. Reaching here
+/// with any of those is a backend reporting an expiry that provably cannot
+/// have happened, so it is a `debug_assert!` rather than a silently plausible
+/// message.
+pub fn timed_out(id: &str, awaited: &'static str, budget: Budget) -> crate::Error {
+    debug_assert!(
+        matches!(budget, Budget::Bounded(d) if d > Duration::ZERO),
+        "only a non-zero Bounded budget can expire, got {budget:?}"
+    );
+    debug_assert!(
+        matches!(awaited, "running" | "stopped"),
+        "awaited is `running` or `stopped`, got {awaited:?}"
+    );
+    crate::Error::WaitTimeout {
+        id: id.to_string(),
+        awaited,
+        waited: match budget {
+            Budget::Bounded(d) => d,
+            Budget::Immediate | Budget::Unbounded => Duration::ZERO,
+        },
+        recovery: format!(
+            "goetia stopped waiting. The request was not cancelled, so `{id}` may still reach \
+             {awaited}; `goetia daemon status {id}` shows the manager's current view. Allow longer \
+             with `--timeout <duration>`, or wait indefinitely with `--no-timeout`."
+        ),
+    }
+}
+
 // Deadline ============================================================================================================
 
 /// An absolute instant a [`Budget`] resolves to via [`Budget::start`].

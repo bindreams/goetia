@@ -82,6 +82,70 @@ fn a_spent_deadline_yields_an_immediate_budget() {
     }
 }
 
+// timed_out ===========================================================================================================
+
+#[skuld::test]
+fn timed_out_names_the_id_the_state_and_how_long_it_waited() {
+    let e = timed_out("frpc", "running", Budget::Bounded(Duration::from_secs(10)));
+
+    let message = e.to_string();
+    assert!(message.contains("frpc"), "{message}");
+    assert!(message.contains("running"), "{message}");
+    assert!(
+        message.contains("10s"),
+        "the waited duration must be rendered: {message}"
+    );
+}
+
+#[skuld::test]
+fn timed_out_is_a_wait_timeout_carrying_the_budget_it_was_given() {
+    match timed_out("frpc", "stopped", Budget::Bounded(Duration::from_secs(3))) {
+        crate::Error::WaitTimeout {
+            id,
+            awaited,
+            waited,
+            recovery,
+        } => {
+            assert_eq!(id, "frpc");
+            assert_eq!(awaited, "stopped");
+            assert_eq!(waited, Duration::from_secs(3));
+            assert!(!recovery.is_empty());
+        }
+        other => panic!("expected Error::WaitTimeout, got {other:?}"),
+    }
+}
+
+/// The three things `recovery` owes a reader, and the one it must not
+/// imply: goetia stopped waiting, the request was **not** cancelled, and
+/// both the way to look and the two ways to wait longer.
+#[skuld::test]
+fn the_recovery_says_the_request_was_not_cancelled_and_names_both_ways_to_wait_longer() {
+    let crate::Error::WaitTimeout { recovery, .. } = timed_out("frpc", "running", Budget::DEFAULT) else {
+        panic!("timed_out must produce Error::WaitTimeout");
+    };
+
+    assert!(recovery.contains("not cancelled"), "{recovery}");
+    assert!(recovery.contains("goetia daemon status frpc"), "{recovery}");
+    assert!(recovery.contains("--timeout"), "{recovery}");
+    assert!(recovery.contains("--no-timeout"), "{recovery}");
+}
+
+/// Only a non-zero `Bounded` budget can expire: `Immediate` and
+/// `Bounded(ZERO)` never waited, and `Unbounded` never ends. A backend that
+/// reaches this constructor with one of those has reported an expiry that
+/// provably cannot have happened.
+#[skuld::test]
+#[should_panic(expected = "only a non-zero Bounded budget can expire")]
+fn timed_out_refuses_a_budget_that_cannot_expire() {
+    let _ = timed_out("frpc", "running", Budget::Unbounded);
+}
+
+#[skuld::test]
+#[should_panic(expected = "only a non-zero Bounded budget can expire")]
+fn timed_out_refuses_a_zero_length_budget() {
+    let _ = timed_out("frpc", "running", Budget::Bounded(Duration::ZERO));
+}
+
 // Deadline ============================================================================================================
 
 #[skuld::test]
