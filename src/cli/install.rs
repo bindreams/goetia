@@ -148,6 +148,12 @@ fn failure_code(e: &Error) -> i32 {
         // the request having been issued and not cancelled. Neither is a
         // step that determinately failed, which is what `1` would claim.
         Error::Undetermined { .. } | Error::WaitTimeout { .. } => 4,
+        // `Error::Unestablished` belongs in the arm above and is missing
+        // from it only because it cannot arrive here: `cli::restart` is its
+        // only producer, and `install` never calls it. `Error` is not
+        // `#[non_exhaustive]`, so a second producer reached from one of
+        // `install`'s own steps would land here and report `1` — "the step
+        // determinately failed" — silently. Add it above if one ever does.
         _ => 1,
     }
 }

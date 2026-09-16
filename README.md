@@ -590,7 +590,7 @@ goetia does not start into an unconfirmed stop.
 
 So a timeout during `restart` leaves the daemon in an indeterminate state —
 it may or may not be stopped when you look, and a start may or may not have
-been issued. Which of the two happened is in the error message.
+been issued. Which case you are in is in the error message.
 
 `restart --timeout 0` issues the stop and the start and confirms neither,
 which is what it is for. A start refused in that window exits `4` rather than
@@ -609,14 +609,14 @@ Two rules come before the numbers:
    `grep` has distinguished "no match" from "could not read the file" since
    v7 Unix.
 
-| Code | Name          | Meaning                                                                                                                                           | Anchored to                                                                                               |
-| ---- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `0`  | success       | The state is as asked, or the question was fully answered.                                                                                        | —                                                                                                         |
-| `1`  | error         | An operation was attempted and failed, or was refused outright.                                                                                   | —                                                                                                         |
-| `2`  | usage         | The command line was rejected before anything ran — by clap, or by the `--json` refusal.                                                          | clap's own default: the same code bash and argparse use for "the parser, not the program, rejected this". |
-| `3`  | drift         | A determinate "installed state differs from the manifest" answer. Only `diff` returns it.                                                         | Nothing; app-specific.                                                                                    |
-| `4`  | indeterminate | A question goetia could not answer about an id: its state, whether it is occupied at all, or the outcome of a request goetia stopped waiting for. | The LSB init-script convention's "service status unknown".                                                |
-| `5`  | conflict      | An installed artifact was modified outside goetia and `--force` was not given. See below: `--force` is not always the remedy.                     | Nothing; app-specific — which is why `5` is the code that moved rather than usage errors.                 |
+| Code | Name          | Meaning                                                                                                                                                                                               | Anchored to                                                                                               |
+| ---- | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `0`  | success       | The state is as asked, or the question was fully answered.                                                                                                                                            | —                                                                                                         |
+| `1`  | error         | An operation was attempted and failed, or was refused outright.                                                                                                                                       | —                                                                                                         |
+| `2`  | usage         | The command line was rejected before anything ran — by clap, or by one of `dispatch`'s refusals (`--json` on a subcommand that does not implement it; a wait flag on an `install` with no `--start`). | clap's own default: the same code bash and argparse use for "the parser, not the program, rejected this". |
+| `3`  | drift         | A determinate "installed state differs from the manifest" answer. Only `diff` returns it.                                                                                                             | Nothing; app-specific.                                                                                    |
+| `4`  | indeterminate | A question goetia could not answer about an id: its state, whether it is occupied at all, or the outcome of a request goetia did not wait out — it stopped waiting, or never waited.                  | The LSB init-script convention's "service status unknown".                                                |
+| `5`  | conflict      | An installed artifact was modified outside goetia and `--force` was not given. See below: `--force` is not always the remedy.                                                                         | Nothing; app-specific — which is why `5` is the code that moved rather than usage errors.                 |
 
 `2` and `4` are the two that must not be renumbered for tidiness: both are
 tied to a convention outside goetia.

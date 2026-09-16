@@ -142,11 +142,11 @@ pub enum DaemonCommand {
 ///   own: one `Create` plus one `Conflict` returns `5`, not `3`, since `5`
 ///   outranks `3` in the precedence rule below.
 /// - `4` indeterminate: a question Goetia could not answer about an id.
-///   Two producers, and the difference between them is what was
-///   established: an id Goetia owns whose *state* it could not determine,
-///   or — [`Error::Undetermined`](crate::error::Error::Undetermined) — an
-///   id where the read that would have said whether anything is installed
-///   at all failed, leaving even ownership unestablished.
+///   Two classes, by what was established — three variants between them:
+///   an id Goetia owns whose *state* it could not determine, or
+///   — [`Error::Undetermined`](crate::error::Error::Undetermined) — an id
+///   where the read that would have said whether anything is installed at
+///   all failed, leaving even ownership unestablished.
 ///   A wait that ran out of budget
 ///   ([`Error::WaitTimeout`](crate::error::Error::WaitTimeout)) is an
 ///   instance of the first and deliberately **not** of the second: what is
