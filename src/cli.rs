@@ -219,6 +219,23 @@ pub fn dispatch(
         return report::emit(&report, out, err);
     }
 
+    // The second rule of this shape, and it lives here for the same reason
+    // as the first: a command line goetia will not act on must run
+    // *nothing*, and rules of that shape belong in one place rather than
+    // split between clap and `dispatch`. `install` without `--start` starts
+    // nothing, so a budget named for that start can never be spent.
+    // `requires = "start"` cannot express it: `--dry-run` makes `--start`
+    // and the wait flags alike inert, and must keep accepting all three.
+    // Checked after the `--json` refusal, so that one wins when both apply.
+    if matches!(cmd, DaemonCommand::Install(args) if args.wait.was_given() && !args.start && !args.dry_run) {
+        let _ = writeln!(
+            err,
+            "error: `--timeout`/`--no-timeout` need `--start`: `daemon install` on its own starts \
+             nothing, so there is nothing to wait for"
+        );
+        return 2;
+    }
+
     match cmd {
         DaemonCommand::Install(args) => install::run(args, get_manager, is_elevated, out, err),
         DaemonCommand::Uninstall(args) => uninstall::run(args, get_manager, is_elevated, out, err),

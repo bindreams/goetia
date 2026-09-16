@@ -3098,6 +3098,48 @@ fn install_start_that_times_out_exits_4() {
     assert!(err.contains("did not report running"), "{err}");
 }
 
+/// A command line goetia will not act on runs nothing: `install` without `--start` starts nothing,
+/// so a budget named for that start can never be spent.
+#[skuld::test]
+fn install_refuses_a_timeout_without_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let fake = Fake::new();
+
+    let (code, out, err) = dispatch_elevated(
+        &[
+            "goetia",
+            "daemon",
+            "install",
+            "--timeout",
+            "30s",
+            "-f",
+            manifest.to_str().unwrap(),
+        ],
+        &fake,
+    );
+    // `was_given()` reads both flags, so both reach the same refusal.
+    let (no_timeout_code, _, no_timeout_err) = dispatch_elevated(
+        &[
+            "goetia",
+            "daemon",
+            "install",
+            "--no-timeout",
+            "-f",
+            manifest.to_str().unwrap(),
+        ],
+        &fake,
+    );
+
+    assert_eq!(code, 2, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.contains("--start"), "the missing flag is named: {err}");
+    assert_eq!(no_timeout_code, 2, "{no_timeout_err}");
+    assert!(
+        installed_ids(&fake).is_empty(),
+        "a refused command line installs nothing"
+    );
+}
+
 /// `--dry-run` keeps ignoring the wait flags exactly as it already ignores `--start`. Refusing this
 /// combination while still accepting a silent `--dry-run --start` would be a new inconsistency.
 #[skuld::test]
