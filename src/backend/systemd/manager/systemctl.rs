@@ -96,9 +96,9 @@ fn run_verb(verb: &str, unit: &str, budget: Budget) -> Result<Finished> {
 fn failed(verb: &str, unit: &str, capture: &Capture) -> Error {
     // Whichever stream carried the diagnostic. `systemctl` writes its
     // failures to stderr, but a failure that produced only stdout would
-    // otherwise render `systemctl start x.service failed: ` with nothing
-    // after the colon — an empty diagnostic on the one path whose entire
-    // value is the diagnostic.
+    // otherwise reach the empty-diagnostic guard below and report that the
+    // command "wrote no diagnostic" — false, since systemd wrote one, and
+    // wrong on the one path whose entire value is the diagnostic.
     let diagnostic = if capture.stderr.is_empty() {
         String::from_utf8_lossy(&capture.stdout)
     } else {

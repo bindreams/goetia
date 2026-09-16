@@ -31,7 +31,8 @@ fn a_failure_is_reported_with_what_systemctl_wrote_on_stderr() {
 
 /// The stdout fallback. `systemctl` writes its failures to stderr, so a
 /// capture with only stdout is the case nothing else in the tree produces —
-/// and the case that used to render `failed: ` with nothing after the colon.
+/// and the case that would otherwise report "wrote no diagnostic" when
+/// systemd did write one.
 #[skuld::test]
 fn a_failure_that_wrote_only_to_stdout_is_still_reported_with_what_it_wrote() {
     let e = failed("stop", "x.service", &capture("something on stdout\n", "", true));
