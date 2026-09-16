@@ -200,6 +200,44 @@ pub fn close_then_drain<H: ScmHandles>(h: &mut H) {
     }
 }
 
+/// The state a follow-up `query_status` reported — one variant per
+/// `windows_service::service::ServiceState`, mirrored here so
+/// [`already_running_is_recoverable`] is a decision about a plain enum and
+/// can be tested off Windows.
+///
+/// Deliberately not [`Observed`], which collapses `StartPending` and
+/// `StopPending` into a single `Pending`: telling those two apart is the
+/// entire content of the decision below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueriedState {
+    Stopped,
+    StartPending,
+    StopPending,
+    Running,
+    ContinuePending,
+    PausePending,
+    Paused,
+}
+
+/// Whether a `StartServiceW` that failed with `ERROR_SERVICE_ALREADY_RUNNING`
+/// (1056) can still be resolved by the wait that is already armed, given the
+/// state a follow-up query reported.
+///
+/// 1056 means only "`dwCurrentState` is not `SERVICE_STOPPED`", which lumps
+/// together states this wait can finish from and states it cannot.
+/// `Running` and `StartPending` are the two it can: `want_to_mask` arms
+/// `SERVICE_NOTIFY_START_PENDING` in *both* of its `WantState::Running`
+/// branches, so a service in either state immediate-fires and the wait
+/// resolves normally. `StartPending` in particular is what a service is in
+/// when something else started it a moment earlier — rejecting it fails a
+/// start that was going to succeed. For every other state the registration
+/// holds no bit that can fire, so accepting 1056 would block until the
+/// deadline instead of reporting what the service is really doing.
+#[must_use]
+pub fn already_running_is_recoverable(queried: QueriedState) -> bool {
+    matches!(queried, QueriedState::Running | QueriedState::StartPending)
+}
+
 // system ==============================================================================================================
 
 #[cfg(windows)]
@@ -223,7 +261,7 @@ pub mod system {
     };
     use windows_sys::Win32::System::Threading::{INFINITE, SleepEx};
 
-    use super::{Deadline, Observed, Waited, WantState};
+    use super::{Deadline, Observed, QueriedState, Waited, WantState, already_running_is_recoverable};
 
     /// `windows-service`'s `Error` does not implement `Into<io::Error>` for
     /// every variant (it also carries parse errors this module never
@@ -285,6 +323,22 @@ pub mod system {
                 SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_STOPPED | SERVICE_NOTIFY_START_PENDING
             }
             WantState::Running => SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_START_PENDING,
+        }
+    }
+
+    /// `windows-service`'s state onto the ungated [`QueriedState`]. One arm
+    /// per variant and no `_` catch-all, so a variant added upstream is a
+    /// compile error here rather than a silent remap — only CI can execute
+    /// this, so it is written to be checkable by eye.
+    fn queried_state(state: ServiceState) -> QueriedState {
+        match state {
+            ServiceState::Stopped => QueriedState::Stopped,
+            ServiceState::StartPending => QueriedState::StartPending,
+            ServiceState::StopPending => QueriedState::StopPending,
+            ServiceState::Running => QueriedState::Running,
+            ServiceState::ContinuePending => QueriedState::ContinuePending,
+            ServiceState::PausePending => QueriedState::PausePending,
+            ServiceState::Paused => QueriedState::Paused,
         }
     }
 
@@ -479,19 +533,10 @@ pub mod system {
             self.started = true;
             match self.service()?.start::<&std::ffi::OsStr>(&[]) {
                 Ok(()) => Ok(()),
-                // Per [MS-SCMR]'s `RStartServiceW` error table, 1056 means
-                // only "`dwCurrentState` is not `SERVICE_STOPPED`", which
-                // covers StopPending/Paused/etc. as well as the two states
-                // the arm above DID immediate-fire for: `want_to_mask` arms
-                // `SERVICE_NOTIFY_START_PENDING` in both of its
-                // `WantState::Running` branches, so a service already in
-                // START_PENDING resolves through the wait exactly as one
-                // already RUNNING does. Treating 1056 as "the wait will
-                // complete" would hang forever in the other cases; rejecting
-                // it outright fails a start that was going to succeed — and
-                // START_PENDING is precisely the state a service is in when
-                // something else started it a moment earlier. Confirm the
-                // real state before deciding.
+                // 1056 does not say which non-STOPPED state the service is
+                // in, so query it and let `already_running_is_recoverable`
+                // decide — that is where the reasoning lives, and it is
+                // tested on every platform.
                 //
                 // Accepting a queried `Running` is right here and would be
                 // WRONG for a `restart` that issued its start leg without a
@@ -506,11 +551,7 @@ pub mod system {
                     if e.raw_os_error() == Some(ERROR_SERVICE_ALREADY_RUNNING as i32) =>
                 {
                     match self.service()?.query_status() {
-                        Ok(status)
-                            if matches!(status.current_state, ServiceState::Running | ServiceState::StartPending) =>
-                        {
-                            Ok(())
-                        }
+                        Ok(status) if already_running_is_recoverable(queried_state(status.current_state)) => Ok(()),
                         Ok(status) => Err(io::Error::other(format!(
                             "StartServiceW reported ERROR_SERVICE_ALREADY_RUNNING, but the service is actually \
                              {:?} — neither Running nor StartPending, so this wait cannot resolve from that state",

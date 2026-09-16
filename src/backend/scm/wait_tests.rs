@@ -319,3 +319,41 @@ fn nothing_is_drained_when_no_registration_is_outstanding() {
     close_then_drain(&mut fake);
     assert_eq!(fake.log, vec!["close"]);
 }
+
+// the already-running (1056) decision ---------------------------------------------------------------------------------
+
+#[skuld::test]
+fn a_queried_running_recovers_an_already_running_start() {
+    // The service is up and the wait, armed for SERVICE_NOTIFY_RUNNING,
+    // immediate-fires on it.
+    assert!(already_running_is_recoverable(QueriedState::Running));
+}
+
+#[skuld::test]
+fn a_queried_start_pending_recovers_an_already_running_start() {
+    // `want_to_mask` arms SERVICE_NOTIFY_START_PENDING in BOTH of its
+    // `WantState::Running` branches, so a service something else started a
+    // moment ago immediate-fires and resolves through the wait. Rejecting it
+    // failed a start that was going to succeed — narrowing this predicate
+    // back to `Running`-only fails here.
+    assert!(already_running_is_recoverable(QueriedState::StartPending));
+}
+
+#[skuld::test]
+fn no_other_queried_state_recovers_an_already_running_start() {
+    // None of these is a state the RUNNING wait is armed for, so treating
+    // 1056 as "the wait will complete" would block until the deadline
+    // instead of reporting what the service is actually doing.
+    for state in [
+        QueriedState::Stopped,
+        QueriedState::StopPending,
+        QueriedState::ContinuePending,
+        QueriedState::PausePending,
+        QueriedState::Paused,
+    ] {
+        assert!(
+            !already_running_is_recoverable(state),
+            "{state:?} must not be recoverable"
+        );
+    }
+}
