@@ -152,6 +152,54 @@ pub fn request_stop<A: ScmActor>(a: &mut A) -> io::Result<()> {
     a.control_stop()
 }
 
+// hoisted from `mod system` ===========================================================================================
+
+/// The teardown half of [`system::SystemScmActor`], behind a trait for the
+/// same reason [`ScmActor`] is one: the thing that matters here is an
+/// *order*, and an order is only assertable if a fake can record it.
+pub trait ScmHandles {
+    /// Close the per-service handle and the SCM connection.
+    fn close_handles(&mut self);
+    /// Whether an `arm` succeeded that no `wait_callback` has consumed.
+    fn registration_outstanding(&self) -> bool;
+    /// Run a notification the SCM has already queued to this thread, via a
+    /// zero-duration alertable wait.
+    fn drain_queued_apc(&mut self);
+}
+
+/// Close both handles, THEN drain a notification the SCM may already have
+/// queued.
+///
+/// An `arm()` that immediate-fired (the service already matched the
+/// requested mask at the moment of the call) queues an APC to THIS thread
+/// regardless of what happens next, and closing the handles only stops
+/// *future* notifications from being queued (per
+/// `NotifyServiceStatusChangeW`'s documented remarks) — it does not un-queue
+/// one already pending. Left undrained — a `control_stop`/`start` that
+/// errored before the wait ever ran, or a wait that expired before the APC
+/// arrived — it fires later, on some unrelated alertable wait elsewhere in
+/// the process, against the `LastStatus`/`SERVICE_NOTIFY_2W` boxes the actor
+/// is about to free: memory corruption, and a `fired` flag set on whatever
+/// occupies that address by then.
+///
+/// Closing first is what makes the drain final. Draining first leaves a
+/// window in which the SCM can queue a fresh notification between the drain
+/// returning and the handle closing — and on the expiry path, where the APC
+/// has usually not been queued yet, that window is the likely case, not the
+/// unlikely one.
+///
+/// What the fake in `wait_tests.rs` pins is exactly that SEQUENCE, and no
+/// more. That `Service`'s `Drop` really closes the `SC_HANDLE`, that the SCM
+/// really stops queuing once it is closed, and that `Drop for
+/// SystemScmActor` reaches this function at all stay verifiable only on
+/// Windows CI.
+pub fn close_then_drain<H: ScmHandles>(h: &mut H) {
+    h.close_handles();
+    if h.registration_outstanding() {
+        h.drain_queued_apc();
+    }
+}
+
 // system ==============================================================================================================
 
 #[cfg(windows)]
@@ -324,37 +372,11 @@ pub mod system {
             Ok(None)
         }
 
-        /// Close both handles, THEN drain a notification the SCM may already
-        /// have queued.
-        ///
-        /// An `arm()` that immediate-fired (the service already matched the
-        /// requested mask at the moment of the call) queues an APC to THIS
-        /// thread regardless of what happens next, and closing the handles
-        /// only stops *future* notifications from being queued (per
-        /// `NotifyServiceStatusChangeW`'s documented remarks) — it does not
-        /// un-queue one already pending. Left undrained — a
-        /// `control_stop`/`start` that errored before the wait ever ran, or a
-        /// wait that expired before the APC arrived — it fires later, on some
-        /// unrelated alertable wait elsewhere in the process, against the
-        /// `LastStatus`/`SERVICE_NOTIFY_2W` boxes this actor is about to
-        /// free: memory corruption, and a `fired` flag set on whatever
-        /// occupies that address by then.
-        ///
-        /// Closing first is what makes the drain final. Draining first leaves
-        /// a window in which the SCM can queue a fresh notification between
-        /// the drain returning and the handle closing — and on the expiry
-        /// path, where the APC has usually not been queued yet, that window
-        /// is the likely case, not the unlikely one.
+        /// Both teardown paths ([`Self::expire`] and `Drop`) go through
+        /// [`super::close_then_drain`], which is where the order and the
+        /// reason for it live.
         fn close_and_drain(&mut self) {
-            drop(self.service.take());
-            drop(self.scm.take());
-            if self.registration_outstanding {
-                // SAFETY: a zero-duration alertable wait; no pointers
-                // involved. `self.status`/`self.notify` are alive at both
-                // call sites — `Drop::drop`'s body runs before any field is
-                // dropped.
-                unsafe { SleepEx(0, 1) };
-            }
+            super::close_then_drain(self);
         }
     }
 
@@ -368,6 +390,25 @@ pub mod system {
             ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::START,
         )
         .map_err(to_io_error)
+    }
+
+    /// The three steps [`super::close_then_drain`] puts in order.
+    impl super::ScmHandles for SystemScmActor {
+        fn close_handles(&mut self) {
+            drop(self.service.take());
+            drop(self.scm.take());
+        }
+
+        fn registration_outstanding(&self) -> bool {
+            self.registration_outstanding
+        }
+
+        fn drain_queued_apc(&mut self) {
+            // SAFETY: a zero-duration alertable wait; no pointers involved.
+            // `self.status`/`self.notify` are alive at both call sites —
+            // `Drop::drop`'s body runs before any field is dropped.
+            unsafe { SleepEx(0, 1) };
+        }
     }
 
     impl Drop for SystemScmActor {

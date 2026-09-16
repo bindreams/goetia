@@ -271,3 +271,51 @@ fn request_stop_arms_nothing_and_waits_for_nothing() {
     request_stop(&mut fake).unwrap();
     assert_eq!(fake.log, vec!["control_stop"]);
 }
+
+// handle teardown -----------------------------------------------------------------------------------------------------
+
+/// Records which of [`ScmHandles`]' steps ran, in call order.
+struct FakeHandles {
+    log: Vec<&'static str>,
+    outstanding: bool,
+}
+
+impl FakeHandles {
+    fn new(outstanding: bool) -> Self {
+        Self {
+            log: vec![],
+            outstanding,
+        }
+    }
+}
+
+impl ScmHandles for FakeHandles {
+    fn close_handles(&mut self) {
+        self.log.push("close");
+    }
+    fn registration_outstanding(&self) -> bool {
+        self.outstanding
+    }
+    fn drain_queued_apc(&mut self) {
+        self.log.push("drain");
+    }
+}
+
+#[skuld::test]
+fn the_handles_close_before_a_queued_apc_is_drained() {
+    // Draining first leaves a window in which the SCM can queue a fresh
+    // notification against boxes that are about to be freed. Reversing the
+    // two lines in `close_then_drain` fails here.
+    let mut fake = FakeHandles::new(true);
+    close_then_drain(&mut fake);
+    assert_eq!(fake.log, vec!["close", "drain"]);
+}
+
+#[skuld::test]
+fn nothing_is_drained_when_no_registration_is_outstanding() {
+    // No arm succeeded, so no APC can be queued and the alertable wait would
+    // only be able to run some *other* registration's callback.
+    let mut fake = FakeHandles::new(false);
+    close_then_drain(&mut fake);
+    assert_eq!(fake.log, vec!["close"]);
+}
