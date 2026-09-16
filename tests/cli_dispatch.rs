@@ -3073,6 +3073,38 @@ fn restart_with_no_budget_reports_a_rejected_start() {
     assert!(err.contains("frpc"), "{err}");
 }
 
+/// The non-waiting path must not absorb an `Undetermined` start leg into `Error::Unestablished`,
+/// which says in its own doc comment that what is installed at the id was never in doubt. Here it
+/// is in doubt, and the waiting path already preserves the variant — so both paths must.
+#[skuld::test]
+fn restart_with_no_budget_keeps_an_undetermined_start_undetermined() {
+    let inner = Fake::new();
+    inner.install(&mk("frpc"), false).unwrap();
+    let mgr = FlakyManager {
+        inner,
+        undetermined_start_for: Some("frpc".to_string()),
+        ..Default::default()
+    };
+
+    let (code, out, err) = dispatch_with(
+        &["goetia", "daemon", "restart", "frpc", "--timeout", "0"],
+        &mgr,
+        &|| true,
+    );
+
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        err.starts_with("error: frpc: cannot determine whether daemon `frpc` is installed"),
+        "the start leg's variant must survive the non-waiting path, not be nested inside another \
+         error that denies the doubt: {err}"
+    );
+    assert!(
+        err.contains("without waiting for it"),
+        "what the stop leg did and did not establish is still disclosed: {err}"
+    );
+    assert_eq!(out, "", "nothing may claim the daemon was restarted: {out}");
+}
+
 #[skuld::test]
 fn install_start_that_times_out_exits_4() {
     let dir = tempfile::tempdir().unwrap();

@@ -185,7 +185,18 @@ fn spent_before_start(id: &Id, budget: Budget) -> Error {
 /// start leg erased here would exit `1` in the states where the distinction
 /// matters most — stopped and not back up, or stopped and still on its way.
 fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
-    if !budget.waits() {
+    match e {
+        // First, and ahead of the non-waiting arm below, so that both paths
+        // preserve it. [`Error::Unestablished`] says in as many words that
+        // what is installed at the id was never in doubt; absorbing an
+        // `Undetermined` start leg into it makes that false. Only the clause
+        // differs between the paths, because only what the stop leg
+        // established differs.
+        Error::Undetermined { id, reason, recovery } => Error::Undetermined {
+            id,
+            reason: format!("{}: {reason}", after_stop_clause(budget)),
+            recovery,
+        },
         // Neither leg confirmed anything: the stop was issued and not waited
         // for, and the start that followed was refused by a manager that may
         // simply be mid-stop (SCM's `ERROR_SERVICE_ALREADY_RUNNING` over a
@@ -193,19 +204,12 @@ fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
         // down, or never moved is precisely what nobody established — so not
         // `Other`, which is exit `1` and claims the restart determinately
         // failed.
-        return Error::Unestablished {
+        e if !budget.waits() => Error::Unestablished {
             id: id.as_str().to_string(),
             detail: format!(
                 "the stop was issued without waiting for it, and the start that followed was \
                  refused: {e}. `goetia daemon status {id}` shows the manager's current view."
             ),
-        };
-    }
-    match e {
-        Error::Undetermined { id, reason, recovery } => Error::Undetermined {
-            id,
-            reason: format!("stopped but failed to restart: {reason}"),
-            recovery,
         },
         Error::WaitTimeout {
             id,
@@ -219,6 +223,18 @@ fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
             waited,
         },
         other => Error::Other(format!("stopped but failed to restart: {other}")),
+    }
+}
+
+/// What the stop leg established, as the clause a start leg's failure hangs
+/// off. A budget that waited saw `stop` return `Ok`, which is a confirmed
+/// stop; one that did not wait confirmed nothing, and must not borrow the
+/// waiting path's wording to claim otherwise.
+fn after_stop_clause(budget: Budget) -> &'static str {
+    if budget.waits() {
+        "stopped but failed to restart"
+    } else {
+        "the stop was issued without waiting for it, and the start that followed was not determined"
     }
 }
 
