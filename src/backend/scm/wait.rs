@@ -44,6 +44,11 @@ pub enum Observed {
 /// Whether a wait reached the state it was waiting for, or ran out of
 /// [`Deadline`] first. An expiry is not an error: the request was issued and
 /// the service may yet arrive, so what to say about it is the caller's.
+///
+/// `#[must_use]` because dropping this reads an expiry as success, and
+/// `Result`'s own `#[must_use]` does not catch it: `?` consumes the
+/// `Result` and leaves a bare `Waited` behind.
+#[must_use = "an expired wait did not confirm the state; decide what to report rather than discarding it"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Waited {
     Confirmed,
