@@ -536,6 +536,67 @@ So the exit status is not a "did I get JSON" test. A `4` still carries a
 complete, well-formed document describing what could and could not be
 determined: parse stdout first, then read `errors` and `undetermined`.
 
+## Waiting for a start or stop
+
+`daemon start`, `daemon stop`, `daemon restart` and `daemon install --start`
+share one pair of flags:
+
+| Flag                   | Meaning                                       |
+| ---------------------- | --------------------------------------------- |
+| `--timeout <DURATION>` | Wait up to `DURATION`. The default is `10s`.  |
+| `--timeout 0`          | Issue the request and return without waiting. |
+| `--no-timeout`         | Wait indefinitely.                            |
+
+The two flags are mutually exclusive. `install` accepts them only alongside
+`--start`: without it nothing is started, so there is nothing to wait for,
+and the command line is refused at exit `2` having run nothing. Under
+`--dry-run` they are inert, exactly as `--start` itself is.
+
+**Durations** use the manifest's own grammar, the one `restart-delay`
+accepts: `10s`, `500ms`, `2m30s`. Write a compound duration **unspaced**, or
+quote it as a single argument. All four verbs take a variadic id list, so
+`--timeout 2m 30s` passes `2m` to the flag and leaves `30s` to be read as a
+daemon id — and goetia then reports that a daemon called `30s` is not
+installed, which is a confusing answer to a typo the shell made.
+
+### What returning means
+
+The platform's service manager reports the service as running, as far as it
+knows — not that the service is ready to serve, which no service manager can
+tell us. That reads as one guarantee and is three, because what each manager
+confirms differs:
+
+- **systemd** confirms the `exec` itself succeeded: a missing executable or a
+  missing user comes back as a failed start.
+- **SCM**, for a `type: simple` daemon, confirms that `goetia-shim` started.
+  Under `restart: always` or `on-failure` the shim reports running before its
+  first spawn, so your own command failing to start is not part of what was
+  confirmed.
+- **launchd** sits between the two: the pid `launchctl kickstart -p` reports
+  is launchd's own fork, taken before the user process reaches its `exec`.
+
+### When the wait runs out
+
+**Exit `4`, not `1`:** neither success nor failure was established. goetia
+stopped waiting; it did not cancel anything, so the request stands and the
+daemon may still arrive. `goetia daemon status <id>` shows the manager's
+current view.
+
+`restart` spends **one budget across the whole operation**, and one per
+daemon — `restart a b c --timeout 30s` promises each of the three 30s rather
+than leaving `c` whatever `a` and `b` did not spend, and neither leg gets a
+budget of its own. If that budget runs out, the start leg is **not issued**:
+goetia does not start into an unconfirmed stop.
+
+So a timeout during `restart` leaves the daemon in an indeterminate state —
+it may or may not be stopped when you look, and a start may or may not have
+been issued. Which of the two happened is in the error message.
+
+`restart --timeout 0` issues the stop and the start and confirms neither,
+which is what it is for. A start refused in that window exits `4` rather than
+`0`: the daemon may be the instance the stop is still taking down, may be
+going down, or may never have moved.
+
 ## Exit codes
 
 Two rules come before the numbers:
@@ -548,14 +609,14 @@ Two rules come before the numbers:
    `grep` has distinguished "no match" from "could not read the file" since
    v7 Unix.
 
-| Code | Name          | Meaning                                                                                                                       | Anchored to                                                                                               |
-| ---- | ------------- | ----------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `0`  | success       | The state is as asked, or the question was fully answered.                                                                    | —                                                                                                         |
-| `1`  | error         | An operation was attempted and failed, or was refused outright.                                                               | —                                                                                                         |
-| `2`  | usage         | The command line was rejected before anything ran — by clap, or by the `--json` refusal.                                      | clap's own default: the same code bash and argparse use for "the parser, not the program, rejected this". |
-| `3`  | drift         | A determinate "installed state differs from the manifest" answer. Only `diff` returns it.                                     | Nothing; app-specific.                                                                                    |
-| `4`  | indeterminate | A question goetia could not answer about an id: its state, or whether it is occupied at all.                                  | The LSB init-script convention's "service status unknown".                                                |
-| `5`  | conflict      | An installed artifact was modified outside goetia and `--force` was not given. See below: `--force` is not always the remedy. | Nothing; app-specific — which is why `5` is the code that moved rather than usage errors.                 |
+| Code | Name          | Meaning                                                                                                                                           | Anchored to                                                                                               |
+| ---- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `0`  | success       | The state is as asked, or the question was fully answered.                                                                                        | —                                                                                                         |
+| `1`  | error         | An operation was attempted and failed, or was refused outright.                                                                                   | —                                                                                                         |
+| `2`  | usage         | The command line was rejected before anything ran — by clap, or by the `--json` refusal.                                                          | clap's own default: the same code bash and argparse use for "the parser, not the program, rejected this". |
+| `3`  | drift         | A determinate "installed state differs from the manifest" answer. Only `diff` returns it.                                                         | Nothing; app-specific.                                                                                    |
+| `4`  | indeterminate | A question goetia could not answer about an id: its state, whether it is occupied at all, or the outcome of a request goetia stopped waiting for. | The LSB init-script convention's "service status unknown".                                                |
+| `5`  | conflict      | An installed artifact was modified outside goetia and `--force` was not given. See below: `--force` is not always the remedy.                     | Nothing; app-specific — which is why `5` is the code that moved rather than usage errors.                 |
 
 `2` and `4` are the two that must not be renumbered for tidiness: both are
 tied to a convention outside goetia.
@@ -571,8 +632,8 @@ When more than one outcome applies in the same run, the winner is:
 **This is a rule about which outcome wins, not an ordering of the
 integers** — `5` outranks `3` despite being the larger number, and `1`
 outranks `4` despite being the smaller. Never take `max()` over goetia's
-exit codes. `2` never enters the ladder: the thing that produces it always
-happens alone, before anything else could occur in the same run.
+exit codes. `2` never enters the ladder: the refusals that produce it always
+happen alone, before anything else could occur in the same run.
 
 **Indeterminate outranks conflict** on purpose. A script that branches on
 conflict re-runs with `--force`, and forcing on an incomplete picture is
@@ -867,7 +928,10 @@ that comes with it.
 
 ### The two sources of `4`
 
-They are not interchangeable, and the remedies do not transfer:
+Two within what `list`, `status` and `show` report; the mutating verbs reach
+`4` a third way, by
+[waiting and giving up](#when-the-wait-runs-out). These two are not
+interchangeable, and the remedies do not transfer:
 
 - **`unreadable`** — goetia's own daemon that goetia cannot use. The marker
   was read; the blob would not decode. Remedy:
