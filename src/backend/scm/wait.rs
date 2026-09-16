@@ -14,7 +14,8 @@
 //! already closes the underlying `SC_HANDLE` — instead of managing raw
 //! `OpenSCManagerW`/`OpenServiceW` handles by hand): the orchestration below
 //! is a pure state machine over [`ScmActor`], unit-tested with a fake in
-//! `scm_wait_tests.rs`; [`system::SystemScmActor`] drives the real SCM.
+//! `wait_tests.rs`; [`system::SystemScmActor`] drives the real SCM.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 use std::io;
 
@@ -388,5 +389,5 @@ pub mod system {
 pub use system::SystemScmActor;
 
 #[cfg(test)]
-#[path = "scm_wait_tests.rs"]
-mod scm_wait_tests;
+#[path = "wait_tests.rs"]
+mod wait_tests;

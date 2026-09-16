@@ -28,7 +28,7 @@
 //! **2. Stopping (and starting) must not poll.** `windows-service`'s
 //! `stop()`/`start()` return as soon as SCM accepts the request, not once
 //! the transition completes, and the crate wraps no wait primitive. See
-//! `scm_wait`, a port of `~/src/hole/crates/bridge/src/cutover/scm_wait.rs`
+//! `super::wait`, a port of `~/src/hole/crates/bridge/src/cutover/scm_wait.rs`
 //! using `NotifyServiceStatusChangeW` — a real kernel rendezvous, never a
 //! `Sleep`+`QueryServiceStatusEx` poll.
 //!
@@ -36,7 +36,7 @@
 //! on a running service only *marks* it for deletion — the registry key
 //! survives until every `SC_HANDLE` closes and the service actually stops —
 //! so the next `install` would meet `ERROR_SERVICE_MARKED_FOR_DELETE`.
-//! [`uninstall_locked`] waits for a confirmed `STOPPED` (via `scm_wait`)
+//! [`uninstall_locked`] waits for a confirmed `STOPPED` (via `super::wait`)
 //! before opening a *fresh* handle for `DeleteService`, so the handle used
 //! to wait is always closed first.
 //!
@@ -88,7 +88,6 @@
 
 mod identity;
 mod registry;
-mod scm_wait;
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -194,18 +193,18 @@ impl ServiceManager for ScmManager {
         let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
         require_ours(id)?;
         drop(service);
-        let mut actor = scm_wait::SystemScmActor::open(id.as_str())
+        let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to start it: {e}")))?;
-        scm_wait::start_via_notify(&mut actor).map_err(|e| Error::Other(format!("start `{id}`: {e}")))
+        super::wait::start_via_notify(&mut actor).map_err(|e| Error::Other(format!("start `{id}`: {e}")))
     }
 
     fn stop(&self, id: &Id) -> Result<()> {
         let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
         require_ours(id)?;
         drop(service);
-        let mut actor = scm_wait::SystemScmActor::open(id.as_str())
+        let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to stop it: {e}")))?;
-        scm_wait::stop_via_notify(&mut actor).map_err(|e| Error::Other(format!("stop `{id}`: {e}")))
+        super::wait::stop_via_notify(&mut actor).map_err(|e| Error::Other(format!("stop `{id}`: {e}")))
     }
 
     fn status(&self, id: &Id) -> Result<Status> {
@@ -843,9 +842,9 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
     };
 
     if needs_stop {
-        let mut actor = scm_wait::SystemScmActor::open(id.as_str())
+        let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to stop it before uninstall: {e}")))?;
-        scm_wait::stop_via_notify(&mut actor).map_err(|e| {
+        super::wait::stop_via_notify(&mut actor).map_err(|e| {
             Error::Other(format!(
                 "`{id}` did not confirm SERVICE_STOPPED before uninstall ({e}); it was NOT deleted — \
                  DeleteService on a running service only marks it for deletion, which the next install would \

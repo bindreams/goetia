@@ -114,7 +114,7 @@ windows-service = "0.8"
 # registry: `windows-service`'s `ServiceConfig` exposes neither.
 winreg = "0.56"
 # The handful of Win32 calls `windows-service` does not wrap: a real
-# `NotifyServiceStatusChangeW` wait (`manager::scm_wait`, replacing a
+# `NotifyServiceStatusChangeW` wait (`scm::wait`, replacing a
 # checkpoint/`Sleep` poll), `SeServiceLogonRight` provisioning
 # (`manager::identity`), and `CommandLineToArgvW` for readback (SCM stores
 # `executable`+`arguments` pre-joined into one command line).
