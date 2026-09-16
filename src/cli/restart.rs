@@ -20,7 +20,7 @@ use clap::Args as ClapArgs;
 use super::support::{IdVerbCall, run_id_verb};
 use super::wait::{self, WaitArgs};
 use crate::error::{Error, Result};
-use crate::manager::budget::{self, budget_for};
+use crate::manager::budget::{self, Deadline, budget_for};
 use crate::manager::{Budget, ServiceManager};
 use crate::spec::Id;
 
@@ -40,6 +40,26 @@ pub fn run(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
+    run_with(args, get_manager, is_elevated, &Budget::start, out, err)
+}
+
+/// [`run`] with the clock injected, so the module's two budget rules can be
+/// tested by counting deadlines rather than by timing them.
+///
+/// Both rules are statements about how many deadlines a run derives and
+/// when — one per [`restart`], one per id — and neither is observable
+/// downstream: `Fake` consumes no wall-clock time, so a budget shared
+/// across both legs and a fresh one per leg hand the manager
+/// indistinguishable values. Counting the derivations decides it exactly,
+/// and reads no clock at all.
+fn run_with(
+    args: &Args,
+    get_manager: &dyn Fn() -> Result<Box<dyn ServiceManager>>,
+    is_elevated: &dyn Fn() -> bool,
+    start_clock: &dyn Fn(Budget) -> Deadline,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
     let budget = args.wait.budget();
     run_id_verb(
         IdVerbCall {
@@ -47,7 +67,7 @@ pub fn run(
             ids: &args.ids,
             get_manager,
             is_elevated,
-            verb: &|mgr, id| restart(mgr, id, budget),
+            verb: &|mgr, id| restart(mgr, id, budget, start_clock),
             verb_past_tense: wait::reported(budget, "restarted", "restart requested"),
             absent_is_success: false,
         },
@@ -65,8 +85,8 @@ pub fn run(
 /// read — "don't wait, just do the steps". Either way no state is queried
 /// between the two, which is what keeps the exit code from being a
 /// stopwatch question.
-fn restart(mgr: &dyn ServiceManager, id: &Id, budget: Budget) -> Result<()> {
-    let deadline = budget.start();
+fn restart(mgr: &dyn ServiceManager, id: &Id, budget: Budget, start_clock: &dyn Fn(Budget) -> Deadline) -> Result<()> {
+    let deadline = start_clock(budget);
     mgr.stop(id, budget_for(deadline)).map_err(abandoned_before_start)?;
 
     let start_budget = match after_stop(budget, budget_for(deadline)) {
