@@ -128,8 +128,9 @@ fn failed(verb: &str, unit: &str, capture: &Capture) -> Error {
 /// `systemctl start` blocks until its job completes — the real synchronization primitive, no polling
 /// needed. Idempotent: starting an already-active unit is a no-op that still exits 0.
 ///
-/// Note for the reviewer: until the shim task lands, a bounded `systemctl start` confirms only that
-/// systemd forked the process (S3).
+/// Every generated unit carries `Type=exec` (see `generate::unit`'s doc comment for why), so a
+/// bounded `systemctl start` confirms the `exec` itself succeeded — not merely that systemd forked
+/// the process. A missing executable or missing user comes back as a failed start.
 pub(super) fn start_impl(id: &str, budget: Budget) -> Result<()> {
     let unit = super::unit_name(id);
     match run_verb("start", &unit, budget)? {
