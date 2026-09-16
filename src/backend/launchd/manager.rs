@@ -1067,6 +1067,9 @@ impl ServiceManager for LaunchdManager {
                     Presence::Undetermined { source } => return Err(Error::Io { path: target, source }),
                 }
                 write_existing(&target, &desired)?;
+                // `install` has no `--timeout` of its own, so its own
+                // `launchctl` calls are deliberately unbounded — unchanged
+                // from before budgets existed.
                 let deadline = Budget::Unbounded.start();
                 if matches!(outcome, Outcome::Update { .. }) && never_expires(is_loaded(spec.id.as_str(), deadline)?) {
                     // launchd holds the plist content it read at bootstrap
@@ -1368,6 +1371,8 @@ impl ServiceManager for LaunchdManager {
             match generate::extract(&text) {
                 Ok(None) => {} // foreign: not Goetia-managed, omitted per the trait doc comment
                 Ok(Some(blob)) => {
+                    // `list` has no budget of its own: unbounded, exactly
+                    // as `status`'s own live read is.
                     let (state, pid) = query_live_state(&id, Budget::Unbounded.start());
                     out.push(Installed::Ours {
                         spec: blob.spec,
