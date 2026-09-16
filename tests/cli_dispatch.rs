@@ -212,6 +212,13 @@ struct FlakyManager {
     /// `install`'s three `failure_code` call sites each classify their own
     /// step.
     undetermined_enable_for: Option<String>,
+    /// `start` fails with `Error::WaitTimeout`. A fourth independent
+    /// decision, and a different *condition* from the two above: the
+    /// request was issued and accepted, and goetia stopped waiting for its
+    /// outcome. `Fake` reaches this only for an entry seeded stalled, which
+    /// no `install`-path fixture has, so injecting it is the only way to
+    /// put it in front of `run_id_verb` and `install`'s own classifier.
+    wait_timeout_start_for: Option<String>,
     /// Makes `install`/`preview_install` return the `Conflict` flavour whose
     /// cause lies outside the directory the backend writes — systemd's
     /// `<id>.service.d` under `/usr/lib` or `.control`. `Fake` has no
@@ -228,6 +235,14 @@ fn unqueryable_failure() -> goetia::Error {
         command: "query-live-state".to_string(),
         stderr: "live state unavailable (injected test failure)".to_string(),
     }
+}
+
+/// A wait that ran out of budget. Built through the **real**
+/// `budget::timed_out` rather than a hand-written `Error::WaitTimeout`, so
+/// these tests pin the constructor every backend actually reports through,
+/// not a look-alike that could drift from it.
+fn injected_wait_timeout(id: &Id) -> goetia::Error {
+    goetia::manager::budget::timed_out(id.as_str(), "running", goetia::manager::Budget::DEFAULT)
 }
 
 fn injected_failure(id: &Id) -> goetia::Error {
@@ -295,6 +310,9 @@ impl ServiceManager for FlakyManager {
         }
         if self.undetermined_start_for.as_deref() == Some(id.as_str()) {
             return Err(injected_indeterminacy(id));
+        }
+        if self.wait_timeout_start_for.as_deref() == Some(id.as_str()) {
+            return Err(injected_wait_timeout(id));
         }
         self.inner.start(id)
     }
@@ -2657,6 +2675,30 @@ fn restart_exits_four_for_an_undetermined_id() {
     );
 }
 
+/// A wait that ran out is the same *class* as an unanswered question — the code is about whether
+/// the question was answered — but a different condition, so `run_id_verb` needs its own arm.
+/// Without one it falls to the catch-all and reports `1`, which says the start determinately
+/// failed: the one thing an expiry did not establish, since the request was never cancelled.
+#[skuld::test]
+fn start_exits_four_when_the_wait_timed_out() {
+    let inner = Fake::new();
+    inner.install(&mk("frpc"), false).unwrap();
+    let mgr = FlakyManager {
+        inner,
+        wait_timeout_start_for: Some("frpc".to_string()),
+        ..Default::default()
+    };
+
+    let (code, _out, err) = dispatch_with(&["goetia", "daemon", "start", "frpc"], &mgr, &|| true);
+
+    assert_eq!(code, 4, "{err}");
+    assert!(err.contains("frpc"), "{err}");
+    assert!(
+        err.contains("did not report running"),
+        "the expiry must reach the user as one: {err}"
+    );
+}
+
 /// The combination a scalar exit flag could not express: one id that failed determinately and one
 /// goetia could not answer for at all.
 #[skuld::test]
@@ -2723,6 +2765,35 @@ fn install_exits_four_when_the_start_leg_cannot_be_determined() {
     let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
     let mgr = FlakyManager {
         undetermined_start_for: Some("frpc".to_string()),
+        ..Default::default()
+    };
+
+    let (code, out, err) = dispatch_with(
+        &[
+            "goetia",
+            "daemon",
+            "install",
+            "--start",
+            "-f",
+            manifest.to_str().unwrap(),
+        ],
+        &mgr,
+        &|| true,
+    );
+
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.contains("start"), "the failing step is named: {err}");
+}
+
+/// `install --start`'s own classifier, and the same rule as the undetermined case above: it
+/// classifies its own step. `failure_code`'s catch-all would report `1` — "the start determinately
+/// failed" — for a request that was issued, accepted and simply not waited out.
+#[skuld::test]
+fn install_exits_four_when_the_start_leg_timed_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let mgr = FlakyManager {
+        wait_timeout_start_for: Some("frpc".to_string()),
         ..Default::default()
     };
 

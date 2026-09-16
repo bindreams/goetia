@@ -132,12 +132,16 @@ pub fn run(
 }
 
 /// The class a failed step contributes: `4` when goetia could not
-/// determine what is at the id, `1` when the step determinately failed.
-/// This is what makes `install` agree with `diff` about one artifact — see
+/// determine the answer, `1` when the step determinately failed. This is
+/// what makes `install` agree with `diff` about one artifact — see
 /// `dispatch`'s doc comment for the vocabulary.
 fn failure_code(e: &Error) -> i32 {
     match e {
-        Error::Undetermined { .. } => 4,
+        // Two conditions, one class. `Undetermined` left it open what is at
+        // the id; `WaitTimeout` answered that and left the *outcome* open,
+        // the request having been issued and not cancelled. Neither is a
+        // step that determinately failed, which is what `1` would claim.
+        Error::Undetermined { .. } | Error::WaitTimeout { .. } => 4,
         _ => 1,
     }
 }

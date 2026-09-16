@@ -319,6 +319,17 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
                 let _ = writeln!(err, "error: {id}: {e}");
                 codes.push(4);
             }
+            // A wait that ran out of budget. The same class as the arm
+            // above, for the same reason — the code is about whether the
+            // question was answered — but a different condition: this one
+            // answered what is at the id and left the *outcome* open. The
+            // catch-all below would report `1`, which says the verb
+            // determinately failed, and the request was never cancelled, so
+            // that is exactly what was not established.
+            Err(e @ Error::WaitTimeout { .. }) => {
+                let _ = writeln!(err, "error: {id}: {e}");
+                codes.push(4);
+            }
             Err(e) => {
                 let _ = writeln!(err, "error: {id}: {e}");
                 codes.push(1);
