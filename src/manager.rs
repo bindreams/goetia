@@ -76,6 +76,15 @@ pub trait ServiceManager {
     /// must the implementation, which is why every state assertion a backend
     /// makes belongs behind [`Budget::waits`].
     ///
+    /// **Where a platform offers no request-only form, [`Budget::Immediate`]
+    /// still performs the full blocking call, because issuing the request
+    /// *is* that call.** This is true of launchd's `launchctl
+    /// print`/`bootstrap`, neither of which has a non-blocking spelling: a
+    /// `start` with no budget still probes and, if needed, bootstraps the
+    /// job to completion before the plain `kickstart` that is what actually
+    /// declines to wait. The budget bounds what goetia waits *for*, and
+    /// there is nothing here to wait for separately.
+    ///
     /// On expiry, [`Error::WaitTimeout`] — never `Ok(())`, and never
     /// [`Error::Undetermined`], which claims the *installation* is in doubt
     /// when what actually happened is that a settled id's request was issued
