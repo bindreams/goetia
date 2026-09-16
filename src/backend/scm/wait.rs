@@ -244,7 +244,9 @@ pub mod system {
     /// [`Service`] handle (each `Drop` closes its own `SC_HANDLE`), plus the
     /// notify buffer. The `LastStatus` slot and the `SERVICE_NOTIFY_2W`
     /// buffer are heap-pinned (`Box`) so their addresses stay stable across
-    /// `arm` -> `SleepEx` -> callback.
+    /// `arm` -> `SleepEx` -> callback. Both handles are `Option`s so
+    /// [`Self::close_and_drain`] can close them *before* it drains — see
+    /// there for why that order is the whole point.
     ///
     /// Owning the SCM connection (rather than borrowing the caller's) is
     /// what makes [`Self::reopen`] able to follow `NotifyServiceStatusChangeW`'s
@@ -253,9 +255,9 @@ pub mod system {
     /// again" — the lag condition is tracked against the SCM connection, not
     /// the per-service handle alone.
     pub struct SystemScmActor {
-        scm: WinServiceManager,
+        scm: Option<WinServiceManager>,
         name: String,
-        service: Service,
+        service: Option<Service>,
         status: Box<LastStatus>,
         notify: Box<SERVICE_NOTIFY_2W>,
         /// The state most recently awaited, for `want_to_mask`.
@@ -263,7 +265,7 @@ pub mod system {
         /// Whether `start()` has been issued. Gates the two-phase arm mask.
         started: bool,
         /// Whether the most recent `arm()` succeeded and has not yet been
-        /// drained by `wait_callback`. See `Drop`.
+        /// drained by `wait_callback`. See [`Self::close_and_drain`].
         registration_outstanding: bool,
     }
 
@@ -275,9 +277,9 @@ pub mod system {
             let scm = open_scm()?;
             let service = open_handle(&scm, name)?;
             Ok(Self {
-                scm,
+                scm: Some(scm),
                 name: name.to_string(),
-                service,
+                service: Some(service),
                 status: Box::new(LastStatus {
                     current_state: AtomicU32::new(0),
                     fired: AtomicBool::new(false),
@@ -291,14 +293,68 @@ pub mod system {
 
         /// Reopen both handles. Used on `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING`
         /// — see the struct's own doc comment for why the SCM handle, not
-        /// only the service handle, must be replaced. Assigning `self.scm`/
-        /// `self.service` only after each `open_*` call succeeds means the
-        /// old handles (closed via `Drop` when replaced) stay valid until
-        /// their replacements are confirmed open.
+        /// only the service handle, must be replaced. Assigning both only
+        /// after both opens succeed means the old handles (closed via `Drop`
+        /// when replaced) stay valid until their replacements are confirmed
+        /// open.
         fn reopen(&mut self) -> io::Result<()> {
-            self.scm = open_scm()?;
-            self.service = open_handle(&self.scm, &self.name)?;
+            let scm = open_scm()?;
+            let service = open_handle(&scm, &self.name)?;
+            self.scm = Some(scm);
+            self.service = Some(service);
             Ok(())
+        }
+
+        /// The open service handle, or an error once this actor has gone
+        /// inert: an expired wait closes both handles there and then (see
+        /// [`Self::close_and_drain`]), so a later call reports that instead
+        /// of panicking on a `None`.
+        fn service(&self) -> io::Result<&Service> {
+            self.service.as_ref().ok_or_else(|| {
+                io::Error::other("the SCM handles were closed when this wait expired; the actor cannot be reused")
+            })
+        }
+
+        /// The bounded wait ran out. Close and drain *here*, while the boxes
+        /// are provably alive and this is still the one place that knows a
+        /// registration is outstanding which no further wait will consume.
+        /// `registration_outstanding` stays true — nothing consumed this arm.
+        fn expire(&mut self) -> io::Result<Option<Observed>> {
+            self.close_and_drain();
+            Ok(None)
+        }
+
+        /// Close both handles, THEN drain a notification the SCM may already
+        /// have queued.
+        ///
+        /// An `arm()` that immediate-fired (the service already matched the
+        /// requested mask at the moment of the call) queues an APC to THIS
+        /// thread regardless of what happens next, and closing the handles
+        /// only stops *future* notifications from being queued (per
+        /// `NotifyServiceStatusChangeW`'s documented remarks) — it does not
+        /// un-queue one already pending. Left undrained — a
+        /// `control_stop`/`start` that errored before the wait ever ran, or a
+        /// wait that expired before the APC arrived — it fires later, on some
+        /// unrelated alertable wait elsewhere in the process, against the
+        /// `LastStatus`/`SERVICE_NOTIFY_2W` boxes this actor is about to
+        /// free: memory corruption, and a `fired` flag set on whatever
+        /// occupies that address by then.
+        ///
+        /// Closing first is what makes the drain final. Draining first leaves
+        /// a window in which the SCM can queue a fresh notification between
+        /// the drain returning and the handle closing — and on the expiry
+        /// path, where the APC has usually not been queued yet, that window
+        /// is the likely case, not the unlikely one.
+        fn close_and_drain(&mut self) {
+            drop(self.service.take());
+            drop(self.scm.take());
+            if self.registration_outstanding {
+                // SAFETY: a zero-duration alertable wait; no pointers
+                // involved. `self.status`/`self.notify` are alive at both
+                // call sites — `Drop::drop`'s body runs before any field is
+                // dropped.
+                unsafe { SleepEx(0, 1) };
+            }
         }
     }
 
@@ -316,25 +372,7 @@ pub mod system {
 
     impl Drop for SystemScmActor {
         fn drop(&mut self) {
-            // An `arm()` that immediate-fired (the service already matched
-            // the requested mask at the moment of the call) queues an APC to
-            // THIS thread regardless of what happens next — closing the
-            // service handle only stops *future* notifications from being
-            // queued (per `NotifyServiceStatusChangeW`'s documented
-            // remarks), it does not un-queue one already pending. If a later
-            // step (`control_stop`/`start`) then errors before
-            // `wait_callback`'s own alertable wait ever runs and drains it,
-            // that APC is still outstanding — and would otherwise fire
-            // later, on some future alertable wait elsewhere in the process,
-            // against the `LastStatus`/`SERVICE_NOTIFY_2W` boxes this drop
-            // is about to free. Drain it here, while they are still valid.
-            if self.registration_outstanding {
-                // SAFETY: a zero-duration alertable wait; no pointers
-                // involved. `self.status`/`self.notify` are still live at
-                // this point in `drop` (Rust drops fields only after this
-                // method returns).
-                unsafe { SleepEx(0, 1) };
-            }
+            self.close_and_drain();
         }
     }
 
@@ -357,14 +395,14 @@ pub mod system {
                 if deadline.expired() {
                     return Ok(Waited::Expired);
                 }
-                // SAFETY: `self.service.raw_handle()` was opened with
+                // SAFETY: `self.service()?.raw_handle()` was opened with
                 // `SERVICE_QUERY_STATUS` access (required by this API);
                 // `self.notify` is heap-pinned and outlives every wait this
                 // arm can precede.
-                let rc = unsafe { NotifyServiceStatusChangeW(self.service.raw_handle(), mask, &*self.notify) };
+                let rc = unsafe { NotifyServiceStatusChangeW(self.service()?.raw_handle(), mask, &*self.notify) };
                 if rc == 0 {
                     // A notification may now be queued (immediately, if the
-                    // service already matched `mask`) — see `Drop`.
+                    // service already matched `mask`) — see `close_and_drain`.
                     self.registration_outstanding = true;
                     return Ok(Waited::Confirmed);
                 }
@@ -379,9 +417,9 @@ pub mod system {
 
         fn control_stop(&mut self) -> io::Result<()> {
             let mut status = SERVICE_STATUS::default();
-            // SAFETY: `self.service.raw_handle()` was opened with
+            // SAFETY: `self.service()?.raw_handle()` was opened with
             // `SERVICE_STOP` access; `status` is a valid, aligned out-param.
-            let ok = unsafe { ControlService(self.service.raw_handle(), SERVICE_CONTROL_STOP, &mut status) };
+            let ok = unsafe { ControlService(self.service()?.raw_handle(), SERVICE_CONTROL_STOP, &mut status) };
             if ok != 0 {
                 return Ok(());
             }
@@ -398,7 +436,7 @@ pub mod system {
 
         fn start(&mut self) -> io::Result<()> {
             self.started = true;
-            match self.service.start::<&std::ffi::OsStr>(&[]) {
+            match self.service()?.start::<&std::ffi::OsStr>(&[]) {
                 Ok(()) => Ok(()),
                 // Per [MS-SCMR]'s `RStartServiceW` error table, 1056 means
                 // only "`dwCurrentState` is not `SERVICE_STOPPED`", which
@@ -426,7 +464,7 @@ pub mod system {
                 Err(windows_service::Error::Winapi(e))
                     if e.raw_os_error() == Some(ERROR_SERVICE_ALREADY_RUNNING as i32) =>
                 {
-                    match self.service.query_status() {
+                    match self.service()?.query_status() {
                         Ok(status)
                             if matches!(status.current_state, ServiceState::Running | ServiceState::StartPending) =>
                         {
@@ -458,7 +496,7 @@ pub mod system {
                 // a loop is the 100%-CPU poll this module exists to avoid.
                 let remaining = deadline.remaining_millis_capped();
                 if remaining == Some(0) {
-                    return Ok(None);
+                    return self.expire();
                 }
                 // SAFETY: `SleepEx` takes no pointers; `1` (`TRUE`) makes it
                 // alertable, which is the entire point of this wait.
@@ -472,13 +510,13 @@ pub mod system {
                     // `SleepEx`'s only other return: the interval elapsed
                     // with nothing delivered. `registration_outstanding`
                     // stays true — nothing consumed this arm.
-                    return Ok(None);
+                    return self.expire();
                 }
                 // An unrelated APC woke us; re-enter on what is left.
             }
             // The APC that `arm()` may have queued has now been delivered
             // and processed (that is what set `fired`) — nothing from this
-            // registration remains outstanding. See `Drop`.
+            // registration remains outstanding. See `close_and_drain`.
             self.registration_outstanding = false;
             let state = self.status.current_state.load(Ordering::Acquire);
             Ok(Some(if state == SERVICE_RUNNING {
