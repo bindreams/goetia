@@ -357,3 +357,73 @@ fn no_other_queried_state_recovers_an_already_running_start() {
         );
     }
 }
+
+// the lagging-registration (1294) retry loop --------------------------------------------------------------------------
+
+/// Replays `NotifyServiceStatusChangeW` return codes for
+/// [`register_until_deadline`], recording each step in call order.
+struct FakeRegistrar {
+    log: Vec<&'static str>,
+    /// Codes for the first `register` calls, front to back.
+    codes: VecDeque<u32>,
+    /// What every `register` past `codes` returns. Lagging forever is how a
+    /// test scripts an SCM that never stops answering 1294.
+    forever: u32,
+}
+
+impl FakeRegistrar {
+    fn new<const N: usize>(codes: [u32; N], forever: u32) -> Self {
+        Self {
+            log: vec![],
+            codes: codes.into(),
+            forever,
+        }
+    }
+}
+
+impl NotifyRegistrar for FakeRegistrar {
+    fn register(&mut self) -> std::io::Result<u32> {
+        self.log.push("register");
+        Ok(self.codes.pop_front().unwrap_or(self.forever))
+    }
+    fn reopen(&mut self) -> std::io::Result<()> {
+        self.log.push("reopen");
+        Ok(())
+    }
+}
+
+#[skuld::test]
+fn a_registrar_that_keeps_lagging_returns_expired_instead_of_looping() {
+    // The 1294 remedy re-enters the loop, so the deadline is the only thing
+    // that can end it — there is deliberately no retry counter. Remove the
+    // `deadline.expired()` check and this test does not fail, it HANGS, so
+    // prove it bites under
+    // `python3 .github/scripts/run-with-timeout.py 120 cargo test <name>`
+    // and expect exit 124.
+    let mut fake = FakeRegistrar::new([], ERROR_SERVICE_NOTIFY_CLIENT_LAGGING);
+    assert_eq!(register_until_deadline(&mut fake, spent()).unwrap(), Waited::Expired);
+    // The check sits at the TOP of the loop, so a deadline that is already
+    // spent does not even attempt a registration.
+    assert!(fake.log.is_empty());
+}
+
+#[skuld::test]
+fn a_lagging_registration_reopens_the_handles_and_arms_again() {
+    // The documented 1294 remedy, and the only path that re-enters the loop.
+    let mut fake = FakeRegistrar::new([ERROR_SERVICE_NOTIFY_CLIENT_LAGGING], 0);
+    assert_eq!(
+        register_until_deadline(&mut fake, unbounded()).unwrap(),
+        Waited::Confirmed
+    );
+    assert_eq!(fake.log, vec!["register", "reopen", "register"]);
+}
+
+#[skuld::test]
+fn a_registration_error_that_is_not_lagging_is_reported_not_retried() {
+    // Anything other than 0 or 1294 is the SCM's own failure: report it
+    // rather than reopening handles in a loop that cannot help.
+    let mut fake = FakeRegistrar::new([], 5); // ERROR_ACCESS_DENIED
+    let err = register_until_deadline(&mut fake, unbounded()).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(5));
+    assert_eq!(fake.log, vec!["register"]);
+}

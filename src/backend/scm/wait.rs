@@ -238,6 +238,44 @@ pub fn already_running_is_recoverable(queried: QueriedState) -> bool {
     matches!(queried, QueriedState::Running | QueriedState::StartPending)
 }
 
+/// `NotifyServiceStatusChangeW`'s "you are too far behind" return. Not among
+/// `windows-sys`'s `Foundation` exports, so it is spelled out.
+pub const ERROR_SERVICE_NOTIFY_CLIENT_LAGGING: u32 = 1294;
+
+/// The two steps [`register_until_deadline`] drives: one attempt to register
+/// the notification, and the lag remedy. Behind a trait so that the loop's
+/// bound — the thing that is easy to lose — is assertable off Windows.
+pub trait NotifyRegistrar {
+    /// Register the notification, reporting `NotifyServiceStatusChangeW`'s
+    /// raw return code (`0` on success).
+    fn register(&mut self) -> io::Result<u32>;
+    /// `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING`'s documented remedy: "close the
+    /// handle to the SCM, open a new handle, and call this function again".
+    fn reopen(&mut self) -> io::Result<()>;
+}
+
+/// Register the notification, following the lag remedy for as long as
+/// `deadline` allows.
+///
+/// This is the one loop in this module that is not the wait itself, and it
+/// sits inside an operation the caller bounded — a lagging SCM would
+/// otherwise make `--timeout 5s` block forever. The deadline is checked at
+/// the TOP of every iteration, including the first, and is the only thing
+/// that ends the loop: deliberately not a retry counter, which would be a
+/// bound nobody asked for, where this one the caller did ask for.
+pub fn register_until_deadline<R: NotifyRegistrar>(r: &mut R, deadline: Deadline) -> io::Result<Waited> {
+    loop {
+        if deadline.expired() {
+            return Ok(Waited::Expired);
+        }
+        match r.register()? {
+            0 => return Ok(Waited::Confirmed),
+            ERROR_SERVICE_NOTIFY_CLIENT_LAGGING => r.reopen()?, // re-arm against the fresh handle
+            rc => return Err(io::Error::from_raw_os_error(rc as i32)),
+        }
+    }
+}
+
 // system ==============================================================================================================
 
 #[cfg(windows)]
@@ -350,8 +388,8 @@ pub mod system {
     /// [`Self::close_and_drain`] can close them *before* it drains — see
     /// there for why that order is the whole point.
     ///
-    /// Owning the SCM connection (rather than borrowing the caller's) is
-    /// what makes [`Self::reopen`] able to follow `NotifyServiceStatusChangeW`'s
+    /// Owning the SCM connection (rather than borrowing the caller's) is what
+    /// makes [`super::NotifyRegistrar::reopen`] able to follow `NotifyServiceStatusChangeW`'s
     /// documented `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING` remedy exactly: "close
     /// the handle to the SCM, open a new handle, and call this function
     /// again" — the lag condition is tracked against the SCM connection, not
@@ -391,20 +429,6 @@ pub mod system {
                 started: false,
                 registration_outstanding: false,
             })
-        }
-
-        /// Reopen both handles. Used on `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING`
-        /// — see the struct's own doc comment for why the SCM handle, not
-        /// only the service handle, must be replaced. Assigning both only
-        /// after both opens succeed means the old handles (closed via `Drop`
-        /// when replaced) stay valid until their replacements are confirmed
-        /// open.
-        fn reopen(&mut self) -> io::Result<()> {
-            let scm = open_scm()?;
-            let service = open_handle(&scm, &self.name)?;
-            self.scm = Some(scm);
-            self.service = Some(service);
-            Ok(())
         }
 
         /// The open service handle, or an error once this actor has gone
@@ -471,6 +495,32 @@ pub mod system {
         }
     }
 
+    /// The two steps [`super::register_until_deadline`] puts under the
+    /// caller's deadline.
+    impl super::NotifyRegistrar for SystemScmActor {
+        fn register(&mut self) -> io::Result<u32> {
+            let mask = want_to_mask(self.awaiting, self.started);
+            // SAFETY: `self.service()?.raw_handle()` was opened with
+            // `SERVICE_QUERY_STATUS` access (required by this API);
+            // `self.notify` is heap-pinned and outlives every wait the arm
+            // it registers can precede.
+            Ok(unsafe { NotifyServiceStatusChangeW(self.service()?.raw_handle(), mask, &*self.notify) })
+        }
+
+        /// Reopen both handles — see the struct's own doc comment for why the
+        /// SCM handle, not only the service handle, must be replaced.
+        /// Assigning both only after both opens succeed means the old handles
+        /// (closed via `Drop` when replaced) stay valid until their
+        /// replacements are confirmed open.
+        fn reopen(&mut self) -> io::Result<()> {
+            let scm = open_scm()?;
+            let service = open_handle(&scm, &self.name)?;
+            self.scm = Some(scm);
+            self.service = Some(service);
+            Ok(())
+        }
+    }
+
     impl super::ScmActor for SystemScmActor {
         fn arm(&mut self, want: WantState, deadline: Deadline) -> io::Result<Waited> {
             self.awaiting = want;
@@ -481,33 +531,13 @@ pub mod system {
                 pContext: (&mut *self.status as *mut LastStatus) as *mut c_void,
                 ..Default::default()
             };
-            let mask = want_to_mask(want, self.started);
-            loop {
-                // The 1294 remedy below re-enters this loop, inside an
-                // operation the caller bounded — so the deadline is what
-                // ends it. Not a retry count: a count is a bound nobody
-                // asked for, and this one the caller did ask for.
-                if deadline.expired() {
-                    return Ok(Waited::Expired);
-                }
-                // SAFETY: `self.service()?.raw_handle()` was opened with
-                // `SERVICE_QUERY_STATUS` access (required by this API);
-                // `self.notify` is heap-pinned and outlives every wait this
-                // arm can precede.
-                let rc = unsafe { NotifyServiceStatusChangeW(self.service()?.raw_handle(), mask, &*self.notify) };
-                if rc == 0 {
-                    // A notification may now be queued (immediately, if the
-                    // service already matched `mask`) — see `close_and_drain`.
-                    self.registration_outstanding = true;
-                    return Ok(Waited::Confirmed);
-                }
-                const ERROR_SERVICE_NOTIFY_CLIENT_LAGGING: u32 = 1294;
-                if rc == ERROR_SERVICE_NOTIFY_CLIENT_LAGGING {
-                    self.reopen()?;
-                    continue; // re-arm against the fresh handle
-                }
-                return Err(io::Error::from_raw_os_error(rc as i32));
+            let waited = super::register_until_deadline(self, deadline)?;
+            if waited == Waited::Confirmed {
+                // A notification may now be queued (immediately, if the
+                // service already matched the mask) — see `close_then_drain`.
+                self.registration_outstanding = true;
             }
+            Ok(waited)
         }
 
         fn control_stop(&mut self) -> io::Result<()> {
