@@ -19,6 +19,8 @@
 
 use std::io;
 
+use crate::manager::budget::Deadline;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WantState {
     Stopped,
@@ -39,6 +41,15 @@ pub enum Observed {
     Pending,
 }
 
+/// Whether a wait reached the state it was waiting for, or ran out of
+/// [`Deadline`] first. An expiry is not an error: the request was issued and
+/// the service may yet arrive, so what to say about it is the caller's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Waited {
+    Confirmed,
+    Expired,
+}
+
 /// The granular SCM operations [`stop_via_notify`]/[`start_via_notify`] need,
 /// isolated so the ordering can be unit-tested with a fake rather than a real
 /// service.
@@ -46,51 +57,99 @@ pub trait ScmActor {
     /// Register a status-change notification for `want`.
     /// `NotifyServiceStatusChangeW` is single-shot, so the sequence re-arms
     /// after every non-terminal callback.
-    fn arm(&mut self, want: WantState) -> io::Result<()>;
+    ///
+    /// `deadline` bounds the one loop here that is not the wait itself: the
+    /// `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING` remedy, which reopens both
+    /// handles and arms again. `Waited::Expired` iff the deadline ran out
+    /// while the SCM kept answering that.
+    fn arm(&mut self, want: WantState, deadline: Deadline) -> io::Result<Waited>;
+    /// Takes no deadline, as [`Self::start`] does not: each is a single
+    /// non-looping call into the SCM, so there is no iteration to bound, and
+    /// what blocking they do is the SCM's own — not a wait this module
+    /// created, and not one it can bound from the client side.
     fn control_stop(&mut self) -> io::Result<()>;
     fn start(&mut self) -> io::Result<()>;
-    /// Block in an alertable wait until the armed notification fires; return
-    /// the service's observed state from the callback buffer.
-    fn wait_callback(&mut self) -> io::Result<Observed>;
+    /// Block in an alertable wait until the armed notification fires and
+    /// return the service's observed state from the callback buffer;
+    /// `Ok(None)` iff `deadline` expired with nothing delivered.
+    fn wait_callback(&mut self, deadline: Deadline) -> io::Result<Option<Observed>>;
 }
 
 /// Stop the service, gated strictly on a real `STOPPED` callback from
 /// `NotifyServiceStatusChangeW`; re-arms after a non-terminal (pending)
-/// callback.
-pub fn stop_via_notify<A: ScmActor>(a: &mut A) -> io::Result<()> {
-    a.arm(WantState::Stopped)?;
+/// callback, under the same `deadline` throughout.
+pub fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
+    let armed = a.arm(WantState::Stopped, deadline)?;
+    // Issued even when the arm expired: only the *waiting* is bounded.
     a.control_stop()?;
+    if armed == Waited::Expired {
+        return Ok(Waited::Expired);
+    }
     loop {
-        match a.wait_callback()? {
-            Observed::Stopped => return Ok(()),
+        match a.wait_callback(deadline)? {
+            None => return Ok(Waited::Expired),
+            Some(Observed::Stopped) => return Ok(Waited::Confirmed),
             // Running/Pending are non-terminal for a stop wait — re-arm and wait.
-            Observed::Running | Observed::Pending => a.arm(WantState::Stopped)?,
+            Some(Observed::Running | Observed::Pending) => {
+                if a.arm(WantState::Stopped, deadline)? == Waited::Expired {
+                    return Ok(Waited::Expired);
+                }
+            }
         }
     }
 }
 
 /// Start the service, gated strictly on a real `RUNNING` callback; re-arms
-/// after a non-terminal callback.
+/// after a non-terminal callback, under the same `deadline` throughout —
+/// which is what makes a service that chatters `START_PENDING` forever
+/// terminate at the caller's budget instead of never.
 ///
 /// Critical ordering: arm `RUNNING` strictly BEFORE issuing `start`, else the
 /// service can reach `RUNNING` before the arm and the notification only
 /// fires on the *next* entry into `RUNNING` — a hang.
-pub fn start_via_notify<A: ScmActor>(a: &mut A) -> io::Result<()> {
-    a.arm(WantState::Running)?;
+pub fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
+    let armed = a.arm(WantState::Running, deadline)?;
+    // Issued even when the arm expired: only the *waiting* is bounded, and a
+    // service left unstarted because goetia ran out of budget while arming
+    // would be the worst of both answers.
     a.start()?;
+    if armed == Waited::Expired {
+        return Ok(Waited::Expired);
+    }
     loop {
-        match a.wait_callback()? {
-            Observed::Running => return Ok(()),
+        match a.wait_callback(deadline)? {
+            None => return Ok(Waited::Expired),
+            Some(Observed::Running) => return Ok(Waited::Confirmed),
             // A terminal Stopped means the service stopped instead of
-            // reaching Running — a failed start.
-            Observed::Stopped => {
+            // reaching Running — a failed start, not an expiry.
+            Some(Observed::Stopped) => {
                 return Err(io::Error::other(
                     "service stopped before reaching Running (failed start)",
                 ));
             }
-            Observed::Pending => a.arm(WantState::Running)?,
+            Some(Observed::Pending) => {
+                if a.arm(WantState::Running, deadline)? == Waited::Expired {
+                    return Ok(Waited::Expired);
+                }
+            }
         }
     }
+}
+
+/// Issue the start request and return, waiting for nothing — the
+/// `Budget::Immediate` path, where the caller has no budget to watch the
+/// service with. A named function rather than a bare [`ScmActor::start`] at
+/// the call site so that what happens when we do *not* wait is covered by
+/// the same fake-actor tests as everything else.
+#[allow(dead_code)] // no caller on Windows either, until the manager's verbs take a `Budget`
+pub fn request_start<A: ScmActor>(a: &mut A) -> io::Result<()> {
+    a.start()
+}
+
+/// [`request_start`]'s mirror: issue the stop control and return.
+#[allow(dead_code)] // no caller on Windows either, until the manager's verbs take a `Budget`
+pub fn request_stop<A: ScmActor>(a: &mut A) -> io::Result<()> {
+    a.control_stop()
 }
 
 // system ==============================================================================================================
@@ -108,15 +167,15 @@ pub mod system {
 
     use windows_service::service::{Service, ServiceAccess};
     use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
-    use windows_sys::Win32::Foundation::{ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_NOT_ACTIVE};
+    use windows_sys::Win32::Foundation::{ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_NOT_ACTIVE, WAIT_IO_COMPLETION};
     use windows_sys::Win32::System::Services::{
         ControlService, NotifyServiceStatusChangeW, SERVICE_CONTROL_STOP, SERVICE_NOTIFY, SERVICE_NOTIFY_2W,
         SERVICE_NOTIFY_RUNNING, SERVICE_NOTIFY_START_PENDING, SERVICE_NOTIFY_STATUS_CHANGE,
         SERVICE_NOTIFY_STOP_PENDING, SERVICE_NOTIFY_STOPPED, SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STOPPED,
     };
-    use windows_sys::Win32::System::Threading::SleepEx;
+    use windows_sys::Win32::System::Threading::{INFINITE, SleepEx};
 
-    use super::{Observed, WantState};
+    use super::{Deadline, Observed, Waited, WantState};
 
     /// `windows-service`'s `Error` does not implement `Into<io::Error>` for
     /// every variant (it also carries parse errors this module never
@@ -280,7 +339,7 @@ pub mod system {
     }
 
     impl super::ScmActor for SystemScmActor {
-        fn arm(&mut self, want: WantState) -> io::Result<()> {
+        fn arm(&mut self, want: WantState, deadline: Deadline) -> io::Result<Waited> {
             self.awaiting = want;
             self.status.fired.store(false, Ordering::Release);
             *self.notify = SERVICE_NOTIFY_2W {
@@ -291,6 +350,13 @@ pub mod system {
             };
             let mask = want_to_mask(want, self.started);
             loop {
+                // The 1294 remedy below re-enters this loop, inside an
+                // operation the caller bounded — so the deadline is what
+                // ends it. Not a retry count: a count is a bound nobody
+                // asked for, and this one the caller did ask for.
+                if deadline.expired() {
+                    return Ok(Waited::Expired);
+                }
                 // SAFETY: `self.service.raw_handle()` was opened with
                 // `SERVICE_QUERY_STATUS` access (required by this API);
                 // `self.notify` is heap-pinned and outlives every wait this
@@ -300,7 +366,7 @@ pub mod system {
                     // A notification may now be queued (immediately, if the
                     // service already matched `mask`) — see `Drop`.
                     self.registration_outstanding = true;
-                    return Ok(());
+                    return Ok(Waited::Confirmed);
                 }
                 const ERROR_SERVICE_NOTIFY_CLIENT_LAGGING: u32 = 1294;
                 if rc == ERROR_SERVICE_NOTIFY_CLIENT_LAGGING {
@@ -360,27 +426,50 @@ pub mod system {
             }
         }
 
-        fn wait_callback(&mut self) -> io::Result<Observed> {
+        fn wait_callback(&mut self, deadline: Deadline) -> io::Result<Option<Observed>> {
             // Alertable wait: blocks until the SCM delivers the notify APC,
-            // which runs `notify_callback` and sets `status.fired`. A
-            // spurious early wake (an unrelated APC) re-enters the wait.
-            while !self.status.fired.load(Ordering::Acquire) {
-                // SAFETY: `SleepEx` takes no pointers; `true` (`TRUE`) makes
-                // it alertable, which is the entire point of this wait.
-                unsafe { SleepEx(u32::MAX, 1) };
+            // which runs `notify_callback` and sets `status.fired`, or until
+            // the deadline. Still a kernel rendezvous, not MSDN's
+            // `Sleep(dwWaitHint/10)` poll: nothing is re-*asked*, and the
+            // bound is the human-facing one the caller set.
+            loop {
+                // `None` is unbounded — `INFINITE`, exactly as before there
+                // was a deadline. `Some(0)` can only mean an already-spent
+                // deadline, because `remaining_millis_capped` rounds up: a
+                // live deadline never converts to zero, and `SleepEx(0)` in
+                // a loop is the 100%-CPU poll this module exists to avoid.
+                let remaining = deadline.remaining_millis_capped();
+                if remaining == Some(0) {
+                    return Ok(None);
+                }
+                // SAFETY: `SleepEx` takes no pointers; `1` (`TRUE`) makes it
+                // alertable, which is the entire point of this wait.
+                let rc = unsafe { SleepEx(remaining.unwrap_or(INFINITE), 1) };
+                if self.status.fired.load(Ordering::Acquire) {
+                    // The notify APC ran — whether or not the interval also
+                    // elapsed on the way out, the state was delivered.
+                    break;
+                }
+                if rc != WAIT_IO_COMPLETION {
+                    // `SleepEx`'s only other return: the interval elapsed
+                    // with nothing delivered. `registration_outstanding`
+                    // stays true — nothing consumed this arm.
+                    return Ok(None);
+                }
+                // An unrelated APC woke us; re-enter on what is left.
             }
             // The APC that `arm()` may have queued has now been delivered
             // and processed (that is what set `fired`) — nothing from this
             // registration remains outstanding. See `Drop`.
             self.registration_outstanding = false;
             let state = self.status.current_state.load(Ordering::Acquire);
-            Ok(if state == SERVICE_RUNNING {
+            Ok(Some(if state == SERVICE_RUNNING {
                 Observed::Running
             } else if state == SERVICE_STOPPED {
                 Observed::Stopped
             } else {
                 Observed::Pending
-            })
+            }))
         }
     }
 }

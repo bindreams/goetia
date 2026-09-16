@@ -107,7 +107,7 @@ use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, S
 use crate::blob::Blob;
 use crate::decide::{self, Outcome, Ownership};
 use crate::error::{Error, Result};
-use crate::manager::{Installed, ServiceManager, State, Status};
+use crate::manager::{Budget, Installed, ServiceManager, State, Status};
 use crate::spec::{DaemonSpec, Id, Kind};
 
 // ScmManager ==========================================================================================================
@@ -195,7 +195,8 @@ impl ServiceManager for ScmManager {
         drop(service);
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to start it: {e}")))?;
-        super::wait::start_via_notify(&mut actor).map_err(|e| Error::Other(format!("start `{id}`: {e}")))
+        confirm(super::wait::start_via_notify(&mut actor, Budget::Unbounded.start()))
+            .map_err(|e| Error::Other(format!("start `{id}`: {e}")))
     }
 
     fn stop(&self, id: &Id) -> Result<()> {
@@ -204,7 +205,8 @@ impl ServiceManager for ScmManager {
         drop(service);
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to stop it: {e}")))?;
-        super::wait::stop_via_notify(&mut actor).map_err(|e| Error::Other(format!("stop `{id}`: {e}")))
+        confirm(super::wait::stop_via_notify(&mut actor, Budget::Unbounded.start()))
+            .map_err(|e| Error::Other(format!("stop `{id}`: {e}")))
     }
 
     fn status(&self, id: &Id) -> Result<Status> {
@@ -844,7 +846,7 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
     if needs_stop {
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to stop it before uninstall: {e}")))?;
-        super::wait::stop_via_notify(&mut actor).map_err(|e| {
+        confirm(super::wait::stop_via_notify(&mut actor, Budget::Unbounded.start())).map_err(|e| {
             Error::Other(format!(
                 "`{id}` did not confirm SERVICE_STOPPED before uninstall ({e}); it was NOT deleted — \
                  DeleteService on a running service only marks it for deletion, which the next install would \
@@ -867,6 +869,18 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
 }
 
 // shared helpers ======================================================================================================
+
+/// Collapse a wait's outcome into the one `Result<_, String>` each call site
+/// already reports through, so a `Waited::Expired` cannot reach a caller as
+/// anything but a failure to confirm. Unreachable today — every wait here
+/// passes [`Budget::Unbounded`], since this trait carries no budget yet.
+fn confirm(outcome: std::io::Result<super::wait::Waited>) -> std::result::Result<(), String> {
+    match outcome {
+        Ok(super::wait::Waited::Confirmed) => Ok(()),
+        Ok(super::wait::Waited::Expired) => Err("the wait expired before the SCM confirmed the state".to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
 
 fn open_scm(access: ServiceManagerAccess) -> Result<WinServiceManager> {
     WinServiceManager::local_computer(None::<&str>, access).map_err(|e| to_error("open the Service Control Manager", e))
