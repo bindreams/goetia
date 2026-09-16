@@ -132,6 +132,25 @@ pub enum Error {
         recovery: String,
     },
 
+    /// Steps goetia issued whose outcome nobody established. Produced only
+    /// by `cli::restart` under a budget that does not wait, where the stop
+    /// was issued without confirmation and the start that followed was
+    /// refused — SCM's `ERROR_SERVICE_ALREADY_RUNNING` over a service still
+    /// coming down is the shape. The daemon may be running the instance the
+    /// stop is still taking down, may be going down, or may never have
+    /// moved, and goetia proved none of the three.
+    ///
+    /// Not [`Other`](Error::Other), which is exit `1` and says the operation
+    /// determinately failed — the one thing a refusal in that window did not
+    /// establish. Not [`WaitTimeout`](Error::WaitTimeout): nothing waited.
+    /// Not [`Undetermined`](Error::Undetermined): what is installed at the
+    /// id was never in doubt.
+    ///
+    /// Exit `4` (indeterminate), like the two above: the code is about
+    /// whether the question was answered, and this one was not.
+    #[error("`{id}` may or may not have restarted: {detail}")]
+    Unestablished { id: String, detail: String },
+
     /// A mutating CLI subcommand was invoked without the elevation
     /// (root/Administrator) it requires. Never returned for `list`,
     /// `status`, `show`, `diff`, or `install --dry-run`, none of which

@@ -32,6 +32,7 @@ pub mod status;
 pub mod stop;
 mod support;
 pub mod uninstall;
+pub mod wait;
 
 use std::io::Write;
 

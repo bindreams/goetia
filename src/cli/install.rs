@@ -7,10 +7,11 @@ use clap::Args as ClapArgs;
 
 use super::report;
 use super::support::{load_and_warn, require_elevation, select_by_ids};
+use super::wait::WaitArgs;
 use crate::backend::Identity;
 use crate::decide::Outcome;
 use crate::error::{Error, Result};
-use crate::manager::{Budget, ServiceManager};
+use crate::manager::ServiceManager;
 use crate::spec::{AccountId, DaemonSpec, Id, User};
 
 #[derive(ClapArgs, Debug)]
@@ -34,6 +35,11 @@ pub struct Args {
     /// design notes on why.
     #[arg(long = "dry-run")]
     pub dry_run: bool,
+    /// Bounds the `--start` above and nothing else. Without `--start` there
+    /// is nothing to wait for, which `dispatch` refuses at exit `2`; under
+    /// `--dry-run` these are inert exactly as `--start` itself is.
+    #[command(flatten)]
+    pub wait: WaitArgs,
 }
 
 pub fn run(
@@ -113,7 +119,7 @@ pub fn run(
                     }
                 }
                 if args.start {
-                    if let Err(e) = mgr.start(&spec.id, Budget::DEFAULT) {
+                    if let Err(e) = mgr.start(&spec.id, args.wait.budget()) {
                         let _ = writeln!(err, "error: {}: start: {e}", spec.id);
                         codes.push(failure_code(&e));
                     }

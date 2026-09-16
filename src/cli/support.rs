@@ -228,6 +228,10 @@ pub(crate) struct IdVerbCall<'a> {
     pub get_manager: &'a dyn Fn() -> Result<Box<dyn ServiceManager>>,
     pub is_elevated: &'a dyn Fn() -> bool,
     pub verb: &'a dyn Fn(&dyn ServiceManager, &Id) -> Result<()>,
+    /// The word printed after an id that succeeded. Supplied by the caller
+    /// because it follows the budget: a verb that waited confirmed something
+    /// and reports `started`, while one that did not reports
+    /// `start requested` — see [`super::wait::reported`].
     pub verb_past_tense: &'a str,
     /// Whether an absent *artifact* already satisfies this verb's goal.
     /// True for `uninstall` alone; every other id-verb keeps `Error::
@@ -327,6 +331,14 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
             // determinately failed, and the request was never cancelled, so
             // that is exactly what was not established.
             Err(e @ Error::WaitTimeout { .. }) => {
+                let _ = writeln!(err, "error: {id}: {e}");
+                codes.push(4);
+            }
+            // Steps that were issued and whose outcome nobody established —
+            // `restart` with no budget, whose start leg was refused. The same
+            // class again, and again a different condition: here both steps
+            // ran and neither confirmed anything.
+            Err(e @ Error::Unestablished { .. }) => {
                 let _ = writeln!(err, "error: {id}: {e}");
                 codes.push(4);
             }

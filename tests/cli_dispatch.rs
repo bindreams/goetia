@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use clap::Parser as _;
-use goetia::cli::{self, Cli};
+use goetia::cli::{self, Cli, Command, DaemonCommand};
 use goetia::manager::fake::Fake;
 use goetia::manager::{Budget, Installed, ServiceManager, State, Status};
 use goetia::spec::{DaemonSpec, Id, Kind, Restart, User};
@@ -219,6 +219,12 @@ struct FlakyManager {
     /// no `install`-path fixture has, so injecting it is the only way to
     /// put it in front of `run_id_verb` and `install`'s own classifier.
     wait_timeout_start_for: Option<String>,
+    /// `start` is refused because the service is not stopped — SCM's
+    /// `ERROR_SERVICE_ALREADY_RUNNING` (1056) over a service still coming
+    /// down. The shape `restart --timeout 0` meets after issuing a stop it
+    /// did not confirm, and the one `Fake` cannot produce: its own `start`
+    /// is idempotent and never refuses.
+    reject_start_for: Option<String>,
     /// Makes `install`/`preview_install` return the `Conflict` flavour whose
     /// cause lies outside the directory the backend writes — systemd's
     /// `<id>.service.d` under `/usr/lib` or `.control`. `Fake` has no
@@ -243,6 +249,15 @@ fn unqueryable_failure() -> goetia::Error {
 /// not a look-alike that could drift from it.
 fn injected_wait_timeout(id: &Id) -> goetia::Error {
     goetia::manager::budget::timed_out(id.as_str(), "running", goetia::manager::Budget::DEFAULT)
+}
+
+/// A `start` step that was issued and refused. `Error::Other` is what a backend reports for it —
+/// the step failed, and nothing about the id's *installation* is in doubt.
+fn injected_start_rejection(id: &Id) -> goetia::Error {
+    goetia::Error::Other(format!(
+        "start `{id}`: StartServiceW reported ERROR_SERVICE_ALREADY_RUNNING, but the service is \
+         actually STOP_PENDING (injected test failure)"
+    ))
 }
 
 fn injected_failure(id: &Id) -> goetia::Error {
@@ -313,6 +328,9 @@ impl ServiceManager for FlakyManager {
         }
         if self.wait_timeout_start_for.as_deref() == Some(id.as_str()) {
             return Err(injected_wait_timeout(id));
+        }
+        if self.reject_start_for.as_deref() == Some(id.as_str()) {
+            return Err(injected_start_rejection(id));
         }
         self.inner.start(id, budget)
     }
@@ -2840,6 +2858,335 @@ fn install_error_beats_indeterminate_beats_conflict() {
 
     assert_eq!(two_code, 4, "indeterminate outranks conflict: {two_err}");
     assert_eq!(three_code, 1, "a refusal outranks both: {three_err}");
+}
+
+// --timeout / --no-timeout ============================================================================================
+
+/// The `Fake` with `status` made unreachable. `restart --timeout 0` must issue its two steps with
+/// no state read between them, and a read is invisible to `Fake::calls`, which records only
+/// `start`/`stop`.
+#[derive(Clone, Default)]
+struct PanicsOnStatus(Fake);
+
+impl ServiceManager for PanicsOnStatus {
+    fn install(&self, spec: &DaemonSpec, force: bool) -> goetia::Result<goetia::decide::Outcome> {
+        self.0.install(spec, force)
+    }
+    fn preview_install(&self, spec: &DaemonSpec) -> goetia::Result<goetia::decide::Outcome> {
+        self.0.preview_install(spec)
+    }
+    fn uninstall(&self, id: &Id) -> goetia::Result<()> {
+        self.0.uninstall(id)
+    }
+    fn enable(&self, id: &Id) -> goetia::Result<()> {
+        self.0.enable(id)
+    }
+    fn disable(&self, id: &Id) -> goetia::Result<()> {
+        self.0.disable(id)
+    }
+    fn start(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
+        self.0.start(id, budget)
+    }
+    fn stop(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
+        self.0.stop(id, budget)
+    }
+    fn status(&self, id: &Id) -> goetia::Result<Status> {
+        panic!("`restart` with no budget must not read state: status({id})")
+    }
+    fn list(&self) -> goetia::Result<Vec<Installed>> {
+        self.0.list()
+    }
+}
+
+#[skuld::test]
+fn start_that_times_out_exits_4_and_says_what_was_established() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_start_stalls("frpc");
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "start", "frpc", "--timeout", "5s"], &fake);
+
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.contains("did not report running"), "{err}");
+    assert!(
+        err.contains("stopped waiting"),
+        "goetia stopped waiting, it did not cancel: {err}"
+    );
+    assert!(err.contains("not cancelled"), "{err}");
+    assert!(
+        err.contains("goetia daemon status"),
+        "the way to find out is named: {err}"
+    );
+}
+
+#[skuld::test]
+fn start_with_timeout_zero_reports_requested_not_started() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "start", "frpc", "--timeout", "0"], &fake);
+
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        out, "frpc: start requested\n",
+        "nothing was confirmed, so nothing is claimed"
+    );
+}
+
+#[skuld::test]
+fn start_with_no_flag_waits_and_reports_started() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "start", "frpc"], &fake);
+
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "frpc: started\n");
+}
+
+#[skuld::test]
+fn no_timeout_is_accepted() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "start", "frpc", "--no-timeout"], &fake);
+
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "frpc: started\n");
+}
+
+#[skuld::test]
+fn stop_that_times_out_exits_4() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_stop_stalls("frpc");
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "stop", "frpc", "--timeout", "5s"], &fake);
+
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.contains("did not report stopped"), "{err}");
+}
+
+/// `cli::restart` re-wraps its start leg's error variant by variant. A flattened `WaitTimeout`
+/// becomes `Error::Other` and silently exits `1` — "the start determinately failed", which is the
+/// one thing an expiry did not establish.
+#[skuld::test]
+fn restart_whose_start_leg_times_out_exits_4_not_1() {
+    let inner = Fake::new();
+    inner.install(&mk("frpc"), false).unwrap();
+    let mgr = FlakyManager {
+        inner,
+        wait_timeout_start_for: Some("frpc".to_string()),
+        ..Default::default()
+    };
+
+    let (code, out, err) = dispatch_with(
+        &["goetia", "daemon", "restart", "frpc", "--timeout", "5s"],
+        &mgr,
+        &|| true,
+    );
+
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        err.contains("was stopped"),
+        "the context the wrap exists for survives it: {err}"
+    );
+    assert!(!out.contains("restarted"), "{out}");
+}
+
+/// The neighbouring behaviour, unchanged: a stop leg that determinately failed is still `1`, and
+/// naming a budget does not soften it.
+#[skuld::test]
+fn restart_that_never_stopped_still_exits_1() {
+    let fake = Fake::new();
+    fake.seed_foreign("stranger", "not a goetia artifact at all\n");
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "restart", "stranger", "--timeout", "5s"], &fake);
+
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(!out.contains("restart"), "{out}");
+}
+
+/// goetia does not start into an unconfirmed stop. Asserted on the **absence** of the start call:
+/// an implementation that issues it and then reports `4` passes an exit-code assertion alone.
+#[skuld::test]
+fn restart_does_not_start_after_a_stop_that_timed_out() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_stop_stalls("frpc");
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "restart", "frpc", "--timeout", "1s"], &fake);
+
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(
+        fake.calls(),
+        vec![("stop", "frpc".to_string())],
+        "the start leg must never be issued"
+    );
+    assert!(err.contains("restart was abandoned"), "{err}");
+    assert!(err.contains("no start was issued"), "{err}");
+    assert!(err.contains("may be left stopped"), "{err}");
+}
+
+/// "Don't wait, just do the steps": both steps issued, in order, with no confirmation and no state
+/// read between them.
+#[skuld::test]
+fn restart_with_no_budget_issues_both_steps_without_confirming() {
+    let mgr = PanicsOnStatus::default();
+    mgr.0.install(&mk("frpc"), false).unwrap();
+
+    let (code, out, err) = dispatch_with(
+        &["goetia", "daemon", "restart", "frpc", "--timeout", "0"],
+        &mgr,
+        &|| true,
+    );
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(
+        mgr.0.calls(),
+        vec![("stop", "frpc".to_string()), ("start", "frpc".to_string())]
+    );
+    assert_eq!(out, "frpc: restart requested\n");
+}
+
+/// The start step was issued and refused, so nothing was established — `4`, never `0`.
+/// `cli::restart` must not read the trait's idempotent `start` `Ok` as proof the service cycled,
+/// and must not read a refusal as proof that it did not.
+#[skuld::test]
+fn restart_with_no_budget_reports_a_rejected_start() {
+    let inner = Fake::new();
+    inner.install(&mk("frpc"), false).unwrap();
+    let mgr = FlakyManager {
+        inner,
+        reject_start_for: Some("frpc".to_string()),
+        ..Default::default()
+    };
+
+    let (code, out, err) = dispatch_with(
+        &["goetia", "daemon", "restart", "frpc", "--timeout", "0"],
+        &mgr,
+        &|| true,
+    );
+
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(out, "", "nothing may claim the daemon was restarted: {out}");
+    assert!(err.contains("frpc"), "{err}");
+}
+
+#[skuld::test]
+fn install_start_that_times_out_exits_4() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let fake = Fake::new();
+    fake.seed_start_stalls("frpc");
+
+    let (code, out, err) = dispatch_elevated(
+        &[
+            "goetia",
+            "daemon",
+            "install",
+            "--start",
+            "--timeout",
+            "5s",
+            "-f",
+            manifest.to_str().unwrap(),
+        ],
+        &fake,
+    );
+
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.contains("did not report running"), "{err}");
+}
+
+/// `--dry-run` keeps ignoring the wait flags exactly as it already ignores `--start`. Refusing this
+/// combination while still accepting a silent `--dry-run --start` would be a new inconsistency.
+#[skuld::test]
+fn install_dry_run_ignores_the_wait_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let fake = Fake::new();
+
+    let (plain_code, plain_out, _) = dispatch_elevated(
+        &[
+            "goetia",
+            "daemon",
+            "install",
+            "--dry-run",
+            "-f",
+            manifest.to_str().unwrap(),
+        ],
+        &fake,
+    );
+    let (code, out, err) = dispatch_elevated(
+        &[
+            "goetia",
+            "daemon",
+            "install",
+            "--dry-run",
+            "--start",
+            "--timeout",
+            "30s",
+            "-f",
+            manifest.to_str().unwrap(),
+        ],
+        &fake,
+    );
+
+    assert_eq!(plain_code, 0);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(
+        out, plain_out,
+        "the dry-run plan is printed exactly as it is without the flags"
+    );
+    assert!(installed_ids(&fake).is_empty(), "--dry-run installs and starts nothing");
+}
+
+/// The refusal above is scoped to the runs it can bite: under `--dry-run` a wait flag is inert
+/// whether or not `--start` is there, because `--start` is inert too.
+#[skuld::test]
+fn install_dry_run_ignores_a_timeout_without_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let fake = Fake::new();
+
+    let (code, out, err) = dispatch_elevated(
+        &[
+            "goetia",
+            "daemon",
+            "install",
+            "--dry-run",
+            "--timeout",
+            "30s",
+            "-f",
+            manifest.to_str().unwrap(),
+        ],
+        &fake,
+    );
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(out.contains("frpc"), "the dry-run plan is still printed: {out}");
+    assert!(installed_ids(&fake).is_empty());
+}
+
+#[skuld::test]
+fn timeout_and_no_timeout_are_mutually_exclusive() {
+    let parsed = Cli::try_parse_from(["goetia", "daemon", "start", "frpc", "--timeout", "5s", "--no-timeout"]);
+
+    assert!(parsed.is_err(), "clap must reject naming both bounds at once");
+}
+
+/// Every waiting verb takes a variadic id list, so a spaced duration is split by the shell and its
+/// tail lands in that list. Pinned as known and documented — the help text's `2m30s` guidance and
+/// the README's quoting note exist for exactly this.
+#[skuld::test]
+fn a_spaced_duration_after_a_variadic_positional_becomes_an_id() {
+    let cli = Cli::try_parse_from(["goetia", "daemon", "start", "foo", "--timeout", "2m", "30s"])
+        .expect("`30s` parses as a daemon id, not as the tail of the duration");
+
+    let Command::Daemon(DaemonCommand::Start(args)) = &cli.command else {
+        panic!("parsed something other than `daemon start`")
+    };
+    assert_eq!(args.ids, vec!["foo".to_string(), "30s".to_string()]);
 }
 
 // --json write failures ===============================================================================================
