@@ -923,12 +923,13 @@ fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout() {
     );
 }
 
-/// The finding-5 regression. `Budget::Immediate` leaves the job in launchd's `spawn scheduled` /
-/// `xpcproxy` window, which D2 classifies as `Unknown` — so a `restart: always` verification block
-/// that runs unconditionally fails here with `Error::Other("… did not start …")` or a
-/// `WaitTimeout`, for a request that was accepted exactly as asked.
+/// `Budget::Immediate` leaves the job in launchd's `spawn scheduled` /
+/// `xpcproxy` window, which `state::classify`'s catch-all folds into `Unknown` — so a
+/// `restart: always` verification block that runs unconditionally fails here with
+/// `Error::Other("… did not start …")` or a `WaitTimeout`, for a request that was accepted exactly
+/// as asked. This test is the regression guard for exactly that.
 ///
-/// **No assertion about the resulting state follows** (D7): `Immediate` establishes none, and a
+/// **No assertion about the resulting state follows**: `Immediate` establishes none, and a
 /// block that asserts state cannot run on a budget that established none.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_start_with_no_budget_is_ok_for_a_restart_always_job() {

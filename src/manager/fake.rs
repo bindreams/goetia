@@ -359,7 +359,7 @@ impl Fake {
     /// which no state read can express: the fake's `start` on an
     /// already-`Running` entry is idempotent and leaves the state
     /// byte-identical, so "never called" and "called, changed nothing" are
-    /// indistinguishable from the outside. Task 7's
+    /// indistinguishable from the outside.
     /// `restart_does_not_start_after_a_stop_that_timed_out` is exactly that
     /// assertion.
     pub fn calls(&self) -> Vec<(&'static str, String)> {

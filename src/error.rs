@@ -119,7 +119,7 @@ pub enum Error {
     /// wait ever began. The request was issued and accepted, and goetia
     /// stopped watching for its outcome; it was not cancelled, and the
     /// service may still arrive. A backend must never report an expiry as
-    /// `Ok(())`, and never as `Undetermined` (D3).
+    /// `Ok(())`, and never as `Undetermined`.
     ///
     /// Exit `4` (indeterminate), like `Undetermined`: the code is about
     /// whether the question was answered, and this one was not.

@@ -53,7 +53,7 @@ pub(crate) fn find_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 }
 
 /// `kickstart -p`'s stdout: the bare decimal pid and a newline, and nothing
-/// else (L3). `None` unless the whole `<digits>\n` line is present.
+/// else. `None` unless the whole `<digits>\n` line is present.
 ///
 /// The trailing newline is the point of this function, not a formality. A
 /// capture the deadline cut mid-write would otherwise turn `"4766\n"` into

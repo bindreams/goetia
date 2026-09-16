@@ -396,7 +396,7 @@ fn the_opaque_recovery_names_both_causes_and_not_uninstall() {
 
 // The call log ========================================================================================================
 
-/// Task 7's `restart_does_not_start_after_a_stop_that_timed_out` asserts on
+/// `restart_does_not_start_after_a_stop_that_timed_out` asserts on
 /// the **absence** of a call, which no state read can express: the fake's
 /// `start` on an already-`Running` entry is idempotent and leaves the state
 /// byte-identical, so "it was never called" and "it was called and changed

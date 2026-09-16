@@ -55,7 +55,7 @@ fn verb_args<'a>(verb: &'a str, unit: &'a str, budget: Budget) -> Vec<&'a str> {
 /// One `systemctl <verb> <unit>` under `budget`, as three deliberately different paths.
 ///
 /// A budget that does not wait becomes `systemctl <verb> --no-block`, the exact native expression
-/// of "issue the request and return" (S5): systemd enqueues the job and `systemctl` exits without
+/// of "issue the request and return": systemd enqueues the job and `systemctl` exits without
 /// waiting for it to complete. `Budget::Unbounded` is today's plain blocking call. Both keep
 /// `Command::output()`, because neither has anything to bound — cosca enters this module only where
 /// a bound is actually required, which is the third path and only the third.
@@ -87,7 +87,7 @@ fn run_verb(verb: &str, unit: &str, budget: Budget) -> Result<Finished> {
 /// The message for a `systemctl` invocation that exited non-zero, built from the whole [`Capture`]
 /// rather than from its bytes alone.
 ///
-/// `systemctl` writes nothing on success (M14), so `complete == false` only ever bites here — on
+/// `systemctl` writes nothing on success, so `complete == false` only ever bites here — on
 /// the one path whose entire value is the diagnostic. A truncated read presented as the whole story
 /// is how "goetia stopped reading" comes out reading as "systemd said nothing".
 ///

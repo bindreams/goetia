@@ -1,8 +1,8 @@
-//! `Budget`/`Deadline`: the wait vocabulary every later start-wait task
-//! speaks. `Budget` is how long a caller is willing to wait; `Deadline` is
-//! the absolute instant [`Budget::start`] derives from it. Pure Rust, no
-//! platform code — see the crate-level design notes on `daemon start
-//! --timeout`.
+//! `Budget`/`Deadline`: the wait vocabulary shared by every backend's
+//! `start`/`stop` wait path. `Budget` is how long a caller is willing to
+//! wait; `Deadline` is the absolute instant [`Budget::start`] derives from
+//! it. Pure Rust, no platform code — see the crate-level design notes on
+//! `daemon start --timeout`.
 
 use std::time::{Duration, Instant};
 
@@ -115,10 +115,10 @@ pub struct Deadline(Option<Instant>);
 
 impl Deadline {
     /// The absolute instant this deadline expires at; `None` = unbounded.
-    /// Task 3 hands it straight to `cosca::Child::wait_deadline`, which is
-    /// deadline-native — so nothing on that path converts to a duration and
-    /// back, and the unbounded case is a different call rather than an
-    /// invented timeout value.
+    /// `bounded::wait_bounded` hands it straight to
+    /// `cosca::Child::wait_deadline`, which is deadline-native — so nothing
+    /// on that path converts to a duration and back, and the unbounded case
+    /// is a different call rather than an invented timeout value.
     pub fn at(&self) -> Option<Instant> {
         self.0
     }

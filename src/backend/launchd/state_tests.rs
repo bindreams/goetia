@@ -110,7 +110,7 @@ fn find_field_returns_none_for_a_missing_key() {
 
 // kickstart_pid =======================================================================================================
 
-/// The measured shape (L3): `kickstart -p` writes the bare decimal pid and a
+/// The measured shape: `kickstart -p` writes the bare decimal pid and a
 /// newline, and nothing else.
 #[skuld::test]
 fn kickstart_pid_reads_the_bare_decimal_form() {

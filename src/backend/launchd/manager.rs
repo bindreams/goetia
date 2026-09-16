@@ -832,7 +832,7 @@ fn bootstrap(path: &Path, deadline: Deadline) -> Result<Option<()>> {
 /// What a `kickstart` established about the job.
 enum Kickstarted {
     /// launchd forked the job and named a pid on a capture that was whole.
-    /// That *is* the confirmation (L4) — and it is the fact that a pid was
+    /// That *is* the confirmation — and it is the fact that a pid was
     /// parsed, not the number, that confirms anything, so no number is
     /// carried here. `state::kickstart_pid` still returns it, and its own
     /// tests still pin it; nothing downstream of this has a use for it.
@@ -847,13 +847,13 @@ enum Kickstarted {
 /// deadline expired.
 ///
 /// **Never `-k`.** It force-restarts the job and blocks ~10.02s on launchd's
-/// respawn throttle, every single time (L7) — it is the obvious wrong reach
+/// respawn throttle, every single time — it is the obvious wrong reach
 /// here, and restarting a running job is not what `start` means.
 ///
 /// `budget.waits()` picks the form. A budget that waits uses **`-p`**, which
 /// returns only once launchd has forked the job and assigned it a pid, and
-/// writes that bare decimal pid on stdout (L3). That is launchd's complete
-/// answer — there is nothing further to subscribe to (L6) — so a pid parsed
+/// writes that bare decimal pid on stdout. That is launchd's complete
+/// answer — there is nothing further to subscribe to — so a pid parsed
 /// out of a successful `-p` *is* the confirmation, and no follow-up `print`
 /// is needed or wanted. A budget that does not wait uses the plain form,
 /// which only requests the spawn.
@@ -1185,8 +1185,8 @@ impl ServiceManager for LaunchdManager {
         if query_live_state(id.as_str(), deadline).0 != State::Running {
             match kickstart(id.as_str(), budget, deadline)?.ok_or_else(timed_out)? {
                 // launchd forked the job and named the pid. That *is* the
-                // confirmation (L4) — there is nothing further to subscribe
-                // to (L6) — so no follow-up `print` is needed or wanted.
+                // confirmation — there is nothing further to subscribe
+                // to — so no follow-up `print` is needed or wanted.
                 Kickstarted::Confirmed => {}
                 // A budget that waits asked for `-p` and got back no pid it
                 // will trust. Never observed (250/250 runs named one), and
@@ -1230,7 +1230,7 @@ impl ServiceManager for LaunchdManager {
         // definition an already-expired deadline: it declines to establish
         // exactly that. Under it the plain `kickstart` has only requested
         // the spawn, so the expected observation is `spawn scheduled`, which
-        // D2 classifies as `Unknown`; running the block anyway would turn
+        // `state::classify`'s catch-all folds into `Unknown`; running the block anyway would turn
         // `--timeout 0`'s `Ok(())` — which means only "the request was
         // accepted", per the trait doc comment — into a spurious failure. A
         // block that asserts state cannot run on a budget that established

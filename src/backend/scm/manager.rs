@@ -866,7 +866,7 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to stop it before uninstall: {e}")))?;
         // Deliberately `Budget::Unbounded`, and not the caller's: `uninstall` has no `--timeout`
-        // of its own (D4), this stop is a means rather than an end, and bounding it would turn a
+        // of its own, this stop is a means rather than an end, and bounding it would turn a
         // slow-stopping service into a failed uninstall where today it succeeds. The message below
         // already routes the user for every way this can actually fail.
         let waited = super::wait::stop_via_notify(&mut actor, Budget::Unbounded.start()).map_err(|e| {
