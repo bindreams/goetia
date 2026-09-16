@@ -75,9 +75,10 @@ fn run_verb(verb: &str, unit: &str, budget: Budget) -> Result<Finished> {
 ///
 /// `systemctl` writes nothing on success (M14), so `complete == false` only ever bites here — on
 /// the one path whose entire value is the diagnostic. A truncated read presented as the whole story
-/// is how "goetia stopped reading" comes out reading as "systemd said nothing", and an empty
-/// truncated read would otherwise render `systemctl start x.service failed: ` with nothing after
-/// the colon.
+/// is how "goetia stopped reading" comes out reading as "systemd said nothing".
+///
+/// `systemctl_tests.rs` covers all four shapes a capture arrives in; nothing else can, since
+/// reaching this through a real `systemctl` needs one that actually fails.
 fn failed(verb: &str, unit: &str, capture: &Capture) -> Error {
     // Whichever stream carried the diagnostic. `systemctl` writes its
     // failures to stderr, but a failure that produced only stdout would
@@ -89,13 +90,20 @@ fn failed(verb: &str, unit: &str, capture: &Capture) -> Error {
     } else {
         String::from_utf8_lossy(&capture.stderr)
     };
+    // Ahead of the `complete` branch, not inside the truncated one: both
+    // streams can be empty either way, and trailing off after a colon is
+    // just as uninformative when the read did finish. Only the *reason* it
+    // is empty differs.
+    if diagnostic.is_empty() {
+        let why = if capture.complete {
+            "and wrote no diagnostic"
+        } else {
+            "and no diagnostic was captured before goetia's budget expired"
+        };
+        return Error::Other(format!("systemctl {verb} {unit} failed, {why}"));
+    }
     if capture.complete {
         return Error::Other(format!("systemctl {verb} {unit} failed: {diagnostic}"));
-    }
-    if diagnostic.is_empty() {
-        return Error::Other(format!(
-            "systemctl {verb} {unit} failed, and no diagnostic was captured before goetia's budget expired"
-        ));
     }
     Error::Other(format!(
         "systemctl {verb} {unit} failed: {diagnostic} (truncated — goetia's budget expired while \
@@ -170,3 +178,7 @@ pub(super) fn status_from_unit(unit: &str) -> Result<Status> {
     let enabled = props.get("UnitFileState").is_some_and(|s| s == "enabled");
     Ok(Status { state, pid, enabled })
 }
+
+#[cfg(test)]
+#[path = "systemctl_tests.rs"]
+mod systemctl_tests;
