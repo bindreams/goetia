@@ -7,13 +7,6 @@
 //! already blocks (`systemctl`/`launchctl`); this is the only machinery
 //! either backend needs to bound that wait. See the crate-level design
 //! notes on `daemon start --timeout`.
-//!
-//! Both backends' calls into this module land in a later task, so outside
-//! `#[cfg(test)]` nothing calls in here yet — mirrors `src/main.rs`'s
-//! `#[cfg_attr(test, allow(dead_code))]` for the same shape of problem, with
-//! the condition flipped: there it is the non-test path that is unused,
-//! here it is the reverse.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::io::Read;
 use std::os::unix::process::ExitStatusExt;
@@ -59,7 +52,15 @@ pub(crate) enum Finished {
     /// The child exited on its own, inside the budget.
     Exited { status: ExitStatus, capture: Capture },
     /// The deadline expired first; the child was killed and reaped.
-    Expired { capture: Capture },
+    ///
+    /// Carries no capture. Whatever the child had written by then is a
+    /// prefix no consumer may treat as whole, and the one thing every
+    /// consumer in this crate does with an expiry is report it through
+    /// `budget::timed_out` — a single shared constructor with no room for a
+    /// per-call diagnostic, deliberately, so that all three backends word an
+    /// expiry identically. A field nothing may read and nothing does read is
+    /// surplus.
+    Expired,
 }
 
 /// Block until `child` exits or `deadline` expires; on expiry, kill the child, tear
@@ -117,7 +118,7 @@ pub(crate) fn wait_bounded(mut child: cosca::Child, deadline: Deadline) -> Resul
     };
     Ok(match status {
         Some(status) => Finished::Exited { status, capture },
-        None => Finished::Expired { capture },
+        None => Finished::Expired,
     })
 }
 
@@ -241,7 +242,16 @@ fn absorb(chunk: Chunk, stdout: &mut Vec<u8>, stderr: &mut Vec<u8>) -> std::io::
     match chunk {
         Chunk::Bytes(Which::Stdout, bytes) => stdout.extend_from_slice(&bytes),
         Chunk::Bytes(Which::Stderr, bytes) => stderr.extend_from_slice(&bytes),
-        Chunk::Failed(_, e) => return Err(e),
+        // The failing stream is named, not dropped: "a reader failed" and
+        // "the stderr reader failed" are different diagnostics, and this is
+        // the only place that knows which.
+        Chunk::Failed(which, e) => {
+            let stream = match which {
+                Which::Stdout => "stdout",
+                Which::Stderr => "stderr",
+            };
+            return Err(std::io::Error::new(e.kind(), format!("{stream}: {e}")));
+        }
     }
     Ok(())
 }

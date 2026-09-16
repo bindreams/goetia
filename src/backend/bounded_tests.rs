@@ -18,7 +18,7 @@ fn a_child_that_exits_is_reported_with_its_output() {
             assert_eq!(capture.stdout, b"hi\n");
             assert!(capture.complete);
         }
-        Finished::Expired { .. } => panic!("expected Exited, got Expired"),
+        Finished::Expired => panic!("expected Exited, got Expired"),
     }
 }
 
@@ -35,7 +35,7 @@ fn a_nonzero_exit_is_reported_not_an_error() {
             assert_eq!(capture.stderr, b"boom\n");
             assert!(capture.complete);
         }
-        Finished::Expired { .. } => panic!("expected Exited, got Expired"),
+        Finished::Expired => panic!("expected Exited, got Expired"),
     }
 }
 
@@ -50,7 +50,7 @@ fn an_expired_deadline_kills_and_reaps_the_child() {
     // already-expired path.
     let deadline = Budget::Bounded(Duration::from_millis(50)).start();
     let finished = wait_bounded(child, deadline).unwrap();
-    assert!(matches!(finished, Finished::Expired { .. }));
+    assert!(matches!(finished, Finished::Expired));
 
     // A zombie would still answer `kill(pid, 0)` successfully; `ESRCH` is
     // what proves the reap, not merely the kill.
@@ -64,7 +64,7 @@ fn an_expired_deadline_kills_and_reaps_the_child() {
 fn an_already_expired_deadline_does_not_wait() {
     let child = command("sleep", &["2147483647"]).unwrap().spawn().unwrap();
     let finished = wait_bounded(child, Budget::Immediate.start()).unwrap();
-    assert!(matches!(finished, Finished::Expired { .. }));
+    assert!(matches!(finished, Finished::Expired));
 }
 
 /// Smoke test, not a truncation guard: `echo late` is a single write well
@@ -79,14 +79,14 @@ fn an_expiry_path_smoke_test() {
         .spawn()
         .unwrap();
     let finished = wait_bounded(child, Budget::Immediate.start()).unwrap();
-    let capture = match finished {
-        Finished::Exited { capture, .. } => capture,
-        Finished::Expired { capture } => capture,
-    };
-    // `complete` asserts "nothing further can arrive", not "something
-    // arrived": an empty-and-complete capture is correct if the spent
-    // deadline killed the child before it wrote anything.
-    assert!(!capture.complete || capture.stdout.is_empty() || capture.stdout == b"late\n");
+    // An expiry carries no capture (see `Finished::Expired`), so there is
+    // only one arm with anything to assert. `complete` asserts "nothing
+    // further can arrive", not "something arrived": an empty-and-complete
+    // capture is correct if the spent deadline killed the child before it
+    // wrote anything.
+    if let Finished::Exited { capture, .. } = finished {
+        assert!(!capture.complete || capture.stdout.is_empty() || capture.stdout == b"late\n");
+    }
 }
 
 #[skuld::test]
@@ -112,7 +112,7 @@ fn a_child_whose_descendant_holds_the_pipe_still_returns_on_expiry() {
 
     let deadline = Budget::Bounded(Duration::from_millis(50)).start();
     let finished = wait_bounded(child, deadline).unwrap();
-    assert!(matches!(finished, Finished::Expired { .. }));
+    assert!(matches!(finished, Finished::Expired));
 
     // Leave nothing behind.
     unsafe {
@@ -139,7 +139,7 @@ fn a_contained_childs_descendant_dies_with_it() {
 
     let deadline = Budget::Bounded(Duration::from_millis(50)).start();
     let finished = wait_bounded(child, deadline).unwrap();
-    assert!(matches!(finished, Finished::Expired { .. }));
+    assert!(matches!(finished, Finished::Expired));
 
     // A real event-driven death-watch (pidfd on Linux, EVFILT_PROC |
     // NOTE_EXIT on macOS), with no timeout to choose: it returns when the
@@ -168,7 +168,7 @@ fn output_larger_than_a_pipe_buffer_does_not_deadlock() {
             assert_eq!(capture.stdout.len(), 200_000);
             assert!(capture.complete);
         }
-        Finished::Expired { .. } => panic!("expected Exited, got Expired"),
+        Finished::Expired => panic!("expected Exited, got Expired"),
     }
 }
 

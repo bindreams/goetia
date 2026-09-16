@@ -107,3 +107,31 @@ fn find_field_returns_none_for_a_missing_key() {
     let text = "system/foo = {\n\tstate = running\n}\n";
     assert_eq!(find_field(text, "pid"), None);
 }
+
+// kickstart_pid =======================================================================================================
+
+/// The measured shape (L3): `kickstart -p` writes the bare decimal pid and a
+/// newline, and nothing else.
+#[skuld::test]
+fn kickstart_pid_reads_the_bare_decimal_form() {
+    assert_eq!(kickstart_pid("4766\n"), Some(4766));
+}
+
+#[skuld::test]
+fn kickstart_pid_rejects_empty_and_non_numeric_output() {
+    assert_eq!(kickstart_pid(""), None);
+    assert_eq!(kickstart_pid("\n"), None);
+    assert_eq!(kickstart_pid("not a pid\n"), None);
+    assert_eq!(kickstart_pid("4766 spawned\n"), None);
+}
+
+/// The rule the whole guard exists for. A prefix of a pid parses as a
+/// *different* pid, and quite possibly a live one: `"4766\n"` cut mid-write
+/// to `"47"` reads as `47`, and nothing about that number looks wrong. So the
+/// whole `<digits>\n` line has to be present, or there is no confirmation —
+/// otherwise the clock picks which process `start` claims it launched.
+#[skuld::test]
+fn kickstart_pid_rejects_a_truncated_line() {
+    assert_eq!(kickstart_pid("47"), None);
+    assert_eq!(kickstart_pid("4766"), None);
+}

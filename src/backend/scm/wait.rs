@@ -146,13 +146,11 @@ pub fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Resul
 /// service with. A named function rather than a bare [`ScmActor::start`] at
 /// the call site so that what happens when we do *not* wait is covered by
 /// the same fake-actor tests as everything else.
-#[allow(dead_code)] // no caller on Windows either, until the manager's verbs take a `Budget`
 pub fn request_start<A: ScmActor>(a: &mut A) -> io::Result<()> {
     a.start()
 }
 
 /// [`request_start`]'s mirror: issue the stop control and return.
-#[allow(dead_code)] // no caller on Windows either, until the manager's verbs take a `Budget`
 pub fn request_stop<A: ScmActor>(a: &mut A) -> io::Result<()> {
     a.control_stop()
 }

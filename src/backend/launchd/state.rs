@@ -52,6 +52,31 @@ pub(crate) fn find_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
         .find_map(|line| line.trim_start().strip_prefix(prefix.as_str()))
 }
 
+/// `kickstart -p`'s stdout: the bare decimal pid and a newline, and nothing
+/// else (L3). `None` unless the whole `<digits>\n` line is present.
+///
+/// The trailing newline is the point of this function, not a formality. A
+/// capture the deadline cut mid-write would otherwise turn `"4766\n"` into
+/// `"47"`, which parses cleanly as a *different* pid — one that may well be
+/// live, and belong to someone else — and `start` would hand it back as its
+/// confirmation, the clock having picked which process it claims to have
+/// launched. Requiring the terminator is what makes "launchd finished
+/// writing this" observable at all.
+///
+/// The caller in `manager` carries the same guard independently, reading a
+/// pid only from a capture that reached EOF inside the deadline, so neither
+/// rule is the only thing standing between a truncated read and a confident
+/// answer.
+pub(crate) fn kickstart_pid(stdout: &str) -> Option<u32> {
+    let digits = stdout.strip_suffix('\n')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // Still fallible after the digit check: a run of digits too large for a
+    // `u32` is not a pid either.
+    digits.parse().ok()
+}
+
 #[cfg(test)]
 #[path = "state_tests.rs"]
 mod state_tests;

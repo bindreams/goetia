@@ -10,7 +10,7 @@ use super::support::{load_and_warn, require_elevation, select_by_ids};
 use crate::backend::Identity;
 use crate::decide::Outcome;
 use crate::error::{Error, Result};
-use crate::manager::ServiceManager;
+use crate::manager::{Budget, ServiceManager};
 use crate::spec::{AccountId, DaemonSpec, Id, User};
 
 #[derive(ClapArgs, Debug)]
@@ -113,7 +113,7 @@ pub fn run(
                     }
                 }
                 if args.start {
-                    if let Err(e) = mgr.start(&spec.id) {
+                    if let Err(e) = mgr.start(&spec.id, Budget::DEFAULT) {
                         let _ = writeln!(err, "error: {}: start: {e}", spec.id);
                         codes.push(failure_code(&e));
                     }

@@ -9,11 +9,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::blob::{self, Blob};
 use crate::decide::{self, Outcome, Ownership};
 use crate::error::{Error, Result};
-use crate::manager::{Installed, ServiceManager, State, Status};
+use crate::manager::budget;
+use crate::manager::{Budget, Installed, ServiceManager, State, Status};
 use crate::spec::{DaemonSpec, Id};
 
 /// The fake's own artifact marker. Deliberately not any of the real
@@ -90,6 +92,14 @@ struct Store {
     /// [`Fake::seed_aggregate_undetermined`]. Not a set of ids: an
     /// aggregate is precisely the case where the ids are not known.
     aggregates: Vec<String>,
+    /// Ids whose manager never confirms a start — see
+    /// [`Fake::seed_start_stalls`].
+    start_stalls: BTreeSet<String>,
+    /// [`Fake::seed_stop_stalls`]'s mirror of `start_stalls`.
+    stop_stalls: BTreeSet<String>,
+    /// Every `start`/`stop` this Fake was asked to perform, in order — see
+    /// [`Fake::calls`].
+    calls: Vec<(&'static str, String)>,
 }
 
 impl Store {
@@ -323,6 +333,40 @@ impl Fake {
         state.aggregates.push(reason.into());
     }
 
+    /// Test-only seeding: mark `id` as a service whose manager never
+    /// confirms a start — the state every timeout test needs and no
+    /// sequence of real verbs can produce.
+    ///
+    /// The fake **never sleeps** for it: [`stalled`] reads the budget and
+    /// reports the expiry directly. That is what makes a `--timeout 1h` test
+    /// finish instantly and deterministically instead of being a bet on a
+    /// scheduler.
+    pub fn seed_start_stalls(&self, id: &str) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.start_stalls.insert(id.to_string());
+    }
+
+    /// [`Fake::seed_start_stalls`]'s mirror for `stop`.
+    pub fn seed_stop_stalls(&self, id: &str) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.stop_stalls.insert(id.to_string());
+    }
+
+    /// Every `start`/`stop` this Fake was asked to perform, in order,
+    /// recorded when it was *asked* rather than when it succeeded.
+    ///
+    /// Exists because some assertions are about the **absence** of a call,
+    /// which no state read can express: the fake's `start` on an
+    /// already-`Running` entry is idempotent and leaves the state
+    /// byte-identical, so "never called" and "called, changed nothing" are
+    /// indistinguishable from the outside. Task 7's
+    /// `restart_does_not_start_after_a_stop_that_timed_out` is exactly that
+    /// assertion.
+    pub fn calls(&self) -> Vec<(&'static str, String)> {
+        let state = self.state.lock().expect("Fake mutex poisoned");
+        state.calls.clone()
+    }
+
     /// Test-only: force `id`'s reported [`State`] directly, bypassing
     /// `start`/`stop` (which can only produce `Running`/`Stopped`). `id`
     /// must already be installed.
@@ -372,6 +416,37 @@ fn require_ours(entry: &Entry, id: &Id) -> Result<()> {
             recovery: decide::foreign_recovery(id.as_str()),
         }),
         Ok(Some(_)) | Err(_) => Ok(()),
+    }
+}
+
+/// What a **stalled** entry's `start`/`stop` reports for `budget`, without
+/// ever sleeping: the fake derives the expiry rather than living it.
+///
+/// The rule branches on the budget's *kind*, not on [`Budget::waits`], and
+/// that distinction is the whole of it:
+///
+/// | budget | result |
+/// |---|---|
+/// | `Immediate`, and `Bounded(ZERO)` with it | `Ok(())`, state untouched — the honest model of "requested, not confirmed" |
+/// | `Bounded(d)`, `d > 0` | [`budget::timed_out`] |
+/// | `Unbounded` | **panic** |
+///
+/// `Unbounded` has to panic. `waits()` is true for it, so a rule phrased as
+/// "a stalled entry under a waiting budget times out" routes it into
+/// `budget::timed_out`, whose own `debug_assert!` requires a `Bounded`
+/// budget — leaving the fake to either trip that assert or report an expiry
+/// that provably cannot have happened. The honest model is "hang forever",
+/// which is unusable in a test, and a fake that cannot honestly model a case
+/// must refuse it rather than approximate it. Deterministic, loud, and
+/// impossible to mistake for a backend behaviour.
+fn stalled(id: &Id, awaited: &'static str, budget: Budget) -> Result<()> {
+    match budget {
+        Budget::Immediate | Budget::Bounded(Duration::ZERO) => Ok(()),
+        Budget::Bounded(_) => Err(budget::timed_out(id.as_str(), awaited, budget)),
+        Budget::Unbounded => panic!(
+            "Fake: a stalled entry cannot be awaited under Budget::Unbounded — that wait has no \
+             end. Use Budget::Bounded to exercise the expiry path."
+        ),
     }
 }
 
@@ -504,18 +579,33 @@ impl ServiceManager for Fake {
         Ok(())
     }
 
-    fn start(&self, id: &Id) -> Result<()> {
+    fn start(&self, id: &Id, budget: Budget) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
+        // Recorded on being *asked*, ahead of every check below: `calls`
+        // answers "was this attempted", which is a different question from
+        // whether it succeeded or changed anything.
+        state.calls.push(("start", id.as_str().to_string()));
+        let stalls = state.start_stalls.contains(id.as_str());
         let entry = state.get_mut(id)?;
         require_ours(entry, id)?;
+        if stalls {
+            // No confirmation is coming, so none is invented: the state is
+            // left exactly as it was on every branch `stalled` can take.
+            return stalled(id, "running", budget);
+        }
         entry.state = State::Running;
         Ok(())
     }
 
-    fn stop(&self, id: &Id) -> Result<()> {
+    fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.calls.push(("stop", id.as_str().to_string()));
+        let stalls = state.stop_stalls.contains(id.as_str());
         let entry = state.get_mut(id)?;
         require_ours(entry, id)?;
+        if stalls {
+            return stalled(id, "stopped", budget);
+        }
         // Idempotent: stopping an already-stopped (or failed, or unknown)
         // service is `Ok(())` — see `ServiceManager::stop`'s doc comment for
         // why every backend must agree on this.

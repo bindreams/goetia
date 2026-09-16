@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use clap::Parser as _;
 use goetia::cli::{self, Cli};
 use goetia::manager::fake::Fake;
-use goetia::manager::{Installed, ServiceManager, State, Status};
+use goetia::manager::{Budget, Installed, ServiceManager, State, Status};
 use goetia::spec::{DaemonSpec, Id, Kind, Restart, User};
 
 fn main() {
@@ -304,7 +304,7 @@ impl ServiceManager for FlakyManager {
     fn disable(&self, id: &Id) -> goetia::Result<()> {
         self.inner.disable(id)
     }
-    fn start(&self, id: &Id) -> goetia::Result<()> {
+    fn start(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
         if self.fail_start_for.as_deref() == Some(id.as_str()) {
             return Err(injected_failure(id));
         }
@@ -314,10 +314,10 @@ impl ServiceManager for FlakyManager {
         if self.wait_timeout_start_for.as_deref() == Some(id.as_str()) {
             return Err(injected_wait_timeout(id));
         }
-        self.inner.start(id)
+        self.inner.start(id, budget)
     }
-    fn stop(&self, id: &Id) -> goetia::Result<()> {
-        self.inner.stop(id)
+    fn stop(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
+        self.inner.stop(id, budget)
     }
     fn status(&self, id: &Id) -> goetia::Result<Status> {
         if self.unqueryable.as_deref() == Some(id.as_str()) {
@@ -998,11 +998,11 @@ impl ServiceManager for PanicsOnStart {
     fn disable(&self, id: &Id) -> goetia::Result<()> {
         self.0.disable(id)
     }
-    fn start(&self, _id: &Id) -> goetia::Result<()> {
+    fn start(&self, _id: &Id, _budget: Budget) -> goetia::Result<()> {
         panic!("restart on an absent id must never reach start")
     }
-    fn stop(&self, id: &Id) -> goetia::Result<()> {
-        self.0.stop(id)
+    fn stop(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
+        self.0.stop(id, budget)
     }
     fn status(&self, id: &Id) -> goetia::Result<Status> {
         self.0.status(id)
@@ -1098,7 +1098,7 @@ fn stop_reaches_the_manager() {
     let fake = Fake::new();
     let spec = mk("frpc");
     fake.install(&spec, false).unwrap();
-    fake.start(&spec.id).unwrap();
+    fake.start(&spec.id, Budget::DEFAULT).unwrap();
 
     let (code, _out, _err) = dispatch_elevated(&["goetia", "daemon", "stop", "frpc"], &fake);
 
@@ -1152,7 +1152,7 @@ fn status_reaches_the_manager() {
     let fake = Fake::new();
     let spec = mk("frpc");
     fake.install(&spec, false).unwrap();
-    fake.start(&spec.id).unwrap();
+    fake.start(&spec.id, Budget::DEFAULT).unwrap();
 
     let (code, out, _err) = dispatch_read_only(&["goetia", "daemon", "status", "frpc"], &fake);
 
@@ -1168,7 +1168,7 @@ fn status_with_no_ids_prints_the_pid_like_the_per_id_form() {
     let fake = Fake::new();
     let spec = mk("frpc");
     fake.install(&spec, false).unwrap();
-    fake.start(&spec.id).unwrap();
+    fake.start(&spec.id, Budget::DEFAULT).unwrap();
 
     let (_, per_id, _) = dispatch_read_only(&["goetia", "daemon", "status", "frpc"], &fake);
     let (_, no_ids, _) = dispatch_read_only(&["goetia", "daemon", "status"], &fake);
@@ -1844,7 +1844,7 @@ fn list_json_emits_every_managed_daemon() {
     let fake = Fake::new();
     fake.install(&mk("websocat"), false).unwrap();
     fake.install(&mk("frpc"), false).unwrap();
-    fake.start(&Id::try_from("frpc").unwrap()).unwrap();
+    fake.start(&Id::try_from("frpc").unwrap(), Budget::DEFAULT).unwrap();
     fake.enable(&Id::try_from("frpc").unwrap()).unwrap();
 
     let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
@@ -1980,7 +1980,7 @@ fn status_json_reports_state_enabled_and_pid_for_a_named_id() {
     let fake = Fake::new();
     let spec = mk("frpc");
     fake.install(&spec, false).unwrap();
-    fake.start(&spec.id).unwrap();
+    fake.start(&spec.id, Budget::DEFAULT).unwrap();
     fake.enable(&spec.id).unwrap();
 
     let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "status", "frpc"], &fake);
@@ -2017,7 +2017,7 @@ fn status_json_reports_a_null_pid_for_a_stopped_daemon() {
 fn status_json_with_no_ids_equals_list_json() {
     let fake = Fake::new();
     fake.install(&mk("frpc"), false).unwrap();
-    fake.start(&Id::try_from("frpc").unwrap()).unwrap();
+    fake.start(&Id::try_from("frpc").unwrap(), Budget::DEFAULT).unwrap();
     fake.install(&mk("websocat"), false).unwrap();
     fake.seed_unreadable("corrupt");
     fake.seed_opaque("opaque");

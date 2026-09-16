@@ -103,10 +103,12 @@ use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SERVICE_DOES_NOT
 use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHANGE};
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
+use super::wait::Waited;
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::blob::Blob;
 use crate::decide::{self, Outcome, Ownership};
 use crate::error::{Error, Result};
+use crate::manager::budget;
 use crate::manager::{Budget, Installed, ServiceManager, State, Status};
 use crate::spec::{DaemonSpec, Id, Kind};
 
@@ -189,24 +191,41 @@ impl ServiceManager for ScmManager {
         set_start_type(&service, ServiceStartType::OnDemand).map_err(|e| Error::Other(format!("disable `{id}`: {e}")))
     }
 
-    fn start(&self, id: &Id) -> Result<()> {
+    fn start(&self, id: &Id, budget: Budget) -> Result<()> {
         let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
         require_ours(id)?;
         drop(service);
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to start it: {e}")))?;
-        confirm(super::wait::start_via_notify(&mut actor, Budget::Unbounded.start()))
-            .map_err(|e| Error::Other(format!("start `{id}`: {e}")))
+        if !budget.waits() {
+            // Request-only: `StartServiceW` and return, arming no wait at
+            // all. `Ok(())` then means the request was accepted and nothing
+            // more, per the trait doc comment.
+            return super::wait::request_start(&mut actor).map_err(|e| Error::Other(format!("start `{id}`: {e}")));
+        }
+        let waited = super::wait::start_via_notify(&mut actor, budget.start())
+            .map_err(|e| Error::Other(format!("start `{id}`: {e}")))?;
+        match waited {
+            Waited::Confirmed => Ok(()),
+            Waited::Expired => Err(budget::timed_out(id.as_str(), "running", budget)),
+        }
     }
 
-    fn stop(&self, id: &Id) -> Result<()> {
+    fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
         let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
         require_ours(id)?;
         drop(service);
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to stop it: {e}")))?;
-        confirm(super::wait::stop_via_notify(&mut actor, Budget::Unbounded.start()))
-            .map_err(|e| Error::Other(format!("stop `{id}`: {e}")))
+        if !budget.waits() {
+            return super::wait::request_stop(&mut actor).map_err(|e| Error::Other(format!("stop `{id}`: {e}")));
+        }
+        let waited = super::wait::stop_via_notify(&mut actor, budget.start())
+            .map_err(|e| Error::Other(format!("stop `{id}`: {e}")))?;
+        match waited {
+            Waited::Confirmed => Ok(()),
+            Waited::Expired => Err(budget::timed_out(id.as_str(), "stopped", budget)),
+        }
     }
 
     fn status(&self, id: &Id) -> Result<Status> {
@@ -846,7 +865,11 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
     if needs_stop {
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to stop it before uninstall: {e}")))?;
-        confirm(super::wait::stop_via_notify(&mut actor, Budget::Unbounded.start())).map_err(|e| {
+        // Deliberately `Budget::Unbounded`, and not the caller's: `uninstall` has no `--timeout`
+        // of its own (D4), this stop is a means rather than an end, and bounding it would turn a
+        // slow-stopping service into a failed uninstall where today it succeeds. The message below
+        // already routes the user for every way this can actually fail.
+        let waited = super::wait::stop_via_notify(&mut actor, Budget::Unbounded.start()).map_err(|e| {
             Error::Other(format!(
                 "`{id}` did not confirm SERVICE_STOPPED before uninstall ({e}); it was NOT deleted — \
                  DeleteService on a running service only marks it for deletion, which the next install would \
@@ -854,6 +877,12 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
                  `goetia daemon uninstall {id}`."
             ))
         })?;
+        match waited {
+            Waited::Confirmed => {}
+            // `let _ = …` is the write that turns an unreachable case into a silent one, and this
+            // is precisely the case where a later edit narrowing that budget must not pass quietly.
+            Waited::Expired => unreachable!("uninstall's stop is Unbounded; an unbounded deadline never expires"),
+        }
         // `actor`'s `SC_HANDLE` must close before the `DELETE` handle opens
         // below — dropping it explicitly documents that ordering rather than
         // relying on it falling out of scope at the end of the function.
@@ -869,18 +898,6 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
 }
 
 // shared helpers ======================================================================================================
-
-/// Collapse a wait's outcome into the one `Result<_, String>` each call site
-/// already reports through, so a `Waited::Expired` cannot reach a caller as
-/// anything but a failure to confirm. Unreachable today — every wait here
-/// passes [`Budget::Unbounded`], since this trait carries no budget yet.
-fn confirm(outcome: std::io::Result<super::wait::Waited>) -> std::result::Result<(), String> {
-    match outcome {
-        Ok(super::wait::Waited::Confirmed) => Ok(()),
-        Ok(super::wait::Waited::Expired) => Err("the wait expired before the SCM confirmed the state".to_string()),
-        Err(e) => Err(e.to_string()),
-    }
-}
 
 fn open_scm(access: ServiceManagerAccess) -> Result<WinServiceManager> {
     WinServiceManager::local_computer(None::<&str>, access).map_err(|e| to_error("open the Service Control Manager", e))

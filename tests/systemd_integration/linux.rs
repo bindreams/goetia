@@ -13,7 +13,7 @@ use std::process::Command;
 
 use goetia::backend::systemd::manager::Systemd;
 use goetia::decide::Outcome;
-use goetia::manager::{Installed, ServiceManager, State, conformance};
+use goetia::manager::{Budget, Installed, ServiceManager, State, conformance};
 use goetia::spec::{DaemonSpec, Id, Kind, Restart, User};
 
 use crate::support::{self, ELEVATED, ServiceGuard, cmd};
@@ -510,15 +510,34 @@ fn start_stop_status_reflect_reality() {
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
 
-    mgr.start(&spec.id).expect("start");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     let status = mgr.status(&spec.id).expect("status after start");
     assert_eq!(status.state, State::Running, "{status:?}");
     assert!(status.pid.is_some(), "{status:?}");
 
-    mgr.stop(&spec.id).expect("stop");
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
     let status = mgr.status(&spec.id).expect("status after stop");
     assert_ne!(status.state, State::Running, "{status:?}");
     assert!(status.pid.is_none(), "{status:?}");
+}
+
+/// `Budget::Immediate` is the native `systemctl start --no-block`: systemd enqueues the job and
+/// `systemctl` returns without waiting for it to complete.
+///
+/// **No assertion about the resulting state follows**, and that is the test. `--no-block` returns
+/// while the job is still queued, so asserting `Running` — or `Stopped` — would be asserting a
+/// race. What `Immediate` promises is that the request was accepted and goetia came back, and that
+/// is exactly and only what is checked here.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_start_with_no_budget_uses_no_block() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let spec = mk(guard.id());
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+
+    mgr.start(&spec.id, Budget::Immediate)
+        .expect("a start with no budget issues the request and returns");
 }
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -529,7 +548,7 @@ fn uninstall_leaves_nothing() {
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
     mgr.enable(&spec.id).expect("enable");
-    mgr.start(&spec.id).expect("start");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     write_dropin(&id);
 
     mgr.uninstall(&spec.id).expect("uninstall");
