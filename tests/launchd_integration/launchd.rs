@@ -878,31 +878,49 @@ fn a_stop_with_no_budget_runs_bootout_to_completion() {
     );
 }
 
-/// The respawn-throttle regression. A `restart: always` job whose process exits inside launchd's
-/// `minimum runtime = 10` sits in `spawn scheduled` — `Unknown`, not `Running` — so a naive
-/// prologue kickstarts a job launchd is already throttling. Plain `kickstart` never waited for the
-/// pid, so the throttle was invisible; `kickstart -p` does wait, which is what makes it visible.
+/// launchd will not report a crash-looping `restart: always` job running, so a bounded `start`
+/// reports [`goetia::Error::WaitTimeout`] — bounded by the budget, not by launchd's respawn
+/// throttle. Saying so is the contract (`ServiceManager::start`: `Ok(())` means the manager
+/// reports it running), not a defect.
 ///
-/// The budget is **5s, not `DEFAULT`**, and that is the whole design of the test. launchd's
-/// throttle is ~10.02s while the fixed prologue's `bootout`/`bootstrap`/`kickstart -p` is tens of
-/// milliseconds, so `Ok` and `WaitTimeout` sit two orders of magnitude apart in either direction
-/// and neither outcome is a race. Against `DEFAULT` they would be ~20ms apart, which is exactly the
-/// bet this project forbids. No elapsed-time assertion is needed or made: the exit code carries it.
+/// Two measured facts, neither of them assumed:
+///
+/// 1. The throttle is ~10.02s and is keyed to the **job**, not to the loaded instance:
+///    `bootout` + `bootstrap` does not clear it. Probe run 35044604324 on macos-latest, a
+///    `KeepAlive` job running `/usr/bin/true`: `kickstart -p` took 10.01s and 10.02s before a
+///    bootout/bootstrap cycle, and 10.03s / 10.02s / 10.02s across three cycles after one. So no
+///    prologue remedy is possible, and `start` no longer attempts one.
+/// 2. `kickstart -p` is kept regardless. It is the only confirmation launchd offers — there is no
+///    notification mechanism, and re-reading state on a timer is polling, which this project
+///    forbids — and skipping it would fail a healthy job launchd is merely about to start.
+///
+/// The budget is **5s, not `DEFAULT`**, and that is deliberate. 5s and the ~10.02s throttle are two
+/// orders of magnitude apart from the outcome's perspective, so `WaitTimeout` is not a race in
+/// either direction; against `DEFAULT` (10s) they would sit ~20ms apart, which is exactly the bet
+/// this project forbids. That closeness is itself the documented consequence for `DEFAULT`: see
+/// this backend's module doc comment. No elapsed-time assertion is made or needed — the error
+/// variant carries the outcome.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_bounded_start_of_a_crash_looping_job_does_not_ride_the_respawn_throttle() {
+fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout() {
     let mgr = LaunchdManager::new();
     let id = support::random_test_id();
-    // Exits immediately, so `restart: always` puts launchd into a respawn loop it throttles.
+    // Exits immediately, so `restart: always` puts launchd into the respawn loop it throttles.
     let mut spec = base_spec(&id, vec!["/usr/bin/true".to_string()]);
     spec.restart = Restart::Always;
     let _guard = Guard::install(&mgr, &spec);
 
-    // Bootstrap it once so launchd has a respawn history to throttle before `start` is measured.
-    mgr.start(&spec.id, Budget::Bounded(Duration::from_secs(5)))
-        .expect("the first start establishes the crash loop");
+    // One start, not two. `install` leaves the job unloaded, so this bootstraps it — and for a
+    // `restart: always` spec whose command exits at once, the bootstrap itself starts the job via
+    // `RunAtLoad`, the process dies, and *that* creates the respawn history. The `kickstart -p`
+    // that follows therefore already meets a throttled job on this very first start.
+    let err = mgr
+        .start(&spec.id, Budget::Bounded(Duration::from_secs(5)))
+        .expect_err("launchd cannot confirm a crash-looping job running, so a bounded start times out");
 
-    mgr.start(&spec.id, Budget::Bounded(Duration::from_secs(5)))
-        .expect("a bounded start must boot the job out and bootstrap it afresh, not wait out the throttle");
+    assert!(
+        matches!(err, goetia::Error::WaitTimeout { awaited: "running", .. }),
+        "an unconfirmed bounded start must be WaitTimeout, not a fabricated success or another error: {err:?}"
+    );
 }
 
 /// The finding-5 regression. `Budget::Immediate` leaves the job in launchd's `spawn scheduled` /

@@ -11,7 +11,19 @@
 //! - `start` `launchctl bootstrap`s the plist from wherever it currently is
 //!   (if not already loaded), then `launchctl kickstart`s it — the second
 //!   step is what actually launches a job with no `KeepAlive`/`RunAtLoad`
-//!   (a `restart: never` daemon).
+//!   (a `restart: never` daemon). Under a budget that waits, that kickstart
+//!   asks for the pid (`-p`) and so blocks on launchd's ~10.02s respawn
+//!   throttle whenever the job already has respawn history — a crash-looping
+//!   `restart: always` job being the ordinary case. [`Budget::DEFAULT`] is
+//!   10s, just *below* that, so such a job essentially always reports
+//!   [`Error::WaitTimeout`] instead of starting. That is honest rather than
+//!   defective: launchd will not report the job running, and `start` says so
+//!   rather than waiting longer than it was asked to. The throttle is keyed
+//!   to the job, not to the loaded instance — `bootout` plus a fresh
+//!   `bootstrap` does not clear it (measured; see
+//!   `tests/launchd_integration/launchd.rs::
+//!   a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout`), so
+//!   there is no remedy for it to apply.
 //! - `stop` `launchctl bootout`s the job. Works regardless of which
 //!   directory it was loaded from.
 //! - `enable` moves the plist from [`STAGING_DIR`] into [`ENABLED_DIR`]
@@ -1157,25 +1169,6 @@ impl ServiceManager for LaunchdManager {
                     return Err(e);
                 }
             }
-        } else if budget.waits() && query_live_state(id.as_str(), deadline).0 != State::Running {
-            // A loaded job that is not running may be one launchd is already
-            // *scheduling*: a `restart: always` job whose process exited
-            // inside launchd's `minimum runtime = 10` sits in `spawn
-            // scheduled`, which D2 classifies as `Unknown`. Kickstarting it
-            // there rides launchd's ~10.02s respawn throttle (L7) — the same
-            // number as the default budget, which would make `start` on a
-            // crash-looping job a coin flip between exit `0` and exit `4`.
-            // Plain `kickstart` never waited for the pid so the throttle was
-            // invisible; `kickstart -p` waits, which is what exposes it.
-            //
-            // A job that has been booted out and bootstrapped afresh has no
-            // respawn history for launchd to throttle, so that is what this
-            // does. Only under a budget that waits: nothing else asks for a
-            // pid, so nothing else is exposed to the throttle, and `bootout`
-            // blocks — running it here would make `--timeout 0` block, which
-            // is the one thing `--timeout 0` promises not to do.
-            bootout(id.as_str(), deadline)?.ok_or_else(timed_out)?;
-            bootstrap(&location.path, deadline)?.ok_or_else(timed_out)?;
         }
         // `kickstart` is what actually launches a job with no
         // `KeepAlive`/`RunAtLoad` (`restart: never`) — `bootstrap` alone
@@ -1239,11 +1232,6 @@ impl ServiceManager for LaunchdManager {
         // accepted", per the trait doc comment — into a spurious failure. A
         // block that asserts state cannot run on a budget that established
         // none.
-        //
-        // It is also a second line of defence now rather than the only one:
-        // the prologue's own bootout-and-bootstrap already handles the
-        // stale-job case before any of the budget has been spent, so
-        // skipping it here does not mean the fix stops applying.
         if budget.waits()
             && blob.spec.restart == Restart::Always
             && query_live_state(id.as_str(), deadline).0 != State::Running
