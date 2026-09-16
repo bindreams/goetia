@@ -446,7 +446,14 @@ fn real_account_gets_service_logon_right() {
     // observes RUNNING or fails immediately, never hanging on a poll.
     let mgr = ScmManager::new();
     let target = id_of(&id);
-    mgr.start(&target, Budget::DEFAULT).unwrap_or_else(|e| {
+    // `Budget::Unbounded`, not `DEFAULT`: the subject here is the logon right, not latency. A
+    // first logon under a freshly created account builds a user profile, which routinely outruns
+    // the 10s default on a runner — measured at 24,737 ms on a green run, and 14,349 ms when
+    // `DEFAULT` turned it into a failure whose message blamed `SeServiceLogonRight` for what was
+    // only a slow profile build. A larger fixed number would just move the guess; unbounded says
+    // what is meant. A start that never arrives is bounded by CI's per-binary watchdog — a failure
+    // bound surfaced to a human, not a synchronisation device.
+    mgr.start(&target, Budget::Unbounded).unwrap_or_else(|e| {
         panic!("service under a real account failed to start (SeServiceLogonRight likely not granted): {e}")
     });
     let status = mgr.status(&target).expect("status");
@@ -538,7 +545,9 @@ fn a_local_service_daemon_actually_runs() {
     // is syntactically acceptable to `CreateServiceW` (`install` already
     // proves that), but that it is an identity Windows can actually launch
     // a process under.
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start as LocalService");
+    // Unbounded for the reason `real_account_gets_service_logon_right` gives: the subject is the
+    // identity, not latency, and a timeout would read as "LocalService cannot launch a process".
+    mgr.start(&spec.id, Budget::Unbounded).expect("start as LocalService");
     started.accept("the fixture to report SERVICE_RUNNING under LocalService");
     let status = mgr.status(&spec.id).expect("status while running");
     assert_eq!(status.state, State::Running);
@@ -613,7 +622,9 @@ fn a_builtin_account_is_never_given_a_stale_password() {
 
     let mgr = ScmManager::new();
     let target = id_of(&id);
-    mgr.start(&target, Budget::DEFAULT).unwrap_or_else(|e| {
+    // Unbounded for the reason `real_account_gets_service_logon_right` gives: a timeout here would
+    // blame a stale password for what was only a slow start.
+    mgr.start(&target, Budget::Unbounded).unwrap_or_else(|e| {
         panic!("service under LocalService failed to start (a stale password likely reached CreateServiceW): {e}")
     });
     let status = mgr.status(&target).expect("status");
