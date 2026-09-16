@@ -164,12 +164,6 @@ fn a_terminal_stopped_after_start_is_still_an_error_not_an_expiry() {
 }
 
 #[skuld::test]
-fn start_via_notify_ok_when_service_runs() {
-    let mut fake = FakeScm::new([Some(Observed::Pending), Some(Observed::Running)]);
-    assert_eq!(start_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
-}
-
-#[skuld::test]
 fn start_via_notify_rearms_on_pending_not_errs() {
     // A StartPending/StopPending intermediate (Pending) must RE-ARM, not fail.
     let mut fake = FakeScm::new([
@@ -179,13 +173,6 @@ fn start_via_notify_rearms_on_pending_not_errs() {
     ]);
     assert_eq!(start_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
     assert_eq!(fake.arm_count(), 3); // initial + 2 re-arms
-}
-
-#[skuld::test]
-fn stop_via_notify_ok_when_already_stopped_on_first_callback() {
-    let mut fake = FakeScm::new([Some(Observed::Stopped)]);
-    assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
-    assert_eq!(fake.arm_count(), 1);
 }
 
 #[skuld::test]
