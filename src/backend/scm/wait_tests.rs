@@ -232,28 +232,14 @@ fn an_arm_that_keeps_lagging_returns_expired_instead_of_looping() {
 }
 
 #[skuld::test]
-fn a_start_issued_while_start_pending_resolves_through_the_wait() {
-    // The shape the corrected ERROR_SERVICE_ALREADY_RUNNING arm produces for
-    // a queried `StartPending`: `start` reports success, and the wait —
-    // which `want_to_mask` armed SERVICE_NOTIFY_START_PENDING for — resolves
-    // through the immediate-fire and a re-arm.
-    let mut fake = FakeScm::new([Some(Observed::Pending), Some(Observed::Running)]);
-    assert_eq!(start_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
-    assert_eq!(
-        fake.log,
-        vec![
-            "arm_running",
-            "start",
-            "wait",
-            "got_pending",
-            "arm_running",
-            "wait",
-            "got_running"
-        ]
-    );
-
-    // The shipped arm rejected that state instead, failing a start that was
-    // going to succeed.
+fn a_start_the_scm_rejects_is_reported_as_a_failed_start() {
+    // The shape the *shipped* ERROR_SERVICE_ALREADY_RUNNING arm produced for
+    // a queried `StartPending`, and the consequence the bug had: a rejected
+    // start surfaces as a failed start. That the corrected arm accepts that
+    // state instead is `already_running_is_recoverable`'s own tests, and the
+    // resolve-through-the-wait shape is
+    // `start_re_arms_after_a_non_terminal_callback`, which this used to
+    // repeat assertion for assertion.
     let mut rejecting = FakeScm::new([]).rejecting_start();
     assert!(start_via_notify(&mut rejecting, unbounded()).is_err());
 }
