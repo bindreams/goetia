@@ -544,6 +544,30 @@ fn a_start_with_no_budget_is_accepted_and_returns() {
         .expect("a start with no budget issues the request and returns");
 }
 
+/// `Type=exec` is what makes `systemctl start` report failure here at all — under `Type=simple` the
+/// same spec's `start` returns `Ok`. `restart: always` is pinned explicitly (`mk`'s default is
+/// `OnFailure`) so the unit under test is exactly `Type=exec` + `Restart=always` +
+/// `StartLimitIntervalSec=0` (`generate.rs:38-44` emits the last of those only when restart is
+/// enabled), the shape measured to fail `start` in 5/5.
+///
+/// Asserts only on `start`'s result: by the time it returns, the unit is already
+/// `activating`/`auto-restart`, not `failed` — a follow-up state read would be asserting a race
+/// against systemd's own restart loop.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_unit_whose_executable_does_not_exist_fails_start() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let mut spec = mk(guard.id());
+    spec.command = vec!["/nonexistent/goetia-test-executable".to_string()];
+    spec.restart = Restart::Always;
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+
+    let result = mgr.start(&spec.id, Budget::DEFAULT);
+
+    assert!(result.is_err(), "{result:?}");
+}
+
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn uninstall_leaves_nothing() {
     let id = support::random_test_id();

@@ -30,6 +30,20 @@ use crate::spec::{DaemonSpec, Restart};
 ///
 /// `unit(&extract(&unit(spec, id)).unwrap().unwrap().spec, id)` must be
 /// byte-identical to `unit(spec, id)`.
+///
+/// Emits `Type=exec` (requires systemd 240+, 2018): `systemd.service(5)` recommends it for
+/// long-running services "as it ensures that process setup errors (e.g. errors such as a missing
+/// service executable, or missing user) are properly tracked", which `Type=simple` does not —
+/// `systemctl start` there can report success for a unit that immediately goes `failed`. The
+/// accepted cost is that `exec` makes systemd block on the NSS lookup `User=` triggers before
+/// reporting back; every generated unit carries `User=`, so this applies to all of them, and
+/// `--timeout` bounds and reports it.
+///
+/// Changing what this function emits after a release ships requires bumping `version` in the same
+/// commit (see `blob::encode`), or every already-installed service using the old bytes reports as
+/// hand-edited: `decide`'s version-mismatch check (`src/decide.rs`) is what tells "stale, regenerate
+/// silently" from "conflict, demand `--force`" apart, and it runs before either `desired` or
+/// `regenerated` is even compared.
 pub fn unit(spec: &DaemonSpec, id: &Identity) -> String {
     let mut out = String::new();
 
@@ -46,7 +60,7 @@ pub fn unit(spec: &DaemonSpec, id: &Identity) -> String {
     out.push('\n');
 
     out.push_str("[Service]\n");
-    out.push_str("Type=simple\n");
+    out.push_str("Type=exec\n");
     out.push_str(&format!("ExecStart={}\n", render_exec_start(&spec.command)));
     if let Some(cwd) = &spec.cwd {
         out.push_str(&format!(

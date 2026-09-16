@@ -4,6 +4,10 @@ A cross-platform CLI and library that installs system daemons described in a
 `goetia.yaml` manifest as native services: systemd on Linux, launchd on
 macOS, and the Service Control Manager on Windows.
 
+Generated systemd units use `Type=exec`, requiring **systemd 240+** (2018):
+on an older systemd, `systemctl start` fails to load the unit with
+systemd's own diagnostic naming the directive.
+
 ## Status
 
 Pre-1.0. See the [releases page](https://github.com/bindreams/goetia/releases)
