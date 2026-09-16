@@ -349,6 +349,19 @@ fn start_and_stop_are_idempotent(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> 
 /// the budget, and that a subsequent `Budget::DEFAULT` start still reaches
 /// `Running`. The second half is what stops a backend satisfying this by
 /// making `Immediate` a no-op that quietly leaves the service unstartable.
+///
+/// **No scenario here asserts the expiry rule** — that an expiry is
+/// `Error::WaitTimeout` and never `Ok(())` — against a real backend, and
+/// that is a decision rather than a gap. Asserting it would need a daemon
+/// that provably fails to reach running on all three platforms, which no
+/// portable `DaemonSpec` can express; the alternative, a real daemon under
+/// a budget small enough to expire, asserts whichever outcome the scheduler
+/// happened to pick, which is the bet this project forbids. `Fake` carries
+/// the rule instead, deriving each expiry from the budget without sleeping
+/// (`fake_tests.rs`: `a_stalled_start_times_out_under_a_bounded_budget` and
+/// its stop mirror, plus the two `Unbounded` refusals). So a real backend
+/// that swallowed an expiry as `Ok` would pass every scenario in this file
+/// — that is understood, and the reason there is nothing to find here.
 fn starting_with_no_budget_is_accepted_and_establishes_nothing(
     mgr: &dyn ServiceManager,
     mk: &dyn Fn(&str) -> DaemonSpec,
