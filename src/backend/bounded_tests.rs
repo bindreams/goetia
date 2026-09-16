@@ -67,26 +67,30 @@ fn an_already_expired_deadline_does_not_wait() {
     assert!(matches!(finished, Finished::Expired));
 }
 
-/// Smoke test, not a truncation guard: `echo late` is a single write well
-/// under `PIPE_BUF`, so the child can never yield a genuine split prefix,
-/// and this assertion holds under any implementation of `collect`. The real
-/// guard against a truncated prefix is
+/// The expiry path with output already in flight — the case the two
+/// sleep-only expiry tests above leave uncovered, and the one this test has
+/// always been about.
+///
+/// Deterministic by construction: the child writes and then `exec`s a
+/// 68-year sleep, so it cannot exit on its own and the deadline is provably
+/// the only way out. `Expired` holds whether or not the write landed before
+/// the kill, so no part of this is a race. The previous `echo late; exit 0`
+/// child could not be asserted on at all — a child that exits at once may
+/// legitimately beat the kill and answer `Exited` — which is how this test
+/// drifted into asserting nothing that could fail.
+///
+/// Nothing is claimed about the bytes: an expiry carries no capture. The
+/// truncation rule is
 /// `collect_keeps_what_already_arrived_when_the_deadline_expires`.
 #[skuld::test]
-fn an_expiry_path_smoke_test() {
-    let child = command("/bin/sh", &["-c", "echo late; exit 0"])
+fn an_expiry_with_output_in_flight_is_reported_as_expired() {
+    let child = command("/bin/sh", &["-c", "echo late; exec sleep 2147483647"])
         .unwrap()
         .spawn()
         .unwrap();
-    let finished = wait_bounded(child, Budget::Immediate.start()).unwrap();
-    // An expiry carries no capture (see `Finished::Expired`), so there is
-    // only one arm with anything to assert. `complete` asserts "nothing
-    // further can arrive", not "something arrived": an empty-and-complete
-    // capture is correct if the spent deadline killed the child before it
-    // wrote anything.
-    if let Finished::Exited { capture, .. } = finished {
-        assert!(!capture.complete || capture.stdout.is_empty() || capture.stdout == b"late\n");
-    }
+    let deadline = Budget::Bounded(Duration::from_millis(50)).start();
+    let finished = wait_bounded(child, deadline).unwrap();
+    assert!(matches!(finished, Finished::Expired), "{finished:?}");
 }
 
 #[skuld::test]
