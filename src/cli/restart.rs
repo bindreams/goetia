@@ -11,7 +11,7 @@ use clap::Args as ClapArgs;
 
 use super::support::{IdVerbCall, run_id_verb};
 use crate::error::{Error, Result};
-use crate::manager::ServiceManager;
+use crate::manager::{Budget, ServiceManager};
 
 #[derive(ClapArgs, Debug)]
 pub struct Args {
@@ -34,7 +34,7 @@ pub fn run(
             get_manager,
             is_elevated,
             verb: &|mgr, id| {
-                mgr.stop(id)?;
+                mgr.stop(id, Budget::DEFAULT)?;
                 // Distinguish "never stopped, restart failed outright" from
                 // "stopped, but did not come back up" — the two have
                 // opposite operational consequences (still running vs. now
@@ -44,7 +44,7 @@ pub fn run(
                 // `Other`: `run_id_verb` reads the variant, and an
                 // `Undetermined` start leg erased here would exit `1` in the
                 // one state where the distinction matters most.
-                mgr.start(id).map_err(|e| match e {
+                mgr.start(id, Budget::DEFAULT).map_err(|e| match e {
                     Error::Undetermined { id, reason, recovery } => Error::Undetermined {
                         id,
                         reason: format!("stopped but failed to restart: {reason}"),

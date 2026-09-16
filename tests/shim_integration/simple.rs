@@ -4,7 +4,7 @@
 
 use goetia::decide::Outcome;
 use goetia::manager::conformance;
-use goetia::manager::{Installed, ServiceManager as _, State};
+use goetia::manager::{Budget, Installed, ServiceManager as _, State};
 
 use crate::common::{conformance_mk, fixture_command, mk_spec};
 use crate::deny::Denied;
@@ -106,7 +106,7 @@ fn start_stop_status_reflect_reality() {
     let spec = mk_spec(&id, fixture_command("report", &[&started.port().to_string()]));
     mgr.install(&spec, false).expect("install");
 
-    mgr.start(&spec.id).expect("start");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     started.accept("the fixture (spawned by the shim) to report running");
     let status = mgr.status(&spec.id).expect("status while running");
     assert_eq!(status.state, State::Running);
@@ -122,7 +122,7 @@ fn start_stop_status_reflect_reality() {
         "pid {pid} reported by status() is not goetia-shim.exe:\n{tasklist}"
     );
 
-    mgr.stop(&spec.id).expect("stop");
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
     let status = mgr.status(&spec.id).expect("status after stop");
     assert_eq!(status.state, State::Stopped);
 }

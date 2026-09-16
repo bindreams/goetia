@@ -9,8 +9,11 @@
 //! of its policy table itself; see [`conformance::run`], which asserts that
 //! contract against any `&dyn ServiceManager`.
 
+pub mod budget;
 pub mod conformance;
 pub mod fake;
+
+pub use budget::Budget;
 
 // All three supported platforms now return a real `ServiceManager`, so
 // `Error::UnsupportedPlatform` is referenced only by the catch-all arm.
@@ -58,12 +61,47 @@ pub trait ServiceManager {
     /// Disable the service at boot. Does not stop it if running.
     fn disable(&self, id: &Id) -> Result<()>;
 
-    /// Start the service now. Does not change its boot-enablement.
-    /// Idempotent: starting an already-running service is `Ok(())`, not an
-    /// error.
-    fn start(&self, id: &Id) -> Result<()>;
+    /// Start the service now, waiting up to `budget` for it. Does not
+    /// change its boot-enablement.
+    ///
+    /// `Ok(())` means **the platform's service manager reports the service
+    /// as running, as far as it knows** — not that the service is ready to
+    /// serve, which no service manager can tell us. An implementation must
+    /// not fabricate that confirmation: reporting one it did not obtain is
+    /// the failure this whole signature exists to prevent.
+    ///
+    /// [`Budget::Immediate`] issues the request and returns without waiting,
+    /// establishing nothing. `Ok(())` then means only that the request was
+    /// accepted, so a caller must not read any state from it — and neither
+    /// must the implementation, which is why every state assertion a backend
+    /// makes belongs behind [`Budget::waits`].
+    ///
+    /// On expiry, [`Error::WaitTimeout`] — never `Ok(())`, and never
+    /// [`Error::Undetermined`], which claims the *installation* is in doubt
+    /// when what actually happened is that a settled id's request was issued
+    /// and not waited out.
+    ///
+    /// Idempotent under every budget: starting an already-running service is
+    /// `Ok(())`, not an error.
+    ///
+    /// [`Error::WaitTimeout`]: crate::Error::WaitTimeout
+    /// [`Error::Undetermined`]: crate::Error::Undetermined
+    fn start(&self, id: &Id, budget: Budget) -> Result<()>;
 
-    /// Stop the service now. Does not change its boot-enablement.
+    /// Stop the service now, waiting up to `budget` for it. Does not change
+    /// its boot-enablement.
+    ///
+    /// `Ok(())` means the service manager reports the service as stopped, on
+    /// the same terms as [`Self::start`], and an expiry is
+    /// [`Error::WaitTimeout`] on the same terms too.
+    ///
+    /// **Where a platform offers no request-only form,
+    /// [`Budget::Immediate`] still performs the full blocking call, because
+    /// issuing the request *is* that call.** This is true of `launchctl
+    /// bootout`, which has no non-blocking spelling: a `stop` with no budget
+    /// still boots the job out to completion. The budget bounds what goetia
+    /// waits *for*, and there is nothing here to wait for separately.
+    ///
     /// Idempotent: stopping an already-stopped service is `Ok(())`, not an
     /// error — `daemon restart`'s `stop` then `start` depends on this
     /// holding for a daemon that was never started, and real managers
@@ -71,7 +109,9 @@ pub trait ServiceManager {
     /// an inactive service both fail; `systemctl stop` does not), so an
     /// implementation must paper over that difference itself, not leave it
     /// for a caller to rediscover per platform.
-    fn stop(&self, id: &Id) -> Result<()>;
+    ///
+    /// [`Error::WaitTimeout`]: crate::Error::WaitTimeout
+    fn stop(&self, id: &Id, budget: Budget) -> Result<()>;
 
     /// The live state of one installed service. `Err` for an id whose blob
     /// will not decode — this must not fabricate a plausible-looking

@@ -4,8 +4,10 @@
 use std::collections::BTreeMap;
 use std::process::Command;
 
+use crate::backend::bounded::{self, Capture, Finished};
 use crate::error::{Error, Result};
-use crate::manager::{State, Status};
+use crate::manager::budget;
+use crate::manager::{Budget, State, Status};
 
 pub(super) fn run_systemctl(args: &[&str]) -> Result<std::process::Output> {
     Command::new("systemctl")
@@ -37,32 +39,93 @@ pub(super) fn daemon_reload_or_report(id: &str) -> Result<()> {
     })
 }
 
+/// One `systemctl <verb> <unit>` under `budget`, as three deliberately different paths.
+///
+/// A budget that does not wait becomes `systemctl <verb> --no-block`, the exact native expression
+/// of "issue the request and return" (S5): systemd enqueues the job and `systemctl` exits without
+/// waiting for it to complete. `Budget::Unbounded` is today's plain blocking call. Both keep
+/// `Command::output()`, because neither has anything to bound — cosca enters this module only where
+/// a bound is actually required, which is the third path and only the third.
+fn run_verb(verb: &str, unit: &str, budget: Budget) -> Result<Finished> {
+    // `output()` reads both pipes to EOF before returning, so on either
+    // unbounded path nothing was cut short and `complete` is simply true.
+    let whole = |output: std::process::Output| Finished::Exited {
+        status: output.status,
+        capture: Capture {
+            stdout: output.stdout,
+            stderr: output.stderr,
+            complete: true,
+        },
+    };
+    if !budget.waits() {
+        return Ok(whole(run_systemctl(&[verb, "--no-block", unit])?));
+    }
+    if budget == Budget::Unbounded {
+        return Ok(whole(run_systemctl(&[verb, unit])?));
+    }
+
+    let failed = |e: cosca::error::Error| Error::Other(format!("failed to run `systemctl {verb} {unit}`: {e}"));
+    let mut cmd = bounded::command("systemctl", &[verb, unit]).map_err(failed)?;
+    let child = cmd.spawn().map_err(failed)?;
+    bounded::wait_bounded(child, budget.start()).map_err(failed)
+}
+
+/// The message for a `systemctl` invocation that exited non-zero, built from the whole [`Capture`]
+/// rather than from its bytes alone.
+///
+/// `systemctl` writes nothing on success (M14), so `complete == false` only ever bites here — on
+/// the one path whose entire value is the diagnostic. A truncated read presented as the whole story
+/// is how "goetia stopped reading" comes out reading as "systemd said nothing", and an empty
+/// truncated read would otherwise render `systemctl start x.service failed: ` with nothing after
+/// the colon.
+fn failed(verb: &str, unit: &str, capture: &Capture) -> Error {
+    // Whichever stream carried the diagnostic. `systemctl` writes its
+    // failures to stderr, but a failure that produced only stdout would
+    // otherwise render `systemctl start x.service failed: ` with nothing
+    // after the colon — an empty diagnostic on the one path whose entire
+    // value is the diagnostic.
+    let diagnostic = if capture.stderr.is_empty() {
+        String::from_utf8_lossy(&capture.stdout)
+    } else {
+        String::from_utf8_lossy(&capture.stderr)
+    };
+    if capture.complete {
+        return Error::Other(format!("systemctl {verb} {unit} failed: {diagnostic}"));
+    }
+    if diagnostic.is_empty() {
+        return Error::Other(format!(
+            "systemctl {verb} {unit} failed, and no diagnostic was captured before goetia's budget expired"
+        ));
+    }
+    Error::Other(format!(
+        "systemctl {verb} {unit} failed: {diagnostic} (truncated — goetia's budget expired while \
+         reading the diagnostic, so this is a prefix of what systemd wrote)"
+    ))
+}
+
 /// `systemctl start` blocks until its job completes — the real synchronization primitive, no polling
 /// needed. Idempotent: starting an already-active unit is a no-op that still exits 0.
-pub(super) fn start_impl(unit: &str) -> Result<()> {
-    let output = run_systemctl(&["start", unit])?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(Error::Other(format!(
-            "systemctl start {unit} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )))
+///
+/// Note for the reviewer: until the shim task lands, a bounded `systemctl start` confirms only that
+/// systemd forked the process (S3).
+pub(super) fn start_impl(id: &str, budget: Budget) -> Result<()> {
+    let unit = super::unit_name(id);
+    match run_verb("start", &unit, budget)? {
+        Finished::Exited { status, .. } if status.success() => Ok(()),
+        Finished::Exited { capture, .. } => Err(failed("start", &unit, &capture)),
+        Finished::Expired => Err(budget::timed_out(id, "running", budget)),
     }
 }
 
 /// Idempotent per `ServiceManager::stop`'s doc comment. Exit code 5 ("unit not loaded") means there
 /// was nothing to stop — the same convention `tests/support/service_guard.rs` already uses for
 /// cleanup — which is success here, not a failure to stop something that was never running.
-pub(super) fn stop_impl(unit: &str) -> Result<()> {
-    let output = run_systemctl(&["stop", unit])?;
-    if output.status.success() || output.status.code() == Some(5) {
-        Ok(())
-    } else {
-        Err(Error::Other(format!(
-            "systemctl stop {unit} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )))
+pub(super) fn stop_impl(id: &str, budget: Budget) -> Result<()> {
+    let unit = super::unit_name(id);
+    match run_verb("stop", &unit, budget)? {
+        Finished::Exited { status, .. } if status.success() || status.code() == Some(5) => Ok(()),
+        Finished::Exited { capture, .. } => Err(failed("stop", &unit, &capture)),
+        Finished::Expired => Err(budget::timed_out(id, "stopped", budget)),
     }
 }
 
@@ -93,6 +156,11 @@ pub(super) fn status_from_unit(unit: &str) -> Result<Status> {
         Some("active") => State::Running,
         Some("inactive") => State::Stopped,
         Some("failed") => State::Failed,
+        // `activating`/`deactivating` land here, along with anything else
+        // systemd reports. One of three places a `State::Starting` would be
+        // produced if goetia grows one (routed post-0.1.0) — the other two
+        // are `state::classify` in `src/backend/launchd/state.rs` and
+        // `map_state` in `src/backend/scm/manager.rs`.
         _ => State::Unknown,
     };
     let pid = props

@@ -60,7 +60,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{Installed, ServiceManager, State};
+use super::{Budget, Installed, ServiceManager, State};
 use crate::error::Error;
 use crate::spec::{DaemonSpec, Id};
 
@@ -121,6 +121,7 @@ pub fn run(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
     install_does_not_enable(mgr, mk, &mut cleanup.ids);
     reinstall_preserves_enablement(mgr, mk, &mut cleanup.ids);
     start_and_stop_are_idempotent(mgr, mk, &mut cleanup.ids);
+    starting_with_no_budget_is_accepted_and_establishes_nothing(mgr, mk, &mut cleanup.ids);
     list_and_status_agree_on_pid(mgr, mk, &mut cleanup.ids);
     refuses_foreign_even_with_force(mgr, mk);
     foreign_refuses_every_verb(mgr, mk);
@@ -254,8 +255,14 @@ fn foreign_refuses_every_verb(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> Dae
     assert!(mgr.uninstall(&spec.id).is_err(), "uninstall must refuse a foreign id");
     assert!(mgr.enable(&spec.id).is_err(), "enable must refuse a foreign id");
     assert!(mgr.disable(&spec.id).is_err(), "disable must refuse a foreign id");
-    assert!(mgr.start(&spec.id).is_err(), "start must refuse a foreign id");
-    assert!(mgr.stop(&spec.id).is_err(), "stop must refuse a foreign id");
+    assert!(
+        mgr.start(&spec.id, Budget::DEFAULT).is_err(),
+        "start must refuse a foreign id"
+    );
+    assert!(
+        mgr.stop(&spec.id, Budget::DEFAULT).is_err(),
+        "stop must refuse a foreign id"
+    );
     assert!(mgr.status(&spec.id).is_err(), "status must refuse a foreign id");
 }
 
@@ -305,28 +312,63 @@ fn start_and_stop_are_idempotent(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> 
     mgr.install(&spec, false).expect("install");
     cleanup.push(spec.id.clone());
 
-    mgr.stop(&spec.id)
+    mgr.stop(&spec.id, Budget::DEFAULT)
         .expect("stop on a never-started service must be Ok, not an error");
-    mgr.start(&spec.id).expect("start");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     assert_eq!(
         mgr.status(&spec.id).expect("status after start").state,
         State::Running,
-        "id {}",
+        "a start under a budget returns only once the service manager reports the service \
+         running, so this ONE status() read must already say so — no retry and no second chance, \
+         which is the whole difference the wait makes (id {})",
         spec.id
     );
 
-    mgr.start(&spec.id)
+    mgr.start(&spec.id, Budget::DEFAULT)
         .expect("start on an already-running service must be Ok, not an error");
-    mgr.stop(&spec.id).expect("stop");
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
     assert_ne!(
         mgr.status(&spec.id).expect("status after stop").state,
+        State::Running,
+        "a stop under a budget mirrors it: one status() read, already settled (id {})",
+        spec.id
+    );
+
+    mgr.stop(&spec.id, Budget::DEFAULT)
+        .expect("stop on an already-stopped service must be Ok, not an error");
+}
+
+/// `Budget::Immediate` issues the request and returns, establishing nothing
+/// — so **no assertion about the resulting state follows it here**, and that
+/// omission is the scenario, not a gap in it. The request has been accepted
+/// and the service may be anywhere between not yet forked and already
+/// running; which of those a backend happens to observe is the scheduler's
+/// choice, so asserting either would be asserting a race.
+///
+/// What is left assertable, and is asserted: that every backend *accepts*
+/// the budget, and that a subsequent `Budget::DEFAULT` start still reaches
+/// `Running`. The second half is what stops a backend satisfying this by
+/// making `Immediate` a no-op that quietly leaves the service unstartable.
+fn starting_with_no_budget_is_accepted_and_establishes_nothing(
+    mgr: &dyn ServiceManager,
+    mk: &dyn Fn(&str) -> DaemonSpec,
+    cleanup: &mut Vec<Id>,
+) {
+    let spec = mk(&fresh_id("no-budget-start"));
+    mgr.install(&spec, false).expect("install");
+    cleanup.push(spec.id.clone());
+
+    mgr.start(&spec.id, Budget::Immediate)
+        .expect("a start with no budget issues the request and returns Ok");
+
+    mgr.start(&spec.id, Budget::DEFAULT)
+        .expect("a start that waits must still reach the service manager");
+    assert_eq!(
+        mgr.status(&spec.id).expect("status after a start that waited").state,
         State::Running,
         "id {}",
         spec.id
     );
-
-    mgr.stop(&spec.id)
-        .expect("stop on an already-stopped service must be Ok, not an error");
 }
 
 /// `pid` must mean the same thing in `list` as in `status` — the number
@@ -342,7 +384,7 @@ fn list_and_status_agree_on_pid(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> D
 
     assert_list_is_complete_and_pid_agrees(mgr, &spec.id, cleanup);
 
-    mgr.start(&spec.id).expect("start");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     assert_eq!(
         mgr.status(&spec.id).expect("status after start").state,
         State::Running,
@@ -351,7 +393,7 @@ fn list_and_status_agree_on_pid(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> D
     );
     assert_list_is_complete_and_pid_agrees(mgr, &spec.id, cleanup);
 
-    mgr.stop(&spec.id).expect("stop");
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
     assert_list_is_complete_and_pid_agrees(mgr, &spec.id, cleanup);
 }
 
@@ -437,8 +479,8 @@ pub fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, m
         ("uninstall", mgr.uninstall(id)),
         ("enable", mgr.enable(id)),
         ("disable", mgr.disable(id)),
-        ("start", mgr.start(id)),
-        ("stop", mgr.stop(id)),
+        ("start", mgr.start(id, Budget::DEFAULT)),
+        ("stop", mgr.stop(id, Budget::DEFAULT)),
     ] {
         assert!(
             matches!(&result, Err(Error::Undetermined { .. })),

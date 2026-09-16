@@ -6,7 +6,7 @@ use clap::Args as ClapArgs;
 
 use super::support::{IdVerbCall, run_id_verb};
 use crate::error::Result;
-use crate::manager::ServiceManager;
+use crate::manager::{Budget, ServiceManager};
 
 #[derive(ClapArgs, Debug)]
 pub struct Args {
@@ -28,7 +28,7 @@ pub fn run(
             ids: &args.ids,
             get_manager,
             is_elevated,
-            verb: &|mgr, id| mgr.start(id),
+            verb: &|mgr, id| mgr.start(id, Budget::DEFAULT),
             verb_past_tense: "started",
             absent_is_success: false,
         },

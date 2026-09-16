@@ -77,7 +77,7 @@ use crate::backend::Identity;
 use crate::backend::systemd::generate;
 use crate::decide::{self, Outcome};
 use crate::error::{Error, Result};
-use crate::manager::{Installed, ServiceManager, Status};
+use crate::manager::{Budget, Installed, ServiceManager, Status};
 use crate::spec::{AccountId, DaemonSpec, Id, User};
 
 /// Where systemd looks for system unit files. Never overridden — the integration tests run for real
@@ -179,7 +179,10 @@ impl ServiceManager for Systemd {
 
         // Order matters: stop, then disable (needs the fragment's `[Install]` section to know which
         // symlinks to remove), then remove the fragment and any drop-in, then reload.
-        stop_impl(&unit)?;
+        // Deliberately `Budget::Unbounded`: `uninstall` has no `--timeout` of its own, this stop
+        // is a means rather than an end, and bounding it would turn a slow-stopping service into a
+        // failed uninstall where today it succeeds.
+        stop_impl(id, Budget::Unbounded)?;
 
         let disabled = run_systemctl(&["disable", &unit])?;
         if !disabled.status.success() {
@@ -249,16 +252,16 @@ impl ServiceManager for Systemd {
         }
     }
 
-    fn start(&self, id: &Id) -> Result<()> {
+    fn start(&self, id: &Id, budget: Budget) -> Result<()> {
         let id = id.as_str();
         require_installed(id)?;
-        start_impl(&unit_name(id))
+        start_impl(id, budget)
     }
 
-    fn stop(&self, id: &Id) -> Result<()> {
+    fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
         let id = id.as_str();
         require_installed(id)?;
-        stop_impl(&unit_name(id))
+        stop_impl(id, budget)
     }
 
     fn status(&self, id: &Id) -> Result<Status> {

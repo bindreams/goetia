@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use clap::Parser as _;
 use goetia::cli::{self, Cli};
 use goetia::manager::fake::Fake;
-use goetia::manager::{Installed, ServiceManager, State, Status};
+use goetia::manager::{Budget, Installed, ServiceManager, State, Status};
 use goetia::spec::{DaemonSpec, Id, Kind, Restart, User};
 
 fn main() {
@@ -212,6 +212,13 @@ struct FlakyManager {
     /// `install`'s three `failure_code` call sites each classify their own
     /// step.
     undetermined_enable_for: Option<String>,
+    /// `start` fails with `Error::WaitTimeout`. A fourth independent
+    /// decision, and a different *condition* from the two above: the
+    /// request was issued and accepted, and goetia stopped waiting for its
+    /// outcome. `Fake` reaches this only for an entry seeded stalled, which
+    /// no `install`-path fixture has, so injecting it is the only way to
+    /// put it in front of `run_id_verb` and `install`'s own classifier.
+    wait_timeout_start_for: Option<String>,
     /// Makes `install`/`preview_install` return the `Conflict` flavour whose
     /// cause lies outside the directory the backend writes — systemd's
     /// `<id>.service.d` under `/usr/lib` or `.control`. `Fake` has no
@@ -228,6 +235,14 @@ fn unqueryable_failure() -> goetia::Error {
         command: "query-live-state".to_string(),
         stderr: "live state unavailable (injected test failure)".to_string(),
     }
+}
+
+/// A wait that ran out of budget. Built through the **real**
+/// `budget::timed_out` rather than a hand-written `Error::WaitTimeout`, so
+/// these tests pin the constructor every backend actually reports through,
+/// not a look-alike that could drift from it.
+fn injected_wait_timeout(id: &Id) -> goetia::Error {
+    goetia::manager::budget::timed_out(id.as_str(), "running", goetia::manager::Budget::DEFAULT)
 }
 
 fn injected_failure(id: &Id) -> goetia::Error {
@@ -289,17 +304,20 @@ impl ServiceManager for FlakyManager {
     fn disable(&self, id: &Id) -> goetia::Result<()> {
         self.inner.disable(id)
     }
-    fn start(&self, id: &Id) -> goetia::Result<()> {
+    fn start(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
         if self.fail_start_for.as_deref() == Some(id.as_str()) {
             return Err(injected_failure(id));
         }
         if self.undetermined_start_for.as_deref() == Some(id.as_str()) {
             return Err(injected_indeterminacy(id));
         }
-        self.inner.start(id)
+        if self.wait_timeout_start_for.as_deref() == Some(id.as_str()) {
+            return Err(injected_wait_timeout(id));
+        }
+        self.inner.start(id, budget)
     }
-    fn stop(&self, id: &Id) -> goetia::Result<()> {
-        self.inner.stop(id)
+    fn stop(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
+        self.inner.stop(id, budget)
     }
     fn status(&self, id: &Id) -> goetia::Result<Status> {
         if self.unqueryable.as_deref() == Some(id.as_str()) {
@@ -980,11 +998,11 @@ impl ServiceManager for PanicsOnStart {
     fn disable(&self, id: &Id) -> goetia::Result<()> {
         self.0.disable(id)
     }
-    fn start(&self, _id: &Id) -> goetia::Result<()> {
+    fn start(&self, _id: &Id, _budget: Budget) -> goetia::Result<()> {
         panic!("restart on an absent id must never reach start")
     }
-    fn stop(&self, id: &Id) -> goetia::Result<()> {
-        self.0.stop(id)
+    fn stop(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
+        self.0.stop(id, budget)
     }
     fn status(&self, id: &Id) -> goetia::Result<Status> {
         self.0.status(id)
@@ -1080,7 +1098,7 @@ fn stop_reaches_the_manager() {
     let fake = Fake::new();
     let spec = mk("frpc");
     fake.install(&spec, false).unwrap();
-    fake.start(&spec.id).unwrap();
+    fake.start(&spec.id, Budget::DEFAULT).unwrap();
 
     let (code, _out, _err) = dispatch_elevated(&["goetia", "daemon", "stop", "frpc"], &fake);
 
@@ -1134,7 +1152,7 @@ fn status_reaches_the_manager() {
     let fake = Fake::new();
     let spec = mk("frpc");
     fake.install(&spec, false).unwrap();
-    fake.start(&spec.id).unwrap();
+    fake.start(&spec.id, Budget::DEFAULT).unwrap();
 
     let (code, out, _err) = dispatch_read_only(&["goetia", "daemon", "status", "frpc"], &fake);
 
@@ -1150,7 +1168,7 @@ fn status_with_no_ids_prints_the_pid_like_the_per_id_form() {
     let fake = Fake::new();
     let spec = mk("frpc");
     fake.install(&spec, false).unwrap();
-    fake.start(&spec.id).unwrap();
+    fake.start(&spec.id, Budget::DEFAULT).unwrap();
 
     let (_, per_id, _) = dispatch_read_only(&["goetia", "daemon", "status", "frpc"], &fake);
     let (_, no_ids, _) = dispatch_read_only(&["goetia", "daemon", "status"], &fake);
@@ -1826,7 +1844,7 @@ fn list_json_emits_every_managed_daemon() {
     let fake = Fake::new();
     fake.install(&mk("websocat"), false).unwrap();
     fake.install(&mk("frpc"), false).unwrap();
-    fake.start(&Id::try_from("frpc").unwrap()).unwrap();
+    fake.start(&Id::try_from("frpc").unwrap(), Budget::DEFAULT).unwrap();
     fake.enable(&Id::try_from("frpc").unwrap()).unwrap();
 
     let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
@@ -1962,7 +1980,7 @@ fn status_json_reports_state_enabled_and_pid_for_a_named_id() {
     let fake = Fake::new();
     let spec = mk("frpc");
     fake.install(&spec, false).unwrap();
-    fake.start(&spec.id).unwrap();
+    fake.start(&spec.id, Budget::DEFAULT).unwrap();
     fake.enable(&spec.id).unwrap();
 
     let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "status", "frpc"], &fake);
@@ -1999,7 +2017,7 @@ fn status_json_reports_a_null_pid_for_a_stopped_daemon() {
 fn status_json_with_no_ids_equals_list_json() {
     let fake = Fake::new();
     fake.install(&mk("frpc"), false).unwrap();
-    fake.start(&Id::try_from("frpc").unwrap()).unwrap();
+    fake.start(&Id::try_from("frpc").unwrap(), Budget::DEFAULT).unwrap();
     fake.install(&mk("websocat"), false).unwrap();
     fake.seed_unreadable("corrupt");
     fake.seed_opaque("opaque");
@@ -2657,6 +2675,30 @@ fn restart_exits_four_for_an_undetermined_id() {
     );
 }
 
+/// A wait that ran out is the same *class* as an unanswered question — the code is about whether
+/// the question was answered — but a different condition, so `run_id_verb` needs its own arm.
+/// Without one it falls to the catch-all and reports `1`, which says the start determinately
+/// failed: the one thing an expiry did not establish, since the request was never cancelled.
+#[skuld::test]
+fn start_exits_four_when_the_wait_timed_out() {
+    let inner = Fake::new();
+    inner.install(&mk("frpc"), false).unwrap();
+    let mgr = FlakyManager {
+        inner,
+        wait_timeout_start_for: Some("frpc".to_string()),
+        ..Default::default()
+    };
+
+    let (code, _out, err) = dispatch_with(&["goetia", "daemon", "start", "frpc"], &mgr, &|| true);
+
+    assert_eq!(code, 4, "{err}");
+    assert!(err.contains("frpc"), "{err}");
+    assert!(
+        err.contains("did not report running"),
+        "the expiry must reach the user as one: {err}"
+    );
+}
+
 /// The combination a scalar exit flag could not express: one id that failed determinately and one
 /// goetia could not answer for at all.
 #[skuld::test]
@@ -2723,6 +2765,35 @@ fn install_exits_four_when_the_start_leg_cannot_be_determined() {
     let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
     let mgr = FlakyManager {
         undetermined_start_for: Some("frpc".to_string()),
+        ..Default::default()
+    };
+
+    let (code, out, err) = dispatch_with(
+        &[
+            "goetia",
+            "daemon",
+            "install",
+            "--start",
+            "-f",
+            manifest.to_str().unwrap(),
+        ],
+        &mgr,
+        &|| true,
+    );
+
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.contains("start"), "the failing step is named: {err}");
+}
+
+/// `install --start`'s own classifier, and the same rule as the undetermined case above: it
+/// classifies its own step. `failure_code`'s catch-all would report `1` — "the start determinately
+/// failed" — for a request that was issued, accepted and simply not waited out.
+#[skuld::test]
+fn install_exits_four_when_the_start_leg_timed_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let mgr = FlakyManager {
+        wait_timeout_start_for: Some("frpc".to_string()),
         ..Default::default()
     };
 

@@ -168,21 +168,6 @@ fn resolve_account_rejects_a_nonexistent_user() {
     assert!(err.to_string().contains("goetia-no-such-user-xyz"), "{err}");
 }
 
-// find_field ==========================================================================================================
-
-#[skuld::test]
-fn find_field_extracts_a_launchctl_print_style_line() {
-    let text = "system/foo = {\n\tstate = running\n\tpid = 4242\n}\n";
-    assert_eq!(find_field(text, "state"), Some("running"));
-    assert_eq!(find_field(text, "pid"), Some("4242"));
-}
-
-#[skuld::test]
-fn find_field_returns_none_for_a_missing_key() {
-    let text = "system/foo = {\n\tstate = running\n}\n";
-    assert_eq!(find_field(text, "pid"), None);
-}
-
 // locate ==============================================================================================================
 
 #[skuld::test]
