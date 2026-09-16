@@ -165,7 +165,7 @@ pub mod system {
     use std::io;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-    use windows_service::service::{Service, ServiceAccess};
+    use windows_service::service::{Service, ServiceAccess, ServiceState};
     use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
     use windows_sys::Win32::Foundation::{ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_NOT_ACTIVE, WAIT_IO_COMPLETION};
     use windows_sys::Win32::System::Services::{
@@ -401,22 +401,40 @@ pub mod system {
             match self.service.start::<&std::ffi::OsStr>(&[]) {
                 Ok(()) => Ok(()),
                 // Per [MS-SCMR]'s `RStartServiceW` error table, 1056 means
-                // only "`dwCurrentState` is not `SERVICE_STOPPED`" — it also
-                // covers StopPending/Paused/etc., none of which the
-                // `RUNNING`/`START_PENDING` arm above would have
-                // immediate-fired for (`NotifyServiceStatusChangeW` only
-                // immediate-fires when the service already matches the
-                // requested mask). Blindly treating 1056 as "already
-                // running, the wait will complete" would hang forever in
-                // those other cases. Confirm the real state before deciding.
+                // only "`dwCurrentState` is not `SERVICE_STOPPED`", which
+                // covers StopPending/Paused/etc. as well as the two states
+                // the arm above DID immediate-fire for: `want_to_mask` arms
+                // `SERVICE_NOTIFY_START_PENDING` in both of its
+                // `WantState::Running` branches, so a service already in
+                // START_PENDING resolves through the wait exactly as one
+                // already RUNNING does. Treating 1056 as "the wait will
+                // complete" would hang forever in the other cases; rejecting
+                // it outright fails a start that was going to succeed — and
+                // START_PENDING is precisely the state a service is in when
+                // something else started it a moment earlier. Confirm the
+                // real state before deciding.
+                //
+                // Accepting a queried `Running` is right here and would be
+                // WRONG for a `restart` that issued its start leg without a
+                // confirmed `Stopped`: a `type: simple` service reads RUNNING
+                // for its whole teardown (`goetia-shim` never reports
+                // STOP_PENDING), so this arm would report a successful start
+                // for a service that is about to go down and stay down.
+                // `restart_does_not_start_after_a_stop_that_timed_out` and
+                // `restart_with_no_budget_reports_a_rejected_start` in
+                // `tests/cli_dispatch.rs` keep that true.
                 Err(windows_service::Error::Winapi(e))
                     if e.raw_os_error() == Some(ERROR_SERVICE_ALREADY_RUNNING as i32) =>
                 {
                     match self.service.query_status() {
-                        Ok(status) if status.current_state == windows_service::service::ServiceState::Running => Ok(()),
+                        Ok(status)
+                            if matches!(status.current_state, ServiceState::Running | ServiceState::StartPending) =>
+                        {
+                            Ok(())
+                        }
                         Ok(status) => Err(io::Error::other(format!(
                             "StartServiceW reported ERROR_SERVICE_ALREADY_RUNNING, but the service is actually \
-                             {:?}, not Running — this wait cannot resolve from that state",
+                             {:?} — neither Running nor StartPending, so this wait cannot resolve from that state",
                             status.current_state
                         ))),
                         Err(query_err) => Err(to_io_error(query_err)),
