@@ -223,19 +223,23 @@ pub enum QueriedState {
 }
 
 /// Whether a `StartServiceW` that failed with `ERROR_SERVICE_ALREADY_RUNNING`
-/// (1056) can still be resolved by the wait that is already armed, given the
-/// state a follow-up query reported.
+/// (1056) still counts as a start, given the state a follow-up query
+/// reported. Consulted from both callers: [`start_via_notify`], which has a
+/// wait armed, and [`request_start`], which arms nothing.
 ///
 /// 1056 means only "`dwCurrentState` is not `SERVICE_STOPPED`", which lumps
-/// together states this wait can finish from and states it cannot.
-/// `Running` and `StartPending` are the two it can: `want_to_mask` arms
-/// `SERVICE_NOTIFY_START_PENDING` in *both* of its `WantState::Running`
-/// branches, so a service in either state immediate-fires and the wait
-/// resolves normally. `StartPending` in particular is what a service is in
+/// together states the service is on its way to running from and states it
+/// is not. `Running` and `StartPending` are the two it is, so the start the
+/// caller asked for needs nothing further — which is the whole of what
+/// [`request_start`] reports, and what the armed wait then confirms, since
+/// `want_to_mask` arms `SERVICE_NOTIFY_START_PENDING` in *both* of its
+/// `WantState::Running` branches and a service in either state
+/// immediate-fires it. `StartPending` in particular is what a service is in
 /// when something else started it a moment earlier — rejecting it fails a
-/// start that was going to succeed. For every other state the registration
-/// holds no bit that can fire, so accepting 1056 would block until the
-/// deadline instead of reporting what the service is really doing.
+/// start that was going to succeed. For every other state the service is not
+/// heading for running at all, so accepting 1056 would report a start that
+/// did not happen — and on the waiting path the registration holds no bit
+/// that can fire, so it would also block until the deadline.
 #[must_use]
 pub fn already_running_is_recoverable(queried: QueriedState) -> bool {
     matches!(queried, QueriedState::Running | QueriedState::StartPending)

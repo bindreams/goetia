@@ -267,9 +267,12 @@ impl super::ScmActor for SystemScmActor {
         let err = io::Error::last_os_error();
         match err.raw_os_error() {
             // The service stopped between the caller's early-return
-            // query and this control. The STOPPED arm has already
-            // queued the notification, so the wait still completes —
-            // benign.
+            // query and this control, so the stop asked for has
+            // happened — benign on both callers. `request_stop` armed
+            // nothing and has nothing left to wait for; under
+            // `stop_via_notify` the STOPPED arm ran before this
+            // control, so the SCM has already queued that notification
+            // and the wait still completes.
             Some(code) if code as u32 == ERROR_SERVICE_NOT_ACTIVE => Ok(()),
             _ => Err(err),
         }
@@ -300,7 +303,7 @@ impl super::ScmActor for SystemScmActor {
                     Ok(status) if already_running_is_recoverable(queried_state(status.current_state)) => Ok(()),
                     Ok(status) => Err(io::Error::other(format!(
                         "StartServiceW reported ERROR_SERVICE_ALREADY_RUNNING, but the service is actually \
-                             {:?} — neither Running nor StartPending, so this wait cannot resolve from that state",
+                             {:?} — neither Running nor StartPending, so nothing is on its way to running",
                         status.current_state
                     ))),
                     Err(query_err) => Err(to_io_error(query_err)),
