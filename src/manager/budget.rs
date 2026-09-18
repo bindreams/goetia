@@ -44,9 +44,14 @@ impl Budget {
     /// clock to represent is indistinguishable from `Unbounded`, so that is
     /// what it becomes.
     pub fn start(self) -> Deadline {
+        self.start_at(Instant::now())
+    }
+
+    /// [`Self::start`] as of `now`, so a test can hold the instant fixed.
+    fn start_at(self, now: Instant) -> Deadline {
         match self {
-            Budget::Immediate => Deadline(Some(Instant::now())),
-            Budget::Bounded(d) => Deadline(Instant::now().checked_add(d)),
+            Budget::Immediate => Deadline(Some(now)),
+            Budget::Bounded(d) => Deadline(now.checked_add(d)),
             Budget::Unbounded => Deadline(None),
         }
     }
@@ -58,8 +63,17 @@ impl Budget {
 /// `Bounded(remaining)`. Normalises the zero case at the one place it is
 /// manufactured, so it agrees with [`Budget::waits`] by construction rather
 /// than by coincidence.
+///
+/// `Immediate` means "do not wait", which a bounded budget that ran out is
+/// not: a caller that must tell the two apart compares against the budget it
+/// started from, as `cli::restart`'s `leg` does.
 pub fn budget_for(deadline: Deadline) -> Budget {
-    match deadline.remaining() {
+    budget_for_at(deadline, Instant::now())
+}
+
+/// [`budget_for`] as of `now`, so a test can hold the instant fixed.
+fn budget_for_at(deadline: Deadline, now: Instant) -> Budget {
+    match deadline.remaining_at(now) {
         None => Budget::Unbounded,
         Some(Duration::ZERO) => Budget::Immediate,
         Some(remaining) => Budget::Bounded(remaining),
@@ -127,8 +141,12 @@ impl Deadline {
     /// Time left until expiry, saturating at `Duration::ZERO` rather than
     /// going negative. `None` = unbounded, never expires.
     pub fn remaining(&self) -> Option<Duration> {
-        self.0
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        self.remaining_at(Instant::now())
+    }
+
+    /// [`Self::remaining`] as of `now`, so a test can hold the instant fixed.
+    fn remaining_at(&self, now: Instant) -> Option<Duration> {
+        self.0.map(|deadline| deadline.saturating_duration_since(now))
     }
 
     pub fn expired(&self) -> bool {

@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::*;
 
@@ -36,12 +36,21 @@ fn immediate_starts_already_expired() {
     assert!(Budget::Immediate.start().expired());
 }
 
+/// Every instant is one the test names, so no margin is bet on how long the run takes.
 #[skuld::test]
-fn a_bounded_deadline_reports_a_remaining_shorter_than_the_budget() {
-    let budget = Duration::from_secs(60);
-    let remaining = Budget::Bounded(budget).start().remaining().unwrap();
-    assert!(remaining <= budget);
-    assert!(remaining > Duration::ZERO);
+fn a_bounded_deadline_counts_down_from_the_budget() {
+    let now = Instant::now();
+    let deadline = Budget::Bounded(Duration::from_secs(60)).start_at(now);
+    assert_eq!(deadline.remaining_at(now), Some(Duration::from_secs(60)));
+    assert_eq!(
+        deadline.remaining_at(now + Duration::from_secs(45)),
+        Some(Duration::from_secs(15))
+    );
+    assert_eq!(
+        deadline.remaining_at(now + Duration::from_secs(61)),
+        Some(Duration::ZERO),
+        "saturates rather than going negative"
+    );
 }
 
 #[skuld::test]
@@ -68,18 +77,22 @@ fn a_budget_too_large_to_represent_is_unbounded_not_a_panic() {
 
 // budget_for ==========================================================================================================
 
+/// Every instant is one the test names, so no margin is bet on how long the run takes.
 #[skuld::test]
 fn a_spent_deadline_yields_an_immediate_budget() {
-    assert_eq!(budget_for(Budget::Immediate.start()), Budget::Immediate);
-    assert_eq!(budget_for(Budget::Unbounded.start()), Budget::Unbounded);
+    let now = Instant::now();
+    assert_eq!(budget_for_at(Budget::Immediate.start_at(now), now), Budget::Immediate);
+    assert_eq!(budget_for_at(Budget::Unbounded.start_at(now), now), Budget::Unbounded);
 
-    match budget_for(Budget::DEFAULT.start()) {
-        Budget::Bounded(d) => {
-            assert!(d > Duration::ZERO);
-            assert!(d <= Duration::from_secs(10));
-        }
-        other => panic!("expected Budget::Bounded, got {other:?}"),
-    }
+    let deadline = Budget::DEFAULT.start_at(now);
+    assert_eq!(
+        budget_for_at(deadline, now + Duration::from_secs(4)),
+        Budget::Bounded(Duration::from_secs(6))
+    );
+    assert_eq!(
+        budget_for_at(deadline, now + Duration::from_secs(10)),
+        Budget::Immediate
+    );
 }
 
 // timed_out ===========================================================================================================

@@ -1125,12 +1125,15 @@ fn stop_reaches_the_manager() {
     );
 }
 
+/// `--no-timeout`, not the default: under a bounded budget, `restart` reads the clock between its
+/// legs, and a machine stalled for the whole budget there would abandon the start — a bet on time
+/// this test has no reason to make.
 #[skuld::test]
 fn restart_reaches_the_manager() {
     let fake = Fake::new();
     fake.install(&mk("frpc"), false).unwrap();
 
-    let (code, _out, _err) = dispatch_elevated(&["goetia", "daemon", "restart", "frpc"], &fake);
+    let (code, _out, _err) = dispatch_elevated(&["goetia", "daemon", "restart", "frpc", "--no-timeout"], &fake);
 
     assert_eq!(code, 0);
     assert_eq!(
@@ -2671,7 +2674,8 @@ fn start_exits_four_for_an_undetermined_id() {
 
 /// `restart` re-wraps the start leg's failure to say the daemon is now down. The wrap must preserve
 /// the variant, or the state where the distinction matters most — stopped, and not back up — is the
-/// one that reports a plain failure.
+/// one that reports a plain failure. `--no-timeout`, as in `restart_reaches_the_manager`, so the
+/// start leg is reached however long the stop took.
 #[skuld::test]
 fn restart_exits_four_for_an_undetermined_id() {
     let inner = Fake::new();
@@ -2682,7 +2686,7 @@ fn restart_exits_four_for_an_undetermined_id() {
         ..Default::default()
     };
 
-    let (code, _out, err) = dispatch_with(&["goetia", "daemon", "restart", "frpc"], &mgr, &|| true);
+    let (code, _out, err) = dispatch_with(&["goetia", "daemon", "restart", "frpc", "--no-timeout"], &mgr, &|| true);
 
     assert_eq!(code, 4, "{err}");
     assert!(
@@ -3014,6 +3018,9 @@ fn restart_that_never_stopped_still_exits_1() {
 
 /// goetia does not start into an unconfirmed stop. Asserted on the **absence** of the start call:
 /// an implementation that issues it and then reports `4` passes an exit-code assertion alone.
+///
+/// No bet on time: whether the stop leg gets what is left of the `1s` or a budget already spent,
+/// every assertion below holds — see `restart_does_not_start_after_a_stop_whose_budget_was_spent`.
 #[skuld::test]
 fn restart_does_not_start_after_a_stop_that_timed_out() {
     let fake = Fake::new();
