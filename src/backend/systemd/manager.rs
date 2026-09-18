@@ -70,7 +70,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use discover::{DROPIN_SEARCH_DIRS, RawState, absent_error, classify_and_read, discover, raw_state, require_installed};
-use systemctl::{daemon_reload, daemon_reload_or_report, run_systemctl, start_impl, status_from_unit, stop_impl};
+use systemctl::{
+    daemon_reload, daemon_reload_or_report, require_supported, run_systemctl, start_impl, status_from_unit, stop_impl,
+};
 use write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 
 use crate::backend::Identity;
@@ -100,6 +102,7 @@ impl Systemd {
 
 impl ServiceManager for Systemd {
     fn install(&self, spec: &DaemonSpec, force: bool) -> Result<Outcome> {
+        require_supported()?;
         let identity = identity_for(&spec.user)?;
         let desired = generate::unit(spec, &identity);
 

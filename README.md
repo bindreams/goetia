@@ -14,11 +14,13 @@ Everything documented below — the manifest's interpolation syntax, the
 may still change** between releases. Pin a specific released version, or a
 specific commit if working ahead of one.
 
-goetia requires **systemd 242+** (2019). Generated units use `Type=exec`
-(240+): on an older systemd, `systemctl start` fails to load the unit with
-systemd's own diagnostic naming the directive. Every `start` and `stop` runs
-`systemctl --show-transaction` (242+), which an older `systemctl` rejects as
-an unrecognized option.
+goetia requires **systemd 242+** (2019), as `systemctl --version` reports it,
+and refuses to install, uninstall, start, stop or restart anything on an older
+one, before writing or running anything. Generated units use `Type=exec`
+(240+), which is what lets a start report a missing executable or user as a
+failure. An older systemd does not reject the directive: it logs that it
+cannot parse it and runs the unit as `Type=simple`, silently losing exactly
+that. And every `start` and `stop` runs `systemctl --show-transaction` (242+).
 
 ## Verifying a download
 

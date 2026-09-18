@@ -311,3 +311,45 @@ fn an_offline_systemctl_that_exits_0_took_nothing() {
         }
     }
 }
+
+// supported ===========================================================================================================
+
+#[skuld::test]
+fn systemd_242_and_newer_is_supported() {
+    for version in [
+        "systemd 242 (242)\n+PAM +AUDIT\n",
+        "systemd 257 (257.13-1~deb13u1)\n",
+        "systemd 258~rc1 (258~rc1-1)\n",
+    ] {
+        assert!(supported(version).is_ok(), "{version:?}");
+    }
+}
+
+/// Below the floor the refusal names both numbers and why: 240 and 241 have `Type=exec` but not
+/// `--show-transaction`, and anything older runs `Type=exec` units as `Type=simple`.
+#[skuld::test]
+fn systemd_older_than_242_is_refused_with_the_floor_and_the_reason() {
+    for (version, reported) in [("systemd 241 (241)\n", "241"), ("systemd 237\n+PAM\n", "237")] {
+        let msg = supported(version).expect_err(version).to_string();
+        assert!(msg.contains("requires systemd 242 or newer"), "{msg}");
+        assert!(msg.contains(&format!("reports {reported}")), "{msg}");
+        assert!(msg.contains("Type=simple"), "{msg}");
+        assert!(msg.contains("--show-transaction"), "{msg}");
+    }
+}
+
+/// A version goetia cannot read is not a version it can vouch for.
+#[skuld::test]
+fn an_unreadable_version_is_refused() {
+    for version in ["", "systemd\n", "systemd abc\n", "not systemd 257\n"] {
+        let msg = supported(version).expect_err(version).to_string();
+        assert!(msg.contains("names no version goetia can read"), "{version:?}: {msg}");
+    }
+}
+
+/// The real `systemctl --version` on this host is readable, and new enough — so the parse above is
+/// the one real output takes.
+#[skuld::test]
+fn this_hosts_systemd_is_supported() {
+    require_supported().expect("the host running the tests runs systemd 242+");
+}

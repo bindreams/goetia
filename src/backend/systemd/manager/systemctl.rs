@@ -39,6 +39,45 @@ pub(super) fn daemon_reload_or_report(id: &str) -> Result<()> {
     })
 }
 
+/// The oldest systemd goetia runs against: generated units declare `Type=exec` (240), and every start
+/// and stop runs `systemctl --show-transaction` (242).
+const SYSTEMD_FLOOR: u32 = 242;
+
+/// Refuse a systemd older than [`SYSTEMD_FLOOR`], as `systemctl --version` reports it. Asked wherever
+/// goetia writes a unit or starts or stops one, and nowhere else: an older systemd does not reject
+/// `Type=exec` but logs that it cannot parse it and runs the unit as `Type=simple`, silently losing
+/// the failed-exec detection the directive is there for.
+pub(super) fn require_supported() -> Result<()> {
+    let output = run_systemctl(&["--version"])?;
+    if !output.status.success() {
+        return Err(Error::Other(format!(
+            "`systemctl --version` failed, so goetia cannot tell whether this is systemd \
+             {SYSTEMD_FLOOR}+: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    supported(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// [`require_supported`]'s verdict on what `systemctl --version` printed: `systemd <N> (...)` first.
+fn supported(version: &str) -> Result<()> {
+    let first = version.lines().next().unwrap_or_default();
+    let number = first
+        .strip_prefix("systemd ")
+        .map(|rest| rest.chars().take_while(char::is_ascii_digit).collect::<String>())
+        .and_then(|digits| digits.parse::<u32>().ok());
+    let found = match number {
+        Some(n) if n >= SYSTEMD_FLOOR => return Ok(()),
+        Some(n) => format!("`systemctl --version` reports {n}"),
+        None => format!("`systemctl --version` names no version goetia can read ({first:?})"),
+    };
+    Err(Error::Other(format!(
+        "goetia requires systemd {SYSTEMD_FLOOR} or newer, and {found}. An older systemd runs \
+         goetia's `Type=exec` units as `Type=simple`, which cannot report a failed exec, and \
+         rejects the `systemctl --show-transaction` every start and stop runs."
+    )))
+}
+
 /// The argv for one `systemctl <verb> <unit>` under `budget`.
 ///
 /// `--show-transaction` on every path: its announcement ([`enqueued`]) is the only evidence that
@@ -83,6 +122,7 @@ fn enqueued(stderr: &[u8]) -> bool {
 /// that discovery used up, or one a few milliseconds long, still reaches systemd, and an expiry is
 /// then exactly what `budget::timed_out` says it is. `budget` only picks the path and the wording.
 fn run_verb(verb: &str, unit: &str, budget: Budget, deadline: Deadline) -> Result<Finished> {
+    require_supported()?;
     run_verb_via("systemctl", &verb_args(verb, unit, budget), budget, deadline)
 }
 

@@ -850,6 +850,64 @@ fn an_offline_systemctl_is_never_reported_as_started_or_stopped() {
     }
 }
 
+/// `goetia <args>`, elevated as this test is, with a `systemctl` first on its `PATH` that reports
+/// systemd 241 — the newest without `--show-transaction` — to `--version`, and fails anything else:
+/// a refusal must come before goetia asks systemd for anything more.
+fn goetia_on_systemd_241(args: &[&str]) -> std::process::Output {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = dir.path().join("systemctl");
+    fs::write(
+        &fake,
+        "#!/bin/sh\n[ \"$1\" = --version ] && { echo 'systemd 241 (241)'; exit 0; }\n\
+         echo \"stand-in: unexpected systemctl $*\" >&2; exit 99\n",
+    )
+    .expect("write the stand-in systemctl");
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod 0755");
+    let path = format!(
+        "{}:{}",
+        dir.path().display(),
+        std::env::var("PATH").expect("PATH is set")
+    );
+    Command::new(env!("CARGO_BIN_EXE_goetia"))
+        .args(args)
+        .env("PATH", path)
+        .output()
+        .expect("spawn goetia")
+}
+
+/// Below systemd 242 goetia refuses before it writes a unit or runs a start or stop — rather than
+/// install a `Type=exec` unit an older systemd silently runs as `Type=simple`, or fail every start
+/// and stop on an unrecognized option.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn an_older_systemd_is_refused_before_anything_is_written_or_run() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let (_dir, manifest) = world_readable_manifest(guard.id());
+    let manifest = manifest.to_str().expect("utf-8 temp path");
+    let refused = |args: &[&str]| {
+        let output = goetia_on_systemd_241(args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(stderr.contains("requires systemd 242 or newer"), "{args:?}: {stderr}");
+    };
+
+    refused(&["daemon", "install", "--file", manifest, guard.id()]);
+    assert!(!unit_path(guard.id()).exists(), "a refused install wrote the unit");
+
+    let mgr = Systemd::new();
+    mgr.install(&mk(guard.id()), false)
+        .expect("install on this host's systemd");
+    for verb in ["start", "stop", "restart", "uninstall"] {
+        refused(&["daemon", verb, guard.id()]);
+        assert_eq!(
+            active_state_and_job(guard.id()),
+            ("inactive".to_string(), String::new()),
+            "a refused {verb} ran something"
+        );
+    }
+    assert!(unit_path(guard.id()).exists(), "a refused uninstall removed the unit");
+}
+
 /// `Type=exec` is what makes `systemctl start` report failure here at all — under `Type=simple` the
 /// same spec's `start` returns `Ok`. `restart: always` is pinned explicitly (`mk`'s default is
 /// `OnFailure`) so the unit under test is exactly `Type=exec` + `Restart=always` +
