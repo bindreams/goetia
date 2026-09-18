@@ -6,12 +6,23 @@ use std::time::Duration;
 use super::*;
 use crate::manager::budget::Budget;
 
+/// `child`, already spawned, armed as [`spawn`] would arm it under `role` — for the roles that need
+/// nothing made before the spawn.
+fn armed(child: cosca::Child, role: Role) -> Spawned {
+    let armed = match role {
+        Role::Query => Armed::Query,
+        Role::AnnouncedRequest(issued) => Armed::AnnouncedRequest(issued),
+        Role::Request => panic!("a request's reaper is made before its spawn: use `spawn_with`"),
+    };
+    Spawned { child, armed }
+}
+
 // wait_bounded, through `command` =====================================================================================
 
 #[skuld::test]
 fn a_child_that_exits_is_reported_with_its_output() {
     let child = command("/bin/echo", &["hi"]).unwrap().spawn().unwrap();
-    let finished = wait_bounded(child, Budget::Unbounded.start(), Role::Query).unwrap();
+    let finished = wait_bounded(armed(child, Role::Query), Budget::Unbounded.start()).unwrap();
     match finished {
         Finished::Exited { status, capture } => {
             assert!(status.success());
@@ -28,7 +39,7 @@ fn a_nonzero_exit_is_reported_not_an_error() {
         .unwrap()
         .spawn()
         .unwrap();
-    let finished = wait_bounded(child, Budget::Unbounded.start(), Role::Query).unwrap();
+    let finished = wait_bounded(armed(child, Role::Query), Budget::Unbounded.start()).unwrap();
     match finished {
         Finished::Exited { status, capture } => {
             assert_eq!(status.code(), Some(3));
@@ -49,7 +60,7 @@ fn an_expired_deadline_kills_and_reaps_the_child() {
     // 50ms is chosen only to exercise a real block rather than the
     // already-expired path.
     let deadline = Budget::Bounded(Duration::from_millis(50)).start();
-    let finished = wait_bounded(child, deadline, Role::Query).unwrap();
+    let finished = wait_bounded(armed(child, Role::Query), deadline).unwrap();
     assert!(matches!(finished, Finished::Expired));
 
     // A zombie would still answer `kill(pid, 0)` successfully; `ESRCH` is
@@ -63,7 +74,7 @@ fn an_expired_deadline_kills_and_reaps_the_child() {
 #[skuld::test]
 fn an_already_expired_deadline_does_not_wait() {
     let child = command("sleep", &["2147483647"]).unwrap().spawn().unwrap();
-    let finished = wait_bounded(child, Budget::Immediate.start(), Role::Query).unwrap();
+    let finished = wait_bounded(armed(child, Role::Query), Budget::Immediate.start()).unwrap();
     assert!(matches!(finished, Finished::Expired));
 }
 
@@ -89,7 +100,7 @@ fn an_expiry_with_output_in_flight_is_reported_as_expired() {
         .spawn()
         .unwrap();
     let deadline = Budget::Bounded(Duration::from_millis(50)).start();
-    let finished = wait_bounded(child, deadline, Role::Query).unwrap();
+    let finished = wait_bounded(armed(child, Role::Query), deadline).unwrap();
     assert!(matches!(finished, Finished::Expired), "{finished:?}");
 }
 
@@ -115,7 +126,7 @@ fn a_child_whose_descendant_holds_the_pipe_still_returns_on_expiry() {
     let descendant: libc::pid_t = line.trim().parse().unwrap();
 
     let deadline = Budget::Bounded(Duration::from_millis(50)).start();
-    let finished = wait_bounded(child, deadline, Role::Query).unwrap();
+    let finished = wait_bounded(armed(child, Role::Query), deadline).unwrap();
     assert!(matches!(finished, Finished::Expired));
 
     // Leave nothing behind.
@@ -144,7 +155,7 @@ fn a_contained_childs_descendant_dies_with_it() {
     let descendant: u32 = line.trim().parse().unwrap();
 
     let deadline = Budget::Bounded(Duration::from_millis(50)).start();
-    let finished = wait_bounded(child, deadline, Role::Query).unwrap();
+    let finished = wait_bounded(armed(child, Role::Query), deadline).unwrap();
     assert!(matches!(finished, Finished::Expired));
 
     // A real event-driven death-watch (pidfd on Linux, EVFILT_PROC |
@@ -193,7 +204,7 @@ fn output_larger_than_a_pipe_buffer_does_not_deadlock() {
         .unwrap()
         .spawn()
         .unwrap();
-    let finished = wait_bounded(child, Budget::Unbounded.start(), Role::Query).unwrap();
+    let finished = wait_bounded(armed(child, Role::Query), Budget::Unbounded.start()).unwrap();
     match finished {
         Finished::Exited { capture, .. } => {
             assert_eq!(capture.stdout.len(), 200_000);
@@ -232,7 +243,11 @@ fn an_announced_request_is_issued_whatever_the_deadline() {
     .spawn()
     .unwrap();
 
-    let finished = wait_bounded(child, Budget::Immediate.start(), Role::AnnouncedRequest(announced)).unwrap();
+    let finished = wait_bounded(
+        armed(child, Role::AnnouncedRequest(announced)),
+        Budget::Immediate.start(),
+    )
+    .unwrap();
 
     assert!(matches!(finished, Finished::Expired), "{finished:?}");
     assert!(request.exists(), "the request must be out before the deadline applies");
@@ -248,7 +263,11 @@ fn an_announced_request_that_ends_unannounced_is_reported_exited() {
         .spawn()
         .unwrap();
 
-    let finished = wait_bounded(child, Budget::Immediate.start(), Role::AnnouncedRequest(announced)).unwrap();
+    let finished = wait_bounded(
+        armed(child, Role::AnnouncedRequest(announced)),
+        Budget::Immediate.start(),
+    )
+    .unwrap();
 
     match finished {
         Finished::Exited { status, capture } => {
@@ -267,7 +286,11 @@ fn what_an_announced_request_wrote_before_announcing_is_kept() {
         .spawn()
         .unwrap();
 
-    let finished = wait_bounded(child, Budget::Unbounded.start(), Role::AnnouncedRequest(announced)).unwrap();
+    let finished = wait_bounded(
+        armed(child, Role::AnnouncedRequest(announced)),
+        Budget::Unbounded.start(),
+    )
+    .unwrap();
 
     match finished {
         Finished::Exited { capture, .. } => assert_eq!(capture.stderr, b"early\nrequest issued\n"),
@@ -276,71 +299,89 @@ fn what_an_announced_request_wrote_before_announcing_is_kept() {
 }
 
 /// A request goetia cannot see arrive is never killed on expiry — the kill could land before the
-/// manager has the request — and is reaped once it exits, so a long-lived caller is left no zombie
-/// per expired request. The test ends the child itself, with `SIGTERM`, and the reaper reports what
-/// it reaped: a child the expiry killed reports the `SIGKILL` that got there first, and one nobody
-/// reaps reports nothing — the channel's sender is dropped unsent, which `recv` returns as an error.
+/// manager has the request — and its reaper reaps it once it exits, so a long-lived caller is left
+/// no zombie per expired request.
+///
+/// The child exits `7` at EOF on its stdin, and the test's write end reaches the reaper along with
+/// the child: the reaper's `wait` drops it, so the child can exit only once it is the reaper's and
+/// the reaper is waiting. Whatever killed it before then — the expiry, or the reaper itself — shows
+/// as a signal instead of `7`, with no race. A child nobody reaps reports nothing: the reaper's
+/// sender is dropped unsent, which `recv` returns as an error.
 #[skuld::test]
 fn an_unannounced_request_is_left_running_on_expiry_and_reaped_once_it_exits() {
-    let child = unannounced_request().spawn().unwrap();
-    let pid = child.id().pid() as libc::pid_t;
-    let (tx, rx) = std::sync::mpsc::channel();
-
-    let finished = wait_bounded_then(child, Budget::Immediate.start(), Role::Request, move |status| {
-        tx.send(status).expect("the test is still receiving");
-    })
+    let (writer_tx, writer_rx) = mpsc::channel::<io::PipeWriter>();
+    let (tx, rx) = mpsc::channel();
+    let reaper = Reaper::with(
+        move |child| {
+            drop(writer_rx.recv());
+            child.wait()
+        },
+        move |status| tx.send(status).expect("the test is still receiving"),
+    )
     .unwrap();
+    let mut spawned = spawn_with(&mut exits_7_at_eof(), Role::Request, || Ok(reaper)).unwrap();
+    writer_tx.send(spawned.child.stdin().expect("stdin is piped")).unwrap();
+
+    let finished = wait_bounded(spawned, Budget::Immediate.start()).unwrap();
 
     assert!(matches!(finished, Finished::Expired), "{finished:?}");
-    unsafe {
-        libc::kill(pid, libc::SIGTERM);
-    }
     let status = rx
         .recv()
         .expect("a request left running must be reaped once it exits")
         .expect("waiting on the child");
     assert_eq!(
-        status.signal(),
-        Some(libc::SIGTERM),
-        "an expiry must not kill a request it cannot see arrive: {status:?}"
+        status.code(),
+        Some(7),
+        "nothing may kill a request it cannot see arrive: {status:?}"
     );
 }
 
-/// What the reaper falls back to when no thread can be made to run it: the child is dropped, and a
-/// [`Detached`] one is left running rather than killed. The test ends and reaps it itself, as nothing
-/// else will.
+/// A request no thread could be made to reap is never run: a program that does not exist reports
+/// the reaper's failure, not its own — so nothing was spawned to fail.
 #[skuld::test]
-fn a_detached_child_is_left_running_when_dropped() {
-    let child = unannounced_request().spawn().unwrap();
-    let pid = child.id().pid() as libc::pid_t;
+fn a_request_that_could_have_no_reaper_is_never_run() {
+    let mut cmd = command("/nonexistent/goetia-never-run", &[]).unwrap();
 
-    drop(Detached(Some(child)));
+    let Err(e) = spawn_with(&mut cmd, Role::Request, || Err(io::Error::other("no threads left"))) else {
+        panic!("a request with no reaper must not be spawned");
+    };
 
-    let mut status = 0;
-    unsafe {
-        libc::kill(pid, libc::SIGTERM);
-        libc::waitpid(pid, &mut status, 0);
-    }
+    let msg = e.to_string();
     assert!(
-        libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGTERM,
-        "dropping a detached child must not kill it (wait status {status:#x})"
+        msg.contains("no thread could be made to reap it, so it was not run"),
+        "{msg}"
     );
+    assert!(msg.contains("no threads left"), "{msg}");
 }
 
-/// The child [`an_unannounced_request_is_left_running_on_expiry_and_reaped_once_it_exits`] leaves running: `command()`'s, as
-/// launchd's `launchctl` — the one production `Role::Request` — is spawned.
+/// A reaper whose request exited inside its budget has nothing to reap, and its thread ends: the
+/// thread's closures are dropped with it, and the channel one of them held reports that.
+#[skuld::test]
+fn a_reaper_with_nothing_to_reap_ends() {
+    let (tx, rx) = mpsc::channel::<()>();
+    let reaper = Reaper::with(cosca::Child::wait, move |_| drop(tx)).unwrap();
+
+    drop(reaper);
+
+    assert!(rx.recv().is_err(), "the reaper reaped something it was never handed");
+}
+
+/// The child the reaper test hands its reaper: exits `7` at EOF on its stdin, a pipe the test holds.
+/// `command()`'s, as launchd's `launchctl` — the one production `Role::Request` — is spawned.
 #[cfg(not(target_os = "linux"))]
-fn unannounced_request() -> cosca::Command {
-    command("sleep", &["2147483647"]).unwrap()
+fn exits_7_at_eof() -> cosca::Command {
+    let mut cmd = command("/bin/sh", &["-c", "read line; exit 7"]).unwrap();
+    cmd.stdin(cosca::Stdio::pipe_in()).unwrap();
+    cmd
 }
 
 /// On Linux, uncontained. cosca 0.4's cgroup containment kills a detached tree — the leaf's `Drop`
 /// writes `cgroup.kill` — and leaves the leaf behind, measured; nothing on Linux detaches, since
 /// `systemctl` announces its requests.
 #[cfg(target_os = "linux")]
-fn unannounced_request() -> cosca::Command {
-    let mut cmd = cosca::run(["sleep", "2147483647"]);
-    cmd.stdin(cosca::Stdio::null()).unwrap();
+fn exits_7_at_eof() -> cosca::Command {
+    let mut cmd = cosca::run(["/bin/sh", "-c", "read line; exit 7"]);
+    cmd.stdin(cosca::Stdio::pipe_in()).unwrap();
     cmd.stdout(cosca::Stdio::pipe_out()).unwrap();
     cmd.stderr(cosca::Stdio::pipe_out()).unwrap();
     cmd

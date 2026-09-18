@@ -223,8 +223,8 @@ fn run_verb_via(program: &str, args: &[&str], budget: Budget, deadline: Deadline
     for (key, value) in AUDIBLE {
         cmd.env(key, value);
     }
-    let child = cmd.spawn().map_err(|e| failed(e.to_string()))?;
-    bounded::wait_bounded(child, deadline, Role::AnnouncedRequest(enqueued)).map_err(|e| failed(e.to_string()))
+    let spawned = bounded::spawn(&mut cmd, Role::AnnouncedRequest(enqueued)).map_err(|e| failed(e.to_string()))?;
+    bounded::wait_bounded(spawned, deadline).map_err(|e| failed(e.to_string()))
 }
 
 /// Whether `line` is one `systemctl` writes on success as much as on failure — the transaction

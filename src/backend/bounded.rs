@@ -15,6 +15,7 @@ use std::io::Read;
 use std::os::unix::process::ExitStatusExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::process::ExitStatus;
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -85,33 +86,61 @@ pub(crate) enum Role {
     AnnouncedRequest(fn(&[u8]) -> bool),
     /// A request that never says when the manager has it. The deadline applies from the spawn, but
     /// an expiry leaves the child running rather than killing it, since a kill could land before
-    /// the request is out, and reaps it once it exits. launchd's alone: on Linux, cosca 0.4's cgroup containment kills a
-    /// detached tree when it drops the leaf, so a [`command`] child would not be left running.
+    /// the request is out, and its [`Reaper`] reaps it once it exits. launchd's alone: on Linux,
+    /// cosca 0.4's cgroup containment kills a detached tree when it drops the leaf, so a
+    /// [`command`] child would not be left running.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Request,
 }
 
-/// Block until `child` exits or `deadline` expires, under `role`'s rule for what an expiry does:
-/// kill the child, tear its tree down and reap it — or, for [`Role::Request`], leave it running and
-/// reap it once it exits.
-/// Its pipes are drained by up to two **detached** threads reporting over a channel, so the return
-/// value never waits on a reader.
-pub(crate) fn wait_bounded(
+/// A child [`spawn`]ed under a [`Role`], holding what that role needed made before the spawn.
+pub(crate) struct Spawned {
     child: cosca::Child,
-    deadline: Deadline,
-    role: Role,
-) -> Result<Finished, cosca::error::Error> {
-    wait_bounded_then(child, deadline, role, |_| {})
+    armed: Armed,
 }
 
-/// [`wait_bounded`], handing the status of a [`Role::Request`] it left running to `reaped` once
-/// that child has exited and been reaped: the one outcome that arrives after this returns.
-fn wait_bounded_then(
-    mut child: cosca::Child,
-    deadline: Deadline,
+/// A [`Role`] with its [`Reaper`], for the role that needs one.
+enum Armed {
+    Query,
+    AnnouncedRequest(fn(&[u8]) -> bool),
+    Request(Reaper),
+}
+
+/// Spawn `cmd` under `role`. A [`Role::Request`]'s [`Reaper`] is made first: an expiry leaves that
+/// child running, and one no thread could reap is not run at all — never killed, and never left a
+/// zombie.
+pub(crate) fn spawn(cmd: &mut cosca::Command, role: Role) -> Result<Spawned, cosca::error::Error> {
+    spawn_with(cmd, role, Reaper::new)
+}
+
+/// [`spawn`], with the reaper's maker named, so a test can make one that fails, or one that reports.
+fn spawn_with(
+    cmd: &mut cosca::Command,
     role: Role,
-    reaped: impl FnOnce(Result<ExitStatus, cosca::error::Error>) + Send + 'static,
-) -> Result<Finished, cosca::error::Error> {
+    reaper: impl FnOnce() -> std::io::Result<Reaper>,
+) -> Result<Spawned, cosca::error::Error> {
+    let armed = match role {
+        Role::Query => Armed::Query,
+        Role::AnnouncedRequest(issued) => Armed::AnnouncedRequest(issued),
+        Role::Request => Armed::Request(reaper().map_err(|e| {
+            cosca::error::Error::Io(std::io::Error::new(
+                e.kind(),
+                format!("no thread could be made to reap it, so it was not run: {e}"),
+            ))
+        })?),
+    };
+    Ok(Spawned {
+        child: cmd.spawn()?,
+        armed,
+    })
+}
+
+/// Block until the child exits or `deadline` expires, under its [`Role`]'s rule for what an expiry
+/// does: kill the child, tear its tree down and reap it — or, for [`Role::Request`], leave it
+/// running for its [`Reaper`]. Its pipes are drained by up to two **detached** threads reporting
+/// over a channel, so the return value never waits on a reader.
+pub(crate) fn wait_bounded(spawned: Spawned, deadline: Deadline) -> Result<Finished, cosca::error::Error> {
+    let Spawned { mut child, armed } = spawned;
     let (tx, rx) = crossbeam_channel::unbounded();
     if let Some(r) = child.stdout() {
         let tx = tx.clone();
@@ -126,7 +155,7 @@ fn wait_bounded_then(
     // Unbounded, deliberately: this is the request going out, not the wait for its answer. A child
     // that ends without announcing ends here too, once its output reaches EOF.
     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-    if let Role::AnnouncedRequest(issued) = role {
+    if let Armed::AnnouncedRequest(issued) = armed {
         while !issued(&stderr) {
             match rx.recv() {
                 Ok(chunk) => absorb(chunk, &mut stdout, &mut stderr).map_err(cosca::error::Error::Io)?,
@@ -139,15 +168,15 @@ fn wait_bounded_then(
         Some(at) => child.wait_deadline(at)?,
         None => Some(child.wait()?), // no timeout value is invented for an unbounded deadline
     };
-    let status = match waited {
-        Some(status) => Some(status),
-        None if matches!(role, Role::Request) => {
+    let status = match (waited, armed) {
+        (Some(status), _) => Some(status),
+        (None, Armed::Request(reaper)) => {
             // Not killed: goetia cannot tell whether the request is out yet, and a request left
             // unsent because goetia ran out of budget is the one answer worse than waiting.
-            reap_in_background(child, reaped);
+            reaper.reap(child);
             return Ok(Finished::Expired);
         }
-        None => {
+        (None, Armed::Query | Armed::AnnouncedRequest(_)) => {
             // The root first, and its `Ok` is what makes the reap below unable to block.
             child.kill()?;
             // Then the tree, best-effort. What this achieves that `Drop` (at the end of
@@ -187,36 +216,46 @@ fn wait_bounded_then(
     })
 }
 
-/// Wait `child` out on a thread of its own and reap it, then hand its status to `reaped`: a request
-/// left running still exits, and a caller that outlives it must not collect one zombie per expiry.
+/// A thread made before a [`Role::Request`] is spawned, which reaps it if an expiry leaves it
+/// running: it still exits, and a caller that outlives it must not collect one zombie per expiry.
+/// Made first because it can fail, and a request no thread could reap is one [`spawn`] never runs.
 ///
-/// Never killed, not even after the reap. The thread [`cosca::Child::detach`]es the reaped child
-/// rather than dropping it, because `Drop` tears a contained tree down, and after the reap that is
-/// the reap-then-recycle hazard [`wait_bounded`]'s kill path is ordered to avoid: macOS's
-/// `FdMarker` `killpg`s the root's pgid, which the kernel may by then have handed to another group.
-/// `detach` touches no pid.
-///
-/// A thread that cannot be created drops its closure, and the child with it. [`Detached`] detaches it
-/// then too — left unreaped, since waiting here would outlast the budget and killing it could cancel
-/// the request.
-fn reap_in_background(
-    child: cosca::Child,
-    reaped: impl FnOnce(Result<ExitStatus, cosca::error::Error>) + Send + 'static,
-) {
-    let child = Detached(Some(child));
-    let _unreaped_if_no_thread = thread::Builder::new().name("goetia-reaper".to_string()).spawn(move || {
-        let status = child.0.as_ref().expect("only `Drop` takes it").wait();
-        drop(child);
-        reaped(status);
-    });
-}
+/// The thread never kills the child, not even after the reap. It [`cosca::Child::detach`]es the
+/// reaped child rather than dropping it, because `Drop` tears a contained tree down, and after the
+/// reap that is the reap-then-recycle hazard [`wait_bounded`]'s kill path is ordered to avoid:
+/// macOS's `FdMarker` `killpg`s the root's pgid, which the kernel may by then have handed to
+/// another group. `detach` touches no pid. With nothing to reap — the request exited inside its
+/// budget — the sender is dropped unsent and the thread ends.
+pub(crate) struct Reaper(mpsc::Sender<cosca::Child>);
 
-/// A child that is [`cosca::Child::detach`]ed when dropped, never killed.
-struct Detached(Option<cosca::Child>);
+impl Reaper {
+    fn new() -> std::io::Result<Reaper> {
+        Reaper::with(cosca::Child::wait, |_| {})
+    }
 
-impl Drop for Detached {
-    fn drop(&mut self) {
-        if let Some(child) = self.0.take() {
+    /// A reaper that waits with `wait` and hands the status to `reaped`: the seam a test drives, to
+    /// release its child only once the child is the reaper's, and to learn how it ended.
+    fn with(
+        wait: impl FnOnce(&cosca::Child) -> Result<ExitStatus, cosca::error::Error> + Send + 'static,
+        reaped: impl FnOnce(Result<ExitStatus, cosca::error::Error>) + Send + 'static,
+    ) -> std::io::Result<Reaper> {
+        let (tx, rx) = mpsc::channel::<cosca::Child>();
+        thread::Builder::new()
+            .name("goetia-reaper".to_string())
+            .spawn(move || {
+                let Ok(child) = rx.recv() else { return };
+                let status = wait(&child);
+                child.detach();
+                reaped(status);
+            })?;
+        Ok(Reaper(tx))
+    }
+
+    fn reap(self, child: cosca::Child) {
+        // The thread blocks in `recv` until this send, so it cannot fail. Were it to, the child is
+        // detached — never killed.
+        if let Err(mpsc::SendError(child)) = self.0.send(child) {
+            debug_assert!(false, "the reaper thread ended before it was handed its child");
             child.detach();
         }
     }

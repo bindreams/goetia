@@ -755,7 +755,8 @@ struct Ran {
 /// **Every** `launchctl` call the budgeted verbs make goes through here
 /// (D6a), and `role` is what keeps the budget from deciding whether a
 /// request is sent: a [`Role::Request`] that expires is left running, never
-/// killed, since `launchctl` never says when launchd has the request.
+/// killed, since `launchctl` never says when launchd has the request — and is
+/// not run at all if no thread could be made to reap it (a `CommandFailed`).
 ///
 /// `Ok(None)` iff the deadline expired first. For a request that is not a
 /// failure of the command — the request is out, or on its way in a
@@ -770,8 +771,8 @@ fn launchctl(args: &[&str], deadline: Deadline, role: Role) -> Result<Option<Ran
         stderr: e.to_string(),
     };
     let mut cmd = bounded::command("launchctl", args).map_err(failed)?;
-    let child = cmd.spawn().map_err(failed)?;
-    Ok(match bounded::wait_bounded(child, deadline, role).map_err(failed)? {
+    let spawned = bounded::spawn(&mut cmd, role).map_err(failed)?;
+    Ok(match bounded::wait_bounded(spawned, deadline).map_err(failed)? {
         bounded::Finished::Exited { status, capture } => Some(Ran { status, capture }),
         bounded::Finished::Expired => None,
     })
