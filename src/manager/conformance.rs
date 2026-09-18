@@ -400,7 +400,9 @@ fn starting_with_no_budget_is_accepted_and_establishes_nothing(
 /// that. What every backend must do is accept the start once the stop before
 /// it is confirmed — a refusal there would fail every `restart --timeout 0`
 /// — and leave the service startable. Like the scenario above, nothing is
-/// asserted about the state the request itself leaves.
+/// asserted about the state the request itself leaves; the systemd suite
+/// asserts that it reaches systemd, race-free, behind a start that cannot
+/// complete (`a_restart_with_no_budget_queues_its_start_in_systemd`).
 fn a_start_request_after_a_confirmed_stop_is_accepted(
     mgr: &dyn ServiceManager,
     mk: &dyn Fn(&str) -> DaemonSpec,

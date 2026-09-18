@@ -703,6 +703,102 @@ fn a_start_on_a_spent_budget_still_reaches_systemd() {
     );
 }
 
+/// The types of the jobs systemd has queued for `id`'s unit, as `systemctl list-jobs` reports them.
+fn queued_job_types(id: &str) -> Vec<String> {
+    let unit = format!("{id}.service");
+    let run = cmd::run("systemctl", &["list-jobs", "--no-legend", "--plain", &unit]).expect_ok();
+    run.stdout
+        .lines()
+        .filter_map(|line| match line.split_whitespace().collect::<Vec<_>>()[..] {
+            [_, name, kind, ..] if name == unit => Some(kind.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A unit whose every start is held once [`HeldStart::install`] returns: a drop-in `ExecStartPre`
+/// blocks for as long as the hold file exists, so a start job, once queued, stays queued. `Drop`
+/// releases it — the hold file, then a blocking `stop`, then `reset-failed` for the `failed` state
+/// a stop in `start-pre` leaves. Declared after the `ServiceGuard`, so it drops first.
+struct HeldStart {
+    unit: String,
+    hold: PathBuf,
+}
+
+impl HeldStart {
+    fn install(mgr: &Systemd, spec: &DaemonSpec) -> Self {
+        let id = spec.id.as_str();
+        let hold = PathBuf::from(format!("/run/{id}.hold"));
+        mgr.install(spec, false).expect("install");
+        let dir = dropin_dir(id);
+        fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
+        fs::write(
+            dir.join("hold.conf"),
+            format!(
+                "[Service]\nExecStartPre=/bin/sh -c 'test -e {} && exec /bin/sleep infinity || exit 0'\n",
+                hold.display()
+            ),
+        )
+        .expect("write drop-in");
+        cmd::run("systemctl", &["daemon-reload"]).expect_ok();
+        let held = HeldStart {
+            unit: format!("{id}.service"),
+            hold,
+        };
+        mgr.start(&spec.id, Budget::DEFAULT).expect("start before the hold");
+        fs::write(&held.hold, "").expect("create the hold file");
+        held
+    }
+}
+
+impl Drop for HeldStart {
+    fn drop(&mut self) {
+        if let Err(e) = fs::remove_file(&self.hold) {
+            eprintln!("HeldStart[{}]: remove {}: {e}", self.unit, self.hold.display());
+        }
+        for args in [&["stop", self.unit.as_str()][..], &["reset-failed", self.unit.as_str()]] {
+            let run = cmd::run("systemctl", args);
+            if !run.ok() {
+                eprintln!("HeldStart[{}]: cleanup failed: {run}", self.unit);
+            }
+        }
+    }
+}
+
+/// `restart --timeout 0`'s start leg is `request_start_after_stop`, and it must reach systemd: the
+/// stop before it proves nothing, since a stop alone restores nothing. The start is held, so the job
+/// it queues can never complete and a `start` job is the only answer — whether systemd has run the
+/// stop yet or not. A start leg that issued nothing leaves a `stop` job or none.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_restart_with_no_budget_queues_its_start_in_systemd() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let spec = mk(guard.id());
+    let mgr = Systemd::new();
+    let _held = HeldStart::install(&mgr, &spec);
+    let args = goetia::cli::restart::Args {
+        ids: vec![guard.id().to_string()],
+        wait: goetia::cli::wait::WaitArgs {
+            timeout: Some(Duration::ZERO),
+            no_timeout: false,
+        },
+    };
+    let get_manager = || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(Systemd::new())) };
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+
+    // Truthful, not a stub: `support::elevated` is this test's own precondition.
+    let code = goetia::cli::restart::run(&args, &get_manager, &|| true, &mut out, &mut err);
+
+    let (out, err) = (String::from_utf8_lossy(&out), String::from_utf8_lossy(&err));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let jobs = queued_job_types(guard.id());
+    assert!(
+        jobs.iter().any(|kind| kind == "start"),
+        "the start leg never reached systemd: jobs={jobs:?}, {:?}",
+        active_state_and_job(guard.id())
+    );
+}
+
 /// `Type=exec` is what makes `systemctl start` report failure here at all — under `Type=simple` the
 /// same spec's `start` returns `Ok`. `restart: always` is pinned explicitly (`mk`'s default is
 /// `OnFailure`) so the unit under test is exactly `Type=exec` + `Restart=always` +
