@@ -238,7 +238,6 @@ impl Prepared {
         Prepared { _held: None }
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn holding(held: impl std::any::Any) -> Self {
         Prepared {
             _held: Some(Box::new(held)),

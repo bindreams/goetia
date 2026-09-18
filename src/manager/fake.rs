@@ -106,9 +106,26 @@ struct Store {
     /// Every `start`/`stop`/`restart` this Fake was asked to perform, in
     /// order — see [`Fake::calls`].
     calls: Vec<(&'static str, String)>,
+    /// The steps each [`ServiceManager::prepare`] was given, in order — see
+    /// [`Fake::prepared`].
+    prepared: Vec<Vec<Step>>,
+    /// The steps of every guard `prepare` returned that has not been
+    /// dropped, by guard number.
+    live: Vec<(u64, Vec<Step>)>,
+    /// The number the next guard `prepare` returns is known by.
+    next_guard: u64,
+    /// Every request, with the steps of the guards live when it was asked —
+    /// see [`Fake::guarded`].
+    guarded: Vec<(&'static str, String, Vec<Step>)>,
 }
 
 impl Store {
+    /// Record a request for [`Fake::guarded`], under the guards live now.
+    fn asked(&mut self, verb: &'static str, id: &Id) {
+        let steps = self.live.iter().flat_map(|(_, steps)| steps.iter().copied()).collect();
+        self.guarded.push((verb, id.as_str().to_string(), steps));
+    }
+
     /// The artifact at `id`, or the error its absence means *there* — never
     /// a bare [`Error::NotInstalled`] read off the map lookup alone. Every
     /// verb goes through this or [`Store::get_mut`], so none of them can
@@ -388,6 +405,22 @@ impl Fake {
         state.calls.clone()
     }
 
+    /// The steps every [`ServiceManager::prepare`] was given, in order —
+    /// failed ones included.
+    pub fn prepared(&self) -> Vec<Vec<Step>> {
+        let state = self.state.lock().expect("Fake mutex poisoned");
+        state.prepared.clone()
+    }
+
+    /// Every `install`/`start`/`stop`/`restart` this Fake was asked for, in
+    /// order, each with the steps of every [`Prepared`] still held when it
+    /// was asked: whether the preparation that should cover a request did —
+    /// the right steps, not yet released.
+    pub fn guarded(&self) -> Vec<(&'static str, String, Vec<Step>)> {
+        let state = self.state.lock().expect("Fake mutex poisoned");
+        state.guarded.clone()
+    }
+
     /// Test-only: force `id`'s reported [`State`] directly, bypassing
     /// `start`/`stop` (which can only produce `Running`/`Stopped`). `id`
     /// must already be installed.
@@ -500,11 +533,25 @@ fn discover(state: &Store, id: &str) -> (Ownership, Option<String>) {
     (found, existing.map(|e| e.text))
 }
 
+/// What [`Fake`]'s `prepare` holds: its steps stay live until this drops.
+struct Held {
+    store: Arc<Mutex<Store>>,
+    guard: u64,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let mut state = self.store.lock().expect("Fake mutex poisoned");
+        state.live.retain(|(guard, _)| *guard != self.guard);
+    }
+}
+
 // ServiceManager ======================================================================================================
 
 impl ServiceManager for Fake {
     fn install(&self, spec: &DaemonSpec, force: bool) -> Result<Outcome> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.asked("install", &spec.id);
         // Before `discover`, which has no error channel: an artifact whose
         // bytes were never read supplies none of `decide`'s inputs, so this
         // is an input failure ahead of policy, not a fifth `Ownership`.
@@ -606,6 +653,7 @@ impl ServiceManager for Fake {
         // answers "was this attempted", which is a different question from
         // whether it succeeded or changed anything.
         state.calls.push(("start", id.as_str().to_string()));
+        state.asked("start", id);
         let stalls = state.start_stalls.contains(id.as_str());
         let entry = state.get_mut(id)?;
         require_ours(entry, id)?;
@@ -622,14 +670,24 @@ impl ServiceManager for Fake {
         Ok(())
     }
 
-    /// Fails only once [`Fake::seed_prepare_fails`]ed; holds nothing.
-    fn prepare(&self, _steps: &[Step]) -> Result<Prepared> {
-        if self.state.lock().expect("Fake mutex poisoned").prepare_fails {
+    /// Fails only once [`Fake::seed_prepare_fails`]ed. Makes nothing ready,
+    /// but records `steps`, and holds them live for [`Fake::guarded`] until
+    /// the guard drops.
+    fn prepare(&self, steps: &[Step]) -> Result<Prepared> {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.prepared.push(steps.to_vec());
+        if state.prepare_fails {
             return Err(Error::Other(
                 "nothing could be prepared (injected test failure)".to_string(),
             ));
         }
-        Ok(Prepared::nothing())
+        let guard = state.next_guard;
+        state.next_guard += 1;
+        state.live.push((guard, steps.to_vec()));
+        Ok(Prepared::holding(Held {
+            store: Arc::clone(&self.state),
+            guard,
+        }))
     }
 
     /// Only once [`Fake::seed_native_restart`]ed. Request-only, so it settles
@@ -640,6 +698,7 @@ impl ServiceManager for Fake {
             return None;
         }
         state.calls.push(("restart", id.as_str().to_string()));
+        state.asked("restart", id);
         Some(state.get_mut(id).and_then(|entry| require_ours(entry, id)))
     }
 
@@ -649,6 +708,7 @@ impl ServiceManager for Fake {
     fn request_start_after_stop(&self, id: &Id) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.calls.push(("start", id.as_str().to_string()));
+        state.asked("start", id);
         let entry = state.get_mut(id)?;
         require_ours(entry, id)?;
         if entry.state == State::Running {
@@ -662,6 +722,7 @@ impl ServiceManager for Fake {
     fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.calls.push(("stop", id.as_str().to_string()));
+        state.asked("stop", id);
         let stalls = state.stop_stalls.contains(id.as_str());
         let entry = state.get_mut(id)?;
         require_ours(entry, id)?;

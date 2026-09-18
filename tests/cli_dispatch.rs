@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use clap::Parser as _;
 use goetia::cli::{self, Cli, Command, DaemonCommand};
 use goetia::manager::fake::Fake;
-use goetia::manager::{Budget, Installed, ServiceManager, State, Status};
+use goetia::manager::{Budget, Installed, ServiceManager, State, Status, Step};
 use goetia::spec::{DaemonSpec, Id, Kind, Restart, User};
 
 fn main() {
@@ -3269,6 +3269,91 @@ fn install_without_start_prepares_nothing() {
     );
 
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(fake.prepared(), Vec::<Vec<Step>>::new());
+    assert_eq!(fake.guarded(), vec![("install", "frpc".to_string(), vec![])]);
+}
+
+/// `(verb, id, steps)` for each of `sent`, as [`Fake::guarded`] records a request asked while a
+/// preparation of `steps` was held.
+fn under(steps: &[Step], sent: &[(&'static str, &str)]) -> Vec<(&'static str, String, Vec<Step>)> {
+    sent.iter()
+        .map(|(verb, id)| (*verb, id.to_string(), steps.to_vec()))
+        .collect()
+}
+
+/// `restart` prepares both of its legs before either sends anything, and holds what it prepared
+/// until both are sent, then releases it before the next id's — under every budget, the one-request
+/// restart included.
+#[skuld::test]
+fn restart_holds_what_it_prepared_for_both_legs_until_both_are_sent() {
+    let both = [Step::Stop, Step::Start];
+    let two_legs: &[(&str, &str)] = &[("stop", "frpc"), ("start", "frpc"), ("stop", "web"), ("start", "web")];
+    for (budget, native, sent) in [
+        (&[][..], false, two_legs),
+        (&["--no-timeout"][..], false, two_legs),
+        (&["--timeout", "0"][..], false, two_legs),
+        (
+            &["--timeout", "0"][..],
+            true,
+            &[("restart", "frpc"), ("restart", "web")][..],
+        ),
+    ] {
+        let fake = Fake::new();
+        fake.install(&mk("frpc"), false).unwrap();
+        fake.install(&mk("web"), false).unwrap();
+        if native {
+            fake.seed_native_restart();
+        }
+        let seeded = fake.guarded().len();
+        let mut args = vec!["goetia", "daemon", "restart", "frpc", "web"];
+        args.extend_from_slice(budget);
+
+        let (code, out, err) = dispatch_elevated(&args, &fake);
+
+        assert_eq!(code, 0, "{budget:?}\nstdout:\n{out}\nstderr:\n{err}");
+        assert_eq!(fake.prepared(), vec![both.to_vec(), both.to_vec()], "{budget:?}");
+        assert_eq!(fake.guarded()[seeded..], under(&both, sent), "{budget:?}");
+    }
+}
+
+/// `install --start` prepares the install and the start before the install sends anything, and
+/// holds what it prepared until the start is sent, then releases it before the next daemon's.
+#[skuld::test]
+fn install_start_holds_what_it_prepared_until_the_start_is_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(
+        dir.path(),
+        "daemons:\n  frpc:\n    command: [daemon]\n  web:\n    command: [daemon]\n",
+    );
+    let fake = Fake::new();
+
+    let (code, out, err) = dispatch_elevated(
+        &[
+            "goetia",
+            "daemon",
+            "install",
+            "--file",
+            manifest.to_str().unwrap(),
+            "--start",
+        ],
+        &fake,
+    );
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let both = [Step::Install, Step::Start];
+    assert_eq!(fake.prepared(), vec![both.to_vec(), both.to_vec()]);
+    assert_eq!(
+        fake.guarded(),
+        under(
+            &both,
+            &[
+                ("install", "frpc"),
+                ("start", "frpc"),
+                ("install", "web"),
+                ("start", "web")
+            ]
+        )
+    );
 }
 
 #[skuld::test]
