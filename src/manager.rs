@@ -70,6 +70,10 @@ pub trait ServiceManager {
     /// not fabricate that confirmation: reporting one it did not obtain is
     /// the failure this whole signature exists to prevent.
     ///
+    /// **`budget` bounds waiting for that confirmation, never whether the
+    /// request is sent.** The request is issued whatever is left of the
+    /// budget, and only the wait for the manager's answer is cut short.
+    ///
     /// [`Budget::Immediate`] issues the request and returns without waiting,
     /// establishing nothing. `Ok(())` then means only that the request was
     /// accepted, so a caller must not read any state from it — and neither
@@ -88,7 +92,8 @@ pub trait ServiceManager {
     /// On expiry, [`Error::WaitTimeout`] — never `Ok(())`, and never
     /// [`Error::Undetermined`], which claims the *installation* is in doubt
     /// when what actually happened is that a settled id's request was issued
-    /// and not waited out.
+    /// and not waited out. That the request *was* issued is what the rule
+    /// above guarantees, and what `WaitTimeout`'s wording states.
     ///
     /// Idempotent under every budget: starting an already-running service is
     /// `Ok(())`, not an error.
@@ -101,8 +106,8 @@ pub trait ServiceManager {
     /// its boot-enablement.
     ///
     /// `Ok(())` means the service manager reports the service as stopped, on
-    /// the same terms as [`Self::start`], and an expiry is
-    /// [`Error::WaitTimeout`] on the same terms too.
+    /// the same terms as [`Self::start`]; `budget` bounds only the wait, as
+    /// there; and an expiry is [`Error::WaitTimeout`] on the same terms too.
     ///
     /// **Where a platform offers no request-only form,
     /// [`Budget::Immediate`] still performs the full blocking call, because

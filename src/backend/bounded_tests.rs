@@ -11,7 +11,7 @@ use crate::manager::budget::Budget;
 #[skuld::test]
 fn a_child_that_exits_is_reported_with_its_output() {
     let child = command("/bin/echo", &["hi"]).unwrap().spawn().unwrap();
-    let finished = wait_bounded(child, Budget::Unbounded.start()).unwrap();
+    let finished = wait_bounded(child, Budget::Unbounded.start(), Role::Query).unwrap();
     match finished {
         Finished::Exited { status, capture } => {
             assert!(status.success());
@@ -28,7 +28,7 @@ fn a_nonzero_exit_is_reported_not_an_error() {
         .unwrap()
         .spawn()
         .unwrap();
-    let finished = wait_bounded(child, Budget::Unbounded.start()).unwrap();
+    let finished = wait_bounded(child, Budget::Unbounded.start(), Role::Query).unwrap();
     match finished {
         Finished::Exited { status, capture } => {
             assert_eq!(status.code(), Some(3));
@@ -49,7 +49,7 @@ fn an_expired_deadline_kills_and_reaps_the_child() {
     // 50ms is chosen only to exercise a real block rather than the
     // already-expired path.
     let deadline = Budget::Bounded(Duration::from_millis(50)).start();
-    let finished = wait_bounded(child, deadline).unwrap();
+    let finished = wait_bounded(child, deadline, Role::Query).unwrap();
     assert!(matches!(finished, Finished::Expired));
 
     // A zombie would still answer `kill(pid, 0)` successfully; `ESRCH` is
@@ -63,7 +63,7 @@ fn an_expired_deadline_kills_and_reaps_the_child() {
 #[skuld::test]
 fn an_already_expired_deadline_does_not_wait() {
     let child = command("sleep", &["2147483647"]).unwrap().spawn().unwrap();
-    let finished = wait_bounded(child, Budget::Immediate.start()).unwrap();
+    let finished = wait_bounded(child, Budget::Immediate.start(), Role::Query).unwrap();
     assert!(matches!(finished, Finished::Expired));
 }
 
@@ -89,7 +89,7 @@ fn an_expiry_with_output_in_flight_is_reported_as_expired() {
         .spawn()
         .unwrap();
     let deadline = Budget::Bounded(Duration::from_millis(50)).start();
-    let finished = wait_bounded(child, deadline).unwrap();
+    let finished = wait_bounded(child, deadline, Role::Query).unwrap();
     assert!(matches!(finished, Finished::Expired), "{finished:?}");
 }
 
@@ -115,7 +115,7 @@ fn a_child_whose_descendant_holds_the_pipe_still_returns_on_expiry() {
     let descendant: libc::pid_t = line.trim().parse().unwrap();
 
     let deadline = Budget::Bounded(Duration::from_millis(50)).start();
-    let finished = wait_bounded(child, deadline).unwrap();
+    let finished = wait_bounded(child, deadline, Role::Query).unwrap();
     assert!(matches!(finished, Finished::Expired));
 
     // Leave nothing behind.
@@ -142,7 +142,7 @@ fn a_contained_childs_descendant_dies_with_it() {
     let descendant: u32 = line.trim().parse().unwrap();
 
     let deadline = Budget::Bounded(Duration::from_millis(50)).start();
-    let finished = wait_bounded(child, deadline).unwrap();
+    let finished = wait_bounded(child, deadline, Role::Query).unwrap();
     assert!(matches!(finished, Finished::Expired));
 
     // A real event-driven death-watch (pidfd on Linux, EVFILT_PROC |
@@ -166,7 +166,7 @@ fn output_larger_than_a_pipe_buffer_does_not_deadlock() {
         .unwrap()
         .spawn()
         .unwrap();
-    let finished = wait_bounded(child, Budget::Unbounded.start()).unwrap();
+    let finished = wait_bounded(child, Budget::Unbounded.start(), Role::Query).unwrap();
     match finished {
         Finished::Exited { capture, .. } => {
             assert_eq!(capture.stdout.len(), 200_000);
@@ -174,6 +174,96 @@ fn output_larger_than_a_pipe_buffer_does_not_deadlock() {
         }
         Finished::Expired => panic!("expected Exited, got Expired"),
     }
+}
+
+// Role ================================================================================================================
+
+/// What [`announced`] reports issued: the marker the scripts below write once their "request" is out.
+const ISSUED: &[u8] = b"request issued";
+
+fn announced(stderr: &[u8]) -> bool {
+    stderr.windows(ISSUED.len()).any(|w| w == ISSUED)
+}
+
+/// The budget never decides whether a request is sent. The child's "request" is the file it creates
+/// before announcing; the deadline is spent before the child even starts, so a wait that applied
+/// the deadline from the spawn would kill it first. The child cannot exit on its own afterwards, so
+/// `Expired` is the only answer and no timing is bet on.
+#[skuld::test]
+fn an_announced_request_is_issued_whatever_the_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let request = dir.path().join("request");
+    let child = command(
+        "/bin/sh",
+        &[
+            "-c",
+            "touch \"$0\"; echo 'request issued' >&2; exec sleep 2147483647",
+            request.to_str().unwrap(),
+        ],
+    )
+    .unwrap()
+    .spawn()
+    .unwrap();
+
+    let finished = wait_bounded(child, Budget::Immediate.start(), Role::AnnouncedRequest(announced)).unwrap();
+
+    assert!(matches!(finished, Finished::Expired), "{finished:?}");
+    assert!(request.exists(), "the request must be out before the deadline applies");
+}
+
+/// A child that ends without announcing — `systemctl` refusing a unit it cannot load — is reported
+/// with its own exit, not as an expiry. Its output reaching EOF means it is already exiting, so the
+/// kill a spent deadline sends cannot overwrite that exit.
+#[skuld::test]
+fn an_announced_request_that_ends_unannounced_is_reported_exited() {
+    let child = command("/bin/sh", &["-c", "echo refused >&2; exit 3"])
+        .unwrap()
+        .spawn()
+        .unwrap();
+
+    let finished = wait_bounded(child, Budget::Immediate.start(), Role::AnnouncedRequest(announced)).unwrap();
+
+    match finished {
+        Finished::Exited { status, capture } => {
+            assert_eq!(status.code(), Some(3));
+            assert_eq!(capture.stderr, b"refused\n");
+        }
+        Finished::Expired => panic!("expected Exited, got Expired"),
+    }
+}
+
+/// What the child wrote while issuing its request is kept: it is the start of the diagnostic.
+#[skuld::test]
+fn what_an_announced_request_wrote_before_announcing_is_kept() {
+    let child = command("/bin/sh", &["-c", "echo early >&2; echo 'request issued' >&2; exit 1"])
+        .unwrap()
+        .spawn()
+        .unwrap();
+
+    let finished = wait_bounded(child, Budget::Unbounded.start(), Role::AnnouncedRequest(announced)).unwrap();
+
+    match finished {
+        Finished::Exited { capture, .. } => assert_eq!(capture.stderr, b"early\nrequest issued\n"),
+        Finished::Expired => panic!("expected Exited, got Expired"),
+    }
+}
+
+/// A request goetia cannot see arrive is never killed: killing it could cancel a request the manager
+/// has not yet received. The child is left running, and the test reaps it itself.
+#[skuld::test]
+fn an_unannounced_request_is_left_running_on_expiry() {
+    let child = command("sleep", &["2147483647"]).unwrap().spawn().unwrap();
+    let pid = child.id().pid() as libc::pid_t;
+
+    let finished = wait_bounded(child, Budget::Immediate.start(), Role::Request).unwrap();
+
+    assert!(matches!(finished, Finished::Expired), "{finished:?}");
+    let alive = unsafe { libc::kill(pid, 0) } == 0;
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+        libc::waitpid(pid, std::ptr::null_mut(), 0);
+    }
+    assert!(alive, "an expiry must not kill a request it cannot see arrive");
 }
 
 // expiry_disposition ==================================================================================================

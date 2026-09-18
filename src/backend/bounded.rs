@@ -1,7 +1,10 @@
 //! `wait_bounded`: block on a `cosca::Child` under a [`Deadline`], capturing
 //! its stdout/stderr concurrently with the wait so a full pipe buffer can
-//! never wedge it, and reporting on expiry whether the killed-and-reaped
-//! child had already finished on its own.
+//! never wedge it, and reporting on expiry whether the child had already
+//! finished on its own.
+//!
+//! The deadline bounds waiting for the manager's answer, never whether a
+//! request is sent — see [`Role`].
 //!
 //! systemd and launchd both reach their manager through a subprocess that
 //! already blocks (`systemctl`/`launchctl`); this is the only machinery
@@ -51,7 +54,8 @@ pub(crate) struct Capture {
 pub(crate) enum Finished {
     /// The child exited on its own, inside the budget.
     Exited { status: ExitStatus, capture: Capture },
-    /// The deadline expired first; the child was killed and reaped.
+    /// The deadline expired first. The child was killed and reaped — or, under
+    /// [`Role::Request`], left running.
     ///
     /// Carries no capture. Whatever the child had written by then is a
     /// prefix no consumer may treat as whole, and the one thing every
@@ -63,10 +67,38 @@ pub(crate) enum Finished {
     Expired,
 }
 
-/// Block until `child` exits or `deadline` expires; on expiry, kill the child, tear
-/// its tree down and reap it. Its pipes are drained by up to two **detached** threads
-/// reporting over a channel, so the return value never waits on a reader.
-pub(crate) fn wait_bounded(mut child: cosca::Child, deadline: Deadline) -> Result<Finished, cosca::error::Error> {
+/// What the child does for its caller, which decides what the deadline may cut short.
+///
+/// The rule all three share: the deadline bounds waiting for the manager's answer, and never
+/// decides whether a request reaches the manager at all.
+#[derive(Debug, Clone, Copy)]
+// Each backend constructs only the roles its own tool needs: `systemctl` announces its request,
+// `launchctl` does not.
+pub(crate) enum Role {
+    /// A read. Killing it on expiry loses nothing.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Query,
+    /// A request that says on stderr when the manager has it: `issued` holds once it has. Until
+    /// then the wait is unbounded; only after it does the deadline apply, and killing the child
+    /// then cancels nothing.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    AnnouncedRequest(fn(&[u8]) -> bool),
+    /// A request that never says when the manager has it. The deadline applies from the spawn, but
+    /// an expiry leaves the child running rather than killing it, since a kill could land before
+    /// the request is out.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Request,
+}
+
+/// Block until `child` exits or `deadline` expires, under `role`'s rule for what an expiry does:
+/// kill the child, tear its tree down and reap it — or, for [`Role::Request`], leave it running.
+/// Its pipes are drained by up to two **detached** threads reporting over a channel, so the return
+/// value never waits on a reader.
+pub(crate) fn wait_bounded(
+    mut child: cosca::Child,
+    deadline: Deadline,
+    role: Role,
+) -> Result<Finished, cosca::error::Error> {
     let (tx, rx) = crossbeam_channel::unbounded();
     if let Some(r) = child.stdout() {
         let tx = tx.clone();
@@ -78,12 +110,30 @@ pub(crate) fn wait_bounded(mut child: cosca::Child, deadline: Deadline) -> Resul
     }
     drop(tx); // the readers are `collect`'s only senders; its EOF is their exit
 
+    // Unbounded, deliberately: this is the request going out, not the wait for its answer. A child
+    // that ends without announcing ends here too, once its output reaches EOF.
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    if let Role::AnnouncedRequest(issued) = role {
+        while !issued(&stderr) {
+            match rx.recv() {
+                Ok(chunk) => absorb(chunk, &mut stdout, &mut stderr).map_err(cosca::error::Error::Io)?,
+                Err(RecvError) => break, // both readers at EOF
+            }
+        }
+    }
+
     let waited = match deadline.at() {
         Some(at) => child.wait_deadline(at)?,
         None => Some(child.wait()?), // no timeout value is invented for an unbounded deadline
     };
     let status = match waited {
         Some(status) => Some(status),
+        None if matches!(role, Role::Request) => {
+            // Not killed: goetia cannot tell whether the request is out yet, and a request left
+            // unsent because goetia ran out of budget is the one answer worse than waiting.
+            child.detach();
+            return Ok(Finished::Expired);
+        }
         None => {
             // The root first, and its `Ok` is what makes the reap below unable to block.
             child.kill()?;
@@ -110,7 +160,9 @@ pub(crate) fn wait_bounded(mut child: cosca::Child, deadline: Deadline) -> Resul
     // natural-exit path too, nothing this call spawned outlives it holding a write end.
     drop(child);
 
-    let (stdout, stderr, complete) = collect(rx, deadline).map_err(cosca::error::Error::Io)?;
+    let (rest_out, rest_err, complete) = collect(rx, deadline).map_err(cosca::error::Error::Io)?;
+    stdout.extend(rest_out);
+    stderr.extend(rest_err);
     let capture = Capture {
         stdout,
         stderr,

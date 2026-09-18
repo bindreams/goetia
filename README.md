@@ -14,9 +14,12 @@ Everything documented below — the manifest's interpolation syntax, the
 may still change** between releases. Pin a specific released version, or a
 specific commit if working ahead of one.
 
-Generated systemd units use `Type=exec`, requiring **systemd 240+** (2018):
-on an older systemd, `systemctl start` fails to load the unit with
-systemd's own diagnostic naming the directive.
+goetia requires **systemd 242+** (2019). Generated units use `Type=exec`
+(240+): on an older systemd, `systemctl start` fails to load the unit with
+systemd's own diagnostic naming the directive. A bounded wait — any `start` or
+`stop` without `--timeout 0` or `--no-timeout` — runs
+`systemctl --show-transaction` (242+), which an older `systemctl` rejects as
+an unrecognized option.
 
 ## Verifying a download
 

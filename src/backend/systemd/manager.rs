@@ -381,14 +381,16 @@ const REAL_STEPS: VerbSteps<'static> = VerbSteps {
 };
 
 fn start_with(id: &str, budget: Budget, steps: &VerbSteps<'_>) -> Result<()> {
-    // Derived before anything runs, so `--timeout` bounds the whole verb — see `run_verb`.
+    // Derived at verb entry, so discovery spends the budget too. It bounds only the wait for the job,
+    // never whether the job is enqueued — see `run_verb`.
     let deadline = (steps.start_clock)(budget);
     (steps.require_installed)(id)?;
     (steps.start)(id, budget, deadline)
 }
 
 fn stop_with(id: &str, budget: Budget, steps: &VerbSteps<'_>) -> Result<()> {
-    // Derived before anything runs, so `--timeout` bounds the whole verb — see `run_verb`.
+    // Derived at verb entry, so discovery spends the budget too. It bounds only the wait for the job,
+    // never whether the job is enqueued — see `run_verb`.
     let deadline = (steps.start_clock)(budget);
     (steps.require_installed)(id)?;
     (steps.stop)(id, budget, deadline)

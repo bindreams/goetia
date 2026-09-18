@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::process::Command;
 
-use crate::backend::bounded::{self, Capture, Finished};
+use crate::backend::bounded::{self, Capture, Finished, Role};
 use crate::error::{Error, Result};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, State, Status};
@@ -41,15 +41,23 @@ pub(super) fn daemon_reload_or_report(id: &str) -> Result<()> {
 
 /// The argv for one `systemctl <verb> <unit>` under `budget`.
 ///
-/// Its own function so that `--no-block` is observable without a timing bet. No elevated test can
-/// see the flag — `start` returns either way — so asserting the argv is the only way this choice
-/// can fail a test at all; `systemctl_tests.rs` does exactly that.
+/// Its own function so that each path's flag is observable without a timing bet: no elevated test
+/// can see `--no-block` (`start` returns either way), and `--show-transaction` only changes when
+/// goetia may give up. `systemctl_tests.rs` asserts all three.
 fn verb_args<'a>(verb: &'a str, unit: &'a str, budget: Budget) -> Vec<&'a str> {
-    if budget.waits() {
-        vec![verb, unit]
-    } else {
-        vec![verb, "--no-block", unit]
+    match budget {
+        _ if !budget.waits() => vec![verb, "--no-block", unit],
+        Budget::Unbounded => vec![verb, unit],
+        _ => vec![verb, "--show-transaction", unit],
     }
+}
+
+/// Whether `systemctl --show-transaction`'s stderr says systemd has answered the request with a
+/// job — the line it writes after `StartUnit`/`StopUnit` returns and before it waits for the job.
+/// A substring, not a whole line: `SYSTEMD_LOG_TIME`/`SYSTEMD_LOG_LOCATION` prefix it.
+fn enqueued(stderr: &[u8]) -> bool {
+    const LINE: &[u8] = b"Enqueued anchor job ";
+    stderr.windows(LINE.len()).any(|w| w == LINE)
 }
 
 /// One `systemctl <verb> <unit>` under `budget`, as three deliberately different paths.
@@ -60,22 +68,23 @@ fn verb_args<'a>(verb: &'a str, unit: &'a str, budget: Budget) -> Vec<&'a str> {
 /// `Command::output()`, because neither has anything to bound — cosca enters this module only where
 /// a bound is actually required, which is the third path and only the third.
 ///
-/// That third path waits on `deadline`, which the caller derived at verb entry: `--timeout` bounds
-/// the verb as a whole — `require_installed`'s scan and the spawn included — as launchd's
-/// `verb_deadline` does, not only the `systemctl` call. `budget` only picks the path and the
-/// wording.
+/// That third path waits on `deadline`, which the caller derived at verb entry, so discovery spends
+/// the budget too — but the deadline bounds only the wait for the job, never whether it is
+/// enqueued. `--show-transaction` makes `systemctl` announce the job once systemd has it
+/// ([`enqueued`]), and until then the wait is unbounded: a budget that discovery used up, or one a
+/// few milliseconds long, still reaches systemd, and an expiry is then exactly what
+/// `budget::timed_out` says it is. `budget` only picks the path and the wording.
 fn run_verb(verb: &str, unit: &str, budget: Budget, deadline: Deadline) -> Result<Finished> {
-    run_verb_via("systemctl", verb, unit, budget, deadline)
+    run_verb_via("systemctl", &verb_args(verb, unit, budget), budget, deadline)
 }
 
-/// [`run_verb`] with the program named, so its bounded path is testable against a child that
-/// cannot exit on its own.
-fn run_verb_via(program: &str, verb: &str, unit: &str, budget: Budget, deadline: Deadline) -> Result<Finished> {
-    let args = verb_args(verb, unit, budget);
-    let failed = |e: String| Error::Other(format!("failed to run `{program} {verb} {unit}`: {e}"));
+/// [`run_verb`] with the program and argv named, so its bounded path is testable against a child
+/// that cannot exit on its own.
+fn run_verb_via(program: &str, args: &[&str], budget: Budget, deadline: Deadline) -> Result<Finished> {
+    let failed = |e: String| Error::Other(format!("failed to run `{program} {}`: {e}", args.join(" ")));
     if !budget.waits() || budget == Budget::Unbounded {
         let output = Command::new(program)
-            .args(&args)
+            .args(args)
             .output()
             .map_err(|e| failed(e.to_string()))?;
         // `output()` reads both pipes to EOF before returning, so on either
@@ -90,9 +99,13 @@ fn run_verb_via(program: &str, verb: &str, unit: &str, budget: Budget, deadline:
         });
     }
 
-    let mut cmd = bounded::command(program, &args).map_err(|e| failed(e.to_string()))?;
+    let mut cmd = bounded::command(program, args).map_err(|e| failed(e.to_string()))?;
+    // The announcement is `log_info`: an inherited `SYSTEMD_LOG_LEVEL=warning` or
+    // `SYSTEMD_LOG_TARGET=null` silences it, and the wait for it would then never end early.
+    cmd.env("SYSTEMD_LOG_LEVEL", "info")
+        .env("SYSTEMD_LOG_TARGET", "console");
     let child = cmd.spawn().map_err(|e| failed(e.to_string()))?;
-    bounded::wait_bounded(child, deadline).map_err(|e| failed(e.to_string()))
+    bounded::wait_bounded(child, deadline, Role::AnnouncedRequest(enqueued)).map_err(|e| failed(e.to_string()))
 }
 
 /// The message for a `systemctl` invocation that exited non-zero, built from the whole [`Capture`]
@@ -137,7 +150,8 @@ fn failed(verb: &str, unit: &str, capture: &Capture) -> Error {
 }
 
 /// `systemctl start` blocks until its job completes — the real synchronization primitive, no polling
-/// needed. Idempotent: starting an already-active unit is a no-op that still exits 0.
+/// needed. Idempotent: starting an already-active unit is a no-op that still exits 0. An expiry
+/// means the job was enqueued and not waited out — see [`run_verb`].
 ///
 /// Every generated unit carries `Type=exec` (see `generate::unit`'s doc comment for why), so a
 /// bounded `systemctl start` confirms the `exec` itself succeeded — not merely that systemd forked

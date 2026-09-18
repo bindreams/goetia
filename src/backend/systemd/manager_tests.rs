@@ -468,9 +468,10 @@ fn steps_taken(verb: fn(&str, Budget, &VerbSteps<'_>) -> Result<()>) -> Vec<&'st
     log.into_inner()
 }
 
-/// `--timeout` bounds the whole verb only if the deadline exists before `require_installed`'s scan
+/// `--timeout` counts from verb entry only if the deadline exists before `require_installed`'s scan
 /// runs. Derived after it, the scan runs outside the budget and nothing else observable changes,
-/// which is why the order is pinned here rather than left to the elevated suite.
+/// which is why the order is pinned here rather than left to the elevated suite. What the scan
+/// spends never keeps the request from systemd — see `systemctl::run_verb`.
 #[skuld::test]
 fn start_derives_its_deadline_before_require_installed_runs() {
     assert_eq!(steps_taken(start_with), ["start_clock", "require_installed", "start"]);

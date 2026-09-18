@@ -102,16 +102,48 @@ fn a_budget_that_does_not_wait_asks_systemd_not_to_block() {
 /// the confirmation the budget exists to wait for.
 #[skuld::test]
 fn a_budget_that_waits_lets_systemctl_block() {
-    for budget in [Budget::Unbounded, Budget::Bounded(Duration::from_secs(10))] {
-        assert_eq!(
-            verb_args("stop", "x.service", budget),
-            ["stop", "x.service"],
-            "{budget:?}"
-        );
-    }
+    assert_eq!(verb_args("stop", "x.service", Budget::Unbounded), ["stop", "x.service"]);
+}
+
+/// A bounded budget also asks `systemctl` to say when systemd has the job, which is the line
+/// [`enqueued`] waits for before the deadline may cut anything short.
+#[skuld::test]
+fn a_bounded_budget_asks_systemctl_to_announce_the_job() {
+    assert_eq!(
+        verb_args("stop", "x.service", Budget::Bounded(Duration::from_secs(10))),
+        ["stop", "--show-transaction", "x.service"]
+    );
+}
+
+// enqueued ============================================================================================================
+
+/// The line `systemctl --show-transaction` writes once systemd has answered the request with a job
+/// — with and without the prefixes `SYSTEMD_LOG_TIME`/`SYSTEMD_LOG_LOCATION` add, which the
+/// environment goetia sets does not switch off.
+#[skuld::test]
+fn enqueued_recognises_the_anchor_job_line() {
+    assert!(enqueued(b"Enqueued anchor job 16157 x.service/start.\n"));
+    assert!(enqueued(
+        b"Fri 2026-09-18 11:16:37 UTC (165435) src/systemctl/systemctl-start-unit.c:114: \
+          Enqueued anchor job 16565 x.service/stop.\n"
+    ));
+}
+
+#[skuld::test]
+fn enqueued_is_false_for_anything_else() {
+    assert!(!enqueued(b""));
+    assert!(!enqueued(
+        b"Failed to start x.service: Unit x.service has a bad unit file setting.\n"
+    ));
+    assert!(!enqueued(b"Enqueued auxiliary job 12 y.service/start.\n"));
 }
 
 // run_verb ============================================================================================================
+
+/// A stand-in for `systemctl --show-transaction`: `touch`es `$0` — the request reaching systemd —
+/// then announces it exactly as `systemctl` does, and never exits on its own.
+const ANNOUNCES_THEN_BLOCKS: &str =
+    "touch \"$0\"; echo 'Enqueued anchor job 1 x.service/start.' >&2; exec sleep 2147483647";
 
 /// The bounded path waits on the `deadline` it is handed — derived at verb entry, so it already
 /// covers `require_installed`'s scan and the spawn — never on one re-derived from `budget`.
@@ -122,13 +154,52 @@ fn a_budget_that_waits_lets_systemctl_block() {
 /// child forever, which the suite's watchdog surfaces.
 #[skuld::test]
 fn the_bounded_path_waits_on_the_deadline_it_was_given() {
+    let dir = tempfile::tempdir().unwrap();
+    let request = dir.path().join("request");
     let finished = run_verb_via(
-        "sleep",
-        "2147483647",
-        "0",
+        "/bin/sh",
+        &["-c", ANNOUNCES_THEN_BLOCKS, request.to_str().unwrap()],
         Budget::Bounded(Duration::MAX),
         Budget::Immediate.start(),
     )
-    .expect("sleep is spawnable");
+    .expect("sh is spawnable");
+    assert!(matches!(finished, Finished::Expired), "{finished:?}");
+}
+
+/// The budget never decides whether the request is sent: with the deadline already spent when
+/// `systemctl` is spawned, the request still reaches systemd before the deadline cuts anything
+/// short. Deterministic — the stand-in announces only after its request is out.
+#[skuld::test]
+fn the_bounded_path_issues_the_request_on_a_spent_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let request = dir.path().join("request");
+    run_verb_via(
+        "/bin/sh",
+        &["-c", ANNOUNCES_THEN_BLOCKS, request.to_str().unwrap()],
+        Budget::Bounded(Duration::from_secs(10)),
+        Budget::Immediate.start(),
+    )
+    .expect("sh is spawnable");
+    assert!(
+        request.exists(),
+        "the request must be issued whatever is left of the budget"
+    );
+}
+
+/// An inherited `SYSTEMD_LOG_LEVEL=warning` or `SYSTEMD_LOG_TARGET=null` silences the announcement,
+/// so the bounded path sets both. The stand-in exits `9` unless it sees exactly those values.
+#[skuld::test]
+fn the_bounded_path_keeps_the_announcement_audible() {
+    let finished = run_verb_via(
+        "/bin/sh",
+        &[
+            "-c",
+            "[ \"$SYSTEMD_LOG_LEVEL\" = info ] && [ \"$SYSTEMD_LOG_TARGET\" = console ] || exit 9; \
+             echo 'Enqueued anchor job 1 x.service/start.' >&2; exec sleep 2147483647",
+        ],
+        Budget::Bounded(Duration::from_secs(10)),
+        Budget::Immediate.start(),
+    )
+    .expect("sh is spawnable");
     assert!(matches!(finished, Finished::Expired), "{finished:?}");
 }
