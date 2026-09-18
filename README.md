@@ -707,9 +707,10 @@ different question from drift.
 | `start`, `restart`, `enable` | 1               | Cannot act on what is not there.                                                                                               |
 
 That table is about an absence goetia **established**. An id whose absence
-it could not establish is `4` for all six verbs, `uninstall` included:
-nothing was done and nothing was learned, which is one condition with one
-remedy for every one of them.
+it could not establish is `4` for all six verbs, `uninstall` included: what
+is at the id was not learned, which is one condition with one remedy for
+every one of them. That is not always all that happened: a `restart` whose
+start leg meets such an id has already issued its stop, and says so.
 
 `4` covers two distinct states, and the difference is what goetia
 established. **Ownership proven, contents not:** an artifact goetia owns

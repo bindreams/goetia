@@ -315,10 +315,12 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
                 let _ = writeln!(out, "{id}: not installed (nothing to do)");
                 codes.push(0);
             }
-            // Nothing was done and nothing was established, which is one
-            // condition with one remedy for every verb here — including
-            // `uninstall`, whose exemption is about absence, not about the
-            // question going unanswered.
+            // What is at the id was not established, which is one condition
+            // with one remedy for every verb here — including `uninstall`,
+            // whose exemption is about absence, not about the question going
+            // unanswered. Not "nothing was done": `restart` keeps an
+            // `Undetermined` start leg as it is after a stop it did issue
+            // (`restart::after_start_failed`), and its reason says so.
             Err(e @ Error::Undetermined { .. }) => {
                 let _ = writeln!(err, "error: {id}: {e}");
                 codes.push(4);
