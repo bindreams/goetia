@@ -612,8 +612,12 @@ impl ServiceManager for Fake {
         }
         // Idempotent: stopping an already-stopped (or failed, or unknown)
         // service is `Ok(())` — see `ServiceManager::stop`'s doc comment for
-        // why every backend must agree on this.
-        entry.state = State::Stopped;
+        // why every backend must agree on this. Request-only settles nothing,
+        // as for `start`: the Fake models the contract's minimum, not
+        // launchd's blocking `bootout`.
+        if budget.waits() {
+            entry.state = State::Stopped;
+        }
         Ok(())
     }
 
