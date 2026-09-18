@@ -363,42 +363,162 @@ fn an_offline_systemctl_that_exits_0_took_nothing() {
 
 // supported ===========================================================================================================
 
+/// The `Version` property as distributions set it, measured with `systemctl --version`, whose
+/// parenthesised part is the same `GIT_VERSION` string (identical on this host's systemd 257).
 #[skuld::test]
-fn systemd_242_and_newer_is_supported() {
+fn a_running_systemd_242_or_newer_is_supported() {
     for version in [
-        "systemd 242 (242)\n+PAM +AUDIT\n",
-        "systemd 257 (257.13-1~deb13u1)\n",
-        "systemd 258~rc1 (258~rc1-1)\n",
+        "242",
+        "257.13-1~deb13u1",   // Debian 13
+        "252.39-1~deb12u2",   // Debian 12
+        "255.4-1ubuntu8.17",  // Ubuntu 24.04
+        "249.11-0ubuntu3.22", // Ubuntu 22.04
+        "256.17-1.fc41",      // Fedora 41
+        "252-78.el9",         // CentOS Stream 9
+        "261.3-1-arch",       // Arch
+        "261.2",              // openSUSE Tumbleweed
+        "258~rc1",
+        "v257-rc1-15-g1234567",
     ] {
-        assert!(supported(version).is_ok(), "{version:?}");
+        assert!(supported(Source::Manager, version).is_ok(), "{version:?}");
     }
 }
 
-/// Below the floor the refusal names both numbers and why: 240 and 241 have `Type=exec` but not
-/// `--show-transaction`, and anything older runs `Type=exec` units as `Type=simple`.
 #[skuld::test]
-fn systemd_older_than_242_is_refused_with_the_floor_and_the_reason() {
-    for (version, reported) in [("systemd 241 (241)\n", "241"), ("systemd 237\n+PAM\n", "237")] {
-        let msg = supported(version).expect_err(version).to_string();
+fn a_client_242_or_newer_is_supported() {
+    for version in [
+        "systemd 242 (242)",
+        "systemd 257 (257.13-1~deb13u1)",
+        "systemd 258~rc1 (258~rc1-1)",
+    ] {
+        assert!(supported(Source::Client, version).is_ok(), "{version:?}");
+    }
+}
+
+/// systemd 240 and 241 parse `Type=exec`; only `--show-transaction` is missing, and the refusal
+/// must say that and nothing more.
+#[skuld::test]
+fn systemd_240_and_241_are_refused_for_show_transaction_alone() {
+    for (source, version, reported) in [
+        (Source::Manager, "241.7-1", "241"),
+        (Source::Manager, "240", "240"),
+        (Source::Client, "systemd 241 (241)", "241"),
+    ] {
+        let msg = supported(source, version).expect_err(version).to_string();
         assert!(msg.contains("requires systemd 242 or newer"), "{msg}");
-        assert!(msg.contains(&format!("reports {reported}")), "{msg}");
-        assert!(msg.contains("Type=simple"), "{msg}");
+        assert!(msg.contains(&format!(" {reported}")), "{msg}");
         assert!(msg.contains("--show-transaction"), "{msg}");
+        assert!(!msg.contains("Type=exec"), "{version} parses Type=exec: {msg}");
     }
 }
 
-/// A version goetia cannot read is not a version it can vouch for.
+/// Before 240 both reasons apply.
 #[skuld::test]
-fn an_unreadable_version_is_refused() {
-    for version in ["", "systemd\n", "systemd abc\n", "not systemd 257\n"] {
-        let msg = supported(version).expect_err(version).to_string();
-        assert!(msg.contains("names no version goetia can read"), "{version:?}: {msg}");
+fn systemd_older_than_240_is_refused_for_both_reasons() {
+    for (source, version) in [(Source::Manager, "239-41.el8"), (Source::Client, "systemd 237")] {
+        let msg = supported(source, version).expect_err(version).to_string();
+        assert!(msg.contains("requires systemd 242 or newer"), "{msg}");
+        assert!(msg.contains("--show-transaction"), "{msg}");
+        assert!(msg.contains("Type=simple"), "{msg}");
     }
 }
 
-/// The real `systemctl --version` on this host is readable, and new enough — so the parse above is
-/// the one real output takes.
+/// The refusal names whose version it read: the running manager's, or — where none could be asked
+/// — the client's.
+#[skuld::test]
+fn a_refusal_names_whose_version_it_read() {
+    let manager = supported(Source::Manager, "241").unwrap_err().to_string();
+    assert!(manager.contains("the running systemd is 241"), "{manager}");
+    let client = supported(Source::Client, "systemd 241 (241)").unwrap_err().to_string();
+    assert!(client.contains("`systemctl --version` reports 241"), "{client}");
+    assert!(client.contains("no running systemd could be asked"), "{client}");
+}
+
+/// A version goetia cannot read is not a version it can vouch for — and not one it may call old.
+/// Escapes included: a colour goetia failed to switch off is refused, never misread.
+#[skuld::test]
+fn an_unreadable_version_is_refused_without_calling_it_old() {
+    for (source, version) in [
+        (Source::Manager, ""),
+        (Source::Manager, "abc"),
+        (Source::Manager, "\u{1b}[0;1;39m257\u{1b}[0m"),
+        (Source::Manager, "257\u{1b}[0m"),
+        (Source::Client, ""),
+        (Source::Client, "systemd"),
+        (Source::Client, "systemd abc"),
+        (Source::Client, "not systemd 257"),
+        (Source::Client, "\u{1b}[0;1;39msystemd 257\u{1b}[0m (257.13-1~deb13u1)"),
+        (Source::Client, "systemd 257\u{1b}[0m (257.13-1~deb13u1)"),
+    ] {
+        let msg = supported(source, version).expect_err(version).to_string();
+        assert!(msg.contains("cannot read the version"), "{version:?}: {msg}");
+        for claim in ["older", "before", "Type=simple", "cannot answer"] {
+            assert!(!msg.contains(claim), "{version:?} is not known to be old: {msg}");
+        }
+    }
+}
+
+// require_supported_via ===============================================================================================
+
+/// A stand-in for `systemctl`: `sh -c <script> systemctl <args>`, so the probe's own arguments are
+/// the script's `$@`. Never a file on disk — writing one and `exec`ing it races every `fork` the
+/// test process makes on another thread (`ETXTBSY`).
+fn stand_in(script: &str) -> [&str; 4] {
+    ["/bin/sh", "-c", script, "systemctl"]
+}
+
+/// Answers `show` with `$MANAGER`'s version and `--version` with `$CLIENT`'s, each `none` to fail.
+fn two_versions(manager: &str, client: &str) -> String {
+    format!(
+        "case \"$*\" in \
+           'show --property=Version --value') [ {manager} = none ] && exit 1; echo {manager};; \
+           --version) [ {client} = none ] && exit 99; echo 'systemd {client} ({client})';; \
+           *) exit 98;; \
+         esac"
+    )
+}
+
+/// The running manager's version is the one that counts: PID 1 parses `Type=exec`.
+#[skuld::test]
+fn the_running_systemds_version_decides_not_the_clients() {
+    assert!(require_supported_via(&stand_in(&two_versions("257", "none"))).is_ok());
+    assert!(require_supported_via(&stand_in(&two_versions("257", "241"))).is_ok());
+    let msg = require_supported_via(&stand_in(&two_versions("241", "257")))
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("the running systemd is 241"), "{msg}");
+}
+
+/// No manager to ask — what `systemctl show` does in a chroot or offline, measured on systemd 257,
+/// and what it does with no bus to reach — and the client's version is used instead.
+#[skuld::test]
+fn with_no_running_systemd_the_clients_version_decides() {
+    let offline = "[ \"$1\" = show ] && { echo \"Running in chroot, ignoring command 'show'\" >&2; exit 0; }; \
+                   echo 'systemd 257 (257.13-1~deb13u1)'";
+    assert!(require_supported_via(&stand_in(offline)).is_ok());
+    assert!(require_supported_via(&stand_in(&two_versions("none", "257"))).is_ok());
+    let msg = require_supported_via(&stand_in(&two_versions("none", "241")))
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("`systemctl --version` reports 241"), "{msg}");
+}
+
+/// Both probes switch colour off: the stand-in colours whatever it prints unless it sees
+/// `SYSTEMD_COLORS=0`, as a real `systemctl` under an inherited `SYSTEMD_COLORS=1` does.
+#[skuld::test]
+fn every_probe_switches_colour_off() {
+    let colours = "c() { [ \"$SYSTEMD_COLORS\" = 0 ] && echo \"$1\" || printf '\\033[0;1;39m%s\\033[0m\\n' \"$1\"; }; ";
+    let manager = format!("{colours}[ \"$1\" = show ] && c 257 || exit 99");
+    assert!(require_supported_via(&stand_in(&manager)).is_ok());
+    let client = format!("{colours}[ \"$1\" = show ] && exit 1; c 'systemd 257'");
+    assert!(require_supported_via(&stand_in(&client)).is_ok());
+}
+
+/// The real `systemctl` on this host, first with an inherited `SYSTEMD_COLORS=1` — set by the
+/// wrapper only where goetia did not set it itself — then as it is.
 #[skuld::test]
 fn this_hosts_systemd_is_supported() {
+    require_supported_via(&stand_in("SYSTEMD_COLORS=${SYSTEMD_COLORS:-1} exec systemctl \"$@\""))
+        .expect("the host running the tests runs systemd 242+, whatever colour is inherited");
     require_supported().expect("the host running the tests runs systemd 242+");
 }

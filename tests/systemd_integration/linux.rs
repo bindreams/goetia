@@ -850,19 +850,90 @@ fn an_offline_systemctl_is_never_reported_as_started_or_stopped() {
     }
 }
 
-/// `goetia <args>`, elevated as this test is, with a `systemctl` first on its `PATH` that reports
-/// systemd 241 — the newest without `--show-transaction` — to `--version`, and fails anything else:
-/// a refusal must come before goetia asks systemd for anything more.
+/// `goetia <args>`, elevated as this test is, with `SYSTEMD_COLORS=<colors>` in its environment.
+fn goetia_coloured(colors: &str, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_goetia"))
+        .args(args)
+        .env("SYSTEMD_COLORS", colors)
+        .output()
+        .expect("spawn goetia")
+}
+
+/// `SYSTEMD_COLORS` forces colour into a pipe, and `systemctl --version` wraps its number in escapes
+/// under it. None of its values may make goetia misread a supported systemd as one it refuses, on
+/// any verb the version gate guards.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_coloured_environment_does_not_fail_the_version_gate() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let (_dir, manifest) = world_readable_manifest(guard.id());
+    let manifest = manifest.to_str().expect("utf-8 temp path");
+    let succeeds = |colors: &str, args: &[&str]| {
+        let output = goetia_coloured(colors, args);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "SYSTEMD_COLORS={colors} {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    succeeds("1", &["daemon", "install", "--file", manifest, guard.id()]);
+    for colors in ["1", "true", "16", "256", "24bit"] {
+        for verb in ["start", "restart", "stop"] {
+            succeeds(colors, &["daemon", verb, guard.id()]);
+        }
+    }
+    succeeds("1", &["daemon", "uninstall", guard.id()]);
+    assert!(!unit_path(guard.id()).exists(), "uninstall left the unit");
+}
+
+/// In a chroot or offline there is no running systemd to ask its version, and `install` without
+/// `--start` must still work there: systemd enables units offline, and an image build is exactly
+/// that. goetia falls back to asking `systemctl --version`.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn an_offline_install_writes_the_unit() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let (_dir, manifest) = world_readable_manifest(guard.id());
+    let manifest = manifest.to_str().expect("utf-8 temp path");
+
+    let output = goetia_offline(&["daemon", "install", "--file", manifest, guard.id()]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(unit_path(guard.id()).exists(), "an offline install wrote no unit");
+}
+
+/// `goetia <args>`, elevated as this test is, with a `systemctl` first on its `PATH` whose running
+/// manager is systemd 241 — the newest without `--show-transaction` — and whose client is 257, and
+/// that fails anything else: the manager's version is the one that counts, and a refusal must come
+/// before goetia asks systemd for anything more.
+///
+/// Written by a child `sh`, not by this process: a descriptor this process held open for writing
+/// could be inherited by a `fork` on another test thread, and `exec`ing the file would then fail
+/// with `ETXTBSY`.
 fn goetia_on_systemd_241(args: &[&str]) -> std::process::Output {
     let dir = tempfile::tempdir().expect("tempdir");
     let fake = dir.path().join("systemctl");
-    fs::write(
-        &fake,
-        "#!/bin/sh\n[ \"$1\" = --version ] && { echo 'systemd 241 (241)'; exit 0; }\n\
-         echo \"stand-in: unexpected systemctl $*\" >&2; exit 99\n",
+    let script = "#!/bin/sh\n\
+                  [ \"$*\" = 'show --property=Version --value' ] && { echo 241; exit 0; }\n\
+                  [ \"$*\" = --version ] && { echo 'systemd 257 (257)'; exit 0; }\n\
+                  echo \"stand-in: unexpected systemctl $*\" >&2; exit 99\n";
+    cmd::run(
+        "/bin/sh",
+        &[
+            "-c",
+            "printf '%s' \"$1\" > \"$0\" && chmod 0755 \"$0\"",
+            fake.to_str().expect("utf-8 temp path"),
+            script,
+        ],
     )
-    .expect("write the stand-in systemctl");
-    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod 0755");
+    .expect_ok();
     let path = format!(
         "{}:{}",
         dir.path().display(),
@@ -889,6 +960,7 @@ fn an_older_systemd_is_refused_before_anything_is_written_or_run() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
         assert!(stderr.contains("requires systemd 242 or newer"), "{args:?}: {stderr}");
+        assert!(stderr.contains("the running systemd is 241"), "{args:?}: {stderr}");
     };
 
     refused(&["daemon", "install", "--file", manifest, guard.id()]);

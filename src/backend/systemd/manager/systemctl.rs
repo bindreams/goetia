@@ -39,42 +39,113 @@ pub(super) fn daemon_reload_or_report(id: &str) -> Result<()> {
     })
 }
 
-/// The oldest systemd goetia runs against: generated units declare `Type=exec` (240), and every start
-/// and stop runs `systemctl --show-transaction` (242).
+/// The oldest systemd goetia runs against: every start and stop runs `systemctl --show-transaction`
+/// (242).
 const SYSTEMD_FLOOR: u32 = 242;
 
-/// Refuse a systemd older than [`SYSTEMD_FLOOR`], as `systemctl --version` reports it. Asked wherever
-/// goetia writes a unit or starts or stops one, and nowhere else: an older systemd does not reject
-/// `Type=exec` but logs that it cannot parse it and runs the unit as `Type=simple`, silently losing
-/// the failed-exec detection the directive is there for.
+/// The oldest systemd that parses the `Type=exec` generated units declare.
+const TYPE_EXEC: u32 = 240;
+
+/// Every version probe's environment. An inherited `SYSTEMD_COLORS` forces colour into a pipe, and
+/// wraps `systemctl --version`'s number in escapes.
+const UNCOLOURED: [(&str, &str); 1] = [("SYSTEMD_COLORS", "0")];
+
+/// Refuse a systemd older than [`SYSTEMD_FLOOR`]. Asked wherever goetia writes a unit or starts or
+/// stops one, and nowhere else: an older systemd does not reject `Type=exec` but logs that it cannot
+/// parse it and runs the unit as `Type=simple`, silently losing the failed-exec detection the
+/// directive is there for.
 pub(super) fn require_supported() -> Result<()> {
-    let output = run_systemctl(&["--version"])?;
-    if !output.status.success() {
-        return Err(Error::Other(format!(
-            "`systemctl --version` failed, so goetia cannot tell whether this is systemd \
-             {SYSTEMD_FLOOR}+: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    supported(&String::from_utf8_lossy(&output.stdout))
+    require_supported_via(&["systemctl"])
 }
 
-/// [`require_supported`]'s verdict on what `systemctl --version` printed: `systemd <N> (...)` first.
-fn supported(version: &str) -> Result<()> {
-    let first = version.lines().next().unwrap_or_default();
-    let number = first
-        .strip_prefix("systemd ")
-        .map(|rest| rest.chars().take_while(char::is_ascii_digit).collect::<String>())
-        .and_then(|digits| digits.parse::<u32>().ok());
-    let found = match number {
+/// Whose version [`supported`] judges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// The running manager's `Version` property. PID 1 is what parses `Type=exec` and answers
+    /// `--show-transaction`'s `EnqueueUnitJob`, so its version is the one that counts.
+    Manager,
+    /// `systemctl --version`: the client alone, asked only where no manager can be reached. An old
+    /// client next to a new manager needs no gate, since it rejects `--show-transaction` itself.
+    Client,
+}
+
+/// [`require_supported`] with `systemctl`'s argv prefix named, so a test can stand a shell script in
+/// for it. The client is asked only where the manager cannot be: `systemctl show` in a chroot or
+/// under `SYSTEMD_OFFLINE=1` says "Running in chroot, ignoring command" and exits `0` with nothing
+/// on stdout, and one with no bus to reach exits non-zero. `install` must still work there, since
+/// systemd enables units offline — an image build is the ordinary case.
+fn require_supported_via(systemctl: &[&str]) -> Result<()> {
+    let manager = probe(systemctl, &["show", "--property=Version", "--value"])?;
+    let reported = String::from_utf8_lossy(&manager.stdout);
+    if manager.status.success() && !reported.trim().is_empty() {
+        return supported(Source::Manager, reported.trim());
+    }
+    let client = probe(systemctl, &["--version"])?;
+    if !client.status.success() {
+        return Err(Error::Other(format!(
+            "no running systemd could be asked its version, and `systemctl --version` failed, so \
+             goetia cannot tell whether this is systemd {SYSTEMD_FLOOR}+: {}",
+            String::from_utf8_lossy(&client.stderr)
+        )));
+    }
+    let reported = String::from_utf8_lossy(&client.stdout);
+    supported(Source::Client, reported.lines().next().unwrap_or_default())
+}
+
+fn probe(systemctl: &[&str], args: &[&str]) -> Result<std::process::Output> {
+    let (program, prefix) = systemctl.split_first().expect("a program to run");
+    Command::new(program)
+        .args(prefix)
+        .args(args)
+        .envs(UNCOLOURED)
+        .output()
+        .map_err(|e| Error::Other(format!("failed to run `systemctl {}`: {e}", args.join(" "))))
+}
+
+/// The major version in what `source` reported: the `Version` property (`257.13-1~deb13u1`,
+/// `252-78.el9`, `258~rc1`), or `systemctl --version`'s first line (`systemd 257 (...)`). `None` for
+/// anything else — escapes included, which a colour goetia failed to switch off would add.
+fn major(source: Source, reported: &str) -> Option<u32> {
+    if reported.chars().any(char::is_control) {
+        return None;
+    }
+    let version = match source {
+        Source::Manager => reported.strip_prefix('v').unwrap_or(reported),
+        Source::Client => reported.strip_prefix("systemd ")?,
+    };
+    let digits: String = version.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// [`require_supported`]'s verdict on the version `source` reported.
+fn supported(source: Source, reported: &str) -> Result<()> {
+    let found = |n: u32| match source {
+        Source::Manager => format!("the running systemd is {n}"),
+        Source::Client => format!("`systemctl --version` reports {n}, and no running systemd could be asked"),
+    };
+    let why = match major(source, reported) {
         Some(n) if n >= SYSTEMD_FLOOR => return Ok(()),
-        Some(n) => format!("`systemctl --version` reports {n}"),
-        None => format!("`systemctl --version` names no version goetia can read ({first:?})"),
+        Some(n) if n >= TYPE_EXEC => format!(
+            "{}. systemd {TYPE_EXEC} and 241 cannot answer the `systemctl --show-transaction` every start \
+             and stop runs",
+            found(n)
+        ),
+        Some(n) => format!(
+            "{}. systemd before {TYPE_EXEC} cannot answer the `systemctl --show-transaction` every start \
+             and stop runs, and runs goetia's `Type=exec` units as `Type=simple`, which cannot report a \
+             failed exec",
+            found(n)
+        ),
+        None => {
+            let asked = match source {
+                Source::Manager => "the running systemd reports",
+                Source::Client => "`systemctl --version` reports",
+            };
+            format!("cannot read the version {asked} ({reported:?}), so cannot tell whether this one is")
+        }
     };
     Err(Error::Other(format!(
-        "goetia requires systemd {SYSTEMD_FLOOR} or newer, and {found}. An older systemd runs \
-         goetia's `Type=exec` units as `Type=simple`, which cannot report a failed exec, and \
-         rejects the `systemctl --show-transaction` every start and stop runs."
+        "goetia requires systemd {SYSTEMD_FLOOR} or newer, and {why}."
     )))
 }
 
