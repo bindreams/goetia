@@ -182,7 +182,7 @@ impl ServiceManager for Systemd {
         // Deliberately `Budget::Unbounded`: `uninstall` has no `--timeout` of its own, this stop
         // is a means rather than an end, and bounding it would turn a slow-stopping service into a
         // failed uninstall where today it succeeds.
-        stop_impl(id, Budget::Unbounded)?;
+        stop_impl(id, Budget::Unbounded, Budget::Unbounded.start())?;
 
         let disabled = run_systemctl(&["disable", &unit])?;
         if !disabled.status.success() {
@@ -254,14 +254,18 @@ impl ServiceManager for Systemd {
 
     fn start(&self, id: &Id, budget: Budget) -> Result<()> {
         let id = id.as_str();
+        // Derived before anything runs, so `--timeout` bounds the whole verb — see `run_verb`.
+        let deadline = budget.start();
         require_installed(id)?;
-        start_impl(id, budget)
+        start_impl(id, budget, deadline)
     }
 
     fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
         let id = id.as_str();
+        // Derived before anything runs, so `--timeout` bounds the whole verb — see `run_verb`.
+        let deadline = budget.start();
         require_installed(id)?;
-        stop_impl(id, budget)
+        stop_impl(id, budget, deadline)
     }
 
     fn status(&self, id: &Id) -> Result<Status> {

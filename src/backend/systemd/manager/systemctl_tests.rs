@@ -110,3 +110,25 @@ fn a_budget_that_waits_lets_systemctl_block() {
         );
     }
 }
+
+// run_verb ============================================================================================================
+
+/// The bounded path waits on the `deadline` it is handed — derived at verb entry, so it already
+/// covers `require_installed`'s scan and the spawn — never on one re-derived from `budget`.
+///
+/// The child cannot exit on its own and the deadline is spent, so `Expired` is the only answer and
+/// no timing is bet on. `Bounded(Duration::MAX)` is what makes a re-derivation fail: it overflows
+/// `Instant` into an unbounded deadline, so a `run_verb` that ignored `deadline` would wait on the
+/// child forever, which the suite's watchdog surfaces.
+#[skuld::test]
+fn the_bounded_path_waits_on_the_deadline_it_was_given() {
+    let finished = run_verb_via(
+        "sleep",
+        "2147483647",
+        "0",
+        Budget::Bounded(Duration::MAX),
+        Budget::Immediate.start(),
+    )
+    .expect("sleep is spawnable");
+    assert!(matches!(finished, Finished::Expired), "{finished:?}");
+}

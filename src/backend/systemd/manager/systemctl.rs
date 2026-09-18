@@ -6,7 +6,7 @@ use std::process::Command;
 
 use crate::backend::bounded::{self, Capture, Finished};
 use crate::error::{Error, Result};
-use crate::manager::budget;
+use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, State, Status};
 
 pub(super) fn run_systemctl(args: &[&str]) -> Result<std::process::Output> {
@@ -59,29 +59,40 @@ fn verb_args<'a>(verb: &'a str, unit: &'a str, budget: Budget) -> Vec<&'a str> {
 /// waiting for it to complete. `Budget::Unbounded` is today's plain blocking call. Both keep
 /// `Command::output()`, because neither has anything to bound — cosca enters this module only where
 /// a bound is actually required, which is the third path and only the third.
-fn run_verb(verb: &str, unit: &str, budget: Budget) -> Result<Finished> {
-    // `output()` reads both pipes to EOF before returning, so on either
-    // unbounded path nothing was cut short and `complete` is simply true.
-    let whole = |output: std::process::Output| Finished::Exited {
-        status: output.status,
-        capture: Capture {
-            stdout: output.stdout,
-            stderr: output.stderr,
-            complete: true,
-        },
-    };
+///
+/// That third path waits on `deadline`, which the caller derived at verb entry: `--timeout` bounds
+/// the verb as a whole — `require_installed`'s scan and the spawn included — as launchd's
+/// `verb_deadline` does, not only the `systemctl` call. `budget` only picks the path and the
+/// wording.
+fn run_verb(verb: &str, unit: &str, budget: Budget, deadline: Deadline) -> Result<Finished> {
+    run_verb_via("systemctl", verb, unit, budget, deadline)
+}
+
+/// [`run_verb`] with the program named, so its bounded path is testable against a child that
+/// cannot exit on its own.
+fn run_verb_via(program: &str, verb: &str, unit: &str, budget: Budget, deadline: Deadline) -> Result<Finished> {
     let args = verb_args(verb, unit, budget);
-    if !budget.waits() {
-        return Ok(whole(run_systemctl(&args)?));
-    }
-    if budget == Budget::Unbounded {
-        return Ok(whole(run_systemctl(&args)?));
+    let failed = |e: String| Error::Other(format!("failed to run `{program} {verb} {unit}`: {e}"));
+    if !budget.waits() || budget == Budget::Unbounded {
+        let output = Command::new(program)
+            .args(&args)
+            .output()
+            .map_err(|e| failed(e.to_string()))?;
+        // `output()` reads both pipes to EOF before returning, so on either
+        // unbounded path nothing was cut short and `complete` is simply true.
+        return Ok(Finished::Exited {
+            status: output.status,
+            capture: Capture {
+                stdout: output.stdout,
+                stderr: output.stderr,
+                complete: true,
+            },
+        });
     }
 
-    let failed = |e: cosca::error::Error| Error::Other(format!("failed to run `systemctl {verb} {unit}`: {e}"));
-    let mut cmd = bounded::command("systemctl", &args).map_err(failed)?;
-    let child = cmd.spawn().map_err(failed)?;
-    bounded::wait_bounded(child, budget.start()).map_err(failed)
+    let mut cmd = bounded::command(program, &args).map_err(|e| failed(e.to_string()))?;
+    let child = cmd.spawn().map_err(|e| failed(e.to_string()))?;
+    bounded::wait_bounded(child, deadline).map_err(|e| failed(e.to_string()))
 }
 
 /// The message for a `systemctl` invocation that exited non-zero, built from the whole [`Capture`]
@@ -131,9 +142,9 @@ fn failed(verb: &str, unit: &str, capture: &Capture) -> Error {
 /// Every generated unit carries `Type=exec` (see `generate::unit`'s doc comment for why), so a
 /// bounded `systemctl start` confirms the `exec` itself succeeded — not merely that systemd forked
 /// the process. A missing executable or missing user comes back as a failed start.
-pub(super) fn start_impl(id: &str, budget: Budget) -> Result<()> {
+pub(super) fn start_impl(id: &str, budget: Budget, deadline: Deadline) -> Result<()> {
     let unit = super::unit_name(id);
-    match run_verb("start", &unit, budget)? {
+    match run_verb("start", &unit, budget, deadline)? {
         Finished::Exited { status, .. } if status.success() => Ok(()),
         Finished::Exited { capture, .. } => Err(failed("start", &unit, &capture)),
         Finished::Expired => Err(budget::timed_out(id, "running", budget)),
@@ -143,9 +154,9 @@ pub(super) fn start_impl(id: &str, budget: Budget) -> Result<()> {
 /// Idempotent per `ServiceManager::stop`'s doc comment. Exit code 5 ("unit not loaded") means there
 /// was nothing to stop — the same convention `tests/support/service_guard.rs` already uses for
 /// cleanup — which is success here, not a failure to stop something that was never running.
-pub(super) fn stop_impl(id: &str, budget: Budget) -> Result<()> {
+pub(super) fn stop_impl(id: &str, budget: Budget, deadline: Deadline) -> Result<()> {
     let unit = super::unit_name(id);
-    match run_verb("stop", &unit, budget)? {
+    match run_verb("stop", &unit, budget, deadline)? {
         Finished::Exited { status, .. } if status.success() || status.code() == Some(5) => Ok(()),
         Finished::Exited { capture, .. } => Err(failed("stop", &unit, &capture)),
         Finished::Expired => Err(budget::timed_out(id, "stopped", budget)),
