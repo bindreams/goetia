@@ -268,6 +268,10 @@ fn foreign_refuses_every_verb(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> Dae
         mgr.request_start_after_stop(&spec.id).is_err(),
         "request_start_after_stop must refuse a foreign id"
     );
+    assert!(
+        mgr.request_restart(&spec.id).is_none_or(|r| r.is_err()),
+        "request_restart must refuse a foreign id"
+    );
     assert!(mgr.status(&spec.id).is_err(), "status must refuse a foreign id");
 }
 
@@ -399,10 +403,11 @@ fn starting_with_no_budget_is_accepted_and_establishes_nothing(
 /// running", and nothing portable can hold every backend to *when* it says
 /// that. What every backend must do is accept the start once the stop before
 /// it is confirmed — a refusal there would fail every `restart --timeout 0`
-/// — and leave the service startable. Like the scenario above, nothing is
-/// asserted about the state the request itself leaves; the systemd suite
-/// asserts that it reaches systemd, race-free, behind a start that cannot
-/// complete (`a_restart_with_no_budget_queues_its_start_in_systemd`).
+/// on a backend without `request_restart` — and leave the service startable.
+/// Like the scenario above, nothing is asserted about the state the request
+/// itself leaves. systemd's `restart --timeout 0` is `request_restart`
+/// instead, which its own suite shows restarting the daemon behind a stop
+/// that has to wait (`a_restart_with_no_budget_restarts_behind_a_stop_that_has_to_wait`).
 fn a_start_request_after_a_confirmed_stop_is_accepted(
     mgr: &dyn ServiceManager,
     mk: &dyn Fn(&str) -> DaemonSpec,
@@ -537,7 +542,10 @@ pub fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, m
         ("disable", mgr.disable(id)),
         ("start", mgr.start(id, Budget::DEFAULT)),
         ("stop", mgr.stop(id, Budget::DEFAULT)),
-    ] {
+    ]
+    .into_iter()
+    .chain(mgr.request_restart(id).map(|result| ("request_restart", result)))
+    {
         assert!(
             matches!(&result, Err(Error::Undetermined { .. })),
             "{verb} on an id goetia cannot classify must be Undetermined, got {result:?}"

@@ -137,23 +137,23 @@ pub enum Error {
     },
 
     /// Steps goetia issued whose outcome nobody established. Produced only
-    /// by `cli::restart` under a budget that does not wait, where the stop
-    /// was issued without confirmation and the start that followed was
-    /// refused. The daemon was not restarted; whether it is running the
-    /// instance the stop is still taking down, is going down, or never moved,
-    /// goetia proved none of the three.
+    /// by `cli::restart` under a budget that does not wait, on a manager with
+    /// no request-only restart (launchd, SCM), where the stop was issued
+    /// without confirmation and the start that followed was refused. The
+    /// daemon was not restarted; whether it is running the instance the stop
+    /// is still taking down, is going down, or never moved, goetia proved
+    /// none of the three.
     ///
-    /// The refusal itself may be determinate or not — systemd's `start
-    /// --no-block` rejects a unit it cannot load outright, where SCM's
-    /// `ERROR_SERVICE_ALREADY_RUNNING` says only that the service is not
-    /// stopped. Either way the stop was never confirmed: it may still be in
-    /// flight, may have completed, or may have had nothing to do — an
-    /// inactive unit systemd cannot load has no stop job at all — so what is
-    /// unestablished is where the daemon ended up. Not [`Other`](Error::Other),
-    /// exit `1`: a refusal, even a determinate one, answers whether the start
-    /// went out, not that question. (A plain `start --timeout 0` of the same
-    /// unit is exit `1`: with no stop before it, the refusal is the whole
-    /// answer.) Not [`WaitTimeout`](Error::WaitTimeout): nothing waited.
+    /// The refusal itself may be determinate or not — a launchd `bootstrap`
+    /// that fails outright, where SCM's `ERROR_SERVICE_ALREADY_RUNNING` says
+    /// only that the service is not stopped. Either way the stop was never
+    /// confirmed: it may still be in flight, may have completed, or may have
+    /// had nothing to do, so what is unestablished is where the daemon ended
+    /// up. Not [`Other`](Error::Other), exit `1`: a refusal, even a
+    /// determinate one, answers whether the start went out, not that
+    /// question. (A plain `start --timeout 0` of the same service is exit
+    /// `1`: with no stop before it, the refusal is the whole answer.) Not
+    /// [`WaitTimeout`](Error::WaitTimeout): nothing waited.
     /// Not [`Undetermined`](Error::Undetermined): what is installed at the
     /// id was never in doubt.
     ///

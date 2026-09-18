@@ -2866,7 +2866,7 @@ fn install_error_beats_indeterminate_beats_conflict() {
 
 /// The `Fake` with `status` made unreachable. `restart --timeout 0` must issue its two steps with
 /// no state read between them, and a read is invisible to `Fake::calls`, which records only
-/// `start`/`stop`.
+/// `start`/`stop`/`restart`.
 #[derive(Clone, Default)]
 struct PanicsOnStatus(Fake);
 
@@ -3068,8 +3068,8 @@ fn restart_does_not_start_after_a_stop_whose_budget_was_spent() {
     assert!(!err.contains("was stopped"), "nothing confirmed the stop: {err}");
 }
 
-/// "Don't wait, just do the steps": both steps issued, in order, with no confirmation and no state
-/// read between them.
+/// "Don't wait, just do the steps": on a manager with no request-only restart, both steps issued, in
+/// order, with no confirmation and no state read between them.
 #[skuld::test]
 fn restart_with_no_budget_issues_both_steps_without_confirming() {
     let mgr = PanicsOnStatus::default();
@@ -3150,6 +3150,55 @@ fn restart_with_no_budget_keeps_an_undetermined_start_undetermined() {
         "what the stop leg did and did not establish is still disclosed: {err}"
     );
     assert_eq!(out, "", "nothing may claim the daemon was restarted: {out}");
+}
+
+/// Where the manager has a request-only restart, `restart --timeout 0` is that one request and
+/// nothing else: a stop and a separate start leave the window systemd closes by replacing the stop.
+/// Over a daemon still up, where the two-step path reports a refused start, the one request is
+/// simply accepted.
+#[skuld::test]
+fn restart_with_no_budget_is_one_request_where_the_manager_has_one() {
+    let fake = Fake::new();
+    fake.seed_native_restart();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_state("frpc", State::Running);
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "restart", "frpc", "--timeout", "0"], &fake);
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(fake.calls(), vec![("restart", "frpc".to_string())]);
+    assert_eq!(out, "frpc: restart requested\n");
+}
+
+/// A restart the manager refused is one it never started: nothing was stopped, so the refusal is
+/// the whole answer — exit `1`, not the two-step path's "where it ended up is not established".
+#[skuld::test]
+fn a_refused_request_only_restart_is_a_failure_that_changed_nothing() {
+    let fake = Fake::new();
+    fake.seed_native_restart();
+    fake.seed_foreign("stranger", "not a goetia artifact at all\n");
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "restart", "stranger", "--timeout", "0"], &fake);
+
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(!err.contains("not established"), "{err}");
+    assert_eq!(fake.calls(), vec![("restart", "stranger".to_string())]);
+}
+
+/// A budget that waits confirms each leg, which the request-only restart cannot: it is never used.
+#[skuld::test]
+fn a_restart_that_waits_never_takes_the_request_only_restart() {
+    let fake = Fake::new();
+    fake.seed_native_restart();
+    fake.install(&mk("frpc"), false).unwrap();
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "restart", "frpc"], &fake);
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(
+        fake.calls(),
+        vec![("stop", "frpc".to_string()), ("start", "frpc".to_string())]
+    );
 }
 
 #[skuld::test]

@@ -716,66 +716,101 @@ fn queued_job_types(id: &str) -> Vec<String> {
         .collect()
 }
 
-/// A unit whose every start is held once [`HeldStart::install`] returns: a drop-in `ExecStartPre`
-/// blocks for as long as the hold file exists, so a start job, once queued, stays queued. `Drop`
-/// releases it — the hold file, then a blocking `stop`, then `reset-failed` for the `failed` state
-/// a stop in `start-pre` leaves. Declared after the `ServiceGuard`, so it drops first.
-struct HeldStart {
-    unit: String,
-    hold: PathBuf,
+/// `MainPID` as `systemctl show` reports it.
+fn main_pid(id: &str) -> String {
+    let unit = format!("{id}.service");
+    let run = cmd::run("systemctl", &["show", "--property=MainPID", "--value", &unit]).expect_ok();
+    run.stdout.trim().to_string()
 }
 
-impl HeldStart {
-    fn install(mgr: &Systemd, spec: &DaemonSpec) -> Self {
-        let id = spec.id.as_str();
-        let hold = PathBuf::from(format!("/run/{id}.hold"));
-        mgr.install(spec, false).expect("install");
-        let dir = dropin_dir(id);
-        fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
+/// A runtime unit that `Requires=` and is `After=` the daemon, and whose own stop blocks on an
+/// exclusive `flock` this guard holds. A stop of the daemon has to wait for it, so it stays a
+/// *waiting* job until [`StopHolder::release`] — the shape in which a separate `start` replaces the
+/// stop instead of queuing behind it. `Drop` releases the lock, stops the holder — its stop then
+/// succeeds, so nothing is left `failed` — and removes it; declared after the `ServiceGuard`, so it
+/// drops first.
+struct StopHolder {
+    unit: String,
+    path: PathBuf,
+    lock: PathBuf,
+    held: Option<fs::File>,
+}
+
+impl StopHolder {
+    fn start(id: &str) -> Self {
+        let unit = format!("{id}-holder.service");
+        let lock = PathBuf::from(format!("/run/{id}.lock"));
+        let held = fs::File::create(&lock).unwrap_or_else(|e| panic!("create {}: {e}", lock.display()));
+        // SAFETY: `held` owns the descriptor for the duration of the call.
+        let locked = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&held), libc::LOCK_EX) };
+        assert_eq!(
+            locked,
+            0,
+            "flock {}: {}",
+            lock.display(),
+            std::io::Error::last_os_error()
+        );
+        let path = PathBuf::from("/run/systemd/system").join(&unit);
+        let holder = StopHolder {
+            unit,
+            path,
+            lock,
+            held: Some(held),
+        };
         fs::write(
-            dir.join("hold.conf"),
+            &holder.path,
             format!(
-                "[Service]\nExecStartPre=/bin/sh -c 'test -e {} && exec /bin/sleep infinity || exit 0'\n",
-                hold.display()
+                "[Unit]\nRequires={id}.service\nAfter={id}.service\n\
+                 [Service]\nExecStart=/bin/sleep infinity\nExecStop=/usr/bin/flock {} true\n\
+                 TimeoutStopSec=infinity\n",
+                holder.lock.display()
             ),
         )
-        .expect("write drop-in");
+        .expect("write the holder unit");
         cmd::run("systemctl", &["daemon-reload"]).expect_ok();
-        let held = HeldStart {
-            unit: format!("{id}.service"),
-            hold,
-        };
-        mgr.start(&spec.id, Budget::DEFAULT).expect("start before the hold");
-        fs::write(&held.hold, "").expect("create the hold file");
-        held
+        cmd::run("systemctl", &["start", &holder.unit]).expect_ok();
+        holder
+    }
+
+    fn release(&mut self) {
+        self.held = None;
     }
 }
 
-impl Drop for HeldStart {
+impl Drop for StopHolder {
     fn drop(&mut self) {
-        if let Err(e) = fs::remove_file(&self.hold) {
-            eprintln!("HeldStart[{}]: remove {}: {e}", self.unit, self.hold.display());
+        self.release();
+        let run = cmd::run("systemctl", &["stop", &self.unit]);
+        if !run.ok() {
+            eprintln!("StopHolder[{}]: cleanup failed: {run}", self.unit);
         }
-        for args in [&["stop", self.unit.as_str()][..], &["reset-failed", self.unit.as_str()]] {
-            let run = cmd::run("systemctl", args);
-            if !run.ok() {
-                eprintln!("HeldStart[{}]: cleanup failed: {run}", self.unit);
+        for path in [&self.path, &self.lock] {
+            if let Err(e) = fs::remove_file(path) {
+                eprintln!("StopHolder[{}]: remove {}: {e}", self.unit, path.display());
             }
         }
+        let run = cmd::run("systemctl", &["daemon-reload"]);
+        if !run.ok() {
+            eprintln!("StopHolder[{}]: cleanup failed: {run}", self.unit);
+        }
     }
 }
 
-/// `restart --timeout 0`'s start leg is `request_start_after_stop`, and it must reach systemd: the
-/// stop before it proves nothing, since a stop alone restores nothing. The start is held, so the job
-/// it queues can never complete and a `start` job is the only answer — whether systemd has run the
-/// stop yet or not. A start leg that issued nothing leaves a `stop` job or none.
+/// `restart --timeout 0` must restart the daemon, even when systemd cannot run its stop at once. A
+/// dependent holds the stop, so it waits; a separate `start` would replace it and, on a unit still
+/// active, complete as a no-op. With the stop held, the daemon is still its old process and systemd
+/// holds a `restart` job for it — nothing else. Released, a blocking `start` joins that job and
+/// returns once it is done, and the daemon is a new process.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_restart_with_no_budget_queues_its_start_in_systemd() {
+fn a_restart_with_no_budget_restarts_behind_a_stop_that_has_to_wait() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let spec = mk(guard.id());
     let mgr = Systemd::new();
-    let _held = HeldStart::install(&mgr, &spec);
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    let before = main_pid(guard.id());
+    let mut holder = StopHolder::start(guard.id());
     let args = goetia::cli::restart::Args {
         ids: vec![guard.id().to_string()],
         wait: goetia::cli::wait::WaitArgs {
@@ -791,11 +826,24 @@ fn a_restart_with_no_budget_queues_its_start_in_systemd() {
 
     let (out, err) = (String::from_utf8_lossy(&out), String::from_utf8_lossy(&err));
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
-    let jobs = queued_job_types(guard.id());
+    assert_eq!(
+        queued_job_types(guard.id()),
+        ["restart"],
+        "systemd must hold a restart for the daemon behind the held stop"
+    );
+    assert_eq!(
+        main_pid(guard.id()),
+        before,
+        "the stop is held, so nothing has stopped yet"
+    );
+
+    holder.release();
+    cmd::run("systemctl", &["start", &format!("{}.service", guard.id())]).expect_ok();
+
+    let after = main_pid(guard.id());
     assert!(
-        jobs.iter().any(|kind| kind == "start"),
-        "the start leg never reached systemd: jobs={jobs:?}, {:?}",
-        active_state_and_job(guard.id())
+        after != before && after != "0",
+        "the daemon was never restarted: MainPID {before} before, {after} after"
     );
 }
 
@@ -811,7 +859,8 @@ fn goetia_offline(args: &[&str]) -> std::process::Output {
 
 /// In a chroot or offline, `systemctl` says "Running in chroot, ignoring command" and exits `0`
 /// having asked systemd nothing — an image build's `install --start` is the ordinary case. Under
-/// every budget that must be a failure, never "started" or "stopped", and the unit stays put.
+/// every budget that must be a failure, never "started", "stopped" or "restarted", and the unit
+/// stays put.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn an_offline_systemctl_is_never_reported_as_started_or_stopped() {
     let id = support::random_test_id();
@@ -821,7 +870,7 @@ fn an_offline_systemctl_is_never_reported_as_started_or_stopped() {
     mgr.install(&spec, false).expect("install");
     let budgets: [&[&str]; 3] = [&[], &["--no-timeout"], &["--timeout", "0"]];
 
-    for (verb, before) in [("start", "inactive"), ("stop", "active")] {
+    for (verb, before) in [("start", "inactive"), ("stop", "active"), ("restart", "active")] {
         if verb == "stop" {
             mgr.start(&spec.id, Budget::DEFAULT).expect("start online");
         }

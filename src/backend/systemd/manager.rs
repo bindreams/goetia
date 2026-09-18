@@ -71,7 +71,8 @@ use std::path::{Path, PathBuf};
 
 use discover::{DROPIN_SEARCH_DIRS, RawState, absent_error, classify_and_read, discover, raw_state, require_installed};
 use systemctl::{
-    daemon_reload, daemon_reload_or_report, require_supported, run_systemctl, start_impl, status_from_unit, stop_impl,
+    daemon_reload, daemon_reload_or_report, request_restart_impl, require_supported, run_systemctl, start_impl,
+    status_from_unit, stop_impl,
 };
 use write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 
@@ -260,9 +261,16 @@ impl ServiceManager for Systemd {
         start_with(id.as_str(), budget, &REAL_STEPS)
     }
 
-    /// The plain request-only start: systemd queues a start job behind a
-    /// pending stop job rather than answering "already running", so there is
-    /// no answer here to misread.
+    /// One `systemctl restart --no-block`: systemd stops the unit and starts
+    /// it again as one job, so no start can overtake the stop.
+    fn request_restart(&self, id: &Id) -> Option<Result<()>> {
+        let id = id.as_str();
+        Some(require_installed(id).and_then(|_| request_restart_impl(id)))
+    }
+
+    /// The plain request-only start. `restart` never issues it here — see
+    /// [`Self::request_restart`] — since after a stop nobody waited for, it
+    /// replaces a stop job systemd has not yet run.
     fn request_start_after_stop(&self, id: &Id) -> Result<()> {
         start_with(id.as_str(), Budget::Immediate, &REAL_STEPS)
     }

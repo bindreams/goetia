@@ -116,8 +116,22 @@ pub trait ServiceManager {
     /// [`Error::Undetermined`]: crate::Error::Undetermined
     fn start(&self, id: &Id, budget: Budget) -> Result<()>;
 
-    /// `daemon restart --timeout 0`'s second step: request a start right
-    /// after a stop request nobody waited for, and return.
+    /// `daemon restart --timeout 0` as one request, where the platform has
+    /// one: stop the service and start it again, confirming neither. `None`,
+    /// the default, where it has none — the caller then issues [`Self::stop`]
+    /// under [`Budget::Immediate`] and [`Self::request_start_after_stop`].
+    ///
+    /// Only a single request is free of the window between two: systemd
+    /// answers a start by replacing a stop job it has not yet run, and on a
+    /// unit still active that start completes at once, restarting nothing.
+    /// `Some(Ok(()))` means the manager accepted the request and nothing more.
+    fn request_restart(&self, _id: &Id) -> Option<Result<()>> {
+        None
+    }
+
+    /// `daemon restart --timeout 0`'s second step, where there is no
+    /// [`Self::request_restart`]: request a start right after a stop request
+    /// nobody waited for, and return.
     ///
     /// **Unlike [`Self::start`], not idempotent over a service that is still
     /// up.** A manager answering "already running" here has refused the

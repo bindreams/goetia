@@ -97,8 +97,11 @@ struct Store {
     start_stalls: BTreeSet<String>,
     /// [`Fake::seed_stop_stalls`]'s mirror of `start_stalls`.
     stop_stalls: BTreeSet<String>,
-    /// Every `start`/`stop` this Fake was asked to perform, in order — see
-    /// [`Fake::calls`].
+    /// Whether this Fake has a request-only restart — see
+    /// [`Fake::seed_native_restart`].
+    native_restart: bool,
+    /// Every `start`/`stop`/`restart` this Fake was asked to perform, in
+    /// order — see [`Fake::calls`].
     calls: Vec<(&'static str, String)>,
 }
 
@@ -352,7 +355,15 @@ impl Fake {
         state.stop_stalls.insert(id.to_string());
     }
 
-    /// Every `start`/`stop` this Fake was asked to perform, in order,
+    /// Test-only seeding: give this Fake a [`ServiceManager::request_restart`],
+    /// as systemd's `systemctl restart --no-block` is. Without it the Fake has
+    /// none, as launchd and SCM have none.
+    pub fn seed_native_restart(&self) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.native_restart = true;
+    }
+
+    /// Every `start`/`stop`/`restart` this Fake was asked to perform, in order,
     /// recorded when it was *asked* rather than when it succeeded.
     ///
     /// Exists because some assertions are about the **absence** of a call,
@@ -599,6 +610,17 @@ impl ServiceManager for Fake {
             entry.state = State::Running;
         }
         Ok(())
+    }
+
+    /// Only once [`Fake::seed_native_restart`]ed. Request-only, so it settles
+    /// nothing, as for `start`.
+    fn request_restart(&self, id: &Id) -> Option<Result<()>> {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        if !state.native_restart {
+            return None;
+        }
+        state.calls.push(("restart", id.as_str().to_string()));
+        Some(state.get_mut(id).and_then(|entry| require_ours(entry, id)))
     }
 
     /// Models the strictest manager the contract allows, SCM's: a service

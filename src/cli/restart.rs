@@ -2,8 +2,10 @@
 //!
 //! Not a `ServiceManager` method of its own — `stop` then `start`, using the
 //! trait's own verbs (both idempotent, per their doc comments: `stop` on an
-//! already-stopped daemon is not an error). Does not change boot-enablement,
-//! same as either verb alone.
+//! already-stopped daemon is not an error) — except under a budget that does
+//! not wait, on a manager with one request-only restart
+//! (`ServiceManager::request_restart`). Does not change boot-enablement, same
+//! as either verb alone.
 //!
 //! **One budget covers the whole restart, not each leg.** The user invoked a
 //! single operation, and taking twice the time it named because the
@@ -84,11 +86,19 @@ fn run_with(
 /// `stop` that returned `Ok` has confirmed stopped, and one that ran out
 /// returned `WaitTimeout` instead, so the start is never reached. Under a
 /// budget that does not wait there is nothing to confirm and deliberately
-/// nothing is read — "don't wait, just do the steps". Either way no state is
-/// queried between the two, which is what keeps the exit code from being a
-/// stopwatch question.
+/// nothing is read — "don't wait, just do the steps", as one request where
+/// the manager has one. Either way no state is queried between the two,
+/// which is what keeps the exit code from being a stopwatch question.
 fn restart(mgr: &dyn ServiceManager, id: &Id, budget: Budget, start_clock: &dyn Fn(Budget) -> Deadline) -> Result<()> {
     let deadline = start_clock(budget);
+    if !budget.waits() {
+        // One request where the manager has one: nothing then happens
+        // between the stop and the start, and a refusal changed nothing, so
+        // its error stands as it is.
+        if let Some(requested) = mgr.request_restart(id) {
+            return requested;
+        }
+    }
     mgr.stop(id, stop_leg(budget, budget_for(deadline)))
         .map_err(|e| abandoned_before_start(e, budget))?;
 
