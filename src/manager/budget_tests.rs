@@ -178,13 +178,6 @@ fn at_is_some_exactly_when_the_deadline_is_bounded() {
     assert!(t <= std::time::Instant::now());
 }
 
-#[skuld::test]
-fn two_deadlines_from_the_same_start_compare_equal() {
-    let d = Budget::DEFAULT.start();
-    let same = d; // `Deadline` is `Copy`; this is a second, independent value.
-    assert_eq!(d, same);
-}
-
 // millis_ceil =========================================================================================================
 
 #[skuld::test]

@@ -110,6 +110,7 @@ pub fn timed_out(id: &str, awaited: &'static str, budget: Budget) -> crate::Erro
 
 /// An absolute instant a [`Budget`] resolves to via [`Budget::start`].
 /// `None` means unbounded — never expires.
+// `PartialEq` is exercised by `scm::wait_tests::a_pending_callback_rearms_under_the_same_deadline`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Deadline(Option<Instant>);
 
