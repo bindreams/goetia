@@ -41,16 +41,25 @@ pub(super) fn daemon_reload_or_report(id: &str) -> Result<()> {
 
 /// The argv for one `systemctl <verb> <unit>` under `budget`.
 ///
-/// Its own function so that each path's flag is observable without a timing bet: no elevated test
-/// can see `--no-block` (`start` returns either way), and `--show-transaction` only changes when
-/// goetia may give up. `systemctl_tests.rs` asserts all three.
+/// `--show-transaction` on every path: its announcement ([`enqueued`]) is the only evidence that
+/// systemd took the request — `systemctl` exits `0` having done nothing in a chroot or under
+/// `SYSTEMD_OFFLINE=1` — and on the bounded path it is also what the wait holds out for. A budget
+/// that does not wait adds `--no-block`, which still announces the job (measured on systemd 257).
+///
+/// Its own function so that each path's flags are observable without a timing bet: no elevated test
+/// can see `--no-block` (`start` returns either way). `systemctl_tests.rs` asserts both argvs.
 fn verb_args<'a>(verb: &'a str, unit: &'a str, budget: Budget) -> Vec<&'a str> {
-    match budget {
-        _ if !budget.waits() => vec![verb, "--no-block", unit],
-        Budget::Unbounded => vec![verb, unit],
-        _ => vec![verb, "--show-transaction", unit],
+    if budget.waits() {
+        vec![verb, "--show-transaction", unit]
+    } else {
+        vec![verb, "--no-block", "--show-transaction", unit]
     }
 }
+
+/// `systemctl`'s environment on every path. The announcement is `log_info`: an inherited
+/// `SYSTEMD_LOG_LEVEL=warning` or `SYSTEMD_LOG_TARGET=null` silences it, and without it a request
+/// systemd took is indistinguishable from one it ignored.
+const AUDIBLE: [(&str, &str); 2] = [("SYSTEMD_LOG_LEVEL", "info"), ("SYSTEMD_LOG_TARGET", "console")];
 
 /// Whether `systemctl --show-transaction`'s stderr says systemd has answered the request with a
 /// job — the line it writes after `StartUnit`/`StopUnit` returns and before it waits for the job.
@@ -64,16 +73,15 @@ fn enqueued(stderr: &[u8]) -> bool {
 ///
 /// A budget that does not wait becomes `systemctl <verb> --no-block`, the exact native expression
 /// of "issue the request and return": systemd enqueues the job and `systemctl` exits without
-/// waiting for it to complete. `Budget::Unbounded` is today's plain blocking call. Both keep
+/// waiting for it to complete. `Budget::Unbounded` is the plain blocking call. Both keep
 /// `Command::output()`, because neither has anything to bound — cosca enters this module only where
 /// a bound is actually required, which is the third path and only the third.
 ///
 /// That third path waits on `deadline`, which the caller derived at verb entry, so discovery spends
 /// the budget too — but the deadline bounds only the wait for the job, never whether it is
-/// enqueued. `--show-transaction` makes `systemctl` announce the job once systemd has it
-/// ([`enqueued`]), and until then the wait is unbounded: a budget that discovery used up, or one a
-/// few milliseconds long, still reaches systemd, and an expiry is then exactly what
-/// `budget::timed_out` says it is. `budget` only picks the path and the wording.
+/// enqueued: until `systemctl` announces the job ([`enqueued`]) the wait is unbounded, so a budget
+/// that discovery used up, or one a few milliseconds long, still reaches systemd, and an expiry is
+/// then exactly what `budget::timed_out` says it is. `budget` only picks the path and the wording.
 fn run_verb(verb: &str, unit: &str, budget: Budget, deadline: Deadline) -> Result<Finished> {
     run_verb_via("systemctl", &verb_args(verb, unit, budget), budget, deadline)
 }
@@ -85,6 +93,7 @@ fn run_verb_via(program: &str, args: &[&str], budget: Budget, deadline: Deadline
     if !budget.waits() || budget == Budget::Unbounded {
         let output = Command::new(program)
             .args(args)
+            .envs(AUDIBLE)
             .output()
             .map_err(|e| failed(e.to_string()))?;
         // `output()` reads both pipes to EOF before returning, so on either
@@ -100,34 +109,50 @@ fn run_verb_via(program: &str, args: &[&str], budget: Budget, deadline: Deadline
     }
 
     let mut cmd = bounded::command(program, args).map_err(|e| failed(e.to_string()))?;
-    // The announcement is `log_info`: an inherited `SYSTEMD_LOG_LEVEL=warning` or
-    // `SYSTEMD_LOG_TARGET=null` silences it, and the wait for it would then never end early.
-    cmd.env("SYSTEMD_LOG_LEVEL", "info")
-        .env("SYSTEMD_LOG_TARGET", "console");
+    for (key, value) in AUDIBLE {
+        cmd.env(key, value);
+    }
     let child = cmd.spawn().map_err(|e| failed(e.to_string()))?;
     bounded::wait_bounded(child, deadline, Role::AnnouncedRequest(enqueued)).map_err(|e| failed(e.to_string()))
+}
+
+/// Whether `line` is one `systemctl` writes on success as much as on failure — the transaction
+/// `--show-transaction` announces, or a job's `finished` notice. Protocol, not diagnosis: left in, it
+/// opens every failure message, and a diagnostic the deadline cut short can consist of nothing else.
+fn is_protocol(line: &str) -> bool {
+    enqueued(line.as_bytes())
+        || line.contains("Enqueued auxiliary job ")
+        || (line.contains("Job for ") && line.trim_end().ends_with(" finished."))
+}
+
+/// What `systemctl` said about its outcome: stderr, where it writes its diagnostics, or stdout when
+/// stderr said nothing else — less the [`is_protocol`] lines either way.
+fn diagnostic(capture: &Capture) -> String {
+    let said = |stream: &[u8]| -> String {
+        String::from_utf8_lossy(stream)
+            .split_inclusive('\n')
+            .filter(|line| !is_protocol(line))
+            .collect()
+    };
+    let stderr = said(&capture.stderr);
+    if stderr.is_empty() {
+        said(&capture.stdout)
+    } else {
+        stderr
+    }
 }
 
 /// The message for a `systemctl` invocation that exited non-zero, built from the whole [`Capture`]
 /// rather than from its bytes alone.
 ///
-/// `systemctl` writes nothing on success, so `complete == false` only ever bites here — on
-/// the one path whose entire value is the diagnostic. A truncated read presented as the whole story
-/// is how "goetia stopped reading" comes out reading as "systemd said nothing".
+/// `systemctl` writes nothing but protocol on success, so `complete == false` only ever bites here —
+/// on the one path whose entire value is the diagnostic. A truncated read presented as the whole
+/// story is how "goetia stopped reading" comes out reading as "systemd said nothing".
 ///
-/// `systemctl_tests.rs` covers all four shapes a capture arrives in; nothing else can, since
-/// reaching this through a real `systemctl` needs one that actually fails.
+/// `systemctl_tests.rs` covers every shape a capture arrives in; nothing else can, since reaching
+/// this through a real `systemctl` needs one that actually fails.
 fn failed(verb: &str, unit: &str, capture: &Capture) -> Error {
-    // Whichever stream carried the diagnostic. `systemctl` writes its
-    // failures to stderr, but a failure that produced only stdout would
-    // otherwise reach the empty-diagnostic guard below and report that the
-    // command "wrote no diagnostic" — false, since systemd wrote one, and
-    // wrong on the one path whose entire value is the diagnostic.
-    let diagnostic = if capture.stderr.is_empty() {
-        String::from_utf8_lossy(&capture.stdout)
-    } else {
-        String::from_utf8_lossy(&capture.stderr)
-    };
+    let diagnostic = diagnostic(capture);
     // Ahead of the `complete` branch, not inside the truncated one: both
     // streams can be empty either way, and trailing off after a colon is
     // just as uninformative when the read did finish. Only the *reason* it
@@ -149,6 +174,28 @@ fn failed(verb: &str, unit: &str, capture: &Capture) -> Error {
     ))
 }
 
+/// A `systemctl` that exited `0`: `Ok` only if systemd answered with a job. `systemctl` in a chroot,
+/// or under `SYSTEMD_OFFLINE=1`, says "Running in chroot, ignoring command" and exits `0` having
+/// asked systemd nothing — an image build's `install --start` is the ordinary case — and reporting
+/// that as started or stopped is reporting a state nobody established.
+///
+/// Reliable on every path: without an announcement the bounded wait reads to EOF before it waits at
+/// all, so a job line cannot be missing for want of reading.
+fn took(verb: &str, unit: &str, capture: &Capture) -> Result<()> {
+    if enqueued(&capture.stderr) {
+        return Ok(());
+    }
+    let diagnostic = diagnostic(capture);
+    let why = if diagnostic.is_empty() {
+        " and said nothing about why".to_string()
+    } else {
+        format!(": {diagnostic}")
+    };
+    Err(Error::Other(format!(
+        "systemctl {verb} {unit} exited 0 without enqueuing a job, so systemd did not act on it{why}"
+    )))
+}
+
 /// `systemctl start` blocks until its job completes — the real synchronization primitive, no polling
 /// needed. Idempotent: starting an already-active unit is a no-op that still exits 0. An expiry
 /// means the job was enqueued and not waited out — see [`run_verb`].
@@ -159,7 +206,7 @@ fn failed(verb: &str, unit: &str, capture: &Capture) -> Error {
 pub(super) fn start_impl(id: &str, budget: Budget, deadline: Deadline) -> Result<()> {
     let unit = super::unit_name(id);
     match run_verb("start", &unit, budget, deadline)? {
-        Finished::Exited { status, .. } if status.success() => Ok(()),
+        Finished::Exited { status, capture } if status.success() => took("start", &unit, &capture),
         Finished::Exited { capture, .. } => Err(failed("start", &unit, &capture)),
         Finished::Expired => Err(budget::timed_out(id, "running", budget)),
     }
@@ -171,7 +218,8 @@ pub(super) fn start_impl(id: &str, budget: Budget, deadline: Deadline) -> Result
 pub(super) fn stop_impl(id: &str, budget: Budget, deadline: Deadline) -> Result<()> {
     let unit = super::unit_name(id);
     match run_verb("stop", &unit, budget, deadline)? {
-        Finished::Exited { status, .. } if status.success() || status.code() == Some(5) => Ok(()),
+        Finished::Exited { status, capture } if status.success() => took("stop", &unit, &capture),
+        Finished::Exited { status, .. } if status.code() == Some(5) => Ok(()),
         Finished::Exited { capture, .. } => Err(failed("stop", &unit, &capture)),
         Finished::Expired => Err(budget::timed_out(id, "stopped", budget)),
     }

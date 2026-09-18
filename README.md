@@ -16,8 +16,7 @@ specific commit if working ahead of one.
 
 goetia requires **systemd 242+** (2019). Generated units use `Type=exec`
 (240+): on an older systemd, `systemctl start` fails to load the unit with
-systemd's own diagnostic naming the directive. A bounded wait — any `start` or
-`stop` without `--timeout 0` or `--no-timeout` — runs
+systemd's own diagnostic naming the directive. Every `start` and `stop` runs
 `systemctl --show-transaction` (242+), which an older `systemctl` rejects as
 an unrecognized option.
 
@@ -574,7 +573,10 @@ tell us. That reads as one guarantee and is three, because what each manager
 confirms differs:
 
 - **systemd** confirms the `exec` itself succeeded: a missing executable or a
-  missing user comes back as a failed start.
+  missing user comes back as a failed start. Under every budget, a `start` or
+  `stop` for which systemd enqueued no job is a failure (exit `1`), `uninstall`'s
+  stop included: `systemctl` in a chroot, or under `SYSTEMD_OFFLINE=1`, exits
+  `0` having done nothing.
 - **SCM**, for a `type: simple` daemon, confirms that `goetia-shim` started.
   Under `restart: always` or `on-failure` the shim reports running before its
   first spawn, so your own command failing to start is not part of what was

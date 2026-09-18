@@ -1,6 +1,7 @@
-//! Unit coverage for the pure halves of `systemctl.rs`: the diagnostic
-//! [`failed`] builds out of a [`Capture`], across the four shapes a capture
-//! can arrive in.
+//! Unit coverage for the pure halves of `systemctl.rs` — the diagnostic
+//! [`failed`] builds out of a [`Capture`], across the shapes a capture can
+//! arrive in, and the argv and environment each budget runs under — plus
+//! [`took`] against a real `systemctl` run offline.
 //!
 //! These are pure-function tests on purpose. `failed`'s whole job is the
 //! wording of a message, and `tests/systemd_integration/linux.rs` can only
@@ -92,7 +93,7 @@ fn a_budget_that_does_not_wait_asks_systemd_not_to_block() {
     for budget in [Budget::Immediate, Budget::Bounded(Duration::ZERO)] {
         assert_eq!(
             verb_args("start", "x.service", budget),
-            ["start", "--no-block", "x.service"],
+            ["start", "--no-block", "--show-transaction", "x.service"],
             "{budget:?}"
         );
     }
@@ -102,17 +103,26 @@ fn a_budget_that_does_not_wait_asks_systemd_not_to_block() {
 /// the confirmation the budget exists to wait for.
 #[skuld::test]
 fn a_budget_that_waits_lets_systemctl_block() {
-    assert_eq!(verb_args("stop", "x.service", Budget::Unbounded), ["stop", "x.service"]);
-}
-
-/// A bounded budget also asks `systemctl` to say when systemd has the job, which is the line
-/// [`enqueued`] waits for before the deadline may cut anything short.
-#[skuld::test]
-fn a_bounded_budget_asks_systemctl_to_announce_the_job() {
     assert_eq!(
-        verb_args("stop", "x.service", Budget::Bounded(Duration::from_secs(10))),
+        verb_args("stop", "x.service", Budget::Unbounded),
         ["stop", "--show-transaction", "x.service"]
     );
+}
+
+/// Every budget asks `systemctl` to say when systemd has the job: the line [`enqueued`] waits for
+/// before the deadline may cut anything short, and the only evidence that systemd took the request.
+#[skuld::test]
+fn every_budget_asks_systemctl_to_announce_the_job() {
+    for budget in [
+        Budget::Immediate,
+        Budget::Unbounded,
+        Budget::Bounded(Duration::from_secs(10)),
+    ] {
+        assert!(
+            verb_args("stop", "x.service", budget).contains(&"--show-transaction"),
+            "{budget:?}"
+        );
+    }
 }
 
 // enqueued ============================================================================================================
@@ -187,19 +197,117 @@ fn the_bounded_path_issues_the_request_on_a_spent_deadline() {
 }
 
 /// An inherited `SYSTEMD_LOG_LEVEL=warning` or `SYSTEMD_LOG_TARGET=null` silences the announcement,
-/// so the bounded path sets both. The stand-in exits `9` unless it sees exactly those values.
+/// so every path sets both. The stand-ins exit `9` unless they see exactly those values.
+const UNLESS_AUDIBLE_EXIT_9: &str =
+    "[ \"$SYSTEMD_LOG_LEVEL\" = info ] && [ \"$SYSTEMD_LOG_TARGET\" = console ] || exit 9";
+
+#[skuld::test]
+fn the_paths_that_do_not_bound_keep_the_announcement_audible() {
+    for budget in [Budget::Immediate, Budget::Unbounded] {
+        let finished = run_verb_via(
+            "/bin/sh",
+            &["-c", &format!("{UNLESS_AUDIBLE_EXIT_9}; exit 0")],
+            budget,
+            budget.start(),
+        )
+        .expect("sh is spawnable");
+        assert!(
+            matches!(&finished, Finished::Exited { status, .. } if status.success()),
+            "{budget:?}: {finished:?}"
+        );
+    }
+}
+
 #[skuld::test]
 fn the_bounded_path_keeps_the_announcement_audible() {
     let finished = run_verb_via(
         "/bin/sh",
         &[
             "-c",
-            "[ \"$SYSTEMD_LOG_LEVEL\" = info ] && [ \"$SYSTEMD_LOG_TARGET\" = console ] || exit 9; \
-             echo 'Enqueued anchor job 1 x.service/start.' >&2; exec sleep 2147483647",
+            &format!(
+                "{UNLESS_AUDIBLE_EXIT_9}; echo 'Enqueued anchor job 1 x.service/start.' >&2; exec sleep 2147483647"
+            ),
         ],
         Budget::Bounded(Duration::from_secs(10)),
         Budget::Immediate.start(),
     )
     .expect("sh is spawnable");
     assert!(matches!(finished, Finished::Expired), "{finished:?}");
+}
+
+// diagnostic ==========================================================================================================
+
+/// The transaction `--show-transaction` announces, and a job's `finished` notice, are written on
+/// success as much as on failure: protocol, not diagnosis, so they never open a failure message.
+#[skuld::test]
+fn a_failure_is_reported_without_the_transaction_lines() {
+    let e = failed(
+        "start",
+        "x.service",
+        &capture(
+            "",
+            "Enqueued anchor job 7 x.service/start.\n\
+             Enqueued auxiliary job 8 y.service/start.\n\
+             Job for y.service finished.\n\
+             Job for x.service failed because the control process exited with error code.\n",
+            true,
+        ),
+    );
+    assert_eq!(
+        e.to_string(),
+        "systemctl start x.service failed: Job for x.service failed because the control process \
+         exited with error code.\n"
+    );
+}
+
+/// A diagnostic the deadline cut short after the announcement is no diagnostic at all, and says so
+/// rather than presenting the transaction as what went wrong.
+#[skuld::test]
+fn a_truncated_capture_of_only_the_transaction_says_nothing_was_captured() {
+    let msg = failed(
+        "start",
+        "x.service",
+        &capture("", "Enqueued anchor job 7 x.service/start.\n", false),
+    )
+    .to_string();
+    assert!(!msg.contains("Enqueued"), "{msg}");
+    assert!(msg.contains("no diagnostic was captured"), "{msg}");
+}
+
+// took ================================================================================================================
+
+#[skuld::test]
+fn an_exit_that_enqueued_a_job_took_the_request() {
+    let taken = took(
+        "start",
+        "x.service",
+        &capture("", "Enqueued anchor job 7 x.service/start.\n", true),
+    );
+    assert!(taken.is_ok(), "{taken:?}");
+}
+
+/// `systemctl` in a chroot or offline exits `0` and enqueues nothing. The real one, run offline, on
+/// every path and for both verbs: an exit of `0` alone must never read as started or stopped.
+#[skuld::test]
+fn an_offline_systemctl_that_exits_0_took_nothing() {
+    for verb in ["start", "stop"] {
+        for budget in [
+            Budget::Immediate,
+            Budget::Unbounded,
+            Budget::Bounded(Duration::from_secs(600)),
+        ] {
+            let mut args = vec!["SYSTEMD_OFFLINE=1", "systemctl"];
+            args.extend(verb_args(verb, "goetia-offline-probe.service", budget));
+            let finished = run_verb_via("env", &args, budget, budget.start()).expect("env is spawnable");
+            let Finished::Exited { status, capture } = finished else {
+                panic!("{verb} {budget:?}: an offline systemctl exits on its own: {finished:?}");
+            };
+            assert!(status.success(), "{verb} {budget:?}: {status:?} {capture:?}");
+            let e = took(verb, "goetia-offline-probe.service", &capture)
+                .expect_err("an exit of 0 with no job enqueued took nothing");
+            let msg = e.to_string();
+            assert!(msg.contains("without enqueuing a job"), "{verb} {budget:?}: {msg}");
+            assert!(msg.contains("ignoring command"), "systemd's own reason: {msg}");
+        }
+    }
 }

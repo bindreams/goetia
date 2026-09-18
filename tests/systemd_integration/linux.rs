@@ -799,6 +799,57 @@ fn a_restart_with_no_budget_queues_its_start_in_systemd() {
     );
 }
 
+/// `goetia <args>`, elevated as this test is, with `SYSTEMD_OFFLINE=1` in its environment: the
+/// switch that makes `systemctl` act as it does in a chroot.
+fn goetia_offline(args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_goetia"))
+        .args(args)
+        .env("SYSTEMD_OFFLINE", "1")
+        .output()
+        .expect("spawn goetia")
+}
+
+/// In a chroot or offline, `systemctl` says "Running in chroot, ignoring command" and exits `0`
+/// having asked systemd nothing — an image build's `install --start` is the ordinary case. Under
+/// every budget that must be a failure, never "started" or "stopped", and the unit stays put.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn an_offline_systemctl_is_never_reported_as_started_or_stopped() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let spec = mk(guard.id());
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+    let budgets: [&[&str]; 3] = [&[], &["--no-timeout"], &["--timeout", "0"]];
+
+    for (verb, before) in [("start", "inactive"), ("stop", "active")] {
+        if verb == "stop" {
+            mgr.start(&spec.id, Budget::DEFAULT).expect("start online");
+        }
+        for budget in budgets {
+            let mut args = vec!["daemon", verb, guard.id()];
+            args.extend_from_slice(budget);
+
+            let output = goetia_offline(&args);
+
+            let (stdout, stderr) = (
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            assert!(stderr.contains("without enqueuing a job"), "{args:?}: {stderr}");
+            assert_eq!(
+                active_state_and_job(guard.id()),
+                (before.to_string(), String::new()),
+                "{args:?} must leave the unit where it was"
+            );
+        }
+    }
+}
+
 /// `Type=exec` is what makes `systemctl start` report failure here at all — under `Type=simple` the
 /// same spec's `start` returns `Ok`. `restart: always` is pinned explicitly (`mk`'s default is
 /// `OnFailure`) so the unit under test is exactly `Type=exec` + `Restart=always` +
