@@ -135,6 +135,8 @@ fn a_contained_childs_descendant_dies_with_it() {
     .unwrap();
     cmd.fd(3, cosca::Stdio::pipe_out()).unwrap();
     let mut child = cmd.spawn().unwrap();
+    #[cfg(target_os = "linux")]
+    let leaf = contained_leaf(child.id().pid());
 
     let fd3 = child.fd_read_end(3.into()).unwrap();
     let mut line = String::new();
@@ -157,6 +159,31 @@ fn a_contained_childs_descendant_dies_with_it() {
         cosca::identity::Resolved::Found(p) => p.wait().unwrap(),
         cosca::identity::Resolved::Gone => {}
         cosca::identity::Resolved::Unknown => panic!("could not resolve the descendant's identity"),
+    }
+    #[cfg(target_os = "linux")]
+    remove_drained_leaf(leaf);
+}
+
+/// The cgroup leaf cosca placed `pid` in, or `None` where containment fell back to a process
+/// group — whose cgroup is this test process's own, and must not be touched.
+#[cfg(target_os = "linux")]
+fn contained_leaf(pid: u32) -> Option<std::path::PathBuf> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let relative = text.lines().find_map(|line| line.strip_prefix("0::"))?;
+    let leaf = std::path::Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
+    leaf.file_name()?.to_str()?.starts_with("cosca-").then_some(leaf)
+}
+
+/// Remove a leaf every member of which has exited. cosca's own `Drop` removes it when the killed
+/// tree has already drained by then, and leaves it behind when a member is still dying — half the
+/// runs of the test above, measured — so the test removes what it made.
+#[cfg(target_os = "linux")]
+fn remove_drained_leaf(leaf: Option<std::path::PathBuf>) {
+    let Some(leaf) = leaf else { return };
+    match std::fs::remove_dir(&leaf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => panic!("remove the drained leaf {}: {e}", leaf.display()),
     }
 }
 
@@ -249,21 +276,45 @@ fn what_an_announced_request_wrote_before_announcing_is_kept() {
 }
 
 /// A request goetia cannot see arrive is never killed: killing it could cancel a request the manager
-/// has not yet received. The child is left running, and the test reaps it itself.
+/// has not yet received. The test ends the child itself, with `SIGTERM`, and reaps it: a child the
+/// expiry left running dies of that, and one already killed dies of the `SIGKILL` that got there
+/// first. `kill(pid, 0)` cannot tell the two apart, since a killed child is still there until reaped.
 #[skuld::test]
 fn an_unannounced_request_is_left_running_on_expiry() {
-    let child = command("sleep", &["2147483647"]).unwrap().spawn().unwrap();
+    let child = unannounced_request().spawn().unwrap();
     let pid = child.id().pid() as libc::pid_t;
 
     let finished = wait_bounded(child, Budget::Immediate.start(), Role::Request).unwrap();
 
     assert!(matches!(finished, Finished::Expired), "{finished:?}");
-    let alive = unsafe { libc::kill(pid, 0) } == 0;
+    let mut status = 0;
     unsafe {
-        libc::kill(pid, libc::SIGKILL);
-        libc::waitpid(pid, std::ptr::null_mut(), 0);
+        libc::kill(pid, libc::SIGTERM);
+        libc::waitpid(pid, &mut status, 0);
     }
-    assert!(alive, "an expiry must not kill a request it cannot see arrive");
+    assert!(
+        libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGTERM,
+        "an expiry must not kill a request it cannot see arrive (wait status {status:#x})"
+    );
+}
+
+/// The child [`an_unannounced_request_is_left_running_on_expiry`] detaches: `command()`'s, as
+/// launchd's `launchctl` — the one production `Role::Request` — is spawned.
+#[cfg(not(target_os = "linux"))]
+fn unannounced_request() -> cosca::Command {
+    command("sleep", &["2147483647"]).unwrap()
+}
+
+/// On Linux, uncontained. cosca 0.4's cgroup containment kills a detached tree — the leaf's `Drop`
+/// writes `cgroup.kill` — and leaves the leaf behind, measured; nothing on Linux detaches, since
+/// `systemctl` announces its requests.
+#[cfg(target_os = "linux")]
+fn unannounced_request() -> cosca::Command {
+    let mut cmd = cosca::run(["sleep", "2147483647"]);
+    cmd.stdin(cosca::Stdio::null()).unwrap();
+    cmd.stdout(cosca::Stdio::pipe_out()).unwrap();
+    cmd.stderr(cosca::Stdio::pipe_out()).unwrap();
+    cmd
 }
 
 // expiry_disposition ==================================================================================================

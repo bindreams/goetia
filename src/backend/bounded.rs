@@ -85,7 +85,8 @@ pub(crate) enum Role {
     AnnouncedRequest(fn(&[u8]) -> bool),
     /// A request that never says when the manager has it. The deadline applies from the spawn, but
     /// an expiry leaves the child running rather than killing it, since a kill could land before
-    /// the request is out.
+    /// the request is out. launchd's alone: on Linux, cosca 0.4's cgroup containment kills a
+    /// detached tree when it drops the leaf, so a [`command`] child would not be left running.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Request,
 }
