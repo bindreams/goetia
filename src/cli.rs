@@ -151,8 +151,10 @@ pub enum DaemonCommand {
 ///   ([`Error::WaitTimeout`](crate::error::Error::WaitTimeout)) is an
 ///   instance of the first and deliberately **not** of the second: what is
 ///   installed at the id was settled before the wait began, and Goetia
-///   stopped waiting rather than cancelling anything, so the request stands
-///   and the daemon may still arrive.
+///   stopped waiting rather than cancelling anything, so a request it issued
+///   stands and the daemon may still arrive. `restart` also reports a start
+///   leg its budget ran out before this way, having issued no start, and its
+///   message says so.
 ///   [`Error::Unestablished`](crate::error::Error::Unestablished) joins it
 ///   there, for `restart` under a budget that does not wait — an unconfirmed
 ///   stop followed by a refused start. Reporting the first as `1` would

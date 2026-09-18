@@ -330,8 +330,11 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
             // question was answered — but a different condition: this one
             // answered what is at the id and left the *outcome* open. The
             // catch-all below would report `1`, which says the verb
-            // determinately failed, and the request was never cancelled, so
-            // that is exactly what was not established.
+            // determinately failed, and nothing goetia issued was cancelled,
+            // so that is exactly what was not established. `restart`'s start
+            // leg is the one expiry with no request behind it — its budget ran
+            // out before it — and it is still a timeout, not a failure (see
+            // `restart::spent_before_start`).
             Err(e @ Error::WaitTimeout { .. }) => {
                 let _ = writeln!(err, "error: {id}: {e}");
                 codes.push(4);
