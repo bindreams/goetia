@@ -241,9 +241,10 @@ fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
             recovery,
         },
         // The stop was issued and not waited for, and the start that
-        // followed was refused — determinately (systemd rejecting a unit it
-        // cannot load) or not (SCM's `ERROR_SERVICE_ALREADY_RUNNING` over a
-        // service still coming down). Either way nothing confirmed the stop,
+        // followed was refused — determinately (a launchd `bootstrap` that
+        // fails outright) or not (SCM's `ERROR_SERVICE_ALREADY_RUNNING` over a
+        // service still coming down). systemd never gets here: its restart is
+        // one request. Either way nothing confirmed the stop,
         // which may be in flight, done, or have had nothing to do, so where
         // the daemon ended up is what nobody established — not `Other`,
         // exit `1`, whose answer a refusal alone would be.

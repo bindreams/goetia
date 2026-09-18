@@ -499,9 +499,11 @@ pub(super) fn stop_impl(id: &str, budget: Budget, deadline: Deadline) -> Result<
     }
 }
 
-/// `systemctl restart --no-block`: one job, which stops the unit and then starts it, where a stop
-/// and a separate start leave a window in which the start replaces the stop. [`took`] as for
-/// `start`: an exit of `0` with no job is a restart nobody made.
+/// `systemctl restart --no-block`: one job, where a stop and a separate start leave a window in
+/// which the start replaces the stop. It stops the unit and then starts it — unless the unit is
+/// still activating, when systemd folds the restart into the start job already running: nothing is
+/// stopped, and the daemon comes up fresh from that start. [`took`] as for `start`: an exit of `0`
+/// with no job is a restart nobody made.
 pub(super) fn request_restart_impl(id: &str) -> Result<()> {
     let unit = super::unit_name(id);
     match run_verb("restart", &unit, Budget::Immediate, Budget::Immediate.start())? {

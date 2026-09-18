@@ -264,7 +264,7 @@ impl ServiceManager for Systemd {
     /// Makes ready now what each start or stop in `steps` needs to watch its one `systemctl`: a
     /// thread to read the stderr it announces its job on, and a temp file for its stdout. `install`
     /// runs no watched `systemctl`. While it is held, the steps also share one version gate — see
-    /// [`systemctl::GateScope`].
+    /// `systemctl::GateScope`.
     fn prepare(&self, steps: &[Step]) -> Result<Prepared> {
         let watched = steps
             .iter()
@@ -283,8 +283,10 @@ impl ServiceManager for Systemd {
         Ok(Prepared::holding((spares, gate_scope())))
     }
 
-    /// One `systemctl restart --no-block`: systemd stops the unit and starts
-    /// it again as one job, so no start can overtake the stop.
+    /// One `systemctl restart --no-block`: one job, so no start can overtake
+    /// the stop. systemd stops the unit and starts it again, or, while it is
+    /// still activating, folds the restart into the start already running —
+    /// see `request_restart_impl`.
     fn request_restart(&self, id: &Id) -> Option<Result<()>> {
         let id = id.as_str();
         Some(require_installed(id).and_then(|_| request_restart_impl(id)))

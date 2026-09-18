@@ -132,7 +132,7 @@ pub trait ServiceManager {
     }
 
     /// `daemon restart --timeout 0` as one request, where the platform has
-    /// one: stop the service and start it again, confirming neither. `None`,
+    /// one: the manager's own restart, confirming nothing. `None`,
     /// the default, where it has none — the caller then issues [`Self::stop`]
     /// under [`Budget::Immediate`] and [`Self::request_start_after_stop`].
     ///

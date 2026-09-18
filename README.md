@@ -618,9 +618,12 @@ it may or may not be stopped when you look, and a start may or may not have
 been issued. Which case you are in is in the error message.
 
 `restart --timeout 0` issues the stop and the start and confirms neither,
-which is what it is for. On systemd it is one `systemctl restart --no-block`:
-systemd stops and starts the unit itself, so the start cannot overtake the
-stop, and a restart systemd refuses has changed nothing (exit `1`). On macOS
+which is what it is for. On systemd it is one `systemctl restart --no-block`,
+one job, so no start can overtake the stop, and a restart systemd refuses has
+changed nothing (exit `1`). systemd stops the unit and starts it again, except
+while the unit is still starting: it folds the restart into the start already
+running, so nothing is stopped and the daemon comes up fresh from that start.
+On macOS
 and Windows it is a stop and then a start, and a start refused in that window
 exits `4` rather than `0`: the daemon may be the instance the stop is still
 taking down, may be going down, or may never have moved.
