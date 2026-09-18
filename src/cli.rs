@@ -168,12 +168,15 @@ pub enum DaemonCommand {
 ///   `errors[].kind` — both codes come from `report::Kind::code`, the one
 ///   kind-to-code map. `diff` returns it for `Outcome::RefuseUnreadable`
 ///   and for `Error::Undetermined` (`cli::diff::run`); `install` returns it
-///   for `Error::Undetermined` from `mgr.install`/`enable`/`start`, so the
-///   two verbs agree about that error and disagree only about
+///   for `Error::Undetermined` from `mgr.install`/`enable`/`start`, and for
+///   `Error::WaitTimeout` from `--start`'s `mgr.start`, so the two verbs
+///   agree about `Undetermined` and disagree only about
 ///   `Outcome::RefuseUnreadable`, which `install` reports as `1` because it
 ///   genuinely failed to install. All six id verbs return it through
-///   `support::run_id_verb`: "could not determine the state and therefore
-///   did nothing" is one condition with one remedy for every one of them.
+///   `support::run_id_verb`, for three conditions: `Undetermined`, where
+///   goetia could not determine what is at the id, and — from the verbs that
+///   act — `WaitTimeout` and `Unestablished`, where it acted and could not
+///   determine the outcome.
 ///   `show` returns it too (`cli::show::run`), in both its per-id and
 ///   no-ids forms — for an "installed but unreadable" id, for an id
 ///   `list()` reported as undetermined, and for *any* id it cannot find
