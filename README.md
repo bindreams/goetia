@@ -615,6 +615,13 @@ which is what it is for. A start refused in that window exits `4` rather than
 `0`: the daemon may be the instance the stop is still taking down, may be
 going down, or may never have moved.
 
+**On Windows, `restart --timeout 0` will usually stop the daemon and not
+restart it.** The start arrives while the service is still coming down and is
+refused — for a `type: simple` daemon almost always, since its service reads
+`RUNNING` until its child is gone — which leaves the daemon stopped, at exit
+`4`. To restart a daemon on Windows, let `restart` wait for the stop: leave
+`--timeout` at its default, or give it a duration other than `0`.
+
 ## Exit codes
 
 Two rules come before the numbers:
