@@ -238,7 +238,9 @@ fn took(verb: &str, unit: &str, capture: &Capture) -> Result<()> {
 
 /// `systemctl start` blocks until its job completes — the real synchronization primitive, no polling
 /// needed. Idempotent: starting an already-active unit is a no-op that still exits 0. An expiry
-/// means the job was enqueued and not waited out — see [`run_verb`].
+/// means the job was enqueued and not waited out — see [`run_verb`]. That holds for an active unit
+/// too: systemd answers the start with a job, not a state, so a budget shorter than that no-op job's
+/// round trip expires where launchd and SCM report started (see `ServiceManager::start`).
 ///
 /// Every generated unit carries `Type=exec` (see `generate::unit`'s doc comment for why), so a
 /// bounded `systemctl start` confirms the `exec` itself succeeded — not merely that systemd forked

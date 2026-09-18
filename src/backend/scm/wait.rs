@@ -139,12 +139,20 @@ fn accept_as_started(reply: StartReply) -> io::Result<()> {
 /// Critical ordering: arm `RUNNING` strictly BEFORE issuing `start`, else the
 /// service can reach `RUNNING` before the arm and the notification only
 /// fires on the *next* entry into `RUNNING` — a hang.
+///
+/// An `ERROR_SERVICE_ALREADY_RUNNING` over a service the query reports
+/// `Running` is the SCM's own answer that the goal is reached, so it is the
+/// confirmation, whatever is left of the deadline — as launchd's `print` of a
+/// running job is. The armed wait would only have immediate-fired on it.
 pub fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
     let armed = a.arm(WantState::Running, deadline)?;
     // Issued even when the arm expired: only the *waiting* is bounded, and a
     // service left unstarted because goetia ran out of budget while arming
     // would be the worst of both answers.
-    accept_as_started(a.start()?)?;
+    match a.start()? {
+        StartReply::AlreadyRunning(QueriedState::Running) => return Ok(Waited::Confirmed),
+        reply => accept_as_started(reply)?,
+    }
     if armed == Waited::Expired {
         return Ok(Waited::Expired);
     }
@@ -278,9 +286,10 @@ pub enum QueriedState {
 /// may be the instance its own unconfirmed stop is taking down, which is why
 /// that caller treats every 1056 as a refusal instead. For a plain start
 /// nothing further is needed — which is the whole of what [`request_start`]
-/// reports, and what the armed wait then confirms, since `want_to_mask` arms
+/// reports. The armed wait confirms `StartPending` (`want_to_mask` arms
 /// `SERVICE_NOTIFY_START_PENDING` in *both* of its `WantState::Running`
-/// branches and a service in either state immediate-fires it. `StartPending`
+/// branches, so it immediate-fires), and takes a queried `Running` as its
+/// confirmation outright (see [`start_via_notify`]). `StartPending`
 /// in particular is what a service is in when something else started it a
 /// moment earlier — rejecting it fails a start that was going to succeed.
 /// For every other state the service is not heading for running at all, so

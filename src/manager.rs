@@ -92,6 +92,17 @@ pub trait ServiceManager {
     /// declines to wait. The budget bounds what goetia waits *for*, and
     /// there is nothing here to wait for separately.
     ///
+    /// An answer from the manager that itself establishes the goal is the
+    /// confirmation, whatever is left of the budget: launchd's `print` of a
+    /// job already running, read before any request is needed, and SCM's
+    /// `ERROR_SERVICE_ALREADY_RUNNING` reply over a service it reports
+    /// `RUNNING`. systemd's answer to a start is a job,
+    /// never a state, so there a unit already active is confirmed only when
+    /// that job completes — which is where the backends disagree: under a
+    /// budget shorter than the job's round trip (tens of milliseconds), the
+    /// same start of a running daemon expires on systemd and succeeds on the
+    /// other two.
+    ///
     /// On expiry, [`Error::WaitTimeout`] — never `Ok(())`, and never
     /// [`Error::Undetermined`], which claims the *installation* is in doubt
     /// when what actually happened is that a settled id's request was issued

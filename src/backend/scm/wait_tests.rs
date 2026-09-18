@@ -386,6 +386,27 @@ fn a_plain_start_over_a_running_service_is_a_start() {
     assert_eq!(start_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
 }
 
+/// A 1056 over a service the query reports `Running` is the SCM saying the goal is reached, so the
+/// wait confirms on it with nothing more to watch — even with the deadline already spent, where the
+/// other two backends agree: launchd reads a running job as started under any budget.
+#[skuld::test]
+fn a_start_the_scm_answers_already_running_is_confirmed_whatever_the_deadline() {
+    for (arm, deadline) in [(Waited::Expired, spent()), (Waited::Confirmed, unbounded())] {
+        let mut fake = FakeScm::new([]).already_running(QueriedState::Running).arming(arm);
+        assert_eq!(start_via_notify(&mut fake, deadline).unwrap(), Waited::Confirmed);
+        assert_eq!(fake.log, vec!["arm_running", "start"], "nothing left to wait for");
+    }
+}
+
+/// `StartPending` is on its way, not there: under a spent deadline that is still an expiry.
+#[skuld::test]
+fn a_start_the_scm_answers_start_pending_still_expires_on_a_spent_deadline() {
+    let mut fake = FakeScm::new([])
+        .already_running(QueriedState::StartPending)
+        .arming(Waited::Expired);
+    assert_eq!(start_via_notify(&mut fake, spent()).unwrap(), Waited::Expired);
+}
+
 #[skuld::test]
 fn a_plain_start_over_a_stopping_service_is_refused() {
     let mut fake = FakeScm::new([]).already_running(QueriedState::StopPending);

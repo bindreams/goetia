@@ -593,6 +593,13 @@ stopped waiting; it did not cancel anything, so the request stands and the
 daemon may still arrive. `goetia daemon status <id>` shows the manager's
 current view.
 
+A `start` of a daemon that is already running is where the three disagree
+under a very short `--timeout`. launchd and SCM say "running" — launchd
+before any request is needed, SCM in its reply to the start — and that is
+the confirmation, so it exits `0` whatever the budget. systemd answers a start with a job, never a state, and confirms only
+when that job completes: a `--timeout` shorter than its round trip — tens of
+milliseconds — exits `4`.
+
 `restart` spends **one budget across the whole operation**, and one per
 daemon — `restart a b c --timeout 30s` promises each of the three 30s rather
 than leaving `c` whatever `a` and `b` did not spend, and neither leg gets a
