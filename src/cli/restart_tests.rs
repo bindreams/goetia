@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use super::{Args, NextLeg, WaitArgs, after_stop, run_with};
+use super::{Args, Leg, WaitArgs, leg, run_with};
 use crate::error::Result;
 use crate::manager::fake::Fake;
 use crate::manager::{Budget, ServiceManager};
@@ -11,37 +11,31 @@ use crate::spec::{DaemonSpec, Id, Kind, Restart, User};
 const THIRTY: Budget = Budget::Bounded(Duration::from_secs(30));
 
 #[skuld::test]
-fn a_bounded_budget_the_stop_leg_spent_abandons_the_restart() {
-    assert_eq!(after_stop(THIRTY, Budget::Immediate), NextLeg::Abandon);
-    assert_eq!(after_stop(THIRTY, Budget::Bounded(Duration::ZERO)), NextLeg::Abandon);
+fn a_bounded_budget_that_ran_out_is_spent() {
+    assert_eq!(leg(THIRTY, Budget::Immediate), Leg::Spent);
+    assert_eq!(leg(THIRTY, Budget::Bounded(Duration::ZERO)), Leg::Spent);
 }
 
 #[skuld::test]
-fn what_is_left_of_a_bounded_budget_is_what_the_start_leg_gets() {
+fn what_is_left_of_a_bounded_budget_is_what_the_leg_gets() {
     let left = Budget::Bounded(Duration::from_secs(5));
-    assert_eq!(after_stop(THIRTY, left), NextLeg::Start(left));
+    assert_eq!(leg(THIRTY, left), Leg::Under(left));
 }
 
 #[skuld::test]
-fn a_budget_that_never_waited_still_issues_the_start() {
+fn a_budget_that_never_waited_still_issues_both_legs() {
     // `--timeout 0` is "do the steps, confirm nothing", and its deadline is expired from the first
-    // instant — so an abandon rule phrased on what is left alone would drop the start leg.
+    // instant — so a rule phrased on what is left alone would drop both legs.
+    assert_eq!(leg(Budget::Immediate, Budget::Immediate), Leg::Under(Budget::Immediate));
     assert_eq!(
-        after_stop(Budget::Immediate, Budget::Immediate),
-        NextLeg::Start(Budget::Immediate)
-    );
-    assert_eq!(
-        after_stop(Budget::Bounded(Duration::ZERO), Budget::Immediate),
-        NextLeg::Start(Budget::Immediate)
+        leg(Budget::Bounded(Duration::ZERO), Budget::Immediate),
+        Leg::Under(Budget::Immediate)
     );
 }
 
 #[skuld::test]
-fn an_unbounded_budget_never_abandons() {
-    assert_eq!(
-        after_stop(Budget::Unbounded, Budget::Unbounded),
-        NextLeg::Start(Budget::Unbounded)
-    );
+fn an_unbounded_budget_is_never_spent() {
+    assert_eq!(leg(Budget::Unbounded, Budget::Unbounded), Leg::Under(Budget::Unbounded));
 }
 
 // deadline threading ==================================================================================================
@@ -121,4 +115,47 @@ fn one_restart_derives_one_deadline_for_both_legs() {
 #[skuld::test]
 fn every_id_derives_a_deadline_of_its_own() {
     assert_eq!(deadlines_derived(&["frpc", "websocat"]), 2);
+}
+
+// a spent budget ======================================================================================================
+
+/// A bounded budget already spent when the stop leg is issued is a timeout, not `--timeout 0`: the
+/// stop that goes out under it confirms nothing, so the restart must neither report it stopped nor
+/// start into it. The clock is injected already spent, so nothing here depends on how long the
+/// run takes.
+#[skuld::test]
+fn a_bounded_budget_spent_before_the_stop_leg_is_a_timeout_and_starts_nothing() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).expect("seed an installed daemon");
+    let args = Args {
+        ids: vec!["frpc".to_string()],
+        wait: WaitArgs {
+            timeout: Some(Duration::from_secs(30)),
+            no_timeout: false,
+        },
+    };
+    let mut out: Vec<u8> = Vec::new();
+    let mut err: Vec<u8> = Vec::new();
+
+    let code = run_with(
+        &args,
+        &|| -> Result<Box<dyn ServiceManager>> { Ok(Box::new(fake.clone())) },
+        &|| true,
+        &|_| Budget::Immediate.start(),
+        &mut out,
+        &mut err,
+    );
+
+    let err = String::from_utf8_lossy(&err);
+    assert_eq!(code, 4, "{err}");
+    assert_eq!(
+        fake.calls(),
+        vec![("stop", "frpc".to_string())],
+        "the stop is still issued, and the start never is"
+    );
+    assert!(err.contains("did not report stopped within 30s"), "{err}");
+    assert!(err.contains("no start was issued"), "{err}");
+    assert!(err.contains("may be left stopped"), "{err}");
+    assert!(!err.contains("was stopped"), "nothing confirmed the stop: {err}");
+    assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
 }

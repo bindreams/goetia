@@ -78,7 +78,8 @@ fn run_with(
 
 /// One daemon's restart, spending `budget` across both legs.
 ///
-/// Under a budget that waits the legs need nothing between them: a `stop`
+/// Under a budget that waits the legs need nothing between them: the stop
+/// leg is only ever handed a budget that waits (see [`leg`]), so a `stop`
 /// that returned `Ok` has confirmed stopped, and one that ran out returned
 /// `WaitTimeout` instead, so the start is never reached. Under a budget that
 /// does not wait there is nothing to confirm and deliberately nothing is
@@ -87,11 +88,24 @@ fn run_with(
 /// stopwatch question.
 fn restart(mgr: &dyn ServiceManager, id: &Id, budget: Budget, start_clock: &dyn Fn(Budget) -> Deadline) -> Result<()> {
     let deadline = start_clock(budget);
-    mgr.stop(id, budget_for(deadline)).map_err(abandoned_before_start)?;
+    match leg(budget, budget_for(deadline)) {
+        Leg::Under(stop_budget) => mgr.stop(id, stop_budget).map_err(abandoned_before_start)?,
+        Leg::Spent => {
+            // The request still goes out — the budget never decides that — and
+            // only its confirmation is not waited for, which under a budget the
+            // user bounded is a timeout like any other.
+            mgr.stop(id, Budget::Immediate)?;
+            return Err(abandoned_before_start(budget::timed_out(
+                id.as_str(),
+                "stopped",
+                budget,
+            )));
+        }
+    }
 
-    let start_budget = match after_stop(budget, budget_for(deadline)) {
-        NextLeg::Start(left) => left,
-        NextLeg::Abandon => return Err(spent_before_start(id, budget)),
+    let start_budget = match leg(budget, budget_for(deadline)) {
+        Leg::Under(left) => left,
+        Leg::Spent => return Err(spent_before_start(id, budget)),
     };
     mgr.start(id, start_budget)
         .map_err(|e| after_start_failed(id, budget, e))
@@ -99,14 +113,14 @@ fn restart(mgr: &dyn ServiceManager, id: &Id, budget: Budget, start_clock: &dyn 
 
 // the abandonment rule ================================================================================================
 
-/// What [`restart`] does after its stop leg returned `Ok`, given the budget
-/// the user named and what is left of it.
+/// The budget a leg of [`restart`] runs under, given the budget the user
+/// named and what is left of it.
 #[derive(Debug, PartialEq, Eq)]
-enum NextLeg {
-    /// Issue the start with this budget.
-    Start(Budget),
-    /// Do not issue it at all.
-    Abandon,
+enum Leg {
+    /// Issue it under this budget.
+    Under(Budget),
+    /// A bounded budget ran out before this leg: a timeout.
+    Spent,
 }
 
 /// A bounded budget that runs out anywhere is a timeout, and the start leg
@@ -115,19 +129,23 @@ enum NextLeg {
 /// requested-but-unconfirmed start.
 ///
 /// Branching on the *requested* budget and not on `left` alone is
-/// load-bearing. `--timeout 0`'s deadline is expired from its first instant,
-/// so "nothing left means abandon" would drop the start leg from the one
-/// mode whose entire point is to issue both steps.
-fn after_stop(requested: Budget, left: Budget) -> NextLeg {
+/// load-bearing, twice over. `--timeout 0`'s deadline is expired from its
+/// first instant, so "nothing left means spent" would drop both legs from
+/// the one mode whose entire point is to issue them. And a spent bounded
+/// budget must not reach a leg as `left` itself — [`budget_for`]'s
+/// `Immediate` — because that means "do not wait": a stop issued under it
+/// returns `Ok` having confirmed nothing, and would read as a stop that did.
+fn leg(requested: Budget, left: Budget) -> Leg {
     if requested.waits() && !left.waits() {
-        return NextLeg::Abandon;
+        return Leg::Spent;
     }
-    NextLeg::Start(left)
+    Leg::Under(left)
 }
 
 // wording =============================================================================================================
 
-/// The stop leg's own expiry, re-worded before it propagates. The variant is
+/// The stop leg's expiry — its own, or a budget spent before it was issued
+/// — re-worded before it propagates. The variant is
 /// preserved — this is still exit `4` — and only the remedy changes:
 /// [`budget::timed_out`]'s shared text speaks for a bare `stop` and
 /// discloses neither that the restart was abandoned nor that the daemon is
@@ -153,8 +171,9 @@ fn abandoned_before_start(e: Error) -> Error {
     }
 }
 
-/// The other way to reach [`NextLeg::Abandon`]: the stop *succeeded* and
-/// consumed the whole budget, leaving nothing to watch a start with.
+/// The start leg's [`Leg::Spent`]: the stop *succeeded* — confirmed, under a
+/// budget that waited — and consumed the whole budget, leaving nothing to
+/// watch a start with.
 ///
 /// `awaited` is `"running"` — the state the restart was asked to reach and
 /// did not — rather than `"stopped"`, which it did reach and must not be

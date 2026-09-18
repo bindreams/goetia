@@ -3028,6 +3028,29 @@ fn restart_does_not_start_after_a_stop_that_timed_out() {
     assert!(err.contains("may be left stopped"), "{err}");
 }
 
+/// A bounded budget spent before the stop leg is issued is still a timeout, never `--timeout 0`'s
+/// "requested": the stop goes out and confirms nothing, so the restart neither reports it stopped nor
+/// starts into it. `1ns` is spent before the stop leg on any machine, and a stop leg that did get
+/// what was left times out against the stall just the same — so the outcome is one, not a race.
+#[skuld::test]
+fn restart_does_not_start_after_a_stop_whose_budget_was_spent() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_stop_stalls("frpc");
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "restart", "frpc", "--timeout", "1ns"], &fake);
+
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(
+        fake.calls(),
+        vec![("stop", "frpc".to_string())],
+        "the start leg must never be issued"
+    );
+    assert!(err.contains("no start was issued"), "{err}");
+    assert!(err.contains("may be left stopped"), "{err}");
+    assert!(!err.contains("was stopped"), "nothing confirmed the stop: {err}");
+}
+
 /// "Don't wait, just do the steps": both steps issued, in order, with no confirmation and no state
 /// read between them.
 #[skuld::test]
