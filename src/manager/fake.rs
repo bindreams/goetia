@@ -15,7 +15,7 @@ use crate::blob::{self, Blob};
 use crate::decide::{self, Outcome, Ownership};
 use crate::error::{Error, Result};
 use crate::manager::budget;
-use crate::manager::{Budget, Installed, ServiceManager, State, Status};
+use crate::manager::{Budget, Installed, Prepared, ServiceManager, State, Status, Step};
 use crate::spec::{DaemonSpec, Id};
 
 /// The fake's own artifact marker. Deliberately not any of the real
@@ -100,6 +100,9 @@ struct Store {
     /// Whether this Fake has a request-only restart — see
     /// [`Fake::seed_native_restart`].
     native_restart: bool,
+    /// Whether [`ServiceManager::prepare`] fails — see
+    /// [`Fake::seed_prepare_fails`].
+    prepare_fails: bool,
     /// Every `start`/`stop`/`restart` this Fake was asked to perform, in
     /// order — see [`Fake::calls`].
     calls: Vec<(&'static str, String)>,
@@ -363,6 +366,13 @@ impl Fake {
         state.native_restart = true;
     }
 
+    /// Test-only seeding: make [`ServiceManager::prepare`] fail, as launchd's
+    /// does when no thread can be made to reap a request.
+    pub fn seed_prepare_fails(&self) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.prepare_fails = true;
+    }
+
     /// Every `start`/`stop`/`restart` this Fake was asked to perform, in order,
     /// recorded when it was *asked* rather than when it succeeded.
     ///
@@ -610,6 +620,16 @@ impl ServiceManager for Fake {
             entry.state = State::Running;
         }
         Ok(())
+    }
+
+    /// Fails only once [`Fake::seed_prepare_fails`]ed; holds nothing.
+    fn prepare(&self, _steps: &[Step]) -> Result<Prepared> {
+        if self.state.lock().expect("Fake mutex poisoned").prepare_fails {
+            return Err(Error::Other(
+                "nothing could be prepared (injected test failure)".to_string(),
+            ));
+        }
+        Ok(Prepared::nothing())
     }
 
     /// Only once [`Fake::seed_native_restart`]ed. Request-only, so it settles

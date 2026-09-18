@@ -6,15 +6,9 @@ use std::time::Duration;
 use super::*;
 use crate::manager::budget::Budget;
 
-/// `child`, already spawned, armed as [`spawn`] would arm it under `role` — for the roles that need
-/// nothing made before the spawn.
+/// `child`, already spawned, under `role`.
 fn armed(child: cosca::Child, role: Role) -> Spawned {
-    let armed = match role {
-        Role::Query => Armed::Query,
-        Role::AnnouncedRequest(issued) => Armed::AnnouncedRequest(issued),
-        Role::Request => panic!("a request's reaper is made before its spawn: use `spawn_with`"),
-    };
-    Spawned { child, armed }
+    Spawned { child, role }
 }
 
 // wait_bounded, through `command` =====================================================================================
@@ -319,7 +313,7 @@ fn an_unannounced_request_is_left_running_on_expiry_and_reaped_once_it_exits() {
         move |status| tx.send(status).expect("the test is still receiving"),
     )
     .unwrap();
-    let mut spawned = spawn_with(&mut exits_7_at_eof(), Role::Request, || Ok(reaper)).unwrap();
+    let mut spawned = spawn(&mut exits_7_at_eof(), Role::Request(reaper)).unwrap();
     writer_tx.send(spawned.child.stdin().expect("stdin is piped")).unwrap();
 
     let finished = wait_bounded(spawned, Budget::Immediate.start()).unwrap();
@@ -336,22 +330,38 @@ fn an_unannounced_request_is_left_running_on_expiry_and_reaped_once_it_exits() {
     );
 }
 
-/// A request no thread could be made to reap is never run: a program that does not exist reports
-/// the reaper's failure, not its own — so nothing was spawned to fail.
+/// A verb's reapers are all made before any is handed out, so a verb whose third request could have
+/// none never sends its first.
 #[skuld::test]
-fn a_request_that_could_have_no_reaper_is_never_run() {
-    let mut cmd = command("/nonexistent/goetia-never-run", &[]).unwrap();
+fn reapers_are_all_made_or_none_are() {
+    let _only_two = test_hook::allow(2);
 
-    let Err(e) = spawn_with(&mut cmd, Role::Request, || Err(io::Error::other("no threads left"))) else {
-        panic!("a request with no reaper must not be spawned");
-    };
+    let made = reapers::<3>();
 
-    let msg = e.to_string();
-    assert!(
-        msg.contains("no thread could be made to reap it, so it was not run"),
-        "{msg}"
-    );
-    assert!(msg.contains("no threads left"), "{msg}");
+    let e = made.expect_err("a third reaper could not be made");
+    assert!(e.to_string().contains("no reaper may be made"), "{e}");
+}
+
+/// A sequence's spares are taken before anything is made: its later verbs need no new thread, so
+/// cannot fail for want of one after an earlier verb has sent something.
+#[skuld::test]
+fn spares_are_taken_before_any_reaper_is_made() {
+    let spares = spare(3).unwrap();
+    let _none = test_hook::allow(0);
+
+    assert!(reapers::<1>().is_ok(), "the stop's reaper is a spare");
+    assert!(reapers::<2>().is_ok(), "the start's reapers are spares");
+    assert!(reapers::<1>().is_err(), "the spares are spent, and nothing may be made");
+    drop(spares);
+}
+
+/// Dropping the guard drops what it left: nothing lingers for a later, unrelated verb.
+#[skuld::test]
+fn spares_are_released_with_their_guard() {
+    drop(spare(2).unwrap());
+    let _none = test_hook::allow(0);
+
+    assert!(reapers::<1>().is_err(), "a released spare was still handed out");
 }
 
 /// A reaper whose request exited inside its budget has nothing to reap, and its thread ends: the

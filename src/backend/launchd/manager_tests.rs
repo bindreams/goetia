@@ -547,3 +547,90 @@ fn a_pass_that_finishes_names_every_plist_and_nothing_else() {
         "a pass that finished has nothing to report: {scan:?}"
     );
 }
+
+// Reapers: a sequence never fails halfway for want of one =============================================================
+
+/// An id nothing is installed at: a verb that gets past its reapers stops at discovery, before any
+/// `launchctl` runs, so these tests touch nothing on the host.
+fn never_installed() -> Id {
+    Id::try_from("goetia-reaper-probe-never-installed").unwrap()
+}
+
+/// Whether `result` is the failure of a verb that could not make its reapers — as opposed to one that
+/// made them and went on to discovery.
+fn refused_for_want_of_a_reaper<T: std::fmt::Debug>(result: Result<T>) -> bool {
+    matches!(&result, Err(e) if e.to_string().contains("no thread could be made to reap a `launchctl` request, so none was sent"))
+}
+
+/// Every verb makes every reaper it can need before anything else — discovery included, so before
+/// any `launchctl` runs: one short, and the verb fails having sent nothing. `start`'s corrective
+/// cycle is its fourth and fifth requests, so four reapers are one short.
+#[skuld::test]
+fn a_verb_one_reaper_short_sends_nothing() {
+    let mgr = LaunchdManager::new();
+    let id = never_installed();
+    let spec = DaemonSpec {
+        id: id.clone(),
+        name: id.to_string(),
+        command: vec!["/bin/true".to_string()],
+        cwd: None,
+        env: Default::default(),
+        user: User::Root,
+        restart: Restart::Always,
+        restart_delay: None,
+        logs: None,
+        kind: Kind::Simple,
+    };
+    for budget in [Budget::DEFAULT, Budget::Immediate] {
+        let _four = bounded::test_hook::allow(START_REQUESTS - 1);
+        assert!(refused_for_want_of_a_reaper(mgr.start(&id, budget)), "start {budget:?}");
+    }
+    let _four = bounded::test_hook::allow(START_REQUESTS - 1);
+    assert!(refused_for_want_of_a_reaper(mgr.request_start_after_stop(&id)));
+    let _none = bounded::test_hook::allow(0);
+    assert!(refused_for_want_of_a_reaper(mgr.stop(&id, Budget::DEFAULT)));
+    assert!(refused_for_want_of_a_reaper(mgr.uninstall(&id)));
+    assert!(refused_for_want_of_a_reaper(mgr.install(&spec, false)));
+}
+
+/// With every reaper made, the same verbs go on to discovery, which finds nothing installed.
+#[skuld::test]
+fn a_verb_with_its_reapers_goes_on_to_discovery() {
+    let mgr = LaunchdManager::new();
+    let id = never_installed();
+    let _five = bounded::test_hook::allow(START_REQUESTS);
+    assert!(!refused_for_want_of_a_reaper(mgr.start(&id, Budget::DEFAULT)));
+    let _one = bounded::test_hook::allow(STOP_REQUESTS);
+    assert!(!refused_for_want_of_a_reaper(mgr.stop(&id, Budget::DEFAULT)));
+}
+
+/// `restart`'s two legs, and `install --start`'s, draw on reapers `prepare` made before either sent
+/// anything: once it succeeded, neither leg can fail for want of one. It fails as a whole when one
+/// is short. `uninstall` stands in for the install, which would write a plist: each takes one.
+#[skuld::test]
+fn prepared_steps_need_no_reaper_made_later() {
+    let mgr = LaunchdManager::new();
+    let id = never_installed();
+    for (steps, needed) in [
+        ([Step::Stop, Step::Start], STOP_REQUESTS + START_REQUESTS),
+        ([Step::Install, Step::Start], INSTALL_REQUESTS + START_REQUESTS),
+    ] {
+        {
+            let _short = bounded::test_hook::allow(needed - 1);
+            assert!(mgr.prepare(&steps).is_err(), "{steps:?}");
+        }
+        let prepared = mgr.prepare(&steps).expect("prepare");
+        let _none = bounded::test_hook::allow(0);
+        let first = if steps[0] == Step::Stop {
+            mgr.stop(&id, Budget::DEFAULT)
+        } else {
+            mgr.uninstall(&id)
+        };
+        assert!(!refused_for_want_of_a_reaper(first), "{steps:?}");
+        assert!(
+            !refused_for_want_of_a_reaper(mgr.start(&id, Budget::DEFAULT)),
+            "{steps:?}"
+        );
+        drop(prepared);
+    }
+}

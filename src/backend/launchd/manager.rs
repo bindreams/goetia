@@ -62,12 +62,12 @@ use std::process::Command;
 use std::{fs, io};
 
 use crate::backend::Identity;
-use crate::backend::bounded::{self, Role};
+use crate::backend::bounded::{self, Reaper, Role};
 use crate::backend::launchd::{generate, state};
 use crate::decide::{self, Outcome, Ownership};
 use crate::error::{Error, Result};
 use crate::manager::budget::{self, Deadline};
-use crate::manager::{Budget, Installed, ServiceManager, State, Status};
+use crate::manager::{Budget, Installed, Prepared, ServiceManager, State, Status, Step};
 use crate::spec::{AccountId, DaemonSpec, Id, Restart, User};
 
 /// Where `install` writes a plist that is not (yet, or any longer) enabled
@@ -755,8 +755,8 @@ struct Ran {
 /// **Every** `launchctl` call the budgeted verbs make goes through here
 /// (D6a), and `role` is what keeps the budget from deciding whether a
 /// request is sent: a [`Role::Request`] that expires is left running, never
-/// killed, since `launchctl` never says when launchd has the request — and is
-/// not run at all if no thread could be made to reap it (a `CommandFailed`).
+/// killed, since `launchctl` never says when launchd has the request. Its
+/// [`Reaper`] was made before the verb sent anything — see [`reapers`].
 ///
 /// `Ok(None)` iff the deadline expired first. For a request that is not a
 /// failure of the command — the request is out, or on its way in a
@@ -822,10 +822,10 @@ fn is_loaded(id: &str, deadline: Deadline) -> Result<Option<bool>> {
 }
 
 /// `Ok(None)` iff `deadline` expired.
-fn bootstrap(path: &Path, deadline: Deadline) -> Result<Option<()>> {
+fn bootstrap(path: &Path, deadline: Deadline, reaper: Reaper) -> Result<Option<()>> {
     let path_str = path.to_str().expect("plist path is UTF-8 (see generate::path_str)");
     let args = ["bootstrap", "system", path_str];
-    let Some(ran) = launchctl(&args, deadline, Role::Request)? else {
+    let Some(ran) = launchctl(&args, deadline, Role::Request(reaper))? else {
         return Ok(None);
     };
     if ran.status.success() {
@@ -863,14 +863,14 @@ enum Kickstarted {
 /// out of a successful `-p` *is* the confirmation, and no follow-up `print`
 /// is needed or wanted. A budget that does not wait uses the plain form,
 /// which only requests the spawn.
-fn kickstart(id: &str, budget: Budget, deadline: Deadline) -> Result<Option<Kickstarted>> {
+fn kickstart(id: &str, budget: Budget, deadline: Deadline, reaper: Reaper) -> Result<Option<Kickstarted>> {
     let target = target(id);
     let args: Vec<&str> = if budget.waits() {
         vec!["kickstart", "-p", &target]
     } else {
         vec!["kickstart", &target]
     };
-    let Some(ran) = launchctl(&args, deadline, Role::Request)? else {
+    let Some(ran) = launchctl(&args, deadline, Role::Request(reaper))? else {
         return Ok(None);
     };
     if !ran.status.success() {
@@ -913,10 +913,10 @@ fn is_not_found(code: Option<i32>) -> bool {
 /// the already-gone case by construction instead of by timing.
 ///
 /// [`ServiceManager::stop`]: crate::manager::ServiceManager::stop
-fn bootout(id: &str, deadline: Deadline) -> Result<Option<()>> {
+fn bootout(id: &str, deadline: Deadline, reaper: Reaper) -> Result<Option<()>> {
     let target = target(id);
     let args = ["bootout", target.as_str()];
-    let Some(ran) = launchctl(&args, deadline, Role::Request)? else {
+    let Some(ran) = launchctl(&args, deadline, Role::Request(reaper))? else {
         return Ok(None);
     };
     if ran.status.success() || is_not_found(ran.status.code()) {
@@ -924,6 +924,28 @@ fn bootout(id: &str, deadline: Deadline) -> Result<Option<()>> {
     } else {
         Err(command_failed(&args, &ran))
     }
+}
+
+// Reapers =============================================================================================================
+
+/// The most `launchctl` requests each verb sends — every one needs a [`Reaper`], and a verb makes all
+/// of its reapers before it sends the first (see [`reapers`]). `install`: the `bootout` of a stale or
+/// updated job. `start`: `bootstrap` and `kickstart`, then the corrective cycle's `bootout`,
+/// `bootstrap` and `kickstart`. `stop` and `uninstall`: one `bootout`.
+const INSTALL_REQUESTS: usize = 1;
+const START_REQUESTS: usize = 5;
+const STOP_REQUESTS: usize = 1;
+
+/// [`bounded::reapers`], as the verb's own failure: nothing was sent, so exit `1` with the daemon
+/// untouched.
+fn reapers<const N: usize>(id: &Id) -> Result<[Reaper; N]> {
+    bounded::reapers::<N>().map_err(|e| no_reaper(id, e))
+}
+
+fn no_reaper(id: &Id, e: io::Error) -> Error {
+    Error::Other(format!(
+        "`{id}`: no thread could be made to reap a `launchctl` request, so none was sent: {e}"
+    ))
 }
 
 /// Best-effort live state, read from `launchctl print`'s body — the one
@@ -968,8 +990,10 @@ fn query_live_state(id: &str, deadline: Deadline) -> (State, Option<u32>) {
 
 // ServiceManager ======================================================================================================
 
-impl ServiceManager for LaunchdManager {
-    fn install(&self, spec: &DaemonSpec, force: bool) -> Result<Outcome> {
+impl LaunchdManager {
+    /// `install`, with the reaper for its one request made. A re-derivation after a race passes the
+    /// same reaper on rather than making another: the verb makes its reapers once, at entry.
+    fn install_reaping(&self, spec: &DaemonSpec, force: bool, reaper: Reaper) -> Result<Outcome> {
         let account = resolve_account(&spec.user)?;
         let desired = generate::plist(spec, &account.identity());
         let discovery = discover(spec.id.as_str())?;
@@ -1012,7 +1036,7 @@ impl ServiceManager for LaunchdManager {
                         // — unchanged from before budgets existed.
                         let deadline = Budget::Unbounded.start();
                         if never_expires(is_loaded(spec.id.as_str(), deadline)?) {
-                            never_expires(bootout(spec.id.as_str(), deadline)?);
+                            never_expires(bootout(spec.id.as_str(), deadline, reaper)?);
                         }
                     }
                     WriteNew::Raced => {
@@ -1023,7 +1047,7 @@ impl ServiceManager for LaunchdManager {
                         // reusing the exact same policy path every other
                         // call goes through, rather than a bespoke
                         // reclassify branch that could drift from it.
-                        return self.install(spec, force);
+                        return self.install_reaping(spec, force, reaper);
                     }
                 }
             }
@@ -1049,7 +1073,7 @@ impl ServiceManager for LaunchdManager {
                 // uses).
                 match occupied(&target) {
                     Presence::Present => {}
-                    Presence::Absent => return self.install(spec, force),
+                    Presence::Absent => return self.install_reaping(spec, force, reaper),
                     // The re-check established neither the vanish that would
                     // license re-deriving nor the presence that would
                     // license the write. [`Error::Io`], not [`undetermined`]:
@@ -1090,7 +1114,7 @@ impl ServiceManager for LaunchdManager {
                     // metadata comment's `Version` field, never anything
                     // `generate::plist` derives from `spec` itself, so a
                     // loaded job is not stale in any way that affects it.
-                    never_expires(bootout(spec.id.as_str(), deadline)?);
+                    never_expires(bootout(spec.id.as_str(), deadline, reaper)?);
                 }
             }
             Outcome::UpToDate
@@ -1100,6 +1124,33 @@ impl ServiceManager for LaunchdManager {
         }
 
         Ok(outcome)
+    }
+}
+
+impl ServiceManager for LaunchdManager {
+    fn install(&self, spec: &DaemonSpec, force: bool) -> Result<Outcome> {
+        let [reaper] = reapers::<INSTALL_REQUESTS>(&spec.id)?;
+        self.install_reaping(spec, force, reaper)
+    }
+
+    /// Makes every reaper `steps` can need now, so that no step fails for want of one after an
+    /// earlier step has sent something: `restart`'s start after its stop, `install --start`'s start
+    /// after the install's `bootout`.
+    fn prepare(&self, steps: &[Step]) -> Result<Prepared> {
+        let requests = steps
+            .iter()
+            .map(|step| match step {
+                Step::Install => INSTALL_REQUESTS,
+                Step::Start => START_REQUESTS,
+                Step::Stop => STOP_REQUESTS,
+            })
+            .sum();
+        let spares = bounded::spare(requests).map_err(|e| {
+            Error::Other(format!(
+                "no thread could be made to reap a `launchctl` request, so none was sent: {e}"
+            ))
+        })?;
+        Ok(Prepared::holding(spares))
     }
 
     fn preview_install(&self, spec: &DaemonSpec) -> Result<Outcome> {
@@ -1119,12 +1170,13 @@ impl ServiceManager for LaunchdManager {
     }
 
     fn uninstall(&self, id: &Id) -> Result<()> {
+        let [reaper] = reapers::<STOP_REQUESTS>(id)?;
         let (location, _text) = located_and_ours(id)?;
 
         // Unbounded, like `install`'s: `uninstall` has no `--timeout` of its
         // own, and bounding this would turn a slow-stopping job into a
         // failed uninstall where today it succeeds.
-        never_expires(bootout(id.as_str(), Budget::Unbounded.start())?);
+        never_expires(bootout(id.as_str(), Budget::Unbounded.start(), reaper)?);
         fs::remove_file(&location.path).map_err(io_err(&location.path))
     }
 
@@ -1164,6 +1216,13 @@ impl ServiceManager for LaunchdManager {
         // First, so discovery spends the budget too — see `verb_deadline`,
         // and for why a non-waiting budget gets an unbounded one.
         let deadline = verb_deadline(budget);
+        let [
+            bootstrap_reaper,
+            kickstart_reaper,
+            corrective_bootout,
+            corrective_bootstrap,
+            corrective_kickstart,
+        ] = reapers::<START_REQUESTS>(id)?;
         let (location, text) = located_and_ours(id)?;
         let blob = generate::extract(&text)?.ok_or_else(|| foreign(id))?;
         let timed_out = || budget::timed_out(id.as_str(), "running", budget);
@@ -1175,7 +1234,7 @@ impl ServiceManager for LaunchdManager {
         let issuing = Budget::Unbounded.start();
 
         if !never_expires(is_loaded(id.as_str(), issuing)?) {
-            if let Err(e) = bootstrap(&location.path, issuing).map(never_expires) {
+            if let Err(e) = bootstrap(&location.path, issuing, bootstrap_reaper).map(never_expires) {
                 // A concurrent `start` may have loaded it between the check
                 // above and this call; only propagate the error if the job
                 // genuinely is not loaded now either.
@@ -1197,7 +1256,7 @@ impl ServiceManager for LaunchdManager {
             // Bounded by `deadline`: `-p` is the wait for the pid. An expiry
             // leaves the `launchctl` running rather than killing it (see
             // `launchctl`), so the request still goes out.
-            match kickstart(id.as_str(), budget, deadline)?.ok_or_else(timed_out)? {
+            match kickstart(id.as_str(), budget, deadline, kickstart_reaper)?.ok_or_else(timed_out)? {
                 // launchd forked the job and named the pid. That *is* the
                 // confirmation — there is nothing further to subscribe
                 // to — so no follow-up `print` is needed or wanted.
@@ -1263,10 +1322,10 @@ impl ServiceManager for LaunchdManager {
             // when a stale job answered to the label, this cycle *is* the
             // request, and skipping it on a spent budget would report a
             // start that was never sent as one that may still arrive.
-            never_expires(bootout(id.as_str(), issuing)?);
-            never_expires(bootstrap(&location.path, issuing)?);
+            never_expires(bootout(id.as_str(), issuing, corrective_bootout)?);
+            never_expires(bootstrap(&location.path, issuing, corrective_bootstrap)?);
             if query_live_state(id.as_str(), issuing).0 != State::Running {
-                kickstart(id.as_str(), budget, deadline)?.ok_or_else(timed_out)?;
+                kickstart(id.as_str(), budget, deadline, corrective_kickstart)?.ok_or_else(timed_out)?;
             }
             if query_live_state(id.as_str(), deadline).0 != State::Running {
                 if deadline.expired() {
@@ -1297,8 +1356,9 @@ impl ServiceManager for LaunchdManager {
         // bounded budget an expiry leaves the `bootout` running rather than
         // killing it (see `launchctl`), so the request still goes out.
         let deadline = verb_deadline(budget);
+        let [reaper] = reapers::<STOP_REQUESTS>(id)?;
         located_and_ours(id)?;
-        bootout(id.as_str(), deadline)?.ok_or_else(|| budget::timed_out(id.as_str(), "stopped", budget))
+        bootout(id.as_str(), deadline, reaper)?.ok_or_else(|| budget::timed_out(id.as_str(), "stopped", budget))
     }
 
     fn status(&self, id: &Id) -> Result<Status> {

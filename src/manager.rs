@@ -116,6 +116,18 @@ pub trait ServiceManager {
     /// [`Error::Undetermined`]: crate::Error::Undetermined
     fn start(&self, id: &Id, budget: Budget) -> Result<()>;
 
+    /// Make ready, before the first of `steps` sends anything, whatever
+    /// they can need that could otherwise run out between two of them — so
+    /// that a failure here means nothing was sent, where the same failure
+    /// later would strand the daemon halfway: stopped by `restart`'s stop
+    /// with its start never sent, or booted out by `install --start`'s
+    /// install with the start never sent. Held for as long as the returned
+    /// [`Prepared`] lives, for verbs run on this thread. Nothing, by
+    /// default — so a wrapper around another manager forwards it.
+    fn prepare(&self, _steps: &[Step]) -> Result<Prepared> {
+        Ok(Prepared::nothing())
+    }
+
     /// `daemon restart --timeout 0` as one request, where the platform has
     /// one: stop the service and start it again, confirming neither. `None`,
     /// the default, where it has none — the caller then issues [`Self::stop`]
@@ -198,6 +210,37 @@ pub trait ServiceManager {
     /// side. A scan that *started* and did not finish is the opposite case
     /// and does report (see `Installed::scan_incomplete`).
     fn list(&self) -> Result<Vec<Installed>>;
+}
+
+// Prepared ============================================================================================================
+
+/// One verb of a sequence a caller runs back to back — see
+/// [`ServiceManager::prepare`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    Install,
+    Start,
+    Stop,
+}
+
+/// What [`ServiceManager::prepare`] made ready, released when dropped.
+#[must_use = "what was prepared is released as soon as this is dropped"]
+pub struct Prepared {
+    _held: Option<Box<dyn std::any::Any>>,
+}
+
+impl Prepared {
+    /// Nothing made ready: a backend with nothing that can run out.
+    pub fn nothing() -> Self {
+        Prepared { _held: None }
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn holding(held: impl std::any::Any) -> Self {
+        Prepared {
+            _held: Some(Box::new(held)),
+        }
+    }
 }
 
 // Installed / Status / State ==========================================================================================

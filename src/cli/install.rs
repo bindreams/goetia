@@ -11,7 +11,7 @@ use super::wait::WaitArgs;
 use crate::backend::Identity;
 use crate::decide::Outcome;
 use crate::error::{Error, Result};
-use crate::manager::ServiceManager;
+use crate::manager::{Prepared, ServiceManager, Step};
 use crate::spec::{AccountId, DaemonSpec, Id, User};
 
 #[derive(ClapArgs, Debug)]
@@ -97,6 +97,20 @@ pub fn run(
     // moment one daemon in the same run hard-failed.
     let mut codes: Vec<i32> = Vec::new();
     for spec in &selected {
+        // Before the install sends anything, so that nothing the start needs
+        // can run out after the install booted a loaded job out.
+        let _prepared = if args.start {
+            match mgr.prepare(&[Step::Install, Step::Start]) {
+                Ok(prepared) => prepared,
+                Err(e) => {
+                    let _ = writeln!(err, "error: {}: {e}", spec.id);
+                    codes.push(failure_code(&e));
+                    continue;
+                }
+            }
+        } else {
+            Prepared::nothing()
+        };
         match mgr.install(spec, args.force) {
             Ok(outcome) => {
                 match report_outcome(&spec.id, &outcome, out, err) {

@@ -3201,6 +3201,76 @@ fn a_restart_that_waits_never_takes_the_request_only_restart() {
     );
 }
 
+/// `restart` makes ready what both legs need before the stop is sent: when that fails, nothing was
+/// sent — exit `1`, with neither leg issued and the daemon untouched.
+#[skuld::test]
+fn restart_that_cannot_prepare_sends_nothing() {
+    for budget in [&[][..], &["--timeout", "0"], &["--no-timeout"]] {
+        let fake = Fake::new();
+        fake.install(&mk("frpc"), false).unwrap();
+        fake.seed_state("frpc", State::Running);
+        fake.seed_prepare_fails();
+        let mut args = vec!["goetia", "daemon", "restart", "frpc"];
+        args.extend_from_slice(budget);
+
+        let (code, out, err) = dispatch_elevated(&args, &fake);
+
+        assert_eq!(code, 1, "{budget:?}\nstdout:\n{out}\nstderr:\n{err}");
+        assert!(err.contains("nothing could be prepared"), "{err}");
+        assert_eq!(fake.calls(), vec![], "{budget:?}: nothing may be sent");
+        assert_eq!(
+            fake.status(&Id::try_from("frpc").unwrap()).unwrap().state,
+            State::Running
+        );
+    }
+}
+
+/// `install --start` makes ready what the start needs before the install sends anything: when that
+/// fails, nothing is installed and nothing started.
+#[skuld::test]
+fn install_start_that_cannot_prepare_installs_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let fake = Fake::new();
+    fake.seed_prepare_fails();
+
+    let (code, out, err) = dispatch_elevated(
+        &[
+            "goetia",
+            "daemon",
+            "install",
+            "--file",
+            manifest.to_str().unwrap(),
+            "--start",
+        ],
+        &fake,
+    );
+
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.contains("nothing could be prepared"), "{err}");
+    assert_eq!(fake.calls(), vec![]);
+    assert!(
+        fake.status(&Id::try_from("frpc").unwrap()).is_err(),
+        "nothing may be installed"
+    );
+}
+
+/// Without `--start` there is no sequence, and nothing is prepared.
+#[skuld::test]
+fn install_without_start_prepares_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let fake = Fake::new();
+    fake.seed_prepare_fails();
+
+    let (code, out, err) = dispatch_elevated(
+        &["goetia", "daemon", "install", "--file", manifest.to_str().unwrap()],
+        &fake,
+    );
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+}
+
 #[skuld::test]
 fn install_start_that_times_out_exits_4() {
     let dir = tempfile::tempdir().unwrap();

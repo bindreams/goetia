@@ -24,7 +24,7 @@ use super::support::{IdVerbCall, run_id_verb};
 use super::wait::{self, WaitArgs};
 use crate::error::{Error, Result};
 use crate::manager::budget::{self, Deadline, budget_for};
-use crate::manager::{Budget, ServiceManager};
+use crate::manager::{Budget, ServiceManager, Step};
 use crate::spec::Id;
 
 #[derive(ClapArgs, Debug)]
@@ -91,6 +91,9 @@ fn run_with(
 /// which is what keeps the exit code from being a stopwatch question.
 fn restart(mgr: &dyn ServiceManager, id: &Id, budget: Budget, start_clock: &dyn Fn(Budget) -> Deadline) -> Result<()> {
     let deadline = start_clock(budget);
+    // Before either leg sends anything, so that nothing either leg needs can
+    // run out between the stop and the start and leave the daemon stopped.
+    let _prepared = mgr.prepare(&[Step::Stop, Step::Start])?;
     if !budget.waits() {
         // One request where the manager has one: nothing then happens
         // between the stop and the start, and a refusal changed nothing, so
