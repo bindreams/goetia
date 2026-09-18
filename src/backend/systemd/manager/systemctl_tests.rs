@@ -506,6 +506,64 @@ fn an_unreadable_version_is_refused_without_calling_it_old() {
     }
 }
 
+// gated ===============================================================================================================
+
+/// A check that counts how often it is asked, and passes.
+fn counted(asked: &std::cell::Cell<usize>) -> impl FnOnce() -> Result<()> + '_ {
+    move || {
+        asked.set(asked.get() + 1);
+        Ok(())
+    }
+}
+
+/// Inside a scope the gate is asked once; outside one, every time — nothing is remembered past the
+/// invocation that opened it.
+#[skuld::test]
+fn the_gate_is_asked_once_inside_a_scope_and_every_time_outside_one() {
+    let asked = std::cell::Cell::new(0);
+    gated(counted(&asked)).unwrap();
+    gated(counted(&asked)).unwrap();
+    assert_eq!(asked.get(), 2, "outside a scope, every verb asks");
+
+    let scope = gate_scope();
+    gated(counted(&asked)).unwrap();
+    gated(counted(&asked)).unwrap();
+    assert_eq!(asked.get(), 3, "inside one, once");
+
+    drop(scope);
+    gated(counted(&asked)).unwrap();
+    assert_eq!(asked.get(), 4, "the answer ends with the scope");
+}
+
+/// Scopes nest and end in any order, and share one answer until the last of them ends.
+#[skuld::test]
+fn nested_scopes_share_one_answer_until_the_last_ends() {
+    for outer_first in [false, true] {
+        let asked = std::cell::Cell::new(0);
+        let outer = gate_scope();
+        gated(counted(&asked)).unwrap();
+        let inner = gate_scope();
+        gated(counted(&asked)).unwrap();
+        let (first, last) = if outer_first { (outer, inner) } else { (inner, outer) };
+        drop(first);
+        gated(counted(&asked)).unwrap();
+        assert_eq!(asked.get(), 1, "outer first: {outer_first}");
+        drop(last);
+        gated(counted(&asked)).unwrap();
+        assert_eq!(asked.get(), 2, "outer first: {outer_first}");
+    }
+}
+
+/// A refusal is not remembered: the next step asks again.
+#[skuld::test]
+fn a_refused_gate_is_asked_again() {
+    let _scope = gate_scope();
+    assert!(gated(|| Err(Error::Other("refused".to_string()))).is_err());
+    let asked = std::cell::Cell::new(0);
+    gated(counted(&asked)).unwrap();
+    assert_eq!(asked.get(), 1);
+}
+
 // require_supported_via ===============================================================================================
 
 /// A stand-in for `systemctl`: `sh -c <script> systemctl <args>`, so the probe's own arguments are

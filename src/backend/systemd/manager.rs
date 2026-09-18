@@ -71,8 +71,8 @@ use std::path::{Path, PathBuf};
 
 use discover::{DROPIN_SEARCH_DIRS, RawState, absent_error, classify_and_read, discover, raw_state, require_installed};
 use systemctl::{
-    daemon_reload, daemon_reload_or_report, request_restart_impl, require_supported, run_systemctl, start_impl,
-    status_from_unit, stop_impl,
+    daemon_reload, daemon_reload_or_report, gate_scope, request_restart_impl, require_supported, run_systemctl,
+    start_impl, status_from_unit, stop_impl,
 };
 use write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 
@@ -263,7 +263,8 @@ impl ServiceManager for Systemd {
 
     /// Makes ready now what each start or stop in `steps` needs to watch its one `systemctl`: a
     /// thread to read the stderr it announces its job on, and a temp file for its stdout. `install`
-    /// runs no watched `systemctl`.
+    /// runs no watched `systemctl`. While it is held, the steps also share one version gate — see
+    /// [`systemctl::GateScope`].
     fn prepare(&self, steps: &[Step]) -> Result<Prepared> {
         let watched = steps
             .iter()
@@ -279,7 +280,7 @@ impl ServiceManager for Systemd {
                 "no thread or file could be made to watch a `systemctl` request, so none was sent: {e}"
             ))
         })?;
-        Ok(Prepared::holding(spares))
+        Ok(Prepared::holding((spares, gate_scope())))
     }
 
     /// One `systemctl restart --no-block`: systemd stops the unit and starts

@@ -471,6 +471,24 @@ fn prepared_steps_need_nothing_made_later() {
     }
 }
 
+/// The steps `prepare` covers share one version gate while it is held: `restart`'s stop and start,
+/// and `install --start`'s install and start, each probe `systemctl` once, not once per step.
+#[skuld::test]
+fn prepared_steps_share_one_version_gate() {
+    let asked = std::cell::Cell::new(0);
+    let count = || {
+        asked.set(asked.get() + 1);
+        Ok(())
+    };
+    let prepared = Systemd::new().prepare(&[Step::Stop, Step::Start]).expect("prepare");
+    systemctl::gated(count).unwrap();
+    systemctl::gated(count).unwrap();
+    assert_eq!(asked.get(), 1, "the two legs asked twice");
+    drop(prepared);
+    systemctl::gated(count).unwrap();
+    assert_eq!(asked.get(), 2, "the answer outlived the preparation");
+}
+
 fn steps_taken(verb: fn(&str, Budget, &VerbSteps<'_>) -> Result<()>) -> Vec<&'static str> {
     let log = std::cell::RefCell::new(Vec::new());
     let derived = std::cell::Cell::new(None);

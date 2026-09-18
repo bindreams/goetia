@@ -1,7 +1,9 @@
 //! Thin wrappers over `systemctl` subprocess invocations: reload, start/stop, and reading a unit's
 //! live state back.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
 use std::process::Command;
 
 use crate::backend::bounded::{self, Capture, Finished, Role};
@@ -53,9 +55,51 @@ const UNCOLOURED: [(&str, &str); 1] = [("SYSTEMD_COLORS", "0")];
 /// Refuse a systemd older than [`SYSTEMD_FLOOR`]. Asked wherever goetia writes a unit or starts or
 /// stops one, and nowhere else: an older systemd does not reject `Type=exec` but logs that it cannot
 /// parse it and runs the unit as `Type=simple`, silently losing the failed-exec detection the
-/// directive is there for.
+/// directive is there for. Asked once per [`GateScope`].
 pub(super) fn require_supported() -> Result<()> {
-    require_supported_via(&["systemctl"])
+    gated(|| require_supported_via(&["systemctl"]))
+}
+
+thread_local! {
+    /// How many [`GateScope`]s are open on this thread, and whether the version gate passed inside
+    /// them.
+    static GATE: Cell<(usize, bool)> = const { Cell::new((0, false)) };
+}
+
+/// While one lives on this thread, a version gate that passed there is not asked again: the steps of
+/// one verb for one id — `restart`'s two legs, `install --start`'s install and start — share one
+/// answer, and one pair of probes spends one share of the budget. Scopes nest and end in any order;
+/// the answer is forgotten when the last one ends, so nothing outlives the invocation that opened
+/// them, and a manager that changes between two is asked again.
+pub(super) struct GateScope {
+    this_thread: PhantomData<*const ()>,
+}
+
+pub(super) fn gate_scope() -> GateScope {
+    let (open, passed) = GATE.get();
+    GATE.set((open + 1, passed));
+    GateScope {
+        this_thread: PhantomData,
+    }
+}
+
+impl Drop for GateScope {
+    fn drop(&mut self) {
+        let (open, passed) = GATE.get();
+        GATE.set((open - 1, passed && open > 1));
+    }
+}
+
+/// `check`, unless it already passed inside the open [`GateScope`]s. Only a pass is remembered: a
+/// refusal ends the verb anyway, and one that did not is asked again.
+pub(super) fn gated(check: impl FnOnce() -> Result<()>) -> Result<()> {
+    if GATE.get().1 {
+        return Ok(());
+    }
+    check()?;
+    let (open, _) = GATE.get();
+    GATE.set((open, open > 0));
+    Ok(())
 }
 
 /// Whose version [`supported`] judges.

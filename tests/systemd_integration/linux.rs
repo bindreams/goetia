@@ -1066,6 +1066,72 @@ fn an_older_systemd_is_refused_before_anything_is_written_or_run() {
     assert!(unit_path(guard.id()).exists(), "a refused uninstall removed the unit");
 }
 
+/// `goetia <args>` with a `systemctl` first on its `PATH` that appends every argv it is run with to
+/// `log`, one per line, and then runs the real one. Written by a child `sh`, as
+/// [`goetia_on_systemd`]'s stand-in is, and for the same reason.
+fn goetia_logging_systemctl(dir: &Path, args: &[&str]) -> std::process::Output {
+    let path = std::env::var("PATH").expect("PATH is set");
+    let real = std::env::split_paths(&path)
+        .map(|dir| dir.join("systemctl"))
+        .find(|candidate| candidate.is_file())
+        .expect("systemctl on PATH");
+    let script = format!(
+        "#!/bin/sh\necho \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+        dir.join("log").display(),
+        real.display()
+    );
+    let stand_in = dir.join("systemctl");
+    cmd::run(
+        "/bin/sh",
+        &[
+            "-c",
+            "printf '%s' \"$1\" > \"$0\" && chmod 0755 \"$0\"",
+            stand_in.to_str().expect("utf-8 temp path"),
+            &script,
+        ],
+    )
+    .expect_ok();
+    Command::new(env!("CARGO_BIN_EXE_goetia"))
+        .args(args)
+        .env("PATH", format!("{}:{path}", dir.display()))
+        .output()
+        .expect("spawn goetia")
+}
+
+/// The version gate probes `systemctl` once per daemon per verb, however many steps the verb takes:
+/// `restart`'s stop and start, and `install --start`'s install and start, share one pair of probes,
+/// and so one share of the budget.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn the_version_gate_probes_once_per_daemon_per_verb() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let (_manifest_dir, manifest) = world_readable_manifest(guard.id());
+    let manifest = manifest.to_str().expect("utf-8 temp path");
+    let probes = |args: &[&str]| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = goetia_logging_systemctl(dir.path(), args);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let log = fs::read_to_string(dir.path().join("log")).expect("read the log");
+        let count = |probe: &str| log.lines().filter(|line| line.starts_with(probe)).count();
+        (count("--version"), count("show --property=Version"))
+    };
+
+    for args in [
+        &["daemon", "install", "--file", manifest, "--start", guard.id()][..],
+        &["daemon", "restart", guard.id()],
+        &["daemon", "restart", guard.id(), "--timeout", "0"],
+        &["daemon", "start", guard.id()],
+        &["daemon", "stop", guard.id()],
+    ] {
+        assert_eq!(probes(args), (1, 1), "{args:?}");
+    }
+}
+
 /// `goetia <args>` in a transient scope allowed `tasks` tasks — threads and processes alike — so
 /// that making a thread, or spawning a process, fails once they are spent.
 fn goetia_with_tasks(tasks: u32, args: &[&str]) -> std::process::Output {
