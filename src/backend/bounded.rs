@@ -240,8 +240,11 @@ impl Reaper {
 }
 
 thread_local! {
-    /// Reapers a [`Spares`] guard on this thread made ready ahead of the verbs it covers.
-    static SPARES: std::cell::RefCell<Vec<Reaper>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Reapers the [`Spares`] guards on this thread made ready ahead of the verbs they cover, each
+    /// tagged with its guard's number.
+    static SPARES: std::cell::RefCell<Vec<(u64, Reaper)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The number the next [`Spares`] guard on this thread tags its spares with.
+    static NEXT_GUARD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Every reaper a verb's requests can need, made before it sends any: a sequence of requests must
@@ -252,9 +255,9 @@ thread_local! {
 /// request than it reserved for does not compile.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn reapers<const N: usize>() -> std::io::Result<[Reaper; N]> {
-    let mut got = SPARES.with_borrow_mut(|spares| {
+    let mut got: Vec<Reaper> = SPARES.with_borrow_mut(|spares| {
         let keep = spares.len().saturating_sub(N);
-        spares.split_off(keep)
+        spares.split_off(keep).into_iter().map(|(_, reaper)| reaper).collect()
     });
     while got.len() < N {
         got.push(Reaper::new()?);
@@ -264,23 +267,32 @@ pub(crate) fn reapers<const N: usize>() -> std::io::Result<[Reaper; N]> {
 
 /// Make `n` reapers ready now, for the verbs this thread runs while the returned guard lives — a
 /// sequence of verbs, such as `restart`'s stop and start, whose later verbs must not fail for want of
-/// a thread once an earlier one has sent something. Dropping the guard drops what is left. Not
-/// nested: one guard per sequence.
+/// a thread once an earlier one has sent something. Any verb run on this thread meanwhile may draw on
+/// them. Dropping the guard drops what is left of its own, and only that: guards nest, and end in any
+/// order.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn spare(n: usize) -> std::io::Result<Spares> {
     let made = (0..n).map(|_| Reaper::new()).collect::<std::io::Result<Vec<_>>>()?;
-    SPARES.with_borrow_mut(|spares| spares.extend(made));
-    Ok(Spares(()))
+    let tag = NEXT_GUARD.get();
+    NEXT_GUARD.set(tag + 1);
+    SPARES.with_borrow_mut(|spares| spares.extend(made.into_iter().map(|reaper| (tag, reaper))));
+    Ok(Spares {
+        tag,
+        this_thread: std::marker::PhantomData,
+    })
 }
 
-/// See [`spare`].
+/// See [`spare`]. Not `Send`: what it releases is this thread's.
 #[derive(Debug)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) struct Spares(());
+pub(crate) struct Spares {
+    tag: u64,
+    this_thread: std::marker::PhantomData<*const ()>,
+}
 
 impl Drop for Spares {
     fn drop(&mut self) {
-        SPARES.with_borrow_mut(Vec::clear);
+        SPARES.with_borrow_mut(|spares| spares.retain(|(tag, _)| *tag != self.tag));
     }
 }
 

@@ -364,6 +364,38 @@ fn spares_are_released_with_their_guard() {
     assert!(reapers::<1>().is_err(), "a released spare was still handed out");
 }
 
+/// A guard releases only the spares it made: an inner one dropped first leaves the outer one's for
+/// the verbs the outer one still covers.
+#[skuld::test]
+fn an_inner_guard_releases_only_its_own_spares() {
+    let outer = spare(2).unwrap();
+    drop(spare(1).unwrap());
+    let _none = test_hook::allow(0);
+
+    assert!(
+        reapers::<2>().is_ok(),
+        "the outer guard's spares were released with the inner's"
+    );
+    assert!(reapers::<1>().is_err(), "the inner guard's spare outlived it");
+    drop(outer);
+}
+
+/// Guards may also end out of order: dropping the outer one first leaves the inner one's spares.
+#[skuld::test]
+fn an_outer_guard_dropped_first_leaves_the_inner_guards_spares() {
+    let outer = spare(2).unwrap();
+    let inner = spare(1).unwrap();
+    drop(outer);
+    let _none = test_hook::allow(0);
+
+    assert!(
+        reapers::<1>().is_ok(),
+        "the inner guard's spare was released with the outer's"
+    );
+    assert!(reapers::<1>().is_err(), "the outer guard's spares outlived it");
+    drop(inner);
+}
+
 /// A reaper whose request exited inside its budget has nothing to reap, and its thread ends: the
 /// thread's closures are dropped with it, and the channel one of them held reports that.
 #[skuld::test]
