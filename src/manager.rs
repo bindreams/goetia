@@ -71,8 +71,11 @@ pub trait ServiceManager {
     /// the failure this whole signature exists to prevent.
     ///
     /// **`budget` bounds waiting for that confirmation, never whether the
-    /// request is sent.** The request is issued whatever is left of the
-    /// budget, and only the wait for the manager's answer is cut short.
+    /// request is sent.** Every real backend starts the clock at verb
+    /// entry, so discovery spends the budget too — and then issues the
+    /// request whatever is left of it, cutting short only the wait for the
+    /// manager's answer. A budget discovery used up still reaches the
+    /// manager.
     ///
     /// [`Budget::Immediate`] issues the request and returns without waiting,
     /// establishing nothing. `Ok(())` then means only that the request was

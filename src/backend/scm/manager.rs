@@ -192,6 +192,9 @@ impl ServiceManager for ScmManager {
     }
 
     fn start(&self, id: &Id, budget: Budget) -> Result<()> {
+        // First, so discovery spends the budget too. What it bounds is the
+        // wait: `start_via_notify` issues the start whatever is left of it.
+        let deadline = budget.start();
         let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
         require_ours(id)?;
         drop(service);
@@ -203,7 +206,7 @@ impl ServiceManager for ScmManager {
             // more, per the trait doc comment.
             return super::wait::request_start(&mut actor).map_err(|e| Error::Other(format!("start `{id}`: {e}")));
         }
-        let waited = super::wait::start_via_notify(&mut actor, budget.start())
+        let waited = super::wait::start_via_notify(&mut actor, deadline)
             .map_err(|e| Error::Other(format!("start `{id}`: {e}")))?;
         match waited {
             Waited::Confirmed => Ok(()),
@@ -212,6 +215,9 @@ impl ServiceManager for ScmManager {
     }
 
     fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
+        // First, so discovery spends the budget too; `stop_via_notify` issues
+        // the stop whatever is left of it.
+        let deadline = budget.start();
         let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
         require_ours(id)?;
         drop(service);
@@ -220,7 +226,7 @@ impl ServiceManager for ScmManager {
         if !budget.waits() {
             return super::wait::request_stop(&mut actor).map_err(|e| Error::Other(format!("stop `{id}`: {e}")));
         }
-        let waited = super::wait::stop_via_notify(&mut actor, budget.start())
+        let waited = super::wait::stop_via_notify(&mut actor, deadline)
             .map_err(|e| Error::Other(format!("stop `{id}`: {e}")))?;
         match waited {
             Waited::Confirmed => Ok(()),

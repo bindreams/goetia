@@ -785,8 +785,9 @@ fn command_failed(args: &[&str], ran: &Ran) -> Error {
     }
 }
 
-/// The one [`Deadline`] a budgeted verb derives — and the reason it is not
-/// simply `budget.start()`.
+/// The one [`Deadline`] a budgeted verb derives, first thing at entry so
+/// that discovery spends the budget too — and the reason it is not simply
+/// `budget.start()`.
 ///
 /// A budget that does not wait gets an explicitly **unbounded** deadline.
 /// `launchctl` exposes no non-blocking `bootout`, so for that call issuing
@@ -1159,11 +1160,11 @@ impl ServiceManager for LaunchdManager {
     }
 
     fn start(&self, id: &Id, budget: Budget) -> Result<()> {
+        // First, so discovery spends the budget too — see `verb_deadline`,
+        // and for why a non-waiting budget gets an unbounded one.
+        let deadline = verb_deadline(budget);
         let (location, text) = located_and_ours(id)?;
         let blob = generate::extract(&text)?.ok_or_else(|| foreign(id))?;
-        // One deadline for the whole wait — see `verb_deadline` for why a
-        // non-waiting budget gets an unbounded one.
-        let deadline = verb_deadline(budget);
         let timed_out = || budget::timed_out(id.as_str(), "running", budget);
         // What issuing the request takes: which of `bootstrap`/`kickstart` it
         // needs, and the `bootstrap` itself. None of it is bounded — the
@@ -1279,15 +1280,16 @@ impl ServiceManager for LaunchdManager {
     }
 
     fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
-        // Under a budget that does not wait this is an explicitly UNBOUNDED
-        // deadline, not `budget.start()` — see `verb_deadline`. `launchctl` exposes no
+        // First, so discovery spends the budget too. Under a budget that
+        // does not wait this is an explicitly UNBOUNDED deadline, not
+        // `budget.start()` — see `verb_deadline`. `launchctl` exposes no
         // non-blocking `bootout`, so issuing the request *is* the blocking
         // call here, which is why the trait doc comment states it on `stop`
         // rather than leaving it to be rediscovered per platform. Under a
         // bounded budget an expiry leaves the `bootout` running rather than
         // killing it (see `launchctl`), so the request still goes out.
-        located_and_ours(id)?;
         let deadline = verb_deadline(budget);
+        located_and_ours(id)?;
         bootout(id.as_str(), deadline)?.ok_or_else(|| budget::timed_out(id.as_str(), "stopped", budget))
     }
 
