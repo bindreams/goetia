@@ -117,7 +117,8 @@ pub trait ServiceManager {
     fn start(&self, id: &Id, budget: Budget) -> Result<()>;
 
     /// Make ready, before the first of `steps` sends anything, whatever
-    /// they can need that could otherwise run out between two of them — so
+    /// they can need under `budget` — the one their verbs will be given —
+    /// that could otherwise run out between two of them — so
     /// that a failure here means nothing was sent, where the same failure
     /// later would strand the daemon halfway: stopped by `restart`'s stop
     /// with its start never sent, or booted out by `install --start`'s
@@ -127,7 +128,7 @@ pub trait ServiceManager {
     /// dropped in any order: dropping one releases only what it made.
     /// Nothing, by default — so a wrapper around another manager forwards
     /// it.
-    fn prepare(&self, _steps: &[Step]) -> Result<Prepared> {
+    fn prepare(&self, _steps: &[Step], _budget: Budget) -> Result<Prepared> {
         Ok(Prepared::nothing())
     }
 

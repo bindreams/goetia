@@ -1174,7 +1174,8 @@ impl ServiceManager for LaunchdManager {
     /// Makes every reaper and temp file `steps` can need now, so that no step fails for want of one
     /// after an earlier step has sent something: `restart`'s start after its stop, `install
     /// --start`'s start after the install's `bootout`.
-    fn prepare(&self, steps: &[Step]) -> Result<Prepared> {
+    /// Every budget: `launchctl` is waited on under all of them.
+    fn prepare(&self, steps: &[Step], _budget: Budget) -> Result<Prepared> {
         let (reapers, calls) = steps
             .iter()
             .map(|step| match step {

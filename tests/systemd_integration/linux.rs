@@ -1224,6 +1224,16 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
     let (code, stderr) = run(4, "restart");
     assert_eq!(code, Some(0), "restart TasksMax=4: {stderr}");
     assert_ne!(main_pid(guard.id()), before, "restart TasksMax=4 restarted nothing");
+
+    // A budget whose `systemctl` goetia does not watch makes no thread, and reserves none: two tasks
+    // are its own and one `systemctl` at a time.
+    let output = goetia_with_tasks(2, &["daemon", "restart", guard.id(), "--timeout", "0"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "restart --timeout 0 TasksMax=2: {stderr}"
+    );
 }
 
 /// `Type=exec` is what makes `systemctl start` report failure here at all — under `Type=simple` the

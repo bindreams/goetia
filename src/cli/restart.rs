@@ -93,7 +93,7 @@ fn restart(mgr: &dyn ServiceManager, id: &Id, budget: Budget, start_clock: &dyn 
     let deadline = start_clock(budget);
     // Before either leg sends anything, so that nothing either leg needs can
     // run out between the stop and the start and leave the daemon stopped.
-    let _prepared = mgr.prepare(&[Step::Stop, Step::Start])?;
+    let _prepared = mgr.prepare(&[Step::Stop, Step::Start], budget)?;
     if !budget.waits() {
         // One request where the manager has one: nothing then happens
         // between the stop and the start, and a refusal changed nothing, so

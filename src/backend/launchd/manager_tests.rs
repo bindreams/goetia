@@ -670,15 +670,16 @@ fn prepared_steps_need_nothing_made_later() {
             INSTALL_CALLS + START_CALLS,
         ),
     ] {
-        {
-            let _short = bounded::test_hook::threads(reapers - 1);
-            assert!(mgr.prepare(&steps).is_err(), "{steps:?}");
-        }
-        {
+        // Every budget: `launchctl` is waited on under all of them.
+        for budget in [Budget::DEFAULT, Budget::Immediate, Budget::Unbounded] {
+            {
+                let _short = bounded::test_hook::threads(reapers - 1);
+                assert!(mgr.prepare(&steps, budget).is_err(), "{steps:?} {budget:?}");
+            }
             let _short = bounded::test_hook::temp_files(calls * FILES_PER_CALL - 1);
-            assert!(mgr.prepare(&steps).is_err(), "{steps:?}");
+            assert!(mgr.prepare(&steps, budget).is_err(), "{steps:?} {budget:?}");
         }
-        let prepared = mgr.prepare(&steps).expect("prepare");
+        let prepared = mgr.prepare(&steps, Budget::DEFAULT).expect("prepare");
         let _no_thread = bounded::test_hook::threads(0);
         let _no_file = bounded::test_hook::temp_files(0);
         let first = if steps[0] == Step::Stop {

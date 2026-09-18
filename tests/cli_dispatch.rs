@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use clap::Parser as _;
 use goetia::cli::{self, Cli, Command, DaemonCommand};
@@ -3269,7 +3270,7 @@ fn install_without_start_prepares_nothing() {
     );
 
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
-    assert_eq!(fake.prepared(), Vec::<Vec<Step>>::new());
+    assert_eq!(fake.prepared(), vec![]);
     assert_eq!(fake.guarded(), vec![("install", "frpc".to_string(), vec![])]);
 }
 
@@ -3281,27 +3282,30 @@ fn under(steps: &[Step], sent: &[(&'static str, &str)]) -> Vec<(&'static str, St
         .collect()
 }
 
-/// `restart` prepares both of its legs before either sends anything, and holds what it prepared
-/// until both are sent, then releases it before the next id's — under every budget, the one-request
-/// restart included.
+/// `restart` prepares both of its legs, under the budget it was given, before either sends anything,
+/// and holds what it prepared until both are sent, then releases it before the next id's — under
+/// every budget, the one-request restart included.
 #[skuld::test]
 fn restart_holds_what_it_prepared_for_both_legs_until_both_are_sent() {
     let both = [Step::Stop, Step::Start];
     let two_legs: &[(&str, &str)] = &[("stop", "frpc"), ("start", "frpc"), ("stop", "web"), ("start", "web")];
-    for (budget, native, sent) in [
-        (&[][..], false, two_legs),
-        (&["--no-timeout"][..], false, two_legs),
-        (&["--timeout", "0"][..], false, two_legs),
+    let native: &[(&str, &str)] = &[("restart", "frpc"), ("restart", "web")];
+    for (budget, given, one_request, sent) in [
+        (&[][..], Budget::DEFAULT, false, two_legs),
+        (&["--no-timeout"][..], Budget::Unbounded, false, two_legs),
         (
-            &["--timeout", "0"][..],
-            true,
-            &[("restart", "frpc"), ("restart", "web")][..],
+            &["--timeout", "5s"][..],
+            Budget::Bounded(Duration::from_secs(5)),
+            false,
+            two_legs,
         ),
+        (&["--timeout", "0"][..], Budget::Immediate, false, two_legs),
+        (&["--timeout", "0"][..], Budget::Immediate, true, native),
     ] {
         let fake = Fake::new();
         fake.install(&mk("frpc"), false).unwrap();
         fake.install(&mk("web"), false).unwrap();
-        if native {
+        if one_request {
             fake.seed_native_restart();
         }
         let seeded = fake.guarded().len();
@@ -3311,13 +3315,18 @@ fn restart_holds_what_it_prepared_for_both_legs_until_both_are_sent() {
         let (code, out, err) = dispatch_elevated(&args, &fake);
 
         assert_eq!(code, 0, "{budget:?}\nstdout:\n{out}\nstderr:\n{err}");
-        assert_eq!(fake.prepared(), vec![both.to_vec(), both.to_vec()], "{budget:?}");
+        assert_eq!(
+            fake.prepared(),
+            vec![(both.to_vec(), given), (both.to_vec(), given)],
+            "{budget:?}"
+        );
         assert_eq!(fake.guarded()[seeded..], under(&both, sent), "{budget:?}");
     }
 }
 
-/// `install --start` prepares the install and the start before the install sends anything, and
-/// holds what it prepared until the start is sent, then releases it before the next daemon's.
+/// `install --start` prepares the install and the start, under the start's budget, before the
+/// install sends anything, and holds what it prepared until the start is sent, then releases it
+/// before the next daemon's.
 #[skuld::test]
 fn install_start_holds_what_it_prepared_until_the_start_is_sent() {
     let dir = tempfile::tempdir().unwrap();
@@ -3335,13 +3344,16 @@ fn install_start_holds_what_it_prepared_until_the_start_is_sent() {
             "--file",
             manifest.to_str().unwrap(),
             "--start",
+            "--timeout",
+            "5s",
         ],
         &fake,
     );
 
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
     let both = [Step::Install, Step::Start];
-    assert_eq!(fake.prepared(), vec![both.to_vec(), both.to_vec()]);
+    let given = Budget::Bounded(Duration::from_secs(5));
+    assert_eq!(fake.prepared(), vec![(both.to_vec(), given), (both.to_vec(), given)]);
     assert_eq!(
         fake.guarded(),
         under(

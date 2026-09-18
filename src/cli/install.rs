@@ -100,7 +100,7 @@ pub fn run(
         // Before the install sends anything, so that nothing the start needs
         // can run out after the install booted a loaded job out.
         let _prepared = if args.start {
-            match mgr.prepare(&[Step::Install, Step::Start]) {
+            match mgr.prepare(&[Step::Install, Step::Start], args.wait.budget()) {
                 Ok(prepared) => prepared,
                 Err(e) => {
                     let _ = writeln!(err, "error: {}: {e}", spec.id);

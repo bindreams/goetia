@@ -106,9 +106,9 @@ struct Store {
     /// Every `start`/`stop`/`restart` this Fake was asked to perform, in
     /// order — see [`Fake::calls`].
     calls: Vec<(&'static str, String)>,
-    /// The steps each [`ServiceManager::prepare`] was given, in order — see
-    /// [`Fake::prepared`].
-    prepared: Vec<Vec<Step>>,
+    /// The steps and budget each [`ServiceManager::prepare`] was given, in
+    /// order — see [`Fake::prepared`].
+    prepared: Vec<(Vec<Step>, Budget)>,
     /// The steps of every guard `prepare` returned that has not been
     /// dropped, by guard number.
     live: Vec<(u64, Vec<Step>)>,
@@ -405,9 +405,9 @@ impl Fake {
         state.calls.clone()
     }
 
-    /// The steps every [`ServiceManager::prepare`] was given, in order —
-    /// failed ones included.
-    pub fn prepared(&self) -> Vec<Vec<Step>> {
+    /// The steps and budget every [`ServiceManager::prepare`] was given, in
+    /// order — failed ones included.
+    pub fn prepared(&self) -> Vec<(Vec<Step>, Budget)> {
         let state = self.state.lock().expect("Fake mutex poisoned");
         state.prepared.clone()
     }
@@ -673,9 +673,9 @@ impl ServiceManager for Fake {
     /// Fails only once [`Fake::seed_prepare_fails`]ed. Makes nothing ready,
     /// but records `steps`, and holds them live for [`Fake::guarded`] until
     /// the guard drops.
-    fn prepare(&self, steps: &[Step]) -> Result<Prepared> {
+    fn prepare(&self, steps: &[Step], budget: Budget) -> Result<Prepared> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
-        state.prepared.push(steps.to_vec());
+        state.prepared.push((steps.to_vec(), budget));
         if state.prepare_fails {
             return Err(Error::Other(
                 "nothing could be prepared (injected test failure)".to_string(),

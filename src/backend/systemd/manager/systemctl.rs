@@ -358,11 +358,17 @@ fn run_verb(verb: &str, unit: &str, budget: Budget, deadline: Deadline) -> Resul
     run_verb_via("systemctl", &verb_args(verb, unit, budget), budget, deadline)
 }
 
+/// Whether [`run_verb`] takes its bounded path under `budget` — the one whose `systemctl` goetia
+/// watches, and which needs a thread and a temp file to do it.
+pub(super) fn watched(budget: Budget) -> bool {
+    budget.waits() && budget != Budget::Unbounded
+}
+
 /// [`run_verb`] with the program and argv named, so its bounded path is testable against a child
 /// that cannot exit on its own.
 fn run_verb_via(program: &str, args: &[&str], budget: Budget, deadline: Deadline) -> Result<Finished> {
     let failed = |e: String| Error::Other(format!("failed to run `{program} {}`: {e}", args.join(" ")));
-    if !budget.waits() || budget == Budget::Unbounded {
+    if !watched(budget) {
         let output = Command::new(program)
             .args(args)
             .envs(AUDIBLE)

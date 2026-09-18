@@ -438,14 +438,15 @@ fn a_drop_in_name_that_is_not_a_directory_still_names_its_id() {
 /// The steps `verb` took, in order, with every step a recording fake — so, unlike the rest of this
 /// file, no elevation and no real systemd. The step that talks to systemd also checks that it was
 /// handed the deadline `start_clock` derived, not one of its own.
-/// `restart`'s legs, and `install --start`'s start, each run one watched `systemctl`, and `prepare`
-/// makes what every one of them needs before either sends anything: once it succeeded, no leg can
-/// fail for want of a thread or a file. It fails as a whole when one is short.
+/// Under a bounded budget `restart`'s legs, and `install --start`'s start, each run one watched
+/// `systemctl`, and `prepare` makes what every one of them needs before either sends anything: once
+/// it succeeded, no leg can fail for want of a thread or a file. It fails as a whole when one is
+/// short.
 #[skuld::test]
 fn prepared_steps_need_nothing_made_later() {
     let mgr = Systemd::new();
     let watched = |steps: &[Step]| {
-        let _prepared = mgr.prepare(steps).expect("prepare");
+        let _prepared = mgr.prepare(steps, Budget::DEFAULT).expect("prepare");
         let _no_thread = bounded::test_hook::threads(0);
         let _no_file = bounded::test_hook::temp_files(0);
         (0..steps.len())
@@ -466,8 +467,25 @@ fn prepared_steps_need_nothing_made_later() {
     let shortfalls: [Allowance; 2] = [|| bounded::test_hook::threads(1), || bounded::test_hook::temp_files(1)];
     for allowance in shortfalls {
         let _short = allowance();
-        let e = mgr.prepare(&[Step::Stop, Step::Start]).err().expect("one short");
+        let e = mgr
+            .prepare(&[Step::Stop, Step::Start], Budget::DEFAULT)
+            .err()
+            .expect("one short");
         assert!(e.to_string().contains("so none was sent"), "{e}");
+    }
+}
+
+/// A budget that does not wait, or never stops waiting, watches no `systemctl`, so nothing is made
+/// for one — a verb that makes no thread must not be refused for want of one.
+#[skuld::test]
+fn a_budget_that_watches_nothing_prepares_nothing() {
+    let _no_thread = bounded::test_hook::threads(0);
+    let _no_file = bounded::test_hook::temp_files(0);
+    for budget in [Budget::Immediate, Budget::Unbounded] {
+        assert!(
+            Systemd::new().prepare(&[Step::Stop, Step::Start], budget).is_ok(),
+            "{budget:?}"
+        );
     }
 }
 
@@ -480,13 +498,18 @@ fn prepared_steps_share_one_version_gate() {
         asked.set(asked.get() + 1);
         Ok(())
     };
-    let prepared = Systemd::new().prepare(&[Step::Stop, Step::Start]).expect("prepare");
-    systemctl::gated(count).unwrap();
-    systemctl::gated(count).unwrap();
-    assert_eq!(asked.get(), 1, "the two legs asked twice");
-    drop(prepared);
-    systemctl::gated(count).unwrap();
-    assert_eq!(asked.get(), 2, "the answer outlived the preparation");
+    for budget in [Budget::DEFAULT, Budget::Immediate, Budget::Unbounded] {
+        asked.set(0);
+        let prepared = Systemd::new()
+            .prepare(&[Step::Stop, Step::Start], budget)
+            .expect("prepare");
+        systemctl::gated(count).unwrap();
+        systemctl::gated(count).unwrap();
+        assert_eq!(asked.get(), 1, "{budget:?}: the two legs asked twice");
+        drop(prepared);
+        systemctl::gated(count).unwrap();
+        assert_eq!(asked.get(), 2, "{budget:?}: the answer outlived the preparation");
+    }
 }
 
 fn steps_taken(verb: fn(&str, Budget, &VerbSteps<'_>) -> Result<()>) -> Vec<&'static str> {

@@ -261,14 +261,15 @@ impl ServiceManager for Systemd {
         start_with(id.as_str(), budget, &REAL_STEPS)
     }
 
-    /// Makes ready now what each start or stop in `steps` needs to watch its one `systemctl`: a
-    /// thread to read the stderr it announces its job on, and a temp file for its stdout. `install`
-    /// runs no watched `systemctl`. While it is held, the steps also share one version gate — see
+    /// Makes ready now what each start or stop in `steps` needs to watch its one `systemctl` under
+    /// `budget`: a thread to read the stderr it announces its job on, and a temp file for its
+    /// stdout. `install` runs no watched `systemctl`, and a budget that does not wait, or never
+    /// stops waiting, watches none. While it is held, the steps also share one version gate — see
     /// `systemctl::GateScope`.
-    fn prepare(&self, steps: &[Step]) -> Result<Prepared> {
+    fn prepare(&self, steps: &[Step], budget: Budget) -> Result<Prepared> {
         let watched = steps
             .iter()
-            .filter(|step| matches!(step, Step::Start | Step::Stop))
+            .filter(|step| matches!(step, Step::Start | Step::Stop) && systemctl::watched(budget))
             .count();
         let spares = bounded::spare(bounded::Needs {
             listeners: watched,
