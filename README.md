@@ -17,8 +17,10 @@ specific commit if working ahead of one.
 goetia requires **systemd 242+** (2019), and refuses to install, uninstall,
 start, stop or restart anything on an older one, before writing or running
 anything. It checks both the running systemd and the `systemctl` client, which
-is what parses `--show-transaction`; where no systemd is running, as in a
-chroot image build, the client alone. Generated units use
+is what parses `--show-transaction`. It checks the client alone only where no
+systemd runs, as in a chroot image build: `SYSTEMD_OFFLINE` is set, `systemctl`
+reports a chroot, or `/run/systemd/system` does not exist. A running systemd it
+cannot ask is refused. Generated units use
 `Type=exec` (240+), which is what lets a start report a missing executable or
 user as a failure. An older systemd does not reject the directive: it logs that it
 cannot parse it and runs the unit as `Type=simple`, silently losing exactly

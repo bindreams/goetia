@@ -428,7 +428,7 @@ fn a_client_242_or_newer_is_supported() {
         "systemd 257 (257.13-1~deb13u1)",
         "systemd 258~rc1 (258~rc1-1)",
     ] {
-        for source in [Source::Client, Source::OfflineClient] {
+        for source in [Source::Client, Source::OfflineClient(NoManager::Offline)] {
             assert!(supported(source, version).is_ok(), "{source:?} {version:?}");
         }
     }
@@ -442,7 +442,7 @@ fn systemd_240_and_241_are_refused_for_show_transaction_alone() {
         (Source::Manager, "241.7-1", "241"),
         (Source::Manager, "240", "240"),
         (Source::Client, "systemd 241 (241)", "241"),
-        (Source::OfflineClient, "systemd 241 (241)", "241"),
+        (Source::OfflineClient(NoManager::Chroot), "systemd 241 (241)", "241"),
     ] {
         let msg = supported(source, version).expect_err(version).to_string();
         assert!(msg.contains("requires systemd 242 or newer"), "{msg}");
@@ -457,7 +457,10 @@ fn systemd_240_and_241_are_refused_for_show_transaction_alone() {
 /// reason.
 #[skuld::test]
 fn systemd_older_than_240_is_refused_for_both_reasons() {
-    for (source, version) in [(Source::Manager, "239-41.el8"), (Source::OfflineClient, "systemd 237")] {
+    for (source, version) in [
+        (Source::Manager, "239-41.el8"),
+        (Source::OfflineClient(NoManager::NotBooted), "systemd 237"),
+    ] {
         let msg = supported(source, version).expect_err(version).to_string();
         assert!(msg.contains("requires systemd 242 or newer"), "{msg}");
         assert!(msg.contains("--show-transaction"), "{msg}");
@@ -475,10 +478,13 @@ fn a_refusal_names_whose_version_it_read() {
     assert!(manager.contains("The running systemd is 241"), "{manager}");
     let client = supported(Source::Client, "systemd 241 (241)").unwrap_err().to_string();
     assert!(client.contains("The `systemctl` client is 241"), "{client}");
-    let offline = supported(Source::OfflineClient, "systemd 241 (241)")
+    let offline = supported(Source::OfflineClient(NoManager::Offline), "systemd 241 (241)")
         .unwrap_err()
         .to_string();
-    assert!(offline.contains("No running systemd could be asked"), "{offline}");
+    assert!(
+        offline.contains("No systemd runs here (`SYSTEMD_OFFLINE` is set)"),
+        "{offline}"
+    );
     assert!(offline.contains("`systemctl --version` reports 241"), "{offline}");
 }
 
@@ -496,7 +502,10 @@ fn an_unreadable_version_is_refused_without_calling_it_old() {
         (Source::Client, "systemd abc"),
         (Source::Client, "not systemd 257"),
         (Source::Client, "\u{1b}[0;1;39msystemd 257\u{1b}[0m (257.13-1~deb13u1)"),
-        (Source::OfflineClient, "systemd 257\u{1b}[0m (257.13-1~deb13u1)"),
+        (
+            Source::OfflineClient(NoManager::Offline),
+            "systemd 257\u{1b}[0m (257.13-1~deb13u1)",
+        ),
     ] {
         let msg = supported(source, version).expect_err(version).to_string();
         assert!(msg.contains("cannot read the version"), "{version:?}: {msg}");
@@ -573,6 +582,14 @@ fn stand_in(script: &str) -> [&str; 4] {
     ["/bin/sh", "-c", script, "systemctl"]
 }
 
+/// A system booted with systemd, and not offline: its manager must be asked.
+fn booted() -> Host {
+    Host {
+        offline: None,
+        unbooted: false,
+    }
+}
+
 /// Answers `show` with `$MANAGER`'s version and `--version` with `$CLIENT`'s, each `none` to fail.
 fn two_versions(manager: &str, client: &str) -> String {
     format!(
@@ -585,7 +602,7 @@ fn two_versions(manager: &str, client: &str) -> String {
 }
 
 fn refused(manager: &str, client: &str) -> String {
-    require_supported_via(&stand_in(&two_versions(manager, client)))
+    require_supported_via(&stand_in(&two_versions(manager, client)), &booted())
         .expect_err(&format!("manager {manager}, client {client}"))
         .to_string()
 }
@@ -595,7 +612,7 @@ fn refused(manager: &str, client: &str) -> String {
 /// failed, with its version, and both when both did.
 #[skuld::test]
 fn both_the_running_systemd_and_the_client_must_be_242_or_newer() {
-    assert!(require_supported_via(&stand_in(&two_versions("257", "257"))).is_ok());
+    assert!(require_supported_via(&stand_in(&two_versions("257", "257")), &booted()).is_ok());
 
     let old_client = refused("257", "241");
     assert!(old_client.contains("The `systemctl` client is 241"), "{old_client}");
@@ -617,29 +634,140 @@ fn a_client_that_cannot_say_its_version_is_refused() {
     assert!(msg.contains("`systemctl --version` failed"), "{msg}");
 }
 
-/// No manager to ask — what `systemctl show` does in a chroot or offline, measured on systemd 257,
-/// and what it does with no bus to reach — and the client alone decides.
+/// Evidence found without asking `systemctl`: `SYSTEMD_OFFLINE` set true, or no
+/// `/run/systemd/system`. The client alone decides, and the manager is never asked — the stand-in
+/// fails its `show`.
 #[skuld::test]
-fn with_no_running_systemd_the_client_alone_decides() {
-    let offline = |client: &str| {
-        format!(
-            "[ \"$1\" = show ] && {{ echo \"Running in chroot, ignoring command 'show'\" >&2; exit 0; }}; \
-             echo 'systemd {client} ({client})'"
-        )
-    };
-    assert!(require_supported_via(&stand_in(&offline("257"))).is_ok());
-    assert!(require_supported_via(&stand_in(&two_versions("none", "257"))).is_ok());
-    for msg in [
-        require_supported_via(&stand_in(&offline("241")))
-            .unwrap_err()
-            .to_string(),
-        refused("none", "241"),
-    ] {
+fn where_no_manager_runs_the_client_alone_decides() {
+    let hosts = [
+        (
+            Host {
+                offline: Some("1".to_string()),
+                unbooted: false,
+            },
+            "`SYSTEMD_OFFLINE` is set",
+        ),
+        (
+            Host {
+                offline: None,
+                unbooted: true,
+            },
+            "`/run/systemd/system` does not exist",
+        ),
+    ];
+    for (host, why) in hosts {
         assert!(
-            msg.contains("No running systemd could be asked, and `systemctl --version` reports 241"),
+            require_supported_via(&stand_in(&two_versions("none", "257")), &host).is_ok(),
+            "{why}"
+        );
+        let msg = require_supported_via(&stand_in(&two_versions("none", "241")), &host)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains(&format!(
+                "No systemd runs here ({why}), and `systemctl --version` reports 241"
+            )),
             "{msg}"
         );
     }
+}
+
+/// `/run/systemd/system` counts as absent only on evidence: not there, not a directory, or under
+/// something that is not one. A stat that failed any other way — here a symlink loop — establishes
+/// nothing.
+#[skuld::test]
+fn only_a_stat_that_finds_no_directory_is_evidence_of_no_systemd() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("file");
+    std::fs::write(&file, "").unwrap();
+    let looped = dir.path().join("loop");
+    std::os::unix::fs::symlink(&looped, &looped).unwrap();
+
+    assert!(established_absent(&dir.path().join("missing")));
+    assert!(established_absent(&file));
+    assert!(established_absent(&file.join("under")));
+    assert!(!established_absent(dir.path()));
+    assert!(
+        !established_absent(&looped),
+        "a stat that failed otherwise establishes nothing"
+    );
+}
+
+/// This host is booted with systemd and not offline: its manager is asked.
+#[skuld::test]
+fn this_host_has_a_manager_to_ask() {
+    assert_eq!(Host::this().no_manager(), None);
+}
+
+/// `SYSTEMD_OFFLINE` is read as `systemctl` reads it, with systemd's `parse_boolean`: only a true
+/// value is evidence, and anything else leaves the manager to be asked.
+#[skuld::test]
+fn systemd_offline_is_evidence_only_when_true() {
+    for value in ["1", "yes", "Y", "TRUE", "t", "on"] {
+        let host = Host {
+            offline: Some(value.to_string()),
+            unbooted: false,
+        };
+        assert_eq!(host.no_manager(), Some(NoManager::Offline), "{value:?}");
+    }
+    for value in ["0", "no", "false", "off", "", "2", "maybe"] {
+        let host = Host {
+            offline: Some(value.to_string()),
+            unbooted: false,
+        };
+        assert_eq!(host.no_manager(), None, "{value:?}");
+    }
+}
+
+/// The chroot `systemctl` itself detects — `/proc/1/root` against `/`, or `SYSTEMD_IN_CHROOT` — as
+/// it reports it: `show` exits `0`, prints nothing, and says why on stderr (measured on systemd
+/// 257; older ones say "ignoring request."). The stand-in says so only when its log level is audible,
+/// as a real one under an inherited `SYSTEMD_LOG_LEVEL=warning` would not.
+#[skuld::test]
+fn a_chroot_systemctl_reports_is_evidence_that_cannot_be_silenced() {
+    for notice in [
+        "Running in chroot, ignoring command 'show'",
+        "Running in chroot, ignoring request.",
+    ] {
+        let in_chroot = |client: &str| {
+            format!(
+                "[ \"$1\" = show ] && {{ [ \"$SYSTEMD_LOG_LEVEL\" = info ] && echo \"{notice}\" >&2; exit 0; }}; \
+                 echo 'systemd {client} ({client})'"
+            )
+        };
+        assert!(
+            require_supported_via(&stand_in(&in_chroot("257")), &booted()).is_ok(),
+            "{notice}"
+        );
+        let msg = require_supported_via(&stand_in(&in_chroot("241")), &booted())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("No systemd runs here (`systemctl` says it is running in a chroot)"),
+            "{msg}"
+        );
+    }
+}
+
+/// On a system booted with systemd, a manager that could not be asked is not evidence that none
+/// runs: a bus that timed out or refused the connection is a refusal naming what `systemctl` said,
+/// and so is a `show` that answered with nothing and no chroot to explain it.
+#[skuld::test]
+fn any_other_failure_to_ask_the_manager_is_a_refusal() {
+    let failing = "[ \"$1\" = show ] && { echo 'Failed to get properties: Connection timed out' >&2; exit 1; }; \
+                   echo 'systemd 257 (257)'";
+    let msg = require_supported_via(&stand_in(failing), &booted())
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("`systemctl show --property=Version` failed"), "{msg}");
+    assert!(msg.contains("Connection timed out"), "{msg}");
+    assert!(msg.contains("cannot tell whether the running systemd is 242+"), "{msg}");
+
+    let silent = "[ \"$1\" = show ] && exit 0; echo 'systemd 257 (257)'";
+    let msg = require_supported_via(&stand_in(silent), &booted())
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("printed no version"), "{msg}");
 }
 
 /// Both probes switch colour off: the stand-in colours whatever it prints unless it sees
@@ -648,16 +776,23 @@ fn with_no_running_systemd_the_client_alone_decides() {
 fn every_probe_switches_colour_off() {
     let colours = "c() { [ \"$SYSTEMD_COLORS\" = 0 ] && echo \"$1\" || printf '\\033[0;1;39m%s\\033[0m\\n' \"$1\"; }; ";
     let online = format!("{colours}[ \"$1\" = show ] && c 257 || c 'systemd 257'");
-    assert!(require_supported_via(&stand_in(&online)).is_ok());
+    assert!(require_supported_via(&stand_in(&online), &booted()).is_ok());
     let offline = format!("{colours}[ \"$1\" = show ] && exit 1; c 'systemd 257'");
-    assert!(require_supported_via(&stand_in(&offline)).is_ok());
+    let unbooted = Host {
+        offline: None,
+        unbooted: true,
+    };
+    assert!(require_supported_via(&stand_in(&offline), &unbooted).is_ok());
 }
 
 /// The real `systemctl` on this host, first with an inherited `SYSTEMD_COLORS=1` — set by the
 /// wrapper only where goetia did not set it itself — then as it is.
 #[skuld::test]
 fn this_hosts_systemd_is_supported() {
-    require_supported_via(&stand_in("SYSTEMD_COLORS=${SYSTEMD_COLORS:-1} exec systemctl \"$@\""))
-        .expect("the host running the tests runs systemd 242+, whatever colour is inherited");
+    require_supported_via(
+        &stand_in("SYSTEMD_COLORS=${SYSTEMD_COLORS:-1} exec systemctl \"$@\""),
+        &Host::this(),
+    )
+    .expect("the host running the tests runs systemd 242+, whatever colour is inherited");
     require_supported().expect("the host running the tests runs systemd 242+");
 }

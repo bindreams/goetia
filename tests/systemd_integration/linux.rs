@@ -1066,6 +1066,45 @@ fn an_older_systemd_is_refused_before_anything_is_written_or_run() {
     assert!(unit_path(guard.id()).exists(), "a refused uninstall removed the unit");
 }
 
+/// On a system booted with systemd, a manager `systemctl` cannot reach is not evidence that none
+/// runs: the version gate refuses, naming what `systemctl` said, before anything is written. Its
+/// own mount namespace hides the manager's private socket, and the bus address points at nothing,
+/// so `systemctl show` fails at once while `/run/systemd/system` stays.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_running_systemd_that_cannot_be_asked_is_refused() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let (_dir, manifest) = world_readable_manifest(guard.id());
+
+    let output = Command::new("unshare")
+        .args([
+            "--mount",
+            "--propagation",
+            "private",
+            "/bin/sh",
+            "-c",
+            "mount --bind /dev/null /run/systemd/private && \
+             exec env DBUS_SYSTEM_BUS_ADDRESS=unix:path=/nonexistent \"$0\" \"$@\"",
+            env!("CARGO_BIN_EXE_goetia"),
+            "daemon",
+            "install",
+            "--file",
+            manifest.to_str().expect("utf-8 temp path"),
+            guard.id(),
+        ])
+        .output()
+        .expect("spawn unshare");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("cannot tell whether the running systemd is 242+"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Connection refused"), "{stderr}");
+    assert!(!unit_path(guard.id()).exists(), "a refused install wrote the unit");
+}
+
 /// `goetia <args>` with a `systemctl` first on its `PATH` that appends every argv it is run with to
 /// `log`, one per line, and then runs the real one. Written by a child `sh`, as
 /// [`goetia_on_systemd`]'s stand-in is, and for the same reason.

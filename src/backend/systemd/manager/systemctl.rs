@@ -57,7 +57,7 @@ const UNCOLOURED: [(&str, &str); 1] = [("SYSTEMD_COLORS", "0")];
 /// parse it and runs the unit as `Type=simple`, silently losing the failed-exec detection the
 /// directive is there for. Asked once per [`GateScope`].
 pub(super) fn require_supported() -> Result<()> {
-    gated(|| require_supported_via(&["systemctl"]))
+    gated(|| require_supported_via(&["systemctl"], &Host::this()))
 }
 
 thread_local! {
@@ -111,18 +111,97 @@ enum Source {
     /// `systemctl --version`, next to a running manager: the client is what parses the
     /// `--show-transaction` option, and a newer manager does not rescue an older client.
     Client,
-    /// `systemctl --version` where no manager can be asked. It stands in for the manager too: an
+    /// `systemctl --version` where no manager runs, and why. It stands in for the manager too: an
     /// image built offline boots the systemd it was built with.
-    OfflineClient,
+    OfflineClient(NoManager),
 }
 
-/// [`require_supported`] with `systemctl`'s argv prefix named, so a test can stand a shell script in
-/// for it. Both the running manager and the client must be new enough; where no manager can be
-/// asked, the client alone. `systemctl show` in a chroot or under `SYSTEMD_OFFLINE=1` says "Running
-/// in chroot, ignoring command" and exits `0` with nothing on stdout, and one with no bus to reach
-/// exits non-zero. `install` must still work there, since systemd enables units offline — an image
-/// build is the ordinary case.
-fn require_supported_via(systemctl: &[&str]) -> Result<()> {
+/// The positive evidence that no systemd manager runs this system — the only grounds on which the
+/// gate judges the client alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoManager {
+    /// `SYSTEMD_OFFLINE` is set true, so `systemctl` asks no manager.
+    Offline,
+    /// `systemctl` says it runs in a chroot, and asks no manager.
+    Chroot,
+    /// `/run/systemd/system` does not exist: systemd is not this system's init (`sd_booted()`).
+    NotBooted,
+}
+
+impl std::fmt::Display for NoManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            NoManager::Offline => "`SYSTEMD_OFFLINE` is set",
+            NoManager::Chroot => "`systemctl` says it is running in a chroot",
+            NoManager::NotBooted => "`/run/systemd/system` does not exist",
+        })
+    }
+}
+
+/// Where `sd_booted()` looks: it exists iff systemd is this system's init.
+const SD_BOOTED: &str = "/run/systemd/system";
+
+/// What goetia reads of this system before asking `systemctl` for its manager: a seam, so a test can
+/// stand any system in.
+#[derive(Debug, Clone)]
+struct Host {
+    /// `SYSTEMD_OFFLINE`, as every `systemctl` goetia runs inherits it.
+    offline: Option<String>,
+    /// [`SD_BOOTED`] is established absent — see [`established_absent`].
+    unbooted: bool,
+}
+
+impl Host {
+    fn this() -> Host {
+        Host {
+            offline: std::env::var("SYSTEMD_OFFLINE").ok(),
+            unbooted: established_absent(std::path::Path::new(SD_BOOTED)),
+        }
+    }
+
+    /// Why no manager runs here, from what is known without asking `systemctl`.
+    fn no_manager(&self) -> Option<NoManager> {
+        if self.offline.as_deref().is_some_and(is_true) {
+            Some(NoManager::Offline)
+        } else if self.unbooted {
+            Some(NoManager::NotBooted)
+        } else {
+            None
+        }
+    }
+}
+
+/// Whether `dir` is established not to be a directory, as `sd_booted()`'s `laccess("…/")` finds
+/// it: not there, or something other than a directory, or under something other than one. A stat
+/// that failed any other way establishes nothing.
+fn established_absent(dir: &std::path::Path) -> bool {
+    match std::fs::metadata(dir) {
+        Ok(meta) => !meta.is_dir(),
+        Err(e) => matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)),
+    }
+}
+
+/// A true value as systemd's `parse_boolean` reads one, which is how `systemctl` reads
+/// `SYSTEMD_OFFLINE`.
+fn is_true(value: &str) -> bool {
+    value == "1"
+        || ["yes", "y", "true", "t", "on"]
+            .iter()
+            .any(|word| value.eq_ignore_ascii_case(word))
+}
+
+/// What `systemctl` says, with its log level forced audible, when it asks no manager because it runs
+/// in a chroot: "Running in chroot, ignoring command 'show'" on systemd 257, "… ignoring request."
+/// before.
+const IN_CHROOT: &str = "Running in chroot, ignoring";
+
+/// [`require_supported`] with `systemctl`'s argv prefix and the host named, so a test can stand a
+/// shell script and any system in. Both the running manager and the client must be new enough; the
+/// client alone only on positive evidence that no manager runs this system ([`NoManager`]) — where
+/// `install` must still work, since systemd enables units offline and an image build is the ordinary
+/// case. Any other failure to read the manager's version is a refusal: a manager that is running and
+/// could not be asked is not one goetia can vouch for.
+fn require_supported_via(systemctl: &[&str], host: &Host) -> Result<()> {
     let client = probe(systemctl, &["--version"])?;
     if !client.status.success() {
         return Err(Error::Other(format!(
@@ -132,25 +211,45 @@ fn require_supported_via(systemctl: &[&str]) -> Result<()> {
     }
     let client = String::from_utf8_lossy(&client.stdout);
     let client = client.lines().next().unwrap_or_default();
-    let manager = probe(systemctl, &["show", "--property=Version", "--value"])?;
-    let reported = String::from_utf8_lossy(&manager.stdout);
-    let verdicts = if manager.status.success() && !reported.trim().is_empty() {
-        vec![
-            verdict(Source::Manager, reported.trim()),
-            verdict(Source::Client, client),
-        ]
-    } else {
-        vec![verdict(Source::OfflineClient, client)]
+    let no_manager = match host.no_manager() {
+        Some(why) => why,
+        None => {
+            let manager = probe(systemctl, &["show", "--property=Version", "--value"])?;
+            let reported = String::from_utf8_lossy(&manager.stdout);
+            let said = String::from_utf8_lossy(&manager.stderr);
+            if manager.status.success() && !reported.trim().is_empty() {
+                let verdicts = [
+                    verdict(Source::Manager, reported.trim()),
+                    verdict(Source::Client, client),
+                ];
+                return refusal(verdicts.into_iter().flatten().collect());
+            }
+            if !(manager.status.success() && said.contains(IN_CHROOT)) {
+                let how = if manager.status.success() {
+                    "printed no version".to_string()
+                } else {
+                    format!("failed ({})", manager.status)
+                };
+                return Err(Error::Other(format!(
+                    "`systemctl show --property=Version` {how}, so goetia cannot tell whether the running systemd \
+                     is {SYSTEMD_FLOOR}+: {said}"
+                )));
+            }
+            NoManager::Chroot
+        }
     };
-    refusal(verdicts.into_iter().flatten().collect())
+    refusal(verdict(Source::OfflineClient(no_manager), client).into_iter().collect())
 }
 
+/// One probe, uncoloured, and audible: a chroot's "ignoring" notice is `log_info`, which an inherited
+/// `SYSTEMD_LOG_LEVEL=warning` would otherwise silence.
 fn probe(systemctl: &[&str], args: &[&str]) -> Result<std::process::Output> {
     let (program, prefix) = systemctl.split_first().expect("a program to run");
     Command::new(program)
         .args(prefix)
         .args(args)
         .envs(UNCOLOURED)
+        .envs(AUDIBLE)
         .output()
         .map_err(|e| Error::Other(format!("failed to run `systemctl {}`: {e}", args.join(" "))))
 }
@@ -164,7 +263,7 @@ fn major(source: Source, reported: &str) -> Option<u32> {
     }
     let version = match source {
         Source::Manager => reported.strip_prefix('v').unwrap_or(reported),
-        Source::Client | Source::OfflineClient => reported.strip_prefix("systemd ")?,
+        Source::Client | Source::OfflineClient(_) => reported.strip_prefix("systemd ")?,
     };
     let digits: String = version.chars().take_while(char::is_ascii_digit).collect();
     digits.parse().ok()
@@ -177,7 +276,7 @@ fn verdict(source: Source, reported: &str) -> Option<String> {
     let Some(n) = major(source, reported) else {
         let asked = match source {
             Source::Manager => "the running systemd reports",
-            Source::Client | Source::OfflineClient => "`systemctl --version` reports",
+            Source::Client | Source::OfflineClient(_) => "`systemctl --version` reports",
         };
         return Some(format!(
             "goetia cannot read the version {asked} ({reported:?}), so cannot tell whether it is."
@@ -189,14 +288,14 @@ fn verdict(source: Source, reported: &str) -> Option<String> {
     let found = match source {
         Source::Manager => format!("The running systemd is {n}"),
         Source::Client => format!("The `systemctl` client is {n}"),
-        Source::OfflineClient => format!("No running systemd could be asked, and `systemctl --version` reports {n}"),
+        Source::OfflineClient(why) => format!("No systemd runs here ({why}), and `systemctl --version` reports {n}"),
     };
     Some(match source {
         Source::Client => {
             format!("{found}, which does not accept the `--show-transaction` option every start and stop passes it.")
         }
-        Source::Manager | Source::OfflineClient if n >= TYPE_EXEC => format!("{found}, which {ANSWER}."),
-        Source::Manager | Source::OfflineClient => format!("{found}, which {ANSWER}, and {TYPE_SIMPLE}."),
+        Source::Manager | Source::OfflineClient(_) if n >= TYPE_EXEC => format!("{found}, which {ANSWER}."),
+        Source::Manager | Source::OfflineClient(_) => format!("{found}, which {ANSWER}, and {TYPE_SIMPLE}."),
     })
 }
 
