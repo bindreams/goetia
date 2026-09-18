@@ -792,8 +792,8 @@ fn command_failed(args: &[&str], ran: &Ran) -> Error {
 /// A budget that does not wait gets an explicitly **unbounded** deadline.
 /// `launchctl` exposes no non-blocking `bootout`, so for that call issuing
 /// the request *is* the blocking call (the trait doc comment states this on
-/// `stop`), and an already-expired deadline would give up on it before it
-/// ran — and then reach `budget::timed_out(.., Budget::Immediate)`,
+/// `stop`), and an already-expired deadline would stop waiting for it at
+/// once — and then reach `budget::timed_out(.., Budget::Immediate)`,
 /// tripping that constructor's own `debug_assert!`. What a non-waiting
 /// budget declines to wait for is the *pid*, and the plain `kickstart` below
 /// is what declines it.

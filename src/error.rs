@@ -116,10 +116,11 @@ pub enum Error {
     /// What this variant does **not** claim, and what separates it from
     /// [`Undetermined`](Error::Undetermined): nothing here is in doubt about
     /// what is *installed* at the id — that question was answered before the
-    /// wait ever began. The request was issued and accepted, and goetia
-    /// stopped watching for its outcome; it was not cancelled, and the
-    /// service may still arrive. A backend must never report an expiry as
-    /// `Ok(())`, and never as `Undetermined`.
+    /// wait ever began. The request was issued — the budget never decides
+    /// that, and on launchd it may still be on its way in a `launchctl`
+    /// goetia left running — and goetia stopped watching for its outcome;
+    /// it was not cancelled, and the service may still arrive. A backend
+    /// must never report an expiry as `Ok(())`, and never as `Undetermined`.
     ///
     /// Exit `4` (indeterminate), like `Undetermined`: the code is about
     /// whether the question was answered, and this one was not.

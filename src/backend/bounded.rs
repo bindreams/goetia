@@ -71,9 +71,9 @@ pub(crate) enum Finished {
 ///
 /// The rule all three share: the deadline bounds waiting for the manager's answer, and never
 /// decides whether a request reaches the manager at all.
-#[derive(Debug, Clone, Copy)]
 // Each backend constructs only the roles its own tool needs: `systemctl` announces its request,
 // `launchctl` does not.
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum Role {
     /// A read. Killing it on expiry loses nothing.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
