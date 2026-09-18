@@ -77,6 +77,7 @@ use crate::backend::Identity;
 use crate::backend::systemd::generate;
 use crate::decide::{self, Outcome};
 use crate::error::{Error, Result};
+use crate::manager::budget::Deadline;
 use crate::manager::{Budget, Installed, ServiceManager, Status};
 use crate::spec::{AccountId, DaemonSpec, Id, User};
 
@@ -253,19 +254,11 @@ impl ServiceManager for Systemd {
     }
 
     fn start(&self, id: &Id, budget: Budget) -> Result<()> {
-        let id = id.as_str();
-        // Derived before anything runs, so `--timeout` bounds the whole verb — see `run_verb`.
-        let deadline = budget.start();
-        require_installed(id)?;
-        start_impl(id, budget, deadline)
+        start_with(id.as_str(), budget, &REAL_STEPS)
     }
 
     fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
-        let id = id.as_str();
-        // Derived before anything runs, so `--timeout` bounds the whole verb — see `run_verb`.
-        let deadline = budget.start();
-        require_installed(id)?;
-        stop_impl(id, budget, deadline)
+        stop_with(id.as_str(), budget, &REAL_STEPS)
     }
 
     fn status(&self, id: &Id) -> Result<Status> {
@@ -367,6 +360,38 @@ fn residue_entry(id: &str) -> Option<Installed> {
         name: Some(id.to_string()),
         reason: failure.detail(),
     })
+}
+
+// start/stop ==========================================================================================================
+
+/// The steps `start`/`stop` take, behind a seam so their ORDER is assertable without a real systemd
+/// — the precedent is `cli::restart`'s `start_clock`. `manager_tests.rs` pins it.
+struct VerbSteps<'a> {
+    start_clock: &'a dyn Fn(Budget) -> Deadline,
+    require_installed: &'a dyn Fn(&str) -> Result<String>,
+    start: &'a dyn Fn(&str, Budget, Deadline) -> Result<()>,
+    stop: &'a dyn Fn(&str, Budget, Deadline) -> Result<()>,
+}
+
+const REAL_STEPS: VerbSteps<'static> = VerbSteps {
+    start_clock: &Budget::start,
+    require_installed: &require_installed,
+    start: &start_impl,
+    stop: &stop_impl,
+};
+
+fn start_with(id: &str, budget: Budget, steps: &VerbSteps<'_>) -> Result<()> {
+    // Derived before anything runs, so `--timeout` bounds the whole verb — see `run_verb`.
+    let deadline = (steps.start_clock)(budget);
+    (steps.require_installed)(id)?;
+    (steps.start)(id, budget, deadline)
+}
+
+fn stop_with(id: &str, budget: Budget, steps: &VerbSteps<'_>) -> Result<()> {
+    // Derived before anything runs, so `--timeout` bounds the whole verb — see `run_verb`.
+    let deadline = (steps.start_clock)(budget);
+    (steps.require_installed)(id)?;
+    (steps.stop)(id, budget, deadline)
 }
 
 // Enumeration =========================================================================================================

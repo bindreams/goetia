@@ -429,3 +429,51 @@ fn a_drop_in_name_that_is_not_a_directory_still_names_its_id() {
     assert!(scan.units.is_empty(), "there is no fragment here: {scan:?}");
     assert_eq!(scan.dropins, ["blocked"], "{scan:?}");
 }
+
+// start/stop: the deadline comes first ================================================================================
+
+/// The steps `verb` took, in order, with every step a recording fake — so, unlike the rest of this
+/// file, no elevation and no real systemd. The step that talks to systemd also checks that it was
+/// handed the deadline `start_clock` derived, not one of its own.
+fn steps_taken(verb: fn(&str, Budget, &VerbSteps<'_>) -> Result<()>) -> Vec<&'static str> {
+    let log = std::cell::RefCell::new(Vec::new());
+    let derived = std::cell::Cell::new(None);
+    let act = |step: &'static str, deadline: Deadline| {
+        log.borrow_mut().push(step);
+        assert_eq!(
+            Some(deadline),
+            derived.get(),
+            "{step} must run under the deadline derived at entry"
+        );
+        Ok(())
+    };
+    let steps = VerbSteps {
+        start_clock: &|budget| {
+            log.borrow_mut().push("start_clock");
+            let deadline = budget.start();
+            derived.set(Some(deadline));
+            deadline
+        },
+        require_installed: &|_| {
+            log.borrow_mut().push("require_installed");
+            Ok(String::new())
+        },
+        start: &|_, _, deadline| act("start", deadline),
+        stop: &|_, _, deadline| act("stop", deadline),
+    };
+    verb("x", Budget::DEFAULT, &steps).expect("every step succeeds");
+    log.into_inner()
+}
+
+/// `--timeout` bounds the whole verb only if the deadline exists before `require_installed`'s scan
+/// runs. Derived after it, the scan runs outside the budget and nothing else observable changes,
+/// which is why the order is pinned here rather than left to the elevated suite.
+#[skuld::test]
+fn start_derives_its_deadline_before_require_installed_runs() {
+    assert_eq!(steps_taken(start_with), ["start_clock", "require_installed", "start"]);
+}
+
+#[skuld::test]
+fn stop_derives_its_deadline_before_require_installed_runs() {
+    assert_eq!(steps_taken(stop_with), ["start_clock", "require_installed", "stop"]);
+}
