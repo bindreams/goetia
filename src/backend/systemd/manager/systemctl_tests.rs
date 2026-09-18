@@ -260,6 +260,55 @@ fn a_failure_is_reported_without_the_transaction_lines() {
     );
 }
 
+/// Stderr that carried nothing but protocol said nothing, so stdout is what gets reported: the
+/// fallback asks what is left of stderr once the protocol is gone, not whether it had any bytes.
+#[skuld::test]
+fn a_failure_whose_stderr_is_only_protocol_is_reported_with_its_stdout() {
+    let e = failed(
+        "start",
+        "x.service",
+        &capture(
+            "something on stdout\n",
+            "Enqueued anchor job 7 x.service/start.\n",
+            true,
+        ),
+    );
+    assert_eq!(e.to_string(), "systemctl start x.service failed: something on stdout\n");
+}
+
+/// `SYSTEMD_LOG_TIME`, `SYSTEMD_LOG_LOCATION` and `SYSTEMD_LOG_TID` each prefix every protocol line,
+/// and goetia's environment switches none of them off. The lines below are what `systemctl start
+/// --show-transaction` wrote under each on systemd 257.
+#[skuld::test]
+fn a_prefixed_transaction_is_still_protocol() {
+    for prefix in [
+        "Fri 2026-09-18 21:16:53 UTC ",
+        "src/systemctl/systemctl-start-unit.c:114: ",
+        "(1053127) ",
+    ] {
+        let finished = if prefix.starts_with("src/") {
+            "src/shared/bus-wait-for-jobs.c:225: "
+        } else {
+            prefix
+        };
+        let stderr = format!(
+            "{prefix}Enqueued anchor job 7 x.service/start.\n\
+             {prefix}Enqueued auxiliary job 8 y.service/start.\n\
+             {finished}Job for y.service finished.\n\
+             {prefix}Job for x.service failed because the control process exited with error code.\n"
+        );
+        let e = failed("start", "x.service", &capture("", &stderr, true));
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "systemctl start x.service failed: {prefix}Job for x.service failed because the control process \
+                 exited with error code.\n"
+            ),
+            "{prefix:?}"
+        );
+    }
+}
+
 /// A diagnostic the deadline cut short after the announcement is no diagnostic at all, and says so
 /// rather than presenting the transaction as what went wrong.
 #[skuld::test]
