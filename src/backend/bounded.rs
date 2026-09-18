@@ -55,7 +55,7 @@ pub(crate) enum Finished {
     /// The child exited on its own, inside the budget.
     Exited { status: ExitStatus, capture: Capture },
     /// The deadline expired first. The child was killed and reaped — or, under
-    /// [`Role::Request`], left running.
+    /// [`Role::Request`], left running, to be reaped on a thread of its own once it exits.
     ///
     /// Carries no capture. Whatever the child had written by then is a
     /// prefix no consumer may treat as whole, and the one thing every
@@ -85,20 +85,32 @@ pub(crate) enum Role {
     AnnouncedRequest(fn(&[u8]) -> bool),
     /// A request that never says when the manager has it. The deadline applies from the spawn, but
     /// an expiry leaves the child running rather than killing it, since a kill could land before
-    /// the request is out. launchd's alone: on Linux, cosca 0.4's cgroup containment kills a
+    /// the request is out, and reaps it once it exits. launchd's alone: on Linux, cosca 0.4's cgroup containment kills a
     /// detached tree when it drops the leaf, so a [`command`] child would not be left running.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Request,
 }
 
 /// Block until `child` exits or `deadline` expires, under `role`'s rule for what an expiry does:
-/// kill the child, tear its tree down and reap it — or, for [`Role::Request`], leave it running.
+/// kill the child, tear its tree down and reap it — or, for [`Role::Request`], leave it running and
+/// reap it once it exits.
 /// Its pipes are drained by up to two **detached** threads reporting over a channel, so the return
 /// value never waits on a reader.
 pub(crate) fn wait_bounded(
+    child: cosca::Child,
+    deadline: Deadline,
+    role: Role,
+) -> Result<Finished, cosca::error::Error> {
+    wait_bounded_then(child, deadline, role, |_| {})
+}
+
+/// [`wait_bounded`], handing the status of a [`Role::Request`] it left running to `reaped` once
+/// that child has exited and been reaped: the one outcome that arrives after this returns.
+fn wait_bounded_then(
     mut child: cosca::Child,
     deadline: Deadline,
     role: Role,
+    reaped: impl FnOnce(Result<ExitStatus, cosca::error::Error>) + Send + 'static,
 ) -> Result<Finished, cosca::error::Error> {
     let (tx, rx) = crossbeam_channel::unbounded();
     if let Some(r) = child.stdout() {
@@ -132,7 +144,7 @@ pub(crate) fn wait_bounded(
         None if matches!(role, Role::Request) => {
             // Not killed: goetia cannot tell whether the request is out yet, and a request left
             // unsent because goetia ran out of budget is the one answer worse than waiting.
-            child.detach();
+            reap_in_background(child, reaped);
             return Ok(Finished::Expired);
         }
         None => {
@@ -173,6 +185,41 @@ pub(crate) fn wait_bounded(
         Some(status) => Finished::Exited { status, capture },
         None => Finished::Expired,
     })
+}
+
+/// Wait `child` out on a thread of its own and reap it, then hand its status to `reaped`: a request
+/// left running still exits, and a caller that outlives it must not collect one zombie per expiry.
+///
+/// Never killed, not even after the reap. The thread [`cosca::Child::detach`]es the reaped child
+/// rather than dropping it, because `Drop` tears a contained tree down, and after the reap that is
+/// the reap-then-recycle hazard [`wait_bounded`]'s kill path is ordered to avoid: macOS's
+/// `FdMarker` `killpg`s the root's pgid, which the kernel may by then have handed to another group.
+/// `detach` touches no pid.
+///
+/// A thread that cannot be created drops its closure, and the child with it. [`Detached`] detaches it
+/// then too — left unreaped, since waiting here would outlast the budget and killing it could cancel
+/// the request.
+fn reap_in_background(
+    child: cosca::Child,
+    reaped: impl FnOnce(Result<ExitStatus, cosca::error::Error>) + Send + 'static,
+) {
+    let child = Detached(Some(child));
+    let _unreaped_if_no_thread = thread::Builder::new().name("goetia-reaper".to_string()).spawn(move || {
+        let status = child.0.as_ref().expect("only `Drop` takes it").wait();
+        drop(child);
+        reaped(status);
+    });
+}
+
+/// A child that is [`cosca::Child::detach`]ed when dropped, never killed.
+struct Detached(Option<cosca::Child>);
+
+impl Drop for Detached {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.take() {
+            child.detach();
+        }
+    }
 }
 
 // drain / collect =====================================================================================================

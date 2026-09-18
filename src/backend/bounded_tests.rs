@@ -275,18 +275,47 @@ fn what_an_announced_request_wrote_before_announcing_is_kept() {
     }
 }
 
-/// A request goetia cannot see arrive is never killed: killing it could cancel a request the manager
-/// has not yet received. The test ends the child itself, with `SIGTERM`, and reaps it: a child the
-/// expiry left running dies of that, and one already killed dies of the `SIGKILL` that got there
-/// first. `kill(pid, 0)` cannot tell the two apart, since a killed child is still there until reaped.
+/// A request goetia cannot see arrive is never killed on expiry — the kill could land before the
+/// manager has the request — and is reaped once it exits, so a long-lived caller is left no zombie
+/// per expired request. The test ends the child itself, with `SIGTERM`, and the reaper reports what
+/// it reaped: a child the expiry killed reports the `SIGKILL` that got there first, and one nobody
+/// reaps reports nothing — the channel's sender is dropped unsent, which `recv` returns as an error.
 #[skuld::test]
-fn an_unannounced_request_is_left_running_on_expiry() {
+fn an_unannounced_request_is_left_running_on_expiry_and_reaped_once_it_exits() {
+    let child = unannounced_request().spawn().unwrap();
+    let pid = child.id().pid() as libc::pid_t;
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let finished = wait_bounded_then(child, Budget::Immediate.start(), Role::Request, move |status| {
+        tx.send(status).expect("the test is still receiving");
+    })
+    .unwrap();
+
+    assert!(matches!(finished, Finished::Expired), "{finished:?}");
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+    let status = rx
+        .recv()
+        .expect("a request left running must be reaped once it exits")
+        .expect("waiting on the child");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "an expiry must not kill a request it cannot see arrive: {status:?}"
+    );
+}
+
+/// What the reaper falls back to when no thread can be made to run it: the child is dropped, and a
+/// [`Detached`] one is left running rather than killed. The test ends and reaps it itself, as nothing
+/// else will.
+#[skuld::test]
+fn a_detached_child_is_left_running_when_dropped() {
     let child = unannounced_request().spawn().unwrap();
     let pid = child.id().pid() as libc::pid_t;
 
-    let finished = wait_bounded(child, Budget::Immediate.start(), Role::Request).unwrap();
+    drop(Detached(Some(child)));
 
-    assert!(matches!(finished, Finished::Expired), "{finished:?}");
     let mut status = 0;
     unsafe {
         libc::kill(pid, libc::SIGTERM);
@@ -294,11 +323,11 @@ fn an_unannounced_request_is_left_running_on_expiry() {
     }
     assert!(
         libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGTERM,
-        "an expiry must not kill a request it cannot see arrive (wait status {status:#x})"
+        "dropping a detached child must not kill it (wait status {status:#x})"
     );
 }
 
-/// The child [`an_unannounced_request_is_left_running_on_expiry`] detaches: `command()`'s, as
+/// The child [`an_unannounced_request_is_left_running_on_expiry_and_reaped_once_it_exits`] leaves running: `command()`'s, as
 /// launchd's `launchctl` — the one production `Role::Request` — is spawned.
 #[cfg(not(target_os = "linux"))]
 fn unannounced_request() -> cosca::Command {
