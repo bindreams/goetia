@@ -2991,6 +2991,10 @@ fn restart_whose_start_leg_times_out_exits_4_not_1() {
         err.contains("was stopped"),
         "the context the wrap exists for survives it: {err}"
     );
+    assert!(
+        err.contains("did not report running within 5s:"),
+        "the budget reported is the `--timeout` given, not what the leg had left: {err}"
+    );
     assert!(!out.contains("restarted"), "{out}");
 }
 
@@ -3026,6 +3030,11 @@ fn restart_does_not_start_after_a_stop_that_timed_out() {
     assert!(err.contains("restart was abandoned"), "{err}");
     assert!(err.contains("no start was issued"), "{err}");
     assert!(err.contains("may be left stopped"), "{err}");
+    assert!(
+        err.contains("did not report stopped within 1s:"),
+        "the budget reported is the `--timeout` given, as plain `stop` reports it, not what the \
+         leg had left: {err}"
+    );
 }
 
 /// A bounded budget spent before the stop leg is issued is still a timeout, never `--timeout 0`'s

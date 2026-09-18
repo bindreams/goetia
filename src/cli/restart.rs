@@ -14,6 +14,7 @@
 //! leaving `c` whatever `a` and `b` did not spend.
 
 use std::io::Write;
+use std::time::Duration;
 
 use clap::Args as ClapArgs;
 
@@ -89,17 +90,18 @@ fn run_with(
 fn restart(mgr: &dyn ServiceManager, id: &Id, budget: Budget, start_clock: &dyn Fn(Budget) -> Deadline) -> Result<()> {
     let deadline = start_clock(budget);
     match leg(budget, budget_for(deadline)) {
-        Leg::Under(stop_budget) => mgr.stop(id, stop_budget).map_err(abandoned_before_start)?,
+        Leg::Under(stop_budget) => mgr
+            .stop(id, stop_budget)
+            .map_err(|e| abandoned_before_start(e, budget))?,
         Leg::Spent => {
             // The request still goes out — the budget never decides that — and
             // only its confirmation is not waited for, which under a budget the
             // user bounded is a timeout like any other.
             mgr.stop(id, Budget::Immediate)?;
-            return Err(abandoned_before_start(budget::timed_out(
-                id.as_str(),
-                "stopped",
+            return Err(abandoned_before_start(
+                budget::timed_out(id.as_str(), "stopped", budget),
                 budget,
-            )));
+            ));
         }
     }
 
@@ -144,18 +146,20 @@ fn leg(requested: Budget, left: Budget) -> Leg {
 
 // wording =============================================================================================================
 
-/// The stop leg's expiry — its own, or a budget spent before it was issued
-/// — re-worded before it propagates. The variant is
-/// preserved — this is still exit `4` — and only the remedy changes:
+/// The stop leg's expiry, re-worded before it propagates — whether the stop
+/// ran out of budget itself or the budget was spent before it was issued.
+/// The variant is preserved (still exit `4`); the remedy changes, because
 /// [`budget::timed_out`]'s shared text speaks for a bare `stop` and
 /// discloses neither that the restart was abandoned nor that the daemon is
-/// left down. Every other failure passes through untouched: a stop that
-/// determinately failed changed nothing and is still exit `1`.
-fn abandoned_before_start(e: Error) -> Error {
+/// left down, and so does `waited` (see [`as_given`]). Every other failure
+/// passes through untouched: a stop that determinately failed changed
+/// nothing and is still exit `1`.
+fn abandoned_before_start(e: Error, budget: Budget) -> Error {
     match e {
         Error::WaitTimeout {
             id, awaited, waited, ..
         } => Error::WaitTimeout {
+            waited: as_given(budget, waited),
             recovery: format!(
                 "the restart was abandoned: no start was issued, so `{id}` may be left stopped — \
                  and the stop was not cancelled, so it may or may not have reached stopped by the \
@@ -165,7 +169,6 @@ fn abandoned_before_start(e: Error) -> Error {
             ),
             id,
             awaited,
-            waited,
         },
         other => other,
     }
@@ -237,11 +240,21 @@ fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
             recovery,
         } => Error::WaitTimeout {
             recovery: format!("`{id}` was stopped and the start was issued. {recovery}"),
+            waited: as_given(budget, waited),
             id,
             awaited,
-            waited,
         },
         other => Error::Other(format!("stopped but failed to restart: {other}")),
+    }
+}
+
+/// How long a restart's expiry reports having waited: the `--timeout` the
+/// user gave, as plain `stop` reports it. A leg's own budget is only what
+/// was left of that one, and `restart` is one operation with one budget.
+fn as_given(budget: Budget, leg_waited: Duration) -> Duration {
+    match budget {
+        Budget::Bounded(given) => given,
+        Budget::Immediate | Budget::Unbounded => leg_waited,
     }
 }
 
