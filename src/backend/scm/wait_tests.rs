@@ -22,6 +22,8 @@ struct FakeScm {
     start_fails: bool,
     /// The deadline each `wait_callback` was handed, in call order.
     deadlines: Vec<Deadline>,
+    /// The deadline each `arm` was handed, in call order.
+    arm_deadlines: Vec<Deadline>,
 }
 
 impl FakeScm {
@@ -32,6 +34,7 @@ impl FakeScm {
             what_arm_reports: Waited::Confirmed,
             start_fails: false,
             deadlines: vec![],
+            arm_deadlines: vec![],
         }
     }
 
@@ -55,7 +58,8 @@ impl FakeScm {
 }
 
 impl ScmActor for FakeScm {
-    fn arm(&mut self, want: WantState, _deadline: Deadline) -> std::io::Result<Waited> {
+    fn arm(&mut self, want: WantState, deadline: Deadline) -> std::io::Result<Waited> {
+        self.arm_deadlines.push(deadline);
         self.log.push(match want {
             WantState::Stopped => "arm_stopped",
             WantState::Running => "arm_running",
@@ -197,14 +201,44 @@ fn an_expired_deadline_still_issues_the_start_request() {
     assert_eq!(fake.log, vec!["arm_running", "start", "wait", "got_nothing"]);
 }
 
+/// A deadline no re-derivation inside the wait can reproduce: an hour out,
+/// where a fresh `Budget::DEFAULT.start()` (or any other budget the code
+/// could reach for) lands somewhere else.
+fn an_hour_out() -> Deadline {
+    Budget::Bounded(std::time::Duration::from_secs(3600)).start()
+}
+
+/// Re-arming must not restart the clock: a service that chatters
+/// START_PENDING forever has to terminate at the caller's budget. Every arm
+/// — `arm`'s own deadline bounds the lagging-remedy loop — and every wait
+/// gets the caller's deadline, not a fresh one.
 #[skuld::test]
 fn a_pending_callback_rearms_under_the_same_deadline() {
-    // Re-arming must not restart the clock: a service that chatters
-    // START_PENDING forever has to terminate at the caller's budget.
-    let mut fake = FakeScm::new([Some(Observed::Pending), Some(Observed::Running)]);
-    assert_eq!(start_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
-    assert_eq!(fake.arm_count(), 2);
-    assert_eq!(fake.deadlines[0], fake.deadlines[1]);
+    let deadline = an_hour_out();
+    let mut fake = FakeScm::new([
+        Some(Observed::Pending),
+        Some(Observed::Pending),
+        Some(Observed::Running),
+    ]);
+    assert_eq!(start_via_notify(&mut fake, deadline).unwrap(), Waited::Confirmed);
+    assert_eq!(fake.arm_count(), 3);
+    assert_eq!(fake.arm_deadlines, vec![deadline; 3]);
+    assert_eq!(fake.deadlines, vec![deadline; 3]);
+}
+
+/// [`a_pending_callback_rearms_under_the_same_deadline`]'s stop mirror.
+#[skuld::test]
+fn a_pending_stop_callback_rearms_under_the_same_deadline() {
+    let deadline = an_hour_out();
+    let mut fake = FakeScm::new([
+        Some(Observed::Pending),
+        Some(Observed::Running),
+        Some(Observed::Stopped),
+    ]);
+    assert_eq!(stop_via_notify(&mut fake, deadline).unwrap(), Waited::Confirmed);
+    assert_eq!(fake.arm_count(), 3);
+    assert_eq!(fake.arm_deadlines, vec![deadline; 3]);
+    assert_eq!(fake.deadlines, vec![deadline; 3]);
 }
 
 #[skuld::test]
