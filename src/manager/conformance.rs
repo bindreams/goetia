@@ -347,21 +347,27 @@ fn start_and_stop_are_idempotent(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> 
 ///
 /// What is left assertable, and is asserted: that every backend *accepts*
 /// the budget, and that a subsequent `Budget::DEFAULT` start still reaches
-/// `Running`. The second half is what stops a backend satisfying this by
-/// making `Immediate` a no-op that quietly leaves the service unstartable.
+/// `Running`. The second half catches an `Immediate` that leaves the service
+/// unstartable. It does **not** catch an `Immediate` that is simply a no-op
+/// — the waiting start that follows succeeds either way — and nothing
+/// portable can: where a request that was sent shows up differs per
+/// manager. The systemd suite asserts it where it can be asserted without a
+/// race (`a_start_with_no_budget_reaches_systemd` and its stop mirror).
 ///
 /// **No scenario here asserts the expiry rule** — that an expiry is
-/// `Error::WaitTimeout` and never `Ok(())` — against a real backend, and
-/// that is a decision rather than a gap. Asserting it would need a daemon
-/// that provably fails to reach running on all three platforms, which no
-/// portable `DaemonSpec` can express; the alternative, a real daemon under
-/// a budget small enough to expire, asserts whichever outcome the scheduler
-/// happened to pick, which is the bet this project forbids. `Fake` carries
-/// the rule instead, deriving each expiry from the budget without sleeping
-/// (`fake_tests.rs`: `a_stalled_start_times_out_under_a_bounded_budget` and
-/// its stop mirror, plus the two `Unbounded` refusals). So a real backend
-/// that swallowed an expiry as `Ok` would pass every scenario in this file
-/// — that is understood, and the reason there is nothing to find here.
+/// `Error::WaitTimeout` and never `Ok(())` — against a real backend.
+/// Asserting it portably would need a daemon that provably fails to reach
+/// the awaited state on all three platforms, which no portable `DaemonSpec`
+/// can express; the alternative, a real daemon under a budget small enough
+/// to expire, asserts whichever outcome the scheduler happened to pick,
+/// which is the bet this project forbids. `Fake` carries the rule here,
+/// deriving each expiry from the budget without sleeping (`fake_tests.rs`:
+/// `a_stalled_start_times_out_under_a_bounded_budget` and its stop mirror,
+/// plus the two `Unbounded` refusals). The systemd suite adds the one real
+/// expiry a unit can be built for — a stop that cannot complete
+/// (`a_stop_that_can_never_complete_times_out_with_the_job_standing`); on
+/// launchd and SCM a real backend that swallowed an expiry as `Ok` would
+/// still pass every scenario.
 fn starting_with_no_budget_is_accepted_and_establishes_nothing(
     mgr: &dyn ServiceManager,
     mk: &dyn Fn(&str) -> DaemonSpec,

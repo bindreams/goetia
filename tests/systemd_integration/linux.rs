@@ -10,6 +10,7 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use goetia::backend::systemd::manager::Systemd;
 use goetia::decide::Outcome;
@@ -521,19 +522,31 @@ fn start_stop_status_reflect_reality() {
     assert!(status.pid.is_none(), "{status:?}");
 }
 
-/// `Budget::Immediate` is the native `systemctl start --no-block`: systemd enqueues the job and
-/// `systemctl` returns without waiting for it to complete.
-///
-/// **No assertion about the resulting state follows**, and that is the test. `--no-block` returns
-/// while the job is still queued, so asserting `Running` — or `Stopped` — would be asserting a
-/// race. What `Immediate` promises is that the request was accepted and goetia came back, and that
-/// is exactly and only what is checked here.
-///
-/// Named for what it observes rather than for the mechanism: a `start` that dropped `--no-block`
-/// entirely would still pass this, so the flag itself is pinned on the argv, in
-/// `src/backend/systemd/manager/systemctl_tests.rs`.
+/// `ActiveState` and `Job` as `systemctl show` reports them: the job is empty when none is queued.
+fn active_state_and_job(id: &str) -> (String, String) {
+    let unit = format!("{id}.service");
+    let run = cmd::run(
+        "systemctl",
+        &["show", "--property=ActiveState", "--property=Job", &unit],
+    )
+    .expect_ok();
+    let prop = |name: &str| {
+        run.stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("no {name} in {run}"))
+            .to_string()
+    };
+    (prop("ActiveState"), prop("Job"))
+}
+
+/// `Budget::Immediate` is the native `systemctl start --no-block`, and it must actually reach
+/// systemd. Which state the unit is in afterwards is a race — the job may be queued, running, or
+/// done — but one state is impossible: systemd answers `StartUnit` only once the job is enqueued,
+/// so after `start` returns the unit is never still `inactive` with no job. A `start` that skipped
+/// the request is exactly that.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_start_with_no_budget_is_accepted_and_returns() {
+fn a_start_with_no_budget_reaches_systemd() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let spec = mk(guard.id());
@@ -542,6 +555,152 @@ fn a_start_with_no_budget_is_accepted_and_returns() {
 
     mgr.start(&spec.id, Budget::Immediate)
         .expect("a start with no budget issues the request and returns");
+
+    let (state, job) = active_state_and_job(guard.id());
+    assert!(
+        !(state == "inactive" && job.is_empty()),
+        "the start job never reached systemd: ActiveState={state} Job={job:?}"
+    );
+}
+
+/// The stop mirror of [`a_start_with_no_budget_reaches_systemd`]: after `StopUnit` is answered the
+/// unit is never still `active` with no job.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_stop_with_no_budget_reaches_systemd() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let spec = mk(guard.id());
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+
+    mgr.stop(&spec.id, Budget::Immediate)
+        .expect("a stop with no budget issues the request and returns");
+
+    let (state, job) = active_state_and_job(guard.id());
+    assert!(
+        !(state == "active" && job.is_empty()),
+        "the stop job never reached systemd: ActiveState={state} Job={job:?}"
+    );
+}
+
+/// A daemon that can never stop: it ignores `SIGTERM`, and a drop-in removes the `SIGKILL` systemd
+/// would otherwise escalate to. [`Unstoppable`]'s `Drop` is what ends it.
+fn unstoppable(id: &str) -> DaemonSpec {
+    let mut spec = mk(id);
+    spec.command = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "trap '' TERM; exec /bin/sleep infinity".to_string(),
+    ];
+    spec
+}
+
+/// Ends an [`unstoppable`] unit: `SIGKILL` lets the stop job it is stuck in complete, a blocking
+/// `systemctl stop` waits for exactly that, and `reset-failed` clears the `failed` state the kill
+/// leaves — which would otherwise outlive the unit file `ServiceGuard` removes. Declared after the
+/// `ServiceGuard`, so it drops first.
+struct Unstoppable(String);
+
+impl Unstoppable {
+    fn install(mgr: &Systemd, spec: &DaemonSpec) -> Self {
+        mgr.install(spec, false).expect("install");
+        let dir = dropin_dir(spec.id.as_str());
+        fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
+        fs::write(dir.join("stop.conf"), "[Service]\nTimeoutStopSec=infinity\n").expect("write drop-in");
+        cmd::run("systemctl", &["daemon-reload"]).expect_ok();
+        Unstoppable(spec.id.as_str().to_string())
+    }
+}
+
+impl Drop for Unstoppable {
+    fn drop(&mut self) {
+        let unit = format!("{}.service", self.0);
+        for args in [
+            &["kill", "--signal=SIGKILL", unit.as_str()][..],
+            &["stop", unit.as_str()],
+            &["reset-failed", unit.as_str()],
+        ] {
+            let run = cmd::run("systemctl", args);
+            if !run.ok() {
+                eprintln!("Unstoppable[{}]: cleanup failed: {run}", self.0);
+            }
+        }
+    }
+}
+
+/// A real expiry, deterministically: the stop can never complete, so a bounded `stop` has exactly
+/// one correct answer — `WaitTimeout`, with the stop job left standing in systemd. A backend that
+/// ignored `--timeout` would wait forever here, which the suite's watchdog surfaces.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_stop_that_can_never_complete_times_out_with_the_job_standing() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let spec = unstoppable(guard.id());
+    let mgr = Systemd::new();
+    let _unstoppable = Unstoppable::install(&mgr, &spec);
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+
+    let err = mgr
+        .stop(&spec.id, Budget::Bounded(Duration::from_secs(1)))
+        .expect_err("a stop that can never complete must not report stopped");
+
+    assert!(
+        matches!(err, goetia::Error::WaitTimeout { awaited: "stopped", .. }),
+        "{err:?}"
+    );
+    let (state, job) = active_state_and_job(guard.id());
+    assert_eq!(state, "deactivating", "the stop was not cancelled (Job={job:?})");
+}
+
+/// The budget never decides whether the request is sent. A budget spent before `systemctl` even
+/// runs still enqueues the stop, and — the stop being unable to complete — still reports
+/// `WaitTimeout` with the job standing: the same answer whatever is left, so no timing is bet on.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_stop_on_a_spent_budget_still_reaches_systemd() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let spec = unstoppable(guard.id());
+    let mgr = Systemd::new();
+    let _unstoppable = Unstoppable::install(&mgr, &spec);
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+
+    let err = mgr
+        .stop(&spec.id, Budget::Bounded(Duration::from_nanos(1)))
+        .expect_err("a stop that can never complete must not report stopped");
+
+    assert!(
+        matches!(err, goetia::Error::WaitTimeout { awaited: "stopped", .. }),
+        "{err:?}"
+    );
+    let (state, job) = active_state_and_job(guard.id());
+    assert_eq!(state, "deactivating", "the stop never reached systemd (Job={job:?})");
+}
+
+/// The start mirror: whatever a spent budget reports, the start job reached systemd, so the unit is
+/// not still `inactive` with no job — see [`a_start_with_no_budget_reaches_systemd`].
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_start_on_a_spent_budget_still_reaches_systemd() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let spec = mk(guard.id());
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+
+    let result = mgr.start(&spec.id, Budget::Bounded(Duration::from_nanos(1)));
+
+    assert!(
+        matches!(
+            result,
+            Ok(()) | Err(goetia::Error::WaitTimeout { awaited: "running", .. })
+        ),
+        "{result:?}"
+    );
+    let (state, job) = active_state_and_job(guard.id());
+    assert!(
+        !(state == "inactive" && job.is_empty()),
+        "the start job never reached systemd: ActiveState={state} Job={job:?}"
+    );
 }
 
 /// `Type=exec` is what makes `systemctl start` report failure here at all — under `Type=simple` the
