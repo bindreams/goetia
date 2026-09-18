@@ -225,10 +225,10 @@ fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
         // The stop was issued and not waited for, and the start that
         // followed was refused — determinately (systemd rejecting a unit it
         // cannot load) or not (SCM's `ERROR_SERVICE_ALREADY_RUNNING` over a
-        // service still coming down). Either way the stop is still in
-        // flight, so whether the daemon cycled, is going down, or never moved
-        // is what nobody established — so not `Other`, which is exit `1` and
-        // claims the restart determinately failed.
+        // service still coming down). Either way nothing confirmed the stop,
+        // which may be in flight, done, or have had nothing to do, so where
+        // the daemon ended up is what nobody established — not `Other`,
+        // exit `1`, whose answer a refusal alone would be.
         e if !budget.waits() => Error::Unestablished {
             id: id.as_str().to_string(),
             detail: format!(

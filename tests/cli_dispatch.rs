@@ -3102,7 +3102,10 @@ fn restart_with_no_budget_reports_a_start_refused_over_a_service_still_up() {
 
     assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
     assert_eq!(out, "", "nothing may claim the daemon was restarted: {out}");
-    assert!(err.contains("may or may not have restarted"), "{err}");
+    assert!(
+        err.contains("was not restarted, and where it ended up is not established"),
+        "{err}"
+    );
     assert_eq!(
         fake.calls(),
         vec![("stop", "frpc".to_string()), ("start", "frpc".to_string())],

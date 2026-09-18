@@ -155,10 +155,11 @@ pub enum DaemonCommand {
 ///   and the daemon may still arrive.
 ///   [`Error::Unestablished`](crate::error::Error::Unestablished) joins it
 ///   there, for `restart` under a budget that does not wait — an unconfirmed
-///   stop followed by a refused start. Reporting either as `1` would claim
-///   the operation determinately failed, which neither established — for
-///   `Unestablished` not even when the refusal itself was determinate, since
-///   the unconfirmed stop leaves where the daemon ended up open.
+///   stop followed by a refused start. Reporting the first as `1` would
+///   claim the operation determinately failed, which it did not establish;
+///   reporting the second as `1` would make the refusal the whole answer,
+///   when the unconfirmed stop before it leaves where the daemon ended up
+///   open — even when the refusal itself was determinate.
 ///   `list`/`status` compute theirs via [`report::exit_code`]
 ///   (see the design spec's §4), in *both* output modes: out of
 ///   `status(&id)` the second producer reaches them as
