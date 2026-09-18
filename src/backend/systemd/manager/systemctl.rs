@@ -359,7 +359,7 @@ fn run_verb(verb: &str, unit: &str, budget: Budget, deadline: Deadline) -> Resul
 }
 
 /// Whether [`run_verb`] takes its bounded path under `budget` — the one whose `systemctl` goetia
-/// watches, and which needs a thread and a temp file to do it.
+/// watches, and which needs a thread for each of its streams to do it.
 pub(super) fn watched(budget: Budget) -> bool {
     budget.waits() && budget != Budget::Unbounded
 }

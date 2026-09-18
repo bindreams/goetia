@@ -1184,9 +1184,10 @@ fn goetia_with_tasks(tasks: u32, args: &[&str]) -> std::process::Output {
 
 /// goetia never panics for want of a task, and a verb that could not have what its request needs
 /// exits `1` with the unit untouched. Its tasks are counted exactly: its own thread; one version
-/// probe at a time; and for a `start` that waits, a thread to read `systemctl`'s stderr, made before
-/// `systemctl` itself. So one task cannot probe, two cannot send the start, and three can. A
-/// `restart` makes the thread each of its legs needs before either leg, so it needs a fourth.
+/// probe at a time; and for a `start` that waits, a thread for each of `systemctl`'s two streams,
+/// made before `systemctl` itself. So one task cannot probe, two or three cannot send the start,
+/// and four can. A `restart` makes the two threads each of its legs needs before either leg, and
+/// probes with all four held, so it needs six.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
     let id = support::random_test_id();
@@ -1199,7 +1200,7 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
         (output.status.code(), stderr)
     };
 
-    for tasks in [1, 2] {
+    for tasks in [1, 2, 3] {
         let (code, stderr) = run(tasks, "start");
         assert_eq!(code, Some(1), "start TasksMax={tasks}: {stderr}");
         assert_eq!(
@@ -1208,11 +1209,11 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
             "a start short of tasks sent something: TasksMax={tasks}"
         );
     }
-    let (code, stderr) = run(3, "start");
-    assert_eq!(code, Some(0), "start TasksMax=3: {stderr}");
+    let (code, stderr) = run(4, "start");
+    assert_eq!(code, Some(0), "start TasksMax=4: {stderr}");
 
     let before = main_pid(guard.id());
-    for tasks in [2, 3] {
+    for tasks in [2, 3, 4, 5] {
         let (code, stderr) = run(tasks, "restart");
         assert_eq!(code, Some(1), "restart TasksMax={tasks}: {stderr}");
         assert_eq!(
@@ -1221,9 +1222,9 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
             "a restart short of tasks touched the daemon: TasksMax={tasks}"
         );
     }
-    let (code, stderr) = run(4, "restart");
-    assert_eq!(code, Some(0), "restart TasksMax=4: {stderr}");
-    assert_ne!(main_pid(guard.id()), before, "restart TasksMax=4 restarted nothing");
+    let (code, stderr) = run(6, "restart");
+    assert_eq!(code, Some(0), "restart TasksMax=6: {stderr}");
+    assert_ne!(main_pid(guard.id()), before, "restart TasksMax=6 restarted nothing");
 
     // A budget whose `systemctl` goetia does not watch makes no thread, and reserves none: two tasks
     // are its own and one `systemctl` at a time.

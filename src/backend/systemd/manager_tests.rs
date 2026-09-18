@@ -464,14 +464,20 @@ fn prepared_steps_need_nothing_made_later() {
     assert_eq!(watched(&[Step::Install, Step::Start]), 1, "`install` watches nothing");
 
     type Allowance = fn() -> bounded::test_hook::Allowance;
-    let shortfalls: [Allowance; 2] = [|| bounded::test_hook::threads(1), || bounded::test_hook::temp_files(1)];
-    for allowance in shortfalls {
+    let shortfalls: [Allowance; 3] = [
+        || bounded::test_hook::threads(1),
+        || bounded::test_hook::threads(3),
+        || bounded::test_hook::temp_files(0),
+    ];
+    for (i, allowance) in shortfalls.into_iter().enumerate() {
         let _short = allowance();
-        let e = mgr
-            .prepare(&[Step::Stop, Step::Start], Budget::DEFAULT)
-            .err()
-            .expect("one short");
-        assert!(e.to_string().contains("so none was sent"), "{e}");
+        let e = mgr.prepare(&[Step::Stop, Step::Start], Budget::DEFAULT).err();
+        if i < 2 {
+            let e = e.expect("threads short");
+            assert!(e.to_string().contains("so none was sent"), "{e}");
+        } else {
+            assert!(e.is_none(), "systemd prepares no temp file: {e:?}");
+        }
     }
 }
 

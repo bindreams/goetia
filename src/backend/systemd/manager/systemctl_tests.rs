@@ -196,15 +196,14 @@ fn the_bounded_path_issues_the_request_on_a_spent_deadline() {
     );
 }
 
-/// A watched `systemctl` whose stderr no thread could read, or whose stdout no file could take, is
-/// never run: `Error::Other`, which every verb exits `1` for, and no request — never a panic, and
+/// A watched `systemctl` whose stdout or stderr no thread could read is never run: `Error::Other`, which every verb exits `1` for, and no request — never a panic, and
 /// never a request out with nothing to watch it.
 #[skuld::test]
 fn a_request_nothing_could_watch_is_never_sent() {
     type Allowance = fn() -> bounded::test_hook::Allowance;
     let shortfalls: [(Allowance, &str); 2] = [
         (|| bounded::test_hook::threads(0), "no thread"),
-        (|| bounded::test_hook::temp_files(0), "no temp file"),
+        (|| bounded::test_hook::threads(1), "no thread"),
     ];
     for (allowance, what) in shortfalls {
         let dir = tempfile::tempdir().unwrap();
@@ -226,6 +225,24 @@ fn a_request_nothing_could_watch_is_never_sent() {
         assert_eq!(bounded::test_hook::spawns(), spawns, "{what}: systemctl was spawned");
         assert!(!request.exists(), "{what}: the request was sent");
     }
+}
+
+/// A watched `systemctl` needs no temp file: it runs where none may be writable — a chroot, or an
+/// image build.
+#[skuld::test]
+fn a_watched_request_needs_no_temp_file() {
+    let _no_file = bounded::test_hook::temp_files(0);
+    let dir = tempfile::tempdir().unwrap();
+    let request = dir.path().join("request");
+    let finished = run_verb_via(
+        "/bin/sh",
+        &["-c", ANNOUNCES_THEN_BLOCKS, request.to_str().unwrap()],
+        Budget::Bounded(Duration::from_secs(10)),
+        Budget::Immediate.start(),
+    )
+    .expect("no temp file is needed");
+    assert!(matches!(finished, Finished::Expired), "{finished:?}");
+    assert!(request.exists());
 }
 
 /// An inherited `SYSTEMD_LOG_LEVEL=warning` or `SYSTEMD_LOG_TARGET=null` silences the announcement,

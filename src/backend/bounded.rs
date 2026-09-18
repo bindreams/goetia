@@ -87,8 +87,8 @@ pub(crate) enum Role {
     Query,
     /// A request that says on stderr when the manager has it: `issued` holds once it has. Until
     /// then the wait is unbounded; only after it does the deadline apply, and killing the child
-    /// then cancels nothing. Its stderr is a pipe a thread made before the spawn reads as it is
-    /// written; its stdout, a temp file.
+    /// then cancels nothing. Both its streams are pipes, each read as it is written by a thread
+    /// made before the spawn: no temp file, since `systemctl` runs where none may be writable.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     AnnouncedRequest(fn(&[u8]) -> bool),
     /// A request that never says when the manager has it. The deadline applies from the spawn, but
@@ -107,54 +107,71 @@ pub(crate) enum Role {
 pub(crate) struct Spawned {
     child: cosca::Child,
     role: Role,
-    stdout: File,
-    stderr: Stderr,
+    stdout: Stream,
+    stderr: Stream,
 }
 
-/// Where a spawned child's stderr went.
-enum Stderr {
+/// Where one of a spawned child's streams went.
+enum Stream {
     /// A temp file, read once the child has exited.
     File(File),
     /// A pipe a thread reads as it is written, heard here as it does.
     Heard(Receiver<Chunk>),
 }
 
-/// Spawn `cmd` under `role`, having first made everything its output needs: a temp file for stdout,
-/// and for stderr another — or, for a [`Role::AnnouncedRequest`], a thread to read the pipe it
-/// announces on. A failure to make one is an `Err` with nothing spawned, and says so. A
-/// [`Role::Request`] brings its [`Reaper`], made before the caller sent anything — see [`reapers`].
-pub(crate) fn spawn(cmd: &mut cosca::Command, role: Role) -> Result<Spawned, cosca::error::Error> {
-    enum Ready {
-        File(File),
-        Listener(spares::Listener),
+/// What a stream needs, made before the spawn.
+enum Ready {
+    File(File),
+    Listener(spares::Listener),
+}
+
+impl Ready {
+    /// A temp file, or for a [`Role::AnnouncedRequest`] a thread to read a pipe: see [`Role`].
+    fn for_role(role: &Role) -> Result<Ready, cosca::error::Error> {
+        Ok(match role {
+            Role::AnnouncedRequest(_) => {
+                Ready::Listener(spares::listener().map_err(not_run("thread to read its output"))?)
+            }
+            Role::Query | Role::Request(_) => Ready::File(spares::file().map_err(not_run("temp file for its output"))?),
+        })
     }
-    let stdout = spares::file().map_err(not_run("temp file for its output"))?;
-    let stderr = match role {
-        Role::AnnouncedRequest(_) => {
-            cmd.stderr(cosca::Stdio::pipe_out())?;
-            Ready::Listener(spares::listener().map_err(not_run("thread to read its output"))?)
+
+    /// Where the child writes this stream.
+    fn stdio(&self) -> Result<cosca::Stdio, cosca::error::Error> {
+        Ok(match self {
+            Ready::File(file) => {
+                cosca::Stdio::from_file(file.try_clone().map_err(not_run("descriptor for its output"))?)
+            }
+            Ready::Listener(_) => cosca::Stdio::pipe_out(),
+        })
+    }
+
+    /// The stream, once the child is spawned: a listener is handed the pipe it was made for.
+    fn spawned(self, pipe: Option<io::PipeReader>) -> Stream {
+        match self {
+            Ready::File(file) => Stream::File(file),
+            Ready::Listener(listener) => Stream::Heard(listener.listen(pipe)),
         }
-        Role::Query | Role::Request(_) => {
-            let file = spares::file().map_err(not_run("temp file for its output"))?;
-            cmd.stderr(cosca::Stdio::from_file(
-                file.try_clone().map_err(not_run("descriptor for its output"))?,
-            ))?;
-            Ready::File(file)
-        }
-    };
-    cmd.stdout(cosca::Stdio::from_file(
-        stdout.try_clone().map_err(not_run("descriptor for its output"))?,
-    ))?;
+    }
+}
+
+/// Spawn `cmd` under `role`, having first made everything its output needs: a temp file for each
+/// stream — or, for a [`Role::AnnouncedRequest`], a thread to read each as it is written, since it
+/// announces on stderr and must not depend on a writable temp directory. A failure to make one is
+/// an `Err` with nothing spawned, and says so. A [`Role::Request`] brings its [`Reaper`], made
+/// before the caller sent anything — see [`reapers`].
+pub(crate) fn spawn(cmd: &mut cosca::Command, role: Role) -> Result<Spawned, cosca::error::Error> {
+    let stdout = Ready::for_role(&role)?;
+    let stderr = Ready::for_role(&role)?;
+    cmd.stdout(stdout.stdio()?)?;
+    cmd.stderr(stderr.stdio()?)?;
     let mut child = start(cmd)?;
-    let stderr = match stderr {
-        Ready::File(file) => Stderr::File(file),
-        Ready::Listener(listener) => Stderr::Heard(listener.listen(child.stderr())),
-    };
+    let (out, err) = (child.stdout(), child.stderr());
     Ok(Spawned {
         child,
         role,
-        stdout,
-        stderr,
+        stdout: stdout.spawned(out),
+        stderr: stderr.spawned(err),
     })
 }
 
@@ -190,10 +207,10 @@ pub(crate) fn wait_bounded(spawned: Spawned, deadline: Deadline) -> Result<Finis
     // Unbounded, deliberately: this is the request going out, not the wait for its answer. A child
     // that ends without announcing ends here too, once its stderr reaches EOF.
     let mut heard = Vec::new();
-    if let (Role::AnnouncedRequest(issued), Stderr::Heard(rx)) = (&role, &stderr) {
+    if let (Role::AnnouncedRequest(issued), Stream::Heard(rx)) = (&role, &stderr) {
         while !issued(&heard) {
             match rx.recv() {
-                Ok(chunk) => absorb(chunk, &mut heard).map_err(cosca::error::Error::Io)?,
+                Ok(chunk) => absorb(chunk, &mut heard, "stderr").map_err(cosca::error::Error::Io)?,
                 Err(RecvError) => break, // EOF
             }
         }
@@ -224,7 +241,7 @@ pub(crate) fn wait_bounded(spawned: Spawned, deadline: Deadline) -> Result<Finis
             // documents. An uncontained child (the descendant test spawns one) reports
             // `Unsupported` here, and a contained tree whose member refused SIGKILL
             // reports `Containment`; the `Result` is discarded either way, so nothing
-            // surfaces it, and a descendant still holding the pipe is exactly what
+            // surfaces it, and a descendant still holding a pipe is exactly what
             // `collect` reports as `complete == false`.
             let _tree_teardown = child.kill_tree();
             let reaped = child.wait()?;
@@ -238,20 +255,32 @@ pub(crate) fn wait_bounded(spawned: Spawned, deadline: Deadline) -> Result<Finis
     // natural-exit path too, nothing this call spawned outlives it holding a write end.
     drop(child);
 
-    let (stderr, complete) = match stderr {
-        Stderr::File(file) => (read_back(file, "stderr")?, true),
-        Stderr::Heard(rx) => {
-            let (rest, complete) = collect(rx, deadline).map_err(cosca::error::Error::Io)?;
-            heard.extend(rest);
-            (heard, complete)
-        }
-    };
+    let (stdout, stdout_whole) = read(stdout, Vec::new(), "stdout", deadline)?;
+    let (stderr, stderr_whole) = read(stderr, heard, "stderr", deadline)?;
     let capture = Capture {
-        stdout: read_back(stdout, "stdout")?,
+        stdout,
         stderr,
-        complete,
+        complete: stdout_whole && stderr_whole,
     };
     Ok(Finished::Exited { status, capture })
+}
+
+/// The rest of `stream`, after `heard`: a file read back whole, or a pipe collected until its EOF or
+/// `deadline`. `(bytes, whole)`.
+fn read(
+    stream: Stream,
+    mut heard: Vec<u8>,
+    name: &str,
+    deadline: Deadline,
+) -> Result<(Vec<u8>, bool), cosca::error::Error> {
+    match stream {
+        Stream::File(file) => Ok((read_back(file, name)?, true)),
+        Stream::Heard(rx) => {
+            let (rest, whole) = collect(rx, deadline, name).map_err(cosca::error::Error::Io)?;
+            heard.extend(rest);
+            Ok((heard, whole))
+        }
+    }
 }
 
 /// Everything written to `file`, a stream's temp file, read from its start: the child wrote through
@@ -342,13 +371,13 @@ impl ChunkSource for Receiver<Chunk> {
 /// deadline cannot keep this loop fed forever (`recv_timeout(ZERO)` returns
 /// a queued item rather than timing out, which is why that snapshot, not a
 /// zero-duration `recv_timeout`, is what expiry drains through).
-fn collect(rx: impl ChunkSource, deadline: Deadline) -> std::io::Result<(Vec<u8>, bool)> {
+fn collect(rx: impl ChunkSource, deadline: Deadline, stream: &str) -> std::io::Result<(Vec<u8>, bool)> {
     let mut bytes = Vec::new();
 
     loop {
         match deadline.remaining() {
             None => match rx.recv() {
-                Ok(chunk) => absorb(chunk, &mut bytes)?,
+                Ok(chunk) => absorb(chunk, &mut bytes, stream)?,
                 Err(_) => return Ok((bytes, true)), // the sender dropped
             },
             Some(Duration::ZERO) => {
@@ -360,12 +389,12 @@ fn collect(rx: impl ChunkSource, deadline: Deadline) -> std::io::Result<(Vec<u8>
                     let chunk = rx
                         .try_recv()
                         .expect("snapshotted length guarantees this chunk is queued");
-                    absorb(chunk, &mut bytes)?;
+                    absorb(chunk, &mut bytes, stream)?;
                 }
                 return Ok((bytes, false));
             }
             Some(remaining) => match rx.recv_timeout(remaining) {
-                Ok(chunk) => absorb(chunk, &mut bytes)?,
+                Ok(chunk) => absorb(chunk, &mut bytes, stream)?,
                 Err(RecvTimeoutError::Disconnected) => return Ok((bytes, true)),
                 Err(RecvTimeoutError::Timeout) => {} // re-check: the deadline has now expired
             },
@@ -373,11 +402,12 @@ fn collect(rx: impl ChunkSource, deadline: Deadline) -> std::io::Result<(Vec<u8>
     }
 }
 
-/// The only stream read as it is written is stderr, so a reader's failure is named as its.
-fn absorb(chunk: Chunk, bytes: &mut Vec<u8>) -> std::io::Result<()> {
+/// A reader's failure names its `stream`: "a reader failed" and "the stderr reader failed" are
+/// different diagnostics.
+fn absorb(chunk: Chunk, bytes: &mut Vec<u8>, stream: &str) -> std::io::Result<()> {
     match chunk {
         Chunk::Bytes(chunk) => bytes.extend_from_slice(&chunk),
-        Chunk::Failed(e) => return Err(std::io::Error::new(e.kind(), format!("stderr: {e}"))),
+        Chunk::Failed(e) => return Err(std::io::Error::new(e.kind(), format!("{stream}: {e}"))),
     }
     Ok(())
 }

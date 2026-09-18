@@ -130,10 +130,9 @@ impl Listener {
 pub(crate) struct Needs {
     /// One per [`super::Role::Request`].
     pub reapers: usize,
-    /// One per [`super::Role::AnnouncedRequest`].
+    /// Two per [`super::Role::AnnouncedRequest`], one for each stream.
     pub listeners: usize,
-    /// One per stream written to a file: both of a child's, but only stdout under
-    /// [`super::Role::AnnouncedRequest`].
+    /// Two per [`super::Role::Query`] or [`super::Role::Request`], one for each stream.
     pub files: usize,
 }
 

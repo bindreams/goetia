@@ -262,8 +262,8 @@ impl ServiceManager for Systemd {
     }
 
     /// Makes ready now what each start or stop in `steps` needs to watch its one `systemctl` under
-    /// `budget`: a thread to read the stderr it announces its job on, and a temp file for its
-    /// stdout. `install` runs no watched `systemctl`, and a budget that does not wait, or never
+    /// `budget`: a thread for each of its two streams, the stderr it announces its job on and its
+    /// stdout — never a temp file. `install` runs no watched `systemctl`, and a budget that does not wait, or never
     /// stops waiting, watches none. While it is held, the steps also share one version gate — see
     /// `systemctl::GateScope`.
     fn prepare(&self, steps: &[Step], budget: Budget) -> Result<Prepared> {
@@ -272,13 +272,12 @@ impl ServiceManager for Systemd {
             .filter(|step| matches!(step, Step::Start | Step::Stop) && systemctl::watched(budget))
             .count();
         let spares = bounded::spare(bounded::Needs {
-            listeners: watched,
-            files: watched,
+            listeners: 2 * watched,
             ..bounded::Needs::default()
         })
         .map_err(|e| {
             Error::Other(format!(
-                "no thread or file could be made to watch a `systemctl` request, so none was sent: {e}"
+                "no thread could be made to watch a `systemctl` request, so none was sent: {e}"
             ))
         })?;
         Ok(Prepared::holding((spares, gate_scope())))

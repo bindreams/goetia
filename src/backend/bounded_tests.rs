@@ -375,15 +375,21 @@ fn marks(marker: &std::path::Path) -> cosca::Command {
 fn a_child_whose_output_nothing_could_take_is_never_run() {
     type Allowance = fn() -> test_hook::Allowance;
     type Case = (&'static str, fn() -> Role, Allowance, &'static str);
-    let cases: [Case; 5] = [
+    let cases: [Case; 6] = [
         ("query stdout", || Role::Query, || test_hook::temp_files(0), "temp file"),
         ("query stderr", || Role::Query, || test_hook::temp_files(1), "temp file"),
         ("request stdout", request, || test_hook::temp_files(0), "temp file"),
         ("request stderr", request, || test_hook::temp_files(1), "temp file"),
         (
-            "announced stderr",
+            "announced stdout",
             || Role::AnnouncedRequest(announced),
             || test_hook::threads(0),
+            "thread",
+        ),
+        (
+            "announced stderr",
+            || Role::AnnouncedRequest(announced),
+            || test_hook::threads(1),
             "thread",
         ),
     ];
@@ -401,13 +407,28 @@ fn a_child_whose_output_nothing_could_take_is_never_run() {
         assert_eq!(test_hook::spawns(), spawns, "{case}: the child was spawned");
         assert!(!marker.exists(), "{case}: the child ran");
     }
-    let dir = tempfile::tempdir().unwrap();
-    let marker = dir.path().join("request");
+}
+
+/// An announced request — `systemctl` — makes no temp file at all: it runs where none may be
+/// writable, a chroot or an image build.
+#[skuld::test]
+fn an_announced_request_needs_no_temp_file() {
     let _no_file = test_hook::temp_files(0);
-    let spawns = test_hook::spawns();
-    assert!(spawn(&mut marks(&marker), Role::AnnouncedRequest(announced)).is_err());
-    assert_eq!(test_hook::spawns(), spawns, "announced stdout: the child was spawned");
-    assert!(!marker.exists(), "announced stdout: the child ran");
+    let finished = wait_bounded(
+        spawned(
+            sh("echo out; echo 'request issued' >&2"),
+            Role::AnnouncedRequest(announced),
+        ),
+        Budget::Unbounded.start(),
+    );
+    match finished {
+        Ok(Finished::Exited { capture, .. }) => {
+            assert_eq!(capture.stdout, b"out\n");
+            assert_eq!(capture.stderr, b"request issued\n");
+            assert!(capture.complete);
+        }
+        other => panic!("expected Exited, got {other:?}"),
+    }
 }
 
 fn request() -> Role {
@@ -418,8 +439,8 @@ fn request() -> Role {
 #[skuld::test]
 fn a_child_takes_its_output_from_the_spares() {
     let spares = spare(Needs {
-        listeners: 1,
-        files: 3,
+        listeners: 2,
+        files: 2,
         ..Needs::default()
     })
     .unwrap();
@@ -630,7 +651,7 @@ fn collect_turns_a_reader_failure_into_an_error() {
     tx.send(Chunk::Failed(io::Error::from(ErrorKind::BrokenPipe))).unwrap();
     drop(tx);
 
-    let e = collect(rx, Budget::Unbounded.start()).unwrap_err();
+    let e = collect(rx, Budget::Unbounded.start(), "stderr").unwrap_err();
     assert!(
         e.to_string().starts_with("stderr: "),
         "the failing stream is named: {e}"
@@ -644,7 +665,7 @@ fn collect_keeps_what_already_arrived_when_the_deadline_expires() {
     // `tx` kept alive deliberately: nothing but the deadline can end this
     // collect, pinning the "expiry, not disconnect" path without a real
     // child.
-    let (bytes, complete) = collect(rx, Budget::Immediate.start()).unwrap();
+    let (bytes, complete) = collect(rx, Budget::Immediate.start(), "stderr").unwrap();
     assert_eq!(bytes, b"partial");
     assert!(!complete);
     drop(tx);
@@ -656,7 +677,7 @@ fn a_complete_drain_reports_complete() {
     tx.send(Chunk::Bytes(b"all of it".to_vec())).unwrap();
     drop(tx);
 
-    let (bytes, complete) = collect(rx, Budget::Unbounded.start()).unwrap();
+    let (bytes, complete) = collect(rx, Budget::Unbounded.start(), "stderr").unwrap();
     assert_eq!(bytes, b"all of it");
     assert!(complete);
 }
@@ -688,7 +709,7 @@ impl ChunkSource for Bottomless {
 #[skuld::test]
 fn collect_stops_at_the_deadline_even_while_a_reader_keeps_producing() {
     // A `collect` that drains until the channel is empty never returns here.
-    let (bytes, complete) = collect(Bottomless, Budget::Immediate.start()).unwrap();
+    let (bytes, complete) = collect(Bottomless, Budget::Immediate.start(), "stderr").unwrap();
     assert_eq!(bytes, b"x".repeat(QUEUED), "exactly the chunks queued at expiry");
     assert!(!complete);
 }
