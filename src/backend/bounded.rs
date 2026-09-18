@@ -155,17 +155,45 @@ impl Ready {
     }
 }
 
+/// How a [`spawn`] failed: whether the child may have run, which for a request is whether it may
+/// have reached the manager.
+#[derive(Debug)]
+pub(crate) enum SpawnError {
+    /// Before the child ran: nothing it would have sent was sent.
+    NotRun(cosca::error::Error),
+    /// Perhaps after it ran — see [`may_have_run`].
+    MayHaveRun(cosca::error::Error),
+}
+
+impl std::fmt::Display for SpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpawnError::NotRun(e) | SpawnError::MayHaveRun(e) => e.fmt(f),
+        }
+    }
+}
+
 /// Spawn `cmd` under `role`, having first made everything its output needs: a temp file for each
 /// stream — or, for a [`Role::AnnouncedRequest`], a thread to read each as it is written, since it
 /// announces on stderr and must not depend on a writable temp directory. A failure to make one is
-/// an `Err` with nothing spawned, and says so. A [`Role::Request`] brings its [`Reaper`], made
-/// before the caller sent anything — see [`reapers`].
-pub(crate) fn spawn(cmd: &mut cosca::Command, role: Role) -> Result<Spawned, cosca::error::Error> {
-    let stdout = Ready::for_role(&role)?;
-    let stderr = Ready::for_role(&role)?;
-    cmd.stdout(stdout.stdio()?)?;
-    cmd.stderr(stderr.stdio()?)?;
-    let mut child = start(cmd)?;
+/// [`SpawnError::NotRun`], and says so. A [`Role::Request`] brings its [`Reaper`], made before the
+/// caller sent anything — see [`reapers`].
+pub(crate) fn spawn(cmd: &mut cosca::Command, role: Role) -> Result<Spawned, SpawnError> {
+    let prepared = (|| {
+        let stdout = Ready::for_role(&role)?;
+        let stderr = Ready::for_role(&role)?;
+        cmd.stdout(stdout.stdio()?)?;
+        cmd.stderr(stderr.stdio()?)?;
+        Ok((stdout, stderr))
+    })();
+    let (stdout, stderr) = prepared.map_err(SpawnError::NotRun)?;
+    let mut child = start(cmd).map_err(|e| {
+        if may_have_run(&e) {
+            SpawnError::MayHaveRun(e)
+        } else {
+            SpawnError::NotRun(e)
+        }
+    })?;
     let (out, err) = (child.stdout(), child.stderr());
     Ok(Spawned {
         child,
@@ -179,8 +207,29 @@ pub(crate) fn spawn(cmd: &mut cosca::Command, role: Role) -> Result<Spawned, cos
 /// needs.
 fn start(cmd: &mut cosca::Command) -> Result<cosca::Child, cosca::error::Error> {
     #[cfg(test)]
-    test_hook::spawning();
+    if let Some(e) = test_hook::spawning() {
+        return Err(e);
+    }
     cmd.spawn()
+}
+
+/// Whether a failed `cosca::Command::spawn` may have run the child, as cosca 0.4.0's
+/// `spawn_unelevated` (`src/child/spawn.rs`) fails. Before `exec`: stdio pipes, dups and
+/// `/dev/null`, and `fork` and `exec` themselves, every one an [`std::io::Error`] carrying its OS
+/// error. After `exec`, with the child already running what it was asked to: the identity read —
+/// [`cosca::error::Error::Unassessable`], or an `Io` "vanished" carrying none — and
+/// `SharedChild::new`'s `waitpid(WNOHANG)`, whose `ECHILD` or `EINVAL` carry one. So only an `Io`
+/// with an OS error `waitpid` cannot give is placed before the child ran; everything else may have
+/// run it, conservatively — `exec` too can fail with `EINVAL`, and cosca's other variants
+/// (`Containment` from the attach, and from the `prepare` before the spawn alike) are not placed at
+/// all.
+fn may_have_run(e: &cosca::error::Error) -> bool {
+    match e {
+        cosca::error::Error::Io(io) => !io
+            .raw_os_error()
+            .is_some_and(|n| n != libc::ECHILD && n != libc::EINVAL),
+        _ => true,
+    }
 }
 
 /// The failure to make `what` before a spawn, which is therefore never attempted.
@@ -203,6 +252,10 @@ pub(crate) fn wait_bounded(spawned: Spawned, deadline: Deadline) -> Result<Finis
         stdout,
         stderr,
     } = spawned;
+    #[cfg(test)]
+    if let Some(e) = test_hook::waiting() {
+        return Err(e);
+    }
 
     // Unbounded, deliberately: this is the request going out, not the wait for its answer. A child
     // that ends without announcing ends here too, once its stderr reaches EOF.

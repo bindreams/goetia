@@ -97,6 +97,8 @@ struct Store {
     start_stalls: BTreeSet<String>,
     /// [`Fake::seed_stop_stalls`]'s mirror of `start_stalls`.
     stop_stalls: BTreeSet<String>,
+    /// Ids whose start request ends in doubt — see [`Fake::seed_start_in_doubt`].
+    start_in_doubt: BTreeSet<String>,
     /// Whether this Fake has a request-only restart — see
     /// [`Fake::seed_native_restart`].
     native_restart: bool,
@@ -369,6 +371,15 @@ impl Fake {
         state.start_stalls.insert(id.to_string());
     }
 
+    /// Test-only seeding: every start of `id` — `start` and
+    /// `request_start_after_stop` alike — fails as a real backend's does when
+    /// the tool carrying the request had started and was then lost:
+    /// [`Error::RequestInDoubt`], changing nothing here.
+    pub fn seed_start_in_doubt(&self, id: &str) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.start_in_doubt.insert(id.to_string());
+    }
+
     /// [`Fake::seed_start_stalls`]'s mirror for `stop`.
     pub fn seed_stop_stalls(&self, id: &str) {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
@@ -533,6 +544,17 @@ fn discover(state: &Store, id: &str) -> (Ownership, Option<String>) {
     (found, existing.map(|e| e.text))
 }
 
+/// [`Fake::seed_start_in_doubt`]'s failure, for a start of `id`.
+fn in_doubt(state: &Store, id: &Id) -> Result<()> {
+    if state.start_in_doubt.contains(id.as_str()) {
+        return Err(Error::RequestInDoubt {
+            request: format!("fake start {id}"),
+            detail: "lost after it started (seeded)".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// What [`Fake`]'s `prepare` holds: its steps stay live until this drops.
 struct Held {
     store: Arc<Mutex<Store>>,
@@ -654,6 +676,7 @@ impl ServiceManager for Fake {
         // whether it succeeded or changed anything.
         state.calls.push(("start", id.as_str().to_string()));
         state.asked("start", id);
+        in_doubt(&state, id)?;
         let stalls = state.start_stalls.contains(id.as_str());
         let entry = state.get_mut(id)?;
         require_ours(entry, id)?;
@@ -709,6 +732,7 @@ impl ServiceManager for Fake {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.calls.push(("start", id.as_str().to_string()));
         state.asked("start", id);
+        in_doubt(&state, id)?;
         let entry = state.get_mut(id)?;
         require_ours(entry, id)?;
         if entry.state == State::Running {

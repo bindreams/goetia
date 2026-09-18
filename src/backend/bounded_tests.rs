@@ -435,6 +435,70 @@ fn request() -> Role {
     Role::Request(Reaper::with(cosca::Child::wait, |_| {}).unwrap())
 }
 
+/// A spawn that failed is placed before the child ran only when cosca's error says so: an `Io`
+/// carrying an OS error from a pipe, `fork` or `exec`. Everything else — cosca's identity read and
+/// `SharedChild::new` after `exec`, and the variants it raises on both sides of it — may have run
+/// the child, and so may have sent its request. Injected, so nothing runs.
+#[skuld::test]
+fn a_failed_spawn_is_not_run_only_on_evidence() {
+    type Case = (&'static str, fn() -> cosca::error::Error, bool);
+    let cases: [Case; 8] = [
+        (
+            "fork: EAGAIN",
+            || io::Error::from_raw_os_error(libc::EAGAIN).into(),
+            false,
+        ),
+        (
+            "exec: ENOENT",
+            || io::Error::from_raw_os_error(libc::ENOENT).into(),
+            false,
+        ),
+        (
+            "pipe: EMFILE",
+            || io::Error::from_raw_os_error(libc::EMFILE).into(),
+            false,
+        ),
+        (
+            "SharedChild::new: ECHILD",
+            || io::Error::from_raw_os_error(libc::ECHILD).into(),
+            true,
+        ),
+        (
+            "SharedChild::new or exec: EINVAL",
+            || io::Error::from_raw_os_error(libc::EINVAL).into(),
+            true,
+        ),
+        (
+            "identity: vanished",
+            || io::Error::other("spawned child vanished before its identity could be read").into(),
+            true,
+        ),
+        (
+            "identity: refused",
+            || cosca::error::Error::Unassessable {
+                detail: "the OS refused to report the spawned child's identity".into(),
+                source: None,
+            },
+            true,
+        ),
+        (
+            "attach",
+            || cosca::error::Error::Containment {
+                detail: "forced".into(),
+            },
+            true,
+        ),
+    ];
+    for (case, error, may_have_run) in cases {
+        test_hook::spawn_fails(error);
+        match spawn(&mut sh("true"), Role::Query) {
+            Err(SpawnError::MayHaveRun(_)) => assert!(may_have_run, "{case}: placed after exec"),
+            Err(SpawnError::NotRun(_)) => assert!(!may_have_run, "{case}: placed before exec"),
+            Ok(_) => panic!("{case}: the injected failure was not returned"),
+        }
+    }
+}
+
 /// A sequence's spares are what its children's output is given, so nothing need be made for them.
 #[skuld::test]
 fn a_child_takes_its_output_from_the_spares() {

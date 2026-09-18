@@ -263,6 +263,27 @@ pub(crate) mod test_hook {
         static THREADS: Cell<Option<usize>> = const { Cell::new(None) };
         static TEMP_FILES: Cell<Option<usize>> = const { Cell::new(None) };
         static SPAWNS: Cell<usize> = const { Cell::new(0) };
+        static SPAWN_FAILS: std::cell::RefCell<Option<fn() -> cosca::error::Error>> =
+            const { std::cell::RefCell::new(None) };
+        static WAIT_FAILS: std::cell::RefCell<Option<fn() -> cosca::error::Error>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Make this thread's next wait on a spawned child fail with `error()`, the child already
+    /// running.
+    pub(crate) fn wait_fails(error: fn() -> cosca::error::Error) {
+        WAIT_FAILS.set(Some(error));
+    }
+
+    /// The failure [`wait_fails`] set up for this wait, if any.
+    pub(in crate::backend::bounded) fn waiting() -> Option<cosca::error::Error> {
+        WAIT_FAILS.take().map(|error| error())
+    }
+
+    /// Make this thread's next spawn fail with `error()` instead of running anything, as cosca's
+    /// would.
+    pub(crate) fn spawn_fails(error: fn() -> cosca::error::Error) {
+        SPAWN_FAILS.set(Some(error));
     }
 
     /// How many children this thread has spawned through [`super::super::spawn`], or tried to.
@@ -270,8 +291,10 @@ pub(crate) mod test_hook {
         SPAWNS.get()
     }
 
-    pub(in crate::backend::bounded) fn spawning() {
+    /// Count a spawn, and hand back the failure [`spawn_fails`] set up for it, if any.
+    pub(in crate::backend::bounded) fn spawning() -> Option<cosca::error::Error> {
         SPAWNS.set(SPAWNS.get() + 1);
+        SPAWN_FAILS.take().map(|error| error())
     }
 
     fn allowance(kind: Kind) -> &'static std::thread::LocalKey<Cell<Option<usize>>> {

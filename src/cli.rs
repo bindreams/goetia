@@ -142,7 +142,7 @@ pub enum DaemonCommand {
 ///   own: one `Create` plus one `Conflict` returns `5`, not `3`, since `5`
 ///   outranks `3` in the precedence rule below.
 /// - `4` indeterminate: a question Goetia could not answer about an id.
-///   Two classes, by what was established — three variants between them:
+///   Two classes, by what was established:
 ///   an id Goetia owns whose *state* it could not determine, or
 ///   — [`Error::Undetermined`](crate::error::Error::Undetermined) — an id
 ///   where the read that would have said whether anything is installed at
@@ -157,7 +157,9 @@ pub enum DaemonCommand {
 ///   message says so.
 ///   [`Error::Unestablished`](crate::error::Error::Unestablished) joins it
 ///   there, for `restart` under a budget that does not wait — an unconfirmed
-///   stop followed by a refused start. Reporting the first as `1` would
+///   stop followed by a refused start — and so does
+///   [`Error::RequestInDoubt`](crate::error::Error::RequestInDoubt), for a
+///   request whose tool had started when goetia lost track of it. Reporting the first as `1` would
 ///   claim the operation determinately failed, which it did not establish;
 ///   reporting the second as `1` would make the refusal the whole answer,
 ///   when the unconfirmed stop before it leaves where the daemon ended up
@@ -171,14 +173,14 @@ pub enum DaemonCommand {
 ///   kind-to-code map. `diff` returns it for `Outcome::RefuseUnreadable`
 ///   and for `Error::Undetermined` (`cli::diff::run`); `install` returns it
 ///   for `Error::Undetermined` from `mgr.install`/`enable`/`start`, and for
-///   `Error::WaitTimeout` from `--start`'s `mgr.start`, so the two verbs
+///   `Error::WaitTimeout` and `Error::RequestInDoubt` from its steps, so the two verbs
 ///   agree about `Undetermined` and disagree only about
 ///   `Outcome::RefuseUnreadable`, which `install` reports as `1` because it
 ///   genuinely failed to install. All six id verbs return it through
 ///   `support::run_id_verb`, for three conditions: `Undetermined`, where
 ///   goetia could not determine what is at the id, and — from the verbs that
-///   act — `WaitTimeout` and `Unestablished`, where it acted and could not
-///   determine the outcome.
+///   act — `WaitTimeout`, `Unestablished` and `RequestInDoubt`, where it
+///   acted, or may have, and could not determine the outcome.
 ///   `show` returns it too (`cli::show::run`), in both its per-id and
 ///   no-ids forms — for an "installed but unreadable" id, for an id
 ///   `list()` reported as undetermined, and for *any* id it cannot find

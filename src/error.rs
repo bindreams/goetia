@@ -162,6 +162,22 @@ pub enum Error {
     #[error("`{id}` was not restarted, and where it ended up is not established: {detail}")]
     Unestablished { id: String, detail: String },
 
+    /// A request that may or may not have reached the service manager: the
+    /// tool carrying it — `systemctl`, `launchctl` — had started when goetia
+    /// lost track of it, so whatever it sends may already be sent. `request`
+    /// is the tool's command line.
+    ///
+    /// What it does **not** claim, which separates it from its neighbours: not
+    /// that nothing was sent, as a plain failure would; not that it was sent,
+    /// as [`WaitTimeout`](Error::WaitTimeout) does; and not that what is
+    /// installed at the id is in doubt, as [`Undetermined`](Error::Undetermined)
+    /// does. A failure goetia can place before the tool ran is never this.
+    ///
+    /// Exit `4` (indeterminate), like the three above: whether the manager
+    /// acted is the question, and it was not answered.
+    #[error("`{request}` failed after it started, so it may or may not have reached the service manager: {detail}")]
+    RequestInDoubt { request: String, detail: String },
+
     /// A mutating CLI subcommand was invoked without the elevation
     /// (root/Administrator) it requires. Never returned for `list`,
     /// `status`, `show`, `diff`, or `install --dry-run`, none of which

@@ -761,18 +761,35 @@ struct Ran {
 /// `Ok(None)` iff the deadline expired first. For a request that is not a
 /// failure of the command — the request is out, or on its way in a
 /// `launchctl` goetia left running — and what it means differs per verb, so
-/// the verb decides rather than this function. A failure to make what the
-/// call needs, to spawn it or to wait on it arrives as a
-/// `cosca::error::Error`, and is rendered into [`Error::CommandFailed`]; the
-/// first says it was not run.
+/// the verb decides rather than this function. A failure before `launchctl`
+/// ran is [`Error::CommandFailed`], and says it was not run. One after it may
+/// have — cosca failing past `exec`, or the wait failing — is the same for a
+/// read, and [`Error::RequestInDoubt`] for a request, which may have reached
+/// launchd.
 fn launchctl(args: &[&str], deadline: Deadline, role: Role) -> Result<Option<Ran>> {
     let failed = |e: cosca::error::Error| Error::CommandFailed {
         command: format!("launchctl {}", args.join(" ")),
         stderr: e.to_string(),
     };
+    // A request whose `launchctl` may have started is in doubt, not failed: it may have reached
+    // launchd. A read changes nothing either way.
+    let request = matches!(role, Role::Request(_));
+    let in_doubt = |e: cosca::error::Error| {
+        if request {
+            Error::RequestInDoubt {
+                request: format!("launchctl {}", args.join(" ")),
+                detail: e.to_string(),
+            }
+        } else {
+            failed(e)
+        }
+    };
     let mut cmd = bounded::command("launchctl", args).map_err(failed)?;
-    let spawned = bounded::spawn(&mut cmd, role).map_err(failed)?;
-    Ok(match bounded::wait_bounded(spawned, deadline).map_err(failed)? {
+    let spawned = bounded::spawn(&mut cmd, role).map_err(|e| match e {
+        bounded::SpawnError::NotRun(e) => failed(e),
+        bounded::SpawnError::MayHaveRun(e) => in_doubt(e),
+    })?;
+    Ok(match bounded::wait_bounded(spawned, deadline).map_err(in_doubt)? {
         bounded::Finished::Exited { status, capture } => Some(Ran { status, capture }),
         bounded::Finished::Expired => None,
     })

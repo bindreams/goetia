@@ -455,8 +455,7 @@ fn prepared_steps_need_nothing_made_later() {
                     &mut bounded::command("/bin/true", &[]).unwrap(),
                     bounded::Role::AnnouncedRequest(|_| true),
                 )
-                .and_then(|spawned| bounded::wait_bounded(spawned, Budget::Unbounded.start()))
-                .is_ok()
+                .is_ok_and(|spawned| bounded::wait_bounded(spawned, Budget::Unbounded.start()).is_ok())
             })
             .count()
     };

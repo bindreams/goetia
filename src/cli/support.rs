@@ -348,6 +348,13 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
                 let _ = writeln!(err, "error: {id}: {e}");
                 codes.push(4);
             }
+            // A request that may or may not have reached the manager. The same class once more:
+            // the tool carrying it had started, so `1` — which says nothing happened — is the one
+            // answer that is not established.
+            Err(e @ Error::RequestInDoubt { .. }) => {
+                let _ = writeln!(err, "error: {id}: {e}");
+                codes.push(4);
+            }
             Err(e) => {
                 let _ = writeln!(err, "error: {id}: {e}");
                 codes.push(1);

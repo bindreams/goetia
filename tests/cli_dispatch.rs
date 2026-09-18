@@ -3202,6 +3202,42 @@ fn a_restart_that_waits_never_takes_the_request_only_restart() {
     );
 }
 
+/// A start that may or may not have reached the manager is indeterminate — exit `4`, never the `1`
+/// that says nothing happened — through every verb that starts: `start`, `install --start`, and
+/// `restart`'s start leg under a budget that waits and one that does not, where the stop before it
+/// is disclosed as the leg left it.
+#[skuld::test]
+fn a_start_in_doubt_exits_4_through_every_verb_that_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let manifest = manifest.to_str().unwrap();
+    for (args, disclosed) in [
+        (&["goetia", "daemon", "start", "frpc"][..], ""),
+        (&["goetia", "daemon", "install", "--file", manifest, "--start"], ""),
+        (
+            &["goetia", "daemon", "restart", "frpc"],
+            "stopped but failed to restart",
+        ),
+        (
+            &["goetia", "daemon", "restart", "frpc", "--timeout", "0"],
+            "the stop was issued without waiting for it",
+        ),
+    ] {
+        let fake = Fake::new();
+        fake.install(&mk("frpc"), false).unwrap();
+        fake.seed_start_in_doubt("frpc");
+
+        let (code, out, err) = dispatch_elevated(args, &fake);
+
+        assert_eq!(code, 4, "{args:?}\nstdout:\n{out}\nstderr:\n{err}");
+        assert!(
+            err.contains("may or may not have reached the service manager"),
+            "{args:?}: {err}"
+        );
+        assert!(err.contains(disclosed), "{args:?}: {err}");
+    }
+}
+
 /// `restart` makes ready what both legs need before the stop is sent: when that fails, nothing was
 /// sent — exit `1`, with neither leg issued and the daemon untouched.
 #[skuld::test]

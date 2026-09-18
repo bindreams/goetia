@@ -696,3 +696,34 @@ fn prepared_steps_need_nothing_made_later() {
         drop(prepared);
     }
 }
+
+// A request in doubt ==================================================================================================
+
+/// A `launchctl` request that may have started before goetia lost it — cosca failing past `exec`,
+/// or the wait failing — may have reached launchd: [`Error::RequestInDoubt`], exit `4`. A read
+/// changes nothing, so the same failure there is a plain one. A failure placed before the spawn is a
+/// plain one for both. Injected, so no `launchctl` runs.
+#[skuld::test]
+fn a_launchctl_request_that_may_have_run_is_in_doubt() {
+    let args = ["bootout", "system/goetia-reaper-probe-never-installed"];
+    let deadline = Budget::Unbounded.start();
+    let request = || Role::Request(bounded::reapers::<1>().unwrap().into_iter().next().unwrap());
+    type Inject = fn(fn() -> cosca::error::Error);
+    let after_exec: [Inject; 2] = [bounded::test_hook::spawn_fails, bounded::test_hook::wait_fails];
+    for inject in after_exec {
+        inject(|| cosca::error::Error::Containment {
+            detail: "forced".into(),
+        });
+        let e = launchctl(&args, deadline, request()).err().expect("injected");
+        assert!(matches!(e, Error::RequestInDoubt { .. }), "{e:?}");
+
+        inject(|| cosca::error::Error::Containment {
+            detail: "forced".into(),
+        });
+        let e = launchctl(&args, deadline, Role::Query).err().expect("injected");
+        assert!(matches!(e, Error::CommandFailed { .. }), "{e:?}");
+    }
+    bounded::test_hook::spawn_fails(|| io::Error::from_raw_os_error(libc::EAGAIN).into());
+    let e = launchctl(&args, deadline, request()).err().expect("injected");
+    assert!(matches!(e, Error::CommandFailed { .. }), "{e:?}");
+}

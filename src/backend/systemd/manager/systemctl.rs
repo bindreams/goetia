@@ -11,11 +11,47 @@ use crate::error::{Error, Result};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, State, Status};
 
+/// `systemctl <args>`, a request — `daemon-reload`, `enable`, `disable` — run to completion. See
+/// [`requested`] for what a failure to run it says.
 pub(super) fn run_systemctl(args: &[&str]) -> Result<std::process::Output> {
+    requested(Command::new("systemctl").args(args), "systemctl", args)
+}
+
+/// `systemctl <args>`, a read, run to completion: a failure is a plain one, since it changes nothing.
+fn query_systemctl(args: &[&str]) -> Result<std::process::Output> {
     Command::new("systemctl")
         .args(args)
         .output()
         .map_err(|e| Error::Other(format!("failed to run `systemctl {}`: {e}", args.join(" "))))
+}
+
+/// `cmd`, a request, run to completion, with its two ways to fail kept apart. std's `spawn` fails
+/// only before the program runs — `fork`, or an `exec` the child reports back — so that is a
+/// request never sent. Reading its output or waiting on it fails only after, when the request may
+/// already be out: [`Error::RequestInDoubt`], never the plain failure that says nothing happened.
+/// `Command::output()` would merge the two; its stdin, `/dev/null`, is kept.
+fn requested(cmd: &mut Command, program: &str, args: &[&str]) -> Result<std::process::Output> {
+    requested_with(cmd, program, args, std::process::Child::wait_with_output)
+}
+
+/// [`requested`], with how the running child is waited on named, so a test can make that fail.
+fn requested_with(
+    cmd: &mut Command,
+    program: &str,
+    args: &[&str],
+    wait: impl FnOnce(std::process::Child) -> std::io::Result<std::process::Output>,
+) -> Result<std::process::Output> {
+    let request = format!("{program} {}", args.join(" "));
+    let child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| Error::Other(format!("could not run `{request}`, so it was not sent: {e}")))?;
+    wait(child).map_err(|e| Error::RequestInDoubt {
+        request,
+        detail: e.to_string(),
+    })
 }
 
 pub(super) fn daemon_reload() -> Result<()> {
@@ -368,12 +404,12 @@ pub(super) fn watched(budget: Budget) -> bool {
 /// that cannot exit on its own.
 fn run_verb_via(program: &str, args: &[&str], budget: Budget, deadline: Deadline) -> Result<Finished> {
     let failed = |e: String| Error::Other(format!("failed to run `{program} {}`: {e}", args.join(" ")));
+    let in_doubt = |e: String| Error::RequestInDoubt {
+        request: format!("{program} {}", args.join(" ")),
+        detail: e,
+    };
     if !watched(budget) {
-        let output = Command::new(program)
-            .args(args)
-            .envs(AUDIBLE)
-            .output()
-            .map_err(|e| failed(e.to_string()))?;
+        let output = requested(Command::new(program).args(args).envs(AUDIBLE), program, args)?;
         // `output()` reads both pipes to EOF before returning, so on either
         // unbounded path nothing was cut short and `complete` is simply true.
         return Ok(Finished::Exited {
@@ -390,8 +426,12 @@ fn run_verb_via(program: &str, args: &[&str], budget: Budget, deadline: Deadline
     for (key, value) in AUDIBLE {
         cmd.env(key, value);
     }
-    let spawned = bounded::spawn(&mut cmd, Role::AnnouncedRequest(enqueued)).map_err(|e| failed(e.to_string()))?;
-    bounded::wait_bounded(spawned, deadline).map_err(|e| failed(e.to_string()))
+    let spawned = bounded::spawn(&mut cmd, Role::AnnouncedRequest(enqueued)).map_err(|e| match e {
+        bounded::SpawnError::NotRun(e) => failed(e.to_string()),
+        bounded::SpawnError::MayHaveRun(e) => in_doubt(e.to_string()),
+    })?;
+    // Past the spawn, `systemctl` is running, and a failure to watch it leaves its request in doubt.
+    bounded::wait_bounded(spawned, deadline).map_err(|e| in_doubt(e.to_string()))
 }
 
 /// Whether `line` is one `systemctl` writes on success as much as on failure — the transaction
@@ -521,7 +561,7 @@ pub(super) fn request_restart_impl(id: &str) -> Result<()> {
 
 fn show_properties(unit: &str, props: &[&str]) -> Result<BTreeMap<String, String>> {
     let joined = props.join(",");
-    let output = run_systemctl(&["show", "--property", &joined, unit])?;
+    let output = query_systemctl(&["show", "--property", &joined, unit])?;
     if !output.status.success() {
         return Err(Error::Other(format!(
             "systemctl show {unit} failed: {}",

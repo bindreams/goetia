@@ -240,6 +240,12 @@ fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
             reason: format!("{}: {reason}", after_stop_clause(budget)),
             recovery,
         },
+        // The start may or may not have reached the manager: kept as it is,
+        // ahead of the non-waiting arm below, whose "refused" it was not.
+        Error::RequestInDoubt { request, detail } => Error::RequestInDoubt {
+            request,
+            detail: format!("{}: {detail}", after_stop_clause(budget)),
+        },
         // The stop was issued and not waited for, and the start that
         // followed was refused — determinately (a launchd `bootstrap` that
         // fails outright) or not (SCM's `ERROR_SERVICE_ALREADY_RUNNING` over a

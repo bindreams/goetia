@@ -227,6 +227,69 @@ fn a_request_nothing_could_watch_is_never_sent() {
     }
 }
 
+/// A watched `systemctl` whose spawn failed after it may have run is a request in doubt — exit `4`,
+/// saying it may or may not have reached systemd — and one that failed before it ran is a plain
+/// failure, which says it was not. Injected, so nothing runs.
+#[skuld::test]
+fn a_watched_request_that_may_have_run_is_in_doubt() {
+    let spawn = || {
+        run_verb_via(
+            "/bin/true",
+            &[],
+            Budget::Bounded(Duration::from_secs(10)),
+            Budget::Unbounded.start(),
+        )
+    };
+    bounded::test_hook::spawn_fails(|| cosca::error::Error::Containment {
+        detail: "forced".into(),
+    });
+    let e = spawn().expect_err("injected");
+    assert!(matches!(e, Error::RequestInDoubt { .. }), "{e:?}");
+    assert!(
+        e.to_string()
+            .contains("may or may not have reached the service manager"),
+        "{e}"
+    );
+
+    bounded::test_hook::spawn_fails(|| std::io::Error::from_raw_os_error(libc::EAGAIN).into());
+    let e = spawn().expect_err("injected");
+    assert!(matches!(e, Error::Other(_)), "{e:?}");
+
+    // Past the spawn `systemctl` runs, so a wait that fails leaves its request in doubt too.
+    bounded::test_hook::wait_fails(|| std::io::Error::other("the wait failed").into());
+    let e = spawn().expect_err("injected");
+    assert!(matches!(e, Error::RequestInDoubt { .. }), "{e:?}");
+}
+
+/// The paths std runs to completion keep the same two apart: a `spawn` that failed never ran the
+/// request, and a wait that failed after it did leaves it in doubt.
+#[skuld::test]
+fn a_request_run_to_completion_is_in_doubt_only_once_it_ran() {
+    let e = requested(
+        &mut Command::new("/nonexistent/systemctl"),
+        "systemctl",
+        &["enable", "x"],
+    )
+    .expect_err("no such program");
+    assert!(matches!(e, Error::Other(_)), "{e:?}");
+    assert!(e.to_string().contains("so it was not sent"), "{e}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let ran = dir.path().join("ran");
+    let e = requested_with(
+        Command::new("/bin/sh").args(["-c", "touch \"$0\"", ran.to_str().unwrap()]),
+        "systemctl",
+        &["enable", "x"],
+        |child| {
+            child.wait_with_output()?;
+            Err(std::io::Error::other("the wait failed"))
+        },
+    )
+    .expect_err("injected");
+    assert!(ran.exists(), "the request ran");
+    assert!(matches!(e, Error::RequestInDoubt { .. }), "{e:?}");
+}
+
 /// A watched `systemctl` needs no temp file: it runs where none may be writable — a chroot, or an
 /// image build.
 #[skuld::test]
