@@ -196,6 +196,38 @@ fn the_bounded_path_issues_the_request_on_a_spent_deadline() {
     );
 }
 
+/// A watched `systemctl` whose stderr no thread could read, or whose stdout no file could take, is
+/// never run: `Error::Other`, which every verb exits `1` for, and no request — never a panic, and
+/// never a request out with nothing to watch it.
+#[skuld::test]
+fn a_request_nothing_could_watch_is_never_sent() {
+    type Allowance = fn() -> bounded::test_hook::Allowance;
+    let shortfalls: [(Allowance, &str); 2] = [
+        (|| bounded::test_hook::threads(0), "no thread"),
+        (|| bounded::test_hook::temp_files(0), "no temp file"),
+    ];
+    for (allowance, what) in shortfalls {
+        let dir = tempfile::tempdir().unwrap();
+        let request = dir.path().join("request");
+        let _short = allowance();
+        let spawns = bounded::test_hook::spawns();
+
+        let e = run_verb_via(
+            "/bin/sh",
+            &["-c", ANNOUNCES_THEN_BLOCKS, request.to_str().unwrap()],
+            Budget::Bounded(Duration::from_secs(10)),
+            Budget::Immediate.start(),
+        )
+        .expect_err(what);
+
+        assert!(matches!(e, Error::Other(_)), "{what}: {e:?}");
+        assert!(e.to_string().contains(what), "{e}");
+        assert!(e.to_string().contains("so it was not run"), "{e}");
+        assert_eq!(bounded::test_hook::spawns(), spawns, "{what}: systemctl was spawned");
+        assert!(!request.exists(), "{what}: the request was sent");
+    }
+}
+
 /// An inherited `SYSTEMD_LOG_LEVEL=warning` or `SYSTEMD_LOG_TARGET=null` silences the announcement,
 /// so every path sets both. The stand-ins exit `9` unless they see exactly those values.
 const UNLESS_AUDIBLE_EXIT_9: &str =

@@ -1,22 +1,28 @@
 use std::io::{self, BufRead, ErrorKind, Read};
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use super::*;
 use crate::manager::budget::Budget;
 
-/// `child`, already spawned, under `role`.
-fn armed(child: cosca::Child, role: Role) -> Spawned {
-    Spawned { child, role }
+/// `cmd`, spawned under `role`.
+fn spawned(mut cmd: cosca::Command, role: Role) -> Spawned {
+    spawn(&mut cmd, role).unwrap()
+}
+
+/// `/bin/sh -c <script>`, as [`command`] builds it.
+fn sh(script: &str) -> cosca::Command {
+    command("/bin/sh", &["-c", script]).unwrap()
 }
 
 // wait_bounded, through `command` =====================================================================================
 
 #[skuld::test]
 fn a_child_that_exits_is_reported_with_its_output() {
-    let child = command("/bin/echo", &["hi"]).unwrap().spawn().unwrap();
-    let finished = wait_bounded(armed(child, Role::Query), Budget::Unbounded.start()).unwrap();
+    let child = spawned(command("/bin/echo", &["hi"]).unwrap(), Role::Query);
+    let finished = wait_bounded(child, Budget::Unbounded.start()).unwrap();
     match finished {
         Finished::Exited { status, capture } => {
             assert!(status.success());
@@ -29,11 +35,8 @@ fn a_child_that_exits_is_reported_with_its_output() {
 
 #[skuld::test]
 fn a_nonzero_exit_is_reported_not_an_error() {
-    let child = command("/bin/sh", &["-c", "echo boom >&2; exit 3"])
-        .unwrap()
-        .spawn()
-        .unwrap();
-    let finished = wait_bounded(armed(child, Role::Query), Budget::Unbounded.start()).unwrap();
+    let child = spawned(sh("echo boom >&2; exit 3"), Role::Query);
+    let finished = wait_bounded(child, Budget::Unbounded.start()).unwrap();
     match finished {
         Finished::Exited { status, capture } => {
             assert_eq!(status.code(), Some(3));
@@ -46,15 +49,15 @@ fn a_nonzero_exit_is_reported_not_an_error() {
 
 #[skuld::test]
 fn an_expired_deadline_kills_and_reaps_the_child() {
-    let child = command("sleep", &["2147483647"]).unwrap().spawn().unwrap();
-    let pid = child.id().pid();
+    let child = spawned(command("sleep", &["2147483647"]).unwrap(), Role::Query);
+    let pid = child.child.id().pid();
 
     // `sleep 2147483647` cannot exit on its own for 68 years, so the deadline
     // is provably the only way out and no budget value can make this flaky;
     // 50ms is chosen only to exercise a real block rather than the
     // already-expired path.
     let deadline = Budget::Bounded(Duration::from_millis(50)).start();
-    let finished = wait_bounded(armed(child, Role::Query), deadline).unwrap();
+    let finished = wait_bounded(child, deadline).unwrap();
     assert!(matches!(finished, Finished::Expired));
 
     // A zombie would still answer `kill(pid, 0)` successfully; `ESRCH` is
@@ -67,8 +70,8 @@ fn an_expired_deadline_kills_and_reaps_the_child() {
 
 #[skuld::test]
 fn an_already_expired_deadline_does_not_wait() {
-    let child = command("sleep", &["2147483647"]).unwrap().spawn().unwrap();
-    let finished = wait_bounded(armed(child, Role::Query), Budget::Immediate.start()).unwrap();
+    let child = spawned(command("sleep", &["2147483647"]).unwrap(), Role::Query);
+    let finished = wait_bounded(child, Budget::Immediate.start()).unwrap();
     assert!(matches!(finished, Finished::Expired));
 }
 
@@ -89,38 +92,39 @@ fn an_already_expired_deadline_does_not_wait() {
 /// `collect_keeps_what_already_arrived_when_the_deadline_expires`.
 #[skuld::test]
 fn an_expiry_with_output_in_flight_is_reported_as_expired() {
-    let child = command("/bin/sh", &["-c", "echo late; exec sleep 2147483647"])
-        .unwrap()
-        .spawn()
-        .unwrap();
+    let child = spawned(sh("echo late; echo late >&2; exec sleep 2147483647"), Role::Query);
     let deadline = Budget::Bounded(Duration::from_millis(50)).start();
-    let finished = wait_bounded(armed(child, Role::Query), deadline).unwrap();
+    let finished = wait_bounded(child, deadline).unwrap();
     assert!(matches!(finished, Finished::Expired), "{finished:?}");
 }
 
+/// The one stream read as it is written, stderr under [`Role::AnnouncedRequest`], held open by a
+/// descendant the kill cannot reach, still returns at the deadline.
 #[skuld::test]
 fn a_child_whose_descendant_holds_the_pipe_still_returns_on_expiry() {
     // Deliberately built WITHOUT `command()`'s containment: a contained
     // descendant is killed, which is the other test below. `exec` makes the
     // second `sleep` *be* the direct child, so the kill lands on it and not
-    // on `sh`; the backgrounded first `sleep` inherits stdout and is not
+    // on `sh`; the backgrounded first `sleep` inherits stderr and is not
     // killed, so its write end stays open for 68 years.
-    let mut cmd = cosca::run(["/bin/sh", "-c", "sleep 2147483647 & echo $! >&3; exec sleep 2147483647"]);
+    let mut cmd = cosca::run([
+        "/bin/sh",
+        "-c",
+        "sleep 2147483647 & echo $! >&3; echo 'request issued' >&2; exec sleep 2147483647",
+    ]);
     cmd.stdin(cosca::Stdio::null()).unwrap();
-    cmd.stdout(cosca::Stdio::pipe_out()).unwrap();
-    cmd.stderr(cosca::Stdio::pipe_out()).unwrap();
     cmd.fd(3, cosca::Stdio::pipe_out()).unwrap();
-    let mut child = cmd.spawn().unwrap();
+    let mut child = spawned(cmd, Role::AnnouncedRequest(announced));
 
     // A blocking read that ends when the shell writes, so the descendant's
     // pid is learned without racing the capture for it.
-    let fd3 = child.fd_read_end(3.into()).unwrap();
+    let fd3 = child.child.fd_read_end(3.into()).unwrap();
     let mut line = String::new();
     io::BufReader::new(fd3).read_line(&mut line).unwrap();
     let descendant: libc::pid_t = line.trim().parse().unwrap();
 
     let deadline = Budget::Bounded(Duration::from_millis(50)).start();
-    let finished = wait_bounded(armed(child, Role::Query), deadline).unwrap();
+    let finished = wait_bounded(child, deadline).unwrap();
     assert!(matches!(finished, Finished::Expired));
 
     // Leave nothing behind.
@@ -133,33 +137,26 @@ fn a_child_whose_descendant_holds_the_pipe_still_returns_on_expiry() {
 fn a_contained_childs_descendant_dies_with_it() {
     // Same script, same fd-3 handshake, but spawned through `bounded::command`
     // so the tree IS contained.
-    let mut cmd = command(
-        "/bin/sh",
-        &["-c", "sleep 2147483647 & echo $! >&3; exec sleep 2147483647"],
-    )
-    .unwrap();
+    let mut cmd = sh("sleep 2147483647 & echo $! >&3; exec sleep 2147483647");
     cmd.fd(3, cosca::Stdio::pipe_out()).unwrap();
-    let mut child = cmd.spawn().unwrap();
+    let mut child = spawned(cmd, Role::Query);
     #[cfg(target_os = "linux")]
-    let leaf = contained_leaf(child.id().pid());
+    let leaf = contained_leaf(child.child.id().pid());
 
-    let fd3 = child.fd_read_end(3.into()).unwrap();
+    let fd3 = child.child.fd_read_end(3.into()).unwrap();
     let mut line = String::new();
     io::BufReader::new(fd3).read_line(&mut line).unwrap();
     let descendant: u32 = line.trim().parse().unwrap();
 
     let deadline = Budget::Bounded(Duration::from_millis(50)).start();
-    let finished = wait_bounded(armed(child, Role::Query), deadline).unwrap();
+    let finished = wait_bounded(child, deadline).unwrap();
     assert!(matches!(finished, Finished::Expired));
 
     // A real event-driven death-watch (pidfd on Linux, EVFILT_PROC |
     // NOTE_EXIT on macOS), with no timeout to choose: it returns when the
     // descendant dies, and hangs if the descendant is not in the child's
     // contained tree (e.g. `command()` without `.contain()`) — then neither
-    // `kill_tree` nor `Drop` can reach it. `capture.complete` is
-    // deliberately not asserted here — the kill is asynchronous and
-    // `collect` runs under an already-spent deadline, so whether the
-    // readers observe EOF within that instant varies run to run.
+    // `kill_tree` nor `Drop` can reach it.
     match cosca::Process::from_pid(descendant) {
         cosca::identity::Resolved::Found(p) => p.wait().unwrap(),
         cosca::identity::Resolved::Gone => {}
@@ -192,19 +189,22 @@ fn remove_drained_leaf(leaf: Option<std::path::PathBuf>) {
     }
 }
 
+/// More than a pipe holds, on every stream in every form it takes: a temp file, and the pipe
+/// [`Role::AnnouncedRequest`] reads its stderr from as it is written.
 #[skuld::test]
 fn output_larger_than_a_pipe_buffer_does_not_deadlock() {
-    let child = command("/bin/sh", &["-c", "yes | head -c 200000"])
-        .unwrap()
-        .spawn()
-        .unwrap();
-    let finished = wait_bounded(armed(child, Role::Query), Budget::Unbounded.start()).unwrap();
-    match finished {
-        Finished::Exited { capture, .. } => {
-            assert_eq!(capture.stdout.len(), 200_000);
-            assert!(capture.complete);
+    let script = "echo 'request issued' >&2; yes | head -c 200000; yes | head -c 200000 >&2";
+    for role in [Role::Query, Role::AnnouncedRequest(announced)] {
+        let child = spawned(sh(script), role);
+        let finished = wait_bounded(child, Budget::Unbounded.start()).unwrap();
+        match finished {
+            Finished::Exited { capture, .. } => {
+                assert_eq!(capture.stdout.len(), 200_000);
+                assert_eq!(capture.stderr.len(), ISSUED.len() + 1 + 200_000);
+                assert!(capture.complete);
+            }
+            Finished::Expired => panic!("expected Exited, got Expired"),
         }
-        Finished::Expired => panic!("expected Exited, got Expired"),
     }
 }
 
@@ -225,23 +225,20 @@ fn announced(stderr: &[u8]) -> bool {
 fn an_announced_request_is_issued_whatever_the_deadline() {
     let dir = tempfile::tempdir().unwrap();
     let request = dir.path().join("request");
-    let child = command(
-        "/bin/sh",
-        &[
-            "-c",
-            "touch \"$0\"; echo 'request issued' >&2; exec sleep 2147483647",
-            request.to_str().unwrap(),
-        ],
-    )
-    .unwrap()
-    .spawn()
-    .unwrap();
+    let child = spawned(
+        command(
+            "/bin/sh",
+            &[
+                "-c",
+                "touch \"$0\"; echo 'request issued' >&2; exec sleep 2147483647",
+                request.to_str().unwrap(),
+            ],
+        )
+        .unwrap(),
+        Role::AnnouncedRequest(announced),
+    );
 
-    let finished = wait_bounded(
-        armed(child, Role::AnnouncedRequest(announced)),
-        Budget::Immediate.start(),
-    )
-    .unwrap();
+    let finished = wait_bounded(child, Budget::Immediate.start()).unwrap();
 
     assert!(matches!(finished, Finished::Expired), "{finished:?}");
     assert!(request.exists(), "the request must be out before the deadline applies");
@@ -252,16 +249,9 @@ fn an_announced_request_is_issued_whatever_the_deadline() {
 /// kill a spent deadline sends cannot overwrite that exit.
 #[skuld::test]
 fn an_announced_request_that_ends_unannounced_is_reported_exited() {
-    let child = command("/bin/sh", &["-c", "echo refused >&2; exit 3"])
-        .unwrap()
-        .spawn()
-        .unwrap();
+    let child = spawned(sh("echo refused >&2; exit 3"), Role::AnnouncedRequest(announced));
 
-    let finished = wait_bounded(
-        armed(child, Role::AnnouncedRequest(announced)),
-        Budget::Immediate.start(),
-    )
-    .unwrap();
+    let finished = wait_bounded(child, Budget::Immediate.start()).unwrap();
 
     match finished {
         Finished::Exited { status, capture } => {
@@ -275,19 +265,18 @@ fn an_announced_request_that_ends_unannounced_is_reported_exited() {
 /// What the child wrote while issuing its request is kept: it is the start of the diagnostic.
 #[skuld::test]
 fn what_an_announced_request_wrote_before_announcing_is_kept() {
-    let child = command("/bin/sh", &["-c", "echo early >&2; echo 'request issued' >&2; exit 1"])
-        .unwrap()
-        .spawn()
-        .unwrap();
+    let child = spawned(
+        sh("echo out; echo early >&2; echo 'request issued' >&2; exit 1"),
+        Role::AnnouncedRequest(announced),
+    );
 
-    let finished = wait_bounded(
-        armed(child, Role::AnnouncedRequest(announced)),
-        Budget::Unbounded.start(),
-    )
-    .unwrap();
+    let finished = wait_bounded(child, Budget::Unbounded.start()).unwrap();
 
     match finished {
-        Finished::Exited { capture, .. } => assert_eq!(capture.stderr, b"early\nrequest issued\n"),
+        Finished::Exited { capture, .. } => {
+            assert_eq!(capture.stderr, b"early\nrequest issued\n");
+            assert_eq!(capture.stdout, b"out\n");
+        }
         Finished::Expired => panic!("expected Exited, got Expired"),
     }
 }
@@ -303,6 +292,34 @@ fn what_an_announced_request_wrote_before_announcing_is_kept() {
 /// sender is dropped unsent, which `recv` returns as an error.
 #[skuld::test]
 fn an_unannounced_request_is_left_running_on_expiry_and_reaped_once_it_exits() {
+    let status = expired_request_released_by_its_reaper("exit 7");
+    assert_eq!(
+        status.code(),
+        Some(7),
+        "nothing may kill a request it cannot see arrive: {status:?}"
+    );
+}
+
+/// A request left running on expiry writes whatever it writes after goetia stopped waiting — and
+/// after goetia is gone — and dies of none of it: its output goes to files, which never break under
+/// a writer the way a pipe nobody reads does, with `SIGPIPE`. The child writes a megabyte to each
+/// stream only once the test releases it, which is after the expiry, and more than any pipe holds;
+/// a write to either that broke ends it with other than `0`.
+#[skuld::test]
+fn an_expired_request_that_writes_afterwards_is_not_killed_for_it() {
+    let status =
+        expired_request_released_by_its_reaper("head -c 1048576 /dev/zero >&2 && exec head -c 1048576 /dev/zero");
+    assert_eq!(
+        (status.code(), status.signal()),
+        (Some(0), None),
+        "a request left running must not die of its own output: {status:?}"
+    );
+}
+
+/// Spawn `sh -c 'read line; <then>'` as a [`Role::Request`], let it expire at once, and return how
+/// it ended as its reaper reports it. It reads EOF on its stdin, and so runs `then`, only once the
+/// reaper holds it and is waiting — after the expiry.
+fn expired_request_released_by_its_reaper(then: &str) -> ExitStatus {
     let (writer_tx, writer_rx) = mpsc::channel::<io::PipeWriter>();
     let (tx, rx) = mpsc::channel();
     let reaper = Reaper::with(
@@ -313,41 +330,140 @@ fn an_unannounced_request_is_left_running_on_expiry_and_reaped_once_it_exits() {
         move |status| tx.send(status).expect("the test is still receiving"),
     )
     .unwrap();
-    let mut spawned = spawn(&mut exits_7_at_eof(), Role::Request(reaper)).unwrap();
-    writer_tx.send(spawned.child.stdin().expect("stdin is piped")).unwrap();
+    let mut child = spawned(released_at_eof(then), Role::Request(reaper));
+    writer_tx.send(child.child.stdin().expect("stdin is piped")).unwrap();
 
-    let finished = wait_bounded(spawned, Budget::Immediate.start()).unwrap();
+    let finished = wait_bounded(child, Budget::Immediate.start()).unwrap();
 
     assert!(matches!(finished, Finished::Expired), "{finished:?}");
-    let status = rx
-        .recv()
+    rx.recv()
         .expect("a request left running must be reaped once it exits")
-        .expect("waiting on the child");
-    assert_eq!(
-        status.code(),
-        Some(7),
-        "nothing may kill a request it cannot see arrive: {status:?}"
-    );
+        .expect("waiting on the child")
+}
+
+/// The child the reaper tests hand their reaper: runs `then` at EOF on its stdin, a pipe the test
+/// holds. `command()`'s, as launchd's `launchctl` — the one production `Role::Request` — is spawned.
+#[cfg(not(target_os = "linux"))]
+fn released_at_eof(then: &str) -> cosca::Command {
+    let mut cmd = sh(&format!("read line; {then}"));
+    cmd.stdin(cosca::Stdio::pipe_in()).unwrap();
+    cmd
+}
+
+/// On Linux, uncontained. cosca 0.4's cgroup containment kills a detached tree — the leaf's `Drop`
+/// writes `cgroup.kill` — and leaves the leaf behind, measured; nothing on Linux detaches, since
+/// `systemctl` announces its requests.
+#[cfg(target_os = "linux")]
+fn released_at_eof(then: &str) -> cosca::Command {
+    let mut cmd = cosca::run(["/bin/sh", "-c", &format!("read line; {then}")]);
+    cmd.stdin(cosca::Stdio::pipe_in()).unwrap();
+    cmd
+}
+
+// Nothing is made after the spawn =====================================================================================
+
+/// `sh -c 'touch <marker>'`: a child whose "request" is the marker it creates, so whether it ran
+/// is a file's existence.
+fn marks(marker: &std::path::Path) -> cosca::Command {
+    command("/bin/sh", &["-c", "touch \"$0\"", marker.to_str().unwrap()]).unwrap()
+}
+
+/// Whatever a role's output needs is made before the child is spawned, and a failure to make it
+/// means the child never ran: never a panic, and never a request out with nothing to watch it.
+/// Each allowance fails a different one: the stdout file, the stderr file, the stderr thread.
+#[skuld::test]
+fn a_child_whose_output_nothing_could_take_is_never_run() {
+    type Allowance = fn() -> test_hook::Allowance;
+    type Case = (&'static str, fn() -> Role, Allowance, &'static str);
+    let cases: [Case; 5] = [
+        ("query stdout", || Role::Query, || test_hook::temp_files(0), "temp file"),
+        ("query stderr", || Role::Query, || test_hook::temp_files(1), "temp file"),
+        ("request stdout", request, || test_hook::temp_files(0), "temp file"),
+        ("request stderr", request, || test_hook::temp_files(1), "temp file"),
+        (
+            "announced stderr",
+            || Role::AnnouncedRequest(announced),
+            || test_hook::threads(0),
+            "thread",
+        ),
+    ];
+    for (case, role, allowance, what) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("request");
+        let role = role();
+        let _short = allowance();
+        let spawns = test_hook::spawns();
+
+        let e = spawn(&mut marks(&marker), role).err().expect(case);
+
+        assert!(e.to_string().contains(&format!("no {what} ")), "{case}: {e}");
+        assert!(e.to_string().contains("so it was not run"), "{case}: {e}");
+        assert_eq!(test_hook::spawns(), spawns, "{case}: the child was spawned");
+        assert!(!marker.exists(), "{case}: the child ran");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("request");
+    let _no_file = test_hook::temp_files(0);
+    let spawns = test_hook::spawns();
+    assert!(spawn(&mut marks(&marker), Role::AnnouncedRequest(announced)).is_err());
+    assert_eq!(test_hook::spawns(), spawns, "announced stdout: the child was spawned");
+    assert!(!marker.exists(), "announced stdout: the child ran");
+}
+
+fn request() -> Role {
+    Role::Request(Reaper::with(cosca::Child::wait, |_| {}).unwrap())
+}
+
+/// A sequence's spares are what its children's output is given, so nothing need be made for them.
+#[skuld::test]
+fn a_child_takes_its_output_from_the_spares() {
+    let spares = spare(Needs {
+        listeners: 1,
+        files: 3,
+        ..Needs::default()
+    })
+    .unwrap();
+    let _no_thread = test_hook::threads(0);
+    let _no_file = test_hook::temp_files(0);
+
+    for role in [Role::AnnouncedRequest(announced), Role::Query] {
+        let finished = wait_bounded(
+            spawned(sh("echo 'request issued' >&2"), role),
+            Budget::Unbounded.start(),
+        );
+        assert!(matches!(finished, Ok(Finished::Exited { .. })), "{finished:?}");
+    }
+    assert!(spawn(&mut sh("true"), Role::Query).is_err(), "the spares are spent");
+    drop(spares);
+}
+
+// Spares ==============================================================================================================
+
+fn reapers_only(n: usize) -> Needs {
+    Needs {
+        reapers: n,
+        ..Needs::default()
+    }
 }
 
 /// A verb's reapers are all made before any is handed out, so a verb whose third request could have
 /// none never sends its first.
 #[skuld::test]
 fn reapers_are_all_made_or_none_are() {
-    let _only_two = test_hook::allow(2);
+    let _only_two = test_hook::threads(2);
 
     let made = reapers::<3>();
 
     let e = made.expect_err("a third reaper could not be made");
-    assert!(e.to_string().contains("no reaper may be made"), "{e}");
+    assert!(e.to_string().contains("no thread may be made"), "{e}");
 }
 
 /// A sequence's spares are taken before anything is made: its later verbs need no new thread, so
 /// cannot fail for want of one after an earlier verb has sent something.
 #[skuld::test]
 fn spares_are_taken_before_any_reaper_is_made() {
-    let spares = spare(3).unwrap();
-    let _none = test_hook::allow(0);
+    let spares = spare(reapers_only(3)).unwrap();
+    let _none = test_hook::threads(0);
 
     assert!(reapers::<1>().is_ok(), "the stop's reaper is a spare");
     assert!(reapers::<2>().is_ok(), "the start's reapers are spares");
@@ -355,11 +471,55 @@ fn spares_are_taken_before_any_reaper_is_made() {
     drop(spares);
 }
 
+/// Sparing is all or nothing: a guard that could not make everything leaves nothing behind.
+#[skuld::test]
+fn a_spare_that_cannot_be_made_whole_spares_nothing() {
+    {
+        let _no_file = test_hook::temp_files(0);
+        let e = spare(Needs {
+            reapers: 1,
+            files: 1,
+            ..Needs::default()
+        })
+        .expect_err("no file may be made");
+        assert!(e.to_string().contains("no temp file may be made"), "{e}");
+    }
+    let _none = test_hook::threads(0);
+    assert!(reapers::<1>().is_err(), "the reaper made before the failure was pooled");
+}
+
+/// Topping up makes only what the pool lacks: a verb inside a prepared sequence makes nothing.
+#[skuld::test]
+fn a_top_up_makes_only_what_the_pool_lacks() {
+    let prepared = spare(Needs {
+        files: 4,
+        ..Needs::default()
+    })
+    .unwrap();
+    {
+        let _no_file = test_hook::temp_files(0);
+        drop(
+            top_up(Needs {
+                files: 4,
+                ..Needs::default()
+            })
+            .expect("the pool holds four"),
+        );
+    }
+    let _one_file = test_hook::temp_files(1);
+    let topped = top_up(Needs {
+        files: 5,
+        ..Needs::default()
+    })
+    .expect("one short, and one may be made");
+    drop((topped, prepared));
+}
+
 /// Dropping the guard drops what it left: nothing lingers for a later, unrelated verb.
 #[skuld::test]
 fn spares_are_released_with_their_guard() {
-    drop(spare(2).unwrap());
-    let _none = test_hook::allow(0);
+    drop(spare(reapers_only(2)).unwrap());
+    let _none = test_hook::threads(0);
 
     assert!(reapers::<1>().is_err(), "a released spare was still handed out");
 }
@@ -368,9 +528,9 @@ fn spares_are_released_with_their_guard() {
 /// the verbs the outer one still covers.
 #[skuld::test]
 fn an_inner_guard_releases_only_its_own_spares() {
-    let outer = spare(2).unwrap();
-    drop(spare(1).unwrap());
-    let _none = test_hook::allow(0);
+    let outer = spare(reapers_only(2)).unwrap();
+    drop(spare(reapers_only(1)).unwrap());
+    let _none = test_hook::threads(0);
 
     assert!(
         reapers::<2>().is_ok(),
@@ -383,10 +543,10 @@ fn an_inner_guard_releases_only_its_own_spares() {
 /// Guards may also end out of order: dropping the outer one first leaves the inner one's spares.
 #[skuld::test]
 fn an_outer_guard_dropped_first_leaves_the_inner_guards_spares() {
-    let outer = spare(2).unwrap();
-    let inner = spare(1).unwrap();
+    let outer = spare(reapers_only(2)).unwrap();
+    let inner = spare(reapers_only(1)).unwrap();
     drop(outer);
-    let _none = test_hook::allow(0);
+    let _none = test_hook::threads(0);
 
     assert!(
         reapers::<1>().is_ok(),
@@ -406,27 +566,6 @@ fn a_reaper_with_nothing_to_reap_ends() {
     drop(reaper);
 
     assert!(rx.recv().is_err(), "the reaper reaped something it was never handed");
-}
-
-/// The child the reaper test hands its reaper: exits `7` at EOF on its stdin, a pipe the test holds.
-/// `command()`'s, as launchd's `launchctl` — the one production `Role::Request` — is spawned.
-#[cfg(not(target_os = "linux"))]
-fn exits_7_at_eof() -> cosca::Command {
-    let mut cmd = command("/bin/sh", &["-c", "read line; exit 7"]).unwrap();
-    cmd.stdin(cosca::Stdio::pipe_in()).unwrap();
-    cmd
-}
-
-/// On Linux, uncontained. cosca 0.4's cgroup containment kills a detached tree — the leaf's `Drop`
-/// writes `cgroup.kill` — and leaves the leaf behind, measured; nothing on Linux detaches, since
-/// `systemctl` announces its requests.
-#[cfg(target_os = "linux")]
-fn exits_7_at_eof() -> cosca::Command {
-    let mut cmd = cosca::run(["/bin/sh", "-c", "read line; exit 7"]);
-    cmd.stdin(cosca::Stdio::pipe_in()).unwrap();
-    cmd.stdout(cosca::Stdio::pipe_out()).unwrap();
-    cmd.stderr(cosca::Stdio::pipe_out()).unwrap();
-    cmd
 }
 
 // expiry_disposition ==================================================================================================
@@ -456,9 +595,9 @@ impl Read for ErrorOnFirstRead {
 #[skuld::test]
 fn a_reader_that_errors_reports_the_error_instead_of_ending_silently() {
     let (tx, rx) = crossbeam_channel::unbounded();
-    drain(ErrorOnFirstRead, Which::Stdout, tx);
+    drain(ErrorOnFirstRead, tx);
     match rx.recv().unwrap() {
-        Chunk::Failed(Which::Stdout, e) => assert_eq!(e.kind(), ErrorKind::BrokenPipe),
+        Chunk::Failed(e) => assert_eq!(e.kind(), ErrorKind::BrokenPipe),
         other => panic!("expected Chunk::Failed, got {other:?}"),
     }
 }
@@ -474,9 +613,9 @@ impl Read for PanicOnRead {
 #[skuld::test]
 fn a_reader_that_panics_reports_it_instead_of_ending_silently() {
     let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = std::thread::spawn(move || drain(PanicOnRead, Which::Stdout, tx));
+    let handle = std::thread::spawn(move || drain(PanicOnRead, tx));
     match rx.recv().unwrap() {
-        Chunk::Failed(Which::Stdout, _) => {}
+        Chunk::Failed(_) => {}
         other => panic!("expected Chunk::Failed, got {other:?}"),
     }
     assert!(handle.join().is_ok());
@@ -487,23 +626,26 @@ fn a_reader_that_panics_reports_it_instead_of_ending_silently() {
 #[skuld::test]
 fn collect_turns_a_reader_failure_into_an_error() {
     let (tx, rx) = crossbeam_channel::unbounded();
-    tx.send(Chunk::Bytes(Which::Stdout, b"partial".to_vec())).unwrap();
-    tx.send(Chunk::Failed(Which::Stderr, io::Error::from(ErrorKind::BrokenPipe)))
-        .unwrap();
+    tx.send(Chunk::Bytes(b"partial".to_vec())).unwrap();
+    tx.send(Chunk::Failed(io::Error::from(ErrorKind::BrokenPipe))).unwrap();
     drop(tx);
 
-    assert!(collect(rx, Budget::Unbounded.start()).is_err());
+    let e = collect(rx, Budget::Unbounded.start()).unwrap_err();
+    assert!(
+        e.to_string().starts_with("stderr: "),
+        "the failing stream is named: {e}"
+    );
 }
 
 #[skuld::test]
 fn collect_keeps_what_already_arrived_when_the_deadline_expires() {
     let (tx, rx) = crossbeam_channel::unbounded();
-    tx.send(Chunk::Bytes(Which::Stdout, b"partial".to_vec())).unwrap();
+    tx.send(Chunk::Bytes(b"partial".to_vec())).unwrap();
     // `tx` kept alive deliberately: nothing but the deadline can end this
     // collect, pinning the "expiry, not disconnect" path without a real
     // child.
-    let (stdout, _stderr, complete) = collect(rx, Budget::Immediate.start()).unwrap();
-    assert_eq!(stdout, b"partial");
+    let (bytes, complete) = collect(rx, Budget::Immediate.start()).unwrap();
+    assert_eq!(bytes, b"partial");
     assert!(!complete);
     drop(tx);
 }
@@ -511,11 +653,11 @@ fn collect_keeps_what_already_arrived_when_the_deadline_expires() {
 #[skuld::test]
 fn a_complete_drain_reports_complete() {
     let (tx, rx) = crossbeam_channel::unbounded();
-    tx.send(Chunk::Bytes(Which::Stdout, b"all of it".to_vec())).unwrap();
+    tx.send(Chunk::Bytes(b"all of it".to_vec())).unwrap();
     drop(tx);
 
-    let (stdout, _stderr, complete) = collect(rx, Budget::Unbounded.start()).unwrap();
-    assert_eq!(stdout, b"all of it");
+    let (bytes, complete) = collect(rx, Budget::Unbounded.start()).unwrap();
+    assert_eq!(bytes, b"all of it");
     assert!(complete);
 }
 
@@ -531,22 +673,22 @@ impl ChunkSource for Bottomless {
     }
 
     fn try_recv(&self) -> Result<Chunk, TryRecvError> {
-        Ok(Chunk::Bytes(Which::Stdout, b"x".to_vec()))
+        Ok(Chunk::Bytes(b"x".to_vec()))
     }
 
     fn recv(&self) -> Result<Chunk, RecvError> {
-        Ok(Chunk::Bytes(Which::Stdout, b"x".to_vec()))
+        Ok(Chunk::Bytes(b"x".to_vec()))
     }
 
     fn recv_timeout(&self, _timeout: Duration) -> Result<Chunk, RecvTimeoutError> {
-        Ok(Chunk::Bytes(Which::Stdout, b"x".to_vec()))
+        Ok(Chunk::Bytes(b"x".to_vec()))
     }
 }
 
 #[skuld::test]
 fn collect_stops_at_the_deadline_even_while_a_reader_keeps_producing() {
     // A `collect` that drains until the channel is empty never returns here.
-    let (stdout, _stderr, complete) = collect(Bottomless, Budget::Immediate.start()).unwrap();
-    assert_eq!(stdout, b"x".repeat(QUEUED), "exactly the chunks queued at expiry");
+    let (bytes, complete) = collect(Bottomless, Budget::Immediate.start()).unwrap();
+    assert_eq!(bytes, b"x".repeat(QUEUED), "exactly the chunks queued at expiry");
     assert!(!complete);
 }

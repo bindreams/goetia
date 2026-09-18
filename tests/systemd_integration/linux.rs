@@ -1066,6 +1066,61 @@ fn an_older_systemd_is_refused_before_anything_is_written_or_run() {
     assert!(unit_path(guard.id()).exists(), "a refused uninstall removed the unit");
 }
 
+/// `goetia <args>` in a transient scope allowed `tasks` tasks — threads and processes alike — so
+/// that making a thread, or spawning a process, fails once they are spent.
+fn goetia_with_tasks(tasks: u32, args: &[&str]) -> std::process::Output {
+    Command::new("systemd-run")
+        .args(["--quiet", "--scope", "-p", &format!("TasksMax={tasks}")])
+        .arg(env!("CARGO_BIN_EXE_goetia"))
+        .args(args)
+        .output()
+        .expect("spawn systemd-run")
+}
+
+/// goetia never panics for want of a task, and a verb that could not have what its request needs
+/// exits `1` with the unit untouched. Its tasks are counted exactly: its own thread; one version
+/// probe at a time; and for a `start` that waits, a thread to read `systemctl`'s stderr, made before
+/// `systemctl` itself. So one task cannot probe, two cannot send the start, and three can. A
+/// `restart` makes the thread each of its legs needs before either leg, so it needs a fourth.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    Systemd::new().install(&mk(guard.id()), false).expect("install");
+    let run = |tasks: u32, verb: &str| {
+        let output = goetia_with_tasks(tasks, &["daemon", verb, guard.id()]);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(!stderr.contains("panicked"), "{verb} TasksMax={tasks}: {stderr}");
+        (output.status.code(), stderr)
+    };
+
+    for tasks in [1, 2] {
+        let (code, stderr) = run(tasks, "start");
+        assert_eq!(code, Some(1), "start TasksMax={tasks}: {stderr}");
+        assert_eq!(
+            active_state_and_job(guard.id()),
+            ("inactive".to_string(), String::new()),
+            "a start short of tasks sent something: TasksMax={tasks}"
+        );
+    }
+    let (code, stderr) = run(3, "start");
+    assert_eq!(code, Some(0), "start TasksMax=3: {stderr}");
+
+    let before = main_pid(guard.id());
+    for tasks in [2, 3] {
+        let (code, stderr) = run(tasks, "restart");
+        assert_eq!(code, Some(1), "restart TasksMax={tasks}: {stderr}");
+        assert_eq!(
+            (active_state_and_job(guard.id()), main_pid(guard.id())),
+            (("active".to_string(), String::new()), before.clone()),
+            "a restart short of tasks touched the daemon: TasksMax={tasks}"
+        );
+    }
+    let (code, stderr) = run(4, "restart");
+    assert_eq!(code, Some(0), "restart TasksMax=4: {stderr}");
+    assert_ne!(main_pid(guard.id()), before, "restart TasksMax=4 restarted nothing");
+}
+
 /// `Type=exec` is what makes `systemctl start` report failure here at all — under `Type=simple` the
 /// same spec's `start` returns `Ok`. `restart: always` is pinned explicitly (`mk`'s default is
 /// `OnFailure`) so the unit under test is exactly `Type=exec` + `Restart=always` +

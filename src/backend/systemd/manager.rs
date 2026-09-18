@@ -76,12 +76,12 @@ use systemctl::{
 };
 use write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 
-use crate::backend::Identity;
 use crate::backend::systemd::generate;
+use crate::backend::{Identity, bounded};
 use crate::decide::{self, Outcome};
 use crate::error::{Error, Result};
 use crate::manager::budget::Deadline;
-use crate::manager::{Budget, Installed, ServiceManager, Status};
+use crate::manager::{Budget, Installed, Prepared, ServiceManager, Status, Step};
 use crate::spec::{AccountId, DaemonSpec, Id, User};
 
 /// Where systemd looks for system unit files. Never overridden — the integration tests run for real
@@ -259,6 +259,27 @@ impl ServiceManager for Systemd {
 
     fn start(&self, id: &Id, budget: Budget) -> Result<()> {
         start_with(id.as_str(), budget, &REAL_STEPS)
+    }
+
+    /// Makes ready now what each start or stop in `steps` needs to watch its one `systemctl`: a
+    /// thread to read the stderr it announces its job on, and a temp file for its stdout. `install`
+    /// runs no watched `systemctl`.
+    fn prepare(&self, steps: &[Step]) -> Result<Prepared> {
+        let watched = steps
+            .iter()
+            .filter(|step| matches!(step, Step::Start | Step::Stop))
+            .count();
+        let spares = bounded::spare(bounded::Needs {
+            listeners: watched,
+            files: watched,
+            ..bounded::Needs::default()
+        })
+        .map_err(|e| {
+            Error::Other(format!(
+                "no thread or file could be made to watch a `systemctl` request, so none was sent: {e}"
+            ))
+        })?;
+        Ok(Prepared::holding(spares))
     }
 
     /// One `systemctl restart --no-block`: systemd stops the unit and starts

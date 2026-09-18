@@ -1,53 +1,57 @@
-//! `wait_bounded`: block on a `cosca::Child` under a [`Deadline`], capturing
-//! its stdout/stderr concurrently with the wait so a full pipe buffer can
-//! never wedge it, and reporting on expiry whether the child had already
-//! finished on its own.
+//! `wait_bounded`: block on a `cosca::Child` under a [`Deadline`], capturing its stdout and stderr
+//! where no full pipe can wedge it, and reporting on expiry whether the child had already finished
+//! on its own.
 //!
-//! The deadline bounds waiting for the manager's answer, never whether a
-//! request is sent — see [`Role`].
+//! The deadline bounds waiting for the manager's answer, never whether a request is sent — see
+//! [`Role`]. Everything a child's output needs is made before it is spawned — see [`spares`].
 //!
 //! systemd and launchd both reach their manager through a subprocess that
 //! already blocks (`systemctl`/`launchctl`); this is the only machinery
 //! either backend needs to bound that wait. See the crate-level design
 //! notes on `daemon start --timeout`.
 
-use std::io::Read;
+mod spares;
+
+use std::fs::File;
+use std::io::{self, Read, Seek};
 use std::os::unix::process::ExitStatusExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::process::ExitStatus;
-use std::sync::mpsc;
-use std::thread;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError, Sender, TryRecvError};
+#[cfg(test)]
+pub(crate) use spares::test_hook;
+pub(crate) use spares::{Needs, Reaper, spare};
+#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
+pub(crate) use spares::{Spares, reapers, top_up};
 
 use crate::manager::budget::Deadline;
 
 // command =============================================================================================================
 
-/// `program` with `args`: stdin from `/dev/null`, stdout and stderr piped, and the
-/// process tree **contained**, so a descendant that inherited the pipe dies with the
-/// child instead of holding its write end open: [`wait_bounded`] tears the contained
-/// tree down with `kill_tree` on expiry, and by dropping the child on every path.
+/// `program` with `args`: stdin from `/dev/null`, and the process tree **contained**, so a
+/// descendant that inherited a pipe dies with the child instead of holding its write end open:
+/// [`wait_bounded`] tears the contained tree down with `kill_tree` on expiry, and by dropping the
+/// child on every path. Where its output goes is [`spawn`]'s to decide, by [`Role`].
 pub(crate) fn command(program: &str, args: &[&str]) -> Result<cosca::Command, cosca::error::Error> {
     let mut cmd = cosca::run(std::iter::once(program).chain(args.iter().copied()));
     cmd.stdin(cosca::Stdio::null())?;
-    cmd.stdout(cosca::Stdio::pipe_out())?;
-    cmd.stderr(cosca::Stdio::pipe_out())?;
     cmd.contain();
     Ok(cmd)
 }
 
 // wait_bounded ========================================================================================================
 
-/// What the child's pipes yielded, and whether that is all of it.
+/// What the child wrote, and whether that is all of it.
 #[derive(Debug)]
 pub(crate) struct Capture {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
-    /// Both readers reached EOF inside the deadline, so these bytes are
-    /// everything the child wrote. `false` means they are a **prefix**: the
-    /// deadline cut the drain short, and no consumer may treat them as whole.
+    /// These bytes are everything the child wrote. `false` means they are a **prefix** no consumer
+    /// may treat as whole: the deadline cut short the reading of a stream read as it was written.
+    /// A stream written to a file is whole once the child has exited and its contained tree is
+    /// torn down, which is before it is read.
     pub complete: bool,
 }
 
@@ -68,7 +72,8 @@ pub(crate) enum Finished {
     Expired,
 }
 
-/// What the child does for its caller, which decides what the deadline may cut short.
+/// What the child does for its caller, which decides what the deadline may cut short, and where its
+/// output goes.
 ///
 /// The rule all three share: the deadline bounds waiting for the manager's answer, and never
 /// decides whether a request reaches the manager at all.
@@ -76,12 +81,14 @@ pub(crate) enum Finished {
 // `launchctl` does not.
 #[derive(Debug)]
 pub(crate) enum Role {
-    /// A read. Killing it on expiry loses nothing.
+    /// A read. Killing it on expiry loses nothing. Its output goes to temp files, read once it has
+    /// exited.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Query,
     /// A request that says on stderr when the manager has it: `issued` holds once it has. Until
     /// then the wait is unbounded; only after it does the deadline apply, and killing the child
-    /// then cancels nothing.
+    /// then cancels nothing. Its stderr is a pipe a thread made before the spawn reads as it is
+    /// written; its stdout, a temp file.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     AnnouncedRequest(fn(&[u8]) -> bool),
     /// A request that never says when the manager has it. The deadline applies from the spawn, but
@@ -89,50 +96,105 @@ pub(crate) enum Role {
     /// the request is out, and its [`Reaper`] reaps it once it exits. launchd's alone: on Linux,
     /// cosca 0.4's cgroup containment kills a detached tree when it drops the leaf, so a
     /// [`command`] child would not be left running.
+    ///
+    /// Its output goes to temp files, never pipes: a pipe goetia stopped reading — on expiry, or by
+    /// exiting — kills the writer with `SIGPIPE`, and a file does not.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Request(Reaper),
 }
 
-/// A child [`spawn`]ed under its [`Role`].
+/// A child [`spawn`]ed under its [`Role`], with where its output went.
 pub(crate) struct Spawned {
     child: cosca::Child,
     role: Role,
+    stdout: File,
+    stderr: Stderr,
 }
 
-/// Spawn `cmd` under `role`. A [`Role::Request`] brings its [`Reaper`], made before the caller sent
-/// anything — see [`reapers`].
+/// Where a spawned child's stderr went.
+enum Stderr {
+    /// A temp file, read once the child has exited.
+    File(File),
+    /// A pipe a thread reads as it is written, heard here as it does.
+    Heard(Receiver<Chunk>),
+}
+
+/// Spawn `cmd` under `role`, having first made everything its output needs: a temp file for stdout,
+/// and for stderr another — or, for a [`Role::AnnouncedRequest`], a thread to read the pipe it
+/// announces on. A failure to make one is an `Err` with nothing spawned, and says so. A
+/// [`Role::Request`] brings its [`Reaper`], made before the caller sent anything — see [`reapers`].
 pub(crate) fn spawn(cmd: &mut cosca::Command, role: Role) -> Result<Spawned, cosca::error::Error> {
+    enum Ready {
+        File(File),
+        Listener(spares::Listener),
+    }
+    let stdout = spares::file().map_err(not_run("temp file for its output"))?;
+    let stderr = match role {
+        Role::AnnouncedRequest(_) => {
+            cmd.stderr(cosca::Stdio::pipe_out())?;
+            Ready::Listener(spares::listener().map_err(not_run("thread to read its output"))?)
+        }
+        Role::Query | Role::Request(_) => {
+            let file = spares::file().map_err(not_run("temp file for its output"))?;
+            cmd.stderr(cosca::Stdio::from_file(
+                file.try_clone().map_err(not_run("descriptor for its output"))?,
+            ))?;
+            Ready::File(file)
+        }
+    };
+    cmd.stdout(cosca::Stdio::from_file(
+        stdout.try_clone().map_err(not_run("descriptor for its output"))?,
+    ))?;
+    let mut child = start(cmd)?;
+    let stderr = match stderr {
+        Ready::File(file) => Stderr::File(file),
+        Ready::Listener(listener) => Stderr::Heard(listener.listen(child.stderr())),
+    };
     Ok(Spawned {
-        child: cmd.spawn()?,
+        child,
         role,
+        stdout,
+        stderr,
     })
+}
+
+/// The spawn itself: [`spawn`]'s last step, once nothing more can fail for want of what its output
+/// needs.
+fn start(cmd: &mut cosca::Command) -> Result<cosca::Child, cosca::error::Error> {
+    #[cfg(test)]
+    test_hook::spawning();
+    cmd.spawn()
+}
+
+/// The failure to make `what` before a spawn, which is therefore never attempted.
+fn not_run(what: &'static str) -> impl Fn(io::Error) -> cosca::error::Error {
+    move |e| {
+        cosca::error::Error::Io(io::Error::new(
+            e.kind(),
+            format!("no {what} could be made, so it was not run: {e}"),
+        ))
+    }
 }
 
 /// Block until the child exits or `deadline` expires, under its [`Role`]'s rule for what an expiry
 /// does: kill the child, tear its tree down and reap it — or, for [`Role::Request`], leave it
-/// running for its [`Reaper`]. Its pipes are drained by up to two **detached** threads reporting
-/// over a channel, so the return value never waits on a reader.
+/// running for its [`Reaper`]. Nothing here makes a thread or a file: [`spawn`] made them all.
 pub(crate) fn wait_bounded(spawned: Spawned, deadline: Deadline) -> Result<Finished, cosca::error::Error> {
-    let Spawned { mut child, role } = spawned;
-    let (tx, rx) = crossbeam_channel::unbounded();
-    if let Some(r) = child.stdout() {
-        let tx = tx.clone();
-        thread::spawn(move || drain(r, Which::Stdout, tx));
-    }
-    if let Some(r) = child.stderr() {
-        let tx = tx.clone();
-        thread::spawn(move || drain(r, Which::Stderr, tx));
-    }
-    drop(tx); // the readers are `collect`'s only senders; its EOF is their exit
+    let Spawned {
+        child,
+        role,
+        stdout,
+        stderr,
+    } = spawned;
 
     // Unbounded, deliberately: this is the request going out, not the wait for its answer. A child
-    // that ends without announcing ends here too, once its output reaches EOF.
-    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-    if let Role::AnnouncedRequest(issued) = role {
-        while !issued(&stderr) {
+    // that ends without announcing ends here too, once its stderr reaches EOF.
+    let mut heard = Vec::new();
+    if let (Role::AnnouncedRequest(issued), Stderr::Heard(rx)) = (&role, &stderr) {
+        while !issued(&heard) {
             match rx.recv() {
-                Ok(chunk) => absorb(chunk, &mut stdout, &mut stderr).map_err(cosca::error::Error::Io)?,
-                Err(RecvError) => break, // both readers at EOF
+                Ok(chunk) => absorb(chunk, &mut heard).map_err(cosca::error::Error::Io)?,
+                Err(RecvError) => break, // EOF
             }
         }
     }
@@ -142,10 +204,11 @@ pub(crate) fn wait_bounded(spawned: Spawned, deadline: Deadline) -> Result<Finis
         None => Some(child.wait()?), // no timeout value is invented for an unbounded deadline
     };
     let status = match (waited, role) {
-        (Some(status), _) => Some(status),
+        (Some(status), _) => status,
         (None, Role::Request(reaper)) => {
             // Not killed: goetia cannot tell whether the request is out yet, and a request left
-            // unsent because goetia ran out of budget is the one answer worse than waiting.
+            // unsent because goetia ran out of budget is the one answer worse than waiting. Its
+            // output files stay open in it, and a file never breaks under its writer.
             reaper.reap(child);
             return Ok(Finished::Expired);
         }
@@ -166,193 +229,55 @@ pub(crate) fn wait_bounded(spawned: Spawned, deadline: Deadline) -> Result<Finis
             let _tree_teardown = child.kill_tree();
             let reaped = child.wait()?;
             match expiry_disposition(reaped) {
-                Disposition::WeKilledIt => None,
-                Disposition::ItExitedOnItsOwn => Some(reaped),
+                Disposition::WeKilledIt => return Ok(Finished::Expired),
+                Disposition::ItExitedOnItsOwn => reaped,
             }
         }
     };
-    // Drop before collecting: `kill_on_drop` tears the contained tree down, so on the
+    // Drop before reading: `kill_on_drop` tears the contained tree down, so on the
     // natural-exit path too, nothing this call spawned outlives it holding a write end.
     drop(child);
 
-    let (rest_out, rest_err, complete) = collect(rx, deadline).map_err(cosca::error::Error::Io)?;
-    stdout.extend(rest_out);
-    stderr.extend(rest_err);
+    let (stderr, complete) = match stderr {
+        Stderr::File(file) => (read_back(file, "stderr")?, true),
+        Stderr::Heard(rx) => {
+            let (rest, complete) = collect(rx, deadline).map_err(cosca::error::Error::Io)?;
+            heard.extend(rest);
+            (heard, complete)
+        }
+    };
     let capture = Capture {
-        stdout,
+        stdout: read_back(stdout, "stdout")?,
         stderr,
         complete,
     };
-    Ok(match status {
-        Some(status) => Finished::Exited { status, capture },
-        None => Finished::Expired,
-    })
+    Ok(Finished::Exited { status, capture })
 }
 
-/// A thread made before a [`Role::Request`] is sent, which reaps it if an expiry leaves it
-/// running: it still exits, and a caller that outlives it must not collect one zombie per expiry.
-/// Made first because making it can fail, and a request no thread could reap must not be sent —
-/// nor, in a sequence of requests, the first of them. See [`reapers`].
-///
-/// The thread never kills the child, not even after the reap. It [`cosca::Child::detach`]es the
-/// reaped child rather than dropping it, because `Drop` tears a contained tree down, and after the
-/// reap that is the reap-then-recycle hazard [`wait_bounded`]'s kill path is ordered to avoid:
-/// macOS's `FdMarker` `killpg`s the root's pgid, which the kernel may by then have handed to
-/// another group. `detach` touches no pid. With nothing to reap — the request exited inside its
-/// budget — the sender is dropped unsent and the thread ends.
-#[derive(Debug)]
-pub(crate) struct Reaper(mpsc::Sender<cosca::Child>);
-
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-impl Reaper {
-    fn new() -> std::io::Result<Reaper> {
-        Reaper::with(cosca::Child::wait, |_| {})
-    }
-
-    /// A reaper that waits with `wait` and hands the status to `reaped`: the seam a test drives, to
-    /// release its child only once the child is the reaper's, and to learn how it ended.
-    fn with(
-        wait: impl FnOnce(&cosca::Child) -> Result<ExitStatus, cosca::error::Error> + Send + 'static,
-        reaped: impl FnOnce(Result<ExitStatus, cosca::error::Error>) + Send + 'static,
-    ) -> std::io::Result<Reaper> {
-        #[cfg(test)]
-        test_hook::make_one()?;
-        let (tx, rx) = mpsc::channel::<cosca::Child>();
-        thread::Builder::new()
-            .name("goetia-reaper".to_string())
-            .spawn(move || {
-                let Ok(child) = rx.recv() else { return };
-                let status = wait(&child);
-                child.detach();
-                reaped(status);
-            })?;
-        Ok(Reaper(tx))
-    }
-
-    fn reap(self, child: cosca::Child) {
-        // The thread blocks in `recv` until this send, so it cannot fail. Were it to, the child is
-        // detached — never killed.
-        if let Err(mpsc::SendError(child)) = self.0.send(child) {
-            debug_assert!(false, "the reaper thread ended before it was handed its child");
-            child.detach();
-        }
-    }
-}
-
-thread_local! {
-    /// Reapers the [`Spares`] guards on this thread made ready ahead of the verbs they cover, each
-    /// tagged with its guard's number.
-    static SPARES: std::cell::RefCell<Vec<(u64, Reaper)>> = const { std::cell::RefCell::new(Vec::new()) };
-    /// The number the next [`Spares`] guard on this thread tags its spares with.
-    static NEXT_GUARD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-/// Every reaper a verb's requests can need, made before it sends any: a sequence of requests must
-/// not fail between two of them for want of a thread, so a failure here means nothing was sent.
-/// Taken from this thread's [`Spares`] first, and made for the rest.
-///
-/// An array, so each request is handed a reaper of its own by name, and a verb that sends one more
-/// request than it reserved for does not compile.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) fn reapers<const N: usize>() -> std::io::Result<[Reaper; N]> {
-    let mut got: Vec<Reaper> = SPARES.with_borrow_mut(|spares| {
-        let keep = spares.len().saturating_sub(N);
-        spares.split_off(keep).into_iter().map(|(_, reaper)| reaper).collect()
-    });
-    while got.len() < N {
-        got.push(Reaper::new()?);
-    }
-    Ok(got.try_into().expect("exactly N reapers were gathered"))
-}
-
-/// Make `n` reapers ready now, for the verbs this thread runs while the returned guard lives — a
-/// sequence of verbs, such as `restart`'s stop and start, whose later verbs must not fail for want of
-/// a thread once an earlier one has sent something. Any verb run on this thread meanwhile may draw on
-/// them. Dropping the guard drops what is left of its own, and only that: guards nest, and end in any
-/// order.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) fn spare(n: usize) -> std::io::Result<Spares> {
-    let made = (0..n).map(|_| Reaper::new()).collect::<std::io::Result<Vec<_>>>()?;
-    let tag = NEXT_GUARD.get();
-    NEXT_GUARD.set(tag + 1);
-    SPARES.with_borrow_mut(|spares| spares.extend(made.into_iter().map(|reaper| (tag, reaper))));
-    Ok(Spares {
-        tag,
-        this_thread: std::marker::PhantomData,
-    })
-}
-
-/// See [`spare`]. Not `Send`: what it releases is this thread's.
-#[derive(Debug)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) struct Spares {
-    tag: u64,
-    this_thread: std::marker::PhantomData<*const ()>,
-}
-
-impl Drop for Spares {
-    fn drop(&mut self) {
-        SPARES.with_borrow_mut(|spares| spares.retain(|(tag, _)| *tag != self.tag));
-    }
-}
-
-/// Makes reaper creation fail on demand, on this thread only, so the paths that must refuse to send
-/// anything when it does are testable.
-#[cfg(test)]
-pub(crate) mod test_hook {
-    use std::cell::Cell;
-
-    thread_local! {
-        static MAKEABLE: Cell<Option<usize>> = const { Cell::new(None) };
-    }
-
-    /// Let this thread make only `n` more reapers, until the returned guard drops.
-    pub(crate) fn allow(n: usize) -> Allowance {
-        MAKEABLE.set(Some(n));
-        Allowance(())
-    }
-
-    /// See [`allow`].
-    pub(crate) struct Allowance(());
-
-    impl Drop for Allowance {
-        fn drop(&mut self) {
-            MAKEABLE.set(None);
-        }
-    }
-
-    pub(super) fn make_one() -> std::io::Result<()> {
-        match MAKEABLE.get() {
-            Some(0) => Err(std::io::Error::other("no reaper may be made (test hook)")),
-            Some(n) => {
-                MAKEABLE.set(Some(n - 1));
-                Ok(())
-            }
-            None => Ok(()),
-        }
-    }
+/// Everything written to `file`, a stream's temp file, read from its start: the child wrote through
+/// a descriptor sharing its offset.
+fn read_back(mut file: File, stream: &str) -> Result<Vec<u8>, cosca::error::Error> {
+    let mut bytes = Vec::new();
+    file.rewind()
+        .and_then(|()| file.read_to_end(&mut bytes))
+        .map_err(|e| cosca::error::Error::Io(io::Error::new(e.kind(), format!("{stream}: {e}"))))?;
+    Ok(bytes)
 }
 
 // drain / collect =====================================================================================================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Which {
-    Stdout,
-    Stderr,
-}
-
 #[derive(Debug)]
 enum Chunk {
-    Bytes(Which, Vec<u8>),
+    Bytes(Vec<u8>),
     /// The reader stopped early: a read error, or a panic caught at the thread
     /// boundary. Never silence.
-    Failed(Which, std::io::Error),
+    Failed(std::io::Error),
 }
 
 /// Read `src` to EOF, sending each chunk. A read error, or a panic inside
 /// `src`, sends `Chunk::Failed` instead of ending the stream silently.
 /// Returns when `src` is exhausted, fails, or the receiver is gone.
-fn drain<R: Read>(mut src: R, which: Which, tx: Sender<Chunk>) {
+fn drain<R: Read>(mut src: R, tx: Sender<Chunk>) {
     // Kept outside the `catch_unwind`'d closure so a caught panic can still
     // report through it after the closure that moved `tx` is gone.
     let failure_tx = tx.clone();
@@ -362,7 +287,7 @@ fn drain<R: Read>(mut src: R, which: Which, tx: Sender<Chunk>) {
             match src.read(&mut buf) {
                 Ok(0) => return None, // EOF: a normal end of stream
                 Ok(n) => {
-                    if tx.send(Chunk::Bytes(which, buf[..n].to_vec())).is_err() {
+                    if tx.send(Chunk::Bytes(buf[..n].to_vec())).is_err() {
                         return None; // the receiver is gone; nothing more to do
                     }
                 }
@@ -372,11 +297,11 @@ fn drain<R: Read>(mut src: R, which: Which, tx: Sender<Chunk>) {
     }));
     match outcome {
         Ok(Some(e)) => {
-            let _ = failure_tx.send(Chunk::Failed(which, e));
+            let _ = failure_tx.send(Chunk::Failed(e));
         }
         Ok(None) => {}
         Err(_) => {
-            let _ = failure_tx.send(Chunk::Failed(which, std::io::Error::other("panicked while reading")));
+            let _ = failure_tx.send(Chunk::Failed(std::io::Error::other("panicked while reading")));
         }
     }
 }
@@ -408,8 +333,8 @@ impl ChunkSource for Receiver<Chunk> {
     }
 }
 
-/// Collect until every sender is dropped (both readers finished) or `deadline`
-/// expires. `Ok((stdout, stderr, complete))`; `Err` iff a `Chunk::Failed`
+/// Collect until the reader is finished (its sender dropped) or `deadline`
+/// expires. `Ok((bytes, complete))`; `Err` iff a `Chunk::Failed`
 /// arrived. Always drains what is already queued before consulting the
 /// deadline, so an expiry never discards bytes that had already arrived —
 /// but once expired, drains exactly what `Receiver::len()` snapshots as
@@ -417,15 +342,14 @@ impl ChunkSource for Receiver<Chunk> {
 /// deadline cannot keep this loop fed forever (`recv_timeout(ZERO)` returns
 /// a queued item rather than timing out, which is why that snapshot, not a
 /// zero-duration `recv_timeout`, is what expiry drains through).
-fn collect(rx: impl ChunkSource, deadline: Deadline) -> std::io::Result<(Vec<u8>, Vec<u8>, bool)> {
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
+fn collect(rx: impl ChunkSource, deadline: Deadline) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut bytes = Vec::new();
 
     loop {
         match deadline.remaining() {
             None => match rx.recv() {
-                Ok(chunk) => absorb(chunk, &mut stdout, &mut stderr)?,
-                Err(_) => return Ok((stdout, stderr, true)), // both senders dropped
+                Ok(chunk) => absorb(chunk, &mut bytes)?,
+                Err(_) => return Ok((bytes, true)), // the sender dropped
             },
             Some(Duration::ZERO) => {
                 // Expired. `len()` is a race-free snapshot of the channel at
@@ -436,33 +360,24 @@ fn collect(rx: impl ChunkSource, deadline: Deadline) -> std::io::Result<(Vec<u8>
                     let chunk = rx
                         .try_recv()
                         .expect("snapshotted length guarantees this chunk is queued");
-                    absorb(chunk, &mut stdout, &mut stderr)?;
+                    absorb(chunk, &mut bytes)?;
                 }
-                return Ok((stdout, stderr, false));
+                return Ok((bytes, false));
             }
             Some(remaining) => match rx.recv_timeout(remaining) {
-                Ok(chunk) => absorb(chunk, &mut stdout, &mut stderr)?,
-                Err(RecvTimeoutError::Disconnected) => return Ok((stdout, stderr, true)),
+                Ok(chunk) => absorb(chunk, &mut bytes)?,
+                Err(RecvTimeoutError::Disconnected) => return Ok((bytes, true)),
                 Err(RecvTimeoutError::Timeout) => {} // re-check: the deadline has now expired
             },
         }
     }
 }
 
-fn absorb(chunk: Chunk, stdout: &mut Vec<u8>, stderr: &mut Vec<u8>) -> std::io::Result<()> {
+/// The only stream read as it is written is stderr, so a reader's failure is named as its.
+fn absorb(chunk: Chunk, bytes: &mut Vec<u8>) -> std::io::Result<()> {
     match chunk {
-        Chunk::Bytes(Which::Stdout, bytes) => stdout.extend_from_slice(&bytes),
-        Chunk::Bytes(Which::Stderr, bytes) => stderr.extend_from_slice(&bytes),
-        // The failing stream is named, not dropped: "a reader failed" and
-        // "the stderr reader failed" are different diagnostics, and this is
-        // the only place that knows which.
-        Chunk::Failed(which, e) => {
-            let stream = match which {
-                Which::Stdout => "stdout",
-                Which::Stderr => "stderr",
-            };
-            return Err(std::io::Error::new(e.kind(), format!("{stream}: {e}")));
-        }
+        Chunk::Bytes(chunk) => bytes.extend_from_slice(&chunk),
+        Chunk::Failed(e) => return Err(std::io::Error::new(e.kind(), format!("stderr: {e}"))),
     }
     Ok(())
 }

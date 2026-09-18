@@ -558,8 +558,8 @@ fn never_installed() -> Id {
 
 /// Whether `result` is the failure of a verb that could not make its reapers — as opposed to one that
 /// made them and went on to discovery.
-fn refused_for_want_of_a_reaper<T: std::fmt::Debug>(result: Result<T>) -> bool {
-    matches!(&result, Err(e) if e.to_string().contains("no thread could be made to reap a `launchctl` request, so none was sent"))
+fn refused_for_want_of_a_reaper<T: std::fmt::Debug>(result: &Result<T>) -> bool {
+    matches!(result, Err(e) if e.to_string().contains("no thread could be made to reap a `launchctl` request, so none was sent"))
 }
 
 /// Every verb makes every reaper it can need before anything else — discovery included, so before
@@ -582,15 +582,18 @@ fn a_verb_one_reaper_short_sends_nothing() {
         kind: Kind::Simple,
     };
     for budget in [Budget::DEFAULT, Budget::Immediate] {
-        let _four = bounded::test_hook::allow(START_REQUESTS - 1);
-        assert!(refused_for_want_of_a_reaper(mgr.start(&id, budget)), "start {budget:?}");
+        let _four = bounded::test_hook::threads(START_REQUESTS - 1);
+        assert!(
+            refused_for_want_of_a_reaper(&mgr.start(&id, budget)),
+            "start {budget:?}"
+        );
     }
-    let _four = bounded::test_hook::allow(START_REQUESTS - 1);
-    assert!(refused_for_want_of_a_reaper(mgr.request_start_after_stop(&id)));
-    let _none = bounded::test_hook::allow(0);
-    assert!(refused_for_want_of_a_reaper(mgr.stop(&id, Budget::DEFAULT)));
-    assert!(refused_for_want_of_a_reaper(mgr.uninstall(&id)));
-    assert!(refused_for_want_of_a_reaper(mgr.install(&spec, false)));
+    let _four = bounded::test_hook::threads(START_REQUESTS - 1);
+    assert!(refused_for_want_of_a_reaper(&mgr.request_start_after_stop(&id)));
+    let _none = bounded::test_hook::threads(0);
+    assert!(refused_for_want_of_a_reaper(&mgr.stop(&id, Budget::DEFAULT)));
+    assert!(refused_for_want_of_a_reaper(&mgr.uninstall(&id)));
+    assert!(refused_for_want_of_a_reaper(&mgr.install(&spec, false)));
 }
 
 /// With every reaper made, the same verbs go on to discovery, which finds nothing installed.
@@ -598,39 +601,97 @@ fn a_verb_one_reaper_short_sends_nothing() {
 fn a_verb_with_its_reapers_goes_on_to_discovery() {
     let mgr = LaunchdManager::new();
     let id = never_installed();
-    let _five = bounded::test_hook::allow(START_REQUESTS);
-    assert!(!refused_for_want_of_a_reaper(mgr.start(&id, Budget::DEFAULT)));
-    let _one = bounded::test_hook::allow(STOP_REQUESTS);
-    assert!(!refused_for_want_of_a_reaper(mgr.stop(&id, Budget::DEFAULT)));
+    let _five = bounded::test_hook::threads(START_REQUESTS);
+    assert!(!refused_for_want_of_a_reaper(&mgr.start(&id, Budget::DEFAULT)));
+    let _one = bounded::test_hook::threads(STOP_REQUESTS);
+    assert!(!refused_for_want_of_a_reaper(&mgr.stop(&id, Budget::DEFAULT)));
 }
 
-/// `restart`'s two legs, and `install --start`'s, draw on reapers `prepare` made before either sent
-/// anything: once it succeeded, neither leg can fail for want of one. It fails as a whole when one
-/// is short. `uninstall` stands in for the install, which would write a plist: each takes one.
+/// Whether `result` is the failure of a verb that could not make the temp files its `launchctl`
+/// calls write to — as opposed to one that made them and went on to discovery.
+fn refused_for_want_of_a_file<T: std::fmt::Debug>(result: &Result<T>) -> bool {
+    matches!(result, Err(e) if e.to_string().contains("no temp file could be made for a `launchctl` call's output, so nothing was sent"))
+}
+
+/// Every verb makes the temp files every `launchctl` call it can make writes to, reads and requests
+/// alike, before anything else: one short, and the verb fails having sent nothing.
 #[skuld::test]
-fn prepared_steps_need_no_reaper_made_later() {
+fn a_verb_one_temp_file_short_sends_nothing() {
     let mgr = LaunchdManager::new();
     let id = never_installed();
-    for (steps, needed) in [
-        ([Step::Stop, Step::Start], STOP_REQUESTS + START_REQUESTS),
-        ([Step::Install, Step::Start], INSTALL_REQUESTS + START_REQUESTS),
+    let spec = DaemonSpec {
+        id: id.clone(),
+        name: id.to_string(),
+        command: vec!["/bin/true".to_string()],
+        cwd: None,
+        env: Default::default(),
+        user: User::Root,
+        restart: Restart::Always,
+        restart_delay: None,
+        logs: None,
+        kind: Kind::Simple,
+    };
+    let short = |calls: usize| bounded::test_hook::temp_files(calls * FILES_PER_CALL - 1);
+    for budget in [Budget::DEFAULT, Budget::Immediate] {
+        let _short = short(START_CALLS);
+        assert!(refused_for_want_of_a_file(&mgr.start(&id, budget)), "start {budget:?}");
+    }
+    {
+        let _short = short(START_CALLS);
+        assert!(refused_for_want_of_a_file(&mgr.request_start_after_stop(&id)));
+    }
+    let _short = short(STOP_CALLS);
+    assert!(refused_for_want_of_a_file(&mgr.stop(&id, Budget::DEFAULT)));
+    let _short = short(STOP_CALLS);
+    assert!(refused_for_want_of_a_file(&mgr.uninstall(&id)));
+    let _short = short(INSTALL_CALLS);
+    assert!(refused_for_want_of_a_file(&mgr.install(&spec, false)));
+    let _enough = bounded::test_hook::temp_files(START_CALLS * FILES_PER_CALL);
+    assert!(!refused_for_want_of_a_file(&mgr.start(&id, Budget::DEFAULT)));
+}
+
+/// `restart`'s two legs, and `install --start`'s, draw on reapers and temp files `prepare` made
+/// before either sent anything: once it succeeded, neither leg can fail for want of one. It fails as
+/// a whole when one is short. `uninstall` stands in for the install, which would write a plist: each
+/// takes one reaper, and no more temp files than the install.
+#[skuld::test]
+fn prepared_steps_need_nothing_made_later() {
+    let mgr = LaunchdManager::new();
+    let id = never_installed();
+    for (steps, reapers, calls) in [
+        (
+            [Step::Stop, Step::Start],
+            STOP_REQUESTS + START_REQUESTS,
+            STOP_CALLS + START_CALLS,
+        ),
+        (
+            [Step::Install, Step::Start],
+            INSTALL_REQUESTS + START_REQUESTS,
+            INSTALL_CALLS + START_CALLS,
+        ),
     ] {
         {
-            let _short = bounded::test_hook::allow(needed - 1);
+            let _short = bounded::test_hook::threads(reapers - 1);
+            assert!(mgr.prepare(&steps).is_err(), "{steps:?}");
+        }
+        {
+            let _short = bounded::test_hook::temp_files(calls * FILES_PER_CALL - 1);
             assert!(mgr.prepare(&steps).is_err(), "{steps:?}");
         }
         let prepared = mgr.prepare(&steps).expect("prepare");
-        let _none = bounded::test_hook::allow(0);
+        let _no_thread = bounded::test_hook::threads(0);
+        let _no_file = bounded::test_hook::temp_files(0);
         let first = if steps[0] == Step::Stop {
             mgr.stop(&id, Budget::DEFAULT)
         } else {
             mgr.uninstall(&id)
         };
-        assert!(!refused_for_want_of_a_reaper(first), "{steps:?}");
-        assert!(
-            !refused_for_want_of_a_reaper(mgr.start(&id, Budget::DEFAULT)),
-            "{steps:?}"
-        );
+        assert!(first.is_err(), "{steps:?}: nothing is installed");
+        assert!(!refused_for_want_of_a_reaper(&first), "{steps:?}");
+        assert!(!refused_for_want_of_a_file(&first), "{steps:?}");
+        let started = mgr.start(&id, Budget::DEFAULT);
+        assert!(!refused_for_want_of_a_reaper(&started), "{steps:?}");
+        assert!(!refused_for_want_of_a_file(&started), "{steps:?}");
         drop(prepared);
     }
 }
