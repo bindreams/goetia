@@ -80,30 +80,17 @@ fn run_with(
 /// One daemon's restart, spending `budget` across both legs.
 ///
 /// Under a budget that waits the legs need nothing between them: the stop
-/// leg is only ever handed a budget that waits (see [`leg`]), so a `stop`
-/// that returned `Ok` has confirmed stopped, and one that ran out returned
-/// `WaitTimeout` instead, so the start is never reached. Under a budget that
-/// does not wait there is nothing to confirm and deliberately nothing is
-/// read — "don't wait, just do the steps". Either way no state is queried
-/// between the two, which is what keeps the exit code from being a
+/// leg is only ever handed a budget that waits (see [`stop_leg`]), so a
+/// `stop` that returned `Ok` has confirmed stopped, and one that ran out
+/// returned `WaitTimeout` instead, so the start is never reached. Under a
+/// budget that does not wait there is nothing to confirm and deliberately
+/// nothing is read — "don't wait, just do the steps". Either way no state is
+/// queried between the two, which is what keeps the exit code from being a
 /// stopwatch question.
 fn restart(mgr: &dyn ServiceManager, id: &Id, budget: Budget, start_clock: &dyn Fn(Budget) -> Deadline) -> Result<()> {
     let deadline = start_clock(budget);
-    match leg(budget, budget_for(deadline)) {
-        Leg::Under(stop_budget) => mgr
-            .stop(id, stop_budget)
-            .map_err(|e| abandoned_before_start(e, budget))?,
-        Leg::Spent => {
-            // The request still goes out — the budget never decides that — and
-            // only its confirmation is not waited for, which under a budget the
-            // user bounded is a timeout like any other.
-            mgr.stop(id, Budget::Immediate)?;
-            return Err(abandoned_before_start(
-                budget::timed_out(id.as_str(), "stopped", budget),
-                budget,
-            ));
-        }
-    }
+    mgr.stop(id, stop_leg(budget, budget_for(deadline)))
+        .map_err(|e| abandoned_before_start(e, budget))?;
 
     let started = match leg(budget, budget_for(deadline)) {
         Leg::Under(left) if left.waits() => mgr.start(id, left),
@@ -124,7 +111,8 @@ fn restart(mgr: &dyn ServiceManager, id: &Id, budget: Budget, start_clock: &dyn 
 enum Leg {
     /// Issue it under this budget.
     Under(Budget),
-    /// A bounded budget ran out before this leg: a timeout.
+    /// A bounded budget ran out before this leg: a timeout. The start leg
+    /// is then not issued; the stop leg still is, under [`SPENT`].
     Spent,
 }
 
@@ -145,6 +133,23 @@ fn leg(requested: Budget, left: Budget) -> Leg {
         return Leg::Spent;
     }
     Leg::Under(left)
+}
+
+/// A bounded budget with nothing left, as the stop leg is handed one: the
+/// least bound there is. It waits, so every backend takes the path a bounded
+/// stop that ran out takes — the stop issued, then `WaitTimeout`, or `Ok` if
+/// stopped is confirmed after all — and never `Immediate`'s, which on launchd
+/// runs `bootout` to completion unbounded.
+const SPENT: Budget = Budget::Bounded(Duration::from_nanos(1));
+
+/// The budget the stop leg is issued under. Always one: the stop goes out
+/// whatever is left of the budget, and a bounded budget already spent is
+/// handed on as [`SPENT`] rather than dropped or turned into `Immediate`.
+fn stop_leg(requested: Budget, left: Budget) -> Budget {
+    match leg(requested, left) {
+        Leg::Under(left) => left,
+        Leg::Spent => SPENT,
+    }
 }
 
 // wording =============================================================================================================
@@ -178,8 +183,8 @@ fn abandoned_before_start(e: Error, budget: Budget) -> Error {
 }
 
 /// The start leg's [`Leg::Spent`]: the stop *succeeded* — confirmed, under a
-/// budget that waited — and consumed the whole budget, leaving nothing to
-/// watch a start with.
+/// budget that waited — and nothing of the budget was left to watch a start
+/// with, whether the stop spent it or it was gone before the stop was issued.
 ///
 /// `awaited` is `"running"` — the state the restart was asked to reach and
 /// did not — rather than `"stopped"`, which it did reach and must not be
