@@ -105,12 +105,15 @@ fn restart(mgr: &dyn ServiceManager, id: &Id, budget: Budget, start_clock: &dyn 
         }
     }
 
-    let start_budget = match leg(budget, budget_for(deadline)) {
-        Leg::Under(left) => left,
+    let started = match leg(budget, budget_for(deadline)) {
+        Leg::Under(left) if left.waits() => mgr.start(id, left),
+        // Not the idempotent `start`: over a stop nobody confirmed, a manager
+        // answering "already running" may be seeing the instance that stop is
+        // taking down, and that answer must not read as a restart.
+        Leg::Under(_) => mgr.request_start_after_stop(id),
         Leg::Spent => return Err(spent_before_start(id, budget)),
     };
-    mgr.start(id, start_budget)
-        .map_err(|e| after_start_failed(id, budget, e))
+    started.map_err(|e| after_start_failed(id, budget, e))
 }
 
 // the abandonment rule ================================================================================================

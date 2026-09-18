@@ -73,7 +73,10 @@ pub trait ScmActor {
     /// what blocking they do is the SCM's own — not a wait this module
     /// created, and not one it can bound from the client side.
     fn control_stop(&mut self) -> io::Result<()>;
-    fn start(&mut self) -> io::Result<()>;
+    /// `StartServiceW`. What an `ERROR_SERVICE_ALREADY_RUNNING` means is not
+    /// decided here but by each caller, from the state the follow-up query
+    /// reported — see [`StartReply`].
+    fn start(&mut self) -> io::Result<StartReply>;
     /// Block in an alertable wait until the armed notification fires and
     /// return the service's observed state from the callback buffer;
     /// `Ok(None)` iff `deadline` expired with nothing delivered.
@@ -104,6 +107,30 @@ pub fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result
     }
 }
 
+/// What `StartServiceW` answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartReply {
+    /// The SCM accepted the start.
+    Accepted,
+    /// `ERROR_SERVICE_ALREADY_RUNNING` (1056), with the state a follow-up
+    /// query reported.
+    AlreadyRunning(QueriedState),
+}
+
+/// `reply` to a caller for whom a service already on its way to running
+/// counts as started — the plain `start` verb, idempotent per its trait doc
+/// comment. See [`already_running_is_recoverable`].
+fn accept_as_started(reply: StartReply) -> io::Result<()> {
+    match reply {
+        StartReply::Accepted => Ok(()),
+        StartReply::AlreadyRunning(queried) if already_running_is_recoverable(queried) => Ok(()),
+        StartReply::AlreadyRunning(queried) => Err(io::Error::other(format!(
+            "StartServiceW reported ERROR_SERVICE_ALREADY_RUNNING, but the service is actually \
+             {queried:?} — neither Running nor StartPending, so nothing is on its way to running"
+        ))),
+    }
+}
+
 /// Start the service, gated strictly on a real `RUNNING` callback; re-arms
 /// after a non-terminal callback, under the same `deadline` throughout —
 /// which is what makes a service that chatters `START_PENDING` forever
@@ -117,7 +144,7 @@ pub fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Resul
     // Issued even when the arm expired: only the *waiting* is bounded, and a
     // service left unstarted because goetia ran out of budget while arming
     // would be the worst of both answers.
-    a.start()?;
+    accept_as_started(a.start()?)?;
     if armed == Waited::Expired {
         return Ok(Waited::Expired);
     }
@@ -147,7 +174,23 @@ pub fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Resul
 /// the call site so that what happens when we do *not* wait is covered by
 /// the same fake-actor tests as everything else.
 pub fn request_start<A: ScmActor>(a: &mut A) -> io::Result<()> {
-    a.start()
+    accept_as_started(a.start()?)
+}
+
+/// `daemon restart --timeout 0`'s start: [`request_start`], except that
+/// `ERROR_SERVICE_ALREADY_RUNNING` is a refusal whatever the query says. The
+/// stop just before it was issued and not waited for, and a `type: simple`
+/// service reads `RUNNING` for its whole teardown — `goetia-shim` never
+/// reports `STOP_PENDING` — so a queried `Running` here may be the very
+/// instance that stop is taking down.
+pub fn request_start_after_stop<A: ScmActor>(a: &mut A) -> io::Result<()> {
+    match a.start()? {
+        StartReply::Accepted => Ok(()),
+        StartReply::AlreadyRunning(queried) => Err(io::Error::other(format!(
+            "StartServiceW reported ERROR_SERVICE_ALREADY_RUNNING with the service {queried:?}: \
+             the stop issued just before it has not taken effect, so the start was refused"
+        ))),
+    }
 }
 
 /// [`request_start`]'s mirror: issue the stop control and return.
@@ -204,8 +247,8 @@ pub fn close_then_drain<H: ScmHandles>(h: &mut H) {
 }
 
 /// The state a follow-up `query_status` reported — one variant per
-/// `windows_service::service::ServiceState`, mirrored here so
-/// [`already_running_is_recoverable`] is a decision about a plain enum and
+/// `windows_service::service::ServiceState`, mirrored here so what an
+/// `ERROR_SERVICE_ALREADY_RUNNING` means is a decision about a plain enum and
 /// can be tested off Windows.
 ///
 /// Deliberately not [`Observed`], which collapses `StartPending` and
@@ -224,22 +267,26 @@ pub enum QueriedState {
 
 /// Whether a `StartServiceW` that failed with `ERROR_SERVICE_ALREADY_RUNNING`
 /// (1056) still counts as a start, given the state a follow-up query
-/// reported. Consulted from both callers: [`start_via_notify`], which has a
-/// wait armed, and [`request_start`], which arms nothing.
+/// reported — for the plain `start` verb only: [`start_via_notify`], which
+/// has a wait armed, and [`request_start`], which arms nothing.
+/// [`request_start_after_stop`] never consults it.
 ///
 /// 1056 means only "`dwCurrentState` is not `SERVICE_STOPPED`", which lumps
 /// together states the service is on its way to running from and states it
-/// is not. `Running` and `StartPending` are the two it is, so the start the
-/// caller asked for needs nothing further — which is the whole of what
-/// [`request_start`] reports, and what the armed wait then confirms, since
-/// `want_to_mask` arms `SERVICE_NOTIFY_START_PENDING` in *both* of its
-/// `WantState::Running` branches and a service in either state
-/// immediate-fires it. `StartPending` in particular is what a service is in
-/// when something else started it a moment earlier — rejecting it fails a
-/// start that was going to succeed. For every other state the service is not
-/// heading for running at all, so accepting 1056 would report a start that
-/// did not happen — and on the waiting path the registration holds no bit
-/// that can fire, so it would also block until the deadline.
+/// is not. `Running` and `StartPending` are the two it is — for a caller that
+/// did not just issue a stop. For `restart --timeout 0` a queried `Running`
+/// may be the instance its own unconfirmed stop is taking down, which is why
+/// that caller treats every 1056 as a refusal instead. For a plain start
+/// nothing further is needed — which is the whole of what [`request_start`]
+/// reports, and what the armed wait then confirms, since `want_to_mask` arms
+/// `SERVICE_NOTIFY_START_PENDING` in *both* of its `WantState::Running`
+/// branches and a service in either state immediate-fires it. `StartPending`
+/// in particular is what a service is in when something else started it a
+/// moment earlier — rejecting it fails a start that was going to succeed.
+/// For every other state the service is not heading for running at all, so
+/// accepting 1056 would report a start that did not happen — and on the
+/// waiting path the registration holds no bit that can fire, so it would
+/// also block until the deadline.
 #[must_use]
 pub fn already_running_is_recoverable(queried: QueriedState) -> bool {
     matches!(queried, QueriedState::Running | QueriedState::StartPending)

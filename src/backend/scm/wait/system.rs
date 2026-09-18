@@ -17,7 +17,7 @@ use windows_sys::Win32::System::Services::{
 };
 use windows_sys::Win32::System::Threading::{INFINITE, SleepEx};
 
-use super::{Deadline, Observed, QueriedState, Waited, WantState, already_running_is_recoverable};
+use super::{Deadline, Observed, QueriedState, StartReply, Waited, WantState};
 
 /// `windows-service`'s `Error` does not implement `Into<io::Error>` for
 /// every variant (it also carries parse errors this module never
@@ -278,36 +278,20 @@ impl super::ScmActor for SystemScmActor {
         }
     }
 
-    fn start(&mut self) -> io::Result<()> {
+    fn start(&mut self) -> io::Result<StartReply> {
         self.started = true;
         match self.service()?.start::<&std::ffi::OsStr>(&[]) {
-            Ok(()) => Ok(()),
-            // 1056 does not say which non-STOPPED state the service is
-            // in, so query it and let `already_running_is_recoverable`
-            // decide — that is where the reasoning lives, and it is
+            Ok(()) => Ok(StartReply::Accepted),
+            // 1056 does not say which non-STOPPED state the service is in, so
+            // query it and hand both back: whether that counts as a start is
+            // the caller's decision (`accept_as_started` for the plain verb,
+            // `request_start_after_stop` for `restart --timeout 0`), and it is
             // tested on every platform.
-            //
-            // Accepting a queried `Running` is right here and would be
-            // WRONG for a `restart` that issued its start leg without a
-            // confirmed `Stopped`: a `type: simple` service reads RUNNING
-            // for its whole teardown (`goetia-shim` never reports
-            // STOP_PENDING), so this arm would report a successful start
-            // for a service that is about to go down and stay down.
-            // `restart_does_not_start_after_a_stop_that_timed_out` and
-            // `restart_with_no_budget_reports_a_rejected_start` in
-            // `tests/cli_dispatch.rs` keep that true.
             Err(windows_service::Error::Winapi(e))
                 if e.raw_os_error() == Some(ERROR_SERVICE_ALREADY_RUNNING as i32) =>
             {
-                match self.service()?.query_status() {
-                    Ok(status) if already_running_is_recoverable(queried_state(status.current_state)) => Ok(()),
-                    Ok(status) => Err(io::Error::other(format!(
-                        "StartServiceW reported ERROR_SERVICE_ALREADY_RUNNING, but the service is actually \
-                             {:?} — neither Running nor StartPending, so nothing is on its way to running",
-                        status.current_state
-                    ))),
-                    Err(query_err) => Err(to_io_error(query_err)),
-                }
+                let status = self.service()?.query_status().map_err(to_io_error)?;
+                Ok(StartReply::AlreadyRunning(queried_state(status.current_state)))
             }
             Err(e) => Err(to_io_error(e)),
         }

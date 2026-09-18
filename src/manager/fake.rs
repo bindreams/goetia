@@ -601,6 +601,22 @@ impl ServiceManager for Fake {
         Ok(())
     }
 
+    /// Models the strictest manager the contract allows, SCM's: a service
+    /// still `Running` refuses the start, since the request-only `stop` before
+    /// it settled nothing. Recorded as `start`, which is what it asks for.
+    fn request_start_after_stop(&self, id: &Id) -> Result<()> {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.calls.push(("start", id.as_str().to_string()));
+        let entry = state.get_mut(id)?;
+        require_ours(entry, id)?;
+        if entry.state == State::Running {
+            return Err(Error::Other(format!(
+                "start `{id}`: refused as already running — the stop issued before it has not taken effect"
+            )));
+        }
+        Ok(())
+    }
+
     fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.calls.push(("stop", id.as_str().to_string()));

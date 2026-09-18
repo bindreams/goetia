@@ -637,3 +637,40 @@ fn a_running_entry_is_left_alone_by_a_stop_under_a_budget_that_does_not_wait() {
         );
     }
 }
+
+// request_start_after_stop ============================================================================================
+
+/// The Fake's request-only `stop` settles nothing, so an entry that was running still is when
+/// `restart --timeout 0`'s start arrives — the shape a Windows `type: simple` service presents, and
+/// the one answer that start must refuse.
+#[skuld::test]
+fn a_start_request_after_an_unconfirmed_stop_is_refused_while_still_running() {
+    let fake = Fake::new();
+    let spec = mk("healthy");
+    fake.install(&spec, false).unwrap();
+    fake.start(&spec.id, Budget::DEFAULT).unwrap();
+    fake.stop(&spec.id, Budget::Immediate).unwrap();
+
+    assert!(fake.request_start_after_stop(&spec.id).is_err());
+    assert_eq!(
+        fake.calls(),
+        vec![
+            ("start", "healthy".to_string()),
+            ("stop", "healthy".to_string()),
+            ("start", "healthy".to_string())
+        ],
+        "a refused request was still asked for"
+    );
+}
+
+/// Accepted, and — request-only — settling nothing.
+#[skuld::test]
+fn a_start_request_over_a_stopped_entry_is_accepted_and_settles_nothing() {
+    let fake = Fake::new();
+    let spec = mk("healthy");
+    fake.install(&spec, false).unwrap();
+
+    fake.request_start_after_stop(&spec.id).unwrap();
+
+    assert_eq!(fake.status(&spec.id).unwrap().state, State::Stopped);
+}

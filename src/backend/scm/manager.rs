@@ -214,6 +214,18 @@ impl ServiceManager for ScmManager {
         }
     }
 
+    /// [`super::wait::request_start_after_stop`]: every
+    /// `ERROR_SERVICE_ALREADY_RUNNING` is a refusal here, since a `type:
+    /// simple` service reads `RUNNING` for its whole teardown.
+    fn request_start_after_stop(&self, id: &Id) -> Result<()> {
+        let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
+        require_ours(id)?;
+        drop(service);
+        let mut actor = super::wait::SystemScmActor::open(id.as_str())
+            .map_err(|e| Error::Other(format!("open `{id}` to start it: {e}")))?;
+        super::wait::request_start_after_stop(&mut actor).map_err(|e| Error::Other(format!("start `{id}`: {e}")))
+    }
+
     fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
         // First, so discovery spends the budget too; `stop_via_notify` issues
         // the stop whatever is left of it.

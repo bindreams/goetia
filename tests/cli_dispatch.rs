@@ -219,12 +219,6 @@ struct FlakyManager {
     /// no `install`-path fixture has, so injecting it is the only way to
     /// put it in front of `run_id_verb` and `install`'s own classifier.
     wait_timeout_start_for: Option<String>,
-    /// `start` is refused because the service is not stopped — SCM's
-    /// `ERROR_SERVICE_ALREADY_RUNNING` (1056) over a service still coming
-    /// down. The shape `restart --timeout 0` meets after issuing a stop it
-    /// did not confirm, and the one `Fake` cannot produce: its own `start`
-    /// is idempotent and never refuses.
-    reject_start_for: Option<String>,
     /// Makes `install`/`preview_install` return the `Conflict` flavour whose
     /// cause lies outside the directory the backend writes — systemd's
     /// `<id>.service.d` under `/usr/lib` or `.control`. `Fake` has no
@@ -249,15 +243,6 @@ fn unqueryable_failure() -> goetia::Error {
 /// not a look-alike that could drift from it.
 fn injected_wait_timeout(id: &Id) -> goetia::Error {
     goetia::manager::budget::timed_out(id.as_str(), "running", goetia::manager::Budget::DEFAULT)
-}
-
-/// A `start` step that was issued and refused. `Error::Other` is what a backend reports for it —
-/// the step failed, and nothing about the id's *installation* is in doubt.
-fn injected_start_rejection(id: &Id) -> goetia::Error {
-    goetia::Error::Other(format!(
-        "start `{id}`: StartServiceW reported ERROR_SERVICE_ALREADY_RUNNING, but the service is \
-         actually STOP_PENDING (injected test failure)"
-    ))
 }
 
 fn injected_failure(id: &Id) -> goetia::Error {
@@ -285,6 +270,23 @@ fn unclearable_conflict(recovery: &str) -> goetia::decide::Outcome {
     goetia::decide::Outcome::Conflict {
         artifact_diff: "- desired\n+ on disk\n".to_string(),
         unclearable_recovery: Some(recovery.to_string()),
+    }
+}
+
+impl FlakyManager {
+    /// The failure a `start`-shaped call is seeded to report — shared by `start` and
+    /// `request_start_after_stop`, which are two ways of asking for the same thing.
+    fn injected_start(&self, id: &Id) -> goetia::Result<()> {
+        if self.fail_start_for.as_deref() == Some(id.as_str()) {
+            return Err(injected_failure(id));
+        }
+        if self.undetermined_start_for.as_deref() == Some(id.as_str()) {
+            return Err(injected_indeterminacy(id));
+        }
+        if self.wait_timeout_start_for.as_deref() == Some(id.as_str()) {
+            return Err(injected_wait_timeout(id));
+        }
+        Ok(())
     }
 }
 
@@ -320,19 +322,12 @@ impl ServiceManager for FlakyManager {
         self.inner.disable(id)
     }
     fn start(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
-        if self.fail_start_for.as_deref() == Some(id.as_str()) {
-            return Err(injected_failure(id));
-        }
-        if self.undetermined_start_for.as_deref() == Some(id.as_str()) {
-            return Err(injected_indeterminacy(id));
-        }
-        if self.wait_timeout_start_for.as_deref() == Some(id.as_str()) {
-            return Err(injected_wait_timeout(id));
-        }
-        if self.reject_start_for.as_deref() == Some(id.as_str()) {
-            return Err(injected_start_rejection(id));
-        }
+        self.injected_start(id)?;
         self.inner.start(id, budget)
+    }
+    fn request_start_after_stop(&self, id: &Id) -> goetia::Result<()> {
+        self.injected_start(id)?;
+        self.inner.request_start_after_stop(id)
     }
     fn stop(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
         self.inner.stop(id, budget)
@@ -1017,6 +1012,9 @@ impl ServiceManager for PanicsOnStart {
         self.0.disable(id)
     }
     fn start(&self, _id: &Id, _budget: Budget) -> goetia::Result<()> {
+        panic!("restart on an absent id must never reach start")
+    }
+    fn request_start_after_stop(&self, _id: &Id) -> goetia::Result<()> {
         panic!("restart on an absent id must never reach start")
     }
     fn stop(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
@@ -2887,6 +2885,9 @@ impl ServiceManager for PanicsOnStatus {
     fn start(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
         self.0.start(id, budget)
     }
+    fn request_start_after_stop(&self, id: &Id) -> goetia::Result<()> {
+        self.0.request_start_after_stop(id)
+    }
     fn stop(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
         self.0.stop(id, budget)
     }
@@ -3081,28 +3082,32 @@ fn restart_with_no_budget_issues_both_steps_without_confirming() {
     assert_eq!(out, "frpc: restart requested\n");
 }
 
-/// The start step was issued and refused, so nothing was established — `4`, never `0`.
-/// `cli::restart` must not read the trait's idempotent `start` `Ok` as proof the service cycled,
-/// and must not read a refusal as proof that it did not.
+/// `restart --timeout 0` over a daemon that is up, in the shape the Windows backend really meets:
+/// the stop request is accepted, and the service goes on reading `RUNNING` for its whole teardown —
+/// `goetia-shim` never reports `STOP_PENDING` — so the start that follows is answered "already
+/// running". The `Fake` models exactly that: its request-only `stop` settles nothing, so the entry
+/// is still `Running` when the start arrives, and its plain `start` is idempotent over it, as SCM's
+/// is over a queried `RUNNING`.
+///
+/// That answer is a refused start, not a restart: `4`, never `0`. `cli::restart` must not read
+/// the trait's idempotent `start` `Ok` as proof the service cycled, and must not read a refusal as
+/// proof that it did not.
 #[skuld::test]
-fn restart_with_no_budget_reports_a_rejected_start() {
-    let inner = Fake::new();
-    inner.install(&mk("frpc"), false).unwrap();
-    let mgr = FlakyManager {
-        inner,
-        reject_start_for: Some("frpc".to_string()),
-        ..Default::default()
-    };
+fn restart_with_no_budget_reports_a_start_refused_over_a_service_still_up() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_state("frpc", State::Running);
 
-    let (code, out, err) = dispatch_with(
-        &["goetia", "daemon", "restart", "frpc", "--timeout", "0"],
-        &mgr,
-        &|| true,
-    );
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "restart", "frpc", "--timeout", "0"], &fake);
 
     assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
     assert_eq!(out, "", "nothing may claim the daemon was restarted: {out}");
-    assert!(err.contains("frpc"), "{err}");
+    assert!(err.contains("may or may not have restarted"), "{err}");
+    assert_eq!(
+        fake.calls(),
+        vec![("stop", "frpc".to_string()), ("start", "frpc".to_string())],
+        "both steps are still issued"
+    );
 }
 
 /// The non-waiting path must not absorb an `Undetermined` start leg into `Error::Unestablished`,

@@ -20,6 +20,8 @@ struct FakeScm {
     waits: VecDeque<Option<Observed>>,
     what_arm_reports: Waited,
     start_fails: bool,
+    /// What `start` answers when it does not fail.
+    start_reply: StartReply,
     /// The deadline each `wait_callback` was handed, in call order.
     deadlines: Vec<Deadline>,
     /// The deadline each `arm` was handed, in call order.
@@ -33,6 +35,7 @@ impl FakeScm {
             waits: waits.into(),
             what_arm_reports: Waited::Confirmed,
             start_fails: false,
+            start_reply: StartReply::Accepted,
             deadlines: vec![],
             arm_deadlines: vec![],
         }
@@ -49,6 +52,13 @@ impl FakeScm {
     /// `StartPending`.
     fn rejecting_start(mut self) -> Self {
         self.start_fails = true;
+        self
+    }
+
+    /// `start` answers `ERROR_SERVICE_ALREADY_RUNNING`, with `queried` as the
+    /// follow-up query's state.
+    fn already_running(mut self, queried: QueriedState) -> Self {
+        self.start_reply = StartReply::AlreadyRunning(queried);
         self
     }
 
@@ -70,12 +80,12 @@ impl ScmActor for FakeScm {
         self.log.push("control_stop");
         Ok(())
     }
-    fn start(&mut self) -> std::io::Result<()> {
+    fn start(&mut self) -> std::io::Result<StartReply> {
         self.log.push("start");
         if self.start_fails {
             return Err(std::io::Error::other("scripted start failure"));
         }
-        Ok(())
+        Ok(self.start_reply)
     }
     fn wait_callback(&mut self, deadline: Deadline) -> std::io::Result<Option<Observed>> {
         self.log.push("wait");
@@ -363,6 +373,58 @@ fn no_other_queried_state_recovers_an_already_running_start() {
             "{state:?} must not be recoverable"
         );
     }
+}
+
+/// The plain verb is idempotent: a 1056 over a service the query reports
+/// `Running` is a start, on both paths.
+#[skuld::test]
+fn a_plain_start_over_a_running_service_is_a_start() {
+    let mut fake = FakeScm::new([]).already_running(QueriedState::Running);
+    request_start(&mut fake).unwrap();
+
+    let mut fake = FakeScm::new([Some(Observed::Running)]).already_running(QueriedState::Running);
+    assert_eq!(start_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+}
+
+#[skuld::test]
+fn a_plain_start_over_a_stopping_service_is_refused() {
+    let mut fake = FakeScm::new([]).already_running(QueriedState::StopPending);
+    assert!(request_start(&mut fake).is_err());
+}
+
+/// `restart --timeout 0`'s start, over the service the real `goetia-shim`
+/// presents after an unconfirmed stop: `RUNNING` for its whole teardown,
+/// never `STOP_PENDING`. That 1056 is a refusal — reading it as a start
+/// reports a restart that leaves the daemon down.
+#[skuld::test]
+fn a_start_after_an_unconfirmed_stop_refuses_a_service_still_reading_running() {
+    let mut fake = FakeScm::new([]).already_running(QueriedState::Running);
+    assert!(request_start_after_stop(&mut fake).is_err());
+    assert_eq!(fake.log, vec!["start"], "it arms nothing and waits for nothing");
+}
+
+/// Every 1056, whatever the query says: none of them establishes that the
+/// stop just issued has taken effect.
+#[skuld::test]
+fn a_start_after_an_unconfirmed_stop_refuses_every_already_running_answer() {
+    for state in [
+        QueriedState::Stopped,
+        QueriedState::StartPending,
+        QueriedState::StopPending,
+        QueriedState::Running,
+        QueriedState::ContinuePending,
+        QueriedState::PausePending,
+        QueriedState::Paused,
+    ] {
+        let mut fake = FakeScm::new([]).already_running(state);
+        assert!(request_start_after_stop(&mut fake).is_err(), "{state:?}");
+    }
+}
+
+#[skuld::test]
+fn a_start_after_an_unconfirmed_stop_that_the_scm_accepts_is_ok() {
+    let mut fake = FakeScm::new([]);
+    request_start_after_stop(&mut fake).unwrap();
 }
 
 // the lagging-registration (1294) retry loop --------------------------------------------------------------------------

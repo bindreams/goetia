@@ -1279,6 +1279,13 @@ impl ServiceManager for LaunchdManager {
         Ok(())
     }
 
+    /// The plain request-only start. The stop before it had no request-only
+    /// form and ran `bootout` to completion, so the instance it stopped is
+    /// gone and cannot be what answers for the label here.
+    fn request_start_after_stop(&self, id: &Id) -> Result<()> {
+        self.start(id, Budget::Immediate)
+    }
+
     fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
         // First, so discovery spends the budget too. Under a budget that
         // does not wait this is an explicitly UNBOUNDED deadline, not

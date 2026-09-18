@@ -257,6 +257,13 @@ impl ServiceManager for Systemd {
         start_with(id.as_str(), budget, &REAL_STEPS)
     }
 
+    /// The plain request-only start: systemd queues a start job behind a
+    /// pending stop job rather than answering "already running", so there is
+    /// no answer here to misread.
+    fn request_start_after_stop(&self, id: &Id) -> Result<()> {
+        start_with(id.as_str(), Budget::Immediate, &REAL_STEPS)
+    }
+
     fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
         stop_with(id.as_str(), budget, &REAL_STEPS)
     }

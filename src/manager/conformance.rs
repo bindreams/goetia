@@ -122,6 +122,7 @@ pub fn run(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
     reinstall_preserves_enablement(mgr, mk, &mut cleanup.ids);
     start_and_stop_are_idempotent(mgr, mk, &mut cleanup.ids);
     starting_with_no_budget_is_accepted_and_establishes_nothing(mgr, mk, &mut cleanup.ids);
+    a_start_request_after_a_confirmed_stop_is_accepted(mgr, mk, &mut cleanup.ids);
     list_and_status_agree_on_pid(mgr, mk, &mut cleanup.ids);
     refuses_foreign_even_with_force(mgr, mk);
     foreign_refuses_every_verb(mgr, mk);
@@ -263,6 +264,10 @@ fn foreign_refuses_every_verb(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> Dae
         mgr.stop(&spec.id, Budget::DEFAULT).is_err(),
         "stop must refuse a foreign id"
     );
+    assert!(
+        mgr.request_start_after_stop(&spec.id).is_err(),
+        "request_start_after_stop must refuse a foreign id"
+    );
     assert!(mgr.status(&spec.id).is_err(), "status must refuse a foreign id");
 }
 
@@ -379,6 +384,36 @@ fn starting_with_no_budget_is_accepted_and_establishes_nothing(
 
     mgr.start(&spec.id, Budget::Immediate)
         .expect("a start with no budget issues the request and returns Ok");
+
+    mgr.start(&spec.id, Budget::DEFAULT)
+        .expect("a start that waits must still reach the service manager");
+    assert_eq!(
+        mgr.status(&spec.id).expect("status after a start that waited").state,
+        State::Running,
+        "id {}",
+        spec.id
+    );
+}
+
+/// `request_start_after_stop` refuses a service that still answers "already
+/// running", and nothing portable can hold every backend to *when* it says
+/// that. What every backend must do is accept the start once the stop before
+/// it is confirmed — a refusal there would fail every `restart --timeout 0`
+/// — and leave the service startable. Like the scenario above, nothing is
+/// asserted about the state the request itself leaves.
+fn a_start_request_after_a_confirmed_stop_is_accepted(
+    mgr: &dyn ServiceManager,
+    mk: &dyn Fn(&str) -> DaemonSpec,
+    cleanup: &mut Vec<Id>,
+) {
+    let spec = mk(&fresh_id("start-after-stop"));
+    mgr.install(&spec, false).expect("install");
+    cleanup.push(spec.id.clone());
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+
+    mgr.request_start_after_stop(&spec.id)
+        .expect("a start request over a confirmed stop must be accepted");
 
     mgr.start(&spec.id, Budget::DEFAULT)
         .expect("a start that waits must still reach the service manager");

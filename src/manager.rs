@@ -105,6 +105,19 @@ pub trait ServiceManager {
     /// [`Error::Undetermined`]: crate::Error::Undetermined
     fn start(&self, id: &Id, budget: Budget) -> Result<()>;
 
+    /// `daemon restart --timeout 0`'s second step: request a start right
+    /// after a stop request nobody waited for, and return.
+    ///
+    /// **Unlike [`Self::start`], not idempotent over a service that is still
+    /// up.** A manager answering "already running" here has refused the
+    /// start, because the instance it sees may be the one the stop is still
+    /// taking down: a Windows `type: simple` service reads `RUNNING` for its
+    /// whole teardown (`goetia-shim` never reports `STOP_PENDING`), and
+    /// reading that answer as a start reports a restart that leaves the
+    /// daemon down. `Ok(())` means the manager accepted a start request and
+    /// nothing more. Takes no budget: it never waits.
+    fn request_start_after_stop(&self, id: &Id) -> Result<()>;
+
     /// Stop the service now, waiting up to `budget` for it. Does not change
     /// its boot-enablement.
     ///
