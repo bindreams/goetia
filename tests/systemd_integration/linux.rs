@@ -899,6 +899,35 @@ fn an_offline_systemctl_is_never_reported_as_started_or_stopped() {
     }
 }
 
+/// The one `stop` with no job that is not a failure: a unit systemd cannot load, and that is not
+/// running. `systemctl stop` answers it "not loaded" (exit `5`) and enqueues nothing — there is
+/// nothing to stop — under every budget. A drop-in that empties `ExecStart=` is the unit it cannot
+/// load.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_stop_of_a_unit_systemd_cannot_load_has_nothing_to_stop() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let mgr = Systemd::new();
+    mgr.install(&mk(guard.id()), false).expect("install");
+    let dir = dropin_dir(guard.id());
+    fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
+    fs::write(dir.join("bad.conf"), "[Service]\nExecStart=\n").expect("write drop-in");
+    cmd::run("systemctl", &["daemon-reload"]).expect_ok();
+    let unit = format!("{}.service", guard.id());
+    let load_state = cmd::run("systemctl", &["show", "--property=LoadState", "--value", &unit]).expect_ok();
+    assert_eq!(load_state.stdout.trim(), "bad-setting");
+
+    for budget in [Budget::DEFAULT, Budget::Unbounded, Budget::Immediate] {
+        mgr.stop(&Id::try_from(guard.id()).unwrap(), budget)
+            .unwrap_or_else(|e| panic!("{budget:?}: {e}"));
+        assert_eq!(
+            active_state_and_job(guard.id()),
+            ("inactive".to_string(), String::new()),
+            "{budget:?}"
+        );
+    }
+}
+
 /// `goetia <args>`, elevated as this test is, with `SYSTEMD_COLORS=<colors>` in its environment.
 fn goetia_coloured(colors: &str, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_goetia"))

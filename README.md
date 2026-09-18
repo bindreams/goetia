@@ -576,10 +576,13 @@ tell us. That reads as one guarantee and is three, because what each manager
 confirms differs:
 
 - **systemd** confirms the `exec` itself succeeded: a missing executable or a
-  missing user comes back as a failed start. Under every budget, a `start` or
-  `stop` for which systemd enqueued no job is a failure (exit `1`), `uninstall`'s
-  stop included: `systemctl` in a chroot, or under `SYSTEMD_OFFLINE=1`, exits
-  `0` having done nothing.
+  missing user comes back as a failed start. Under every budget, a `start`,
+  `stop` or `restart` for which systemd enqueued no job is a failure (exit
+  `1`), `uninstall`'s stop included: `systemctl` in a chroot, or under
+  `SYSTEMD_OFFLINE=1`, exits `0` having done nothing. The one exception is a
+  `stop` of a unit systemd cannot load and that is not running: systemd
+  answers it "not loaded" with no job, since there is nothing to stop, and
+  that stop succeeds.
 - **SCM**, for a `type: simple` daemon, confirms that `goetia-shim` started.
   Under `restart: always` or `on-failure` the shim reports running before its
   first spawn, so your own command failing to start is not part of what was
