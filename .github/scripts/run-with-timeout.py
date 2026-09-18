@@ -7,13 +7,14 @@ bound surfaced to a human -- no test's correctness depends on it.
 Exit status (the coreutils `timeout` convention):
     124  the bound fired and the tree was torn down
     125  the watchdog itself failed (`ps` missing, a kill refused, the bound
-         not a number, ...)
+         not a finite number of seconds above zero, ...)
     126  the command was found but could not be executed
     127  the command was not found
       1  usage error (too few arguments)
       N  otherwise, the watched command's own exit status
 """
 
+import math
 import os
 import shutil
 import signal
@@ -133,7 +134,11 @@ def main(argv):
     try:
         seconds = float(argv[1])
     except ValueError:
-        _die(f"the bound must be a number of seconds, not {argv[1]!r}")
+        seconds = math.nan
+    # `float` also accepts `inf` and `nan`, which would never fire, and a
+    # bound at or below zero fires before the command can do anything.
+    if not (math.isfinite(seconds) and seconds > 0):
+        _die(f"the bound must be a finite number of seconds greater than zero, not {argv[1]!r}")
     command = argv[2:]
     if not WINDOWS and shutil.which("ps") is None:
         _die("`ps` is not on PATH, and expiry needs it to find the session to kill")

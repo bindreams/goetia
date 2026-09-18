@@ -10,6 +10,7 @@ Run from this directory: `python3 -B -m unittest run-with-timeout-unit-tests -v`
 
 import importlib.util
 import io
+import re
 import subprocess
 import unittest
 from contextlib import ExitStack, redirect_stderr
@@ -166,6 +167,19 @@ class FakePopen:
         return -SIGKILL
 
 
+class ExitingPopen:
+    """A watched command that exits with `code` inside the bound."""
+
+    def __init__(self, code):
+        self.pid = ROOT
+        self.code = code
+        self.waits = []
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        return self.code
+
+
 class MainPosixTests(unittest.TestCase):
     def run_main(self, popen, ps_path, host=None):
         self.stderr = io.StringIO()
@@ -217,6 +231,24 @@ class MainPosixTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 125)
         self.assertRegex(self.stderr.getvalue(), r"^run-with-timeout: .*abc")
         popen.assert_not_called()
+
+    def test_a_bound_that_is_not_finite_and_positive_is_a_watchdog_failure(self):
+        # `inf` and `nan` would never fire, silently disabling the watchdog;
+        # `0` and `-1` would fire before the command could do anything.
+        for bound in ("inf", "nan", "-1", "0"):
+            with self.subTest(bound=bound):
+                popen = MagicMock(side_effect=AssertionError("the command was started"))
+                with self.assertRaises(SystemExit) as raised:
+                    self.run_main_argv(popen, ["run-with-timeout.py", bound, "command"])
+                self.assertEqual(raised.exception.code, 125)
+                self.assertRegex(self.stderr.getvalue(), rf"^run-with-timeout: .*'{re.escape(bound)}'")
+                popen.assert_not_called()
+
+    def test_a_valid_bound_reaches_the_wait(self):
+        proc = ExitingPopen(code=3)
+        code = self.run_main_argv(lambda *_args, **_kwargs: proc, ["run-with-timeout.py", "0.5", "command"])
+        self.assertEqual(code, 3)
+        self.assertEqual(proc.waits, [0.5])
 
     def test_a_command_that_does_not_exist_reports_127(self):
         popen = MagicMock(side_effect=FileNotFoundError(2, "No such file or directory"))
