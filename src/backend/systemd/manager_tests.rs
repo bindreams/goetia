@@ -4,9 +4,12 @@
 //! `quarantine_if_still_ours`, with a foreign write injected between classification and write —
 //! something no interleaving of `install` calls alone can force deterministically.
 //!
-//! Elevated (writes real files under `/etc/systemd/system`), so it opts into the same `elevated`
-//! precondition/label convention `tests/support/mod.rs` uses, duplicated locally rather than shared:
-//! a plain library unit test cannot depend on the `tests/` integration-test support crate.
+//! Most of these are elevated (they write real files under `/etc/systemd/system`), so they opt into
+//! the same `elevated` precondition/label convention `tests/support/mod.rs` uses, duplicated locally
+//! rather than shared: a plain library unit test cannot depend on the `tests/` integration-test
+//! support crate. The two deadline-ordering tests (`start_derives_its_deadline_before_require_
+//! installed_runs` and its `stop_` mirror) are the exception: they drive only the `VerbSteps` seam,
+//! touch nothing on disk, and run unelevated.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
