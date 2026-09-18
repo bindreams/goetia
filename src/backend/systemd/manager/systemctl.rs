@@ -62,34 +62,43 @@ pub(super) fn require_supported() -> Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Source {
     /// The running manager's `Version` property. PID 1 is what parses `Type=exec` and answers
-    /// `--show-transaction`'s `EnqueueUnitJob`, so its version is the one that counts.
+    /// `--show-transaction`'s `EnqueueUnitJob`.
     Manager,
-    /// `systemctl --version`: the client alone, asked only where no manager can be reached. An old
-    /// client next to a new manager needs no gate, since it rejects `--show-transaction` itself.
+    /// `systemctl --version`, next to a running manager: the client is what parses the
+    /// `--show-transaction` option, and a newer manager does not rescue an older client.
     Client,
+    /// `systemctl --version` where no manager can be asked. It stands in for the manager too: an
+    /// image built offline boots the systemd it was built with.
+    OfflineClient,
 }
 
 /// [`require_supported`] with `systemctl`'s argv prefix named, so a test can stand a shell script in
-/// for it. The client is asked only where the manager cannot be: `systemctl show` in a chroot or
-/// under `SYSTEMD_OFFLINE=1` says "Running in chroot, ignoring command" and exits `0` with nothing
-/// on stdout, and one with no bus to reach exits non-zero. `install` must still work there, since
-/// systemd enables units offline — an image build is the ordinary case.
+/// for it. Both the running manager and the client must be new enough; where no manager can be
+/// asked, the client alone. `systemctl show` in a chroot or under `SYSTEMD_OFFLINE=1` says "Running
+/// in chroot, ignoring command" and exits `0` with nothing on stdout, and one with no bus to reach
+/// exits non-zero. `install` must still work there, since systemd enables units offline — an image
+/// build is the ordinary case.
 fn require_supported_via(systemctl: &[&str]) -> Result<()> {
-    let manager = probe(systemctl, &["show", "--property=Version", "--value"])?;
-    let reported = String::from_utf8_lossy(&manager.stdout);
-    if manager.status.success() && !reported.trim().is_empty() {
-        return supported(Source::Manager, reported.trim());
-    }
     let client = probe(systemctl, &["--version"])?;
     if !client.status.success() {
         return Err(Error::Other(format!(
-            "no running systemd could be asked its version, and `systemctl --version` failed, so \
-             goetia cannot tell whether this is systemd {SYSTEMD_FLOOR}+: {}",
+            "`systemctl --version` failed, so goetia cannot tell whether this is systemd {SYSTEMD_FLOOR}+: {}",
             String::from_utf8_lossy(&client.stderr)
         )));
     }
-    let reported = String::from_utf8_lossy(&client.stdout);
-    supported(Source::Client, reported.lines().next().unwrap_or_default())
+    let client = String::from_utf8_lossy(&client.stdout);
+    let client = client.lines().next().unwrap_or_default();
+    let manager = probe(systemctl, &["show", "--property=Version", "--value"])?;
+    let reported = String::from_utf8_lossy(&manager.stdout);
+    let verdicts = if manager.status.success() && !reported.trim().is_empty() {
+        vec![
+            verdict(Source::Manager, reported.trim()),
+            verdict(Source::Client, client),
+        ]
+    } else {
+        vec![verdict(Source::OfflineClient, client)]
+    };
+    refusal(verdicts.into_iter().flatten().collect())
 }
 
 fn probe(systemctl: &[&str], args: &[&str]) -> Result<std::process::Output> {
@@ -111,41 +120,50 @@ fn major(source: Source, reported: &str) -> Option<u32> {
     }
     let version = match source {
         Source::Manager => reported.strip_prefix('v').unwrap_or(reported),
-        Source::Client => reported.strip_prefix("systemd ")?,
+        Source::Client | Source::OfflineClient => reported.strip_prefix("systemd ")?,
     };
     let digits: String = version.chars().take_while(char::is_ascii_digit).collect();
     digits.parse().ok()
 }
 
-/// [`require_supported`]'s verdict on the version `source` reported.
-fn supported(source: Source, reported: &str) -> Result<()> {
-    let found = |n: u32| match source {
-        Source::Manager => format!("the running systemd is {n}"),
-        Source::Client => format!("`systemctl --version` reports {n}, and no running systemd could be asked"),
+/// Why the version `source` reported is refused, as one sentence; `None` if it is not.
+fn verdict(source: Source, reported: &str) -> Option<String> {
+    const ANSWER: &str = "cannot answer the `systemctl --show-transaction` every start and stop runs";
+    const TYPE_SIMPLE: &str = "runs goetia's `Type=exec` units as `Type=simple`, which cannot report a failed exec";
+    let Some(n) = major(source, reported) else {
+        let asked = match source {
+            Source::Manager => "the running systemd reports",
+            Source::Client | Source::OfflineClient => "`systemctl --version` reports",
+        };
+        return Some(format!(
+            "goetia cannot read the version {asked} ({reported:?}), so cannot tell whether it is."
+        ));
     };
-    let why = match major(source, reported) {
-        Some(n) if n >= SYSTEMD_FLOOR => return Ok(()),
-        Some(n) if n >= TYPE_EXEC => format!(
-            "{}. systemd {TYPE_EXEC} and 241 cannot answer the `systemctl --show-transaction` every start \
-             and stop runs",
-            found(n)
-        ),
-        Some(n) => format!(
-            "{}. systemd before {TYPE_EXEC} cannot answer the `systemctl --show-transaction` every start \
-             and stop runs, and runs goetia's `Type=exec` units as `Type=simple`, which cannot report a \
-             failed exec",
-            found(n)
-        ),
-        None => {
-            let asked = match source {
-                Source::Manager => "the running systemd reports",
-                Source::Client => "`systemctl --version` reports",
-            };
-            format!("cannot read the version {asked} ({reported:?}), so cannot tell whether this one is")
+    if n >= SYSTEMD_FLOOR {
+        return None;
+    }
+    let found = match source {
+        Source::Manager => format!("The running systemd is {n}"),
+        Source::Client => format!("The `systemctl` client is {n}"),
+        Source::OfflineClient => format!("No running systemd could be asked, and `systemctl --version` reports {n}"),
+    };
+    Some(match source {
+        Source::Client => {
+            format!("{found}, which does not accept the `--show-transaction` option every start and stop passes it.")
         }
-    };
+        Source::Manager | Source::OfflineClient if n >= TYPE_EXEC => format!("{found}, which {ANSWER}."),
+        Source::Manager | Source::OfflineClient => format!("{found}, which {ANSWER}, and {TYPE_SIMPLE}."),
+    })
+}
+
+/// `Ok` for no verdicts; otherwise the refusal naming every one.
+fn refusal(verdicts: Vec<String>) -> Result<()> {
+    if verdicts.is_empty() {
+        return Ok(());
+    }
     Err(Error::Other(format!(
-        "goetia requires systemd {SYSTEMD_FLOOR} or newer, and {why}."
+        "goetia requires systemd {SYSTEMD_FLOOR} or newer. {}",
+        verdicts.join(" ")
     )))
 }
 

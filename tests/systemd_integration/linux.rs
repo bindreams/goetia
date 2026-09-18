@@ -988,27 +988,28 @@ fn an_offline_install_writes_the_unit() {
 }
 
 /// `goetia <args>`, elevated as this test is, with a `systemctl` first on its `PATH` whose running
-/// manager is systemd 241 — the newest without `--show-transaction` — and whose client is 257, and
-/// that fails anything else: the manager's version is the one that counts, and a refusal must come
-/// before goetia asks systemd for anything more.
+/// manager reports `manager` and whose client reports `client`, and that fails anything else: a
+/// refusal must come before goetia asks systemd for anything more.
 ///
 /// Written by a child `sh`, not by this process: a descriptor this process held open for writing
 /// could be inherited by a `fork` on another test thread, and `exec`ing the file would then fail
 /// with `ETXTBSY`.
-fn goetia_on_systemd_241(args: &[&str]) -> std::process::Output {
+fn goetia_on_systemd(manager: u32, client: u32, args: &[&str]) -> std::process::Output {
     let dir = tempfile::tempdir().expect("tempdir");
     let fake = dir.path().join("systemctl");
-    let script = "#!/bin/sh\n\
-                  [ \"$*\" = 'show --property=Version --value' ] && { echo 241; exit 0; }\n\
-                  [ \"$*\" = --version ] && { echo 'systemd 257 (257)'; exit 0; }\n\
-                  echo \"stand-in: unexpected systemctl $*\" >&2; exit 99\n";
+    let script = format!(
+        "#!/bin/sh\n\
+         [ \"$*\" = 'show --property=Version --value' ] && {{ echo {manager}; exit 0; }}\n\
+         [ \"$*\" = --version ] && {{ echo 'systemd {client} ({client})'; exit 0; }}\n\
+         echo \"stand-in: unexpected systemctl $*\" >&2; exit 99\n"
+    );
     cmd::run(
         "/bin/sh",
         &[
             "-c",
             "printf '%s' \"$1\" > \"$0\" && chmod 0755 \"$0\"",
             fake.to_str().expect("utf-8 temp path"),
-            script,
+            &script,
         ],
     )
     .expect_ok();
@@ -1026,19 +1027,26 @@ fn goetia_on_systemd_241(args: &[&str]) -> std::process::Output {
 
 /// Below systemd 242 goetia refuses before it writes a unit or runs a start or stop — rather than
 /// install a `Type=exec` unit an older systemd silently runs as `Type=simple`, or fail every start
-/// and stop on an unrecognized option.
+/// and stop on an unrecognized option. The running systemd and the client each count: an old one
+/// is refused next to a new other, and named.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn an_older_systemd_is_refused_before_anything_is_written_or_run() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let (_dir, manifest) = world_readable_manifest(guard.id());
     let manifest = manifest.to_str().expect("utf-8 temp path");
+    let versions = [
+        (241, 257, "The running systemd is 241"),
+        (257, 241, "The `systemctl` client is 241"),
+    ];
     let refused = |args: &[&str]| {
-        let output = goetia_on_systemd_241(args);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
-        assert!(stderr.contains("requires systemd 242 or newer"), "{args:?}: {stderr}");
-        assert!(stderr.contains("the running systemd is 241"), "{args:?}: {stderr}");
+        for (manager, client, named) in versions {
+            let output = goetia_on_systemd(manager, client, args);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
+            assert!(stderr.contains("requires systemd 242 or newer"), "{args:?}: {stderr}");
+            assert!(stderr.contains(named), "{args:?}: {stderr}");
+        }
     };
 
     refused(&["daemon", "install", "--file", manifest, guard.id()]);

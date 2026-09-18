@@ -363,6 +363,11 @@ fn an_offline_systemctl_that_exits_0_took_nothing() {
 
 // supported ===========================================================================================================
 
+/// The refusal for the version one `source` reported, as [`require_supported`] words it.
+fn supported(source: Source, reported: &str) -> Result<()> {
+    refusal(verdict(source, reported).into_iter().collect())
+}
+
 /// The `Version` property as distributions set it, measured with `systemctl --version`, whose
 /// parenthesised part is the same `GIT_VERSION` string (identical on this host's systemd 257).
 #[skuld::test]
@@ -391,7 +396,9 @@ fn a_client_242_or_newer_is_supported() {
         "systemd 257 (257.13-1~deb13u1)",
         "systemd 258~rc1 (258~rc1-1)",
     ] {
-        assert!(supported(Source::Client, version).is_ok(), "{version:?}");
+        for source in [Source::Client, Source::OfflineClient] {
+            assert!(supported(source, version).is_ok(), "{source:?} {version:?}");
+        }
     }
 }
 
@@ -403,6 +410,7 @@ fn systemd_240_and_241_are_refused_for_show_transaction_alone() {
         (Source::Manager, "241.7-1", "241"),
         (Source::Manager, "240", "240"),
         (Source::Client, "systemd 241 (241)", "241"),
+        (Source::OfflineClient, "systemd 241 (241)", "241"),
     ] {
         let msg = supported(source, version).expect_err(version).to_string();
         assert!(msg.contains("requires systemd 242 or newer"), "{msg}");
@@ -412,26 +420,34 @@ fn systemd_240_and_241_are_refused_for_show_transaction_alone() {
     }
 }
 
-/// Before 240 both reasons apply.
+/// Before 240 both reasons apply — to the running systemd, and to a client standing in for it
+/// offline. A client next to a running systemd parses no units, so `--show-transaction` is its only
+/// reason.
 #[skuld::test]
 fn systemd_older_than_240_is_refused_for_both_reasons() {
-    for (source, version) in [(Source::Manager, "239-41.el8"), (Source::Client, "systemd 237")] {
+    for (source, version) in [(Source::Manager, "239-41.el8"), (Source::OfflineClient, "systemd 237")] {
         let msg = supported(source, version).expect_err(version).to_string();
         assert!(msg.contains("requires systemd 242 or newer"), "{msg}");
         assert!(msg.contains("--show-transaction"), "{msg}");
         assert!(msg.contains("Type=simple"), "{msg}");
     }
+    let msg = supported(Source::Client, "systemd 237").unwrap_err().to_string();
+    assert!(msg.contains("--show-transaction"), "{msg}");
+    assert!(!msg.contains("Type=simple"), "{msg}");
 }
 
-/// The refusal names whose version it read: the running manager's, or — where none could be asked
-/// — the client's.
+/// The refusal names whose version it read.
 #[skuld::test]
 fn a_refusal_names_whose_version_it_read() {
     let manager = supported(Source::Manager, "241").unwrap_err().to_string();
-    assert!(manager.contains("the running systemd is 241"), "{manager}");
+    assert!(manager.contains("The running systemd is 241"), "{manager}");
     let client = supported(Source::Client, "systemd 241 (241)").unwrap_err().to_string();
-    assert!(client.contains("`systemctl --version` reports 241"), "{client}");
-    assert!(client.contains("no running systemd could be asked"), "{client}");
+    assert!(client.contains("The `systemctl` client is 241"), "{client}");
+    let offline = supported(Source::OfflineClient, "systemd 241 (241)")
+        .unwrap_err()
+        .to_string();
+    assert!(offline.contains("No running systemd could be asked"), "{offline}");
+    assert!(offline.contains("`systemctl --version` reports 241"), "{offline}");
 }
 
 /// A version goetia cannot read is not a version it can vouch for — and not one it may call old.
@@ -448,11 +464,11 @@ fn an_unreadable_version_is_refused_without_calling_it_old() {
         (Source::Client, "systemd abc"),
         (Source::Client, "not systemd 257"),
         (Source::Client, "\u{1b}[0;1;39msystemd 257\u{1b}[0m (257.13-1~deb13u1)"),
-        (Source::Client, "systemd 257\u{1b}[0m (257.13-1~deb13u1)"),
+        (Source::OfflineClient, "systemd 257\u{1b}[0m (257.13-1~deb13u1)"),
     ] {
         let msg = supported(source, version).expect_err(version).to_string();
         assert!(msg.contains("cannot read the version"), "{version:?}: {msg}");
-        for claim in ["older", "before", "Type=simple", "cannot answer"] {
+        for claim in ["older", "before", "Type=simple", "cannot answer", "does not accept"] {
             assert!(!msg.contains(claim), "{version:?} is not known to be old: {msg}");
         }
     }
@@ -478,29 +494,62 @@ fn two_versions(manager: &str, client: &str) -> String {
     )
 }
 
-/// The running manager's version is the one that counts: PID 1 parses `Type=exec`.
+fn refused(manager: &str, client: &str) -> String {
+    require_supported_via(&stand_in(&two_versions(manager, client)))
+        .expect_err(&format!("manager {manager}, client {client}"))
+        .to_string()
+}
+
+/// Both must be 242 or newer: the running systemd parses `Type=exec` and answers the job, and the
+/// client parses `--show-transaction`, so neither rescues the other. The refusal names whichever
+/// failed, with its version, and both when both did.
 #[skuld::test]
-fn the_running_systemds_version_decides_not_the_clients() {
-    assert!(require_supported_via(&stand_in(&two_versions("257", "none"))).is_ok());
-    assert!(require_supported_via(&stand_in(&two_versions("257", "241"))).is_ok());
-    let msg = require_supported_via(&stand_in(&two_versions("241", "257")))
-        .unwrap_err()
-        .to_string();
-    assert!(msg.contains("the running systemd is 241"), "{msg}");
+fn both_the_running_systemd_and_the_client_must_be_242_or_newer() {
+    assert!(require_supported_via(&stand_in(&two_versions("257", "257"))).is_ok());
+
+    let old_client = refused("257", "241");
+    assert!(old_client.contains("The `systemctl` client is 241"), "{old_client}");
+    assert!(!old_client.contains("running systemd is"), "{old_client}");
+
+    let old_manager = refused("241", "257");
+    assert!(old_manager.contains("The running systemd is 241"), "{old_manager}");
+    assert!(!old_manager.contains("client is"), "{old_manager}");
+
+    let both = refused("239", "241");
+    assert!(both.contains("The running systemd is 239"), "{both}");
+    assert!(both.contains("The `systemctl` client is 241"), "{both}");
+}
+
+/// A client that cannot say its version cannot be vouched for, whatever the manager says.
+#[skuld::test]
+fn a_client_that_cannot_say_its_version_is_refused() {
+    let msg = refused("257", "none");
+    assert!(msg.contains("`systemctl --version` failed"), "{msg}");
 }
 
 /// No manager to ask — what `systemctl show` does in a chroot or offline, measured on systemd 257,
-/// and what it does with no bus to reach — and the client's version is used instead.
+/// and what it does with no bus to reach — and the client alone decides.
 #[skuld::test]
-fn with_no_running_systemd_the_clients_version_decides() {
-    let offline = "[ \"$1\" = show ] && { echo \"Running in chroot, ignoring command 'show'\" >&2; exit 0; }; \
-                   echo 'systemd 257 (257.13-1~deb13u1)'";
-    assert!(require_supported_via(&stand_in(offline)).is_ok());
+fn with_no_running_systemd_the_client_alone_decides() {
+    let offline = |client: &str| {
+        format!(
+            "[ \"$1\" = show ] && {{ echo \"Running in chroot, ignoring command 'show'\" >&2; exit 0; }}; \
+             echo 'systemd {client} ({client})'"
+        )
+    };
+    assert!(require_supported_via(&stand_in(&offline("257"))).is_ok());
     assert!(require_supported_via(&stand_in(&two_versions("none", "257"))).is_ok());
-    let msg = require_supported_via(&stand_in(&two_versions("none", "241")))
-        .unwrap_err()
-        .to_string();
-    assert!(msg.contains("`systemctl --version` reports 241"), "{msg}");
+    for msg in [
+        require_supported_via(&stand_in(&offline("241")))
+            .unwrap_err()
+            .to_string(),
+        refused("none", "241"),
+    ] {
+        assert!(
+            msg.contains("No running systemd could be asked, and `systemctl --version` reports 241"),
+            "{msg}"
+        );
+    }
 }
 
 /// Both probes switch colour off: the stand-in colours whatever it prints unless it sees
@@ -508,10 +557,10 @@ fn with_no_running_systemd_the_clients_version_decides() {
 #[skuld::test]
 fn every_probe_switches_colour_off() {
     let colours = "c() { [ \"$SYSTEMD_COLORS\" = 0 ] && echo \"$1\" || printf '\\033[0;1;39m%s\\033[0m\\n' \"$1\"; }; ";
-    let manager = format!("{colours}[ \"$1\" = show ] && c 257 || exit 99");
-    assert!(require_supported_via(&stand_in(&manager)).is_ok());
-    let client = format!("{colours}[ \"$1\" = show ] && exit 1; c 'systemd 257'");
-    assert!(require_supported_via(&stand_in(&client)).is_ok());
+    let online = format!("{colours}[ \"$1\" = show ] && c 257 || c 'systemd 257'");
+    assert!(require_supported_via(&stand_in(&online)).is_ok());
+    let offline = format!("{colours}[ \"$1\" = show ] && exit 1; c 'systemd 257'");
+    assert!(require_supported_via(&stand_in(&offline)).is_ok());
 }
 
 /// The real `systemctl` on this host, first with an inherited `SYSTEMD_COLORS=1` — set by the
