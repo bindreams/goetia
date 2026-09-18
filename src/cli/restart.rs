@@ -197,13 +197,13 @@ fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
             reason: format!("{}: {reason}", after_stop_clause(budget)),
             recovery,
         },
-        // Neither leg confirmed anything: the stop was issued and not waited
-        // for, and the start that followed was refused by a manager that may
-        // simply be mid-stop (SCM's `ERROR_SERVICE_ALREADY_RUNNING` over a
-        // service still coming down). Whether the daemon cycled, is going
-        // down, or never moved is precisely what nobody established — so not
-        // `Other`, which is exit `1` and claims the restart determinately
-        // failed.
+        // The stop was issued and not waited for, and the start that
+        // followed was refused — determinately (systemd rejecting a unit it
+        // cannot load) or not (SCM's `ERROR_SERVICE_ALREADY_RUNNING` over a
+        // service still coming down). Either way the stop is still in
+        // flight, so whether the daemon cycled, is going down, or never moved
+        // is what nobody established — so not `Other`, which is exit `1` and
+        // claims the restart determinately failed.
         e if !budget.waits() => Error::Unestablished {
             id: id.as_str().to_string(),
             detail: format!(

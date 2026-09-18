@@ -135,14 +135,18 @@ pub enum Error {
     /// Steps goetia issued whose outcome nobody established. Produced only
     /// by `cli::restart` under a budget that does not wait, where the stop
     /// was issued without confirmation and the start that followed was
-    /// refused — SCM's `ERROR_SERVICE_ALREADY_RUNNING` over a service still
-    /// coming down is the shape. The daemon may be running the instance the
-    /// stop is still taking down, may be going down, or may never have
-    /// moved, and goetia proved none of the three.
+    /// refused. The daemon may be running the instance the stop is still
+    /// taking down, may be going down, or may never have moved, and goetia
+    /// proved none of the three.
     ///
-    /// Not [`Other`](Error::Other), which is exit `1` and says the operation
-    /// determinately failed — the one thing a refusal in that window did not
-    /// establish. Not [`WaitTimeout`](Error::WaitTimeout): nothing waited.
+    /// The refusal itself may be determinate or not — systemd's `start
+    /// --no-block` rejects a unit it cannot load outright, where SCM's
+    /// `ERROR_SERVICE_ALREADY_RUNNING` over a service still coming down says
+    /// only that the manager is mid-stop. Either way the unconfirmed stop is
+    /// still in flight, so what is unestablished is the *restart*: where the
+    /// daemon ended up. Not [`Other`](Error::Other), which is exit `1` and
+    /// says the operation determinately failed — even a determinate refusal
+    /// leaves that open. Not [`WaitTimeout`](Error::WaitTimeout): nothing waited.
     /// Not [`Undetermined`](Error::Undetermined): what is installed at the
     /// id was never in doubt.
     ///

@@ -337,7 +337,8 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
             // Steps that were issued and whose outcome nobody established —
             // `restart` with no budget, whose start leg was refused. The same
             // class again, and again a different condition: here both steps
-            // ran and neither confirmed anything.
+            // ran and neither settled where the daemon ended up, even when
+            // the start's refusal was itself determinate.
             Err(e @ Error::Unestablished { .. }) => {
                 let _ = writeln!(err, "error: {id}: {e}");
                 codes.push(4);
