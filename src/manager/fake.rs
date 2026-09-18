@@ -593,7 +593,11 @@ impl ServiceManager for Fake {
             // left exactly as it was on every branch `stalled` can take.
             return stalled(id, "running", budget);
         }
-        entry.state = State::Running;
+        // Request-only: no real backend establishes anything here, so
+        // neither does the Fake — see `ServiceManager::start`.
+        if budget.waits() {
+            entry.state = State::Running;
+        }
         Ok(())
     }
 

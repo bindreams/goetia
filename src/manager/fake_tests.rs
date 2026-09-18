@@ -572,17 +572,12 @@ fn a_stalled_stop_under_an_unbounded_budget_refuses_rather_than_pretending() {
     let _ = fake.stop(&spec.id, Budget::Unbounded);
 }
 
-/// An un-stalled entry transitions exactly as it does today under every
-/// budget, `Unbounded` included — the refusal above is about the stall, not
-/// about the budget.
+/// An un-stalled entry reaches `Running` under every budget that waits,
+/// `Unbounded` included — the refusal above is about the stall, not about the
+/// budget.
 #[skuld::test]
-fn an_unstalled_entry_starts_under_every_budget() {
-    for budget in [
-        Budget::Immediate,
-        Budget::Bounded(Duration::ZERO),
-        Budget::Bounded(Duration::from_secs(10)),
-        Budget::Unbounded,
-    ] {
+fn an_unstalled_entry_starts_under_every_budget_that_waits() {
+    for budget in [Budget::Bounded(Duration::from_secs(10)), Budget::Unbounded] {
         let fake = Fake::new();
         let spec = mk("healthy");
         fake.install(&spec, false).unwrap();
@@ -591,5 +586,29 @@ fn an_unstalled_entry_starts_under_every_budget() {
             .unwrap_or_else(|e| panic!("{budget:?}: {e}"));
 
         assert_eq!(fake.status(&spec.id).unwrap().state, State::Running, "{budget:?}");
+    }
+}
+
+/// A budget that does not wait establishes nothing on any real backend —
+/// systemd's `start --no-block`, SCM's `request_start` and launchd's plain
+/// `kickstart` all return with the service anywhere from not yet forked to
+/// running. A `Fake` that settled to `Running` here would let a CLI test
+/// assert a state no platform guarantees and stay green, so it settles
+/// nothing, even for an entry that would start.
+#[skuld::test]
+fn an_unstalled_entry_is_left_alone_under_a_budget_that_does_not_wait() {
+    for budget in [Budget::Immediate, Budget::Bounded(Duration::ZERO)] {
+        let fake = Fake::new();
+        let spec = mk("healthy");
+        fake.install(&spec, false).unwrap();
+
+        fake.start(&spec.id, budget)
+            .unwrap_or_else(|e| panic!("{budget:?} accepts the request: {e}"));
+
+        assert_eq!(
+            fake.status(&spec.id).unwrap().state,
+            State::Stopped,
+            "{budget:?} confirmed nothing, so it must not have changed the state"
+        );
     }
 }
