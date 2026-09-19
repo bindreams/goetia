@@ -1005,8 +1005,14 @@ sources are not interchangeable, and the remedies do not transfer:
 - **`unreadable`** — goetia's own daemon that goetia cannot use or report
   on. The marker was read; the blob would not decode, or the manager gave
   no live state for it — on systemd, a unit file the running manager
-  cannot see. Remedy: `goetia daemon uninstall <id>`, which needs neither;
-  for a live state, what `message` names.
+  cannot see. `goetia daemon uninstall <id>` is the remedy for a blob that
+  would not decode, and needs neither the blob nor a live state. It is not
+  a remedy for the other: its `disable` goes through the manager too, and
+  fails the same way, exit `1`, leaving the artifact where it was. What
+  that case means is that goetia and the manager are reading different unit
+  directories — goetia's own mount namespace, say — and nothing run from
+  inside it, `systemctl daemon-reload` included, brings the two back into
+  view of each other.
 - **`undetermined`** — a name goetia could not classify at all. The read
   that would have said whose it is never completed, so ownership is
   unestablished. Remedy: read it with more privilege.
