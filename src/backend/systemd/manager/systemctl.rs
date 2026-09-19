@@ -28,9 +28,10 @@ enum Purpose {
 
 /// Where every `systemctl` goetia runs is refused before it is spawned: on evidence, known without
 /// asking, that no manager can be asked here ([`Host::evidence`]); and for a request, until the
-/// manager has passed the version gate. The gate's `show` is what finds a chroot out before anything
-/// acts on it: `enable` and `disable` act on unit files offline, in a chroot and on a system systemd
-/// did not boot, and say nothing about it (measured on 257). [`answered`] is the other half.
+/// manager has passed the version gate. The gate's `show` is what finds out, before anything acts,
+/// a chroot goetia could not see for itself: `enable` and `disable` act on unit files offline, in a
+/// chroot and on a system systemd did not boot, and say nothing about it (measured on 257).
+/// [`answered`] is the other half.
 fn door(purpose: Purpose) -> Result<()> {
     if let Some(evidence) = host().evidence() {
         return Err(no_manager(evidence));
@@ -46,9 +47,9 @@ fn door(purpose: Purpose) -> Result<()> {
 const IGNORED: [&str; 2] = ["ignoring command", "ignoring request"];
 
 /// Every `systemctl` answer, checked before anything reads it as one: an answer saying it ignored
-/// what it was asked ([`IGNORED`]) is the refusal on every path, and never a success. For a probe or
-/// a read it is how a chroot is found out; for anything else it is the backstop for what [`door`]
-/// missed.
+/// what it was asked ([`IGNORED`]) is the refusal on every path, and never a success: the backstop
+/// for what [`door`] could not see — a chroot whose `/proc/1/root` goetia may not read, or one
+/// `SYSTEMD_IN_CHROOT` declares.
 fn answered(stdout: &[u8], stderr: &[u8]) -> Result<()> {
     let ignored = |stream: &[u8]| {
         String::from_utf8_lossy(stream)
@@ -176,6 +177,8 @@ enum Evidence {
     Offline(String),
     /// `/run/systemd/system` does not exist: systemd is not this system's init (`sd_booted()`).
     NotBooted,
+    /// `/` is not PID 1's root: this runs in a chroot (`running_in_chroot()`).
+    Chroot,
     /// `systemctl` said, in this line, that it ignored what it was asked: its chroot report.
     Ignored(String),
 }
@@ -185,6 +188,7 @@ impl std::fmt::Display for Evidence {
         match self {
             Evidence::Offline(value) => write!(f, "`SYSTEMD_OFFLINE={value}` is set"),
             Evidence::NotBooted => write!(f, "`{SD_BOOTED}` does not exist, so systemd is not this system's init"),
+            Evidence::Chroot => write!(f, "`/` is not PID 1's root (`{INIT_ROOT}`), so this runs in a chroot"),
             Evidence::Ignored(line) => write!(f, "`systemctl` said {line:?}"),
         }
     }
@@ -192,6 +196,9 @@ impl std::fmt::Display for Evidence {
 
 /// Where `sd_booted()` looks: it exists iff systemd is this system's init.
 const SD_BOOTED: &str = "/run/systemd/system";
+
+/// PID 1's root, which `running_in_chroot()` compares `/` with.
+const INIT_ROOT: &str = "/proc/1/root";
 
 /// What goetia reads of this system without asking `systemctl`: a seam, so a test can stand any
 /// system in.
@@ -201,6 +208,8 @@ pub(super) struct Host {
     offline: Option<String>,
     /// [`SD_BOOTED`] is established absent — see [`established_absent`].
     unbooted: bool,
+    /// `/` is established not to be [`INIT_ROOT`] — see [`identities_differ`].
+    chrooted: bool,
 }
 
 impl Host {
@@ -208,6 +217,7 @@ impl Host {
         Host {
             offline: std::env::var("SYSTEMD_OFFLINE").ok(),
             unbooted: established_absent(std::path::Path::new(SD_BOOTED)),
+            chrooted: identities_differ(identity("/"), identity(INIT_ROOT)),
         }
     }
 
@@ -217,10 +227,28 @@ impl Host {
             Some(Evidence::Offline(value.to_string()))
         } else if self.unbooted {
             Some(Evidence::NotBooted)
+        } else if self.chrooted {
+            Some(Evidence::Chroot)
         } else {
             None
         }
     }
+}
+
+/// `path`'s device and inode, followed through symlinks as `running_in_chroot()`'s `inode_same`
+/// does: `/proc/1/root` is a link to PID 1's root.
+fn identity(path: &str) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(path).map(|meta| (meta.dev(), meta.ino()))
+}
+
+/// Whether `/` and PID 1's root are established to differ: two identities read, and different. A
+/// stat that failed — `EACCES` on `/proc/1/root` for a caller that may not trace PID 1, or no
+/// `/proc` — establishes nothing, so the other checks and systemctl's own report ([`answered`])
+/// decide. Read regardless of `SYSTEMD_IN_CHROOT`: in a chroot with `/run` bound in, a `systemctl`
+/// told it is not in one asks the host's manager about units goetia writes into the chroot.
+fn identities_differ(root: std::io::Result<(u64, u64)>, init_root: std::io::Result<(u64, u64)>) -> bool {
+    matches!((root, init_root), (Ok(root), Ok(init_root)) if root != init_root)
 }
 
 /// Whether `dir` is established not to be a directory, as `sd_booted()`'s `laccess("…/")` finds

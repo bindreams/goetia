@@ -501,6 +501,7 @@ fn booted() -> Host {
     Host {
         offline: None,
         unbooted: false,
+        chrooted: false,
     }
 }
 
@@ -564,9 +565,9 @@ fn assert_no_manager(result: Result<()>, evidence: &str, path: &str) {
     assert!(msg.contains(evidence), "{path}: {msg}");
 }
 
-/// Evidence known without asking — `SYSTEMD_OFFLINE` set true, or no `/run/systemd/system` — is
-/// refused on every path before any `systemctl` runs, the version gate's own probes included: the
-/// stand-in records every run, and none happens.
+/// Evidence known without asking — `SYSTEMD_OFFLINE` set true, no `/run/systemd/system`, or a `/`
+/// that is not PID 1's root — is refused on every path before any `systemctl` runs, the version
+/// gate's own probes included: the stand-in records every run, and none happens.
 #[skuld::test]
 fn evidence_known_without_asking_refuses_every_path_before_anything_runs() {
     let hosts = [
@@ -574,6 +575,7 @@ fn evidence_known_without_asking_refuses_every_path_before_anything_runs() {
             Host {
                 offline: Some("1".to_string()),
                 unbooted: false,
+                chrooted: false,
             },
             "`SYSTEMD_OFFLINE=1` is set",
         ),
@@ -581,8 +583,17 @@ fn evidence_known_without_asking_refuses_every_path_before_anything_runs() {
             Host {
                 offline: None,
                 unbooted: true,
+                chrooted: false,
             },
             "`/run/systemd/system` does not exist",
+        ),
+        (
+            Host {
+                offline: None,
+                unbooted: false,
+                chrooted: true,
+            },
+            "`/` is not PID 1's root (`/proc/1/root`), so this runs in a chroot",
         ),
     ];
     for (host, evidence) in hosts {
@@ -911,6 +922,7 @@ fn a_remembered_pass_does_not_skip_the_evidence() {
         Host {
             offline: Some("yes".to_string()),
             unbooted: false,
+            chrooted: false,
         },
     );
     assert_no_manager(daemon_reload(), "`SYSTEMD_OFFLINE=yes` is set", "daemon-reload");
@@ -989,6 +1001,21 @@ fn only_a_stat_that_finds_no_directory_is_evidence_of_no_systemd() {
     );
 }
 
+/// `/` and PID 1's root differ only on two identities read, and different — a chroot. A stat that
+/// failed establishes nothing: `EACCES`, as `/proc/1/root` answers a caller that may not trace
+/// PID 1, or `ENOENT`, with no `/proc`.
+#[skuld::test]
+fn only_two_roots_read_and_different_are_evidence_of_a_chroot() {
+    let failed = |errno| Err(std::io::Error::from_raw_os_error(errno));
+    assert!(identities_differ(Ok((1, 2)), Ok((1, 3))));
+    assert!(identities_differ(Ok((1, 2)), Ok((4, 2))));
+    assert!(!identities_differ(Ok((1, 2)), Ok((1, 2))));
+    for errno in [libc::EACCES, libc::ENOENT] {
+        assert!(!identities_differ(Ok((1, 2)), failed(errno)), "{errno}");
+        assert!(!identities_differ(failed(errno), Ok((1, 2))), "{errno}");
+    }
+}
+
 /// This host is booted with systemd and not offline: its manager is asked.
 #[skuld::test]
 fn this_host_has_a_manager_to_ask() {
@@ -1003,6 +1030,7 @@ fn systemd_offline_is_evidence_only_when_true() {
         let host = Host {
             offline: Some(value.to_string()),
             unbooted: false,
+            chrooted: false,
         };
         assert_eq!(host.evidence(), Some(Evidence::Offline(value.to_string())), "{value:?}");
     }
@@ -1010,6 +1038,7 @@ fn systemd_offline_is_evidence_only_when_true() {
         let host = Host {
             offline: Some(value.to_string()),
             unbooted: false,
+            chrooted: false,
         };
         assert_eq!(host.evidence(), None, "{value:?}");
     }

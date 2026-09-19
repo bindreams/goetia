@@ -253,3 +253,110 @@ fn the_verbs_that_never_reach_the_manager_are_untouched() {
     }
     assert_eq!(fs::read(unit_path(guard.id())).expect("read the unit"), before);
 }
+
+/// A real chroot, in `arch-chroot`'s shape: a tmpfs root with `/usr` bound read-only, `/dev`,
+/// `/run` and `/sys` bound, a fresh `/proc`, and an `/etc` of its own. `/run` bound in means
+/// `/run/systemd/system` exists and the host's manager answers its bus, so `/` not being PID 1's
+/// root is the one sign. Every mount lives in a private mount namespace, gone however the script
+/// exits. The script copies `manifest` to the chroot's `/tmp/goetia.yaml` and `unit` into its
+/// `/etc/systemd/system` (unless `-`), runs `goetia <args>` there, then lists that directory and
+/// its `multi-user.target.wants` on stderr.
+const IN_A_CHROOT: &str = r#"set -e
+root=$1 goetia=$2 manifest=$3 unit=$4; shift 4
+mount -t tmpfs goetia-chroot "$root"
+mkdir -p "$root/usr" "$root/dev" "$root/run" "$root/sys" "$root/proc" "$root/tmp" "$root/etc/systemd/system"
+for dir in bin sbin lib lib64; do ln -s "usr/$dir" "$root/$dir"; done
+mount --bind /usr "$root/usr"
+mount -o remount,bind,ro "$root/usr"
+mount --rbind /dev "$root/dev"
+mount --rbind /run "$root/run"
+mount --rbind /sys "$root/sys"
+mount -t proc proc "$root/proc"
+cp /etc/passwd /etc/group /etc/nsswitch.conf "$root/etc/"
+cp "$goetia" "$root/goetia"
+cp "$manifest" "$root/tmp/goetia.yaml"
+[ "$unit" = - ] || cp "$unit" "$root/etc/systemd/system/"
+rc=0
+chroot "$root" /goetia "$@" || rc=$?
+echo "chroot units: $(cd "$root/etc/systemd/system" && ls -A | tr '\n' ' ')" >&2
+echo "chroot links: $(ls -A "$root/etc/systemd/system/multi-user.target.wants" 2>/dev/null | tr '\n' ' ')" >&2
+exit $rc
+"#;
+
+/// Every verb that reaches the manager, run in a real chroot, is refused up front — naming the
+/// chroot goetia found itself, before any `systemctl` runs, so never through `systemctl`'s own
+/// "Running in chroot" — and writes nothing into the chroot, and asks the host's manager nothing.
+/// The daemon's unit is installed on the host, and copied into the chroot for every verb but
+/// `install`.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn every_verb_in_a_real_chroot_is_refused_before_anything_runs() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let (_manifest_dir, manifest) = world_readable_manifest(guard.id());
+    installed(&guard);
+    let unit = unit_path(guard.id());
+    let unit = unit.to_str().expect("utf-8 unit path");
+    let copied = format!("chroot units: {}.service \n", guard.id());
+
+    let installs = ["daemon", "install", "--file", "/tmp/goetia.yaml", guard.id()];
+    for (args, unit, units) in [
+        (&installs[..], "-", "chroot units: \n"),
+        (
+            &[
+                "daemon",
+                "install",
+                "--file",
+                "/tmp/goetia.yaml",
+                "--enable",
+                "--start",
+                guard.id(),
+            ],
+            "-",
+            "chroot units: \n",
+        ),
+        (&["daemon", "uninstall", guard.id()], unit, &copied),
+        (&["daemon", "start", guard.id()], unit, &copied),
+        (&["daemon", "stop", guard.id()], unit, &copied),
+        (&["daemon", "restart", guard.id()], unit, &copied),
+        (&["daemon", "restart", guard.id(), "--timeout", "0"], unit, &copied),
+        (&["daemon", "enable", guard.id()], unit, &copied),
+        (&["daemon", "disable", guard.id()], unit, &copied),
+        (&["daemon", "status", guard.id()], unit, &copied),
+        (&["daemon", "list"], unit, &copied),
+    ] {
+        let root = tempfile::tempdir().expect("tempdir");
+        let output = Command::new("unshare")
+            .args([
+                "--mount",
+                "--propagation",
+                "private",
+                "/bin/sh",
+                "-c",
+                IN_A_CHROOT,
+                "goetia-chroot",
+            ])
+            .arg(root.path())
+            .arg(env!("CARGO_BIN_EXE_goetia"))
+            .arg(&manifest)
+            .arg(unit)
+            .args(args)
+            .output()
+            .expect("spawn unshare");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let context = format!("{args:?}\nstderr:\n{stderr}");
+        assert_eq!(output.status.code(), Some(1), "{context}");
+        assert!(
+            stderr.contains("no running systemd manager can be asked here (`/` is not PID 1's root"),
+            "{context}"
+        );
+        assert!(!stderr.contains("Running in chroot"), "systemctl ran: {context}");
+        assert!(stderr.contains(units), "{context}");
+        assert!(stderr.contains("chroot links: \n"), "{context}");
+        assert_eq!(
+            active_state_and_job(guard.id()),
+            ("inactive".to_string(), String::new()),
+            "{context}"
+        );
+        assert!(!wants_symlink(guard.id()).exists(), "{context}");
+    }
+}

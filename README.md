@@ -25,10 +25,10 @@ cannot parse it and runs the unit as `Type=simple`, silently losing exactly
 that. And every `start` and `stop` runs `systemctl --show-transaction` (242+).
 
 goetia does not manage systemd offline or in a chroot. Where no running
-systemd can be asked — `SYSTEMD_OFFLINE` is set, `systemctl` reports a chroot,
-or `/run/systemd/system` does not exist — every verb that reaches systemd exits
-`1` before it writes or sends anything, with one message naming which of the
-three it found. That is `install`, `uninstall`, `start`, `stop`, `restart`,
+systemd can be asked — `SYSTEMD_OFFLINE` is set, `/run/systemd/system` does not
+exist, `/` is not PID 1's root (a chroot), or `systemctl` reports a chroot —
+every verb that reaches systemd exits `1` before it writes or sends anything,
+with one message naming which it found. That is `install`, `uninstall`, `start`, `stop`, `restart`,
 `enable`, `disable`, `status`, `list`, and `show` without `--file`, which reads
 what `list` reads. `install --dry-run`, `diff` and `show --file` never reach
 systemd, and work there as anywhere else.
