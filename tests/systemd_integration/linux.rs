@@ -1175,8 +1175,8 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
 /// `Type=exec` is what makes `systemctl start` report failure here at all — under `Type=simple` the
 /// same spec's `start` returns `Ok`. `restart: always` is pinned explicitly (`mk`'s default is
 /// `OnFailure`) so the unit under test is exactly `Type=exec` + `Restart=always` +
-/// `StartLimitIntervalSec=0` (`generate.rs:38-44` emits the last of those only when restart is
-/// enabled), the shape measured to fail `start` in 5/5.
+/// `StartLimitIntervalSec=0` (emitted only when restart is enabled), the shape measured to fail
+/// `start` in 5/5.
 ///
 /// Asserts only on `start`'s result: by the time it returns, the unit is already
 /// `activating`/`auto-restart`, not `failed` — a follow-up state read would be asserting a race

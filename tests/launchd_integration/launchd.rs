@@ -886,7 +886,7 @@ fn a_stop_with_no_budget_runs_bootout_to_completion() {
 /// Two measured facts, neither of them assumed:
 ///
 /// 1. The throttle is ~10.02s and is keyed to the **job**, not to the loaded instance:
-///    `bootout` + `bootstrap` does not clear it. Probe run 35044604324 on macos-latest, a
+///    `bootout` + `bootstrap` does not clear it. Measured on macos-latest with a
 ///    `KeepAlive` job running `/usr/bin/true`: `kickstart -p` took 10.01s and 10.02s before a
 ///    bootout/bootstrap cycle, and 10.03s / 10.02s / 10.02s across three cycles after one. So no
 ///    prologue remedy is possible, and `start` no longer attempts one.

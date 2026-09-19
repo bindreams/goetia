@@ -86,9 +86,9 @@ fn an_empty_diagnostic_is_explained_rather_than_trailing_off_after_a_colon() {
 // verb_args ===========================================================================================================
 
 /// `--no-block` is the whole of what a non-waiting budget means to systemd, and no elevated test
-/// can see it: `start` returns either way, so dropping the flag leaves that suite green (measured —
-/// the review's mutation 2b kept 37/37). The argv is observable with no timing bet at all, which is
-/// why the mechanism is pinned here rather than through a live `systemctl`.
+/// can see it: `start` returns either way, so dropping the flag leaves that suite green (measured:
+/// 37/37 still passed without it). The argv is observable with no timing bet at all, which is why
+/// the mechanism is pinned here rather than through a live `systemctl`.
 #[skuld::test]
 fn a_budget_that_does_not_wait_asks_systemd_not_to_block() {
     for budget in [Budget::Immediate, Budget::Bounded(Duration::ZERO)] {
