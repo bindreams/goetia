@@ -78,9 +78,9 @@ impl NoManager {
                 let mut cmd = Command::new(goetia);
                 cmd.env("PATH", path_first(dir.path()));
                 // Inherited by goetia, and by every `systemctl` it does not clear them from: three
-                // of them turn a real chroot detection off, and the other two are names no systemd
-                // reads — one of which no source file holds — so what the stand-in models is
-                // goetia's removal by prefix, not systemd's reading.
+                // of them turn a real chroot detection off, one names another root's bus, and the
+                // rest no systemd reads at all — two of them unlistable — so what the stand-in
+                // models is goetia's removal by prefix, not systemd's reading.
                 for (switch, value) in every_silencer() {
                     cmd.env(switch, value);
                 }
@@ -129,30 +129,35 @@ impl Drop for RmLink {
     }
 }
 
-/// The environment settings that turn a real `systemctl`'s own chroot detection off, with a value
-/// that does it: `running_in_chroot_or_offline()` consults `SYSTEMD_OFFLINE` first (every supported
-/// version, and a *false* value short-circuits the chroot check as surely as a true one short-
-/// circuits everything), then `SYSTEMD_IN_CHROOT` (257 on), then `SYSTEMD_IGNORE_CHROOT`. The
-/// fourth is a switch no systemd has, so the removal is shown to reach past the switches systemd
-/// ships today. Setting them all on goetia proves the removal rather than assuming it — without it,
-/// the stand-in below looks away and there is no report for goetia to refuse on.
+/// The names goetia must take off the `systemctl` it spawns here, with a value that would matter.
+/// The first three turn a real `systemctl`'s own chroot detection off:
+/// `running_in_chroot_or_offline()` consults `SYSTEMD_OFFLINE` first (every supported version, and
+/// a *false* value short-circuits the chroot check as surely as a true one short-circuits
+/// everything), then `SYSTEMD_IN_CHROOT` (257 on), then `SYSTEMD_IGNORE_CHROOT`. The fourth is a
+/// switch no systemd has, so the removal is shown to reach past the switches systemd ships today.
+/// The fifth is from systemd's other switch namespace for this binary, the one that sends a real
+/// `systemctl` to the bus `DBUS_SYSTEM_BUS_ADDRESS` names rather than this root's manager. Setting
+/// them all on goetia proves the removal rather than assuming it — without it, the stand-in below
+/// looks away and there is no report for goetia to refuse on.
 ///
 /// What no name written here can show is that the removal goes by *prefix*: a denylist holding
-/// exactly these four satisfies every assertion in this file. [`unlistable`] is the entry that
-/// shows it, and it is set on goetia alongside these.
-const SILENCERS: [(&str, &str); 4] = [
+/// exactly these five satisfies every assertion in this file. [`unlistable`] is what shows it, and
+/// is set on goetia alongside these.
+const SILENCERS: [(&str, &str); 5] = [
     ("SYSTEMD_IGNORE_CHROOT", "1"),
     ("SYSTEMD_IN_CHROOT", "0"),
     ("SYSTEMD_OFFLINE", "0"),
     ("SYSTEMD_A_SWITCH_NO_SUPPORTED_VERSION_HAS_YET", "1"),
+    ("SYSTEMCTL_FORCE_BUS", "1"),
 ];
 
-/// A [`SILENCERS`] entry whose name no source file can contain: it is made at run time from this
-/// test process's pid, so no denylist of literal names — the shape goetia shipped and had to
-/// correct twice — can hold it, and a child that arrives without it arrives without it for its
-/// prefix. Set on goetia and honoured by the stand-in exactly as [`SILENCERS`] are.
-fn unlistable() -> String {
-    format!("SYSTEMD_H{}", std::process::id())
+/// One more [`SILENCERS`] name under each prefix goetia removes, made at run time from this test
+/// process's pid: no denylist of literal names — the shape goetia shipped and had to correct twice
+/// — can contain them, so a child that arrives without them arrives without them for their prefix.
+/// Set on goetia and honoured by the stand-in exactly as [`SILENCERS`] are.
+fn unlistable() -> [String; 2] {
+    let pid = std::process::id();
+    [format!("SYSTEMD_H{pid}"), format!("SYSTEMCTL_H{pid}")]
 }
 
 /// [`SILENCERS`] and [`unlistable`] together: every name goetia must take off the child here.
@@ -160,7 +165,7 @@ fn every_silencer() -> Vec<(String, String)> {
     SILENCERS
         .iter()
         .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
-        .chain([(unlistable(), "1".to_string())])
+        .chain(unlistable().map(|name| (name, "1".to_string())))
         .collect()
 }
 
@@ -176,16 +181,19 @@ fn path_first(dir: &Path) -> std::ffi::OsString {
 /// [`SILENCERS`] nor [`unlistable`], by exiting `0` silently if any survived — as a real `systemctl`
 /// that believed it was not in a chroot and went on to do the work would. Stricter than a real one,
 /// which honours only the names it knows, and deliberately so: what is pinned is goetia's removal,
-/// not systemd's reading, so the two names no systemd reads must silence it too.
+/// not systemd's reading, so the three names no systemd would act on here must silence it too.
 fn honours_the_silencers() -> String {
-    format!(
-        "case \"${{SYSTEMD_OFFLINE-}}\" in 0|no|n|false|f|off) exit 0;; esac\n\
-         case \"${{SYSTEMD_IN_CHROOT-}}\" in 0|no|false|off) exit 0;; esac\n\
-         case \"${{SYSTEMD_IGNORE_CHROOT-}}\" in 1|yes|true|on) exit 0;; esac\n\
-         [ -n \"${{SYSTEMD_A_SWITCH_NO_SUPPORTED_VERSION_HAS_YET-}}\" ] && exit 0\n\
-         [ -n \"${{{unlistable}-}}\" ] && exit 0\n",
-        unlistable = unlistable()
-    )
+    let mut shell = String::from(
+        "case \"${SYSTEMD_OFFLINE-}\" in 0|no|n|false|f|off) exit 0;; esac\n\
+         case \"${SYSTEMD_IN_CHROOT-}\" in 0|no|false|off) exit 0;; esac\n\
+         case \"${SYSTEMD_IGNORE_CHROOT-}\" in 1|yes|true|on) exit 0;; esac\n\
+         [ -n \"${SYSTEMD_A_SWITCH_NO_SUPPORTED_VERSION_HAS_YET-}\" ] && exit 0\n\
+         [ -n \"${SYSTEMCTL_FORCE_BUS-}\" ] && exit 0\n",
+    );
+    for name in unlistable() {
+        shell.push_str(&format!("[ -n \"${{{name}-}}\" ] && exit 0\n"));
+    }
+    shell
 }
 
 /// A stand-in `systemctl` that says `report` on stderr, `$1` the verb, for every verb but

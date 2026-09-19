@@ -89,12 +89,13 @@ const ENVIRONMENT: [(&str, &str); 3] = [
     ("SYSTEMD_LOG_TARGET", "console"),
 ];
 
-/// The prefix systemd's own switches carry, and which every `systemctl` goetia runs is denied: an
-/// inherited `SYSTEMD_*` is removed from the child whatever it is, and [`ENVIRONMENT`] alone is
-/// then given. Named by prefix rather than one switch at a time because the switches are
-/// systemd's to add, not goetia's to keep up with: `systemctl` and the library it links carry 45
-/// such names on 255 and 90 on 257, and *three* of those turn off, each on its own, the chroot
-/// report [`answered`] is the last line against. Naming them is what missed the next one twice.
+/// The two prefixes systemd's own switches for this binary carry, and which every `systemctl`
+/// goetia runs is denied: an inherited name under either is removed from the child whatever it is,
+/// and [`ENVIRONMENT`] alone is then given. Named by prefix rather than one switch at a time
+/// because the switches are systemd's to add, not goetia's to keep up with: `systemctl` and the
+/// library it links carry 45 such names on 255 and 90 on 257, and *three* of those turn off, each
+/// on its own, the chroot report [`answered`] is the last line against. Naming them is what missed
+/// the next one twice.
 ///
 /// The three, MEASURED on 255 and 257 in a chroot with no `/proc`, where goetia establishes nothing
 /// of its own: `SYSTEMD_IGNORE_CHROOT` true; `SYSTEMD_IN_CHROOT` false, on 257 on; and
@@ -109,17 +110,25 @@ const ENVIRONMENT: [(&str, &str); 3] = [
 /// makes `systemctl` ignore every command. Detecting it is the child's job; goetia only declines to
 /// prejudge it.
 ///
+/// `SYSTEMCTL_*` is systemd's second switch namespace for this binary, and is covered for the same
+/// reason rather than for anything it holds today: MEASURED on 255 and 257, both carry the same
+/// five names, and none of them silences the chroot report. `SYSTEMCTL_FORCE_BUS` is nonetheless
+/// the other shape goetia refuses for — it makes `systemctl` reach the manager over the bus
+/// `DBUS_SYSTEM_BUS_ADDRESS` names instead of this root's private socket. MEASURED with that
+/// address pointed at a path that does not exist: `show` answered `Version=…` without the switch
+/// and failed to connect with it. Off the child, the address decides nothing.
+///
 /// What removing the rest costs: nothing any real environment carries. MEASURED on 255 and 257 — a
-/// plain shell, a login shell and `sudo` carry no `SYSTEMD_*` at all, and the one systemd itself
-/// puts in a process's environment, `SYSTEMD_EXEC_PID`, changes nothing `systemctl` does. Both of
-/// its streams are captured, never a terminal, so `SYSTEMD_PAGER`, `SYSTEMD_LESS` and
+/// plain shell, a login shell and `sudo` carry no name under either prefix, and the one systemd
+/// itself puts in a process's environment, `SYSTEMD_EXEC_PID`, changes nothing `systemctl` does.
+/// Both of its streams are captured, never a terminal, so `SYSTEMD_PAGER`, `SYSTEMD_LESS` and
 /// `SYSTEMD_PAGERSECURE` changed nothing either.
 ///
-/// What it does *not* reach is a variable without the prefix that `systemctl` also reads. MEASURED
-/// on 255 and 257, each with the report in force: `PAGER=cat`, `LESS=X`, `TERM=xterm-256color`,
-/// `LC_ALL=de_DE.UTF-8` and `LANG=ja_JP.UTF-8` all leave it word for word in English, which is what
-/// [`IGNORED`] matches on.
-const DENIED: &str = "SYSTEMD_";
+/// What they do *not* reach is a variable under neither prefix that `systemctl` also reads.
+/// MEASURED on 255 and 257, each with the report in force: `PAGER=cat`, `LESS=X`,
+/// `TERM=xterm-256color`, `LC_ALL=de_DE.UTF-8` and `LANG=ja_JP.UTF-8` all leave it word for word in
+/// English, which is what [`IGNORED`] matches on.
+const DENIED: [&str; 2] = ["SYSTEMD_", "SYSTEMCTL_"];
 
 /// A child's environment, as each of the two `Command` types goetia spawns a `systemctl` through
 /// offers it: [`environment`] is applied through this, so neither path can be given one and not the
@@ -155,7 +164,8 @@ impl Environment for cosca::Command {
 /// neither `Command`'s own rule for a key both set and removed can decide what the child gets.
 fn environment_from(cmd: &mut impl Environment, inherited: impl Iterator<Item = String>) {
     let given = |key: &str| ENVIRONMENT.iter().any(|(name, _)| *name == key);
-    for key in inherited.filter(|key| key.starts_with(DENIED) && !given(key)) {
+    let denied = |key: &str| DENIED.iter().any(|prefix| key.starts_with(prefix));
+    for key in inherited.filter(|key| denied(key) && !given(key)) {
         cmd.remove(&key);
     }
     for (key, value) in ENVIRONMENT {

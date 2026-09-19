@@ -1259,10 +1259,11 @@ fn a_chroot_systemctl_reports_is_refused_and_cannot_be_silenced() {
 }
 
 /// What a `systemctl` goetia ran carries of [`DENIED`], as shell: [`ENVIRONMENT`]'s three names
-/// with [`ENVIRONMENT`]'s values, and nothing else under the prefix. Asked of `env`, so it is the
-/// child's environment as it arrived rather than a list of the switches a real `systemctl` happens
-/// to read — which is the point of removing by prefix.
+/// with [`ENVIRONMENT`]'s values, and nothing else under either prefix. Asked of `env`, so it is
+/// the child's environment as it arrived rather than a list of the switches a real `systemctl`
+/// happens to read — which is the point of removing by prefix.
 const ONLY_GOETIAS_OWN_SWITCHES: &str = "[ \"$(env | grep -c '^SYSTEMD_')\" = 3 ] \
+                                         && [ \"$(env | grep -c '^SYSTEMCTL_')\" = 0 ] \
                                          && [ \"$SYSTEMD_COLORS\" = 0 ] \
                                          && [ \"$SYSTEMD_LOG_LEVEL\" = info ] \
                                          && [ \"$SYSTEMD_LOG_TARGET\" = console ]";
@@ -1284,17 +1285,18 @@ impl Environment for Recorded {
     }
 }
 
-/// Every inherited name under [`DENIED`] is *removed* from a child, including one whose name this
-/// file does not contain and cannot: it is made at run time from this process's pid, so no denylist
-/// of literals — the shape [`DENIED`] replaced, twice — can hold it, and only the prefix can select
-/// it. `SYSTEMD_A_SWITCH_NO_SUPPORTED_VERSION_HAS_YET` is a name no systemd reads but this file
-/// does spell, so it pins reach beyond the switches systemd has today and nothing more. Nothing
-/// outside the prefix is touched, and [`ENVIRONMENT`] is set rather than removed —
-/// `SYSTEMD_IN_CHROOT=0` would assert there is no chroot and `=1` one everywhere, so a value is
-/// never asserted for a switch goetia does not own.
+/// Every inherited name under either of [`DENIED`]'s prefixes is *removed* from a child, including
+/// one per prefix whose name this file does not contain and cannot: it is made at run time from
+/// this process's pid, so no denylist of literals — the shape [`DENIED`] replaced, twice — can hold
+/// it, and only the prefix can select it. `SYSTEMD_A_SWITCH_NO_SUPPORTED_VERSION_HAS_YET` is a name
+/// no systemd reads but this file does spell, so it pins reach beyond the switches systemd has
+/// today and nothing more. Nothing outside the prefixes is touched, and [`ENVIRONMENT`] is set
+/// rather than removed — `SYSTEMD_IN_CHROOT=0` would assert there is no chroot and `=1` one
+/// everywhere, so a value is never asserted for a switch goetia does not own.
 #[skuld::test]
 fn every_inherited_systemd_switch_is_removed_from_a_child_and_nothing_else_is() {
-    let unlistable = format!("SYSTEMD_H{}", std::process::id());
+    let pid = std::process::id();
+    let (unlistable, unlistable_client) = (format!("SYSTEMD_H{pid}"), format!("SYSTEMCTL_H{pid}"));
     let inherited = [
         "SYSTEMD_IGNORE_CHROOT",
         "SYSTEMD_IN_CHROOT",
@@ -1304,8 +1306,11 @@ fn every_inherited_systemd_switch_is_removed_from_a_child_and_nothing_else_is() 
         "SYSTEMD_COLORS",
         "SYSTEMD_LOG_LEVEL",
         "SYSTEMD_LOG_TARGET",
+        "SYSTEMCTL_FORCE_BUS",
+        unlistable_client.as_str(),
         "PATH",
         "SYSTEMDNOUNDERSCORE",
+        "SYSTEMCTLNOUNDERSCORE",
         "NOT_SYSTEMD_EITHER",
     ];
     let mut recorded = Recorded::default();
@@ -1318,6 +1323,8 @@ fn every_inherited_systemd_switch_is_removed_from_a_child_and_nothing_else_is() 
             "SYSTEMD_OFFLINE",
             "SYSTEMD_A_SWITCH_NO_SUPPORTED_VERSION_HAS_YET",
             unlistable.as_str(),
+            "SYSTEMCTL_FORCE_BUS",
+            unlistable_client.as_str(),
         ]
     );
     assert_eq!(recorded.given, ENVIRONMENT.map(|(k, v)| (k.to_string(), v.to_string())));

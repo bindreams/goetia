@@ -34,12 +34,15 @@ no mount at all, which only `chroot(2)` leaves and which goetia's own table
 shows without PID 1's; `/run/systemd/system` missing; or `systemctl`
 reporting a chroot — a verb that would reach systemd exits `1` before it
 writes or sends anything, with one message naming the first of these it
-found. No inherited variable can turn that last one off: every `SYSTEMD_*`
-variable is removed from the `systemctl` goetia runs, and only the three
-goetia sets itself are given back, so nothing in the environment — including
-a switch a newer systemd adds — can stop it detecting a chroot goetia could
-not see for itself. `install` always reaches it; the other verbs only for a
-daemon of goetia's, and they answer from files alone otherwise:
+found. No switch under either prefix systemd gives this binary can turn that
+last one off: every inherited `SYSTEMD_*` and `SYSTEMCTL_*` variable is
+removed from the `systemctl` goetia runs, and only the three goetia sets
+itself are given back, so nothing in those two namespaces — including a
+switch a newer systemd adds — can stop it detecting a chroot goetia could not
+see for itself, or send it to a manager that is not this root's. A variable
+under neither prefix is passed through as it arrived. `install` always
+reaches it; the other verbs only for a daemon of goetia's, and they answer
+from files alone otherwise:
 
 - `uninstall`, `start`, `stop`, `restart`, `enable` and `disable` refuse
   an id goetia finds its own, and answer any other as anywhere else — for
