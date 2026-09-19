@@ -54,7 +54,7 @@ fn stderr_is_preferred_over_stdout_when_both_carry_something() {
 /// reads as "systemd said this and stopped", when what happened is that
 /// goetia stopped reading.
 #[skuld::test]
-fn a_truncated_diagnostic_says_it_is_a_prefix() {
+fn a_truncated_diagnostic_says_it_may_be_only_a_prefix() {
     let e = failed("start", "x.service", &capture("", "Unit x.ser", false));
     let msg = e.to_string();
     assert!(msg.contains("Unit x.ser"), "{msg}");
