@@ -107,10 +107,10 @@ def kill_tree_posix(proc):
     `setsid()` itself has left it, and is not killed.
 
     The root goes first, directly by pid, so the caller's `proc.wait()` is
-    bounded whatever the enumeration then finds, or cannot read; the loop skips
-    it, since that `proc.wait()` is its reap. Each pass signals every member
-    `getsid` just named, without checking it first: a pid checked and only
-    then killed can be reaped and its number reused in between, and the
+    bounded whatever the enumeration then finds, or cannot read; the loop
+    skips it, since that `proc.wait()` is its reap. Each pass signals every
+    member `getsid` just named, without checking it first: a pid checked and
+    only then killed can be reaped and its number reused in between, and the
     check buys nothing anyway, since `_sigkill` already forgives a member
     that simply exited. `_is_live` runs only after the signals, to decide
     whether another pass is needed, which catches a member forked before its
