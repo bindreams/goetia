@@ -94,20 +94,25 @@ def kill_tree_posix(proc):
 
     The root goes first, directly by pid, so the caller's `proc.wait()` is
     bounded whatever the enumeration finds or fails to find; the loop skips
-    it, since that `proc.wait()` is its reap. The loop repeats until no LIVE
-    member is left, which catches one forked before its parent's SIGKILL
-    landed. A zombie counts as gone: every SIGKILLed member becomes one until
-    its own parent reaps it, which may be never. The loop ends because a
-    SIGKILLed process cannot fork; a member in uninterruptible sleep (`D`)
-    delays that until it wakes, and the CI job's `timeout-minutes` backstops
-    one that never does."""
+    it, since that `proc.wait()` is its reap. Each pass signals every member
+    `getsid` just named, without checking it first: a pid checked and only
+    then killed can be reaped and its number reused in between, and the
+    check buys nothing anyway, since `_sigkill` already forgives a member
+    that simply exited. `_is_live` runs only after the signals, to decide
+    whether another pass is needed, which catches a member forked before its
+    parent's SIGKILL landed. A zombie counts as gone: every SIGKILLed member
+    becomes one until its own parent reaps it, which may be never, and
+    signalling one again on a later pass changes nothing. The loop ends
+    because a SIGKILLed process cannot fork; a member in uninterruptible
+    sleep (`D`) delays that until it wakes, and the CI job's
+    `timeout-minutes` backstops one that never does."""
     _sigkill(proc.pid)
     while True:
-        live = [pid for pid in _session_members(proc.pid) if pid != proc.pid and _is_live(pid)]
-        if not live:
+        for pid in _session_members(proc.pid):
+            if pid != proc.pid:
+                _sigkill(pid)
+        if not any(pid != proc.pid and _is_live(pid) for pid in _session_members(proc.pid)):
             return
-        for pid in live:
-            _sigkill(pid)
 
 
 def kill_tree_windows(proc):

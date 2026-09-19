@@ -45,13 +45,17 @@ class FakeHost:
     """A process table behind `kill_tree_posix`'s touch points: `ps` (through
     `subprocess.run`), `os.getsid` and `os.kill`. A SIGKILLed process becomes
     a zombie that nothing reaps and `ps` still lists. A SIGKILL here takes
-    effect at once, so signalling one pid twice can only mean the kill loop
-    is spinning: that fails the test instead of hanging it."""
+    effect at once, so signalling a LIVE pid twice can only mean the kill
+    loop is spinning: that fails the test instead of hanging it. Signalling a
+    zombie again is allowed, and is what a later pass legitimately does --
+    `kill_tree_posix` signals straight off the enumeration rather than
+    checking each pid first."""
 
     def __init__(self, sessions):
         self.sid = dict(sessions)
         self.stat = {pid: "S" for pid in sessions}
         self.kills = []
+        self.ops = []  # ("kill" | "check", pid), in call order
         self.ps_failure = None  # stderr of a failing `ps -A`
         self.gone_before_getsid = set()  # listed by `ps -A`, gone by `getsid`
         self.gone_before_kill = set()  # in the session, gone by `kill`
@@ -66,6 +70,7 @@ class FakeHost:
             listed = sorted(set(self.sid) | self.gone_before_getsid)
             return subprocess.CompletedProcess(argv, 0, "".join(f"{pid}\n" for pid in listed), "")
         if argv[:3] == ["ps", "-o", "stat="]:
+            self.ops.append(("check", int(argv[-1])))
             stat = self.stat.get(int(argv[-1]))
             if stat is None:
                 return subprocess.CompletedProcess(argv, 1, "", "")
@@ -83,9 +88,10 @@ class FakeHost:
         return self.sid[pid]
 
     def kill(self, pid, sig):
-        if (pid, sig) in self.kills:
-            raise AssertionError(f"pid {pid} signalled twice: the kill loop is spinning")
+        if (pid, sig) in self.kills and self.stat.get(pid) != "Z":
+            raise AssertionError(f"live pid {pid} signalled twice: the kill loop is spinning")
         self.kills.append((pid, sig))
+        self.ops.append(("kill", pid))
         if pid in self.refuses_kill:
             raise PermissionError(1, "Operation not permitted")
         if pid in self.gone_before_kill or pid not in self.sid:
@@ -99,7 +105,9 @@ class FakeHost:
         self.stat[pid] = "Z"
 
     def killed(self):
-        return sorted(pid for pid, _sig in self.kills)
+        """The distinct pids signalled, since a zombie may be signalled on
+        more than one pass."""
+        return sorted({pid for pid, _sig in self.kills})
 
     def installed(self):
         stack = ExitStack()
@@ -129,6 +137,19 @@ class KillTreePosixTests(unittest.TestCase):
         self.kill_tree(host)
         self.assertEqual(host.kills[:1], [(ROOT, SIGKILL)])
         self.assertEqual(host.killed(), [ROOT, 101, 102])
+
+    def test_every_member_is_signalled_before_any_liveness_check(self):
+        # A pid checked and only then killed can be reaped and its number
+        # reused in between, and under `sudo` the SIGKILL that follows is
+        # unrestricted. Liveness decides only whether another pass is needed,
+        # so no check may stand between `getsid` naming a member and its
+        # kill.
+        host = FakeHost(_session(101, 102))
+        self.kill_tree(host)
+        first_check = next((i for i, (op, _pid) in enumerate(host.ops) if op == "check"), None)
+        self.assertIsNotNone(first_check, "nothing decided whether another pass was needed")
+        signalled_first = sorted(pid for op, pid in host.ops[:first_check] if op == "kill")
+        self.assertEqual(signalled_first, [ROOT, 101, 102])
 
     def test_a_member_forked_before_its_parent_died_is_killed_on_the_next_pass(self):
         host = FakeHost(_session(101))
