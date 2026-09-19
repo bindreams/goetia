@@ -734,14 +734,41 @@ fn an_answer_that_ignored_nothing_is_an_answer() {
 #[skuld::test]
 fn a_show_answer_without_every_property_is_not_a_state() {
     for (answer, missing) in [
-        ("true", "ActiveState, MainPID, UnitFileState"),
-        ("printf 'ActiveState=active\\n'", "MainPID, UnitFileState"),
-        ("printf 'ActiveState=active\\nMainPID=42\\n'", "UnitFileState"),
+        ("true", "ActiveState, MainPID, UnitFileState, LoadState"),
+        ("printf 'ActiveState=active\\n'", "MainPID, UnitFileState, LoadState"),
+        (
+            "printf 'ActiveState=active\\nMainPID=42\\nUnitFileState=enabled\\n'",
+            "LoadState",
+        ),
     ] {
         let _stand_in = stand_in::set(Some(&format!("{answer}; exit 0")), booted());
         let e = status_from_unit("x.service").expect_err(answer);
         let msg = e.to_string();
         assert!(msg.contains(&format!("answered without {missing}")), "{answer}: {msg}");
+    }
+}
+
+/// A unit systemd has not loaded — `LoadState=not-found`, no unit file for the name — is never a
+/// state, whatever else systemd answers for it: goetia asks only about units it finds installed, so
+/// that is systemd not having loaded one, and "stopped, not enabled" would be made up. Every other
+/// load state is systemd's own answer about a unit it has.
+#[skuld::test]
+fn a_unit_systemd_has_not_loaded_is_not_a_state() {
+    for (active, unit_file) in [("inactive", ""), ("active", "enabled")] {
+        let answer = format!("ActiveState={active}\\nMainPID=0\\nUnitFileState={unit_file}\\nLoadState=not-found\\n");
+        let _stand_in = stand_in::set(Some(&format!("printf '{answer}'")), booted());
+        let msg = status_from_unit("x.service").expect_err(&answer).to_string();
+        assert!(
+            msg.contains("systemd has not loaded the unit file goetia finds installed for `x.service`"),
+            "{answer}: {msg}"
+        );
+        assert!(msg.contains("`LoadState=not-found`"), "{answer}: {msg}");
+    }
+    for load in ["loaded", "masked", "bad-setting", "error"] {
+        let answer = format!("ActiveState=inactive\\nMainPID=0\\nUnitFileState=\\nLoadState={load}\\n");
+        let _stand_in = stand_in::set(Some(&format!("printf '{answer}'")), booted());
+        let status = status_from_unit("x.service").expect(&answer);
+        assert_eq!(status.state, State::Stopped, "{answer}");
     }
 }
 
@@ -751,7 +778,7 @@ fn a_show_answer_without_every_property_is_not_a_state() {
 fn a_show_answer_with_every_property_is_read() {
     for (answer, expected) in [
         (
-            "ActiveState=active\\nMainPID=42\\nUnitFileState=enabled\\n",
+            "ActiveState=active\\nMainPID=42\\nUnitFileState=enabled\\nLoadState=loaded\\n",
             Status {
                 state: State::Running,
                 pid: Some(42),
@@ -759,7 +786,7 @@ fn a_show_answer_with_every_property_is_read() {
             },
         ),
         (
-            "MainPID=0\\nActiveState=inactive\\nUnitFileState=\\n",
+            "MainPID=0\\nLoadState=loaded\\nActiveState=inactive\\nUnitFileState=\\n",
             Status {
                 state: State::Stopped,
                 pid: None,

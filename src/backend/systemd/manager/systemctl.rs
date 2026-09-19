@@ -843,8 +843,19 @@ fn show_properties(unit: &str, props: &[&str]) -> Result<BTreeMap<String, String
 
 /// `UnitFileState` is the same install-state systemd derives for `systemctl is-enabled` — one query
 /// covers state, pid, and boot-enablement together.
+///
+/// Asked only about a unit goetia finds installed, so `LoadState=not-found` — systemd has no unit
+/// file for the name — is systemd not having loaded that file: a unit written and not yet loaded,
+/// or one systemd cannot see. What systemd reports for it then is not that unit's state, and never
+/// read as one.
 pub(super) fn status_from_unit(unit: &str) -> Result<Status> {
-    let props = show_properties(unit, &["ActiveState", "MainPID", "UnitFileState"])?;
+    let props = show_properties(unit, &["ActiveState", "MainPID", "UnitFileState", "LoadState"])?;
+    if props.get("LoadState").map(String::as_str) == Some("not-found") {
+        return Err(Error::Other(format!(
+            "systemd has not loaded the unit file goetia finds installed for `{unit}` (`LoadState=not-found`), so \
+             what it reports is not that unit's state"
+        )));
+    }
     let state = match props.get("ActiveState").map(String::as_str) {
         Some("active") => State::Running,
         Some("inactive") => State::Stopped,
