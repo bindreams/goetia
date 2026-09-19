@@ -54,10 +54,11 @@ const IGNORED: [&str; 2] = ["ignoring command", "ignoring request"];
 ///
 /// It is the last line in a chroot with no `/proc` at all — `/proc/1/root` and both mount tables
 /// are `ENOENT`, so goetia establishes nothing, while `systemctl` reports the chroot from that same
-/// absence (MEASURED, 255 and 257) — and, on 257, in one that `SYSTEMD_IN_CHROOT=1` declares. Where
-/// PID 1 is hidden from goetia rather than absent, as under a `hidepid` `/proc`, `systemctl` runs
-/// with goetia's credentials and hits the same wall: it reports nothing, and this backstop does not
-/// fire either.
+/// absence (MEASURED, 255 and 257). Nothing in the environment can put it there instead: every
+/// switch that would declare a chroot is taken off the child ([`DENIED`]), so what reaches this is
+/// always the child's own detection. Where PID 1 is hidden from goetia rather than absent, as under
+/// a `hidepid` `/proc`, `systemctl` runs with goetia's credentials and hits the same wall: it
+/// reports nothing, and this backstop does not fire either.
 fn answered(stdout: &[u8], stderr: &[u8]) -> Result<()> {
     let ignored = |stream: &[u8]| {
         String::from_utf8_lossy(stream)

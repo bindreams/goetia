@@ -1226,10 +1226,11 @@ fn systemd_offline_is_evidence_only_when_true() {
     }
 }
 
-/// The chroot `systemctl` itself detects — `/proc/1/root` against `/`, or on 257 `SYSTEMD_IN_CHROOT`
-/// — as it reports it: `show` exits `0`, prints nothing, and says why on stderr, in 246's words and
-/// newer ones' (measured on 257), 242 to 245's, or those with no verb to name (see [`IGNORED`]). The
-/// gate refuses it, naming the report.
+/// The chroot `systemctl` itself detects — `/proc/1/root` against `/`, or the absence that leaves
+/// neither readable — as it reports it: `show` exits `0`, prints nothing, and says why on stderr,
+/// in 246's words and newer ones' (measured on 257), 242 to 245's, or those with no verb to name
+/// (see [`IGNORED`]). The gate refuses it, naming the report. A chroot the *environment* declares
+/// is not among the causes: [`DENIED`] takes every such switch off the child.
 ///
 /// Three environment settings would stop a real `systemctl` from reporting it. The stand-in asks
 /// something stricter and simpler — that the child carry [`ENVIRONMENT`] and nothing else under
