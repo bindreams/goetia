@@ -29,10 +29,24 @@ through the running systemd manager of the system it runs on. Where it finds
 `SYSTEMD_OFFLINE` set; `/` other than PID 1's root (a chroot, or a container
 sharing the host's PID namespace — seen in `/proc/1/root`, or unelevated in
 the mount tables); `/run/systemd/system` missing; or `systemctl` reporting a
-chroot — every verb that reaches systemd exits `1` before it writes or sends
-anything, with one message naming the first of these it found. That is
-`install`, `uninstall`, `start`, `stop`, `restart`, `enable`, `disable`,
-`status`, `list`, and `show` without `--file`, which reads what `list` reads.
+chroot — a verb that would reach systemd exits `1` before it writes or sends
+anything, with one message naming the first of these it found. `install`
+always reaches it; the other verbs only for a daemon of goetia's, and they
+answer from files alone otherwise:
+
+- `uninstall`, `start`, `stop`, `restart`, `enable` and `disable` refuse
+  an id goetia finds its own, and answer any other as anywhere else — for
+  one with nothing installed, `uninstall` exits `0`, "nothing to do", and
+  the others `1`, "not installed".
+- `status <id>` refuses an id of goetia's whose unit decodes, the only kind
+  whose live state it reads, and answers any other as anywhere else.
+- `status` and `list` read the live state of every such daemon, so with one
+  installed they refuse. With none, they answer from files: with nothing
+  installed, an empty listing, exit `0`.
+- `show <id>` without `--file` renders what `list` reads, so it refuses
+  while any such daemon is installed, whether or not it is that id. With
+  none, an id with nothing installed is "not installed", exit `1`.
+
 `install --dry-run`, `diff` and `show --file` never reach systemd, and work
 there as anywhere else.
 
