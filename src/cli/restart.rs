@@ -242,8 +242,13 @@ fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
         },
         // The start may or may not have reached the manager: kept as it is,
         // ahead of the non-waiting arm below, whose "refused" it was not.
-        Error::RequestInDoubt { request, detail } => Error::RequestInDoubt {
+        Error::RequestInDoubt {
             request,
+            reached,
+            detail,
+        } => Error::RequestInDoubt {
+            request,
+            reached,
             detail: format!("{}: {detail}", after_stop_clause(budget)),
         },
         // The stop was issued and not waited for, and the start that

@@ -3203,7 +3203,7 @@ fn a_restart_that_waits_never_takes_the_request_only_restart() {
 }
 
 /// A start that may or may not have reached the manager is indeterminate — exit `4`, never the `1`
-/// that says nothing happened — through every verb that starts: `start`, `install --start`, and
+/// that says it failed — through every verb that starts: `start`, `install --start`, and
 /// `restart`'s start leg under a budget that waits and one that does not, where the stop before it
 /// is disclosed as the leg left it.
 #[skuld::test]

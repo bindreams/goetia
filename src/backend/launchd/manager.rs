@@ -778,6 +778,8 @@ fn launchctl(args: &[&str], deadline: Deadline, role: Role) -> Result<Option<Ran
         if request {
             Error::RequestInDoubt {
                 request: format!("launchctl {}", args.join(" ")),
+                // `launchctl` never says when launchd has it.
+                reached: false,
                 detail: e.to_string(),
             }
         } else {
@@ -792,10 +794,12 @@ fn launchctl(args: &[&str], deadline: Deadline, role: Role) -> Result<Option<Ran
         bounded::SpawnError::NotRun(e) => failed(e),
         bounded::SpawnError::MayHaveRun(e) => in_doubt(e),
     })?;
-    Ok(match bounded::wait_bounded(spawned, deadline).map_err(in_doubt)? {
-        bounded::Finished::Exited { status, capture } => Some(Ran { status, capture }),
-        bounded::Finished::Expired => None,
-    })
+    Ok(
+        match bounded::wait_bounded(spawned, deadline).map_err(|lost| in_doubt(lost.error))? {
+            bounded::Finished::Exited { status, capture } => Some(Ran { status, capture }),
+            bounded::Finished::Expired => None,
+        },
+    )
 }
 
 /// A stand-in for `launchctl` on this thread: a shell script run as `sh -c <script> launchctl

@@ -162,21 +162,28 @@ pub enum Error {
     #[error("`{id}` was not restarted, and where it ended up is not established: {detail}")]
     Unestablished { id: String, detail: String },
 
-    /// A request that may or may not have reached the service manager: the
-    /// tool carrying it — `systemctl`, `launchctl` — had started when goetia
-    /// lost track of it, so whatever it sends may already be sent. `request`
-    /// is the tool's command line.
+    /// A request goetia lost track of before its outcome was established: the
+    /// tool carrying it — `systemctl`, `launchctl` — may have started when it
+    /// failed, so whatever it sends may already be sent. `request` is the
+    /// tool's command line. `reached` is whether goetia knows the request
+    /// reached the manager: systemd says so (`Enqueued anchor job`) before it
+    /// acts, and a request lost after that had reached it.
     ///
     /// What it does **not** claim, which separates it from its neighbours: not
-    /// that nothing was sent, as a plain failure would; not that it was sent,
-    /// as [`WaitTimeout`](Error::WaitTimeout) does; and not that what is
-    /// installed at the id is in doubt, as [`Undetermined`](Error::Undetermined)
-    /// does. A failure goetia can place before the tool ran is never this.
+    /// that nothing was sent, as a plain failure would; not that goetia waited
+    /// for the outcome and gave up, as [`WaitTimeout`](Error::WaitTimeout)
+    /// does; and not that what is installed at the id is in doubt, as
+    /// [`Undetermined`](Error::Undetermined) does. A failure goetia can place
+    /// before the tool ran is never this.
     ///
     /// Exit `4` (indeterminate), like the three above: whether the manager
     /// acted is the question, and it was not answered.
-    #[error("`{request}` failed after it started, so it may or may not have reached the service manager: {detail}")]
-    RequestInDoubt { request: String, detail: String },
+    #[error("{}", in_doubt(request, *reached, detail))]
+    RequestInDoubt {
+        request: String,
+        reached: bool,
+        detail: String,
+    },
 
     /// No service manager can be asked on this host, on positive evidence: systemd's offline mode,
     /// a chroot, or a system systemd did not boot. `evidence` says which. goetia refuses there
@@ -235,6 +242,22 @@ pub enum Error {
     /// default: prefer a real variant when the failure recurs anywhere else.
     #[error("{0}")]
     Other(String),
+}
+
+/// [`Error::RequestInDoubt`]'s message: what goetia knows of how far the
+/// request got, and no more.
+fn in_doubt(request: &str, reached: bool, detail: &str) -> String {
+    if reached {
+        format!(
+            "`{request}` reached the service manager, but goetia lost track of it before its outcome was confirmed: \
+             {detail}"
+        )
+    } else {
+        format!(
+            "`{request}` may have started before it failed, so it may or may not have reached the service manager: \
+             {detail}"
+        )
+    }
 }
 
 /// This crate's `Result` alias, used throughout [`crate::manager`] and

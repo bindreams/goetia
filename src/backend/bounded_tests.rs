@@ -244,6 +244,28 @@ fn an_announced_request_is_issued_whatever_the_deadline() {
     assert!(request.exists(), "the request must be out before the deadline applies");
 }
 
+/// A wait lost after the announcement says the announcement came: that is what tells a request
+/// that reached the manager from one that may not have. Lost before it — here the child ends
+/// without announcing — or under a role that announces nothing, it says nothing.
+#[skuld::test]
+fn a_lost_wait_says_whether_the_request_was_announced() {
+    for (script, role, expected) in [
+        (
+            "echo 'request issued' >&2; exec sleep 2147483647",
+            Role::AnnouncedRequest(announced),
+            true,
+        ),
+        ("exit 0", Role::AnnouncedRequest(announced), false),
+        ("echo 'request issued' >&2; exit 0", Role::Query, false),
+    ] {
+        let child = spawned(sh(script), role);
+        test_hook::wait_fails(|| io::Error::other("the wait failed").into());
+        let lost = wait_bounded(child, Budget::Unbounded.start()).expect_err(script);
+        assert_eq!(lost.announced, expected, "{script}");
+        assert!(lost.error.to_string().contains("the wait failed"), "{script}: {lost:?}");
+    }
+}
+
 /// A child that ends without announcing — `systemctl` refusing a unit it cannot load — is reported
 /// with its own exit, not as an expiry. Its output reaching EOF means it is already exiting, so the
 /// kill a spent deadline sends cannot overwrite that exit.

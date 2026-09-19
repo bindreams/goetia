@@ -242,20 +242,26 @@ fn not_run(what: &'static str) -> impl Fn(io::Error) -> cosca::error::Error {
     }
 }
 
+/// How [`wait_bounded`] lost its child, and whether the child had announced first.
+#[derive(Debug)]
+pub(crate) struct Lost {
+    pub error: cosca::error::Error,
+    /// A [`Role::AnnouncedRequest`] had said the manager has its request, so the request reached
+    /// it. `false` establishes nothing.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub announced: bool,
+}
+
 /// Block until the child exits or `deadline` expires, under its [`Role`]'s rule for what an expiry
 /// does: kill the child, tear its tree down and reap it — or, for [`Role::Request`], leave it
 /// running for its [`Reaper`]. Nothing here makes a thread or a file: [`spawn`] made them all.
-pub(crate) fn wait_bounded(spawned: Spawned, deadline: Deadline) -> Result<Finished, cosca::error::Error> {
+pub(crate) fn wait_bounded(spawned: Spawned, deadline: Deadline) -> Result<Finished, Lost> {
     let Spawned {
         child,
         role,
         stdout,
         stderr,
     } = spawned;
-    #[cfg(test)]
-    if let Some(e) = test_hook::waiting() {
-        return Err(e);
-    }
 
     // Unbounded, deliberately: this is the request going out, not the wait for its answer. A child
     // that ends without announcing ends here too, once its stderr reaches EOF.
@@ -263,12 +269,31 @@ pub(crate) fn wait_bounded(spawned: Spawned, deadline: Deadline) -> Result<Finis
     if let (Role::AnnouncedRequest(issued), Stream::Heard(rx)) = (&role, &stderr) {
         while !issued(&heard) {
             match rx.recv() {
-                Ok(chunk) => absorb(chunk, &mut heard, "stderr").map_err(cosca::error::Error::Io)?,
+                Ok(chunk) => absorb(chunk, &mut heard, "stderr").map_err(|e| Lost {
+                    error: cosca::error::Error::Io(e),
+                    announced: false,
+                })?,
                 Err(RecvError) => break, // EOF
             }
         }
     }
+    let announced = matches!(&role, Role::AnnouncedRequest(issued) if issued(&heard));
+    waited_out(child, role, stdout, stderr, heard, deadline).map_err(|error| Lost { error, announced })
+}
 
+/// [`wait_bounded`] once the request is out: the wait for its answer, and the output it wrote.
+fn waited_out(
+    child: cosca::Child,
+    role: Role,
+    stdout: Stream,
+    stderr: Stream,
+    heard: Vec<u8>,
+    deadline: Deadline,
+) -> Result<Finished, cosca::error::Error> {
+    #[cfg(test)]
+    if let Some(e) = test_hook::waiting() {
+        return Err(e);
+    }
     let waited = match deadline.at() {
         Some(at) => child.wait_deadline(at)?,
         None => Some(child.wait()?), // no timeout value is invented for an unbounded deadline

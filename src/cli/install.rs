@@ -162,7 +162,7 @@ fn failure_code(e: &Error) -> i32 {
         // the request having been issued and not cancelled. Neither is a
         // step that determinately failed, which is what `1` would claim.
         // `RequestInDoubt` left open whether a request `install` or `--start`
-        // sent reached the manager at all.
+        // sent reached the manager, or what came of one that did.
         Error::Undetermined { .. } | Error::WaitTimeout { .. } | Error::RequestInDoubt { .. } => 4,
         // `Error::Unestablished` belongs in the arm above and is missing
         // from it only because it cannot arrive here: `cli::restart` is its

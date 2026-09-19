@@ -230,7 +230,8 @@ fn a_request_nothing_could_watch_is_never_sent() {
 
 /// A watched `systemctl` whose spawn failed after it may have run is a request in doubt — exit `4`,
 /// saying it may or may not have reached systemd — and one that failed before it ran is a plain
-/// failure, which says it was not. Injected, so nothing runs.
+/// failure, which says it was not. The spawn failures are injected, so nothing runs for them; the
+/// failed wait is injected once `/bin/true` has run, and it announced nothing.
 #[skuld::test]
 fn a_watched_request_that_may_have_run_is_in_doubt() {
     let spawn = || {
@@ -241,16 +242,16 @@ fn a_watched_request_that_may_have_run_is_in_doubt() {
             Budget::Unbounded.start(),
         )
     };
+    let may_or_may_not = |e: &Error| {
+        assert!(matches!(e, Error::RequestInDoubt { reached: false, .. }), "{e:?}");
+        let msg = e.to_string();
+        assert!(msg.contains("may have started before it failed"), "{msg}");
+        assert!(msg.contains("may or may not have reached the service manager"), "{msg}");
+    };
     bounded::test_hook::spawn_fails(|| cosca::error::Error::Containment {
         detail: "forced".into(),
     });
-    let e = spawn().expect_err("injected");
-    assert!(matches!(e, Error::RequestInDoubt { .. }), "{e:?}");
-    assert!(
-        e.to_string()
-            .contains("may or may not have reached the service manager"),
-        "{e}"
-    );
+    may_or_may_not(&spawn().expect_err("injected"));
 
     bounded::test_hook::spawn_fails(|| std::io::Error::from_raw_os_error(libc::EAGAIN).into());
     let e = spawn().expect_err("injected");
@@ -258,8 +259,30 @@ fn a_watched_request_that_may_have_run_is_in_doubt() {
 
     // Past the spawn `systemctl` runs, so a wait that fails leaves its request in doubt too.
     bounded::test_hook::wait_fails(|| std::io::Error::other("the wait failed").into());
-    let e = spawn().expect_err("injected");
-    assert!(matches!(e, Error::RequestInDoubt { .. }), "{e:?}");
+    may_or_may_not(&spawn().expect_err("injected"));
+}
+
+/// A request lost after `systemctl` announced its job had reached systemd, and says so: its outcome
+/// is what is unconfirmed, never whether it arrived.
+#[skuld::test]
+fn a_watched_request_lost_after_its_announcement_reached_the_manager() {
+    let dir = tempfile::tempdir().unwrap();
+    let request = dir.path().join("request");
+    bounded::test_hook::wait_fails(|| std::io::Error::other("the wait failed").into());
+    let e = run_verb_via(
+        &["/bin/sh"],
+        &["-c", ANNOUNCES_THEN_BLOCKS, request.to_str().unwrap()],
+        Budget::Bounded(Duration::from_secs(10)),
+        Budget::Unbounded.start(),
+    )
+    .expect_err("injected");
+    assert!(matches!(e, Error::RequestInDoubt { reached: true, .. }), "{e:?}");
+    let msg = e.to_string();
+    assert!(
+        msg.contains("reached the service manager, but goetia lost track of it before its outcome was confirmed"),
+        "{msg}"
+    );
+    assert!(!msg.contains("may or may not"), "{msg}");
 }
 
 /// The paths std runs to completion keep the same two apart: a `spawn` that failed never ran the

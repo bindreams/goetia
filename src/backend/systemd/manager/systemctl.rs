@@ -253,7 +253,7 @@ pub(super) fn run_systemctl(args: &[&str]) -> Result<std::process::Output> {
 /// `cmd`, a request, run to completion, with its two ways to fail kept apart. std's `spawn` fails
 /// only before the program runs — `fork`, or an `exec` the child reports back — so that is a
 /// request never sent. Reading its output or waiting on it fails only after, when the request may
-/// already be out: [`Error::RequestInDoubt`], never the plain failure that says nothing happened.
+/// already be out: [`Error::RequestInDoubt`], never the plain failure that says it was not sent.
 /// `Command::output()` would merge the two; its stdin, `/dev/null`, is kept.
 fn requested(cmd: &mut Command, program: &str, args: &[&str]) -> Result<std::process::Output> {
     requested_with(cmd, program, args, std::process::Child::wait_with_output)
@@ -275,6 +275,7 @@ fn requested_with(
         .map_err(|e| Error::Other(format!("could not run `{request}`, so it was not sent: {e}")))?;
     wait(child).map_err(|e| Error::RequestInDoubt {
         request,
+        reached: false,
         detail: e.to_string(),
     })
 }
@@ -519,8 +520,9 @@ pub(super) fn watched(budget: Budget) -> bool {
 /// [`answered`].
 fn run_verb_via(program: &[&str], args: &[&str], budget: Budget, deadline: Deadline) -> Result<Finished> {
     let failed = |e: String| Error::Other(format!("failed to run `systemctl {}`: {e}", args.join(" ")));
-    let in_doubt = |e: String| Error::RequestInDoubt {
+    let in_doubt = |e: String, reached: bool| Error::RequestInDoubt {
         request: format!("systemctl {}", args.join(" ")),
+        reached,
         detail: e,
     };
     if !watched(budget) {
@@ -545,10 +547,12 @@ fn run_verb_via(program: &[&str], args: &[&str], budget: Budget, deadline: Deadl
     }
     let spawned = bounded::spawn(&mut cmd, Role::AnnouncedRequest(enqueued)).map_err(|e| match e {
         bounded::SpawnError::NotRun(e) => failed(e.to_string()),
-        bounded::SpawnError::MayHaveRun(e) => in_doubt(e.to_string()),
+        bounded::SpawnError::MayHaveRun(e) => in_doubt(e.to_string(), false),
     })?;
-    // Past the spawn, `systemctl` is running, and a failure to watch it leaves its request in doubt.
-    let finished = bounded::wait_bounded(spawned, deadline).map_err(|e| in_doubt(e.to_string()))?;
+    // Past the spawn, `systemctl` is running, and a failure to watch it leaves its request in doubt —
+    // one it had announced reached systemd.
+    let finished =
+        bounded::wait_bounded(spawned, deadline).map_err(|lost| in_doubt(lost.error.to_string(), lost.announced))?;
     if let Finished::Exited { capture, .. } = &finished {
         answered(&capture.stdout, &capture.stderr)?;
     }

@@ -348,9 +348,9 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
                 let _ = writeln!(err, "error: {id}: {e}");
                 codes.push(4);
             }
-            // A request that may or may not have reached the manager. The same class once more:
-            // the tool carrying it had started, so `1` — which says nothing happened — is the one
-            // answer that is not established.
+            // A request goetia lost track of: it may or may not have reached the manager, or did
+            // and its outcome is unconfirmed. The same class once more: `1` says the verb was
+            // attempted and failed, or was refused, and neither is what was established.
             Err(e @ Error::RequestInDoubt { .. }) => {
                 let _ = writeln!(err, "error: {id}: {e}");
                 codes.push(4);

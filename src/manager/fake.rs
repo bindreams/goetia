@@ -385,7 +385,7 @@ impl Fake {
 
     /// Test-only seeding: every start of `id` — `start` and
     /// `request_start_after_stop` alike — fails as a real backend's does when
-    /// the tool carrying the request had started and was then lost:
+    /// the tool carrying the request may have started, and was then lost:
     /// [`Error::RequestInDoubt`], changing nothing here.
     pub fn seed_start_in_doubt(&self, id: &str) {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
@@ -570,7 +570,8 @@ fn in_doubt(state: &Store, id: &Id) -> Result<()> {
     if state.start_in_doubt.contains(id.as_str()) {
         return Err(Error::RequestInDoubt {
             request: format!("fake start {id}"),
-            detail: "lost after it started (seeded)".to_string(),
+            reached: false,
+            detail: "lost (seeded)".to_string(),
         });
     }
     Ok(())

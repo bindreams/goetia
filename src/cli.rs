@@ -159,7 +159,8 @@ pub enum DaemonCommand {
 ///   there, for `restart` under a budget that does not wait — an unconfirmed
 ///   stop followed by a refused start — and so does
 ///   [`Error::RequestInDoubt`](crate::error::Error::RequestInDoubt), for a
-///   request whose tool had started when goetia lost track of it. Reporting the first as `1` would
+///   request goetia lost track of, which may or may not have reached the
+///   manager, or reached it with its outcome unconfirmed. Reporting the first as `1` would
 ///   claim the operation determinately failed, which it did not establish;
 ///   reporting the second as `1` would make the refusal the whole answer,
 ///   when the unconfirmed stop before it leaves where the daemon ended up
