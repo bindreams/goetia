@@ -1216,7 +1216,7 @@ fn systemd_offline_is_evidence_only_when_true() {
         };
         assert_eq!(host.evidence(), Some(Evidence::Offline(value.to_string())), "{value:?}");
     }
-    for value in ["0", "no", "false", "off", "", "2", "maybe"] {
+    for value in ["0", "no", "n", "false", "f", "off", "", "2", "maybe"] {
         let host = Host {
             offline: Some(value.to_string()),
             unbooted: false,

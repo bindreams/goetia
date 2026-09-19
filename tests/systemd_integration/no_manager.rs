@@ -181,12 +181,15 @@ fn path_first(dir: &Path) -> std::ffi::OsString {
 /// [`SILENCERS`] nor [`unlistable`], by exiting `0` silently if any survived — as a real `systemctl`
 /// that believed it was not in a chroot and went on to do the work would. Stricter than a real one,
 /// which honours only the names it knows, and deliberately so: what is pinned is goetia's removal,
-/// not systemd's reading, so the three names no systemd would act on here must silence it too.
+/// not systemd's reading, so the three names no systemd would act on here must silence it too. The
+/// three it does read are matched over the whole of `parse_boolean`'s spelling —
+/// `1|yes|y|true|t|on` and `0|no|n|false|f|off` — rather than only the value [`SILENCERS`] sets, so
+/// a child given one of the other spellings is caught as well.
 fn honours_the_silencers() -> String {
     let mut shell = String::from(
         "case \"${SYSTEMD_OFFLINE-}\" in 0|no|n|false|f|off) exit 0;; esac\n\
-         case \"${SYSTEMD_IN_CHROOT-}\" in 0|no|false|off) exit 0;; esac\n\
-         case \"${SYSTEMD_IGNORE_CHROOT-}\" in 1|yes|true|on) exit 0;; esac\n\
+         case \"${SYSTEMD_IN_CHROOT-}\" in 0|no|n|false|f|off) exit 0;; esac\n\
+         case \"${SYSTEMD_IGNORE_CHROOT-}\" in 1|yes|y|true|t|on) exit 0;; esac\n\
          [ -n \"${SYSTEMD_A_SWITCH_NO_SUPPORTED_VERSION_HAS_YET-}\" ] && exit 0\n\
          [ -n \"${SYSTEMCTL_FORCE_BUS-}\" ] && exit 0\n",
     );
