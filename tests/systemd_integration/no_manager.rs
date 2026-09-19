@@ -323,10 +323,11 @@ fn the_verbs_that_never_reach_the_manager_are_untouched() {
 /// `/etc/systemd/system` (unless `-`), runs `goetia <args>` there — as `user`, a `chroot
 /// --userspec`, unless `-` — then lists that directory and its `multi-user.target.wants` on
 /// stderr. The root is a tmpfs for `shape` `tmpfs`, and for `dir` the directory itself, no mount;
-/// for `bare` a tmpfs with no `/run` bound in, as a `debootstrap` chroot has none.
+/// for `bare` a tmpfs with no `/run` bound in, as a `debootstrap` chroot has none; and for
+/// `dir-hidepid` a directory whose `/proc` is mounted `hidepid=2`, hiding PID 1 from other users.
 const IN_A_CHROOT: &str = r#"set -e
 root=$1 goetia=$2 manifest=$3 unit=$4 user=$5 shape=$6; shift 6
-[ "$shape" = dir ] || mount -t tmpfs goetia-chroot "$root"
+case $shape in dir*) ;; *) mount -t tmpfs goetia-chroot "$root" ;; esac
 chmod 755 "$root"
 mkdir -p "$root/usr" "$root/dev" "$root/run" "$root/sys" "$root/proc" "$root/tmp" "$root/etc/systemd/system"
 for dir in bin sbin lib lib64; do ln -s "usr/$dir" "$root/$dir"; done
@@ -335,7 +336,7 @@ mount -o remount,bind,ro "$root/usr"
 mount --rbind /dev "$root/dev"
 [ "$shape" = bare ] || mount --rbind /run "$root/run"
 mount --rbind /sys "$root/sys"
-mount -t proc proc "$root/proc"
+case $shape in dir-hidepid) mount -t proc -o hidepid=2 proc "$root/proc" ;; *) mount -t proc proc "$root/proc" ;; esac
 cp /etc/passwd /etc/group /etc/nsswitch.conf "$root/etc/"
 cp "$goetia" "$root/goetia"
 cp "$manifest" "$root/tmp/goetia.yaml"
@@ -440,8 +441,9 @@ fn every_verb_in_a_real_chroot_is_refused_before_anything_runs() {
 /// `/proc/1/root`, and neither may `systemctl`, which then assumes no chroot and asks the host's
 /// manager over the bound `/run` about a unit the host does not have: once read as "stopped, not
 /// enabled", exit `0`. The mount tables are what show it, `/` in goetia's naming none of PID 1's:
-/// a tmpfs root's mount is another, and a directory that is no mount has none at `/`. The daemon's
-/// unit is goetia's, in the chroot only.
+/// a tmpfs root's mount is another, and a directory that is no mount has none at `/` — which
+/// goetia's own table shows even where a `hidepid=2` `/proc` hides PID 1's. The daemon's unit is
+/// goetia's, in the chroot only.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn an_unelevated_state_read_in_a_real_chroot_is_refused_before_anything_runs() {
     let id = support::random_test_id();
@@ -457,6 +459,7 @@ fn an_unelevated_state_read_in_a_real_chroot_is_refused_before_anything_runs() {
     for (shape, evidence) in [
         ("tmpfs", "the mount at `/` is none of PID 1's"),
         ("dir", "no mount is at `/`"),
+        ("dir-hidepid", "no mount is at `/`"),
     ] {
         for args in [
             &["daemon", "status", guard.id()][..],

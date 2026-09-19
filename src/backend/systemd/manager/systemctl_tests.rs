@@ -611,8 +611,8 @@ fn evidence_known_without_asking_refuses_every_path_before_anything_runs() {
                 unbooted: false,
                 chroot: Some(Chroot::NoMount),
             },
-            "no mount is at `/` (`/proc/self/mountinfo`), where PID 1 has one (`/proc/1/mountinfo`), so goetia \
-             runs under another root than PID 1",
+            "no mount is at `/` (`/proc/self/mountinfo`): `/` is a directory inside one, so goetia runs in a \
+             chroot",
         ),
     ];
     for (host, evidence) in hosts {
@@ -1103,10 +1103,10 @@ fn table(mounts: &[(&str, &str, &str)]) -> std::io::Result<String> {
         .collect())
 }
 
-/// goetia's `/` is not PID 1's, by the mount tables, only when PID 1's is read and has a mount at
-/// `/`, and goetia's is read and has none there, or none of PID 1's: a device and a root within it
-/// both make a mount. Shapes measured on this host: a tmpfs chroot (`0:131 /` against `8:1 /`) and
-/// a directory chroot, where no mount is at `/`.
+/// goetia's `/` is not PID 1's, by the mount tables, only when goetia's is read and has no mount at
+/// `/` — whatever PID 1's — or PID 1's is read too and has a mount at `/`, and none of goetia's
+/// there is PID 1's: a device and a root within it both make a mount. Shapes measured on this host:
+/// a tmpfs chroot (`0:131 /` against `8:1 /`) and a directory chroot, where no mount is at `/`.
 #[skuld::test]
 fn only_a_mount_table_without_pid_1s_mount_at_root_is_evidence_of_a_chroot() {
     let failed = |errno| Err(std::io::Error::from_raw_os_error(errno));
@@ -1158,6 +1158,24 @@ fn only_a_mount_table_without_pid_1s_mount_at_root_is_evidence_of_a_chroot() {
     ] {
         assert_eq!(mounts_differ(table(&[("0:131", "/", "/")]), init), None, "{why}");
     }
+    // No mount at `/` of goetia's own needs nothing of PID 1's: only `chroot(2)` makes such a root.
+    for (init, why) in [
+        (failed(libc::EACCES), "PID 1's hidden by hidepid"),
+        (failed(libc::ENOENT), "PID 1's gone"),
+        (table(&[("8:1", "/usr", "/usr")]), "PID 1 with no mount at /"),
+        (table(&host), "PID 1's read"),
+    ] {
+        assert_eq!(
+            mounts_differ(table(&[("8:1", "/usr", "/usr")]), init),
+            Some(Chroot::NoMount),
+            "{why}"
+        );
+    }
+    assert_eq!(
+        mounts_differ(failed(libc::EACCES), table(&host)),
+        None,
+        "our own unreadable"
+    );
 }
 
 /// A chroot is named before a missing `/run/systemd/system`, which a chroot with no `/run` bound in

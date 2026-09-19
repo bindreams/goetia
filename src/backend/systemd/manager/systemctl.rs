@@ -195,28 +195,23 @@ impl std::fmt::Display for Evidence {
                 f,
                 "`{SD_BOOTED}`, which systemd makes when it boots a system, does not exist here"
             ),
-            Evidence::Chroot(found) => {
-                match found {
-                    Chroot::Root => write!(f, "`/` is not PID 1's root (`{INIT_ROOT}`)")?,
-                    Chroot::Mount => write!(
-                        f,
-                        "the mount at `/` is none of PID 1's (`{OWN_MOUNTS}`, `{INIT_MOUNTS}`)"
-                    )?,
-                    Chroot::NoMount => write!(
-                        f,
-                        "no mount is at `/` (`{OWN_MOUNTS}`), where PID 1 has one (`{INIT_MOUNTS}`)"
-                    )?,
-                }
-                write!(
-                    f,
-                    ", so goetia runs under another root than PID 1, as in a chroot or a container sharing the host's \
-                     PID namespace"
-                )
-            }
+            Evidence::Chroot(Chroot::Root) => write!(f, "`/` is not PID 1's root (`{INIT_ROOT}`){ANOTHER_ROOT}"),
+            Evidence::Chroot(Chroot::Mount) => write!(
+                f,
+                "the mount at `/` is none of PID 1's (`{OWN_MOUNTS}`, `{INIT_MOUNTS}`){ANOTHER_ROOT}"
+            ),
+            Evidence::Chroot(Chroot::NoMount) => write!(
+                f,
+                "no mount is at `/` (`{OWN_MOUNTS}`): `/` is a directory inside one, so goetia runs in a chroot"
+            ),
             Evidence::Ignored(line) => write!(f, "`systemctl` said {line:?}"),
         }
     }
 }
+
+/// What `/` not being PID 1's root means, as far as goetia can tell.
+const ANOTHER_ROOT: &str =
+    ", so goetia runs under another root than PID 1, as in a chroot or a container sharing the host's PID namespace";
 
 /// Where `sd_booted()` looks: it exists iff systemd is this system's init.
 const SD_BOOTED: &str = "/run/systemd/system";
@@ -236,7 +231,8 @@ enum Chroot {
     Root,
     /// The mount at `/` is none of PID 1's — see [`mounts_differ`]. Readable unelevated.
     Mount,
-    /// No mount is at `/` where one is at PID 1's: `/` is a directory inside one.
+    /// No mount is at `/`: `/` is a directory inside one, which only `chroot(2)` makes a root — see
+    /// [`mounts_differ`]. Readable unelevated, and without PID 1's table.
     NoMount,
 }
 
@@ -307,29 +303,29 @@ fn chroot_from(
     }
 }
 
-/// Whether goetia's mount table, `own`, establishes that its `/` is not PID 1's, from PID 1's,
-/// `init`: `init` read and with a mount at `/`, and `own` read with none at `/`, or with none of
-/// PID 1's there — the same mount being its device and its root within that device. Readable where
-/// `/proc/1/root` is not, and asked only there: an unelevated `systemctl` in a chroot with `/run`
-/// bound in cannot tell it is in one, and asks the host's manager about a unit it does not have. A table that could not be
-/// read, or a PID 1 with no mount at `/`, establishes nothing. A private mount namespace whose `/`
-/// is PID 1's filesystem at the same root — a service's `ProtectSystem=` — lists the same mount.
+/// Whether goetia's mount table, `own`, establishes that its `/` is not PID 1's, with PID 1's,
+/// `init`. Readable where `/proc/1/root` is not, and asked only there: an unelevated `systemctl` in
+/// a chroot with `/run` bound in cannot tell it is in one, and asks the host's manager about a unit
+/// it does not have. Two ways:
+///
+/// - `own` read, with no mount at `/`: `/` is a directory inside a mount, which only `chroot(2)`
+///   makes a root — `pivot_root(2)` and a new mount namespace take a mount's. That needs no `init`,
+///   so it holds where a `hidepid` `/proc` hides PID 1.
+/// - `own` read with mounts at `/`, and `init` read with one there too, but none of ours is PID 1's
+///   — the same mount being its device and its root within that device. A private mount namespace
+///   whose `/` is PID 1's filesystem at the same root — a service's `ProtectSystem=` — lists the
+///   same mount.
+///
+/// A table that could not be read, or a PID 1 with no mount at `/`, establishes nothing.
 fn mounts_differ(own: std::io::Result<String>, init: std::io::Result<String>) -> Option<Chroot> {
-    let (Ok(own), Ok(init)) = (own, init) else {
-        return None;
-    };
-    let init = root_mounts(&init);
-    if init.is_empty() {
-        return None;
-    }
+    let own = own.ok()?;
     let own = root_mounts(&own);
     if own.is_empty() {
-        Some(Chroot::NoMount)
-    } else if own.iter().any(|mount| init.contains(mount)) {
-        None
-    } else {
-        Some(Chroot::Mount)
+        return Some(Chroot::NoMount);
     }
+    let init = init.ok()?;
+    let init = root_mounts(&init);
+    (!init.is_empty() && !own.iter().any(|mount| init.contains(mount))).then_some(Chroot::Mount)
 }
 
 /// The mounts a mount table lists at `/`: each one's device, `major:minor`, and its root within
