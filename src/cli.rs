@@ -178,7 +178,7 @@ pub enum DaemonCommand {
 ///   agree about `Undetermined` and disagree only about
 ///   `Outcome::RefuseUnreadable`, which `install` reports as `1` because it
 ///   genuinely failed to install. All six id verbs return it through
-///   `support::run_id_verb`, for three conditions: `Undetermined`, where
+///   `support::run_id_verb`, for four conditions: `Undetermined`, where
 ///   goetia could not determine what is at the id, and — from the verbs that
 ///   act — `WaitTimeout`, `Unestablished` and `RequestInDoubt`, where it
 ///   acted, or may have, and could not determine the outcome.

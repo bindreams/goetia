@@ -700,11 +700,14 @@ fn prepared_steps_need_nothing_made_later() {
 // A request in doubt ==================================================================================================
 
 /// A `launchctl` request that may have started before goetia lost it — cosca failing past `exec`,
-/// or the wait failing — may have reached launchd: [`Error::RequestInDoubt`], exit `4`. A read
-/// changes nothing, so the same failure there is a plain one. A failure placed before the spawn is a
-/// plain one for both. Injected, so no `launchctl` runs.
+/// or the wait failing — may have reached launchd: [`Error::RequestInDoubt`], exit `4`, and never
+/// known to have, since `launchctl` never says so. A read changes nothing, so the same failure there
+/// is a plain one. A failure placed before the spawn is a plain one for both. The spawn failures are
+/// injected, so nothing runs for them; the failed waits are injected once a stand-in that exits `0`
+/// has run, so no `launchctl` ever runs, and launchd is never asked anything.
 #[skuld::test]
 fn a_launchctl_request_that_may_have_run_is_in_doubt() {
+    let _stand_in = launchctl_stand_in::set("exit 0".to_string());
     let args = ["bootout", "system/goetia-reaper-probe-never-installed"];
     let deadline = Budget::Unbounded.start();
     let request = || Role::Request(bounded::reapers::<1>().unwrap().into_iter().next().unwrap());
@@ -715,7 +718,7 @@ fn a_launchctl_request_that_may_have_run_is_in_doubt() {
             detail: "forced".into(),
         });
         let e = launchctl(&args, deadline, request()).err().expect("injected");
-        assert!(matches!(e, Error::RequestInDoubt { .. }), "{e:?}");
+        assert!(matches!(e, Error::RequestInDoubt { reached: false, .. }), "{e:?}");
 
         inject(|| cosca::error::Error::Containment {
             detail: "forced".into(),

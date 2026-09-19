@@ -974,10 +974,12 @@ that comes with it.
 
 ### The two sources of `4`
 
-Two within what `list`, `status` and `show` report; the mutating verbs reach
-`4` a third way, by
-[waiting and giving up](#when-the-wait-runs-out). These two are not
-interchangeable, and the remedies do not transfer:
+Two within what `list`, `status` and `show` report. The mutating verbs reach
+`4` three more ways: by
+[waiting and giving up](#when-the-wait-runs-out); by losing track of a
+request, which may or may not have reached the manager; and, for a `restart`
+that does not wait, by a start refused after a stop nobody confirmed. The two
+sources are not interchangeable, and the remedies do not transfer:
 
 - **`unreadable`** — goetia's own daemon that goetia cannot use. The marker
   was read; the blob would not decode. Remedy:
