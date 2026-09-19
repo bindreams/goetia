@@ -49,7 +49,15 @@ def _is_live(pid):
 def _sigkill(pid):
     """SIGKILL `pid`, skipping one already gone. One this process may not
     signal ends the watchdog, reported: the kill loop would otherwise spin on
-    it forever, and `main` would wait on it forever."""
+    it forever, and `main` would wait on it forever.
+
+    Since `kill_tree_posix` signals what `getsid` named rather than what
+    `_is_live` confirmed, a member of another uid now reaches here even when it
+    is already dead but unreaped, where the liveness check used to skip it --
+    trading a `124` for a `125` in that case. Neither CI path can produce one:
+    the elevated suite runs this whole script under `sudo`, where root may
+    signal anything, and unelevated every session member is a same-uid
+    descendant of the watched command."""
     try:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
