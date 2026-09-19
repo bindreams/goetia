@@ -50,8 +50,14 @@ const IGNORED: [&str; 2] = ["ignoring command", "ignoring request"];
 
 /// Every `systemctl` answer, checked before anything reads it as one: an answer saying it ignored
 /// what it was asked ([`IGNORED`]) is the refusal on every path, and never a success: the backstop
-/// for what [`door`] could not see — a chroot neither `/proc/1/root` nor the mount tables show
-/// goetia, as where PID 1's `/proc` entries are hidden from it, or one `SYSTEMD_IN_CHROOT` declares.
+/// for what [`door`] could not see.
+///
+/// It is the last line in a chroot with no `/proc` at all — `/proc/1/root` and both mount tables
+/// are `ENOENT`, so goetia establishes nothing, and `systemctl` reports the chroot from that same
+/// absence (MEASURED, 255 and 257) — and on 257 in one `SYSTEMD_IN_CHROOT=1` declares. Where PID 1
+/// is hidden from goetia rather than absent, as under a `hidepid` `/proc`, `systemctl` runs with
+/// goetia's credentials and hits the same wall: it reports nothing, and this backstop does not fire
+/// either.
 fn answered(stdout: &[u8], stderr: &[u8]) -> Result<()> {
     let ignored = |stream: &[u8]| {
         String::from_utf8_lossy(stream)
