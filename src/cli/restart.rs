@@ -122,7 +122,6 @@ fn restart(mgr: &dyn ServiceManager, id: &Id, budget: Budget, start_clock: &dyn 
 /// named and what is left of it.
 #[derive(Debug, PartialEq, Eq)]
 enum Leg {
-    /// Issue it under this budget.
     Under(Budget),
     /// A bounded budget ran out before this leg: a timeout. The start leg
     /// is then not issued; the stop leg still is, under [`SPENT`].

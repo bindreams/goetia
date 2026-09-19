@@ -64,7 +64,8 @@ pub fn run(
     report::exit_code(&report)
 }
 
-/// The whole answer when no daemon's could be obtained: `e`, exit `1`.
+/// `report::unavailable` always maps to exit 1; taken from
+/// `report::exit_code` here so json and text agree.
 fn unavailable(e: &Error, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let report = report::unavailable(e);
     if json {

@@ -3341,8 +3341,8 @@ fn install_without_start_prepares_nothing() {
     assert_eq!(fake.guarded(), vec![("install", "frpc".to_string(), vec![])]);
 }
 
-/// `(verb, id, steps)` for each of `sent`, as [`Fake::guarded`] records a request asked while a
-/// preparation of `steps` was held.
+/// Builds what [`Fake::guarded`] compares against: each (verb, id) paired with the steps held
+/// during it.
 fn under(steps: &[Step], sent: &[(&'static str, &str)]) -> Vec<(&'static str, String, Vec<Step>)> {
     sent.iter()
         .map(|(verb, id)| (*verb, id.to_string(), steps.to_vec()))
