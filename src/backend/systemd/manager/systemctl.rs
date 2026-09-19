@@ -92,10 +92,12 @@ const ENVIRONMENT: [(&str, &str); 3] = [
 /// The two prefixes systemd's own switches for this binary carry, and which every `systemctl`
 /// goetia runs is denied: an inherited name under either is removed from the child whatever it is,
 /// and [`ENVIRONMENT`] alone is then given. Named by prefix rather than one switch at a time
-/// because the switches are systemd's to add, not goetia's to keep up with: `systemctl` and the
-/// library it links carry 45 such names on 255 and 90 on 257, and *three* of those turn off, each
-/// on its own, the chroot report [`answered`] is the last line against. Naming them is what missed
-/// the next one twice.
+/// because the switches are systemd's to add, not goetia's to keep up with. MEASURED, `strings`
+/// anchored on each prefix: 255's `systemctl` links no systemd library — it is built against
+/// `libsystemd-shared` statically — and carries **44** `SYSTEMD_*` names by itself; 257's carries
+/// **90** with `libsystemd-shared-257.so`, which it does link; both carry the same **5**
+/// `SYSTEMCTL_*`. *Three* of the `SYSTEMD_*` turn off, each on its own, the chroot report
+/// [`answered`] is the last line against. Naming them is what missed the next one twice.
 ///
 /// The three, MEASURED on 255 and 257 in a chroot with no `/proc`, where goetia establishes nothing
 /// of its own: `SYSTEMD_IGNORE_CHROOT` true; `SYSTEMD_IN_CHROOT` false, on 257 on; and
@@ -111,9 +113,9 @@ const ENVIRONMENT: [(&str, &str); 3] = [
 /// prejudge it.
 ///
 /// `SYSTEMCTL_*` is systemd's second switch namespace for this binary, and is covered for the same
-/// reason rather than for anything it holds today: MEASURED on 255 and 257, both carry the same
-/// five names, and none of them silences the chroot report. `SYSTEMCTL_FORCE_BUS` is nonetheless
-/// the other shape goetia refuses for — it makes `systemctl` reach the manager over the bus
+/// reason rather than for anything it holds today: MEASURED, none of its five silences the chroot
+/// report on either version. `SYSTEMCTL_FORCE_BUS` is nonetheless the other shape goetia refuses
+/// for — it makes `systemctl` reach the manager over the bus
 /// `DBUS_SYSTEM_BUS_ADDRESS` names instead of this root's private socket. MEASURED with that
 /// address pointed at a path that does not exist: `show` answered `Version=…` without the switch
 /// and failed to connect with it. Off the child, the address decides nothing.
