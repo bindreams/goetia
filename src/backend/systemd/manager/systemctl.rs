@@ -231,7 +231,7 @@ const INIT_MOUNTS: &str = "/proc/1/mountinfo";
 /// How goetia established that its `/` is not PID 1's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Chroot {
-    /// `/` and [`INIT_ROOT`] are different directories — see [`identities_differ`]. Readable only
+    /// `/` and [`INIT_ROOT`] are different directories — see [`chroot_from`]. Readable only
     /// to a caller that may trace PID 1.
     Root,
     /// The mount at `/` is none of PID 1's — see [`mounts_differ`]. Readable unelevated.
@@ -257,14 +257,12 @@ impl Host {
         Host {
             offline: std::env::var("SYSTEMD_OFFLINE").ok(),
             unbooted: established_absent(std::path::Path::new(SD_BOOTED)),
-            chroot: if identities_differ(identity("/"), identity(INIT_ROOT)) {
-                Some(Chroot::Root)
-            } else {
-                mounts_differ(
+            chroot: chroot_from(identity("/"), identity(INIT_ROOT), || {
+                (
                     std::fs::read_to_string(OWN_MOUNTS),
                     std::fs::read_to_string(INIT_MOUNTS),
                 )
-            },
+            }),
         }
     }
 
@@ -288,21 +286,32 @@ fn identity(path: &str) -> std::io::Result<(u64, u64)> {
     std::fs::metadata(path).map(|meta| (meta.dev(), meta.ino()))
 }
 
-/// Whether `/` and PID 1's root are established to differ: two identities read, and different. A
-/// stat that failed — `EACCES` on `/proc/1/root` for a caller that may not trace PID 1, or no
-/// `/proc` — establishes nothing, so the mount tables ([`mounts_differ`]), the other checks and
-/// systemctl's own report ([`answered`]) decide. Read regardless of `SYSTEMD_IN_CHROOT`: in a
-/// chroot with `/run` bound in, a `systemctl` told it is not in one asks the host's manager about
-/// units goetia writes into the chroot.
-fn identities_differ(root: std::io::Result<(u64, u64)>, init_root: std::io::Result<(u64, u64)>) -> bool {
-    matches!((root, init_root), (Ok(root), Ok(init_root)) if root != init_root)
+/// How `/` is established not to be PID 1's root, if it is. `root` and `init_root`, both read,
+/// decide, either way: that is `running_in_chroot()`'s own check. A stat that failed — `EACCES` on
+/// `/proc/1/root` for a caller that may not trace PID 1, or no `/proc` — establishes nothing, and
+/// leaves it to the mount `tables` ([`mounts_differ`]); where they establish nothing either, the
+/// other checks and systemctl's own report ([`answered`]) decide. Read regardless of
+/// `SYSTEMD_IN_CHROOT`: in a chroot with `/run` bound in, a `systemctl` told it is not in one asks
+/// the host's manager about units goetia writes into the chroot.
+fn chroot_from(
+    root: std::io::Result<(u64, u64)>,
+    init_root: std::io::Result<(u64, u64)>,
+    tables: impl FnOnce() -> (std::io::Result<String>, std::io::Result<String>),
+) -> Option<Chroot> {
+    match (root, init_root) {
+        (Ok(root), Ok(init_root)) => (root != init_root).then_some(Chroot::Root),
+        _ => {
+            let (own, init) = tables();
+            mounts_differ(own, init)
+        }
+    }
 }
 
 /// Whether goetia's mount table, `own`, establishes that its `/` is not PID 1's, from PID 1's,
 /// `init`: `init` read and with a mount at `/`, and `own` read with none at `/`, or with none of
 /// PID 1's there — the same mount being its device and its root within that device. Readable where
-/// `/proc/1/root` is not: an unelevated `systemctl` in a chroot with `/run` bound in cannot tell it
-/// is in one, and asks the host's manager about a unit it does not have. A table that could not be
+/// `/proc/1/root` is not, and asked only there: an unelevated `systemctl` in a chroot with `/run`
+/// bound in cannot tell it is in one, and asks the host's manager about a unit it does not have. A table that could not be
 /// read, or a PID 1 with no mount at `/`, establishes nothing. A private mount namespace whose `/`
 /// is PID 1's filesystem at the same root — a service's `ProtectSystem=` — lists the same mount.
 fn mounts_differ(own: std::io::Result<String>, init: std::io::Result<String>) -> Option<Chroot> {

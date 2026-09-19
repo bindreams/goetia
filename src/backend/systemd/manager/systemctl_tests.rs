@@ -1056,18 +1056,35 @@ fn only_a_stat_that_finds_no_directory_is_evidence_of_no_systemd() {
     );
 }
 
-/// `/` and PID 1's root differ only on two identities read, and different — a chroot. A stat that
-/// failed establishes nothing: `EACCES`, as `/proc/1/root` answers a caller that may not trace
-/// PID 1, or `ENOENT`, with no `/proc`.
+/// `/` and PID 1's root, both read, decide, either way — the check `running_in_chroot()` makes, so
+/// two equal roots are no chroot whatever the mount tables say. A stat that failed establishes
+/// nothing — `EACCES`, as `/proc/1/root` answers a caller that may not trace PID 1, or `ENOENT`,
+/// with no `/proc` — and leaves it to the mount tables.
 #[skuld::test]
-fn only_two_roots_read_and_different_are_evidence_of_a_chroot() {
+fn two_roots_read_decide_and_the_mount_tables_only_where_they_could_not_be() {
     let failed = |errno| Err(std::io::Error::from_raw_os_error(errno));
-    assert!(identities_differ(Ok((1, 2)), Ok((1, 3))));
-    assert!(identities_differ(Ok((1, 2)), Ok((4, 2))));
-    assert!(!identities_differ(Ok((1, 2)), Ok((1, 2))));
+    let differ = || (table(&[("0:131", "/", "/")]), table(&[("8:1", "/", "/")]));
+    let agree = || (table(&[("8:1", "/", "/")]), table(&[("8:1", "/", "/")]));
+    assert_eq!(chroot_from(Ok((1, 2)), Ok((1, 3)), agree), Some(Chroot::Root));
+    assert_eq!(chroot_from(Ok((1, 2)), Ok((4, 2)), agree), Some(Chroot::Root));
+    assert_eq!(
+        chroot_from(Ok((1, 2)), Ok((1, 2)), differ),
+        None,
+        "equal roots are final"
+    );
     for errno in [libc::EACCES, libc::ENOENT] {
-        assert!(!identities_differ(Ok((1, 2)), failed(errno)), "{errno}");
-        assert!(!identities_differ(failed(errno), Ok((1, 2))), "{errno}");
+        assert_eq!(chroot_from(Ok((1, 2)), failed(errno), agree), None, "{errno}");
+        assert_eq!(chroot_from(failed(errno), Ok((1, 2)), agree), None, "{errno}");
+        assert_eq!(
+            chroot_from(Ok((1, 2)), failed(errno), differ),
+            Some(Chroot::Mount),
+            "{errno}"
+        );
+        assert_eq!(
+            chroot_from(failed(errno), Ok((1, 2)), differ),
+            Some(Chroot::Mount),
+            "{errno}"
+        );
     }
 }
 
