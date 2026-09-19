@@ -63,10 +63,9 @@ const FIELD_SPEC: &str = "Spec";
 // Constants ===========================================================================================================
 
 /// `SC_ACTION.Delay` when `goetia.yaml` sets no `restart-delay`. Matches
-/// `~/src/hole/crates/bridge/src/platform/windows.rs`'s
-/// `restart_failure_actions`: long enough that a process that dies
-/// instantly on start doesn't spin SCM in a tight relaunch loop, short
-/// enough that a benign flap recovers quickly.
+/// `hole`'s bridge service (`restart_failure_actions`): long enough that a
+/// process that dies instantly on start doesn't spin SCM in a tight
+/// relaunch loop, short enough that a benign flap recovers quickly.
 const DEFAULT_RESTART_DELAY: Duration = Duration::from_secs(1);
 
 /// `dwResetPeriod`: the window of health after which SCM's failure counter
@@ -118,8 +117,8 @@ pub struct FailureActions {
     /// reporting `SERVICE_STOPPED` to SCM first — so a `type: managed`
     /// daemon that fails to bind a port and exits 1 *cleanly* (a
     /// well-behaved failure report, not a crash) would never restart, ever,
-    /// including at boot. `~/src/hole/crates/bridge/src/platform/windows.rs`'s
-    /// `apply_failure_actions` sets the same flag for the same reason.
+    /// including at boot. `hole`'s bridge service sets the same flag in
+    /// `apply_failure_actions`, for the same reason.
     pub on_non_crash_failures: bool,
 }
 

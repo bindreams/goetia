@@ -7,12 +7,7 @@
 //! thread has been created, not once it reports `SERVICE_RUNNING` — and the
 //! crate wraps no wait primitive of its own. The MSDN checkpoint/`dwWaitHint`
 //! pattern (`QueryServiceStatusEx` in a `Sleep` loop with a hardcoded bound)
-//! is exactly the sleep-poll this project forbids. This module is a
-//! near-verbatim port of `~/src/hole/crates/bridge/src/cutover/scm_wait.rs`
-//! (translated from the `windows` crate to `windows-sys`, and adapted to
-//! reuse `windows-service`'s already-open [`Service`] handle — whose `Drop`
-//! already closes the underlying `SC_HANDLE` — instead of managing raw
-//! `OpenSCManagerW`/`OpenServiceW` handles by hand): the orchestration below
+//! is exactly the sleep-poll this project forbids. The orchestration below
 //! is a pure state machine over [`ScmActor`], unit-tested with a fake in
 //! `wait_tests.rs`; [`system::SystemScmActor`] drives the real SCM.
 #![cfg_attr(not(windows), allow(dead_code))]

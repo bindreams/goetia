@@ -2,7 +2,6 @@
 //! [`super::start_via_notify`] against a scripted [`super::ScmActor`] — no
 //! real SCM involved, so these run on every platform and need no elevation.
 //! Expiry is driven by the script, never by the clock: nothing here waits.
-//! Ported from `~/src/hole/crates/bridge/src/cutover/scm_wait_tests.rs`.
 
 use std::collections::VecDeque;
 

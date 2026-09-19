@@ -28,9 +28,8 @@
 //! **2. Stopping (and starting) must not poll.** `windows-service`'s
 //! `stop()`/`start()` return as soon as SCM accepts the request, not once
 //! the transition completes, and the crate wraps no wait primitive. See
-//! `super::wait`, a port of `~/src/hole/crates/bridge/src/cutover/scm_wait.rs`
-//! using `NotifyServiceStatusChangeW` — a real kernel rendezvous, never a
-//! `Sleep`+`QueryServiceStatusEx` poll.
+//! `super::wait`, which uses `NotifyServiceStatusChangeW` — a real kernel
+//! rendezvous, never a `Sleep`+`QueryServiceStatusEx` poll.
 //!
 //! **3. Uninstall must confirm a real stop before deleting.** `DeleteService`
 //! on a running service only *marks* it for deletion — the registry key
