@@ -173,8 +173,8 @@ fn unit_is_the_generation_invariant() {
 
 /// Pins the mechanism `decide` already has for a generator change that carries no version bump of
 /// its own: `0.0.9` is not and will never be this crate's version, so it stands in for "some
-/// earlier release" without this task making the bump it is not making. Protects every FUTURE
-/// generator change, this one included — see `unit`'s doc comment.
+/// earlier release". Protects every FUTURE generator change, this one included — see `unit`'s doc
+/// comment.
 #[skuld::test]
 fn a_unit_written_by_an_older_goetia_is_stale_not_a_conflict() {
     let spec = full_spec();

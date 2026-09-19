@@ -46,9 +46,7 @@ impl FakeScm {
         self
     }
 
-    /// `start` reports failure — the shape the *shipped*
-    /// `ERROR_SERVICE_ALREADY_RUNNING` arm produced for a queried
-    /// `StartPending`.
+    /// `start` reports failure.
     fn rejecting_start(mut self) -> Self {
         self.start_fails = true;
         self
@@ -263,13 +261,10 @@ fn an_arm_that_keeps_lagging_returns_expired_instead_of_looping() {
 
 #[skuld::test]
 fn a_start_the_scm_rejects_is_reported_as_a_failed_start() {
-    // The shape the *shipped* ERROR_SERVICE_ALREADY_RUNNING arm produced for
-    // a queried `StartPending`, and the consequence the bug had: a rejected
-    // start surfaces as a failed start. That the corrected arm accepts that
-    // state instead is `already_running_is_recoverable`'s own tests, and the
-    // resolve-through-the-wait shape is
-    // `start_re_arms_after_a_non_terminal_callback`, which this used to
-    // repeat assertion for assertion.
+    // A start the SCM rejects is a failed start, not a wait that ran out of
+    // budget. See `already_running_is_recoverable` and
+    // `start_re_arms_after_a_non_terminal_callback` for the related cases
+    // this doesn't duplicate.
     let mut rejecting = FakeScm::new([]).rejecting_start();
     assert!(start_via_notify(&mut rejecting, unbounded()).is_err());
 }

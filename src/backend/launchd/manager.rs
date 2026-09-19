@@ -1142,8 +1142,7 @@ impl LaunchdManager {
                         // to a label — so the fix has to be here, at the one
                         // moment we know the artifact is new.
                         // `install` has no `--timeout` of its own, so its
-                        // own `launchctl` calls are deliberately unbounded
-                        // — unchanged from before budgets existed.
+                        // own `launchctl` calls are deliberately unbounded.
                         let deadline = Budget::Unbounded.start();
                         if never_expires(is_loaded(spec.id.as_str(), deadline)?) {
                             never_expires(bootout(spec.id.as_str(), deadline, reaper)?);
@@ -1208,8 +1207,7 @@ impl LaunchdManager {
                 }
                 write_existing(&target, &desired)?;
                 // `install` has no `--timeout` of its own, so its own
-                // `launchctl` calls are deliberately unbounded — unchanged
-                // from before budgets existed.
+                // `launchctl` calls are deliberately unbounded.
                 let deadline = Budget::Unbounded.start();
                 if matches!(outcome, Outcome::Update { .. }) && never_expires(is_loaded(spec.id.as_str(), deadline)?) {
                     // launchd holds the plist content it read at bootstrap

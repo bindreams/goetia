@@ -153,8 +153,8 @@ const SILENCERS: [(&str, &str); 5] = [
 ];
 
 /// One more [`SILENCERS`] name under each prefix goetia removes, made at run time from this test
-/// process's pid: no denylist of literal names — the shape goetia shipped and had to correct twice
-/// — can contain them, so a child that arrives without them arrives without them for their prefix.
+/// process's pid: no denylist of literal names can contain them, so a child that arrives without
+/// them arrives without them for their prefix.
 /// Set on goetia and honoured by the stand-in exactly as [`SILENCERS`] are.
 fn unlistable() -> [String; 2] {
     let pid = std::process::id();
