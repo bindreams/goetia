@@ -2,7 +2,12 @@
 name = "goetia"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# `cosca` uses `std::io::PipeReader`, stable since 1.87. That is already true
+# on Windows, where cosca has been a dependency all along, and the Unix
+# backends' bounded wait (`backend::bounded`) extends the same requirement to
+# Linux and macOS. Not verified end to end: CI pins `dtolnay/rust-toolchain`
+# at `stable` on every job, so nothing checks this floor.
+rust-version = "1.87"
 description = "Install system daemons described in goetia.yaml as native Windows/SCM, macOS/launchd, and Linux/systemd services"
 license = "Apache-2.0"
 readme = "README.md"
@@ -51,6 +56,19 @@ cli = ["dep:clap", "dep:libc"]
 [dependencies]
 base64 = "0.23"
 clap = { version = "4.6.6", features = ["derive"], optional = true }
+# The shim's process-tree containment, spawn, and waiting: `.contain()` is a
+# Windows Job Object with `KILL_ON_JOB_CLOSE`, and `wait()`/`wait_tree()` are
+# real, event-driven kernel waits — see `src/bin/shim/service.rs`. Also the
+# Unix backends' bounded subprocess wait (`backend::bounded`): `Child::wait_deadline`
+# and `Child::kill_tree` bound and reap the `systemctl`/`launchctl` calls
+# `daemon start --timeout` waits on. 0.x with an explicitly unstable API.
+cosca = "0.4"
+# `backend::bounded::collect`'s reader channel: `Receiver::len()` is a
+# race-free snapshot of what is already queued, which is what lets `collect`
+# stop exactly at the deadline instead of draining however long a reader
+# keeps producing (`std::sync::mpsc` has no equivalent — `recv_timeout(ZERO)`
+# still returns a queued item rather than timing out).
+crossbeam-channel = "0.5.17"
 humantime = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -96,7 +114,7 @@ windows-service = "0.8"
 # registry: `windows-service`'s `ServiceConfig` exposes neither.
 winreg = "0.56"
 # The handful of Win32 calls `windows-service` does not wrap: a real
-# `NotifyServiceStatusChangeW` wait (`manager::scm_wait`, replacing a
+# `NotifyServiceStatusChangeW` wait (`scm::wait`, replacing a
 # checkpoint/`Sleep` poll), `SeServiceLogonRight` provisioning
 # (`manager::identity`), and `CommandLineToArgvW` for readback (SCM stores
 # `executable`+`arguments` pre-joined into one command line).
@@ -118,12 +136,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
     "Win32_UI_Shell",
 ] }
-# The shim's process-tree containment, spawn, and waiting: `.contain()` is
-# a Windows Job Object with `KILL_ON_JOB_CLOSE`, and `wait()`/`wait_tree()`
-# are real, event-driven kernel waits — see `src/bin/shim/service.rs`.
-# 0.x with an explicitly unstable API; pinned to `"0.2"` rather than a
-# looser range since a minor bump may break this crate's own build.
-cosca = "0.4"
 
 [dev-dependencies]
 skuld = "0.3"

@@ -28,7 +28,7 @@
 //! **2. Stopping (and starting) must not poll.** `windows-service`'s
 //! `stop()`/`start()` return as soon as SCM accepts the request, not once
 //! the transition completes, and the crate wraps no wait primitive. See
-//! `scm_wait`, a port of `~/src/hole/crates/bridge/src/cutover/scm_wait.rs`
+//! `super::wait`, a port of `~/src/hole/crates/bridge/src/cutover/scm_wait.rs`
 //! using `NotifyServiceStatusChangeW` — a real kernel rendezvous, never a
 //! `Sleep`+`QueryServiceStatusEx` poll.
 //!
@@ -36,7 +36,7 @@
 //! on a running service only *marks* it for deletion — the registry key
 //! survives until every `SC_HANDLE` closes and the service actually stops —
 //! so the next `install` would meet `ERROR_SERVICE_MARKED_FOR_DELETE`.
-//! [`uninstall_locked`] waits for a confirmed `STOPPED` (via `scm_wait`)
+//! [`uninstall_locked`] waits for a confirmed `STOPPED` (via `super::wait`)
 //! before opening a *fresh* handle for `DeleteService`, so the handle used
 //! to wait is always closed first.
 //!
@@ -88,7 +88,6 @@
 
 mod identity;
 mod registry;
-mod scm_wait;
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -104,11 +103,13 @@ use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SERVICE_DOES_NOT
 use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHANGE};
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
+use super::wait::Waited;
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::blob::Blob;
 use crate::decide::{self, Outcome, Ownership};
 use crate::error::{Error, Result};
-use crate::manager::{Installed, ServiceManager, State, Status};
+use crate::manager::budget;
+use crate::manager::{Budget, Installed, ServiceManager, State, Status};
 use crate::spec::{DaemonSpec, Id, Kind};
 
 // ScmManager ==========================================================================================================
@@ -190,22 +191,59 @@ impl ServiceManager for ScmManager {
         set_start_type(&service, ServiceStartType::OnDemand).map_err(|e| Error::Other(format!("disable `{id}`: {e}")))
     }
 
-    fn start(&self, id: &Id) -> Result<()> {
+    fn start(&self, id: &Id, budget: Budget) -> Result<()> {
+        // First, so discovery spends the budget too. What it bounds is the
+        // wait: `start_via_notify` issues the start whatever is left of it.
+        let deadline = budget.start();
         let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
         require_ours(id)?;
         drop(service);
-        let mut actor = scm_wait::SystemScmActor::open(id.as_str())
+        let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to start it: {e}")))?;
-        scm_wait::start_via_notify(&mut actor).map_err(|e| Error::Other(format!("start `{id}`: {e}")))
+        if !budget.waits() {
+            // Request-only: `StartServiceW` and return, arming no wait at
+            // all. `Ok(())` then means the request was accepted and nothing
+            // more, per the trait doc comment.
+            return super::wait::request_start(&mut actor).map_err(|e| Error::Other(format!("start `{id}`: {e}")));
+        }
+        let waited = super::wait::start_via_notify(&mut actor, deadline)
+            .map_err(|e| Error::Other(format!("start `{id}`: {e}")))?;
+        match waited {
+            Waited::Confirmed => Ok(()),
+            Waited::Expired => Err(budget::timed_out(id.as_str(), "running", budget)),
+        }
     }
 
-    fn stop(&self, id: &Id) -> Result<()> {
+    /// [`super::wait::request_start_after_stop`]: every
+    /// `ERROR_SERVICE_ALREADY_RUNNING` is a refusal here, since a `type:
+    /// simple` service reads `RUNNING` for its whole teardown.
+    fn request_start_after_stop(&self, id: &Id) -> Result<()> {
         let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
         require_ours(id)?;
         drop(service);
-        let mut actor = scm_wait::SystemScmActor::open(id.as_str())
+        let mut actor = super::wait::SystemScmActor::open(id.as_str())
+            .map_err(|e| Error::Other(format!("open `{id}` to start it: {e}")))?;
+        super::wait::request_start_after_stop(&mut actor).map_err(|e| Error::Other(format!("start `{id}`: {e}")))
+    }
+
+    fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
+        // First, so discovery spends the budget too; `stop_via_notify` issues
+        // the stop whatever is left of it.
+        let deadline = budget.start();
+        let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
+        require_ours(id)?;
+        drop(service);
+        let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to stop it: {e}")))?;
-        scm_wait::stop_via_notify(&mut actor).map_err(|e| Error::Other(format!("stop `{id}`: {e}")))
+        if !budget.waits() {
+            return super::wait::request_stop(&mut actor).map_err(|e| Error::Other(format!("stop `{id}`: {e}")));
+        }
+        let waited = super::wait::stop_via_notify(&mut actor, deadline)
+            .map_err(|e| Error::Other(format!("stop `{id}`: {e}")))?;
+        match waited {
+            Waited::Confirmed => Ok(()),
+            Waited::Expired => Err(budget::timed_out(id.as_str(), "stopped", budget)),
+        }
     }
 
     fn status(&self, id: &Id) -> Result<Status> {
@@ -843,9 +881,13 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
     };
 
     if needs_stop {
-        let mut actor = scm_wait::SystemScmActor::open(id.as_str())
+        let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to stop it before uninstall: {e}")))?;
-        scm_wait::stop_via_notify(&mut actor).map_err(|e| {
+        // Deliberately `Budget::Unbounded`, and not the caller's: `uninstall` has no `--timeout`
+        // of its own, this stop is a means rather than an end, and bounding it would turn a
+        // slow-stopping service into a failed uninstall where today it succeeds. The message below
+        // already routes the user for every way this can actually fail.
+        let waited = super::wait::stop_via_notify(&mut actor, Budget::Unbounded.start()).map_err(|e| {
             Error::Other(format!(
                 "`{id}` did not confirm SERVICE_STOPPED before uninstall ({e}); it was NOT deleted — \
                  DeleteService on a running service only marks it for deletion, which the next install would \
@@ -853,6 +895,12 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
                  `goetia daemon uninstall {id}`."
             ))
         })?;
+        match waited {
+            Waited::Confirmed => {}
+            // `let _ = …` is the write that turns an unreachable case into a silent one, and this
+            // is precisely the case where a later edit narrowing that budget must not pass quietly.
+            Waited::Expired => unreachable!("uninstall's stop is Unbounded; an unbounded deadline never expires"),
+        }
         // `actor`'s `SC_HANDLE` must close before the `DELETE` handle opens
         // below — dropping it explicitly documents that ordering rather than
         // relying on it falling out of scope at the end of the function.
@@ -1043,6 +1091,12 @@ fn map_state(s: WinState) -> State {
         // not `dwCurrentState`. Recovery actions may already have restarted
         // it by the time this is read, in any case.
         WinState::Stopped => State::Stopped,
+        // One of three places a `State::Starting` would be produced if
+        // goetia grows one (routed post-0.1.0) — the other two are
+        // `state::classify` in `src/backend/launchd/state.rs` and
+        // `status_from_unit` in `src/backend/systemd/manager/systemctl.rs`.
+        // This match is exhaustive over `WinState`, so adding that variant
+        // to `State` will not silently leave this arm behind.
         WinState::StartPending
         | WinState::StopPending
         | WinState::ContinuePending

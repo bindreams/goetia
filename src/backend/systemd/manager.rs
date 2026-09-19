@@ -70,14 +70,18 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use discover::{DROPIN_SEARCH_DIRS, RawState, absent_error, classify_and_read, discover, raw_state, require_installed};
-use systemctl::{daemon_reload, daemon_reload_or_report, run_systemctl, start_impl, status_from_unit, stop_impl};
+use systemctl::{
+    daemon_reload, daemon_reload_or_report, gate_scope, request_restart_impl, require_supported, run_systemctl,
+    start_impl, status_from_unit, stop_impl,
+};
 use write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 
-use crate::backend::Identity;
 use crate::backend::systemd::generate;
+use crate::backend::{Identity, bounded};
 use crate::decide::{self, Outcome};
 use crate::error::{Error, Result};
-use crate::manager::{Installed, ServiceManager, Status};
+use crate::manager::budget::Deadline;
+use crate::manager::{Budget, Installed, Prepared, ServiceManager, Status, Step};
 use crate::spec::{AccountId, DaemonSpec, Id, User};
 
 /// Where systemd looks for system unit files. Never overridden — the integration tests run for real
@@ -99,6 +103,10 @@ impl Systemd {
 
 impl ServiceManager for Systemd {
     fn install(&self, spec: &DaemonSpec, force: bool) -> Result<Outcome> {
+        // Before anything is written: the gate is where no manager to ask refuses too. Its answer
+        // holds for the `daemon-reload` after the write.
+        let _gate = gate_scope();
+        require_supported()?;
         let identity = identity_for(&spec.user)?;
         let desired = generate::unit(spec, &identity);
 
@@ -176,10 +184,15 @@ impl ServiceManager for Systemd {
         let id = id.as_str();
         let expected_text = require_installed(id)?;
         let unit = unit_name(id);
+        // One version gate for the stop, the `disable` and the `daemon-reload`: the stop's.
+        let _gate = gate_scope();
 
         // Order matters: stop, then disable (needs the fragment's `[Install]` section to know which
         // symlinks to remove), then remove the fragment and any drop-in, then reload.
-        stop_impl(&unit)?;
+        // Deliberately `Budget::Unbounded`: `uninstall` has no `--timeout` of its own, this stop
+        // is a means rather than an end, and bounding it would turn a slow-stopping service into a
+        // failed uninstall where today it succeeds.
+        stop_impl(id, Budget::Unbounded, Budget::Unbounded.start())?;
 
         let disabled = run_systemctl(&["disable", &unit])?;
         if !disabled.status.success() {
@@ -249,16 +262,50 @@ impl ServiceManager for Systemd {
         }
     }
 
-    fn start(&self, id: &Id) -> Result<()> {
-        let id = id.as_str();
-        require_installed(id)?;
-        start_impl(&unit_name(id))
+    fn start(&self, id: &Id, budget: Budget) -> Result<()> {
+        start_with(id.as_str(), budget, &REAL_STEPS)
     }
 
-    fn stop(&self, id: &Id) -> Result<()> {
+    /// Makes ready now what each start or stop in `steps` needs to watch its one `systemctl` under
+    /// `budget`: a thread for each of its two streams, the stderr it announces its job on and its
+    /// stdout — never a temp file. `install` runs no watched `systemctl`, and a budget that does not wait, or never
+    /// stops waiting, watches none. While it is held, the steps also share one version gate — see
+    /// `systemctl::GateScope`.
+    fn prepare(&self, steps: &[Step], budget: Budget) -> Result<Prepared> {
+        let watched = steps
+            .iter()
+            .filter(|step| matches!(step, Step::Start | Step::Stop) && systemctl::watched(budget))
+            .count();
+        let spares = bounded::spare(bounded::Needs {
+            listeners: 2 * watched,
+            ..bounded::Needs::default()
+        })
+        .map_err(|e| {
+            Error::Other(format!(
+                "no thread could be made to watch a `systemctl` request, so none was sent: {e}"
+            ))
+        })?;
+        Ok(Prepared::holding((spares, gate_scope())))
+    }
+
+    /// One `systemctl restart --no-block`: one job, so no start can overtake
+    /// the stop. systemd stops the unit and starts it again, or, while it is
+    /// still activating, folds the restart into the start already running —
+    /// see `request_restart_impl`.
+    fn request_restart(&self, id: &Id) -> Option<Result<()>> {
         let id = id.as_str();
-        require_installed(id)?;
-        stop_impl(&unit_name(id))
+        Some(require_installed(id).and_then(|_| request_restart_impl(id)))
+    }
+
+    /// The plain request-only start. `restart` never issues it here — see
+    /// [`Self::request_restart`] — since after a stop nobody waited for, it
+    /// replaces a stop job systemd has not yet run.
+    fn request_start_after_stop(&self, id: &Id) -> Result<()> {
+        start_with(id.as_str(), Budget::Immediate, &REAL_STEPS)
+    }
+
+    fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
+        stop_with(id.as_str(), budget, &REAL_STEPS)
     }
 
     fn status(&self, id: &Id) -> Result<Status> {
@@ -327,6 +374,8 @@ impl ServiceManager for Systemd {
                         pid: status.pid,
                         enabled: status.enabled,
                     }),
+                    // Not this entry's failure: no manager can be asked about any of them.
+                    Err(e @ Error::NoManager { .. }) => return Err(e),
                     Err(e) => out.push(Installed::OursUnreadable {
                         name: id.to_string(),
                         reason: format!("decoded, but its live state could not be queried: {e}"),
@@ -360,6 +409,40 @@ fn residue_entry(id: &str) -> Option<Installed> {
         name: Some(id.to_string()),
         reason: failure.detail(),
     })
+}
+
+// start/stop ==========================================================================================================
+
+/// The steps `start`/`stop` take, behind a seam so their ORDER is assertable without a real systemd
+/// — the precedent is `cli::restart`'s `start_clock`. `manager_tests.rs` pins it.
+struct VerbSteps<'a> {
+    start_clock: &'a dyn Fn(Budget) -> Deadline,
+    require_installed: &'a dyn Fn(&str) -> Result<String>,
+    start: &'a dyn Fn(&str, Budget, Deadline) -> Result<()>,
+    stop: &'a dyn Fn(&str, Budget, Deadline) -> Result<()>,
+}
+
+const REAL_STEPS: VerbSteps<'static> = VerbSteps {
+    start_clock: &Budget::start,
+    require_installed: &require_installed,
+    start: &start_impl,
+    stop: &stop_impl,
+};
+
+fn start_with(id: &str, budget: Budget, steps: &VerbSteps<'_>) -> Result<()> {
+    // Derived at verb entry, so discovery spends the budget too. It bounds only the wait for the job,
+    // never whether the job is enqueued — see `run_verb`.
+    let deadline = (steps.start_clock)(budget);
+    (steps.require_installed)(id)?;
+    (steps.start)(id, budget, deadline)
+}
+
+fn stop_with(id: &str, budget: Budget, steps: &VerbSteps<'_>) -> Result<()> {
+    // Derived at verb entry, so discovery spends the budget too. It bounds only the wait for the job,
+    // never whether the job is enqueued — see `run_verb`.
+    let deadline = (steps.start_clock)(budget);
+    (steps.require_installed)(id)?;
+    (steps.stop)(id, budget, deadline)
 }
 
 // Enumeration =========================================================================================================

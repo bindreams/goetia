@@ -65,8 +65,8 @@ pub(crate) struct DaemonReport {
 #[derive(serde::Serialize)]
 pub(crate) struct ErrorReport {
     /// The daemon id or service name the failure is attributable to, or
-    /// `None` when it is not — exactly the `unavailable` and `unsupported`
-    /// cases.
+    /// `None` when it is not: `unsupported`, and an `unavailable` from
+    /// obtaining the manager or from listing.
     pub id: Option<String>,
     pub kind: Kind,
     pub message: String,
@@ -116,7 +116,8 @@ pub(crate) enum Kind {
     /// `support::parse_id` rejected a CLI argument: fix the argument.
     InvalidId,
     /// `get_manager()` or `mgr.list()` failed, so no answer was obtained for
-    /// any daemon.
+    /// any daemon — or, under one id, `status(&id)` found no manager to ask
+    /// about it ([`Error::NoManager`]).
     Unavailable,
     /// `--json` was given to a subcommand that does not implement it.
     Unsupported,
@@ -242,8 +243,13 @@ pub(crate) fn daemon(id: &str, status: &Status) -> DaemonReport {
 /// classification by error variant: `status(&id)` is the one operation that
 /// answers "what is at this id", so its three answers — absent, present and
 /// foreign, unestablished — are exactly what its failures can mean.
+///
+/// [`Error::NoManager`] is the one failure that says nothing about the id:
+/// no manager could be asked about it, which is `unavailable` under the id,
+/// exit `1` — per id, as every verb given ids answers each one.
 pub(crate) fn status_error(id: &str, e: &Error) -> ErrorReport {
     let kind = match e {
+        Error::NoManager { .. } => Kind::Unavailable,
         Error::NotInstalled { .. } => Kind::NotInstalled,
         Error::Foreign { .. } => Kind::Foreign,
         Error::Undetermined { .. } => Kind::Undetermined,

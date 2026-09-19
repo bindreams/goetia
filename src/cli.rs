@@ -32,6 +32,7 @@ pub mod status;
 pub mod stop;
 mod support;
 pub mod uninstall;
+pub mod wait;
 
 use std::io::Write;
 
@@ -126,8 +127,9 @@ pub enum DaemonCommand {
 /// - `1` error: an operation was attempted and failed, or was refused
 ///   outright.
 /// - `2` usage: clap rejected the command line before `dispatch` ever ran,
-///   or (`--json` on a subcommand that does not implement it) `dispatch`
-///   refused to run anything. Anchored to clap's own default for a
+///   or `dispatch` refused to run anything: `--json` on a subcommand that
+///   does not implement it, or a wait flag on an `install` with no `--start`
+///   to bound. Anchored to clap's own default for a
 ///   rejected command line — the same code bash and argparse both use for
 ///   "the parser, not the program, rejected this" — so `main.rs`
 ///   deliberately keeps calling `Cli::parse()` un-overridden and lets clap
@@ -140,11 +142,29 @@ pub enum DaemonCommand {
 ///   own: one `Create` plus one `Conflict` returns `5`, not `3`, since `5`
 ///   outranks `3` in the precedence rule below.
 /// - `4` indeterminate: a question Goetia could not answer about an id.
-///   Two producers, and the difference between them is what was
-///   established: an id Goetia owns whose *state* it could not determine,
-///   or — [`Error::Undetermined`](crate::error::Error::Undetermined) — an
-///   id where the read that would have said whether anything is installed
-///   at all failed, leaving even ownership unestablished.
+///   Two classes, by what was established:
+///   an id Goetia owns whose *state* it could not determine, or
+///   — [`Error::Undetermined`](crate::error::Error::Undetermined) — an id
+///   where the read that would have said whether anything is installed at
+///   all failed, leaving even ownership unestablished.
+///   A wait that ran out of budget
+///   ([`Error::WaitTimeout`](crate::error::Error::WaitTimeout)) is an
+///   instance of the first and deliberately **not** of the second: what is
+///   installed at the id was settled before the wait began, and Goetia
+///   stopped waiting rather than cancelling anything, so a request it issued
+///   stands and the daemon may still arrive. `restart` also reports a start
+///   leg its budget ran out before this way, having issued no start, and its
+///   message says so.
+///   [`Error::Unestablished`](crate::error::Error::Unestablished) joins it
+///   there, for `restart` under a budget that does not wait — an unconfirmed
+///   stop followed by a refused start — and so does
+///   [`Error::RequestInDoubt`](crate::error::Error::RequestInDoubt), for a
+///   request goetia lost track of, which may or may not have reached the
+///   manager, or reached it with its outcome unconfirmed. Reporting the first as `1` would
+///   claim the operation determinately failed, which it did not establish;
+///   reporting the second as `1` would make the refusal the whole answer,
+///   when the unconfirmed stop before it leaves where the daemon ended up
+///   open — even when the refusal itself was determinate.
 ///   `list`/`status` compute theirs via [`report::exit_code`]
 ///   (see the design spec's §4), in *both* output modes: out of
 ///   `status(&id)` the second producer reaches them as
@@ -153,12 +173,15 @@ pub enum DaemonCommand {
 ///   `errors[].kind` — both codes come from `report::Kind::code`, the one
 ///   kind-to-code map. `diff` returns it for `Outcome::RefuseUnreadable`
 ///   and for `Error::Undetermined` (`cli::diff::run`); `install` returns it
-///   for `Error::Undetermined` from `mgr.install`/`enable`/`start`, so the
-///   two verbs agree about that error and disagree only about
+///   for `Error::Undetermined` from `mgr.install`/`enable`/`start`, and for
+///   `Error::WaitTimeout` and `Error::RequestInDoubt` from its steps, so the two verbs
+///   agree about `Undetermined` and disagree only about
 ///   `Outcome::RefuseUnreadable`, which `install` reports as `1` because it
 ///   genuinely failed to install. All six id verbs return it through
-///   `support::run_id_verb`: "could not determine the state and therefore
-///   did nothing" is one condition with one remedy for every one of them.
+///   `support::run_id_verb`, for four conditions: `Undetermined`, where
+///   goetia could not determine what is at the id, and — from the verbs that
+///   act — `WaitTimeout`, `Unestablished` and `RequestInDoubt`, where it
+///   acted, or may have, and could not determine the outcome.
 ///   `show` returns it too (`cli::show::run`), in both its per-id and
 ///   no-ids forms — for an "installed but unreadable" id, for an id
 ///   `list()` reported as undetermined, and for *any* id it cannot find
@@ -185,9 +208,10 @@ pub enum DaemonCommand {
 /// `show` can produce.
 /// That is a rule about which outcome wins when more than one applies at
 /// once, not an ordering of the integers — `5` outranks `3` despite being
-/// the larger number. `2` never enters that ladder: the one thing that produces it
-/// there (`--json` on a subcommand that does not implement it) always
-/// happens alone, before any other kind could exist in the same report.
+/// the larger number. `2` never enters that ladder: both refusals that
+/// produce it there (`--json` on a subcommand that does not implement it,
+/// and a wait flag on an `install` with no `--start`) always happen alone,
+/// before any other kind could exist in the same report.
 ///
 /// Whenever `--json` is given together with a subcommand **that clap
 /// accepted**, stdout is exactly one JSON document: `list` and `status`
@@ -216,6 +240,23 @@ pub fn dispatch(
     if cli.json && !matches!(cmd, DaemonCommand::List | DaemonCommand::Status(_)) {
         let report = report::unsupported(subcommand_name(cmd));
         return report::emit(&report, out, err);
+    }
+
+    // The second rule of this shape, and it lives here for the same reason
+    // as the first: a command line goetia will not act on must run
+    // *nothing*, and rules of that shape belong in one place rather than
+    // split between clap and `dispatch`. `install` without `--start` starts
+    // nothing, so a budget named for that start can never be spent.
+    // `requires = "start"` cannot express it: `--dry-run` makes `--start`
+    // and the wait flags alike inert, and must keep accepting all three.
+    // Checked after the `--json` refusal, so that one wins when both apply.
+    if matches!(cmd, DaemonCommand::Install(args) if args.wait.was_given() && !args.start && !args.dry_run) {
+        let _ = writeln!(
+            err,
+            "error: `--timeout`/`--no-timeout` need `--start`: `daemon install` on its own starts \
+             nothing, so there is nothing to wait for"
+        );
+        return 2;
     }
 
     match cmd {

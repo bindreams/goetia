@@ -228,6 +228,10 @@ pub(crate) struct IdVerbCall<'a> {
     pub get_manager: &'a dyn Fn() -> Result<Box<dyn ServiceManager>>,
     pub is_elevated: &'a dyn Fn() -> bool,
     pub verb: &'a dyn Fn(&dyn ServiceManager, &Id) -> Result<()>,
+    /// The word printed after an id that succeeded. Supplied by the caller
+    /// because it follows the budget: a verb that waited confirmed something
+    /// and reports `started`, while one that did not reports
+    /// `start requested` — see [`super::wait::reported`].
     pub verb_past_tense: &'a str,
     /// Whether an absent *artifact* already satisfies this verb's goal.
     /// True for `uninstall` alone; every other id-verb keeps `Error::
@@ -311,11 +315,43 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
                 let _ = writeln!(out, "{id}: not installed (nothing to do)");
                 codes.push(0);
             }
-            // Nothing was done and nothing was established, which is one
-            // condition with one remedy for every verb here — including
-            // `uninstall`, whose exemption is about absence, not about the
-            // question going unanswered.
+            // What is at the id was not established, which is one condition
+            // with one remedy for every verb here — including `uninstall`,
+            // whose exemption is about absence, not about the question going
+            // unanswered. Not "nothing was done": `restart` keeps an
+            // `Undetermined` start leg as it is after a stop it did issue
+            // (`restart::after_start_failed`), and its reason says so.
             Err(e @ Error::Undetermined { .. }) => {
+                let _ = writeln!(err, "error: {id}: {e}");
+                codes.push(4);
+            }
+            // A wait that ran out of budget. The same class as the arm
+            // above, for the same reason — the code is about whether the
+            // question was answered — but a different condition: this one
+            // answered what is at the id and left the *outcome* open. The
+            // catch-all below would report `1`, which says the verb
+            // determinately failed, and nothing goetia issued was cancelled,
+            // so that is exactly what was not established. `restart`'s start
+            // leg is the one expiry with no request behind it — its budget ran
+            // out before it — and it is still a timeout, not a failure (see
+            // `restart::spent_before_start`).
+            Err(e @ Error::WaitTimeout { .. }) => {
+                let _ = writeln!(err, "error: {id}: {e}");
+                codes.push(4);
+            }
+            // Steps that were issued and whose outcome nobody established —
+            // `restart` with no budget, whose start leg was refused. The same
+            // class again, and again a different condition: here both steps
+            // were issued and neither settled where the daemon ended up, even
+            // when the start's refusal was itself determinate.
+            Err(e @ Error::Unestablished { .. }) => {
+                let _ = writeln!(err, "error: {id}: {e}");
+                codes.push(4);
+            }
+            // A request goetia lost track of: it may or may not have reached the manager, or did
+            // and its outcome is unconfirmed. The same class once more: `1` says the verb was
+            // attempted and failed, or was refused, and neither is what was established.
+            Err(e @ Error::RequestInDoubt { .. }) => {
                 let _ = writeln!(err, "error: {id}: {e}");
                 codes.push(4);
             }

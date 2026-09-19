@@ -195,7 +195,7 @@ fn supervisor_loop(spec: &DaemonSpec, stop_bus: &StopBus, id: &str, status_handl
     // one spawn's outcome, so for those policies `Running` means "the
     // supervisor itself is alive and will keep trying" — reported up
     // front, matching what `ScmManager::start`'s own real
-    // `NotifyServiceStatusChangeW` wait (`scm_wait::start_via_notify`)
+    // `NotifyServiceStatusChangeW` wait (`scm::wait::start_via_notify`)
     // expects promptly. `restart: never` makes exactly one spawn attempt
     // ever, so reporting `Running` before that attempt resolves would race
     // an immediate `Stopped`: `start_via_notify`'s single-shot notify can

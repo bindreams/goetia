@@ -15,10 +15,11 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use goetia::backend::launchd::manager::{ENABLED_DIR, LaunchdManager, STAGING_DIR};
 use goetia::decide::Outcome;
-use goetia::manager::{self, Installed, ServiceManager, State};
+use goetia::manager::{self, Budget, Installed, ServiceManager, State};
 use goetia::spec::{DaemonSpec, Id, Kind, Restart, User};
 
 use crate::support::{self, ConnectBack, ELEVATED, cmd};
@@ -327,7 +328,7 @@ fn start_does_not_enable() {
     let spec = sleepy(&support::random_test_id());
     let _guard = Guard::install(&mgr, &spec);
 
-    mgr.start(&spec.id).expect("start");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
 
     assert!(
         staging_path(spec.id.as_str()).exists(),
@@ -374,7 +375,7 @@ fn disable_returns_the_plist_to_staging() {
     let _guard = Guard::install(&mgr, &spec);
 
     mgr.enable(&spec.id).expect("enable");
-    mgr.start(&spec.id).expect("start");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     listener.accept("the daemon to report in after start");
     assert_eq!(
         mgr.status(&spec.id).unwrap().state,
@@ -397,7 +398,7 @@ fn disable_returns_the_plist_to_staging() {
         State::Running,
         "disable must not stop a job that was loaded"
     );
-    mgr.stop(&spec.id).expect("stop"); // tidy up before the guard's uninstall
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop"); // tidy up before the guard's uninstall
 }
 
 // Runtime behavior ====================================================================================================
@@ -424,13 +425,13 @@ fn start_stop_status_reflect_reality() {
 
     assert_eq!(mgr.status(&spec.id).unwrap().state, State::Stopped);
 
-    mgr.start(&spec.id).expect("start");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     listener.accept("the daemon to report in after start");
     let running = mgr.status(&spec.id).unwrap();
     assert_eq!(running.state, State::Running);
     assert!(running.pid.is_some(), "a running job should report a pid");
 
-    mgr.stop(&spec.id).expect("stop");
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
     assert_ne!(mgr.status(&spec.id).unwrap().state, State::Running);
 }
 
@@ -443,7 +444,7 @@ fn uninstall_leaves_nothing() {
     // a harmless, already-gone no-op — see its `Drop` impl — so this still
     // doubles as the panic-safety net every other test gets.
     let _guard = Guard::install(&mgr, &spec);
-    mgr.start(&spec.id).expect("start");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
 
     mgr.uninstall(&spec.id).expect("uninstall");
 
@@ -842,13 +843,106 @@ fn root_user_runs_as_uid_zero() {
         ],
     );
     let _guard = Guard::install(&mgr, &spec);
-    mgr.start(&spec.id).expect("start");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
 
     let reported_uid = listener.accept_value("the daemon to report its uid");
     assert_eq!(
         reported_uid, "0",
         "a `user: root` daemon must run as uid 0, got {reported_uid}"
     );
+}
+
+// Budgets =============================================================================================================
+
+/// `launchctl` exposes no non-blocking `bootout`, so under `Budget::Immediate` `stop` still runs it
+/// to completion: issuing the request *is* the wait here, which is why the trait doc comment says
+/// so on `stop` rather than leaving it to be rediscovered per platform.
+///
+/// Against the trap — handing `wait_bounded` the `Immediate` budget's own already-expired deadline
+/// — `bootout` is SIGKILLed the instant it is spawned, so this returns a `WaitTimeout` instead of
+/// stopping anything, or trips `budget::timed_out`'s `debug_assert!` outright in a debug build.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_stop_with_no_budget_runs_bootout_to_completion() {
+    let mgr = LaunchdManager::new();
+    let spec = sleepy(&support::random_test_id());
+    let _guard = Guard::install(&mgr, &spec);
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+
+    mgr.stop(&spec.id, Budget::Immediate)
+        .expect("bootout has no non-blocking form, so a stop with no budget still completes");
+
+    assert_ne!(
+        mgr.status(&spec.id).expect("status after stop").state,
+        State::Running,
+        "the bootout ran to completion, so the job really is down"
+    );
+}
+
+/// launchd will not report a crash-looping `restart: always` job running, so a bounded `start`
+/// reports [`goetia::Error::WaitTimeout`] — bounded by the budget, not by launchd's respawn
+/// throttle. Saying so is the contract (`ServiceManager::start`: `Ok(())` means the manager
+/// reports it running), not a defect.
+///
+/// Two measured facts, neither of them assumed:
+///
+/// 1. The throttle is ~10.02s and is keyed to the **job**, not to the loaded instance:
+///    `bootout` + `bootstrap` does not clear it. Probe run 35044604324 on macos-latest, a
+///    `KeepAlive` job running `/usr/bin/true`: `kickstart -p` took 10.01s and 10.02s before a
+///    bootout/bootstrap cycle, and 10.03s / 10.02s / 10.02s across three cycles after one. So no
+///    prologue remedy is possible, and `start` no longer attempts one.
+/// 2. `kickstart -p` is kept regardless. It is the only confirmation launchd offers — there is no
+///    notification mechanism, and re-reading state on a timer is polling, which this project
+///    forbids — and skipping it would fail a healthy job launchd is merely about to start.
+///
+/// The budget is **5s, not `DEFAULT`**, and that is deliberate. 5s and the ~10.02s throttle are two
+/// orders of magnitude apart from the outcome's perspective, so `WaitTimeout` is not a race in
+/// either direction; against `DEFAULT` (10s) they would sit ~20ms apart, which is exactly the bet
+/// this project forbids. That closeness is itself the documented consequence for `DEFAULT`: see
+/// this backend's module doc comment. No elapsed-time assertion is made or needed — the error
+/// variant carries the outcome.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout() {
+    let mgr = LaunchdManager::new();
+    let id = support::random_test_id();
+    // Exits immediately, so `restart: always` puts launchd into the respawn loop it throttles.
+    let mut spec = base_spec(&id, vec!["/usr/bin/true".to_string()]);
+    spec.restart = Restart::Always;
+    let _guard = Guard::install(&mgr, &spec);
+
+    // One start, not two. `install` leaves the job unloaded, so this bootstraps it — and for a
+    // `restart: always` spec whose command exits at once, the bootstrap itself starts the job via
+    // `RunAtLoad`, the process dies, and *that* creates the respawn history. The `kickstart -p`
+    // that follows therefore already meets a throttled job on this very first start.
+    let err = mgr
+        .start(&spec.id, Budget::Bounded(Duration::from_secs(5)))
+        .expect_err("launchd cannot confirm a crash-looping job running, so a bounded start times out");
+
+    assert!(
+        matches!(err, goetia::Error::WaitTimeout { awaited: "running", .. }),
+        "an unconfirmed bounded start must be WaitTimeout, not a fabricated success or another error: {err:?}"
+    );
+}
+
+/// `Budget::Immediate` leaves the job in launchd's `spawn scheduled` /
+/// `xpcproxy` window, which `state::classify`'s catch-all folds into `Unknown` — so a
+/// `restart: always` verification block that runs unconditionally fails here with
+/// `Error::Other("… did not start …")` or a `WaitTimeout`, for a request that was accepted exactly
+/// as asked. This test is the regression guard for exactly that.
+///
+/// **No assertion about the resulting state follows**: `Immediate` establishes none, and a
+/// block that asserts state cannot run on a budget that established none.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_start_with_no_budget_is_ok_for_a_restart_always_job() {
+    let mgr = LaunchdManager::new();
+    let id = support::random_test_id();
+    let mut spec = sleepy(&id);
+    spec.restart = Restart::Always;
+    let _guard = Guard::install(&mgr, &spec);
+
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+
+    mgr.start(&spec.id, Budget::Immediate)
+        .expect("a start with no budget issues the request and returns Ok");
 }
 
 // Parent directories ==================================================================================================
@@ -1056,7 +1150,7 @@ fn start_is_not_fooled_by_a_stale_job_holding_the_label() {
 
     // The decoy now holds the label and is running, which is exactly the
     // state that used to make `start` a no-op.
-    mgr.start(&spec.id)
+    mgr.start(&spec.id, Budget::DEFAULT)
         .expect("start must recover the label, not report a false success");
 
     let status = mgr.status(&spec.id).expect("status");
