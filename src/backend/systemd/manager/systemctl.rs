@@ -72,15 +72,68 @@ fn no_manager(evidence: Evidence) -> Error {
     }
 }
 
-/// Every `systemctl`'s environment. An inherited `SYSTEMD_COLORS` wraps what it prints in escapes,
-/// and an inherited `SYSTEMD_LOG_LEVEL=warning` or `SYSTEMD_LOG_TARGET=null` silences the
-/// `log_info` lines goetia reads: the job `--show-transaction` announces ([`enqueued`]), and the
-/// report that it ignored the request ([`IGNORED`]).
+/// What every `systemctl` goetia runs is given. An inherited `SYSTEMD_COLORS` wraps what it prints
+/// in escapes, and an inherited `SYSTEMD_LOG_LEVEL=warning` or `SYSTEMD_LOG_TARGET=null` silences
+/// the `log_info` lines goetia reads: the job `--show-transaction` announces ([`enqueued`]), and
+/// the report that it ignored the request ([`IGNORED`]).
 const ENVIRONMENT: [(&str, &str); 3] = [
     ("SYSTEMD_COLORS", "0"),
     ("SYSTEMD_LOG_LEVEL", "info"),
     ("SYSTEMD_LOG_TARGET", "console"),
 ];
+
+/// What every `systemctl` goetia runs is denied: the two switches `running_in_chroot()` consults
+/// before it looks at anything, so an inherited one cannot make `systemctl` answer from a manager
+/// that is not this root's — the chroot [`answered`] is the last line against (MEASURED: with
+/// `SYSTEMD_IGNORE_CHROOT=1` inherited, `install` from a chroot with no `/proc` exits `0` and
+/// writes the unit into it).
+///
+/// Removed rather than set, because every value asserts something goetia is in no position to
+/// assert. `SYSTEMD_IN_CHROOT=0` asserts there is no chroot — measured on 257, it silences the
+/// report in one — and `=1` asserts there is one everywhere, which on a 257 host that is no chroot
+/// makes `systemctl` ignore every command. Detecting it is the child's job; goetia only declines to
+/// prejudge it. `SYSTEMD_IGNORE_CHROOT` is read by every supported version, `SYSTEMD_IN_CHROOT`
+/// from 257.
+const UNSET: [&str; 2] = ["SYSTEMD_IGNORE_CHROOT", "SYSTEMD_IN_CHROOT"];
+
+/// A child's environment, as each of the two `Command` types goetia spawns a `systemctl` through
+/// offers it: [`environment`] is applied through this, so neither path can be given one and not the
+/// other.
+trait Environment {
+    fn set(&mut self, key: &str, value: &str);
+    fn remove(&mut self, key: &str);
+}
+
+impl Environment for Command {
+    fn set(&mut self, key: &str, value: &str) {
+        self.env(key, value);
+    }
+
+    fn remove(&mut self, key: &str) {
+        self.env_remove(key);
+    }
+}
+
+impl Environment for cosca::Command {
+    fn set(&mut self, key: &str, value: &str) {
+        self.env(key, value);
+    }
+
+    fn remove(&mut self, key: &str) {
+        self.env_remove(key);
+    }
+}
+
+/// `cmd`'s environment as every `systemctl` goetia runs gets it: [`ENVIRONMENT`] set on it, and
+/// [`UNSET`] removed from it.
+fn environment(cmd: &mut impl Environment) {
+    for (key, value) in ENVIRONMENT {
+        cmd.set(key, value);
+    }
+    for key in UNSET {
+        cmd.remove(key);
+    }
+}
 
 /// `systemctl <args>` for `purpose`, through [`door`], run to completion, and [`answered`].
 fn systemctl(purpose: Purpose, args: &[&str]) -> Result<std::process::Output> {
@@ -95,7 +148,8 @@ fn systemctl(purpose: Purpose, args: &[&str]) -> Result<std::process::Output> {
 fn ran(purpose: Purpose, program: &[&str], args: &[&str]) -> Result<std::process::Output> {
     let (bin, prefix) = program.split_first().expect("a program to run");
     let mut cmd = Command::new(bin);
-    cmd.args(prefix).args(args).envs(ENVIRONMENT);
+    cmd.args(prefix).args(args);
+    environment(&mut cmd);
     let output = match purpose {
         Purpose::Request => requested(&mut cmd, "systemctl", args)?,
         Purpose::Probe | Purpose::Read => cmd
@@ -678,9 +732,7 @@ fn run_verb_via(program: &[&str], args: &[&str], budget: Budget, deadline: Deadl
     let (bin, prefix) = program.split_first().expect("a program to run");
     let argv: Vec<&str> = prefix.iter().chain(args).copied().collect();
     let mut cmd = bounded::command(bin, &argv).map_err(|e| failed(e.to_string()))?;
-    for (key, value) in ENVIRONMENT {
-        cmd.env(key, value);
-    }
+    environment(&mut cmd);
     let spawned = bounded::spawn(&mut cmd, Role::AnnouncedRequest(enqueued)).map_err(|e| match e {
         bounded::SpawnError::NotRun(e) => failed(e.to_string()),
         bounded::SpawnError::MayHaveRun(e) => in_doubt(e.to_string(), false),

@@ -30,7 +30,10 @@ through the running systemd manager of the system it runs on. Where it finds
 sharing the host's PID namespace — seen in `/proc/1/root`, or unelevated in
 the mount tables); `/run/systemd/system` missing; or `systemctl` reporting a
 chroot — a verb that would reach systemd exits `1` before it writes or sends
-anything, with one message naming the first of these it found. `install`
+anything, with one message naming the first of these it found. That last one
+cannot be turned off from the environment: `systemctl` runs with
+`SYSTEMD_IGNORE_CHROOT` and `SYSTEMD_IN_CHROOT` removed, so an inherited one
+cannot stop it detecting a chroot goetia could not see for itself. `install`
 always reaches it; the other verbs only for a daemon of goetia's, and they
 answer from files alone otherwise:
 

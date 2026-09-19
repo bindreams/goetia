@@ -74,11 +74,13 @@ impl NoManager {
             }
             NoManager::Reported(report) => {
                 let dir = stand_in(report);
-                let path = std::env::var_os("PATH").unwrap_or_default();
-                let mut path = std::env::split_paths(&path).collect::<Vec<_>>();
-                path.insert(0, dir.path().to_path_buf());
                 let mut cmd = Command::new(goetia);
-                cmd.env("PATH", std::env::join_paths(path).expect("PATH"));
+                cmd.env("PATH", path_first(dir.path()));
+                // Inherited by goetia, and by every `systemctl` it does not clear them from: either
+                // one turns a real `running_in_chroot()` off, and the stand-in models that.
+                for (switch, value) in SILENCERS {
+                    cmd.env(switch, value);
+                }
                 _stand_in = Some(dir);
                 cmd
             }
@@ -124,21 +126,58 @@ impl Drop for RmLink {
     }
 }
 
-/// A directory holding a stand-in `systemctl` that says `report` on stderr, `$1` the verb, for every
-/// verb but `--version`, and exits `0`, as a real one in a chroot does; `--version` it answers, as
-/// a real one does there. It runs nothing else, so it never reaches the manager. Written by a child
-/// process, so no descriptor open for writing on it can be inherited by a `fork` another test
-/// thread makes, and fail its `exec` with `ETXTBSY`.
+/// The environment settings that turn a real `systemctl`'s own chroot detection off, with a value
+/// that does it: `running_in_chroot()` consults `SYSTEMD_IN_CHROOT` first (257 on), then
+/// `SYSTEMD_IGNORE_CHROOT` (every supported version). goetia removes both from every `systemctl` it
+/// runs, so setting them here proves the removal rather than assuming it — without them, the
+/// stand-in below looks away and there is no report for goetia to refuse on.
+const SILENCERS: [(&str, &str); 2] = [("SYSTEMD_IGNORE_CHROOT", "1"), ("SYSTEMD_IN_CHROOT", "0")];
+
+/// `dir` ahead of the inherited `PATH`.
+fn path_first(dir: &Path) -> std::ffi::OsString {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut path = std::env::split_paths(&path).collect::<Vec<_>>();
+    path.insert(0, dir.to_path_buf());
+    std::env::join_paths(path).expect("PATH")
+}
+
+/// What a real `systemctl` checks before it reports a chroot, as shell: [`SILENCERS`] in
+/// `running_in_chroot()`'s own order, each exiting `0` silently, as one that believes it is not in a
+/// chroot and went on to do the work would.
+const HONOURS_THE_SILENCERS: &str = "case \"${SYSTEMD_IN_CHROOT-}\" in 0|no|false|off) exit 0;; esac\n\
+                                     case \"${SYSTEMD_IGNORE_CHROOT-}\" in 1|yes|true|on) exit 0;; esac\n";
+
+/// A stand-in `systemctl` that says `report` on stderr, `$1` the verb, for every verb but
+/// `--version`, and exits `0`, as a real one in a chroot does; `--version` it answers, as a real
+/// one does there. It runs nothing else, so it never reaches the manager.
 fn stand_in(report: &str) -> tempfile::TempDir {
+    written(&format!(
+        "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo 'systemd 255 (255)'; exit 0; }}\n\
+         {HONOURS_THE_SILENCERS}echo \"{report}\" >&2\n"
+    ))
+}
+
+/// A stand-in `systemctl` that answers the version gate — `--version` for the client, the `Version`
+/// property for the manager — and reports `report` for anything else, honouring [`SILENCERS`] as a
+/// real one does. So `door` and the gate both pass, and only the request itself is ignored.
+fn gate_then_stand_in(report: &str) -> tempfile::TempDir {
+    written(&format!(
+        "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo 'systemd 255 (255)'; exit 0; }}\n\
+         [ \"$1\" = show ] && {{ echo 255; exit 0; }}\n\
+         {HONOURS_THE_SILENCERS}echo \"{report}\" >&2\n"
+    ))
+}
+
+/// A directory holding `script` as its `systemctl`. Written by a child process, so no descriptor
+/// open for writing on it can be inherited by a `fork` another test thread makes, and fail its
+/// `exec` with `ETXTBSY`.
+fn written(script: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
-    let script = format!(
-        "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo 'systemd 255 (255)'; exit 0; }}\necho \"{report}\" >&2\n"
-    );
     let wrote = Command::new("/bin/sh")
         .args([
             "-c",
             "printf '%s' \"$0\" > \"$1/systemctl\" && chmod 755 \"$1/systemctl\"",
-            &script,
+            script,
         ])
         .arg(dir.path())
         .status()
@@ -515,5 +554,48 @@ fn a_chroot_without_run_is_refused_as_a_chroot() {
     assert_eq!(
         active_state_and_job(guard.id()),
         ("inactive".to_string(), String::new())
+    );
+}
+
+/// The other place goetia spawns a `systemctl`: the watched one a bounded `start` runs, built
+/// through cosca rather than `Command`, so its environment is set in its own place. The stand-in
+/// answers the version gate, so nothing but that spawn's own capture can produce a refusal, and it
+/// honours [`SILENCERS`] — both of which goetia carries in its own environment here. A child that
+/// kept them looks away, exits `0` having announced no job, and goetia reports a start that never
+/// happened.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_watched_request_a_systemctl_ignored_is_refused_whatever_the_environment_said() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let _daemon = installed(&guard);
+    let before = (active_state_and_job(guard.id()), main_pid(guard.id()));
+    let report = "Running in chroot, ignoring command 'start'";
+    let dir = gate_then_stand_in(report);
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_goetia"));
+    cmd.env("PATH", path_first(dir.path()));
+    for (switch, value) in SILENCERS {
+        cmd.env(switch, value);
+    }
+    // No budget flag: `Budget::DEFAULT` waits and has a deadline, which is what `watched` is.
+    let output = cmd
+        .args(["daemon", "start", guard.id()])
+        .output()
+        .expect("spawn goetia");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let context = format!(
+        "stdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(output.status.code(), Some(1), "{context}");
+    assert!(
+        stderr.contains(&format!("{REFUSAL}`systemctl` said \"{report}\"")),
+        "{context}"
+    );
+    assert_eq!(
+        (active_state_and_job(guard.id()), main_pid(guard.id())),
+        before,
+        "{context}"
     );
 }

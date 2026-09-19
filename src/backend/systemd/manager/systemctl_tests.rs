@@ -1226,8 +1226,14 @@ fn systemd_offline_is_evidence_only_when_true() {
 /// The chroot `systemctl` itself detects — `/proc/1/root` against `/`, or on 257 `SYSTEMD_IN_CHROOT`
 /// — as it reports it: `show` exits `0`, prints nothing, and says why on stderr, in 246's words and
 /// newer ones' (measured on 257), 242 to 245's, or those with no verb to name (see [`IGNORED`]). The
-/// gate refuses it, naming the report. The stand-in says so only when its log level is audible, as
-/// a real one under an inherited `SYSTEMD_LOG_LEVEL=warning` would not.
+/// gate refuses it, naming the report.
+///
+/// Three environment settings would stop a real `systemctl` from reporting it, and the stand-in
+/// reports only where none of them is in force: an inaudible `SYSTEMD_LOG_LEVEL`, and either of
+/// [`UNSET`]'s switches *set* rather than removed. That an *inherited* one is removed is the half
+/// no test on this thread can show — putting a variable in this process's environment would race
+/// every other test thread — and is proved end to end against a real `systemctl` by
+/// `tests/systemd_integration/no_manager.rs`.
 #[skuld::test]
 fn a_chroot_systemctl_reports_is_refused_and_cannot_be_silenced() {
     for notice in [
@@ -1236,10 +1242,45 @@ fn a_chroot_systemctl_reports_is_refused_and_cannot_be_silenced() {
         "Running in chroot, ignoring request.",
     ] {
         let script = format!(
-            "[ \"$1\" = show ] && {{ [ \"$SYSTEMD_LOG_LEVEL\" = info ] && echo \"{notice}\" >&2; exit 0; }}; \
+            "[ \"$1\" = show ] && {{ [ \"$SYSTEMD_LOG_LEVEL\" = info ] && [ -z \"${{SYSTEMD_IGNORE_CHROOT+set}}\" ] \
+             && [ -z \"${{SYSTEMD_IN_CHROOT+set}}\" ] && echo \"{notice}\" >&2; exit 0; }}; \
              echo 'systemd 257 (257)'"
         );
         assert_no_manager(supported_by(&script), notice, notice);
+    }
+}
+
+/// What [`environment`] gives one child, recorded rather than spawned.
+#[derive(Default)]
+struct Recorded {
+    given: Vec<(String, String)>,
+    denied: Vec<String>,
+}
+
+impl Environment for Recorded {
+    fn set(&mut self, key: &str, value: &str) {
+        self.given.push((key.to_string(), value.to_string()));
+    }
+
+    fn remove(&mut self, key: &str) {
+        self.denied.push(key.to_string());
+    }
+}
+
+/// The switches that turn `systemctl`'s own chroot detection off are *removed* from every child's
+/// environment, never set to a value: `SYSTEMD_IN_CHROOT=0` would assert there is no chroot, and
+/// `=1` one everywhere — measured on 257, where `=1` makes `systemctl` ignore every command on a
+/// host that is no chroot. See [`UNSET`].
+#[skuld::test]
+fn the_chroot_switches_are_removed_from_every_child_rather_than_set() {
+    let mut recorded = Recorded::default();
+    environment(&mut recorded);
+    assert_eq!(recorded.denied, ["SYSTEMD_IGNORE_CHROOT", "SYSTEMD_IN_CHROOT"]);
+    for (key, value) in &recorded.given {
+        assert!(
+            !recorded.denied.contains(key),
+            "{key}={value} is set as well as removed"
+        );
     }
 }
 
