@@ -20,8 +20,9 @@ enum NoManager {
     /// `SYSTEMD_OFFLINE=1`, systemd's own offline switch, which goetia reads itself.
     Offline,
     /// A `systemctl` that reports a chroot in these words, and only its report says so: a stand-in
-    /// first on `PATH` ([`stand_in`]). No switch makes the real one report a chroot on every
-    /// supported systemd — 255 ignores `SYSTEMD_IN_CHROOT` and asks the manager.
+    /// first on `PATH` ([`stand_in`]). `SYSTEMD_OFFLINE=1` would make a real one report on every
+    /// supported systemd, but it cannot serve here: goetia reads it itself and refuses with
+    /// [`NoManager::Offline`]'s evidence before it spawns anything, which is the case above.
     Reported(&'static str),
     /// `/run/systemd/system` hidden under a tmpfs in a private mount namespace: a system systemd
     /// did not boot.
