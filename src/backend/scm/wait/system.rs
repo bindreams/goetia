@@ -43,14 +43,25 @@ struct LastStatus {
 /// `pparameter`; we read its `pContext` (our `*mut LastStatus`) and copy
 /// out the current state. Runs on the thread that issued the alertable
 /// wait.
+///
+/// Neither pointer can be null while the registration discipline holds, so
+/// a null one is a broken invariant and not a case to absorb: returning on
+/// it silently leaves `fired` unset, and the wait then lapses into a
+/// `Waited::Expired` that `budget::timed_out` reports as the service having
+/// failed to confirm — blaming the service for goetia's own plumbing. The
+/// `debug_assert!`s trap that where a test can see it; the returns still
+/// stand, because this runs in an APC and an `extern "system"` panic aborts
+/// the process rather than unwinding out of it.
 unsafe extern "system" fn notify_callback(pparameter: *const c_void) {
     let buf = pparameter as *const SERVICE_NOTIFY_2W;
+    debug_assert!(!buf.is_null(), "SCM notify callback: pparameter was null");
     if buf.is_null() {
         return;
     }
     // SAFETY: the SCM passes back the exact buffer registered in `arm`,
     // whose `pContext` is the live `*mut LastStatus` pinned for the wait.
     let slot = unsafe { (*buf).pContext as *mut LastStatus };
+    debug_assert!(!slot.is_null(), "SCM notify callback: pContext was null");
     if slot.is_null() {
         return;
     }
