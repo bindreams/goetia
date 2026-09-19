@@ -1284,19 +1284,23 @@ impl Environment for Recorded {
     }
 }
 
-/// Every inherited name under [`DENIED`] is *removed* from a child, and a name goetia has never
-/// heard of exactly as the three known to turn `systemctl`'s own chroot detection off: the prefix
-/// is what selects them, not a list this file would have to keep up with. Nothing outside the
-/// prefix is touched, and [`ENVIRONMENT`] is set rather than removed — `SYSTEMD_IN_CHROOT=0` would
-/// assert there is no chroot and `=1` one everywhere, so a value is never asserted for a switch
-/// goetia does not own.
+/// Every inherited name under [`DENIED`] is *removed* from a child, including one whose name this
+/// file does not contain and cannot: it is made at run time from this process's pid, so no denylist
+/// of literals — the shape [`DENIED`] replaced, twice — can hold it, and only the prefix can select
+/// it. `SYSTEMD_A_SWITCH_NO_SUPPORTED_VERSION_HAS_YET` is a name no systemd reads but this file
+/// does spell, so it pins reach beyond the switches systemd has today and nothing more. Nothing
+/// outside the prefix is touched, and [`ENVIRONMENT`] is set rather than removed —
+/// `SYSTEMD_IN_CHROOT=0` would assert there is no chroot and `=1` one everywhere, so a value is
+/// never asserted for a switch goetia does not own.
 #[skuld::test]
 fn every_inherited_systemd_switch_is_removed_from_a_child_and_nothing_else_is() {
+    let unlistable = format!("SYSTEMD_H{}", std::process::id());
     let inherited = [
         "SYSTEMD_IGNORE_CHROOT",
         "SYSTEMD_IN_CHROOT",
         "SYSTEMD_OFFLINE",
         "SYSTEMD_A_SWITCH_NO_SUPPORTED_VERSION_HAS_YET",
+        unlistable.as_str(),
         "SYSTEMD_COLORS",
         "SYSTEMD_LOG_LEVEL",
         "SYSTEMD_LOG_TARGET",
@@ -1313,6 +1317,7 @@ fn every_inherited_systemd_switch_is_removed_from_a_child_and_nothing_else_is() 
             "SYSTEMD_IN_CHROOT",
             "SYSTEMD_OFFLINE",
             "SYSTEMD_A_SWITCH_NO_SUPPORTED_VERSION_HAS_YET",
+            unlistable.as_str(),
         ]
     );
     assert_eq!(recorded.given, ENVIRONMENT.map(|(k, v)| (k.to_string(), v.to_string())));

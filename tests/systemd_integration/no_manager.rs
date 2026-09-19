@@ -78,9 +78,10 @@ impl NoManager {
                 let mut cmd = Command::new(goetia);
                 cmd.env("PATH", path_first(dir.path()));
                 // Inherited by goetia, and by every `systemctl` it does not clear them from: three
-                // of them turn a real chroot detection off and the fourth is a name no systemd
-                // reads, so what the stand-in models is goetia's removal, not systemd's reading.
-                for (switch, value) in SILENCERS {
+                // of them turn a real chroot detection off, and the other two are names no systemd
+                // reads — one of which no source file holds — so what the stand-in models is
+                // goetia's removal by prefix, not systemd's reading.
+                for (switch, value) in every_silencer() {
                     cmd.env(switch, value);
                 }
                 _stand_in = Some(dir);
@@ -132,15 +133,36 @@ impl Drop for RmLink {
 /// that does it: `running_in_chroot_or_offline()` consults `SYSTEMD_OFFLINE` first (every supported
 /// version, and a *false* value short-circuits the chroot check as surely as a true one short-
 /// circuits everything), then `SYSTEMD_IN_CHROOT` (257 on), then `SYSTEMD_IGNORE_CHROOT`. The
-/// fourth is a switch no systemd has: goetia removes by prefix, not by name, and that is the row
-/// which says so. Setting all four on goetia proves the removal rather than assuming it — without
-/// it, the stand-in below looks away and there is no report for goetia to refuse on.
+/// fourth is a switch no systemd has, so the removal is shown to reach past the switches systemd
+/// ships today. Setting them all on goetia proves the removal rather than assuming it — without it,
+/// the stand-in below looks away and there is no report for goetia to refuse on.
+///
+/// What no name written here can show is that the removal goes by *prefix*: a denylist holding
+/// exactly these four satisfies every assertion in this file. [`unlistable`] is the entry that
+/// shows it, and it is set on goetia alongside these.
 const SILENCERS: [(&str, &str); 4] = [
     ("SYSTEMD_IGNORE_CHROOT", "1"),
     ("SYSTEMD_IN_CHROOT", "0"),
     ("SYSTEMD_OFFLINE", "0"),
     ("SYSTEMD_A_SWITCH_NO_SUPPORTED_VERSION_HAS_YET", "1"),
 ];
+
+/// A [`SILENCERS`] entry whose name no source file can contain: it is made at run time from this
+/// test process's pid, so no denylist of literal names — the shape goetia shipped and had to
+/// correct twice — can hold it, and a child that arrives without it arrives without it for its
+/// prefix. Set on goetia and honoured by the stand-in exactly as [`SILENCERS`] are.
+fn unlistable() -> String {
+    format!("SYSTEMD_H{}", std::process::id())
+}
+
+/// [`SILENCERS`] and [`unlistable`] together: every name goetia must take off the child here.
+fn every_silencer() -> Vec<(String, String)> {
+    SILENCERS
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+        .chain([(unlistable(), "1".to_string())])
+        .collect()
+}
 
 /// `dir` ahead of the inherited `PATH`.
 fn path_first(dir: &Path) -> std::ffi::OsString {
@@ -151,22 +173,29 @@ fn path_first(dir: &Path) -> std::ffi::OsString {
 }
 
 /// What the stand-in checks before it reports a chroot, as shell: that it carries none of
-/// [`SILENCERS`], by exiting `0` silently if any survived — as a real `systemctl` that believed it
-/// was not in a chroot and went on to do the work would. Stricter than a real one, which honours
-/// only the names it knows, and deliberately so: what is under test is goetia removing every
-/// `SYSTEMD_*` from the child, so the fourth name, which no systemd reads, must silence it too.
-const HONOURS_THE_SILENCERS: &str = "case \"${SYSTEMD_OFFLINE-}\" in 0|no|n|false|f|off) exit 0;; esac\n\
-                                     case \"${SYSTEMD_IN_CHROOT-}\" in 0|no|false|off) exit 0;; esac\n\
-                                     case \"${SYSTEMD_IGNORE_CHROOT-}\" in 1|yes|true|on) exit 0;; esac\n\
-                                     [ -n \"${SYSTEMD_A_SWITCH_NO_SUPPORTED_VERSION_HAS_YET-}\" ] && exit 0\n";
+/// [`SILENCERS`] nor [`unlistable`], by exiting `0` silently if any survived — as a real `systemctl`
+/// that believed it was not in a chroot and went on to do the work would. Stricter than a real one,
+/// which honours only the names it knows, and deliberately so: what is pinned is goetia's removal,
+/// not systemd's reading, so the two names no systemd reads must silence it too.
+fn honours_the_silencers() -> String {
+    format!(
+        "case \"${{SYSTEMD_OFFLINE-}}\" in 0|no|n|false|f|off) exit 0;; esac\n\
+         case \"${{SYSTEMD_IN_CHROOT-}}\" in 0|no|false|off) exit 0;; esac\n\
+         case \"${{SYSTEMD_IGNORE_CHROOT-}}\" in 1|yes|true|on) exit 0;; esac\n\
+         [ -n \"${{SYSTEMD_A_SWITCH_NO_SUPPORTED_VERSION_HAS_YET-}}\" ] && exit 0\n\
+         [ -n \"${{{unlistable}-}}\" ] && exit 0\n",
+        unlistable = unlistable()
+    )
+}
 
 /// A stand-in `systemctl` that says `report` on stderr, `$1` the verb, for every verb but
 /// `--version`, and exits `0`, as a real one in a chroot does; `--version` it answers, as a real
 /// one does there. It runs nothing else, so it never reaches the manager.
 fn stand_in(report: &str) -> tempfile::TempDir {
+    let honours = honours_the_silencers();
     written(&format!(
         "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo 'systemd 255 (255)'; exit 0; }}\n\
-         {HONOURS_THE_SILENCERS}echo \"{report}\" >&2\n"
+         {honours}echo \"{report}\" >&2\n"
     ))
 }
 
@@ -174,10 +203,11 @@ fn stand_in(report: &str) -> tempfile::TempDir {
 /// property for the manager — and reports `report` for anything else, honouring [`SILENCERS`] as a
 /// real one does. So `door` and the gate both pass, and only the request itself is ignored.
 fn gate_then_stand_in(report: &str) -> tempfile::TempDir {
+    let honours = honours_the_silencers();
     written(&format!(
         "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo 'systemd 255 (255)'; exit 0; }}\n\
          [ \"$1\" = show ] && {{ echo 255; exit 0; }}\n\
-         {HONOURS_THE_SILENCERS}echo \"{report}\" >&2\n"
+         {honours}echo \"{report}\" >&2\n"
     ))
 }
 
@@ -573,9 +603,9 @@ fn a_chroot_without_run_is_refused_as_a_chroot() {
 /// The other place goetia spawns a `systemctl`: the watched one a bounded `start` runs, built
 /// through cosca rather than `Command`, so its environment is set in its own place. The stand-in
 /// answers the version gate, so nothing but that spawn's own capture can produce a refusal, and it
-/// honours [`SILENCERS`] — both of which goetia carries in its own environment here. A child that
-/// kept them looks away, exits `0` having announced no job, and goetia reports a start that never
-/// happened.
+/// honours [`SILENCERS`] and [`unlistable`] — all of which goetia carries in its own environment
+/// here. A child that kept them looks away, exits `0` having announced no job, and goetia reports a
+/// start that never happened.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_watched_request_a_systemctl_ignored_is_refused_whatever_the_environment_said() {
     let id = support::random_test_id();
@@ -587,7 +617,7 @@ fn a_watched_request_a_systemctl_ignored_is_refused_whatever_the_environment_sai
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_goetia"));
     cmd.env("PATH", path_first(dir.path()));
-    for (switch, value) in SILENCERS {
+    for (switch, value) in every_silencer() {
         cmd.env(switch, value);
     }
     // No budget flag: `Budget::DEFAULT` waits and has a deadline, which is what `watched` is.
