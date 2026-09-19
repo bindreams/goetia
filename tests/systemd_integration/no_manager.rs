@@ -70,8 +70,8 @@ impl NoManager {
     }
 
     /// Runs `goetia <args>` this way and asserts the refusal: exit `1`, and the one message, naming
-    /// this way's evidence.
-    fn refuses(self, args: &[&str]) {
+    /// this way's evidence. Its stderr.
+    fn refuses(self, args: &[&str]) -> String {
         let output = self.goetia(args);
         let (stdout, stderr) = (
             String::from_utf8_lossy(&output.stdout),
@@ -84,6 +84,7 @@ impl NoManager {
             "{context}"
         );
         assert!(stderr.contains(self.evidence()), "{context}");
+        stderr.into_owned()
     }
 }
 
@@ -216,6 +217,17 @@ fn a_live_state_read_where_no_manager_can_be_asked_is_refused() {
         ] {
             way.refuses(args);
         }
+        // By id, every other id is still answered: one not installed, from files alone.
+        let ghost = format!("{}-ghost", guard.id());
+        let stderr = way.refuses(&["daemon", "status", guard.id(), &ghost]);
+        assert!(
+            stderr.contains(&format!("error: {ghost}: daemon `{ghost}` is not installed")),
+            "{way:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("error: {}: no running systemd manager", guard.id())),
+            "{way:?}: {stderr}"
+        );
     }
     mgr.disable(&daemon).expect("disable online");
 }

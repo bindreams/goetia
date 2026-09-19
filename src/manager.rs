@@ -192,7 +192,7 @@ pub trait ServiceManager {
     /// same reason on the `list` side) — and [`Error::Undetermined`] for an
     /// id whose artifact could not be read at all, where not even ownership
     /// was established. [`Error::NoManager`] where no manager can be asked
-    /// for the state, which the CLI answers for the whole verb.
+    /// for the state, which the CLI reports as `unavailable` under the id.
     ///
     /// [`Error::Undetermined`]: crate::Error::Undetermined
     /// [`Error::NoManager`]: crate::Error::NoManager

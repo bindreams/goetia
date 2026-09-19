@@ -189,9 +189,10 @@ pub enum Error {
     /// a chroot, or a system systemd did not boot. `evidence` says which. goetia refuses there
     /// rather than act on unit files alone, or read a `systemctl` that asked nobody as an answer.
     ///
-    /// Exit `1`, from every verb that reaches the manager, `status` and `list` included: a refusal
-    /// of the whole verb, not an answer about any one daemon. Raised before anything is written or
-    /// sent, and by any `systemctl` that says it ignored what it was asked, which did nothing.
+    /// Exit `1`, from every verb that reaches the manager, `status` and `list` included: a refusal,
+    /// not an answer about the daemon — per id where the verb takes ids, and for the whole listing
+    /// from `list`. Raised before anything is written or sent, and by any `systemctl` that says it
+    /// ignored what it was asked, which did nothing.
     #[error(
         "no running systemd manager can be asked here ({evidence}), and goetia does not manage systemd offline or in a chroot"
     )]

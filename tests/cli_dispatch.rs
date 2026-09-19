@@ -3666,10 +3666,11 @@ fn json_returns_its_own_code_when_stdout_accepts_the_document() {
     }
 }
 
-/// Where no manager can be asked, every verb that reaches it is refused whole: exit `1`, with the
-/// one message. `status` and `list` included, whose refusal is `unavailable` — no answer for any
-/// daemon — and never a daemon's own `unreadable`, exit `4`. The verbs that never reach the manager
-/// are untouched.
+/// Where no manager can be asked, every verb that reaches it is refused: exit `1`, with the one
+/// message. `status` and `list` included, whose refusal is `unavailable` and never a daemon's own
+/// `unreadable`, exit `4` — for the whole listing, which is one question, and per id for `status`
+/// by id, as every other verb given ids answers per id. The verbs that never reach the manager are
+/// untouched.
 #[skuld::test]
 fn where_no_manager_can_be_asked_every_verb_that_reaches_it_is_refused_whole() {
     let dir = tempfile::tempdir().unwrap();
@@ -3702,10 +3703,13 @@ fn where_no_manager_can_be_asked_every_verb_that_reaches_it_is_refused_whole() {
         assert!(err.contains(refusal), "{args:?}: {err}");
     }
 
-    for args in [
-        &["goetia", "--json", "daemon", "status", "frpc"][..],
-        &["goetia", "--json", "daemon", "status"],
-        &["goetia", "--json", "daemon", "list"],
+    for (args, id) in [
+        (
+            &["goetia", "--json", "daemon", "status", "frpc"][..],
+            serde_json::json!("frpc"),
+        ),
+        (&["goetia", "--json", "daemon", "status"], serde_json::Value::Null),
+        (&["goetia", "--json", "daemon", "list"], serde_json::Value::Null),
     ] {
         let (code, out, _) = dispatch_read_only(args, &fake());
         assert_eq!(code, 1, "{args:?}: {out}");
@@ -3714,7 +3718,7 @@ fn where_no_manager_can_be_asked_every_verb_that_reaches_it_is_refused_whole() {
         let errors = errors(&doc);
         assert_eq!(errors.len(), 1, "{args:?}: {out}");
         assert_eq!(errors[0]["kind"], "unavailable", "{args:?}: {out}");
-        assert!(errors[0]["id"].is_null(), "{args:?}: {out}");
+        assert_eq!(errors[0]["id"], id, "{args:?}: {out}");
         assert!(
             errors[0]["message"].as_str().unwrap().contains(refusal),
             "{args:?}: {out}"
@@ -3730,4 +3734,54 @@ fn where_no_manager_can_be_asked_every_verb_that_reaches_it_is_refused_whole() {
         assert_ne!(code, 1, "{args:?}\nstdout:\n{out}\nstderr:\n{err}");
         assert!(!err.contains(refusal), "{args:?}: {err}");
     }
+}
+
+/// `status` by id where no manager can be asked still answers every id it can from files, and
+/// reports the one it cannot as `unavailable` under its own id: every entry is kept, in argument
+/// order, and the exit code is the precedence over all of them. Here `1` — the refusal and the
+/// determinate answers alike — over the `4` of an id whose read failed.
+#[skuld::test]
+fn status_by_id_where_no_manager_can_be_asked_answers_every_other_id() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_opaque("opaque");
+    fake.seed_no_manager();
+
+    let (code, out, _) = dispatch_read_only(
+        &[
+            "goetia", "--json", "daemon", "status", "ghost", "frpc", "opaque", "bad!id",
+        ],
+        &fake,
+    );
+
+    assert_eq!(code, 1, "{out}");
+    let doc = parse_json(&out);
+    let reported: Vec<(String, String)> = errors(&doc)
+        .iter()
+        .map(|e| {
+            (
+                e["id"].as_str().unwrap().to_string(),
+                e["kind"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        reported,
+        [
+            ("ghost", "not-installed"),
+            ("frpc", "unavailable"),
+            ("opaque", "undetermined"),
+            ("bad!id", "invalid-id"),
+        ]
+        .map(|(id, kind)| (id.to_string(), kind.to_string())),
+        "{out}"
+    );
+
+    let (code, _, err) = dispatch_read_only(&["goetia", "daemon", "status", "opaque", "frpc"], &fake);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("error: opaque: cannot determine"), "{err}");
+    assert!(
+        err.contains("error: frpc: no running systemd manager can be asked here (seeded)"),
+        "{err}"
+    );
 }

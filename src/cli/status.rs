@@ -51,9 +51,6 @@ pub fn run(
             Err(e) => report.errors.push(report::invalid_id(id_str, &e)),
             Ok(id) => match mgr.status(&id) {
                 Ok(status) => report.daemons.push(report::daemon(id_str, &status)),
-                // No manager can be asked about any id, so the answer is that refusal alone, as
-                // when no manager could be obtained at all.
-                Err(e @ Error::NoManager { .. }) => return unavailable(&e, json, out, err),
                 Err(e) => report.errors.push(report::status_error(id_str, &e)),
             },
         }
