@@ -98,8 +98,9 @@ fn an_expiry_with_output_in_flight_is_reported_as_expired() {
     assert!(matches!(finished, Finished::Expired), "{finished:?}");
 }
 
-/// The one stream read as it is written, stderr under [`Role::AnnouncedRequest`], held open by a
-/// descendant the kill cannot reach, still returns at the deadline.
+/// The kill path, with a descendant the kill cannot reach holding both of an announced request's
+/// pipes open: it returns `Expired` at the deadline, and reads neither stream. The read of a stream
+/// a descendant holds is [`a_heard_stream_a_descendant_holds_is_read_only_until_the_deadline`]'s.
 #[skuld::test]
 fn a_child_whose_descendant_holds_the_pipe_still_returns_on_expiry() {
     // Deliberately built WITHOUT `command()`'s containment: a contained
@@ -130,6 +131,56 @@ fn a_child_whose_descendant_holds_the_pipe_still_returns_on_expiry() {
     // Leave nothing behind.
     unsafe {
         libc::kill(descendant, libc::SIGKILL);
+    }
+}
+
+/// SIGKILLs a pid on drop, so a descendant a test let escape dies however the test ends.
+struct KillOnDrop(libc::pid_t);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(self.0, libc::SIGKILL);
+        }
+    }
+}
+
+/// A child that exits on its own while a descendant it let escape holds both its pipes: each heard
+/// stream is read only until the deadline, and comes back marked not whole — never waited on for
+/// an EOF that descendant would give in 68 years.
+///
+/// Deterministic, with no timing bet: the test reaps the child itself before the wait, so the wait
+/// finds it exited whatever the deadline, and the deadline is spent before the wait begins, so the
+/// read ends at once. A read that ignored the deadline never ends, which the suite's watchdog
+/// surfaces. Built without `command()`'s containment, as the test above is: a contained descendant
+/// dies with the child.
+#[skuld::test]
+fn a_heard_stream_a_descendant_holds_is_read_only_until_the_deadline() {
+    let mut cmd = cosca::run([
+        "/bin/sh",
+        "-c",
+        "sleep 2147483647 & echo $! >&3; echo 'request issued' >&2; exit 0",
+    ]);
+    cmd.stdin(cosca::Stdio::null()).unwrap();
+    cmd.fd(3, cosca::Stdio::pipe_out()).unwrap();
+    let mut child = spawned(cmd, Role::AnnouncedRequest(announced));
+
+    let fd3 = child.child.fd_read_end(3.into()).unwrap();
+    let mut line = String::new();
+    io::BufReader::new(fd3).read_line(&mut line).unwrap();
+    let _descendant = KillOnDrop(line.trim().parse().unwrap());
+    let status = child.child.wait().unwrap();
+    assert!(status.success(), "{status:?}");
+
+    let finished = wait_bounded(child, Budget::Immediate.start()).unwrap();
+
+    match finished {
+        Finished::Exited { status, capture } => {
+            assert!(status.success(), "{status:?}");
+            assert!(!capture.complete, "the descendant still holds both pipes: {capture:?}");
+            assert!(announced(&capture.stderr), "{capture:?}");
+        }
+        Finished::Expired => panic!("the child exited on its own: expected Exited, got Expired"),
     }
 }
 
