@@ -125,12 +125,20 @@ class KillTreePosixTests(unittest.TestCase):
             run_with_timeout.kill_tree_posix(SimpleNamespace(pid=ROOT))
         return captured.getvalue()
 
-    def test_a_failing_ps_still_kills_the_root_and_reports_why(self):
+    def test_a_failing_ps_is_a_watchdog_failure_not_an_empty_session(self):
+        # A `ps -A` that failed says nothing about the session. Reading it as
+        # "no members" would return from the teardown with member 101 still
+        # running and report 124 -- the tree was torn down -- over it, so the
+        # watchdog must report its own failure instead: exit 125, as `main`
+        # already does for a `ps` that is missing rather than failing.
         host = FakeHost(_session(101))
         host.ps_failure = "ps: cannot enumerate"
-        stderr = self.kill_tree(host)
-        self.assertIn((ROOT, SIGKILL), host.kills)
-        self.assertIn("ps: cannot enumerate", stderr)
+        captured = io.StringIO()
+        with self.assertRaises(SystemExit) as raised, host.installed(), redirect_stderr(captured):
+            run_with_timeout.kill_tree_posix(SimpleNamespace(pid=ROOT))
+        self.assertEqual(raised.exception.code, 125)
+        self.assertIn((ROOT, SIGKILL), host.kills, "the root is killed before anything is enumerated")
+        self.assertIn("ps: cannot enumerate", captured.getvalue())
 
     def test_kills_the_root_first_then_every_session_member_and_nothing_else(self):
         host = FakeHost(_session(101, 102))

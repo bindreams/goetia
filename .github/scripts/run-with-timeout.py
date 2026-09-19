@@ -6,8 +6,8 @@ bound surfaced to a human -- no test's correctness depends on it.
 
 Exit status (the coreutils `timeout` convention):
     124  the bound fired and the tree was torn down
-    125  the watchdog itself failed (`ps` missing, a kill refused, the bound
-         not a finite number of seconds above zero, ...)
+    125  the watchdog itself failed (`ps` missing or failing, a kill refused,
+         the bound not a finite number of seconds above zero, ...)
     126  the command was found but could not be executed
     127  the command was not found
       1  usage error (too few arguments)
@@ -59,16 +59,17 @@ def _sigkill(pid):
 
 
 def _session_members(sid):
-    """Every pid `ps -A` lists whose session is `sid`. The session is read
-    with `getsid`, because macOS's `pgrep`/`pkill` have no `-s` and its
-    `ps -o sess` prints 0 for every process. A failing `ps` is reported and
-    yields no members."""
+    """Every pid `ps -A` lists whose session is `sid`, or `None` when `ps`
+    itself failed -- which is not an answer about the session at all, and
+    least of all the empty one. The session is read with `getsid`, because
+    macOS's `pgrep`/`pkill` have no `-s` and its `ps -o sess` prints 0 for
+    every process."""
     result = subprocess.run(
         ["ps", "-A", "-o", "pid="], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False
     )
     if result.returncode != 0:
         print(f"run-with-timeout: `ps -A` failed (exit {result.returncode}): {result.stderr.strip()}", file=sys.stderr)
-        return []
+        return None
     members = []
     for pid in map(int, result.stdout.split()):
         try:
@@ -85,6 +86,19 @@ def _session_members(sid):
     return members
 
 
+def _members_or_die(sid):
+    """`_session_members`, with a failed enumeration ending the watchdog.
+    Reading it as no members instead would return from the teardown having
+    killed only the root and report 124 -- "the bound fired and the tree was
+    torn down" -- over every other member of the session still running, still
+    holding the pipes the kill exists to release. `main` already refuses to
+    start without a usable `ps`, exit 125, for exactly this need."""
+    members = _session_members(sid)
+    if members is None:
+        _die("`ps -A` failed, so the session to kill could not be read")
+    return members
+
+
 def kill_tree_posix(proc):
     """SIGKILL every process in the watched command's session, which
     `start_new_session=True` made `proc` the leader of. A session, unlike the
@@ -93,7 +107,7 @@ def kill_tree_posix(proc):
     `setsid()` itself has left it, and is not killed.
 
     The root goes first, directly by pid, so the caller's `proc.wait()` is
-    bounded whatever the enumeration finds or fails to find; the loop skips
+    bounded whatever the enumeration then finds, or cannot read; the loop skips
     it, since that `proc.wait()` is its reap. Each pass signals every member
     `getsid` just named, without checking it first: a pid checked and only
     then killed can be reaped and its number reused in between, and the
@@ -108,10 +122,10 @@ def kill_tree_posix(proc):
     `timeout-minutes` backstops one that never does."""
     _sigkill(proc.pid)
     while True:
-        for pid in _session_members(proc.pid):
+        for pid in _members_or_die(proc.pid):
             if pid != proc.pid:
                 _sigkill(pid)
-        if not any(pid != proc.pid and _is_live(pid) for pid in _session_members(proc.pid)):
+        if not any(pid != proc.pid and _is_live(pid) for pid in _members_or_die(proc.pid)):
             return
 
 
