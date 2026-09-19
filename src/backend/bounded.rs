@@ -48,8 +48,9 @@ pub(crate) fn command(program: &str, args: &[&str]) -> Result<cosca::Command, co
 pub(crate) struct Capture {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
-    /// These bytes are everything the child wrote. `false` means they are a **prefix** no consumer
-    /// may treat as whole: the deadline cut short the reading of a stream read as it was written.
+    /// These bytes are everything the child wrote. `false` means they may be only a **prefix**, which
+    /// no consumer may treat as whole: the deadline ended the reading of a stream read as it was
+    /// written before its end was seen — perhaps with nothing left to read, which is not waited for.
     /// A stream written to a file is whole once the child has exited and its contained tree is
     /// torn down, which is before it is read.
     pub complete: bool,

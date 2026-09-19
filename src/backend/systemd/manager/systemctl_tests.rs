@@ -58,7 +58,7 @@ fn a_truncated_diagnostic_says_it_is_a_prefix() {
     let e = failed("start", "x.service", &capture("", "Unit x.ser", false));
     let msg = e.to_string();
     assert!(msg.contains("Unit x.ser"), "{msg}");
-    assert!(msg.contains("truncated"), "{msg}");
+    assert!(msg.contains("may be only a prefix"), "{msg}");
     assert!(msg.contains("budget expired"), "{msg}");
 }
 

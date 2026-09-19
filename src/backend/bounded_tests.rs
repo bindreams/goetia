@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, ErrorKind, Read};
+use std::io::{self, BufRead, ErrorKind, Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 use std::sync::mpsc;
@@ -151,23 +151,31 @@ impl Drop for KillOnDrop {
 ///
 /// Deterministic, with no timing bet: the test reaps the child itself before the wait, so the wait
 /// finds it exited whatever the deadline, and the deadline is spent before the wait begins, so the
-/// read ends at once. A read that ignored the deadline never ends, which the suite's watchdog
-/// surfaces. Built without `command()`'s containment, as the test above is: a contained descendant
-/// dies with the child.
+/// read ends at once. A spent deadline alone marks the capture not whole
+/// ([`a_heard_stream_is_read_only_until_a_spent_deadline_even_at_its_end`]), so what this test adds
+/// is the descendant: once the read is over, the test asks it, over fd 4, and it answers on fd 3
+/// that its stdout and stderr — the child's, which it inherited — are still pipes. A read that
+/// ignored the deadline never ends here, which the suite's watchdog surfaces. Built without
+/// `command()`'s containment, as the test above is: a contained descendant dies with the child.
 #[skuld::test]
 fn a_heard_stream_a_descendant_holds_is_read_only_until_the_deadline() {
     let mut cmd = cosca::run([
         "/bin/sh",
         "-c",
-        "sleep 2147483647 & echo $! >&3; echo 'request issued' >&2; exit 0",
+        "( read asked <&4; \
+           if [ -p /dev/fd/1 ] && [ -p /dev/fd/2 ]; then echo holds >&3; else echo free >&3; fi; \
+           exec sleep 2147483647 ) & \
+         echo $! >&3; echo 'request issued' >&2; exit 0",
     ]);
     cmd.stdin(cosca::Stdio::null()).unwrap();
     cmd.fd(3, cosca::Stdio::pipe_out()).unwrap();
+    cmd.fd(4, cosca::Stdio::pipe_in()).unwrap();
     let mut child = spawned(cmd, Role::AnnouncedRequest(announced));
 
-    let fd3 = child.child.fd_read_end(3.into()).unwrap();
+    let mut ask = child.child.fd_write_end(4.into()).unwrap();
+    let mut answers = io::BufReader::new(child.child.fd_read_end(3.into()).unwrap());
     let mut line = String::new();
-    io::BufReader::new(fd3).read_line(&mut line).unwrap();
+    answers.read_line(&mut line).unwrap();
     let _descendant = KillOnDrop(line.trim().parse().unwrap());
     let status = child.child.wait().unwrap();
     assert!(status.success(), "{status:?}");
@@ -177,11 +185,41 @@ fn a_heard_stream_a_descendant_holds_is_read_only_until_the_deadline() {
     match finished {
         Finished::Exited { status, capture } => {
             assert!(status.success(), "{status:?}");
-            assert!(!capture.complete, "the descendant still holds both pipes: {capture:?}");
+            assert!(!capture.complete, "the spent deadline ended the read: {capture:?}");
             assert!(announced(&capture.stderr), "{capture:?}");
         }
         Finished::Expired => panic!("the child exited on its own: expected Exited, got Expired"),
     }
+    ask.write_all(b"now\n").unwrap();
+    let mut held = String::new();
+    answers.read_line(&mut held).unwrap();
+    assert_eq!(
+        held.trim(),
+        "holds",
+        "the descendant held both of the child's pipes through the read"
+    );
+}
+
+/// A heard stream is read only until the deadline, even at its end: once the deadline is spent,
+/// what is queued is taken and nothing is waited for — the end of the stream included, since
+/// waiting for it is what a descendant holding the pipe would make last forever. So the bytes are
+/// kept, after what was heard, and not established whole. A read that ignored the deadline would
+/// wait, find the sender gone, and call them whole.
+#[skuld::test]
+fn a_heard_stream_is_read_only_until_a_spent_deadline_even_at_its_end() {
+    let (tx, rx) = crossbeam_channel::unbounded();
+    tx.send(Chunk::Bytes(b" said".to_vec())).unwrap();
+    drop(tx);
+
+    let (bytes, whole) = read(
+        Stream::Heard(rx),
+        b"heard".to_vec(),
+        "stderr",
+        Budget::Immediate.start(),
+    )
+    .unwrap();
+    assert_eq!(bytes, b"heard said");
+    assert!(!whole, "a spent deadline establishes no end");
 }
 
 #[skuld::test]

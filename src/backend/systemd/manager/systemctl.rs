@@ -741,8 +741,8 @@ fn failed(verb: &str, unit: &str, capture: &Capture) -> Error {
         return Error::Other(format!("systemctl {verb} {unit} failed: {diagnostic}"));
     }
     Error::Other(format!(
-        "systemctl {verb} {unit} failed: {diagnostic} (truncated — goetia's budget expired while \
-         reading the diagnostic, so this is a prefix of what systemd wrote)"
+        "systemctl {verb} {unit} failed: {diagnostic} (goetia's budget expired before it read the \
+         diagnostic to its end, so this may be only a prefix of what systemd wrote)"
     ))
 }
 
