@@ -1101,7 +1101,10 @@ fn a_running_systemd_that_cannot_be_asked_is_refused() {
         stderr.contains("cannot tell whether the running systemd is 242+"),
         "{stderr}"
     );
-    assert!(stderr.contains("Connection refused"), "{stderr}");
+    // systemctl's own words, up to where versions and hosts differ: 257 says "Failed to connect to
+    // system scope bus via local transport: Connection refused" here, and the Ubuntu CI runner's
+    // says "Failed to connect to bus: No such file or directory".
+    assert!(stderr.contains("Failed to connect to"), "{stderr}");
     assert!(!unit_path(guard.id()).exists(), "a refused install wrote the unit");
 }
 
