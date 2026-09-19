@@ -26,19 +26,20 @@ that. And every `start` and `stop` runs `systemctl --show-transaction` (242+).
 
 goetia does not manage systemd offline or from a chroot: it works only
 through the running systemd manager of the system it runs on. Where it finds
-`SYSTEMD_OFFLINE` set; a `/` of goetia's own rather than the system's —
-either one other than PID 1's root (a chroot, or a container sharing the
-host's PID namespace), seen in `/proc/1/root` or, where that cannot be read,
-in the mount tables, or one that is no mount at all, which only `chroot(2)`
-leaves and which the mount tables show on their own; `/run/systemd/system`
-missing; or `systemctl` reporting a chroot — a verb that would reach systemd
-exits `1` before it writes or sends anything, with one message naming the
-first of these it found. That last one cannot be turned off from the
-environment: `systemctl` runs with `SYSTEMD_IGNORE_CHROOT` and
-`SYSTEMD_IN_CHROOT` removed, so an inherited one cannot stop it detecting a
-chroot goetia could not see for itself. `install` always reaches it; the
-other verbs only for a daemon of goetia's, and they answer from files alone
-otherwise:
+`SYSTEMD_OFFLINE` set to a true value; a `/` of goetia's own rather than the
+system's — either one other than PID 1's root (a chroot, or a container
+sharing the host's PID namespace), seen in `/proc/1/root` or, where that
+cannot be read, in the mount tables, or one that is no mount at all, which
+only `chroot(2)` leaves and which the mount tables show on their own;
+`/run/systemd/system` missing; or `systemctl` reporting a chroot — a verb
+that would reach systemd exits `1` before it writes or sends anything, with
+one message naming the first of these it found. No inherited variable can
+turn that last one off: every `SYSTEMD_*` variable is removed from the
+`systemctl` goetia runs, and only the three goetia sets itself are given
+back, so nothing in the environment — including a switch a newer systemd
+adds — can stop it detecting a chroot goetia could not see for itself.
+`install` always reaches it; the other verbs only for a daemon of goetia's,
+and they answer from files alone otherwise:
 
 - `uninstall`, `start`, `stop`, `restart`, `enable` and `disable` refuse
   an id goetia finds its own, and answer any other as anywhere else — for

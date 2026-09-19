@@ -76,8 +76,9 @@ impl NoManager {
                 let dir = stand_in(report);
                 let mut cmd = Command::new(goetia);
                 cmd.env("PATH", path_first(dir.path()));
-                // Inherited by goetia, and by every `systemctl` it does not clear them from: either
-                // one turns a real `running_in_chroot()` off, and the stand-in models that.
+                // Inherited by goetia, and by every `systemctl` it does not clear them from: three
+                // of them turn a real chroot detection off and the fourth is a name no systemd
+                // reads, so what the stand-in models is goetia's removal, not systemd's reading.
                 for (switch, value) in SILENCERS {
                     cmd.env(switch, value);
                 }
@@ -127,11 +128,18 @@ impl Drop for RmLink {
 }
 
 /// The environment settings that turn a real `systemctl`'s own chroot detection off, with a value
-/// that does it: `running_in_chroot()` consults `SYSTEMD_IN_CHROOT` first (257 on), then
-/// `SYSTEMD_IGNORE_CHROOT` (every supported version). goetia removes both from every `systemctl` it
-/// runs, so setting them here proves the removal rather than assuming it — without them, the
-/// stand-in below looks away and there is no report for goetia to refuse on.
-const SILENCERS: [(&str, &str); 2] = [("SYSTEMD_IGNORE_CHROOT", "1"), ("SYSTEMD_IN_CHROOT", "0")];
+/// that does it: `running_in_chroot_or_offline()` consults `SYSTEMD_OFFLINE` first (every supported
+/// version, and a *false* value short-circuits the chroot check as surely as a true one short-
+/// circuits everything), then `SYSTEMD_IN_CHROOT` (257 on), then `SYSTEMD_IGNORE_CHROOT`. The
+/// fourth is a switch no systemd has: goetia removes by prefix, not by name, and that is the row
+/// which says so. Setting all four on goetia proves the removal rather than assuming it — without
+/// it, the stand-in below looks away and there is no report for goetia to refuse on.
+const SILENCERS: [(&str, &str); 4] = [
+    ("SYSTEMD_IGNORE_CHROOT", "1"),
+    ("SYSTEMD_IN_CHROOT", "0"),
+    ("SYSTEMD_OFFLINE", "0"),
+    ("SYSTEMD_A_SWITCH_NO_SUPPORTED_VERSION_HAS_YET", "1"),
+];
 
 /// `dir` ahead of the inherited `PATH`.
 fn path_first(dir: &Path) -> std::ffi::OsString {
@@ -141,11 +149,15 @@ fn path_first(dir: &Path) -> std::ffi::OsString {
     std::env::join_paths(path).expect("PATH")
 }
 
-/// What a real `systemctl` checks before it reports a chroot, as shell: [`SILENCERS`] in
-/// `running_in_chroot()`'s own order, each exiting `0` silently, as one that believes it is not in a
-/// chroot and went on to do the work would.
-const HONOURS_THE_SILENCERS: &str = "case \"${SYSTEMD_IN_CHROOT-}\" in 0|no|false|off) exit 0;; esac\n\
-                                     case \"${SYSTEMD_IGNORE_CHROOT-}\" in 1|yes|true|on) exit 0;; esac\n";
+/// What the stand-in checks before it reports a chroot, as shell: that it carries none of
+/// [`SILENCERS`], by exiting `0` silently if any survived — as a real `systemctl` that believed it
+/// was not in a chroot and went on to do the work would. Stricter than a real one, which honours
+/// only the names it knows, and deliberately so: what is under test is goetia removing every
+/// `SYSTEMD_*` from the child, so the fourth name, which no systemd reads, must silence it too.
+const HONOURS_THE_SILENCERS: &str = "case \"${SYSTEMD_OFFLINE-}\" in 0|no|n|false|f|off) exit 0;; esac\n\
+                                     case \"${SYSTEMD_IN_CHROOT-}\" in 0|no|false|off) exit 0;; esac\n\
+                                     case \"${SYSTEMD_IGNORE_CHROOT-}\" in 1|yes|true|on) exit 0;; esac\n\
+                                     [ -n \"${SYSTEMD_A_SWITCH_NO_SUPPORTED_VERSION_HAS_YET-}\" ] && exit 0\n";
 
 /// A stand-in `systemctl` that says `report` on stderr, `$1` the verb, for every verb but
 /// `--version`, and exits `0`, as a real one in a chroot does; `--version` it answers, as a real

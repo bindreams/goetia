@@ -129,8 +129,8 @@ fn every_budget_asks_systemctl_to_announce_the_job() {
 // enqueued ============================================================================================================
 
 /// The line `systemctl --show-transaction` writes once systemd has answered the request with a job
-/// — with and without the prefixes `SYSTEMD_LOG_TIME`/`SYSTEMD_LOG_LOCATION` add, which the
-/// environment goetia sets does not switch off.
+/// — with and without the prefixes `SYSTEMD_LOG_TIME`/`SYSTEMD_LOG_LOCATION` add, which [`DENIED`]
+/// now removes from every child, so this pins tolerance goetia no longer depends on.
 #[skuld::test]
 fn enqueued_recognises_the_anchor_job_line() {
     assert!(enqueued(b"Enqueued anchor job 16157 x.service/start.\n"));
@@ -435,9 +435,11 @@ fn a_failure_whose_stderr_is_only_protocol_is_reported_with_its_stdout() {
     assert_eq!(e.to_string(), "systemctl start x.service failed: something on stdout\n");
 }
 
-/// `SYSTEMD_LOG_TIME`, `SYSTEMD_LOG_LOCATION` and `SYSTEMD_LOG_TID` each prefix every protocol line,
-/// and goetia's environment switches none of them off. The lines below are what `systemctl start
-/// --show-transaction` wrote under each on systemd 257.
+/// `SYSTEMD_LOG_TIME`, `SYSTEMD_LOG_LOCATION` and `SYSTEMD_LOG_TID` each prefix every protocol
+/// line. No `systemctl` goetia runs can be given one — [`DENIED`] removes them with every other
+/// `SYSTEMD_*` — so this pins tolerance goetia does not depend on, which is why [`enqueued`] and
+/// [`is_protocol`] read a substring rather than a whole line. The lines below are what `systemctl
+/// start --show-transaction` wrote under each on systemd 257.
 #[skuld::test]
 fn a_prefixed_transaction_is_still_protocol() {
     for prefix in [
@@ -1201,8 +1203,9 @@ fn this_host_has_a_manager_to_ask() {
     assert_eq!(Host::this().evidence(), None);
 }
 
-/// `SYSTEMD_OFFLINE` is read as `systemctl` reads it, with systemd's `parse_boolean`: only a true
-/// value is evidence, and anything else leaves the manager to be asked.
+/// `SYSTEMD_OFFLINE` is parsed as systemd's `parse_boolean` parses it, but only its true half is
+/// evidence: anything else — a false value, or one that does not parse — leaves the manager to be
+/// asked, and is not passed on to the `systemctl` that asks it ([`DENIED`]).
 #[skuld::test]
 fn systemd_offline_is_evidence_only_when_true() {
     for value in ["1", "yes", "Y", "TRUE", "t", "on"] {
@@ -1228,12 +1231,12 @@ fn systemd_offline_is_evidence_only_when_true() {
 /// newer ones' (measured on 257), 242 to 245's, or those with no verb to name (see [`IGNORED`]). The
 /// gate refuses it, naming the report.
 ///
-/// Three environment settings would stop a real `systemctl` from reporting it, and the stand-in
-/// reports only where none of them is in force: an inaudible `SYSTEMD_LOG_LEVEL`, and either of
-/// [`UNSET`]'s switches *set* rather than removed. That an *inherited* one is removed is the half
-/// no test on this thread can show — putting a variable in this process's environment would race
-/// every other test thread — and is proved end to end against a real `systemctl` by
-/// `tests/systemd_integration/no_manager.rs`.
+/// Three environment settings would stop a real `systemctl` from reporting it. The stand-in asks
+/// something stricter and simpler — that the child carry [`ENVIRONMENT`] and nothing else under
+/// [`DENIED`] — because what is under test is goetia's removal, not systemd's reading. That an
+/// *inherited* name is removed is the half no test on this thread can show — putting a variable in
+/// this process's environment would race every other test thread — and is proved end to end
+/// against a real `systemctl` by `tests/systemd_integration/no_manager.rs`.
 #[skuld::test]
 fn a_chroot_systemctl_reports_is_refused_and_cannot_be_silenced() {
     for notice in [
@@ -1242,15 +1245,23 @@ fn a_chroot_systemctl_reports_is_refused_and_cannot_be_silenced() {
         "Running in chroot, ignoring request.",
     ] {
         let script = format!(
-            "[ \"$1\" = show ] && {{ [ \"$SYSTEMD_LOG_LEVEL\" = info ] && [ -z \"${{SYSTEMD_IGNORE_CHROOT+set}}\" ] \
-             && [ -z \"${{SYSTEMD_IN_CHROOT+set}}\" ] && echo \"{notice}\" >&2; exit 0; }}; \
+            "[ \"$1\" = show ] && {{ {ONLY_GOETIAS_OWN_SWITCHES} && echo \"{notice}\" >&2; exit 0; }}; \
              echo 'systemd 257 (257)'"
         );
         assert_no_manager(supported_by(&script), notice, notice);
     }
 }
 
-/// What [`environment`] gives one child, recorded rather than spawned.
+/// What a `systemctl` goetia ran carries of [`DENIED`], as shell: [`ENVIRONMENT`]'s three names
+/// with [`ENVIRONMENT`]'s values, and nothing else under the prefix. Asked of `env`, so it is the
+/// child's environment as it arrived rather than a list of the switches a real `systemctl` happens
+/// to read — which is the point of removing by prefix.
+const ONLY_GOETIAS_OWN_SWITCHES: &str = "[ \"$(env | grep -c '^SYSTEMD_')\" = 3 ] \
+                                         && [ \"$SYSTEMD_COLORS\" = 0 ] \
+                                         && [ \"$SYSTEMD_LOG_LEVEL\" = info ] \
+                                         && [ \"$SYSTEMD_LOG_TARGET\" = console ]";
+
+/// What [`environment_from`] gives one child, recorded rather than spawned.
 #[derive(Default)]
 struct Recorded {
     given: Vec<(String, String)>,
@@ -1267,15 +1278,38 @@ impl Environment for Recorded {
     }
 }
 
-/// The switches that turn `systemctl`'s own chroot detection off are *removed* from every child's
-/// environment, never set to a value: `SYSTEMD_IN_CHROOT=0` would assert there is no chroot, and
-/// `=1` one everywhere — measured on 257, where `=1` makes `systemctl` ignore every command on a
-/// host that is no chroot. See [`UNSET`].
+/// Every inherited name under [`DENIED`] is *removed* from a child, and a name goetia has never
+/// heard of exactly as the three known to turn `systemctl`'s own chroot detection off: the prefix
+/// is what selects them, not a list this file would have to keep up with. Nothing outside the
+/// prefix is touched, and [`ENVIRONMENT`] is set rather than removed — `SYSTEMD_IN_CHROOT=0` would
+/// assert there is no chroot and `=1` one everywhere, so a value is never asserted for a switch
+/// goetia does not own.
 #[skuld::test]
-fn the_chroot_switches_are_removed_from_every_child_rather_than_set() {
+fn every_inherited_systemd_switch_is_removed_from_a_child_and_nothing_else_is() {
+    let inherited = [
+        "SYSTEMD_IGNORE_CHROOT",
+        "SYSTEMD_IN_CHROOT",
+        "SYSTEMD_OFFLINE",
+        "SYSTEMD_A_SWITCH_NO_SUPPORTED_VERSION_HAS_YET",
+        "SYSTEMD_COLORS",
+        "SYSTEMD_LOG_LEVEL",
+        "SYSTEMD_LOG_TARGET",
+        "PATH",
+        "SYSTEMDNOUNDERSCORE",
+        "NOT_SYSTEMD_EITHER",
+    ];
     let mut recorded = Recorded::default();
-    environment(&mut recorded);
-    assert_eq!(recorded.denied, ["SYSTEMD_IGNORE_CHROOT", "SYSTEMD_IN_CHROOT"]);
+    environment_from(&mut recorded, inherited.iter().map(|key| key.to_string()));
+    assert_eq!(
+        recorded.denied,
+        [
+            "SYSTEMD_IGNORE_CHROOT",
+            "SYSTEMD_IN_CHROOT",
+            "SYSTEMD_OFFLINE",
+            "SYSTEMD_A_SWITCH_NO_SUPPORTED_VERSION_HAS_YET",
+        ]
+    );
+    assert_eq!(recorded.given, ENVIRONMENT.map(|(k, v)| (k.to_string(), v.to_string())));
     for (key, value) in &recorded.given {
         assert!(
             !recorded.denied.contains(key),

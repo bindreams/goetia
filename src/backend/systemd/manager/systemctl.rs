@@ -88,19 +88,32 @@ const ENVIRONMENT: [(&str, &str); 3] = [
     ("SYSTEMD_LOG_TARGET", "console"),
 ];
 
-/// What every `systemctl` goetia runs is denied: the two switches `running_in_chroot()` consults
-/// before it looks at anything, so an inherited one cannot make `systemctl` answer from a manager
-/// that is not this root's — the chroot [`answered`] is the last line against (MEASURED: with
-/// `SYSTEMD_IGNORE_CHROOT=1` inherited, `install` from a chroot with no `/proc` exits `0` and
-/// writes the unit into it).
+/// The prefix every variable systemd reads carries, and which every `systemctl` goetia runs is
+/// denied: an inherited `SYSTEMD_*` is removed from the child whatever it is, and [`ENVIRONMENT`]
+/// alone is then given. Named by prefix rather than one switch at a time because the switches are
+/// systemd's to add, not goetia's to keep up with: `systemctl` and the library it links carry 45
+/// such names on 255 and 90 on 257, and *three* of those turn off, each on its own, the chroot
+/// report [`answered`] is the last line against. Naming them is what missed the next one twice.
+///
+/// The three, MEASURED on 255 and 257 in a chroot with no `/proc`, where goetia establishes nothing
+/// of its own: `SYSTEMD_IGNORE_CHROOT` true; `SYSTEMD_IN_CHROOT` false, on 257 on; and
+/// `SYSTEMD_OFFLINE` false, on every supported version — `running_in_chroot_or_offline()`
+/// (systemd's `src/shared/verbs.c`) consults that one first and returns it whenever it *parses*, so
+/// a false value discards the chroot check as surely as `SYSTEMD_IGNORE_CHROOT=1` does. With any of
+/// the three inherited, `install` from such a chroot exited `0` and wrote the unit into it.
 ///
 /// Removed rather than set, because every value asserts something goetia is in no position to
 /// assert. `SYSTEMD_IN_CHROOT=0` asserts there is no chroot — measured on 257, it silences the
 /// report in one — and `=1` asserts there is one everywhere, which on a 257 host that is no chroot
 /// makes `systemctl` ignore every command. Detecting it is the child's job; goetia only declines to
-/// prejudge it. `SYSTEMD_IGNORE_CHROOT` is read by every supported version, `SYSTEMD_IN_CHROOT`
-/// from 257.
-const UNSET: [&str; 2] = ["SYSTEMD_IGNORE_CHROOT", "SYSTEMD_IN_CHROOT"];
+/// prejudge it.
+///
+/// What removing the rest costs: nothing any real environment carries. MEASURED on 255 and 257 — a
+/// plain shell, a login shell and `sudo` carry no `SYSTEMD_*` at all, and the one systemd itself
+/// puts in a process's environment, `SYSTEMD_EXEC_PID`, changes nothing `systemctl` does. Both of
+/// its streams are captured, never a terminal, so the pager and colour families never engage
+/// either.
+const DENIED: &str = "SYSTEMD_";
 
 /// A child's environment, as each of the two `Command` types goetia spawns a `systemctl` through
 /// offers it: [`environment`] is applied through this, so neither path can be given one and not the
@@ -130,15 +143,25 @@ impl Environment for cosca::Command {
     }
 }
 
-/// `cmd`'s environment as every `systemctl` goetia runs gets it: [`ENVIRONMENT`] set on it, and
-/// [`UNSET`] removed from it.
-fn environment(cmd: &mut impl Environment) {
+/// `cmd`'s environment as every `systemctl` goetia runs gets it: every [`DENIED`] name `inherited`
+/// carries removed from it, and [`ENVIRONMENT`] set on it. The two are kept disjoint here — a name
+/// goetia sets is never also removed — rather than by the order the calls happen to be made in, so
+/// neither `Command`'s own rule for a key both set and removed can decide what the child gets.
+fn environment_from(cmd: &mut impl Environment, inherited: impl Iterator<Item = String>) {
+    let given = |key: &str| ENVIRONMENT.iter().any(|(name, _)| *name == key);
+    for key in inherited.filter(|key| key.starts_with(DENIED) && !given(key)) {
+        cmd.remove(&key);
+    }
     for (key, value) in ENVIRONMENT {
         cmd.set(key, value);
     }
-    for key in UNSET {
-        cmd.remove(key);
-    }
+}
+
+/// [`environment_from`] over the names this process would pass a child of its own. A name that is
+/// not UTF-8 is skipped: `getenv` finds a switch by its exact ASCII name, so a name that does not
+/// decode is not one of them.
+fn environment(cmd: &mut impl Environment) {
+    environment_from(cmd, std::env::vars_os().filter_map(|(key, _)| key.into_string().ok()));
 }
 
 /// `systemctl <args>` for `purpose`, through [`door`], run to completion, and [`answered`].
@@ -235,7 +258,8 @@ pub(super) mod stand_in {
 /// The positive evidence that no systemd manager can be asked here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Evidence {
-    /// `SYSTEMD_OFFLINE` is set true, with this value, so `systemctl` asks no manager.
+    /// `SYSTEMD_OFFLINE` is set true, with this value: systemd is told to ask no manager here, and
+    /// goetia takes the caller at their word rather than spawning one to find out.
     Offline(String),
     /// `/run/systemd/system` does not exist, which systemd makes when it boots a system
     /// (`sd_booted()`): not booted with systemd, or a chroot with no `/run` of the host's.
@@ -302,7 +326,8 @@ enum Chroot {
 /// system in.
 #[derive(Debug, Clone)]
 pub(super) struct Host {
-    /// `SYSTEMD_OFFLINE`, as every `systemctl` goetia runs inherits it.
+    /// `SYSTEMD_OFFLINE`, as goetia itself inherits it. No `systemctl` goetia runs is given it —
+    /// [`DENIED`] takes it away — so this reading is the only one it has.
     offline: Option<String>,
     /// [`SD_BOOTED`] is established absent — see [`established_absent`].
     unbooted: bool,
@@ -350,9 +375,9 @@ fn identity(path: &str) -> std::io::Result<(u64, u64)> {
 /// nothing, and leaves it to the mount `tables` ([`mounts_differ`]); where they establish nothing
 /// either, the other checks and systemctl's own report ([`answered`]) decide.
 ///
-/// Read regardless of `SYSTEMD_IN_CHROOT`: this is goetia's own evidence, and a declaration in the
-/// environment is evidence of nothing. The child is not left to trust it either — [`UNSET`] takes
-/// it away — so neither half of the check can be told to look away.
+/// Read regardless of what the environment declares about a chroot: this is goetia's own evidence,
+/// and a declaration is evidence of nothing. The child is not left to trust one either — [`DENIED`]
+/// takes every such switch away — so neither half of the check can be told to look away.
 fn chroot_from(
     root: std::io::Result<(u64, u64)>,
     init_root: std::io::Result<(u64, u64)>,
@@ -415,8 +440,11 @@ fn established_absent(dir: &std::path::Path) -> bool {
     }
 }
 
-/// A true value as systemd's `parse_boolean` reads one, which is how `systemctl` reads
-/// `SYSTEMD_OFFLINE`.
+/// A true value as systemd's `parse_boolean` reads one. That is the half of `SYSTEMD_OFFLINE`
+/// goetia can read as evidence: systemd is being told to ask no manager, which is what
+/// [`Evidence::Offline`] says. A *false* value is not the opposite evidence — `systemctl` acts on
+/// it, returning it from `running_in_chroot_or_offline()` before the chroot check runs — and
+/// goetia neither believes it nor passes it on ([`DENIED`]).
 fn is_true(value: &str) -> bool {
     value == "1"
         || ["yes", "y", "true", "t", "on"]
@@ -683,7 +711,10 @@ fn verb_args<'a>(verb: &'a str, unit: &'a str, budget: Budget) -> Vec<&'a str> {
 
 /// Whether `systemctl --show-transaction`'s stderr says systemd has answered the request with a
 /// job — the line it writes after `StartUnit`/`StopUnit` returns and before it waits for the job.
-/// A substring, not a whole line: `SYSTEMD_LOG_TIME`/`SYSTEMD_LOG_LOCATION` prefix it.
+/// A substring of the stream, not a whole line: the job number and unit follow it, and were a
+/// prefix ever to precede it the line would still be found. [`DENIED`] removes the switches that
+/// add one — `SYSTEMD_LOG_TIME`, `SYSTEMD_LOG_LOCATION`, `SYSTEMD_LOG_TID` — so no `systemctl`
+/// goetia runs can be given one; tolerating it anyway costs nothing.
 fn enqueued(stderr: &[u8]) -> bool {
     const LINE: &[u8] = b"Enqueued anchor job ";
     stderr.windows(LINE.len()).any(|w| w == LINE)
