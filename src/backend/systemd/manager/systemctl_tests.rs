@@ -664,7 +664,8 @@ fn a_systemctl_that_ignored_the_request_is_refused_on_every_path() {
 }
 
 /// The real `systemctl`, offline, on every path `start` and `stop` take: an exit of `0` that asked
-/// nobody is the refusal, never read as started or stopped.
+/// nobody is the refusal, never read as started or stopped. It says so in 246's words and newer
+/// ones', or 242 to 245's.
 #[skuld::test]
 fn a_real_offline_systemctl_is_refused_on_every_path() {
     for verb in ["start", "stop", "restart"] {
@@ -679,10 +680,17 @@ fn a_real_offline_systemctl_is_refused_on_every_path() {
                 budget,
                 budget.start(),
             );
-            assert_no_manager(
-                result.map(drop),
-                &format!("Running in chroot, ignoring command '{verb}'"),
-                &format!("{verb} {budget:?}"),
+            let e = result.expect_err(verb);
+            assert!(matches!(e, Error::NoManager { .. }), "{verb} {budget:?}: {e:?}");
+            let msg = e.to_string();
+            assert!(
+                [
+                    format!("Running in chroot, ignoring command '{verb}'"),
+                    format!("Running in chroot, ignoring request: {verb}"),
+                ]
+                .iter()
+                .any(|said| msg.contains(&format!("`systemctl` said \"{said}\""))),
+                "{verb} {budget:?}: {msg}"
             );
         }
     }

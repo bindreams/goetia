@@ -19,37 +19,62 @@ use crate::support::{self, ELEVATED, ServiceGuard};
 enum NoManager {
     /// `SYSTEMD_OFFLINE=1`, systemd's own offline switch, which goetia reads itself.
     Offline,
-    /// `SYSTEMD_IN_CHROOT=1`: `systemctl` behaves as in a chroot, and only its own report says so.
-    Chroot,
+    /// A `systemctl` that reports a chroot in these words, and only its report says so: a stand-in
+    /// first on `PATH` ([`stand_in`]). No switch makes the real one report a chroot on every
+    /// supported systemd — 255 ignores `SYSTEMD_IN_CHROOT` and asks the manager.
+    Reported(&'static str),
     /// `/run/systemd/system` hidden under a tmpfs in a private mount namespace: a system systemd
     /// did not boot.
     Unbooted,
 }
 
-const EVERY_WAY: [NoManager; 3] = [NoManager::Offline, NoManager::Chroot, NoManager::Unbooted];
+/// What `systemctl` in a chroot says for a verb, `$1`, it ignored: 246 and newer, 242 to 245, and
+/// every version with no verb to name (systemd's `verbs.c` and `systemctl.c`).
+const REPORTS: [&str; 3] = [
+    "Running in chroot, ignoring command '$1'",
+    "Running in chroot, ignoring request: $1",
+    "Running in chroot, ignoring request.",
+];
+
+const EVERY_WAY: [NoManager; 5] = [
+    NoManager::Offline,
+    NoManager::Reported(REPORTS[0]),
+    NoManager::Reported(REPORTS[1]),
+    NoManager::Reported(REPORTS[2]),
+    NoManager::Unbooted,
+];
 
 impl NoManager {
-    /// What the refusal names as its evidence.
-    fn evidence(self) -> &'static str {
+    /// What the refusal names as its evidence. Every verb that reaches the manager asks it with
+    /// `show` first — a state read, or the version gate before a request — so that is the verb a
+    /// stand-in reports.
+    fn evidence(self) -> String {
         match self {
-            NoManager::Offline => "`SYSTEMD_OFFLINE=1` is set",
-            NoManager::Chroot => "Running in chroot, ignoring command",
-            NoManager::Unbooted => "`/run/systemd/system` does not exist",
+            NoManager::Offline => "`SYSTEMD_OFFLINE=1` is set".to_string(),
+            NoManager::Reported(report) => format!("`systemctl` said \"{}\"", report.replace("$1", "show")),
+            NoManager::Unbooted => "`/run/systemd/system` does not exist".to_string(),
         }
     }
 
     /// `goetia <args>`, elevated as this test is, on a host shown this way.
     fn goetia(self, args: &[&str]) -> Output {
         let goetia = env!("CARGO_BIN_EXE_goetia");
+        // Kept until goetia has exited: the stand-in's directory.
+        let mut _stand_in = None;
         let mut cmd = match self {
             NoManager::Offline => {
                 let mut cmd = Command::new(goetia);
                 cmd.env("SYSTEMD_OFFLINE", "1");
                 cmd
             }
-            NoManager::Chroot => {
+            NoManager::Reported(report) => {
+                let dir = stand_in(report);
+                let path = std::env::var_os("PATH").unwrap_or_default();
+                let mut path = std::env::split_paths(&path).collect::<Vec<_>>();
+                path.insert(0, dir.path().to_path_buf());
                 let mut cmd = Command::new(goetia);
-                cmd.env("SYSTEMD_IN_CHROOT", "1");
+                cmd.env("PATH", std::env::join_paths(path).expect("PATH"));
+                _stand_in = Some(dir);
                 cmd
             }
             NoManager::Unbooted => {
@@ -83,7 +108,7 @@ impl NoManager {
             stderr.contains("no running systemd manager can be asked here"),
             "{context}"
         );
-        assert!(stderr.contains(self.evidence()), "{context}");
+        assert!(stderr.contains(&self.evidence()), "{context}");
         stderr.into_owned()
     }
 }
@@ -96,6 +121,29 @@ impl Drop for RmLink {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
     }
+}
+
+/// A directory holding a stand-in `systemctl` that says `report` on stderr, `$1` the verb, for every
+/// verb but `--version`, and exits `0`, as a real one in a chroot does; `--version` it answers, as
+/// a real one does there. It runs nothing else, so it never reaches the manager. Written by a child
+/// process, so no descriptor open for writing on it can be inherited by a `fork` another test
+/// thread makes, and fail its `exec` with `ETXTBSY`.
+fn stand_in(report: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = format!(
+        "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo 'systemd 255 (255)'; exit 0; }}\necho \"{report}\" >&2\n"
+    );
+    let wrote = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "printf '%s' \"$0\" > \"$1/systemctl\" && chmod 755 \"$1/systemctl\"",
+            &script,
+        ])
+        .arg(dir.path())
+        .status()
+        .expect("spawn sh");
+    assert!(wrote.success(), "writing the stand-in failed: {wrote:?}");
+    dir
 }
 
 /// A unit installed on this host's running systemd.
