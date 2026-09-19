@@ -240,8 +240,10 @@ enum Evidence {
     /// `/run/systemd/system` does not exist, which systemd makes when it boots a system
     /// (`sd_booted()`): not booted with systemd, or a chroot with no `/run` of the host's.
     NotBooted,
-    /// `/` is not PID 1's root, found as this says: a chroot (`running_in_chroot()`), or a
-    /// container sharing the host's PID namespace.
+    /// `/` is established to be a root of goetia's own rather than this system's, found as this
+    /// says: either it is not PID 1's root — a chroot (`running_in_chroot()`), or a container
+    /// sharing the host's PID namespace — or it is no mount at all, which only `chroot(2)` leaves,
+    /// and which PID 1's table has no say in.
     Chroot(Chroot),
     /// `systemctl` said, in this line, that it ignored what it was asked: its chroot report.
     Ignored(String),
@@ -283,7 +285,7 @@ const INIT_ROOT: &str = "/proc/1/root";
 const OWN_MOUNTS: &str = "/proc/self/mountinfo";
 const INIT_MOUNTS: &str = "/proc/1/mountinfo";
 
-/// How goetia established that its `/` is not PID 1's.
+/// How goetia established that its `/` is a root of its own rather than this system's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Chroot {
     /// `/` and [`INIT_ROOT`] are different directories — see [`chroot_from`]. Readable only
@@ -304,7 +306,7 @@ pub(super) struct Host {
     offline: Option<String>,
     /// [`SD_BOOTED`] is established absent — see [`established_absent`].
     unbooted: bool,
-    /// `/` is established not to be PID 1's root, and how.
+    /// `/` is established to be a root of goetia's own rather than this system's, and how.
     chroot: Option<Chroot>,
 }
 
@@ -342,8 +344,8 @@ fn identity(path: &str) -> std::io::Result<(u64, u64)> {
     std::fs::metadata(path).map(|meta| (meta.dev(), meta.ino()))
 }
 
-/// How `/` is established not to be PID 1's root, if it is. `root` and `init_root`, both read,
-/// decide, either way: that is `running_in_chroot()`'s own check. A stat that failed — `EACCES` on
+/// How `/` is established to be a root of goetia's own, if it is. `root` and `init_root`, both
+/// read, decide, either way: that is `running_in_chroot()`'s own check. A stat that failed — `EACCES` on
 /// `/proc/1/root` for a caller that may not trace PID 1, or no `/proc` — establishes nothing, and
 /// leaves it to the mount `tables` ([`mounts_differ`]); where they establish nothing either, the
 /// other checks and systemctl's own report ([`answered`]) decide. Read regardless of
@@ -363,8 +365,9 @@ fn chroot_from(
     }
 }
 
-/// Whether goetia's mount table, `own`, establishes that its `/` is not PID 1's, with PID 1's,
-/// `init`. Readable where `/proc/1/root` is not, and asked only there: an unelevated `systemctl` in
+/// Whether goetia's mount table, `own`, establishes that its `/` is a root of its own, with PID
+/// 1's, `init`, where that is needed. Readable where `/proc/1/root` is not, and asked only there:
+/// an unelevated `systemctl` in
 /// a chroot with `/run` bound in cannot tell it is in one, and asks the host's manager about a unit
 /// it does not have. Two ways:
 ///

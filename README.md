@@ -26,9 +26,11 @@ that. And every `start` and `stop` runs `systemctl --show-transaction` (242+).
 
 goetia does not manage systemd offline or from a chroot: it works only
 through the running systemd manager of the system it runs on. Where it finds
-`SYSTEMD_OFFLINE` set; `/` other than PID 1's root (a chroot, or a container
-sharing the host's PID namespace — seen in `/proc/1/root`, or unelevated in
-the mount tables); `/run/systemd/system` missing; or `systemctl` reporting a
+`SYSTEMD_OFFLINE` set; a `/` of goetia's own rather than the system's —
+either one other than PID 1's root (a chroot, or a container sharing the
+host's PID namespace), or one that is no mount at all, which only `chroot(2)`
+leaves, seen in `/proc/1/root`, or in the mount tables wherever that cannot
+be read; `/run/systemd/system` missing; or `systemctl` reporting a
 chroot — a verb that would reach systemd exits `1` before it writes or sends
 anything, with one message naming the first of these it found. That last one
 cannot be turned off from the environment: `systemctl` runs with
