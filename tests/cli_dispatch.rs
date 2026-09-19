@@ -3682,7 +3682,7 @@ fn where_no_manager_can_be_asked_every_verb_that_reaches_it_is_refused_whole() {
         fake.seed_no_manager();
         fake
     };
-    let refusal = "no running systemd manager can be asked here (seeded)";
+    let refusal = "goetia does not manage systemd here (seeded)";
 
     for args in [
         &["goetia", "daemon", "install", "--file", manifest][..],
@@ -3781,7 +3781,7 @@ fn status_by_id_where_no_manager_can_be_asked_answers_every_other_id() {
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("error: opaque: cannot determine"), "{err}");
     assert!(
-        err.contains("error: frpc: no running systemd manager can be asked here (seeded)"),
+        err.contains("error: frpc: goetia does not manage systemd here (seeded)"),
         "{err}"
     );
 }

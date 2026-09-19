@@ -4,7 +4,7 @@
 //! untouched.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use goetia::backend::systemd::manager::Systemd;
@@ -44,6 +44,9 @@ const EVERY_WAY: [NoManager; 5] = [
     NoManager::Unbooted,
 ];
 
+/// How the refusal starts, before its evidence.
+const REFUSAL: &str = "goetia does not manage systemd here (";
+
 impl NoManager {
     /// What the refusal names as its evidence. Every verb that reaches the manager asks it with
     /// `show` first — a state read, or the version gate before a request — so that is the verb a
@@ -52,7 +55,9 @@ impl NoManager {
         match self {
             NoManager::Offline => "`SYSTEMD_OFFLINE=1` is set".to_string(),
             NoManager::Reported(report) => format!("`systemctl` said \"{}\"", report.replace("$1", "show")),
-            NoManager::Unbooted => "`/run/systemd/system` does not exist".to_string(),
+            NoManager::Unbooted => {
+                "`/run/systemd/system`, which systemd makes when it boots a system, does not exist here".to_string()
+            }
         }
     }
 
@@ -104,11 +109,7 @@ impl NoManager {
         );
         let context = format!("{self:?} {args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
         assert_eq!(output.status.code(), Some(1), "{context}");
-        assert!(
-            stderr.contains("no running systemd manager can be asked here"),
-            "{context}"
-        );
-        assert!(stderr.contains(&self.evidence()), "{context}");
+        assert!(stderr.contains(&format!("{REFUSAL}{}", self.evidence())), "{context}");
         stderr.into_owned()
     }
 }
@@ -273,7 +274,7 @@ fn a_live_state_read_where_no_manager_can_be_asked_is_refused() {
             "{way:?}: {stderr}"
         );
         assert!(
-            stderr.contains(&format!("error: {}: no running systemd manager", guard.id())),
+            stderr.contains(&format!("error: {}: {REFUSAL}", guard.id())),
             "{way:?}: {stderr}"
         );
     }
@@ -321,17 +322,18 @@ fn the_verbs_that_never_reach_the_manager_are_untouched() {
 /// exits. The script copies `manifest` to the chroot's `/tmp/goetia.yaml` and `unit` into its
 /// `/etc/systemd/system` (unless `-`), runs `goetia <args>` there — as `user`, a `chroot
 /// --userspec`, unless `-` — then lists that directory and its `multi-user.target.wants` on
-/// stderr. The root is a tmpfs for `shape` `tmpfs`, and for `dir` the directory itself, no mount.
+/// stderr. The root is a tmpfs for `shape` `tmpfs`, and for `dir` the directory itself, no mount;
+/// for `bare` a tmpfs with no `/run` bound in, as a `debootstrap` chroot has none.
 const IN_A_CHROOT: &str = r#"set -e
 root=$1 goetia=$2 manifest=$3 unit=$4 user=$5 shape=$6; shift 6
-[ "$shape" = tmpfs ] && mount -t tmpfs goetia-chroot "$root"
+[ "$shape" = dir ] || mount -t tmpfs goetia-chroot "$root"
 chmod 755 "$root"
 mkdir -p "$root/usr" "$root/dev" "$root/run" "$root/sys" "$root/proc" "$root/tmp" "$root/etc/systemd/system"
 for dir in bin sbin lib lib64; do ln -s "usr/$dir" "$root/$dir"; done
 mount --bind /usr "$root/usr"
 mount -o remount,bind,ro "$root/usr"
 mount --rbind /dev "$root/dev"
-mount --rbind /run "$root/run"
+[ "$shape" = bare ] || mount --rbind /run "$root/run"
 mount --rbind /sys "$root/sys"
 mount -t proc proc "$root/proc"
 cp /etc/passwd /etc/group /etc/nsswitch.conf "$root/etc/"
@@ -348,6 +350,28 @@ echo "chroot units: $(cd "$root/etc/systemd/system" && ls -A | tr '\n' ' ')" >&2
 echo "chroot links: $(ls -A "$root/etc/systemd/system/multi-user.target.wants" 2>/dev/null | tr '\n' ' ')" >&2
 exit $rc
 "#;
+
+/// [`IN_A_CHROOT`], in a private mount namespace, on a root `root`: `goetia <args>` in a chroot of
+/// `shape`, run as `user`, with `manifest` and `unit` copied in.
+fn in_a_chroot(root: &Path, manifest: &Path, unit: &str, user: &str, shape: &str, args: &[&str]) -> Output {
+    Command::new("unshare")
+        .args([
+            "--mount",
+            "--propagation",
+            "private",
+            "/bin/sh",
+            "-c",
+            IN_A_CHROOT,
+            "goetia-chroot",
+        ])
+        .arg(root)
+        .arg(env!("CARGO_BIN_EXE_goetia"))
+        .arg(manifest)
+        .args([unit, user, shape])
+        .args(args)
+        .output()
+        .expect("spawn unshare")
+}
 
 /// Every verb that reaches the manager, run in a real chroot, is refused up front — naming the
 /// chroot goetia found itself, before any `systemctl` runs, so never through `systemctl`'s own
@@ -391,29 +415,12 @@ fn every_verb_in_a_real_chroot_is_refused_before_anything_runs() {
         (&["daemon", "list"], unit, &copied),
     ] {
         let root = tempfile::tempdir().expect("tempdir");
-        let output = Command::new("unshare")
-            .args([
-                "--mount",
-                "--propagation",
-                "private",
-                "/bin/sh",
-                "-c",
-                IN_A_CHROOT,
-                "goetia-chroot",
-            ])
-            .arg(root.path())
-            .arg(env!("CARGO_BIN_EXE_goetia"))
-            .arg(&manifest)
-            .arg(unit)
-            .args(["-", "tmpfs"])
-            .args(args)
-            .output()
-            .expect("spawn unshare");
+        let output = in_a_chroot(root.path(), &manifest, unit, "-", "tmpfs", args);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let context = format!("{args:?}\nstderr:\n{stderr}");
         assert_eq!(output.status.code(), Some(1), "{context}");
         assert!(
-            stderr.contains("no running systemd manager can be asked here (`/` is not PID 1's root"),
+            stderr.contains(&format!("{REFUSAL}`/` is not PID 1's root")),
             "{context}"
         );
         assert!(!stderr.contains("Running in chroot"), "systemctl ran: {context}");
@@ -445,6 +452,7 @@ fn an_unelevated_state_read_in_a_real_chroot_is_refused_before_anything_runs() {
     let unit = unit_dir.path().join(format!("{}.service", guard.id()));
     fs::copy(unit_path(guard.id()), &unit).expect("copy the unit");
     Systemd::new().uninstall(&daemon).expect("uninstall from the host");
+    let unit = unit.to_str().expect("utf-8 temp path");
 
     for (shape, evidence) in [
         ("tmpfs", "the mount at `/` is none of PID 1's"),
@@ -456,34 +464,53 @@ fn an_unelevated_state_read_in_a_real_chroot_is_refused_before_anything_runs() {
             &["daemon", "list"],
         ] {
             let root = tempfile::tempdir().expect("tempdir");
-            let output = Command::new("unshare")
-                .args([
-                    "--mount",
-                    "--propagation",
-                    "private",
-                    "/bin/sh",
-                    "-c",
-                    IN_A_CHROOT,
-                    "goetia-chroot",
-                ])
-                .arg(root.path())
-                .arg(env!("CARGO_BIN_EXE_goetia"))
-                .arg(&manifest)
-                .arg(&unit)
-                .args(["65534:65534", shape])
-                .args(args)
-                .output()
-                .expect("spawn unshare");
+            let output = in_a_chroot(root.path(), &manifest, unit, "65534:65534", shape, args);
             let (stdout, stderr) = (
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr),
             );
             let context = format!("{shape} {args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
             assert_eq!(output.status.code(), Some(1), "{context}");
-            assert!(stderr.contains(evidence), "{context}");
+            assert!(stderr.contains(&format!("{REFUSAL}{evidence}")), "{context}");
             assert!(stdout.is_empty(), "{context}");
             assert!(!stderr.contains("Running in chroot"), "systemctl ran: {context}");
         }
     }
     assert!(!unit_path(guard.id()).exists(), "the host has no such unit");
+}
+
+/// A chroot with no `/run` bound in, as a `debootstrap` one has none, is refused as the chroot it
+/// is: `/run/systemd/system` is missing there too, but systemd did boot this machine, and the
+/// chroot is the more specific cause. Elevated `/proc/1/root` shows it, and unelevated the mount
+/// tables do.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_chroot_without_run_is_refused_as_a_chroot() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let (_manifest_dir, manifest) = world_readable_manifest(guard.id());
+    installed(&guard);
+    let unit = unit_path(guard.id());
+    let unit = unit.to_str().expect("utf-8 unit path");
+
+    for (user, args, evidence) in [
+        ("-", &["daemon", "status", guard.id()][..], "`/` is not PID 1's root"),
+        ("-", &["daemon", "start", guard.id()], "`/` is not PID 1's root"),
+        (
+            "65534:65534",
+            &["daemon", "status", guard.id()],
+            "the mount at `/` is none of PID 1's",
+        ),
+    ] {
+        let root = tempfile::tempdir().expect("tempdir");
+        let output = in_a_chroot(root.path(), &manifest, unit, user, "bare", args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let context = format!("{user} {args:?}\nstderr:\n{stderr}");
+        assert_eq!(output.status.code(), Some(1), "{context}");
+        assert!(stderr.contains(&format!("{REFUSAL}{evidence}")), "{context}");
+        assert!(!stderr.contains("/run/systemd/system"), "{context}");
+    }
+    assert_eq!(
+        active_state_and_job(guard.id()),
+        ("inactive".to_string(), String::new())
+    );
 }

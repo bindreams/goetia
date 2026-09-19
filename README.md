@@ -24,16 +24,17 @@ user as a failure. An older systemd does not reject the directive: it logs that 
 cannot parse it and runs the unit as `Type=simple`, silently losing exactly
 that. And every `start` and `stop` runs `systemctl --show-transaction` (242+).
 
-goetia does not manage systemd offline or in a chroot. Where no running
-systemd can be asked — `SYSTEMD_OFFLINE` is set, `/run/systemd/system` does not
-exist, `/` is not PID 1's root (a chroot, or a container sharing the host's
-PID namespace — seen in `/proc/1/root`, or unelevated in the mount tables), or
-`systemctl` reports a chroot —
-every verb that reaches systemd exits `1` before it writes or sends anything,
-with one message naming which it found. That is `install`, `uninstall`, `start`, `stop`, `restart`,
-`enable`, `disable`, `status`, `list`, and `show` without `--file`, which reads
-what `list` reads. `install --dry-run`, `diff` and `show --file` never reach
-systemd, and work there as anywhere else.
+goetia does not manage systemd offline or from a chroot: it works only
+through the running systemd manager of the system it runs on. Where it finds
+`SYSTEMD_OFFLINE` set; `/` other than PID 1's root (a chroot, or a container
+sharing the host's PID namespace — seen in `/proc/1/root`, or unelevated in
+the mount tables); `/run/systemd/system` missing; or `systemctl` reporting a
+chroot — every verb that reaches systemd exits `1` before it writes or sends
+anything, with one message naming the first of these it found. That is
+`install`, `uninstall`, `start`, `stop`, `restart`, `enable`, `disable`,
+`status`, `list`, and `show` without `--file`, which reads what `list` reads.
+`install --dry-run`, `diff` and `show --file` never reach systemd, and work
+there as anywhere else.
 
 ## Verifying a download
 
@@ -490,7 +491,7 @@ worse than sending you to `goetia daemon show`.
 | `unreadable`    | 4         | Goetia read enough to know the id is its own, but cannot report on it — a blob it cannot decode, or a live state it could not query. `message` says which.                                                                                                                                                                                                                                      |
 | `undetermined`  | 4         | Goetia could not determine **whether** anything is installed at that id: a read it needed failed. Claims no ownership — that is the whole difference from `unreadable`. `message` names what would not read — a path, or on Windows a registry key or service object — and what would make it readable. Only from `status <id>`; out of `list()` the same fact is the `undetermined` key below. |
 | `invalid-id`    | 1         | A command-line argument was not a valid daemon id. Fix the argument.                                                                                                                                                                                                                                                                                                                            |
-| `unavailable`   | 1         | Obtaining the manager, or listing, failed, so **no** answer was obtained for any daemon — `id` is `null`. Or, under a daemon's `id`, no running manager can be asked about that daemon.                                                                                                                                                                                                         |
+| `unavailable`   | 1         | Obtaining the manager, or listing, failed, so **no** answer was obtained for any daemon — `id` is `null`. Or, under a daemon's `id`, goetia would not ask systemd about that daemon: offline, from a chroot, or where systemd did not boot.                                                                                                                                                     |
 | `unsupported`   | 2         | `--json` was given to a subcommand that does not implement it.                                                                                                                                                                                                                                                                                                                                  |
 | `other`         | 1         | Unreachable today; reserved so an unclassified failure has a home rather than being silently dropped.                                                                                                                                                                                                                                                                                           |
 

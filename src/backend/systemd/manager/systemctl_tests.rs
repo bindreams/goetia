@@ -559,7 +559,7 @@ fn assert_no_manager(result: Result<()>, evidence: &str, path: &str) {
     assert!(matches!(e, Error::NoManager { .. }), "{path}: {e:?}");
     let msg = e.to_string();
     assert!(
-        msg.contains("no running systemd manager can be asked here"),
+        msg.starts_with("goetia does not manage systemd here ("),
         "{path}: {msg}"
     );
     assert!(msg.contains(evidence), "{path}: {msg}");
@@ -585,7 +585,7 @@ fn evidence_known_without_asking_refuses_every_path_before_anything_runs() {
                 unbooted: true,
                 chroot: None,
             },
-            "`/run/systemd/system` does not exist",
+            "`/run/systemd/system`, which systemd makes when it boots a system, does not exist here",
         ),
         (
             Host {
@@ -1113,6 +1113,23 @@ fn only_a_mount_table_without_pid_1s_mount_at_root_is_evidence_of_a_chroot() {
     ] {
         assert_eq!(mounts_differ(table(&[("0:131", "/", "/")]), init), None, "{why}");
     }
+}
+
+/// A chroot is named before a missing `/run/systemd/system`, which a chroot with no `/run` bound in
+/// lacks too: it is the more specific cause. `SYSTEMD_OFFLINE` is named before either.
+#[skuld::test]
+fn a_chroot_is_named_before_a_missing_run_systemd_system() {
+    let unbooted_chroot = Host {
+        offline: None,
+        unbooted: true,
+        chroot: Some(Chroot::NoMount),
+    };
+    assert_eq!(unbooted_chroot.evidence(), Some(Evidence::Chroot(Chroot::NoMount)));
+    let everything = Host {
+        offline: Some("1".to_string()),
+        ..unbooted_chroot
+    };
+    assert_eq!(everything.evidence(), Some(Evidence::Offline("1".to_string())));
 }
 
 /// This host is booted with systemd and not offline: its manager is asked.

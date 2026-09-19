@@ -175,7 +175,8 @@ pub(super) mod stand_in {
 enum Evidence {
     /// `SYSTEMD_OFFLINE` is set true, with this value, so `systemctl` asks no manager.
     Offline(String),
-    /// `/run/systemd/system` does not exist: systemd is not this system's init (`sd_booted()`).
+    /// `/run/systemd/system` does not exist, which systemd makes when it boots a system
+    /// (`sd_booted()`): not booted with systemd, or a chroot with no `/run` of the host's.
     NotBooted,
     /// `/` is not PID 1's root, found as this says: a chroot (`running_in_chroot()`), or a
     /// container sharing the host's PID namespace.
@@ -188,7 +189,10 @@ impl std::fmt::Display for Evidence {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Evidence::Offline(value) => write!(f, "`SYSTEMD_OFFLINE={value}` is set"),
-            Evidence::NotBooted => write!(f, "`{SD_BOOTED}` does not exist, so systemd is not this system's init"),
+            Evidence::NotBooted => write!(
+                f,
+                "`{SD_BOOTED}`, which systemd makes when it boots a system, does not exist here"
+            ),
             Evidence::Chroot(found) => {
                 match found {
                     Chroot::Root => write!(f, "`/` is not PID 1's root (`{INIT_ROOT}`)")?,
@@ -262,14 +266,15 @@ impl Host {
         }
     }
 
-    /// Why no manager can be asked here, from what is known without asking `systemctl`.
+    /// Why no manager can be asked here, from what is known without asking `systemctl`: the most
+    /// specific cause first. A chroot with no `/run` bound in lacks [`SD_BOOTED`] too.
     fn evidence(&self) -> Option<Evidence> {
         if let Some(value) = self.offline.as_deref().filter(|value| is_true(value)) {
             Some(Evidence::Offline(value.to_string()))
-        } else if self.unbooted {
-            Some(Evidence::NotBooted)
+        } else if let Some(found) = self.chroot {
+            Some(Evidence::Chroot(found))
         } else {
-            self.chroot.map(Evidence::Chroot)
+            self.unbooted.then_some(Evidence::NotBooted)
         }
     }
 }

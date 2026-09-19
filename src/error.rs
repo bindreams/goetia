@@ -185,8 +185,8 @@ pub enum Error {
         detail: String,
     },
 
-    /// No service manager can be asked on this host, on positive evidence: systemd's offline mode,
-    /// a chroot, or a system systemd did not boot. `evidence` says which. goetia refuses there
+    /// goetia will ask no service manager here, on positive evidence: systemd's offline mode, a
+    /// chroot, or a system systemd did not boot. `evidence` says which. goetia refuses there
     /// rather than act on unit files alone, or read a `systemctl` that asked nobody as an answer.
     ///
     /// Exit `1`, from every verb that reaches the manager, `status` and `list` included: a refusal,
@@ -194,7 +194,8 @@ pub enum Error {
     /// from `list`. Raised before anything is written or sent, and by any `systemctl` that says it
     /// ignored what it was asked, which did nothing.
     #[error(
-        "no running systemd manager can be asked here ({evidence}), and goetia does not manage systemd offline or in a chroot"
+        "goetia does not manage systemd here ({evidence}): it works only through the running systemd manager of the \
+         system it runs on, never offline or from a chroot"
     )]
     NoManager { evidence: String },
 
