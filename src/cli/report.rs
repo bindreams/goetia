@@ -236,17 +236,19 @@ pub(crate) fn daemon(id: &str, status: &Status) -> DaemonReport {
 /// which is precisely what `list` calls `OursUnreadable`. Routing the
 /// remainder to `unreadable` is what makes the two subcommands agree about
 /// one machine: a unit that decodes but whose live state cannot be queried
-/// reaches `list` as `Installed::OursUnreadable` and `status` as
-/// [`Error::CommandFailed`].
+/// reaches `list` as `Installed::OursUnreadable` and `status` as a failure
+/// of its own — [`Error::CommandFailed`] on launchd, [`Error::Other`] on
+/// systemd.
 ///
-/// The three named arms are still the operation's own vocabulary, not a
+/// Three of the named arms are still the operation's own vocabulary, not a
 /// classification by error variant: `status(&id)` is the one operation that
 /// answers "what is at this id", so its three answers — absent, present and
 /// foreign, unestablished — are exactly what its failures can mean.
 ///
-/// [`Error::NoManager`] is the one failure that says nothing about the id:
-/// no manager could be asked about it, which is `unavailable` under the id,
-/// exit `1` — per id, as every verb given ids answers each one.
+/// The fourth, [`Error::NoManager`], is the one failure that says nothing
+/// about the id: goetia would ask no manager about it, which is
+/// `unavailable` under the id, exit `1` — per id, as every verb given ids
+/// answers each one.
 pub(crate) fn status_error(id: &str, e: &Error) -> ErrorReport {
     let kind = match e {
         Error::NoManager { .. } => Kind::Unavailable,

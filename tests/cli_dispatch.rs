@@ -3672,7 +3672,7 @@ fn json_returns_its_own_code_when_stdout_accepts_the_document() {
 /// by id, as every other verb given ids answers per id. The verbs that never reach the manager are
 /// untouched.
 #[skuld::test]
-fn where_no_manager_can_be_asked_every_verb_that_reaches_it_is_refused_whole() {
+fn where_no_manager_can_be_asked_every_verb_that_reaches_it_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
     let manifest = manifest.to_str().unwrap();

@@ -166,8 +166,9 @@ pub enum Error {
     /// tool carrying it — `systemctl`, `launchctl` — may have started when it
     /// failed, so whatever it sends may already be sent. `request` is the
     /// tool's command line. `reached` is whether goetia knows the request
-    /// reached the manager: systemd says so (`Enqueued anchor job`) before it
-    /// acts, and a request lost after that had reached it.
+    /// reached the manager: systemd says so (`Enqueued anchor job`) once it
+    /// has enqueued the job, which may already be running, and a request lost
+    /// after that had reached it.
     ///
     /// What it does **not** claim, which separates it from its neighbours: not
     /// that nothing was sent, as a plain failure would; not that goetia waited

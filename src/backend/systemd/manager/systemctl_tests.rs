@@ -659,13 +659,14 @@ fn no_request_is_sent_before_the_manager_is_asked() {
 }
 
 /// The backstop: a `systemctl` past the gate that says it ignored what it was asked is refused on
-/// every path, and never read as a success — in systemd 257's wording and the older one, on either
+/// every path, and never read as a success — in every wording [`IGNORED`] lists, on either
 /// stream. The stand-in says so only when its log level is audible, as a real one under an
 /// inherited `SYSTEMD_LOG_LEVEL=warning` would not, so every path must also make it audible.
 #[skuld::test]
 fn a_systemctl_that_ignored_the_request_is_refused_on_every_path() {
     for (report, stream) in [
         ("Running in chroot, ignoring command '$1'", ">&2"),
+        ("Running in chroot, ignoring request: $1", ">&2"),
         ("Running in chroot, ignoring request.", ">&2"),
         ("Running in chroot, ignoring request.", ""),
     ] {
@@ -1187,15 +1188,16 @@ fn systemd_offline_is_evidence_only_when_true() {
     }
 }
 
-/// The chroot `systemctl` itself detects — `/proc/1/root` against `/`, or `SYSTEMD_IN_CHROOT` — as
-/// it reports it: `show` exits `0`, prints nothing, and says why on stderr (measured on systemd
-/// 257; older ones say "ignoring request."). The gate refuses it, naming the report. The stand-in
-/// says so only when its log level is audible, as a real one under an inherited
-/// `SYSTEMD_LOG_LEVEL=warning` would not.
+/// The chroot `systemctl` itself detects — `/proc/1/root` against `/`, or on 257 `SYSTEMD_IN_CHROOT`
+/// — as it reports it: `show` exits `0`, prints nothing, and says why on stderr, in 246's words and
+/// newer ones' (measured on 257), 242 to 245's, or those with no verb to name (see [`IGNORED`]). The
+/// gate refuses it, naming the report. The stand-in says so only when its log level is audible, as
+/// a real one under an inherited `SYSTEMD_LOG_LEVEL=warning` would not.
 #[skuld::test]
 fn a_chroot_systemctl_reports_is_refused_and_cannot_be_silenced() {
     for notice in [
         "Running in chroot, ignoring command 'show'",
+        "Running in chroot, ignoring request: show",
         "Running in chroot, ignoring request.",
     ] {
         let script = format!(

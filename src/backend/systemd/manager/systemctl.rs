@@ -43,7 +43,9 @@ fn door(purpose: Purpose) -> Result<()> {
 }
 
 /// What `systemctl` says when it asked no manager and did nothing, exiting `0`: "Running in chroot,
-/// ignoring command 'start'" on systemd 257, and "… ignoring request." on older ones.
+/// ignoring command 'start'" from systemd 246 on, "… ignoring request: start" on 242 to 245, and
+/// "… ignoring request." with no verb to name, on every version (systemd's `verbs.c` and
+/// `systemctl.c`; 257's binary has both).
 const IGNORED: [&str; 2] = ["ignoring command", "ignoring request"];
 
 /// Every `systemctl` answer, checked before anything reads it as one: an answer saying it ignored
