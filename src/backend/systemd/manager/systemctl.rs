@@ -89,9 +89,9 @@ const ENVIRONMENT: [(&str, &str); 3] = [
     ("SYSTEMD_LOG_TARGET", "console"),
 ];
 
-/// The prefix every variable systemd reads carries, and which every `systemctl` goetia runs is
-/// denied: an inherited `SYSTEMD_*` is removed from the child whatever it is, and [`ENVIRONMENT`]
-/// alone is then given. Named by prefix rather than one switch at a time because the switches are
+/// The prefix systemd's own switches carry, and which every `systemctl` goetia runs is denied: an
+/// inherited `SYSTEMD_*` is removed from the child whatever it is, and [`ENVIRONMENT`] alone is
+/// then given. Named by prefix rather than one switch at a time because the switches are
 /// systemd's to add, not goetia's to keep up with: `systemctl` and the library it links carry 45
 /// such names on 255 and 90 on 257, and *three* of those turn off, each on its own, the chroot
 /// report [`answered`] is the last line against. Naming them is what missed the next one twice.
@@ -112,8 +112,13 @@ const ENVIRONMENT: [(&str, &str); 3] = [
 /// What removing the rest costs: nothing any real environment carries. MEASURED on 255 and 257 — a
 /// plain shell, a login shell and `sudo` carry no `SYSTEMD_*` at all, and the one systemd itself
 /// puts in a process's environment, `SYSTEMD_EXEC_PID`, changes nothing `systemctl` does. Both of
-/// its streams are captured, never a terminal, so the pager and colour families never engage
-/// either.
+/// its streams are captured, never a terminal, so `SYSTEMD_PAGER`, `SYSTEMD_LESS` and
+/// `SYSTEMD_PAGERSECURE` changed nothing either.
+///
+/// What it does *not* reach is a variable without the prefix that `systemctl` also reads. MEASURED
+/// on 255 and 257, each with the report in force: `PAGER=cat`, `LESS=X`, `TERM=xterm-256color`,
+/// `LC_ALL=de_DE.UTF-8` and `LANG=ja_JP.UTF-8` all leave it word for word in English, which is what
+/// [`IGNORED`] matches on.
 const DENIED: &str = "SYSTEMD_";
 
 /// A child's environment, as each of the two `Command` types goetia spawns a `systemctl` through

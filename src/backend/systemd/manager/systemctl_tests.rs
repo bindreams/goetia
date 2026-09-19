@@ -130,7 +130,7 @@ fn every_budget_asks_systemctl_to_announce_the_job() {
 
 /// The line `systemctl --show-transaction` writes once systemd has answered the request with a job
 /// — with and without the prefixes `SYSTEMD_LOG_TIME`/`SYSTEMD_LOG_LOCATION` add, which [`DENIED`]
-/// now removes from every child, so this pins tolerance goetia no longer depends on.
+/// keeps off every child: tolerance goetia does not depend on, pinned anyway.
 #[skuld::test]
 fn enqueued_recognises_the_anchor_job_line() {
     assert!(enqueued(b"Enqueued anchor job 16157 x.service/start.\n"));
