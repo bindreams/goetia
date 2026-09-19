@@ -429,6 +429,10 @@ fn percent_is_doubled_in_every_value() {
 
     let text = unit(&spec, &id);
 
+    // One line the doubling must have reached, asserted outright: the loop
+    // below checks only what `unit` emitted, so text it stopped emitting
+    // would leave this test passing with nothing checked.
+    assert!(text.contains("Description=100%% Uptime"), "{text}");
     for line in text.lines() {
         // `Spec=`'s base64 alphabet never contains `%`, so it needs no
         // doubling and is exempt from this check.

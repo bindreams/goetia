@@ -169,10 +169,11 @@ fn zero_millis_means_expired() {
     ] {
         // Read `remaining_millis_capped()` first: the implication is
         // deterministic in this order because a deadline only ever moves
-        // toward expiry, not away from it.
-        if deadline.remaining_millis_capped() == Some(0) {
-            assert!(deadline.expired());
-        }
+        // toward expiry, not away from it. The zero is asserted, not made a
+        // guard: a remainder that stopped saturating to exactly `ZERO` would
+        // otherwise leave this test passing with nothing checked.
+        assert_eq!(deadline.remaining_millis_capped(), Some(0));
+        assert!(deadline.expired());
     }
 }
 
