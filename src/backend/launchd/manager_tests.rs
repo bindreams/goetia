@@ -727,3 +727,194 @@ fn a_launchctl_request_that_may_have_run_is_in_doubt() {
     let e = launchctl(&args, deadline, request()).err().expect("injected");
     assert!(matches!(e, Error::CommandFailed { .. }), "{e:?}");
 }
+
+// Every verb path stays inside its reservation ========================================================================
+
+#[skuld::label]
+const ELEVATED: skuld::Label;
+
+fn elevated() -> std::result::Result<(), String> {
+    if unsafe { libc::geteuid() } == 0 {
+        Ok(())
+    } else {
+        Err("writes a plist under /Library/Application Support/Goetia; re-run under sudo".to_string())
+    }
+}
+
+/// What the stand-in answers one `launchctl` call with: a shell snippet.
+const NOT_LOADED: &str = "exit 113";
+const DONE: &str = "exit 0";
+const REFUSED: &str = "echo 'Bootstrap failed: 5: Input/output error' >&2; exit 5";
+const RUNNING: &str = "printf '\\tstate = running\\n\\tpid = 4242\\n'";
+const NOT_RUNNING: &str = "printf '\\tstate = not running\\n'";
+const PID: &str = "echo 4242";
+
+/// `start`'s longest path, every one of its [`START_CALLS`] `launchctl` calls: not loaded; a
+/// `bootstrap` refused, by a concurrent start that loaded it meanwhile; a `kickstart -p` that names
+/// no pid, so a bounded read decides; and then, `restart: always` reading not running, the
+/// corrective `bootout`, `bootstrap` and `kickstart`, and the read that confirms it.
+const START_LONGEST: [(&str, &str); START_CALLS] = [
+    ("print", NOT_LOADED),
+    ("bootstrap", REFUSED),
+    ("print", DONE),
+    ("print", NOT_RUNNING),
+    ("kickstart", DONE),
+    ("print", RUNNING),
+    ("print", NOT_RUNNING),
+    ("bootout", DONE),
+    ("bootstrap", DONE),
+    ("print", NOT_RUNNING),
+    ("kickstart", PID),
+    ("print", RUNNING),
+];
+
+/// `request_start_after_stop`'s longest path: `start` under a budget that does not wait, which
+/// neither reads the pid nor takes the corrective cycle.
+const START_NOT_WAITING: [(&str, &str); 5] = [
+    ("print", NOT_LOADED),
+    ("bootstrap", REFUSED),
+    ("print", DONE),
+    ("print", NOT_RUNNING),
+    ("kickstart", DONE),
+];
+
+/// `install`'s longest path, [`INSTALL_CALLS`] calls: its read, and the `bootout` of the job it
+/// finds loaded.
+const INSTALL_LONGEST: [(&str, &str); INSTALL_CALLS] = [("print", DONE), ("bootout", DONE)];
+
+/// `stop`'s and `uninstall`'s one call.
+const BOOTOUT: [(&str, &str); STOP_CALLS] = [("bootout", DONE)];
+
+/// A stand-in `launchctl` for this thread that answers the calls it gets, in order, from
+/// `expected`, logs each call's arguments, and fails any call past the last.
+struct Scripted {
+    dir: tempfile::TempDir,
+    expected: Vec<&'static str>,
+    _stand_in: launchctl_stand_in::Guard,
+}
+
+impl Scripted {
+    fn new(expected: &[(&'static str, &str)]) -> Scripted {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("n"), "0").unwrap();
+        let arms: String = expected
+            .iter()
+            .enumerate()
+            .map(|(i, (_, answer))| format!("{}) {answer};; ", i + 1))
+            .collect();
+        let script = format!(
+            "d='{}'; n=$(( $(cat \"$d/n\") + 1 )); echo \"$n\" > \"$d/n\"; echo \"$*\" >> \"$d/log\"; \
+             case \"$n\" in {arms}*) echo \"unscripted launchctl call $n: $*\" >&2; exit 99;; esac",
+            dir.path().display()
+        );
+        Scripted {
+            expected: expected.iter().map(|(verb, _)| *verb).collect(),
+            _stand_in: launchctl_stand_in::set(script),
+            dir,
+        }
+    }
+
+    /// Every call was made, in the order scripted — the path was driven end to end.
+    fn assert_driven(&self, what: &str) {
+        let log = std::fs::read_to_string(self.dir.path().join("log")).unwrap_or_default();
+        let made: Vec<&str> = log
+            .lines()
+            .map(|line| line.split_whitespace().next().unwrap_or_default())
+            .collect();
+        assert_eq!(made, self.expected, "{what}: the calls made");
+    }
+}
+
+/// Every stand-in call list, concatenated: one script for a prepared sequence.
+fn then(steps: &[&[(&'static str, &'static str)]]) -> Vec<(&'static str, &'static str)> {
+    steps.iter().flat_map(|step| step.iter().copied()).collect()
+}
+
+/// Removes the plists a test's install wrote, if a failure left them.
+struct Plists(String);
+
+impl Drop for Plists {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(staging_path(&self.0));
+        let _ = std::fs::remove_file(enabled_path(&self.0));
+    }
+}
+
+/// Every launchd verb, down its longest path, makes no thread and no temp file outside the
+/// reservation it made at entry — or that `prepare` made for its sequence: one made on the spot
+/// while a reservation is live fails a debug assertion, so a count one short fails here. Under
+/// `prepare`, what the sequence reserved is spent exactly, so a count one over fails too. A
+/// stand-in `launchctl` answers every call, so the longest paths — `start`'s corrective cycle
+/// among them — are driven deterministically, and no job is ever loaded.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn every_launchd_verb_path_stays_inside_its_reservation() {
+    let mgr = LaunchdManager::new();
+    let name = format!("goetia-reservation-{:x}", std::process::id());
+    let _plists = Plists(name.clone());
+    let id = Id::try_from(name.as_str()).unwrap();
+    let mut spec = DaemonSpec {
+        id: id.clone(),
+        name: name.clone(),
+        command: vec!["/bin/sleep".to_string(), "300".to_string()],
+        cwd: None,
+        env: Default::default(),
+        user: User::Root,
+        restart: Restart::Always,
+        restart_delay: None,
+        logs: None,
+        kind: Kind::Simple,
+    };
+    let exhausted = || {
+        assert_eq!(
+            bounded::test_hook::pooled(),
+            bounded::Needs::default(),
+            "the sequence reserved more than its steps spent"
+        );
+    };
+
+    // Each verb alone, under its own reservation.
+    let script = Scripted::new(&INSTALL_LONGEST);
+    assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
+    script.assert_driven("install, created over a loaded job");
+
+    let script = Scripted::new(&START_LONGEST);
+    mgr.start(&id, Budget::DEFAULT).expect("start");
+    script.assert_driven("start, longest path");
+
+    let script = Scripted::new(&START_NOT_WAITING);
+    mgr.request_start_after_stop(&id).expect("request_start_after_stop");
+    script.assert_driven("request_start_after_stop, longest path");
+
+    let script = Scripted::new(&BOOTOUT);
+    mgr.stop(&id, Budget::DEFAULT).expect("stop");
+    script.assert_driven("stop");
+
+    spec.command.push("updated".to_string());
+    let script = Scripted::new(&INSTALL_LONGEST);
+    assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Update { .. })));
+    script.assert_driven("install, updating a loaded job");
+
+    // `restart`: the stop and the start under one reservation, spent exactly.
+    let script = Scripted::new(&then(&[&BOOTOUT, &START_LONGEST]));
+    let prepared = mgr.prepare(&[Step::Stop, Step::Start], Budget::DEFAULT).unwrap();
+    mgr.stop(&id, Budget::DEFAULT).expect("restart's stop");
+    mgr.start(&id, Budget::DEFAULT).expect("restart's start");
+    exhausted();
+    drop(prepared);
+    script.assert_driven("restart");
+
+    // `install --start`: the install and the start under one reservation, spent exactly.
+    spec.command.push("again".to_string());
+    let script = Scripted::new(&then(&[&INSTALL_LONGEST, &START_LONGEST]));
+    let prepared = mgr.prepare(&[Step::Install, Step::Start], Budget::DEFAULT).unwrap();
+    assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Update { .. })));
+    mgr.start(&id, Budget::DEFAULT).expect("install --start's start");
+    exhausted();
+    drop(prepared);
+    script.assert_driven("install --start");
+
+    let script = Scripted::new(&BOOTOUT);
+    mgr.uninstall(&id).expect("uninstall");
+    script.assert_driven("uninstall");
+    assert!(!staging_path(&name).exists(), "uninstall left the plist");
+}

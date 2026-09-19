@@ -445,22 +445,24 @@ fn a_drop_in_name_that_is_not_a_directory_still_names_its_id() {
 #[skuld::test]
 fn prepared_steps_need_nothing_made_later() {
     let mgr = Systemd::new();
-    let watched = |steps: &[Step]| {
+    for (steps, watched) in [(&[Step::Stop, Step::Start][..], 2), (&[Step::Install, Step::Start], 1)] {
         let _prepared = mgr.prepare(steps, Budget::DEFAULT).expect("prepare");
         let _no_thread = bounded::test_hook::threads(0);
         let _no_file = bounded::test_hook::temp_files(0);
-        (0..steps.len())
-            .filter(|_| {
-                bounded::spawn(
-                    &mut bounded::command("/bin/true", &[]).unwrap(),
-                    bounded::Role::AnnouncedRequest(|_| true),
-                )
-                .is_ok_and(|spawned| bounded::wait_bounded(spawned, Budget::Unbounded.start()).is_ok())
-            })
-            .count()
-    };
-    assert_eq!(watched(&[Step::Stop, Step::Start]), 2);
-    assert_eq!(watched(&[Step::Install, Step::Start]), 1, "`install` watches nothing");
+        for _ in 0..watched {
+            let spawned = bounded::spawn(
+                &mut bounded::command("/bin/true", &[]).unwrap(),
+                bounded::Role::AnnouncedRequest(|_| true),
+            )
+            .expect("its threads were prepared");
+            bounded::wait_bounded(spawned, Budget::Unbounded.start()).expect("wait");
+        }
+        assert_eq!(
+            bounded::test_hook::pooled(),
+            bounded::Needs::default(),
+            "{steps:?}: prepared more than its steps watch"
+        );
+    }
 
     type Allowance = fn() -> bounded::test_hook::Allowance;
     let shortfalls: [Allowance; 3] = [

@@ -148,6 +148,20 @@ thread_local! {
     static SPARES: RefCell<Pool> = RefCell::default();
     /// The number the next [`Spares`] guard on this thread tags what it makes with.
     static NEXT_GUARD: Cell<u64> = const { Cell::new(0) };
+    /// How many [`Spares`] guards are live on this thread.
+    static RESERVATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Called wherever something is made on the spot rather than taken from this thread's [`Spares`]:
+/// while a reservation is live, everything its verbs need was to have been made in it, so making
+/// one here means a verb needed more than was counted for it — a request could then fail halfway
+/// through a sequence for want of it. Loud in every debug build, the test suites' included, so an
+/// undercount fails them.
+fn made_on_the_spot(what: &str) {
+    debug_assert!(
+        RESERVATIONS.get() == 0,
+        "a {what} was made outside the reservation live on this thread: a verb needed more than was counted for it"
+    );
 }
 
 /// Make `needs` ready now, all or none, for the verbs this thread runs while the returned guard lives
@@ -161,6 +175,7 @@ pub(crate) fn spare(needs: Needs) -> io::Result<Spares> {
     let files = made(needs.files, make_file)?;
     let tag = NEXT_GUARD.get();
     NEXT_GUARD.set(tag + 1);
+    RESERVATIONS.set(RESERVATIONS.get() + 1);
     SPARES.with_borrow_mut(|pool| {
         pool.reapers.extend(reapers.into_iter().map(|r| (tag, r)));
         pool.listeners.extend(listeners.into_iter().map(|l| (tag, l)));
@@ -181,6 +196,9 @@ pub(crate) fn top_up(needs: Needs) -> io::Result<Spares> {
         listeners: needs.listeners.saturating_sub(pool.listeners.len()),
         files: needs.files.saturating_sub(pool.files.len()),
     });
+    if short != Needs::default() {
+        made_on_the_spot("spare");
+    }
     spare(short)
 }
 
@@ -197,6 +215,7 @@ pub(crate) struct Spares {
 
 impl Drop for Spares {
     fn drop(&mut self) {
+        RESERVATIONS.set(RESERVATIONS.get() - 1);
         SPARES.with_borrow_mut(|pool| {
             pool.reapers.retain(|(tag, _)| *tag != self.tag);
             pool.listeners.retain(|(tag, _)| *tag != self.tag);
@@ -218,6 +237,7 @@ pub(crate) fn reapers<const N: usize>() -> io::Result<[Reaper; N]> {
         pool.reapers.split_off(keep).into_iter().map(|(_, r)| r).collect()
     });
     while got.len() < N {
+        made_on_the_spot("reaper");
         got.push(Reaper::new()?);
     }
     Ok(got.try_into().expect("exactly N reapers were gathered"))
@@ -227,7 +247,10 @@ pub(crate) fn reapers<const N: usize>() -> io::Result<[Reaper; N]> {
 pub(super) fn listener() -> io::Result<Listener> {
     match SPARES.with_borrow_mut(|pool| pool.listeners.pop()) {
         Some((_, listener)) => Ok(listener),
-        None => Listener::new(),
+        None => {
+            made_on_the_spot("listener");
+            Listener::new()
+        }
     }
 }
 
@@ -235,7 +258,10 @@ pub(super) fn listener() -> io::Result<Listener> {
 pub(super) fn file() -> io::Result<File> {
     match SPARES.with_borrow_mut(|pool| pool.files.pop()) {
         Some((_, file)) => Ok(file),
-        None => make_file(),
+        None => {
+            made_on_the_spot("temp file");
+            make_file()
+        }
     }
 }
 
@@ -284,6 +310,15 @@ pub(crate) mod test_hook {
     /// would.
     pub(crate) fn spawn_fails(error: fn() -> cosca::error::Error) {
         SPAWN_FAILS.set(Some(error));
+    }
+
+    /// What this thread's pool holds now.
+    pub(crate) fn pooled() -> super::Needs {
+        super::SPARES.with_borrow(|pool| super::Needs {
+            reapers: pool.reapers.len(),
+            listeners: pool.listeners.len(),
+            files: pool.files.len(),
+        })
     }
 
     /// How many children this thread has spawned through [`super::super::spawn`], or tried to.

@@ -784,7 +784,10 @@ fn launchctl(args: &[&str], deadline: Deadline, role: Role) -> Result<Option<Ran
             failed(e)
         }
     };
+    #[cfg(not(test))]
     let mut cmd = bounded::command("launchctl", args).map_err(failed)?;
+    #[cfg(test)]
+    let mut cmd = launchctl_stand_in::command(args).map_err(failed)?;
     let spawned = bounded::spawn(&mut cmd, role).map_err(|e| match e {
         bounded::SpawnError::NotRun(e) => failed(e),
         bounded::SpawnError::MayHaveRun(e) => in_doubt(e),
@@ -793,6 +796,48 @@ fn launchctl(args: &[&str], deadline: Deadline, role: Role) -> Result<Option<Ran
         bounded::Finished::Exited { status, capture } => Some(Ran { status, capture }),
         bounded::Finished::Expired => None,
     })
+}
+
+/// A stand-in for `launchctl` on this thread: a shell script run as `sh -c <script> launchctl
+/// <args>`, so that a test can drive every verb down every path without a real launchd. Never a
+/// file on disk — `exec`ing one just written races every `fork` another test thread makes.
+#[cfg(test)]
+pub(super) mod launchctl_stand_in {
+    use std::cell::RefCell;
+
+    use crate::backend::bounded;
+
+    thread_local! {
+        static SCRIPT: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    /// Run `script` in place of `launchctl` on this thread until the returned guard drops.
+    pub(in crate::backend::launchd) fn set(script: String) -> Guard {
+        SCRIPT.set(Some(script));
+        Guard(())
+    }
+
+    /// See [`set`].
+    pub(in crate::backend::launchd) struct Guard(());
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            SCRIPT.set(None);
+        }
+    }
+
+    pub(super) fn command(args: &[&str]) -> Result<cosca::Command, cosca::error::Error> {
+        match SCRIPT.with_borrow(Clone::clone) {
+            Some(script) => {
+                let argv: Vec<&str> = ["-c", script.as_str(), "launchctl"]
+                    .into_iter()
+                    .chain(args.iter().copied())
+                    .collect();
+                bounded::command("/bin/sh", &argv)
+            }
+            None => bounded::command("launchctl", args),
+        }
+    }
 }
 
 /// The failure for a `launchctl` call that ran and exited non-zero.

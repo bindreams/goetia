@@ -518,8 +518,40 @@ fn a_child_takes_its_output_from_the_spares() {
         );
         assert!(matches!(finished, Ok(Finished::Exited { .. })), "{finished:?}");
     }
-    assert!(spawn(&mut sh("true"), Role::Query).is_err(), "the spares are spent");
+    assert_eq!(test_hook::pooled(), Needs::default(), "the spares are spent");
     drop(spares);
+}
+
+fn files(n: usize) -> Needs {
+    Needs {
+        files: n,
+        ..Needs::default()
+    }
+}
+
+/// Whether `f` panics — the debug assertion every build of the test suites carries.
+fn panics(f: impl FnOnce()) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err()
+}
+
+/// While a reservation is live on this thread, everything its verbs need was to have been made in
+/// it: a thread or file made on the spot instead means one needed more than was counted, and fails
+/// loudly — every way one is made. With none live, making on the spot is how a lone verb gets what
+/// it needs.
+#[skuld::test]
+fn making_on_the_spot_inside_a_reservation_is_loud() {
+    let spent = || spare(Needs::default()).unwrap();
+    assert!(panics(|| drop((spent(), spares::file()))), "a temp file");
+    assert!(panics(|| drop((spent(), spares::listener()))), "a listener");
+    assert!(panics(|| drop((spent(), reapers::<1>()))), "a reaper");
+    assert!(
+        panics(|| drop((spent(), top_up(files(1))))),
+        "a top-up that falls short"
+    );
+
+    drop(spares::file().expect("no reservation is live"));
+    drop(reapers::<1>().expect("no reservation is live"));
+    drop(top_up(files(1)).expect("no reservation is live"));
 }
 
 // Spares ==============================================================================================================
@@ -552,7 +584,7 @@ fn spares_are_taken_before_any_reaper_is_made() {
 
     assert!(reapers::<1>().is_ok(), "the stop's reaper is a spare");
     assert!(reapers::<2>().is_ok(), "the start's reapers are spares");
-    assert!(reapers::<1>().is_err(), "the spares are spent, and nothing may be made");
+    assert_eq!(test_hook::pooled(), Needs::default(), "the spares are spent");
     drop(spares);
 }
 
@@ -569,35 +601,26 @@ fn a_spare_that_cannot_be_made_whole_spares_nothing() {
         .expect_err("no file may be made");
         assert!(e.to_string().contains("no temp file may be made"), "{e}");
     }
-    let _none = test_hook::threads(0);
-    assert!(reapers::<1>().is_err(), "the reaper made before the failure was pooled");
+    assert_eq!(
+        test_hook::pooled(),
+        Needs::default(),
+        "the reaper made before the failure was pooled"
+    );
 }
 
-/// Topping up makes only what the pool lacks: a verb inside a prepared sequence makes nothing.
+/// Topping up makes only what the pool lacks: a verb inside a prepared sequence makes nothing, and
+/// a lone verb makes all it needs.
 #[skuld::test]
 fn a_top_up_makes_only_what_the_pool_lacks() {
-    let prepared = spare(Needs {
-        files: 4,
-        ..Needs::default()
-    })
-    .unwrap();
-    {
-        let _no_file = test_hook::temp_files(0);
-        drop(
-            top_up(Needs {
-                files: 4,
-                ..Needs::default()
-            })
-            .expect("the pool holds four"),
-        );
-    }
-    let _one_file = test_hook::temp_files(1);
-    let topped = top_up(Needs {
-        files: 5,
-        ..Needs::default()
-    })
-    .expect("one short, and one may be made");
-    drop((topped, prepared));
+    let prepared = spare(files(4)).unwrap();
+    let _no_file = test_hook::temp_files(0);
+    drop(top_up(files(4)).expect("the pool holds four"));
+    drop(prepared);
+
+    let _four = test_hook::temp_files(4);
+    let lone = top_up(files(4)).expect("four may be made");
+    assert_eq!(test_hook::pooled(), files(4));
+    drop(lone);
 }
 
 /// Dropping the guard drops what it left: nothing lingers for a later, unrelated verb.
@@ -617,11 +640,11 @@ fn an_inner_guard_releases_only_its_own_spares() {
     drop(spare(reapers_only(1)).unwrap());
     let _none = test_hook::threads(0);
 
-    assert!(
-        reapers::<2>().is_ok(),
-        "the outer guard's spares were released with the inner's"
+    assert_eq!(
+        test_hook::pooled(),
+        reapers_only(2),
+        "only the inner guard's spare goes with it"
     );
-    assert!(reapers::<1>().is_err(), "the inner guard's spare outlived it");
     drop(outer);
 }
 
@@ -633,11 +656,11 @@ fn an_outer_guard_dropped_first_leaves_the_inner_guards_spares() {
     drop(outer);
     let _none = test_hook::threads(0);
 
-    assert!(
-        reapers::<1>().is_ok(),
-        "the inner guard's spare was released with the outer's"
+    assert_eq!(
+        test_hook::pooled(),
+        reapers_only(1),
+        "only the outer guard's spares go with it"
     );
-    assert!(reapers::<1>().is_err(), "the outer guard's spares outlived it");
     drop(inner);
 }
 
