@@ -53,11 +53,11 @@ const IGNORED: [&str; 2] = ["ignoring command", "ignoring request"];
 /// for what [`door`] could not see.
 ///
 /// It is the last line in a chroot with no `/proc` at all — `/proc/1/root` and both mount tables
-/// are `ENOENT`, so goetia establishes nothing, and `systemctl` reports the chroot from that same
-/// absence (MEASURED, 255 and 257) — and on 257 in one `SYSTEMD_IN_CHROOT=1` declares. Where PID 1
-/// is hidden from goetia rather than absent, as under a `hidepid` `/proc`, `systemctl` runs with
-/// goetia's credentials and hits the same wall: it reports nothing, and this backstop does not fire
-/// either.
+/// are `ENOENT`, so goetia establishes nothing, while `systemctl` reports the chroot from that same
+/// absence (MEASURED, 255 and 257) — and, on 257, in one that `SYSTEMD_IN_CHROOT=1` declares. Where
+/// PID 1 is hidden from goetia rather than absent, as under a `hidepid` `/proc`, `systemctl` runs
+/// with goetia's credentials and hits the same wall: it reports nothing, and this backstop does not
+/// fire either.
 fn answered(stdout: &[u8], stderr: &[u8]) -> Result<()> {
     let ignored = |stream: &[u8]| {
         String::from_utf8_lossy(stream)
@@ -369,9 +369,8 @@ fn chroot_from(
 
 /// Whether goetia's mount table, `own`, establishes that its `/` is a root of its own, with PID
 /// 1's, `init`, where that is needed. Readable where `/proc/1/root` is not, and asked only there:
-/// an unelevated `systemctl` in
-/// a chroot with `/run` bound in cannot tell it is in one, and asks the host's manager about a unit
-/// it does not have. Two ways:
+/// an unelevated `systemctl` in a chroot with `/run` bound in cannot tell it is in one, and asks
+/// the host's manager about a unit it does not have. Two ways:
 ///
 /// - `own` read, with no mount at `/`: `/` is a directory inside a mount, which only `chroot(2)`
 ///   makes a root — `pivot_root(2)` and a new mount namespace take a mount's. That needs no `init`,
