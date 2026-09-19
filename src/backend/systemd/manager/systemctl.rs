@@ -910,9 +910,10 @@ fn show_properties(unit: &str, props: &[&str]) -> Result<BTreeMap<String, String
 /// covers state, pid, and boot-enablement together.
 ///
 /// Asked only about a unit goetia finds installed, so `LoadState=not-found` — systemd has no unit
-/// file for the name — is systemd not having loaded that file: a unit written and not yet loaded,
-/// or one systemd cannot see. What systemd reports for it then is not that unit's state, and never
-/// read as one.
+/// file for the name — is a unit file systemd cannot see, one goetia's own mount namespace holds,
+/// say. Not one merely written and not yet reloaded: the manager picks a unit file up on demand and
+/// reports `loaded` for one written a moment earlier (MEASURED, 255). What systemd reports for such
+/// a name is not that unit's state, and never read as one.
 pub(super) fn status_from_unit(unit: &str) -> Result<Status> {
     let props = show_properties(unit, &["ActiveState", "MainPID", "UnitFileState", "LoadState"])?;
     if props.get("LoadState").map(String::as_str) == Some("not-found") {
