@@ -126,10 +126,15 @@ const ENVIRONMENT: [(&str, &str); 3] = [
 /// Both of its streams are captured, never a terminal, so `SYSTEMD_PAGER`, `SYSTEMD_LESS` and
 /// `SYSTEMD_PAGERSECURE` changed nothing either.
 ///
-/// What they do *not* reach is a variable under neither prefix that `systemctl` also reads.
-/// MEASURED on 255 and 257, each with the report in force: `PAGER=cat`, `LESS=X`,
-/// `TERM=xterm-256color`, `LC_ALL=de_DE.UTF-8` and `LANG=ja_JP.UTF-8` all leave it word for word in
-/// English, which is what [`IGNORED`] matches on.
+/// What they do *not* reach is a variable under neither prefix that `systemctl` also reads:
+/// `PAGER`, `LESS`, `TERM`, and the locale. MEASURED on 255 and 257 with the report in force,
+/// `PAGER=cat`, `LESS=X` and `TERM=xterm-256color` leave it word for word in English, which is what
+/// [`IGNORED`] matches on. The locale cannot reach it at all, which is the stronger claim and the
+/// one that matters, because a locale a user has generated is not something a sweep can enumerate:
+/// the report is not a translatable string. MEASURED — 255 ships no systemd message catalog; 257
+/// ships 41, none of which contains `Running in chroot` (its `de` holds 672 strings and its `ja`
+/// 300, all polkit action descriptions), and the report itself sits in English in
+/// `libsystemd-shared-257.so`.
 const DENIED: [&str; 2] = ["SYSTEMD_", "SYSTEMCTL_"];
 
 /// A child's environment, as each of the two `Command` types goetia spawns a `systemctl` through
