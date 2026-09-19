@@ -141,8 +141,9 @@ impl Drop for RmLink {
 /// looks away and there is no report for goetia to refuse on.
 ///
 /// What no name written here can show is that the removal goes by *prefix*: a denylist holding
-/// exactly these five satisfies every assertion in this file. [`unlistable`] is what shows it, and
-/// is set on goetia alongside these.
+/// exactly these five literals would satisfy every assertion that rests on them alone.
+/// [`unlistable`] is what closes that, and is set on goetia alongside these — so such a denylist
+/// does NOT pass this file as it stands, and is measured failing six of its tests.
 const SILENCERS: [(&str, &str); 5] = [
     ("SYSTEMD_IGNORE_CHROOT", "1"),
     ("SYSTEMD_IN_CHROOT", "0"),
@@ -182,9 +183,12 @@ fn path_first(dir: &Path) -> std::ffi::OsString {
 /// that believed it was not in a chroot and went on to do the work would. Stricter than a real one,
 /// which honours only the names it knows, and deliberately so: what is pinned is goetia's removal,
 /// not systemd's reading, so the three names no systemd would act on here must silence it too. The
-/// three it does read are matched over the whole of `parse_boolean`'s spelling —
+/// three it does read are matched over every word `parse_boolean` accepts —
 /// `1|yes|y|true|t|on` and `0|no|n|false|f|off` — rather than only the value [`SILENCERS`] sets, so
-/// a child given one of the other spellings is caught as well.
+/// a child given one of the other spellings is caught as well. Lower case only, where
+/// `parse_boolean` compares case-insensitively: `SILENCERS` sets `1` and `0` and nothing else, so no
+/// child is ever given `YES` or `Off`, and a stand-in that looks away less readily than a real
+/// `systemctl` can only make these tests stricter.
 fn honours_the_silencers() -> String {
     let mut shell = String::from(
         "case \"${SYSTEMD_OFFLINE-}\" in 0|no|n|false|f|off) exit 0;; esac\n\
@@ -211,8 +215,8 @@ fn stand_in(report: &str) -> tempfile::TempDir {
 }
 
 /// A stand-in `systemctl` that answers the version gate — `--version` for the client, the `Version`
-/// property for the manager — and reports `report` for anything else, honouring [`SILENCERS`] as a
-/// real one does. So `door` and the gate both pass, and only the request itself is ignored.
+/// property for the manager — and reports `report` for anything else, honouring [`SILENCERS`] and
+/// [`unlistable`]. So `door` and the gate both pass, and only the request itself is ignored.
 fn gate_then_stand_in(report: &str) -> tempfile::TempDir {
     let honours = honours_the_silencers();
     written(&format!(

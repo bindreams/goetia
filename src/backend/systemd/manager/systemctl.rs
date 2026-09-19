@@ -116,9 +116,17 @@ const ENVIRONMENT: [(&str, &str); 3] = [
 /// reason rather than for anything it holds today: MEASURED, none of its five silences the chroot
 /// report on either version. `SYSTEMCTL_FORCE_BUS` is nonetheless the other shape goetia refuses
 /// for — it makes `systemctl` reach the manager over the bus
-/// `DBUS_SYSTEM_BUS_ADDRESS` names instead of this root's private socket. MEASURED with that
+/// `DBUS_SYSTEM_BUS_ADDRESS` names instead of this root's private socket. MEASURED as root, that
 /// address pointed at a path that does not exist: `show` answered `Version=…` without the switch
-/// and failed to connect with it. Off the child, the address decides nothing.
+/// and failed to connect with it.
+///
+/// The switch decides that only for the root `systemctl` every mutating verb runs. MEASURED at uid
+/// 502 on both versions: a non-root `systemctl` honours the address with NO switch set at all, this
+/// root's private socket not being its to open, and an unelevated `status` is then answered by
+/// whichever manager the address names. [`status_from_unit`]'s `LoadState=not-found` arm makes that
+/// exit `4` rather than a state, so it is refused rather than believed — but the address itself is
+/// outside this prefix's reach, and whether a read's child should lose `DBUS_*` too is an open
+/// question, not a settled one.
 ///
 /// What removing the rest costs: nothing any real environment carries. MEASURED on 255 and 257 — a
 /// plain shell, a login shell and `sudo` carry no name under either prefix, and the one systemd
