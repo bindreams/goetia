@@ -1232,12 +1232,17 @@ fn systemd_offline_is_evidence_only_when_true() {
 /// (see [`IGNORED`]). The gate refuses it, naming the report. A chroot the *environment* declares
 /// is not among the causes: [`DENIED`] takes every such switch off the child.
 ///
-/// Three environment settings would stop a real `systemctl` from reporting it. The stand-in asks
-/// something stricter and simpler — that the child carry [`ENVIRONMENT`] and nothing else under
-/// [`DENIED`] — because what is under test is goetia's removal, not systemd's reading. That an
-/// *inherited* name is removed is the half no test on this thread can show — putting a variable in
-/// this process's environment would race every other test thread — and is proved end to end
-/// against a real `systemctl` by `tests/systemd_integration/no_manager.rs`.
+/// Five settings stop a real one reporting it, MEASURED in that chroot on 255 and 257:
+/// `SYSTEMD_LOG_LEVEL=emerg` or `SYSTEMD_LOG_TARGET=null`, which discard the line rather than the
+/// check; `SYSTEMD_IGNORE_CHROOT` **true**; `SYSTEMD_OFFLINE` **false**, on both versions; and
+/// `SYSTEMD_IN_CHROOT` **false**, on 257 only. The value is what decides: `SYSTEMD_IGNORE_CHROOT=0`
+/// and `SYSTEMD_IN_CHROOT=1` leave it reporting, and `SYSTEMD_OFFLINE=maybe` does not parse, so it
+/// falls through to the chroot check. The stand-in asks something stricter and simpler — that the
+/// child carry [`ENVIRONMENT`] and nothing else under [`DENIED`] — because what is under test is
+/// goetia's removal, not systemd's reading. That an *inherited* name is removed is the half no test
+/// on this thread can show — putting a variable in this process's environment would race every
+/// other test thread — and is proved end to end against a real `systemctl` by
+/// `tests/systemd_integration/no_manager.rs`.
 #[skuld::test]
 fn a_chroot_systemctl_reports_is_refused_and_cannot_be_silenced() {
     for notice in [
