@@ -10,7 +10,7 @@ use clap::Args as ClapArgs;
 
 use super::report::{self, DaemonReport, Report};
 use super::support::{parse_id, partition_installed, print_undetermined_warnings, print_unreadable_warnings};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::manager::ServiceManager;
 
 #[derive(ClapArgs, Debug)]
@@ -28,14 +28,7 @@ pub fn run(
 ) -> i32 {
     let mgr = match get_manager() {
         Ok(mgr) => mgr,
-        Err(e) => {
-            let report = report::unavailable(&e);
-            if json {
-                return report::emit(&report, out, err);
-            }
-            let _ = writeln!(err, "error: {e}");
-            return report::exit_code(&report);
-        }
+        Err(e) => return unavailable(&e, json, out, err),
     };
 
     if args.ids.is_empty() {
@@ -58,6 +51,9 @@ pub fn run(
             Err(e) => report.errors.push(report::invalid_id(id_str, &e)),
             Ok(id) => match mgr.status(&id) {
                 Ok(status) => report.daemons.push(report::daemon(id_str, &status)),
+                // No manager can be asked about any id, so the answer is that refusal alone, as
+                // when no manager could be obtained at all.
+                Err(e @ Error::NoManager { .. }) => return unavailable(&e, json, out, err),
                 Err(e) => report.errors.push(report::status_error(id_str, &e)),
             },
         }
@@ -68,6 +64,16 @@ pub fn run(
     }
 
     print_text(&report, out, err);
+    report::exit_code(&report)
+}
+
+/// The whole answer when no daemon's could be obtained: `e`, exit `1`.
+fn unavailable(e: &Error, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let report = report::unavailable(e);
+    if json {
+        return report::emit(&report, out, err);
+    }
+    let _ = writeln!(err, "error: {e}");
     report::exit_code(&report)
 }
 

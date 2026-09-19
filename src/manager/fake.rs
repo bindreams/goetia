@@ -105,6 +105,8 @@ struct Store {
     /// Whether [`ServiceManager::prepare`] fails — see
     /// [`Fake::seed_prepare_fails`].
     prepare_fails: bool,
+    /// Whether no manager can be asked — see [`Fake::seed_no_manager`].
+    no_manager: bool,
     /// Every `start`/`stop`/`restart` this Fake was asked to perform, in
     /// order — see [`Fake::calls`].
     calls: Vec<(&'static str, String)>,
@@ -122,6 +124,16 @@ struct Store {
 }
 
 impl Store {
+    /// [`Fake::seed_no_manager`]'s refusal, if seeded.
+    fn manager(&self) -> Result<()> {
+        if self.no_manager {
+            return Err(Error::NoManager {
+                evidence: "seeded".to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Record a request for [`Fake::guarded`], under the guards live now.
     fn asked(&mut self, verb: &'static str, id: &Id) {
         let steps = self.live.iter().flat_map(|(_, steps)| steps.iter().copied()).collect();
@@ -394,6 +406,15 @@ impl Fake {
         state.native_restart = true;
     }
 
+    /// Test-only seeding: no manager can be asked, as systemd's offline mode
+    /// shows. Every verb that reaches the manager refuses with
+    /// [`Error::NoManager`] once it has found an artifact of goetia's to act
+    /// on, changing nothing; `preview_install` never reaches it.
+    pub fn seed_no_manager(&self) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.no_manager = true;
+    }
+
     /// Test-only seeding: make [`ServiceManager::prepare`] fail, as launchd's
     /// does when no thread can be made to reap a request.
     pub fn seed_prepare_fails(&self) {
@@ -580,6 +601,7 @@ impl ServiceManager for Fake {
         if state.opaque.contains(spec.id.as_str()) {
             return Err(Store::undetermined(&spec.id));
         }
+        state.manager()?;
         let desired = generate(spec);
         let (found, on_disk) = discover(&state, spec.id.as_str());
 
@@ -649,22 +671,27 @@ impl ServiceManager for Fake {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         let entry = state.get(id)?;
         require_ours(entry, id)?;
+        state.manager()?;
         state.entries.remove(id.as_str());
         Ok(())
     }
 
     fn enable(&self, id: &Id) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
+        let manager = state.manager();
         let entry = state.get_mut(id)?;
         require_ours(entry, id)?;
+        manager?;
         entry.enabled = true;
         Ok(())
     }
 
     fn disable(&self, id: &Id) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
+        let manager = state.manager();
         let entry = state.get_mut(id)?;
         require_ours(entry, id)?;
+        manager?;
         entry.enabled = false;
         Ok(())
     }
@@ -678,8 +705,10 @@ impl ServiceManager for Fake {
         state.asked("start", id);
         in_doubt(&state, id)?;
         let stalls = state.start_stalls.contains(id.as_str());
+        let manager = state.manager();
         let entry = state.get_mut(id)?;
         require_ours(entry, id)?;
+        manager?;
         if stalls {
             // No confirmation is coming, so none is invented: the state is
             // left exactly as it was on every branch `stalled` can take.
@@ -722,7 +751,8 @@ impl ServiceManager for Fake {
         }
         state.calls.push(("restart", id.as_str().to_string()));
         state.asked("restart", id);
-        Some(state.get_mut(id).and_then(|entry| require_ours(entry, id)))
+        let manager = state.manager();
+        Some(state.get_mut(id).and_then(|entry| require_ours(entry, id)).and(manager))
     }
 
     /// Models the strictest manager the contract allows, SCM's: a service
@@ -733,8 +763,10 @@ impl ServiceManager for Fake {
         state.calls.push(("start", id.as_str().to_string()));
         state.asked("start", id);
         in_doubt(&state, id)?;
+        let manager = state.manager();
         let entry = state.get_mut(id)?;
         require_ours(entry, id)?;
+        manager?;
         if entry.state == State::Running {
             return Err(Error::Other(format!(
                 "start `{id}`: refused as already running — the stop issued before it has not taken effect"
@@ -748,8 +780,10 @@ impl ServiceManager for Fake {
         state.calls.push(("stop", id.as_str().to_string()));
         state.asked("stop", id);
         let stalls = state.stop_stalls.contains(id.as_str());
+        let manager = state.manager();
         let entry = state.get_mut(id)?;
         require_ours(entry, id)?;
+        manager?;
         if stalls {
             return stalled(id, "stopped", budget);
         }
@@ -778,7 +812,7 @@ impl ServiceManager for Fake {
                 recovery: decide::foreign_recovery(id.as_str()),
             }),
             Err(e) => Err(e),
-            Ok(Some(_)) => Ok(Status {
+            Ok(Some(_)) => state.manager().map(|()| Status {
                 state: entry.state,
                 pid: pid_for(entry.state),
                 enabled: entry.enabled,
@@ -815,12 +849,15 @@ impl ServiceManager for Fake {
                 // A foreign entry is not Goetia-managed at all: `list`
                 // reports only what Goetia owns, per the trait doc comment.
                 Ok(None) => {}
-                Ok(Some(blob)) => out.push(Installed::Ours {
-                    spec: blob.spec,
-                    state: entry.state,
-                    pid: pid_for(entry.state),
-                    enabled: entry.enabled,
-                }),
+                Ok(Some(blob)) => {
+                    state.manager()?;
+                    out.push(Installed::Ours {
+                        spec: blob.spec,
+                        state: entry.state,
+                        pid: pid_for(entry.state),
+                        enabled: entry.enabled,
+                    });
+                }
                 Err(e) => out.push(Installed::OursUnreadable {
                     name: name.clone(),
                     reason: e.to_string(),

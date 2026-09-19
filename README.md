@@ -15,16 +15,23 @@ may still change** between releases. Pin a specific released version, or a
 specific commit if working ahead of one.
 
 goetia requires **systemd 242+** (2019), and refuses to install, uninstall,
-start, stop or restart anything on an older one, before writing or running
-anything. It checks both the running systemd and the `systemctl` client, which
-is what parses `--show-transaction`. It checks the client alone only where no
-systemd runs, as in a chroot image build: `SYSTEMD_OFFLINE` is set, `systemctl`
-reports a chroot, or `/run/systemd/system` does not exist. A running systemd it
-cannot ask is refused. Generated units use
+start, stop, restart, enable or disable anything on an older one, before
+writing or running anything. It checks both the running systemd and the
+`systemctl` client, which is what parses `--show-transaction`. A running
+systemd it cannot ask is refused. Generated units use
 `Type=exec` (240+), which is what lets a start report a missing executable or
 user as a failure. An older systemd does not reject the directive: it logs that it
 cannot parse it and runs the unit as `Type=simple`, silently losing exactly
 that. And every `start` and `stop` runs `systemctl --show-transaction` (242+).
+
+goetia does not manage systemd offline or in a chroot. Where no running
+systemd can be asked — `SYSTEMD_OFFLINE` is set, `systemctl` reports a chroot,
+or `/run/systemd/system` does not exist — every verb that reaches systemd exits
+`1` before it writes or sends anything, with one message naming which of the
+three it found. That is `install`, `uninstall`, `start`, `stop`, `restart`,
+`enable`, `disable`, `status`, `list`, and `show` without `--file`, which reads
+what `list` reads. `install --dry-run`, `diff` and `show --file` never reach
+systemd, and work there as anywhere else.
 
 ## Verifying a download
 
@@ -481,7 +488,7 @@ worse than sending you to `goetia daemon show`.
 | `unreadable`    | 4         | Goetia read enough to know the id is its own, but cannot report on it — a blob it cannot decode, or a live state it could not query. `message` says which.                                                                                                                                                                                                                                      |
 | `undetermined`  | 4         | Goetia could not determine **whether** anything is installed at that id: a read it needed failed. Claims no ownership — that is the whole difference from `unreadable`. `message` names what would not read — a path, or on Windows a registry key or service object — and what would make it readable. Only from `status <id>`; out of `list()` the same fact is the `undetermined` key below. |
 | `invalid-id`    | 1         | A command-line argument was not a valid daemon id. Fix the argument.                                                                                                                                                                                                                                                                                                                            |
-| `unavailable`   | 1         | Obtaining the manager, or listing, failed, so **no** answer was obtained for any daemon.                                                                                                                                                                                                                                                                                                        |
+| `unavailable`   | 1         | Obtaining the manager, or listing, failed, or no running manager can be asked, so **no** answer was obtained for any daemon.                                                                                                                                                                                                                                                                    |
 | `unsupported`   | 2         | `--json` was given to a subcommand that does not implement it.                                                                                                                                                                                                                                                                                                                                  |
 | `other`         | 1         | Unreachable today; reserved so an unclassified failure has a home rather than being silently dropped.                                                                                                                                                                                                                                                                                           |
 
@@ -581,8 +588,8 @@ confirms differs:
 - **systemd** confirms the `exec` itself succeeded: a missing executable or a
   missing user comes back as a failed start. Under every budget, a `start`,
   `stop` or `restart` for which systemd enqueued no job is a failure (exit
-  `1`), `uninstall`'s stop included: `systemctl` in a chroot, or under
-  `SYSTEMD_OFFLINE=1`, exits `0` having done nothing. The one exception is a
+  `1`), `uninstall`'s stop included, even where `systemctl` itself exits `0`.
+  The one exception is a
   `stop` of a unit systemd cannot load and that is not running: systemd
   answers it "not loaded" with no job, since there is nothing to stop, and
   that stop succeeds.

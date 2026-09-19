@@ -3634,3 +3634,69 @@ fn json_returns_its_own_code_when_stdout_accepts_the_document() {
         assert!(!out.is_empty(), "{args:?} still emits a document");
     }
 }
+
+/// Where no manager can be asked, every verb that reaches it is refused whole: exit `1`, with the
+/// one message. `status` and `list` included, whose refusal is `unavailable` — no answer for any
+/// daemon — and never a daemon's own `unreadable`, exit `4`. The verbs that never reach the manager
+/// are untouched.
+#[skuld::test]
+fn where_no_manager_can_be_asked_every_verb_that_reaches_it_is_refused_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let manifest = manifest.to_str().unwrap();
+    let fake = || {
+        let fake = Fake::new();
+        fake.install(&mk("frpc"), false).unwrap();
+        fake.seed_no_manager();
+        fake
+    };
+    let refusal = "no running systemd manager can be asked here (seeded)";
+
+    for args in [
+        &["goetia", "daemon", "install", "--file", manifest][..],
+        &["goetia", "daemon", "uninstall", "frpc"],
+        &["goetia", "daemon", "start", "frpc"],
+        &["goetia", "daemon", "stop", "frpc"],
+        &["goetia", "daemon", "restart", "frpc"],
+        &["goetia", "daemon", "restart", "frpc", "--timeout", "0"],
+        &["goetia", "daemon", "enable", "frpc"],
+        &["goetia", "daemon", "disable", "frpc"],
+        &["goetia", "daemon", "status", "frpc"],
+        &["goetia", "daemon", "status"],
+        &["goetia", "daemon", "list"],
+        &["goetia", "daemon", "show", "frpc"],
+    ] {
+        let (code, out, err) = dispatch_elevated(args, &fake());
+        assert_eq!(code, 1, "{args:?}\nstdout:\n{out}\nstderr:\n{err}");
+        assert!(err.contains(refusal), "{args:?}: {err}");
+    }
+
+    for args in [
+        &["goetia", "--json", "daemon", "status", "frpc"][..],
+        &["goetia", "--json", "daemon", "status"],
+        &["goetia", "--json", "daemon", "list"],
+    ] {
+        let (code, out, _) = dispatch_read_only(args, &fake());
+        assert_eq!(code, 1, "{args:?}: {out}");
+        let doc = parse_json(&out);
+        assert_eq!(daemons(&doc).len(), 0, "{args:?}: {out}");
+        let errors = errors(&doc);
+        assert_eq!(errors.len(), 1, "{args:?}: {out}");
+        assert_eq!(errors[0]["kind"], "unavailable", "{args:?}: {out}");
+        assert!(errors[0]["id"].is_null(), "{args:?}: {out}");
+        assert!(
+            errors[0]["message"].as_str().unwrap().contains(refusal),
+            "{args:?}: {out}"
+        );
+    }
+
+    for args in [
+        &["goetia", "daemon", "install", "--dry-run", "--file", manifest][..],
+        &["goetia", "daemon", "diff", "--file", manifest],
+        &["goetia", "daemon", "show", "--file", manifest],
+    ] {
+        let (code, out, err) = dispatch_elevated(args, &fake());
+        assert_ne!(code, 1, "{args:?}\nstdout:\n{out}\nstderr:\n{err}");
+        assert!(!err.contains(refusal), "{args:?}: {err}");
+    }
+}

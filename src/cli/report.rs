@@ -115,7 +115,8 @@ pub(crate) enum Kind {
     Undetermined,
     /// `support::parse_id` rejected a CLI argument: fix the argument.
     InvalidId,
-    /// `get_manager()` or `mgr.list()` failed, so no answer was obtained for
+    /// `get_manager()` or `mgr.list()` failed, or `status(&id)` found no
+    /// manager to ask ([`Error::NoManager`]), so no answer was obtained for
     /// any daemon.
     Unavailable,
     /// `--json` was given to a subcommand that does not implement it.
@@ -242,7 +243,11 @@ pub(crate) fn daemon(id: &str, status: &Status) -> DaemonReport {
 /// classification by error variant: `status(&id)` is the one operation that
 /// answers "what is at this id", so its three answers — absent, present and
 /// foreign, unestablished — are exactly what its failures can mean.
+///
+/// Never handed [`Error::NoManager`]: that refuses the whole verb, which
+/// `status` answers as [`unavailable`].
 pub(crate) fn status_error(id: &str, e: &Error) -> ErrorReport {
+    debug_assert!(!matches!(e, Error::NoManager { .. }), "{e}");
     let kind = match e {
         Error::NotInstalled { .. } => Kind::NotInstalled,
         Error::Foreign { .. } => Kind::Foreign,

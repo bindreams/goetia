@@ -1,7 +1,8 @@
 //! Unit coverage for the pure halves of `systemctl.rs` — the diagnostic
 //! [`failed`] builds out of a [`Capture`], across the shapes a capture can
-//! arrive in, and the argv and environment each budget runs under — plus
-//! [`took`] against a real `systemctl` run offline.
+//! arrive in, and the argv and environment each budget runs under — plus the
+//! manager boundary and the version gate, driven through a stand-in
+//! `systemctl` ([`stand_in`]) and a real one run offline.
 //!
 //! These are pure-function tests on purpose. `failed`'s whole job is the
 //! wording of a message, and `tests/systemd_integration/linux.rs` can only
@@ -167,7 +168,7 @@ fn the_bounded_path_waits_on_the_deadline_it_was_given() {
     let dir = tempfile::tempdir().unwrap();
     let request = dir.path().join("request");
     let finished = run_verb_via(
-        "/bin/sh",
+        &["/bin/sh"],
         &["-c", ANNOUNCES_THEN_BLOCKS, request.to_str().unwrap()],
         Budget::Bounded(Duration::MAX),
         Budget::Immediate.start(),
@@ -184,7 +185,7 @@ fn the_bounded_path_issues_the_request_on_a_spent_deadline() {
     let dir = tempfile::tempdir().unwrap();
     let request = dir.path().join("request");
     run_verb_via(
-        "/bin/sh",
+        &["/bin/sh"],
         &["-c", ANNOUNCES_THEN_BLOCKS, request.to_str().unwrap()],
         Budget::Bounded(Duration::from_secs(10)),
         Budget::Immediate.start(),
@@ -212,7 +213,7 @@ fn a_request_nothing_could_watch_is_never_sent() {
         let spawns = bounded::test_hook::spawns();
 
         let e = run_verb_via(
-            "/bin/sh",
+            &["/bin/sh"],
             &["-c", ANNOUNCES_THEN_BLOCKS, request.to_str().unwrap()],
             Budget::Bounded(Duration::from_secs(10)),
             Budget::Immediate.start(),
@@ -234,7 +235,7 @@ fn a_request_nothing_could_watch_is_never_sent() {
 fn a_watched_request_that_may_have_run_is_in_doubt() {
     let spawn = || {
         run_verb_via(
-            "/bin/true",
+            &["/bin/true"],
             &[],
             Budget::Bounded(Duration::from_secs(10)),
             Budget::Unbounded.start(),
@@ -290,15 +291,14 @@ fn a_request_run_to_completion_is_in_doubt_only_once_it_ran() {
     assert!(matches!(e, Error::RequestInDoubt { .. }), "{e:?}");
 }
 
-/// A watched `systemctl` needs no temp file: it runs where none may be writable — a chroot, or an
-/// image build.
+/// A watched `systemctl` needs no temp file: it runs where none may be writable.
 #[skuld::test]
 fn a_watched_request_needs_no_temp_file() {
     let _no_file = bounded::test_hook::temp_files(0);
     let dir = tempfile::tempdir().unwrap();
     let request = dir.path().join("request");
     let finished = run_verb_via(
-        "/bin/sh",
+        &["/bin/sh"],
         &["-c", ANNOUNCES_THEN_BLOCKS, request.to_str().unwrap()],
         Budget::Bounded(Duration::from_secs(10)),
         Budget::Immediate.start(),
@@ -317,7 +317,7 @@ const UNLESS_AUDIBLE_EXIT_9: &str =
 fn the_paths_that_do_not_bound_keep_the_announcement_audible() {
     for budget in [Budget::Immediate, Budget::Unbounded] {
         let finished = run_verb_via(
-            "/bin/sh",
+            &["/bin/sh"],
             &["-c", &format!("{UNLESS_AUDIBLE_EXIT_9}; exit 0")],
             budget,
             budget.start(),
@@ -333,7 +333,7 @@ fn the_paths_that_do_not_bound_keep_the_announcement_audible() {
 #[skuld::test]
 fn the_bounded_path_keeps_the_announcement_audible() {
     let finished = run_verb_via(
-        "/bin/sh",
+        &["/bin/sh"],
         &[
             "-c",
             &format!(
@@ -447,36 +447,255 @@ fn an_exit_that_enqueued_a_job_took_the_request() {
     assert!(taken.is_ok(), "{taken:?}");
 }
 
-/// `systemctl` in a chroot or offline exits `0` and enqueues nothing. The real one, run offline, on
-/// every path and for both verbs: an exit of `0` alone must never read as started or stopped.
+// The manager boundary ================================================================================================
+
+/// A system booted with systemd, and not offline: its manager must be asked.
+fn booted() -> Host {
+    Host {
+        offline: None,
+        unbooted: false,
+    }
+}
+
+/// A stand-in `systemctl` that passes the version gate, and answers anything else with `rest`.
+fn gate_passes_then(rest: &str) -> String {
+    format!(
+        "case \"$*\" in \
+           'show --property=Version --value') echo 257;; \
+           --version) echo 'systemd 257 (257)';; \
+           *) {rest};; \
+         esac"
+    )
+}
+
+/// One way in to the manager, named.
+type Path = (String, Box<dyn Fn() -> Result<()>>);
+
+/// Every path goetia reaches the manager by, each through the function the verbs call: the three
+/// requests run to completion, the `show` a state read runs, and `start`, `stop` and `restart` under
+/// every budget, bounded or not.
+fn every_path() -> Vec<Path> {
+    let mut paths: Vec<Path> = vec![
+        ("daemon-reload".to_string(), Box::new(daemon_reload)),
+        (
+            "enable".to_string(),
+            Box::new(|| run_systemctl(&["enable", "x.service"]).map(drop)),
+        ),
+        (
+            "disable".to_string(),
+            Box::new(|| run_systemctl(&["disable", "x.service"]).map(drop)),
+        ),
+        ("show".to_string(), Box::new(|| status_from_unit("x.service").map(drop))),
+        ("restart".to_string(), Box::new(|| request_restart_impl("x"))),
+    ];
+    for budget in [
+        Budget::Immediate,
+        Budget::Unbounded,
+        Budget::Bounded(Duration::from_secs(600)),
+    ] {
+        paths.push((
+            format!("start {budget:?}"),
+            Box::new(move || start_impl("x", budget, budget.start())),
+        ));
+        paths.push((
+            format!("stop {budget:?}"),
+            Box::new(move || stop_impl("x", budget, budget.start())),
+        ));
+    }
+    paths
+}
+
+/// The refusal, naming `evidence`.
+fn assert_no_manager(result: Result<()>, evidence: &str, path: &str) {
+    let e = result.expect_err(path);
+    assert!(matches!(e, Error::NoManager { .. }), "{path}: {e:?}");
+    let msg = e.to_string();
+    assert!(
+        msg.contains("no running systemd manager can be asked here"),
+        "{path}: {msg}"
+    );
+    assert!(msg.contains(evidence), "{path}: {msg}");
+}
+
+/// Evidence known without asking — `SYSTEMD_OFFLINE` set true, or no `/run/systemd/system` — is
+/// refused on every path before any `systemctl` runs, the version gate's own probes included: the
+/// stand-in records every run, and none happens.
 #[skuld::test]
-fn an_offline_systemctl_that_exits_0_took_nothing() {
-    for verb in ["start", "stop"] {
+fn evidence_known_without_asking_refuses_every_path_before_anything_runs() {
+    let hosts = [
+        (
+            Host {
+                offline: Some("1".to_string()),
+                unbooted: false,
+            },
+            "`SYSTEMD_OFFLINE=1` is set",
+        ),
+        (
+            Host {
+                offline: None,
+                unbooted: true,
+            },
+            "`/run/systemd/system` does not exist",
+        ),
+    ];
+    for (host, evidence) in hosts {
+        let dir = tempfile::tempdir().unwrap();
+        let ran = dir.path().join("ran");
+        let script = format!("echo \"$*\" >> '{}'; exit 0", ran.display());
+        let _stand_in = stand_in::set(Some(&script), host);
+        assert_no_manager(require_supported(), evidence, "the gate");
+        for (path, run) in every_path() {
+            assert_no_manager(run(), evidence, &path);
+        }
+        assert!(
+            !ran.exists(),
+            "{evidence}: systemctl ran: {:?}",
+            std::fs::read_to_string(&ran)
+        );
+    }
+}
+
+/// A chroot only `systemctl` can report, and reports only once asked. No request is sent until
+/// the manager has been asked: here every request would act silently and exit `0`, as `enable` and
+/// `disable` do in a chroot, and none runs. The read is refused by its own answer.
+#[skuld::test]
+fn no_request_is_sent_before_the_manager_is_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let acted = dir.path().join("acted");
+    let script = format!(
+        "case \"$1\" in \
+           show) echo \"Running in chroot, ignoring command 'show'\" >&2;; \
+           --version) echo 'systemd 257 (257)';; \
+           *) echo \"$*\" >> '{}';; \
+         esac",
+        acted.display()
+    );
+    let _stand_in = stand_in::set(Some(&script), booted());
+    for (path, run) in every_path() {
+        assert_no_manager(run(), "Running in chroot, ignoring command 'show'", &path);
+    }
+    assert!(
+        !acted.exists(),
+        "a request was sent before the manager was asked: {:?}",
+        std::fs::read_to_string(&acted)
+    );
+}
+
+/// The backstop: a `systemctl` past the gate that says it ignored what it was asked is refused on
+/// every path, and never read as a success — in systemd 257's wording and the older one, on either
+/// stream. The stand-in says so only when its log level is audible, as a real one under an
+/// inherited `SYSTEMD_LOG_LEVEL=warning` would not, so every path must also make it audible.
+#[skuld::test]
+fn a_systemctl_that_ignored_the_request_is_refused_on_every_path() {
+    for (report, stream) in [
+        ("Running in chroot, ignoring command '$1'", ">&2"),
+        ("Running in chroot, ignoring request.", ">&2"),
+        ("Running in chroot, ignoring request.", ""),
+    ] {
+        let script = gate_passes_then(&format!(
+            "[ \"$SYSTEMD_LOG_LEVEL\" = info ] && [ \"$SYSTEMD_LOG_TARGET\" = console ] && echo \"{report}\" {stream}; \
+             exit 0"
+        ));
+        let _stand_in = stand_in::set(Some(&script), booted());
+        for (path, run) in every_path() {
+            let verb = path.split(' ').next().unwrap();
+            let said = report.replace("$1", verb);
+            assert_no_manager(run(), &said, &format!("{path} ({report:?} {stream:?})"));
+        }
+    }
+}
+
+/// The real `systemctl`, offline, on every path `start` and `stop` take: an exit of `0` that asked
+/// nobody is the refusal, never read as started or stopped.
+#[skuld::test]
+fn a_real_offline_systemctl_is_refused_on_every_path() {
+    for verb in ["start", "stop", "restart"] {
         for budget in [
             Budget::Immediate,
             Budget::Unbounded,
             Budget::Bounded(Duration::from_secs(600)),
         ] {
-            let mut args = vec!["SYSTEMD_OFFLINE=1", "systemctl"];
-            args.extend(verb_args(verb, "goetia-offline-probe.service", budget));
-            let finished = run_verb_via("env", &args, budget, budget.start()).expect("env is spawnable");
-            let Finished::Exited { status, capture } = finished else {
-                panic!("{verb} {budget:?}: an offline systemctl exits on its own: {finished:?}");
-            };
-            assert!(status.success(), "{verb} {budget:?}: {status:?} {capture:?}");
-            let e = took(verb, "goetia-offline-probe.service", &capture)
-                .expect_err("an exit of 0 with no job enqueued took nothing");
-            let msg = e.to_string();
-            assert!(msg.contains("without enqueuing a job"), "{verb} {budget:?}: {msg}");
-            assert!(msg.contains("ignoring command"), "systemd's own reason: {msg}");
+            let result = run_verb_via(
+                &["env", "SYSTEMD_OFFLINE=1", "systemctl"],
+                &verb_args(verb, "goetia-offline-probe.service", budget),
+                budget,
+                budget.start(),
+            );
+            assert_no_manager(
+                result.map(drop),
+                &format!("Running in chroot, ignoring command '{verb}'"),
+                &format!("{verb} {budget:?}"),
+            );
         }
+    }
+}
+
+/// An answer `systemctl` says nothing about ignoring is not refused.
+#[skuld::test]
+fn an_answer_that_ignored_nothing_is_an_answer() {
+    assert!(answered(b"ActiveState=active\n", b"").is_ok());
+    assert!(answered(b"", b"Enqueued anchor job 7 x.service/start.\n").is_ok());
+    assert!(
+        answered(b"", b"x.service:3: Unknown key 'Foo' in section [Service], ignoring.\n").is_ok(),
+        "a unit file warning is not a report that the request was ignored"
+    );
+}
+
+// status_from_unit ====================================================================================================
+
+/// An answer without every property asked for is no answer: never the state, pid or enablement its
+/// absence would default to. Empty — as a `systemctl` that asked nobody and did not say so answers
+/// — or partial.
+#[skuld::test]
+fn a_show_answer_without_every_property_is_not_a_state() {
+    for (answer, missing) in [
+        ("true", "ActiveState, MainPID, UnitFileState"),
+        ("printf 'ActiveState=active\\n'", "MainPID, UnitFileState"),
+        ("printf 'ActiveState=active\\nMainPID=42\\n'", "UnitFileState"),
+    ] {
+        let _stand_in = stand_in::set(Some(&format!("{answer}; exit 0")), booted());
+        let e = status_from_unit("x.service").expect_err(answer);
+        let msg = e.to_string();
+        assert!(msg.contains(&format!("answered without {missing}")), "{answer}: {msg}");
+    }
+}
+
+/// Every property answered, an empty `UnitFileState` included — what systemd answers for a unit it
+/// has not loaded.
+#[skuld::test]
+fn a_show_answer_with_every_property_is_read() {
+    for (answer, expected) in [
+        (
+            "ActiveState=active\\nMainPID=42\\nUnitFileState=enabled\\n",
+            Status {
+                state: State::Running,
+                pid: Some(42),
+                enabled: true,
+            },
+        ),
+        (
+            "MainPID=0\\nActiveState=inactive\\nUnitFileState=\\n",
+            Status {
+                state: State::Stopped,
+                pid: None,
+                enabled: false,
+            },
+        ),
+    ] {
+        let _stand_in = stand_in::set(Some(&format!("printf '{answer}'")), booted());
+        let status = status_from_unit("x.service").expect(answer);
+        assert_eq!(
+            (status.state, status.pid, status.enabled),
+            (expected.state, expected.pid, expected.enabled),
+            "{answer}"
+        );
     }
 }
 
 // supported ===========================================================================================================
 
 /// The refusal for the version one `source` reported, as [`require_supported`] words it.
-fn supported(source: Source, reported: &str) -> Result<()> {
+fn verdicted(source: Source, reported: &str) -> Result<()> {
     refusal(verdict(source, reported).into_iter().collect())
 }
 
@@ -497,7 +716,7 @@ fn a_running_systemd_242_or_newer_is_supported() {
         "258~rc1",
         "v257-rc1-15-g1234567",
     ] {
-        assert!(supported(Source::Manager, version).is_ok(), "{version:?}");
+        assert!(verdicted(Source::Manager, version).is_ok(), "{version:?}");
     }
 }
 
@@ -508,9 +727,7 @@ fn a_client_242_or_newer_is_supported() {
         "systemd 257 (257.13-1~deb13u1)",
         "systemd 258~rc1 (258~rc1-1)",
     ] {
-        for source in [Source::Client, Source::OfflineClient(NoManager::Offline)] {
-            assert!(supported(source, version).is_ok(), "{source:?} {version:?}");
-        }
+        assert!(verdicted(Source::Client, version).is_ok(), "{version:?}");
     }
 }
 
@@ -522,9 +739,8 @@ fn systemd_240_and_241_are_refused_for_show_transaction_alone() {
         (Source::Manager, "241.7-1", "241"),
         (Source::Manager, "240", "240"),
         (Source::Client, "systemd 241 (241)", "241"),
-        (Source::OfflineClient(NoManager::Chroot), "systemd 241 (241)", "241"),
     ] {
-        let msg = supported(source, version).expect_err(version).to_string();
+        let msg = verdicted(source, version).expect_err(version).to_string();
         assert!(msg.contains("requires systemd 242 or newer"), "{msg}");
         assert!(msg.contains(&format!(" {reported}")), "{msg}");
         assert!(msg.contains("--show-transaction"), "{msg}");
@@ -532,21 +748,15 @@ fn systemd_240_and_241_are_refused_for_show_transaction_alone() {
     }
 }
 
-/// Before 240 both reasons apply — to the running systemd, and to a client standing in for it
-/// offline. A client next to a running systemd parses no units, so `--show-transaction` is its only
-/// reason.
+/// Before 240 both reasons apply to the running systemd. The client parses no units, so
+/// `--show-transaction` is its only reason.
 #[skuld::test]
 fn systemd_older_than_240_is_refused_for_both_reasons() {
-    for (source, version) in [
-        (Source::Manager, "239-41.el8"),
-        (Source::OfflineClient(NoManager::NotBooted), "systemd 237"),
-    ] {
-        let msg = supported(source, version).expect_err(version).to_string();
-        assert!(msg.contains("requires systemd 242 or newer"), "{msg}");
-        assert!(msg.contains("--show-transaction"), "{msg}");
-        assert!(msg.contains("Type=simple"), "{msg}");
-    }
-    let msg = supported(Source::Client, "systemd 237").unwrap_err().to_string();
+    let msg = verdicted(Source::Manager, "239-41.el8").unwrap_err().to_string();
+    assert!(msg.contains("requires systemd 242 or newer"), "{msg}");
+    assert!(msg.contains("--show-transaction"), "{msg}");
+    assert!(msg.contains("Type=simple"), "{msg}");
+    let msg = verdicted(Source::Client, "systemd 237").unwrap_err().to_string();
     assert!(msg.contains("--show-transaction"), "{msg}");
     assert!(!msg.contains("Type=simple"), "{msg}");
 }
@@ -554,18 +764,10 @@ fn systemd_older_than_240_is_refused_for_both_reasons() {
 /// The refusal names whose version it read.
 #[skuld::test]
 fn a_refusal_names_whose_version_it_read() {
-    let manager = supported(Source::Manager, "241").unwrap_err().to_string();
+    let manager = verdicted(Source::Manager, "241").unwrap_err().to_string();
     assert!(manager.contains("The running systemd is 241"), "{manager}");
-    let client = supported(Source::Client, "systemd 241 (241)").unwrap_err().to_string();
+    let client = verdicted(Source::Client, "systemd 241 (241)").unwrap_err().to_string();
     assert!(client.contains("The `systemctl` client is 241"), "{client}");
-    let offline = supported(Source::OfflineClient(NoManager::Offline), "systemd 241 (241)")
-        .unwrap_err()
-        .to_string();
-    assert!(
-        offline.contains("No systemd runs here (`SYSTEMD_OFFLINE` is set)"),
-        "{offline}"
-    );
-    assert!(offline.contains("`systemctl --version` reports 241"), "{offline}");
 }
 
 /// A version goetia cannot read is not a version it can vouch for — and not one it may call old.
@@ -582,12 +784,8 @@ fn an_unreadable_version_is_refused_without_calling_it_old() {
         (Source::Client, "systemd abc"),
         (Source::Client, "not systemd 257"),
         (Source::Client, "\u{1b}[0;1;39msystemd 257\u{1b}[0m (257.13-1~deb13u1)"),
-        (
-            Source::OfflineClient(NoManager::Offline),
-            "systemd 257\u{1b}[0m (257.13-1~deb13u1)",
-        ),
     ] {
-        let msg = supported(source, version).expect_err(version).to_string();
+        let msg = verdicted(source, version).expect_err(version).to_string();
         assert!(msg.contains("cannot read the version"), "{version:?}: {msg}");
         for claim in ["older", "before", "Type=simple", "cannot answer", "does not accept"] {
             assert!(!msg.contains(claim), "{version:?} is not known to be old: {msg}");
@@ -653,22 +851,25 @@ fn a_refused_gate_is_asked_again() {
     assert_eq!(asked.get(), 1);
 }
 
-// require_supported_via ===============================================================================================
-
-/// A stand-in for `systemctl`: `sh -c <script> systemctl <args>`, so the probe's own arguments are
-/// the script's `$@`. Never a file on disk — writing one and `exec`ing it races every `fork` the
-/// test process makes on another thread (`ETXTBSY`).
-fn stand_in(script: &str) -> [&str; 4] {
-    ["/bin/sh", "-c", script, "systemctl"]
+/// A remembered pass never stands in for the evidence [`door`] reads without asking: that is read
+/// on every run.
+#[skuld::test]
+fn a_remembered_pass_does_not_skip_the_evidence() {
+    let _gate = gate_scope();
+    let _online = stand_in::set(Some(&gate_passes_then("exit 0")), booted());
+    require_supported().expect("the stand-in passes the gate");
+    drop(_online);
+    let _offline = stand_in::set(
+        Some(&gate_passes_then("exit 0")),
+        Host {
+            offline: Some("yes".to_string()),
+            unbooted: false,
+        },
+    );
+    assert_no_manager(daemon_reload(), "`SYSTEMD_OFFLINE=yes` is set", "daemon-reload");
 }
 
-/// A system booted with systemd, and not offline: its manager must be asked.
-fn booted() -> Host {
-    Host {
-        offline: None,
-        unbooted: false,
-    }
-}
+// supported, asked ====================================================================================================
 
 /// Answers `show` with `$MANAGER`'s version and `--version` with `$CLIENT`'s, each `none` to fail.
 fn two_versions(manager: &str, client: &str) -> String {
@@ -681,8 +882,14 @@ fn two_versions(manager: &str, client: &str) -> String {
     )
 }
 
+/// [`supported`], with `script` standing in for `systemctl` on a booted host.
+fn supported_by(script: &str) -> Result<()> {
+    let _stand_in = stand_in::set(Some(script), booted());
+    supported()
+}
+
 fn refused(manager: &str, client: &str) -> String {
-    require_supported_via(&stand_in(&two_versions(manager, client)), &booted())
+    supported_by(&two_versions(manager, client))
         .expect_err(&format!("manager {manager}, client {client}"))
         .to_string()
 }
@@ -692,7 +899,7 @@ fn refused(manager: &str, client: &str) -> String {
 /// failed, with its version, and both when both did.
 #[skuld::test]
 fn both_the_running_systemd_and_the_client_must_be_242_or_newer() {
-    assert!(require_supported_via(&stand_in(&two_versions("257", "257")), &booted()).is_ok());
+    assert!(supported_by(&two_versions("257", "257")).is_ok());
 
     let old_client = refused("257", "241");
     assert!(old_client.contains("The `systemctl` client is 241"), "{old_client}");
@@ -712,44 +919,6 @@ fn both_the_running_systemd_and_the_client_must_be_242_or_newer() {
 fn a_client_that_cannot_say_its_version_is_refused() {
     let msg = refused("257", "none");
     assert!(msg.contains("`systemctl --version` failed"), "{msg}");
-}
-
-/// Evidence found without asking `systemctl`: `SYSTEMD_OFFLINE` set true, or no
-/// `/run/systemd/system`. The client alone decides, and the manager is never asked — the stand-in
-/// fails its `show`.
-#[skuld::test]
-fn where_no_manager_runs_the_client_alone_decides() {
-    let hosts = [
-        (
-            Host {
-                offline: Some("1".to_string()),
-                unbooted: false,
-            },
-            "`SYSTEMD_OFFLINE` is set",
-        ),
-        (
-            Host {
-                offline: None,
-                unbooted: true,
-            },
-            "`/run/systemd/system` does not exist",
-        ),
-    ];
-    for (host, why) in hosts {
-        assert!(
-            require_supported_via(&stand_in(&two_versions("none", "257")), &host).is_ok(),
-            "{why}"
-        );
-        let msg = require_supported_via(&stand_in(&two_versions("none", "241")), &host)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            msg.contains(&format!(
-                "No systemd runs here ({why}), and `systemctl --version` reports 241"
-            )),
-            "{msg}"
-        );
-    }
 }
 
 /// `/run/systemd/system` counts as absent only on evidence: not there, not a directory, or under
@@ -776,7 +945,7 @@ fn only_a_stat_that_finds_no_directory_is_evidence_of_no_systemd() {
 /// This host is booted with systemd and not offline: its manager is asked.
 #[skuld::test]
 fn this_host_has_a_manager_to_ask() {
-    assert_eq!(Host::this().no_manager(), None);
+    assert_eq!(Host::this().evidence(), None);
 }
 
 /// `SYSTEMD_OFFLINE` is read as `systemctl` reads it, with systemd's `parse_boolean`: only a true
@@ -788,65 +957,50 @@ fn systemd_offline_is_evidence_only_when_true() {
             offline: Some(value.to_string()),
             unbooted: false,
         };
-        assert_eq!(host.no_manager(), Some(NoManager::Offline), "{value:?}");
+        assert_eq!(host.evidence(), Some(Evidence::Offline(value.to_string())), "{value:?}");
     }
     for value in ["0", "no", "false", "off", "", "2", "maybe"] {
         let host = Host {
             offline: Some(value.to_string()),
             unbooted: false,
         };
-        assert_eq!(host.no_manager(), None, "{value:?}");
+        assert_eq!(host.evidence(), None, "{value:?}");
     }
 }
 
 /// The chroot `systemctl` itself detects — `/proc/1/root` against `/`, or `SYSTEMD_IN_CHROOT` — as
 /// it reports it: `show` exits `0`, prints nothing, and says why on stderr (measured on systemd
-/// 257; older ones say "ignoring request."). The stand-in says so only when its log level is audible,
-/// as a real one under an inherited `SYSTEMD_LOG_LEVEL=warning` would not.
+/// 257; older ones say "ignoring request."). The gate refuses it, naming the report. The stand-in
+/// says so only when its log level is audible, as a real one under an inherited
+/// `SYSTEMD_LOG_LEVEL=warning` would not.
 #[skuld::test]
-fn a_chroot_systemctl_reports_is_evidence_that_cannot_be_silenced() {
+fn a_chroot_systemctl_reports_is_refused_and_cannot_be_silenced() {
     for notice in [
         "Running in chroot, ignoring command 'show'",
         "Running in chroot, ignoring request.",
     ] {
-        let in_chroot = |client: &str| {
-            format!(
-                "[ \"$1\" = show ] && {{ [ \"$SYSTEMD_LOG_LEVEL\" = info ] && echo \"{notice}\" >&2; exit 0; }}; \
-                 echo 'systemd {client} ({client})'"
-            )
-        };
-        assert!(
-            require_supported_via(&stand_in(&in_chroot("257")), &booted()).is_ok(),
-            "{notice}"
+        let script = format!(
+            "[ \"$1\" = show ] && {{ [ \"$SYSTEMD_LOG_LEVEL\" = info ] && echo \"{notice}\" >&2; exit 0; }}; \
+             echo 'systemd 257 (257)'"
         );
-        let msg = require_supported_via(&stand_in(&in_chroot("241")), &booted())
-            .unwrap_err()
-            .to_string();
-        assert!(
-            msg.contains("No systemd runs here (`systemctl` says it is running in a chroot)"),
-            "{msg}"
-        );
+        assert_no_manager(supported_by(&script), notice, notice);
     }
 }
 
 /// On a system booted with systemd, a manager that could not be asked is not evidence that none
 /// runs: a bus that timed out or refused the connection is a refusal naming what `systemctl` said,
-/// and so is a `show` that answered with nothing and no chroot to explain it.
+/// and so is a `show` that answered with nothing and did not say it ignored the question.
 #[skuld::test]
 fn any_other_failure_to_ask_the_manager_is_a_refusal() {
     let failing = "[ \"$1\" = show ] && { echo 'Failed to get properties: Connection timed out' >&2; exit 1; }; \
                    echo 'systemd 257 (257)'";
-    let msg = require_supported_via(&stand_in(failing), &booted())
-        .unwrap_err()
-        .to_string();
+    let msg = supported_by(failing).unwrap_err().to_string();
     assert!(msg.contains("`systemctl show --property=Version` failed"), "{msg}");
     assert!(msg.contains("Connection timed out"), "{msg}");
     assert!(msg.contains("cannot tell whether the running systemd is 242+"), "{msg}");
 
     let silent = "[ \"$1\" = show ] && exit 0; echo 'systemd 257 (257)'";
-    let msg = require_supported_via(&stand_in(silent), &booted())
-        .unwrap_err()
-        .to_string();
+    let msg = supported_by(silent).unwrap_err().to_string();
     assert!(msg.contains("printed no version"), "{msg}");
 }
 
@@ -855,24 +1009,19 @@ fn any_other_failure_to_ask_the_manager_is_a_refusal() {
 #[skuld::test]
 fn every_probe_switches_colour_off() {
     let colours = "c() { [ \"$SYSTEMD_COLORS\" = 0 ] && echo \"$1\" || printf '\\033[0;1;39m%s\\033[0m\\n' \"$1\"; }; ";
-    let online = format!("{colours}[ \"$1\" = show ] && c 257 || c 'systemd 257'");
-    assert!(require_supported_via(&stand_in(&online), &booted()).is_ok());
-    let offline = format!("{colours}[ \"$1\" = show ] && exit 1; c 'systemd 257'");
-    let unbooted = Host {
-        offline: None,
-        unbooted: true,
-    };
-    assert!(require_supported_via(&stand_in(&offline), &unbooted).is_ok());
+    assert!(supported_by(&format!("{colours}[ \"$1\" = show ] && c 257 || c 'systemd 257'")).is_ok());
 }
 
 /// The real `systemctl` on this host, first with an inherited `SYSTEMD_COLORS=1` — set by the
 /// wrapper only where goetia did not set it itself — then as it is.
 #[skuld::test]
 fn this_hosts_systemd_is_supported() {
-    require_supported_via(
-        &stand_in("SYSTEMD_COLORS=${SYSTEMD_COLORS:-1} exec systemctl \"$@\""),
-        &Host::this(),
-    )
-    .expect("the host running the tests runs systemd 242+, whatever colour is inherited");
+    {
+        let _stand_in = stand_in::set(
+            Some("SYSTEMD_COLORS=${SYSTEMD_COLORS:-1} exec systemctl \"$@\""),
+            Host::this(),
+        );
+        supported().expect("the host running the tests runs systemd 242+, whatever colour is inherited");
+    }
     require_supported().expect("the host running the tests runs systemd 242+");
 }

@@ -410,7 +410,7 @@ fn a_child_whose_output_nothing_could_take_is_never_run() {
 }
 
 /// An announced request — `systemctl` — makes no temp file at all: it runs where none may be
-/// writable, a chroot or an image build.
+/// writable.
 #[skuld::test]
 fn an_announced_request_needs_no_temp_file() {
     let _no_file = test_hook::temp_files(0);

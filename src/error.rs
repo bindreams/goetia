@@ -178,6 +178,18 @@ pub enum Error {
     #[error("`{request}` failed after it started, so it may or may not have reached the service manager: {detail}")]
     RequestInDoubt { request: String, detail: String },
 
+    /// No service manager can be asked on this host, on positive evidence: systemd's offline mode,
+    /// a chroot, or a system systemd did not boot. `evidence` says which. goetia refuses there
+    /// rather than act on unit files alone, or read a `systemctl` that asked nobody as an answer.
+    ///
+    /// Exit `1`, from every verb that reaches the manager, `status` and `list` included: a refusal
+    /// of the whole verb, not an answer about any one daemon. Raised before anything is written or
+    /// sent, and by any `systemctl` that says it ignored what it was asked, which did nothing.
+    #[error(
+        "no running systemd manager can be asked here ({evidence}), and goetia does not manage systemd offline or in a chroot"
+    )]
+    NoManager { evidence: String },
+
     /// A mutating CLI subcommand was invoked without the elevation
     /// (root/Administrator) it requires. Never returned for `list`,
     /// `status`, `show`, `diff`, or `install --dry-run`, none of which

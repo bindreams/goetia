@@ -30,7 +30,7 @@ const UNIT_DIR_EXCLUSIVE: skuld::Label;
 // Fixtures ============================================================================================================
 
 /// A minimal, real, long-running daemon: `sleep infinity` exists on every coreutils Ubuntu ships.
-fn mk(id: &str) -> DaemonSpec {
+pub(crate) fn mk(id: &str) -> DaemonSpec {
     DaemonSpec {
         id: Id::try_from(id.to_string()).expect("valid id"),
         name: id.to_string(),
@@ -51,7 +51,7 @@ fn mk(id: &str) -> DaemonSpec {
 /// and the reason those two backends now answer one question one way.
 const NON_UTF8_UNIT: [u8; 4] = [b'[', 0xff, 0xfe, b']'];
 
-fn unit_path(id: &str) -> PathBuf {
+pub(crate) fn unit_path(id: &str) -> PathBuf {
     PathBuf::from(support::SYSTEMD_UNIT_DIR).join(format!("{id}.service"))
 }
 
@@ -59,7 +59,7 @@ fn dropin_dir(id: &str) -> PathBuf {
     PathBuf::from(support::SYSTEMD_UNIT_DIR).join(format!("{id}.service.d"))
 }
 
-fn wants_symlink(id: &str) -> PathBuf {
+pub(crate) fn wants_symlink(id: &str) -> PathBuf {
     PathBuf::from(support::SYSTEMD_UNIT_DIR)
         .join("multi-user.target.wants")
         .join(format!("{id}.service"))
@@ -166,7 +166,7 @@ fn seed_control_dropin(root: &str, id: &str) -> (PathBuf, RmDropin) {
 
 /// A manifest at a path an unprivileged process can actually reach: `tempfile`'s own directory is
 /// 0700, which `runuser -u nobody` cannot traverse.
-fn world_readable_manifest(id: &str) -> (tempfile::TempDir, PathBuf) {
+pub(crate) fn world_readable_manifest(id: &str) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).expect("chmod the tempdir 0755");
     let path = dir.path().join("goetia.yaml");
@@ -523,7 +523,7 @@ fn start_stop_status_reflect_reality() {
 }
 
 /// `ActiveState` and `Job` as `systemctl show` reports them: the job is empty when none is queued.
-fn active_state_and_job(id: &str) -> (String, String) {
+pub(crate) fn active_state_and_job(id: &str) -> (String, String) {
     let unit = format!("{id}.service");
     let run = cmd::run(
         "systemctl",
@@ -717,7 +717,7 @@ fn queued_job_types(id: &str) -> Vec<String> {
 }
 
 /// `MainPID` as `systemctl show` reports it.
-fn main_pid(id: &str) -> String {
+pub(crate) fn main_pid(id: &str) -> String {
     let unit = format!("{id}.service");
     let run = cmd::run("systemctl", &["show", "--property=MainPID", "--value", &unit]).expect_ok();
     run.stdout.trim().to_string()
@@ -847,58 +847,6 @@ fn a_restart_with_no_budget_restarts_behind_a_stop_that_has_to_wait() {
     );
 }
 
-/// `goetia <args>`, elevated as this test is, with `SYSTEMD_OFFLINE=1` in its environment: the
-/// switch that makes `systemctl` act as it does in a chroot.
-fn goetia_offline(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_goetia"))
-        .args(args)
-        .env("SYSTEMD_OFFLINE", "1")
-        .output()
-        .expect("spawn goetia")
-}
-
-/// In a chroot or offline, `systemctl` says "Running in chroot, ignoring command" and exits `0`
-/// having asked systemd nothing — an image build's `install --start` is the ordinary case. Under
-/// every budget that must be a failure, never "started", "stopped" or "restarted", and the unit
-/// stays put.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn an_offline_systemctl_is_never_reported_as_started_or_stopped() {
-    let id = support::random_test_id();
-    let guard = ServiceGuard::new(&id);
-    let spec = mk(guard.id());
-    let mgr = Systemd::new();
-    mgr.install(&spec, false).expect("install");
-    let budgets: [&[&str]; 3] = [&[], &["--no-timeout"], &["--timeout", "0"]];
-
-    for (verb, before) in [("start", "inactive"), ("stop", "active"), ("restart", "active")] {
-        if verb == "stop" {
-            mgr.start(&spec.id, Budget::DEFAULT).expect("start online");
-        }
-        for budget in budgets {
-            let mut args = vec!["daemon", verb, guard.id()];
-            args.extend_from_slice(budget);
-
-            let output = goetia_offline(&args);
-
-            let (stdout, stderr) = (
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-            assert_eq!(
-                output.status.code(),
-                Some(1),
-                "{args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
-            );
-            assert!(stderr.contains("without enqueuing a job"), "{args:?}: {stderr}");
-            assert_eq!(
-                active_state_and_job(guard.id()),
-                (before.to_string(), String::new()),
-                "{args:?} must leave the unit where it was"
-            );
-        }
-    }
-}
-
 /// The one `stop` with no job that is not a failure: a unit systemd cannot load, and that is not
 /// running. `systemctl stop` answers it "not loaded" (exit `5`) and enqueues nothing — there is
 /// nothing to stop — under every budget. A drop-in that empties `ExecStart=` is the unit it cannot
@@ -964,27 +912,6 @@ fn a_coloured_environment_does_not_fail_the_version_gate() {
     }
     succeeds("1", &["daemon", "uninstall", guard.id()]);
     assert!(!unit_path(guard.id()).exists(), "uninstall left the unit");
-}
-
-/// In a chroot or offline there is no running systemd to ask its version, and `install` without
-/// `--start` must still work there: systemd enables units offline, and an image build is exactly
-/// that. goetia falls back to asking `systemctl --version`.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn an_offline_install_writes_the_unit() {
-    let id = support::random_test_id();
-    let guard = ServiceGuard::new(&id);
-    let (_dir, manifest) = world_readable_manifest(guard.id());
-    let manifest = manifest.to_str().expect("utf-8 temp path");
-
-    let output = goetia_offline(&["daemon", "install", "--file", manifest, guard.id()]);
-
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "stderr:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(unit_path(guard.id()).exists(), "an offline install wrote no unit");
 }
 
 /// `goetia <args>`, elevated as this test is, with a `systemctl` first on its `PATH` whose running
@@ -1141,8 +1068,9 @@ fn goetia_logging_systemctl(dir: &Path, args: &[&str]) -> std::process::Output {
 }
 
 /// The version gate probes `systemctl` once per daemon per verb, however many steps the verb takes:
-/// `restart`'s stop and start, and `install --start`'s install and start, share one pair of probes,
-/// and so one share of the budget.
+/// `restart`'s stop and start, `install --start`'s install and start, `uninstall`'s stop, `disable`
+/// and `daemon-reload`, share one pair of probes, and so one share of the budget. `enable` and
+/// `disable` ask it too: no request is sent before the manager is asked.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn the_version_gate_probes_once_per_daemon_per_verb() {
     let id = support::random_test_id();
@@ -1169,6 +1097,10 @@ fn the_version_gate_probes_once_per_daemon_per_verb() {
         &["daemon", "restart", guard.id(), "--timeout", "0"],
         &["daemon", "start", guard.id()],
         &["daemon", "stop", guard.id()],
+        &["daemon", "enable", guard.id()],
+        &["daemon", "disable", guard.id()],
+        &["daemon", "uninstall", guard.id()],
+        &["daemon", "install", "--file", manifest, guard.id()],
     ] {
         assert_eq!(probes(args), (1, 1), "{args:?}");
     }

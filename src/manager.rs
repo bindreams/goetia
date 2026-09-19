@@ -190,9 +190,11 @@ pub trait ServiceManager {
     /// design notes on `Installed::OursUnreadable`, which exists for the
     /// same reason on the `list` side) — and [`Error::Undetermined`] for an
     /// id whose artifact could not be read at all, where not even ownership
-    /// was established.
+    /// was established. [`Error::NoManager`] where no manager can be asked
+    /// for the state, which the CLI answers for the whole verb.
     ///
     /// [`Error::Undetermined`]: crate::Error::Undetermined
+    /// [`Error::NoManager`]: crate::Error::NoManager
     fn status(&self, id: &Id) -> Result<Status>;
 
     /// Every id this backend could account for. A foreign (unmarked)
@@ -212,7 +214,12 @@ pub trait ServiceManager {
     /// putting a settled answer behind it is the same conflation
     /// [`Installed::Undetermined`] exists to end, arrived at from the other
     /// side. A scan that *started* and did not finish is the opposite case
-    /// and does report (see `Installed::scan_incomplete`).
+    /// and does report (see `Installed::scan_incomplete`). So does an entry
+    /// whose live state could not be queried, as `OursUnreadable` — except
+    /// where no manager can be asked for any entry's: that is
+    /// [`Error::NoManager`], for the whole listing.
+    ///
+    /// [`Error::NoManager`]: crate::Error::NoManager
     fn list(&self) -> Result<Vec<Installed>>;
 }
 

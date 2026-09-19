@@ -103,6 +103,9 @@ impl Systemd {
 
 impl ServiceManager for Systemd {
     fn install(&self, spec: &DaemonSpec, force: bool) -> Result<Outcome> {
+        // Before anything is written: the gate is where no manager to ask refuses too. Its answer
+        // holds for the `daemon-reload` after the write.
+        let _gate = gate_scope();
         require_supported()?;
         let identity = identity_for(&spec.user)?;
         let desired = generate::unit(spec, &identity);
@@ -181,6 +184,8 @@ impl ServiceManager for Systemd {
         let id = id.as_str();
         let expected_text = require_installed(id)?;
         let unit = unit_name(id);
+        // One version gate for the stop, the `disable` and the `daemon-reload`: the stop's.
+        let _gate = gate_scope();
 
         // Order matters: stop, then disable (needs the fragment's `[Install]` section to know which
         // symlinks to remove), then remove the fragment and any drop-in, then reload.
@@ -369,6 +374,8 @@ impl ServiceManager for Systemd {
                         pid: status.pid,
                         enabled: status.enabled,
                     }),
+                    // Not this entry's failure: no manager can be asked about any of them.
+                    Err(e @ Error::NoManager { .. }) => return Err(e),
                     Err(e) => out.push(Installed::OursUnreadable {
                         name: id.to_string(),
                         reason: format!("decoded, but its live state could not be queried: {e}"),

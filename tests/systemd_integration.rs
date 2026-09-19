@@ -13,6 +13,10 @@ mod support;
 #[path = "systemd_integration/linux.rs"]
 mod linux;
 
+#[cfg(target_os = "linux")]
+#[path = "systemd_integration/no_manager.rs"]
+mod no_manager;
+
 fn main() {
     skuld::run_all();
 }
