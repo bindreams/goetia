@@ -2,8 +2,8 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use super::{Args, Leg, SPENT, WaitArgs, leg, run_with, stop_leg};
-use crate::error::Result;
+use super::{Args, Leg, SPENT, WaitArgs, abandoned_before_start, after_start_failed, leg, run_with, stop_leg};
+use crate::error::{Error, Result};
 use crate::manager::fake::Fake;
 use crate::manager::{Budget, ServiceManager};
 use crate::spec::{DaemonSpec, Id, Kind, Restart, User};
@@ -207,4 +207,33 @@ fn a_bounded_budget_spent_before_a_confirmed_stop_reports_it_stopped_and_starts_
     assert!(err.contains("no start was issued"), "{err}");
     assert!(!err.contains("did not report stopped"), "the stop was confirmed: {err}");
     assert!(out.is_empty(), "{out}");
+}
+
+// wording =============================================================================================================
+
+fn in_doubt() -> Error {
+    Error::RequestInDoubt {
+        request: "systemctl start x.service".to_string(),
+        reached: true,
+        detail: "lost".to_string(),
+    }
+}
+
+/// A leg in doubt stays in doubt, whatever the budget, and keeps what goetia knows of how far it
+/// got — never flattened into the refused start of a restart that does not wait, or into a
+/// failure.
+#[skuld::test]
+fn a_leg_in_doubt_stays_in_doubt_under_every_budget() {
+    let id = Id::try_from("frpc").unwrap();
+    for budget in [Budget::Immediate, Budget::Unbounded, Budget::DEFAULT] {
+        for e in [
+            after_start_failed(&id, budget, in_doubt()),
+            abandoned_before_start(&id, in_doubt(), budget),
+        ] {
+            assert!(
+                matches!(e, Error::RequestInDoubt { reached: true, .. }),
+                "{budget:?}: {e:?}"
+            );
+        }
+    }
 }

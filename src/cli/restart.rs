@@ -103,7 +103,7 @@ fn restart(mgr: &dyn ServiceManager, id: &Id, budget: Budget, start_clock: &dyn 
         }
     }
     mgr.stop(id, stop_leg(budget, budget_for(deadline)))
-        .map_err(|e| abandoned_before_start(e, budget))?;
+        .map_err(|e| abandoned_before_start(id, e, budget))?;
 
     let started = match leg(budget, budget_for(deadline)) {
         Leg::Under(left) if left.waits() => mgr.start(id, left),
@@ -168,14 +168,15 @@ fn stop_leg(requested: Budget, left: Budget) -> Budget {
 // wording =============================================================================================================
 
 /// The stop leg's expiry, re-worded before it propagates — whether the stop
-/// ran out of budget itself or the budget was spent before it was issued.
-/// The variant is preserved (still exit `4`); the remedy changes, because
-/// [`budget::timed_out`]'s shared text speaks for a bare `stop` and
-/// discloses neither that the restart was abandoned nor that the daemon is
-/// left down, and so does `waited` (see [`as_given`]). Every other failure
-/// passes through untouched: a stop that determinately failed changed
-/// nothing and is still exit `1`.
-fn abandoned_before_start(e: Error, budget: Budget) -> Error {
+/// ran out of budget itself or the budget was spent before it was issued —
+/// and so is a stop in doubt, which may have stopped the daemon too. The
+/// variant is preserved (still exit `4`); the words change, because the
+/// shared texts — [`budget::timed_out`]'s, and the in-doubt request's — speak
+/// for a bare `stop` and disclose neither that the restart was abandoned nor
+/// that the daemon may be left down, and so does `waited` (see
+/// [`as_given`]). Every other failure passes through untouched: a stop that
+/// determinately failed changed nothing and is still exit `1`.
+fn abandoned_before_start(id: &Id, e: Error, budget: Budget) -> Error {
     match e {
         Error::WaitTimeout {
             id, awaited, waited, ..
@@ -190,6 +191,19 @@ fn abandoned_before_start(e: Error, budget: Budget) -> Error {
             ),
             id,
             awaited,
+        },
+        Error::RequestInDoubt {
+            request,
+            reached,
+            detail,
+        } => Error::RequestInDoubt {
+            request,
+            reached,
+            detail: format!(
+                "the restart was abandoned: no start was issued, so `{id}` may be left stopped. `goetia daemon \
+                 status {id}` shows the manager's current view, and `goetia daemon start {id}` brings it back up: \
+                 {detail}"
+            ),
         },
         other => other,
     }
@@ -240,8 +254,9 @@ fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
             reason: format!("{}: {reason}", after_stop_clause(budget)),
             recovery,
         },
-        // The start may or may not have reached the manager: kept as it is,
-        // ahead of the non-waiting arm below, whose "refused" it was not.
+        // The start may have reached the manager: kept as it is, ahead of the
+        // non-waiting arm below, whose "refused" it was not, and never called a
+        // failure to restart, which is what it did not establish.
         Error::RequestInDoubt {
             request,
             reached,
@@ -249,7 +264,7 @@ fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
         } => Error::RequestInDoubt {
             request,
             reached,
-            detail: format!("{}: {detail}", after_stop_clause(budget)),
+            detail: format!("{}: {detail}", start_after_stop_clause(id, budget)),
         },
         // The stop was issued and not waited for, and the start that
         // followed was refused — determinately (a launchd `bootstrap` that
@@ -288,6 +303,16 @@ fn as_given(budget: Budget, leg_waited: Duration) -> Duration {
     match budget {
         Budget::Bounded(given) => given,
         Budget::Immediate | Budget::Unbounded => leg_waited,
+    }
+}
+
+/// What the stop leg established, as the clause a start in doubt hangs off:
+/// that it was attempted, never that it failed.
+fn start_after_stop_clause(id: &Id, budget: Budget) -> String {
+    if budget.waits() {
+        format!("`{id}` was stopped, and this start was attempted after it")
+    } else {
+        "the stop was issued without waiting for it, and this start was attempted after it".to_string()
     }
 }
 

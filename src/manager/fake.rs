@@ -99,6 +99,8 @@ struct Store {
     stop_stalls: BTreeSet<String>,
     /// Ids whose start request ends in doubt — see [`Fake::seed_start_in_doubt`].
     start_in_doubt: BTreeSet<String>,
+    /// [`Fake::seed_stop_in_doubt`]'s mirror of `start_in_doubt`.
+    stop_in_doubt: BTreeSet<String>,
     /// Whether this Fake has a request-only restart — see
     /// [`Fake::seed_native_restart`].
     native_restart: bool,
@@ -392,6 +394,12 @@ impl Fake {
         state.start_in_doubt.insert(id.to_string());
     }
 
+    /// [`Fake::seed_start_in_doubt`]'s mirror for `stop`.
+    pub fn seed_stop_in_doubt(&self, id: &str) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.stop_in_doubt.insert(id.to_string());
+    }
+
     /// [`Fake::seed_start_stalls`]'s mirror for `stop`.
     pub fn seed_stop_stalls(&self, id: &str) {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
@@ -567,9 +575,14 @@ fn discover(state: &Store, id: &str) -> (Ownership, Option<String>) {
 
 /// [`Fake::seed_start_in_doubt`]'s failure, for a start of `id`.
 fn in_doubt(state: &Store, id: &Id) -> Result<()> {
-    if state.start_in_doubt.contains(id.as_str()) {
+    lost(&state.start_in_doubt, "start", id)
+}
+
+/// The failure a `seed_*_in_doubt` seeded in `ids`, for a `verb` of `id`.
+fn lost(ids: &BTreeSet<String>, verb: &str, id: &Id) -> Result<()> {
+    if ids.contains(id.as_str()) {
         return Err(Error::RequestInDoubt {
-            request: format!("fake start {id}"),
+            request: format!("fake {verb} {id}"),
             reached: false,
             detail: "lost (seeded)".to_string(),
         });
@@ -780,6 +793,7 @@ impl ServiceManager for Fake {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.calls.push(("stop", id.as_str().to_string()));
         state.asked("stop", id);
+        lost(&state.stop_in_doubt, "stop", id)?;
         let stalls = state.stop_stalls.contains(id.as_str());
         let manager = state.manager();
         let entry = state.get_mut(id)?;

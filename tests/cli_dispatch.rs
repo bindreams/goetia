@@ -3205,7 +3205,9 @@ fn a_restart_that_waits_never_takes_the_request_only_restart() {
 /// A start that may or may not have reached the manager is indeterminate — exit `4`, never the `1`
 /// that says it failed — through every verb that starts: `start`, `install --start`, and
 /// `restart`'s start leg under a budget that waits and one that does not, where the stop before it
-/// is disclosed as the leg left it.
+/// is disclosed as the leg left it. Never as a failure to restart, which is not what was
+/// established, and never, under the budget that does not wait, as the refused start after an
+/// unconfirmed stop it is not.
 #[skuld::test]
 fn a_start_in_doubt_exits_4_through_every_verb_that_starts() {
     let dir = tempfile::tempdir().unwrap();
@@ -3216,11 +3218,11 @@ fn a_start_in_doubt_exits_4_through_every_verb_that_starts() {
         (&["goetia", "daemon", "install", "--file", manifest, "--start"], ""),
         (
             &["goetia", "daemon", "restart", "frpc"],
-            "stopped but failed to restart",
+            "`frpc` was stopped, and this start was attempted after it",
         ),
         (
             &["goetia", "daemon", "restart", "frpc", "--timeout", "0"],
-            "the stop was issued without waiting for it",
+            "the stop was issued without waiting for it, and this start was attempted after it",
         ),
     ] {
         let fake = Fake::new();
@@ -3235,6 +3237,35 @@ fn a_start_in_doubt_exits_4_through_every_verb_that_starts() {
             "{args:?}: {err}"
         );
         assert!(err.contains(disclosed), "{args:?}: {err}");
+        for claim in ["failed to restart", "refused", "not established"] {
+            assert!(!err.contains(claim), "{args:?}: {err}");
+        }
+    }
+}
+
+/// A stop in doubt may have stopped the daemon, and `restart` goes no further: it says so — no
+/// start was issued, and the daemon may be left stopped — as it does for a stop that timed out.
+/// Exit `4`, under every budget.
+#[skuld::test]
+fn a_stop_in_doubt_abandons_the_restart_and_says_so() {
+    for budget in [&[][..], &["--no-timeout"], &["--timeout", "0"]] {
+        let fake = Fake::new();
+        fake.install(&mk("frpc"), false).unwrap();
+        fake.seed_stop_in_doubt("frpc");
+        let mut args = vec!["goetia", "daemon", "restart", "frpc"];
+        args.extend_from_slice(budget);
+
+        let (code, out, err) = dispatch_elevated(&args, &fake);
+
+        assert_eq!(code, 4, "{budget:?}\nstdout:\n{out}\nstderr:\n{err}");
+        for said in [
+            "may or may not have reached the service manager",
+            "no start was issued, so `frpc` may be left stopped",
+            "goetia daemon start frpc",
+        ] {
+            assert!(err.contains(said), "{budget:?}: {err}");
+        }
+        assert_eq!(fake.calls(), vec![("stop", "frpc".to_string())], "{budget:?}");
     }
 }
 
