@@ -913,6 +913,20 @@ fn every_launchd_verb_path_stays_inside_its_reservation() {
     drop(prepared);
     script.assert_driven("install --start");
 
+    // `status` counts nothing, so it draws on no reservation: inside one with spares left, and one
+    // spent, it makes its own files, trips no assertion, and leaves the pool as it was.
+    let script = Scripted::new(&[("print", RUNNING), ("bootout", DONE), ("print", RUNNING)]);
+    let prepared = mgr.prepare(&[Step::Stop], Budget::DEFAULT).unwrap();
+    let pooled = bounded::test_hook::pooled();
+    assert_eq!(mgr.status(&id).expect("status").state, State::Running);
+    assert_eq!(bounded::test_hook::pooled(), pooled, "status drew on the reservation");
+    mgr.stop(&id, Budget::DEFAULT).expect("stop");
+    exhausted();
+    assert_eq!(mgr.status(&id).expect("status").state, State::Running);
+    exhausted();
+    drop(prepared);
+    script.assert_driven("status inside a reservation");
+
     let script = Scripted::new(&BOOTOUT);
     mgr.uninstall(&id).expect("uninstall");
     script.assert_driven("uninstall");

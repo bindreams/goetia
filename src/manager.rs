@@ -123,8 +123,9 @@ pub trait ServiceManager {
     /// later would strand the daemon halfway: stopped by `restart`'s stop
     /// with its start never sent, or booted out by `install --start`'s
     /// install with the start never sent. Held for as long as the returned
-    /// [`Prepared`] lives, for verbs run on this thread — any of them, for
-    /// any id, may draw on it meanwhile. Preparations nest and may be
+    /// [`Prepared`] lives, for verbs run on this thread — any step of them,
+    /// for any id, may draw on it meanwhile; `status` and `list` never do,
+    /// and make what they need for themselves. Preparations nest and may be
     /// dropped in any order: dropping one releases only what it made.
     /// Nothing, by default — so a wrapper around another manager forwards
     /// it.

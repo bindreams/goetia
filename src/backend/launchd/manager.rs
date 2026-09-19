@@ -1042,9 +1042,11 @@ fn files(id: &Id, calls: usize) -> Result<bounded::Spares> {
 
 /// Best-effort live state for `status` and `list`: [`live_state`], with a
 /// `launchctl` that cannot be run at all degraded to `(State::Unknown,
-/// None)` rather than taking down `status`/`list` for every other entry.
+/// None)` rather than taking down `status`/`list` for every other entry. A
+/// read neither verb counted, so it never draws on a reservation a library
+/// caller may hold ([`Role::UncountedQuery`]).
 fn query_live_state(id: &str, deadline: Deadline) -> (State, Option<u32>) {
-    live_state(id, deadline).unwrap_or((State::Unknown, None))
+    read_live_state(id, deadline, Role::UncountedQuery).unwrap_or((State::Unknown, None))
 }
 
 /// Live state, read from `launchctl print`'s body — the one place this
@@ -1054,11 +1056,16 @@ fn query_live_state(id: &str, deadline: Deadline) -> (State, Option<u32>) {
 /// `launchctl` could not be run at all, which `start` must not mistake for a
 /// job that is not running: it would act on it.
 fn live_state(id: &str, deadline: Deadline) -> Result<(State, Option<u32>)> {
+    read_live_state(id, deadline, Role::Query)
+}
+
+/// [`live_state`], read as `role`.
+fn read_live_state(id: &str, deadline: Deadline, role: Role) -> Result<(State, Option<u32>)> {
     // An expiry degrades to `Unknown`, as a capture that is not whole would:
     // a state this did not fully read is a state it does not know. The two
     // budgeted verbs check the deadline themselves wherever an `Unknown`
     // would otherwise become a wrong error.
-    let Some(ran) = launchctl(&["print", &target(id)], deadline, Role::Query)? else {
+    let Some(ran) = launchctl(&["print", &target(id)], deadline, role)? else {
         return Ok((State::Unknown, None));
     };
     Ok(classified(&ran))

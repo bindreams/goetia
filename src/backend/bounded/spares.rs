@@ -166,9 +166,9 @@ fn made_on_the_spot(what: &str) {
 
 /// Make `needs` ready now, all or none, for the verbs this thread runs while the returned guard lives
 /// — a sequence, such as `restart`'s stop and start, whose later verbs must not fail for want of a
-/// thread or a file once an earlier one has sent something. Any verb run on this thread meanwhile may
-/// draw on them. Dropping the guard drops what is left of its own, and only that: guards nest, and
-/// end in any order.
+/// thread or a file once an earlier one has sent something. Any step run on this thread meanwhile
+/// may draw on them; a read no step counted never does ([`super::Role::UncountedQuery`]). Dropping
+/// the guard drops what is left of its own, and only that: guards nest, and end in any order.
 pub(crate) fn spare(needs: Needs) -> io::Result<Spares> {
     let reapers = made(needs.reapers, Reaper::new)?;
     let listeners = made(needs.listeners, Listener::new)?;
@@ -263,6 +263,12 @@ pub(super) fn file() -> io::Result<File> {
             make_file()
         }
     }
+}
+
+/// An empty anonymous temp file for a stream of a read no verb counted: made now, never a spare,
+/// wherever a reservation is live — see [`super::Role::UncountedQuery`].
+pub(super) fn own_file() -> io::Result<File> {
+    make_file()
 }
 
 fn make_file() -> io::Result<File> {

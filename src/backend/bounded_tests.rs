@@ -627,6 +627,42 @@ fn making_on_the_spot_inside_a_reservation_is_loud() {
     drop(top_up(files(1)).expect("no reservation is live"));
 }
 
+/// A read no verb counted — launchd's `status` and `list`, which a library caller may run while it
+/// holds a preparation — makes its own files on the spot: inside a reservation with spares left, or
+/// one already spent, it draws nothing from the pool and trips no assertion. A file it cannot make
+/// fails it before it runs, and leaves the pool as it was.
+#[skuld::test]
+fn an_uncounted_query_never_draws_on_a_reservation() {
+    for spares_left in [2, 0] {
+        let _reserved = spare(files(spares_left)).unwrap();
+        let pooled = test_hook::pooled();
+
+        let finished = wait_bounded(spawned(sh("echo hi"), Role::UncountedQuery), Budget::Unbounded.start()).unwrap();
+        assert!(
+            matches!(&finished, Finished::Exited { capture, .. } if capture.stdout == b"hi\n"),
+            "{spares_left}: {finished:?}"
+        );
+        assert_eq!(
+            test_hook::pooled(),
+            pooled,
+            "{spares_left}: the read drew on the reservation"
+        );
+
+        let _no_file = test_hook::temp_files(0);
+        let spawns = test_hook::spawns();
+        match spawn(&mut sh("true"), Role::UncountedQuery) {
+            Err(SpawnError::NotRun(e)) => assert!(e.to_string().contains("temp file"), "{e}"),
+            other => panic!("{spares_left}: {:?}", other.map(|_| "spawned")),
+        }
+        assert_eq!(test_hook::spawns(), spawns, "{spares_left}: the read ran");
+        assert_eq!(
+            test_hook::pooled(),
+            pooled,
+            "{spares_left}: the failed read touched the pool"
+        );
+    }
+}
+
 // Spares ==============================================================================================================
 
 fn reapers_only(n: usize) -> Needs {

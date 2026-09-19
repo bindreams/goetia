@@ -81,10 +81,15 @@ pub(crate) enum Finished {
 // `launchctl` does not.
 #[derive(Debug)]
 pub(crate) enum Role {
-    /// A read. Killing it on expiry loses nothing. Its output goes to temp files, read once it has
-    /// exited.
+    /// A read a verb counted among its calls. Killing it on expiry loses nothing. Its output goes to
+    /// temp files, read once it has exited, taken from the verb's reservation.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Query,
+    /// A read no verb counted — launchd's `status` and `list` — as [`Role::Query`], except that its
+    /// files are made for it on the spot, whatever reservation is live: it never draws on one,
+    /// which only the requests' steps counted for, and failing to make one sends nothing.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    UncountedQuery,
     /// A request that says on stderr when the manager has it: `issued` holds once it has. Until
     /// then the wait is unbounded; only after it does the deadline apply, and killing the child
     /// then cancels nothing. Both its streams are pipes, each read as it is written by a thread
@@ -133,6 +138,7 @@ impl Ready {
                 Ready::Listener(spares::listener().map_err(not_run("thread to read its output"))?)
             }
             Role::Query | Role::Request(_) => Ready::File(spares::file().map_err(not_run("temp file for its output"))?),
+            Role::UncountedQuery => Ready::File(spares::own_file().map_err(not_run("temp file for its output"))?),
         })
     }
 
@@ -307,7 +313,7 @@ fn waited_out(
             reaper.reap(child);
             return Ok(Finished::Expired);
         }
-        (None, Role::Query | Role::AnnouncedRequest(_)) => {
+        (None, Role::Query | Role::UncountedQuery | Role::AnnouncedRequest(_)) => {
             // The root first, and its `Ok` is what makes the reap below unable to block.
             child.kill()?;
             // Then the tree, best-effort. What this achieves that `Drop` (at the end of
