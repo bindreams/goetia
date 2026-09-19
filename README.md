@@ -28,16 +28,17 @@ goetia does not manage systemd offline or from a chroot: it works only
 through the running systemd manager of the system it runs on. Where it finds
 `SYSTEMD_OFFLINE` set; a `/` of goetia's own rather than the system's —
 either one other than PID 1's root (a chroot, or a container sharing the
-host's PID namespace), or one that is no mount at all, which only `chroot(2)`
-leaves, seen in `/proc/1/root`, or in the mount tables wherever that cannot
-be read; `/run/systemd/system` missing; or `systemctl` reporting a
-chroot — a verb that would reach systemd exits `1` before it writes or sends
-anything, with one message naming the first of these it found. That last one
-cannot be turned off from the environment: `systemctl` runs with
-`SYSTEMD_IGNORE_CHROOT` and `SYSTEMD_IN_CHROOT` removed, so an inherited one
-cannot stop it detecting a chroot goetia could not see for itself. `install`
-always reaches it; the other verbs only for a daemon of goetia's, and they
-answer from files alone otherwise:
+host's PID namespace), seen in `/proc/1/root` or, where that cannot be read,
+in the mount tables, or one that is no mount at all, which only `chroot(2)`
+leaves and which the mount tables show on their own; `/run/systemd/system`
+missing; or `systemctl` reporting a chroot — a verb that would reach systemd
+exits `1` before it writes or sends anything, with one message naming the
+first of these it found. That last one cannot be turned off from the
+environment: `systemctl` runs with `SYSTEMD_IGNORE_CHROOT` and
+`SYSTEMD_IN_CHROOT` removed, so an inherited one cannot stop it detecting a
+chroot goetia could not see for itself. `install` always reaches it; the
+other verbs only for a daemon of goetia's, and they answer from files alone
+otherwise:
 
 - `uninstall`, `start`, `stop`, `restart`, `enable` and `disable` refuse
   an id goetia finds its own, and answer any other as anywhere else — for
@@ -1010,11 +1011,11 @@ sources are not interchangeable, and the remedies do not transfer:
   cannot see. `goetia daemon uninstall <id>` is the remedy for a blob that
   would not decode, and needs neither the blob nor a live state. It is not
   a remedy for the other: its `disable` goes through the manager too, and
-  fails the same way, exit `1`, leaving the artifact where it was. What
-  that case means is that goetia and the manager are reading different unit
-  directories — goetia's own mount namespace, say — and nothing run from
-  inside it, `systemctl daemon-reload` included, brings the two back into
-  view of each other.
+  fails the same way, exit `1`, leaving the artifact where it was. Nor is
+  `systemctl daemon-reload`, and the reason is what the case is: systemd
+  loads a unit file it can see on demand, so having none for a name goetia
+  found a file for means the two are not reading the same directory —
+  goetia's own mount namespace, say — which no goetia verb changes.
 - **`undetermined`** — a name goetia could not classify at all. The read
   that would have said whose it is never completed, so ownership is
   unestablished. Remedy: read it with more privilege.

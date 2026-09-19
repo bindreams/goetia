@@ -345,12 +345,14 @@ fn identity(path: &str) -> std::io::Result<(u64, u64)> {
 }
 
 /// How `/` is established to be a root of goetia's own, if it is. `root` and `init_root`, both
-/// read, decide, either way: that is `running_in_chroot()`'s own check. A stat that failed — `EACCES` on
-/// `/proc/1/root` for a caller that may not trace PID 1, or no `/proc` — establishes nothing, and
-/// leaves it to the mount `tables` ([`mounts_differ`]); where they establish nothing either, the
-/// other checks and systemctl's own report ([`answered`]) decide. Read regardless of
-/// `SYSTEMD_IN_CHROOT`: in a chroot with `/run` bound in, a `systemctl` told it is not in one asks
-/// the host's manager about units goetia writes into the chroot.
+/// read, decide, either way: that is `running_in_chroot()`'s own check. A stat that failed —
+/// `EACCES` on `/proc/1/root` for a caller that may not trace PID 1, or no `/proc` — establishes
+/// nothing, and leaves it to the mount `tables` ([`mounts_differ`]); where they establish nothing
+/// either, the other checks and systemctl's own report ([`answered`]) decide.
+///
+/// Read regardless of `SYSTEMD_IN_CHROOT`: this is goetia's own evidence, and a declaration in the
+/// environment is evidence of nothing. The child is not left to trust it either — [`UNSET`] takes
+/// it away — so neither half of the check can be told to look away.
 fn chroot_from(
     root: std::io::Result<(u64, u64)>,
     init_root: std::io::Result<(u64, u64)>,
