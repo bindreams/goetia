@@ -314,6 +314,30 @@ fn a_request_run_to_completion_is_in_doubt_only_once_it_ran() {
     assert!(matches!(e, Error::RequestInDoubt { .. }), "{e:?}");
 }
 
+/// A `daemon-reload` in doubt after `install` wrote the unit stays in doubt — exit `4` — and says
+/// the unit was written; any other failure there is exit `1`, and says so too.
+#[skuld::test]
+fn a_reload_in_doubt_after_the_write_stays_in_doubt() {
+    let _stand_in = stand_in::set(Some(&gate_passes_then("exit 0")), booted());
+    bounded::test_hook::wait_fails(|| std::io::Error::other("the wait failed").into());
+    let e = daemon_reload_or_report("x").expect_err("injected");
+    assert!(
+        matches!(&e, Error::RequestInDoubt { request, reached: false, .. } if request == "systemctl daemon-reload"),
+        "{e:?}"
+    );
+    let msg = e.to_string();
+    assert!(msg.contains("wrote the unit for `x`"), "{msg}");
+    assert!(msg.contains("the wait failed"), "{msg}");
+
+    drop(_stand_in);
+    let _stand_in = stand_in::set(Some(&gate_passes_then("echo 'Access denied' >&2; exit 1")), booted());
+    let e = daemon_reload_or_report("x").expect_err("refused");
+    assert!(matches!(e, Error::Other(_)), "{e:?}");
+    let msg = e.to_string();
+    assert!(msg.contains("wrote the unit for `x`"), "{msg}");
+    assert!(msg.contains("Access denied"), "{msg}");
+}
+
 /// A watched `systemctl` needs no temp file: it runs where none may be writable.
 #[skuld::test]
 fn a_watched_request_needs_no_temp_file() {

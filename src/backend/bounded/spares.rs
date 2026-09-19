@@ -302,7 +302,7 @@ pub(crate) mod test_hook {
     }
 
     /// The failure [`wait_fails`] set up for this wait, if any.
-    pub(in crate::backend::bounded) fn waiting() -> Option<cosca::error::Error> {
+    pub(crate) fn waiting() -> Option<cosca::error::Error> {
         WAIT_FAILS.take().map(|error| error())
     }
 

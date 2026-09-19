@@ -256,7 +256,14 @@ pub(super) fn run_systemctl(args: &[&str]) -> Result<std::process::Output> {
 /// already be out: [`Error::RequestInDoubt`], never the plain failure that says it was not sent.
 /// `Command::output()` would merge the two; its stdin, `/dev/null`, is kept.
 fn requested(cmd: &mut Command, program: &str, args: &[&str]) -> Result<std::process::Output> {
-    requested_with(cmd, program, args, std::process::Child::wait_with_output)
+    requested_with(cmd, program, args, |child| {
+        #[cfg(test)]
+        if let Some(e) = bounded::test_hook::waiting() {
+            child.wait_with_output()?;
+            return Err(std::io::Error::other(e.to_string()));
+        }
+        child.wait_with_output()
+    })
 }
 
 /// [`requested`], with how the running child is waited on named, so a test can make that fail.
@@ -293,13 +300,24 @@ pub(super) fn daemon_reload() -> Result<()> {
 }
 
 /// `daemon-reload` after a unit file write that itself succeeded. A failure here must not be reported
-/// as a successful install — the on-disk artifact and systemd's loaded view of it have diverged.
+/// as a successful install — the on-disk artifact and systemd's loaded view of it may have diverged
+/// — and says the unit was written. A reload in doubt stays in doubt, exit `4`; any other failure
+/// is exit `1`.
 pub(super) fn daemon_reload_or_report(id: &str) -> Result<()> {
-    daemon_reload().map_err(|e| {
-        Error::Other(format!(
+    daemon_reload().map_err(|e| match e {
+        Error::RequestInDoubt {
+            request,
+            reached,
+            detail,
+        } => Error::RequestInDoubt {
+            request,
+            reached,
+            detail: format!("wrote the unit for `{id}`, so systemd may not have picked it up yet: {detail}"),
+        },
+        e => Error::Other(format!(
             "wrote the unit for `{id}` but `systemctl daemon-reload` failed, so systemd may not have \
              picked it up yet: {e}"
-        ))
+        )),
     })
 }
 
