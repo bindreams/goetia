@@ -26,7 +26,9 @@ that. And every `start` and `stop` runs `systemctl --show-transaction` (242+).
 
 goetia does not manage systemd offline or in a chroot. Where no running
 systemd can be asked — `SYSTEMD_OFFLINE` is set, `/run/systemd/system` does not
-exist, `/` is not PID 1's root (a chroot), or `systemctl` reports a chroot —
+exist, `/` is not PID 1's root (a chroot, or a container sharing the host's
+PID namespace — seen in `/proc/1/root`, or unelevated in the mount tables), or
+`systemctl` reports a chroot —
 every verb that reaches systemd exits `1` before it writes or sends anything,
 with one message naming which it found. That is `install`, `uninstall`, `start`, `stop`, `restart`,
 `enable`, `disable`, `status`, `list`, and `show` without `--file`, which reads

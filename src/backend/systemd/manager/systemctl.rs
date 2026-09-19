@@ -48,8 +48,8 @@ const IGNORED: [&str; 2] = ["ignoring command", "ignoring request"];
 
 /// Every `systemctl` answer, checked before anything reads it as one: an answer saying it ignored
 /// what it was asked ([`IGNORED`]) is the refusal on every path, and never a success: the backstop
-/// for what [`door`] could not see — a chroot whose `/proc/1/root` goetia may not read, or one
-/// `SYSTEMD_IN_CHROOT` declares.
+/// for what [`door`] could not see — a chroot neither `/proc/1/root` nor the mount tables show
+/// goetia, as where PID 1's `/proc` entries are hidden from it, or one `SYSTEMD_IN_CHROOT` declares.
 fn answered(stdout: &[u8], stderr: &[u8]) -> Result<()> {
     let ignored = |stream: &[u8]| {
         String::from_utf8_lossy(stream)
@@ -177,8 +177,9 @@ enum Evidence {
     Offline(String),
     /// `/run/systemd/system` does not exist: systemd is not this system's init (`sd_booted()`).
     NotBooted,
-    /// `/` is not PID 1's root: this runs in a chroot (`running_in_chroot()`).
-    Chroot,
+    /// `/` is not PID 1's root, found as this says: a chroot (`running_in_chroot()`), or a
+    /// container sharing the host's PID namespace.
+    Chroot(Chroot),
     /// `systemctl` said, in this line, that it ignored what it was asked: its chroot report.
     Ignored(String),
 }
@@ -188,7 +189,24 @@ impl std::fmt::Display for Evidence {
         match self {
             Evidence::Offline(value) => write!(f, "`SYSTEMD_OFFLINE={value}` is set"),
             Evidence::NotBooted => write!(f, "`{SD_BOOTED}` does not exist, so systemd is not this system's init"),
-            Evidence::Chroot => write!(f, "`/` is not PID 1's root (`{INIT_ROOT}`), so this runs in a chroot"),
+            Evidence::Chroot(found) => {
+                match found {
+                    Chroot::Root => write!(f, "`/` is not PID 1's root (`{INIT_ROOT}`)")?,
+                    Chroot::Mount => write!(
+                        f,
+                        "the mount at `/` is none of PID 1's (`{OWN_MOUNTS}`, `{INIT_MOUNTS}`)"
+                    )?,
+                    Chroot::NoMount => write!(
+                        f,
+                        "no mount is at `/` (`{OWN_MOUNTS}`), where PID 1 has one (`{INIT_MOUNTS}`)"
+                    )?,
+                }
+                write!(
+                    f,
+                    ", so goetia runs under another root than PID 1, as in a chroot or a container sharing the host's \
+                     PID namespace"
+                )
+            }
             Evidence::Ignored(line) => write!(f, "`systemctl` said {line:?}"),
         }
     }
@@ -200,6 +218,22 @@ const SD_BOOTED: &str = "/run/systemd/system";
 /// PID 1's root, which `running_in_chroot()` compares `/` with.
 const INIT_ROOT: &str = "/proc/1/root";
 
+/// goetia's mount table, and PID 1's: each lists the mounts its process sees, `/` included.
+const OWN_MOUNTS: &str = "/proc/self/mountinfo";
+const INIT_MOUNTS: &str = "/proc/1/mountinfo";
+
+/// How goetia established that its `/` is not PID 1's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Chroot {
+    /// `/` and [`INIT_ROOT`] are different directories — see [`identities_differ`]. Readable only
+    /// to a caller that may trace PID 1.
+    Root,
+    /// The mount at `/` is none of PID 1's — see [`mounts_differ`]. Readable unelevated.
+    Mount,
+    /// No mount is at `/` where one is at PID 1's: `/` is a directory inside one.
+    NoMount,
+}
+
 /// What goetia reads of this system without asking `systemctl`: a seam, so a test can stand any
 /// system in.
 #[derive(Debug, Clone)]
@@ -208,8 +242,8 @@ pub(super) struct Host {
     offline: Option<String>,
     /// [`SD_BOOTED`] is established absent — see [`established_absent`].
     unbooted: bool,
-    /// `/` is established not to be [`INIT_ROOT`] — see [`identities_differ`].
-    chrooted: bool,
+    /// `/` is established not to be PID 1's root, and how.
+    chroot: Option<Chroot>,
 }
 
 impl Host {
@@ -217,7 +251,14 @@ impl Host {
         Host {
             offline: std::env::var("SYSTEMD_OFFLINE").ok(),
             unbooted: established_absent(std::path::Path::new(SD_BOOTED)),
-            chrooted: identities_differ(identity("/"), identity(INIT_ROOT)),
+            chroot: if identities_differ(identity("/"), identity(INIT_ROOT)) {
+                Some(Chroot::Root)
+            } else {
+                mounts_differ(
+                    std::fs::read_to_string(OWN_MOUNTS),
+                    std::fs::read_to_string(INIT_MOUNTS),
+                )
+            },
         }
     }
 
@@ -227,10 +268,8 @@ impl Host {
             Some(Evidence::Offline(value.to_string()))
         } else if self.unbooted {
             Some(Evidence::NotBooted)
-        } else if self.chrooted {
-            Some(Evidence::Chroot)
         } else {
-            None
+            self.chroot.map(Evidence::Chroot)
         }
     }
 }
@@ -244,11 +283,50 @@ fn identity(path: &str) -> std::io::Result<(u64, u64)> {
 
 /// Whether `/` and PID 1's root are established to differ: two identities read, and different. A
 /// stat that failed — `EACCES` on `/proc/1/root` for a caller that may not trace PID 1, or no
-/// `/proc` — establishes nothing, so the other checks and systemctl's own report ([`answered`])
-/// decide. Read regardless of `SYSTEMD_IN_CHROOT`: in a chroot with `/run` bound in, a `systemctl`
-/// told it is not in one asks the host's manager about units goetia writes into the chroot.
+/// `/proc` — establishes nothing, so the mount tables ([`mounts_differ`]), the other checks and
+/// systemctl's own report ([`answered`]) decide. Read regardless of `SYSTEMD_IN_CHROOT`: in a
+/// chroot with `/run` bound in, a `systemctl` told it is not in one asks the host's manager about
+/// units goetia writes into the chroot.
 fn identities_differ(root: std::io::Result<(u64, u64)>, init_root: std::io::Result<(u64, u64)>) -> bool {
     matches!((root, init_root), (Ok(root), Ok(init_root)) if root != init_root)
+}
+
+/// Whether goetia's mount table, `own`, establishes that its `/` is not PID 1's, from PID 1's,
+/// `init`: `init` read and with a mount at `/`, and `own` read with none at `/`, or with none of
+/// PID 1's there — the same mount being its device and its root within that device. Readable where
+/// `/proc/1/root` is not: an unelevated `systemctl` in a chroot with `/run` bound in cannot tell it
+/// is in one, and asks the host's manager about a unit it does not have. A table that could not be
+/// read, or a PID 1 with no mount at `/`, establishes nothing. A private mount namespace whose `/`
+/// is PID 1's filesystem at the same root — a service's `ProtectSystem=` — lists the same mount.
+fn mounts_differ(own: std::io::Result<String>, init: std::io::Result<String>) -> Option<Chroot> {
+    let (Ok(own), Ok(init)) = (own, init) else {
+        return None;
+    };
+    let init = root_mounts(&init);
+    if init.is_empty() {
+        return None;
+    }
+    let own = root_mounts(&own);
+    if own.is_empty() {
+        Some(Chroot::NoMount)
+    } else if own.iter().any(|mount| init.contains(mount)) {
+        None
+    } else {
+        Some(Chroot::Mount)
+    }
+}
+
+/// The mounts a mount table lists at `/`: each one's device, `major:minor`, and its root within
+/// that device — fields 3, 4 and 5 of `proc_pid_mountinfo(5)`, the fifth being the mount point.
+fn root_mounts(table: &str) -> Vec<(&str, &str)> {
+    table
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(' ').skip(2);
+            let (device, root, point) = (fields.next()?, fields.next()?, fields.next()?);
+            (point == "/").then_some((device, root))
+        })
+        .collect()
 }
 
 /// Whether `dir` is established not to be a directory, as `sd_booted()`'s `laccess("…/")` finds

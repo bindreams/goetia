@@ -501,7 +501,7 @@ fn booted() -> Host {
     Host {
         offline: None,
         unbooted: false,
-        chrooted: false,
+        chroot: None,
     }
 }
 
@@ -575,7 +575,7 @@ fn evidence_known_without_asking_refuses_every_path_before_anything_runs() {
             Host {
                 offline: Some("1".to_string()),
                 unbooted: false,
-                chrooted: false,
+                chroot: None,
             },
             "`SYSTEMD_OFFLINE=1` is set",
         ),
@@ -583,7 +583,7 @@ fn evidence_known_without_asking_refuses_every_path_before_anything_runs() {
             Host {
                 offline: None,
                 unbooted: true,
-                chrooted: false,
+                chroot: None,
             },
             "`/run/systemd/system` does not exist",
         ),
@@ -591,9 +591,28 @@ fn evidence_known_without_asking_refuses_every_path_before_anything_runs() {
             Host {
                 offline: None,
                 unbooted: false,
-                chrooted: true,
+                chroot: Some(Chroot::Root),
             },
-            "`/` is not PID 1's root (`/proc/1/root`), so this runs in a chroot",
+            "`/` is not PID 1's root (`/proc/1/root`), so goetia runs under another root than PID 1, as in a \
+             chroot or a container sharing the host's PID namespace",
+        ),
+        (
+            Host {
+                offline: None,
+                unbooted: false,
+                chroot: Some(Chroot::Mount),
+            },
+            "the mount at `/` is none of PID 1's (`/proc/self/mountinfo`, `/proc/1/mountinfo`), so goetia runs \
+             under another root than PID 1",
+        ),
+        (
+            Host {
+                offline: None,
+                unbooted: false,
+                chroot: Some(Chroot::NoMount),
+            },
+            "no mount is at `/` (`/proc/self/mountinfo`), where PID 1 has one (`/proc/1/mountinfo`), so goetia \
+             runs under another root than PID 1",
         ),
     ];
     for (host, evidence) in hosts {
@@ -930,7 +949,7 @@ fn a_remembered_pass_does_not_skip_the_evidence() {
         Host {
             offline: Some("yes".to_string()),
             unbooted: false,
-            chrooted: false,
+            chroot: None,
         },
     );
     assert_no_manager(daemon_reload(), "`SYSTEMD_OFFLINE=yes` is set", "daemon-reload");
@@ -1024,6 +1043,78 @@ fn only_two_roots_read_and_different_are_evidence_of_a_chroot() {
     }
 }
 
+/// A mount table: one line for each `(device, root, mount point)`, the other fields as a real one
+/// has them.
+fn table(mounts: &[(&str, &str, &str)]) -> std::io::Result<String> {
+    Ok(mounts
+        .iter()
+        .enumerate()
+        .map(|(n, (device, root, point))| {
+            format!(
+                "{} 1 {device} {root} {point} rw,relatime shared:{n} - ext4 /dev/sda1 rw\n",
+                n + 22
+            )
+        })
+        .collect())
+}
+
+/// goetia's `/` is not PID 1's, by the mount tables, only when PID 1's is read and has a mount at
+/// `/`, and goetia's is read and has none there, or none of PID 1's: a device and a root within it
+/// both make a mount. Shapes measured on this host: a tmpfs chroot (`0:131 /` against `8:1 /`) and
+/// a directory chroot, where no mount is at `/`.
+#[skuld::test]
+fn only_a_mount_table_without_pid_1s_mount_at_root_is_evidence_of_a_chroot() {
+    let failed = |errno| Err(std::io::Error::from_raw_os_error(errno));
+    let host = [("8:1", "/", "/"), ("0:25", "/", "/proc"), ("8:1", "/usr", "/usr")];
+    let cases = [
+        ("the host", table(&host), None),
+        (
+            "a tmpfs root",
+            table(&[("0:131", "/", "/"), ("8:1", "/usr", "/usr")]),
+            Some(Chroot::Mount),
+        ),
+        (
+            "a directory root",
+            table(&[("8:1", "/usr", "/usr"), ("0:5", "/", "/dev")]),
+            Some(Chroot::NoMount),
+        ),
+        (
+            "a bound subdirectory",
+            table(&[("8:1", "/srv/root", "/")]),
+            Some(Chroot::Mount),
+        ),
+        (
+            "an escaped mount point",
+            table(&[("0:131", "/", "/\\040")]),
+            Some(Chroot::NoMount),
+        ),
+        (
+            "a mount over PID 1's",
+            table(&[("8:1", "/", "/"), ("0:40", "/", "/")]),
+            None,
+        ),
+        ("unreadable", failed(libc::EACCES), None),
+    ];
+    for (shape, own, chroot) in cases {
+        assert_eq!(mounts_differ(own, table(&host)), chroot, "{shape}");
+    }
+
+    let btrfs = [("0:30", "/@", "/")];
+    assert_eq!(mounts_differ(table(&btrfs), table(&btrfs)), None, "the same subvolume");
+    assert_eq!(
+        mounts_differ(table(&[("0:30", "/@snap", "/")]), table(&btrfs)),
+        Some(Chroot::Mount),
+        "another subvolume"
+    );
+    for (init, why) in [
+        (failed(libc::EACCES), "PID 1's unreadable"),
+        (failed(libc::ENOENT), "no /proc"),
+        (table(&[("8:1", "/usr", "/usr")]), "PID 1 with no mount at /"),
+    ] {
+        assert_eq!(mounts_differ(table(&[("0:131", "/", "/")]), init), None, "{why}");
+    }
+}
+
 /// This host is booted with systemd and not offline: its manager is asked.
 #[skuld::test]
 fn this_host_has_a_manager_to_ask() {
@@ -1038,7 +1129,7 @@ fn systemd_offline_is_evidence_only_when_true() {
         let host = Host {
             offline: Some(value.to_string()),
             unbooted: false,
-            chrooted: false,
+            chroot: None,
         };
         assert_eq!(host.evidence(), Some(Evidence::Offline(value.to_string())), "{value:?}");
     }
@@ -1046,7 +1137,7 @@ fn systemd_offline_is_evidence_only_when_true() {
         let host = Host {
             offline: Some(value.to_string()),
             unbooted: false,
-            chrooted: false,
+            chroot: None,
         };
         assert_eq!(host.evidence(), None, "{value:?}");
     }

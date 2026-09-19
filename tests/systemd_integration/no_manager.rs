@@ -314,16 +314,18 @@ fn the_verbs_that_never_reach_the_manager_are_untouched() {
     assert_eq!(fs::read(unit_path(guard.id())).expect("read the unit"), before);
 }
 
-/// A real chroot, in `arch-chroot`'s shape: a tmpfs root with `/usr` bound read-only, `/dev`,
-/// `/run` and `/sys` bound, a fresh `/proc`, and an `/etc` of its own. `/run` bound in means
+/// A real chroot, in `arch-chroot`'s shape: a root with `/usr` bound read-only, `/dev`, `/run` and
+/// `/sys` bound, a fresh `/proc`, and an `/etc` of its own. `/run` bound in means
 /// `/run/systemd/system` exists and the host's manager answers its bus, so `/` not being PID 1's
 /// root is the one sign. Every mount lives in a private mount namespace, gone however the script
 /// exits. The script copies `manifest` to the chroot's `/tmp/goetia.yaml` and `unit` into its
-/// `/etc/systemd/system` (unless `-`), runs `goetia <args>` there, then lists that directory and
-/// its `multi-user.target.wants` on stderr.
+/// `/etc/systemd/system` (unless `-`), runs `goetia <args>` there — as `user`, a `chroot
+/// --userspec`, unless `-` — then lists that directory and its `multi-user.target.wants` on
+/// stderr. The root is a tmpfs for `shape` `tmpfs`, and for `dir` the directory itself, no mount.
 const IN_A_CHROOT: &str = r#"set -e
-root=$1 goetia=$2 manifest=$3 unit=$4; shift 4
-mount -t tmpfs goetia-chroot "$root"
+root=$1 goetia=$2 manifest=$3 unit=$4 user=$5 shape=$6; shift 6
+[ "$shape" = tmpfs ] && mount -t tmpfs goetia-chroot "$root"
+chmod 755 "$root"
 mkdir -p "$root/usr" "$root/dev" "$root/run" "$root/sys" "$root/proc" "$root/tmp" "$root/etc/systemd/system"
 for dir in bin sbin lib lib64; do ln -s "usr/$dir" "$root/$dir"; done
 mount --bind /usr "$root/usr"
@@ -337,7 +339,11 @@ cp "$goetia" "$root/goetia"
 cp "$manifest" "$root/tmp/goetia.yaml"
 [ "$unit" = - ] || cp "$unit" "$root/etc/systemd/system/"
 rc=0
-chroot "$root" /goetia "$@" || rc=$?
+if [ "$user" = - ]; then
+    chroot "$root" /goetia "$@" || rc=$?
+else
+    chroot --userspec="$user" "$root" /goetia "$@" || rc=$?
+fi
 echo "chroot units: $(cd "$root/etc/systemd/system" && ls -A | tr '\n' ' ')" >&2
 echo "chroot links: $(ls -A "$root/etc/systemd/system/multi-user.target.wants" 2>/dev/null | tr '\n' ' ')" >&2
 exit $rc
@@ -399,6 +405,7 @@ fn every_verb_in_a_real_chroot_is_refused_before_anything_runs() {
             .arg(env!("CARGO_BIN_EXE_goetia"))
             .arg(&manifest)
             .arg(unit)
+            .args(["-", "tmpfs"])
             .args(args)
             .output()
             .expect("spawn unshare");
@@ -419,4 +426,64 @@ fn every_verb_in_a_real_chroot_is_refused_before_anything_runs() {
         );
         assert!(!wants_symlink(guard.id()).exists(), "{context}");
     }
+}
+
+/// Unelevated, in a real chroot with `/run` bound in, `status` and `list` — the verbs that need no
+/// elevation — are refused up front too, before any `systemctl` runs. There goetia may not read
+/// `/proc/1/root`, and neither may `systemctl`, which then assumes no chroot and asks the host's
+/// manager over the bound `/run` about a unit the host does not have: once read as "stopped, not
+/// enabled", exit `0`. The mount tables are what show it, `/` in goetia's naming none of PID 1's:
+/// a tmpfs root's mount is another, and a directory that is no mount has none at `/`. The daemon's
+/// unit is goetia's, in the chroot only.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn an_unelevated_state_read_in_a_real_chroot_is_refused_before_anything_runs() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let (_manifest_dir, manifest) = world_readable_manifest(guard.id());
+    let daemon = installed(&guard);
+    let unit_dir = tempfile::tempdir().expect("tempdir");
+    let unit = unit_dir.path().join(format!("{}.service", guard.id()));
+    fs::copy(unit_path(guard.id()), &unit).expect("copy the unit");
+    Systemd::new().uninstall(&daemon).expect("uninstall from the host");
+
+    for (shape, evidence) in [
+        ("tmpfs", "the mount at `/` is none of PID 1's"),
+        ("dir", "no mount is at `/`"),
+    ] {
+        for args in [
+            &["daemon", "status", guard.id()][..],
+            &["daemon", "status"],
+            &["daemon", "list"],
+        ] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let output = Command::new("unshare")
+                .args([
+                    "--mount",
+                    "--propagation",
+                    "private",
+                    "/bin/sh",
+                    "-c",
+                    IN_A_CHROOT,
+                    "goetia-chroot",
+                ])
+                .arg(root.path())
+                .arg(env!("CARGO_BIN_EXE_goetia"))
+                .arg(&manifest)
+                .arg(&unit)
+                .args(["65534:65534", shape])
+                .args(args)
+                .output()
+                .expect("spawn unshare");
+            let (stdout, stderr) = (
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let context = format!("{shape} {args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+            assert_eq!(output.status.code(), Some(1), "{context}");
+            assert!(stderr.contains(evidence), "{context}");
+            assert!(stdout.is_empty(), "{context}");
+            assert!(!stderr.contains("Running in chroot"), "systemctl ran: {context}");
+        }
+    }
+    assert!(!unit_path(guard.id()).exists(), "the host has no such unit");
 }
