@@ -93,6 +93,26 @@ fn wait_for_child_or_stop_returns_child_exited_when_the_child_exits_on_its_own()
     assert!(matches!(outcome, WaitOutcome::ChildExited));
 }
 
+/// [`Waiter`]'s "handed nothing — it ends", the one lifetime claim in this module with no other
+/// test behind it. `service::launch`'s spawn-failure arm drops an un-handed `Waiter`, which is
+/// exactly this — minus the `JoinHandle` needed to observe the outcome, so this destructures
+/// rather than drops, keeping the handle to join on. A regression here hangs this test rather
+/// than failing it: a thread that never ends leaves no event to bound.
+#[skuld::test]
+fn a_waiter_that_is_never_handed_a_child_ends_on_its_own() {
+    let bus = Arc::new(StopBus::new());
+    let waiter = bus
+        .waiter("a_waiter_that_is_never_handed_a_child_ends_on_its_own")
+        .expect("make the waiter thread");
+
+    // Closing the only `Sender` is the whole mechanism: the thread's first act is `rx.recv()`,
+    // which now returns `Err` and returns.
+    let Waiter { hand, thread } = waiter;
+    drop(hand);
+
+    thread.join().expect("the waiter thread panicked instead of ending");
+}
+
 #[skuld::test]
 fn wait_or_stop_returns_true_when_a_stop_is_requested_before_the_delay_elapses() {
     let bus = StopBus::new();
