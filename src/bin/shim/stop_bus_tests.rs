@@ -179,7 +179,7 @@ fn a_waiter_that_is_never_handed_a_child_ends_on_its_own() {
 
     // Closing the only `Sender` is the whole mechanism: the thread's first act is `rx.recv()`,
     // which now returns `Err` and returns.
-    let Waiter { hand, thread } = waiter;
+    let Waiter { hand, thread, bus: _ } = waiter;
     drop(hand);
 
     thread.join().expect("the waiter thread panicked instead of ending");

@@ -73,6 +73,14 @@ pub enum WaitOutcome {
 pub struct Waiter {
     hand: mpsc::Sender<Arc<Child>>,
     thread: std::thread::JoinHandle<()>,
+    /// The bus this waiter's thread reports the child's exit to, so
+    /// [`StopBus::wait_for_child_or_stop`] can check it is the bus that will
+    /// be waiting for that report. A waiter handed to any other bus leaves
+    /// that bus's `wait_while` with no waker at all in the no-stop case — the
+    /// permanent hang this module exists to avoid, reached with no OS failure
+    /// involved. One `Arc` clone per waiter is what makes that checkable
+    /// rather than conventional.
+    bus: Arc<StopBus>,
 }
 
 impl Waiter {
@@ -80,6 +88,7 @@ impl Waiter {
         #[cfg(test)]
         test_hook::make_thread()?;
         let (hand, rx) = mpsc::channel::<Arc<Child>>();
+        let reporting_to = Arc::clone(bus);
         let bus = Arc::clone(bus);
         let id = id.to_string();
         let thread = std::thread::Builder::new()
@@ -103,7 +112,11 @@ impl Waiter {
                 g.child_done = true;
                 bus.cvar.notify_all();
             })?;
-        Ok(Waiter { hand, thread })
+        Ok(Waiter {
+            hand,
+            thread,
+            bus: reporting_to,
+        })
     }
 
     /// Hand the thread the daemon to wait on, and give back its handle to join once that wait can
@@ -168,7 +181,9 @@ impl StopBus {
     /// `waiter` is consumed here: it was made before `child` was spawned
     /// ([`Waiter`]), and this is where it is handed the daemon it was made
     /// for. Taking it by value is what makes "no waiter, no wait" checkable
-    /// at the call site rather than a convention.
+    /// at the call site rather than a convention; the `debug_assert` below
+    /// does the same for *which* bus it was made for, since a waiter that
+    /// reports to another bus would leave this wait with no waker.
     ///
     /// **Why the teardown happens here, inside this call, rather than in the
     /// caller after it returns.** The [`Waiter`]'s thread performs the real,
@@ -248,7 +263,12 @@ impl StopBus {
     /// `kill_tree`'s own `Ok(())` already is the confirmation; a follow-up
     /// `wait_tree` would only ever produce a spurious logged failure on
     /// every ordinary successful stop.
-    pub fn wait_for_child_or_stop(&self, waiter: Waiter, child: &Arc<Child>, id: &str) -> WaitOutcome {
+    pub fn wait_for_child_or_stop(self: &Arc<Self>, waiter: Waiter, child: &Arc<Child>, id: &str) -> WaitOutcome {
+        debug_assert!(
+            Arc::ptr_eq(&waiter.bus, self),
+            "this waiter was made for a different StopBus: it would report the child's exit to that one, \
+             leaving this wait with no waker"
+        );
         {
             let mut g = self.state.lock().expect("StopBus mutex poisoned");
             g.child_done = false;
