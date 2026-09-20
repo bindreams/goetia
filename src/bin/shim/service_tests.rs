@@ -139,6 +139,12 @@ fn a_daemon_is_spawned_once_the_thread_that_waits_on_it_exists() {
         .as_ref()
         .map(|(child, _waiter)| child.id())
         .expect("the daemon just asserted launched");
+    assert_eq!(
+        daemon.is_alive(),
+        Liveness::Alive,
+        "the daemon is not running even before the drop, so the assertion after it would hold for the \
+         wrong reason"
+    );
     drop(launched);
     assert_eq!(
         daemon.is_alive(),
