@@ -36,8 +36,9 @@ use crate::supervisor::{self, ChildOutcome, RestartDecision};
 // automation and a human reading `%ProgramData%\Goetia\logs\<id>.log`
 // agree on what happened.
 
-/// Commanded stop, or a `restart:` policy that does not respawn a clean
-/// exit — not a failure.
+/// A commanded stop the shim carried out, or a `restart:` policy that does
+/// not respawn a clean exit — not a failure. A commanded stop whose kills all
+/// failed is `EXIT_STOP_INCOMPLETE` below, not this.
 const EXIT_OK: i32 = 0;
 /// argv[1] (the service id) was not supplied. Only reachable from a
 /// malformed manual invocation: SCM itself always supplies it (`ImagePath`
@@ -53,6 +54,15 @@ const EXIT_DISPATCH_FAILURE: i32 = 4;
 /// failure (nonzero exit, or a spawn failure) under a `restart:` policy
 /// that does not retry further (`never`, or the daemon simply never ran).
 const EXIT_CHILD_FAILURE: i32 = 5;
+/// A commanded stop the shim could not carry out: neither `kill_tree` nor the
+/// direct-child fallback could kill the daemon (see
+/// `StopBus::wait_for_child_or_stop`), so it may still be running. The
+/// service itself does stop — that is what keeps it stoppable and
+/// uninstallable — and this code, reported to SCM as the service-specific
+/// exit code and to `%ProgramData%\Goetia\logs\<id>.log` and the Event Log as
+/// two logged kill failures, is what keeps that stop from reading as a clean
+/// one.
+const EXIT_STOP_INCOMPLETE: i32 = 6;
 
 // Entry ===============================================================================================================
 
@@ -187,9 +197,11 @@ fn report_stopped(id: &str, handle: &ServiceStatusHandle, exit_code: ServiceExit
 
 // Supervisor loop =====================================================================================================
 
-/// Spawn, wait, restart — until `supervisor::decide_restart` says stop.
-/// Returns the process exit code `run_service` reports both to SCM and via
-/// `std::process::exit`.
+/// Spawn, wait, restart — until `supervisor::decide_restart` says stop, or
+/// until a stop this shim could not carry out ends it sooner (the one return
+/// below that does not ask, because for it the answer is fixed and the
+/// exit code is the part that differs). Returns the process exit code
+/// `run_service` reports both to SCM and via `std::process::exit`.
 fn supervisor_loop(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, status_handle: &ServiceStatusHandle) -> i32 {
     // `restart: on-failure`/`always` retries indefinitely regardless of any
     // one spawn's outcome, so for those policies `Running` means "the
@@ -256,6 +268,8 @@ fn supervisor_loop(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, status_
         // if `kill_tree` itself failed and the fallback kill did not, the
         // direct child is and its descendants (if any) were unreachable.
         // Either way it is logged there, and nothing is left to reap here.
+        // `StoppingUnkillable` is the one outcome where something is: both
+        // kills failed, so the daemon is still running and unreaped.
         let outcome = match stop_bus.wait_for_child_or_stop(waiter, &child, id) {
             WaitOutcome::ChildExited => {
                 // The child has already exited — `wait()` reaps and returns
@@ -274,6 +288,17 @@ fn supervisor_loop(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, status_
             // Unused by `decide_restart` below once `stopping` is true
             // (checked first, unconditionally) — see its own doc comment.
             WaitOutcome::Stopping => ChildOutcome::Exited(-1),
+            // No policy is skipped by returning here: this outcome is only
+            // produced with `stopping` already set, and `stopping` is never
+            // cleared, so `decide_restart` would answer `Stop` for every
+            // `restart:` policy below. What it cannot answer is *how* this
+            // stopped — its `Stop` plus `stopping` produces `EXIT_OK`, a
+            // clean stop the shim did not achieve, with the daemon neither
+            // killed nor reaped. The service still stops, which is what
+            // keeps it stoppable and uninstallable; this code and the two
+            // logged kill failures are what say the daemon may have
+            // outlived it.
+            WaitOutcome::StoppingUnkillable => return EXIT_STOP_INCOMPLETE,
         };
 
         let stopping = stop_bus.is_stopping();

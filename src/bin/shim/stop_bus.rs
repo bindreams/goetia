@@ -36,7 +36,15 @@ pub struct StopBus {
 
 pub enum WaitOutcome {
     ChildExited,
+    /// A stop was requested, and the daemon is dead and reaped: the tree, or
+    /// (if `kill_tree` failed) at least the direct child.
     Stopping,
+    /// A stop was requested and neither `kill_tree` nor the direct-child
+    /// fallback could kill the daemon, so nothing was reaped and it may still
+    /// be running — see [`StopBus::wait_for_child_or_stop`] for why this is
+    /// still a return rather than a wait, and `service::EXIT_STOP_INCOMPLETE`
+    /// for what the caller reports for it.
+    StoppingUnkillable,
 }
 
 // Waiter ==============================================================================================================
@@ -152,9 +160,10 @@ impl StopBus {
     }
 
     /// Block until `child` exits or a stop is requested, returning which. On
-    /// a stop, also tears the whole contained tree down (`kill_tree`, with
-    /// a fallback to killing just the direct child — see below) before
-    /// returning.
+    /// a stop, also tears the whole contained tree down (`kill_tree`, with a
+    /// fallback to killing just the direct child — see below) before
+    /// returning, and says in its return value whether that teardown
+    /// succeeded.
     ///
     /// `waiter` is consumed here: it was made before `child` was spawned
     /// ([`Waiter`]), and this is where it is handed the daemon it was made
@@ -180,7 +189,9 @@ impl StopBus {
     /// mean the OS has finished signalling the process object, and the
     /// caller's very next act on `Stopping` is to report `SERVICE_STOPPED`
     /// to SCM. Only the waiter's own `child.wait()` completing proves the
-    /// child is reaped, and joining is how this call learns that it has.
+    /// child is reaped, and joining is how this call learns that it has. The
+    /// one arm that does not join is the one that already knows that wait
+    /// cannot complete, and says so in its return value — see below.
     ///
     /// **A panic between the hand-off and that join detaches the waiter**,
     /// which is a real difference from the `&Child`/`thread::scope` shape
@@ -200,21 +211,32 @@ impl StopBus {
     /// outright). That is exactly the same deadlock at one remove: if
     /// nothing kills the child, the background thread's `wait()` still
     /// never returns. `child.kill()` — the direct process handle, no
-    /// containment required — is the fallback that keeps this call
-    /// returning regardless; it cannot reach any of the child's own
-    /// descendants, so a `kill_tree` failure genuinely does mean a reduced
-    /// guarantee (root killed, tree possibly not), not merely a doc
-    /// footnote. Both failures are always logged.
+    /// containment required — is the fallback that lets the wait below
+    /// resolve anyway; it cannot reach any of the child's own descendants,
+    /// so a `kill_tree` failure genuinely does mean a reduced guarantee
+    /// (root killed, tree possibly not), not merely a doc footnote. Both
+    /// failures are always logged.
     ///
-    /// **If that fallback `kill` fails too, this call does hang** (see the
-    /// `Err(e2)` arm below, which logs and carries on): nothing has told the
-    /// child to exit, so the waiter's `child.wait()` never returns and the
-    /// join below blocks for as long as that child lives — SCM's stop never
-    /// completes. `thread::scope`'s implicit join had exactly the same
-    /// property, so this is not new here; and bounding the join would mean
-    /// returning while a live thread still holds this child, which is what
-    /// the paragraph above exists to prevent. An unkillable direct child is
-    /// the case where there is nothing good to do.
+    /// **If that fallback `kill` fails too, the waiter is left detached and
+    /// this call returns [`WaitOutcome::StoppingUnkillable`]** ([`kill_for_stop`]
+    /// returning `false` below — the one path that does not join). Two failed kills are
+    /// positive evidence that nothing has told the child to exit, so the
+    /// waiter's `child.wait()` cannot return and joining it would block for
+    /// as long as that child lives: `supervisor_loop` would never reach
+    /// `report_stopped`, SCM's stop would never complete, and the service —
+    /// which reads `RUNNING` throughout its own teardown, since this shim
+    /// never reports `STOP_PENDING` — could then be neither stopped nor
+    /// uninstalled for the daemon's whole remaining life. Skipping the join
+    /// on that one arm is not the bounded join rejected above: it bounds
+    /// nothing and races nothing, because the wait it would wait for is
+    /// already known not to resolve. What it gives up is the guarantee the
+    /// join buys on every other path — the daemon is not reaped and may well
+    /// still be running — so the outcome is a distinct one, reported to SCM
+    /// as a stop that failed (`service::EXIT_STOP_INCOMPLETE`) rather than a
+    /// clean one, with the log above naming which kill failed and how. The
+    /// detached thread still holds its own `Arc<Child>` clone, so this is
+    /// memory-safe, and if the child ever does exit its `wait()` returns and
+    /// that clone drops.
     ///
     /// **No `wait_tree` call after `kill_tree` succeeds.** `cosca`'s Job
     /// Object `hard_kill` (what `kill_tree` calls) closes the job handle as
@@ -246,17 +268,13 @@ impl StopBus {
             // block `is_stopping()`/`request_stop()` callers (e.g. a
             // second, redundant SCM stop control) for no reason.
             drop(g);
-            if let Err(e) = child.kill_tree() {
-                logging::log_failure(
-                    id,
-                    &format!(
-                        "kill_tree on stop: {e}; falling back to killing the direct child only (its own \
-                         descendants, if any, cannot be reached without a containment mechanism)"
-                    ),
-                );
-                if let Err(e2) = child.kill() {
-                    logging::log_failure(id, &format!("fallback kill on stop: {e2}"));
-                }
+            if !kill_for_stop(child, id) {
+                // Returning here is what leaves `waiting` unjoined: nothing
+                // can make the wait it holds return, so joining it would
+                // block for the child's whole remaining life. See this
+                // function's doc comment — this is the one path where the
+                // return value does not mean "reaped".
+                return WaitOutcome::StoppingUnkillable;
             }
             WaitOutcome::Stopping
         } else {
@@ -264,9 +282,10 @@ impl StopBus {
             WaitOutcome::ChildExited
         };
         // Joined only now, after the kill above: the waiter's `child.wait()`
-        // can return (the child exited on its own, or the kill at least
-        // tried and logged why not), and its completing is what makes this
-        // call's return mean the child is really reaped.
+        // can return — the child exited on its own, or one of the two kills
+        // reached it; the arm where neither is true returned above rather
+        // than joining — and its completing is what makes this call's return
+        // mean the child is really reaped.
         if waiting.join().is_err() {
             logging::log_failure(id, "the thread waiting on the child panicked");
         }
@@ -288,17 +307,96 @@ impl StopBus {
     }
 }
 
+// Teardown ============================================================================================================
+
+/// Kill the daemon for a commanded stop: the whole contained tree, or failing that the direct
+/// child alone. `false` means neither worked, so nothing has told the daemon to exit and no
+/// `child.wait()` on it can return — see [`StopBus::wait_for_child_or_stop`], the only caller, for
+/// what it does with that. Each failure is logged as it happens.
+fn kill_for_stop(child: &Child, id: &str) -> bool {
+    let Err(e) = kill_tree(child) else { return true };
+    logging::log_failure(
+        id,
+        &format!(
+            "kill_tree on stop: {e}; falling back to killing the direct child only (its own descendants, if \
+             any, cannot be reached without a containment mechanism)"
+        ),
+    );
+    let Err(e2) = kill_child(child) else { return true };
+    logging::log_failure(
+        id,
+        &format!(
+            "fallback kill on stop: {e2}; the daemon was neither killed nor reaped and may still be running — \
+             reporting the service stopped, with that failure, rather than waiting for an exit nothing can \
+             now cause"
+        ),
+    );
+    false
+}
+
+/// `child.kill_tree()`, as its own function so a test can make it fail or panic — the two
+/// outcomes that decide whether the waiter is joined, and neither one the OS can be asked for on
+/// demand. See [`test_hook`].
+fn kill_tree(child: &Child) -> Result<(), cosca::error::Error> {
+    #[cfg(test)]
+    test_hook::killing()?;
+    child.kill_tree()
+}
+
+/// `child.kill()`, the direct-child fallback — same seam as [`kill_tree`], for the same reason.
+fn kill_child(child: &Child) -> Result<(), cosca::error::Error> {
+    #[cfg(test)]
+    test_hook::killing()?;
+    child.kill()
+}
+
 // test_hook ===========================================================================================================
 
-/// Makes waiter-thread creation fail on demand, on this thread only, so the path that must refuse
-/// to launch a daemon when it does is testable. Mirrors `goetia::backend::bounded`'s own hook,
-/// which is `#[cfg(test)]` inside the library and therefore invisible here — see [`Waiter`].
+/// Makes waiter-thread creation fail, and the stop path's kills fail or panic, on demand and on
+/// this thread only, so the paths that must refuse to launch a daemon and must not wait on a
+/// daemon nothing can kill are testable. Mirrors `goetia::backend::bounded`'s own hook, which is
+/// `#[cfg(test)]` inside the library and therefore invisible here — see [`Waiter`].
 #[cfg(test)]
 pub(crate) mod test_hook {
     use std::cell::Cell;
 
     thread_local! {
         static THREADS: Cell<Option<usize>> = const { Cell::new(None) };
+        static KILLS: Cell<Option<Kill>> = const { Cell::new(None) };
+    }
+
+    /// What [`super::kill_tree`] and [`super::kill_child`] do instead of killing.
+    #[derive(Clone, Copy)]
+    pub(crate) enum Kill {
+        /// Fail, as an OS refusal would — a child holding no actionable containment mechanism for
+        /// `kill_tree`, a `TerminateProcess` refusal for `kill`.
+        Refuse,
+    }
+
+    /// Make both kills on this thread's stop path do `what` rather than kill, until the returned
+    /// guard drops. Only the two functions above are affected: a test can still kill the daemon it
+    /// spawned itself through `Child`'s own methods.
+    pub(crate) fn kills(what: Kill) -> Interference {
+        KILLS.set(Some(what));
+        Interference
+    }
+
+    /// See [`kills`].
+    pub(crate) struct Interference;
+
+    impl Drop for Interference {
+        fn drop(&mut self) {
+            KILLS.set(None);
+        }
+    }
+
+    pub(super) fn killing() -> Result<(), cosca::error::Error> {
+        match KILLS.get() {
+            None => Ok(()),
+            Some(Kill::Refuse) => Err(cosca::error::Error::Io(std::io::Error::other(
+                "the kill was refused (test hook)",
+            ))),
+        }
     }
 
     /// Let this thread make only `n` more waiter threads, until the returned guard drops.

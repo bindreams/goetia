@@ -72,6 +72,78 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
     );
 }
 
+/// The one arm that does not join the waiter: both kills failed, so nothing has told the daemon to
+/// exit, no `child.wait()` on it can return, and joining would block for the daemon's whole
+/// remaining life — leaving SCM's stop uncompleted and the service neither stoppable nor
+/// uninstallable. Returning instead is what this asserts, along with the reduced guarantee it
+/// carries: the daemon really is still running when it returns, so `StoppingUnkillable` is not
+/// `Stopping` under another name.
+///
+/// Both failures are injected ([`test_hook::kills`]) because neither can be asked of the OS here:
+/// `kill_tree` fails for real only on a child holding no actionable containment mechanism, and
+/// Windows fixes a child handle's access rights at creation, so `TerminateProcess` on a child this
+/// process spawned itself does not get refused on demand. The child is contained anyway — the job
+/// object's `KILL_ON_JOB_CLOSE` is what keeps a failure of *this test* from leaving a five-minute
+/// sleep behind on the runner.
+#[skuld::test]
+fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_kill() {
+    const ID: &str = "wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_kill";
+
+    let mut cmd = cosca::run([
+        "powershell",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Start-Sleep -Seconds 300",
+    ]);
+    cmd.contain();
+    let bus = Arc::new(StopBus::new());
+    let waiter = bus.waiter(ID).expect("make the waiter thread");
+    let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
+
+    let (tx, rx) = mpsc::channel();
+    {
+        let child = Arc::clone(&child);
+        let bus = Arc::clone(&bus);
+        std::thread::spawn(move || {
+            // Armed on the thread the kills happen on, which is not this test's — the hook is
+            // thread-local, so the cleanup kill at the end of this test is unaffected by it.
+            let _refused = test_hook::kills(test_hook::Kill::Refuse);
+            let outcome = bus.wait_for_child_or_stop(waiter, &child, ID);
+            let _ = tx.send(outcome);
+        });
+    }
+
+    bus.request_stop();
+
+    // The same regression bound, for the same reason, as
+    // `wait_for_child_or_stop_does_not_deadlock_on_stop` above: the failure this test exists to
+    // catch is a call that never returns, which without a bound hangs the whole test binary.
+    let outcome = rx.recv_timeout(Duration::from_secs(30)).expect(
+        "wait_for_child_or_stop did not return within 30s of a stop whose kills both failed — it joined a \
+         waiter whose wait nothing can make return",
+    );
+    assert!(
+        matches!(outcome, WaitOutcome::StoppingUnkillable),
+        "a stop with both kills refused reported a reaped child"
+    );
+
+    // Still running, which is the whole content of that outcome: an assertion that could not tell
+    // it from an ordinary `Stopping` would leave the reduced guarantee unproven.
+    let status = child
+        .wait_timeout(Duration::ZERO)
+        .expect("query the child's exit status");
+    assert!(
+        status.is_none(),
+        "the child exited even though both kills were refused, so this test says nothing about the \
+         unkillable case"
+    );
+
+    // What the call deliberately did not do. The detached waiter thread is parked in `child.wait()`
+    // and ends once this lands.
+    child.kill_tree().expect("kill the daemon the call left running");
+}
+
 #[skuld::test]
 fn wait_for_child_or_stop_returns_child_exited_when_the_child_exits_on_its_own() {
     let mut cmd = cosca::run(["powershell", "-NoProfile", "-NonInteractive", "-Command", "exit 0"]);
