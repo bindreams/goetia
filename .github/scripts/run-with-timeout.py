@@ -124,7 +124,8 @@ def kill_tree_posix(proc):
     whether another pass is needed, which catches a member forked before its
     parent's SIGKILL landed. A zombie counts as gone: every SIGKILLed member
     becomes one until its own parent reaps it, which may be never, and
-    signalling one again on a later pass changes nothing. The loop ends
+    signalling one again on a later pass does nothing to it -- bar one of
+    another uid, which `_sigkill` ends the watchdog over. The loop ends
     because a SIGKILLed process cannot fork; a member in uninterruptible
     sleep (`D`) delays that until it wakes, and the CI job's
     `timeout-minutes` backstops one that never does."""
