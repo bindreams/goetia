@@ -61,16 +61,19 @@ pub enum WaitOutcome {
 /// widening it would still not carry the part that matters most here — its failure-injection seam
 /// is `#[cfg(test)]` *inside the library*, which a binary linking that library never compiles, so
 /// no shim test could make a library `Standby` fail.
-pub struct Waiter(mpsc::Sender<Arc<Child>>);
+pub struct Waiter {
+    hand: mpsc::Sender<Arc<Child>>,
+    thread: std::thread::JoinHandle<()>,
+}
 
 impl Waiter {
     fn new(bus: &Arc<StopBus>, id: &str) -> io::Result<Waiter> {
         #[cfg(test)]
         test_hook::make_thread()?;
-        let (tx, rx) = mpsc::channel::<Arc<Child>>();
+        let (hand, rx) = mpsc::channel::<Arc<Child>>();
         let bus = Arc::clone(bus);
         let id = id.to_string();
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("goetia-shim-waiter".to_string())
             .spawn(move || {
                 let Ok(child) = rx.recv() else {
@@ -91,18 +94,22 @@ impl Waiter {
                 g.child_done = true;
                 bus.cvar.notify_all();
             })?;
-        Ok(Waiter(tx))
+        Ok(Waiter { hand, thread })
     }
 
-    /// Hand the thread the daemon to wait on. It is parked in `recv` with nothing before it that
-    /// could end it, so the only way this could fail is a thread that panicked before receiving
-    /// anything, which nothing in its body can do.
-    fn watch(self, child: Arc<Child>) {
-        let handed = self.0.send(child);
+    /// Hand the thread the daemon to wait on, and give back its handle to join once that wait can
+    /// return — see [`StopBus::wait_for_child_or_stop`], which is the only place that joins it.
+    ///
+    /// The thread is parked in `recv` with nothing before it that could end it, so the only way
+    /// the hand-off could fail is a thread that panicked before receiving anything, which nothing
+    /// in its body can do.
+    fn watch(self, child: Arc<Child>) -> std::thread::JoinHandle<()> {
+        let handed = self.hand.send(child);
         debug_assert!(
             handed.is_ok(),
             "the waiter thread ended before it was handed the daemon"
         );
+        self.thread
     }
 }
 
@@ -153,18 +160,25 @@ impl StopBus {
     /// at the call site rather than a convention.
     ///
     /// **Why the teardown happens here, inside this call, rather than in the
-    /// caller after it returns.** The caller's very next act on a
-    /// `Stopping` return is to report `SERVICE_STOPPED` to SCM and exit the
-    /// process, so the tree has to be dead *before* this returns; the job
-    /// object's `KILL_ON_JOB_CLOSE` would catch the stragglers as this
-    /// process exits, but only for a child that got containment at all, and
-    /// a `kill_tree` that failed would go unreported either way. The
-    /// [`Waiter`]'s thread is the second reason: it is parked in the real,
-    /// blocking `child.wait()`, and for a daemon that does not exit on its
-    /// own — the ordinary `type: simple` case — nothing makes that wait
-    /// return except killing the child. A kill left to the caller would
-    /// leave that thread parked forever, holding the `Arc<Child>` whose own
-    /// `Drop` is the only other thing that would have torn the tree down.
+    /// caller after it returns.** The [`Waiter`]'s thread performs the real,
+    /// blocking `child.wait()`, and this call joins it before returning, so
+    /// that wait must itself return before this function can. For a daemon
+    /// that does not exit on its own — the ordinary `type: simple` case —
+    /// nothing makes `child.wait()` return except killing the child. If the
+    /// kill happened only after this call returned (the caller's job in an
+    /// earlier version of this module), the join would block forever waiting
+    /// for a worker that is parked on a process nothing has told it to kill
+    /// yet — a deadlock on every commanded stop of a running daemon, not a
+    /// rare case. Killing first, then joining, is what lets that wait
+    /// actually resolve.
+    ///
+    /// **Why it joins at all**, rather than leaving the waiter detached: the
+    /// join is what makes the return value mean "the tree is dead" rather
+    /// than "the kill was issued". `TerminateJobObject` returning does not
+    /// mean the OS has finished signalling the process object, and the
+    /// caller's very next act on `Stopping` is to report `SERVICE_STOPPED`
+    /// to SCM. Only the waiter's own `child.wait()` completing proves the
+    /// child is reaped, and joining is how this call learns that it has.
     ///
     /// **`kill_tree` can itself fail to kill anything** — `Err(Unsupported)`
     /// when this child holds no actionable containment mechanism (e.g. a
@@ -196,36 +210,43 @@ impl StopBus {
         // After the reset, never before it: the waiter is parked until this
         // call, so nothing can report *this* child done until it is handed
         // one, and a reset afterwards could erase that report.
-        waiter.watch(Arc::clone(child));
+        let waiting = waiter.watch(Arc::clone(child));
         let g = self.state.lock().expect("StopBus mutex poisoned");
         let g = self
             .cvar
             .wait_while(g, |g| !g.stopping && !g.child_done)
             .expect("StopBus mutex poisoned");
-        if !g.stopping {
-            return WaitOutcome::ChildExited;
-        }
-        // Release the lock before calling into `child` — `kill_tree`/
-        // `kill` need it not, and holding it across a kernel call would
-        // block `is_stopping()`/`request_stop()` callers (e.g. a
-        // second, redundant SCM stop control) for no reason.
-        drop(g);
-        if let Err(e) = child.kill_tree() {
-            logging::log_failure(
-                id,
-                &format!(
-                    "kill_tree on stop: {e}; falling back to killing the direct child only (its own \
-                     descendants, if any, cannot be reached without a containment mechanism)"
-                ),
-            );
-            if let Err(e2) = child.kill() {
-                logging::log_failure(id, &format!("fallback kill on stop: {e2}"));
+        let outcome = if g.stopping {
+            // Release the lock before calling into `child` — `kill_tree`/
+            // `kill` need it not, and holding it across a kernel call would
+            // block `is_stopping()`/`request_stop()` callers (e.g. a
+            // second, redundant SCM stop control) for no reason.
+            drop(g);
+            if let Err(e) = child.kill_tree() {
+                logging::log_failure(
+                    id,
+                    &format!(
+                        "kill_tree on stop: {e}; falling back to killing the direct child only (its own \
+                         descendants, if any, cannot be reached without a containment mechanism)"
+                    ),
+                );
+                if let Err(e2) = child.kill() {
+                    logging::log_failure(id, &format!("fallback kill on stop: {e2}"));
+                }
             }
+            WaitOutcome::Stopping
+        } else {
+            drop(g);
+            WaitOutcome::ChildExited
+        };
+        // Joined only now, after the kill above: the waiter's `child.wait()`
+        // can return (the child exited on its own, or the kill at least
+        // tried and logged why not), and its completing is what makes this
+        // call's return mean the child is really reaped.
+        if waiting.join().is_err() {
+            logging::log_failure(id, "the thread waiting on the child panicked");
         }
-        // The waiter thread's `child.wait()` can now return (the child is
-        // dead, or `kill_tree`/`kill` at least tried and logged why not),
-        // so it is not left parked on a process nothing killed.
-        WaitOutcome::Stopping
+        outcome
     }
 
     /// Wait up to `delay` for a stop request — `restart-delay` itself, not a

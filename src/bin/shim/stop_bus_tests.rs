@@ -24,15 +24,15 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
         .expect("make the waiter thread");
     let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
 
-    // This test drives `wait_for_child_or_stop` from a thread it never
-    // joins, so that a call which fails to return is a failed assertion
-    // rather than a hung test binary: if the teardown inside it ever again
-    // happens *after* the call would need to return rather than before,
-    // this thread simply never sends, and `recv_timeout` below reports that
-    // as a clear failure. Both halves of that hazard are described on
-    // `wait_for_child_or_stop` itself — the daemon does not exit on its
-    // own, so nothing but the kill inside the call ever unblocks the
-    // waiter thread it is waiting to hear from.
+    // `wait_for_child_or_stop` runs on its own, un-scoped `'static` thread
+    // (not `std::thread::scope`, which this test itself would then also
+    // have to join, defeating the timeout below on exactly the regression
+    // it exists to catch): if the teardown inside it ever again happens
+    // *after* the call would need to return rather than before — the join
+    // deadlock this module's own doc comment on `wait_for_child_or_stop`
+    // describes — this thread simply never sends, and `recv_timeout` below
+    // reports that as a clear failure instead of hanging the whole test
+    // binary.
     let (tx, rx) = mpsc::channel();
     {
         let child = Arc::clone(&child);
