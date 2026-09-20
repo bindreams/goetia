@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use cosca::identity::Liveness;
 use goetia::spec::{Id, Kind, User};
 // rand 0.10 moved `random` off `Rng` onto `RngExt`.
 use rand::RngExt as _;
@@ -130,5 +131,19 @@ fn a_daemon_is_spawned_once_the_thread_that_waits_on_it_exists() {
 
     // The waiter was never handed this child (no `wait_for_child_or_stop` here), so dropping it
     // drops the last `Arc`: `cosca::Child::drop` hard-kills the job object and waits for it.
+    // Asserted rather than left as prose: this is a real five-minute `Start-Sleep`, and a
+    // `Child::drop` that ever became fire-and-forget would leak one per CI run while every
+    // assertion above still passed. The identity is kept because the drop takes the handle with
+    // it, and it is an identity rather than a bare pid so a recycled pid cannot read as alive.
+    let daemon = launched
+        .as_ref()
+        .map(|(child, _waiter)| child.id())
+        .expect("the daemon just asserted launched");
     drop(launched);
+    assert_eq!(
+        daemon.is_alive(),
+        Liveness::Dead,
+        "the daemon outlived the `Child` that owned it: `Child::drop` kills the tree and waits for it, so \
+         by here it is dead and reaped"
+    );
 }
