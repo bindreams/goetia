@@ -65,6 +65,7 @@ class FakeHost:
         self.kills = []
         self.ops = []  # ("kill" | "check", pid), in call order
         self.ps_failure = None  # stderr of a failing `ps -A`
+        self.ps_failure_on_kill = {}  # pid -> the stderr every `ps -A` fails with once it is signalled
         self.gone_before_getsid = set()  # listed by `ps -A`, gone by `getsid`
         self.gone_before_kill = set()  # in the session, gone by `kill`
         self.forks_on_kill = {}  # pid -> the child it forked before SIGKILL landed
@@ -79,7 +80,12 @@ class FakeHost:
         run. `kills` and `ops` are deliberately absent: they only record, and
         they grow on every pass, so including one would make every
         fingerprint unique and the spin detector dead."""
-        return (sorted(self.sid.items()), sorted(self.stat.items()), sorted(self.forks_on_kill.items()))
+        return (
+            sorted(self.sid.items()),
+            sorted(self.stat.items()),
+            sorted(self.forks_on_kill.items()),
+            self.ps_failure,
+        )
 
     def _enumerated(self):
         """Fingerprint one answered `ps -A` and reject a repeat. See the
@@ -122,6 +128,10 @@ class FakeHost:
     def kill(self, pid, sig):
         self.kills.append((pid, sig))
         self.ops.append(("kill", pid))
+        if pid in self.ps_failure_on_kill:
+            # Signalling this member is what exhausts whatever `ps` needs to
+            # run: every enumeration from here on fails.
+            self.ps_failure = self.ps_failure_on_kill[pid]
         if pid in self.refuses_kill:
             raise PermissionError(1, "Operation not permitted")
         if pid in self.gone_before_kill or pid not in self.sid:
@@ -169,6 +179,23 @@ class KillTreePosixTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 125)
         self.assertIn((ROOT, SIGKILL), host.kills, "the root is killed before anything is enumerated")
         self.assertIn("ps: cannot enumerate", captured.getvalue())
+
+    def test_a_ps_that_starts_failing_after_the_kill_pass_is_a_watchdog_failure(self):
+        # The pass reads the session TWICE -- once to signal it, once to
+        # decide whether another pass is needed -- and the second read can be
+        # the one that fails: a teardown is exactly when a machine is short of
+        # whatever `ps` forks. That read decides whether the teardown is over,
+        # so a failure there is no more an answer than at the first, and
+        # letting it through unguarded ends the watchdog in a `TypeError` on
+        # exit 1, the status reserved for a usage error.
+        host = FakeHost(_session(101))
+        host.ps_failure_on_kill[101] = "ps: fork: Resource temporarily unavailable"
+        captured = io.StringIO()
+        with self.assertRaises(SystemExit) as raised, host.installed(), redirect_stderr(captured):
+            run_with_timeout.kill_tree_posix(SimpleNamespace(pid=ROOT))
+        self.assertEqual(raised.exception.code, 125)
+        self.assertEqual(host.killed(), [ROOT, 101], "the kill pass had already read the session and signalled it")
+        self.assertIn("ps: fork: Resource temporarily unavailable", captured.getvalue())
 
     def test_kills_the_root_first_then_every_session_member_and_nothing_else(self):
         host = FakeHost(_session(101, 102))
