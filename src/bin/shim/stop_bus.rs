@@ -286,15 +286,13 @@ impl StopBus {
             // block `is_stopping()`/`request_stop()` callers (e.g. a
             // second, redundant SCM stop control) for no reason.
             drop(g);
-            if !kill_for_stop(child, id) {
-                // Returning here is what leaves `waiting` unjoined: nothing
-                // can make the wait it holds return, so joining it would
-                // block for the child's whole remaining life. See this
-                // function's doc comment — this is the one path where the
-                // return value does not mean "reaped".
-                return WaitOutcome::StoppingUnkillable;
+            if kill_for_stop(child, id) {
+                WaitOutcome::Stopping
+            } else {
+                // PROBE: the pre-fix disposition — fall through to the
+                // unconditional join below instead of returning here.
+                WaitOutcome::StoppingUnkillable
             }
-            WaitOutcome::Stopping
         } else {
             drop(g);
             WaitOutcome::ChildExited
