@@ -15,7 +15,7 @@ use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cosca::{Fd, Stdio};
+use cosca::{Child, Fd, Stdio};
 use goetia::backend::scm::manager::read_spec_blob;
 use goetia::spec::{DaemonSpec, Restart};
 use windows_service::service::{
@@ -25,7 +25,7 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::{define_windows_service, service_dispatcher};
 
 use crate::logging;
-use crate::stop_bus::{StopBus, WaitOutcome};
+use crate::stop_bus::{StopBus, WaitOutcome, Waiter};
 use crate::supervisor::{self, ChildOutcome, RestartDecision};
 
 // Exit codes ==========================================================================================================
@@ -190,7 +190,7 @@ fn report_stopped(id: &str, handle: &ServiceStatusHandle, exit_code: ServiceExit
 /// Spawn, wait, restart — until `supervisor::decide_restart` says stop.
 /// Returns the process exit code `run_service` reports both to SCM and via
 /// `std::process::exit`.
-fn supervisor_loop(spec: &DaemonSpec, stop_bus: &StopBus, id: &str, status_handle: &ServiceStatusHandle) -> i32 {
+fn supervisor_loop(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, status_handle: &ServiceStatusHandle) -> i32 {
     // `restart: on-failure`/`always` retries indefinitely regardless of any
     // one spawn's outcome, so for those policies `Running` means "the
     // supervisor itself is alive and will keep trying" — reported up
@@ -219,35 +219,41 @@ fn supervisor_loop(spec: &DaemonSpec, stop_bus: &StopBus, id: &str, status_handl
             return EXIT_OK;
         }
 
-        let mut cmd = build_command(spec, id);
-        let child = match cmd.spawn() {
-            Ok(c) => {
-                if defer_running_report {
-                    report_running(id, status_handle);
-                }
-                c
-            }
-            Err(e) => {
-                logging::log_failure(id, &format!("spawn {:?}: {e}", spec.command));
-                let stopping = stop_bus.is_stopping();
-                match supervisor::decide_restart(spec.restart, ChildOutcome::SpawnFailed, stopping, spec.restart_delay)
-                {
-                    RestartDecision::Stop => return if stopping { EXIT_OK } else { EXIT_CHILD_FAILURE },
-                    RestartDecision::Respawn { delay } => {
-                        if stop_bus.wait_or_stop(delay) {
-                            return EXIT_OK;
-                        }
-                        continue;
+        // A thread the OS refused and a daemon that could not be spawned are
+        // one fact to the restart policy — nothing is running, and nothing
+        // was launched — so they share this path deliberately, rather than
+        // the first spawn and a later respawn differing by accident. That
+        // makes a waiter-thread failure under `restart: never` exactly a
+        // clean start failure with no daemon launched: it is the one policy
+        // that has not yet told SCM `RUNNING` (see `defer_running_report`
+        // above), and its loop body runs exactly once. Under
+        // `on-failure`/`always` — already `RUNNING` before the first spawn,
+        // by that same policy — it is instead a retry at `restart-delay`'s
+        // cadence, on the same reasoning as a persistently-failing spawn:
+        // thread exhaustion is a transient, machine-wide condition, and
+        // tearing down a service the user asked to be kept running costs
+        // more than one thread-creation attempt per delay.
+        let Some((child, waiter)) = launch(spec, stop_bus, id) else {
+            let stopping = stop_bus.is_stopping();
+            match supervisor::decide_restart(spec.restart, ChildOutcome::SpawnFailed, stopping, spec.restart_delay) {
+                RestartDecision::Stop => return if stopping { EXIT_OK } else { EXIT_CHILD_FAILURE },
+                RestartDecision::Respawn { delay } => {
+                    if stop_bus.wait_or_stop(delay) {
+                        return EXIT_OK;
                     }
+                    continue;
                 }
             }
         };
+        if defer_running_report {
+            report_running(id, status_handle);
+        }
 
         // `wait_for_child_or_stop` also performs the kill-tree-and-confirm
         // teardown on a stop (see its own doc comment for why that has to
         // happen inside the call rather than out here) — by the time it
         // returns `Stopping`, the whole tree is already confirmed dead.
-        let outcome = match stop_bus.wait_for_child_or_stop(&child, id) {
+        let outcome = match stop_bus.wait_for_child_or_stop(waiter, &child, id) {
             WaitOutcome::ChildExited => {
                 // The child has already exited — `wait()` reaps and returns
                 // immediately rather than blocking.
@@ -281,6 +287,45 @@ fn supervisor_loop(spec: &DaemonSpec, stop_bus: &StopBus, id: &str, status_handl
             }
         }
     }
+}
+
+/// The daemon, running and already being waited on — or `None`, logged, with nothing launched.
+///
+/// Everything supervising the daemon needs is made before the daemon is: the [`Waiter`] thread
+/// first, then the spawn, and nothing between them that can fail. A daemon is never launched with
+/// nothing to wait on it, because the one thing that could refuse — the OS, asked for a thread —
+/// is asked before anything is running. See [`Waiter`] for what the reverse order cost.
+fn launch(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str) -> Option<(Arc<Child>, Waiter)> {
+    let waiter = match stop_bus.waiter(id) {
+        Ok(waiter) => waiter,
+        Err(e) => {
+            logging::log_failure(
+                id,
+                &format!(
+                    "make the thread that waits on {:?}: {e}; it was not spawned, so nothing of this daemon is \
+                     running",
+                    spec.command
+                ),
+            );
+            return None;
+        }
+    };
+    let mut cmd = build_command(spec, id);
+    match start(&mut cmd) {
+        Ok(child) => Some((Arc::new(child), waiter)),
+        Err(e) => {
+            logging::log_failure(id, &format!("spawn {:?}: {e}", spec.command));
+            None
+        }
+    }
+}
+
+/// The spawn itself: [`launch`]'s last step, once the thread that will wait on the daemon has
+/// already been made.
+fn start(cmd: &mut cosca::Command) -> Result<Child, cosca::error::Error> {
+    #[cfg(test)]
+    test_hook::spawning();
+    cmd.spawn()
 }
 
 /// Build the (unspawned) command for `spec`: argv, cwd, env, Job Object
@@ -325,3 +370,30 @@ fn build_command(spec: &DaemonSpec, id: &str) -> cosca::Command {
     }
     cmd
 }
+
+// test_hook ===========================================================================================================
+
+/// Counts daemon spawns, on this thread only, so a test can assert that none happened. Mirrors
+/// `goetia::backend::bounded`'s own hook, which is `#[cfg(test)]` inside the library and
+/// therefore invisible here — see `stop_bus::Waiter`.
+#[cfg(test)]
+pub(crate) mod test_hook {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SPAWNS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// How many daemons this thread has spawned through [`super::start`].
+    pub(crate) fn spawns() -> usize {
+        SPAWNS.get()
+    }
+
+    pub(super) fn spawning() {
+        SPAWNS.set(SPAWNS.get() + 1);
+    }
+}
+
+#[cfg(test)]
+#[path = "service_tests.rs"]
+mod service_tests;

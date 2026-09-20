@@ -17,24 +17,29 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
         "Start-Sleep -Seconds 300",
     ]);
     cmd.contain();
-    let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
     let bus = Arc::new(StopBus::new());
+    // Made before the spawn, as `service::launch` makes it — see `Waiter`.
+    let waiter = bus
+        .waiter("wait_for_child_or_stop_does_not_deadlock_on_stop")
+        .expect("make the waiter thread");
+    let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
 
-    // `wait_for_child_or_stop` runs on its own, un-scoped `'static` thread
-    // (not `std::thread::scope`, which this test itself would then also
-    // have to join, defeating the timeout below on exactly the regression
-    // it exists to catch): if the teardown inside it ever again happens
-    // *after* the call would need to return rather than before — the
-    // `std::thread::scope` join deadlock this module's own doc comment on
-    // `wait_for_child_or_stop` describes — this thread simply never sends,
-    // and `recv_timeout` below reports that as a clear failure instead of
-    // hanging the whole test binary.
+    // This test drives `wait_for_child_or_stop` from a thread it never
+    // joins, so that a call which fails to return is a failed assertion
+    // rather than a hung test binary: if the teardown inside it ever again
+    // happens *after* the call would need to return rather than before,
+    // this thread simply never sends, and `recv_timeout` below reports that
+    // as a clear failure. Both halves of that hazard are described on
+    // `wait_for_child_or_stop` itself — the daemon does not exit on its
+    // own, so nothing but the kill inside the call ever unblocks the
+    // waiter thread it is waiting to hear from.
     let (tx, rx) = mpsc::channel();
     {
         let child = Arc::clone(&child);
         let bus = Arc::clone(&bus);
         std::thread::spawn(move || {
-            let outcome = bus.wait_for_child_or_stop(&child, "wait_for_child_or_stop_does_not_deadlock_on_stop");
+            let outcome =
+                bus.wait_for_child_or_stop(waiter, &child, "wait_for_child_or_stop_does_not_deadlock_on_stop");
             let _ = tx.send(outcome);
         });
     }
@@ -71,13 +76,17 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
 fn wait_for_child_or_stop_returns_child_exited_when_the_child_exits_on_its_own() {
     let mut cmd = cosca::run(["powershell", "-NoProfile", "-NonInteractive", "-Command", "exit 0"]);
     cmd.contain();
-    let child = cmd.spawn().expect("spawn a short-lived child");
-    let bus = StopBus::new();
+    let bus = Arc::new(StopBus::new());
+    let waiter = bus
+        .waiter("wait_for_child_or_stop_returns_child_exited_when_the_child_exits_on_its_own")
+        .expect("make the waiter thread");
+    let child = Arc::new(cmd.spawn().expect("spawn a short-lived child"));
 
     // No stop requested: the child exiting on its own is the only wakeup
     // source, so this blocks only as long as the child itself takes to
     // start and exit.
     let outcome = bus.wait_for_child_or_stop(
+        waiter,
         &child,
         "wait_for_child_or_stop_returns_child_exited_when_the_child_exits_on_its_own",
     );
