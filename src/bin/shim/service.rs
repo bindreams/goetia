@@ -252,7 +252,10 @@ fn supervisor_loop(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, status_
         // `wait_for_child_or_stop` also performs the kill-tree-and-confirm
         // teardown on a stop (see its own doc comment for why that has to
         // happen inside the call rather than out here) — by the time it
-        // returns `Stopping`, the whole tree is already confirmed dead.
+        // returns `Stopping`, the whole tree is already confirmed dead, or,
+        // if `kill_tree` itself failed and the fallback kill did not, the
+        // direct child is and its descendants (if any) were unreachable.
+        // Either way it is logged there, and nothing is left to reap here.
         let outcome = match stop_bus.wait_for_child_or_stop(waiter, &child, id) {
             WaitOutcome::ChildExited => {
                 // The child has already exited — `wait()` reaps and returns

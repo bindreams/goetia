@@ -57,8 +57,9 @@ pub enum WaitOutcome {
 /// enforces the order.
 ///
 /// Deliberately not `goetia::backend::bounded`'s `Standby`, whose shape and vocabulary this
-/// follows: `spares` is `pub(crate)` to the library and this is a separate binary crate, and
-/// widening it would still not carry the part that matters most here — its failure-injection seam
+/// follows: `spares` is a private module of the library's `pub(crate)` `backend::bounded` and
+/// this is a separate binary crate, and widening it would still not carry the part that matters
+/// most here — its failure-injection seam
 /// is `#[cfg(test)]` *inside the library*, which a binary linking that library never compiles, so
 /// no shim test could make a library `Standby` fail.
 pub struct Waiter {
@@ -142,9 +143,10 @@ impl StopBus {
         self.state.lock().expect("StopBus mutex poisoned").stopping
     }
 
-    /// The thread this bus's next wait will block on, made before the daemon it will wait on is
-    /// spawned. See [`Waiter`] for why that order is the whole point, and `io::Result` rather
-    /// than a panic the whole mechanism.
+    /// The thread that will run the blocking `child.wait()` for this bus's next wait, made before
+    /// the daemon it will wait on is spawned. (This bus's own wait blocks on the condvar; the
+    /// [`Waiter`]'s thread is what blocks on the child.) See [`Waiter`] for why that order is the
+    /// whole point, and `io::Result` rather than a panic the whole mechanism.
     pub fn waiter(self: &Arc<Self>, id: &str) -> io::Result<Waiter> {
         Waiter::new(self, id)
     }
@@ -180,6 +182,18 @@ impl StopBus {
     /// to SCM. Only the waiter's own `child.wait()` completing proves the
     /// child is reaped, and joining is how this call learns that it has.
     ///
+    /// **A panic between the hand-off and that join detaches the waiter**,
+    /// which is a real difference from the `&Child`/`thread::scope` shape
+    /// this replaced: a panic at one of the `expect`s below (or inside
+    /// `kill_tree`/`kill`) drops the `JoinHandle` instead of joining it,
+    /// and the detached thread still holds an `Arc<Child>` clone — so the
+    /// caller's own `Arc` going out of scope during unwind does not drop
+    /// the last reference, and `cosca::Child::drop`'s kill-tree teardown
+    /// does not run. The daemon's Job Object is `KILL_ON_JOB_CLOSE`, so the
+    /// tree still dies once the shim process exits; what is lost is the
+    /// teardown before that. Worth knowing before anyone makes one of those
+    /// `expect`s recoverable.
+    ///
     /// **`kill_tree` can itself fail to kill anything** — `Err(Unsupported)`
     /// when this child holds no actionable containment mechanism (e.g. a
     /// nested/`Delegated` child, or one whose containment setup failed
@@ -190,7 +204,17 @@ impl StopBus {
     /// returning regardless; it cannot reach any of the child's own
     /// descendants, so a `kill_tree` failure genuinely does mean a reduced
     /// guarantee (root killed, tree possibly not), not merely a doc
-    /// footnote, but it is always logged, and it is never a hang.
+    /// footnote. Both failures are always logged.
+    ///
+    /// **If that fallback `kill` fails too, this call does hang** (see the
+    /// `Err(e2)` arm below, which logs and carries on): nothing has told the
+    /// child to exit, so the waiter's `child.wait()` never returns and the
+    /// join below blocks for as long as that child lives — SCM's stop never
+    /// completes. `thread::scope`'s implicit join had exactly the same
+    /// property, so this is not new here; and bounding the join would mean
+    /// returning while a live thread still holds this child, which is what
+    /// the paragraph above exists to prevent. An unkillable direct child is
+    /// the case where there is nothing good to do.
     ///
     /// **No `wait_tree` call after `kill_tree` succeeds.** `cosca`'s Job
     /// Object `hard_kill` (what `kill_tree` calls) closes the job handle as
