@@ -302,28 +302,25 @@ fn supervisor_loop(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, status_
 /// asked for a thread — is asked before anything is running. See [`Waiter`] for what the reverse
 /// order cost.
 fn launch(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str) -> Option<(Arc<Child>, Waiter)> {
-    let waiter = match stop_bus.waiter(id) {
-        Ok(waiter) => waiter,
+    // TEMPORARY PROBE, reverted in the next commit: the pre-fix order, daemon
+    // spawned before the waiter exists. Pushed only to record that BOTH the
+    // counter assertion and the new on-disk witness go red against the defect.
+    let mut cmd = build_command(spec, id);
+    let child = match start(&mut cmd) {
+        Ok(child) => child,
         Err(e) => {
-            logging::log_failure(
-                id,
-                &format!(
-                    "make the thread that waits on {:?}: {e}; it was not spawned, so nothing of this daemon is \
-                     running",
-                    spec.command
-                ),
-            );
+            logging::log_failure(id, &format!("spawn {:?}: {e}", spec.command));
             return None;
         }
     };
-    let mut cmd = build_command(spec, id);
-    match start(&mut cmd) {
-        Ok(child) => Some((Arc::new(child), waiter)),
+    let waiter = match stop_bus.waiter(id) {
+        Ok(waiter) => waiter,
         Err(e) => {
-            logging::log_failure(id, &format!("spawn {:?}: {e}", spec.command));
-            None
+            logging::log_failure(id, &format!("make the thread that waits on {:?}: {e}", spec.command));
+            return None;
         }
-    }
+    };
+    Some((Arc::new(child), waiter))
 }
 
 /// The spawn itself: [`launch`]'s last step, once the thread that will wait on the daemon has
