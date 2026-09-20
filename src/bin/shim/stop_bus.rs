@@ -194,8 +194,8 @@ impl StopBus {
     /// kill happened only after this call returned, the join would block
     /// forever waiting for a worker that is parked on a process nothing has
     /// told it to kill yet — a deadlock on every commanded stop of a running
-    /// daemon, not a rare case. Killing first, then joining, is what lets that wait
-    /// actually resolve.
+    /// daemon, not a rare case. Killing first, then joining, is what lets
+    /// that wait actually resolve.
     ///
     /// **Why it joins at all**, rather than leaving the waiter detached: the
     /// join is what makes the return value mean "the tree is dead" rather
@@ -286,13 +286,15 @@ impl StopBus {
             // block `is_stopping()`/`request_stop()` callers (e.g. a
             // second, redundant SCM stop control) for no reason.
             drop(g);
-            if kill_for_stop(child, id) {
-                WaitOutcome::Stopping
-            } else {
-                // PROBE: the pre-fix disposition — fall through to the
-                // unconditional join below instead of returning here.
-                WaitOutcome::StoppingUnkillable
+            if !kill_for_stop(child, id) {
+                // Returning here is what leaves `waiting` unjoined: nothing
+                // can make the wait it holds return, so joining it would
+                // block for the child's whole remaining life. See this
+                // function's doc comment — this is the one path where the
+                // return value does not mean "reaped".
+                return WaitOutcome::StoppingUnkillable;
             }
+            WaitOutcome::Stopping
         } else {
             drop(g);
             WaitOutcome::ChildExited
