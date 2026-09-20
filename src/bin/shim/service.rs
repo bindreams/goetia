@@ -326,8 +326,9 @@ fn launch(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str) -> Option<(Arc<C
 /// The spawn itself: [`launch`]'s last step, once the thread that will wait on the daemon has
 /// already been made.
 fn start(cmd: &mut cosca::Command) -> Result<Child, cosca::error::Error> {
-    #[cfg(test)]
-    test_hook::spawning();
+    // PROBE: the hook has "drifted" -- it no longer counts. The counter
+    // assertion now passes vacuously, leaving the on-disk witness as the only
+    // thing that can catch the inverted order. That is exactly what it is for.
     cmd.spawn()
 }
 
