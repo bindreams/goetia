@@ -219,16 +219,22 @@ impl StopBus {
     /// `expect`s recoverable.
     ///
     /// **`kill_tree` can itself fail to kill anything** — `Err(Unsupported)`
-    /// when this child holds no actionable containment mechanism (e.g. a
-    /// nested/`Delegated` child, or one whose containment setup failed
-    /// outright). That is exactly the same deadlock at one remove: if
-    /// nothing kills the child, the background thread's `wait()` still
-    /// never returns. `child.kill()` — the direct process handle, no
-    /// containment required — is the fallback that lets the wait below
-    /// resolve anyway; it cannot reach any of the child's own descendants,
-    /// so a `kill_tree` failure genuinely does mean a reduced guarantee
-    /// (root killed, tree possibly not), not merely a doc footnote. Both
-    /// failures are always logged.
+    /// when this child holds no actionable containment mechanism, which
+    /// here means a nested `Delegated` child (a failed Job Object
+    /// *assignment* degrades to `cosca`'s TreeWalk mechanism, which is
+    /// actionable, and a failed attach fails the spawn outright, so neither
+    /// arrives here), or `Err(Io)` when the job termination is refused.
+    /// That is exactly the same deadlock at one remove: if nothing kills the
+    /// child, the background thread's `wait()` still never returns.
+    /// `child.kill()` — the direct process handle, no containment required —
+    /// is the fallback that lets the wait below resolve anyway. On a
+    /// contained child it is a second attempt rather than a new idea:
+    /// `kill_tree` ends in that same handle kill as its own backstop, so
+    /// what the fallback is really for is the `Unsupported` path and a
+    /// refusal transient enough to clear between the two. It cannot reach
+    /// any of the child's own descendants, so a `kill_tree` failure
+    /// genuinely does mean a reduced guarantee (root killed, tree possibly
+    /// not), not merely a doc footnote. Both failures are always logged.
     ///
     /// **If that fallback `kill` fails too, the waiter is left detached and
     /// this call returns [`WaitOutcome::StoppingUnkillable`]** ([`kill_for_stop`]
