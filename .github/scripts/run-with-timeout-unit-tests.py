@@ -44,12 +44,20 @@ def _session(*members):
 class FakeHost:
     """A process table behind `kill_tree_posix`'s touch points: `ps` (through
     `subprocess.run`), `os.getsid` and `os.kill`. A SIGKILLed process becomes
-    a zombie that nothing reaps and `ps` still lists. A SIGKILL here takes
-    effect at once, so signalling a LIVE pid twice can only mean the kill
-    loop is spinning: that fails the test instead of hanging it. Signalling a
-    zombie again is allowed, and is what a later pass legitimately does --
+    a zombie that nothing reaps and `ps` still lists. Signalling a zombie
+    again is allowed, and is what a later pass legitimately does --
     `kill_tree_posix` signals straight off the enumeration rather than
-    checking each pid first."""
+    checking each pid first.
+
+    A spinning kill loop fails the test instead of hanging it, and exactly:
+    the loop keeps no state of its own across passes, so what it does from
+    any `ps -A` onwards is fixed by this host's state plus which enumeration
+    it is -- told apart by the ops since the previous one, kills for the one
+    the kill pass reads and checks for the one the exit decision reads. An
+    enumeration repeating an earlier one in both can only be followed by the
+    same thing again, forever. It is also complete, so no iteration limit is
+    needed: a host's pids come from a fixed finite set and each is live, a
+    zombie or gone, so a loop that never returns must repeat a pair."""
 
     def __init__(self, sessions):
         self.sid = dict(sessions)
@@ -62,11 +70,35 @@ class FakeHost:
         self.forks_on_kill = {}  # pid -> the child it forked before SIGKILL landed
         self.refuses_kill = set()
         self.refuses_getsid = set()
+        self._enumerations = []  # one fingerprint per `ps -A` that answered
+        self._ops_fingerprinted = 0
+
+    def _state(self):
+        """The host state a pass can change, and so all that can tell two
+        enumerations of one run apart -- every other field is fixed for the
+        run. `kills` and `ops` are deliberately absent: they only record, and
+        they grow on every pass, so including one would make every
+        fingerprint unique and the spin detector dead."""
+        return (sorted(self.sid.items()), sorted(self.stat.items()), sorted(self.forks_on_kill.items()))
+
+    def _enumerated(self):
+        """Fingerprint one answered `ps -A` and reject a repeat. See the
+        class docstring for why a repeat is exactly a spinning kill loop."""
+        fingerprint = (self.ops[self._ops_fingerprinted :], self._state())
+        self._ops_fingerprinted = len(self.ops)
+        if fingerprint in self._enumerations:
+            raise AssertionError(
+                "the kill loop is spinning: this enumeration repeats an earlier one exactly -- same "
+                "process table, same ops since the previous enumeration -- and the loop carries "
+                "nothing else, so no later pass can differ"
+            )
+        self._enumerations.append(fingerprint)
 
     def run(self, argv, **_kwargs):
         if argv == ["ps", "-A", "-o", "pid="]:
             if self.ps_failure is not None:
                 return subprocess.CompletedProcess(argv, 1, "", self.ps_failure)
+            self._enumerated()
             listed = sorted(set(self.sid) | self.gone_before_getsid)
             return subprocess.CompletedProcess(argv, 0, "".join(f"{pid}\n" for pid in listed), "")
         if argv[:3] == ["ps", "-o", "stat="]:
@@ -88,8 +120,6 @@ class FakeHost:
         return self.sid[pid]
 
     def kill(self, pid, sig):
-        if (pid, sig) in self.kills and self.stat.get(pid) != "Z":
-            raise AssertionError(f"live pid {pid} signalled twice: the kill loop is spinning")
         self.kills.append((pid, sig))
         self.ops.append(("kill", pid))
         if pid in self.refuses_kill:
