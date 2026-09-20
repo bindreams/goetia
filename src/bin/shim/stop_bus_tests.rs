@@ -80,11 +80,12 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
 /// `Stopping` under another name.
 ///
 /// Both failures are injected ([`test_hook::kills`]) because neither can be asked of the OS here:
-/// `kill_tree` fails for real only on a child holding no actionable containment mechanism, and
-/// Windows fixes a child handle's access rights at creation, so `TerminateProcess` on a child this
-/// process spawned itself does not get refused on demand. The child is contained anyway — the job
-/// object's `KILL_ON_JOB_CLOSE` is what keeps a failure of *this test* from leaving a five-minute
-/// sleep behind on the runner.
+/// `kill_tree` fails for real only on a child holding no actionable containment mechanism or on a
+/// refused kill (see `wait_for_child_or_stop`), and Windows fixes a child handle's access rights at
+/// creation, so `TerminateProcess` on a child this process spawned itself does not get refused on
+/// demand. The child is contained anyway, so a failure of *this test* does not leave a five-minute
+/// sleep behind on the runner: the job object's `KILL_ON_JOB_CLOSE` reaps it where containment
+/// reached that mechanism, and `Child::drop`'s own kill covers it where it degraded to TreeWalk.
 #[skuld::test]
 fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_kill() {
     const ID: &str = "wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_kill";
@@ -153,7 +154,9 @@ fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_k
 ///
 /// The other half of that paragraph — `KILL_ON_JOB_CLOSE` reaping the tree once the shim process
 /// exits — is not asserted here and cannot be from inside the process whose exit is the event; it
-/// is `cosca`'s guarantee about its own job object, and its tests are where it is proven.
+/// is `cosca`'s guarantee about its own job object, and its tests are where it is proven. It is
+/// also only available where containment reached that mechanism: a failed Job Object assignment
+/// degrades to TreeWalk, where there is no job object to close and so no such backstop.
 #[skuld::test]
 fn a_panic_on_the_stop_path_leaves_the_waiter_detached_and_the_daemon_untorn_down() {
     const ID: &str = "a_panic_on_the_stop_path_leaves_the_waiter_detached_and_the_daemon_untorn_down";

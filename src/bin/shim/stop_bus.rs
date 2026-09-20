@@ -223,7 +223,11 @@ impl StopBus {
     /// here means a nested `Delegated` child (a failed Job Object
     /// *assignment* degrades to `cosca`'s TreeWalk mechanism, which is
     /// actionable, and a failed attach fails the spawn outright, so neither
-    /// arrives here), or `Err(Io)` when the job termination is refused.
+    /// arrives here); or a refused job termination; or a refused handle
+    /// kill, since `kill_tree` ends in the same direct-handle kill the
+    /// fallback below re-issues, and on the TreeWalk mechanism that
+    /// backstop is the only part of it that can fail at all. A refusal is
+    /// `Err(Io)`, or `Err(Elevation)` where it was an elevated child.
     /// That is exactly the same deadlock at one remove: if nothing kills the
     /// child, the background thread's `wait()` still never returns.
     /// `child.kill()` — the direct process handle, no containment required —
@@ -360,7 +364,7 @@ fn kill_for_stop(child: &Child, id: &str) -> bool {
 
 /// `child.kill_tree()`, as its own function so a test can make it fail or panic — the two
 /// outcomes that decide whether the waiter is joined, and neither one the OS can be asked for on
-/// demand. See [`test_hook`].
+/// demand. See `test_hook::kills`.
 fn kill_tree(child: &Child) -> Result<(), cosca::error::Error> {
     #[cfg(test)]
     test_hook::killing()?;
