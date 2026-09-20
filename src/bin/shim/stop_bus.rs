@@ -391,6 +391,8 @@ pub(crate) mod test_hook {
         /// Fail, as an OS refusal would — a child holding no actionable containment mechanism for
         /// `kill_tree`, a `TerminateProcess` refusal for `kill`.
         Refuse,
+        /// Panic, which is the documented way the waiter is left detached mid-stop.
+        Panic,
     }
 
     /// Make both kills on this thread's stop path do `what` rather than kill, until the returned
@@ -416,6 +418,7 @@ pub(crate) mod test_hook {
             Some(Kill::Refuse) => Err(cosca::error::Error::Io(std::io::Error::other(
                 "the kill was refused (test hook)",
             ))),
+            Some(Kill::Panic) => panic!("the kill panicked (test hook)"),
         }
     }
 

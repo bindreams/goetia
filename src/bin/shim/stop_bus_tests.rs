@@ -144,6 +144,82 @@ fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_k
     child.kill_tree().expect("kill the daemon the call left running");
 }
 
+/// A panic between the hand-off and the join detaches the waiter, which still holds an
+/// `Arc<Child>` clone — so the caller's own `Arc` going out of scope during the unwind is not the
+/// last reference and `cosca::Child::drop`'s kill-tree teardown does not run.
+/// [`StopBus::wait_for_child_or_stop`]'s doc comment states this; this is what will notice when
+/// someone makes one of its `expect`s recoverable, reorders the kill and the join, or adds the
+/// `Drop`-guard join that would turn this unwind into a block.
+///
+/// The other half of that paragraph — `KILL_ON_JOB_CLOSE` reaping the tree once the shim process
+/// exits — is not asserted here and cannot be from inside the process whose exit is the event; it
+/// is `cosca`'s guarantee about its own job object, and its tests are where it is proven.
+#[skuld::test]
+fn a_panic_on_the_stop_path_leaves_the_waiter_detached_and_the_daemon_untorn_down() {
+    const ID: &str = "a_panic_on_the_stop_path_leaves_the_waiter_detached_and_the_daemon_untorn_down";
+
+    let mut cmd = cosca::run([
+        "powershell",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Start-Sleep -Seconds 300",
+    ]);
+    cmd.contain();
+    let bus = Arc::new(StopBus::new());
+    let waiter = bus.waiter(ID).expect("make the waiter thread");
+    let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
+
+    // Requested before the call, so it reaches the kill — and the panic — without blocking first:
+    // `wait_while` checks its predicate before ever waiting.
+    bus.request_stop();
+
+    let (tx, rx) = mpsc::channel();
+    {
+        let child = Arc::clone(&child);
+        let bus = Arc::clone(&bus);
+        std::thread::spawn(move || {
+            let _panicking = test_hook::kills(test_hook::Kill::Panic);
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                bus.wait_for_child_or_stop(waiter, &child, ID);
+            }))
+            .is_err();
+            // Dropped before the send, so the reference count asserted below is not a race against
+            // this thread's own clone going out of scope.
+            drop(child);
+            let _ = tx.send(panicked);
+        });
+    }
+
+    let panicked = rx.recv_timeout(Duration::from_secs(30)).expect(
+        "the panicking call never returned: an unwind that blocks — a join in a `Drop`, say — is one of the \
+         regressions this bounds",
+    );
+    assert!(panicked, "the kill did not panic, so nothing below is about an unwind");
+
+    // Two `Arc`s: this test's, and the detached thread's, parked in `child.wait()`. The unwind
+    // therefore could not have dropped the last one, which is the only thing that runs
+    // `Child::drop`'s teardown.
+    assert_eq!(
+        Arc::strong_count(&child),
+        2,
+        "the waiter's clone is gone, so the unwind joined or ended it after all and this test no longer \
+         describes the detached case"
+    );
+    let status = child
+        .wait_timeout(Duration::ZERO)
+        .expect("query the child's exit status");
+    assert!(
+        status.is_none(),
+        "the daemon was torn down during the unwind — which is better, but it is not what this module's \
+         doc comment tells the next reader"
+    );
+
+    child
+        .kill_tree()
+        .expect("kill the daemon the panicking call left running");
+}
+
 #[skuld::test]
 fn wait_for_child_or_stop_returns_child_exited_when_the_child_exits_on_its_own() {
     let mut cmd = cosca::run(["powershell", "-NoProfile", "-NonInteractive", "-Command", "exit 0"]);
