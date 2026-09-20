@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use super::*;
+use crate::manager::Budget;
 use crate::manager::conformance;
 use crate::spec::{Id, Kind, Restart, User};
 
@@ -59,7 +61,7 @@ fn list_reports_the_same_pid_as_status() {
     let fake = Fake::new();
     let spec = mk("pid-agreement");
     fake.install(&spec, false).unwrap();
-    fake.start(&spec.id).unwrap();
+    fake.start(&spec.id, Budget::DEFAULT).unwrap();
 
     let status = fake.status(&spec.id).unwrap();
     let listed = fake.list().unwrap();
@@ -76,7 +78,7 @@ fn list_reports_the_same_pid_as_status() {
         "list's pid must agree with status's pid while running"
     );
 
-    fake.stop(&spec.id).unwrap();
+    fake.stop(&spec.id, Budget::DEFAULT).unwrap();
     let status = fake.status(&spec.id).unwrap();
     let listed = fake.list().unwrap();
     let entry = listed
@@ -137,8 +139,8 @@ fn operations_on_an_unknown_id_error() {
     assert!(fake.uninstall(&id).is_err());
     assert!(fake.enable(&id).is_err());
     assert!(fake.disable(&id).is_err());
-    assert!(fake.start(&id).is_err());
-    assert!(fake.stop(&id).is_err());
+    assert!(fake.start(&id, Budget::DEFAULT).is_err());
+    assert!(fake.stop(&id, Budget::DEFAULT).is_err());
     assert!(fake.status(&id).is_err());
 }
 
@@ -155,8 +157,14 @@ fn mutating_verbs_refuse_a_foreign_id() {
     assert!(fake.uninstall(&id).is_err(), "uninstall must refuse a foreign id");
     assert!(fake.enable(&id).is_err(), "enable must refuse a foreign id");
     assert!(fake.disable(&id).is_err(), "disable must refuse a foreign id");
-    assert!(fake.start(&id).is_err(), "start must refuse a foreign id");
-    assert!(fake.stop(&id).is_err(), "stop must refuse a foreign id");
+    assert!(
+        fake.start(&id, Budget::DEFAULT).is_err(),
+        "start must refuse a foreign id"
+    );
+    assert!(
+        fake.stop(&id, Budget::DEFAULT).is_err(),
+        "stop must refuse a foreign id"
+    );
     assert!(fake.status(&id).is_err(), "status must refuse a foreign id");
     // Refusing it must not have removed it either.
     assert_eq!(
@@ -195,8 +203,8 @@ fn absence_over_a_residual_artifact_is_not_not_installed() {
         ("uninstall", fake.uninstall(&id)),
         ("enable", fake.enable(&id)),
         ("disable", fake.disable(&id)),
-        ("start", fake.start(&id)),
-        ("stop", fake.stop(&id)),
+        ("start", fake.start(&id, Budget::DEFAULT)),
+        ("stop", fake.stop(&id, Budget::DEFAULT)),
         ("status", fake.status(&id).map(drop)),
     ] {
         match result {
@@ -252,8 +260,8 @@ fn every_verb(fake: &Fake, spec: &DaemonSpec) -> Vec<(&'static str, Result<()>)>
         ("uninstall", fake.uninstall(&spec.id)),
         ("enable", fake.enable(&spec.id)),
         ("disable", fake.disable(&spec.id)),
-        ("start", fake.start(&spec.id)),
-        ("stop", fake.stop(&spec.id)),
+        ("start", fake.start(&spec.id, Budget::DEFAULT)),
+        ("stop", fake.stop(&spec.id, Budget::DEFAULT)),
         ("install", fake.install(spec, false).map(drop)),
         ("preview_install", fake.preview_install(spec).map(drop)),
     ]
@@ -384,4 +392,285 @@ fn the_opaque_recovery_names_both_causes_and_not_uninstall() {
         !recovery.contains("uninstall"),
         "uninstall certifies ownership this read never established: {recovery}"
     );
+}
+
+// The call log ========================================================================================================
+
+/// `restart_does_not_start_after_a_stop_that_timed_out` asserts on
+/// the **absence** of a call, which no state read can express: the fake's
+/// `start` on an already-`Running` entry is idempotent and leaves the state
+/// byte-identical, so "it was never called" and "it was called and changed
+/// nothing" are the same observation from the outside. Observing the call
+/// that changed nothing is the whole point of the log.
+#[skuld::test]
+fn the_fake_records_the_calls_it_was_asked_to_make() {
+    let fake = Fake::new();
+    let first = mk("first");
+    let second = mk("second");
+    fake.install(&first, false).unwrap();
+    fake.install(&second, false).unwrap();
+
+    fake.start(&first.id, Budget::DEFAULT).unwrap();
+    // Already running: idempotent, changes nothing, and is still recorded.
+    fake.start(&first.id, Budget::DEFAULT).unwrap();
+    fake.stop(&first.id, Budget::DEFAULT).unwrap();
+    fake.start(&second.id, Budget::DEFAULT).unwrap();
+
+    assert_eq!(
+        fake.calls(),
+        vec![
+            ("start", "first".to_string()),
+            ("start", "first".to_string()),
+            ("stop", "first".to_string()),
+            ("start", "second".to_string()),
+        ]
+    );
+}
+
+// Stalled entries =====================================================================================================
+
+/// The expiry is **derived from the budget, never lived**: nothing here
+/// sleeps, which is what makes every timeout test in the tree deterministic
+/// rather than a bet on a scheduler.
+#[skuld::test]
+fn a_stalled_start_times_out_under_a_bounded_budget() {
+    let fake = Fake::new();
+    let spec = mk("stalls");
+    fake.install(&spec, false).unwrap();
+    fake.seed_start_stalls(spec.id.as_str());
+
+    let result = fake.start(&spec.id, Budget::Bounded(Duration::from_secs(10)));
+
+    match result {
+        Err(Error::WaitTimeout { id, awaited, .. }) => {
+            assert_eq!(id, "stalls");
+            assert_eq!(awaited, "running");
+        }
+        other => panic!("a stalled start under a bounded budget must time out, got {other:?}"),
+    }
+    assert_ne!(
+        fake.status(&spec.id).unwrap().state,
+        State::Running,
+        "a start that timed out must not have fabricated the confirmation"
+    );
+}
+
+#[skuld::test]
+fn a_stalled_stop_times_out_under_a_bounded_budget() {
+    let fake = Fake::new();
+    let spec = mk("stalls");
+    fake.install(&spec, false).unwrap();
+    fake.start(&spec.id, Budget::DEFAULT).unwrap();
+    fake.seed_stop_stalls(spec.id.as_str());
+
+    match fake.stop(&spec.id, Budget::Bounded(Duration::from_secs(10))) {
+        Err(Error::WaitTimeout { id, awaited, .. }) => {
+            assert_eq!(id, "stalls");
+            assert_eq!(awaited, "stopped");
+        }
+        other => panic!("a stalled stop under a bounded budget must time out, got {other:?}"),
+    }
+    assert_eq!(
+        fake.status(&spec.id).unwrap().state,
+        State::Running,
+        "a stop that timed out must not have fabricated the confirmation"
+    );
+}
+
+/// "Requested, not confirmed" is the honest model of a budget that waits for
+/// nothing, and leaving the state alone is what says so.
+#[skuld::test]
+fn a_stalled_start_is_ok_under_no_budget_and_leaves_the_state_alone() {
+    let fake = Fake::new();
+    let spec = mk("stalls");
+    fake.install(&spec, false).unwrap();
+    fake.seed_start_stalls(spec.id.as_str());
+
+    for budget in [Budget::Immediate, Budget::Bounded(Duration::ZERO)] {
+        fake.start(&spec.id, budget)
+            .unwrap_or_else(|e| panic!("{budget:?} establishes nothing, so it cannot fail: {e}"));
+        assert_ne!(
+            fake.status(&spec.id).unwrap().state,
+            State::Running,
+            "{budget:?} confirmed nothing, so it must not have changed the state"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_stalled_stop_is_ok_under_no_budget_and_leaves_the_state_alone() {
+    let fake = Fake::new();
+    let spec = mk("stalls");
+    fake.install(&spec, false).unwrap();
+    fake.start(&spec.id, Budget::DEFAULT).unwrap();
+    fake.seed_stop_stalls(spec.id.as_str());
+
+    for budget in [Budget::Immediate, Budget::Bounded(Duration::ZERO)] {
+        fake.stop(&spec.id, budget)
+            .unwrap_or_else(|e| panic!("{budget:?} establishes nothing, so it cannot fail: {e}"));
+        assert_eq!(
+            fake.status(&spec.id).unwrap().state,
+            State::Running,
+            "{budget:?} confirmed nothing, so it must not have changed the state"
+        );
+    }
+}
+
+/// The fake reads the budget and reports the expiry; it does not live it.
+///
+/// No tighter bound than the budget itself is asserted, deliberately: any
+/// smaller number would be a bet on how fast this machine is, which is the
+/// class of assertion this project forbids. A fake that actually slept would
+/// not fail this line — it would never reach it, and the suite's own
+/// watchdog is what surfaces that.
+#[skuld::test]
+fn the_fake_never_sleeps() {
+    let fake = Fake::new();
+    let spec = mk("stalls");
+    fake.install(&spec, false).unwrap();
+    fake.seed_start_stalls(spec.id.as_str());
+    let budget = Duration::from_secs(3600);
+
+    let before = std::time::Instant::now();
+    let result = fake.start(&spec.id, Budget::Bounded(budget));
+    let elapsed = before.elapsed();
+
+    assert!(matches!(result, Err(Error::WaitTimeout { .. })), "{result:?}");
+    assert!(
+        elapsed < budget,
+        "the fake derived a {budget:?} expiry by living it, taking {elapsed:?}"
+    );
+}
+
+/// The `Unbounded` hole, and why the fake must refuse rather than
+/// approximate. `waits()` is true for `Unbounded`, so a rule phrased as "a
+/// stalled entry under a *waiting* budget times out" sends this into
+/// `budget::timed_out`, whose own `debug_assert!` requires a `Bounded`
+/// budget — so the fake would either trip that assert or report an expiry
+/// that provably cannot have happened. The honest model is "hang forever",
+/// which is unusable in a test, so the only honest answer left is to refuse.
+#[skuld::test]
+#[should_panic(expected = "that wait has no end")]
+fn a_stalled_start_under_an_unbounded_budget_refuses_rather_than_pretending() {
+    let fake = Fake::new();
+    let spec = mk("stalls");
+    fake.install(&spec, false).unwrap();
+    fake.seed_start_stalls(spec.id.as_str());
+
+    let _ = fake.start(&spec.id, Budget::Unbounded);
+}
+
+#[skuld::test]
+#[should_panic(expected = "that wait has no end")]
+fn a_stalled_stop_under_an_unbounded_budget_refuses_rather_than_pretending() {
+    let fake = Fake::new();
+    let spec = mk("stalls");
+    fake.install(&spec, false).unwrap();
+    fake.start(&spec.id, Budget::DEFAULT).unwrap();
+    fake.seed_stop_stalls(spec.id.as_str());
+
+    let _ = fake.stop(&spec.id, Budget::Unbounded);
+}
+
+/// An un-stalled entry reaches `Running` under every budget that waits,
+/// `Unbounded` included — the refusal above is about the stall, not about the
+/// budget.
+#[skuld::test]
+fn an_unstalled_entry_starts_under_every_budget_that_waits() {
+    for budget in [Budget::Bounded(Duration::from_secs(10)), Budget::Unbounded] {
+        let fake = Fake::new();
+        let spec = mk("healthy");
+        fake.install(&spec, false).unwrap();
+
+        fake.start(&spec.id, budget)
+            .unwrap_or_else(|e| panic!("{budget:?}: {e}"));
+
+        assert_eq!(fake.status(&spec.id).unwrap().state, State::Running, "{budget:?}");
+    }
+}
+
+/// A budget that does not wait establishes nothing on any real backend —
+/// systemd's `start --no-block`, SCM's `request_start` and launchd's plain
+/// `kickstart` all return with the service anywhere from not yet forked to
+/// running. A `Fake` that settled to `Running` here would let a CLI test
+/// assert a state no platform guarantees and stay green, so it settles
+/// nothing, even for an entry that would start.
+#[skuld::test]
+fn an_unstalled_entry_is_left_alone_under_a_budget_that_does_not_wait() {
+    for budget in [Budget::Immediate, Budget::Bounded(Duration::ZERO)] {
+        let fake = Fake::new();
+        let spec = mk("healthy");
+        fake.install(&spec, false).unwrap();
+
+        fake.start(&spec.id, budget)
+            .unwrap_or_else(|e| panic!("{budget:?} accepts the request: {e}"));
+
+        assert_eq!(
+            fake.status(&spec.id).unwrap().state,
+            State::Stopped,
+            "{budget:?} confirmed nothing, so it must not have changed the state"
+        );
+    }
+}
+
+/// [`an_unstalled_entry_is_left_alone_under_a_budget_that_does_not_wait`]'s
+/// stop mirror. launchd's `bootout` has no non-blocking form, so there an
+/// `Immediate` stop does settle — but that is more than the contract
+/// promises, and systemd (`stop --no-block`) and SCM (`request_stop`) settle
+/// nothing. The Fake models the contract's minimum, so no test can come to
+/// depend on an `Immediate` stop having established `Stopped`.
+#[skuld::test]
+fn a_running_entry_is_left_alone_by_a_stop_under_a_budget_that_does_not_wait() {
+    for budget in [Budget::Immediate, Budget::Bounded(Duration::ZERO)] {
+        let fake = Fake::new();
+        let spec = mk("healthy");
+        fake.install(&spec, false).unwrap();
+        fake.start(&spec.id, Budget::DEFAULT).unwrap();
+
+        fake.stop(&spec.id, budget)
+            .unwrap_or_else(|e| panic!("{budget:?} accepts the request: {e}"));
+
+        assert_eq!(
+            fake.status(&spec.id).unwrap().state,
+            State::Running,
+            "{budget:?} confirmed nothing, so it must not have changed the state"
+        );
+    }
+}
+
+// request_start_after_stop ============================================================================================
+
+/// The Fake's request-only `stop` settles nothing, so an entry that was running still is when
+/// `restart --timeout 0`'s start arrives — the shape a Windows `type: simple` service presents, and
+/// the one answer that start must refuse.
+#[skuld::test]
+fn a_start_request_after_an_unconfirmed_stop_is_refused_while_still_running() {
+    let fake = Fake::new();
+    let spec = mk("healthy");
+    fake.install(&spec, false).unwrap();
+    fake.start(&spec.id, Budget::DEFAULT).unwrap();
+    fake.stop(&spec.id, Budget::Immediate).unwrap();
+
+    assert!(fake.request_start_after_stop(&spec.id).is_err());
+    assert_eq!(
+        fake.calls(),
+        vec![
+            ("start", "healthy".to_string()),
+            ("stop", "healthy".to_string()),
+            ("start", "healthy".to_string())
+        ],
+        "a refused request was still asked for"
+    );
+}
+
+/// Accepted, and — request-only — settling nothing.
+#[skuld::test]
+fn a_start_request_over_a_stopped_entry_is_accepted_and_settles_nothing() {
+    let fake = Fake::new();
+    let spec = mk("healthy");
+    fake.install(&spec, false).unwrap();
+
+    fake.request_start_after_stop(&spec.id).unwrap();
+
+    assert_eq!(fake.status(&spec.id).unwrap().state, State::Stopped);
 }

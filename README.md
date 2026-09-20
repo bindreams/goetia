@@ -14,6 +14,52 @@ Everything documented below — the manifest's interpolation syntax, the
 may still change** between releases. Pin a specific released version, or a
 specific commit if working ahead of one.
 
+goetia requires **systemd 242+** (2019), and refuses to install, uninstall,
+start, stop, restart, enable or disable anything on an older one, before
+writing or running anything. It checks both the running systemd and the
+`systemctl` client, which is what parses `--show-transaction`. A running
+systemd it cannot ask is refused. Generated units use
+`Type=exec` (240+), which is what lets a start report a missing executable or
+user as a failure. An older systemd does not reject the directive: it logs that it
+cannot parse it and runs the unit as `Type=simple`, silently losing exactly
+that. And every `start` and `stop` runs `systemctl --show-transaction` (242+).
+
+goetia does not manage systemd offline or from a chroot: it works only
+through the running systemd manager of the system it runs on. Where it finds
+`SYSTEMD_OFFLINE` set to a true value; a `/` of goetia's own rather than the
+system's, seen in `/proc/1/root` — one other than PID 1's root: a chroot, or
+a container sharing the host's PID namespace — or, only where that cannot be
+read, in the mount tables: a `/` whose mount is none of PID 1's, or one with
+no mount at all, which only `chroot(2)` leaves and which goetia's own table
+shows without PID 1's; `/run/systemd/system` missing; or `systemctl`
+reporting a chroot — a verb that would reach systemd exits `1` before it
+writes or sends anything, with one message naming the first of these it
+found. No switch under either prefix systemd gives this binary can turn that
+last one off: every inherited `SYSTEMD_*` and `SYSTEMCTL_*` variable is
+removed from the `systemctl` goetia runs, and only the three goetia sets
+itself are given back, so nothing in those two namespaces — including a
+switch a newer systemd adds — can stop it detecting a chroot goetia could not
+see for itself, or send it to a manager that is not this root's. A variable
+under neither prefix is passed through as it arrived. `install` always
+reaches it; the other verbs only for a daemon of goetia's, and they answer
+from files alone otherwise:
+
+- `uninstall`, `start`, `stop`, `restart`, `enable` and `disable` refuse
+  an id goetia finds its own, and answer any other as anywhere else — for
+  one with nothing installed, `uninstall` exits `0`, "nothing to do", and
+  the others `1`, "not installed".
+- `status <id>` refuses an id of goetia's whose unit decodes, the only kind
+  whose live state it reads, and answers any other as anywhere else.
+- `status` and `list` read the live state of every such daemon, so with one
+  installed they refuse. With none, they answer from files: with nothing
+  installed, an empty listing, exit `0`.
+- `show <id>` without `--file` renders what `list` reads, so it refuses
+  while any such daemon is installed, whether or not it is that id. With
+  none, an id with nothing installed is "not installed", exit `1`.
+
+`install --dry-run`, `diff` and `show --file` never reach systemd, and work
+there as anywhere else.
+
 ## Verifying a download
 
 Every release ships `SHA256SUMS` and one `goetia.sigstore.json` — a Sigstore
@@ -450,7 +496,7 @@ possibly empty.
 | `daemons[].state`       | string          | One of `running`, `stopped`, `failed`, `unknown`.                                                                                                                                                                                                                                 |
 | `daemons[].enabled`     | bool            | Whether the service is enabled at boot.                                                                                                                                                                                                                                           |
 | `daemons[].pid`         | integer or null | `null` means the manager reports **no main process** — never "goetia could not find out", which is an `errors` entry instead.                                                                                                                                                     |
-| `errors[].id`           | string or null  | The daemon id or service name the failure is attributable to; `null` for exactly the `unavailable` and `unsupported` kinds, which belong to no id.                                                                                                                                |
+| `errors[].id`           | string or null  | The daemon id or service name the failure is attributable to; `null` for `unsupported`, and for an `unavailable` that belongs to no id.                                                                                                                                           |
 | `errors[].kind`         | string          | See below.                                                                                                                                                                                                                                                                        |
 | `errors[].message`      | string          | Human-readable detail.                                                                                                                                                                                                                                                            |
 | `undetermined[].name`   | string or null  | The id the entry stands for. **`null` is one entry standing for many ids** — see below.                                                                                                                                                                                           |
@@ -466,10 +512,10 @@ worse than sending you to `goetia daemon show`.
 | --------------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `not-installed` | 1         | Nothing is installed at that id. Only from `status <id>`.                                                                                                                                                                                                                                                                                                                                       |
 | `foreign`       | 1         | A read that _completed_ established that what is there is not goetia's: an artifact carrying no marker, or a masked unit's symlink. Never inferred from a read that failed. Only from `status <id>`.                                                                                                                                                                                            |
-| `unreadable`    | 4         | Goetia read enough to know the id is its own, but cannot report on it — a blob it cannot decode, or a live state it could not query. `message` says which.                                                                                                                                                                                                                                      |
+| `unreadable`    | 4         | Goetia read enough to know the id is its own, but cannot report on it — a blob it cannot decode, or a live state it could not query, as of a unit systemd has not loaded. `message` says which.                                                                                                                                                                                                 |
 | `undetermined`  | 4         | Goetia could not determine **whether** anything is installed at that id: a read it needed failed. Claims no ownership — that is the whole difference from `unreadable`. `message` names what would not read — a path, or on Windows a registry key or service object — and what would make it readable. Only from `status <id>`; out of `list()` the same fact is the `undetermined` key below. |
 | `invalid-id`    | 1         | A command-line argument was not a valid daemon id. Fix the argument.                                                                                                                                                                                                                                                                                                                            |
-| `unavailable`   | 1         | Obtaining the manager, or listing, failed, so **no** answer was obtained for any daemon.                                                                                                                                                                                                                                                                                                        |
+| `unavailable`   | 1         | Obtaining the manager, or listing, failed, so **no** answer was obtained for any daemon — `id` is `null`. Or, under a daemon's `id`, goetia would not ask systemd about that daemon: offline, from a chroot, or where systemd did not boot.                                                                                                                                                     |
 | `unsupported`   | 2         | `--json` was given to a subcommand that does not implement it.                                                                                                                                                                                                                                                                                                                                  |
 | `other`         | 1         | Unreachable today; reserved so an unclassified failure has a home rather than being silently dropped.                                                                                                                                                                                                                                                                                           |
 
@@ -532,6 +578,97 @@ So the exit status is not a "did I get JSON" test. A `4` still carries a
 complete, well-formed document describing what could and could not be
 determined: parse stdout first, then read `errors` and `undetermined`.
 
+## Waiting for a start or stop
+
+`daemon start`, `daemon stop`, `daemon restart` and `daemon install --start`
+share one pair of flags:
+
+| Flag                   | Meaning                                       |
+| ---------------------- | --------------------------------------------- |
+| `--timeout <DURATION>` | Wait up to `DURATION`. The default is `10s`.  |
+| `--timeout 0`          | Issue the request and return without waiting. |
+| `--no-timeout`         | Wait indefinitely.                            |
+
+On macOS, `stop --timeout 0` is the exception: launchd has no request-only
+stop, so it still runs `launchctl bootout` to completion, and the daemon is
+down when goetia returns.
+
+The two flags are mutually exclusive. `install` accepts them only alongside
+`--start`: without it nothing is started, so there is nothing to wait for,
+and the command line is refused at exit `2` having run nothing. Under
+`--dry-run` they are inert, exactly as `--start` itself is.
+
+**Durations** use the manifest's own grammar, the one `restart-delay`
+accepts: `10s`, `500ms`, `2m30s`. Write a compound duration **unspaced**, or
+quote it as a single argument. All four verbs take a variadic id list, so
+`--timeout 2m 30s` passes `2m` to the flag and leaves `30s` to be read as a
+daemon id — and goetia then reports that a daemon called `30s` is not
+installed, which is a confusing answer to a typo the shell made.
+
+### What returning means
+
+The platform's service manager reports the service as running, as far as it
+knows — not that the service is ready to serve, which no service manager can
+tell us. That reads as one guarantee and is three, because what each manager
+confirms differs:
+
+- **systemd** confirms the `exec` itself succeeded: a missing executable or a
+  missing user comes back as a failed start. Under every budget, a `start`,
+  `stop` or `restart` for which systemd enqueued no job is a failure (exit
+  `1`), `uninstall`'s stop included, even where `systemctl` itself exits `0`.
+  The one exception is a
+  `stop` of a unit systemd cannot load and that is not running: systemd
+  answers it "not loaded" with no job, since there is nothing to stop, and
+  that stop succeeds.
+- **SCM**, for a `type: simple` daemon, confirms that `goetia-shim` started.
+  Under `restart: always` or `on-failure` the shim reports running before its
+  first spawn, so your own command failing to start is not part of what was
+  confirmed.
+- **launchd** sits between the two: the pid `launchctl kickstart -p` reports
+  is launchd's own fork, taken before the user process reaches its `exec`.
+
+### When the wait runs out
+
+**Exit `4`, not `1`:** neither success nor failure was established. goetia
+stopped waiting; it did not cancel anything, so the request stands and the
+daemon may still arrive. `goetia daemon status <id>` shows the manager's
+current view.
+
+A `start` of a daemon that is already running is where the three disagree
+under a very short `--timeout`. launchd and SCM say "running" — launchd
+before any request is needed, SCM in its reply to the start — and that is
+the confirmation, so it exits `0` whatever the budget. systemd answers a start with a job, never a state, and confirms only
+when that job completes: a `--timeout` shorter than its round trip — tens of
+milliseconds — exits `4`.
+
+`restart` spends **one budget across the whole operation**, and one per
+daemon — `restart a b c --timeout 30s` promises each of the three 30s rather
+than leaving `c` whatever `a` and `b` did not spend, and neither leg gets a
+budget of its own. If that budget runs out, the start leg is **not issued**:
+goetia does not start into an unconfirmed stop.
+
+So a timeout during `restart` leaves the daemon in an indeterminate state —
+it may or may not be stopped when you look, and a start may or may not have
+been issued. Which case you are in is in the error message.
+
+`restart --timeout 0` issues the stop and the start and confirms neither,
+which is what it is for. On systemd it is one `systemctl restart --no-block`,
+one job, so no start can overtake the stop, and a restart systemd refuses has
+changed nothing (exit `1`). systemd stops the unit and starts it again, except
+while the unit is still starting: it folds the restart into the start already
+running, so nothing is stopped and the daemon comes up fresh from that start.
+On macOS
+and Windows it is a stop and then a start, and a start refused in that window
+exits `4` rather than `0`: the daemon may be the instance the stop is still
+taking down, may be going down, or may never have moved.
+
+**On Windows, `restart --timeout 0` will usually stop the daemon and not
+restart it.** The start arrives while the service is still coming down and is
+refused — for a `type: simple` daemon almost always, since its service reads
+`RUNNING` until its child is gone — which leaves the daemon stopped, at exit
+`4`. To restart a daemon on Windows, let `restart` wait for the stop: leave
+`--timeout` at its default, or give it a duration other than `0`.
+
 ## Exit codes
 
 Two rules come before the numbers:
@@ -544,14 +681,14 @@ Two rules come before the numbers:
    `grep` has distinguished "no match" from "could not read the file" since
    v7 Unix.
 
-| Code | Name          | Meaning                                                                                                                       | Anchored to                                                                                               |
-| ---- | ------------- | ----------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `0`  | success       | The state is as asked, or the question was fully answered.                                                                    | —                                                                                                         |
-| `1`  | error         | An operation was attempted and failed, or was refused outright.                                                               | —                                                                                                         |
-| `2`  | usage         | The command line was rejected before anything ran — by clap, or by the `--json` refusal.                                      | clap's own default: the same code bash and argparse use for "the parser, not the program, rejected this". |
-| `3`  | drift         | A determinate "installed state differs from the manifest" answer. Only `diff` returns it.                                     | Nothing; app-specific.                                                                                    |
-| `4`  | indeterminate | A question goetia could not answer about an id: its state, or whether it is occupied at all.                                  | The LSB init-script convention's "service status unknown".                                                |
-| `5`  | conflict      | An installed artifact was modified outside goetia and `--force` was not given. See below: `--force` is not always the remedy. | Nothing; app-specific — which is why `5` is the code that moved rather than usage errors.                 |
+| Code | Name          | Meaning                                                                                                                                                                                                                                                                                                                   | Anchored to                                                                                               |
+| ---- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `0`  | success       | The state is as asked, or the question was fully answered.                                                                                                                                                                                                                                                                | —                                                                                                         |
+| `1`  | error         | An operation was attempted and failed, or was refused outright.                                                                                                                                                                                                                                                           | —                                                                                                         |
+| `2`  | usage         | The command line was rejected before anything ran — by clap, or by one of `dispatch`'s refusals (`--json` on a subcommand that does not implement it; a wait flag on an `install` with no `--start`).                                                                                                                     | clap's own default: the same code bash and argparse use for "the parser, not the program, rejected this". |
+| `3`  | drift         | A determinate "installed state differs from the manifest" answer. Only `diff` returns it.                                                                                                                                                                                                                                 | Nothing; app-specific.                                                                                    |
+| `4`  | indeterminate | A question goetia could not answer about an id: its state, whether it is occupied at all, or the outcome of a request goetia did not wait out — it stopped waiting, never waited, or lost track of it — or whether a request reached the manager at all, when goetia lost the tool carrying it after it may have started. | The LSB init-script convention's "service status unknown".                                                |
+| `5`  | conflict      | An installed artifact was modified outside goetia and `--force` was not given. See below: `--force` is not always the remedy.                                                                                                                                                                                             | Nothing; app-specific — which is why `5` is the code that moved rather than usage errors.                 |
 
 `2` and `4` are the two that must not be renumbered for tidiness: both are
 tied to a convention outside goetia.
@@ -567,8 +704,8 @@ When more than one outcome applies in the same run, the winner is:
 **This is a rule about which outcome wins, not an ordering of the
 integers** — `5` outranks `3` despite being the larger number, and `1`
 outranks `4` despite being the smaller. Never take `max()` over goetia's
-exit codes. `2` never enters the ladder: the thing that produces it always
-happens alone, before anything else could occur in the same run.
+exit codes. `2` never enters the ladder: the refusals that produce it always
+happen alone, before anything else could occur in the same run.
 
 **Indeterminate outranks conflict** on purpose. A script that branches on
 conflict re-runs with `--force`, and forcing on an incomplete picture is
@@ -635,9 +772,10 @@ different question from drift.
 | `start`, `restart`, `enable` | 1               | Cannot act on what is not there.                                                                                               |
 
 That table is about an absence goetia **established**. An id whose absence
-it could not establish is `4` for all six verbs, `uninstall` included:
-nothing was done and nothing was learned, which is one condition with one
-remedy for every one of them.
+it could not establish is `4` for all six verbs, `uninstall` included: what
+is at the id was not learned, which is one condition with one remedy for
+every one of them. That is not always all that happened: a `restart` whose
+start leg meets such an id has already issued its stop, and says so.
 
 `4` covers two distinct states, and the difference is what goetia
 established. **Ownership proven, contents not:** an artifact goetia owns
@@ -863,11 +1001,25 @@ that comes with it.
 
 ### The two sources of `4`
 
-They are not interchangeable, and the remedies do not transfer:
+Two within what `list`, `status` and `show` report. The mutating verbs reach
+`4` three more ways: by
+[waiting and giving up](#when-the-wait-runs-out); by losing track of a
+request, one that reached the manager or one that may or may not have; and,
+for a `restart` that does not wait, by a start refused after a stop nobody
+confirmed. The two
+sources are not interchangeable, and the remedies do not transfer:
 
-- **`unreadable`** — goetia's own daemon that goetia cannot use. The marker
-  was read; the blob would not decode. Remedy:
-  `goetia daemon uninstall <id>`, which does not need to decode it.
+- **`unreadable`** — goetia's own daemon that goetia cannot use or report
+  on. The marker was read; the blob would not decode, or the manager gave
+  no live state for it — on systemd, a unit file the running manager
+  cannot see. `goetia daemon uninstall <id>` is the remedy for a blob that
+  would not decode, and needs neither the blob nor a live state. It is not
+  a remedy for the other: its `disable` goes through the manager too, and
+  fails the same way, exit `1`, leaving the artifact where it was. Nor is
+  `systemctl daemon-reload`, and the reason is what the case is: systemd
+  loads a unit file it can see on demand, so having none for a name goetia
+  found a file for means the two are not reading the same directory —
+  goetia's own mount namespace, say — which no goetia verb changes.
 - **`undetermined`** — a name goetia could not classify at all. The read
   that would have said whose it is never completed, so ownership is
   unestablished. Remedy: read it with more privilege.

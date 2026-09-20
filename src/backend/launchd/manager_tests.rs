@@ -168,21 +168,6 @@ fn resolve_account_rejects_a_nonexistent_user() {
     assert!(err.to_string().contains("goetia-no-such-user-xyz"), "{err}");
 }
 
-// find_field ==========================================================================================================
-
-#[skuld::test]
-fn find_field_extracts_a_launchctl_print_style_line() {
-    let text = "system/foo = {\n\tstate = running\n\tpid = 4242\n}\n";
-    assert_eq!(find_field(text, "state"), Some("running"));
-    assert_eq!(find_field(text, "pid"), Some("4242"));
-}
-
-#[skuld::test]
-fn find_field_returns_none_for_a_missing_key() {
-    let text = "system/foo = {\n\tstate = running\n}\n";
-    assert_eq!(find_field(text, "pid"), None);
-}
-
 // locate ==============================================================================================================
 
 #[skuld::test]
@@ -561,4 +546,392 @@ fn a_pass_that_finishes_names_every_plist_and_nothing_else() {
         scan.incomplete.is_none(),
         "a pass that finished has nothing to report: {scan:?}"
     );
+}
+
+// Reapers: a sequence never fails halfway for want of one =============================================================
+
+/// An id nothing is installed at: a verb that gets past its reapers stops at discovery, before any
+/// `launchctl` runs, so these tests touch nothing on the host.
+fn never_installed() -> Id {
+    Id::try_from("goetia-reaper-probe-never-installed").unwrap()
+}
+
+/// Whether `result` is the failure of a verb that could not make its reapers — as opposed to one that
+/// made them and went on to discovery.
+fn refused_for_want_of_a_reaper<T: std::fmt::Debug>(result: &Result<T>) -> bool {
+    matches!(result, Err(e) if e.to_string().contains("no thread could be made to reap a `launchctl` request, so none was sent"))
+}
+
+/// Every verb makes every reaper it can need before anything else — discovery included, so before
+/// any `launchctl` runs: one short, and the verb fails having sent nothing. `start`'s corrective
+/// cycle is its fourth and fifth requests, so four reapers are one short.
+#[skuld::test]
+fn a_verb_one_reaper_short_sends_nothing() {
+    let mgr = LaunchdManager::new();
+    let id = never_installed();
+    let spec = DaemonSpec {
+        id: id.clone(),
+        name: id.to_string(),
+        command: vec!["/bin/true".to_string()],
+        cwd: None,
+        env: Default::default(),
+        user: User::Root,
+        restart: Restart::Always,
+        restart_delay: None,
+        logs: None,
+        kind: Kind::Simple,
+    };
+    for budget in [Budget::DEFAULT, Budget::Immediate] {
+        let _four = bounded::test_hook::threads(START_REQUESTS - 1);
+        assert!(
+            refused_for_want_of_a_reaper(&mgr.start(&id, budget)),
+            "start {budget:?}"
+        );
+    }
+    let _four = bounded::test_hook::threads(START_REQUESTS - 1);
+    assert!(refused_for_want_of_a_reaper(&mgr.request_start_after_stop(&id)));
+    let _none = bounded::test_hook::threads(0);
+    assert!(refused_for_want_of_a_reaper(&mgr.stop(&id, Budget::DEFAULT)));
+    assert!(refused_for_want_of_a_reaper(&mgr.uninstall(&id)));
+    assert!(refused_for_want_of_a_reaper(&mgr.install(&spec, false)));
+}
+
+/// With every reaper made, the same verbs go on to discovery, which finds nothing installed.
+#[skuld::test]
+fn a_verb_with_its_reapers_goes_on_to_discovery() {
+    let mgr = LaunchdManager::new();
+    let id = never_installed();
+    let _five = bounded::test_hook::threads(START_REQUESTS);
+    assert!(!refused_for_want_of_a_reaper(&mgr.start(&id, Budget::DEFAULT)));
+    let _one = bounded::test_hook::threads(STOP_REQUESTS);
+    assert!(!refused_for_want_of_a_reaper(&mgr.stop(&id, Budget::DEFAULT)));
+}
+
+/// Whether `result` is the failure of a verb that could not make the temp files its `launchctl`
+/// calls write to — as opposed to one that made them and went on to discovery.
+fn refused_for_want_of_a_file<T: std::fmt::Debug>(result: &Result<T>) -> bool {
+    matches!(result, Err(e) if e.to_string().contains("no temp file could be made for a `launchctl` call's output, so nothing was sent"))
+}
+
+/// Every verb makes the temp files every `launchctl` call it can make writes to, reads and requests
+/// alike, before anything else: one short, and the verb fails having sent nothing.
+#[skuld::test]
+fn a_verb_one_temp_file_short_sends_nothing() {
+    let mgr = LaunchdManager::new();
+    let id = never_installed();
+    let spec = DaemonSpec {
+        id: id.clone(),
+        name: id.to_string(),
+        command: vec!["/bin/true".to_string()],
+        cwd: None,
+        env: Default::default(),
+        user: User::Root,
+        restart: Restart::Always,
+        restart_delay: None,
+        logs: None,
+        kind: Kind::Simple,
+    };
+    let short = |calls: usize| bounded::test_hook::temp_files(calls * FILES_PER_CALL - 1);
+    for budget in [Budget::DEFAULT, Budget::Immediate] {
+        let _short = short(START_CALLS);
+        assert!(refused_for_want_of_a_file(&mgr.start(&id, budget)), "start {budget:?}");
+    }
+    {
+        let _short = short(START_CALLS);
+        assert!(refused_for_want_of_a_file(&mgr.request_start_after_stop(&id)));
+    }
+    let _short = short(STOP_CALLS);
+    assert!(refused_for_want_of_a_file(&mgr.stop(&id, Budget::DEFAULT)));
+    let _short = short(STOP_CALLS);
+    assert!(refused_for_want_of_a_file(&mgr.uninstall(&id)));
+    let _short = short(INSTALL_CALLS);
+    assert!(refused_for_want_of_a_file(&mgr.install(&spec, false)));
+    let _enough = bounded::test_hook::temp_files(START_CALLS * FILES_PER_CALL);
+    assert!(!refused_for_want_of_a_file(&mgr.start(&id, Budget::DEFAULT)));
+}
+
+/// `restart`'s two legs, and `install --start`'s, draw on reapers and temp files `prepare` made
+/// before either sent anything: once it succeeded, neither leg can fail for want of one. It fails as
+/// a whole when one is short. `uninstall` stands in for the install, which would write a plist: each
+/// takes one reaper, and no more temp files than the install.
+#[skuld::test]
+fn prepared_steps_need_nothing_made_later() {
+    let mgr = LaunchdManager::new();
+    let id = never_installed();
+    for (steps, reapers, calls) in [
+        (
+            [Step::Stop, Step::Start],
+            STOP_REQUESTS + START_REQUESTS,
+            STOP_CALLS + START_CALLS,
+        ),
+        (
+            [Step::Install, Step::Start],
+            INSTALL_REQUESTS + START_REQUESTS,
+            INSTALL_CALLS + START_CALLS,
+        ),
+    ] {
+        // Every budget: `launchctl` is waited on under all of them.
+        for budget in [Budget::DEFAULT, Budget::Immediate, Budget::Unbounded] {
+            {
+                let _short = bounded::test_hook::threads(reapers - 1);
+                assert!(mgr.prepare(&steps, budget).is_err(), "{steps:?} {budget:?}");
+            }
+            let _short = bounded::test_hook::temp_files(calls * FILES_PER_CALL - 1);
+            assert!(mgr.prepare(&steps, budget).is_err(), "{steps:?} {budget:?}");
+        }
+        let prepared = mgr.prepare(&steps, Budget::DEFAULT).expect("prepare");
+        let _no_thread = bounded::test_hook::threads(0);
+        let _no_file = bounded::test_hook::temp_files(0);
+        let first = if steps[0] == Step::Stop {
+            mgr.stop(&id, Budget::DEFAULT)
+        } else {
+            mgr.uninstall(&id)
+        };
+        assert!(first.is_err(), "{steps:?}: nothing is installed");
+        assert!(!refused_for_want_of_a_reaper(&first), "{steps:?}");
+        assert!(!refused_for_want_of_a_file(&first), "{steps:?}");
+        let started = mgr.start(&id, Budget::DEFAULT);
+        assert!(!refused_for_want_of_a_reaper(&started), "{steps:?}");
+        assert!(!refused_for_want_of_a_file(&started), "{steps:?}");
+        drop(prepared);
+    }
+}
+
+// A request in doubt ==================================================================================================
+
+/// A `launchctl` request that may have started before goetia lost it — cosca failing past `exec`,
+/// or the wait failing — may have reached launchd: [`Error::RequestInDoubt`], exit `4`, and never
+/// known to have, since `launchctl` never says so. A read changes nothing, so the same failure there
+/// is a plain one. A failure placed before the spawn is a plain one for both. The spawn failures are
+/// injected, so nothing runs for them; the failed waits are injected once a stand-in that exits `0`
+/// has run, so no `launchctl` ever runs, and launchd is never asked anything.
+#[skuld::test]
+fn a_launchctl_request_that_may_have_run_is_in_doubt() {
+    let _stand_in = launchctl_stand_in::set("exit 0".to_string());
+    let args = ["bootout", "system/goetia-reaper-probe-never-installed"];
+    let deadline = Budget::Unbounded.start();
+    let request = || Role::Request(bounded::reapers::<1>().unwrap().into_iter().next().unwrap());
+    type Inject = fn(fn() -> cosca::error::Error);
+    let after_exec: [Inject; 2] = [bounded::test_hook::spawn_fails, bounded::test_hook::wait_fails];
+    for inject in after_exec {
+        inject(|| cosca::error::Error::Containment {
+            detail: "forced".into(),
+        });
+        let e = launchctl(&args, deadline, request()).err().expect("injected");
+        assert!(matches!(e, Error::RequestInDoubt { reached: false, .. }), "{e:?}");
+
+        inject(|| cosca::error::Error::Containment {
+            detail: "forced".into(),
+        });
+        let e = launchctl(&args, deadline, Role::Query).err().expect("injected");
+        assert!(matches!(e, Error::CommandFailed { .. }), "{e:?}");
+    }
+    bounded::test_hook::spawn_fails(|| io::Error::from_raw_os_error(libc::EAGAIN).into());
+    let e = launchctl(&args, deadline, request()).err().expect("injected");
+    assert!(matches!(e, Error::CommandFailed { .. }), "{e:?}");
+}
+
+// Every verb path stays inside its reservation ========================================================================
+
+#[skuld::label]
+const ELEVATED: skuld::Label;
+
+fn elevated() -> std::result::Result<(), String> {
+    if unsafe { libc::geteuid() } == 0 {
+        Ok(())
+    } else {
+        Err("writes a plist under /Library/Application Support/Goetia; re-run under sudo".to_string())
+    }
+}
+
+/// What the stand-in answers one `launchctl` call with: a shell snippet.
+const NOT_LOADED: &str = "exit 113";
+const DONE: &str = "exit 0";
+const REFUSED: &str = "echo 'Bootstrap failed: 5: Input/output error' >&2; exit 5";
+const RUNNING: &str = "printf '\\tstate = running\\n\\tpid = 4242\\n'";
+const NOT_RUNNING: &str = "printf '\\tstate = not running\\n'";
+const PID: &str = "echo 4242";
+
+/// `start`'s longest path, every one of its [`START_CALLS`] `launchctl` calls: not loaded; a
+/// `bootstrap` refused, by a concurrent start that loaded it meanwhile; a `kickstart -p` that names
+/// no pid, so a bounded read decides; and then, `restart: always` reading not running, the
+/// corrective `bootout`, `bootstrap` and `kickstart`, and the read that confirms it.
+const START_LONGEST: [(&str, &str); START_CALLS] = [
+    ("print", NOT_LOADED),
+    ("bootstrap", REFUSED),
+    ("print", DONE),
+    ("print", NOT_RUNNING),
+    ("kickstart", DONE),
+    ("print", RUNNING),
+    ("print", NOT_RUNNING),
+    ("bootout", DONE),
+    ("bootstrap", DONE),
+    ("print", NOT_RUNNING),
+    ("kickstart", PID),
+    ("print", RUNNING),
+];
+
+/// `request_start_after_stop`'s longest path: `start` under a budget that does not wait, which
+/// neither reads the pid nor takes the corrective cycle.
+const START_NOT_WAITING: [(&str, &str); 5] = [
+    ("print", NOT_LOADED),
+    ("bootstrap", REFUSED),
+    ("print", DONE),
+    ("print", NOT_RUNNING),
+    ("kickstart", DONE),
+];
+
+/// `install`'s longest path, [`INSTALL_CALLS`] calls: its read, and the `bootout` of the job it
+/// finds loaded.
+const INSTALL_LONGEST: [(&str, &str); INSTALL_CALLS] = [("print", DONE), ("bootout", DONE)];
+
+/// `stop`'s and `uninstall`'s one call.
+const BOOTOUT: [(&str, &str); STOP_CALLS] = [("bootout", DONE)];
+
+/// A stand-in `launchctl` for this thread that answers the calls it gets, in order, from
+/// `expected`, logs each call's arguments, and fails any call past the last.
+struct Scripted {
+    dir: tempfile::TempDir,
+    expected: Vec<&'static str>,
+    _stand_in: launchctl_stand_in::Guard,
+}
+
+impl Scripted {
+    fn new(expected: &[(&'static str, &str)]) -> Scripted {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("n"), "0").unwrap();
+        let arms: String = expected
+            .iter()
+            .enumerate()
+            .map(|(i, (_, answer))| format!("{}) {answer};; ", i + 1))
+            .collect();
+        let script = format!(
+            "d='{}'; n=$(( $(cat \"$d/n\") + 1 )); echo \"$n\" > \"$d/n\"; echo \"$*\" >> \"$d/log\"; \
+             case \"$n\" in {arms}*) echo \"unscripted launchctl call $n: $*\" >&2; exit 99;; esac",
+            dir.path().display()
+        );
+        Scripted {
+            expected: expected.iter().map(|(verb, _)| *verb).collect(),
+            _stand_in: launchctl_stand_in::set(script),
+            dir,
+        }
+    }
+
+    /// Every call was made, in the order scripted — the path was driven end to end.
+    fn assert_driven(&self, what: &str) {
+        let log = std::fs::read_to_string(self.dir.path().join("log")).unwrap_or_default();
+        let made: Vec<&str> = log
+            .lines()
+            .map(|line| line.split_whitespace().next().unwrap_or_default())
+            .collect();
+        assert_eq!(made, self.expected, "{what}: the calls made");
+    }
+}
+
+/// Every stand-in call list, concatenated: one script for a prepared sequence.
+fn then(steps: &[&[(&'static str, &'static str)]]) -> Vec<(&'static str, &'static str)> {
+    steps.iter().flat_map(|step| step.iter().copied()).collect()
+}
+
+/// Removes the plists a test's install wrote, if a failure left them.
+struct Plists(String);
+
+impl Drop for Plists {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(staging_path(&self.0));
+        let _ = std::fs::remove_file(enabled_path(&self.0));
+    }
+}
+
+/// Every launchd verb, down its longest path, makes no thread and no temp file outside the
+/// reservation it made at entry — or that `prepare` made for its sequence: one made on the spot
+/// while a reservation is live fails a debug assertion, so a count one short fails here. Under
+/// `prepare`, what the sequence reserved is spent exactly, so a count one over fails too. A
+/// stand-in `launchctl` answers every call, so the longest paths — `start`'s corrective cycle
+/// among them — are driven deterministically, and no job is ever loaded.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn every_launchd_verb_path_stays_inside_its_reservation() {
+    let mgr = LaunchdManager::new();
+    let name = format!("goetia-reservation-{:x}", std::process::id());
+    let _plists = Plists(name.clone());
+    let id = Id::try_from(name.as_str()).unwrap();
+    let mut spec = DaemonSpec {
+        id: id.clone(),
+        name: name.clone(),
+        command: vec!["/bin/sleep".to_string(), "300".to_string()],
+        cwd: None,
+        env: Default::default(),
+        user: User::Root,
+        restart: Restart::Always,
+        restart_delay: None,
+        logs: None,
+        kind: Kind::Simple,
+    };
+    let exhausted = || {
+        assert_eq!(
+            bounded::test_hook::pooled(),
+            bounded::Needs::default(),
+            "the sequence reserved more than its steps spent"
+        );
+    };
+
+    // Each verb alone, under its own reservation.
+    let script = Scripted::new(&INSTALL_LONGEST);
+    assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
+    script.assert_driven("install, created over a loaded job");
+
+    let script = Scripted::new(&START_LONGEST);
+    mgr.start(&id, Budget::DEFAULT).expect("start");
+    script.assert_driven("start, longest path");
+
+    let script = Scripted::new(&START_NOT_WAITING);
+    mgr.request_start_after_stop(&id).expect("request_start_after_stop");
+    script.assert_driven("request_start_after_stop, longest path");
+
+    let script = Scripted::new(&BOOTOUT);
+    mgr.stop(&id, Budget::DEFAULT).expect("stop");
+    script.assert_driven("stop");
+
+    spec.command.push("updated".to_string());
+    let script = Scripted::new(&INSTALL_LONGEST);
+    assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Update { .. })));
+    script.assert_driven("install, updating a loaded job");
+
+    // `restart`: the stop and the start under one reservation, spent exactly.
+    let script = Scripted::new(&then(&[&BOOTOUT, &START_LONGEST]));
+    let prepared = mgr.prepare(&[Step::Stop, Step::Start], Budget::DEFAULT).unwrap();
+    mgr.stop(&id, Budget::DEFAULT).expect("restart's stop");
+    mgr.start(&id, Budget::DEFAULT).expect("restart's start");
+    exhausted();
+    drop(prepared);
+    script.assert_driven("restart");
+
+    // `install --start`: the install and the start under one reservation, spent exactly.
+    spec.command.push("again".to_string());
+    let script = Scripted::new(&then(&[&INSTALL_LONGEST, &START_LONGEST]));
+    let prepared = mgr.prepare(&[Step::Install, Step::Start], Budget::DEFAULT).unwrap();
+    assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Update { .. })));
+    mgr.start(&id, Budget::DEFAULT).expect("install --start's start");
+    exhausted();
+    drop(prepared);
+    script.assert_driven("install --start");
+
+    // `status` counts nothing, so it draws on no reservation: inside one with spares left, and one
+    // spent, it makes its own files, trips no assertion, and leaves the pool as it was.
+    let script = Scripted::new(&[("print", RUNNING), ("bootout", DONE), ("print", RUNNING)]);
+    let prepared = mgr.prepare(&[Step::Stop], Budget::DEFAULT).unwrap();
+    let pooled = bounded::test_hook::pooled();
+    assert_eq!(mgr.status(&id).expect("status").state, State::Running);
+    assert_eq!(bounded::test_hook::pooled(), pooled, "status drew on the reservation");
+    mgr.stop(&id, Budget::DEFAULT).expect("stop");
+    exhausted();
+    assert_eq!(mgr.status(&id).expect("status").state, State::Running);
+    exhausted();
+    drop(prepared);
+    script.assert_driven("status inside a reservation");
+
+    let script = Scripted::new(&BOOTOUT);
+    mgr.uninstall(&id).expect("uninstall");
+    script.assert_driven("uninstall");
+    assert!(!staging_path(&name).exists(), "uninstall left the plist");
 }

@@ -9,7 +9,7 @@ use std::time::Duration;
 use goetia::backend::scm::manager::ScmManager;
 use goetia::decide::Outcome;
 use goetia::manager::conformance;
-use goetia::manager::{Installed, ServiceManager as _, State};
+use goetia::manager::{Budget, Installed, ServiceManager as _, State};
 use goetia::spec::{AccountId, DaemonSpec, Id, Restart, User};
 use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
@@ -169,7 +169,7 @@ fn start_stop_status_reflect_reality() {
     );
     mgr.install(&spec, false).expect("install");
 
-    mgr.start(&spec.id).expect("start");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     started.accept("the fixture to report SERVICE_RUNNING");
     let status = mgr.status(&spec.id).expect("status while running");
     assert_eq!(status.state, State::Running);
@@ -178,7 +178,7 @@ fn start_stop_status_reflect_reality() {
         "type: managed reports the daemon's own pid, not a shim's"
     );
 
-    mgr.stop(&spec.id).expect("stop");
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
     stopped.accept("the fixture to handle SERVICE_CONTROL_STOP");
     let status = mgr.status(&spec.id).expect("status after stop");
     assert_eq!(status.state, State::Stopped);
@@ -256,7 +256,7 @@ fn uninstall_then_immediate_reinstall_succeeds() {
     );
 
     mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id).expect("start");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     started.accept("the fixture to report SERVICE_RUNNING");
 
     // Uninstalling a *running* service is the real test of trap 3: `delete`
@@ -287,7 +287,7 @@ fn uninstall_errors_when_service_will_not_stop() {
     );
 
     mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id).expect("start");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     started.accept("the fixture to report SERVICE_RUNNING");
 
     let err = mgr
@@ -366,7 +366,7 @@ fn managed_kind_environment_availability() {
     let spec = mk_spec(&id, fixture_command(&id, started.port(), 1, &format!("env:{VAR}")), env);
 
     mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id).expect("start");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     let reported = started.accept_line("the fixture to report its own environment");
 
     support::record_probe(
@@ -446,12 +446,19 @@ fn real_account_gets_service_logon_right() {
     // observes RUNNING or fails immediately, never hanging on a poll.
     let mgr = ScmManager::new();
     let target = id_of(&id);
-    mgr.start(&target).unwrap_or_else(|e| {
+    // `Budget::Unbounded`, not `DEFAULT`: the subject here is the logon right, not latency. A
+    // first logon under a freshly created account builds a user profile, which routinely outruns
+    // the 10s default on a runner — measured at 24,737 ms on a green run, and 14,349 ms when
+    // `DEFAULT` turned it into a failure whose message blamed `SeServiceLogonRight` for what was
+    // only a slow profile build. A larger fixed number would just move the guess; unbounded says
+    // what is meant. A start that never arrives is bounded by CI's per-binary watchdog — a failure
+    // bound surfaced to a human, not a synchronisation device.
+    mgr.start(&target, Budget::Unbounded).unwrap_or_else(|e| {
         panic!("service under a real account failed to start (SeServiceLogonRight likely not granted): {e}")
     });
     let status = mgr.status(&target).expect("status");
     assert_eq!(status.state, State::Running);
-    let _ = mgr.stop(&target);
+    let _ = mgr.stop(&target, Budget::DEFAULT);
 }
 
 // Step 8: built-in service accounts install and run without a password or a logon-right grant =========================
@@ -538,12 +545,14 @@ fn a_local_service_daemon_actually_runs() {
     // is syntactically acceptable to `CreateServiceW` (`install` already
     // proves that), but that it is an identity Windows can actually launch
     // a process under.
-    mgr.start(&spec.id).expect("start as LocalService");
+    // Unbounded for the reason `real_account_gets_service_logon_right` gives: the subject is the
+    // identity, not latency, and a timeout would read as "LocalService cannot launch a process".
+    mgr.start(&spec.id, Budget::Unbounded).expect("start as LocalService");
     started.accept("the fixture to report SERVICE_RUNNING under LocalService");
     let status = mgr.status(&spec.id).expect("status while running");
     assert_eq!(status.state, State::Running);
 
-    mgr.stop(&spec.id).expect("stop");
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
     stopped.accept("the fixture to handle SERVICE_CONTROL_STOP under LocalService");
 }
 
@@ -613,12 +622,14 @@ fn a_builtin_account_is_never_given_a_stale_password() {
 
     let mgr = ScmManager::new();
     let target = id_of(&id);
-    mgr.start(&target).unwrap_or_else(|e| {
+    // Unbounded for the reason `real_account_gets_service_logon_right` gives: a timeout here would
+    // blame a stale password for what was only a slow start.
+    mgr.start(&target, Budget::Unbounded).unwrap_or_else(|e| {
         panic!("service under LocalService failed to start (a stale password likely reached CreateServiceW): {e}")
     });
     let status = mgr.status(&target).expect("status");
     assert_eq!(status.state, State::Running);
-    let _ = mgr.stop(&target);
+    let _ = mgr.stop(&target, Budget::DEFAULT);
 }
 
 // Round-tripping restart: on-failure (the Some(fa) branch of apply_failure_actions/read_failure_actions) ==============

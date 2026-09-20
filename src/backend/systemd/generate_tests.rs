@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::*;
+use crate::decide::{Outcome, Overlay, Ownership, decide};
 use crate::spec::{Id, Kind, User};
 
 // Fixtures ============================================================================================================
@@ -80,7 +81,7 @@ fn unit_snapshot_full() {
          StartLimitIntervalSec=0\n\
          \n\
          [Service]\n\
-         Type=simple\n\
+         Type=exec\n\
          ExecStart=frpc -c frpc.toml\n\
          WorkingDirectory={cwd}\n\
          Environment=RUST_LOG=info\n\
@@ -118,7 +119,7 @@ fn unit_snapshot_minimal() {
          Description=frpc\n\
          \n\
          [Service]\n\
-         Type=simple\n\
+         Type=exec\n\
          ExecStart=frpc\n\
          User=0\n\
          Restart=no\n\
@@ -166,6 +167,53 @@ fn unit_is_the_generation_invariant() {
 
         assert_eq!(first, second);
     }
+}
+
+// Upgrade path ========================================================================================================
+
+/// Pins the mechanism `decide` already has for a generator change that carries no version bump of
+/// its own: `0.0.9` is not and will never be this crate's version, so it stands in for "some
+/// earlier release". Protects every FUTURE generator change, this one included — see `unit`'s doc
+/// comment.
+#[skuld::test]
+fn a_unit_written_by_an_older_goetia_is_stale_not_a_conflict() {
+    let spec = full_spec();
+    let id = full_identity();
+    let today = unit(&spec, &id);
+
+    // The text an older goetia would have written for the same spec: `Type=simple`, and a blob
+    // whose embedded version is `0.0.9` rather than today's.
+    let older_spec_b64 = blob::encode_with_version(&spec, "0.0.9");
+    let on_disk = today
+        .replacen("Type=exec\n", "Type=simple\n", 1)
+        .replacen(&format!("Version={}\n", crate::version()), "Version=0.0.9\n", 1)
+        .replacen(
+            &format!("Spec={}\n", blob::encode(&spec)),
+            &format!("Spec={older_spec_b64}\n"),
+            1,
+        );
+    assert_ne!(on_disk, today, "the fixture must actually differ from today's unit");
+
+    let blob = extract(&on_disk).unwrap().unwrap();
+    assert_eq!(blob.version, "0.0.9");
+
+    let regenerated = unit(&blob.spec, &id);
+    let outcome = decide(
+        &Ownership::Ours { blob, regenerated },
+        Some(on_disk.as_str()),
+        &today,
+        &spec,
+        crate::version(),
+        false,
+        &Overlay::default(),
+    );
+
+    assert_eq!(
+        outcome,
+        Outcome::Stale {
+            from_version: "0.0.9".to_string()
+        }
+    );
 }
 
 // Extract dispositions ================================================================================================
@@ -381,6 +429,10 @@ fn percent_is_doubled_in_every_value() {
 
     let text = unit(&spec, &id);
 
+    // One line the doubling must have reached, asserted outright: the loop
+    // below checks only what `unit` emitted, so text it stopped emitting
+    // would leave this test passing with nothing checked.
+    assert!(text.contains("Description=100%% Uptime"), "{text}");
     for line in text.lines() {
         // `Spec=`'s base64 alphabet never contains `%`, so it needs no
         // doubling and is exempt from this check.

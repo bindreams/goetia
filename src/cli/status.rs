@@ -10,7 +10,7 @@ use clap::Args as ClapArgs;
 
 use super::report::{self, DaemonReport, Report};
 use super::support::{parse_id, partition_installed, print_undetermined_warnings, print_unreadable_warnings};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::manager::ServiceManager;
 
 #[derive(ClapArgs, Debug)]
@@ -28,14 +28,7 @@ pub fn run(
 ) -> i32 {
     let mgr = match get_manager() {
         Ok(mgr) => mgr,
-        Err(e) => {
-            let report = report::unavailable(&e);
-            if json {
-                return report::emit(&report, out, err);
-            }
-            let _ = writeln!(err, "error: {e}");
-            return report::exit_code(&report);
-        }
+        Err(e) => return unavailable(&e, json, out, err),
     };
 
     if args.ids.is_empty() {
@@ -68,6 +61,17 @@ pub fn run(
     }
 
     print_text(&report, out, err);
+    report::exit_code(&report)
+}
+
+/// `report::unavailable` always maps to exit 1; taken from
+/// `report::exit_code` here so json and text agree.
+fn unavailable(e: &Error, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let report = report::unavailable(e);
+    if json {
+        return report::emit(&report, out, err);
+    }
+    let _ = writeln!(err, "error: {e}");
     report::exit_code(&report)
 }
 

@@ -7,10 +7,11 @@ use clap::Args as ClapArgs;
 
 use super::report;
 use super::support::{load_and_warn, require_elevation, select_by_ids};
+use super::wait::WaitArgs;
 use crate::backend::Identity;
 use crate::decide::Outcome;
 use crate::error::{Error, Result};
-use crate::manager::ServiceManager;
+use crate::manager::{Prepared, ServiceManager, Step};
 use crate::spec::{AccountId, DaemonSpec, Id, User};
 
 #[derive(ClapArgs, Debug)]
@@ -34,6 +35,11 @@ pub struct Args {
     /// design notes on why.
     #[arg(long = "dry-run")]
     pub dry_run: bool,
+    /// Bounds the `--start` above and nothing else. Without `--start` there
+    /// is nothing to wait for, which `dispatch` refuses at exit `2`; under
+    /// `--dry-run` these are inert exactly as `--start` itself is.
+    #[command(flatten)]
+    pub wait: WaitArgs,
 }
 
 pub fn run(
@@ -91,6 +97,20 @@ pub fn run(
     // moment one daemon in the same run hard-failed.
     let mut codes: Vec<i32> = Vec::new();
     for spec in &selected {
+        // Before the install sends anything, so that nothing the start needs
+        // can run out after the install booted a loaded job out.
+        let _prepared = if args.start {
+            match mgr.prepare(&[Step::Install, Step::Start], args.wait.budget()) {
+                Ok(prepared) => prepared,
+                Err(e) => {
+                    let _ = writeln!(err, "error: {}: {e}", spec.id);
+                    codes.push(failure_code(&e));
+                    continue;
+                }
+            }
+        } else {
+            Prepared::nothing()
+        };
         match mgr.install(spec, args.force) {
             Ok(outcome) => {
                 match report_outcome(&spec.id, &outcome, out, err) {
@@ -113,7 +133,7 @@ pub fn run(
                     }
                 }
                 if args.start {
-                    if let Err(e) = mgr.start(&spec.id) {
+                    if let Err(e) = mgr.start(&spec.id, args.wait.budget()) {
                         let _ = writeln!(err, "error: {}: start: {e}", spec.id);
                         codes.push(failure_code(&e));
                     }
@@ -132,12 +152,24 @@ pub fn run(
 }
 
 /// The class a failed step contributes: `4` when goetia could not
-/// determine what is at the id, `1` when the step determinately failed.
-/// This is what makes `install` agree with `diff` about one artifact — see
+/// determine the answer, `1` when the step determinately failed. This is
+/// what makes `install` agree with `diff` about one artifact — see
 /// `dispatch`'s doc comment for the vocabulary.
 fn failure_code(e: &Error) -> i32 {
     match e {
-        Error::Undetermined { .. } => 4,
+        // Two conditions, one class. `Undetermined` left it open what is at
+        // the id; `WaitTimeout` answered that and left the *outcome* open,
+        // the request having been issued and not cancelled. Neither is a
+        // step that determinately failed, which is what `1` would claim.
+        // `RequestInDoubt` left open whether a request `install` or `--start`
+        // sent reached the manager, or what came of one that did.
+        Error::Undetermined { .. } | Error::WaitTimeout { .. } | Error::RequestInDoubt { .. } => 4,
+        // `Error::Unestablished` belongs in the arm above and is missing
+        // from it only because it cannot arrive here: `cli::restart` is its
+        // only producer, and `install` never calls it. `Error` is not
+        // `#[non_exhaustive]`, so a second producer reached from one of
+        // `install`'s own steps would land here and report `1` — "the step
+        // determinately failed" — silently. Add it above if one ever does.
         _ => 1,
     }
 }

@@ -4,9 +4,12 @@
 //! `quarantine_if_still_ours`, with a foreign write injected between classification and write —
 //! something no interleaving of `install` calls alone can force deterministically.
 //!
-//! Elevated (writes real files under `/etc/systemd/system`), so it opts into the same `elevated`
-//! precondition/label convention `tests/support/mod.rs` uses, duplicated locally rather than shared:
-//! a plain library unit test cannot depend on the `tests/` integration-test support crate.
+//! Most of these are elevated (they write real files under `/etc/systemd/system`), so they opt into
+//! the same `elevated` precondition/label convention `tests/support/mod.rs` uses, duplicated locally
+//! rather than shared: a plain library unit test cannot depend on the `tests/` integration-test
+//! support crate. The two deadline-ordering tests (`start_derives_its_deadline_before_require_
+//! installed_runs` and its `stop_` mirror) are the exception: they drive only the `VerbSteps` seam,
+//! touch nothing on disk, and run unelevated.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
@@ -428,4 +431,134 @@ fn a_drop_in_name_that_is_not_a_directory_still_names_its_id() {
 
     assert!(scan.units.is_empty(), "there is no fragment here: {scan:?}");
     assert_eq!(scan.dropins, ["blocked"], "{scan:?}");
+}
+
+// start/stop: the deadline comes first ================================================================================
+
+/// The steps `verb` took, in order, with every step a recording fake — so, unlike the rest of this
+/// file, no elevation and no real systemd. The step that talks to systemd also checks that it was
+/// handed the deadline `start_clock` derived, not one of its own.
+/// Under a bounded budget `restart`'s legs, and `install --start`'s start, each run one watched
+/// `systemctl`, and `prepare` makes what every one of them needs before either sends anything: once
+/// it succeeded, no leg can fail for want of a thread or a file. It fails as a whole when one is
+/// short.
+#[skuld::test]
+fn prepared_steps_need_nothing_made_later() {
+    let mgr = Systemd::new();
+    for (steps, watched) in [(&[Step::Stop, Step::Start][..], 2), (&[Step::Install, Step::Start], 1)] {
+        let _prepared = mgr.prepare(steps, Budget::DEFAULT).expect("prepare");
+        let _no_thread = bounded::test_hook::threads(0);
+        let _no_file = bounded::test_hook::temp_files(0);
+        for _ in 0..watched {
+            let spawned = bounded::spawn(
+                &mut bounded::command("/bin/true", &[]).unwrap(),
+                bounded::Role::AnnouncedRequest(|_| true),
+            )
+            .expect("its threads were prepared");
+            bounded::wait_bounded(spawned, Budget::Unbounded.start()).expect("wait");
+        }
+        assert_eq!(
+            bounded::test_hook::pooled(),
+            bounded::Needs::default(),
+            "{steps:?}: prepared more than its steps watch"
+        );
+    }
+
+    type Allowance = fn() -> bounded::test_hook::Allowance;
+    let shortfalls: [Allowance; 3] = [
+        || bounded::test_hook::threads(1),
+        || bounded::test_hook::threads(3),
+        || bounded::test_hook::temp_files(0),
+    ];
+    for (i, allowance) in shortfalls.into_iter().enumerate() {
+        let _short = allowance();
+        let e = mgr.prepare(&[Step::Stop, Step::Start], Budget::DEFAULT).err();
+        if i < 2 {
+            let e = e.expect("threads short");
+            assert!(e.to_string().contains("so none was sent"), "{e}");
+        } else {
+            assert!(e.is_none(), "systemd prepares no temp file: {e:?}");
+        }
+    }
+}
+
+/// A budget that does not wait, or never stops waiting, watches no `systemctl`, so nothing is made
+/// for one — a verb that makes no thread must not be refused for want of one.
+#[skuld::test]
+fn a_budget_that_watches_nothing_prepares_nothing() {
+    let _no_thread = bounded::test_hook::threads(0);
+    let _no_file = bounded::test_hook::temp_files(0);
+    for budget in [Budget::Immediate, Budget::Unbounded] {
+        assert!(
+            Systemd::new().prepare(&[Step::Stop, Step::Start], budget).is_ok(),
+            "{budget:?}"
+        );
+    }
+}
+
+/// The steps `prepare` covers share one version gate while it is held: `restart`'s stop and start,
+/// and `install --start`'s install and start, each probe `systemctl` once, not once per step.
+#[skuld::test]
+fn prepared_steps_share_one_version_gate() {
+    let asked = std::cell::Cell::new(0);
+    let count = || {
+        asked.set(asked.get() + 1);
+        Ok(())
+    };
+    for budget in [Budget::DEFAULT, Budget::Immediate, Budget::Unbounded] {
+        asked.set(0);
+        let prepared = Systemd::new()
+            .prepare(&[Step::Stop, Step::Start], budget)
+            .expect("prepare");
+        systemctl::gated(count).unwrap();
+        systemctl::gated(count).unwrap();
+        assert_eq!(asked.get(), 1, "{budget:?}: the two legs asked twice");
+        drop(prepared);
+        systemctl::gated(count).unwrap();
+        assert_eq!(asked.get(), 2, "{budget:?}: the answer outlived the preparation");
+    }
+}
+
+fn steps_taken(verb: fn(&str, Budget, &VerbSteps<'_>) -> Result<()>) -> Vec<&'static str> {
+    let log = std::cell::RefCell::new(Vec::new());
+    let derived = std::cell::Cell::new(None);
+    let act = |step: &'static str, deadline: Deadline| {
+        log.borrow_mut().push(step);
+        assert_eq!(
+            Some(deadline),
+            derived.get(),
+            "{step} must run under the deadline derived at entry"
+        );
+        Ok(())
+    };
+    let steps = VerbSteps {
+        start_clock: &|budget| {
+            log.borrow_mut().push("start_clock");
+            let deadline = budget.start();
+            derived.set(Some(deadline));
+            deadline
+        },
+        require_installed: &|_| {
+            log.borrow_mut().push("require_installed");
+            Ok(String::new())
+        },
+        start: &|_, _, deadline| act("start", deadline),
+        stop: &|_, _, deadline| act("stop", deadline),
+    };
+    verb("x", Budget::DEFAULT, &steps).expect("every step succeeds");
+    log.into_inner()
+}
+
+/// `--timeout` counts from verb entry only if the deadline exists before `require_installed`'s scan
+/// runs. Derived after it, the scan runs outside the budget and nothing else observable changes,
+/// which is why the order is pinned here rather than left to the elevated suite. What the scan
+/// spends never keeps the request from systemd — see `systemctl::run_verb`.
+#[skuld::test]
+fn start_derives_its_deadline_before_require_installed_runs() {
+    assert_eq!(steps_taken(start_with), ["start_clock", "require_installed", "start"]);
+}
+
+#[skuld::test]
+fn stop_derives_its_deadline_before_require_installed_runs() {
+    assert_eq!(steps_taken(stop_with), ["start_clock", "require_installed", "stop"]);
 }

@@ -36,6 +36,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      # kill_tree_windows's logic (taskkill argv, stderr surfacing, the
+      # unconditional proc.kill() backstop) faked against subprocess.run --
+      # touches no real process, so it runs on every OS in this matrix.
+      - name: Test run-with-timeout.py (unit)
+        shell: bash
+        run: cd .github/scripts && python3 -B -m unittest run-with-timeout-unit-tests -v
+
+      # run-with-timeout.py's POSIX path kills by session through `ps` and
+      # `getsid`, whose behaviour differs between Linux and macOS, so it needs
+      # both to cover it; this matrix is the only job that runs on both.
+      - name: Test run-with-timeout.py (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash .github/scripts/run-with-timeout-tests.sh
+
+      # kill_tree_windows's real taskkill/process-tree behavior needs an
+      # actual Windows host and taskkill to exercise; the unit step above
+      # only fakes both.
+      - name: Test run-with-timeout.py (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: python3 .github/scripts/run-with-timeout-windows-tests.py
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
@@ -83,24 +106,44 @@ jobs:
 
           .github/scripts/assert-test-binaries.sh test-binaries.txt
 
+          # The job exits with the FIRST failure's code, and every failing
+          # binary is named with its own: `124` (the watchdog fired) and a
+          # test failure mean different things, and keeping only one code
+          # would let either mask the other.
           status=0
+          failures=()
           while IFS= read -r bin; do
             # Strip a trailing CR: on Windows, Python's text-mode stdout
             # writes CRLF, and bash's `read` does not strip it — an
             # unstripped `\r` makes the path unresolvable at exec time.
             bin="${bin%$'\r'}"
-            if [ -z "$bin" ]; then
+            if [[ -z "$bin" ]]; then
               continue
             fi
             echo "::group::$bin"
-            if [ "$RUNNER_OS" = "Windows" ]; then
-              "$bin" || status=$?
+            # The watchdog runs INSIDE the elevation: one outside `sudo`
+            # cannot signal the root process it started. The interpreter is
+            # resolved before `sudo`, not by it — `sudo` resets `PATH` to
+            # its own `secure_path`, which the macOS runner's toolcache
+            # `python3` is not on.
+            bin_status=0
+            if [[ "$RUNNER_OS" == "Windows" ]]; then
+              python3 .github/scripts/run-with-timeout.py 600 "$bin" || bin_status=$?
             else
-              sudo "$bin" || status=$?
+              sudo "$(command -v python3)" .github/scripts/run-with-timeout.py 600 "$bin" || bin_status=$?
             fi
             echo "::endgroup::"
+            if [[ "$bin_status" -ne 0 ]]; then
+              failures+=("exit ${bin_status}: ${bin}")
+              if [[ "$status" -eq 0 ]]; then
+                status="$bin_status"
+              fi
+            fi
           done < test-binaries.txt
 
+          if [[ "${#failures[@]}" -gt 0 ]]; then
+            printf '::error::%s\n' "${failures[@]}"
+          fi
           exit "$status"
 
       # See `tests/support/mod.rs::record_probe`.

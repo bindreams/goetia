@@ -48,7 +48,7 @@
       "automerge": true
     },
     {
-      "description": "Major updates: one PR per package, reviewed by a human. Deviates from ~/src/hole, which auto-merges majors on the strength of its CI. Goetia's three platform backends do not exist yet, so a major bump of e.g. windows-service would land with almost no behavioural coverage. Revisit once the backends and their integration tests are in.",
+      "description": "Major updates: one PR per package, reviewed by a human. Deviates from the `hole` repo, which auto-merges majors on the strength of its CI. Goetia's three platform backends do not exist yet, so a major bump of e.g. windows-service would land with almost no behavioural coverage. Revisit once the backends and their integration tests are in.",
       "matchUpdateTypes": [
         "major"
       ],

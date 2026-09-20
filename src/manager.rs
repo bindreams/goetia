@@ -9,8 +9,11 @@
 //! of its policy table itself; see [`conformance::run`], which asserts that
 //! contract against any `&dyn ServiceManager`.
 
+pub mod budget;
 pub mod conformance;
 pub mod fake;
+
+pub use budget::Budget;
 
 // All three supported platforms now return a real `ServiceManager`, so
 // `Error::UnsupportedPlatform` is referenced only by the catch-all arm.
@@ -58,12 +61,119 @@ pub trait ServiceManager {
     /// Disable the service at boot. Does not stop it if running.
     fn disable(&self, id: &Id) -> Result<()>;
 
-    /// Start the service now. Does not change its boot-enablement.
-    /// Idempotent: starting an already-running service is `Ok(())`, not an
-    /// error.
-    fn start(&self, id: &Id) -> Result<()>;
+    /// Start the service now, waiting up to `budget` for it. Does not
+    /// change its boot-enablement.
+    ///
+    /// `Ok(())` means **the platform's service manager reports the service
+    /// as running, as far as it knows** — not that the service is ready to
+    /// serve, which no service manager can tell us. An implementation must
+    /// not fabricate that confirmation: reporting one it did not obtain is
+    /// the failure this whole signature exists to prevent.
+    ///
+    /// **`budget` bounds waiting for that confirmation, never whether the
+    /// request is sent.** Every real backend starts the clock at verb
+    /// entry, so discovery spends the budget too — and then issues the
+    /// request whatever is left of it, cutting short only the wait for the
+    /// manager's answer. A budget discovery used up still reaches the
+    /// manager.
+    ///
+    /// [`Budget::Immediate`] issues the request and returns without waiting,
+    /// establishing nothing. `Ok(())` then means only that the request was
+    /// accepted, so a caller must not read any state from it — and neither
+    /// must the implementation, which is why every state assertion a backend
+    /// makes belongs behind [`Budget::waits`].
+    ///
+    /// **Where a platform offers no request-only form, [`Budget::Immediate`]
+    /// still performs the full blocking call, because issuing the request
+    /// *is* that call.** This is true of launchd's `launchctl
+    /// print`/`bootstrap`, neither of which has a non-blocking spelling: a
+    /// `start` with no budget still probes and, if needed, bootstraps the
+    /// job to completion before the plain `kickstart` that is what actually
+    /// declines to wait. The budget bounds what goetia waits *for*, and
+    /// there is nothing here to wait for separately.
+    ///
+    /// An answer from the manager that itself establishes the goal is the
+    /// confirmation, whatever is left of the budget: launchd's `print` of a
+    /// job already running, read before any request is needed, and SCM's
+    /// `ERROR_SERVICE_ALREADY_RUNNING` reply over a service it reports
+    /// `RUNNING`. systemd's answer to a start is a job,
+    /// never a state, so there a unit already active is confirmed only when
+    /// that job completes — which is where the backends disagree: under a
+    /// budget shorter than the job's round trip (tens of milliseconds), the
+    /// same start of a running daemon expires on systemd and succeeds on the
+    /// other two.
+    ///
+    /// On expiry, [`Error::WaitTimeout`] — never `Ok(())`, and never
+    /// [`Error::Undetermined`], which claims the *installation* is in doubt
+    /// when what actually happened is that a settled id's request was issued
+    /// and not waited out. That the request *was* issued is what the rule
+    /// above guarantees, and what `WaitTimeout`'s wording states.
+    ///
+    /// Idempotent under every budget: starting an already-running service is
+    /// `Ok(())`, not an error.
+    ///
+    /// [`Error::WaitTimeout`]: crate::Error::WaitTimeout
+    /// [`Error::Undetermined`]: crate::Error::Undetermined
+    fn start(&self, id: &Id, budget: Budget) -> Result<()>;
 
-    /// Stop the service now. Does not change its boot-enablement.
+    /// Make ready, before the first of `steps` sends anything, whatever
+    /// they can need under `budget` — the one their verbs will be given —
+    /// that could otherwise run out between two of them — so
+    /// that a failure here means nothing was sent, where the same failure
+    /// later would strand the daemon halfway: stopped by `restart`'s stop
+    /// with its start never sent, or booted out by `install --start`'s
+    /// install with the start never sent. Held for as long as the returned
+    /// [`Prepared`] lives, for verbs run on this thread — any step of them,
+    /// for any id, may draw on it meanwhile; `status` and `list` never do,
+    /// and make what they need for themselves. Preparations nest and may be
+    /// dropped in any order: dropping one releases only what it made.
+    /// Nothing, by default — so a wrapper around another manager forwards
+    /// it.
+    fn prepare(&self, _steps: &[Step], _budget: Budget) -> Result<Prepared> {
+        Ok(Prepared::nothing())
+    }
+
+    /// `daemon restart --timeout 0` as one request, where the platform has
+    /// one: the manager's own restart, confirming nothing. `None`,
+    /// the default, where it has none — the caller then issues [`Self::stop`]
+    /// under [`Budget::Immediate`] and [`Self::request_start_after_stop`].
+    ///
+    /// Only a single request is free of the window between two: systemd
+    /// answers a start by replacing a stop job it has not yet run, and on a
+    /// unit still active that start completes at once, restarting nothing.
+    /// `Some(Ok(()))` means the manager accepted the request and nothing more.
+    fn request_restart(&self, _id: &Id) -> Option<Result<()>> {
+        None
+    }
+
+    /// `daemon restart --timeout 0`'s second step, where there is no
+    /// [`Self::request_restart`]: request a start right after a stop request
+    /// nobody waited for, and return.
+    ///
+    /// **Unlike [`Self::start`], not idempotent over a service that is still
+    /// up.** A manager answering "already running" here has refused the
+    /// start, because the instance it sees may be the one the stop is still
+    /// taking down: a Windows `type: simple` service reads `RUNNING` for its
+    /// whole teardown (`goetia-shim` never reports `STOP_PENDING`), and
+    /// reading that answer as a start reports a restart that leaves the
+    /// daemon down. `Ok(())` means the manager accepted a start request and
+    /// nothing more. Takes no budget: it never waits.
+    fn request_start_after_stop(&self, id: &Id) -> Result<()>;
+
+    /// Stop the service now, waiting up to `budget` for it. Does not change
+    /// its boot-enablement.
+    ///
+    /// `Ok(())` means the service manager reports the service as stopped, on
+    /// the same terms as [`Self::start`]; `budget` bounds only the wait, as
+    /// there; and an expiry is [`Error::WaitTimeout`] on the same terms too.
+    ///
+    /// **Where a platform offers no request-only form,
+    /// [`Budget::Immediate`] still performs the full blocking call, because
+    /// issuing the request *is* that call.** This is true of `launchctl
+    /// bootout`, which has no non-blocking spelling: a `stop` with no budget
+    /// still boots the job out to completion. The budget bounds what goetia
+    /// waits *for*, and there is nothing here to wait for separately.
+    ///
     /// Idempotent: stopping an already-stopped service is `Ok(())`, not an
     /// error — `daemon restart`'s `stop` then `start` depends on this
     /// holding for a daemon that was never started, and real managers
@@ -71,7 +181,9 @@ pub trait ServiceManager {
     /// an inactive service both fail; `systemctl stop` does not), so an
     /// implementation must paper over that difference itself, not leave it
     /// for a caller to rediscover per platform.
-    fn stop(&self, id: &Id) -> Result<()>;
+    ///
+    /// [`Error::WaitTimeout`]: crate::Error::WaitTimeout
+    fn stop(&self, id: &Id, budget: Budget) -> Result<()>;
 
     /// The live state of one installed service. `Err` for an id whose blob
     /// will not decode — this must not fabricate a plausible-looking
@@ -79,9 +191,11 @@ pub trait ServiceManager {
     /// design notes on `Installed::OursUnreadable`, which exists for the
     /// same reason on the `list` side) — and [`Error::Undetermined`] for an
     /// id whose artifact could not be read at all, where not even ownership
-    /// was established.
+    /// was established. [`Error::NoManager`] where no manager can be asked
+    /// for the state, which the CLI reports as `unavailable` under the id.
     ///
     /// [`Error::Undetermined`]: crate::Error::Undetermined
+    /// [`Error::NoManager`]: crate::Error::NoManager
     fn status(&self, id: &Id) -> Result<Status>;
 
     /// Every id this backend could account for. A foreign (unmarked)
@@ -101,8 +215,43 @@ pub trait ServiceManager {
     /// putting a settled answer behind it is the same conflation
     /// [`Installed::Undetermined`] exists to end, arrived at from the other
     /// side. A scan that *started* and did not finish is the opposite case
-    /// and does report (see `Installed::scan_incomplete`).
+    /// and does report (see `Installed::scan_incomplete`). So does an entry
+    /// whose live state could not be queried, as `OursUnreadable` — except
+    /// where no manager can be asked for any entry's: that is
+    /// [`Error::NoManager`], for the whole listing.
+    ///
+    /// [`Error::NoManager`]: crate::Error::NoManager
     fn list(&self) -> Result<Vec<Installed>>;
+}
+
+// Prepared ============================================================================================================
+
+/// One verb of a sequence a caller runs back to back — see
+/// [`ServiceManager::prepare`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    Install,
+    Start,
+    Stop,
+}
+
+/// What [`ServiceManager::prepare`] made ready, released when dropped.
+#[must_use = "what was prepared is released as soon as this is dropped"]
+pub struct Prepared {
+    _held: Option<Box<dyn std::any::Any>>,
+}
+
+impl Prepared {
+    /// Nothing made ready: a backend with nothing that can run out.
+    pub fn nothing() -> Self {
+        Prepared { _held: None }
+    }
+
+    pub(crate) fn holding(held: impl std::any::Any) -> Self {
+        Prepared {
+            _held: Some(Box::new(held)),
+        }
+    }
 }
 
 // Installed / Status / State ==========================================================================================

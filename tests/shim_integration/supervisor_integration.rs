@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use goetia::backend::scm::manager::ScmManager;
-use goetia::manager::ServiceManager as _;
+use goetia::manager::{Budget, ServiceManager as _};
 
 use crate::common::{fixture_command, mk_spec_full};
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
@@ -34,10 +34,10 @@ fn shim_runs_child_with_cwd_and_env() {
         None,
     );
     mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id).expect("start");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
 
     let line = reported.accept_line("the fixture to report its cwd and env");
-    mgr.stop(&spec.id).expect("stop");
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
 
     let (cwd_part, env_part) = line
         .split_once(';')
@@ -74,9 +74,9 @@ fn shim_captures_stdout_to_logs_path() {
         Some(log_path.clone()),
     );
     mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id).expect("start");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     reported.accept("the fixture to finish writing its log lines");
-    mgr.stop(&spec.id).expect("stop");
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
 
     let contents =
         std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read captured log {}: {e}", log_path.display()));
@@ -118,7 +118,7 @@ fn stop_kills_the_whole_process_tree() {
         None,
     );
     mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id).expect("start");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     let child_pid = child_reported.accept_line("the direct child to start and report its pid");
     let grandchild_pid = grandchild_reported.accept_line("the grandchild to start and report its pid");
 
@@ -129,7 +129,7 @@ fn stop_kills_the_whole_process_tree() {
     // has already decided not to respawn (see `service::supervisor_loop`'s
     // `Stopping` arm) — so nothing after this call can still be racing a
     // decision made before it returned.
-    mgr.stop(&spec.id).expect("stop");
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
 
     // The namesake claim: the stop reached the *whole* tree, not merely
     // "no new connection arrived" (which a surviving-but-silent process
@@ -186,14 +186,14 @@ fn on_failure_respawns_after_a_nonzero_exit() {
         None,
     );
     mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id).expect("start");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
 
     reported.accept("the first spawn to report in before exiting 1");
     let before_respawn = std::time::Instant::now();
     reported.accept("a respawned child to report in after the first one exited nonzero");
     let elapsed = before_respawn.elapsed();
 
-    mgr.stop(&spec.id).expect("stop");
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
 
     // A real, if generous (scheduling jitter, not a chosen synchronization
     // bound), lower bound on `DEFAULT_RESTART_DELAY` (1s): proves the
@@ -225,7 +225,7 @@ fn unreadable_blob_logs_to_fallback_path_and_event_log() {
     corrupt_spec_value(&id);
 
     let err = mgr
-        .start(&spec.id)
+        .start(&spec.id, Budget::DEFAULT)
         .expect_err("a shim that cannot decode its own metadata blob must fail to start, not hang");
     let _ = err;
 

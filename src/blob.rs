@@ -70,8 +70,10 @@ pub fn encode(spec: &DaemonSpec) -> String {
 /// `encode`, with the embedded version pinned explicitly rather than read
 /// from `crate::version()`. Lets `blob_wire_names_are_pinned` assert
 /// golden bytes that stay stable across `Cargo.toml` version bumps —
-/// those aren't the wire-format drift that test guards against.
-fn encode_with_version(spec: &DaemonSpec, version: &str) -> String {
+/// those aren't the wire-format drift that test guards against. `pub(crate)`
+/// so a generator's own tests can build the artifact an older goetia would
+/// have written, to pin `decide`'s stale-version handling against it.
+pub(crate) fn encode_with_version(spec: &DaemonSpec, version: &str) -> String {
     BASE64.encode(canonical_json(SCHEMA, version, spec))
 }
 

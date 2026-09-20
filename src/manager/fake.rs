@@ -9,11 +9,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::blob::{self, Blob};
 use crate::decide::{self, Outcome, Ownership};
 use crate::error::{Error, Result};
-use crate::manager::{Installed, ServiceManager, State, Status};
+use crate::manager::budget;
+use crate::manager::{Budget, Installed, Prepared, ServiceManager, State, Status, Step};
 use crate::spec::{DaemonSpec, Id};
 
 /// The fake's own artifact marker. Deliberately not any of the real
@@ -90,9 +92,56 @@ struct Store {
     /// [`Fake::seed_aggregate_undetermined`]. Not a set of ids: an
     /// aggregate is precisely the case where the ids are not known.
     aggregates: Vec<String>,
+    /// Ids whose manager never confirms a start — see
+    /// [`Fake::seed_start_stalls`].
+    start_stalls: BTreeSet<String>,
+    /// [`Fake::seed_stop_stalls`]'s mirror of `start_stalls`.
+    stop_stalls: BTreeSet<String>,
+    /// Ids whose start request ends in doubt — see [`Fake::seed_start_in_doubt`].
+    start_in_doubt: BTreeSet<String>,
+    /// [`Fake::seed_stop_in_doubt`]'s mirror of `start_in_doubt`.
+    stop_in_doubt: BTreeSet<String>,
+    /// Whether this Fake has a request-only restart — see
+    /// [`Fake::seed_native_restart`].
+    native_restart: bool,
+    /// Whether [`ServiceManager::prepare`] fails — see
+    /// [`Fake::seed_prepare_fails`].
+    prepare_fails: bool,
+    /// Whether no manager can be asked — see [`Fake::seed_no_manager`].
+    no_manager: bool,
+    /// Every `start`/`stop`/`restart` this Fake was asked to perform, in
+    /// order — see [`Fake::calls`].
+    calls: Vec<(&'static str, String)>,
+    /// The steps and budget each [`ServiceManager::prepare`] was given, in
+    /// order — see [`Fake::prepared`].
+    prepared: Vec<(Vec<Step>, Budget)>,
+    /// The steps of every guard `prepare` returned that has not been
+    /// dropped, by guard number.
+    live: Vec<(u64, Vec<Step>)>,
+    /// The number the next guard `prepare` returns is known by.
+    next_guard: u64,
+    /// Every request, with the steps of the guards live when it was asked —
+    /// see [`Fake::guarded`].
+    guarded: Vec<(&'static str, String, Vec<Step>)>,
 }
 
 impl Store {
+    /// [`Fake::seed_no_manager`]'s refusal, if seeded.
+    fn manager(&self) -> Result<()> {
+        if self.no_manager {
+            return Err(Error::NoManager {
+                evidence: "seeded".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Record a request for [`Fake::guarded`], under the guards live now.
+    fn asked(&mut self, verb: &'static str, id: &Id) {
+        let steps = self.live.iter().flat_map(|(_, steps)| steps.iter().copied()).collect();
+        self.guarded.push((verb, id.as_str().to_string(), steps));
+    }
+
     /// The artifact at `id`, or the error its absence means *there* — never
     /// a bare [`Error::NotInstalled`] read off the map lookup alone. Every
     /// verb goes through this or [`Store::get_mut`], so none of them can
@@ -323,6 +372,95 @@ impl Fake {
         state.aggregates.push(reason.into());
     }
 
+    /// Test-only seeding: mark `id` as a service whose manager never
+    /// confirms a start — the state every timeout test needs and no
+    /// sequence of real verbs can produce.
+    ///
+    /// The fake **never sleeps** for it: [`stalled`] reads the budget and
+    /// reports the expiry directly. That is what makes a `--timeout 1h` test
+    /// finish instantly and deterministically instead of being a bet on a
+    /// scheduler.
+    pub fn seed_start_stalls(&self, id: &str) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.start_stalls.insert(id.to_string());
+    }
+
+    /// Test-only seeding: every start of `id` — `start` and
+    /// `request_start_after_stop` alike — fails as a real backend's does when
+    /// the tool carrying the request may have started, and was then lost:
+    /// [`Error::RequestInDoubt`], changing nothing here.
+    pub fn seed_start_in_doubt(&self, id: &str) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.start_in_doubt.insert(id.to_string());
+    }
+
+    /// [`Fake::seed_start_in_doubt`]'s mirror for `stop`.
+    pub fn seed_stop_in_doubt(&self, id: &str) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.stop_in_doubt.insert(id.to_string());
+    }
+
+    /// [`Fake::seed_start_stalls`]'s mirror for `stop`.
+    pub fn seed_stop_stalls(&self, id: &str) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.stop_stalls.insert(id.to_string());
+    }
+
+    /// Test-only seeding: give this Fake a [`ServiceManager::request_restart`],
+    /// as systemd's `systemctl restart --no-block` is. Without it the Fake has
+    /// none, as launchd and SCM have none.
+    pub fn seed_native_restart(&self) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.native_restart = true;
+    }
+
+    /// Test-only seeding: no manager can be asked, as systemd's offline mode
+    /// shows. Every verb that reaches the manager refuses with
+    /// [`Error::NoManager`] once it has found an artifact of goetia's to act
+    /// on, changing nothing; `preview_install` never reaches it.
+    pub fn seed_no_manager(&self) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.no_manager = true;
+    }
+
+    /// Test-only seeding: make [`ServiceManager::prepare`] fail, as launchd's
+    /// does when no thread can be made to reap a request.
+    pub fn seed_prepare_fails(&self) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.prepare_fails = true;
+    }
+
+    /// Every `start`/`stop`/`restart` this Fake was asked to perform, in order,
+    /// recorded when it was *asked* rather than when it succeeded.
+    ///
+    /// Exists because some assertions are about the **absence** of a call,
+    /// which no state read can express: the fake's `start` on an
+    /// already-`Running` entry is idempotent and leaves the state
+    /// byte-identical, so "never called" and "called, changed nothing" are
+    /// indistinguishable from the outside.
+    /// `restart_does_not_start_after_a_stop_that_timed_out` is exactly that
+    /// assertion.
+    pub fn calls(&self) -> Vec<(&'static str, String)> {
+        let state = self.state.lock().expect("Fake mutex poisoned");
+        state.calls.clone()
+    }
+
+    /// The steps and budget every [`ServiceManager::prepare`] was given, in
+    /// order — failed ones included.
+    pub fn prepared(&self) -> Vec<(Vec<Step>, Budget)> {
+        let state = self.state.lock().expect("Fake mutex poisoned");
+        state.prepared.clone()
+    }
+
+    /// Every `install`/`start`/`stop`/`restart` this Fake was asked for, in
+    /// order, each with the steps of every [`Prepared`] still held when it
+    /// was asked: whether the preparation that should cover a request did —
+    /// the right steps, not yet released.
+    pub fn guarded(&self) -> Vec<(&'static str, String, Vec<Step>)> {
+        let state = self.state.lock().expect("Fake mutex poisoned");
+        state.guarded.clone()
+    }
+
     /// Test-only: force `id`'s reported [`State`] directly, bypassing
     /// `start`/`stop` (which can only produce `Running`/`Stopped`). `id`
     /// must already be installed.
@@ -375,6 +513,37 @@ fn require_ours(entry: &Entry, id: &Id) -> Result<()> {
     }
 }
 
+/// What a **stalled** entry's `start`/`stop` reports for `budget`, without
+/// ever sleeping: the fake derives the expiry rather than living it.
+///
+/// The rule branches on the budget's *kind*, not on [`Budget::waits`], and
+/// that distinction is the whole of it:
+///
+/// | budget | result |
+/// |---|---|
+/// | `Immediate`, and `Bounded(ZERO)` with it | `Ok(())`, state untouched — the honest model of "requested, not confirmed" |
+/// | `Bounded(d)`, `d > 0` | [`budget::timed_out`] |
+/// | `Unbounded` | **panic** |
+///
+/// `Unbounded` has to panic. `waits()` is true for it, so a rule phrased as
+/// "a stalled entry under a waiting budget times out" routes it into
+/// `budget::timed_out`, whose own `debug_assert!` requires a `Bounded`
+/// budget — leaving the fake to either trip that assert or report an expiry
+/// that provably cannot have happened. The honest model is "hang forever",
+/// which is unusable in a test, and a fake that cannot honestly model a case
+/// must refuse it rather than approximate it. Deterministic, loud, and
+/// impossible to mistake for a backend behaviour.
+fn stalled(id: &Id, awaited: &'static str, budget: Budget) -> Result<()> {
+    match budget {
+        Budget::Immediate | Budget::Bounded(Duration::ZERO) => Ok(()),
+        Budget::Bounded(_) => Err(budget::timed_out(id.as_str(), awaited, budget)),
+        Budget::Unbounded => panic!(
+            "Fake: a stalled entry cannot be awaited under Budget::Unbounded — that wait has no \
+             end. Use Budget::Bounded to exercise the expiry path."
+        ),
+    }
+}
+
 /// Classify what's at `id` in `state`, exactly as `install` would discover
 /// it, plus the raw on-disk text `decide` needs alongside the
 /// classification. Shared by `install` and `preview_install` so the two can
@@ -404,17 +573,49 @@ fn discover(state: &Store, id: &str) -> (Ownership, Option<String>) {
     (found, existing.map(|e| e.text))
 }
 
+/// [`Fake::seed_start_in_doubt`]'s failure, for a start of `id`.
+fn in_doubt(state: &Store, id: &Id) -> Result<()> {
+    lost(&state.start_in_doubt, "start", id)
+}
+
+/// The failure a `seed_*_in_doubt` seeded in `ids`, for a `verb` of `id`.
+fn lost(ids: &BTreeSet<String>, verb: &str, id: &Id) -> Result<()> {
+    if ids.contains(id.as_str()) {
+        return Err(Error::RequestInDoubt {
+            request: format!("fake {verb} {id}"),
+            reached: false,
+            detail: "lost (seeded)".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// What [`Fake`]'s `prepare` holds: its steps stay live until this drops.
+struct Held {
+    store: Arc<Mutex<Store>>,
+    guard: u64,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let mut state = self.store.lock().expect("Fake mutex poisoned");
+        state.live.retain(|(guard, _)| *guard != self.guard);
+    }
+}
+
 // ServiceManager ======================================================================================================
 
 impl ServiceManager for Fake {
     fn install(&self, spec: &DaemonSpec, force: bool) -> Result<Outcome> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.asked("install", &spec.id);
         // Before `discover`, which has no error channel: an artifact whose
         // bytes were never read supplies none of `decide`'s inputs, so this
         // is an input failure ahead of policy, not a fifth `Ownership`.
         if state.opaque.contains(spec.id.as_str()) {
             return Err(Store::undetermined(&spec.id));
         }
+        state.manager()?;
         let desired = generate(spec);
         let (found, on_disk) = discover(&state, spec.id.as_str());
 
@@ -484,42 +685,131 @@ impl ServiceManager for Fake {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         let entry = state.get(id)?;
         require_ours(entry, id)?;
+        state.manager()?;
         state.entries.remove(id.as_str());
         Ok(())
     }
 
     fn enable(&self, id: &Id) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
+        let manager = state.manager();
         let entry = state.get_mut(id)?;
         require_ours(entry, id)?;
+        manager?;
         entry.enabled = true;
         Ok(())
     }
 
     fn disable(&self, id: &Id) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
+        let manager = state.manager();
         let entry = state.get_mut(id)?;
         require_ours(entry, id)?;
+        manager?;
         entry.enabled = false;
         Ok(())
     }
 
-    fn start(&self, id: &Id) -> Result<()> {
+    fn start(&self, id: &Id, budget: Budget) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
+        // Recorded on being *asked*, ahead of every check below: `calls`
+        // answers "was this attempted", which is a different question from
+        // whether it succeeded or changed anything.
+        state.calls.push(("start", id.as_str().to_string()));
+        state.asked("start", id);
+        in_doubt(&state, id)?;
+        let stalls = state.start_stalls.contains(id.as_str());
+        let manager = state.manager();
         let entry = state.get_mut(id)?;
         require_ours(entry, id)?;
-        entry.state = State::Running;
+        manager?;
+        if stalls {
+            // No confirmation is coming, so none is invented: the state is
+            // left exactly as it was on every branch `stalled` can take.
+            return stalled(id, "running", budget);
+        }
+        // Request-only: no real backend establishes anything here, so
+        // neither does the Fake — see `ServiceManager::start`.
+        if budget.waits() {
+            entry.state = State::Running;
+        }
         Ok(())
     }
 
-    fn stop(&self, id: &Id) -> Result<()> {
+    /// Fails only once [`Fake::seed_prepare_fails`]ed. Makes nothing ready,
+    /// but records `steps`, and holds them live for [`Fake::guarded`] until
+    /// the guard drops.
+    fn prepare(&self, steps: &[Step], budget: Budget) -> Result<Prepared> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.prepared.push((steps.to_vec(), budget));
+        if state.prepare_fails {
+            return Err(Error::Other(
+                "nothing could be prepared (injected test failure)".to_string(),
+            ));
+        }
+        let guard = state.next_guard;
+        state.next_guard += 1;
+        state.live.push((guard, steps.to_vec()));
+        Ok(Prepared::holding(Held {
+            store: Arc::clone(&self.state),
+            guard,
+        }))
+    }
+
+    /// Only once [`Fake::seed_native_restart`]ed. Request-only, so it settles
+    /// nothing, as for `start`.
+    fn request_restart(&self, id: &Id) -> Option<Result<()>> {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        if !state.native_restart {
+            return None;
+        }
+        state.calls.push(("restart", id.as_str().to_string()));
+        state.asked("restart", id);
+        let manager = state.manager();
+        Some(state.get_mut(id).and_then(|entry| require_ours(entry, id)).and(manager))
+    }
+
+    /// Models the strictest manager the contract allows, SCM's: a service
+    /// still `Running` refuses the start, since the request-only `stop` before
+    /// it settled nothing. Recorded as `start`, which is what it asks for.
+    fn request_start_after_stop(&self, id: &Id) -> Result<()> {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.calls.push(("start", id.as_str().to_string()));
+        state.asked("start", id);
+        in_doubt(&state, id)?;
+        let manager = state.manager();
         let entry = state.get_mut(id)?;
         require_ours(entry, id)?;
+        manager?;
+        if entry.state == State::Running {
+            return Err(Error::Other(format!(
+                "start `{id}`: refused as already running — the stop issued before it has not taken effect"
+            )));
+        }
+        Ok(())
+    }
+
+    fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.calls.push(("stop", id.as_str().to_string()));
+        state.asked("stop", id);
+        lost(&state.stop_in_doubt, "stop", id)?;
+        let stalls = state.stop_stalls.contains(id.as_str());
+        let manager = state.manager();
+        let entry = state.get_mut(id)?;
+        require_ours(entry, id)?;
+        manager?;
+        if stalls {
+            return stalled(id, "stopped", budget);
+        }
         // Idempotent: stopping an already-stopped (or failed, or unknown)
         // service is `Ok(())` — see `ServiceManager::stop`'s doc comment for
-        // why every backend must agree on this.
-        entry.state = State::Stopped;
+        // why every backend must agree on this. Request-only settles nothing,
+        // as for `start`: the Fake models the contract's minimum, not
+        // launchd's blocking `bootout`.
+        if budget.waits() {
+            entry.state = State::Stopped;
+        }
         Ok(())
     }
 
@@ -537,7 +827,7 @@ impl ServiceManager for Fake {
                 recovery: decide::foreign_recovery(id.as_str()),
             }),
             Err(e) => Err(e),
-            Ok(Some(_)) => Ok(Status {
+            Ok(Some(_)) => state.manager().map(|()| Status {
                 state: entry.state,
                 pid: pid_for(entry.state),
                 enabled: entry.enabled,
@@ -574,12 +864,15 @@ impl ServiceManager for Fake {
                 // A foreign entry is not Goetia-managed at all: `list`
                 // reports only what Goetia owns, per the trait doc comment.
                 Ok(None) => {}
-                Ok(Some(blob)) => out.push(Installed::Ours {
-                    spec: blob.spec,
-                    state: entry.state,
-                    pid: pid_for(entry.state),
-                    enabled: entry.enabled,
-                }),
+                Ok(Some(blob)) => {
+                    state.manager()?;
+                    out.push(Installed::Ours {
+                        spec: blob.spec,
+                        state: entry.state,
+                        pid: pid_for(entry.state),
+                        enabled: entry.enabled,
+                    });
+                }
                 Err(e) => out.push(Installed::OursUnreadable {
                     name: name.clone(),
                     reason: e.to_string(),

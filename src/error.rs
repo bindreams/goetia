@@ -109,6 +109,97 @@ pub enum Error {
         recovery: String,
     },
 
+    /// A wait for `id` to reach `awaited` ran out of budget. Produced only
+    /// through [`crate::manager::budget::timed_out`], so all three backends
+    /// word one condition identically.
+    ///
+    /// What this variant does **not** claim, and what separates it from
+    /// [`Undetermined`](Error::Undetermined): nothing here is in doubt about
+    /// what is *installed* at the id — that question was answered before the
+    /// wait ever began. From a backend, the request was issued — the budget
+    /// never decides that, and on launchd it may still be on its way in a
+    /// `launchctl` goetia left running — and goetia stopped watching for its
+    /// outcome; it was not cancelled, and the service may still arrive.
+    /// `cli::restart` is the one producer that also reports a step it never
+    /// issued: a start leg its budget ran out before, whose message says no
+    /// start was issued and the daemon is left stopped. A backend must never
+    /// report an expiry as `Ok(())`, and never as `Undetermined`.
+    ///
+    /// Exit `4` (indeterminate), like `Undetermined`: the code is about
+    /// whether the question was answered, and this one was not.
+    #[error("`{id}` did not report {awaited} within {waited}: {recovery}", waited = humantime::format_duration(*waited))]
+    WaitTimeout {
+        id: String,
+        /// `"running"` or `"stopped"`, and nothing else.
+        awaited: &'static str,
+        waited: std::time::Duration,
+        recovery: String,
+    },
+
+    /// Steps goetia issued whose outcome nobody established. Produced only
+    /// by `cli::restart` under a budget that does not wait, on a manager with
+    /// no request-only restart (launchd, SCM), where the stop was issued
+    /// without confirmation and the start that followed was refused. The
+    /// daemon was not restarted; whether it is running the instance the stop
+    /// is still taking down, is going down, or never moved, goetia proved
+    /// none of the three.
+    ///
+    /// The refusal itself may be determinate or not — a launchd `bootstrap`
+    /// that fails outright, where SCM's `ERROR_SERVICE_ALREADY_RUNNING` says
+    /// only that the service is not stopped. Either way the stop was never
+    /// confirmed: it may still be in flight, may have completed, or may have
+    /// had nothing to do, so what is unestablished is where the daemon ended
+    /// up. Not [`Other`](Error::Other), exit `1`: a refusal, even a
+    /// determinate one, answers whether the start went out, not that
+    /// question. (A plain `start --timeout 0` of the same service is exit
+    /// `1`: with no stop before it, the refusal is the whole answer.) Not
+    /// [`WaitTimeout`](Error::WaitTimeout): nothing waited.
+    /// Not [`Undetermined`](Error::Undetermined): what is installed at the
+    /// id was never in doubt.
+    ///
+    /// Exit `4` (indeterminate), like the two above: the code is about
+    /// whether the question was answered, and this one was not.
+    #[error("`{id}` was not restarted, and where it ended up is not established: {detail}")]
+    Unestablished { id: String, detail: String },
+
+    /// A request goetia lost track of before its outcome was established: the
+    /// tool carrying it — `systemctl`, `launchctl` — may have started when it
+    /// failed, so whatever it sends may already be sent. `request` is the
+    /// tool's command line. `reached` is whether goetia knows the request
+    /// reached the manager: systemd says so (`Enqueued anchor job`) once it
+    /// has enqueued the job, which may already be running, and a request lost
+    /// after that had reached it.
+    ///
+    /// What it does **not** claim, which separates it from its neighbours: not
+    /// that nothing was sent, as a plain failure would; not that goetia waited
+    /// for the outcome and gave up, as [`WaitTimeout`](Error::WaitTimeout)
+    /// does; and not that what is installed at the id is in doubt, as
+    /// [`Undetermined`](Error::Undetermined) does. A failure goetia can place
+    /// before the tool ran is never this.
+    ///
+    /// Exit `4` (indeterminate), like the three above: whether the manager
+    /// acted is the question, and it was not answered.
+    #[error("{}", in_doubt(request, *reached, detail))]
+    RequestInDoubt {
+        request: String,
+        reached: bool,
+        detail: String,
+    },
+
+    /// goetia will ask no service manager here, on positive evidence: systemd's offline mode, a
+    /// chroot, or a system systemd did not boot. `evidence` says which. goetia refuses there
+    /// rather than act on unit files alone, or read a `systemctl` that asked nobody as an answer.
+    ///
+    /// Exit `1`, from every verb that reaches the manager, `status` and `list` included: a refusal,
+    /// not an answer about the daemon — per id where the verb takes ids, and for the whole listing
+    /// from `list`. Raised before anything is written or sent, and by any `systemctl` that says it
+    /// ignored what it was asked, which did nothing.
+    #[error(
+        "goetia does not manage systemd here ({evidence}): it works only through the running systemd manager of the \
+         system it runs on, never offline or from a chroot"
+    )]
+    NoManager { evidence: String },
+
     /// A mutating CLI subcommand was invoked without the elevation
     /// (root/Administrator) it requires. Never returned for `list`,
     /// `status`, `show`, `diff`, or `install --dry-run`, none of which
@@ -154,6 +245,22 @@ pub enum Error {
     /// default: prefer a real variant when the failure recurs anywhere else.
     #[error("{0}")]
     Other(String),
+}
+
+/// [`Error::RequestInDoubt`]'s message: what goetia knows of how far the
+/// request got, and no more.
+fn in_doubt(request: &str, reached: bool, detail: &str) -> String {
+    if reached {
+        format!(
+            "`{request}` reached the service manager, but goetia lost track of it before its outcome was confirmed: \
+             {detail}"
+        )
+    } else {
+        format!(
+            "`{request}` may have started before it failed, so it may or may not have reached the service manager: \
+             {detail}"
+        )
+    }
 }
 
 /// This crate's `Result` alias, used throughout [`crate::manager`] and

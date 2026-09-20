@@ -10,10 +10,11 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use goetia::backend::systemd::manager::Systemd;
 use goetia::decide::Outcome;
-use goetia::manager::{Installed, ServiceManager, State, conformance};
+use goetia::manager::{Budget, Installed, ServiceManager, State, conformance};
 use goetia::spec::{DaemonSpec, Id, Kind, Restart, User};
 
 use crate::support::{self, ELEVATED, ServiceGuard, cmd};
@@ -29,7 +30,7 @@ const UNIT_DIR_EXCLUSIVE: skuld::Label;
 // Fixtures ============================================================================================================
 
 /// A minimal, real, long-running daemon: `sleep infinity` exists on every coreutils Ubuntu ships.
-fn mk(id: &str) -> DaemonSpec {
+pub(crate) fn mk(id: &str) -> DaemonSpec {
     DaemonSpec {
         id: Id::try_from(id.to_string()).expect("valid id"),
         name: id.to_string(),
@@ -50,7 +51,7 @@ fn mk(id: &str) -> DaemonSpec {
 /// and the reason those two backends now answer one question one way.
 const NON_UTF8_UNIT: [u8; 4] = [b'[', 0xff, 0xfe, b']'];
 
-fn unit_path(id: &str) -> PathBuf {
+pub(crate) fn unit_path(id: &str) -> PathBuf {
     PathBuf::from(support::SYSTEMD_UNIT_DIR).join(format!("{id}.service"))
 }
 
@@ -58,7 +59,7 @@ fn dropin_dir(id: &str) -> PathBuf {
     PathBuf::from(support::SYSTEMD_UNIT_DIR).join(format!("{id}.service.d"))
 }
 
-fn wants_symlink(id: &str) -> PathBuf {
+pub(crate) fn wants_symlink(id: &str) -> PathBuf {
     PathBuf::from(support::SYSTEMD_UNIT_DIR)
         .join("multi-user.target.wants")
         .join(format!("{id}.service"))
@@ -165,7 +166,7 @@ fn seed_control_dropin(root: &str, id: &str) -> (PathBuf, RmDropin) {
 
 /// A manifest at a path an unprivileged process can actually reach: `tempfile`'s own directory is
 /// 0700, which `runuser -u nobody` cannot traverse.
-fn world_readable_manifest(id: &str) -> (tempfile::TempDir, PathBuf) {
+pub(crate) fn world_readable_manifest(id: &str) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).expect("chmod the tempdir 0755");
     let path = dir.path().join("goetia.yaml");
@@ -510,15 +511,689 @@ fn start_stop_status_reflect_reality() {
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
 
-    mgr.start(&spec.id).expect("start");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     let status = mgr.status(&spec.id).expect("status after start");
     assert_eq!(status.state, State::Running, "{status:?}");
     assert!(status.pid.is_some(), "{status:?}");
 
-    mgr.stop(&spec.id).expect("stop");
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
     let status = mgr.status(&spec.id).expect("status after stop");
     assert_ne!(status.state, State::Running, "{status:?}");
     assert!(status.pid.is_none(), "{status:?}");
+}
+
+/// `ActiveState` and `Job` as `systemctl show` reports them: the job is empty when none is queued.
+pub(crate) fn active_state_and_job(id: &str) -> (String, String) {
+    let unit = format!("{id}.service");
+    let run = cmd::run(
+        "systemctl",
+        &["show", "--property=ActiveState", "--property=Job", &unit],
+    )
+    .expect_ok();
+    let prop = |name: &str| {
+        run.stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("no {name} in {run}"))
+            .to_string()
+    };
+    (prop("ActiveState"), prop("Job"))
+}
+
+/// `Budget::Immediate` is the native `systemctl start --no-block`, and it must actually reach
+/// systemd. Which state the unit is in afterwards is a race — the job may be queued, running, or
+/// done — but one state is impossible: systemd answers `StartUnit` only once the job is enqueued,
+/// so after `start` returns the unit is never still `inactive` with no job. A `start` that skipped
+/// the request is exactly that.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_start_with_no_budget_reaches_systemd() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let spec = mk(guard.id());
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+
+    mgr.start(&spec.id, Budget::Immediate)
+        .expect("a start with no budget issues the request and returns");
+
+    let (state, job) = active_state_and_job(guard.id());
+    assert!(
+        !(state == "inactive" && job.is_empty()),
+        "the start job never reached systemd: ActiveState={state} Job={job:?}"
+    );
+}
+
+/// The stop mirror of [`a_start_with_no_budget_reaches_systemd`]: after `StopUnit` is answered the
+/// unit is never still `active` with no job.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_stop_with_no_budget_reaches_systemd() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let spec = mk(guard.id());
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+
+    mgr.stop(&spec.id, Budget::Immediate)
+        .expect("a stop with no budget issues the request and returns");
+
+    let (state, job) = active_state_and_job(guard.id());
+    assert!(
+        !(state == "active" && job.is_empty()),
+        "the stop job never reached systemd: ActiveState={state} Job={job:?}"
+    );
+}
+
+/// A daemon that can never stop: it ignores `SIGTERM`, and a drop-in removes the `SIGKILL` systemd
+/// would otherwise escalate to. [`Unstoppable`]'s `Drop` is what ends it.
+fn unstoppable(id: &str) -> DaemonSpec {
+    let mut spec = mk(id);
+    spec.command = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "trap '' TERM; exec /bin/sleep infinity".to_string(),
+    ];
+    spec
+}
+
+/// Ends an [`unstoppable`] unit: `SIGKILL` lets the stop job it is stuck in complete, a blocking
+/// `systemctl stop` waits for exactly that, and `reset-failed` clears the `failed` state the kill
+/// leaves — which would otherwise outlive the unit file `ServiceGuard` removes. Declared after the
+/// `ServiceGuard`, so it drops first.
+struct Unstoppable(String);
+
+impl Unstoppable {
+    fn install(mgr: &Systemd, spec: &DaemonSpec) -> Self {
+        mgr.install(spec, false).expect("install");
+        let dir = dropin_dir(spec.id.as_str());
+        fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
+        fs::write(dir.join("stop.conf"), "[Service]\nTimeoutStopSec=infinity\n").expect("write drop-in");
+        cmd::run("systemctl", &["daemon-reload"]).expect_ok();
+        Unstoppable(spec.id.as_str().to_string())
+    }
+}
+
+impl Drop for Unstoppable {
+    fn drop(&mut self) {
+        let unit = format!("{}.service", self.0);
+        for args in [
+            &["kill", "--signal=SIGKILL", unit.as_str()][..],
+            &["stop", unit.as_str()],
+            &["reset-failed", unit.as_str()],
+        ] {
+            let run = cmd::run("systemctl", args);
+            if !run.ok() {
+                eprintln!("Unstoppable[{}]: cleanup failed: {run}", self.0);
+            }
+        }
+    }
+}
+
+/// A real expiry, deterministically: the stop can never complete, so a bounded `stop` has exactly
+/// one correct answer — `WaitTimeout`, with the stop job left standing in systemd. A backend that
+/// ignored `--timeout` would wait forever here, which the suite's watchdog surfaces.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_stop_that_can_never_complete_times_out_with_the_job_standing() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let spec = unstoppable(guard.id());
+    let mgr = Systemd::new();
+    let _unstoppable = Unstoppable::install(&mgr, &spec);
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+
+    let err = mgr
+        .stop(&spec.id, Budget::Bounded(Duration::from_secs(1)))
+        .expect_err("a stop that can never complete must not report stopped");
+
+    assert!(
+        matches!(err, goetia::Error::WaitTimeout { awaited: "stopped", .. }),
+        "{err:?}"
+    );
+    let (state, job) = active_state_and_job(guard.id());
+    assert_eq!(state, "deactivating", "the stop was not cancelled (Job={job:?})");
+}
+
+/// The budget never decides whether the request is sent. A budget spent before `systemctl` even
+/// runs still enqueues the stop, and — the stop being unable to complete — still reports
+/// `WaitTimeout` with the job standing: the same answer whatever is left, so no timing is bet on.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_stop_on_a_spent_budget_still_reaches_systemd() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let spec = unstoppable(guard.id());
+    let mgr = Systemd::new();
+    let _unstoppable = Unstoppable::install(&mgr, &spec);
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+
+    let err = mgr
+        .stop(&spec.id, Budget::Bounded(Duration::from_nanos(1)))
+        .expect_err("a stop that can never complete must not report stopped");
+
+    assert!(
+        matches!(err, goetia::Error::WaitTimeout { awaited: "stopped", .. }),
+        "{err:?}"
+    );
+    let (state, job) = active_state_and_job(guard.id());
+    assert_eq!(state, "deactivating", "the stop never reached systemd (Job={job:?})");
+}
+
+/// The start mirror: whatever a spent budget reports, the start job reached systemd, so the unit is
+/// not still `inactive` with no job — see [`a_start_with_no_budget_reaches_systemd`].
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_start_on_a_spent_budget_still_reaches_systemd() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let spec = mk(guard.id());
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+
+    let result = mgr.start(&spec.id, Budget::Bounded(Duration::from_nanos(1)));
+
+    assert!(
+        matches!(
+            result,
+            Ok(()) | Err(goetia::Error::WaitTimeout { awaited: "running", .. })
+        ),
+        "{result:?}"
+    );
+    let (state, job) = active_state_and_job(guard.id());
+    assert!(
+        !(state == "inactive" && job.is_empty()),
+        "the start job never reached systemd: ActiveState={state} Job={job:?}"
+    );
+}
+
+/// The types of the jobs systemd has queued for `id`'s unit, as `systemctl list-jobs` reports them.
+fn queued_job_types(id: &str) -> Vec<String> {
+    let unit = format!("{id}.service");
+    let run = cmd::run("systemctl", &["list-jobs", "--no-legend", "--plain", &unit]).expect_ok();
+    run.stdout
+        .lines()
+        .filter_map(|line| match line.split_whitespace().collect::<Vec<_>>()[..] {
+            [_, name, kind, ..] if name == unit => Some(kind.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `MainPID` as `systemctl show` reports it.
+pub(crate) fn main_pid(id: &str) -> String {
+    let unit = format!("{id}.service");
+    let run = cmd::run("systemctl", &["show", "--property=MainPID", "--value", &unit]).expect_ok();
+    run.stdout.trim().to_string()
+}
+
+/// A runtime unit that `Requires=` and is `After=` the daemon, and whose own stop blocks on an
+/// exclusive `flock` this guard holds. A stop of the daemon has to wait for it, so it stays a
+/// *waiting* job until [`StopHolder::release`] — the shape in which a separate `start` replaces the
+/// stop instead of queuing behind it. `Drop` releases the lock, stops the holder — its stop then
+/// succeeds, so nothing is left `failed` — and removes it; declared after the `ServiceGuard`, so it
+/// drops first.
+struct StopHolder {
+    unit: String,
+    path: PathBuf,
+    lock: PathBuf,
+    held: Option<fs::File>,
+}
+
+impl StopHolder {
+    fn start(id: &str) -> Self {
+        let unit = format!("{id}-holder.service");
+        let lock = PathBuf::from(format!("/run/{id}.lock"));
+        let held = fs::File::create(&lock).unwrap_or_else(|e| panic!("create {}: {e}", lock.display()));
+        // SAFETY: `held` owns the descriptor for the duration of the call.
+        let locked = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&held), libc::LOCK_EX) };
+        assert_eq!(
+            locked,
+            0,
+            "flock {}: {}",
+            lock.display(),
+            std::io::Error::last_os_error()
+        );
+        let path = PathBuf::from("/run/systemd/system").join(&unit);
+        let holder = StopHolder {
+            unit,
+            path,
+            lock,
+            held: Some(held),
+        };
+        fs::write(
+            &holder.path,
+            format!(
+                "[Unit]\nRequires={id}.service\nAfter={id}.service\n\
+                 [Service]\nExecStart=/bin/sleep infinity\nExecStop=/usr/bin/flock {} true\n\
+                 TimeoutStopSec=infinity\n",
+                holder.lock.display()
+            ),
+        )
+        .expect("write the holder unit");
+        cmd::run("systemctl", &["daemon-reload"]).expect_ok();
+        cmd::run("systemctl", &["start", &holder.unit]).expect_ok();
+        holder
+    }
+
+    fn release(&mut self) {
+        self.held = None;
+    }
+}
+
+impl Drop for StopHolder {
+    fn drop(&mut self) {
+        self.release();
+        let run = cmd::run("systemctl", &["stop", &self.unit]);
+        if !run.ok() {
+            eprintln!("StopHolder[{}]: cleanup failed: {run}", self.unit);
+        }
+        for path in [&self.path, &self.lock] {
+            if let Err(e) = fs::remove_file(path) {
+                eprintln!("StopHolder[{}]: remove {}: {e}", self.unit, path.display());
+            }
+        }
+        let run = cmd::run("systemctl", &["daemon-reload"]);
+        if !run.ok() {
+            eprintln!("StopHolder[{}]: cleanup failed: {run}", self.unit);
+        }
+    }
+}
+
+/// `restart --timeout 0` must restart the daemon, even when systemd cannot run its stop at once. A
+/// dependent holds the stop, so it waits; a separate `start` would replace it and, on a unit still
+/// active, complete as a no-op. With the stop held, the daemon is still its old process and systemd
+/// holds a `restart` job for it — nothing else. Released, a blocking `start` joins that job and
+/// returns once it is done, and the daemon is a new process.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_restart_with_no_budget_restarts_behind_a_stop_that_has_to_wait() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let spec = mk(guard.id());
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    let before = main_pid(guard.id());
+    let mut holder = StopHolder::start(guard.id());
+    let args = goetia::cli::restart::Args {
+        ids: vec![guard.id().to_string()],
+        wait: goetia::cli::wait::WaitArgs {
+            timeout: Some(Duration::ZERO),
+            no_timeout: false,
+        },
+    };
+    let get_manager = || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(Systemd::new())) };
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+
+    // Truthful, not a stub: `support::elevated` is this test's own precondition.
+    let code = goetia::cli::restart::run(&args, &get_manager, &|| true, &mut out, &mut err);
+
+    let (out, err) = (String::from_utf8_lossy(&out), String::from_utf8_lossy(&err));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(
+        queued_job_types(guard.id()),
+        ["restart"],
+        "systemd must hold a restart for the daemon behind the held stop"
+    );
+    assert_eq!(
+        main_pid(guard.id()),
+        before,
+        "the stop is held, so nothing has stopped yet"
+    );
+
+    holder.release();
+    cmd::run("systemctl", &["start", &format!("{}.service", guard.id())]).expect_ok();
+
+    let after = main_pid(guard.id());
+    assert!(
+        after != before && after != "0",
+        "the daemon was never restarted: MainPID {before} before, {after} after"
+    );
+}
+
+/// The one `stop` with no job that is not a failure: a unit systemd cannot load, and that is not
+/// running. `systemctl stop` answers it "not loaded" (exit `5`) and enqueues nothing — there is
+/// nothing to stop — under every budget. A drop-in that empties `ExecStart=` is the unit it cannot
+/// load.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_stop_of_a_unit_systemd_cannot_load_has_nothing_to_stop() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let mgr = Systemd::new();
+    mgr.install(&mk(guard.id()), false).expect("install");
+    let dir = dropin_dir(guard.id());
+    fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
+    fs::write(dir.join("bad.conf"), "[Service]\nExecStart=\n").expect("write drop-in");
+    cmd::run("systemctl", &["daemon-reload"]).expect_ok();
+    let unit = format!("{}.service", guard.id());
+    let load_state = cmd::run("systemctl", &["show", "--property=LoadState", "--value", &unit]).expect_ok();
+    assert_eq!(load_state.stdout.trim(), "bad-setting");
+
+    for budget in [Budget::DEFAULT, Budget::Unbounded, Budget::Immediate] {
+        mgr.stop(&Id::try_from(guard.id()).unwrap(), budget)
+            .unwrap_or_else(|e| panic!("{budget:?}: {e}"));
+        assert_eq!(
+            active_state_and_job(guard.id()),
+            ("inactive".to_string(), String::new()),
+            "{budget:?}"
+        );
+    }
+}
+
+/// `goetia <args>`, elevated as this test is, with `SYSTEMD_COLORS=<colors>` in its environment.
+fn goetia_coloured(colors: &str, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_goetia"))
+        .args(args)
+        .env("SYSTEMD_COLORS", colors)
+        .output()
+        .expect("spawn goetia")
+}
+
+/// `SYSTEMD_COLORS` forces colour into a pipe, and `systemctl --version` wraps its number in escapes
+/// under it. None of its values may make goetia misread a supported systemd as one it refuses, on
+/// any verb the version gate guards.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_coloured_environment_does_not_fail_the_version_gate() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let (_dir, manifest) = world_readable_manifest(guard.id());
+    let manifest = manifest.to_str().expect("utf-8 temp path");
+    let succeeds = |colors: &str, args: &[&str]| {
+        let output = goetia_coloured(colors, args);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "SYSTEMD_COLORS={colors} {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    succeeds("1", &["daemon", "install", "--file", manifest, guard.id()]);
+    for colors in ["1", "true", "16", "256", "24bit"] {
+        for verb in ["start", "restart", "stop"] {
+            succeeds(colors, &["daemon", verb, guard.id()]);
+        }
+    }
+    succeeds("1", &["daemon", "uninstall", guard.id()]);
+    assert!(!unit_path(guard.id()).exists(), "uninstall left the unit");
+}
+
+/// `goetia <args>`, elevated as this test is, with a `systemctl` first on its `PATH` whose running
+/// manager reports `manager` and whose client reports `client`, and that fails anything else: a
+/// refusal must come before goetia asks systemd for anything more.
+///
+/// Written by a child `sh`, not by this process: a descriptor this process held open for writing
+/// could be inherited by a `fork` on another test thread, and `exec`ing the file would then fail
+/// with `ETXTBSY`.
+fn goetia_on_systemd(manager: u32, client: u32, args: &[&str]) -> std::process::Output {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = dir.path().join("systemctl");
+    let script = format!(
+        "#!/bin/sh\n\
+         [ \"$*\" = 'show --property=Version --value' ] && {{ echo {manager}; exit 0; }}\n\
+         [ \"$*\" = --version ] && {{ echo 'systemd {client} ({client})'; exit 0; }}\n\
+         echo \"stand-in: unexpected systemctl $*\" >&2; exit 99\n"
+    );
+    cmd::run(
+        "/bin/sh",
+        &[
+            "-c",
+            "printf '%s' \"$1\" > \"$0\" && chmod 0755 \"$0\"",
+            fake.to_str().expect("utf-8 temp path"),
+            &script,
+        ],
+    )
+    .expect_ok();
+    let path = format!(
+        "{}:{}",
+        dir.path().display(),
+        std::env::var("PATH").expect("PATH is set")
+    );
+    Command::new(env!("CARGO_BIN_EXE_goetia"))
+        .args(args)
+        .env("PATH", path)
+        .output()
+        .expect("spawn goetia")
+}
+
+/// Below systemd 242 goetia refuses before it writes a unit or runs a start or stop — rather than
+/// install a `Type=exec` unit an older systemd silently runs as `Type=simple`, or fail every start
+/// and stop on an unrecognized option. The running systemd and the client each count: an old one
+/// is refused next to a new other, and named.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn an_older_systemd_is_refused_before_anything_is_written_or_run() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let (_dir, manifest) = world_readable_manifest(guard.id());
+    let manifest = manifest.to_str().expect("utf-8 temp path");
+    let versions = [
+        (241, 257, "The running systemd is 241"),
+        (257, 241, "The `systemctl` client is 241"),
+    ];
+    let refused = |args: &[&str]| {
+        for (manager, client, named) in versions {
+            let output = goetia_on_systemd(manager, client, args);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
+            assert!(stderr.contains("requires systemd 242 or newer"), "{args:?}: {stderr}");
+            assert!(stderr.contains(named), "{args:?}: {stderr}");
+        }
+    };
+
+    refused(&["daemon", "install", "--file", manifest, guard.id()]);
+    assert!(!unit_path(guard.id()).exists(), "a refused install wrote the unit");
+
+    let mgr = Systemd::new();
+    mgr.install(&mk(guard.id()), false)
+        .expect("install on this host's systemd");
+    for verb in ["start", "stop", "restart", "uninstall"] {
+        refused(&["daemon", verb, guard.id()]);
+        assert_eq!(
+            active_state_and_job(guard.id()),
+            ("inactive".to_string(), String::new()),
+            "a refused {verb} ran something"
+        );
+    }
+    assert!(unit_path(guard.id()).exists(), "a refused uninstall removed the unit");
+}
+
+/// On a system booted with systemd, a manager `systemctl` cannot reach is not evidence that none
+/// runs: the version gate refuses, naming what `systemctl` said, before anything is written. Its
+/// own mount namespace hides the manager's private socket, and the bus address points at nothing,
+/// so `systemctl show` fails at once while `/run/systemd/system` stays.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_running_systemd_that_cannot_be_asked_is_refused() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let (_dir, manifest) = world_readable_manifest(guard.id());
+
+    let output = Command::new("unshare")
+        .args([
+            "--mount",
+            "--propagation",
+            "private",
+            "/bin/sh",
+            "-c",
+            "mount --bind /dev/null /run/systemd/private && \
+             exec env DBUS_SYSTEM_BUS_ADDRESS=unix:path=/nonexistent \"$0\" \"$@\"",
+            env!("CARGO_BIN_EXE_goetia"),
+            "daemon",
+            "install",
+            "--file",
+            manifest.to_str().expect("utf-8 temp path"),
+            guard.id(),
+        ])
+        .output()
+        .expect("spawn unshare");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("cannot tell whether the running systemd is 242+"),
+        "{stderr}"
+    );
+    // systemctl's own words, up to where versions and hosts differ: 257 says "Failed to connect to
+    // system scope bus via local transport: Connection refused" here, and the Ubuntu CI runner's
+    // says "Failed to connect to bus: No such file or directory".
+    assert!(stderr.contains("Failed to connect to"), "{stderr}");
+    assert!(!unit_path(guard.id()).exists(), "a refused install wrote the unit");
+}
+
+/// `goetia <args>` with a `systemctl` first on its `PATH` that appends every argv it is run with to
+/// `log`, one per line, and then runs the real one. Written by a child `sh`, as
+/// [`goetia_on_systemd`]'s stand-in is, and for the same reason.
+fn goetia_logging_systemctl(dir: &Path, args: &[&str]) -> std::process::Output {
+    let path = std::env::var("PATH").expect("PATH is set");
+    let real = std::env::split_paths(&path)
+        .map(|dir| dir.join("systemctl"))
+        .find(|candidate| candidate.is_file())
+        .expect("systemctl on PATH");
+    let script = format!(
+        "#!/bin/sh\necho \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+        dir.join("log").display(),
+        real.display()
+    );
+    let stand_in = dir.join("systemctl");
+    cmd::run(
+        "/bin/sh",
+        &[
+            "-c",
+            "printf '%s' \"$1\" > \"$0\" && chmod 0755 \"$0\"",
+            stand_in.to_str().expect("utf-8 temp path"),
+            &script,
+        ],
+    )
+    .expect_ok();
+    Command::new(env!("CARGO_BIN_EXE_goetia"))
+        .args(args)
+        .env("PATH", format!("{}:{path}", dir.display()))
+        .output()
+        .expect("spawn goetia")
+}
+
+/// The version gate probes `systemctl` once per daemon per verb, however many steps the verb takes:
+/// `restart`'s stop and start, `install --start`'s install and start, `uninstall`'s stop, `disable`
+/// and `daemon-reload`, share one pair of probes, and so one share of the budget. `enable` and
+/// `disable` ask it too: no request is sent before the manager is asked.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn the_version_gate_probes_once_per_daemon_per_verb() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let (_manifest_dir, manifest) = world_readable_manifest(guard.id());
+    let manifest = manifest.to_str().expect("utf-8 temp path");
+    let probes = |args: &[&str]| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = goetia_logging_systemctl(dir.path(), args);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let log = fs::read_to_string(dir.path().join("log")).expect("read the log");
+        let count = |probe: &str| log.lines().filter(|line| line.starts_with(probe)).count();
+        (count("--version"), count("show --property=Version"))
+    };
+
+    for args in [
+        &["daemon", "install", "--file", manifest, "--start", guard.id()][..],
+        &["daemon", "restart", guard.id()],
+        &["daemon", "restart", guard.id(), "--timeout", "0"],
+        &["daemon", "start", guard.id()],
+        &["daemon", "stop", guard.id()],
+        &["daemon", "enable", guard.id()],
+        &["daemon", "disable", guard.id()],
+        &["daemon", "uninstall", guard.id()],
+        &["daemon", "install", "--file", manifest, guard.id()],
+    ] {
+        assert_eq!(probes(args), (1, 1), "{args:?}");
+    }
+}
+
+/// `goetia <args>` in a transient scope allowed `tasks` tasks — threads and processes alike — so
+/// that making a thread, or spawning a process, fails once they are spent.
+fn goetia_with_tasks(tasks: u32, args: &[&str]) -> std::process::Output {
+    Command::new("systemd-run")
+        .args(["--quiet", "--scope", "-p", &format!("TasksMax={tasks}")])
+        .arg(env!("CARGO_BIN_EXE_goetia"))
+        .args(args)
+        .output()
+        .expect("spawn systemd-run")
+}
+
+/// goetia never panics for want of a task, and a verb that could not have what its request needs
+/// exits `1` with the unit untouched. Its tasks are counted exactly: its own thread; one version
+/// probe at a time; and for a `start` that waits, a thread for each of `systemctl`'s two streams,
+/// made before `systemctl` itself. So one task cannot probe, two or three cannot send the start,
+/// and four can. A `restart` makes the two threads each of its legs needs before either leg, and
+/// probes with all four held, so it needs six.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    Systemd::new().install(&mk(guard.id()), false).expect("install");
+    let run = |tasks: u32, verb: &str| {
+        let output = goetia_with_tasks(tasks, &["daemon", verb, guard.id()]);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(!stderr.contains("panicked"), "{verb} TasksMax={tasks}: {stderr}");
+        (output.status.code(), stderr)
+    };
+
+    for tasks in [1, 2, 3] {
+        let (code, stderr) = run(tasks, "start");
+        assert_eq!(code, Some(1), "start TasksMax={tasks}: {stderr}");
+        assert_eq!(
+            active_state_and_job(guard.id()),
+            ("inactive".to_string(), String::new()),
+            "a start short of tasks sent something: TasksMax={tasks}"
+        );
+    }
+    let (code, stderr) = run(4, "start");
+    assert_eq!(code, Some(0), "start TasksMax=4: {stderr}");
+
+    let before = main_pid(guard.id());
+    for tasks in [2, 3, 4, 5] {
+        let (code, stderr) = run(tasks, "restart");
+        assert_eq!(code, Some(1), "restart TasksMax={tasks}: {stderr}");
+        assert_eq!(
+            (active_state_and_job(guard.id()), main_pid(guard.id())),
+            (("active".to_string(), String::new()), before.clone()),
+            "a restart short of tasks touched the daemon: TasksMax={tasks}"
+        );
+    }
+    let (code, stderr) = run(6, "restart");
+    assert_eq!(code, Some(0), "restart TasksMax=6: {stderr}");
+    assert_ne!(main_pid(guard.id()), before, "restart TasksMax=6 restarted nothing");
+
+    // A budget whose `systemctl` goetia does not watch makes no thread, and reserves none: two tasks
+    // are its own and one `systemctl` at a time.
+    let output = goetia_with_tasks(2, &["daemon", "restart", guard.id(), "--timeout", "0"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "restart --timeout 0 TasksMax=2: {stderr}"
+    );
+}
+
+/// `Type=exec` is what makes `systemctl start` report failure here at all — under `Type=simple` the
+/// same spec's `start` returns `Ok`. `restart: always` is pinned explicitly (`mk`'s default is
+/// `OnFailure`) so the unit under test is exactly `Type=exec` + `Restart=always` +
+/// `StartLimitIntervalSec=0` (emitted only when restart is enabled), the shape measured to fail
+/// `start` in 5/5.
+///
+/// Asserts only on `start`'s result: by the time it returns, the unit is already
+/// `activating`/`auto-restart`, not `failed` — a follow-up state read would be asserting a race
+/// against systemd's own restart loop.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_unit_whose_executable_does_not_exist_fails_start() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let mut spec = mk(guard.id());
+    spec.command = vec!["/nonexistent/goetia-test-executable".to_string()];
+    spec.restart = Restart::Always;
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+
+    let result = mgr.start(&spec.id, Budget::DEFAULT);
+
+    assert!(result.is_err(), "{result:?}");
 }
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -529,7 +1204,7 @@ fn uninstall_leaves_nothing() {
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
     mgr.enable(&spec.id).expect("enable");
-    mgr.start(&spec.id).expect("start");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     write_dropin(&id);
 
     mgr.uninstall(&spec.id).expect("uninstall");
