@@ -48,6 +48,20 @@
       "automerge": true
     },
     {
+      "description": "Group non-major updates to the version-pinned tools the custom manager above finds. Without this rule they match neither of the two rules that set `automerge`, since those name the `github-actions` and `cargo` managers, so every such bump waits for a human however green it is -- which is what left a passing prek PR open. A CI tool is the case where green CI is the strongest possible evidence: the tool's own job is what runs it, so a bump that breaks it fails the run that would have merged it.",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "digest"
+      ],
+      "groupName": "CI tools",
+      "automerge": true
+    },
+    {
       "description": "Major updates: one PR per package, reviewed by a human. Deviates from the `hole` repo, which auto-merges majors on the strength of its CI. Goetia's three platform backends do not exist yet, so a major bump of e.g. windows-service would land with almost no behavioural coverage. Revisit once the backends and their integration tests are in.",
       "matchUpdateTypes": [
         "major"
