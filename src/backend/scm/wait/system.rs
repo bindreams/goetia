@@ -46,12 +46,19 @@ struct LastStatus {
 ///
 /// Neither pointer can be null while the registration discipline holds, so
 /// a null one is a broken invariant and not a case to absorb: returning on
-/// it silently leaves `fired` unset, and the wait then lapses into a
-/// `Waited::Expired` that `budget::timed_out` reports as the service having
-/// failed to confirm — blaming the service for goetia's own plumbing. The
-/// `debug_assert!`s trap that where a test can see it; the returns still
-/// stand, because this runs in an APC and an `extern "system"` panic aborts
-/// the process rather than unwinding out of it.
+/// it silently leaves `fired` unset, and what the wait does then is the
+/// budget's to decide. Bounded, it lapses into a `Waited::Expired` that
+/// `budget::timed_out` reports as the service having failed to confirm —
+/// blaming the service for goetia's own plumbing. Unbounded (uninstall's
+/// stop, `--no-timeout`) there is no expiry to lapse into:
+/// `remaining_millis_capped` stays `None` and `SleepEx` returns
+/// `WAIT_IO_COMPLETION`, so `wait_callback` takes neither of its exits, and
+/// the registration is one-shot, re-armed only after `fired` — the wait
+/// blocks forever, reporting nothing. The `debug_assert!`s trap both where
+/// a test can see it, and matter most for the second, whose release build
+/// has no other symptom at all; the returns still stand, because this runs
+/// in an APC and an `extern "system"` panic aborts the process rather than
+/// unwinding out of it.
 unsafe extern "system" fn notify_callback(pparameter: *const c_void) {
     let buf = pparameter as *const SERVICE_NOTIFY_2W;
     debug_assert!(!buf.is_null(), "SCM notify callback: pparameter was null");
