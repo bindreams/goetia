@@ -58,8 +58,8 @@ pub enum WaitOutcome {
 /// be running before the shim knows whether anything can watch it, and the OS refusing a thread
 /// there leaves that daemon orphaned: nothing supervising it, nothing to stop it, no kill-tree
 /// teardown — with SCM told, at best, that its service just died. `std::thread::Scope::spawn`
-/// (this module's shape before this type existed) could not even report that refusal: it has no
-/// `Result` and panics, taking the service process down with the daemon already up.
+/// could not even report that refusal: it has no `Result` and panics, taking the service process
+/// down with the daemon already up.
 /// [`std::thread::Builder::spawn`] returns `io::Result`, which is what lets the refusal be a
 /// clean start failure with nothing launched — see `service::launch`, the one caller that
 /// enforces the order.
@@ -191,11 +191,10 @@ impl StopBus {
     /// that wait must itself return before this function can. For a daemon
     /// that does not exit on its own — the ordinary `type: simple` case —
     /// nothing makes `child.wait()` return except killing the child. If the
-    /// kill happened only after this call returned (the caller's job in an
-    /// earlier version of this module), the join would block forever waiting
-    /// for a worker that is parked on a process nothing has told it to kill
-    /// yet — a deadlock on every commanded stop of a running daemon, not a
-    /// rare case. Killing first, then joining, is what lets that wait
+    /// kill happened only after this call returned, the join would block
+    /// forever waiting for a worker that is parked on a process nothing has
+    /// told it to kill yet — a deadlock on every commanded stop of a running
+    /// daemon, not a rare case. Killing first, then joining, is what lets that wait
     /// actually resolve.
     ///
     /// **Why it joins at all**, rather than leaving the waiter detached: the
@@ -208,10 +207,9 @@ impl StopBus {
     /// one arm that does not join is the one that already knows that wait
     /// cannot complete, and says so in its return value — see below.
     ///
-    /// **A panic between the hand-off and that join detaches the waiter**,
-    /// which is a real difference from the `&Child`/`thread::scope` shape
-    /// this replaced: a panic at one of the `expect`s below (or inside
-    /// `kill_tree`/`kill`) drops the `JoinHandle` instead of joining it,
+    /// **A panic between the hand-off and that join detaches the waiter**: a
+    /// panic at one of the `expect`s below (or inside `kill_tree`/`kill`)
+    /// drops the `JoinHandle` instead of joining it,
     /// and the detached thread still holds an `Arc<Child>` clone — so the
     /// caller's own `Arc` going out of scope during unwind does not drop
     /// the last reference, and `cosca::Child::drop`'s kill-tree teardown

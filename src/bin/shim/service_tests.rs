@@ -77,9 +77,9 @@ fn no_daemon_is_spawned_when_no_thread_can_be_made_to_wait_on_it() {
     let spawned_before = test_hook::spawns();
     let _no_thread = waiter_threads::threads(0);
 
-    // Reported, not panicked: `std::thread::Scope::spawn` — what this used to be — has no
-    // `Result` at all, so reaching this state at the old call site (after the spawn) took the
-    // whole service process down with the daemon already running.
+    // Reported, not panicked: a refused thread here surfaces as an `io::Result`, not a
+    // `Scope::spawn` panic that would take the whole service process down with the daemon already
+    // running.
     let launched = launch(&spec(dir.path(), id.as_str()), &stop_bus, id.as_str());
 
     assert!(
