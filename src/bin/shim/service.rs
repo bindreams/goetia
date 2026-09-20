@@ -295,9 +295,12 @@ fn supervisor_loop(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, status_
 /// The daemon, running and already being waited on — or `None`, logged, with nothing launched.
 ///
 /// Everything supervising the daemon needs is made before the daemon is: the [`Waiter`] thread
-/// first, then the spawn, and nothing between them that can fail. A daemon is never launched with
-/// nothing to wait on it, because the one thing that could refuse — the OS, asked for a thread —
-/// is asked before anything is running. See [`Waiter`] for what the reverse order cost.
+/// first, then the spawn, and nothing between them that could launch a daemon on the way.
+/// `build_command` does sit between them, and the log-file open inside it fails routinely, but
+/// that failure arm falls back to null stdio and runs nothing. A daemon is never launched with
+/// nothing to wait on it, because the one thing that could refuse to make that waiter — the OS,
+/// asked for a thread — is asked before anything is running. See [`Waiter`] for what the reverse
+/// order cost.
 fn launch(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str) -> Option<(Arc<Child>, Waiter)> {
     let waiter = match stop_bus.waiter(id) {
         Ok(waiter) => waiter,
@@ -387,7 +390,9 @@ pub(crate) mod test_hook {
         static SPAWNS: Cell<usize> = const { Cell::new(0) };
     }
 
-    /// How many daemons this thread has spawned through [`super::start`].
+    /// How many daemons this thread has spawned through [`super::start`], or tried to: the count
+    /// moves before `cmd.spawn()`, so a spawn that launched nothing is counted too — which is what
+    /// makes "nothing was launched" assertions against it strictly stronger.
     pub(crate) fn spawns() -> usize {
         SPAWNS.get()
     }
