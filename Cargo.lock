@@ -222,6 +222,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
 name = "either"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -763,12 +769,13 @@ dependencies = [
 
 [[package]]
 name = "skuld"
-version = "0.3.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f32c2b50d647d02f3f4a70885da691a9fc3b40c3f1854aad5e19fc7a68d9463"
+checksum = "d4c0c03c2cef0bdb277334bdd3ffa3cf31c2598e142fa4a954be56aea6c5911f"
 dependencies = [
  "boolean_expression",
  "clap",
+ "dunce",
  "inventory",
  "libc",
  "libtest-mimic",
@@ -776,19 +783,21 @@ dependencies = [
  "pest",
  "pest_derive",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "serde_yml",
  "skuld-macros",
  "tempfile",
+ "unicode-normalization",
  "windows",
 ]
 
 [[package]]
 name = "skuld-macros"
-version = "0.3.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28477fb57907336d109550b9da439312e548409a734ee43d902dce68df8ebf50"
+checksum = "b437478b7a7ce24dfaaaaf79f7f698d1c79e3d3dba5e5d1604f60d1d0cf22028"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -875,6 +884,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinyvec"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+
+[[package]]
 name = "ucd-trie"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -885,6 +900,15 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "utf8parse"
