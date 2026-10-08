@@ -66,12 +66,14 @@ fn stop_and_exit_code(h: SC_HANDLE, ph: HANDLE, bound_ms: u32) -> String {
     let mut s: SERVICE_STATUS = unsafe { std::mem::zeroed() };
     unsafe { ControlService(h, SERVICE_CONTROL_STOP, &mut s) };
     if ph.is_null() { return "no process handle".into(); }
+    let t0 = std::time::Instant::now();
     let w = unsafe { WaitForSingleObject(ph, bound_ms) };
+    let waited = t0.elapsed();
     let mut code = 0u32;
     let ok = unsafe { GetExitCodeProcess(ph, &mut code) };
     unsafe { CloseHandle(ph) };
     let st = status(h);
-    format!("exited_within_bound={} exit_code={code:#x} ({code}) get_ok={ok} scm: state={} win32={} specific={}",
+    format!("waited={waited:?} exited_within_bound={} exit_code={code:#x} ({code}) get_ok={ok} scm: state={} win32={} specific={}",
         w == WAIT_OBJECT_0, st.dwCurrentState, st.dwWin32ExitCode, st.dwServiceSpecificExitCode)
 }
 
@@ -103,7 +105,7 @@ fn main() {
             let h = svc(&a[2]);
             println!("  net start rc={:?}", net(&["start", &a[2]]));
             let ph = open_pinned(h, &format!("linger {}", a[2]));
-            println!("linger {}: reports STOPPED(6) then never exits; within 120s -> {}", a[2], stop_and_exit_code(h, ph, 120_000));
+            println!("linger {}: reports STOPPED(6) then never exits; within 300s -> {}", a[2], stop_and_exit_code(h, ph, 300_000));
         }
         _ => unreachable!(),
     }
