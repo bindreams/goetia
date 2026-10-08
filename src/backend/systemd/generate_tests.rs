@@ -226,7 +226,7 @@ fn extract_returns_none_for_foreign_unit() {
 }
 
 #[skuld::test]
-fn extract_errors_on_corrupt_blob() {
+fn extract_errors_on_corrupt_blob_in_unit() {
     let text =
         "[Unit]\nDescription=frpc\n\n[X-Goetia]\nMarker=goetia\nSchema=1\nVersion=0.1.0\nSpec=not-valid-base64!!!\n";
 
