@@ -11,23 +11,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: cargo build --manifest-path probe/svc/Cargo.toml
-      - run: ./probe/recovery.ps1 *> probe-results.txt
-        shell: pwsh
       - run: ./probe/notify2.ps1 *> notify2-results.txt
         shell: pwsh
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: probe-results
           path: |
-            probe-results.txt
             notify2-results.txt
-  launchd:
-    runs-on: macos-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - run: ./probe/launchd/run.sh > launchd-results.txt 2>&1
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: launchd-results
-          path: launchd-results.txt

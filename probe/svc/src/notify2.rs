@@ -10,10 +10,12 @@ use windows_sys::Win32::System::Threading::SleepEx;
 
 static STATE: AtomicU32 = AtomicU32::new(0);
 static CODES: AtomicU32 = AtomicU32::new(0);
+static PID: AtomicU32 = AtomicU32::new(0);
 
 unsafe extern "system" fn cb(p: *const c_void) {
     let n = unsafe { &*(p as *const SERVICE_NOTIFY_2W) };
     STATE.store(n.ServiceStatus.dwCurrentState, Ordering::SeqCst);
+    PID.store(n.ServiceStatus.dwProcessId, Ordering::SeqCst);
     CODES.store(n.ServiceStatus.dwWin32ExitCode * 100 + n.ServiceStatus.dwServiceSpecificExitCode, Ordering::SeqCst);
 }
 
@@ -37,7 +39,7 @@ impl H {
         }
         unsafe { SleepEx(10_000, 1) };
         let s = STATE.load(Ordering::SeqCst);
-        println!("{label}: arm rc={rc} -> {}", if s == 0 { "NO FIRE in 10s".to_string() } else { format!("state={s} win32*100+specific={}", CODES.load(Ordering::SeqCst)) });
+        println!("{label}: arm rc={rc} -> {}", if s == 0 { "NO FIRE in 10s".to_string() } else { format!("state={s} win32*100+specific={} pid={}", CODES.load(Ordering::SeqCst), PID.load(Ordering::SeqCst)) });
     }
 }
 
@@ -71,4 +73,12 @@ fn main() {
     h.arm_wait("F1 all-states on STOPPED", ALL, None);
     net(&["start", &name]);
     h.arm_wait("F2 stops-mask while the new instance runs, then sc stop", STOPS, Some(&["stop", &name]));
+    // G: all-states arms only. Snapshot (running), then a stop and a start
+    // both unobserved, then an all-states re-arm: does it fire with the new pid?
+    h.arm_wait("G1 all-states snapshot while running", ALL, None);
+    net(&["stop", &name]);
+    net(&["start", &name]);
+    h.arm_wait("G2 all-states after an unobserved stop+start", ALL, None);
+    h.arm_wait("G3 all-states again, no change", ALL, None);
+    h.arm_wait("G4 all-states, then sc stop", ALL, Some(&["stop", &name]));
 }
