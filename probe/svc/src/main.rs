@@ -11,15 +11,16 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::{define_windows_service, service_dispatcher};
 
 use windows_sys::Win32::Foundation::HANDLE;
-use windows_sys::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::{INFINITE, OpenEventW, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject};
 
 define_windows_service!(ffi_main, svc_main);
 
-/// The probe's release gate: a manual-reset event the probe opens and sets.
+/// The probe's release gate: a manual-reset event the probe creates and sets.
 fn gate(name: &str) -> HANDLE {
     let w: Vec<u16> = format!("Global\\goetiaprobe-gate-{name}").encode_utf16().chain([0]).collect();
-    let ev = unsafe { CreateEventW(std::ptr::null(), 1, 0, w.as_ptr()) };
-    assert!(!ev.is_null(), "CreateEventW");
+    // Created by the probe (an elevated admin token, whose default DACL grants SYSTEM).
+    let ev = unsafe { OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, 0, w.as_ptr()) };
+    assert!(!ev.is_null(), "OpenEventW");
     ev
 }
 

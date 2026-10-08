@@ -6,9 +6,10 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::System::Services::*;
-use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent, SleepEx};
+use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, SleepEx};
 
 const ALL: u32 = SERVICE_NOTIFY_STOPPED | SERVICE_NOTIFY_START_PENDING | SERVICE_NOTIFY_STOP_PENDING
     | SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_CONTINUE_PENDING | SERVICE_NOTIFY_PAUSE_PENDING | SERVICE_NOTIFY_PAUSED;
@@ -95,11 +96,15 @@ fn ctl_ex(label: &str, h: SC_HANDLE, code: u32, reason: u32) -> u32 {
     err
 }
 
-fn release(name: &str) {
-    let ev = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, wide(&format!("Global\\goetiaprobe-gate-{name}")).as_ptr()) };
-    let ok = if ev.is_null() { 0 } else { unsafe { SetEvent(ev) } };
-    println!("  release gate {name}: opened={} set={ok}", !ev.is_null());
-    if !ev.is_null() { unsafe { CloseHandle(ev) }; }
+fn gate(name: &str) -> HANDLE {
+    let ev = unsafe { CreateEventW(std::ptr::null(), 1, 0, wide(&format!("Global\\goetiaprobe-gate-{name}")).as_ptr()) };
+    println!("  gate {name}: created={} err={}", !ev.is_null(), unsafe { GetLastError() });
+    ev
+}
+
+fn release(name: &str, ev: HANDLE) {
+    let ok = unsafe { SetEvent(ev) };
+    println!("  release gate {name}: set={ok}");
 }
 
 fn h1() {
@@ -155,6 +160,7 @@ fn h2() {
 fn m1() {
     println!("=== M1: what ControlService(Ex) fills, per outcome");
     let name = "goetiap3-m1";
+    let g = gate(name);
     run("net.exe", &["start", name]);
     let h = open(name);
     println!("M1: {}", query(h));
@@ -167,12 +173,13 @@ fn m1() {
     ctl("M1 STOP_PENDING, STOP again", h, SERVICE_CONTROL_STOP);
     ctl_ex("M1 STOP_PENDING, STOP again (Ex)", h, SERVICE_CONTROL_STOP, SERVICE_STOP_REASON_FLAG_PLANNED | SERVICE_STOP_REASON_MAJOR_NONE | SERVICE_STOP_REASON_MINOR_NONE);
     n.arm(STOPS);
-    release(name);
+    release(name, g);
     println!("M1: after release, observed {}", n.wait());
     ctl("M1 STOPPED, STOP", h, SERVICE_CONTROL_STOP);
     ctl_ex("M1 STOPPED, STOP (Ex)", h, SERVICE_CONTROL_STOP, SERVICE_STOP_REASON_FLAG_PLANNED | SERVICE_STOP_REASON_MAJOR_NONE | SERVICE_STOP_REASON_MINOR_NONE);
 
     let name = "goetiap3-m1s";
+    let g = gate(name);
     run("sc.exe", &["start", name]);
     let h = open(name);
     let mut n = Notifier::new(h);
@@ -182,7 +189,7 @@ fn m1() {
     ctl("M1s START_PENDING, STOP", h, SERVICE_CONTROL_STOP);
     ctl_ex("M1s START_PENDING, STOP (Ex)", h, SERVICE_CONTROL_STOP, SERVICE_STOP_REASON_FLAG_PLANNED | SERVICE_STOP_REASON_MAJOR_NONE | SERVICE_STOP_REASON_MINOR_NONE);
     n.arm(ALL);
-    release(name);
+    release(name, g);
     println!("M1s: after release, observed {}", n.wait());
     run("net.exe", &["stop", name]);
 }
@@ -199,8 +206,9 @@ fn m3() {
 }
 
 fn main() {
-    h1();
-    h2();
     m1();
-    m3();
+    let h = open("goetiap3-m3");
+    println!("=== M1: a never-started service");
+    ctl("M1n STOPPED (never started), STOP", h, SERVICE_CONTROL_STOP);
+    ctl_ex("M1n STOPPED (never started), STOP (Ex)", h, SERVICE_CONTROL_STOP, SERVICE_STOP_REASON_FLAG_PLANNED | SERVICE_STOP_REASON_MAJOR_NONE | SERVICE_STOP_REASON_MINOR_NONE);
 }
