@@ -205,7 +205,37 @@ fn m3() {
     for i in 1..=3 { let rc = n.arm(ALL); println!("M3 arm {i} after two unobserved start+stop cycles: rc={rc} {}", n.wait()); }
 }
 
+fn mg() {
+    let name = "goetiap3-h1";
+    println!("=== M-G: is a NON-immediate notification's status captured at the transition or at delivery?");
+    run("net.exe", &["start", name]);
+    let (to_b, from_a) = mpsc::channel::<()>();
+    let (to_a, from_b) = mpsc::channel::<()>();
+    let b = std::thread::spawn(move || {
+        from_a.recv().unwrap();
+        let h = open(name);
+        let mut n = Notifier::new(h);
+        n.arm(STOPS);
+        ctl("M-G thread B", h, SERVICE_CONTROL_STOP);
+        println!("M-G thread B: stop confirmed {}", n.wait());
+        run("net.exe", &["start", name]);
+        println!("M-G thread B: restarted, {}", query(h));
+        to_a.send(()).unwrap();
+    });
+    let h = open(name);
+    let mut n = Notifier::new(h);
+    println!("M-G thread A: before arm, {}", query(h));
+    let rc = n.arm(STOPS);
+    println!("M-G thread A: armed STOPPED|STOP_PENDING rc={rc} on the RUNNING service (no immediate fire); not alertable until B has stopped AND restarted it");
+    to_b.send(()).unwrap();
+    from_b.recv().unwrap();
+    println!("M-G thread A: now alertable -> {}", n.wait());
+    b.join().unwrap();
+    run("net.exe", &["stop", name]);
+}
+
 fn main() {
+    mg();
     m1();
     let h = open("goetiap3-m3");
     println!("=== M1: a never-started service");

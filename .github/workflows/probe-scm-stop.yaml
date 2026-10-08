@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: cargo build --manifest-path probe/svc/Cargo.toml
-      - run: ./probe/probe4.ps1 *> probe4-results.txt
+      - run: ./probe/probe3.ps1 *> probe3-results.txt
         timeout-minutes: 20
         shell: pwsh
       - if: always()
@@ -19,4 +19,4 @@ jobs:
         with:
           name: probe-results
           path: |
-            probe4-results.txt
+            probe3-results.txt
