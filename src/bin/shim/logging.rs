@@ -43,6 +43,7 @@ pub fn append_line(file: &mut File, line: &str) {
 
 // Windows Event Log ===================================================================================================
 
+#[cfg(not(test))]
 pub mod eventlog {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt as _;
@@ -113,13 +114,20 @@ pub mod eventlog {
 /// Event Log — both best-effort, so a decode or spawn failure is never lost
 /// just because one of the two channels is itself unavailable (see the
 /// module doc comment for why each can independently fail).
+///
+/// A test build journals the line instead (see `test_hook`).
 pub fn log_failure(id: &str, message: &str) {
     let line = format!("goetia-shim[{id}]: {message}");
     eprintln!("{line}");
-    if let Ok(mut f) = open_append(&default_log_path(id)) {
-        append_line(&mut f, &line);
+    #[cfg(not(test))]
+    {
+        if let Ok(mut f) = open_append(&default_log_path(id)) {
+            append_line(&mut f, &line);
+        }
+        eventlog::report_error(&line);
     }
-    eventlog::report_error(&line);
+    #[cfg(test)]
+    test_hook::report(id, line);
 }
 
 // test_hook ===========================================================================================================
