@@ -1,0 +1,17 @@
+# Throwaway measurement probe for launchd writable-dirs. Never merged.
+[workspace]
+
+[package]
+name = "launchd-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "launchd-probe"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
