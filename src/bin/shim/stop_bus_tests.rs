@@ -5,10 +5,18 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use super::test_hook::{KILL_REFUSED, WaiterEnd, waiter_end};
 use super::*;
+use crate::logging::test_hook::take;
+use crate::test_support::TestId;
 
+const PREFIX: &str = "goetia-shim-stop-bus-test";
+
+/// Waits for a stop; a clean one reports nothing, and the waiter is joined inside the call, so no
+/// later log can arrive.
 #[skuld::test]
 fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
+    let id = TestId::new(PREFIX);
     let mut cmd = cosca::run([
         "powershell",
         "-NoProfile",
@@ -19,9 +27,7 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
     cmd.contain();
     let bus = Arc::new(StopBus::new());
     // Made before the spawn, as `service::launch` makes it — see `Waiter`.
-    let waiter = bus
-        .waiter("wait_for_child_or_stop_does_not_deadlock_on_stop")
-        .expect("make the waiter thread");
+    let waiter = bus.waiter(id.as_str()).expect("make the waiter thread");
     let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
 
     // `wait_for_child_or_stop` runs on its own, un-scoped `'static` thread
@@ -30,16 +36,16 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
     // it exists to catch): if the teardown inside it ever again happens
     // *after* the call would need to return rather than before — the join
     // deadlock this module's own doc comment on `wait_for_child_or_stop`
-    // describes — this thread simply never sends, and `recv_timeout` below
-    // reports that as a clear failure instead of hanging the whole test
-    // binary.
+    // describes — this thread simply never sends, and `recv` below blocks
+    // forever. Both ends are this crate's code, so there is no bound to
+    // choose; CI's per-binary watchdog is the external one.
     let (tx, rx) = mpsc::channel();
     {
         let child = Arc::clone(&child);
         let bus = Arc::clone(&bus);
+        let id = id.as_str().to_string();
         std::thread::spawn(move || {
-            let outcome =
-                bus.wait_for_child_or_stop(waiter, &child, "wait_for_child_or_stop_does_not_deadlock_on_stop");
+            let outcome = bus.wait_for_child_or_stop(waiter, &child, &id);
             let _ = tx.send(outcome);
         });
     }
@@ -51,14 +57,15 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
     // comment).
     bus.request_stop();
 
-    // A real regression-detection bound, not a synchronization mechanism —
-    // see the comment on the `thread::spawn` call above for why a deadlock
-    // here would otherwise hang the whole test binary rather than fail one
-    // test.
     let outcome = rx
-        .recv_timeout(Duration::from_secs(30))
-        .expect("wait_for_child_or_stop did not return within 30s of a stop request — it likely deadlocked");
+        .recv()
+        .expect("the thread running wait_for_child_or_stop ended without a result");
     assert!(matches!(outcome, WaitOutcome::Stopping));
+    assert_eq!(
+        take(id.as_str()),
+        Vec::<String>::new(),
+        "a clean stop reported a failure"
+    );
 
     // The child must actually be dead by now (the whole point of the call
     // returning `Stopping` only after `kill_tree` confirms it), not merely
@@ -79,6 +86,9 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
 /// carries: the daemon really is still running when it returns, so `StoppingUnkillable` is not
 /// `Stopping` under another name.
 ///
+/// It also pins that both refused kills are logged, `kill_tree`'s first. The detached waiter must
+/// have finished logging before the journal is read, hence the wait on its end.
+///
 /// Both failures are injected ([`test_hook::kills`]) because neither can be asked of the OS here:
 /// `kill_tree` fails for real only on a child holding no actionable containment mechanism or on a
 /// refused kill (see `wait_for_child_or_stop`), and Windows fixes a child handle's access rights at
@@ -88,7 +98,7 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
 /// reached that mechanism, and `Child::drop`'s own kill covers it where it degraded to TreeWalk.
 #[skuld::test]
 fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_kill() {
-    const ID: &str = "wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_kill";
+    let id = TestId::new(PREFIX);
 
     let mut cmd = cosca::run([
         "powershell",
@@ -99,31 +109,30 @@ fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_k
     ]);
     cmd.contain();
     let bus = Arc::new(StopBus::new());
-    let waiter = bus.waiter(ID).expect("make the waiter thread");
+    let waiter = bus.waiter(id.as_str()).expect("make the waiter thread");
     let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
 
     let (tx, rx) = mpsc::channel();
     {
         let child = Arc::clone(&child);
         let bus = Arc::clone(&bus);
+        let id = id.as_str().to_string();
         std::thread::spawn(move || {
             // Armed on the thread the kills happen on, which is not this test's — the hook is
             // thread-local, so the cleanup kill at the end of this test is unaffected by it.
             let _refused = test_hook::kills(test_hook::Kill::Refuse);
-            let outcome = bus.wait_for_child_or_stop(waiter, &child, ID);
+            let outcome = bus.wait_for_child_or_stop(waiter, &child, &id);
             let _ = tx.send(outcome);
         });
     }
 
     bus.request_stop();
 
-    // The same regression bound, for the same reason, as
-    // `wait_for_child_or_stop_does_not_deadlock_on_stop` above: the failure this test exists to
-    // catch is a call that never returns, which without a bound hangs the whole test binary.
-    let outcome = rx.recv_timeout(Duration::from_secs(30)).expect(
-        "wait_for_child_or_stop did not return within 30s of a stop whose kills both failed — it joined a \
-         waiter whose wait nothing can make return",
-    );
+    // Blocks forever if the call joined a waiter whose wait nothing can make return; unbounded for
+    // the reason given in `wait_for_child_or_stop_does_not_deadlock_on_stop`.
+    let outcome = rx
+        .recv()
+        .expect("the thread running wait_for_child_or_stop ended without a result");
     assert!(
         matches!(outcome, WaitOutcome::StoppingUnkillable),
         "a stop with both kills refused reported a reaped child"
@@ -143,6 +152,31 @@ fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_k
     // What the call deliberately did not do. The detached waiter thread is parked in `child.wait()`
     // and ends once this lands.
     child.kill_tree().expect("kill the daemon the call left running");
+    assert_eq!(
+        waiter_end(id.as_str()),
+        WaiterEnd::Returned,
+        "the detached waiter thread panicked"
+    );
+
+    let refused = cosca::error::Error::Io(std::io::Error::other(KILL_REFUSED));
+    let expected = vec![
+        format!(
+            "goetia-shim[{id}]: kill_tree on stop: {refused}; falling back to killing the direct child only \
+             (its own descendants, if any, cannot be reached without a containment mechanism)",
+            id = id.as_str()
+        ),
+        format!(
+            "goetia-shim[{id}]: fallback kill on stop: {refused}; the daemon was neither killed nor reaped and \
+             may still be running — reporting the service stopped, with that failure, rather than waiting for \
+             an exit nothing can now cause",
+            id = id.as_str()
+        ),
+    ];
+    assert_eq!(
+        (take(id.as_str()), logging::default_log_path(id.as_str()).exists()),
+        (expected, false),
+        "both refused kills must be journalled, kill_tree's first, and must not reach the fallback log"
+    );
 }
 
 /// A panic between the hand-off and the join detaches the waiter, which still holds an
@@ -157,9 +191,11 @@ fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_k
 /// is `cosca`'s guarantee about its own job object, and its tests are where it is proven. It is
 /// also only available where containment reached that mechanism: a failed Job Object assignment
 /// degrades to TreeWalk, where there is no job object to close and so no such backstop.
+///
+/// The injected panic precedes any log; waiting for the detached waiter's end settles the journal.
 #[skuld::test]
 fn a_panic_on_the_stop_path_leaves_the_waiter_detached_and_the_daemon_untorn_down() {
-    const ID: &str = "a_panic_on_the_stop_path_leaves_the_waiter_detached_and_the_daemon_untorn_down";
+    let id = TestId::new(PREFIX);
 
     let mut cmd = cosca::run([
         "powershell",
@@ -170,7 +206,7 @@ fn a_panic_on_the_stop_path_leaves_the_waiter_detached_and_the_daemon_untorn_dow
     ]);
     cmd.contain();
     let bus = Arc::new(StopBus::new());
-    let waiter = bus.waiter(ID).expect("make the waiter thread");
+    let waiter = bus.waiter(id.as_str()).expect("make the waiter thread");
     let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
 
     // Requested before the call, so it reaches the kill — and the panic — without blocking first:
@@ -181,10 +217,11 @@ fn a_panic_on_the_stop_path_leaves_the_waiter_detached_and_the_daemon_untorn_dow
     {
         let child = Arc::clone(&child);
         let bus = Arc::clone(&bus);
+        let id = id.as_str().to_string();
         std::thread::spawn(move || {
             let _panicking = test_hook::kills(test_hook::Kill::Panic);
             let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                bus.wait_for_child_or_stop(waiter, &child, ID);
+                bus.wait_for_child_or_stop(waiter, &child, &id);
             }))
             .is_err();
             // Dropped before the send, so the reference count asserted below is not a race against
@@ -194,10 +231,11 @@ fn a_panic_on_the_stop_path_leaves_the_waiter_detached_and_the_daemon_untorn_dow
         });
     }
 
-    let panicked = rx.recv_timeout(Duration::from_secs(30)).expect(
-        "the panicking call never returned: an unwind that blocks — a join in a `Drop`, say — is one of the \
-         regressions this bounds",
-    );
+    // Blocks forever if the unwind blocks — a join in a `Drop`, say; unbounded for the reason given
+    // in `wait_for_child_or_stop_does_not_deadlock_on_stop`.
+    let panicked = rx
+        .recv()
+        .expect("the thread running the panicking call ended without a result");
     assert!(panicked, "the kill did not panic, so nothing below is about an unwind");
 
     // Two `Arc`s: this test's, and the detached thread's, parked in `child.wait()`. The unwind
@@ -221,27 +259,38 @@ fn a_panic_on_the_stop_path_leaves_the_waiter_detached_and_the_daemon_untorn_dow
     child
         .kill_tree()
         .expect("kill the daemon the panicking call left running");
+    assert_eq!(
+        waiter_end(id.as_str()),
+        WaiterEnd::Returned,
+        "the detached waiter thread panicked"
+    );
+    assert_eq!(
+        take(id.as_str()),
+        Vec::<String>::new(),
+        "the stop path logged around the injected panic"
+    );
 }
 
+/// The waiter is joined inside the call, so no later log can arrive.
 #[skuld::test]
 fn wait_for_child_or_stop_returns_child_exited_when_the_child_exits_on_its_own() {
+    let id = TestId::new(PREFIX);
     let mut cmd = cosca::run(["powershell", "-NoProfile", "-NonInteractive", "-Command", "exit 0"]);
     cmd.contain();
     let bus = Arc::new(StopBus::new());
-    let waiter = bus
-        .waiter("wait_for_child_or_stop_returns_child_exited_when_the_child_exits_on_its_own")
-        .expect("make the waiter thread");
+    let waiter = bus.waiter(id.as_str()).expect("make the waiter thread");
     let child = Arc::new(cmd.spawn().expect("spawn a short-lived child"));
 
     // No stop requested: the child exiting on its own is the only wakeup
     // source, so this blocks only as long as the child itself takes to
     // start and exit.
-    let outcome = bus.wait_for_child_or_stop(
-        waiter,
-        &child,
-        "wait_for_child_or_stop_returns_child_exited_when_the_child_exits_on_its_own",
-    );
+    let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str());
     assert!(matches!(outcome, WaitOutcome::ChildExited));
+    assert_eq!(
+        take(id.as_str()),
+        Vec::<String>::new(),
+        "a child that exited on its own reported a failure"
+    );
 }
 
 /// [`Waiter`]'s "handed nothing — it ends", the one lifetime claim in this module with no other

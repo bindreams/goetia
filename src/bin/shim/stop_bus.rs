@@ -94,6 +94,8 @@ impl Waiter {
         let thread = std::thread::Builder::new()
             .name("goetia-shim-waiter".to_string())
             .spawn(move || {
+                #[cfg(test)]
+                let _exit = test_hook::waiter_running(&id);
                 let Ok(child) = rx.recv() else {
                     return; // never handed a daemon: none was spawned
                 };
@@ -387,6 +389,13 @@ fn kill_child(child: &Child) -> Result<(), cosca::error::Error> {
 #[cfg(test)]
 pub(crate) mod test_hook {
     use std::cell::Cell;
+    use std::collections::BTreeMap;
+    use std::sync::{Condvar, Mutex, PoisonError};
+
+    /// The error [`threads`] makes `Waiter::new` fail with.
+    pub(crate) const NO_THREAD: &str = "no thread may be made (test hook)";
+    /// The error [`Kill::Refuse`] makes both kills fail with.
+    pub(crate) const KILL_REFUSED: &str = "the kill was refused (test hook)";
 
     thread_local! {
         static THREADS: Cell<Option<usize>> = const { Cell::new(None) };
@@ -423,9 +432,7 @@ pub(crate) mod test_hook {
     pub(super) fn killing() -> Result<(), cosca::error::Error> {
         match KILLS.get() {
             None => Ok(()),
-            Some(Kill::Refuse) => Err(cosca::error::Error::Io(std::io::Error::other(
-                "the kill was refused (test hook)",
-            ))),
+            Some(Kill::Refuse) => Err(cosca::error::Error::Io(std::io::Error::other(KILL_REFUSED))),
             Some(Kill::Panic) => panic!("the kill panicked (test hook)"),
         }
     }
@@ -445,9 +452,55 @@ pub(crate) mod test_hook {
         }
     }
 
+    /// How a waiter thread ended.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) enum WaiterEnd {
+        Returned,
+        Panicked,
+    }
+
+    static ENDS: Mutex<BTreeMap<String, WaiterEnd>> = Mutex::new(BTreeMap::new());
+    static ENDED: Condvar = Condvar::new();
+
+    /// Held for the whole life of the waiter thread's closure, so that its drop is the last thing
+    /// the thread does: it records how the thread ended under its daemon id and wakes
+    /// [`waiter_end`]. Runs on a normal return and during an unwind.
+    pub(super) struct WaiterExit(String);
+
+    pub(super) fn waiter_running(id: &str) -> WaiterExit {
+        WaiterExit(id.to_string())
+    }
+
+    impl Drop for WaiterExit {
+        fn drop(&mut self) {
+            let end = if std::thread::panicking() {
+                WaiterEnd::Panicked
+            } else {
+                WaiterEnd::Returned
+            };
+            ENDS.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(std::mem::take(&mut self.0), end);
+            ENDED.notify_all();
+        }
+    }
+
+    /// Block until the waiter thread made for `id` has ended, then remove and return how. For the
+    /// tests where `wait_for_child_or_stop` detaches the waiter, so they cannot join it: everything
+    /// the waiter logged happens-before this returns.
+    pub(crate) fn waiter_end(id: &str) -> WaiterEnd {
+        let mut ends = ENDS.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if let Some(end) = ends.remove(id) {
+                return end;
+            }
+            ends = ENDED.wait(ends).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
     pub(super) fn make_thread() -> std::io::Result<()> {
         match THREADS.get() {
-            Some(0) => Err(std::io::Error::other("no thread may be made (test hook)")),
+            Some(0) => Err(std::io::Error::other(NO_THREAD)),
             Some(n) => {
                 THREADS.set(Some(n - 1));
                 Ok(())

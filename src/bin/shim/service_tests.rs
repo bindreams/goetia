@@ -8,46 +8,21 @@ use std::path::Path;
 
 use cosca::identity::Liveness;
 use goetia::spec::{Id, Kind, User};
-// rand 0.10 moved `random` off `Rng` onto `RngExt`.
-use rand::RngExt as _;
 
 use super::*;
+use crate::logging::test_hook::take;
 use crate::stop_bus::test_hook as waiter_threads;
+use crate::test_support::TestId;
 
-/// A per-run daemon id, and the removal of the one file these tests write outside any tempdir.
-///
-/// `launch`'s failure arm reports through `logging::log_failure`, which never consults
-/// `spec.logs`: it appends to `%ProgramData%\Goetia\logs\<id>.log`, creating the directory, and
-/// writes a Windows Event Log entry. Random rather than fixed for the same reason
-/// `tests/support`'s `random_test_id` is — a straggler from a crashed run cannot collide with a
-/// live one, and a path derived from a random id can never be a really-installed daemon's log —
-/// and removed on drop so an elevated CI runner does not accumulate one file per run. (That
-/// module is `tests/`-only; a binary crate cannot reach it, hence the local copy.) The event log
-/// entry cannot be avoided from here: it is one entry per run that reaches a failure arm.
-struct TestId(String);
-
-impl TestId {
-    fn new() -> Self {
-        Self(format!("goetia-shim-launch-test-{:016x}", rand::rng().random::<u64>()))
-    }
-
-    fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Drop for TestId {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(logging::default_log_path(&self.0));
-    }
-}
+const PREFIX: &str = "goetia-shim-launch-test";
 
 /// A `type: simple` daemon that keeps running until it is killed — the case where a lost waiter
 /// would leave a real orphan, rather than a process that was about to exit anyway.
 ///
 /// `logs` is set rather than left to `build_command`'s `%ProgramData%\Goetia\logs\` default: a
 /// test must not append to the path a really-installed daemon of the same id logs to. That covers
-/// the daemon's own output only — `launch`'s failure reporting writes elsewhere; see [`TestId`].
+/// the daemon's own output only: `launch`'s failure reporting goes through `logging::log_failure`,
+/// which never consults `spec.logs`.
 fn spec(dir: &Path, id: &str) -> DaemonSpec {
     DaemonSpec {
         id: Id::try_from(id).expect("a valid daemon id"),
@@ -72,7 +47,7 @@ fn spec(dir: &Path, id: &str) -> DaemonSpec {
 #[skuld::test]
 fn no_daemon_is_spawned_when_no_thread_can_be_made_to_wait_on_it() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
-    let id = TestId::new();
+    let id = TestId::new(PREFIX);
     let stop_bus = Arc::new(StopBus::new());
     let spawned_before = test_hook::spawns();
     let _no_thread = waiter_threads::threads(0);
@@ -85,6 +60,20 @@ fn no_daemon_is_spawned_when_no_thread_can_be_made_to_wait_on_it() {
     assert!(
         launched.is_none(),
         "launch reported a daemon that nothing could wait on"
+    );
+    // The failure `launch` reports for it: journalled, not written to the fallback file or the
+    // Event Log. Paired so a seam that regresses to writing shows both halves.
+    let line = format!(
+        "goetia-shim[{}]: make the thread that waits on {:?}: {}; it was not spawned, so nothing of this \
+         daemon is running",
+        id.as_str(),
+        spec(dir.path(), id.as_str()).command,
+        waiter_threads::NO_THREAD,
+    );
+    assert_eq!(
+        (take(id.as_str()), logging::default_log_path(id.as_str()).exists()),
+        (vec![line], false),
+        "launch's refused-thread failure must be journalled and must not reach the fallback log"
     );
     assert_eq!(
         test_hook::spawns(),
@@ -111,13 +100,18 @@ fn a_daemon_is_spawned_once_the_thread_that_waits_on_it_exists() {
     // assert against — the counter and the daemon's log file — do move when the thread it needs
     // first can be made.
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
-    let id = TestId::new();
+    let id = TestId::new(PREFIX);
     let stop_bus = Arc::new(StopBus::new());
     let spawned_before = test_hook::spawns();
 
     let launched = launch(&spec(dir.path(), id.as_str()), &stop_bus, id.as_str());
 
     assert!(launched.is_some(), "launch failed with every thread available");
+    assert_eq!(
+        take(id.as_str()),
+        Vec::<String>::new(),
+        "a launch that succeeded reported a failure"
+    );
     assert_eq!(
         test_hook::spawns(),
         spawned_before + 1,

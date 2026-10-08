@@ -18,9 +18,7 @@ use std::path::PathBuf;
 /// `%ProgramData%\Goetia\logs\<id>.log` — derivable from `id` alone. This is
 /// also the design spec's own OS-default `logs:` path for `type: simple` on
 /// Windows when `goetia.yaml` sets none (§2, "`logs` default"), so a daemon
-/// that never overrides `logs:` has no fallback/real distinction at all —
-/// see `log_failure`'s doc comment for why that coincidence is load-bearing
-/// rather than accidental.
+/// that never overrides `logs:` has no fallback/real distinction at all.
 pub fn default_log_path(id: &str) -> PathBuf {
     programdata_dir().join("Goetia").join("logs").join(format!("{id}.log"))
 }
@@ -123,3 +121,41 @@ pub fn log_failure(id: &str, message: &str) {
     }
     eventlog::report_error(&line);
 }
+
+// test_hook ===========================================================================================================
+
+/// What a test build's [`super::log_failure`] records instead of writing the fallback file and the Event
+/// Log, keyed by daemon id so a test can take the lines of work done on any thread once it has a
+/// happens-before with that work.
+#[cfg(test)]
+pub(crate) mod test_hook {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, PoisonError};
+
+    /// Poisonable by a test, which is why `logging_tests` reaches it. Both accessors recover from
+    /// poison: one panicking test must not make every later `log_failure` panic, the waiter
+    /// thread's included.
+    pub(super) static REPORTED: Mutex<BTreeMap<String, Vec<String>>> = Mutex::new(BTreeMap::new());
+
+    pub(super) fn report(id: &str, line: String) {
+        REPORTED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(id.to_string())
+            .or_default()
+            .push(line);
+    }
+
+    /// Remove and return every line reported under `id`, oldest first.
+    pub(crate) fn take(id: &str) -> Vec<String> {
+        REPORTED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id)
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+#[path = "logging_tests.rs"]
+mod logging_tests;
