@@ -5,17 +5,19 @@ set -u
 run_case() {
   local label=$1 program=$2
   local plist=/Library/LaunchDaemons/$label.plist
+  local xml=${program//&/&amp;}
   cat > /tmp/$label.plist <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>$label</string>
-<key>ProgramArguments</key><array><string>/bin/bash</string><string>-c</string><string>$program</string></array>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>-c</string><string>$xml</string></array>
 <key>RunAtLoad</key><true/>
 <key>ExitTimeOut</key><integer>5</integer>
 </dict></plist>
 PLIST
   rm -f /tmp/$label.ready; mkfifo -m 666 /tmp/$label.ready
+  plutil -lint /tmp/$label.plist
   sudo cp /tmp/$label.plist "$plist"
   sudo launchctl bootstrap system "$plist"
   read -r _ < /tmp/$label.ready   # blocks until the job writes; the job timeout bounds it
