@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 windows-service = "0.8"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Services", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Services", "Win32_System_Threading"] }
 
 [[bin]]
 name = "probe-svc"
@@ -21,3 +21,7 @@ path = "src/notify.rs"
 [[bin]]
 name = "notify2"
 path = "src/notify2.rs"
+
+[[bin]]
+name = "probe3"
+path = "src/probe3.rs"

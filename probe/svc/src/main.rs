@@ -10,7 +10,18 @@ use windows_service::service::{
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::{define_windows_service, service_dispatcher};
 
+use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+
 define_windows_service!(ffi_main, svc_main);
+
+/// The probe's release gate: a manual-reset event the probe opens and sets.
+fn gate(name: &str) -> HANDLE {
+    let w: Vec<u16> = format!("Global\\goetiaprobe-gate-{name}").encode_utf16().chain([0]).collect();
+    let ev = unsafe { CreateEventW(std::ptr::null(), 1, 0, w.as_ptr()) };
+    assert!(!ev.is_null(), "CreateEventW");
+    ev
+}
 
 fn main() {
     let name = std::env::args().nth(1).expect("name");
@@ -42,10 +53,32 @@ fn svc_main(_: Vec<OsString>) {
         _ => ServiceControlHandlerResult::NotImplemented,
     })
     .expect("register");
+    if mode == "pendstart" {
+        let ev = gate(&name);
+        let mut st = status(ServiceState::StartPending, ServiceControlAccept::empty(), ServiceExitCode::Win32(0));
+        st.checkpoint = 1;
+        st.wait_hint = Duration::from_secs(120);
+        h.set_service_status(st).expect("start pending");
+        unsafe { WaitForSingleObject(ev, INFINITE) };
+    }
     h.set_service_status(status(ServiceState::Running, ServiceControlAccept::STOP, ServiceExitCode::Win32(0)))
         .expect("running");
     rx.recv().expect("stop");
     match mode.as_str() {
+        "pendstop" => {
+            let ev = gate(&name);
+            let mut st = status(ServiceState::StopPending, ServiceControlAccept::empty(), ServiceExitCode::Win32(0));
+            st.checkpoint = 1;
+            st.wait_hint = Duration::from_secs(120);
+            let _ = h.set_service_status(st);
+            unsafe { WaitForSingleObject(ev, INFINITE) };
+            let _ = h.set_service_status(status(ServiceState::Stopped, ServiceControlAccept::empty(), ServiceExitCode::ServiceSpecific(6)));
+            std::process::exit(6);
+        }
+        "pendstart" => {
+            let _ = h.set_service_status(status(ServiceState::Stopped, ServiceControlAccept::empty(), ServiceExitCode::Win32(0)));
+            std::process::exit(0);
+        }
         "clean" => {
             let _ = h.set_service_status(status(ServiceState::Stopped, ServiceControlAccept::empty(), ServiceExitCode::Win32(0)));
             std::process::exit(0);

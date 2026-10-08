@@ -11,10 +11,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: cargo build --manifest-path probe/svc/Cargo.toml
-      - run: ./probe/notify2.ps1 *> notify2-results.txt
+      - run: ./probe/probe3.ps1 *> probe3-results.txt
         shell: pwsh
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: probe-results
           path: |
-            notify2-results.txt
+            probe3-results.txt
