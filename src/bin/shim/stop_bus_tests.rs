@@ -5,15 +5,15 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use super::test_hook::{KILL_REFUSED, WaiterEnd, waiter_end};
+use super::test_hook::{KILL_REFUSED, WAIT_FAILED, Wait, WaiterEnd, waiter_end};
 use super::*;
+use crate::logging::failure_line;
 use crate::logging::test_hook::take;
 use crate::test_support::TestId;
 
 const PREFIX: &str = "goetia-shim-stop-bus-test";
 
-/// Waits for a stop; a clean one reports nothing, and the waiter is joined inside the call, so no
-/// later log can arrive.
+/// The waiter is joined inside the call, so no later log can arrive.
 #[skuld::test]
 fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
     let id = TestId::new(PREFIX);
@@ -37,8 +37,7 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
     // *after* the call would need to return rather than before — the join
     // deadlock this module's own doc comment on `wait_for_child_or_stop`
     // describes — this thread simply never sends, and `recv` below blocks
-    // forever. Both ends are this crate's code, so there is no bound to
-    // choose; CI's per-binary watchdog is the external one.
+    // forever. Both ends are this crate's code; CI's per-binary watchdog is the external bound.
     let (tx, rx) = mpsc::channel();
     {
         let child = Arc::clone(&child);
@@ -161,17 +160,8 @@ fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_k
 
     let refused = cosca::error::Error::Io(std::io::Error::other(KILL_REFUSED));
     let expected = vec![
-        format!(
-            "goetia-shim[{id}]: kill_tree on stop: {refused}; falling back to killing the direct child only \
-             (its own descendants, if any, cannot be reached without a containment mechanism)",
-            id = id.as_str()
-        ),
-        format!(
-            "goetia-shim[{id}]: fallback kill on stop: {refused}; the daemon was neither killed nor reaped and \
-             may still be running — reporting the service stopped, with that failure, rather than waiting for \
-             an exit nothing can now cause",
-            id = id.as_str()
-        ),
+        failure_line(id.as_str(), &kill_tree_failed(&refused)),
+        failure_line(id.as_str(), &fallback_kill_failed(&refused)),
     ];
     assert_eq!(
         (take(id.as_str()), logging::default_log_path(id.as_str()).exists()),
@@ -338,4 +328,64 @@ fn wait_or_stop_returns_false_when_the_delay_elapses_with_no_stop() {
     // signal.
     let stopped = bus.wait_or_stop(Duration::from_millis(50));
     assert!(!stopped, "wait_or_stop reported a stop that was never requested");
+}
+
+/// A failed `child.wait()` says nothing about the child, so the waiter still reports it done: the
+/// call returns `ChildExited` instead of hanging, with the failure logged.
+#[skuld::test]
+fn a_failed_background_wait_is_logged_and_still_wakes_the_stop_bus() {
+    let id = TestId::new(PREFIX);
+    let mut cmd = cosca::run(["powershell", "-NoProfile", "-NonInteractive", "-Command", "exit 0"]);
+    cmd.contain();
+    let bus = Arc::new(StopBus::new());
+    // Armed on this thread, which makes the waiter: the hook is read when it is made.
+    let waiter = {
+        let _failing = test_hook::waits(Wait::Fail);
+        bus.waiter(id.as_str()).expect("make the waiter thread")
+    };
+    let child = Arc::new(cmd.spawn().expect("spawn a short-lived child"));
+
+    let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str());
+
+    assert!(matches!(outcome, WaitOutcome::ChildExited));
+    let failed = cosca::error::Error::Io(std::io::Error::other(WAIT_FAILED));
+    assert_eq!(
+        (take(id.as_str()), logging::default_log_path(id.as_str()).exists()),
+        (vec![failure_line(id.as_str(), &wait_failed(&failed))], false),
+    );
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+/// A waiter that panics is reported by the join. A stop is requested first so the call reaches
+/// that join: the panicked waiter never notified, which `wait_while` would otherwise wait on.
+#[skuld::test]
+fn a_panicked_waiter_is_logged_when_the_stop_path_joins_it() {
+    let id = TestId::new(PREFIX);
+    let mut cmd = cosca::run([
+        "powershell",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Start-Sleep -Seconds 300",
+    ]);
+    cmd.contain();
+    let bus = Arc::new(StopBus::new());
+    let waiter = {
+        let _panicking = test_hook::waits(Wait::Panic);
+        bus.waiter(id.as_str()).expect("make the waiter thread")
+    };
+    let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
+    bus.request_stop();
+
+    let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str());
+
+    assert!(
+        matches!(outcome, WaitOutcome::Stopping),
+        "the stop's kill is real and reaches the child"
+    );
+    assert_eq!(
+        (take(id.as_str()), logging::default_log_path(id.as_str()).exists()),
+        (vec![failure_line(id.as_str(), WAITER_PANICKED)], false),
+    );
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Panicked);
 }

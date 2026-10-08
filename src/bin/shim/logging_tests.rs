@@ -1,12 +1,15 @@
-//! `log_failure`'s test-build seam: it journals under the daemon id rather than writing the
-//! fallback file and the Event Log, from any thread. What production writes is proven by
-//! `tests/shim_integration`'s `unreadable_blob_logs_to_fallback_path_and_event_log`.
+//! `log_failure`'s test-build seam, and the production file channel it stands in for.
+//!
+//! The journal tests check the fixture, not production: only the first one is a smoke test of the
+//! seam itself. The Event Log half of production is covered by the shim integration tests.
 
 use super::test_hook::{REPORTED, take};
 use super::*;
 use crate::test_support::TestId;
 
 const PREFIX: &str = "goetia-shim-logging-test";
+
+// seam ================================================================================================================
 
 #[skuld::test]
 fn log_failure_journals_instead_of_writing_on_any_thread() {
@@ -26,6 +29,8 @@ fn log_failure_journals_instead_of_writing_on_any_thread() {
         "a line from another thread must be journalled under its id and must not reach the file"
     );
 }
+
+// journal fixture -----------------------------------------------------------------------------------------------------
 
 #[skuld::test]
 fn lines_come_back_oldest_first() {
@@ -87,4 +92,50 @@ fn a_poisoned_journal_still_records_and_returns() {
     REPORTED.clear_poison();
 
     assert_eq!(taken, vec![format!("goetia-shim[{}]: after poison", id.as_str())]);
+}
+
+// production file channel =============================================================================================
+
+#[skuld::test]
+fn write_fallback_creates_missing_directories_and_writes_the_line() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("Goetia").join("logs").join("x.log");
+
+    write_fallback(&path, "the line");
+
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("the file was written"),
+        "the line\n"
+    );
+}
+
+#[skuld::test]
+fn write_fallback_appends_rather_than_truncates() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("x.log");
+
+    write_fallback(&path, "first");
+    write_fallback(&path, "second");
+
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("the file was written"),
+        "first\nsecond\n"
+    );
+}
+
+#[skuld::test]
+fn write_fallback_is_best_effort_when_the_path_cannot_be_opened() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let file = dir.path().join("a-file");
+    std::fs::write(&file, "x").expect("a regular file to use as a parent");
+
+    // A directory cannot be created under a regular file: this must neither panic nor write.
+    write_fallback(&file.join("x.log"), "lost");
+
+    assert_eq!(std::fs::read_to_string(&file).expect("the file is untouched"), "x");
+}
+
+#[skuld::test]
+fn failure_line_is_the_id_in_brackets_then_the_message() {
+    assert_eq!(failure_line("svc", "boom"), "goetia-shim[svc]: boom");
 }

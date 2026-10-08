@@ -10,6 +10,7 @@ use cosca::identity::Liveness;
 use goetia::spec::{Id, Kind, User};
 
 use super::*;
+use crate::logging::failure_line;
 use crate::logging::test_hook::take;
 use crate::stop_bus::test_hook as waiter_threads;
 use crate::test_support::TestId;
@@ -61,14 +62,11 @@ fn no_daemon_is_spawned_when_no_thread_can_be_made_to_wait_on_it() {
         launched.is_none(),
         "launch reported a daemon that nothing could wait on"
     );
-    // The failure `launch` reports for it: journalled, not written to the fallback file or the
-    // Event Log. Paired so a seam that regresses to writing shows both halves.
-    let line = format!(
-        "goetia-shim[{}]: make the thread that waits on {:?}: {}; it was not spawned, so nothing of this \
-         daemon is running",
+    // The failure `launch` reports: journalled, not written.
+    let refused = std::io::Error::other(waiter_threads::NO_THREAD);
+    let line = failure_line(
         id.as_str(),
-        spec(dir.path(), id.as_str()).command,
-        waiter_threads::NO_THREAD,
+        &thread_refused(&spec(dir.path(), id.as_str()).command, &refused),
     );
     assert_eq!(
         (take(id.as_str()), logging::default_log_path(id.as_str()).exists()),
@@ -151,5 +149,72 @@ fn a_daemon_is_spawned_once_the_thread_that_waits_on_it_exists() {
         Liveness::Dead,
         "the daemon outlived the `Child` that owned it: `Child::drop` kills the tree and waits for it, so \
          by here it is dead and reaped"
+    );
+}
+
+#[skuld::test]
+fn a_daemon_that_cannot_be_spawned_is_logged_and_nothing_is_left_running() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+    let missing = DaemonSpec {
+        command: vec!["goetia-shim-test-no-such-binary".to_string()],
+        ..spec(dir.path(), id.as_str())
+    };
+
+    let launched = launch(&missing, &stop_bus, id.as_str());
+
+    assert!(launched.is_none(), "launch reported a daemon whose spawn failed");
+    // The OS's own refusal, asked for independently of the log line under test.
+    let refusal = start(&mut build_command(&missing, id.as_str())).expect_err("the binary does not exist");
+    assert_eq!(
+        (take(id.as_str()), logging::default_log_path(id.as_str()).exists()),
+        (
+            vec![failure_line(id.as_str(), &spawn_failed(&missing.command, &refusal))],
+            false
+        ),
+    );
+    // The waiter made before the spawn was dropped un-handed, which ends it.
+    assert_eq!(
+        waiter_threads::waiter_end(id.as_str()),
+        waiter_threads::WaiterEnd::Returned
+    );
+}
+
+#[skuld::test]
+fn a_log_file_that_cannot_be_opened_is_logged_and_the_daemon_still_runs() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+    // A directory cannot be created under a regular file.
+    let file = dir.path().join("a-file");
+    std::fs::write(&file, "x").expect("a regular file to use as a parent");
+    let unopenable = file.join("daemon.log");
+    let daemon = DaemonSpec {
+        logs: Some(unopenable.clone()),
+        ..spec(dir.path(), id.as_str())
+    };
+
+    let launched = launch(&daemon, &stop_bus, id.as_str());
+
+    assert!(
+        launched.is_some(),
+        "an unopenable log file stopped the daemon from running"
+    );
+    let refusal = logging::open_append(&unopenable).expect_err("the path cannot be opened");
+    assert_eq!(
+        (take(id.as_str()), logging::default_log_path(id.as_str()).exists()),
+        (
+            vec![failure_line(id.as_str(), &log_open_failed(&unopenable, &refusal))],
+            false
+        ),
+    );
+
+    // Dropping the un-handed waiter ends it and the `Child` kills the daemon, as in the control
+    // test above.
+    drop(launched);
+    assert_eq!(
+        waiter_threads::waiter_end(id.as_str()),
+        waiter_threads::WaiterEnd::Returned
     );
 }

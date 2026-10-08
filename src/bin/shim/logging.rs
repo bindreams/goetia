@@ -13,7 +13,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// `%ProgramData%\Goetia\logs\<id>.log` — derivable from `id` alone. This is
 /// also the design spec's own OS-default `logs:` path for `type: simple` on
@@ -30,7 +30,7 @@ fn programdata_dir() -> PathBuf {
 }
 
 /// Open `path` for append, creating parent directories first.
-pub fn open_append(path: &std::path::Path) -> std::io::Result<File> {
+pub fn open_append(path: &Path) -> std::io::Result<File> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -43,7 +43,6 @@ pub fn append_line(file: &mut File, line: &str) {
 
 // Windows Event Log ===================================================================================================
 
-#[cfg(not(test))]
 pub mod eventlog {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt as _;
@@ -115,19 +114,34 @@ pub mod eventlog {
 /// just because one of the two channels is itself unavailable (see the
 /// module doc comment for why each can independently fail).
 ///
-/// A test build journals the line instead (see `test_hook`).
+/// A test build journals the line instead (see `test_hook`), so a unit test never writes the
+/// Event Log.
 pub fn log_failure(id: &str, message: &str) {
-    let line = format!("goetia-shim[{id}]: {message}");
+    let line = failure_line(id, message);
     eprintln!("{line}");
     #[cfg(not(test))]
-    {
-        if let Ok(mut f) = open_append(&default_log_path(id)) {
-            append_line(&mut f, &line);
-        }
-        eventlog::report_error(&line);
-    }
+    write_channels(id, &line);
     #[cfg(test)]
     test_hook::report(id, line);
+}
+
+/// The line `log_failure` reports `message` as.
+pub fn failure_line(id: &str, message: &str) -> String {
+    format!("goetia-shim[{id}]: {message}")
+}
+
+/// Both production channels, fallback file first. Compiled in every build, so a change to either
+/// is type-checked under test even though `log_failure` does not call it there.
+fn write_channels(id: &str, line: &str) {
+    write_fallback(&default_log_path(id), line);
+    eventlog::report_error(line);
+}
+
+/// The file channel: append `line` to `path`, creating its directory. Best-effort.
+fn write_fallback(path: &Path, line: &str) {
+    if let Ok(mut f) = open_append(path) {
+        append_line(&mut f, line);
+    }
 }
 
 // test_hook ===========================================================================================================

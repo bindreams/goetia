@@ -330,14 +330,7 @@ fn launch(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str) -> Option<(Arc<C
     let waiter = match stop_bus.waiter(id) {
         Ok(waiter) => waiter,
         Err(e) => {
-            logging::log_failure(
-                id,
-                &format!(
-                    "make the thread that waits on {:?}: {e}; it was not spawned, so nothing of this daemon is \
-                     running",
-                    spec.command
-                ),
-            );
+            logging::log_failure(id, &thread_refused(&spec.command, &e));
             return None;
         }
     };
@@ -345,10 +338,29 @@ fn launch(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str) -> Option<(Arc<C
     match start(&mut cmd) {
         Ok(child) => Some((Arc::new(child), waiter)),
         Err(e) => {
-            logging::log_failure(id, &format!("spawn {:?}: {e}", spec.command));
+            logging::log_failure(id, &spawn_failed(&spec.command, &e));
             None
         }
     }
+}
+
+// Failure reports -----------------------------------------------------------------------------------------------------
+
+// Built here, not at the `log_failure` calls, so the tests assert on the same text.
+
+fn thread_refused(command: &[String], e: &std::io::Error) -> String {
+    format!("make the thread that waits on {command:?}: {e}; it was not spawned, so nothing of this daemon is running")
+}
+
+fn spawn_failed(command: &[String], e: &cosca::error::Error) -> String {
+    format!("spawn {command:?}: {e}")
+}
+
+fn log_open_failed(path: &std::path::Path, e: &std::io::Error) -> String {
+    format!(
+        "open log file {}: {e} (this daemon's output will not be captured; it is still being run and supervised)",
+        path.display()
+    )
 }
 
 /// The spawn itself: [`launch`]'s last step, once the thread that will wait on the daemon has
@@ -386,14 +398,7 @@ fn build_command(spec: &DaemonSpec, id: &str) -> cosca::Command {
             let _ = cmd.stderr(Stdio::merge(Fd::STDOUT));
         }
         Err(e) => {
-            logging::log_failure(
-                id,
-                &format!(
-                    "open log file {}: {e} (this daemon's output will not be captured; it is still being run \
-                     and supervised)",
-                    log_path.display()
-                ),
-            );
+            logging::log_failure(id, &log_open_failed(&log_path, &e));
             // Same infallibility reasoning as above, for `Stdio::null()`.
             let _ = cmd.stdout(Stdio::null());
             let _ = cmd.stderr(Stdio::null());
