@@ -5,11 +5,23 @@
 //! `unreadable_blob_logs_to_fallback_path_and_event_log` (version skew);
 //! `shim_runs_child_with_cwd_and_env`/`shim_captures_stdout_to_logs_path`
 //! cover the ordinary spawn path these two failure tests assume works.
+//! `the_shim_exits_with_the_code_it_reported_to_scm_*` and
+//! `a_shim_that_cannot_decode_its_blob_reports_service_specific_3` pin the
+//! shim's exit code against what it reported to SCM (spec tests; they
+//! observe the process exit through a handle taken while it runs).
 
 use std::collections::BTreeMap;
+use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 
 use goetia::backend::scm::manager::ScmManager;
 use goetia::manager::{Budget, ServiceManager as _};
+use windows_service::service::{ServiceAccess, ServiceExitCode, ServiceState, ServiceStatus};
+use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+use windows_sys::Win32::System::Threading::{
+    GetExitCodeProcess, INFINITE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    WaitForSingleObject,
+};
 
 use crate::common::{fixture_command, mk_spec_full};
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
@@ -291,4 +303,133 @@ fn corrupt_spec_value(id: &str) {
         .unwrap_or_else(|e| panic!("open {path} to corrupt Spec: {e}"));
     key.set_value("Spec", &"not valid base64 or JSON at all".to_string())
         .unwrap_or_else(|e| panic!("overwrite Spec under {path}: {e}"));
+}
+
+// Exit code vs. what SCM was told =====================================================================================
+
+/// Values derived from the shim's documented code vocabulary
+/// (`src/bin/shim/service.rs`: `EXIT_OK = 0`, `EXIT_DECODE_FAILURE = 3`,
+/// `EXIT_CHILD_FAILURE = 5`), not imported: this crate cannot import from a
+/// bin target. Under `restart: never` a child that fails makes the shim stop
+/// with 5, reported as `ServiceSpecific(5)`; a clean child gives 0, reported
+/// as `Win32(0)`.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn the_shim_exits_with_the_code_it_reported_to_scm_when_the_child_fails() {
+    assert_shim_exit_matches_scm_record(1, 5, ServiceExitCode::ServiceSpecific(5));
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn the_shim_exits_with_the_code_it_reported_to_scm_when_the_child_exits_cleanly() {
+    assert_shim_exit_matches_scm_record(0, 0, ServiceExitCode::Win32(0));
+}
+
+/// Runs `exit-on-close` with `child_code`, takes a handle on the shim's
+/// process while it is running, lets the child exit, and checks both the
+/// process's exit code and SCM's final record.
+fn assert_shim_exit_matches_scm_record(child_code: i32, expected_exit: u32, expected_record: ServiceExitCode) {
+    // Declaration order is drop order in reverse: the listener outlives the
+    // guard, and the process handle is released before the service is removed.
+    let reported = ConnectBack::listen();
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+
+    let spec = mk_spec_full(
+        &id,
+        fixture_command(
+            "exit-on-close",
+            &[&reported.port().to_string(), &child_code.to_string()],
+        ),
+        None,
+        BTreeMap::new(),
+        goetia::spec::Restart::Never,
+        None,
+        None,
+    );
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    let stream = reported.accept_stream("the fixture to connect and wait for the test to close its end");
+
+    let running = scm_status(&id);
+    assert_eq!(running.current_state, ServiceState::Running, "{running:?}");
+    let pid = running
+        .process_id
+        .unwrap_or_else(|| panic!("SCM reports a running service with no process id: {running:?}"));
+
+    // SAFETY: plain FFI call; the returned handle is checked and then owned.
+    let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if raw.is_null() {
+        panic!("OpenProcess({pid}): {}", std::io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a valid handle we own and nothing else closes.
+    let process = unsafe { OwnedHandle::from_raw_handle(raw as _) };
+
+    // The handle must name the shim that was running, not a recycled pid.
+    let again = scm_status(&id);
+    assert_eq!(again.current_state, ServiceState::Running, "{again:?}");
+    assert_eq!(again.process_id, Some(pid), "{again:?}");
+
+    drop(stream);
+
+    // SAFETY: `process` is a live handle with SYNCHRONIZE access.
+    let waited = unsafe { WaitForSingleObject(process.as_raw_handle() as HANDLE, INFINITE) };
+    if waited != WAIT_OBJECT_0 {
+        panic!(
+            "WaitForSingleObject on the shim (pid {pid}) returned {waited:#x}, GetLastError: {}; SCM: {:?}",
+            std::io::Error::last_os_error(),
+            scm_status(&id)
+        );
+    }
+    let mut exit_code = 0u32;
+    // SAFETY: `process` is live; `exit_code` is a valid out-pointer.
+    let ok = unsafe { GetExitCodeProcess(process.as_raw_handle() as HANDLE, &mut exit_code) };
+    assert_ne!(ok, 0, "GetExitCodeProcess: {}", std::io::Error::last_os_error());
+    // The wait returned WAIT_OBJECT_0, so the process has exited and this is
+    // not STILL_ACTIVE (259).
+    assert_eq!(
+        exit_code, expected_exit,
+        "the shim's process exit code differs from the one it reported to SCM"
+    );
+
+    let stopped = scm_status(&id);
+    assert_eq!(stopped.exit_code, expected_record, "{stopped:?}");
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_shim_that_cannot_decode_its_blob_reports_service_specific_3() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+
+    let spec = mk_spec_full(
+        &id,
+        fixture_command("report", &["1"]),
+        None,
+        BTreeMap::new(),
+        goetia::spec::Restart::Never,
+        None,
+        None,
+    );
+    mgr.install(&spec, false).expect("install");
+    corrupt_spec_value(&id);
+
+    mgr.start(&spec.id, Budget::DEFAULT)
+        .expect_err("a shim that cannot decode its own metadata blob must fail to start");
+
+    let status = scm_status(&id);
+    assert_eq!(
+        status.exit_code,
+        ServiceExitCode::ServiceSpecific(3),
+        "EXIT_DECODE_FAILURE should be what the shim reported: {status:?}"
+    );
+}
+
+fn scm_status(id: &str) -> ServiceStatus {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .expect("connect to the service manager");
+    manager
+        .open_service(id, ServiceAccess::QUERY_STATUS)
+        .unwrap_or_else(|e| panic!("open service {id}: {e}"))
+        .query_status()
+        .unwrap_or_else(|e| panic!("query status of {id}: {e}"))
 }
