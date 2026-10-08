@@ -75,6 +75,7 @@ fn main() {
     h.arm_wait("F2 stops-mask while the new instance runs, then sc stop", STOPS, Some(&["stop", &name]));
     // G: all-states arms only. Snapshot (running), then a stop and a start
     // both unobserved, then an all-states re-arm: does it fire with the new pid?
+    net(&["start", &name]);
     h.arm_wait("G1 all-states snapshot while running", ALL, None);
     net(&["stop", &name]);
     net(&["start", &name]);
