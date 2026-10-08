@@ -27,6 +27,9 @@ fn gate(name: &str) -> HANDLE {
 fn main() {
     let name = std::env::args().nth(1).expect("name");
     service_dispatcher::start(name, ffi_main).expect("dispatcher");
+    if std::env::args().nth(2).as_deref() == Some("linger") {
+        loop { std::thread::park(); }
+    }
 }
 
 fn status(state: ServiceState, accept: ServiceControlAccept, exit: ServiceExitCode) -> ServiceStatus {
@@ -75,6 +78,10 @@ fn svc_main(_: Vec<OsString>) {
             unsafe { WaitForSingleObject(ev, INFINITE) };
             let _ = h.set_service_status(status(ServiceState::Stopped, ServiceControlAccept::empty(), ServiceExitCode::ServiceSpecific(6)));
             std::process::exit(6);
+        }
+        "linger" => {
+            let _ = h.set_service_status(status(ServiceState::Stopped, ServiceControlAccept::empty(), ServiceExitCode::ServiceSpecific(6)));
+            loop { std::thread::park(); }
         }
         "pendstart" => {
             let _ = h.set_service_status(status(ServiceState::Stopped, ServiceControlAccept::empty(), ServiceExitCode::Win32(0)));
