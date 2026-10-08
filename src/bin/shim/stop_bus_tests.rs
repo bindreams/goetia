@@ -66,6 +66,7 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
         Vec::<String>::new(),
         "a clean stop reported a failure"
     );
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 
     // The child must actually be dead by now (the whole point of the call
     // returning `Stopping` only after `kill_tree` confirms it), not merely
@@ -291,6 +292,7 @@ fn wait_for_child_or_stop_returns_child_exited_when_the_child_exits_on_its_own()
         Vec::<String>::new(),
         "a child that exited on its own reported a failure"
     );
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }
 
 /// [`Waiter`]'s "handed nothing — it ends", the one lifetime claim in this module with no other
@@ -300,10 +302,9 @@ fn wait_for_child_or_stop_returns_child_exited_when_the_child_exits_on_its_own()
 /// than failing it: a thread that never ends leaves no event to bound.
 #[skuld::test]
 fn a_waiter_that_is_never_handed_a_child_ends_on_its_own() {
+    let id = TestId::new(PREFIX);
     let bus = Arc::new(StopBus::new());
-    let waiter = bus
-        .waiter("a_waiter_that_is_never_handed_a_child_ends_on_its_own")
-        .expect("make the waiter thread");
+    let waiter = bus.waiter(id.as_str()).expect("make the waiter thread");
 
     // Closing the only `Sender` is the whole mechanism: the thread's first act is `rx.recv()`,
     // which now returns `Err` and returns.
@@ -311,6 +312,7 @@ fn a_waiter_that_is_never_handed_a_child_ends_on_its_own() {
     drop(hand);
 
     thread.join().expect("the waiter thread panicked instead of ending");
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }
 
 #[skuld::test]

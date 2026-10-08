@@ -140,6 +140,12 @@ fn a_daemon_is_spawned_once_the_thread_that_waits_on_it_exists() {
          wrong reason"
     );
     drop(launched);
+    // Dropping the un-handed `Waiter` closes its channel, which ends its thread; consuming the end
+    // keeps the process-global record empty.
+    assert_eq!(
+        waiter_threads::waiter_end(id.as_str()),
+        waiter_threads::WaiterEnd::Returned
+    );
     assert_eq!(
         daemon.is_alive(),
         Liveness::Dead,

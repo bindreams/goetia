@@ -10,10 +10,13 @@ use crate::logging;
 ///
 /// In a test build `log_failure` journals instead (see `logging::test_hook`), so nothing is
 /// written unless that seam regresses; removing the file on drop stops such a regression from
-/// leaking one file per run. Random rather than fixed because tests assert the file is absent: a
-/// fixed id plus one broken build would fail that check forever, and a random id can never be a
-/// really-installed daemon's. (`tests/support`'s `random_test_id` is `tests/`-only; a binary
-/// crate cannot reach it.)
+/// leaking one file per run.
+///
+/// Every test needs its own id: the journal is one process-global map shared by tests running in
+/// parallel. Random rather than fixed also because tests assert the file is absent, and a fixed id
+/// would keep failing that check after a killed run left the file behind; a random id can never be
+/// a really-installed daemon's either. (`tests/support`'s `random_test_id` is `tests/`-only; a
+/// binary crate cannot reach it.)
 pub(crate) struct TestId(String);
 
 impl TestId {

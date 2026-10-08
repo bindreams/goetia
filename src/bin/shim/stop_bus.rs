@@ -386,6 +386,9 @@ fn kill_child(child: &Child) -> Result<(), cosca::error::Error> {
 /// this thread only, so the paths that must refuse to launch a daemon and must not wait on a
 /// daemon nothing can kill are testable. Mirrors `goetia::backend::bounded`'s own hook, which is
 /// `#[cfg(test)]` inside the library and therefore invisible here — see [`Waiter`].
+///
+/// Unlike the thread-local hooks, [`waiter_end`] reads a process-global record that every waiter
+/// thread writes on exit, keyed by daemon id; a test that makes a waiter consumes its end.
 #[cfg(test)]
 pub(crate) mod test_hook {
     use std::cell::Cell;
@@ -462,8 +465,8 @@ pub(crate) mod test_hook {
     static ENDS: Mutex<BTreeMap<String, WaiterEnd>> = Mutex::new(BTreeMap::new());
     static ENDED: Condvar = Condvar::new();
 
-    /// Held for the whole life of the waiter thread's closure, so that its drop is the last thing
-    /// the thread does: it records how the thread ended under its daemon id and wakes
+    /// Held for the whole life of the waiter thread's closure, so its drop runs after every log the
+    /// waiter can make: it records how the thread ended under its daemon id and wakes
     /// [`waiter_end`]. Runs on a normal return and during an unwind.
     pub(super) struct WaiterExit(String);
 

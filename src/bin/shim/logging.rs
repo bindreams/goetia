@@ -140,9 +140,8 @@ pub(crate) mod test_hook {
     use std::collections::BTreeMap;
     use std::sync::{Mutex, PoisonError};
 
-    /// Poisonable by a test, which is why `logging_tests` reaches it. Both accessors recover from
-    /// poison: one panicking test must not make every later `log_failure` panic, the waiter
-    /// thread's included.
+    /// `pub(super)` so `logging_tests` can poison it and prove the accessors recover: one panicking
+    /// test must not make every later `log_failure` panic, the waiter thread's included.
     pub(super) static REPORTED: Mutex<BTreeMap<String, Vec<String>>> = Mutex::new(BTreeMap::new());
 
     pub(super) fn report(id: &str, line: String) {
