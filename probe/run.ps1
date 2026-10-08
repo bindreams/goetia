@@ -1,5 +1,6 @@
 $ErrorActionPreference = 'Continue'
 $exe = (Resolve-Path 'probe/svc/target/debug/probe-svc.exe').Path
+$notify = (Resolve-Path 'probe/svc/target/debug/notify-probe.exe').Path
 function Show($name) {
   "  sc query:"; (sc.exe query $name) | Where-Object { $_ -match 'STATE|EXIT_CODE' } | ForEach-Object { "    $_" }
   $w = Get-CimInstance Win32_Service -Filter "Name='$name'"
@@ -23,6 +24,7 @@ foreach ($mode in 'clean', 'specific6', 'crash') {
     Start-Service $name
     "  -- first stop"; StopWith $tool $name; Show $name
     "  -- second stop (already stopped)"; StopWith $tool $name; Show $name
+    if ($tool -eq 'sc') { "  -- notify on an already-STOPPED service"; & $notify $name }
     sc.exe delete $name | Out-Null
   }
 }
