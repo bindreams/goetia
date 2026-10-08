@@ -822,7 +822,7 @@ fn extract_returns_none_for_foreign_parameters() {
 }
 
 #[skuld::test]
-fn extract_errors_on_corrupt_blob() {
+fn extract_errors_on_corrupt_blob_in_parameters() {
     let reg = build(&managed_spec());
     let mut parameters = reg.parameters;
     parameters.insert(FIELD_SPEC.to_string(), "not valid base64 !!!".to_string());
