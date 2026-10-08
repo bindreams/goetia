@@ -387,14 +387,14 @@ fn fallback_kill_failed(e: &cosca::error::Error) -> String {
 /// demand. See `test_hook::kills`.
 fn kill_tree(child: &Child) -> Result<(), cosca::error::Error> {
     #[cfg(test)]
-    test_hook::killing()?;
+    test_hook::killing(test_hook::Site::Tree)?;
     child.kill_tree()
 }
 
 /// `child.kill()`, the direct-child fallback — same seam as [`kill_tree`], for the same reason.
 fn kill_child(child: &Child) -> Result<(), cosca::error::Error> {
     #[cfg(test)]
-    test_hook::killing()?;
+    test_hook::killing(test_hook::Site::Child)?;
     child.kill()
 }
 
@@ -416,7 +416,7 @@ pub(crate) mod test_hook {
 
     /// The error [`threads`] makes `Waiter::new` fail with.
     pub(crate) const NO_THREAD: &str = "no thread may be made (test hook)";
-    /// The error [`Kill::Refuse`] makes both kills fail with.
+    /// The error [`Kill::Refuse`] and [`Kill::RefuseTree`] make a kill fail with.
     pub(crate) const KILL_REFUSED: &str = "the kill was refused (test hook)";
     /// The error [`Wait::Fail`] makes the waiter's `child.wait()` fail with.
     pub(crate) const WAIT_FAILED: &str = "the wait failed (test hook)";
@@ -433,6 +433,8 @@ pub(crate) mod test_hook {
         /// Fail, as an OS refusal would — a child holding no actionable containment mechanism for
         /// `kill_tree`, a `TerminateProcess` refusal for `kill`.
         Refuse,
+        /// Fail `kill_tree` only, so the direct-child fallback does its real kill.
+        RefuseTree,
         /// Panic, which is the documented way the waiter is left detached mid-stop.
         Panic,
     }
@@ -454,10 +456,21 @@ pub(crate) mod test_hook {
         }
     }
 
-    pub(super) fn killing() -> Result<(), cosca::error::Error> {
+    /// Which of the two kills is asking.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Site {
+        Tree,
+        Child,
+    }
+
+    pub(super) fn killing(site: Site) -> Result<(), cosca::error::Error> {
         match KILLS.get() {
             None => Ok(()),
             Some(Kill::Refuse) => Err(cosca::error::Error::Io(std::io::Error::other(KILL_REFUSED))),
+            Some(Kill::RefuseTree) if site == Site::Tree => {
+                Err(cosca::error::Error::Io(std::io::Error::other(KILL_REFUSED)))
+            }
+            Some(Kill::RefuseTree) => Ok(()),
             Some(Kill::Panic) => panic!("the kill panicked (test hook)"),
         }
     }

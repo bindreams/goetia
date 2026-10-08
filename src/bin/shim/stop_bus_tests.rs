@@ -389,3 +389,45 @@ fn a_panicked_waiter_is_logged_when_the_stop_path_joins_it() {
     );
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Panicked);
 }
+
+/// `kill_tree` fails but the direct-child fallback works: the daemon is dead and reaped, so the
+/// call joins the waiter and returns `Stopping`, with only `kill_tree`'s failure logged.
+#[skuld::test]
+fn a_stop_whose_kill_tree_fails_falls_back_to_killing_the_child() {
+    let id = TestId::new(PREFIX);
+    let mut cmd = cosca::run([
+        "powershell",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Start-Sleep -Seconds 300",
+    ]);
+    cmd.contain();
+    let bus = Arc::new(StopBus::new());
+    let waiter = bus.waiter(id.as_str()).expect("make the waiter thread");
+    let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
+    bus.request_stop();
+
+    // The call runs on this thread, so the hook is armed on it; the guard drops with the test.
+    let _refused = test_hook::kills(test_hook::Kill::RefuseTree);
+    let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str());
+
+    assert!(
+        matches!(outcome, WaitOutcome::Stopping),
+        "the fallback kill reaped the child, so the stop is a clean one"
+    );
+    assert!(
+        child
+            .wait_timeout(Duration::ZERO)
+            .expect("query the child's exit status")
+            .is_some(),
+        "the fallback kill did not end the child"
+    );
+    let refused = cosca::error::Error::Io(std::io::Error::other(KILL_REFUSED));
+    assert_eq!(
+        (take(id.as_str()), logging::default_log_path(id.as_str()).exists()),
+        (vec![failure_line(id.as_str(), &kill_tree_failed(&refused))], false),
+        "only kill_tree's failure may be logged: the fallback succeeded"
+    );
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
