@@ -3,8 +3,9 @@
 //! traps `tests/scm_integration.rs` covers for `type: managed`;
 //! this file is the `type: simple` analogue, plus the shim's own four
 //! failure paths (a commanded stop must not respawn, the restart-delay
-//! default, a logged-not-crashed spawn failure, and the version-skew
-//! fallback log).
+//! default, a logged-not-crashed spawn failure, the version-skew
+//! fallback log, and the process exit code matching what the shim reported
+//! to SCM).
 //!
 //! Every test here registers and removes real Windows services and needs
 //! `CARGO_BIN_EXE_goetia-shim` — see `main` below for how `GOETIA_SHIM_PATH`
