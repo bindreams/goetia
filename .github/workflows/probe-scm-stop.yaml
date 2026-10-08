@@ -1,0 +1,15 @@
+name: probe-scm-stop
+on:
+  push:
+    branches: [probe/scm-stop-exit-code]
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: cargo build --manifest-path probe/svc/Cargo.toml
+      - run: ./probe/run.ps1
+        shell: pwsh
