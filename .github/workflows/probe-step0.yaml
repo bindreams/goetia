@@ -660,9 +660,318 @@ jobs:
         timeout-minutes: 3
         run: probe/verify.sh
 
+  ptmx:
+    name: ptmx (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      PROBE_JOB: ptmx
+      PROBE_IMAGE: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Build
+        timeout-minutes: 15
+        run: |
+          cargo build --release --manifest-path probe/Cargo.toml
+          cc -O2 -Wall -Wextra -o probe/target/release/job probe/job.c
+      - name: Guards and runner info
+        timeout-minutes: 3
+        run: |
+          set +e
+          env -u RUNNER_ENVIRONMENT probe/target/release/launchd-probe step0 b1
+          code=$?
+          set -e
+          if [ "$code" -ne 2 ]; then echo "guard self-check: exit $code, want 2" >&2; exit 1; fi
+          if ls -d /private/var/goetia-probe-* 2>/dev/null; then echo "guard self-check: something was created" >&2; exit 1; fi
+          mkdir -p "results/$PROBE_JOB"
+          probe/target/release/launchd-probe step0 runner-info
+      - name: Stage
+        timeout-minutes: 3
+        run: probe/stage.sh
+      - name: Self-check selftest
+        timeout-minutes: 3
+        run: probe/run.sh selftest
+      - name: Self-check verdicts
+        if: always()
+        timeout-minutes: 5
+        run: probe/run.sh selfcheck-verdicts
+      - name: M1 control (/dev/null)
+        if: always()
+        timeout-minutes: 5
+        run: probe/run.sh ptmx control
+      - name: M1 nobody (/dev/ptmx)
+        if: always()
+        timeout-minutes: 5
+        run: probe/run.sh ptmx nobody
+      - name: M1 root (/dev/ptmx)
+        if: always()
+        timeout-minutes: 5
+        run: probe/run.sh ptmx root
+      - name: Self-check result schema
+        if: always()
+        timeout-minutes: 2
+        run: python3 probe/aggregate.py --check results
+      - name: Aggregate
+        if: always()
+        timeout-minutes: 2
+        run: python3 probe/aggregate.py report results
+      - name: Upload
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: probe-step0-ptmx-${{ matrix.os }}
+          path: results/
+          if-no-files-found: warn
+      - name: Teardown
+        if: always()
+        timeout-minutes: 10
+        run: probe/run.sh teardown
+      - name: Verify teardown
+        if: always()
+        timeout-minutes: 3
+        run: probe/verify.sh
+
+  lifecycle:
+    name: lifecycle (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      PROBE_JOB: lifecycle
+      PROBE_IMAGE: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Build
+        timeout-minutes: 15
+        run: |
+          cargo build --release --manifest-path probe/Cargo.toml
+          cc -O2 -Wall -Wextra -o probe/target/release/job probe/job.c
+      - name: Guards and runner info
+        timeout-minutes: 3
+        run: |
+          set +e
+          env -u RUNNER_ENVIRONMENT probe/target/release/launchd-probe step0 b1
+          code=$?
+          set -e
+          if [ "$code" -ne 2 ]; then echo "guard self-check: exit $code, want 2" >&2; exit 1; fi
+          if ls -d /private/var/goetia-probe-* 2>/dev/null; then echo "guard self-check: something was created" >&2; exit 1; fi
+          mkdir -p "results/$PROBE_JOB"
+          probe/target/release/launchd-probe step0 runner-info
+      - name: Stage
+        timeout-minutes: 3
+        run: probe/stage.sh
+      - name: Self-check selftest
+        timeout-minutes: 3
+        run: probe/run.sh selftest
+      - name: Self-check verdicts
+        if: always()
+        timeout-minutes: 5
+        run: probe/run.sh selfcheck-verdicts
+      - name: Self-check suspended-start verdicts
+        if: always()
+        timeout-minutes: 10
+        run: probe/run.sh selfcheck-suspended
+      - name: M2 cwd
+        if: always()
+        timeout-minutes: 30
+        run: probe/run.sh m2 cwd
+      - name: M2 log
+        if: always()
+        timeout-minutes: 30
+        run: probe/run.sh m2 log
+      - name: M2 gap
+        if: always()
+        timeout-minutes: 30
+        run: probe/run.sh m2 gap
+      - name: M2 control
+        if: always()
+        timeout-minutes: 30
+        run: probe/run.sh m2 control
+      - name: M2b
+        if: always()
+        timeout-minutes: 30
+        run: probe/run.sh m2b
+      - name: Self-check result schema
+        if: always()
+        timeout-minutes: 2
+        run: python3 probe/aggregate.py --check results
+      - name: Aggregate
+        if: always()
+        timeout-minutes: 2
+        run: python3 probe/aggregate.py report results
+      - name: Upload
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: probe-step0-lifecycle-${{ matrix.os }}
+          path: results/
+          if-no-files-found: warn
+      - name: Teardown
+        if: always()
+        timeout-minutes: 10
+        run: probe/run.sh teardown
+      - name: Verify teardown
+        if: always()
+        timeout-minutes: 3
+        run: probe/verify.sh
+
+  nfs-shipped:
+    name: nfs-shipped (${{ matrix.form }}, ${{ matrix.rep }}, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-latest]
+        form: [showmount, default, retrycnt0]
+        rep: [1, 2, 3, 4, 5]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      PROBE_JOB: nfs-shipped
+      PROBE_IMAGE: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Build
+        timeout-minutes: 15
+        run: |
+          cargo build --release --manifest-path probe/Cargo.toml
+          cc -O2 -Wall -Wextra -o probe/target/release/job probe/job.c
+      - name: Guards and runner info
+        timeout-minutes: 3
+        run: |
+          set +e
+          env -u RUNNER_ENVIRONMENT probe/target/release/launchd-probe step0 b1
+          code=$?
+          set -e
+          if [ "$code" -ne 2 ]; then echo "guard self-check: exit $code, want 2" >&2; exit 1; fi
+          if ls -d /private/var/goetia-probe-* 2>/dev/null; then echo "guard self-check: something was created" >&2; exit 1; fi
+          mkdir -p "results/$PROBE_JOB"
+          probe/target/release/launchd-probe step0 runner-info
+      - name: Stage
+        timeout-minutes: 3
+        run: probe/stage.sh
+      - name: Self-check selftest
+        timeout-minutes: 3
+        run: probe/run.sh selftest
+      - name: M3
+        if: always()
+        timeout-minutes: 10
+        env:
+          FORM: ${{ matrix.form }}
+          REP: ${{ matrix.rep }}
+        run: probe/run.sh nfs-shipped "$FORM" "$REP"
+      - name: Self-check result schema
+        if: always()
+        timeout-minutes: 2
+        run: python3 probe/aggregate.py --check results
+      - name: Aggregate
+        if: always()
+        timeout-minutes: 2
+        run: python3 probe/aggregate.py report results
+      - name: Upload
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: probe-step0-nfs-shipped-${{ matrix.form }}-${{ matrix.rep }}-${{ matrix.os }}
+          path: results/
+          if-no-files-found: warn
+      - name: Teardown
+        if: always()
+        timeout-minutes: 10
+        run: probe/run.sh teardown
+      - name: Verify teardown
+        if: always()
+        timeout-minutes: 3
+        run: probe/verify.sh
+
+  sandbox:
+    name: sandbox (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      PROBE_JOB: sandbox
+      PROBE_IMAGE: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Build
+        timeout-minutes: 15
+        run: |
+          cargo build --release --manifest-path probe/Cargo.toml
+          cc -O2 -Wall -Wextra -o probe/target/release/job probe/job.c
+      - name: Guards and runner info
+        timeout-minutes: 3
+        run: |
+          set +e
+          env -u RUNNER_ENVIRONMENT probe/target/release/launchd-probe step0 b1
+          code=$?
+          set -e
+          if [ "$code" -ne 2 ]; then echo "guard self-check: exit $code, want 2" >&2; exit 1; fi
+          if ls -d /private/var/goetia-probe-* 2>/dev/null; then echo "guard self-check: something was created" >&2; exit 1; fi
+          mkdir -p "results/$PROBE_JOB"
+          probe/target/release/launchd-probe step0 runner-info
+      - name: Stage
+        timeout-minutes: 3
+        run: probe/stage.sh
+      - name: Self-check selftest
+        timeout-minutes: 3
+        run: probe/run.sh selftest
+      - name: M4
+        if: always()
+        timeout-minutes: 10
+        run: probe/run.sh sandbox
+      - name: Self-check result schema
+        if: always()
+        timeout-minutes: 2
+        run: python3 probe/aggregate.py --check results
+      - name: Aggregate
+        if: always()
+        timeout-minutes: 2
+        run: python3 probe/aggregate.py report results
+      - name: Upload
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: probe-step0-sandbox-${{ matrix.os }}
+          path: results/
+          if-no-files-found: warn
+      - name: Teardown
+        if: always()
+        timeout-minutes: 10
+        run: probe/run.sh teardown
+      - name: Verify teardown
+        if: always()
+        timeout-minutes: 3
+        run: probe/verify.sh
+
   report:
     name: report
-    needs: [b0, b0-size, devices, tcc, nfs, gap]
+    needs: [b0, b0-size, devices, tcc, nfs, gap, ptmx, lifecycle, nfs-shipped, sandbox]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
