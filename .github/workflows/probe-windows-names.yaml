@@ -40,7 +40,7 @@ jobs:
             fi
           }
           try newline-mid "$(printf 'scripts\nx')"
-          try trailing-newline "$(printf 'scripts\n')"
+          try trailing-newline $'scripts\n'
           try star 'a*b'
           try dquote 'a"b'
           try comma 'a,b'
