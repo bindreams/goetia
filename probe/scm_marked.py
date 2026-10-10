@@ -933,6 +933,39 @@ def hkcu_deleted_key_read_probe():
             say(f"KC2 {label} on pre-delete handle", f"error winerror={getattr(ex, 'winerror', None)}")
     winreg.CloseKey(h1)
 
+
+def scm_delete_open_parameters_probe(binpath):
+    """KS: hold a KEY_READ handle on Services\\<id>\\Parameters, let the SCM
+    delete the service (no other handle), then read through the held handle."""
+    print("== SCM-delete under open Parameters handle probe", flush=True)
+    HK = winreg.HKEY_LOCAL_MACHINE
+    full = advapi.OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS)
+    for n in range(3):
+        name = f"goetia-probe-ks{n}"
+        h, e = create(full, name, binpath)
+        if not h:
+            raise SystemExit(f"create {name}: {e}")
+        svc = rf"SYSTEM\CurrentControlSet\Services\{name}"
+        pk = winreg.CreateKeyEx(HK, svc + r"\Parameters", 0, winreg.KEY_WRITE)
+        winreg.SetValueEx(pk, "Marker", 0, winreg.REG_SZ, "probe")
+        winreg.CloseKey(pk)
+        held = winreg.OpenKey(HK, svc + r"\Parameters", 0, winreg.KEY_READ)
+        r = Recorder(full, SERVICE_NOTIFY_DELETED)
+        r.arm()
+        advapi.DeleteService(h)
+        advapi.CloseServiceHandle(h)
+        got = r.wait_one()
+        res = []
+        for label, fn in (("Query", lambda: winreg.QueryValueEx(held, "Marker")),
+                          ("Enum0", lambda: winreg.EnumValue(held, 0))):
+            try:
+                res.append((label, "ok", fn()))
+            except OSError as ex:
+                res.append((label, "error", getattr(ex, "winerror", None)))
+        winreg.CloseKey(held)
+        say(f"KS.{n} delivered / reads on held Parameters / key after",
+            (got is not None, res, key_state(name)))
+
 def main():
     if len(sys.argv) > 2 and sys.argv[1] == "hold":
         holder(sys.argv[2])
@@ -959,6 +992,7 @@ def main():
     deleted_key_read_probe()
     held_lingering_probe(stopped_bin)
     hkcu_deleted_key_read_probe()
+    scm_delete_open_parameters_probe(stopped_bin)
     inprocess_lingering_probe(stopped_bin)
 
 
