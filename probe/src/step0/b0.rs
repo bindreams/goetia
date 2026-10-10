@@ -554,3 +554,30 @@ pub fn b5(ctx: &mut Ctx) {
     });
     ctx.emit(r);
 }
+
+/// Last in the `b0` job: BTM records appear with a lag, so look once more, at the end, for the
+/// staged plist (B3) next to the `/Library/LaunchDaemons` ones (B3's control, B5's two).
+pub fn btm_final(ctx: &mut Ctx) {
+    let mut r = Res::new("B3.final", "B", &["B0 Q-S5 (location)", "B0 Q-S3 (e)"]).expect(json!(
+        "no record for the staged path, records for the /Library/LaunchDaemons plists"
+    ));
+    let dir = vardir(ctx).join("daemons");
+    let needles = vec![
+        ctx.label("b3"),
+        dir.to_string_lossy().into_owned(),
+        ctx.label("b3ctl"),
+        ctx.label("b5"),
+        ctx.label("b5ctl"),
+    ];
+    let snap = btm_snapshot(ctx, "B3.final", &needles);
+    let staged_mentions = needles[..2]
+        .iter()
+        .map(|n| snap["mentions"][n].as_u64().unwrap_or(0))
+        .sum::<u64>();
+    if snap["available"] != json!(true) {
+        r.verdict = "unavailable".into();
+    }
+    r.differs = Some(staged_mentions > 0);
+    r.observed = json!({ "btm_final": snap, "staged_mentions": staged_mentions });
+    ctx.emit(r);
+}

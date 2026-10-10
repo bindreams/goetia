@@ -76,6 +76,10 @@ jobs:
         if: always()
         timeout-minutes: 10
         run: probe/run.sh b5
+      - name: B3 final BTM
+        if: always()
+        timeout-minutes: 5
+        run: probe/run.sh btm-final
       - name: Self-check result schema
         if: always()
         timeout-minutes: 2

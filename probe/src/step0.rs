@@ -97,6 +97,7 @@ pub fn main(args: &[String]) -> i32 {
         "b3" => b0::b3(&mut ctx),
         "b4" => b0::b4(&mut ctx),
         "b5" => b0::b5(&mut ctx),
+        "btm-final" => b0::btm_final(&mut ctx),
         "b6" => size::b6(&mut ctx),
         "devices" => devices::run(&mut ctx, arg),
         "tcc-setup" => tcc::setup(&mut ctx),
