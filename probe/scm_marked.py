@@ -676,6 +676,88 @@ def dacl_rp_and_marked_query_probe(binpath):
     advapi.CloseServiceHandle(held)
     say("P3d key after close", key_state(name))
 
+
+REG_NOTIFY_CHANGE_NAME = 0x1
+advapi.RegNotifyChangeKeyValue.restype = ctypes.c_long
+advapi.RegNotifyChangeKeyValue.argtypes = [ctypes.c_void_p, w.BOOL, w.DWORD,
+                                           ctypes.c_void_p, w.BOOL]
+kernel.CreateEventW.restype = ctypes.c_void_p
+kernel.CreateEventW.argtypes = [ctypes.c_void_p, w.BOOL, w.BOOL, w.LPCWSTR]
+kernel.WaitForSingleObject.restype = w.DWORD
+kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, w.DWORD]
+
+
+def watch(key, subtree=False):
+    ev = kernel.CreateEventW(None, False, False, None)
+    rc = advapi.RegNotifyChangeKeyValue(key.handle, subtree,
+                                        REG_NOTIFY_CHANGE_NAME, ev, True)
+    return ev, rc
+
+
+def waited(ev, ms=3000):
+    r = kernel.WaitForSingleObject(ev, ms)
+    return {0: "signalled", 0x102: f"not signalled within {ms} ms"}.get(r, hex(r))
+
+
+def registry_probe(binpath):
+    """Does REG_NOTIFY_CHANGE_NAME on a key signal when that key itself is
+    deleted, versus watching its parent? (Bounded waits: probe failure bound
+    on an external event.)"""
+    print("== registry probe", flush=True)
+    HK = winreg.HKEY_LOCAL_MACHINE
+    base = r"SOFTWARE\goetia-probe"
+    winreg.CreateKey(HK, base + r"\k")
+    k = winreg.OpenKey(HK, base + r"\k", 0, winreg.KEY_NOTIFY)
+    ev, rc = watch(k)
+    winreg.DeleteKey(HK, base + r"\k")
+    say("G1 watch key itself, delete it", (rc, waited(ev)))
+    winreg.CloseKey(k)
+    winreg.CreateKey(HK, base + r"\k")
+    parent = winreg.OpenKey(HK, base, 0, winreg.KEY_NOTIFY)
+    ev, rc = watch(parent)
+    winreg.DeleteKey(HK, base + r"\k")
+    say("G2 watch parent, delete child", (rc, waited(ev)))
+    winreg.CloseKey(parent)
+    winreg.DeleteKey(HK, base)
+    # SCM deletion of a service key with a Parameters subkey.
+    full = advapi.OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS)
+    name = "goetia-probe-reg"
+    h, e = create(full, name, binpath)
+    if not h:
+        raise SystemExit(f"create {name}: {e}")
+    svc = rf"SYSTEM\CurrentControlSet\Services\{name}"
+    pk = winreg.CreateKeyEx(HK, svc + r"\Parameters", 0, winreg.KEY_WRITE)
+    winreg.SetValueEx(pk, "Marker", 0, winreg.REG_SZ, "probe")
+    winreg.CloseKey(pk)
+    own = winreg.OpenKey(HK, svc, 0, winreg.KEY_NOTIFY)
+    ev_own, rc_own = watch(own)
+    services = winreg.OpenKey(HK, r"SYSTEM\CurrentControlSet\Services", 0,
+                              winreg.KEY_NOTIFY)
+    ev_par, rc_par = watch(services)
+    r = Recorder(full, SERVICE_NOTIFY_DELETED)
+    r.arm()
+    advapi.DeleteService(h)
+    advapi.CloseServiceHandle(h)
+    got = r.wait_one()
+    try:
+        kk = winreg.OpenKey(HK, svc)
+        subs = []
+        i = 0
+        while True:
+            try:
+                subs.append(winreg.EnumKey(kk, i))
+            except OSError:
+                break
+            i += 1
+        winreg.CloseKey(kk)
+        at = f"present, subkeys={subs}"
+    except FileNotFoundError:
+        at = "absent"
+    say("G3 at DELETED delivery: service key", (got is not None, at))
+    say("G4 watch on Services\\<id> itself during SCM delete", (rc_own, waited(ev_own)))
+    say("G5 watch on Services parent during SCM delete", (rc_par, waited(ev_par, 1)))
+    say("G6 key after", key_state(name))
+
 def main():
     if len(sys.argv) > 2 and sys.argv[1] == "hold":
         holder(sys.argv[2])
@@ -697,6 +779,7 @@ def main():
     dacl_probe(stopped_bin)
     latency_probe(stopped_bin)
     dacl_rp_and_marked_query_probe(stopped_bin)
+    registry_probe(stopped_bin)
 
 
 if __name__ == "__main__":
