@@ -251,3 +251,61 @@ pub fn run(ctx: &mut Ctx, id: &str) {
     }
     ctx.emit(res);
 }
+
+// Pass 2, M1: the /dev/ptmx stall with O_NONBLOCK on fds 1 and 2 -----------------------------------
+
+/// A write result as the sentinel reports it: `"<return>,<errno>"`.
+fn write_result(s: &Value) -> Option<(i64, i64)> {
+    let (r, e) = s.as_str()?.split_once(',')?;
+    Some((r.parse().ok()?, e.parse().ok()?))
+}
+
+/// `which`: `control` (`/dev/null`, nobody), `nobody` or `root` (`/dev/ptmx`). The sentinel sets
+/// `O_NONBLOCK` on fds 1 and 2, writes the nonce to each, then reports and blocks on CTRL. If the
+/// stall is not the first write, the sentinel never reports and the step's timeout is the bound;
+/// the provisional record then says so.
+pub fn ptmx(ctx: &mut Ctx, which: &str) {
+    let (user, path) = match which {
+        "control" => ("nobody", "/dev/null"),
+        "nobody" => ("nobody", "/dev/ptmx"),
+        "root" => ("root", "/dev/ptmx"),
+        other => {
+            ctx.note(&format!("unknown ptmx row {other:?}"));
+            return;
+        }
+    };
+    let expect = if which == "control" {
+        json!("both first writes succeed with O_NONBLOCK set")
+    } else {
+        json!("both first writes return -1 with EAGAIN")
+    };
+    let mut res = Res::new(&format!("P2.M1.{which}"), "P2", &["A1 round 10 M1 ptmx-nonblock"]).expect(expect);
+    let ls = cmd("ls", &["-leOd", path]).both();
+    ctx.provisional(&res, &format!("m1-{which}"));
+    let mut spec = JobSpec::new(&format!("m1-{which}"), user, Path::new("/Library/LaunchDaemons"));
+    spec.log = Some(PathBuf::from(path));
+    spec.nonblock_stdio = true;
+    let o = launch::launch(ctx, &spec);
+    o.apply(&mut res);
+    let rd = o.ready().cloned().unwrap_or(Value::Null);
+    let (w1, w2) = (write_result(&rd["w1"]), write_result(&rd["w2"]));
+    let flag = |k: &str| rd[k].as_str().and_then(|s| s.parse::<i64>().ok());
+    let nonblock_set = flag("flafter1").is_some_and(|f| f & 4 != 0) && flag("flafter2").is_some_and(|f| f & 4 != 0);
+    let eagain = |w: Option<(i64, i64)>| w == Some((-1, i64::from(libc::EAGAIN)));
+    if which == "control" {
+        let ok = |w: Option<(i64, i64)>| w.is_some_and(|(r, e)| r > 0 && e == 0);
+        if o.verdict != "ran" || !ok(w1) || !ok(w2) || !nonblock_set {
+            res.anomaly("control: /dev/null with --nonblock-stdio must run, set O_NONBLOCK and write both nonces");
+        }
+    } else {
+        res.differs = Some(!(eagain(w1) && eagain(w2)));
+    }
+    res.observed = json!({
+        "user": user, "path": path, "ls": ls, "w1": rd["w1"], "w2": rd["w2"],
+        "nbset1": rd["nbset1"], "nbset2": rd["nbset2"],
+        "getfl_before": { "fd1": rd["fd1"]["getfl"], "fd2": rd["fd2"]["getfl"] },
+        "getfl_after": { "fd1": rd["flafter1"], "fd2": rd["flafter2"] },
+        "nonblock_set": nonblock_set, "held_fds": rd["held"], "detail": o.detail(),
+    });
+    ctx.emit(res);
+}

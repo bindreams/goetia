@@ -6,8 +6,12 @@ mod common;
 mod devices;
 mod gap;
 mod launch;
+mod lifecycle;
 mod nfs;
+mod nfs_shipped;
+mod sandbox;
 mod size;
+mod suspended;
 mod tcc;
 mod teardown;
 
@@ -81,8 +85,13 @@ fn helper(args: &[String]) -> i32 {
 pub fn main(args: &[String]) -> i32 {
     let sub = args.first().map(String::as_str).unwrap_or("");
     let arg = args.get(1).map(String::as_str).unwrap_or("");
+    let arg2 = args.get(2).map(String::as_str).unwrap_or("");
     if sub == "helper" {
         return helper(&args[1..]);
+    }
+    // Runs as an unprivileged account without a results directory; checks the guards itself.
+    if sub == "sandbox-child" {
+        return sandbox::child(arg);
     }
     let mut ctx = match Ctx::init() {
         Ok(c) => c,
@@ -112,6 +121,12 @@ pub fn main(args: &[String]) -> i32 {
         "m12" => nfs::m12(&mut ctx),
         "m3" => nfs::m3(&mut ctx),
         "gap" => gap::run(&mut ctx),
+        "ptmx" => devices::ptmx(&mut ctx, arg),
+        "selfcheck-suspended" => lifecycle::selfcheck(&mut ctx),
+        "m2" => lifecycle::m2(&mut ctx, arg),
+        "m2b" => lifecycle::m2b(&mut ctx),
+        "nfs-shipped" => nfs_shipped::run(&mut ctx, arg, arg2),
+        "sandbox" => sandbox::run(&mut ctx),
         "teardown" => return teardown::run(&ctx),
         other => {
             eprintln!("unknown step0 subcommand {other:?}");

@@ -39,7 +39,7 @@ fn showmount() -> Out {
     cmd("showmount", &["-e", "127.0.0.1"])
 }
 
-fn exports_line(ctx: &Ctx, fspath: Option<&str>) -> String {
+pub(super) fn exports_line(ctx: &Ctx, fspath: Option<&str>) -> String {
     match fspath {
         None => format!("{} -maproot=nobody 127.0.0.1", export(ctx).display()),
         Some(f) => format!("{} -fspath={f} -maproot=nobody 127.0.0.1", export(ctx).display()),
@@ -57,6 +57,50 @@ fn rewrite_exports(old: Option<&str>, new: &str) -> Result<(), String> {
     fs::write("/etc/exports", lines.join("\n") + "\n").map_err(|e| format!("write /etc/exports: {e}"))
 }
 
+/// Step 3 of A1 Task 1: creates `/etc/exports` with `line`, or backs it up and appends. Returns
+/// whether it existed. Recorded in the state file before it acts.
+pub(super) fn install_exports(ctx: &Ctx, line: &str, anomalies: &mut Vec<String>) -> bool {
+    ctx.state("exports_line", line);
+    let existed = Path::new("/etc/exports").exists();
+    if existed {
+        let backup =
+            PathBuf::from(env_or("RUNNER_TEMP", "/tmp")).join(format!("goetia-probe-exports-backup-{}", ctx.run));
+        ctx.state("exports_backup", &backup.to_string_lossy());
+        ctx.state("exports", "appended");
+        if let Err(e) = fs::copy("/etc/exports", &backup)
+            .map_err(|e| e.to_string())
+            .and_then(|_| rewrite_exports(None, line))
+        {
+            anomalies.push(e);
+        }
+    } else {
+        ctx.state("exports", "created");
+        if let Err(e) = rewrite_exports(None, line) {
+            anomalies.push(e);
+        }
+    }
+    existed
+}
+
+/// Step 4 of A1 Task 1: `nfsd checkexports`, `enable` if it was not enabled, `start` or `update`.
+pub(super) fn start_nfsd(ctx: &Ctx, enabled: bool, running: bool, anomalies: &mut Vec<String>) {
+    must(anomalies, "nfsd", &["checkexports"]);
+    ctx.state("nfsd_touched", "1");
+    if !enabled {
+        must(anomalies, "nfsd", &["enable"]);
+    }
+    must(anomalies, "nfsd", &[if running { "update" } else { "start" }]);
+}
+
+/// Step 1 of A1 Task 1: nfsd's enabled and running state, recorded.
+pub(super) fn record_nfsd_state(ctx: &Ctx) -> (bool, bool) {
+    let enabled = cmd("nfsd", &["status"]).ok();
+    let running = nfsd_running();
+    ctx.state("nfsd_enabled_before", if enabled { "1" } else { "0" });
+    ctx.state("nfsd_running_before", if running { "1" } else { "0" });
+    (enabled, running)
+}
+
 // Setup ----------------------------------------------------------------------------------------------
 
 /// A1 Task 1 setup steps 1 to 7, then the fixture account and its server-side directories.
@@ -65,10 +109,7 @@ pub fn setup(ctx: &mut Ctx) {
     let mut ready = Res::new("N5", "N", &["A1 pending list: sheet deputy ruling 1"]);
     let (exp, m1, m2) = (export(ctx), mnt1(ctx), mnt2(ctx));
     // 1. nfsd's prior state.
-    let enabled = cmd("nfsd", &["status"]).ok();
-    let running = nfsd_running();
-    ctx.state("nfsd_enabled_before", if enabled { "1" } else { "0" });
-    ctx.state("nfsd_running_before", if running { "1" } else { "0" });
+    let (enabled, running) = record_nfsd_state(ctx);
     // 2. The export and the mount points.
     for d in [&exp, &m1, &m2] {
         if let Err(e) = scratch_dir(ctx, d) {
@@ -82,32 +123,9 @@ pub fn setup(ctx: &mut Ctx) {
     }
     // 3. /etc/exports.
     let line = exports_line(ctx, None);
-    ctx.state("exports_line", &line);
-    let existed = Path::new("/etc/exports").exists();
-    if existed {
-        let backup =
-            PathBuf::from(env_or("RUNNER_TEMP", "/tmp")).join(format!("goetia-probe-exports-backup-{}", ctx.run));
-        ctx.state("exports_backup", &backup.to_string_lossy());
-        ctx.state("exports", "appended");
-        if let Err(e) = fs::copy("/etc/exports", &backup)
-            .map_err(|e| e.to_string())
-            .and_then(|_| rewrite_exports(None, &line))
-        {
-            r.anomaly(e);
-        }
-    } else {
-        ctx.state("exports", "created");
-        if let Err(e) = rewrite_exports(None, &line) {
-            r.anomaly(e);
-        }
-    }
+    let existed = install_exports(ctx, &line, &mut r.anomalies);
     // 4. checkexports, enable, start or update.
-    must(&mut r.anomalies, "nfsd", &["checkexports"]);
-    ctx.state("nfsd_touched", "1");
-    if !enabled {
-        must(&mut r.anomalies, "nfsd", &["enable"]);
-    }
-    must(&mut r.anomalies, "nfsd", &[if running { "update" } else { "start" }]);
+    start_nfsd(ctx, enabled, running, &mut r.anomalies);
     // 5. Readiness: no wait. One look at showmount, one pre-decided fallback on `<offline>`.
     let mut forms = vec![json!({ "line": line })];
     let first = showmount();
