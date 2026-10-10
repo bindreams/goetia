@@ -1,12 +1,15 @@
 /*
  * The program launchd runs for every probe row. Throwaway measurement code.
  *
- * Usage: job STATUS CTRL N1 N2 [bits path]...
+ * Usage: job [--nonblock-stdio] STATUS CTRL N1 N2 [bits path]...
  *
  * Records fds 0-15 before anything else runs (C, not Rust: std reopens closed
  * fds 0-2 as /dev/null before main). After writing N1 to fd 1 it records the
  * file offsets of fd 2 and fd 1 (Q2: equal offsets on a regular file mean one
  * shared open file description). Records the public getiopolicy_np values.
+ * With --nonblock-stdio, fds 1 and 2 get O_NONBLOCK (F_SETFL) before the first write; the
+ * F_SETFL results and the flags afterwards are reported (pass 2, M1: a pty master with no
+ * replica open).
  * Exit codes >= 200 are job-internal failures (200 + step), never launchd's
  * outcome.
  */
@@ -52,12 +55,29 @@ int main(int argc, char **argv) {
 	}
 	signal(SIGPIPE, SIG_IGN);
 
+	int nonblock = 0;
+	if (argc > 1 && strcmp(argv[1], "--nonblock-stdio") == 0) {
+		nonblock = 1;
+		argv[1] = argv[0];
+		argv++;
+		argc--;
+	}
+
 	if (argc < 5 || (argc - 5) % 2 != 0) {
 		_exit(201);
 	}
 	const char *status_path = argv[1], *ctrl_path = argv[2];
 
 	/* Step 2: one nonce per stream. Results are data. */
+	int nb_ret[3] = {0, 0, 0}, nb_err[3] = {0, 0, 0}, nb_after[3] = {-1, -1, -1};
+	if (nonblock) {
+		for (int fd = 1; fd <= 2; fd++) {
+			errno = 0;
+			nb_ret[fd] = fcntl(fd, F_SETFL, (getfl[fd] < 0 ? 0 : getfl[fd]) | O_NONBLOCK);
+			nb_err[fd] = nb_ret[fd] < 0 ? errno : 0;
+			nb_after[fd] = fcntl(fd, F_GETFL);
+		}
+	}
 	char buf[256];
 	int n1 = snprintf(buf, sizeof buf, "%s\n", argv[3]);
 	ssize_t w1 = write(1, buf, (size_t)n1);
@@ -95,6 +115,10 @@ int main(int argc, char **argv) {
 	add(" w1=%zd,%d w2=%zd,%d", w1, w1e, w2, w2e);
 	add(" l1=%lld,%d l2=%lld,%d", (long long)l1, l1e, (long long)l2, l2e);
 	add(" n1len=%d", n1);
+	if (nonblock) {
+		add(" nbset1=%d,%d nbset2=%d,%d flafter1=%d flafter2=%d", nb_ret[1], nb_err[1], nb_ret[2], nb_err[2],
+		    nb_after[1], nb_after[2]);
+	}
 	add(" iopol=");
 #define IOPOL(name, type) \
 	add("%s%s:%d", iopol_first ? "" : ",", name, getiopolicy_np(type, IOPOL_SCOPE_PROCESS)), iopol_first = 0

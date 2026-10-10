@@ -111,11 +111,19 @@ impl Ctx {
     /// Writes a `blocked` record for `r` that the real result replaces. If the step is cut off by
     /// its human-facing timeout, this is what survives. Not counted as an anomaly of this step.
     pub fn provisional(&self, r: &Res, phase_suffix: &str) {
+        self.provisional_with(r, phase_suffix, json!({}));
+    }
+
+    /// `provisional`, plus whatever was already measured (`partial`), so a step cut off midway
+    /// keeps its data. Rewritten as the step progresses; the real result replaces it.
+    pub fn provisional_with(&self, r: &Res, phase_suffix: &str, partial: Value) {
         let mut p = Res::new(&r.id, r.group, &r.question);
         p.expected = r.expected.clone();
         p.verdict = "blocked".into();
-        p.observed =
-            json!({ "phase_file": format!("{phase_suffix}.phase"), "note": "no verdict before the step ended" });
+        p.observed = json!({
+            "phase_file": format!("{phase_suffix}.phase"), "note": "no verdict before the step ended",
+            "partial": partial,
+        });
         p.anomalies =
             vec!["no verdict before the step's timeout-minutes (the failure bound): see the phase file".into()];
         let file = self.results.join(format!("{}.json", p.id));

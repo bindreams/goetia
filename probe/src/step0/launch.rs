@@ -30,6 +30,8 @@ pub struct JobSpec<'a> {
     pub on_ready: Option<&'a dyn Fn() -> Value>,
     /// After the job is released and gone, `kickstart` it again and record that too.
     pub second: bool,
+    /// Run the sentinel with `--nonblock-stdio` (pass 2, M1).
+    pub nonblock_stdio: bool,
 }
 
 impl<'a> JobSpec<'a> {
@@ -43,6 +45,7 @@ impl<'a> JobSpec<'a> {
             access: vec![],
             on_ready: None,
             second: false,
+            nonblock_stdio: false,
         }
     }
 }
@@ -208,10 +211,10 @@ pub fn parse_ready(line: &str) -> Value {
     out
 }
 
-struct Sync {
-    status: Fifo,
-    ctrl: Fifo,
-    ctrl_path: PathBuf,
+pub(super) struct Sync {
+    pub status: Fifo,
+    pub ctrl: Fifo,
+    pub ctrl_path: PathBuf,
 }
 
 /// Bootstraps, runs the sentinel once (twice with `second`), boots it out, removes the plist.
@@ -245,13 +248,16 @@ pub fn launch(ctx: &Ctx, spec: &JobSpec) -> Outcome {
         ctrl_path: cp.clone(),
     };
 
-    let mut args = vec![
-        base.join("bin/job").to_string_lossy().into_owned(),
+    let mut args = vec![base.join("bin/job").to_string_lossy().into_owned()];
+    if spec.nonblock_stdio {
+        args.push("--nonblock-stdio".into());
+    }
+    args.extend([
         sp.to_string_lossy().into_owned(),
         cp.to_string_lossy().into_owned(),
         format!("N1-{}-{}", ctx.run, spec.suffix),
         format!("N2-{}-{}", ctx.run, spec.suffix),
-    ];
+    ]);
     for (bits, p) in &spec.access {
         args.push(bits.to_string());
         args.push(p.to_string_lossy().into_owned());
@@ -456,7 +462,7 @@ fn classify_refusal(run: &mut Run, exit: Option<i32>, printed: Option<String>) {
 }
 
 /// Wait for our own child with a kqueue event (the same register-then-`try_wait` order as before).
-fn wait_own_child(child: &mut std::process::Child) -> std::process::ExitStatus {
+pub(super) fn wait_own_child(child: &mut std::process::Child) -> std::process::ExitStatus {
     let kq = Kq::new();
     let r = kq.add(child.id() as usize, libc::EVFILT_PROC, libc::NOTE_EXIT);
     if let Ok(Some(st)) = child.try_wait() {

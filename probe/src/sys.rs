@@ -7,6 +7,12 @@ use std::path::Path;
 
 extern "C" {
     pub fn pthread_setugid_np(uid: libc::uid_t, gid: libc::gid_t) -> libc::c_int;
+    /// Per-thread working directory; `pthread_fchdir_np(-1)` returns to the process-wide one.
+    pub fn pthread_chdir_np(path: *const libc::c_char) -> libc::c_int;
+    pub fn pthread_fchdir_np(fd: libc::c_int) -> libc::c_int;
+    /// Undocumented with `flags == 0` (`sandbox.h` wants `SANDBOX_NAMED`): pass 2, M4 measures it.
+    pub fn sandbox_init(profile: *const libc::c_char, flags: u64, errorbuf: *mut *mut libc::c_char) -> libc::c_int;
+    pub fn sandbox_free_error(errorbuf: *mut libc::c_char);
 }
 
 /// `sys/kauth.h`: `(~(uid_t)0 - 100)`.
@@ -37,7 +43,11 @@ pub fn errno() -> i32 {
 /// `access(path, bits)` on the calling thread's credential: 0 or errno.
 pub fn access(path: &Path, bits: i32) -> i32 {
     let c = cpath(path);
-    if unsafe { libc::access(c.as_ptr(), bits) } == 0 { 0 } else { errno() }
+    if unsafe { libc::access(c.as_ptr(), bits) } == 0 {
+        0
+    } else {
+        errno()
+    }
 }
 
 /// `getgrouplist` with room for `cap` entries. Returns the list as filled.
