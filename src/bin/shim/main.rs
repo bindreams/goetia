@@ -34,6 +34,8 @@ mod logging;
 mod service;
 #[cfg(windows)]
 mod stop_bus;
+#[cfg(all(test, windows))]
+mod test_support;
 
 #[cfg(not(test))]
 fn main() {

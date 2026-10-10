@@ -13,14 +13,12 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// `%ProgramData%\Goetia\logs\<id>.log` — derivable from `id` alone. This is
 /// also the design spec's own OS-default `logs:` path for `type: simple` on
 /// Windows when `goetia.yaml` sets none (§2, "`logs` default"), so a daemon
-/// that never overrides `logs:` has no fallback/real distinction at all —
-/// see `log_failure`'s doc comment for why that coincidence is load-bearing
-/// rather than accidental.
+/// that never overrides `logs:` has no fallback/real distinction at all.
 pub fn default_log_path(id: &str) -> PathBuf {
     programdata_dir().join("Goetia").join("logs").join(format!("{id}.log"))
 }
@@ -32,7 +30,7 @@ fn programdata_dir() -> PathBuf {
 }
 
 /// Open `path` for append, creating parent directories first.
-pub fn open_append(path: &std::path::Path) -> std::io::Result<File> {
+pub fn open_append(path: &Path) -> std::io::Result<File> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -115,11 +113,70 @@ pub mod eventlog {
 /// Event Log — both best-effort, so a decode or spawn failure is never lost
 /// just because one of the two channels is itself unavailable (see the
 /// module doc comment for why each can independently fail).
+///
+/// A test build journals the line instead (see `test_hook`), so a unit test never writes the
+/// Event Log.
 pub fn log_failure(id: &str, message: &str) {
-    let line = format!("goetia-shim[{id}]: {message}");
+    let line = failure_line(id, message);
     eprintln!("{line}");
-    if let Ok(mut f) = open_append(&default_log_path(id)) {
-        append_line(&mut f, &line);
-    }
-    eventlog::report_error(&line);
+    #[cfg(not(test))]
+    write_channels(id, &line);
+    #[cfg(test)]
+    test_hook::report(id, line);
 }
+
+/// The line `log_failure` reports `message` as.
+pub fn failure_line(id: &str, message: &str) -> String {
+    format!("goetia-shim[{id}]: {message}")
+}
+
+/// Both production channels, fallback file first. Compiled in every build, so a change to either
+/// is type-checked under test even though `log_failure` does not call it there.
+fn write_channels(id: &str, line: &str) {
+    write_fallback(&default_log_path(id), line);
+    eventlog::report_error(line);
+}
+
+/// The file channel: append `line` to `path`, creating its directory. Best-effort.
+fn write_fallback(path: &Path, line: &str) {
+    if let Ok(mut f) = open_append(path) {
+        append_line(&mut f, line);
+    }
+}
+
+// test_hook ===========================================================================================================
+
+/// What a test build's [`super::log_failure`] records instead of writing the fallback file and the Event
+/// Log, keyed by daemon id so a test can take the lines of work done on any thread once it has a
+/// happens-before with that work.
+#[cfg(test)]
+pub(crate) mod test_hook {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, PoisonError};
+
+    /// `pub(super)` so `logging_tests` can poison it and prove the accessors recover: one panicking
+    /// test must not make every later `log_failure` panic, the waiter thread's included.
+    pub(super) static REPORTED: Mutex<BTreeMap<String, Vec<String>>> = Mutex::new(BTreeMap::new());
+
+    pub(super) fn report(id: &str, line: String) {
+        REPORTED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(id.to_string())
+            .or_default()
+            .push(line);
+    }
+
+    /// Remove and return every line reported under `id`, oldest first.
+    pub(crate) fn take(id: &str) -> Vec<String> {
+        REPORTED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id)
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+#[path = "logging_tests.rs"]
+mod logging_tests;
