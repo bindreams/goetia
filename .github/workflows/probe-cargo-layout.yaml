@@ -1,0 +1,38 @@
+name: Probe cargo layout
+
+# Throwaway measurement (never merged): how the Ubuntu runner image lays out
+# rustup's proxies in ~/.cargo/bin, and whether CARGO_HOME/RUSTUP_HOME are set.
+
+on:
+  push:
+    branches: [probe/ubuntu-cargo-layout]
+
+permissions: {}
+
+jobs:
+  layout:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - name: Measure
+        shell: bash
+        run: |
+          set -u
+          echo "image=${ImageOS:-?} ${ImageVersion:-?}"
+          echo "HOME=$HOME"
+          echo "CARGO_HOME=${CARGO_HOME-<unset>}"
+          echo "RUSTUP_HOME=${RUSTUP_HOME-<unset>}"
+          env | grep -E '^(CARGO|RUSTUP)' || echo "no CARGO*/RUSTUP* env"
+          echo "--- PATH"; tr ':' '\n' <<<"$PATH"
+          echo "--- command -v"; for t in cargo rustc rustup; do printf '%s: ' "$t"; command -v "$t" || echo missing; done
+          echo "--- ~/.cargo/bin"; ls -la "$HOME/.cargo/bin" || true
+          echo "--- stat"; for t in cargo rustc rustup; do stat -c '%n inode=%i links=%h type=%F -> %N' "$HOME/.cargo/bin/$t" || true; done
+          echo "--- -ef against rustup"
+          for t in cargo rustc; do
+            if [ "$HOME/.cargo/bin/$t" -ef "$HOME/.cargo/bin/rustup" ]; then echo "$t -ef rustup: yes"; else echo "$t -ef rustup: no"; fi
+            if [ "$(command -v "$t")" -ef "$HOME/.cargo/bin/rustup" ]; then echo "command -v $t -ef rustup: yes"; else echo "command -v $t -ef rustup: no"; fi
+          done
+          echo "--- ~/.rustup"; ls -la "$HOME/.rustup" 2>&1 | head -5 || true
