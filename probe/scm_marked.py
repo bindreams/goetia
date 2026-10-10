@@ -544,6 +544,75 @@ def orphan_key_probe():
                      rf"SYSTEM\CurrentControlSet\Services\{name}")
     say("O4 key after cleanup", key_state(name))
 
+
+def dacl_probe(binpath):
+    """P2: a throwaway service whose DACL denies SD/WP to BA: what does an
+    elevated admin get, and can it restore the DACL and delete it?"""
+    print("== dacl probe", flush=True)
+    full = advapi.OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS)
+    name = "goetia-probe-dacl"
+    h, e = create(full, name, binpath)
+    if not h:
+        raise SystemExit(f"create {name}: {e}")
+    advapi.CloseServiceHandle(h)
+    orig = subprocess.run(["sc.exe", "sdshow", name], capture_output=True,
+                          text=True).stdout.strip()
+    say("D0 original sd", orig)
+    out = subprocess.run(["sc.exe", "sdset", name,
+                          "D:(D;;SDWP;;;BA)(A;;CCLCSWLORCWD;;;BA)"],
+                         capture_output=True, text=True)
+    say("D1 sdset deny", (out.returncode, " ".join(out.stdout.split())))
+    for label, acc in (("QUERY_STATUS", SERVICE_QUERY_STATUS),
+                       ("QUERY_STATUS|STOP", SERVICE_QUERY_STATUS | SERVICE_STOP),
+                       ("QUERY_STATUS|STOP|DELETE",
+                        SERVICE_QUERY_STATUS | SERVICE_STOP | DELETE_ACCESS),
+                       ("DELETE", DELETE_ACCESS)):
+        h = advapi.OpenServiceW(full, name, acc)
+        res = "success" if h else f"error {err()}"
+        if h:
+            advapi.CloseServiceHandle(h)
+        say(f"D2 open {label}", res)
+    out = subprocess.run(["sc.exe", "sdset", name, orig], capture_output=True,
+                         text=True)
+    say("D3 restore sd", (out.returncode, " ".join(out.stdout.split())))
+    out = subprocess.run(["sc.exe", "delete", name], capture_output=True,
+                         text=True)
+    say("D4 sc delete", (out.returncode, " ".join(out.stdout.split())))
+
+
+def latency_probe(binpath):
+    """P1: T probe with a bounded alertable wait after each arm, so 'late'
+    and 'never' differ. The bound is the probe's failure bound on an
+    external event (the SCM)."""
+    print("== latency probe", flush=True)
+    full = advapi.OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS)
+    name = "goetia-probe-lat"
+    h, e = create(full, name, binpath)
+    if not h:
+        raise SystemExit(f"create {name}: {e}")
+
+    def bounded(r, ms=2000):
+        start = kernel.GetTickCount64()
+        before = len(r.got)
+        while len(r.got) == before:
+            left = ms - (kernel.GetTickCount64() - start)
+            if left <= 0:
+                return ("none within", ms)
+            kernel.SleepEx(int(left), True)
+        return (kernel.GetTickCount64() - start, r.got[before:])
+
+    r = Recorder(h, SERVICE_NOTIFY_STOPPED)
+    say("L1 arm STOPPED (creating handle)", (r.arm(), bounded(r)))
+    say("L2 re-arm STOPPED same handle", (r.arm(), bounded(r)))
+    r.mask = SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_STOPPED
+    say("L3 arm RUNNING|STOPPED same handle", (r.arm(), bounded(r)))
+    h2 = advapi.OpenServiceW(full, name, SERVICE_ALL_ACCESS)
+    r2 = Recorder(h2, SERVICE_NOTIFY_STOPPED)
+    say("L4 fresh handle arm STOPPED", (r2.arm(), bounded(r2)))
+    advapi.CloseServiceHandle(h2)
+    advapi.DeleteService(h)
+    advapi.CloseServiceHandle(h)
+
 def main():
     if len(sys.argv) > 2 and sys.argv[1] == "hold":
         holder(sys.argv[2])
@@ -562,6 +631,8 @@ def main():
     state_rearm_probe(stopped_bin)
     access_probe()
     orphan_key_probe()
+    dacl_probe(stopped_bin)
+    latency_probe(stopped_bin)
 
 
 if __name__ == "__main__":
