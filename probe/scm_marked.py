@@ -870,6 +870,47 @@ def held_lingering_probe(binpath):
             (got is not None, snap, key_state(name), el))
         winreg.CloseKey(services)
 
+
+def inprocess_lingering_probe(binpath):
+    """P7c: T5's path. Open a second in-process handle, DeleteService via the
+    first, close both; at the first 1060 list Services\\<id> and Parameters;
+    then wait for absence via the Services parent watch (bounded failure
+    bound on an external event) and print elapsed ms. 5 samples."""
+    print("== in-process lingering probe", flush=True)
+    HK = winreg.HKEY_LOCAL_MACHINE
+    full = advapi.OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS)
+    for n in range(5):
+        name = f"goetia-probe-ip{n}"
+        h, e = create(full, name, binpath)
+        if not h:
+            raise SystemExit(f"create {name}: {e}")
+        svc = rf"SYSTEM\CurrentControlSet\Services\{name}"
+        pk = winreg.CreateKeyEx(HK, svc + r"\Parameters", 0, winreg.KEY_WRITE)
+        winreg.SetValueEx(pk, "Marker", 0, winreg.REG_SZ, "probe")
+        winreg.CloseKey(pk)
+        h2 = advapi.OpenServiceW(full, name, SERVICE_QUERY_STATUS)
+        advapi.DeleteService(h)
+        h3 = advapi.OpenServiceW(full, name, SERVICE_QUERY_STATUS)  # opened while marked
+        advapi.CloseServiceHandle(h)
+        advapi.CloseServiceHandle(h2)
+        if h3:
+            advapi.CloseServiceHandle(h3)
+        o = open_result(full, name)
+        snap = (o, key_contents(svc), key_contents(svc + r"\Parameters"))
+        services = winreg.OpenKey(HK, r"SYSTEM\CurrentControlSet\Services", 0,
+                                  winreg.KEY_NOTIFY)
+        start = kernel.GetTickCount64()
+        ev, rc = watch(services)
+        while key_state(name) != "absent":
+            left = 10000 - (kernel.GetTickCount64() - start)
+            if left <= 0:
+                break
+            kernel.WaitForSingleObject(ev, int(left))
+            ev, rc = watch(services)
+        el = kernel.GetTickCount64() - start
+        say(f"P7c.{n} at-first-check / key-after / ms", (snap, key_state(name), el))
+        winreg.CloseKey(services)
+
 def main():
     if len(sys.argv) > 2 and sys.argv[1] == "hold":
         holder(sys.argv[2])
@@ -895,6 +936,7 @@ def main():
     lingering_key_probe(stopped_bin)
     deleted_key_read_probe()
     held_lingering_probe(stopped_bin)
+    inprocess_lingering_probe(stopped_bin)
 
 
 if __name__ == "__main__":
