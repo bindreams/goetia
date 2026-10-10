@@ -25,7 +25,7 @@ jobs:
       - name: Measure
         shell: bash
         run: |
-          set -u
+          set -u +e
           [ "${GITHUB_ACTIONS:-}" = true ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ] && [ "${RUNNER_OS:-}" = macOS ] || { echo "refusing: not a GitHub-hosted macOS runner"; exit 2; }
           sw_vers
           db=/private/var/db/com.apple.xpc.launchd/disabled.plist
