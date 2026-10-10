@@ -1,0 +1,76 @@
+name: Probe launchd override database
+
+# Throwaway measurement (never merged). Questions:
+#  A. Can a `launchctl disable`/`enable` override entry for a label ever be removed?
+#  B. Does `launchctl bootstrap` refuse a plist whose label is override-disabled?
+#  C. Disable while loaded: does the job keep running; can kickstart still start it?
+#  D. Does a plist in /Library/LaunchDaemons stay inert across bootout/bootstrap when disabled?
+# Runs only on disposable GitHub-hosted runners.
+
+on:
+  push:
+    branches: [probe/launchd-override]
+
+permissions: {}
+
+jobs:
+  override:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - name: Measure
+        shell: bash
+        run: |
+          set -u
+          [ "${GITHUB_ACTIONS:-}" = true ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ] && [ "${RUNNER_OS:-}" = macOS ] || { echo "refusing: not a GitHub-hosted macOS runner"; exit 2; }
+          sw_vers
+          db=/private/var/db/com.apple.xpc.launchd/disabled.plist
+          label="dev.goetia.probe.ovr.$GITHUB_RUN_ID.$RANDOM"
+          plist="/Library/LaunchDaemons/$label.plist"
+          entry() { echo "-- print-disabled: $(sudo launchctl print-disabled system | grep -F "\"$label\"" || echo '<absent>')"; echo "-- db file: $(sudo plutil -p "$db" 2>/dev/null | grep -F "\"$label\"" || echo '<absent>')"; }
+          state() { local out rc; out="$(sudo launchctl print "system/$label" 2>&1)"; rc=$?; echo "-- print rc=$rc $(printf '%s\n' "$out" | grep -E '^\s*(state|pid) =' | tr -s ' ' | tr '\n' ';')"; }
+          step() { echo; echo "== $*"; }
+
+          step "A1 disable a label that has no plist and was never loaded"
+          sudo launchctl disable "system/$label"; echo "rc=$?"; entry
+          step "A2 enable it"
+          sudo launchctl enable "system/$label"; echo "rc=$?"; entry
+          step "A3 write plist (KeepAlive true, sleep 600), disable, bootstrap"
+          sudo tee "$plist" >/dev/null <<PL
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>Label</key><string>$label</string>
+            <key>ProgramArguments</key><array><string>/bin/sleep</string><string>600</string></array>
+            <key>KeepAlive</key><true/>
+          </dict></plist>
+          PL
+          sudo sed -i '' 's/^          //' "$plist"; sudo chown root:wheel "$plist"; sudo chmod 644 "$plist"
+          sudo launchctl disable "system/$label"; echo "disable rc=$?"; entry
+          step "B bootstrap while override-disabled"
+          sudo launchctl bootstrap system "$plist"; echo "bootstrap rc=$?"; state
+          step "B2 kickstart while override-disabled"
+          sudo launchctl kickstart "system/$label"; echo "kickstart rc=$?"; state
+          step "C1 enable, bootstrap (KeepAlive: expect running)"
+          sudo launchctl enable "system/$label"; echo "enable rc=$?"
+          sudo launchctl bootstrap system "$plist"; echo "bootstrap rc=$?"; state
+          step "C2 disable while loaded and running"
+          sudo launchctl disable "system/$label"; echo "disable rc=$?"; entry; state
+          step "C3 kickstart -k while loaded and disabled"
+          sudo launchctl kickstart -k "system/$label"; echo "kickstart rc=$?"; state
+          step "C4 bootout, then bootstrap again while disabled"
+          sudo launchctl bootout "system/$label"; echo "bootout rc=$?"; state
+          sudo launchctl bootstrap system "$plist"; echo "bootstrap rc=$?"; state
+          step "A4 remove the plist; entry after uninstall-like cleanup"
+          sudo launchctl bootout "system/$label" 2>/dev/null; sudo rm -f "$plist"; entry
+          step "A5 try removal candidates"
+          sudo launchctl enable "system/$label"; echo "enable rc=$?"; entry
+          echo "-- launchctl help mentions of disabled/override:"; launchctl help 2>&1 | grep -i -E 'disab|enab|overrid|reset' || true
+          step "A6 a never-touched label for comparison"
+          other="dev.goetia.probe.ovr.never.$RANDOM"; sudo launchctl print-disabled system | grep -F "$other" || echo "<absent>"
+          step "A7 total entries in db"
+          sudo plutil -p "$db" 2>/dev/null | wc -l
