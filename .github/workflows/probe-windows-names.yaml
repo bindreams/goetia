@@ -1,0 +1,52 @@
+name: Probe Windows names
+
+# Throwaway measurement (never merged): can Git Bash on the Windows runner
+# create directories whose names end in a newline or hold * or ", and do
+# cd -P / pwd -P round-trip them? Also: does ln -s make a real link
+# under MSYS=winsymlinks:nativestrict?
+
+on:
+  push:
+    branches: [probe/windows-dirnames]
+
+permissions: {}
+
+jobs:
+  names:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - name: Measure
+        shell: bash
+        env:
+          MSYS: winsymlinks:nativestrict
+        run: |
+          set -u
+          echo "bash=$BASH_VERSION uname=$(uname -a)"
+          base="$(cd -P -- "$(mktemp -d)" && pwd -P)"
+          echo "base=$base"
+          try() {
+            local label="$1" name="$2"
+            if mkdir -- "$base/$name" 2>err.txt; then
+              got="$(cd -P -- "$base/$name" && pwd -P && printf x)"; got="${got%??}"
+              if [ "$got" = "$base/$name" ]; then rt=exact; else rt="differs: $(printf %q "$got")"; fi
+              printf '%s: mkdir ok; roundtrip %s; ls: %s\n' "$label" "$rt" "$(ls -1 "$base" | od -c | head -2 | tr '\n' ' ')"
+            else
+              printf '%s: mkdir FAILED: %s\n' "$label" "$(cat err.txt)"
+            fi
+          }
+          try newline-mid "$(printf 'scripts\nx')"
+          try trailing-newline "$(printf 'scripts\n')"
+          try star 'a*b'
+          try dquote 'a"b'
+          try comma 'a,b'
+          try space 'a b'
+          echo "--- symlink"
+          echo hi > "$base/target.txt"
+          if ln -s target.txt "$base/link.txt" 2>err.txt; then
+            if [ -L "$base/link.txt" ]; then echo "ln -s: real link"; else echo "ln -s: NOT a link (copy?)"; fi
+          else echo "ln -s FAILED: $(cat err.txt)"; fi
