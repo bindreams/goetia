@@ -344,13 +344,18 @@ class Recorder:
         self.got = []
         self.cb = NOTIFY_CB(self._cb)
         self.n = None
+        self.keep = []  # every struct ever registered stays alive
 
     def arm(self):
-        self.n = SERVICE_NOTIFY_2W()
-        self.n.dwVersion = 2
-        self.n.pfnNotifyCallback = self.cb
-        return advapi.NotifyServiceStatusChangeW(self.h, self.mask,
-                                                 ctypes.byref(self.n))
+        n = SERVICE_NOTIFY_2W()
+        n.dwVersion = 2
+        n.pfnNotifyCallback = self.cb
+        self.keep.append(n)
+        rc = advapi.NotifyServiceStatusChangeW(self.h, self.mask,
+                                               ctypes.byref(n))
+        if rc == 0:
+            self.n = n
+        return rc
 
     def _cb(self, _p):
         names = []
@@ -406,11 +411,10 @@ def rearm_probe(binpath):
     say("R1 immediate callback after first arm", r.immediate())
     make_and_delete(full, "goetia-probe-ra", binpath)
     say("R2 after deleting A (bounded wait)", r.wait_one())
-    for i in range(3):
-        rc = r.arm()
-        say(f"R3.{i} re-arm rc / immediate", (rc, r.immediate()))
-        if not r.got or rc != 0:
-            break
+    rc = r.arm()
+    say("R3 re-arm after delivery: rc / immediate", (rc, r.immediate()))
+    rc = r.arm()
+    say("R3b second arm while one is pending: rc", rc)
     # A registration may now be pending (no immediate callback above).
     make_and_delete(full, "goetia-probe-rb", binpath)
     say("R4 after deleting B with a pending registration", r.wait_one())
