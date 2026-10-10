@@ -911,6 +911,28 @@ def inprocess_lingering_probe(binpath):
         say(f"P7c.{n} at-first-check / key-after / ms", (snap, key_state(name), el))
         winreg.CloseKey(services)
 
+
+def hkcu_deleted_key_read_probe():
+    """K-HKCU: read values through a handle whose key was deleted, under HKCU."""
+    print("== HKCU deleted-key read probe", flush=True)
+    HK = winreg.HKEY_CURRENT_USER
+    base = r"Software\goetia-probe3"
+    k = winreg.CreateKeyEx(HK, base + r"\k\Parameters", 0, winreg.KEY_WRITE)
+    winreg.SetValueEx(k, "Marker", 0, winreg.REG_SZ, "x")
+    winreg.CloseKey(k)
+    h1 = winreg.OpenKey(HK, base + r"\k\Parameters", 0, winreg.KEY_READ)
+    say("KC0 read before delete", winreg.QueryValueEx(h1, "Marker"))
+    advapi.RegDeleteTreeW.argtypes = [ctypes.c_void_p, w.LPCWSTR]
+    advapi.RegDeleteTreeW.restype = ctypes.c_long
+    say("KC1 RegDeleteTreeW rc", advapi.RegDeleteTreeW(int(HK), base))
+    for label, fn in (("RegQueryValueEx", lambda: winreg.QueryValueEx(h1, "Marker")),
+                      ("RegEnumValue(0)", lambda: winreg.EnumValue(h1, 0))):
+        try:
+            say(f"KC2 {label} on pre-delete handle", f"ok {fn()!r}")
+        except OSError as ex:
+            say(f"KC2 {label} on pre-delete handle", f"error winerror={getattr(ex, 'winerror', None)}")
+    winreg.CloseKey(h1)
+
 def main():
     if len(sys.argv) > 2 and sys.argv[1] == "hold":
         holder(sys.argv[2])
@@ -936,6 +958,7 @@ def main():
     lingering_key_probe(stopped_bin)
     deleted_key_read_probe()
     held_lingering_probe(stopped_bin)
+    hkcu_deleted_key_read_probe()
     inprocess_lingering_probe(stopped_bin)
 
 
