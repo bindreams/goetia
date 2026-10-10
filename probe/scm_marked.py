@@ -328,6 +328,148 @@ def apc_probe():
         f"queued={bool(ok)} err={e} sleepex={r:#x} ran={bool(ran)}")
 
 
+
+SC_MANAGER_CONNECT = 0x1
+SC_MANAGER_ENUMERATE_SERVICE = 0x4
+SERVICE_NOTIFY_START_PENDING = 0x2
+advapi.CloseServiceHandle.restype = w.BOOL
+
+
+class Recorder:
+    """One-shot SERVICE_NOTIFY_2W registrations; records each delivery."""
+
+    def __init__(self, handle, mask):
+        self.h = handle
+        self.mask = mask
+        self.got = []
+        self.cb = NOTIFY_CB(self._cb)
+        self.n = None
+
+    def arm(self):
+        self.n = SERVICE_NOTIFY_2W()
+        self.n.dwVersion = 2
+        self.n.pfnNotifyCallback = self.cb
+        return advapi.NotifyServiceStatusChangeW(self.h, self.mask,
+                                                 ctypes.byref(self.n))
+
+    def _cb(self, _p):
+        names = []
+        if self.n.pszServiceNames:
+            p = self.n.pszServiceNames
+            while True:
+                s = ctypes.wstring_at(p)
+                if not s:
+                    break
+                names.append(s)
+                p += (len(s) + 1) * 2
+            kernel.LocalFree(self.n.pszServiceNames)
+        self.got.append((self.n.dwNotificationStatus,
+                         hex(self.n.dwNotificationTriggered), names,
+                         self.n.ServiceStatus.dwCurrentState))
+
+    def immediate(self):
+        """Non-blocking: did a callback run right now?"""
+        before = len(self.got)
+        kernel.SleepEx(0, True)
+        return self.got[before:]
+
+    def wait_one(self):
+        before = len(self.got)
+        start = kernel.GetTickCount64()
+        while len(self.got) == before:
+            left = FAIL_BOUND_MS - (kernel.GetTickCount64() - start)
+            if left <= 0:
+                return None
+            kernel.SleepEx(int(left), True)
+        return self.got[before:]
+
+
+def make_and_delete(scm, name, binpath):
+    h, e = create(scm, name, binpath)
+    if not h:
+        raise SystemExit(f"create {name}: {e}")
+    ok = advapi.DeleteService(h)
+    advapi.CloseServiceHandle(h)
+    return ok
+
+
+def rearm_probe(binpath):
+    """Does re-arming SERVICE_NOTIFY_DELETED on an SCM handle re-deliver
+    names already delivered (a spin), and are deletions made while nothing
+    is armed retained?"""
+    print("== rearm probe", flush=True)
+    full = advapi.OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS)
+    h = advapi.OpenSCManagerW(None, None,
+                              SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE)
+    r = Recorder(h, SERVICE_NOTIFY_DELETED)
+    say("R1 first arm rc", r.arm())
+    say("R1 immediate callback after first arm", r.immediate())
+    make_and_delete(full, "goetia-probe-ra", binpath)
+    say("R2 after deleting A (bounded wait)", r.wait_one())
+    for i in range(3):
+        rc = r.arm()
+        say(f"R3.{i} re-arm rc / immediate", (rc, r.immediate()))
+        if not r.got or rc != 0:
+            break
+    # A registration may now be pending (no immediate callback above).
+    make_and_delete(full, "goetia-probe-rb", binpath)
+    say("R4 after deleting B with a pending registration", r.wait_one())
+    # Nothing armed now: delete C, then arm.
+    make_and_delete(full, "goetia-probe-rc", binpath)
+    rc = r.arm()
+    say("R5 arm after C deleted while unarmed: rc / immediate", (rc, r.immediate()))
+    h2 = advapi.OpenSCManagerW(None, None,
+                               SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE)
+    r2 = Recorder(h2, SERVICE_NOTIFY_DELETED)
+    rc = r2.arm()
+    say("R6 fresh handle: arm rc / immediate", (rc, r2.immediate()))
+    say("R7 all deliveries on H", r.got)
+
+
+def start_pending_probe():
+    """A service whose process never connects to the SCM sits in
+    START_PENDING until the SCM's start timeout. What does a STOP get?"""
+    import threading
+    print("== start-pending probe", flush=True)
+    full = advapi.OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS)
+    name = "goetia-probe-sp"
+    h, e = create(full, name,
+                  r"C:\Windows\System32\cmd.exe /c ping -n 120 127.0.0.1")
+    if not h:
+        raise SystemExit(f"create {name}: {e}")
+    r = Recorder(h, SERVICE_NOTIFY_START_PENDING)
+    say("S0 arm rc", r.arm())
+    result = {}
+
+    def starter():
+        ok = advapi.StartServiceW(h, 0, None)
+        result["start"] = "ok" if ok else f"error {ctypes.get_last_error()}"
+
+    t = threading.Thread(target=starter)
+    t.start()
+    say("S1 START_PENDING notification", r.wait_one())
+    st = SERVICE_STATUS_PROCESS()
+    need = w.DWORD(0)
+    advapi.QueryServiceStatusEx(h, 0, ctypes.byref(st), ctypes.sizeof(st),
+                                ctypes.byref(need))
+    say("S2 state / controls accepted / pid",
+        (st.dwCurrentState, hex(st.dwControlsAccepted), st.dwProcessId))
+    ss = SERVICE_STATUS()
+    say("S3 ControlService(STOP) while START_PENDING",
+        "ok" if advapi.ControlService(h, SERVICE_CONTROL_STOP, ctypes.byref(ss))
+        else f"error {err()}")
+    out = subprocess.run(["sc.exe", "stop", name], capture_output=True,
+                         text=True)
+    say("S4 sc stop while START_PENDING",
+        (out.returncode, " ".join(out.stdout.split())))
+    t.join()
+    say("S5 StartServiceW result", result.get("start"))
+    if st.dwProcessId:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(st.dwProcessId)],
+                       capture_output=True)
+    advapi.DeleteService(h)
+    advapi.CloseServiceHandle(h)
+
 def main():
     if len(sys.argv) > 2 and sys.argv[1] == "hold":
         holder(sys.argv[2])
@@ -341,6 +483,8 @@ def main():
     scenario(scm, "child-stopped", stopped_bin, "child", run=False)
     scenario(scm, "self-stopped", stopped_bin, "self", run=False)
     scenario(scm, "none-stopped", stopped_bin, "none", run=False)
+    rearm_probe(stopped_bin)
+    start_pending_probe()
 
 
 if __name__ == "__main__":
