@@ -758,6 +758,76 @@ def registry_probe(binpath):
     say("G5 watch on Services parent during SCM delete", (rc_par, waited(ev_par, 1)))
     say("G6 key after", key_state(name))
 
+
+def key_contents(path):
+    HK = winreg.HKEY_LOCAL_MACHINE
+    try:
+        k = winreg.OpenKey(HK, path)
+    except FileNotFoundError:
+        return "absent"
+    subs, vals = [], []
+    i = 0
+    while True:
+        try:
+            subs.append(winreg.EnumKey(k, i))
+        except OSError:
+            break
+        i += 1
+    i = 0
+    while True:
+        try:
+            vals.append(winreg.EnumValue(k, i)[0])
+        except OSError:
+            break
+        i += 1
+    winreg.CloseKey(k)
+    return f"subkeys={subs} values={vals}"
+
+
+def lingering_key_probe(binpath):
+    """P7: right after an unheld delete, while OpenServiceW already says
+    1060, what does Services\\<id> still hold? Sampled 5 times."""
+    print("== lingering key probe", flush=True)
+    HK = winreg.HKEY_LOCAL_MACHINE
+    full = advapi.OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS)
+    for n in range(5):
+        name = f"goetia-probe-lk{n}"
+        h, e = create(full, name, binpath)
+        if not h:
+            raise SystemExit(f"create {name}: {e}")
+        svc = rf"SYSTEM\CurrentControlSet\Services\{name}"
+        pk = winreg.CreateKeyEx(HK, svc + r"\Parameters", 0, winreg.KEY_WRITE)
+        winreg.SetValueEx(pk, "Marker", 0, winreg.REG_SZ, "probe")
+        winreg.CloseKey(pk)
+        advapi.DeleteService(h)
+        advapi.CloseServiceHandle(h)
+        o = open_result(full, name)
+        say(f"P7.{n} open / key / Parameters",
+            (o, key_contents(svc), key_contents(svc + r"\Parameters")))
+
+
+def deleted_key_read_probe():
+    """M-4: read values through a handle opened before the key was deleted."""
+    print("== deleted-key read probe", flush=True)
+    HK = winreg.HKEY_LOCAL_MACHINE
+    base = r"SOFTWARE\goetia-probe2"
+    k = winreg.CreateKeyEx(HK, base + r"\k", 0, winreg.KEY_WRITE)
+    winreg.SetValueEx(k, "v", 0, winreg.REG_SZ, "x")
+    winreg.CloseKey(k)
+    h1 = winreg.OpenKey(HK, base + r"\k", 0, winreg.KEY_READ)
+    advapi.RegDeleteTreeW.argtypes = [ctypes.c_void_p, w.LPCWSTR]
+    advapi.RegDeleteTreeW.restype = ctypes.c_long
+    rc = advapi.RegDeleteTreeW(int(HK), base)
+    say("K1 RegDeleteTreeW rc", rc)
+    for label, fn in (("RegQueryValueEx(v)", lambda: winreg.QueryValueEx(h1, "v")),
+                      ("RegEnumValue(0)", lambda: winreg.EnumValue(h1, 0))):
+        try:
+            say(f"K2 {label} on pre-delete handle", f"ok {fn()!r}")
+        except OSError as ex:
+            say(f"K2 {label} on pre-delete handle",
+                f"error winerror={getattr(ex, 'winerror', None)} {ex}")
+    winreg.CloseKey(h1)
+
 def main():
     if len(sys.argv) > 2 and sys.argv[1] == "hold":
         holder(sys.argv[2])
@@ -780,6 +850,8 @@ def main():
     latency_probe(stopped_bin)
     dacl_rp_and_marked_query_probe(stopped_bin)
     registry_probe(stopped_bin)
+    lingering_key_probe(stopped_bin)
+    deleted_key_read_probe()
 
 
 if __name__ == "__main__":
