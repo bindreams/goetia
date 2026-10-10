@@ -1,266 +1,242 @@
 #!/usr/bin/env python3
-"""Cross-row classification for the launchd writable-dirs probe. Throwaway; stdlib only.
+"""Step 0 report. Throwaway; stdlib only.
 
-Usage: aggregate.py RESULTS_DIR [--expect-f29]
-Writes RESULTS_DIR/aggregate.json and a Markdown table to $GITHUB_STEP_SUMMARY (or stdout).
-Exits 1 only when an expected results file is missing or malformed.
+  aggregate.py --check DIR      every DIR/<job>/*.json parses and has id, os and verdict (exit 1 if not)
+  aggregate.py report DIR       one-OS report from DIR/<job>/*.json -> DIR/report.md (+ $GITHUB_STEP_SUMMARY)
+  aggregate.py combine ROOT OUT every ROOT/*/<job>/*.json from all artifacts, OSes side by side
+                                -> OUT/report.md (+ $GITHUB_STEP_SUMMARY)
 """
+import glob
 import json
 import os
 import sys
+from collections import defaultdict
 
-ALL = ["F1c", "F2c", "F25c", "F5l", "F19a", "F6l", "F7l", "F12l", "F26l", "F21b", "F22l", "F23l",
-       "F24l", "F28l", "F29l", "F14g", "F18g", "F20g", "F16l", "F17l"]
-O_ACCMODE, O_WRONLY, O_RDWR, O_NONBLOCK, O_APPEND = 3, 1, 2, 4, 8
+MIB = 1 << 20
 
 
-def parse_ready(line):
-    if not line:
-        return None
-    head, _, cwd = line.partition(" cwd=")
-    out = {"cwd": cwd}
-    for tok in head.split()[1:]:
-        k, _, v = tok.partition("=")
-        out[k] = v
-    for fd in ("fd0", "fd1", "fd2"):
-        v = out.get(fd, "")
-        if v.startswith("err:"):
-            out[fd] = {"err": int(v[4:])}
+def load(pattern):
+    recs, bad = [], []
+    for p in sorted(glob.glob(pattern)):
+        if p.endswith("report.md") or not p.endswith(".json"):
             continue
-        parts = v.split(",")
-        d = {"getfd": int(parts[0]), "getfl": int(parts[1])}
-        if len(parts) == 3:
-            d["staterr"] = parts[2]
-        elif len(parts) == 6:
-            d.update(dev=int(parts[2]), ino=int(parts[3]), mode=parts[4], rdev=int(parts[5]))
-        fl = d["getfl"]
-        d["accmode"] = {0: "RDONLY", O_WRONLY: "WRONLY", O_RDWR: "RDWR"}.get(fl & O_ACCMODE, "?")
-        d["append"] = bool(fl & O_APPEND)
-        d["nonblock"] = bool(fl & O_NONBLOCK)
-        out[fd] = d
-    out["acc"] = [int(x) for x in out.get("acc", "").split(",") if x != ""]
+        try:
+            with open(p) as f:
+                r = json.load(f)
+            if not isinstance(r, dict):
+                raise ValueError("not an object")
+            missing = [k for k in ("id", "os", "verdict") if k not in r]
+            if missing:
+                raise ValueError(f"missing {missing}")
+            r["_path"] = p
+            recs.append(r)
+        except Exception as e:  # noqa: BLE001 - any failure is "malformed"
+            bad.append(f"{p}: {e}")
+    return recs, bad
+
+
+def os_key(r):
+    o = r.get("os") or {}
+    return o.get("image", "?")
+
+
+def cell(r):
+    """A short observed value for one record."""
+    if r is None:
+        return "-"
+    o = r.get("observed") or {}
+    i = r["id"]
+    v = r["verdict"]
+    if i == "B1":
+        return "nlink " + ",".join(str(x.get("nlink")) for x in o.get("cumulative", []))
+    if i == "B2":
+        return "fsid vardir=%s ld=%s" % (o.get("vardir", {}).get("fsid"), o.get("library_launchdaemons", {}).get("fsid"))
+    if i == "B3":
+        return "%s; path=%s; btm changed=%s" % (v, o.get("print_path_line"), o.get("btm_changed"))
+    if i.startswith("B4."):
+        return "accepted" if o.get("accepted") else "refused: " + str((o.get("bootstrap") or {}).get("stderr", "")).strip()[:60]
+    if i == "B5":
+        return "loaded=%s btm changed=%s rebootstrap=%s" % (o.get("still_loaded"), o.get("btm_changed"), o.get("bootstrap_again_accepted"))
+    if i == "B6":
+        return "limit=%s" % (o.get("limit") if o.get("limit") is not None else o.get("note"))
+    if i.startswith("D"):
+        return v + (" held=%s" % o.get("held_fds") if v == "ran" and o.get("held_fds") is not None else "")
+    if i.startswith("T1.") or i.startswith("N4."):
+        return v
+    if i == "T2":
+        return "%s (%s matching lines)" % (v, o.get("matched"))
+    if i == "N1":
+        return "MNT_LOCAL=%s pathconf=%s/%s" % (o.get("mnt_local"), (o.get("pathconf_vers3") or {}).get("value"), (o.get("pathconf_noopaque_auth") or {}).get("value"))
+    if i == "N2":
+        return "root errno=%s; account=%s" % (o.get("root_fstatat_private_inner"), (o.get("account_search_open_then_fstatat") or {}).get("values"))
+    if i == "N3":
+        return "denied=%s allowed=%s" % (((o.get("acl_denied") or {}).get("values") or {}).get("errno"), ((o.get("allowed") or {}).get("values") or {}).get("errno"))
+    if i == "N5":
+        return "polls=0 offline=%s" % o.get("offline_seen_first")
+    if i == "M1":
+        return "; ".join("%s=%s" % (a["attempt"][:1], "ok" if a["succeeded"] else ((a["result"].get("stderr") or "").strip()[:40] or "fail")) for a in o.get("attempts", []))
+    if i == "M2":
+        return "; ".join(m.get("mntonname", "?") for m in o.get("mounts_listed", [])) or "none"
+    if i == "M3":
+        return "%s; returned=%s listed=%s stalled=%s" % (v, o.get("getfsstat_returned"), o.get("mount_listed"), o.get("stall_reproduced"))
+    if i == "Q2":
+        return "shared=%s (n1=%s l1=%s l2=%s)" % (o.get("shared_description"), o.get("n1_bytes"), o.get("lseek_fd1"), o.get("lseek_fd2"))
+    if i.startswith("Q1"):
+        return "first=%s second=%s" % (o.get("first"), (o.get("second") or {}).get("verdict"))
+    return v
+
+
+def by_question(recs):
+    q = defaultdict(lambda: defaultdict(dict))
+    for r in recs:
+        for name in r.get("question") or ["(no question)"]:
+            q[name][r["id"]][os_key(r)] = r
+    return q
+
+
+def fmt(x):
+    return str(x).replace("|", "\\|").replace("\n", " ")
+
+
+def table(rows, header):
+    out = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
+    out += ["| " + " | ".join(fmt(c) for c in r) + " |" for r in rows]
     return out
 
 
-def need_for(fd):
-    """Rights an existing-file open authorizes (vfs_subr.c:8440-8452)."""
-    s = ""
-    if fd["accmode"] in ("RDONLY", "RDWR"):
-        s += "R"
-    if fd["accmode"] in ("WRONLY", "RDWR"):
-        s += "A" if fd["append"] else "W"
-    return "".join(sorted(s, key="RWA".index))
+CONTROLS = [
+    ("D01 /dev/null is Ran", "D01", lambda r: r["verdict"] == "ran"),
+    ("B4.p0 root:wheel 0644 accepted", "B4.p0", lambda r: r["observed"].get("accepted") is True),
+    ("B4.p4 o+w refused", "B4.p4", lambda r: r["observed"].get("accepted") is False),
+    ("B1 empty directory has st_nlink 2", "B1", lambda r: (r["observed"].get("cumulative") or [{}])[0].get("nlink") == 2),
+    ("B2 fsid(/private/var/db) == fsid(/Library/LaunchDaemons)", "B2", lambda r: not any("control" in a for a in r["anomalies"])),
+    ("B3 sentinel from /Library/LaunchDaemons is Ran", "B3", lambda r: r["observed"].get("control") == "ran"),
+    ("Q1c deny add_file is Refused", "Q1c", lambda r: r["verdict"] == "refused"),
+    ("Q2 clean launch is Ran", "Q2", lambda r: r["verdict"] == "ran"),
+    ("SELF known-good sentinel is Ran", "SELF.verdict-ran", lambda r: r["verdict"] == "ran"),
+    ("SELF nonexistent cwd is Refused", "SELF.verdict-refused", lambda r: r["verdict"] == "refused"),
+    ("SELF selftest (zombie, reparented, exec)", "SELF.selftest", lambda r: r["observed"].get("ok") is True),
+    ("N2 root fstatat on allowed/ works", "N2", lambda r: r["observed"].get("root_fstatat_allowed_inner_control") == 0),
+    ("N3 _WRITE_OK on allowed/ granted", "N3", lambda r: not any("control" in a for a in r["anomalies"])),
+    ("N4 allowed/ cwd and log are Ran", "N4.allowed.cwd", lambda r: r["verdict"] == "ran"),
+    ("N4 allowed/ log is Ran", "N4.allowed.log", lambda r: r["verdict"] == "ran"),
+]
 
 
-def same(fd, obs):
-    return bool(fd and obs and "dev" in fd and obs.get("dev") == fd["dev"] and obs.get("ino") == fd["ino"])
+def report(recs, bad, title):
+    oses = sorted({os_key(r) for r in recs})
+    md = [f"# {title}", ""]
+    md.append("## Runners")
+    infos = {}
+    for r in recs:
+        if r["id"] == "RUNNER":
+            infos.setdefault(os_key(r), r)
+    for o in oses:
+        r = infos.get(o)
+        sw = (r["os"].get("sw_vers") if r else "-")
+        md.append(f"- **{o}**: {sw}; build {r['os'].get('build') if r else '-'}; {r['os'].get('csrutil') if r else '-'}")
+        if r:
+            ob = r["observed"]
+            md.append(f"  - uname: {ob.get('uname_v')}; model: {ob.get('hw_model')}; image: {ob.get('image_version')}; id: {ob.get('id')}")
+    md.append("")
+    # Q2 first: it decides how Q1 is read.
+    q = by_question(recs)
+    for name in sorted(q, key=lambda n: (0 if "known-gap" in n else 1, n)):
+        ids = q[name]
+        rows = []
+        for i in sorted(ids):
+            per = ids[i]
+            any_r = next(iter(per.values()))
+            exp = any_r.get("expected")
+            diff = [("%s: %s" % (o, per[o].get("differs"))) for o in oses if o in per and per[o].get("differs") is not None]
+            rows.append([i, exp if exp is not None else "-"] + [cell(per.get(o)) for o in oses] + [", ".join(diff) or "-"])
+        md.append(f"## {name}")
+        md += table(rows, ["id", "plan's expectation"] + oses + ["differs"])
+        md.append("")
+    md.append("## Controls")
+    rows = []
+    byid = {(r["id"], os_key(r)): r for r in recs}
+    for label, rid, ok in CONTROLS:
+        res = []
+        for o in oses:
+            r = byid.get((rid, o))
+            try:
+                res.append("-" if r is None else ("pass" if ok(r) else "FAIL"))
+            except Exception as e:  # noqa: BLE001
+                res.append(f"error: {e}")
+        rows.append([label] + res)
+    md += table(rows, ["control"] + oses)
+    md.append("")
+    md.append("## Anomalies")
+    n = 0
+    for r in recs:
+        for a in r.get("anomalies") or []:
+            md.append(f"- [{os_key(r)}] {r['id']}: {a}")
+            n += 1
+    for b in bad:
+        md.append(f"- MALFORMED {b}")
+        n += 1
+    if n == 0:
+        md.append("none")
+    md.append("")
+    md.append("## Refusal bookkeeping (X1)")
+    rows, unsettled = [], 0
+    for r in recs:
+        if r["verdict"] in ("refused", "inconclusive") or r.get("exit_source") not in (None, "n/a"):
+            if r["verdict"] == "bootstrap-refused":
+                continue
+            fp = r.get("first_print")
+            bad_fp = any("bookkeeping not settled" in a for a in r.get("anomalies") or [])
+            unsettled += bad_fp
+            rows.append([r["id"], os_key(r), r["verdict"], r.get("exit_source"), json.dumps(fp) if fp else "-"])
+    md += table(rows, ["id", "os", "verdict", "exit source", "first print"]) if rows else ["no refused rows"]
+    md.append("")
+    md.append(f"Rows where the first print was unsettled: **{unsettled}**")
+    md.append("")
+    md.append("## The cap (B6)")
+    limits = {}
+    for r in recs:
+        if r["id"] == "B6":
+            limits[os_key(r)] = r["observed"]
+    for o in oses:
+        ob = limits.get(o)
+        md.append(f"- {o}: " + ("not run" if ob is None else (f"limit {ob['limit']} bytes ({ob['limit_mib']:.3f} MiB)" if ob.get("limit") is not None else str(ob.get("note")))))
+    nums = [ob["limit"] for ob in limits.values() if ob.get("limit") is not None]
+    if nums:
+        md.append(f"- larger of the two: **{max(nums)} bytes ({max(nums) / MIB:.3f} MiB)**; "
+                  "a plist of that size is held in launchd's memory while it is parsed (memory use not measured)")
+    return "\n".join(md) + "\n"
 
 
-def content_change(before, after):
-    b = (before or {}).get("content")
-    a = (after or {}).get("content")
-    if a is None:
-        return "no-regular-file-after"
-    if b is None:
-        return "created"
-    if a == b:
-        return "unchanged"
-    if a.startswith(b):
-        return "appended"
-    if len(a) < len(b):
-        return "truncated"
-    return "overwritten"
-
-
-def mech_bools(rec):
-    out = {}
-    for m in rec.get("mechanisms") or []:
-        vals = []
-        for v in m["verdicts"]:
-            if "errno" in v:
-                vals.append(v["errno"] == 0)
-            else:
-                vals.append(None)  # mechanism-failed: excluded
-        out[m["mech"]] = {"granted": vals, "groups": m.get("groups"), "raw": m["verdicts"]}
-    return out
-
-
-def classify(launchd, root, mech):
-    if launchd is None or root is None or mech is None:
-        return None
-    disc = root != mech
-    if mech == launchd and root == launchd:
-        c = "both"
-    elif mech == launchd:
-        c = "account"
-    elif root == launchd:
-        c = "root"
-    else:
-        c = "neither"
-    return {"class": c, "discriminates": disc}
+def emit(text, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "report.md"), "w") as f:
+        f.write(text)
+    s = os.environ.get("GITHUB_STEP_SUMMARY")
+    if s:
+        with open(s, "a") as f:
+            f.write(text)
+    print(text)
 
 
 def main():
-    d = sys.argv[1]
-    expect_f29 = "--expect-f29" in sys.argv
-    problems, rows = [], {}
-    for rid in ALL:
-        if rid == "F29l" and not expect_f29:
-            continue
-        p = os.path.join(d, f"{rid}.json")
-        try:
-            with open(p) as f:
-                rows[rid] = json.load(f)
-        except Exception as e:  # noqa: BLE001 - any failure is "missing or malformed"
-            problems.append(f"{rid}: {e}")
-    extras = {}
-    for name in ("selftest", "exfat"):
-        try:
-            with open(os.path.join(d, f"{name}.json")) as f:
-                extras[name] = json.load(f)
-        except Exception as e:  # noqa: BLE001
-            problems.append(f"{name}: {e}")
-
-    # Flag model from the positive controls (F7l, else F19a/F24l).
-    model = {}
-    for src in ("F7l", "F19a", "F24l"):
-        r = parse_ready((rows.get(src) or {}).get("ready"))
-        if r and isinstance(r.get("fd1"), dict) and "accmode" in r["fd1"]:
-            model = {"source": src, "fd1": need_for(r["fd1"]), "fd2": need_for(r["fd2"]),
-                     "fd1_flags": r["fd1"], "fd2_flags": r["fd2"]}
-            break
-
-    table = {}
-    for rid, rec in rows.items():
-        t = {"anomalies": rec.get("anomalies"), "outcome": rec.get("outcome"), "status": rec.get("status")}
-        ready = parse_ready(rec.get("ready"))
-        t["ran"] = ready is not None
-        mb = mech_bools(rec)
-        targets = rec.get("targets") or []
-        kind = rec.get("kind")
-        launchd = {}  # need-name -> bool
-        if ready:
-            t["fds"] = {k: ready.get(k) for k in ("fd0", "fd1", "fd2")}
-            t["writes"] = {"w1": ready.get("w1"), "w2": ready.get("w2")}
-        if kind in ("cwd", "cwd-and-log"):
-            cs = rec.get("cwd_stat") or {}
-            ok = False
-            if ready:
-                dot = ready.get("dot", "")
-                if not dot.startswith("err"):
-                    dev, ino = (int(x) for x in dot.split(","))
-                    ok = cs.get("dev") == dev and cs.get("ino") == ino
-                else:
-                    k = rec.get("cwd_kernel") or {}
-                    ok = cs.get("dev") == k.get("dev") and cs.get("ino") == k.get("ino")
-                t["cwd_seen"] = ready.get("cwd") or rec.get("cwd_kernel")
-            launchd["X"] = ok
-            t["ran_elsewhere"] = bool(ready) and not ok
-        log_after = rec.get("log_after")
-        if rec.get("log"):
-            obs = rec.get("target_after") if rid == "F23l" else log_after
-            if rid == "F28l" or rid == "F29l":
-                obs = rec.get("log_before")  # the FIFO's identity
-            o1 = same(ready and ready.get("fd1"), obs)
-            o2 = same(ready and ready.get("fd2"), obs)
-            if rid == "F24l":
-                dn = rec.get("dev_null") or {}
-                fd1 = (ready or {}).get("fd1") or {}
-                o1 = fd1.get("rdev") == dn.get("rdev") and fd1.get("ino") == dn.get("ino") \
-                    and (ready or {}).get("w1", "-1").split(",")[0] not in ("-1", "0")
-                o2 = None
-            t["opened_fd1"], t["opened_fd2"] = o1, o2
-            t["content"] = content_change(rec.get("log_before"), obs if rid == "F23l" else log_after)
-            t["log_after"] = {k: (obs or {}).get(k) for k in ("lstat_type", "uid", "gid", "mode")}
-            if rid in ("F28l", "F29l"):
-                t["fifo_read"] = rec.get("log_reader") or rec.get("released_reader")
-            t["ran_without_log"] = bool(ready) and not o1
-            if kind in ("log-create", "cwd-and-log") or rid == "F23l":
-                launchd["WX"] = o1
-            elif model:
-                launchd[model["fd1"]] = o1
-                if o2 is not None:
-                    launchd.setdefault(model["fd2"], o2)
-        if kind == "groups" and ready:
-            for i, n in enumerate(rec.get("job_needs") or []):
-                if i < len(ready["acc"]):
-                    launchd[n["need"]] = ready["acc"][i] == 0
-        t["launchd"] = launchd
-        # Compare booleans per need (L1), excluding F22l (L2).
-        cmp = {}
-        if rid != "F22l":
-            root = mb.get("root", {}).get("granted", [])
-            for i, tg in enumerate(targets):
-                L = launchd.get(tg["need"])
-                if L is None:
-                    continue
-                for m, v in mb.items():
-                    if m == "root":
-                        continue
-                    c = classify(L, root[i] if i < len(root) else None, v["granted"][i])
-                    if c:
-                        cmp.setdefault(tg["need"], {})[m] = c
-                cmp.setdefault(tg["need"], {})["_root_granted"] = root[i] if i < len(root) else None
-                cmp[tg["need"]]["_launchd"] = L
-        t["compare"] = cmp
-        t["facts"] = rec.get("facts")
-        t["groups"] = {m: v["groups"] for m, v in mb.items()}
-        table[rid] = t
-
-    decisions = {}
-    # D1/D3/D4: who, per kind, per mechanism: all discriminating rows must class account|both.
-    kinds = {"cwd": ["F1c", "F2c", "F19a"], "log-create": ["F5l", "F19a"],
-             "log-existing": ["F6l", "F7l", "F12l", "F26l"], "groups": ["F14g", "F18g", "F20g"]}
-    for k, ids in kinds.items():
-        per = {}
-        for rid in ids:
-            for need, ms in (table.get(rid, {}).get("compare") or {}).items():
-                if k == "cwd" and need != "X" or k == "log-create" and need != "WX":
-                    continue
-                for m, c in ms.items():
-                    if m.startswith("_"):
-                        continue
-                    per.setdefault(m, []).append((rid, need, c["class"], c["discriminates"]))
-        verdict = {}
-        for m, lst in per.items():
-            disc = [x for x in lst if x[3]]
-            acct = all(x[2] in ("account", "both") for x in disc)
-            root = all(x[2] in ("root", "both") for x in disc)
-            verdict[m] = {"as_account": acct and bool(disc), "as_root": root and bool(disc),
-                          "discriminating_rows": disc, "all": lst}
-        decisions[k] = verdict
-    decisions["D2_ran_elsewhere"] = {r: table.get(r, {}).get("ran_elsewhere") for r in ("F1c", "F25c")}
-    decisions["D5_ran_without_log"] = {r: table.get(r, {}).get("ran_without_log")
-                                       for r in ("F5l", "F6l", "F21b", "F22l")}
-    decisions["flag_model"] = model
-    decisions["D8"] = {r: table.get(r, {}).get("compare") for r in ("F16l", "F17l")}
-    decisions["D9"] = extras.get("exfat")
-    decisions["selftest"] = extras.get("selftest")
-
-    out = {"problems": problems, "rows": table, "decisions": decisions}
-    with open(os.path.join(d, "aggregate.json"), "w") as f:
-        json.dump(out, f, indent=1, default=str)
-    md = ["| row | ran | outcome | opened fd1/fd2 | content | launchd | anomalies |", "|---|---|---|---|---|---|---|"]
-    for rid in ALL:
-        t = table.get(rid)
-        if not t:
-            continue
-        md.append(f"| {rid} | {t['ran']} | {t['outcome'] or t['status']} | {t.get('opened_fd1')}/{t.get('opened_fd2')} "
-                  f"| {t.get('content')} | {t['launchd']} | {len(t['anomalies'] or [])} |")
-    md.append("")
-    md.append("```json")
-    md.append(json.dumps({k: v for k, v in decisions.items() if k in ("flag_model", "D2_ran_elsewhere",
-                                                                     "D5_ran_without_log")}, default=str))
-    md.append("```")
-    if problems:
-        md.append(f"**problems:** {problems}")
-    text = "\n".join(md) + "\n"
-    summary = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary:
-        with open(summary, "a") as f:
-            f.write(text)
-    print(text)
-    return 1 if problems else 0
+    a = sys.argv[1:]
+    if len(a) == 2 and a[0] == "--check":
+        recs, bad = load(os.path.join(a[1], "*", "*.json"))
+        for b in bad:
+            print("MALFORMED", b)
+        print(f"{len(recs)} result files checked")
+        return 1 if bad or not recs else 0
+    if len(a) == 2 and a[0] == "report":
+        recs, bad = load(os.path.join(a[1], "*", "*.json"))
+        emit(report(recs, bad, "Step 0 probe: " + os.environ.get("PROBE_JOB", "job")), a[1])
+        return 1 if bad else 0
+    if len(a) == 3 and a[0] == "combine":
+        recs, bad = load(os.path.join(a[1], "*", "*", "*.json"))
+        emit(report(recs, bad, "Step 0 probe: all jobs"), a[2])
+        return 1 if bad else 0
+    print(__doc__)
+    return 2
 
 
 if __name__ == "__main__":

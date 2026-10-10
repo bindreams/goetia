@@ -4,6 +4,7 @@
 mod candidates;
 mod fixtures;
 mod lifecycle;
+mod step0;
 mod sys;
 
 use std::fs;
@@ -24,6 +25,7 @@ fn main() {
             args[6].parse().expect("bits"),
             Path::new(&args[7]),
         ),
+        Some("step0") => step0::main(&args[2..]),
         Some("selftest") => selftest(),
         Some("exfat") => exfat(&run_id),
         Some("ids") => {
@@ -31,7 +33,9 @@ fn main() {
             0
         }
         _ => {
-            eprintln!("usage: launchd-probe row <id> | access --as <name> <uid> <gid> <bits> <path> | selftest | exfat | ids");
+            eprintln!(
+                "usage: launchd-probe row <id> | access --as <name> <uid> <gid> <bits> <path> | selftest | exfat | ids"
+            );
             2
         }
     };
@@ -81,7 +85,7 @@ fn pipe() -> (i32, i32) {
 }
 
 /// The lifecycle's kernel assumptions, checked on this runner before any row is trusted.
-fn selftest() -> i32 {
+pub(crate) fn selftest() -> i32 {
     fs::create_dir_all("results").expect("results");
     let mut out = json!({});
     let mut ok = true;
@@ -196,7 +200,11 @@ fn selftest() -> i32 {
     let text = out.to_string();
     fs::write("results/selftest.json", &text).expect("write");
     println!("RESULT {text}");
-    if ok { 0 } else { 1 }
+    if ok {
+        0
+    } else {
+        1
+    }
 }
 
 // exfat (D9) ---------------------------------------------------------------------------------------
@@ -206,8 +214,20 @@ fn rename_excl_to_absent(dir: &Path) -> i32 {
     let z = dir.join("z");
     let _ = fs::create_dir(&x);
     let (cx, cz) = (sys::cpath(&x), sys::cpath(&z));
-    let r = unsafe { libc::renameatx_np(libc::AT_FDCWD, cx.as_ptr(), libc::AT_FDCWD, cz.as_ptr(), libc::RENAME_EXCL) };
-    if r == 0 { 0 } else { sys::errno() }
+    let r = unsafe {
+        libc::renameatx_np(
+            libc::AT_FDCWD,
+            cx.as_ptr(),
+            libc::AT_FDCWD,
+            cz.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if r == 0 {
+        0
+    } else {
+        sys::errno()
+    }
 }
 
 fn vol_caps(path: &Path) -> Value {
@@ -256,7 +276,10 @@ fn exfat(run_id: &str) -> i32 {
     out["apfs_tmp"] = json!({ "rename_excl_to_absent": rename_excl_to_absent(&base), "caps": vol_caps(&base) });
     let _ = fs::remove_dir_all(&base);
 
-    let create = fixtures::run("hdiutil", &["create", "-size", "64m", "-fs", "ExFAT", "-volname", "GPROBE", &dmg]);
+    let create = fixtures::run(
+        "hdiutil",
+        &["create", "-size", "64m", "-fs", "ExFAT", "-volname", "GPROBE", &dmg],
+    );
     out["create"] = json!(create);
     let attach = fixtures::run("hdiutil", &["attach", "-nobrowse", "-mountpoint", &mnt, &dmg]);
     out["attach"] = json!(attach);
@@ -278,5 +301,9 @@ fn exfat(run_id: &str) -> i32 {
     let text = out.to_string();
     fs::write("results/exfat.json", &text).expect("write");
     println!("RESULT {text}");
-    if ok { 0 } else { 1 }
+    if ok {
+        0
+    } else {
+        1
+    }
 }

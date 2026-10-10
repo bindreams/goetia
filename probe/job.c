@@ -3,9 +3,12 @@
  *
  * Usage: job STATUS CTRL N1 N2 [bits path]...
  *
- * Records fds 0-2 before anything else runs (C, not Rust: std reopens closed
- * fds 0-2 as /dev/null before main). Exit codes >= 200 are job-internal
- * failures (200 + step), never launchd's outcome.
+ * Records fds 0-15 before anything else runs (C, not Rust: std reopens closed
+ * fds 0-2 as /dev/null before main). After writing N1 to fd 1 it records the
+ * file offsets of fd 2 and fd 1 (Q2: equal offsets on a regular file mean one
+ * shared open file description). Records the public getiopolicy_np values.
+ * Exit codes >= 200 are job-internal failures (200 + step), never launchd's
+ * outcome.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -15,10 +18,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-static char line[PIPE_BUF + 1];
+#define NFDS 16
+
+static char line[4096];
 static size_t len;
 
 static void add(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -35,9 +41,9 @@ static void add(const char *fmt, ...) {
 
 int main(int argc, char **argv) {
 	/* Step 1: fds 0-2 exactly as launchd left them. */
-	int getfd[3], getfl[3], fd_errno[3], st_errno[3];
-	struct stat st[3];
-	for (int fd = 0; fd < 3; fd++) {
+	int getfd[NFDS], getfl[NFDS], fd_errno[NFDS], st_errno[NFDS];
+	struct stat st[NFDS];
+	for (int fd = 0; fd < NFDS; fd++) {
 		errno = 0;
 		getfd[fd] = fcntl(fd, F_GETFD);
 		getfl[fd] = fcntl(fd, F_GETFL);
@@ -56,6 +62,12 @@ int main(int argc, char **argv) {
 	int n1 = snprintf(buf, sizeof buf, "%s\n", argv[3]);
 	ssize_t w1 = write(1, buf, (size_t)n1);
 	int w1e = w1 < 0 ? errno : 0;
+	errno = 0;
+	off_t l2 = lseek(2, 0, SEEK_CUR);
+	int l2e = l2 < 0 ? errno : 0;
+	errno = 0;
+	off_t l1 = lseek(1, 0, SEEK_CUR);
+	int l1e = l1 < 0 ? errno : 0;
 	int n2 = snprintf(buf, sizeof buf, "%s\n", argv[4]);
 	ssize_t w2 = write(2, buf, (size_t)n2);
 	int w2e = w2 < 0 ? errno : 0;
@@ -67,9 +79,11 @@ int main(int argc, char **argv) {
 	int dot_errno = stat(".", &dot) == 0 ? 0 : errno;
 
 	add("ready pid=%d", (int)getpid());
-	for (int fd = 0; fd < 3; fd++) {
+	for (int fd = 0; fd < NFDS; fd++) {
 		if (fd_errno[fd]) {
-			add(" fd%d=err:%d", fd, fd_errno[fd]);
+			if (fd < 3) {
+				add(" fd%d=err:%d", fd, fd_errno[fd]);
+			}
 		} else if (st_errno[fd]) {
 			add(" fd%d=%d,%d,staterr:%d", fd, getfd[fd], getfl[fd], st_errno[fd]);
 		} else {
@@ -79,6 +93,37 @@ int main(int argc, char **argv) {
 		}
 	}
 	add(" w1=%zd,%d w2=%zd,%d", w1, w1e, w2, w2e);
+	add(" l1=%lld,%d l2=%lld,%d", (long long)l1, l1e, (long long)l2, l2e);
+	add(" n1len=%d", n1);
+	add(" iopol=");
+#define IOPOL(name, type) \
+	add("%s%s:%d", iopol_first ? "" : ",", name, getiopolicy_np(type, IOPOL_SCOPE_PROCESS)), iopol_first = 0
+	int iopol_first = 1;
+	IOPOL("disk", IOPOL_TYPE_DISK);
+#ifdef IOPOL_TYPE_VFS_ATIME_UPDATES
+	IOPOL("atime", IOPOL_TYPE_VFS_ATIME_UPDATES);
+#endif
+#ifdef IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES
+	IOPOL("dataless", IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES);
+#endif
+#ifdef IOPOL_TYPE_VFS_TRIGGER_RESOLVE
+	IOPOL("trigger", IOPOL_TYPE_VFS_TRIGGER_RESOLVE);
+#endif
+#ifdef IOPOL_TYPE_VFS_CONTENT_PROTECTION
+	IOPOL("contentprot", IOPOL_TYPE_VFS_CONTENT_PROTECTION);
+#endif
+#ifdef IOPOL_TYPE_VFS_IGNORE_PERMISSIONS
+	IOPOL("ignoreperm", IOPOL_TYPE_VFS_IGNORE_PERMISSIONS);
+#endif
+#ifdef IOPOL_TYPE_VFS_SKIP_MTIME_UPDATE
+	IOPOL("skipmtime", IOPOL_TYPE_VFS_SKIP_MTIME_UPDATE);
+#endif
+#ifdef IOPOL_TYPE_VFS_ALLOW_LOW_SPACE_WRITES
+	IOPOL("lowspace", IOPOL_TYPE_VFS_ALLOW_LOW_SPACE_WRITES);
+#endif
+#ifdef IOPOL_TYPE_VFS_DISALLOW_RW_FOR_O_EVTONLY
+	IOPOL("evtonly", IOPOL_TYPE_VFS_DISALLOW_RW_FOR_O_EVTONLY);
+#endif
 	if (dot_errno) {
 		add(" dot=err:%d", dot_errno);
 	} else {

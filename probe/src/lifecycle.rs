@@ -23,26 +23,34 @@ fn phase(id: &str, s: &str) {
     let line = format!("phase={s}\n");
     print!("{line}");
     let _ = std::io::stdout().flush();
-    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(format!("results/{id}.phase")) {
+    if let Ok(mut f) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(format!("results/{id}.phase"))
+    {
         let _ = f.write_all(line.as_bytes());
     }
 }
 
 // FIFOs -------------------------------------------------------------------------------------------
 
-fn open_raw(p: &Path, flags: i32) -> Result<OwnedFd, i32> {
+pub(crate) fn open_raw(p: &Path, flags: i32) -> Result<OwnedFd, i32> {
     let c = sys::cpath(p);
     let fd = unsafe { libc::open(c.as_ptr(), flags | libc::O_CLOEXEC) };
-    if fd < 0 { Err(sys::errno()) } else { Ok(unsafe { OwnedFd::from_raw_fd(fd) }) }
+    if fd < 0 {
+        Err(sys::errno())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
 }
 
 /// A FIFO with a held non-blocking reader and a held writer (H4a/b).
-struct Fifo {
-    r: OwnedFd,
-    w: Option<OwnedFd>,
+pub(crate) struct Fifo {
+    pub r: OwnedFd,
+    pub w: Option<OwnedFd>,
 }
 
-fn make_fifo(p: &Path, anomalies: &mut Vec<String>) -> Option<Fifo> {
+pub(crate) fn make_fifo(p: &Path, anomalies: &mut Vec<String>) -> Option<Fifo> {
     let c = sys::cpath(p);
     if unsafe { libc::mkfifo(c.as_ptr(), 0o666) } != 0 {
         anomalies.push(format!("mkfifo {}: {}", p.display(), sys::errno()));
@@ -64,7 +72,7 @@ fn make_fifo(p: &Path, anomalies: &mut Vec<String>) -> Option<Fifo> {
 }
 
 /// Everything readable right now, never blocking.
-fn drain(fd: &OwnedFd, into: &mut Vec<u8>) {
+pub(crate) fn drain(fd: &OwnedFd, into: &mut Vec<u8>) {
     let mut buf = [0u8; 4096];
     loop {
         let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
@@ -77,52 +85,60 @@ fn drain(fd: &OwnedFd, into: &mut Vec<u8>) {
 
 // Plist / launchctl --------------------------------------------------------------------------------
 
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 /// goetia's `restart: never` shape and key order (`generate.rs:330-356`).
 fn plist(label: &str, args: &[String], cwd: Option<&Path>, user: &str, log: Option<&Path>) -> String {
-    let mut d = format!("<key>Label</key><string>{}</string>\n<key>ProgramArguments</key><array>", esc(label));
+    let mut d = format!(
+        "<key>Label</key><string>{}</string>\n<key>ProgramArguments</key><array>",
+        esc(label)
+    );
     for a in args {
         d += &format!("<string>{}</string>", esc(a));
     }
     d += "</array>\n";
     if let Some(c) = cwd {
-        d += &format!("<key>WorkingDirectory</key><string>{}</string>\n", esc(&c.to_string_lossy()));
+        d += &format!(
+            "<key>WorkingDirectory</key><string>{}</string>\n",
+            esc(&c.to_string_lossy())
+        );
     }
     d += &format!("<key>UserName</key><string>{}</string>\n", esc(user));
     if let Some(l) = log {
         let l = esc(&l.to_string_lossy());
-        d += &format!("<key>StandardOutPath</key><string>{l}</string>\n<key>StandardErrorPath</key><string>{l}</string>\n");
+        d += &format!(
+            "<key>StandardOutPath</key><string>{l}</string>\n<key>StandardErrorPath</key><string>{l}</string>\n"
+        );
     }
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n{d}</dict>\n</plist>\n"
     )
 }
 
-fn field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     let prefix = format!("{key} = ");
     text.lines().find_map(|l| l.trim_start().strip_prefix(prefix.as_str()))
 }
 
-fn print_job(label: &str) -> String {
+pub(crate) fn print_job(label: &str) -> String {
     fixtures::run("launchctl", &["print", &format!("system/{label}")]).1
 }
 
 // kqueue ---------------------------------------------------------------------------------------------
 
-struct Kq(OwnedFd);
+pub(crate) struct Kq(OwnedFd);
 
 impl Kq {
-    fn new() -> Kq {
+    pub fn new() -> Kq {
         let fd = unsafe { libc::kqueue() };
         assert!(fd >= 0, "kqueue");
         Kq(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
     /// Register with `EV_RECEIPT`; returns the per-change errno (0 = attached).
-    fn add(&self, ident: usize, filter: i16, fflags: u32) -> i64 {
+    pub fn add(&self, ident: usize, filter: i16, fflags: u32) -> i64 {
         let ch = libc::kevent {
             ident,
             filter,
@@ -140,7 +156,7 @@ impl Kq {
     }
 
     /// Next batch of events; `None` when `bound` elapsed (F29 only).
-    fn wait(&self, bound: Option<Duration>) -> Option<Vec<libc::kevent>> {
+    pub fn wait(&self, bound: Option<Duration>) -> Option<Vec<libc::kevent>> {
         let mut out: [libc::kevent; 4] = unsafe { std::mem::zeroed() };
         let ts = bound.map(|b| libc::timespec {
             tv_sec: b.as_secs() as libc::time_t,
@@ -219,7 +235,9 @@ fn observe(p: &Path) -> LogObs {
     o.rdev = Some(m.rdev());
     // Content only for regular files (H4); FIFOs go through the held reader.
     if ft.is_file() {
-        o.content = fs::read(p).ok().map(|b| String::from_utf8_lossy(&b[..b.len().min(65536)]).into_owned());
+        o.content = fs::read(p)
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b[..b.len().min(65536)]).into_owned());
     }
     o.ls = Some(fixtures::run("ls", &["-leOd", &p.to_string_lossy()]).1);
     o
@@ -228,7 +246,15 @@ fn observe(p: &Path) -> LogObs {
 fn cwd_from_kernel(pid: i32) -> Value {
     let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as i32;
-    let n = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDVNODEPATHINFO, 0, (&mut info as *mut libc::proc_vnodepathinfo).cast(), size) };
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            (&mut info as *mut libc::proc_vnodepathinfo).cast(),
+            size,
+        )
+    };
     if n != size {
         return json!({ "error": format!("proc_pidinfo returned {n}, want {size}, errno {}", sys::errno()) });
     }
@@ -277,17 +303,35 @@ pub fn run_row(id: &str, run_id: &str) -> i32 {
         &bin.join("launchd-probe"),
         &spec.acct,
         &[
-            Target { need: "Exec".into(), bits: sys::X, path: bin.join("job") },
-            Target { need: "Write".into(), bits: sys::W, path: sync.join("STATUS") },
-            Target { need: "Read".into(), bits: sys::R, path: sync.join("CTRL") },
+            Target {
+                need: "Exec".into(),
+                bits: sys::X,
+                path: bin.join("job"),
+            },
+            Target {
+                need: "Write".into(),
+                bits: sys::W,
+                path: sync.join("STATUS"),
+            },
+            Target {
+                need: "Read".into(),
+                bits: sys::R,
+                path: sync.join("CTRL"),
+            },
         ],
     );
-    if reach.verdicts.iter().any(|v| !matches!(v, candidates::Verdict::Errno(0))) {
+    if reach
+        .verdicts
+        .iter()
+        .any(|v| !matches!(v, candidates::Verdict::Errno(0)))
+    {
         anomalies.push(format!("account cannot reach job/STATUS/CTRL: {:?}", reach.verdicts));
     }
 
     let log_reader = if spec.hold_log_reader {
-        spec.log.as_deref().and_then(|l| open_raw(l, libc::O_RDONLY | libc::O_NONBLOCK).ok())
+        spec.log
+            .as_deref()
+            .and_then(|l| open_raw(l, libc::O_RDONLY | libc::O_NONBLOCK).ok())
     } else {
         None
     };
@@ -299,7 +343,11 @@ pub fn run_row(id: &str, run_id: &str) -> i32 {
     if !spec.targets.is_empty() {
         mechs.push(candidates::root(&spec.targets));
         mechs.push(candidates::thread(&spec.acct, &spec.targets));
-        mechs.push(candidates::helper(&bin.join("launchd-probe"), &spec.acct, &spec.targets));
+        mechs.push(candidates::helper(
+            &bin.join("launchd-probe"),
+            &spec.acct,
+            &spec.targets,
+        ));
         mechs.push(candidates::fork_initgroups(&spec.acct, &spec.targets));
         if spec.run_static {
             mechs.push(candidates::static_control(&spec.acct, &spec.targets));
@@ -352,7 +400,10 @@ pub fn run_row(id: &str, run_id: &str) -> i32 {
         None => {
             phase(id, "bound-fired-in-kickstart");
             rec["f29_bound"] = json!(bound_evidence(id, &label, ks.id() as i32));
-            released_log = spec.log.as_deref().and_then(|l| open_raw(l, libc::O_RDONLY | libc::O_NONBLOCK).ok());
+            released_log = spec
+                .log
+                .as_deref()
+                .and_then(|l| open_raw(l, libc::O_RDONLY | libc::O_NONBLOCK).ok());
             phase(id, "released-log-fifo");
             wait_child(&mut ks, None).expect("kickstart exit")
         }
@@ -363,7 +414,10 @@ pub fn run_row(id: &str, run_id: &str) -> i32 {
     ks.stderr.take().unwrap().read_to_string(&mut ks_err).ok();
     rec["kickstart"] = json!({ "status": format!("{ks_status:?}"), "stdout": ks_out, "stderr": ks_err });
     let pid = ks_out.strip_suffix('\n').and_then(|d| d.parse::<i32>().ok());
-    phase(id, &format!("post-kickstart pid={}", pid.map_or("none".into(), |p| p.to_string())));
+    phase(
+        id,
+        &format!("post-kickstart pid={}", pid.map_or("none".into(), |p| p.to_string())),
+    );
     let Some(pid) = pid else {
         rec["outcome"] = json!({ "spawn_refused": true, "print": print_job(&label) });
         if spec.must_run {
@@ -410,7 +464,10 @@ pub fn run_row(id: &str, run_id: &str) -> i32 {
                 let Some(evs) = kq.wait(bound) else {
                     phase(id, "bound-fired-in-wait");
                     rec["f29_bound"] = json!(bound_evidence(id, &label, pid));
-                    released_log = spec.log.as_deref().and_then(|l| open_raw(l, libc::O_RDONLY | libc::O_NONBLOCK).ok());
+                    released_log = spec
+                        .log
+                        .as_deref()
+                        .and_then(|l| open_raw(l, libc::O_RDONLY | libc::O_NONBLOCK).ok());
                     phase(id, "released-log-fifo");
                     bound = None;
                     continue;
@@ -479,7 +536,10 @@ pub fn run_row(id: &str, run_id: &str) -> i32 {
     if id == "F24l" {
         rec["dev_null"] = json!(observe(Path::new("/dev/null")));
     }
-    for (name, fd) in [("log_reader", log_reader.as_ref()), ("released_reader", released_log.as_ref())] {
+    for (name, fd) in [
+        ("log_reader", log_reader.as_ref()),
+        ("released_reader", released_log.as_ref()),
+    ] {
         if let Some(fd) = fd {
             let mut b = Vec::new();
             drain(fd, &mut b);
@@ -495,7 +555,11 @@ fn bound_evidence(id: &str, label: &str, pid: i32) -> Value {
     let p = print_job(label);
     let job_pid = field(&p, "pid").map(str::trim).map(String::from);
     let mut out = json!({ "print": p });
-    for (name, target) in [("kickstart_or_job", Some(pid.to_string())), ("job", job_pid), ("launchd", Some("1".into()))] {
+    for (name, target) in [
+        ("kickstart_or_job", Some(pid.to_string())),
+        ("job", job_pid),
+        ("launchd", Some("1".into())),
+    ] {
         if let Some(t) = target {
             let file = format!("results/{id}.sample.{name}.txt");
             out[name] = json!(fixtures::run("sample", &[&t, "1", "-file", &file]));
@@ -524,7 +588,9 @@ fn finish(
                 f,
                 "| {id} | {} | {} | {} |",
                 rec["outcome"],
-                rec["ready"].as_str().map_or("-", |r| if r.len() > 80 { &r[..80] } else { r }),
+                rec["ready"]
+                    .as_str()
+                    .map_or("-", |r| if r.len() > 80 { &r[..80] } else { r }),
                 rec["anomalies"]
             );
         }
@@ -534,7 +600,11 @@ fn finish(
     if !td.is_empty() {
         eprintln!("teardown failures: {td:?}");
     }
-    if anomalies.is_empty() && td.is_empty() { 0 } else { 1 }
+    if anomalies.is_empty() && td.is_empty() {
+        0
+    } else {
+        1
+    }
 }
 
 fn teardown(spec: &Spec, row: &Path, job: Option<(&str, &Path)>) -> Vec<String> {
@@ -554,7 +624,10 @@ fn teardown(spec: &Spec, row: &Path, job: Option<(&str, &Path)>) -> Vec<String> 
         }
     }
     let fx = row.join("fx");
-    let (ok, out) = fixtures::run("chflags", &["-R", "nouchg,noschg,nouappnd,nosappnd", &fx.to_string_lossy()]);
+    let (ok, out) = fixtures::run(
+        "chflags",
+        &["-R", "nouchg,noschg,nouappnd,nosappnd", &fx.to_string_lossy()],
+    );
     if !ok {
         errs.push(format!("chflags: {out}"));
     }
