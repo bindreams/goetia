@@ -215,7 +215,12 @@ pub fn b3(ctx: &mut Ctx) {
         return ctx.emit(r);
     }
     let label = ctx.label("b3");
-    let needles = vec![label.clone(), dir.to_string_lossy().into_owned()];
+    // `{label}.plist` and the path without `/private`: BTM prints `file:///var/db/...`, and a bare
+    // label would also match `...b3ctl`.
+    let needles = vec![
+        format!("{label}.plist"),
+        dir.to_string_lossy().trim_start_matches("/private").to_string(),
+    ];
     // Control first: the same sentinel from /Library/LaunchDaemons is Ran.
     let ctl = launch::launch(ctx, &JobSpec::new("b3ctl", NOBODY, Path::new("/Library/LaunchDaemons")));
     if ctl.verdict != "ran" {
@@ -475,12 +480,7 @@ pub fn b5(ctx: &mut Ctx) {
     let (label, ctl_label) = (ctx.label("b5"), ctx.label("b5ctl"));
     let path = PathBuf::from(format!("/Library/LaunchDaemons/{label}.plist"));
     let ctl_path = PathBuf::from(format!("/Library/LaunchDaemons/{ctl_label}.plist"));
-    let needles = vec![
-        label.clone(),
-        path.to_string_lossy().into_owned(),
-        ctl_label.clone(),
-        ctl_path.to_string_lossy().into_owned(),
-    ];
+    let needles = vec![format!("{label}.plist"), format!("{ctl_label}.plist")];
     for (l, p) in [(&label, &path), (&ctl_label, &ctl_path)] {
         ctx.state("label", l);
         ctx.state("plist", &p.to_string_lossy());
@@ -563,11 +563,11 @@ pub fn btm_final(ctx: &mut Ctx) {
     ));
     let dir = vardir(ctx).join("daemons");
     let needles = vec![
-        ctx.label("b3"),
-        dir.to_string_lossy().into_owned(),
-        ctx.label("b3ctl"),
-        ctx.label("b5"),
-        ctx.label("b5ctl"),
+        format!("{}.plist", ctx.label("b3")),
+        dir.to_string_lossy().trim_start_matches("/private").to_string(),
+        format!("{}.plist", ctx.label("b3ctl")),
+        format!("{}.plist", ctx.label("b5")),
+        format!("{}.plist", ctx.label("b5ctl")),
     ];
     let snap = btm_snapshot(ctx, "B3.final", &needles);
     let staged_mentions = needles[..2]
