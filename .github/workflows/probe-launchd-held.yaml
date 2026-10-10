@@ -1,0 +1,56 @@
+name: Probe launchd held launch side effects
+
+# Throwaway measurement (never merged): does bootstrapping a job from a plist
+# OUTSIDE /Library/LaunchDaemons under a fresh label, kickstarting it suspended
+# (-s) and booting it out leave any Background Task Management (BTM) entry,
+# notification evidence, or residue? Runs only on disposable CI runners.
+
+on:
+  push:
+    branches: [probe/launchd-held]
+
+permissions: {}
+
+jobs:
+  held:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - name: Measure
+        shell: bash
+        run: |
+          set -u
+          sw_vers
+          label="dev.goetia.probe.held.$GITHUB_RUN_ID.$RANDOM"
+          work="$(mktemp -d)"
+          plist="$work/$label.plist"
+          cat > "$plist" <<PL
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>Label</key><string>$label</string>
+            <key>ProgramArguments</key><array><string>/usr/bin/true</string></array>
+            <key>StandardOutPath</key><string>$work/out.log</string>
+            <key>StandardErrorPath</key><string>$work/err.log</string>
+            <key>WorkingDirectory</key><string>$work</string>
+          </dict></plist>
+          PL
+          sed -i '' 's/^          //' "$plist"
+          sudo chown root:wheel "$plist"; sudo chmod 644 "$plist"
+          sudo sfltool dumpbtm > "$work/btm-before.txt" 2>&1; echo "dumpbtm-before rc=$?"
+          echo "== bootstrap"; sudo launchctl bootstrap system "$plist"; echo "rc=$?"
+          echo "== kickstart -s"; sudo launchctl kickstart -s "system/$label"; echo "rc=$?"
+          sudo launchctl print "system/$label" | sed -n '1,40p'
+          echo "== bootout"; sudo launchctl bootout "system/$label"; echo "rc=$?"
+          sudo sfltool dumpbtm > "$work/btm-after.txt" 2>&1; echo "dumpbtm-after rc=$?"
+          echo "== btm diff (lines mentioning the label or added)"
+          diff "$work/btm-before.txt" "$work/btm-after.txt" | head -60; echo "diff rc=${PIPESTATUS[0]}"
+          grep -c "$label" "$work/btm-after.txt" || true
+          echo "== residue in work dir"; ls -la "$work"
+          echo "== BTM log lines mentioning the label or plist path (unified log)"
+          sudo log show --style compact --predicate "subsystem BEGINSWITH \"com.apple.backgroundtaskmanagement\" OR eventMessage CONTAINS \"$label\"" --last 5m 2>/dev/null | grep -i -E "$label|$work|notif" | head -40
+          echo "== label still loaded?"; sudo launchctl print "system/$label" >/dev/null 2>&1; echo "print rc=$?"
