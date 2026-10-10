@@ -27,6 +27,11 @@ import winreg
 
 FAIL_BOUND_MS = 60_000
 
+# Every notifier object lives for the whole process: the SCM may deliver a
+# callback for a registration long after the step that made it (for example
+# when its handle closes), and that callback must find live memory.
+KEEP_ALIVE = []
+
 advapi = ctypes.WinDLL("advapi32", use_last_error=True)
 kernel = ctypes.WinDLL("kernel32", use_last_error=True)
 
@@ -196,10 +201,13 @@ class DeletedWatch:
         self.on_seen = None
         self.at_seen = None
         self.cb = NOTIFY_CB(self._cb)
+        self.keep = []
+        KEEP_ALIVE.append(self)
         self.arm()
 
     def arm(self):
         self.n = SERVICE_NOTIFY_2W()
+        self.keep.append(self.n)
         self.n.dwVersion = 2
         self.n.pfnNotifyCallback = self.cb
         rc = advapi.NotifyServiceStatusChangeW(self.scm, SERVICE_NOTIFY_DELETED,
@@ -345,6 +353,7 @@ class Recorder:
         self.cb = NOTIFY_CB(self._cb)
         self.n = None
         self.keep = []  # every struct ever registered stays alive
+        KEEP_ALIVE.append(self)
 
     def arm(self):
         n = SERVICE_NOTIFY_2W()
