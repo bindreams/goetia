@@ -47,6 +47,15 @@ def cell(r):
     o = r.get("observed") or {}
     i = r["id"]
     v = r["verdict"]
+    if v == "blocked":
+        pf = o.get("phase_file")
+        last = "?"
+        try:
+            with open(os.path.join(os.path.dirname(r["_path"]), pf)) as f:
+                last = f.read().strip().splitlines()[-1]
+        except Exception:  # noqa: BLE001
+            pass
+        return "BLOCKED (no verdict before the step timeout); last phase: " + last
     if i == "B1":
         return "nlink " + ",".join(str(x.get("nlink")) for x in o.get("cumulative", []))
     if i == "B2":

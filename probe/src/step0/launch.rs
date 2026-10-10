@@ -264,25 +264,30 @@ pub fn launch(ctx: &Ctx, spec: &JobSpec) -> Outcome {
         out.anomalies.push(e);
         return out;
     }
+    ctx.phase(&spec.suffix, "bootstrap-started");
     let boot = cmd("launchctl", &["bootstrap", "system", &plist_path.to_string_lossy()]);
+    ctx.phase(&spec.suffix, &format!("bootstrap-returned code={:?}", boot.code));
     out.bootstrap = boot.to_json();
     if !boot.ok() {
         out.verdict = "bootstrap-refused".into();
     } else {
-        let first = watch(&label, &mut sync, spec.on_ready);
+        let ph = |w: &str| ctx.phase(&spec.suffix, w);
+        let first = watch(&label, &mut sync, spec.on_ready, &ph);
         out.verdict = first.verdict.clone();
         out.exit_source = first.exit_source.clone();
         out.first_print = first.first_print.clone();
         out.anomalies.extend(first.anomalies.iter().cloned());
         out.first = Some(first);
         if spec.second {
-            let again = watch(&label, &mut sync, None);
+            let ph2 = |w: &str| ctx.phase(&spec.suffix, &format!("second: {w}"));
+            let again = watch(&label, &mut sync, None, &ph2);
             out.anomalies
                 .extend(again.anomalies.iter().map(|a| format!("second launch: {a}")));
             out.again = Some(again);
         }
     }
     drop(sync);
+    ctx.phase(&spec.suffix, &format!("bootout verdict={}", out.verdict));
     let bo = cmd("launchctl", &["bootout", &format!("system/{label}")]);
     let gone = bo.both().contains("No such process")
         || bo.both().contains("Could not find service")
@@ -297,7 +302,7 @@ pub fn launch(ctx: &Ctx, spec: &JobSpec) -> Outcome {
 }
 
 /// `kickstart -p`, attach, wait for the ready line and the exit. Never retried.
-fn watch(label: &str, sync: &mut Sync, on_ready: Option<&dyn Fn() -> Value>) -> Run {
+fn watch(label: &str, sync: &mut Sync, on_ready: Option<&dyn Fn() -> Value>, phase: &dyn Fn(&str)) -> Run {
     let mut run = Run {
         exit_source: "n/a".into(),
         ready_parsed: Value::Null,
@@ -310,6 +315,7 @@ fn watch(label: &str, sync: &mut Sync, on_ready: Option<&dyn Fn() -> Value>) -> 
             run.anomalies.push("reopen CTRL writer".into());
         }
     }
+    phase("kickstart-started");
     let mut ks = Command::new("launchctl")
         .args(["kickstart", "-p", &format!("system/{label}")])
         .stdout(Stdio::piped())
@@ -321,6 +327,7 @@ fn watch(label: &str, sync: &mut Sync, on_ready: Option<&dyn Fn() -> Value>) -> 
     ks.stdout.take().unwrap().read_to_string(&mut so).ok();
     ks.stderr.take().unwrap().read_to_string(&mut se).ok();
     run.kickstart = json!({ "status": format!("{st:?}"), "stdout": so, "stderr": se });
+    phase(&format!("kickstart-returned stdout={so:?}"));
     let Some(pid) = so.strip_suffix('\n').and_then(|d| d.parse::<i32>().ok()) else {
         run.verdict = "spawn-refused".into();
         run.first_print = Some(print_summary(&print_job(label)));
@@ -359,6 +366,7 @@ fn watch(label: &str, sync: &mut Sync, on_ready: Option<&dyn Fn() -> Value>) -> 
             }
         }
     }
+    phase(&format!("attached receipt={proc_r} waiting={waiting}"));
     if waiting {
         loop {
             let evs = kq.wait(None).unwrap_or_default();
@@ -376,6 +384,7 @@ fn watch(label: &str, sync: &mut Sync, on_ready: Option<&dyn Fn() -> Value>) -> 
                     run.print_loaded = Some(json!({ "print": print_job(label) }));
                     run.on_ready = on_ready.map(|f| f());
                     run.ready = Some(line);
+                    phase("ready; releasing");
                     sync.ctrl.w = None; // release: the job's read() sees EOF
                 }
             }

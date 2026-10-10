@@ -215,6 +215,7 @@ pub fn run(ctx: &mut Ctx, id: &str) {
         res.observed = json!({ "path": r.path, "exists": false, "user": r.user });
         return ctx.emit(res);
     }
+    ctx.provisional(&res, &r.id.to_lowercase());
     let mut spec = JobSpec::new(&r.id.to_lowercase(), r.user, Path::new("/Library/LaunchDaemons"));
     match r.usage {
         Use::Log => spec.log = Some(path.to_path_buf()),

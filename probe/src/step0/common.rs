@@ -95,6 +95,33 @@ impl Ctx {
         f.sync_all().expect("state sync");
     }
 
+    /// Appends a phase line for a launch to `<results>/<suffix>.phase` and stdout, so a step that
+    /// is cut off by its timeout still says how far it got.
+    pub fn phase(&self, suffix: &str, what: &str) {
+        println!("phase {suffix}: {what}");
+        if let Ok(mut f) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.results.join(format!("{suffix}.phase")))
+        {
+            let _ = writeln!(f, "{what}");
+        }
+    }
+
+    /// Writes a `blocked` record for `r` that the real result replaces. If the step is cut off by
+    /// its human-facing timeout, this is what survives. Not counted as an anomaly of this step.
+    pub fn provisional(&self, r: &Res, phase_suffix: &str) {
+        let mut p = Res::new(&r.id, r.group, &r.question);
+        p.expected = r.expected.clone();
+        p.verdict = "blocked".into();
+        p.observed =
+            json!({ "phase_file": format!("{phase_suffix}.phase"), "note": "no verdict before the step ended" });
+        p.anomalies =
+            vec!["no verdict before the step's timeout-minutes (the failure bound): see the phase file".into()];
+        let file = self.results.join(format!("{}.json", p.id));
+        fs::write(&file, p.to_json(&self.os).to_string()).unwrap_or_else(|e| panic!("write {}: {e}", file.display()));
+    }
+
     pub fn emit(&mut self, mut r: Res) {
         self.anomalies += r.anomalies.len();
         let doc = r.to_json(&self.os);

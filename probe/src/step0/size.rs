@@ -58,7 +58,12 @@ fn trial(ctx: &mut Ctx, dir: &Path, n: usize, size: u64) -> Result<Trial, String
     let path = dir.join(format!("{label}.plist"));
     ctx.state("label", &label);
     println!("trial {n}: {size} bytes (started)");
+    let mut pending = Res::new(&format!("B6.{size}"), "B", &["B0 Q-S6 (the cap)"]);
+    pending.observed = json!({ "size": size });
+    ctx.phase(&format!("b6t{n}"), &format!("write {size} bytes"));
+    ctx.provisional(&pending, &format!("b6t{n}"));
     write_sized(&path, &label, size)?;
+    ctx.phase(&format!("b6t{n}"), "bootstrap-started");
     let actual = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     let t = Instant::now();
     let boot = cmd("launchctl", &["bootstrap", "system", &path.to_string_lossy()]);

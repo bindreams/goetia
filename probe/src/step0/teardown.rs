@@ -200,18 +200,7 @@ pub fn run(ctx: &Ctx) -> i32 {
         }
     }
 
-    // 2. /etc/exports and nfsd.
-    if let Some(mode) = st.last("exports") {
-        if let Err(e) = restore_exports(&st, mode) {
-            say(&format!("exports: {e}"));
-            red = true;
-        }
-        if st.last("nfsd_running_before") == Some("0") {
-            // stopped below
-        } else {
-            let _ = cmd("nfsd", &["update"]);
-        }
-    }
+    // 2. nfsd first (it reads /etc/exports), then /etc/exports.
     if st.last("nfsd_touched").is_some() {
         if st.last("nfsd_running_before") == Some("0") {
             let o = cmd("nfsd", &["stop"]);
@@ -220,10 +209,23 @@ pub fn run(ctx: &Ctx) -> i32 {
         if st.last("nfsd_enabled_before") == Some("0") {
             let o = cmd("nfsd", &["disable"]);
             say(&format!("nfsd disable: {:?} {}", o.code, o.both().trim()));
-            if cmd("nfsd", &["status"]).ok() {
-                say("nfsd is still enabled after disable");
+            let disabled = cmd("launchctl", &["print-disabled", "system"])
+                .stdout
+                .lines()
+                .any(|l| l.contains("com.apple.nfsd") && l.contains("disabled") && !l.contains("enabled"));
+            if !disabled {
+                say("nfsd is not listed as disabled after nfsd disable");
                 red = true;
             }
+        }
+    }
+    if let Some(mode) = st.last("exports") {
+        if let Err(e) = restore_exports(&st, mode) {
+            say(&format!("exports: {e}"));
+            red = true;
+        }
+        if st.last("nfsd_running_before") == Some("1") {
+            let _ = cmd("nfsd", &["update"]);
         }
     }
 

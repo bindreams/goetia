@@ -37,6 +37,7 @@ fn q1(ctx: &mut Ctx, id: &str, acl: &str, expect: &str) {
     let before = ls(&parent);
     let log2 = log.clone();
     let created = move || json!({ "log_ls": ls(&log2) });
+    ctx.provisional(&r, &id.to_lowercase());
     let mut spec = JobSpec::new(&id.to_lowercase(), "nobody", Path::new("/Library/LaunchDaemons"));
     spec.log = Some(log.clone());
     spec.second = true;
@@ -73,6 +74,7 @@ fn q2(ctx: &mut Ctx) {
         r.anomaly(e);
         return ctx.emit(r);
     }
+    ctx.provisional(&r, "q2");
     let mut spec = JobSpec::new("q2", "nobody", Path::new("/Library/LaunchDaemons"));
     spec.log = Some(parent.join("out.log"));
     let o = launch::launch(ctx, &spec);
