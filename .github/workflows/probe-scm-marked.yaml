@@ -1,0 +1,27 @@
+name: Probe SCM marked-for-deletion
+
+# Throwaway measurement (never merged): how the Windows SCM presents a
+# service that is marked for deletion while a handle is held. See
+# probe/scm_marked.py for the questions.
+
+on:
+  push:
+    branches: [probe/scm-marked]
+
+permissions: {}
+
+jobs:
+  measure:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Measure
+        shell: pwsh
+        run: python -I probe/scm_marked.py
