@@ -474,6 +474,76 @@ def start_pending_probe():
     advapi.DeleteService(h)
     advapi.CloseServiceHandle(h)
 
+
+SERVICE_NOTIFY_STOPPED = 0x1
+SERVICE_NOTIFY_RUNNING = 0x8
+SERVICE_STOP = 0x20
+DELETE_ACCESS = 0x10000
+
+
+def state_rearm_probe(binpath):
+    """Service-handle state notifications on an already-STOPPED service:
+    which arms queue a callback immediately?"""
+    print("== state re-arm probe", flush=True)
+    full = advapi.OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS)
+    name = "goetia-probe-st"
+    h, e = create(full, name, binpath)
+    if not h:
+        raise SystemExit(f"create {name}: {e}")
+    r = Recorder(h, SERVICE_NOTIFY_STOPPED)
+    say("T1 arm STOPPED on stopped svc: rc / immediate", (r.arm(), r.immediate()))
+    say("T2 re-arm STOPPED, same handle: rc / immediate", (r.arm(), r.immediate()))
+    r.mask = SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_STOPPED
+    say("T3 arm RUNNING|STOPPED, same handle: rc / immediate",
+        (r.arm(), r.immediate()))
+    h2 = advapi.OpenServiceW(full, name, SERVICE_ALL_ACCESS)
+    r2 = Recorder(h2, SERVICE_NOTIFY_STOPPED)
+    say("T4 fresh handle, arm STOPPED: rc / immediate", (r2.arm(), r2.immediate()))
+    advapi.CloseServiceHandle(h2)
+    advapi.DeleteService(h)
+    advapi.CloseServiceHandle(h)
+
+
+def access_probe():
+    """Does a protected service deny STOP|DELETE to an elevated admin at
+    open time, while QUERY_STATUS succeeds? Opens and closes only."""
+    print("== access probe", flush=True)
+    full = advapi.OpenSCManagerW(None, None, SC_MANAGER_CONNECT)
+    for name in ("WinDefend", "wuauserv", "TrustedInstaller"):
+        for label, acc in (("QUERY_STATUS", SERVICE_QUERY_STATUS),
+                           ("QUERY_STATUS|STOP|DELETE",
+                            SERVICE_QUERY_STATUS | SERVICE_STOP | DELETE_ACCESS),
+                           ("QUERY_STATUS|STOP", SERVICE_QUERY_STATUS | SERVICE_STOP)):
+            h = advapi.OpenServiceW(full, name, acc)
+            res = "success" if h else f"error {err()}"
+            if h:
+                advapi.CloseServiceHandle(h)
+            say(f"A {name} {label}", res)
+        out = subprocess.run(["sc.exe", "sdshow", name], capture_output=True,
+                             text=True)
+        say(f"A {name} sdshow", " ".join(out.stdout.split()))
+
+
+def orphan_key_probe():
+    """A Services\\<id> key with no SCM record: what does the SCM answer?"""
+    print("== orphan key probe", flush=True)
+    name = "goetia-probe-orphan"
+    path = rf"SYSTEM\CurrentControlSet\Services\{name}\Parameters"
+    k = winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, path, 0,
+                           winreg.KEY_WRITE)
+    winreg.SetValueEx(k, "Marker", 0, winreg.REG_SZ, "probe")
+    winreg.CloseKey(k)
+    full = advapi.OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS)
+    say("O1 OpenServiceW on orphan key", open_result(full, name))
+    say("O2 enumeration", enum_lists(full, name))
+    out = subprocess.run(["sc.exe", "query", name], capture_output=True,
+                         text=True)
+    say("O3 sc query", (out.returncode, " ".join(out.stdout.split())))
+    winreg.DeleteKey(winreg.HKEY_LOCAL_MACHINE, path)
+    winreg.DeleteKey(winreg.HKEY_LOCAL_MACHINE,
+                     rf"SYSTEM\CurrentControlSet\Services\{name}")
+    say("O4 key after cleanup", key_state(name))
+
 def main():
     if len(sys.argv) > 2 and sys.argv[1] == "hold":
         holder(sys.argv[2])
@@ -489,6 +559,9 @@ def main():
     scenario(scm, "none-stopped", stopped_bin, "none", run=False)
     rearm_probe(stopped_bin)
     start_pending_probe()
+    state_rearm_probe(stopped_bin)
+    access_probe()
+    orphan_key_probe()
 
 
 if __name__ == "__main__":
