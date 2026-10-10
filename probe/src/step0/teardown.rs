@@ -215,11 +215,15 @@ pub fn run(ctx: &Ctx) -> i32 {
     if st.last("nfsd_touched").is_some() {
         if st.last("nfsd_running_before") == Some("0") {
             let o = cmd("nfsd", &["stop"]);
-            say(&format!("nfsd stop: {:?}", o.code));
+            say(&format!("nfsd stop: {:?} {}", o.code, o.both().trim()));
         }
         if st.last("nfsd_enabled_before") == Some("0") {
             let o = cmd("nfsd", &["disable"]);
-            say(&format!("nfsd disable: {:?}", o.code));
+            say(&format!("nfsd disable: {:?} {}", o.code, o.both().trim()));
+            if cmd("nfsd", &["status"]).ok() {
+                say("nfsd is still enabled after disable");
+                red = true;
+            }
         }
     }
 

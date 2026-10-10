@@ -262,7 +262,7 @@ pub fn n1(ctx: &mut Ctx) {
         r.verdict = "unavailable".into();
     }
     r.differs = Some(local || p1["value"] != json!(1) || (mount2_up && p2["value"] != json!(0)));
-    r.observed = json!({ "statfs_mount1": s, "mnt_local": local, "pathconf_vers3": p1, "pathconf_noopaque_auth": p2, "mount2_available": mount2_up });
+    r.observed = json!({ "statfs_mount1": s, "mnt_local": local, "pathconf_vers3": p1, "pathconf_noopaque_auth": p2, "mount2_available": mount2_up, "nfsstat_m": cmd("nfsstat", &["-m"]).both() });
     ctx.emit(r);
 }
 
@@ -394,7 +394,12 @@ pub fn m12(ctx: &mut Ctx) {
         }
     }
     let nfs_source = format!("127.0.0.1:{}", exp.display());
-    let img = PathBuf::from(env_or("RUNNER_TEMP", "/tmp")).join(format!("goetia-probe-{}-m1.dmg", ctx.run));
+    // Under a root-owned 0755 directory of its own, so the account can traverse to it.
+    let imgdir = PathBuf::from(format!("/private/var/goetia-probe-m1img-{}", ctx.run));
+    if let Err(e) = scratch_dir(ctx, &imgdir) {
+        m1.anomaly(e);
+    }
+    let img = imgdir.join("m1.dmg");
     ctx.state("image", &img.to_string_lossy());
     must(
         &mut m1.anomalies,
@@ -411,6 +416,7 @@ pub fn m12(ctx: &mut Ctx) {
         ],
     );
     let _ = fs::set_permissions(&img, std::os::unix::fs::PermissionsExt::from_mode(0o644));
+    let readable = as_user(&u.name, "/usr/bin/head", &["-c", "1", &img.to_string_lossy()]);
     let mut attempts = vec![];
     let mut mounted: Vec<(&str, PathBuf)> = vec![];
     let tries: [(&str, &PathBuf); 3] = [
@@ -452,7 +458,7 @@ pub fn m12(ctx: &mut Ctx) {
             .any(|a| a["attempt"] == n && a["succeeded"] == json!(true))
     };
     m1.differs = Some(!ok("a-hdiutil-owned") || !ok("b-mount_nfs-owned") || ok("c-mount_nfs-notowned"));
-    m1.observed = json!({ "account": pw_json(&u), "attempts": attempts });
+    m1.observed = json!({ "account": pw_json(&u), "image_readable_by_account": readable.ok(), "image_read": readable.to_json(), "attempts": attempts });
     // M2: the getfsstat entry of each mount that is still up (the NFS ones; (a) was detached to free the directory).
     let entries = getfsstat_entries();
     let parent_s = parent.to_string_lossy().into_owned();

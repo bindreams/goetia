@@ -107,7 +107,7 @@ fn disk_node(ctx: &Ctx, anomalies: &mut Vec<String>) -> Option<(String, PathBuf)
     Some((node, img))
 }
 
-/// D28: a `mknod` copy of `/dev/null` on an image mounted `nodev`.
+/// D28: a `mknod` copy of `/dev/null` on a bare-filesystem image mounted `nodev`.
 fn nodev_node(ctx: &Ctx, anomalies: &mut Vec<String>) -> Option<(String, PathBuf, Value)> {
     let img = PathBuf::from(env_or("RUNNER_TEMP", "/tmp")).join(format!("goetia-probe-{}-d28.dmg", ctx.run));
     let mnt = PathBuf::from(format!("/private/var/goetia-probe-d28-{}", ctx.run));
@@ -116,6 +116,7 @@ fn nodev_node(ctx: &Ctx, anomalies: &mut Vec<String>) -> Option<(String, PathBuf
         anomalies.push(e);
         return None;
     }
+    // `-layout NONE`: the image is one bare HFS+ volume, so the disk node is the filesystem.
     must(
         anomalies,
         "hdiutil",
@@ -123,6 +124,8 @@ fn nodev_node(ctx: &Ctx, anomalies: &mut Vec<String>) -> Option<(String, PathBuf
             "create",
             "-size",
             "8m",
+            "-layout",
+            "NONE",
             "-fs",
             "HFS+",
             "-volname",
@@ -130,21 +133,14 @@ fn nodev_node(ctx: &Ctx, anomalies: &mut Vec<String>) -> Option<(String, PathBuf
             &img.to_string_lossy(),
         ],
     );
+    let a = must(anomalies, "hdiutil", &["attach", "-nomount", &img.to_string_lossy()]);
+    let disk = a.stdout.lines().next()?.split_whitespace().next()?.to_string();
+    ctx.state("disk", &disk);
     ctx.state("mount", &mnt.to_string_lossy());
     must(
         anomalies,
-        "hdiutil",
-        &[
-            "attach",
-            "-nobrowse",
-            "-owners",
-            "on",
-            "-mountpoint",
-            &mnt.to_string_lossy(),
-            "-mountoptions",
-            "nodev",
-            &img.to_string_lossy(),
-        ],
+        "mount",
+        &["-t", "hfs", "-o", "nodev,nosuid", &disk, &mnt.to_string_lossy()],
     );
     let rdev = cmd("stat", &["-f", "%Hr %Lr", "/dev/null"]).stdout;
     let mm: Vec<&str> = rdev.split_whitespace().collect();
@@ -154,7 +150,13 @@ fn nodev_node(ctx: &Ctx, anomalies: &mut Vec<String>) -> Option<(String, PathBuf
     }
     let _ = fs::set_permissions(&mnt, std::os::unix::fs::PermissionsExt::from_mode(0o755));
     let _ = fs::set_permissions(&node, std::os::unix::fs::PermissionsExt::from_mode(0o666));
-    let facts = json!({ "statfs": statfs_json(&mnt), "ls": cmd("ls", &["-leOd", &node.to_string_lossy()]).both() });
+    let facts = json!({ "statfs": statfs_json(&mnt), "disk": disk, "ls": cmd("ls", &["-leOd", &node.to_string_lossy()]).both() });
+    let nodev = facts["statfs"]["flags_named"]
+        .as_array()
+        .is_some_and(|a| a.contains(&json!("NODEV")));
+    if !nodev {
+        anomalies.push("D28 fixture: the volume is not mounted nodev".into());
+    }
     Some((node.to_string_lossy().into_owned(), mnt, facts))
 }
 
@@ -176,6 +178,7 @@ pub fn run(ctx: &mut Ctx, id: &str) {
     }
     let mut extra = json!({});
     let mut detach_targets: Vec<String> = vec![];
+    let mut umount_targets: Vec<String> = vec![];
     match id {
         "D27" => match disk_node(ctx, &mut res.anomalies) {
             Some((node, _img)) => {
@@ -192,7 +195,10 @@ pub fn run(ctx: &mut Ctx, id: &str) {
                 r.path = node;
                 extra = facts;
                 let m = mnt.to_string_lossy().into_owned();
-                detach_targets.push(m);
+                umount_targets.push(m);
+                if let Some(d) = extra["disk"].as_str() {
+                    detach_targets.push(d.to_string());
+                }
             }
             None => {
                 res.anomaly("D28: no nodev node");
@@ -216,6 +222,12 @@ pub fn run(ctx: &mut Ctx, id: &str) {
     }
     let o = launch::launch(ctx, &spec);
     o.apply(&mut res);
+    for t in &umount_targets {
+        let o = cmd("umount", &[t]);
+        if !o.ok() {
+            res.anomaly(format!("umount {t}: {}", o.both().trim()));
+        }
+    }
     for t in &detach_targets {
         detach(t, &mut res.anomalies);
     }

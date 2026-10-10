@@ -132,7 +132,7 @@ fn runner_info(ctx: &mut Ctx) {
 
 /// The earlier probe's selftest (zombie child, reparented grandchild, exec), unchanged.
 fn selftest(ctx: &mut Ctx) {
-    let mut r = Res::new("SELF.selftest", "self", &[]);
+    let mut r = Res::new(&format!("SELF.{}.selftest", ctx.job), "self", &[]);
     let code = crate::selftest();
     let doc: Value = std::fs::read_to_string("results/selftest.json")
         .ok()
@@ -150,7 +150,7 @@ fn selftest(ctx: &mut Ctx) {
 /// Refused with exit 78.
 fn selfcheck_verdicts(ctx: &mut Ctx) {
     let ld = Path::new("/Library/LaunchDaemons");
-    let mut good = Res::new("SELF.verdict-ran", "self", &[]).expect(json!("ran"));
+    let mut good = Res::new(&format!("SELF.{}.verdict-ran", ctx.job), "self", &[]).expect(json!("ran"));
     let o = launch::launch(ctx, &JobSpec::new("self-ran", "nobody", ld));
     o.apply(&mut good);
     if o.verdict != "ran" {
@@ -159,7 +159,7 @@ fn selfcheck_verdicts(ctx: &mut Ctx) {
     good.observed = o.detail();
     ctx.emit(good);
 
-    let mut bad = Res::new("SELF.verdict-refused", "self", &[]).expect(json!("refused, exit 78"));
+    let mut bad = Res::new(&format!("SELF.{}.verdict-refused", ctx.job), "self", &[]).expect(json!("refused, exit 78"));
     let mut spec = JobSpec::new("self-refused", "nobody", ld);
     spec.cwd = Some(format!("/nonexistent-goetia-probe-{}", ctx.run).into());
     let o = launch::launch(ctx, &spec);

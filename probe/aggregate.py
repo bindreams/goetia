@@ -56,7 +56,12 @@ def cell(r):
     if i.startswith("B4."):
         return "accepted" if o.get("accepted") else "refused: " + str((o.get("bootstrap") or {}).get("stderr", "")).strip()[:60]
     if i == "B5":
-        return "loaded=%s btm changed=%s rebootstrap=%s" % (o.get("still_loaded"), o.get("btm_changed"), o.get("bootstrap_again_accepted"))
+        def n(k, needle):
+            sn = o.get(k) or {}
+            return (sn.get("mentions") or {}).get(needle)
+        return "loaded=%s btm uuid lines %s/%s/%s/%s; changed(bootstrap->rewrite)=%s; rebootstrap=%s" % (
+            o.get("still_loaded"), *[(o.get(k) or {}).get("uuid_lines") for k in ("btm_0_before_bootstrap", "btm_1_after_bootstrap", "btm_2_after_rewrite", "btm_3_end")],
+            o.get("btm_changed_bootstrap_to_rewrite"), o.get("bootstrap_again_accepted"))
     if i == "B6":
         return "limit=%s" % (o.get("limit") if o.get("limit") is not None else o.get("note"))
     if i.startswith("D"):
@@ -72,7 +77,8 @@ def cell(r):
     if i == "N3":
         return "denied=%s allowed=%s" % (((o.get("acl_denied") or {}).get("values") or {}).get("errno"), ((o.get("allowed") or {}).get("values") or {}).get("errno"))
     if i == "N5":
-        return "polls=0 offline=%s" % o.get("offline_seen_first")
+        sm = ((o.get("forms_tried") or [{}])[0].get("showmount") or {})
+        return "polls=0 offline=%s; first showmount code=%s %s" % (o.get("offline_seen_first"), sm.get("code"), (sm.get("stderr") or sm.get("stdout") or "").strip()[:60])
     if i == "M1":
         return "; ".join("%s=%s" % (a["attempt"][:1], "ok" if a["succeeded"] else ((a["result"].get("stderr") or "").strip()[:40] or "fail")) for a in o.get("attempts", []))
     if i == "M2":
@@ -89,7 +95,9 @@ def cell(r):
 def by_question(recs):
     q = defaultdict(lambda: defaultdict(dict))
     for r in recs:
-        for name in r.get("question") or ["(no question)"]:
+        if r["id"] == "RUNNER":
+            continue
+        for name in r.get("question") or ["(harness self-checks)"]:
             q[name][r["id"]][os_key(r)] = r
     return q
 
@@ -113,9 +121,6 @@ CONTROLS = [
     ("B3 sentinel from /Library/LaunchDaemons is Ran", "B3", lambda r: r["observed"].get("control") == "ran"),
     ("Q1c deny add_file is Refused", "Q1c", lambda r: r["verdict"] == "refused"),
     ("Q2 clean launch is Ran", "Q2", lambda r: r["verdict"] == "ran"),
-    ("SELF known-good sentinel is Ran", "SELF.verdict-ran", lambda r: r["verdict"] == "ran"),
-    ("SELF nonexistent cwd is Refused", "SELF.verdict-refused", lambda r: r["verdict"] == "refused"),
-    ("SELF selftest (zombie, reparented, exec)", "SELF.selftest", lambda r: r["observed"].get("ok") is True),
     ("N2 root fstatat on allowed/ works", "N2", lambda r: r["observed"].get("root_fstatat_allowed_inner_control") == 0),
     ("N3 _WRITE_OK on allowed/ granted", "N3", lambda r: not any("control" in a for a in r["anomalies"])),
     ("N4 allowed/ cwd and log are Ran", "N4.allowed.cwd", lambda r: r["verdict"] == "ran"),
@@ -165,6 +170,17 @@ def report(recs, bad, title):
             except Exception as e:  # noqa: BLE001
                 res.append(f"error: {e}")
         rows.append([label] + res)
+    for job in ("b0", "b0-size", "devices", "tcc", "nfs", "gap"):
+        for label, suffix, ok in (
+            ("known-good sentinel is Ran", "verdict-ran", lambda r: r["verdict"] == "ran"),
+            ("nonexistent cwd is Refused (exit 78)", "verdict-refused", lambda r: r["verdict"] == "refused"),
+            ("selftest (zombie, reparented, exec)", "selftest", lambda r: r["observed"].get("ok") is True),
+        ):
+            res = []
+            for o in oses:
+                r = byid.get((f"SELF.{job}.{suffix}", o))
+                res.append("-" if r is None else ("pass" if ok(r) else "FAIL"))
+            rows.append([f"self-check [{job}] {label}"] + res)
     md += table(rows, ["control"] + oses)
     md.append("")
     md.append("## Anomalies")
@@ -182,9 +198,7 @@ def report(recs, bad, title):
     md.append("## Refusal bookkeeping (X1)")
     rows, unsettled = [], 0
     for r in recs:
-        if r["verdict"] in ("refused", "inconclusive") or r.get("exit_source") not in (None, "n/a"):
-            if r["verdict"] == "bootstrap-refused":
-                continue
+        if r["verdict"] in ("refused", "inconclusive"):
             fp = r.get("first_print")
             bad_fp = any("bookkeeping not settled" in a for a in r.get("anomalies") or [])
             unsettled += bad_fp

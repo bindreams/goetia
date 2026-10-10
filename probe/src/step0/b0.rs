@@ -470,23 +470,40 @@ pub fn b4(ctx: &mut Ctx) {
 pub fn b5(ctx: &mut Ctx) {
     let mut r = Res::new("B5", "B", &["B0 Q-S3 (e)"])
         .expect(json!("job still loaded, no BTM change after a fresh-inode rewrite"));
-    let label = ctx.label("b5");
+    // `ctl` is bootstrapped alongside and never rewritten: a record that appears for it as well
+    // is BTM's own lag, not an effect of the rewrite.
+    let (label, ctl_label) = (ctx.label("b5"), ctx.label("b5ctl"));
     let path = PathBuf::from(format!("/Library/LaunchDaemons/{label}.plist"));
-    let needles = vec![label.clone(), path.to_string_lossy().into_owned()];
-    ctx.state("label", &label);
-    ctx.state("plist", &path.to_string_lossy());
-    if let Err(e) = launch::write_plist(&path, launch::minimal_plist(&label).as_bytes()) {
-        r.anomaly(e);
-        return ctx.emit(r);
+    let ctl_path = PathBuf::from(format!("/Library/LaunchDaemons/{ctl_label}.plist"));
+    let needles = vec![
+        label.clone(),
+        path.to_string_lossy().into_owned(),
+        ctl_label.clone(),
+        ctl_path.to_string_lossy().into_owned(),
+    ];
+    for (l, p) in [(&label, &path), (&ctl_label, &ctl_path)] {
+        ctx.state("label", l);
+        ctx.state("plist", &p.to_string_lossy());
+        if let Err(e) = launch::write_plist(p, launch::minimal_plist(l).as_bytes()) {
+            r.anomaly(e);
+            return ctx.emit(r);
+        }
     }
     let disabled = cmd("launchctl", &["print-disabled", "system"]);
+    let snap_pre = btm_snapshot(ctx, "B5.0-before-bootstrap", &needles);
     let boot = cmd("launchctl", &["bootstrap", "system", &path.to_string_lossy()]);
-    if !boot.ok() {
-        r.anomaly(format!("control: bootstrap of p0: {}", boot.both().trim()));
+    let boot_ctl = cmd("launchctl", &["bootstrap", "system", &ctl_path.to_string_lossy()]);
+    if !boot.ok() || !boot_ctl.ok() {
+        r.anomaly(format!(
+            "control: bootstrap of p0 shapes: {} / {}",
+            boot.both().trim(),
+            boot_ctl.both().trim()
+        ));
         let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&ctl_path);
         return ctx.emit(r);
     }
-    let before = btm_snapshot(ctx, "B5.before", &needles);
+    let snap_boot = btm_snapshot(ctx, "B5.1-after-bootstrap", &needles);
     let ino_before = fs::metadata(&path).map(|m| m.ino()).ok();
     let sibling = path.with_extension("plist.new");
     let rewrite = (|| -> Result<(), String> {
@@ -502,15 +519,20 @@ pub fn b5(ctx: &mut Ctx) {
         let _ = fs::remove_file(&sibling);
     }
     let ino_after = fs::metadata(&path).map(|m| m.ino()).ok();
-    let after = btm_snapshot(ctx, "B5.after", &needles);
+    let snap_rewrite = btm_snapshot(ctx, "B5.2-after-rewrite", &needles);
     let print = cmd("launchctl", &["print", &format!("system/{label}")]);
     let still_loaded = print.ok();
     let bo = cmd("launchctl", &["bootout", &format!("system/{label}")]);
     let again = cmd("launchctl", &["bootstrap", "system", &path.to_string_lossy()]);
     let bo2 = cmd("launchctl", &["bootout", &format!("system/{label}")]);
+    let snap_end = btm_snapshot(ctx, "B5.3-end", &needles);
+    let bo_ctl = cmd("launchctl", &["bootout", &format!("system/{ctl_label}")]);
     let _ = fs::remove_file(&path);
-    if !bo.ok() {
-        r.anomaly(format!("bootout: {}", bo.both().trim()));
+    let _ = fs::remove_file(&ctl_path);
+    for (what, o) in [("bootout", &bo), ("control bootout", &bo_ctl)] {
+        if !o.ok() {
+            r.anomaly(format!("{what}: {}", o.both().trim()));
+        }
     }
     if again.ok() && !bo2.ok() {
         r.anomaly(format!("second bootout: {}", bo2.both().trim()));
@@ -518,13 +540,17 @@ pub fn b5(ctx: &mut Ctx) {
     if ino_before.is_some() && ino_before == ino_after {
         r.anomaly("rewrite kept the inode: not a fresh inode");
     }
-    let changed = btm_changed(&before, &after);
+    // The rewrite's effect: bootstrap -> rewrite. The control shows what happens with no rewrite.
+    let changed = btm_changed(&snap_boot, &snap_rewrite);
+    let changed_since_pre = btm_changed(&snap_pre, &snap_rewrite);
     r.differs = Some(!still_loaded || changed == Some(true) || !again.ok());
     r.observed = json!({
         "print_disabled_has_label": disabled.stdout.contains(&label), "inode_before": ino_before, "inode_after": ino_after,
-        "btm_before": before, "btm_after": after, "btm_changed": changed,
+        "btm_0_before_bootstrap": snap_pre, "btm_1_after_bootstrap": snap_boot, "btm_2_after_rewrite": snap_rewrite,
+        "btm_3_end": snap_end, "btm_changed_bootstrap_to_rewrite": changed, "btm_changed_before_bootstrap_to_rewrite": changed_since_pre,
         "still_loaded": still_loaded, "print_after_rewrite": launch::print_summary(&print.stdout),
         "bootstrap_again_accepted": again.ok(), "bootstrap_again": again.to_json(),
+        "note": "mentions of the control label (b5ctl) growing between snapshots with no rewrite means BTM lags, not the rewrite",
     });
     ctx.emit(r);
 }
