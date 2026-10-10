@@ -828,6 +828,48 @@ def deleted_key_read_probe():
                 f"error winerror={getattr(ex, 'winerror', None)} {ex}")
     winreg.CloseKey(h1)
 
+
+def held_lingering_probe(binpath):
+    """P7b: delete while a CHILD holds a handle; close it; at the first 1060
+    list Services\\<id> and Parameters once; then wait for the key to vanish
+    via the Services parent watch (bounded: probe failure bound on an
+    external event) and print elapsed ms."""
+    print("== held lingering probe", flush=True)
+    HK = winreg.HKEY_LOCAL_MACHINE
+    full = advapi.OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS)
+    for n in range(5):
+        name = f"goetia-probe-hl{n}"
+        h, e = create(full, name, binpath)
+        if not h:
+            raise SystemExit(f"create {name}: {e}")
+        svc = rf"SYSTEM\CurrentControlSet\Services\{name}"
+        pk = winreg.CreateKeyEx(HK, svc + r"\Parameters", 0, winreg.KEY_WRITE)
+        winreg.SetValueEx(pk, "Marker", 0, winreg.REG_SZ, "probe")
+        winreg.CloseKey(pk)
+        child = spawn_holder(name)
+        advapi.DeleteService(h)
+        advapi.CloseServiceHandle(h)
+        r = Recorder(full, SERVICE_NOTIFY_DELETED)
+        r.arm()
+        release_holder(child)
+        got = r.wait_one()
+        o = open_result(full, name)
+        snap = (o, key_contents(svc), key_contents(svc + r"\Parameters"))
+        services = winreg.OpenKey(HK, r"SYSTEM\CurrentControlSet\Services", 0,
+                                  winreg.KEY_NOTIFY)
+        start = kernel.GetTickCount64()
+        ev, rc = watch(services)
+        while key_state(name) != "absent":
+            left = 10000 - (kernel.GetTickCount64() - start)
+            if left <= 0:
+                break
+            kernel.WaitForSingleObject(ev, int(left))
+            ev, rc = watch(services)
+        el = kernel.GetTickCount64() - start
+        say(f"P7b.{n} delivered / at-first-check / key-after / ms",
+            (got is not None, snap, key_state(name), el))
+        winreg.CloseKey(services)
+
 def main():
     if len(sys.argv) > 2 and sys.argv[1] == "hold":
         holder(sys.argv[2])
@@ -852,6 +894,7 @@ def main():
     registry_probe(stopped_bin)
     lingering_key_probe(stopped_bin)
     deleted_key_read_probe()
+    held_lingering_probe(stopped_bin)
 
 
 if __name__ == "__main__":
