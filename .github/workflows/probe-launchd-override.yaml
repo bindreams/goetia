@@ -74,3 +74,16 @@ jobs:
           other="dev.goetia.probe.ovr.never.$RANDOM"; sudo launchctl print-disabled system | grep -F "$other" || echo "<absent>"
           step "A7 total entries in db"
           sudo plutil -p "$db" 2>/dev/null | wc -l
+
+  runatload:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Measure RunAtLoad and KeepAlive shapes
+        shell: bash
+        run: sudo -n /usr/bin/env GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_OS="$RUNNER_OS" GITHUB_RUN_ID="$GITHUB_RUN_ID" /bin/bash probe/runatload.sh
