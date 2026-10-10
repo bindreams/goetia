@@ -622,6 +622,60 @@ def latency_probe(binpath):
     advapi.DeleteService(h)
     advapi.CloseServiceHandle(h)
 
+
+SERVICE_START = 0x10
+
+
+def dacl_rp_and_marked_query_probe(binpath):
+    """P2-RP: deny RP/WP to BA: does QUERY_STATUS|START answer 5?
+    P3: QueryServiceStatusEx through a handle held across DeleteService,
+    on a stopped service that is now marked."""
+    print("== dacl RP + marked query probe", flush=True)
+    full = advapi.OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS)
+    name = "goetia-probe-rp"
+    h, e = create(full, name, binpath)
+    if not h:
+        raise SystemExit(f"create {name}: {e}")
+    advapi.CloseServiceHandle(h)
+    orig = subprocess.run(["sc.exe", "sdshow", name], capture_output=True,
+                          text=True).stdout.strip()
+    out = subprocess.run(["sc.exe", "sdset", name,
+                          "D:(D;;RPWP;;;BA)(A;;CCLCSWLOCRRCWDSD;;;BA)"],
+                         capture_output=True, text=True)
+    say("E1 sdset deny RPWP", (out.returncode, " ".join(out.stdout.split())))
+    for label, acc in (("QUERY_STATUS", SERVICE_QUERY_STATUS),
+                       ("QUERY_STATUS|START", SERVICE_QUERY_STATUS | SERVICE_START),
+                       ("QUERY_STATUS|STOP", SERVICE_QUERY_STATUS | SERVICE_STOP)):
+        hh = advapi.OpenServiceW(full, name, acc)
+        res = "success" if hh else f"error {err()}"
+        if hh:
+            advapi.CloseServiceHandle(hh)
+        say(f"E2 open {label}", res)
+    out = subprocess.run(["sc.exe", "sdset", name, orig], capture_output=True,
+                         text=True)
+    say("E3 restore sd", (out.returncode, " ".join(out.stdout.split())))
+    # P3: hold a handle, delete, query through the held handle.
+    held = advapi.OpenServiceW(full, name, SERVICE_ALL_ACCESS)
+    say("P3a delete via held handle",
+        "ok" if advapi.DeleteService(held) else f"error {err()}")
+    st = SERVICE_STATUS_PROCESS()
+    need = w.DWORD(0)
+    ok = advapi.QueryServiceStatusEx(held, 0, ctypes.byref(st), ctypes.sizeof(st),
+                                     ctypes.byref(need))
+    say("P3b QueryServiceStatusEx on marked stopped (held handle)",
+        f"ok state={st.dwCurrentState}" if ok else f"error {err()}")
+    h2 = advapi.OpenServiceW(full, name, SERVICE_QUERY_STATUS)
+    if h2:
+        ok = advapi.QueryServiceStatusEx(h2, 0, ctypes.byref(st), ctypes.sizeof(st),
+                                         ctypes.byref(need))
+        say("P3c fresh open + QueryServiceStatusEx while marked",
+            f"ok state={st.dwCurrentState}" if ok else f"error {err()}")
+        advapi.CloseServiceHandle(h2)
+    else:
+        say("P3c fresh open while marked", f"error {err()}")
+    advapi.CloseServiceHandle(held)
+    say("P3d key after close", key_state(name))
+
 def main():
     if len(sys.argv) > 2 and sys.argv[1] == "hold":
         holder(sys.argv[2])
@@ -642,6 +696,7 @@ def main():
     orphan_key_probe()
     dacl_probe(stopped_bin)
     latency_probe(stopped_bin)
+    dacl_rp_and_marked_query_probe(stopped_bin)
 
 
 if __name__ == "__main__":
