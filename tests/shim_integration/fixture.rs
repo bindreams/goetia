@@ -26,8 +26,12 @@
 //! - `write-log <port> <text>` — connect to `<port>`, write `<text>` to
 //!   both stdout and stderr, then block forever.
 //! - `exit <port> <code>` — connect to `<port>`, then exit with `<code>`.
+//! - `exit-on-close <port> <code>` — connect to `<port>`, hold the connection
+//!   open until the test closes its end, then exit with `<code>`. The test
+//!   decides when the daemon exits, so it can inspect the running service
+//!   first. A failed connect exits 2.
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, TcpStream};
 use std::sync::mpsc;
 
@@ -88,6 +92,18 @@ pub fn run_if_requested() -> bool {
             let port: u16 = args[3].parse().expect("port");
             let code: i32 = args[4].parse().expect("code");
             connect(port);
+            std::process::exit(code);
+        }
+        "exit-on-close" => {
+            let port: u16 = args[3].parse().expect("port");
+            let code: i32 = args[4].parse().expect("code");
+            let Ok(mut stream) = TcpStream::connect((Ipv4Addr::LOCALHOST, port)) else {
+                std::process::exit(2);
+            };
+            let mut buf = [0u8; 64];
+            // The test never writes: the read ends with `Ok(0)` when it drops
+            // its end, or `Err` if the connection is reset.
+            while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
             std::process::exit(code);
         }
         other => panic!("unknown shim fixture mode: {other}"),
