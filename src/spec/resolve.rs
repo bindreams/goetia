@@ -265,10 +265,13 @@ fn resolve_as(
                 .as_ref()
                 .map(|base| base.merged_for(*backend).0)
                 .and_then(|merged| resolve_shape(&id, merged, base_dir, Phase::Substituted).ok());
-            backend.warn(
-                substituted.as_ref().map_or(authored, |(shaped, _)| shaped),
-                &mut daemon_warnings,
-            );
+            let view = substituted.as_ref().map_or(authored, |(shaped, _)| shaped);
+            // Judged here, on the view that also carries the substituted
+            // base, so a `restart: ${R}` whose `.env` says `always` is
+            // refused too. No `backend-specific.<backend>` attribution: the
+            // value may be the base's, and the message names the remedy.
+            backend.reject_merged(view)?;
+            backend.warn(view, &mut daemon_warnings);
         }
 
         // Step 5b: the native pass, and the substitution whose result is
@@ -294,6 +297,7 @@ fn resolve_as(
         // same attribution its non-native twin gets.
         if let Some(b) = native {
             b.error(&shaped, native_supplied).map_err(|e| attribute_to(e, b))?;
+            b.reject_merged(&shaped)?;
             b.warn(&shaped, &mut pass_warnings);
         }
         daemon_warnings.extend(pass_warnings);
