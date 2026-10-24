@@ -1,6 +1,6 @@
 //! THROWAWAY (issue #59, phase A): measures how the Windows SCM treats a
 //! service's reported exit, so the shim's design rests on measurements.
-//! Round 5: P13 (STOP and notify after DeleteService; STOP during START_PENDING). Never merges. Every observation is a `PROBE ...` line in the job log.
+//! Round 6: P14 (a restart queued by a failure, as seen in the System log). Never merges. Every observation is a `PROBE ...` line in the job log.
 //!
 //! This binary is also the service host: `<exe> --probe-host <name> <port> <scripts>`
 //! where `<scripts>` is `|`-separated, one script per run of the service
@@ -1404,16 +1404,165 @@ mod probes {
         r
     }
 
+    // P14 =============================================================================================================
+
+    /// Start, wait for run 0 to connect back and fail (1066, 7); returns the
+    /// time the failure was recorded.
+    fn p14_fail_first(p: &mut Probe) -> Duration {
+        let _ = p.start();
+        p.connect(0, EXPECTED_BOUND);
+        p.wait_state(ServiceState::Stopped, EXPECTED_BOUND);
+        let f1 = p.t0.elapsed();
+        p.p(format_args!(
+            "failure recorded at t={}ms: {}",
+            f1.as_millis(),
+            p.status()
+        ));
+        f1
+    }
+
+    /// Clean stop of the running instance and wait for STOPPED.
+    fn p14_stop(p: &Probe, f1: Duration, what: &str) {
+        let h = p.service(ServiceAccess::STOP | ServiceAccess::QUERY_STATUS);
+        let stop = control_stop(&h);
+        let stopped = wait_state_via(&h, Services::SERVICE_STOPPED, EXPECTED_BOUND);
+        p.p(format_args!(
+            "{what}: ControlService(STOP) -> {stop}; stopped {stopped} at {}ms after the failure; {}",
+            (p.t0.elapsed() - f1).as_millis(),
+            query_via(&h)
+        ));
+    }
+
+    /// Whether the connect-back `n` arrived within `bound`, logged with its
+    /// time relative to the failure.
+    fn p14_connect(p: &mut Probe, f1: Duration, n: usize, bound: Duration, what: &str) -> String {
+        let c = p.connect(n, bound).cloned();
+        let d = describe(c.as_ref(), bound);
+        let rel = c
+            .as_ref()
+            .map(|c| {
+                format!(
+                    " = {}ms after the failure",
+                    c.at.as_millis() as i128 - f1.as_millis() as i128
+                )
+            })
+            .unwrap_or_default();
+        p.p(format_args!("{what}: {d}{rel}"));
+        format!("{what}: {d}{rel}")
+    }
+
+    /// A restart queued by a failure: which System-log events mark the queue,
+    /// the firing, and the cases where the status misleads. Delay 6 s.
+    fn p14(variant: &'static str) -> String {
+        let delay = Duration::from_millis(6000);
+        let bound = absence_bound(delay);
+        let tag = format!("P14{variant}");
+        let actions = if variant.starts_with('d') { "" } else { "restart/6000" };
+        let scripts = match variant {
+            "f" => format!("run,connect,stopped:spec:7|run,connect,stopped:spec:7|{STAY_UP}"),
+            _ => format!("run,connect,stopped:spec:7|{STAY_UP}"),
+        };
+        let mut p = Probe::new(&tag, &scripts, actions);
+        if variant == "d0" {
+            let (c, o) = sc(&["failureflag", &p.name, "0"]);
+            p.p(format_args!("setup: sc failureflag 0 -> {c:?} {o}"));
+        }
+        let (_, q) = sc(&["qfailure", &p.name]);
+        let (_, qf) = sc(&["qfailureflag", &p.name]);
+        p.p(format_args!("before the failure: qfailure: {q}; qfailureflag: {qf}"));
+        let r;
+        let f1 = p14_fail_first(&mut p);
+
+        match variant {
+            // Baseline: the restart fires and the new instance stays up.
+            "a" => {
+                r = p14_connect(&mut p, f1, 1, bound, "restart");
+                p.wait_state(ServiceState::Running, EXPECTED_BOUND);
+                p14_stop(&p, f1, "clean stop of the restarted instance");
+            }
+            // H2: manual start during the delay, clean stop before it ends.
+            "b" => {
+                let _ = p.start();
+                p14_connect(&mut p, f1, 1, EXPECTED_BOUND, "manual start");
+                p.wait_state(ServiceState::Running, EXPECTED_BOUND);
+                p14_stop(&p, f1, "clean stop inside the delay");
+                r = p14_connect(&mut p, f1, 2, bound, "queued restart");
+                if p.seen.len() > 2 {
+                    p.wait_state(ServiceState::Running, EXPECTED_BOUND);
+                    p14_stop(&p, f1, "clean stop of the queued restart's instance");
+                }
+            }
+            // Manual start during the delay; still RUNNING when it ends.
+            "c" => {
+                let _ = p.start();
+                p14_connect(&mut p, f1, 1, EXPECTED_BOUND, "manual start");
+                p.wait_state(ServiceState::Running, EXPECTED_BOUND);
+                r = p14_connect(&mut p, f1, 2, bound, "second instance");
+                p.p(format_args!("after the delay: {}", p.status()));
+                p14_stop(&p, f1, "clean stop after the delay");
+            }
+            // H1 stale: the failure had no actions; add them afterwards.
+            "d" | "d0" => {
+                let (c1, o1) = sc(&["failure", &p.name, "reset=", "86400", "actions=", "restart/6000"]);
+                let (c2, o2) = sc(&["failureflag", &p.name, "1"]);
+                let (_, q) = sc(&["qfailure", &p.name]);
+                let (_, qf) = sc(&["qfailureflag", &p.name]);
+                p.p(format_args!(
+                    "actions added {}ms after the failure: sc failure -> {c1:?} {o1}; sc failureflag -> {c2:?} {o2}; qfailure: {q}; qfailureflag: {qf}",
+                    (p.t0.elapsed() - f1).as_millis()
+                ));
+                r = p14_connect(&mut p, f1, 1, bound, "restart after adding actions");
+                p.p(format_args!("status at the end: {}", p.status()));
+            }
+            // The actions are cleared during the delay.
+            "e" => {
+                let (c, o) = sc(&["failure", &p.name, "reset=", "0", "actions=", ""]);
+                let (_, q) = sc(&["qfailure", &p.name]);
+                p.p(format_args!(
+                    "actions cleared {}ms after the failure: sc failure -> {c:?} {o}; qfailure: {q}",
+                    (p.t0.elapsed() - f1).as_millis()
+                ));
+                r = p14_connect(&mut p, f1, 1, bound, "restart after clearing actions");
+                if p.seen.len() > 1 {
+                    p.wait_state(ServiceState::Running, EXPECTED_BOUND);
+                    p14_stop(&p, f1, "clean stop of the restarted instance");
+                }
+            }
+            // The restarted run fails too; then the third run stays up.
+            "f" => {
+                let c1 = p14_connect(&mut p, f1, 1, bound, "restart 1 (run 1)");
+                p.wait_state(ServiceState::Stopped, EXPECTED_BOUND);
+                p.p(format_args!(
+                    "run 1 failed {}ms after failure 1: {}",
+                    (p.t0.elapsed() - f1).as_millis(),
+                    p.status()
+                ));
+                let c2 = p14_connect(&mut p, f1, 2, bound, "restart 2 (run 2)");
+                r = format!("{c1}; {c2}");
+                p.wait_state(ServiceState::Running, EXPECTED_BOUND);
+                p14_stop(&p, f1, "clean stop of run 2");
+            }
+            other => panic!("bad variant {other}"),
+        }
+        p.quiesce();
+        p.result(&r);
+        p.dump_scm_events(&tag);
+        r
+    }
+
     // Driver ==========================================================================================================
 
     pub fn run_all() {
         // Sequential: the System-log events of a probe must be its own.
         type Job = Box<dyn FnOnce() -> String + Send>;
         let jobs: Vec<(&'static str, Job)> = vec![
-            ("P13a", Box::new(|| p13_delete_then_stop(false))),
-            ("P13b", Box::new(|| p13_delete_then_stop(true))),
-            ("P13c", Box::new(|| p13c(false))),
-            ("P13c2", Box::new(|| p13c(true))),
+            ("P14a", Box::new(|| p14("a"))),
+            ("P14b", Box::new(|| p14("b"))),
+            ("P14c", Box::new(|| p14("c"))),
+            ("P14d", Box::new(|| p14("d"))),
+            ("P14d0", Box::new(|| p14("d0"))),
+            ("P14e", Box::new(|| p14("e"))),
+            ("P14f", Box::new(|| p14("f"))),
         ];
         println!("PROBE SUMMARY begin");
         for (name, job) in jobs {
