@@ -10,7 +10,7 @@
 //!   nothing loads and nothing runs. A plist that would change what a job
 //!   launchd has loaded reads is refused instead, and nothing is written
 //!   (see [`refuse`]). A `Create` over a loaded job of the same label boots
-//!   that job out first, the one case where `install` stops a daemon.
+//!   that job out first.
 //! - `start` `launchctl bootstrap`s the plist from wherever it currently is
 //!   (if not already loaded), then `launchctl kickstart`s it — the second
 //!   step is what actually launches a job with no `KeepAlive`/`RunAtLoad`
@@ -150,10 +150,10 @@ enum Presence {
 /// just a regular file, and not a claim at all when the stat could not be
 /// performed. `Path::is_file` is `false` for a directory, a
 /// symlink, a socket, or any other non-regular entry, which would let
-/// `locate` classify an occupied path as `Absent`; `write_new`'s
+/// `locate` classify an occupied path as `Absent`; `persist_new`'s
 /// underlying `link`(2) refuses to create over *any* of those the same as
 /// over a regular file (`EEXIST`), so that mismatch would send
-/// `install` into `Create` -> `write_new` -> `Raced` -> re-`install` ->
+/// `install` into `Create` -> `persist_new` -> `Raced` -> re-`install` ->
 /// the identical classification, forever. `symlink_metadata` (not
 /// `metadata`, which follows symlinks and would report a *dangling* one
 /// as absent) catches every case uniformly.
@@ -653,7 +653,7 @@ enum WriteNew {
     Raced,
 }
 
-/// Create-only write for the `Ownership::Absent` case: refuses to replace
+/// Create-only write of a staged plist for the `Ownership::Absent` case: refuses to replace
 /// anything already at `target`, so a foreign plist (or a concurrent
 /// installer's) dropped into the gap between discovery and this write
 /// cannot be destroyed by an install whose entire stated purpose is
@@ -663,9 +663,8 @@ enum WriteNew {
 /// means the destination genuinely did not exist a moment ago and does
 /// now, not that this code lost a filesystem-level race it should have
 /// won.
-fn write_new(target: &Path, content: &str) -> Result<WriteNew> {
-    let tmp = staged_tempfile(target.parent().expect("plist path always has a parent"), content)?;
-    match tmp.persist_noclobber(target) {
+fn persist_new(staged: tempfile::NamedTempFile, target: &Path) -> Result<WriteNew> {
+    match staged.persist_noclobber(target) {
         Ok(_file) => Ok(WriteNew::Written),
         Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => Ok(WriteNew::Raced),
         Err(e) => Err(Error::Io {
@@ -686,15 +685,66 @@ fn write_existing(target: &Path, content: &str) -> Result<()> {
     })
 }
 
+/// Whether a plist is still at `target`. [`Error::Io`] if the stat could not tell, not
+/// [`undetermined`]: the callers have already read an artifact at this id, so "is anything installed
+/// here" is not the question the stat left open.
+fn still_present(target: &Path) -> Result<bool> {
+    match occupied(target) {
+        Presence::Present => Ok(true),
+        Presence::Absent => Ok(false),
+        Presence::Undetermined { source } => Err(Error::Io {
+            path: target.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Undo `install`'s write to `target`: put `previous` back, or remove the plist if there was none.
+/// Only over the plist `install` wrote (`wrote`). The path can have changed since: a concurrent
+/// `enable` or `uninstall` moved or removed it, or a concurrent install wrote after ours, and a write
+/// here would put a plist in both directories, resurrect a removed one, or destroy the other's.
+/// The `Err` says what is on disk.
+fn undo_write(target: &Path, wrote: &str, previous: Option<&str>) -> Result<()> {
+    let path = target.display();
+    if !still_present(target)? {
+        return Err(Error::Other(format!("{path} no longer exists")));
+    }
+    match fs::read_to_string(target) {
+        Ok(on_disk) if on_disk == wrote => {}
+        Ok(_) => return Err(Error::Other(format!("{path} no longer holds what install wrote"))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Error::Other(format!("{path} no longer exists"))),
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+            return Err(Error::Other(format!("{path} no longer holds what install wrote")));
+        }
+        Err(e) => return Err(io_err(target)(e)),
+    }
+    let undone = match previous {
+        Some(previous) => write_existing(target, previous),
+        None => fs::remove_file(target).map_err(io_err(target)),
+    };
+    undone.map_err(|e| Error::Other(format!("{e}; {path} still holds what install wrote")))
+}
+
+/// What is at `path`, for a message.
+fn describe_at(path: &Path) -> String {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.is_file() => "a file".to_owned(),
+        Ok(m) if m.is_dir() => "a directory".to_owned(),
+        Ok(m) if m.is_symlink() => "a symlink".to_owned(),
+        Ok(_) => "a special file".to_owned(),
+        Err(e) => format!("something that could not be read ({e})"),
+    }
+}
+
 /// Move `src` to `dest` without ever replacing something already at
 /// `dest` — used by `enable`/`disable` to move the plist between
 /// [`STAGING_DIR`] and [`ENABLED_DIR`]. A plain `fs::rename` silently
 /// replaces an existing destination on POSIX, which would make a
 /// same-shape TOCTOU clobber possible here exactly as it is for `install`'s
-/// create path (see `write_new`'s doc comment) — a foreign plist, or a
+/// create path (see `persist_new`'s doc comment) — a foreign plist, or a
 /// concurrent operation's, landing at `dest` between the caller's own
 /// checks and this call would otherwise be silently destroyed. Hard-link
-/// then unlink, the same portable non-clobbering primitive `write_new`
+/// then unlink, the same portable non-clobbering primitive `persist_new`
 /// uses via `persist_noclobber`: the link is the atomic step, so
 /// `AlreadyExists` means `dest` genuinely was already occupied.
 fn move_no_clobber(src: &Path, dest: &Path) -> Result<()> {
@@ -885,10 +935,8 @@ fn never_expires<T>(step: Option<T>) -> T {
 
 /// Whether launchd has `id` loaded. `Ok(None)` iff `deadline` expired.
 ///
-/// Only success and the "no such job" codes [`is_not_found`] names answer the question. Any other
-/// failure (a permission error, a launchd that is not answering) says nothing about the job, and
-/// is an `Err`: every caller acts on "not loaded" by writing a plist or bootstrapping a job, and
-/// a guess there leaves a loaded job running a definition other than the installed one.
+/// Only success and the not-found codes in [`is_not_found`] answer the question; any other failure is
+/// an `Err`, since callers act on "not loaded" by writing or bootstrapping.
 fn is_loaded(id: &str, deadline: Deadline) -> Result<Option<bool>> {
     // Not "structured data" parsing (see the module doc comment): this only
     // ever looks at the exit code, never the body of `print`'s output.
@@ -1023,28 +1071,17 @@ const STOP_REQUESTS: usize = 1;
 
 /// The most `launchctl` calls each verb makes, requests and reads alike — every one needs a temp
 /// file for each of its two streams, and a verb makes them all before it sends anything (see
-/// [`files`]). `install`: a `Create`'s `is_loaded` and `bootout`, both before the plist is written, or
-/// an `Update`'s two `is_loaded`s, before the write and after it. A pass repeated after a race is not counted.
+/// [`files`]). `install`: a `Create`'s `is_loaded`, `bootout` and the `is_loaded` after the write, or an
+/// `Update`'s two `is_loaded`s, before the write and after it. A pass repeated after a race that sent no
+/// request is not counted.
 /// `start`: its five requests, two `is_loaded`s and five `live_state`s. `stop` and `uninstall`: their
 /// request.
-const INSTALL_CALLS: usize = INSTALL_REQUESTS + 1;
+const INSTALL_CALLS: usize = INSTALL_REQUESTS + 2;
 const START_CALLS: usize = START_REQUESTS + 7;
 const STOP_CALLS: usize = STOP_REQUESTS;
 
 /// The temp files one `launchctl` call writes its output to: stdout and stderr.
 const FILES_PER_CALL: usize = 2;
-
-/// The reaper for `install`'s `bootout`: the one it holds, or another if a request of an earlier
-/// pass of its re-derivation has used it.
-fn reaper_for_request(spec: &DaemonSpec, held: Option<Reaper>) -> Result<Reaper> {
-    match held {
-        Some(reaper) => Ok(reaper),
-        None => {
-            let [reaper] = reapers::<INSTALL_REQUESTS>(&spec.id)?;
-            Ok(reaper)
-        }
-    }
-}
 
 /// [`bounded::reapers`], as the verb's own failure: nothing was sent, so exit `1` with the daemon
 /// untouched.
@@ -1134,9 +1171,11 @@ fn classified(ran: &Ran) -> (State, Option<u32>) {
 // ServiceManager ======================================================================================================
 
 impl LaunchdManager {
-    /// `install`, with the reaper for its one request made. A re-derivation after a race passes the
-    /// same reaper on if no request has used it, and makes another if one has.
-    fn install_reaping(&self, spec: &DaemonSpec, force: bool, reaper: Option<Reaper>) -> Result<Outcome> {
+    /// `install`, with the reaper for its one request made. A re-derivation after a race that sent no
+    /// request passes the same reaper on.
+    ///
+    /// `install` has no `--timeout` of its own, so its own `launchctl` calls are deliberately unbounded.
+    fn install_reaping(&self, spec: &DaemonSpec, force: bool, reaper: Reaper) -> Result<Outcome> {
         let account = resolve_account(&spec.user)?;
         let desired = generate::plist(spec, &account.identity());
         let discovery = discover(spec.id.as_str())?;
@@ -1152,62 +1191,50 @@ impl LaunchdManager {
             // *directory*, which is deliberately outside the compared surface.
             &decide::Overlay::default(),
         );
+        let deadline = Budget::Unbounded.start();
 
         match &outcome {
             Outcome::Create => {
-                // A job may already answer to this label even though
-                // no artifact of ours existed a moment ago — a
-                // predecessor installed by hand, or one an external
-                // actor boot'ed out that has not finished tearing
-                // down. It cannot be from the plist we are about to create,
-                // so it is stale by construction. Booting it out is the one
-                // way `install` stops a running daemon: the label is being
-                // taken over, and `start` would otherwise see it loaded *and
-                // running*, conclude there was nothing to do, and return `Ok`
-                // while the daemon never ran, as in a real migration.
-                // Every label-scoped check has that blind spot — `is_loaded`
-                // and `live_state` cannot tell whose job answers to a label —
-                // so the fix has to be here, at the one moment we know the
-                // artifact is new.
+                // A job may already answer to this label with no plist of ours (a hand-installed
+                // predecessor, or a booted-out one still tearing down). `start` would see it loaded and
+                // running and return Ok while our daemon never ran, and label-scoped checks cannot tell
+                // whose job it is, so boot it out here, where the artifact is known to be new.
                 //
-                // Before the write, so that a read or a `bootout` that fails
-                // leaves nothing behind: a rerun is a `Create` again, and
-                // reaches the stale job. After a plist is written, the rerun
-                // would read `UpToDate` and never look.
-                //
-                // `install` has no `--timeout` of its own, so its
-                // own `launchctl` calls are deliberately unbounded.
-                let deadline = Budget::Unbounded.start();
-                let reaper = reaper_for_request(spec, reaper)?;
+                // Staging comes first, so a failure there stops nothing. A read or `bootout` that fails
+                // leaves no plist, so a rerun is a `Create` again and reaches the stale job; after a
+                // plist is written the rerun would read `UpToDate` and never look.
+                let target = staging_path(spec.id.as_str());
+                prepare_parent_dirs(spec, &account)?;
+                let staged = staged_tempfile(target.parent().expect("plist path always has a parent"), &desired)?;
                 let reaper = if never_expires(is_loaded(spec.id.as_str(), deadline)?) {
                     never_expires(bootout(spec.id.as_str(), deadline, reaper)?);
                     None
                 } else {
                     Some(reaper)
                 };
-                prepare_parent_dirs(spec, &account)?;
-                let target = staging_path(spec.id.as_str());
-                match write_new(&target, &desired)? {
+                match persist_new(staged, &target)? {
                     WriteNew::Written => {}
+                    // Something now exists where discovery saw nothing. Before any request, `install`
+                    // runs again to re-derive `Ownership` against what is there and reach whatever
+                    // `decide` says about *that*, rather than a bespoke branch that could drift from
+                    // it. After the `bootout` that would send further requests, and make reapers, past
+                    // what the verb reserved: it reports instead.
                     WriteNew::Raced => {
-                        // Something now exists where discovery saw nothing.
-                        // Re-running `install` from scratch re-derives
-                        // `Ownership` against what is actually there and
-                        // reaches whatever `decide` says about *that* —
-                        // reusing the exact same policy path every other
-                        // call goes through, rather than a bespoke
-                        // reclassify branch that could drift from it.
-                        return self.install_reaping(spec, force, reaper);
+                        return match reaper {
+                            Some(reaper) => self.install_reaping(spec, force, reaper),
+                            None => Err(refuse::slot_taken_after_bootout(
+                                &spec.id,
+                                &target,
+                                &describe_at(&target),
+                            )),
+                        };
                     }
                 }
+                recheck_after_write(&spec.id, deadline, &target, &desired, None)?;
             }
             Outcome::Update { .. } | Outcome::Stale { .. } => {
-                // First, before anything is created or written: a refusal leaves the host as it was.
                 // `Stale` is checked too: a release can change what the generator renders.
                 let changes_job = refuse::changes_loaded_job(&outcome, discovery.on_disk.as_deref(), &desired);
-                // `install` has no `--timeout` of its own, so its own `launchctl` calls are
-                // deliberately unbounded.
-                let deadline = Budget::Unbounded.start();
                 if changes_job && never_expires(is_loaded(spec.id.as_str(), deadline)?) {
                     return Err(refuse::loaded_refusal(&spec.id));
                 }
@@ -1218,68 +1245,23 @@ impl LaunchdManager {
                     .expect("Ownership::Ours implies discovery found a location")
                     .path
                     .clone();
-                // `target` was captured by `discover`, before `decide` ran.
-                // If a concurrent `enable`/`disable`/`uninstall` has since
-                // moved or removed the artifact, writing here would
-                // recreate a plist at the now-vacated path — landing it in
-                // *both* directories, the exact ambiguous state `locate`
-                // hard-errors on. Re-checking immediately before the write
-                // narrows the race to the few instructions between this
-                // check and `write_existing`'s own open, and on a detected
-                // vanish, re-running `install` re-derives the correct
-                // outcome against whatever is actually there now (the same
-                // reclassify-via-recursion the `Create`/`Raced` case above
-                // uses).
-                match occupied(&target) {
-                    Presence::Present => {}
-                    Presence::Absent => return self.install_reaping(spec, force, reaper),
-                    // The re-check established neither the vanish that would
-                    // license re-deriving nor the presence that would
-                    // license the write. [`Error::Io`], not [`undetermined`]:
-                    // `discover` has already opened, read and decoded this
-                    // artifact, so "is anything installed at this id" is not
-                    // the question this stat left open.
-                    //
-                    // Deliberately untested, and stated rather than
-                    // contrived: reaching it needs a stat that fails
-                    // *between* `discover`'s own read of this very path and
-                    // this one. Every fixture that would deny this stat —
-                    // an unsearchable parent, a parent replaced by a file —
-                    // denies `discover`'s first, so `install` never gets
-                    // here. `manager_tests.rs::
-                    // occupied_distinguishes_a_denied_stat_from_absence`
-                    // covers `occupied`'s three-way answer, and
-                    // `tests/launchd_integration/launchd.rs::
-                    // an_unsearchable_plist_directory_is_undetermined_rather_than_absent`
-                    // covers `locate`'s use of it end to end; what is only
-                    // here is the choice of class, and it is one line.
-                    Presence::Undetermined { source } => return Err(Error::Io { path: target, source }),
+                // `target` was captured by `discover`, before `decide` ran. If a concurrent
+                // `enable`/`disable`/`uninstall` has since moved or removed the artifact, writing here
+                // would recreate a plist at the now-vacated path, landing it in *both* directories, the
+                // ambiguous state `locate` hard-errors on. Checking immediately before the write narrows
+                // the race to the few instructions between the check and `write_existing`'s own open;
+                // on a detected vanish, `install` runs again and re-derives the outcome against
+                // whatever is there now.
+                if !still_present(&target)? {
+                    return self.install_reaping(spec, force, reaper);
                 }
                 write_existing(&target, &desired)?;
-                // The check above and the write are not atomic, and launchd relaunches a loaded job
-                // from the definition it was loaded with, never from the plist now on disk. A job
-                // someone bootstrapped in between may hold the old plist or the new one, and a
-                // relaunch of one that read the old runs the old spec (systemd's `Restart=` would
-                // read the new unit). goetia takes no lock, so it says it cannot tell instead of
-                // reporting a success. A read that fails here leaves the same question open, and
-                // the plist is already written, so it is no plain failure either.
-                //
-                // The previous plist goes back before either error returns: with the new one on
-                // disk a rerun would read `UpToDate` and never reach the loaded job, whereas with
-                // the old one it is refused and the stop, install, start remedy runs through goetia.
                 if changes_job {
-                    let put_back = || {
-                        let previous = discovery
-                            .on_disk
-                            .as_deref()
-                            .expect("Ownership::Ours implies discovery read the artifact");
-                        write_existing(&target, previous)
-                    };
-                    match is_loaded(spec.id.as_str(), deadline) {
-                        Ok(loaded) if !never_expires(loaded) => {}
-                        Ok(_) => return Err(refuse::loaded_after_write(&spec.id, put_back())),
-                        Err(read) => return Err(refuse::state_unknown_after_write(&spec.id, &read, put_back())),
-                    }
+                    let previous = discovery
+                        .on_disk
+                        .as_deref()
+                        .expect("Ownership::Ours implies discovery read the artifact");
+                    recheck_after_write(&spec.id, deadline, &target, &desired, Some(previous))?;
                 }
             }
             Outcome::UpToDate
@@ -1292,11 +1274,30 @@ impl LaunchdManager {
     }
 }
 
+/// The read after `install` wrote `wrote` to `target`, where `previous` was (`None` after a create).
+///
+/// The check before the write and the write are not atomic, and launchd relaunches a loaded job from
+/// the definition it was loaded with, not the plist on disk. A job loaded in between may hold either,
+/// and goetia takes no lock, so it reports doubt rather than success. A failed read leaves the same
+/// question open. Put the plist back as it was first: with the new one on disk a rerun reads
+/// `UpToDate` and never reaches the loaded job.
+fn recheck_after_write(id: &Id, deadline: Deadline, target: &Path, wrote: &str, previous: Option<&str>) -> Result<()> {
+    match is_loaded(id.as_str(), deadline) {
+        Ok(loaded) if !never_expires(loaded) => Ok(()),
+        Ok(_) => Err(refuse::loaded_after_write(id, undo_write(target, wrote, previous))),
+        Err(read) => Err(refuse::state_unknown_after_write(
+            id,
+            &read,
+            undo_write(target, wrote, previous),
+        )),
+    }
+}
+
 impl ServiceManager for LaunchdManager {
     fn install(&self, spec: &DaemonSpec, force: bool) -> Result<Outcome> {
         let [reaper] = reapers::<INSTALL_REQUESTS>(&spec.id)?;
         let _files = files(&spec.id, INSTALL_CALLS)?;
-        self.install_reaping(spec, force, Some(reaper))
+        self.install_reaping(spec, force, reaper)
     }
 
     /// Makes every reaper and temp file `steps` can need now, so that no step fails for want of one

@@ -22,3 +22,15 @@ fn an_unread_loaded_state_after_the_write_exits_4() {
     };
     assert_eq!(failure_code(&e), 4);
 }
+
+/// A stale job was booted out and a concurrent writer then took the plist's place: a request was
+/// sent, so the install did not determinately fail, and `1` would say it did.
+#[skuld::test]
+fn a_stale_job_booted_out_before_the_plist_was_taken_exits_4() {
+    let e = Error::StaleJobBootedOut {
+        id: "frpc".to_owned(),
+        path: "/Library/Application Support/Goetia/daemons/frpc.plist".into(),
+        found: "a file".to_owned(),
+    };
+    assert_eq!(failure_code(&e), 4);
+}

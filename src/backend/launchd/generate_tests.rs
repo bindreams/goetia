@@ -698,3 +698,15 @@ fn without_metadata_leaves_a_plist_with_no_comment_and_an_unterminated_one_as_th
     let unterminated = "<!-- goetia:begin\nMarker: goetia\n<plist/>\n";
     assert_eq!(without_metadata(unterminated), unterminated);
 }
+
+#[skuld::test]
+fn without_metadata_drops_every_terminated_comment() {
+    let two = "<a/>\n<!-- goetia:begin\nx\ngoetia:end -->\n<b/>\n<!-- goetia:begin\ny\ngoetia:end -->\n<c/>\n";
+    assert_eq!(without_metadata(two), "<a/>\n<b/>\n<c/>\n");
+}
+
+#[skuld::test]
+fn without_metadata_drops_a_terminated_comment_and_keeps_an_unterminated_one_after_it() {
+    let text = "<a/>\n<!-- goetia:begin\nx\ngoetia:end -->\n<b/>\n<!-- goetia:begin\ny\n<c/>\n";
+    assert_eq!(without_metadata(text), "<a/>\n<b/>\n<!-- goetia:begin\ny\n<c/>\n");
+}

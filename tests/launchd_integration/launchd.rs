@@ -277,8 +277,8 @@ fn hand_edit_is_detected_as_conflict() {
 
 /// The genuine TOCTOU race this guards against — a foreign write landing
 /// between `discover`'s read and the actual persist — is unit-tested
-/// directly against `write_new` in
-/// `src/backend/launchd/manager_tests.rs::write_new_does_not_clobber_existing_content`,
+/// directly against `persist_new` in
+/// `src/backend/launchd/manager_tests.rs::persist_new_does_not_clobber_existing_content`,
 /// where the target is a plain tempdir path and the timing is therefore
 /// deterministic rather than dependent on winning a race with the
 /// scheduler. This is the end-to-end complement, through the real
@@ -398,7 +398,7 @@ fn disable_returns_the_plist_to_staging() {
         State::Running,
         "disable must not stop a job that was loaded"
     );
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop"); // tidy up before the guard's uninstall
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
 }
 
 // Runtime behavior ====================================================================================================
@@ -482,7 +482,7 @@ fn install_refuses_a_changed_spec_while_the_job_is_loaded() {
     assert_ne!(std::fs::read_to_string(staging_path(&id)).unwrap(), installed);
     mgr.start(&spec.id, Budget::DEFAULT).expect("start the updated daemon");
     listener.accept("the updated daemon to report in");
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop"); // tidy up before the guard's uninstall
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
 }
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -1067,12 +1067,12 @@ impl Drop for DirGuard {
 
 // Non-regular occupants ===============================================================================================
 
-/// Regression coverage for the `locate`/`write_new` classification
+/// Regression coverage for the `locate`/`persist_new` classification
 /// mismatch: `Path::is_file` (what `locate` used to check) is `false` for
 /// a directory, while `link`(2) (what `persist_noclobber` uses) refuses to
 /// create over one exactly as it would over a regular file. That mismatch
 /// made a directory sitting at a fresh id's staging path classify as
-/// `Absent` -> `Create` -> `write_new` -> `Raced` -> re-`install` -> the
+/// `Absent` -> `Create` -> `persist_new` -> `Raced` -> re-`install` -> the
 /// identical classification, an unbounded recursion that would eventually
 /// abort the process. `locate` now uses `symlink_metadata`, so a directory
 /// is "occupied" like anything else, and `discover`'s read classifies it

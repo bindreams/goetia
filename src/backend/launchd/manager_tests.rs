@@ -1,5 +1,5 @@
 //! Unit coverage for the pieces of the launchd backend that neither need
-//! root nor the real `/Library/...` system paths: `write_new`/
+//! root nor the real `/Library/...` system paths: `persist_new`/
 //! `write_existing` take an arbitrary target path, so the non-clobbering
 //! race and the `plutil -lint` gate are both fully testable against a
 //! `tempfile::tempdir()`. Everything that genuinely needs elevation and the
@@ -31,35 +31,37 @@ fn sample_plist(id: &str) -> String {
     )
 }
 
-// write_new / write_existing ==========================================================================================
+// persist_new / write_existing ========================================================================================
 
 #[skuld::test]
-fn write_new_creates_when_absent() {
+fn persist_new_creates_when_absent() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("fresh.plist");
     let content = sample_plist("fresh");
 
-    let result = write_new(&target, &content).expect("write_new over an absent target");
+    let staged = staged_tempfile(dir.path(), &content).unwrap();
+    let result = persist_new(staged, &target).expect("persist_new over an absent target");
     assert!(matches!(result, WriteNew::Written));
     assert_eq!(std::fs::read_to_string(&target).unwrap(), content);
 }
 
 /// The mechanism `install`'s "create must not clobber" obligation rests on:
-/// by the time `write_new` runs, discovery already classified the target as
+/// by the time `persist_new` runs, discovery already classified the target as
 /// absent, so anything present now (a foreign plist, or a concurrent
 /// installer's) arrived after that classification — exactly the shape of
 /// the TOCTOU race a plain unconditional `rename` would lose. Simulating
 /// "something is already there" directly (rather than trying to force a
 /// genuine two-thread race, which no amount of `Barrier` synchronization
 /// can *guarantee* lands inside a window of a few instructions) reproduces
-/// the one fact that matters: `write_new` must never overwrite it.
+/// the one fact that matters: `persist_new` must never overwrite it.
 #[skuld::test]
-fn write_new_does_not_clobber_existing_content() {
+fn persist_new_does_not_clobber_existing_content() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("raced.plist");
     std::fs::write(&target, "not a goetia artifact\n").unwrap();
 
-    let result = write_new(&target, &sample_plist("raced")).expect("write_new over a raced target");
+    let staged = staged_tempfile(dir.path(), &sample_plist("raced")).unwrap();
+    let result = persist_new(staged, &target).expect("persist_new over a raced target");
     assert!(matches!(result, WriteNew::Raced));
     assert_eq!(
         std::fs::read_to_string(&target).unwrap(),
@@ -78,6 +80,67 @@ fn write_existing_overwrites() {
     write_existing(&target, &updated).expect("write_existing over an already-ours target");
 
     assert_eq!(std::fs::read_to_string(&target).unwrap(), updated);
+}
+
+// undo_write ==========================================================================================================
+
+/// The put-back after an install that ended in doubt writes only over the plist `install` wrote.
+#[skuld::test]
+fn undo_write_puts_the_previous_plist_over_what_install_wrote() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("id.plist");
+    let previous = sample_plist("id");
+    let wrote = previous.replace("/bin/true", "/bin/false");
+    std::fs::write(&target, &wrote).unwrap();
+
+    undo_write(&target, &wrote, Some(&previous)).expect("undo over what install wrote");
+
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), previous);
+}
+
+/// A `Create` has no previous plist: undoing it removes the one it created.
+#[skuld::test]
+fn undo_write_removes_a_plist_that_install_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("id.plist");
+    let wrote = sample_plist("id");
+    std::fs::write(&target, &wrote).unwrap();
+
+    undo_write(&target, &wrote, None).expect("undo of a create");
+
+    assert!(!target.exists());
+}
+
+/// A concurrent install that wrote after ours owns the path now; the put-back leaves it, and the
+/// failure says so.
+#[skuld::test]
+fn undo_write_leaves_a_plist_that_is_no_longer_what_install_wrote() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("id.plist");
+    let wrote = sample_plist("id");
+    std::fs::write(&target, "someone else's plist\n").unwrap();
+
+    for previous in [Some(wrote.as_str()), None] {
+        let err = undo_write(&target, &wrote, previous).expect_err("not what install wrote");
+        assert!(err.to_string().contains("no longer holds"), "{err}");
+        assert!(err.to_string().contains(&target.display().to_string()), "{err}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "someone else's plist\n");
+    }
+}
+
+/// A concurrent `uninstall` or `enable` took the plist from this path; writing it back would resurrect
+/// it, or put a plist in both directories.
+#[skuld::test]
+fn undo_write_does_not_recreate_a_plist_that_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("id.plist");
+    let wrote = sample_plist("id");
+
+    for previous in [Some(wrote.as_str()), None] {
+        let err = undo_write(&target, &wrote, previous).expect_err("nothing there");
+        assert!(err.to_string().contains("no longer"), "{err}");
+        assert!(!target.exists(), "the put-back recreated the plist");
+    }
 }
 
 #[skuld::test]
@@ -112,7 +175,7 @@ fn move_no_clobber_moves_when_absent() {
     assert_eq!(std::fs::read_to_string(&dest).unwrap(), "content");
 }
 
-/// The same TOCTOU class `write_new` guards against for `install`'s create
+/// The same TOCTOU class `persist_new` guards against for `install`'s create
 /// path, but for the move `enable`/`disable` perform: a plain `fs::rename`
 /// would silently replace whatever landed at `dest` between a caller's own
 /// checks and the move.
@@ -783,9 +846,13 @@ const START_NOT_WAITING: [(&str, &str); 5] = [
     ("kickstart", DONE),
 ];
 
-/// `install`'s longest path, [`INSTALL_CALLS`] calls: a `Create`'s read, and the `bootout` of the
-/// stale job it finds loaded. An `Update` makes two reads, before the write and after it.
-const INSTALL_LONGEST: [(&str, &str); INSTALL_CALLS] = [("print", DONE), ("bootout", DONE)];
+/// `install`'s longest path, [`INSTALL_CALLS`] calls: a `Create`'s read, the `bootout` of the stale job
+/// it finds loaded, and the read after the write. An `Update` makes two reads, before the write and
+/// after it.
+const INSTALL_LONGEST: [(&str, &str); INSTALL_CALLS] = [("print", DONE), ("bootout", DONE), ("print", NOT_LOADED)];
+
+/// A `Create` over no loaded job: the read before the write and the read after it.
+const CREATED: [(&str, &str); 2] = [("print", NOT_LOADED), ("print", NOT_LOADED)];
 
 /// `stop`'s and `uninstall`'s one call.
 const BOOTOUT: [(&str, &str); STOP_CALLS] = [("bootout", DONE)];
@@ -962,7 +1029,7 @@ fn a_changed_spec_is_refused_while_the_job_is_loaded() {
         kind: Kind::Simple,
     };
 
-    let script = Scripted::new(&[("print", NOT_LOADED)]);
+    let script = Scripted::new(&CREATED);
     assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
     script.assert_driven("the first install");
     let installed = std::fs::read_to_string(staging_path(&name)).unwrap();
@@ -1040,18 +1107,15 @@ fn a_print_that_fails_otherwise_is_an_error_not_a_job_that_is_not_loaded() {
         "a create whose stale job could not be booted out wrote nothing"
     );
 
-    // The rerun: the stale job is booted out, then the plist is written.
-    let script = Scripted::new(&[("print", DONE), ("bootout", DONE)]);
+    let script = Scripted::new(&INSTALL_LONGEST);
     assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
     script.assert_driven("create over a loaded job");
 
-    // `start`: the first read.
     let script = Scripted::new(&[("print", UNREADABLE)]);
     let e = mgr.start(&spec.id, Budget::DEFAULT).expect_err("an unreadable print");
     assert!(names_print(&e), "{e:?}");
     script.assert_driven("start, unreadable first read");
 
-    // `start`: the read after a refused `bootstrap`.
     let script = Scripted::new(&[("print", NOT_LOADED), ("bootstrap", REFUSED), ("print", UNREADABLE)]);
     let e = mgr.start(&spec.id, Budget::DEFAULT).expect_err("an unreadable print");
     assert!(names_print(&e), "{e:?}");
@@ -1071,9 +1135,7 @@ fn a_print_that_fails_otherwise_is_an_error_not_a_job_that_is_not_loaded() {
     );
 }
 
-/// After an exit-`4` install the disk shows the change as not installed, so a rerun meets the loaded
-/// job and is refused, instead of reading `UpToDate` and leaving the job on a definition no goetia verb
-/// would reconcile.
+/// After an exit-`4` install a rerun is refused, not read as `UpToDate`.
 fn assert_restored_and_rerun_refused(mgr: &LaunchdManager, spec: &DaemonSpec, name: &str, installed: &str) {
     assert_eq!(
         std::fs::read_to_string(staging_path(name)).unwrap(),
@@ -1099,7 +1161,7 @@ fn a_job_loaded_between_the_check_and_the_write_leaves_the_install_in_doubt() {
     let _plists = Plists(name.clone());
     let mut spec = spec_named(&name);
 
-    let script = Scripted::new(&[("print", NOT_LOADED)]);
+    let script = Scripted::new(&CREATED);
     assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
     script.assert_driven("the first install");
     let installed = std::fs::read_to_string(staging_path(&name)).unwrap();
@@ -1132,7 +1194,7 @@ fn an_unreadable_recheck_after_the_write_leaves_the_install_in_doubt() {
     let _plists = Plists(name.clone());
     let mut spec = spec_named(&name);
 
-    let script = Scripted::new(&[("print", NOT_LOADED)]);
+    let script = Scripted::new(&CREATED);
     assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
     script.assert_driven("the first install");
     let installed = std::fs::read_to_string(staging_path(&name)).unwrap();
@@ -1166,7 +1228,7 @@ fn a_spec_change_the_plist_does_not_render_is_written_over_a_loaded_job() {
     let _plists = Plists(name.clone());
     let mut spec = spec_named(&name);
 
-    let script = Scripted::new(&[("print", NOT_LOADED)]);
+    let script = Scripted::new(&CREATED);
     assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
     script.assert_driven("the first install");
     let installed = std::fs::read_to_string(staging_path(&name)).unwrap();
@@ -1180,4 +1242,315 @@ fn a_spec_change_the_plist_does_not_render_is_written_over_a_loaded_job() {
         installed,
         "the metadata comment was refreshed"
     );
+}
+
+// A put-back, and a Create, that races ================================================================================
+
+/// Installs a spec, then a changed one whose read after the write first runs `during` (as a shell
+/// snippet, standing for something else on the host) and then answers "loaded". Returns that install's
+/// error and the text of the changed plist it wrote.
+fn install_loaded_after_write(mgr: &LaunchdManager, name: &str, during: &str) -> (Error, String) {
+    let mut spec = spec_named(name);
+    let script = Scripted::new(&CREATED);
+    assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
+    script.assert_driven("the first install");
+
+    spec.command.push("updated".to_string());
+    let changed = generate::plist(
+        &spec,
+        &Identity {
+            user: "root".to_string(),
+        },
+    );
+    let recheck = format!("{during}; {RUNNING}");
+    let script = Scripted::new(&[("print", NOT_LOADED), ("print", &recheck)]);
+    let e = mgr.install(&spec, false).expect_err("loaded after the write");
+    script.assert_driven("install, job loaded after the write");
+    (e, changed)
+}
+
+/// The failed put-back of an install that ended in doubt, or a panic.
+fn restore_failure_of(e: &Error) -> &str {
+    match e {
+        Error::LoadedJobInDoubt {
+            restore_failed: Some(detail),
+            ..
+        } => detail,
+        other => panic!("expected an exit-4 error whose put-back failed: {other:?}"),
+    }
+}
+
+/// The put-back writes only over what this install wrote: a concurrent install that wrote after it
+/// owns the path, and a put-back over it would destroy that write.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_put_back_does_not_overwrite_a_plist_that_is_no_longer_ours() {
+    let mgr = LaunchdManager::new();
+    let name = format!("goetia-putback-{:x}", std::process::id());
+    let _plists = Plists(name.clone());
+    let target = staging_path(&name);
+
+    let (e, _) = install_loaded_after_write(&mgr, &name, &format!("echo 'someone else' > '{}'", target.display()));
+
+    assert!(restore_failure_of(&e).contains("no longer holds"), "{e}");
+    assert!(e.to_string().contains(&target.display().to_string()), "{e}");
+    assert!(!e.to_string().contains("plist is back as it was"), "{e}");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "someone else\n");
+}
+
+/// A concurrent `enable` moved the plist to `ENABLED_DIR` before the put-back: writing the previous
+/// plist back to staging would leave one in both directories, which `locate` refuses for every verb.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_put_back_does_not_recreate_a_plist_that_was_enabled_meanwhile() {
+    let mgr = LaunchdManager::new();
+    let name = format!("goetia-putback-enabled-{:x}", std::process::id());
+    let _plists = Plists(name.clone());
+
+    let during = format!(
+        "mv '{}' '{}'",
+        staging_path(&name).display(),
+        enabled_path(&name).display()
+    );
+    let (e, changed) = install_loaded_after_write(&mgr, &name, &during);
+
+    assert!(restore_failure_of(&e).contains("no longer"), "{e}");
+    assert!(!staging_path(&name).exists(), "the put-back recreated the staged plist");
+    assert_eq!(std::fs::read_to_string(enabled_path(&name)).unwrap(), changed);
+}
+
+/// A concurrent `uninstall` removed the plist before the put-back: writing the previous one back would
+/// resurrect a daemon that was just uninstalled.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_put_back_does_not_resurrect_a_plist_that_was_uninstalled_meanwhile() {
+    let mgr = LaunchdManager::new();
+    let name = format!("goetia-putback-removed-{:x}", std::process::id());
+    let _plists = Plists(name.clone());
+
+    let (e, _) = install_loaded_after_write(&mgr, &name, &format!("rm '{}'", staging_path(&name).display()));
+
+    assert!(restore_failure_of(&e).contains("no longer"), "{e}");
+    assert!(!staging_path(&name).exists(), "the put-back resurrected the plist");
+}
+
+/// A plist from an older release is `Stale`, and `Stale` is refused over a loaded job exactly when
+/// its rendering differs from what would be written: a release that renders the same text only
+/// refreshes the metadata, without asking launchd anything.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_stale_plist_is_refused_over_a_loaded_job_only_when_its_rendering_differs() {
+    let mgr = LaunchdManager::new();
+    let name = format!("goetia-stale-{:x}", std::process::id());
+    let _plists = Plists(name.clone());
+    let spec = spec_named(&name);
+
+    let script = Scripted::new(&CREATED);
+    assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
+    script.assert_driven("the first install");
+    let installed = std::fs::read_to_string(staging_path(&name)).unwrap();
+
+    let older = installed
+        .replace(
+            &crate::blob::encode(&spec),
+            &crate::blob::encode_with_version(&spec, "0.0.1"),
+        )
+        .replace(&format!("Version: {}", crate::version()), "Version: 0.0.1");
+    assert_ne!(older, installed);
+
+    let rendered_differently = older.replace("<string>300</string>", "<string>299</string>");
+    assert_ne!(rendered_differently, older);
+    std::fs::write(staging_path(&name), &rendered_differently).unwrap();
+    assert!(matches!(mgr.preview_install(&spec), Ok(Outcome::Stale { .. })));
+    let script = Scripted::new(&[("print", RUNNING)]);
+    let refused = mgr
+        .install(&spec, false)
+        .expect_err("a stale plist that renders differently");
+    assert!(
+        matches!(refused, Error::Other(_)) && refused.to_string().contains(&format!("goetia daemon stop {name}")),
+        "{refused}"
+    );
+    script.assert_driven("the stale plist's rendering differs, so launchd is asked");
+    assert_eq!(
+        std::fs::read_to_string(staging_path(&name)).unwrap(),
+        rendered_differently,
+        "a refused install left the plist as it was"
+    );
+
+    std::fs::write(staging_path(&name), &older).unwrap();
+    assert!(matches!(mgr.preview_install(&spec), Ok(Outcome::Stale { .. })));
+    let script = Scripted::new(&[]);
+    assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Stale { .. })));
+    script.assert_driven("a stale plist that renders the same asks launchd nothing");
+    assert_eq!(std::fs::read_to_string(staging_path(&name)).unwrap(), installed);
+}
+
+/// A `Create` that fails before it has a plist to write has not stopped the job under its label: the
+/// stale job is booted out only once the plist is staged, so a rerun that fails the same way leaves
+/// the predecessor running.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_create_that_cannot_stage_its_plist_boots_nothing_out() {
+    let mgr = LaunchdManager::new();
+    let name = format!("goetia-unstaged-{:x}", std::process::id());
+    let _plists = Plists(name.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let blocker = dir.path().join("not-a-directory");
+    std::fs::write(&blocker, "").unwrap();
+    let mut spec = spec_named(&name);
+    spec.cwd = Some(blocker.join("cwd"));
+
+    let script = Scripted::new(&[]);
+    let e = mgr.install(&spec, false).expect_err("a cwd that cannot be created");
+    assert!(matches!(e, Error::Io { .. }), "{e:?}");
+    script.assert_driven("a create that cannot stage asks launchd nothing");
+    assert!(!staging_path(&name).exists());
+}
+
+/// A job loaded between a `Create`'s check and its write is the job the plist was written under, which
+/// `start` would find loaded and running: the install is in doubt (exit `4`), the plist it created is
+/// removed, and the rerun is a `Create` again, not `UpToDate`. Reading the job back fails the same way.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_job_loaded_after_a_create_leaves_the_install_in_doubt_with_no_plist() {
+    let mgr = LaunchdManager::new();
+    let name = format!("goetia-create-indoubt-{:x}", std::process::id());
+    let _plists = Plists(name.clone());
+    let spec = spec_named(&name);
+
+    for (calls, what) in [
+        (
+            vec![("print", NOT_LOADED), ("print", RUNNING)],
+            "loaded after the write",
+        ),
+        (
+            vec![("print", DONE), ("bootout", DONE), ("print", RUNNING)],
+            "reloaded after the bootout",
+        ),
+    ] {
+        let script = Scripted::new(&calls);
+        let e = mgr.install(&spec, false).expect_err(what);
+        assert!(
+            matches!(
+                e,
+                Error::LoadedJobInDoubt {
+                    restore_failed: None,
+                    ..
+                }
+            ),
+            "{what}: {e:?}"
+        );
+        script.assert_driven(what);
+        assert!(!staging_path(&name).exists(), "{what}: the created plist was left");
+    }
+
+    let script = Scripted::new(&[("print", NOT_LOADED), ("print", UNREADABLE)]);
+    let e = mgr.install(&spec, false).expect_err("an unreadable recheck");
+    assert!(
+        matches!(
+            e,
+            Error::LoadedStateInDoubt {
+                restore_failed: None,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    script.assert_driven("create, unreadable recheck");
+    assert!(!staging_path(&name).exists(), "the created plist was left");
+
+    let script = Scripted::new(&CREATED);
+    assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
+    script.assert_driven("the rerun is a create again");
+}
+
+/// A plist appears at the target while the stale job's `bootout` runs. A request has been sent, so the
+/// install does not go on to re-derive into further `launchctl` calls: it reports that the job was
+/// booted out and what is at the path (exit `4`), and leaves what is there.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_plist_taken_after_the_bootout_is_reported_without_further_launchctl_calls() {
+    let mgr = LaunchdManager::new();
+    let name = format!("goetia-taken-{:x}", std::process::id());
+    let _plists = Plists(name.clone());
+    let spec = spec_named(&name);
+    let target = staging_path(&name);
+
+    let take = format!("echo 'someone else' > '{}'; exit 0", target.display());
+    let script = Scripted::new(&[("print", DONE), ("bootout", &take)]);
+    let e = mgr
+        .install(&spec, false)
+        .expect_err("the plist was taken after the bootout");
+    assert!(matches!(e, Error::StaleJobBootedOut { .. }), "{e:?}");
+    assert!(e.to_string().contains("booted out"), "{e}");
+    assert!(e.to_string().contains(&target.display().to_string()), "{e}");
+    script.assert_driven("nothing is sent after the race");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "someone else\n");
+}
+
+/// The same race before any request was sent is re-derived as ever: the plist found is foreign, which
+/// `install` refuses without a further `launchctl` call.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_plist_taken_before_any_request_is_re_derived() {
+    let mgr = LaunchdManager::new();
+    let name = format!("goetia-taken-early-{:x}", std::process::id());
+    let _plists = Plists(name.clone());
+    let spec = spec_named(&name);
+    let target = staging_path(&name);
+
+    let take = format!("echo 'someone else' > '{}'; exit 113", target.display());
+    let script = Scripted::new(&[("print", &take)]);
+    assert!(matches!(mgr.install(&spec, false), Ok(Outcome::RefuseForeign { .. })));
+    script.assert_driven("the re-derivation asks launchd nothing more");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "someone else\n");
+}
+
+/// `install --dry-run` and `diff` read no job state, and `install --start` over a loaded job with a
+/// changed rendering is refused before it bootstraps anything: the stand-in answers one `print`, so
+/// any other call fails the test.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn dry_run_and_diff_ask_launchd_nothing_and_install_start_is_refused_before_it_starts() {
+    use crate::cli::wait::WaitArgs;
+    use crate::cli::{diff, install};
+
+    let name = format!("goetia-cli-{:x}", std::process::id());
+    let _plists = Plists(name.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = |seconds: &str| {
+        std::fs::write(
+            dir.path().join("goetia.yaml"),
+            format!("daemons:\n  {name}:\n    command: [/bin/sleep, \"{seconds}\"]\n"),
+        )
+        .unwrap();
+    };
+    let get_manager = || -> Result<Box<dyn ServiceManager>> { Ok(Box::new(LaunchdManager::new())) };
+    let run_install = |start: bool, dry_run: bool| {
+        let args = install::Args {
+            ids: vec![],
+            file: dir.path().to_path_buf(),
+            force: false,
+            start,
+            enable: false,
+            dry_run,
+            wait: WaitArgs::default(),
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = install::run(&args, &get_manager, &|| true, &mut out, &mut err);
+        (code, String::from_utf8(err).unwrap())
+    };
+
+    manifest("300");
+    let script = Scripted::new(&CREATED);
+    assert_eq!(run_install(false, false).0, 0);
+    script.assert_driven("the first install");
+
+    manifest("299");
+    let script = Scripted::new(&[]);
+    assert_eq!(run_install(false, true).0, 0, "install --dry-run");
+    let args = diff::Args {
+        ids: vec![],
+        file: dir.path().to_path_buf(),
+    };
+    let code = diff::run(&args, &get_manager, &mut Vec::new(), &mut Vec::new());
+    assert_eq!(code, 3, "diff reports the drift");
+    script.assert_driven("neither --dry-run nor diff asks launchd");
+
+    let script = Scripted::new(&[("print", RUNNING)]);
+    let (code, err) = run_install(true, false);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains(&format!("goetia daemon stop {name}")), "{err}");
+    script.assert_driven("install --start is refused after one read, before any bootstrap");
 }

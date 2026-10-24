@@ -163,13 +163,15 @@ fn failure_code(e: &Error) -> i32 {
         // step that determinately failed, which is what `1` would claim.
         // `RequestInDoubt` left open whether a request `install` or `--start`
         // sent reached the manager, or what came of one that did.
-        // `LoadedJobInDoubt`, `LoadedStateInDoubt`: the plist was rewritten (and put back unless
-        // that failed), and which definition a job started meanwhile read is open.
+        // `LoadedJobInDoubt`, `LoadedStateInDoubt`: the plist was written (and put back unless that
+        // failed), and which definition a job started meanwhile read is open. `StaleJobBootedOut`: a
+        // job was booted out and a concurrent writer then took the plist's place.
         Error::Undetermined { .. }
         | Error::WaitTimeout { .. }
         | Error::RequestInDoubt { .. }
         | Error::LoadedJobInDoubt { .. }
-        | Error::LoadedStateInDoubt { .. } => 4,
+        | Error::LoadedStateInDoubt { .. }
+        | Error::StaleJobBootedOut { .. } => 4,
         // `Error::Unestablished` belongs in the arm above and is missing
         // from it only because it cannot arrive here: `cli::restart` is its
         // only producer, and `install` never calls it. `Error` is not

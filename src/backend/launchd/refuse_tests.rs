@@ -171,8 +171,8 @@ fn restore_failure() -> Error {
 }
 
 /// The job was not loaded at the first check and is loaded now: goetia cannot tell which definition
-/// it read, so the install is in doubt (exit `4`), not a success and not a refusal. The previous
-/// plist is back, so the remedy is the one for a refusal: stop, install again, start.
+/// it read, so the install is in doubt (exit `4`), not a success and not a refusal. The plist is
+/// back as it was, so the remedy is the one for a refusal: stop, install again, start.
 #[skuld::test]
 fn a_job_loaded_after_the_write_is_in_doubt_and_names_the_remedy() {
     let e = loaded_after_write(&Id::try_from("frpc").unwrap(), Ok(()));
@@ -182,22 +182,21 @@ fn a_job_loaded_after_the_write_is_in_doubt_and_names_the_remedy() {
     assert!(message.contains("goetia daemon stop frpc"), "{message}");
     assert!(message.contains("goetia daemon start frpc"), "{message}");
     assert!(message.contains("re-run install"), "{message}");
-    assert!(message.contains("previous plist is back"), "{message}");
+    assert!(message.contains("plist is back as it was"), "{message}");
 }
 
-/// A plist that could not be put back leaves the new one on disk, where a rerun of `install` reads
-/// `UpToDate`: the message must not send the operator there, and carries the failure.
+/// A plist that could not be put back is not "back": the message carries the failure, which says
+/// what is on disk, and never claims the restore.
 #[skuld::test]
-fn a_job_in_doubt_whose_plist_could_not_be_restored_says_the_new_plist_is_on_disk() {
+fn a_job_in_doubt_whose_plist_could_not_be_restored_carries_the_failure() {
     let e = loaded_after_write(&Id::try_from("frpc").unwrap(), Err(restore_failure()));
     assert!(matches!(e, Error::LoadedJobInDoubt { .. }), "{e:?}");
     let message = e.to_string();
-    assert!(message.contains("new plist is on disk"), "{message}");
     assert!(message.contains("could not be put back"), "{message}");
+    assert!(message.contains("/Library/LaunchDaemons/frpc.plist"), "{message}");
     assert!(message.contains("goetia daemon stop frpc"), "{message}");
     assert!(message.contains("goetia daemon start frpc"), "{message}");
-    assert!(!message.contains("re-run install"), "{message}");
-    assert!(!message.contains("previous plist is back"), "{message}");
+    assert!(!message.contains("plist is back as it was"), "{message}");
 }
 
 // state_unknown_after_write ===========================================================================================
@@ -218,11 +217,11 @@ fn an_unreadable_recheck_is_in_doubt_and_names_the_remedy_and_the_failure() {
     assert!(message.contains("goetia daemon start frpc"), "{message}");
     assert!(message.contains("Input/output error"), "{message}");
     assert!(message.contains("re-run install"), "{message}");
-    assert!(message.contains("previous plist is back"), "{message}");
+    assert!(message.contains("plist is back as it was"), "{message}");
 }
 
 #[skuld::test]
-fn an_unreadable_recheck_whose_plist_could_not_be_restored_says_the_new_plist_is_on_disk() {
+fn an_unreadable_recheck_whose_plist_could_not_be_restored_carries_both_failures() {
     let read = Error::CommandFailed {
         command: "launchctl print system/frpc".to_owned(),
         stderr: "Could not print: 5: Input/output error".to_owned(),
@@ -231,8 +230,24 @@ fn an_unreadable_recheck_whose_plist_could_not_be_restored_says_the_new_plist_is
     assert!(matches!(e, Error::LoadedStateInDoubt { .. }), "{e:?}");
     let message = e.to_string();
     assert!(message.contains("Input/output error"), "{message}");
-    assert!(message.contains("new plist is on disk"), "{message}");
     assert!(message.contains("could not be put back"), "{message}");
-    assert!(!message.contains("re-run install"), "{message}");
-    assert!(!message.contains("previous plist is back"), "{message}");
+    assert!(!message.contains("plist is back as it was"), "{message}");
+}
+
+// slot_taken_after_bootout ============================================================================================
+
+/// The stale job is gone and the plist's place was taken by someone else: the message says both, names
+/// what is there, and does not claim that nothing was done.
+#[skuld::test]
+fn a_plist_taken_after_the_bootout_says_what_was_done_and_what_is_there() {
+    let path = std::path::Path::new("/Library/Application Support/Goetia/daemons/frpc.plist");
+    let e = slot_taken_after_bootout(&Id::try_from("frpc").unwrap(), path, "a directory");
+    assert!(matches!(e, Error::StaleJobBootedOut { .. }), "{e:?}");
+    let message = e.to_string();
+    assert!(message.contains("`frpc`"), "{message}");
+    assert!(message.contains("booted out"), "{message}");
+    assert!(message.contains("a directory"), "{message}");
+    assert!(message.contains(&path.display().to_string()), "{message}");
+    assert!(message.contains("re-run install"), "{message}");
+    assert!(!message.contains("nothing was"), "{message}");
 }

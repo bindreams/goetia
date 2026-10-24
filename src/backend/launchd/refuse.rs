@@ -6,6 +6,8 @@
 //! `Ok`, so `install` refuses the write instead of deferring it as systemd and SCM do.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
+use std::path::Path;
+
 use crate::backend::launchd::generate;
 use crate::decide::Outcome;
 use crate::error::{Error, Result};
@@ -14,12 +16,8 @@ use crate::spec::Id;
 /// Whether carrying out `outcome` would give the plist other content than the one on disk, which is
 /// what a loaded job was bootstrapped from.
 ///
-/// Compared are the plist to be written (`desired`) and `on_disk`, each without goetia's own
-/// metadata comment ([`generate::without_metadata`]): it holds the spec and the version, and a
-/// change in either alone leaves what launchd reads as it was. So the check follows the rendering,
-/// not the spec. A spec change the plist does not show, or a release whose generator renders the
-/// same text, does not stop `install` from refreshing the artifact; a generator change or another
-/// resolved account for an unchanged spec does.
+/// Compared without goetia's metadata comment ([`generate::without_metadata`]), which holds the spec
+/// and version: the check follows the rendering, not the spec.
 pub(crate) fn changes_loaded_job(outcome: &Outcome, on_disk: Option<&str>, desired: &str) -> bool {
     match outcome {
         // `Update` is also what `--force` turns a `Conflict` into. Both are `Ours`, so there is
@@ -48,7 +46,7 @@ pub(crate) fn loaded_refusal(id: &Id) -> Error {
 
 /// The error for a job that is loaded after `install` wrote its plist, though it was not before.
 /// Which definition the job read is not known, so this is not a success. `restore` is the result of
-/// putting the previous plist back, which the caller has done before returning this.
+/// putting the plist back.
 pub(crate) fn loaded_after_write(id: &Id, restore: Result<()>) -> Error {
     Error::LoadedJobInDoubt {
         id: id.to_string(),
@@ -64,6 +62,16 @@ pub(crate) fn state_unknown_after_write(id: &Id, read: &Error, restore: Result<(
         id: id.to_string(),
         detail: read.to_string(),
         restore_failed: restore.err().map(|e| e.to_string()),
+    }
+}
+
+/// The error for a plist that was taken from `Create` after a stale job was booted out: `found` is
+/// what is at `path` now.
+pub(crate) fn slot_taken_after_bootout(id: &Id, path: &Path, found: &str) -> Error {
+    Error::StaleJobBootedOut {
+        id: id.to_string(),
+        path: path.to_path_buf(),
+        found: found.to_owned(),
     }
 }
 
