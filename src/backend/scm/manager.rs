@@ -206,11 +206,6 @@ impl ServiceManager for ScmManager {
             return super::wait::request_start(&mut actor).map_err(|e| Error::Other(format!("start `{id}`: {e}")));
         }
         let (kind, unreadable) = installed_kind(id);
-        if let Some(why) = &unreadable {
-            eprintln!(
-                "warning: `{id}`'s spec blob could not be read ({why}); judging its start as a `type: managed` service's"
-            );
-        }
         let waited = super::wait::start_via_notify(&mut actor, deadline, kind)
             .map_err(|e| failed_start(id, &e, unreadable.as_deref()))?;
         match waited {

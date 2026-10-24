@@ -715,9 +715,16 @@ does for `type: managed`. If the shim cannot kill the command on `stop`, it
 logs both failed kills and reports the stop with Win32 code `0`, because a
 non-zero Win32 code would make SCM start a second copy; the service-specific
 code `1003` is the record that the command may still be running. goetia reads
-that record: `stop` exits `1` saying the command may still be running, `restart`
-does not start a second copy, and `uninstall` deletes the service and then exits
-`1` with the same message.
+that record: `stop` exits `1` saying the command may still be running, `start`
+and `restart` do not start a second copy (they exit `1`; once you have stopped
+the command yourself, `sc start` starts the service), and `uninstall` deletes the
+service and then exits `1` with the same message.
+
+A service that refuses the stop control with no change of state to explain it,
+such as a `type: managed` service that reports running and answers `STOP` with an
+error, makes `stop` and `restart` exit `1`, and `uninstall` exit `1` saying the
+service was not deleted. goetia sends the control again only to a service whose
+state has changed since it last looked.
 
 ### What returning means
 
