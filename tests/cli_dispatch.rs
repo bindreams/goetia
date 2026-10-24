@@ -834,6 +834,64 @@ fn install_applies_the_native_backend_override() {
     );
 }
 
+/// `restart: always` is refused only for `scm`, so on a systemd or launchd host it still reaches
+/// the installed blob: from the base (literal or templated) or from the native override, with an
+/// `scm` override keeping the manifest valid everywhere. On a Windows host the `scm` override wins.
+#[skuld::test]
+fn always_survives_install_and_show_on_hosts_that_can_honour_it() {
+    let native = goetia::spec::Backend::native().expect("native() is Some on every CI platform");
+    let expected = if native == goetia::spec::Backend::Scm {
+        "restart: on-failure"
+    } else {
+        "restart: always"
+    };
+    let scm = "      scm:\n        restart: on-failure\n";
+    let manifests = [
+        (
+            "literal",
+            format!("daemons:\n  frpc:\n    command: [frpc]\n    restart: always\n    backend-specific:\n{scm}"),
+        ),
+        (
+            "templated",
+            format!("daemons:\n  frpc:\n    command: [frpc]\n    restart: ${{R}}\n    backend-specific:\n{scm}"),
+        ),
+        (
+            "native override",
+            format!(
+                "daemons:\n  frpc:\n    command: [frpc]\n    restart: never\n    backend-specific:\n      \
+                 systemd:\n        restart: always\n      launchd:\n        restart: always\n{scm}"
+            ),
+        ),
+    ];
+    for (label, text) in manifests {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_manifest(dir.path(), &text);
+        std::fs::write(dir.path().join(".env"), "R=always\n").expect("write .env fixture");
+        let fake = Fake::new();
+
+        let (code, out, err) = dispatch_elevated(
+            &["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()],
+            &fake,
+        );
+        assert_eq!(code, 0, "{label}: stdout:\n{out}\nstderr:\n{err}");
+
+        let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "show"], &fake);
+        assert_eq!(code, 0, "{label}: stdout:\n{out}\nstderr:\n{err}");
+        assert!(
+            out.contains(expected),
+            "{label}: the installed blob must say `{expected}`:\n{out}"
+        );
+
+        let (code, out, err) =
+            dispatch_read_only(&["goetia", "daemon", "show", "-f", manifest.to_str().unwrap()], &fake);
+        assert_eq!(code, 0, "{label}: stdout:\n{out}\nstderr:\n{err}");
+        assert!(
+            out.contains(expected),
+            "{label}: the manifest must resolve to `{expected}`:\n{out}"
+        );
+    }
+}
+
 /// Editing only a non-native backend's override between two installs is
 /// inert for drift: the second `install` reports `up to date`, because
 /// `merged_for` never reads a non-native override into the spec that gets
@@ -1243,7 +1301,7 @@ fn a_service_installed_with_restart_always_stays_operable() {
     assert_eq!(code, 0, "status frpc: stdout:\n{out}\nstderr:\n{err}");
     assert!(out.contains("frpc"), "{out}");
 
-    // The manifest the user migrates to: `diff` loads it, not the blob, through the refusal.
+    // `diff -f` with the migrated manifest still shows the installed `always`.
     let dir = tempfile::tempdir().unwrap();
     let manifest = write_manifest(
         dir.path(),
@@ -1256,7 +1314,7 @@ fn a_service_installed_with_restart_always_stays_operable() {
         "the installed side of the diff must show `always`:\n{out}"
     );
 
-    for verb in ["start", "stop", "uninstall"] {
+    for verb in ["start", "restart", "stop", "uninstall"] {
         let (code, out, err) = dispatch_elevated(&["goetia", "daemon", verb, "frpc"], &fake);
         assert_eq!(code, 0, "{verb}: stdout:\n{out}\nstderr:\n{err}");
     }

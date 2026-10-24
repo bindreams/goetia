@@ -73,7 +73,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::backend::{Backend, Shaped, ShapedSpec};
-use super::interpolate;
+use super::interpolate::{self, Unresolved};
 use super::overrides::Supplied;
 use super::raw::RawManifest;
 use super::user::{AccountId, RawUser, User};
@@ -92,8 +92,7 @@ const MANIFEST_FILE_NAME: &str = "goetia.yaml";
 enum Phase {
     /// Steps 3 and 4: uninterpolated, authored text.
     Authored,
-    /// Step 5: substituted text — 5a's advisory derivations, 5b's native
-    /// pass.
+    /// Step 5b: the native pass's substituted text.
     Substituted,
 }
 
@@ -189,12 +188,18 @@ fn resolve_as(
     let base_needs_vars = entries
         .iter()
         .any(|(_, raw)| interpolate::spec_would_change(&raw.without_overrides()));
-    let vars = if native_needs_vars {
-        Vars::load(base_dir)?
+    // When step 5a's `.env` read fails the base stays authored: a
+    // `${VAR:-default}` substituted against no `.env` is a guess, not the value
+    // any install would read.
+    let (vars, base_readable) = if native_needs_vars {
+        (Vars::load(base_dir)?, true)
     } else if base_needs_vars {
-        Vars::load(base_dir).unwrap_or_else(|_| Vars::empty())
+        match Vars::load(base_dir) {
+            Ok(vars) => (vars, true),
+            Err(_) => (Vars::empty(), false),
+        }
     } else {
-        Vars::empty()
+        (Vars::empty(), true)
     };
 
     let mut specs = Vec::with_capacity(entries.len());
@@ -218,8 +223,8 @@ fn resolve_as(
         // every `Error` raised anywhere in this pass — from shape or from
         // `Backend::error` — is annotated with `backend` before it
         // propagates. Each non-native backend's shaped spec is kept for
-        // step 5, which owns every advisory and is the fallback when the
-        // substituted derivation there is unavailable.
+        // step 5, which owns every advisory and reads each field the checks
+        // need from the substituted base where it can.
         let mut swept: Vec<(Backend, ShapedSpec)> = Vec::with_capacity(Backend::ALL.len());
         for backend in Backend::ALL {
             let (merged, supplied) = raw.merged_for(backend);
@@ -246,28 +251,16 @@ fn resolve_as(
             }
         }
 
-        // Step 5a: every non-native backend's advisories, computed on the
-        // substituted base plus that backend's authored override. The base
-        // half is text step 5b substitutes anyway, from the same `vars`, so
-        // a `${VAR}` there resolves to the value the returned spec carries
-        // and must be judged as that value — computing it from authored
-        // text instead loses the advisory the moment a field moves into
-        // `.env`. The override half is never substituted for a backend this
-        // host cannot install, so a `$`-bearing value there stays
-        // `Shaped::Deferred` and stays silent: the honest "cannot resolve"
-        // case. Shape warnings from this derivation are dropped —
-        // `resolve_path_string`'s advisory is keyed to the four cases its
-        // doc enumerates, and a fifth pass would say nothing step 5b does
-        // not already say.
-        let advisory_base = substituted_base(&raw, &path, &vars);
-        for (backend, authored) in &swept {
-            let substituted =
-                resolve_shape(&id, advisory_base.merged_for(*backend).0, base_dir, Phase::Substituted).ok();
-            let view = substituted.as_ref().map_or(authored, |(shaped, _)| shaped);
-            // Judged here, on the view that also carries the substituted
-            // base, so a `restart: ${R}` whose `.env` says `always` is
-            // refused too. No `backend-specific.<backend>` attribution: the
-            // value may be the base's, and the message names the remedy.
+        // Step 5a: every non-native backend's advisories and verdict. Each field
+        // a check reads is judged alone, on the value that backend's install
+        // would read; one it cannot determine is silent (see `read_substituted`).
+        let (advisory_base, unresolved) = substituted_base(&raw, &path, &vars, base_readable);
+        for (backend, view) in &mut swept {
+            let (merged, supplied) = advisory_base.merged_for(*backend);
+            let trusted = Trusted::new(unresolved, supplied);
+            read_substituted(&id, view, merged, trusted, base_dir);
+            // No `backend-specific.<backend>` attribution: the value may be
+            // the base's, and the message names the remedy.
             backend.reject_merged(view)?;
             backend.warn(view, &mut daemon_warnings);
         }
@@ -338,19 +331,97 @@ pub fn load(path: &Path) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
 }
 
 /// `raw`'s base spec, substituted, carrying `raw`'s overrides back so
-/// [`RawSpec::merged_for`] can layer an authored override on top of it —
-/// the spec step 5a's advisories read.
+/// [`RawSpec::merged_for`] can layer an authored override on top of it — the
+/// spec step 5a reads — and which of its fields could not be substituted.
 ///
 /// Substituted field by field: a field that cannot be substituted (a variable
-/// `.env` does not define, an unreadable `.env`) keeps its authored text, so
-/// it cannot hide the fields that do resolve. Step 2 gates `vars` on this
-/// spec as well as on the merged native one. An advisory or verdict this host
-/// cannot compute is silent, not an error.
-fn substituted_base(raw: &RawSpec, path: &str, vars: &Vars) -> RawSpec {
+/// `.env` does not define, a `$` in an `env` name) keeps its authored text. With
+/// `readable` false (`.env` could not be read) nothing is substituted.
+fn substituted_base(raw: &RawSpec, path: &str, vars: &Vars, readable: bool) -> (RawSpec, Unresolved) {
     let mut base = raw.without_overrides();
-    interpolate::spec_resolvable(&mut base, path, vars);
+    let unresolved = if readable {
+        interpolate::spec_resolvable(&mut base, path, vars)
+    } else {
+        Unresolved::ALL
+    };
     base.backend_specific = raw.backend_specific.clone();
-    base
+    (base, unresolved)
+}
+
+/// Which of the checked fields of a backend's merged spec hold a substituted
+/// value. Such a value is taken as it is, whatever it contains; any other is
+/// authored text, which a `$` marks as not yet determined.
+#[derive(Clone, Copy)]
+struct Trusted {
+    restart: bool,
+    restart_delay: bool,
+    kind: bool,
+    cwd: bool,
+    logs: bool,
+}
+
+impl Trusted {
+    /// A field is substituted when the base's substitution succeeded and no
+    /// override replaced it: an override is never substituted here.
+    fn new(unresolved: Unresolved, supplied: Supplied) -> Trusted {
+        Trusted {
+            restart: !unresolved.restart && !supplied.restart,
+            restart_delay: !unresolved.restart_delay && !supplied.restart_delay,
+            kind: !unresolved.kind && !supplied.kind,
+            cwd: !unresolved.cwd && !supplied.cwd,
+            logs: !unresolved.logs && !supplied.logs,
+        }
+    }
+}
+
+/// Replace, in `view` (a backend's authored shape), each field the checks read
+/// with the one `substituted` carries, when that value passes the field's own
+/// shape check. A field that cannot be determined (not substituted and still
+/// carrying a `$`, or failing that check) stays deferred, or for `cwd` and
+/// `logs` (read for presence) becomes absent, so it is silent.
+fn read_substituted(id: &Id, view: &mut ShapedSpec, substituted: RawSpec, trusted: Trusted, base_dir: &Path) {
+    let RawSpec {
+        restart,
+        restart_delay,
+        kind,
+        cwd,
+        logs,
+        ..
+    } = substituted;
+    if let Ok(restart) = determinable(id, restart, trusted.restart, parse_restart) {
+        view.restart = restart;
+    }
+    if let Ok(restart_delay) = determinable(id, restart_delay, trusted.restart_delay, parse_restart_delay) {
+        view.restart_delay = restart_delay;
+    }
+    if let Ok(kind) = determinable(id, kind, trusted.kind, parse_kind) {
+        view.kind = kind;
+    }
+    view.cwd = determinable_path(id, "cwd", cwd, trusted.cwd, base_dir);
+    view.logs = determinable_path(id, "logs", logs, trusted.logs, base_dir);
+}
+
+/// [`shape`], except a `trusted` value is parsed even if it contains a `$`.
+fn determinable<T>(
+    id: &Id,
+    raw: Option<String>,
+    trusted: bool,
+    parse: fn(&Id, &str) -> Result<T, Error>,
+) -> Result<Shaped<T>, Error> {
+    match raw {
+        Some(text) if trusted => Ok(Shaped::Parsed(parse(id, &text)?)),
+        raw => shape(id, raw, parse),
+    }
+}
+
+/// `raw` resolved as a path, or `None` when the field is absent or cannot be
+/// determined: it is untrusted and still carries a `$`, or its value fails the
+/// field's own check.
+fn determinable_path(id: &Id, field: &str, raw: Option<String>, trusted: bool, base_dir: &Path) -> Option<PathBuf> {
+    let text = raw.filter(|text| trusted || !interpolate::would_substitution_change(text))?;
+    resolve_optional_path(id, field, Some(text), base_dir, Phase::Substituted, &mut Vec::new())
+        .ok()
+        .flatten()
 }
 
 /// Backend annotation for step 4. `Error::Invalid` (from `resolve_shape` or
@@ -1204,3 +1275,7 @@ pub(super) fn invalid(id: &Id, message: &str) -> Error {
 #[cfg(test)]
 #[path = "resolve_tests.rs"]
 mod resolve_tests;
+
+#[cfg(test)]
+#[path = "resolve_view_tests.rs"]
+mod resolve_view_tests;

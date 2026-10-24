@@ -454,8 +454,7 @@ daemons:
 
 #[skuld::test]
 fn an_undefined_variable_in_an_overridden_base_field_does_not_hide_an_advisory() {
-    // Same hiding, for an advisory: `restart-delay: ${DELAY}` resolves, so the
-    // launchd rounding advisory is owed exactly as for the literal `500ms`.
+    // Same, for an advisory: a resolvable `${DELAY}` warns like the literal `500ms`.
     let literal = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    restart-delay: 500ms\n";
     let templated = "daemons:\n  frpc:\n    command: [\"${CMD}\"]\n    restart-delay: ${DELAY}\n    \
                      backend-specific:\n      systemd: { command: [/bin/frpc] }\n      \
