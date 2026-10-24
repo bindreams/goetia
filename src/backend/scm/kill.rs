@@ -85,10 +85,10 @@ mod system {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
     use windows_service::service::Service;
-    use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, WAIT_OBJECT_0};
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0};
     use windows_sys::Win32::System::Services::{QueryServiceStatusEx, SC_STATUS_PROCESS_INFO, SERVICE_STATUS_PROCESS};
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+        INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
     };
 
     use super::{KillTarget, Termination};
@@ -130,35 +130,51 @@ mod system {
         }
 
         fn open(&mut self, pid: u32) -> io::Result<Option<OwnedHandle>> {
-            // SAFETY: no pointers; a null return is the failure.
-            let handle = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid) };
-            if handle.is_null() {
-                let e = io::Error::last_os_error();
-                // No process has this pid: it was gone.
-                return if e.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
-                    Ok(None)
-                } else {
-                    Err(e)
-                };
-            }
-            // SAFETY: a valid handle `OpenProcess` just returned and nothing else owns.
-            Ok(Some(unsafe { OwnedHandle::from_raw_handle(handle) }))
+            open_process(pid)
         }
 
         fn terminate(&mut self, process: &OwnedHandle) -> io::Result<Termination> {
-            // Exit code `1`: SCM sees a failure, the same as for a crash.
-            // SAFETY: `process` is a live handle with `PROCESS_TERMINATE`.
-            if unsafe { TerminateProcess(process.as_raw_handle(), 1) } != 0 {
-                return Ok(Termination::Terminated);
-            }
+            terminate_process(process)
+        }
+    }
+
+    /// Open `pid` with the rights to terminate it and to wait for its exit. `None` if no process has
+    /// that pid.
+    pub(super) fn open_process(pid: u32) -> io::Result<Option<OwnedHandle>> {
+        // SAFETY: no pointers; a null return is the failure.
+        let handle = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid) };
+        if handle.is_null() {
             let e = io::Error::last_os_error();
-            // Terminating a process that has exited fails (with access denied); a signalled handle
-            // is how that is told from a real refusal.
-            // SAFETY: as above; `PROCESS_SYNCHRONIZE` was requested.
-            if unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } == WAIT_OBJECT_0 {
-                return Ok(Termination::AlreadyExited);
-            }
-            Err(e)
+            // No process has this pid: it was gone.
+            return if e.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                Ok(None)
+            } else {
+                Err(e)
+            };
+        }
+        // SAFETY: a valid handle `OpenProcess` just returned and nothing else owns.
+        Ok(Some(unsafe { OwnedHandle::from_raw_handle(handle) }))
+    }
+
+    /// Terminate the process behind `process`, an [`open_process`] handle.
+    pub(super) fn terminate_process(process: &OwnedHandle) -> io::Result<Termination> {
+        // Exit code `1`: SCM sees a failure, the same as for a crash.
+        // SAFETY: `process` is a live handle with `PROCESS_TERMINATE`.
+        if unsafe { TerminateProcess(process.as_raw_handle(), 1) } != 0 {
+            return Ok(Termination::Terminated);
+        }
+        let e = io::Error::last_os_error();
+        // The handle was opened with `PROCESS_TERMINATE`, so access denied here means the process is
+        // already terminating: `TerminateProcess` is asynchronous, and refuses from the moment the
+        // process is terminating, before its handle is signalled. Wait for that signal; the process is
+        // exiting, so the wait ends.
+        if e.raw_os_error() != Some(ERROR_ACCESS_DENIED as i32) {
+            return Err(e);
+        }
+        // SAFETY: as above; `PROCESS_SYNCHRONIZE` was requested.
+        match unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) } {
+            WAIT_OBJECT_0 => Ok(Termination::AlreadyExited),
+            _ => Err(io::Error::last_os_error()),
         }
     }
 }
@@ -166,3 +182,7 @@ mod system {
 #[cfg(test)]
 #[path = "kill_tests.rs"]
 mod kill_tests;
+
+#[cfg(all(test, windows))]
+#[path = "kill_system_tests.rs"]
+mod kill_system_tests;
