@@ -365,12 +365,19 @@ was ever the problem. Set `cwd`, or write the argument absolute.
 
 ## Directories: `install` prepares, it does not check
 
-On systemd and launchd, `install` creates a `cwd` and the parent directory of
-`logs` if they are missing, and gives only what it created to a non-root
-`user`. A directory that already exists is left exactly as found and is not
+`install` creates a `cwd` and the parent directory of `logs` if they are
+missing. A directory that already exists is left exactly as found and is not
 checked: `install` is not a start, and the directory may be one you are still
 preparing. If the account cannot use it, the service manager reports that at
-`start`. The one refusal is a path that exists but is not a directory.
+`start`. The backends differ in what they create and what they refuse:
+
+- **systemd** creates every missing component and gives each one it created
+  to a non-root `user`. A path that exists but is not a directory is refused.
+- **launchd** creates every missing component, but gives only the last one
+  (the `cwd` itself, or the parent of `logs`) to a non-root `user`; missing
+  intermediate components stay owned by root. An existing path of any kind is
+  accepted, so a file where a directory belongs surfaces at `start`.
+- **scm** creates nothing.
 
 ## Per-backend overrides
 
