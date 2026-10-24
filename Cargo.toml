@@ -178,3 +178,8 @@ harness = false
 name = "shim_integration"
 path = "tests/shim_integration.rs"
 harness = false
+
+[[test]]
+name = "scm_probes"
+path = "tests/scm_probes.rs"
+harness = false
