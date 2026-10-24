@@ -442,6 +442,31 @@ $ goetia daemon show -f goetia.yaml
 error: daemon `frpc`: backend-specific.scm: `1000` is a numeric uid, which is never a Windows account
 ```
 
+**`restart: always` is refused for `scm`, from whichever layer it comes.**
+SCM recovery actions fire only on a failure, never after a clean exit, so a
+Windows service cannot be made to restart "always". Unlike the rule above
+this does not need a `scm:` block to trigger it: a base `restart: always`
+is what the `scm` backend would install, so a Linux or macOS run fails too,
+for both `type: simple` and `type: managed`:
+
+```console
+$ goetia daemon show -f goetia.yaml
+error: daemon `frpc`: `restart: always` cannot be honoured by the scm backend: SCM recovery actions never fire after a clean exit. To keep `always` on systemd and launchd, set `backend-specific: scm: { restart: on-failure }`
+```
+
+Override it for Windows:
+
+```yaml
+restart: always
+backend-specific:
+  scm: { restart: on-failure }
+```
+
+A service installed by an earlier release with `restart: always` on Windows
+keeps working: `status`, `list`, `start`, `stop`, `restart` and `uninstall`
+read its embedded copy of the spec and never see this refusal. `diff` and
+`install` read the manifest, which needs the override above.
+
 `${VAR}` is substituted only in the override for the backend being
 installed. The other two are validated as authored, never substituted, so a
 check that would need a resolved value is skipped rather than guessed at:
@@ -451,8 +476,11 @@ like any other native value.
 
 A _base_ field is the other case: it is substituted for the backend being
 installed, so it is the resolved value every backend's advisories read.
-Moving `type` or `restart-delay` into `.env` does not silence a warning the
-literal would have produced.
+Moving `type`, `restart` or `restart-delay` into `.env` does not silence a
+warning or an error the literal would have produced.
+A field that cannot be resolved (an undefined variable, a value its own
+field rejects, or an unreadable `.env`) is skipped on its own: it never changes
+what a check says about another field.
 
 ## Machine-readable output
 
@@ -621,9 +649,9 @@ confirms differs:
   answers it "not loaded" with no job, since there is nothing to stop, and
   that stop succeeds.
 - **SCM**, for a `type: simple` daemon, confirms that `goetia-shim` started.
-  Under `restart: always` or `on-failure` the shim reports running before its
-  first spawn, so your own command failing to start is not part of what was
-  confirmed.
+  Under `restart: on-failure` (or a 0.1.0 install's `always`) the shim reports
+  running before its first spawn, so your own command failing to start is not
+  part of what was confirmed.
 - **launchd** sits between the two: the pid `launchctl kickstart -p` reports
   is launchd's own fork, taken before the user process reaches its `exec`.
 
