@@ -435,6 +435,80 @@ fn start_stop_status_reflect_reality() {
     assert_ne!(mgr.status(&spec.id).unwrap().state, State::Running);
 }
 
+// kill ================================================================================================================
+
+/// The test binary as a daemon that reports in on every start, under `restart`.
+fn reporting(id: &str, restart: Restart, listener: &ConnectBack) -> DaemonSpec {
+    let mut spec = base_spec(
+        id,
+        vec![
+            support::current_exe_str(),
+            support::sentinel::RUN_UNTIL_KILLED.to_string(),
+            listener.port().to_string(),
+        ],
+    );
+    spec.restart = restart;
+    spec
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_killed_always_restart_daemon_comes_back_with_a_new_pid() {
+    let mgr = LaunchdManager::new();
+    let listener = ConnectBack::listen();
+    let spec = reporting(&support::random_test_id(), Restart::Always, &listener);
+    let _guard = Guard::install(&mgr, &spec);
+
+    support::kill::a_killed_daemon_comes_back_with_a_new_pid(&mgr, &spec.id, &listener);
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_killed_never_restart_daemon_stays_down() {
+    let mgr = LaunchdManager::new();
+    let listener = ConnectBack::listen();
+    let spec = reporting(&support::random_test_id(), Restart::Never, &listener);
+    let _guard = Guard::install(&mgr, &spec);
+
+    support::kill::a_killed_daemon_that_never_restarts_stays_down(&mgr, &spec.id, &listener, &|| {
+        let id = spec.id.as_str();
+        let plist = [enabled_path(id), staging_path(id)]
+            .into_iter()
+            .find_map(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_else(|| panic!("no plist of `{id}` to read"));
+        assert!(
+            !plist.contains("<key>KeepAlive</key>"),
+            "the job has a KeepAlive: {plist}"
+        );
+        let printed = cmd::run("launchctl", &["print", &format!("system/{id}")]);
+        assert!(
+            !printed.stdout.contains("state = running"),
+            "the job is running: {printed}"
+        );
+    });
+}
+
+/// Both ways a job has no process: never loaded, and loaded then booted out by `stop`. And the
+/// third, which only a job launchd keeps loaded can show: a `restart: never` job that was killed
+/// stays loaded with no process, and a second kill finds nothing to signal.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn killing_a_job_with_no_process_is_not_running() {
+    let mgr = LaunchdManager::new();
+    let listener = ConnectBack::listen();
+    let spec = reporting(&support::random_test_id(), Restart::Never, &listener);
+    let _guard = Guard::install(&mgr, &spec);
+    let get_manager = || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(LaunchdManager::new())) };
+
+    support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.id);
+
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    listener.accept("the daemon to report in after start");
+    mgr.kill(&spec.id).expect("kill");
+    support::kill::until(|| mgr.status(&spec.id).expect("status").state != State::Running);
+    support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.id);
+
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.id);
+}
+
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn uninstall_leaves_nothing() {
     let mgr = LaunchdManager::new();

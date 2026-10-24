@@ -992,23 +992,43 @@ fn bootout(id: &str, deadline: Deadline, reaper: Reaper) -> Result<Option<()>> {
     }
 }
 
+/// `launchctl kill SIGKILL` on the job, never a pid; what happens next is the plist's `KeepAlive`.
+/// Exit 113 (not loaded) and 3 (loaded, no process) are both [`Error::NotRunning`], the codes
+/// [`is_not_found`] already names. `Ok(None)` iff the deadline expired.
+fn kill_job(id: &str, deadline: Deadline, reaper: Reaper) -> Result<Option<()>> {
+    let target = target(id);
+    let args = ["kill", "SIGKILL", target.as_str()];
+    let Some(ran) = launchctl(&args, deadline, Role::Request(reaper))? else {
+        return Ok(None);
+    };
+    if ran.status.success() {
+        Ok(Some(()))
+    } else if is_not_found(ran.status.code()) {
+        Err(Error::NotRunning { id: id.to_string() })
+    } else {
+        Err(command_failed(&args, &ran))
+    }
+}
+
 // Reapers and files ===================================================================================================
 
 /// The most `launchctl` requests each verb sends — every one needs a [`Reaper`], and a verb makes all
 /// of its reapers before it sends the first (see [`reapers`]). `install`: the `bootout` of a stale or
 /// updated job. `start`: `bootstrap` and `kickstart`, then the corrective cycle's `bootout`,
-/// `bootstrap` and `kickstart`. `stop` and `uninstall`: one `bootout`.
+/// `bootstrap` and `kickstart`. `stop` and `uninstall`: one `bootout`. `kill`: one `launchctl kill`.
 const INSTALL_REQUESTS: usize = 1;
 const START_REQUESTS: usize = 5;
 const STOP_REQUESTS: usize = 1;
+const KILL_REQUESTS: usize = 1;
 
 /// The most `launchctl` calls each verb makes, requests and reads alike — every one needs a temp
 /// file for each of its two streams, and a verb makes them all before it sends anything (see
 /// [`files`]). `install`: its request and one `is_loaded`. `start`: its five requests, two
-/// `is_loaded`s and five `live_state`s. `stop` and `uninstall`: their request.
+/// `is_loaded`s and five `live_state`s. `stop`, `uninstall` and `kill`: their request.
 const INSTALL_CALLS: usize = INSTALL_REQUESTS + 1;
 const START_CALLS: usize = START_REQUESTS + 7;
 const STOP_CALLS: usize = STOP_REQUESTS;
+const KILL_CALLS: usize = KILL_REQUESTS;
 
 /// The temp files one `launchctl` call writes its output to: stdout and stderr.
 const FILES_PER_CALL: usize = 2;
@@ -1477,6 +1497,14 @@ impl ServiceManager for LaunchdManager {
         let _files = files(id, STOP_CALLS)?;
         located_and_ours(id)?;
         bootout(id.as_str(), deadline, reaper)?.ok_or_else(|| budget::timed_out(id.as_str(), "stopped", budget))
+    }
+
+    fn kill(&self, id: &Id) -> Result<()> {
+        let [reaper] = reapers::<KILL_REQUESTS>(id)?;
+        let _files = files(id, KILL_CALLS)?;
+        located_and_ours(id)?;
+        never_expires(kill_job(id.as_str(), Budget::Unbounded.start(), reaper)?);
+        Ok(())
     }
 
     fn status(&self, id: &Id) -> Result<Status> {

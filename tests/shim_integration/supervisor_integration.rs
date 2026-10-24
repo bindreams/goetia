@@ -8,8 +8,10 @@
 
 use std::collections::BTreeMap;
 
+use cosca::Process;
+use cosca::identity::Resolved;
 use goetia::backend::scm::manager::ScmManager;
-use goetia::manager::{Budget, ServiceManager as _};
+use goetia::manager::{Budget, ServiceManager as _, State};
 
 use crate::common::{fixture_command, mk_spec_full};
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
@@ -153,6 +155,65 @@ fn stop_kills_the_whole_process_tree() {
         !grandchild_reported.connected_yet(),
         "a replacement grandchild connected after the stop was confirmed"
     );
+}
+
+/// Block until the process `pid` has exited: a kernel death-watch, so there is nothing to time. A
+/// pid with no process is a process that has already exited.
+fn exited(pid: u32) {
+    match Process::from_pid(pid) {
+        Resolved::Found(process) => process.wait().unwrap_or_else(|e| panic!("wait for process {pid}: {e}")),
+        Resolved::Gone => {}
+        Resolved::Unknown => panic!("the operating system refused to say whether process {pid} exists"),
+    }
+}
+
+/// `kill` of a `type: simple` service ends `goetia-shim`, the service's process, and with it the
+/// daemon and its descendants, through the Job Object the shim dies holding. The shim's death is
+/// SCM's unexpected exit; with `restart: never` there is no recovery action, so the service stays
+/// stopped.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn kill_ends_the_shim_and_the_daemon_tree_with_it() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let child_reported = ConnectBack::listen();
+    let grandchild_reported = ConnectBack::listen();
+    let spec = mk_spec_full(
+        &id,
+        fixture_command(
+            "spawn-grandchild",
+            &[
+                &child_reported.port().to_string(),
+                &grandchild_reported.port().to_string(),
+            ],
+        ),
+        None,
+        BTreeMap::new(),
+        goetia::spec::Restart::Never,
+        None,
+        None,
+    );
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    let child_pid: u32 = child_reported
+        .accept_line("the direct child to start and report its pid")
+        .trim()
+        .parse()
+        .expect("the child's pid");
+    let grandchild_pid: u32 = grandchild_reported
+        .accept_line("the grandchild to start and report its pid")
+        .trim()
+        .parse()
+        .expect("the grandchild's pid");
+    let shim_pid = mgr.status(&spec.id).expect("status").pid.expect("the shim's pid");
+    assert_ne!(shim_pid, child_pid, "the service's process is the shim, not the daemon");
+
+    mgr.kill(&spec.id).expect("kill");
+
+    exited(shim_pid);
+    exited(child_pid);
+    exited(grandchild_pid);
+    support::kill::until(|| mgr.status(&spec.id).expect("status").state == State::Stopped);
 }
 
 /// `tasklist /FI "PID eq <pid>"` prints an informational "no tasks found"

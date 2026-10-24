@@ -9,6 +9,7 @@
 
 pub mod cmd;
 pub mod connect_back;
+pub mod kill;
 pub mod sentinel;
 pub mod service_guard;
 

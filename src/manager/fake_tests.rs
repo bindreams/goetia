@@ -674,3 +674,65 @@ fn a_start_request_over_a_stopped_entry_is_accepted_and_settles_nothing() {
 
     assert_eq!(fake.status(&spec.id).unwrap().state, State::Stopped);
 }
+
+// kill ================================================================================================================
+
+#[skuld::test]
+fn kill_ends_a_running_service_as_a_failure() {
+    let fake = Fake::new();
+    let spec = mk("killed");
+    fake.install(&spec, false).unwrap();
+    fake.start(&spec.id, Budget::DEFAULT).unwrap();
+
+    fake.kill(&spec.id).unwrap();
+
+    assert_eq!(fake.status(&spec.id).unwrap().state, State::Failed);
+    assert_eq!(fake.status(&spec.id).unwrap().pid, None);
+}
+
+#[skuld::test]
+fn kill_of_a_service_that_is_not_running_says_so() {
+    let fake = Fake::new();
+    let spec = mk("idle");
+    fake.install(&spec, false).unwrap();
+
+    let result = fake.kill(&spec.id);
+
+    assert!(
+        matches!(&result, Err(Error::NotRunning { id }) if id == "idle"),
+        "{result:?}"
+    );
+    assert_eq!(fake.status(&spec.id).unwrap().state, State::Stopped, "nothing changed");
+}
+
+#[skuld::test]
+fn kill_of_an_absent_id_is_not_installed() {
+    let fake = Fake::new();
+
+    let result = fake.kill(&Id::try_from("ghost").unwrap());
+
+    assert!(matches!(result, Err(Error::NotInstalled { .. })), "{result:?}");
+}
+
+#[skuld::test]
+fn kill_is_recorded_as_asked_even_when_it_fails() {
+    let fake = Fake::new();
+    let id = Id::try_from("ghost").unwrap();
+
+    let _ = fake.kill(&id);
+
+    assert_eq!(fake.calls(), [("kill", "ghost".to_string())]);
+}
+
+#[skuld::test]
+fn kill_is_refused_where_no_manager_can_be_asked() {
+    let fake = Fake::new();
+    let spec = mk("offline");
+    fake.install(&spec, false).unwrap();
+    fake.start(&spec.id, Budget::DEFAULT).unwrap();
+    fake.seed_no_manager();
+
+    let result = fake.kill(&spec.id);
+
+    assert!(matches!(result, Err(Error::NoManager { .. })), "{result:?}");
+}
