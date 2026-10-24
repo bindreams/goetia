@@ -346,8 +346,6 @@ fn launch(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str) -> Option<(Arc<C
 
 // Failure reports -----------------------------------------------------------------------------------------------------
 
-// Built here, not at the `log_failure` calls, so the tests assert on the same text.
-
 fn thread_refused(command: &[String], e: &std::io::Error) -> String {
     format!("make the thread that waits on {command:?}: {e}; it was not spawned, so nothing of this daemon is running")
 }

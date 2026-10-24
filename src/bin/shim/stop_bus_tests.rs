@@ -7,9 +7,8 @@ use std::time::Duration;
 
 use super::test_hook::{KILL_REFUSED, WAIT_FAILED, Wait, WaiterEnd, waiter_end};
 use super::*;
-use crate::logging::failure_line;
 use crate::logging::test_hook::take;
-use crate::test_support::TestId;
+use crate::test_support::{TestId, assert_one_failure};
 
 const PREFIX: &str = "goetia-shim-stop-bus-test";
 
@@ -128,8 +127,7 @@ fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_k
 
     bus.request_stop();
 
-    // Blocks forever if the call joined a waiter whose wait nothing can make return; unbounded for
-    // the reason given in `wait_for_child_or_stop_does_not_deadlock_on_stop`.
+    // Blocks forever if the call joined a waiter whose wait nothing can make return.
     let outcome = rx
         .recv()
         .expect("the thread running wait_for_child_or_stop ended without a result");
@@ -158,15 +156,26 @@ fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_k
         "the detached waiter thread panicked"
     );
 
-    let refused = cosca::error::Error::Io(std::io::Error::other(KILL_REFUSED));
-    let expected = vec![
-        failure_line(id.as_str(), &kill_tree_failed(&refused)),
-        failure_line(id.as_str(), &fallback_kill_failed(&refused)),
-    ];
-    assert_eq!(
-        (take(id.as_str()), logging::default_log_path(id.as_str()).exists()),
-        (expected, false),
-        "both refused kills must be journalled, kill_tree's first, and must not reach the fallback log"
+    let lines = take(id.as_str());
+    assert_eq!(lines.len(), 2, "both refused kills must be journalled: {lines:?}");
+    // kill_tree's first.
+    assert_one_failure(
+        &lines[..1],
+        id.as_str(),
+        &[
+            "kill_tree on stop: ",
+            KILL_REFUSED,
+            "; falling back to killing the direct child only",
+        ],
+    );
+    assert_one_failure(
+        &lines[1..],
+        id.as_str(),
+        &[
+            "fallback kill on stop: ",
+            KILL_REFUSED,
+            "; the daemon was neither killed nor reaped and may still be running",
+        ],
     );
 }
 
@@ -222,8 +231,7 @@ fn a_panic_on_the_stop_path_leaves_the_waiter_detached_and_the_daemon_untorn_dow
         });
     }
 
-    // Blocks forever if the unwind blocks — a join in a `Drop`, say; unbounded for the reason given
-    // in `wait_for_child_or_stop_does_not_deadlock_on_stop`.
+    // Blocks forever if the unwind blocks — a join in a `Drop`, say.
     let panicked = rx
         .recv()
         .expect("the thread running the panicking call ended without a result");
@@ -348,10 +356,10 @@ fn a_failed_background_wait_is_logged_and_still_wakes_the_stop_bus() {
     let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str());
 
     assert!(matches!(outcome, WaitOutcome::ChildExited));
-    let failed = cosca::error::Error::Io(std::io::Error::other(WAIT_FAILED));
-    assert_eq!(
-        (take(id.as_str()), logging::default_log_path(id.as_str()).exists()),
-        (vec![failure_line(id.as_str(), &wait_failed(&failed))], false),
+    assert_one_failure(
+        &take(id.as_str()),
+        id.as_str(),
+        &["background wait on child: ", WAIT_FAILED],
     );
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }
@@ -383,9 +391,10 @@ fn a_panicked_waiter_is_logged_when_the_stop_path_joins_it() {
         matches!(outcome, WaitOutcome::Stopping),
         "the stop's kill is real and reaches the child"
     );
-    assert_eq!(
-        (take(id.as_str()), logging::default_log_path(id.as_str()).exists()),
-        (vec![failure_line(id.as_str(), WAITER_PANICKED)], false),
+    assert_one_failure(
+        &take(id.as_str()),
+        id.as_str(),
+        &["the thread waiting on the child panicked"],
     );
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Panicked);
 }
@@ -423,11 +432,15 @@ fn a_stop_whose_kill_tree_fails_falls_back_to_killing_the_child() {
             .is_some(),
         "the fallback kill did not end the child"
     );
-    let refused = cosca::error::Error::Io(std::io::Error::other(KILL_REFUSED));
-    assert_eq!(
-        (take(id.as_str()), logging::default_log_path(id.as_str()).exists()),
-        (vec![failure_line(id.as_str(), &kill_tree_failed(&refused))], false),
-        "only kill_tree's failure may be logged: the fallback succeeded"
+    // Only kill_tree's failure: the fallback succeeded.
+    assert_one_failure(
+        &take(id.as_str()),
+        id.as_str(),
+        &[
+            "kill_tree on stop: ",
+            KILL_REFUSED,
+            "; falling back to killing the direct child only",
+        ],
     );
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }

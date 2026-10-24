@@ -360,8 +360,6 @@ fn kill_for_stop(child: &Child, id: &str) -> bool {
 
 // Failure reports -----------------------------------------------------------------------------------------------------
 
-// Built here, not at the `log_failure` calls, so the tests assert on the same text.
-
 fn wait_failed(e: &cosca::error::Error) -> String {
     format!("background wait on child: {e}")
 }
@@ -400,14 +398,9 @@ fn kill_child(child: &Child) -> Result<(), cosca::error::Error> {
 
 // test_hook ===========================================================================================================
 
-/// Makes waiter-thread creation fail, the stop path's kills fail or panic, and the waiter's
-/// `child.wait()` fail or panic, on demand and on this thread only, so the paths that must refuse
-/// to launch a daemon and must not wait on a daemon nothing can kill are testable. Mirrors
-/// `goetia::backend::bounded`'s own hook, which is `#[cfg(test)]` inside the library and
-/// therefore invisible here — see [`Waiter`].
-///
-/// Unlike the thread-local hooks, the waiter-end record is process-global, keyed by daemon id: a
-/// test that makes a waiter must consume its end.
+/// Test hooks for the waiter and stop path, thread-local except the process-global waiter-end
+/// record (a test that makes a waiter must consume its end). Mirrors `goetia::backend::bounded`'s
+/// hook, which is invisible here.
 #[cfg(test)]
 pub(crate) mod test_hook {
     use std::cell::Cell;
@@ -571,6 +564,11 @@ pub(crate) mod test_hook {
             }
             ends = ENDED.wait(ends).unwrap_or_else(PoisonError::into_inner);
         }
+    }
+
+    /// Whether a waiter-end record for `id` is waiting to be consumed by [`waiter_end`]. Never blocks.
+    pub(crate) fn has_waiter_end(id: &str) -> bool {
+        ENDS.lock().unwrap_or_else(PoisonError::into_inner).contains_key(id)
     }
 
     pub(super) fn make_thread() -> std::io::Result<()> {

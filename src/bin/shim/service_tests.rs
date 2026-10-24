@@ -10,10 +10,9 @@ use cosca::identity::Liveness;
 use goetia::spec::{Id, Kind, User};
 
 use super::*;
-use crate::logging::failure_line;
 use crate::logging::test_hook::take;
 use crate::stop_bus::test_hook as waiter_threads;
-use crate::test_support::TestId;
+use crate::test_support::{TestId, assert_one_failure};
 
 const PREFIX: &str = "goetia-shim-launch-test";
 
@@ -62,16 +61,15 @@ fn no_daemon_is_spawned_when_no_thread_can_be_made_to_wait_on_it() {
         launched.is_none(),
         "launch reported a daemon that nothing could wait on"
     );
-    // The failure `launch` reports: journalled, not written.
-    let refused = std::io::Error::other(waiter_threads::NO_THREAD);
-    let line = failure_line(
+    // The failure `launch` reports, journalled rather than written.
+    assert_one_failure(
+        &take(id.as_str()),
         id.as_str(),
-        &thread_refused(&spec(dir.path(), id.as_str()).command, &refused),
-    );
-    assert_eq!(
-        (take(id.as_str()), logging::default_log_path(id.as_str()).exists()),
-        (vec![line], false),
-        "launch's refused-thread failure must be journalled and must not reach the fallback log"
+        &[
+            r#"make the thread that waits on ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"]: "#,
+            waiter_threads::NO_THREAD,
+            "; it was not spawned, so nothing of this daemon is running",
+        ],
     );
     assert_eq!(
         test_hook::spawns(),
@@ -138,8 +136,7 @@ fn a_daemon_is_spawned_once_the_thread_that_waits_on_it_exists() {
          wrong reason"
     );
     drop(launched);
-    // Dropping the un-handed `Waiter` closes its channel, which ends its thread; consuming the end
-    // keeps the process-global record empty.
+    // The un-handed waiter ends on drop; consume its end.
     assert_eq!(
         waiter_threads::waiter_end(id.as_str()),
         waiter_threads::WaiterEnd::Returned
@@ -167,14 +164,12 @@ fn a_daemon_that_cannot_be_spawned_is_logged_and_nothing_is_left_running() {
     assert!(launched.is_none(), "launch reported a daemon whose spawn failed");
     // The OS's own refusal, asked for independently of the log line under test.
     let refusal = start(&mut build_command(&missing, id.as_str())).expect_err("the binary does not exist");
-    assert_eq!(
-        (take(id.as_str()), logging::default_log_path(id.as_str()).exists()),
-        (
-            vec![failure_line(id.as_str(), &spawn_failed(&missing.command, &refusal))],
-            false
-        ),
+    assert_one_failure(
+        &take(id.as_str()),
+        id.as_str(),
+        &["spawn [\"goetia-shim-test-no-such-binary\"]: ", &refusal.to_string()],
     );
-    // The waiter made before the spawn was dropped un-handed, which ends it.
+    // The un-handed waiter ends on drop; consume its end.
     assert_eq!(
         waiter_threads::waiter_end(id.as_str()),
         waiter_threads::WaiterEnd::Returned
@@ -202,19 +197,33 @@ fn a_log_file_that_cannot_be_opened_is_logged_and_the_daemon_still_runs() {
         "an unopenable log file stopped the daemon from running"
     );
     let refusal = logging::open_append(&unopenable).expect_err("the path cannot be opened");
-    assert_eq!(
-        (take(id.as_str()), logging::default_log_path(id.as_str()).exists()),
-        (
-            vec![failure_line(id.as_str(), &log_open_failed(&unopenable, &refusal))],
-            false
-        ),
+    assert_one_failure(
+        &take(id.as_str()),
+        id.as_str(),
+        &[
+            &format!("open log file {}: {refusal}", unopenable.display()),
+            " (this daemon's output will not be captured; it is still being run and supervised)",
+        ],
     );
 
-    // Dropping the un-handed waiter ends it and the `Child` kills the daemon, as in the control
-    // test above.
+    let daemon = launched
+        .as_ref()
+        .map(|(child, _waiter)| child.id())
+        .expect("the daemon just asserted launched");
+    assert_eq!(
+        daemon.is_alive(),
+        Liveness::Alive,
+        "the daemon is not running, so the log failure stopped it after all"
+    );
+    // The un-handed waiter ends on drop; consume its end.
     drop(launched);
     assert_eq!(
         waiter_threads::waiter_end(id.as_str()),
         waiter_threads::WaiterEnd::Returned
+    );
+    assert_eq!(
+        daemon.is_alive(),
+        Liveness::Dead,
+        "the daemon outlived the `Child` that owned it"
     );
 }
