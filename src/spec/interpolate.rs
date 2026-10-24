@@ -315,8 +315,7 @@ pub(crate) fn spec(raw: &mut RawSpec, path: &str, vars: &Vars) -> Result<()> {
 
 /// [`spec`], except a field that cannot be substituted (an undefined
 /// variable, a `$` in an `env` name) keeps its authored text and the walk
-/// goes on. The fields that do resolve end up substituted, so one failing
-/// field cannot hide what the others say.
+/// goes on.
 pub(crate) fn spec_resolvable(raw: &mut RawSpec, path: &str, vars: &Vars) {
     substitute_spec(raw, path, vars, true).expect("a lenient walk never fails");
 }
@@ -325,8 +324,6 @@ pub(crate) fn spec_resolvable(raw: &mut RawSpec, path: &str, vars: &Vars) {
 /// substituted into a copy and stored only on success, so a failing field is
 /// left exactly as authored, never half-substituted.
 fn substitute_spec(raw: &mut RawSpec, path: &str, vars: &Vars, lenient: bool) -> Result<()> {
-    // `settle` turns a field's failure into "keep the authored text" when
-    // `lenient`, and into the walk's failure otherwise.
     fn settle<T>(result: Result<T>, lenient: bool) -> Result<Option<T>> {
         match result {
             Ok(value) => Ok(Some(value)),

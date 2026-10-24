@@ -7,9 +7,8 @@
 //! `restart` (the `scm` refusal, the over-long-delay advisory), `restart-delay`
 //! (launchd rounding, the over-long-delay advisory), `type` (both `scm`
 //! advisories), and `cwd` and `logs` (presence only, for the managed
-//! advisory). `Backend::error` reads `user`, but only from a backend's own
-//! override, which step 5a never substitutes. A field added to those readers
-//! must be added to `Field` and to a scenario below.
+//! advisory). A field added to those readers must be added to `Field` and to a
+//! scenario below.
 
 use std::path::Path;
 
@@ -225,8 +224,13 @@ const SCENARIOS: [Scenario; 8] = [
 ];
 
 impl Scenario {
+    /// Whether the scenario's verdict depends on `field`. Under `type: managed`
+    /// that includes `cwd` and `logs`, whose presence the managed advisory reads.
     fn reads(&self, field: Field) -> bool {
-        self.field == field || self.literals.iter().any(|(f, _)| *f == field)
+        let managed =
+            (self.field == Field::Type && self.value == "managed") || self.literals.contains(&(Field::Type, "managed"));
+        let presence = managed && matches!(field, Field::Cwd | Field::Logs);
+        presence || self.field == field || self.literals.iter().any(|(f, _)| *f == field)
     }
 
     fn literal_lines(&self) -> Vec<(Field, String)> {
@@ -295,34 +299,68 @@ fn an_unrelated_field_that_fails_never_changes_the_verdict_on_a_field_the_checks
 }
 
 #[skuld::test]
-fn an_unreadable_env_file_leaves_every_templated_field_unjudged() {
-    // `.env` is a directory, so `Vars::load` fails. The native override
-    // replaces the one templated field, so the install needs no `.env`; the
-    // other backends inherit a `${V:-default}` whose default is exactly the
-    // value that would trip a check. Nothing may be judged on that guess: the
-    // verdict is that of the manifest with the base field not written at all
-    // (for `cwd` and `logs`, written as a literal: see below).
+fn a_field_under_test_that_cannot_be_determined_is_unjudged() {
+    // The native override replaces the templated field, so the install needs
+    // no value for it; the other backends inherit a base value that is
+    // undefined, invalid once substituted, or a `${V:-default}` whose default
+    // is exactly the value that would trip a check while `.env` is unreadable.
+    // Nothing may be judged on it: the verdict is that of the manifest with the
+    // field not written at all.
     for scenario in &SCENARIOS {
         for native in Backend::ALL {
-            let label = format!("{} / native {native}", scenario.name);
-            let dir = env_dir(None);
-            std::fs::create_dir(dir.path().join(".env")).expect("fixture directory should be creatable");
+            for (mode, template, env) in [
+                ("undefined", "${NOPE}".to_string(), Some("X=1\n".to_string())),
+                (
+                    "invalid once substituted",
+                    "${BAD}".to_string(),
+                    Some(format!("BAD={}\n", scenario.field.invalid())),
+                ),
+                ("unreadable .env", format!("${{V:-{}}}", scenario.value), None),
+            ] {
+                let label = format!("{} / native {native} / {mode}", scenario.name);
+                let dir = env_dir(env.as_deref());
+                if env.is_none() {
+                    // `.env` is a directory, so `Vars::load` fails.
+                    std::fs::create_dir(dir.path().join(".env")).expect("fixture directory should be creatable");
+                }
 
-            let overrides = [(scenario.field, scenario.native.to_string())];
-            let mut templated = scenario.literal_lines();
-            templated.insert(0, (scenario.field, format!("${{V:-{}}}", scenario.value)));
+                let overrides = [(scenario.field, scenario.native.to_string())];
+                let mut templated = scenario.literal_lines();
+                templated.insert(0, (scenario.field, template));
 
-            // `cwd` and `logs` are read for presence, which no `.env` changes:
-            // an unreadable one is still set, so it is judged as a literal.
-            let mut reference = scenario.literal_lines();
-            if matches!(scenario.field, Field::Cwd | Field::Logs) {
-                reference.insert(0, (scenario.field, scenario.native.to_string()));
+                let got = run(&manifest(&templated, native, &overrides), dir.path(), native);
+                let expected = run(
+                    &manifest(&scenario.literal_lines(), native, &overrides),
+                    dir.path(),
+                    native,
+                );
+                assert!(expected.is_ok(), "{label}: {expected:?}");
+                assert_eq!(got, expected, "{label}");
             }
+        }
+    }
+}
 
-            let got = run(&manifest(&templated, native, &overrides), dir.path(), native);
-            let expected = run(&manifest(&reference, native, &overrides), dir.path(), native);
-            assert!(expected.is_ok(), "{label}: {expected:?}");
-            assert_eq!(got, expected, "{label}");
+#[skuld::test]
+fn a_templated_field_in_a_non_native_override_is_unjudged() {
+    // A backend this host cannot install never has its override substituted,
+    // so the `$` stays deferred: the verdict is that of the unwritten field.
+    for scenario in &SCENARIOS {
+        for native in Backend::ALL {
+            for other in Backend::ALL.into_iter().filter(|b| *b != native) {
+                let label = format!("{} / native {native} / templated in {other}", scenario.name);
+                let dir = env_dir(Some(&format!("V={}\n", scenario.value)));
+
+                let templated = [(scenario.field, "${V}".to_string())];
+                let got = run(
+                    &manifest(&scenario.literal_lines(), other, &templated),
+                    dir.path(),
+                    native,
+                );
+                let expected = run(&manifest(&scenario.literal_lines(), other, &[]), dir.path(), native);
+                assert!(expected.is_ok(), "{label}: {expected:?}");
+                assert_eq!(got, expected, "{label}");
+            }
         }
     }
 }

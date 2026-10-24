@@ -230,15 +230,11 @@ impl Backend {
     /// the whole merged spec, unlike [`Backend::error`]: the base is what a
     /// backend installs when it has no override, so it is judged too.
     ///
-    /// Only `scm` has such a value today: `restart: always`. SCM recovery
-    /// actions fire on a failure, never after a clean exit, so the service
-    /// would silently stop restarting. Neither `type: simple` nor `type:
-    /// managed` can fake it, so the manifest must say what Windows should do
-    /// instead.
+    /// Only `scm` has one today: `restart: always` (SCM recovery actions never
+    /// fire after a clean exit).
     ///
     /// A `restart` that is [`Shaped::Deferred`] (its `$` not yet substituted)
-    /// reads as unknown and passes; `resolve` calls this again on the
-    /// substituted view, which is where it is caught.
+    /// reads as unknown and passes.
     pub(crate) fn reject_merged(self, spec: &ShapedSpec) -> Result<(), Error> {
         match self {
             Backend::Scm if spec.restart.parsed() == Some(Restart::Always) => Err(invalid(

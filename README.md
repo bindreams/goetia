@@ -454,7 +454,7 @@ $ goetia daemon show -f goetia.yaml
 error: daemon `frpc`: `restart: always` cannot be honoured by the scm backend: SCM recovery actions never fire after a clean exit. To keep `always` on systemd and launchd, set `backend-specific: scm: { restart: on-failure }`
 ```
 
-To keep `always` on systemd and launchd, override it for Windows:
+Override it for Windows:
 
 ```yaml
 restart: always
@@ -649,9 +649,9 @@ confirms differs:
   answers it "not loaded" with no job, since there is nothing to stop, and
   that stop succeeds.
 - **SCM**, for a `type: simple` daemon, confirms that `goetia-shim` started.
-  Under `restart: on-failure` the shim reports running before its
-  first spawn, so your own command failing to start is not part of what was
-  confirmed.
+  Under `restart: on-failure` (or a 0.1.0 install's `always`) the shim reports
+  running before its first spawn, so your own command failing to start is not
+  part of what was confirmed.
 - **launchd** sits between the two: the pid `launchctl kickstart -p` reports
   is launchd's own fork, taken before the user process reaches its `exec`.
 
