@@ -159,6 +159,46 @@ fn timed_out_refuses_a_zero_length_budget() {
     let _ = timed_out("frpc", "running", Budget::Bounded(Duration::ZERO));
 }
 
+// restart_pending =====================================================================================================
+
+#[skuld::test]
+fn restart_pending_is_not_a_wait_timeout_and_names_the_id_and_the_queued_restart() {
+    for budget in [Budget::DEFAULT, Budget::Immediate] {
+        let e = restart_pending("frpc", budget);
+        assert!(matches!(e, crate::Error::RestartPending { .. }), "{e:?}");
+        let message = e.to_string();
+        assert!(message.contains("frpc"), "{message}");
+        assert!(message.contains("restart"), "{message}");
+        assert!(message.contains("pending"), "{message}");
+        assert!(message.contains("nothing was stopped"), "{message}");
+    }
+}
+
+#[skuld::test]
+fn a_restart_pending_that_was_waited_for_says_how_long_and_how_to_wait_longer() {
+    let message = restart_pending("frpc", Budget::Bounded(Duration::from_secs(10))).to_string();
+    assert!(message.contains("10s"), "{message}");
+    assert!(message.contains("--timeout <duration>"), "{message}");
+    assert!(message.contains("--no-timeout"), "{message}");
+    assert!(message.contains("goetia daemon status frpc"), "{message}");
+}
+
+/// `--timeout 0` waited for nothing: the message must not claim a wait, and must say what to run.
+#[skuld::test]
+fn a_restart_pending_that_was_not_waited_for_says_so() {
+    let message = restart_pending("frpc", Budget::Immediate).to_string();
+    assert!(!message.contains("waited"), "{message}");
+    assert!(message.contains("--timeout 0"), "{message}");
+    assert!(message.contains("goetia daemon stop frpc"), "{message}");
+}
+
+/// An unbounded wait never ends, so it cannot report a restart it ran out of time for.
+#[skuld::test]
+#[should_panic(expected = "an unbounded wait cannot run out")]
+fn restart_pending_refuses_an_unbounded_budget() {
+    let _ = restart_pending("frpc", Budget::Unbounded);
+}
+
 // Deadline ============================================================================================================
 
 #[skuld::test]

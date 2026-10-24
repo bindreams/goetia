@@ -160,7 +160,10 @@ pub enum DaemonCommand {
 ///   stop followed by a refused start — and so does
 ///   [`Error::RequestInDoubt`](crate::error::Error::RequestInDoubt), for a
 ///   request goetia lost track of, which may or may not have reached the
-///   manager, or reached it with its outcome unconfirmed. Reporting the first as `1` would
+///   manager, or reached it with its outcome unconfirmed, and so does
+///   [`Error::RestartPending`](crate::error::Error::RestartPending), for a
+///   `stop` that found a restart queued by the manager and could not wait it
+///   out: nothing was stopped, and the daemon will run again. Reporting the first as `1` would
 ///   claim the operation determinately failed, which it did not establish;
 ///   reporting the second as `1` would make the refusal the whole answer,
 ///   when the unconfirmed stop before it leaves where the daemon ended up
@@ -178,9 +181,9 @@ pub enum DaemonCommand {
 ///   agree about `Undetermined` and disagree only about
 ///   `Outcome::RefuseUnreadable`, which `install` reports as `1` because it
 ///   genuinely failed to install. All six id verbs return it through
-///   `support::run_id_verb`, for four conditions: `Undetermined`, where
+///   `support::run_id_verb`, for five conditions: `Undetermined`, where
 ///   goetia could not determine what is at the id, and — from the verbs that
-///   act — `WaitTimeout`, `Unestablished` and `RequestInDoubt`, where it
+///   act — `WaitTimeout`, `Unestablished`, `RequestInDoubt` and `RestartPending`, where it
 ///   acted, or may have, and could not determine the outcome.
 ///   `show` returns it too (`cli::show::run`), in both its per-id and
 ///   no-ids forms — for an "installed but unreadable" id, for an id

@@ -7,7 +7,7 @@ use std::ffi::c_void;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use windows_service::service::{Service, ServiceAccess, ServiceState};
+use windows_service::service::{Service, ServiceAccess, ServiceActionType, ServiceExitCode, ServiceState};
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_NOT_ACTIVE, WAIT_IO_COMPLETION};
 use windows_sys::Win32::System::Services::{
@@ -17,9 +17,9 @@ use windows_sys::Win32::System::Services::{
 };
 use windows_sys::Win32::System::Threading::{INFINITE, SleepEx};
 
-use crate::backend::scm::exit_status::RecordedExit;
+use crate::backend::scm::exit_status::{ERROR_SERVICE_SPECIFIC_ERROR, RecordedExit};
 
-use super::{Deadline, Observed, QueriedState, StartReply, Waited, WantState};
+use super::{Deadline, Observed, QueriedState, Recovery, StartReply, Waited, WantState};
 
 /// `windows-service`'s `Error` does not implement `Into<io::Error>` for
 /// every variant (it also carries parse errors this module never
@@ -104,6 +104,9 @@ fn want_to_mask(want: WantState, started: bool) -> SERVICE_NOTIFY {
         WantState::Stopped => SERVICE_NOTIFY_STOPPED | SERVICE_NOTIFY_STOP_PENDING,
         WantState::Running if started => SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_STOPPED | SERVICE_NOTIFY_START_PENDING,
         WantState::Running => SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_START_PENDING,
+        // Never the state the service is in: a mask holding it fires at once, on the same record.
+        WantState::RestartBegins => SERVICE_NOTIFY_START_PENDING | SERVICE_NOTIFY_RUNNING,
+        WantState::RestartResolves => SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_STOPPED,
     }
 }
 
@@ -153,7 +156,7 @@ pub struct SystemScmActor {
 }
 
 impl SystemScmActor {
-    /// Open `name` with `QUERY_STATUS | STOP | START` — everything both
+    /// Open `name` with `QUERY_STATUS | QUERY_CONFIG | STOP | START` — everything both
     /// [`super::stop_via_notify`] and [`super::start_via_notify`] need,
     /// so one actor serves either wait without reopening.
     pub fn open(name: &str) -> io::Result<Self> {
@@ -210,7 +213,7 @@ fn open_scm() -> io::Result<WinServiceManager> {
 fn open_handle(scm: &WinServiceManager, name: &str) -> io::Result<Service> {
     scm.open_service(
         name,
-        ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::START,
+        ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG | ServiceAccess::STOP | ServiceAccess::START,
     )
     .map_err(to_io_error)
 }
@@ -377,5 +380,34 @@ impl super::ScmActor for SystemScmActor {
             win32: self.status.exit_win32.load(Ordering::Acquire),
             specific: self.status.exit_specific.load(Ordering::Acquire),
         }
+    }
+
+    fn query_status(&mut self) -> io::Result<(QueriedState, RecordedExit)> {
+        let status = self.service()?.query_status().map_err(to_io_error)?;
+        // `windows-service` folds the pair into one code: a service-specific code is carried by
+        // Win32 1066. Only Win32 decides recovery, and `(0, n)` reads as `Win32(0)`, which is right.
+        let exit = match status.exit_code {
+            ServiceExitCode::Win32(win32) => RecordedExit { win32, specific: 0 },
+            ServiceExitCode::ServiceSpecific(specific) => RecordedExit {
+                win32: ERROR_SERVICE_SPECIFIC_ERROR,
+                specific,
+            },
+        };
+        Ok((queried_state(status.current_state), exit))
+    }
+
+    fn recovery(&mut self) -> io::Result<Recovery> {
+        let service = self.service()?;
+        let actions = service.get_failure_actions().map_err(to_io_error)?;
+        Ok(Recovery {
+            restarts: actions
+                .actions
+                .iter()
+                .flatten()
+                .any(|action| action.action_type == ServiceActionType::Restart),
+            on_non_crash_failures: service
+                .get_failure_actions_on_non_crash_failures()
+                .map_err(to_io_error)?,
+        })
     }
 }

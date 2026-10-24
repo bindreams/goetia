@@ -29,6 +29,18 @@ struct FakeScm {
     arm_deadlines: Vec<Deadline>,
     /// What SCM recorded for a `Stopped` the script delivers.
     recorded: RecordedExit,
+    /// Records for the first delivered `Stopped`s, front to back; `recorded` once it runs dry.
+    stopped_records: VecDeque<RecordedExit>,
+    /// The failure-action configuration `recovery` reads; `None` makes the read fail.
+    recovery: Option<Recovery>,
+    /// What the next `query_status` calls answer, front to back; the last delivered record, stopped,
+    /// once it runs dry.
+    queries: VecDeque<(QueriedState, RecordedExit)>,
+    /// What `query_status` answers before any `Stopped` was delivered: a stop requested without a
+    /// wait finds the service in this state.
+    queried_at_request: (QueriedState, RecordedExit),
+    last_stopped: Option<RecordedExit>,
+    recovery_reads: usize,
 }
 
 impl FakeScm {
@@ -42,7 +54,43 @@ impl FakeScm {
             deadlines: vec![],
             arm_deadlines: vec![],
             recorded: shim_failed(),
+            stopped_records: VecDeque::new(),
+            recovery: Some(Recovery::default()),
+            queries: VecDeque::new(),
+            queried_at_request: (QueriedState::Running, RecordedExit { win32: 0, specific: 0 }),
+            last_stopped: None,
+            recovery_reads: 0,
         }
+    }
+
+    /// The first delivered `Stopped`s carry these records, in order.
+    fn stopped_with<const N: usize>(mut self, records: [RecordedExit; N]) -> Self {
+        self.stopped_records = records.into();
+        self
+    }
+
+    /// The service restarts on a failure, as goetia configures `restart: on-failure`.
+    fn restarting(mut self) -> Self {
+        self.recovery = Some(RESTARTS);
+        self
+    }
+
+    /// Reading the failure actions fails.
+    fn unreadable_recovery(mut self) -> Self {
+        self.recovery = None;
+        self
+    }
+
+    /// `query_status` answers these, front to back.
+    fn queried<const N: usize>(mut self, answers: [(QueriedState, RecordedExit); N]) -> Self {
+        self.queries = answers.into();
+        self
+    }
+
+    /// A stop requested with no wait finds the service in `state` with `exit` recorded.
+    fn found(mut self, state: QueriedState, exit: RecordedExit) -> Self {
+        self.queried_at_request = (state, exit);
+        self
     }
 
     /// A delivered `Stopped` carries the record `reported` leaves in SCM.
@@ -82,6 +130,8 @@ impl ScmActor for FakeScm {
         self.log.push(match want {
             WantState::Stopped => "arm_stopped",
             WantState::Running => "arm_running",
+            WantState::RestartBegins => "arm_restart_begins",
+            WantState::RestartResolves => "arm_restart_resolves",
         });
         Ok(self.what_arm_reports)
     }
@@ -100,6 +150,9 @@ impl ScmActor for FakeScm {
         self.log.push("wait");
         self.deadlines.push(deadline);
         let observed = self.waits.pop_front().expect("script ran dry");
+        if observed == Some(Observed::Stopped) {
+            self.last_stopped = Some(self.stopped_records.pop_front().unwrap_or(self.recorded));
+        }
         self.log.push(match observed {
             Some(Observed::Stopped) => "got_stopped",
             Some(Observed::Running) => "got_running",
@@ -109,8 +162,38 @@ impl ScmActor for FakeScm {
         Ok(observed)
     }
     fn stopped_exit(&self) -> RecordedExit {
-        self.recorded
+        self.last_stopped.unwrap_or(self.recorded)
     }
+    fn query_status(&mut self) -> std::io::Result<(QueriedState, RecordedExit)> {
+        self.log.push("query");
+        Ok(self.queries.pop_front().unwrap_or(match self.last_stopped {
+            // Unchanged since the last `Stopped` the script delivered.
+            Some(exit) => (QueriedState::Stopped, exit),
+            None => self.queried_at_request,
+        }))
+    }
+    fn recovery(&mut self) -> std::io::Result<Recovery> {
+        self.recovery_reads += 1;
+        self.recovery
+            .ok_or_else(|| std::io::Error::other("scripted recovery read failure"))
+    }
+}
+
+/// `restart: on-failure` as goetia writes it: a restart action, and the non-crash flag.
+const RESTARTS: Recovery = Recovery {
+    restarts: true,
+    on_non_crash_failures: true,
+};
+
+/// A daemon that exited 7: what SCM records and restarts on.
+fn daemon_failed() -> RecordedExit {
+    let (win32, specific) = Reported::from_daemon_code(7).scm_codes();
+    RecordedExit { win32, specific }
+}
+
+/// A commanded stop, or a clean exit: nothing follows it.
+fn stopped_clean() -> RecordedExit {
+    RecordedExit { win32: 0, specific: 0 }
 }
 
 /// The record of a service whose shim failed before launching the daemon.
@@ -132,7 +215,7 @@ fn spent() -> Deadline {
 #[skuld::test]
 fn stop_via_notify_arms_stopped_then_gates_on_stopped() {
     let mut fake = FakeScm::new([Some(Observed::Stopped)]);
-    assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), StopWaited::Confirmed);
     assert_eq!(fake.log, vec!["arm_stopped", "control_stop", "wait", "got_stopped"]);
 }
 
@@ -141,7 +224,7 @@ fn stop_re_arms_after_a_non_terminal_callback() {
     // A pending (intermediate) callback fires while waiting for STOPPED, then
     // STOPPED; the non-terminal callback must trigger a re-arm.
     let mut fake = FakeScm::new([Some(Observed::Pending), Some(Observed::Stopped)]);
-    assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), StopWaited::Confirmed);
     assert_eq!(
         fake.log,
         vec![
@@ -294,7 +377,7 @@ fn a_start_wait_whose_deadline_expires_reports_expired() {
 #[skuld::test]
 fn a_stop_wait_whose_deadline_expires_reports_expired() {
     let mut fake = FakeScm::new([Some(Observed::Pending), None]);
-    assert_eq!(stop_via_notify(&mut fake, spent()).unwrap(), Waited::Expired);
+    assert_eq!(stop_via_notify(&mut fake, spent()).unwrap(), StopWaited::Expired);
 }
 
 #[skuld::test]
@@ -347,7 +430,7 @@ fn a_pending_stop_callback_rearms_under_the_same_deadline() {
         Some(Observed::Running),
         Some(Observed::Stopped),
     ]);
-    assert_eq!(stop_via_notify(&mut fake, deadline).unwrap(), Waited::Confirmed);
+    assert_eq!(stop_via_notify(&mut fake, deadline).unwrap(), StopWaited::Confirmed);
     assert_eq!(fake.arm_count(), 3);
     assert_eq!(fake.arm_deadlines, vec![deadline; 3]);
     assert_eq!(fake.deadlines, vec![deadline; 3]);
@@ -387,8 +470,288 @@ fn request_start_arms_nothing_and_waits_for_nothing() {
 #[skuld::test]
 fn request_stop_arms_nothing_and_waits_for_nothing() {
     let mut fake = FakeScm::new([]);
-    request_stop(&mut fake).unwrap();
-    assert_eq!(fake.log, vec!["control_stop"]);
+    assert_eq!(request_stop(&mut fake).unwrap(), RequestedStop::Issued);
+    assert_eq!(fake.log, vec!["query", "control_stop"]);
+}
+
+// a restart SCM has queued --------------------------------------------------------------------------------------------
+
+/// A service that stopped on a failure while recovery actions are configured has a restart queued
+/// that nothing cancels, so the stop waits for it, stops what it starts, and ends on a `STOPPED`
+/// that queues nothing.
+#[skuld::test]
+fn a_stop_of_a_service_awaiting_its_restart_waits_for_the_restart_and_stops_what_it_starts() {
+    let deadline = an_hour_out();
+    let mut fake = FakeScm::new([
+        Some(Observed::Stopped),
+        Some(Observed::Running),
+        Some(Observed::Stopped),
+    ])
+    .restarting()
+    .stopped_with([daemon_failed(), stopped_clean()]);
+    assert_eq!(stop_via_notify(&mut fake, deadline).unwrap(), StopWaited::Confirmed);
+    assert_eq!(
+        fake.log,
+        vec![
+            "arm_stopped",
+            "control_stop",
+            "wait",
+            "got_stopped",
+            // The restart is queued: wait for it to begin.
+            "arm_restart_begins",
+            "query",
+            "wait",
+            "got_running",
+            // The restarted daemon is running: an ordinary stop, armed before it is issued.
+            "arm_stopped",
+            "control_stop",
+            "wait",
+            "got_stopped",
+        ]
+    );
+    assert_eq!(fake.arm_deadlines, vec![deadline; 3]);
+    assert_eq!(fake.deadlines, vec![deadline; 3]);
+}
+
+#[skuld::test]
+fn a_restart_passing_through_start_pending_is_watched_to_its_outcome() {
+    let mut fake = FakeScm::new([
+        Some(Observed::Stopped),
+        Some(Observed::Pending),
+        Some(Observed::Running),
+        Some(Observed::Stopped),
+    ])
+    .restarting()
+    .stopped_with([daemon_failed(), stopped_clean()]);
+    assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), StopWaited::Confirmed);
+    assert_eq!(
+        fake.log,
+        vec![
+            "arm_stopped",
+            "control_stop",
+            "wait",
+            "got_stopped",
+            "arm_restart_begins",
+            "query",
+            "wait",
+            "got_pending",
+            "arm_restart_resolves",
+            "wait",
+            "got_running",
+            "arm_stopped",
+            "control_stop",
+            "wait",
+            "got_stopped",
+        ]
+    );
+}
+
+/// SCM's own attempt to start the service failed (P10): `START_PENDING`, then `STOPPED` with Win32
+/// 0, and nothing follows. Waiting on for a `RUNNING` would only run out the budget.
+#[skuld::test]
+fn a_restart_attempt_scm_could_not_make_leaves_nothing_pending() {
+    let mut fake = FakeScm::new([
+        Some(Observed::Stopped),
+        Some(Observed::Pending),
+        Some(Observed::Stopped),
+    ])
+    .restarting()
+    .stopped_with([daemon_failed(), stopped_clean()]);
+    assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), StopWaited::Confirmed);
+    assert_eq!(
+        fake.log,
+        vec![
+            "arm_stopped",
+            "control_stop",
+            "wait",
+            "got_stopped",
+            "arm_restart_begins",
+            "query",
+            "wait",
+            "got_pending",
+            "arm_restart_resolves",
+            "wait",
+            "got_stopped",
+        ],
+        "no stop is issued: there is nothing running"
+    );
+}
+
+/// A restarted process that fails before it is running is an ordinary failure (P9), and the action
+/// repeats.
+#[skuld::test]
+fn a_restarted_daemon_that_fails_again_keeps_the_wait_going() {
+    let shim_failed = RecordedExit { win32: 5, specific: 0 };
+    let mut fake = FakeScm::new([
+        Some(Observed::Stopped),
+        Some(Observed::Pending),
+        Some(Observed::Stopped),
+        Some(Observed::Running),
+        Some(Observed::Stopped),
+    ])
+    .restarting()
+    .stopped_with([daemon_failed(), shim_failed, stopped_clean()]);
+    assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), StopWaited::Confirmed);
+    assert_eq!(
+        fake.log,
+        vec![
+            "arm_stopped",
+            "control_stop",
+            "wait",
+            "got_stopped",
+            "arm_restart_begins",
+            "query",
+            "wait",
+            "got_pending",
+            "arm_restart_resolves",
+            "wait",
+            "got_stopped",
+            // Another restart is queued.
+            "arm_restart_begins",
+            "query",
+            "wait",
+            "got_running",
+            "arm_stopped",
+            "control_stop",
+            "wait",
+            "got_stopped",
+        ]
+    );
+}
+
+/// The attempt can be made, and fail, between the `STOPPED` that queued the restart and the arm
+/// that watches for it: the arm is on `START_PENDING` and `RUNNING`, so it would never hear of it.
+/// The status read right after the arm is what catches it.
+#[skuld::test]
+fn a_restart_attempt_that_failed_before_the_arm_is_not_waited_for() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)])
+        .restarting()
+        .stopped_with([daemon_failed()])
+        .queried([(QueriedState::Stopped, stopped_clean())]);
+    assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), StopWaited::Confirmed);
+    assert_eq!(
+        fake.log,
+        vec![
+            "arm_stopped",
+            "control_stop",
+            "wait",
+            "got_stopped",
+            "arm_restart_begins",
+            "query"
+        ]
+    );
+}
+
+/// A stop that arrives as the daemon fails: the `STOPPED` the stop waits for is the failure's, and
+/// SCM queues its restart. The stop then meets the pending state.
+#[skuld::test]
+fn a_stop_that_meets_a_failing_daemon_follows_the_restart_that_failure_queues() {
+    let mut fake = FakeScm::new([
+        Some(Observed::Pending),
+        Some(Observed::Stopped),
+        Some(Observed::Running),
+        Some(Observed::Stopped),
+    ])
+    .restarting()
+    .stopped_with([daemon_failed(), stopped_clean()]);
+    assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), StopWaited::Confirmed);
+    assert_eq!(fake.log.iter().filter(|step| **step == "control_stop").count(), 2);
+}
+
+#[skuld::test]
+fn a_wait_for_a_restart_that_runs_out_reports_the_restart_pending() {
+    for waits in [
+        vec![Some(Observed::Stopped), None],
+        vec![Some(Observed::Stopped), Some(Observed::Pending), None],
+    ] {
+        let mut fake = FakeScm::new([]).restarting().stopped_with([daemon_failed()]);
+        fake.waits = waits.into();
+        assert_eq!(stop_via_notify(&mut fake, spent()).unwrap(), StopWaited::RestartPending);
+        assert_eq!(
+            fake.log.iter().filter(|step| **step == "control_stop").count(),
+            1,
+            "nothing is running to stop while the restart is pending"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_failure_with_no_recovery_actions_queues_nothing() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_with([daemon_failed()]);
+    assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), StopWaited::Confirmed);
+    assert_eq!(fake.log, vec!["arm_stopped", "control_stop", "wait", "got_stopped"]);
+}
+
+/// A clean stop is the common case and needs no read of the configuration.
+#[skuld::test]
+fn a_clean_stop_reads_no_recovery_configuration() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)])
+        .unreadable_recovery()
+        .stopped_with([stopped_clean()]);
+    assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), StopWaited::Confirmed);
+}
+
+#[skuld::test]
+fn a_recovery_configuration_that_cannot_be_read_fails_the_stop() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)])
+        .unreadable_recovery()
+        .stopped_with([daemon_failed()]);
+    assert!(stop_via_notify(&mut fake, unbounded()).is_err());
+}
+
+#[skuld::test]
+fn only_a_non_zero_win32_code_with_a_restart_action_queues_a_restart() {
+    let exit = |win32| RecordedExit { win32, specific: 7 };
+    let crashes_only = Recovery {
+        restarts: true,
+        on_non_crash_failures: false,
+    };
+    let no_restart = Recovery {
+        restarts: false,
+        on_non_crash_failures: true,
+    };
+
+    // Win32 0 is never restarted, whatever the service-specific code (P7b).
+    assert!(!restart_queued(exit(0), RESTARTS));
+    assert!(restart_queued(exit(1066), RESTARTS));
+    assert!(restart_queued(exit(31), RESTARTS));
+    assert!(!restart_queued(exit(1066), no_restart));
+    // Without the non-crash flag only a process that ended without reporting (1067) is restarted.
+    assert!(!restart_queued(exit(1066), crashes_only));
+    assert!(!restart_queued(exit(31), crashes_only));
+    assert!(restart_queued(exit(1067), crashes_only));
+}
+
+/// `--timeout 0` waits for nothing, so it cannot stop what the restart will start. It says so
+/// instead of issuing a stop that SCM answers with a success the pending restart then undoes.
+#[skuld::test]
+fn a_stop_request_over_a_pending_restart_issues_nothing() {
+    let mut fake = FakeScm::new([])
+        .restarting()
+        .found(QueriedState::Stopped, daemon_failed());
+    assert_eq!(request_stop(&mut fake).unwrap(), RequestedStop::RestartPending);
+    assert_eq!(fake.log, vec!["query"]);
+}
+
+#[skuld::test]
+fn a_stop_request_is_issued_unless_a_restart_is_pending() {
+    for (recovering, state, exit) in [
+        (true, QueriedState::Stopped, stopped_clean()),
+        (false, QueriedState::Stopped, daemon_failed()),
+        (true, QueriedState::Running, daemon_failed()),
+        (true, QueriedState::StartPending, daemon_failed()),
+    ] {
+        let mut fake = FakeScm::new([]).found(state, exit);
+        if recovering {
+            fake = fake.restarting();
+        }
+        assert_eq!(
+            request_stop(&mut fake).unwrap(),
+            RequestedStop::Issued,
+            "{state:?} {exit:?}"
+        );
+        assert_eq!(fake.log, vec!["query", "control_stop"], "{state:?} {exit:?}");
+    }
 }
 
 // handle teardown -----------------------------------------------------------------------------------------------------

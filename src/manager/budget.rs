@@ -120,6 +120,40 @@ pub fn timed_out(id: &str, awaited: &'static str, budget: Budget) -> crate::Erro
     }
 }
 
+// restart_pending =====================================================================================================
+
+/// The one [`crate::Error::RestartPending`] constructor: `stop` found a restart queued by SCM's
+/// recovery actions and either did not wait for it (`Immediate`, or `Bounded(ZERO)`) or waited
+/// `budget` and it had not arrived. In both cases nothing was stopped.
+///
+/// `Unbounded` waits until the restart arrives and stops what it starts, so it never reports this.
+pub fn restart_pending(id: &str, budget: Budget) -> crate::Error {
+    let advice = format!(
+        "Allow longer with `--timeout <duration>`, or wait indefinitely with `--no-timeout`; \
+         `goetia daemon status {id}` shows the manager's current view."
+    );
+    let recovery = match budget {
+        Budget::Bounded(waited) if waited > Duration::ZERO => format!(
+            "its daemon failed and SCM will start it again, which nothing cancels. goetia waited {} \
+             for that restart and stopped waiting, so nothing was stopped. {advice}",
+            humantime::format_duration(waited),
+        ),
+        Budget::Immediate | Budget::Bounded(_) => format!(
+            "its daemon failed and SCM will start it again, which nothing cancels. `--timeout 0` does \
+             not wait for that restart, so nothing was stopped. Run `goetia daemon stop {id}` with a \
+             `--timeout` above 0 to wait for the restart and stop the daemon it starts. {advice}"
+        ),
+        Budget::Unbounded => {
+            debug_assert!(false, "an unbounded wait cannot run out of budget");
+            String::new()
+        }
+    };
+    crate::Error::RestartPending {
+        id: id.to_string(),
+        recovery,
+    }
+}
+
 // Deadline ============================================================================================================
 
 /// An absolute instant a [`Budget`] resolves to via [`Budget::start`].

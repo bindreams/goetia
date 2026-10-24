@@ -94,15 +94,15 @@ use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::PathBuf;
 
 use windows_service::service::{
-    Service, ServiceAccess, ServiceActionType, ServiceErrorControl, ServiceFailureResetPeriod, ServiceInfo,
-    ServiceStartType, ServiceState as WinState, ServiceType,
+    Service, ServiceAccess, ServiceActionType, ServiceErrorControl, ServiceExitCode, ServiceFailureResetPeriod,
+    ServiceInfo, ServiceStartType, ServiceState as WinState, ServiceType,
 };
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SERVICE_DOES_NOT_EXIST, LocalFree};
 use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHANGE};
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
-use super::wait::Waited;
+use super::wait::{RequestedStop, StopWaited, Waited};
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::blob::Blob;
 use crate::decide::{self, Outcome, Ownership};
@@ -237,13 +237,17 @@ impl ServiceManager for ScmManager {
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to stop it: {e}")))?;
         if !budget.waits() {
-            return super::wait::request_stop(&mut actor).map_err(|e| Error::Other(format!("stop `{id}`: {e}")));
+            return match super::wait::request_stop(&mut actor).map_err(|e| Error::Other(format!("stop `{id}`: {e}")))? {
+                RequestedStop::Issued => Ok(()),
+                RequestedStop::RestartPending => Err(budget::restart_pending(id.as_str(), budget)),
+            };
         }
         let waited = super::wait::stop_via_notify(&mut actor, deadline)
             .map_err(|e| Error::Other(format!("stop `{id}`: {e}")))?;
         match waited {
-            Waited::Confirmed => Ok(()),
-            Waited::Expired => Err(budget::timed_out(id.as_str(), "stopped", budget)),
+            StopWaited::Confirmed => Ok(()),
+            StopWaited::Expired => Err(budget::timed_out(id.as_str(), "stopped", budget)),
+            StopWaited::RestartPending => Err(budget::restart_pending(id.as_str(), budget)),
         }
     }
 
@@ -905,7 +909,9 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
         let status = service
             .query_status()
             .map_err(|e| to_error(&format!("query status for `{id}` before uninstall"), e))?;
-        status.current_state != WinState::Stopped
+        // A `STOPPED` with a non-zero Win32 code may have a restart queued, which deleting the
+        // service does not stop from firing into it: `stop_via_notify` decides.
+        status.current_state != WinState::Stopped || status.exit_code != ServiceExitCode::Win32(0)
         // `service`'s `SC_HANDLE` closes here, at the end of this block.
     };
 
@@ -925,10 +931,12 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
             ))
         })?;
         match waited {
-            Waited::Confirmed => {}
+            StopWaited::Confirmed => {}
             // `let _ = …` is the write that turns an unreachable case into a silent one, and this
             // is precisely the case where a later edit narrowing that budget must not pass quietly.
-            Waited::Expired => unreachable!("uninstall's stop is Unbounded; an unbounded deadline never expires"),
+            StopWaited::Expired | StopWaited::RestartPending => {
+                unreachable!("uninstall's stop is Unbounded; an unbounded deadline never expires")
+            }
         }
         // `actor`'s `SC_HANDLE` must close before the `DELETE` handle opens
         // below — dropping it explicitly documents that ordering rather than

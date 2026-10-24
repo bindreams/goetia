@@ -644,9 +644,15 @@ reports how it ended as the service's exit, and exits. With `restart: on-failure
 SCM then starts a new shim after `restart-delay` (1s by default), and that shim
 reads the spec as installed, so a daemon restarted after `goetia daemon install`
 runs the updated spec. A shim that is killed or crashes is restarted too. A
-clean exit is never restarted, and a stop reports a clean exit. A command that
-fails at the moment a `goetia daemon stop` arrives is restarted anyway: SCM
-cannot tell that stop from the crash.
+clean exit is never restarted, and a stop reports a clean exit.
+
+Nothing cancels a restart SCM has queued, so `goetia daemon stop` meets it
+head on: a command that failed and is waiting out `restart-delay`, or one that
+fails as the stop arrives. `stop` waits for that restart, within `--timeout`,
+and stops the command it starts, so the daemon stays down; `restart` and
+`uninstall` stop it the same way. If the restart does not arrive in time, or
+`--timeout` is `0`, nothing is stopped: `stop` exits `4` and says a restart is
+pending. Run it again with a longer `--timeout`, or `--no-timeout`.
 
 After upgrading goetia, run `goetia daemon install` again for every daemon
 installed by an older version. Services registered before this shim existed
@@ -702,6 +708,12 @@ confirms differs:
 stopped waiting; it did not cancel anything, so the request stands and the
 daemon may still arrive. `goetia daemon status <id>` shows the manager's
 current view.
+
+On Windows a `stop` can also exit `4` with nothing issued: the daemon failed
+and SCM has a restart queued (see [Restarts on
+Windows](#restarts-on-windows)). The restart is the thing to wait for, so
+`stop --timeout 0` and a `--timeout` that ends before it both exit `4`, and the
+message says that a restart is pending.
 
 A `start` of a daemon that is already running is where the three disagree
 under a very short `--timeout`. launchd and SCM say "running" — launchd
@@ -1073,7 +1085,8 @@ that comes with it.
 Two within what `list`, `status` and `show` report. The mutating verbs reach
 `4` three more ways: by
 [waiting and giving up](#when-the-wait-runs-out); by losing track of a
-request, one that reached the manager or one that may or may not have; and,
+request, one that reached the manager or one that may or may not have; by a
+`stop` that found a restart SCM had queued and could not wait for it; and,
 for a `restart` that does not wait, by a start refused after a stop nobody
 confirmed. The two
 sources are not interchangeable, and the remedies do not transfer:
