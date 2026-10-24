@@ -482,3 +482,64 @@ fn a_scan_that_finished_over_nothing_adds_no_entry() {
 
     assert!(classify_scan(scan).expect("list").is_empty());
 }
+
+// Install refuses `restart: always` ===================================================================================
+
+fn daemon_spec(restart: crate::spec::Restart) -> DaemonSpec {
+    DaemonSpec {
+        id: Id::try_from("frpc").unwrap(),
+        name: "frpc".to_string(),
+        command: vec![r"C:\bin\frpc.exe".to_string()],
+        cwd: None,
+        env: BTreeMap::new(),
+        user: crate::spec::User::Root,
+        restart,
+        restart_delay: None,
+        logs: None,
+        kind: Kind::Managed,
+    }
+}
+
+/// A `DaemonSpec` that did not come from `resolve` must not install with on-failure semantics.
+#[skuld::test]
+fn install_refuses_restart_always_before_touching_the_scm() {
+    let err = refuse_always(&daemon_spec(crate::spec::Restart::Always)).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("frpc") && text.contains("restart: always"), "{text}");
+}
+
+#[skuld::test]
+fn install_accepts_every_other_restart() {
+    for restart in [crate::spec::Restart::Never, crate::spec::Restart::OnFailure] {
+        refuse_always(&daemon_spec(restart)).unwrap();
+    }
+}
+
+// start_kind ----------------------------------------------------------------------------------------------------------
+
+fn blob_of(kind: Kind) -> Blob {
+    Blob {
+        schema: 1,
+        version: "0.1.0".to_string(),
+        spec: DaemonSpec {
+            id: Id::try_from("frpc").unwrap(),
+            name: "frpc".to_string(),
+            command: vec!["frpc".to_string()],
+            cwd: None,
+            env: BTreeMap::new(),
+            user: crate::spec::User::Root,
+            restart: Restart::Never,
+            restart_delay: None,
+            logs: None,
+            kind,
+        },
+    }
+}
+
+#[skuld::test]
+fn start_reads_a_simple_service_by_the_shims_vocabulary_and_anything_else_strictly() {
+    assert_eq!(start_kind(Ok(Some(blob_of(Kind::Simple)))), Kind::Simple);
+    assert_eq!(start_kind(Ok(Some(blob_of(Kind::Managed)))), Kind::Managed);
+    assert_eq!(start_kind(Ok(None)), Kind::Managed);
+    assert_eq!(start_kind(Err(Error::Blob("corrupt".to_string()))), Kind::Managed);
+}

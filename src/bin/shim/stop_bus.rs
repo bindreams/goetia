@@ -1,6 +1,6 @@
 //! The stop signal shared between the SCM control-handler callback and the
-//! supervisor loop, and the composition that lets the loop block on either
-//! "the current child exited" or "a stop was requested" without polling.
+//! service thread, and the composition that lets that thread block on either
+//! "the child exited" or "a stop was requested" without polling.
 //!
 //! Process-tree waiting is `cosca::Child`'s job (see `main.rs`'s module doc
 //! comment); this module supplies the piece `cosca` does not: a way to
@@ -14,7 +14,6 @@
 
 use std::io;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
-use std::time::Duration;
 
 use cosca::Child;
 
@@ -42,7 +41,7 @@ pub enum WaitOutcome {
     /// A stop was requested and neither `kill_tree` nor the direct-child
     /// fallback could kill the daemon, so nothing was reaped and it may still
     /// be running — see [`StopBus::wait_for_child_or_stop`] for why this is
-    /// still a return rather than a wait, and `service::EXIT_STOP_INCOMPLETE`
+    /// still a return rather than a wait, and `Reported::incomplete_stop`
     /// for what the caller reports for it.
     StoppingUnkillable,
 }
@@ -56,7 +55,7 @@ pub enum WaitOutcome {
 /// **Why it is made first, and never after.** This wait is the only thing that ever observes the
 /// daemon exiting or tears its tree down on a stop. Making it after the spawn means a daemon can
 /// be running before the shim knows whether anything can watch it, and the OS refusing a thread
-/// there leaves that daemon orphaned: nothing supervising it, nothing to stop it, no kill-tree
+/// there leaves that daemon orphaned: nothing waiting on it, nothing to stop it, no kill-tree
 /// teardown — with SCM told, at best, that its service just died. `std::thread::Scope::spawn`
 /// could not even report that refusal: it has no `Result` and panics, taking the service process
 /// down with the daemon already up.
@@ -91,9 +90,14 @@ impl Waiter {
         let reporting_to = Arc::clone(bus);
         let bus = Arc::clone(bus);
         let id = id.to_string();
+        // Read here, on the calling thread: the closure runs on a thread the hook was not armed on.
+        #[cfg(test)]
+        let waiting = test_hook::waiting();
         let thread = std::thread::Builder::new()
             .name("goetia-shim-waiter".to_string())
             .spawn(move || {
+                #[cfg(test)]
+                let _exit = test_hook::waiter_running(&id);
                 let Ok(child) = rx.recv() else {
                     return; // never handed a daemon: none was spawned
                 };
@@ -103,10 +107,14 @@ impl Waiter {
                 // to keep waiting on, and staying silent would leave
                 // `wait_for_child_or_stop`'s `Condvar::wait_while` with no
                 // further waker at all in the (ordinary, no-stop-requested)
-                // case, hanging the supervisor loop forever on a child that
+                // case, hanging the service thread forever on a child that
                 // may already be gone.
-                if let Err(e) = child.wait() {
-                    logging::log_failure(&id, &format!("background wait on child: {e}"));
+                #[cfg(test)]
+                let waited = test_hook::wait(waiting).and_then(|()| child.wait());
+                #[cfg(not(test))]
+                let waited = child.wait();
+                if let Err(e) = waited {
+                    logging::log_failure(&id, &wait_failed(&e));
                 }
                 let mut g = bus.state.lock().expect("StopBus mutex poisoned");
                 g.child_done = true;
@@ -147,12 +155,10 @@ impl StopBus {
     /// itself owns, per `service.rs`'s `service_control_handler::register`).
     /// Only ever sets a flag and wakes waiters — it never acts on the child
     /// itself. Acting directly from this callback (calling `kill_tree()`
-    /// here) would reopen exactly the race `supervisor::decide_restart`'s
-    /// explicit `stopping` input exists to close: this callback cannot know
-    /// whether the supervisor loop has spawned its next child yet, so a stop
-    /// delivered in that gap could kill nothing and be silently lost. Routing
-    /// the actual kill through the loop's own thread, gated on this same
-    /// flag re-checked at every wake-up, means a stop is never missed
+    /// here) could not know whether the service thread has spawned the child
+    /// yet, so a stop delivered in that gap could kill nothing and be silently
+    /// lost. Routing the actual kill through the service thread, gated on this
+    /// same flag re-checked at every wake-up, means a stop is never missed
     /// regardless of when it arrives.
     pub fn request_stop(&self) {
         let mut g = self.state.lock().expect("StopBus mutex poisoned");
@@ -245,7 +251,7 @@ impl StopBus {
     /// returning `false` below — the one path that does not join). Two failed kills are
     /// positive evidence that nothing has told the child to exit, so the
     /// waiter's `child.wait()` cannot return and joining it would block for
-    /// as long as that child lives: `supervisor_loop` would never reach
+    /// as long as that child lives: `run_service` would never reach
     /// `report_stopped`, SCM's stop would never complete, and the service —
     /// which reads `RUNNING` throughout its own teardown, since this shim
     /// never reports `STOP_PENDING` — could then be neither stopped nor
@@ -254,9 +260,9 @@ impl StopBus {
     /// nothing and races nothing, because the wait it would wait for is
     /// already known not to resolve. What it gives up is the guarantee the
     /// join buys on every other path — the daemon is not reaped and may well
-    /// still be running — so the outcome is a distinct one, reported to SCM
-    /// as a stop that failed (`service::EXIT_STOP_INCOMPLETE`) rather than a
-    /// clean one, with the log above naming which kill failed and how. The
+    /// still be running — so the outcome is a distinct one, reported as
+    /// `Reported::incomplete_stop` (a distinct process exit code, and `Win32(0)` with service-specific
+    /// code 1003 to SCM: any non-zero Win32 code would start a second daemon) rather than a clean one, with the log above naming which kill failed and how. The
     /// detached thread still holds its own `Arc<Child>` clone, so this is
     /// memory-safe, and if the child ever does exit its `wait()` returns and
     /// that clone drops.
@@ -315,23 +321,9 @@ impl StopBus {
         // than joining — and its completing is what makes this call's return
         // mean the child is really reaped.
         if waiting.join().is_err() {
-            logging::log_failure(id, "the thread waiting on the child panicked");
+            logging::log_failure(id, WAITER_PANICKED);
         }
         outcome
-    }
-
-    /// Wait up to `delay` for a stop request — `restart-delay` itself, not a
-    /// synchronization workaround; see
-    /// `supervisor::DEFAULT_RESTART_DELAY`'s doc comment for the policy this
-    /// implements. Returns `true` if a stop was requested during the wait
-    /// (the caller must not respawn), `false` if the full delay elapsed.
-    pub fn wait_or_stop(&self, delay: Duration) -> bool {
-        let g = self.state.lock().expect("StopBus mutex poisoned");
-        let (g, _timed_out) = self
-            .cvar
-            .wait_timeout_while(g, delay, |g| !g.stopping)
-            .expect("StopBus mutex poisoned");
-        g.stopping
     }
 }
 
@@ -343,23 +335,33 @@ impl StopBus {
 /// what it does with that. Each failure is logged as it happens.
 fn kill_for_stop(child: &Child, id: &str) -> bool {
     let Err(e) = kill_tree(child) else { return true };
-    logging::log_failure(
-        id,
-        &format!(
-            "kill_tree on stop: {e}; falling back to killing the direct child only (its own descendants, if \
-             any, cannot be reached without a containment mechanism)"
-        ),
-    );
+    logging::log_failure(id, &kill_tree_failed(&e));
     let Err(e2) = kill_child(child) else { return true };
-    logging::log_failure(
-        id,
-        &format!(
-            "fallback kill on stop: {e2}; the daemon was neither killed nor reaped and may still be running — \
-             reporting the service stopped, with that failure, rather than waiting for an exit nothing can \
-             now cause"
-        ),
-    );
+    logging::log_failure(id, &fallback_kill_failed(&e2));
     false
+}
+
+// Failure reports -----------------------------------------------------------------------------------------------------
+
+fn wait_failed(e: &cosca::error::Error) -> String {
+    format!("background wait on child: {e}")
+}
+
+const WAITER_PANICKED: &str = "the thread waiting on the child panicked";
+
+fn kill_tree_failed(e: &cosca::error::Error) -> String {
+    format!(
+        "kill_tree on stop: {e}; falling back to killing the direct child only (its own descendants, if any, \
+         cannot be reached without a containment mechanism)"
+    )
+}
+
+fn fallback_kill_failed(e: &cosca::error::Error) -> String {
+    format!(
+        "fallback kill on stop: {e}; the daemon was neither killed nor reaped and may still be running — \
+         SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, \
+         and with service-specific exit code 1003 as the record of this failure"
+    )
 }
 
 /// `child.kill_tree()`, as its own function so a test can make it fail or panic — the two
@@ -367,30 +369,39 @@ fn kill_for_stop(child: &Child, id: &str) -> bool {
 /// demand. See `test_hook::kills`.
 fn kill_tree(child: &Child) -> Result<(), cosca::error::Error> {
     #[cfg(test)]
-    test_hook::killing()?;
+    test_hook::killing(test_hook::Site::Tree)?;
     child.kill_tree()
 }
 
 /// `child.kill()`, the direct-child fallback — same seam as [`kill_tree`], for the same reason.
 fn kill_child(child: &Child) -> Result<(), cosca::error::Error> {
     #[cfg(test)]
-    test_hook::killing()?;
+    test_hook::killing(test_hook::Site::Child)?;
     child.kill()
 }
 
 // test_hook ===========================================================================================================
 
-/// Makes waiter-thread creation fail, and the stop path's kills fail or panic, on demand and on
-/// this thread only, so the paths that must refuse to launch a daemon and must not wait on a
-/// daemon nothing can kill are testable. Mirrors `goetia::backend::bounded`'s own hook, which is
-/// `#[cfg(test)]` inside the library and therefore invisible here — see [`Waiter`].
+/// Test hooks for the waiter and stop path, thread-local except the process-global waiter-end
+/// record (a test that makes a waiter must consume its end). Mirrors `goetia::backend::bounded`'s
+/// hook, which is invisible here.
 #[cfg(test)]
 pub(crate) mod test_hook {
     use std::cell::Cell;
+    use std::collections::BTreeMap;
+    use std::sync::{Condvar, Mutex, PoisonError};
+
+    /// The error [`threads`] makes `Waiter::new` fail with.
+    pub(crate) const NO_THREAD: &str = "no thread may be made (test hook)";
+    /// The error [`Kill::Refuse`] and [`Kill::RefuseTree`] make a kill fail with.
+    pub(crate) const KILL_REFUSED: &str = "the kill was refused (test hook)";
+    /// The error [`Wait::Fail`] makes the waiter's `child.wait()` fail with.
+    pub(crate) const WAIT_FAILED: &str = "the wait failed (test hook)";
 
     thread_local! {
         static THREADS: Cell<Option<usize>> = const { Cell::new(None) };
         static KILLS: Cell<Option<Kill>> = const { Cell::new(None) };
+        static WAITS: Cell<Option<Wait>> = const { Cell::new(None) };
     }
 
     /// What [`super::kill_tree`] and [`super::kill_child`] do instead of killing.
@@ -399,6 +410,8 @@ pub(crate) mod test_hook {
         /// Fail, as an OS refusal would — a child holding no actionable containment mechanism for
         /// `kill_tree`, a `TerminateProcess` refusal for `kill`.
         Refuse,
+        /// Fail `kill_tree` only, so the direct-child fallback does its real kill.
+        RefuseTree,
         /// Panic, which is the documented way the waiter is left detached mid-stop.
         Panic,
     }
@@ -420,13 +433,59 @@ pub(crate) mod test_hook {
         }
     }
 
-    pub(super) fn killing() -> Result<(), cosca::error::Error> {
+    /// Which of the two kills is asking.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Site {
+        Tree,
+        Child,
+    }
+
+    pub(super) fn killing(site: Site) -> Result<(), cosca::error::Error> {
         match KILLS.get() {
             None => Ok(()),
-            Some(Kill::Refuse) => Err(cosca::error::Error::Io(std::io::Error::other(
-                "the kill was refused (test hook)",
-            ))),
+            Some(Kill::Refuse) => Err(cosca::error::Error::Io(std::io::Error::other(KILL_REFUSED))),
+            Some(Kill::RefuseTree) if site == Site::Tree => {
+                Err(cosca::error::Error::Io(std::io::Error::other(KILL_REFUSED)))
+            }
+            Some(Kill::RefuseTree) => Ok(()),
             Some(Kill::Panic) => panic!("the kill panicked (test hook)"),
+        }
+    }
+
+    /// What a waiter's `child.wait()` does instead of waiting.
+    #[derive(Clone, Copy)]
+    pub(crate) enum Wait {
+        /// Fail with [`WAIT_FAILED`], as a broken wait mechanism would.
+        Fail,
+        /// Panic, ending the waiter thread without it reporting the child done.
+        Panic,
+    }
+
+    /// Make the waiters this thread makes while the returned guard lives do `what` rather than
+    /// wait. Read when the waiter is made, not when it runs.
+    pub(crate) fn waits(what: Wait) -> Waiting {
+        WAITS.set(Some(what));
+        Waiting
+    }
+
+    /// See [`waits`].
+    pub(crate) struct Waiting;
+
+    impl Drop for Waiting {
+        fn drop(&mut self) {
+            WAITS.set(None);
+        }
+    }
+
+    pub(super) fn waiting() -> Option<Wait> {
+        WAITS.get()
+    }
+
+    pub(super) fn wait(what: Option<Wait>) -> Result<(), cosca::error::Error> {
+        match what {
+            None => Ok(()),
+            Some(Wait::Fail) => Err(cosca::error::Error::Io(std::io::Error::other(WAIT_FAILED))),
+            Some(Wait::Panic) => panic!("the wait panicked (test hook)"),
         }
     }
 
@@ -445,9 +504,60 @@ pub(crate) mod test_hook {
         }
     }
 
+    /// How a waiter thread ended.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) enum WaiterEnd {
+        Returned,
+        Panicked,
+    }
+
+    static ENDS: Mutex<BTreeMap<String, WaiterEnd>> = Mutex::new(BTreeMap::new());
+    static ENDED: Condvar = Condvar::new();
+
+    /// Held for the whole life of the waiter thread's closure, so its drop runs after every log the
+    /// waiter can make: it records how the thread ended under its daemon id and wakes
+    /// [`waiter_end`].
+    pub(super) struct WaiterExit(String);
+
+    pub(super) fn waiter_running(id: &str) -> WaiterExit {
+        WaiterExit(id.to_string())
+    }
+
+    impl Drop for WaiterExit {
+        fn drop(&mut self) {
+            let end = if std::thread::panicking() {
+                WaiterEnd::Panicked
+            } else {
+                WaiterEnd::Returned
+            };
+            ENDS.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(std::mem::take(&mut self.0), end);
+            ENDED.notify_all();
+        }
+    }
+
+    /// Block until the waiter thread made for `id` has ended, then remove and return how. For the
+    /// tests where `wait_for_child_or_stop` detaches the waiter, so they cannot join it: everything
+    /// the waiter logged happens-before this returns.
+    pub(crate) fn waiter_end(id: &str) -> WaiterEnd {
+        let mut ends = ENDS.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if let Some(end) = ends.remove(id) {
+                return end;
+            }
+            ends = ENDED.wait(ends).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Whether a waiter-end record for `id` is waiting to be consumed by [`waiter_end`]. Never blocks.
+    pub(crate) fn has_waiter_end(id: &str) -> bool {
+        ENDS.lock().unwrap_or_else(PoisonError::into_inner).contains_key(id)
+    }
+
     pub(super) fn make_thread() -> std::io::Result<()> {
         match THREADS.get() {
-            Some(0) => Err(std::io::Error::other("no thread may be made (test hook)")),
+            Some(0) => Err(std::io::Error::other(NO_THREAD)),
             Some(n) => {
                 THREADS.set(Some(n - 1));
                 Ok(())

@@ -8,7 +8,7 @@
 //! and the LocalSystem boundary and exists on all three platforms.
 
 use std::io;
-use std::net::{Ipv4Addr, TcpListener};
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -54,6 +54,28 @@ impl ConnectBack {
     /// report to whoever reads the CI log.
     pub fn accept(&self, what: &str) {
         self.accept_value(what);
+    }
+
+    /// Like [`Self::accept`], but hands back the connection itself, unread.
+    ///
+    /// The daemon may be waiting on its end of the stream (it reads until the
+    /// test drops this), so closing the stream is how a test releases it
+    /// deterministically rather than by timing.
+    pub fn accept_stream(&self, what: &str) -> TcpStream {
+        let listener = self.listener.try_clone().expect("clone listener");
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(listener.accept().map(|(stream, _addr)| stream));
+        });
+        match rx.recv_timeout(START_DEADLINE) {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => panic!("accept while waiting for {what}: {e}"),
+            Err(_) => panic!(
+                "waited {}s for {what} on 127.0.0.1:{}; it never connected",
+                START_DEADLINE.as_secs(),
+                self.port
+            ),
+        }
     }
 
     /// Like [`Self::accept`], but returns whatever bytes the daemon wrote

@@ -815,7 +815,7 @@ fn install_applies_the_native_backend_override() {
         dir.path(),
         &format!(
             "daemons:\n  frpc:\n    command: [frpc]\n    restart: never\n    backend-specific:\n      {native}:\n        \
-             restart: always\n"
+             restart: on-failure\n"
         ),
     );
 
@@ -829,9 +829,67 @@ fn install_applies_the_native_backend_override() {
 
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
     assert!(
-        out.contains("restart: always"),
+        out.contains("restart: on-failure"),
         "show (no -f) must read the merged spec back out of the installed blob:\n{out}"
     );
+}
+
+/// `restart: always` is refused only for `scm`, so on a systemd or launchd host it still reaches
+/// the installed blob: from the base (literal or templated) or from the native override, with an
+/// `scm` override keeping the manifest valid everywhere. On a Windows host the `scm` override wins.
+#[skuld::test]
+fn always_survives_install_and_show_on_hosts_that_can_honour_it() {
+    let native = goetia::spec::Backend::native().expect("native() is Some on every CI platform");
+    let expected = if native == goetia::spec::Backend::Scm {
+        "restart: on-failure"
+    } else {
+        "restart: always"
+    };
+    let scm = "      scm:\n        restart: on-failure\n";
+    let manifests = [
+        (
+            "literal",
+            format!("daemons:\n  frpc:\n    command: [frpc]\n    restart: always\n    backend-specific:\n{scm}"),
+        ),
+        (
+            "templated",
+            format!("daemons:\n  frpc:\n    command: [frpc]\n    restart: ${{R}}\n    backend-specific:\n{scm}"),
+        ),
+        (
+            "native override",
+            format!(
+                "daemons:\n  frpc:\n    command: [frpc]\n    restart: never\n    backend-specific:\n      \
+                 systemd:\n        restart: always\n      launchd:\n        restart: always\n{scm}"
+            ),
+        ),
+    ];
+    for (label, text) in manifests {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_manifest(dir.path(), &text);
+        std::fs::write(dir.path().join(".env"), "R=always\n").expect("write .env fixture");
+        let fake = Fake::new();
+
+        let (code, out, err) = dispatch_elevated(
+            &["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()],
+            &fake,
+        );
+        assert_eq!(code, 0, "{label}: stdout:\n{out}\nstderr:\n{err}");
+
+        let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "show"], &fake);
+        assert_eq!(code, 0, "{label}: stdout:\n{out}\nstderr:\n{err}");
+        assert!(
+            out.contains(expected),
+            "{label}: the installed blob must say `{expected}`:\n{out}"
+        );
+
+        let (code, out, err) =
+            dispatch_read_only(&["goetia", "daemon", "show", "-f", manifest.to_str().unwrap()], &fake);
+        assert_eq!(code, 0, "{label}: stdout:\n{out}\nstderr:\n{err}");
+        assert!(
+            out.contains(expected),
+            "{label}: the manifest must resolve to `{expected}`:\n{out}"
+        );
+    }
 }
 
 /// Editing only a non-native backend's override between two installs is
@@ -846,7 +904,7 @@ fn changing_only_a_non_native_override_leaves_the_install_up_to_date() {
     let fake = Fake::new();
     let manifest_text = |non_native_delay: &str| {
         format!(
-            "daemons:\n  frpc:\n    command: [frpc]\n    backend-specific:\n      {native}:\n        restart: always\n      \
+            "daemons:\n  frpc:\n    command: [frpc]\n    backend-specific:\n      {native}:\n        restart: on-failure\n      \
              {non_native}:\n        restart-delay: {non_native_delay}\n"
         )
     };
@@ -885,7 +943,7 @@ fn changing_the_native_override_is_an_update() {
             "daemons:\n  frpc:\n    command: [frpc]\n    backend-specific:\n      {native}:\n        restart: {restart}\n"
         )
     };
-    let manifest = write_manifest(dir.path(), &manifest_text("always"));
+    let manifest = write_manifest(dir.path(), &manifest_text("on-failure"));
 
     let (first_code, first_out, first_err) = dispatch_elevated(
         &["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()],
@@ -893,7 +951,7 @@ fn changing_the_native_override_is_an_update() {
     );
     assert_eq!(first_code, 0, "stdout:\n{first_out}\nstderr:\n{first_err}");
 
-    write_manifest(dir.path(), &manifest_text("on-failure"));
+    write_manifest(dir.path(), &manifest_text("never"));
     let (code, out, err) = dispatch_elevated(
         &["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()],
         &fake,
@@ -1223,6 +1281,44 @@ fn list_reaches_the_manager() {
 
     assert_eq!(code, 0);
     assert!(out.contains("frpc"), "{out}");
+}
+
+/// A service installed by 0.1.0 may carry `restart: always` on the scm backend, which a manifest
+/// can no longer say. Reading its blob must not run the manifest refusal, or the service could
+/// not even be stopped or removed.
+#[skuld::test]
+fn a_service_installed_with_restart_always_stays_operable() {
+    let fake = Fake::new();
+    let mut spec = mk("frpc");
+    spec.restart = Restart::Always;
+    fake.install(&spec, false).unwrap();
+
+    for verb in ["status", "list"] {
+        let (code, out, err) = dispatch_read_only(&["goetia", "daemon", verb], &fake);
+        assert_eq!(code, 0, "{verb}: stdout:\n{out}\nstderr:\n{err}");
+    }
+    let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "status", "frpc"], &fake);
+    assert_eq!(code, 0, "status frpc: stdout:\n{out}\nstderr:\n{err}");
+    assert!(out.contains("frpc"), "{out}");
+
+    // `diff -f` with the migrated manifest still shows the installed `always`.
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(
+        dir.path(),
+        "daemons:\n  frpc:\n    command: [daemon]\n    restart: on-failure\n",
+    );
+    let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
+    assert_eq!(code, 3, "diff: stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains("always"),
+        "the installed side of the diff must show `always`:\n{out}"
+    );
+
+    for verb in ["start", "restart", "stop", "uninstall"] {
+        let (code, out, err) = dispatch_elevated(&["goetia", "daemon", verb, "frpc"], &fake);
+        assert_eq!(code, 0, "{verb}: stdout:\n{out}\nstderr:\n{err}");
+    }
+    assert!(installed_ids(&fake).is_empty());
 }
 
 // Foreign-id refusal and unreadable-entry regression coverage =========================================================

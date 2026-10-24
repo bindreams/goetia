@@ -113,7 +113,7 @@ fn start_stop_status_reflect_reality() {
     let pid = status.pid.expect("type: simple reports the shim's own pid");
 
     // `Status.pid`'s own doc comment (`src/manager.rs`) promises this is
-    // `goetia-shim.exe`'s pid, not the supervised daemon's — SCM knows no
+    // `goetia-shim.exe`'s pid, not the daemon's — SCM knows no
     // other process for this service. Confirm it names the shim, not the
     // fixture.
     let tasklist = support::cmd::run("tasklist.exe", &["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);

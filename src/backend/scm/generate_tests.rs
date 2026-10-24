@@ -677,13 +677,52 @@ fn windows_style_split_matches_real_command_line_to_argv_w() {
 // FailureActions ======================================================================================================
 
 #[skuld::test]
-fn simple_kind_has_no_failure_actions() {
-    let reg = build(&simple_spec());
-    assert_eq!(
-        reg.failure_actions, None,
-        "the shim supervises the child itself; SCM recovery must stay empty (matching `sc qfailure` for the \
-         nssm-based deployment this project is modeled on)"
+fn simple_kind_maps_restart_to_failure_actions_like_managed() {
+    let mut spec = simple_spec();
+    spec.restart = Restart::OnFailure;
+    spec.restart_delay = Some(Duration::from_secs(42));
+    let fa = build(&spec)
+        .failure_actions
+        .expect("restart: on-failure must configure recovery actions: SCM does every restart for a simple daemon");
+    assert_eq!(fa.delay, Duration::from_secs(42));
+    assert_eq!(fa.reset_period, FAILURE_RESET_PERIOD);
+    assert!(
+        fa.on_non_crash_failures,
+        "without the flag, a clean non-zero report never restarts"
     );
+
+    spec.restart = Restart::Never;
+    assert_eq!(build(&spec).failure_actions, None);
+}
+
+#[skuld::test]
+fn simple_kind_default_restart_delay_when_unset() {
+    let mut spec = simple_spec();
+    spec.restart = Restart::OnFailure;
+    spec.restart_delay = None;
+
+    let fa = build(&spec).failure_actions.expect("recovery actions");
+    assert_eq!(fa.delay, DEFAULT_RESTART_DELAY);
+}
+
+#[skuld::test]
+fn the_two_kinds_get_the_same_failure_actions_for_every_restart_value() {
+    for restart in [Restart::Never, Restart::OnFailure, Restart::Always] {
+        for restart_delay in [None, Some(Duration::from_secs(42))] {
+            let mut simple = simple_spec();
+            simple.restart = restart;
+            simple.restart_delay = restart_delay;
+            let mut managed = managed_spec();
+            managed.restart = restart;
+            managed.restart_delay = restart_delay;
+
+            assert_eq!(
+                build(&simple).failure_actions,
+                build(&managed).failure_actions,
+                "restart {restart:?}, delay {restart_delay:?}"
+            );
+        }
+    }
 }
 
 #[skuld::test]
@@ -734,17 +773,25 @@ fn managed_kind_with_restart_never_has_no_failure_actions() {
     );
 }
 
+/// The generator must neither panic nor emit anything but on-failure's recovery
+/// actions for `Always` (installed blobs may carry it). Only the blob, which
+/// records the authored `restart`, may differ.
 #[skuld::test]
-fn managed_kind_restart_always_also_sets_failure_actions() {
-    let mut spec = managed_spec();
-    spec.restart = Restart::Always;
-    let reg = build(&spec);
+fn managed_kind_restart_always_renders_as_on_failure() {
+    let mut always = managed_spec();
+    always.restart = Restart::Always;
+    let mut on_failure = managed_spec();
+    on_failure.restart = Restart::OnFailure;
 
+    let mut always = build(&always);
+    let mut on_failure = build(&on_failure);
     assert!(
-        reg.failure_actions.is_some(),
-        "restart: always is approximated by the same recovery action as on-failure on SCM \
-         (accepted divergence: SCM recovery never fires after a clean exit)"
+        always.failure_actions.is_some(),
+        "0.1.0 registered recovery actions for `always`"
     );
+    always.parameters.clear();
+    on_failure.parameters.clear();
+    assert_eq!(render(&always), render(&on_failure));
 }
 
 #[skuld::test]

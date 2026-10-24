@@ -109,7 +109,7 @@ use crate::decide::{self, Outcome, Ownership};
 use crate::error::{Error, Result};
 use crate::manager::budget;
 use crate::manager::{Budget, Installed, ServiceManager, State, Status};
-use crate::spec::{DaemonSpec, Id, Kind};
+use crate::spec::{DaemonSpec, Id, Kind, Restart};
 
 // ScmManager ==========================================================================================================
 
@@ -127,6 +127,7 @@ impl ScmManager {
 
 impl ServiceManager for ScmManager {
     fn install(&self, spec: &DaemonSpec, force: bool) -> Result<Outcome> {
+        refuse_always(spec)?;
         let d = discover(spec)?;
         let outcome = decide::decide(
             &d.found,
@@ -153,6 +154,7 @@ impl ServiceManager for ScmManager {
     }
 
     fn preview_install(&self, spec: &DaemonSpec) -> Result<Outcome> {
+        refuse_always(spec)?;
         let d = discover(spec)?;
         Ok(decide::decide(
             &d.found,
@@ -205,7 +207,7 @@ impl ServiceManager for ScmManager {
             // more, per the trait doc comment.
             return super::wait::request_start(&mut actor).map_err(|e| Error::Other(format!("start `{id}`: {e}")));
         }
-        let waited = super::wait::start_via_notify(&mut actor, deadline)
+        let waited = super::wait::start_via_notify(&mut actor, deadline, installed_kind(id))
             .map_err(|e| Error::Other(format!("start `{id}`: {e}")))?;
         match waited {
             Waited::Confirmed => Ok(()),
@@ -374,6 +376,20 @@ pub fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
     generate::extract(&params)
 }
 
+/// The kind `start_via_notify` reads a `Stopped`-before-`Running` by. Only a decodable blob that
+/// says `type: simple` selects the shim's vocabulary; an unreadable one reads as strictly as
+/// `type: managed`, which is what a shim that cannot decode it reports anyway (a failed start).
+fn start_kind(blob: Result<Option<Blob>>) -> Kind {
+    match blob {
+        Ok(Some(blob)) => blob.spec.kind,
+        Ok(None) | Err(_) => Kind::Managed,
+    }
+}
+
+fn installed_kind(id: &Id) -> Kind {
+    start_kind(read_spec_blob(id.as_str()))
+}
+
 // discover ============================================================================================================
 
 /// What `install`/`preview_install` need from a fresh read of the world:
@@ -412,6 +428,20 @@ fn shim_path() -> PathBuf {
         .ok()
         .and_then(|p| p.parent().map(|dir| dir.join("goetia-shim.exe")))
         .unwrap_or_else(|| PathBuf::from("goetia-shim.exe"))
+}
+
+/// `resolve` refuses `restart: always` for scm, but `generate` still accepts it
+/// to regenerate blobs installed by 0.1.0; a spec that did not come from
+/// `resolve` must not install with on-failure semantics.
+fn refuse_always(spec: &DaemonSpec) -> Result<()> {
+    if spec.restart == Restart::Always {
+        return Err(Error::Invalid {
+            daemon: spec.id.to_string(),
+            message: "`restart: always` cannot be honoured by the scm backend: SCM recovery actions never fire after a clean exit"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn discover(spec: &DaemonSpec) -> Result<Discovery> {

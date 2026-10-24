@@ -1,6 +1,9 @@
-//! SCM wiring: dispatch, control handler, status reporting, and the
-//! supervisor loop that spawns/waits/restarts the daemon `goetia.yaml`
-//! describes.
+//! SCM wiring: dispatch, control handler, status reporting, and the one pass that spawns the
+//! daemon `goetia.yaml` describes, waits for it and reports how it ended.
+//!
+//! The shim never restarts the daemon. It reports the daemon's exit as the service's exit and
+//! exits; SCM's recovery actions (`backend::scm::generate`) start a new shim, which reads the
+//! installed spec afresh.
 //!
 //! Everything that touches the child process tree — containment, waiting,
 //! stdio capture — is `cosca`'s job, not this module's: `cosca::Command`'s
@@ -12,10 +15,14 @@
 //! cancellation source) and driving SCM's own status protocol.
 
 use std::ffi::OsString;
+use std::os::windows::io::AsRawHandle as _;
 use std::sync::Arc;
 use std::time::Duration;
 
 use cosca::{Child, Fd, Stdio};
+use goetia::backend::scm::exit_status::{
+    ERROR_BAD_ARGUMENTS, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_INVALID_DATA, Reported,
+};
 use goetia::backend::scm::manager::read_spec_blob;
 use goetia::spec::{DaemonSpec, Restart};
 use windows_service::service::{
@@ -23,68 +30,34 @@ use windows_service::service::{
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult, ServiceStatusHandle};
 use windows_service::{define_windows_service, service_dispatcher};
+use windows_sys::Win32::System::Services::{
+    SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOPPED, SERVICE_WIN32_OWN_PROCESS, SetServiceStatus,
+};
 
 use crate::logging;
 use crate::stop_bus::{StopBus, WaitOutcome, Waiter};
-use crate::supervisor::{self, ChildOutcome, RestartDecision};
-
-// Exit codes ==========================================================================================================
-//
-// Distinguishable process exit codes: each failure class below both reports
-// through `logging::log_failure` (fallback log path + Windows Event Log)
-// and exits with its own code, so `sc.exe query`/Task Scheduler-style
-// automation and a human reading `%ProgramData%\Goetia\logs\<id>.log`
-// agree on what happened.
-
-/// A commanded stop the shim carried out, or a `restart:` policy that does
-/// not respawn a clean exit — not a failure. A commanded stop whose kills all
-/// failed is `EXIT_STOP_INCOMPLETE` below, not this.
-const EXIT_OK: i32 = 0;
-/// argv[1] (the service id) was not supplied. Only reachable from a
-/// malformed manual invocation: SCM itself always supplies it (`ImagePath`
-/// names `goetia-shim.exe <id>` — see `backend::scm::generate::registration`).
-const EXIT_USAGE: i32 = 2;
-/// The metadata blob under `Services\<id>\Parameters` could not be read or
-/// decoded — an old shim against a newer/incompatible blob, or corruption.
-const EXIT_DECODE_FAILURE: i32 = 3;
-/// `service_control_handler::register`/`StartServiceCtrlDispatcherW` itself
-/// failed, so the shim could never report anything else to SCM.
-const EXIT_DISPATCH_FAILURE: i32 = 4;
-/// The supervisor loop stopped with the daemon's most recent attempt a
-/// failure (nonzero exit, or a spawn failure) under a `restart:` policy
-/// that does not retry further (`never`, or the daemon simply never ran).
-const EXIT_CHILD_FAILURE: i32 = 5;
-/// A commanded stop the shim could not carry out: neither `kill_tree` nor the
-/// direct-child fallback could kill the daemon (see
-/// `StopBus::wait_for_child_or_stop`), so it may still be running. The
-/// service itself does stop — that is what keeps it stoppable and
-/// uninstallable — and this code, reported to SCM as the service-specific
-/// exit code and to `%ProgramData%\Goetia\logs\<id>.log` and the Event Log as
-/// two logged kill failures, is what keeps that stop from reading as a clean
-/// one.
-const EXIT_STOP_INCOMPLETE: i32 = 6;
 
 // Entry ===============================================================================================================
 
 /// Called from `main()`. Reads `argv[1]` (the service id), hands control to
 /// SCM, and never returns normally: `run_service` (via `service_main`)
 /// calls `std::process::exit` on every path, including every failure one,
-/// so the process's own exit code is always one of the constants above.
+/// with a code from `goetia::backend::scm::exit_status`.
 pub fn run() -> ! {
     let args: Vec<String> = std::env::args().collect();
     let Some(id) = args.get(1) else {
         eprintln!("goetia-shim: usage: goetia-shim <service-id>");
-        std::process::exit(EXIT_USAGE);
+        std::process::exit(ERROR_BAD_ARGUMENTS as i32);
     };
     if let Err(e) = service_dispatcher::start(id, ffi_service_main) {
         logging::log_failure(id, &format!("connect to the SCM dispatcher: {e}"));
-        std::process::exit(EXIT_DISPATCH_FAILURE);
+        std::process::exit(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT as i32);
     }
     // Unreachable in practice — every path inside `service_main` exits the
     // process directly, and SCM only lets `StartServiceCtrlDispatcherW`'s
     // wait return once the process is already being torn down — but exit
     // cleanly here too rather than falling off `main`.
-    std::process::exit(EXIT_OK);
+    std::process::exit(Reported::Clean.process_exit_code());
 }
 
 define_windows_service!(ffi_service_main, service_main);
@@ -106,7 +79,7 @@ fn run_service(id: &str) {
         Ok(h) => h,
         Err(e) => {
             logging::log_failure(id, &format!("register SCM control handler: {e}"));
-            std::process::exit(EXIT_DISPATCH_FAILURE);
+            std::process::exit(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT as i32);
         }
     };
 
@@ -118,33 +91,51 @@ fn run_service(id: &str) {
                 "no Goetia metadata found under Services\\<id>\\Parameters (Marker absent) — this service was \
                  not created by `goetia daemon install`",
             );
-            report_stopped(
+            finish(
                 id,
                 &status_handle,
-                ServiceExitCode::ServiceSpecific(EXIT_DECODE_FAILURE as u32),
+                Reported::shim_failure(Some(ERROR_INVALID_DATA as i32)),
             );
-            std::process::exit(EXIT_DECODE_FAILURE);
         }
         Err(e) => {
             logging::log_failure(id, &format!("decode metadata blob: {e}"));
-            report_stopped(
+            finish(
                 id,
                 &status_handle,
-                ServiceExitCode::ServiceSpecific(EXIT_DECODE_FAILURE as u32),
+                Reported::shim_failure(Some(ERROR_INVALID_DATA as i32)),
             );
-            std::process::exit(EXIT_DECODE_FAILURE);
         }
     };
-    let spec = blob.spec;
 
-    let code = supervisor_loop(&spec, &stop_bus, id, &status_handle);
-    let exit_code = if code == EXIT_OK {
-        ServiceExitCode::Win32(0)
-    } else {
-        ServiceExitCode::ServiceSpecific(code as u32)
-    };
-    report_stopped(id, &status_handle, exit_code);
-    std::process::exit(code);
+    if let Some(notice) = version_skew_notice(&blob.spec, &blob.version, goetia::version()) {
+        logging::log_failure(id, &notice);
+    }
+    let reported = run_daemon(&blob.spec, &stop_bus, id, || report_running(id, &status_handle));
+    finish(id, &status_handle, reported);
+}
+
+/// Tell SCM the service stopped, then end the process. SCM restarts the service or not from
+/// the status reported here, never from the process exit code.
+fn finish(id: &str, status_handle: &ServiceStatusHandle, reported: Reported) -> ! {
+    report_stopped(id, status_handle, reported);
+    std::process::exit(reported.process_exit_code());
+}
+
+/// The `STOPPED` status SCM is told for `reported`, with the exact `(win32, specific)` pair of
+/// [`Reported::scm_codes`]. Built raw because `windows-service`'s `ServiceExitCode` cannot express
+/// a service-specific code beside Win32 0, which is how an incomplete stop leaves a record without
+/// a restart.
+fn stopped_status(reported: Reported) -> SERVICE_STATUS {
+    let (win32, specific) = reported.scm_codes();
+    SERVICE_STATUS {
+        dwServiceType: SERVICE_WIN32_OWN_PROCESS,
+        dwCurrentState: SERVICE_STOPPED,
+        dwControlsAccepted: 0,
+        dwWin32ExitCode: win32,
+        dwServiceSpecificExitCode: specific,
+        dwCheckPoint: 0,
+        dwWaitHint: 0,
+    }
 }
 
 fn register_control_handler(id: &str, stop_bus: &Arc<StopBus>) -> windows_service::Result<ServiceStatusHandle> {
@@ -181,174 +172,159 @@ fn report_running(id: &str, handle: &ServiceStatusHandle) {
     }
 }
 
-fn report_stopped(id: &str, handle: &ServiceStatusHandle, exit_code: ServiceExitCode) {
-    if let Err(e) = handle.set_service_status(ServiceStatus {
-        service_type: ServiceType::OWN_PROCESS,
-        current_state: ServiceState::Stopped,
-        controls_accepted: ServiceControlAccept::empty(),
-        exit_code,
-        checkpoint: 0,
-        wait_hint: Duration::default(),
-        process_id: None,
-    }) {
+fn report_stopped(id: &str, handle: &ServiceStatusHandle, reported: Reported) {
+    let status = stopped_status(reported);
+    // SAFETY: `handle` wraps the live `SERVICE_STATUS_HANDLE` that `RegisterServiceCtrlHandlerExW`
+    // returned (it stays valid for the life of the process), and `status` outlives the call.
+    let ok = unsafe { SetServiceStatus(handle.as_raw_handle() as SERVICE_STATUS_HANDLE, &status) };
+    if ok == 0 {
+        let e = std::io::Error::last_os_error();
         logging::log_failure(id, &format!("report SERVICE_STOPPED to SCM: {e}"));
     }
 }
 
-// Supervisor loop =====================================================================================================
+// One pass ============================================================================================================
 
-/// Spawn, wait, restart — until `supervisor::decide_restart` says stop, or
-/// until a stop this shim could not carry out ends it sooner (the one return
-/// below that does not ask, because for it the answer is fixed and the
-/// exit code is the part that differs). Returns the process exit code
-/// `run_service` reports both to SCM and via `std::process::exit`.
-fn supervisor_loop(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, status_handle: &ServiceStatusHandle) -> i32 {
-    // `restart: on-failure`/`always` retries indefinitely regardless of any
-    // one spawn's outcome, so for those policies `Running` means "the
-    // supervisor itself is alive and will keep trying" — reported up
-    // front, matching what `ScmManager::start`'s own real
-    // `NotifyServiceStatusChangeW` wait (`scm::wait::start_via_notify`)
-    // expects promptly. `restart: never` makes exactly one spawn attempt
-    // ever, so reporting `Running` before that attempt resolves would race
-    // an immediate `Stopped`: `start_via_notify`'s single-shot notify can
-    // observe either the transient `Running` or the subsequent `Stopped`
-    // depending purely on scheduling, so `goetia daemon start` could
-    // report success for a daemon whose command does not even exist.
-    // Deferring the report until the one attempt's outcome is known (below)
-    // makes that a deterministic failed start instead.
-    let defer_running_report = spec.restart == Restart::Never;
-    if !defer_running_report {
-        report_running(id, status_handle);
-    }
+/// Launch the daemon, report `RUNNING` through `on_running`, wait for the daemon to end or for a
+/// stop, and say how it ended. Never respawns: SCM restarts the service from the status the caller
+/// reports.
+///
+/// `on_running` is called exactly once, after the daemon is spawned and never when launching failed.
+/// A daemon that cannot start is therefore `STOPPED` with a non-zero Win32 code without ever having
+/// been `RUNNING`, which `start_via_notify` reads as a failed start under every restart policy.
+fn run_daemon(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, on_running: impl FnOnce()) -> Reported {
+    let (child, waiter) = match launch(spec, stop_bus, id) {
+        Ok(launched) => launched,
+        Err(reported) => return reported,
+    };
+    on_running();
 
-    loop {
-        // Checked before every spawn, not only after a wait: a stop
-        // requested during the *previous* iteration's restart-delay wait
-        // already returns from that wait's own call site below, but this
-        // guard covers the first iteration too, where nothing has waited
-        // yet.
-        if stop_bus.is_stopping() {
-            return EXIT_OK;
-        }
-
-        // A thread the OS refused and a daemon that could not be spawned are
-        // one fact to the restart policy — nothing is running, and nothing
-        // was launched — so they share this path deliberately, rather than
-        // the first spawn and a later respawn differing by accident. That
-        // makes a waiter-thread failure under `restart: never` exactly a
-        // clean start failure with no daemon launched: it is the one policy
-        // that has not yet told SCM `RUNNING` (see `defer_running_report`
-        // above), and its loop body runs exactly once. Under
-        // `on-failure`/`always` — already `RUNNING` before the first spawn,
-        // by that same policy — it is instead a retry at `restart-delay`'s
-        // cadence, on the same reasoning as a persistently-failing spawn:
-        // thread exhaustion is a transient, machine-wide condition, and
-        // tearing down a service the user asked to be kept running costs
-        // more than one thread-creation attempt per delay.
-        let Some((child, waiter)) = launch(spec, stop_bus, id) else {
-            let stopping = stop_bus.is_stopping();
-            match supervisor::decide_restart(spec.restart, ChildOutcome::SpawnFailed, stopping, spec.restart_delay) {
-                RestartDecision::Stop => return if stopping { EXIT_OK } else { EXIT_CHILD_FAILURE },
-                RestartDecision::Respawn { delay } => {
-                    if stop_bus.wait_or_stop(delay) {
-                        return EXIT_OK;
+    // `wait_for_child_or_stop` also performs the kill-tree-and-confirm
+    // teardown on a stop (see its own doc comment for why that has to
+    // happen inside the call rather than out here) — by the time it
+    // returns `Stopping`, the whole tree is already confirmed dead, or,
+    // if `kill_tree` itself failed and the fallback kill did not, the
+    // direct child is and its descendants (if any) were unreachable.
+    // Either way it is logged there, and nothing is left to reap here.
+    // `StoppingUnkillable` is the one outcome where something is: both
+    // kills failed, so the daemon is still running and unreaped.
+    match stop_bus.wait_for_child_or_stop(waiter, &child, id) {
+        WaitOutcome::ChildExited => {
+            // The child has already exited — `wait()` reaps and returns
+            // immediately rather than blocking.
+            let code = match child.wait() {
+                Ok(status) => {
+                    let code = status.code();
+                    if code.is_none() {
+                        logging::log_failure(id, NO_EXIT_CODE);
                     }
-                    continue;
+                    code
                 }
-            }
-        };
-        if defer_running_report {
-            report_running(id, status_handle);
+                Err(e) => {
+                    logging::log_failure(id, &exit_status_unavailable(&e));
+                    None
+                }
+            };
+            exit_report(stop_bus.is_stopping(), code)
         }
-
-        // `wait_for_child_or_stop` also performs the kill-tree-and-confirm
-        // teardown on a stop (see its own doc comment for why that has to
-        // happen inside the call rather than out here) — by the time it
-        // returns `Stopping`, the whole tree is already confirmed dead, or,
-        // if `kill_tree` itself failed and the fallback kill did not, the
-        // direct child is and its descendants (if any) were unreachable.
-        // Either way it is logged there, and nothing is left to reap here.
-        // `StoppingUnkillable` is the one outcome where something is: both
-        // kills failed, so the daemon is still running and unreaped.
-        let outcome = match stop_bus.wait_for_child_or_stop(waiter, &child, id) {
-            WaitOutcome::ChildExited => {
-                // The child has already exited — `wait()` reaps and returns
-                // immediately rather than blocking.
-                match child.wait() {
-                    Ok(status) => ChildOutcome::Exited(status.code().unwrap_or_else(|| {
-                        logging::log_failure(id, "child exited with no reportable exit code; treating as failed");
-                        -1
-                    })),
-                    Err(e) => {
-                        logging::log_failure(id, &format!("re-query child exit status: {e}"));
-                        ChildOutcome::Exited(-1)
-                    }
-                }
-            }
-            // Unused by `decide_restart` below once `stopping` is true
-            // (checked first, unconditionally) — see its own doc comment.
-            WaitOutcome::Stopping => ChildOutcome::Exited(-1),
-            // No policy is skipped by returning here: this outcome is only
-            // produced with `stopping` already set, and `stopping` is never
-            // cleared, so `decide_restart` would answer `Stop` for every
-            // `restart:` policy below. What it cannot answer is *how* this
-            // stopped — its `Stop` plus `stopping` produces `EXIT_OK`, a
-            // clean stop the shim did not achieve, with the daemon neither
-            // killed nor reaped. The service still stops, which is what
-            // keeps it stoppable and uninstallable; this code and the two
-            // logged kill failures are what say the daemon may have
-            // outlived it.
-            WaitOutcome::StoppingUnkillable => return EXIT_STOP_INCOMPLETE,
-        };
-
-        let stopping = stop_bus.is_stopping();
-        match supervisor::decide_restart(spec.restart, outcome, stopping, spec.restart_delay) {
-            RestartDecision::Stop => {
-                let clean = stopping || matches!(outcome, ChildOutcome::Exited(0));
-                return if clean { EXIT_OK } else { EXIT_CHILD_FAILURE };
-            }
-            RestartDecision::Respawn { delay } => {
-                if stop_bus.wait_or_stop(delay) {
-                    return EXIT_OK;
-                }
-                continue;
-            }
-        }
+        WaitOutcome::Stopping => Reported::Clean,
+        // The service still stops, which is what keeps it stoppable and
+        // uninstallable; the report and the two logged kill failures are
+        // what say the daemon may have outlived it.
+        WaitOutcome::StoppingUnkillable => Reported::incomplete_stop(),
     }
 }
 
-/// The daemon, running and already being waited on — or `None`, logged, with nothing launched.
+/// How an exited daemon is reported. A stop requested at the same moment wins: terminating the
+/// daemon's job makes it exit non-zero, which a commanded stop must not report as a failure.
+/// `None` is an exit status that could not be obtained, already logged by the caller.
+fn exit_report(stopping: bool, code: Option<i32>) -> Reported {
+    match (stopping, code) {
+        (true, _) => Reported::Clean,
+        (false, Some(code)) => Reported::from_daemon_code(code),
+        (false, None) => Reported::shim_failure(None),
+    }
+}
+
+/// The daemon, running and already being waited on — or why not, logged, with nothing launched.
 ///
-/// Everything supervising the daemon needs is made before the daemon is: the [`Waiter`] thread
+/// Everything waiting on the daemon needs is made before the daemon is: the [`Waiter`] thread
 /// first, then the spawn, and nothing between them that could launch a daemon on the way.
 /// `build_command` does sit between them, and the log-file open inside it fails routinely, but
 /// that failure arm falls back to null stdio and runs nothing. A daemon is never launched with
 /// nothing to wait on it, because the one thing that could refuse to make that waiter — the OS,
 /// asked for a thread — is asked before anything is running. See [`Waiter`] for what the reverse
 /// order cost.
-fn launch(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str) -> Option<(Arc<Child>, Waiter)> {
+///
+/// The `Err` is what the service reports: the OS error of the failure, or `ERROR_GEN_FAILURE`.
+fn launch(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str) -> Result<(Arc<Child>, Waiter), Reported> {
     let waiter = match stop_bus.waiter(id) {
         Ok(waiter) => waiter,
         Err(e) => {
-            logging::log_failure(
-                id,
-                &format!(
-                    "make the thread that waits on {:?}: {e}; it was not spawned, so nothing of this daemon is \
-                     running",
-                    spec.command
-                ),
-            );
-            return None;
+            logging::log_failure(id, &thread_refused(&spec.command, &e));
+            return Err(Reported::shim_failure(e.raw_os_error()));
         }
     };
     let mut cmd = build_command(spec, id);
     match start(&mut cmd) {
-        Ok(child) => Some((Arc::new(child), waiter)),
+        Ok(child) => Ok((Arc::new(child), waiter)),
         Err(e) => {
-            logging::log_failure(id, &format!("spawn {:?}: {e}", spec.command));
-            None
+            logging::log_failure(id, &spawn_failed(&spec.command, &e));
+            Err(Reported::shim_failure(os_error_of(&e)))
         }
     }
+}
+
+/// The OS error code behind a `cosca` failure, if it has one.
+fn os_error_of(e: &cosca::error::Error) -> Option<i32> {
+    match e {
+        cosca::error::Error::Io(e) => e.raw_os_error(),
+        cosca::error::Error::Unassessable { source, .. } => source.as_ref().and_then(std::io::Error::raw_os_error),
+        _ => None,
+    }
+}
+
+// Failure reports -----------------------------------------------------------------------------------------------------
+
+const NO_EXIT_CODE: &str = "child exited with no reportable exit code";
+
+fn exit_status_unavailable(e: &cosca::error::Error) -> String {
+    format!("query child exit status: {e}")
+}
+
+fn thread_refused(command: &[String], e: &std::io::Error) -> String {
+    format!("make the thread that waits on {command:?}: {e}; it was not spawned, so nothing of this daemon is running")
+}
+
+fn spawn_failed(command: &[String], e: &cosca::error::Error) -> String {
+    format!("spawn {command:?}: {e}")
+}
+
+/// The failure line for a service registered by another goetia version, or `None` when there is
+/// nothing to say. Recovery actions are applied at install time, so a service registered before
+/// they existed (or by a version that set different ones) keeps running under this shim without
+/// restarts until `goetia daemon install` is run again.
+fn version_skew_notice(spec: &DaemonSpec, registered_by: &str, running: &str) -> Option<String> {
+    if registered_by == running || spec.restart == Restart::Never {
+        return None;
+    }
+    let mut notice = format!(
+        "daemon {:?} was registered by goetia {registered_by} and this goetia-shim is {running}: its SCM recovery actions may be missing, so it may not restart after a failure. Run `goetia daemon install` to apply them",
+        spec.name
+    );
+    if spec.restart == Restart::Always {
+        notice.push_str(
+            ", after setting `backend-specific: scm: { restart: on-failure }` in the manifest: `restart: always` is not supported for scm",
+        );
+    }
+    Some(notice)
+}
+
+fn log_open_failed(path: &std::path::Path, e: &std::io::Error) -> String {
+    format!(
+        "open log file {}: {e} (this daemon's output will not be captured; it is still being run)",
+        path.display()
+    )
 }
 
 /// The spawn itself: [`launch`]'s last step, once the thread that will wait on the daemon has
@@ -386,14 +362,7 @@ fn build_command(spec: &DaemonSpec, id: &str) -> cosca::Command {
             let _ = cmd.stderr(Stdio::merge(Fd::STDOUT));
         }
         Err(e) => {
-            logging::log_failure(
-                id,
-                &format!(
-                    "open log file {}: {e} (this daemon's output will not be captured; it is still being run \
-                     and supervised)",
-                    log_path.display()
-                ),
-            );
+            logging::log_failure(id, &log_open_failed(&log_path, &e));
             // Same infallibility reasoning as above, for `Stdio::null()`.
             let _ = cmd.stdout(Stdio::null());
             let _ = cmd.stderr(Stdio::null());

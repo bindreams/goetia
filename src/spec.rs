@@ -142,6 +142,9 @@ pub struct DaemonSpec {
 /// `${VAR}` reference can be interpolated into it before this type is ever
 /// produced — a derived `Deserialize` would fail at YAML-parse time on an
 /// unresolved placeholder, before interpolation gets a chance to run.
+///
+/// `resolve` refuses `Always` for scm, whose recovery actions never fire after a
+/// clean exit. It survives for scm only in blobs installed by 0.1.0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Restart {
     Never,

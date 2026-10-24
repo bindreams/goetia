@@ -341,6 +341,53 @@ fn older_version_is_stale_not_conflict() {
     );
 }
 
+/// A rendering that differs from the desired one only in its recovery actions, as a `type: simple`
+/// service registered by 0.1.0 does, is a `Stale` refresh and never a `Conflict`, because the
+/// version is compared before the content. Pins that ordering only; that re-installing such a
+/// service really writes the actions is `reinstalling_an_earlier_version_simple_service_applies_the_recovery_actions`.
+#[skuld::test]
+fn a_version_difference_wins_over_a_difference_in_recovery_actions() {
+    use crate::backend::Identity;
+    use crate::backend::scm::generate::{ScmRegistration, registration, render};
+
+    let spec = spec_fixture();
+    let reg_now = registration(
+        &spec,
+        &Identity { user: "svc".to_owned() },
+        &PathBuf::from("goetia-shim.exe"),
+    );
+    assert!(
+        reg_now.failure_actions.is_some(),
+        "the fixture must be a policy that now gets recovery actions"
+    );
+    let reg_0_1_0 = ScmRegistration {
+        failure_actions: None,
+        ..reg_now.clone()
+    };
+    let on_disk = render(&reg_0_1_0);
+    assert!(on_disk.contains("FailureActions: none"));
+    let desired = render(&reg_now);
+    assert_ne!(on_disk, desired);
+    let found = ours(&spec, "0.1.0", &on_disk);
+
+    let outcome = decide(
+        &found,
+        Some(&on_disk),
+        &desired,
+        &spec,
+        RUNNING_VERSION,
+        false,
+        &Overlay::default(),
+    );
+
+    assert_eq!(
+        outcome,
+        Outcome::Stale {
+            from_version: "0.1.0".to_owned()
+        }
+    );
+}
+
 /// A stale artifact that also carries a foreign overlay (systemd's drop-in
 /// directory, or any future backend's equivalent) must not be silently
 /// regenerated: the overlay is exactly as much "not solely goetia's doing"

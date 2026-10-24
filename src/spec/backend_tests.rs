@@ -134,7 +134,7 @@ fn an_over_long_delay_warns_from_the_scm_arm() {
 }
 
 #[skuld::test]
-fn the_scm_delay_advisory_is_gated_on_kind_and_restart() {
+fn the_scm_delay_advisory_is_gated_on_restart_alone() {
     let over_long = MAX_SC_ACTION_DELAY + Duration::from_millis(1);
 
     let mut simple = shaped_spec();
@@ -143,7 +143,11 @@ fn the_scm_delay_advisory_is_gated_on_kind_and_restart() {
     simple.restart_delay = Shaped::Parsed(over_long);
     let mut warnings = Vec::new();
     Backend::Scm.warn(&simple, &mut warnings);
-    assert!(warnings.is_empty(), "Kind::Simple must not warn: {warnings:?}");
+    assert_eq!(
+        warnings.len(),
+        1,
+        "Kind::Simple clamps like managed, so it warns: {warnings:?}"
+    );
 
     let mut never_restarts = shaped_spec();
     never_restarts.kind = Shaped::Parsed(Kind::Managed);

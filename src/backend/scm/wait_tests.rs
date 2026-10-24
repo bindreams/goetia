@@ -6,7 +6,9 @@
 use std::collections::VecDeque;
 
 use super::*;
+use crate::backend::scm::exit_status::{RecordedExit, Reported};
 use crate::manager::budget::{Budget, Deadline};
+use crate::spec::Kind;
 
 /// Records the granular SCM steps in call order and replays a scripted
 /// outcome for each `wait_callback` — `None` being "the deadline expired
@@ -25,6 +27,8 @@ struct FakeScm {
     deadlines: Vec<Deadline>,
     /// The deadline each `arm` was handed, in call order.
     arm_deadlines: Vec<Deadline>,
+    /// What SCM recorded for a `Stopped` the script delivers.
+    recorded: RecordedExit,
 }
 
 impl FakeScm {
@@ -37,7 +41,15 @@ impl FakeScm {
             start_reply: StartReply::Accepted,
             deadlines: vec![],
             arm_deadlines: vec![],
+            recorded: shim_failed(),
         }
+    }
+
+    /// A delivered `Stopped` carries the record `reported` leaves in SCM.
+    fn stopped_after(mut self, reported: Reported) -> Self {
+        let (win32, specific) = reported.scm_codes();
+        self.recorded = RecordedExit { win32, specific };
+        self
     }
 
     /// Every `arm` reports `reports` rather than `Waited::Confirmed`.
@@ -96,6 +108,15 @@ impl ScmActor for FakeScm {
         });
         Ok(observed)
     }
+    fn stopped_exit(&self) -> RecordedExit {
+        self.recorded
+    }
+}
+
+/// The record of a service whose shim failed before launching the daemon.
+fn shim_failed() -> RecordedExit {
+    let (win32, specific) = Reported::shim_failure(None).scm_codes();
+    RecordedExit { win32, specific }
 }
 
 fn unbounded() -> Deadline {
@@ -138,7 +159,10 @@ fn stop_re_arms_after_a_non_terminal_callback() {
 #[skuld::test]
 fn start_via_notify_arms_running_before_start_then_gates_on_running() {
     let mut fake = FakeScm::new([Some(Observed::Running)]);
-    assert_eq!(start_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        Waited::Confirmed
+    );
     // The critical ordering: arm RUNNING strictly BEFORE start, else a
     // RUNNING reached before the arm fires only on the NEXT entry — a hang.
     assert_eq!(fake.log, vec!["arm_running", "start", "wait", "got_running"]);
@@ -150,7 +174,10 @@ fn start_re_arms_after_a_non_terminal_callback() {
     // for RUNNING, then RUNNING; the non-terminal callback must trigger a
     // re-arm.
     let mut fake = FakeScm::new([Some(Observed::Pending), Some(Observed::Running)]);
-    assert_eq!(start_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        Waited::Confirmed
+    );
     assert_eq!(
         fake.log,
         vec![
@@ -171,7 +198,73 @@ fn a_terminal_stopped_after_start_is_still_an_error_not_an_expiry() {
     // start*, not a wait that ran out of budget — the caller's remedy
     // differs, so the two must not collapse into one another.
     let mut fake = FakeScm::new([Some(Observed::Pending), Some(Observed::Stopped)]);
-    assert!(start_via_notify(&mut fake, unbounded()).is_err());
+    assert!(start_via_notify(&mut fake, unbounded(), Kind::Simple).is_err());
+}
+
+#[skuld::test]
+fn a_daemon_that_exited_right_after_launch_is_a_started_service() {
+    // `start` confirms the shim launched the daemon, as `systemctl start` confirms the exec: what
+    // the daemon does next is not the start's to judge, and racing it would make the answer vary.
+    for reported in [
+        Reported::from_daemon_code(7),
+        Reported::Clean,
+        Reported::incomplete_stop(),
+    ] {
+        let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(reported);
+        assert_eq!(
+            start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+            Waited::Confirmed,
+            "{reported:?}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_shim_failure_before_launch_is_a_failed_start() {
+    for reported in [Reported::shim_failure(None), Reported::shim_failure(Some(2))] {
+        let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(reported);
+        let err = start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap_err();
+        assert!(
+            err.to_string().contains("failed start"),
+            "{reported:?} gave an error that does not say so: {err}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_managed_service_that_stops_before_running_is_a_failed_start_whatever_it_recorded() {
+    // A managed service speaks SCM itself: STOPPED with a service-specific code before RUNNING is
+    // how it reports that it could not start. The shim's reading of a record (a daemon exit means
+    // the daemon was launched) does not apply to it.
+    for reported in [
+        Reported::from_daemon_code(7),
+        Reported::Clean,
+        Reported::incomplete_stop(),
+        Reported::shim_failure(Some(2)),
+    ] {
+        let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(reported);
+        let err = start_via_notify(&mut fake, unbounded(), Kind::Managed).unwrap_err();
+        assert!(
+            err.to_string().contains("failed start"),
+            "{reported:?} gave an error that does not say so: {err}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_managed_service_that_reaches_running_is_a_started_service() {
+    let mut fake = FakeScm::new([Some(Observed::Running)]);
+    assert_eq!(
+        start_via_notify(&mut fake, unbounded(), Kind::Managed).unwrap(),
+        Waited::Confirmed
+    );
+}
+
+#[skuld::test]
+fn a_failed_start_names_the_recorded_code() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(Reported::shim_failure(Some(2)));
+    let err = start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap_err();
+    assert!(err.to_string().contains("exit code 2"), "{err}");
 }
 
 #[skuld::test]
@@ -182,14 +275,20 @@ fn start_via_notify_rearms_on_pending_not_errs() {
         Some(Observed::Pending),
         Some(Observed::Running),
     ]);
-    assert_eq!(start_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        Waited::Confirmed
+    );
     assert_eq!(fake.arm_count(), 3); // initial + 2 re-arms
 }
 
 #[skuld::test]
 fn a_start_wait_whose_deadline_expires_reports_expired() {
     let mut fake = FakeScm::new([Some(Observed::Pending), None]);
-    assert_eq!(start_via_notify(&mut fake, spent()).unwrap(), Waited::Expired);
+    assert_eq!(
+        start_via_notify(&mut fake, spent(), Kind::Simple).unwrap(),
+        Waited::Expired
+    );
 }
 
 #[skuld::test]
@@ -204,7 +303,10 @@ fn an_expired_deadline_still_issues_the_start_request() {
     // goetia ran out of budget while watching for it would be the worst of
     // both answers.
     let mut fake = FakeScm::new([None]);
-    assert_eq!(start_via_notify(&mut fake, spent()).unwrap(), Waited::Expired);
+    assert_eq!(
+        start_via_notify(&mut fake, spent(), Kind::Simple).unwrap(),
+        Waited::Expired
+    );
     assert_eq!(fake.log, vec!["arm_running", "start", "wait", "got_nothing"]);
 }
 
@@ -227,7 +329,10 @@ fn a_pending_callback_rearms_under_the_same_deadline() {
         Some(Observed::Pending),
         Some(Observed::Running),
     ]);
-    assert_eq!(start_via_notify(&mut fake, deadline).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        start_via_notify(&mut fake, deadline, Kind::Simple).unwrap(),
+        Waited::Confirmed
+    );
     assert_eq!(fake.arm_count(), 3);
     assert_eq!(fake.arm_deadlines, vec![deadline; 3]);
     assert_eq!(fake.deadlines, vec![deadline; 3]);
@@ -255,7 +360,10 @@ fn an_arm_that_keeps_lagging_returns_expired_instead_of_looping() {
     // empty script proves no wait was entered; the log proves the request
     // still went out.
     let mut fake = FakeScm::new([]).arming(Waited::Expired);
-    assert_eq!(start_via_notify(&mut fake, spent()).unwrap(), Waited::Expired);
+    assert_eq!(
+        start_via_notify(&mut fake, spent(), Kind::Simple).unwrap(),
+        Waited::Expired
+    );
     assert_eq!(fake.log, vec!["arm_running", "start"]);
 }
 
@@ -266,7 +374,7 @@ fn a_start_the_scm_rejects_is_reported_as_a_failed_start() {
     // `start_re_arms_after_a_non_terminal_callback` for the related cases
     // this doesn't duplicate.
     let mut rejecting = FakeScm::new([]).rejecting_start();
-    assert!(start_via_notify(&mut rejecting, unbounded()).is_err());
+    assert!(start_via_notify(&mut rejecting, unbounded(), Kind::Simple).is_err());
 }
 
 #[skuld::test]
@@ -377,7 +485,10 @@ fn a_plain_start_over_a_running_service_is_a_start() {
     request_start(&mut fake).unwrap();
 
     let mut fake = FakeScm::new([Some(Observed::Running)]).already_running(QueriedState::Running);
-    assert_eq!(start_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        Waited::Confirmed
+    );
 }
 
 /// A 1056 over a service the query reports `Running` is the SCM saying the goal is reached, so the
@@ -387,7 +498,10 @@ fn a_plain_start_over_a_running_service_is_a_start() {
 fn a_start_the_scm_answers_already_running_is_confirmed_whatever_the_deadline() {
     for (arm, deadline) in [(Waited::Expired, spent()), (Waited::Confirmed, unbounded())] {
         let mut fake = FakeScm::new([]).already_running(QueriedState::Running).arming(arm);
-        assert_eq!(start_via_notify(&mut fake, deadline).unwrap(), Waited::Confirmed);
+        assert_eq!(
+            start_via_notify(&mut fake, deadline, Kind::Simple).unwrap(),
+            Waited::Confirmed
+        );
         assert_eq!(fake.log, vec!["arm_running", "start"], "nothing left to wait for");
     }
 }
@@ -398,7 +512,10 @@ fn a_start_the_scm_answers_start_pending_still_expires_on_a_spent_deadline() {
     let mut fake = FakeScm::new([])
         .already_running(QueriedState::StartPending)
         .arming(Waited::Expired);
-    assert_eq!(start_via_notify(&mut fake, spent()).unwrap(), Waited::Expired);
+    assert_eq!(
+        start_via_notify(&mut fake, spent(), Kind::Simple).unwrap(),
+        Waited::Expired
+    );
 }
 
 #[skuld::test]

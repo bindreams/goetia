@@ -11,9 +11,9 @@
 //! Also home to the per-backend cross-validation `resolve` runs over every
 //! backend's merged spec: [`ShapedSpec`]/[`Shaped`] (a spec that
 //! has passed the shape gate but may not yet be complete),
-//! [`Backend::warn`]/[`Backend::error`] (the advisory and rejection rules),
-//! and the Windows built-in account vocabulary (`windows_builtin`) both
-//! read.
+//! [`Backend::warn`]/[`Backend::error`]/[`Backend::reject_merged`] (the
+//! advisory and rejection rules), and the Windows built-in account
+//! vocabulary (`windows_builtin`) both read.
 //!
 //! [`Backend::error`] rejects only a field the override actually supplied
 //! (`Supplied`, from `overrides.rs`) — a base value is never a per-backend
@@ -22,6 +22,12 @@
 //! about any value it can read, base or overridden, which is what lets a
 //! Linux host warn about a Windows-only divergence in a manifest with no
 //! `backend-specific:` block at all.
+//!
+//! [`Backend::reject_merged`] is the one rejection that is *not* scoped to a
+//! supplied field: a backend that cannot honour a value refuses it whoever
+//! wrote it, base included, because the base is what that backend would
+//! install. It is what makes the README's "every backend's merged spec is
+//! validated on every host" true of `restart: always` on `scm`.
 //!
 //! What a non-native backend is judged *on* splits along one seam. Its
 //! override is read as authored by both, so `scm: {user: {id: 1000}}` is
@@ -219,25 +225,36 @@ impl Backend {
             },
         }
     }
+
+    /// Values this backend cannot honour, whichever layer wrote them. Reads
+    /// the whole merged spec, unlike [`Backend::error`]: the base is what a
+    /// backend installs when it has no override, so it is judged too.
+    ///
+    /// Only `scm` has one today: `restart: always` (SCM recovery actions never
+    /// fire after a clean exit).
+    ///
+    /// A `restart` that is [`Shaped::Deferred`] (its `$` not yet substituted)
+    /// reads as unknown and passes.
+    pub(crate) fn reject_merged(self, spec: &ShapedSpec) -> Result<(), Error> {
+        match self {
+            Backend::Scm if spec.restart.parsed() == Some(Restart::Always) => Err(invalid(
+                &spec.id,
+                "`restart: always` cannot be honoured by the scm backend: SCM recovery actions never fire \
+                 after a clean exit. To keep `always` on systemd and launchd, set \
+                 `backend-specific: scm: { restart: on-failure }`",
+            )),
+            Backend::Scm | Backend::Systemd | Backend::Launchd => Ok(()),
+        }
+    }
 }
 
 /// `type: managed` on Windows has no working-directory or stdout-capture
-/// field, and SCM recovery actions never fire after a clean exit — so
-/// `cwd`/`logs` and `restart: always` are accepted, not rejected, but
-/// silently unavailable there. See the design spec's accepted divergences
-/// (a) and (b).
+/// field, so `cwd`/`logs` are accepted, not rejected, but silently
+/// unavailable there. See the design spec's accepted divergence (a).
 ///
-/// Reads `kind`/`restart` through [`Shaped::parsed`], and the two fields
-/// get different treatment: `kind == None` (absent, or unavailable) means
-/// silence is correct either way, since an absent `type` defaults to
-/// `Simple`, which warns about nothing. `restart == None` must **not**
-/// blanket-suppress the `cwd`/`logs` warning below it — an absent
-/// `restart` defaults to `Never`, which only ever suppressed the *second*
-/// warning, so silence about the first would be a deletion. See
-/// `managed_on_windows_warns_for_cwd_and_logs`/
-/// `managed_on_windows_warning_names_the_argument_consequence`
-/// (`resolve_tests.rs`), which set no `restart:` and still expect exactly
-/// one warning.
+/// Reads `kind` through [`Shaped::parsed`]: `None` (absent, or unavailable)
+/// means silence is correct, since an absent `type` defaults to `Simple`,
+/// which warns about nothing.
 fn warn_on_windows_divergences(spec: &ShapedSpec, out: &mut Vec<Warning>) {
     if spec.kind.parsed() != Some(Kind::Managed) {
         return;
@@ -248,14 +265,6 @@ fn warn_on_windows_divergences(spec: &ShapedSpec, out: &mut Vec<Warning>) {
             message: "type: managed has no working-directory or stdout-capture field on Windows SCM; \
                       `cwd`/`logs` are silently unavailable there, and with no working directory, \
                       every relative path in an argument resolves against System32"
-                .to_string(),
-        });
-    }
-    if spec.restart.parsed() == Some(Restart::Always) {
-        out.push(Warning {
-            id: Some(spec.id.clone()),
-            message: "restart: always is not faithfully expressible for type: managed on Windows: SCM \
-                      recovery actions only fire on failure, never after a clean exit"
                 .to_string(),
         });
     }
@@ -297,14 +306,11 @@ pub(crate) const MAX_SC_ACTION_DELAY: Duration = Duration::from_millis(u32::MAX 
 /// The advisory for `generate::registration`'s restart-delay clamp, fired at
 /// resolve time on every host rather than only when an effectful Windows
 /// install runs the generator. Gated identically to the clamp itself:
-/// `Kind::Simple` builds no `FailureActions` at all and `Restart::Never`
-/// builds none either, so a `restart-delay` with neither `type: managed` nor
-/// `restart: on-failure`/`always` warns about nothing.
+/// `Restart::Never` builds no `FailureActions`, so a `restart-delay` without
+/// `restart: on-failure` warns about nothing. `always` never reaches here:
+/// [`Backend::reject_merged`] refuses it first.
 fn warn_on_over_long_restart_delay(spec: &ShapedSpec, out: &mut Vec<Warning>) {
-    if spec.kind.parsed() != Some(Kind::Managed) {
-        return;
-    }
-    if !matches!(spec.restart.parsed(), Some(Restart::OnFailure) | Some(Restart::Always)) {
+    if spec.restart.parsed() != Some(Restart::OnFailure) {
         return;
     }
     let Some(delay) = spec.restart_delay.parsed() else {
