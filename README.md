@@ -650,11 +650,35 @@ Nothing cancels a restart SCM has queued, so `goetia daemon stop` meets it
 head on: a command that failed and is waiting out `restart-delay`, or one that
 fails as the stop arrives. `stop` waits for that restart, within `--timeout`,
 and stops the command it starts, so the daemon stays down; `restart` stops it
-the same way. If the restart does not arrive in time, or
-`--timeout` is `0`, nothing is stopped: `stop` exits `4` and says a restart is
-pending. Run it again with a longer `--timeout`, or `--no-timeout`.
+the same way. A service that is starting refuses a stop, so a `stop` that
+arrives as a restart begins waits for the daemon to be running, then stops it.
+If the restart does not arrive in time, or `--timeout` is `0`, nothing is
+stopped: `stop` exits `4` and says a restart is pending. Run it again with a
+longer `--timeout`, or `--no-timeout`.
 
-`uninstall` does not wait for a restart. It stops a running daemon first, and
+`stop` finds out whether a restart is queued from the record SCM keeps of how
+the service last ended, and two sequences make that record wrong:
+
+- **A failed record outlives the settings it failed under.** A daemon fails
+  under `restart: never`; you change the manifest to `restart: on-failure` and
+  run `goetia daemon install`. The failure is still recorded but no restart was
+  queued, so `stop` waits for one that never comes: it exits `4` after
+  `--timeout`, and waits forever under `--no-timeout`. `restart` gives up the
+  same way at its stop and does not start the daemon. The same happens to a
+  service that was disabled outside goetia (`sc config <id> start= disabled`)
+  after its daemon failed. Run `goetia daemon start <id>` once first: starting
+  replaces the record.
+- **A manual start hides a queued restart.** A daemon fails and SCM queues a
+  restart for `restart-delay` later. If you run `goetia daemon start <id>`
+  before it fires, the start replaces the record, so a later
+  `goetia daemon stop <id>` sees a clean service and exits `0`, and the restart
+  that was queued still starts the daemon when the delay ends. The same happens when
+  someone starts the service while a `stop` is waiting for that restart. To
+  avoid it, `stop` a failed daemon instead of starting it, and when you have
+  started one by hand, stop it again after `restart-delay` has passed.
+
+`uninstall` does not wait for a restart. It stops a running daemon first (one
+that is still starting is waited on until it runs, then stopped), and
 if that fails it exits `1` and leaves the service installed. It then deletes the
 service, which cancels a restart SCM has queued and prevents any other, and
 stops any daemon that a restart started in the meantime. A daemon that fails as
@@ -718,7 +742,7 @@ daemon may still arrive. `goetia daemon status <id>` shows the manager's
 current view.
 
 On Windows a `stop` can also exit `4` with nothing issued: the daemon failed
-and SCM has a restart queued (see [Restarts on
+and SCM has a restart queued or beginning (see [Restarts on
 Windows](#restarts-on-windows)). The restart is the thing to wait for, so
 `stop --timeout 0` and a `--timeout` that ends before it both exit `4`, and the
 message says that a restart is pending.
