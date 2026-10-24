@@ -7,7 +7,11 @@
 //!
 //! That last step rests on a premise about SCM, which Microsoft does not document: a pid SCM still
 //! reports cannot have been freed and reissued to a stranger. This relies on SCM holding its own
-//! handle to the service's process for as long as it reports that process's pid.
+//! handle to the service's process for as long as it reports that process's pid. SCM learns of the
+//! exit through that handle, so the process object outlives the exit until SCM has handled it, and
+//! measured, it records `STOPPED` with pid 0 before letting go: 250 terminated services, 13,546
+//! tight-loop samples of `QueryServiceStatusEx` and `OpenProcess`, and not one reported pid whose
+//! process was gone (windows-latest, run 40119307045).
 //!
 //! A pure state machine over [`KillTarget`], unit-tested with a script in `kill_tests.rs`;
 //! [`SystemKillTarget`] drives the real SCM and `OpenProcess`/`TerminateProcess`.
