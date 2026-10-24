@@ -411,6 +411,32 @@ fn an_unknown_type_that_substitutes_does_not_hide_an_advisory() {
 }
 
 #[skuld::test]
+fn a_path_that_substitutes_to_a_value_with_a_dollar_is_still_determined() {
+    // A real path can contain `$`; only a failed substitution makes a field
+    // undeterminable, never the text it resolved to.
+    for (field, line) in [(Field::Cwd, "cwd"), (Field::Logs, "logs")] {
+        for native in [Backend::Systemd, Backend::Launchd] {
+            let label = format!("{field:?} / native {native}");
+            let templated = format!(
+                "daemons:\n  svc:\n    command: [/bin/svc]\n    type: managed\n    {line}: ${{P}}\n    \
+                 backend-specific:\n      {native}: {{ {line}: /srv/n }}\n"
+            );
+            let literal = format!(
+                "daemons:\n  svc:\n    command: [/bin/svc]\n    type: managed\n    {line}: /srv/Share/x\n    \
+                 backend-specific:\n      {native}: {{ {line}: /srv/n }}\n"
+            );
+            let dir = env_dir(Some("P=/srv/Share$/x\n"));
+            let from_literal = run(&literal, dir.path(), native).expect("resolves");
+            assert!(
+                from_literal.iter().any(|w| w.message.contains("type: managed")),
+                "{label}: {from_literal:?}"
+            );
+            assert_eq!(run(&templated, dir.path(), native), Ok(from_literal), "{label}");
+        }
+    }
+}
+
+#[skuld::test]
 fn a_default_is_not_the_resolved_value_when_env_cannot_be_read() {
     let yaml = "daemons:\n  svc:\n    command: [/bin/svc]\n    restart: ${R:-always}\n    \
                 backend-specific:\n      systemd: { restart: on-failure }\n      launchd: { restart: on-failure }\n";

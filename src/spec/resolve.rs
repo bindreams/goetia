@@ -73,7 +73,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::backend::{Backend, Shaped, ShapedSpec};
-use super::interpolate;
+use super::interpolate::{self, Unresolved};
 use super::overrides::Supplied;
 use super::raw::RawManifest;
 use super::user::{AccountId, RawUser, User};
@@ -254,9 +254,11 @@ fn resolve_as(
         // Step 5a: every non-native backend's advisories and verdict. Each field
         // a check reads is judged alone, on the value that backend's install
         // would read; one it cannot determine is silent (see `read_substituted`).
-        let advisory_base = substituted_base(&raw, &path, &vars, base_readable);
+        let (advisory_base, unresolved) = substituted_base(&raw, &path, &vars, base_readable);
         for (backend, view) in &mut swept {
-            read_substituted(&id, view, advisory_base.merged_for(*backend).0, base_dir);
+            let (merged, supplied) = advisory_base.merged_for(*backend);
+            let trusted = Trusted::new(unresolved, supplied);
+            read_substituted(&id, view, merged, trusted, base_dir);
             // No `backend-specific.<backend>` attribution: the value may be
             // the base's, and the message names the remedy.
             backend.reject_merged(view)?;
@@ -329,27 +331,55 @@ pub fn load(path: &Path) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
 }
 
 /// `raw`'s base spec, substituted, carrying `raw`'s overrides back so
-/// [`RawSpec::merged_for`] can layer an authored override on top of it —
-/// the spec step 5a reads.
+/// [`RawSpec::merged_for`] can layer an authored override on top of it — the
+/// spec step 5a reads — and which of its fields could not be substituted.
 ///
 /// Substituted field by field: a field that cannot be substituted (a variable
 /// `.env` does not define, a `$` in an `env` name) keeps its authored text. With
 /// `readable` false (`.env` could not be read) nothing is substituted.
-fn substituted_base(raw: &RawSpec, path: &str, vars: &Vars, readable: bool) -> RawSpec {
+fn substituted_base(raw: &RawSpec, path: &str, vars: &Vars, readable: bool) -> (RawSpec, Unresolved) {
     let mut base = raw.without_overrides();
-    if readable {
-        interpolate::spec_resolvable(&mut base, path, vars);
-    }
+    let unresolved = if readable {
+        interpolate::spec_resolvable(&mut base, path, vars)
+    } else {
+        Unresolved::ALL
+    };
     base.backend_specific = raw.backend_specific.clone();
-    base
+    (base, unresolved)
+}
+
+/// Which of the checked fields of a backend's merged spec hold a substituted
+/// value. Such a value is taken as it is, whatever it contains; any other is
+/// authored text, which a `$` marks as not yet determined.
+#[derive(Clone, Copy)]
+struct Trusted {
+    restart: bool,
+    restart_delay: bool,
+    kind: bool,
+    cwd: bool,
+    logs: bool,
+}
+
+impl Trusted {
+    /// A field is substituted when the base's substitution succeeded and no
+    /// override replaced it: an override is never substituted here.
+    fn new(unresolved: Unresolved, supplied: Supplied) -> Trusted {
+        Trusted {
+            restart: !unresolved.restart && !supplied.restart,
+            restart_delay: !unresolved.restart_delay && !supplied.restart_delay,
+            kind: !unresolved.kind && !supplied.kind,
+            cwd: !unresolved.cwd && !supplied.cwd,
+            logs: !unresolved.logs && !supplied.logs,
+        }
+    }
 }
 
 /// Replace, in `view` (a backend's authored shape), each field the checks read
 /// with the one `substituted` carries, when that value passes the field's own
-/// shape check. A field that cannot be determined (still carries a `$`, or
-/// fails that check) stays deferred, or for `cwd` and `logs` (read for
-/// presence) becomes absent, so it is silent.
-fn read_substituted(id: &Id, view: &mut ShapedSpec, substituted: RawSpec, base_dir: &Path) {
+/// shape check. A field that cannot be determined (not substituted and still
+/// carrying a `$`, or failing that check) stays deferred, or for `cwd` and
+/// `logs` (read for presence) becomes absent, so it is silent.
+fn read_substituted(id: &Id, view: &mut ShapedSpec, substituted: RawSpec, trusted: Trusted, base_dir: &Path) {
     let RawSpec {
         restart,
         restart_delay,
@@ -358,23 +388,37 @@ fn read_substituted(id: &Id, view: &mut ShapedSpec, substituted: RawSpec, base_d
         logs,
         ..
     } = substituted;
-    if let Ok(restart) = shape(id, restart, parse_restart) {
+    if let Ok(restart) = determinable(id, restart, trusted.restart, parse_restart) {
         view.restart = restart;
     }
-    if let Ok(restart_delay) = shape(id, restart_delay, parse_restart_delay) {
+    if let Ok(restart_delay) = determinable(id, restart_delay, trusted.restart_delay, parse_restart_delay) {
         view.restart_delay = restart_delay;
     }
-    if let Ok(kind) = shape(id, kind, parse_kind) {
+    if let Ok(kind) = determinable(id, kind, trusted.kind, parse_kind) {
         view.kind = kind;
     }
-    view.cwd = determinable_path(id, "cwd", cwd, base_dir);
-    view.logs = determinable_path(id, "logs", logs, base_dir);
+    view.cwd = determinable_path(id, "cwd", cwd, trusted.cwd, base_dir);
+    view.logs = determinable_path(id, "logs", logs, trusted.logs, base_dir);
+}
+
+/// [`shape`], except a `trusted` value is parsed even if it contains a `$`.
+fn determinable<T>(
+    id: &Id,
+    raw: Option<String>,
+    trusted: bool,
+    parse: fn(&Id, &str) -> Result<T, Error>,
+) -> Result<Shaped<T>, Error> {
+    match raw {
+        Some(text) if trusted => Ok(Shaped::Parsed(parse(id, &text)?)),
+        raw => shape(id, raw, parse),
+    }
 }
 
 /// `raw` resolved as a path, or `None` when the field is absent or cannot be
-/// determined: it still carries a `$`, or its value fails the field's own check.
-fn determinable_path(id: &Id, field: &str, raw: Option<String>, base_dir: &Path) -> Option<PathBuf> {
-    let text = raw.filter(|text| !interpolate::would_substitution_change(text))?;
+/// determined: it is untrusted and still carries a `$`, or its value fails the
+/// field's own check.
+fn determinable_path(id: &Id, field: &str, raw: Option<String>, trusted: bool, base_dir: &Path) -> Option<PathBuf> {
+    let text = raw.filter(|text| trusted || !interpolate::would_substitution_change(text))?;
     resolve_optional_path(id, field, Some(text), base_dir, Phase::Substituted, &mut Vec::new())
         .ok()
         .flatten()
