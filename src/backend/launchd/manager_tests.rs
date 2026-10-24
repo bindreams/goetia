@@ -748,6 +748,8 @@ fn elevated() -> std::result::Result<(), String> {
 const NOT_LOADED: &str = "exit 113";
 const DONE: &str = "exit 0";
 const REFUSED: &str = "echo 'Bootstrap failed: 5: Input/output error' >&2; exit 5";
+/// A `print` that failed for a reason other than "no such job".
+const UNREADABLE: &str = "echo 'Could not print: 5: Input/output error' >&2; exit 5";
 const RUNNING: &str = "printf '\\tstate = running\\n\\tpid = 4242\\n'";
 const NOT_RUNNING: &str = "printf '\\tstate = not running\\n'";
 const PID: &str = "echo 4242";
@@ -782,7 +784,7 @@ const START_NOT_WAITING: [(&str, &str); 5] = [
 ];
 
 /// `install`'s longest path, [`INSTALL_CALLS`] calls: a `Create`'s read, and the `bootout` of the
-/// stale job it finds loaded. An `Update` makes the read alone.
+/// stale job it finds loaded. An `Update` makes two reads, before the write and after it.
 const INSTALL_LONGEST: [(&str, &str); INSTALL_CALLS] = [("print", DONE), ("bootout", DONE)];
 
 /// `stop`'s and `uninstall`'s one call.
@@ -893,7 +895,7 @@ fn every_launchd_verb_path_stays_inside_its_reservation() {
     script.assert_driven("stop");
 
     spec.command.push("updated".to_string());
-    let script = Scripted::new(&[("print", NOT_LOADED)]);
+    let script = Scripted::new(&[("print", NOT_LOADED), ("print", NOT_LOADED)]);
     assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Update { .. })));
     script.assert_driven("install, updating a job that is not loaded");
 
@@ -981,8 +983,98 @@ fn a_changed_spec_is_refused_while_the_job_is_loaded() {
         );
     }
 
-    let script = Scripted::new(&[("print", NOT_LOADED)]);
+    let script = Scripted::new(&[("print", NOT_LOADED), ("print", NOT_LOADED)]);
     assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Update { .. })));
     script.assert_driven("install once the job is not loaded");
     assert_ne!(std::fs::read_to_string(staging_path(&name)).unwrap(), installed);
+}
+
+/// The spec the tests below install, under a name of their own: the tests run on parallel threads of
+/// one process, so each needs plists no other writes.
+fn spec_named(name: &str) -> DaemonSpec {
+    DaemonSpec {
+        id: Id::try_from(name).unwrap(),
+        name: name.to_owned(),
+        command: vec!["/bin/sleep".to_string(), "300".to_string()],
+        cwd: None,
+        env: Default::default(),
+        user: User::Root,
+        restart: Restart::Never,
+        restart_delay: None,
+        logs: None,
+        kind: Kind::Simple,
+    }
+}
+
+/// A `print` that fails for a reason other than "no such job" does not say the job is not loaded, so
+/// `install` over an installed plist and over none, and `start`, fail on it instead of acting as if
+/// the job were absent. Each stand-in answers `print` only: a write under a loaded job, a `bootout`
+/// or a `bootstrap` would be an unscripted call, and `assert_driven` would see it.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_print_that_fails_otherwise_is_an_error_not_a_job_that_is_not_loaded() {
+    let mgr = LaunchdManager::new();
+    let name = format!("goetia-unreadable-{:x}", std::process::id());
+    let _plists = Plists(name.clone());
+    let mut spec = spec_named(&name);
+    let names_print =
+        |e: &Error| matches!(e, Error::CommandFailed { command, .. } if command.starts_with("launchctl print"));
+
+    // `Create`: the stale-job check.
+    let script = Scripted::new(&[("print", UNREADABLE)]);
+    let e = mgr.install(&spec, false).expect_err("an unreadable print");
+    assert!(names_print(&e), "{e:?}");
+    script.assert_driven("create, unreadable print");
+
+    // `start`: the first read.
+    let script = Scripted::new(&[("print", UNREADABLE)]);
+    let e = mgr.start(&spec.id, Budget::DEFAULT).expect_err("an unreadable print");
+    assert!(names_print(&e), "{e:?}");
+    script.assert_driven("start, unreadable first read");
+
+    // `start`: the read after a refused `bootstrap`.
+    let script = Scripted::new(&[("print", NOT_LOADED), ("bootstrap", REFUSED), ("print", UNREADABLE)]);
+    let e = mgr.start(&spec.id, Budget::DEFAULT).expect_err("an unreadable print");
+    assert!(names_print(&e), "{e:?}");
+    script.assert_driven("start, unreadable read after a refused bootstrap");
+
+    // `Update`: the refusal check. The plist exists from the `Create` above.
+    let installed = std::fs::read_to_string(staging_path(&name)).unwrap();
+    spec.command.push("updated".to_string());
+    let script = Scripted::new(&[("print", UNREADABLE)]);
+    let e = mgr.install(&spec, false).expect_err("an unreadable print");
+    assert!(names_print(&e), "{e:?}");
+    script.assert_driven("update, unreadable print");
+    assert_eq!(
+        std::fs::read_to_string(staging_path(&name)).unwrap(),
+        installed,
+        "an install that could not tell whether the job is loaded left the plist as it was"
+    );
+}
+
+/// A job that is not loaded when `install` checks but is loaded once it has written, because someone
+/// else started it between the two, may have read either plist: the install is in doubt
+/// ([`Error::LoadedJobInDoubt`], exit `4`), though the new plist is on disk.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_job_loaded_between_the_check_and_the_write_leaves_the_install_in_doubt() {
+    let mgr = LaunchdManager::new();
+    let name = format!("goetia-indoubt-{:x}", std::process::id());
+    let _plists = Plists(name.clone());
+    let mut spec = spec_named(&name);
+
+    let script = Scripted::new(&[("print", NOT_LOADED)]);
+    assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
+    script.assert_driven("the first install");
+    let installed = std::fs::read_to_string(staging_path(&name)).unwrap();
+
+    spec.command.push("updated".to_string());
+    let script = Scripted::new(&[("print", NOT_LOADED), ("print", RUNNING)]);
+    let e = mgr.install(&spec, false).expect_err("loaded after the write");
+    assert!(matches!(e, Error::LoadedJobInDoubt { .. }), "{e:?}");
+    assert!(e.to_string().contains(&format!("goetia daemon stop {name}")), "{e}");
+    script.assert_driven("install, job loaded after the write");
+    assert_ne!(
+        std::fs::read_to_string(staging_path(&name)).unwrap(),
+        installed,
+        "the plist was written before the second check"
+    );
 }

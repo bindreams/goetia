@@ -39,6 +39,13 @@ pub(crate) fn loaded_refusal(id: &Id) -> Error {
     ))
 }
 
+/// The error for a job that is loaded after `install` wrote its plist, though it was not before.
+/// The write cannot be undone, and which definition the job read is not known, so this is not a
+/// success.
+pub(crate) fn loaded_after_write(id: &Id) -> Error {
+    Error::LoadedJobInDoubt { id: id.to_string() }
+}
+
 #[cfg(test)]
 #[path = "refuse_tests.rs"]
 mod refuse_tests;

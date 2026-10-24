@@ -174,7 +174,7 @@ pub enum DaemonCommand {
 ///   kind-to-code map. `diff` returns it for `Outcome::RefuseUnreadable`
 ///   and for `Error::Undetermined` (`cli::diff::run`); `install` returns it
 ///   for `Error::Undetermined` from `mgr.install`/`enable`/`start`, and for
-///   `Error::WaitTimeout` and `Error::RequestInDoubt` from its steps, so the two verbs
+///   `Error::WaitTimeout`, `Error::RequestInDoubt` and `Error::LoadedJobInDoubt` from its steps, so the two verbs
 ///   agree about `Undetermined` and disagree only about
 ///   `Outcome::RefuseUnreadable`, which `install` reports as `1` because it
 ///   genuinely failed to install. All six id verbs return it through

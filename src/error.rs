@@ -186,6 +186,19 @@ pub enum Error {
         detail: String,
     },
 
+    /// `install` rewrote the plist of a daemon whose job launchd now has loaded, though it was not
+    /// loaded when `install` checked: someone started it in between. Which definition the loaded job
+    /// read, the old plist or the new, is not established, so the job may run a spec other than the
+    /// installed one. launchd only (it cannot update a loaded job).
+    ///
+    /// Exit `4` (indeterminate), like the four above: the plist is on disk, and whether the daemon
+    /// runs it is the question, which was not answered.
+    #[error(
+        "`{id}` was loaded in launchd while its plist was rewritten, so goetia cannot tell whether the loaded job \
+         holds the old definition or the new one: run `goetia daemon stop {id}` and then `goetia daemon start {id}`"
+    )]
+    LoadedJobInDoubt { id: String },
+
     /// goetia will ask no service manager here, on positive evidence: systemd's offline mode, a
     /// chroot, or a system systemd did not boot. `evidence` says which. goetia refuses there
     /// rather than act on unit files alone, or read a `systemctl` that asked nobody as an answer.

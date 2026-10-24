@@ -881,11 +881,27 @@ fn never_expires<T>(step: Option<T>) -> T {
     step.expect("this call passed an unbounded deadline, which never expires")
 }
 
-/// `Ok(None)` iff `deadline` expired.
+/// Whether launchd has `id` loaded. `Ok(None)` iff `deadline` expired.
+///
+/// Only success and the "no such job" codes [`is_not_found`] names answer the question. Any other
+/// failure (a permission error, a launchd that is not answering) says nothing about the job, and
+/// is an `Err`: every caller acts on "not loaded" by writing a plist or bootstrapping a job, and
+/// a guess there leaves a loaded job running a definition other than the installed one.
 fn is_loaded(id: &str, deadline: Deadline) -> Result<Option<bool>> {
     // Not "structured data" parsing (see the module doc comment): this only
     // ever looks at the exit code, never the body of `print`'s output.
-    Ok(launchctl(&["print", &target(id)], deadline, Role::Query)?.map(|ran| ran.status.success()))
+    let target = target(id);
+    let args = ["print", target.as_str()];
+    let Some(ran) = launchctl(&args, deadline, Role::Query)? else {
+        return Ok(None);
+    };
+    if ran.status.success() {
+        Ok(Some(true))
+    } else if is_not_found(ran.status.code()) {
+        Ok(Some(false))
+    } else {
+        Err(command_failed(&args, &ran))
+    }
 }
 
 /// `Ok(None)` iff `deadline` expired.
@@ -1005,8 +1021,9 @@ const STOP_REQUESTS: usize = 1;
 
 /// The most `launchctl` calls each verb makes, requests and reads alike — every one needs a temp
 /// file for each of its two streams, and a verb makes them all before it sends anything (see
-/// [`files`]). `install`: its request and one `is_loaded`. `start`: its five requests, two
-/// `is_loaded`s and five `live_state`s. `stop` and `uninstall`: their request.
+/// [`files`]). `install`: a `Create`'s `is_loaded` and `bootout`, or an `Update`'s two `is_loaded`s.
+/// `start`: its five requests, two `is_loaded`s and five `live_state`s. `stop` and `uninstall`: their
+/// request.
 const INSTALL_CALLS: usize = INSTALL_REQUESTS + 1;
 const START_CALLS: usize = START_REQUESTS + 7;
 const STOP_CALLS: usize = STOP_REQUESTS;
@@ -1163,17 +1180,13 @@ impl LaunchdManager {
             }
             Outcome::Update { .. } | Outcome::Stale { .. } => {
                 // First, before anything is created or written: a refusal leaves the host as it was.
-                // `Stale` is checked too, since a version bump can carry a changed spec. A job
-                // bootstrapped by someone else after this read is not caught: it keeps the
-                // definition it was loaded with, as a deferred install would on systemd, and the
-                // next stop and start runs the new one.
-                if refuse::changes_loaded_job(&outcome, &discovery.found, spec) {
-                    // `install` has no `--timeout` of its own, so its own `launchctl` calls are
-                    // deliberately unbounded.
-                    let deadline = Budget::Unbounded.start();
-                    if never_expires(is_loaded(spec.id.as_str(), deadline)?) {
-                        return Err(refuse::loaded_refusal(&spec.id));
-                    }
+                // `Stale` is checked too, since a version bump can carry a changed spec.
+                let changes_job = refuse::changes_loaded_job(&outcome, &discovery.found, spec);
+                // `install` has no `--timeout` of its own, so its own `launchctl` calls are
+                // deliberately unbounded.
+                let deadline = Budget::Unbounded.start();
+                if changes_job && never_expires(is_loaded(spec.id.as_str(), deadline)?) {
+                    return Err(refuse::loaded_refusal(&spec.id));
                 }
                 prepare_parent_dirs(spec, &account)?;
                 let target = discovery
@@ -1220,6 +1233,15 @@ impl LaunchdManager {
                     Presence::Undetermined { source } => return Err(Error::Io { path: target, source }),
                 }
                 write_existing(&target, &desired)?;
+                // The check above and the write are not atomic, and launchd relaunches a loaded job
+                // from the definition it was loaded with, never from the plist now on disk. A job
+                // someone bootstrapped in between may hold the old plist or the new one, and a
+                // relaunch of one that read the old runs the old spec (systemd's `Restart=` would
+                // read the new unit). goetia takes no lock, so it says it cannot tell instead of
+                // reporting a success.
+                if changes_job && never_expires(is_loaded(spec.id.as_str(), deadline)?) {
+                    return Err(refuse::loaded_after_write(&spec.id));
+                }
             }
             Outcome::UpToDate
             | Outcome::Conflict { .. }

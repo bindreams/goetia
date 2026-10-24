@@ -163,7 +163,12 @@ fn failure_code(e: &Error) -> i32 {
         // step that determinately failed, which is what `1` would claim.
         // `RequestInDoubt` left open whether a request `install` or `--start`
         // sent reached the manager, or what came of one that did.
-        Error::Undetermined { .. } | Error::WaitTimeout { .. } | Error::RequestInDoubt { .. } => 4,
+        // `LoadedJobInDoubt`: the plist is written, and which definition a job started
+        // meanwhile read is open.
+        Error::Undetermined { .. }
+        | Error::WaitTimeout { .. }
+        | Error::RequestInDoubt { .. }
+        | Error::LoadedJobInDoubt { .. } => 4,
         // `Error::Unestablished` belongs in the arm above and is missing
         // from it only because it cannot arrive here: `cli::restart` is its
         // only producer, and `install` never calls it. `Error` is not
@@ -309,3 +314,7 @@ fn preview_artifact(spec: &DaemonSpec, err: &mut dyn Write) -> String {
         "# no dry-run preview generator for this platform\n".to_string()
     }
 }
+
+#[cfg(test)]
+#[path = "install_tests.rs"]
+mod install_tests;

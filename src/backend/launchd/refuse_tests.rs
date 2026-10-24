@@ -113,3 +113,17 @@ fn the_refusal_names_the_daemon_and_the_remedy() {
     assert!(message.contains("goetia daemon stop frpc"), "{message}");
     assert!(message.contains("not installed"), "{message}");
 }
+
+// loaded_after_write ==================================================================================================
+
+/// The job was not loaded at the first check and is loaded now: goetia cannot tell which definition
+/// it read, so the install is in doubt (exit `4`), not a success and not a refusal.
+#[skuld::test]
+fn a_job_loaded_after_the_write_is_in_doubt_and_names_the_remedy() {
+    let e = loaded_after_write(&Id::try_from("frpc").unwrap());
+    assert!(matches!(e, Error::LoadedJobInDoubt { .. }), "{e:?}");
+    let message = e.to_string();
+    assert!(message.contains("`frpc`"), "{message}");
+    assert!(message.contains("goetia daemon stop frpc"), "{message}");
+    assert!(message.contains("goetia daemon start frpc"), "{message}");
+}
