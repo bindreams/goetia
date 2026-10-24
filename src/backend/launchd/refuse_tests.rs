@@ -251,3 +251,19 @@ fn a_plist_taken_after_the_bootout_says_what_was_done_and_what_is_there() {
     assert!(message.contains("re-run install"), "{message}");
     assert!(!message.contains("nothing was"), "{message}");
 }
+
+// changed_during_install ==============================================================================================
+
+/// A plist that changed under `install` after a read: a plain failure that says nothing was written and
+/// to run `install` again.
+#[skuld::test]
+fn a_plist_changed_during_install_is_a_plain_failure_that_says_to_rerun() {
+    let path = std::path::Path::new("/Library/Application Support/Goetia/daemons/frpc.plist");
+    let e = changed_during_install(&Id::try_from("frpc").unwrap(), path);
+    assert!(matches!(e, Error::Other(_)), "{e:?}");
+    let message = e.to_string();
+    assert!(message.contains("`frpc`"), "{message}");
+    assert!(message.contains(&path.display().to_string()), "{message}");
+    assert!(message.contains("nothing was written"), "{message}");
+    assert!(message.contains("re-run"), "{message}");
+}

@@ -1481,10 +1481,11 @@ fn a_plist_taken_after_the_bootout_is_reported_without_further_launchctl_calls()
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "someone else\n");
 }
 
-/// The same race before any request was sent is re-derived as ever: the plist found is foreign, which
-/// `install` refuses without a further `launchctl` call.
+/// The same race after a read only: nothing was sent and nothing written, but `install` does not
+/// re-derive into a second pass, whose reads the verb did not reserve. It fails (exit `1`) and says to
+/// run it again, and leaves what is at the path.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_plist_taken_before_any_request_is_re_derived() {
+fn a_plist_taken_after_a_read_fails_the_install_without_further_launchctl_calls() {
     let mgr = LaunchdManager::new();
     let name = format!("goetia-taken-early-{:x}", std::process::id());
     let _plists = Plists(name.clone());
@@ -1493,9 +1494,40 @@ fn a_plist_taken_before_any_request_is_re_derived() {
 
     let take = format!("echo 'someone else' > '{}'; exit 113", target.display());
     let script = Scripted::new(&[("print", &take)]);
-    assert!(matches!(mgr.install(&spec, false), Ok(Outcome::RefuseForeign { .. })));
-    script.assert_driven("the re-derivation asks launchd nothing more");
+    let e = mgr.install(&spec, false).expect_err("the plist was taken after a read");
+    assert!(matches!(e, Error::Other(_)), "{e:?}");
+    assert!(e.to_string().contains("re-run"), "{e}");
+    assert!(e.to_string().contains(&target.display().to_string()), "{e}");
+    script.assert_driven("nothing is sent after the race");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "someone else\n");
+}
+
+/// The plist is removed (a concurrent `uninstall`) after the read that found no job loaded, while a
+/// changed spec is being written over it. A call has been made, so `install` does not re-derive: a
+/// second pass is a `Create` over what may be a job loaded meanwhile, which needs more calls than the
+/// verb reserved. It fails (exit `1`) and writes nothing.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_plist_removed_after_a_read_fails_the_install_without_further_launchctl_calls() {
+    let mgr = LaunchdManager::new();
+    let name = format!("goetia-vanished-{:x}", std::process::id());
+    let _plists = Plists(name.clone());
+    let mut spec = spec_named(&name);
+    let target = staging_path(&name);
+
+    let script = Scripted::new(&CREATED);
+    assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
+    script.assert_driven("the first install");
+
+    spec.command.push("updated".to_string());
+    let remove = format!("rm '{}'; exit 113", target.display());
+    let script = Scripted::new(&[("print", &remove)]);
+    let e = mgr
+        .install(&spec, false)
+        .expect_err("the plist was removed after a read");
+    assert!(matches!(e, Error::Other(_)), "{e:?}");
+    assert!(e.to_string().contains("re-run"), "{e}");
+    script.assert_driven("nothing is sent after the vanish");
+    assert!(!target.exists(), "the install wrote a plist over the vanished one");
 }
 
 /// `install --dry-run` and `diff` read no job state, and `install --start` over a loaded job with a

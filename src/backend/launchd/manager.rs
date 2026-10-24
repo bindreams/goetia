@@ -152,9 +152,9 @@ enum Presence {
 /// symlink, a socket, or any other non-regular entry, which would let
 /// `locate` classify an occupied path as `Absent`; `persist_new`'s
 /// underlying `link`(2) refuses to create over *any* of those the same as
-/// over a regular file (`EEXIST`), so that mismatch would send
-/// `install` into `Create` -> `persist_new` -> `Raced` -> re-`install` ->
-/// the identical classification, forever. `symlink_metadata` (not
+/// over a regular file (`EEXIST`), so that mismatch would make
+/// `install` classify `Create`, then fail `persist_new` with `Raced`, on
+/// every run. `symlink_metadata` (not
 /// `metadata`, which follows symlinks and would report a *dangling* one
 /// as absent) catches every case uniformly.
 fn occupied(path: &Path) -> Presence {
@@ -1072,8 +1072,8 @@ const STOP_REQUESTS: usize = 1;
 /// The most `launchctl` calls each verb makes, requests and reads alike — every one needs a temp
 /// file for each of its two streams, and a verb makes them all before it sends anything (see
 /// [`files`]). `install`: a `Create`'s `is_loaded`, `bootout` and the `is_loaded` after the write, or an
-/// `Update`'s two `is_loaded`s, before the write and after it. A pass repeated after a race that sent no
-/// request is not counted.
+/// `Update`'s two `is_loaded`s, before the write and after it. A pass is repeated only when the one before
+/// it made no call, so this is one pass's longest path.
 /// `start`: its five requests, two `is_loaded`s and five `live_state`s. `stop` and `uninstall`: their
 /// request.
 const INSTALL_CALLS: usize = INSTALL_REQUESTS + 2;
@@ -1171,8 +1171,8 @@ fn classified(ran: &Ran) -> (State, Option<u32>) {
 // ServiceManager ======================================================================================================
 
 impl LaunchdManager {
-    /// `install`, with the reaper for its one request made. A re-derivation after a race that sent no
-    /// request passes the same reaper on.
+    /// `install`, with the reaper for its one request made. A re-derivation after a race that made no
+    /// `launchctl` call passes the same reaper on; once a pass has made one, a race ends the install.
     ///
     /// `install` has no `--timeout` of its own, so its own `launchctl` calls are deliberately unbounded.
     fn install_reaping(&self, spec: &DaemonSpec, force: bool, reaper: Reaper) -> Result<Outcome> {
@@ -1214,20 +1214,14 @@ impl LaunchdManager {
                 };
                 match persist_new(staged, &target)? {
                     WriteNew::Written => {}
-                    // Something now exists where discovery saw nothing. Before any request, `install`
-                    // runs again to re-derive `Ownership` against what is there and reach whatever
-                    // `decide` says about *that*, rather than a bespoke branch that could drift from
-                    // it. After the `bootout` that would send further requests, and make reapers, past
-                    // what the verb reserved: it reports instead.
+                    // Something now exists where discovery saw nothing. This pass has already made a
+                    // call (`is_loaded`), so a second pass could make more than the verb reserved:
+                    // it reports instead.
                     WriteNew::Raced => {
-                        return match reaper {
-                            Some(reaper) => self.install_reaping(spec, force, reaper),
-                            None => Err(refuse::slot_taken_after_bootout(
-                                &spec.id,
-                                &target,
-                                &describe_at(&target),
-                            )),
-                        };
+                        return Err(match reaper {
+                            Some(_) => refuse::changed_during_install(&spec.id, &target),
+                            None => refuse::slot_taken_after_bootout(&spec.id, &target, &describe_at(&target)),
+                        });
                     }
                 }
                 recheck_after_write(&spec.id, deadline, &target, &desired, None)?;
@@ -1249,11 +1243,17 @@ impl LaunchdManager {
                 // `enable`/`disable`/`uninstall` has since moved or removed the artifact, writing here
                 // would recreate a plist at the now-vacated path, landing it in *both* directories, the
                 // ambiguous state `locate` hard-errors on. Checking immediately before the write narrows
-                // the race to the few instructions between the check and `write_existing`'s own open;
-                // on a detected vanish, `install` runs again and re-derives the outcome against
-                // whatever is there now.
+                // the race to the few instructions between the check and `write_existing`'s own open.
+                // On a detected vanish, `install` runs again and re-derives the outcome against
+                // whatever is there now, unless this pass already made its `is_loaded` call
+                // (`changes_job`): a second pass could make more calls than the verb reserved, so it
+                // reports instead.
                 if !still_present(&target)? {
-                    return self.install_reaping(spec, force, reaper);
+                    return if changes_job {
+                        Err(refuse::changed_during_install(&spec.id, &target))
+                    } else {
+                        self.install_reaping(spec, force, reaper)
+                    };
                 }
                 write_existing(&target, &desired)?;
                 if changes_job {
