@@ -41,10 +41,13 @@
 //!    root-only, breaking the promise that `list`/`show`/`diff` need no elevation.
 //!    [`write::write_temp_unit`] `chmod`s 0644 before persisting.
 //! 5. **Parent directories.** [`dirs::ensure_parent_dirs`] creates and, for a non-root account,
-//!    `chown`s the parents of `logs` and `cwd` while still elevated — otherwise
-//!    `StandardOutput=append:` fails the unit at start with an opaque status. Only path components
-//!    this call actually creates are touched; an already-existing directory's mode and ownership are
-//!    left alone, and verified writable by the target account instead.
+//!    `chown`s the parents of `logs` and `cwd` while still elevated. A missing log directory fails
+//!    the unit at start (`ENOENT` opening `StandardOutput=append:`), and a missing `cwd` fails it
+//!    with `200/CHDIR`. Only path components this call actually creates are touched; an
+//!    already-existing directory is not checked, because install is not a start. systemd opens the
+//!    log file as root before it drops privileges, so an existing log directory is never a problem
+//!    for the account; it `chdir`s into `cwd` after the switch, so only a `cwd` the account cannot
+//!    traverse fails at start.
 //! 6. **Uninstall order** is stop -> `systemctl disable` -> remove -> `daemon-reload`. Disabling
 //!    after the fragment is gone is impossible (no `[Install]` section left to read), which would
 //!    leave exactly the `.wants` symlink `uninstall_leaves_nothing` checks for.

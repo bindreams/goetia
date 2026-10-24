@@ -15,7 +15,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::dirs::ensure_writable_dir;
+use super::dirs::ensure_dir;
 use super::discover::{RawState, raw_state};
 use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 use super::*;
@@ -213,25 +213,25 @@ fn install_never_corrupts_state_when_something_races_the_first_create() {
     });
 }
 
-// ensure_writable_dir: obligation 5 ===================================================================================
+// ensure_dir: obligation 5 ============================================================================================
+
+/// RAII cleanup for a directory tree.
+struct RmDir(PathBuf);
+
+impl Drop for RmDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn ensure_writable_dir_leaves_a_preexisting_directory_untouched() {
+fn ensure_dir_leaves_a_preexisting_directory_untouched() {
     let dir = std::env::temp_dir().join(format!("{}-preexisting", test_id()));
     std::fs::create_dir(&dir).expect("create pre-existing dir");
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
-    struct RmDir(PathBuf);
-    impl Drop for RmDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
     let _cleanup = RmDir(dir.clone());
 
-    // `User::Root` skips the writability check entirely (see `verify_writable_by`), so this proves
-    // only the mode/ownership side; a non-root account would additionally need a real account to
-    // `chown` to and is covered at the integration level instead.
-    ensure_writable_dir(&dir, &User::Root).expect("ensure_writable_dir on a pre-existing dir");
+    ensure_dir(&dir, &User::Root).expect("ensure_dir on a pre-existing dir");
 
     let meta = std::fs::metadata(&dir).expect("stat");
     assert_eq!(
@@ -239,6 +239,32 @@ fn ensure_writable_dir_leaves_a_preexisting_directory_untouched() {
         0o700,
         "a pre-existing directory's mode must not be widened"
     );
+}
+
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn ensure_dir_accepts_a_preexisting_directory_the_account_cannot_write() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let dir = std::env::temp_dir().join(format!("{}-unwritable", test_id()));
+    std::fs::create_dir(&dir).expect("create pre-existing dir");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    let _cleanup = RmDir(dir.clone());
+
+    ensure_dir(&dir, &User::Name("nobody".to_string())).expect("ensure_dir");
+
+    let meta = std::fs::metadata(&dir).expect("stat");
+    assert_eq!(meta.permissions().mode() & 0o777, 0o700, "mode must be untouched");
+    assert_eq!(meta.uid(), 0, "owner must be untouched");
+}
+
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn ensure_dir_refuses_a_preexisting_file() {
+    let path = std::env::temp_dir().join(format!("{}-a-file", test_id()));
+    std::fs::write(&path, b"").expect("create file");
+    let _cleanup = Cleanup(path.clone());
+
+    let err = ensure_dir(&path, &User::Root).expect_err("a file cannot be a directory");
+    assert!(err.to_string().contains("not a directory"), "{err}");
 }
 
 // replace_unit_verified / quarantine_if_still_ours: the remaining race branches =======================================
