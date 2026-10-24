@@ -162,20 +162,16 @@ fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_k
     assert_one_failure(
         &lines[..1],
         id.as_str(),
-        &[
-            "kill_tree on stop: ",
-            KILL_REFUSED,
-            "; falling back to killing the direct child only",
-        ],
+        &format!(
+            "kill_tree on stop: {KILL_REFUSED}; falling back to killing the direct child only (its own descendants, if any, cannot be reached without a containment mechanism)"
+        ),
     );
     assert_one_failure(
         &lines[1..],
         id.as_str(),
-        &[
-            "fallback kill on stop: ",
-            KILL_REFUSED,
-            "; the daemon was neither killed nor reaped and may still be running",
-        ],
+        &format!(
+            "fallback kill on stop: {KILL_REFUSED}; the daemon was neither killed nor reaped and may still be running — reporting the service stopped, with that failure, rather than waiting for an exit nothing can now cause"
+        ),
     );
 }
 
@@ -359,7 +355,7 @@ fn a_failed_background_wait_is_logged_and_still_wakes_the_stop_bus() {
     assert_one_failure(
         &take(id.as_str()),
         id.as_str(),
-        &["background wait on child: ", WAIT_FAILED],
+        &format!("background wait on child: {WAIT_FAILED}"),
     );
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }
@@ -394,7 +390,7 @@ fn a_panicked_waiter_is_logged_when_the_stop_path_joins_it() {
     assert_one_failure(
         &take(id.as_str()),
         id.as_str(),
-        &["the thread waiting on the child panicked"],
+        "the thread waiting on the child panicked",
     );
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Panicked);
 }
@@ -436,11 +432,9 @@ fn a_stop_whose_kill_tree_fails_falls_back_to_killing_the_child() {
     assert_one_failure(
         &take(id.as_str()),
         id.as_str(),
-        &[
-            "kill_tree on stop: ",
-            KILL_REFUSED,
-            "; falling back to killing the direct child only",
-        ],
+        &format!(
+            "kill_tree on stop: {KILL_REFUSED}; falling back to killing the direct child only (its own descendants, if any, cannot be reached without a containment mechanism)"
+        ),
     );
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }

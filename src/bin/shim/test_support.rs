@@ -60,23 +60,15 @@ impl Drop for TestId {
     }
 }
 
-/// Asserts `lines` is exactly one `log_failure` line for `id`: `goetia-shim[<id>]: ` and then
-/// `fragments`, in order, the first one immediately. The text is pinned by the caller, not rebuilt
-/// from production's formatters.
-pub(crate) fn assert_one_failure(lines: &[String], id: &str, fragments: &[&str]) {
+/// Asserts `lines` is exactly one `log_failure` line for `id`: `goetia-shim[<id>]: ` then
+/// `expected`, with nothing before, between or after. The caller writes `expected` out in full
+/// (splicing in only the injected error it chose), not rebuilt from production's formatters, so a
+/// change to any part of the text fails the test.
+pub(crate) fn assert_one_failure(lines: &[String], id: &str, expected: &str) {
     let [line] = lines else {
         panic!("expected exactly one `log_failure` line for {id}, got {lines:?}");
     };
-    let Some(mut rest) = line.strip_prefix(&format!("goetia-shim[{id}]: ")) else {
-        panic!("not a line for {id}: {line:?}");
-    };
-    for (i, fragment) in fragments.iter().enumerate() {
-        let at = rest
-            .find(fragment)
-            .unwrap_or_else(|| panic!("{fragment:?} is missing, or out of order, in {line:?}"));
-        assert!(i > 0 || at == 0, "{line:?} does not begin with {fragment:?}");
-        rest = &rest[at + fragment.len()..];
-    }
+    assert_eq!(line, &format!("goetia-shim[{id}]: {expected}"));
 }
 
 #[path = "test_support_tests.rs"]

@@ -65,11 +65,10 @@ fn no_daemon_is_spawned_when_no_thread_can_be_made_to_wait_on_it() {
     assert_one_failure(
         &take(id.as_str()),
         id.as_str(),
-        &[
-            r#"make the thread that waits on ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"]: "#,
-            waiter_threads::NO_THREAD,
-            "; it was not spawned, so nothing of this daemon is running",
-        ],
+        &format!(
+            r#"make the thread that waits on ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"]: {}; it was not spawned, so nothing of this daemon is running"#,
+            waiter_threads::NO_THREAD
+        ),
     );
     assert_eq!(
         test_hook::spawns(),
@@ -167,7 +166,7 @@ fn a_daemon_that_cannot_be_spawned_is_logged_and_nothing_is_left_running() {
     assert_one_failure(
         &take(id.as_str()),
         id.as_str(),
-        &["spawn [\"goetia-shim-test-no-such-binary\"]: ", &refusal.to_string()],
+        &format!("spawn [\"goetia-shim-test-no-such-binary\"]: {refusal}"),
     );
     // The un-handed waiter ends on drop; consume its end.
     assert_eq!(
@@ -200,10 +199,10 @@ fn a_log_file_that_cannot_be_opened_is_logged_and_the_daemon_still_runs() {
     assert_one_failure(
         &take(id.as_str()),
         id.as_str(),
-        &[
-            &format!("open log file {}: {refusal}", unopenable.display()),
-            " (this daemon's output will not be captured; it is still being run and supervised)",
-        ],
+        &format!(
+            "open log file {}: {refusal} (this daemon's output will not be captured; it is still being run and supervised)",
+            unopenable.display()
+        ),
     );
 
     let daemon = launched
