@@ -201,9 +201,7 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> ScmRe
 }
 
 /// Clamp `delay` to what `SC_ACTION.Delay` (a `DWORD` of milliseconds) can
-/// express. The advisory for when this actually changes the value lives in
-/// `Backend::Scm.warn` now (`spec/backend.rs`), not here — generation, not
-/// validation.
+/// express. The advisory for a clamped value is `Backend::Scm.warn` (`spec/backend.rs`).
 fn bounded_restart_delay(delay: Duration) -> Duration {
     delay.min(MAX_SC_ACTION_DELAY)
 }

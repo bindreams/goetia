@@ -106,7 +106,7 @@ fn identical_is_up_to_date() {
 /// spec regenerates to (no hand-edit), but `new_spec` differs from the
 /// embedded spec. Pinned apart from `spec_change_with_hand_edit_conflicts`
 /// below, which looks identical except `on_disk` is *not*
-/// `regenerated` -- that's the row `decide` could not previously reach.
+/// `regenerated`.
 #[skuld::test]
 fn spec_change_updates() {
     let embedded = spec_fixture();
@@ -196,7 +196,7 @@ fn hand_edit_with_force_updates() {
     );
 }
 
-/// The row `decide` previously could not reach: the spec changed *and* the
+/// The spec changed *and* the
 /// artifact was hand-edited on top of the old spec. `on_disk` matches
 /// neither `desired` (generated from the new spec) nor `regenerated`
 /// (generated from the embedded spec) -- it must be a conflict, not a

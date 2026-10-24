@@ -16,9 +16,9 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 /// `%ProgramData%\Goetia\logs\<id>.log` — derivable from `id` alone. This is
-/// also the design spec's own OS-default `logs:` path for `type: simple` on
-/// Windows when `goetia.yaml` sets none (§2, "`logs` default"), so a daemon
-/// that never overrides `logs:` has no fallback/real distinction at all.
+/// also the OS-default `logs:` path for `type: simple` on Windows when
+/// `goetia.yaml` sets none, so a daemon that never overrides `logs:` has no
+/// fallback/real distinction at all.
 pub fn default_log_path(id: &str) -> PathBuf {
     programdata_dir().join("Goetia").join("logs").join(format!("{id}.log"))
 }

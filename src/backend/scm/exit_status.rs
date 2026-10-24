@@ -62,7 +62,6 @@ impl Reported {
         }
     }
 
-    /// A commanded stop whose kills all failed.
     pub fn incomplete_stop() -> Reported {
         Reported::IncompleteStop
     }

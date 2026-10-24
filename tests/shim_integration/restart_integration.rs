@@ -188,8 +188,7 @@ fn a_clean_daemon_exit_is_recorded_as_win32_zero() {
     assert_eq!(recorded_exit_code(0), ServiceExitCode::Win32(0));
 }
 
-/// 3 and 7 are codes the shim itself used to exit with, and are not told apart from a daemon's by
-/// the record any more.
+/// Any daemon exit code, including 3 and 7, is recorded as service-specific.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_daemon_exit_code_is_recorded_as_service_specific_whatever_its_value() {
     assert_eq!(recorded_exit_code(3), ServiceExitCode::ServiceSpecific(3));

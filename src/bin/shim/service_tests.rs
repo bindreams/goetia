@@ -339,7 +339,7 @@ fn a_daemon_that_exits_nonzero_is_one_pass() {
     let id = TestId::new(PREFIX);
     let stop_bus = Arc::new(StopBus::new());
     let spawned_before = test_hook::spawns();
-    // The shim no longer reads the restart policy, so none may respawn.
+    // The shim ignores the restart policy: no respawn.
     let daemon = DaemonSpec {
         restart: Restart::OnFailure,
         restart_delay: None,

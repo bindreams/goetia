@@ -15,7 +15,7 @@ pub mod fake;
 
 pub use budget::Budget;
 
-// All three supported platforms now return a real `ServiceManager`, so
+// All three supported platforms return a real `ServiceManager`, so
 // `Error::UnsupportedPlatform` is referenced only by the catch-all arm.
 // Gating the import keeps every supported target from warning about it.
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]

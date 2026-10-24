@@ -505,9 +505,8 @@ daemons:
     assert!(warnings.is_empty());
 }
 
-/// The warning above now runs on a `Duration` parsed by `parse_restart_delay`
-/// rather than one `humantime_serde` produced during deserialization — pin
-/// that moving the parse did not move the threshold too.
+/// The warning above runs on a `Duration` parsed by `parse_restart_delay`, not one
+/// `humantime_serde` produced during deserialization: pin the threshold.
 #[skuld::test]
 fn a_sub_second_restart_delay_still_warns() {
     let yaml = "daemons:\n  frpc:\n    command: [bin/frpc]\n    restart-delay: 500ms\n";
@@ -1393,9 +1392,8 @@ fn resolve_yaml_as(native: Backend, yaml: &str) -> Result<(Vec<DaemonSpec>, Vec<
 fn a_value_that_only_substitution_made_invalid_says_so() {
     // The other half of step 5's annotation, and the half whose premise
     // does hold: step 4 shape-checked this same merged spec and passed, so
-    // substitution is provably what changed. Pinned here because the
-    // verdict path no longer carries this prefix, and nothing else would
-    // notice if it stopped carrying it altogether.
+    // substitution is provably what changed. Pinned here because nothing else
+    // would notice if the verdict path stopped carrying this prefix.
     let dir = fixture_dir(
         "daemons:\n  frpc:\n    command: [/bin/frpc]\n    name: ${N}\n",
         Some("N=frpc\\\n"),
@@ -1432,7 +1430,7 @@ fn a_templated_user_is_judged_under_the_native_backend_and_nowhere_else() {
         );
     }
 
-    // The other direction, and the one the doc used to get backwards: with
+    // The other direction: with
     // `scm` native, neither `${ACCT}` is substituted, so neither is judged
     // — and `.env` is not read at all.
     resolve_as(parse_manifest(yaml), dir.path(), Some(Backend::Scm))

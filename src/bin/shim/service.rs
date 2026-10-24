@@ -5,14 +5,8 @@
 //! exits; SCM's recovery actions (`backend::scm::generate`) start a new shim, which reads the
 //! installed spec afresh.
 //!
-//! Everything that touches the child process tree — containment, waiting,
-//! stdio capture — is `cosca`'s job, not this module's: `cosca::Command`'s
-//! `.contain()` is a Windows Job Object with `KILL_ON_JOB_CLOSE`, and
-//! `cosca::Child::wait()`/`wait_tree()` are real, event-driven kernel
-//! waits. This module's own job is narrower: interrupting a blocking
-//! `child.wait()` when SCM delivers `Stop` (see `stop_bus`, the one piece
-//! `cosca` does not supply, since it has no notion of an external
-//! cancellation source) and driving SCM's own status protocol.
+//! Process-tree containment and waiting belong to `cosca`; this module interrupts its blocking
+//! `child.wait()` on `Stop` (`stop_bus`) and drives SCM's status protocol.
 
 use std::ffi::OsString;
 use std::os::windows::io::AsRawHandle as _;
@@ -53,20 +47,14 @@ pub fn run() -> ! {
         logging::log_failure(id, &format!("connect to the SCM dispatcher: {e}"));
         std::process::exit(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT as i32);
     }
-    // Unreachable in practice — every path inside `service_main` exits the
-    // process directly, and SCM only lets `StartServiceCtrlDispatcherW`'s
-    // wait return once the process is already being torn down — but exit
-    // cleanly here too rather than falling off `main`.
+    // `service_main` exits on every path; this covers the dispatcher returning anyway.
     std::process::exit(Reported::Clean.process_exit_code());
 }
 
 define_windows_service!(ffi_service_main, service_main);
 
 fn service_main(_scm_args: Vec<OsString>) {
-    // The service id argv[1] carried — re-read directly rather than
-    // threaded through `service_main`'s own SCM-supplied arguments (whose
-    // shape SCM controls, not this shim): `run` already confirmed argv[1]
-    // is present before ever dispatching, and process argv does not change.
+    // SCM's own arguments are not ours to rely on; `run` validated argv[1].
     let id = std::env::args()
         .nth(1)
         .expect("argv[1] was validated present in run() before service_dispatcher::start was ever called");
@@ -149,13 +137,7 @@ fn register_control_handler(id: &str, stop_bus: &Arc<StopBus>) -> windows_servic
     service_control_handler::register(id, event_handler)
 }
 
-/// `set_service_status` is the only mechanism by which SCM learns this
-/// service's state; a failure here is logged like every other Win32/cosca
-/// failure in this file, not silently discarded — see `logging`'s module
-/// doc comment for why both the fallback log and the Windows Event Log
-/// need to carry it: SCM believing the service is still in whatever state
-/// it last confirmed is exactly the kind of thing a human debugging a
-/// stuck `stop`/`uninstall` needs to be able to find.
+/// Report `RUNNING`. A failure is logged: SCM keeps the last state it confirmed.
 fn report_running(id: &str, handle: &ServiceStatusHandle) {
     if let Err(e) = handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
@@ -197,19 +179,10 @@ fn run_daemon(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, on_running: 
     };
     on_running();
 
-    // `wait_for_child_or_stop` also performs the kill-tree-and-confirm
-    // teardown on a stop (see its own doc comment for why that has to
-    // happen inside the call rather than out here) — by the time it
-    // returns `Stopping`, the whole tree is already confirmed dead, or,
-    // if `kill_tree` itself failed and the fallback kill did not, the
-    // direct child is and its descendants (if any) were unreachable.
-    // Either way it is logged there, and nothing is left to reap here.
-    // `StoppingUnkillable` is the one outcome where something is: both
-    // kills failed, so the daemon is still running and unreaped.
+    // `wait_for_child_or_stop` kills and confirms the tree on a stop, so only `StoppingUnkillable`
+    // leaves a running, unreaped daemon.
     match stop_bus.wait_for_child_or_stop(waiter, &child, id) {
         WaitOutcome::ChildExited => {
-            // The child has already exited — `wait()` reaps and returns
-            // immediately rather than blocking.
             let code = match child.wait() {
                 Ok(status) => {
                     let code = status.code();
@@ -226,9 +199,7 @@ fn run_daemon(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, on_running: 
             exit_report(stop_bus.is_stopping(), code)
         }
         WaitOutcome::Stopping => Reported::Clean,
-        // The service still stops, which is what keeps it stoppable and
-        // uninstallable; the report and the two logged kill failures are
-        // what say the daemon may have outlived it.
+        // Still reports STOPPED so the service stays stoppable and uninstallable.
         WaitOutcome::StoppingUnkillable => Reported::incomplete_stop(),
     }
 }
@@ -246,13 +217,8 @@ fn exit_report(stopping: bool, code: Option<i32>) -> Reported {
 
 /// The daemon, running and already being waited on — or why not, logged, with nothing launched.
 ///
-/// Everything waiting on the daemon needs is made before the daemon is: the [`Waiter`] thread
-/// first, then the spawn, and nothing between them that could launch a daemon on the way.
-/// `build_command` does sit between them, and the log-file open inside it fails routinely, but
-/// that failure arm falls back to null stdio and runs nothing. A daemon is never launched with
-/// nothing to wait on it, because the one thing that could refuse to make that waiter — the OS,
-/// asked for a thread — is asked before anything is running. See [`Waiter`] for what the reverse
-/// order cost.
+/// The [`Waiter`] thread is made before the daemon is spawned, so a daemon is never running with
+/// nothing to wait on it. `build_command` sits between them but never launches anything.
 ///
 /// The `Err` is what the service reports: the OS error of the failure, or `ERROR_GEN_FAILURE`.
 fn launch(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str) -> Result<(Arc<Child>, Waiter), Reported> {

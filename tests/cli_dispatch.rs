@@ -1383,10 +1383,10 @@ fn install_exit_code_does_not_mask_an_error_behind_a_conflict() {
 }
 
 /// `--dry-run`'s preview must not silently drop a `Warning` (e.g. SCM
-/// clamping a too-large `restart-delay`). This advisory now fires at
+/// clamping a too-large `restart-delay`). This advisory fires at
 /// resolve time, from `Backend::Scm.warn`, through `load_and_warn` — on
 /// every host, not only from an effectful Windows install preview — which
-/// is the property this test now pins.
+/// is the property this test pins.
 #[skuld::test]
 fn install_dry_run_prints_generator_warnings() {
     let dir = tempfile::tempdir().unwrap();
@@ -1579,8 +1579,7 @@ fn diff_exits_five_for_a_hand_edited_artifact() {
 }
 
 /// `diff` must distinguish "absent" from "occupied by a stranger's
-/// service": both used to render identically as "would be created", which
-/// `install` would then immediately contradict by refusing. A second,
+/// service": the first is "would be created", the second a refusal. A second,
 /// drifting daemon in the same run must not lower the code to 3: `1`
 /// outranks `3` in the precedence rule.
 #[skuld::test]

@@ -301,7 +301,7 @@ fn a_waiter_that_is_never_handed_a_child_ends_on_its_own() {
     let waiter = bus.waiter(id.as_str()).expect("make the waiter thread");
 
     // Closing the only `Sender` is the whole mechanism: the thread's first act is `rx.recv()`,
-    // which now returns `Err` and returns.
+    // which returns `Err` and returns.
     let Waiter { hand, thread, bus: _ } = waiter;
     drop(hand);
 

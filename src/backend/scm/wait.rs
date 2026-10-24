@@ -582,12 +582,9 @@ pub fn request_start<A: ScmActor>(a: &mut A) -> io::Result<()> {
     accept_as_started(a.start()?)
 }
 
-/// `daemon restart --timeout 0`'s start: [`request_start`], except that
-/// `ERROR_SERVICE_ALREADY_RUNNING` is a refusal whatever the query says. The
-/// stop just before it was issued and not waited for, and a `type: simple`
-/// service reads `RUNNING` for its whole teardown — `goetia-shim` never
-/// reports `STOP_PENDING` — so a queried `Running` here may be the very
-/// instance that stop is taking down.
+/// `daemon restart --timeout 0`'s start: [`request_start`], except `ERROR_SERVICE_ALREADY_RUNNING`
+/// is always a refusal: the queried `Running` may be the instance the unconfirmed stop just before
+/// it is taking down.
 pub fn request_start_after_stop<A: ScmActor>(a: &mut A) -> io::Result<()> {
     match a.start()? {
         StartReply::Accepted => Ok(()),
@@ -626,7 +623,7 @@ pub fn request_stop<A: ScmActor>(a: &mut A) -> io::Result<RequestedStop> {
     }
 }
 
-// hoisted from `mod system` ===========================================================================================
+// handle teardown =====================================================================================================
 
 /// The teardown half of [`system::SystemScmActor`], behind a trait for the
 /// same reason [`ScmActor`] is one: the thing that matters here is an
@@ -656,17 +653,7 @@ pub trait ScmHandles {
 /// is about to free: memory corruption, and a `fired` flag set on whatever
 /// occupies that address by then.
 ///
-/// Closing first is what makes the drain final. Draining first leaves a
-/// window in which the SCM can queue a fresh notification between the drain
-/// returning and the handle closing — and on the expiry path, where the APC
-/// has usually not been queued yet, that window is the likely case, not the
-/// unlikely one.
-///
-/// What the fake in `wait_tests.rs` pins is exactly that SEQUENCE, and no
-/// more. That `Service`'s `Drop` really closes the `SC_HANDLE`, that the SCM
-/// really stops queuing once it is closed, and that `Drop for
-/// SystemScmActor` reaches this function at all stay verifiable only on
-/// Windows CI.
+/// Close first: draining first leaves a window in which SCM queues a fresh notification.
 pub fn close_then_drain<H: ScmHandles>(h: &mut H) {
     h.close_handles();
     if h.registration_outstanding() {
@@ -693,29 +680,10 @@ pub enum QueriedState {
     Paused,
 }
 
-/// Whether a `StartServiceW` that failed with `ERROR_SERVICE_ALREADY_RUNNING`
-/// (1056) still counts as a start, given the state a follow-up query
-/// reported — for the plain `start` verb only: [`start_via_notify`], which
-/// has a wait armed, and [`request_start`], which arms nothing.
-/// [`request_start_after_stop`] never consults it.
-///
-/// 1056 means only "`dwCurrentState` is not `SERVICE_STOPPED`", which lumps
-/// together states the service is on its way to running from and states it
-/// is not. `Running` and `StartPending` are the two it is — for a caller that
-/// did not just issue a stop. For `restart --timeout 0` a queried `Running`
-/// may be the instance its own unconfirmed stop is taking down, which is why
-/// that caller treats every 1056 as a refusal instead. For a plain start
-/// nothing further is needed — which is the whole of what [`request_start`]
-/// reports. The armed wait confirms `StartPending` (`want_to_mask` arms
-/// `SERVICE_NOTIFY_START_PENDING` in *both* of its `WantState::Running`
-/// branches, so it immediate-fires), and takes a queried `Running` as its
-/// confirmation outright (see [`start_via_notify`]). `StartPending`
-/// in particular is what a service is in when something else started it a
-/// moment earlier — rejecting it fails a start that was going to succeed.
-/// For every other state the service is not heading for running at all, so
-/// accepting 1056 would report a start that did not happen — and on the
-/// waiting path the registration holds no bit that can fire, so it would
-/// also block until the deadline.
+/// Whether 1056 still counts as a start, for the plain `start` verb: `Running` and `StartPending`
+/// are states the service is heading to running from; every other state is not, and accepting it
+/// would report a start that did not happen. `restart --timeout 0` never consults it
+/// ([`request_start_after_stop`]).
 #[must_use]
 pub fn already_running_is_recoverable(queried: QueriedState) -> bool {
     matches!(queried, QueriedState::Running | QueriedState::StartPending)

@@ -135,7 +135,7 @@ fn resolve_as(
     native: Option<Backend>,
 ) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
     // Declared before `absolutize` runs, not after: `absolutize` itself can
-    // now push a manifest-level advisory (a drive-relative `-f`), and
+    // push a manifest-level advisory (a drive-relative `-f`), and
     // `Vec::new()` reads nothing, so hoisting the declaration up is safe by
     // inspection. The alternative — a second vector concatenated in after
     // the daemon loop — would get the asserted warning order wrong.
@@ -1219,7 +1219,7 @@ pub(crate) fn reject_empty(id: &Id, field: &str, value: &str) -> Result<(), Erro
 /// `pub(crate)`: also called by `blob::decode`.
 ///
 /// An already-installed artifact whose blob carries an empty or
-/// whitespace-only `user.name` now decodes as `Installed::OursUnreadable`
+/// whitespace-only `user.name` decodes as `Installed::OursUnreadable`
 /// rather than silently as root — the correct disclosure, and goetia has
 /// no release yet whose compatibility that would break.
 ///
