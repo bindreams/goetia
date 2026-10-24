@@ -163,8 +163,8 @@ fn failure_code(e: &Error) -> i32 {
         // step that determinately failed, which is what `1` would claim.
         // `RequestInDoubt` left open whether a request `install` or `--start`
         // sent reached the manager, or what came of one that did.
-        // `LoadedJobInDoubt`, `LoadedStateInDoubt`: the plist is written, and which definition a
-        // job started meanwhile read is open.
+        // `LoadedJobInDoubt`, `LoadedStateInDoubt`: the plist was rewritten (and put back unless
+        // that failed), and which definition a job started meanwhile read is open.
         Error::Undetermined { .. }
         | Error::WaitTimeout { .. }
         | Error::RequestInDoubt { .. }

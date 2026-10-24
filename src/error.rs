@@ -304,10 +304,10 @@ fn loaded_in_doubt(id: &str, read_failed: Option<&str>, restore_failed: Option<&
     };
     let remedy = match restore_failed {
         None => format!(
-            "The previous plist is back on disk, so the change is not installed: run `goetia daemon stop {id}`,              re-run install, then `goetia daemon start {id}`"
+            "The previous plist is back on disk, so the change is not installed: run `goetia daemon stop {id}`, re-run install, then `goetia daemon start {id}`"
         ),
         Some(detail) => format!(
-            "The previous plist could not be put back ({detail}), so the new plist is on disk: run              `goetia daemon stop {id}` and then `goetia daemon start {id}`, which loads it"
+            "The previous plist could not be put back ({detail}), so the new plist is on disk: run `goetia daemon stop {id}` and then `goetia daemon start {id}`, which loads it"
         ),
     };
     format!("{cause}, so goetia cannot tell whether a loaded job holds the old definition or the new one. {remedy}")

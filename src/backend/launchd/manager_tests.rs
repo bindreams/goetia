@@ -1083,7 +1083,7 @@ fn assert_restored_and_rerun_refused(mgr: &LaunchdManager, spec: &DaemonSpec, na
     let script = Scripted::new(&[("print", RUNNING)]);
     let refused = mgr.install(spec, false).expect_err("the rerun, job loaded");
     assert!(
-        refused.to_string().contains(&format!("goetia daemon stop {name}")),
+        matches!(refused, Error::Other(_)) && refused.to_string().contains(&format!("goetia daemon stop {name}")),
         "a refusal, not an exit-4 or an up-to-date: {refused}"
     );
     script.assert_driven("the rerun reads the job and is refused");
