@@ -2,37 +2,73 @@
 //! SCM and no process involved, so these run on every platform. Every change of the service's
 //! state between two of its steps is scripted, never raced for.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::rc::Rc;
 
 use super::*;
 
-/// What SCM answers the next `service_pid`, and what opening a pid finds.
+type Log = Rc<RefCell<Vec<String>>>;
+
+/// What opening a pid finds.
+enum Open {
+    Found,
+    Gone,
+    Fails,
+}
+
+/// What terminating an opened process does.
+enum Terminate {
+    Done,
+    AlreadyExited,
+    Fails,
+}
+
+/// What SCM answers each `service_pid`, and what each `open` and `terminate` do.
 struct Scripted {
     /// Front to back; the last answer repeats.
     pids: VecDeque<Option<u32>>,
-    /// Per `open`, front to back: the process found, or `None` for gone.
-    opens: VecDeque<Option<u32>>,
-    log: Vec<String>,
-    terminate_fails: bool,
+    opens: VecDeque<Open>,
+    terminates: VecDeque<Terminate>,
+    log: Log,
 }
 
 impl Scripted {
-    fn new<const P: usize, const O: usize>(pids: [Option<u32>; P], opens: [Option<u32>; O]) -> Self {
+    fn new<const P: usize, const O: usize, const T: usize>(
+        pids: [Option<u32>; P],
+        opens: [Open; O],
+        terminates: [Terminate; T],
+    ) -> Self {
         Self {
             pids: pids.into(),
             opens: opens.into(),
-            log: vec![],
-            terminate_fails: false,
+            terminates: terminates.into(),
+            log: Log::default(),
         }
+    }
+
+    fn log(&self) -> Vec<String> {
+        self.log.borrow().clone()
+    }
+}
+
+/// A held process: logs when it is closed, so a test sees how long the handle was held.
+struct Held {
+    pid: u32,
+    log: Log,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.log.borrow_mut().push(format!("close {}", self.pid));
     }
 }
 
 impl KillTarget for Scripted {
-    /// The pid the process was opened under: what a handle to it would say.
-    type Process = u32;
+    type Process = Held;
 
     fn service_pid(&mut self) -> io::Result<Option<u32>> {
-        self.log.push("service_pid".to_string());
+        self.log.borrow_mut().push("service_pid".to_string());
         Ok(if self.pids.len() > 1 {
             self.pids.pop_front().unwrap()
         } else {
@@ -40,56 +76,81 @@ impl KillTarget for Scripted {
         })
     }
 
-    fn open(&mut self, pid: u32) -> io::Result<Option<u32>> {
-        self.log.push(format!("open {pid}"));
-        Ok(self.opens.pop_front().expect("a scripted open"))
+    fn open(&mut self, pid: u32) -> io::Result<Option<Held>> {
+        self.log.borrow_mut().push(format!("open {pid}"));
+        match self.opens.pop_front().expect("a scripted open") {
+            Open::Found => Ok(Some(Held {
+                pid,
+                log: self.log.clone(),
+            })),
+            Open::Gone => Ok(None),
+            Open::Fails => Err(io::Error::other("access denied")),
+        }
     }
 
-    fn terminate(&mut self, process: u32) -> io::Result<()> {
-        self.log.push(format!("terminate {process}"));
-        if self.terminate_fails {
-            return Err(io::Error::other("access denied"));
+    fn terminate(&mut self, process: &Held) -> io::Result<Termination> {
+        self.log.borrow_mut().push(format!("terminate {}", process.pid));
+        match self.terminates.pop_front().expect("a scripted terminate") {
+            Terminate::Done => Ok(Termination::Terminated),
+            Terminate::AlreadyExited => Ok(Termination::AlreadyExited),
+            Terminate::Fails => Err(io::Error::other("terminate failed")),
         }
-        Ok(())
     }
+}
+
+fn steps<const N: usize>(steps: [&str; N]) -> Vec<String> {
+    steps.iter().map(|s| s.to_string()).collect()
 }
 
 #[skuld::test]
 fn a_service_with_no_process_has_nothing_to_kill() {
-    let mut target = Scripted::new([None], []);
+    let mut target = Scripted::new([None], [], []);
 
     assert_eq!(kill_service(&mut target).unwrap(), Killed::NotRunning);
-    assert_eq!(target.log, ["service_pid"], "nothing was opened, nothing terminated");
+    assert_eq!(
+        target.log(),
+        steps(["service_pid"]),
+        "nothing was opened, nothing terminated"
+    );
 }
 
-/// The order that makes the kill safe: the process is opened first, then SCM is asked again whether
-/// it is still the service's, and only then is it terminated.
+/// The order that makes the kill safe: the process is opened and held, SCM is asked again whether it
+/// is still the service's, and only then is it terminated, through the handle still held.
 #[skuld::test]
-fn the_process_is_opened_then_confirmed_through_scm_then_terminated() {
-    let mut target = Scripted::new([Some(100)], [Some(100)]);
-
-    assert_eq!(kill_service(&mut target).unwrap(), Killed::Terminated);
-    assert_eq!(target.log, ["service_pid", "open 100", "service_pid", "terminate 100"]);
-}
-
-/// The service restarted between the read and the confirmation: the pid read first may belong to
-/// anyone now, so nothing is terminated through it, and the service's new process is the one killed.
-#[skuld::test]
-fn a_restart_between_the_read_and_the_confirmation_terminates_nothing_stale() {
-    let mut target = Scripted::new([Some(100), Some(200), Some(200)], [Some(100), Some(200)]);
+fn the_process_is_held_from_the_open_through_the_termination() {
+    let mut target = Scripted::new([Some(100)], [Open::Found], [Terminate::Done]);
 
     assert_eq!(kill_service(&mut target).unwrap(), Killed::Terminated);
     assert_eq!(
-        target.log,
-        [
+        target.log(),
+        steps(["service_pid", "open 100", "service_pid", "terminate 100", "close 100"])
+    );
+}
+
+/// The service restarted between the read and the confirmation: the process opened is not the
+/// service's, so it is let go before SCM is asked again, and the new process is the one killed.
+#[skuld::test]
+fn a_restart_between_the_open_and_the_confirmation_lets_go_of_the_stale_process() {
+    let mut target = Scripted::new(
+        [Some(100), Some(200), Some(200)],
+        [Open::Found, Open::Found],
+        [Terminate::Done],
+    );
+
+    assert_eq!(kill_service(&mut target).unwrap(), Killed::Terminated);
+    assert_eq!(
+        target.log(),
+        steps([
             "service_pid",
             "open 100",
             "service_pid",
+            "close 100",
             "service_pid",
             "open 200",
             "service_pid",
-            "terminate 200"
-        ]
+            "terminate 200",
+            "close 200",
+        ])
     );
 }
 
@@ -97,32 +158,183 @@ fn a_restart_between_the_read_and_the_confirmation_terminates_nothing_stale() {
 /// again, and reports the service stopped.
 #[skuld::test]
 fn a_process_gone_before_it_was_opened_sends_the_question_back_to_scm() {
-    let mut target = Scripted::new([Some(100), None], [None]);
+    let mut target = Scripted::new([Some(100), None], [Open::Gone], []);
 
     assert_eq!(kill_service(&mut target).unwrap(), Killed::NotRunning);
-    assert_eq!(target.log, ["service_pid", "open 100", "service_pid"]);
+    assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
 }
 
-/// The service stopped between the open and the confirmation: the process opened is no longer one
-/// to terminate.
+/// The same, with the service restarted: the process that vanished is not the answer, the service's
+/// new one is.
+#[skuld::test]
+fn a_process_gone_before_it_was_opened_is_followed_to_the_services_new_process() {
+    let mut target = Scripted::new(
+        [Some(100), Some(200), Some(200)],
+        [Open::Gone, Open::Found],
+        [Terminate::Done],
+    );
+
+    assert_eq!(kill_service(&mut target).unwrap(), Killed::Terminated);
+    assert_eq!(
+        target.log(),
+        steps([
+            "service_pid",
+            "open 100",
+            "service_pid",
+            "open 200",
+            "service_pid",
+            "terminate 200",
+            "close 200",
+        ])
+    );
+}
+
+/// The service stopped between the open and the confirmation: the process held is no longer one to
+/// terminate.
 #[skuld::test]
 fn a_service_stopped_after_the_open_is_not_terminated_through_the_handle() {
-    let mut target = Scripted::new([Some(100), None], [Some(100)]);
+    let mut target = Scripted::new([Some(100), None], [Open::Found], []);
 
     assert_eq!(kill_service(&mut target).unwrap(), Killed::NotRunning);
-    assert!(
-        !target.log.iter().any(|step| step.starts_with("terminate")),
-        "{:?}",
-        target.log
+    assert_eq!(
+        target.log(),
+        steps(["service_pid", "open 100", "service_pid", "close 100", "service_pid"])
+    );
+}
+
+/// The process exited between the confirmation and the termination, on its own: nothing was
+/// terminated, so the kill is not reported delivered. SCM is asked again, and has stopped the service.
+#[skuld::test]
+fn a_process_that_exited_before_the_termination_is_not_a_kill() {
+    let mut target = Scripted::new([Some(100), Some(100), None], [Open::Found], [Terminate::AlreadyExited]);
+
+    assert_eq!(kill_service(&mut target).unwrap(), Killed::NotRunning);
+    assert_eq!(
+        target.log(),
+        steps([
+            "service_pid",
+            "open 100",
+            "service_pid",
+            "terminate 100",
+            "close 100",
+            "service_pid",
+        ])
+    );
+}
+
+/// The same, with the service restarted by the time SCM is asked again: the new process is killed.
+#[skuld::test]
+fn a_process_that_exited_before_the_termination_is_followed_to_the_services_new_process() {
+    let mut target = Scripted::new(
+        [Some(100), Some(100), Some(200), Some(200)],
+        [Open::Found, Open::Found],
+        [Terminate::AlreadyExited, Terminate::Done],
+    );
+
+    assert_eq!(kill_service(&mut target).unwrap(), Killed::Terminated);
+    assert_eq!(
+        target.log(),
+        steps([
+            "service_pid",
+            "open 100",
+            "service_pid",
+            "terminate 100",
+            "close 100",
+            "service_pid",
+            "open 200",
+            "service_pid",
+            "terminate 200",
+            "close 200",
+        ])
+    );
+}
+
+/// An open that failed for a pid SCM has since moved off is the pid having been somebody else's or
+/// gone, not a refusal about the service: SCM is asked again.
+#[skuld::test]
+fn an_open_that_failed_on_a_pid_scm_moved_off_follows_the_service() {
+    let mut target = Scripted::new(
+        [Some(100), Some(200), Some(200), Some(200)],
+        [Open::Fails, Open::Found],
+        [Terminate::Done],
+    );
+
+    assert_eq!(kill_service(&mut target).unwrap(), Killed::Terminated);
+    assert_eq!(
+        target.log(),
+        steps([
+            "service_pid",
+            "open 100",
+            "service_pid",
+            "service_pid",
+            "open 200",
+            "service_pid",
+            "terminate 200",
+            "close 200",
+        ])
     );
 }
 
 #[skuld::test]
-fn a_failed_termination_is_an_error_not_a_kill() {
-    let mut target = Scripted::new([Some(100)], [Some(100)]);
-    target.terminate_fails = true;
+fn an_open_that_failed_on_a_service_that_stopped_is_not_running() {
+    let mut target = Scripted::new([Some(100), None], [Open::Fails], []);
+
+    assert_eq!(kill_service(&mut target).unwrap(), Killed::NotRunning);
+}
+
+/// SCM still vouches for the pid and it cannot be opened: that is a refusal, and it is reported.
+#[skuld::test]
+fn an_open_that_failed_on_the_services_own_pid_is_an_error() {
+    let mut target = Scripted::new([Some(100)], [Open::Fails], []);
 
     let e = kill_service(&mut target).unwrap_err();
 
     assert_eq!(e.to_string(), "access denied");
+    assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
+}
+
+#[skuld::test]
+fn a_failed_termination_is_an_error_not_a_kill() {
+    let mut target = Scripted::new([Some(100)], [Open::Found], [Terminate::Fails]);
+
+    let e = kill_service(&mut target).unwrap_err();
+
+    assert_eq!(e.to_string(), "terminate failed");
+    assert_eq!(
+        target.log(),
+        steps(["service_pid", "open 100", "service_pid", "terminate 100", "close 100"]),
+        "the handle is closed on the error path too"
+    );
+}
+
+// The raw status ------------------------------------------------------------------------------------------------------
+
+/// `windows-service`'s `query_status` reports a pid only in `Running`; SCM reports one in every
+/// state that has a process, and a service stuck starting or stopping is what `kill` is for.
+#[cfg(windows)]
+#[skuld::test]
+fn every_state_with_a_process_yields_its_pid() {
+    use windows_sys::Win32::System::Services::{
+        SERVICE_CONTINUE_PENDING, SERVICE_PAUSE_PENDING, SERVICE_PAUSED, SERVICE_RUNNING, SERVICE_START_PENDING,
+        SERVICE_STATUS_PROCESS, SERVICE_STOP_PENDING, SERVICE_STOPPED,
+    };
+
+    let status = |state: u32, pid: u32| SERVICE_STATUS_PROCESS {
+        dwCurrentState: state,
+        dwProcessId: pid,
+        // SAFETY: plain integers; all-zero is a valid value of every field.
+        ..unsafe { std::mem::zeroed() }
+    };
+
+    for state in [
+        SERVICE_RUNNING,
+        SERVICE_START_PENDING,
+        SERVICE_STOP_PENDING,
+        SERVICE_CONTINUE_PENDING,
+        SERVICE_PAUSE_PENDING,
+        SERVICE_PAUSED,
+    ] {
+        assert_eq!(system::process_of(&status(state, 4242)), Some(4242), "state {state}");
+    }
+    assert_eq!(system::process_of(&status(SERVICE_STOPPED, 0)), None);
 }

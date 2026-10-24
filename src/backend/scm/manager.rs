@@ -245,11 +245,11 @@ impl ServiceManager for ScmManager {
         }
     }
 
-    /// Terminates the service's process through [`super::kill::kill_service`], which opens it, asks
-    /// SCM again whether it is still the service's, and only then terminates it. Exit code `1`
-    /// (`TerminateProcess`, via `cosca`), and SCM sees an unexpected exit: the service's recovery
-    /// actions apply, the same as for a crash. For `type: simple` the process is `goetia-shim`, and
-    /// its Job Object takes the daemon's tree with it.
+    /// Terminates the service's process through [`super::kill::kill_service`], which opens it and
+    /// holds it open, asks SCM again whether it is still the service's, and only then terminates it
+    /// through that handle. Exit code `1` (`TerminateProcess`), and SCM sees an unexpected exit: the
+    /// service's recovery actions apply, the same as for a crash. For `type: simple` the process is
+    /// `goetia-shim`, and its Job Object takes the daemon's tree with it.
     fn kill(&self, id: &Id) -> Result<()> {
         let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
         require_ours(id)?;

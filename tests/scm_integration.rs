@@ -24,6 +24,9 @@ mod fixture;
 #[path = "scm_integration/install_helper.rs"]
 mod install_helper;
 #[cfg(windows)]
+#[path = "scm_integration/kill.rs"]
+mod kill;
+#[cfg(windows)]
 #[path = "scm_integration/managed.rs"]
 mod managed;
 
