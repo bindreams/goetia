@@ -77,6 +77,9 @@ pub trait ScmActor {
     /// what blocking they do is the SCM's own — not a wait this module
     /// created, and not one it can bound from the client side.
     fn control_stop(&mut self) -> io::Result<()>;
+    /// `DeleteService` on the open handle. The record goes when the last handle to the service
+    /// closes, and SCM starts nothing for the service from this call on.
+    fn delete(&mut self) -> io::Result<()>;
     /// `StartServiceW`. What an `ERROR_SERVICE_ALREADY_RUNNING` means is not
     /// decided here but by each caller, from the state the follow-up query
     /// reported — see [`StartReply`].
@@ -231,14 +234,35 @@ pub fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result
     }
 }
 
-/// The stop before `uninstall` deletes the service. `DeleteService` cancels the restart SCM has
-/// queued (measured, P12), so unlike [`stop_via_notify`] this never waits for one: a `STOPPED` is
-/// the end of the wait whatever follows it, and waiting on a daemon that fails as soon as it is
-/// spawned would never end.
+/// `uninstall`'s teardown: delete the service, then stop it if it is running.
 ///
-/// A service that is already `STOPPED`, restart queued or not, is deleted without a stop. Any other
-/// state is stopped as for any stop, under the same `deadline`.
-pub fn stop_before_delete<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
+/// The delete comes first because it is what ends the possibility of a restart. `DeleteService`
+/// cancels the restart SCM has queued and SCM starts nothing for a service marked for deletion
+/// (measured, P12), so after it no restart can fire into the service, whether it is waiting out
+/// `restart-delay` now or the daemon fails while the stop is in flight. The stop that follows
+/// therefore never waits for a restart, and a daemon that fails as soon as it is spawned cannot
+/// keep it waiting. Stopping first would leave a window between the status read and the delete in
+/// which a restart starts a daemon under a service marked for deletion.
+///
+/// A `STOPPED` service is not stopped. Any other state is stopped as for any stop, under `deadline`;
+/// the service then goes when this handle closes, which is the caller's to do afterwards. Every
+/// error says whether the delete had happened.
+pub fn delete_then_stop<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
+    a.delete()
+        .map_err(|e| io::Error::new(e.kind(), format!("the service was NOT deleted: {e}")))?;
+    stop_deleted(a, deadline).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "the service is deleted but not confirmed stopped ({e}); it goes when its process ends, \
+                 and until then the next install meets ERROR_SERVICE_MARKED_FOR_DELETE"
+            ),
+        )
+    })
+}
+
+/// [`delete_then_stop`]'s stop.
+fn stop_deleted<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
     if a.query_status()?.0 == QueriedState::Stopped {
         return Ok(Waited::Confirmed);
     }

@@ -654,8 +654,11 @@ the same way. If the restart does not arrive in time, or
 `--timeout` is `0`, nothing is stopped: `stop` exits `4` and says a restart is
 pending. Run it again with a longer `--timeout`, or `--no-timeout`.
 
-`uninstall` does not wait for a restart: deleting the service cancels it, so a
-daemon that fails as soon as it starts can still be uninstalled.
+`uninstall` does not wait for a restart: it deletes the service first, which
+cancels the restart and prevents any other, and then stops the daemon if it is
+running. A daemon that fails as soon as it starts can still be uninstalled. If a
+running daemon cannot be confirmed stopped, `uninstall` exits `1` having already
+deleted the service, which Windows removes when the daemon's process ends.
 
 After upgrading goetia, run `goetia daemon install` again for every daemon
 installed by an older version. Services registered before this shim existed

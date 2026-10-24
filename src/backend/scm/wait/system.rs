@@ -143,6 +143,8 @@ fn queried_state(state: ServiceState) -> QueriedState {
 pub struct SystemScmActor {
     scm: Option<WinServiceManager>,
     name: String,
+    /// The rights `service` is opened with, here and on every reopen.
+    access: ServiceAccess,
     service: Option<Service>,
     status: Box<LastStatus>,
     notify: Box<SERVICE_NOTIFY_2W>,
@@ -160,11 +162,21 @@ impl SystemScmActor {
     /// [`super::stop_via_notify`] and [`super::start_via_notify`] need,
     /// so one actor serves either wait without reopening.
     pub fn open(name: &str) -> io::Result<Self> {
+        Self::open_with(name, WAIT_ACCESS)
+    }
+
+    /// [`Self::open`] with `DELETE` as well, for [`super::delete_then_stop`].
+    pub fn open_to_delete(name: &str) -> io::Result<Self> {
+        Self::open_with(name, WAIT_ACCESS | ServiceAccess::DELETE)
+    }
+
+    fn open_with(name: &str, access: ServiceAccess) -> io::Result<Self> {
         let scm = open_scm()?;
-        let service = open_handle(&scm, name)?;
+        let service = open_handle(&scm, name, access)?;
         Ok(Self {
             scm: Some(scm),
             name: name.to_string(),
+            access,
             service: Some(service),
             status: Box::new(LastStatus {
                 current_state: AtomicU32::new(0),
@@ -210,12 +222,14 @@ fn open_scm() -> io::Result<WinServiceManager> {
     WinServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).map_err(to_io_error)
 }
 
-fn open_handle(scm: &WinServiceManager, name: &str) -> io::Result<Service> {
-    scm.open_service(
-        name,
-        ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG | ServiceAccess::STOP | ServiceAccess::START,
-    )
-    .map_err(to_io_error)
+/// What both [`super::stop_via_notify`] and [`super::start_via_notify`] need.
+const WAIT_ACCESS: ServiceAccess = ServiceAccess::QUERY_STATUS
+    .union(ServiceAccess::QUERY_CONFIG)
+    .union(ServiceAccess::STOP)
+    .union(ServiceAccess::START);
+
+fn open_handle(scm: &WinServiceManager, name: &str, access: ServiceAccess) -> io::Result<Service> {
+    scm.open_service(name, access).map_err(to_io_error)
 }
 
 /// The three steps [`super::close_then_drain`] puts in order.
@@ -262,7 +276,7 @@ impl super::NotifyRegistrar for SystemScmActor {
     /// replacements are confirmed open.
     fn reopen(&mut self) -> io::Result<()> {
         let scm = open_scm()?;
-        let service = open_handle(&scm, &self.name)?;
+        let service = open_handle(&scm, &self.name, self.access)?;
         self.scm = Some(scm);
         self.service = Some(service);
         Ok(())
@@ -308,6 +322,10 @@ impl super::ScmActor for SystemScmActor {
             Some(code) if code as u32 == ERROR_SERVICE_NOT_ACTIVE => Ok(()),
             _ => Err(err),
         }
+    }
+
+    fn delete(&mut self) -> io::Result<()> {
+        self.service()?.delete().map_err(to_io_error)
     }
 
     fn start(&mut self) -> io::Result<StartReply> {
