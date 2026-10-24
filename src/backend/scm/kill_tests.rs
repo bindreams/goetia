@@ -1,6 +1,5 @@
 //! Orchestration tests for [`super::kill_service`] against a scripted [`super::KillTarget`]: no
-//! SCM and no process involved, so these run on every platform. Every change of the service's
-//! state between two of its steps is scripted, never raced for.
+//! SCM and no process involved, so these run on every platform.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -30,6 +29,9 @@ struct Scripted {
     pids: VecDeque<Option<u32>>,
     opens: VecDeque<Open>,
     terminates: VecDeque<Terminate>,
+    /// Which `service_pid` calls, counted from 1, fail instead of answering.
+    failing_reads: Vec<usize>,
+    reads: usize,
     log: Log,
 }
 
@@ -43,8 +45,16 @@ impl Scripted {
             pids: pids.into(),
             opens: opens.into(),
             terminates: terminates.into(),
+            failing_reads: Vec::new(),
+            reads: 0,
             log: Log::default(),
         }
+    }
+
+    /// The `n`th `service_pid` call (from 1) fails.
+    fn failing_read(mut self, n: usize) -> Self {
+        self.failing_reads.push(n);
+        self
     }
 
     fn log(&self) -> Vec<String> {
@@ -69,6 +79,10 @@ impl KillTarget for Scripted {
 
     fn service_pid(&mut self) -> io::Result<Option<u32>> {
         self.log.borrow_mut().push("service_pid".to_string());
+        self.reads += 1;
+        if self.failing_reads.contains(&self.reads) {
+            return Err(io::Error::other("scm read failed"));
+        }
         Ok(if self.pids.len() > 1 {
             self.pids.pop_front().unwrap()
         } else {
@@ -291,6 +305,46 @@ fn an_open_that_failed_on_the_services_own_pid_is_an_error() {
 
     assert_eq!(e.to_string(), "access denied");
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
+}
+
+// A failed read of SCM ------------------------------------------------------------------------------------------------
+
+/// The first read: nothing is opened, nothing terminated.
+#[skuld::test]
+fn a_failed_first_read_is_an_error_and_touches_nothing() {
+    let mut target = Scripted::new([Some(100)], [], []).failing_read(1);
+
+    let e = kill_service(&mut target).unwrap_err();
+
+    assert_eq!(e.to_string(), "scm read failed");
+    assert_eq!(target.log(), steps(["service_pid"]));
+}
+
+/// The read that decides whether an open refusal is the service's own: both errors reach the caller.
+#[skuld::test]
+fn a_failed_read_after_a_refused_open_reports_both_errors() {
+    let mut target = Scripted::new([Some(100)], [Open::Fails], []).failing_read(2);
+
+    let e = kill_service(&mut target).unwrap_err();
+
+    let msg = e.to_string();
+    assert!(msg.contains("scm read failed"), "{msg}");
+    assert!(msg.contains("access denied"), "{msg}");
+    assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
+}
+
+/// The confirming read, with the handle held: the handle is closed and nothing is terminated.
+#[skuld::test]
+fn a_failed_confirming_read_closes_the_handle_and_terminates_nothing() {
+    let mut target = Scripted::new([Some(100)], [Open::Found], []).failing_read(2);
+
+    let e = kill_service(&mut target).unwrap_err();
+
+    assert_eq!(e.to_string(), "scm read failed");
+    assert_eq!(
+        target.log(),
+        steps(["service_pid", "open 100", "service_pid", "close 100"])
+    );
 }
 
 #[skuld::test]

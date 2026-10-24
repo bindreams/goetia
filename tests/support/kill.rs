@@ -12,8 +12,7 @@ use goetia::spec::Id;
 use super::ConnectBack;
 
 /// Re-check `condition` until it holds, with no cap: it is the state being waited for that ends the
-/// wait. A state that never arrives hangs the test for CI's watchdog to report, which is the right
-/// failure, not a bound chosen here.
+/// wait. A state that never arrives hangs the test for CI's watchdog to report.
 pub fn until(mut condition: impl FnMut() -> bool) {
     while !condition() {
         std::thread::yield_now();
@@ -43,7 +42,15 @@ pub fn a_killed_daemon_comes_back_with_a_new_pid(mgr: &dyn ServiceManager, id: &
 
 /// A daemon whose policy is not to restart stays down after a kill, in a state that says it is not
 /// running. `id` must be installed, not started, with `restart: never`.
-pub fn a_killed_daemon_that_never_restarts_stays_down(mgr: &dyn ServiceManager, id: &Id, started: &ConnectBack) {
+///
+/// `no_restart_configured` asserts what the platform's manager itself says about restarting this
+/// service, so that "down" is a standing fact and not a snapshot of one moment.
+pub fn a_killed_daemon_that_never_restarts_stays_down(
+    mgr: &dyn ServiceManager,
+    id: &Id,
+    started: &ConnectBack,
+    no_restart_configured: &dyn Fn(),
+) {
     mgr.start(id, Budget::DEFAULT).expect("start");
     started.accept("the daemon to report in after start");
     assert_eq!(mgr.status(id).expect("status before the kill").state, State::Running);
@@ -55,10 +62,7 @@ pub fn a_killed_daemon_that_never_restarts_stays_down(mgr: &dyn ServiceManager, 
     until(|| matches!(mgr.status(id).expect("status").state, State::Stopped | State::Failed));
     let status = mgr.status(id).expect("status after the kill");
     assert_eq!(status.pid, None, "a killed daemon has no process ({status:?})");
-    assert!(
-        !started.connected_yet(),
-        "the daemon was started again after a kill under a policy that never restarts"
-    );
+    no_restart_configured();
 }
 
 /// Killing a daemon with no process is `NotRunning`, at the library and as a CLI exit `1` that

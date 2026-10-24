@@ -1156,8 +1156,6 @@ stderr:
     assert_eq!(fake.status(&spec.id).unwrap().state, State::Failed);
 }
 
-/// Nothing to kill is not success: `kill x && echo "ended"` must not print that for a daemon that was
-/// never running.
 #[skuld::test]
 fn kill_exits_one_when_the_daemon_is_not_running() {
     let fake = Fake::new();

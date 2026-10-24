@@ -72,7 +72,7 @@ use std::path::{Path, PathBuf};
 use discover::{DROPIN_SEARCH_DIRS, RawState, absent_error, classify_and_read, discover, raw_state, require_installed};
 use systemctl::{
     daemon_reload, daemon_reload_or_report, gate_scope, kill_impl, request_restart_impl, require_supported,
-    run_systemctl, start_impl, status_from_unit, stop_impl,
+    run_systemctl, start_impl, status_from_unit, stop_impl, unit_args,
 };
 use write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 
@@ -194,7 +194,7 @@ impl ServiceManager for Systemd {
         // failed uninstall where today it succeeds.
         stop_impl(id, Budget::Unbounded, Budget::Unbounded.start())?;
 
-        let disabled = run_systemctl(&["disable", &unit])?;
+        let disabled = run_systemctl(&unit_args(&["disable"], &unit))?;
         if !disabled.status.success() {
             return Err(Error::Other(format!(
                 "systemctl disable {unit} failed: {}",
@@ -236,7 +236,7 @@ impl ServiceManager for Systemd {
         let id = id.as_str();
         require_installed(id)?;
         let unit = unit_name(id);
-        let output = run_systemctl(&["enable", &unit])?;
+        let output = run_systemctl(&unit_args(&["enable"], &unit))?;
         if output.status.success() {
             Ok(())
         } else {
@@ -251,7 +251,7 @@ impl ServiceManager for Systemd {
         let id = id.as_str();
         require_installed(id)?;
         let unit = unit_name(id);
-        let output = run_systemctl(&["disable", &unit])?;
+        let output = run_systemctl(&unit_args(&["disable"], &unit))?;
         if output.status.success() {
             Ok(())
         } else {

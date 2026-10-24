@@ -269,7 +269,11 @@ fn foreign_refuses_every_verb(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> Dae
         mgr.request_start_after_stop(&spec.id).is_err(),
         "request_start_after_stop must refuse a foreign id"
     );
-    assert!(mgr.kill(&spec.id).is_err(), "kill must refuse a foreign id");
+    let killed = mgr.kill(&spec.id);
+    assert!(
+        matches!(&killed, Err(Error::Foreign { id, .. }) if id == spec.id.as_str()),
+        "kill must refuse a foreign id as Foreign, not as NotRunning or anything else: {killed:?}"
+    );
     assert!(
         mgr.request_restart(&spec.id).is_none_or(|r| r.is_err()),
         "request_restart must refuse a foreign id"
@@ -349,11 +353,8 @@ fn start_and_stop_are_idempotent(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> 
         .expect("stop on an already-stopped service must be Ok, not an error");
 }
 
-/// `kill` of a service with no process answers [`Error::NotRunning`], on every backend and for
-/// every way of having none: never started, and started then stopped. Neither is success (nothing
-/// was killed) nor an anonymous failure (the CLI reports this one by name). Not a pre-check that
-/// races the kill: each backend classifies the kill request's own answer, so this scenario is
-/// the only place the two shapes meet.
+/// `kill` of a service with no process answers [`Error::NotRunning`] on every backend, both when
+/// never started and when started then stopped.
 fn kill_of_a_service_that_is_not_running_says_so(
     mgr: &dyn ServiceManager,
     mk: &dyn Fn(&str) -> DaemonSpec,

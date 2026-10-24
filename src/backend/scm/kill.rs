@@ -5,6 +5,10 @@
 //! same handle. While the handle is open its pid cannot be reused, so a pid SCM confirms after the
 //! open is the process held, never a stranger that took the number.
 //!
+//! That last step rests on a premise about SCM, which Microsoft does not document: a pid SCM still
+//! reports cannot have been freed and reissued to a stranger. This relies on SCM holding its own
+//! handle to the service's process for as long as it reports that process's pid.
+//!
 //! A pure state machine over [`KillTarget`], unit-tested with a script in `kill_tests.rs`;
 //! [`SystemKillTarget`] drives the real SCM and `OpenProcess`/`TerminateProcess`.
 #![cfg_attr(not(windows), allow(dead_code))]
@@ -23,7 +27,6 @@ pub enum Killed {
 /// What asking a held process to terminate came to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Termination {
-    /// The termination was delivered.
     Terminated,
     /// The process had already exited, so nothing was terminated.
     AlreadyExited,
@@ -58,11 +61,25 @@ pub fn kill_service<T: KillTarget>(target: &mut T) -> io::Result<Killed> {
         };
         let process = match target.open(pid) {
             Ok(Some(process)) => process,
-            Ok(None) => continue,
-            // A pid that cannot be opened is a refusal only while SCM still says it is the service's;
-            // once SCM has moved on, it was a process that exited, or somebody else's.
-            Err(e) if target.service_pid()? == Some(pid) => return Err(e),
-            Err(_) => continue,
+            // SCM has not yet noticed the exit; it will, and until then this re-reads it.
+            Ok(None) => {
+                std::thread::yield_now();
+                continue;
+            }
+            // A pid that cannot be opened is a refusal only while SCM still says it is the service's.
+            Err(e) => match target.service_pid() {
+                Ok(Some(now)) if now == pid => return Err(e),
+                // SCM has moved on: the pid was a process that exited, or somebody else's, and `e`
+                // is superseded by what the next read finds.
+                Ok(_) => continue,
+                // Cannot tell a refusal from a stale pid; both errors are the caller's to see.
+                Err(read) => {
+                    return Err(io::Error::new(
+                        read.kind(),
+                        format!("{read} (after the service's process could not be opened: {e})"),
+                    ));
+                }
+            },
         };
         if target.service_pid()? != Some(pid) {
             continue;
@@ -159,16 +176,15 @@ mod system {
     /// `SeDebugPrivilege` enabled for the open, as without it a `LocalService` service's process is
     /// refused. `None` if no process has that pid.
     pub(super) fn open_process(pid: u32) -> io::Result<Option<OwnedHandle>> {
-        let _debug = DebugPrivilege::enable();
+        let debug = DebugPrivilege::enable();
         // SAFETY: no pointers; a null return is the failure.
         let handle = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid) };
         if handle.is_null() {
             let e = io::Error::last_os_error();
-            // No process has this pid: it was gone.
             return if e.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
                 Ok(None)
             } else {
-                Err(e)
+                Err(debug.explain_denial(e))
             };
         }
         // SAFETY: a valid handle `OpenProcess` just returned and nothing else owns.
@@ -186,11 +202,9 @@ mod system {
             return Ok(Termination::Terminated);
         }
         let e = io::Error::last_os_error();
-        // Microsoft documents that "after a process has terminated, calls to `TerminateProcess` with
-        // open handles to the process fail with `ERROR_ACCESS_DENIED`". Measured by the real-process
-        // test: a second terminate right after the first is denied this way while the process handle
-        // is not yet signalled. So a denial on a handle opened with `PROCESS_TERMINATE` is taken to
-        // mean the process is terminating, and the exit is awaited on the handle.
+        // `TerminateProcess` on a process that is already terminating fails with `ERROR_ACCESS_DENIED`
+        // while its handle is not yet signalled. A denial on a handle opened with `PROCESS_TERMINATE`
+        // is therefore taken to mean 'terminating', and the exit is awaited on the handle.
         if e.raw_os_error() != Some(ERROR_ACCESS_DENIED as i32) {
             return Err(e);
         }

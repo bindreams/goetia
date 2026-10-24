@@ -220,7 +220,17 @@ fn a_killed_never_restart_daemon_stays_down() {
     let spec = reporting(&id, Restart::Never, &started, &stopped);
     mgr.install(&spec, false).expect("install");
 
-    support::kill::a_killed_daemon_that_never_restarts_stays_down(&mgr, &spec.id, &started);
+    support::kill::a_killed_daemon_that_never_restarts_stays_down(&mgr, &spec.id, &started, &|| {
+        let scm = WinServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).expect("open SCM");
+        let service = scm
+            .open_service(&id, ServiceAccess::QUERY_CONFIG)
+            .expect("open the service to read its failure actions");
+        let configured = service.get_failure_actions().expect("failure actions");
+        assert!(
+            configured.actions.is_none_or(|actions| actions.is_empty()),
+            "the service has failure actions configured"
+        );
+    });
 }
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]

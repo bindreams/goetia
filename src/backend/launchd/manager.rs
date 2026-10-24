@@ -992,14 +992,9 @@ fn bootout(id: &str, deadline: Deadline, reaper: Reaper) -> Result<Option<()>> {
     }
 }
 
-/// `launchctl kill SIGKILL`, unconditionally — no `print` pre-check, for the reason [`bootout`]
-/// gives: a read then the kill leaves a window for the job to exit or start between the two. The
-/// kill's own answer classifies instead. A job that is not loaded (113) and one that is loaded with
-/// no process to signal (3, "No such process") are both [`Error::NotRunning`]: the two codes
-/// [`is_not_found`] already names for the same label lookup.
-///
-/// The job, never a pid: launchd signals the job's own process, and what it does next is the plist's
-/// `KeepAlive`. `Ok(None)` iff the deadline expired.
+/// `launchctl kill SIGKILL` on the job, never a pid; what happens next is the plist's `KeepAlive`.
+/// Exit 113 (not loaded) and 3 (loaded, no process) are both [`Error::NotRunning`], the codes
+/// [`is_not_found`] already names. `Ok(None)` iff the deadline expired.
 fn kill_job(id: &str, deadline: Deadline, reaper: Reaper) -> Result<Option<()>> {
     let target = target(id);
     let args = ["kill", "SIGKILL", target.as_str()];
@@ -1508,7 +1503,6 @@ impl ServiceManager for LaunchdManager {
         let [reaper] = reapers::<KILL_REQUESTS>(id)?;
         let _files = files(id, KILL_CALLS)?;
         located_and_ours(id)?;
-        // Unbounded: `kill` has no budget, and the request is the whole call.
         never_expires(kill_job(id.as_str(), Budget::Unbounded.start(), reaper)?);
         Ok(())
     }

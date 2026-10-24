@@ -129,8 +129,7 @@ pub enum DaemonCommand {
 ///   that is `4` for all seven verbs, `uninstall` included.
 /// - `1` error: an operation was attempted and failed, or was refused
 ///   outright. `kill` of a daemon with no process is this
-///   ([`Error::NotRunning`](crate::error::Error::NotRunning)): nothing was killed, so
-///   `kill x && echo "ended"` must not print that.
+///   ([`Error::NotRunning`](crate::error::Error::NotRunning)): nothing was killed.
 /// - `2` usage: clap rejected the command line before `dispatch` ever ran,
 ///   or `dispatch` refused to run anything: `--json` on a subcommand that
 ///   does not implement it, or a wait flag on an `install` with no `--start`

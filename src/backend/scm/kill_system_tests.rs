@@ -1,6 +1,8 @@
 //! The Win32 half of the SCM kill against real child processes the test spawns itself: no service,
 //! no SCM and no elevation. These are the classifications that decide between "follow SCM" and
-//! "error", which the scripted tests in `kill_tests.rs` take as given.
+//! "error", which the scripted tests in `kill_tests.rs` take as given. The gone-pid case
+//! (`ERROR_INVALID_PARAMETER`) is scripted in `kill_tests.rs`; when the OS frees a process object is
+//! not the test's to control.
 
 use std::cell::Cell;
 use std::process::{Child, Command, Stdio};
@@ -38,8 +40,6 @@ fn spawn_long_running() -> Spawned {
 fn spawn_exiting_with(code: u32) -> Spawned {
     spawn("cmd", &["/c", &format!("exit {code}")])
 }
-
-// `ERROR_INVALID_PARAMETER` -> gone is covered by `kill_tests.rs` only: when the OS frees a real process object is not the test's to control.
 
 /// The kill loop meets a process that exited but is still held: the held object keeps its pid
 /// openable. `child` keeps its own handle open until it is dropped.
@@ -98,8 +98,7 @@ fn terminating_right_after_a_terminate_is_already_exited() {
     assert!(notices.get() <= 1, "noticed {} times", notices.get());
 }
 
-/// 259 is `STILL_ACTIVE`, the code a check of the exit code would take for a live process. The
-/// process is already gone, so there is nothing to wait for and nothing to announce.
+/// 259 is `STILL_ACTIVE`, the code a check of the exit code would take for a live process.
 #[skuld::test]
 fn terminating_a_process_that_exited_with_259_is_already_exited() {
     let mut child = spawn_exiting_with(259);

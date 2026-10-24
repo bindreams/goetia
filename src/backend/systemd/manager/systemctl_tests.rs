@@ -94,7 +94,7 @@ fn a_budget_that_does_not_wait_asks_systemd_not_to_block() {
     for budget in [Budget::Immediate, Budget::Bounded(Duration::ZERO)] {
         assert_eq!(
             verb_args("start", "x.service", budget),
-            ["start", "--no-block", "--show-transaction", "x.service"],
+            ["start", "--no-block", "--show-transaction", "--", "x.service"],
             "{budget:?}"
         );
     }
@@ -106,7 +106,7 @@ fn a_budget_that_does_not_wait_asks_systemd_not_to_block() {
 fn a_budget_that_waits_lets_systemctl_block() {
     assert_eq!(
         verb_args("stop", "x.service", Budget::Unbounded),
-        ["stop", "--show-transaction", "x.service"]
+        ["stop", "--show-transaction", "--", "x.service"]
     );
 }
 
@@ -124,6 +124,47 @@ fn every_budget_asks_systemctl_to_announce_the_job() {
             "{budget:?}"
         );
     }
+}
+
+/// An id may start with `-` (`is_valid_id` allows it), and a unit name that does is read by
+/// `systemctl` as an option unless `--` precedes it: `-h.service` is `-h`, which prints help and
+/// exits `0` having done nothing. `systemctl` parses with `getopt_long`, which stops at `--`.
+#[skuld::test]
+fn start_stop_and_restart_put_the_unit_after_the_option_terminator() {
+    for budget in [
+        Budget::Immediate,
+        Budget::Unbounded,
+        Budget::Bounded(Duration::from_secs(10)),
+    ] {
+        for verb in ["start", "stop", "restart"] {
+            let args = verb_args(verb, "-h.service", budget);
+            assert_eq!(args[0], verb, "{budget:?}");
+            assert_eq!(args[args.len() - 2..], ["--", "-h.service"], "{verb} {budget:?}");
+        }
+    }
+}
+
+/// The verbs that take a unit and are not `verb_args`'s: `enable`, `disable` and `show`.
+#[skuld::test]
+fn enable_and_disable_put_the_unit_after_the_option_terminator() {
+    for verb in ["enable", "disable"] {
+        assert_eq!(unit_args(&[verb], "-h.service"), [verb, "--", "-h.service"]);
+    }
+}
+
+#[skuld::test]
+fn show_puts_the_unit_after_the_option_terminator() {
+    let dir = tempfile::tempdir().unwrap();
+    let ran = dir.path().join("ran");
+    let _stand_in = stand_in::set(Some(&format!("echo \"$*\" >> '{}'; exit 1", ran.display())), booted());
+
+    let _ = status_from_unit("-h.service");
+
+    assert_eq!(
+        std::fs::read_to_string(&ran).unwrap(),
+        "show --property ActiveState,MainPID,UnitFileState,LoadState -- -h.service
+"
+    );
 }
 
 // enqueued ============================================================================================================
@@ -1384,26 +1425,44 @@ fn kill_with(rest: &str) -> Result<()> {
     kill_impl("x")
 }
 
-/// The one signal and the one process: SIGKILL to the main process, failing when there is none.
-/// `--kill-who`, not `--kill-whom`: 245 and older do not know the second (MEASURED, 245), and the
-/// first is still accepted by 255 and 257. `main-fail` is what turns "no main process" into an
-/// error, where plain `main` succeeds having signalled nobody (MEASURED, 245 and 255).
+/// The argv is pinned: see `KILL_ARGS` for why each flag.
 #[skuld::test]
-fn kill_signals_only_the_main_process_with_sigkill_and_fails_where_there_is_none() {
+fn kill_runs_the_pinned_argv() {
     let dir = tempfile::tempdir().unwrap();
     let ran = dir.path().join("ran");
     kill_with(&format!("echo \"$*\" >> '{}'; exit 0", ran.display())).unwrap();
 
     assert_eq!(
         std::fs::read_to_string(&ran).unwrap(),
-        "kill --kill-who=main-fail --signal=SIGKILL x.service
+        "kill --kill-who=main-fail --signal=SIGKILL -- x.service
 "
     );
 }
 
-/// systemd's two answers for a unit with no process to signal, word for word (MEASURED, 245 and
-/// 255): a unit that is not loaded, which is what an inactive one is once nothing holds it, and a
-/// loaded one whose main process is gone.
+/// An id may start with `-`; without `--` systemctl would read `-h.service` as `-h` and print its
+/// help, exit `0`, and signal nobody.
+#[skuld::test]
+fn kill_of_an_id_starting_with_a_dash_names_the_unit_after_the_terminator() {
+    let dir = tempfile::tempdir().unwrap();
+    let ran = dir.path().join("ran");
+    let _stand_in = stand_in::set(
+        Some(&gate_passes_then(&format!(
+            "echo \"$*\" >> '{}'; exit 0",
+            ran.display()
+        ))),
+        booted(),
+    );
+
+    kill_impl("-h").unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&ran).unwrap(),
+        "kill --kill-who=main-fail --signal=SIGKILL -- -h.service
+"
+    );
+}
+
+/// Both of systemd's no-process answers (see `no_process`) are `NotRunning`.
 #[skuld::test]
 fn kill_of_a_unit_with_no_main_process_is_not_running() {
     for said in [
@@ -1435,7 +1494,6 @@ fn a_not_loaded_answer_about_another_unit_is_a_plain_failure() {
     assert!(matches!(&e, Error::Other(_)), "{e:?}");
 }
 
-/// An exit of `0` is the signal sent, and nothing more is claimed.
 #[skuld::test]
 fn kill_that_systemd_took_succeeds() {
     kill_with("exit 0").unwrap();

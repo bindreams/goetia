@@ -555,7 +555,24 @@ fn a_killed_never_restart_daemon_stays_down() {
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
 
-    support::kill::a_killed_daemon_that_never_restarts_stays_down(&mgr, &spec.id, &listener);
+    let unit = format!("{}.service", spec.id);
+    support::kill::a_killed_daemon_that_never_restarts_stays_down(&mgr, &spec.id, &listener, &|| {
+        let shown = cmd::run(
+            "systemctl",
+            &["show", "--property=Restart,NRestarts,SubState", "--", &unit],
+        )
+        .expect_ok();
+        for expected in ["Restart=no", "NRestarts=0"] {
+            assert!(
+                shown.stdout.lines().any(|line| line == expected),
+                "no `{expected}` in {shown}"
+            );
+        }
+        assert!(
+            !shown.stdout.lines().any(|line| line == "SubState=auto-restart"),
+            "the unit is waiting to restart: {shown}"
+        );
+    });
 }
 
 /// An installed unit that was never started is not loaded; one that was stopped is loaded or not

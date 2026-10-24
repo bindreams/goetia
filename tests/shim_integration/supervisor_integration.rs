@@ -171,10 +171,6 @@ fn exited(pid: u32) {
 /// daemon and its descendants, through the Job Object the shim dies holding. The shim's death is
 /// SCM's unexpected exit; with `restart: never` there is no recovery action, so the service stays
 /// stopped.
-///
-/// The "comes back with a new pid" assertion for `type: simple` belongs here once its recovery
-/// actions land (#59): the same test with `Restart::OnFailure`, ending in
-/// `support::kill::a_killed_daemon_comes_back_with_a_new_pid`.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn kill_ends_the_shim_and_the_daemon_tree_with_it() {
     let mgr = ScmManager::new();

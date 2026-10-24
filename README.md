@@ -680,11 +680,11 @@ is refused.
 
 It addresses the service, never a bare pid:
 
-| Platform | What it sends                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| systemd  | `SIGKILL` to the unit's main process alone (`systemctl kill --kill-who=main-fail`); systemd cleans up the rest of the cgroup.                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| launchd  | `launchctl kill SIGKILL system/<id>`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| Windows  | SCM has no kill-by-service call, so goetia reads the service's process, in any state that has one, opens it and keeps it open, asks SCM again whether it is still the service's, and only then terminates it through that handle, with exit code `1`. A service restarted in between is never mistaken for the old one, and a process that exited on its own first is followed to the service's next one or reported as not running, never as killed. SCM sees an unexpected exit and applies the service's recovery actions, as for a crash. |
+| Platform | What it sends                                                                                                                                                                                                                           |
+| -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| systemd  | `SIGKILL` to the unit's main process alone (`systemctl kill --kill-who=main-fail`); systemd cleans up the rest of the cgroup.                                                                                                           |
+| launchd  | `launchctl kill SIGKILL system/<id>`.                                                                                                                                                                                                   |
+| Windows  | SCM has no kill-by-service call, so goetia terminates the service's process (exit code `1`), after confirming through SCM that it is still the service's. SCM sees an unexpected exit and applies the recovery actions, as for a crash. |
 
 On Windows with `type: simple` the service's process is `goetia-shim`; its Job
 Object ends the daemon and its descendants with it.
@@ -696,10 +696,7 @@ for it to exit` to stderr; a process stuck in a driver request can keep it
 waiting.
 
 A daemon with no process, whether stopped or between runs, is an error: exit
-`1` and "is not running", because nothing was killed and `goetia daemon kill x
-&& echo ended` must not say otherwise. It is read off the kill request's own
-answer, never from a state checked first, which the process could leave or
-enter in between.
+`1` and "is not running", because nothing was killed.
 
 ## Exit codes
 

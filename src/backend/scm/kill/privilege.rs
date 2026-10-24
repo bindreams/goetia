@@ -1,6 +1,6 @@
 //! `SeDebugPrivilege` for the `OpenProcess` in `kill`. An elevated administrator holds it but has
 //! it disabled, and without it the process of a `LocalService` service is refused
-//! `PROCESS_TERMINATE` (measured on CI). `taskkill` enables it the same way.
+//! `PROCESS_TERMINATE`. `taskkill` enables it the same way.
 //!
 //! It is enabled on a copy of the caller's token, installed as the calling thread's impersonation
 //! token for the open alone, so the rest of the process never sees the change. A token that does not
@@ -9,7 +9,7 @@
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 
-use windows_sys::Win32::Foundation::{ERROR_NO_TOKEN, ERROR_NOT_ALL_ASSIGNED, GetLastError, LUID};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_NO_TOKEN, ERROR_NOT_ALL_ASSIGNED, GetLastError, LUID};
 use windows_sys::Win32::Security::{
     AdjustTokenPrivileges, DuplicateTokenEx, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_DEBUG_NAME,
     SE_PRIVILEGE_ENABLED, SecurityImpersonation, TOKEN_ADJUST_PRIVILEGES, TOKEN_DUPLICATE, TOKEN_IMPERSONATE,
@@ -24,14 +24,32 @@ use windows_sys::Win32::System::Threading::{
 pub(super) struct DebugPrivilege {
     /// `Some` once the thread token was replaced; the token to put back (`None` inside: none).
     restore: Option<Option<OwnedHandle>>,
+    /// Why enabling failed. Absent when it worked and when the token lacks the privilege.
+    failure: Option<io::Error>,
 }
 
 impl DebugPrivilege {
-    /// Enable the privilege for this thread if the caller holds it. Any failure leaves the thread
-    /// untouched, and the open that follows reports its own error.
+    /// Enable the privilege for this thread if the caller holds it. A failure leaves the thread
+    /// untouched and is kept for [`Self::explain_denial`]; the open that follows reports its own error.
     pub(super) fn enable() -> Self {
-        Self {
-            restore: install().ok().flatten(),
+        match install() {
+            Ok(restore) => Self { restore, failure: None },
+            Err(e) => Self {
+                restore: None,
+                failure: Some(e),
+            },
+        }
+    }
+
+    /// `open`'s error, with the failed privilege step named when the open was denied: the denial may
+    /// be the privilege that could not be enabled.
+    pub(super) fn explain_denial(&self, open: io::Error) -> io::Error {
+        match &self.failure {
+            Some(step) if open.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => io::Error::new(
+                open.kind(),
+                format!("{open} (enabling SeDebugPrivilege for the open also failed: {step})"),
+            ),
+            _ => open,
         }
     }
 }
@@ -42,9 +60,19 @@ impl Drop for DebugPrivilege {
             let handle = previous.as_ref().map_or(std::ptr::null_mut(), |h| h.as_raw_handle());
             // SAFETY: a null thread means this one; `handle` is a token this function opened or null.
             let ok = unsafe { SetThreadToken(std::ptr::null(), handle) };
-            debug_assert_ne!(ok, 0, "SetThreadToken: {}", io::Error::last_os_error());
+            if ok == 0 {
+                // The thread keeps the privileged token, so this is said in release builds too.
+                let e = io::Error::last_os_error();
+                eprintln!("{}", restore_notice(&e));
+                debug_assert!(false, "SetThreadToken: {e}");
+            }
         }
     }
+}
+
+/// The warning for a thread token that could not be put back.
+fn restore_notice(e: &io::Error) -> String {
+    format!("warning: SetThreadToken failed to restore the thread's token after enabling SeDebugPrivilege: {e}")
 }
 
 /// Impersonate a privileged copy of the thread's effective token. `Ok(Some(previous))` when

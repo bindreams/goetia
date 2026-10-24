@@ -468,7 +468,22 @@ fn a_killed_never_restart_daemon_stays_down() {
     let spec = reporting(&support::random_test_id(), Restart::Never, &listener);
     let _guard = Guard::install(&mgr, &spec);
 
-    support::kill::a_killed_daemon_that_never_restarts_stays_down(&mgr, &spec.id, &listener);
+    support::kill::a_killed_daemon_that_never_restarts_stays_down(&mgr, &spec.id, &listener, &|| {
+        let id = spec.id.as_str();
+        let plist = [enabled_path(id), staging_path(id)]
+            .into_iter()
+            .find_map(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_else(|| panic!("no plist of `{id}` to read"));
+        assert!(
+            !plist.contains("<key>KeepAlive</key>"),
+            "the job has a KeepAlive: {plist}"
+        );
+        let printed = cmd::run("launchctl", &["print", &format!("system/{id}")]);
+        assert!(
+            !printed.stdout.contains("state = running"),
+            "the job is running: {printed}"
+        );
+    });
 }
 
 /// Both ways a job has no process: never loaded, and loaded then booted out by `stop`. And the
