@@ -6,7 +6,7 @@
 //! where `<scripts>` is `|`-separated, one script per run of the service
 //! (run index kept in `%ProgramData%\<name>.runs`; the last script repeats).
 //! A script is `,`-separated steps: `pending`, `run`, `connect`, `wait-stop`,
-//! `stopped:w32:<n>`, `stopped:spec:<n>`, `exit:<n>`.
+//! `stopped:w32:<n>`, `stopped:spec:<n>`, `rawstopped:<w32>:<spec>`, `exit:<n>`.
 //!
 //! Absence is shown with a bound (a one-off attended measurement; the result
 //! is read by a human as "no restart within N s", not as proof).
@@ -27,8 +27,11 @@ mod host {
     use std::ffi::OsString;
     use std::io::Write as _;
     use std::net::{Ipv4Addr, TcpStream};
+    use std::os::windows::io::AsRawHandle as _;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    use windows_sys::Win32::System::Services;
 
     use windows_service::service::{
         ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
@@ -141,6 +144,21 @@ mod host {
                         ))
                         .expect("report STOPPED");
                 }
+                // A raw SERVICE_STATUS, for pairs `ServiceExitCode` cannot say
+                // (win32 code and service-specific code independent).
+                ["rawstopped", w32, spec] => {
+                    let raw = Services::SERVICE_STATUS {
+                        dwServiceType: Services::SERVICE_WIN32_OWN_PROCESS,
+                        dwCurrentState: Services::SERVICE_STOPPED,
+                        dwControlsAccepted: 0,
+                        dwWin32ExitCode: code(w32),
+                        dwServiceSpecificExitCode: code(spec),
+                        dwCheckPoint: 0,
+                        dwWaitHint: 0,
+                    };
+                    let ok = unsafe { Services::SetServiceStatus(handle.as_raw_handle(), &raw) };
+                    assert!(ok != 0, "SetServiceStatus failed: {}", std::io::Error::last_os_error());
+                }
                 ["exit", n] => std::process::exit(code(n) as i32),
                 other => panic!("bad step {other:?}"),
             }
@@ -164,6 +182,7 @@ mod probes {
         ServiceType,
     };
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+    use windows_sys::Win32::System::Services;
 
     use super::host::HOST;
 
@@ -214,9 +233,9 @@ mod probes {
             println!("PROBE {} t={}ms {}", self.tag, self.t0.elapsed().as_millis(), msg);
         }
 
-        /// `scripts` as in the module doc; `delay_ms` is the single
-        /// `restart/<ms>` action goetia writes.
-        fn new(tag: &str, scripts: &str, delay_ms: u64) -> Probe {
+        /// `scripts` as in the module doc; `actions` is the `sc failure`
+        /// actions list (goetia writes a single `restart/<ms>`).
+        fn new(tag: &str, scripts: &str, actions: &str) -> Probe {
             let t0 = Instant::now();
             let n = COUNTER.fetch_add(1, Ordering::SeqCst);
             let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
@@ -262,8 +281,7 @@ mod probes {
                 .expect("create service");
 
             // The same sc.exe calls `apply_failure_actions` makes.
-            let action = format!("restart/{delay_ms}");
-            let (c1, o1) = sc(&["failure", &name, "reset=", "86400", "actions=", &action]);
+            let (c1, o1) = sc(&["failure", &name, "reset=", "86400", "actions=", actions]);
             let (c2, o2) = sc(&["failureflag", &name, "1"]);
             let (_, q1) = sc(&["qfailure", &name]);
             let (_, q2) = sc(&["qfailureflag", &name]);
@@ -279,7 +297,7 @@ mod probes {
                 tracer: None,
             };
             probe.p(format_args!(
-                "setup name={name} port={port} scripts={scripts} delay={delay_ms}ms"
+                "setup name={name} port={port} scripts={scripts} actions={actions}"
             ));
             probe.p(format_args!("setup sc failure -> {c1:?} {o1}"));
             probe.p(format_args!("setup sc failureflag -> {c2:?} {o2}"));
@@ -295,23 +313,16 @@ mod probes {
                 };
                 let mut last = None;
                 while tracing.load(Ordering::SeqCst) {
-                    match svc.query_status() {
+                    match raw_query(&svc) {
                         Ok(s) => {
-                            let cur = (s.current_state, s.exit_code, s.process_id, s.controls_accepted);
-                            if last != Some(cur) {
-                                println!(
-                                    "PROBE {ttag} t={}ms scm state={:?} exit={} pid={:?} accepts={:?}",
-                                    t0.elapsed().as_millis(),
-                                    s.current_state,
-                                    fmt_exit(s.exit_code),
-                                    s.process_id,
-                                    s.controls_accepted
-                                );
+                            let cur = fmt_raw(&s);
+                            if last.as_ref() != Some(&cur) {
+                                println!("PROBE {ttag} t={}ms scm {cur}", t0.elapsed().as_millis());
                                 last = Some(cur);
                             }
                         }
                         Err(e) => {
-                            println!("PROBE {ttag} t={}ms scm query error {e:?}", t0.elapsed().as_millis());
+                            println!("PROBE {ttag} t={}ms scm query error {e}", t0.elapsed().as_millis());
                             return;
                         }
                     }
@@ -381,15 +392,11 @@ mod probes {
             }
         }
 
+        /// QueryServiceStatusEx, both exit-code fields raw.
         fn status(&self) -> String {
-            match self.service(ServiceAccess::QUERY_STATUS).query_status() {
-                Ok(s) => format!(
-                    "state={:?} exit={} pid={:?}",
-                    s.current_state,
-                    fmt_exit(s.exit_code),
-                    s.process_id
-                ),
-                Err(e) => format!("query error {e:?}"),
+            match raw_query(&self.service(ServiceAccess::QUERY_STATUS)) {
+                Ok(s) => fmt_raw(&s),
+                Err(e) => format!("query error {e}"),
             }
         }
 
@@ -423,6 +430,32 @@ mod probes {
         }
     }
 
+    fn raw_query(svc: &Service) -> Result<Services::SERVICE_STATUS_PROCESS, std::io::Error> {
+        let mut s: Services::SERVICE_STATUS_PROCESS = unsafe { std::mem::zeroed() };
+        let mut needed = 0u32;
+        let ok = unsafe {
+            Services::QueryServiceStatusEx(
+                svc.raw_handle(),
+                Services::SC_STATUS_PROCESS_INFO,
+                (&raw mut s).cast::<u8>(),
+                size_of::<Services::SERVICE_STATUS_PROCESS>() as u32,
+                &mut needed,
+            )
+        };
+        if ok == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(s)
+        }
+    }
+
+    fn fmt_raw(s: &Services::SERVICE_STATUS_PROCESS) -> String {
+        format!(
+            "state={} win32={} specific={} pid={} accepts={:#x}",
+            s.dwCurrentState, s.dwWin32ExitCode, s.dwServiceSpecificExitCode, s.dwProcessId, s.dwControlsAccepted
+        )
+    }
+
     fn fmt_exit(e: ServiceExitCode) -> String {
         match e {
             ServiceExitCode::Win32(n) => format!("Win32({n})"),
@@ -440,151 +473,200 @@ mod probes {
         }
     }
 
-    // P1 ==============================================================================================================
+    // P7 ==============================================================================================================
 
-    fn p1(label: &'static str, stopped: &'static str) -> String {
-        let tag = format!("P1[{label}]");
-        let mut p = Probe::new(&tag, &format!("run,connect,{stopped}|{STAY_UP}"), 1000);
-        let _ = p.start();
-        let first = p.connect(0, EXPECTED_BOUND).map(|c| c.body.clone());
-        p.p(format_args!("first run connect-back: {first:?}"));
-        let bound = EXPECTED_BOUND;
-        let second = p.connect(1, bound).cloned();
-        let r = describe(second.as_ref(), bound);
-        p.result(format_args!(
-            "after RUNNING, report STOPPED {stopped}: {r}; final {}",
-            p.status()
-        ));
-        r
-    }
-
-    // P2 ==============================================================================================================
-
-    fn p2(label: &'static str, stop_code: &'static str) -> String {
-        let tag = format!("P2[{label}]");
+    /// Commanded stop, host reports STOPPED with win32 = 0 and specific = 6.
+    fn p7() -> String {
         let delay = Duration::from_millis(1000);
         let mut p = Probe::new(
-            &tag,
-            &format!("run,connect,wait-stop,stopped:{stop_code}|{STAY_UP}"),
-            1000,
+            "P7",
+            &format!("run,connect,wait-stop,rawstopped:0:6|{STAY_UP}"),
+            "restart/1000",
         );
         let _ = p.start();
         p.connect(0, EXPECTED_BOUND);
+        p.p(format_args!("before stop: {}", p.status()));
         let stop = p.stop();
+        p.p(format_args!("right after ControlService(STOP): {}", p.status()));
+        let stopped = p.wait_state(ServiceState::Stopped, EXPECTED_BOUND);
+        let at_stopped = p.status();
+        p.p(format_args!("reached STOPPED: {stopped}; {at_stopped}"));
         let bound = absence_bound(delay);
         let second = p.connect(1, bound).cloned();
         let r = describe(second.as_ref(), bound);
         p.result(format_args!(
-            "commanded stop (stop() -> {stop:?}), host reports STOPPED {stop_code}: {r}; final {}",
+            "commanded stop, host reports win32=0 specific=6 (stop() -> {stop:?}); QueryServiceStatusEx at STOPPED: {at_stopped}; {r}; final {}",
             p.status()
         ));
         r
     }
 
-    // P3 ==============================================================================================================
-
-    fn p3(label: &'static str, first_run: &'static str) -> String {
-        let tag = format!("P3[{label}]");
-        let mut p = Probe::new(&tag, &format!("{first_run}|{STAY_UP}"), 1000);
-        let start = p.start();
-        let bound = EXPECTED_BOUND;
-        let second = p.connect(0, bound).cloned();
-        let r = describe(second.as_ref(), bound);
-        p.result(format_args!(
-            "failure before ever RUNNING ({first_run}): StartService -> {start:?}; {r}; final {}",
-            p.status()
-        ));
-        r
-    }
-
-    // P4 ==============================================================================================================
-
-    fn p4_stop() -> String {
-        let tag = "P4[stop]";
-        let delay = Duration::from_secs(15);
-        let mut p = Probe::new(tag, &format!("run,connect,stopped:w32:1|{STAY_UP}"), 15000);
-        let _ = p.start();
-        p.connect(0, EXPECTED_BOUND);
-        let stopped = p.wait_state(ServiceState::Stopped, EXPECTED_BOUND);
-        p.p(format_args!("reached STOPPED: {stopped}"));
-        let stop = p.stop();
-        let bound = absence_bound(delay);
-        let second = p.connect(1, bound).cloned();
-        let r = describe(second.as_ref(), bound);
-        p.result(format_args!(
-            "failed, 15s action pending, stop() -> {stop:?}: {r}; final {}",
-            p.status()
-        ));
-        r
-    }
-
-    fn p4_start_stop() -> String {
-        let tag = "P4[start-then-stop]";
-        let delay = Duration::from_secs(15);
-        let mut p = Probe::new(tag, &format!("run,connect,stopped:w32:1|{STAY_UP}"), 15000);
-        let _ = p.start();
-        p.connect(0, EXPECTED_BOUND);
-        let stopped = p.wait_state(ServiceState::Stopped, EXPECTED_BOUND);
-        p.p(format_args!("reached STOPPED: {stopped}"));
-        let manual = p.start();
-        let manual_up = p.connect(1, EXPECTED_BOUND).map(|c| c.at.as_millis());
-        p.p(format_args!("manual start connect-back at {manual_up:?}ms"));
-        let stop = p.stop();
-        let stopped_again = p.wait_state(ServiceState::Stopped, EXPECTED_BOUND);
-        p.p(format_args!("stopped again: {stopped_again}"));
-        let bound = absence_bound(delay);
-        let third = p.connect(2, bound).cloned();
-        let r = describe(third.as_ref(), bound);
-        p.result(format_args!(
-            "failed, 15s action pending, manual start -> {manual:?}, then stop() -> {stop:?}: {r}; final {}",
-            p.status()
-        ));
-        r
-    }
-
-    // P5 ==============================================================================================================
-
-    fn p5(label: &'static str, first_run: &'static str) -> String {
-        let tag = format!("P5[{label}]");
+    /// Same pair, but the process stops on its own after RUNNING (no stop command).
+    fn p7b() -> String {
         let delay = Duration::from_millis(1000);
-        let mut p = Probe::new(&tag, &format!("{first_run}|{STAY_UP}"), 1000);
+        let mut p = Probe::new(
+            "P7b",
+            &format!("run,connect,rawstopped:0:6,exit:0|{STAY_UP}"),
+            "restart/1000",
+        );
         let _ = p.start();
         p.connect(0, EXPECTED_BOUND);
+        let stopped = p.wait_state(ServiceState::Stopped, EXPECTED_BOUND);
+        let at_stopped = p.status();
+        p.p(format_args!("reached STOPPED: {stopped}; {at_stopped}"));
         let bound = absence_bound(delay);
         let second = p.connect(1, bound).cloned();
         let r = describe(second.as_ref(), bound);
         p.result(format_args!(
-            "host script `{first_run}` (the timeline above shows the SCM record just after the report/exit): {r}; final {}",
+            "self-exit after RUNNING, host reports win32=0 specific=6; QueryServiceStatusEx at STOPPED: {at_stopped}; {r}; final {}",
             p.status()
         ));
         r
     }
 
-    // P6 ==============================================================================================================
+    // P8 ==============================================================================================================
 
-    fn p6() -> String {
-        let tag = "P6";
-        let fail = "run,connect,stopped:w32:1";
-        let mut p = Probe::new(tag, &format!("{fail}|{fail}|{fail}|{fail}|{STAY_UP}"), 1000);
-        let _ = p.start();
-        // Runs 0..=3 fail, run 4 stays up: 4 failures, so 4 restarts if the
-        // single action repeats.
-        let mut at = Vec::new();
-        for n in 0..5 {
-            match p.connect(n, EXPECTED_BOUND) {
-                Some(c) => at.push(c.at.as_millis()),
-                None => break,
-            }
+    /// Two actions: if the SCM failure count survives a mutation, the second
+    /// failure waits 2 s (action #2); if the count was reset it waits 15 s.
+    const P8_ACTIONS: &str = "restart/15000/restart/2000";
+    const P8_FAIL: &str = "run,connect,stopped:w32:1";
+
+    fn set_actions_api(name: &str, actions: &[(i32, u32)], reset: u32) -> String {
+        let mut raw: Vec<Services::SC_ACTION> = actions
+            .iter()
+            .map(|(t, d)| Services::SC_ACTION { Type: *t, Delay: *d })
+            .collect();
+        let fa = Services::SERVICE_FAILURE_ACTIONSW {
+            dwResetPeriod: reset,
+            lpRebootMsg: std::ptr::null_mut(),
+            lpCommand: std::ptr::null_mut(),
+            cActions: raw.len() as u32,
+            lpsaActions: if raw.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                raw.as_mut_ptr()
+            },
+        };
+        let svc = manager()
+            .open_service(name, ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG)
+            .expect("open service for config");
+        let ok = unsafe {
+            Services::ChangeServiceConfig2W(
+                svc.raw_handle(),
+                Services::SERVICE_CONFIG_FAILURE_ACTIONS,
+                (&raw const fa).cast(),
+            )
+        };
+        if ok == 0 {
+            format!("ChangeServiceConfig2W failed: {}", std::io::Error::last_os_error())
+        } else {
+            "ChangeServiceConfig2W ok".to_string()
         }
-        let r = format!(
-            "{} runs connected back (expected 5 = 4 restarts), at ms {at:?}",
-            at.len()
-        );
-        p.result(format_args!(
-            "4 consecutive failures, one restart/1000 action: {r}; final {}",
+    }
+
+    fn restart_actions() -> [(i32, u32); 2] {
+        [
+            (Services::SC_ACTION_RESTART, 15000),
+            (Services::SC_ACTION_RESTART, 2000),
+        ]
+    }
+
+    fn sc_failure(name: &str, reset: &str, actions: &str) -> String {
+        let (c, o) = sc(&["failure", name, "reset=", reset, "actions=", actions]);
+        format!("sc failure reset={reset} actions={actions:?} -> {c:?} {o}")
+    }
+
+    fn p8(label: &'static str, mutate: fn(&Probe) -> String) -> String {
+        let tag = format!("P8[{label}]");
+        let mut p = Probe::new(&tag, &format!("{P8_FAIL}|{P8_FAIL}|{STAY_UP}"), P8_ACTIONS);
+        let _ = p.start();
+        p.connect(0, EXPECTED_BOUND);
+        let stopped = p.wait_state(ServiceState::Stopped, EXPECTED_BOUND);
+        let f1 = p.t0.elapsed();
+        p.p(format_args!(
+            "failure 1 recorded (STOPPED reached: {stopped}); {}",
             p.status()
         ));
+
+        let log = mutate(&p);
+        let (_, q) = sc(&["qfailure", &p.name]);
+        let (_, qf) = sc(&["qfailureflag", &p.name]);
+        let m = p.t0.elapsed();
+        p.p(format_args!(
+            "mutation done {}ms after failure 1: {log}; qfailure: {q}; qfailureflag: {qf}; {}",
+            (m - f1).as_millis(),
+            p.status()
+        ));
+
+        let bound = absence_bound(Duration::from_secs(15));
+        let second = p.connect(1, bound).cloned();
+        let fired = match &second {
+            Some(c) => format!("pending restart FIRED {}ms after failure 1", (c.at - f1).as_millis()),
+            None => format!(
+                "pending restart did NOT fire within {}s of the mutation",
+                bound.as_secs()
+            ),
+        };
+        p.p(format_args!("{fired}"));
+        let mut manual = String::new();
+        let second = if second.is_some() {
+            second
+        } else {
+            manual = format!(" (manual start: {:?})", p.start());
+            p.connect(1, EXPECTED_BOUND).cloned()
+        };
+        // Run 1 fails at once: which action does SCM use for failure 2?
+        let delay2 = match second {
+            None => "run 1 never connected".to_string(),
+            Some(_) => {
+                p.wait_state(ServiceState::Stopped, EXPECTED_BOUND);
+                let f2 = p.t0.elapsed();
+                p.p(format_args!("failure 2 recorded; {}", p.status()));
+                match p.connect(2, bound) {
+                    Some(c) => format!(
+                        "failure 2 -> restart {}ms later (2000 = count survived, 15000 = count reset)",
+                        (c.at - f2).as_millis()
+                    ),
+                    None => format!("no restart after failure 2 within {}s", bound.as_secs()),
+                }
+            }
+        };
+        let r = format!("{fired}{manual}; {delay2}");
+        p.result(format_args!("{r}; final {}", p.status()));
         r
+    }
+
+    fn mutate_none(_: &Probe) -> String {
+        "no mutation (control)".to_string()
+    }
+
+    fn mutate_a_sc(p: &Probe) -> String {
+        sc_failure(&p.name, "86400", P8_ACTIONS)
+    }
+
+    fn mutate_a_api(p: &Probe) -> String {
+        set_actions_api(&p.name, &restart_actions(), 86400)
+    }
+
+    fn mutate_b_sc(p: &Probe) -> String {
+        let a = sc_failure(&p.name, "0", "");
+        let (_, mid) = sc(&["qfailure", &p.name]);
+        let b = sc_failure(&p.name, "86400", P8_ACTIONS);
+        format!("{a}; qfailure between: {mid}; restore: {b}")
+    }
+
+    fn mutate_b_api(p: &Probe) -> String {
+        let a = set_actions_api(&p.name, &[], 0);
+        let (_, mid) = sc(&["qfailure", &p.name]);
+        let b = set_actions_api(&p.name, &restart_actions(), 86400);
+        format!("empty: {a}; qfailure between: {mid}; restore: {b}")
+    }
+
+    fn mutate_c_sc(p: &Probe) -> String {
+        let (c0, o0) = sc(&["failureflag", &p.name, "0"]);
+        let (_, mid) = sc(&["qfailureflag", &p.name]);
+        let (c1, o1) = sc(&["failureflag", &p.name, "1"]);
+        format!("failureflag 0 -> {c0:?} {o0}; between: {mid}; failureflag 1 -> {c1:?} {o1}")
     }
 
     // Driver ==========================================================================================================
@@ -592,33 +674,14 @@ mod probes {
     pub fn run_all() {
         type Job = Box<dyn FnOnce() -> String + Send>;
         let jobs: Vec<(&'static str, Job)> = vec![
-            ("P1[w32-13]", Box::new(|| p1("w32-13", "stopped:w32:13"))),
-            ("P1[w32-31]", Box::new(|| p1("w32-31", "stopped:w32:31"))),
-            ("P1[w32-1003]", Box::new(|| p1("w32-1003", "stopped:w32:1003"))),
-            ("P1[spec-3]", Box::new(|| p1("spec-3", "stopped:spec:3"))),
-            ("P1[spec-7]", Box::new(|| p1("spec-7", "stopped:spec:7"))),
-            (
-                "P1[spec-0xC0000005]",
-                Box::new(|| p1("spec-0xC0000005", "stopped:spec:0xC0000005")),
-            ),
-            ("P2[1003]", Box::new(|| p2("1003", "w32:1003"))),
-            ("P2[baseline-0]", Box::new(|| p2("baseline-0", "w32:0"))),
-            (
-                "P3[a-stopped-w32-2]",
-                Box::new(|| p3("a-stopped-w32-2", "pending,stopped:w32:2")),
-            ),
-            ("P3[b-exit-1]", Box::new(|| p3("b-exit-1", "pending,exit:1"))),
-            ("P4[stop]", Box::new(p4_stop)),
-            ("P4[start-then-stop]", Box::new(p4_start_stop)),
-            (
-                "P5[spec7-then-exit0]",
-                Box::new(|| p5("spec7-then-exit0", "run,connect,stopped:spec:7,exit:0")),
-            ),
-            (
-                "P5[w32-0-then-exit7]",
-                Box::new(|| p5("w32-0-then-exit7", "run,connect,stopped:w32:0,exit:7")),
-            ),
-            ("P6", Box::new(p6)),
+            ("P7", Box::new(p7)),
+            ("P7b", Box::new(p7b)),
+            ("P8[control]", Box::new(|| p8("control", mutate_none))),
+            ("P8[a-sc]", Box::new(|| p8("a-sc", mutate_a_sc))),
+            ("P8[a-api]", Box::new(|| p8("a-api", mutate_a_api))),
+            ("P8[b-sc]", Box::new(|| p8("b-sc", mutate_b_sc))),
+            ("P8[b-api]", Box::new(|| p8("b-api", mutate_b_api))),
+            ("P8[c-sc]", Box::new(|| p8("c-sc", mutate_c_sc))),
         ];
         let handles: Vec<_> = jobs
             .into_iter()
