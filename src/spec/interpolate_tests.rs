@@ -1,4 +1,7 @@
-use super::{check_spec_grammar, reject_interpolated_id, scalar, spec, spec_would_change, would_substitution_change};
+use super::{
+    check_spec_grammar, reject_interpolated_id, scalar, spec, spec_resolvable, spec_would_change,
+    would_substitution_change,
+};
 use crate::error::Error;
 use crate::spec::resolve::resolve_user;
 use crate::spec::vars::Vars;
@@ -253,6 +256,34 @@ fn interpolate_yaml(yaml: &str, pairs: &[(&str, &str)]) -> Result<RawSpec, Error
     let mut entry = raw.daemons.remove("frpc").expect("fixture must declare `frpc`");
     spec(&mut entry, "daemons.frpc", &Vars::from_pairs(pairs))?;
     Ok(entry)
+}
+
+#[skuld::test]
+fn spec_resolvable_substitutes_what_resolves_and_leaves_the_rest_authored() {
+    let yaml = r#"
+daemons:
+  frpc:
+    name: ${NAME}
+    command: ["/bin/${GOOD}", "${MISSING}"]
+    cwd: ${MISSING}
+    env: { A: "${GOOD}", B: "${MISSING}" }
+    restart: ${RESTART}
+"#;
+    let mut raw: RawManifest = yaml_serde::from_str(yaml).expect("fixture yaml should parse");
+    let mut entry = raw.daemons.remove("frpc").expect("fixture must declare `frpc`");
+    let vars = Vars::from_pairs(&[("NAME", "n"), ("GOOD", "g"), ("RESTART", "always")]);
+    spec_resolvable(&mut entry, "daemons.frpc", &vars);
+
+    assert_eq!(entry.name.as_deref(), Some("n"));
+    assert_eq!(entry.restart.as_deref(), Some("always"));
+    assert_eq!(entry.env["A"], "g");
+    // A field with a failing leaf stays whole and authored.
+    assert_eq!(entry.env["B"], "${MISSING}");
+    assert_eq!(entry.cwd.as_deref(), Some("${MISSING}"));
+    assert_eq!(
+        entry.command.as_deref(),
+        Some(&["/bin/${GOOD}".to_string(), "${MISSING}".to_string()][..])
+    );
 }
 
 #[skuld::test]

@@ -158,6 +158,10 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> ScmRe
         Kind::Simple => None,
         Kind::Managed => match spec.restart {
             Restart::Never => None,
+            // `spec::resolve` refuses `Always` for `scm`, so no new manifest
+            // reaches this arm. A blob written by 0.1.0 still can, and
+            // `classify` regenerates from it to detect drift: the arm keeps
+            // 0.1.0's output, so such a service is not reported modified.
             Restart::OnFailure | Restart::Always => {
                 let delay = spec.restart_delay.unwrap_or(DEFAULT_RESTART_DELAY);
                 Some(FailureActions {

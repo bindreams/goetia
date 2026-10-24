@@ -734,17 +734,20 @@ fn managed_kind_with_restart_never_has_no_failure_actions() {
     );
 }
 
+/// `spec::resolve` refuses `restart: always` for `scm`, but a service installed
+/// by 0.1.0 still carries it in its blob, and `classify` regenerates from that
+/// blob to detect drift. The generator must neither panic nor produce anything
+/// but 0.1.0's recovery actions, or every such service would read as modified.
 #[skuld::test]
-fn managed_kind_restart_always_also_sets_failure_actions() {
-    let mut spec = managed_spec();
-    spec.restart = Restart::Always;
-    let reg = build(&spec);
+fn managed_kind_restart_always_keeps_the_on_failure_recovery_actions() {
+    let mut always = managed_spec();
+    always.restart = Restart::Always;
+    let mut on_failure = managed_spec();
+    on_failure.restart = Restart::OnFailure;
 
-    assert!(
-        reg.failure_actions.is_some(),
-        "restart: always is approximated by the same recovery action as on-failure on SCM \
-         (accepted divergence: SCM recovery never fires after a clean exit)"
-    );
+    let actions = build(&always).failure_actions;
+    assert!(actions.is_some(), "0.1.0 registered recovery actions for `always`");
+    assert_eq!(actions, build(&on_failure).failure_actions);
 }
 
 #[skuld::test]

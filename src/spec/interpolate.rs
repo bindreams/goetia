@@ -310,6 +310,31 @@ pub(crate) fn reject_interpolated_id(id: &str) -> Result<()> {
 /// native backend's `merged_for` result, which becomes the returned spec,
 /// and on the base spec the non-native backends' advisories read.
 pub(crate) fn spec(raw: &mut RawSpec, path: &str, vars: &Vars) -> Result<()> {
+    substitute_spec(raw, path, vars, false)
+}
+
+/// [`spec`], except a field that cannot be substituted (an undefined
+/// variable, a `$` in an `env` name) keeps its authored text and the walk
+/// goes on. The fields that do resolve end up substituted, so one failing
+/// field cannot hide what the others say.
+pub(crate) fn spec_resolvable(raw: &mut RawSpec, path: &str, vars: &Vars) {
+    substitute_spec(raw, path, vars, true).expect("a lenient walk never fails");
+}
+
+/// The walk behind [`spec`] and [`spec_resolvable`]. Every field is
+/// substituted into a copy and stored only on success, so a failing field is
+/// left exactly as authored, never half-substituted.
+fn substitute_spec(raw: &mut RawSpec, path: &str, vars: &Vars, lenient: bool) -> Result<()> {
+    // `settle` turns a field's failure into "keep the authored text" when
+    // `lenient`, and into the walk's failure otherwise.
+    fn settle<T>(result: Result<T>, lenient: bool) -> Result<Option<T>> {
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(_) if lenient => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
     // Destructured rather than field-accessed on purpose: a field added to
     // `RawSpec` stops compiling here until someone decides whether it
     // interpolates. A walk that reads fields by name would silently skip
@@ -329,26 +354,40 @@ pub(crate) fn spec(raw: &mut RawSpec, path: &str, vars: &Vars) -> Result<()> {
     } = raw;
     debug_assert!(backend_specific.is_empty(), "interpolation runs on merged specs only");
 
-    substitute_option(name, &format!("{path}.name"), vars)?;
-    for (index, arg) in command.iter_mut().flatten().enumerate() {
-        *arg = scalar(arg, &format!("{path}.command[{index}]"), vars)?;
+    settle(substitute_option(name, &format!("{path}.name"), vars), lenient)?;
+    if let Some(args) = command {
+        let substituted = args
+            .iter()
+            .enumerate()
+            .map(|(index, arg)| scalar(arg, &format!("{path}.command[{index}]"), vars))
+            .collect::<Result<Vec<_>>>();
+        if let Some(substituted) = settle(substituted, lenient)? {
+            *args = substituted;
+        }
     }
-    substitute_option(cwd, &format!("{path}.cwd"), vars)?;
-    substitute_option(logs, &format!("{path}.logs"), vars)?;
+    settle(substitute_option(cwd, &format!("{path}.cwd"), vars), lenient)?;
+    settle(substitute_option(logs, &format!("{path}.logs"), vars), lenient)?;
 
     for (key, value) in env.iter_mut() {
         let key_path = format!("{path}.env[{key:?}]");
-        if would_substitution_change(key) {
-            return Err(interpolate_error(&key_path, ENV_NAME_MESSAGE.to_string()));
+        let substituted = if would_substitution_change(key) {
+            Err(interpolate_error(&key_path, ENV_NAME_MESSAGE.to_string()))
+        } else {
+            scalar(value, &key_path, vars)
+        };
+        if let Some(substituted) = settle(substituted, lenient)? {
+            *value = substituted;
         }
-        *value = scalar(value, &key_path, vars)?;
     }
 
-    substitute_user(user, path, vars)?;
+    settle(substitute_user(user, path, vars), lenient)?;
 
-    substitute_option(restart, &format!("{path}.restart"), vars)?;
-    substitute_option(restart_delay, &format!("{path}.restart-delay"), vars)?;
-    substitute_option(kind, &format!("{path}.type"), vars)?;
+    settle(substitute_option(restart, &format!("{path}.restart"), vars), lenient)?;
+    settle(
+        substitute_option(restart_delay, &format!("{path}.restart-delay"), vars),
+        lenient,
+    )?;
+    settle(substitute_option(kind, &format!("{path}.type"), vars), lenient)?;
 
     Ok(())
 }
