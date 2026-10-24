@@ -1,12 +1,13 @@
 //! THROWAWAY (issue #59, phase A): measures how the Windows SCM treats a
 //! service's reported exit, so the shim's design rests on measurements.
-//! Round 4: P12 (DeleteService with a restart pending). Never merges. Every observation is a `PROBE ...` line in the job log.
+//! Round 5: P13 (STOP and notify after DeleteService; STOP during START_PENDING). Never merges. Every observation is a `PROBE ...` line in the job log.
 //!
 //! This binary is also the service host: `<exe> --probe-host <name> <port> <scripts>`
 //! where `<scripts>` is `|`-separated, one script per run of the service
 //! (run index kept in `%ProgramData%\<name>.runs`; the last script repeats).
 //! A script is `,`-separated steps: `pending`, `run`, `connect`, `wait-stop`,
-//! `stopped:w32:<n>`, `stopped:spec:<n>`, `rawstopped:<w32>:<spec>`, `exit:<n>`.
+//! `stopped:w32:<n>`, `stopped:spec:<n>`, `rawstopped:<w32>:<spec>`, `exit:<n>`,
+//! `hold:<ms>` (stay in the state reported so far, e.g. START_PENDING).
 //!
 //! Absence is shown with a bound (a one-off attended measurement; the result
 //! is read by a human as "no restart within N s", not as proof).
@@ -127,6 +128,7 @@ mod host {
                     }
                 }
                 ["wait-stop"] => stop_rx.recv().expect("stop control"),
+                ["hold", ms] => std::thread::sleep(Duration::from_millis(u64::from(code(ms)))),
                 ["stopped", kind, n] => {
                     let n = code(n);
                     let exit_code = match *kind {
@@ -1206,15 +1208,203 @@ mod probes {
         r
     }
 
+    // P13 =============================================================================================================
+
+    /// `ControlService(STOP)` through a raw handle: the Win32 error (or Ok)
+    /// and the `SERVICE_STATUS` it filled in.
+    fn control_stop(svc: &Service) -> String {
+        let mut st: Services::SERVICE_STATUS = unsafe { std::mem::zeroed() };
+        let ok = unsafe { Services::ControlService(svc.raw_handle(), Services::SERVICE_CONTROL_STOP, &mut st) };
+        let res = if ok != 0 {
+            "Ok".to_string()
+        } else {
+            let e = std::io::Error::last_os_error();
+            format!("Err {:?} ({e})", e.raw_os_error())
+        };
+        format!(
+            "{res}; SERVICE_STATUS state={} win32={} specific={} checkpoint={} waithint={} accepts={:#x}",
+            st.dwCurrentState,
+            st.dwWin32ExitCode,
+            st.dwServiceSpecificExitCode,
+            st.dwCheckPoint,
+            st.dwWaitHint,
+            st.dwControlsAccepted
+        )
+    }
+
+    fn query_via(svc: &Service) -> String {
+        raw_query(svc)
+            .map(|s| fmt_raw(&s))
+            .unwrap_or_else(|e| format!("query error {e}"))
+    }
+
+    fn wait_state_via(svc: &Service, state: u32, bound: Duration) -> bool {
+        let deadline = Instant::now() + bound;
+        loop {
+            if raw_query(svc).is_ok_and(|s| s.dwCurrentState == state) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Register a one-shot `NotifyServiceStatusChangeW` for `mask` on `svc`;
+    /// returns the return code and the (leaked) context.
+    fn register_notify(p: &Probe, svc: &Service, mask: u32) -> (u32, &'static NotifyCtx) {
+        let ctx: &'static NotifyCtx = Box::leak(Box::new(NotifyCtx {
+            tag: p.tag.clone(),
+            t0: p.t0,
+            last: AtomicU32::new(0),
+            fired: AtomicBool::new(false),
+            err: AtomicU32::new(0),
+            count: AtomicU32::new(0),
+        }));
+        let buf = Box::into_raw(Box::new(Services::SERVICE_NOTIFY_2W {
+            dwVersion: Services::SERVICE_NOTIFY_STATUS_CHANGE,
+            pfnNotifyCallback: Some(on_notify),
+            pContext: (ctx as *const NotifyCtx).cast_mut().cast(),
+            ..Default::default()
+        }));
+        let rc = unsafe { Services::NotifyServiceStatusChangeW(svc.raw_handle(), mask, buf) };
+        (rc, ctx)
+    }
+
+    /// The APC delivery, run in this thread's alertable wait; at most `bound`.
+    fn await_notify(ctx: &NotifyCtx, bound: Duration) -> bool {
+        let deadline = Instant::now() + bound;
+        while !ctx.fired.load(Ordering::SeqCst) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            unsafe { SleepEx(100, 1) };
+        }
+        true
+    }
+
+    /// A RUNNING host that accepts STOP; `DeleteService`, then (on the same
+    /// handle) a STOPPED notification registration and `ControlService(STOP)`.
+    /// (b) sends the stop from a second handle opened before the delete.
+    fn p13_delete_then_stop(second_handle: bool) -> String {
+        let tag = if second_handle { "P13b" } else { "P13a" };
+        let bound = Duration::from_secs(30);
+        // No tracer or notifier: the probe holds no handle beyond its own.
+        let mut p = Probe::with_observers(tag, STAY_UP, "", false);
+        let _ = p.start();
+        p.connect(0, EXPECTED_BOUND);
+        let h = p.service(ServiceAccess::STOP | ServiceAccess::QUERY_STATUS | ServiceAccess::DELETE);
+        let h2 = second_handle.then(|| p.service(ServiceAccess::STOP | ServiceAccess::QUERY_STATUS));
+        let running = wait_state_via(&h, Services::SERVICE_RUNNING, EXPECTED_BOUND);
+        p.p(format_args!("running: {running}; {}", query_via(&h)));
+
+        let del = h.delete().map_err(|e| format!("{e:?}"));
+        p.p(format_args!(
+            "DeleteService -> {del:?}; status via h: {}",
+            query_via(&h)
+        ));
+        p.p(format_args!("OpenService after delete: {}", open_state(&p.name)));
+
+        // SERVICE_NOTIFY_STOPPED = 0x1.
+        let (rc, ctx) = register_notify(&p, &h, 0x1);
+        p.p(format_args!("NotifyServiceStatusChangeW(STOPPED) on h -> {rc}"));
+
+        let stopper = h2.as_ref().unwrap_or(&h);
+        let stop = control_stop(stopper);
+        p.p(format_args!(
+            "ControlService(STOP) via {} -> {stop}",
+            if second_handle { "second handle" } else { "h" }
+        ));
+
+        let notified = rc == 0 && await_notify(ctx, bound);
+        p.p(format_args!(
+            "notification delivered: {notified} (registration rc {rc}; no delivery within {}s if false); count {}",
+            bound.as_secs(),
+            ctx.count.load(Ordering::SeqCst)
+        ));
+        let stopped = wait_stopped_via(&h, bound);
+        let fin = query_via(&h);
+        p.p(format_args!(
+            "stopped: {stopped} (no change within {}s if false); final status via h: {fin}",
+            bound.as_secs()
+        ));
+        let open_before_close = open_state(&p.name);
+        p.p(format_args!("OpenService with h still open: {open_before_close}"));
+
+        drop(h);
+        let mut mid = String::new();
+        if h2.is_some() {
+            mid = format!("; after h closed, h2 open: {}", open_state(&p.name));
+            p.p(format_args!(
+                "after h closed, second handle still open: {}",
+                open_state(&p.name)
+            ));
+        }
+        drop(h2);
+        let first = open_state(&p.name);
+        p.p(format_args!("immediately after every handle closed: {first}"));
+        let deadline = Instant::now() + bound;
+        while !record_gone(&p.name) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let later = open_state(&p.name);
+        p.p(format_args!(
+            "record check (up to {}s after close): {later}",
+            bound.as_secs()
+        ));
+        let r = format!(
+            "delete {del:?}; notify register rc {rc}, delivered {notified}; ControlService {stop}; stopped {stopped}, final {fin}; with handle open: {open_before_close}{mid}; after close: {first}; later: {later}"
+        );
+        p.result(&r);
+        p.dump_scm_events(tag);
+        r
+    }
+
+    /// STOP during START_PENDING (the host holds it 4 s before RUNNING).
+    fn p13c() -> String {
+        let mut p = Probe::new("P13c", &format!("pending,hold:4000,{STAY_UP}"), "");
+        let _ = p.start();
+        let h = p.service(ServiceAccess::STOP | ServiceAccess::QUERY_STATUS);
+        // The real condition: SCM has left STOPPED (the host reported START_PENDING).
+        while raw_query(&h).is_ok_and(|s| s.dwCurrentState == Services::SERVICE_STOPPED) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let before = query_via(&h);
+        let stop = control_stop(&h);
+        p.p(format_args!("status before stop: {before}"));
+        p.p(format_args!("ControlService(STOP) during START_PENDING -> {stop}"));
+        p.p(format_args!("status after stop: {}", query_via(&h)));
+        let running = wait_state_via(&h, Services::SERVICE_RUNNING, EXPECTED_BOUND);
+        let c = p.connect(0, EXPECTED_BOUND).cloned();
+        p.p(format_args!(
+            "reached RUNNING: {running} (at t={}ms); connect-back: {}; status {}",
+            p.t0.elapsed().as_millis(),
+            describe(c.as_ref(), EXPECTED_BOUND),
+            query_via(&h)
+        ));
+        let bound = Duration::from_secs(10);
+        let stopped = wait_state_via(&h, Services::SERVICE_STOPPED, bound);
+        let fin = query_via(&h);
+        p.p(format_args!(
+            "stopped by the earlier STOP: {stopped} (no change within {}s if false); status {fin}",
+            bound.as_secs()
+        ));
+        let r = format!("ControlService {stop}; reached RUNNING {running}; later stopped {stopped}; final {fin}");
+        p.result(&r);
+        p.dump_scm_events("P13c");
+        r
+    }
+
     // Driver ==========================================================================================================
 
     pub fn run_all() {
         // Sequential: the System-log events of a probe must be its own.
         type Job = Box<dyn FnOnce() -> String + Send>;
         let jobs: Vec<(&'static str, Job)> = vec![
-            ("P12a", Box::new(|| p12('a'))),
-            ("P12b", Box::new(|| p12('b'))),
-            ("P12c", Box::new(|| p12('c'))),
+            ("P13a", Box::new(|| p13_delete_then_stop(false))),
+            ("P13b", Box::new(|| p13_delete_then_stop(true))),
+            ("P13c", Box::new(p13c)),
         ];
         println!("PROBE SUMMARY begin");
         for (name, job) in jobs {
