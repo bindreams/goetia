@@ -432,6 +432,47 @@ daemons:
 }
 
 #[skuld::test]
+fn an_undefined_variable_in_an_overridden_base_field_does_not_hide_a_templated_always() {
+    // `${CMD}` is undefined, but every backend replaces `command`, so it can
+    // never reach an installed spec. It must not stop `${R}` from being read.
+    let yaml = r#"
+daemons:
+  svc:
+    command: ["${CMD}"]
+    restart: ${R}
+    backend-specific:
+      systemd: { command: [/bin/a] }
+      launchd: { command: [/bin/a] }
+      scm:     { command: [/bin/a] }
+"#;
+    let dir = fixture_dir(yaml, Some("R=always\n"));
+    for native in Backend::ALL {
+        let err = resolve_as(parse_manifest(yaml), dir.path(), Some(native)).unwrap_err();
+        assert_names_daemon_reason_and_remedy(&err);
+    }
+}
+
+#[skuld::test]
+fn an_undefined_variable_in_an_overridden_base_field_does_not_hide_an_advisory() {
+    // Same hiding, for an advisory: `restart-delay: ${DELAY}` resolves, so the
+    // launchd rounding advisory is owed exactly as for the literal `500ms`.
+    let literal = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    restart-delay: 500ms\n";
+    let templated = "daemons:\n  frpc:\n    command: [\"${CMD}\"]\n    restart-delay: ${DELAY}\n    \
+                     backend-specific:\n      systemd: { command: [/bin/frpc] }\n      \
+                     launchd: { command: [/bin/frpc] }\n      scm: { command: [/bin/frpc] }\n";
+    let dir = fixture_dir("", Some("DELAY=500ms\n"));
+    let native = Some(Backend::Systemd);
+    let (_specs, from_literal) = resolve_as(parse_manifest(literal), dir.path(), native).expect("resolves");
+    let (_specs, from_env) = resolve_as(parse_manifest(templated), dir.path(), native).expect("resolves");
+    assert_eq!(
+        from_literal.len(),
+        1,
+        "launchd's rounding advisory is owed: {from_literal:?}"
+    );
+    assert_eq!(from_env, from_literal);
+}
+
+#[skuld::test]
 fn sub_second_restart_delay_rounds_up_and_warns() {
     let yaml = r#"
 daemons:

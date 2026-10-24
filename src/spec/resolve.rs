@@ -261,10 +261,8 @@ fn resolve_as(
         // not already say.
         let advisory_base = substituted_base(&raw, &path, &vars);
         for (backend, authored) in &swept {
-            let substituted = advisory_base
-                .as_ref()
-                .map(|base| base.merged_for(*backend).0)
-                .and_then(|merged| resolve_shape(&id, merged, base_dir, Phase::Substituted).ok());
+            let substituted =
+                resolve_shape(&id, advisory_base.merged_for(*backend).0, base_dir, Phase::Substituted).ok();
             let view = substituted.as_ref().map_or(authored, |(shaped, _)| shaped);
             // Judged here, on the view that also carries the substituted
             // base, so a `restart: ${R}` whose `.env` says `always` is
@@ -343,16 +341,16 @@ pub fn load(path: &Path) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
 /// [`RawSpec::merged_for`] can layer an authored override on top of it —
 /// the spec step 5a's advisories read.
 ///
-/// `None` when substitution fails, and the caller then falls back to the
-/// authored spec step 4 shaped. Step 2 gates `vars` on this spec as well as
-/// on the merged native one, so the ordinary reasons to fail are a `.env`
-/// that could not be read and a variable it does not define — neither an
-/// error here, because an advisory this host cannot compute is silent.
-fn substituted_base(raw: &RawSpec, path: &str, vars: &Vars) -> Option<RawSpec> {
+/// Substituted field by field: a field that cannot be substituted (a variable
+/// `.env` does not define, an unreadable `.env`) keeps its authored text, so
+/// it cannot hide the fields that do resolve. Step 2 gates `vars` on this
+/// spec as well as on the merged native one. An advisory or verdict this host
+/// cannot compute is silent, not an error.
+fn substituted_base(raw: &RawSpec, path: &str, vars: &Vars) -> RawSpec {
     let mut base = raw.without_overrides();
-    interpolate::spec(&mut base, path, vars).ok()?;
+    interpolate::spec_resolvable(&mut base, path, vars);
     base.backend_specific = raw.backend_specific.clone();
-    Some(base)
+    base
 }
 
 /// Backend annotation for step 4. `Error::Invalid` (from `resolve_shape` or
