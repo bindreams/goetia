@@ -261,8 +261,8 @@ impl StopBus {
     /// already known not to resolve. What it gives up is the guarantee the
     /// join buys on every other path — the daemon is not reaped and may well
     /// still be running — so the outcome is a distinct one, reported as
-    /// `Reported::incomplete_stop` (a distinct process exit code, but `Win32(0)` to SCM, which
-    /// would otherwise start a second daemon) rather than a clean one, with the log above naming which kill failed and how. The
+    /// `Reported::incomplete_stop` (a distinct process exit code, and `Win32(0)` with service-specific
+    /// code 1003 to SCM: any non-zero Win32 code would start a second daemon) rather than a clean one, with the log above naming which kill failed and how. The
     /// detached thread still holds its own `Arc<Child>` clone, so this is
     /// memory-safe, and if the child ever does exit its `wait()` returns and
     /// that clone drops.
@@ -359,7 +359,8 @@ fn kill_tree_failed(e: &cosca::error::Error) -> String {
 fn fallback_kill_failed(e: &cosca::error::Error) -> String {
     format!(
         "fallback kill on stop: {e}; the daemon was neither killed nor reaped and may still be running — \
-         SCM is told the service stopped cleanly (exit code 0) so that it does not start a second copy beside it"
+         SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, \
+         and with service-specific exit code 1003 as the record of this failure"
     )
 }
 

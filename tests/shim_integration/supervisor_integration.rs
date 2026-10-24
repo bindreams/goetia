@@ -8,12 +8,12 @@
 
 use std::collections::BTreeMap;
 
-use goetia::backend::scm::exit_status::ERROR_INVALID_DATA;
+use goetia::backend::scm::exit_status::{ERROR_INVALID_DATA, RecordedExit};
 use goetia::backend::scm::manager::ScmManager;
 use goetia::manager::{Budget, ServiceManager as _};
 use windows_service::service::{ServiceExitCode, ServiceState};
 
-use crate::common::{fixture_command, mk_spec_full, scm_status};
+use crate::common::{fixture_command, mk_spec_full, recorded_exit, scm_status};
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -136,6 +136,12 @@ fn stop_kills_the_whole_process_tree() {
     let stopped = scm_status(&id);
     assert_eq!(stopped.current_state, ServiceState::Stopped, "{stopped:?}");
     assert_eq!(stopped.exit_code, ServiceExitCode::Win32(0), "{stopped:?}");
+    // A clean stop has no service-specific code; an incomplete one reports 1003 beside Win32 0.
+    assert_eq!(
+        recorded_exit(&id),
+        RecordedExit { win32: 0, specific: 0 },
+        "{stopped:?}"
+    );
 }
 
 /// `tasklist /FI "PID eq <pid>"` prints an informational "no tasks found"

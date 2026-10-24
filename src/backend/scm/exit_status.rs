@@ -8,7 +8,9 @@
 //!
 //! Under the failure-actions flag SCM restarts after any `STOPPED` report whose Win32 code is
 //! non-zero, a service-specific code included (it is carried as [`ERROR_SERVICE_SPECIFIC_ERROR`]),
-//! and it does so for a stop it commanded too. A report of `Win32(0)` is never restarted.
+//! and it does so for a stop it commanded too. A report whose Win32 code is 0 is never restarted,
+//! whatever its service-specific code: SCM stores that pair as reported, which is how an incomplete
+//! stop leaves a record without a restart.
 
 /// `argv[1]` (the service id) is missing.
 pub const ERROR_BAD_ARGUMENTS: u32 = 160;
@@ -16,7 +18,8 @@ pub const ERROR_BAD_ARGUMENTS: u32 = 160;
 pub const ERROR_INVALID_DATA: u32 = 13;
 /// A shim failure that carries no usable OS error.
 pub const ERROR_GEN_FAILURE: u32 = 31;
-/// A commanded stop that could not kill the daemon.
+/// A commanded stop that could not kill the daemon: the process exit code, and the service-specific
+/// code of the `STOPPED` report.
 pub const ERROR_CAN_NOT_COMPLETE: u32 = 1003;
 /// The control handler or the dispatcher could not be connected, so nothing is reportable.
 pub const ERROR_FAILED_SERVICE_CONTROLLER_CONNECT: u32 = 1063;
@@ -24,7 +27,8 @@ pub const ERROR_FAILED_SERVICE_CONTROLLER_CONNECT: u32 = 1063;
 pub const ERROR_SERVICE_SPECIFIC_ERROR: u32 = 1066;
 
 /// The Win32 code an incomplete stop reports. Zero, not [`ERROR_CAN_NOT_COMPLETE`]: any non-zero
-/// code queues a restart, which would start a second daemon beside the one that would not die.
+/// code queues a restart, which would start a second daemon beside the one that would not die. The
+/// failure travels in the service-specific code instead.
 const INCOMPLETE_STOP_WIN32: u32 = 0;
 
 /// How a `goetia-shim` run ended, as SCM and the process exit code express it.
@@ -73,27 +77,35 @@ impl Reported {
     }
 
     /// `(win32, service_specific)` for the `STOPPED` report. A daemon failure is
-    /// `(ERROR_SERVICE_SPECIFIC_ERROR, code)`, which is how SCM records a service-specific code.
+    /// `(ERROR_SERVICE_SPECIFIC_ERROR, code)`, which is how SCM records a service-specific code;
+    /// an incomplete stop is `(0, ERROR_CAN_NOT_COMPLETE)`. The pair needs a raw `SetServiceStatus`:
+    /// `windows-service`'s `ServiceExitCode` cannot express a service-specific code beside Win32 0.
     pub fn scm_codes(self) -> (u32, u32) {
         match self {
             Reported::Clean => (0, 0),
             Reported::DaemonExit(code) => (ERROR_SERVICE_SPECIFIC_ERROR, code),
             Reported::ShimFailure(code) => (code, 0),
-            Reported::IncompleteStop => (INCOMPLETE_STOP_WIN32, 0),
+            Reported::IncompleteStop => (INCOMPLETE_STOP_WIN32, ERROR_CAN_NOT_COMPLETE),
         }
     }
 }
 
-/// The exit code SCM holds for a service that reached `STOPPED`: what the shim reported, or
+/// The exit codes SCM holds for a service that reached `STOPPED`: what the shim reported, or
 /// `ERROR_PROCESS_ABORTED` (1067) when its process ended without reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordedExit {
     pub win32: u32,
-    /// Meaningful only when `win32` is [`ERROR_SERVICE_SPECIFIC_ERROR`].
+    /// Meaningful when `win32` is [`ERROR_SERVICE_SPECIFIC_ERROR`], and for an incomplete stop.
     pub specific: u32,
 }
 
 impl RecordedExit {
+    /// Whether this is [`Reported::IncompleteStop`]: a commanded stop that could not kill the
+    /// daemon, which may still be running.
+    pub fn incomplete_stop(self) -> bool {
+        (self.win32, self.specific) == Reported::IncompleteStop.scm_codes()
+    }
+
     /// Whether the shim launched the daemon and the daemon then ended: a daemon exit
     /// ([`Reported::Clean`], [`Reported::DaemonExit`], [`Reported::IncompleteStop`]). Any other
     /// Win32 code is a shim failure before or around the launch.

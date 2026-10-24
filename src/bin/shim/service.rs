@@ -15,6 +15,7 @@
 //! cancellation source) and driving SCM's own status protocol.
 
 use std::ffi::OsString;
+use std::os::windows::io::AsRawHandle as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,6 +30,9 @@ use windows_service::service::{
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult, ServiceStatusHandle};
 use windows_service::{define_windows_service, service_dispatcher};
+use windows_sys::Win32::System::Services::{
+    SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOPPED, SERVICE_WIN32_OWN_PROCESS, SetServiceStatus,
+};
 
 use crate::logging;
 use crate::stop_bus::{StopBus, WaitOutcome, Waiter};
@@ -113,16 +117,24 @@ fn run_service(id: &str) {
 /// Tell SCM the service stopped, then end the process. SCM restarts the service or not from
 /// the status reported here, never from the process exit code.
 fn finish(id: &str, status_handle: &ServiceStatusHandle, reported: Reported) -> ! {
-    report_stopped(id, status_handle, service_exit_code(reported));
+    report_stopped(id, status_handle, reported);
     std::process::exit(reported.process_exit_code());
 }
 
-/// `reported` as the `ServiceExitCode` SCM records: a daemon's own failure is service-specific,
-/// everything else is a Win32 code.
-fn service_exit_code(reported: Reported) -> ServiceExitCode {
-    match reported.scm_codes() {
-        (_, specific) if specific != 0 => ServiceExitCode::ServiceSpecific(specific),
-        (win32, _) => ServiceExitCode::Win32(win32),
+/// The `STOPPED` status SCM is told for `reported`, with the exact `(win32, specific)` pair of
+/// [`Reported::scm_codes`]. Built raw because `windows-service`'s `ServiceExitCode` cannot express
+/// a service-specific code beside Win32 0, which is how an incomplete stop leaves a record without
+/// a restart.
+fn stopped_status(reported: Reported) -> SERVICE_STATUS {
+    let (win32, specific) = reported.scm_codes();
+    SERVICE_STATUS {
+        dwServiceType: SERVICE_WIN32_OWN_PROCESS,
+        dwCurrentState: SERVICE_STOPPED,
+        dwControlsAccepted: 0,
+        dwWin32ExitCode: win32,
+        dwServiceSpecificExitCode: specific,
+        dwCheckPoint: 0,
+        dwWaitHint: 0,
     }
 }
 
@@ -160,16 +172,13 @@ fn report_running(id: &str, handle: &ServiceStatusHandle) {
     }
 }
 
-fn report_stopped(id: &str, handle: &ServiceStatusHandle, exit_code: ServiceExitCode) {
-    if let Err(e) = handle.set_service_status(ServiceStatus {
-        service_type: ServiceType::OWN_PROCESS,
-        current_state: ServiceState::Stopped,
-        controls_accepted: ServiceControlAccept::empty(),
-        exit_code,
-        checkpoint: 0,
-        wait_hint: Duration::default(),
-        process_id: None,
-    }) {
+fn report_stopped(id: &str, handle: &ServiceStatusHandle, reported: Reported) {
+    let status = stopped_status(reported);
+    // SAFETY: `handle` wraps the live `SERVICE_STATUS_HANDLE` that `RegisterServiceCtrlHandlerExW`
+    // returned (it stays valid for the life of the process), and `status` outlives the call.
+    let ok = unsafe { SetServiceStatus(handle.as_raw_handle() as SERVICE_STATUS_HANDLE, &status) };
+    if ok == 0 {
+        let e = std::io::Error::last_os_error();
         logging::log_failure(id, &format!("report SERVICE_STOPPED to SCM: {e}"));
     }
 }

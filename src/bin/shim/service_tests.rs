@@ -8,8 +8,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use cosca::identity::Liveness;
-use goetia::backend::scm::exit_status::{ERROR_GEN_FAILURE, ERROR_SERVICE_SPECIFIC_ERROR, Reported};
+use goetia::backend::scm::exit_status::{
+    ERROR_CAN_NOT_COMPLETE, ERROR_GEN_FAILURE, ERROR_SERVICE_SPECIFIC_ERROR, Reported,
+};
 use goetia::spec::{Id, Kind, Restart, User};
+use windows_sys::Win32::System::Services::SERVICE_STOPPED;
 
 use super::*;
 use crate::logging::test_hook::take;
@@ -405,7 +408,7 @@ fn an_unkillable_daemon_reports_the_incomplete_stop_failure() {
         &lines[1..],
         id.as_str(),
         &format!(
-            "fallback kill on stop: {KILL_REFUSED}; the daemon was neither killed nor reaped and may still be running — SCM is told the service stopped cleanly (exit code 0) so that it does not start a second copy beside it"
+            "fallback kill on stop: {KILL_REFUSED}; the daemon was neither killed nor reaped and may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure"
         ),
     );
 }
@@ -435,26 +438,40 @@ fn an_unobtainable_exit_status_is_a_shim_failure() {
 }
 
 #[skuld::test]
-fn each_report_maps_to_the_service_exit_code_scm_records() {
-    assert_eq!(service_exit_code(Reported::Clean), ServiceExitCode::Win32(0));
-    assert_eq!(
-        service_exit_code(Reported::DaemonExit(7)),
-        ServiceExitCode::ServiceSpecific(7)
-    );
-    assert_eq!(
-        service_exit_code(Reported::shim_failure(Some(13))),
-        ServiceExitCode::Win32(13)
-    );
-    assert_eq!(
-        service_exit_code(Reported::incomplete_stop()),
-        ServiceExitCode::Win32(0),
-        "any non-zero code on a commanded stop makes SCM start a second daemon"
-    );
+fn each_report_maps_to_the_exit_codes_scm_records() {
+    let codes = |reported| {
+        let status = stopped_status(reported);
+        (status.dwWin32ExitCode, status.dwServiceSpecificExitCode)
+    };
+
+    assert_eq!(codes(Reported::Clean), (0, 0));
+    assert_eq!(codes(Reported::DaemonExit(7)), (ERROR_SERVICE_SPECIFIC_ERROR, 7));
+    assert_eq!(codes(Reported::shim_failure(Some(13))), (13, 0));
     assert_ne!(
-        service_exit_code(Reported::shim_failure(Some(ERROR_SERVICE_SPECIFIC_ERROR as i32))),
-        ServiceExitCode::Win32(ERROR_SERVICE_SPECIFIC_ERROR),
+        codes(Reported::shim_failure(Some(ERROR_SERVICE_SPECIFIC_ERROR as i32))).0,
+        ERROR_SERVICE_SPECIFIC_ERROR,
         "1066 reads as a daemon's code"
     );
+}
+
+#[skuld::test]
+fn an_incomplete_stop_is_reported_as_win32_zero_with_specific_1003() {
+    // Win32 0 is what keeps SCM from starting a second daemon beside the one that would not die;
+    // the specific code is the record `sc query` and the manager can read.
+    let status = stopped_status(Reported::incomplete_stop());
+
+    assert_eq!(
+        (status.dwWin32ExitCode, status.dwServiceSpecificExitCode),
+        (0, ERROR_CAN_NOT_COMPLETE)
+    );
+}
+
+#[skuld::test]
+fn a_stopped_report_is_stopped_and_accepts_no_control() {
+    let status = stopped_status(Reported::Clean);
+
+    assert_eq!(status.dwCurrentState, SERVICE_STOPPED);
+    assert_eq!(status.dwControlsAccepted, 0);
 }
 
 #[skuld::test]

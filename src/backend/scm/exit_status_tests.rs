@@ -73,12 +73,13 @@ fn a_zero_daemon_code_is_clean() {
 }
 
 #[skuld::test]
-fn an_incomplete_stop_reports_win32_zero_so_scm_does_not_restart_it() {
-    // SCM restarts after a commanded stop that reports any non-zero code, and an incomplete stop
-    // leaves a daemon that may still be alive.
+fn an_incomplete_stop_reports_win32_zero_and_the_specific_code_1003() {
+    // SCM restarts after a commanded stop that reports a non-zero Win32 code, and an incomplete stop
+    // leaves a daemon that may still be alive. A non-zero service-specific code beside Win32 0 is
+    // stored as reported and never queues recovery, so it is the visible record that costs no restart.
     let reported = Reported::incomplete_stop();
 
-    assert_eq!(reported.scm_codes(), (0, 0));
+    assert_eq!(reported.scm_codes(), (0, ERROR_CAN_NOT_COMPLETE));
     assert_eq!(reported.process_exit_code(), ERROR_CAN_NOT_COMPLETE as i32);
 }
 
@@ -121,4 +122,22 @@ fn a_service_that_died_without_reporting_did_not_run_a_daemon() {
         }
         .daemon_ran()
     );
+}
+
+#[skuld::test]
+fn only_win32_zero_with_specific_1003_is_an_incomplete_stop() {
+    let recorded = |reported: Reported| {
+        let (win32, specific) = reported.scm_codes();
+        RecordedExit { win32, specific }
+    };
+
+    assert!(recorded(Reported::incomplete_stop()).incomplete_stop());
+    for other in [
+        Reported::Clean,
+        Reported::DaemonExit(ERROR_CAN_NOT_COMPLETE),
+        Reported::shim_failure(Some(ERROR_CAN_NOT_COMPLETE as i32)),
+        Reported::shim_failure(None),
+    ] {
+        assert!(!recorded(other).incomplete_stop(), "{other:?}");
+    }
 }

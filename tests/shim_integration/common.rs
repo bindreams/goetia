@@ -5,6 +5,7 @@ use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use goetia::backend::scm::exit_status::RecordedExit;
 use goetia::spec::{DaemonSpec, Id, Kind, Restart, User};
 use windows_service::service::{ServiceAccess, ServiceState, ServiceStatus};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
@@ -71,6 +72,32 @@ pub fn scm_status(id: &str) -> ServiceStatus {
         .unwrap_or_else(|e| panic!("open service {id}: {e}"))
         .query_status()
         .unwrap_or_else(|e| panic!("query status of {id}: {e}"))
+}
+
+/// Both exit codes SCM holds for `id`, from `sc query`. `ServiceStatus::exit_code` cannot show a
+/// service-specific code beside Win32 0, which is exactly what tells a clean stop from an
+/// incomplete one.
+pub fn recorded_exit(id: &str) -> RecordedExit {
+    let query = support::cmd::run("sc.exe", &["query", id]).expect_ok();
+    let field = |name: &str| -> u32 {
+        query
+            .stdout
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                (key.trim() == name).then(|| value.split_whitespace().next()?.parse().ok())?
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "no numeric `{name}` in:
+{query}"
+                )
+            })
+    };
+    RecordedExit {
+        win32: field("WIN32_EXIT_CODE"),
+        specific: field("SERVICE_EXIT_CODE"),
+    }
 }
 
 /// `taskkill /F` on `pid`: the way a test ends a shim or a daemon without telling either.

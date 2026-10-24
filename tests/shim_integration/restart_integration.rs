@@ -11,14 +11,14 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use goetia::backend::scm::exit_status::ERROR_SERVICE_SPECIFIC_ERROR;
+use goetia::backend::scm::exit_status::{ERROR_SERVICE_SPECIFIC_ERROR, RecordedExit};
 use goetia::backend::scm::manager::ScmManager;
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, ServiceManager as _};
 use goetia::spec::{DaemonSpec, Restart};
 use windows_service::service::{ServiceExitCode, ServiceState};
 
-use crate::common::{ShimProcess, fixture_command, kill_process, mk_spec_full, scm_status};
+use crate::common::{ShimProcess, fixture_command, kill_process, mk_spec_full, recorded_exit, scm_status};
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
 
 const ONE_SECOND: Option<Duration> = Some(Duration::from_secs(1));
@@ -282,6 +282,12 @@ fn a_commanded_stop_reports_win32_zero() {
     let stopped = scm_status(&id);
     assert_eq!(stopped.current_state, ServiceState::Stopped, "{stopped:?}");
     assert_eq!(stopped.exit_code, ServiceExitCode::Win32(0), "{stopped:?}");
+    // Win32 0 alone would also be an incomplete stop, which adds service-specific 1003.
+    assert_eq!(
+        recorded_exit(&id),
+        RecordedExit { win32: 0, specific: 0 },
+        "{stopped:?}"
+    );
 }
 
 // Services registered by an earlier version ===========================================================================

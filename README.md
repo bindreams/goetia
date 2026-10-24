@@ -657,17 +657,19 @@ different goetia version registered and `restart` is not `never`.
 `sc query` shows the difference between your command failing and the shim
 failing:
 
-| What happened                      | Exit code SCM records                                                          |
+| What happened                      | `WIN32_EXIT_CODE`, `SERVICE_EXIT_CODE` SCM records                             |
 | ---------------------------------- | ------------------------------------------------------------------------------ |
-| command exited `0`, or was stopped | `0`                                                                            |
-| command exited `n`, not `0`        | service-specific `n` (`WIN32_EXIT_CODE` `1066`)                                |
+| command exited `0`, or was stopped | `0`, `0`                                                                       |
+| command exited `n`, not `0`        | `1066`, `n` (a service-specific code)                                          |
 | the shim could not run the command | a Win32 code: the OS error, `13` for an unreadable spec, `31` if there is none |
+| `stop` could not kill the command  | `0`, `1003`                                                                    |
 
 Under `on-failure` both failures are restarted, so a spec the shim cannot read
 or a command that is missing retries at `restart-delay` indefinitely, as it
 does for `type: managed`. If the shim cannot kill the command on `stop`, it
-logs both failed kills and still reports the stop as clean, because a failure
-code would make SCM start a second copy.
+logs both failed kills and reports the stop with Win32 code `0`, because a
+non-zero Win32 code would make SCM start a second copy; the service-specific
+code `1003` is the record that the command may still be running.
 
 ### What returning means
 
@@ -689,7 +691,8 @@ confirms differs:
   cannot start is a failed start under every `restart:` policy. A command that
   starts and then exits at once is a successful start, whatever its exit code,
   as with `systemctl start`; it is the command's exit, not `start`, that
-  reports it.
+  reports it. For a `type: managed` daemon, which speaks to SCM itself, a
+  service that stops before it reports running is a failed start.
 - **launchd** sits between the two: the pid `launchctl kickstart -p` reports
   is launchd's own fork, taken before the user process reaches its `exec`.
 

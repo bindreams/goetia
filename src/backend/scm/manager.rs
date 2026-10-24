@@ -207,7 +207,7 @@ impl ServiceManager for ScmManager {
             // more, per the trait doc comment.
             return super::wait::request_start(&mut actor).map_err(|e| Error::Other(format!("start `{id}`: {e}")));
         }
-        let waited = super::wait::start_via_notify(&mut actor, deadline)
+        let waited = super::wait::start_via_notify(&mut actor, deadline, installed_kind(id))
             .map_err(|e| Error::Other(format!("start `{id}`: {e}")))?;
         match waited {
             Waited::Confirmed => Ok(()),
@@ -374,6 +374,20 @@ fn classify_scan(scan: registry::ServiceScan) -> Result<Vec<Installed>> {
 pub fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
     let params = registry::read_parameters(id)?;
     generate::extract(&params)
+}
+
+/// The kind `start_via_notify` reads a `Stopped`-before-`Running` by. Only a decodable blob that
+/// says `type: simple` selects the shim's vocabulary; an unreadable one reads as strictly as
+/// `type: managed`, which is what a shim that cannot decode it reports anyway (a failed start).
+fn start_kind(blob: Result<Option<Blob>>) -> Kind {
+    match blob {
+        Ok(Some(blob)) => blob.spec.kind,
+        Ok(None) | Err(_) => Kind::Managed,
+    }
+}
+
+fn installed_kind(id: &Id) -> Kind {
+    start_kind(read_spec_blob(id.as_str()))
 }
 
 // discover ============================================================================================================

@@ -514,3 +514,32 @@ fn install_accepts_every_other_restart() {
         refuse_always(&daemon_spec(restart)).unwrap();
     }
 }
+
+// start_kind ----------------------------------------------------------------------------------------------------------
+
+fn blob_of(kind: Kind) -> Blob {
+    Blob {
+        schema: 1,
+        version: "0.1.0".to_string(),
+        spec: DaemonSpec {
+            id: Id::try_from("frpc").unwrap(),
+            name: "frpc".to_string(),
+            command: vec!["frpc".to_string()],
+            cwd: None,
+            env: BTreeMap::new(),
+            user: crate::spec::User::Root,
+            restart: Restart::Never,
+            restart_delay: None,
+            logs: None,
+            kind,
+        },
+    }
+}
+
+#[skuld::test]
+fn start_reads_a_simple_service_by_the_shims_vocabulary_and_anything_else_strictly() {
+    assert_eq!(start_kind(Ok(Some(blob_of(Kind::Simple)))), Kind::Simple);
+    assert_eq!(start_kind(Ok(Some(blob_of(Kind::Managed)))), Kind::Managed);
+    assert_eq!(start_kind(Ok(None)), Kind::Managed);
+    assert_eq!(start_kind(Err(Error::Blob("corrupt".to_string()))), Kind::Managed);
+}

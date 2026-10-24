@@ -170,7 +170,7 @@ fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_k
         &lines[1..],
         id.as_str(),
         &format!(
-            "fallback kill on stop: {KILL_REFUSED}; the daemon was neither killed nor reaped and may still be running — SCM is told the service stopped cleanly (exit code 0) so that it does not start a second copy beside it"
+            "fallback kill on stop: {KILL_REFUSED}; the daemon was neither killed nor reaped and may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure"
         ),
     );
 }
