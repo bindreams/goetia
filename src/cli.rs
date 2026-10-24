@@ -162,8 +162,8 @@ pub enum DaemonCommand {
 ///   request goetia lost track of, which may or may not have reached the
 ///   manager, or reached it with its outcome unconfirmed, and so does
 ///   [`Error::RestartPending`](crate::error::Error::RestartPending), for a
-///   `stop` that found a restart queued by the manager and could not wait it
-///   out: nothing was stopped, and the daemon will run again. Reporting the first as `1` would
+///   `stop` that found the manager starting the daemon, or a restart queued by it, and
+///   could not wait that out: nothing was stopped, and the daemon will run again. Reporting the first as `1` would
 ///   claim the operation determinately failed, which it did not establish;
 ///   reporting the second as `1` would make the refusal the whole answer,
 ///   when the unconfirmed stop before it leaves where the daemon ended up

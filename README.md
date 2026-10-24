@@ -653,8 +653,9 @@ and stops the command it starts, so the daemon stays down; `restart` stops it
 the same way. A service that is starting refuses a stop, so a `stop` that
 arrives as a restart begins waits for the daemon to be running, then stops it.
 If the restart does not arrive in time, or `--timeout` is `0`, nothing is
-stopped: `stop` exits `4` and says a restart is pending. Run it again with a
-longer `--timeout`, or `--no-timeout`.
+stopped: `stop` exits `4` and says SCM is starting the daemon or has a restart
+queued, and that goetia did not stop it. Run it again with a longer
+`--timeout`, or `--no-timeout`.
 
 `stop` finds out whether a restart is queued from the record SCM keeps of how
 the service last ended, and two sequences make that record wrong:
@@ -741,11 +742,11 @@ stopped waiting; it did not cancel anything, so the request stands and the
 daemon may still arrive. `goetia daemon status <id>` shows the manager's
 current view.
 
-On Windows a `stop` can also exit `4` with nothing issued: the daemon failed
-and SCM has a restart queued or beginning (see [Restarts on
-Windows](#restarts-on-windows)). The restart is the thing to wait for, so
+On Windows a `stop` can also exit `4` with nothing issued: SCM is starting the
+daemon, or has a restart queued after a failure (see [Restarts on
+Windows](#restarts-on-windows)). That is the thing to wait for, so
 `stop --timeout 0` and a `--timeout` that ends before it both exit `4`, and the
-message says that a restart is pending.
+message says that SCM is starting the daemon or has a restart queued.
 
 A `start` of a daemon that is already running is where the three disagree
 under a very short `--timeout`. launchd and SCM say "running" — launchd

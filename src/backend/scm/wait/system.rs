@@ -9,7 +9,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use windows_service::service::{Service, ServiceAccess, ServiceActionType, ServiceExitCode, ServiceState};
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
-use windows_sys::Win32::Foundation::{ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_NOT_ACTIVE, WAIT_IO_COMPLETION};
+use windows_sys::Win32::Foundation::{
+    ERROR_INVALID_SERVICE_CONTROL, ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_CANNOT_ACCEPT_CTRL,
+    ERROR_SERVICE_NOT_ACTIVE, WAIT_IO_COMPLETION,
+};
 use windows_sys::Win32::System::Services::{
     ControlService, NotifyServiceStatusChangeW, SERVICE_CONTROL_STOP, SERVICE_NOTIFY, SERVICE_NOTIFY_2W,
     SERVICE_NOTIFY_RUNNING, SERVICE_NOTIFY_START_PENDING, SERVICE_NOTIFY_STATUS_CHANGE, SERVICE_NOTIFY_STOP_PENDING,
@@ -19,7 +22,7 @@ use windows_sys::Win32::System::Threading::{INFINITE, SleepEx};
 
 use crate::backend::scm::exit_status::{ERROR_SERVICE_SPECIFIC_ERROR, RecordedExit};
 
-use super::{Deadline, Observed, QueriedState, Recovery, StartReply, Waited, WantState};
+use super::{ControlReply, Deadline, Observed, QueriedState, Recovery, StartReply, Waited, WantState};
 
 /// `windows-service`'s `Error` does not implement `Into<io::Error>` for
 /// every variant (it also carries parse errors this module never
@@ -302,26 +305,38 @@ impl super::ScmActor for SystemScmActor {
         Ok(waited)
     }
 
-    fn control_stop(&mut self) -> io::Result<()> {
+    fn control_stop(&mut self) -> io::Result<ControlReply> {
         let mut status = SERVICE_STATUS::default();
         // SAFETY: `self.service()?.raw_handle()` was opened with
         // `SERVICE_STOP` access; `status` is a valid, aligned out-param.
         let ok = unsafe { ControlService(self.service()?.raw_handle(), SERVICE_CONTROL_STOP, &mut status) };
         if ok != 0 {
-            return Ok(());
+            return Ok(ControlReply::Sent);
         }
         let err = io::Error::last_os_error();
-        match err.raw_os_error() {
-            // The service stopped between the caller's early-return
-            // query and this control, so the stop asked for has
-            // happened — benign on both callers. `request_stop` armed
-            // nothing and has nothing left to wait for; under
-            // `stop_via_notify` the STOPPED arm ran before this
-            // control, so the SCM has already queued that notification
-            // and the wait still completes.
-            Some(code) if code as u32 == ERROR_SERVICE_NOT_ACTIVE => Ok(()),
+        // The caller read the state before this control; each of these says the state it read is
+        // gone, and what to do is decided from a fresh read.
+        match err.raw_os_error().map(|code| code as u32) {
+            Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL | ERROR_SERVICE_NOT_ACTIVE) => Ok(ControlReply::StateMoved),
+            Some(ERROR_INVALID_SERVICE_CONTROL) => Ok(ControlReply::NotAccepted),
             _ => Err(err),
         }
+    }
+
+    /// Opens the replacement before releasing the old handle, so a service marked for deletion
+    /// whose record the old handle alone holds open is never left without one.
+    fn reopen_service(&mut self) -> io::Result<()> {
+        let scm = open_scm()?;
+        let service = open_handle(&scm, &self.name, self.access)?;
+        drop(self.service.replace(service));
+        drop(self.scm.replace(scm));
+        // The registration died with the old handle, but a notification it already queued to this
+        // thread would still run, against the buffers the next `arm` is about to reuse.
+        if self.registration_outstanding {
+            super::ScmHandles::drain_queued_apc(self);
+            self.registration_outstanding = false;
+        }
+        Ok(())
     }
 
     fn delete(&mut self) -> io::Result<()> {

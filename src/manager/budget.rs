@@ -122,9 +122,10 @@ pub fn timed_out(id: &str, awaited: &'static str, budget: Budget) -> crate::Erro
 
 // restart_pending =====================================================================================================
 
-/// The one [`crate::Error::RestartPending`] constructor: `stop` found a restart queued by SCM's
-/// recovery actions and either did not wait for it (`Immediate`, or `Bounded(ZERO)`) or waited
-/// `budget` and it had not arrived. In both cases nothing was stopped.
+/// The one [`crate::Error::RestartPending`] constructor: `stop` found the service being started by
+/// SCM, or a restart queued by its recovery actions, and either did not wait for that
+/// (`Immediate`, or `Bounded(ZERO)`) or waited `budget` and it had not settled. In both cases
+/// nothing was stopped.
 ///
 /// `Unbounded` waits until the restart arrives and stops what it starts, so it never reports this.
 pub fn restart_pending(id: &str, budget: Budget) -> crate::Error {
@@ -134,14 +135,14 @@ pub fn restart_pending(id: &str, budget: Budget) -> crate::Error {
     );
     let recovery = match budget {
         Budget::Bounded(waited) if waited > Duration::ZERO => format!(
-            "its daemon failed and SCM will start it again, which nothing cancels. goetia waited {} \
-             for that restart and stopped waiting, so nothing was stopped. {advice}",
+            "SCM is starting it, or has a restart queued; goetia did not stop it. goetia waited {} \
+             for that to settle and stopped waiting. {advice}",
             humantime::format_duration(waited),
         ),
         Budget::Immediate | Budget::Bounded(_) => format!(
-            "its daemon failed and SCM will start it again, which nothing cancels. `--timeout 0` does \
-             not wait for that restart, so nothing was stopped. Run `goetia daemon stop {id}` with a \
-             `--timeout` above 0 to wait for the restart and stop the daemon it starts. {advice}"
+            "SCM is starting it, or has a restart queued; goetia did not stop it. `--timeout 0` does \
+             not wait for that to settle. Run `goetia daemon stop {id}` with a `--timeout` above 0 \
+             to wait for it and stop the daemon it starts. {advice}"
         ),
         Budget::Unbounded => {
             debug_assert!(false, "an unbounded wait cannot run out of budget");

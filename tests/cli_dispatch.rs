@@ -3093,7 +3093,7 @@ fn stop_that_meets_a_pending_restart_exits_4_under_every_budget() {
         let (code, out, err) = dispatch_with(&argv, &mgr, &|| true);
 
         assert_eq!(code, 4, "{flags:?}\nstdout:\n{out}\nstderr:\n{err}");
-        assert!(err.contains("restart pending"), "{flags:?}: {err}");
+        assert!(err.contains("restart queued"), "{flags:?}: {err}");
         assert!(!out.contains("stopped"), "{flags:?}: {out}");
     }
 }

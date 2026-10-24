@@ -153,11 +153,15 @@ impl ScmActor for FakeScm {
         });
         Ok(self.what_arm_reports)
     }
-    fn control_stop(&mut self) -> std::io::Result<()> {
+    fn control_stop(&mut self) -> std::io::Result<ControlReply> {
         self.log.push("control_stop");
         if self.stop_fails {
             return Err(std::io::Error::other("scripted stop failure"));
         }
+        Ok(ControlReply::Sent)
+    }
+    fn reopen_service(&mut self) -> std::io::Result<()> {
+        self.log.push("reopen");
         Ok(())
     }
     fn delete(&mut self) -> std::io::Result<()> {
@@ -778,10 +782,11 @@ fn a_stop_request_over_a_pending_restart_issues_nothing() {
 
 #[skuld::test]
 fn a_stop_request_is_issued_unless_a_restart_is_pending() {
-    for (recovering, state, exit) in [
-        (true, QueriedState::Stopped, stopped_clean()),
-        (false, QueriedState::Stopped, daemon_failed()),
-        (true, QueriedState::Running, daemon_failed()),
+    for (recovering, state, exit, sends) in [
+        (true, QueriedState::Stopped, stopped_clean(), false),
+        (false, QueriedState::Stopped, daemon_failed(), false),
+        (true, QueriedState::StopPending, stopped_clean(), false),
+        (true, QueriedState::Running, daemon_failed(), true),
     ] {
         let mut fake = FakeScm::new([]).found(state, exit);
         if recovering {
@@ -792,7 +797,13 @@ fn a_stop_request_is_issued_unless_a_restart_is_pending() {
             RequestedStop::Issued,
             "{state:?} {exit:?}"
         );
-        assert_eq!(fake.log, vec!["query", "control_stop"], "{state:?} {exit:?}");
+        // A service that is stopped, or already stopping, refuses a control and needs none.
+        let sent = if sends {
+            vec!["query", "control_stop"]
+        } else {
+            vec!["query"]
+        };
+        assert_eq!(fake.log, sent, "{state:?} {exit:?}");
     }
 }
 
@@ -957,9 +968,8 @@ fn a_running_service_is_stopped_before_the_delete() {
 }
 
 #[skuld::test]
-fn every_state_but_stopped_and_start_pending_is_stopped_before_the_delete() {
+fn every_state_that_takes_a_control_is_stopped_before_the_delete() {
     for state in [
-        QueriedState::StopPending,
         QueriedState::Running,
         QueriedState::ContinuePending,
         QueriedState::PausePending,

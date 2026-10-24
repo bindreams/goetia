@@ -162,15 +162,16 @@ fn timed_out_refuses_a_zero_length_budget() {
 // restart_pending =====================================================================================================
 
 #[skuld::test]
-fn restart_pending_is_not_a_wait_timeout_and_names_the_id_and_the_queued_restart() {
+fn restart_pending_is_not_a_wait_timeout_and_says_it_is_a_start_or_a_queued_restart() {
     for budget in [Budget::DEFAULT, Budget::Immediate] {
         let e = restart_pending("frpc", budget);
         assert!(matches!(e, crate::Error::RestartPending { .. }), "{e:?}");
         let message = e.to_string();
         assert!(message.contains("frpc"), "{message}");
-        assert!(message.contains("restart"), "{message}");
-        assert!(message.contains("pending"), "{message}");
-        assert!(message.contains("nothing was stopped"), "{message}");
+        assert!(
+            message.contains("SCM is starting it, or has a restart queued; goetia did not stop it"),
+            "{message}"
+        );
     }
 }
 
