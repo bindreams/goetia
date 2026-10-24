@@ -620,3 +620,81 @@ fn non_utf8_path_panics_loudly_rather_than_emit_a_corrupted_path() {
 
     assert!(result.is_err(), "plist() must panic on a non-UTF-8 cwd");
 }
+
+// without_metadata ====================================================================================================
+
+#[skuld::test]
+fn without_metadata_drops_the_whole_comment_and_keeps_the_rest() {
+    let text = plist(&minimal_spec(), &minimal_identity());
+    let stripped = without_metadata(&text);
+
+    assert!(!stripped.contains("goetia"), "{stripped}");
+    assert!(!stripped.contains(&blob::encode(&minimal_spec())), "{stripped}");
+    assert!(stripped.contains("<key>Label</key>"), "{stripped}");
+    assert!(stripped.contains("<!DOCTYPE plist"), "{stripped}");
+    assert!(
+        !stripped.contains("\n\n"),
+        "no blank line is left where the comment was: {stripped}"
+    );
+}
+
+#[skuld::test]
+fn without_metadata_makes_a_spec_change_the_plist_does_not_render_vanish() {
+    // `name` is in the blob and nowhere in the plist.
+    let renamed = DaemonSpec {
+        name: "another name".to_string(),
+        ..minimal_spec()
+    };
+    let before = plist(&minimal_spec(), &minimal_identity());
+    let after = plist(&renamed, &minimal_identity());
+
+    assert_ne!(before, after);
+    assert_eq!(without_metadata(&before), without_metadata(&after));
+}
+
+#[skuld::test]
+fn without_metadata_makes_a_version_bump_vanish() {
+    let text = plist(&minimal_spec(), &minimal_identity());
+    let bumped = text.replace(&format!("Version: {}", crate::version()), "Version: 999.0.0");
+
+    assert_ne!(text, bumped);
+    assert_eq!(without_metadata(&text), without_metadata(&bumped));
+}
+
+#[skuld::test]
+fn without_metadata_keeps_what_launchd_reads() {
+    let before = plist(&minimal_spec(), &minimal_identity());
+    let other_user = plist(
+        &minimal_spec(),
+        &Identity {
+            user: "svc".to_string(),
+        },
+    );
+    let other_command = plist(
+        &DaemonSpec {
+            command: vec!["frpc".to_string(), "--verbose".to_string()],
+            ..minimal_spec()
+        },
+        &minimal_identity(),
+    );
+
+    assert_ne!(without_metadata(&before), without_metadata(&other_user));
+    assert_ne!(without_metadata(&before), without_metadata(&other_command));
+}
+
+#[skuld::test]
+fn without_metadata_handles_crlf() {
+    let text = plist(&minimal_spec(), &minimal_identity());
+    let crlf = text.replace('\n', "\r\n");
+
+    assert_eq!(without_metadata(&crlf), without_metadata(&text).replace('\n', "\r\n"));
+}
+
+#[skuld::test]
+fn without_metadata_leaves_a_plist_with_no_comment_and_an_unterminated_one_as_they_are() {
+    let foreign = "<?xml version=\"1.0\"?>\n<plist><dict/></plist>\n";
+    assert_eq!(without_metadata(foreign), foreign);
+
+    let unterminated = "<!-- goetia:begin\nMarker: goetia\n<plist/>\n";
+    assert_eq!(without_metadata(unterminated), unterminated);
+}

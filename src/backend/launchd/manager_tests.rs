@@ -1019,11 +1019,31 @@ fn a_print_that_fails_otherwise_is_an_error_not_a_job_that_is_not_loaded() {
     let names_print =
         |e: &Error| matches!(e, Error::CommandFailed { command, .. } if command.starts_with("launchctl print"));
 
-    // `Create`: the stale-job check.
+    // `Create`: the stale-job check, which comes before anything is written.
     let script = Scripted::new(&[("print", UNREADABLE)]);
     let e = mgr.install(&spec, false).expect_err("an unreadable print");
     assert!(names_print(&e), "{e:?}");
     script.assert_driven("create, unreadable print");
+    assert!(
+        !staging_path(&name).exists(),
+        "a create that could not tell whether a job is loaded wrote nothing"
+    );
+
+    // `Create` over a loaded job whose `bootout` fails: nothing written either, so a rerun is a
+    // `Create` again and reaches the stale job.
+    let script = Scripted::new(&[("print", DONE), ("bootout", REFUSED)]);
+    let e = mgr.install(&spec, false).expect_err("a refused bootout");
+    assert!(matches!(e, Error::CommandFailed { .. }), "{e:?}");
+    script.assert_driven("create, refused bootout");
+    assert!(
+        !staging_path(&name).exists(),
+        "a create whose stale job could not be booted out wrote nothing"
+    );
+
+    // The rerun: the stale job is booted out, then the plist is written.
+    let script = Scripted::new(&[("print", DONE), ("bootout", DONE)]);
+    assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
+    script.assert_driven("create over a loaded job");
 
     // `start`: the first read.
     let script = Scripted::new(&[("print", UNREADABLE)]);
@@ -1037,7 +1057,7 @@ fn a_print_that_fails_otherwise_is_an_error_not_a_job_that_is_not_loaded() {
     assert!(names_print(&e), "{e:?}");
     script.assert_driven("start, unreadable read after a refused bootstrap");
 
-    // `Update`: the refusal check. The plist exists from the `Create` above.
+    // `Update`: the refusal check. The plist exists from the rerun above.
     let installed = std::fs::read_to_string(staging_path(&name)).unwrap();
     spec.command.push("updated".to_string());
     let script = Scripted::new(&[("print", UNREADABLE)]);
@@ -1076,5 +1096,55 @@ fn a_job_loaded_between_the_check_and_the_write_leaves_the_install_in_doubt() {
         std::fs::read_to_string(staging_path(&name)).unwrap(),
         installed,
         "the plist was written before the second check"
+    );
+}
+
+/// The recheck after the write is a read like the first; one that fails leaves the plist written and
+/// the loaded state unknown, so the install is in doubt (exit `4`), not a plain failure (exit `1`).
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn an_unreadable_recheck_after_the_write_leaves_the_install_in_doubt() {
+    let mgr = LaunchdManager::new();
+    let name = format!("goetia-recheck-{:x}", std::process::id());
+    let _plists = Plists(name.clone());
+    let mut spec = spec_named(&name);
+
+    let script = Scripted::new(&[("print", NOT_LOADED)]);
+    assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
+    script.assert_driven("the first install");
+    let installed = std::fs::read_to_string(staging_path(&name)).unwrap();
+
+    spec.command.push("updated".to_string());
+    let script = Scripted::new(&[("print", NOT_LOADED), ("print", UNREADABLE)]);
+    let e = mgr.install(&spec, false).expect_err("an unreadable recheck");
+    assert!(matches!(e, Error::LoadedStateInDoubt { .. }), "{e:?}");
+    assert!(e.to_string().contains(&format!("goetia daemon stop {name}")), "{e}");
+    assert!(e.to_string().contains("Input/output error"), "{e}");
+    script.assert_driven("install, unreadable recheck");
+    assert_ne!(std::fs::read_to_string(staging_path(&name)).unwrap(), installed);
+}
+
+/// What launchd reads decides the refusal, not the spec: a spec change the plist does not render
+/// (`name` is in the embedded metadata only) is written over a loaded job without a single
+/// `launchctl` call, and the loaded job is as the new plist would have it.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_spec_change_the_plist_does_not_render_is_written_over_a_loaded_job() {
+    let mgr = LaunchdManager::new();
+    let name = format!("goetia-samerender-{:x}", std::process::id());
+    let _plists = Plists(name.clone());
+    let mut spec = spec_named(&name);
+
+    let script = Scripted::new(&[("print", NOT_LOADED)]);
+    assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
+    script.assert_driven("the first install");
+    let installed = std::fs::read_to_string(staging_path(&name)).unwrap();
+
+    spec.name = "another name".to_string();
+    let script = Scripted::new(&[]);
+    assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Update { .. })));
+    script.assert_driven("an install whose rendering is unchanged asks launchd nothing");
+    assert_ne!(
+        std::fs::read_to_string(staging_path(&name)).unwrap(),
+        installed,
+        "the metadata comment was refreshed"
     );
 }

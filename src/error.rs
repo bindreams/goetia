@@ -199,6 +199,19 @@ pub enum Error {
     )]
     LoadedJobInDoubt { id: String },
 
+    /// `install` rewrote the plist of a daemon and could not read whether launchd has its job loaded
+    /// afterwards, so which definition a job loaded meanwhile read is not established either.
+    /// `detail` is the failed read. launchd only.
+    ///
+    /// Exit `4` (indeterminate), like [`LoadedJobInDoubt`](Error::LoadedJobInDoubt): the plist is on
+    /// disk, and whether the daemon runs it is the question, which was not answered.
+    #[error(
+        "`{id}`'s plist was rewritten, but whether launchd has its job loaded could not be read ({detail}), so \
+         goetia cannot tell whether a loaded job holds the old definition or the new one: run \
+         `goetia daemon stop {id}` and then `goetia daemon start {id}`"
+    )]
+    LoadedStateInDoubt { id: String, detail: String },
+
     /// goetia will ask no service manager here, on positive evidence: systemd's offline mode, a
     /// chroot, or a system systemd did not boot. `evidence` says which. goetia refuses there
     /// rather than act on unit files alone, or read a `systemctl` that asked nobody as an answer.

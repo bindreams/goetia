@@ -7,8 +7,10 @@
 //! - `install` writes/updates the plist in [`STAGING_DIR`] (or, for an
 //!   update, wherever the existing artifact already lives — see
 //!   [`discover`]). launchd never scans either directory on its own, so
-//!   nothing loads and nothing runs. A changed spec over a job launchd has
-//!   loaded is refused instead, and nothing is written (see [`refuse`]).
+//!   nothing loads and nothing runs. A plist that would change what a job
+//!   launchd has loaded reads is refused instead, and nothing is written
+//!   (see [`refuse`]). A `Create` over a loaded job of the same label boots
+//!   that job out first, the one case where `install` stops a daemon.
 //! - `start` `launchctl bootstrap`s the plist from wherever it currently is
 //!   (if not already loaded), then `launchctl kickstart`s it — the second
 //!   step is what actually launches a job with no `KeepAlive`/`RunAtLoad`
@@ -1021,7 +1023,8 @@ const STOP_REQUESTS: usize = 1;
 
 /// The most `launchctl` calls each verb makes, requests and reads alike — every one needs a temp
 /// file for each of its two streams, and a verb makes them all before it sends anything (see
-/// [`files`]). `install`: a `Create`'s `is_loaded` and `bootout`, or an `Update`'s two `is_loaded`s.
+/// [`files`]). `install`: a `Create`'s `is_loaded` and `bootout`, both before the plist is written, or
+/// an `Update`'s two `is_loaded`s, before the write and after it. A pass repeated after a race is not counted.
 /// `start`: its five requests, two `is_loaded`s and five `live_state`s. `stop` and `uninstall`: their
 /// request.
 const INSTALL_CALLS: usize = INSTALL_REQUESTS + 1;
@@ -1030,6 +1033,18 @@ const STOP_CALLS: usize = STOP_REQUESTS;
 
 /// The temp files one `launchctl` call writes its output to: stdout and stderr.
 const FILES_PER_CALL: usize = 2;
+
+/// The reaper for `install`'s `bootout`: the one it holds, or another if a request of an earlier
+/// pass of its re-derivation has used it.
+fn reaper_for_request(spec: &DaemonSpec, held: Option<Reaper>) -> Result<Reaper> {
+    match held {
+        Some(reaper) => Ok(reaper),
+        None => {
+            let [reaper] = reapers::<INSTALL_REQUESTS>(&spec.id)?;
+            Ok(reaper)
+        }
+    }
+}
 
 /// [`bounded::reapers`], as the verb's own failure: nothing was sent, so exit `1` with the daemon
 /// untouched.
@@ -1120,8 +1135,8 @@ fn classified(ran: &Ran) -> (State, Option<u32>) {
 
 impl LaunchdManager {
     /// `install`, with the reaper for its one request made. A re-derivation after a race passes the
-    /// same reaper on rather than making another: the verb makes its reapers once, at entry.
-    fn install_reaping(&self, spec: &DaemonSpec, force: bool, reaper: Reaper) -> Result<Outcome> {
+    /// same reaper on if no request has used it, and makes another if one has.
+    fn install_reaping(&self, spec: &DaemonSpec, force: bool, reaper: Option<Reaper>) -> Result<Outcome> {
         let account = resolve_account(&spec.user)?;
         let desired = generate::plist(spec, &account.identity());
         let discovery = discover(spec.id.as_str())?;
@@ -1140,32 +1155,40 @@ impl LaunchdManager {
 
         match &outcome {
             Outcome::Create => {
+                // A job may already answer to this label even though
+                // no artifact of ours existed a moment ago — a
+                // predecessor installed by hand, or one an external
+                // actor boot'ed out that has not finished tearing
+                // down. It cannot be from the plist we are about to create,
+                // so it is stale by construction. Booting it out is the one
+                // way `install` stops a running daemon: the label is being
+                // taken over, and `start` would otherwise see it loaded *and
+                // running*, conclude there was nothing to do, and return `Ok`
+                // while the daemon never ran, as in a real migration.
+                // Every label-scoped check has that blind spot — `is_loaded`
+                // and `live_state` cannot tell whose job answers to a label —
+                // so the fix has to be here, at the one moment we know the
+                // artifact is new.
+                //
+                // Before the write, so that a read or a `bootout` that fails
+                // leaves nothing behind: a rerun is a `Create` again, and
+                // reaches the stale job. After a plist is written, the rerun
+                // would read `UpToDate` and never look.
+                //
+                // `install` has no `--timeout` of its own, so its
+                // own `launchctl` calls are deliberately unbounded.
+                let deadline = Budget::Unbounded.start();
+                let reaper = reaper_for_request(spec, reaper)?;
+                let reaper = if never_expires(is_loaded(spec.id.as_str(), deadline)?) {
+                    never_expires(bootout(spec.id.as_str(), deadline, reaper)?);
+                    None
+                } else {
+                    Some(reaper)
+                };
                 prepare_parent_dirs(spec, &account)?;
                 let target = staging_path(spec.id.as_str());
                 match write_new(&target, &desired)? {
-                    WriteNew::Written => {
-                        // A job may already answer to this label even though
-                        // no artifact of ours existed a moment ago — a
-                        // predecessor installed by hand, or one an external
-                        // actor boot'ed out that has not finished tearing
-                        // down. It cannot be from the plist we just created,
-                        // so it is stale by construction.
-                        //
-                        // Leaving it loaded is what broke a real migration:
-                        // `start` then saw the label loaded *and running*,
-                        // concluded there was nothing to do, and returned
-                        // `Ok` while the daemon never ran. Every label-scoped
-                        // check has that blind spot — `is_loaded` and
-                        // `live_state` cannot tell whose job answers
-                        // to a label — so the fix has to be here, at the one
-                        // moment we know the artifact is new.
-                        // `install` has no `--timeout` of its own, so its
-                        // own `launchctl` calls are deliberately unbounded.
-                        let deadline = Budget::Unbounded.start();
-                        if never_expires(is_loaded(spec.id.as_str(), deadline)?) {
-                            never_expires(bootout(spec.id.as_str(), deadline, reaper)?);
-                        }
-                    }
+                    WriteNew::Written => {}
                     WriteNew::Raced => {
                         // Something now exists where discovery saw nothing.
                         // Re-running `install` from scratch re-derives
@@ -1180,8 +1203,8 @@ impl LaunchdManager {
             }
             Outcome::Update { .. } | Outcome::Stale { .. } => {
                 // First, before anything is created or written: a refusal leaves the host as it was.
-                // `Stale` is checked too, since a version bump can carry a changed spec.
-                let changes_job = refuse::changes_loaded_job(&outcome, &discovery.found, spec);
+                // `Stale` is checked too: a release can change what the generator renders.
+                let changes_job = refuse::changes_loaded_job(&outcome, discovery.on_disk.as_deref(), &desired);
                 // `install` has no `--timeout` of its own, so its own `launchctl` calls are
                 // deliberately unbounded.
                 let deadline = Budget::Unbounded.start();
@@ -1238,9 +1261,14 @@ impl LaunchdManager {
                 // someone bootstrapped in between may hold the old plist or the new one, and a
                 // relaunch of one that read the old runs the old spec (systemd's `Restart=` would
                 // read the new unit). goetia takes no lock, so it says it cannot tell instead of
-                // reporting a success.
-                if changes_job && never_expires(is_loaded(spec.id.as_str(), deadline)?) {
-                    return Err(refuse::loaded_after_write(&spec.id));
+                // reporting a success. A read that fails here leaves the same question open, and
+                // the plist is already written, so it is no plain failure either.
+                if changes_job {
+                    match is_loaded(spec.id.as_str(), deadline) {
+                        Ok(loaded) if !never_expires(loaded) => {}
+                        Ok(_) => return Err(refuse::loaded_after_write(&spec.id)),
+                        Err(read) => return Err(refuse::state_unknown_after_write(&spec.id, &read)),
+                    }
                 }
             }
             Outcome::UpToDate
@@ -1257,7 +1285,7 @@ impl ServiceManager for LaunchdManager {
     fn install(&self, spec: &DaemonSpec, force: bool) -> Result<Outcome> {
         let [reaper] = reapers::<INSTALL_REQUESTS>(&spec.id)?;
         let _files = files(&spec.id, INSTALL_CALLS)?;
-        self.install_reaping(spec, force, reaper)
+        self.install_reaping(spec, force, Some(reaper))
     }
 
     /// Makes every reaper and temp file `steps` can need now, so that no step fails for want of one
