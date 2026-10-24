@@ -220,9 +220,8 @@ struct FlakyManager {
     /// no `install`-path fixture has, so injecting it is the only way to
     /// put it in front of `run_id_verb` and `install`'s own classifier.
     wait_timeout_start_for: Option<String>,
-    /// `stop` finds a restart queued by SCM's recovery actions: the request is left unissued
-    /// (`--timeout 0`) or the wait ran out (any other budget). Exit `4`, like an expiry, and a
-    /// different condition.
+    /// `stop` finds a restart queued by SCM's recovery actions and refuses it, whatever the budget.
+    /// Exit `4`, like an expiry, and a different condition.
     restart_pending_stop_for: Option<String>,
     /// Makes `install`/`preview_install` return the `Conflict` flavour whose
     /// cause lies outside the directory the backend writes — systemd's
@@ -336,7 +335,7 @@ impl ServiceManager for FlakyManager {
     }
     fn stop(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
         if self.restart_pending_stop_for.as_deref() == Some(id.as_str()) {
-            return Err(goetia::manager::budget::restart_pending(id.as_str(), budget));
+            return Err(goetia::manager::budget::restart_pending(id.as_str()));
         }
         self.inner.stop(id, budget)
     }
@@ -3079,7 +3078,7 @@ fn stop_that_times_out_exits_4() {
 /// A restart SCM has queued is neither a failure (`1`) nor a success: the stop could not settle it.
 #[skuld::test]
 fn stop_that_meets_a_pending_restart_exits_4_under_every_budget() {
-    for flags in [&["--timeout", "0"][..], &["--timeout", "5s"][..]] {
+    for flags in [&["--timeout", "0"][..], &["--timeout", "5s"][..], &["--no-timeout"][..]] {
         let inner = Fake::new();
         inner.install(&mk("frpc"), false).unwrap();
         let mgr = FlakyManager {

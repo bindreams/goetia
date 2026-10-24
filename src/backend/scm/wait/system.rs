@@ -7,22 +7,24 @@ use std::ffi::c_void;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use windows_service::service::{Service, ServiceAccess, ServiceActionType, ServiceExitCode, ServiceState};
+use windows_service::service::{Service, ServiceAccess, ServiceActionType};
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{
     ERROR_INVALID_SERVICE_CONTROL, ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_CANNOT_ACCEPT_CTRL,
     ERROR_SERVICE_NOT_ACTIVE, WAIT_IO_COMPLETION,
 };
 use windows_sys::Win32::System::Services::{
-    ControlService, NotifyServiceStatusChangeW, SERVICE_CONTROL_STOP, SERVICE_NOTIFY, SERVICE_NOTIFY_2W,
-    SERVICE_NOTIFY_RUNNING, SERVICE_NOTIFY_START_PENDING, SERVICE_NOTIFY_STATUS_CHANGE, SERVICE_NOTIFY_STOP_PENDING,
-    SERVICE_NOTIFY_STOPPED, SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STOPPED,
+    ControlService, NotifyServiceStatusChangeW, QueryServiceStatusEx, SC_STATUS_PROCESS_INFO, SERVICE_ACCEPT_STOP,
+    SERVICE_CONTINUE_PENDING, SERVICE_CONTROL_STOP, SERVICE_NOTIFY, SERVICE_NOTIFY_2W, SERVICE_NOTIFY_RUNNING,
+    SERVICE_NOTIFY_START_PENDING, SERVICE_NOTIFY_STATUS_CHANGE, SERVICE_NOTIFY_STOP_PENDING, SERVICE_NOTIFY_STOPPED,
+    SERVICE_PAUSE_PENDING, SERVICE_PAUSED, SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS,
+    SERVICE_STATUS_PROCESS, SERVICE_STOP_PENDING, SERVICE_STOPPED,
 };
 use windows_sys::Win32::System::Threading::{INFINITE, SleepEx};
 
-use crate::backend::scm::exit_status::{ERROR_SERVICE_SPECIFIC_ERROR, RecordedExit};
+use crate::backend::scm::exit_status::RecordedExit;
 
-use super::{ControlReply, Deadline, Observed, QueriedState, Recovery, StartReply, Waited, WantState};
+use super::{ControlReply, Deadline, Observed, QueriedState, QueriedStatus, Recovery, StartReply, Waited, WantState};
 
 /// `windows-service`'s `Error` does not implement `Into<io::Error>` for
 /// every variant (it also carries parse errors this module never
@@ -107,26 +109,28 @@ fn want_to_mask(want: WantState, started: bool) -> SERVICE_NOTIFY {
         WantState::Stopped => SERVICE_NOTIFY_STOPPED | SERVICE_NOTIFY_STOP_PENDING,
         WantState::Running if started => SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_STOPPED | SERVICE_NOTIFY_START_PENDING,
         WantState::Running => SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_START_PENDING,
-        // Never the state the service is in: a mask holding it fires at once, on the same record.
-        WantState::RestartBegins => SERVICE_NOTIFY_START_PENDING | SERVICE_NOTIFY_RUNNING,
         WantState::RestartResolves => SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_STOPPED,
     }
 }
 
-/// `windows-service`'s state onto the ungated [`QueriedState`]. One arm
-/// per variant and no `_` catch-all, so a variant added upstream is a
-/// compile error here rather than a silent remap — only CI can execute
+/// The `SERVICE_*` state code onto the ungated [`QueriedState`]. One arm per code and no catch-all
+/// beyond the error, so a state the SDK adds is reported rather than remapped; only CI can execute
 /// this, so it is written to be checkable by eye.
-fn queried_state(state: ServiceState) -> QueriedState {
-    match state {
-        ServiceState::Stopped => QueriedState::Stopped,
-        ServiceState::StartPending => QueriedState::StartPending,
-        ServiceState::StopPending => QueriedState::StopPending,
-        ServiceState::Running => QueriedState::Running,
-        ServiceState::ContinuePending => QueriedState::ContinuePending,
-        ServiceState::PausePending => QueriedState::PausePending,
-        ServiceState::Paused => QueriedState::Paused,
-    }
+fn queried_state(state: u32) -> io::Result<QueriedState> {
+    Ok(match state {
+        SERVICE_STOPPED => QueriedState::Stopped,
+        SERVICE_START_PENDING => QueriedState::StartPending,
+        SERVICE_STOP_PENDING => QueriedState::StopPending,
+        SERVICE_RUNNING => QueriedState::Running,
+        SERVICE_CONTINUE_PENDING => QueriedState::ContinuePending,
+        SERVICE_PAUSE_PENDING => QueriedState::PausePending,
+        SERVICE_PAUSED => QueriedState::Paused,
+        other => {
+            return Err(io::Error::other(format!(
+                "SCM reported an unknown service state {other}"
+            )));
+        }
+    })
 }
 
 /// Owns both its `WinServiceManager` (SCM) connection and its per-service
@@ -355,8 +359,7 @@ impl super::ScmActor for SystemScmActor {
             Err(windows_service::Error::Winapi(e))
                 if e.raw_os_error() == Some(ERROR_SERVICE_ALREADY_RUNNING as i32) =>
             {
-                let status = self.service()?.query_status().map_err(to_io_error)?;
-                Ok(StartReply::AlreadyRunning(queried_state(status.current_state)))
+                Ok(StartReply::AlreadyRunning(self.query_status()?.state))
             }
             Err(e) => Err(to_io_error(e)),
         }
@@ -415,18 +418,33 @@ impl super::ScmActor for SystemScmActor {
         }
     }
 
-    fn query_status(&mut self) -> io::Result<(QueriedState, RecordedExit)> {
-        let status = self.service()?.query_status().map_err(to_io_error)?;
-        // `windows-service` folds the pair into one code: a service-specific code is carried by
-        // Win32 1066. Only Win32 decides recovery, and `(0, n)` reads as `Win32(0)`, which is right.
-        let exit = match status.exit_code {
-            ServiceExitCode::Win32(win32) => RecordedExit { win32, specific: 0 },
-            ServiceExitCode::ServiceSpecific(specific) => RecordedExit {
-                win32: ERROR_SERVICE_SPECIFIC_ERROR,
-                specific,
-            },
+    fn query_status(&mut self) -> io::Result<QueriedStatus> {
+        // Read raw: `windows-service` folds the pair into one code, so `(0, 1003)`, the record of an
+        // incomplete stop, would read as `(0, 0)`.
+        let mut status = SERVICE_STATUS_PROCESS::default();
+        let mut needed = 0u32;
+        // SAFETY: `self.service()?.raw_handle()` was opened with `SERVICE_QUERY_STATUS`; the buffer
+        // is a `SERVICE_STATUS_PROCESS` of exactly the size passed.
+        let ok = unsafe {
+            QueryServiceStatusEx(
+                self.service()?.raw_handle(),
+                SC_STATUS_PROCESS_INFO,
+                (&mut status as *mut SERVICE_STATUS_PROCESS).cast::<u8>(),
+                std::mem::size_of::<SERVICE_STATUS_PROCESS>() as u32,
+                &mut needed,
+            )
         };
-        Ok((queried_state(status.current_state), exit))
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(QueriedStatus {
+            state: queried_state(status.dwCurrentState)?,
+            exit: RecordedExit {
+                win32: status.dwWin32ExitCode,
+                specific: status.dwServiceSpecificExitCode,
+            },
+            accepts_stop: status.dwControlsAccepted & SERVICE_ACCEPT_STOP != 0,
+        })
     }
 
     fn recovery(&mut self) -> io::Result<Recovery> {

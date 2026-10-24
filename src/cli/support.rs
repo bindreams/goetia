@@ -348,9 +348,9 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
                 let _ = writeln!(err, "error: {id}: {e}");
                 codes.push(4);
             }
-            // `stop` found a restart the manager has queued and could not settle it: nothing was
-            // stopped, and the daemon will be running again unless the stop is repeated with a
-            // wait. Not a failure of the stop (`1`), and not an expiry of a request it issued.
+            // `stop` found a restart the manager has queued, which nothing cancels: nothing was
+            // stopped, and the daemon will be running again. Not a failure of the stop (`1`), and
+            // not an expiry of a request it issued.
             Err(e @ Error::RestartPending { .. }) => {
                 let _ = writeln!(err, "error: {id}: {e}");
                 codes.push(4);

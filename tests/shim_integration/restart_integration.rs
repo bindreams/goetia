@@ -312,35 +312,11 @@ fn fail_once(mgr: &ScmManager, id: &str, restart_delay: Duration) -> (ConnectBac
     (reported, spec)
 }
 
-/// The restart is queued whether or not it has fired by the time `stop` looks, so `stop` finds
-/// either the queued restart or the daemon it started, and both end the same way: stopped by a
-/// commanded stop, which SCM records as Win32 0 and restarts nothing after.
-///
-/// The second run may be stopped before it connects back, so the test does not wait for it. The
-/// record proves the stop reached it: the first run left Win32 1066 with specific 7, and only a stop
-/// delivered to a later run replaces that with Win32 0, which queues nothing.
+/// `stop` refuses a pending restart at once, under every budget (`--no-timeout` included): nothing
+/// cancels it, so there is nothing to wait for. The delay is an hour, so the restart cannot fire
+/// during the test and the record read below is the first failure's.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_stop_during_the_restart_delay_waits_for_the_restart_and_leaves_the_service_stopped() {
-    let mgr = ScmManager::new();
-    let id = support::random_test_id();
-    let _guard = ServiceGuard::new(&id);
-    let (_reported, spec) = fail_once(&mgr, &id, Duration::from_secs(5));
-
-    mgr.stop(&spec.id, Budget::Unbounded).expect("stop");
-
-    let stopped = scm_status(&id);
-    assert_eq!(stopped.current_state, ServiceState::Stopped, "{stopped:?}");
-    assert_eq!(
-        recorded_exit(&id),
-        RecordedExit { win32: 0, specific: 0 },
-        "the record must be the commanded stop's, not the first run's: {stopped:?}"
-    );
-}
-
-/// A restart that cannot arrive within the request's budget is reported, not mistaken for a stop.
-/// The delay is an hour, so the restart cannot fire during the test.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_stop_that_cannot_wait_out_a_pending_restart_says_so_and_issues_nothing() {
+fn a_stop_during_the_restart_delay_is_refused_under_every_budget() {
     let mgr = ScmManager::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -351,10 +327,14 @@ fn a_stop_that_cannot_wait_out_a_pending_restart_says_so_and_issues_nothing() {
     };
     assert_eq!(recorded_exit(&id), failed, "the daemon's failure is what SCM holds");
 
-    for budget in [Budget::Immediate, Budget::Bounded(Duration::from_secs(1))] {
+    for budget in [
+        Budget::Immediate,
+        Budget::Bounded(Duration::from_secs(1)),
+        Budget::Unbounded,
+    ] {
         let e = mgr
             .stop(&spec.id, budget)
-            .expect_err("a stop cannot settle a pending restart without waiting for it");
+            .expect_err("a stop cannot cancel a pending restart");
         assert!(matches!(e, goetia::Error::RestartPending { .. }), "{budget:?}: {e:?}");
         // Nothing was commanded: the record is still the daemon's failure.
         assert_eq!(recorded_exit(&id), failed, "{budget:?}");

@@ -3,8 +3,9 @@
 //!
 //! Paths: `stop` (which is also `restart`'s stop: the manager's `restart` calls `stop`), `stop` on
 //! a spent budget, `stop --timeout 0`, and `uninstall`'s steps 1 and 3. Each is crossed with the
-//! state at the first read, a change of state between that observation and the first control, and
-//! the result of that control.
+//! state at the first read, a change of state between that observation and the stop's next step,
+//! the result of the first control, how a start in progress ends, and how a stop that reaches a
+//! running daemon ends.
 //!
 //! Every row asserts: no control is sent while the latest observation says `START_PENDING` or
 //! `STOPPED`; no second notification is registered on a handle; every wait runs on the caller's
@@ -53,7 +54,8 @@ const FIRSTS: [First; 6] = [
     First::StoppedFailedNoRecovery,
 ];
 
-/// What the service becomes between the observation and the first control.
+/// What the service becomes between the observation and the stop's next step: the first control
+/// for a running service, the arm for one that is starting or stopping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Change {
     None,
@@ -79,15 +81,57 @@ enum Forced {
     Busy,
     /// `ERROR_SERVICE_NOT_ACTIVE`
     NotActive,
-    /// `ERROR_INVALID_SERVICE_CONTROL`
+    /// `ERROR_INVALID_SERVICE_CONTROL`, from a service that does accept `STOP`
     Invalid,
+    /// `ERROR_INVALID_SERVICE_CONTROL` for good: a running service that does not accept `STOP`.
+    NeverAccepts,
 }
 
-const FORCED: [Forced; 4] = [Forced::Ok, Forced::Busy, Forced::NotActive, Forced::Invalid];
+const FORCED: [Forced; 5] = [
+    Forced::Ok,
+    Forced::Busy,
+    Forced::NotActive,
+    Forced::Invalid,
+    Forced::NeverAccepts,
+];
+
+/// How a start in progress (a restart SCM made, or one a user asked for) ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Starts {
+    Runs,
+    /// The daemon fails: Win32 1066 beside its code.
+    DaemonFails,
+    /// The shim fails: a non-zero Win32 code of its own.
+    ShimFails,
+    /// SCM's own attempt fails (P10): `STOPPED` with Win32 0, and nothing follows.
+    AttemptFailsClean,
+}
+
+const STARTS: [Starts; 4] = [
+    Starts::Runs,
+    Starts::DaemonFails,
+    Starts::ShimFails,
+    Starts::AttemptFailsClean,
+];
+
+/// How a stop that reaches a running daemon ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopMeets {
+    /// The stop kills the daemon: Win32 0.
+    Clean,
+    /// The daemon fails as the stop arrives: the `STOPPED` is the failure's.
+    Failure,
+}
+
+const STOP_MEETS: [StopMeets; 2] = [StopMeets::Clean, StopMeets::Failure];
 
 fn daemon_failed() -> RecordedExit {
     let (win32, specific) = Reported::from_daemon_code(7).scm_codes();
     RecordedExit { win32, specific }
+}
+
+fn shim_failed() -> RecordedExit {
+    RecordedExit { win32: 5, specific: 0 }
 }
 
 fn clean() -> RecordedExit {
@@ -98,7 +142,6 @@ fn in_mask(want: WantState, state: QueriedState) -> bool {
     match want {
         WantState::Stopped => matches!(state, QueriedState::Stopped | QueriedState::StopPending),
         WantState::Running => matches!(state, QueriedState::Running | QueriedState::StartPending),
-        WantState::RestartBegins => matches!(state, QueriedState::StartPending | QueriedState::Running),
         WantState::RestartResolves => matches!(state, QueriedState::Running | QueriedState::Stopped),
     }
 }
@@ -113,21 +156,24 @@ enum Known {
 }
 
 /// The SCM as one service sees it. Time passes only when the stop blocks (`wait_callback`), and
-/// then the next thing that was due happens: a queued restart begins, a starting service runs, a
-/// stopping one stops.
+/// then the next thing that was due happens: a queued restart begins, a starting service runs or
+/// fails, a stopping one stops.
 struct Scm {
     state: QueriedState,
     exit: RecordedExit,
     recovery: Recovery,
     restart_queued: bool,
     marked_for_deletion: bool,
-    /// Applied when the first control arrives.
+    /// Applied at the first control for a running service, and at the first arm for any other.
     change: Change,
+    change_at_control: bool,
     change_applied: bool,
     forced: Forced,
     forced_used: bool,
-    /// The state the first control found.
-    state_at_first_control: Option<QueriedState>,
+    starts: Starts,
+    stop_meets: StopMeets,
+    /// A control was sent to a running service that does not accept `STOP`.
+    refused_running: bool,
     /// `uninstall` step 3: what `delete` finds the service in, a restart having fired meanwhile.
     state_after_delete: Option<(QueriedState, RecordedExit)>,
     armed: Option<WantState>,
@@ -144,7 +190,7 @@ struct Scm {
 }
 
 impl Scm {
-    fn new(first: First, change: Change, forced: Forced, deadline: Deadline, step3: bool) -> Self {
+    fn new(first: First, row: &Row, deadline: Deadline, step3: bool) -> Self {
         let (state, exit) = match first {
             First::StartPending => (QueriedState::StartPending, clean()),
             First::StopPending => (QueriedState::StopPending, clean()),
@@ -166,11 +212,14 @@ impl Scm {
             recovery,
             restart_queued: false,
             marked_for_deletion: false,
-            change,
+            change: row.change,
+            change_at_control: first == First::Running,
             change_applied: false,
-            forced,
+            forced: row.forced,
             forced_used: false,
-            state_at_first_control: None,
+            starts: row.starts,
+            stop_meets: row.stop_meets,
+            refused_running: false,
             state_after_delete: None,
             armed: None,
             delivered: None,
@@ -228,7 +277,12 @@ impl Scm {
         if self.restart_queued {
             self.set(QueriedState::StartPending, clean());
         } else if self.state == QueriedState::StartPending {
-            self.set(QueriedState::Running, clean());
+            match self.starts {
+                Starts::Runs => self.set(QueriedState::Running, clean()),
+                Starts::DaemonFails => self.set(QueriedState::Stopped, daemon_failed()),
+                Starts::ShimFails => self.set(QueriedState::Stopped, shim_failed()),
+                Starts::AttemptFailsClean => self.set(QueriedState::Stopped, clean()),
+            }
         } else if self.state == QueriedState::StopPending {
             self.set(QueriedState::Stopped, clean());
         } else {
@@ -285,14 +339,13 @@ impl Scm {
         if self.deletes == 0 {
             self.controls_before_delete += 1;
         }
-        if !self.change_applied {
+        if self.change_at_control && !self.change_applied {
             self.apply_change();
         }
-        self.state_at_first_control.get_or_insert(self.state);
         if !self.forced_used {
             self.forced_used = true;
             match self.forced {
-                Forced::Ok => {}
+                Forced::Ok | Forced::NeverAccepts => {}
                 Forced::Busy => return Ok(Reply::Busy),
                 Forced::NotActive => return Ok(Reply::NotActive),
                 Forced::Invalid => return Ok(Reply::Invalid),
@@ -302,8 +355,16 @@ impl Scm {
             // Measured: a starting service answers `ERROR_INVALID_SERVICE_CONTROL`.
             QueriedState::StartPending => Reply::Invalid,
             QueriedState::Stopped => Reply::NotActive,
+            QueriedState::Running if self.forced == Forced::NeverAccepts => {
+                self.refused_running = true;
+                Reply::Invalid
+            }
             QueriedState::Running => {
-                self.set(QueriedState::Stopped, clean());
+                let exit = match self.stop_meets {
+                    StopMeets::Clean => clean(),
+                    StopMeets::Failure => daemon_failed(),
+                };
+                self.set(QueriedState::Stopped, exit);
                 Reply::Sent
             }
             _ => Reply::Sent,
@@ -315,6 +376,9 @@ impl ScmActor for Scm {
     fn arm(&mut self, want: WantState, deadline: Deadline) -> io::Result<Waited> {
         self.count_call()?;
         self.check_deadline(deadline, "arm");
+        if !self.change_at_control && !self.change_applied {
+            self.apply_change();
+        }
         if self.armed.is_some() || self.delivered.is_some() {
             self.violations
                 .push("a second notification was registered on one handle".to_string());
@@ -322,6 +386,8 @@ impl ScmActor for Scm {
         if deadline.expired() {
             return Ok(Waited::Expired);
         }
+        // A registration made after `DeleteService` succeeds and delivers (measured, P13a/b), so
+        // a service marked for deletion is armed like any other.
         self.armed = Some(want);
         if in_mask(want, self.state) {
             self.armed = None;
@@ -398,10 +464,14 @@ impl ScmActor for Scm {
         self.last_stopped
     }
 
-    fn query_status(&mut self) -> io::Result<(QueriedState, RecordedExit)> {
+    fn query_status(&mut self) -> io::Result<QueriedStatus> {
         self.count_call()?;
         self.known = Known::Is(self.state);
-        Ok((self.state, self.exit))
+        Ok(QueriedStatus {
+            state: self.state,
+            exit: self.exit,
+            accepts_stop: self.forced != Forced::NeverAccepts,
+        })
     }
 
     fn recovery(&mut self) -> io::Result<Recovery> {
@@ -426,20 +496,39 @@ fn run(path: Path, scm: &mut Scm, deadline: Deadline) -> io::Result<Outcome> {
             StopWaited::Confirmed => Outcome::Stopped,
             StopWaited::Expired => Outcome::Expired,
             StopWaited::RestartPending => Outcome::RestartPending,
+            StopWaited::Incomplete => unreachable!("the model never reports an incomplete stop"),
         },
         Path::StopTimeoutZero => match request_stop(scm)? {
             RequestedStop::Issued => Outcome::Issued,
             RequestedStop::RestartPending => Outcome::RestartPending,
+            RequestedStop::Incomplete => unreachable!("the model never reports an incomplete stop"),
         },
         Path::UninstallStep1 | Path::UninstallStep3 => match uninstall_teardown(scm, deadline)? {
-            Waited::Confirmed => Outcome::Stopped,
-            Waited::Expired => Outcome::Expired,
+            StopWaited::Confirmed => Outcome::Stopped,
+            StopWaited::Expired => Outcome::Expired,
+            other => unreachable!("an uninstall cannot end {other:?} in the model"),
         },
     })
 }
 
-/// The state a stop acts on after the change: the first state, or what it became.
+/// The dimensions of a row that are not the path or the first state.
+#[derive(Debug, Clone, Copy)]
+struct Row {
+    change: Change,
+    forced: Forced,
+    starts: Starts,
+    stop_meets: StopMeets,
+}
+
+/// The state a stop acts on: the first state, or what it became when the stop's next step found it
+/// changed. A service that is already stopped is acted on as read, since no step follows.
 fn acted_on(first: First, change: Change) -> First {
+    if matches!(
+        first,
+        First::StoppedClean | First::StoppedFailed | First::StoppedFailedNoRecovery
+    ) {
+        return first;
+    }
     match change {
         Change::None => first,
         Change::ToStartPending => First::StartPending,
@@ -449,32 +538,57 @@ fn acted_on(first: First, change: Change) -> First {
     }
 }
 
-/// The outcome the spec gives for `path` when the service is first read as `first`, and a change
-/// and a refused control then move it to `acted_on`.
-fn expected(path: Path, first: First, change: Change) -> Outcome {
+/// What a `STOPPED` with the daemon's failure recorded settles as: a restart is pending when recovery
+/// actions are configured.
+fn settled_failed(first: First) -> Outcome {
+    if first == First::StoppedFailedNoRecovery {
+        Outcome::Stopped
+    } else {
+        Outcome::RestartPending
+    }
+}
+
+/// The outcome the spec gives for `path` when the service is first read as `first` and the row's
+/// dimensions play out.
+fn expected(path: Path, first: First, row: &Row) -> Outcome {
+    let acts_on = acted_on(first, row.change);
+    // How a stop that reaches a running daemon ends.
+    let running = match row.stop_meets {
+        StopMeets::Clean => Outcome::Stopped,
+        StopMeets::Failure => settled_failed(first),
+    };
     match path {
-        // Waits out a queued restart, stops what it starts, and ends stopped whatever happens meanwhile.
-        Path::Stop | Path::UninstallStep1 | Path::UninstallStep3 => Outcome::Stopped,
-        // A spent budget waits for nothing: a restart still to come is reported, a stop in progress
-        // or a control just sent is left unconfirmed, and a service with nothing queued is stopped.
+        // Waits out a start or a stop in progress, stops a running daemon, and refuses a restart
+        // that is pending: it never waits on one.
+        Path::Stop => match acts_on {
+            First::StoppedClean | First::StopPending => Outcome::Stopped,
+            First::StoppedFailed | First::StoppedFailedNoRecovery => settled_failed(first),
+            First::Running => running,
+            First::StartPending => match row.starts {
+                Starts::Runs => running,
+                Starts::DaemonFails | Starts::ShimFails => settled_failed(first),
+                Starts::AttemptFailsClean => Outcome::Stopped,
+            },
+        },
+        // A spent budget waits for nothing: a start in progress is reported, a stop in progress or a
+        // control just sent is left unconfirmed, and a stopped service is judged as it is.
         Path::StopOnSpentBudget => match first {
-            First::StartPending | First::StoppedFailed => Outcome::RestartPending,
+            First::StartPending => Outcome::RestartPending,
             First::StopPending | First::Running => Outcome::Expired,
-            First::StoppedClean | First::StoppedFailedNoRecovery => Outcome::Stopped,
+            First::StoppedClean => Outcome::Stopped,
+            First::StoppedFailed | First::StoppedFailedNoRecovery => settled_failed(first),
         },
         // Waits for nothing and sends a control only to a running service: a service that is
-        // starting, or has a restart queued, is reported.
+        // starting, or has a restart pending, is reported.
         Path::StopTimeoutZero => {
-            let seen = if first == First::Running {
-                acted_on(first, change)
-            } else {
-                first
-            };
+            let seen = if first == First::Running { acts_on } else { first };
             match seen {
                 First::StartPending | First::StoppedFailed => Outcome::RestartPending,
                 _ => Outcome::Issued,
             }
         }
+        // Stops what runs, waits for no restart, and deletes.
+        Path::UninstallStep1 | Path::UninstallStep3 => Outcome::Stopped,
     }
 }
 
@@ -487,67 +601,91 @@ fn every_stop_path_survives_every_interleaving_of_the_service_state() {
         for first in FIRSTS {
             for change in CHANGES {
                 for forced in FORCED {
-                    rows += 1;
-                    let deadline = if path == Path::StopOnSpentBudget {
-                        Budget::Immediate.start()
-                    } else {
-                        Budget::Unbounded.start()
-                    };
-                    let mut scm = Scm::new(first, change, forced, deadline, path == Path::UninstallStep3);
-                    let row = format!("{path:?} / first read {first:?} / then {change:?} / control {forced:?}");
-                    let outcome = run(path, &mut scm, deadline);
-                    if scm.controls > 0 {
-                        reached_a_control += 1;
-                    }
-                    let mut problems = std::mem::take(&mut scm.violations);
-                    // A running service that refuses `STOP` for good is an error, not a state to
-                    // read again: rereading it would refuse again, for ever.
-                    let refuses_for_good =
-                        forced == Forced::Invalid && scm.state_at_first_control == Some(QueriedState::Running);
-                    if refuses_for_good {
-                        match outcome {
-                            Err(e) if e.to_string().contains("does not accept the stop control") => {}
-                            other => problems.push(format!("a refusal for good gave {other:?}")),
+                    for starts in STARTS {
+                        for stop_meets in STOP_MEETS {
+                            rows += 1;
+                            let row = Row {
+                                change,
+                                forced,
+                                starts,
+                                stop_meets,
+                            };
+                            let deadline = if path == Path::StopOnSpentBudget {
+                                Budget::Immediate.start()
+                            } else {
+                                Budget::Unbounded.start()
+                            };
+                            let mut scm = Scm::new(first, &row, deadline, path == Path::UninstallStep3);
+                            let label = format!("{path:?} / first read {first:?} / {row:?}");
+                            let outcome = run(path, &mut scm, deadline);
+                            if scm.controls > 0 {
+                                reached_a_control += 1;
+                            }
+                            let mut problems = std::mem::take(&mut scm.violations);
+                            // A running service that refuses `STOP` for good is an error, not a state
+                            // to read again: rereading it would refuse again, for ever.
+                            if scm.refused_running {
+                                match &outcome {
+                                    Err(e) if e.to_string().contains("does not accept the stop control") => {}
+                                    other => problems.push(format!("a refusal for good gave {other:?}")),
+                                }
+                                // The error says whether the delete happened, and it must be true.
+                                if let Err(e) = &outcome
+                                    && matches!(path, Path::UninstallStep1 | Path::UninstallStep3)
+                                {
+                                    let text = e.to_string();
+                                    if text.contains("NOT deleted") != (scm.deletes == 0) {
+                                        problems.push(format!("{} deletes, but the error says: {text}", scm.deletes));
+                                    }
+                                }
+                            } else {
+                                let want = expected(path, first, &row);
+                                match outcome {
+                                    Ok(got) if got == want => {}
+                                    Ok(got) => problems.push(format!("outcome {got:?}, wanted {want:?}")),
+                                    Err(e) => problems.push(format!("errored: {e}")),
+                                }
+                                let stopped_for_good = match path {
+                                    Path::Stop => want == Outcome::Stopped,
+                                    Path::UninstallStep1 | Path::UninstallStep3 => true,
+                                    Path::StopOnSpentBudget | Path::StopTimeoutZero => false,
+                                };
+                                if stopped_for_good && (scm.state != QueriedState::Stopped || scm.restart_queued) {
+                                    problems.push(format!(
+                                        "ended {:?} with a restart queued: {}",
+                                        scm.state, scm.restart_queued
+                                    ));
+                                }
+                                if matches!(path, Path::UninstallStep1 | Path::UninstallStep3) {
+                                    if scm.deletes != 1 {
+                                        problems.push(format!("deleted {} times", scm.deletes));
+                                    }
+                                    if path == Path::UninstallStep3 && scm.controls_before_delete > 0 {
+                                        problems.push("step 1 sent a control to a stopped service".to_string());
+                                    }
+                                }
+                            }
+                            if !problems.is_empty() {
+                                failures.push(format!("{label}: {}", problems.join("; ")));
+                            }
                         }
-                        if path == Path::UninstallStep1 && scm.deletes != 0 {
-                            problems.push("deleted a service it could not stop".to_string());
-                        }
-                        if !problems.is_empty() {
-                            failures.push(format!("{row}: {}", problems.join("; ")));
-                        }
-                        continue;
-                    }
-                    let want = expected(path, first, change);
-                    match outcome {
-                        Ok(got) if got == want => {}
-                        Ok(got) => problems.push(format!("outcome {got:?}, wanted {want:?}")),
-                        Err(e) => problems.push(format!("errored: {e}")),
-                    }
-                    if matches!(path, Path::Stop | Path::UninstallStep1 | Path::UninstallStep3)
-                        && (scm.state != QueriedState::Stopped || scm.restart_queued)
-                    {
-                        problems.push(format!(
-                            "ended {:?} with a restart queued: {}",
-                            scm.state, scm.restart_queued
-                        ));
-                    }
-                    if matches!(path, Path::UninstallStep1 | Path::UninstallStep3) {
-                        if scm.deletes != 1 {
-                            problems.push(format!("deleted {} times", scm.deletes));
-                        }
-                        if path == Path::UninstallStep3 && scm.controls_before_delete > 0 {
-                            problems.push("step 1 sent a control to a stopped service".to_string());
-                        }
-                    }
-                    if !problems.is_empty() {
-                        failures.push(format!("{row}: {}", problems.join("; ")));
                     }
                 }
             }
         }
     }
     eprintln!(
-        "{rows} rows (5 paths x 6 first states x 5 changes x 4 control results); {reached_a_control} send a control"
+        "{rows} rows ({} paths x {} first states x {} changes x {} control results x {} start outcomes x {} stop outcomes); {reached_a_control} send a control",
+        PATHS.len(),
+        FIRSTS.len(),
+        CHANGES.len(),
+        FORCED.len(),
+        STARTS.len(),
+        STOP_MEETS.len(),
+    );
+    assert!(
+        reached_a_control > 0,
+        "no row sent a control: the dimension that reaches the control step is not exercised"
     );
     assert!(
         failures.is_empty(),

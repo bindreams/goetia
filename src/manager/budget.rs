@@ -123,35 +123,16 @@ pub fn timed_out(id: &str, awaited: &'static str, budget: Budget) -> crate::Erro
 // restart_pending =====================================================================================================
 
 /// The one [`crate::Error::RestartPending`] constructor: `stop` found the service being started by
-/// SCM, or a restart queued by its recovery actions, and either did not wait for that
-/// (`Immediate`, or `Bounded(ZERO)`) or waited `budget` and it had not settled. In both cases
-/// nothing was stopped.
-///
-/// `Unbounded` waits until the restart arrives and stops what it starts, so it never reports this.
-pub fn restart_pending(id: &str, budget: Budget) -> crate::Error {
-    let advice = format!(
-        "Allow longer with `--timeout <duration>`, or wait indefinitely with `--no-timeout`; \
-         `goetia daemon status {id}` shows the manager's current view."
-    );
-    let recovery = match budget {
-        Budget::Bounded(waited) if waited > Duration::ZERO => format!(
-            "SCM is starting it, or has a restart queued; goetia did not stop it. goetia waited {} \
-             for that to settle and stopped waiting. {advice}",
-            humantime::format_duration(waited),
-        ),
-        Budget::Immediate | Budget::Bounded(_) => format!(
-            "SCM is starting it, or has a restart queued; goetia did not stop it. `--timeout 0` does \
-             not wait for that to settle. Run `goetia daemon stop {id}` with a `--timeout` above 0 \
-             to wait for it and stop the daemon it starts. {advice}"
-        ),
-        Budget::Unbounded => {
-            debug_assert!(false, "an unbounded wait cannot run out of budget");
-            String::new()
-        }
-    };
+/// SCM, or a restart queued by its recovery actions. Nothing was stopped, and nothing can cancel
+/// the restart.
+pub fn restart_pending(id: &str) -> crate::Error {
     crate::Error::RestartPending {
         id: id.to_string(),
-        recovery,
+        recovery: format!(
+            "SCM is starting it, or has a restart queued that goetia cannot cancel; goetia did not \
+             stop it. Run `goetia daemon stop {id}` again once the daemon is back, or \
+             `goetia daemon uninstall {id}`."
+        ),
     }
 }
 

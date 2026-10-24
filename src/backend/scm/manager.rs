@@ -237,7 +237,8 @@ impl ServiceManager for ScmManager {
         if !budget.waits() {
             return match super::wait::request_stop(&mut actor).map_err(|e| Error::Other(format!("stop `{id}`: {e}")))? {
                 RequestedStop::Issued => Ok(()),
-                RequestedStop::RestartPending => Err(budget::restart_pending(id.as_str(), budget)),
+                RequestedStop::RestartPending => Err(budget::restart_pending(id.as_str())),
+                RequestedStop::Incomplete => Err(daemon_may_still_run(id, "stop", "the service stopped")),
             };
         }
         let waited = super::wait::stop_via_notify(&mut actor, deadline)
@@ -245,7 +246,8 @@ impl ServiceManager for ScmManager {
         match waited {
             StopWaited::Confirmed => Ok(()),
             StopWaited::Expired => Err(budget::timed_out(id.as_str(), "stopped", budget)),
-            StopWaited::RestartPending => Err(budget::restart_pending(id.as_str(), budget)),
+            StopWaited::RestartPending => Err(budget::restart_pending(id.as_str())),
+            StopWaited::Incomplete => Err(daemon_may_still_run(id, "stop", "the service stopped")),
         }
     }
 
@@ -914,15 +916,28 @@ fn uninstall_locked(id: &Id) -> Result<()> {
     // says whether the service was deleted.
     let waited = super::wait::uninstall_teardown(&mut actor, Budget::Unbounded.start())
         .map_err(|e| Error::Other(format!("uninstall `{id}`: {e}")))?;
-    match waited {
-        Waited::Confirmed => {}
-        // `let _ = …` is the write that turns an unreachable case into a silent one, and this
-        // is precisely the case where a later edit narrowing that budget must not pass quietly.
-        Waited::Expired => unreachable!("uninstall's stop is Unbounded; an unbounded deadline never expires"),
-    }
     // The record goes when the last handle closes, so this is the end of the uninstall.
     drop(actor);
-    Ok(())
+    match waited {
+        StopWaited::Confirmed => Ok(()),
+        // The service is deleted; the daemon the shim could not kill is not.
+        StopWaited::Incomplete => Err(daemon_may_still_run(id, "uninstall", "the service was deleted")),
+        // `let _ = …` is the write that turns an unreachable case into a silent one, and this
+        // is precisely the case where a later edit narrowing that budget must not pass quietly.
+        StopWaited::Expired => unreachable!("uninstall's stop is Unbounded; an unbounded deadline never expires"),
+        StopWaited::RestartPending => unreachable!("uninstall's stop never judges a restart"),
+    }
+}
+
+/// The error for a stop whose shim could not kill the daemon: SCM counts the service stopped, but
+/// the daemon may be running, and a second one would start beside it. `did` is what happened
+/// anyway.
+fn daemon_may_still_run(id: &Id, verb: &str, did: &str) -> Error {
+    Error::Other(format!(
+        "{verb} `{id}`: {did}, but goetia-shim could not kill the daemon, which may still be \
+         running (its log and the Windows Event Log name the failed kills). Stop its process \
+         yourself before starting it again."
+    ))
 }
 
 // shared helpers ======================================================================================================
