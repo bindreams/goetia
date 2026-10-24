@@ -76,6 +76,9 @@ pub fn kill_service<T: KillTarget>(target: &mut T) -> io::Result<Killed> {
 }
 
 #[cfg(windows)]
+mod privilege;
+
+#[cfg(windows)]
 pub use system::SystemKillTarget;
 
 #[cfg(windows)]
@@ -91,6 +94,7 @@ mod system {
         INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
     };
 
+    use super::privilege::DebugPrivilege;
     use super::{KillTarget, Termination};
 
     /// The real SCM service; the process is a Win32 handle.
@@ -151,9 +155,11 @@ mod system {
         }
     }
 
-    /// Open `pid` with the rights to terminate it and to wait for its exit. `None` if no process has
-    /// that pid.
+    /// Open `pid` with the rights to terminate it and to wait for its exit, with the caller's
+    /// `SeDebugPrivilege` enabled for the open, as without it a `LocalService` service's process is
+    /// refused. `None` if no process has that pid.
     pub(super) fn open_process(pid: u32) -> io::Result<Option<OwnedHandle>> {
+        let _debug = DebugPrivilege::enable();
         // SAFETY: no pointers; a null return is the failure.
         let handle = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid) };
         if handle.is_null() {
