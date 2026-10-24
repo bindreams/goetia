@@ -1,6 +1,6 @@
 //! The shim's own behavior, exercised through a real, elevated SCM
 //! install/start/stop — the two central failure paths this file covers are
-//! `stop_kills_the_whole_process_tree` (a commanded stop must not respawn,
+//! `stop_kills_the_whole_process_tree` (a commanded stop must not be restarted,
 //! and must reach the whole tree) and
 //! `unreadable_blob_logs_to_fallback_path_and_event_log` (version skew);
 //! `shim_runs_child_with_cwd_and_env`/`shim_captures_stdout_to_logs_path`
@@ -8,10 +8,12 @@
 
 use std::collections::BTreeMap;
 
+use goetia::backend::scm::exit_status::ERROR_INVALID_DATA;
 use goetia::backend::scm::manager::ScmManager;
 use goetia::manager::{Budget, ServiceManager as _};
+use windows_service::service::ServiceExitCode;
 
-use crate::common::{fixture_command, mk_spec_full};
+use crate::common::{fixture_command, mk_spec_full, scm_status};
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -96,12 +98,9 @@ fn stop_kills_the_whole_process_tree() {
     let child_reported = ConnectBack::listen();
     let grandchild_reported = ConnectBack::listen();
 
-    // `restart: always`, not `never`: with `never`, `decide_restart` would
-    // return `Stop` for every input regardless of the `stopping` flag, so
-    // "no replacement child appears" would hold trivially even if the
-    // `stopping`-checked-first logic this test exists to guard were deleted
-    // outright. `always` is the policy that would actually respawn a
-    // replacement absent that check.
+    // `on-failure`, not `never`: under `never` SCM has no recovery actions, so "no replacement
+    // child appears" would hold trivially even if the shim reported the killed daemon as a
+    // failure. `on-failure` is the policy that would actually restart it.
     let spec = mk_spec_full(
         &id,
         fixture_command(
@@ -113,7 +112,7 @@ fn stop_kills_the_whole_process_tree() {
         ),
         None,
         BTreeMap::new(),
-        goetia::spec::Restart::Always,
+        goetia::spec::Restart::OnFailure,
         None,
         None,
     );
@@ -125,10 +124,8 @@ fn stop_kills_the_whole_process_tree() {
     // The synchronous barrier `ConnectBack::connected_yet`'s own doc
     // comment requires: `stop` blocks (via a real `NotifyServiceStatusChangeW`
     // wait, `backend::scm::manager::scm_wait`) until SCM confirms
-    // `SERVICE_STOPPED`, and the shim does not report that until AFTER it
-    // has already decided not to respawn (see `service::supervisor_loop`'s
-    // `Stopping` arm) — so nothing after this call can still be racing a
-    // decision made before it returned.
+    // `SERVICE_STOPPED`, and the shim reports `Win32(0)` for a commanded stop, so SCM has
+    // queued no restart by the time this call returns.
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
 
     // The namesake claim: the stop reached the *whole* tree, not merely
@@ -167,45 +164,6 @@ fn pid_is_alive(pid: &str) -> bool {
 }
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn on_failure_respawns_after_a_nonzero_exit() {
-    let mgr = ScmManager::new();
-    let id = support::random_test_id();
-    let _guard = ServiceGuard::new(&id);
-    let reported = ConnectBack::listen();
-
-    // No `restart-delay` — exercises the real end-to-end wiring for
-    // `supervisor::DEFAULT_RESTART_DELAY`, not only the pure
-    // `missing_restart_delay_uses_the_documented_default` unit test.
-    let spec = mk_spec_full(
-        &id,
-        fixture_command("exit", &[&reported.port().to_string(), "1"]),
-        None,
-        BTreeMap::new(),
-        goetia::spec::Restart::OnFailure,
-        None,
-        None,
-    );
-    mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
-
-    reported.accept("the first spawn to report in before exiting 1");
-    let before_respawn = std::time::Instant::now();
-    reported.accept("a respawned child to report in after the first one exited nonzero");
-    let elapsed = before_respawn.elapsed();
-
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
-
-    // A real, if generous (scheduling jitter, not a chosen synchronization
-    // bound), lower bound on `DEFAULT_RESTART_DELAY` (1s): proves the
-    // supervisor actually paced the respawn rather than looping
-    // immediately, without pinning it to an exact duration.
-    assert!(
-        elapsed >= std::time::Duration::from_millis(700),
-        "respawn happened after only {elapsed:?}, faster than the documented ~1s restart-delay default allows for"
-    );
-}
-
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn unreadable_blob_logs_to_fallback_path_and_event_log() {
     let mgr = ScmManager::new();
     let id = support::random_test_id();
@@ -228,6 +186,14 @@ fn unreadable_blob_logs_to_fallback_path_and_event_log() {
         .start(&spec.id, Budget::DEFAULT)
         .expect_err("a shim that cannot decode its own metadata blob must fail to start, not hang");
     let _ = err;
+
+    // The shim's own failure, in the Win32 space: it cannot read as a daemon's exit code.
+    let status = scm_status(&id);
+    assert_eq!(
+        status.exit_code,
+        ServiceExitCode::Win32(ERROR_INVALID_DATA),
+        "an undecodable blob is a shim failure: {status:?}"
+    );
 
     let fallback_path = programdata_dir().join("Goetia").join("logs").join(format!("{id}.log"));
     let logged = std::fs::read_to_string(&fallback_path)

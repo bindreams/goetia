@@ -78,7 +78,7 @@ fn no_daemon_is_spawned_when_no_thread_can_be_made_to_wait_on_it() {
         test_hook::spawns(),
         spawned_before,
         "the daemon was spawned before the thread that would have waited on it was made — \
-         a failure there leaves it running with nothing supervising it"
+         a failure there leaves it running with nothing waiting on it"
     );
     // A witness outside the `#[cfg(test)]` counter above, which on its own would keep passing if
     // that hook ever drifted from the production wiring: `build_command` opens this file with

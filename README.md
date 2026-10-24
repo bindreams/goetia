@@ -630,6 +630,31 @@ quote it as a single argument. All four verbs take a variadic id list, so
 daemon id — and goetia then reports that a daemon called `30s` is not
 installed, which is a confusing answer to a typo the shell made.
 
+### Restarts on Windows
+
+Windows restarts a daemon through the service manager's recovery actions, for
+`type: simple` and `type: managed` alike. `goetia-shim` runs your command once,
+reports how it ended as the service's exit, and exits. With `restart: on-failure`
+SCM then starts a new shim after `restart-delay` (1s by default), and that shim
+reads the spec as installed, so a daemon restarted after `goetia daemon install`
+runs the updated spec. A shim that is killed or crashes is restarted too. A
+clean exit and `goetia daemon stop` are never restarted.
+
+`sc query` shows the difference between your command failing and the shim
+failing:
+
+| What happened                      | Exit code SCM records                                                          |
+| ---------------------------------- | ------------------------------------------------------------------------------ |
+| command exited `0`, or was stopped | `0`                                                                            |
+| command exited `n`, not `0`        | service-specific `n` (`WIN32_EXIT_CODE` `1066`)                                |
+| the shim could not run the command | a Win32 code: the OS error, `13` for an unreadable spec, `31` if there is none |
+
+Under `on-failure` both failures are restarted, so a spec the shim cannot read
+or a command that is missing retries at `restart-delay` indefinitely, as it
+does for `type: managed`. If the shim cannot kill the command on `stop`, it
+logs both failed kills and still reports the stop as clean, because a failure
+code would make SCM start a second copy.
+
 ### What returning means
 
 The platform's service manager reports the service as running, as far as it
@@ -645,10 +670,9 @@ confirms differs:
   `stop` of a unit systemd cannot load and that is not running: systemd
   answers it "not loaded" with no job, since there is nothing to stop, and
   that stop succeeds.
-- **SCM**, for a `type: simple` daemon, confirms that `goetia-shim` started.
-  Under `restart: on-failure` the shim reports running before its
-  first spawn, so your own command failing to start is not part of what was
-  confirmed.
+- **SCM**, for a `type: simple` daemon, confirms that `goetia-shim` started
+  your command: the shim reports running after the spawn, so a command that
+  cannot start is a failed start under every `restart:` policy.
 - **launchd** sits between the two: the pid `launchctl kickstart -p` reports
   is launchd's own fork, taken before the user process reaches its `exec`.
 
