@@ -17,6 +17,8 @@ use windows_sys::Win32::System::Services::{
 };
 use windows_sys::Win32::System::Threading::{INFINITE, SleepEx};
 
+use crate::backend::scm::exit_status::RecordedExit;
+
 use super::{Deadline, Observed, QueriedState, StartReply, Waited, WantState};
 
 /// `windows-service`'s `Error` does not implement `Into<io::Error>` for
@@ -35,6 +37,8 @@ fn to_io_error(e: windows_service::Error) -> io::Error {
 /// the awaiting loop must not treat them as loop-invariant.
 struct LastStatus {
     current_state: AtomicU32,
+    exit_win32: AtomicU32,
+    exit_specific: AtomicU32,
     fired: AtomicBool,
 }
 
@@ -72,8 +76,13 @@ unsafe extern "system" fn notify_callback(pparameter: *const c_void) {
     if slot.is_null() {
         return;
     }
-    let state = unsafe { (*buf).ServiceStatus.dwCurrentState };
+    let status = unsafe { &(*buf).ServiceStatus };
+    let state = status.dwCurrentState;
     unsafe {
+        (*slot).exit_win32.store(status.dwWin32ExitCode, Ordering::Release);
+        (*slot)
+            .exit_specific
+            .store(status.dwServiceSpecificExitCode, Ordering::Release);
         (*slot).current_state.store(state, Ordering::Release);
         (*slot).fired.store(true, Ordering::Release);
     }
@@ -156,6 +165,8 @@ impl SystemScmActor {
             service: Some(service),
             status: Box::new(LastStatus {
                 current_state: AtomicU32::new(0),
+                exit_win32: AtomicU32::new(0),
+                exit_specific: AtomicU32::new(0),
                 fired: AtomicBool::new(false),
             }),
             notify: Box::default(),
@@ -359,5 +370,12 @@ impl super::ScmActor for SystemScmActor {
         } else {
             Observed::Pending
         }))
+    }
+
+    fn stopped_exit(&self) -> RecordedExit {
+        RecordedExit {
+            win32: self.status.exit_win32.load(Ordering::Acquire),
+            specific: self.status.exit_specific.load(Ordering::Acquire),
+        }
     }
 }

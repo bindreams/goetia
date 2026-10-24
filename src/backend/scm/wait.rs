@@ -14,6 +14,7 @@
 
 use std::io;
 
+use crate::backend::scm::exit_status::RecordedExit;
 use crate::manager::budget::Deadline;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,9 +27,9 @@ pub enum WantState {
 /// a callback can report a state that is neither what the caller wants nor
 /// its opposite. `Running`/`Stopped` are terminal; `Pending` is any
 /// intermediate (`StartPending`/`StopPending`) and re-arms.
-/// [`start_via_notify`] treats a terminal `Stopped` as a *failed* start (the
-/// service stopped instead of reaching `Running`), returning `Err` rather
-/// than blocking forever.
+/// [`start_via_notify`] reads a terminal `Stopped` through the exit code SCM
+/// recorded: the daemon having run is a start, the shim failing is a *failed*
+/// start returning `Err`, and neither blocks forever.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Observed {
     Running,
@@ -76,6 +77,10 @@ pub trait ScmActor {
     /// return the service's observed state from the callback buffer;
     /// `Ok(None)` iff `deadline` expired with nothing delivered.
     fn wait_callback(&mut self, deadline: Deadline) -> io::Result<Option<Observed>>;
+    /// The exit code SCM recorded with the `Stopped` that the last [`Self::wait_callback`]
+    /// returned. Read from that notification, not queried afterwards: a recovery action may have
+    /// restarted the service by then.
+    fn stopped_exit(&self) -> RecordedExit;
 }
 
 /// Stop the service, gated strictly on a real `STOPPED` callback from
@@ -155,12 +160,18 @@ pub fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Resul
         match a.wait_callback(deadline)? {
             None => return Ok(Waited::Expired),
             Some(Observed::Running) => return Ok(Waited::Confirmed),
-            // A terminal Stopped means the service stopped instead of
-            // reaching Running — a failed start, not an expiry.
+            // A terminal Stopped is not an expiry. It is a start when the shim launched the
+            // daemon and the daemon then ended before the wait saw Running: confirming the
+            // launch, as `systemctl start` confirms the exec, keeps the answer from depending
+            // on whether the wait saw Running or Stopped first. Otherwise the daemon never ran.
             Some(Observed::Stopped) => {
-                return Err(io::Error::other(
-                    "service stopped before reaching Running (failed start)",
-                ));
+                let exit = a.stopped_exit();
+                if exit.daemon_ran() {
+                    return Ok(Waited::Confirmed);
+                }
+                return Err(io::Error::other(format!(
+                    "service stopped before reaching Running (failed start): it recorded {exit}"
+                )));
             }
             Some(Observed::Pending) => {
                 if a.arm(WantState::Running, deadline)? == Waited::Expired {

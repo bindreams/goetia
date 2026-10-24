@@ -23,7 +23,7 @@ use goetia::backend::scm::exit_status::{
     ERROR_BAD_ARGUMENTS, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_INVALID_DATA, Reported,
 };
 use goetia::backend::scm::manager::read_spec_blob;
-use goetia::spec::DaemonSpec;
+use goetia::spec::{DaemonSpec, Restart};
 use windows_service::service::{
     ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
 };
@@ -103,6 +103,9 @@ fn run_service(id: &str) {
         }
     };
 
+    if let Some(notice) = version_skew_notice(&blob.spec, &blob.version, goetia::version()) {
+        logging::log_failure(id, &notice);
+    }
     let reported = run_daemon(&blob.spec, &stop_bus, id, || report_running(id, &status_handle));
     finish(id, &status_handle, reported);
 }
@@ -286,6 +289,26 @@ fn thread_refused(command: &[String], e: &std::io::Error) -> String {
 
 fn spawn_failed(command: &[String], e: &cosca::error::Error) -> String {
     format!("spawn {command:?}: {e}")
+}
+
+/// The failure line for a service registered by another goetia version, or `None` when there is
+/// nothing to say. Recovery actions are applied at install time, so a service registered before
+/// they existed (or by a version that set different ones) keeps running under this shim without
+/// restarts until `goetia daemon install` is run again.
+fn version_skew_notice(spec: &DaemonSpec, registered_by: &str, running: &str) -> Option<String> {
+    if registered_by == running || spec.restart == Restart::Never {
+        return None;
+    }
+    let mut notice = format!(
+        "daemon {:?} was registered by goetia {registered_by} and this goetia-shim is {running}: its SCM          recovery actions may be missing, so it may not restart after a failure. Run `goetia daemon install`          to apply them",
+        spec.name
+    );
+    if spec.restart == Restart::Always {
+        notice.push_str(
+            ", after setting `backend-specific: scm: { restart: on-failure }` in the manifest: `restart: always`              is not supported for scm",
+        );
+    }
+    Some(notice)
 }
 
 fn log_open_failed(path: &std::path::Path, e: &std::io::Error) -> String {

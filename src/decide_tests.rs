@@ -341,11 +341,12 @@ fn older_version_is_stale_not_conflict() {
     );
 }
 
-/// A `type: simple` service registered by 0.1.0 has no recovery actions on disk; the generator now
-/// writes them. The version check runs first, so that difference is a `Stale` refresh and never a
-/// `Conflict` that needs `--force`.
+/// A rendering that differs from the desired one only in its recovery actions, as a `type: simple`
+/// service registered by 0.1.0 does, is a `Stale` refresh and never a `Conflict`, because the
+/// version is compared before the content. Pins that ordering only; that re-installing such a
+/// service really writes the actions is `reinstalling_an_earlier_version_simple_service_applies_the_recovery_actions`.
 #[skuld::test]
-fn a_0_1_0_simple_artifact_is_stale_not_conflict() {
+fn a_version_difference_wins_over_a_difference_in_recovery_actions() {
     use crate::backend::Identity;
     use crate::backend::scm::generate::{ScmRegistration, registration, render};
 

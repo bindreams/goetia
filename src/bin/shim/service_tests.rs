@@ -405,7 +405,7 @@ fn an_unkillable_daemon_reports_the_incomplete_stop_failure() {
         &lines[1..],
         id.as_str(),
         &format!(
-            "fallback kill on stop: {KILL_REFUSED}; the daemon was neither killed nor reaped and may still be running — reporting the service stopped, with that failure, rather than waiting for an exit nothing can now cause"
+            "fallback kill on stop: {KILL_REFUSED}; the daemon was neither killed nor reaped and may still be running — SCM is told the service stopped cleanly (exit code 0) so that it does not start a second copy beside it"
         ),
     );
 }
@@ -473,4 +473,56 @@ fn the_os_error_of_an_io_failure_is_kept_and_other_failures_have_none() {
         }),
         None
     );
+}
+
+// Services registered by an earlier version ---------------------------------------------------------------------------
+
+fn spec_restarting(restart: Restart) -> DaemonSpec {
+    DaemonSpec {
+        restart,
+        ..spec(Path::new("unused"), "earlier-registration")
+    }
+}
+
+#[skuld::test]
+fn an_earlier_registration_under_on_failure_names_the_daemon_and_the_remedy() {
+    let notice = version_skew_notice(&spec_restarting(Restart::OnFailure), "0.1.0", "0.2.0");
+
+    assert_eq!(
+        notice.as_deref(),
+        Some(
+            r#"daemon "goetia-shim launch test" was registered by goetia 0.1.0 and this goetia-shim is 0.2.0: its SCM recovery actions may be missing, so it may not restart after a failure. Run `goetia daemon install` to apply them"#
+        )
+    );
+}
+
+#[skuld::test]
+fn an_earlier_registration_under_always_also_names_the_manifest_change() {
+    let notice = version_skew_notice(&spec_restarting(Restart::Always), "0.1.0", "0.2.0");
+
+    assert_eq!(
+        notice.as_deref(),
+        Some(
+            r#"daemon "goetia-shim launch test" was registered by goetia 0.1.0 and this goetia-shim is 0.2.0: its SCM recovery actions may be missing, so it may not restart after a failure. Run `goetia daemon install` to apply them, after setting `backend-specific: scm: { restart: on-failure }` in the manifest: `restart: always` is not supported for scm"#
+        )
+    );
+}
+
+#[skuld::test]
+fn no_notice_for_a_daemon_that_is_never_restarted() {
+    assert_eq!(
+        version_skew_notice(&spec_restarting(Restart::Never), "0.1.0", "0.2.0"),
+        None
+    );
+}
+
+#[skuld::test]
+fn no_notice_when_the_shim_is_the_version_that_registered_the_service() {
+    for restart in [Restart::Never, Restart::OnFailure, Restart::Always] {
+        assert_eq!(
+            version_skew_notice(&spec_restarting(restart), "0.2.0", "0.2.0"),
+            None,
+            "{restart:?}"
+        );
+    }
 }

@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 
 use super::*;
+use crate::backend::scm::exit_status::{RecordedExit, Reported};
 use crate::manager::budget::{Budget, Deadline};
 
 /// Records the granular SCM steps in call order and replays a scripted
@@ -25,6 +26,8 @@ struct FakeScm {
     deadlines: Vec<Deadline>,
     /// The deadline each `arm` was handed, in call order.
     arm_deadlines: Vec<Deadline>,
+    /// What SCM recorded for a `Stopped` the script delivers.
+    recorded: RecordedExit,
 }
 
 impl FakeScm {
@@ -37,7 +40,15 @@ impl FakeScm {
             start_reply: StartReply::Accepted,
             deadlines: vec![],
             arm_deadlines: vec![],
+            recorded: shim_failed(),
         }
+    }
+
+    /// A delivered `Stopped` carries the record `reported` leaves in SCM.
+    fn stopped_after(mut self, reported: Reported) -> Self {
+        let (win32, specific) = reported.scm_codes();
+        self.recorded = RecordedExit { win32, specific };
+        self
     }
 
     /// Every `arm` reports `reports` rather than `Waited::Confirmed`.
@@ -96,6 +107,15 @@ impl ScmActor for FakeScm {
         });
         Ok(observed)
     }
+    fn stopped_exit(&self) -> RecordedExit {
+        self.recorded
+    }
+}
+
+/// The record of a service whose shim failed before launching the daemon.
+fn shim_failed() -> RecordedExit {
+    let (win32, specific) = Reported::shim_failure(None).scm_codes();
+    RecordedExit { win32, specific }
 }
 
 fn unbounded() -> Deadline {
@@ -172,6 +192,43 @@ fn a_terminal_stopped_after_start_is_still_an_error_not_an_expiry() {
     // differs, so the two must not collapse into one another.
     let mut fake = FakeScm::new([Some(Observed::Pending), Some(Observed::Stopped)]);
     assert!(start_via_notify(&mut fake, unbounded()).is_err());
+}
+
+#[skuld::test]
+fn a_daemon_that_exited_right_after_launch_is_a_started_service() {
+    // `start` confirms the shim launched the daemon, as `systemctl start` confirms the exec: what
+    // the daemon does next is not the start's to judge, and racing it would make the answer vary.
+    for reported in [
+        Reported::from_daemon_code(7),
+        Reported::Clean,
+        Reported::incomplete_stop(),
+    ] {
+        let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(reported);
+        assert_eq!(
+            start_via_notify(&mut fake, unbounded()).unwrap(),
+            Waited::Confirmed,
+            "{reported:?}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_shim_failure_before_launch_is_a_failed_start() {
+    for reported in [Reported::shim_failure(None), Reported::shim_failure(Some(2))] {
+        let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(reported);
+        let err = start_via_notify(&mut fake, unbounded()).unwrap_err();
+        assert!(
+            err.to_string().contains("failed start"),
+            "{reported:?} gave an error that does not say so: {err}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_failed_start_names_the_recorded_code() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(Reported::shim_failure(Some(2)));
+    let err = start_via_notify(&mut fake, unbounded()).unwrap_err();
+    assert!(err.to_string().contains("exit code 2"), "{err}");
 }
 
 #[skuld::test]

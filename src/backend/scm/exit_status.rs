@@ -84,6 +84,34 @@ impl Reported {
     }
 }
 
+/// The exit code SCM holds for a service that reached `STOPPED`: what the shim reported, or
+/// `ERROR_PROCESS_ABORTED` (1067) when its process ended without reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordedExit {
+    pub win32: u32,
+    /// Meaningful only when `win32` is [`ERROR_SERVICE_SPECIFIC_ERROR`].
+    pub specific: u32,
+}
+
+impl RecordedExit {
+    /// Whether the shim launched the daemon and the daemon then ended: a daemon exit
+    /// ([`Reported::Clean`], [`Reported::DaemonExit`], [`Reported::IncompleteStop`]). Any other
+    /// Win32 code is a shim failure before or around the launch.
+    pub fn daemon_ran(self) -> bool {
+        self.win32 == 0 || self.win32 == ERROR_SERVICE_SPECIFIC_ERROR
+    }
+}
+
+impl std::fmt::Display for RecordedExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.win32 == ERROR_SERVICE_SPECIFIC_ERROR {
+            write!(f, "service-specific exit code {}", self.specific)
+        } else {
+            write!(f, "exit code {}", self.win32)
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "exit_status_tests.rs"]
 mod exit_status_tests;

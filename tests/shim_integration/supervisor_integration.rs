@@ -1,7 +1,7 @@
 //! The shim's own behavior, exercised through a real, elevated SCM
 //! install/start/stop — the two central failure paths this file covers are
-//! `stop_kills_the_whole_process_tree` (a commanded stop must not be restarted,
-//! and must reach the whole tree) and
+//! `stop_kills_the_whole_process_tree` (a commanded stop must reach the whole tree and be
+//! recorded as clean) and
 //! `unreadable_blob_logs_to_fallback_path_and_event_log` (version skew);
 //! `shim_runs_child_with_cwd_and_env`/`shim_captures_stdout_to_logs_path`
 //! cover the ordinary spawn path these two failure tests assume works.
@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use goetia::backend::scm::exit_status::ERROR_INVALID_DATA;
 use goetia::backend::scm::manager::ScmManager;
 use goetia::manager::{Budget, ServiceManager as _};
-use windows_service::service::ServiceExitCode;
+use windows_service::service::{ServiceExitCode, ServiceState};
 
 use crate::common::{fixture_command, mk_spec_full, scm_status};
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
@@ -98,9 +98,6 @@ fn stop_kills_the_whole_process_tree() {
     let child_reported = ConnectBack::listen();
     let grandchild_reported = ConnectBack::listen();
 
-    // `on-failure`, not `never`: under `never` SCM has no recovery actions, so "no replacement
-    // child appears" would hold trivially even if the shim reported the killed daemon as a
-    // failure. `on-failure` is the policy that would actually restart it.
     let spec = mk_spec_full(
         &id,
         fixture_command(
@@ -121,17 +118,10 @@ fn stop_kills_the_whole_process_tree() {
     let child_pid = child_reported.accept_line("the direct child to start and report its pid");
     let grandchild_pid = grandchild_reported.accept_line("the grandchild to start and report its pid");
 
-    // The synchronous barrier `ConnectBack::connected_yet`'s own doc
-    // comment requires: `stop` blocks (via a real `NotifyServiceStatusChangeW`
-    // wait, `backend::scm::manager::scm_wait`) until SCM confirms
-    // `SERVICE_STOPPED`, and the shim reports `Win32(0)` for a commanded stop, so SCM has
-    // queued no restart by the time this call returns.
+    // `stop` returns once SCM confirms `STOPPED`, so the shim has reported and the record is final.
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
 
-    // The namesake claim: the stop reached the *whole* tree, not merely
-    // "no new connection arrived" (which a surviving-but-silent process
-    // would also satisfy, since both fixture modes only ever connect once,
-    // at startup).
+    // The stop reached the whole tree, not only the direct child.
     assert!(
         !pid_is_alive(&child_pid),
         "direct child pid {child_pid} is still alive after the stop was confirmed"
@@ -141,15 +131,11 @@ fn stop_kills_the_whole_process_tree() {
         "grandchild pid {grandchild_pid} is still alive after the stop was confirmed"
     );
 
-    assert!(
-        !child_reported.connected_yet(),
-        "a replacement direct child connected after the stop was confirmed — the naive respawn-outside-\
-         the-terminated-job bug"
-    );
-    assert!(
-        !grandchild_reported.connected_yet(),
-        "a replacement grandchild connected after the stop was confirmed"
-    );
+    // `Win32(0)` is the record SCM does not recover from (a commanded stop reported as a failure
+    // would be restarted), so the tree dying is also the last thing this service did.
+    let stopped = scm_status(&id);
+    assert_eq!(stopped.current_state, ServiceState::Stopped, "{stopped:?}");
+    assert_eq!(stopped.exit_code, ServiceExitCode::Win32(0), "{stopped:?}");
 }
 
 /// `tasklist /FI "PID eq <pid>"` prints an informational "no tasks found"

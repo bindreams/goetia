@@ -463,9 +463,12 @@ backend-specific:
 ```
 
 A service installed by an earlier release with `restart: always` on Windows
-keeps working: `status`, `list`, `start`, `stop`, `restart` and `uninstall`
-read its embedded copy of the spec and never see this refusal. `diff` and
-`install` read the manifest, which needs the override above.
+still starts, stops and reports: `status`, `list`, `start`, `stop`, `restart`
+and `uninstall` read its embedded copy of the spec and never see this
+refusal. It is no longer restarted when the command exits, because the new
+`goetia-shim` leaves every restart to SCM and the service has no recovery
+actions. To get them, add the override above to the manifest and run
+`goetia daemon install`; `diff` and `install` read the manifest.
 
 `${VAR}` is substituted only in the override for the backend being
 installed. The other two are validated as authored, never substituted, so a
@@ -638,7 +641,15 @@ reports how it ended as the service's exit, and exits. With `restart: on-failure
 SCM then starts a new shim after `restart-delay` (1s by default), and that shim
 reads the spec as installed, so a daemon restarted after `goetia daemon install`
 runs the updated spec. A shim that is killed or crashes is restarted too. A
-clean exit and `goetia daemon stop` are never restarted.
+clean exit is never restarted, and a stop reports a clean exit. A command that
+fails at the moment a `goetia daemon stop` arrives is restarted anyway: SCM
+cannot tell that stop from the crash.
+
+After upgrading goetia, run `goetia daemon install` again for every daemon
+installed by an older version. Services registered before this shim existed
+have no recovery actions until then, so the new shim runs them but SCM does
+not restart them. The shim logs one line when it starts under a service that a
+different goetia version registered and `restart` is not `never`.
 
 `sc query` shows the difference between your command failing and the shim
 failing:
@@ -672,7 +683,10 @@ confirms differs:
   that stop succeeds.
 - **SCM**, for a `type: simple` daemon, confirms that `goetia-shim` started
   your command: the shim reports running after the spawn, so a command that
-  cannot start is a failed start under every `restart:` policy.
+  cannot start is a failed start under every `restart:` policy. A command that
+  starts and then exits at once is a successful start, whatever its exit code,
+  as with `systemctl start`; it is the command's exit, not `start`, that
+  reports it.
 - **launchd** sits between the two: the pid `launchctl kickstart -p` reports
   is launchd's own fork, taken before the user process reaches its `exec`.
 

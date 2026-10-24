@@ -359,7 +359,7 @@ fn kill_tree_failed(e: &cosca::error::Error) -> String {
 fn fallback_kill_failed(e: &cosca::error::Error) -> String {
     format!(
         "fallback kill on stop: {e}; the daemon was neither killed nor reaped and may still be running — \
-         reporting the service stopped, with that failure, rather than waiting for an exit nothing can now cause"
+         SCM is told the service stopped cleanly (exit code 0) so that it does not start a second copy beside it"
     )
 }
 

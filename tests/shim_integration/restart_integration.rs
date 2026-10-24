@@ -231,6 +231,35 @@ fn a_daemon_that_cannot_be_spawned_fails_start_under_every_policy() {
     }
 }
 
+/// `start` confirms that the shim launched the daemon, so a daemon that exits at once is a started
+/// service whether the wait sees `RUNNING` or the `STOPPED` after it.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn start_confirms_the_launch_of_a_daemon_that_exits_at_once() {
+    let mgr = ScmManager::new();
+    // A delay that cannot elapse during the test, so `on-failure` does not restart the daemon.
+    let hour = Some(Duration::from_secs(3600));
+
+    for (restart, code) in [(Restart::Never, 7), (Restart::OnFailure, 7), (Restart::Never, 0)] {
+        let id = support::random_test_id();
+        let _guard = ServiceGuard::new(&id);
+        let reported = ConnectBack::listen();
+        let spec = mk_spec_full(
+            &id,
+            fixture_command("exit", &[&reported.port().to_string(), &code.to_string()]),
+            None,
+            BTreeMap::new(),
+            restart,
+            hour,
+            None,
+        );
+        mgr.install(&spec, false).expect("install");
+
+        mgr.start(&spec.id, Budget::DEFAULT)
+            .unwrap_or_else(|e| panic!("{restart:?}, exit {code}: a launched daemon must make start succeed: {e}"));
+        reported.accept("the daemon to have run");
+    }
+}
+
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_commanded_stop_reports_win32_zero() {
     let mgr = ScmManager::new();
