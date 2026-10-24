@@ -782,16 +782,16 @@ fn a_stop_request_is_issued_unless_a_restart_is_pending() {
     }
 }
 
-// a delete, then a stop -----------------------------------------------------------------------------------------------
+// the uninstall teardown: stop, delete, settle ------------------------------------------------------------------------
 
-/// The delete is what ends any restart, so it is the first thing done to the service: before the
-/// state is read, and before anything is stopped.
+/// A stopped service gets no stop, whatever is queued for it: the delete that follows is what
+/// cancels a queued restart.
 #[skuld::test]
 fn a_stopped_service_is_deleted_and_not_stopped_whatever_is_queued() {
     for exit in [stopped_clean(), daemon_failed(), shim_failed()] {
         let mut fake = FakeScm::new([]).restarting().found(QueriedState::Stopped, exit);
-        assert_eq!(delete_then_stop(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
-        assert_eq!(fake.log, vec!["delete", "query"], "{exit:?}");
+        assert_eq!(uninstall_teardown(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+        assert_eq!(fake.log, vec!["query", "delete", "query"], "{exit:?}");
         assert_eq!(
             fake.recovery_reads, 0,
             "{exit:?}: the configuration decides nothing here"
@@ -799,18 +799,28 @@ fn a_stopped_service_is_deleted_and_not_stopped_whatever_is_queued() {
     }
 }
 
+/// The stop comes before the delete, so a service that refuses to stop is not left marked for
+/// deletion.
 #[skuld::test]
-fn a_running_service_is_stopped_after_the_delete() {
+fn a_running_service_is_stopped_before_the_delete() {
     let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_with([stopped_clean()]);
-    assert_eq!(delete_then_stop(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(uninstall_teardown(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
     assert_eq!(
         fake.log,
-        vec!["delete", "query", "arm_stopped", "control_stop", "wait", "got_stopped"]
+        vec![
+            "query",
+            "arm_stopped",
+            "control_stop",
+            "wait",
+            "got_stopped",
+            "delete",
+            "query"
+        ]
     );
 }
 
 #[skuld::test]
-fn every_state_but_stopped_is_stopped_after_the_delete() {
+fn every_state_but_stopped_is_stopped_before_the_delete() {
     for state in [
         QueriedState::StartPending,
         QueriedState::StopPending,
@@ -822,34 +832,81 @@ fn every_state_but_stopped_is_stopped_after_the_delete() {
         let mut fake = FakeScm::new([Some(Observed::Stopped)])
             .found(state, stopped_clean())
             .stopped_with([stopped_clean()]);
-        assert_eq!(delete_then_stop(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
-        assert_eq!(fake.log.first(), Some(&"delete"), "{state:?}");
-        assert_eq!(
-            fake.log.iter().filter(|step| **step == "control_stop").count(),
-            1,
-            "{state:?}"
+        assert_eq!(uninstall_teardown(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+        let stop = fake.log.iter().position(|step| *step == "control_stop");
+        let delete = fake.log.iter().position(|step| *step == "delete");
+        assert!(
+            stop.is_some() && delete.is_some() && stop < delete,
+            "{state:?}: {:?}",
+            fake.log
         );
         assert_eq!(
-            fake.log.iter().filter(|step| **step == "delete").count(),
+            fake.log.iter().filter(|step| **step == "control_stop").count(),
             1,
             "{state:?}"
         );
     }
 }
 
-/// A stop that meets a daemon failing at that moment ends on the failure's `STOPPED`. The delete
-/// has cancelled the restart, so the stop does not wait for it, stop what it starts, or look at the
-/// failure actions.
+/// A restart that fires between the stop and the delete is stopped after the delete, on the same
+/// handle. Nothing can start again, so it is stopped without looking at the failure actions.
+#[skuld::test]
+fn a_restart_between_the_stop_and_the_delete_is_stopped_after_the_delete() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)])
+        .restarting()
+        .queried([
+            (QueriedState::Stopped, daemon_failed()),
+            (QueriedState::Running, stopped_clean()),
+        ])
+        .stopped_with([stopped_clean()]);
+    assert_eq!(uninstall_teardown(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        fake.log,
+        vec![
+            "query",
+            "delete",
+            "query",
+            "arm_stopped",
+            "control_stop",
+            "wait",
+            "got_stopped"
+        ]
+    );
+    assert_eq!(fake.recovery_reads, 0);
+}
+
+/// A service whose stop is refused is left intact: no delete, and the error says so.
+#[skuld::test]
+fn a_service_that_refuses_to_stop_is_not_deleted() {
+    let mut fake = FakeScm::new([]).rejecting_stop();
+    let e = uninstall_teardown(&mut fake, unbounded()).unwrap_err();
+    assert_eq!(fake.log, vec!["query", "arm_stopped", "control_stop"]);
+    assert!(e.to_string().contains("NOT deleted"), "{e}");
+}
+
+/// A stop that runs out before `STOPPED` deletes nothing.
+#[skuld::test]
+fn a_stop_that_runs_out_deletes_nothing() {
+    let mut fake = FakeScm::new([None]);
+    assert_eq!(uninstall_teardown(&mut fake, spent()).unwrap(), Waited::Expired);
+    assert!(!fake.log.contains(&"delete"), "{:?}", fake.log);
+    let mut fake = FakeScm::new([]).arming(Waited::Expired);
+    assert_eq!(uninstall_teardown(&mut fake, spent()).unwrap(), Waited::Expired);
+    assert!(!fake.log.contains(&"delete"), "{:?}", fake.log);
+}
+
+/// A stop that meets a failing daemon ends on the failure's `STOPPED`: it does not wait for a
+/// restart, stop what it starts, or look at the failure actions. The delete that follows cancels
+/// the restart.
 #[skuld::test]
 fn a_stop_that_meets_a_failing_daemon_does_not_wait_for_a_restart() {
     let mut fake = FakeScm::new([Some(Observed::Pending), Some(Observed::Stopped)])
         .restarting()
         .stopped_with([daemon_failed()]);
-    assert_eq!(delete_then_stop(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(uninstall_teardown(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
     assert_eq!(
         fake.log,
         vec![
-            "delete",
             "query",
             "arm_stopped",
             "control_stop",
@@ -858,38 +915,51 @@ fn a_stop_that_meets_a_failing_daemon_does_not_wait_for_a_restart() {
             "arm_stopped",
             "wait",
             "got_stopped",
+            "delete",
+            "query",
         ]
     );
     assert_eq!(fake.recovery_reads, 0);
 }
 
+/// A delete that fails leaves the service as it was, and the error says so.
 #[skuld::test]
-fn a_stop_after_a_delete_that_runs_out_reports_it() {
-    let mut fake = FakeScm::new([None]);
-    assert_eq!(delete_then_stop(&mut fake, spent()).unwrap(), Waited::Expired);
-    let mut fake = FakeScm::new([]).arming(Waited::Expired);
-    assert_eq!(delete_then_stop(&mut fake, spent()).unwrap(), Waited::Expired);
-}
-
-/// A delete that fails leaves the service as it was: nothing is stopped, and the error says so.
-#[skuld::test]
-fn a_delete_that_fails_stops_nothing_and_says_the_service_was_not_deleted() {
-    let mut fake = FakeScm::new([]).rejecting_delete();
-    let e = delete_then_stop(&mut fake, unbounded()).unwrap_err();
-    assert_eq!(fake.log, vec!["delete"]);
+fn a_delete_that_fails_says_the_service_was_not_deleted() {
+    let mut fake = FakeScm::new([])
+        .found(QueriedState::Stopped, stopped_clean())
+        .rejecting_delete();
+    let e = uninstall_teardown(&mut fake, unbounded()).unwrap_err();
+    assert_eq!(fake.log, vec!["query", "delete"]);
     assert!(e.to_string().contains("NOT deleted"), "{e}");
 }
 
-/// A stop that fails after the delete says the delete happened: the service is marked for deletion
+/// A stop after the delete that fails says the delete happened: the service is marked for deletion
 /// and goes when it stops.
 #[skuld::test]
 fn a_stop_that_fails_after_the_delete_says_the_service_is_deleted() {
-    let mut fake = FakeScm::new([]).rejecting_stop();
-    let e = delete_then_stop(&mut fake, unbounded()).unwrap_err();
-    assert_eq!(fake.log, vec!["delete", "query", "arm_stopped", "control_stop"]);
+    let mut fake = FakeScm::new([]).rejecting_stop().queried([
+        (QueriedState::Stopped, stopped_clean()),
+        (QueriedState::Running, stopped_clean()),
+    ]);
+    let e = uninstall_teardown(&mut fake, unbounded()).unwrap_err();
+    assert_eq!(
+        fake.log,
+        vec!["query", "delete", "query", "arm_stopped", "control_stop"]
+    );
     let text = e.to_string();
     assert!(text.contains("is deleted"), "{text}");
     assert!(!text.contains("NOT deleted"), "{text}");
+}
+
+/// A stop after the delete that runs out is reported, not taken for a stop.
+#[skuld::test]
+fn a_stop_after_the_delete_that_runs_out_reports_it() {
+    let mut fake = FakeScm::new([None]).queried([
+        (QueriedState::Stopped, stopped_clean()),
+        (QueriedState::Running, stopped_clean()),
+    ]);
+    assert_eq!(uninstall_teardown(&mut fake, spent()).unwrap(), Waited::Expired);
+    assert_eq!(fake.log.iter().filter(|step| **step == "delete").count(), 1);
 }
 
 // handle teardown -----------------------------------------------------------------------------------------------------

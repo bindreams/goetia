@@ -35,9 +35,9 @@
 //! on a running service only *marks* it for deletion — the registry key
 //! survives until every `SC_HANDLE` closes and the service actually stops —
 //! so the next `install` would meet `ERROR_SERVICE_MARKED_FOR_DELETE`.
-//! [`uninstall_locked`] deletes first, which also cancels any restart SCM
-//! has queued, then waits for a confirmed `STOPPED` (via `super::wait`) on
-//! the same handle and closes it last.
+//! [`uninstall_locked`] stops the service and waits for a confirmed `STOPPED`
+//! (via `super::wait`), deletes it, then stops anything a queued restart
+//! started in between, all on one handle that it closes last.
 //!
 //! **4. A real account needs `SeServiceLogonRight`.** `CreateServiceW`
 //! succeeds without it; the first start then fails with error 1069
@@ -897,13 +897,14 @@ fn run_sc(args: &[&str]) -> Result<()> {
 
 // uninstall ===========================================================================================================
 
-/// Delete the service, then stop it if it is running, on one handle that closes last. See trap 3.
+/// Stop the service, delete it, then stop what a restart started in between, on one handle that
+/// closes last. See trap 3.
 ///
-/// The delete is first because it ends every restart: `DeleteService` cancels the one SCM has
-/// queued (the attempt fails with `ERROR_SERVICE_DISABLED` and the host never runs) and SCM starts
-/// nothing for a service marked for deletion. A daemon that fails as soon as it is spawned, which
-/// is when `uninstall` is used, therefore cannot keep the stop waiting, and no restart can run a
-/// daemon under the deleted service between a status read and the delete.
+/// The stop is first so a service that will not stop is left intact. The delete ends every
+/// restart: it cancels the one SCM has queued (the attempt fails with `ERROR_SERVICE_DISABLED` and
+/// the host never runs) and SCM starts nothing for a service marked for deletion. A daemon that
+/// fails as soon as it is spawned, which is when `uninstall` is used, therefore cannot keep a stop
+/// waiting, and a restart that fires between the stop and the delete is stopped after it.
 fn uninstall_locked(id: &Id) -> Result<()> {
     let mut actor = super::wait::SystemScmActor::open_to_delete(id.as_str())
         .map_err(|e| Error::Other(format!("open `{id}` to delete it: {e}")))?;
@@ -911,7 +912,7 @@ fn uninstall_locked(id: &Id) -> Result<()> {
     // of its own, this stop is a means rather than an end, and bounding it would turn a
     // slow-stopping service into a failed uninstall where today it succeeds. The error already
     // says whether the service was deleted.
-    let waited = super::wait::delete_then_stop(&mut actor, Budget::Unbounded.start())
+    let waited = super::wait::uninstall_teardown(&mut actor, Budget::Unbounded.start())
         .map_err(|e| Error::Other(format!("uninstall `{id}`: {e}")))?;
     match waited {
         Waited::Confirmed => {}

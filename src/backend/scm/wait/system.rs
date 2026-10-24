@@ -165,7 +165,7 @@ impl SystemScmActor {
         Self::open_with(name, WAIT_ACCESS)
     }
 
-    /// [`Self::open`] with `DELETE` as well, for [`super::delete_then_stop`].
+    /// [`Self::open`] with `DELETE` as well, for [`super::uninstall_teardown`].
     pub fn open_to_delete(name: &str) -> io::Result<Self> {
         Self::open_with(name, WAIT_ACCESS | ServiceAccess::DELETE)
     }
