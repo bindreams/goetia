@@ -582,7 +582,7 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 /// Create `cwd` itself (its own contents are what `WorkingDirectory`
 /// needs to exist) and the *parent* of `logs` (a file path; launchd creates
 /// the leaf log file itself but not its containing directory) — both
-/// world-readable-and-searchable, then handed to `account` so a non-root
+/// world-readable-and-searchable; each component created is handed to `account` so a non-root
 /// daemon can actually write there. Without this, a `user: someuser` daemon
 /// with `StandardOutPath` pointed at a directory only root can write into
 /// fails at launch with an opaque status, and `WorkingDirectory` naming a
