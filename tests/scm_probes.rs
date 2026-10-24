@@ -340,6 +340,87 @@ mod probes {
         })
     }
 
+    // System-log tailer ===============================================================================================
+
+    fn between<'a>(s: &'a str, open: &str, close: &str) -> Option<&'a str> {
+        let from = s.find(open)? + open.len();
+        let len = s[from..].find(close)?;
+        Some(&s[from..from + len])
+    }
+
+    /// `2026-10-24T21:23:21.3623361Z` as ms since the epoch.
+    fn iso_to_ms(t: &str) -> Option<i64> {
+        let (date, time) = t.trim_end_matches('Z').split_once('T')?;
+        let mut d = date.split('-').map(|x| x.parse::<i64>());
+        let (y, m, day) = (d.next()?.ok()?, d.next()?.ok()?, d.next()?.ok()?);
+        let (hms, frac) = time.split_once('.').unwrap_or((time, "0"));
+        let mut h = hms.split(':').map(|x| x.parse::<i64>());
+        let (hh, mm, ss) = (h.next()?.ok()?, h.next()?.ok()?, h.next()?.ok()?);
+        let ms: i64 = format!("{:0<3}", &frac[..frac.len().min(3)]).parse().ok()?;
+        // Howard Hinnant's days_from_civil.
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = y.div_euclid(400);
+        let yoe = y.rem_euclid(400);
+        let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146_097 + doe - 719_468;
+        Some(((days * 24 + hh) * 60 + mm) * 60_000 + ss * 1000 + ms)
+    }
+
+    /// Polls the System log back to back and logs each Service Control
+    /// Manager event of this service the first time it is visible, with how
+    /// long after its `TimeCreated` that was (the log's visibility lag).
+    fn spawn_log_tailer(
+        tag: String,
+        t0: Instant,
+        name: String,
+        display: String,
+        run: Arc<AtomicBool>,
+        stopped_logged: Arc<AtomicU32>,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let query =
+                "*[System[Provider[@Name='Service Control Manager'] and TimeCreated[timediff(@SystemTime) <= 600000]]]";
+            let mut seen = std::collections::HashSet::new();
+            while run.load(Ordering::SeqCst) {
+                let Ok(o) = Command::new("wevtutil")
+                    .args(["qe", "System", &format!("/q:{query}"), "/f:xml", "/rd:false"])
+                    .output()
+                else {
+                    println!("PROBE {tag} {} logseen wevtutil spawn error", stamp(t0));
+                    return;
+                };
+                let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+                let text = String::from_utf8_lossy(&o.stdout).to_string();
+                for e in text.split("</Event>").filter(|s| s.contains("<Event")) {
+                    if !(e.contains(&display) || e.contains(&name)) {
+                        continue;
+                    }
+                    let record = between(e, "<EventRecordID>", "</EventRecordID>")
+                        .unwrap_or("?")
+                        .to_string();
+                    if !seen.insert(record.clone()) {
+                        continue;
+                    }
+                    let id = e
+                        .find("<EventID")
+                        .and_then(|i| between(&e[i..], ">", "</EventID>"))
+                        .unwrap_or("?");
+                    let created = between(e, "SystemTime='", "'").unwrap_or("?");
+                    let lag = iso_to_ms(created).map(|c| now_ms - c);
+                    if id == "7036" && e.contains(">stopped</Data>") {
+                        stopped_logged.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let flat = e.split_whitespace().collect::<Vec<_>>().join(" ");
+                    println!(
+                        "PROBE {tag} {} logseen id={id} record={record} created={created} lag_ms={lag:?} EVENT {flat}</Event>",
+                        stamp(t0)
+                    );
+                }
+            }
+        })
+    }
+
     // Probe ===========================================================================================================
 
     /// One service under test, with a connect-back listener, a status tracer,
@@ -354,6 +435,9 @@ mod probes {
         tracer: Option<thread::JoinHandle<()>>,
         notify: &'static NotifyCtx,
         notifier: Option<thread::JoinHandle<()>>,
+        /// Tails the System log; counts this service's 7036 "stopped" events.
+        logger: Option<thread::JoinHandle<()>>,
+        stopped_logged: Arc<AtomicU32>,
     }
 
     fn manager() -> ServiceManager {
@@ -446,6 +530,8 @@ mod probes {
                 tracer: None,
                 notify,
                 notifier: None,
+                logger: None,
+                stopped_logged: Arc::new(AtomicU32::new(0)),
             };
             probe.p(format_args!(
                 "setup name={name} display={display} port={port} scripts={scripts} actions={actions}"
@@ -459,6 +545,14 @@ mod probes {
                 return probe;
             }
             probe.notifier = Some(spawn_notifier(notify, name.clone(), tracing.clone()));
+            probe.logger = Some(spawn_log_tailer(
+                tag.to_string(),
+                t0,
+                name.clone(),
+                display.clone(),
+                tracing.clone(),
+                probe.stopped_logged.clone(),
+            ));
 
             let ttag = tag.to_string();
             let tname = name;
@@ -497,6 +591,24 @@ mod probes {
             }
             if let Some(t) = self.notifier.take() {
                 let _ = t.join();
+            }
+            if let Some(t) = self.logger.take() {
+                let _ = t.join();
+            }
+        }
+
+        /// Until the tailer has seen `n` "stopped" (7036) events of this
+        /// service. 120 s is the failure bound for an event that never comes.
+        fn wait_logged_stopped(&self, n: u32) {
+            let deadline = Instant::now() + Duration::from_secs(120);
+            while self.stopped_logged.load(Ordering::SeqCst) < n {
+                if Instant::now() >= deadline {
+                    self.p(format_args!(
+                        "log tailer never saw {n} stopped events (failure bound 120s)"
+                    ));
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
             }
         }
 
@@ -607,6 +719,9 @@ mod probes {
                 let _ = t.join();
             }
             if let Some(t) = self.notifier.take() {
+                let _ = t.join();
+            }
+            if let Some(t) = self.logger.take() {
                 let _ = t.join();
             }
             if let Some(dir) = std::env::var_os("ProgramData") {
@@ -1544,6 +1659,13 @@ mod probes {
             }
             other => panic!("bad variant {other}"),
         }
+        // Stopped events: failure(s) plus the final clean stop(s) of each variant.
+        let stops = match variant {
+            "a" | "c" | "e" => 2,
+            "b" | "f" => 3,
+            _ => 1,
+        };
+        p.wait_logged_stopped(stops);
         p.quiesce();
         p.result(&r);
         p.dump_scm_events(&tag);
