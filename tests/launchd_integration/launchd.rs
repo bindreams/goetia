@@ -435,6 +435,56 @@ fn start_stop_status_reflect_reality() {
     assert_ne!(mgr.status(&spec.id).unwrap().state, State::Running);
 }
 
+/// launchd cannot update a loaded job, so a changed spec over one is refused with the plist and the
+/// running daemon untouched, and goes through once the job has been stopped.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn install_refuses_a_changed_spec_while_the_job_is_loaded() {
+    let mgr = LaunchdManager::new();
+    let id = support::random_test_id();
+    let listener = ConnectBack::listen();
+    let mut spec = base_spec(
+        &id,
+        vec![
+            support::current_exe_str(),
+            support::sentinel::RUN_UNTIL_KILLED.to_string(),
+            listener.port().to_string(),
+        ],
+    );
+    let _guard = Guard::install(&mgr, &spec);
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    listener.accept("the daemon to report in after start");
+    let installed = std::fs::read_to_string(staging_path(&id)).unwrap();
+
+    spec.env.insert("GOETIA_TEST_REVISION".to_string(), "2".to_string());
+    let refused = mgr
+        .install(&spec, false)
+        .expect_err("a changed spec over a loaded job must be refused");
+    assert!(
+        refused.to_string().contains(&format!("goetia daemon stop {id}")),
+        "the refusal must give the remedy: {refused}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(staging_path(&id)).unwrap(),
+        installed,
+        "a refused install must leave the plist as it was"
+    );
+    assert_eq!(
+        mgr.status(&spec.id).unwrap().state,
+        State::Running,
+        "a refused install must not stop the daemon"
+    );
+
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    assert!(
+        matches!(mgr.install(&spec, false), Ok(Outcome::Update { .. })),
+        "the same install must go through once the job is not loaded"
+    );
+    assert_ne!(std::fs::read_to_string(staging_path(&id)).unwrap(), installed);
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start the updated daemon");
+    listener.accept("the updated daemon to report in");
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop"); // tidy up before the guard's uninstall
+}
+
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn uninstall_leaves_nothing() {
     let mgr = LaunchdManager::new();

@@ -781,8 +781,8 @@ const START_NOT_WAITING: [(&str, &str); 5] = [
     ("kickstart", DONE),
 ];
 
-/// `install`'s longest path, [`INSTALL_CALLS`] calls: its read, and the `bootout` of the job it
-/// finds loaded.
+/// `install`'s longest path, [`INSTALL_CALLS`] calls: a `Create`'s read, and the `bootout` of the
+/// stale job it finds loaded. An `Update` makes the read alone.
 const INSTALL_LONGEST: [(&str, &str); INSTALL_CALLS] = [("print", DONE), ("bootout", DONE)];
 
 /// `stop`'s and `uninstall`'s one call.
@@ -893,9 +893,9 @@ fn every_launchd_verb_path_stays_inside_its_reservation() {
     script.assert_driven("stop");
 
     spec.command.push("updated".to_string());
-    let script = Scripted::new(&INSTALL_LONGEST);
+    let script = Scripted::new(&[("print", NOT_LOADED)]);
     assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Update { .. })));
-    script.assert_driven("install, updating a loaded job");
+    script.assert_driven("install, updating a job that is not loaded");
 
     // `restart`: the stop and the start under one reservation, spent exactly.
     let script = Scripted::new(&then(&[&BOOTOUT, &START_LONGEST]));
@@ -906,11 +906,12 @@ fn every_launchd_verb_path_stays_inside_its_reservation() {
     drop(prepared);
     script.assert_driven("restart");
 
-    // `install --start`: the install and the start under one reservation, spent exactly.
-    spec.command.push("again".to_string());
+    // `install --start`: the install and the start under one reservation, spent exactly. The install
+    // is a `Create` over a stale loaded job, the one install path that sends a request.
+    std::fs::remove_file(staging_path(&name)).expect("remove the plist so the install creates it");
     let script = Scripted::new(&then(&[&INSTALL_LONGEST, &START_LONGEST]));
     let prepared = mgr.prepare(&[Step::Install, Step::Start], Budget::DEFAULT).unwrap();
-    assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Update { .. })));
+    assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
     mgr.start(&id, Budget::DEFAULT).expect("install --start's start");
     exhausted();
     drop(prepared);
@@ -934,4 +935,54 @@ fn every_launchd_verb_path_stays_inside_its_reservation() {
     mgr.uninstall(&id).expect("uninstall");
     script.assert_driven("uninstall");
     assert!(!staging_path(&name).exists(), "uninstall left the plist");
+}
+
+// A changed spec over a loaded job ====================================================================================
+
+/// A changed spec over a job launchd has loaded is refused before anything is written, whether or
+/// not the job has a process, and is installed once the job is not loaded. The stand-in answers
+/// `print` only: a `bootout` of the loaded job would be an unscripted call and fail the test.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_changed_spec_is_refused_while_the_job_is_loaded() {
+    let mgr = LaunchdManager::new();
+    let name = format!("goetia-refuse-{:x}", std::process::id());
+    let _plists = Plists(name.clone());
+    let mut spec = DaemonSpec {
+        id: Id::try_from(name.as_str()).unwrap(),
+        name: name.clone(),
+        command: vec!["/bin/sleep".to_string(), "300".to_string()],
+        cwd: None,
+        env: Default::default(),
+        user: User::Root,
+        restart: Restart::Never,
+        restart_delay: None,
+        logs: None,
+        kind: Kind::Simple,
+    };
+
+    let script = Scripted::new(&[("print", NOT_LOADED)]);
+    assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
+    script.assert_driven("the first install");
+    let installed = std::fs::read_to_string(staging_path(&name)).unwrap();
+
+    spec.command.push("updated".to_string());
+    for loaded in [RUNNING, NOT_RUNNING] {
+        let script = Scripted::new(&[("print", loaded)]);
+        let refused = mgr.install(&spec, false).expect_err("a changed spec over a loaded job");
+        assert!(
+            refused.to_string().contains(&format!("goetia daemon stop {name}")),
+            "{refused}"
+        );
+        script.assert_driven("install over a loaded job sends nothing but the read");
+        assert_eq!(
+            std::fs::read_to_string(staging_path(&name)).unwrap(),
+            installed,
+            "a refused install left the plist as it was"
+        );
+    }
+
+    let script = Scripted::new(&[("print", NOT_LOADED)]);
+    assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Update { .. })));
+    script.assert_driven("install once the job is not loaded");
+    assert_ne!(std::fs::read_to_string(staging_path(&name)).unwrap(), installed);
 }

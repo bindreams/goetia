@@ -7,7 +7,8 @@
 //! - `install` writes/updates the plist in [`STAGING_DIR`] (or, for an
 //!   update, wherever the existing artifact already lives — see
 //!   [`discover`]). launchd never scans either directory on its own, so
-//!   nothing loads and nothing runs.
+//!   nothing loads and nothing runs. A changed spec over a job launchd has
+//!   loaded is refused instead, and nothing is written (see [`refuse`]).
 //! - `start` `launchctl bootstrap`s the plist from wherever it currently is
 //!   (if not already loaded), then `launchctl kickstart`s it — the second
 //!   step is what actually launches a job with no `KeepAlive`/`RunAtLoad`
@@ -63,7 +64,7 @@ use std::{fs, io};
 
 use crate::backend::Identity;
 use crate::backend::bounded::{self, Reaper, Role};
-use crate::backend::launchd::{generate, state};
+use crate::backend::launchd::{generate, refuse, state};
 use crate::decide::{self, Outcome, Ownership};
 use crate::error::{Error, Result};
 use crate::manager::budget::{self, Deadline};
@@ -995,8 +996,8 @@ fn bootout(id: &str, deadline: Deadline, reaper: Reaper) -> Result<Option<()>> {
 // Reapers and files ===================================================================================================
 
 /// The most `launchctl` requests each verb sends — every one needs a [`Reaper`], and a verb makes all
-/// of its reapers before it sends the first (see [`reapers`]). `install`: the `bootout` of a stale or
-/// updated job. `start`: `bootstrap` and `kickstart`, then the corrective cycle's `bootout`,
+/// of its reapers before it sends the first (see [`reapers`]). `install`: the `bootout` of a stale job
+/// under a new artifact. `start`: `bootstrap` and `kickstart`, then the corrective cycle's `bootout`,
 /// `bootstrap` and `kickstart`. `stop` and `uninstall`: one `bootout`.
 const INSTALL_REQUESTS: usize = 1;
 const START_REQUESTS: usize = 5;
@@ -1161,6 +1162,19 @@ impl LaunchdManager {
                 }
             }
             Outcome::Update { .. } | Outcome::Stale { .. } => {
+                // First, before anything is created or written: a refusal leaves the host as it was.
+                // `Stale` is checked too, since a version bump can carry a changed spec. A job
+                // bootstrapped by someone else after this read is not caught: it keeps the
+                // definition it was loaded with, as a deferred install would on systemd, and the
+                // next stop and start runs the new one.
+                if refuse::changes_loaded_job(&outcome, &discovery.found, spec) {
+                    // `install` has no `--timeout` of its own, so its own `launchctl` calls are
+                    // deliberately unbounded.
+                    let deadline = Budget::Unbounded.start();
+                    if never_expires(is_loaded(spec.id.as_str(), deadline)?) {
+                        return Err(refuse::loaded_refusal(&spec.id));
+                    }
+                }
                 prepare_parent_dirs(spec, &account)?;
                 let target = discovery
                     .location
@@ -1206,24 +1220,6 @@ impl LaunchdManager {
                     Presence::Undetermined { source } => return Err(Error::Io { path: target, source }),
                 }
                 write_existing(&target, &desired)?;
-                // `install` has no `--timeout` of its own, so its own
-                // `launchctl` calls are deliberately unbounded.
-                let deadline = Budget::Unbounded.start();
-                if matches!(outcome, Outcome::Update { .. }) && never_expires(is_loaded(spec.id.as_str(), deadline)?) {
-                    // launchd holds the plist content it read at bootstrap
-                    // time in memory; rewriting the file on disk does not
-                    // reach an already-loaded job. Without this, a job
-                    // that happens to still be loaded (its own process may
-                    // long since have exited, for a `restart: never`
-                    // daemon) would have `start` silently kickstart the
-                    // *pre-update* command/env/user/cwd/logs forever,
-                    // reporting `Ok` the whole time. Bootout is skipped for
-                    // `Stale`: that outcome only ever changes the embedded
-                    // metadata comment's `Version` field, never anything
-                    // `generate::plist` derives from `spec` itself, so a
-                    // loaded job is not stale in any way that affects it.
-                    never_expires(bootout(spec.id.as_str(), deadline, reaper)?);
-                }
             }
             Outcome::UpToDate
             | Outcome::Conflict { .. }

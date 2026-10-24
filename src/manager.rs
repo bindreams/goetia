@@ -36,6 +36,11 @@ pub trait ServiceManager {
     /// install-off-by-default. Routes through [`crate::decide::decide`]; see
     /// that function's doc comment for what each [`crate::decide::Outcome`]
     /// means and when `force` is honored.
+    ///
+    /// Never changes whether the service is running. A changed spec takes
+    /// effect at the service's next start where the platform allows that
+    /// (systemd, SCM); launchd cannot update a loaded job, so there `install`
+    /// returns an error and writes nothing.
     fn install(&self, spec: &DaemonSpec, force: bool) -> Result<crate::decide::Outcome>;
 
     /// What [`Self::install`] would do for `spec`, without doing it —
