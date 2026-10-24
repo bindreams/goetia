@@ -478,6 +478,9 @@ A _base_ field is the other case: it is substituted for the backend being
 installed, so it is the resolved value every backend's advisories read.
 Moving `type`, `restart` or `restart-delay` into `.env` does not silence a
 warning or an error the literal would have produced.
+A field that cannot be resolved (an undefined variable, a value its own
+field rejects, or an unreadable `.env`) is skipped on its own: it never changes
+what a check says about another field.
 
 ## Machine-readable output
 
