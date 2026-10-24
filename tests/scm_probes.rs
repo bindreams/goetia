@@ -789,7 +789,7 @@ mod probes {
         let user = format!("gprobe{}", COUNTER.load(Ordering::SeqCst));
         if matches!(how, Break::AccountDeleted) {
             let out = Command::new("net")
-                .args(["user", &user, "Pw-Probe-1234!x", "/add"])
+                .args(["user", &user, "Pw-Probe-12!x", "/add"])
                 .output()
                 .expect("net user /add");
             println!(
@@ -836,7 +836,7 @@ mod probes {
                     "obj=",
                     &format!(".\\{user}"),
                     "password=",
-                    "Pw-Probe-1234!x",
+                    "Pw-Probe-12!x",
                 ]);
                 let del = Command::new("net").args(["user", &user, "/delete"]).output();
                 let del = del.map(|d| format!("{:?} {}", d.status.code(), String::from_utf8_lossy(&d.stdout).trim()));
@@ -907,6 +907,153 @@ mod probes {
         r
     }
 
+    // P11 =============================================================================================================
+
+    /// Does SCM keep reporting a pid after the process object is freed?
+    /// Per run: start a host that reports RUNNING, terminate it from a handle
+    /// that is closed at once, then (no sleeps) alternate QueryServiceStatusEx
+    /// and OpenProcess(pid) until SCM reports STOPPED.
+    fn p11() -> String {
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
+        };
+        const SERVICES: usize = 25;
+        const REPS: usize = 10;
+        const KILL_CODE: u32 = 0xC0DE_0011;
+
+        let t0 = Instant::now();
+        let tag = "P11";
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut iterations = 0u64;
+        let mut freed_while_reported = 0u64;
+        let mut freed_same_pid = 0u64;
+        let mut runs = 0u64;
+        let mut sequences: std::collections::BTreeMap<String, u64> = Default::default();
+
+        for s in 0..SERVICES {
+            let name = format!("goetia-probe11-{nanos:x}-{s}");
+            let info = ServiceInfo {
+                name: name.clone().into(),
+                display_name: name.clone().into(),
+                service_type: ServiceType::OWN_PROCESS,
+                start_type: ServiceStartType::OnDemand,
+                error_control: ServiceErrorControl::Normal,
+                executable_path: exe.clone(),
+                launch_arguments: vec![
+                    HOST.into(),
+                    name.clone().into(),
+                    "0".into(),
+                    "run,wait-stop,stopped:w32:0".into(),
+                ],
+                dependencies: vec![],
+                account_name: None,
+                account_password: None,
+            };
+            manager()
+                .create_service(&info, ServiceAccess::QUERY_STATUS)
+                .expect("create service");
+            let svc = manager()
+                .open_service(&name, ServiceAccess::QUERY_STATUS | ServiceAccess::START)
+                .expect("open service");
+
+            for rep in 0..REPS {
+                svc.start::<&str>(&[]).expect("StartService");
+                // Wait for the host to be RUNNING (the real condition).
+                let pid = loop {
+                    let st = raw_query(&svc).expect("query");
+                    if st.dwCurrentState == Services::SERVICE_RUNNING && st.dwProcessId != 0 {
+                        break st.dwProcessId;
+                    }
+                    assert!(
+                        st.dwCurrentState != Services::SERVICE_STOPPED,
+                        "host stopped before RUNNING: {}",
+                        fmt_raw(&st)
+                    );
+                };
+                unsafe {
+                    let h = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                    assert!(!h.is_null(), "OpenProcess(terminate) failed: {}", GetLastError());
+                    assert!(TerminateProcess(h, KILL_CODE) != 0, "TerminateProcess failed");
+                    CloseHandle(h);
+                }
+
+                // (state, pid relation, OpenProcess outcome), run-length encoded.
+                let mut rle: Vec<(String, u64)> = Vec::new();
+                loop {
+                    let st = raw_query(&svc).expect("query");
+                    let rel = if st.dwProcessId == 0 {
+                        "pid0"
+                    } else if st.dwProcessId == pid {
+                        "samepid"
+                    } else {
+                        "otherpid"
+                    };
+                    let outcome = if st.dwProcessId == 0 {
+                        "-".to_string()
+                    } else {
+                        unsafe {
+                            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, st.dwProcessId);
+                            if h.is_null() {
+                                let e = GetLastError();
+                                if e == 87 {
+                                    freed_while_reported += 1;
+                                    if st.dwProcessId == pid {
+                                        freed_same_pid += 1;
+                                    }
+                                }
+                                format!("open-err({e})")
+                            } else {
+                                let mut code = 0u32;
+                                let ok = GetExitCodeProcess(h, &mut code);
+                                CloseHandle(h);
+                                if ok == 0 {
+                                    "open-ok(exitcode-query-failed)".to_string()
+                                } else if code == 259 {
+                                    "open-ok(STILL_ACTIVE)".to_string()
+                                } else {
+                                    format!("open-ok(exit={code:#x})")
+                                }
+                            }
+                        }
+                    };
+                    iterations += 1;
+                    let key = format!("state={}/{rel}/{outcome}", st.dwCurrentState);
+                    match rle.last_mut() {
+                        Some((k, n)) if *k == key => *n += 1,
+                        _ => rle.push((key, 1)),
+                    }
+                    if st.dwCurrentState == Services::SERVICE_STOPPED {
+                        break;
+                    }
+                }
+                runs += 1;
+                let line: Vec<String> = rle.iter().map(|(k, n)| format!("{k} x{n}")).collect();
+                println!(
+                    "PROBE {tag} t={}ms run={runs} service={s} rep={rep} pid={pid} iterations: {}",
+                    t0.elapsed().as_millis(),
+                    line.join(" -> ")
+                );
+                let seq: Vec<&str> = rle.iter().map(|(k, _)| k.as_str()).collect();
+                *sequences.entry(seq.join(" -> ")).or_default() += 1;
+            }
+            sc(&["delete", &name]);
+            if let Some(dir) = std::env::var_os("ProgramData") {
+                let _ = std::fs::remove_file(std::path::PathBuf::from(dir).join(format!("{name}.runs")));
+            }
+        }
+        for (seq, n) in &sequences {
+            println!("PROBE {tag} sequence seen in {n} runs: {seq}");
+        }
+        let r = format!(
+            "{runs} runs over {SERVICES} services, {iterations} iterations; SCM reported a pid while OpenProcess failed with ERROR_INVALID_PARAMETER in {freed_while_reported} iterations ({freed_same_pid} of them for the terminated pid); {} distinct state sequences",
+            sequences.len()
+        );
+        println!("PROBE {tag} RESULT {r}");
+        r
+    }
+
     // Driver ==========================================================================================================
 
     pub fn run_all() {
@@ -914,6 +1061,7 @@ mod probes {
         type Job = Box<dyn FnOnce() -> String + Send>;
         let jobs: Vec<(&'static str, Job)> = vec![
             ("P9", Box::new(p9)),
+            ("P11", Box::new(p11)),
             ("P10[a-imagepath]", Box::new(|| p10("a-imagepath", Break::ImagePath))),
             (
                 "P10[b1-account-registry]",
