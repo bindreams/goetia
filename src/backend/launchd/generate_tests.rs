@@ -248,7 +248,7 @@ fn extract_returns_none_when_no_metadata_comment_matches_our_marker() {
 }
 
 #[skuld::test]
-fn extract_errors_on_corrupt_blob() {
+fn extract_errors_on_corrupt_blob_in_plist() {
     let spec = full_spec();
     let text = plist(&spec, &full_identity());
 

@@ -138,7 +138,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-skuld = "0.3"
+skuld = "0.6"
 rand = "0.10"
 
 [target.'cfg(unix)'.dev-dependencies]
