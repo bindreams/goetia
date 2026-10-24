@@ -976,6 +976,28 @@ pub(super) fn kill_impl(id: &str) -> Result<()> {
     ))
 }
 
+/// `systemctl enable` for `id`'s unit; a failure carries systemd's words.
+pub(super) fn enable_impl(id: &str) -> Result<()> {
+    unit_file_verb("enable", id)
+}
+
+/// `systemctl disable` for `id`'s unit, as [`enable_impl`]: `Systemd::disable` and `uninstall` both.
+pub(super) fn disable_impl(id: &str) -> Result<()> {
+    unit_file_verb("disable", id)
+}
+
+fn unit_file_verb(verb: &str, id: &str) -> Result<()> {
+    let unit = super::unit_name(id);
+    let output = run_systemctl(&unit_args(&[verb], &unit))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(Error::Other(format!(
+        "systemctl {verb} {unit} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    )))
+}
+
 /// `systemctl restart --no-block`: one job, where a stop and a separate start leave a window in
 /// which the start replaces the stop. It stops the unit and then starts it — unless the unit is
 /// still activating, when systemd folds the restart into the start job already running: nothing is

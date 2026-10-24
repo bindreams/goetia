@@ -144,11 +144,45 @@ fn start_stop_and_restart_put_the_unit_after_the_option_terminator() {
     }
 }
 
-/// The verbs that take a unit and are not `verb_args`'s: `enable`, `disable` and `show`.
+/// `enable` and `disable` over `-h`, which `systemctl` would read as `-h` and print its help for,
+/// exit `0`, and change nothing. Run through the functions `Systemd::enable`, `Systemd::disable` and
+/// `uninstall` call.
 #[skuld::test]
 fn enable_and_disable_put_the_unit_after_the_option_terminator() {
-    for verb in ["enable", "disable"] {
-        assert_eq!(unit_args(&[verb], "-h.service"), [verb, "--", "-h.service"]);
+    type Verb = fn(&str) -> Result<()>;
+    for (verb, run) in [("enable", enable_impl as Verb), ("disable", disable_impl as Verb)] {
+        let dir = tempfile::tempdir().unwrap();
+        let ran = dir.path().join("ran");
+        let _stand_in = stand_in::set(
+            Some(&gate_passes_then(&format!(
+                "echo \"$*\" >> '{}'; exit 0",
+                ran.display()
+            ))),
+            booted(),
+        );
+
+        run("-h").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&ran).unwrap(),
+            format!(
+                "{verb} -- -h.service
+"
+            )
+        );
+    }
+}
+
+#[skuld::test]
+fn enable_and_disable_failures_name_the_verb_the_unit_and_systemd_s_words() {
+    type Verb = fn(&str) -> Result<()>;
+    for (verb, run) in [("enable", enable_impl as Verb), ("disable", disable_impl as Verb)] {
+        let _stand_in = stand_in::set(Some(&gate_passes_then("echo 'Access denied' >&2; exit 1")), booted());
+
+        let msg = run("x").expect_err(verb).to_string();
+
+        assert!(msg.contains(&format!("systemctl {verb} x.service failed")), "{msg}");
+        assert!(msg.contains("Access denied"), "{msg}");
     }
 }
 
@@ -568,14 +602,8 @@ type Path = (String, Box<dyn Fn() -> Result<()>>);
 fn every_path() -> Vec<Path> {
     let mut paths: Vec<Path> = vec![
         ("daemon-reload".to_string(), Box::new(daemon_reload)),
-        (
-            "enable".to_string(),
-            Box::new(|| run_systemctl(&["enable", "x.service"]).map(drop)),
-        ),
-        (
-            "disable".to_string(),
-            Box::new(|| run_systemctl(&["disable", "x.service"]).map(drop)),
-        ),
+        ("enable".to_string(), Box::new(|| enable_impl("x"))),
+        ("disable".to_string(), Box::new(|| disable_impl("x"))),
         ("show".to_string(), Box::new(|| status_from_unit("x.service").map(drop))),
         ("restart".to_string(), Box::new(|| request_restart_impl("x"))),
         ("kill".to_string(), Box::new(|| kill_impl("x"))),

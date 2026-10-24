@@ -284,7 +284,7 @@ fn a_refusal_that_is_not_a_denial_is_unchanged_whatever_the_step_did() {
 }
 
 #[skuld::test]
-fn a_failed_restore_is_reported_naming_the_call_that_failed() {
+fn the_restore_notice_names_the_call_and_the_error() {
     let notice = restore_notice(&io::Error::other("the token handle is invalid"));
 
     assert!(notice.starts_with("warning: "), "{notice}");

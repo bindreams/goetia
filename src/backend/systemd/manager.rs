@@ -71,8 +71,8 @@ use std::path::{Path, PathBuf};
 
 use discover::{DROPIN_SEARCH_DIRS, RawState, absent_error, classify_and_read, discover, raw_state, require_installed};
 use systemctl::{
-    daemon_reload, daemon_reload_or_report, gate_scope, kill_impl, request_restart_impl, require_supported,
-    run_systemctl, start_impl, status_from_unit, stop_impl, unit_args,
+    daemon_reload, daemon_reload_or_report, disable_impl, enable_impl, gate_scope, kill_impl, request_restart_impl,
+    require_supported, start_impl, status_from_unit, stop_impl,
 };
 use write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 
@@ -183,7 +183,6 @@ impl ServiceManager for Systemd {
     fn uninstall(&self, id: &Id) -> Result<()> {
         let id = id.as_str();
         let expected_text = require_installed(id)?;
-        let unit = unit_name(id);
         // One version gate for the stop, the `disable` and the `daemon-reload`: the stop's.
         let _gate = gate_scope();
 
@@ -194,13 +193,7 @@ impl ServiceManager for Systemd {
         // failed uninstall where today it succeeds.
         stop_impl(id, Budget::Unbounded, Budget::Unbounded.start())?;
 
-        let disabled = run_systemctl(&unit_args(&["disable"], &unit))?;
-        if !disabled.status.success() {
-            return Err(Error::Other(format!(
-                "systemctl disable {unit} failed: {}",
-                String::from_utf8_lossy(&disabled.stderr)
-            )));
-        }
+        disable_impl(id)?;
 
         // Verified removal, mirroring `replace_unit_verified`: the gap since `require_installed`
         // spans two full `systemctl` round-trips, wide enough for something else to have replaced
@@ -235,31 +228,13 @@ impl ServiceManager for Systemd {
     fn enable(&self, id: &Id) -> Result<()> {
         let id = id.as_str();
         require_installed(id)?;
-        let unit = unit_name(id);
-        let output = run_systemctl(&unit_args(&["enable"], &unit))?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(Error::Other(format!(
-                "systemctl enable {unit} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )))
-        }
+        enable_impl(id)
     }
 
     fn disable(&self, id: &Id) -> Result<()> {
         let id = id.as_str();
         require_installed(id)?;
-        let unit = unit_name(id);
-        let output = run_systemctl(&unit_args(&["disable"], &unit))?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(Error::Other(format!(
-                "systemctl disable {unit} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )))
-        }
+        disable_impl(id)
     }
 
     fn start(&self, id: &Id, budget: Budget) -> Result<()> {
