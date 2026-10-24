@@ -592,6 +592,7 @@ fn a_verb_one_reaper_short_sends_nothing() {
     assert!(refused_for_want_of_a_reaper(&mgr.request_start_after_stop(&id)));
     let _none = bounded::test_hook::threads(0);
     assert!(refused_for_want_of_a_reaper(&mgr.stop(&id, Budget::DEFAULT)));
+    assert!(refused_for_want_of_a_reaper(&mgr.kill(&id)));
     assert!(refused_for_want_of_a_reaper(&mgr.uninstall(&id)));
     assert!(refused_for_want_of_a_reaper(&mgr.install(&spec, false)));
 }
@@ -605,6 +606,8 @@ fn a_verb_with_its_reapers_goes_on_to_discovery() {
     assert!(!refused_for_want_of_a_reaper(&mgr.start(&id, Budget::DEFAULT)));
     let _one = bounded::test_hook::threads(STOP_REQUESTS);
     assert!(!refused_for_want_of_a_reaper(&mgr.stop(&id, Budget::DEFAULT)));
+    let _one = bounded::test_hook::threads(KILL_REQUESTS);
+    assert!(!refused_for_want_of_a_reaper(&mgr.kill(&id)));
 }
 
 /// Whether `result` is the failure of a verb that could not make the temp files its `launchctl`
@@ -644,6 +647,8 @@ fn a_verb_one_temp_file_short_sends_nothing() {
     assert!(refused_for_want_of_a_file(&mgr.stop(&id, Budget::DEFAULT)));
     let _short = short(STOP_CALLS);
     assert!(refused_for_want_of_a_file(&mgr.uninstall(&id)));
+    let _short = short(KILL_CALLS);
+    assert!(refused_for_want_of_a_file(&mgr.kill(&id)));
     let _short = short(INSTALL_CALLS);
     assert!(refused_for_want_of_a_file(&mgr.install(&spec, false)));
     let _enough = bounded::test_hook::temp_files(START_CALLS * FILES_PER_CALL);
@@ -934,4 +939,57 @@ fn every_launchd_verb_path_stays_inside_its_reservation() {
     mgr.uninstall(&id).expect("uninstall");
     script.assert_driven("uninstall");
     assert!(!staging_path(&name).exists(), "uninstall left the plist");
+}
+
+// kill ================================================================================================================
+
+/// `kill_job` over `id`, with `answer` standing in for what `launchctl kill` says.
+fn kill_answered(answer: &'static str) -> (Result<Option<()>>, Scripted) {
+    let script = Scripted::new(&[("kill", answer)]);
+    let [reaper] = reapers::<KILL_REQUESTS>(&never_installed()).unwrap();
+    let _files = files(&never_installed(), KILL_CALLS).unwrap();
+    let result = kill_job(never_installed().as_str(), Budget::Unbounded.start(), reaper);
+    (result, script)
+}
+
+/// SIGKILL to the job by label, in the system domain; the signal is named so a failure of the job
+/// is what launchd records, whatever `restart` then does.
+#[skuld::test]
+fn kill_sends_sigkill_to_the_job_in_the_system_domain() {
+    let id = never_installed();
+    let (result, script) = kill_answered(DONE);
+
+    assert!(matches!(result, Ok(Some(()))), "{result:?}");
+    let log = std::fs::read_to_string(script.dir.path().join("log")).unwrap();
+    assert_eq!(log, format!("kill SIGKILL system/{id}\n"));
+}
+
+/// The two ways launchd says there is no process to signal: the job is not loaded (113), or it is
+/// loaded and has no process (3, "No such process"). Classified off the kill's own answer — a
+/// separate `print` first would leave a window for the job to exit between the two.
+#[skuld::test]
+fn kill_of_a_job_with_no_process_is_not_running() {
+    for code in ["exit 3", NOT_LOADED] {
+        let id = never_installed();
+        let (result, script) = kill_answered(code);
+
+        let e = result.expect_err(code);
+        assert!(
+            matches!(&e, Error::NotRunning { id: named } if named == id.as_str()),
+            "{code}: {e:?}"
+        );
+        script.assert_driven("a kill classified off its own answer, with no read before it");
+    }
+}
+
+/// Any other refusal is a failure of the request, with launchctl's words.
+#[skuld::test]
+fn kill_refused_for_any_other_reason_is_a_plain_failure() {
+    let (result, _script) = kill_answered("echo 'Operation not permitted' >&2; exit 1");
+
+    let e = result.expect_err("refused");
+    assert!(
+        matches!(&e, Error::CommandFailed { stderr, .. } if stderr.contains("Operation not permitted")),
+        "{e:?}"
+    );
 }

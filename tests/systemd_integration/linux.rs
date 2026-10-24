@@ -522,6 +522,59 @@ fn start_stop_status_reflect_reality() {
     assert!(status.pid.is_none(), "{status:?}");
 }
 
+// kill ================================================================================================================
+
+/// The test binary as a daemon that reports in on every start, under `restart`.
+fn reporting(id: &str, restart: Restart, listener: &support::ConnectBack) -> DaemonSpec {
+    let mut spec = mk(id);
+    spec.command = vec![
+        support::current_exe_str(),
+        support::sentinel::RUN_UNTIL_KILLED.to_string(),
+        listener.port().to_string(),
+    ];
+    spec.restart = restart;
+    spec
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_killed_always_restart_daemon_comes_back_with_a_new_pid() {
+    let guard = ServiceGuard::new(support::random_test_id());
+    let listener = support::ConnectBack::listen();
+    let spec = reporting(guard.id(), Restart::Always, &listener);
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+
+    support::kill::a_killed_daemon_comes_back_with_a_new_pid(&mgr, &spec.id, &listener);
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_killed_never_restart_daemon_stays_down() {
+    let guard = ServiceGuard::new(support::random_test_id());
+    let listener = support::ConnectBack::listen();
+    let spec = reporting(guard.id(), Restart::Never, &listener);
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+
+    support::kill::a_killed_daemon_that_never_restarts_stays_down(&mgr, &spec.id, &listener);
+}
+
+/// An installed unit that was never started is not loaded; one that was stopped is loaded or not
+/// depending on what still refers to it. Both are `NotRunning`, off `systemctl kill`'s own answer.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn killing_a_stopped_unit_is_not_running() {
+    let guard = ServiceGuard::new(support::random_test_id());
+    let spec = mk(guard.id());
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+    let get_manager = || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(Systemd::new())) };
+
+    support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.id);
+
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.id);
+}
+
 /// `ActiveState` and `Job` as `systemctl show` reports them: the job is empty when none is queued.
 pub(crate) fn active_state_and_job(id: &str) -> (String, String) {
     let unit = format!("{id}.service");

@@ -929,6 +929,48 @@ pub(super) fn stop_impl(id: &str, budget: Budget, deadline: Deadline) -> Result<
     }
 }
 
+/// `systemctl kill` of `unit`'s main process with `SIGKILL`, and nothing else of it: not the control
+/// process, not the rest of the cgroup, which systemd cleans up when the main process is gone.
+///
+/// `--kill-who`, not `--kill-whom`: 245 and older do not know the second (MEASURED, 245), and the
+/// first is still accepted by 255 and 257. `main-fail` rather than `main`: `main` exits `0` having
+/// signalled nobody when there is no main process (MEASURED, 245 and 255), where `main-fail` fails
+/// with the answer [`no_process`] reads.
+const KILL_ARGS: [&str; 3] = ["kill", "--kill-who=main-fail", "--signal=SIGKILL"];
+
+/// Whether `stderr` is systemd saying `unit` has no process to signal, word for word (MEASURED, 245
+/// and 255, exit `1` both): it is not loaded, which is what an inactive unit is once nothing holds
+/// it, or it is loaded and its main process is gone. Read off the kill's own answer, so no state
+/// read before it can race the kill.
+fn no_process(stderr: &str, unit: &str) -> bool {
+    stderr.contains(&format!("Unit {unit} not loaded.")) || stderr.contains("No main process to kill")
+}
+
+/// One `systemctl kill` of `id`'s main process. `Ok` is the signal delivered: systemd sends it
+/// before it answers, and goetia does not wait for the process to be gone. [`Error::NotRunning`]
+/// where [`no_process`]; any other refusal is [`failed`], with systemd's words.
+pub(super) fn kill_impl(id: &str) -> Result<()> {
+    let unit = super::unit_name(id);
+    let args: Vec<&str> = KILL_ARGS.iter().copied().chain([unit.as_str()]).collect();
+    let output = run_systemctl(&args)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if no_process(&stderr, &unit) {
+        return Err(Error::NotRunning { id: id.to_string() });
+    }
+    Err(failed(
+        "kill",
+        &unit,
+        &Capture {
+            stdout: output.stdout,
+            stderr: output.stderr,
+            complete: true,
+        },
+    ))
+}
+
 /// `systemctl restart --no-block`: one job, where a stop and a separate start leave a window in
 /// which the start replaces the stop. It stops the unit and then starts it — unless the unit is
 /// still activating, when systemd folds the restart into the start job already running: nothing is

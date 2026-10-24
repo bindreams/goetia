@@ -537,6 +537,7 @@ fn every_path() -> Vec<Path> {
         ),
         ("show".to_string(), Box::new(|| status_from_unit("x.service").map(drop))),
         ("restart".to_string(), Box::new(|| request_restart_impl("x"))),
+        ("kill".to_string(), Box::new(|| kill_impl("x"))),
     ];
     for budget in [
         Budget::Immediate,
@@ -1373,4 +1374,69 @@ fn this_hosts_systemd_is_supported() {
         supported().expect("the host running the tests runs systemd 242+, whatever colour is inherited");
     }
     require_supported().expect("the host running the tests runs systemd 242+");
+}
+
+// kill ================================================================================================================
+
+/// `kill` over `x`, with `rest` standing in for what systemd answers it.
+fn kill_with(rest: &str) -> Result<()> {
+    let _stand_in = stand_in::set(Some(&gate_passes_then(rest)), booted());
+    kill_impl("x")
+}
+
+/// The one signal and the one process: SIGKILL to the main process, failing when there is none.
+/// `--kill-who`, not `--kill-whom`: 245 and older do not know the second (MEASURED, 245), and the
+/// first is still accepted by 255 and 257. `main-fail` is what turns "no main process" into an
+/// error, where plain `main` succeeds having signalled nobody (MEASURED, 245 and 255).
+#[skuld::test]
+fn kill_signals_only_the_main_process_with_sigkill_and_fails_where_there_is_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let ran = dir.path().join("ran");
+    kill_with(&format!("echo \"$*\" >> '{}'; exit 0", ran.display())).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&ran).unwrap(),
+        "kill --kill-who=main-fail --signal=SIGKILL x.service
+"
+    );
+}
+
+/// systemd's two answers for a unit with no process to signal, word for word (MEASURED, 245 and
+/// 255): a unit that is not loaded, which is what an inactive one is once nothing holds it, and a
+/// loaded one whose main process is gone.
+#[skuld::test]
+fn kill_of_a_unit_with_no_main_process_is_not_running() {
+    for said in [
+        "Failed to kill unit x.service: Unit x.service not loaded.",
+        "Failed to kill unit x.service: No main process to kill",
+    ] {
+        let e = kill_with(&format!("echo '{said}' >&2; exit 1")).expect_err(said);
+        assert!(matches!(&e, Error::NotRunning { id } if id == "x"), "{said}: {e:?}");
+    }
+}
+
+/// Any other refusal is a failure of the request, with systemd's words: never read as "nothing
+/// was running".
+#[skuld::test]
+fn kill_refused_for_any_other_reason_is_a_plain_failure() {
+    let e = kill_with("echo 'Failed to kill unit x.service: Access denied' >&2; exit 1").expect_err("refused");
+    assert!(matches!(&e, Error::Other(_)), "{e:?}");
+    let msg = e.to_string();
+    assert!(msg.contains("systemctl kill x.service failed"), "{msg}");
+    assert!(msg.contains("Access denied"), "{msg}");
+}
+
+/// A different unit's absence is not this one's: the not-loaded answer has to name the unit asked
+/// about.
+#[skuld::test]
+fn a_not_loaded_answer_about_another_unit_is_a_plain_failure() {
+    let e = kill_with("echo 'Failed to kill unit x.service: Unit y.service not loaded.' >&2; exit 1")
+        .expect_err("not this unit's absence");
+    assert!(matches!(&e, Error::Other(_)), "{e:?}");
+}
+
+/// An exit of `0` is the signal sent, and nothing more is claimed.
+#[skuld::test]
+fn kill_that_systemd_took_succeeds() {
+    kill_with("exit 0").unwrap();
 }

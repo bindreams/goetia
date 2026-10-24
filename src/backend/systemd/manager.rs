@@ -71,8 +71,8 @@ use std::path::{Path, PathBuf};
 
 use discover::{DROPIN_SEARCH_DIRS, RawState, absent_error, classify_and_read, discover, raw_state, require_installed};
 use systemctl::{
-    daemon_reload, daemon_reload_or_report, gate_scope, request_restart_impl, require_supported, run_systemctl,
-    start_impl, status_from_unit, stop_impl,
+    daemon_reload, daemon_reload_or_report, gate_scope, kill_impl, request_restart_impl, require_supported,
+    run_systemctl, start_impl, status_from_unit, stop_impl,
 };
 use write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 
@@ -306,6 +306,12 @@ impl ServiceManager for Systemd {
 
     fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
         stop_with(id.as_str(), budget, &REAL_STEPS)
+    }
+
+    fn kill(&self, id: &Id) -> Result<()> {
+        let id = id.as_str();
+        require_installed(id)?;
+        kill_impl(id)
     }
 
     fn status(&self, id: &Id) -> Result<Status> {

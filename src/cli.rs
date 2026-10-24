@@ -23,6 +23,7 @@ pub mod disable;
 mod elevation;
 pub mod enable;
 pub mod install;
+pub mod kill;
 pub mod list;
 mod report;
 pub mod restart;
@@ -95,6 +96,8 @@ pub enum DaemonCommand {
     Start(start::Args),
     /// Stop a daemon now. Does not change its boot-enablement.
     Stop(stop::Args),
+    /// Kill a daemon's running process as a failure, leaving any restart to its restart policy.
+    Kill(kill::Args),
     /// Stop then start a daemon. Does not change its boot-enablement.
     Restart(restart::Args),
     /// Enable a daemon at boot. Does not start it.
@@ -121,11 +124,13 @@ pub enum DaemonCommand {
 ///   as success — `Error::NotInstalled` says nothing about the *process*,
 ///   only the artifact, which is why every other id-verb keeps that same
 ///   error at `1` instead; see `IdVerbCall::absent_is_success`'s doc
-///   comment for the full six-row table. That table is about an absent
+///   comment for the full seven-verb table. That table is about an absent
 ///   artifact, so it never reaches an id whose absence was not established:
-///   that is `4` for all six verbs, `uninstall` included.
+///   that is `4` for all seven verbs, `uninstall` included.
 /// - `1` error: an operation was attempted and failed, or was refused
-///   outright.
+///   outright. `kill` of a daemon with no process is this
+///   ([`Error::NotRunning`](crate::error::Error::NotRunning)): nothing was killed, so
+///   `kill x && echo "ended"` must not print that.
 /// - `2` usage: clap rejected the command line before `dispatch` ever ran,
 ///   or `dispatch` refused to run anything: `--json` on a subcommand that
 ///   does not implement it, or a wait flag on an `install` with no `--start`
@@ -177,7 +182,7 @@ pub enum DaemonCommand {
 ///   `Error::WaitTimeout` and `Error::RequestInDoubt` from its steps, so the two verbs
 ///   agree about `Undetermined` and disagree only about
 ///   `Outcome::RefuseUnreadable`, which `install` reports as `1` because it
-///   genuinely failed to install. All six id verbs return it through
+///   genuinely failed to install. All seven id verbs return it through
 ///   `support::run_id_verb`, for four conditions: `Undetermined`, where
 ///   goetia could not determine what is at the id, and — from the verbs that
 ///   act — `WaitTimeout`, `Unestablished` and `RequestInDoubt`, where it
@@ -264,6 +269,7 @@ pub fn dispatch(
         DaemonCommand::Uninstall(args) => uninstall::run(args, get_manager, is_elevated, out, err),
         DaemonCommand::Start(args) => start::run(args, get_manager, is_elevated, out, err),
         DaemonCommand::Stop(args) => stop::run(args, get_manager, is_elevated, out, err),
+        DaemonCommand::Kill(args) => kill::run(args, get_manager, is_elevated, out, err),
         DaemonCommand::Restart(args) => restart::run(args, get_manager, is_elevated, out, err),
         DaemonCommand::Enable(args) => enable::run(args, get_manager, is_elevated, out, err),
         DaemonCommand::Disable(args) => disable::run(args, get_manager, is_elevated, out, err),
@@ -283,6 +289,7 @@ fn subcommand_name(cmd: &DaemonCommand) -> &'static str {
         DaemonCommand::Uninstall(_) => "uninstall",
         DaemonCommand::Start(_) => "start",
         DaemonCommand::Stop(_) => "stop",
+        DaemonCommand::Kill(_) => "kill",
         DaemonCommand::Restart(_) => "restart",
         DaemonCommand::Enable(_) => "enable",
         DaemonCommand::Disable(_) => "disable",

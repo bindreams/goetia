@@ -136,6 +136,15 @@ pub enum Error {
         recovery: String,
     },
 
+    /// `kill` found no process of `id`'s to end: the service is stopped, or between runs. Nothing
+    /// was signalled. Exit `1`, as a refusal: the command asked for an end that did not happen, and
+    /// succeeding would let `kill x && echo "ended"` print that over a daemon that was not there.
+    ///
+    /// Classified off the kill request's own answer on every backend, never off a state read before
+    /// it, which would leave a window for the process to exit or start between the two.
+    #[error("daemon `{id}` is not running: there is no process to kill")]
+    NotRunning { id: String },
+
     /// Steps goetia issued whose outcome nobody established. Produced only
     /// by `cli::restart` under a budget that does not wait, on a manager with
     /// no request-only restart (launchd, SCM), where the stop was issued
