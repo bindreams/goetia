@@ -531,7 +531,9 @@ mod probes {
     const P8_ACTIONS: &str = "restart/15000/restart/2000";
     const P8_FAIL: &str = "run,connect,stopped:w32:1";
 
-    fn set_actions_api(name: &str, actions: &[(i32, u32)], reset: u32) -> String {
+    /// `null_when_empty`: pass a NULL action array for an empty list (else a
+    /// non-NULL pointer with `cActions` = 0).
+    fn set_actions_api(name: &str, actions: &[(i32, u32)], reset: u32, null_when_empty: bool) -> String {
         let mut raw: Vec<Services::SC_ACTION> = actions
             .iter()
             .map(|(t, d)| Services::SC_ACTION { Type: *t, Delay: *d })
@@ -541,14 +543,17 @@ mod probes {
             lpRebootMsg: std::ptr::null_mut(),
             lpCommand: std::ptr::null_mut(),
             cActions: raw.len() as u32,
-            lpsaActions: if raw.is_empty() {
+            lpsaActions: if raw.is_empty() && null_when_empty {
                 std::ptr::null_mut()
             } else {
                 raw.as_mut_ptr()
             },
         };
         let svc = manager()
-            .open_service(name, ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG)
+            .open_service(
+                name,
+                ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG | ServiceAccess::START,
+            )
             .expect("open service for config");
         let ok = unsafe {
             Services::ChangeServiceConfig2W(
@@ -645,7 +650,7 @@ mod probes {
     }
 
     fn mutate_a_api(p: &Probe) -> String {
-        set_actions_api(&p.name, &restart_actions(), 86400)
+        set_actions_api(&p.name, &restart_actions(), 86400, true)
     }
 
     fn mutate_b_sc(p: &Probe) -> String {
@@ -655,11 +660,17 @@ mod probes {
         format!("{a}; qfailure between: {mid}; restore: {b}")
     }
 
-    fn mutate_b_api(p: &Probe) -> String {
-        let a = set_actions_api(&p.name, &[], 0);
+    fn mutate_b_api(p: &Probe, null_when_empty: bool) -> String {
+        let a = set_actions_api(&p.name, &[], 0, null_when_empty);
         let (_, mid) = sc(&["qfailure", &p.name]);
-        let b = set_actions_api(&p.name, &restart_actions(), 86400);
-        format!("empty: {a}; qfailure between: {mid}; restore: {b}")
+        let b = set_actions_api(&p.name, &restart_actions(), 86400, true);
+        format!("empty (null array: {null_when_empty}): {a}; qfailure between: {mid}; restore: {b}")
+    }
+    fn mutate_b_api_null(p: &Probe) -> String {
+        mutate_b_api(p, true)
+    }
+    fn mutate_b_api_empty(p: &Probe) -> String {
+        mutate_b_api(p, false)
     }
 
     fn mutate_c_sc(p: &Probe) -> String {
@@ -680,7 +691,8 @@ mod probes {
             ("P8[a-sc]", Box::new(|| p8("a-sc", mutate_a_sc))),
             ("P8[a-api]", Box::new(|| p8("a-api", mutate_a_api))),
             ("P8[b-sc]", Box::new(|| p8("b-sc", mutate_b_sc))),
-            ("P8[b-api]", Box::new(|| p8("b-api", mutate_b_api))),
+            ("P8[b-api-null]", Box::new(|| p8("b-api-null", mutate_b_api_null))),
+            ("P8[b-api-empty]", Box::new(|| p8("b-api-empty", mutate_b_api_empty))),
             ("P8[c-sc]", Box::new(|| p8("c-sc", mutate_c_sc))),
         ];
         let handles: Vec<_> = jobs
