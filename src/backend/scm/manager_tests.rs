@@ -538,8 +538,71 @@ fn blob_of(kind: Kind) -> Blob {
 
 #[skuld::test]
 fn start_reads_a_simple_service_by_the_shims_vocabulary_and_anything_else_strictly() {
-    assert_eq!(start_kind(Ok(Some(blob_of(Kind::Simple)))), Kind::Simple);
-    assert_eq!(start_kind(Ok(Some(blob_of(Kind::Managed)))), Kind::Managed);
-    assert_eq!(start_kind(Ok(None)), Kind::Managed);
-    assert_eq!(start_kind(Err(Error::Blob("corrupt".to_string()))), Kind::Managed);
+    assert_eq!(start_kind(Ok(Some(blob_of(Kind::Simple)))), (Kind::Simple, None));
+    assert_eq!(start_kind(Ok(Some(blob_of(Kind::Managed)))), (Kind::Managed, None));
+    let (kind, why) = start_kind(Ok(None));
+    assert_eq!(kind, Kind::Managed);
+    assert!(why.is_some());
+    let (kind, why) = start_kind(Err(Error::Blob("corrupt".to_string())));
+    assert_eq!(kind, Kind::Managed);
+    assert!(why.unwrap().contains("corrupt"));
+}
+
+/// A start judged strictly because the blob could not be read says why, so the user is not told a
+/// `type: simple` daemon failed to start in a way that only a managed service's start can.
+#[skuld::test]
+fn a_failed_start_names_the_blob_read_error_that_made_it_strict() {
+    let id = Id::try_from("frpc").unwrap();
+    let e = std::io::Error::other("service stopped before reaching Running");
+
+    let plain = failed_start(&id, &e, None).to_string();
+    assert!(!plain.contains("blob"), "{plain}");
+
+    let strict = failed_start(&id, &e, Some("invalid blob JSON: EOF")).to_string();
+    assert!(strict.contains("service stopped before reaching Running"), "{strict}");
+    assert!(strict.contains("could not be read"), "{strict}");
+    assert!(strict.contains("invalid blob JSON: EOF"), "{strict}");
+}
+
+/// A service installed by 0.1.0 under `restart: always` keeps a blob that says so. It decodes, and
+/// a `type: simple` one starts by the shim's vocabulary like any other.
+#[skuld::test]
+fn a_blob_that_says_always_decodes_and_starts_as_its_kind() {
+    let spec = DaemonSpec {
+        restart: Restart::Always,
+        ..blob_of(Kind::Simple).spec
+    };
+    let reg = generate::registration(
+        &spec,
+        &crate::backend::Identity {
+            user: "svc-frpc".to_string(),
+        },
+        &PathBuf::from(r"C:\shim\goetia-shim.exe"),
+    );
+
+    let blob = generate::extract(&reg.parameters)
+        .expect("the blob decodes")
+        .expect("the blob is ours");
+
+    assert_eq!(blob.spec.restart, Restart::Always);
+    assert_eq!(start_kind(Ok(Some(blob))), (Kind::Simple, None));
+}
+
+// refuse_always at its call sites -------------------------------------------------------------------------------------
+
+/// `install` and `preview_install` refuse `always` before anything reads the SCM, so the refusal is
+/// reachable without one.
+#[skuld::test]
+fn install_and_preview_install_refuse_restart_always() {
+    let mgr = ScmManager::new();
+    let spec = daemon_spec(Restart::Always);
+
+    for result in [
+        mgr.install(&spec, false).map(|_| ()),
+        mgr.preview_install(&spec).map(|_| ()),
+    ] {
+        let err = result.expect_err("`restart: always` must be refused for scm");
+        assert!(matches!(err, Error::Invalid { .. }), "{err:?}");
+        assert!(err.to_string().contains("restart: always"), "{err}");
+    }
 }

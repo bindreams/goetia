@@ -141,3 +141,15 @@ fn only_win32_zero_with_specific_1003_is_an_incomplete_stop() {
         assert!(!recorded(other).incomplete_stop(), "{other:?}");
     }
 }
+
+#[skuld::test]
+fn a_recorded_exit_is_displayed_as_a_service_specific_code_or_a_win32_one() {
+    let specific = RecordedExit {
+        win32: ERROR_SERVICE_SPECIFIC_ERROR,
+        specific: 7,
+    };
+    let win32 = RecordedExit { win32: 2, specific: 0 };
+
+    assert_eq!(specific.to_string(), "service-specific exit code 7");
+    assert_eq!(win32.to_string(), "exit code 2");
+}

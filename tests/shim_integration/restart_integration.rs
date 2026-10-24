@@ -18,7 +18,9 @@ use goetia::manager::{Budget, ServiceManager as _};
 use goetia::spec::{DaemonSpec, Restart};
 use windows_service::service::{ServiceExitCode, ServiceState};
 
-use crate::common::{ShimProcess, fixture_command, kill_process, mk_spec_full, recorded_exit, scm_status};
+use crate::common::{
+    ShimProcess, fallback_log, fixture_command, kill_process, mk_spec_full, recorded_exit, scm_status,
+};
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
 
 const ONE_SECOND: Option<Duration> = Some(Duration::from_secs(1));
@@ -365,28 +367,37 @@ fn uninstall_during_the_restart_delay_deletes_the_service_without_waiting_for_th
 
 // Services registered by an earlier version ===========================================================================
 
-/// Makes the installed service look as an earlier goetia left it: that version in `Parameters` and
-/// in the blob, and no recovery actions (the earlier shim did every restart itself).
-fn register_as_earlier_version(id: &str, current_version: &str) {
+fn parameters_key(id: &str) -> winreg::RegKey {
     use winreg::RegKey;
     use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
 
     let path = format!(r"SYSTEM\CurrentControlSet\Services\{id}\Parameters");
-    let key = RegKey::predef(HKEY_LOCAL_MACHINE)
+    RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(&path, KEY_READ | KEY_WRITE)
-        .unwrap_or_else(|e| panic!("open {path}: {e}"));
+        .unwrap_or_else(|e| panic!("open {path}: {e}"))
+}
 
-    let encoded: String = key
-        .get_value("Spec")
-        .unwrap_or_else(|e| panic!("read Spec under {path}: {e}"));
+/// Replaces `from` with `to` in the blob JSON under `Parameters\Spec`, which must hold `from`.
+fn replace_in_blob(id: &str, from: &str, to: &str) {
+    let key = parameters_key(id);
+    let encoded: String = key.get_value("Spec").expect("read Spec");
     let json = String::from_utf8(BASE64.decode(encoded).expect("Spec is base64")).expect("Spec is UTF-8 JSON");
-    let current = format!(r#""version":"{current_version}""#);
-    assert!(json.contains(&current), "no {current} in the blob: {json}");
-    let earlier = json.replace(&current, &format!(r#""version":"{EARLIER_VERSION}""#));
-    key.set_value("Spec", &BASE64.encode(earlier))
-        .unwrap_or_else(|e| panic!("write Spec under {path}: {e}"));
-    key.set_value("Version", &EARLIER_VERSION.to_string())
-        .unwrap_or_else(|e| panic!("write Version under {path}: {e}"));
+    assert!(json.contains(from), "no {from} in the blob: {json}");
+    key.set_value("Spec", &BASE64.encode(json.replace(from, to)))
+        .expect("write Spec");
+}
+
+/// Makes the installed service look as an earlier goetia left it: that version in `Parameters` and
+/// in the blob, and no recovery actions (the earlier shim did every restart itself).
+fn register_as_earlier_version(id: &str, current_version: &str) {
+    replace_in_blob(
+        id,
+        &format!(r#""version":"{current_version}""#),
+        &format!(r#""version":"{EARLIER_VERSION}""#),
+    );
+    parameters_key(id)
+        .set_value("Version", &EARLIER_VERSION.to_string())
+        .expect("write Version");
 
     support::cmd::run("sc.exe", &["failureflag", id, "0"]).expect_ok();
     support::cmd::run("sc.exe", &["failure", id, "reset=", "0", "actions=", ""]).expect_ok();
@@ -409,7 +420,41 @@ fn a_new_shim_runs_a_service_registered_by_an_earlier_version() {
 
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     reported.accept("the daemon of a service registered by an earlier version to report in");
+
+    // The shim logs the notice before it spawns the daemon, so it is in the log by now.
+    let logged = fallback_log(&id);
+    assert!(
+        logged.contains(&format!("registered by goetia {EARLIER_VERSION}")) && logged.contains("goetia daemon install"),
+        "the shim did not log the version-skew notice:\n{logged}"
+    );
+
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+}
+
+/// A service installed by 0.1.0 under `restart: always` keeps a blob that says so. Only `install`
+/// refuses `always` for scm, so the service must stay operable.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let reported = ConnectBack::listen();
+
+    let spec = on_failure(
+        &id,
+        fixture_command("report", &[&reported.port().to_string()]),
+        ONE_SECOND,
+    );
+    mgr.install(&spec, false).expect("install");
+    replace_in_blob(&id, r#""restart":"on-failure""#, r#""restart":"always""#);
+
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    reported.accept("the daemon of a service whose blob says always to report in");
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    mgr.uninstall(&spec.id).expect("uninstall");
+
+    let query = support::cmd::run("sc.exe", &["query", &id]);
+    assert_eq!(query.code, Some(1060), "the service should no longer exist:\n{query}");
 }
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]

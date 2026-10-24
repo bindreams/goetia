@@ -100,6 +100,16 @@ pub fn recorded_exit(id: &str) -> RecordedExit {
     }
 }
 
+/// The shim's fallback log for `id`, `%ProgramData%\Goetia\logs\<id>.log`: where it reports what it
+/// cannot report to the daemon's own log, and the daemon's output when the spec sets no `logs`.
+pub fn fallback_log(id: &str) -> String {
+    let programdata = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    let path = programdata.join("Goetia").join("logs").join(format!("{id}.log"));
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read fallback log {}: {e}", path.display()))
+}
+
 /// `taskkill /F` on `pid`: the way a test ends a shim or a daemon without telling either.
 pub fn kill_process(pid: u32) {
     support::cmd::run("taskkill.exe", &["/F", "/PID", &pid.to_string()]).expect_ok();

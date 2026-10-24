@@ -695,7 +695,8 @@ Windows removes when the daemon's process ends.
 After upgrading goetia, run `goetia daemon install` again for every daemon
 installed by an older version. Services registered before this shim existed
 have no recovery actions until then, so the new shim runs them but SCM does
-not restart them. The shim logs one line when it starts under a service that a
+not restart them. On every start, the shim logs one warning (in the log file and
+as a warning in the Windows Event Log) when it starts under a service that a
 different goetia version registered and `restart` is not `never`.
 
 `sc query` shows the difference between your command failing and the shim
@@ -713,7 +714,10 @@ or a command that is missing retries at `restart-delay` indefinitely, as it
 does for `type: managed`. If the shim cannot kill the command on `stop`, it
 logs both failed kills and reports the stop with Win32 code `0`, because a
 non-zero Win32 code would make SCM start a second copy; the service-specific
-code `1003` is the record that the command may still be running.
+code `1003` is the record that the command may still be running. goetia reads
+that record: `stop` exits `1` saying the command may still be running, `restart`
+does not start a second copy, and `uninstall` deletes the service and then exits
+`1` with the same message.
 
 ### What returning means
 

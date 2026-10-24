@@ -13,7 +13,7 @@ use goetia::backend::scm::manager::ScmManager;
 use goetia::manager::{Budget, ServiceManager as _};
 use windows_service::service::{ServiceExitCode, ServiceState};
 
-use crate::common::{fixture_command, mk_spec_full, recorded_exit, scm_status};
+use crate::common::{fallback_log, fixture_command, mk_spec_full, recorded_exit, scm_status};
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -187,13 +187,10 @@ fn unreadable_blob_logs_to_fallback_path_and_event_log() {
         "an undecodable blob is a shim failure: {status:?}"
     );
 
-    let fallback_path = programdata_dir().join("Goetia").join("logs").join(format!("{id}.log"));
-    let logged = std::fs::read_to_string(&fallback_path)
-        .unwrap_or_else(|e| panic!("read fallback log {}: {e}", fallback_path.display()));
+    let logged = fallback_log(&id);
     assert!(
         logged.contains(&id) && logged.to_lowercase().contains("decode"),
-        "fallback log at {} does not look like a decode-failure report naming `{id}`:\n{logged}",
-        fallback_path.display()
+        "fallback log does not look like a decode-failure report naming `{id}`:\n{logged}"
     );
 
     // Filtered server-side by provider, not by an arbitrary "most recent N"
@@ -227,12 +224,6 @@ fn unreadable_blob_logs_to_fallback_path_and_event_log() {
         !events.stdout.contains("The operation completed successfully"),
         "event rendered with no message resource, so an admin sees nothing useful; \n         install must register the `Goetia` source:\n{events}"
     );
-}
-
-fn programdata_dir() -> std::path::PathBuf {
-    std::env::var_os("ProgramData")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\ProgramData"))
 }
 
 /// Overwrite `Services\<id>\Parameters\Spec` with undecodable text, leaving

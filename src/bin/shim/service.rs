@@ -107,9 +107,7 @@ fn run_service(id: &str) {
         }
     };
 
-    if let Some(notice) = version_skew_notice(&blob.spec, &blob.version, goetia::version()) {
-        logging::log_failure(id, &notice);
-    }
+    log_version_skew(id, &blob.spec, &blob.version, goetia::version());
     let reported = run_daemon(&blob.spec, &stop_bus, id, || report_running(id, &status_handle));
     finish(id, &status_handle, reported);
 }
@@ -300,7 +298,15 @@ fn spawn_failed(command: &[String], e: &cosca::error::Error) -> String {
     format!("spawn {command:?}: {e}")
 }
 
-/// The failure line for a service registered by another goetia version, or `None` when there is
+/// Log [`version_skew_notice`] as a warning: the daemon runs, and each start is a new shim that
+/// sees the same condition until `goetia daemon install` is run again.
+fn log_version_skew(id: &str, spec: &DaemonSpec, registered_by: &str, running: &str) {
+    if let Some(notice) = version_skew_notice(spec, registered_by, running) {
+        logging::log_warning(id, &notice);
+    }
+}
+
+/// The line for a service registered by another goetia version, or `None` when there is
 /// nothing to say. Recovery actions are applied at install time, so a service registered before
 /// they existed (or by a version that set different ones) keeps running under this shim without
 /// restarts until `goetia daemon install` is run again.

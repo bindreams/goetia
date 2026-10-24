@@ -205,8 +205,14 @@ impl ServiceManager for ScmManager {
             // more, per the trait doc comment.
             return super::wait::request_start(&mut actor).map_err(|e| Error::Other(format!("start `{id}`: {e}")));
         }
-        let waited = super::wait::start_via_notify(&mut actor, deadline, installed_kind(id))
-            .map_err(|e| Error::Other(format!("start `{id}`: {e}")))?;
+        let (kind, unreadable) = installed_kind(id);
+        if let Some(why) = &unreadable {
+            eprintln!(
+                "warning: `{id}`'s spec blob could not be read ({why}); judging its start as a `type: managed` service's"
+            );
+        }
+        let waited = super::wait::start_via_notify(&mut actor, deadline, kind)
+            .map_err(|e| failed_start(id, &e, unreadable.as_deref()))?;
         match waited {
             Waited::Confirmed => Ok(()),
             Waited::Expired => Err(budget::timed_out(id.as_str(), "running", budget)),
@@ -380,17 +386,32 @@ pub fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
     generate::extract(&params)
 }
 
-/// The kind `start_via_notify` reads a `Stopped`-before-`Running` by. Only a decodable blob that
-/// says `type: simple` selects the shim's vocabulary; an unreadable one reads as strictly as
-/// `type: managed`, which is what a shim that cannot decode it reports anyway (a failed start).
-fn start_kind(blob: Result<Option<Blob>>) -> Kind {
+/// The kind `start_via_notify` reads a `Stopped`-before-`Running` by, and why the blob could not
+/// say. Only a decodable blob that says `type: simple` selects the shim's vocabulary; an unreadable
+/// one reads as strictly as `type: managed`, which is what a shim that cannot decode it reports
+/// anyway (a failed start).
+fn start_kind(blob: Result<Option<Blob>>) -> (Kind, Option<String>) {
     match blob {
-        Ok(Some(blob)) => blob.spec.kind,
-        Ok(None) | Err(_) => Kind::Managed,
+        Ok(Some(blob)) => (blob.spec.kind, None),
+        Ok(None) => (Kind::Managed, Some("it carries no goetia metadata".to_string())),
+        Err(e) => (Kind::Managed, Some(e.to_string())),
     }
 }
 
-fn installed_kind(id: &Id) -> Kind {
+/// `start`'s error for a `start_via_notify` failure. When the blob was unreadable the start was
+/// judged as a `type: managed` service's, and the error says why, since that is not what a
+/// `type: simple` service would have been told.
+fn failed_start(id: &Id, e: &std::io::Error, unreadable: Option<&str>) -> Error {
+    match unreadable {
+        None => Error::Other(format!("start `{id}`: {e}")),
+        Some(why) => Error::Other(format!(
+            "start `{id}`: {e} (its spec blob could not be read, so the start was judged as a `type: managed` \
+             service's: {why})"
+        )),
+    }
+}
+
+fn installed_kind(id: &Id) -> (Kind, Option<String>) {
     start_kind(read_spec_blob(id.as_str()))
 }
 

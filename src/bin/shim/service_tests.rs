@@ -15,7 +15,7 @@ use goetia::spec::{Id, Kind, Restart, User};
 use windows_sys::Win32::System::Services::SERVICE_STOPPED;
 
 use super::*;
-use crate::logging::test_hook::take;
+use crate::logging::test_hook::{take, take_warnings};
 use crate::stop_bus::test_hook as waiter_threads;
 use crate::stop_bus::test_hook::{KILL_REFUSED, Kill, WaiterEnd, kills, waiter_end};
 use crate::test_support::{TestId, assert_one_failure};
@@ -542,4 +542,31 @@ fn no_notice_when_the_shim_is_the_version_that_registered_the_service() {
             "{restart:?}"
         );
     }
+}
+
+/// The daemon is running, and every start is a new shim that sees the same condition: a warning,
+/// and not the error a failure to run would be.
+#[skuld::test]
+fn the_version_skew_notice_is_logged_as_a_warning_and_not_as_a_failure() {
+    let id = TestId::new(PREFIX);
+
+    log_version_skew(id.as_str(), &spec_restarting(Restart::OnFailure), "0.1.0", "0.2.0");
+
+    assert!(take(id.as_str()).is_empty(), "the notice was logged as a failure");
+    let warnings = take_warnings(id.as_str());
+    let [line] = warnings.as_slice() else {
+        panic!("expected exactly one warning, got {warnings:?}");
+    };
+    assert!(line.contains("registered by goetia 0.1.0"), "{line}");
+}
+
+#[skuld::test]
+fn nothing_is_logged_for_a_service_the_shim_has_no_notice_about() {
+    let id = TestId::new(PREFIX);
+
+    log_version_skew(id.as_str(), &spec_restarting(Restart::Never), "0.1.0", "0.2.0");
+    log_version_skew(id.as_str(), &spec_restarting(Restart::OnFailure), "0.2.0", "0.2.0");
+
+    assert!(take(id.as_str()).is_empty());
+    assert!(take_warnings(id.as_str()).is_empty());
 }

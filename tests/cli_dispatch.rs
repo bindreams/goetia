@@ -1292,6 +1292,11 @@ fn list_reaches_the_manager() {
 /// A service installed by 0.1.0 may carry `restart: always` on the scm backend, which a manifest
 /// can no longer say. Reading its blob must not run the manifest refusal, or the service could
 /// not even be stopped or removed.
+///
+/// CLI-only: the verbs run against `Fake`, which has no scm refusal of its own to trip. The scm
+/// side is `a_blob_that_says_always_decodes_and_starts_as_its_kind` (`manager_tests.rs`) and
+/// `a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled`
+/// (`tests/shim_integration/restart_integration.rs`).
 #[skuld::test]
 fn a_service_installed_with_restart_always_stays_operable() {
     let fake = Fake::new();
