@@ -85,7 +85,7 @@ mod system {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
     use windows_service::service::Service;
-    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0};
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Services::{QueryServiceStatusEx, SC_STATUS_PROCESS_INFO, SERVICE_STATUS_PROCESS};
     use windows_sys::Win32::System::Threading::{
         INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
@@ -96,6 +96,14 @@ mod system {
     /// The real SCM service; the process is a Win32 handle.
     pub struct SystemKillTarget {
         pub service: Service,
+        /// The daemon's id, for the notice printed when a kill has to wait.
+        pub id: String,
+    }
+
+    /// An opened service process and the pid it was opened by.
+    pub struct Held {
+        handle: OwnedHandle,
+        pid: u32,
     }
 
     /// The pid in `status`, in any state that has a process. `windows-service`'s `query_status`
@@ -106,8 +114,8 @@ mod system {
     }
 
     impl KillTarget for SystemKillTarget {
-        /// Opened with the rights to terminate it and to tell whether it already has exited.
-        type Process = OwnedHandle;
+        /// Opened with the rights to terminate it and to wait for its exit.
+        type Process = Held;
 
         fn service_pid(&mut self) -> io::Result<Option<u32>> {
             // SAFETY: an all-zero `SERVICE_STATUS_PROCESS` is valid; the call fills it, and is given
@@ -129,12 +137,17 @@ mod system {
             Ok(process_of(&status))
         }
 
-        fn open(&mut self, pid: u32) -> io::Result<Option<OwnedHandle>> {
-            open_process(pid)
+        fn open(&mut self, pid: u32) -> io::Result<Option<Held>> {
+            Ok(open_process(pid)?.map(|handle| Held { handle, pid }))
         }
 
-        fn terminate(&mut self, process: &OwnedHandle) -> io::Result<Termination> {
-            terminate_process(process)
+        fn terminate(&mut self, process: &Held) -> io::Result<Termination> {
+            terminate_process(&process.handle, || {
+                eprintln!(
+                    "{}: process {} is already terminating; waiting for it to exit",
+                    self.id, process.pid
+                );
+            })
         }
     }
 
@@ -157,21 +170,35 @@ mod system {
     }
 
     /// Terminate the process behind `process`, an [`open_process`] handle.
-    pub(super) fn terminate_process(process: &OwnedHandle) -> io::Result<Termination> {
+    ///
+    /// `on_wait` runs once, just before blocking on a process that is terminating but has not yet
+    /// exited, so a caller can tell a human why nothing returns.
+    pub(super) fn terminate_process(process: &OwnedHandle, on_wait: impl FnOnce()) -> io::Result<Termination> {
         // Exit code `1`: SCM sees a failure, the same as for a crash.
         // SAFETY: `process` is a live handle with `PROCESS_TERMINATE`.
         if unsafe { TerminateProcess(process.as_raw_handle(), 1) } != 0 {
             return Ok(Termination::Terminated);
         }
         let e = io::Error::last_os_error();
-        // The handle was opened with `PROCESS_TERMINATE`, so access denied here means the process is
-        // already terminating: `TerminateProcess` is asynchronous, and refuses from the moment the
-        // process is terminating, before its handle is signalled. Wait for that signal; the process is
-        // exiting, so the wait ends.
+        // Microsoft documents that "after a process has terminated, calls to `TerminateProcess` with
+        // open handles to the process fail with `ERROR_ACCESS_DENIED`". Measured by the real-process
+        // test: a second terminate right after the first is denied this way while the process handle
+        // is not yet signalled. So a denial on a handle opened with `PROCESS_TERMINATE` is taken to
+        // mean the process is terminating, and the exit is awaited on the handle.
         if e.raw_os_error() != Some(ERROR_ACCESS_DENIED as i32) {
             return Err(e);
         }
+        // A zero-timeout poll reads the state; it is not a wait. Already signalled: nothing to wait for.
         // SAFETY: as above; `PROCESS_SYNCHRONIZE` was requested.
+        match unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } {
+            WAIT_OBJECT_0 => return Ok(Termination::AlreadyExited),
+            WAIT_TIMEOUT => {}
+            _ => return Err(io::Error::last_os_error()),
+        }
+        // Unbounded on purpose: the process's exit is the event, and there is no outcome to report
+        // before it. A process wedged in a driver request is never signalled, so say why this blocks.
+        on_wait();
+        // SAFETY: as above.
         match unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) } {
             WAIT_OBJECT_0 => Ok(Termination::AlreadyExited),
             _ => Err(io::Error::last_os_error()),

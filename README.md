@@ -689,6 +689,12 @@ It addresses the service, never a bare pid:
 On Windows with `type: simple` the service's process is `goetia-shim`; its Job
 Object ends the daemon and its descendants with it.
 
+On Windows a process that is already terminating (a second `kill`, or a daemon
+dying on its own) is waited for until it exits, with no time limit. When that
+wait begins goetia prints `<id>: process <pid> is already terminating; waiting
+for it to exit` to stderr; a process stuck in a driver request can keep it
+waiting.
+
 A daemon with no process, whether stopped or between runs, is an error: exit
 `1` and "is not running", because nothing was killed and `goetia daemon kill x
 && echo ended` must not say otherwise. It is read off the kill request's own
