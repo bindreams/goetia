@@ -8,8 +8,10 @@
 //! that daemon's real `DaemonSpec` back out of the same
 //! `Services\<id>\Parameters` metadata blob the SCM backend wrote it into
 //! (see `service::run`), and does everything a real service host needs:
-//! spawn the daemon, capture its output, restart it per policy, and kill
-//! its whole process tree on `SERVICE_STOP`.
+//! spawn the daemon once, capture its output, report its exit as the service's
+//! exit, and kill its whole process tree on `SERVICE_STOP`. It never restarts the
+//! daemon: SCM's recovery actions do, each time as a new shim reading the
+//! installed spec.
 //!
 //! **Process-tree management is `cosca`'s job, not hand-rolled here.**
 //! `cosca::Command::contain()` is a Windows Job Object with
@@ -17,16 +19,10 @@
 //! event-driven kernel waits. See `service.rs`'s own module doc comment for
 //! the one piece `cosca` does not supply: interrupting a blocking
 //! `child.wait()` when SCM delivers `Stop`, which `stop_bus` provides.
-//!
-//! `supervisor.rs` is the one piece of this binary with no Win32 dependency
-//! at all — the restart-policy decision, pure and unit-tested on every
-//! platform this workspace builds on, not only Windows.
 
 // In test mode the bin's `main` becomes a skuld test runner; the regular
 // entry point below is dead code in that build — mirrors `src/main.rs`.
 #![cfg_attr(test, allow(dead_code))]
-
-mod supervisor;
 
 #[cfg(windows)]
 mod logging;

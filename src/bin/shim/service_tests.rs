@@ -1,17 +1,20 @@
-//! `launch`'s ordering, which is the whole of this module that can be tested without a real SCM:
-//! the thread that will wait on the daemon is made before the daemon is, so the OS refusing that
-//! thread is a start failure with nothing launched rather than an orphaned daemon nothing
-//! supervises.
+//! What `launch` and `run_daemon` do, which is the whole of this module that can be tested without
+//! a real SCM. `launch` makes the thread that will wait on the daemon before the daemon, so the OS
+//! refusing that thread is a start failure with nothing launched rather than an orphaned daemon
+//! nothing waits on. `run_daemon` is one pass: it reports running after the spawn, never after a
+//! failed launch, and turns the daemon's end into what SCM is told.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use cosca::identity::Liveness;
-use goetia::spec::{Id, Kind, User};
+use goetia::backend::scm::exit_status::{ERROR_GEN_FAILURE, ERROR_SERVICE_SPECIFIC_ERROR, Reported};
+use goetia::spec::{Id, Kind, Restart, User};
 
 use super::*;
 use crate::logging::test_hook::take;
 use crate::stop_bus::test_hook as waiter_threads;
+use crate::stop_bus::test_hook::{KILL_REFUSED, Kill, WaiterEnd, kills, waiter_end};
 use crate::test_support::{TestId, assert_one_failure};
 
 const PREFIX: &str = "goetia-shim-launch-test";
@@ -57,8 +60,9 @@ fn no_daemon_is_spawned_when_no_thread_can_be_made_to_wait_on_it() {
     // running.
     let launched = launch(&spec(dir.path(), id.as_str()), &stop_bus, id.as_str());
 
-    assert!(
-        launched.is_none(),
+    assert_eq!(
+        launched.as_ref().err(),
+        Some(&Reported::shim_failure(None)),
         "launch reported a daemon that nothing could wait on"
     );
     // The failure `launch` reports, journalled rather than written.
@@ -101,7 +105,7 @@ fn a_daemon_is_spawned_once_the_thread_that_waits_on_it_exists() {
 
     let launched = launch(&spec(dir.path(), id.as_str()), &stop_bus, id.as_str());
 
-    assert!(launched.is_some(), "launch failed with every thread available");
+    assert!(launched.is_ok(), "launch failed with every thread available");
     assert_eq!(
         take(id.as_str()),
         Vec::<String>::new(),
@@ -160,9 +164,13 @@ fn a_daemon_that_cannot_be_spawned_is_logged_and_nothing_is_left_running() {
 
     let launched = launch(&missing, &stop_bus, id.as_str());
 
-    assert!(launched.is_none(), "launch reported a daemon whose spawn failed");
     // The OS's own refusal, asked for independently of the log line under test.
     let refusal = start(&mut build_command(&missing, id.as_str())).expect_err("the binary does not exist");
+    assert_eq!(
+        launched.as_ref().err(),
+        Some(&Reported::shim_failure(os_error_of(&refusal))),
+        "launch reported a daemon whose spawn failed, or lost the OS error"
+    );
     assert_one_failure(
         &take(id.as_str()),
         id.as_str(),
@@ -192,7 +200,7 @@ fn a_log_file_that_cannot_be_opened_is_logged_and_the_daemon_still_runs() {
     let launched = launch(&daemon, &stop_bus, id.as_str());
 
     assert!(
-        launched.is_some(),
+        launched.is_ok(),
         "an unopenable log file stopped the daemon from running"
     );
     let refusal = logging::open_append(&unopenable).expect_err("the path cannot be opened");
@@ -200,7 +208,7 @@ fn a_log_file_that_cannot_be_opened_is_logged_and_the_daemon_still_runs() {
         &take(id.as_str()),
         id.as_str(),
         &format!(
-            "open log file {}: {refusal} (this daemon's output will not be captured; it is still being run and supervised)",
+            "open log file {}: {refusal} (this daemon's output will not be captured; it is still being run)",
             unopenable.display()
         ),
     );
@@ -224,5 +232,245 @@ fn a_log_file_that_cannot_be_opened_is_logged_and_the_daemon_still_runs() {
         daemon.is_alive(),
         Liveness::Dead,
         "the daemon outlived the `Child` that owned it"
+    );
+}
+
+// run_daemon ==========================================================================================================
+
+/// A daemon that runs a PowerShell script.
+fn powershell(dir: &Path, id: &str, script: &str) -> DaemonSpec {
+    DaemonSpec {
+        command: ["powershell", "-NoProfile", "-NonInteractive", "-Command", script]
+            .map(String::from)
+            .to_vec(),
+        ..spec(dir, id)
+    }
+}
+
+#[skuld::test]
+fn no_running_report_when_no_thread_can_be_made() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+    let spawned_before = test_hook::spawns();
+    let _no_thread = waiter_threads::threads(0);
+    let mut running_reports = 0;
+
+    let reported = run_daemon(&spec(dir.path(), id.as_str()), &stop_bus, id.as_str(), || {
+        running_reports += 1
+    });
+
+    assert_eq!(
+        running_reports, 0,
+        "RUNNING was reported for a daemon nothing could wait on"
+    );
+    assert_eq!(reported, Reported::shim_failure(None));
+    assert_one_failure(
+        &take(id.as_str()),
+        id.as_str(),
+        &format!(
+            r#"make the thread that waits on ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"]: {}; it was not spawned, so nothing of this daemon is running"#,
+            waiter_threads::NO_THREAD
+        ),
+    );
+    assert_eq!(test_hook::spawns(), spawned_before, "a daemon was spawned");
+}
+
+#[skuld::test]
+fn no_running_report_when_the_spawn_fails() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+    let missing = DaemonSpec {
+        command: vec!["goetia-shim-test-no-such-binary".to_string()],
+        ..spec(dir.path(), id.as_str())
+    };
+    let mut running_reports = 0;
+
+    let reported = run_daemon(&missing, &stop_bus, id.as_str(), || running_reports += 1);
+
+    assert_eq!(
+        running_reports, 0,
+        "RUNNING was reported for a daemon that never started"
+    );
+    let refusal = start(&mut build_command(&missing, id.as_str())).expect_err("the binary does not exist");
+    assert_eq!(reported, Reported::shim_failure(os_error_of(&refusal)));
+    assert_one_failure(
+        &take(id.as_str()),
+        id.as_str(),
+        &format!(r#"spawn ["goetia-shim-test-no-such-binary"]: {refusal}"#),
+    );
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+#[skuld::test]
+fn running_is_reported_once_and_after_the_spawn() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+    let spawned_before = test_hook::spawns();
+    let mut running_reports = Vec::new();
+
+    // The stop ends the pass once the report is made; the daemon sleeps until then.
+    let reported = run_daemon(&spec(dir.path(), id.as_str()), &stop_bus, id.as_str(), || {
+        running_reports.push(test_hook::spawns() - spawned_before);
+        stop_bus.request_stop();
+    });
+
+    assert_eq!(
+        running_reports,
+        [1],
+        "RUNNING must be reported exactly once, with one spawn already made"
+    );
+    assert_eq!(
+        reported,
+        Reported::Clean,
+        "a commanded stop that killed the daemon is clean"
+    );
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+#[skuld::test]
+fn a_daemon_that_exits_nonzero_is_one_pass() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+    let spawned_before = test_hook::spawns();
+    // The shim no longer reads the restart policy, so none may respawn.
+    let daemon = DaemonSpec {
+        restart: Restart::OnFailure,
+        restart_delay: None,
+        ..powershell(dir.path(), id.as_str(), "exit 7")
+    };
+
+    let reported = run_daemon(&daemon, &stop_bus, id.as_str(), || {});
+
+    assert_eq!(reported, Reported::DaemonExit(7));
+    assert_eq!(test_hook::spawns(), spawned_before + 1, "the daemon was spawned again");
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+#[skuld::test]
+fn a_daemon_that_exits_zero_is_clean() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+
+    let reported = run_daemon(
+        &powershell(dir.path(), id.as_str(), "exit 0"),
+        &stop_bus,
+        id.as_str(),
+        || {},
+    );
+
+    assert_eq!(reported, Reported::Clean);
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+#[skuld::test]
+fn an_unkillable_daemon_reports_the_incomplete_stop_failure() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+    // Both kills are refused, so the daemon outlives `run_daemon`: it ends when the test creates
+    // this file, which is what lets the detached waiter thread be consumed.
+    let release = dir.path().join("release");
+    let daemon = powershell(
+        dir.path(),
+        id.as_str(),
+        &format!(
+            "while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 100 }}",
+            release.display()
+        ),
+    );
+
+    let reported = {
+        let _refused = kills(Kill::Refuse);
+        run_daemon(&daemon, &stop_bus, id.as_str(), || stop_bus.request_stop())
+    };
+
+    assert_eq!(reported, Reported::incomplete_stop());
+    std::fs::write(&release, "").expect("release the daemon");
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+    let lines = take(id.as_str());
+    assert_eq!(lines.len(), 2, "both refused kills must be journalled: {lines:?}");
+    assert_one_failure(
+        &lines[..1],
+        id.as_str(),
+        &format!(
+            "kill_tree on stop: {KILL_REFUSED}; falling back to killing the direct child only (its own descendants, if any, cannot be reached without a containment mechanism)"
+        ),
+    );
+    assert_one_failure(
+        &lines[1..],
+        id.as_str(),
+        &format!(
+            "fallback kill on stop: {KILL_REFUSED}; the daemon was neither killed nor reaped and may still be running — reporting the service stopped, with that failure, rather than waiting for an exit nothing can now cause"
+        ),
+    );
+}
+
+// Pure helpers --------------------------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn a_stop_wins_over_a_daemon_that_failed_at_the_same_moment() {
+    assert_eq!(exit_report(true, Some(7)), Reported::Clean);
+    assert_eq!(exit_report(true, None), Reported::Clean);
+}
+
+#[skuld::test]
+fn an_exit_code_becomes_a_daemon_report() {
+    assert_eq!(exit_report(false, Some(0)), Reported::Clean);
+    assert_eq!(exit_report(false, Some(7)), Reported::DaemonExit(7));
+    assert_eq!(exit_report(false, Some(-1073741819)), Reported::DaemonExit(0xC000_0005));
+}
+
+#[skuld::test]
+fn an_unobtainable_exit_status_is_a_shim_failure() {
+    assert_eq!(
+        exit_report(false, None),
+        Reported::ShimFailure(ERROR_GEN_FAILURE),
+        "an exit with no code must not read as a daemon's code or as clean"
+    );
+}
+
+#[skuld::test]
+fn each_report_maps_to_the_service_exit_code_scm_records() {
+    assert_eq!(service_exit_code(Reported::Clean), ServiceExitCode::Win32(0));
+    assert_eq!(
+        service_exit_code(Reported::DaemonExit(7)),
+        ServiceExitCode::ServiceSpecific(7)
+    );
+    assert_eq!(
+        service_exit_code(Reported::shim_failure(Some(13))),
+        ServiceExitCode::Win32(13)
+    );
+    assert_eq!(
+        service_exit_code(Reported::incomplete_stop()),
+        ServiceExitCode::Win32(0),
+        "any non-zero code on a commanded stop makes SCM start a second daemon"
+    );
+    assert_ne!(
+        service_exit_code(Reported::shim_failure(Some(ERROR_SERVICE_SPECIFIC_ERROR as i32))),
+        ServiceExitCode::Win32(ERROR_SERVICE_SPECIFIC_ERROR),
+        "1066 reads as a daemon's code"
+    );
+}
+
+#[skuld::test]
+fn the_os_error_of_an_io_failure_is_kept_and_other_failures_have_none() {
+    assert_eq!(
+        os_error_of(&cosca::error::Error::Io(std::io::Error::from_raw_os_error(5))),
+        Some(5)
+    );
+    assert_eq!(
+        os_error_of(&cosca::error::Error::Io(std::io::Error::other("no os code"))),
+        None
+    );
+    assert_eq!(
+        os_error_of(&cosca::error::Error::Containment {
+            detail: "attach".to_string()
+        }),
+        None
     );
 }
