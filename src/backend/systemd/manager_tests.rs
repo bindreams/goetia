@@ -241,8 +241,6 @@ fn ensure_dir_leaves_a_preexisting_directory_untouched() {
     );
 }
 
-/// `install` is not a start: a directory the service account cannot write is the administrator's to
-/// prepare, and the service manager reports it at start. Install neither refuses it nor touches it.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn ensure_dir_accepts_a_preexisting_directory_the_account_cannot_write() {
     use std::os::unix::fs::MetadataExt as _;
@@ -252,8 +250,7 @@ fn ensure_dir_accepts_a_preexisting_directory_the_account_cannot_write() {
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
     let _cleanup = RmDir(dir.clone());
 
-    ensure_dir(&dir, &User::Name("nobody".to_string()))
-        .expect("a pre-existing directory must not be checked for writability");
+    ensure_dir(&dir, &User::Name("nobody".to_string())).expect("ensure_dir");
 
     let meta = std::fs::metadata(&dir).expect("stat");
     assert_eq!(meta.permissions().mode() & 0o777, 0o700, "mode must be untouched");

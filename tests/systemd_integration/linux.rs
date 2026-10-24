@@ -1682,8 +1682,6 @@ fn install_creates_and_owns_fresh_cwd_and_logs_dirs_for_a_named_user() {
     }
 }
 
-/// `install` is not a start: a `cwd` and a log directory the target account cannot write are left
-/// exactly as found, and the install succeeds.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn install_accepts_preexisting_dirs_the_target_account_cannot_write() {
     let id = support::random_test_id();
@@ -1703,8 +1701,7 @@ fn install_accepts_preexisting_dirs_the_target_account_cannot_write() {
     spec.logs = Some(log_dir.join("out.log"));
 
     let mgr = Systemd::new();
-    mgr.install(&spec, false)
-        .expect("install must not check that an existing directory is writable");
+    mgr.install(&spec, false).expect("install");
 
     for dir in [&cwd, &log_dir] {
         let meta = fs::metadata(dir).expect("stat");

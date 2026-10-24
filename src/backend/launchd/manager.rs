@@ -56,7 +56,7 @@
 //! refuses a `Disabled` plist outright (see the crate-level design notes).
 
 use std::io::{Read as _, Write as _};
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{fs, io};
@@ -579,7 +579,7 @@ fn ensure_dir(dir: &Path) -> Result<()> {
     fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).map_err(io_err(dir))
 }
 
-/// `create_dir_all` `cwd` itself (its own contents are what `WorkingDirectory`
+/// Create `cwd` itself (its own contents are what `WorkingDirectory`
 /// needs to exist) and the *parent* of `logs` (a file path; launchd creates
 /// the leaf log file itself but not its containing directory) — both
 /// world-readable-and-searchable, then handed to `account` so a non-root
@@ -600,20 +600,52 @@ fn prepare_parent_dirs(spec: &DaemonSpec, account: &Account) -> Result<()> {
     Ok(())
 }
 
-/// Only touches a directory this call itself creates. `dir` is an
-/// arbitrary absolute path a spec author supplied (`spec::resolve`
-/// guarantees only that it's absolute) — `chown`ing and `chmod 0755`ing it
-/// unconditionally would hand ownership of, and strip the mode from,
-/// whatever already happened to be there (`/var/log`, a user's home
-/// directory, ...) on every single `install`. A directory that already
-/// exists is therefore left completely untouched.
+/// Create `dir` and every missing ancestor, `chmod`ing `0755` and `chown`ing to `account` only the
+/// components this call itself creates. `dir` is an arbitrary absolute path a spec author supplied
+/// (`spec::resolve` guarantees only that it's absolute), so doing that to a path that already
+/// exists would hand ownership of, and strip the mode from, whatever happened to be there
+/// (`/var/log`, a user's home directory, ...). A path that already exists — of any kind, a dangling
+/// symlink included — is left untouched, and so is one a concurrent install creates first.
 fn ensure_dir_owned_by(dir: &Path, account: &Account) -> Result<()> {
-    if dir.exists() {
-        return Ok(());
+    create_owned(&missing_components(dir)?, account)
+}
+
+/// The components of `dir` that do not exist, outermost first. A dangling symlink exists.
+fn missing_components(dir: &Path) -> Result<Vec<&Path>> {
+    let mut missing = Vec::new();
+    let mut cursor = dir;
+    loop {
+        match fs::symlink_metadata(cursor) {
+            Ok(_) => break,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                missing.push(cursor);
+                match cursor.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => cursor = parent,
+                    _ => break,
+                }
+            }
+            Err(e) => return Err(io_err(cursor)(e)),
+        }
     }
-    ensure_dir(dir)?;
-    nix::unistd::chown(dir, Some(account.uid), Some(account.gid))
-        .map_err(|e| Error::Other(format!("chown {} to {}: {e}", dir.display(), account.name)))
+    missing.reverse();
+    Ok(missing)
+}
+
+/// `mkdir` each of `missing` (outermost first), then `chmod` and `chown` it. `AlreadyExists` means
+/// another install created it after the walk: not ours, so left alone.
+fn create_owned(missing: &[&Path], account: &Account) -> Result<()> {
+    for path in missing {
+        match fs::DirBuilder::new().mode(0o755).create(path) {
+            Ok(()) => {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o755)).map_err(io_err(*path))?;
+                nix::unistd::chown(*path, Some(account.uid), Some(account.gid))
+                    .map_err(|e| Error::Other(format!("chown {} to {}: {e}", path.display(), account.name)))?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(io_err(*path)(e)),
+        }
+    }
+    Ok(())
 }
 
 /// Build a `0644` named temp file in `dir` (so a later hard-link-based

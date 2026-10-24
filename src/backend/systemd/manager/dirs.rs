@@ -1,7 +1,6 @@
 //! Creating and owning the parent directories `logs` and `cwd` need — obligation 5. Only path
 //! components a call actually creates are touched; an already-existing directory's mode and
-//! ownership are left alone. Install does not check that an existing directory is usable: install is
-//! not a start, and the service manager reports a directory the account cannot write at start.
+//! ownership are left alone.
 
 use std::fs;
 use std::io;
@@ -15,8 +14,7 @@ use crate::spec::{AccountId, DaemonSpec, User};
 use super::io_err;
 
 /// Create (and, for a non-root account, `chown`) the parent of `logs` and the `cwd` directory itself
-/// — obligation 5. Runs while still elevated, so a directory goetia creates is one the target account
-/// can write.
+/// — obligation 5. Runs while still elevated.
 pub(super) fn ensure_parent_dirs(spec: &DaemonSpec) -> Result<()> {
     if let Some(logs) = &spec.logs {
         if let Some(parent) = logs.parent() {
@@ -36,8 +34,8 @@ pub(super) fn ensure_parent_dirs(spec: &DaemonSpec) -> Result<()> {
 /// Goetia-owned root, so reassigning mode/ownership unconditionally — including when `dir` or an
 /// ancestor already existed — would let a manifest silently widen or reassign an arbitrary existing
 /// system directory (`/var/log`, `/etc`, another user's home). A directory that already existed (or
-/// that a concurrent, racing install created first — see the loop below) is left exactly as it was
-/// and is not checked for writability; only a non-directory at that path is an error.
+/// that a concurrent, racing install created first — see the loop below) is left exactly as it was;
+/// only a non-directory at that path is an error.
 pub(super) fn ensure_dir(dir: &Path, user: &User) -> Result<()> {
     let mut missing = Vec::new();
     let mut cursor = dir;
