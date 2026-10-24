@@ -754,6 +754,88 @@ fn a_stop_request_is_issued_unless_a_restart_is_pending() {
     }
 }
 
+// a stop before a delete ----------------------------------------------------------------------------------------------
+
+/// Deleting a service cancels the restart SCM has queued (P12), so a service that is already
+/// `STOPPED` needs no stop, whatever is queued, and nothing is waited for.
+#[skuld::test]
+fn a_stopped_service_is_deleted_without_a_stop_whatever_is_queued() {
+    for exit in [stopped_clean(), daemon_failed(), shim_failed()] {
+        let mut fake = FakeScm::new([]).restarting().found(QueriedState::Stopped, exit);
+        assert_eq!(stop_before_delete(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+        assert_eq!(fake.log, vec!["query"], "{exit:?}");
+        assert_eq!(
+            fake.recovery_reads, 0,
+            "{exit:?}: the configuration decides nothing here"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_running_service_is_stopped_as_for_any_stop() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_with([stopped_clean()]);
+    assert_eq!(stop_before_delete(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        fake.log,
+        vec!["query", "arm_stopped", "control_stop", "wait", "got_stopped"]
+    );
+}
+
+#[skuld::test]
+fn every_state_but_stopped_is_stopped_before_the_delete() {
+    for state in [
+        QueriedState::StartPending,
+        QueriedState::StopPending,
+        QueriedState::Running,
+        QueriedState::ContinuePending,
+        QueriedState::PausePending,
+        QueriedState::Paused,
+    ] {
+        let mut fake = FakeScm::new([Some(Observed::Stopped)])
+            .found(state, stopped_clean())
+            .stopped_with([stopped_clean()]);
+        assert_eq!(stop_before_delete(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+        assert_eq!(
+            fake.log.iter().filter(|step| **step == "control_stop").count(),
+            1,
+            "{state:?}"
+        );
+    }
+}
+
+/// A stop that meets a daemon failing at that moment ends on the failure's `STOPPED`, with a restart
+/// queued. The delete cancels it, so the stop does not wait for it, stop what it starts, or look at
+/// the failure actions.
+#[skuld::test]
+fn a_stop_that_meets_a_failing_daemon_does_not_wait_for_the_restart_the_delete_cancels() {
+    let mut fake = FakeScm::new([Some(Observed::Pending), Some(Observed::Stopped)])
+        .restarting()
+        .stopped_with([daemon_failed()]);
+    assert_eq!(stop_before_delete(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        fake.log,
+        vec![
+            "query",
+            "arm_stopped",
+            "control_stop",
+            "wait",
+            "got_pending",
+            "arm_stopped",
+            "wait",
+            "got_stopped",
+        ]
+    );
+    assert_eq!(fake.recovery_reads, 0);
+}
+
+#[skuld::test]
+fn a_stop_before_a_delete_that_runs_out_reports_it() {
+    let mut fake = FakeScm::new([None]);
+    assert_eq!(stop_before_delete(&mut fake, spent()).unwrap(), Waited::Expired);
+    let mut fake = FakeScm::new([]).arming(Waited::Expired);
+    assert_eq!(stop_before_delete(&mut fake, spent()).unwrap(), Waited::Expired);
+}
+
 // handle teardown -----------------------------------------------------------------------------------------------------
 
 /// Records which of [`ScmHandles`]' steps ran, in call order.

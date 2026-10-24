@@ -649,10 +649,13 @@ clean exit is never restarted, and a stop reports a clean exit.
 Nothing cancels a restart SCM has queued, so `goetia daemon stop` meets it
 head on: a command that failed and is waiting out `restart-delay`, or one that
 fails as the stop arrives. `stop` waits for that restart, within `--timeout`,
-and stops the command it starts, so the daemon stays down; `restart` and
-`uninstall` stop it the same way. If the restart does not arrive in time, or
+and stops the command it starts, so the daemon stays down; `restart` stops it
+the same way. If the restart does not arrive in time, or
 `--timeout` is `0`, nothing is stopped: `stop` exits `4` and says a restart is
 pending. Run it again with a longer `--timeout`, or `--no-timeout`.
+
+`uninstall` does not wait for a restart: deleting the service cancels it, so a
+daemon that fails as soon as it starts can still be uninstalled.
 
 After upgrading goetia, run `goetia daemon install` again for every daemon
 installed by an older version. Services registered before this shim existed

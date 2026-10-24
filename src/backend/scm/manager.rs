@@ -94,8 +94,8 @@ use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::PathBuf;
 
 use windows_service::service::{
-    Service, ServiceAccess, ServiceActionType, ServiceErrorControl, ServiceExitCode, ServiceFailureResetPeriod,
-    ServiceInfo, ServiceStartType, ServiceState as WinState, ServiceType,
+    Service, ServiceAccess, ServiceActionType, ServiceErrorControl, ServiceFailureResetPeriod, ServiceInfo,
+    ServiceStartType, ServiceState as WinState, ServiceType,
 };
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SERVICE_DOES_NOT_EXIST, LocalFree};
@@ -901,47 +901,35 @@ fn run_sc(args: &[&str]) -> Result<()> {
 
 /// Stop (waiting for a confirmed `STOPPED`, closing that handle), then
 /// delete via a fresh handle. See trap 3.
+///
+/// A restart SCM has queued is not waited for: `DeleteService` cancels it (the attempt fails with
+/// `ERROR_SERVICE_DISABLED` and the host never runs), so a service that is `STOPPED` is deleted
+/// as it is, and a stop that meets a failing daemon ends on that failure's `STOPPED`. Waiting would
+/// never end for a daemon that fails as soon as it is spawned, which is when `uninstall` is used.
 fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
-    let needs_stop = {
-        let service = scm
-            .open_service(id.as_str(), ServiceAccess::QUERY_STATUS)
-            .map_err(|e| to_error(&format!("query status for `{id}` before uninstall"), e))?;
-        let status = service
-            .query_status()
-            .map_err(|e| to_error(&format!("query status for `{id}` before uninstall"), e))?;
-        // A `STOPPED` with a non-zero Win32 code may have a restart queued, which deleting the
-        // service does not stop from firing into it: `stop_via_notify` decides.
-        status.current_state != WinState::Stopped || status.exit_code != ServiceExitCode::Win32(0)
-        // `service`'s `SC_HANDLE` closes here, at the end of this block.
-    };
-
-    if needs_stop {
+    {
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to stop it before uninstall: {e}")))?;
         // Deliberately `Budget::Unbounded`, and not the caller's: `uninstall` has no `--timeout`
         // of its own, this stop is a means rather than an end, and bounding it would turn a
         // slow-stopping service into a failed uninstall where today it succeeds. The message below
         // already routes the user for every way this can actually fail.
-        let waited = super::wait::stop_via_notify(&mut actor, Budget::Unbounded.start()).map_err(|e| {
+        let waited = super::wait::stop_before_delete(&mut actor, Budget::Unbounded.start()).map_err(|e| {
             Error::Other(format!(
                 "`{id}` did not confirm SERVICE_STOPPED before uninstall ({e}); it was NOT deleted — \
-                 DeleteService on a running service only marks it for deletion, which the next install would \
-                 meet as ERROR_SERVICE_MARKED_FOR_DELETE. Stop it (or wait for it to stop) and re-run \
-                 `goetia daemon uninstall {id}`."
+                DeleteService on a running service only marks it for deletion, which the next install would \
+                meet as ERROR_SERVICE_MARKED_FOR_DELETE. Stop it (or wait for it to stop) and re-run \
+                `goetia daemon uninstall {id}`."
             ))
         })?;
         match waited {
-            StopWaited::Confirmed => {}
+            Waited::Confirmed => {}
             // `let _ = …` is the write that turns an unreachable case into a silent one, and this
             // is precisely the case where a later edit narrowing that budget must not pass quietly.
-            StopWaited::Expired | StopWaited::RestartPending => {
-                unreachable!("uninstall's stop is Unbounded; an unbounded deadline never expires")
-            }
+            Waited::Expired => unreachable!("uninstall's stop is Unbounded; an unbounded deadline never expires"),
         }
-        // `actor`'s `SC_HANDLE` must close before the `DELETE` handle opens
-        // below — dropping it explicitly documents that ordering rather than
-        // relying on it falling out of scope at the end of the function.
-        drop(actor);
+        // `actor`'s `SC_HANDLE` must close before the `DELETE` handle opens below, which the end of
+        // this block does.
     }
 
     let service = scm

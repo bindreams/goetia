@@ -361,6 +361,28 @@ fn a_stop_that_cannot_wait_out_a_pending_restart_says_so_and_issues_nothing() {
     }
 }
 
+/// `uninstall` does not wait for a queued restart: deleting the service cancels it. The delay is an
+/// hour, so a stop that waited for the restart would not return, and the service would not be gone.
+/// After the uninstall returns, `sc` finds no record (1060, `ERROR_SERVICE_DOES_NOT_EXIST`), so the
+/// restart has nothing to start.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn uninstall_during_the_restart_delay_deletes_the_service_without_waiting_for_the_restart() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let (_reported, spec) = fail_once(&mgr, &id, Duration::from_secs(3600));
+    let failed = RecordedExit {
+        win32: ERROR_SERVICE_SPECIFIC_ERROR,
+        specific: 7,
+    };
+    assert_eq!(recorded_exit(&id), failed, "the daemon's failure is what SCM holds");
+
+    mgr.uninstall(&spec.id).expect("uninstall");
+
+    let query = support::cmd::run("sc.exe", &["query", &id]);
+    assert_eq!(query.code, Some(1060), "the service should no longer exist:\n{query}");
+}
+
 // Services registered by an earlier version ===========================================================================
 
 /// Makes the installed service look as an earlier goetia left it: that version in `Parameters` and

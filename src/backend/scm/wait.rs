@@ -231,6 +231,33 @@ pub fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result
     }
 }
 
+/// The stop before `uninstall` deletes the service. `DeleteService` cancels the restart SCM has
+/// queued (measured, P12), so unlike [`stop_via_notify`] this never waits for one: a `STOPPED` is
+/// the end of the wait whatever follows it, and waiting on a daemon that fails as soon as it is
+/// spawned would never end.
+///
+/// A service that is already `STOPPED`, restart queued or not, is deleted without a stop. Any other
+/// state is stopped as for any stop, under the same `deadline`.
+pub fn stop_before_delete<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
+    if a.query_status()?.0 == QueriedState::Stopped {
+        return Ok(Waited::Confirmed);
+    }
+    if issue_stop(a, deadline)? == Waited::Expired {
+        return Ok(Waited::Expired);
+    }
+    loop {
+        match a.wait_callback(deadline)? {
+            None => return Ok(Waited::Expired),
+            Some(Observed::Stopped) => return Ok(Waited::Confirmed),
+            Some(Observed::Running | Observed::Pending) => {
+                if a.arm(WantState::Stopped, deadline)? == Waited::Expired {
+                    return Ok(Waited::Expired);
+                }
+            }
+        }
+    }
+}
+
 /// What `StartServiceW` answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartReply {
