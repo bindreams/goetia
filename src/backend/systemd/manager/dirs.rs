@@ -1,6 +1,7 @@
 //! Creating and owning the parent directories `logs` and `cwd` need — obligation 5. Only path
 //! components a call actually creates are touched; an already-existing directory's mode and
-//! ownership are left alone and merely verified writable, never reassigned.
+//! ownership are left alone. Install does not check that an existing directory is usable: install is
+//! not a start, and the service manager reports a directory the account cannot write at start.
 
 use std::fs;
 use std::io;
@@ -14,18 +15,18 @@ use crate::spec::{AccountId, DaemonSpec, User};
 use super::io_err;
 
 /// Create (and, for a non-root account, `chown`) the parent of `logs` and the `cwd` directory itself
-/// — obligation 5. Runs while still elevated, at install time, so a later `start` never fails with an
-/// opaque status over a directory the target account could not write.
+/// — obligation 5. Runs while still elevated, so a directory goetia creates is one the target account
+/// can write.
 pub(super) fn ensure_parent_dirs(spec: &DaemonSpec) -> Result<()> {
     if let Some(logs) = &spec.logs {
         if let Some(parent) = logs.parent() {
             if !parent.as_os_str().is_empty() {
-                ensure_writable_dir(parent, &spec.user)?;
+                ensure_dir(parent, &spec.user)?;
             }
         }
     }
     if let Some(cwd) = &spec.cwd {
-        ensure_writable_dir(cwd, &spec.user)?;
+        ensure_dir(cwd, &spec.user)?;
     }
     Ok(())
 }
@@ -35,10 +36,9 @@ pub(super) fn ensure_parent_dirs(spec: &DaemonSpec) -> Result<()> {
 /// Goetia-owned root, so reassigning mode/ownership unconditionally — including when `dir` or an
 /// ancestor already existed — would let a manifest silently widen or reassign an arbitrary existing
 /// system directory (`/var/log`, `/etc`, another user's home). A directory that already existed (or
-/// that a concurrent, racing install created first — see the loop below) is left exactly as it was;
-/// it is verified to actually be a directory, and that the target account can write it, and either
-/// failure is reported as an error instead of silently accepted or silently widened.
-pub(super) fn ensure_writable_dir(dir: &Path, user: &User) -> Result<()> {
+/// that a concurrent, racing install created first — see the loop below) is left exactly as it was
+/// and is not checked for writability; only a non-directory at that path is an error.
+pub(super) fn ensure_dir(dir: &Path, user: &User) -> Result<()> {
     let mut missing = Vec::new();
     let mut cursor = dir;
     loop {
@@ -100,62 +100,8 @@ pub(super) fn ensure_writable_dir(dir: &Path, user: &User) -> Result<()> {
                 dir.display()
             )));
         }
-        verify_writable_by(dir, user)?;
     }
     Ok(())
-}
-
-/// Whether the account `user` names can write to the already-existing `dir`, checked by literally
-/// asking the OS as that account (`runuser`) rather than hand-rolling permission-bit/ACL math.
-/// `dir`'s mode/ownership is never touched here — see `ensure_writable_dir`'s doc comment for why —
-/// so this exists purely to surface the same opaque-status-at-start failure obligation 5 exists to
-/// avoid, at install time instead of discovered later by the daemon itself.
-pub(super) fn verify_writable_by(dir: &Path, user: &User) -> Result<()> {
-    let User::Root = user else {
-        let account = chown_target(user).expect("a SID user is rejected by identity_for before this is reached");
-        // `runuser -u` resolves its argument via `getpwnam` only — a bare numeric uid is rejected
-        // outright even when a passwd entry exists for it (verified: `runuser -u 65534 -- true` fails
-        // with "user 65534 does not exist or the user entry does not contain all the required
-        // fields", while `runuser -u nobody -- true` succeeds for that same uid). Resolve a numeric
-        // account to its name first so this never mistakes "runuser rejected the uid form" for "not
-        // writable".
-        let account = resolve_account_name(&account)?;
-        let output = Command::new("runuser")
-            .args(["-u", &account, "--", "test", "-w"])
-            .arg(dir)
-            .output()
-            .map_err(|e| Error::Other(format!("failed to spawn runuser to verify {}: {e}", dir.display())))?;
-        if !output.status.success() {
-            return Err(Error::Other(format!(
-                "{} already exists and is not writable by `{account}`; goetia only creates and owns \
-                 directories it did not find already present, so fix its ownership/permissions \
-                 manually, or point `cwd`/`logs` elsewhere",
-                dir.display()
-            )));
-        }
-        return Ok(());
-    };
-    Ok(())
-}
-
-/// Resolve a numeric uid to its account name; passes a non-numeric account straight through. A
-/// lookup failure is reported explicitly rather than folded into a later "not writable" verdict — see
-/// `verify_writable_by`'s call site.
-fn resolve_account_name(account: &str) -> Result<String> {
-    if !account.bytes().all(|b| b.is_ascii_digit()) {
-        return Ok(account.to_string());
-    }
-    let output = Command::new("id")
-        .args(["-nu", account])
-        .output()
-        .map_err(|e| Error::Other(format!("failed to spawn `id -nu {account}`: {e}")))?;
-    if !output.status.success() {
-        return Err(Error::Other(format!(
-            "uid {account} has no passwd entry (`id -nu {account}` failed: {})",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn chown(path: &Path, owner: &str) -> Result<()> {

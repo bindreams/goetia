@@ -363,6 +363,15 @@ was ever the problem. Set `cwd`, or write the argument absolute.
 
 (`cwd` and `logs` are resolved against the manifest's directory too.)
 
+## Directories: `install` prepares, it does not check
+
+On systemd and launchd, `install` creates a `cwd` and the parent directory of
+`logs` if they are missing, and gives only what it created to a non-root
+`user`. A directory that already exists is left exactly as found and is not
+checked: `install` is not a start, and the directory may be one you are still
+preparing. If the account cannot use it, the service manager reports that at
+`start`. The one refusal is a path that exists but is not a directory.
+
 ## Per-backend overrides
 
 One manifest describes a daemon on all three platforms, but a path, an
