@@ -1,6 +1,6 @@
 //! THROWAWAY (issue #59, phase A): measures how the Windows SCM treats a
 //! service's reported exit, so the shim's design rests on measurements.
-//! Round 3: P9/P10 (failed restart attempts). Never merges. Every observation is a `PROBE ...` line in the job log.
+//! Round 4: P12 (DeleteService with a restart pending). Never merges. Every observation is a `PROBE ...` line in the job log.
 //!
 //! This binary is also the service host: `<exe> --probe-host <name> <port> <scripts>`
 //! where `<scripts>` is `|`-separated, one script per run of the service
@@ -167,6 +167,7 @@ mod host {
 }
 
 #[cfg(windows)]
+#[allow(dead_code, unused_imports)]
 mod probes {
     use std::ffi::c_void;
     use std::io::Read as _;
@@ -365,6 +366,12 @@ mod probes {
         /// `scripts` as in the module doc; `actions` is the `sc failure`
         /// actions list (goetia writes a single `restart/<ms>`).
         fn new(tag: &str, scripts: &str, actions: &str) -> Probe {
+            Probe::with_observers(tag, scripts, actions, true)
+        }
+
+        /// `observe == false` starts no status tracer and no notification
+        /// watcher, so the probe holds no service handle of its own.
+        fn with_observers(tag: &str, scripts: &str, actions: &str, observe: bool) -> Probe {
             let t0 = Instant::now();
             let n = COUNTER.fetch_add(1, Ordering::SeqCst);
             let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
@@ -446,6 +453,9 @@ mod probes {
             probe.p(format_args!("setup qfailure: {q1}"));
             probe.p(format_args!("setup qfailureflag: {q2}"));
 
+            if !observe {
+                return probe;
+            }
             probe.notifier = Some(spawn_notifier(notify, name.clone(), tracing.clone()));
 
             let ttag = tag.to_string();
@@ -475,6 +485,17 @@ mod probes {
             });
             probe.tracer = Some(tracer);
             probe
+        }
+
+        /// Stop the tracer and the notifier (and so close their handles).
+        fn quiesce(&mut self) {
+            self.tracing.store(false, Ordering::SeqCst);
+            if let Some(t) = self.tracer.take() {
+                let _ = t.join();
+            }
+            if let Some(t) = self.notifier.take() {
+                let _ = t.join();
+            }
         }
 
         fn service(&self, access: ServiceAccess) -> Service {
@@ -1054,23 +1075,146 @@ mod probes {
         r
     }
 
+    // P12 =============================================================================================================
+
+    /// `OpenService` outcome (with the raw status when it opens), for a
+    /// service that may be gone or marked for deletion.
+    fn open_state(name: &str) -> String {
+        match manager().open_service(name, ServiceAccess::QUERY_STATUS) {
+            Ok(svc) => format!(
+                "OpenService ok; {}",
+                raw_query(&svc)
+                    .map(|s| fmt_raw(&s))
+                    .unwrap_or_else(|e| format!("query error {e}"))
+            ),
+            Err(windows_service::Error::Winapi(e)) => format!("OpenService error {:?} ({e})", e.raw_os_error()),
+            Err(e) => format!("OpenService error {e:?}"),
+        }
+    }
+
+    fn record_gone(name: &str) -> bool {
+        const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+        matches!(
+            manager().open_service(name, ServiceAccess::QUERY_STATUS),
+            Err(windows_service::Error::Winapi(e)) if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST)
+        )
+    }
+
+    /// Through a handle the caller already holds (OpenService may be refused
+    /// once the record is marked for deletion).
+    fn wait_stopped_via(svc: &Service, bound: Duration) -> bool {
+        let deadline = Instant::now() + bound;
+        loop {
+            if raw_query(svc).is_ok_and(|s| s.dwCurrentState == Services::SERVICE_STOPPED) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Stopped after a failure with a 5 s restart pending; `DeleteService`
+    /// inside the delay. (a) no other handle open; (b) a handle kept open past
+    /// the delay, restarted host fails before RUNNING (Win32(5)) once then
+    /// stops cleanly; (c) as (b) but the restarted host stays up.
+    fn p12(variant: char) -> String {
+        let delay = Duration::from_millis(5000);
+        let bound = absence_bound(delay);
+        let tag = format!("P12{variant}");
+        let scripts = match variant {
+            'a' | 'c' => format!("run,connect,stopped:spec:7|{STAY_UP}"),
+            _ => "run,connect,stopped:spec:7|connect,stopped:w32:5|connect,stopped:w32:0".to_string(),
+        };
+        let mut p = Probe::with_observers(&tag, &scripts, "restart/5000", variant != 'a');
+        let _ = p.start();
+        p.connect(0, EXPECTED_BOUND);
+        p.wait_state(ServiceState::Stopped, EXPECTED_BOUND);
+        let f1 = p.t0.elapsed();
+        p.p(format_args!("failure recorded: {}", p.status()));
+
+        let keep = (variant != 'a').then(|| p.service(ServiceAccess::QUERY_STATUS));
+        let del = {
+            let svc = p.service(ServiceAccess::DELETE);
+            svc.delete().map_err(|e| format!("{e:?}"))
+        };
+        p.p(format_args!(
+            "DeleteService -> {del:?} {}ms after failure (delay {}ms); delete handle closed",
+            (p.t0.elapsed() - f1).as_millis(),
+            delay.as_millis()
+        ));
+        p.p(format_args!(
+            "after DeleteService, before the delay: {}",
+            open_state(&p.name)
+        ));
+        if let Some(k) = &keep {
+            p.p(format_args!(
+                "QueryServiceStatusEx via kept handle, before the delay: {}",
+                raw_query(k)
+                    .map(|s| fmt_raw(&s))
+                    .unwrap_or_else(|e| format!("query error {e}"))
+            ));
+        }
+
+        let c1 = p.connect(1, bound).cloned();
+        p.p(format_args!(
+            "connect-back after delete ({}ms after failure window start): {}",
+            (p.t0.elapsed() - f1).as_millis(),
+            describe(c1.as_ref(), bound)
+        ));
+        let mut extra = String::new();
+        if let Some(k) = &keep {
+            p.p(format_args!(
+                "QueryServiceStatusEx via kept handle, after the delay: {}",
+                raw_query(k)
+                    .map(|s| fmt_raw(&s))
+                    .unwrap_or_else(|e| format!("query error {e}"))
+            ));
+            if variant == 'b' && c1.is_some() {
+                let c2 = p.connect(2, bound).cloned();
+                p.p(format_args!("second restart: {}", describe(c2.as_ref(), bound)));
+                let stopped = wait_stopped_via(k, Duration::from_secs(30));
+                p.p(format_args!(
+                    "stopped again: {stopped}; {}",
+                    raw_query(k)
+                        .map(|s| fmt_raw(&s))
+                        .unwrap_or_else(|e| format!("query error {e}"))
+                ));
+            }
+            p.quiesce();
+            drop(keep);
+            let s = open_state(&p.name);
+            p.p(format_args!("after every handle closed: {s}"));
+            if variant == 'c' && c1.is_some() {
+                let (c, o) = sc(&["stop", &p.name]);
+                p.p(format_args!("sc stop -> {c:?} {o}"));
+            }
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !record_gone(&p.name) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(50));
+            }
+            let s2 = open_state(&p.name);
+            p.p(format_args!("record check (up to 30s after close/stop): {s2}"));
+            extra = format!("; after close: {s}; later: {s2}");
+        } else {
+            p.p(format_args!("after the bound: {}", open_state(&p.name)));
+        }
+        let r = format!("delete {del:?}; {}{extra}", describe(c1.as_ref(), bound));
+        p.result(&r);
+        p.dump_scm_events(&tag);
+        r
+    }
+
     // Driver ==========================================================================================================
 
     pub fn run_all() {
         // Sequential: the System-log events of a probe must be its own.
         type Job = Box<dyn FnOnce() -> String + Send>;
         let jobs: Vec<(&'static str, Job)> = vec![
-            ("P9", Box::new(p9)),
-            ("P11", Box::new(p11)),
-            ("P10[a-imagepath]", Box::new(|| p10("a-imagepath", Break::ImagePath))),
-            (
-                "P10[b1-account-registry]",
-                Box::new(|| p10("b1-account-registry", Break::AccountRegistry)),
-            ),
-            (
-                "P10[b2-account-deleted]",
-                Box::new(|| p10("b2-account-deleted", Break::AccountDeleted)),
-            ),
+            ("P12a", Box::new(|| p12('a'))),
+            ("P12b", Box::new(|| p12('b'))),
+            ("P12c", Box::new(|| p12('c'))),
         ];
         println!("PROBE SUMMARY begin");
         for (name, job) in jobs {
