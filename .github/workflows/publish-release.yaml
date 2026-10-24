@@ -57,8 +57,7 @@ jobs:
       # draft as absent.
       contents: write
       # Lets the runner mint the OIDC JWT that crates.io exchanges for a
-      # short-lived publish token. Declaring any `permissions:` block sets
-      # every unlisted scope to `none`, so `contents` has to stay listed.
+      # short-lived publish token.
       id-token: write
     env:
       GH_TOKEN: ${{ github.token }}
@@ -223,8 +222,7 @@ jobs:
             goetia "$VERSION" "target/package/goetia-${VERSION}.crate" >> "$GITHUB_OUTPUT"
 
       # Trusted publishing: crates.io exchanges this job's OIDC token for a
-      # short-lived publish token. Skipped when the version is already
-      # published, since nothing then needs authenticating.
+      # short-lived publish token.
       #
       # The action revokes its token in a post step, which runs after every
       # regular step and fails the job if the revoke fails. A red run whose
