@@ -771,15 +771,38 @@ mod probes {
     #[derive(Clone, Copy)]
     enum Break {
         ImagePath,
-        Account,
+        /// `ObjectName` written straight to the registry (`sc config obj=`
+        /// rejects a nonexistent account with 1057).
+        AccountRegistry,
+        /// A real local user, configured as the account, then deleted.
+        AccountDeleted,
     }
 
     /// Stopped after a failure with a restart pending; during the delay SCM is
     /// made unable to start the service itself. What changes?
     fn p10(label: &'static str, how: Break) -> String {
         let tag = format!("P10[{label}]");
-        let delay = Duration::from_millis(3000);
-        let mut p = Probe::new(&tag, &format!("run,connect,stopped:spec:7|{STAY_UP}"), "restart/3000");
+        let delay = match how {
+            Break::AccountDeleted => Duration::from_millis(6000),
+            _ => Duration::from_millis(3000),
+        };
+        let user = format!("gprobe{}", COUNTER.load(Ordering::SeqCst));
+        if matches!(how, Break::AccountDeleted) {
+            let out = Command::new("net")
+                .args(["user", &user, "Pw-Probe-1234!x", "/add"])
+                .output()
+                .expect("net user /add");
+            println!(
+                "PROBE {tag} net user {user} /add -> {:?} {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout).trim()
+            );
+        }
+        let mut p = Probe::new(
+            &tag,
+            &format!("run,connect,stopped:spec:7|{STAY_UP}"),
+            &format!("restart/{}", delay.as_millis()),
+        );
         let orig_image = registry_string(&p.name, "ImagePath");
         let orig_obj = registry_string(&p.name, "ObjectName");
         p.p(format_args!(
@@ -800,14 +823,25 @@ mod probes {
                 "binPath=",
                 "\"C:\\goetia-nonexistent-dir\\nope.exe\" --probe-host x",
             ]),
-            Break::Account => sc(&[
-                "config",
-                &p.name,
-                "obj=",
-                ".\\goetia-nouser-xyz",
-                "password=",
-                "Pw-not-real-1",
-            ]),
+            Break::AccountRegistry => {
+                let r = RegKey::predef(HKEY_LOCAL_MACHINE)
+                    .open_subkey_with_flags(services_key(&p.name), winreg::enums::KEY_SET_VALUE)
+                    .and_then(|k| k.set_value("ObjectName", &".\\goetia-nouser-xyz"));
+                (Some(0), format!("registry ObjectName write: {r:?}"))
+            }
+            Break::AccountDeleted => {
+                let (c, o) = sc(&[
+                    "config",
+                    &p.name,
+                    "obj=",
+                    &format!(".\\{user}"),
+                    "password=",
+                    "Pw-Probe-1234!x",
+                ]);
+                let del = Command::new("net").args(["user", &user, "/delete"]).output();
+                let del = del.map(|d| format!("{:?} {}", d.status.code(), String::from_utf8_lossy(&d.stdout).trim()));
+                (c, format!("{o}; net user /delete -> {del:?}"))
+            }
         };
         let m = p.t0.elapsed();
         p.p(format_args!(
@@ -881,7 +915,14 @@ mod probes {
         let jobs: Vec<(&'static str, Job)> = vec![
             ("P9", Box::new(p9)),
             ("P10[a-imagepath]", Box::new(|| p10("a-imagepath", Break::ImagePath))),
-            ("P10[b-account]", Box::new(|| p10("b-account", Break::Account))),
+            (
+                "P10[b1-account-registry]",
+                Box::new(|| p10("b1-account-registry", Break::AccountRegistry)),
+            ),
+            (
+                "P10[b2-account-deleted]",
+                Box::new(|| p10("b2-account-deleted", Break::AccountDeleted)),
+            ),
         ];
         println!("PROBE SUMMARY begin");
         for (name, job) in jobs {
