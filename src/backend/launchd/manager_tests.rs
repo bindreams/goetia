@@ -1071,9 +1071,27 @@ fn a_print_that_fails_otherwise_is_an_error_not_a_job_that_is_not_loaded() {
     );
 }
 
+/// After an exit-`4` install the disk shows the change as not installed, so a rerun meets the loaded
+/// job and is refused, instead of reading `UpToDate` and leaving the job on a definition no goetia verb
+/// would reconcile.
+fn assert_restored_and_rerun_refused(mgr: &LaunchdManager, spec: &DaemonSpec, name: &str, installed: &str) {
+    assert_eq!(
+        std::fs::read_to_string(staging_path(name)).unwrap(),
+        installed,
+        "the previous plist was put back"
+    );
+    let script = Scripted::new(&[("print", RUNNING)]);
+    let refused = mgr.install(spec, false).expect_err("the rerun, job loaded");
+    assert!(
+        refused.to_string().contains(&format!("goetia daemon stop {name}")),
+        "a refusal, not an exit-4 or an up-to-date: {refused}"
+    );
+    script.assert_driven("the rerun reads the job and is refused");
+}
+
 /// A job that is not loaded when `install` checks but is loaded once it has written, because someone
 /// else started it between the two, may have read either plist: the install is in doubt
-/// ([`Error::LoadedJobInDoubt`], exit `4`), though the new plist is on disk.
+/// ([`Error::LoadedJobInDoubt`], exit `4`), and the previous plist is put back.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_job_loaded_between_the_check_and_the_write_leaves_the_install_in_doubt() {
     let mgr = LaunchdManager::new();
@@ -1089,18 +1107,24 @@ fn a_job_loaded_between_the_check_and_the_write_leaves_the_install_in_doubt() {
     spec.command.push("updated".to_string());
     let script = Scripted::new(&[("print", NOT_LOADED), ("print", RUNNING)]);
     let e = mgr.install(&spec, false).expect_err("loaded after the write");
-    assert!(matches!(e, Error::LoadedJobInDoubt { .. }), "{e:?}");
+    assert!(
+        matches!(
+            e,
+            Error::LoadedJobInDoubt {
+                restore_failed: None,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
     assert!(e.to_string().contains(&format!("goetia daemon stop {name}")), "{e}");
     script.assert_driven("install, job loaded after the write");
-    assert_ne!(
-        std::fs::read_to_string(staging_path(&name)).unwrap(),
-        installed,
-        "the plist was written before the second check"
-    );
+    assert_restored_and_rerun_refused(&mgr, &spec, &name, &installed);
 }
 
-/// The recheck after the write is a read like the first; one that fails leaves the plist written and
-/// the loaded state unknown, so the install is in doubt (exit `4`), not a plain failure (exit `1`).
+/// The recheck after the write is a read like the first; one that fails leaves the loaded state
+/// unknown, so the install is in doubt (exit `4`), not a plain failure (exit `1`), and the previous
+/// plist is put back.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn an_unreadable_recheck_after_the_write_leaves_the_install_in_doubt() {
     let mgr = LaunchdManager::new();
@@ -1116,11 +1140,20 @@ fn an_unreadable_recheck_after_the_write_leaves_the_install_in_doubt() {
     spec.command.push("updated".to_string());
     let script = Scripted::new(&[("print", NOT_LOADED), ("print", UNREADABLE)]);
     let e = mgr.install(&spec, false).expect_err("an unreadable recheck");
-    assert!(matches!(e, Error::LoadedStateInDoubt { .. }), "{e:?}");
+    assert!(
+        matches!(
+            e,
+            Error::LoadedStateInDoubt {
+                restore_failed: None,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
     assert!(e.to_string().contains(&format!("goetia daemon stop {name}")), "{e}");
     assert!(e.to_string().contains("Input/output error"), "{e}");
     script.assert_driven("install, unreadable recheck");
-    assert_ne!(std::fs::read_to_string(staging_path(&name)).unwrap(), installed);
+    assert_restored_and_rerun_refused(&mgr, &spec, &name, &installed);
 }
 
 /// What launchd reads decides the refusal, not the spec: a spec change the plist does not render

@@ -8,7 +8,7 @@
 
 use crate::backend::launchd::generate;
 use crate::decide::Outcome;
-use crate::error::Error;
+use crate::error::{Error, Result};
 use crate::spec::Id;
 
 /// Whether carrying out `outcome` would give the plist other content than the one on disk, which is
@@ -47,19 +47,23 @@ pub(crate) fn loaded_refusal(id: &Id) -> Error {
 }
 
 /// The error for a job that is loaded after `install` wrote its plist, though it was not before.
-/// The write cannot be undone, and which definition the job read is not known, so this is not a
-/// success.
-pub(crate) fn loaded_after_write(id: &Id) -> Error {
-    Error::LoadedJobInDoubt { id: id.to_string() }
+/// Which definition the job read is not known, so this is not a success. `restore` is the result of
+/// putting the previous plist back, which the caller has done before returning this.
+pub(crate) fn loaded_after_write(id: &Id, restore: Result<()>) -> Error {
+    Error::LoadedJobInDoubt {
+        id: id.to_string(),
+        restore_failed: restore.err().map(|e| e.to_string()),
+    }
 }
 
 /// The error for a recheck after the write that could not tell whether the job is loaded: `read` is
 /// the failed read. As in doubt as [`loaded_after_write`], and not a failure that left nothing
 /// written, which exit `1` would claim.
-pub(crate) fn state_unknown_after_write(id: &Id, read: &Error) -> Error {
+pub(crate) fn state_unknown_after_write(id: &Id, read: &Error, restore: Result<()>) -> Error {
     Error::LoadedStateInDoubt {
         id: id.to_string(),
         detail: read.to_string(),
+        restore_failed: restore.err().map(|e| e.to_string()),
     }
 }
 

@@ -5,7 +5,10 @@ use crate::error::Error;
 /// question exit `4` is about; `1` would say the install determinately failed.
 #[skuld::test]
 fn a_loaded_job_in_doubt_exits_4() {
-    let e = Error::LoadedJobInDoubt { id: "frpc".to_owned() };
+    let e = Error::LoadedJobInDoubt {
+        id: "frpc".to_owned(),
+        restore_failed: None,
+    };
     assert_eq!(failure_code(&e), 4);
 }
 
@@ -15,6 +18,7 @@ fn an_unread_loaded_state_after_the_write_exits_4() {
     let e = Error::LoadedStateInDoubt {
         id: "frpc".to_owned(),
         detail: "launchctl print failed".to_owned(),
+        restore_failed: Some("denied".to_owned()),
     };
     assert_eq!(failure_code(&e), 4);
 }

@@ -163,21 +163,46 @@ fn the_refusal_names_the_daemon_and_the_remedy() {
 
 // loaded_after_write ==================================================================================================
 
+fn restore_failure() -> Error {
+    Error::Io {
+        path: "/Library/LaunchDaemons/frpc.plist".into(),
+        source: std::io::Error::from_raw_os_error(5),
+    }
+}
+
 /// The job was not loaded at the first check and is loaded now: goetia cannot tell which definition
-/// it read, so the install is in doubt (exit `4`), not a success and not a refusal.
+/// it read, so the install is in doubt (exit `4`), not a success and not a refusal. The previous
+/// plist is back, so the remedy is the one for a refusal: stop, install again, start.
 #[skuld::test]
 fn a_job_loaded_after_the_write_is_in_doubt_and_names_the_remedy() {
-    let e = loaded_after_write(&Id::try_from("frpc").unwrap());
+    let e = loaded_after_write(&Id::try_from("frpc").unwrap(), Ok(()));
     assert!(matches!(e, Error::LoadedJobInDoubt { .. }), "{e:?}");
     let message = e.to_string();
     assert!(message.contains("`frpc`"), "{message}");
     assert!(message.contains("goetia daemon stop frpc"), "{message}");
     assert!(message.contains("goetia daemon start frpc"), "{message}");
+    assert!(message.contains("re-run install"), "{message}");
+    assert!(message.contains("previous plist is back"), "{message}");
+}
+
+/// A plist that could not be put back leaves the new one on disk, where a rerun of `install` reads
+/// `UpToDate`: the message must not send the operator there, and carries the failure.
+#[skuld::test]
+fn a_job_in_doubt_whose_plist_could_not_be_restored_says_the_new_plist_is_on_disk() {
+    let e = loaded_after_write(&Id::try_from("frpc").unwrap(), Err(restore_failure()));
+    assert!(matches!(e, Error::LoadedJobInDoubt { .. }), "{e:?}");
+    let message = e.to_string();
+    assert!(message.contains("new plist is on disk"), "{message}");
+    assert!(message.contains("could not be put back"), "{message}");
+    assert!(message.contains("goetia daemon stop frpc"), "{message}");
+    assert!(message.contains("goetia daemon start frpc"), "{message}");
+    assert!(!message.contains("re-run install"), "{message}");
+    assert!(!message.contains("previous plist is back"), "{message}");
 }
 
 // state_unknown_after_write ===========================================================================================
 
-/// The plist is written and the second read failed: whether the job is loaded is open, which is the
+/// The plist was written and the second read failed: whether the job is loaded is open, which is the
 /// same exit `4` and the same remedy, and the message carries the read's own failure.
 #[skuld::test]
 fn an_unreadable_recheck_is_in_doubt_and_names_the_remedy_and_the_failure() {
@@ -185,11 +210,29 @@ fn an_unreadable_recheck_is_in_doubt_and_names_the_remedy_and_the_failure() {
         command: "launchctl print system/frpc".to_owned(),
         stderr: "Could not print: 5: Input/output error".to_owned(),
     };
-    let e = state_unknown_after_write(&Id::try_from("frpc").unwrap(), &read);
+    let e = state_unknown_after_write(&Id::try_from("frpc").unwrap(), &read, Ok(()));
     assert!(matches!(e, Error::LoadedStateInDoubt { .. }), "{e:?}");
     let message = e.to_string();
     assert!(message.contains("`frpc`"), "{message}");
     assert!(message.contains("goetia daemon stop frpc"), "{message}");
     assert!(message.contains("goetia daemon start frpc"), "{message}");
     assert!(message.contains("Input/output error"), "{message}");
+    assert!(message.contains("re-run install"), "{message}");
+    assert!(message.contains("previous plist is back"), "{message}");
+}
+
+#[skuld::test]
+fn an_unreadable_recheck_whose_plist_could_not_be_restored_says_the_new_plist_is_on_disk() {
+    let read = Error::CommandFailed {
+        command: "launchctl print system/frpc".to_owned(),
+        stderr: "Could not print: 5: Input/output error".to_owned(),
+    };
+    let e = state_unknown_after_write(&Id::try_from("frpc").unwrap(), &read, Err(restore_failure()));
+    assert!(matches!(e, Error::LoadedStateInDoubt { .. }), "{e:?}");
+    let message = e.to_string();
+    assert!(message.contains("Input/output error"), "{message}");
+    assert!(message.contains("new plist is on disk"), "{message}");
+    assert!(message.contains("could not be put back"), "{message}");
+    assert!(!message.contains("re-run install"), "{message}");
+    assert!(!message.contains("previous plist is back"), "{message}");
 }

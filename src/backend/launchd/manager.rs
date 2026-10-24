@@ -1263,11 +1263,22 @@ impl LaunchdManager {
                 // read the new unit). goetia takes no lock, so it says it cannot tell instead of
                 // reporting a success. A read that fails here leaves the same question open, and
                 // the plist is already written, so it is no plain failure either.
+                //
+                // The previous plist goes back before either error returns: with the new one on
+                // disk a rerun would read `UpToDate` and never reach the loaded job, whereas with
+                // the old one it is refused and the stop, install, start remedy runs through goetia.
                 if changes_job {
+                    let put_back = || {
+                        let previous = discovery
+                            .on_disk
+                            .as_deref()
+                            .expect("Ownership::Ours implies discovery read the artifact");
+                        write_existing(&target, previous)
+                    };
                     match is_loaded(spec.id.as_str(), deadline) {
                         Ok(loaded) if !never_expires(loaded) => {}
-                        Ok(_) => return Err(refuse::loaded_after_write(&spec.id)),
-                        Err(read) => return Err(refuse::state_unknown_after_write(&spec.id, &read)),
+                        Ok(_) => return Err(refuse::loaded_after_write(&spec.id, put_back())),
+                        Err(read) => return Err(refuse::state_unknown_after_write(&spec.id, &read, put_back())),
                     }
                 }
             }
