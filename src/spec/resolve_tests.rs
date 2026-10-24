@@ -1992,13 +1992,28 @@ fn a_base_named_system_account_resolves_under_every_backend() {
 
 #[skuld::test]
 fn an_over_long_restart_delay_warns_on_every_host() {
-    // All three keys are load-bearing: the advisory is unreachable for
-    // `Kind::Simple` and for `Restart::Never`.
+    // `restart: on-failure` is load-bearing: the advisory is unreachable for `Restart::Never`.
     let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    type: managed\n    restart: on-failure\n    restart-delay: 100d\n";
     let (_specs, warnings) = resolve_yaml(yaml).expect("resolves, with a warning");
     assert!(
         warnings.iter().any(|w| w.message.contains("restart-delay")),
         "expected the SCM clamp advisory on every host: {warnings:?}"
+    );
+}
+
+#[skuld::test]
+fn over_long_restart_delay_warns_for_simple_too() {
+    let yaml = "daemons:
+  frpc:
+    command: [/bin/frpc]
+    type: simple
+    restart: on-failure
+    restart-delay: 100d
+";
+    let (_specs, warnings) = resolve_yaml(yaml).expect("resolves, with a warning");
+    assert!(
+        warnings.iter().any(|w| w.message.contains("SC_ACTION")),
+        "a simple daemon's restart-delay is an SC_ACTION.Delay now and is clamped like a managed one: {warnings:?}"
     );
 }
 
@@ -2014,7 +2029,7 @@ fn an_over_long_restart_delay_with_no_type_does_not_warn() {
     let (_specs, warnings) = resolve_yaml(&yaml).expect("resolves");
     assert!(
         !warnings.iter().any(|w| w.message.contains("SC_ACTION")),
-        "the SCM clamp advisory is unreachable with no `type:`/`restart:`: {warnings:?}"
+        "the SCM clamp advisory is unreachable with no `restart:`: {warnings:?}"
     );
 }
 

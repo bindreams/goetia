@@ -310,14 +310,10 @@ pub(crate) const MAX_SC_ACTION_DELAY: Duration = Duration::from_millis(u32::MAX 
 /// The advisory for `generate::registration`'s restart-delay clamp, fired at
 /// resolve time on every host rather than only when an effectful Windows
 /// install runs the generator. Gated identically to the clamp itself:
-/// `Kind::Simple` builds no `FailureActions` at all and `Restart::Never`
-/// builds none either, so a `restart-delay` with neither `type: managed` nor
+/// `Restart::Never` builds no `FailureActions`, so a `restart-delay` without
 /// `restart: on-failure` warns about nothing. `always` never reaches here:
 /// [`Backend::reject_merged`] refuses it first.
 fn warn_on_over_long_restart_delay(spec: &ShapedSpec, out: &mut Vec<Warning>) {
-    if spec.kind.parsed() != Some(Kind::Managed) {
-        return;
-    }
     if spec.restart.parsed() != Some(Restart::OnFailure) {
         return;
     }
