@@ -3,11 +3,7 @@
 //! "error", which the scripted tests in `kill_tests.rs` take as given.
 
 use std::cell::Cell;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::process::{Child, Command, Stdio};
-
-use windows_sys::Win32::Foundation::FILETIME;
-use windows_sys::Win32::System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
 use super::Termination;
 use super::system::{open_process, terminate_process};
@@ -43,59 +39,32 @@ fn spawn_exiting_with(code: u32) -> Spawned {
     spawn("cmd", &["/c", &format!("exit {code}")])
 }
 
-/// When the process behind `pid` started, or `None` if it cannot be opened for the query.
-fn creation_time_of(pid: u32) -> Option<u64> {
-    // SAFETY: no pointers; a null return is the failure.
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        return None;
-    }
-    // SAFETY: a valid handle `OpenProcess` just returned and nothing else owns.
-    Some(creation_time(&unsafe { OwnedHandle::from_raw_handle(handle) }))
-}
+// `ERROR_INVALID_PARAMETER` -> gone is covered by `kill_tests.rs` only: when the OS frees a real process object is not the test's to control.
 
-/// When the process started, from its handle, which needs query rights.
-fn creation_time(process: &impl AsRawHandle) -> u64 {
-    let zero = FILETIME {
-        dwLowDateTime: 0,
-        dwHighDateTime: 0,
-    };
-    let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
-    // SAFETY: a live handle and four valid out-pointers.
-    let ok = unsafe {
-        GetProcessTimes(
-            process.as_raw_handle(),
-            &mut created,
-            &mut exited,
-            &mut kernel,
-            &mut user,
-        )
-    };
-    assert_ne!(ok, 0, "GetProcessTimes: {}", std::io::Error::last_os_error());
-    (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime)
-}
-
-/// Windows hands a freed pid to the next process created, and the other tests of this crate create
-/// processes concurrently, so the pid may already name a stranger: one that cannot be opened is
-/// fine, and so is one that started later. What must never happen is the exited process still
-/// being openable.
+/// The kill loop meets a process that exited but is still held: the held object keeps its pid
+/// openable. `child` keeps its own handle open until it is dropped.
 #[skuld::test]
-fn opening_a_pid_whose_process_is_gone_finds_none() {
+fn opening_a_pid_whose_exited_process_is_held_finds_it() {
     let mut child = spawn_exiting_with(0);
-    let pid = child.0.id();
-    let started = creation_time(&child.0);
     child.0.wait().unwrap();
-    // Every handle to the process is closed, so its object is gone and the pid names nothing.
-    drop(child);
 
-    // An `Err` is a stranger that cannot be opened for termination.
-    if let Ok(Some(_found)) = open_process(pid) {
-        // The query is its own open: `_found` has no query rights. A stranger that cannot be
-        // queried either is not the exited process.
-        if let Some(found_started) = creation_time_of(pid) {
-            assert_ne!(found_started, started, "the exited process is still open");
-        }
-    }
+    let found = open_process(child.0.id()).unwrap();
+
+    assert!(found.is_some(), "the exited process is held by the child's handle");
+}
+
+/// What the loop does with that handle: terminating it finds nothing left to do.
+#[skuld::test]
+fn terminating_a_held_exited_process_is_already_exited() {
+    let mut child = spawn_exiting_with(0);
+    child.0.wait().unwrap();
+    let process = open_process(child.0.id())
+        .unwrap()
+        .expect("the exited process is held by the child's handle");
+
+    let result = terminate_process(&process, || unreachable!("an exited process is not waited for"));
+
+    assert_eq!(result.unwrap(), Termination::AlreadyExited);
 }
 
 #[skuld::test]
