@@ -315,22 +315,25 @@ fn fail_once(mgr: &ScmManager, id: &str, restart_delay: Duration) -> (ConnectBac
 /// The restart is queued whether or not it has fired by the time `stop` looks, so `stop` finds
 /// either the queued restart or the daemon it started, and both end the same way: stopped by a
 /// commanded stop, which SCM records as Win32 0 and restarts nothing after.
+///
+/// The second run may be stopped before it connects back, so the test does not wait for it. The
+/// record proves the stop reached it: the first run left Win32 1066 with specific 7, and only a stop
+/// delivered to a later run replaces that with Win32 0, which queues nothing.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_stop_during_the_restart_delay_waits_for_the_restart_and_leaves_the_service_stopped() {
     let mgr = ScmManager::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
-    let (reported, spec) = fail_once(&mgr, &id, Duration::from_secs(5));
+    let (_reported, spec) = fail_once(&mgr, &id, Duration::from_secs(5));
 
     mgr.stop(&spec.id, Budget::Unbounded).expect("stop");
 
-    reported.accept("the second run, started by the restart the stop waited for");
     let stopped = scm_status(&id);
     assert_eq!(stopped.current_state, ServiceState::Stopped, "{stopped:?}");
     assert_eq!(
         recorded_exit(&id),
         RecordedExit { win32: 0, specific: 0 },
-        "{stopped:?}"
+        "the record must be the commanded stop's, not the first run's: {stopped:?}"
     );
 }
 
