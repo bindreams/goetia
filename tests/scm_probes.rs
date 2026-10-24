@@ -1362,12 +1362,20 @@ mod probes {
     }
 
     /// STOP during START_PENDING (the host holds it 4 s before RUNNING).
-    fn p13c() -> String {
-        let mut p = Probe::new("P13c", &format!("pending,hold:4000,{STAY_UP}"), "");
+    /// `after_host_pending`: send it only once the host's own START_PENDING
+    /// (checkpoint 1) is recorded, not in SCM's initial one (checkpoint 0).
+    fn p13c(after_host_pending: bool) -> String {
+        let tag = if after_host_pending { "P13c2" } else { "P13c" };
+        let mut p = Probe::new(tag, &format!("pending,hold:4000,{STAY_UP}"), "");
         let _ = p.start();
         let h = p.service(ServiceAccess::STOP | ServiceAccess::QUERY_STATUS);
         // The real condition: SCM has left STOPPED (the host reported START_PENDING).
         while raw_query(&h).is_ok_and(|s| s.dwCurrentState == Services::SERVICE_STOPPED) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        while after_host_pending
+            && raw_query(&h).is_ok_and(|s| s.dwCurrentState == Services::SERVICE_START_PENDING && s.dwCheckPoint == 0)
+        {
             thread::sleep(Duration::from_millis(5));
         }
         let before = query_via(&h);
@@ -1392,7 +1400,7 @@ mod probes {
         ));
         let r = format!("ControlService {stop}; reached RUNNING {running}; later stopped {stopped}; final {fin}");
         p.result(&r);
-        p.dump_scm_events("P13c");
+        p.dump_scm_events(tag);
         r
     }
 
@@ -1404,7 +1412,8 @@ mod probes {
         let jobs: Vec<(&'static str, Job)> = vec![
             ("P13a", Box::new(|| p13_delete_then_stop(false))),
             ("P13b", Box::new(|| p13_delete_then_stop(true))),
-            ("P13c", Box::new(p13c)),
+            ("P13c", Box::new(|| p13c(false))),
+            ("P13c2", Box::new(|| p13c(true))),
         ];
         println!("PROBE SUMMARY begin");
         for (name, job) in jobs {
