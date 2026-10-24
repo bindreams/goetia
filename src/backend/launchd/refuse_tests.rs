@@ -254,7 +254,7 @@ fn a_plist_taken_after_the_bootout_says_what_was_done_and_what_is_there() {
 
 // changed_during_install ==============================================================================================
 
-/// A plist that changed under `install` after a read: a plain failure that says nothing was written and
+/// A plist that changed under `install` after a read: a plain failure that says no plist was written and
 /// to run `install` again.
 #[skuld::test]
 fn a_plist_changed_during_install_is_a_plain_failure_that_says_to_rerun() {
@@ -264,6 +264,6 @@ fn a_plist_changed_during_install_is_a_plain_failure_that_says_to_rerun() {
     let message = e.to_string();
     assert!(message.contains("`frpc`"), "{message}");
     assert!(message.contains(&path.display().to_string()), "{message}");
-    assert!(message.contains("nothing was written"), "{message}");
+    assert!(message.contains("no plist was written"), "{message}");
     assert!(message.contains("re-run"), "{message}");
 }

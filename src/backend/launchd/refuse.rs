@@ -77,10 +77,10 @@ pub(crate) fn slot_taken_after_bootout(id: &Id, path: &Path, found: &str) -> Err
 
 /// The error for a plist that was taken, or removed, under `install` after it had made a `launchctl`
 /// call but before it sent a request. A second pass would need more calls than `install` reserved, so
-/// the install ends: nothing was sent and nothing written.
+/// the install ends: nothing was sent and no plist written.
 pub(crate) fn changed_during_install(id: &Id, path: &Path) -> Error {
     Error::Other(format!(
-        "`{id}`: the plist at {} changed while `install` was running, so nothing was written and nothing \
+        "`{id}`: the plist at {} changed while `install` was running, so no plist was written and nothing \
          was sent to launchd: re-run install",
         path.display()
     ))

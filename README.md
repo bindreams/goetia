@@ -635,8 +635,8 @@ the job is loaded again once the plist is created, `install` removes the plist
 and exits `4`. If another writer took the plist's place after the boot out,
 `install` exits `4`, says the job was booted out and what is there, and leaves
 it. If the plist is taken or removed after `install` has read launchd's state
-but before it has sent anything, `install` exits `1`: nothing was written or
-sent, and a rerun starts afresh.
+but before it has sent anything, `install` exits `1`: no plist was written and
+nothing was sent, and a rerun starts afresh.
 
 ## Waiting for a start or stop
 
