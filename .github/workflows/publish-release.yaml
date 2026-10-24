@@ -222,14 +222,6 @@ jobs:
           .github/scripts/check-crates-io-version.sh \
             goetia "$VERSION" "target/package/goetia-${VERSION}.crate" >> "$GITHUB_OUTPUT"
 
-      # THE POINT OF NO RETURN. A version can be yanked but never
-      # unpublished, and the crate name can never be released. This runs
-      # BEFORE the GitHub flip below, not after: this step is re-runnable
-      # (guarded by the check above), the flip is not (once `draft=false`, a
-      # re-dispatch aborts at the isDraft assertion above). The door that
-      # can be re-entered has to be the one walked through first — reversed,
-      # a crates.io failure after a successful flip would leave no automated
-      # path to finish.
       # Trusted publishing: crates.io exchanges this job's OIDC token for a
       # short-lived publish token. Skipped when the version is already
       # published, since nothing then needs authenticating.
@@ -243,6 +235,14 @@ jobs:
         if: steps.crates_check.outputs.already_published == 'false'
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1
 
+      # THE POINT OF NO RETURN. A version can be yanked but never
+      # unpublished, and the crate name can never be released. This runs
+      # BEFORE the GitHub flip below, not after: this step is re-runnable
+      # (guarded by the check above), the flip is not (once `draft=false`, a
+      # re-dispatch aborts at the isDraft assertion above). The door that
+      # can be re-entered has to be the one walked through first — reversed,
+      # a crates.io failure after a successful flip would leave no automated
+      # path to finish.
       - name: Publish to crates.io
         if: steps.crates_check.outputs.already_published == 'false'
         env:
