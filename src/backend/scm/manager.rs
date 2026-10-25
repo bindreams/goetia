@@ -259,7 +259,8 @@ impl ServiceManager for ScmManager {
     /// See [`super::kill::kill_service`] for how the process is chosen safely. Exit code `1`
     /// (`TerminateProcess`): SCM sees an unexpected exit and applies the recovery actions, as for a
     /// crash. For `type: simple` the process is `goetia-shim`, whose Job Object takes the daemon's
-    /// tree with it.
+    /// tree with it, and the failure is recorded in the shim's state file first, so a `stop` in the
+    /// restart delay is refused.
     fn kill(&self, id: &Id) -> Result<()> {
         let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
         require_ours(id)?;
@@ -814,10 +815,10 @@ fn reapply_uncompared_effects(spec: &DaemonSpec, reg: &ScmRegistration) -> Resul
     };
     registry::write_environment(&reg.name, &env_for_host)?;
     // The state file is the shim's: `type: managed` has none, and an id whose `type:` flips from
-    // `simple` to `managed` converges by losing it.
+    // `simple` to `managed` converges by losing it, except a record of a daemon still running.
     match spec.kind {
         Kind::Simple => state::provision(&reg.name, reg.account.as_deref())?,
-        Kind::Managed => state::remove(&reg.name)?,
+        Kind::Managed => state::release(&reg.name)?,
     }
     // Only for an account that actually needs it (see `apply`'s identical
     // predicate above): `LookupAccountNameW`, which the grant goes
@@ -964,8 +965,9 @@ fn uninstall_locked(id: &Id) -> Result<()> {
         .map_err(|e| Error::Other(format!("uninstall `{id}`: {e}")))?;
     // The record goes when the last handle closes, so this is the end of the uninstall.
     drop(actor);
-    // The service is gone, and so is what its shim recorded about it.
-    state::remove(id.as_str())
+    // The service is gone, and so is what its shim recorded about it, except a daemon it could not
+    // kill.
+    state::release(id.as_str())
         .map_err(|e| Error::Other(format!("uninstall `{id}`: the service was deleted, but {e}")))?;
     match waited {
         StopWaited::Confirmed => Ok(()),

@@ -1,5 +1,5 @@
 //! Install-time provisioning of a `type: simple` service's state file
-//! ([`crate::backend::scm::state_file`]), and its removal.
+//! ([`crate::backend::scm::state_file`]), and its release.
 //!
 //! The shim writes the file as the service account, and replaces it by rename, so the account
 //! needs to create a file in the directory and to delete the one it replaces. The directory is
@@ -105,10 +105,13 @@ pub(super) fn provision(id: &str, account: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Delete `id`'s state file (and a temporary left beside it). Absent is fine.
-pub(super) fn remove(id: &str) -> Result<()> {
+/// Release `id`'s state file when its service goes away (or stops having a shim): delete it, and
+/// a temporary left beside it, unless it names a daemon that is still running. That one stays, with
+/// only its failure dropped, so the same id registered again cannot start a second daemon beside
+/// it; a later [`provision`] reuses the file. Absent is fine.
+pub(super) fn release(id: &str) -> Result<()> {
     let file = host::path(id);
-    state_file::remove(&file).map_err(|e| Error::Other(format!("remove {}: {e}", file.display())))
+    state_file::release(&file).map_err(|e| Error::Other(format!("release {}: {e}", file.display())))
 }
 
 #[cfg(test)]

@@ -16,7 +16,8 @@ use windows_service::service::{ServiceAccess, ServiceState};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use crate::common::{
-    ShimProcess, fallback_log, fixture_command, grant_everyone_read_and_execute, recorded_exit, scm_status,
+    ShimProcess, fallback_log, fixture_command, grant_everyone_read_and_execute, kill_process, recorded_exit,
+    scm_status,
 };
 use crate::restart_integration::{fail_once, fail_once_as, on_failure};
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
@@ -167,7 +168,81 @@ fn a_service_with_no_state_file_has_no_restart_pending() {
         .expect("a stop with no record is not refused");
 }
 
+// A restart SCM queued for a process that did not report ==============================================================
+
+/// `goetia daemon kill` ends the shim as a crash, which SCM recovers from; it records the failure
+/// first, as the shim records its own, so a `stop` in the delay is refused.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_stop_after_goetia_kill_is_refused_in_the_restart_delay() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let started = ConnectBack::listen();
+    let spec = on_failure(
+        &id,
+        fixture_command("report", &[&started.port().to_string()]),
+        Some(HOUR),
+    );
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    started.accept("the daemon to report in");
+
+    mgr.kill(&spec.id).expect("kill");
+
+    let failure = record(&id).failure.expect("kill recorded the failure it causes");
+    assert_eq!(failure.restart, RestartDue::After(3_600_000), "{failure:?}");
+    let refused = mgr
+        .stop(&spec.id, Budget::DEFAULT)
+        .expect_err("a stop cannot cancel the queued restart");
+    assert!(matches!(refused, goetia::Error::RestartPending { .. }), "{refused:?}");
+}
+
+/// A shim ended from outside reports nothing and records nothing. SCM sees a crash (1067), which
+/// the shim never reports itself, so `stop` falls back on the status rule.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_stop_after_the_shim_was_ended_from_outside_is_refused_in_the_restart_delay() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let started = ConnectBack::listen();
+    let spec = on_failure(
+        &id,
+        fixture_command("report", &[&started.port().to_string()]),
+        Some(HOUR),
+    );
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    started.accept("the daemon to report in");
+    let shim = ShimProcess::attach(&id);
+
+    kill_process(shim.pid());
+    support::kill::until(|| scm_status(&id).current_state == ServiceState::Stopped);
+
+    assert_eq!(record(&id).failure, None, "an ended shim wrote nothing");
+    let refused = mgr
+        .stop(&spec.id, Budget::DEFAULT)
+        .expect_err("a stop cannot cancel the queued restart");
+    assert!(matches!(refused, goetia::Error::RestartPending { .. }), "{refused:?}");
+}
+
 // A survivor ==========================================================================================================
+
+/// A running process named as `id`'s survivor in its state file: all the shim and the CLI ever read
+/// of a daemon an incomplete stop could not kill.
+fn plant_survivor(id: &str) -> std::process::Child {
+    let planted = ConnectBack::listen();
+    let survivor = std::process::Command::new(support::current_exe_str())
+        .args(["--goetia-shim-fixture", "report", &planted.port().to_string()])
+        .stdin(Stdio::null())
+        .spawn()
+        .expect("spawn the process to plant as the survivor");
+    planted.accept("the planted survivor to be running");
+    let Resolved::Found(identity) = ProcessId::of(survivor.id()) else {
+        panic!("the planted survivor has no identity");
+    };
+    state_file::note_survivor(&host::path(id), &identity.to_record().expect("record")).expect("plant the survivor");
+    survivor
+}
 
 /// A daemon the shim could not kill cannot be produced end to end (both kills are refused only by
 /// a unit-test hook), so the survivor is planted: a running process named in the state file, which
@@ -186,17 +261,7 @@ fn a_start_is_refused_while_the_survivor_runs_and_allowed_when_it_is_gone() {
     spec.restart = Restart::Never;
     mgr.install(&spec, false).expect("install");
 
-    let planted = ConnectBack::listen();
-    let mut survivor = std::process::Command::new(support::current_exe_str())
-        .args(["--goetia-shim-fixture", "report", &planted.port().to_string()])
-        .stdin(Stdio::null())
-        .spawn()
-        .expect("spawn the process to plant as the survivor");
-    planted.accept("the planted survivor to be running");
-    let Resolved::Found(identity) = ProcessId::of(survivor.id()) else {
-        panic!("the planted survivor has no identity");
-    };
-    state_file::note_survivor(&host::path(&id), &identity.to_record().expect("record")).expect("plant the survivor");
+    let mut survivor = plant_survivor(&id);
 
     // goetia's own start refuses before it asks SCM to start anything.
     let refused = mgr
@@ -238,5 +303,48 @@ fn a_start_is_refused_while_the_survivor_runs_and_allowed_when_it_is_gone() {
     reported.accept("the daemon to run");
     assert_eq!(record(&id), StateRecord::empty());
 
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+}
+
+/// The record of a surviving daemon outlives the service it was written for, so registering the
+/// id again and starting it cannot run a second daemon beside the first.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn uninstall_keeps_a_live_survivor_so_a_reinstalled_service_cannot_start_over_it() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let reported = ConnectBack::listen();
+    let mut spec = on_failure(
+        &id,
+        fixture_command("report", &[&reported.port().to_string()]),
+        Some(HOUR),
+    );
+    spec.restart = Restart::Never;
+    mgr.install(&spec, false).expect("install");
+    let mut survivor = plant_survivor(&id);
+    let failure = state_file::FailureRecord::at(host::clock(), RestartDue::After(5));
+    state_file::note_failure(&host::path(&id), failure).expect("record a failure as the shim would");
+
+    // The service is deleted; the error says the daemon may still run.
+    let told = mgr
+        .uninstall(&spec.id)
+        .expect_err("uninstall reports a daemon it could not stop");
+    assert!(told.to_string().contains("deleted"), "{told}");
+    let kept = record(&id);
+    assert!(kept.survivor.is_some(), "the survivor must outlive the service");
+    assert_eq!(kept.failure, None, "the pending restart went with the service");
+
+    mgr.install(&spec, false).expect("install again");
+    let refused = mgr
+        .start(&spec.id, Budget::DEFAULT)
+        .expect_err("a start over a running survivor");
+    assert!(refused.to_string().contains(&survivor.id().to_string()), "{refused}");
+    assert!(!reported.connected_yet(), "no second daemon may have started");
+
+    survivor.kill().expect("kill the planted survivor");
+    survivor.wait().expect("reap the planted survivor");
+    mgr.start(&spec.id, Budget::DEFAULT)
+        .expect("start once the survivor is gone");
+    reported.accept("the daemon to run");
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
 }

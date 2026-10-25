@@ -135,28 +135,55 @@ pub struct QueriedStatus {
 /// pending. The one place that decides it, for every stop path.
 ///
 /// A `type: simple` service is judged by the shim's state file ([`ShimState::restart_pending`]),
-/// whatever its state: a restart queued before a manual start is still to fire. Any other service
-/// is judged by its status. SCM queues recovery for a non-zero `dwWin32ExitCode` alone, whatever the
-/// process exit code or the service-specific code, and for a stop it commanded as much as for a
-/// crash. That rule reads the record and the failure actions as they are now; it cannot see a
-/// restart queued under other actions or hidden by a later start (see the README).
+/// whatever its state: a restart queued before a manual start is still to fire. The one thing the
+/// file cannot hold is a failure the shim never got to report: it died (killed, crashed), leaving
+/// the `ERROR_PROCESS_ABORTED` it never reports itself, and a record that does not call a restart
+/// pending does not cover that. Such a service is judged by its status, as any other service is.
+///
+/// A service with no shim is judged by its status alone. SCM queues recovery for a non-zero
+/// `dwWin32ExitCode`, whatever the process exit code or the service-specific code, and for a stop
+/// it commanded as much as for a crash. That rule reads the record and the failure actions as they
+/// are now; it cannot see a restart queued under other actions or hidden by a later start (see the
+/// README).
 fn restart_pending<A: ScmActor>(a: &mut A, state: QueriedState, exit: RecordedExit) -> io::Result<bool> {
     let stopped = state == QueriedState::Stopped;
     if let Some(shim) = a.shim_state()? {
-        return Ok(shim.restart_pending(stopped && exit.win32 != 0));
+        if shim.restart_pending(stopped && exit.win32 != 0) {
+            return Ok(true);
+        }
+        if stopped && exit.win32 == ERROR_PROCESS_ABORTED && !shim.disabled {
+            return status_rule(a, exit);
+        }
+        return Ok(false);
     }
     // A clean stop is the common case and has nothing pending whatever the configuration says.
     if !stopped || exit.win32 == 0 {
         return Ok(false);
     }
+    status_rule(a, exit)
+}
+
+/// Whether the failure actions, as they are now, queue a restart for a `STOPPED` with `exit`.
+fn status_rule<A: ScmActor>(a: &mut A, exit: RecordedExit) -> io::Result<bool> {
     let recovery = a.recovery()?;
     Ok(recovery.restarts && (recovery.on_non_crash_failures || exit.win32 == ERROR_PROCESS_ABORTED))
+}
+
+/// Whether a daemon the shim could not kill may still be running after a `STOPPED` with `exit`.
+/// A `type: simple` service is judged by the survivor its shim recorded, which ends with the
+/// daemon; the status record of the incomplete stop outlives it. A service with no shim is judged
+/// by the record alone.
+fn daemon_may_still_run<A: ScmActor>(a: &mut A, exit: RecordedExit) -> io::Result<bool> {
+    if a.shim_state()?.is_some() {
+        return Ok(a.survivor()?.is_some());
+    }
+    Ok(exit.incomplete_stop())
 }
 
 /// What a `STOPPED` with `exit` recorded settles a stop as: a daemon that may still be running, a
 /// restart that nothing cancels, or a stopped service.
 fn settle<A: ScmActor>(a: &mut A, exit: RecordedExit) -> io::Result<StopWaited> {
-    if exit.incomplete_stop() {
+    if daemon_may_still_run(a, exit)? {
         return Ok(StopWaited::Incomplete);
     }
     Ok(if restart_pending(a, QueriedState::Stopped, exit)? {
@@ -167,12 +194,12 @@ fn settle<A: ScmActor>(a: &mut A, exit: RecordedExit) -> io::Result<StopWaited> 
 }
 
 /// `uninstall` stops on any `STOPPED`, whatever follows it: the delete cancels a restart.
-fn stopped_result(exit: RecordedExit) -> StopWaited {
-    if exit.incomplete_stop() {
+fn stopped_result<A: ScmActor>(a: &mut A, exit: RecordedExit) -> io::Result<StopWaited> {
+    Ok(if daemon_may_still_run(a, exit)? {
         StopWaited::Incomplete
     } else {
         StopWaited::Confirmed
-    }
+    })
 }
 
 /// What `ControlService(STOP)` answered.
@@ -487,7 +514,7 @@ fn stop_unless_stopped<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result
 fn stop_unless_stopped_once<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Option<StopWaited>> {
     let status = a.query_status()?;
     let mut watching = match status.state {
-        QueriedState::Stopped => return Ok(Some(stopped_result(status.exit))),
+        QueriedState::Stopped => return Ok(Some(stopped_result(a, status.exit)?)),
         QueriedState::StartPending => {
             if a.arm(WantState::RestartResolves, deadline)? == Waited::Expired {
                 return Ok(Some(StopWaited::Expired));
@@ -496,7 +523,7 @@ fn stop_unless_stopped_once<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::R
         }
         QueriedState::StopPending => match arm_stopped_then_reread(a, deadline)? {
             Rearmed::Expired => return Ok(Some(StopWaited::Expired)),
-            Rearmed::Stopped(exit) => return Ok(Some(stopped_result(exit))),
+            Rearmed::Stopped(exit) => return Ok(Some(stopped_result(a, exit)?)),
             Rearmed::Stopping => Watching::Stop,
             Rearmed::Moved => return Ok(None),
         },
@@ -509,7 +536,10 @@ fn stop_unless_stopped_once<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::R
     loop {
         let rearm = match (watching, a.wait_callback(deadline)?) {
             (_, None) => return Ok(Some(StopWaited::Expired)),
-            (_, Some(Observed::Stopped)) => return Ok(Some(stopped_result(a.stopped_exit()))),
+            (_, Some(Observed::Stopped)) => {
+                let exit = a.stopped_exit();
+                return Ok(Some(stopped_result(a, exit)?));
+            }
             (Watching::Starting, Some(Observed::Running)) => {
                 watching = Watching::Stop;
                 match issue_stop(a, QueriedState::Running, deadline)? {
@@ -524,7 +554,7 @@ fn stop_unless_stopped_once<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::R
         if rearm == WantState::Stopped {
             match arm_stopped_then_reread(a, deadline)? {
                 Rearmed::Expired => return Ok(Some(StopWaited::Expired)),
-                Rearmed::Stopped(exit) => return Ok(Some(stopped_result(exit))),
+                Rearmed::Stopped(exit) => return Ok(Some(stopped_result(a, exit)?)),
                 Rearmed::Stopping => {}
                 Rearmed::Moved => return Ok(None),
             }

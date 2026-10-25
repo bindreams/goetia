@@ -511,6 +511,173 @@ fn a_failure_is_recorded_over_an_unreadable_file() {
     assert!(matches!(read(&path), Ok(Loaded::Record(r)) if r.failure.is_some()));
 }
 
+// A failure noted around an act =======================================================================================
+
+fn failure_at(ms: u64) -> FailureRecord {
+    FailureRecord {
+        boot: BOOT,
+        at_ms: ms,
+        restart: RestartDue::After(5000),
+    }
+}
+
+#[skuld::test]
+fn the_failure_is_on_disk_before_the_act_runs_and_stays_when_the_act_took_effect() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("svc");
+    write(&path, &StateRecord::empty()).expect("write");
+
+    let seen = noting_failure_around(
+        &path,
+        failure_at(9),
+        || Ok(read(&path).expect("read during the act")),
+        |_| true,
+    )
+    .expect("the act");
+
+    assert!(matches!(seen, Loaded::Record(r) if r.failure == Some(failure_at(9))));
+    assert!(matches!(read(&path), Ok(Loaded::Record(r)) if r.failure == Some(failure_at(9))));
+}
+
+#[skuld::test]
+fn the_failure_is_noted_beside_a_survivor_without_dropping_it() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("svc");
+    let mut before = StateRecord::empty();
+    before.survivor = Some(this_process());
+    write(&path, &before).expect("write");
+
+    noting_failure_around(&path, failure_at(9), || Ok(()), |_| true).expect("the act");
+
+    assert!(matches!(read(&path), Ok(Loaded::Record(r)) if r.survivor == before.survivor && r.failure.is_some()));
+}
+
+#[skuld::test]
+fn an_act_that_failed_leaves_the_previous_record_in_place() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("svc");
+    let before = failed(1, RestartDue::After(100));
+    write(&path, &before).expect("write");
+
+    let result: io::Result<()> =
+        noting_failure_around(&path, failure_at(9), || Err(io::Error::other("refused")), |()| true);
+
+    assert!(result.is_err());
+    assert!(matches!(read(&path), Ok(Loaded::Record(r)) if r == before));
+}
+
+#[skuld::test]
+fn an_act_that_did_not_take_effect_leaves_the_previous_record_in_place() {
+    // The process was already on its way out: nothing was failed by this act, and the record
+    // would only make a stop wait for a restart that nobody queued.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("svc");
+    let mut before = StateRecord::empty();
+    before.survivor = Some(this_process());
+    write(&path, &before).expect("write");
+
+    noting_failure_around(&path, failure_at(9), || Ok(false), |&took_effect| took_effect).expect("the act");
+
+    assert!(matches!(read(&path), Ok(Loaded::Record(r)) if r == before));
+}
+
+#[skuld::test]
+fn an_unreadable_file_is_put_back_as_an_empty_record_when_the_act_did_not_take_effect() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("svc");
+    std::fs::write(&path, "{not json").expect("write garbage");
+
+    noting_failure_around(&path, failure_at(9), || Ok(()), |_| false).expect("the act");
+
+    assert!(matches!(read(&path), Ok(Loaded::Record(r)) if r == StateRecord::empty()));
+}
+
+#[skuld::test]
+fn a_service_with_no_state_file_gets_none_and_the_act_still_runs() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("svc");
+
+    let ran = noting_failure_around(&path, failure_at(9), || Ok("ran"), |_| true).expect("the act");
+
+    assert_eq!(ran, "ran");
+    assert!(!path.exists());
+}
+
+#[skuld::test]
+fn a_failure_that_cannot_be_recorded_stops_the_act_and_says_so() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("svc");
+    write(&path, &StateRecord::empty()).expect("write");
+    // A directory where the record is written before it replaces the file.
+    std::fs::create_dir(temporary(&path)).expect("block the temporary");
+    let mut ran = false;
+
+    let result = noting_failure_around(
+        &path,
+        failure_at(9),
+        || {
+            ran = true;
+            Ok(())
+        },
+        |_| true,
+    );
+
+    let message = result.expect_err("the record could not be written").to_string();
+    assert!(!ran, "an act that is not recorded must not run");
+    assert!(message.contains("could not record the failure"), "{message}");
+    assert!(message.contains(&path.display().to_string()), "{message}");
+}
+
+// Releasing a file ====================================================================================================
+
+#[skuld::test]
+fn releasing_removes_a_file_with_no_survivor_and_its_temporary() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("svc");
+    write(&path, &failed(1, RestartDue::After(100))).expect("write");
+    std::fs::write(temporary(&path), "x").expect("leftover temporary");
+
+    release(&path).expect("release");
+    release(&path).expect("releasing nothing is fine");
+
+    assert!(!path.exists());
+    assert!(!temporary(&path).exists());
+}
+
+#[skuld::test]
+fn releasing_removes_a_file_whose_survivor_has_gone_or_that_does_not_decode() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("svc");
+    let mut gone = this_process();
+    gone.token += 1;
+    let mut record = StateRecord::empty();
+    record.survivor = Some(gone);
+    write(&path, &record).expect("write");
+    release(&path).expect("release");
+    assert!(!path.exists());
+
+    std::fs::write(&path, "{not json").expect("write garbage");
+    release(&path).expect("release");
+    assert!(!path.exists());
+}
+
+#[skuld::test]
+fn releasing_keeps_a_live_survivor_and_drops_only_the_failure() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("svc");
+    let mut record = failed(1, RestartDue::After(100));
+    record.survivor = Some(this_process());
+    write(&path, &record).expect("write");
+
+    release(&path).expect("release");
+
+    let Loaded::Record(kept) = read(&path).expect("read") else {
+        panic!("the file must stay while its survivor runs");
+    };
+    assert_eq!(kept.survivor, record.survivor);
+    assert_eq!(kept.failure, None, "the service is gone, and so is its pending restart");
+}
+
 // Survivors ===========================================================================================================
 
 #[skuld::test]

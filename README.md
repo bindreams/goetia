@@ -767,10 +767,14 @@ now:
 
 The record is written by the shim, so a service installed by an earlier goetia
 has none until `goetia daemon install` is run again, and `stop` takes nothing
-to be pending for it. A shim that is killed (`goetia daemon kill`, `taskkill`)
-or crashes writes nothing before SCM queues its restart, so a `stop` during the
-delay that follows is not refused, and the restart then starts the daemon
-again. If the shim cannot write the file it logs that, and the same holds.
+to be pending for it. `goetia daemon kill` writes the record itself, just before
+it ends the shim, so a `stop` during the delay that follows is refused like any
+other. A shim that is ended some other way (`taskkill`) or crashes writes
+nothing, and leaves SCM's record of a process that ended without reporting
+(`1067`), which the shim never reports itself. For that record `stop` goes by
+the recovery actions as they are now, as it does for `type: managed`: refused if
+the service restarts on failure and is not `Disabled`. If the shim cannot write
+the file it logs that, and `stop` does not see the failures it could not record.
 
 **`type: managed`.** There is no shim, so `stop` goes by the record SCM keeps of
 how the service last ended and by the service's recovery actions as they are
@@ -805,7 +809,10 @@ stops any daemon that a restart started in the meantime. A daemon that fails as
 soon as it starts can still be uninstalled. If that last stop cannot be
 confirmed, `uninstall` exits `1` having already deleted the service, which
 Windows removes when the daemon's process ends. It also removes the shim's state
-file for a `type: simple` daemon.
+file for a `type: simple` daemon, except while the file names a daemon that
+`stop` could not kill and that is still running (see below): then it keeps the
+file, without the pending restart, so installing the same id again and starting
+it cannot run a second copy.
 
 After upgrading goetia, run `goetia daemon install` again for every daemon
 installed by an older version. Services registered before this shim existed
@@ -832,10 +839,11 @@ logs both failed kills and reports the stop with Win32 code `0`, because a
 non-zero Win32 code would make SCM start a second copy; the service-specific
 code `1003` is the record that the command may still be running, and the shim
 also writes the surviving process (its pid and creation time) to the state file.
-goetia reads both: `stop` exits `1` saying the command may still be running,
-`start` and `restart` do not start a second copy while that process runs (they
-exit `1` and name its pid), and `uninstall` deletes the service and then exits
-`1` with the same message. Once the process is gone, `start` works again. The
+goetia reads the state file, not the `1003` record, which outlives the process:
+`stop` exits `1` saying the command may still be running while that process
+runs, `start` and `restart` do not start a second copy (they exit `1` and name
+its pid), and `uninstall` deletes the service and then exits `1` with the same
+message. Once the process is gone, `stop` and `start` work again. The
 shim makes the same check as it starts, so `sc start` is no way around it: the
 shim does not launch a second command, logs the pid and what to do, and reports
 Win32 code `1056`. Under `restart: on-failure` SCM then retries the start at
@@ -938,7 +946,9 @@ It addresses the service, never a bare pid:
 | Windows  | SCM has no kill-by-service call, so goetia terminates the service's process (exit code `1`), after confirming through SCM that it is still the service's. SCM sees an unexpected exit and applies the recovery actions, as for a crash. |
 
 On Windows with `type: simple` the service's process is `goetia-shim`; its Job
-Object ends the daemon and its descendants with it.
+Object ends the daemon and its descendants with it. `kill` first records the
+failure in the shim's state file, as the shim does for its own, so a `stop` during
+the restart delay is refused.
 
 On Windows a process that is already terminating (a second `kill`, or a daemon
 dying on its own) is waited for until it exits, with no time limit. When that
