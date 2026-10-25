@@ -904,6 +904,40 @@ mod probes {
         r
     }
 
+    // P15 =============================================================================================================
+
+    /// The shim's report for a daemon no Job Object contains: `STOPPED (0, 1003)` with no `RUNNING`,
+    /// from SCM's own START_PENDING (a) or after the host's own START_PENDING (b). Is it stored as
+    /// reported, and is a restart queued? Run 1 stays up, so a connect-back from it is a restart.
+    fn p15(variant: &'static str) -> String {
+        let delay = Duration::from_millis(1000);
+        let run0 = match variant {
+            "a" => "connect,rawstopped:0:1003",
+            "b" => "pending,connect,rawstopped:0:1003",
+            other => panic!("bad variant {other}"),
+        };
+        let mut p = Probe::new(
+            &format!("P15{variant}"),
+            &format!("{run0}|{STAY_UP}"),
+            &format!("restart/{}", delay.as_millis()),
+        );
+        let started = p.start();
+        p.connect(0, EXPECTED_BOUND);
+        p.wait_state(ServiceState::Stopped, EXPECTED_BOUND);
+        p.p(format_args!("run 0 stopped: {}", p.status()));
+        let bound = absence_bound(delay);
+        let r1 = p.connect(1, bound).cloned();
+        let r = format!(
+            "StartService {started:?}; run 1: {}; notifications fired: {}; status {}",
+            describe(r1.as_ref(), bound),
+            p.notify.count.load(Ordering::SeqCst),
+            p.status()
+        );
+        p.result(&r);
+        p.dump_scm_events(&format!("P15{variant}"));
+        r
+    }
+
     // P10 =============================================================================================================
 
     #[derive(Clone, Copy)]
@@ -1678,13 +1712,8 @@ mod probes {
         // Sequential: the System-log events of a probe must be its own.
         type Job = Box<dyn FnOnce() -> String + Send>;
         let jobs: Vec<(&'static str, Job)> = vec![
-            ("P14a", Box::new(|| p14("a"))),
-            ("P14b", Box::new(|| p14("b"))),
-            ("P14c", Box::new(|| p14("c"))),
-            ("P14d", Box::new(|| p14("d"))),
-            ("P14d0", Box::new(|| p14("d0"))),
-            ("P14e", Box::new(|| p14("e"))),
-            ("P14f", Box::new(|| p14("f"))),
+            ("P15a", Box::new(|| p15("a"))),
+            ("P15b", Box::new(|| p15("b"))),
         ];
         println!("PROBE SUMMARY begin");
         for (name, job) in jobs {
