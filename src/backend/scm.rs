@@ -5,6 +5,7 @@ pub mod generate;
 pub(crate) mod kill;
 #[cfg(windows)]
 pub mod manager;
+pub mod state_file;
 // `pub(crate)`, not `pub`: `backend` is `pub` in `lib.rs`, so `pub` here
 // would publish this Windows-only vocabulary on every platform. Declared
 // last because `cargo fmt` sorts these alphabetically and would move a
