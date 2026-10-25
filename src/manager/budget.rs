@@ -120,6 +120,48 @@ pub fn timed_out(id: &str, awaited: &'static str, budget: Budget) -> crate::Erro
     }
 }
 
+// restart_pending =====================================================================================================
+
+/// The one [`crate::Error::RestartPending`] constructor: `stop` found the service being started by
+/// SCM, or a restart queued by its recovery actions. Nothing was stopped, and nothing can cancel
+/// the restart.
+pub fn restart_pending(id: &str) -> crate::Error {
+    crate::Error::RestartPending {
+        id: id.to_string(),
+        recovery: format!(
+            "SCM is starting it, or has a restart queued that goetia cannot cancel; goetia did not \
+             stop it. Run `goetia daemon stop {id}` again once the daemon is back, or \
+             `goetia daemon uninstall {id}`."
+        ),
+    }
+}
+
+/// [`restart_pending`]'s sibling for a `stop` that issued nothing because the service kept changing
+/// state under every control: whether a restart is queued is not known.
+pub fn kept_moving(id: &str) -> crate::Error {
+    crate::Error::RestartPending {
+        id: id.to_string(),
+        recovery: format!(
+            "the service kept changing state, so no stop was issued. Run `goetia daemon stop {id}` \
+             again, or `goetia daemon uninstall {id}`."
+        ),
+    }
+}
+
+/// [`restart_pending`]'s sibling for a `stop` the shim refused because the daemon's command had
+/// failed, on a service with no restart configured: the service is stopping on its own, and
+/// goetia ran out of time before seeing it stop. No request is outstanding and nothing is queued.
+pub fn stopping_on_its_own(id: &str) -> crate::Error {
+    crate::Error::RestartPending {
+        id: id.to_string(),
+        recovery: format!(
+            "the daemon's command failed and the service is stopping on its own, which goetia did not \
+             confirm within the timeout; goetia did not stop it. `goetia daemon status {id}` shows \
+             whether it has stopped."
+        ),
+    }
+}
+
 // Deadline ============================================================================================================
 
 /// An absolute instant a [`Budget`] resolves to via [`Budget::start`].

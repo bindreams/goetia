@@ -159,6 +159,47 @@ fn timed_out_refuses_a_zero_length_budget() {
     let _ = timed_out("frpc", "running", Budget::Bounded(Duration::ZERO));
 }
 
+// restart_pending =====================================================================================================
+
+#[skuld::test]
+fn restart_pending_is_not_a_wait_timeout_and_says_what_to_do_next() {
+    let e = restart_pending("frpc");
+    assert!(matches!(e, crate::Error::RestartPending { .. }), "{e:?}");
+    let message = e.to_string();
+    assert!(message.contains("frpc"), "{message}");
+    assert!(
+        message.contains("SCM is starting it, or has a restart queued that goetia cannot cancel"),
+        "{message}"
+    );
+    assert!(message.contains("goetia did not stop it"), "{message}");
+    // The two ways out: stop it again once the restart has happened, or remove it.
+    assert!(message.contains("goetia daemon stop frpc"), "{message}");
+    assert!(message.contains("goetia daemon uninstall frpc"), "{message}");
+}
+
+#[skuld::test]
+fn kept_moving_is_a_restart_pending_error_that_says_no_stop_was_issued() {
+    let e = kept_moving("frpc");
+    assert!(matches!(e, crate::Error::RestartPending { .. }), "{e:?}");
+    let message = e.to_string();
+    assert!(message.contains("kept changing state"), "{message}");
+    assert!(message.contains("no stop was issued"), "{message}");
+    assert!(message.contains("goetia daemon stop frpc"), "{message}");
+}
+
+#[skuld::test]
+fn stopping_on_its_own_says_the_command_failed_and_is_not_a_wait_timeout() {
+    let e = stopping_on_its_own("frpc");
+    assert!(matches!(e, crate::Error::RestartPending { .. }), "{e:?}");
+    let message = e.to_string();
+    assert!(message.contains("command failed"), "{message}");
+    assert!(message.contains("stopping on its own"), "{message}");
+    assert!(message.contains("goetia did not stop it"), "{message}");
+    assert!(!message.contains("restart queued"), "{message}");
+    assert!(!message.contains("request"), "{message}");
+    assert!(message.contains("goetia daemon status frpc"), "{message}");
+}
+
 // Deadline ============================================================================================================
 
 #[skuld::test]
