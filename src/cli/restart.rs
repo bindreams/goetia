@@ -191,6 +191,11 @@ fn abandoned_before_start(id: &Id, e: Error, budget: Budget) -> Error {
             id,
             awaited,
         },
+        // The stop settled nothing, so the daemon is not stopped, and a start into it is not issued.
+        Error::RestartPending { id, recovery } => Error::RestartPending {
+            recovery: format!("the restart was abandoned: no start was issued. {recovery}"),
+            id,
+        },
         Error::RequestInDoubt {
             request,
             reached,

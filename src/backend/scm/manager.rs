@@ -31,13 +31,13 @@
 //! `super::wait`, which uses `NotifyServiceStatusChangeW` — a real kernel
 //! rendezvous, never a `Sleep`+`QueryServiceStatusEx` poll.
 //!
-//! **3. Uninstall must confirm a real stop before deleting.** `DeleteService`
+//! **3. Uninstall returns only once the service is gone.** `DeleteService`
 //! on a running service only *marks* it for deletion — the registry key
 //! survives until every `SC_HANDLE` closes and the service actually stops —
 //! so the next `install` would meet `ERROR_SERVICE_MARKED_FOR_DELETE`.
-//! [`uninstall_locked`] waits for a confirmed `STOPPED` (via `super::wait`)
-//! before opening a *fresh* handle for `DeleteService`, so the handle used
-//! to wait is always closed first.
+//! [`uninstall_locked`] stops the service and waits for a confirmed `STOPPED`
+//! (via `super::wait`), deletes it, then stops anything a queued restart
+//! started in between, all on one handle that it closes last.
 //!
 //! **4. A real account needs `SeServiceLogonRight`.** `CreateServiceW`
 //! succeeds without it; the first start then fails with error 1069
@@ -102,7 +102,7 @@ use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SERVICE_DOES_NOT
 use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHANGE};
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
-use super::wait::Waited;
+use super::wait::{RequestedStop, StopWaited, Waited};
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::blob::Blob;
 use crate::decide::{self, Outcome, Ownership};
@@ -169,15 +169,13 @@ impl ServiceManager for ScmManager {
     }
 
     fn uninstall(&self, id: &Id) -> Result<()> {
-        let (scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
+        let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
         require_ours(id)?;
-        // Close this handle before `uninstall_locked` opens (and eventually
-        // deletes through) its own — trap 3 is specifically that a
-        // still-open handle, of *any* access, defers `DeleteService`'s
-        // actual removal until every handle to the service has closed, not
-        // only the one `DeleteService` itself was called on.
+        // Close this handle before `uninstall_locked` opens its own: it ends the uninstall by
+        // closing the handle it deletes through, and the record goes only when every handle to
+        // the service has closed, this one included (trap 3).
         drop(service);
-        uninstall_locked(&scm, id)
+        uninstall_locked(id)
     }
 
     fn enable(&self, id: &Id) -> Result<()> {
@@ -238,13 +236,19 @@ impl ServiceManager for ScmManager {
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to stop it: {e}")))?;
         if !budget.waits() {
-            return super::wait::request_stop(&mut actor).map_err(|e| Error::Other(format!("stop `{id}`: {e}")));
+            return match super::wait::request_stop(&mut actor).map_err(|e| Error::Other(format!("stop `{id}`: {e}")))? {
+                RequestedStop::Issued => Ok(()),
+                RequestedStop::RestartPending => Err(budget::restart_pending(id.as_str())),
+                RequestedStop::Incomplete => Err(daemon_may_still_run(id, "stop", "the service stopped")),
+            };
         }
         let waited = super::wait::stop_via_notify(&mut actor, deadline)
             .map_err(|e| Error::Other(format!("stop `{id}`: {e}")))?;
         match waited {
-            Waited::Confirmed => Ok(()),
-            Waited::Expired => Err(budget::timed_out(id.as_str(), "stopped", budget)),
+            StopWaited::Confirmed => Ok(()),
+            StopWaited::Expired => Err(budget::timed_out(id.as_str(), "stopped", budget)),
+            StopWaited::RestartPending => Err(budget::restart_pending(id.as_str())),
+            StopWaited::Incomplete => Err(daemon_may_still_run(id, "stop", "the service stopped")),
         }
     }
 
@@ -930,53 +934,45 @@ fn run_sc(args: &[&str]) -> Result<()> {
 
 // uninstall ===========================================================================================================
 
-/// Stop (waiting for a confirmed `STOPPED`, closing that handle), then
-/// delete via a fresh handle. See trap 3.
-fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
-    let needs_stop = {
-        let service = scm
-            .open_service(id.as_str(), ServiceAccess::QUERY_STATUS)
-            .map_err(|e| to_error(&format!("query status for `{id}` before uninstall"), e))?;
-        let status = service
-            .query_status()
-            .map_err(|e| to_error(&format!("query status for `{id}` before uninstall"), e))?;
-        status.current_state != WinState::Stopped
-        // `service`'s `SC_HANDLE` closes here, at the end of this block.
-    };
-
-    if needs_stop {
-        let mut actor = super::wait::SystemScmActor::open(id.as_str())
-            .map_err(|e| Error::Other(format!("open `{id}` to stop it before uninstall: {e}")))?;
-        // Deliberately `Budget::Unbounded`, and not the caller's: `uninstall` has no `--timeout`
-        // of its own, this stop is a means rather than an end, and bounding it would turn a
-        // slow-stopping service into a failed uninstall where today it succeeds. The message below
-        // already routes the user for every way this can actually fail.
-        let waited = super::wait::stop_via_notify(&mut actor, Budget::Unbounded.start()).map_err(|e| {
-            Error::Other(format!(
-                "`{id}` did not confirm SERVICE_STOPPED before uninstall ({e}); it was NOT deleted — \
-                 DeleteService on a running service only marks it for deletion, which the next install would \
-                 meet as ERROR_SERVICE_MARKED_FOR_DELETE. Stop it (or wait for it to stop) and re-run \
-                 `goetia daemon uninstall {id}`."
-            ))
-        })?;
-        match waited {
-            Waited::Confirmed => {}
-            // `let _ = …` is the write that turns an unreachable case into a silent one, and this
-            // is precisely the case where a later edit narrowing that budget must not pass quietly.
-            Waited::Expired => unreachable!("uninstall's stop is Unbounded; an unbounded deadline never expires"),
-        }
-        // `actor`'s `SC_HANDLE` must close before the `DELETE` handle opens
-        // below — dropping it explicitly documents that ordering rather than
-        // relying on it falling out of scope at the end of the function.
-        drop(actor);
+/// Stop the service, delete it, then stop what a restart started in between, on one handle that
+/// closes last. See trap 3.
+///
+/// The stop is first so a service that will not stop is left intact. The delete ends every
+/// restart: it cancels the one SCM has queued (the attempt fails with `ERROR_SERVICE_DISABLED` and
+/// the host never runs) and SCM starts nothing for a service marked for deletion. A daemon that
+/// fails as soon as it is spawned, which is when `uninstall` is used, therefore cannot keep a stop
+/// waiting, and a restart that fires between the stop and the delete is stopped after it.
+fn uninstall_locked(id: &Id) -> Result<()> {
+    let mut actor = super::wait::SystemScmActor::open_to_delete(id.as_str())
+        .map_err(|e| Error::Other(format!("open `{id}` to delete it: {e}")))?;
+    // Deliberately `Budget::Unbounded`, and not the caller's: `uninstall` has no `--timeout`
+    // of its own, this stop is a means rather than an end, and bounding it would turn a
+    // slow-stopping service into a failed uninstall where today it succeeds. The error already
+    // says whether the service was deleted.
+    let waited = super::wait::uninstall_teardown(&mut actor, Budget::Unbounded.start())
+        .map_err(|e| Error::Other(format!("uninstall `{id}`: {e}")))?;
+    // The record goes when the last handle closes, so this is the end of the uninstall.
+    drop(actor);
+    match waited {
+        StopWaited::Confirmed => Ok(()),
+        // The service is deleted; the daemon the shim could not kill is not.
+        StopWaited::Incomplete => Err(daemon_may_still_run(id, "uninstall", "the service was deleted")),
+        // `let _ = …` is the write that turns an unreachable case into a silent one, and this
+        // is precisely the case where a later edit narrowing that budget must not pass quietly.
+        StopWaited::Expired => unreachable!("uninstall's stop is Unbounded; an unbounded deadline never expires"),
+        StopWaited::RestartPending => unreachable!("uninstall's stop never judges a restart"),
     }
+}
 
-    let service = scm
-        .open_service(id.as_str(), ServiceAccess::DELETE)
-        .map_err(|e| to_error(&format!("open `{id}` to delete it"), e))?;
-    service
-        .delete()
-        .map_err(|e| to_error(&format!("delete service `{id}`"), e))
+/// The error for a stop whose shim could not kill the daemon: SCM counts the service stopped, but
+/// the daemon may be running, and a second one would start beside it. `did` is what happened
+/// anyway.
+fn daemon_may_still_run(id: &Id, verb: &str, did: &str) -> Error {
+    Error::Other(format!(
+        "{verb} `{id}`: {did}, but goetia-shim could not kill the daemon, which may still be \
+         running (its log and the Windows Event Log name the failed kills). Stop its process \
+         yourself before starting it again."
+    ))
 }
 
 // shared helpers ======================================================================================================

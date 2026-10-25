@@ -237,3 +237,18 @@ fn a_leg_in_doubt_stays_in_doubt_under_every_budget() {
         }
     }
 }
+
+/// A stop that met a queued SCM restart stays exit 4 through the restart verb, and says the start
+/// was not issued.
+#[skuld::test]
+fn a_stop_leg_that_met_a_pending_restart_stays_a_pending_restart_and_says_no_start_was_issued() {
+    let id = Id::try_from("frpc").unwrap();
+    for budget in [Budget::Immediate, Budget::Unbounded, Budget::DEFAULT] {
+        let e = abandoned_before_start(&id, crate::manager::budget::restart_pending("frpc"), budget);
+        let Error::RestartPending { recovery, .. } = &e else {
+            panic!("{budget:?}: {e:?}");
+        };
+        assert!(recovery.contains("no start was issued"), "{recovery}");
+        assert!(recovery.contains("goetia daemon stop frpc"), "{recovery}");
+    }
+}

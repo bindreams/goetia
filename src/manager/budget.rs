@@ -120,6 +120,22 @@ pub fn timed_out(id: &str, awaited: &'static str, budget: Budget) -> crate::Erro
     }
 }
 
+// restart_pending =====================================================================================================
+
+/// The one [`crate::Error::RestartPending`] constructor: `stop` found the service being started by
+/// SCM, or a restart queued by its recovery actions. Nothing was stopped, and nothing can cancel
+/// the restart.
+pub fn restart_pending(id: &str) -> crate::Error {
+    crate::Error::RestartPending {
+        id: id.to_string(),
+        recovery: format!(
+            "SCM is starting it, or has a restart queued that goetia cannot cancel; goetia did not \
+             stop it. Run `goetia daemon stop {id}` again once the daemon is back, or \
+             `goetia daemon uninstall {id}`."
+        ),
+    }
+}
+
 // Deadline ============================================================================================================
 
 /// An absolute instant a [`Budget`] resolves to via [`Budget::start`].

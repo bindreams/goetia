@@ -22,6 +22,9 @@ use crate::spec::Kind;
 pub enum WantState {
     Stopped,
     Running,
+    /// The service is `START_PENDING`: wait for the start to succeed (`RUNNING`) or fail
+    /// (`STOPPED`).
+    RestartResolves,
 }
 
 /// The service state a `wait_callback` observed. Distinct from [`WantState`]:
@@ -69,7 +72,14 @@ pub trait ScmActor {
     /// non-looping call into the SCM, so there is no iteration to bound, and
     /// what blocking they do is the SCM's own — not a wait this module
     /// created, and not one it can bound from the client side.
-    fn control_stop(&mut self) -> io::Result<()>;
+    fn control_stop(&mut self) -> io::Result<ControlReply>;
+    /// Close the service handle, which cancels its outstanding notification registration, and open
+    /// a fresh one with the same access. One handle carries one registration, so this is the way to
+    /// arm again after a registration that no callback consumed.
+    fn reopen_service(&mut self) -> io::Result<()>;
+    /// `DeleteService` on the open handle. The record goes when the last handle to the service
+    /// closes, and SCM starts nothing for the service from this call on.
+    fn delete(&mut self) -> io::Result<()>;
     /// `StartServiceW`. What an `ERROR_SERVICE_ALREADY_RUNNING` means is not
     /// decided here but by each caller, from the state the follow-up query
     /// reported — see [`StartReply`].
@@ -82,30 +92,436 @@ pub trait ScmActor {
     /// returned. Read from that notification, not queried afterwards: a recovery action may have
     /// restarted the service by then.
     fn stopped_exit(&self) -> RecordedExit;
+    /// The service's state now, the exit codes SCM holds for it (meaningful when `Stopped`) and
+    /// whether it accepts `STOP`.
+    fn query_status(&mut self) -> io::Result<QueriedStatus>;
+    /// How the service's failure actions are configured.
+    fn recovery(&mut self) -> io::Result<Recovery>;
+}
+
+/// The part of a service's failure-action configuration that decides whether a failure queues a
+/// restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Recovery {
+    /// Some failure action is `restart`.
+    pub restarts: bool,
+    /// The failure-actions flag: actions run for a stop with a non-zero exit code, and not only for
+    /// a process that ended without reporting.
+    pub on_non_crash_failures: bool,
+}
+
+/// `ERROR_PROCESS_ABORTED`: what SCM records for a process that ended without reporting `STOPPED`.
+const ERROR_PROCESS_ABORTED: u32 = 1067;
+
+/// What a status query read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueriedStatus {
+    pub state: QueriedState,
+    /// The raw `(dwWin32ExitCode, dwServiceSpecificExitCode)` pair.
+    pub exit: RecordedExit,
+    /// `dwControlsAccepted` includes `SERVICE_ACCEPT_STOP`.
+    pub accepts_stop: bool,
+}
+
+/// Whether a service that reached `STOPPED` with `exit` has a restart pending. The one place that
+/// decides it, for every stop path.
+///
+/// SCM queues recovery for a non-zero `dwWin32ExitCode` alone, whatever the process exit code or
+/// the service-specific code, and for a stop it commanded as much as for a crash. The rule reads the
+/// record and the failure actions as they are now; it cannot see a restart queued under other
+/// actions or hidden by a later start (see the README).
+fn restart_pending<A: ScmActor>(a: &mut A, exit: RecordedExit) -> io::Result<bool> {
+    // A clean stop is the common case and has nothing pending whatever the configuration says.
+    if exit.win32 == 0 {
+        return Ok(false);
+    }
+    let recovery = a.recovery()?;
+    Ok(recovery.restarts && (recovery.on_non_crash_failures || exit.win32 == ERROR_PROCESS_ABORTED))
+}
+
+/// What a `STOPPED` with `exit` recorded settles a stop as: a daemon that may still be running, a
+/// restart that nothing cancels, or a stopped service.
+fn settle<A: ScmActor>(a: &mut A, exit: RecordedExit) -> io::Result<StopWaited> {
+    if exit.incomplete_stop() {
+        return Ok(StopWaited::Incomplete);
+    }
+    Ok(if restart_pending(a, exit)? {
+        StopWaited::RestartPending
+    } else {
+        StopWaited::Confirmed
+    })
+}
+
+/// `uninstall` stops on any `STOPPED`, whatever follows it: the delete cancels a restart.
+fn stopped_result(exit: RecordedExit) -> StopWaited {
+    if exit.incomplete_stop() {
+        StopWaited::Incomplete
+    } else {
+        StopWaited::Confirmed
+    }
+}
+
+/// What `ControlService(STOP)` answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlReply {
+    /// The service accepted the control.
+    Sent,
+    /// `ERROR_SERVICE_CANNOT_ACCEPT_CTRL` (1061) or `ERROR_SERVICE_NOT_ACTIVE` (1062): the control
+    /// met a state that refuses it. Whether the service moved to that state is read from the
+    /// service afterwards (see [`control`]).
+    StateMoved,
+    /// `ERROR_INVALID_SERVICE_CONTROL` (1052): what a `START_PENDING` service answers (measured),
+    /// and also what a running service that does not accept `STOP` answers. Read like
+    /// [`Self::StateMoved`].
+    NotAccepted,
+}
+
+/// How [`stop_via_notify`] ended.
+#[must_use = "an expiry did not confirm the stop; decide what to report rather than discarding it"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopWaited {
+    /// `STOPPED` with nothing pending after it.
+    Confirmed,
+    /// The deadline ran out while waiting for the stop it issued.
+    Expired,
+    /// SCM is starting the service, or has a restart queued that nothing cancels. Nothing was
+    /// stopped.
+    RestartPending,
+    /// `STOPPED`, but the shim could not kill the daemon, which may still be running.
+    Incomplete,
+}
+
+/// What [`request_stop`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestedStop {
+    Issued,
+    /// SCM is starting the service, or has a restart queued that nothing cancels: nothing was
+    /// issued.
+    RestartPending,
+    /// The service is stopped, but the shim could not kill the daemon, which may still be running.
+    Incomplete,
+}
+
+/// What the loop in [`stop_via_notify`] is waiting for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Watching {
+    /// The `STOPPED` of the stop it issued, or of one already under way.
+    Stop,
+    /// A start that has begun, still to succeed or fail. The shim accepts no control before
+    /// `RUNNING`, so a stop waits here rather than send one.
+    Starting,
+}
+
+/// What [`issue_stop`] did.
+enum Stopping {
+    /// The control was accepted. Carries whether the `STOPPED` arm that preceded it was registered.
+    Sent(Waited),
+    /// The control met a state that refuses it.
+    Moved,
+}
+
+/// What [`arm_stopped_then_reread`] found.
+enum Rearmed {
+    /// The deadline ran out before the arm was registered.
+    Expired,
+    /// The service is `STOPPED` with this record.
+    Stopped(RecordedExit),
+    /// The service is still `STOP_PENDING`, and the arm will hear it stop.
+    Stopping,
+    /// The service is neither: it stopped and started again, which the arm cannot hear.
+    Moved,
+}
+
+/// Whether a service in `status` refuses `STOP` whatever it was last doing: a state that takes
+/// controls (not starting, stopping or stopped) that does not accept `STOP`.
+fn refuses_stop(status: &QueriedStatus) -> bool {
+    !matches!(
+        status.state,
+        QueriedState::StartPending | QueriedState::StopPending | QueriedState::Stopped
+    ) && !status.accepts_stop
+}
+
+/// The error for a control the service refused with nothing to explain it.
+fn stop_refused() -> io::Error {
+    io::Error::other("the service refused the stop control, and no change of its state explains the refusal")
+}
+
+/// Send the stop control to a service last read in state `decided`. `true`: it was accepted.
+///
+/// A refusal is read against the service as it is now. A service in another state than `decided`
+/// has moved, and the control met that state: `false`, for the caller to read it again. One still in
+/// `decided`, or one in a state that takes controls and does not accept `STOP`, has refused the
+/// control itself, and sending it again would be refused again: an error. That also bounds every
+/// path with no counter, since each repeat needs the service to have changed.
+fn control<A: ScmActor>(a: &mut A, decided: QueriedState) -> io::Result<bool> {
+    if a.control_stop()? == ControlReply::Sent {
+        return Ok(true);
+    }
+    let status = a.query_status()?;
+    if status.state == decided || refuses_stop(&status) {
+        return Err(stop_refused());
+    }
+    Ok(false)
+}
+
+/// Arm `STOPPED`, then issue the stop to a service last read in state `decided`: the arm comes
+/// first, so a `STOPPED` reached before the request is delivered still fires it. Issued even when
+/// the arm expired: only the *waiting* is bounded.
+fn issue_stop<A: ScmActor>(a: &mut A, decided: QueriedState, deadline: Deadline) -> io::Result<Stopping> {
+    let armed = a.arm(WantState::Stopped, deadline)?;
+    Ok(if control(a, decided)? {
+        Stopping::Sent(armed)
+    } else {
+        Stopping::Moved
+    })
+}
+
+/// Arm `STOPPED` for a `STOP_PENDING` service, then read it again: the arm hears nothing that
+/// happened before it, and a service that stopped and was restarted in between is on its way up,
+/// which this arm's mask does not cover. A `STOPPED` read here drops the registration (the handle is
+/// reopened), so the handle can arm again.
+fn arm_stopped_then_reread<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Rearmed> {
+    if a.arm(WantState::Stopped, deadline)? == Waited::Expired {
+        return Ok(Rearmed::Expired);
+    }
+    let status = a.query_status()?;
+    Ok(match status.state {
+        QueriedState::StopPending => Rearmed::Stopping,
+        QueriedState::Stopped => {
+            a.reopen_service()?;
+            Rearmed::Stopped(status.exit)
+        }
+        _ => Rearmed::Moved,
+    })
+}
+
+/// Run `once` until it settles. `None` from it means the service moved on after being read, so the
+/// stop must read it again: close the handle, which drops the registration `once` left behind, and
+/// start from the top, under the same `deadline`. A rerun is a fresh reading of a service that
+/// changed, never a retry of the same request; `expired` is what a deadline that has run out by
+/// then settles as.
+fn rerun_if_moved<A: ScmActor, T>(
+    a: &mut A,
+    deadline: Deadline,
+    expired: T,
+    mut once: impl FnMut(&mut A) -> io::Result<Option<T>>,
+) -> io::Result<T> {
+    loop {
+        if let Some(settled) = once(a)? {
+            return Ok(settled);
+        }
+        if deadline.expired() {
+            return Ok(expired);
+        }
+        a.reopen_service()?;
+    }
 }
 
 /// Stop the service, gated strictly on a real `STOPPED` callback from
 /// `NotifyServiceStatusChangeW`; re-arms after a non-terminal (pending)
 /// callback, under the same `deadline` throughout.
-pub fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
-    let armed = a.arm(WantState::Stopped, deadline)?;
-    // Issued even when the arm expired: only the *waiting* is bounded.
-    a.control_stop()?;
-    if armed == Waited::Expired {
-        return Ok(Waited::Expired);
-    }
+///
+/// A control is sent only to a service in a state that accepts it. One found `START_PENDING` is
+/// waited on for `RUNNING` (then stopped) or `STOPPED`; one found `STOP_PENDING` is already
+/// stopping and is waited on for `STOPPED`; every arm of `STOPPED` is followed by a read of the
+/// state, since an arm hears nothing that happened before it. If the service moves between the read
+/// and the control, so that the control is refused, the stop starts again from a fresh read (see
+/// `rerun_if_moved`); a refusal from a service that has not moved is an error (see [`control`]).
+///
+/// Every `STOPPED` is then judged by [`settle`]. A restart pending after it, whether it is the
+/// failure of a daemon that was already down or of one that failed as the stop arrived, is reported
+/// and never waited for: nothing cancels it, and a crash-looping daemon would keep such a wait from
+/// ever ending.
+pub fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<StopWaited> {
+    rerun_if_moved(a, deadline, StopWaited::Expired, |a| stop_once(a, deadline))
+}
+
+/// One pass of [`stop_via_notify`]; `None` when the service moved and must be read again.
+fn stop_once<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Option<StopWaited>> {
+    let status = a.query_status()?;
+    let mut watching = match status.state {
+        QueriedState::StartPending => {
+            if a.arm(WantState::RestartResolves, deadline)? == Waited::Expired {
+                return Ok(Some(StopWaited::RestartPending));
+            }
+            Watching::Starting
+        }
+        QueriedState::StopPending => match arm_stopped_then_reread(a, deadline)? {
+            Rearmed::Expired => return Ok(Some(StopWaited::Expired)),
+            Rearmed::Stopped(exit) => return Ok(Some(settle(a, exit)?)),
+            Rearmed::Stopping => Watching::Stop,
+            Rearmed::Moved => return Ok(None),
+        },
+        QueriedState::Stopped => return Ok(Some(settle(a, status.exit)?)),
+        state => match issue_stop(a, state, deadline)? {
+            Stopping::Moved => return Ok(None),
+            Stopping::Sent(Waited::Expired) => return Ok(Some(StopWaited::Expired)),
+            Stopping::Sent(Waited::Confirmed) => Watching::Stop,
+        },
+    };
     loop {
-        match a.wait_callback(deadline)? {
-            None => return Ok(Waited::Expired),
-            Some(Observed::Stopped) => return Ok(Waited::Confirmed),
-            // Running/Pending are non-terminal for a stop wait — re-arm and wait.
-            Some(Observed::Running | Observed::Pending) => {
-                if a.arm(WantState::Stopped, deadline)? == Waited::Expired {
-                    return Ok(Waited::Expired);
+        let Some(observed) = a.wait_callback(deadline)? else {
+            return Ok(Some(match watching {
+                Watching::Stop => StopWaited::Expired,
+                Watching::Starting => StopWaited::RestartPending,
+            }));
+        };
+        match (watching, observed) {
+            (_, Observed::Stopped) => {
+                let exit = a.stopped_exit();
+                return Ok(Some(settle(a, exit)?));
+            }
+            // Running/Pending are non-terminal for a stop wait: arm again, and read the service
+            // again, since the arm hears nothing that happened before it.
+            (Watching::Stop, Observed::Running | Observed::Pending) => match arm_stopped_then_reread(a, deadline)? {
+                Rearmed::Expired => return Ok(Some(StopWaited::Expired)),
+                Rearmed::Stopped(exit) => return Ok(Some(settle(a, exit)?)),
+                Rearmed::Stopping => {}
+                Rearmed::Moved => return Ok(None),
+            },
+            (Watching::Starting, Observed::Pending) => {
+                if a.arm(WantState::RestartResolves, deadline)? == Waited::Expired {
+                    return Ok(Some(StopWaited::RestartPending));
+                }
+            }
+            (Watching::Starting, Observed::Running) => {
+                watching = Watching::Stop;
+                match issue_stop(a, QueriedState::Running, deadline)? {
+                    Stopping::Moved => return Ok(None),
+                    Stopping::Sent(Waited::Expired) => return Ok(Some(StopWaited::Expired)),
+                    Stopping::Sent(Waited::Confirmed) => {}
                 }
             }
         }
     }
+}
+
+/// `uninstall`'s teardown on one handle: stop the service, delete it, then stop whatever started
+/// in between.
+///
+/// 1. Stop first, so a service that will not stop is left intact rather than marked for deletion.
+///    A `START_PENDING` service (a restart beginning) refuses controls, so it is waited on until
+///    it runs, and then stopped, or stops. A `STOPPED` service is not stopped, and no stop waits
+///    for a queued restart: the delete in step 2
+///    cancels the one SCM has queued, and a daemon that fails as soon as it is spawned (when
+///    `uninstall` is used) would keep such a wait from ever ending. A failure here leaves the
+///    service as it was.
+/// 2. Delete. From then on SCM starts nothing for the service, a queued restart included
+///    (measured, P12).
+/// 3. Read the state again. A restart that fired between 1 and 2 is stopped now; nothing can start
+///    again, so this too ignores restarts. Only this step can leave a running service marked for
+///    deletion, and its error says so.
+///
+/// The service goes when the caller closes the handle afterwards. Every error says whether the
+/// delete had happened. A daemon the stop could not kill ([`StopWaited::Incomplete`]) does not
+/// hold up the delete, since SCM counts the service stopped; it is reported after it.
+pub fn uninstall_teardown<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<StopWaited> {
+    let first = stop_unless_stopped(a, deadline).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "the service did not confirm stopped ({e}) and was NOT deleted: deleting a running \
+                 service only marks it for deletion, which the next install meets as \
+                 ERROR_SERVICE_MARKED_FOR_DELETE. Stop it, or wait for it to stop, and uninstall again"
+            ),
+        )
+    })?;
+    if first == StopWaited::Expired {
+        return Ok(StopWaited::Expired);
+    }
+    a.delete()
+        .map_err(|e| io::Error::new(e.kind(), format!("the service was NOT deleted: {e}")))?;
+    let second = stop_unless_stopped(a, deadline).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "the service is deleted but not confirmed stopped ({e}); it goes when its process ends, \
+                 and until then the next install meets ERROR_SERVICE_MARKED_FOR_DELETE"
+            ),
+        )
+    })?;
+    Ok(match (first, second) {
+        (StopWaited::Incomplete, StopWaited::Confirmed) => StopWaited::Incomplete,
+        _ => second,
+    })
+}
+
+/// A `STOPPED` service is left alone. A `START_PENDING` one refuses controls, so it is waited on
+/// until it is `RUNNING` (then stopped) or `STOPPED`; a `STOP_PENDING` one is waited on for
+/// `STOPPED`. Any other state is stopped. Either way the wait ends on any `STOPPED`, whatever
+/// follows it. A control refused because the service moved starts again from a fresh read; one
+/// refused by a service that has not moved is an error. Ends
+/// [`StopWaited::Confirmed`], [`StopWaited::Incomplete`] or [`StopWaited::Expired`].
+fn stop_unless_stopped<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<StopWaited> {
+    rerun_if_moved(a, deadline, StopWaited::Expired, |a| {
+        stop_unless_stopped_once(a, deadline)
+    })
+}
+
+/// One pass of [`stop_unless_stopped`]; `None` when the service moved and must be read again.
+fn stop_unless_stopped_once<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Option<StopWaited>> {
+    let status = a.query_status()?;
+    let mut watching = match status.state {
+        QueriedState::Stopped => return Ok(Some(stopped_result(status.exit))),
+        QueriedState::StartPending => {
+            if a.arm(WantState::RestartResolves, deadline)? == Waited::Expired {
+                return Ok(Some(StopWaited::Expired));
+            }
+            Watching::Starting
+        }
+        QueriedState::StopPending => match arm_stopped_then_reread(a, deadline)? {
+            Rearmed::Expired => return Ok(Some(StopWaited::Expired)),
+            Rearmed::Stopped(exit) => return Ok(Some(stopped_result(exit))),
+            Rearmed::Stopping => Watching::Stop,
+            Rearmed::Moved => return Ok(None),
+        },
+        state => match issue_stop(a, state, deadline)? {
+            Stopping::Moved => return Ok(None),
+            Stopping::Sent(Waited::Expired) => return Ok(Some(StopWaited::Expired)),
+            Stopping::Sent(Waited::Confirmed) => Watching::Stop,
+        },
+    };
+    loop {
+        let rearm = match (watching, a.wait_callback(deadline)?) {
+            (_, None) => return Ok(Some(StopWaited::Expired)),
+            (_, Some(Observed::Stopped)) => return Ok(Some(stopped_result(a.stopped_exit()))),
+            (Watching::Starting, Some(Observed::Running)) => {
+                watching = Watching::Stop;
+                match issue_stop(a, QueriedState::Running, deadline)? {
+                    Stopping::Moved => return Ok(None),
+                    Stopping::Sent(Waited::Expired) => return Ok(Some(StopWaited::Expired)),
+                    Stopping::Sent(Waited::Confirmed) => continue,
+                }
+            }
+            (Watching::Starting, Some(Observed::Pending)) => WantState::RestartResolves,
+            (_, Some(Observed::Running | Observed::Pending)) => WantState::Stopped,
+        };
+        if rearm == WantState::Stopped {
+            match arm_stopped_then_reread(a, deadline)? {
+                Rearmed::Expired => return Ok(Some(StopWaited::Expired)),
+                Rearmed::Stopped(exit) => return Ok(Some(stopped_result(exit))),
+                Rearmed::Stopping => {}
+                Rearmed::Moved => return Ok(None),
+            }
+        } else if a.arm(rearm, deadline)? == Waited::Expired {
+            return Ok(Some(StopWaited::Expired));
+        }
+    }
+}
+
+/// Refuse a start over a service that is `STOPPED` with the record of a stop that could not kill the
+/// daemon: SCM would accept the start, and a second daemon would run beside the first. Read before
+/// every start, since a start cannot be told from the reply alone.
+fn refuse_over_a_survivor<A: ScmActor>(a: &mut A) -> io::Result<()> {
+    let status = a.query_status()?;
+    if status.state == QueriedState::Stopped && status.exit.incomplete_stop() {
+        return Err(io::Error::other(
+            "the service is stopped, but goetia-shim could not kill its daemon at the last stop, which may \
+             still be running; a start would run a second one. Stop its process yourself, then start the \
+             service with `sc start`",
+        ));
+    }
+    Ok(())
 }
 
 /// What `StartServiceW` answered.
@@ -152,6 +568,7 @@ fn accept_as_started(reply: StartReply) -> io::Result<()> {
 /// confirmation, whatever is left of the deadline — as launchd's `print` of a
 /// running job is. The armed wait would only have immediate-fired on it.
 pub fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Kind) -> io::Result<Waited> {
+    refuse_over_a_survivor(a)?;
     let armed = a.arm(WantState::Running, deadline)?;
     // Issued even when the arm expired: only the *waiting* is bounded, and a
     // service left unstarted because goetia ran out of budget while arming
@@ -196,6 +613,7 @@ pub fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Kind) 
 /// the call site so that what happens when we do *not* wait is covered by
 /// the same fake-actor tests as everything else.
 pub fn request_start<A: ScmActor>(a: &mut A) -> io::Result<()> {
+    refuse_over_a_survivor(a)?;
     accept_as_started(a.start()?)
 }
 
@@ -203,6 +621,7 @@ pub fn request_start<A: ScmActor>(a: &mut A) -> io::Result<()> {
 /// is always a refusal: the queried `Running` may be the instance the unconfirmed stop just before
 /// it is taking down.
 pub fn request_start_after_stop<A: ScmActor>(a: &mut A) -> io::Result<()> {
+    refuse_over_a_survivor(a)?;
     match a.start()? {
         StartReply::Accepted => Ok(()),
         StartReply::AlreadyRunning(queried) => Err(io::Error::other(format!(
@@ -212,9 +631,33 @@ pub fn request_start_after_stop<A: ScmActor>(a: &mut A) -> io::Result<()> {
     }
 }
 
-/// [`request_start`]'s mirror: issue the stop control and return.
-pub fn request_stop<A: ScmActor>(a: &mut A) -> io::Result<()> {
-    a.control_stop()
+/// [`request_start`]'s mirror: issue the stop control and return, unless the service is `STOPPED`
+/// with a restart pending, or `START_PENDING`. A stop cannot cancel that restart, and a starting
+/// service refuses the control, so it reports the restart and issues nothing. A `STOPPED` service
+/// with nothing pending, or a `STOP_PENDING` one, is already as stopped as the request can make it
+/// and is sent nothing.
+///
+/// A control refused because the service moved after the read starts again from a fresh read; one
+/// refused by a service that has not moved is an error.
+pub fn request_stop<A: ScmActor>(a: &mut A) -> io::Result<RequestedStop> {
+    loop {
+        let status = a.query_status()?;
+        match status.state {
+            QueriedState::StartPending => return Ok(RequestedStop::RestartPending),
+            QueriedState::Stopped => {
+                return Ok(match settle(a, status.exit)? {
+                    StopWaited::Incomplete => RequestedStop::Incomplete,
+                    StopWaited::RestartPending => RequestedStop::RestartPending,
+                    StopWaited::Confirmed | StopWaited::Expired => RequestedStop::Issued,
+                });
+            }
+            QueriedState::StopPending => return Ok(RequestedStop::Issued),
+            _ => {}
+        }
+        if control(a, status.state)? {
+            return Ok(RequestedStop::Issued);
+        }
+    }
 }
 
 // handle teardown =====================================================================================================
@@ -330,3 +773,7 @@ pub use system::SystemScmActor;
 #[cfg(test)]
 #[path = "wait_tests.rs"]
 mod wait_tests;
+
+#[cfg(test)]
+#[path = "wait_stop_paths_tests.rs"]
+mod wait_stop_paths_tests;

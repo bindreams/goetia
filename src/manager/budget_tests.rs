@@ -159,6 +159,24 @@ fn timed_out_refuses_a_zero_length_budget() {
     let _ = timed_out("frpc", "running", Budget::Bounded(Duration::ZERO));
 }
 
+// restart_pending =====================================================================================================
+
+#[skuld::test]
+fn restart_pending_is_not_a_wait_timeout_and_says_what_to_do_next() {
+    let e = restart_pending("frpc");
+    assert!(matches!(e, crate::Error::RestartPending { .. }), "{e:?}");
+    let message = e.to_string();
+    assert!(message.contains("frpc"), "{message}");
+    assert!(
+        message.contains("SCM is starting it, or has a restart queued that goetia cannot cancel"),
+        "{message}"
+    );
+    assert!(message.contains("goetia did not stop it"), "{message}");
+    // The two ways out: stop it again once the restart has happened, or remove it.
+    assert!(message.contains("goetia daemon stop frpc"), "{message}");
+    assert!(message.contains("goetia daemon uninstall frpc"), "{message}");
+}
+
 // Deadline ============================================================================================================
 
 #[skuld::test]

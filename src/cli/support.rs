@@ -348,6 +348,13 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
                 let _ = writeln!(err, "error: {id}: {e}");
                 codes.push(4);
             }
+            // `stop` found a restart the manager has queued, which nothing cancels: nothing was
+            // stopped, and the daemon will be running again. Not a failure of the stop (`1`), and
+            // not an expiry of a request it issued.
+            Err(e @ Error::RestartPending { .. }) => {
+                let _ = writeln!(err, "error: {id}: {e}");
+                codes.push(4);
+            }
             // A request goetia lost track of: it may or may not have reached the manager, or did
             // and its outcome is unconfirmed. The same class once more: `1` says the verb was
             // attempted and failed, or was refused, and neither is what was established.
