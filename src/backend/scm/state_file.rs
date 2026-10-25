@@ -276,6 +276,56 @@ pub fn remove(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Remove the state file of a service going away, except what must outlive it: while a recorded
+/// survivor is still running (or cannot be told not to be), only the failure is dropped, so a
+/// service registered again under the same id cannot start a second daemon beside it.
+pub fn release(path: &Path) -> io::Result<()> {
+    let loaded = read(path)?;
+    if blocking_survivor(&loaded).is_none() {
+        return remove(path);
+    }
+    let Loaded::Record(mut record) = loaded else {
+        unreachable!("only a decoded record names a survivor");
+    };
+    record.failure = None;
+    write(path, &record)
+}
+
+/// Run `act`, which ends the shim as a failure SCM will recover from, with `failure` already on
+/// disk, as the shim would have left it; a record that cannot be written is an error and `act`
+/// does not run. The record is kept if `took_effect` says the act did
+/// what it was for; otherwise (the act failed, or the process was already going) the previous
+/// record is put back. A service with no state file has no record to write and none is created.
+pub fn noting_failure_around<T>(
+    path: &Path,
+    failure: FailureRecord,
+    act: impl FnOnce() -> io::Result<T>,
+    took_effect: impl FnOnce(&T) -> bool,
+) -> io::Result<T> {
+    let not_recorded = |e: io::Error| {
+        io::Error::new(
+            e.kind(),
+            format!("could not record the failure in {}: {e}", path.display()),
+        )
+    };
+    let previous = match read(path).map_err(not_recorded)? {
+        Loaded::Absent => return act(),
+        Loaded::Record(record) => record,
+        // The shim resets a file it cannot read in the same way when it next starts.
+        Loaded::Unreadable(_) => StateRecord::empty(),
+    };
+    let mut noted = previous.clone();
+    noted.failure = Some(failure);
+    write(path, &noted).map_err(not_recorded)?;
+    let result = act();
+    if !matches!(&result, Ok(done) if took_effect(done)) {
+        // The act's own result is what the caller needs; a record that cannot be put back is
+        // spent by the next start like any other.
+        let _ = write(path, &previous);
+    }
+    result
+}
+
 /// The record at `path`, or an empty one where there is none or it does not decode.
 fn current(path: &Path) -> io::Result<StateRecord> {
     Ok(match read(path)? {
