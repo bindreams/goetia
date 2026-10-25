@@ -13,8 +13,10 @@ use goetia::backend::scm::exit_status::{
     ERROR_CAN_NOT_COMPLETE, ERROR_GEN_FAILURE, ERROR_SERVICE_SPECIFIC_ERROR, Reported,
 };
 use goetia::spec::{Id, Kind, Restart, User};
-use windows_sys::Win32::Foundation::ERROR_SERVICE_CANNOT_ACCEPT_CTRL;
-use windows_sys::Win32::System::Services::SERVICE_STOPPED;
+use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, NO_ERROR};
+use windows_sys::Win32::System::Services::{
+    SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_PAUSE, SERVICE_CONTROL_STOP, SERVICE_STOPPED,
+};
 
 use super::*;
 use crate::logging::test_hook::{take, take_warnings};
@@ -672,10 +674,11 @@ fn an_exit_status_that_cannot_be_read_is_a_shim_failure() {
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }
 
-/// The exit is decided once. A failure the shim has settled on refuses a later stop, so SCM is never
-/// told a stop was accepted and then handed a failure to restart.
+/// The exit is decided once: a stop after the failure is settled does not turn it into a clean stop.
+/// SCM acknowledges every `STOP` it delivers whatever the handler answers, so the handler answers
+/// `NO_ERROR`.
 #[skuld::test]
-fn a_stop_after_a_daemon_failure_was_reported_is_refused() {
+fn a_stop_after_a_daemon_failure_was_decided_leaves_the_failure() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
     let stop_bus = Arc::new(StopBus::new());
@@ -692,12 +695,31 @@ fn a_stop_after_a_daemon_failure_was_reported_is_refused() {
         !stop_bus.request_stop(),
         "a stop was accepted after the failure was decided"
     );
-    assert_eq!(
-        stop_control(&stop_bus).to_raw(),
-        ERROR_SERVICE_CANNOT_ACCEPT_CTRL,
-        "the control handler acknowledged a stop the shim had already refused"
-    );
+    assert_eq!(handle_control(&stop_bus, SERVICE_CONTROL_STOP), NO_ERROR);
+    assert_eq!(stop_bus.settle(Reported::DaemonExit(7)), Reported::DaemonExit(7));
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+/// SCM may deliver a control after `STOP`, so the handler's context lives as long as the process.
+/// (`windows-service`'s `register` frees its closure after the first `Stop`.)
+#[skuld::test]
+fn a_control_after_a_stop_still_reaches_the_bus() {
+    let stop_bus = Arc::new(StopBus::new());
+    let context = leak_handler_context(&stop_bus);
+    let control = |code| {
+        // SAFETY: `context` came from `leak_handler_context` and is never freed.
+        unsafe { control_handler(code, 0, std::ptr::null_mut(), context) }
+    };
+
+    assert_eq!(control(SERVICE_CONTROL_STOP), NO_ERROR);
+    assert_eq!(control(SERVICE_CONTROL_INTERROGATE), NO_ERROR);
+    assert_eq!(control(SERVICE_CONTROL_STOP), NO_ERROR);
+    assert_eq!(control(SERVICE_CONTROL_PAUSE), ERROR_CALL_NOT_IMPLEMENTED);
+    assert_eq!(
+        stop_bus.settle(Reported::DaemonExit(7)),
+        Reported::Clean,
+        "the stop did not reach the bus"
+    );
 }
 
 /// The other order: the stop is accepted before the exit is decided, so the exit is a clean stop even
@@ -712,7 +734,7 @@ fn a_stop_accepted_before_a_daemon_failure_was_decided_is_clean() {
         &powershell(dir.path(), id.as_str(), "exit 7"),
         &stop_bus,
         id.as_str(),
-        || assert_eq!(stop_control(&stop_bus).to_raw(), 0, "the stop was not acknowledged"),
+        || assert_eq!(handle_control(&stop_bus, SERVICE_CONTROL_STOP), NO_ERROR),
     );
 
     assert_eq!(reported, Reported::Clean);

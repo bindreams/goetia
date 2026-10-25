@@ -21,16 +21,16 @@ use goetia::backend::scm::exit_status::Reported;
 use crate::logging;
 use crate::service::os_error_of;
 
-/// How the run ends, decided once under the [`StopBus`] mutex. A stop and a restartable failure
-/// exclude each other: SCM must never be told a stop was accepted and then record a failure, which
-/// it would restart.
+/// How the run ends, decided once under the [`StopBus`] mutex: a stop accepted before the exit is
+/// decided wins over any failure; a failure decided first is reported whatever stop follows. SCM
+/// acknowledges that later stop anyway and restarts the service after the failure.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum Fate {
     #[default]
     Open,
     /// A stop was accepted: the run reports clean (or the incomplete-stop record).
     Stopped,
-    /// A failure was decided: a stop is refused.
+    /// A failure was decided: a later stop does not change it.
     Failed,
 }
 
@@ -168,8 +168,7 @@ impl StopBus {
         }
     }
 
-    /// Called from the SCM control-handler callback (a thread `windows-service`
-    /// itself owns, per `service.rs`'s `service_control_handler::register`).
+    /// Called from the SCM control handler (`service::control_handler`), on the dispatcher thread.
     /// Only ever sets a flag and wakes waiters — it never acts on the child
     /// itself. Acting directly from this callback (calling `kill_tree()`
     /// here) could not know whether the service thread has spawned the child
@@ -178,10 +177,8 @@ impl StopBus {
     /// same flag re-checked at every wake-up, means a stop is never missed
     /// regardless of when it arrives.
     ///
-    /// Returns whether the stop was accepted, which is what the handler answers SCM with. A stop is
-    /// refused once [`StopBus::settle`] has decided a failure: SCM would record that failure and
-    /// restart the service, so an acknowledged stop must never be followed by one. A stop accepted
-    /// here makes `settle` report clean.
+    /// Returns whether the stop was accepted: not once [`StopBus::settle`] has decided a failure,
+    /// which is then reported as it is. A stop accepted here makes `settle` report clean.
     pub fn request_stop(&self) -> bool {
         let mut g = self.state.lock().expect("StopBus mutex poisoned");
         if g.fate == Fate::Failed {
@@ -198,8 +195,7 @@ impl StopBus {
     /// the result is `candidate`, and a failure among those closes the bus to later stops.
     ///
     /// Check and decision are one critical section with [`StopBus::request_stop`], so a stop is
-    /// either accepted before the exit is decided or refused after it, never acknowledged and then
-    /// overtaken by a failure report.
+    /// either accepted before the exit is decided or arrives after it, never both.
     pub fn settle(&self, candidate: Reported) -> Reported {
         let mut g = self.state.lock().expect("StopBus mutex poisoned");
         match (g.fate, candidate) {
@@ -212,8 +208,8 @@ impl StopBus {
         }
     }
 
-    /// Close the bus to later stops: the exit is decided as a failure that must not be followed by
-    /// an acknowledged stop. A stop accepted already stays accepted.
+    /// Close the bus to later stops: the exit is decided, and a later stop must not change it. A
+    /// stop accepted already stays accepted.
     fn refuse_stops(&self) {
         let mut g = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if g.fate == Fate::Open {
@@ -322,7 +318,7 @@ impl StopBus {
     /// executes. Otherwise (the tree kill failed, even if the direct child's fallback worked) the
     /// outcome is [`WaitOutcome::DaemonMayRun`], and the bus refuses later stops: reporting a
     /// restartable failure over a daemon that may still be running would start a second copy
-    /// beside it, and an acknowledged stop must not end in that record.
+    /// beside it.
     ///
     /// **A stop whose tree kill failed** is [`WaitOutcome::DaemonMayRun`] too, even when the direct
     /// child's fallback worked: its descendants may still run.

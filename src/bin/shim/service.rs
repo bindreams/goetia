@@ -5,10 +5,9 @@
 //! exits; SCM's recovery actions (`backend::scm::generate`) start a new shim, which reads the
 //! installed spec afresh.
 
-use std::ffi::OsString;
-use std::os::windows::io::AsRawHandle as _;
+use std::ffi::{OsStr, OsString, c_void};
+use std::os::windows::ffi::OsStrExt as _;
 use std::sync::Arc;
-use std::time::Duration;
 
 use cosca::{Child, Containment, Fd, Stdio};
 use goetia::backend::scm::exit_status::{
@@ -16,14 +15,12 @@ use goetia::backend::scm::exit_status::{
 };
 use goetia::backend::scm::manager::read_spec_blob;
 use goetia::spec::{DaemonSpec, Restart};
-use windows_service::service::{
-    ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
-};
-use windows_service::service_control_handler::{self, ServiceControlHandlerResult, ServiceStatusHandle};
 use windows_service::{define_windows_service, service_dispatcher};
-use windows_sys::Win32::Foundation::ERROR_SERVICE_CANNOT_ACCEPT_CTRL;
+use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, NO_ERROR};
 use windows_sys::Win32::System::Services::{
-    SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOPPED, SERVICE_WIN32_OWN_PROCESS, SetServiceStatus,
+    RegisterServiceCtrlHandlerExW, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_STOP,
+    SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOPPED, SERVICE_WIN32_OWN_PROCESS,
+    SetServiceStatus,
 };
 
 use crate::logging;
@@ -79,7 +76,7 @@ fn run_service(id: &str) {
             );
             finish(
                 id,
-                &status_handle,
+                status_handle,
                 Reported::shim_failure(Some(ERROR_INVALID_DATA as i32)),
             );
         }
@@ -87,28 +84,27 @@ fn run_service(id: &str) {
             logging::log_failure(id, &format!("decode metadata blob: {e}"));
             finish(
                 id,
-                &status_handle,
+                status_handle,
                 Reported::shim_failure(Some(ERROR_INVALID_DATA as i32)),
             );
         }
     };
 
     log_version_skew(id, &blob.spec, &blob.version, goetia::version());
-    let reported = run_daemon(&blob.spec, &stop_bus, id, || report_running(id, &status_handle));
-    finish(id, &status_handle, reported);
+    let reported = run_daemon(&blob.spec, &stop_bus, id, || report_running(id, status_handle));
+    finish(id, status_handle, reported);
 }
 
 /// Tell SCM the service stopped, then end the process. SCM restarts the service or not from
 /// the status reported here, never from the process exit code.
-fn finish(id: &str, status_handle: &ServiceStatusHandle, reported: Reported) -> ! {
+fn finish(id: &str, status_handle: StatusHandle, reported: Reported) -> ! {
     report_stopped(id, status_handle, reported);
     std::process::exit(reported.process_exit_code());
 }
 
 /// The `STOPPED` status SCM is told for `reported`, with the exact `(win32, specific)` pair of
-/// [`Reported::scm_codes`]. Built raw because `windows-service`'s `ServiceExitCode` cannot express
-/// a service-specific code beside Win32 0, which is how an incomplete stop leaves a record without
-/// a restart.
+/// [`Reported::scm_codes`], including a service-specific code beside Win32 0, which is how an
+/// incomplete stop leaves a record without a restart.
 fn stopped_status(reported: Reported) -> SERVICE_STATUS {
     let (win32, specific) = reported.scm_codes();
     SERVICE_STATUS {
@@ -122,47 +118,78 @@ fn stopped_status(reported: Reported) -> SERVICE_STATUS {
     }
 }
 
-fn register_control_handler(id: &str, stop_bus: &Arc<StopBus>) -> windows_service::Result<ServiceStatusHandle> {
-    let handler_bus = Arc::clone(stop_bus);
-    let event_handler = move |control_event| match control_event {
-        ServiceControl::Stop => stop_control(&handler_bus),
-        ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-        _ => ServiceControlHandlerResult::NotImplemented,
-    };
-    service_control_handler::register(id, event_handler)
+/// The handle `RegisterServiceCtrlHandlerExW` returned. It stays valid for the life of the process.
+#[derive(Clone, Copy)]
+struct StatusHandle(SERVICE_STATUS_HANDLE);
+
+/// Registered directly rather than through `windows-service`'s `register`, which frees its closure
+/// after the first `Stop`: SCM can deliver a control after that, which would reach freed memory.
+fn register_control_handler(id: &str, stop_bus: &Arc<StopBus>) -> std::io::Result<StatusHandle> {
+    let name: Vec<u16> = OsStr::new(id).encode_wide().chain(std::iter::once(0)).collect();
+    // SAFETY: `name` is NUL-terminated and outlives the call; the context is never freed.
+    let handle =
+        unsafe { RegisterServiceCtrlHandlerExW(name.as_ptr(), Some(control_handler), leak_handler_context(stop_bus)) };
+    if handle.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(StatusHandle(handle))
 }
 
-/// The control handler's answer to `Stop`. A stop the bus refuses (the exit is already decided as a
-/// failure, which SCM restarts) is an error, so that `ControlService` fails instead of acknowledging
-/// a stop that will not happen.
-fn stop_control(stop_bus: &StopBus) -> ServiceControlHandlerResult {
-    if stop_bus.request_stop() {
-        ServiceControlHandlerResult::NoError
-    } else {
-        ServiceControlHandlerResult::Other(ERROR_SERVICE_CANNOT_ACCEPT_CTRL)
+/// The handler's context: a clone of `stop_bus`, leaked so that it outlives every control.
+fn leak_handler_context(stop_bus: &Arc<StopBus>) -> *mut c_void {
+    Box::into_raw(Box::new(Arc::clone(stop_bus))).cast()
+}
+
+/// # Safety
+///
+/// `context` comes from [`leak_handler_context`].
+unsafe extern "system" fn control_handler(
+    control: u32,
+    _event_type: u32,
+    _event_data: *mut c_void,
+    context: *mut c_void,
+) -> u32 {
+    // SAFETY: the caller's contract; the `Arc` it points to is never freed.
+    let stop_bus = unsafe { &*context.cast::<Arc<StopBus>>() };
+    handle_control(stop_bus, control)
+}
+
+/// The handler's answer to `control`. SCM acknowledges every `STOP` it delivers whatever the
+/// handler answers, so a stop the bus does not accept (the exit is already decided as a failure)
+/// is answered `NO_ERROR` too: the failure is still reported, and SCM restarts the service.
+fn handle_control(stop_bus: &StopBus, control: u32) -> u32 {
+    match control {
+        SERVICE_CONTROL_STOP => {
+            stop_bus.request_stop();
+            NO_ERROR
+        }
+        SERVICE_CONTROL_INTERROGATE => NO_ERROR,
+        _ => ERROR_CALL_NOT_IMPLEMENTED,
     }
 }
 
 /// Report `RUNNING`. A failure is logged: SCM keeps the last state it confirmed.
-fn report_running(id: &str, handle: &ServiceStatusHandle) {
-    if let Err(e) = handle.set_service_status(ServiceStatus {
-        service_type: ServiceType::OWN_PROCESS,
-        current_state: ServiceState::Running,
-        controls_accepted: ServiceControlAccept::STOP,
-        exit_code: ServiceExitCode::Win32(0),
-        checkpoint: 0,
-        wait_hint: Duration::default(),
-        process_id: None,
-    }) {
+fn report_running(id: &str, handle: StatusHandle) {
+    let status = SERVICE_STATUS {
+        dwServiceType: SERVICE_WIN32_OWN_PROCESS,
+        dwCurrentState: SERVICE_RUNNING,
+        dwControlsAccepted: SERVICE_ACCEPT_STOP,
+        dwWin32ExitCode: 0,
+        dwServiceSpecificExitCode: 0,
+        dwCheckPoint: 0,
+        dwWaitHint: 0,
+    };
+    // SAFETY: `handle` is live for the life of the process, and `status` outlives the call.
+    if unsafe { SetServiceStatus(handle.0, &status) } == 0 {
+        let e = std::io::Error::last_os_error();
         logging::log_failure(id, &format!("report SERVICE_RUNNING to SCM: {e}"));
     }
 }
 
-fn report_stopped(id: &str, handle: &ServiceStatusHandle, reported: Reported) {
+fn report_stopped(id: &str, handle: StatusHandle, reported: Reported) {
     let status = stopped_status(reported);
-    // SAFETY: `handle` wraps the live `SERVICE_STATUS_HANDLE` that `RegisterServiceCtrlHandlerExW`
-    // returned (it stays valid for the life of the process), and `status` outlives the call.
-    let ok = unsafe { SetServiceStatus(handle.as_raw_handle() as SERVICE_STATUS_HANDLE, &status) };
+    // SAFETY: `handle` is live for the life of the process, and `status` outlives the call.
+    let ok = unsafe { SetServiceStatus(handle.0, &status) };
     if ok == 0 {
         let e = std::io::Error::last_os_error();
         logging::log_failure(id, &format!("report SERVICE_STOPPED to SCM: {e}"));

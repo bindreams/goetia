@@ -730,9 +730,9 @@ look for one. A command that failed and is waiting out `restart-delay` finds
 the service already stopped, so `stop` exits `0` and the daemon is started when
 the delay ends. When a command fails just as a `stop` arrives, the shim decides
 once: a stop it accepts before it decides the exit is reported as a clean stop,
-which SCM does not restart; once it has decided on the failure it refuses the
-stop (`ERROR_SERVICE_CANNOT_ACCEPT_CTRL`), so a stop is never acknowledged and
-then followed by a restart, and SCM restarts the command as above.
+which SCM does not restart; a stop that arrives after it has decided on the
+failure does not change it. SCM acknowledges that stop anyway, whatever the
+shim answers, so `stop` exits `0` and SCM restarts the command as above.
 `goetia daemon uninstall` is not affected: deleting the service cancels a
 restart SCM has queued.
 
@@ -776,8 +776,8 @@ record is a failed start.
 Before the shim reports any failure SCM restarts (the command exiting non-zero,
 or the shim's own wait on it failing), it terminates the job, so the restart does
 not overlap descendants the previous run left behind. If the job cannot be
-terminated, it reports `0`, `1003` as for a `stop` it could not complete, and
-refuses a later `stop`.
+terminated, it reports `0`, `1003` as for a `stop` it could not complete, whatever
+`stop` follows.
 
 Nothing guards against a possible survivor afterwards: `stop` exits `0`,
 including the `stop` that produced the record, and a later `start`, `restart` or
