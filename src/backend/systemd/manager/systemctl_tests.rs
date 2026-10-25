@@ -94,7 +94,7 @@ fn a_budget_that_does_not_wait_asks_systemd_not_to_block() {
     for budget in [Budget::Immediate, Budget::Bounded(Duration::ZERO)] {
         assert_eq!(
             verb_args("start", "x.service", budget),
-            ["start", "--no-block", "--show-transaction", "x.service"],
+            ["start", "--no-block", "--show-transaction", "--", "x.service"],
             "{budget:?}"
         );
     }
@@ -106,7 +106,7 @@ fn a_budget_that_does_not_wait_asks_systemd_not_to_block() {
 fn a_budget_that_waits_lets_systemctl_block() {
     assert_eq!(
         verb_args("stop", "x.service", Budget::Unbounded),
-        ["stop", "--show-transaction", "x.service"]
+        ["stop", "--show-transaction", "--", "x.service"]
     );
 }
 
@@ -124,6 +124,81 @@ fn every_budget_asks_systemctl_to_announce_the_job() {
             "{budget:?}"
         );
     }
+}
+
+/// An id may start with `-` (`is_valid_id` allows it), and a unit name that does is read by
+/// `systemctl` as an option unless `--` precedes it: `-h.service` is `-h`, which prints help and
+/// exits `0` having done nothing. `systemctl` parses with `getopt_long`, which stops at `--`.
+#[skuld::test]
+fn start_stop_and_restart_put_the_unit_after_the_option_terminator() {
+    for budget in [
+        Budget::Immediate,
+        Budget::Unbounded,
+        Budget::Bounded(Duration::from_secs(10)),
+    ] {
+        for verb in ["start", "stop", "restart"] {
+            let args = verb_args(verb, "-h.service", budget);
+            assert_eq!(args[0], verb, "{budget:?}");
+            assert_eq!(args[args.len() - 2..], ["--", "-h.service"], "{verb} {budget:?}");
+        }
+    }
+}
+
+/// `enable` and `disable` over `-h`, which `systemctl` would read as `-h` and print its help for,
+/// exit `0`, and change nothing. Run through the functions `Systemd::enable`, `Systemd::disable` and
+/// `uninstall` call.
+#[skuld::test]
+fn enable_and_disable_put_the_unit_after_the_option_terminator() {
+    type Verb = fn(&str) -> Result<()>;
+    for (verb, run) in [("enable", enable_impl as Verb), ("disable", disable_impl as Verb)] {
+        let dir = tempfile::tempdir().unwrap();
+        let ran = dir.path().join("ran");
+        let _stand_in = stand_in::set(
+            Some(&gate_passes_then(&format!(
+                "echo \"$*\" >> '{}'; exit 0",
+                ran.display()
+            ))),
+            booted(),
+        );
+
+        run("-h").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&ran).unwrap(),
+            format!(
+                "{verb} -- -h.service
+"
+            )
+        );
+    }
+}
+
+#[skuld::test]
+fn enable_and_disable_failures_name_the_verb_the_unit_and_systemd_s_words() {
+    type Verb = fn(&str) -> Result<()>;
+    for (verb, run) in [("enable", enable_impl as Verb), ("disable", disable_impl as Verb)] {
+        let _stand_in = stand_in::set(Some(&gate_passes_then("echo 'Access denied' >&2; exit 1")), booted());
+
+        let msg = run("x").expect_err(verb).to_string();
+
+        assert!(msg.contains(&format!("systemctl {verb} x.service failed")), "{msg}");
+        assert!(msg.contains("Access denied"), "{msg}");
+    }
+}
+
+#[skuld::test]
+fn show_puts_the_unit_after_the_option_terminator() {
+    let dir = tempfile::tempdir().unwrap();
+    let ran = dir.path().join("ran");
+    let _stand_in = stand_in::set(Some(&format!("echo \"$*\" >> '{}'; exit 1", ran.display())), booted());
+
+    let _ = status_from_unit("-h.service");
+
+    assert_eq!(
+        std::fs::read_to_string(&ran).unwrap(),
+        "show --property ActiveState,MainPID,UnitFileState,LoadState -- -h.service
+"
+    );
 }
 
 // enqueued ============================================================================================================
@@ -527,16 +602,11 @@ type Path = (String, Box<dyn Fn() -> Result<()>>);
 fn every_path() -> Vec<Path> {
     let mut paths: Vec<Path> = vec![
         ("daemon-reload".to_string(), Box::new(daemon_reload)),
-        (
-            "enable".to_string(),
-            Box::new(|| run_systemctl(&["enable", "x.service"]).map(drop)),
-        ),
-        (
-            "disable".to_string(),
-            Box::new(|| run_systemctl(&["disable", "x.service"]).map(drop)),
-        ),
+        ("enable".to_string(), Box::new(|| enable_impl("x"))),
+        ("disable".to_string(), Box::new(|| disable_impl("x"))),
         ("show".to_string(), Box::new(|| status_from_unit("x.service").map(drop))),
         ("restart".to_string(), Box::new(|| request_restart_impl("x"))),
+        ("kill".to_string(), Box::new(|| kill_impl("x"))),
     ];
     for budget in [
         Budget::Immediate,
@@ -1373,4 +1443,86 @@ fn this_hosts_systemd_is_supported() {
         supported().expect("the host running the tests runs systemd 242+, whatever colour is inherited");
     }
     require_supported().expect("the host running the tests runs systemd 242+");
+}
+
+// kill ================================================================================================================
+
+/// `kill` over `x`, with `rest` standing in for what systemd answers it.
+fn kill_with(rest: &str) -> Result<()> {
+    let _stand_in = stand_in::set(Some(&gate_passes_then(rest)), booted());
+    kill_impl("x")
+}
+
+/// The argv is pinned: see `KILL_ARGS` for why each flag.
+#[skuld::test]
+fn kill_runs_the_pinned_argv() {
+    let dir = tempfile::tempdir().unwrap();
+    let ran = dir.path().join("ran");
+    kill_with(&format!("echo \"$*\" >> '{}'; exit 0", ran.display())).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&ran).unwrap(),
+        "kill --kill-who=main-fail --signal=SIGKILL -- x.service
+"
+    );
+}
+
+/// An id may start with `-`; without `--` systemctl would read `-h.service` as `-h` and print its
+/// help, exit `0`, and signal nobody.
+#[skuld::test]
+fn kill_of_an_id_starting_with_a_dash_names_the_unit_after_the_terminator() {
+    let dir = tempfile::tempdir().unwrap();
+    let ran = dir.path().join("ran");
+    let _stand_in = stand_in::set(
+        Some(&gate_passes_then(&format!(
+            "echo \"$*\" >> '{}'; exit 0",
+            ran.display()
+        ))),
+        booted(),
+    );
+
+    kill_impl("-h").unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&ran).unwrap(),
+        "kill --kill-who=main-fail --signal=SIGKILL -- -h.service
+"
+    );
+}
+
+/// Both of systemd's no-process answers (see `no_process`) are `NotRunning`.
+#[skuld::test]
+fn kill_of_a_unit_with_no_main_process_is_not_running() {
+    for said in [
+        "Failed to kill unit x.service: Unit x.service not loaded.",
+        "Failed to kill unit x.service: No main process to kill",
+    ] {
+        let e = kill_with(&format!("echo '{said}' >&2; exit 1")).expect_err(said);
+        assert!(matches!(&e, Error::NotRunning { id } if id == "x"), "{said}: {e:?}");
+    }
+}
+
+/// Any other refusal is a failure of the request, with systemd's words: never read as "nothing
+/// was running".
+#[skuld::test]
+fn kill_refused_for_any_other_reason_is_a_plain_failure() {
+    let e = kill_with("echo 'Failed to kill unit x.service: Access denied' >&2; exit 1").expect_err("refused");
+    assert!(matches!(&e, Error::Other(_)), "{e:?}");
+    let msg = e.to_string();
+    assert!(msg.contains("systemctl kill x.service failed"), "{msg}");
+    assert!(msg.contains("Access denied"), "{msg}");
+}
+
+/// A different unit's absence is not this one's: the not-loaded answer has to name the unit asked
+/// about.
+#[skuld::test]
+fn a_not_loaded_answer_about_another_unit_is_a_plain_failure() {
+    let e = kill_with("echo 'Failed to kill unit x.service: Unit y.service not loaded.' >&2; exit 1")
+        .expect_err("not this unit's absence");
+    assert!(matches!(&e, Error::Other(_)), "{e:?}");
+}
+
+#[skuld::test]
+fn kill_that_systemd_took_succeeds() {
+    kill_with("exit 0").unwrap();
 }

@@ -34,6 +34,17 @@
       "automerge": true
     },
     {
+      "description": "Actions only the release workflows run: PR CI never exercises them, so a green PR proves nothing and they are never automerged.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchPackageNames": [
+        "rust-lang/crates-io-auth-action"
+      ],
+      "groupName": "release-actions",
+      "automerge": false
+    },
+    {
       "description": "Group non-major Rust crate updates.",
       "matchManagers": [
         "cargo"
