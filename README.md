@@ -746,12 +746,12 @@ different goetia version registered and `restart` is not `never`.
 `sc query` shows the difference between your command failing and the shim
 failing:
 
-| What happened                      | `WIN32_EXIT_CODE`, `SERVICE_EXIT_CODE` SCM records                             |
-| ---------------------------------- | ------------------------------------------------------------------------------ |
-| command exited `0`, or was stopped | `0`, `0`                                                                       |
-| command exited `n`, not `0`        | `1066`, `n` (a service-specific code)                                          |
-| the shim could not run the command | a Win32 code: the OS error, `13` for an unreadable spec, `31` if there is none |
-| `stop` could not kill the command  | `0`, `1003`                                                                    |
+| What happened                              | `WIN32_EXIT_CODE`, `SERVICE_EXIT_CODE` SCM records                             |
+| ------------------------------------------ | ------------------------------------------------------------------------------ |
+| command exited `0`, or was stopped         | `0`, `0`                                                                       |
+| command exited `n`, not `0`                | `1066`, `n` (a service-specific code)                                          |
+| the shim could not run the command         | a Win32 code: the OS error, `13` for an unreadable spec, `31` if there is none |
+| the shim could not kill the command's tree | `0`, `1003`                                                                    |
 
 Under `on-failure` both failures are restarted, so a spec the shim cannot read
 or a command that is missing retries at `restart-delay` indefinitely, as it
@@ -761,10 +761,18 @@ non-zero Win32 code would make SCM start a second copy; the service-specific
 code `1003` is the record that the command may still be running. goetia does not
 read that record: `stop` exits `0`, and a later `start` starts a second copy.
 
-The same holds when the shim's own wait on the command fails: it kills the command
-and reports a shim failure, restarted under `on-failure`, only once it has
-confirmed the command and its descendants gone. When it cannot confirm that, it
-reports `0`, `1003` as for a `stop` it could not complete.
+The shim runs a `type: simple` command inside a Windows Job Object and requires
+one: if the job cannot be assigned, it kills the command, logs why, and reports
+a shim failure, so no command runs uncontained. Before it reports any failure
+SCM restarts (the command exiting non-zero, or the shim's own wait on it
+failing), it terminates the job, so the restart does not overlap descendants the
+previous run left behind. If the job cannot be terminated, it reports `0`,
+`1003` as for a `stop` it could not complete, and refuses a later `stop`.
+
+"Terminated" means the OS has stopped every thread of the command and its
+descendants, not that it has finished releasing what they held. A restarted
+command can briefly find a resource its predecessor held (a listening port, say)
+and fail; SCM retries it like any other failure.
 
 ### What returning means
 

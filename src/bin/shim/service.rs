@@ -10,7 +10,7 @@ use std::os::windows::io::AsRawHandle as _;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cosca::{Child, Fd, Stdio};
+use cosca::{Child, Containment, Fd, Stdio};
 use goetia::backend::scm::exit_status::{
     ERROR_BAD_ARGUMENTS, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_INVALID_DATA, Reported,
 };
@@ -27,7 +27,7 @@ use windows_sys::Win32::System::Services::{
 };
 
 use crate::logging;
-use crate::stop_bus::{StopBus, WaitOutcome, Waiter};
+use crate::stop_bus::{StopBus, Teardown, WaitOutcome, Waiter, kill_for_stop, terminate_failed_tree};
 
 // Entry ===============================================================================================================
 
@@ -184,8 +184,8 @@ fn run_daemon(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, on_running: 
     };
     on_running();
 
-    // `wait_for_child_or_stop` kills and confirms the tree, so only `DaemonMayRun` leaves a daemon
-    // that may be running.
+    // `wait_for_child_or_stop` kills the tree on a stop or a failed wait, so only `DaemonMayRun`
+    // leaves a daemon that may be running.
     match stop_bus.wait_for_child_or_stop(waiter, &child, id) {
         WaitOutcome::ChildExited => {
             let code = match exit_status(&child) {
@@ -201,14 +201,29 @@ fn run_daemon(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, on_running: 
                     None
                 }
             };
-            stop_bus.settle(exit_report(code))
+            end_tree_before_failure(stop_bus.settle(exit_report(code)), &child, id)
         }
-        // The failure is already logged; the daemon was torn down and confirmed gone, so it is the
-        // shim that failed.
+        // The failure is already logged; the daemon's tree was terminated, so it is the shim that
+        // failed.
         WaitOutcome::WaitFailed { os_error } => stop_bus.settle(Reported::shim_failure(os_error)),
         WaitOutcome::Stopping => Reported::Clean,
         // Still reports STOPPED so the service stays stoppable and uninstallable.
         WaitOutcome::DaemonMayRun => Reported::incomplete_stop(),
+    }
+}
+
+/// A failure SCM restarts is reported only once the tree the daemon left is terminated, so the
+/// restart does not overlap it. If it cannot be terminated, SCM must not restart: the incomplete
+/// stop. Anything that is not a failure (a clean exit, or a stop that won) is returned as it is.
+///
+/// "Terminated" is `kill_tree` succeeding on the Job Object `launch` requires: no thread of any
+/// member executes after it. The kernel may still be releasing what they held, so a restarted
+/// daemon can briefly find a resource its predecessor held (a port) and fail like any other start.
+fn end_tree_before_failure(settled: Reported, child: &Child, id: &str) -> Reported {
+    if settled == Reported::Clean || terminate_failed_tree(child, id) {
+        settled
+    } else {
+        Reported::incomplete_stop()
     }
 }
 
@@ -244,12 +259,38 @@ fn launch(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str) -> Result<(Arc<C
     };
     let mut cmd = build_command(spec, id);
     match start(&mut cmd) {
-        Ok(child) => Ok((Arc::new(child), waiter)),
+        Ok(child) => require_job_object(child, spec, id).map(|child| (Arc::new(child), waiter)),
         Err(e) => {
             logging::log_failure(id, &spawn_failed(&spec.command, &e));
             Err(Reported::shim_failure(os_error_of(&e)))
         }
     }
+}
+
+/// The daemon, if a Job Object contains it. `type: simple` is stopped, and restarted after a
+/// failure, only by terminating its whole tree, which `cosca` can guarantee only with a job: when
+/// assigning the job fails it falls back to a process-tree walk that cannot say whether a
+/// descendant was killed. Any other containment is a start failure: the daemon is killed, never run.
+fn require_job_object(child: Child, spec: &DaemonSpec, id: &str) -> Result<Child, Reported> {
+    let containment = containment_of(&child);
+    if containment == Containment::JobObject {
+        return Ok(child);
+    }
+    logging::log_failure(id, &not_job_contained(&spec.command, containment));
+    // Dropping the child as well kills its tree and waits for it.
+    match kill_for_stop(&child, id) {
+        Teardown::Failed => Err(Reported::incomplete_stop()),
+        Teardown::Tree | Teardown::ChildOnly => Err(Reported::shim_failure(None)),
+    }
+}
+
+/// The containment `cosca` achieved, as its own function so a test can make it differ.
+fn containment_of(child: &Child) -> Containment {
+    #[cfg(test)]
+    if let Some(forced) = test_hook::containment() {
+        return forced;
+    }
+    child.containment()
 }
 
 /// The OS error code behind a `cosca` failure, if it has one.
@@ -271,6 +312,12 @@ fn exit_status_unavailable(e: &cosca::error::Error) -> String {
 
 fn thread_refused(command: &[String], e: &std::io::Error) -> String {
     format!("make the thread that waits on {command:?}: {e}; it was not spawned, so nothing of this daemon is running")
+}
+
+fn not_job_contained(command: &[String], containment: Containment) -> String {
+    format!(
+        "the daemon {command:?} was contained by {containment}, not a job object: `type: simple` needs a job object to terminate its whole tree, so it was killed and nothing of it runs"
+    )
 }
 
 fn spawn_failed(command: &[String], e: &cosca::error::Error) -> String {
@@ -376,13 +423,14 @@ fn build_command(spec: &DaemonSpec, id: &str) -> cosca::Command {
 pub(crate) mod test_hook {
     use std::cell::Cell;
 
-    use cosca::Child;
     use cosca::identity::ProcessId;
+    use cosca::{Child, Containment};
 
     /// The error [`exit_status_fails`] makes the exit-status query fail with.
     pub(crate) const EXIT_STATUS_UNREADABLE: &str = "the exit status could not be read (test hook)";
 
     thread_local! {
+        static CONTAINMENT: Cell<Option<Containment>> = const { Cell::new(None) };
         static SPAWNS: Cell<usize> = const { Cell::new(0) };
         static SPAWNED: Cell<Option<ProcessId>> = const { Cell::new(None) };
         static STATUS_FAILS: Cell<bool> = const { Cell::new(false) };
@@ -396,6 +444,26 @@ pub(crate) mod test_hook {
 
     pub(super) fn spawned_child(child: &Child) {
         SPAWNED.set(Some(child.id()));
+    }
+
+    /// Make this thread's spawned daemons read as contained by `containment`, until the returned
+    /// guard drops. A job assignment cannot be made to fail on demand.
+    pub(crate) fn containment_is(containment: Containment) -> Degraded {
+        CONTAINMENT.set(Some(containment));
+        Degraded
+    }
+
+    /// See [`containment_is`].
+    pub(crate) struct Degraded;
+
+    impl Drop for Degraded {
+        fn drop(&mut self) {
+            CONTAINMENT.set(None);
+        }
+    }
+
+    pub(super) fn containment() -> Option<Containment> {
+        CONTAINMENT.get()
     }
 
     /// Make the exit-status query on this thread fail, until the returned guard drops.
