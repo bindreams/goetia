@@ -27,7 +27,7 @@ use windows_sys::Win32::System::Services::{
 };
 
 use crate::logging;
-use crate::stop_bus::{StopBus, WaitOutcome, Waiter, kill_for_stop, terminate_failed_tree};
+use crate::stop_bus::{StopBus, Teardown, WaitOutcome, Waiter, kill_for_stop, terminate_failed_tree};
 
 // Entry ===============================================================================================================
 
@@ -175,8 +175,9 @@ fn report_stopped(id: &str, handle: &ServiceStatusHandle, reported: Reported) {
 /// stop, and say how it ended.
 ///
 /// `on_running` is called exactly once, after the daemon is spawned and never when launching failed.
-/// A daemon that cannot start is therefore `STOPPED` with a non-zero Win32 code without ever having
-/// been `RUNNING`, which `start_via_notify` reads as a failed start under every restart policy.
+/// A daemon that cannot start is therefore `STOPPED` without ever having been `RUNNING`, with a
+/// non-zero Win32 code or, when no Job Object contains it, the incomplete stop. `start_via_notify`
+/// reads both as a failed start under every restart policy.
 fn run_daemon(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, on_running: impl FnOnce()) -> Reported {
     let (child, waiter) = match launch(spec, stop_bus, id) {
         Ok(launched) => launched,
@@ -243,12 +244,13 @@ fn exit_status(child: &Child) -> Result<std::process::ExitStatus, cosca::error::
     child.wait()
 }
 
-/// The daemon, running and already being waited on — or why not, logged, with nothing launched.
+/// The daemon, running, job-contained and already being waited on — or why not, logged.
 ///
 /// The [`Waiter`] thread is made before the daemon is spawned, so a daemon is never running with
 /// nothing to wait on it. `build_command` sits between them but never launches anything.
 ///
-/// The `Err` is what the service reports: the OS error of the failure, or `ERROR_GEN_FAILURE`.
+/// The `Err` is what the service reports: the OS error of the failure, `ERROR_GEN_FAILURE`, or the
+/// incomplete stop for a daemon no Job Object contains.
 fn launch(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str) -> Result<(Arc<Child>, Waiter), Reported> {
     let waiter = match stop_bus.waiter(id) {
         Ok(waiter) => waiter,
@@ -279,8 +281,11 @@ fn require_job_object(child: Child, spec: &DaemonSpec, id: &str) -> Result<Child
         return Ok(child);
     }
     logging::log_failure(id, &not_job_contained(&spec.command, containment));
-    // Dropping the child as well kills its tree and waits for it.
-    kill_for_stop(&child, id);
+    // Dropping the child kills it again and waits for it, with no bound when the kill is refused,
+    // so a child that could not be killed is let go: the record must still be reported.
+    if kill_for_stop(&child, id) == Teardown::Failed {
+        child.detach();
+    }
     Err(Reported::incomplete_stop())
 }
 

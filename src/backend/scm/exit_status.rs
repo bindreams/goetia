@@ -18,7 +18,7 @@ pub const ERROR_BAD_ARGUMENTS: u32 = 160;
 pub const ERROR_INVALID_DATA: u32 = 13;
 /// A shim failure that carries no usable OS error.
 pub const ERROR_GEN_FAILURE: u32 = 31;
-/// A commanded stop that could not kill the daemon.
+/// The shim could not show that the daemon's tree was terminated: the incomplete stop.
 pub const ERROR_CAN_NOT_COMPLETE: u32 = 1003;
 /// The control handler or the dispatcher could not be connected, so nothing is reportable.
 pub const ERROR_FAILED_SERVICE_CONTROLLER_CONNECT: u32 = 1063;
@@ -39,7 +39,8 @@ pub enum Reported {
     DaemonExit(u32),
     /// The shim failed; holds a Win32 code that is neither 0 nor [`ERROR_SERVICE_SPECIFIC_ERROR`].
     ShimFailure(u32),
-    /// A commanded stop that could not kill the daemon, which may still be running.
+    /// The shim could not show that the daemon's tree was terminated, after a stop or a failure,
+    /// or because no Job Object contained it; it may still be running.
     IncompleteStop,
 }
 
@@ -98,15 +99,15 @@ pub struct RecordedExit {
 }
 
 impl RecordedExit {
-    /// Whether the shim launched the daemon and the daemon then ended: a daemon exit
-    /// ([`Reported::Clean`], [`Reported::DaemonExit`], [`Reported::IncompleteStop`]). Any other
+    /// Whether the shim launched the daemon: [`Reported::Clean`] and [`Reported::DaemonExit`], where
+    /// it then ended, and [`Reported::IncompleteStop`], where it may still be running. Any other
     /// Win32 code is a shim failure before or around the launch.
     pub fn daemon_ran(self) -> bool {
         self.win32 == 0 || self.win32 == ERROR_SERVICE_SPECIFIC_ERROR
     }
 
-    /// Whether this is [`Reported::IncompleteStop`]'s record: the shim could not kill a daemon it
-    /// launched, which may still be running. A daemon that itself exits 1003 is
+    /// Whether this is [`Reported::IncompleteStop`]'s record: a daemon the shim launched may still
+    /// be running. A daemon that itself exits 1003 is
     /// [`ERROR_SERVICE_SPECIFIC_ERROR`] with specific 1003, not this.
     pub fn is_incomplete_stop(self) -> bool {
         (self.win32, self.specific) == Reported::IncompleteStop.scm_codes()

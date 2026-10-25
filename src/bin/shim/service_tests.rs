@@ -543,14 +543,14 @@ fn a_clean_exit_does_not_terminate_the_tree() {
 /// The line logged when `kill_tree` is refused and the direct child's kill is tried next.
 fn tree_refused_failure() -> String {
     format!(
-        "kill_tree on stop: {KILL_REFUSED}; falling back to killing the direct child only (its own descendants, if any, cannot be reached without a containment mechanism)"
+        "kill_tree: {KILL_REFUSED}; falling back to killing the direct child only (its own descendants, if any, cannot be reached without a containment mechanism)"
     )
 }
 
 /// The line logged when the direct child's kill is refused too.
 fn fallback_refused_failure() -> String {
     format!(
-        "fallback kill on stop: {KILL_REFUSED}; the daemon was neither killed nor reaped and may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure"
+        "fallback kill: {KILL_REFUSED}; the daemon was neither killed nor reaped and may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure"
     )
 }
 
@@ -633,6 +633,17 @@ fn an_uncontained_daemon_that_cannot_be_killed_is_the_incomplete_stop_record() {
             fallback_refused_failure(),
         ],
     );
+    // A real refusal makes `Child::drop` wait with no bound for a daemon it cannot kill, before
+    // anything is reported, so `run_daemon` must let it go undropped. The hook refuses only the
+    // shim's own kills: a drop would have killed it by here.
+    let daemon = cosca::Process::from_id(test_hook::spawned().expect("the daemon was spawned"));
+    assert_eq!(
+        daemon.is_alive(),
+        Liveness::Alive,
+        "the shim dropped a daemon it could not kill"
+    );
+    daemon.kill().expect("kill the daemon the shim let go");
+    daemon.wait().expect("wait for the daemon the shim let go");
 }
 
 /// The status query after `ChildExited` can fail; the exit is then a shim failure, not a daemon code.

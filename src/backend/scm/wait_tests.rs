@@ -228,10 +228,11 @@ fn a_daemon_that_exited_right_after_launch_is_a_started_service() {
     }
 }
 
-/// The shim reports `(0, 1003)` before `RUNNING` only when it could not contain or kill the daemon
-/// it launched. That is not a launch to confirm, and the daemon may still be running.
+/// The shim's `(0, 1003)` says it could not show the daemon's tree gone: not a launch to confirm,
+/// and the daemon may still be running. A `Stopped` notification can follow a `RUNNING` the wait
+/// never saw, so the message claims neither when the record was made nor why.
 #[skuld::test]
-fn an_incomplete_stop_record_before_running_is_a_failed_start() {
+fn an_incomplete_stop_record_is_a_failed_start() {
     for joined in [None, Some(QueriedState::StartPending)] {
         let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(Reported::incomplete_stop());
         if let Some(queried) = joined {
@@ -243,6 +244,8 @@ fn an_incomplete_stop_record_before_running_is_a_failed_start() {
         let message = err.to_string();
         assert!(message.contains("failed start"), "{joined:?}: {message}");
         assert!(message.contains("may still be running"), "{joined:?}: {message}");
+        assert!(!message.contains("before reaching Running"), "{joined:?}: {message}");
+        assert!(!message.contains("contained"), "{joined:?}: {message}");
     }
 }
 

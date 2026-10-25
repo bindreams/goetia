@@ -758,9 +758,7 @@ or a command that is missing retries at `restart-delay` indefinitely, as it
 does for `type: managed`. If the shim cannot kill the command on `stop`, it
 logs both failed kills and reports the stop with Win32 code `0`, because a
 non-zero Win32 code would make SCM start a second copy; the service-specific
-code `1003` is the record that the command may still be running. goetia does not
-read that record after a `stop`: `stop` exits `0`, and a later `start` starts a
-second copy.
+code `1003` is the record that the command may still be running.
 
 The shim runs a `type: simple` command inside a Windows Job Object and requires
 one. It cannot assign the job before the command starts: if the assignment fails,
@@ -768,14 +766,18 @@ the command has already run, from its launch until the shim noticed and killed
 it, and anything it started in that time sits outside any job. The shim then
 logs why and reports `0`, `1003`, as for a `stop` it could not complete, because
 no kill of a tree outside a job shows its descendants gone and SCM must not
-restart over a possible survivor. `start` reads that record before the service
-reports running as a failed start, not as a launch.
+restart over a possible survivor. A `start` that sees the service stop with that
+record is a failed start.
 
 Before the shim reports any failure SCM restarts (the command exiting non-zero,
 or the shim's own wait on it failing), it terminates the job, so the restart does
 not overlap descendants the previous run left behind. If the job cannot be
 terminated, it reports `0`, `1003` as for a `stop` it could not complete, and
 refuses a later `stop`.
+
+Nothing guards against that survivor afterwards: `stop` of the stopped service
+exits `0`, and a later `start`, `restart` or `sc start` launches a second copy
+beside it.
 
 "Terminated" means the OS has stopped every thread of the command and its
 descendants, not that it has finished releasing what they held. A restarted
@@ -804,8 +806,8 @@ confirms differs:
   as with `systemctl start`; it is the command's exit, not `start`, that
   reports it. A `start` that lands as SCM is restarting the command, and that
   restart fails (a missing `goetia-shim` or a broken account), is a failed start,
-  as is a service that stops with the shim's `0`, `1003` record before running
-  (the command could not be contained).
+  as is a service that stops with the shim's `0`, `1003` record, whether or not
+  it reported running first.
   For a `type: managed` daemon, which speaks to SCM itself, a
   service that stops before it reports running is a failed start.
 - **launchd** sits between the two: the pid `launchctl kickstart -p` reports

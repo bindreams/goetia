@@ -462,7 +462,7 @@ const WAITER_PANICKED: &str = "the thread waiting on the child panicked";
 
 fn kill_tree_failed(e: &cosca::error::Error) -> String {
     format!(
-        "kill_tree on stop: {e}; falling back to killing the direct child only (its own descendants, if any, \
+        "kill_tree: {e}; falling back to killing the direct child only (its own descendants, if any, \
          cannot be reached without a containment mechanism)"
     )
 }
@@ -471,9 +471,7 @@ fn kill_tree_failed(e: &cosca::error::Error) -> String {
 const NOT_RESTARTED: &str = " — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure";
 
 fn fallback_kill_failed(e: &cosca::error::Error) -> String {
-    format!(
-        "fallback kill on stop: {e}; the daemon was neither killed nor reaped and may still be running{NOT_RESTARTED}"
-    )
+    format!("fallback kill: {e}; the daemon was neither killed nor reaped and may still be running{NOT_RESTARTED}")
 }
 
 fn tree_unkilled() -> String {
