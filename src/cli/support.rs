@@ -242,11 +242,11 @@ pub(crate) struct IdVerbCall<'a> {
     /// | `uninstall` | **0** | artifact absence is exactly what it asks for |
     /// | `stop` | 1 | a running unit whose fragment was deleted keeps running, so `stop x && echo "confirmed down"` would print that with `x` alive |
     /// | `disable` | 1 | disabling after the fragment is gone is impossible, leaving a dangling `.wants` symlink: exit 0 while still enabled at boot |
-    /// | `start`, `restart`, `enable` | 1 | cannot act on what is not there |
+    /// | `start`, `restart`, `enable`, `kill` | 1 | cannot act on what is not there |
     ///
     /// The table is about an *absent* artifact, so it never reaches an id
     /// whose absence was not established: an undetermined id is `4` for all
-    /// six verbs, this flag included.
+    /// seven verbs, this flag included.
     ///
     /// Lives here, never inside the trait: `restart`'s closure calls
     /// `mgr.stop(id)?` before `mgr.start(id)`, and tolerating absence
@@ -264,7 +264,7 @@ pub(crate) struct IdVerbCall<'a> {
 }
 
 /// Shared shape for the id-list mutating verbs (`uninstall`, `start`,
-/// `stop`, `enable`, `disable`, `restart`): check elevation once, obtain
+/// `stop`, `kill`, `enable`, `disable`, `restart`): check elevation once, obtain
 /// the manager once, then call `verb` per id, printing one result line per
 /// id and combining what each id contributed by [`super::report::precedence`] —
 /// the same rule `install`, `diff` and `show` use — except that when

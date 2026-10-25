@@ -27,7 +27,7 @@ use crate::spec::{DaemonSpec, Id};
 
 /// One platform's service manager, seen through the operations Goetia needs.
 ///
-/// `install`/`uninstall`/`enable`/`disable`/`start`/`stop` are the mutating
+/// `install`/`uninstall`/`enable`/`disable`/`start`/`stop`/`kill` are the mutating
 /// verbs; `status`/`list` are read-only. The CLI checks elevation itself
 /// before calling any mutating verb — implementations do not re-check it.
 pub trait ServiceManager {
@@ -36,6 +36,17 @@ pub trait ServiceManager {
     /// install-off-by-default. Routes through [`crate::decide::decide`]; see
     /// that function's doc comment for what each [`crate::decide::Outcome`]
     /// means and when `force` is honored.
+    ///
+    /// Never changes whether the service is running, with one launchd
+    /// exception: a `Create` over a job already loaded under the same label
+    /// (no goetia plist on disk) boots that job out. A changed spec takes
+    /// effect at the service's next start where the platform allows that
+    /// (systemd, SCM). launchd cannot update a loaded job, so `install` returns
+    /// an error and writes nothing; if the job turns out loaded only after the
+    /// write, it restores the previous plist and returns
+    /// [`Error::LoadedJobInDoubt`](crate::error::Error::LoadedJobInDoubt) or
+    /// [`Error::LoadedStateInDoubt`](crate::error::Error::LoadedStateInDoubt)
+    /// (exit `4`).
     fn install(&self, spec: &DaemonSpec, force: bool) -> Result<crate::decide::Outcome>;
 
     /// What [`Self::install`] would do for `spec`, without doing it —
@@ -184,6 +195,26 @@ pub trait ServiceManager {
     ///
     /// [`Error::WaitTimeout`]: crate::Error::WaitTimeout
     fn stop(&self, id: &Id, budget: Budget) -> Result<()>;
+
+    /// End the service's running process as a failure, and return once that is delivered. Does not
+    /// wait for the process to be gone, and does not change its boot-enablement. What happens next
+    /// is the manager's restart policy: a `restart: always` daemon comes back, a `restart: never`
+    /// one stays down.
+    ///
+    /// Addresses the service, never a bare pid: systemd signals the unit's main process with
+    /// `SIGKILL` (`systemctl kill`), launchd signals the job (`launchctl kill`), and SCM, which has
+    /// no kill-by-service call, reads the service's process and terminates it only after SCM
+    /// confirms it is still the service's. Descendants are the manager's to clean up: the cgroup,
+    /// the process group, or `goetia-shim`'s Job Object.
+    ///
+    /// [`Error::NotRunning`] where the service has no process, **classified off the kill request's
+    /// own answer** and never off a state read before it, which would race the kill. Not an
+    /// `Ok(())`: nothing was killed.
+    ///
+    /// Takes no budget, as it waits for nothing.
+    ///
+    /// [`Error::NotRunning`]: crate::Error::NotRunning
+    fn kill(&self, id: &Id) -> Result<()>;
 
     /// The live state of one installed service. `Err` for an id whose blob
     /// will not decode — this must not fabricate a plausible-looking

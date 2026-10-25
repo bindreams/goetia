@@ -2,6 +2,7 @@
 
 pub mod exit_status;
 pub mod generate;
+pub(crate) mod kill;
 #[cfg(windows)]
 pub mod manager;
 // `pub(crate)`, not `pub`: `backend` is `pub` in `lib.rs`, so `pub` here

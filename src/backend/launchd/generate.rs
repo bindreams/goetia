@@ -149,6 +149,29 @@ pub fn extract(plist_text: &str) -> Result<Option<Blob>, Error> {
     }
 }
 
+/// `text` without its metadata comments, each with the line break after it: what is left is the part
+/// of a plist launchd reads. The comment carries the spec and the goetia version, which change
+/// without the rest changing. An unterminated `goetia:begin` is left as it is, with everything after.
+pub(crate) fn without_metadata(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(begin) = rest.find(COMMENT_BEGIN) {
+        let after_begin = begin + COMMENT_BEGIN.len();
+        let Some(end_rel) = rest[after_begin..].find(COMMENT_END) else {
+            break;
+        };
+        out.push_str(&rest[..begin]);
+        let end = after_begin + end_rel + COMMENT_END.len();
+        rest = &rest[end..];
+        rest = rest
+            .strip_prefix("\r\n")
+            .or_else(|| rest.strip_prefix('\n'))
+            .unwrap_or(rest);
+    }
+    out.push_str(rest);
+    out
+}
+
 // XML rendering =======================================================================================================
 
 /// Escape the three characters XML element content cannot contain

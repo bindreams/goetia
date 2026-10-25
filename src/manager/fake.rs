@@ -109,7 +109,7 @@ struct Store {
     prepare_fails: bool,
     /// Whether no manager can be asked — see [`Fake::seed_no_manager`].
     no_manager: bool,
-    /// Every `start`/`stop`/`restart` this Fake was asked to perform, in
+    /// Every `start`/`stop`/`restart`/`kill` this Fake was asked to perform, in
     /// order — see [`Fake::calls`].
     calls: Vec<(&'static str, String)>,
     /// The steps and budget each [`ServiceManager::prepare`] was given, in
@@ -430,7 +430,7 @@ impl Fake {
         state.prepare_fails = true;
     }
 
-    /// Every `start`/`stop`/`restart` this Fake was asked to perform, in order,
+    /// Every `start`/`stop`/`restart`/`kill` this Fake was asked to perform, in order,
     /// recorded when it was *asked* rather than when it succeeded.
     ///
     /// Exists because some assertions are about the **absence** of a call,
@@ -452,7 +452,7 @@ impl Fake {
         state.prepared.clone()
     }
 
-    /// Every `install`/`start`/`stop`/`restart` this Fake was asked for, in
+    /// Every `install`/`start`/`stop`/`restart`/`kill` this Fake was asked for, in
     /// order, each with the steps of every [`Prepared`] still held when it
     /// was asked: whether the preparation that should cover a request did —
     /// the right steps, not yet released.
@@ -810,6 +810,25 @@ impl ServiceManager for Fake {
         if budget.waits() {
             entry.state = State::Stopped;
         }
+        Ok(())
+    }
+
+    /// A running entry becomes [`State::Failed`], with no pid: the Fake models the kill and nothing
+    /// of the restart policy that follows it. Any other state has no process to end.
+    fn kill(&self, id: &Id) -> Result<()> {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.calls.push(("kill", id.as_str().to_string()));
+        state.asked("kill", id);
+        let manager = state.manager();
+        let entry = state.get_mut(id)?;
+        require_ours(entry, id)?;
+        manager?;
+        if entry.state != State::Running {
+            return Err(Error::NotRunning {
+                id: id.as_str().to_string(),
+            });
+        }
+        entry.state = State::Failed;
         Ok(())
     }
 

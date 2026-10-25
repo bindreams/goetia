@@ -339,6 +339,9 @@ impl ServiceManager for FlakyManager {
         }
         self.inner.stop(id, budget)
     }
+    fn kill(&self, id: &Id) -> goetia::Result<()> {
+        self.inner.kill(id)
+    }
     fn status(&self, id: &Id) -> goetia::Result<Status> {
         if self.unqueryable.as_deref() == Some(id.as_str()) {
             return Err(unqueryable_failure());
@@ -1085,6 +1088,9 @@ impl ServiceManager for PanicsOnStart {
     fn stop(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
         self.0.stop(id, budget)
     }
+    fn kill(&self, id: &Id) -> goetia::Result<()> {
+        self.0.kill(id)
+    }
     fn status(&self, id: &Id) -> goetia::Result<Status> {
         self.0.status(id)
     }
@@ -1188,6 +1194,147 @@ fn stop_reaches_the_manager() {
         fake.status(&Id::try_from("frpc").unwrap()).unwrap().state,
         State::Running
     );
+}
+
+#[skuld::test]
+fn kill_reaches_the_manager() {
+    let fake = Fake::new();
+    let spec = mk("frpc");
+    fake.install(&spec, false).unwrap();
+    fake.start(&spec.id, Budget::DEFAULT).unwrap();
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "kill", "frpc"], &fake);
+
+    assert_eq!(
+        code, 0,
+        "stdout:
+{out}
+stderr:
+{err}"
+    );
+    assert_eq!(
+        out,
+        "frpc: kill delivered
+"
+    );
+    assert_eq!(fake.status(&spec.id).unwrap().state, State::Failed);
+}
+
+#[skuld::test]
+fn kill_exits_one_when_the_daemon_is_not_running() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "kill", "frpc"], &fake);
+
+    assert_eq!(
+        code, 1,
+        "stdout:
+{out}
+stderr:
+{err}"
+    );
+    assert_eq!(out, "");
+    assert!(err.contains("frpc") && err.contains("not running"), "{err}");
+}
+
+#[skuld::test]
+fn kill_exits_one_when_the_daemon_is_absent() {
+    let fake = Fake::new();
+
+    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "kill", "ghost"], &fake);
+
+    assert_eq!(code, 1);
+    assert!(err.contains("ghost") && err.contains("not installed"), "{err}");
+}
+
+#[skuld::test]
+fn kill_exits_four_for_an_undetermined_id() {
+    let fake = Fake::new();
+    fake.seed_opaque("opaque");
+
+    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "kill", "opaque"], &fake);
+
+    assert_eq!(code, 4, "{err}");
+    assert!(err.contains("opaque"), "{err}");
+}
+
+#[skuld::test]
+fn kill_refuses_a_foreign_id() {
+    let fake = Fake::new();
+    fake.seed_foreign(
+        "stranger",
+        "not a goetia artifact at all
+",
+    );
+
+    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "kill", "stranger"], &fake);
+
+    assert_eq!(code, 1);
+    assert!(err.contains("not managed by goetia"), "{err}");
+}
+
+#[skuld::test]
+fn kill_needs_elevation_and_asks_nothing_of_the_manager_without_it() {
+    let fake = Fake::new();
+    let spec = mk("frpc");
+    fake.install(&spec, false).unwrap();
+    fake.start(&spec.id, Budget::DEFAULT).unwrap();
+
+    let (code, _out, err) = dispatch_with(&["goetia", "daemon", "kill", "frpc"], &fake, &|| false);
+
+    assert_eq!(code, 1);
+    assert!(err.contains("requires elevation"), "{err}");
+    assert_eq!(fake.status(&spec.id).unwrap().state, State::Running);
+}
+
+/// Every id is tried, and the exit code combines what each contributed: killing the running one is
+/// not undone by the idle one beside it.
+#[skuld::test]
+fn kill_tries_every_id_and_reports_the_worst() {
+    let fake = Fake::new();
+    let running = mk("alpha");
+    fake.install(&running, false).unwrap();
+    fake.start(&running.id, Budget::DEFAULT).unwrap();
+    fake.install(&mk("beta"), false).unwrap();
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "kill", "alpha", "beta"], &fake);
+
+    assert_eq!(
+        code, 1,
+        "stdout:
+{out}
+stderr:
+{err}"
+    );
+    assert_eq!(
+        out,
+        "alpha: kill delivered
+"
+    );
+    assert!(err.contains("beta"), "{err}");
+    assert_eq!(fake.status(&running.id).unwrap().state, State::Failed);
+}
+
+/// `kill` waits for nothing, so it has no wait flags to accept and ignore.
+#[skuld::test]
+fn kill_has_no_wait_flags() {
+    assert!(Cli::try_parse_from(["goetia", "daemon", "kill", "frpc", "--timeout", "1s"]).is_err());
+    assert!(Cli::try_parse_from(["goetia", "daemon", "kill", "frpc", "--no-timeout"]).is_err());
+}
+
+#[skuld::test]
+fn kill_refuses_json_before_running_anything() {
+    let (code, out, _err) = dispatch_get_manager(
+        &["goetia", "--json", "daemon", "kill", "frpc"],
+        &|| panic!("a refused --json subcommand must never obtain a manager"),
+        &|| panic!("a refused --json subcommand must never check elevation"),
+    );
+
+    assert_eq!(code, 2, "{out}");
+    let doc = parse_json(&out);
+    assert_eq!(error_kinds(&doc), ["unsupported"]);
+    assert!(errors(&doc)[0]["message"].as_str().unwrap().contains("kill"), "{doc}");
 }
 
 /// `--no-timeout`, not the default: under a bounded budget, `restart` reads the clock between its
@@ -3001,6 +3148,9 @@ impl ServiceManager for PanicsOnStatus {
     }
     fn stop(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
         self.0.stop(id, budget)
+    }
+    fn kill(&self, id: &Id) -> goetia::Result<()> {
+        self.0.kill(id)
     }
     fn status(&self, id: &Id) -> goetia::Result<Status> {
         panic!("`restart` with no budget must not read state: status({id})")
