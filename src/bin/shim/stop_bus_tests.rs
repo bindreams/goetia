@@ -309,12 +309,20 @@ fn a_waiter_that_is_never_handed_a_child_ends_on_its_own() {
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }
 
-/// A failed `child.wait()` says nothing about the child, so the waiter still reports it done: the
-/// call returns `ChildExited` instead of hanging, with the failure logged.
+/// A failed `child.wait()` says nothing about the child, and a second blocking wait on it would sit
+/// outside the bus, deaf to a stop. So the call tears the daemon down as for a stop and reports the
+/// wait as failed, with the failure logged. The daemon here is long-running: the wait fails while it
+/// lives.
 #[skuld::test]
-fn a_failed_background_wait_is_logged_and_still_wakes_the_stop_bus() {
+fn a_failed_background_wait_kills_the_daemon_and_is_reported_as_a_wait_failure() {
     let id = TestId::new(PREFIX);
-    let mut cmd = cosca::run(["powershell", "-NoProfile", "-NonInteractive", "-Command", "exit 0"]);
+    let mut cmd = cosca::run([
+        "powershell",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Start-Sleep -Seconds 300",
+    ]);
     cmd.contain();
     let bus = Arc::new(StopBus::new());
     // Armed on this thread, which makes the waiter: the hook is read when it is made.
@@ -322,16 +330,56 @@ fn a_failed_background_wait_is_logged_and_still_wakes_the_stop_bus() {
         let _failing = test_hook::waits(Wait::Fail);
         bus.waiter(id.as_str()).expect("make the waiter thread")
     };
-    let child = Arc::new(cmd.spawn().expect("spawn a short-lived child"));
+    let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
 
     let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str());
 
-    assert!(matches!(outcome, WaitOutcome::ChildExited));
+    assert!(
+        matches!(outcome, WaitOutcome::WaitFailed { os_error: None }),
+        "a failed wait was not reported as one"
+    );
+    assert!(
+        child
+            .wait_timeout(Duration::ZERO)
+            .expect("query the child's exit status")
+            .is_some(),
+        "the daemon was left running after its wait failed"
+    );
     assert_one_failure(
         &take(id.as_str()),
         id.as_str(),
         &format!("background wait on child: {WAIT_FAILED}"),
     );
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+/// The same failed wait over a daemon neither kill reaches: nothing is known to have ended it, so it
+/// is the unkillable outcome, which reports a stop SCM does not restart.
+#[skuld::test]
+fn a_failed_background_wait_over_an_unkillable_daemon_is_the_unkillable_outcome() {
+    let id = TestId::new(PREFIX);
+    let mut cmd = cosca::run([
+        "powershell",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Start-Sleep -Seconds 300",
+    ]);
+    cmd.contain();
+    let bus = Arc::new(StopBus::new());
+    let waiter = {
+        let _failing = test_hook::waits(Wait::Fail);
+        bus.waiter(id.as_str()).expect("make the waiter thread")
+    };
+    let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
+
+    let outcome = {
+        let _refused = test_hook::kills(test_hook::Kill::Refuse);
+        bus.wait_for_child_or_stop(waiter, &child, id.as_str())
+    };
+
+    assert!(matches!(outcome, WaitOutcome::StoppingUnkillable));
+    child.kill_tree().expect("kill the daemon the call left running");
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }
 

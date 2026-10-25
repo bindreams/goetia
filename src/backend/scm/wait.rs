@@ -82,6 +82,9 @@ pub trait ScmActor {
     /// returned. Read from that notification, not queried afterwards: a recovery action may have
     /// restarted the service by then.
     fn stopped_exit(&self) -> RecordedExit;
+    /// The `dwWaitHint` of the same notification, in milliseconds. A shim reports `STOPPED` with
+    /// 0; SCM's own failed recovery start leaves 2000 on its `STOPPED` (measured).
+    fn stopped_wait_hint(&self) -> u32;
 }
 
 /// Stop the service, gated strictly on a real `STOPPED` callback from
@@ -156,10 +159,12 @@ pub fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Kind) 
     // Issued even when the arm expired: only the *waiting* is bounded, and a
     // service left unstarted because goetia ran out of budget while arming
     // would be the worst of both answers.
-    match a.start()? {
-        StartReply::AlreadyRunning(QueriedState::Running) => return Ok(Waited::Confirmed),
-        reply => accept_as_started(reply)?,
+    let reply = a.start()?;
+    if reply == StartReply::AlreadyRunning(QueriedState::Running) {
+        return Ok(Waited::Confirmed);
     }
+    accept_as_started(reply)?;
+    let joined_a_start = matches!(reply, StartReply::AlreadyRunning(_));
     if armed == Waited::Expired {
         return Ok(Waited::Expired);
     }
@@ -174,6 +179,16 @@ pub fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Kind) 
             // daemon never ran.
             Some(Observed::Stopped) => {
                 let exit = a.stopped_exit();
+                // An `AlreadyRunning` over `START_PENDING` joined a start that was not ours: SCM's
+                // own recovery start. When that fails SCM reports `STOPPED (0, 0)` with a wait
+                // hint, which the shim never sets; no shim ran.
+                let failed_scm_start =
+                    joined_a_start && (exit.win32, exit.specific) == (0, 0) && a.stopped_wait_hint() != 0;
+                if failed_scm_start {
+                    return Err(io::Error::other(
+                        "service stopped before reaching Running (failed start): SCM's own start of it failed, so no shim or daemon ran",
+                    ));
+                }
                 if kind == Kind::Simple && exit.daemon_ran() {
                     return Ok(Waited::Confirmed);
                 }

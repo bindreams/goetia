@@ -29,6 +29,8 @@ struct FakeScm {
     arm_deadlines: Vec<Deadline>,
     /// What SCM recorded for a `Stopped` the script delivers.
     recorded: RecordedExit,
+    /// The `dwWaitHint` of a `Stopped` the script delivers.
+    wait_hint: u32,
 }
 
 impl FakeScm {
@@ -42,6 +44,7 @@ impl FakeScm {
             deadlines: vec![],
             arm_deadlines: vec![],
             recorded: shim_failed(),
+            wait_hint: 0,
         }
     }
 
@@ -49,6 +52,13 @@ impl FakeScm {
     fn stopped_after(mut self, reported: Reported) -> Self {
         let (win32, specific) = reported.scm_codes();
         self.recorded = RecordedExit { win32, specific };
+        self
+    }
+
+    /// A delivered `Stopped` is SCM's own: it records `(0, 0)` and leaves `wait_hint` behind.
+    fn stopped_by_scm_with_wait_hint(mut self, wait_hint: u32) -> Self {
+        self.recorded = RecordedExit { win32: 0, specific: 0 };
+        self.wait_hint = wait_hint;
         self
     }
 
@@ -110,6 +120,9 @@ impl ScmActor for FakeScm {
     }
     fn stopped_exit(&self) -> RecordedExit {
         self.recorded
+    }
+    fn stopped_wait_hint(&self) -> u32 {
+        self.wait_hint
     }
 }
 
@@ -217,6 +230,33 @@ fn a_daemon_that_exited_right_after_launch_is_a_started_service() {
             "{reported:?}"
         );
     }
+}
+
+/// A `start` that lands as SCM's queued recovery start fires gets 1056 over `START_PENDING`. If
+/// that attempt fails (missing ImagePath, broken account) SCM reports `STOPPED (0, 0)` with a
+/// wait hint of 2000, and no shim ever ran.
+#[skuld::test]
+fn a_failed_scm_recovery_start_that_a_start_joined_is_a_failed_start() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)])
+        .already_running(QueriedState::StartPending)
+        .stopped_by_scm_with_wait_hint(2000);
+
+    let err = start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap_err();
+
+    assert!(err.to_string().contains("failed start"), "{err}");
+}
+
+/// The same `(0, 0)` with no wait hint is the shim's clean report: the daemon ran and ended.
+#[skuld::test]
+fn a_clean_daemon_exit_that_a_start_joined_is_still_a_started_service() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)])
+        .already_running(QueriedState::StartPending)
+        .stopped_after(Reported::Clean);
+
+    assert_eq!(
+        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        Waited::Confirmed
+    );
 }
 
 #[skuld::test]

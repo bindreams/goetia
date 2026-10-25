@@ -728,9 +728,11 @@ clean exit is never restarted, and a stop reports a clean exit.
 Nothing cancels a restart SCM has queued, and `goetia daemon stop` does not
 look for one. A command that failed and is waiting out `restart-delay` finds
 the service already stopped, so `stop` exits `0` and the daemon is started when
-the delay ends. A command that fails at the moment a `stop` arrives is restarted
-the same way: SCM cannot tell that stop from the crash. `goetia daemon uninstall`
-is not affected: deleting the service cancels a restart SCM has queued.
+the delay ends. A command that fails before a `stop` arrives is restarted the
+same way, because `stop` finds the service already stopped. One that fails after
+the stop is requested reports a clean stop, which SCM does not restart.
+`goetia daemon uninstall` is not affected: deleting the service cancels a
+restart SCM has queued.
 
 After upgrading goetia, run `goetia daemon install` again for every daemon
 installed by an older version. Services registered before this shim existed
@@ -777,7 +779,9 @@ confirms differs:
   cannot start is a failed start under every `restart:` policy. A command that
   starts and then exits at once is a successful start, whatever its exit code,
   as with `systemctl start`; it is the command's exit, not `start`, that
-  reports it. For a `type: managed` daemon, which speaks to SCM itself, a
+  reports it. A `start` that lands as SCM is restarting the command, and that
+  restart fails (a missing `goetia-shim` or a broken account), is a failed start.
+  For a `type: managed` daemon, which speaks to SCM itself, a
   service that stops before it reports running is a failed start.
 - **launchd** sits between the two: the pid `launchctl kickstart -p` reports
   is launchd's own fork, taken before the user process reaches its `exec`.
