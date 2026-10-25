@@ -100,6 +100,23 @@ fn a_recorded_daemon_exit_means_the_daemon_was_launched() {
 }
 
 #[skuld::test]
+fn only_the_incomplete_stop_report_reads_back_as_an_incomplete_stop() {
+    let record = |reported: Reported| {
+        let (win32, specific) = reported.scm_codes();
+        RecordedExit { win32, specific }
+    };
+
+    assert!(record(Reported::incomplete_stop()).is_incomplete_stop());
+    for reported in [
+        Reported::Clean,
+        Reported::from_daemon_code(ERROR_CAN_NOT_COMPLETE as i32),
+        Reported::shim_failure(Some(ERROR_CAN_NOT_COMPLETE as i32)),
+    ] {
+        assert!(!record(reported).is_incomplete_stop(), "{reported:?}");
+    }
+}
+
+#[skuld::test]
 fn a_recorded_shim_failure_means_the_daemon_never_ran() {
     for reported in [
         Reported::shim_failure(None),

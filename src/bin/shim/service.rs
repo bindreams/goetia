@@ -27,7 +27,7 @@ use windows_sys::Win32::System::Services::{
 };
 
 use crate::logging;
-use crate::stop_bus::{StopBus, Teardown, WaitOutcome, Waiter, kill_for_stop, terminate_failed_tree};
+use crate::stop_bus::{StopBus, WaitOutcome, Waiter, kill_for_stop, terminate_failed_tree};
 
 // Entry ===============================================================================================================
 
@@ -270,7 +270,9 @@ fn launch(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str) -> Result<(Arc<C
 /// The daemon, if a Job Object contains it. `type: simple` is stopped, and restarted after a
 /// failure, only by terminating its whole tree, which `cosca` can guarantee only with a job: when
 /// assigning the job fails it falls back to a process-tree walk that cannot say whether a
-/// descendant was killed. Any other containment is a start failure: the daemon is killed, never run.
+/// descendant was killed. Any other containment is a start failure: the daemon is killed, but
+/// that kill proves nothing about its descendants, so the record is the incomplete stop whatever
+/// the kill returned. SCM never restarts over it, and `start` reads it as a failed start.
 fn require_job_object(child: Child, spec: &DaemonSpec, id: &str) -> Result<Child, Reported> {
     let containment = containment_of(&child);
     if containment == Containment::JobObject {
@@ -278,10 +280,8 @@ fn require_job_object(child: Child, spec: &DaemonSpec, id: &str) -> Result<Child
     }
     logging::log_failure(id, &not_job_contained(&spec.command, containment));
     // Dropping the child as well kills its tree and waits for it.
-    match kill_for_stop(&child, id) {
-        Teardown::Failed => Err(Reported::incomplete_stop()),
-        Teardown::Tree | Teardown::ChildOnly => Err(Reported::shim_failure(None)),
-    }
+    kill_for_stop(&child, id);
+    Err(Reported::incomplete_stop())
 }
 
 /// The containment `cosca` achieved, as its own function so a test can make it differ.
@@ -316,7 +316,7 @@ fn thread_refused(command: &[String], e: &std::io::Error) -> String {
 
 fn not_job_contained(command: &[String], containment: Containment) -> String {
     format!(
-        "the daemon {command:?} was contained by {containment}, not a job object: `type: simple` needs a job object to terminate its whole tree, so it was killed and nothing of it runs"
+        "the daemon {command:?} was contained by {containment}, not a job object: `type: simple` needs a job object to terminate its whole tree. The daemon ran from its launch, and no kill of it shows that its descendants are gone, so it is reported as possibly still running"
     )
 }
 

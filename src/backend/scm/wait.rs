@@ -142,7 +142,8 @@ fn accept_as_started(reply: StartReply) -> io::Result<()> {
 ///
 /// A terminal `Stopped` before `Running` is read by `kind`. For `type: simple` it is a start when
 /// the shim launched the daemon and the daemon then ended (the recorded exit is the shim's own
-/// vocabulary, see [`RecordedExit::daemon_ran`]). A `type: managed` service speaks SCM itself, and
+/// vocabulary, see [`RecordedExit::daemon_ran`]), except the incomplete-stop record, which means the
+/// daemon could not be contained and may still be running. A `type: managed` service speaks SCM itself, and
 /// stopping with a service-specific code before `Running` is how it reports a failed start, so for
 /// it any `Stopped` before `Running` is a failed start.
 ///
@@ -187,6 +188,13 @@ pub fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Kind) 
                 if failed_scm_start {
                     return Err(io::Error::other(
                         "service stopped before reaching Running (failed start): SCM's own start of it failed, so no shim or daemon ran",
+                    ));
+                }
+                // The shim's `(0, 1003)` before `RUNNING` is its report that it could neither contain
+                // nor kill the daemon it launched: not a launch to confirm.
+                if kind == Kind::Simple && exit.is_incomplete_stop() {
+                    return Err(io::Error::other(
+                        "service stopped before reaching Running (failed start): the daemon could not be contained, and may still be running",
                     ));
                 }
                 if kind == Kind::Simple && exit.daemon_ran() {

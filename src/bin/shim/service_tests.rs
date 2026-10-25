@@ -544,10 +544,15 @@ fn a_clean_exit_does_not_terminate_the_tree() {
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }
 
+/// The line logged when the daemon is not job-contained, whatever the kill then does.
+const NOT_JOB_CONTAINED: &str = r#"the daemon ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"] was contained by process-tree walk, not a job object: `type: simple` needs a job object to terminate its whole tree. The daemon ran from its launch, and no kill of it shows that its descendants are gone, so it is reported as possibly still running"#;
+
 /// `type: simple` needs a Job Object to terminate the daemon's whole tree. A daemon contained any
-/// other way is killed at once and the start fails, with nothing reported RUNNING.
+/// other way is killed and the start fails with nothing reported RUNNING. No kill proves a
+/// non-job tree gone, so the record is the incomplete stop (never restartable), whatever the kill
+/// returned.
 #[skuld::test]
-fn a_daemon_without_job_object_containment_is_killed_and_not_run() {
+fn a_daemon_without_job_object_containment_is_killed_and_reported_possibly_running() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
     let stop_bus = Arc::new(StopBus::new());
@@ -560,18 +565,35 @@ fn a_daemon_without_job_object_containment_is_killed_and_not_run() {
         })
     };
 
-    assert_eq!(reported, Reported::shim_failure(None));
+    assert_eq!(reported, Reported::incomplete_stop());
     assert_eq!(running_reports, 0, "RUNNING was reported for an uncontained daemon");
     assert_eq!(
         test_hook::spawned().expect("the daemon was spawned").is_alive(),
         Liveness::Dead,
         "the uncontained daemon was left running"
     );
-    assert_one_failure(
-        &take(id.as_str()),
-        id.as_str(),
-        r#"the daemon ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"] was contained by process-tree walk, not a job object: `type: simple` needs a job object to terminate its whole tree, so it was killed and nothing of it runs"#,
-    );
+    assert_one_failure(&take(id.as_str()), id.as_str(), NOT_JOB_CONTAINED);
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+/// The same when `kill_tree` fails and only the direct child is killed: the descendants were never
+/// reached, so this is no more restartable than a kill that reports success.
+#[skuld::test]
+fn an_uncontained_daemon_whose_tree_kill_failed_is_reported_possibly_running() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+
+    let reported = {
+        let _degraded = test_hook::containment_is(Containment::TreeWalk);
+        let _tree_refused = kills(Kill::RefuseTree);
+        run_daemon(&spec(dir.path(), id.as_str()), &stop_bus, id.as_str(), || {})
+    };
+
+    assert_eq!(reported, Reported::incomplete_stop());
+    let lines = take(id.as_str());
+    assert_eq!(lines.len(), 2, "the containment and the refused kill_tree: {lines:?}");
+    assert_one_failure(&lines[..1], id.as_str(), NOT_JOB_CONTAINED);
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }
 
@@ -595,6 +617,7 @@ fn an_uncontained_daemon_that_cannot_be_killed_is_the_incomplete_stop_record() {
         3,
         "the containment, kill_tree and the fallback kill: {lines:?}"
     );
+    assert_one_failure(&lines[..1], id.as_str(), NOT_JOB_CONTAINED);
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }
 
