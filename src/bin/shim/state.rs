@@ -168,7 +168,7 @@ fn failure_not_recorded(store: &Store, e: &std::io::Error) -> String {
 
 fn launch_not_recorded(store: &Store, why: &str) -> String {
     format!(
-        "could not record the daemon in {}: {why}; the daemon is stopped rather than run where goetia cannot see it, and the service fails",
+        "could not record the daemon in {}: {why}; the daemon is stopped rather than run where goetia cannot see it, and the service fails. If this service was registered by an older goetia, run `goetia daemon install` again",
         store.path.display()
     )
 }

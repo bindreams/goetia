@@ -744,10 +744,12 @@ the same way.
 
 `stop` finds out whether a restart is queued differently for the two types.
 
-**`type: simple`.** The shim writes a record to
-`%ProgramData%\Goetia\state\<id>` just before it reports a failure to SCM:
-when it failed, and when the restart SCM queues for it is due, read from the
-service's recovery actions at that moment. `stop` refuses (exit `4`, as above)
+**`type: simple`.** Each service has a directory of its own,
+`%ProgramData%\Goetia\state\svc-<id>`, which `goetia daemon install` creates
+and closes to every account but `SYSTEM`, the Administrators and the one
+account the service runs as. The shim writes a record there just before it
+reports a failure to SCM: when it failed, and when the restart SCM queues for it
+is due, read from the service's recovery actions at that moment. `stop` refuses (exit `4`, as above)
 from the failure until `restart-delay` and one second more have passed, and for
 longer while the service is still stopped with a failure, because SCM has not
 started it yet. It goes by the record, not by the recovery actions as they are
@@ -764,21 +766,28 @@ now:
   delay has passed.
 - A service whose start type is `Disabled` is never refused: SCM's restart
   attempt fails.
-- A record from before the last boot is ignored, and a run that starts at or
-  after the restart's due time (the restart itself) spends it.
-- If the shim could not read the recovery actions, the record says so, and
-  `stop` refuses until the service next starts.
+- A record from before the last boot is ignored, whatever account wrote it,
+  and a run that starts at or after the restart's due time (the restart itself)
+  spends it.
+- If the shim cannot read its recovery actions, it records the ones
+  `goetia daemon install` registered the service with, which the service
+  directory also holds. Only when it has neither does the record say the delay
+  is unknown, and then a start does not spend it (a start by hand does not
+  cancel what SCM queued): `stop` refuses, with exit `4`, until the host boots
+  again or the service is uninstalled.
 
 The record is written by the shim, so a service installed by an earlier goetia
 has none until `goetia daemon install` is run again, and `stop` takes nothing
 to be pending for it. `goetia daemon kill` writes the record itself, just before
 it ends the shim, so a `stop` during the delay that follows is refused like any
-other. A shim that is ended some other way (`taskkill`) or crashes writes
-nothing, and leaves SCM's record of a process that ended without reporting
-(`1067`), which the shim never reports itself. For that record `stop` goes by
-the recovery actions as they are now, as it does for `type: managed`: refused if
-the service restarts on failure and is not `Disabled`. If the shim cannot write
-the file it logs that, and `stop` does not see the failures it could not record.
+other; it records the restart SCM queues for a process that ends without
+reporting, which SCM restarts whatever the failure-actions flag says. A shim that
+is ended some other way (`taskkill`) or crashes writes nothing, and leaves SCM's
+record of a process that ended without reporting (`1067`), which the shim never
+reports itself. For that record `stop` goes by the recovery actions as they are
+now, as it does for `type: managed`: refused if the service restarts on failure
+and is not `Disabled`. If the shim cannot write the record it logs that, and
+`stop` does not see the failures it could not record.
 
 **`type: managed`.** There is no shim, so `stop` goes by the record SCM keeps of
 how the service last ended and by the service's recovery actions as they are
@@ -817,15 +826,18 @@ stops any daemon that a restart started in the meantime. A daemon that fails as
 soon as it starts can still be uninstalled. If that last stop cannot be
 confirmed, `uninstall` exits `1` having already deleted the service, which
 Windows removes when the daemon's process ends. It also removes the shim's state
-file for a `type: simple` daemon, except while the file names a daemon that
-`stop` could not kill and that is still running (see below): then it keeps the
-file, without the pending restart, so installing the same id again and starting
-it cannot run a second copy.
+directory for a `type: simple` daemon, except while the record names a daemon
+that `stop` could not kill and that is still running (see below): then it keeps
+the record, without the pending restart, so installing the same id again and
+starting it cannot run a second copy.
 
 After upgrading goetia, run `goetia daemon install` again for every daemon
-installed by an older version. Services registered before this shim existed
-have no recovery actions until then, so the new shim runs them but SCM does
-not restart them, and no state file, so `stop` sees no queued restart for them.
+installed by an older version. A service registered before the shim kept a state
+directory has none, and the shim does not run a daemon it cannot record (see
+below): the service fails to start, with the error `3` (the system cannot find
+the path specified) and a line in its log that says to install again. Services
+registered before the shim existed also have no recovery actions until then, so
+SCM does not restart them.
 On every start, the shim logs one warning (in the log file and
 as a warning in the Windows Event Log) when it starts under a service that a
 different goetia version registered and `restart` is not `never`.
@@ -845,25 +857,35 @@ or a command that is missing retries at `restart-delay` indefinitely, as it
 does for `type: managed`. If the shim cannot kill the command on `stop`, it
 logs both failed kills and reports the stop with Win32 code `0`, because a
 non-zero Win32 code would make SCM start a second copy; the service-specific
-code `1003` is the record that the command may still be running, and the shim
-also writes the surviving process (its pid and creation time) to the state file.
-goetia reads the state file, not the `1003` record, which outlives the process:
-`stop` exits `1` saying the command may still be running while that process
-runs, `start` and `restart` do not start a second copy (they exit `1` and name
-its pid), and `uninstall` deletes the service and then exits `1` with the same
-message. Once the process is gone, `stop` and `start` work again. If the shim
-could not write the state file, there is no process to watch: the `1003` record
-stands alone, so goetia treats the command as possibly still running until you
-stop it yourself and start the service with `sc start`. The
-shim makes the same check as it starts, so `sc start` is no way around it: the
-shim does not launch a second command, logs the pid and what to do, and reports
-Win32 code `1056`. Under `restart: on-failure` SCM then retries the start at
-`restart-delay`, and the command starts by itself once the process is gone.
+code `1003` is the record that the command may still be running. The shim writes
+the process it launched (its pid and creation time) to the service's state
+directory before it reports the service running, and forgets it once the process
+is known to have ended, so a stop that could not kill it leaves it recorded.
+goetia reads that record, not the `1003` status, which outlives the process, and
+it reads it for every service that has a state directory, whatever its type and
+even when its spec cannot be read. While the service is stopped and the recorded
+process runs, `stop` exits `1` saying the command may still be running, `start`
+and `restart` do not start a second copy (they exit `1` and name its pid), and
+`uninstall` deletes the service and then exits `1` with the same message. Once
+the process is gone, `stop` and `start` work again. The shim makes the same check
+as it starts, so `sc start` is no way around it: the shim does not launch a
+second command, logs the pid and what to do, and reports Win32 code `1056`. Under
+`restart: on-failure` SCM then retries the start at `restart-delay`, and the
+command starts by itself once the process is gone.
 
-The `1003` record is the shim's, so goetia reads it only for `type: simple`; the
-same pair from a `type: managed` service, which speaks to SCM itself, is judged
-like any other stop. A service whose spec goetia cannot read is taken for
-`type: simple` here, so a start is refused rather than risk a second copy.
+If the shim cannot record the process it launched (a full disk, a directory it
+may not write to), it does not leave the command running unseen: it kills the
+command, logs why, and fails the service with the error of the write, without
+ever reporting it running. Only if that kill fails too is the command left
+running with the `1003` status alone to say so; with no recorded process to
+watch, goetia then treats the command as possibly still running until you stop
+it yourself and start the service with `sc start`.
+
+The `1003` status is the shim's, so goetia reads it alone only for `type:
+simple`; the same pair from a `type: managed` service, which speaks to SCM
+itself, is judged like any other stop. A service whose spec goetia cannot read
+is taken for `type: simple` here, so a start is refused rather than risk a
+second copy.
 
 A service that refuses the stop control with no change of state to explain it,
 such as a `type: managed` service that reports running and answers `STOP` with an
@@ -967,8 +989,8 @@ It addresses the service, never a bare pid:
 
 On Windows with `type: simple` the service's process is `goetia-shim`; its Job
 Object ends the daemon and its descendants with it. `kill` first records the
-failure in the shim's state file, as the shim does for its own, so a `stop` during
-the restart delay is refused.
+failure in the service's state directory, as the shim does for its own, so a
+`stop` during the restart delay is refused.
 
 On Windows a process that is already terminating (a second `kill`, or a daemon
 dying on its own) is waited for until it exits, with no time limit. When that

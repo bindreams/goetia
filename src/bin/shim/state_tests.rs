@@ -298,7 +298,7 @@ fn a_launch_that_cannot_be_written_is_logged_with_the_consequence_and_reports_th
         "{line}"
     );
     assert!(
-        line.ends_with("; the daemon is stopped rather than run where goetia cannot see it, and the service fails"),
+        line.ends_with("; the daemon is stopped rather than run where goetia cannot see it, and the service fails. If this service was registered by an older goetia, run `goetia daemon install` again"),
         "{line}"
     );
 }

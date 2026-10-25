@@ -2377,7 +2377,7 @@ fn only_a_1067_falls_back_on_the_status_rule() {
     assert_eq!(fake.recovery_reads, 0);
 }
 
-// the daemon the last run launched: the state file decides whether it may still run ----------------------------------
+// the daemon the last run launched: the state file decides whether it may still run -----------------------------------
 
 /// The status record of an incomplete stop outlives the daemon. A service stopped with it whose
 /// recorded daemon is gone is stopped, for every stop path, whether or not it has a shim state.
