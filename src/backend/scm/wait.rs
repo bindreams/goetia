@@ -186,7 +186,7 @@ fn stopped_result(exit: RecordedExit, kind: StopKind) -> StopWaited {
 /// writes it, so only `type: simple` reads it; a `type: managed` service speaks SCM itself and may
 /// report any pair.
 fn incomplete_stop(exit: RecordedExit, kind: Kind) -> bool {
-    kind == Kind::Simple && exit.incomplete_stop()
+    kind == Kind::Simple && exit.is_incomplete_stop()
 }
 
 /// How a stop reads the service it stops.
@@ -727,7 +727,8 @@ fn accept_as_started(reply: StartReply) -> io::Result<()> {
 ///
 /// A terminal `Stopped` before `Running` is read by `kind`. For `type: simple` it is a start when
 /// the shim launched the daemon and the daemon then ended (the recorded exit is the shim's own
-/// vocabulary, see [`RecordedExit::daemon_ran`]). A `type: managed` service speaks SCM itself, and
+/// vocabulary, see [`RecordedExit::daemon_ran`]), except the incomplete-stop record, which means the
+/// daemon could not be contained and may still be running. A `type: managed` service speaks SCM itself, and
 /// stopping with a service-specific code before `Running` is how it reports a failed start, so for
 /// it any `Stopped` before `Running` is a failed start. `record` reads the exit record of a service
 /// found stopped, for the refusal over a survivor (see [`refuse_over_a_survivor`]); it differs from
@@ -775,6 +776,13 @@ pub fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Kind, 
                 if failed_scm_start {
                     return Err(io::Error::other(
                         "service stopped before reaching Running (failed start): SCM's own start of it failed, so no shim or daemon ran",
+                    ));
+                }
+                // The shim's `(0, 1003)` before `RUNNING` is its report that it could neither contain
+                // nor kill the daemon it launched: not a launch to confirm.
+                if incomplete_stop(exit, kind) {
+                    return Err(io::Error::other(
+                        "service stopped before reaching Running (failed start): the daemon could not be contained, and may still be running",
                     ));
                 }
                 if kind == Kind::Simple && exit.daemon_ran() {

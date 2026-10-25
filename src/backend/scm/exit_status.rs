@@ -98,17 +98,18 @@ pub struct RecordedExit {
 }
 
 impl RecordedExit {
-    /// Whether this is [`Reported::IncompleteStop`]: a commanded stop that could not kill the
-    /// daemon, which may still be running.
-    pub fn incomplete_stop(self) -> bool {
-        (self.win32, self.specific) == Reported::IncompleteStop.scm_codes()
-    }
-
     /// Whether the shim launched the daemon and the daemon then ended: a daemon exit
     /// ([`Reported::Clean`], [`Reported::DaemonExit`], [`Reported::IncompleteStop`]). Any other
     /// Win32 code is a shim failure before or around the launch.
     pub fn daemon_ran(self) -> bool {
         self.win32 == 0 || self.win32 == ERROR_SERVICE_SPECIFIC_ERROR
+    }
+
+    /// Whether this is [`Reported::IncompleteStop`]'s record: the shim could not kill a daemon it
+    /// launched, which may still be running. A daemon that itself exits 1003 is
+    /// [`ERROR_SERVICE_SPECIFIC_ERROR`] with specific 1003, not this.
+    pub fn is_incomplete_stop(self) -> bool {
+        (self.win32, self.specific) == Reported::IncompleteStop.scm_codes()
     }
 }
 

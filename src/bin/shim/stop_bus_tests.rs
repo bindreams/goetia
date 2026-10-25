@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use super::test_hook::{CONFIRM_REFUSED, KILL_REFUSED, WAIT_FAILED, Wait, WaiterEnd, waiter_end};
+use super::test_hook::{KILL_REFUSED, WAIT_FAILED, Wait, WaiterEnd, waiter_end};
 use super::*;
 use crate::logging::test_hook::take;
 use crate::test_support::{TestId, assert_one_failure};
@@ -533,49 +533,8 @@ fn a_stop_wins_over_a_failed_background_wait() {
     assert_dead(&child);
 }
 
-/// The failed wait said nothing about the daemon, and the kill's return does not say it is gone: a
-/// restartable failure is reported only after a fresh wait on the process returns. When that wait
-/// fails too the daemon may still be running, and SCM must not start a second copy.
-#[skuld::test]
-fn a_failed_background_wait_whose_kill_could_not_be_confirmed_is_not_a_restartable_failure() {
-    let id = TestId::new(PREFIX);
-    let mut cmd = sleeper();
-    let bus = Arc::new(StopBus::new());
-    let waiter = {
-        let _failing = test_hook::waits(Wait::Fail(None));
-        bus.waiter(id.as_str()).expect("make the waiter thread")
-    };
-    let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
-
-    let outcome = {
-        let _unconfirmed = test_hook::confirmations_fail();
-        bus.wait_for_child_or_stop(waiter, &child, id.as_str())
-    };
-
-    assert!(
-        matches!(outcome, WaitOutcome::DaemonMayRun),
-        "a daemon not confirmed gone was reported as a restartable failure"
-    );
-    // The kill itself worked; only the confirmation was refused.
-    assert_dead(&child);
-    let lines = take(id.as_str());
-    assert_eq!(lines.len(), 2, "the wait failure and the unconfirmed exit: {lines:?}");
-    assert_one_failure(
-        &lines[..1],
-        id.as_str(),
-        &format!("background wait on child: {WAIT_FAILED}"),
-    );
-    assert_one_failure(
-        &lines[1..],
-        id.as_str(),
-        &format!(
-            "confirm the daemon ended after the background wait failed: {CONFIRM_REFUSED}; the daemon may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure"
-        ),
-    );
-}
-
-/// With only the direct child killed, the daemon's descendants were not reached, so the tree is not
-/// confirmed gone and the failed wait is not a restartable failure.
+/// With only the direct child killed, the daemon's descendants were not reached, so the failed wait
+/// is not a restartable failure.
 #[skuld::test]
 fn a_failed_background_wait_whose_tree_kill_failed_is_not_a_restartable_failure() {
     let id = TestId::new(PREFIX);
@@ -611,7 +570,65 @@ fn a_failed_background_wait_whose_tree_kill_failed_is_not_a_restartable_failure(
     assert_one_failure(
         &lines[2..],
         id.as_str(),
-        "the daemon's descendants were not confirmed ended after the background wait failed: only the direct child was killed; the daemon may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure",
+        "the daemon's descendants were not killed after the background wait failed: only the direct child was killed; the daemon may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure",
+    );
+}
+
+/// A failed wait that ends in `DaemonMayRun` is a decided failure: a stop arriving afterwards must be
+/// refused, not acknowledged over a daemon that may be running.
+#[skuld::test]
+fn a_failed_wait_over_an_unkillable_daemon_refuses_a_later_stop() {
+    let id = TestId::new(PREFIX);
+    let mut cmd = sleeper();
+    let bus = Arc::new(StopBus::new());
+    let waiter = {
+        let _failing = test_hook::waits(Wait::Fail(None));
+        bus.waiter(id.as_str()).expect("make the waiter thread")
+    };
+    let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
+
+    let outcome = {
+        let _refused = test_hook::kills(test_hook::Kill::Refuse);
+        bus.wait_for_child_or_stop(waiter, &child, id.as_str())
+    };
+
+    assert!(matches!(outcome, WaitOutcome::DaemonMayRun));
+    assert!(
+        !bus.request_stop(),
+        "a stop was acknowledged over a daemon that may still be running"
+    );
+    child.kill_tree().expect("kill the daemon the call left running");
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+    assert_eq!(take(id.as_str()).len(), 3, "the wait failure and both refused kills");
+}
+
+/// The same when only the tree kill is refused and the direct child's kill works.
+#[skuld::test]
+fn a_failed_wait_whose_tree_kill_was_refused_refuses_a_later_stop() {
+    let id = TestId::new(PREFIX);
+    let mut cmd = sleeper();
+    let bus = Arc::new(StopBus::new());
+    let waiter = {
+        let _failing = test_hook::waits(Wait::Fail(None));
+        bus.waiter(id.as_str()).expect("make the waiter thread")
+    };
+    let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
+
+    let outcome = {
+        let _refused = test_hook::kills(test_hook::Kill::RefuseTree);
+        bus.wait_for_child_or_stop(waiter, &child, id.as_str())
+    };
+
+    assert!(matches!(outcome, WaitOutcome::DaemonMayRun));
+    assert!(
+        !bus.request_stop(),
+        "a stop was acknowledged over a daemon whose tree may still be running"
+    );
+    assert_dead(&child);
+    assert_eq!(
+        take(id.as_str()).len(),
+        3,
+        "the wait failure, the tree kill and the unkilled descendants"
     );
 }
 

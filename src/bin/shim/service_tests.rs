@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use cosca::Containment;
 use cosca::identity::Liveness;
 use goetia::backend::scm::exit_status::{
     ERROR_CAN_NOT_COMPLETE, ERROR_GEN_FAILURE, ERROR_SERVICE_SPECIFIC_ERROR, Reported,
@@ -18,9 +19,7 @@ use windows_sys::Win32::System::Services::SERVICE_STOPPED;
 use super::*;
 use crate::logging::test_hook::{take, take_warnings};
 use crate::stop_bus::test_hook as waiter_threads;
-use crate::stop_bus::test_hook::{
-    CONFIRM_REFUSED, KILL_REFUSED, Kill, WAIT_FAILED, Wait, WaiterEnd, confirmations_fail, kills, waiter_end, waits,
-};
+use crate::stop_bus::test_hook::{KILL_REFUSED, Kill, WAIT_FAILED, Wait, WaiterEnd, kills, waiter_end, waits};
 use crate::test_support::{TestId, assert_one_failure};
 
 const PREFIX: &str = "goetia-shim-launch-test";
@@ -465,24 +464,160 @@ fn a_failed_wait_with_no_os_error_is_the_generic_shim_failure() {
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }
 
-/// A daemon not confirmed gone must not be reported as a failure SCM restarts: the restart would
-/// start a second copy beside it.
+/// A daemon whose tree could not be killed must not be reported as a failure SCM restarts: the
+/// restart would start a second copy beside it. The failure is decided, so a stop is refused too.
 #[skuld::test]
-fn a_failed_wait_over_a_daemon_not_confirmed_gone_is_the_incomplete_stop_record() {
+fn a_failed_wait_over_an_unkillable_daemon_is_the_incomplete_stop_record() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
     let stop_bus = Arc::new(StopBus::new());
 
     let reported = {
         let _failing = waits(Wait::Fail(None));
-        let _unconfirmed = confirmations_fail();
+        let _refused = kills(Kill::Refuse);
+        run_daemon(&spec(dir.path(), id.as_str()), &stop_bus, id.as_str(), || {})
+    };
+
+    assert_eq!(reported, Reported::incomplete_stop());
+    assert!(
+        !stop_bus.request_stop(),
+        "a stop was acknowledged over a daemon that may still be running"
+    );
+    let lines = take(id.as_str());
+    assert_eq!(lines.len(), 3, "the wait failure and both refused kills: {lines:?}");
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+/// The daemon has failed, so SCM will restart it: its tree is terminated first, so that the restart
+/// does not overlap descendants the previous run left. When the tree cannot be terminated the
+/// restart must not happen.
+#[skuld::test]
+fn a_failing_daemon_whose_tree_cannot_be_terminated_is_the_incomplete_stop_record() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+
+    let reported = {
+        let _refused = kills(Kill::Refuse);
+        run_daemon(
+            &powershell(dir.path(), id.as_str(), "exit 7"),
+            &stop_bus,
+            id.as_str(),
+            || {},
+        )
+    };
+
+    assert_eq!(reported, Reported::incomplete_stop());
+    assert!(
+        !stop_bus.request_stop(),
+        "a stop was acknowledged over a daemon whose tree may still be running"
+    );
+    assert_one_failure(
+        &take(id.as_str()),
+        id.as_str(),
+        &format!(
+            "kill_tree after the daemon failed: {KILL_REFUSED}; its descendants may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure"
+        ),
+    );
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+/// A clean exit is not restarted, so nothing is terminated for it.
+#[skuld::test]
+fn a_clean_exit_does_not_terminate_the_tree() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+
+    let reported = {
+        let _refused = kills(Kill::Refuse);
+        run_daemon(
+            &powershell(dir.path(), id.as_str(), "exit 0"),
+            &stop_bus,
+            id.as_str(),
+            || {},
+        )
+    };
+
+    assert_eq!(reported, Reported::Clean);
+    assert_eq!(take(id.as_str()), Vec::<String>::new(), "a clean exit attempted a kill");
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+/// The line logged when the daemon is not job-contained, whatever the kill then does.
+const NOT_JOB_CONTAINED: &str = r#"the daemon ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"] was contained by process-tree walk, not a job object: `type: simple` needs a job object to terminate its whole tree. The daemon ran from its launch, and no kill of it shows that its descendants are gone, so it is reported as possibly still running"#;
+
+/// `type: simple` needs a Job Object to terminate the daemon's whole tree. A daemon contained any
+/// other way is killed and the start fails with nothing reported RUNNING. No kill proves a
+/// non-job tree gone, so the record is the incomplete stop (never restartable), whatever the kill
+/// returned.
+#[skuld::test]
+fn a_daemon_without_job_object_containment_is_killed_and_reported_possibly_running() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+    let mut running_reports = 0;
+
+    let reported = {
+        let _degraded = test_hook::containment_is(Containment::TreeWalk);
+        run_daemon(&spec(dir.path(), id.as_str()), &stop_bus, id.as_str(), || {
+            running_reports += 1
+        })
+    };
+
+    assert_eq!(reported, Reported::incomplete_stop());
+    assert_eq!(running_reports, 0, "RUNNING was reported for an uncontained daemon");
+    assert_eq!(
+        test_hook::spawned().expect("the daemon was spawned").is_alive(),
+        Liveness::Dead,
+        "the uncontained daemon was left running"
+    );
+    assert_one_failure(&take(id.as_str()), id.as_str(), NOT_JOB_CONTAINED);
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+/// The same when `kill_tree` fails and only the direct child is killed: the descendants were never
+/// reached, so this is no more restartable than a kill that reports success.
+#[skuld::test]
+fn an_uncontained_daemon_whose_tree_kill_failed_is_reported_possibly_running() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+
+    let reported = {
+        let _degraded = test_hook::containment_is(Containment::TreeWalk);
+        let _tree_refused = kills(Kill::RefuseTree);
         run_daemon(&spec(dir.path(), id.as_str()), &stop_bus, id.as_str(), || {})
     };
 
     assert_eq!(reported, Reported::incomplete_stop());
     let lines = take(id.as_str());
-    assert_eq!(lines.len(), 2, "{lines:?}");
-    assert!(lines[1].contains(CONFIRM_REFUSED), "{lines:?}");
+    assert_eq!(lines.len(), 2, "the containment and the refused kill_tree: {lines:?}");
+    assert_one_failure(&lines[..1], id.as_str(), NOT_JOB_CONTAINED);
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+/// The same, when the uncontained daemon cannot be killed either: it may be running.
+#[skuld::test]
+fn an_uncontained_daemon_that_cannot_be_killed_is_the_incomplete_stop_record() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+
+    let reported = {
+        let _degraded = test_hook::containment_is(Containment::TreeWalk);
+        let _refused = kills(Kill::Refuse);
+        run_daemon(&spec(dir.path(), id.as_str()), &stop_bus, id.as_str(), || {})
+    };
+
+    assert_eq!(reported, Reported::incomplete_stop());
+    let lines = take(id.as_str());
+    assert_eq!(
+        lines.len(),
+        3,
+        "the containment, kill_tree and the fallback kill: {lines:?}"
+    );
+    assert_one_failure(&lines[..1], id.as_str(), NOT_JOB_CONTAINED);
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }
 

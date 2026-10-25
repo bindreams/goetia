@@ -404,11 +404,7 @@ fn a_terminal_stopped_after_start_is_still_an_error_not_an_expiry() {
 fn a_daemon_that_exited_right_after_launch_is_a_started_service() {
     // `start` confirms the shim launched the daemon, as `systemctl start` confirms the exec: what
     // the daemon does next is not the start's to judge, and racing it would make the answer vary.
-    for reported in [
-        Reported::from_daemon_code(7),
-        Reported::Clean,
-        Reported::incomplete_stop(),
-    ] {
+    for reported in [Reported::from_daemon_code(7), Reported::Clean] {
         let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(reported);
         assert_eq!(
             start_via_notify(&mut fake, unbounded(), Kind::Simple, Kind::Simple).unwrap(),
@@ -416,6 +412,35 @@ fn a_daemon_that_exited_right_after_launch_is_a_started_service() {
             "{reported:?}"
         );
     }
+}
+
+/// The shim reports `(0, 1003)` before `RUNNING` only when it could not contain or kill the daemon
+/// it launched. That is not a launch to confirm, and the daemon may still be running.
+#[skuld::test]
+fn an_incomplete_stop_record_before_running_is_a_failed_start() {
+    for joined in [None, Some(QueriedState::StartPending)] {
+        let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(Reported::incomplete_stop());
+        if let Some(queried) = joined {
+            fake = fake.already_running(queried);
+        }
+
+        let err = start_via_notify(&mut fake, unbounded(), Kind::Simple, Kind::Simple).unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("failed start"), "{joined:?}: {message}");
+        assert!(message.contains("may still be running"), "{joined:?}: {message}");
+    }
+}
+
+/// A daemon that exits with code 1003 is `(1066, 1003)`, not the incomplete-stop record.
+#[skuld::test]
+fn a_daemon_exiting_1003_is_still_a_started_service() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(Reported::from_daemon_code(1003));
+
+    assert_eq!(
+        start_via_notify(&mut fake, unbounded(), Kind::Simple, Kind::Simple).unwrap(),
+        Waited::Confirmed
+    );
 }
 
 /// A `start` that lands as SCM's queued recovery start fires gets 1056 over `START_PENDING`. If
@@ -432,8 +457,7 @@ fn a_failed_scm_recovery_start_that_a_start_joined_is_a_failed_start() {
     assert!(err.to_string().contains("failed start"), "{err}");
 }
 
-/// The same `(0, 0)` with no wait hint is the shim's clean report: the daemon ran and ended.
-/// A start SCM accepted is ours, so the same `(0, 0)` and wait hint is not SCM's failed attempt.
+/// A start SCM accepted is ours, so `(0, 0)` with a wait hint is not SCM's failed attempt.
 #[skuld::test]
 fn a_stopped_with_a_wait_hint_after_an_accepted_start_is_a_started_service() {
     let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_by_scm_with_wait_hint(2000);
@@ -459,6 +483,7 @@ fn a_daemon_exit_record_with_a_wait_hint_that_a_start_joined_is_a_started_servic
     );
 }
 
+/// `(0, 0)` with no wait hint is the shim's clean report: the daemon ran and ended.
 #[skuld::test]
 fn a_clean_daemon_exit_that_a_start_joined_is_still_a_started_service() {
     let mut fake = FakeScm::new([Some(Observed::Stopped)])

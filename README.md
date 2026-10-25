@@ -793,12 +793,12 @@ different goetia version registered and `restart` is not `never`.
 `sc query` shows the difference between your command failing and the shim
 failing:
 
-| What happened                      | `WIN32_EXIT_CODE`, `SERVICE_EXIT_CODE` SCM records                             |
-| ---------------------------------- | ------------------------------------------------------------------------------ |
-| command exited `0`, or was stopped | `0`, `0`                                                                       |
-| command exited `n`, not `0`        | `1066`, `n` (a service-specific code)                                          |
-| the shim could not run the command | a Win32 code: the OS error, `13` for an unreadable spec, `31` if there is none |
-| `stop` could not kill the command  | `0`, `1003`                                                                    |
+| What happened                                         | `WIN32_EXIT_CODE`, `SERVICE_EXIT_CODE` SCM records                             |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------ |
+| command exited `0`, or was stopped                    | `0`, `0`                                                                       |
+| command exited `n`, not `0`                           | `1066`, `n` (a service-specific code)                                          |
+| the shim could not run the command                    | a Win32 code: the OS error, `13` for an unreadable spec, `31` if there is none |
+| the shim could not kill or contain the command's tree | `0`, `1003`                                                                    |
 
 Under `on-failure` both failures are restarted, so a spec the shim cannot read
 or a command that is missing retries at `restart-delay` indefinitely, as it
@@ -830,10 +830,25 @@ recognises that refusal only from a service whose spec it can read as
 `type: simple`; the same reply from any other service, one whose spec it cannot
 read included, is a refusal like the one above.
 
-The same holds when the shim's own wait on the command fails: it kills the command
-and reports a shim failure, restarted under `on-failure`, only once it has
-confirmed the command and its descendants gone. When it cannot confirm that, it
-reports `0`, `1003` as for a `stop` it could not complete.
+The shim runs a `type: simple` command inside a Windows Job Object and requires
+one. It cannot assign the job before the command starts: if the assignment fails,
+the command has already run, from its launch until the shim noticed and killed
+it, and anything it started in that time sits outside any job. The shim then
+logs why and reports `0`, `1003`, as for a `stop` it could not complete, because
+no kill of a tree outside a job shows its descendants gone and SCM must not
+restart over a possible survivor. `start` reads that record before the service
+reports running as a failed start, not as a launch.
+
+Before the shim reports any failure SCM restarts (the command exiting non-zero,
+or the shim's own wait on it failing), it terminates the job, so the restart does
+not overlap descendants the previous run left behind. If the job cannot be
+terminated, it reports `0`, `1003` as for a `stop` it could not complete, and
+refuses a later `stop`.
+
+"Terminated" means the OS has stopped every thread of the command and its
+descendants, not that it has finished releasing what they held. A restarted
+command can briefly find a resource its predecessor held (a listening port, say)
+and fail; SCM retries it like any other failure.
 
 ### What returning means
 
@@ -856,7 +871,9 @@ confirms differs:
   starts and then exits at once is a successful start, whatever its exit code,
   as with `systemctl start`; it is the command's exit, not `start`, that
   reports it. A `start` that lands as SCM is restarting the command, and that
-  restart fails (a missing `goetia-shim` or a broken account), is a failed start.
+  restart fails (a missing `goetia-shim` or a broken account), is a failed start,
+  as is a service that stops with the shim's `0`, `1003` record before running
+  (the command could not be contained).
   For a `type: managed` daemon, which speaks to SCM itself, a
   service that stops before it reports running is a failed start.
 - **launchd** sits between the two: the pid `launchctl kickstart -p` reports
