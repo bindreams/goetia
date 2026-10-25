@@ -66,3 +66,10 @@ pub(crate) fn assert_one_failure(lines: &[String], id: &str, expected: &str) {
     };
     assert_eq!(line, &format!("goetia-shim[{id}]: {expected}"));
 }
+
+/// Asserts `lines` is exactly `expected`, in order: each one `log_failure` line for `id`, as
+/// [`assert_one_failure`] checks it.
+pub(crate) fn assert_failures(lines: &[String], id: &str, expected: &[String]) {
+    let expected: Vec<String> = expected.iter().map(|e| format!("goetia-shim[{id}]: {e}")).collect();
+    assert_eq!(lines, expected);
+}

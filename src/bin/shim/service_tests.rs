@@ -20,7 +20,7 @@ use super::*;
 use crate::logging::test_hook::{take, take_warnings};
 use crate::stop_bus::test_hook as waiter_threads;
 use crate::stop_bus::test_hook::{KILL_REFUSED, Kill, WAIT_FAILED, Wait, WaiterEnd, kills, waiter_end, waits};
-use crate::test_support::{TestId, assert_one_failure};
+use crate::test_support::{TestId, assert_failures, assert_one_failure};
 
 const PREFIX: &str = "goetia-shim-launch-test";
 
@@ -399,21 +399,10 @@ fn an_unkillable_daemon_reports_the_incomplete_stop_failure() {
     assert_eq!(reported, Reported::incomplete_stop());
     std::fs::write(&release, "").expect("release the daemon");
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
-    let lines = take(id.as_str());
-    assert_eq!(lines.len(), 2, "both refused kills must be journalled: {lines:?}");
-    assert_one_failure(
-        &lines[..1],
+    assert_failures(
+        &take(id.as_str()),
         id.as_str(),
-        &format!(
-            "kill_tree on stop: {KILL_REFUSED}; falling back to killing the direct child only (its own descendants, if any, cannot be reached without a containment mechanism)"
-        ),
-    );
-    assert_one_failure(
-        &lines[1..],
-        id.as_str(),
-        &format!(
-            "fallback kill on stop: {KILL_REFUSED}; the daemon was neither killed nor reaped and may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure"
-        ),
+        &[tree_refused_failure(), fallback_refused_failure()],
     );
 }
 
@@ -483,9 +472,16 @@ fn a_failed_wait_over_an_unkillable_daemon_is_the_incomplete_stop_record() {
         !stop_bus.request_stop(),
         "a stop was acknowledged over a daemon that may still be running"
     );
-    let lines = take(id.as_str());
-    assert_eq!(lines.len(), 3, "the wait failure and both refused kills: {lines:?}");
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+    assert_failures(
+        &take(id.as_str()),
+        id.as_str(),
+        &[
+            format!("background wait on child: {WAIT_FAILED}"),
+            tree_refused_failure(),
+            fallback_refused_failure(),
+        ],
+    );
 }
 
 /// The daemon has failed, so SCM will restart it: its tree is terminated first, so that the restart
@@ -544,6 +540,20 @@ fn a_clean_exit_does_not_terminate_the_tree() {
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }
 
+/// The line logged when `kill_tree` is refused and the direct child's kill is tried next.
+fn tree_refused_failure() -> String {
+    format!(
+        "kill_tree on stop: {KILL_REFUSED}; falling back to killing the direct child only (its own descendants, if any, cannot be reached without a containment mechanism)"
+    )
+}
+
+/// The line logged when the direct child's kill is refused too.
+fn fallback_refused_failure() -> String {
+    format!(
+        "fallback kill on stop: {KILL_REFUSED}; the daemon was neither killed nor reaped and may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure"
+    )
+}
+
 /// The line logged when the daemon is not job-contained, whatever the kill then does.
 const NOT_JOB_CONTAINED: &str = r#"the daemon ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"] was contained by process-tree walk, not a job object: `type: simple` needs a job object to terminate its whole tree. The daemon ran from its launch, and no kill of it shows that its descendants are gone, so it is reported as possibly still running"#;
 
@@ -591,10 +601,12 @@ fn an_uncontained_daemon_whose_tree_kill_failed_is_reported_possibly_running() {
     };
 
     assert_eq!(reported, Reported::incomplete_stop());
-    let lines = take(id.as_str());
-    assert_eq!(lines.len(), 2, "the containment and the refused kill_tree: {lines:?}");
-    assert_one_failure(&lines[..1], id.as_str(), NOT_JOB_CONTAINED);
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+    assert_failures(
+        &take(id.as_str()),
+        id.as_str(),
+        &[NOT_JOB_CONTAINED.to_string(), tree_refused_failure()],
+    );
 }
 
 /// The same, when the uncontained daemon cannot be killed either: it may be running.
@@ -611,14 +623,16 @@ fn an_uncontained_daemon_that_cannot_be_killed_is_the_incomplete_stop_record() {
     };
 
     assert_eq!(reported, Reported::incomplete_stop());
-    let lines = take(id.as_str());
-    assert_eq!(
-        lines.len(),
-        3,
-        "the containment, kill_tree and the fallback kill: {lines:?}"
-    );
-    assert_one_failure(&lines[..1], id.as_str(), NOT_JOB_CONTAINED);
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+    assert_failures(
+        &take(id.as_str()),
+        id.as_str(),
+        &[
+            NOT_JOB_CONTAINED.to_string(),
+            tree_refused_failure(),
+            fallback_refused_failure(),
+        ],
+    );
 }
 
 /// The status query after `ChildExited` can fail; the exit is then a shim failure, not a daemon code.

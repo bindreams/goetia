@@ -8,7 +8,7 @@ use std::time::Duration;
 use super::test_hook::{KILL_REFUSED, WAIT_FAILED, Wait, WaiterEnd, waiter_end};
 use super::*;
 use crate::logging::test_hook::take;
-use crate::test_support::{TestId, assert_one_failure};
+use crate::test_support::{TestId, assert_failures, assert_one_failure};
 
 const PREFIX: &str = "goetia-shim-stop-bus-test";
 
@@ -379,6 +379,7 @@ fn a_failed_background_wait_over_an_unkillable_daemon_is_the_unkillable_outcome(
     assert!(matches!(outcome, WaitOutcome::DaemonMayRun));
     child.kill_tree().expect("kill the daemon the call left running");
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+    assert_failures(&take(id.as_str()), id.as_str(), &unkillable_failures());
 }
 
 /// A waiter that panics is reported by the join, and a stop over it is still a stop.
@@ -507,6 +508,7 @@ fn a_failed_background_wait_carries_its_os_error() {
         "the OS error of the failed wait was lost"
     );
     assert_dead(&child);
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
     assert_one_failure(
         &take(id.as_str()),
         id.as_str(),
@@ -531,6 +533,12 @@ fn a_stop_wins_over_a_failed_background_wait() {
 
     assert!(matches!(outcome, WaitOutcome::Stopping));
     assert_dead(&child);
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+    assert_one_failure(
+        &take(id.as_str()),
+        id.as_str(),
+        &format!("background wait on child: {WAIT_FAILED}"),
+    );
 }
 
 /// With only the direct child killed, the daemon's descendants were not reached, so the failed wait
@@ -553,25 +561,8 @@ fn a_failed_background_wait_whose_tree_kill_failed_is_not_a_restartable_failure(
 
     assert!(matches!(outcome, WaitOutcome::DaemonMayRun));
     assert_dead(&child);
-    let lines = take(id.as_str());
-    assert_eq!(lines.len(), 3, "{lines:?}");
-    assert_one_failure(
-        &lines[..1],
-        id.as_str(),
-        &format!("background wait on child: {WAIT_FAILED}"),
-    );
-    assert_one_failure(
-        &lines[1..2],
-        id.as_str(),
-        &format!(
-            "kill_tree on stop: {KILL_REFUSED}; falling back to killing the direct child only (its own descendants, if any, cannot be reached without a containment mechanism)"
-        ),
-    );
-    assert_one_failure(
-        &lines[2..],
-        id.as_str(),
-        "the daemon's descendants were not killed after the background wait failed: only the direct child was killed; the daemon may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure",
-    );
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+    assert_failures(&take(id.as_str()), id.as_str(), &tree_unkilled_failures());
 }
 
 /// A failed wait that ends in `DaemonMayRun` is a decided failure: a stop arriving afterwards must be
@@ -599,7 +590,7 @@ fn a_failed_wait_over_an_unkillable_daemon_refuses_a_later_stop() {
     );
     child.kill_tree().expect("kill the daemon the call left running");
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
-    assert_eq!(take(id.as_str()).len(), 3, "the wait failure and both refused kills");
+    assert_failures(&take(id.as_str()), id.as_str(), &unkillable_failures());
 }
 
 /// The same when only the tree kill is refused and the direct child's kill works.
@@ -625,11 +616,8 @@ fn a_failed_wait_whose_tree_kill_was_refused_refuses_a_later_stop() {
         "a stop was acknowledged over a daemon whose tree may still be running"
     );
     assert_dead(&child);
-    assert_eq!(
-        take(id.as_str()).len(),
-        3,
-        "the wait failure, the tree kill and the unkilled descendants"
-    );
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+    assert_failures(&take(id.as_str()), id.as_str(), &tree_unkilled_failures());
 }
 
 // Fate ----------------------------------------------------------------------------------------------------------------
@@ -671,6 +659,32 @@ fn a_repeated_stop_is_accepted_again() {
 
     assert!(bus.request_stop());
     assert!(bus.request_stop());
+}
+
+/// The lines of a failed wait whose `kill_tree` was refused and whose direct-child kill worked.
+fn tree_unkilled_failures() -> [String; 3] {
+    [
+        format!("background wait on child: {WAIT_FAILED}"),
+        tree_refused_failure(),
+        "the daemon's descendants were not killed after the background wait failed: only the direct child was killed; the daemon may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure".to_string(),
+    ]
+}
+
+/// The lines of a failed wait whose `kill_tree` and direct-child kill were both refused.
+fn unkillable_failures() -> [String; 3] {
+    [
+        format!("background wait on child: {WAIT_FAILED}"),
+        tree_refused_failure(),
+        format!(
+            "fallback kill on stop: {KILL_REFUSED}; the daemon was neither killed nor reaped and may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure"
+        ),
+    ]
+}
+
+fn tree_refused_failure() -> String {
+    format!(
+        "kill_tree on stop: {KILL_REFUSED}; falling back to killing the direct child only (its own descendants, if any, cannot be reached without a containment mechanism)"
+    )
 }
 
 fn sleeper() -> cosca::Command {
