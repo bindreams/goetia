@@ -15,7 +15,7 @@ use goetia::backend::scm::exit_status::{ERROR_SERVICE_SPECIFIC_ERROR, RecordedEx
 use goetia::backend::scm::manager::ScmManager;
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, ServiceManager as _};
-use goetia::spec::{DaemonSpec, Restart};
+use goetia::spec::{DaemonSpec, Restart, User};
 use windows_service::service::{ServiceExitCode, ServiceState};
 
 use crate::common::{
@@ -29,7 +29,7 @@ const ONE_SECOND: Option<Duration> = Some(Duration::from_secs(1));
 /// before this shim existed.
 const EARLIER_VERSION: &str = "0.0.0";
 
-fn on_failure(id: &str, command: Vec<String>, restart_delay: Option<Duration>) -> DaemonSpec {
+pub(crate) fn on_failure(id: &str, command: Vec<String>, restart_delay: Option<Duration>) -> DaemonSpec {
     mk_spec_full(
         id,
         command,
@@ -314,13 +314,26 @@ fn a_commanded_stop_reports_win32_zero() {
 /// Installs an `on-failure` daemon that exits 7 once the test closes its connection, starts it, and
 /// returns once the shim has reported the failure and gone, so SCM holds a `STOPPED` with a
 /// non-zero code and a restart queued after `restart_delay`. The listener sees every run.
-fn fail_once(mgr: &ScmManager, id: &str, restart_delay: Duration) -> (ConnectBack, DaemonSpec) {
+pub(crate) fn fail_once(mgr: &ScmManager, id: &str, restart_delay: Duration) -> (ConnectBack, DaemonSpec) {
+    fail_once_as(mgr, id, restart_delay, User::Root)
+}
+
+/// [`fail_once`] for a service that runs as `user`.
+pub(crate) fn fail_once_as(
+    mgr: &ScmManager,
+    id: &str,
+    restart_delay: Duration,
+    user: User,
+) -> (ConnectBack, DaemonSpec) {
     let reported = ConnectBack::listen();
-    let spec = on_failure(
-        id,
-        fixture_command("exit-on-close", &[&reported.port().to_string(), "7"]),
-        Some(restart_delay),
-    );
+    let spec = DaemonSpec {
+        user,
+        ..on_failure(
+            id,
+            fixture_command("exit-on-close", &[&reported.port().to_string(), "7"]),
+            Some(restart_delay),
+        )
+    };
     mgr.install(&spec, false).expect("install");
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     let stream = reported.accept_stream("the first run to connect and wait for the test to close its end");

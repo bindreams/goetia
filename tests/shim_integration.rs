@@ -35,6 +35,9 @@ mod restart_integration;
 #[path = "shim_integration/simple.rs"]
 mod simple;
 #[cfg(windows)]
+#[path = "shim_integration/state_integration.rs"]
+mod state_integration;
+#[cfg(windows)]
 #[path = "shim_integration/supervisor_integration.rs"]
 mod supervisor_integration;
 
