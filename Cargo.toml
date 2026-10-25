@@ -5,9 +5,10 @@ edition = "2024"
 # `cosca` uses `std::io::PipeReader`, stable since 1.87. That is already true
 # on Windows, where cosca has been a dependency all along, and the Unix
 # backends' bounded wait (`backend::bounded`) extends the same requirement to
-# Linux and macOS. Not verified end to end: CI pins `dtolnay/rust-toolchain`
-# at `stable` on every job, so nothing checks this floor.
-rust-version = "1.87"
+# Linux and macOS. `File::lock` and `lock_shared`, stable since 1.89, serialize the writers of the
+# SCM shim's state file (`backend::scm::state_file`). Not verified end to end: CI pins
+# `dtolnay/rust-toolchain` at `stable` on every job, so nothing checks this floor.
+rust-version = "1.89"
 description = "Install system daemons described in goetia.yaml as native Windows/SCM, macOS/launchd, and Linux/systemd services"
 license = "Apache-2.0"
 readme = "README.md"

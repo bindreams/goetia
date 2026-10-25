@@ -367,10 +367,10 @@ pub fn plist(spec: &DaemonSpec, id: &Identity) -> String {
 
     push_keep_alive(&mut dict, INDENT, spec.restart);
 
-    if spec.restart != Restart::Never {
-        if let Some(delay) = spec.restart_delay {
-            push_key_integer(&mut dict, INDENT, "ThrottleInterval", round_up_seconds(delay));
-        }
+    if spec.restart != Restart::Never
+        && let Some(delay) = spec.restart_delay
+    {
+        push_key_integer(&mut dict, INDENT, "ThrottleInterval", round_up_seconds(delay));
     }
 
     if let Some(logs) = &spec.logs {

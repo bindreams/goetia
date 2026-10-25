@@ -90,10 +90,10 @@ impl WorldReadableExe {
 
 impl Drop for WorldReadableExe {
     fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_file(&self.path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("WorldReadableExe[{}]: cleanup failed: {e}", self.path.display());
-            }
+        if let Err(e) = std::fs::remove_file(&self.path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("WorldReadableExe[{}]: cleanup failed: {e}", self.path.display());
         }
     }
 }

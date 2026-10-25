@@ -16,12 +16,11 @@ use super::io_err;
 /// Create (and, for a non-root account, `chown`) the parent of `logs` and the `cwd` directory itself
 /// — obligation 5. Runs while still elevated.
 pub(super) fn ensure_parent_dirs(spec: &DaemonSpec) -> Result<()> {
-    if let Some(logs) = &spec.logs {
-        if let Some(parent) = logs.parent() {
-            if !parent.as_os_str().is_empty() {
-                ensure_dir(parent, &spec.user)?;
-            }
-        }
+    if let Some(logs) = &spec.logs
+        && let Some(parent) = logs.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        ensure_dir(parent, &spec.user)?;
     }
     if let Some(cwd) = &spec.cwd {
         ensure_dir(cwd, &spec.user)?;

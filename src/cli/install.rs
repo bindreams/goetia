@@ -126,17 +126,17 @@ pub fn run(
                         continue;
                     }
                 }
-                if args.enable {
-                    if let Err(e) = mgr.enable(&spec.id) {
-                        let _ = writeln!(err, "error: {}: enable: {e}", spec.id);
-                        codes.push(failure_code(&e));
-                    }
+                if args.enable
+                    && let Err(e) = mgr.enable(&spec.id)
+                {
+                    let _ = writeln!(err, "error: {}: enable: {e}", spec.id);
+                    codes.push(failure_code(&e));
                 }
-                if args.start {
-                    if let Err(e) = mgr.start(&spec.id, args.wait.budget()) {
-                        let _ = writeln!(err, "error: {}: start: {e}", spec.id);
-                        codes.push(failure_code(&e));
-                    }
+                if args.start
+                    && let Err(e) = mgr.start(&spec.id, args.wait.budget())
+                {
+                    let _ = writeln!(err, "error: {}: start: {e}", spec.id);
+                    codes.push(failure_code(&e));
                 }
             }
             Err(e) => {

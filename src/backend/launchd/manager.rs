@@ -1460,14 +1460,14 @@ impl ServiceManager for LaunchdManager {
         // launchd.
         let issuing = Budget::Unbounded.start();
 
-        if !never_expires(is_loaded(id.as_str(), issuing)?) {
-            if let Err(e) = bootstrap(&location.path, issuing, bootstrap_reaper).map(never_expires) {
-                // A concurrent `start` may have loaded it between the check
-                // above and this call; only propagate the error if the job
-                // genuinely is not loaded now either.
-                if !never_expires(is_loaded(id.as_str(), issuing)?) {
-                    return Err(e);
-                }
+        if !never_expires(is_loaded(id.as_str(), issuing)?)
+            && let Err(e) = bootstrap(&location.path, issuing, bootstrap_reaper).map(never_expires)
+        {
+            // A concurrent `start` may have loaded it between the check
+            // above and this call; only propagate the error if the job
+            // genuinely is not loaded now either.
+            if !never_expires(is_loaded(id.as_str(), issuing)?) {
+                return Err(e);
             }
         }
         // `kickstart` is what actually launches a job with no
