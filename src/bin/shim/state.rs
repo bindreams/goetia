@@ -136,7 +136,7 @@ fn failure_not_recorded(store: &Store, e: &std::io::Error) -> String {
 
 fn survivor_not_recorded(store: &Store, why: &str) -> String {
     format!(
-        "could not record the surviving daemon in {}: {why}; a start would not be refused while it runs",
+        "could not record the surviving daemon in {}: {why}; goetia cannot tell when it is gone and treats the stop as incomplete: stop that process yourself, then start the service with `sc start`",
         store.path.display()
     )
 }

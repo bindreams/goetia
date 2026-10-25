@@ -243,3 +243,32 @@ fn the_survivor_is_recorded_by_pid_and_creation_time() {
 
     assert_eq!(record_of(&store).survivor, Some(this_process()));
 }
+
+#[skuld::test]
+fn a_survivor_that_cannot_be_written_is_logged_with_the_consequence() {
+    let id = TestId::new(PREFIX);
+    let dir = tempfile::tempdir().expect("temp dir");
+    let missing = dir.path().join("no-such-dir").join("svc");
+    let store = Store::at(missing.clone(), clock(5000), Ok(RestartDue::Never));
+
+    record_survivor(id.as_str(), &store, ProcessId::current());
+
+    let lines = take(id.as_str());
+    let [line] = lines.as_slice() else {
+        panic!("{lines:?}");
+    };
+    assert!(
+        line.starts_with(&format!(
+            "goetia-shim[{}]: could not record the surviving daemon in {}: ",
+            id.as_str(),
+            missing.display()
+        )),
+        "{line}"
+    );
+    assert!(
+        line.ends_with(
+            "; goetia cannot tell when it is gone and treats the stop as incomplete: stop that process yourself, then start the service with `sc start`"
+        ),
+        "{line}"
+    );
+}

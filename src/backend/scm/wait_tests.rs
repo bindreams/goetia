@@ -5,6 +5,8 @@
 
 use std::collections::VecDeque;
 
+use cosca::identity::ProcessId;
+
 use super::*;
 use crate::backend::scm::exit_status::{RecordedExit, Reported};
 use crate::backend::scm::state_file::{Clock, FailureRecord, Loaded, RestartDue, ShimState, StateRecord, Survivor};
@@ -1804,6 +1806,58 @@ fn a_start_over_the_status_record_of_an_incomplete_stop_is_issued_once_the_survi
     assert_eq!(fake.log, vec!["survivor", "start"]);
 }
 
+/// The shim may fail to record the survivor it reports with the incomplete stop. A `type: simple`
+/// service stopped with that status record and a file that names no survivor is refused a start,
+/// whichever verb or budget asks, since the daemon may be running and nothing says it is not.
+#[skuld::test]
+fn no_start_is_issued_over_the_incomplete_stop_status_when_the_survivor_was_not_recorded() {
+    let found = || {
+        FakeScm::new([])
+            .found(QueriedState::Stopped, incomplete_stop())
+            .with_shim(state_without_a_record())
+    };
+    let mut fake = found();
+    let e = start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap_err();
+    assert!(e.to_string().contains("not recorded which process"), "{e}");
+    assert_eq!(fake.log, vec!["survivor", "query"]);
+
+    let mut fake = found();
+    let e = request_start(&mut fake).unwrap_err();
+    assert!(e.to_string().contains("sc start"), "{e}");
+    assert_eq!(fake.log, vec!["survivor", "query"]);
+
+    let mut fake = found();
+    let e = request_start_after_stop(&mut fake).unwrap_err();
+    assert!(e.to_string().contains("may still be running"), "{e}");
+    assert_eq!(fake.log, vec!["survivor", "query"]);
+}
+
+/// Only a recorded survivor that is gone makes the status record of the incomplete stop stale.
+#[skuld::test]
+fn a_start_over_the_incomplete_stop_status_is_issued_when_the_recorded_survivor_is_gone() {
+    let mut fake = FakeScm::new([])
+        .found(QueriedState::Stopped, incomplete_stop())
+        .with_shim(state_with_a_gone_survivor());
+    request_start(&mut fake).unwrap();
+    assert_eq!(fake.log, vec!["survivor", "start"]);
+}
+
+/// The status record only means a stop was incomplete while the service is stopped with it.
+#[skuld::test]
+fn a_simple_service_not_stopped_with_the_incomplete_stop_status_is_started_with_no_survivor() {
+    for (state, exit) in [
+        (QueriedState::Stopped, stopped_clean()),
+        (QueriedState::Stopped, daemon_failed()),
+        (QueriedState::Stopped, shim_failed()),
+        (QueriedState::Running, incomplete_stop()),
+        (QueriedState::StartPending, incomplete_stop()),
+    ] {
+        let mut fake = FakeScm::new([]).found(state, exit).with_shim(state_without_a_record());
+        request_start(&mut fake).unwrap();
+        assert_eq!(fake.log, vec!["survivor", "query", "start"], "{state:?} {exit:?}");
+    }
+}
+
 /// With no survivor every state and record is started as before.
 #[skuld::test]
 fn a_start_over_any_state_or_record_is_issued_when_no_survivor_lives() {
@@ -2049,6 +2103,18 @@ fn shim_died() -> RecordedExit {
     }
 }
 
+/// A file whose record names a survivor that is no longer running.
+fn state_with_a_gone_survivor() -> ShimState {
+    let mut gone = ProcessId::current().to_record().expect("this process has an identity");
+    gone.token += 1;
+    let mut record = StateRecord::empty();
+    record.survivor = Some(gone);
+    ShimState {
+        loaded: Loaded::Record(record),
+        ..state_without_a_record()
+    }
+}
+
 fn state_without_a_record_disabled() -> ShimState {
     ShimState {
         disabled: true,
@@ -2149,13 +2215,13 @@ fn only_a_1067_falls_back_on_the_status_rule() {
 // a simple service's survivor: the state file decides whether a daemon may still run ----------------------------------
 
 /// The status record of an incomplete stop outlives the daemon. A `type: simple` service stopped
-/// with it whose survivor is gone is stopped, for every stop path.
+/// with it whose recorded survivor is gone is stopped, for every stop path.
 #[skuld::test]
-fn a_simple_service_with_the_status_record_of_an_incomplete_stop_but_no_live_survivor_is_stopped() {
+fn a_simple_service_with_the_status_record_of_an_incomplete_stop_and_a_gone_survivor_is_stopped() {
     let found = || {
         FakeScm::new([])
             .found(QueriedState::Stopped, incomplete_stop())
-            .with_shim(state_without_a_record())
+            .with_shim(state_with_a_gone_survivor())
     };
 
     let mut fake = found();
@@ -2172,8 +2238,63 @@ fn a_simple_service_with_the_status_record_of_an_incomplete_stop_but_no_live_sur
 
     let mut fake = FakeScm::new([Some(Observed::Stopped)])
         .stopped_after(Reported::incomplete_stop())
-        .with_shim(state_without_a_record());
+        .with_shim(state_with_a_gone_survivor());
     assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), StopWaited::Confirmed);
+}
+
+/// The shim records the survivor before it reports the incomplete stop, and may fail to. The
+/// status record then stands alone: nothing says the daemon is gone, so the stop is incomplete,
+/// whether the file is absent, unreadable or holds a record without a survivor.
+#[skuld::test]
+fn a_simple_service_with_the_status_record_of_an_incomplete_stop_and_no_recorded_survivor_is_incomplete() {
+    for shim in [
+        state_without_a_record(),
+        ShimState {
+            loaded: Loaded::Unreadable("garbled".to_string()),
+            ..state_without_a_record()
+        },
+        ShimState {
+            loaded: Loaded::Record(StateRecord::empty()),
+            ..state_without_a_record()
+        },
+    ] {
+        let found = || {
+            FakeScm::new([])
+                .found(QueriedState::Stopped, incomplete_stop())
+                .with_shim(shim.clone())
+        };
+
+        let mut fake = found();
+        assert_eq!(
+            stop_via_notify(&mut fake, unbounded()).unwrap(),
+            StopWaited::Incomplete,
+            "{shim:?}"
+        );
+
+        let mut fake = found();
+        assert_eq!(request_stop(&mut fake).unwrap(), RequestedStop::Incomplete, "{shim:?}");
+
+        let mut fake = found();
+        assert_eq!(
+            uninstall_teardown(&mut fake, unbounded()).unwrap(),
+            StopWaited::Incomplete,
+            "{shim:?}"
+        );
+        assert!(fake.log.contains(&"delete"), "{:?}", fake.log);
+
+        // A running service whose file is unreadable is refused before any stop is issued.
+        if matches!(shim.loaded, Loaded::Unreadable(_)) {
+            continue;
+        }
+        let mut fake = FakeScm::new([Some(Observed::Stopped)])
+            .stopped_after(Reported::incomplete_stop())
+            .with_shim(shim.clone());
+        assert_eq!(
+            stop_via_notify(&mut fake, unbounded()).unwrap(),
+            StopWaited::Incomplete,
+            "{shim:?}"
+        );
+    }
 }
 
 /// A live survivor is a daemon that may still be running, whatever the status record says.

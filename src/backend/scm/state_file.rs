@@ -224,6 +224,12 @@ impl ShimState {
                 .is_some_and(|failure| failure.pending(self.now, stopped_failed)),
         }
     }
+
+    /// Whether the file records a survivor, running or not. Without one, the status record of an
+    /// incomplete stop is all there is to say that a daemon may still be running.
+    pub fn names_a_survivor(&self) -> bool {
+        matches!(&self.loaded, Loaded::Record(record) if record.survivor.is_some())
+    }
 }
 
 // The file ============================================================================================================

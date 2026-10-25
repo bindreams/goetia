@@ -843,7 +843,10 @@ goetia reads the state file, not the `1003` record, which outlives the process:
 `stop` exits `1` saying the command may still be running while that process
 runs, `start` and `restart` do not start a second copy (they exit `1` and name
 its pid), and `uninstall` deletes the service and then exits `1` with the same
-message. Once the process is gone, `stop` and `start` work again. The
+message. Once the process is gone, `stop` and `start` work again. If the shim
+could not write the state file, there is no process to watch: the `1003` record
+stands alone, so goetia treats the command as possibly still running until you
+stop it yourself and start the service with `sc start`. The
 shim makes the same check as it starts, so `sc start` is no way around it: the
 shim does not launch a second command, logs the pid and what to do, and reports
 Win32 code `1056`. Under `restart: on-failure` SCM then retries the start at

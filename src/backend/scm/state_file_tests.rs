@@ -212,6 +212,23 @@ fn a_record_with_only_a_survivor_has_no_restart_pending() {
     assert!(!shim_state(record, 100).restart_pending(true));
 }
 
+#[skuld::test]
+fn only_a_decoded_record_with_a_survivor_names_one() {
+    let mut with = StateRecord::empty();
+    with.survivor = Some(this_process());
+
+    assert!(shim_state(with, 100).names_a_survivor());
+    assert!(!shim_state(StateRecord::empty(), 100).names_a_survivor());
+    for loaded in [Loaded::Absent, Loaded::Unreadable("garbled".to_string())] {
+        let state = ShimState {
+            loaded,
+            now: at(100),
+            disabled: false,
+        };
+        assert!(!state.names_a_survivor());
+    }
+}
+
 // The format ==========================================================================================================
 
 #[skuld::test]

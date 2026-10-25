@@ -171,13 +171,18 @@ fn status_rule<A: ScmActor>(a: &mut A, exit: RecordedExit) -> io::Result<bool> {
 
 /// Whether a daemon the shim could not kill may still be running after a `STOPPED` with `exit`.
 /// A `type: simple` service is judged by the survivor its shim recorded, which ends with the
-/// daemon; the status record of the incomplete stop outlives it. A service with no shim is judged
-/// by the record alone.
+/// daemon; the status record of the incomplete stop outlives it. The shim records the survivor
+/// before it reports that status, but may fail to: with the status and no survivor in the file,
+/// nothing says the daemon is gone, so it may be running. A service with no shim is judged by the
+/// status alone.
 fn daemon_may_still_run<A: ScmActor>(a: &mut A, exit: RecordedExit) -> io::Result<bool> {
-    if a.shim_state()?.is_some() {
-        return Ok(a.survivor()?.is_some());
+    let Some(shim) = a.shim_state()? else {
+        return Ok(exit.incomplete_stop());
+    };
+    if a.survivor()?.is_some() {
+        return Ok(true);
     }
-    Ok(exit.incomplete_stop())
+    Ok(exit.incomplete_stop() && !shim.names_a_survivor())
 }
 
 /// What a `STOPPED` with `exit` recorded settles a stop as: a daemon that may still be running, a
@@ -570,10 +575,23 @@ fn stop_unless_stopped_once<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::R
 /// left, which outlives it. Read before every start, since a start cannot be told from the reply
 /// alone. (A start through `sc start` meets the same check in the shim.)
 fn refuse_over_a_survivor<A: ScmActor>(a: &mut A) -> io::Result<()> {
-    match a.survivor()? {
-        None => Ok(()),
-        Some((pid, survivor)) => Err(io::Error::other(survivor_refusal(pid, survivor))),
+    if let Some((pid, survivor)) = a.survivor()? {
+        return Err(io::Error::other(survivor_refusal(pid, survivor)));
     }
+    // The shim failed to record the survivor: the status of the incomplete stop is all there is.
+    if let Some(shim) = a.shim_state()?
+        && !shim.names_a_survivor()
+    {
+        let status = a.query_status()?;
+        if status.state == QueriedState::Stopped && status.exit.incomplete_stop() {
+            return Err(io::Error::other(
+                "goetia-shim could not kill the daemon at the last stop, which may still be running, and \
+                 has not recorded which process it is; a start would run a second one. Stop the daemon \
+                 yourself, then start the service with `sc start`",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Why a start is refused over the survivor `pid`, and what to do.
