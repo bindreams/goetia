@@ -728,9 +728,10 @@ clean exit is never restarted, and a stop reports a clean exit.
 Nothing cancels a restart SCM has queued, and `goetia daemon stop` does not
 look for one. A command that failed and is waiting out `restart-delay` finds
 the service already stopped, so `stop` exits `0` and the daemon is started when
-the delay ends. A command that fails before a `stop` arrives is restarted the
-same way, because `stop` finds the service already stopped. One that fails after
-the stop is requested reports a clean stop, which SCM does not restart.
+the delay ends. When a command fails just as a `stop` arrives, what the shim
+reports decides it: if the stop request has reached the shim by the time it
+reports the exit, it reports a clean stop, which SCM does not restart; otherwise
+it reports the failure, and SCM restarts the command as above.
 `goetia daemon uninstall` is not affected: deleting the service cancels a
 restart SCM has queued.
 

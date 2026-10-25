@@ -338,13 +338,11 @@ fn a_failed_background_wait_kills_the_daemon_and_is_reported_as_a_wait_failure()
         matches!(outcome, WaitOutcome::WaitFailed { os_error: None }),
         "a failed wait was not reported as one"
     );
-    assert!(
-        child
-            .wait_timeout(Duration::ZERO)
-            .expect("query the child's exit status")
-            .is_some(),
-        "the daemon was left running after its wait failed"
-    );
+    // Termination is asynchronous: wait for the exit rather than polling for it. A daemon left
+    // running hangs here, for CI's watchdog to report.
+    child
+        .wait()
+        .expect("the daemon ends once its failed wait has killed it");
     assert_one_failure(
         &take(id.as_str()),
         id.as_str(),
