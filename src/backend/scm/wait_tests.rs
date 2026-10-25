@@ -2017,13 +2017,10 @@ fn a_start_over_any_state_or_record_is_issued_when_no_survivor_lives() {
 /// A failure at 1000 ms with a restart due after 5000 ms, read at `now_ms`.
 fn state_with_a_restart_due(now_ms: u64) -> ShimState {
     let mut record = StateRecord::empty();
-    record.failure = Some(FailureRecord::new(Some(1), 1000, RestartDue::After(5000)));
+    record.failure = Some(FailureRecord::new(1, 1000, RestartDue::After(5000)));
     ShimState {
         loaded: Loaded::Record(record),
-        now: Clock {
-            boot: Some(1),
-            ms: now_ms,
-        },
+        now: Clock { boot: 1, ms: now_ms },
         disabled: false,
     }
 }
@@ -2032,10 +2029,7 @@ fn state_with_a_restart_due(now_ms: u64) -> ShimState {
 fn state_without_a_record() -> ShimState {
     ShimState {
         loaded: Loaded::Absent,
-        now: Clock {
-            boot: Some(1),
-            ms: 1100,
-        },
+        now: Clock { boot: 1, ms: 1100 },
         disabled: false,
     }
 }
@@ -2270,13 +2264,10 @@ fn state_without_a_record_disabled() -> ShimState {
 /// A failure the shim recorded as queuing nothing.
 fn state_with_a_failure_that_queued_nothing() -> ShimState {
     let mut record = StateRecord::empty();
-    record.failure = Some(FailureRecord::new(Some(1), 1000, RestartDue::Never));
+    record.failure = Some(FailureRecord::new(1, 1000, RestartDue::Never));
     ShimState {
         loaded: Loaded::Record(record),
-        now: Clock {
-            boot: Some(1),
-            ms: 1100,
-        },
+        now: Clock { boot: 1, ms: 1100 },
         disabled: false,
     }
 }

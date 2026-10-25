@@ -121,7 +121,8 @@ winreg = "0.56"
 # checkpoint/`Sleep` poll), `SeServiceLogonRight` provisioning
 # (`manager::identity`), and `CommandLineToArgvW` for readback (SCM stores
 # `executable`+`arguments` pre-joined into one command line), and `GetTickCount64`
-# (`Win32_System_SystemInformation`), the boot-relative clock of the shim's state file.
+# (`Win32_System_SystemInformation`) and the boot counter in `KUSER_SHARED_DATA`
+# (`Wdk_System_SystemServices`), the boot-relative clock of the shim's state file.
 #
 # The shim (`src/bin/shim/`, same crate/dependency graph — see the
 # `goetia-shim` `[[bin]]` above) adds `Win32_System_EventLog`, the
@@ -131,11 +132,14 @@ winreg = "0.56"
 # `cosca`'s own dependency, not a windows-sys feature this crate needs to
 # request itself.
 windows-sys = { version = "0.61", features = [
+    "Wdk_System_SystemServices",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Authentication_Identity",
+    "Win32_System_Diagnostics_Debug",
     "Win32_System_EventLog",
+    "Win32_System_Kernel",
     "Win32_System_Services",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",

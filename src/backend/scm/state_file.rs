@@ -44,8 +44,9 @@ pub const FIRE_MARGIN_MS: u64 = 1000;
 /// Boot-relative milliseconds and the identity of the boot they count from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Clock {
-    /// `None` when the boot identity could not be read.
-    pub boot: Option<u64>,
+    /// Names the boot, and is different on every one. Every account can read it, so a record
+    /// written by a shim that is not an administrator can be told from an earlier boot's.
+    pub boot: u64,
     pub ms: u64,
 }
 
@@ -68,7 +69,7 @@ pub enum RestartDue {
 /// A failure the shim reported to SCM with a non-zero Win32 code.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FailureRecord {
-    pub boot: Option<u64>,
+    pub boot: u64,
     pub at_ms: u64,
     pub restart: RestartDue,
     /// The process that wrote this record. Two writers can note the same failure in the same
@@ -79,7 +80,7 @@ pub struct FailureRecord {
 
 impl FailureRecord {
     /// A failure written by this process.
-    pub fn new(boot: Option<u64>, at_ms: u64, restart: RestartDue) -> Self {
+    pub fn new(boot: u64, at_ms: u64, restart: RestartDue) -> Self {
         Self {
             boot,
             at_ms,
@@ -93,13 +94,9 @@ impl FailureRecord {
         Self::new(now.boot, now.ms, restart)
     }
 
-    /// Whether `now` is on the boot this was written on. With either identity unreadable it falls
-    /// back on the clock: a tick count smaller than the record's means the counter started over.
+    /// Whether `now` is on the boot this was written on.
     fn same_boot(&self, now: Clock) -> bool {
-        match (self.boot, now.boot) {
-            (Some(recorded), Some(current)) => recorded == current && self.at_ms <= now.ms,
-            _ => self.at_ms <= now.ms,
-        }
+        self.boot == now.boot && self.at_ms <= now.ms
     }
 
     fn due_at(&self, after_ms: u64) -> u64 {

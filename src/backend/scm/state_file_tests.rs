@@ -4,8 +4,8 @@ use cosca::identity::{Platform, ProcessId};
 
 use super::*;
 
-const BOOT: Option<u64> = Some(0x01DB_0000_0000_0001);
-const OTHER_BOOT: Option<u64> = Some(0x01DB_0000_0000_9999);
+const BOOT: u64 = 11;
+const OTHER_BOOT: u64 = 12;
 
 fn at(ms: u64) -> Clock {
     Clock { boot: BOOT, ms }
@@ -142,25 +142,21 @@ fn a_record_from_an_earlier_boot_is_stale() {
 }
 
 #[skuld::test]
-fn without_a_readable_boot_identity_a_record_from_the_future_is_from_an_earlier_boot() {
-    let mut record = failed(500_000, RestartDue::Unknown);
-    record.failure.as_mut().expect("failure").boot = None;
-    let state = ShimState {
-        loaded: Loaded::Record(record.clone()),
-        now: Clock { boot: None, ms: 100 },
-        disabled: false,
-    };
-    let same_boot = ShimState {
-        loaded: Loaded::Record(record),
+fn a_record_from_an_earlier_boot_is_stale_whatever_the_tick_count_says() {
+    // A one-hour delay recorded at one hour of uptime, read after a reboot at 1 h 2 min: the tick
+    // count alone cannot tell this boot's hour from the last one's.
+    let one_hour = 3_600_000;
+    let record = ShimState {
+        loaded: Loaded::Record(failed(one_hour, RestartDue::After(one_hour))),
         now: Clock {
-            boot: None,
-            ms: 600_000,
+            boot: OTHER_BOOT,
+            ms: one_hour + 120_000,
         },
         disabled: false,
     };
 
-    assert!(!state.restart_pending(true), "the tick count went backwards: a reboot");
-    assert!(same_boot.restart_pending(true));
+    assert!(!record.restart_pending(true));
+    assert!(!record.restart_pending(false));
 }
 
 #[skuld::test]

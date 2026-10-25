@@ -8,7 +8,7 @@ use crate::test_support::{TestId, assert_one_failure};
 
 const PREFIX: &str = "goetia-shim-state-test";
 
-const BOOT: Option<u64> = Some(7);
+const BOOT: u64 = 7;
 
 fn clock(ms: u64) -> Clock {
     Clock { boot: BOOT, ms }

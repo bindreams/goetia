@@ -4,9 +4,9 @@
 
 use std::path::PathBuf;
 
-use cosca::identity::{ProcessId, Resolved};
 use windows_service::service::{ServiceAccess, ServiceActionType};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+use windows_sys::Wdk::System::SystemServices::KUSER_SHARED_DATA;
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 
 use super::{Clock, RECORD, RestartDue, dir_name, restart_due_from};
@@ -30,16 +30,18 @@ pub fn path(id: &str) -> PathBuf {
     service_dir(id).join(RECORD)
 }
 
-/// The system process: it starts at boot and its creation time is an absolute timestamp, so it
-/// names the boot and is unaffected by a later change of the wall clock.
-const SYSTEM_PID: u32 = 4;
+/// Where the kernel maps `KUSER_SHARED_DATA` in every process (`MM_SHARED_USER_DATA_VA`), read-only.
+const SHARED_USER_DATA: usize = 0x7FFE_0000;
 
-/// The identity of the current boot, or `None` if the OS refuses to say.
-fn boot_identity() -> Option<u64> {
-    match ProcessId::of(SYSTEM_PID) {
-        Resolved::Found(system) => system.to_record().ok().map(|record| record.token),
-        Resolved::Gone | Resolved::Unknown => None,
-    }
+/// The number of this boot, from the shared page every process has mapped: no access check
+/// applies, unlike the System process, which only an administrator can open. It counts boots, so
+/// a change of the wall clock does not move it. (On the measured host it equals the `BootId` the
+/// prefetcher keeps in the registry.)
+fn boot_identity() -> u64 {
+    let shared = SHARED_USER_DATA as *const KUSER_SHARED_DATA;
+    // SAFETY: the kernel maps this page at this address, readable, in every process for as long as
+    // it lives, and the field is a plain `u32` the kernel wrote before any process started.
+    u64::from(unsafe { std::ptr::read_volatile(&raw const (*shared).BootId) })
 }
 
 /// Now, on the clock every record is written against.
@@ -68,3 +70,7 @@ pub fn restart_due(id: &str) -> Result<RestartDue, windows_service::Error> {
         .collect();
     Ok(restart_due_from(flag, &delays))
 }
+
+#[cfg(test)]
+#[path = "host_tests.rs"]
+mod host_tests;
