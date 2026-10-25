@@ -15,6 +15,7 @@
 use std::io;
 
 use crate::backend::scm::exit_status::RecordedExit;
+use crate::backend::scm::state_file::{ShimState, Survivor};
 use crate::manager::budget::Deadline;
 use crate::spec::Kind;
 
@@ -100,6 +101,13 @@ pub trait ScmActor {
     fn query_status(&mut self) -> io::Result<QueriedStatus>;
     /// How the service's failure actions are configured.
     fn recovery(&mut self) -> io::Result<Recovery>;
+    /// What the shim's state file and the clock say, for a `type: simple` service; `None` for one
+    /// with no shim (`type: managed`), whose pending restarts are judged by its status alone.
+    /// The file is read afresh by every call.
+    fn shim_state(&mut self) -> io::Result<Option<ShimState>>;
+    /// The daemon an earlier incomplete stop could not kill, if the state file names one that is
+    /// still running (or cannot be told not to be): its pid, and which of the two it is.
+    fn survivor(&mut self) -> io::Result<Option<(u32, Survivor)>>;
 }
 
 /// The part of a service's failure-action configuration that decides whether a failure queues a
@@ -133,30 +141,69 @@ pub struct QueriedStatus {
     pub pid: u32,
 }
 
-/// Whether a service that reached `STOPPED` with `exit` has a restart pending. The one place that
-/// decides it, for every stop path.
+/// Whether a service in `state` (`STOPPED` with `exit` recorded, when it is stopped) has a restart
+/// pending. The one place that decides it, for every stop path.
 ///
-/// SCM queues recovery for a non-zero `dwWin32ExitCode` alone, whatever the process exit code or
-/// the service-specific code, and for a stop it commanded as much as for a crash. The one non-zero
-/// code SCM records without a failure, [`ERROR_SERVICE_NEVER_STARTED`], queues nothing. The rule reads the
-/// record and the failure actions as they are now; it cannot see a restart queued under other
-/// actions or hidden by a later start (see the README).
-fn restart_pending<A: ScmActor>(a: &mut A, exit: RecordedExit) -> io::Result<bool> {
-    // A clean stop is the common case and has nothing pending whatever the configuration says.
-    if exit.win32 == 0 || exit.win32 == ERROR_SERVICE_NEVER_STARTED {
+/// A `type: simple` service is judged by the shim's state file ([`ShimState::restart_pending`]),
+/// whatever its state: a restart queued before a manual start is still to fire. The one thing the
+/// file cannot hold is a failure the shim never got to report: it died (killed, crashed), leaving
+/// the `ERROR_PROCESS_ABORTED` it never reports itself, and a record that does not call a restart
+/// pending does not cover that. Such a service is judged by its status, as any other service is.
+///
+/// A service with no shim is judged by its status alone. SCM queues recovery for a non-zero
+/// `dwWin32ExitCode`, whatever the process exit code or the service-specific code, and for a stop
+/// it commanded as much as for a crash. The one non-zero code SCM records without a failure,
+/// [`ERROR_SERVICE_NEVER_STARTED`], queues nothing. That rule reads the record and the failure
+/// actions as they are now; it cannot see a restart queued under other actions or hidden by a later
+/// start (see the README).
+fn restart_pending<A: ScmActor>(a: &mut A, state: QueriedState, exit: RecordedExit) -> io::Result<bool> {
+    let stopped = state == QueriedState::Stopped;
+    let failed = stopped && exit.win32 != 0 && exit.win32 != ERROR_SERVICE_NEVER_STARTED;
+    if let Some(shim) = a.shim_state()? {
+        if shim.restart_pending(failed) {
+            return Ok(true);
+        }
+        if stopped && exit.win32 == ERROR_PROCESS_ABORTED && !shim.disabled {
+            return status_rule(a, exit);
+        }
         return Ok(false);
     }
+    // A clean stop is the common case and has nothing pending whatever the configuration says.
+    if !failed {
+        return Ok(false);
+    }
+    status_rule(a, exit)
+}
+
+/// Whether the failure actions, as they are now, queue a restart for a `STOPPED` with `exit`.
+fn status_rule<A: ScmActor>(a: &mut A, exit: RecordedExit) -> io::Result<bool> {
     let recovery = a.recovery()?;
     Ok(recovery.restarts && (recovery.on_non_crash_failures || exit.win32 == ERROR_PROCESS_ABORTED))
+}
+
+/// Whether a daemon the shim could not kill may still be running after a `STOPPED` with `exit`.
+/// A `type: simple` service is judged by the survivor its shim recorded, which ends with the
+/// daemon; the status record of the incomplete stop outlives it. The shim records the survivor
+/// before it reports that status, but may fail to: with the status and no survivor in the file,
+/// nothing says the daemon is gone, so it may be running. A service with no shim is judged by the
+/// status alone. `kind` reads that status (see [`incomplete_stop`]).
+fn daemon_may_still_run<A: ScmActor>(a: &mut A, exit: RecordedExit, kind: Kind) -> io::Result<bool> {
+    let Some(shim) = a.shim_state()? else {
+        return Ok(incomplete_stop(exit, kind));
+    };
+    if a.survivor()?.is_some() {
+        return Ok(true);
+    }
+    Ok(incomplete_stop(exit, kind) && !shim.names_a_survivor())
 }
 
 /// What a `STOPPED` with `exit` recorded settles a stop as: a daemon that may still be running, a
 /// restart that nothing cancels, or a stopped service.
 fn settle<A: ScmActor>(a: &mut A, exit: RecordedExit, kind: Kind) -> io::Result<StopWaited> {
-    if incomplete_stop(exit, kind) {
+    if daemon_may_still_run(a, exit, kind)? {
         return Ok(StopWaited::Incomplete);
     }
-    Ok(if restart_pending(a, exit)? {
+    Ok(if restart_pending(a, QueriedState::Stopped, exit)? {
         StopWaited::RestartPending
     } else {
         StopWaited::Confirmed
@@ -164,12 +211,12 @@ fn settle<A: ScmActor>(a: &mut A, exit: RecordedExit, kind: Kind) -> io::Result<
 }
 
 /// `uninstall` stops on any `STOPPED`, whatever follows it: the delete cancels a restart.
-fn stopped_result(exit: RecordedExit, kind: Kind) -> StopWaited {
-    if incomplete_stop(exit, kind) {
+fn stopped_result<A: ScmActor>(a: &mut A, exit: RecordedExit, kind: Kind) -> io::Result<StopWaited> {
+    Ok(if daemon_may_still_run(a, exit, kind)? {
         StopWaited::Incomplete
     } else {
         StopWaited::Confirmed
-    }
+    })
 }
 
 /// Whether `exit` is the record of an incomplete stop that `kind` can have produced. Only the shim
@@ -387,11 +434,16 @@ fn stop_once<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Kind) -> io::Resu
             Rearmed::Moved => return Ok(None),
         },
         QueriedState::Stopped => return Ok(Some(settle(a, status.exit, kind)?)),
-        _ => match issue_stop(a, status, deadline)? {
-            Stopping::Moved => return Ok(None),
-            Stopping::Sent(Waited::Expired) => return Ok(Some(StopWaited::Expired)),
-            Stopping::Sent(Waited::Confirmed) => Watching::Stop,
-        },
+        state => {
+            if restart_pending(a, state, status.exit)? {
+                return Ok(Some(StopWaited::RestartPending));
+            }
+            match issue_stop(a, status, deadline)? {
+                Stopping::Moved => return Ok(None),
+                Stopping::Sent(Waited::Expired) => return Ok(Some(StopWaited::Expired)),
+                Stopping::Sent(Waited::Confirmed) => Watching::Stop,
+            }
+        }
     };
     loop {
         let Some(observed) = a.wait_callback(deadline)? else {
@@ -419,6 +471,9 @@ fn stop_once<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Kind) -> io::Resu
                 }
             }
             (Watching::Starting, Observed::Running) => {
+                if restart_pending(a, QueriedState::Running, NO_FAILURE)? {
+                    return Ok(Some(StopWaited::RestartPending));
+                }
                 watching = Watching::Stop;
                 match issue_stop_after_running(a, deadline)? {
                     Stopping::Moved => return Ok(None),
@@ -429,6 +484,9 @@ fn stop_once<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Kind) -> io::Resu
         }
     }
 }
+
+/// The record of a service that is not stopped: nothing was recorded.
+const NO_FAILURE: RecordedExit = RecordedExit { win32: 0, specific: 0 };
 
 /// `uninstall`'s teardown on one handle: stop the service, delete it, then stop whatever started
 /// in between.
@@ -496,7 +554,7 @@ fn stop_unless_stopped<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Kind) -
 fn stop_unless_stopped_once<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Kind) -> io::Result<Option<StopWaited>> {
     let status = a.query_status()?;
     let mut watching = match status.state {
-        QueriedState::Stopped => return Ok(Some(stopped_result(status.exit, kind))),
+        QueriedState::Stopped => return Ok(Some(stopped_result(a, status.exit, kind)?)),
         QueriedState::StartPending => {
             if a.arm(WantState::RestartResolves, deadline)? == Waited::Expired {
                 return Ok(Some(StopWaited::Expired));
@@ -505,7 +563,7 @@ fn stop_unless_stopped_once<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Ki
         }
         QueriedState::StopPending => match arm_stopped_then_reread(a, deadline)? {
             Rearmed::Expired => return Ok(Some(StopWaited::Expired)),
-            Rearmed::Stopped(exit) => return Ok(Some(stopped_result(exit, kind))),
+            Rearmed::Stopped(exit) => return Ok(Some(stopped_result(a, exit, kind)?)),
             Rearmed::Stopping => Watching::Stop,
             Rearmed::Moved => return Ok(None),
         },
@@ -518,7 +576,10 @@ fn stop_unless_stopped_once<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Ki
     loop {
         let rearm = match (watching, a.wait_callback(deadline)?) {
             (_, None) => return Ok(Some(StopWaited::Expired)),
-            (_, Some(Observed::Stopped)) => return Ok(Some(stopped_result(a.stopped_exit(), kind))),
+            (_, Some(Observed::Stopped)) => {
+                let exit = a.stopped_exit();
+                return Ok(Some(stopped_result(a, exit, kind)?));
+            }
             (Watching::Starting, Some(Observed::Running)) => {
                 watching = Watching::Stop;
                 match issue_stop_after_running(a, deadline)? {
@@ -533,7 +594,7 @@ fn stop_unless_stopped_once<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Ki
         if rearm == WantState::Stopped {
             match arm_stopped_then_reread(a, deadline)? {
                 Rearmed::Expired => return Ok(Some(StopWaited::Expired)),
-                Rearmed::Stopped(exit) => return Ok(Some(stopped_result(exit, kind))),
+                Rearmed::Stopped(exit) => return Ok(Some(stopped_result(a, exit, kind)?)),
                 Rearmed::Stopping => {}
                 Rearmed::Moved => return Ok(None),
             }
@@ -543,19 +604,46 @@ fn stop_unless_stopped_once<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Ki
     }
 }
 
-/// Refuse a start over a service that is `STOPPED` with the record of a stop that could not kill the
-/// daemon: SCM would accept the start, and a second daemon would run beside the first. Read before
-/// every start, since a start cannot be told from the reply alone.
+/// Refuse a start while the daemon an earlier incomplete stop could not kill is still running: SCM
+/// would accept the start, and a second daemon would run beside the first. The shim's state file
+/// names that daemon, so the refusal ends with the daemon and not with the status record the stop
+/// left, which outlives it. Read before every start, since a start cannot be told from the reply
+/// alone. (A start through `sc start` meets the same check in the shim.)
+///
+/// With the status of the incomplete stop and no survivor in the file, nothing says the daemon is
+/// gone: the shim failed to record it, or there is no shim state to ask. `kind` reads that status
+/// (see [`incomplete_stop`]).
 fn refuse_over_a_survivor<A: ScmActor>(a: &mut A, kind: Kind) -> io::Result<()> {
-    let status = a.query_status()?;
-    if status.state == QueriedState::Stopped && incomplete_stop(status.exit, kind) {
-        return Err(io::Error::other(
-            "the service is stopped, but goetia-shim could not kill its daemon at the last stop, which may \
-             still be running; a start would run a second one. Stop its process yourself, then start the \
-             service with `sc start`",
-        ));
+    if let Some((pid, survivor)) = a.survivor()? {
+        return Err(io::Error::other(survivor_refusal(pid, survivor)));
+    }
+    let unrecorded = match a.shim_state()? {
+        Some(shim) => !shim.names_a_survivor(),
+        None => true,
+    };
+    if unrecorded {
+        let status = a.query_status()?;
+        if status.state == QueriedState::Stopped && incomplete_stop(status.exit, kind) {
+            return Err(io::Error::other(
+                "goetia-shim could not kill the daemon at the last stop, which may still be running, and \
+                 has not recorded which process it is; a start would run a second one. Stop the daemon \
+                 yourself, then start the service with `sc start`",
+            ));
+        }
     }
     Ok(())
+}
+
+/// Why a start is refused over the survivor `pid`, and what to do.
+fn survivor_refusal(pid: u32, survivor: Survivor) -> String {
+    let state = match survivor {
+        Survivor::Alive => format!("process {pid} is still running"),
+        Survivor::Unknown | Survivor::Gone => format!("process {pid} could not be told not to be running"),
+    };
+    format!(
+        "goetia-shim could not kill the daemon at the last stop, which may still be running: {state}, and a \
+         start would run a second one. Stop that process yourself, then start the service"
+    )
 }
 
 /// What `StartServiceW` answered.
@@ -701,6 +789,9 @@ pub fn request_stop<A: ScmActor>(a: &mut A, kind: Kind) -> io::Result<RequestedS
             }
             QueriedState::StopPending => return Ok(RequestedStop::Issued),
             _ => {}
+        }
+        if restart_pending(a, status.state, status.exit)? {
+            return Ok(RequestedStop::RestartPending);
         }
         if control(a, &status)? {
             return Ok(RequestedStop::Issued);

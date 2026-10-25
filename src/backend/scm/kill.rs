@@ -117,6 +117,7 @@ mod system {
 
     use super::privilege::DebugPrivilege;
     use super::{KillTarget, Termination};
+    use crate::backend::scm::state_file::{self, FailureRecord, RestartDue, host};
 
     /// The real SCM service; the process is a Win32 handle.
     pub struct SystemKillTarget {
@@ -166,13 +167,26 @@ mod system {
             Ok(open_process(pid)?.map(|handle| Held { handle, pid }))
         }
 
+        /// The failure this causes is recorded in the service's state file, if it has one (a
+        /// `type: simple` service), just before the process is terminated, as the shim records its
+        /// own: SCM queues a restart for the exit, and `stop` reads the file to know. It is kept
+        /// only if this call terminated the process; one already exiting on its own was not failed
+        /// by this call.
         fn terminate(&mut self, process: &Held) -> io::Result<Termination> {
-            terminate_process(&process.handle, || {
+            let wait_notice = || {
                 eprintln!(
                     "{}: process {} is already terminating; waiting for it to exit",
                     self.id, process.pid
                 );
-            })
+            };
+            let restart = host::restart_due(&self.id).unwrap_or(RestartDue::Unknown);
+            let failure = FailureRecord::at(host::clock(), restart);
+            state_file::noting_failure_around(
+                &host::path(&self.id),
+                failure,
+                || terminate_process(&process.handle, wait_notice),
+                |termination| *termination == Termination::Terminated,
+            )
         }
     }
 

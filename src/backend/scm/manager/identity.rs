@@ -21,8 +21,9 @@ use windows_sys::Win32::Security::Authentication::Identity::{
     LSA_OBJECT_ATTRIBUTES, LSA_UNICODE_STRING, LsaAddAccountRights, LsaClose, LsaNtStatusToWinError, LsaOpenPolicy,
     POLICY_CREATE_ACCOUNT, POLICY_LOOKUP_NAMES,
 };
-use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSidToSidW};
 use windows_sys::Win32::Security::{LookupAccountNameW, LookupAccountSidW, PSID};
+use windows_sys::core::PWSTR;
 
 use crate::backend::Identity;
 use crate::error::{Error, Result};
@@ -233,6 +234,30 @@ fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
         return Err(last_error(&format!("resolve SID for account `{account_name}`")));
     }
     Ok(sid_buf)
+}
+
+/// The SID of `account_name`, as the string form (`S-1-5-19`) that `icacls` takes after a `*`.
+pub fn account_sid_string(account_name: &str) -> Result<String> {
+    let mut sid_buf = sid_for_account_name(account_name)?;
+    let mut text: PWSTR = std::ptr::null_mut();
+    // SAFETY: `sid_buf` holds a SID that `LookupAccountNameW` just wrote, and lives past the call;
+    // `text` is a valid out-param, freed with `LocalFree` below on success.
+    let ok = unsafe { ConvertSidToStringSidW(sid_buf.as_mut_ptr() as PSID, &mut text) };
+    if ok == 0 {
+        return Err(last_error(&format!("write the SID of `{account_name}` as a string")));
+    }
+    let mut len = 0usize;
+    // SAFETY: `text` is a NUL-terminated wide string that `ConvertSidToStringSidW` allocated.
+    while unsafe { *text.add(len) } != 0 {
+        len += 1;
+    }
+    // SAFETY: `text[..len]` is the string just measured.
+    let sid = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) });
+    // SAFETY: allocated by `ConvertSidToStringSidW`, freed exactly once, after the copy above.
+    unsafe {
+        LocalFree(text.cast());
+    }
+    Ok(sid)
 }
 
 // SeServiceLogonRight =================================================================================================

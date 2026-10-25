@@ -110,6 +110,14 @@ pub fn fallback_log(id: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read fallback log {}: {e}", path.display()))
 }
 
+/// Grants `Everyone` read and execute on the file at `path`, by well-known SID. A service account
+/// other than `LocalSystem` cannot be assumed to reach the repository's build tree, which CI checks
+/// out under an ACL scoped to the runner's own account. Parent directories need no grant:
+/// traversal is not checked.
+pub fn grant_everyone_read_and_execute(path: &str) {
+    support::cmd::run("icacls.exe", &[path, "/grant", "*S-1-1-0:(RX)"]).expect_ok();
+}
+
 /// `taskkill /F` on `pid`: the way a test ends a shim or a daemon without telling either.
 pub fn kill_process(pid: u32) {
     support::cmd::run("taskkill.exe", &["/F", "/PID", &pid.to_string()]).expect_ok();

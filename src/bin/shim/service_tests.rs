@@ -259,9 +259,13 @@ fn no_running_report_when_no_thread_can_be_made() {
     let _no_thread = waiter_threads::threads(0);
     let mut running_reports = 0;
 
-    let reported = run_daemon(&spec(dir.path(), id.as_str()), &stop_bus, id.as_str(), || {
-        running_reports += 1
-    });
+    let reported = run_daemon(
+        &spec(dir.path(), id.as_str()),
+        &stop_bus,
+        id.as_str(),
+        || running_reports += 1,
+        |_| {},
+    );
 
     assert_eq!(
         running_reports, 0,
@@ -290,7 +294,7 @@ fn no_running_report_when_the_spawn_fails() {
     };
     let mut running_reports = 0;
 
-    let reported = run_daemon(&missing, &stop_bus, id.as_str(), || running_reports += 1);
+    let reported = run_daemon(&missing, &stop_bus, id.as_str(), || running_reports += 1, |_| {});
 
     assert_eq!(
         running_reports, 0,
@@ -314,11 +318,22 @@ fn running_is_reported_once_and_after_the_spawn() {
     let spawned_before = test_hook::spawns();
     let mut running_reports = Vec::new();
 
+    let mut survivors = Vec::new();
     // The stop ends the pass once the report is made; the daemon sleeps until then.
-    let reported = run_daemon(&spec(dir.path(), id.as_str()), &stop_bus, id.as_str(), || {
-        running_reports.push(test_hook::spawns() - spawned_before);
-        stop_bus.request_stop();
-    });
+    let reported = run_daemon(
+        &spec(dir.path(), id.as_str()),
+        &stop_bus,
+        id.as_str(),
+        || {
+            running_reports.push(test_hook::spawns() - spawned_before);
+            stop_bus.request_stop();
+        },
+        |survivor| survivors.push(survivor),
+    );
+    assert!(
+        survivors.is_empty(),
+        "a daemon the stop killed is no survivor: {survivors:?}"
+    );
 
     assert_eq!(
         running_reports,
@@ -346,7 +361,7 @@ fn a_daemon_that_exits_nonzero_is_one_pass() {
         ..powershell(dir.path(), id.as_str(), "exit 7")
     };
 
-    let reported = run_daemon(&daemon, &stop_bus, id.as_str(), || {});
+    let reported = run_daemon(&daemon, &stop_bus, id.as_str(), || {}, |_| {});
 
     assert_eq!(reported, Reported::DaemonExit(7));
     assert_eq!(test_hook::spawns(), spawned_before + 1, "the daemon was spawned again");
@@ -364,6 +379,7 @@ fn a_daemon_that_exits_zero_is_clean() {
         &stop_bus,
         id.as_str(),
         || {},
+        |_| {},
     );
 
     assert_eq!(reported, Reported::Clean);
@@ -387,12 +403,22 @@ fn an_unkillable_daemon_reports_the_incomplete_stop_failure() {
         ),
     );
 
+    let mut survivors = Vec::new();
     let reported = {
         let _refused = kills(Kill::Refuse);
-        run_daemon(&daemon, &stop_bus, id.as_str(), || stop_bus.request_stop())
+        run_daemon(
+            &daemon,
+            &stop_bus,
+            id.as_str(),
+            || stop_bus.request_stop(),
+            |survivor| survivors.push(survivor),
+        )
     };
 
     assert_eq!(reported, Reported::incomplete_stop());
+    // The identity handed over is the daemon's own, and it is the process that outlived the stop.
+    assert_eq!(survivors.len(), 1, "{survivors:?}");
+    assert_eq!(survivors[0].is_alive(), Liveness::Alive, "{survivors:?}");
     std::fs::write(&release, "").expect("release the daemon");
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
     let lines = take(id.as_str());

@@ -5,8 +5,11 @@
 
 use std::collections::VecDeque;
 
+use cosca::identity::ProcessId;
+
 use super::*;
 use crate::backend::scm::exit_status::{RecordedExit, Reported};
+use crate::backend::scm::state_file::{Clock, FailureRecord, Loaded, RestartDue, ShimState, StateRecord, Survivor};
 use crate::manager::budget::{Budget, Deadline};
 use crate::spec::Kind;
 
@@ -51,6 +54,10 @@ struct FakeScm {
     controls: VecDeque<ControlReply>,
     /// Whether `query_status` reports the service as accepting `STOP`.
     accepts_stop: bool,
+    /// What `shim_state` answers: `None` is a service with no state file (`type: managed`).
+    shim: Option<ShimState>,
+    /// The survivor `survivor` finds.
+    survivor: Option<(u32, Survivor)>,
     /// The `dwWaitHint` of a `Stopped` the script delivers.
     wait_hint: u32,
 }
@@ -77,6 +84,8 @@ impl FakeScm {
             recovery_reads: 0,
             controls: VecDeque::new(),
             accepts_stop: true,
+            shim: None,
+            survivor: None,
             wait_hint: 0,
         }
     }
@@ -84,6 +93,18 @@ impl FakeScm {
     /// The next `control_stop` calls answer these, front to back.
     fn controlled<const N: usize>(mut self, replies: [ControlReply; N]) -> Self {
         self.controls = replies.into();
+        self
+    }
+
+    /// The service is a `type: simple` one, and `shim` is what its state file and clock say.
+    fn with_shim(mut self, shim: ShimState) -> Self {
+        self.shim = Some(shim);
+        self
+    }
+
+    /// An earlier incomplete stop left this daemon behind.
+    fn with_survivor(mut self, pid: u32, survivor: Survivor) -> Self {
+        self.survivor = Some((pid, survivor));
         self
     }
 
@@ -249,6 +270,13 @@ impl ScmActor for FakeScm {
             pid: self.pids.pop_front().unwrap_or(0),
         })
     }
+    fn shim_state(&mut self) -> std::io::Result<Option<ShimState>> {
+        Ok(self.shim.clone())
+    }
+    fn survivor(&mut self) -> std::io::Result<Option<(u32, Survivor)>> {
+        self.log.push("survivor");
+        Ok(self.survivor)
+    }
     fn recovery(&mut self) -> std::io::Result<Recovery> {
         self.recovery_reads += 1;
         self.recovery
@@ -339,7 +367,10 @@ fn start_via_notify_arms_running_before_start_then_gates_on_running() {
     );
     // The critical ordering: arm RUNNING strictly BEFORE start, else a
     // RUNNING reached before the arm fires only on the NEXT entry — a hang.
-    assert_eq!(fake.log, vec!["query", "arm_running", "start", "wait", "got_running"]);
+    assert_eq!(
+        fake.log,
+        vec!["survivor", "query", "arm_running", "start", "wait", "got_running"]
+    );
 }
 
 #[skuld::test]
@@ -355,6 +386,7 @@ fn start_re_arms_after_a_non_terminal_callback() {
     assert_eq!(
         fake.log,
         vec![
+            "survivor",
             "query",
             "arm_running",
             "start",
@@ -512,7 +544,10 @@ fn an_expired_deadline_still_issues_the_start_request() {
         start_via_notify(&mut fake, spent(), Kind::Simple, Kind::Simple).unwrap(),
         Waited::Expired
     );
-    assert_eq!(fake.log, vec!["query", "arm_running", "start", "wait", "got_nothing"]);
+    assert_eq!(
+        fake.log,
+        vec!["survivor", "query", "arm_running", "start", "wait", "got_nothing"]
+    );
 }
 
 /// A deadline no re-derivation inside the wait can reproduce: an hour out,
@@ -577,7 +612,7 @@ fn an_arm_that_keeps_lagging_returns_expired_instead_of_looping() {
         start_via_notify(&mut fake, spent(), Kind::Simple, Kind::Simple).unwrap(),
         Waited::Expired
     );
-    assert_eq!(fake.log, vec!["query", "arm_running", "start"]);
+    assert_eq!(fake.log, vec!["survivor", "query", "arm_running", "start"]);
 }
 
 #[skuld::test]
@@ -594,7 +629,7 @@ fn a_start_the_scm_rejects_is_reported_as_a_failed_start() {
 fn request_start_arms_nothing_and_waits_for_nothing() {
     let mut fake = FakeScm::new([]);
     request_start(&mut fake, Kind::Simple).unwrap();
-    assert_eq!(fake.log, vec!["query", "start"]);
+    assert_eq!(fake.log, vec!["survivor", "query", "start"]);
 }
 
 #[skuld::test]
@@ -1805,7 +1840,7 @@ fn a_start_the_scm_answers_already_running_is_confirmed_whatever_the_deadline() 
         );
         assert_eq!(
             fake.log,
-            vec!["query", "arm_running", "start"],
+            vec!["survivor", "query", "arm_running", "start"],
             "nothing left to wait for"
         );
     }
@@ -1839,7 +1874,7 @@ fn a_start_after_an_unconfirmed_stop_refuses_a_service_still_reading_running() {
     assert!(request_start_after_stop(&mut fake, Kind::Simple).is_err());
     assert_eq!(
         fake.log,
-        vec!["query", "start"],
+        vec!["survivor", "query", "start"],
         "it arms nothing and waits for nothing"
     );
 }
@@ -1870,31 +1905,96 @@ fn a_start_after_an_unconfirmed_stop_that_the_scm_accepts_is_ok() {
 
 // a start over a daemon that may still be running ---------------------------------------------------------------------
 
-/// A service `STOPPED` with the record of a stop that could not kill the daemon holds a daemon that
-/// may be running, and `StartServiceW` would accept the start. No start goes out over it, whichever
-/// verb or budget asks.
+/// The shim's state file names a daemon an earlier incomplete stop could not kill, and it is still
+/// there. `StartServiceW` would accept the start, so no start goes out over it, whichever verb or
+/// budget asks.
 #[skuld::test]
-fn no_start_is_issued_over_the_record_of_an_incomplete_stop() {
-    let found = |fake: FakeScm| fake.found(QueriedState::Stopped, incomplete_stop());
+fn no_start_is_issued_over_a_survivor_that_is_still_running() {
+    let found = |fake: FakeScm| fake.with_survivor(4321, Survivor::Alive);
     let mut fake = found(FakeScm::new([]));
     let e = start_via_notify(&mut fake, unbounded(), Kind::Simple, Kind::Simple).unwrap_err();
     assert!(e.to_string().contains("may still be running"), "{e}");
-    assert_eq!(fake.log, vec!["query"]);
+    assert!(e.to_string().contains("4321"), "{e}");
+    assert_eq!(fake.log, vec!["survivor"]);
 
     let mut fake = found(FakeScm::new([]));
     let e = request_start(&mut fake, Kind::Simple).unwrap_err();
-    assert!(e.to_string().contains("may still be running"), "{e}");
-    assert_eq!(fake.log, vec!["query"]);
+    assert!(e.to_string().contains("4321"), "{e}");
+    assert_eq!(fake.log, vec!["survivor"]);
 
     let mut fake = found(FakeScm::new([]));
     let e = request_start_after_stop(&mut fake, Kind::Simple).unwrap_err();
-    assert!(e.to_string().contains("may still be running"), "{e}");
-    assert_eq!(fake.log, vec!["query"]);
+    assert!(e.to_string().contains("4321"), "{e}");
+    assert_eq!(fake.log, vec!["survivor"]);
 }
 
-/// Only that record refuses: every other state, and every other record, is started as before.
+/// A survivor the OS would not say is gone is treated as running, and the message says why.
 #[skuld::test]
-fn a_start_over_any_other_state_or_record_is_issued() {
+fn a_survivor_the_os_cannot_tell_gone_also_blocks_a_start_and_the_message_says_so() {
+    let mut fake = FakeScm::new([]).with_survivor(77, Survivor::Unknown);
+
+    let e = request_start(&mut fake, Kind::Simple).unwrap_err();
+
+    assert!(e.to_string().contains("77"), "{e}");
+    assert!(e.to_string().contains("could not be told"), "{e}");
+    assert_eq!(fake.log, vec!["survivor"]);
+}
+
+/// The shim may fail to record the survivor it reports with the incomplete stop. A `type: simple`
+/// service stopped with that status record and a file that names no survivor is refused a start,
+/// whichever verb or budget asks, since the daemon may be running and nothing says it is not.
+#[skuld::test]
+fn no_start_is_issued_over_the_incomplete_stop_status_when_the_survivor_was_not_recorded() {
+    let found = || {
+        FakeScm::new([])
+            .found(QueriedState::Stopped, incomplete_stop())
+            .with_shim(state_without_a_record())
+    };
+    let mut fake = found();
+    let e = start_via_notify(&mut fake, unbounded(), Kind::Simple, Kind::Simple).unwrap_err();
+    assert!(e.to_string().contains("not recorded which process"), "{e}");
+    assert_eq!(fake.log, vec!["survivor", "query"]);
+
+    let mut fake = found();
+    let e = request_start(&mut fake, Kind::Simple).unwrap_err();
+    assert!(e.to_string().contains("sc start"), "{e}");
+    assert_eq!(fake.log, vec!["survivor", "query"]);
+
+    let mut fake = found();
+    let e = request_start_after_stop(&mut fake, Kind::Simple).unwrap_err();
+    assert!(e.to_string().contains("may still be running"), "{e}");
+    assert_eq!(fake.log, vec!["survivor", "query"]);
+}
+
+/// Only a recorded survivor that is gone makes the status record of the incomplete stop stale.
+#[skuld::test]
+fn a_start_over_the_incomplete_stop_status_is_issued_when_the_recorded_survivor_is_gone() {
+    let mut fake = FakeScm::new([])
+        .found(QueriedState::Stopped, incomplete_stop())
+        .with_shim(state_with_a_gone_survivor());
+    request_start(&mut fake, Kind::Simple).unwrap();
+    assert_eq!(fake.log, vec!["survivor", "start"]);
+}
+
+/// The status record only means a stop was incomplete while the service is stopped with it.
+#[skuld::test]
+fn a_simple_service_not_stopped_with_the_incomplete_stop_status_is_started_with_no_survivor() {
+    for (state, exit) in [
+        (QueriedState::Stopped, stopped_clean()),
+        (QueriedState::Stopped, daemon_failed()),
+        (QueriedState::Stopped, shim_failed()),
+        (QueriedState::Running, incomplete_stop()),
+        (QueriedState::StartPending, incomplete_stop()),
+    ] {
+        let mut fake = FakeScm::new([]).found(state, exit).with_shim(state_without_a_record());
+        request_start(&mut fake, Kind::Simple).unwrap();
+        assert_eq!(fake.log, vec!["survivor", "query", "start"], "{state:?} {exit:?}");
+    }
+}
+
+/// With no survivor every state and record is started as before.
+#[skuld::test]
+fn a_start_over_any_state_or_record_is_issued_when_no_survivor_lives() {
     for (state, exit) in [
         (QueriedState::Stopped, stopped_clean()),
         (QueriedState::Stopped, daemon_failed()),
@@ -1904,12 +2004,524 @@ fn a_start_over_any_other_state_or_record_is_issued() {
     ] {
         let mut fake = FakeScm::new([]).found(state, exit);
         request_start(&mut fake, Kind::Simple).unwrap();
-        assert_eq!(fake.log, vec!["query", "start"], "{state:?} {exit:?}");
+        assert_eq!(fake.log, vec!["survivor", "query", "start"], "{state:?} {exit:?}");
 
         let mut fake = FakeScm::new([]).found(state, exit);
         request_start_after_stop(&mut fake, Kind::Simple).unwrap();
-        assert_eq!(fake.log, vec!["query", "start"], "{state:?} {exit:?}");
+        assert_eq!(fake.log, vec!["survivor", "query", "start"], "{state:?} {exit:?}");
     }
+}
+
+// a simple service's pending restart: the shim's state file decides ---------------------------------------------------
+
+/// A failure at 1000 ms with a restart due after 5000 ms, read at `now_ms`.
+fn state_with_a_restart_due(now_ms: u64) -> ShimState {
+    let mut record = StateRecord::empty();
+    record.failure = Some(FailureRecord {
+        boot: Some(1),
+        at_ms: 1000,
+        restart: RestartDue::After(5000),
+    });
+    ShimState {
+        loaded: Loaded::Record(record),
+        now: Clock {
+            boot: Some(1),
+            ms: now_ms,
+        },
+        disabled: false,
+    }
+}
+
+/// No file: no record.
+fn state_without_a_record() -> ShimState {
+    ShimState {
+        loaded: Loaded::Absent,
+        now: Clock {
+            boot: Some(1),
+            ms: 1100,
+        },
+        disabled: false,
+    }
+}
+
+#[skuld::test]
+fn a_stop_of_a_simple_service_in_its_restart_delay_is_refused_and_sends_nothing() {
+    let found = || {
+        FakeScm::new([])
+            .found(QueriedState::Stopped, daemon_failed())
+            .with_shim(state_with_a_restart_due(1100))
+    };
+
+    let mut fake = found();
+    assert_eq!(
+        stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        StopWaited::RestartPending
+    );
+    assert_eq!(fake.log, vec!["query", "survivor"]);
+
+    let mut fake = found();
+    assert_eq!(
+        request_stop(&mut fake, Kind::Simple).unwrap(),
+        RequestedStop::RestartPending
+    );
+    assert_eq!(fake.log, vec!["query", "survivor"]);
+}
+
+/// The record decides, not the failure actions as they are now: a restart queued under a policy
+/// that has since been cleared still fires, and one never queued is not made pending by actions
+/// added later. The actions are not even read.
+#[skuld::test]
+fn a_simple_service_is_judged_by_its_record_and_never_by_its_current_failure_actions() {
+    // Policy cleared in the delay: the status rule would say nothing is pending.
+    let mut fake = FakeScm::new([])
+        .found(QueriedState::Stopped, daemon_failed())
+        .with_shim(state_with_a_restart_due(1100));
+    assert_eq!(
+        stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        StopWaited::RestartPending
+    );
+    assert_eq!(fake.recovery_reads, 0);
+
+    // Actions added after a failure that queued nothing: the status rule would say pending.
+    let mut fake = FakeScm::new([])
+        .found(QueriedState::Stopped, daemon_failed())
+        .restarting()
+        .with_shim(state_without_a_record());
+    assert_eq!(
+        stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        StopWaited::Confirmed
+    );
+    assert_eq!(fake.recovery_reads, 0);
+}
+
+/// A manual start in the delay leaves a running service the status calls healthy, with the queued
+/// restart still to fire after a stop.
+#[skuld::test]
+fn a_running_simple_service_with_a_live_record_is_not_stopped() {
+    let found = || {
+        FakeScm::new([])
+            .found(QueriedState::Running, stopped_clean())
+            .with_shim(state_with_a_restart_due(1500))
+    };
+
+    let mut fake = found();
+    assert_eq!(
+        stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        StopWaited::RestartPending
+    );
+    assert!(!fake.log.contains(&"control_stop"), "{:?}", fake.log);
+
+    let mut fake = found();
+    assert_eq!(
+        request_stop(&mut fake, Kind::Simple).unwrap(),
+        RequestedStop::RestartPending
+    );
+    assert!(!fake.log.contains(&"control_stop"), "{:?}", fake.log);
+}
+
+/// Past the due time and its margin the entry is spent: the service is stopped as any running one.
+#[skuld::test]
+fn a_running_simple_service_whose_record_is_spent_is_stopped() {
+    let spent = state_with_a_restart_due(1000 + 5000 + crate::backend::scm::state_file::FIRE_MARGIN_MS);
+    let mut fake = FakeScm::new([Some(Observed::Stopped)])
+        .found(QueriedState::Running, stopped_clean())
+        .stopped_with([stopped_clean()])
+        .with_shim(spent);
+
+    assert_eq!(
+        stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        StopWaited::Confirmed
+    );
+
+    assert!(fake.log.contains(&"control_stop"), "{:?}", fake.log);
+}
+
+/// A daemon that failed as the stop was delivered: the stop is judged on the record the shim wrote
+/// before it reported, and the wait does not report a stop that SCM is about to undo.
+#[skuld::test]
+fn a_stopped_that_carries_a_failure_with_a_live_record_is_a_pending_restart() {
+    // No record at the first read (the service looked healthy and was running), a live one by the
+    // time the `STOPPED` arrives.
+    struct RecordAppearsWhileStopping(FakeScm);
+    impl ScmActor for RecordAppearsWhileStopping {
+        fn arm(&mut self, want: WantState, deadline: Deadline) -> std::io::Result<Waited> {
+            self.0.arm(want, deadline)
+        }
+        fn control_stop(&mut self) -> std::io::Result<ControlReply> {
+            // The daemon fails as the control lands: the shim writes its record first.
+            self.0.shim = Some(state_with_a_restart_due(1100));
+            self.0.control_stop()
+        }
+        fn reopen_service(&mut self) -> std::io::Result<()> {
+            self.0.reopen_service()
+        }
+        fn delete(&mut self) -> std::io::Result<()> {
+            self.0.delete()
+        }
+        fn start(&mut self) -> std::io::Result<StartReply> {
+            self.0.start()
+        }
+        fn wait_callback(&mut self, deadline: Deadline) -> std::io::Result<Option<Observed>> {
+            self.0.wait_callback(deadline)
+        }
+        fn stopped_exit(&self) -> RecordedExit {
+            self.0.stopped_exit()
+        }
+        fn stopped_wait_hint(&self) -> u32 {
+            self.0.stopped_wait_hint()
+        }
+        fn query_status(&mut self) -> std::io::Result<QueriedStatus> {
+            self.0.query_status()
+        }
+        fn recovery(&mut self) -> std::io::Result<Recovery> {
+            self.0.recovery()
+        }
+        fn shim_state(&mut self) -> std::io::Result<Option<ShimState>> {
+            self.0.shim_state()
+        }
+        fn survivor(&mut self) -> std::io::Result<Option<(u32, Survivor)>> {
+            self.0.survivor()
+        }
+    }
+
+    let mut fake = RecordAppearsWhileStopping(
+        FakeScm::new([Some(Observed::Stopped)])
+            .found(QueriedState::Running, stopped_clean())
+            .stopped_with([daemon_failed()])
+            .with_shim(state_without_a_record()),
+    );
+
+    assert_eq!(
+        stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        StopWaited::RestartPending
+    );
+}
+
+/// A starting service refuses a stop; once it runs the record is read again, since a run that
+/// starts before the due time is a manual start with the entry still live.
+#[skuld::test]
+fn a_stop_that_waits_for_a_start_reads_the_record_when_the_service_runs() {
+    let mut fake = FakeScm::new([Some(Observed::Running)])
+        .found(QueriedState::StartPending, stopped_clean())
+        .with_shim(state_with_a_restart_due(1500));
+
+    assert_eq!(
+        stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        StopWaited::RestartPending
+    );
+
+    assert!(!fake.log.contains(&"control_stop"), "{:?}", fake.log);
+}
+
+/// Uninstall never waits on or judges a restart: the delete cancels it.
+#[skuld::test]
+fn uninstall_ignores_a_pending_restart_in_the_record() {
+    let mut fake = FakeScm::new([])
+        .found(QueriedState::Stopped, daemon_failed())
+        .with_shim(state_with_a_restart_due(1100));
+
+    assert_eq!(
+        uninstall_teardown(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        StopWaited::Confirmed
+    );
+
+    assert!(fake.log.contains(&"delete"), "{:?}", fake.log);
+    assert!(!fake.log.contains(&"control_stop"), "{:?}", fake.log);
+}
+
+/// A service with no state file keeps the status rule, whose cases the README states.
+#[skuld::test]
+fn a_service_with_no_state_file_is_judged_by_its_status() {
+    let mut fake = FakeScm::new([])
+        .found(QueriedState::Stopped, daemon_failed())
+        .restarting();
+
+    assert_eq!(
+        stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        StopWaited::RestartPending
+    );
+    assert_eq!(fake.recovery_reads, 1);
+}
+
+/// What SCM records for a process that ended without reporting `STOPPED`, which the shim never
+/// reports itself.
+fn shim_died() -> RecordedExit {
+    RecordedExit {
+        win32: 1067,
+        specific: 0,
+    }
+}
+
+/// A file whose record names a survivor that is no longer running.
+fn state_with_a_gone_survivor() -> ShimState {
+    let mut gone = ProcessId::current().to_record().expect("this process has an identity");
+    gone.token += 1;
+    let mut record = StateRecord::empty();
+    record.survivor = Some(gone);
+    ShimState {
+        loaded: Loaded::Record(record),
+        ..state_without_a_record()
+    }
+}
+
+fn state_without_a_record_disabled() -> ShimState {
+    ShimState {
+        disabled: true,
+        ..state_without_a_record()
+    }
+}
+
+/// A failure the shim recorded as queuing nothing.
+fn state_with_a_failure_that_queued_nothing() -> ShimState {
+    let mut record = StateRecord::empty();
+    record.failure = Some(FailureRecord {
+        boot: Some(1),
+        at_ms: 1000,
+        restart: RestartDue::Never,
+    });
+    ShimState {
+        loaded: Loaded::Record(record),
+        now: Clock {
+            boot: Some(1),
+            ms: 1100,
+        },
+        disabled: false,
+    }
+}
+
+/// A shim that died without reporting (taskkill, a crash) wrote no record, and leaves the 1067 it
+/// never reports itself. That is a crash to SCM, which queued a restart if recovery is configured.
+#[skuld::test]
+fn a_simple_service_whose_shim_died_unreported_is_judged_by_its_status_when_no_record_covers_it() {
+    for shim in [state_without_a_record(), state_with_a_failure_that_queued_nothing()] {
+        let found = || {
+            FakeScm::new([])
+                .found(QueriedState::Stopped, shim_died())
+                .restarting()
+                .with_shim(shim.clone())
+        };
+
+        let mut fake = found();
+        assert_eq!(
+            stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+            StopWaited::RestartPending,
+            "{shim:?}"
+        );
+        assert_eq!(fake.recovery_reads, 1);
+
+        let mut fake = found();
+        assert_eq!(
+            request_stop(&mut fake, Kind::Simple).unwrap(),
+            RequestedStop::RestartPending
+        );
+    }
+}
+
+#[skuld::test]
+fn a_stopped_notification_carrying_1067_with_no_record_is_a_pending_restart() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)])
+        .found(QueriedState::Running, stopped_clean())
+        .stopped_with([shim_died()])
+        .restarting()
+        .with_shim(state_without_a_record());
+
+    assert_eq!(
+        stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        StopWaited::RestartPending
+    );
+}
+
+#[skuld::test]
+fn a_simple_service_whose_shim_died_unreported_with_no_recovery_configured_is_a_confirmed_stop() {
+    let mut fake = FakeScm::new([])
+        .found(QueriedState::Stopped, shim_died())
+        .with_shim(state_without_a_record());
+
+    assert_eq!(
+        stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        StopWaited::Confirmed
+    );
+    assert_eq!(fake.recovery_reads, 1, "the failure actions decide, so they are read");
+}
+
+#[skuld::test]
+fn a_disabled_simple_service_whose_shim_died_unreported_has_nothing_pending() {
+    let mut fake = FakeScm::new([])
+        .found(QueriedState::Stopped, shim_died())
+        .restarting()
+        .with_shim(state_without_a_record_disabled());
+
+    assert_eq!(
+        stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        StopWaited::Confirmed
+    );
+}
+
+/// The fall-back is for the one code the shim never reports. A failure the shim did report and
+/// recorded nothing for is still "no record".
+#[skuld::test]
+fn only_a_1067_falls_back_on_the_status_rule() {
+    let mut fake = FakeScm::new([])
+        .found(QueriedState::Stopped, daemon_failed())
+        .restarting()
+        .with_shim(state_without_a_record());
+
+    assert_eq!(
+        stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        StopWaited::Confirmed
+    );
+    assert_eq!(fake.recovery_reads, 0);
+}
+
+// a simple service's survivor: the state file decides whether a daemon may still run ----------------------------------
+
+/// The status record of an incomplete stop outlives the daemon. A `type: simple` service stopped
+/// with it whose recorded survivor is gone is stopped, for every stop path.
+#[skuld::test]
+fn a_simple_service_with_the_status_record_of_an_incomplete_stop_and_a_gone_survivor_is_stopped() {
+    let found = || {
+        FakeScm::new([])
+            .found(QueriedState::Stopped, incomplete_stop())
+            .with_shim(state_with_a_gone_survivor())
+    };
+
+    let mut fake = found();
+    assert_eq!(
+        stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        StopWaited::Confirmed
+    );
+
+    let mut fake = found();
+    assert_eq!(request_stop(&mut fake, Kind::Simple).unwrap(), RequestedStop::Issued);
+
+    let mut fake = found();
+    assert_eq!(
+        uninstall_teardown(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        StopWaited::Confirmed
+    );
+
+    let mut fake = FakeScm::new([Some(Observed::Stopped)])
+        .stopped_after(Reported::incomplete_stop())
+        .with_shim(state_with_a_gone_survivor());
+    assert_eq!(
+        stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        StopWaited::Confirmed
+    );
+}
+
+/// The shim records the survivor before it reports the incomplete stop, and may fail to. The
+/// status record then stands alone: nothing says the daemon is gone, so the stop is incomplete,
+/// whether the file is absent, unreadable or holds a record without a survivor.
+#[skuld::test]
+fn a_simple_service_with_the_status_record_of_an_incomplete_stop_and_no_recorded_survivor_is_incomplete() {
+    for shim in [
+        state_without_a_record(),
+        ShimState {
+            loaded: Loaded::Unreadable("garbled".to_string()),
+            ..state_without_a_record()
+        },
+        ShimState {
+            loaded: Loaded::Record(StateRecord::empty()),
+            ..state_without_a_record()
+        },
+    ] {
+        let found = || {
+            FakeScm::new([])
+                .found(QueriedState::Stopped, incomplete_stop())
+                .with_shim(shim.clone())
+        };
+
+        let mut fake = found();
+        assert_eq!(
+            stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+            StopWaited::Incomplete,
+            "{shim:?}"
+        );
+
+        let mut fake = found();
+        assert_eq!(
+            request_stop(&mut fake, Kind::Simple).unwrap(),
+            RequestedStop::Incomplete,
+            "{shim:?}"
+        );
+
+        let mut fake = found();
+        assert_eq!(
+            uninstall_teardown(&mut fake, unbounded(), Kind::Simple).unwrap(),
+            StopWaited::Incomplete,
+            "{shim:?}"
+        );
+        assert!(fake.log.contains(&"delete"), "{:?}", fake.log);
+
+        // A running service whose file is unreadable is refused before any stop is issued.
+        if matches!(shim.loaded, Loaded::Unreadable(_)) {
+            continue;
+        }
+        let mut fake = FakeScm::new([Some(Observed::Stopped)])
+            .stopped_after(Reported::incomplete_stop())
+            .with_shim(shim.clone());
+        assert_eq!(
+            stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+            StopWaited::Incomplete,
+            "{shim:?}"
+        );
+    }
+}
+
+/// A live survivor is a daemon that may still be running, whatever the status record says.
+#[skuld::test]
+fn a_simple_service_with_a_live_survivor_is_an_incomplete_stop_whatever_the_status_records() {
+    for survivor in [Survivor::Alive, Survivor::Unknown] {
+        let found = || {
+            FakeScm::new([])
+                .found(QueriedState::Stopped, stopped_clean())
+                .with_shim(state_without_a_record())
+                .with_survivor(4321, survivor)
+        };
+
+        let mut fake = found();
+        assert_eq!(
+            stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+            StopWaited::Incomplete,
+            "{survivor:?}"
+        );
+
+        let mut fake = found();
+        assert_eq!(
+            request_stop(&mut fake, Kind::Simple).unwrap(),
+            RequestedStop::Incomplete
+        );
+
+        let mut fake = found();
+        assert_eq!(
+            uninstall_teardown(&mut fake, unbounded(), Kind::Simple).unwrap(),
+            StopWaited::Incomplete
+        );
+        assert!(fake.log.contains(&"delete"), "{:?}", fake.log);
+    }
+
+    let mut fake = FakeScm::new([Some(Observed::Stopped)])
+        .stopped_with([stopped_clean()])
+        .with_shim(state_without_a_record())
+        .with_survivor(4321, Survivor::Alive);
+    assert_eq!(
+        stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        StopWaited::Incomplete
+    );
+}
+
+/// The survivor check comes before the pending-restart check, as the status check did.
+#[skuld::test]
+fn a_live_survivor_is_reported_before_a_pending_restart() {
+    let mut fake = FakeScm::new([])
+        .found(QueriedState::Stopped, daemon_failed())
+        .with_shim(state_with_a_restart_due(1100))
+        .with_survivor(4321, Survivor::Alive);
+
+    assert_eq!(
+        stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        StopWaited::Incomplete
+    );
 }
 
 // the lagging-registration (1294) retry loop --------------------------------------------------------------------------

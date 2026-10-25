@@ -13,6 +13,7 @@ use std::os::windows::io::AsRawHandle as _;
 use std::sync::Arc;
 use std::time::Duration;
 
+use cosca::identity::ProcessId;
 use cosca::{Child, Fd, Stdio};
 use goetia::backend::scm::exit_status::{
     ERROR_BAD_ARGUMENTS, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_INVALID_DATA, Reported,
@@ -29,6 +30,7 @@ use windows_sys::Win32::System::Services::{
 };
 
 use crate::logging;
+use crate::state::{self, Store};
 use crate::stop_bus::{StopBus, WaitOutcome, Waiter};
 
 // Entry ===============================================================================================================
@@ -71,6 +73,7 @@ fn run_service(id: &str) {
         }
     };
 
+    let store = Store::for_service(id);
     let blob = match read_spec_blob(id) {
         Ok(Some(b)) => b,
         Ok(None) => {
@@ -82,6 +85,7 @@ fn run_service(id: &str) {
             finish(
                 id,
                 &status_handle,
+                &store,
                 Reported::shim_failure(Some(ERROR_INVALID_DATA as i32)),
             );
         }
@@ -90,19 +94,32 @@ fn run_service(id: &str) {
             finish(
                 id,
                 &status_handle,
+                &store,
                 Reported::shim_failure(Some(ERROR_INVALID_DATA as i32)),
             );
         }
     };
 
     log_version_skew(id, &blob.spec, &blob.version, goetia::version());
-    let reported = run_daemon(&blob.spec, &stop_bus, id, || report_running(id, &status_handle));
-    finish(id, &status_handle, reported);
+    if let Err(reported) = state::begin(id, &store) {
+        finish(id, &status_handle, &store, reported);
+    }
+    let reported = run_daemon(
+        &blob.spec,
+        &stop_bus,
+        id,
+        || report_running(id, &status_handle),
+        |survivor| state::record_survivor(id, &store, survivor),
+    );
+    finish(id, &status_handle, &store, reported);
 }
 
-/// Tell SCM the service stopped, then end the process. SCM restarts the service or not from
-/// the status reported here, never from the process exit code.
-fn finish(id: &str, status_handle: &ServiceStatusHandle, reported: Reported) -> ! {
+/// Record the failure `reported` stands for, tell SCM the service stopped, then end the process.
+/// SCM restarts the service or not from the status reported here, never from the process exit
+/// code. The record comes first: SCM's restart can follow the report at once, and
+/// `goetia daemon stop` has to find the record by then.
+fn finish(id: &str, status_handle: &ServiceStatusHandle, store: &Store, reported: Reported) -> ! {
+    state::record_failure(id, store, reported);
     report_stopped(id, status_handle, reported);
     std::process::exit(reported.process_exit_code());
 }
@@ -172,7 +189,16 @@ fn report_stopped(id: &str, handle: &ServiceStatusHandle, reported: Reported) {
 /// `on_running` is called exactly once, after the daemon is spawned and never when launching failed.
 /// A daemon that cannot start is therefore `STOPPED` with a non-zero Win32 code without ever having
 /// been `RUNNING`, which `start_via_notify` reads as a failed start under every restart policy.
-fn run_daemon(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, on_running: impl FnOnce()) -> Reported {
+///
+/// `on_survivor` is called, with the daemon's identity, only for a stop that could not kill it, and
+/// before the incomplete stop is returned to be reported.
+fn run_daemon(
+    spec: &DaemonSpec,
+    stop_bus: &Arc<StopBus>,
+    id: &str,
+    on_running: impl FnOnce(),
+    on_survivor: impl FnOnce(ProcessId),
+) -> Reported {
     let (child, waiter) = match launch(spec, stop_bus, id) {
         Ok(launched) => launched,
         Err(reported) => return reported,
@@ -202,7 +228,10 @@ fn run_daemon(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, on_running: 
         WaitOutcome::WaitFailed { os_error } => Reported::shim_failure(os_error),
         WaitOutcome::Stopping => Reported::Clean,
         // Still reports STOPPED so the service stays stoppable and uninstallable.
-        WaitOutcome::StoppingUnkillable => Reported::incomplete_stop(),
+        WaitOutcome::StoppingUnkillable => {
+            on_survivor(child.id());
+            Reported::incomplete_stop()
+        }
     }
 }
 

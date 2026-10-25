@@ -87,6 +87,7 @@
 
 mod identity;
 mod registry;
+mod state;
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -175,7 +176,7 @@ impl ServiceManager for ScmManager {
         // closing the handle it deletes through, and the record goes only when every handle to
         // the service has closed, this one included (trap 3).
         drop(service);
-        uninstall_locked(id, installed_kinds(id).record)
+        uninstall_locked(id)
     }
 
     fn enable(&self, id: &Id) -> Result<()> {
@@ -197,13 +198,13 @@ impl ServiceManager for ScmManager {
         let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
         require_ours(id)?;
         drop(service);
-        let mut actor = super::wait::SystemScmActor::open(id.as_str())
-            .map_err(|e| Error::Other(format!("open `{id}` to start it: {e}")))?;
         let Kinds {
             start: kind,
             record,
             unreadable,
         } = installed_kinds(id);
+        let mut actor = super::wait::SystemScmActor::open(id.as_str(), kind)
+            .map_err(|e| Error::Other(format!("open `{id}` to start it: {e}")))?;
         if !budget.waits() {
             // Request-only: `StartServiceW` and return, arming no wait at
             // all. `Ok(())` then means the request was accepted and nothing
@@ -226,9 +227,10 @@ impl ServiceManager for ScmManager {
         let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
         require_ours(id)?;
         drop(service);
-        let mut actor = super::wait::SystemScmActor::open(id.as_str())
+        let Kinds { start, record, .. } = installed_kinds(id);
+        let mut actor = super::wait::SystemScmActor::open(id.as_str(), start)
             .map_err(|e| Error::Other(format!("open `{id}` to start it: {e}")))?;
-        super::wait::request_start_after_stop(&mut actor, installed_kinds(id).record)
+        super::wait::request_start_after_stop(&mut actor, record)
             .map_err(|e| Error::Other(format!("start `{id}`: {e}")))
     }
 
@@ -239,9 +241,12 @@ impl ServiceManager for ScmManager {
         let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
         require_ours(id)?;
         drop(service);
-        let mut actor = super::wait::SystemScmActor::open(id.as_str())
+        // A blob that cannot be read selects the status rule, as it does for `start`.
+        let Kinds {
+            start, record: kind, ..
+        } = installed_kinds(id);
+        let mut actor = super::wait::SystemScmActor::open(id.as_str(), start)
             .map_err(|e| Error::Other(format!("open `{id}` to stop it: {e}")))?;
-        let kind = installed_kinds(id).record;
         if !budget.waits() {
             return match super::wait::request_stop(&mut actor, kind)
                 .map_err(|e| Error::Other(format!("stop `{id}`: {e}")))?
@@ -264,7 +269,8 @@ impl ServiceManager for ScmManager {
     /// See [`super::kill::kill_service`] for how the process is chosen safely. Exit code `1`
     /// (`TerminateProcess`): SCM sees an unexpected exit and applies the recovery actions, as for a
     /// crash. For `type: simple` the process is `goetia-shim`, whose Job Object takes the daemon's
-    /// tree with it.
+    /// tree with it, and the failure is recorded in the shim's state file first, so a `stop` in the
+    /// restart delay is refused.
     fn kill(&self, id: &Id) -> Result<()> {
         let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
         require_ours(id)?;
@@ -839,6 +845,12 @@ fn reapply_uncompared_effects(spec: &DaemonSpec, reg: &ScmRegistration) -> Resul
         Kind::Simple => BTreeMap::new(),
     };
     registry::write_environment(&reg.name, &env_for_host)?;
+    // The state file is the shim's: `type: managed` has none, and an id whose `type:` flips from
+    // `simple` to `managed` converges by losing it, except a record of a daemon still running.
+    match spec.kind {
+        Kind::Simple => state::provision(&reg.name, reg.account.as_deref())?,
+        Kind::Managed => state::release(&reg.name)?,
+    }
     // Only for an account that actually needs it (see `apply`'s identical
     // predicate above): `LookupAccountNameW`, which the grant goes
     // through, does not resolve `LocalSystem`, `LocalService`, or
@@ -972,8 +984,11 @@ fn run_sc(args: &[&str]) -> Result<()> {
 /// the host never runs) and SCM starts nothing for a service marked for deletion. A daemon that
 /// fails as soon as it is spawned, which is when `uninstall` is used, therefore cannot keep a stop
 /// waiting, and a restart that fires between the stop and the delete is stopped after it.
-fn uninstall_locked(id: &Id, kind: Kind) -> Result<()> {
-    let mut actor = super::wait::SystemScmActor::open_to_delete(id.as_str())
+fn uninstall_locked(id: &Id) -> Result<()> {
+    let Kinds {
+        start, record: kind, ..
+    } = installed_kinds(id);
+    let mut actor = super::wait::SystemScmActor::open_to_delete(id.as_str(), start)
         .map_err(|e| Error::Other(format!("open `{id}` to delete it: {e}")))?;
     // Deliberately `Budget::Unbounded`, and not the caller's: `uninstall` has no `--timeout`
     // of its own, this stop is a means rather than an end, and bounding it would turn a
@@ -983,6 +998,10 @@ fn uninstall_locked(id: &Id, kind: Kind) -> Result<()> {
         .map_err(|e| Error::Other(format!("uninstall `{id}`: {e}")))?;
     // The record goes when the last handle closes, so this is the end of the uninstall.
     drop(actor);
+    // The service is gone, and so is what its shim recorded about it, except a daemon it could not
+    // kill.
+    state::release(id.as_str())
+        .map_err(|e| Error::Other(format!("uninstall `{id}`: the service was deleted, but {e}")))?;
     match waited {
         StopWaited::Confirmed => Ok(()),
         // The service is deleted; the daemon the shim could not kill is not.

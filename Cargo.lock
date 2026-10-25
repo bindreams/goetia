@@ -191,6 +191,7 @@ dependencies = [
  "log",
  "nix",
  "rustix",
+ "serde",
  "shared_child",
  "thiserror",
  "windows",

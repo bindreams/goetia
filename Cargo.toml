@@ -61,8 +61,10 @@ clap = { version = "4.6.6", features = ["derive"], optional = true }
 # real, event-driven kernel waits — see `src/bin/shim/service.rs`. Also the
 # Unix backends' bounded subprocess wait (`backend::bounded`): `Child::wait_deadline`
 # and `Child::kill_tree` bound and reap the `systemctl`/`launchctl` calls
-# `daemon start --timeout` waits on. 0.x with an explicitly unstable API.
-cosca = "0.4"
+# `daemon start --timeout` waits on. `serde`: the survivor record in the shim's state file
+# (`backend::scm::state_file`) is a `cosca::identity::ProcessIdRecord`. 0.x with an explicitly
+# unstable API.
+cosca = { version = "0.4", features = ["serde"] }
 # `backend::bounded::collect`'s reader channel: `Receiver::len()` is a
 # race-free snapshot of what is already queued, which is what lets `collect`
 # stop exactly at the deadline instead of draining however long a reader
@@ -117,7 +119,8 @@ winreg = "0.56"
 # `NotifyServiceStatusChangeW` wait (`scm::wait`, replacing a
 # checkpoint/`Sleep` poll), `SeServiceLogonRight` provisioning
 # (`manager::identity`), and `CommandLineToArgvW` for readback (SCM stores
-# `executable`+`arguments` pre-joined into one command line).
+# `executable`+`arguments` pre-joined into one command line), and `GetTickCount64`
+# (`Win32_System_SystemInformation`), the boot-relative clock of the shim's state file.
 #
 # The shim (`src/bin/shim/`, same crate/dependency graph — see the
 # `goetia-shim` `[[bin]]` above) adds `Win32_System_EventLog`, the
@@ -133,6 +136,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Authentication_Identity",
     "Win32_System_EventLog",
     "Win32_System_Services",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_Shell",
 ] }
