@@ -118,11 +118,7 @@ fn a_start_after_the_restart_was_due_drops_the_failure_it_spent() {
     let id = TestId::new(PREFIX);
     let (store, _dir) = store(7000, Ok(RestartDue::Never));
     let mut record = StateRecord::empty();
-    record.failure = Some(FailureRecord {
-        boot: BOOT,
-        at_ms: 1000,
-        restart: RestartDue::After(5000),
-    });
+    record.failure = Some(FailureRecord::new(BOOT, 1000, RestartDue::After(5000)));
     state_file::write(&store.path, &record).expect("write");
 
     assert_eq!(begin(id.as_str(), &store), Ok(()));
@@ -141,11 +137,7 @@ fn a_daemon_failure_is_recorded_with_the_restart_the_failure_actions_queue() {
 
     assert_eq!(
         record_of(&store).failure,
-        Some(FailureRecord {
-            boot: BOOT,
-            at_ms: 5000,
-            restart: RestartDue::After(1000)
-        })
+        Some(FailureRecord::new(BOOT, 5000, RestartDue::After(1000)))
     );
 }
 

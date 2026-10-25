@@ -12,8 +12,10 @@
 //!   (a [`cosca::identity::ProcessIdRecord`]) before it reports the incomplete stop, and a start
 //!   is refused only while that process lives.
 //!
-//! One writer at a time (the shim of the running service) and the file is replaced whole by
-//! rename, so a reader sees the old record or the new one. The clock is boot-relative
+//! The shim, `goetia daemon kill` and `goetia daemon uninstall` all write, from different
+//! processes, each holding the service's lock for the whole of its read-modify-write; the record
+//! is replaced whole by renaming a file of the writer's own over it, so a reader sees the old
+//! record or the new one. The clock is boot-relative
 //! milliseconds plus a boot identity ([`Clock`]), so a record from an earlier boot reads as
 //! stale and a wall-clock change does not matter. A missing file is "no record": a service
 //! registered before the file existed has none until it is installed again.
@@ -69,16 +71,26 @@ pub struct FailureRecord {
     pub boot: Option<u64>,
     pub at_ms: u64,
     pub restart: RestartDue,
+    /// The process that wrote this record. Two writers can note the same failure in the same
+    /// clock tick; this is what tells them apart when one has to take back its own.
+    #[serde(default)]
+    pub by: u32,
 }
 
 impl FailureRecord {
+    /// A failure written by this process.
+    pub fn new(boot: Option<u64>, at_ms: u64, restart: RestartDue) -> Self {
+        Self {
+            boot,
+            at_ms,
+            restart,
+            by: std::process::id(),
+        }
+    }
+
     /// A failure happening now.
     pub fn at(now: Clock, restart: RestartDue) -> Self {
-        Self {
-            boot: now.boot,
-            at_ms: now.ms,
-            restart,
-        }
+        Self::new(now.boot, now.ms, restart)
     }
 
     /// Whether `now` is on the boot this was written on. With either identity unreadable it falls
@@ -237,6 +249,12 @@ impl ShimState {
 /// The file in a service's directory that holds its record.
 pub const RECORD: &str = "record";
 
+/// The file beside the record that serializes the processes writing it.
+const LOCK: &str = "lock";
+
+/// The end of the name of the file a write goes through before it replaces the record.
+const TEMPORARY_SUFFIX: &str = ".tmp";
+
 /// The name of the directory that holds service `id`'s state under the state directory.
 ///
 /// An id is a service name, not a file name: Windows reads `a.` as `a`, reads `nul` as a device and
@@ -258,17 +276,83 @@ pub fn dir_name(id: &str) -> String {
 
 // The file ============================================================================================================
 
-/// The name a record is written under before it replaces `path`. `~` is not in an id's alphabet,
-/// so it can never be another daemon's file.
-pub fn temporary(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push("~tmp");
-    path.with_file_name(name)
+/// The lock beside the record at `path`. Every writer holds it exclusively from the moment it reads
+/// the record to the moment it has replaced it, and a reader holds it shared while it reads, so a
+/// read-modify-write in one process is never interleaved with one in another. The wait for it has no
+/// bound: its holders only read and rename.
+fn lock_path(path: &Path) -> PathBuf {
+    path.with_file_name(LOCK)
+}
+
+/// The directory of the record at `path`.
+fn dir_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    }
+}
+
+/// A held lock on a state file; dropping it lets go.
+struct Held(std::fs::File);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        // Closing the handle releases the lock all the same.
+        let _ = self.0.unlock();
+    }
+}
+
+/// Wait for the exclusive lock, creating it. Fails with `NotFound` when the service has no
+/// directory, which is how a service registered before the directory existed reads. Whatever
+/// temporary an earlier writer died with is removed: under this lock no live writer has one.
+fn lock_exclusive(path: &Path) -> io::Result<Held> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path(path))?;
+    file.lock()?;
+    #[cfg(test)]
+    test_hook::locked(true);
+    sweep_temporaries(dir_of(path));
+    Ok(Held(file))
+}
+
+/// Wait for the shared lock. `None` when there is no lock to wait for: no writer has ever run in
+/// this directory, so there is nothing to read half-written.
+fn lock_shared(path: &Path) -> io::Result<Option<Held>> {
+    let file = match std::fs::OpenOptions::new().read(true).open(lock_path(path)) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    file.lock_shared()?;
+    #[cfg(test)]
+    test_hook::locked(false);
+    Ok(Some(Held(file)))
+}
+
+/// Best effort: a temporary that stays is only clutter, and the write in hand does not use it.
+fn sweep_temporaries(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().ends_with(TEMPORARY_SUFFIX) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Read the state file at `path`. A missing file is [`Loaded::Absent`]; other I/O failures are
 /// errors, and a file that does not decode is [`Loaded::Unreadable`].
 pub fn read(path: &Path) -> io::Result<Loaded> {
+    let _held = lock_shared(path)?;
+    read_unlocked(path)
+}
+
+fn read_unlocked(path: &Path) -> io::Result<Loaded> {
     let text = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Loaded::Absent),
@@ -283,49 +367,102 @@ pub fn read(path: &Path) -> io::Result<Loaded> {
     })
 }
 
-/// Replace the state file at `path` with `record`, whole: written beside it and renamed over it.
+/// Replace the state file at `path` with `record`, whole.
 pub fn write(path: &Path, record: &StateRecord) -> io::Result<()> {
-    let temp = temporary(path);
-    let written = std::fs::write(&temp, record.encode()).and_then(|()| std::fs::rename(&temp, path));
-    if written.is_err() {
-        // Best effort: the error being returned is the one that matters.
-        let _ = std::fs::remove_file(&temp);
-    }
-    written
+    let _held = lock_exclusive(path)?;
+    write_unlocked(path, record)
 }
 
-/// Delete the state file at `path` and any temporary left beside it. Neither existing is fine.
+/// Written to a file of its own in the directory (a name no other writer has, created new) and
+/// renamed over the record, so a reader sees the old record or the new one, and the file keeps
+/// the ACL the directory gave it. The caller holds the exclusive lock.
+fn write_unlocked(path: &Path, record: &StateRecord) -> io::Result<()> {
+    let mut temporary = tempfile::Builder::new()
+        .prefix(&format!("{}-", std::process::id()))
+        .suffix(TEMPORARY_SUFFIX)
+        .tempfile_in(dir_of(path))?;
+    io::Write::write_all(&mut temporary, record.encode().as_bytes())?;
+    // A failed rename drops the temporary, which deletes it.
+    temporary.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
+/// The record at `path`, or an empty one where there is none or it does not decode.
+fn current_unlocked(path: &Path) -> io::Result<StateRecord> {
+    Ok(match read_unlocked(path)? {
+        Loaded::Record(record) => record,
+        Loaded::Absent | Loaded::Unreadable(_) => StateRecord::empty(),
+    })
+}
+
+/// Change the record at `path` under the exclusive lock: `change` sees the record as it is now
+/// (an empty one where there is none or it does not decode), and what it leaves is written back.
+/// The directory must exist.
+pub fn update<T>(path: &Path, change: impl FnOnce(&mut StateRecord) -> T) -> io::Result<T> {
+    let _held = lock_exclusive(path)?;
+    let mut record = current_unlocked(path)?;
+    let changed = change(&mut record);
+    write_unlocked(path, &record)?;
+    Ok(changed)
+}
+
+/// Delete the service's state at `path`: the record, its lock, any temporary a writer died with,
+/// and the directory. Nothing existing is fine.
 pub fn remove(path: &Path) -> io::Result<()> {
-    for file in [path.to_path_buf(), temporary(path)] {
-        match std::fs::remove_file(&file) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
+    match lock_exclusive(path) {
+        Ok(held) => remove_held(held, path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// [`remove`], for a caller that holds the exclusive lock already.
+fn remove_held(held: Held, path: &Path) -> io::Result<()> {
+    let dir = dir_of(path);
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_name() != LOCK {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    // The lock file goes last, and only once nobody holds it.
+    drop(held);
+    for result in [std::fs::remove_file(lock_path(path)), std::fs::remove_dir(dir)] {
+        match result {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
         }
     }
     Ok(())
 }
 
-/// Remove the state file of a service going away, except what must outlive it: while a recorded
+/// Remove the state of a service going away, except what must outlive it: while a recorded
 /// survivor is still running (or cannot be told not to be), only the failure is dropped, so a
 /// service registered again under the same id cannot start a second daemon beside it.
 pub fn release(path: &Path) -> io::Result<()> {
-    let loaded = read(path)?;
+    let held = match lock_exclusive(path) {
+        Ok(held) => held,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let loaded = read_unlocked(path)?;
     if blocking_survivor(&loaded).is_none() {
-        return remove(path);
+        return remove_held(held, path);
     }
     let Loaded::Record(mut record) = loaded else {
         unreachable!("only a decoded record names a survivor");
     };
     record.failure = None;
-    write(path, &record)
+    write_unlocked(path, &record)
 }
 
 /// Run `act`, which ends the shim as a failure SCM will recover from, with `failure` already on
 /// disk, as the shim would have left it; a record that cannot be written is an error and `act`
-/// does not run. The record is kept if `took_effect` says the act did
-/// what it was for; otherwise (the act failed, or the process was already going) the previous
-/// record is put back. A service with no state file has no record to write and none is created.
+/// does not run. The record is kept if `took_effect` says the act did what it was for; otherwise
+/// (the act failed, or the process was already going) the failure is put back as it was, unless
+/// another writer has replaced it since: the shim noting its own failure while `act` was ending it
+/// is not this call's to undo. No lock is held while `act` runs, since the shim has to be able to
+/// write to be ended. A service with no state file has no record to write and none is created.
 pub fn noting_failure_around<T>(
     path: &Path,
     failure: FailureRecord,
@@ -338,45 +475,54 @@ pub fn noting_failure_around<T>(
             format!("could not record the failure in {}: {e}", path.display()),
         )
     };
-    let previous = match read(path).map_err(not_recorded)? {
-        Loaded::Absent => return act(),
+    // The lock is let go before `act` runs, whichever way this goes.
+    let previous = match note_beforehand(path, &failure) {
+        Ok(Some(previous)) => previous,
+        Ok(None) => return act(),
+        Err(e) => return Err(not_recorded(e)),
+    };
+    let result = act();
+    if !matches!(&result, Ok(done) if took_effect(done)) {
+        // The act's own result is what the caller needs; a record that cannot be put back is
+        // spent by the next start like any other.
+        let _ = update(path, |record| {
+            if record.failure.as_ref() == Some(&failure) {
+                record.failure = previous.failure;
+            }
+        });
+    }
+    result
+}
+
+/// The first half of [`noting_failure_around`]: write `failure` into the record and return the
+/// record it replaced. `None` when the service has no record to write into.
+fn note_beforehand(path: &Path, failure: &FailureRecord) -> io::Result<Option<StateRecord>> {
+    let _held = match lock_exclusive(path) {
+        Ok(held) => held,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let previous = match read_unlocked(path)? {
+        Loaded::Absent => return Ok(None),
         Loaded::Record(record) => record,
         // The shim resets a file it cannot read in the same way when it next starts.
         Loaded::Unreadable(_) => StateRecord::empty(),
     };
     let mut noted = previous.clone();
-    noted.failure = Some(failure);
-    write(path, &noted).map_err(not_recorded)?;
-    let result = act();
-    if !matches!(&result, Ok(done) if took_effect(done)) {
-        // The act's own result is what the caller needs; a record that cannot be put back is
-        // spent by the next start like any other.
-        let _ = write(path, &previous);
-    }
-    result
-}
-
-/// The record at `path`, or an empty one where there is none or it does not decode.
-fn current(path: &Path) -> io::Result<StateRecord> {
-    Ok(match read(path)? {
-        Loaded::Record(record) => record,
-        Loaded::Absent | Loaded::Unreadable(_) => StateRecord::empty(),
-    })
+    noted.failure = Some(failure.clone());
+    write_unlocked(path, &noted)?;
+    Ok(Some(previous))
 }
 
 /// Record `failure`, replacing the previous failure and keeping the survivor. Called just before
 /// the shim reports a `STOPPED` with a non-zero Win32 code.
 pub fn note_failure(path: &Path, failure: FailureRecord) -> io::Result<()> {
-    let mut record = current(path)?;
-    record.failure = Some(failure);
-    write(path, &record)
+    update(path, |record| record.failure = Some(failure))
 }
 
 /// Record the daemon an incomplete stop could not kill. Called before the shim reports it.
 pub fn note_survivor(path: &Path, survivor: &ProcessIdRecord) -> io::Result<()> {
-    let mut record = current(path)?;
-    record.survivor = Some(survivor.clone());
-    write(path, &record)
+    update(path, |record| record.survivor = Some(survivor.clone()))
 }
 
 // A run starting ======================================================================================================
@@ -399,10 +545,15 @@ pub enum Begin {
 /// failure the restart this run may be has spent. The file is written only if that changed it,
 /// and never created.
 pub fn begin_run(path: &Path, now: Clock) -> io::Result<Begin> {
-    let mut record = match read(path)? {
+    let _held = match lock_exclusive(path) {
+        Ok(held) => held,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Begin::Proceed),
+        Err(e) => return Err(e),
+    };
+    let mut record = match read_unlocked(path)? {
         Loaded::Absent => return Ok(Begin::Proceed),
         Loaded::Unreadable(why) => {
-            write(path, &StateRecord::empty())?;
+            write_unlocked(path, &StateRecord::empty())?;
             return Ok(Begin::Reset(why));
         }
         Loaded::Record(record) => record,
@@ -424,7 +575,7 @@ pub fn begin_run(path: &Path, now: Clock) -> io::Result<Begin> {
     }
     changed |= record.after_start(now);
     if changed {
-        write(path, &record)?;
+        write_unlocked(path, &record)?;
     }
     Ok(Begin::Proceed)
 }
@@ -468,6 +619,40 @@ pub fn blocking_survivor(loaded: &Loaded) -> Option<(u32, Survivor)> {
     match survivor_of(survivor) {
         Survivor::Gone => None,
         alive => Some((survivor.pid, alive)),
+    }
+}
+
+#[cfg(test)]
+mod test_hook {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnMut(bool)>;
+
+    thread_local! {
+        static LOCKED: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Run `hook` on this thread each time a lock is taken, once it is held; it is told whether
+    /// the lock is exclusive.
+    pub(super) fn on_locked(hook: impl FnMut(bool) + 'static) -> Installed {
+        LOCKED.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        Installed
+    }
+
+    pub(super) struct Installed;
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            LOCKED.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    pub(super) fn locked(exclusive: bool) {
+        LOCKED.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().as_mut() {
+                hook(exclusive);
+            }
+        });
     }
 }
 

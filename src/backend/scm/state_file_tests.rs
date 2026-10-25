@@ -13,11 +13,7 @@ fn at(ms: u64) -> Clock {
 
 fn failed(at_ms: u64, restart: RestartDue) -> StateRecord {
     let mut record = StateRecord::empty();
-    record.failure = Some(FailureRecord {
-        boot: BOOT,
-        at_ms,
-        restart,
-    });
+    record.failure = Some(FailureRecord::new(BOOT, at_ms, restart));
     record
 }
 
@@ -101,24 +97,8 @@ fn back_to_back_failures_leave_the_newest_one_pending() {
     // is queued from the second failure's time.
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("svc");
-    note_failure(
-        &path,
-        FailureRecord {
-            boot: BOOT,
-            at_ms: 1000,
-            restart: RestartDue::After(1000),
-        },
-    )
-    .expect("first failure");
-    note_failure(
-        &path,
-        FailureRecord {
-            boot: BOOT,
-            at_ms: 2010,
-            restart: RestartDue::After(1000),
-        },
-    )
-    .expect("second failure");
+    note_failure(&path, FailureRecord::new(BOOT, 1000, RestartDue::After(1000))).expect("first failure");
+    note_failure(&path, FailureRecord::new(BOOT, 2010, RestartDue::After(1000))).expect("second failure");
 
     let state = ShimState {
         loaded: read(&path).expect("read"),
@@ -278,6 +258,16 @@ fn the_empty_record_names_the_version_this_build_writes() {
 
 // The file ============================================================================================================
 
+/// The names in `dir`, sorted.
+fn names_in(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<_> = std::fs::read_dir(dir)
+        .expect("list")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
 #[skuld::test]
 fn a_missing_file_reads_as_absent() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -294,11 +284,7 @@ fn a_written_record_reads_back_and_leaves_no_temporary_file() {
     write(&path, &record).expect("write");
 
     assert!(matches!(read(&path), Ok(Loaded::Record(r)) if r == record));
-    let names: Vec<_> = std::fs::read_dir(dir.path())
-        .expect("list")
-        .map(|e| e.expect("entry").file_name())
-        .collect();
-    assert_eq!(names, [std::ffi::OsString::from("svc")], "{names:?}");
+    assert_eq!(names_in(dir.path()), ["lock", "svc"], "no temporary is left behind");
 }
 
 #[skuld::test]
@@ -325,25 +311,18 @@ fn a_file_that_does_not_decode_reads_as_unreadable_with_the_reason() {
 }
 
 #[skuld::test]
-fn remove_deletes_the_file_and_a_leftover_temporary_and_tolerates_neither() {
+fn remove_deletes_the_record_its_lock_and_a_leftover_temporary_and_the_directory() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().join("svc");
+    let service = dir.path().join("svc-x");
+    std::fs::create_dir(&service).expect("the service directory");
+    let path = service.join(RECORD);
     write(&path, &StateRecord::empty()).expect("write");
-    std::fs::write(temporary(&path), "x").expect("leftover temporary");
+    std::fs::write(service.join("1-abc.tmp"), "x").expect("leftover temporary");
 
     remove(&path).expect("remove");
     remove(&path).expect("removing nothing is fine");
 
-    assert!(!path.exists());
-    assert!(!temporary(&path).exists());
-}
-
-#[skuld::test]
-fn the_temporary_name_cannot_be_another_daemon_id() {
-    // Ids match ^[A-Za-z0-9._-]{1,80}$, so a name with `~` is never one, and `svc.tmp` is.
-    let temp = temporary(std::path::Path::new("dir/svc.tmp"));
-
-    assert!(temp.file_name().expect("name").to_string_lossy().contains('~'));
+    assert!(!service.exists());
 }
 
 // A run starting ======================================================================================================
@@ -492,15 +471,7 @@ fn a_failure_is_recorded_beside_a_survivor_without_dropping_it() {
     let path = dir.path().join("svc");
     note_survivor(&path, &this_process()).expect("survivor");
 
-    note_failure(
-        &path,
-        FailureRecord {
-            boot: BOOT,
-            at_ms: 9,
-            restart: RestartDue::Unknown,
-        },
-    )
-    .expect("failure");
+    note_failure(&path, FailureRecord::new(BOOT, 9, RestartDue::Unknown)).expect("failure");
 
     let Loaded::Record(record) = read(&path).expect("read") else {
         panic!("a record");
@@ -515,15 +486,7 @@ fn a_failure_is_recorded_over_an_unreadable_file() {
     let path = dir.path().join("svc");
     std::fs::write(&path, "{not json").expect("write garbage");
 
-    note_failure(
-        &path,
-        FailureRecord {
-            boot: BOOT,
-            at_ms: 9,
-            restart: RestartDue::Never,
-        },
-    )
-    .expect("failure");
+    note_failure(&path, FailureRecord::new(BOOT, 9, RestartDue::Never)).expect("failure");
 
     assert!(matches!(read(&path), Ok(Loaded::Record(r)) if r.failure.is_some()));
 }
@@ -531,11 +494,7 @@ fn a_failure_is_recorded_over_an_unreadable_file() {
 // A failure noted around an act =======================================================================================
 
 fn failure_at(ms: u64) -> FailureRecord {
-    FailureRecord {
-        boot: BOOT,
-        at_ms: ms,
-        restart: RestartDue::After(5000),
-    }
+    FailureRecord::new(BOOT, ms, RestartDue::After(5000))
 }
 
 #[skuld::test]
@@ -624,9 +583,8 @@ fn a_service_with_no_state_file_gets_none_and_the_act_still_runs() {
 fn a_failure_that_cannot_be_recorded_stops_the_act_and_says_so() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("svc");
-    write(&path, &StateRecord::empty()).expect("write");
-    // A directory where the record is written before it replaces the file.
-    std::fs::create_dir(temporary(&path)).expect("block the temporary");
+    // A directory where the record should be: it can be neither read nor replaced.
+    std::fs::create_dir(&path).expect("block the record");
     let mut ran = false;
 
     let result = noting_failure_around(
@@ -652,13 +610,12 @@ fn releasing_removes_a_file_with_no_survivor_and_its_temporary() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("svc");
     write(&path, &failed(1, RestartDue::After(100))).expect("write");
-    std::fs::write(temporary(&path), "x").expect("leftover temporary");
+    std::fs::write(dir.path().join("1-abc.tmp"), "x").expect("leftover temporary");
 
     release(&path).expect("release");
     release(&path).expect("releasing nothing is fine");
 
-    assert!(!path.exists());
-    assert!(!temporary(&path).exists());
+    assert!(!dir.path().exists(), "the service's directory goes with its record");
 }
 
 #[skuld::test]
@@ -673,6 +630,7 @@ fn releasing_removes_a_file_whose_survivor_has_gone_or_that_does_not_decode() {
     release(&path).expect("release");
     assert!(!path.exists());
 
+    std::fs::create_dir_all(dir.path()).expect("the service directory again");
     std::fs::write(&path, "{not json").expect("write garbage");
     release(&path).expect("release");
     assert!(!path.exists());
@@ -828,4 +786,163 @@ fn two_ids_never_share_a_directory_name() {
             panic!("{id:?} and {other:?} share {:?}", dir_name(id));
         }
     }
+}
+
+// Writers that do not meet ============================================================================================
+
+#[skuld::test]
+fn updaters_in_different_threads_lose_no_update_and_readers_never_see_a_torn_record() {
+    const THREADS: u64 = 8;
+    const ROUNDS: u64 = 25;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("svc");
+    let writing = std::sync::atomic::AtomicBool::new(true);
+    /// Ends the reader's loop on every way out, a failed writer's panic included.
+    struct Done<'a>(&'a std::sync::atomic::AtomicBool);
+    impl Drop for Done<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    std::thread::scope(|scope| {
+        let _done = Done(&writing);
+        let reader = scope.spawn(|| {
+            while writing.load(std::sync::atomic::Ordering::Acquire) {
+                let loaded = read(&path).expect("read");
+                assert!(matches!(loaded, Loaded::Record(_) | Loaded::Absent), "{loaded:?}");
+            }
+        });
+        let writers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                scope.spawn(|| {
+                    for _ in 0..ROUNDS {
+                        update(&path, |record| {
+                            let n = record.failure.as_ref().map_or(0, |f| f.at_ms);
+                            record.failure = Some(failure_at(n + 1));
+                        })
+                        .expect("update");
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().expect("a writer");
+        }
+        drop(_done);
+        reader.join().expect("the reader");
+    });
+
+    let Loaded::Record(record) = read(&path).expect("read") else {
+        panic!("a record");
+    };
+    assert_eq!(record.failure.expect("failure").at_ms, THREADS * ROUNDS);
+    assert_eq!(names_in(dir.path()), ["lock", "svc"], "no temporary is left behind");
+}
+
+#[skuld::test]
+fn a_read_holds_the_lock_shared_and_an_update_holds_it_exclusive() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("svc");
+    write(&path, &StateRecord::empty()).expect("write");
+    let lock = lock_path(&path);
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(vec![]));
+    let _hook = test_hook::on_locked({
+        let seen = seen.clone();
+        move |exclusive| {
+            let other = std::fs::OpenOptions::new()
+                .read(true)
+                .open(&lock)
+                .expect("a second handle");
+            seen.borrow_mut()
+                .push((exclusive, other.try_lock().is_err(), other.try_lock_shared().is_err()));
+        }
+    });
+
+    read(&path).expect("read");
+    update(&path, |_| ()).expect("update");
+
+    // While a read is in flight nobody can write, but others can read; while an update is, nobody
+    // can do either.
+    assert_eq!(*seen.borrow(), [(false, true, false), (true, true, true)]);
+}
+
+#[skuld::test]
+fn a_temporary_left_by_a_writer_that_died_is_removed_by_the_next_update() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("svc");
+    write(&path, &StateRecord::empty()).expect("write");
+    std::fs::write(dir.path().join("4242-dead.tmp"), r#"{"v":1,"#).expect("a torn temporary");
+
+    update(&path, |_| ()).expect("update");
+
+    assert_eq!(names_in(dir.path()), ["lock", "svc"]);
+}
+
+#[skuld::test]
+fn an_update_of_a_directory_that_does_not_exist_fails_without_creating_it() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("no-such-service").join("svc");
+
+    assert!(update(&path, |_| ()).is_err());
+
+    assert!(!path.parent().expect("parent").exists());
+}
+
+// The failure noted around an act, with other writers =================================================================
+
+/// A failure from a process other than this one, at the same time and with the same delay.
+fn failure_from_elsewhere(ms: u64) -> FailureRecord {
+    FailureRecord {
+        by: std::process::id() + 1,
+        ..failure_at(ms)
+    }
+}
+
+#[skuld::test]
+fn a_failure_the_shim_wrote_during_the_act_is_not_undone_by_the_restore() {
+    // `kill` writes, the shim (failing on its own) writes, `kill`'s terminate finds the process
+    // already going and reports it did nothing: only `kill`'s own failure is taken back.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("svc");
+    write(&path, &failed(1, RestartDue::After(100))).expect("write");
+
+    noting_failure_around(
+        &path,
+        failure_at(9),
+        || {
+            // The act holds no lock: the shim's write has to get through during it.
+            update(&path, |record| record.failure = Some(failure_from_elsewhere(9))).expect("the shim's write");
+            Ok(false)
+        },
+        |&took_effect| took_effect,
+    )
+    .expect("the act");
+
+    assert!(matches!(read(&path), Ok(Loaded::Record(r)) if r.failure == Some(failure_from_elsewhere(9))));
+}
+
+#[skuld::test]
+fn a_restore_puts_back_the_failure_alone() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("svc");
+    let before = failed(1, RestartDue::After(100));
+    write(&path, &before).expect("write");
+
+    noting_failure_around(
+        &path,
+        failure_at(9),
+        || {
+            update(&path, |record| record.survivor = Some(this_process())).expect("the shim records a survivor");
+            Ok(false)
+        },
+        |&took_effect| took_effect,
+    )
+    .expect("the act");
+
+    let Loaded::Record(after) = read(&path).expect("read") else {
+        panic!("a record");
+    };
+    assert_eq!(after.failure, before.failure);
+    assert_eq!(after.survivor, Some(this_process()));
 }
