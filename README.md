@@ -739,24 +739,28 @@ restart SCM has queued.
 After upgrading goetia, run `goetia daemon install` again for every daemon
 installed by an older version. Services registered before this shim existed
 have no recovery actions until then, so the new shim runs them but SCM does
-not restart them. On every start, the shim logs one warning (in the log file and
-as a warning in the Windows Event Log) when it starts under a service that a
-different goetia version registered and `restart` is not `never`.
+not restart them. On every start, the shim logs one warning (in
+`%ProgramData%\Goetia\logs\<id>.log` and as a warning in the Windows Event
+Log) when it starts under a service that a different goetia version registered
+and `restart` is not `never`.
 
 `sc query` shows the difference between your command failing and the shim
 failing:
 
-| What happened                                         | `WIN32_EXIT_CODE`, `SERVICE_EXIT_CODE` SCM records                             |
-| ----------------------------------------------------- | ------------------------------------------------------------------------------ |
-| command exited `0`, or was stopped                    | `0`, `0`                                                                       |
-| command exited `n`, not `0`                           | `1066`, `n` (a service-specific code)                                          |
-| the shim could not run the command                    | a Win32 code: the OS error, `13` for an unreadable spec, `31` if there is none |
-| the shim could not kill or contain the command's tree | `0`, `1003`                                                                    |
+| What happened                                                | `WIN32_EXIT_CODE`, `SERVICE_EXIT_CODE` SCM records                             |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------ |
+| command exited `0`, or was stopped                           | `0`, `0`                                                                       |
+| command exited `n`, not `0`                                  | `1066`, `n` (a service-specific code)                                          |
+| the shim could not run the command, or its wait on it failed | a Win32 code: the OS error, `13` for an unreadable spec, `31` if there is none |
+| the shim could not show the command's tree terminated        | `0`, `1003`                                                                    |
+
+A shim that cannot report at all, because it was started without a service id
+or cannot connect to SCM, exits `160` or `1063`; SCM's record is then its own.
 
 Under `on-failure` both failures are restarted, so a spec the shim cannot read
 or a command that is missing retries at `restart-delay` indefinitely, as it
-does for `type: managed`. If the shim cannot kill the command on `stop`, it
-logs both failed kills and reports the stop with Win32 code `0`, because a
+does for `type: managed`. If the shim cannot terminate the command's job on
+`stop`, it logs why and reports the stop with Win32 code `0`, because a
 non-zero Win32 code would make SCM start a second copy; the service-specific
 code `1003` is the record that the command may still be running.
 
@@ -775,9 +779,9 @@ not overlap descendants the previous run left behind. If the job cannot be
 terminated, it reports `0`, `1003` as for a `stop` it could not complete, and
 refuses a later `stop`.
 
-Nothing guards against that survivor afterwards: `stop` of the stopped service
-exits `0`, and a later `start`, `restart` or `sc start` launches a second copy
-beside it.
+Nothing guards against a possible survivor afterwards: `stop` exits `0`,
+including the `stop` that produced the record, and a later `start`, `restart` or
+`sc start` launches a second copy beside it.
 
 "Terminated" means the OS has stopped every thread of the command and its
 descendants, not that it has finished releasing what they held. A restarted

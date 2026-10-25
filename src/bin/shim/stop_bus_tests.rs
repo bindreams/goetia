@@ -416,10 +416,10 @@ fn a_panicked_waiter_is_logged_when_the_stop_path_joins_it() {
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Panicked);
 }
 
-/// `kill_tree` fails but the direct-child fallback works: the daemon is dead and reaped, so the
-/// call joins the waiter and returns `Stopping`, with only `kill_tree`'s failure logged.
+/// `kill_tree` fails but the direct-child fallback works: the child is dead and reaped, so the call
+/// joins the waiter, but its descendants may run, as after a failed wait whose tree kill failed.
 #[skuld::test]
-fn a_stop_whose_kill_tree_fails_falls_back_to_killing_the_child() {
+fn a_stop_whose_kill_tree_fails_kills_the_child_and_reports_the_daemon_possibly_running() {
     let id = TestId::new(PREFIX);
     let mut cmd = cosca::run([
         "powershell",
@@ -439,8 +439,8 @@ fn a_stop_whose_kill_tree_fails_falls_back_to_killing_the_child() {
     let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str());
 
     assert!(
-        matches!(outcome, WaitOutcome::Stopping),
-        "the fallback kill reaped the child, so the stop is a clean one"
+        matches!(outcome, WaitOutcome::DaemonMayRun),
+        "the tree kill failed, so the daemon's descendants may still run"
     );
     assert!(
         child
@@ -449,13 +449,10 @@ fn a_stop_whose_kill_tree_fails_falls_back_to_killing_the_child() {
             .is_some(),
         "the fallback kill did not end the child"
     );
-    // Only kill_tree's failure: the fallback succeeded.
-    assert_one_failure(
+    assert_failures(
         &take(id.as_str()),
         id.as_str(),
-        &format!(
-            "kill_tree: {KILL_REFUSED}; falling back to killing the direct child only (its own descendants, if any, cannot be reached without a containment mechanism)"
-        ),
+        &[tree_refused_failure(), TREE_UNKILLED.to_string()],
     );
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }
@@ -666,9 +663,12 @@ fn tree_unkilled_failures() -> [String; 3] {
     [
         format!("background wait on child: {WAIT_FAILED}"),
         tree_refused_failure(),
-        "the daemon's descendants were not killed after the background wait failed: only the direct child was killed; the daemon may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure".to_string(),
+        TREE_UNKILLED.to_string(),
     ]
 }
+
+/// The line logged when `kill_tree` failed and only the direct child was killed.
+const TREE_UNKILLED: &str = "the daemon's descendants were not killed: only the direct child was killed; the daemon may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure";
 
 /// The lines of a failed wait whose `kill_tree` and direct-child kill were both refused.
 fn unkillable_failures() -> [String; 3] {

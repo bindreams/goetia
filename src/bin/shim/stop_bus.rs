@@ -59,11 +59,10 @@ pub enum WaitOutcome {
     WaitFailed {
         os_error: Option<i32>,
     },
-    /// A stop was requested, and the daemon was terminated: the tree, or
-    /// (if `kill_tree` failed) at least the direct child.
+    /// A stop was requested, and `kill_tree` terminated the daemon's tree.
     Stopping,
-    /// The daemon may still be running: a stop was requested and neither `kill_tree` nor the
-    /// direct-child fallback could kill it, or a wait failure's `kill_tree` failed. See
+    /// The daemon may still be running: `kill_tree` failed, after a stop or a failed wait, and
+    /// the direct-child fallback, if it worked, does not reach descendants. See
     /// [`StopBus::wait_for_child_or_stop`] for why this is a return rather than a wait, and
     /// `Reported::incomplete_stop` for what the caller reports for it.
     DaemonMayRun,
@@ -323,8 +322,10 @@ impl StopBus {
     /// executes. Otherwise (the tree kill failed, even if the direct child's fallback worked) the
     /// outcome is [`WaitOutcome::DaemonMayRun`], and the bus refuses later stops: reporting a
     /// restartable failure over a daemon that may still be running would start a second copy
-    /// beside it, and an acknowledged stop must not end in that record. Over a stop the reduced
-    /// guarantee of a direct-child kill stands, as for any stop.
+    /// beside it, and an acknowledged stop must not end in that record.
+    ///
+    /// **A stop whose tree kill failed** is [`WaitOutcome::DaemonMayRun`] too, even when the direct
+    /// child's fallback worked: its descendants may still run.
     ///
     /// **No drain after `kill_tree`.** `cosca`'s Job Object `hard_kill` closes the job handle as
     /// part of terminating it, so `wait_tree` afterwards always fails with "the job handle was
@@ -374,12 +375,14 @@ impl StopBus {
                     }
                     return WaitOutcome::DaemonMayRun;
                 }
-                _ if stopping => WaitOutcome::Stopping,
                 (Teardown::ChildOnly, _) => {
                     logging::log_failure(id, &tree_unkilled());
-                    self.refuse_stops();
+                    if !stopping {
+                        self.refuse_stops();
+                    }
                     WaitOutcome::DaemonMayRun
                 }
+                _ if stopping => WaitOutcome::Stopping,
                 (Teardown::Tree, os_error) => WaitOutcome::WaitFailed {
                     os_error: os_error.flatten(),
                 },
@@ -476,7 +479,7 @@ fn fallback_kill_failed(e: &cosca::error::Error) -> String {
 
 fn tree_unkilled() -> String {
     format!(
-        "the daemon's descendants were not killed after the background wait failed: only the direct child was killed; the daemon may still be running{NOT_RESTARTED}"
+        "the daemon's descendants were not killed: only the direct child was killed; the daemon may still be running{NOT_RESTARTED}"
     )
 }
 
