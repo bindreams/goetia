@@ -21,6 +21,8 @@ pub const ERROR_GEN_FAILURE: u32 = 31;
 /// A commanded stop that could not kill the daemon: the process exit code, and the service-specific
 /// code of the `STOPPED` report.
 pub const ERROR_CAN_NOT_COMPLETE: u32 = 1003;
+/// A start refused because the daemon an earlier incomplete stop could not kill is still running.
+pub const ERROR_SERVICE_ALREADY_RUNNING: u32 = 1056;
 /// The control handler or the dispatcher could not be connected, so nothing is reportable.
 pub const ERROR_FAILED_SERVICE_CONTROLLER_CONNECT: u32 = 1063;
 /// The Win32 code SCM records alongside any service-specific code.
