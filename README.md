@@ -733,10 +733,13 @@ once: a stop it accepts before it decides the exit is reported as a clean stop,
 which SCM does not restart; a stop that arrives after it has decided on the
 failure does not change it. SCM acknowledges that stop anyway, whatever the
 shim answers, so `stop` exits `0` and SCM restarts the command as above.
-`goetia daemon uninstall` stops the service first, waiting out a start in
-progress rather than sending a stop SCM would reject. SCM may begin a restart
-between that stop and the delete; `uninstall` stops that restart after the
-delete. A restart queued before the delete does not fire.
+`goetia daemon uninstall` deletes the service first, then stops whatever is
+running, a restart that had already begun included, and waits for it to stop.
+A restart queued before the delete does not fire. A stop that SCM rejects
+because the state changed is sent again on the next state. If the stop cannot
+be done, `uninstall` fails and says the service is marked for
+deletion and may still be running; `sc.exe stop <id>` stops it, and the
+service record goes once it stops.
 
 After upgrading goetia, run `goetia daemon install` again for every daemon
 installed by an older version. Services registered before this shim existed
@@ -814,7 +817,10 @@ confirms differs:
   cannot start is a failed start under every `restart:` policy. A command that
   starts and then exits at once is a successful start, whatever its exit code,
   as with `systemctl start`; it is the command's exit, not `start`, that
-  reports it. A `start` that lands as SCM is restarting the command, and that
+  reports it. The shim itself failing after the spawn, with a failed wait on
+  the command or an exit status it cannot read, is a failed start if `start`
+  sees the service stopped first and a successful one if it sees it running
+  first. A `start` that lands as SCM is restarting the command, and that
   restart fails (a missing `goetia-shim` or a broken account), is a failed start,
   as is a service that stops with the shim's `0`, `1003` record, whether or not
   it reported running first.

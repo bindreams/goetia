@@ -22,9 +22,9 @@ use crate::spec::Kind;
 pub enum WantState {
     Stopped,
     Running,
-    /// Either terminal state, `START_PENDING` excluded: arming it while the service is starting
-    /// does not fire until the start has settled.
-    RunningOrStopped,
+    /// A state that is settled: `RUNNING`, `PAUSED` or `STOPPED`, and no pending one. Arming
+    /// `START_PENDING` while the service is starting would not fire until the start had settled.
+    RunningPausedOrStopped,
 }
 
 /// The service state a `wait_callback` observed. Distinct from [`WantState`]:
@@ -37,6 +37,7 @@ pub enum WantState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Observed {
     Running,
+    Paused,
     Stopped,
     Pending,
 }
@@ -88,6 +89,10 @@ pub trait ScmActor {
     /// The `dwWaitHint` of the same notification, in milliseconds. A shim reports `STOPPED` with
     /// 0; SCM's own failed recovery start leaves 2000 on its `STOPPED` (measured).
     fn stopped_wait_hint(&self) -> u32;
+    /// Whether the notification the last [`Self::wait_callback`] returned had
+    /// `SERVICE_ACCEPT_STOP` in its `dwControlsAccepted`. Read from that notification, not queried
+    /// afterwards, for the reason [`Self::stopped_exit`] is.
+    fn accepts_stop(&self) -> bool;
 }
 
 /// Stop the service, gated strictly on a real `STOPPED` callback from
@@ -100,12 +105,19 @@ pub fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result
     if armed == Waited::Expired {
         return Ok(Waited::Expired);
     }
+    await_stopped(a, deadline)
+}
+
+/// The wait half of a stop: the `Stopped`-mask arm is already in place. Re-arms after every
+/// non-terminal callback.
+fn await_stopped<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
     loop {
         match a.wait_callback(deadline)? {
             None => return Ok(Waited::Expired),
             Some(Observed::Stopped) => return Ok(Waited::Confirmed),
-            // Running/Pending are non-terminal for a stop wait — re-arm and wait.
-            Some(Observed::Running | Observed::Pending) => {
+            // Running/Pending are non-terminal for a stop wait — re-arm and wait. `Paused` cannot
+            // arrive under the stop mask; it is treated as pending.
+            Some(Observed::Running | Observed::Paused | Observed::Pending) => {
                 if a.arm(WantState::Stopped, deadline)? == Waited::Expired {
                     return Ok(Waited::Expired);
                 }
@@ -114,27 +126,55 @@ pub fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result
     }
 }
 
-/// Bring the service to `STOPPED` without ever sending a STOP that SCM rejects. `uninstall` runs it
-/// before the delete and again after, since SCM may begin a restart in between.
+/// `ControlService(STOP)` answered `ERROR_INVALID_SERVICE_CONTROL`: the service is in a state that
+/// does not accept it, `START_PENDING` among them (measured).
+const ERROR_INVALID_SERVICE_CONTROL: i32 = 1052;
+/// `ERROR_SERVICE_CANNOT_ACCEPT_CTRL`: a STOP is already delivered and the service has not yet
+/// reported `STOP_PENDING` (measured).
+const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
+
+/// Stop the service, whatever state it is in, and wait for `STOPPED`. A STOP is sent only on a
+/// `RUNNING` or `PAUSED` notification that accepts it, never on an earlier observation.
 ///
-/// Waits, with no poll, for `RUNNING` or `STOPPED`. `STOPPED` is done. `RUNNING` is stopped through
-/// [`stop_via_notify`]. No stop is sent while `START_PENDING`: SCM rejects it with 1052 and it has
-/// no later effect. Whether SCM restarts a delete-marked service after a later failure is not
-/// measured; a restart queued before the delete does not fire.
-pub fn settle_to_stopped<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
-    if a.arm(WantState::RunningOrStopped, deadline)? == Waited::Expired {
-        return Ok(Waited::Expired);
-    }
+/// Loops over notifications of `RUNNING`, `PAUSED` and `STOPPED`; a pending state is not in the mask,
+/// so SCM does not report one until the service has settled. `STOPPED` ends the loop. On `RUNNING` or
+/// `PAUSED` the STOP is sent; SCM may have changed the state since that notification, and then it
+/// rejects the STOP with 1052 (a restart began) or 1061 (a STOP is already delivered). That is a new
+/// state to wait for, so the loop goes round. No iteration limit and no timing: each pass needs a
+/// state change SCM made, and a settled state that refuses STOP is an error. A STOP SCM accepts is
+/// followed by the same wait as [`stop_via_notify`]'s, armed after the STOP; that holds once nothing
+/// can start the service again, which `uninstall` guarantees by deleting it first.
+pub fn settle_and_stop<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
     loop {
-        match a.wait_callback(deadline)? {
+        if a.arm(WantState::RunningPausedOrStopped, deadline)? == Waited::Expired {
+            return Ok(Waited::Expired);
+        }
+        let state = match a.wait_callback(deadline)? {
             None => return Ok(Waited::Expired),
             Some(Observed::Stopped) => return Ok(Waited::Confirmed),
-            Some(Observed::Running) => return stop_via_notify(a, deadline),
-            Some(Observed::Pending) => {
-                if a.arm(WantState::RunningOrStopped, deadline)? == Waited::Expired {
+            // Not in the mask; go round rather than act on it.
+            Some(Observed::Pending) => continue,
+            Some(Observed::Running) => "RUNNING",
+            Some(Observed::Paused) => "PAUSED",
+        };
+        if !a.accepts_stop() {
+            return Err(io::Error::other(format!(
+                "the service is {state} and does not accept STOP"
+            )));
+        }
+        match a.control_stop() {
+            Ok(()) => {
+                if a.arm(WantState::Stopped, deadline)? == Waited::Expired {
                     return Ok(Waited::Expired);
                 }
+                return await_stopped(a, deadline);
             }
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(ERROR_INVALID_SERVICE_CONTROL | ERROR_SERVICE_CANNOT_ACCEPT_CTRL)
+                ) => {}
+            Err(e) => return Err(e),
         }
     }
 }
@@ -202,10 +242,11 @@ pub fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Kind) 
             None => return Ok(Waited::Expired),
             Some(Observed::Running) => return Ok(Waited::Confirmed),
             // A terminal Stopped is not an expiry. For `type: simple` it is a start when the shim
-            // launched the daemon and the daemon then ended before the wait saw Running:
-            // confirming the launch, as `systemctl start` confirms the exec, keeps the answer
-            // from depending on whether the wait saw Running or Stopped first. Otherwise the
-            // daemon never ran.
+            // launched the daemon and the daemon then ended before the wait saw Running, as
+            // `systemctl start` confirms the exec. That holds for the daemon's own exit. A shim
+            // failure after the launch (a failed wait, an unreadable exit status) is recorded as
+            // a shim failure, so the answer still depends on which the wait sees first: a failed
+            // start for Stopped, a start for Running.
             Some(Observed::Stopped) => {
                 let exit = a.stopped_exit();
                 // An `AlreadyRunning` over `START_PENDING` joined a start that was not ours: SCM's
@@ -232,7 +273,8 @@ pub fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Kind) 
                     "service stopped before reaching Running (failed start): it recorded {exit}"
                 )));
             }
-            Some(Observed::Pending) => {
+            // `Paused` cannot arrive under the start mask; it is treated as pending.
+            Some(Observed::Paused | Observed::Pending) => {
                 if a.arm(WantState::Running, deadline)? == Waited::Expired {
                     return Ok(Waited::Expired);
                 }

@@ -338,12 +338,13 @@ fn uninstall_then_immediate_reinstall_succeeds() {
     assert!(matches!(outcome, Outcome::Create), "{outcome:?}");
 }
 
-// Step 4: uninstall must not proceed if the service will not stop =====================================================
+// Step 4: uninstall reports a service that will not stop, which is marked for deletion by then ========================
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn uninstall_errors_when_service_will_not_stop() {
     let mgr = ScmManager::new();
     let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
     let started = ConnectBack::listen();
     // `refuse-stop`: the fixture reports RUNNING with an empty
     // `controls_accepted`, so `ControlService(STOP)` fails *synchronously*
@@ -361,20 +362,21 @@ fn uninstall_errors_when_service_will_not_stop() {
 
     let err = mgr
         .uninstall(&spec.id)
-        .expect_err("a service that declines SERVICE_CONTROL_STOP must not be deleted");
+        .expect_err("a service that declines SERVICE_CONTROL_STOP cannot be stopped by uninstall");
+    let text = err.to_string();
     assert!(
-        err.to_string().contains("NOT deleted"),
-        "error should explain the service was not deleted: {err}"
+        text.contains("marked for deletion") && text.contains("does not accept STOP") && text.contains("sc.exe stop"),
+        "error should say the service is marked for deletion, why, and the remedy: {err}"
     );
 
-    // Confirm it is really still there, then clean up without ever asking
-    // it to stop (which would fail the exact same way): kill the process
-    // directly by pid, then delete the now-dead service entry.
-    let status = mgr.status(&spec.id).expect("status: the service must still exist");
+    // The delete came first, so the service is marked and still running. Kill the process directly
+    // by pid (a stop would fail the same way); the record goes once it is gone.
+    let status = mgr
+        .status(&spec.id)
+        .expect("status: the marked service must still exist");
     assert_eq!(status.state, State::Running);
     let pid = status.pid.expect("a running service reports a pid");
     support::cmd::run("taskkill.exe", &["/F", "/PID", &pid.to_string()]).expect_ok();
-    support::cmd::run("sc.exe", &["delete", &id]).expect_ok();
 }
 
 // Step 5: an install interrupted before the metadata write is recoverable =============================================

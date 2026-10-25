@@ -21,7 +21,6 @@ struct FakeScm {
     waits: VecDeque<Option<Observed>>,
     what_arm_reports: Waited,
     start_fails: bool,
-    stop_fails: bool,
     /// What `start` answers when it does not fail.
     start_reply: StartReply,
     /// The deadline each `wait_callback` was handed, in call order.
@@ -32,22 +31,62 @@ struct FakeScm {
     recorded: RecordedExit,
     /// The `dwWaitHint` of a `Stopped` the script delivers.
     wait_hint: u32,
+    /// Whether each notification the script delivers accepts `SERVICE_ACCEPT_STOP`, front to back;
+    /// `true` once it runs out.
+    accepts: VecDeque<bool>,
+    /// What the notification `wait_callback` returned last accepted.
+    last_accepts: bool,
+    /// What each `control_stop` answers, front to back; `Ok` once it runs out.
+    stop_replies: VecDeque<StopReply>,
+    /// The notification no `control_stop` has answered yet. `None` after a `control_stop` and after
+    /// an expiry.
+    unanswered: Option<(Observed, bool)>,
+    /// Each `control_stop` that did not follow a `Running` or `Paused` notification accepting STOP.
+    /// Only the settle tests read it; the stop and start waits send theirs without a notification.
+    bad_stops: Vec<String>,
+}
+
+/// What a scripted `control_stop` answers.
+#[derive(Debug, Clone, Copy)]
+enum StopReply {
+    Ok,
+    Os(i32),
 }
 
 impl FakeScm {
-    fn new<const N: usize>(waits: [Option<Observed>; N]) -> Self {
+    fn new(waits: impl IntoIterator<Item = Option<Observed>>) -> Self {
         Self {
             log: vec![],
-            waits: waits.into(),
+            waits: waits.into_iter().collect(),
             what_arm_reports: Waited::Confirmed,
             start_fails: false,
-            stop_fails: false,
             start_reply: StartReply::Accepted,
             deadlines: vec![],
             arm_deadlines: vec![],
             recorded: shim_failed(),
             wait_hint: 0,
+            accepts: VecDeque::new(),
+            last_accepts: true,
+            stop_replies: VecDeque::new(),
+            unanswered: None,
+            bad_stops: vec![],
         }
+    }
+
+    /// Notification `n` accepts `SERVICE_ACCEPT_STOP` iff `accepts[n]`.
+    fn accepting(mut self, accepts: impl IntoIterator<Item = bool>) -> Self {
+        self.accepts = accepts.into_iter().collect();
+        self
+    }
+
+    /// The `control_stop` calls answer `replies` in order.
+    fn stop_replies(mut self, replies: impl IntoIterator<Item = StopReply>) -> Self {
+        self.stop_replies = replies.into_iter().collect();
+        self
+    }
+
+    fn stop_count(&self) -> usize {
+        self.log.iter().filter(|step| **step == "control_stop").count()
     }
 
     /// A delivered `Stopped` carries the record `reported` leaves in SCM.
@@ -76,12 +115,6 @@ impl FakeScm {
         self
     }
 
-    /// `control_stop` reports failure.
-    fn rejecting_stop(mut self) -> Self {
-        self.stop_fails = true;
-        self
-    }
-
     /// `start` answers `ERROR_SERVICE_ALREADY_RUNNING`, with `queried` as the
     /// follow-up query's state.
     fn already_running(mut self, queried: QueriedState) -> Self {
@@ -100,16 +133,20 @@ impl ScmActor for FakeScm {
         self.log.push(match want {
             WantState::Stopped => "arm_stopped",
             WantState::Running => "arm_running",
-            WantState::RunningOrStopped => "arm_running_or_stopped",
+            WantState::RunningPausedOrStopped => "arm_settle",
         });
         Ok(self.what_arm_reports)
     }
     fn control_stop(&mut self) -> std::io::Result<()> {
         self.log.push("control_stop");
-        if self.stop_fails {
-            return Err(std::io::Error::other("scripted stop failure"));
+        match self.unanswered.take() {
+            Some((Observed::Running | Observed::Paused, true)) => {}
+            other => self.bad_stops.push(format!("after {other:?}")),
         }
-        Ok(())
+        match self.stop_replies.pop_front().unwrap_or(StopReply::Ok) {
+            StopReply::Ok => Ok(()),
+            StopReply::Os(code) => Err(std::io::Error::from_raw_os_error(code)),
+        }
     }
     fn start(&mut self) -> std::io::Result<StartReply> {
         self.log.push("start");
@@ -125,10 +162,16 @@ impl ScmActor for FakeScm {
         self.log.push(match observed {
             Some(Observed::Stopped) => "got_stopped",
             Some(Observed::Running) => "got_running",
+            Some(Observed::Paused) => "got_paused",
             Some(Observed::Pending) => "got_pending",
             None => "got_nothing",
         });
+        self.last_accepts = self.accepts.pop_front().unwrap_or(true);
+        self.unanswered = observed.map(|o| (o, self.last_accepts));
         Ok(observed)
+    }
+    fn accepts_stop(&self) -> bool {
+        self.last_accepts
     }
     fn stopped_exit(&self) -> RecordedExit {
         self.recorded
@@ -181,84 +224,241 @@ fn stop_re_arms_after_a_non_terminal_callback() {
     );
 }
 
-// settle_to_stopped ----
+// settle_and_stop ----
 
-#[skuld::test]
-fn settle_a_running_service_is_stopped_and_its_stop_awaited() {
-    let mut fake = FakeScm::new([Some(Observed::Running), Some(Observed::Stopped)]);
-    assert_eq!(settle_to_stopped(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
-    assert_eq!(
-        fake.log,
-        vec![
-            "arm_running_or_stopped",
-            "wait",
-            "got_running",
-            "arm_stopped",
-            "control_stop",
-            "wait",
-            "got_stopped",
-        ]
-    );
+/// What one SCM interleaving must make [`settle_and_stop`] do.
+enum Outcome {
+    Confirmed,
+    /// An error whose text contains this.
+    Fails(&'static str),
 }
 
-/// STOP sent in `START_PENDING` is rejected with 1052 and has no later effect, so nothing is sent
-/// until the service has reached `RUNNING`.
-#[skuld::test]
-fn settle_a_start_pending_service_is_waited_out_before_any_stop() {
-    let mut fake = FakeScm::new([
-        Some(Observed::Pending),
-        Some(Observed::Running),
-        Some(Observed::Stopped),
-    ]);
-    assert_eq!(settle_to_stopped(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
-    assert_eq!(
-        fake.log,
-        vec![
-            "arm_running_or_stopped",
-            "wait",
-            "got_pending",
-            "arm_running_or_stopped",
-            "wait",
-            "got_running",
-            "arm_stopped",
-            "control_stop",
-            "wait",
-            "got_stopped",
-        ]
-    );
+/// One SCM interleaving: the notifications SCM delivers, whether each accepts STOP, what each STOP
+/// is answered, and the steps the loop must take in response.
+struct Row {
+    name: &'static str,
+    waits: Vec<Option<Observed>>,
+    accepts: Vec<bool>,
+    replies: Vec<StopReply>,
+    outcome: Outcome,
+    log: Vec<&'static str>,
 }
 
-/// A service that is stopping (or starting and then ending) is waited out, never sent a STOP.
+const INVALID_SERVICE_CONTROL: i32 = 1052;
+const CANNOT_ACCEPT_CTRL: i32 = 1061;
+
+fn settle_rows() -> Vec<Row> {
+    use Observed::{Paused, Pending, Running, Stopped};
+    vec![
+        Row {
+            name: "stopped at once",
+            waits: vec![Some(Stopped)],
+            accepts: vec![],
+            replies: vec![],
+            outcome: Outcome::Confirmed,
+            log: vec!["arm_settle", "wait", "got_stopped"],
+        },
+        Row {
+            name: "running, the stop is accepted, then stopped",
+            waits: vec![Some(Running), Some(Stopped)],
+            accepts: vec![],
+            replies: vec![StopReply::Ok],
+            outcome: Outcome::Confirmed,
+            log: vec![
+                "arm_settle",
+                "wait",
+                "got_running",
+                "control_stop",
+                "arm_stopped",
+                "wait",
+                "got_stopped",
+            ],
+        },
+        Row {
+            name: "paused, the stop is accepted, then stopped",
+            waits: vec![Some(Paused), Some(Stopped)],
+            accepts: vec![],
+            replies: vec![StopReply::Ok],
+            outcome: Outcome::Confirmed,
+            log: vec![
+                "arm_settle",
+                "wait",
+                "got_paused",
+                "control_stop",
+                "arm_stopped",
+                "wait",
+                "got_stopped",
+            ],
+        },
+        Row {
+            name: "running, a restart began (1052), running again, the stop is accepted, then stopped",
+            waits: vec![Some(Running), Some(Running), Some(Stopped)],
+            accepts: vec![],
+            replies: vec![StopReply::Os(INVALID_SERVICE_CONTROL), StopReply::Ok],
+            outcome: Outcome::Confirmed,
+            log: vec![
+                "arm_settle",
+                "wait",
+                "got_running",
+                "control_stop",
+                "arm_settle",
+                "wait",
+                "got_running",
+                "control_stop",
+                "arm_stopped",
+                "wait",
+                "got_stopped",
+            ],
+        },
+        Row {
+            name: "running, a stop was already delivered (1061), then stopped",
+            waits: vec![Some(Running), Some(Stopped)],
+            accepts: vec![],
+            replies: vec![StopReply::Os(CANNOT_ACCEPT_CTRL)],
+            outcome: Outcome::Confirmed,
+            log: vec![
+                "arm_settle",
+                "wait",
+                "got_running",
+                "control_stop",
+                "arm_settle",
+                "wait",
+                "got_stopped",
+            ],
+        },
+        Row {
+            name: "1052, 1061 and an accepted stop in a row",
+            waits: vec![Some(Running), Some(Running), Some(Running), Some(Stopped)],
+            accepts: vec![],
+            replies: vec![
+                StopReply::Os(INVALID_SERVICE_CONTROL),
+                StopReply::Os(CANNOT_ACCEPT_CTRL),
+                StopReply::Ok,
+            ],
+            outcome: Outcome::Confirmed,
+            log: vec![
+                "arm_settle",
+                "wait",
+                "got_running",
+                "control_stop",
+                "arm_settle",
+                "wait",
+                "got_running",
+                "control_stop",
+                "arm_settle",
+                "wait",
+                "got_running",
+                "control_stop",
+                "arm_stopped",
+                "wait",
+                "got_stopped",
+            ],
+        },
+        Row {
+            name: "running and STOP not accepted",
+            waits: vec![Some(Running)],
+            accepts: vec![false],
+            replies: vec![],
+            outcome: Outcome::Fails("does not accept STOP"),
+            log: vec!["arm_settle", "wait", "got_running"],
+        },
+        Row {
+            name: "paused and STOP not accepted",
+            waits: vec![Some(Paused)],
+            accepts: vec![false],
+            replies: vec![],
+            outcome: Outcome::Fails("does not accept STOP"),
+            log: vec!["arm_settle", "wait", "got_paused"],
+        },
+        Row {
+            name: "running, then another error",
+            waits: vec![Some(Running)],
+            accepts: vec![],
+            replies: vec![StopReply::Os(5)],
+            outcome: Outcome::Fails("os error 5"),
+            log: vec!["arm_settle", "wait", "got_running", "control_stop"],
+        },
+        Row {
+            name: "running, the stop is accepted, stop pending, then stopped",
+            waits: vec![Some(Running), Some(Pending), Some(Stopped)],
+            accepts: vec![],
+            replies: vec![StopReply::Ok],
+            outcome: Outcome::Confirmed,
+            log: vec![
+                "arm_settle",
+                "wait",
+                "got_running",
+                "control_stop",
+                "arm_stopped",
+                "wait",
+                "got_pending",
+                "arm_stopped",
+                "wait",
+                "got_stopped",
+            ],
+        },
+        Row {
+            name: "a pending notification that accepts STOP is not stopped",
+            waits: vec![Some(Pending), Some(Stopped)],
+            accepts: vec![true, true],
+            replies: vec![],
+            outcome: Outcome::Confirmed,
+            log: vec!["arm_settle", "wait", "got_pending", "arm_settle", "wait", "got_stopped"],
+        },
+    ]
+}
+
+/// Every interleaving ends, returns `Confirmed` only on a `Stopped` observation, and sends a STOP
+/// only on a `Running` or `Paused` notification that accepts it. The fake runs dry, and panics, if
+/// the loop asks for a notification the row did not script.
 #[skuld::test]
-fn settle_a_pending_service_that_stops_is_never_sent_a_stop() {
-    let mut fake = FakeScm::new([Some(Observed::Pending), Some(Observed::Stopped)]);
-    assert_eq!(settle_to_stopped(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
-    assert!(!fake.log.contains(&"control_stop"), "{:?}", fake.log);
+fn settle_and_stop_handles_every_scm_interleaving() {
+    for row in settle_rows() {
+        let mut fake = FakeScm::new(row.waits.clone())
+            .accepting(row.accepts.clone())
+            .stop_replies(row.replies.clone());
+        let result = settle_and_stop(&mut fake, unbounded());
+        match (&row.outcome, result) {
+            (Outcome::Confirmed, Ok(Waited::Confirmed)) => {
+                assert_eq!(
+                    fake.log.last(),
+                    Some(&"got_stopped"),
+                    "{}: Confirmed without a Stopped observation: {:?}",
+                    row.name,
+                    fake.log
+                );
+            }
+            (Outcome::Fails(text), Err(e)) => {
+                assert!(e.to_string().contains(text), "{}: {e}", row.name);
+            }
+            (_, other) => panic!("{}: unexpected {other:?}", row.name),
+        }
+        assert_eq!(fake.log, row.log, "{}", row.name);
+        assert!(fake.bad_stops.is_empty(), "{}: {:?}", row.name, fake.bad_stops);
+        assert!(fake.waits.is_empty(), "{}: unconsumed notifications", row.name);
+    }
 }
 
 #[skuld::test]
-fn settle_a_stopped_service_is_left_alone() {
-    let mut fake = FakeScm::new([Some(Observed::Stopped)]);
-    assert_eq!(settle_to_stopped(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
-    assert_eq!(fake.log, vec!["arm_running_or_stopped", "wait", "got_stopped"]);
+fn settle_and_stop_names_the_state_that_refuses_a_stop() {
+    let mut fake = FakeScm::new([Some(Observed::Paused)]).accepting([false]);
+    let err = settle_and_stop(&mut fake, unbounded()).unwrap_err().to_string();
+    assert!(err.contains("PAUSED"), "{err}");
 }
 
-/// The daemon can end between `RUNNING` and the stop, where `control_stop` answers
-/// `ERROR_SERVICE_NOT_ACTIVE` (absorbed by the actor as `Ok`). The `STOPPED` it left must still reach
-/// the wait, which holds only if the stop wait is armed before the stop is sent.
+/// A bounded wait that runs out is an expiry, never a confirmation.
 #[skuld::test]
-fn settle_a_service_that_ends_before_the_stop_lands_still_confirms() {
-    let mut fake = FakeScm::new([Some(Observed::Running), Some(Observed::Stopped)]);
-    assert_eq!(settle_to_stopped(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
-    let arm = fake.log.iter().position(|s| *s == "arm_stopped").unwrap();
-    let stop = fake.log.iter().position(|s| *s == "control_stop").unwrap();
-    assert!(arm < stop, "{:?}", fake.log);
-}
+fn settle_and_stop_reports_each_kind_of_expiry() {
+    let mut fake = FakeScm::new([]).arming(Waited::Expired);
+    assert_eq!(settle_and_stop(&mut fake, spent()).unwrap(), Waited::Expired);
+    assert_eq!(fake.log, vec!["arm_settle"]);
 
-#[skuld::test]
-fn settle_a_failed_stop_is_an_error() {
-    let mut fake = FakeScm::new([Some(Observed::Running)]).rejecting_stop();
-    assert!(settle_to_stopped(&mut fake, unbounded()).is_err());
+    let mut fake = FakeScm::new([None]);
+    assert_eq!(settle_and_stop(&mut fake, spent()).unwrap(), Waited::Expired);
+
+    let mut fake = FakeScm::new([Some(Observed::Running), None]);
+    assert_eq!(settle_and_stop(&mut fake, spent()).unwrap(), Waited::Expired);
+    assert_eq!(fake.stop_count(), 1);
 }
 
 #[skuld::test]

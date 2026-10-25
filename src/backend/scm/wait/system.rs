@@ -11,9 +11,10 @@ use windows_service::service::{Service, ServiceAccess, ServiceState};
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_NOT_ACTIVE, WAIT_IO_COMPLETION};
 use windows_sys::Win32::System::Services::{
-    ControlService, NotifyServiceStatusChangeW, SERVICE_CONTROL_STOP, SERVICE_NOTIFY, SERVICE_NOTIFY_2W,
-    SERVICE_NOTIFY_RUNNING, SERVICE_NOTIFY_START_PENDING, SERVICE_NOTIFY_STATUS_CHANGE, SERVICE_NOTIFY_STOP_PENDING,
-    SERVICE_NOTIFY_STOPPED, SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STOPPED,
+    ControlService, NotifyServiceStatusChangeW, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_STOP, SERVICE_NOTIFY,
+    SERVICE_NOTIFY_2W, SERVICE_NOTIFY_PAUSED, SERVICE_NOTIFY_RUNNING, SERVICE_NOTIFY_START_PENDING,
+    SERVICE_NOTIFY_STATUS_CHANGE, SERVICE_NOTIFY_STOP_PENDING, SERVICE_NOTIFY_STOPPED, SERVICE_PAUSED, SERVICE_RUNNING,
+    SERVICE_STATUS, SERVICE_STOPPED,
 };
 use windows_sys::Win32::System::Threading::{INFINITE, SleepEx};
 
@@ -40,6 +41,7 @@ struct LastStatus {
     exit_win32: AtomicU32,
     exit_specific: AtomicU32,
     wait_hint: AtomicU32,
+    controls_accepted: AtomicU32,
     fired: AtomicBool,
 }
 
@@ -85,6 +87,9 @@ unsafe extern "system" fn notify_callback(pparameter: *const c_void) {
             .exit_specific
             .store(status.dwServiceSpecificExitCode, Ordering::Release);
         (*slot).wait_hint.store(status.dwWaitHint, Ordering::Release);
+        (*slot)
+            .controls_accepted
+            .store(status.dwControlsAccepted, Ordering::Release);
         (*slot).current_state.store(state, Ordering::Release);
         (*slot).fired.store(true, Ordering::Release);
     }
@@ -107,7 +112,7 @@ fn want_to_mask(want: WantState, started: bool) -> SERVICE_NOTIFY {
         WantState::Running if started => SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_STOPPED | SERVICE_NOTIFY_START_PENDING,
         WantState::Running => SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_START_PENDING,
         // No `START_PENDING`: a service starting at the arm must not fire it.
-        WantState::RunningOrStopped => SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_STOPPED,
+        WantState::RunningPausedOrStopped => SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_PAUSED | SERVICE_NOTIFY_STOPPED,
     }
 }
 
@@ -172,6 +177,7 @@ impl SystemScmActor {
                 exit_win32: AtomicU32::new(0),
                 exit_specific: AtomicU32::new(0),
                 wait_hint: AtomicU32::new(0),
+                controls_accepted: AtomicU32::new(0),
                 fired: AtomicBool::new(false),
             }),
             notify: Box::default(),
@@ -370,6 +376,8 @@ impl super::ScmActor for SystemScmActor {
         let state = self.status.current_state.load(Ordering::Acquire);
         Ok(Some(if state == SERVICE_RUNNING {
             Observed::Running
+        } else if state == SERVICE_PAUSED {
+            Observed::Paused
         } else if state == SERVICE_STOPPED {
             Observed::Stopped
         } else {
@@ -386,5 +394,9 @@ impl super::ScmActor for SystemScmActor {
 
     fn stopped_wait_hint(&self) -> u32 {
         self.status.wait_hint.load(Ordering::Acquire)
+    }
+
+    fn accepts_stop(&self) -> bool {
+        self.status.controls_accepted.load(Ordering::Acquire) & SERVICE_ACCEPT_STOP != 0
     }
 }
