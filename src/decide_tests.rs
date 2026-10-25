@@ -313,6 +313,32 @@ fn unreadable_refuses_with_recovery() {
     }
 }
 
+/// A service registered by the released 0.1.0 must read as stale under this build, whatever the
+/// artifact looks like: the version string is the only thing that tells the two generators apart.
+#[skuld::test]
+fn a_registration_by_released_0_1_0_is_stale_under_this_build() {
+    let spec = spec_fixture();
+    let on_disk = "ARTIFACT WITHOUT RECOVERY ACTIONS";
+    let found = ours(&spec, "0.1.0", "REGENERATED WITH THE OLD GENERATOR");
+
+    let outcome = decide(
+        &found,
+        Some(on_disk),
+        "ARTIFACT WITH RECOVERY ACTIONS",
+        &spec,
+        crate::version(),
+        false,
+        &Overlay::default(),
+    );
+
+    assert_eq!(
+        outcome,
+        Outcome::Stale {
+            from_version: "0.1.0".to_owned()
+        }
+    );
+}
+
 #[skuld::test]
 fn older_version_is_stale_not_conflict() {
     let spec = spec_fixture();

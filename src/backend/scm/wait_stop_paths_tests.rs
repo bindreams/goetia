@@ -14,6 +14,7 @@
 use super::*;
 use crate::backend::scm::exit_status::{RecordedExit, Reported};
 use crate::manager::budget::{Budget, Deadline};
+use crate::spec::Kind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Path {
@@ -39,17 +40,21 @@ enum First {
     StopPending,
     Running,
     StoppedClean,
+    /// SCM's initial record for a service that has not run since it was created or since boot:
+    /// `ERROR_SERVICE_NEVER_STARTED`, which is not a failure and queues nothing (measured, P-lines).
+    StoppedNeverStarted,
     /// Daemon failed under `restart: on-failure`: SCM has a restart queued.
     StoppedFailed,
     /// Daemon failed with no recovery actions configured: nothing is queued.
     StoppedFailedNoRecovery,
 }
 
-const FIRSTS: [First; 6] = [
+const FIRSTS: [First; 7] = [
     First::StartPending,
     First::StopPending,
     First::Running,
     First::StoppedClean,
+    First::StoppedNeverStarted,
     First::StoppedFailed,
     First::StoppedFailedNoRecovery,
 ];
@@ -61,14 +66,17 @@ enum Change {
     None,
     ToStartPending,
     ToRunning,
+    /// The service stopped and was started again: `RUNNING`, in a new process.
+    ToRunningAgain,
     ToStoppedClean,
     ToStoppedFailed,
 }
 
-const CHANGES: [Change; 5] = [
+const CHANGES: [Change; 6] = [
     Change::None,
     Change::ToStartPending,
     Change::ToRunning,
+    Change::ToRunningAgain,
     Change::ToStoppedClean,
     Change::ToStoppedFailed,
 ];
@@ -91,9 +99,13 @@ enum Forced {
     AlwaysInvalid,
     /// `ERROR_INVALID_SERVICE_CONTROL` for good: a running service that does not accept `STOP`.
     NeverAccepts,
+    /// Every control meets a service that has crashed and been restarted since it was read: it
+    /// answers `ERROR_SERVICE_NOT_ACTIVE`, and is `RUNNING` again in a new process. A service that
+    /// never settles.
+    AlwaysMoved,
 }
 
-const FORCED: [Forced; 7] = [
+const FORCED: [Forced; 8] = [
     Forced::Ok,
     Forced::Busy,
     Forced::NotActive,
@@ -101,6 +113,7 @@ const FORCED: [Forced; 7] = [
     Forced::AlwaysBusy,
     Forced::AlwaysInvalid,
     Forced::NeverAccepts,
+    Forced::AlwaysMoved,
 ];
 
 /// How a start in progress (a restart SCM made, or one a user asked for) ends.
@@ -142,6 +155,13 @@ fn shim_failed() -> RecordedExit {
     RecordedExit { win32: 5, specific: 0 }
 }
 
+fn never_started() -> RecordedExit {
+    RecordedExit {
+        win32: 1077,
+        specific: 0,
+    }
+}
+
 fn clean() -> RecordedExit {
     RecordedExit { win32: 0, specific: 0 }
 }
@@ -169,6 +189,8 @@ enum Known {
 struct Scm {
     state: QueriedState,
     exit: RecordedExit,
+    /// The process of the current run: a new one for every start.
+    pid: u32,
     recovery: Recovery,
     restart_queued: bool,
     marked_for_deletion: bool,
@@ -193,6 +215,8 @@ struct Scm {
     delivered_by_arm: bool,
     last_stopped: RecordedExit,
     known: Known,
+    /// The process id the last query read; `None` after a callback, which carries none.
+    known_pid: Option<u32>,
     deadline: Deadline,
     calls: usize,
     controls: usize,
@@ -208,6 +232,7 @@ impl Scm {
             First::StopPending => (QueriedState::StopPending, clean()),
             First::Running => (QueriedState::Running, clean()),
             First::StoppedClean => (QueriedState::Stopped, clean()),
+            First::StoppedNeverStarted => (QueriedState::Stopped, never_started()),
             First::StoppedFailed | First::StoppedFailedNoRecovery => (QueriedState::Stopped, daemon_failed()),
         };
         let recovery = if first == First::StoppedFailedNoRecovery {
@@ -221,6 +246,7 @@ impl Scm {
         let mut scm = Self {
             state,
             exit,
+            pid: 1,
             recovery,
             restart_queued: false,
             marked_for_deletion: false,
@@ -240,6 +266,7 @@ impl Scm {
             delivered_by_arm: false,
             last_stopped: clean(),
             known: Known::Nothing,
+            known_pid: None,
             deadline,
             calls: 0,
             controls: 0,
@@ -261,6 +288,7 @@ impl Scm {
     fn queues_restart(&self, state: QueriedState, exit: RecordedExit) -> bool {
         state == QueriedState::Stopped
             && exit.win32 != 0
+            && exit.win32 != 1077
             && self.recovery.restarts
             && self.recovery.on_non_crash_failures
             && !self.marked_for_deletion
@@ -277,6 +305,9 @@ impl Scm {
     fn set(&mut self, state: QueriedState, exit: RecordedExit) {
         self.state = state;
         self.exit = exit;
+        if state == QueriedState::StartPending {
+            self.pid += 1;
+        }
         self.restart_queued = self.queues_restart(state, exit);
         if let Some(want) = self.armed
             && in_mask(want, state)
@@ -325,6 +356,10 @@ impl Scm {
             Change::None => {}
             Change::ToStartPending => self.set(QueriedState::StartPending, clean()),
             Change::ToRunning => self.set(QueriedState::Running, clean()),
+            Change::ToRunningAgain => {
+                self.pid += 1;
+                self.set(QueriedState::Running, clean());
+            }
             Change::ToStoppedClean => self.set(QueriedState::Stopped, clean()),
             Change::ToStoppedFailed => self.set(QueriedState::Stopped, daemon_failed()),
         }
@@ -358,7 +393,7 @@ impl Scm {
             self.apply_change();
         }
         let forced = match self.forced {
-            Forced::Ok | Forced::NeverAccepts => None,
+            Forced::Ok | Forced::NeverAccepts | Forced::AlwaysMoved => None,
             Forced::Busy | Forced::AlwaysBusy => Some(Reply::Busy),
             Forced::NotActive => Some(Reply::NotActive),
             Forced::Invalid | Forced::AlwaysInvalid => Some(Reply::Invalid),
@@ -375,6 +410,11 @@ impl Scm {
             QueriedState::StartPending => Reply::Invalid,
             QueriedState::Stopped => Reply::NotActive,
             QueriedState::Running if self.forced == Forced::NeverAccepts => self.refuse(Reply::Invalid),
+            QueriedState::Running if self.forced == Forced::AlwaysMoved => {
+                self.pid += 1;
+                self.set(QueriedState::Running, clean());
+                self.refuse(Reply::NotActive)
+            }
             QueriedState::Running => {
                 let exit = match self.stop_meets {
                     StopMeets::Clean => clean(),
@@ -387,9 +427,12 @@ impl Scm {
         })
     }
 
-    /// A refusal, noting whether the service is in the state the stop last saw it running in.
+    /// A refusal, noting whether it is final: the service is the run the stop last saw running, or
+    /// refuses `STOP` whatever run it is.
     fn refuse(&mut self, reply: Reply) -> Reply {
-        if self.state == QueriedState::Running && self.known == Known::Is(QueriedState::Running) {
+        let same_run = self.known_pid.is_none_or(|pid| pid == self.pid);
+        let final_refusal = same_run || self.forced == Forced::NeverAccepts;
+        if self.state == QueriedState::Running && self.known == Known::Is(QueriedState::Running) && final_refusal {
             self.unexplained_refusal = true;
         }
         reply
@@ -465,6 +508,7 @@ impl ScmActor for Scm {
         }
         loop {
             if let Some((observed, exit)) = self.delivered.take() {
+                self.known_pid = None;
                 self.known = match observed {
                     Observed::Running => Known::Is(QueriedState::Running),
                     Observed::Stopped => Known::Is(QueriedState::Stopped),
@@ -494,13 +538,25 @@ impl ScmActor for Scm {
         self.last_stopped
     }
 
+    /// Only `start_via_notify` reads the hint, and no stop path starts the service.
+    fn stopped_wait_hint(&self) -> u32 {
+        0
+    }
+
     fn query_status(&mut self) -> io::Result<QueriedStatus> {
         self.count_call()?;
         self.known = Known::Is(self.state);
+        let pid = if self.state == QueriedState::Stopped {
+            0
+        } else {
+            self.pid
+        };
+        self.known_pid = Some(pid);
         Ok(QueriedStatus {
             state: self.state,
             exit: self.exit,
             accepts_stop: self.forced != Forced::NeverAccepts,
+            pid,
         })
     }
 
@@ -531,18 +587,18 @@ enum Outcome {
 
 fn run(path: Path, scm: &mut Scm, deadline: Deadline) -> io::Result<Outcome> {
     Ok(match path {
-        Path::Stop | Path::StopOnSpentBudget => match stop_via_notify(scm, deadline)? {
+        Path::Stop | Path::StopOnSpentBudget => match stop_via_notify(scm, deadline, Kind::Simple)? {
             StopWaited::Confirmed => Outcome::Stopped,
             StopWaited::Expired => Outcome::Expired,
             StopWaited::RestartPending => Outcome::RestartPending,
             StopWaited::Incomplete => unreachable!("the model never reports an incomplete stop"),
         },
-        Path::StopTimeoutZero => match request_stop(scm)? {
+        Path::StopTimeoutZero => match request_stop(scm, Kind::Simple)? {
             RequestedStop::Issued => Outcome::Issued,
             RequestedStop::RestartPending => Outcome::RestartPending,
             RequestedStop::Incomplete => unreachable!("the model never reports an incomplete stop"),
         },
-        Path::UninstallStep1 | Path::UninstallStep3 => match uninstall_teardown(scm, deadline)? {
+        Path::UninstallStep1 | Path::UninstallStep3 => match uninstall_teardown(scm, deadline, Kind::Simple)? {
             StopWaited::Confirmed => Outcome::Stopped,
             StopWaited::Expired => Outcome::Expired,
             other => unreachable!("an uninstall cannot end {other:?} in the model"),
@@ -567,14 +623,14 @@ struct Row {
 fn acted_on(first: First, change: Change) -> First {
     if matches!(
         first,
-        First::StoppedClean | First::StoppedFailed | First::StoppedFailedNoRecovery
+        First::StoppedClean | First::StoppedNeverStarted | First::StoppedFailed | First::StoppedFailedNoRecovery
     ) {
         return first;
     }
     match change {
         Change::None => first,
         Change::ToStartPending => First::StartPending,
-        Change::ToRunning => First::Running,
+        Change::ToRunning | Change::ToRunningAgain => First::Running,
         Change::ToStoppedClean => First::StoppedClean,
         Change::ToStoppedFailed => First::StoppedFailed,
     }
@@ -603,7 +659,7 @@ fn expected(path: Path, first: First, row: &Row) -> Outcome {
         // Waits out a start or a stop in progress, stops a running daemon, and refuses a restart
         // that is pending: it never waits on one.
         Path::Stop => match acts_on {
-            First::StoppedClean | First::StopPending => Outcome::Stopped,
+            First::StoppedClean | First::StoppedNeverStarted | First::StopPending => Outcome::Stopped,
             First::StoppedFailed | First::StoppedFailedNoRecovery => settled_failed(first),
             First::Running => running,
             First::StartPending => match row.starts {
@@ -613,11 +669,20 @@ fn expected(path: Path, first: First, row: &Row) -> Outcome {
             },
         },
         // A spent budget waits for nothing: a start in progress is reported, a stop in progress or a
-        // control just sent is left unconfirmed, and a stopped service is judged as it is.
+        // control just sent is left unconfirmed, and a stopped service is judged as it is. A control
+        // refused because the service moved is not an expiry: the service is read again, and judged
+        // as it is then.
         Path::StopOnSpentBudget => match first {
             First::StartPending => Outcome::RestartPending,
-            First::StopPending | First::Running => Outcome::Expired,
-            First::StoppedClean => Outcome::Stopped,
+            First::StopPending => Outcome::Expired,
+            First::Running if row.forced == Forced::AlwaysMoved => Outcome::Expired,
+            First::Running => match acts_on {
+                First::StartPending => Outcome::RestartPending,
+                First::StoppedClean => Outcome::Stopped,
+                First::StoppedFailed => settled_failed(first),
+                _ => Outcome::Expired,
+            },
+            First::StoppedClean | First::StoppedNeverStarted => Outcome::Stopped,
             First::StoppedFailed | First::StoppedFailedNoRecovery => settled_failed(first),
         },
         // Waits for nothing and sends a control only to a running service: a service that is
@@ -636,7 +701,14 @@ fn expected(path: Path, first: First, row: &Row) -> Outcome {
 
 /// Whether a row can happen: the late change needs a pending callback to follow, which only a
 /// stopping service the stop waits on gives.
-fn possible(path: Path, first: First, change: Change, late: bool) -> bool {
+fn possible(path: Path, first: First, change: Change, late: bool, forced: Forced) -> bool {
+    // A service that never settles ends only on a deadline that has run out, and is met by a
+    // control only when it starts out running.
+    if forced == Forced::AlwaysMoved
+        && (path != Path::StopOnSpentBudget || first != First::Running || change != Change::None || late)
+    {
+        return false;
+    }
     !late
         || (first == First::StopPending
             && change != Change::None
@@ -653,10 +725,10 @@ fn every_stop_path_survives_every_interleaving_of_the_service_state() {
         for first in FIRSTS {
             for change in CHANGES {
                 for late in [false, true] {
-                    if !possible(path, first, change, late) {
-                        continue;
-                    }
                     for forced in FORCED {
+                        if !possible(path, first, change, late, forced) {
+                            continue;
+                        }
                         for starts in STARTS {
                             for stop_meets in STOP_MEETS {
                                 rows += 1;
@@ -724,6 +796,11 @@ fn every_stop_path_survives_every_interleaving_of_the_service_state() {
                                             problems.push("step 1 sent a control to a stopped service".to_string());
                                         }
                                     }
+                                }
+                                // Past the deadline the stop reads the service once more and no further,
+                                // however much it keeps moving: the first control, and one after it.
+                                if forced == Forced::AlwaysMoved && scm.controls != 2 {
+                                    problems.push(format!("{} controls past a spent deadline, wanted 2", scm.controls));
                                 }
                                 if !problems.is_empty() {
                                     failures.push(format!("{label}: {}", problems.join("; ")));

@@ -224,6 +224,8 @@ fn run_daemon(
             };
             exit_report(stop_bus.is_stopping(), code)
         }
+        // The failure is already logged; the daemon was torn down, so it is the shim that failed.
+        WaitOutcome::WaitFailed { os_error } => Reported::shim_failure(os_error),
         WaitOutcome::Stopping => Reported::Clean,
         // Still reports STOPPED so the service stays stoppable and uninstallable.
         WaitOutcome::StoppingUnkillable => {
@@ -269,7 +271,7 @@ fn launch(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str) -> Result<(Arc<C
 }
 
 /// The OS error code behind a `cosca` failure, if it has one.
-fn os_error_of(e: &cosca::error::Error) -> Option<i32> {
+pub(crate) fn os_error_of(e: &cosca::error::Error) -> Option<i32> {
     match e {
         cosca::error::Error::Io(e) => e.raw_os_error(),
         cosca::error::Error::Unassessable { source, .. } => source.as_ref().and_then(std::io::Error::raw_os_error),

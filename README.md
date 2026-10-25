@@ -728,10 +728,14 @@ clean exit is never restarted, and a stop reports a clean exit.
 
 Nothing cancels a restart SCM has queued, so `goetia daemon stop` refuses one
 instead of waiting for it: a command that failed and is waiting out
-`restart-delay`, or one that fails as the stop arrives. `stop` exits `4`, says
-that SCM is starting the daemon or has a restart queued that goetia cannot
-cancel, and that goetia did not stop it. That holds under every `--timeout`,
-`--no-timeout` included. Run `stop` again once the daemon is back, or
+`restart-delay`, or one that fails as the stop arrives. When a command fails
+just as a `stop` arrives, what the shim reports decides it: if the stop request
+has reached the shim by the time it reports the exit, it reports a clean stop,
+which SCM does not restart and `stop` accepts; otherwise it reports the failure
+and `stop` refuses as below. A refusing `stop` exits `4`, says that SCM is
+starting the daemon or has a restart queued that goetia cannot cancel, and that
+goetia did not stop it. That holds under every `--timeout`, `--no-timeout`
+included. Run `stop` again once the daemon is back, or
 `uninstall` it. `restart` refuses at its stop the same way and does not start
 the daemon. A service that is starting refuses a stop, so a `stop` that arrives
 as a restart begins waits, within `--timeout`, for the daemon to be running and
@@ -778,7 +782,9 @@ the file it logs that, and `stop` does not see the failures it could not record.
 
 **`type: managed`.** There is no shim, so `stop` goes by the record SCM keeps of
 how the service last ended and by the service's recovery actions as they are
-now. Three sequences make that wrong:
+now. A service that has not run since it was created or since boot holds SCM's
+own record of that (`1077`), which is not a failure, so nothing is pending for
+it. Three sequences make that wrong:
 
 - **A failed record outlives the settings it failed under.** A daemon fails
   under `restart: never`; you change the manifest to `restart: on-failure` and
@@ -787,7 +793,9 @@ now. Three sequences make that wrong:
   `restart`, which does not start the daemon. The same happens to a service
   that was disabled outside goetia (`sc config <id> start= disabled`) after its
   daemon failed. Run `goetia daemon start <id>` once first: starting replaces
-  the record.
+  the record. A disabled service refuses `start`, so for it run
+  `sc config <id> start= demand` (or the start type you want) first, or
+  `uninstall` it.
 - **A policy change during the delay hides a queued restart.** A daemon fails
   under `restart: on-failure` and SCM queues a restart. If you change the
   manifest to `restart: never` and run `goetia daemon install` before it
@@ -852,11 +860,18 @@ shim does not launch a second command, logs the pid and what to do, and reports
 Win32 code `1056`. Under `restart: on-failure` SCM then retries the start at
 `restart-delay`, and the command starts by itself once the process is gone.
 
+The `1003` record is the shim's, so goetia reads it only for `type: simple`; the
+same pair from a `type: managed` service, which speaks to SCM itself, is judged
+like any other stop. A service whose spec goetia cannot read is taken for
+`type: simple` here, so a start is refused rather than risk a second copy.
+
 A service that refuses the stop control with no change of state to explain it,
 such as a `type: managed` service that reports running and answers `STOP` with an
 error, makes `stop` and `restart` exit `1`, and `uninstall` exit `1` saying the
 service was not deleted. goetia sends the control again only to a service whose
-state has changed since it last looked.
+state or process has changed since it last looked. That second look is not a
+wait, so it happens even when `--timeout` has run out; after that, one more look
+at most, and a service that is still changing is reported as timed out.
 
 ### What returning means
 
@@ -878,7 +893,9 @@ confirms differs:
   cannot start is a failed start under every `restart:` policy. A command that
   starts and then exits at once is a successful start, whatever its exit code,
   as with `systemctl start`; it is the command's exit, not `start`, that
-  reports it. For a `type: managed` daemon, which speaks to SCM itself, a
+  reports it. A `start` that lands as SCM is restarting the command, and that
+  restart fails (a missing `goetia-shim` or a broken account), is a failed start.
+  For a `type: managed` daemon, which speaks to SCM itself, a
   service that stops before it reports running is a failed start.
 - **launchd** sits between the two: the pid `launchctl kickstart -p` reports
   is launchd's own fork, taken before the user process reaches its `exec`.

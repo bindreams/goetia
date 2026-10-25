@@ -514,7 +514,7 @@ fn install_accepts_every_other_restart() {
     }
 }
 
-// start_kind ----------------------------------------------------------------------------------------------------------
+// read_kinds ----------------------------------------------------------------------------------------------------------
 
 fn blob_of(kind: Kind) -> Blob {
     Blob {
@@ -536,15 +536,30 @@ fn blob_of(kind: Kind) -> Blob {
 }
 
 #[skuld::test]
-fn start_reads_a_simple_service_by_the_shims_vocabulary_and_anything_else_strictly() {
-    assert_eq!(start_kind(Ok(Some(blob_of(Kind::Simple)))), (Kind::Simple, None));
-    assert_eq!(start_kind(Ok(Some(blob_of(Kind::Managed)))), (Kind::Managed, None));
-    let (kind, why) = start_kind(Ok(None));
-    assert_eq!(kind, Kind::Managed);
-    assert!(why.is_some());
-    let (kind, why) = start_kind(Err(Error::Blob("corrupt".to_string())));
-    assert_eq!(kind, Kind::Managed);
-    assert!(why.unwrap().contains("corrupt"));
+fn a_readable_blob_selects_its_own_kind_for_both_readings() {
+    let simple = read_kinds(Ok(Some(blob_of(Kind::Simple))));
+    assert_eq!(
+        (simple.start, simple.record, simple.unreadable),
+        (Kind::Simple, Kind::Simple, None)
+    );
+    let managed = read_kinds(Ok(Some(blob_of(Kind::Managed))));
+    assert_eq!(
+        (managed.start, managed.record, managed.unreadable),
+        (Kind::Managed, Kind::Managed, None)
+    );
+}
+
+/// A blob that cannot be read waits strictly, like `type: managed`, which is what a shim that
+/// cannot decode it reports anyway; but its exit record is read as the shim's, so that a stop does
+/// not call a daemon stopped that may still run and a start is refused over it.
+#[skuld::test]
+fn an_unreadable_blob_waits_strictly_and_reads_the_record_as_the_shims() {
+    let none = read_kinds(Ok(None));
+    assert_eq!((none.start, none.record), (Kind::Managed, Kind::Simple));
+    assert!(none.unreadable.is_some());
+    let corrupt = read_kinds(Err(Error::Blob("corrupt".to_string())));
+    assert_eq!((corrupt.start, corrupt.record), (Kind::Managed, Kind::Simple));
+    assert!(corrupt.unreadable.unwrap().contains("corrupt"));
 }
 
 /// A start judged strictly because the blob could not be read says why, so the user is not told a
@@ -584,7 +599,7 @@ fn a_blob_that_says_always_decodes_and_starts_as_its_kind() {
         .expect("the blob is ours");
 
     assert_eq!(blob.spec.restart, Restart::Always);
-    assert_eq!(start_kind(Ok(Some(blob))), (Kind::Simple, None));
+    assert_eq!(read_kinds(Ok(Some(blob))).start, Kind::Simple);
 }
 
 // refuse_always at its call sites -------------------------------------------------------------------------------------
