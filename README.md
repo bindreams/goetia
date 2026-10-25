@@ -725,12 +725,51 @@ reads the spec as installed, so a daemon restarted after `goetia daemon install`
 runs the updated spec. A shim that is killed or crashes is restarted too. A
 clean exit is never restarted, and a stop reports a clean exit.
 
-Nothing cancels a restart SCM has queued, and `goetia daemon stop` does not
-look for one. A command that failed and is waiting out `restart-delay` finds
-the service already stopped, so `stop` exits `0` and the daemon is started when
-the delay ends. A command that fails at the moment a `stop` arrives is restarted
-the same way: SCM cannot tell that stop from the crash. `goetia daemon uninstall`
-is not affected: deleting the service cancels a restart SCM has queued.
+Nothing cancels a restart SCM has queued, so `goetia daemon stop` refuses one
+instead of waiting for it: a command that failed and is waiting out
+`restart-delay`, or one that fails as the stop arrives. `stop` exits `4`, says
+that SCM is starting the daemon or has a restart queued that goetia cannot
+cancel, and that goetia did not stop it. That holds under every `--timeout`,
+`--no-timeout` included. Run `stop` again once the daemon is back, or
+`uninstall` it. `restart` refuses at its stop the same way and does not start
+the daemon. A service that is starting refuses a stop, so a `stop` that arrives
+as a restart begins waits, within `--timeout`, for the daemon to be running and
+then stops it; if that takes longer, or `--timeout` is `0`, it exits `4` in
+the same way.
+
+`stop` finds out whether a restart is queued from the record SCM keeps of how
+the service last ended and from the service's recovery actions as they are
+now. Three sequences make that wrong:
+
+- **A failed record outlives the settings it failed under.** A daemon fails
+  under `restart: never`; you change the manifest to `restart: on-failure` and
+  run `goetia daemon install`. The failure is still recorded but no restart was
+  queued, so `stop` exits `4` for a restart that is not coming, and so does
+  `restart`, which does not start the daemon. The same happens to a service
+  that was disabled outside goetia (`sc config <id> start= disabled`) after its
+  daemon failed. Run `goetia daemon start <id>` once first: starting replaces
+  the record.
+- **A policy change during the delay hides a queued restart.** A daemon fails
+  under `restart: on-failure` and SCM queues a restart. If you change the
+  manifest to `restart: never` and run `goetia daemon install` before it
+  fires, the queued restart still fires, but the service now has no restart
+  action, so `goetia daemon stop` exits `0`.
+- **A manual start hides a queued restart.** A daemon fails and SCM queues a
+  restart for `restart-delay` later. If you run `goetia daemon start <id>`
+  before it fires, the start replaces the record, so a later
+  `goetia daemon stop <id>` sees a clean service and exits `0`, and the restart
+  that was queued still starts the daemon when the delay ends. To avoid it,
+  `stop` a failed daemon instead of starting it, and when you have started one
+  by hand, stop it again after `restart-delay` has passed.
+
+`uninstall` does not wait for a restart. It stops a running daemon first (one
+that is still starting is waited on until it runs, then stopped), and
+if that fails it exits `1` and leaves the service installed. It then deletes the
+service, which cancels a restart SCM has queued and prevents any other, and
+stops any daemon that a restart started in the meantime. A daemon that fails as
+soon as it starts can still be uninstalled. If that last stop cannot be
+confirmed, `uninstall` exits `1` having already deleted the service, which
+Windows removes when the daemon's process ends.
 
 After upgrading goetia, run `goetia daemon install` again for every daemon
 installed by an older version. Services registered before this shim existed
@@ -754,8 +793,17 @@ or a command that is missing retries at `restart-delay` indefinitely, as it
 does for `type: managed`. If the shim cannot kill the command on `stop`, it
 logs both failed kills and reports the stop with Win32 code `0`, because a
 non-zero Win32 code would make SCM start a second copy; the service-specific
-code `1003` is the record that the command may still be running. goetia does not
-read that record: `stop` exits `0`, and a later `start` starts a second copy.
+code `1003` is the record that the command may still be running. goetia reads
+that record: `stop` exits `1` saying the command may still be running, `start`
+and `restart` do not start a second copy (they exit `1`; once you have stopped
+the command yourself, `sc start` starts the service), and `uninstall` deletes the
+service and then exits `1` with the same message.
+
+A service that refuses the stop control with no change of state to explain it,
+such as a `type: managed` service that reports running and answers `STOP` with an
+error, makes `stop` and `restart` exit `1`, and `uninstall` exit `1` saying the
+service was not deleted. goetia sends the control again only to a service whose
+state has changed since it last looked.
 
 ### What returning means
 
@@ -788,6 +836,12 @@ confirms differs:
 stopped waiting; it did not cancel anything, so the request stands and the
 daemon may still arrive. `goetia daemon status <id>` shows the manager's
 current view.
+
+On Windows a `stop` can also exit `4` with nothing issued: SCM is starting the
+daemon for longer than `--timeout`, or has a restart queued after a failure,
+which `stop` refuses under any `--timeout` (see [Restarts on
+Windows](#restarts-on-windows)). The message says that SCM is starting the
+daemon or has a restart queued that goetia cannot cancel.
 
 A `start` of a daemon that is already running is where the three disagree
 under a very short `--timeout`. launchd and SCM say "running" — launchd
@@ -1186,13 +1240,14 @@ that comes with it.
 ### The two sources of `4`
 
 Two within what `list`, `status` and `show` report. The mutating verbs reach
-`4` four more ways: by
+`4` five more ways: by
 [waiting and giving up](#when-the-wait-runs-out); by losing track of a
-request, one that reached the manager or one that may or may not have; for a
-`restart` that does not wait, by a start refused after a stop nobody confirmed;
-and, on launchd, by an `install` that wrote a plist and then found the job
-loaded, or could not read whether it was, or that booted out a job and found
-its plist taken
+request, one that reached the manager or one that may or may not have; by a
+`stop` that found a restart SCM had queued, which it refuses; for a `restart`
+that does not wait, by a start refused after a stop nobody confirmed; and, on
+launchd, by an `install` that wrote a plist and then found the job loaded, or
+could not read whether it was, or that booted out a job and found its plist
+taken
 ([above](#install-never-changes-whether-a-daemon-runs)). The two
 sources are not interchangeable, and the remedies do not transfer:
 
