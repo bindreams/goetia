@@ -508,6 +508,15 @@ impl ScmActor for Scm {
         self.count_call()?;
         Ok(self.recovery)
     }
+
+    /// The table models the status rule, which is the `type: managed` one.
+    fn shim_state(&mut self) -> io::Result<Option<crate::backend::scm::state_file::ShimState>> {
+        Ok(None)
+    }
+
+    fn survivor(&mut self) -> io::Result<Option<(u32, crate::backend::scm::state_file::Survivor)>> {
+        Ok(None)
+    }
 }
 
 /// What a path returned, in one vocabulary.

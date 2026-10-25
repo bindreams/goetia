@@ -7,7 +7,7 @@ use std::ffi::c_void;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use windows_service::service::{Service, ServiceAccess, ServiceActionType};
+use windows_service::service::{Service, ServiceAccess, ServiceActionType, ServiceStartType};
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{
     ERROR_INVALID_SERVICE_CONTROL, ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_CANNOT_ACCEPT_CTRL,
@@ -23,6 +23,8 @@ use windows_sys::Win32::System::Services::{
 use windows_sys::Win32::System::Threading::{INFINITE, SleepEx};
 
 use crate::backend::scm::exit_status::RecordedExit;
+use crate::backend::scm::state_file::{self, ShimState, Survivor};
+use crate::spec::Kind;
 
 use super::{ControlReply, Deadline, Observed, QueriedState, QueriedStatus, Recovery, StartReply, Waited, WantState};
 
@@ -150,6 +152,8 @@ fn queried_state(state: u32) -> io::Result<QueriedState> {
 pub struct SystemScmActor {
     scm: Option<WinServiceManager>,
     name: String,
+    /// Whether the service has a shim, and so a state file ([`super::ScmActor::shim_state`]).
+    kind: Kind,
     /// The rights `service` is opened with, here and on every reopen.
     access: ServiceAccess,
     service: Option<Service>,
@@ -165,24 +169,25 @@ pub struct SystemScmActor {
 }
 
 impl SystemScmActor {
-    /// Open `name` with `QUERY_STATUS | QUERY_CONFIG | STOP | START` — everything both
-    /// [`super::stop_via_notify`] and [`super::start_via_notify`] need,
+    /// Open `name`, a service of `kind`, with `QUERY_STATUS | QUERY_CONFIG | STOP | START` —
+    /// everything both [`super::stop_via_notify`] and [`super::start_via_notify`] need,
     /// so one actor serves either wait without reopening.
-    pub fn open(name: &str) -> io::Result<Self> {
-        Self::open_with(name, WAIT_ACCESS)
+    pub fn open(name: &str, kind: Kind) -> io::Result<Self> {
+        Self::open_with(name, kind, WAIT_ACCESS)
     }
 
     /// [`Self::open`] with `DELETE` as well, for [`super::uninstall_teardown`].
-    pub fn open_to_delete(name: &str) -> io::Result<Self> {
-        Self::open_with(name, WAIT_ACCESS | ServiceAccess::DELETE)
+    pub fn open_to_delete(name: &str, kind: Kind) -> io::Result<Self> {
+        Self::open_with(name, kind, WAIT_ACCESS | ServiceAccess::DELETE)
     }
 
-    fn open_with(name: &str, access: ServiceAccess) -> io::Result<Self> {
+    fn open_with(name: &str, kind: Kind, access: ServiceAccess) -> io::Result<Self> {
         let scm = open_scm()?;
         let service = open_handle(&scm, name, access)?;
         Ok(Self {
             scm: Some(scm),
             name: name.to_string(),
+            kind,
             access,
             service: Some(service),
             status: Box::new(LastStatus {
@@ -445,6 +450,24 @@ impl super::ScmActor for SystemScmActor {
             },
             accepts_stop: status.dwControlsAccepted & SERVICE_ACCEPT_STOP != 0,
         })
+    }
+
+    fn shim_state(&mut self) -> io::Result<Option<ShimState>> {
+        if self.kind != Kind::Simple {
+            return Ok(None);
+        }
+        let loaded = state_file::read(&state_file::host::path(&self.name))?;
+        let start_type = self.service()?.query_config().map_err(to_io_error)?.start_type;
+        Ok(Some(ShimState {
+            loaded,
+            now: state_file::host::clock(),
+            disabled: start_type == ServiceStartType::Disabled,
+        }))
+    }
+
+    fn survivor(&mut self) -> io::Result<Option<(u32, Survivor)>> {
+        let loaded = state_file::read(&state_file::host::path(&self.name))?;
+        Ok(state_file::blocking_survivor(&loaded))
     }
 
     fn recovery(&mut self) -> io::Result<Recovery> {
