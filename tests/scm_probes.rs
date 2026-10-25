@@ -67,6 +67,27 @@ mod host {
         idx
     }
 
+    /// `%ProgramData%\<name>.trace`: one line per host event, with Unix-epoch microseconds, so the
+    /// probe can see what the host did and when, including a panic.
+    pub fn trace_path(name: &str) -> std::path::PathBuf {
+        let dir = std::env::var_os("ProgramData").expect("%ProgramData%");
+        std::path::PathBuf::from(dir).join(format!("{name}.trace"))
+    }
+
+    fn trace(name: &str, msg: &str) {
+        let us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros();
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(trace_path(name))
+        {
+            let _ = writeln!(f, "us={us} pid={} {msg}", std::process::id());
+        }
+    }
+
     fn code(s: &str) -> u32 {
         match s.strip_prefix("0x") {
             Some(hex) => u32::from_str_radix(hex, 16).expect("hex code"),
@@ -81,19 +102,29 @@ mod host {
         let scripts: Vec<&str> = args[4].split('|').collect();
         let idx = next_run_index(&name);
         let script = scripts[idx.min(scripts.len() - 1)];
+        let hook_name = name.clone();
+        std::panic::set_hook(Box::new(move |info| {
+            trace(&hook_name, &format!("run={idx} PANIC {info}"))
+        }));
+        trace(&name, &format!("run={idx} service_main script={script}"));
 
         let (stop_tx, stop_rx) = mpsc::channel();
-        let handler = move |control| match control {
-            // As goetia-shim refuses a stop once it has decided on a failure.
-            ServiceControl::Stop if REFUSE_ONE_STOP.swap(false, Ordering::SeqCst) => {
-                ServiceControlHandlerResult::Other(windows_sys::Win32::Foundation::ERROR_SERVICE_CANNOT_ACCEPT_CTRL)
-            }
-            ServiceControl::Stop => {
-                let _ = stop_tx.send(());
-                ServiceControlHandlerResult::NoError
-            }
-            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-            _ => ServiceControlHandlerResult::NotImplemented,
+        let handler_name = name.clone();
+        let handler = move |control| {
+            let result = match control {
+                // As goetia-shim refuses a stop once it has decided on a failure.
+                ServiceControl::Stop if REFUSE_ONE_STOP.swap(false, Ordering::SeqCst) => {
+                    ServiceControlHandlerResult::Other(windows_sys::Win32::Foundation::ERROR_SERVICE_CANNOT_ACCEPT_CTRL)
+                }
+                ServiceControl::Stop => {
+                    let _ = stop_tx.send(());
+                    ServiceControlHandlerResult::NoError
+                }
+                ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+                _ => ServiceControlHandlerResult::NotImplemented,
+            };
+            trace(&handler_name, &format!("run={idx} handler {control:?} -> {result:?}"));
+            result
         };
         let handle = service_control_handler::register(&name, handler).expect("register control handler");
 
@@ -108,6 +139,7 @@ mod host {
         };
 
         for step in script.split(',') {
+            trace(&name, &format!("run={idx} step {step}"));
             let parts: Vec<&str> = step.split(':').collect();
             match parts.as_slice() {
                 ["pending"] => handle
@@ -173,6 +205,7 @@ mod host {
                 other => panic!("bad step {other:?}"),
             }
         }
+        trace(&name, &format!("run={idx} service_main end"));
     }
 }
 
@@ -949,34 +982,51 @@ mod probes {
     // P16 =============================================================================================================
 
     /// A host whose control handler refuses STOP with `ERROR_SERVICE_CANNOT_ACCEPT_CTRL`, as
-    /// goetia-shim does once it has decided on a failure: does `ControlService` fail with that code,
-    /// and does SCM leave the state alone? The second STOP is accepted and ends the run cleanly.
-    fn p16() -> String {
+    /// goetia-shim does once it has decided on a failure: what does `ControlService` return, and
+    /// what does SCM do with the service? The host traces every control its handler receives and
+    /// what it returned. (a) a second STOP follows the refused one; (b) only the refused STOP, then
+    /// the service is watched for the absence bound.
+    fn p16(variant: &'static str) -> String {
         let delay = Duration::from_millis(1000);
+        let tag = format!("P16{variant}");
         let mut p = Probe::new(
-            "P16",
+            &tag,
             &format!("run,refuse-one-stop,connect,wait-stop,stopped:w32:0|{STAY_UP}"),
             &format!("restart/{}", delay.as_millis()),
         );
+        let trace = super::host::trace_path(&p.name);
+        let dump = |p: &Probe, when: &str| {
+            let text = std::fs::read_to_string(&trace).unwrap_or_default();
+            for line in text.lines() {
+                p.p(format_args!("host trace ({when}): {line}"));
+            }
+        };
         let _ = p.start();
         p.connect(0, EXPECTED_BOUND);
         let svc = p.service(ServiceAccess::STOP | ServiceAccess::QUERY_STATUS);
         let refused = control_stop(&svc);
         p.p(format_args!("first STOP: {refused}"));
+        dump(&p, "right after the first STOP returned");
         let after_refusal = p.status();
-        p.p(format_args!("status after the refused STOP: {after_refusal}"));
-        let accepted = control_stop(&svc);
-        p.p(format_args!("second STOP: {accepted}"));
-        p.wait_state(ServiceState::Stopped, EXPECTED_BOUND);
+        p.p(format_args!("status after the first STOP: {after_refusal}"));
         let bound = absence_bound(delay);
+        let second = if variant == "a" {
+            let accepted = control_stop(&svc);
+            p.p(format_args!("second STOP: {accepted}"));
+            dump(&p, "right after the second STOP returned");
+            accepted
+        } else {
+            "not sent".to_string()
+        };
         let r1 = p.connect(1, bound).cloned();
+        dump(&p, "end");
         let r = format!(
-            "first STOP {refused}; then status {after_refusal}; second STOP {accepted}; final status {}; after: {}",
+            "first STOP {refused}; then status {after_refusal}; second STOP {second}; final status {}; after: {}",
             p.status(),
             describe(r1.as_ref(), bound)
         );
         p.result(&r);
-        p.dump_scm_events("P16");
+        p.dump_scm_events(&tag);
         r
     }
 
@@ -1753,11 +1803,7 @@ mod probes {
     pub fn run_all() {
         // Sequential: the System-log events of a probe must be its own.
         type Job = Box<dyn FnOnce() -> String + Send>;
-        let jobs: Vec<(&'static str, Job)> = vec![
-            ("P15a", Box::new(|| p15("a"))),
-            ("P15b", Box::new(|| p15("b"))),
-            ("P16", Box::new(p16)),
-        ];
+        let jobs: Vec<(&'static str, Job)> = vec![("P16a", Box::new(|| p16("a"))), ("P16b", Box::new(|| p16("b")))];
         println!("PROBE SUMMARY begin");
         for (name, job) in jobs {
             let res = thread::spawn(move || catch_unwind(AssertUnwindSafe(job))).join();
