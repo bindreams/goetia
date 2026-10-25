@@ -739,7 +739,9 @@ the same way.
 
 `stop` finds out whether a restart is queued from the record SCM keeps of how
 the service last ended and from the service's recovery actions as they are
-now. Three sequences make that wrong:
+now. A service that has not run since it was created or since boot holds SCM's
+own record of that (`1077`), which is not a failure, so nothing is pending for
+it. Three sequences make that wrong:
 
 - **A failed record outlives the settings it failed under.** A daemon fails
   under `restart: never`; you change the manifest to `restart: on-failure` and
@@ -748,7 +750,9 @@ now. Three sequences make that wrong:
   `restart`, which does not start the daemon. The same happens to a service
   that was disabled outside goetia (`sc config <id> start= disabled`) after its
   daemon failed. Run `goetia daemon start <id>` once first: starting replaces
-  the record.
+  the record. A disabled service refuses `start`, so for it run
+  `sc config <id> start= demand` (or the start type you want) first, or
+  `uninstall` it.
 - **A policy change during the delay hides a queued restart.** A daemon fails
   under `restart: on-failure` and SCM queues a restart. If you change the
   manifest to `restart: never` and run `goetia daemon install` before it
@@ -797,13 +801,16 @@ code `1003` is the record that the command may still be running. goetia reads
 that record: `stop` exits `1` saying the command may still be running, `start`
 and `restart` do not start a second copy (they exit `1`; once you have stopped
 the command yourself, `sc start` starts the service), and `uninstall` deletes the
-service and then exits `1` with the same message.
+service and then exits `1` with the same message. This record is the shim's, so goetia
+reads it only for `type: simple`; the same pair from a `type: managed` service,
+which speaks to SCM itself, is judged like any other stop.
 
 A service that refuses the stop control with no change of state to explain it,
 such as a `type: managed` service that reports running and answers `STOP` with an
 error, makes `stop` and `restart` exit `1`, and `uninstall` exit `1` saying the
 service was not deleted. goetia sends the control again only to a service whose
-state has changed since it last looked.
+state or process has changed since it last looked. That second look is not a
+wait, so it happens even when `--timeout` has run out.
 
 ### What returning means
 

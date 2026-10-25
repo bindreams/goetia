@@ -444,6 +444,7 @@ impl super::ScmActor for SystemScmActor {
                 specific: status.dwServiceSpecificExitCode,
             },
             accepts_stop: status.dwControlsAccepted & SERVICE_ACCEPT_STOP != 0,
+            pid: status.dwProcessId,
         })
     }
 

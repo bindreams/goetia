@@ -175,7 +175,7 @@ impl ServiceManager for ScmManager {
         // closing the handle it deletes through, and the record goes only when every handle to
         // the service has closed, this one included (trap 3).
         drop(service);
-        uninstall_locked(id)
+        uninstall_locked(id, installed_kind(id).0)
     }
 
     fn enable(&self, id: &Id) -> Result<()> {
@@ -199,13 +199,14 @@ impl ServiceManager for ScmManager {
         drop(service);
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to start it: {e}")))?;
+        let (kind, unreadable) = installed_kind(id);
         if !budget.waits() {
             // Request-only: `StartServiceW` and return, arming no wait at
             // all. `Ok(())` then means the request was accepted and nothing
             // more, per the trait doc comment.
-            return super::wait::request_start(&mut actor).map_err(|e| Error::Other(format!("start `{id}`: {e}")));
+            return super::wait::request_start(&mut actor, kind)
+                .map_err(|e| Error::Other(format!("start `{id}`: {e}")));
         }
-        let (kind, unreadable) = installed_kind(id);
         let waited = super::wait::start_via_notify(&mut actor, deadline, kind)
             .map_err(|e| failed_start(id, &e, unreadable.as_deref()))?;
         match waited {
@@ -223,7 +224,8 @@ impl ServiceManager for ScmManager {
         drop(service);
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to start it: {e}")))?;
-        super::wait::request_start_after_stop(&mut actor).map_err(|e| Error::Other(format!("start `{id}`: {e}")))
+        super::wait::request_start_after_stop(&mut actor, installed_kind(id).0)
+            .map_err(|e| Error::Other(format!("start `{id}`: {e}")))
     }
 
     fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
@@ -235,14 +237,17 @@ impl ServiceManager for ScmManager {
         drop(service);
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to stop it: {e}")))?;
+        let kind = installed_kind(id).0;
         if !budget.waits() {
-            return match super::wait::request_stop(&mut actor).map_err(|e| Error::Other(format!("stop `{id}`: {e}")))? {
+            return match super::wait::request_stop(&mut actor, kind)
+                .map_err(|e| Error::Other(format!("stop `{id}`: {e}")))?
+            {
                 RequestedStop::Issued => Ok(()),
                 RequestedStop::RestartPending => Err(budget::restart_pending(id.as_str())),
                 RequestedStop::Incomplete => Err(daemon_may_still_run(id, "stop", "the service stopped")),
             };
         }
-        let waited = super::wait::stop_via_notify(&mut actor, deadline)
+        let waited = super::wait::stop_via_notify(&mut actor, deadline, kind)
             .map_err(|e| Error::Other(format!("stop `{id}`: {e}")))?;
         match waited {
             StopWaited::Confirmed => Ok(()),
@@ -942,14 +947,14 @@ fn run_sc(args: &[&str]) -> Result<()> {
 /// the host never runs) and SCM starts nothing for a service marked for deletion. A daemon that
 /// fails as soon as it is spawned, which is when `uninstall` is used, therefore cannot keep a stop
 /// waiting, and a restart that fires between the stop and the delete is stopped after it.
-fn uninstall_locked(id: &Id) -> Result<()> {
+fn uninstall_locked(id: &Id, kind: Kind) -> Result<()> {
     let mut actor = super::wait::SystemScmActor::open_to_delete(id.as_str())
         .map_err(|e| Error::Other(format!("open `{id}` to delete it: {e}")))?;
     // Deliberately `Budget::Unbounded`, and not the caller's: `uninstall` has no `--timeout`
     // of its own, this stop is a means rather than an end, and bounding it would turn a
     // slow-stopping service into a failed uninstall where today it succeeds. The error already
     // says whether the service was deleted.
-    let waited = super::wait::uninstall_teardown(&mut actor, Budget::Unbounded.start())
+    let waited = super::wait::uninstall_teardown(&mut actor, Budget::Unbounded.start(), kind)
         .map_err(|e| Error::Other(format!("uninstall `{id}`: {e}")))?;
     // The record goes when the last handle closes, so this is the end of the uninstall.
     drop(actor);
