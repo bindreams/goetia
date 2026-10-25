@@ -181,12 +181,12 @@ fn stop_re_arms_after_a_non_terminal_callback() {
     );
 }
 
-// the wait after DeleteService ----------------------------------------------------------------------------------------
+// settle_to_stopped ----
 
 #[skuld::test]
-fn after_a_delete_a_running_service_is_stopped_and_its_stop_awaited() {
+fn settle_a_running_service_is_stopped_and_its_stop_awaited() {
     let mut fake = FakeScm::new([Some(Observed::Running), Some(Observed::Stopped)]);
-    assert_eq!(settle_after_delete(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(settle_to_stopped(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
     assert_eq!(
         fake.log,
         vec![
@@ -204,13 +204,13 @@ fn after_a_delete_a_running_service_is_stopped_and_its_stop_awaited() {
 /// STOP sent in `START_PENDING` is rejected with 1052 and has no later effect, so nothing is sent
 /// until the service has reached `RUNNING`.
 #[skuld::test]
-fn after_a_delete_a_start_pending_service_is_waited_out_before_any_stop() {
+fn settle_a_start_pending_service_is_waited_out_before_any_stop() {
     let mut fake = FakeScm::new([
         Some(Observed::Pending),
         Some(Observed::Running),
         Some(Observed::Stopped),
     ]);
-    assert_eq!(settle_after_delete(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(settle_to_stopped(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
     assert_eq!(
         fake.log,
         vec![
@@ -228,10 +228,18 @@ fn after_a_delete_a_start_pending_service_is_waited_out_before_any_stop() {
     );
 }
 
+/// A service that is stopping (or starting and then ending) is waited out, never sent a STOP.
 #[skuld::test]
-fn after_a_delete_a_stopped_service_is_left_alone() {
+fn settle_a_pending_service_that_stops_is_never_sent_a_stop() {
+    let mut fake = FakeScm::new([Some(Observed::Pending), Some(Observed::Stopped)]);
+    assert_eq!(settle_to_stopped(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert!(!fake.log.contains(&"control_stop"), "{:?}", fake.log);
+}
+
+#[skuld::test]
+fn settle_a_stopped_service_is_left_alone() {
     let mut fake = FakeScm::new([Some(Observed::Stopped)]);
-    assert_eq!(settle_after_delete(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(settle_to_stopped(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
     assert_eq!(fake.log, vec!["arm_running_or_stopped", "wait", "got_stopped"]);
 }
 
@@ -239,18 +247,18 @@ fn after_a_delete_a_stopped_service_is_left_alone() {
 /// `ERROR_SERVICE_NOT_ACTIVE` (absorbed by the actor as `Ok`). The `STOPPED` it left must still reach
 /// the wait, which holds only if the stop wait is armed before the stop is sent.
 #[skuld::test]
-fn after_a_delete_a_service_that_ends_before_the_stop_lands_still_confirms() {
+fn settle_a_service_that_ends_before_the_stop_lands_still_confirms() {
     let mut fake = FakeScm::new([Some(Observed::Running), Some(Observed::Stopped)]);
-    assert_eq!(settle_after_delete(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(settle_to_stopped(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
     let arm = fake.log.iter().position(|s| *s == "arm_stopped").unwrap();
     let stop = fake.log.iter().position(|s| *s == "control_stop").unwrap();
     assert!(arm < stop, "{:?}", fake.log);
 }
 
 #[skuld::test]
-fn after_a_delete_a_failed_stop_is_an_error() {
+fn settle_a_failed_stop_is_an_error() {
     let mut fake = FakeScm::new([Some(Observed::Running)]).rejecting_stop();
-    assert!(settle_after_delete(&mut fake, unbounded()).is_err());
+    assert!(settle_to_stopped(&mut fake, unbounded()).is_err());
 }
 
 #[skuld::test]

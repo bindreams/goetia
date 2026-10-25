@@ -24,7 +24,7 @@ use windows_sys::Win32::System::Services::{
 };
 
 use crate::logging;
-use crate::stop_bus::{StopBus, Teardown, WaitOutcome, Waiter, kill_for_stop, terminate_failed_tree};
+use crate::stop_bus::{StopBus, Teardown, WaitOutcome, Waiter, kill_for_stop, terminate_exited_tree};
 
 // Entry ===============================================================================================================
 
@@ -230,26 +230,28 @@ fn run_daemon(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, on_running: 
                     None
                 }
             };
-            end_tree_before_failure(stop_bus.settle(exit_report(code)), &child, id)
+            end_tree_before_report(stop_bus.settle(exit_report(code)), &child, id)
         }
         // The failure is already logged; the daemon's tree was terminated, so it is the shim that
         // failed.
         WaitOutcome::WaitFailed { os_error } => stop_bus.settle(Reported::shim_failure(os_error)),
+        // `wait_for_child_or_stop` terminated the tree before returning this.
         WaitOutcome::Stopping => Reported::Clean,
         // Still reports STOPPED so the service stays stoppable and uninstallable.
         WaitOutcome::DaemonMayRun => Reported::incomplete_stop(),
     }
 }
 
-/// A failure SCM restarts is reported only once the tree the daemon left is terminated, so the
-/// restart does not overlap it. If it cannot be terminated, SCM must not restart: the incomplete
-/// stop. Anything that is not a failure (a clean exit, or a stop that won) is returned as it is.
+/// An exited daemon is reported only once the tree it left is terminated, whatever `settled` is: a
+/// `start` that lands once SCM reads `STOPPED` must not run beside survivors, and a failure SCM
+/// restarts must not either. If the tree cannot be terminated, SCM must not restart and the service
+/// must not read as cleanly stopped: the incomplete stop.
 ///
 /// "Terminated" is `kill_tree` succeeding on the Job Object `launch` requires: no thread of any
 /// member executes after it. The kernel may still be releasing what they held, so a restarted
 /// daemon can briefly find a resource its predecessor held (a port) and fail like any other start.
-fn end_tree_before_failure(settled: Reported, child: &Child, id: &str) -> Reported {
-    if settled == Reported::Clean || terminate_failed_tree(child, id) {
+fn end_tree_before_report(settled: Reported, child: &Child, id: &str) -> Reported {
+    if terminate_exited_tree(child, id) {
         settled
     } else {
         Reported::incomplete_stop()

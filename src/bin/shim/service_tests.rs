@@ -515,15 +515,17 @@ fn a_failing_daemon_whose_tree_cannot_be_terminated_is_the_incomplete_stop_recor
         &take(id.as_str()),
         id.as_str(),
         &format!(
-            "kill_tree after the daemon failed: {KILL_REFUSED}; its descendants may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure"
+            "kill_tree after the daemon ended: {KILL_REFUSED}; its descendants may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure"
         ),
     );
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }
 
-/// A clean exit is not restarted, so nothing is terminated for it.
+/// `STOPPED` is never reported over a tree that may still be running, whatever ended the daemon: a
+/// `start` that lands before the shim exits would run a second copy beside it. When the tree cannot
+/// be terminated, the record is the incomplete stop even for a clean exit.
 #[skuld::test]
-fn a_clean_exit_does_not_terminate_the_tree() {
+fn a_clean_exit_whose_tree_cannot_be_terminated_is_the_incomplete_stop_record() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
     let stop_bus = Arc::new(StopBus::new());
@@ -538,8 +540,33 @@ fn a_clean_exit_does_not_terminate_the_tree() {
         )
     };
 
+    assert_eq!(reported, Reported::incomplete_stop());
+    assert_one_failure(
+        &take(id.as_str()),
+        id.as_str(),
+        &format!(
+            "kill_tree after the daemon ended: {KILL_REFUSED}; its descendants may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure"
+        ),
+    );
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+/// A clean exit whose tree is terminated is reported as it was.
+#[skuld::test]
+fn a_clean_exit_whose_tree_is_terminated_is_clean() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+
+    let reported = run_daemon(
+        &powershell(dir.path(), id.as_str(), "exit 0"),
+        &stop_bus,
+        id.as_str(),
+        || {},
+    );
+
     assert_eq!(reported, Reported::Clean);
-    assert_eq!(take(id.as_str()), Vec::<String>::new(), "a clean exit attempted a kill");
+    assert_eq!(take(id.as_str()), Vec::<String>::new());
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }
 

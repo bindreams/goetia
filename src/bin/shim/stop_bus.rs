@@ -427,13 +427,12 @@ pub(crate) enum Teardown {
     Failed,
 }
 
-/// Terminate the tree of a daemon that has already exited and is about to be reported as a failure
-/// SCM restarts, so that the restart does not overlap what the previous run left behind. `false`
-/// (logged) means the tree may still be running and the failure must not be reported as a
-/// restartable one.
-pub(crate) fn terminate_failed_tree(child: &Child, id: &str) -> bool {
+/// Terminate the tree of a daemon that has already exited and is about to be reported `STOPPED`,
+/// so that neither SCM's restart nor a `start` overlaps what the previous run left behind. `false`
+/// (logged) means the tree may still be running and the stop must be reported as incomplete.
+pub(crate) fn terminate_exited_tree(child: &Child, id: &str) -> bool {
     let Err(e) = kill_tree(child) else { return true };
-    logging::log_failure(id, &failed_tree_unkilled(&e));
+    logging::log_failure(id, &exited_tree_unkilled(&e));
     false
 }
 
@@ -480,8 +479,8 @@ fn tree_unkilled() -> String {
     )
 }
 
-fn failed_tree_unkilled(e: &cosca::error::Error) -> String {
-    format!("kill_tree after the daemon failed: {e}; its descendants may still be running{NOT_RESTARTED}")
+fn exited_tree_unkilled(e: &cosca::error::Error) -> String {
+    format!("kill_tree after the daemon ended: {e}; its descendants may still be running{NOT_RESTARTED}")
 }
 
 /// `child.kill_tree()`, as its own function so a test can make it fail or panic — the two

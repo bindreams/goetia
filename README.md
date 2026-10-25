@@ -733,8 +733,10 @@ once: a stop it accepts before it decides the exit is reported as a clean stop,
 which SCM does not restart; a stop that arrives after it has decided on the
 failure does not change it. SCM acknowledges that stop anyway, whatever the
 shim answers, so `stop` exits `0` and SCM restarts the command as above.
-`goetia daemon uninstall` is not affected: it deletes first, so no queued restart
-fires, and then stops anything already restarted.
+`goetia daemon uninstall` stops the service first, waiting out a start in
+progress rather than sending a stop SCM would reject. SCM may begin a restart
+between that stop and the delete; `uninstall` stops that restart after the
+delete. A restart queued before the delete does not fire.
 
 After upgrading goetia, run `goetia daemon install` again for every daemon
 installed by an older version. Services registered before this shim existed
@@ -773,17 +775,19 @@ could not complete, because no kill of a tree outside a job shows its
 descendants gone and SCM must not restart over a possible survivor. A `start`
 that sees the service stop with that record is a failed start.
 
-Before the shim reports any failure SCM restarts (the command exiting non-zero,
-or the shim's own wait on it failing), it terminates the job, so the restart does
-not overlap descendants the previous run left behind. If the job cannot be
-terminated, it reports `0`, `1003` as for a `stop` it could not complete, whatever
-`stop` follows.
+Before the shim reports the service stopped for any reason (the command exiting,
+cleanly or not, or the shim's own wait on it failing), it terminates the job, so
+neither SCM's restart nor a `start` overlaps descendants the previous run left
+behind. A `stop` terminates it the same way before it reports. If the job cannot
+be terminated, the shim reports `0`, `1003` as for a `stop` it could not
+complete, whatever `stop` follows.
 
 Nothing guards against a possible survivor afterwards: `stop` exits `0`,
 including the `stop` that produced the record, and a later `start`, `restart` or
 `sc start` launches a second copy beside it. `goetia daemon status` and `list`
 show such a service as `stopped`, and so they do one waiting out its
-`restart-delay`.
+`restart-delay`. `goetia daemon uninstall` does not read the record either: it
+deletes such a service, and a surviving command is left with no service.
 
 "Terminated" means the OS has stopped every thread of the command and its
 descendants, not that it has finished releasing what they held. A restarted

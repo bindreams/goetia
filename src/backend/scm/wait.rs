@@ -114,14 +114,14 @@ pub fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result
     }
 }
 
-/// What to do once `DeleteService` has marked the service, so that nothing it was running or
-/// restarting outlives `uninstall`. A marked service gets no further SCM restarts, but one
-/// begun before the delete may still be `START_PENDING` or `RUNNING`.
+/// Bring the service to `STOPPED` without ever sending a STOP that SCM rejects. `uninstall` runs it
+/// before the delete and again after, since SCM may begin a restart in between.
 ///
 /// Waits, with no poll, for `RUNNING` or `STOPPED`. `STOPPED` is done. `RUNNING` is stopped through
 /// [`stop_via_notify`]. No stop is sent while `START_PENDING`: SCM rejects it with 1052 and it has
-/// no later effect.
-pub fn settle_after_delete<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
+/// no later effect. Whether SCM restarts a delete-marked service after a later failure is not
+/// measured; a restart queued before the delete does not fire.
+pub fn settle_to_stopped<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
     if a.arm(WantState::RunningOrStopped, deadline)? == Waited::Expired {
         return Ok(Waited::Expired);
     }
