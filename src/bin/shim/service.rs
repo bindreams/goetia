@@ -4,9 +4,6 @@
 //! The shim never restarts the daemon. It reports the daemon's exit as the service's exit and
 //! exits; SCM's recovery actions (`backend::scm::generate`) start a new shim, which reads the
 //! installed spec afresh.
-//!
-//! Process-tree containment and waiting belong to `cosca`; this module interrupts its blocking
-//! `child.wait()` on `Stop` (`stop_bus`) and drives SCM's status protocol.
 
 use std::ffi::OsString;
 use std::os::windows::io::AsRawHandle as _;
@@ -24,6 +21,7 @@ use windows_service::service::{
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult, ServiceStatusHandle};
 use windows_service::{define_windows_service, service_dispatcher};
+use windows_sys::Win32::Foundation::ERROR_SERVICE_CANNOT_ACCEPT_CTRL;
 use windows_sys::Win32::System::Services::{
     SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOPPED, SERVICE_WIN32_OWN_PROCESS, SetServiceStatus,
 };
@@ -127,14 +125,22 @@ fn stopped_status(reported: Reported) -> SERVICE_STATUS {
 fn register_control_handler(id: &str, stop_bus: &Arc<StopBus>) -> windows_service::Result<ServiceStatusHandle> {
     let handler_bus = Arc::clone(stop_bus);
     let event_handler = move |control_event| match control_event {
-        ServiceControl::Stop => {
-            handler_bus.request_stop();
-            ServiceControlHandlerResult::NoError
-        }
+        ServiceControl::Stop => stop_control(&handler_bus),
         ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
         _ => ServiceControlHandlerResult::NotImplemented,
     };
     service_control_handler::register(id, event_handler)
+}
+
+/// The control handler's answer to `Stop`. A stop the bus refuses (the exit is already decided as a
+/// failure, which SCM restarts) is an error, so that `ControlService` fails instead of acknowledging
+/// a stop that will not happen.
+fn stop_control(stop_bus: &StopBus) -> ServiceControlHandlerResult {
+    if stop_bus.request_stop() {
+        ServiceControlHandlerResult::NoError
+    } else {
+        ServiceControlHandlerResult::Other(ERROR_SERVICE_CANNOT_ACCEPT_CTRL)
+    }
 }
 
 /// Report `RUNNING`. A failure is logged: SCM keeps the last state it confirmed.
@@ -166,8 +172,7 @@ fn report_stopped(id: &str, handle: &ServiceStatusHandle, reported: Reported) {
 // One pass ============================================================================================================
 
 /// Launch the daemon, report `RUNNING` through `on_running`, wait for the daemon to end or for a
-/// stop, and say how it ended. Never respawns: SCM restarts the service from the status the caller
-/// reports.
+/// stop, and say how it ended.
 ///
 /// `on_running` is called exactly once, after the daemon is spawned and never when launching failed.
 /// A daemon that cannot start is therefore `STOPPED` with a non-zero Win32 code without ever having
@@ -179,11 +184,11 @@ fn run_daemon(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, on_running: 
     };
     on_running();
 
-    // `wait_for_child_or_stop` kills and confirms the tree on a stop, so only `StoppingUnkillable`
-    // leaves a running, unreaped daemon.
+    // `wait_for_child_or_stop` kills and confirms the tree, so only `DaemonMayRun` leaves a daemon
+    // that may be running.
     match stop_bus.wait_for_child_or_stop(waiter, &child, id) {
         WaitOutcome::ChildExited => {
-            let code = match child.wait() {
+            let code = match exit_status(&child) {
                 Ok(status) => {
                     let code = status.code();
                     if code.is_none() {
@@ -196,25 +201,31 @@ fn run_daemon(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, on_running: 
                     None
                 }
             };
-            exit_report(stop_bus.is_stopping(), code)
+            stop_bus.settle(exit_report(code))
         }
-        // The failure is already logged; the daemon was torn down, so it is the shim that failed.
-        WaitOutcome::WaitFailed { os_error } => Reported::shim_failure(os_error),
+        // The failure is already logged; the daemon was torn down and confirmed gone, so it is the
+        // shim that failed.
+        WaitOutcome::WaitFailed { os_error } => stop_bus.settle(Reported::shim_failure(os_error)),
         WaitOutcome::Stopping => Reported::Clean,
         // Still reports STOPPED so the service stays stoppable and uninstallable.
-        WaitOutcome::StoppingUnkillable => Reported::incomplete_stop(),
+        WaitOutcome::DaemonMayRun => Reported::incomplete_stop(),
     }
 }
 
-/// How an exited daemon is reported. A stop requested at the same moment wins: terminating the
-/// daemon's job makes it exit non-zero, which a commanded stop must not report as a failure.
-/// `None` is an exit status that could not be obtained, already logged by the caller.
-fn exit_report(stopping: bool, code: Option<i32>) -> Reported {
-    match (stopping, code) {
-        (true, _) => Reported::Clean,
-        (false, Some(code)) => Reported::from_daemon_code(code),
-        (false, None) => Reported::shim_failure(None),
+/// How an exited daemon is reported, before [`StopBus::settle`] lets a stop win. `None` is an exit
+/// status that could not be obtained, already logged by the caller.
+fn exit_report(code: Option<i32>) -> Reported {
+    match code {
+        Some(code) => Reported::from_daemon_code(code),
+        None => Reported::shim_failure(None),
     }
+}
+
+/// The exit status of the daemon the bus found exited, as its own function so a test can make it fail.
+fn exit_status(child: &Child) -> Result<std::process::ExitStatus, cosca::error::Error> {
+    #[cfg(test)]
+    test_hook::exit_status()?;
+    child.wait()
 }
 
 /// The daemon, running and already being waited on — or why not, logged, with nothing launched.
@@ -306,7 +317,10 @@ fn log_open_failed(path: &std::path::Path, e: &std::io::Error) -> String {
 fn start(cmd: &mut cosca::Command) -> Result<Child, cosca::error::Error> {
     #[cfg(test)]
     test_hook::spawning();
-    cmd.spawn()
+    let child = cmd.spawn()?;
+    #[cfg(test)]
+    test_hook::spawned_child(&child);
+    Ok(child)
 }
 
 /// Build the (unspawned) command for `spec`: argv, cwd, env, Job Object
@@ -354,8 +368,48 @@ fn build_command(spec: &DaemonSpec, id: &str) -> cosca::Command {
 pub(crate) mod test_hook {
     use std::cell::Cell;
 
+    use cosca::Child;
+    use cosca::identity::ProcessId;
+
+    /// The error [`exit_status_fails`] makes the exit-status query fail with.
+    pub(crate) const EXIT_STATUS_UNREADABLE: &str = "the exit status could not be read (test hook)";
+
     thread_local! {
         static SPAWNS: Cell<usize> = const { Cell::new(0) };
+        static SPAWNED: Cell<Option<ProcessId>> = const { Cell::new(None) };
+        static STATUS_FAILS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// The identity of the daemon this thread spawned last, so a test can ask the OS whether it is
+    /// still running after `run_daemon` has dropped its `Child`.
+    pub(crate) fn spawned() -> Option<ProcessId> {
+        SPAWNED.get()
+    }
+
+    pub(super) fn spawned_child(child: &Child) {
+        SPAWNED.set(Some(child.id()));
+    }
+
+    /// Make the exit-status query on this thread fail, until the returned guard drops.
+    pub(crate) fn exit_status_fails() -> Unreadable {
+        STATUS_FAILS.set(true);
+        Unreadable
+    }
+
+    /// See [`exit_status_fails`].
+    pub(crate) struct Unreadable;
+
+    impl Drop for Unreadable {
+        fn drop(&mut self) {
+            STATUS_FAILS.set(false);
+        }
+    }
+
+    pub(super) fn exit_status() -> Result<(), cosca::error::Error> {
+        if STATUS_FAILS.get() {
+            return Err(cosca::error::Error::Io(std::io::Error::other(EXIT_STATUS_UNREADABLE)));
+        }
+        Ok(())
     }
 
     /// How many daemons this thread has spawned through [`super::start`], or tried to: the count

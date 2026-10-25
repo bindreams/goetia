@@ -12,12 +12,15 @@ use goetia::backend::scm::exit_status::{
     ERROR_CAN_NOT_COMPLETE, ERROR_GEN_FAILURE, ERROR_SERVICE_SPECIFIC_ERROR, Reported,
 };
 use goetia::spec::{Id, Kind, Restart, User};
+use windows_sys::Win32::Foundation::ERROR_SERVICE_CANNOT_ACCEPT_CTRL;
 use windows_sys::Win32::System::Services::SERVICE_STOPPED;
 
 use super::*;
 use crate::logging::test_hook::{take, take_warnings};
 use crate::stop_bus::test_hook as waiter_threads;
-use crate::stop_bus::test_hook::{KILL_REFUSED, Kill, WaiterEnd, kills, waiter_end};
+use crate::stop_bus::test_hook::{
+    CONFIRM_REFUSED, KILL_REFUSED, Kill, WAIT_FAILED, Wait, WaiterEnd, confirmations_fail, kills, waiter_end, waits,
+};
 use crate::test_support::{TestId, assert_one_failure};
 
 const PREFIX: &str = "goetia-shim-launch-test";
@@ -389,7 +392,9 @@ fn an_unkillable_daemon_reports_the_incomplete_stop_failure() {
 
     let reported = {
         let _refused = kills(Kill::Refuse);
-        run_daemon(&daemon, &stop_bus, id.as_str(), || stop_bus.request_stop())
+        run_daemon(&daemon, &stop_bus, id.as_str(), || {
+            stop_bus.request_stop();
+        })
     };
 
     assert_eq!(reported, Reported::incomplete_stop());
@@ -413,25 +418,160 @@ fn an_unkillable_daemon_reports_the_incomplete_stop_failure() {
     );
 }
 
-// Pure helpers --------------------------------------------------------------------------------------------------------
-
+/// The pass `Wait::Fail` breaks: the waiter's wait failed, so the daemon is torn down and, once
+/// confirmed gone, the shim reports the failure with the wait's own OS error.
 #[skuld::test]
-fn a_stop_wins_over_a_daemon_that_failed_at_the_same_moment() {
-    assert_eq!(exit_report(true, Some(7)), Reported::Clean);
-    assert_eq!(exit_report(true, None), Reported::Clean);
+fn a_failed_wait_is_a_shim_failure_with_the_os_error_and_the_daemon_is_dead() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+
+    let reported = {
+        let _failing = waits(Wait::Fail(Some(5)));
+        run_daemon(&spec(dir.path(), id.as_str()), &stop_bus, id.as_str(), || {})
+    };
+
+    assert_eq!(reported, Reported::shim_failure(Some(5)));
+    assert_eq!(
+        test_hook::spawned().expect("the daemon was spawned").is_alive(),
+        Liveness::Dead,
+        "a restartable failure was reported over a daemon still running"
+    );
+    assert_one_failure(
+        &take(id.as_str()),
+        id.as_str(),
+        &format!("background wait on child: {}", std::io::Error::from_raw_os_error(5)),
+    );
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }
 
 #[skuld::test]
+fn a_failed_wait_with_no_os_error_is_the_generic_shim_failure() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+
+    let reported = {
+        let _failing = waits(Wait::Fail(None));
+        run_daemon(&spec(dir.path(), id.as_str()), &stop_bus, id.as_str(), || {})
+    };
+
+    assert_eq!(reported, Reported::ShimFailure(ERROR_GEN_FAILURE));
+    assert_one_failure(
+        &take(id.as_str()),
+        id.as_str(),
+        &format!("background wait on child: {WAIT_FAILED}"),
+    );
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+/// A daemon not confirmed gone must not be reported as a failure SCM restarts: the restart would
+/// start a second copy beside it.
+#[skuld::test]
+fn a_failed_wait_over_a_daemon_not_confirmed_gone_is_the_incomplete_stop_record() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+
+    let reported = {
+        let _failing = waits(Wait::Fail(None));
+        let _unconfirmed = confirmations_fail();
+        run_daemon(&spec(dir.path(), id.as_str()), &stop_bus, id.as_str(), || {})
+    };
+
+    assert_eq!(reported, Reported::incomplete_stop());
+    let lines = take(id.as_str());
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[1].contains(CONFIRM_REFUSED), "{lines:?}");
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+/// The status query after `ChildExited` can fail; the exit is then a shim failure, not a daemon code.
+#[skuld::test]
+fn an_exit_status_that_cannot_be_read_is_a_shim_failure() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+
+    let reported = {
+        let _unreadable = test_hook::exit_status_fails();
+        run_daemon(
+            &powershell(dir.path(), id.as_str(), "exit 7"),
+            &stop_bus,
+            id.as_str(),
+            || {},
+        )
+    };
+
+    assert_eq!(reported, Reported::ShimFailure(ERROR_GEN_FAILURE));
+    assert_one_failure(
+        &take(id.as_str()),
+        id.as_str(),
+        &format!("query child exit status: {}", test_hook::EXIT_STATUS_UNREADABLE),
+    );
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+/// The exit is decided once. A failure the shim has settled on refuses a later stop, so SCM is never
+/// told a stop was accepted and then handed a failure to restart.
+#[skuld::test]
+fn a_stop_after_a_daemon_failure_was_reported_is_refused() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+
+    let reported = run_daemon(
+        &powershell(dir.path(), id.as_str(), "exit 7"),
+        &stop_bus,
+        id.as_str(),
+        || {},
+    );
+
+    assert_eq!(reported, Reported::DaemonExit(7));
+    assert!(
+        !stop_bus.request_stop(),
+        "a stop was accepted after the failure was decided"
+    );
+    assert_eq!(
+        stop_control(&stop_bus).to_raw(),
+        ERROR_SERVICE_CANNOT_ACCEPT_CTRL,
+        "the control handler acknowledged a stop the shim had already refused"
+    );
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+/// The other order: the stop is accepted before the exit is decided, so the exit is a clean stop even
+/// though the daemon's own code is non-zero.
+#[skuld::test]
+fn a_stop_accepted_before_a_daemon_failure_was_decided_is_clean() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+
+    let reported = run_daemon(
+        &powershell(dir.path(), id.as_str(), "exit 7"),
+        &stop_bus,
+        id.as_str(),
+        || assert_eq!(stop_control(&stop_bus).to_raw(), 0, "the stop was not acknowledged"),
+    );
+
+    assert_eq!(reported, Reported::Clean);
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+// Pure helpers --------------------------------------------------------------------------------------------------------
+
+#[skuld::test]
 fn an_exit_code_becomes_a_daemon_report() {
-    assert_eq!(exit_report(false, Some(0)), Reported::Clean);
-    assert_eq!(exit_report(false, Some(7)), Reported::DaemonExit(7));
-    assert_eq!(exit_report(false, Some(-1073741819)), Reported::DaemonExit(0xC000_0005));
+    assert_eq!(exit_report(Some(0)), Reported::Clean);
+    assert_eq!(exit_report(Some(7)), Reported::DaemonExit(7));
+    assert_eq!(exit_report(Some(-1073741819)), Reported::DaemonExit(0xC000_0005));
 }
 
 #[skuld::test]
 fn an_unobtainable_exit_status_is_a_shim_failure() {
     assert_eq!(
-        exit_report(false, None),
+        exit_report(None),
         Reported::ShimFailure(ERROR_GEN_FAILURE),
         "an exit with no code must not read as a daemon's code or as clean"
     );

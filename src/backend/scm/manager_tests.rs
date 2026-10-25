@@ -563,7 +563,7 @@ fn a_failed_start_names_the_blob_read_error_that_made_it_strict() {
     assert!(strict.contains("invalid blob JSON: EOF"), "{strict}");
 }
 
-/// A service installed by 0.1.0 under `restart: always` keeps a blob that says so. It decodes, and
+/// A service installed before `resolve` refused `restart: always` keeps a blob that says so. It decodes, and
 /// a `type: simple` one starts by the shim's vocabulary like any other.
 #[skuld::test]
 fn a_blob_that_says_always_decodes_and_starts_as_its_kind() {

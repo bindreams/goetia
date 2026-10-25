@@ -125,24 +125,6 @@ fn a_service_that_died_without_reporting_did_not_run_a_daemon() {
 }
 
 #[skuld::test]
-fn only_win32_zero_with_specific_1003_is_an_incomplete_stop() {
-    let recorded = |reported: Reported| {
-        let (win32, specific) = reported.scm_codes();
-        RecordedExit { win32, specific }
-    };
-
-    assert!(recorded(Reported::incomplete_stop()).incomplete_stop());
-    for other in [
-        Reported::Clean,
-        Reported::DaemonExit(ERROR_CAN_NOT_COMPLETE),
-        Reported::shim_failure(Some(ERROR_CAN_NOT_COMPLETE as i32)),
-        Reported::shim_failure(None),
-    ] {
-        assert!(!recorded(other).incomplete_stop(), "{other:?}");
-    }
-}
-
-#[skuld::test]
 fn a_recorded_exit_is_displayed_as_a_service_specific_code_or_a_win32_one() {
     let specific = RecordedExit {
         win32: ERROR_SERVICE_SPECIFIC_ERROR,

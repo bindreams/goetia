@@ -1430,7 +1430,7 @@ fn list_reaches_the_manager() {
     assert!(out.contains("frpc"), "{out}");
 }
 
-/// A service installed by 0.1.0 may carry `restart: always` on the scm backend, which a manifest
+/// A service installed before `resolve` refused it may carry `restart: always` on the scm backend, which a manifest
 /// can no longer say. Reading its blob must not run the manifest refusal, or the service could
 /// not even be stopped or removed.
 ///

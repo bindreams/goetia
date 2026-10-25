@@ -2,9 +2,9 @@
 //!
 //! Two disjoint spaces. A daemon's exit code is a service-specific code: daemons exit with any
 //! `u32` (NTSTATUS values included), so no part of that space can be set aside for the shim.
-//! Everything the shim itself fails at is a Win32 code, which cannot collide with it, and which
-//! `sc query` and the event log print as text. Win32 codes are plain constants here so the shim,
-//! the manager and the tests share one definition; nothing in this module needs Windows.
+//! Everything the shim itself fails at is a Win32 code, which cannot collide with it. Win32 codes
+//! are plain constants here so the shim, the manager and the tests share one definition; nothing in
+//! this module needs Windows.
 //!
 //! Under the failure-actions flag SCM restarts after any `STOPPED` report whose Win32 code is
 //! non-zero, a service-specific code included (it is carried as [`ERROR_SERVICE_SPECIFIC_ERROR`]),
@@ -18,8 +18,7 @@ pub const ERROR_BAD_ARGUMENTS: u32 = 160;
 pub const ERROR_INVALID_DATA: u32 = 13;
 /// A shim failure that carries no usable OS error.
 pub const ERROR_GEN_FAILURE: u32 = 31;
-/// A commanded stop that could not kill the daemon: the process exit code, and the service-specific
-/// code of the `STOPPED` report.
+/// A commanded stop that could not kill the daemon.
 pub const ERROR_CAN_NOT_COMPLETE: u32 = 1003;
 /// The control handler or the dispatcher could not be connected, so nothing is reportable.
 pub const ERROR_FAILED_SERVICE_CONTROLLER_CONNECT: u32 = 1063;
@@ -99,12 +98,6 @@ pub struct RecordedExit {
 }
 
 impl RecordedExit {
-    /// Whether this is [`Reported::IncompleteStop`]: a commanded stop that could not kill the
-    /// daemon, which may still be running.
-    pub fn incomplete_stop(self) -> bool {
-        (self.win32, self.specific) == Reported::IncompleteStop.scm_codes()
-    }
-
     /// Whether the shim launched the daemon and the daemon then ended: a daemon exit
     /// ([`Reported::Clean`], [`Reported::DaemonExit`], [`Reported::IncompleteStop`]). Any other
     /// Win32 code is a shim failure before or around the launch.

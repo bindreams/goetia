@@ -13,19 +13,32 @@
 //! spawned, never after — see [`Waiter`].
 
 use std::io;
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 
 use cosca::Child;
+use goetia::backend::scm::exit_status::Reported;
 
 use crate::logging;
 use crate::service::os_error_of;
 
+/// How the run ends, decided once under the [`StopBus`] mutex. A stop and a restartable failure
+/// exclude each other: SCM must never be told a stop was accepted and then record a failure, which
+/// it would restart.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum Fate {
+    #[default]
+    Open,
+    /// A stop was accepted: the run reports clean (or the incomplete-stop record).
+    Stopped,
+    /// A failure was decided: a stop is refused.
+    Failed,
+}
+
 #[derive(Default)]
 struct Gate {
-    stopping: bool,
-    /// Reset by [`StopBus::wait_for_child_or_stop`] before each spawn's
-    /// wait, so a stale completion from a *previous* child can never be
-    /// misread as the current one's.
+    fate: Fate,
+    /// Set by the waiter when its `child.wait()` returns. Reset by [`StopBus::wait_for_child_or_stop`]
+    /// before each wait.
     child_done: bool,
     /// Set by the waiter when its `child.wait()` failed: the OS error code, if the failure has one.
     /// `Some` means the daemon's fate is unknown and nothing else is watching it.
@@ -39,21 +52,22 @@ pub struct StopBus {
 
 pub enum WaitOutcome {
     ChildExited,
-    /// The waiter's `child.wait()` failed, so whether the daemon ended is unknown. The daemon was
-    /// torn down as for a stop and is dead and reaped; `os_error` is the failure's OS error code.
-    /// When the teardown failed too the outcome is [`WaitOutcome::StoppingUnkillable`] instead.
+    /// The waiter's `child.wait()` failed, so whether the daemon ended was unknown. The tree was
+    /// killed and the daemon confirmed gone by a fresh wait on it, so the shim may report a
+    /// restartable failure. `os_error` is the failure's OS error code. When the tree is not
+    /// confirmed gone the outcome is [`WaitOutcome::DaemonMayRun`] instead.
     WaitFailed {
         os_error: Option<i32>,
     },
     /// A stop was requested, and the daemon is dead and reaped: the tree, or
     /// (if `kill_tree` failed) at least the direct child.
     Stopping,
-    /// A stop was requested and neither `kill_tree` nor the direct-child
-    /// fallback could kill the daemon, so nothing was reaped and it may still
-    /// be running — see [`StopBus::wait_for_child_or_stop`] for why this is
-    /// still a return rather than a wait, and `Reported::incomplete_stop`
-    /// for what the caller reports for it.
-    StoppingUnkillable,
+    /// The daemon may still be running: a stop was requested and neither `kill_tree` nor the
+    /// direct-child fallback could kill it, or a wait failure's kill could not be confirmed to have
+    /// reached the whole tree. Nothing was reaped. See [`StopBus::wait_for_child_or_stop`] for why
+    /// this is a return rather than a wait, and `Reported::incomplete_stop` for what the caller
+    /// reports for it.
+    DaemonMayRun,
 }
 
 // Waiter ==============================================================================================================
@@ -111,12 +125,9 @@ impl Waiter {
                 let Ok(child) = rx.recv() else {
                     return; // never handed a daemon: none was spawned
                 };
-                // Notified on *both* `Ok` and `Err`: an `Err` here means the
-                // wait mechanism itself failed, which says nothing about
-                // whether the child is still running. Staying silent would
-                // leave `wait_for_child_or_stop`'s `Condvar::wait_while` with
-                // no further waker at all in the (ordinary, no-stop-requested)
-                // case, so the failure is recorded for that call to act on.
+                // A panic from here on reports as a failed wait, or `wait_while` would have no waker.
+                let mut report = ReportOnPanic { bus: &bus, armed: true };
+                // Notified on `Err` too: nothing else wakes `wait_while` in the no-stop case.
                 #[cfg(test)]
                 let waited = test_hook::wait(waiting).and_then(|()| child.wait());
                 #[cfg(not(test))]
@@ -125,10 +136,8 @@ impl Waiter {
                     logging::log_failure(&id, &wait_failed(&e));
                     os_error_of(&e)
                 });
-                let mut g = bus.state.lock().expect("StopBus mutex poisoned");
-                g.wait_failure = failure;
-                g.child_done = true;
-                bus.cvar.notify_all();
+                bus.report_done(failure);
+                report.armed = false;
             })?;
         Ok(Waiter {
             hand,
@@ -170,14 +179,47 @@ impl StopBus {
     /// lost. Routing the actual kill through the service thread, gated on this
     /// same flag re-checked at every wake-up, means a stop is never missed
     /// regardless of when it arrives.
-    pub fn request_stop(&self) {
+    ///
+    /// Returns whether the stop was accepted, which is what the handler answers SCM with. A stop is
+    /// refused once [`StopBus::settle`] has decided a failure: SCM would record that failure and
+    /// restart the service, so an acknowledged stop must never be followed by one. A stop accepted
+    /// here makes `settle` report clean.
+    pub fn request_stop(&self) -> bool {
         let mut g = self.state.lock().expect("StopBus mutex poisoned");
-        g.stopping = true;
+        if g.fate == Fate::Failed {
+            return false;
+        }
+        g.fate = Fate::Stopped;
         self.cvar.notify_all();
+        true
     }
 
-    pub fn is_stopping(&self) -> bool {
-        self.state.lock().expect("StopBus mutex poisoned").stopping
+    /// Decide how the run ends when `candidate` is what the daemon's end amounts to. An accepted
+    /// stop wins over any candidate (terminating the daemon's job makes it exit non-zero, which a
+    /// commanded stop must not report as a failure) and the result is [`Reported::Clean`]. Otherwise
+    /// the result is `candidate`, and a failure among those closes the bus to later stops.
+    ///
+    /// Check and decision are one critical section with [`StopBus::request_stop`], so a stop is
+    /// either accepted before the exit is decided or refused after it, never acknowledged and then
+    /// overtaken by a failure report.
+    pub fn settle(&self, candidate: Reported) -> Reported {
+        let mut g = self.state.lock().expect("StopBus mutex poisoned");
+        match (g.fate, candidate) {
+            (Fate::Stopped, _) => Reported::Clean,
+            (_, Reported::Clean) => Reported::Clean,
+            (_, failure) => {
+                g.fate = Fate::Failed;
+                failure
+            }
+        }
+    }
+
+    /// The waiter's report that its wait is over, with the failure it ended in, if any.
+    fn report_done(&self, failure: Option<Option<i32>>) {
+        let mut g = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        g.wait_failure = failure;
+        g.child_done = true;
+        self.cvar.notify_all();
     }
 
     /// The thread that will run the blocking `child.wait()` for this bus's next wait, made before
@@ -257,8 +299,8 @@ impl StopBus {
     /// not), not merely a doc footnote. Both failures are always logged.
     ///
     /// **If that fallback `kill` fails too, the waiter is left detached and
-    /// this call returns [`WaitOutcome::StoppingUnkillable`]** ([`kill_for_stop`]
-    /// returning `false` below — the one path that does not join). Two failed kills are
+    /// this call returns [`WaitOutcome::DaemonMayRun`]** ([`kill_for_stop`]
+    /// returning [`Teardown::Failed`] below — the one path that does not join). Two failed kills are
     /// positive evidence that nothing has told the child to exit, so the
     /// waiter's `child.wait()` cannot return and joining it would block for
     /// as long as that child lives: `run_service` would never reach
@@ -266,27 +308,30 @@ impl StopBus {
     /// which reads `RUNNING` throughout its own teardown, since this shim
     /// never reports `STOP_PENDING` — could then be neither stopped nor
     /// uninstalled for the daemon's whole remaining life. Skipping the join
-    /// on that one arm is not the bounded join rejected above: it bounds
-    /// nothing and races nothing, because the wait it would wait for is
-    /// already known not to resolve. What it gives up is the guarantee the
-    /// join buys on every other path — the daemon is not reaped and may well
-    /// still be running — so the outcome is a distinct one, reported as
-    /// `Reported::incomplete_stop` (a distinct process exit code, and `Win32(0)` with service-specific
-    /// code 1003 to SCM: any non-zero Win32 code would start a second daemon) rather than a clean one, with the log above naming which kill failed and how. The
+    /// on that one arm bounds nothing and races nothing, because the wait it
+    /// would wait for is already known not to resolve. What it gives up is the
+    /// guarantee the join buys on every other path — the daemon is not reaped
+    /// and may well still be running — so the outcome is a distinct one,
+    /// reported as `Reported::incomplete_stop` rather than a clean one. The
     /// detached thread still holds its own `Arc<Child>` clone, so this is
     /// memory-safe, and if the child ever does exit its `wait()` returns and
     /// that clone drops.
+    ///
+    /// **A failed wait is not evidence the daemon ended**, so the kill that follows it is confirmed
+    /// before the failure may be reported as one SCM restarts: a fresh wait on the process (a new
+    /// handle, not the one whose wait failed) must return, and `kill_tree` must have reached the
+    /// whole tree rather than only the direct child. Otherwise the outcome is
+    /// [`WaitOutcome::DaemonMayRun`]: reporting a restartable failure over a daemon that may still
+    /// be running would start a second copy beside it. Over a stop the reduced guarantee of a
+    /// direct-child kill stands, as for any stop.
     ///
     /// **No `wait_tree` call after `kill_tree` succeeds.** `cosca`'s Job
     /// Object `hard_kill` (what `kill_tree` calls) closes the job handle as
     /// part of terminating it, so a subsequent `wait_tree` always fails
     /// with "the job handle was already closed" — not because anything is
-    /// still running. `TerminateJobObject`, which `hard_kill` issues, is
-    /// itself synchronous per its documented Win32 contract (every member
-    /// of the job is already terminated by the time the call returns), so
-    /// `kill_tree`'s own `Ok(())` already is the confirmation; a follow-up
-    /// `wait_tree` would only ever produce a spurious logged failure on
-    /// every ordinary successful stop.
+    /// still running. This call holds no handle to the daemon's descendants,
+    /// so `kill_tree`'s own `Ok(())` is what vouches for them; only the
+    /// root has a process handle to wait on.
     pub fn wait_for_child_or_stop(self: &Arc<Self>, waiter: Waiter, child: &Arc<Child>, id: &str) -> WaitOutcome {
         debug_assert!(
             Arc::ptr_eq(&waiter.bus, self),
@@ -305,27 +350,40 @@ impl StopBus {
         let g = self.state.lock().expect("StopBus mutex poisoned");
         let g = self
             .cvar
-            .wait_while(g, |g| !g.stopping && !g.child_done)
+            .wait_while(g, |g| g.fate != Fate::Stopped && !g.child_done)
             .expect("StopBus mutex poisoned");
+        let stopping = g.fate == Fate::Stopped;
         let wait_failure = g.wait_failure;
-        let outcome = if g.stopping || wait_failure.is_some() {
+        let outcome = if stopping || wait_failure.is_some() {
             // Release the lock before calling into `child` — `kill_tree`/
             // `kill` need it not, and holding it across a kernel call would
-            // block `is_stopping()`/`request_stop()` callers (e.g. a
+            // block `request_stop()`/`settle()` callers (e.g. a
             // second, redundant SCM stop control) for no reason.
             drop(g);
-            if !kill_for_stop(child, id) {
+            let teardown = kill_for_stop(child, id);
+            if teardown == Teardown::Failed {
                 // Returning here is what leaves `waiting` unjoined: nothing
                 // can make the wait it holds return, so joining it would
                 // block for the child's whole remaining life. See this
                 // function's doc comment — this is the one path where the
                 // return value does not mean "reaped".
-                return WaitOutcome::StoppingUnkillable;
+                return WaitOutcome::DaemonMayRun;
             }
             match wait_failure {
-                // A stop requested at the same time wins, as it does over an exit.
-                Some(os_error) if !self.is_stopping() => WaitOutcome::WaitFailed { os_error },
-                _ => WaitOutcome::Stopping,
+                None => WaitOutcome::Stopping,
+                // The waiter's wait is over, so the join below cannot block.
+                Some(os_error) => {
+                    if !confirm_exited(child, id) {
+                        WaitOutcome::DaemonMayRun
+                    } else if stopping {
+                        WaitOutcome::Stopping
+                    } else if teardown == Teardown::ChildOnly {
+                        logging::log_failure(id, &tree_unconfirmed());
+                        WaitOutcome::DaemonMayRun
+                    } else {
+                        WaitOutcome::WaitFailed { os_error }
+                    }
+                }
             }
         } else {
             drop(g);
@@ -343,18 +401,66 @@ impl StopBus {
     }
 }
 
+// Waiter panic --------------------------------------------------------------------------------------------------------
+
+/// Reports a panic in the waiter's closure as a failed wait. Without it the panic ends the thread
+/// with `child_done` unset, and in the no-stop case nothing else would wake `wait_while`.
+struct ReportOnPanic<'a> {
+    bus: &'a StopBus,
+    armed: bool,
+}
+
+impl Drop for ReportOnPanic<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.bus.report_done(Some(None));
+        }
+    }
+}
+
 // Teardown ============================================================================================================
 
+/// What [`kill_for_stop`] reached.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Teardown {
+    /// `kill_tree` succeeded.
+    Tree,
+    /// `kill_tree` failed and the direct child was killed: its descendants were not reached.
+    ChildOnly,
+    /// Neither worked, so nothing has told the daemon to exit and no `child.wait()` on it can
+    /// return.
+    Failed,
+}
+
 /// Kill the daemon for a commanded stop: the whole contained tree, or failing that the direct
-/// child alone. `false` means neither worked, so nothing has told the daemon to exit and no
-/// `child.wait()` on it can return — see [`StopBus::wait_for_child_or_stop`], the only caller, for
-/// what it does with that. Each failure is logged as it happens.
-fn kill_for_stop(child: &Child, id: &str) -> bool {
-    let Err(e) = kill_tree(child) else { return true };
+/// child alone. See [`StopBus::wait_for_child_or_stop`], the only caller, for what it does with
+/// [`Teardown::Failed`]. Each failure is logged as it happens.
+fn kill_for_stop(child: &Child, id: &str) -> Teardown {
+    let Err(e) = kill_tree(child) else {
+        return Teardown::Tree;
+    };
     logging::log_failure(id, &kill_tree_failed(&e));
-    let Err(e2) = kill_child(child) else { return true };
+    let Err(e2) = kill_child(child) else {
+        return Teardown::ChildOnly;
+    };
     logging::log_failure(id, &fallback_kill_failed(&e2));
+    Teardown::Failed
+}
+
+/// Block until the daemon's root process has exited, on a fresh handle to it: the waiter's own wait
+/// failed, and `TerminateProcess` returning does not mean the process has ended. `false` (logged)
+/// means that could not be confirmed.
+fn confirm_exited(child: &Child, id: &str) -> bool {
+    let Err(e) = wait_for_exit(child) else { return true };
+    logging::log_failure(id, &confirm_failed(&e));
     false
+}
+
+/// A `cosca::Process` wait on the child's identity, as its own function so a test can make it fail.
+fn wait_for_exit(child: &Child) -> Result<(), cosca::error::Error> {
+    #[cfg(test)]
+    test_hook::confirming()?;
+    cosca::Process::from_id(child.id()).wait()
 }
 
 // Failure reports -----------------------------------------------------------------------------------------------------
@@ -372,11 +478,24 @@ fn kill_tree_failed(e: &cosca::error::Error) -> String {
     )
 }
 
+/// What every report of a daemon that may still be running says SCM is told.
+const NOT_RESTARTED: &str = " — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure";
+
 fn fallback_kill_failed(e: &cosca::error::Error) -> String {
     format!(
-        "fallback kill on stop: {e}; the daemon was neither killed nor reaped and may still be running — \
-         SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, \
-         and with service-specific exit code 1003 as the record of this failure"
+        "fallback kill on stop: {e}; the daemon was neither killed nor reaped and may still be running{NOT_RESTARTED}"
+    )
+}
+
+fn confirm_failed(e: &cosca::error::Error) -> String {
+    format!(
+        "confirm the daemon ended after the background wait failed: {e}; the daemon may still be running{NOT_RESTARTED}"
+    )
+}
+
+fn tree_unconfirmed() -> String {
+    format!(
+        "the daemon's descendants were not confirmed ended after the background wait failed: only the direct child was killed; the daemon may still be running{NOT_RESTARTED}"
     )
 }
 
@@ -411,13 +530,16 @@ pub(crate) mod test_hook {
     pub(crate) const NO_THREAD: &str = "no thread may be made (test hook)";
     /// The error [`Kill::Refuse`] and [`Kill::RefuseTree`] make a kill fail with.
     pub(crate) const KILL_REFUSED: &str = "the kill was refused (test hook)";
-    /// The error [`Wait::Fail`] makes the waiter's `child.wait()` fail with.
+    /// The error [`Wait::Fail`] makes the waiter's `child.wait()` fail with when it has no OS code.
     pub(crate) const WAIT_FAILED: &str = "the wait failed (test hook)";
+    /// The error [`confirmations_fail`] makes the confirming wait fail with.
+    pub(crate) const CONFIRM_REFUSED: &str = "the confirming wait failed (test hook)";
 
     thread_local! {
         static THREADS: Cell<Option<usize>> = const { Cell::new(None) };
         static KILLS: Cell<Option<Kill>> = const { Cell::new(None) };
         static WAITS: Cell<Option<Wait>> = const { Cell::new(None) };
+        static CONFIRMS_FAIL: Cell<bool> = const { Cell::new(false) };
     }
 
     /// What [`super::kill_tree`] and [`super::kill_child`] do instead of killing.
@@ -471,8 +593,8 @@ pub(crate) mod test_hook {
     /// What a waiter's `child.wait()` does instead of waiting.
     #[derive(Clone, Copy)]
     pub(crate) enum Wait {
-        /// Fail with [`WAIT_FAILED`], as a broken wait mechanism would.
-        Fail,
+        /// Fail as a broken wait mechanism would: with this OS error, or with [`WAIT_FAILED`].
+        Fail(Option<i32>),
         /// Panic, ending the waiter thread without it reporting the child done.
         Panic,
     }
@@ -500,9 +622,32 @@ pub(crate) mod test_hook {
     pub(super) fn wait(what: Option<Wait>) -> Result<(), cosca::error::Error> {
         match what {
             None => Ok(()),
-            Some(Wait::Fail) => Err(cosca::error::Error::Io(std::io::Error::other(WAIT_FAILED))),
+            Some(Wait::Fail(Some(code))) => Err(cosca::error::Error::Io(std::io::Error::from_raw_os_error(code))),
+            Some(Wait::Fail(None)) => Err(cosca::error::Error::Io(std::io::Error::other(WAIT_FAILED))),
             Some(Wait::Panic) => panic!("the wait panicked (test hook)"),
         }
+    }
+
+    /// Make the wait that confirms a daemon exited fail on this thread, until the returned guard drops.
+    pub(crate) fn confirmations_fail() -> Unconfirmed {
+        CONFIRMS_FAIL.set(true);
+        Unconfirmed
+    }
+
+    /// See [`confirmations_fail`].
+    pub(crate) struct Unconfirmed;
+
+    impl Drop for Unconfirmed {
+        fn drop(&mut self) {
+            CONFIRMS_FAIL.set(false);
+        }
+    }
+
+    pub(super) fn confirming() -> Result<(), cosca::error::Error> {
+        if CONFIRMS_FAIL.get() {
+            return Err(cosca::error::Error::Io(std::io::Error::other(CONFIRM_REFUSED)));
+        }
+        Ok(())
     }
 
     /// Let this thread make only `n` more waiter threads, until the returned guard drops.

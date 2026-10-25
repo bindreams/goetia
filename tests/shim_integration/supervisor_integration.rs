@@ -177,7 +177,11 @@ fn unreadable_blob_logs_to_fallback_path_and_event_log() {
     let err = mgr
         .start(&spec.id, Budget::DEFAULT)
         .expect_err("a shim that cannot decode its own metadata blob must fail to start, not hang");
-    let _ = err;
+    let text = err.to_string();
+    assert!(
+        text.contains("failed start") && text.contains("could not be read"),
+        "the start failure does not say the blob could not be read: {text}"
+    );
 
     // The shim's own failure, in the Win32 space: it cannot read as a daemon's exit code.
     let status = scm_status(&id);

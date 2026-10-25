@@ -728,10 +728,11 @@ clean exit is never restarted, and a stop reports a clean exit.
 Nothing cancels a restart SCM has queued, and `goetia daemon stop` does not
 look for one. A command that failed and is waiting out `restart-delay` finds
 the service already stopped, so `stop` exits `0` and the daemon is started when
-the delay ends. When a command fails just as a `stop` arrives, what the shim
-reports decides it: if the stop request has reached the shim by the time it
-reports the exit, it reports a clean stop, which SCM does not restart; otherwise
-it reports the failure, and SCM restarts the command as above.
+the delay ends. When a command fails just as a `stop` arrives, the shim decides
+once: a stop it accepts before it decides the exit is reported as a clean stop,
+which SCM does not restart; once it has decided on the failure it refuses the
+stop (`ERROR_SERVICE_CANNOT_ACCEPT_CTRL`), so a stop is never acknowledged and
+then followed by a restart, and SCM restarts the command as above.
 `goetia daemon uninstall` is not affected: deleting the service cancels a
 restart SCM has queued.
 
@@ -759,6 +760,11 @@ logs both failed kills and reports the stop with Win32 code `0`, because a
 non-zero Win32 code would make SCM start a second copy; the service-specific
 code `1003` is the record that the command may still be running. goetia does not
 read that record: `stop` exits `0`, and a later `start` starts a second copy.
+
+The same holds when the shim's own wait on the command fails: it kills the command
+and reports a shim failure, restarted under `on-failure`, only once it has
+confirmed the command and its descendants gone. When it cannot confirm that, it
+reports `0`, `1003` as for a `stop` it could not complete.
 
 ### What returning means
 
