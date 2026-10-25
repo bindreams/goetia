@@ -324,7 +324,8 @@ impl super::ScmActor for SystemScmActor {
         // The caller read the state before this control; each of these says the state it read is
         // gone, and what to do is decided from a fresh read.
         match err.raw_os_error().map(|code| code as u32) {
-            Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL | ERROR_SERVICE_NOT_ACTIVE) => Ok(ControlReply::StateMoved),
+            Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL) => Ok(ControlReply::CannotAccept),
+            Some(ERROR_SERVICE_NOT_ACTIVE) => Ok(ControlReply::StateMoved),
             Some(ERROR_INVALID_SERVICE_CONTROL) => Ok(ControlReply::NotAccepted),
             _ => Err(err),
         }

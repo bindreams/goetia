@@ -730,8 +730,11 @@ instead of waiting for it: a command that failed and is waiting out
 `restart-delay`, or one that fails as the stop arrives. When a command fails
 just as a `stop` arrives, what the shim reports decides it: if the stop request
 has reached the shim by the time it reports the exit, it reports a clean stop,
-which SCM does not restart and `stop` accepts; otherwise it reports the failure
-and `stop` refuses as below. A refusing `stop` exits `4`, says that SCM is
+which SCM does not restart and `stop` accepts; otherwise it refuses the stop
+(`ERROR_SERVICE_CANNOT_ACCEPT_CTRL`) and reports the failure, and `stop` reads
+the failure as it would any other and refuses as below. With `--timeout 0`,
+which does not wait for the failure to be reported, `stop` judges it by the
+service's recovery actions instead. A refusing `stop` exits `4`, says that SCM is
 starting the daemon or has a restart queued that goetia cannot cancel, and that
 goetia did not stop it. That holds under every `--timeout`, `--no-timeout`
 included. Run `stop` again once the daemon is back, or
@@ -777,7 +780,8 @@ service, which cancels a restart SCM has queued and prevents any other, and
 stops any daemon that a restart started in the meantime. A daemon that fails as
 soon as it starts can still be uninstalled. If that last stop cannot be
 confirmed, `uninstall` exits `1` having already deleted the service, which
-Windows removes when the daemon's process ends.
+Windows removes when the daemon's process ends; running `uninstall` again
+finds the service marked for deletion and completes.
 
 After upgrading goetia, run `goetia daemon install` again for every daemon
 installed by an older version. Services registered before this shim existed
@@ -817,7 +821,9 @@ error, makes `stop` and `restart` exit `1`, and `uninstall` exit `1` saying the
 service was not deleted. goetia sends the control again only to a service whose
 state or process has changed since it last looked. That second look is not a
 wait, so it happens even when `--timeout` has run out; after that, one more look
-at most, and a service that is still changing is reported as timed out.
+at most, and a service that is still changing is reported as timed out. With
+`--timeout 0` a service that changes under the second control as well exits `4`,
+saying it kept changing state and no stop was issued.
 
 The same holds when the shim's own wait on the command fails: it kills the command
 and reports a shim failure, restarted under `on-failure`, only once it has

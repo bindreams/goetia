@@ -70,15 +70,19 @@ enum Change {
     ToRunningAgain,
     ToStoppedClean,
     ToStoppedFailed,
+    /// The daemon crashed and SCM restarted it: the failure's `STOPPED` is delivered to a
+    /// notification armed before, and the service is `RUNNING` again in a new process.
+    ToCrashedAndRestarted,
 }
 
-const CHANGES: [Change; 6] = [
+const CHANGES: [Change; 7] = [
     Change::None,
     Change::ToStartPending,
     Change::ToRunning,
     Change::ToRunningAgain,
     Change::ToStoppedClean,
     Change::ToStoppedFailed,
+    Change::ToCrashedAndRestarted,
 ];
 
 /// What the control returns, whatever the state: `Ok` leaves it to the state. Unless it says
@@ -86,7 +90,8 @@ const CHANGES: [Change; 6] = [
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Forced {
     Ok,
-    /// `ERROR_SERVICE_CANNOT_ACCEPT_CTRL`
+    /// `ERROR_SERVICE_CANNOT_ACCEPT_CTRL`. From a service that still reads as it did, in the same
+    /// run, it is the shim's: the failure is decided and its `STOPPED` is on its way.
     Busy,
     /// `ERROR_SERVICE_NOT_ACTIVE`
     NotActive,
@@ -94,6 +99,13 @@ enum Forced {
     Invalid,
     /// `Busy`, on every control.
     AlwaysBusy,
+    /// The shim refuses the first control with `Busy` because it has decided a failure, and has
+    /// reported the `STOPPED` with that failure by the time the stop reads the service again.
+    FailureDecided,
+    /// The first control meets a crashed-and-restarted run that reports `RUNNING` before it sets
+    /// `ACCEPT_STOP`: `ERROR_INVALID_SERVICE_CONTROL`, in a new process that accepts `STOP` a moment
+    /// later.
+    RestartedNotAccepting,
     /// `Invalid`, on every control: a handler that answers `STOP` with 1052 though the service
     /// reports `RUNNING` and `ACCEPT_STOP`.
     AlwaysInvalid,
@@ -105,12 +117,14 @@ enum Forced {
     AlwaysMoved,
 }
 
-const FORCED: [Forced; 8] = [
+const FORCED: [Forced; 10] = [
     Forced::Ok,
     Forced::Busy,
     Forced::NotActive,
     Forced::Invalid,
     Forced::AlwaysBusy,
+    Forced::FailureDecided,
+    Forced::RestartedNotAccepting,
     Forced::AlwaysInvalid,
     Forced::NeverAccepts,
     Forced::AlwaysMoved,
@@ -208,6 +222,13 @@ struct Scm {
     /// A control was refused by a service that was `RUNNING` when the stop last looked, and still
     /// is: nothing moved, so the refusal is the answer.
     unexplained_refusal: bool,
+    /// The shim refused a control with `Busy` while the service was `RUNNING` in the run the stop last
+    /// saw: its failure is decided, and it reports the `STOPPED` the next time anything is due.
+    failing: bool,
+    /// A control was refused that way at least once.
+    shim_refused: bool,
+    /// The service reports `ACCEPT_STOP`; a run that has just started does not, until it is read.
+    accepting: bool,
     /// `uninstall` step 3: what `delete` finds the service in, a restart having fired meanwhile.
     state_after_delete: Option<(QueriedState, RecordedExit)>,
     armed: Option<WantState>,
@@ -260,6 +281,9 @@ impl Scm {
             starts: row.starts,
             stop_meets: row.stop_meets,
             unexplained_refusal: false,
+            failing: false,
+            shim_refused: false,
+            accepting: true,
             state_after_delete: None,
             armed: None,
             delivered: None,
@@ -319,7 +343,10 @@ impl Scm {
 
     /// The next thing that was due happens. `false` when nothing is due: the service stays as it is.
     fn time_passes(&mut self) -> bool {
-        if self.restart_queued {
+        if self.failing && self.state == QueriedState::Running {
+            self.failing = false;
+            self.set(QueriedState::Stopped, daemon_failed());
+        } else if self.restart_queued {
             self.set(QueriedState::StartPending, clean());
         } else if self.state == QueriedState::StartPending {
             match self.starts {
@@ -362,6 +389,11 @@ impl Scm {
             }
             Change::ToStoppedClean => self.set(QueriedState::Stopped, clean()),
             Change::ToStoppedFailed => self.set(QueriedState::Stopped, daemon_failed()),
+            Change::ToCrashedAndRestarted => {
+                self.set(QueriedState::Stopped, daemon_failed());
+                self.set(QueriedState::StartPending, clean());
+                self.set(QueriedState::Running, clean());
+            }
         }
     }
 }
@@ -393,7 +425,11 @@ impl Scm {
             self.apply_change();
         }
         let forced = match self.forced {
-            Forced::Ok | Forced::NeverAccepts | Forced::AlwaysMoved => None,
+            Forced::Ok
+            | Forced::NeverAccepts
+            | Forced::AlwaysMoved
+            | Forced::FailureDecided
+            | Forced::RestartedNotAccepting => None,
             Forced::Busy | Forced::AlwaysBusy => Some(Reply::Busy),
             Forced::NotActive => Some(Reply::NotActive),
             Forced::Invalid | Forced::AlwaysInvalid => Some(Reply::Invalid),
@@ -410,6 +446,18 @@ impl Scm {
             QueriedState::StartPending => Reply::Invalid,
             QueriedState::Stopped => Reply::NotActive,
             QueriedState::Running if self.forced == Forced::NeverAccepts => self.refuse(Reply::Invalid),
+            QueriedState::Running if self.forced == Forced::FailureDecided && !self.forced_used => {
+                self.forced_used = true;
+                self.set(QueriedState::Stopped, daemon_failed());
+                Reply::Busy
+            }
+            QueriedState::Running if self.forced == Forced::RestartedNotAccepting && !self.forced_used => {
+                self.forced_used = true;
+                self.accepting = false;
+                self.pid += 1;
+                self.set(QueriedState::Running, clean());
+                self.refuse(Reply::Invalid)
+            }
             QueriedState::Running if self.forced == Forced::AlwaysMoved => {
                 self.pid += 1;
                 self.set(QueriedState::Running, clean());
@@ -433,7 +481,12 @@ impl Scm {
         let same_run = self.known_pid.is_none_or(|pid| pid == self.pid);
         let final_refusal = same_run || self.forced == Forced::NeverAccepts;
         if self.state == QueriedState::Running && self.known == Known::Is(QueriedState::Running) && final_refusal {
-            self.unexplained_refusal = true;
+            if matches!(reply, Reply::Busy) {
+                self.failing = true;
+                self.shim_refused = true;
+            } else {
+                self.unexplained_refusal = true;
+            }
         }
         reply
     }
@@ -472,7 +525,8 @@ impl ScmActor for Scm {
     fn control_stop(&mut self) -> io::Result<ControlReply> {
         Ok(match self.control()? {
             Reply::Sent => ControlReply::Sent,
-            Reply::Busy | Reply::NotActive => ControlReply::StateMoved,
+            Reply::Busy => ControlReply::CannotAccept,
+            Reply::NotActive => ControlReply::StateMoved,
             Reply::Invalid => ControlReply::NotAccepted,
         })
     }
@@ -552,10 +606,12 @@ impl ScmActor for Scm {
             self.pid
         };
         self.known_pid = Some(pid);
+        let accepts_stop = self.accepting && self.forced != Forced::NeverAccepts;
+        self.accepting = true;
         Ok(QueriedStatus {
             state: self.state,
             exit: self.exit,
-            accepts_stop: self.forced != Forced::NeverAccepts,
+            accepts_stop,
             pid,
         })
     }
@@ -574,6 +630,8 @@ enum Outcome {
     RestartPending,
     /// `--timeout 0` issued the stop (or found nothing to issue).
     Issued,
+    /// `--timeout 0` met a service that kept changing state, and issued nothing.
+    KeptMoving,
 }
 
 fn run(path: Path, scm: &mut Scm, deadline: Deadline) -> io::Result<Outcome> {
@@ -587,6 +645,7 @@ fn run(path: Path, scm: &mut Scm, deadline: Deadline) -> io::Result<Outcome> {
         Path::StopTimeoutZero => match request_stop(scm, Kind::Simple)? {
             RequestedStop::Issued => Outcome::Issued,
             RequestedStop::RestartPending => Outcome::RestartPending,
+            RequestedStop::KeptMoving => Outcome::KeptMoving,
             RequestedStop::Incomplete => unreachable!("the model never reports an incomplete stop"),
         },
         Path::UninstallStep1 | Path::UninstallStep3 => match uninstall_teardown(scm, deadline, Kind::Simple)? {
@@ -624,6 +683,7 @@ fn acted_on(first: First, change: Change) -> First {
         Change::ToRunning | Change::ToRunningAgain => First::Running,
         Change::ToStoppedClean => First::StoppedClean,
         Change::ToStoppedFailed => First::StoppedFailed,
+        Change::ToCrashedAndRestarted => First::Running,
     }
 }
 
@@ -637,12 +697,25 @@ fn settled_failed(first: First) -> Outcome {
     }
 }
 
+/// How a stop of a service that is starting ends: by how the start ends.
+fn start_outcome(row: &Row, running: Outcome, first: First) -> Outcome {
+    match row.starts {
+        Starts::Runs => running,
+        Starts::DaemonFails | Starts::ShimFails => settled_failed(first),
+        Starts::AttemptFailsClean => Outcome::Stopped,
+    }
+}
+
 /// The outcome the spec gives for `path` when the service is first read as `first` and the row's
 /// dimensions play out.
 fn expected(path: Path, first: First, row: &Row) -> Outcome {
     let acts_on = acted_on(first, row.change);
+    // The shim refuses the stop that reaches a running daemon, and what the service reads as then is
+    // the failure it decided.
+    let refused = row.forced == Forced::FailureDecided;
     // How a stop that reaches a running daemon ends.
     let running = match row.stop_meets {
+        _ if refused => settled_failed(first),
         StopMeets::Clean => Outcome::Stopped,
         StopMeets::Failure => settled_failed(first),
     };
@@ -650,14 +723,14 @@ fn expected(path: Path, first: First, row: &Row) -> Outcome {
         // Waits out a start or a stop in progress, stops a running daemon, and refuses a restart
         // that is pending: it never waits on one.
         Path::Stop => match acts_on {
+            // The failure is heard as the stop arms for the start, and the restart it queued fires
+            // before the stop reads the service again: the stop is of the new run, not judged by the
+            // failure that is no longer pending.
+            First::StoppedFailed if first == First::StartPending => start_outcome(row, running, first),
             First::StoppedClean | First::StoppedNeverStarted | First::StopPending => Outcome::Stopped,
             First::StoppedFailed | First::StoppedFailedNoRecovery => settled_failed(first),
             First::Running => running,
-            First::StartPending => match row.starts {
-                Starts::Runs => running,
-                Starts::DaemonFails | Starts::ShimFails => settled_failed(first),
-                Starts::AttemptFailsClean => Outcome::Stopped,
-            },
+            First::StartPending => start_outcome(row, running, first),
         },
         // A spent budget waits for nothing: a start in progress is reported, a stop in progress or a
         // control just sent is left unconfirmed, and a stopped service is judged as it is. A control
@@ -671,6 +744,7 @@ fn expected(path: Path, first: First, row: &Row) -> Outcome {
                 First::StartPending => Outcome::RestartPending,
                 First::StoppedClean => Outcome::Stopped,
                 First::StoppedFailed => settled_failed(first),
+                First::Running if refused => settled_failed(first),
                 _ => Outcome::Expired,
             },
             First::StoppedClean | First::StoppedNeverStarted => Outcome::Stopped,
@@ -679,9 +753,13 @@ fn expected(path: Path, first: First, row: &Row) -> Outcome {
         // Waits for nothing and sends a control only to a running service: a service that is
         // starting, or has a restart pending, is reported.
         Path::StopTimeoutZero => {
+            if row.forced == Forced::AlwaysMoved {
+                return Outcome::KeptMoving;
+            }
             let seen = if first == First::Running { acts_on } else { first };
             match seen {
                 First::StartPending | First::StoppedFailed => Outcome::RestartPending,
+                First::Running if refused => Outcome::RestartPending,
                 _ => Outcome::Issued,
             }
         }
@@ -690,13 +768,27 @@ fn expected(path: Path, first: First, row: &Row) -> Outcome {
     }
 }
 
+/// What a path gives when the shim refused its control because it had decided a failure that was not
+/// yet reported: the stop waits for the failure's `STOPPED` and judges it (a restart is configured in
+/// every state that gets a control), or, with nothing to wait on, says so.
+fn after_a_shim_refusal(path: Path) -> Outcome {
+    match path {
+        Path::Stop | Path::StopTimeoutZero => Outcome::RestartPending,
+        Path::StopOnSpentBudget => Outcome::Expired,
+        Path::UninstallStep1 | Path::UninstallStep3 => Outcome::Stopped,
+    }
+}
+
 /// Whether a row can happen: the late change needs a pending callback to follow, which only a
 /// stopping service the stop waits on gives.
 fn possible(path: Path, first: First, change: Change, late: bool, forced: Forced) -> bool {
-    // A service that never settles ends only on a deadline that has run out, and is met by a
-    // control only when it starts out running.
+    // A service that never settles ends only on a deadline that has run out, or on a request that
+    // looks twice, and is met by a control only when it starts out running.
     if forced == Forced::AlwaysMoved
-        && (path != Path::StopOnSpentBudget || first != First::Running || change != Change::None || late)
+        && (!matches!(path, Path::StopOnSpentBudget | Path::StopTimeoutZero)
+            || first != First::Running
+            || change != Change::None
+            || late)
     {
         return false;
     }
@@ -762,7 +854,11 @@ fn every_stop_path_survives_every_interleaving_of_the_service_state() {
                                         }
                                     }
                                 } else {
-                                    let want = expected(path, first, &row);
+                                    let want = if scm.shim_refused {
+                                        after_a_shim_refusal(path)
+                                    } else {
+                                        expected(path, first, &row)
+                                    };
                                     match outcome {
                                         Ok(got) if got == want => {}
                                         Ok(got) => problems.push(format!("outcome {got:?}, wanted {want:?}")),
@@ -788,8 +884,9 @@ fn every_stop_path_survives_every_interleaving_of_the_service_state() {
                                         }
                                     }
                                 }
-                                // Past the deadline the stop reads the service once more and no further,
-                                // however much it keeps moving: the first control, and one after it.
+                                // Past the deadline, or on a request that waits for nothing, the stop reads
+                                // the service once more and no further, however much it keeps moving:
+                                // the first control, and one after it.
                                 if forced == Forced::AlwaysMoved && scm.controls != 2 {
                                     problems.push(format!("{} controls past a spent deadline, wanted 2", scm.controls));
                                 }

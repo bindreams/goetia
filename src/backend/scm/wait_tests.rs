@@ -23,6 +23,8 @@ struct FakeScm {
     start_fails: bool,
     /// `delete` reports failure.
     delete_fails: bool,
+    /// The OS error `delete` fails with, when it fails with one.
+    delete_code: Option<i32>,
     /// `control_stop` reports failure.
     stop_fails: bool,
     /// What `start` answers when it does not fail.
@@ -51,6 +53,9 @@ struct FakeScm {
     controls: VecDeque<ControlReply>,
     /// Whether `query_status` reports the service as accepting `STOP`.
     accepts_stop: bool,
+    /// Whether the next `query_status` calls report it accepting `STOP`, front to back;
+    /// `accepts_stop` once it runs dry.
+    acceptances: VecDeque<bool>,
     /// The `dwWaitHint` of a `Stopped` the script delivers.
     wait_hint: u32,
 }
@@ -63,6 +68,7 @@ impl FakeScm {
             what_arm_reports: Waited::Confirmed,
             start_fails: false,
             delete_fails: false,
+            delete_code: None,
             stop_fails: false,
             start_reply: StartReply::Accepted,
             deadlines: vec![],
@@ -77,6 +83,7 @@ impl FakeScm {
             recovery_reads: 0,
             controls: VecDeque::new(),
             accepts_stop: true,
+            acceptances: VecDeque::new(),
             wait_hint: 0,
         }
     }
@@ -84,6 +91,12 @@ impl FakeScm {
     /// The next `control_stop` calls answer these, front to back.
     fn controlled<const N: usize>(mut self, replies: [ControlReply; N]) -> Self {
         self.controls = replies.into();
+        self
+    }
+
+    /// The next `query_status` calls report whether the service accepts `STOP` as these say.
+    fn accepting<const N: usize>(mut self, answers: [bool; N]) -> Self {
+        self.acceptances = answers.into();
         self
     }
 
@@ -155,6 +168,13 @@ impl FakeScm {
         self
     }
 
+    /// `delete` fails with the OS error `code`.
+    fn rejecting_delete_with(mut self, code: i32) -> Self {
+        self.delete_fails = true;
+        self.delete_code = Some(code);
+        self
+    }
+
     /// `control_stop` reports failure.
     fn rejecting_stop(mut self) -> Self {
         self.stop_fails = true;
@@ -202,6 +222,9 @@ impl ScmActor for FakeScm {
     }
     fn delete(&mut self) -> std::io::Result<()> {
         self.log.push("delete");
+        if let Some(code) = self.delete_code.filter(|_| self.delete_fails) {
+            return Err(std::io::Error::from_raw_os_error(code));
+        }
         if self.delete_fails {
             return Err(std::io::Error::other("scripted delete failure"));
         }
@@ -245,7 +268,7 @@ impl ScmActor for FakeScm {
         Ok(QueriedStatus {
             state,
             exit,
-            accepts_stop: self.accepts_stop,
+            accepts_stop: self.acceptances.pop_front().unwrap_or(self.accepts_stop),
             pid: self.pids.pop_front().unwrap_or(0),
         })
     }
@@ -298,7 +321,7 @@ fn stop_via_notify_arms_stopped_then_gates_on_stopped() {
     );
     assert_eq!(
         fake.log,
-        vec!["query", "arm_stopped", "control_stop", "wait", "got_stopped"]
+        vec!["query", "arm_stopped", "control_stop", "wait", "got_stopped", "query"]
     );
 }
 
@@ -326,6 +349,7 @@ fn stop_re_arms_after_a_non_terminal_callback() {
             "query",       // and the service is read again
             "wait",
             "got_stopped",
+            "query",
         ]
     );
 }
@@ -690,6 +714,7 @@ fn a_stop_that_meets_a_failing_daemon_reports_the_restart_pending() {
             "query",
             "wait",
             "got_stopped",
+            "query",
         ]
     );
 }
@@ -703,7 +728,7 @@ fn a_failure_with_no_recovery_actions_queues_nothing() {
     );
     assert_eq!(
         fake.log,
-        vec!["query", "arm_stopped", "control_stop", "wait", "got_stopped"]
+        vec!["query", "arm_stopped", "control_stop", "wait", "got_stopped", "query"]
     );
 }
 
@@ -847,7 +872,10 @@ fn a_stopping_service_is_waited_on_after_its_state_is_read_again() {
         stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
         StopWaited::Confirmed
     );
-    assert_eq!(fake.log, vec!["query", "arm_stopped", "query", "wait", "got_stopped"]);
+    assert_eq!(
+        fake.log,
+        vec!["query", "arm_stopped", "query", "wait", "got_stopped", "query"]
+    );
 }
 
 /// A `STOPPED` reached between the first read and the arm is judged from the second read. The
@@ -902,6 +930,7 @@ fn a_stopping_service_that_started_again_before_the_arm_is_read_from_the_top() {
             "control_stop",
             "wait",
             "got_stopped",
+            "query",
         ]
     );
 }
@@ -948,6 +977,7 @@ fn the_arm_after_a_pending_callback_is_followed_by_a_read_that_finds_a_start() {
             "control_stop",
             "wait",
             "got_stopped",
+            "query",
         ]
     );
 }
@@ -1009,6 +1039,7 @@ fn the_arm_after_a_pending_callback_keeps_waiting_for_a_service_that_is_still_st
             "query",
             "wait",
             "got_stopped",
+            "query",
         ]
     );
 }
@@ -1052,6 +1083,7 @@ fn an_uninstall_rereads_the_service_after_the_arm_that_follows_a_pending_callbac
             "control_stop",
             "wait",
             "got_stopped",
+            "query",
             "delete",
             "query",
         ]
@@ -1089,6 +1121,7 @@ fn a_refusal_from_a_service_that_moved_on_is_read_again() {
             "control_stop",
             "wait",
             "got_stopped",
+            "query",
         ]
     );
 }
@@ -1137,6 +1170,7 @@ fn a_refusal_from_a_service_that_is_not_running_is_read_again_whatever_it_accept
             "control_stop",
             "wait",
             "got_stopped",
+            "query",
         ]
     );
 }
@@ -1208,6 +1242,7 @@ fn a_stop_of_a_starting_service_waits_for_running_before_it_stops() {
             "control_stop",
             "wait",
             "got_stopped",
+            "query",
         ]
     );
     assert_eq!(fake.arm_deadlines, vec![deadline; 2]);
@@ -1242,6 +1277,7 @@ fn a_starting_service_that_reports_pending_again_is_watched_to_its_outcome() {
             "control_stop",
             "wait",
             "got_stopped",
+            "query",
         ]
     );
 }
@@ -1256,7 +1292,10 @@ fn a_start_that_ends_stopped_is_a_stop_without_a_control() {
         stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
         StopWaited::Confirmed
     );
-    assert_eq!(fake.log, vec!["query", "arm_restart_resolves", "wait", "got_stopped"]);
+    assert_eq!(
+        fake.log,
+        vec!["query", "arm_restart_resolves", "wait", "got_stopped", "query"]
+    );
 }
 
 /// A start that ends in a failure with recovery configured has a restart pending, as any other
@@ -1271,7 +1310,10 @@ fn a_start_that_fails_into_a_queued_restart_is_refused() {
         stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
         StopWaited::RestartPending
     );
-    assert_eq!(fake.log, vec!["query", "arm_restart_resolves", "wait", "got_stopped"]);
+    assert_eq!(
+        fake.log,
+        vec!["query", "arm_restart_resolves", "wait", "got_stopped", "query"]
+    );
 }
 
 /// A wait for a start that runs out stops nothing and says a restart is pending.
@@ -1342,6 +1384,7 @@ fn a_running_service_is_stopped_before_the_delete() {
             "control_stop",
             "wait",
             "got_stopped",
+            "query",
             "delete",
             "query"
         ]
@@ -1402,7 +1445,8 @@ fn a_restart_between_the_stop_and_the_delete_is_stopped_after_the_delete() {
             "arm_stopped",
             "control_stop",
             "wait",
-            "got_stopped"
+            "got_stopped",
+            "query"
         ]
     );
     assert_eq!(fake.recovery_reads, 0);
@@ -1462,6 +1506,7 @@ fn a_stop_that_meets_a_failing_daemon_does_not_wait_for_a_restart() {
             "query",
             "wait",
             "got_stopped",
+            "query",
             "delete",
             "query",
         ]
@@ -1535,6 +1580,7 @@ fn an_uninstall_that_meets_a_starting_service_waits_for_it_before_the_stop() {
             "control_stop",
             "wait",
             "got_stopped",
+            "query",
             "delete",
             "query",
         ]
@@ -1561,6 +1607,7 @@ fn an_uninstall_whose_starting_service_ends_stopped_sends_no_stop() {
             "arm_restart_resolves",
             "wait",
             "got_stopped",
+            "query",
             "delete",
             "query",
         ]
@@ -1608,6 +1655,7 @@ fn a_restart_starting_when_the_delete_is_done_is_stopped_once_it_runs() {
             "control_stop",
             "wait",
             "got_stopped",
+            "query",
         ]
     );
 }
@@ -1645,6 +1693,7 @@ fn an_uninstall_that_meets_a_stopping_service_reads_it_again_after_the_arm() {
             "query",
             "wait",
             "got_stopped",
+            "query",
             "delete",
             "query"
         ]
@@ -1692,6 +1741,7 @@ fn an_uninstall_whose_stopping_service_started_again_before_the_arm_reads_it_fro
             "control_stop",
             "wait",
             "got_stopped",
+            "query",
             "delete",
             "query",
         ]
@@ -2164,6 +2214,7 @@ fn a_refusal_from_a_new_run_in_the_same_state_is_read_again_on_every_path() {
             "control_stop",
             "wait",
             "got_stopped",
+            "query",
         ]
     );
 
@@ -2185,7 +2236,7 @@ fn a_refusal_from_a_new_run_in_the_same_state_is_read_again_on_every_path() {
     assert_eq!(request_stop(&mut fake, Kind::Simple).unwrap(), RequestedStop::Issued);
     assert_eq!(
         fake.log,
-        vec!["query", "control_stop", "query", "query", "control_stop"]
+        vec!["query", "control_stop", "query", "reopen", "query", "control_stop"]
     );
 }
 
@@ -2238,6 +2289,7 @@ fn a_stop_that_waited_for_running_reads_the_run_before_it_sends_the_control() {
             "control_stop",
             "wait",
             "got_stopped",
+            "query",
         ]
     );
 }
@@ -2285,4 +2337,328 @@ fn a_refusal_from_a_moved_service_is_read_again_after_the_deadline_has_run_out()
         StopWaited::Confirmed
     );
     assert!(fake.log.contains(&"delete"), "{:?}", fake.log);
+}
+
+// a delete of a service already marked for deletion -------------------------------------------------------------------
+
+/// `DeleteService` on a record that is already marked answers `ERROR_SERVICE_MARKED_FOR_DELETE`: the
+/// service is as deleted as a delete makes it, and goes when the handle closes. A rerun of an
+/// `uninstall` whose last stop could not be confirmed meets exactly this.
+#[skuld::test]
+fn a_delete_that_finds_the_service_already_marked_goes_on_as_deleted() {
+    let mut fake = FakeScm::new([])
+        .found(QueriedState::Stopped, stopped_clean())
+        .rejecting_delete_with(1072);
+    assert_eq!(
+        uninstall_teardown(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        StopWaited::Confirmed
+    );
+    assert_eq!(fake.log, vec!["query", "delete", "query"]);
+}
+
+/// Any other refusal of the delete still leaves the service installed.
+#[skuld::test]
+fn a_delete_refused_for_another_reason_says_the_service_was_not_deleted() {
+    let mut fake = FakeScm::new([])
+        .found(QueriedState::Stopped, stopped_clean())
+        .rejecting_delete_with(5);
+    let e = uninstall_teardown(&mut fake, unbounded(), Kind::Simple).unwrap_err();
+    assert!(e.to_string().contains("NOT deleted"), "{e}");
+}
+
+// a refusal from a new run that does not accept STOP yet --------------------------------------------------------------
+
+/// A service that crashed and was restarted reports `RUNNING` before it sets `ACCEPT_STOP`. The
+/// control met that run; the process changed, so the refusal is read again, and a moment later the
+/// run accepts the control.
+#[skuld::test]
+fn a_refusal_from_a_new_run_that_does_not_accept_stop_yet_is_read_again() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)])
+        .controlled([ControlReply::NotAccepted])
+        .queried([
+            (QueriedState::Running, stopped_clean()),
+            (QueriedState::Running, stopped_clean()),
+            (QueriedState::Running, stopped_clean()),
+        ])
+        .running_as([10, 11, 11])
+        .accepting([true, false, true])
+        .stopped_with([stopped_clean()]);
+    assert_eq!(
+        stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        StopWaited::Confirmed
+    );
+    assert_eq!(fake.log.iter().filter(|step| **step == "control_stop").count(), 2);
+}
+
+/// The same run, not accepting `STOP`, is still refused for good.
+#[skuld::test]
+fn a_refusal_from_the_same_run_that_does_not_accept_stop_is_an_error() {
+    let mut fake = FakeScm::new([])
+        .controlled([ControlReply::NotAccepted])
+        .queried([
+            (QueriedState::Running, stopped_clean()),
+            (QueriedState::Running, stopped_clean()),
+        ])
+        .running_as([10, 10])
+        .accepting([true, false]);
+    let e = stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap_err();
+    assert!(e.to_string().contains("refused the stop control"), "{e}");
+}
+
+// a STOPPED that belongs to an earlier run ----------------------------------------------------------------------------
+
+/// The arm precedes the control, so a `STOPPED` the earlier run reached is queued for it. If SCM
+/// restarted the service before the control, the control stopped the new run, and the queued failure
+/// is not the stop's: it is read again, the new run is waited on, and the stop is judged by how that
+/// one ends.
+#[skuld::test]
+fn a_stopped_of_an_earlier_run_is_not_what_the_stop_is_judged_by() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped), Some(Observed::Stopped)])
+        .restarting()
+        .queried([
+            (QueriedState::Running, stopped_clean()),
+            (QueriedState::Running, stopped_clean()),
+            (QueriedState::StopPending, stopped_clean()),
+        ])
+        .running_as([10, 11, 11])
+        .stopped_with([daemon_failed(), stopped_clean()]);
+    assert_eq!(
+        stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        StopWaited::Confirmed
+    );
+    assert_eq!(
+        fake.log,
+        vec![
+            "query",
+            "arm_stopped",
+            "control_stop",
+            "wait",
+            "got_stopped", // the earlier run's failure
+            "query",       // read again: a new run
+            "arm_stopped",
+            "query",
+            "wait",
+            "got_stopped",
+            "query",
+        ]
+    );
+}
+
+/// A `STOPPED` that is still `STOPPED` when read again is judged by the record read, not the one the
+/// callback carried.
+#[skuld::test]
+fn a_stopped_is_judged_by_the_record_read_after_it() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)])
+        .restarting()
+        .queried([
+            (QueriedState::Running, stopped_clean()),
+            (QueriedState::Stopped, stopped_clean()),
+        ])
+        .stopped_with([daemon_failed()]);
+    assert_eq!(
+        stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        StopWaited::Confirmed
+    );
+    assert_eq!(fake.recovery_reads, 0);
+
+    let mut fake = FakeScm::new([Some(Observed::Stopped)])
+        .restarting()
+        .queried([
+            (QueriedState::Running, stopped_clean()),
+            (QueriedState::Stopped, daemon_failed()),
+        ])
+        .stopped_with([stopped_clean()]);
+    assert_eq!(
+        stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        StopWaited::RestartPending
+    );
+}
+
+/// `uninstall`'s stop ends on the `STOPPED` of the run it stopped, not on a queued one of an earlier run.
+#[skuld::test]
+fn an_uninstall_waits_for_the_new_run_after_a_stopped_of_an_earlier_one() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped), Some(Observed::Stopped)])
+        .queried([
+            (QueriedState::Running, stopped_clean()),
+            (QueriedState::Running, stopped_clean()),
+            (QueriedState::StopPending, stopped_clean()),
+        ])
+        .running_as([10, 11, 11])
+        .stopped_with([daemon_failed(), stopped_clean()]);
+    assert_eq!(
+        uninstall_teardown(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        StopWaited::Confirmed
+    );
+    let waits = fake.log.iter().filter(|step| **step == "wait").count();
+    assert_eq!(waits, 2, "{:?}", fake.log);
+    let delete = fake.log.iter().position(|step| *step == "delete").unwrap();
+    let second_stopped = fake.log.iter().position(|step| *step == "got_stopped").unwrap();
+    assert!(second_stopped < delete, "{:?}", fake.log);
+}
+
+// a stop the shim refused after deciding a failure --------------------------------------------------------------------
+
+/// The shim answers `ERROR_SERVICE_CANNOT_ACCEPT_CTRL` to a stop once it has decided its run ends in
+/// a failure. The service then reads `STOPPED` with that failure, and the rule for a failure decides:
+/// a restart pending, or nothing pending.
+#[skuld::test]
+fn a_stop_the_shim_refused_is_judged_by_the_failure_it_decided() {
+    for (restarts, want) in [(true, StopWaited::RestartPending), (false, StopWaited::Confirmed)] {
+        let mut fake = FakeScm::new([]).controlled([ControlReply::CannotAccept]).queried([
+            (QueriedState::Running, stopped_clean()),
+            (QueriedState::Stopped, daemon_failed()),
+            (QueriedState::Stopped, daemon_failed()),
+        ]);
+        if restarts {
+            fake = fake.restarting();
+        }
+        assert_eq!(
+            stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+            want,
+            "restarts: {restarts}"
+        );
+    }
+}
+
+/// The refusal can arrive before the shim has reported its `STOPPED`: the service still reads
+/// `RUNNING`, in the same run. For `type: simple` that is the shim's decided failure on its way, and
+/// the stop waits for the `STOPPED` it armed before the control.
+#[skuld::test]
+fn a_stop_the_shim_refused_waits_for_the_stopped_that_follows() {
+    for (restarts, want) in [(true, StopWaited::RestartPending), (false, StopWaited::Confirmed)] {
+        let mut fake = FakeScm::new([Some(Observed::Stopped)])
+            .controlled([ControlReply::CannotAccept])
+            .queried([
+                (QueriedState::Running, stopped_clean()),
+                (QueriedState::Running, stopped_clean()),
+            ])
+            .running_as([10, 10])
+            .stopped_with([daemon_failed()]);
+        if restarts {
+            fake = fake.restarting();
+        }
+        assert_eq!(
+            stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+            want,
+            "restarts: {restarts}"
+        );
+        assert_eq!(
+            fake.log,
+            vec![
+                "query",
+                "arm_stopped",
+                "control_stop",
+                "query",
+                "wait",
+                "got_stopped",
+                "query"
+            ]
+        );
+    }
+}
+
+/// `uninstall` stops on that `STOPPED` and deletes.
+#[skuld::test]
+fn an_uninstall_over_a_stop_the_shim_refused_waits_for_the_stopped_and_deletes() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)])
+        .controlled([ControlReply::CannotAccept])
+        .queried([
+            (QueriedState::Running, stopped_clean()),
+            (QueriedState::Running, stopped_clean()),
+        ])
+        .running_as([10, 10])
+        .stopped_with([daemon_failed()]);
+    assert_eq!(
+        uninstall_teardown(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        StopWaited::Confirmed
+    );
+    assert!(fake.log.contains(&"delete"), "{:?}", fake.log);
+}
+
+/// A stop on a spent deadline cannot wait for the `STOPPED`; it says so.
+#[skuld::test]
+fn a_stop_the_shim_refused_on_a_spent_deadline_is_a_timeout_without_a_wait() {
+    let mut fake = FakeScm::new([])
+        .arming(Waited::Expired)
+        .controlled([ControlReply::CannotAccept])
+        .queried([
+            (QueriedState::Running, stopped_clean()),
+            (QueriedState::Running, stopped_clean()),
+        ])
+        .running_as([10, 10]);
+    assert_eq!(
+        stop_via_notify(&mut fake, spent(), Kind::Simple).unwrap(),
+        StopWaited::Expired
+    );
+    assert!(!fake.log.contains(&"wait"), "{:?}", fake.log);
+}
+
+/// `--timeout 0` waits for nothing: the decided failure is judged as a failure is, by whether a
+/// restart is configured.
+#[skuld::test]
+fn a_stop_request_the_shim_refused_is_judged_by_the_recovery_actions() {
+    for (restarts, want) in [(true, RequestedStop::RestartPending), (false, RequestedStop::Issued)] {
+        let mut fake = FakeScm::new([]).controlled([ControlReply::CannotAccept]).queried([
+            (QueriedState::Running, stopped_clean()),
+            (QueriedState::Running, stopped_clean()),
+        ]);
+        if restarts {
+            fake = fake.restarting();
+        }
+        assert_eq!(
+            request_stop(&mut fake, Kind::Simple).unwrap(),
+            want,
+            "restarts: {restarts}"
+        );
+        assert_eq!(fake.log, vec!["query", "control_stop", "query"]);
+    }
+}
+
+/// Only the shim speaks that refusal. A `type: managed` service that answers 1061 while it reads the
+/// same as before has refused the stop.
+#[skuld::test]
+fn a_managed_service_that_answers_cannot_accept_without_moving_has_refused() {
+    let queried = [
+        (QueriedState::Running, stopped_clean()),
+        (QueriedState::Running, stopped_clean()),
+    ];
+    let mut fake = FakeScm::new([])
+        .controlled([ControlReply::CannotAccept])
+        .queried(queried)
+        .running_as([10, 10]);
+    let e = stop_via_notify(&mut fake, unbounded(), Kind::Managed).unwrap_err();
+    assert!(e.to_string().contains("refused the stop control"), "{e}");
+
+    let mut fake = FakeScm::new([])
+        .controlled([ControlReply::CannotAccept])
+        .queried(queried)
+        .running_as([10, 10]);
+    let e = request_stop(&mut fake, Kind::Managed).unwrap_err();
+    assert!(e.to_string().contains("refused the stop control"), "{e}");
+}
+
+// a stop request that keeps meeting a moving service ------------------------------------------------------------------
+
+/// `--timeout 0` reads a service that moved under the control once more, and no further: a service
+/// that keeps moving is reported, with nothing issued.
+#[skuld::test]
+fn a_stop_request_reads_a_moving_service_once_more_and_then_gives_up() {
+    let mut fake = FakeScm::new([])
+        .controlled([
+            ControlReply::StateMoved,
+            ControlReply::StateMoved,
+            ControlReply::StateMoved,
+        ])
+        .queried([
+            (QueriedState::Running, stopped_clean()),
+            (QueriedState::Running, stopped_clean()),
+            (QueriedState::Running, stopped_clean()),
+            (QueriedState::Running, stopped_clean()),
+        ])
+        .running_as([10, 11, 11, 12]);
+    assert_eq!(
+        request_stop(&mut fake, Kind::Simple).unwrap(),
+        RequestedStop::KeptMoving
+    );
+    assert_eq!(fake.log.iter().filter(|step| **step == "control_stop").count(), 2);
 }

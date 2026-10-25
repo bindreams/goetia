@@ -248,6 +248,7 @@ impl ServiceManager for ScmManager {
             {
                 RequestedStop::Issued => Ok(()),
                 RequestedStop::RestartPending => Err(budget::restart_pending(id.as_str())),
+                RequestedStop::KeptMoving => Err(budget::kept_moving(id.as_str())),
                 RequestedStop::Incomplete => Err(daemon_may_still_run(id, "stop", "the service stopped")),
             };
         }

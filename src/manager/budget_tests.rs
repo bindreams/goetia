@@ -177,6 +177,16 @@ fn restart_pending_is_not_a_wait_timeout_and_says_what_to_do_next() {
     assert!(message.contains("goetia daemon uninstall frpc"), "{message}");
 }
 
+#[skuld::test]
+fn kept_moving_is_a_restart_pending_error_that_says_no_stop_was_issued() {
+    let e = kept_moving("frpc");
+    assert!(matches!(e, crate::Error::RestartPending { .. }), "{e:?}");
+    let message = e.to_string();
+    assert!(message.contains("kept changing state"), "{message}");
+    assert!(message.contains("no stop was issued"), "{message}");
+    assert!(message.contains("goetia daemon stop frpc"), "{message}");
+}
+
 // Deadline ============================================================================================================
 
 #[skuld::test]

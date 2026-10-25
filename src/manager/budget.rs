@@ -136,6 +136,18 @@ pub fn restart_pending(id: &str) -> crate::Error {
     }
 }
 
+/// [`restart_pending`]'s sibling for a `stop` that issued nothing because the service kept changing
+/// state under every control: whether a restart is queued is not known.
+pub fn kept_moving(id: &str) -> crate::Error {
+    crate::Error::RestartPending {
+        id: id.to_string(),
+        recovery: format!(
+            "the service kept changing state, so no stop was issued. Run `goetia daemon stop {id}` \
+             again, or `goetia daemon uninstall {id}`."
+        ),
+    }
+}
+
 // Deadline ============================================================================================================
 
 /// An absolute instant a [`Budget`] resolves to via [`Budget::start`].
