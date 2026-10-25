@@ -2601,22 +2601,59 @@ fn an_uninstall_over_a_stop_the_shim_refused_waits_for_the_stopped_and_deletes()
 }
 
 /// A stop on a spent deadline cannot wait for the `STOPPED`. No stop is outstanding (the shim
-/// refused it), so it is not a timeout of a request that stands: it refuses like a pending restart.
+/// refused it), so it is not a timeout of a request that stands. Whether a restart follows is what
+/// the recovery actions say, as for a failure whose `STOPPED` has arrived; with none configured the
+/// service is stopping on its own and goetia could not confirm it.
 #[skuld::test]
-fn a_stop_the_shim_refused_on_a_spent_deadline_is_refused_not_timed_out() {
-    let mut fake = FakeScm::new([])
-        .arming(Waited::Expired)
-        .controlled([ControlReply::CannotAccept])
-        .queried([
-            (QueriedState::Running, stopped_clean()),
-            (QueriedState::Running, stopped_clean()),
-        ])
-        .running_as([10, 10]);
-    assert_eq!(
-        stop_via_notify(&mut fake, spent(), Kind::Simple).unwrap(),
-        StopWaited::RestartPending
-    );
-    assert!(!fake.log.contains(&"wait"), "{:?}", fake.log);
+fn a_stop_the_shim_refused_on_a_spent_deadline_is_judged_by_the_recovery_actions() {
+    for (restarts, want) in [
+        (true, StopWaited::RestartPending),
+        (false, StopWaited::StoppingOnItsOwn),
+    ] {
+        let mut fake = FakeScm::new([])
+            .arming(Waited::Expired)
+            .controlled([ControlReply::CannotAccept])
+            .queried([
+                (QueriedState::Running, stopped_clean()),
+                (QueriedState::Running, stopped_clean()),
+            ])
+            .running_as([10, 10]);
+        if restarts {
+            fake = fake.restarting();
+        }
+        assert_eq!(
+            stop_via_notify(&mut fake, spent(), Kind::Simple).unwrap(),
+            want,
+            "restarts: {restarts}"
+        );
+        assert!(!fake.log.contains(&"wait"), "{:?}", fake.log);
+    }
+}
+
+/// The same refusal, with the wait for its `STOPPED` running out after the arm was registered: still
+/// no stop is outstanding, so the answer is the one the spent-deadline arm gives, never a timeout.
+#[skuld::test]
+fn a_wait_for_the_stopped_of_a_refused_stop_that_runs_out_is_judged_by_the_recovery_actions() {
+    for (restarts, want) in [
+        (true, StopWaited::RestartPending),
+        (false, StopWaited::StoppingOnItsOwn),
+    ] {
+        let mut fake = FakeScm::new([None])
+            .controlled([ControlReply::CannotAccept])
+            .queried([
+                (QueriedState::Running, stopped_clean()),
+                (QueriedState::Running, stopped_clean()),
+            ])
+            .running_as([10, 10]);
+        if restarts {
+            fake = fake.restarting();
+        }
+        assert_eq!(
+            stop_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+            want,
+            "restarts: {restarts}"
+        );
+    }
 }
 
 /// A stop whose control was accepted and whose arm ran out did issue a stop: that one is a timeout.

@@ -642,6 +642,7 @@ fn run(path: Path, scm: &mut Scm, deadline: Deadline) -> io::Result<Outcome> {
             StopWaited::RestartPending => Outcome::RestartPending,
             StopWaited::KeptMoving => Outcome::KeptMoving,
             StopWaited::Incomplete => unreachable!("the model never reports an incomplete stop"),
+            StopWaited::StoppingOnItsOwn => unreachable!("the model configures a restart wherever a control is sent"),
         },
         Path::StopTimeoutZero => match request_stop(scm, Kind::Simple)? {
             RequestedStop::Issued => Outcome::Issued,

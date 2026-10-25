@@ -259,6 +259,7 @@ impl ServiceManager for ScmManager {
             StopWaited::Expired => Err(budget::timed_out(id.as_str(), "stopped", budget)),
             StopWaited::RestartPending => Err(budget::restart_pending(id.as_str())),
             StopWaited::KeptMoving => Err(budget::kept_moving(id.as_str())),
+            StopWaited::StoppingOnItsOwn => Err(budget::stopping_on_its_own(id.as_str())),
             StopWaited::Incomplete => Err(daemon_may_still_run(id, "stop", "the service stopped")),
         }
     }
@@ -1005,7 +1006,9 @@ fn uninstall_locked(id: &Id, kind: StopKind) -> Result<()> {
         // is precisely the case where a later edit narrowing that budget must not pass quietly.
         StopWaited::Expired => unreachable!("uninstall's stop is Unbounded; an unbounded deadline never expires"),
         StopWaited::RestartPending => unreachable!("uninstall's stop never judges a restart"),
-        StopWaited::KeptMoving => unreachable!("uninstall's stop is not `stop_via_notify`"),
+        StopWaited::KeptMoving | StopWaited::StoppingOnItsOwn => {
+            unreachable!("uninstall's stop is not `stop_via_notify`")
+        }
     }
 }
 

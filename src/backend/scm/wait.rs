@@ -253,6 +253,10 @@ pub enum StopWaited {
     /// The deadline had run out and the service kept changing state under the stop control, so no
     /// stop was issued.
     KeptMoving,
+    /// The shim refused the stop because its command had failed, no restart is configured, and the
+    /// `STOPPED` it will report was not seen before the deadline. No stop is outstanding and
+    /// nothing is queued: the service is stopping on its own.
+    StoppingOnItsOwn,
     /// `STOPPED`, but the shim could not kill the daemon, which may still be running.
     Incomplete,
 }
@@ -268,6 +272,27 @@ pub enum RequestedStop {
     KeptMoving,
     /// The service is stopped, but the shim could not kill the daemon, which may still be running.
     Incomplete,
+}
+
+/// How a stop ends when its deadline runs out and the shim's refusal (see [`control`]) is all it
+/// met: no stop request is outstanding, so it is judged as the failure is, by the recovery actions,
+/// and never as a timeout of a request that stands.
+fn failing_expired<A: ScmActor>(a: &mut A) -> io::Result<StopWaited> {
+    Ok(if restart_pending(a, DECIDED_FAILURE)? {
+        StopWaited::RestartPending
+    } else {
+        StopWaited::StoppingOnItsOwn
+    })
+}
+
+/// [`StopWaited::Expired`] for a stop that issued a request, [`failing_expired`] for one the shim
+/// refused.
+fn expired_stop<A: ScmActor>(a: &mut A, failing: bool) -> io::Result<StopWaited> {
+    if failing {
+        failing_expired(a)
+    } else {
+        Ok(StopWaited::Expired)
+    }
 }
 
 /// What the loop in [`stop_via_notify`] is waiting for.
@@ -482,6 +507,9 @@ pub fn stop_via_notify<A: ScmActor>(
 /// One pass of [`stop_via_notify`]; `None` when the service moved and must be read again.
 fn stop_once<A: ScmActor>(a: &mut A, deadline: Deadline, kind: StopKind) -> io::Result<Option<StopWaited>> {
     let status = a.query_status()?;
+    // Whether the shim refused the control: no stop is outstanding, so running out of time is not a
+    // timeout.
+    let mut failing = false;
     let mut watching = match status.state {
         QueriedState::StartPending => {
             if a.arm(WantState::RestartResolves, deadline)? == Waited::Expired {
@@ -499,20 +527,24 @@ fn stop_once<A: ScmActor>(a: &mut A, deadline: Deadline, kind: StopKind) -> io::
         _ => match issue_stop(a, status, deadline, kind)? {
             Stopping::Moved => return Ok(None),
             Stopping::Sent(Waited::Expired) => return Ok(Some(StopWaited::Expired)),
-            Stopping::Failing(Waited::Expired) => return Ok(Some(StopWaited::RestartPending)),
-            Stopping::Sent(Waited::Confirmed) | Stopping::Failing(Waited::Confirmed) => Watching::Stop,
+            Stopping::Failing(Waited::Expired) => return Ok(Some(failing_expired(a)?)),
+            Stopping::Sent(Waited::Confirmed) => Watching::Stop,
+            Stopping::Failing(Waited::Confirmed) => {
+                failing = true;
+                Watching::Stop
+            }
         },
     };
     loop {
         let Some(observed) = a.wait_callback(deadline)? else {
             return Ok(Some(match watching {
-                Watching::Stop => StopWaited::Expired,
+                Watching::Stop => expired_stop(a, failing)?,
                 Watching::Starting => StopWaited::RestartPending,
             }));
         };
         match (watching, observed) {
             (_, Observed::Stopped) => match reread_after_stopped(a, deadline)? {
-                Rearmed::Expired => return Ok(Some(StopWaited::Expired)),
+                Rearmed::Expired => return Ok(Some(expired_stop(a, failing)?)),
                 Rearmed::Stopped(exit) => return Ok(Some(settle(a, exit, kind)?)),
                 Rearmed::Stopping => watching = Watching::Stop,
                 Rearmed::Moved => return Ok(None),
@@ -520,7 +552,7 @@ fn stop_once<A: ScmActor>(a: &mut A, deadline: Deadline, kind: StopKind) -> io::
             // Running/Pending are non-terminal for a stop wait: arm again, and read the service
             // again, since the arm hears nothing that happened before it.
             (Watching::Stop, Observed::Running | Observed::Pending) => match arm_stopped_then_reread(a, deadline)? {
-                Rearmed::Expired => return Ok(Some(StopWaited::Expired)),
+                Rearmed::Expired => return Ok(Some(expired_stop(a, failing)?)),
                 Rearmed::Stopped(exit) => return Ok(Some(settle(a, exit, kind)?)),
                 Rearmed::Stopping => {}
                 Rearmed::Moved => return Ok(None),
@@ -535,8 +567,9 @@ fn stop_once<A: ScmActor>(a: &mut A, deadline: Deadline, kind: StopKind) -> io::
                 match issue_stop_after_running(a, deadline, kind)? {
                     Stopping::Moved => return Ok(None),
                     Stopping::Sent(Waited::Expired) => return Ok(Some(StopWaited::Expired)),
-                    Stopping::Failing(Waited::Expired) => return Ok(Some(StopWaited::RestartPending)),
-                    Stopping::Sent(Waited::Confirmed) | Stopping::Failing(Waited::Confirmed) => {}
+                    Stopping::Failing(Waited::Expired) => return Ok(Some(failing_expired(a)?)),
+                    Stopping::Sent(Waited::Confirmed) => {}
+                    Stopping::Failing(Waited::Confirmed) => failing = true,
                 }
             }
         }
@@ -855,7 +888,9 @@ fn request_stop_once<A: ScmActor>(a: &mut A, kind: StopKind) -> io::Result<Optio
                 StopWaited::Incomplete => RequestedStop::Incomplete,
                 StopWaited::RestartPending => RequestedStop::RestartPending,
                 StopWaited::Confirmed | StopWaited::Expired => RequestedStop::Issued,
-                StopWaited::KeptMoving => unreachable!("`settle` never reports a service that kept moving"),
+                StopWaited::KeptMoving | StopWaited::StoppingOnItsOwn => {
+                    unreachable!("`settle` reports neither a service that kept moving nor a refusal")
+                }
             }));
         }
         QueriedState::StopPending => return Ok(Some(RequestedStop::Issued)),

@@ -187,6 +187,19 @@ fn kept_moving_is_a_restart_pending_error_that_says_no_stop_was_issued() {
     assert!(message.contains("goetia daemon stop frpc"), "{message}");
 }
 
+#[skuld::test]
+fn stopping_on_its_own_says_the_command_failed_and_is_not_a_wait_timeout() {
+    let e = stopping_on_its_own("frpc");
+    assert!(matches!(e, crate::Error::RestartPending { .. }), "{e:?}");
+    let message = e.to_string();
+    assert!(message.contains("command failed"), "{message}");
+    assert!(message.contains("stopping on its own"), "{message}");
+    assert!(message.contains("goetia did not stop it"), "{message}");
+    assert!(!message.contains("restart queued"), "{message}");
+    assert!(!message.contains("request"), "{message}");
+    assert!(message.contains("goetia daemon status frpc"), "{message}");
+}
+
 // Deadline ============================================================================================================
 
 #[skuld::test]

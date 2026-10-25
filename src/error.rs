@@ -140,8 +140,10 @@ pub enum Error {
     /// recovery actions (the daemon had failed and the manager will start it again, which nothing
     /// cancels). A starting service refuses a stop and goetia does not wait for a queued restart,
     /// so nothing was stopped. Also a `stop` that issued nothing because the service kept changing
-    /// state under it. Produced only through [`crate::manager::budget::restart_pending`] and
-    /// [`crate::manager::budget::kept_moving`]; today only SCM queues restarts this way.
+    /// state under it, or whose stop the shim refused and whose outcome was not seen in time.
+    /// Produced only through [`crate::manager::budget::restart_pending`],
+    /// [`crate::manager::budget::kept_moving`] and [`crate::manager::budget::stopping_on_its_own`];
+    /// today only SCM queues restarts this way.
     ///
     /// Not [`WaitTimeout`](Error::WaitTimeout): that one issued a request and stopped watching,
     /// and this one issued none. Exit `4`, like it: the daemon will be running again unless it is

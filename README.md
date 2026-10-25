@@ -825,7 +825,10 @@ at most. A service that is still changing then exits `4` under any `--timeout`,
 `0` included, saying it kept changing state and no stop was issued; it is not
 reported as timed out, since no stop request is outstanding. The same holds for a
 `stop` whose `--timeout` runs out while it waits for a shim that refused the stop:
-the shim refused it, so it exits `4` with the restart message above. goetia
+the shim refused it, so no stop is outstanding, and it exits `4`, never as timed
+out. Under a restart policy it says what the restart message above says. With
+none configured it says that the daemon's command failed and the service is
+stopping on its own, which goetia did not confirm within the timeout. goetia
 recognises that refusal only from a service whose spec it can read as
 `type: simple`; the same reply from any other service, one whose spec it cannot
 read included, is a refusal like the one above.

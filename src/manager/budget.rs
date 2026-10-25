@@ -148,6 +148,20 @@ pub fn kept_moving(id: &str) -> crate::Error {
     }
 }
 
+/// [`restart_pending`]'s sibling for a `stop` the shim refused because the daemon's command had
+/// failed, on a service with no restart configured: the service is stopping on its own, and
+/// goetia ran out of time before seeing it stop. No request is outstanding and nothing is queued.
+pub fn stopping_on_its_own(id: &str) -> crate::Error {
+    crate::Error::RestartPending {
+        id: id.to_string(),
+        recovery: format!(
+            "the daemon's command failed and the service is stopping on its own, which goetia did not \
+             confirm within the timeout; goetia did not stop it. `goetia daemon status {id}` shows \
+             whether it has stopped."
+        ),
+    }
+}
+
 // Deadline ============================================================================================================
 
 /// An absolute instant a [`Budget`] resolves to via [`Budget::start`].
