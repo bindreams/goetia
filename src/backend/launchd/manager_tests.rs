@@ -197,6 +197,125 @@ fn move_no_clobber_does_not_clobber_existing_content() {
     assert!(src.exists(), "the source must not be consumed by a failed move");
 }
 
+// ensure_dir_owned_by =================================================================================================
+
+/// An account whose uid is the test user's own (so `chown` needs no privilege) and whose gid is a
+/// group other than the one the temp directory carries, so a `chown` is visible in the result.
+fn other_group_account(tmp: &Path) -> Account {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let inherited = nix::unistd::Gid::from_raw(std::fs::metadata(tmp).expect("stat tempdir").gid());
+    // SAFETY: a zero-length query takes no buffer; the second call's buffer holds `n` gids.
+    let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    assert!(n >= 0, "getgroups: {}", io::Error::last_os_error());
+    let mut groups: Vec<libc::gid_t> = vec![0; n as usize];
+    let n = unsafe { libc::getgroups(n, groups.as_mut_ptr()) };
+    assert!(n >= 0, "getgroups: {}", io::Error::last_os_error());
+    groups.truncate(n as usize);
+    let gid = groups
+        .into_iter()
+        .map(nix::unistd::Gid::from_raw)
+        .find(|g| *g != inherited)
+        .expect("the test user must belong to a group other than the temp directory's");
+    Account {
+        name: "test".to_string(),
+        uid: nix::unistd::Uid::current(),
+        gid,
+    }
+}
+
+fn mode_and_gid(path: &Path) -> (u32, u32) {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let meta = std::fs::metadata(path).expect("stat");
+    (meta.permissions().mode() & 0o777, meta.gid())
+}
+
+#[skuld::test]
+fn ensure_dir_owned_by_leaves_an_existing_directory_exactly_as_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let account = other_group_account(tmp.path());
+    let dir = tmp.path().join("existing");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let before = mode_and_gid(&dir);
+
+    ensure_dir_owned_by(&dir, &account).expect("an existing directory is accepted");
+
+    assert_eq!(mode_and_gid(&dir), before);
+    assert_eq!(before.0, 0o700);
+}
+
+#[skuld::test]
+fn ensure_dir_owned_by_creates_and_hands_over_every_missing_component() {
+    let tmp = tempfile::tempdir().unwrap();
+    let account = other_group_account(tmp.path());
+    let leaf = tmp.path().join("a").join("b").join("c");
+
+    ensure_dir_owned_by(&leaf, &account).expect("create the whole chain");
+
+    for dir in [tmp.path().join("a"), tmp.path().join("a/b"), leaf] {
+        assert_eq!(
+            mode_and_gid(&dir),
+            (0o755, account.gid.as_raw()),
+            "{} must be 0755 and the account's",
+            dir.display()
+        );
+    }
+}
+
+/// A component another install creates after the walk and before the `mkdir` is not ours to
+/// `chmod` or `chown`; the components below it still are.
+#[skuld::test]
+fn create_owned_leaves_a_component_that_appeared_after_the_walk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let account = other_group_account(tmp.path());
+    let raced = tmp.path().join("a");
+    let leaf = raced.join("b");
+
+    let missing = missing_components(&leaf).expect("walk");
+    assert_eq!(missing, [raced.as_path(), leaf.as_path()]);
+    std::fs::create_dir(&raced).unwrap();
+    std::fs::set_permissions(&raced, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let before = mode_and_gid(&raced);
+
+    create_owned(&missing, &account).expect("a lost race is not an error");
+
+    assert_eq!(
+        mode_and_gid(&raced),
+        before,
+        "the racing install's directory is untouched"
+    );
+    assert_eq!(mode_and_gid(&leaf), (0o755, account.gid.as_raw()));
+}
+
+/// A dangling symlink is an existing path: `exists()` would follow it and call it missing.
+#[skuld::test]
+fn ensure_dir_owned_by_treats_a_dangling_symlink_as_existing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let account = other_group_account(tmp.path());
+    let target = tmp.path().join("nowhere");
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    ensure_dir_owned_by(&link, &account).expect("an existing path of any kind is accepted");
+
+    assert!(!target.exists(), "the link's target must not be created");
+    assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+}
+
+#[skuld::test]
+fn ensure_dir_owned_by_accepts_a_regular_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let account = other_group_account(tmp.path());
+    let file = tmp.path().join("file");
+    std::fs::write(&file, b"x").unwrap();
+
+    ensure_dir_owned_by(&file, &account).expect("an existing path of any kind is accepted");
+
+    assert_eq!(std::fs::read(&file).unwrap(), b"x");
+}
+
 // resolve_account =====================================================================================================
 
 #[skuld::test]
