@@ -191,6 +191,44 @@ pub enum Error {
         detail: String,
     },
 
+    /// `install` rewrote the plist of a daemon whose job launchd now has loaded, though it was not
+    /// loaded when `install` checked: someone started it in between. Which definition the loaded job
+    /// read, the old plist or the new, is not established, so the job may run a spec other than the
+    /// installed one. launchd only (it cannot update a loaded job).
+    ///
+    /// `install` then puts the plist back as it was (the previous one, or none after a create), so a
+    /// rerun is refused while the job is loaded. `restore_failed` is the failure of that put-back,
+    /// when it failed, and says what is on disk.
+    ///
+    /// Exit `4` (indeterminate).
+    #[error("{}", loaded_in_doubt(id, None, restore_failed.as_deref()))]
+    LoadedJobInDoubt { id: String, restore_failed: Option<String> },
+
+    /// `install` wrote the plist of a daemon and could not read whether launchd has its job loaded
+    /// afterwards, so which definition a job loaded meanwhile read is not established either.
+    /// `detail` is the failed read; `restore_failed` is as in
+    /// [`LoadedJobInDoubt`](Error::LoadedJobInDoubt). launchd only.
+    ///
+    /// Exit `4` (indeterminate).
+    #[error("{}", loaded_in_doubt(id, Some(detail), restore_failed.as_deref()))]
+    LoadedStateInDoubt {
+        id: String,
+        detail: String,
+        restore_failed: Option<String>,
+    },
+
+    /// `install` booted out a job that answered to the label, then found `found` at `path`, where it
+    /// was about to create the plist: a concurrent writer took the place. The `bootout` was sent, so
+    /// the job is gone and the daemon is not installed. launchd only.
+    ///
+    /// Exit `4` (indeterminate).
+    #[error(
+        "`{id}`: a job loaded under that label was booted out, but {found} appeared at {path} before the plist \
+         could be created, so the daemon is not installed: re-run install, which decides against what is there",
+        path = path.display()
+    )]
+    StaleJobBootedOut { id: String, path: PathBuf, found: String },
+
     /// goetia will ask no service manager here, on positive evidence: systemd's offline mode, a
     /// chroot, or a system systemd did not boot. `evidence` says which. goetia refuses there
     /// rather than act on unit files alone, or read a `systemctl` that asked nobody as an answer.
@@ -266,6 +304,26 @@ fn in_doubt(request: &str, reached: bool, detail: &str) -> String {
              {detail}"
         )
     }
+}
+
+/// The message of both in-doubt variants. `read_failed` is the failed read (second variant only);
+/// `restore_failed` is the failed put-back of the plist.
+fn loaded_in_doubt(id: &str, read_failed: Option<&str>, restore_failed: Option<&str>) -> String {
+    let cause = match read_failed {
+        None => format!("`{id}` was loaded in launchd while its plist was written"),
+        Some(detail) => {
+            format!("`{id}`'s plist was written, but whether launchd has its job loaded could not be read ({detail})")
+        }
+    };
+    let remedy = match restore_failed {
+        None => format!(
+            "The plist is back as it was before this install, so the change is not installed: run `goetia daemon stop {id}`, re-run install, then `goetia daemon start {id}`"
+        ),
+        Some(detail) => format!(
+            "The plist could not be put back as it was before this install ({detail}): check what is on disk, then run `goetia daemon stop {id}`, re-run install, then `goetia daemon start {id}`"
+        ),
+    };
+    format!("{cause}, so goetia cannot tell whether a loaded job holds the old definition or the new one. {remedy}")
 }
 
 /// This crate's `Result` alias, used throughout [`crate::manager`] and

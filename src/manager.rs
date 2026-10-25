@@ -36,6 +36,17 @@ pub trait ServiceManager {
     /// install-off-by-default. Routes through [`crate::decide::decide`]; see
     /// that function's doc comment for what each [`crate::decide::Outcome`]
     /// means and when `force` is honored.
+    ///
+    /// Never changes whether the service is running, with one launchd
+    /// exception: a `Create` over a job already loaded under the same label
+    /// (no goetia plist on disk) boots that job out. A changed spec takes
+    /// effect at the service's next start where the platform allows that
+    /// (systemd, SCM). launchd cannot update a loaded job, so `install` returns
+    /// an error and writes nothing; if the job turns out loaded only after the
+    /// write, it restores the previous plist and returns
+    /// [`Error::LoadedJobInDoubt`](crate::error::Error::LoadedJobInDoubt) or
+    /// [`Error::LoadedStateInDoubt`](crate::error::Error::LoadedStateInDoubt)
+    /// (exit `4`).
     fn install(&self, spec: &DaemonSpec, force: bool) -> Result<crate::decide::Outcome>;
 
     /// What [`Self::install`] would do for `spec`, without doing it —
