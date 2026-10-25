@@ -170,7 +170,7 @@ fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_k
         &lines[1..],
         id.as_str(),
         &format!(
-            "fallback kill on stop: {KILL_REFUSED}; the daemon was neither killed nor reaped and may still be running — reporting the service stopped, with that failure, rather than waiting for an exit nothing can now cause"
+            "fallback kill on stop: {KILL_REFUSED}; the daemon was neither killed nor reaped and may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure"
         ),
     );
 }
@@ -301,37 +301,12 @@ fn a_waiter_that_is_never_handed_a_child_ends_on_its_own() {
     let waiter = bus.waiter(id.as_str()).expect("make the waiter thread");
 
     // Closing the only `Sender` is the whole mechanism: the thread's first act is `rx.recv()`,
-    // which now returns `Err` and returns.
+    // which returns `Err` and returns.
     let Waiter { hand, thread, bus: _ } = waiter;
     drop(hand);
 
     thread.join().expect("the waiter thread panicked instead of ending");
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
-}
-
-#[skuld::test]
-fn wait_or_stop_returns_true_when_a_stop_is_requested_before_the_delay_elapses() {
-    let bus = StopBus::new();
-    // A 30s delay against an essentially-instant `request_stop()` call from
-    // another thread proves the composite `Condvar::wait_timeout_while`
-    // wakes on the stop rather than merely on the (much longer) timeout —
-    // the delay itself is not a synchronization mechanism this test relies
-    // on completing.
-    let stopped_early = std::thread::scope(|scope| {
-        scope.spawn(|| bus.request_stop());
-        bus.wait_or_stop(Duration::from_secs(30))
-    });
-    assert!(stopped_early, "wait_or_stop did not observe the stop request");
-}
-
-#[skuld::test]
-fn wait_or_stop_returns_false_when_the_delay_elapses_with_no_stop() {
-    let bus = StopBus::new();
-    // Real elapsed time here is the behavior under test — `wait_or_stop`'s
-    // whole contract is "wait up to `delay`" — not a stand-in for a missing
-    // signal.
-    let stopped = bus.wait_or_stop(Duration::from_millis(50));
-    assert!(!stopped, "wait_or_stop reported a stop that was never requested");
 }
 
 /// A failed `child.wait()` says nothing about the child, so the waiter still reports it done: the

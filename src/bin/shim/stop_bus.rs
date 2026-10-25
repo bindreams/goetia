@@ -1,6 +1,6 @@
 //! The stop signal shared between the SCM control-handler callback and the
-//! supervisor loop, and the composition that lets the loop block on either
-//! "the current child exited" or "a stop was requested" without polling.
+//! service thread, and the composition that lets that thread block on either
+//! "the child exited" or "a stop was requested" without polling.
 //!
 //! Process-tree waiting is `cosca::Child`'s job (see `main.rs`'s module doc
 //! comment); this module supplies the piece `cosca` does not: a way to
@@ -14,7 +14,6 @@
 
 use std::io;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
-use std::time::Duration;
 
 use cosca::Child;
 
@@ -42,7 +41,7 @@ pub enum WaitOutcome {
     /// A stop was requested and neither `kill_tree` nor the direct-child
     /// fallback could kill the daemon, so nothing was reaped and it may still
     /// be running — see [`StopBus::wait_for_child_or_stop`] for why this is
-    /// still a return rather than a wait, and `service::EXIT_STOP_INCOMPLETE`
+    /// still a return rather than a wait, and `Reported::incomplete_stop`
     /// for what the caller reports for it.
     StoppingUnkillable,
 }
@@ -56,7 +55,7 @@ pub enum WaitOutcome {
 /// **Why it is made first, and never after.** This wait is the only thing that ever observes the
 /// daemon exiting or tears its tree down on a stop. Making it after the spawn means a daemon can
 /// be running before the shim knows whether anything can watch it, and the OS refusing a thread
-/// there leaves that daemon orphaned: nothing supervising it, nothing to stop it, no kill-tree
+/// there leaves that daemon orphaned: nothing waiting on it, nothing to stop it, no kill-tree
 /// teardown — with SCM told, at best, that its service just died. `std::thread::Scope::spawn`
 /// could not even report that refusal: it has no `Result` and panics, taking the service process
 /// down with the daemon already up.
@@ -108,7 +107,7 @@ impl Waiter {
                 // to keep waiting on, and staying silent would leave
                 // `wait_for_child_or_stop`'s `Condvar::wait_while` with no
                 // further waker at all in the (ordinary, no-stop-requested)
-                // case, hanging the supervisor loop forever on a child that
+                // case, hanging the service thread forever on a child that
                 // may already be gone.
                 #[cfg(test)]
                 let waited = test_hook::wait(waiting).and_then(|()| child.wait());
@@ -156,12 +155,10 @@ impl StopBus {
     /// itself owns, per `service.rs`'s `service_control_handler::register`).
     /// Only ever sets a flag and wakes waiters — it never acts on the child
     /// itself. Acting directly from this callback (calling `kill_tree()`
-    /// here) would reopen exactly the race `supervisor::decide_restart`'s
-    /// explicit `stopping` input exists to close: this callback cannot know
-    /// whether the supervisor loop has spawned its next child yet, so a stop
-    /// delivered in that gap could kill nothing and be silently lost. Routing
-    /// the actual kill through the loop's own thread, gated on this same
-    /// flag re-checked at every wake-up, means a stop is never missed
+    /// here) could not know whether the service thread has spawned the child
+    /// yet, so a stop delivered in that gap could kill nothing and be silently
+    /// lost. Routing the actual kill through the service thread, gated on this
+    /// same flag re-checked at every wake-up, means a stop is never missed
     /// regardless of when it arrives.
     pub fn request_stop(&self) {
         let mut g = self.state.lock().expect("StopBus mutex poisoned");
@@ -254,7 +251,7 @@ impl StopBus {
     /// returning `false` below — the one path that does not join). Two failed kills are
     /// positive evidence that nothing has told the child to exit, so the
     /// waiter's `child.wait()` cannot return and joining it would block for
-    /// as long as that child lives: `supervisor_loop` would never reach
+    /// as long as that child lives: `run_service` would never reach
     /// `report_stopped`, SCM's stop would never complete, and the service —
     /// which reads `RUNNING` throughout its own teardown, since this shim
     /// never reports `STOP_PENDING` — could then be neither stopped nor
@@ -263,9 +260,9 @@ impl StopBus {
     /// nothing and races nothing, because the wait it would wait for is
     /// already known not to resolve. What it gives up is the guarantee the
     /// join buys on every other path — the daemon is not reaped and may well
-    /// still be running — so the outcome is a distinct one, reported to SCM
-    /// as a stop that failed (`service::EXIT_STOP_INCOMPLETE`) rather than a
-    /// clean one, with the log above naming which kill failed and how. The
+    /// still be running — so the outcome is a distinct one, reported as
+    /// `Reported::incomplete_stop` (a distinct process exit code, and `Win32(0)` with service-specific
+    /// code 1003 to SCM: any non-zero Win32 code would start a second daemon) rather than a clean one, with the log above naming which kill failed and how. The
     /// detached thread still holds its own `Arc<Child>` clone, so this is
     /// memory-safe, and if the child ever does exit its `wait()` returns and
     /// that clone drops.
@@ -328,20 +325,6 @@ impl StopBus {
         }
         outcome
     }
-
-    /// Wait up to `delay` for a stop request — `restart-delay` itself, not a
-    /// synchronization workaround; see
-    /// `supervisor::DEFAULT_RESTART_DELAY`'s doc comment for the policy this
-    /// implements. Returns `true` if a stop was requested during the wait
-    /// (the caller must not respawn), `false` if the full delay elapsed.
-    pub fn wait_or_stop(&self, delay: Duration) -> bool {
-        let g = self.state.lock().expect("StopBus mutex poisoned");
-        let (g, _timed_out) = self
-            .cvar
-            .wait_timeout_while(g, delay, |g| !g.stopping)
-            .expect("StopBus mutex poisoned");
-        g.stopping
-    }
 }
 
 // Teardown ============================================================================================================
@@ -376,7 +359,8 @@ fn kill_tree_failed(e: &cosca::error::Error) -> String {
 fn fallback_kill_failed(e: &cosca::error::Error) -> String {
     format!(
         "fallback kill on stop: {e}; the daemon was neither killed nor reaped and may still be running — \
-         reporting the service stopped, with that failure, rather than waiting for an exit nothing can now cause"
+         SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, \
+         and with service-specific exit code 1003 as the record of this failure"
     )
 }
 
