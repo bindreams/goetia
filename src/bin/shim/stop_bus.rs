@@ -22,8 +22,9 @@ use crate::logging;
 use crate::service::os_error_of;
 
 /// How the run ends, decided once under the [`StopBus`] mutex: a stop accepted before the exit is
-/// decided wins over any failure; a failure decided first is reported whatever stop follows. SCM
-/// acknowledges that later stop anyway and restarts the service after the failure.
+/// decided wins over any failure; an exit decided first is reported whatever stop follows. SCM
+/// acknowledges that later stop anyway, and restarts the service if the restart policy covers the
+/// exit.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum Fate {
     #[default]

@@ -118,7 +118,7 @@ fn stopped_status(reported: Reported) -> SERVICE_STATUS {
     }
 }
 
-/// The handle `RegisterServiceCtrlHandlerExW` returned. It stays valid for the life of the process.
+/// The handle `RegisterServiceCtrlHandlerExW` returned, used until the service reports `STOPPED`.
 #[derive(Clone, Copy)]
 struct StatusHandle(SERVICE_STATUS_HANDLE);
 
@@ -155,8 +155,9 @@ unsafe extern "system" fn control_handler(
 }
 
 /// The handler's answer to `control`. SCM acknowledges every `STOP` it delivers whatever the
-/// handler answers, so a stop the bus does not accept (the exit is already decided as a failure)
-/// is answered `NO_ERROR` too: the failure is still reported, and SCM restarts the service.
+/// handler answers, so a stop the bus does not accept (the exit is already decided) is answered
+/// `NO_ERROR` too. The decided exit is reported as it is; SCM restarts it if the restart policy
+/// covers it.
 fn handle_control(stop_bus: &StopBus, control: u32) -> u32 {
     match control {
         SERVICE_CONTROL_STOP => {

@@ -456,7 +456,8 @@ fn a_failed_wait_with_no_os_error_is_the_generic_shim_failure() {
 }
 
 /// A daemon whose tree could not be killed must not be reported as a failure SCM restarts: the
-/// restart would start a second copy beside it. The failure is decided, so a stop is refused too.
+/// restart would start a second copy beside it. The exit is decided, so the bus does not accept a
+/// later stop either.
 #[skuld::test]
 fn a_failed_wait_over_an_unkillable_daemon_is_the_incomplete_stop_record() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
@@ -472,7 +473,7 @@ fn a_failed_wait_over_an_unkillable_daemon_is_the_incomplete_stop_record() {
     assert_eq!(reported, Reported::incomplete_stop());
     assert!(
         !stop_bus.request_stop(),
-        "a stop was acknowledged over a daemon that may still be running"
+        "the bus accepted a stop over a daemon that may still be running"
     );
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
     assert_failures(
@@ -508,7 +509,7 @@ fn a_failing_daemon_whose_tree_cannot_be_terminated_is_the_incomplete_stop_recor
     assert_eq!(reported, Reported::incomplete_stop());
     assert!(
         !stop_bus.request_stop(),
-        "a stop was acknowledged over a daemon whose tree may still be running"
+        "the bus accepted a stop over a daemon whose tree may still be running"
     );
     assert_one_failure(
         &take(id.as_str()),
@@ -700,8 +701,10 @@ fn a_stop_after_a_daemon_failure_was_decided_leaves_the_failure() {
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }
 
-/// SCM may deliver a control after `STOP`, so the handler's context lives as long as the process.
-/// (`windows-service`'s `register` frees its closure after the first `Stop`.)
+/// SCM may deliver a control after `STOP`: the handler and the context `leak_handler_context` makes
+/// still answer it. That `register_control_handler` passes that context, and not `windows-service`'s
+/// `register`, which frees its closure after the first `Stop`, is not covered here: it needs a real
+/// SCM.
 #[skuld::test]
 fn a_control_after_a_stop_still_reaches_the_bus() {
     let stop_bus = Arc::new(StopBus::new());
