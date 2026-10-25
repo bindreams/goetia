@@ -734,10 +734,17 @@ fn refusal(verdicts: Vec<String>) -> Result<()> {
 /// can see `--no-block` (`start` returns either way). `systemctl_tests.rs` asserts both argvs.
 fn verb_args<'a>(verb: &'a str, unit: &'a str, budget: Budget) -> Vec<&'a str> {
     if budget.waits() {
-        vec![verb, "--show-transaction", unit]
+        unit_args(&[verb, "--show-transaction"], unit)
     } else {
-        vec![verb, "--no-block", "--show-transaction", unit]
+        unit_args(&[verb, "--no-block", "--show-transaction"], unit)
     }
+}
+
+/// `head`, then `--`, then `unit`. An id may start with `-`, and `systemctl` reads such a unit name
+/// as an option unless `--` precedes it. Every `systemctl` call that names a unit builds its argv
+/// with this.
+pub(super) fn unit_args<'a>(head: &[&'a str], unit: &'a str) -> Vec<&'a str> {
+    head.iter().copied().chain(["--", unit]).collect()
 }
 
 /// Whether `systemctl --show-transaction`'s stderr says systemd has answered the request with a
@@ -929,6 +936,68 @@ pub(super) fn stop_impl(id: &str, budget: Budget, deadline: Deadline) -> Result<
     }
 }
 
+/// `systemctl kill` of `unit`'s main process with `SIGKILL`, and nothing else of it: not the control
+/// process, not the rest of the cgroup, which systemd cleans up when the main process is gone.
+///
+/// `--kill-who`, not `--kill-whom`: 245 and older do not know the second (MEASURED, 245), and the
+/// first is still accepted by 255 and 257. `main-fail` rather than `main`: `main` exits `0` having
+/// signalled nobody when there is no main process (MEASURED, 245 and 255), where `main-fail` fails
+/// with the answer [`no_process`] reads.
+const KILL_ARGS: [&str; 3] = ["kill", "--kill-who=main-fail", "--signal=SIGKILL"];
+
+/// Whether `stderr` is systemd saying `unit` has no process to signal, word for word (MEASURED, 245
+/// and 255, exit `1` both): it is not loaded, which is what an inactive unit is once nothing holds
+/// it, or it is loaded and its main process is gone. Read off the kill's own answer, so no state
+/// read before it can race the kill.
+fn no_process(stderr: &str, unit: &str) -> bool {
+    stderr.contains(&format!("Unit {unit} not loaded.")) || stderr.contains("No main process to kill")
+}
+
+/// `Ok` means the signal was delivered: systemd sends it before it answers, and goetia does not wait
+/// for the process to be gone.
+pub(super) fn kill_impl(id: &str) -> Result<()> {
+    let unit = super::unit_name(id);
+    let output = run_systemctl(&unit_args(&KILL_ARGS, &unit))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if no_process(&stderr, &unit) {
+        return Err(Error::NotRunning { id: id.to_string() });
+    }
+    Err(failed(
+        "kill",
+        &unit,
+        &Capture {
+            stdout: output.stdout,
+            stderr: output.stderr,
+            complete: true,
+        },
+    ))
+}
+
+/// `systemctl enable` for `id`'s unit; a failure carries systemd's words.
+pub(super) fn enable_impl(id: &str) -> Result<()> {
+    unit_file_verb("enable", id)
+}
+
+/// `systemctl disable` for `id`'s unit, as [`enable_impl`]: `Systemd::disable` and `uninstall` both.
+pub(super) fn disable_impl(id: &str) -> Result<()> {
+    unit_file_verb("disable", id)
+}
+
+fn unit_file_verb(verb: &str, id: &str) -> Result<()> {
+    let unit = super::unit_name(id);
+    let output = run_systemctl(&unit_args(&[verb], &unit))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(Error::Other(format!(
+        "systemctl {verb} {unit} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    )))
+}
+
 /// `systemctl restart --no-block`: one job, where a stop and a separate start leave a window in
 /// which the start replaces the stop. It stops the unit and then starts it — unless the unit is
 /// still activating, when systemd folds the restart into the start job already running: nothing is
@@ -948,7 +1017,7 @@ pub(super) fn request_restart_impl(id: &str) -> Result<()> {
 /// is no answer, and never the state its absence would default to.
 fn show_properties(unit: &str, props: &[&str]) -> Result<BTreeMap<String, String>> {
     let joined = props.join(",");
-    let output = systemctl(Purpose::Read, &["show", "--property", &joined, unit])?;
+    let output = systemctl(Purpose::Read, &unit_args(&["show", "--property", &joined], unit))?;
     if !output.status.success() {
         return Err(Error::Other(format!(
             "systemctl show {unit} failed: {}",

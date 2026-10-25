@@ -184,6 +184,75 @@ fn start_stop_status_reflect_reality() {
     assert_eq!(status.state, State::Stopped);
 }
 
+// kill ================================================================================================================
+
+/// The fixture as a daemon that reports in on every start, under `restart`. `on-failure`, not
+/// `always`: SCM's recovery actions are what restart a service whose process was terminated.
+fn reporting(id: &str, restart: Restart, started: &ConnectBack, stopped: &ConnectBack) -> DaemonSpec {
+    common::mk_spec_full(
+        id,
+        fixture_command(id, started.port(), stopped.port(), "plain"),
+        BTreeMap::new(),
+        User::Root,
+        restart,
+        Some(Duration::from_secs(1)),
+    )
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_killed_on_failure_daemon_comes_back_with_a_new_pid() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let (started, stopped) = (ConnectBack::listen(), ConnectBack::listen());
+    let spec = reporting(&id, Restart::OnFailure, &started, &stopped);
+    mgr.install(&spec, false).expect("install");
+
+    support::kill::a_killed_daemon_comes_back_with_a_new_pid(&mgr, &spec.id, &started);
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_killed_never_restart_daemon_stays_down() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let (started, stopped) = (ConnectBack::listen(), ConnectBack::listen());
+    let spec = reporting(&id, Restart::Never, &started, &stopped);
+    mgr.install(&spec, false).expect("install");
+
+    support::kill::a_killed_daemon_that_never_restarts_stays_down(&mgr, &spec.id, &started, &|| {
+        let scm = WinServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).expect("open SCM");
+        let service = scm
+            .open_service(&id, ServiceAccess::QUERY_CONFIG)
+            .expect("open the service to read its failure actions");
+        let configured = service.get_failure_actions().expect("failure actions");
+        assert!(
+            configured.actions.is_none_or(|actions| actions.is_empty()),
+            "the service has failure actions configured"
+        );
+    });
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn killing_a_stopped_service_is_not_running() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let (started, stopped) = (ConnectBack::listen(), ConnectBack::listen());
+    let spec = reporting(&id, Restart::Never, &started, &stopped);
+    mgr.install(&spec, false).expect("install");
+    let get_manager =
+        || -> goetia::Result<Box<dyn goetia::manager::ServiceManager>> { Ok(Box::new(ScmManager::new())) };
+
+    support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.id);
+
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    started.accept("the fixture to report SERVICE_RUNNING");
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    stopped.accept("the fixture to handle SERVICE_CONTROL_STOP");
+    support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.id);
+}
+
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn uninstall_leaves_nothing() {
     let mgr = ScmManager::new();

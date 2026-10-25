@@ -44,7 +44,7 @@ under neither prefix is passed through as it arrived. `install` always
 reaches it; the other verbs only for a daemon of goetia's, and they answer
 from files alone otherwise:
 
-- `uninstall`, `start`, `stop`, `restart`, `enable` and `disable` refuse
+- `uninstall`, `start`, `stop`, `kill`, `restart`, `enable` and `disable` refuse
   an id goetia finds its own, and answer any other as anywhere else — for
   one with nothing installed, `uninstall` exits `0`, "nothing to do", and
   the others `1`, "not installed".
@@ -748,6 +748,35 @@ refused — for a `type: simple` daemon almost always, since its service reads
 `4`. To restart a daemon on Windows, let `restart` wait for the stop: leave
 `--timeout` at its default, or give it a duration other than `0`.
 
+## Killing a daemon
+
+`goetia daemon kill <ID...>` ends each daemon's running process as a failure,
+and returns once that is delivered. It does not wait for the process to be
+gone, takes no `--timeout`, and does not change boot-enablement. What follows
+is the daemon's `restart` policy: an `always` or `on-failure` daemon comes
+back, a `never` one stays down. Like `stop`, it needs elevation, and `--json`
+is refused.
+
+It addresses the service, never a bare pid:
+
+| Platform | What it sends                                                                                                                                                                                                                           |
+| -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| systemd  | `SIGKILL` to the unit's main process alone (`systemctl kill --kill-who=main-fail`); systemd cleans up the rest of the cgroup.                                                                                                           |
+| launchd  | `launchctl kill SIGKILL system/<id>`.                                                                                                                                                                                                   |
+| Windows  | SCM has no kill-by-service call, so goetia terminates the service's process (exit code `1`), after confirming through SCM that it is still the service's. SCM sees an unexpected exit and applies the recovery actions, as for a crash. |
+
+On Windows with `type: simple` the service's process is `goetia-shim`; its Job
+Object ends the daemon and its descendants with it.
+
+On Windows a process that is already terminating (a second `kill`, or a daemon
+dying on its own) is waited for until it exits, with no time limit. When that
+wait begins goetia prints `<id>: process <pid> is already terminating; waiting
+for it to exit` to stderr; a process stuck in a driver request can keep it
+waiting.
+
+A daemon with no process, whether stopped or between runs, is an error: exit
+`1` and "is not running", because nothing was killed.
+
 ## Exit codes
 
 Two rules come before the numbers:
@@ -763,7 +792,7 @@ Two rules come before the numbers:
 | Code | Name          | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                        | Anchored to                                                                                               |
 | ---- | ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
 | `0`  | success       | The state is as asked, or the question was fully answered.                                                                                                                                                                                                                                                                                                                                                                                                     | —                                                                                                         |
-| `1`  | error         | An operation was attempted and failed, or was refused outright.                                                                                                                                                                                                                                                                                                                                                                                                | —                                                                                                         |
+| `1`  | error         | An operation was attempted and failed, or was refused outright. `kill` of a daemon with no process is this: nothing was killed.                                                                                                                                                                                                                                                                                                                                | —                                                                                                         |
 | `2`  | usage         | The command line was rejected before anything ran — by clap, or by one of `dispatch`'s refusals (`--json` on a subcommand that does not implement it; a wait flag on an `install` with no `--start`).                                                                                                                                                                                                                                                          | clap's own default: the same code bash and argparse use for "the parser, not the program, rejected this". |
 | `3`  | drift         | A determinate "installed state differs from the manifest" answer. Only `diff` returns it.                                                                                                                                                                                                                                                                                                                                                                      | Nothing; app-specific.                                                                                    |
 | `4`  | indeterminate | A question goetia could not answer about an id: its state, whether it is occupied at all, or the outcome of a request goetia did not wait out — it stopped waiting, never waited, or lost track of it — or whether a request reached the manager at all, when goetia lost the tool carrying it after it may have started; or, on launchd, which definition a job loaded during `install` holds, or what took a plist's place after `install` booted out a job. | The LSB init-script convention's "service status unknown".                                                |
@@ -817,7 +846,7 @@ outranks `3`. A script that branches on `3` as "is there drift" silently
 skips the conflicting daemon.
 
 **Id verbs.** `uninstall` alone treats an already-absent artifact as
-success; the other five keep it as a plain failure.
+success; the other six keep it as a plain failure.
 
 "Absent" means the **id** is empty, not that one file is missing. A systemd
 unit whose fragment is gone but which still has a `<id>.service.d/*.conf`
@@ -843,15 +872,15 @@ deliberately aimed at a goetia daemon through one of those directories is not
 reported; seeing it takes a "what will actually run here" check, which is a
 different question from drift.
 
-| Verb                         | Absent artifact | Why                                                                                                                            |
-| ---------------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `uninstall`                  | **0**           | Artifact absence is exactly what it asks for.                                                                                  |
-| `stop`                       | 1               | A running unit whose fragment was deleted keeps running, so `stop x && echo "confirmed down"` would print that with `x` alive. |
-| `disable`                    | 1               | Disabling after the fragment is gone is impossible, leaving a dangling `.wants` symlink: exit 0 while still enabled at boot.   |
-| `start`, `restart`, `enable` | 1               | Cannot act on what is not there.                                                                                               |
+| Verb                                 | Absent artifact | Why                                                                                                                            |
+| ------------------------------------ | --------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `uninstall`                          | **0**           | Artifact absence is exactly what it asks for.                                                                                  |
+| `stop`                               | 1               | A running unit whose fragment was deleted keeps running, so `stop x && echo "confirmed down"` would print that with `x` alive. |
+| `disable`                            | 1               | Disabling after the fragment is gone is impossible, leaving a dangling `.wants` symlink: exit 0 while still enabled at boot.   |
+| `start`, `restart`, `enable`, `kill` | 1               | Cannot act on what is not there.                                                                                               |
 
 That table is about an absence goetia **established**. An id whose absence
-it could not establish is `4` for all six verbs, `uninstall` included: what
+it could not establish is `4` for all seven verbs, `uninstall` included: what
 is at the id was not learned, which is one condition with one remedy for
 every one of them. That is not always all that happened: a `restart` whose
 start leg meets such an id has already issued its stop, and says so.
@@ -867,7 +896,7 @@ claims no ownership in the second case, and does not suggest uninstalling.
 
 Where each verb surfaces it: `status <id>` as that id's own `undetermined`
 kind; `list` and `status` with no ids in the document's
-[third key](#undetermined); `diff`, `show`, `install` and all six id verbs
+[third key](#undetermined); `diff`, `show`, `install` and all seven id verbs
 on stderr, having no `--json` document. Which verb returns which code for
 which outcome is `dispatch`'s doc comment in `src/cli.rs` — the one place
 the vocabulary is written down, and the authority this chapter summarises.

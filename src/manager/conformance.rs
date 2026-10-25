@@ -123,6 +123,7 @@ pub fn run(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
     start_and_stop_are_idempotent(mgr, mk, &mut cleanup.ids);
     starting_with_no_budget_is_accepted_and_establishes_nothing(mgr, mk, &mut cleanup.ids);
     a_start_request_after_a_confirmed_stop_is_accepted(mgr, mk, &mut cleanup.ids);
+    kill_of_a_service_that_is_not_running_says_so(mgr, mk, &mut cleanup.ids);
     list_and_status_agree_on_pid(mgr, mk, &mut cleanup.ids);
     refuses_foreign_even_with_force(mgr, mk);
     foreign_refuses_every_verb(mgr, mk);
@@ -268,6 +269,11 @@ fn foreign_refuses_every_verb(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> Dae
         mgr.request_start_after_stop(&spec.id).is_err(),
         "request_start_after_stop must refuse a foreign id"
     );
+    let killed = mgr.kill(&spec.id);
+    assert!(
+        matches!(&killed, Err(Error::Foreign { id, .. }) if id == spec.id.as_str()),
+        "kill must refuse a foreign id as Foreign, not as NotRunning or anything else: {killed:?}"
+    );
     assert!(
         mgr.request_restart(&spec.id).is_none_or(|r| r.is_err()),
         "request_restart must refuse a foreign id"
@@ -345,6 +351,32 @@ fn start_and_stop_are_idempotent(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> 
 
     mgr.stop(&spec.id, Budget::DEFAULT)
         .expect("stop on an already-stopped service must be Ok, not an error");
+}
+
+/// `kill` of a service with no process answers [`Error::NotRunning`] on every backend, both when
+/// never started and when started then stopped.
+fn kill_of_a_service_that_is_not_running_says_so(
+    mgr: &dyn ServiceManager,
+    mk: &dyn Fn(&str) -> DaemonSpec,
+    cleanup: &mut Vec<Id>,
+) {
+    let spec = mk(&fresh_id("kill-not-running"));
+    mgr.install(&spec, false).expect("install");
+    cleanup.push(spec.id.clone());
+
+    let never_started = mgr.kill(&spec.id);
+    assert!(
+        matches!(&never_started, Err(Error::NotRunning { id }) if id == spec.id.as_str()),
+        "kill of a never-started service must be NotRunning, got {never_started:?}"
+    );
+
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    let stopped = mgr.kill(&spec.id);
+    assert!(
+        matches!(&stopped, Err(Error::NotRunning { id }) if id == spec.id.as_str()),
+        "kill of a stopped service must be NotRunning, got {stopped:?}"
+    );
 }
 
 /// `Budget::Immediate` issues the request and returns, establishing nothing
@@ -542,6 +574,7 @@ pub fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, m
         ("disable", mgr.disable(id)),
         ("start", mgr.start(id, Budget::DEFAULT)),
         ("stop", mgr.stop(id, Budget::DEFAULT)),
+        ("kill", mgr.kill(id)),
     ]
     .into_iter()
     .chain(mgr.request_restart(id).map(|result| ("request_restart", result)))
