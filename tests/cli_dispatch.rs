@@ -220,6 +220,9 @@ struct FlakyManager {
     /// no `install`-path fixture has, so injecting it is the only way to
     /// put it in front of `run_id_verb` and `install`'s own classifier.
     wait_timeout_start_for: Option<String>,
+    /// `stop` finds a restart queued by SCM's recovery actions and refuses it, whatever the budget.
+    /// Exit `4`, like an expiry, and a different condition.
+    restart_pending_stop_for: Option<String>,
     /// Makes `install`/`preview_install` return the `Conflict` flavour whose
     /// cause lies outside the directory the backend writes — systemd's
     /// `<id>.service.d` under `/usr/lib` or `.control`. `Fake` has no
@@ -331,6 +334,9 @@ impl ServiceManager for FlakyManager {
         self.inner.request_start_after_stop(id)
     }
     fn stop(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
+        if self.restart_pending_stop_for.as_deref() == Some(id.as_str()) {
+            return Err(goetia::manager::budget::restart_pending(id.as_str()));
+        }
         self.inner.stop(id, budget)
     }
     fn kill(&self, id: &Id) -> goetia::Result<()> {
@@ -3221,6 +3227,50 @@ fn stop_that_times_out_exits_4() {
 
     assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
     assert!(err.contains("did not report stopped"), "{err}");
+}
+
+/// A restart SCM has queued is neither a failure (`1`) nor a success: the stop could not settle it.
+#[skuld::test]
+fn stop_that_meets_a_pending_restart_exits_4_under_every_budget() {
+    for flags in [&["--timeout", "0"][..], &["--timeout", "5s"][..], &["--no-timeout"][..]] {
+        let inner = Fake::new();
+        inner.install(&mk("frpc"), false).unwrap();
+        let mgr = FlakyManager {
+            inner,
+            restart_pending_stop_for: Some("frpc".to_string()),
+            ..Default::default()
+        };
+        let mut argv = vec!["goetia", "daemon", "stop", "frpc"];
+        argv.extend_from_slice(flags);
+
+        let (code, out, err) = dispatch_with(&argv, &mgr, &|| true);
+
+        assert_eq!(code, 4, "{flags:?}\nstdout:\n{out}\nstderr:\n{err}");
+        assert!(err.contains("restart queued"), "{flags:?}: {err}");
+        assert!(!out.contains("stopped"), "{flags:?}: {out}");
+    }
+}
+
+/// `restart` does not start into a stop that found a restart pending, and says so.
+#[skuld::test]
+fn restart_whose_stop_leg_meets_a_pending_restart_exits_4_and_starts_nothing() {
+    let inner = Fake::new();
+    inner.install(&mk("frpc"), false).unwrap();
+    let mgr = FlakyManager {
+        inner,
+        restart_pending_stop_for: Some("frpc".to_string()),
+        ..Default::default()
+    };
+
+    let (code, out, err) = dispatch_with(
+        &["goetia", "daemon", "restart", "frpc", "--timeout", "5s"],
+        &mgr,
+        &|| true,
+    );
+
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.contains("no start was issued"), "{err}");
+    assert!(!out.contains("restarted"), "{out}");
 }
 
 /// `cli::restart` re-wraps its start leg's error variant by variant. A flattened `WaitTimeout`

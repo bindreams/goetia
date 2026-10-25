@@ -309,6 +309,79 @@ fn a_commanded_stop_reports_win32_zero() {
     );
 }
 
+// A stop that meets a restart SCM has queued ==========================================================================
+
+/// Installs an `on-failure` daemon that exits 7 once the test closes its connection, starts it, and
+/// returns once the shim has reported the failure and gone, so SCM holds a `STOPPED` with a
+/// non-zero code and a restart queued after `restart_delay`. The listener sees every run.
+fn fail_once(mgr: &ScmManager, id: &str, restart_delay: Duration) -> (ConnectBack, DaemonSpec) {
+    let reported = ConnectBack::listen();
+    let spec = on_failure(
+        id,
+        fixture_command("exit-on-close", &[&reported.port().to_string(), "7"]),
+        Some(restart_delay),
+    );
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    let stream = reported.accept_stream("the first run to connect and wait for the test to close its end");
+    let shim = ShimProcess::attach(id);
+
+    drop(stream);
+    shim.wait_for_exit();
+    (reported, spec)
+}
+
+/// `stop` refuses a pending restart at once, under every budget (`--no-timeout` included): nothing
+/// cancels it, so there is nothing to wait for. The delay is an hour, so the restart cannot fire
+/// during the test and the record read below is the first failure's.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_stop_during_the_restart_delay_is_refused_under_every_budget() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let (_reported, spec) = fail_once(&mgr, &id, Duration::from_secs(3600));
+    let failed = RecordedExit {
+        win32: ERROR_SERVICE_SPECIFIC_ERROR,
+        specific: 7,
+    };
+    assert_eq!(recorded_exit(&id), failed, "the daemon's failure is what SCM holds");
+
+    for budget in [
+        Budget::Immediate,
+        Budget::Bounded(Duration::from_secs(1)),
+        Budget::Unbounded,
+    ] {
+        let e = mgr
+            .stop(&spec.id, budget)
+            .expect_err("a stop cannot cancel a pending restart");
+        assert!(matches!(e, goetia::Error::RestartPending { .. }), "{budget:?}: {e:?}");
+        // Nothing was commanded: the record is still the daemon's failure.
+        assert_eq!(recorded_exit(&id), failed, "{budget:?}");
+    }
+}
+
+/// `uninstall` does not wait for a queued restart: deleting the service cancels it. The delay is an
+/// hour, so a stop that waited for the restart would not return, and the service would not be gone.
+/// After the uninstall returns, `sc` finds no record (1060, `ERROR_SERVICE_DOES_NOT_EXIST`), so the
+/// restart has nothing to start.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn uninstall_during_the_restart_delay_deletes_the_service_without_waiting_for_the_restart() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let (_reported, spec) = fail_once(&mgr, &id, Duration::from_secs(3600));
+    let failed = RecordedExit {
+        win32: ERROR_SERVICE_SPECIFIC_ERROR,
+        specific: 7,
+    };
+    assert_eq!(recorded_exit(&id), failed, "the daemon's failure is what SCM holds");
+
+    mgr.uninstall(&spec.id).expect("uninstall");
+
+    let query = support::cmd::run("sc.exe", &["query", &id]);
+    assert_eq!(query.code, Some(1060), "the service should no longer exist:\n{query}");
+}
+
 // Services registered by an earlier version ===========================================================================
 
 fn parameters_key(id: &str) -> winreg::RegKey {
