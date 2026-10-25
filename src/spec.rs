@@ -144,7 +144,7 @@ pub struct DaemonSpec {
 /// unresolved placeholder, before interpolation gets a chance to run.
 ///
 /// `resolve` refuses `Always` for scm, whose recovery actions never fire after a
-/// clean exit. It survives for scm only in blobs installed by 0.1.0.
+/// clean exit. It survives for scm only in blobs installed before that refusal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Restart {
     Never,

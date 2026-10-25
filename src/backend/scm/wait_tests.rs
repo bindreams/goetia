@@ -409,6 +409,32 @@ fn a_failed_scm_recovery_start_that_a_start_joined_is_a_failed_start() {
 }
 
 /// The same `(0, 0)` with no wait hint is the shim's clean report: the daemon ran and ended.
+/// A start SCM accepted is ours, so the same `(0, 0)` and wait hint is not SCM's failed attempt.
+#[skuld::test]
+fn a_stopped_with_a_wait_hint_after_an_accepted_start_is_a_started_service() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_by_scm_with_wait_hint(2000);
+
+    assert_eq!(
+        start_via_notify(&mut fake, unbounded(), Kind::Simple, Kind::Simple).unwrap(),
+        Waited::Confirmed
+    );
+}
+
+/// The shim's own report of a daemon's exit is not `(0, 0)`, so a leftover wait hint does not make
+/// it a failed start.
+#[skuld::test]
+fn a_daemon_exit_record_with_a_wait_hint_that_a_start_joined_is_a_started_service() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)])
+        .already_running(QueriedState::StartPending)
+        .stopped_after(Reported::from_daemon_code(7));
+    fake.wait_hint = 2000;
+
+    assert_eq!(
+        start_via_notify(&mut fake, unbounded(), Kind::Simple, Kind::Simple).unwrap(),
+        Waited::Confirmed
+    );
+}
+
 #[skuld::test]
 fn a_clean_daemon_exit_that_a_start_joined_is_still_a_started_service() {
     let mut fake = FakeScm::new([Some(Observed::Stopped)])

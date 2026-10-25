@@ -499,9 +499,8 @@ fn shim_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("goetia-shim.exe"))
 }
 
-/// `resolve` refuses `restart: always` for scm, but `generate` still accepts it
-/// to regenerate blobs installed by 0.1.0; a spec that did not come from
-/// `resolve` must not install with on-failure semantics.
+/// `generate` still accepts `restart: always` so that blobs installed before `resolve` refused it
+/// regenerate; a spec that did not come from `resolve` must not install with on-failure semantics.
 fn refuse_always(spec: &DaemonSpec) -> Result<()> {
     if spec.restart == Restart::Always {
         return Err(Error::Invalid {

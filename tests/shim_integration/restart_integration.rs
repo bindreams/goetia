@@ -14,7 +14,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use goetia::backend::scm::exit_status::{ERROR_SERVICE_SPECIFIC_ERROR, RecordedExit};
 use goetia::backend::scm::manager::ScmManager;
 use goetia::decide::Outcome;
-use goetia::manager::{Budget, ServiceManager as _};
+use goetia::manager::{Budget, Installed, ServiceManager as _, State, Step};
 use goetia::spec::{DaemonSpec, Restart};
 use windows_service::service::{ServiceExitCode, ServiceState};
 
@@ -169,8 +169,9 @@ fn on_failure_restarts_are_paced_new_shims() {
 // What is reported ====================================================================================================
 
 /// Runs `exit-on-close` under `restart: never` (so SCM does nothing after the report), lets the
-/// daemon exit with `child_code`, and returns the exit code SCM recorded once the shim is gone.
-fn recorded_exit_code(child_code: i32) -> ServiceExitCode {
+/// daemon exit with `child_code`, and returns the exit codes SCM recorded once the shim is gone:
+/// the `ServiceExitCode` view and both raw codes of `sc query`.
+fn exit_records(child_code: i32) -> (ServiceExitCode, RecordedExit) {
     let reported = ConnectBack::listen();
     let mgr = ScmManager::new();
     let id = support::random_test_id();
@@ -198,7 +199,11 @@ fn recorded_exit_code(child_code: i32) -> ServiceExitCode {
 
     let stopped = scm_status(&id);
     assert_eq!(stopped.current_state, ServiceState::Stopped, "{stopped:?}");
-    stopped.exit_code
+    (stopped.exit_code, recorded_exit(&id))
+}
+
+fn recorded_exit_code(child_code: i32) -> ServiceExitCode {
+    exit_records(child_code).0
 }
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -211,6 +216,24 @@ fn a_clean_daemon_exit_is_recorded_as_win32_zero() {
 fn a_daemon_exit_code_is_recorded_as_service_specific_whatever_its_value() {
     assert_eq!(recorded_exit_code(3), ServiceExitCode::ServiceSpecific(3));
     assert_eq!(recorded_exit_code(7), ServiceExitCode::ServiceSpecific(7));
+}
+
+/// A daemon's code is service-specific whatever its value: an NTSTATUS with the high bit set round
+/// trips, and 1003 from a daemon is `(1066, 1003)`, never the incomplete-stop pair `(0, 1003)`.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_daemon_exit_code_round_trips_through_the_recorded_pair() {
+    for code in [0xC000_0005_u32 as i32, 1003] {
+        let (_, recorded) = exit_records(code);
+
+        assert_eq!(
+            recorded,
+            RecordedExit {
+                win32: ERROR_SERVICE_SPECIFIC_ERROR,
+                specific: code as u32
+            },
+            "daemon exit {code}"
+        );
+    }
 }
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -235,8 +258,10 @@ fn a_daemon_that_cannot_be_spawned_fails_start_under_every_policy() {
         );
         mgr.install(&spec, false).expect("install");
 
-        mgr.start(&spec.id, Budget::DEFAULT)
+        let err = mgr
+            .start(&spec.id, Budget::DEFAULT)
             .expect_err("a daemon that cannot be spawned must fail the start");
+        assert!(err.to_string().contains("failed start"), "{restart:?}: {err}");
 
         let status = scm_status(&id);
         assert_eq!(status.current_state, ServiceState::Stopped, "{restart:?}: {status:?}");
@@ -448,8 +473,9 @@ fn a_new_shim_runs_a_service_registered_by_an_earlier_version() {
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
 }
 
-/// A service installed by 0.1.0 under `restart: always` keeps a blob that says so. Only `install`
-/// refuses `always` for scm, so the service must stay operable.
+/// A service installed before `resolve` refused `restart: always` keeps a blob that says so. Only
+/// `install` refuses `always` for scm, so the service must stay operable: started, listed, queried,
+/// restarted, stopped and uninstalled.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled() {
     let mgr = ScmManager::new();
@@ -467,6 +493,25 @@ fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled
 
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     reported.accept("the daemon of a service whose blob says always to report in");
+
+    let status = mgr.status(&spec.id).expect("status");
+    assert_eq!(status.state, State::Running, "{status:?}");
+    let listed = mgr.list().expect("list");
+    assert!(
+        listed
+            .iter()
+            .any(|entry| matches!(entry, Installed::Ours { spec: s, .. } if s.id == spec.id)),
+        "the service is missing from `list`, or listed as unreadable: {listed:?}"
+    );
+
+    // The same steps `daemon restart` runs.
+    let _prepared = mgr
+        .prepare(&[Step::Stop, Step::Start], Budget::DEFAULT)
+        .expect("prepare a restart");
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop for the restart");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start for the restart");
+    reported.accept("the daemon of the restarted service to report in");
+
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
     mgr.uninstall(&spec.id).expect("uninstall");
 

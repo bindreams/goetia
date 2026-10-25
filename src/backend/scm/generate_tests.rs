@@ -787,7 +787,7 @@ fn managed_kind_restart_always_renders_as_on_failure() {
     let mut on_failure = build(&on_failure);
     assert!(
         always.failure_actions.is_some(),
-        "0.1.0 registered recovery actions for `always`"
+        "`always` keeps on-failure's recovery actions"
     );
     always.parameters.clear();
     on_failure.parameters.clear();

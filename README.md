@@ -819,6 +819,11 @@ state or process has changed since it last looked. That second look is not a
 wait, so it happens even when `--timeout` has run out; after that, one more look
 at most, and a service that is still changing is reported as timed out.
 
+The same holds when the shim's own wait on the command fails: it kills the command
+and reports a shim failure, restarted under `on-failure`, only once it has
+confirmed the command and its descendants gone. When it cannot confirm that, it
+reports `0`, `1003` as for a `stop` it could not complete.
+
 ### What returning means
 
 The platform's service manager reports the service as running, as far as it
