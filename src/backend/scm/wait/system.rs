@@ -44,6 +44,7 @@ struct LastStatus {
     current_state: AtomicU32,
     exit_win32: AtomicU32,
     exit_specific: AtomicU32,
+    wait_hint: AtomicU32,
     fired: AtomicBool,
 }
 
@@ -88,6 +89,7 @@ unsafe extern "system" fn notify_callback(pparameter: *const c_void) {
         (*slot)
             .exit_specific
             .store(status.dwServiceSpecificExitCode, Ordering::Release);
+        (*slot).wait_hint.store(status.dwWaitHint, Ordering::Release);
         (*slot).current_state.store(state, Ordering::Release);
         (*slot).fired.store(true, Ordering::Release);
     }
@@ -189,6 +191,7 @@ impl SystemScmActor {
                 current_state: AtomicU32::new(0),
                 exit_win32: AtomicU32::new(0),
                 exit_specific: AtomicU32::new(0),
+                wait_hint: AtomicU32::new(0),
                 fired: AtomicBool::new(false),
             }),
             notify: Box::default(),
@@ -461,5 +464,9 @@ impl super::ScmActor for SystemScmActor {
                 .get_failure_actions_on_non_crash_failures()
                 .map_err(to_io_error)?,
         })
+    }
+
+    fn stopped_wait_hint(&self) -> u32 {
+        self.status.wait_hint.load(Ordering::Acquire)
     }
 }

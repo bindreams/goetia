@@ -727,10 +727,14 @@ clean exit is never restarted, and a stop reports a clean exit.
 
 Nothing cancels a restart SCM has queued, so `goetia daemon stop` refuses one
 instead of waiting for it: a command that failed and is waiting out
-`restart-delay`, or one that fails as the stop arrives. `stop` exits `4`, says
-that SCM is starting the daemon or has a restart queued that goetia cannot
-cancel, and that goetia did not stop it. That holds under every `--timeout`,
-`--no-timeout` included. Run `stop` again once the daemon is back, or
+`restart-delay`, or one that fails as the stop arrives. When a command fails
+just as a `stop` arrives, what the shim reports decides it: if the stop request
+has reached the shim by the time it reports the exit, it reports a clean stop,
+which SCM does not restart and `stop` accepts; otherwise it reports the failure
+and `stop` refuses as below. A refusing `stop` exits `4`, says that SCM is
+starting the daemon or has a restart queued that goetia cannot cancel, and that
+goetia did not stop it. That holds under every `--timeout`, `--no-timeout`
+included. Run `stop` again once the daemon is back, or
 `uninstall` it. `restart` refuses at its stop the same way and does not start
 the daemon. A service that is starting refuses a stop, so a `stop` that arrives
 as a restart begins waits, within `--timeout`, for the daemon to be running and
@@ -832,7 +836,9 @@ confirms differs:
   cannot start is a failed start under every `restart:` policy. A command that
   starts and then exits at once is a successful start, whatever its exit code,
   as with `systemctl start`; it is the command's exit, not `start`, that
-  reports it. For a `type: managed` daemon, which speaks to SCM itself, a
+  reports it. A `start` that lands as SCM is restarting the command, and that
+  restart fails (a missing `goetia-shim` or a broken account), is a failed start.
+  For a `type: managed` daemon, which speaks to SCM itself, a
   service that stops before it reports running is a failed start.
 - **launchd** sits between the two: the pid `launchctl kickstart -p` reports
   is launchd's own fork, taken before the user process reaches its `exec`.

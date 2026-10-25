@@ -18,6 +18,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use cosca::Child;
 
 use crate::logging;
+use crate::service::os_error_of;
 
 #[derive(Default)]
 struct Gate {
@@ -26,6 +27,9 @@ struct Gate {
     /// wait, so a stale completion from a *previous* child can never be
     /// misread as the current one's.
     child_done: bool,
+    /// Set by the waiter when its `child.wait()` failed: the OS error code, if the failure has one.
+    /// `Some` means the daemon's fate is unknown and nothing else is watching it.
+    wait_failure: Option<Option<i32>>,
 }
 
 pub struct StopBus {
@@ -35,6 +39,12 @@ pub struct StopBus {
 
 pub enum WaitOutcome {
     ChildExited,
+    /// The waiter's `child.wait()` failed, so whether the daemon ended is unknown. The daemon was
+    /// torn down as for a stop and is dead and reaped; `os_error` is the failure's OS error code.
+    /// When the teardown failed too the outcome is [`WaitOutcome::StoppingUnkillable`] instead.
+    WaitFailed {
+        os_error: Option<i32>,
+    },
     /// A stop was requested, and the daemon is dead and reaped: the tree, or
     /// (if `kill_tree` failed) at least the direct child.
     Stopping,
@@ -103,20 +113,20 @@ impl Waiter {
                 };
                 // Notified on *both* `Ok` and `Err`: an `Err` here means the
                 // wait mechanism itself failed, which says nothing about
-                // whether the child is still running — it is not evidence
-                // to keep waiting on, and staying silent would leave
-                // `wait_for_child_or_stop`'s `Condvar::wait_while` with no
-                // further waker at all in the (ordinary, no-stop-requested)
-                // case, hanging the service thread forever on a child that
-                // may already be gone.
+                // whether the child is still running. Staying silent would
+                // leave `wait_for_child_or_stop`'s `Condvar::wait_while` with
+                // no further waker at all in the (ordinary, no-stop-requested)
+                // case, so the failure is recorded for that call to act on.
                 #[cfg(test)]
                 let waited = test_hook::wait(waiting).and_then(|()| child.wait());
                 #[cfg(not(test))]
                 let waited = child.wait();
-                if let Err(e) = waited {
+                let failure = waited.err().map(|e| {
                     logging::log_failure(&id, &wait_failed(&e));
-                }
+                    os_error_of(&e)
+                });
                 let mut g = bus.state.lock().expect("StopBus mutex poisoned");
+                g.wait_failure = failure;
                 g.child_done = true;
                 bus.cvar.notify_all();
             })?;
@@ -286,6 +296,7 @@ impl StopBus {
         {
             let mut g = self.state.lock().expect("StopBus mutex poisoned");
             g.child_done = false;
+            g.wait_failure = None;
         }
         // After the reset, never before it: the waiter is parked until this
         // call, so nothing can report *this* child done until it is handed
@@ -296,7 +307,8 @@ impl StopBus {
             .cvar
             .wait_while(g, |g| !g.stopping && !g.child_done)
             .expect("StopBus mutex poisoned");
-        let outcome = if g.stopping {
+        let wait_failure = g.wait_failure;
+        let outcome = if g.stopping || wait_failure.is_some() {
             // Release the lock before calling into `child` — `kill_tree`/
             // `kill` need it not, and holding it across a kernel call would
             // block `is_stopping()`/`request_stop()` callers (e.g. a
@@ -310,7 +322,11 @@ impl StopBus {
                 // return value does not mean "reaped".
                 return WaitOutcome::StoppingUnkillable;
             }
-            WaitOutcome::Stopping
+            match wait_failure {
+                // A stop requested at the same time wins, as it does over an exit.
+                Some(os_error) if !self.is_stopping() => WaitOutcome::WaitFailed { os_error },
+                _ => WaitOutcome::Stopping,
+            }
         } else {
             drop(g);
             WaitOutcome::ChildExited

@@ -528,6 +528,11 @@ impl ScmActor for Scm {
         self.last_stopped
     }
 
+    /// Only `start_via_notify` reads the hint, and no stop path starts the service.
+    fn stopped_wait_hint(&self) -> u32 {
+        0
+    }
+
     fn query_status(&mut self) -> io::Result<QueriedStatus> {
         self.count_call()?;
         self.known = Known::Is(self.state);

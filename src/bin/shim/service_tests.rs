@@ -526,6 +526,13 @@ fn an_earlier_registration_under_always_also_names_the_manifest_change() {
 }
 
 #[skuld::test]
+fn a_registration_by_released_0_1_0_warns_under_this_build() {
+    let notice = version_skew_notice(&spec_restarting(Restart::OnFailure), "0.1.0", goetia::version());
+
+    assert!(notice.is_some(), "a service registered by 0.1.0 must get the warning");
+}
+
+#[skuld::test]
 fn no_notice_for_a_daemon_that_is_never_restarted() {
     assert_eq!(
         version_skew_notice(&spec_restarting(Restart::Never), "0.1.0", "0.2.0"),
