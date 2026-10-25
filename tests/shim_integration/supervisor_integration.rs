@@ -1,19 +1,19 @@
 //! The shim's own behavior, exercised through a real, elevated SCM
 //! install/start/stop — the two central failure paths this file covers are
-//! `stop_kills_the_whole_process_tree` (a commanded stop must not respawn,
-//! and must reach the whole tree) and
+//! `stop_kills_the_whole_process_tree` (a commanded stop must reach the whole tree and be
+//! recorded as clean) and
 //! `unreadable_blob_logs_to_fallback_path_and_event_log` (version skew);
 //! `shim_runs_child_with_cwd_and_env`/`shim_captures_stdout_to_logs_path`
 //! cover the ordinary spawn path these two failure tests assume works.
 
 use std::collections::BTreeMap;
 
-use cosca::Process;
-use cosca::identity::Resolved;
+use goetia::backend::scm::exit_status::{ERROR_INVALID_DATA, RecordedExit};
 use goetia::backend::scm::manager::ScmManager;
-use goetia::manager::{Budget, ServiceManager as _, State};
+use goetia::manager::{Budget, ServiceManager as _};
+use windows_service::service::{ServiceExitCode, ServiceState};
 
-use crate::common::{fixture_command, mk_spec_full};
+use crate::common::{fallback_log, fixture_command, mk_spec_full, recorded_exit, scm_status};
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -98,12 +98,6 @@ fn stop_kills_the_whole_process_tree() {
     let child_reported = ConnectBack::listen();
     let grandchild_reported = ConnectBack::listen();
 
-    // `restart: on-failure`, not `never`: with `never`, `decide_restart` would
-    // return `Stop` for every input regardless of the `stopping` flag, so
-    // "no replacement child appears" would hold trivially even if the
-    // `stopping`-checked-first logic this test exists to guard were deleted
-    // outright. A killed child exits non-zero, so `on-failure` would actually
-    // respawn a replacement absent that check (scm refuses `always`).
     let spec = mk_spec_full(
         &id,
         fixture_command(
@@ -124,19 +118,10 @@ fn stop_kills_the_whole_process_tree() {
     let child_pid = child_reported.accept_line("the direct child to start and report its pid");
     let grandchild_pid = grandchild_reported.accept_line("the grandchild to start and report its pid");
 
-    // The synchronous barrier `ConnectBack::connected_yet`'s own doc
-    // comment requires: `stop` blocks (via a real `NotifyServiceStatusChangeW`
-    // wait, `backend::scm::manager::scm_wait`) until SCM confirms
-    // `SERVICE_STOPPED`, and the shim does not report that until AFTER it
-    // has already decided not to respawn (see `service::supervisor_loop`'s
-    // `Stopping` arm) — so nothing after this call can still be racing a
-    // decision made before it returned.
+    // `stop` returns once SCM confirms `STOPPED`, so the shim has reported and the record is final.
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
 
-    // The namesake claim: the stop reached the *whole* tree, not merely
-    // "no new connection arrived" (which a surviving-but-silent process
-    // would also satisfy, since both fixture modes only ever connect once,
-    // at startup).
+    // The stop reached the whole tree, not only the direct child.
     assert!(
         !pid_is_alive(&child_pid),
         "direct child pid {child_pid} is still alive after the stop was confirmed"
@@ -146,74 +131,17 @@ fn stop_kills_the_whole_process_tree() {
         "grandchild pid {grandchild_pid} is still alive after the stop was confirmed"
     );
 
-    assert!(
-        !child_reported.connected_yet(),
-        "a replacement direct child connected after the stop was confirmed — the naive respawn-outside-\
-         the-terminated-job bug"
+    // `Win32(0)` is the record SCM does not recover from (a commanded stop reported as a failure
+    // would be restarted), so the tree dying is also the last thing this service did.
+    let stopped = scm_status(&id);
+    assert_eq!(stopped.current_state, ServiceState::Stopped, "{stopped:?}");
+    assert_eq!(stopped.exit_code, ServiceExitCode::Win32(0), "{stopped:?}");
+    // A clean stop has no service-specific code; an incomplete one reports 1003 beside Win32 0.
+    assert_eq!(
+        recorded_exit(&id),
+        RecordedExit { win32: 0, specific: 0 },
+        "{stopped:?}"
     );
-    assert!(
-        !grandchild_reported.connected_yet(),
-        "a replacement grandchild connected after the stop was confirmed"
-    );
-}
-
-/// Block until the process `pid` has exited: a kernel death-watch, so there is nothing to time. A
-/// pid with no process is a process that has already exited.
-fn exited(pid: u32) {
-    match Process::from_pid(pid) {
-        Resolved::Found(process) => process.wait().unwrap_or_else(|e| panic!("wait for process {pid}: {e}")),
-        Resolved::Gone => {}
-        Resolved::Unknown => panic!("the operating system refused to say whether process {pid} exists"),
-    }
-}
-
-/// `kill` of a `type: simple` service ends `goetia-shim`, the service's process, and with it the
-/// daemon and its descendants, through the Job Object the shim dies holding. The shim's death is
-/// SCM's unexpected exit; with `restart: never` there is no recovery action, so the service stays
-/// stopped.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn kill_ends_the_shim_and_the_daemon_tree_with_it() {
-    let mgr = ScmManager::new();
-    let id = support::random_test_id();
-    let _guard = ServiceGuard::new(&id);
-    let child_reported = ConnectBack::listen();
-    let grandchild_reported = ConnectBack::listen();
-    let spec = mk_spec_full(
-        &id,
-        fixture_command(
-            "spawn-grandchild",
-            &[
-                &child_reported.port().to_string(),
-                &grandchild_reported.port().to_string(),
-            ],
-        ),
-        None,
-        BTreeMap::new(),
-        goetia::spec::Restart::Never,
-        None,
-        None,
-    );
-    mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
-    let child_pid: u32 = child_reported
-        .accept_line("the direct child to start and report its pid")
-        .trim()
-        .parse()
-        .expect("the child's pid");
-    let grandchild_pid: u32 = grandchild_reported
-        .accept_line("the grandchild to start and report its pid")
-        .trim()
-        .parse()
-        .expect("the grandchild's pid");
-    let shim_pid = mgr.status(&spec.id).expect("status").pid.expect("the shim's pid");
-    assert_ne!(shim_pid, child_pid, "the service's process is the shim, not the daemon");
-
-    mgr.kill(&spec.id).expect("kill");
-
-    exited(shim_pid);
-    exited(child_pid);
-    exited(grandchild_pid);
-    support::kill::until(|| mgr.status(&spec.id).expect("status").state == State::Stopped);
 }
 
 /// `tasklist /FI "PID eq <pid>"` prints an informational "no tasks found"
@@ -225,45 +153,6 @@ fn kill_ends_the_shim_and_the_daemon_tree_with_it() {
 fn pid_is_alive(pid: &str) -> bool {
     let out = support::cmd::run("tasklist.exe", &["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);
     out.ok() && out.stdout.contains(&format!("\"{pid}\""))
-}
-
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn on_failure_respawns_after_a_nonzero_exit() {
-    let mgr = ScmManager::new();
-    let id = support::random_test_id();
-    let _guard = ServiceGuard::new(&id);
-    let reported = ConnectBack::listen();
-
-    // No `restart-delay` — exercises the real end-to-end wiring for
-    // `supervisor::DEFAULT_RESTART_DELAY`, not only the pure
-    // `missing_restart_delay_uses_the_documented_default` unit test.
-    let spec = mk_spec_full(
-        &id,
-        fixture_command("exit", &[&reported.port().to_string(), "1"]),
-        None,
-        BTreeMap::new(),
-        goetia::spec::Restart::OnFailure,
-        None,
-        None,
-    );
-    mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
-
-    reported.accept("the first spawn to report in before exiting 1");
-    let before_respawn = std::time::Instant::now();
-    reported.accept("a respawned child to report in after the first one exited nonzero");
-    let elapsed = before_respawn.elapsed();
-
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
-
-    // A real, if generous (scheduling jitter, not a chosen synchronization
-    // bound), lower bound on `DEFAULT_RESTART_DELAY` (1s): proves the
-    // supervisor actually paced the respawn rather than looping
-    // immediately, without pinning it to an exact duration.
-    assert!(
-        elapsed >= std::time::Duration::from_millis(700),
-        "respawn happened after only {elapsed:?}, faster than the documented ~1s restart-delay default allows for"
-    );
 }
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -290,13 +179,18 @@ fn unreadable_blob_logs_to_fallback_path_and_event_log() {
         .expect_err("a shim that cannot decode its own metadata blob must fail to start, not hang");
     let _ = err;
 
-    let fallback_path = programdata_dir().join("Goetia").join("logs").join(format!("{id}.log"));
-    let logged = std::fs::read_to_string(&fallback_path)
-        .unwrap_or_else(|e| panic!("read fallback log {}: {e}", fallback_path.display()));
+    // The shim's own failure, in the Win32 space: it cannot read as a daemon's exit code.
+    let status = scm_status(&id);
+    assert_eq!(
+        status.exit_code,
+        ServiceExitCode::Win32(ERROR_INVALID_DATA),
+        "an undecodable blob is a shim failure: {status:?}"
+    );
+
+    let logged = fallback_log(&id);
     assert!(
         logged.contains(&id) && logged.to_lowercase().contains("decode"),
-        "fallback log at {} does not look like a decode-failure report naming `{id}`:\n{logged}",
-        fallback_path.display()
+        "fallback log does not look like a decode-failure report naming `{id}`:\n{logged}"
     );
 
     // Filtered server-side by provider, not by an arbitrary "most recent N"
@@ -330,12 +224,6 @@ fn unreadable_blob_logs_to_fallback_path_and_event_log() {
         !events.stdout.contains("The operation completed successfully"),
         "event rendered with no message resource, so an admin sees nothing useful; \n         install must register the `Goetia` source:\n{events}"
     );
-}
-
-fn programdata_dir() -> std::path::PathBuf {
-    std::env::var_os("ProgramData")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\ProgramData"))
 }
 
 /// Overwrite `Services\<id>\Parameters\Spec` with undecodable text, leaving

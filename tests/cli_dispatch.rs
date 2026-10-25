@@ -1433,6 +1433,11 @@ fn list_reaches_the_manager() {
 /// A service installed by 0.1.0 may carry `restart: always` on the scm backend, which a manifest
 /// can no longer say. Reading its blob must not run the manifest refusal, or the service could
 /// not even be stopped or removed.
+///
+/// CLI-only: the verbs run against `Fake`, which has no scm refusal of its own to trip. The scm
+/// side is `a_blob_that_says_always_decodes_and_starts_as_its_kind` (`manager_tests.rs`) and
+/// `a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled`
+/// (`tests/shim_integration/restart_integration.rs`).
 #[skuld::test]
 fn a_service_installed_with_restart_always_stays_operable() {
     let fake = Fake::new();
@@ -1519,10 +1524,10 @@ fn install_exit_code_does_not_mask_an_error_behind_a_conflict() {
 }
 
 /// `--dry-run`'s preview must not silently drop a `Warning` (e.g. SCM
-/// clamping a too-large `restart-delay`). This advisory now fires at
+/// clamping a too-large `restart-delay`). This advisory fires at
 /// resolve time, from `Backend::Scm.warn`, through `load_and_warn` — on
 /// every host, not only from an effectful Windows install preview — which
-/// is the property this test now pins.
+/// is the property this test pins.
 #[skuld::test]
 fn install_dry_run_prints_generator_warnings() {
     let dir = tempfile::tempdir().unwrap();
@@ -1715,8 +1720,7 @@ fn diff_exits_five_for_a_hand_edited_artifact() {
 }
 
 /// `diff` must distinguish "absent" from "occupied by a stranger's
-/// service": both used to render identically as "would be created", which
-/// `install` would then immediately contradict by refusing. A second,
+/// service": the first is "would be created", the second a refusal. A second,
 /// drifting daemon in the same run must not lower the code to 3: `1`
 /// outranks `3` in the precedence rule.
 #[skuld::test]
