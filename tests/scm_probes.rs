@@ -1,13 +1,15 @@
 //! THROWAWAY (issue #59, phase A): measures how the Windows SCM treats a
 //! service's reported exit, so the shim's design rests on measurements.
-//! Round 6: P14 (a restart queued by a failure, as seen in the System log). Never merges. Every observation is a `PROBE ...` line in the job log.
+//! Round 8: P17 (a failure after `DeleteService` marked the service), P18 (STOP_PENDING from the host). Never merges. Every observation is a `PROBE ...` line in the job log.
 //!
 //! This binary is also the service host: `<exe> --probe-host <name> <port> <scripts>`
 //! where `<scripts>` is `|`-separated, one script per run of the service
 //! (run index kept in `%ProgramData%\<name>.runs`; the last script repeats).
 //! A script is `,`-separated steps: `pending`, `run`, `connect`, `wait-stop`,
 //! `stopped:w32:<n>`, `stopped:spec:<n>`, `rawstopped:<w32>:<spec>`, `exit:<n>`,
-//! `hold:<ms>` (stay in the state reported so far, e.g. START_PENDING).
+//! `hold:<ms>` (stay in the state reported so far, e.g. START_PENDING), `stoppending` (report
+//! STOP_PENDING, checkpoint 1, tracing whether `SetServiceStatus` succeeded), `signal-wait` (block
+//! until the probe fires the named event `Global\<name>-go`).
 //!
 //! Absence is shown with a bound (a one-off attended measurement; the result
 //! is read by a human as "no restart within N s", not as proof).
@@ -25,25 +27,34 @@ fn main() {
 
 #[cfg(windows)]
 mod host {
-    use std::ffi::OsString;
+    use std::ffi::{OsString, c_void};
     use std::io::Write as _;
     use std::net::{Ipv4Addr, TcpStream};
-    use std::os::windows::io::AsRawHandle as _;
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use windows_sys::Win32::System::Services;
-
-    use windows_service::service::{
-        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
-    };
-    use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
     use windows_service::{define_windows_service, service_dispatcher};
+    use windows_sys::Win32::Foundation;
+    use windows_sys::Win32::System::Services;
+    use windows_sys::Win32::System::Threading;
 
     pub const HOST: &str = "--probe-host";
 
+    /// Standard access right (`windows-sys` has it only behind the FileSystem feature).
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+
     static REFUSE_ONE_STOP: AtomicBool = AtomicBool::new(false);
+
+    /// `Global\<name>-go`, NUL-terminated UTF-16: the event a `signal-wait` step blocks on.
+    pub fn signal_name(name: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(&format!("Global\\{name}-go"))
+            .encode_wide()
+            .chain([0])
+            .collect()
+    }
 
     pub fn run_if_requested() -> bool {
         let args: Vec<String> = std::env::args().collect();
@@ -95,6 +106,69 @@ mod host {
         }
     }
 
+    /// Never freed: a control may arrive at any time up to process exit (the `windows-service`
+    /// crate frees its handler closure after a STOP, so a later control would reach freed memory).
+    struct HandlerCtx {
+        name: String,
+        idx: usize,
+        stop_tx: Mutex<mpsc::Sender<()>>,
+    }
+
+    unsafe extern "system" fn on_control(
+        control: u32,
+        _event_type: u32,
+        _event_data: *mut c_void,
+        ctx: *mut c_void,
+    ) -> u32 {
+        // SAFETY: `ctx` is the leaked `HandlerCtx` registered in `service_main`.
+        let ctx = unsafe { &*(ctx as *const HandlerCtx) };
+        let result = match control {
+            // As goetia-shim refuses a stop once it has decided on a failure.
+            Services::SERVICE_CONTROL_STOP if REFUSE_ONE_STOP.swap(false, Ordering::SeqCst) => {
+                Foundation::ERROR_SERVICE_CANNOT_ACCEPT_CTRL
+            }
+            Services::SERVICE_CONTROL_STOP => {
+                if let Ok(tx) = ctx.stop_tx.lock() {
+                    let _ = tx.send(());
+                }
+                Foundation::NO_ERROR
+            }
+            Services::SERVICE_CONTROL_INTERROGATE => Foundation::NO_ERROR,
+            _ => Foundation::ERROR_CALL_NOT_IMPLEMENTED,
+        };
+        trace(
+            &ctx.name,
+            &format!("run={} handler control={control} -> {result}", ctx.idx),
+        );
+        result
+    }
+
+    /// A raw `SetServiceStatus`; the win32 and service-specific codes are independent.
+    fn report(
+        handle: Services::SERVICE_STATUS_HANDLE,
+        state: u32,
+        accepted: u32,
+        (w32, spec): (u32, u32),
+        checkpoint: u32,
+        wait_hint_ms: u32,
+    ) -> Result<(), std::io::Error> {
+        let raw = Services::SERVICE_STATUS {
+            dwServiceType: Services::SERVICE_WIN32_OWN_PROCESS,
+            dwCurrentState: state,
+            dwControlsAccepted: accepted,
+            dwWin32ExitCode: w32,
+            dwServiceSpecificExitCode: spec,
+            dwCheckPoint: checkpoint,
+            dwWaitHint: wait_hint_ms,
+        };
+        // SAFETY: `handle` came from `RegisterServiceCtrlHandlerExW`; `raw` is a valid SERVICE_STATUS.
+        if unsafe { Services::SetServiceStatus(handle, &raw) } == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
     fn service_main(_scm_arguments: Vec<OsString>) {
         let args: Vec<String> = std::env::args().collect();
         let name = args[2].clone();
@@ -109,57 +183,57 @@ mod host {
         trace(&name, &format!("run={idx} service_main script={script}"));
 
         let (stop_tx, stop_rx) = mpsc::channel();
-        let handler_name = name.clone();
-        let handler = move |control| {
-            let result = match control {
-                // As goetia-shim refuses a stop once it has decided on a failure.
-                ServiceControl::Stop if REFUSE_ONE_STOP.swap(false, Ordering::SeqCst) => {
-                    ServiceControlHandlerResult::Other(windows_sys::Win32::Foundation::ERROR_SERVICE_CANNOT_ACCEPT_CTRL)
-                }
-                ServiceControl::Stop => {
-                    let _ = stop_tx.send(());
-                    ServiceControlHandlerResult::NoError
-                }
-                ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-                _ => ServiceControlHandlerResult::NotImplemented,
-            };
-            trace(&handler_name, &format!("run={idx} handler {control:?} -> {result:?}"));
-            result
+        let ctx: &'static HandlerCtx = Box::leak(Box::new(HandlerCtx {
+            name: name.clone(),
+            idx,
+            stop_tx: Mutex::new(stop_tx),
+        }));
+        let wide_name: Vec<u16> = std::ffi::OsStr::new(&name).encode_wide().chain([0]).collect();
+        // SAFETY: `wide_name` is NUL-terminated; `ctx` is never freed.
+        let handle = unsafe {
+            Services::RegisterServiceCtrlHandlerExW(
+                wide_name.as_ptr(),
+                Some(on_control),
+                (ctx as *const HandlerCtx).cast_mut().cast(),
+            )
         };
-        let handle = service_control_handler::register(&name, handler).expect("register control handler");
-
-        let status = |state, accepted, exit_code, checkpoint, wait_hint| ServiceStatus {
-            service_type: ServiceType::OWN_PROCESS,
-            current_state: state,
-            controls_accepted: accepted,
-            exit_code,
-            checkpoint,
-            wait_hint,
-            process_id: None,
-        };
+        assert!(
+            !handle.is_null(),
+            "register control handler: {}",
+            std::io::Error::last_os_error()
+        );
 
         for step in script.split(',') {
             trace(&name, &format!("run={idx} step {step}"));
             let parts: Vec<&str> = step.split(':').collect();
             match parts.as_slice() {
-                ["pending"] => handle
-                    .set_service_status(status(
-                        ServiceState::StartPending,
-                        ServiceControlAccept::empty(),
-                        ServiceExitCode::Win32(0),
-                        1,
-                        Duration::from_secs(10),
-                    ))
-                    .expect("report START_PENDING"),
-                ["run"] => handle
-                    .set_service_status(status(
-                        ServiceState::Running,
-                        ServiceControlAccept::STOP,
-                        ServiceExitCode::Win32(0),
-                        0,
-                        Duration::default(),
-                    ))
-                    .expect("report RUNNING"),
+                ["pending"] => {
+                    report(handle, Services::SERVICE_START_PENDING, 0, (0, 0), 1, 10_000).expect("report START_PENDING")
+                }
+                ["run"] => report(
+                    handle,
+                    Services::SERVICE_RUNNING,
+                    Services::SERVICE_ACCEPT_STOP,
+                    (0, 0),
+                    0,
+                    0,
+                )
+                .expect("report RUNNING"),
+                ["stoppending"] => {
+                    let r = report(handle, Services::SERVICE_STOP_PENDING, 0, (0, 0), 1, 10_000);
+                    trace(
+                        &name,
+                        &format!("run={idx} SetServiceStatus(STOP_PENDING, checkpoint 1, waithint 10000) -> {r:?}"),
+                    );
+                }
+                ["signal-wait"] => {
+                    // SAFETY: a NUL-terminated name; the handle is closed right after the wait.
+                    let ev = unsafe { Threading::OpenEventW(SYNCHRONIZE, 0, signal_name(&name).as_ptr()) };
+                    assert!(!ev.is_null(), "OpenEventW: {}", std::io::Error::last_os_error());
+                    let rc = unsafe { Threading::WaitForSingleObject(ev, Threading::INFINITE) };
+                    unsafe { Foundation::CloseHandle(ev) };
+                    trace(&name, &format!("run={idx} signal-wait -> WaitForSingleObject {rc:#x}"));
+                }
                 ["connect"] => {
                     if let Ok(mut s) = TcpStream::connect((Ipv4Addr::LOCALHOST, port)) {
                         let _ = write!(s, "run={idx} pid={}", std::process::id());
@@ -172,34 +246,17 @@ mod host {
                 ["stopped", kind, n] => {
                     let n = code(n);
                     let exit_code = match *kind {
-                        "w32" => ServiceExitCode::Win32(n),
-                        "spec" => ServiceExitCode::ServiceSpecific(n),
+                        "w32" => (n, 0),
+                        // What `ServiceExitCode::ServiceSpecific` sends: 1066 plus the code.
+                        "spec" => (Foundation::ERROR_SERVICE_SPECIFIC_ERROR, n),
                         other => panic!("bad kind {other}"),
                     };
-                    handle
-                        .set_service_status(status(
-                            ServiceState::Stopped,
-                            ServiceControlAccept::empty(),
-                            exit_code,
-                            0,
-                            Duration::default(),
-                        ))
-                        .expect("report STOPPED");
+                    report(handle, Services::SERVICE_STOPPED, 0, exit_code, 0, 0).expect("report STOPPED");
                 }
-                // A raw SERVICE_STATUS, for pairs `ServiceExitCode` cannot say
-                // (win32 code and service-specific code independent).
+                // A raw pair `stopped` cannot say (win32 code and service-specific code independent).
                 ["rawstopped", w32, spec] => {
-                    let raw = Services::SERVICE_STATUS {
-                        dwServiceType: Services::SERVICE_WIN32_OWN_PROCESS,
-                        dwCurrentState: Services::SERVICE_STOPPED,
-                        dwControlsAccepted: 0,
-                        dwWin32ExitCode: code(w32),
-                        dwServiceSpecificExitCode: code(spec),
-                        dwCheckPoint: 0,
-                        dwWaitHint: 0,
-                    };
-                    let ok = unsafe { Services::SetServiceStatus(handle.as_raw_handle(), &raw) };
-                    assert!(ok != 0, "SetServiceStatus failed: {}", std::io::Error::last_os_error());
+                    report(handle, Services::SERVICE_STOPPED, 0, (code(w32), code(spec)), 0, 0)
+                        .expect("report STOPPED");
                 }
                 ["exit", n] => std::process::exit(code(n) as i32),
                 other => panic!("bad step {other:?}"),
@@ -1798,12 +1855,224 @@ mod probes {
         r
     }
 
+    // P17, P18 ========================================================================================================
+
+    /// The named event the host's `signal-wait` step blocks on. Auto-reset: one `fire` releases one wait.
+    struct Signal(windows_sys::Win32::Foundation::HANDLE);
+
+    impl Signal {
+        /// Created before the service starts, so the host can open it.
+        fn create(service: &str) -> Signal {
+            use windows_sys::Win32::System::Threading::CreateEventW;
+            let name = super::host::signal_name(service);
+            // SAFETY: a NUL-terminated name; default security (SYSTEM and Administrators).
+            let h = unsafe { CreateEventW(std::ptr::null(), 0, 0, name.as_ptr()) };
+            assert!(!h.is_null(), "CreateEventW: {}", std::io::Error::last_os_error());
+            Signal(h)
+        }
+
+        fn fire(&self) {
+            use windows_sys::Win32::System::Threading::SetEvent;
+            // SAFETY: `self.0` is a live event handle.
+            assert!(
+                unsafe { SetEvent(self.0) } != 0,
+                "SetEvent: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
+    impl Drop for Signal {
+        fn drop(&mut self) {
+            // SAFETY: owned handle, closed once.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+        }
+    }
+
+    /// Every line the host has traced so far (handler calls, `SetServiceStatus` results).
+    fn dump_host_trace(p: &Probe, when: &str) {
+        let text = std::fs::read_to_string(super::host::trace_path(&p.name)).unwrap_or_default();
+        for line in text.lines() {
+            p.p(format_args!("host trace ({when}): {line}"));
+        }
+    }
+
+    /// A failure that comes after `DeleteService` marked the service (the handle `h` that deleted
+    /// stays open). Failure actions restart, `failureflag` 1. Does SCM restart a marked service
+    /// after a later failure, and does the attempt fail as in P12b (7032, `%%1058`) without a
+    /// START_PENDING? (a) delay 0 ms; (b) delay 2000 ms.
+    fn p17(variant: &'static str) -> String {
+        let delay = Duration::from_millis(match variant {
+            "a" => 0,
+            "b" => 2000,
+            other => panic!("bad variant {other}"),
+        });
+        let bound = absence_bound(delay);
+        let tag = format!("P17{variant}");
+        let mut p = Probe::new(
+            &tag,
+            &format!("run,connect,signal-wait,stopped:spec:7|{STAY_UP}"),
+            &format!("restart/{}", delay.as_millis()),
+        );
+        let go = Signal::create(&p.name);
+        let _ = p.start();
+        p.connect(0, EXPECTED_BOUND);
+        let h = p.service(ServiceAccess::DELETE | ServiceAccess::STOP | ServiceAccess::QUERY_STATUS);
+        let running = wait_state_via(&h, Services::SERVICE_RUNNING, EXPECTED_BOUND);
+        p.p(format_args!("running: {running}; {}", query_via(&h)));
+
+        let del = h.delete().map_err(|e| format!("{e:?}"));
+        let marked = p.t0.elapsed();
+        p.p(format_args!(
+            "DeleteService -> {del:?}; status via h: {}; OpenService after delete: {}",
+            query_via(&h),
+            open_state(&p.name)
+        ));
+
+        go.fire();
+        let stopped = wait_state_via(&h, Services::SERVICE_STOPPED, EXPECTED_BOUND);
+        p.p(format_args!(
+            "host told to report STOPPED (1066, 7) {}ms after the mark; stopped via h: {stopped}; {}",
+            (p.t0.elapsed() - marked).as_millis(),
+            query_via(&h)
+        ));
+        let failed_at = p.t0.elapsed();
+
+        let c1 = p.connect(1, bound).cloned();
+        p.p(format_args!(
+            "{}ms after the failure: {}",
+            (p.t0.elapsed() - failed_at).as_millis(),
+            describe(c1.as_ref(), bound)
+        ));
+        let after = query_via(&h);
+        p.p(format_args!(
+            "status via h after the bound: {after}; notifications fired: {}",
+            p.notify.count.load(Ordering::SeqCst)
+        ));
+        let mut clean = String::new();
+        if c1.is_some() {
+            let stop = control_stop(&h);
+            let s = wait_state_via(&h, Services::SERVICE_STOPPED, EXPECTED_BOUND);
+            clean = format!("; restarted instance stopped by ControlService: {stop}, stopped {s}");
+            p.p(format_args!("clean-up of the restarted instance{clean}"));
+        }
+        p.wait_logged_stopped(if c1.is_some() { 2 } else { 1 });
+        dump_host_trace(&p, "end");
+        p.quiesce();
+        drop(h);
+        let first = open_state(&p.name);
+        p.p(format_args!(
+            "OpenService right after h and every observer closed: {first}"
+        ));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !record_gone(&p.name) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let later = open_state(&p.name);
+        p.p(format_args!("record check (up to 30s after close): {later}"));
+        let r = format!(
+            "delete {del:?}; failure reported after the mark: {}; status via h at the end {after}{clean}; after close: {first}; later: {later}",
+            describe(c1.as_ref(), bound)
+        );
+        p.result(&r);
+        p.dump_scm_events(&tag);
+        r
+    }
+
+    /// STOP_PENDING reported by the host while it tears down. Failure actions restart, delay 0 ms,
+    /// `failureflag` 1. (a) no STOP: RUNNING, STOP_PENDING (checkpoint 1, hint 10 s), STOPPED (1066, 7).
+    /// (b) the probe sends STOP, the handler answers NO_ERROR, STOP_PENDING, STOPPED (0, 0).
+    /// (c) as (b), but the host holds STOP_PENDING until the probe has sent another STOP, a
+    /// StartService and a query, and then signals it.
+    fn p18(variant: &'static str) -> String {
+        let delay = Duration::ZERO;
+        let bound = absence_bound(delay);
+        let tag = format!("P18{variant}");
+        let script = match variant {
+            "a" => "run,connect,stoppending,stopped:spec:7",
+            "b" => "run,connect,wait-stop,stoppending,stopped:w32:0",
+            "c" => "run,connect,wait-stop,stoppending,signal-wait,stopped:w32:0",
+            other => panic!("bad variant {other}"),
+        };
+        let mut p = Probe::new(&tag, &format!("{script}|{STAY_UP}"), "restart/0");
+        let go = (variant == "c").then(|| Signal::create(&p.name));
+        let started = p.start();
+        let started_at = p.t0.elapsed();
+        p.connect(0, EXPECTED_BOUND);
+        let h = p.service(ServiceAccess::STOP | ServiceAccess::QUERY_STATUS);
+        let mut steps = format!("StartService {started:?}");
+
+        if variant != "a" {
+            let running = wait_state_via(&h, Services::SERVICE_RUNNING, EXPECTED_BOUND);
+            p.p(format_args!("running: {running}; {}", query_via(&h)));
+            let stop = control_stop(&h);
+            p.p(format_args!("ControlService(STOP) -> {stop}"));
+            steps = format!("{steps}; STOP {stop}");
+        }
+        if let Some(go) = &go {
+            let pending = wait_state_via(&h, Services::SERVICE_STOP_PENDING, EXPECTED_BOUND);
+            p.p(format_args!("STOP_PENDING reached: {pending}; {}", query_via(&h)));
+            let stop2 = control_stop(&h);
+            p.p(format_args!("second ControlService(STOP) in STOP_PENDING -> {stop2}"));
+            p.p(format_args!("status after the second STOP: {}", query_via(&h)));
+            let start2 = p.start();
+            p.p(format_args!(
+                "status after StartService in STOP_PENDING: {}",
+                query_via(&h)
+            ));
+            let q = query_via(&h);
+            p.p(format_args!("QueryServiceStatusEx in STOP_PENDING: {q}"));
+            dump_host_trace(&p, "before the signal");
+            steps = format!("{steps}; in STOP_PENDING: second STOP {stop2}; StartService {start2:?}; query {q}");
+            go.fire();
+            p.p(format_args!("host signalled to leave STOP_PENDING"));
+        }
+
+        // (a) restarts at once, so STOPPED may be gone before a poll sees it: the tracer and the
+        // notifier record it instead.
+        if variant != "a" {
+            let stopped = wait_state_via(&h, Services::SERVICE_STOPPED, EXPECTED_BOUND);
+            p.p(format_args!("stopped via h: {stopped}; {}", query_via(&h)));
+        }
+        let c1 = p.connect(1, bound).cloned();
+        let after = query_via(&h);
+        p.p(format_args!(
+            "{}ms after the first connect-back: {}; status via h {after}; notifications fired: {}",
+            (p.t0.elapsed() - started_at).as_millis(),
+            describe(c1.as_ref(), bound),
+            p.notify.count.load(Ordering::SeqCst)
+        ));
+        let mut stops = 1;
+        if c1.is_some() {
+            let running = wait_state_via(&h, Services::SERVICE_RUNNING, EXPECTED_BOUND);
+            let stop = control_stop(&h);
+            let s = wait_state_via(&h, Services::SERVICE_STOPPED, EXPECTED_BOUND);
+            p.p(format_args!(
+                "clean-up of the restarted instance: running {running}; ControlService {stop}; stopped {s}"
+            ));
+            stops = 2;
+        }
+        p.wait_logged_stopped(stops);
+        dump_host_trace(&p, "end");
+        p.quiesce();
+        let r = format!("{steps}; after: {}; final status {after}", describe(c1.as_ref(), bound));
+        p.result(&r);
+        p.dump_scm_events(&tag);
+        r
+    }
+
     // Driver ==========================================================================================================
 
     pub fn run_all() {
         // Sequential: the System-log events of a probe must be its own.
         type Job = Box<dyn FnOnce() -> String + Send>;
-        let jobs: Vec<(&'static str, Job)> = vec![("P16a", Box::new(|| p16("a"))), ("P16b", Box::new(|| p16("b")))];
+        let jobs: Vec<(&'static str, Job)> = vec![
+            ("P17a", Box::new(|| p17("a"))),
+            ("P17b", Box::new(|| p17("b"))),
+            ("P18a", Box::new(|| p18("a"))),
+            ("P18b", Box::new(|| p18("b"))),
+            ("P18c", Box::new(|| p18("c"))),
+        ];
         println!("PROBE SUMMARY begin");
         for (name, job) in jobs {
             let res = thread::spawn(move || catch_unwind(AssertUnwindSafe(job))).join();
