@@ -9,7 +9,7 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_sys::Wdk::System::SystemServices::KUSER_SHARED_DATA;
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 
-use super::{Clock, RECORD, RestartDue, dir_name, restart_due_from};
+use super::{Actions, Clock, RECORD, dir_name};
 
 /// `%ProgramData%\Goetia\state`, beside the `logs` directory the shim already uses.
 pub fn dir() -> PathBuf {
@@ -53,10 +53,10 @@ pub fn clock() -> Clock {
     }
 }
 
-/// What a failure of service `id` reported now queues, from its failure actions.
+/// The failure actions of service `id`, as the service holds them now.
 ///
 /// `QUERY_CONFIG` is all this needs, which every account has on its own service by default.
-pub fn restart_due(id: &str) -> Result<RestartDue, windows_service::Error> {
+pub fn failure_actions(id: &str) -> Result<Actions, windows_service::Error> {
     let scm = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = scm.open_service(id, ServiceAccess::QUERY_CONFIG)?;
     let flag = service.get_failure_actions_on_non_crash_failures()?;
@@ -68,7 +68,7 @@ pub fn restart_due(id: &str) -> Result<RestartDue, windows_service::Error> {
         .filter(|action| action.action_type == ServiceActionType::Restart)
         .map(|action| action.delay)
         .collect();
-    Ok(restart_due_from(flag, &delays))
+    Ok(Actions::new(flag, &delays))
 }
 
 #[cfg(test)]

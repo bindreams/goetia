@@ -117,13 +117,26 @@ mod system {
 
     use super::privilege::DebugPrivilege;
     use super::{KillTarget, Termination};
-    use crate::backend::scm::state_file::{self, FailureRecord, RestartDue, host};
+    use crate::backend::scm::state_file::{self, Cause, NewFailure, RestartDue, host};
 
     /// The real SCM service; the process is a Win32 handle.
     pub struct SystemKillTarget {
         pub service: Service,
         /// The daemon's id, for the notice printed when a kill has to wait.
         pub id: String,
+        /// The restart a crash of the service queues, from its failure actions, once they have been
+        /// read; `Some(None)` if they could not be.
+        restart_due: Option<Option<RestartDue>>,
+    }
+
+    impl SystemKillTarget {
+        pub fn new(service: Service, id: String) -> Self {
+            Self {
+                service,
+                id,
+                restart_due: None,
+            }
+        }
     }
 
     /// An opened service process and the pid it was opened by.
@@ -179,11 +192,20 @@ mod system {
                     self.id, process.pid
                 );
             };
-            let restart = host::restart_due(&self.id).unwrap_or(RestartDue::Unknown);
-            let failure = FailureRecord::at(host::clock(), restart);
+            // Read once: this runs again for as long as SCM has not noticed the exit.
+            let live = *self.restart_due.get_or_insert_with(|| {
+                host::failure_actions(&self.id)
+                    .ok()
+                    .map(|actions| actions.after(Cause::Crashed))
+            });
+            let failure = NewFailure {
+                now: host::clock(),
+                cause: Cause::Crashed,
+                live,
+            };
             state_file::noting_failure_around(
                 &host::path(&self.id),
-                failure,
+                &failure,
                 || terminate_process(&process.handle, wait_notice),
                 |termination| *termination == Termination::Terminated,
             )

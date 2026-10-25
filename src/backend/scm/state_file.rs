@@ -118,11 +118,18 @@ impl FailureRecord {
 
     /// Whether the restart this record stands for has fired or expired: the entry SCM queued is
     /// spent once a run starts at or after its due time (SCM cannot fire earlier than the failure
-    /// plus the delay), and a record that names no due time is spent by any start.
+    /// plus the delay). A failure that queued nothing, and one from an earlier boot, is spent by any
+    /// start. One whose delay is unknown is not: a start by hand does not cancel the entry SCM
+    /// queued, and with no due time to compare against the entry may still be there, until the boot
+    /// ends.
     fn spent_by_a_start_at(&self, now: Clock) -> bool {
+        if !self.same_boot(now) {
+            return true;
+        }
         match self.restart {
-            RestartDue::After(after_ms) if self.same_boot(now) => now.ms >= self.due_at(after_ms),
-            _ => true,
+            RestartDue::Never => true,
+            RestartDue::After(after_ms) => now.ms >= self.due_at(after_ms),
+            RestartDue::Unknown => false,
         }
     }
 }
@@ -140,6 +147,78 @@ pub fn restart_due_from(flag: bool, restart_delays: &[Duration]) -> RestartDue {
     }
 }
 
+/// What ended the process whose failure is noted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cause {
+    /// The shim reported a `STOPPED` with a non-zero Win32 code. SCM acts on it only with the
+    /// failure-actions flag set.
+    Reported,
+    /// The process ended without reporting (`TerminateProcess`, a crash). SCM runs recovery for it
+    /// whatever the flag says.
+    Crashed,
+}
+
+/// The restart queued for a process that ended without reporting: any restart action fires, and
+/// the longest delay bounds whichever one a failure count selects.
+pub fn restart_due_after_a_crash(restart_delays: &[Duration]) -> RestartDue {
+    restart_due_from(true, restart_delays)
+}
+
+/// A service's failure actions, as far as they decide whether a failure queues a restart.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Actions {
+    /// The failure-actions flag.
+    pub flag: bool,
+    /// The delay of each restart action, in milliseconds.
+    pub restart_delays_ms: Vec<u64>,
+}
+
+impl Actions {
+    pub fn new(flag: bool, restart_delays: &[Duration]) -> Self {
+        Self {
+            flag,
+            restart_delays_ms: restart_delays
+                .iter()
+                .map(|delay| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX))
+                .collect(),
+        }
+    }
+
+    /// The restart a failure of `cause` queues under these actions.
+    pub fn after(&self, cause: Cause) -> RestartDue {
+        let delays: Vec<_> = self
+            .restart_delays_ms
+            .iter()
+            .map(|&ms| Duration::from_millis(ms))
+            .collect();
+        match cause {
+            Cause::Reported => restart_due_from(self.flag, &delays),
+            Cause::Crashed => restart_due_after_a_crash(&delays),
+        }
+    }
+}
+
+/// A failure to be noted now: when it happened, what ended the process, and the restart the failure
+/// actions say it queues if they could be read (`None` if not).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewFailure {
+    pub now: Clock,
+    pub cause: Cause,
+    pub live: Option<RestartDue>,
+}
+
+impl NewFailure {
+    /// The failure to write into `record`. Failure actions that could not be read are replaced by
+    /// what `install` configured, which the record holds; with neither, the delay is unknown.
+    fn resolve(&self, record: &StateRecord) -> FailureRecord {
+        let restart = self
+            .live
+            .or_else(|| record.configured.as_ref().map(|actions| actions.after(self.cause)))
+            .unwrap_or(RestartDue::Unknown);
+        FailureRecord::at(self.now, restart)
+    }
+}
+
 /// The whole content of a state file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateRecord {
@@ -149,6 +228,10 @@ pub struct StateRecord {
     /// The daemon the last incomplete stop could not kill.
     #[serde(default)]
     pub survivor: Option<ProcessIdRecord>,
+    /// The failure actions `install` configured, for a shim that cannot read them itself. `None`
+    /// where `install` has not written them (a service registered by an older goetia).
+    #[serde(default)]
+    pub configured: Option<Actions>,
 }
 
 impl StateRecord {
@@ -157,6 +240,7 @@ impl StateRecord {
             v: VERSION,
             failure: None,
             survivor: None,
+            configured: None,
         }
     }
 
@@ -462,7 +546,7 @@ pub fn release(path: &Path) -> io::Result<()> {
 /// write to be ended. A service with no state file has no record to write and none is created.
 pub fn noting_failure_around<T>(
     path: &Path,
-    failure: FailureRecord,
+    failure: &NewFailure,
     act: impl FnOnce() -> io::Result<T>,
     took_effect: impl FnOnce(&T) -> bool,
 ) -> io::Result<T> {
@@ -473,8 +557,8 @@ pub fn noting_failure_around<T>(
         )
     };
     // The lock is let go before `act` runs, whichever way this goes.
-    let previous = match note_beforehand(path, &failure) {
-        Ok(Some(previous)) => previous,
+    let (previous, failure) = match note_beforehand(path, failure) {
+        Ok(Some(noted)) => noted,
         Ok(None) => return act(),
         Err(e) => return Err(not_recorded(e)),
     };
@@ -492,8 +576,8 @@ pub fn noting_failure_around<T>(
 }
 
 /// The first half of [`noting_failure_around`]: write `failure` into the record and return the
-/// record it replaced. `None` when the service has no record to write into.
-fn note_beforehand(path: &Path, failure: &FailureRecord) -> io::Result<Option<StateRecord>> {
+/// record it replaced and the failure written. `None` when the service has no record to write into.
+fn note_beforehand(path: &Path, failure: &NewFailure) -> io::Result<Option<(StateRecord, FailureRecord)>> {
     let _held = match lock_exclusive(path) {
         Ok(held) => held,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -505,16 +589,32 @@ fn note_beforehand(path: &Path, failure: &FailureRecord) -> io::Result<Option<St
         // The shim resets a file it cannot read in the same way when it next starts.
         Loaded::Unreadable(_) => StateRecord::empty(),
     };
+    let failure = failure.resolve(&previous);
     let mut noted = previous.clone();
     noted.failure = Some(failure.clone());
     write_unlocked(path, &noted)?;
-    Ok(Some(previous))
+    Ok(Some((previous, failure)))
 }
 
-/// Record `failure`, replacing the previous failure and keeping the survivor. Called just before
-/// the shim reports a `STOPPED` with a non-zero Win32 code.
+/// Record `failure`, replacing the previous failure and keeping the survivor.
 pub fn note_failure(path: &Path, failure: FailureRecord) -> io::Result<()> {
     update(path, |record| record.failure = Some(failure))
+}
+
+/// [`note_failure`] for a failure as it happens: the shim calls it just before it reports a
+/// `STOPPED` with a non-zero Win32 code. Returns the failure written.
+pub fn note_failure_now(path: &Path, failure: &NewFailure) -> io::Result<FailureRecord> {
+    update(path, |record| {
+        let failure = failure.resolve(record);
+        record.failure = Some(failure.clone());
+        failure
+    })
+}
+
+/// Record the failure actions `install` configured, keeping the rest. The directory must exist;
+/// the record is made where there is none.
+pub fn configure(path: &Path, actions: Actions) -> io::Result<()> {
+    update(path, |record| record.configured = Some(actions))
 }
 
 /// Record the daemon an incomplete stop could not kill. Called before the shim reports it.

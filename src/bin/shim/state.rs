@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use cosca::identity::ProcessId;
 use goetia::backend::scm::exit_status::{ERROR_SERVICE_ALREADY_RUNNING, Reported};
-use goetia::backend::scm::state_file::{self, Begin, Clock, FailureRecord, RestartDue, Survivor, host};
+use goetia::backend::scm::state_file::{self, Begin, Cause, Clock, NewFailure, RestartDue, Survivor, host};
 
 use crate::logging;
 
@@ -29,7 +29,11 @@ impl Store {
         Self {
             path: host::path(id),
             clock: Box::new(host::clock),
-            due: Box::new(move || host::restart_due(&service).map_err(|e| e.to_string())),
+            due: Box::new(move || {
+                host::failure_actions(&service)
+                    .map(|actions| actions.after(Cause::Reported))
+                    .map_err(|e| e.to_string())
+            }),
         }
     }
 
@@ -70,16 +74,22 @@ pub fn record_failure(id: &str, store: &Store, reported: Reported) {
     if reported.scm_codes().0 == 0 {
         return;
     }
-    let restart = match (store.due)() {
-        Ok(restart) => restart,
-        Err(why) => {
-            logging::log_warning(id, &failure_actions_unreadable(&why));
-            RestartDue::Unknown
-        }
+    let (live, unreadable) = match (store.due)() {
+        Ok(restart) => (Some(restart), None),
+        Err(why) => (None, Some(why)),
     };
-    let failure = FailureRecord::at((store.clock)(), restart);
-    if let Err(e) = state_file::note_failure(&store.path, failure) {
-        logging::log_failure(id, &failure_not_recorded(store, &e));
+    let failure = NewFailure {
+        now: (store.clock)(),
+        cause: Cause::Reported,
+        live,
+    };
+    match state_file::note_failure_now(&store.path, &failure) {
+        Ok(noted) => {
+            if let Some(why) = unreadable {
+                logging::log_warning(id, &failure_actions_unreadable(&why, noted.restart));
+            }
+        }
+        Err(e) => logging::log_failure(id, &failure_not_recorded(store, &e)),
     }
 }
 
@@ -121,10 +131,16 @@ fn begin_failed(store: &Store, e: &std::io::Error) -> String {
     )
 }
 
-fn failure_actions_unreadable(why: &str) -> String {
-    format!(
-        "could not read this service's failure actions ({why}): the failure is recorded with an unknown restart delay, so `goetia daemon stop` refuses until the service next starts"
-    )
+/// The warning for failure actions that could not be read, and what the failure was recorded with
+/// instead: the restart `install` configured, or, with none, an unknown delay.
+fn failure_actions_unreadable(why: &str, recorded: RestartDue) -> String {
+    let instead = match recorded {
+        RestartDue::Unknown => {
+            "an unknown restart delay, so `goetia daemon stop` refuses until the host next boots or the service is uninstalled"
+        }
+        _ => "the restart `goetia daemon install` configured",
+    };
+    format!("could not read this service's failure actions ({why}): the failure is recorded with {instead}")
 }
 
 fn failure_not_recorded(store: &Store, e: &std::io::Error) -> String {

@@ -11,8 +11,11 @@
 
 use std::path::Path;
 
+use std::time::Duration;
+
 use super::identity;
-use crate::backend::scm::state_file::{self, host};
+use crate::backend::scm::generate::FailureActions;
+use crate::backend::scm::state_file::{self, Actions, host};
 use crate::error::{Error, Result};
 
 const SYSTEM: &str = "*S-1-5-18";
@@ -72,11 +75,20 @@ fn run_icacls(args: &[String]) -> Result<()> {
     }
 }
 
+/// The failure actions a service is registered with, as the record keeps them: for a shim that
+/// cannot read its own, and for `goetia daemon kill`.
+pub(super) fn configured(actions: Option<FailureActions>) -> Actions {
+    match actions {
+        Some(actions) => Actions::new(actions.on_non_crash_failures, &[actions.delay]),
+        None => Actions::new(false, &[] as &[Duration]),
+    }
+}
+
 /// Create the state directory and `id`'s directory in it if absent, fix both ACLs for the account
-/// the service runs as (`None`: `LocalSystem`), and make sure the record exists. An existing
-/// record keeps its content, so a re-install does not forget a survivor or a pending restart.
-/// Idempotent.
-pub(super) fn provision(id: &str, account: Option<&str>) -> Result<()> {
+/// the service runs as (`None`: `LocalSystem`), and make sure the record exists and holds the
+/// failure actions the service is registered with. The rest of an existing record is kept, so a
+/// re-install does not forget a survivor or a pending restart. Idempotent.
+pub(super) fn provision(id: &str, account: Option<&str>, actions: Actions) -> Result<()> {
     let account_sid = account.map(identity::account_sid_string).transpose()?;
     let account_sid = account_sid.as_deref();
 
@@ -95,12 +107,7 @@ pub(super) fn provision(id: &str, account: Option<&str>) -> Result<()> {
 
     // After the ACLs, so what is created inherits them.
     let file = host::path(id);
-    match std::fs::OpenOptions::new().write(true).create_new(true).open(&file) {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(Error::Other(format!("create {}: {e}", file.display()))),
-    }
-    Ok(())
+    state_file::configure(&file, actions).map_err(|e| Error::Other(format!("write {}: {e}", file.display())))
 }
 
 /// Release `id`'s state when its service goes away (or stops having a shim): delete it, and the

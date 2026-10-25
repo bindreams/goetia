@@ -345,14 +345,36 @@ fn a_run_starting_at_the_deadline_has_consumed_the_failure() {
 }
 
 #[skuld::test]
-fn a_run_starting_clears_failures_that_name_no_pending_restart() {
-    for failure in [failed(1000, RestartDue::Never), failed(1000, RestartDue::Unknown)] {
-        let mut record = failure;
+fn a_run_starting_clears_a_failure_that_queued_no_restart() {
+    let mut record = failed(1000, RestartDue::Never);
 
-        assert!(record.after_start(at(1001)));
+    assert!(record.after_start(at(1001)));
 
-        assert_eq!(record.failure, None);
-    }
+    assert_eq!(record.failure, None);
+}
+
+#[skuld::test]
+fn a_run_starting_does_not_spend_a_failure_whose_delay_nobody_knows() {
+    // A start by hand does not cancel the entry SCM queued (P14b/c): with no due time to compare
+    // the start against, the restart may still be coming, so the failure stands until the boot ends.
+    let mut record = failed(1000, RestartDue::Unknown);
+
+    assert!(!record.after_start(at(1001)));
+    assert!(!record.after_start(at(100_000_000)));
+
+    assert!(record.failure.is_some());
+}
+
+#[skuld::test]
+fn a_run_starting_after_a_reboot_clears_a_failure_whose_delay_nobody_knew() {
+    let mut record = failed(1000, RestartDue::Unknown);
+
+    assert!(record.after_start(Clock {
+        boot: OTHER_BOOT,
+        ms: 5
+    }));
+
+    assert_eq!(record.failure, None);
 }
 
 #[skuld::test]
@@ -489,6 +511,15 @@ fn a_failure_is_recorded_over_an_unreadable_file() {
 
 // A failure noted around an act =======================================================================================
 
+/// A failure at `ms` that the failure actions, read now, say queues a restart after 5 s.
+fn noted(ms: u64) -> NewFailure {
+    NewFailure {
+        now: at(ms),
+        cause: Cause::Reported,
+        live: Some(RestartDue::After(5000)),
+    }
+}
+
 fn failure_at(ms: u64) -> FailureRecord {
     FailureRecord::new(BOOT, ms, RestartDue::After(5000))
 }
@@ -501,7 +532,7 @@ fn the_failure_is_on_disk_before_the_act_runs_and_stays_when_the_act_took_effect
 
     let seen = noting_failure_around(
         &path,
-        failure_at(9),
+        &noted(9),
         || Ok(read(&path).expect("read during the act")),
         |_| true,
     )
@@ -519,7 +550,7 @@ fn the_failure_is_noted_beside_a_survivor_without_dropping_it() {
     before.survivor = Some(this_process());
     write(&path, &before).expect("write");
 
-    noting_failure_around(&path, failure_at(9), || Ok(()), |_| true).expect("the act");
+    noting_failure_around(&path, &noted(9), || Ok(()), |_| true).expect("the act");
 
     assert!(matches!(read(&path), Ok(Loaded::Record(r)) if r.survivor == before.survivor && r.failure.is_some()));
 }
@@ -532,7 +563,7 @@ fn an_act_that_failed_leaves_the_previous_record_in_place() {
     write(&path, &before).expect("write");
 
     let result: io::Result<()> =
-        noting_failure_around(&path, failure_at(9), || Err(io::Error::other("refused")), |()| true);
+        noting_failure_around(&path, &noted(9), || Err(io::Error::other("refused")), |()| true);
 
     assert!(result.is_err());
     assert!(matches!(read(&path), Ok(Loaded::Record(r)) if r == before));
@@ -548,7 +579,7 @@ fn an_act_that_did_not_take_effect_leaves_the_previous_record_in_place() {
     before.survivor = Some(this_process());
     write(&path, &before).expect("write");
 
-    noting_failure_around(&path, failure_at(9), || Ok(false), |&took_effect| took_effect).expect("the act");
+    noting_failure_around(&path, &noted(9), || Ok(false), |&took_effect| took_effect).expect("the act");
 
     assert!(matches!(read(&path), Ok(Loaded::Record(r)) if r == before));
 }
@@ -559,7 +590,7 @@ fn an_unreadable_file_is_put_back_as_an_empty_record_when_the_act_did_not_take_e
     let path = dir.path().join("svc");
     std::fs::write(&path, "{not json").expect("write garbage");
 
-    noting_failure_around(&path, failure_at(9), || Ok(()), |_| false).expect("the act");
+    noting_failure_around(&path, &noted(9), || Ok(()), |_| false).expect("the act");
 
     assert!(matches!(read(&path), Ok(Loaded::Record(r)) if r == StateRecord::empty()));
 }
@@ -569,7 +600,7 @@ fn a_service_with_no_state_file_gets_none_and_the_act_still_runs() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("svc");
 
-    let ran = noting_failure_around(&path, failure_at(9), || Ok("ran"), |_| true).expect("the act");
+    let ran = noting_failure_around(&path, &noted(9), || Ok("ran"), |_| true).expect("the act");
 
     assert_eq!(ran, "ran");
     assert!(!path.exists());
@@ -585,7 +616,7 @@ fn a_failure_that_cannot_be_recorded_stops_the_act_and_says_so() {
 
     let result = noting_failure_around(
         &path,
-        failure_at(9),
+        &noted(9),
         || {
             ran = true;
             Ok(())
@@ -905,7 +936,7 @@ fn a_failure_the_shim_wrote_during_the_act_is_not_undone_by_the_restore() {
 
     noting_failure_around(
         &path,
-        failure_at(9),
+        &noted(9),
         || {
             // The act holds no lock: the shim's write has to get through during it.
             update(&path, |record| record.failure = Some(failure_from_elsewhere(9))).expect("the shim's write");
@@ -927,7 +958,7 @@ fn a_restore_puts_back_the_failure_alone() {
 
     noting_failure_around(
         &path,
-        failure_at(9),
+        &noted(9),
         || {
             update(&path, |record| record.survivor = Some(this_process())).expect("the shim records a survivor");
             Ok(false)
@@ -941,4 +972,162 @@ fn a_restore_puts_back_the_failure_alone() {
     };
     assert_eq!(after.failure, before.failure);
     assert_eq!(after.survivor, Some(this_process()));
+}
+
+// The restart a failure queues ========================================================================================
+
+#[skuld::test]
+fn a_process_that_ends_without_reporting_is_restarted_whatever_the_flag_says() {
+    // `TerminateProcess` of the shim is a crash: SCM runs recovery for it with the flag off too.
+    assert_eq!(
+        restart_due_after_a_crash(&[Duration::from_millis(1500)]),
+        RestartDue::After(1500)
+    );
+    assert_eq!(
+        restart_due_after_a_crash(&[Duration::from_secs(1), Duration::from_secs(60)]),
+        RestartDue::After(60_000)
+    );
+    assert_eq!(restart_due_after_a_crash(&[]), RestartDue::Never);
+}
+
+#[skuld::test]
+fn the_actions_install_configured_give_the_restart_for_a_report_and_for_a_crash() {
+    let with_flag = Actions::new(true, &[Duration::from_secs(2)]);
+    let without_flag = Actions::new(false, &[Duration::from_secs(2)]);
+    let no_restart = Actions::new(true, &[]);
+
+    assert_eq!(with_flag.after(Cause::Reported), RestartDue::After(2000));
+    assert_eq!(with_flag.after(Cause::Crashed), RestartDue::After(2000));
+    assert_eq!(without_flag.after(Cause::Reported), RestartDue::Never);
+    assert_eq!(without_flag.after(Cause::Crashed), RestartDue::After(2000));
+    assert_eq!(no_restart.after(Cause::Reported), RestartDue::Never);
+    assert_eq!(no_restart.after(Cause::Crashed), RestartDue::Never);
+}
+
+#[skuld::test]
+fn a_record_keeps_the_actions_install_configured_through_its_text() {
+    let mut record = failed(5, RestartDue::Never);
+    record.configured = Some(Actions::new(true, &[Duration::from_millis(30)]));
+
+    assert_eq!(StateRecord::decode(&record.encode()).expect("decode"), record);
+    // A record written before the actions were kept has none.
+    let older = r#"{"v":1,"failure":null,"survivor":null}"#;
+    assert_eq!(StateRecord::decode(older).expect("decode").configured, None);
+}
+
+#[skuld::test]
+fn configuring_keeps_the_rest_of_the_record_and_makes_one_where_there_is_none() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("svc");
+    let actions = Actions::new(true, &[Duration::from_secs(1)]);
+
+    configure(&path, actions.clone()).expect("configure");
+    assert!(
+        matches!(read(&path), Ok(Loaded::Record(r)) if r.configured == Some(actions.clone()) && r.failure.is_none())
+    );
+
+    let mut busy = failed(1, RestartDue::After(100));
+    busy.survivor = Some(this_process());
+    write(&path, &busy).expect("write");
+    configure(&path, Actions::default()).expect("configure again");
+
+    let Loaded::Record(after) = read(&path).expect("read") else {
+        panic!("a record");
+    };
+    assert_eq!((after.failure, after.survivor), (busy.failure, busy.survivor));
+    assert_eq!(
+        after.configured,
+        Some(Actions::default()),
+        "the actions are replaced, and only they"
+    );
+}
+
+#[skuld::test]
+fn a_failure_noted_with_unreadable_actions_takes_the_restart_install_configured() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("svc");
+    configure(&path, Actions::new(true, &[Duration::from_secs(3)])).expect("configure");
+
+    let noted = note_failure_now(
+        &path,
+        &NewFailure {
+            now: at(7),
+            cause: Cause::Reported,
+            live: None,
+        },
+    )
+    .expect("note");
+
+    assert_eq!(noted, FailureRecord::new(BOOT, 7, RestartDue::After(3000)));
+    assert!(matches!(read(&path), Ok(Loaded::Record(r)) if r.failure == Some(noted.clone())));
+}
+
+#[skuld::test]
+fn a_failure_noted_with_nothing_to_go_by_is_of_unknown_delay() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("svc");
+    write(&path, &StateRecord::empty()).expect("write");
+
+    let noted = note_failure_now(
+        &path,
+        &NewFailure {
+            now: at(7),
+            cause: Cause::Reported,
+            live: None,
+        },
+    )
+    .expect("note");
+
+    assert_eq!(noted.restart, RestartDue::Unknown);
+}
+
+#[skuld::test]
+fn a_failure_noted_with_readable_actions_takes_them_over_what_install_configured() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("svc");
+    configure(&path, Actions::new(true, &[Duration::from_secs(3)])).expect("configure");
+
+    let noted = note_failure_now(
+        &path,
+        &NewFailure {
+            now: at(7),
+            cause: Cause::Reported,
+            live: Some(RestartDue::After(9)),
+        },
+    )
+    .expect("note");
+
+    assert_eq!(noted.restart, RestartDue::After(9));
+}
+
+#[skuld::test]
+fn a_kill_with_unreadable_actions_takes_the_crash_restart_install_configured() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("svc");
+    // Set by hand to off: a report would queue nothing, a crash does.
+    configure(&path, Actions::new(false, &[Duration::from_secs(3)])).expect("configure");
+
+    noting_failure_around(
+        &path,
+        &NewFailure {
+            now: at(7),
+            cause: Cause::Crashed,
+            live: None,
+        },
+        || Ok(()),
+        |_| true,
+    )
+    .expect("the act");
+
+    assert!(
+        matches!(read(&path), Ok(Loaded::Record(r)) if r.failure.as_ref().map(|f| f.restart) == Some(RestartDue::After(3000)))
+    );
+}
+
+#[skuld::test]
+fn a_start_over_an_unknown_failure_of_this_boot_leaves_it_in_the_file() {
+    let (outcome, after, _path, _dir) = begin(&failed(1000, RestartDue::Unknown), 5000);
+
+    assert!(matches!(outcome, Begin::Proceed));
+    assert!(matches!(after, Loaded::Record(r) if r.failure.is_some()));
 }

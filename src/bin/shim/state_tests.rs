@@ -1,6 +1,8 @@
 use cosca::identity::ProcessId;
 use goetia::backend::scm::exit_status::{ERROR_SERVICE_ALREADY_RUNNING, Reported};
-use goetia::backend::scm::state_file::{self, Clock, FailureRecord, Loaded, RestartDue, StateRecord};
+use std::time::Duration;
+
+use goetia::backend::scm::state_file::{self, Actions, Clock, FailureRecord, Loaded, RestartDue, StateRecord};
 
 use super::*;
 use crate::logging::test_hook::{take, take_warnings};
@@ -189,7 +191,28 @@ fn failure_actions_that_cannot_be_read_record_an_unknown_delay_and_say_so() {
     assert_eq!(
         warnings,
         [format!(
-            "goetia-shim[{}]: could not read this service's failure actions (access denied): the failure is recorded with an unknown restart delay, so `goetia daemon stop` refuses until the service next starts",
+            "goetia-shim[{}]: could not read this service's failure actions (access denied): the failure is recorded with an unknown restart delay, so `goetia daemon stop` refuses until the host next boots or the service is uninstalled",
+            id.as_str()
+        )]
+    );
+}
+
+#[skuld::test]
+fn failure_actions_that_cannot_be_read_fall_back_on_the_restart_install_configured() {
+    let id = TestId::new(PREFIX);
+    let (store, _dir) = store(5000, Err("access denied".to_string()));
+    state_file::configure(&store.path, Actions::new(true, &[Duration::from_secs(30)])).expect("configure");
+
+    record_failure(id.as_str(), &store, Reported::DaemonExit(7));
+
+    assert_eq!(
+        record_of(&store).failure.expect("a failure").restart,
+        RestartDue::After(30_000)
+    );
+    assert_eq!(
+        take_warnings(id.as_str()),
+        [format!(
+            "goetia-shim[{}]: could not read this service's failure actions (access denied): the failure is recorded with the restart `goetia daemon install` configured",
             id.as_str()
         )]
     );

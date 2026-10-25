@@ -274,10 +274,7 @@ impl ServiceManager for ScmManager {
     fn kill(&self, id: &Id) -> Result<()> {
         let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
         require_ours(id)?;
-        let mut target = super::kill::SystemKillTarget {
-            service,
-            id: id.as_str().to_string(),
-        };
+        let mut target = super::kill::SystemKillTarget::new(service, id.as_str().to_string());
         match super::kill::kill_service(&mut target).map_err(|e| Error::Other(format!("kill `{id}`: {e}")))? {
             super::kill::Killed::Terminated => Ok(()),
             super::kill::Killed::NotRunning => Err(Error::NotRunning {
@@ -848,7 +845,11 @@ fn reapply_uncompared_effects(spec: &DaemonSpec, reg: &ScmRegistration) -> Resul
     // The state file is the shim's: `type: managed` has none, and an id whose `type:` flips from
     // `simple` to `managed` converges by losing it, except a record of a daemon still running.
     match spec.kind {
-        Kind::Simple => state::provision(&reg.name, reg.account.as_deref())?,
+        Kind::Simple => state::provision(
+            &reg.name,
+            reg.account.as_deref(),
+            state::configured(reg.failure_actions),
+        )?,
         Kind::Managed => state::release(&reg.name)?,
     }
     // Only for an account that actually needs it (see `apply`'s identical

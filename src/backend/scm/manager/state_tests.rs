@@ -1,6 +1,9 @@
 use std::path::Path;
+use std::time::Duration;
 
 use super::*;
+use crate::backend::scm::generate::FailureActions;
+use crate::backend::scm::state_file::{Actions, Cause, RestartDue};
 
 fn joined(commands: &[Vec<String>]) -> Vec<String> {
     commands.iter().map(|command| command.join(" ")).collect()
@@ -43,4 +46,24 @@ fn a_local_system_service_needs_no_grant_beyond_what_the_state_directory_gives()
     let commands = service_dir_commands(Path::new("d"), None);
 
     assert_eq!(joined(&commands), ["d /reset /T"]);
+}
+
+#[skuld::test]
+fn the_actions_recorded_for_the_shim_are_the_ones_the_service_is_registered_with() {
+    let configured = configured(Some(FailureActions {
+        delay: Duration::from_secs(30),
+        reset_period: Duration::from_secs(86_400),
+        on_non_crash_failures: true,
+    }));
+
+    assert_eq!(configured, Actions::new(true, &[Duration::from_secs(30)]));
+    assert_eq!(configured.after(Cause::Reported), RestartDue::After(30_000));
+}
+
+#[skuld::test]
+fn a_service_registered_without_failure_actions_is_recorded_as_restarting_nothing() {
+    let configured = configured(None);
+
+    assert_eq!(configured.after(Cause::Reported), RestartDue::Never);
+    assert_eq!(configured.after(Cause::Crashed), RestartDue::Never);
 }
