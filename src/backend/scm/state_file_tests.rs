@@ -553,7 +553,7 @@ fn only_a_survivor_that_lives_or_cannot_be_told_blocks() {
     assert_eq!(blocking_survivor(&Loaded::Record(record)), None);
 }
 
-// The restart a failure queued =========================================================================================
+// The restart a failure queued ========================================================================================
 
 #[skuld::test]
 fn a_restart_action_with_the_flag_set_is_due_after_its_delay() {
