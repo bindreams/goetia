@@ -98,13 +98,12 @@ fn cleanup(id: &str) -> Vec<String> {
     if !delete.ok() && delete.code != Some(1060) {
         problems.push(delete.to_string());
     }
-    // The shim's state file (and a temporary left beside it) outlives a service deleted by `sc`.
-    // The path is spelled out rather than taken from the library: the support code is shared with
-    // probes that run before any backend exists.
+    // The shim's state (its directory, with whatever a writer left in it) outlives a service deleted
+    // by `sc`. The path is spelled out rather than taken from the library: the support code is
+    // shared with probes that run before any backend exists. A test id is letters, digits and `-`,
+    // which `state_file::dir_name` keeps as they are.
     let programdata = std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into());
     let state = std::path::PathBuf::from(programdata).join("Goetia").join("state");
-    for name in [id.to_string(), format!("{id}~tmp")] {
-        problems.extend(remove_path(&state.join(name), false));
-    }
+    problems.extend(remove_path(&state.join(format!("svc-{id}")), true));
     problems
 }

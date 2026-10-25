@@ -1,17 +1,19 @@
-//! The shim's state file (`%ProgramData%\Goetia\state\<id>`): what install provisions, what the
-//! shim writes as the service account, and what `stop` and `start` read from it. Every wait is for
-//! a positive event: a daemon connecting back, a process exiting, SCM reaching a state.
+//! The shim's state (`%ProgramData%\Goetia\state\<dir_name(id)>\record`): what install provisions,
+//! what the shim writes as the service account, and what `stop` and `start` read from it. Every
+//! wait is for a positive event: a daemon connecting back, a process exiting, SCM reaching a state.
 
+use std::collections::BTreeSet;
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
 use cosca::identity::{ProcessId, Resolved};
 use goetia::backend::scm::exit_status::{ERROR_SERVICE_ALREADY_RUNNING, RecordedExit};
 use goetia::backend::scm::manager::ScmManager;
-use goetia::backend::scm::state_file::{self, Loaded, RestartDue, StateRecord, host};
+use goetia::backend::scm::state_file::{self, Actions, Loaded, RestartDue, StateRecord, host};
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, ServiceManager as _};
-use goetia::spec::{Restart, User};
+use goetia::spec::{DaemonSpec, Restart, User};
 use windows_service::service::{ServiceAccess, ServiceState};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
@@ -36,6 +38,45 @@ fn record(id: &str) -> StateRecord {
     }
 }
 
+/// The trustees of the ACEs in the ACL of `path`, as SDDL names them: an alias such as `SY`, `BA`,
+/// `LS` (LocalService) or `NS` (NetworkService), or a SID string. Read back through `icacls /save`,
+/// which gives the descriptor and not a localized rendering of it.
+fn trustees(path: &Path) -> BTreeSet<String> {
+    let scratch = tempfile::tempdir().expect("a directory for the saved ACL");
+    let saved = scratch.path().join("acl.txt");
+    support::cmd::run(
+        "icacls.exe",
+        &[&path.display().to_string(), "/save", &saved.display().to_string()],
+    )
+    .expect_ok();
+    let bytes = std::fs::read(&saved).expect("read the saved ACL");
+    // `icacls` writes UTF-16 with a byte order mark.
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    let text = String::from_utf16_lossy(&units);
+    let sddl = text
+        .lines()
+        .map(|line| line.trim_start_matches('\u{feff}'))
+        .find(|line| line.starts_with("D:"))
+        .unwrap_or_else(|| panic!("no DACL in the saved ACL of {}:\n{text}", path.display()));
+    sddl.split('(')
+        .skip(1)
+        .map(|ace| {
+            let ace = ace.trim_end_matches(')');
+            ace.split(';')
+                .nth(5)
+                .unwrap_or_else(|| panic!("an ACE without a trustee: {ace:?} in {sddl}"))
+                .to_string()
+        })
+        .collect()
+}
+
+fn names(trustees: &[&str]) -> BTreeSet<String> {
+    trustees.iter().map(|name| (*name).to_string()).collect()
+}
+
 // Provisioning ========================================================================================================
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -46,7 +87,14 @@ fn install_creates_the_state_file_and_a_reinstall_keeps_what_the_shim_wrote() {
     let spec = on_failure(&id, fixture_command("report", &["1"]), Some(HOUR));
 
     mgr.install(&spec, false).expect("install");
-    assert_eq!(record(&id), StateRecord::empty(), "a new file holds the empty record");
+    assert_eq!(
+        record(&id),
+        StateRecord {
+            configured: Some(Actions::new(true, &[HOUR])),
+            ..StateRecord::empty()
+        },
+        "a new file holds the failure actions the service was registered with, for a shim that cannot read its own"
+    );
 
     let failure = state_file::FailureRecord::at(host::clock(), RestartDue::After(5));
     state_file::note_failure(&host::path(&id), failure.clone()).expect("record a failure as the shim would");
@@ -60,7 +108,7 @@ fn install_creates_the_state_file_and_a_reinstall_keeps_what_the_shim_wrote() {
 }
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn uninstall_removes_the_state_file() {
+fn uninstall_removes_the_service_directory() {
     let mgr = ScmManager::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -70,7 +118,7 @@ fn uninstall_removes_the_state_file() {
 
     mgr.uninstall(&spec.id).expect("uninstall");
 
-    assert!(!host::path(&id).exists());
+    assert!(!host::service_dir(&id).exists());
 }
 
 // What the shim writes ================================================================================================
@@ -94,6 +142,61 @@ fn a_local_service_shim_writes_its_failure_record() {
         failure.restart,
         RestartDue::After(3_600_000),
         "the shim must read the restart action it runs under as LocalService: {failure:?}"
+    );
+    // The boot identity is the kernel's boot counter, which any account can read: the one this
+    // shim recorded is the one an administrator reads now, so the record is not mistaken for an
+    // earlier boot's.
+    assert_eq!(
+        failure.boot,
+        host::clock().boot,
+        "a LocalService shim must record the boot it runs on: {failure:?}"
+    );
+}
+
+/// After the shim has replaced its record (which it does at every launch), the file still grants
+/// only the account its service runs as: a rename keeps the descriptor of the file it moves, which
+/// is the one the directory gave the shim's temporary. A service under another account has a
+/// directory of its own, and no service account can reach the state directory itself.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_services_record_stays_closed_to_other_service_accounts_after_the_shim_replaced_it() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let other = support::random_test_id();
+    let _other_guard = ServiceGuard::new(&other);
+    grant_everyone_read_and_execute(env!("CARGO_BIN_EXE_goetia-shim"));
+    grant_everyone_read_and_execute(&support::current_exe_str());
+    let neighbour = DaemonSpec {
+        user: User::Name("NetworkService".to_string()),
+        ..on_failure(&other, fixture_command("report", &["1"]), Some(HOUR))
+    };
+    mgr.install(&neighbour, false).expect("install the other service");
+
+    let (_reported, _spec) = fail_once_as(&mgr, &id, HOUR, User::Name("LocalService".to_string()));
+
+    assert!(
+        record(&id).failure.is_some(),
+        "precondition: the shim wrote through its ACL"
+    );
+    for path in [host::path(&id), host::service_dir(&id)] {
+        let granted = trustees(&path);
+        assert!(granted.contains("LS"), "{}: {granted:?}", path.display());
+        assert!(!granted.contains("NS"), "{}: {granted:?}", path.display());
+        assert!(
+            granted.is_subset(&names(&["SY", "BA", "LS"])),
+            "{}: {granted:?}",
+            path.display()
+        );
+    }
+    let neighbours = trustees(&host::path(&other));
+    assert!(
+        neighbours.contains("NS") && !neighbours.contains("LS"),
+        "{neighbours:?}"
+    );
+    assert_eq!(
+        trustees(&host::dir()),
+        names(&["SY", "BA"]),
+        "no service account may create or read anything directly under the state directory"
     );
 }
 
@@ -240,13 +343,13 @@ fn plant_survivor(id: &str) -> std::process::Child {
     let Resolved::Found(identity) = ProcessId::of(survivor.id()) else {
         panic!("the planted survivor has no identity");
     };
-    state_file::note_survivor(&host::path(id), &identity.to_record().expect("record")).expect("plant the survivor");
+    state_file::note_launch(&host::path(id), &identity.to_record().expect("record")).expect("plant the survivor");
     survivor
 }
 
 /// A daemon the shim could not kill cannot be produced end to end (both kills are refused only by
-/// a unit-test hook), so the survivor is planted: a running process named in the state file, which
-/// is all the shim and the CLI ever read.
+/// a unit-test hook), so the survivor is planted: a running process named as the launched daemon in
+/// the state file, which is all the shim and the CLI ever read.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_start_is_refused_while_the_survivor_runs_and_allowed_when_it_is_gone() {
     let mgr = ScmManager::new();
@@ -301,9 +404,15 @@ fn a_start_is_refused_while_the_survivor_runs_and_allowed_when_it_is_gone() {
     mgr.start(&spec.id, Budget::DEFAULT)
         .expect("start once the survivor is gone");
     reported.accept("the daemon to run");
-    assert_eq!(record(&id), StateRecord::empty());
+    let launched = record(&id).daemon.expect("the shim recorded the daemon it launched");
+    assert_ne!(
+        launched.pid,
+        survivor.id(),
+        "the new daemon replaced the old one's entry"
+    );
 
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    assert_eq!(record(&id).daemon, None, "a daemon that ended is forgotten");
 }
 
 /// The record of a surviving daemon outlives the service it was written for, so registering the
@@ -331,7 +440,7 @@ fn uninstall_keeps_a_live_survivor_so_a_reinstalled_service_cannot_start_over_it
         .expect_err("uninstall reports a daemon it could not stop");
     assert!(told.to_string().contains("deleted"), "{told}");
     let kept = record(&id);
-    assert!(kept.survivor.is_some(), "the survivor must outlive the service");
+    assert!(kept.daemon.is_some(), "the survivor must outlive the service");
     assert_eq!(kept.failure, None, "the pending restart went with the service");
 
     mgr.install(&spec, false).expect("install again");
@@ -347,4 +456,87 @@ fn uninstall_keeps_a_live_survivor_so_a_reinstalled_service_cannot_start_over_it
         .expect("start once the survivor is gone");
     reported.accept("the daemon to run");
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+}
+
+// What kill and a lost delay record ===================================================================================
+
+/// A process that ends without reporting is a crash, and SCM runs recovery for it whatever the
+/// failure-actions flag says; `kill` records the restart it causes the same way.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn goetia_kill_records_the_restart_a_crash_queues_whatever_the_failure_flag_says() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let started = ConnectBack::listen();
+    let spec = on_failure(
+        &id,
+        fixture_command("report", &[&started.port().to_string()]),
+        Some(HOUR),
+    );
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    started.accept("the daemon to report in");
+    support::cmd::run("sc.exe", &["failureflag", &id, "0"]).expect_ok();
+
+    mgr.kill(&spec.id).expect("kill");
+
+    let failure = record(&id).failure.expect("kill recorded the failure it causes");
+    assert_eq!(failure.restart, RestartDue::After(3_600_000), "{failure:?}");
+}
+
+/// A failure whose delay nobody knows is not spent by a start: a start by hand does not cancel what
+/// SCM queued, so the stop that follows is refused, until the host boots again.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_failure_of_unknown_delay_survives_a_start_and_keeps_a_stop_refused() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let started = ConnectBack::listen();
+    let mut spec = on_failure(
+        &id,
+        fixture_command("report", &[&started.port().to_string()]),
+        Some(HOUR),
+    );
+    spec.restart = Restart::Never;
+    mgr.install(&spec, false).expect("install");
+    state_file::note_failure(
+        &host::path(&id),
+        state_file::FailureRecord::at(host::clock(), RestartDue::Unknown),
+    )
+    .expect("record a failure of unknown delay as the shim would");
+
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    started.accept("the daemon to run");
+
+    assert!(record(&id).failure.is_some(), "the start must not spend the failure");
+    let refused = mgr
+        .stop(&spec.id, Budget::DEFAULT)
+        .expect_err("a stop cannot cancel what may be queued");
+    assert!(matches!(refused, goetia::Error::RestartPending { .. }), "{refused:?}");
+}
+
+// A daemon that cannot be recorded ====================================================================================
+
+/// A service registered by an older goetia has no directory, and the shim cannot make one as the
+/// account it runs as. It does not run the daemon where goetia cannot see it: the service fails,
+/// and the log says what to do.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_service_with_no_state_directory_fails_to_start_rather_than_run_a_daemon_unrecorded() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let started = ConnectBack::listen();
+    let mut spec = on_failure(&id, fixture_command("report", &[&started.port().to_string()]), None);
+    spec.restart = Restart::Never;
+    mgr.install(&spec, false).expect("install");
+    std::fs::remove_dir_all(host::service_dir(&id)).expect("remove the service's directory");
+
+    mgr.start(&spec.id, Budget::DEFAULT)
+        .expect_err("a daemon that cannot be recorded must not be reported running");
+
+    // ERROR_PATH_NOT_FOUND: the directory the record would be in.
+    assert_eq!(recorded_exit(&id), RecordedExit { win32: 3, specific: 0 });
+    let logged = fallback_log(&id);
+    assert!(logged.contains("could not record the daemon"), "{logged}");
+    assert!(logged.contains("goetia daemon install"), "{logged}");
 }
