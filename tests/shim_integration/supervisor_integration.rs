@@ -98,12 +98,12 @@ fn stop_kills_the_whole_process_tree() {
     let child_reported = ConnectBack::listen();
     let grandchild_reported = ConnectBack::listen();
 
-    // `restart: always`, not `never`: with `never`, `decide_restart` would
+    // `restart: on-failure`, not `never`: with `never`, `decide_restart` would
     // return `Stop` for every input regardless of the `stopping` flag, so
     // "no replacement child appears" would hold trivially even if the
     // `stopping`-checked-first logic this test exists to guard were deleted
-    // outright. `always` is the policy that would actually respawn a
-    // replacement absent that check.
+    // outright. A killed child exits non-zero, so `on-failure` would actually
+    // respawn a replacement absent that check (scm refuses `always`).
     let spec = mk_spec_full(
         &id,
         fixture_command(
@@ -115,7 +115,7 @@ fn stop_kills_the_whole_process_tree() {
         ),
         None,
         BTreeMap::new(),
-        goetia::spec::Restart::Always,
+        goetia::spec::Restart::OnFailure,
         None,
         None,
     );

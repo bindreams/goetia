@@ -734,17 +734,25 @@ fn managed_kind_with_restart_never_has_no_failure_actions() {
     );
 }
 
+/// The generator must neither panic nor emit anything but on-failure's recovery
+/// actions for `Always` (installed blobs may carry it). Only the blob, which
+/// records the authored `restart`, may differ.
 #[skuld::test]
-fn managed_kind_restart_always_also_sets_failure_actions() {
-    let mut spec = managed_spec();
-    spec.restart = Restart::Always;
-    let reg = build(&spec);
+fn managed_kind_restart_always_renders_as_on_failure() {
+    let mut always = managed_spec();
+    always.restart = Restart::Always;
+    let mut on_failure = managed_spec();
+    on_failure.restart = Restart::OnFailure;
 
+    let mut always = build(&always);
+    let mut on_failure = build(&on_failure);
     assert!(
-        reg.failure_actions.is_some(),
-        "restart: always is approximated by the same recovery action as on-failure on SCM \
-         (accepted divergence: SCM recovery never fires after a clean exit)"
+        always.failure_actions.is_some(),
+        "0.1.0 registered recovery actions for `always`"
     );
+    always.parameters.clear();
+    on_failure.parameters.clear();
+    assert_eq!(render(&always), render(&on_failure));
 }
 
 #[skuld::test]

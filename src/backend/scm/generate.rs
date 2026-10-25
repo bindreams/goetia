@@ -158,6 +158,9 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> ScmRe
         Kind::Simple => None,
         Kind::Managed => match spec.restart {
             Restart::Never => None,
+            // Unreachable from a manifest (`resolve` refuses it), but `classify`
+            // regenerates from installed blobs that may carry it; keep
+            // on-failure's actions so they don't read as modified.
             Restart::OnFailure | Restart::Always => {
                 let delay = spec.restart_delay.unwrap_or(DEFAULT_RESTART_DELAY);
                 Some(FailureActions {

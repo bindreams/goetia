@@ -482,3 +482,35 @@ fn a_scan_that_finished_over_nothing_adds_no_entry() {
 
     assert!(classify_scan(scan).expect("list").is_empty());
 }
+
+// Install refuses `restart: always` ===================================================================================
+
+fn daemon_spec(restart: crate::spec::Restart) -> DaemonSpec {
+    DaemonSpec {
+        id: Id::try_from("frpc").unwrap(),
+        name: "frpc".to_string(),
+        command: vec![r"C:\bin\frpc.exe".to_string()],
+        cwd: None,
+        env: BTreeMap::new(),
+        user: crate::spec::User::Root,
+        restart,
+        restart_delay: None,
+        logs: None,
+        kind: Kind::Managed,
+    }
+}
+
+/// A `DaemonSpec` that did not come from `resolve` must not install with on-failure semantics.
+#[skuld::test]
+fn install_refuses_restart_always_before_touching_the_scm() {
+    let err = refuse_always(&daemon_spec(crate::spec::Restart::Always)).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("frpc") && text.contains("restart: always"), "{text}");
+}
+
+#[skuld::test]
+fn install_accepts_every_other_restart() {
+    for restart in [crate::spec::Restart::Never, crate::spec::Restart::OnFailure] {
+        refuse_always(&daemon_spec(restart)).unwrap();
+    }
+}
