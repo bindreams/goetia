@@ -328,14 +328,26 @@ fn arm_stopped_then_reread<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Re
 /// Run `once` until it settles. `None` from it means the service moved on after being read, so the
 /// stop must read it again: close the handle, which drops the registration `once` left behind, and
 /// start from the top, under the same deadline. A rerun is a fresh reading of a service that
-/// changed, never a retry of the same request, and it happens whatever is left of the deadline: a
-/// read is an RPC, not a wait, and the deadline bounds the waiting `once` does.
-fn rerun_if_moved<A: ScmActor, T>(a: &mut A, mut once: impl FnMut(&mut A) -> io::Result<Option<T>>) -> io::Result<T> {
+/// changed, never a retry of the same request. Whatever is left of the deadline, a service that
+/// moved gets one more reading (a read is an RPC, not a wait), so the answer follows the state; once
+/// the deadline has run out that is the last one, and a service that has moved again is `expired`:
+/// `--timeout` bounds the whole call, not only the waits.
+fn rerun_if_moved<A: ScmActor, T>(
+    a: &mut A,
+    deadline: Deadline,
+    expired: T,
+    mut once: impl FnMut(&mut A) -> io::Result<Option<T>>,
+) -> io::Result<T> {
+    let mut last = false;
     loop {
         if let Some(settled) = once(a)? {
             return Ok(settled);
         }
         a.reopen_service()?;
+        if last {
+            return Ok(expired);
+        }
+        last = deadline.expired();
     }
 }
 
@@ -355,7 +367,7 @@ fn rerun_if_moved<A: ScmActor, T>(a: &mut A, mut once: impl FnMut(&mut A) -> io:
 /// and never waited for: nothing cancels it, and a crash-looping daemon would keep such a wait from
 /// ever ending.
 pub fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Kind) -> io::Result<StopWaited> {
-    rerun_if_moved(a, |a| stop_once(a, deadline, kind))
+    rerun_if_moved(a, deadline, StopWaited::Expired, |a| stop_once(a, deadline, kind))
 }
 
 /// One pass of [`stop_via_notify`]; `None` when the service moved and must be read again.
@@ -475,7 +487,9 @@ pub fn uninstall_teardown<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Kind
 /// refused by a service that has not moved is an error. Ends
 /// [`StopWaited::Confirmed`], [`StopWaited::Incomplete`] or [`StopWaited::Expired`].
 fn stop_unless_stopped<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Kind) -> io::Result<StopWaited> {
-    rerun_if_moved(a, |a| stop_unless_stopped_once(a, deadline, kind))
+    rerun_if_moved(a, deadline, StopWaited::Expired, |a| {
+        stop_unless_stopped_once(a, deadline, kind)
+    })
 }
 
 /// One pass of [`stop_unless_stopped`]; `None` when the service moved and must be read again.

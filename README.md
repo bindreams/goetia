@@ -814,7 +814,8 @@ such as a `type: managed` service that reports running and answers `STOP` with a
 error, makes `stop` and `restart` exit `1`, and `uninstall` exit `1` saying the
 service was not deleted. goetia sends the control again only to a service whose
 state or process has changed since it last looked. That second look is not a
-wait, so it happens even when `--timeout` has run out.
+wait, so it happens even when `--timeout` has run out; after that, one more look
+at most, and a service that is still changing is reported as timed out.
 
 ### What returning means
 

@@ -99,9 +99,13 @@ enum Forced {
     AlwaysInvalid,
     /// `ERROR_INVALID_SERVICE_CONTROL` for good: a running service that does not accept `STOP`.
     NeverAccepts,
+    /// Every control meets a service that has crashed and been restarted since it was read: it
+    /// answers `ERROR_SERVICE_NOT_ACTIVE`, and is `RUNNING` again in a new process. A service that
+    /// never settles.
+    AlwaysMoved,
 }
 
-const FORCED: [Forced; 7] = [
+const FORCED: [Forced; 8] = [
     Forced::Ok,
     Forced::Busy,
     Forced::NotActive,
@@ -109,6 +113,7 @@ const FORCED: [Forced; 7] = [
     Forced::AlwaysBusy,
     Forced::AlwaysInvalid,
     Forced::NeverAccepts,
+    Forced::AlwaysMoved,
 ];
 
 /// How a start in progress (a restart SCM made, or one a user asked for) ends.
@@ -388,7 +393,7 @@ impl Scm {
             self.apply_change();
         }
         let forced = match self.forced {
-            Forced::Ok | Forced::NeverAccepts => None,
+            Forced::Ok | Forced::NeverAccepts | Forced::AlwaysMoved => None,
             Forced::Busy | Forced::AlwaysBusy => Some(Reply::Busy),
             Forced::NotActive => Some(Reply::NotActive),
             Forced::Invalid | Forced::AlwaysInvalid => Some(Reply::Invalid),
@@ -405,6 +410,11 @@ impl Scm {
             QueriedState::StartPending => Reply::Invalid,
             QueriedState::Stopped => Reply::NotActive,
             QueriedState::Running if self.forced == Forced::NeverAccepts => self.refuse(Reply::Invalid),
+            QueriedState::Running if self.forced == Forced::AlwaysMoved => {
+                self.pid += 1;
+                self.set(QueriedState::Running, clean());
+                self.refuse(Reply::NotActive)
+            }
             QueriedState::Running => {
                 let exit = match self.stop_meets {
                     StopMeets::Clean => clean(),
@@ -656,6 +666,7 @@ fn expected(path: Path, first: First, row: &Row) -> Outcome {
         Path::StopOnSpentBudget => match first {
             First::StartPending => Outcome::RestartPending,
             First::StopPending => Outcome::Expired,
+            First::Running if row.forced == Forced::AlwaysMoved => Outcome::Expired,
             First::Running => match acts_on {
                 First::StartPending => Outcome::RestartPending,
                 First::StoppedClean => Outcome::Stopped,
@@ -681,7 +692,14 @@ fn expected(path: Path, first: First, row: &Row) -> Outcome {
 
 /// Whether a row can happen: the late change needs a pending callback to follow, which only a
 /// stopping service the stop waits on gives.
-fn possible(path: Path, first: First, change: Change, late: bool) -> bool {
+fn possible(path: Path, first: First, change: Change, late: bool, forced: Forced) -> bool {
+    // A service that never settles ends only on a deadline that has run out, and is met by a
+    // control only when it starts out running.
+    if forced == Forced::AlwaysMoved
+        && (path != Path::StopOnSpentBudget || first != First::Running || change != Change::None || late)
+    {
+        return false;
+    }
     !late
         || (first == First::StopPending
             && change != Change::None
@@ -698,10 +716,10 @@ fn every_stop_path_survives_every_interleaving_of_the_service_state() {
         for first in FIRSTS {
             for change in CHANGES {
                 for late in [false, true] {
-                    if !possible(path, first, change, late) {
-                        continue;
-                    }
                     for forced in FORCED {
+                        if !possible(path, first, change, late, forced) {
+                            continue;
+                        }
                         for starts in STARTS {
                             for stop_meets in STOP_MEETS {
                                 rows += 1;
@@ -769,6 +787,11 @@ fn every_stop_path_survives_every_interleaving_of_the_service_state() {
                                             problems.push("step 1 sent a control to a stopped service".to_string());
                                         }
                                     }
+                                }
+                                // Past the deadline the stop reads the service once more and no further,
+                                // however much it keeps moving: the first control, and one after it.
+                                if forced == Forced::AlwaysMoved && scm.controls != 2 {
+                                    problems.push(format!("{} controls past a spent deadline, wanted 2", scm.controls));
                                 }
                                 if !problems.is_empty() {
                                     failures.push(format!("{label}: {}", problems.join("; ")));
