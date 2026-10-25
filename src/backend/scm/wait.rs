@@ -22,6 +22,9 @@ use crate::spec::Kind;
 pub enum WantState {
     Stopped,
     Running,
+    /// Either terminal state, `START_PENDING` excluded: arming it while the service is starting
+    /// does not fire until the start has settled.
+    RunningOrStopped,
 }
 
 /// The service state a `wait_callback` observed. Distinct from [`WantState`]:
@@ -104,6 +107,31 @@ pub fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result
             // Running/Pending are non-terminal for a stop wait — re-arm and wait.
             Some(Observed::Running | Observed::Pending) => {
                 if a.arm(WantState::Stopped, deadline)? == Waited::Expired {
+                    return Ok(Waited::Expired);
+                }
+            }
+        }
+    }
+}
+
+/// What to do once `DeleteService` has marked the service, so that nothing it was running or
+/// restarting outlives `uninstall`. A marked service gets no further SCM restarts, but one
+/// begun before the delete may still be `START_PENDING` or `RUNNING`.
+///
+/// Waits, with no poll, for `RUNNING` or `STOPPED`. `STOPPED` is done. `RUNNING` is stopped through
+/// [`stop_via_notify`]. No stop is sent while `START_PENDING`: SCM rejects it with 1052 and it has
+/// no later effect.
+pub fn settle_after_delete<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
+    if a.arm(WantState::RunningOrStopped, deadline)? == Waited::Expired {
+        return Ok(Waited::Expired);
+    }
+    loop {
+        match a.wait_callback(deadline)? {
+            None => return Ok(Waited::Expired),
+            Some(Observed::Stopped) => return Ok(Waited::Confirmed),
+            Some(Observed::Running) => return stop_via_notify(a, deadline),
+            Some(Observed::Pending) => {
+                if a.arm(WantState::RunningOrStopped, deadline)? == Waited::Expired {
                     return Ok(Waited::Expired);
                 }
             }

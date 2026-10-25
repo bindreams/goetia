@@ -21,6 +21,7 @@ struct FakeScm {
     waits: VecDeque<Option<Observed>>,
     what_arm_reports: Waited,
     start_fails: bool,
+    stop_fails: bool,
     /// What `start` answers when it does not fail.
     start_reply: StartReply,
     /// The deadline each `wait_callback` was handed, in call order.
@@ -40,6 +41,7 @@ impl FakeScm {
             waits: waits.into(),
             what_arm_reports: Waited::Confirmed,
             start_fails: false,
+            stop_fails: false,
             start_reply: StartReply::Accepted,
             deadlines: vec![],
             arm_deadlines: vec![],
@@ -74,6 +76,12 @@ impl FakeScm {
         self
     }
 
+    /// `control_stop` reports failure.
+    fn rejecting_stop(mut self) -> Self {
+        self.stop_fails = true;
+        self
+    }
+
     /// `start` answers `ERROR_SERVICE_ALREADY_RUNNING`, with `queried` as the
     /// follow-up query's state.
     fn already_running(mut self, queried: QueriedState) -> Self {
@@ -92,11 +100,15 @@ impl ScmActor for FakeScm {
         self.log.push(match want {
             WantState::Stopped => "arm_stopped",
             WantState::Running => "arm_running",
+            WantState::RunningOrStopped => "arm_running_or_stopped",
         });
         Ok(self.what_arm_reports)
     }
     fn control_stop(&mut self) -> std::io::Result<()> {
         self.log.push("control_stop");
+        if self.stop_fails {
+            return Err(std::io::Error::other("scripted stop failure"));
+        }
         Ok(())
     }
     fn start(&mut self) -> std::io::Result<StartReply> {
@@ -167,6 +179,78 @@ fn stop_re_arms_after_a_non_terminal_callback() {
             "got_stopped",
         ]
     );
+}
+
+// the wait after DeleteService ----------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn after_a_delete_a_running_service_is_stopped_and_its_stop_awaited() {
+    let mut fake = FakeScm::new([Some(Observed::Running), Some(Observed::Stopped)]);
+    assert_eq!(settle_after_delete(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        fake.log,
+        vec![
+            "arm_running_or_stopped",
+            "wait",
+            "got_running",
+            "arm_stopped",
+            "control_stop",
+            "wait",
+            "got_stopped",
+        ]
+    );
+}
+
+/// STOP sent in `START_PENDING` is rejected with 1052 and has no later effect, so nothing is sent
+/// until the service has reached `RUNNING`.
+#[skuld::test]
+fn after_a_delete_a_start_pending_service_is_waited_out_before_any_stop() {
+    let mut fake = FakeScm::new([
+        Some(Observed::Pending),
+        Some(Observed::Running),
+        Some(Observed::Stopped),
+    ]);
+    assert_eq!(settle_after_delete(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        fake.log,
+        vec![
+            "arm_running_or_stopped",
+            "wait",
+            "got_pending",
+            "arm_running_or_stopped",
+            "wait",
+            "got_running",
+            "arm_stopped",
+            "control_stop",
+            "wait",
+            "got_stopped",
+        ]
+    );
+}
+
+#[skuld::test]
+fn after_a_delete_a_stopped_service_is_left_alone() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]);
+    assert_eq!(settle_after_delete(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(fake.log, vec!["arm_running_or_stopped", "wait", "got_stopped"]);
+}
+
+/// The daemon can end between `RUNNING` and the stop, where `control_stop` answers
+/// `ERROR_SERVICE_NOT_ACTIVE` (absorbed by the actor as `Ok`). The `STOPPED` it left must still reach
+/// the wait, which holds only if the stop wait is armed before the stop is sent.
+#[skuld::test]
+fn after_a_delete_a_service_that_ends_before_the_stop_lands_still_confirms() {
+    let mut fake = FakeScm::new([Some(Observed::Running), Some(Observed::Stopped)]);
+    assert_eq!(settle_after_delete(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    let arm = fake.log.iter().position(|s| *s == "arm_stopped").unwrap();
+    let stop = fake.log.iter().position(|s| *s == "control_stop").unwrap();
+    assert!(arm < stop, "{:?}", fake.log);
+}
+
+#[skuld::test]
+fn after_a_delete_a_failed_stop_is_an_error() {
+    let mut fake = FakeScm::new([Some(Observed::Running)]).rejecting_stop();
+    assert!(settle_after_delete(&mut fake, unbounded()).is_err());
 }
 
 #[skuld::test]

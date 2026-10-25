@@ -166,6 +166,47 @@ fn on_failure_restarts_are_paced_new_shims() {
     drop(running);
 }
 
+/// A daemon that fails at once under `restart-delay: 0s` is `STOPPED`, `START_PENDING` or `RUNNING`
+/// at any moment, so `uninstall` meets a restart SCM has queued or just begun. Whatever it meets, the
+/// service must be gone when it returns: a delete that landed after a restart would only mark it.
+/// The test holds no service handle across the `uninstall`, or the record would survive it.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn uninstall_leaves_no_restarted_daemon_behind() {
+    use windows_service::service::ServiceAccess;
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let reported = ConnectBack::listen();
+
+    let spec = on_failure(
+        &id,
+        fixture_command("exit", &[&reported.port().to_string(), "1"]),
+        Some(Duration::ZERO),
+    );
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    reported.accept("the daemon to have run");
+
+    mgr.uninstall(&spec.id).expect("uninstall");
+
+    let scm = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).expect("connect to SCM");
+    match scm.open_service(&id, ServiceAccess::QUERY_STATUS) {
+        Err(windows_service::Error::Winapi(e)) => assert_eq!(
+            e.raw_os_error(),
+            Some(1060),
+            "expected ERROR_SERVICE_DOES_NOT_EXIST, got {e}"
+        ),
+        Err(other) => panic!("opening the uninstalled service failed unexpectedly: {other}"),
+        Ok(service) => {
+            let status = service.query_status().expect("query the service that is still there");
+            panic!("the service survived `uninstall`: {status:?}");
+        }
+    }
+    // The record is gone, so no shim of this service (and no daemon under one) is running.
+}
+
 // What is reported ====================================================================================================
 
 /// Runs `exit-on-close` under `restart: never` (so SCM does nothing after the report), lets the

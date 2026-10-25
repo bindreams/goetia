@@ -733,8 +733,8 @@ once: a stop it accepts before it decides the exit is reported as a clean stop,
 which SCM does not restart; a stop that arrives after it has decided on the
 failure does not change it. SCM acknowledges that stop anyway, whatever the
 shim answers, so `stop` exits `0` and SCM restarts the command as above.
-`goetia daemon uninstall` is not affected: deleting the service cancels a
-restart SCM has queued.
+`goetia daemon uninstall` is not affected: it deletes first, so no queued restart
+fires, and then stops anything already restarted.
 
 After upgrading goetia, run `goetia daemon install` again for every daemon
 installed by an older version. Services registered before this shim existed
@@ -770,8 +770,8 @@ if the assignment fails, it is resumed anyway and runs outside any job until the
 shim notices and kills it, and anything it started in that time sits outside any
 job too. The shim then logs why and reports `0`, `1003`, as for a `stop` it
 could not complete, because no kill of a tree outside a job shows its
-descendants gone and SCM must not restart over a possible survivor. A `start` that sees the service stop with that
-record is a failed start.
+descendants gone and SCM must not restart over a possible survivor. A `start`
+that sees the service stop with that record is a failed start.
 
 Before the shim reports any failure SCM restarts (the command exiting non-zero,
 or the shim's own wait on it failing), it terminates the job, so the restart does
@@ -781,7 +781,9 @@ terminated, it reports `0`, `1003` as for a `stop` it could not complete, whatev
 
 Nothing guards against a possible survivor afterwards: `stop` exits `0`,
 including the `stop` that produced the record, and a later `start`, `restart` or
-`sc start` launches a second copy beside it.
+`sc start` launches a second copy beside it. `goetia daemon status` and `list`
+show such a service as `stopped`, and so they do one waiting out its
+`restart-delay`.
 
 "Terminated" means the OS has stopped every thread of the command and its
 descendants, not that it has finished releasing what they held. A restarted
