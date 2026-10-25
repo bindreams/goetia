@@ -20,6 +20,8 @@ mod logging;
 #[cfg(windows)]
 mod service;
 #[cfg(windows)]
+mod state;
+#[cfg(windows)]
 mod stop_bus;
 #[cfg(all(test, windows))]
 mod test_support;
