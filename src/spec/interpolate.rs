@@ -3,9 +3,8 @@
 //! [`scalar`] substitutes one string against `.env`; [`check_grammar`]
 //! checks the same grammar without resolving anything. [`spec`] and
 //! [`check_spec_grammar`] walk one [`RawSpec`]'s string leaves, calling one
-//! or the other on each. `resolve` (`resolve.rs`) is what calls all four —
-//! this module no longer walks a whole [`RawManifest`] itself; see "This
-//! must run before `resolve_shape`, never after" below.
+//! or the other on each. `resolve` (`resolve.rs`) is what calls all four;
+//! see "This must run before `resolve_shape`, never after" below.
 //!
 //! # This must run before `resolve_shape`, never after
 //!

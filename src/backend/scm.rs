@@ -1,5 +1,6 @@
 //! The scm backend.
 
+pub mod exit_status;
 pub mod generate;
 pub(crate) mod kill;
 #[cfg(windows)]

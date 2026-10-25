@@ -236,8 +236,8 @@ fn an_aggregate_undetermined_entry_has_a_null_name_and_names_its_count() {
     }
 }
 
-/// The invariant `Installed::Undetermined` states and the aggregate used to break: *an entry for
-/// exactly one known id always names it*. The name is in hand at the call site, and a null one is
+/// The invariant `Installed::Undetermined` states: *an entry for exactly one known id always names
+/// it*. The name is in hand at the call site, and a null one is
 /// not a stricter report but a wrong one — it withholds every negative answer about every other id
 /// on the host, when the only thing goetia failed to read was this service.
 #[skuld::test]
@@ -259,9 +259,9 @@ fn an_aggregate_standing_for_one_service_names_it() {
 /// The remedy on a named entry is the one the *errno* earned, not the one the common case usually
 /// wants. `undetermined` picks between them for `status` — "elevation is advice only a permission
 /// boundary earns" is its own doc comment — and a named `list` entry stands for exactly the same
-/// single failed read, so it has the same errno in hand and no reason to answer differently. A
-/// corrupt hive on an already-elevated host used to be told to re-run elevated by `list` while
-/// `status <same-id>` told it to fix the disk: two answers on one condition.
+/// single failed read, so it has the same errno in hand and no reason to answer differently. On a
+/// corrupt hive on an already-elevated host, `list` and `status <same-id>` both say to fix the disk,
+/// not to re-run elevated.
 #[skuld::test]
 fn a_named_entry_carries_the_remedy_the_errno_earned_not_elevation() {
     let hive = unreadable_parts(
@@ -315,8 +315,7 @@ fn a_named_entry_offers_the_same_remedy_status_renders() {
 
 /// A failure that arrived without a conditioned remedy gets none invented for it. `read_parameters`
 /// builds every failure it has through `registry_undetermined`, so this arm is unreachable there;
-/// what it pins is that the fallback stays honest rather than defaulting to the elevation advice
-/// that used to be unconditional.
+/// what it pins is that the fallback stays honest rather than defaulting to the elevation advice.
 #[skuld::test]
 fn a_cause_that_carries_no_remedy_is_given_none() {
     let parts = unreadable_parts("MsSecFlt".to_string(), Error::Other("the hive is corrupt".to_string()));
@@ -344,8 +343,8 @@ fn a_named_entry_does_not_carry_the_aggregate_claim() {
     let Some(Installed::Undetermined { reason, .. }) = unreadable_aggregate(vec![denied("MsSecFlt")]) else {
         panic!("one unreadable service is undetermined");
     };
-    // `Err(_)` used to throw the cause away here and hand the entry a static sentence — the one
-    // thing `service_detail`'s own doc comment calls useless for diagnosing a real Win32 failure.
+    // The cause is kept: `service_detail`'s own doc comment calls a static sentence useless for
+    // diagnosing a real Win32 failure.
     assert!(
         reason.contains(r"registry open HKLM\...\MsSecFlt\Parameters: denied"),
         "the read that failed is the diagnosable part, and one entry has room for it: {reason}"
@@ -512,5 +511,97 @@ fn install_refuses_restart_always_before_touching_the_scm() {
 fn install_accepts_every_other_restart() {
     for restart in [crate::spec::Restart::Never, crate::spec::Restart::OnFailure] {
         refuse_always(&daemon_spec(restart)).unwrap();
+    }
+}
+
+// start_kind ----------------------------------------------------------------------------------------------------------
+
+fn blob_of(kind: Kind) -> Blob {
+    Blob {
+        schema: 1,
+        version: "0.1.0".to_string(),
+        spec: DaemonSpec {
+            id: Id::try_from("frpc").unwrap(),
+            name: "frpc".to_string(),
+            command: vec!["frpc".to_string()],
+            cwd: None,
+            env: BTreeMap::new(),
+            user: crate::spec::User::Root,
+            restart: Restart::Never,
+            restart_delay: None,
+            logs: None,
+            kind,
+        },
+    }
+}
+
+#[skuld::test]
+fn start_reads_a_simple_service_by_the_shims_vocabulary_and_anything_else_strictly() {
+    assert_eq!(start_kind(Ok(Some(blob_of(Kind::Simple)))), (Kind::Simple, None));
+    assert_eq!(start_kind(Ok(Some(blob_of(Kind::Managed)))), (Kind::Managed, None));
+    let (kind, why) = start_kind(Ok(None));
+    assert_eq!(kind, Kind::Managed);
+    assert!(why.is_some());
+    let (kind, why) = start_kind(Err(Error::Blob("corrupt".to_string())));
+    assert_eq!(kind, Kind::Managed);
+    assert!(why.unwrap().contains("corrupt"));
+}
+
+/// A start judged strictly because the blob could not be read says why, so the user is not told a
+/// `type: simple` daemon failed to start in a way that only a managed service's start can.
+#[skuld::test]
+fn a_failed_start_names_the_blob_read_error_that_made_it_strict() {
+    let id = Id::try_from("frpc").unwrap();
+    let e = std::io::Error::other("service stopped before reaching Running");
+
+    let plain = failed_start(&id, &e, None).to_string();
+    assert!(!plain.contains("blob"), "{plain}");
+
+    let strict = failed_start(&id, &e, Some("invalid blob JSON: EOF")).to_string();
+    assert!(strict.contains("service stopped before reaching Running"), "{strict}");
+    assert!(strict.contains("could not be read"), "{strict}");
+    assert!(strict.contains("invalid blob JSON: EOF"), "{strict}");
+}
+
+/// A service installed by 0.1.0 under `restart: always` keeps a blob that says so. It decodes, and
+/// a `type: simple` one starts by the shim's vocabulary like any other.
+#[skuld::test]
+fn a_blob_that_says_always_decodes_and_starts_as_its_kind() {
+    let spec = DaemonSpec {
+        restart: Restart::Always,
+        ..blob_of(Kind::Simple).spec
+    };
+    let reg = generate::registration(
+        &spec,
+        &crate::backend::Identity {
+            user: "svc-frpc".to_string(),
+        },
+        &PathBuf::from(r"C:\shim\goetia-shim.exe"),
+    );
+
+    let blob = generate::extract(&reg.parameters)
+        .expect("the blob decodes")
+        .expect("the blob is ours");
+
+    assert_eq!(blob.spec.restart, Restart::Always);
+    assert_eq!(start_kind(Ok(Some(blob))), (Kind::Simple, None));
+}
+
+// refuse_always at its call sites -------------------------------------------------------------------------------------
+
+/// `install` and `preview_install` refuse `always` before anything reads the SCM, so the refusal is
+/// reachable without one.
+#[skuld::test]
+fn install_and_preview_install_refuse_restart_always() {
+    let mgr = ScmManager::new();
+    let spec = daemon_spec(Restart::Always);
+
+    for result in [
+        mgr.install(&spec, false).map(|_| ()),
+        mgr.preview_install(&spec).map(|_| ()),
+    ] {
+        let err = result.expect_err("`restart: always` must be refused for scm");
+        assert!(matches!(err, Error::Invalid { .. }), "{err:?}");
+        assert!(err.to_string().contains("restart: always"), "{err}");
     }
 }
