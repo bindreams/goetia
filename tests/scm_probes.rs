@@ -29,6 +29,7 @@ mod host {
     use std::io::Write as _;
     use std::net::{Ipv4Addr, TcpStream};
     use std::os::windows::io::AsRawHandle as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -41,6 +42,8 @@ mod host {
     use windows_service::{define_windows_service, service_dispatcher};
 
     pub const HOST: &str = "--probe-host";
+
+    static REFUSE_ONE_STOP: AtomicBool = AtomicBool::new(false);
 
     pub fn run_if_requested() -> bool {
         let args: Vec<String> = std::env::args().collect();
@@ -81,6 +84,10 @@ mod host {
 
         let (stop_tx, stop_rx) = mpsc::channel();
         let handler = move |control| match control {
+            // As goetia-shim refuses a stop once it has decided on a failure.
+            ServiceControl::Stop if REFUSE_ONE_STOP.swap(false, Ordering::SeqCst) => {
+                ServiceControlHandlerResult::Other(windows_sys::Win32::Foundation::ERROR_SERVICE_CANNOT_ACCEPT_CTRL)
+            }
             ServiceControl::Stop => {
                 let _ = stop_tx.send(());
                 ServiceControlHandlerResult::NoError
@@ -128,6 +135,7 @@ mod host {
                     }
                 }
                 ["wait-stop"] => stop_rx.recv().expect("stop control"),
+                ["refuse-one-stop"] => REFUSE_ONE_STOP.store(true, Ordering::SeqCst),
                 ["hold", ms] => std::thread::sleep(Duration::from_millis(u64::from(code(ms)))),
                 ["stopped", kind, n] => {
                     let n = code(n);
@@ -938,6 +946,40 @@ mod probes {
         r
     }
 
+    // P16 =============================================================================================================
+
+    /// A host whose control handler refuses STOP with `ERROR_SERVICE_CANNOT_ACCEPT_CTRL`, as
+    /// goetia-shim does once it has decided on a failure: does `ControlService` fail with that code,
+    /// and does SCM leave the state alone? The second STOP is accepted and ends the run cleanly.
+    fn p16() -> String {
+        let delay = Duration::from_millis(1000);
+        let mut p = Probe::new(
+            "P16",
+            &format!("run,refuse-one-stop,connect,wait-stop,stopped:w32:0|{STAY_UP}"),
+            &format!("restart/{}", delay.as_millis()),
+        );
+        let _ = p.start();
+        p.connect(0, EXPECTED_BOUND);
+        let svc = p.service(ServiceAccess::STOP | ServiceAccess::QUERY_STATUS);
+        let refused = control_stop(&svc);
+        p.p(format_args!("first STOP: {refused}"));
+        let after_refusal = p.status();
+        p.p(format_args!("status after the refused STOP: {after_refusal}"));
+        let accepted = control_stop(&svc);
+        p.p(format_args!("second STOP: {accepted}"));
+        p.wait_state(ServiceState::Stopped, EXPECTED_BOUND);
+        let bound = absence_bound(delay);
+        let r1 = p.connect(1, bound).cloned();
+        let r = format!(
+            "first STOP {refused}; then status {after_refusal}; second STOP {accepted}; final status {}; after: {}",
+            p.status(),
+            describe(r1.as_ref(), bound)
+        );
+        p.result(&r);
+        p.dump_scm_events("P16");
+        r
+    }
+
     // P10 =============================================================================================================
 
     #[derive(Clone, Copy)]
@@ -1714,6 +1756,7 @@ mod probes {
         let jobs: Vec<(&'static str, Job)> = vec![
             ("P15a", Box::new(|| p15("a"))),
             ("P15b", Box::new(|| p15("b"))),
+            ("P16", Box::new(p16)),
         ];
         println!("PROBE SUMMARY begin");
         for (name, job) in jobs {
