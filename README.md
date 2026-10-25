@@ -578,6 +578,66 @@ So the exit status is not a "did I get JSON" test. A `4` still carries a
 complete, well-formed document describing what could and could not be
 determined: parse stdout first, then read `errors` and `undetermined`.
 
+## `install` never changes whether a daemon runs
+
+Installing over a running daemon neither stops nor restarts it, on every
+platform, with one exception on launchd (below). What differs is when a changed
+spec takes effect:
+
+| Platform | Installing a changed spec over a running daemon                                                  |
+| -------- | ------------------------------------------------------------------------------------------------ |
+| systemd  | The daemon keeps running. Its next start of any kind, goetia's or `Restart=`'s or boot, uses it. |
+| SCM      | The same: the daemon keeps running, and its next start of any kind uses the new spec.            |
+| launchd  | Refused: `install` writes nothing, exits `1` and names the daemon. See below.                    |
+
+launchd keeps the definition a job was loaded with and cannot update it, so
+a rewritten plist would leave `start` running the old definition and reporting
+success. `install` refuses instead, while launchd has the job loaded. That
+includes a job that has exited, or crashed and is awaiting its relaunch:
+"loaded" means launchd holds the job, not that it has a process. The remedy
+is in the message:
+
+```sh
+goetia daemon stop <id>   # boots the job out of launchd
+goetia daemon install     # now writes the new plist
+goetia daemon start <id>
+```
+
+What is compared is the plist, not the spec: the one `install` would write
+against the one on disk, each without goetia's own metadata comment (the
+embedded spec and goetia version). `install` refuses when they differ. That
+covers a changed spec, a `--force` overwrite of a hand-edited plist, a newer
+goetia that renders the same spec differently, and an unchanged
+`user: {id: ...}` whose account name has changed. It does not cover a spec
+change the plist does not render, or a newer goetia that renders the same
+text: those are written as usual and leave the loaded job as it is, since
+launchd reads the same thing either way. `install --start` is refused the
+same way, before it starts anything. `install --dry-run` and `diff` read no
+job state and do not report the refusal. If something else loads the job
+between that check and the write, `install` checks again after writing, puts
+the plist back as it was and exits `4`: goetia cannot tell which plist the
+loaded job read. So it does when that second check cannot read launchd's
+answer. With the plist back, re-running `install` is refused while the job is
+loaded, and the message gives the same stop, install, start remedy. The
+put-back writes only over the plist `install` wrote: if a concurrent `enable`,
+`uninstall` or install has moved, removed or replaced it since, it is left as
+it is, and the message says what is on disk. When `launchctl print` fails for
+any reason other than "no such job", `install` and `start` fail rather than
+take the job to be unloaded.
+
+**The exception.** Creating a daemon whose id has no goetia plist, while
+launchd has a job loaded under the same label (a predecessor installed by hand,
+say), stops that job: `start` would otherwise see the label loaded, take it
+for the new daemon, and report success while the daemon never ran. The job is
+booted out only after the plist is staged and checked, and the plist is created
+after that, so a failure at any step leaves no plist and a rerun tries again. If
+the job is loaded again once the plist is created, `install` removes the plist
+and exits `4`. If another writer took the plist's place after the boot out,
+`install` exits `4`, says the job was booted out and what is there, and leaves
+it. If the plist is taken or removed after `install` has read launchd's state
+but before it has sent anything, `install` exits `1`: no plist was written and
+nothing was sent, and a rerun starts afresh.
+
 ## Waiting for a start or stop
 
 `daemon start`, `daemon stop`, `daemon restart` and `daemon install --start`
@@ -681,14 +741,14 @@ Two rules come before the numbers:
    `grep` has distinguished "no match" from "could not read the file" since
    v7 Unix.
 
-| Code | Name          | Meaning                                                                                                                                                                                                                                                                                                                   | Anchored to                                                                                               |
-| ---- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `0`  | success       | The state is as asked, or the question was fully answered.                                                                                                                                                                                                                                                                | —                                                                                                         |
-| `1`  | error         | An operation was attempted and failed, or was refused outright.                                                                                                                                                                                                                                                           | —                                                                                                         |
-| `2`  | usage         | The command line was rejected before anything ran — by clap, or by one of `dispatch`'s refusals (`--json` on a subcommand that does not implement it; a wait flag on an `install` with no `--start`).                                                                                                                     | clap's own default: the same code bash and argparse use for "the parser, not the program, rejected this". |
-| `3`  | drift         | A determinate "installed state differs from the manifest" answer. Only `diff` returns it.                                                                                                                                                                                                                                 | Nothing; app-specific.                                                                                    |
-| `4`  | indeterminate | A question goetia could not answer about an id: its state, whether it is occupied at all, or the outcome of a request goetia did not wait out — it stopped waiting, never waited, or lost track of it — or whether a request reached the manager at all, when goetia lost the tool carrying it after it may have started. | The LSB init-script convention's "service status unknown".                                                |
-| `5`  | conflict      | An installed artifact was modified outside goetia and `--force` was not given. See below: `--force` is not always the remedy.                                                                                                                                                                                             | Nothing; app-specific — which is why `5` is the code that moved rather than usage errors.                 |
+| Code | Name          | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                        | Anchored to                                                                                               |
+| ---- | ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `0`  | success       | The state is as asked, or the question was fully answered.                                                                                                                                                                                                                                                                                                                                                                                                     | —                                                                                                         |
+| `1`  | error         | An operation was attempted and failed, or was refused outright.                                                                                                                                                                                                                                                                                                                                                                                                | —                                                                                                         |
+| `2`  | usage         | The command line was rejected before anything ran — by clap, or by one of `dispatch`'s refusals (`--json` on a subcommand that does not implement it; a wait flag on an `install` with no `--start`).                                                                                                                                                                                                                                                          | clap's own default: the same code bash and argparse use for "the parser, not the program, rejected this". |
+| `3`  | drift         | A determinate "installed state differs from the manifest" answer. Only `diff` returns it.                                                                                                                                                                                                                                                                                                                                                                      | Nothing; app-specific.                                                                                    |
+| `4`  | indeterminate | A question goetia could not answer about an id: its state, whether it is occupied at all, or the outcome of a request goetia did not wait out — it stopped waiting, never waited, or lost track of it — or whether a request reached the manager at all, when goetia lost the tool carrying it after it may have started; or, on launchd, which definition a job loaded during `install` holds, or what took a plist's place after `install` booted out a job. | The LSB init-script convention's "service status unknown".                                                |
+| `5`  | conflict      | An installed artifact was modified outside goetia and `--force` was not given. See below: `--force` is not always the remedy.                                                                                                                                                                                                                                                                                                                                  | Nothing; app-specific — which is why `5` is the code that moved rather than usage errors.                 |
 
 `2` and `4` are the two that must not be renumbered for tidiness: both are
 tied to a convention outside goetia.
@@ -1002,11 +1062,14 @@ that comes with it.
 ### The two sources of `4`
 
 Two within what `list`, `status` and `show` report. The mutating verbs reach
-`4` three more ways: by
+`4` four more ways: by
 [waiting and giving up](#when-the-wait-runs-out); by losing track of a
-request, one that reached the manager or one that may or may not have; and,
-for a `restart` that does not wait, by a start refused after a stop nobody
-confirmed. The two
+request, one that reached the manager or one that may or may not have; for a
+`restart` that does not wait, by a start refused after a stop nobody confirmed;
+and, on launchd, by an `install` that wrote a plist and then found the job
+loaded, or could not read whether it was, or that booted out a job and found
+its plist taken
+([above](#install-never-changes-whether-a-daemon-runs)). The two
 sources are not interchangeable, and the remedies do not transfer:
 
 - **`unreadable`** — goetia's own daemon that goetia cannot use or report
