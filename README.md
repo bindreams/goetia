@@ -821,9 +821,14 @@ error, makes `stop` and `restart` exit `1`, and `uninstall` exit `1` saying the
 service was not deleted. goetia sends the control again only to a service whose
 state or process has changed since it last looked. That second look is not a
 wait, so it happens even when `--timeout` has run out; after that, one more look
-at most, and a service that is still changing is reported as timed out. With
-`--timeout 0` a service that changes under the second control as well exits `4`,
-saying it kept changing state and no stop was issued.
+at most. A service that is still changing then exits `4` under any `--timeout`,
+`0` included, saying it kept changing state and no stop was issued; it is not
+reported as timed out, since no stop request is outstanding. The same holds for a
+`stop` whose `--timeout` runs out while it waits for a shim that refused the stop:
+the shim refused it, so it exits `4` with the restart message above. goetia
+recognises that refusal only from a service whose spec it can read as
+`type: simple`; the same reply from any other service, one whose spec it cannot
+read included, is a refusal like the one above.
 
 The same holds when the shim's own wait on the command fails: it kills the command
 and reports a shim failure, restarted under `on-failure`, only once it has

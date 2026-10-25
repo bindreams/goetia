@@ -20,6 +20,10 @@
 //!   `managed::uninstall_errors_when_service_will_not_stop`), connects to
 //!   `start-port`, then blocks forever on a channel nobody sends to. Killed
 //!   directly by its PID during that test's own cleanup, never via `stop`.
+//! - `busy-stop` - like `refuse-stop`, except `RUNNING` reports `SERVICE_ACCEPT_STOP` and the
+//!   handler answers `SERVICE_CONTROL_STOP` with `ERROR_SERVICE_CANNOT_ACCEPT_CTRL`: the answer
+//!   `goetia-shim` gives to a stop once it has decided a failure (see
+//!   `managed::a_stop_a_handler_answers_with_cannot_accept_ctrl_comes_back_as_1061_from_a_running_service`).
 
 use std::ffi::OsString;
 use std::net::{Ipv4Addr, TcpStream};
@@ -33,6 +37,9 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::{define_windows_service, service_dispatcher};
 
 pub const FIXTURE: &str = "--goetia-scm-fixture";
+
+/// `ERROR_SERVICE_CANNOT_ACCEPT_CTRL`.
+const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: u32 = 1061;
 
 pub fn run_if_requested() -> bool {
     let args: Vec<String> = std::env::args().collect();
@@ -56,9 +63,11 @@ fn service_main(_scm_arguments: Vec<OsString>) {
     let stop_port: u16 = args[4].parse().expect("stop port");
     let mode = args.get(5).cloned().unwrap_or_else(|| "plain".to_string());
     let refuse_stop = mode == "refuse-stop";
+    let busy_stop = mode == "busy-stop";
 
     let (stop_tx, stop_rx) = mpsc::channel();
     let handler = move |control| match control {
+        ServiceControl::Stop if busy_stop => ServiceControlHandlerResult::Other(ERROR_SERVICE_CANNOT_ACCEPT_CTRL),
         ServiceControl::Stop if !refuse_stop => {
             let _ = stop_tx.send(());
             ServiceControlHandlerResult::NoError
@@ -93,7 +102,7 @@ fn service_main(_scm_arguments: Vec<OsString>) {
         connect(start_port);
     }
 
-    if refuse_stop {
+    if refuse_stop || busy_stop {
         // See the module doc comment: nothing ever signals this, by design
         // — the test exercising this mode kills the process directly.
         let (_never_tx, never_rx) = mpsc::channel::<()>();

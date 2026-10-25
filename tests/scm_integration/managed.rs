@@ -11,7 +11,7 @@ use goetia::decide::Outcome;
 use goetia::manager::conformance;
 use goetia::manager::{Budget, Installed, ServiceManager as _, State};
 use goetia::spec::{AccountId, DaemonSpec, Id, Restart, User};
-use windows_service::service::ServiceAccess;
+use windows_service::service::{ServiceAccess, ServiceControlAccept, ServiceState};
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use winreg::RegKey;
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
@@ -373,6 +373,82 @@ fn uninstall_errors_when_service_will_not_stop() {
     let status = mgr.status(&spec.id).expect("status: the service must still exist");
     assert_eq!(status.state, State::Running);
     let pid = status.pid.expect("a running service reports a pid");
+    support::cmd::run("taskkill.exe", &["/F", "/PID", &pid.to_string()]).expect_ok();
+    support::cmd::run("sc.exe", &["delete", &id]).expect_ok();
+}
+
+/// Measures what `Controlled::Failing` rests on: a handler that answers `STOP` with
+/// `ERROR_SERVICE_CANNOT_ACCEPT_CTRL` while it reports `RUNNING` with `SERVICE_ACCEPT_STOP` is handed
+/// back by `ControlService` as 1061, with the state still `RUNNING` and `STOP` still accepted. That
+/// is the shape of `goetia-shim`'s refusal of a stop after it has decided a failure, and `goetia
+/// daemon stop` treats exactly that shape from a `type: simple` service as "a `STOPPED` is on its
+/// way". If SCM answers otherwise, `Failing` must be adapted to what it does.
+///
+/// The service here is `type: managed`, whose refusal is an error: the same reply from a service
+/// that is not the shim must not make `stop` wait for a `STOPPED` nobody sends.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_stop_a_handler_answers_with_cannot_accept_ctrl_comes_back_as_1061_from_a_running_service() {
+    const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
+
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let started = ConnectBack::listen();
+    let spec = mk_spec(
+        &id,
+        fixture_command(&id, started.port(), 1, "busy-stop"),
+        BTreeMap::new(),
+    );
+
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    started.accept("the fixture to report SERVICE_RUNNING");
+
+    let scm = WinServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).expect("open SCM");
+    let service = scm
+        .open_service(&id, ServiceAccess::QUERY_STATUS | ServiceAccess::STOP)
+        .expect("open the service to control it");
+    let before = service.query_status().expect("query before the control");
+    let refused = service
+        .stop()
+        .expect_err("a handler that answers STOP with 1061 refuses the control");
+    let raw = match &refused {
+        windows_service::Error::Winapi(e) => e.raw_os_error(),
+        other => panic!("ControlService failed with something other than a Win32 error: {other}"),
+    };
+    let after = service.query_status().expect("query after the control");
+
+    assert_eq!(
+        raw,
+        Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL),
+        "ControlService did not hand back the handler's answer (state before: {:?}, after: {:?})",
+        before.current_state,
+        after.current_state,
+    );
+    assert_eq!(after.current_state, ServiceState::Running);
+    assert!(
+        after.controls_accepted.contains(ServiceControlAccept::STOP),
+        "the refusal left the service not accepting STOP: {:?}",
+        after.controls_accepted
+    );
+    assert_eq!(after.process_id, before.process_id, "the refusal changed the process");
+
+    // A `type: managed` service that refuses with the same reply has refused: an error, with no
+    // wait for a `STOPPED`, whatever the budget.
+    let err = mgr
+        .stop(&spec.id, Budget::Unbounded)
+        .expect_err("a managed service's 1061 is a refusal");
+    assert!(
+        err.to_string().contains("refused the stop control"),
+        "unexpected error: {err}"
+    );
+    let err = mgr
+        .uninstall(&spec.id)
+        .expect_err("a service that refuses the stop control must not be deleted");
+    assert!(err.to_string().contains("NOT deleted"), "unexpected error: {err}");
+
+    // Cleanup as in `uninstall_errors_when_service_will_not_stop`: the process by pid, never by a stop.
+    let pid = after.process_id.expect("a running service reports a pid");
+    drop(service);
     support::cmd::run("taskkill.exe", &["/F", "/PID", &pid.to_string()]).expect_ok();
     support::cmd::run("sc.exe", &["delete", &id]).expect_ok();
 }

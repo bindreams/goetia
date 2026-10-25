@@ -562,6 +562,26 @@ fn an_unreadable_blob_waits_strictly_and_reads_the_record_as_the_shims() {
     assert!(corrupt.unreadable.unwrap().contains("corrupt"));
 }
 
+/// A stop waits out the shim's refusal only for a spec that decodes as `type: simple`. An unreadable
+/// blob reads its exit record as the shim's, but nothing says a shim is running.
+#[skuld::test]
+fn only_a_readable_simple_blob_lets_a_stop_wait_for_the_shims_refusal() {
+    assert_eq!(
+        read_kinds(Ok(Some(blob_of(Kind::Simple)))).stop_kind(),
+        StopKind::from(Kind::Simple)
+    );
+    assert_eq!(
+        read_kinds(Ok(Some(blob_of(Kind::Managed)))).stop_kind(),
+        StopKind::from(Kind::Managed)
+    );
+    assert_eq!(read_kinds(Ok(None)).stop_kind(), StopKind::unreadable());
+    assert_eq!(
+        read_kinds(Err(Error::Blob("corrupt".to_string()))).stop_kind(),
+        StopKind::unreadable()
+    );
+    assert_ne!(StopKind::unreadable(), StopKind::from(Kind::Simple));
+}
+
 /// A start judged strictly because the blob could not be read says why, so the user is not told a
 /// `type: simple` daemon failed to start in a way that only a managed service's start can.
 #[skuld::test]

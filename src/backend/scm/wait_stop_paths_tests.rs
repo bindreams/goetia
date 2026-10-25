@@ -640,6 +640,7 @@ fn run(path: Path, scm: &mut Scm, deadline: Deadline) -> io::Result<Outcome> {
             StopWaited::Confirmed => Outcome::Stopped,
             StopWaited::Expired => Outcome::Expired,
             StopWaited::RestartPending => Outcome::RestartPending,
+            StopWaited::KeptMoving => Outcome::KeptMoving,
             StopWaited::Incomplete => unreachable!("the model never reports an incomplete stop"),
         },
         Path::StopTimeoutZero => match request_stop(scm, Kind::Simple)? {
@@ -739,7 +740,7 @@ fn expected(path: Path, first: First, row: &Row) -> Outcome {
         Path::StopOnSpentBudget => match first {
             First::StartPending => Outcome::RestartPending,
             First::StopPending => Outcome::Expired,
-            First::Running if row.forced == Forced::AlwaysMoved => Outcome::Expired,
+            First::Running if row.forced == Forced::AlwaysMoved => Outcome::KeptMoving,
             First::Running => match acts_on {
                 First::StartPending => Outcome::RestartPending,
                 First::StoppedClean => Outcome::Stopped,
@@ -770,11 +771,11 @@ fn expected(path: Path, first: First, row: &Row) -> Outcome {
 
 /// What a path gives when the shim refused its control because it had decided a failure that was not
 /// yet reported: the stop waits for the failure's `STOPPED` and judges it (a restart is configured in
-/// every state that gets a control), or, with nothing to wait on, says so.
+/// every state that gets a control). With nothing to wait on it still issued no stop, so it refuses
+/// the same way.
 fn after_a_shim_refusal(path: Path) -> Outcome {
     match path {
-        Path::Stop | Path::StopTimeoutZero => Outcome::RestartPending,
-        Path::StopOnSpentBudget => Outcome::Expired,
+        Path::Stop | Path::StopTimeoutZero | Path::StopOnSpentBudget => Outcome::RestartPending,
         Path::UninstallStep1 | Path::UninstallStep3 => Outcome::Stopped,
     }
 }

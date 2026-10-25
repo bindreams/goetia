@@ -2575,9 +2575,10 @@ fn an_uninstall_over_a_stop_the_shim_refused_waits_for_the_stopped_and_deletes()
     assert!(fake.log.contains(&"delete"), "{:?}", fake.log);
 }
 
-/// A stop on a spent deadline cannot wait for the `STOPPED`; it says so.
+/// A stop on a spent deadline cannot wait for the `STOPPED`. No stop is outstanding (the shim
+/// refused it), so it is not a timeout of a request that stands: it refuses like a pending restart.
 #[skuld::test]
-fn a_stop_the_shim_refused_on_a_spent_deadline_is_a_timeout_without_a_wait() {
+fn a_stop_the_shim_refused_on_a_spent_deadline_is_refused_not_timed_out() {
     let mut fake = FakeScm::new([])
         .arming(Waited::Expired)
         .controlled([ControlReply::CannotAccept])
@@ -2588,9 +2589,60 @@ fn a_stop_the_shim_refused_on_a_spent_deadline_is_a_timeout_without_a_wait() {
         .running_as([10, 10]);
     assert_eq!(
         stop_via_notify(&mut fake, spent(), Kind::Simple).unwrap(),
-        StopWaited::Expired
+        StopWaited::RestartPending
     );
     assert!(!fake.log.contains(&"wait"), "{:?}", fake.log);
+}
+
+/// A stop whose control was accepted and whose arm ran out did issue a stop: that one is a timeout.
+#[skuld::test]
+fn an_accepted_stop_whose_arm_ran_out_is_a_timeout() {
+    let mut fake = FakeScm::new([]).arming(Waited::Expired);
+    assert_eq!(
+        stop_via_notify(&mut fake, spent(), Kind::Simple).unwrap(),
+        StopWaited::Expired
+    );
+    assert!(fake.log.contains(&"control_stop"), "{:?}", fake.log);
+}
+
+/// Only a spec that reads as `type: simple` says a shim is on the other end. For one that could not
+/// be read, nothing says one runs, and a service that answers 1061 while it reads `RUNNING` and
+/// accepts `STOP` has refused: waiting for a `STOPPED` that nobody sends would never end.
+#[skuld::test]
+fn a_service_whose_spec_could_not_be_read_has_refused_when_it_answers_cannot_accept() {
+    let queried = [
+        (QueriedState::Running, stopped_clean()),
+        (QueriedState::Running, stopped_clean()),
+    ];
+    let unreadable = StopKind::unreadable();
+    let scripted = || {
+        FakeScm::new([])
+            .controlled([ControlReply::CannotAccept])
+            .queried(queried)
+            .running_as([10, 10])
+    };
+
+    let e = stop_via_notify(&mut scripted(), unbounded(), unreadable).unwrap_err();
+    assert!(e.to_string().contains("refused the stop control"), "{e}");
+
+    let e = request_stop(&mut scripted(), unreadable).unwrap_err();
+    assert!(e.to_string().contains("refused the stop control"), "{e}");
+
+    let mut fake = scripted();
+    let e = uninstall_teardown(&mut fake, unbounded(), unreadable).unwrap_err();
+    assert!(e.to_string().contains("NOT deleted"), "{e}");
+    assert!(!fake.log.contains(&"delete"), "{:?}", fake.log);
+}
+
+/// An unreadable spec still reads the exit record as the shim's: a stop that ends on `(0, 1003)` is
+/// an incomplete stop.
+#[skuld::test]
+fn an_unreadable_spec_still_reads_the_shims_record_of_a_survivor() {
+    let mut fake = FakeScm::new([]).found(QueriedState::Stopped, incomplete_stop());
+    assert_eq!(
+        stop_via_notify(&mut fake, unbounded(), StopKind::unreadable()).unwrap(),
+        StopWaited::Incomplete
+    );
 }
 
 /// `--timeout 0` waits for nothing: the decided failure is judged as a failure is, by whether a
@@ -2659,6 +2711,31 @@ fn a_stop_request_reads_a_moving_service_once_more_and_then_gives_up() {
     assert_eq!(
         request_stop(&mut fake, Kind::Simple).unwrap(),
         RequestedStop::KeptMoving
+    );
+    assert_eq!(fake.log.iter().filter(|step| **step == "control_stop").count(), 2);
+}
+
+/// A bounded stop whose deadline has run out reads a moving service once more and no further, and
+/// no stop was issued: that is not a timeout of a request that stands, it is the answer `--timeout 0`
+/// gives.
+#[skuld::test]
+fn a_bounded_stop_that_keeps_meeting_a_moving_service_on_a_spent_deadline_issued_nothing() {
+    let mut fake = FakeScm::new([])
+        .controlled([
+            ControlReply::StateMoved,
+            ControlReply::StateMoved,
+            ControlReply::StateMoved,
+        ])
+        .queried([
+            (QueriedState::Running, stopped_clean()),
+            (QueriedState::Running, stopped_clean()),
+            (QueriedState::Running, stopped_clean()),
+            (QueriedState::Running, stopped_clean()),
+        ])
+        .running_as([10, 11, 11, 12]);
+    assert_eq!(
+        stop_via_notify(&mut fake, spent(), Kind::Simple).unwrap(),
+        StopWaited::KeptMoving
     );
     assert_eq!(fake.log.iter().filter(|step| **step == "control_stop").count(), 2);
 }
