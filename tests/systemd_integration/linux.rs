@@ -1753,38 +1753,39 @@ fn install_creates_and_owns_fresh_cwd_and_logs_dirs_for_a_named_user() {
 }
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn install_refuses_a_preexisting_cwd_the_target_account_cannot_write() {
+fn install_accepts_preexisting_dirs_the_target_account_cannot_write() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
-    let cwd = std::env::temp_dir().join(format!("{}-preexisting-cwd", guard.id()));
-    fs::create_dir(&cwd).unwrap_or_else(|e| panic!("mkdir {}: {e}", cwd.display()));
-    fs::set_permissions(&cwd, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
-    let _rm = RmDirAll(cwd.clone());
+    let base = std::env::temp_dir().join(format!("{}-preexisting", guard.id()));
+    let cwd = base.join("work");
+    let log_dir = base.join("logs");
+    for dir in [&cwd, &log_dir] {
+        fs::create_dir_all(dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    }
+    let _rm = RmDirAll(base.clone());
 
     let mut spec = mk(guard.id());
     spec.user = User::Name("nobody".to_string());
     spec.cwd = Some(cwd.clone());
+    spec.logs = Some(log_dir.join("out.log"));
 
     let mgr = Systemd::new();
-    let err = mgr
-        .install(&spec, false)
-        .expect_err("install must refuse a cwd the target account cannot write");
-    assert!(err.to_string().contains("not writable"), "{err}");
+    mgr.install(&spec, false).expect("install");
 
-    let meta = fs::metadata(&cwd).expect("stat");
-    assert_eq!(
-        meta.permissions().mode() & 0o777,
-        0o700,
-        "a pre-existing directory's mode must not be widened, even on refusal"
-    );
-    assert_eq!(
-        meta.uid(),
-        0,
-        "a pre-existing directory's owner must not be reassigned, even on refusal"
-    );
+    for dir in [&cwd, &log_dir] {
+        let meta = fs::metadata(dir).expect("stat");
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o700,
+            "{}: mode must be untouched",
+            dir.display()
+        );
+        assert_eq!(meta.uid(), 0, "{}: owner must be untouched", dir.display());
+    }
 }
 
-/// The mixed case `ensure_writable_dir`'s own doc comment is about: an ancestor that already exists
+/// The mixed case `ensure_dir`'s own doc comment is about: an ancestor that already exists
 /// must never be touched, even when a deeper, freshly-created component under it is.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn install_leaves_a_preexisting_ancestor_directory_untouched() {

@@ -1071,8 +1071,8 @@ fn a_start_with_no_budget_is_ok_for_a_restart_always_job() {
 
 // Parent directories ==================================================================================================
 
-/// `install` `create_dir_all`s `cwd` and the parent of `logs`, then hands
-/// each to the daemon's own account — otherwise a non-root daemon whose
+/// `install` creates a missing `cwd` and parent of `logs`, and hands each
+/// component it created to the daemon's own account — otherwise a non-root daemon whose
 /// `WorkingDirectory` or `StandardOutPath` names a directory only root can
 /// write into fails at launch with an opaque status.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]

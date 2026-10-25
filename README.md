@@ -363,6 +363,25 @@ was ever the problem. Set `cwd`, or write the argument absolute.
 
 (`cwd` and `logs` are resolved against the manifest's directory too.)
 
+## Directories: `install` prepares, it does not check
+
+`install` creates a `cwd` and the parent directory of `logs` if they are
+missing. A directory that already exists is not checked or changed: `install`
+is not a start, and you may still be preparing it. On systemd an existing log
+directory is never a problem for the account, because systemd opens the log
+file as root before dropping privileges; a `cwd` the account cannot traverse
+fails at `start` with `200/CHDIR`. A missing directory fails at `start` too,
+which is why `install` creates it. The backends differ in what they create
+and what they refuse:
+
+- **systemd** creates every missing component and gives each one it created
+  to a non-root `user`. A path that exists but is not a directory is refused.
+- **launchd** creates every missing component and gives each one it created
+  to a non-root `user`. An existing path of any kind, a dangling symlink
+  included, is accepted, so a file where a directory belongs surfaces at
+  `start`.
+- **scm** creates nothing.
+
 ## Per-backend overrides
 
 One manifest describes a daemon on all three platforms, but a path, an
