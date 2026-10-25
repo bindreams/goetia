@@ -765,12 +765,12 @@ non-zero Win32 code would make SCM start a second copy; the service-specific
 code `1003` is the record that the command may still be running.
 
 The shim runs a `type: simple` command inside a Windows Job Object and requires
-one. It cannot assign the job before the command starts: if the assignment fails,
-the command has already run, from its launch until the shim noticed and killed
-it, and anything it started in that time sits outside any job. The shim then
-logs why and reports `0`, `1003`, as for a `stop` it could not complete, because
-no kill of a tree outside a job shows its descendants gone and SCM must not
-restart over a possible survivor. A `start` that sees the service stop with that
+one. The command is created suspended and assigned to the job before it runs;
+if the assignment fails, it is resumed anyway and runs outside any job until the
+shim notices and kills it, and anything it started in that time sits outside any
+job too. The shim then logs why and reports `0`, `1003`, as for a `stop` it
+could not complete, because no kill of a tree outside a job shows its
+descendants gone and SCM must not restart over a possible survivor. A `start` that sees the service stop with that
 record is a failed start.
 
 Before the shim reports any failure SCM restarts (the command exiting non-zero,

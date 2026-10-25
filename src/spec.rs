@@ -135,7 +135,7 @@ pub struct DaemonSpec {
 }
 
 /// Restart policy. Corresponds to systemd's `Restart=`, launchd's
-/// `KeepAlive`, and (for `Kind::Managed`) SCM recovery actions.
+/// `KeepAlive`, and SCM recovery actions.
 ///
 /// Parsed from its authored kebab-case string by `resolve::parse_restart`,
 /// not derived `Deserialize`: `RawSpec::restart` is a `String` so that a
