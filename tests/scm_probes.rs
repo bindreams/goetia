@@ -1,6 +1,6 @@
 //! THROWAWAY (issue #59, phase A): measures how the Windows SCM treats a
 //! service's reported exit, so the shim's design rests on measurements.
-//! Round 8: P17 (a failure after `DeleteService` marked the service), P18 (STOP_PENDING from the host). Never merges. Every observation is a `PROBE ...` line in the job log.
+//! Round 9: P22 (`NotifyServiceStatusChangeW` on a delete-marked service), P20 (re-arming on an unchanged state in the mask), P21 (a `SERVICE_DISABLED` service and recovery), P19 (the disable-or-delete instant against a due restart). Never merges. Every observation is a `PROBE ...` line in the job log.
 //!
 //! This binary is also the service host: `<exe> --probe-host <name> <port> <scripts>`
 //! where `<scripts>` is `|`-separated, one script per run of the service
@@ -274,7 +274,7 @@ mod probes {
     use std::net::{Ipv4Addr, TcpListener};
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::process::Command;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, mpsc};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -358,6 +358,8 @@ mod probes {
         /// `dwNotificationStatus` of a delivery that was an error.
         err: AtomicU32,
         count: AtomicU32,
+        /// Nanoseconds since `t0` at which the last delivery ran.
+        at_ns: AtomicU64,
     }
 
     unsafe extern "system" fn on_notify(p: *const c_void) {
@@ -365,21 +367,33 @@ mod probes {
         // whose pContext is the leaked `NotifyCtx`.
         let n = unsafe { &*(p as *const Services::SERVICE_NOTIFY_2W) };
         let ctx = unsafe { &*(n.pContext as *const NotifyCtx) };
+        ctx.at_ns.store(ctx.t0.elapsed().as_nanos() as u64, Ordering::SeqCst);
         let s = &n.ServiceStatus;
-        println!(
-            "PROBE {} {} notify #{} notification_status={} triggered={:#x} state={} win32={} specific={} checkpoint={} waithint={} pid={}",
-            ctx.tag,
-            stamp(ctx.t0),
-            ctx.count.load(Ordering::SeqCst) + 1,
-            n.dwNotificationStatus,
-            n.dwNotificationTriggered,
-            s.dwCurrentState,
-            s.dwWin32ExitCode,
-            s.dwServiceSpecificExitCode,
-            s.dwCheckPoint,
-            s.dwWaitHint,
-            s.dwProcessId
-        );
+        let seen = ctx.count.load(Ordering::SeqCst);
+        // A re-arm storm (P20) would flood the log: print the first 20 only.
+        if seen == 20 {
+            println!(
+                "PROBE {} {} notify: further deliveries are not printed",
+                ctx.tag,
+                stamp(ctx.t0)
+            );
+        }
+        if seen < 20 {
+            println!(
+                "PROBE {} {} notify #{} notification_status={} triggered={:#x} state={} win32={} specific={} checkpoint={} waithint={} pid={}",
+                ctx.tag,
+                stamp(ctx.t0),
+                ctx.count.load(Ordering::SeqCst) + 1,
+                n.dwNotificationStatus,
+                n.dwNotificationTriggered,
+                s.dwCurrentState,
+                s.dwWin32ExitCode,
+                s.dwServiceSpecificExitCode,
+                s.dwCheckPoint,
+                s.dwWaitHint,
+                s.dwProcessId
+            );
+        }
         if n.dwNotificationStatus != 0 {
             ctx.err.store(n.dwNotificationStatus, Ordering::SeqCst);
         } else {
@@ -526,6 +540,7 @@ mod probes {
     struct Probe {
         tag: String,
         name: String,
+        display: String,
         t0: Instant,
         connects: mpsc::Receiver<Connect>,
         seen: Vec<Connect>,
@@ -617,10 +632,12 @@ mod probes {
                 fired: AtomicBool::new(false),
                 err: AtomicU32::new(0),
                 count: AtomicU32::new(0),
+                at_ns: AtomicU64::new(0),
             }));
             let mut probe = Probe {
                 tag: tag.to_string(),
                 name: name.clone(),
+                display: display.clone(),
                 t0,
                 connects: rx,
                 seen: Vec::new(),
@@ -794,6 +811,42 @@ mod probes {
                     }
                 }
             }
+        }
+    }
+
+    impl Probe {
+        /// This service's System-log "Service Control Manager" events from the probe's lifetime,
+        /// counted by EventID (7036 split into `7036running` and `7036stopped`).
+        fn event_counts(&self) -> std::collections::BTreeMap<String, u32> {
+            let age_ms = self.t0.elapsed().as_millis() + 5000;
+            let query = format!(
+                "*[System[Provider[@Name='Service Control Manager'] and TimeCreated[timediff(@SystemTime) <= {age_ms}]]]"
+            );
+            let mut counts = std::collections::BTreeMap::new();
+            let Ok(o) = Command::new("wevtutil")
+                .args(["qe", "System", &format!("/q:{query}"), "/f:xml", "/rd:false"])
+                .output()
+            else {
+                counts.insert("wevtutil-spawn-error".to_string(), 1);
+                return counts;
+            };
+            let text = String::from_utf8_lossy(&o.stdout).to_string();
+            for e in text.split("</Event>").filter(|s| s.contains("<Event")) {
+                if !(e.contains(&self.display) || e.contains(&self.name)) {
+                    continue;
+                }
+                let id = e
+                    .find("<EventID")
+                    .and_then(|i| between(&e[i..], ">", "</EventID>"))
+                    .unwrap_or("?");
+                let key = match id {
+                    "7036" if e.contains(">running</Data>") => "7036running".to_string(),
+                    "7036" if e.contains(">stopped</Data>") => "7036stopped".to_string(),
+                    other => other.to_string(),
+                };
+                *counts.entry(key).or_default() += 1;
+            }
+            counts
         }
     }
 
@@ -1559,6 +1612,7 @@ mod probes {
             fired: AtomicBool::new(false),
             err: AtomicU32::new(0),
             count: AtomicU32::new(0),
+            at_ns: AtomicU64::new(0),
         }));
         let buf = Box::into_raw(Box::new(Services::SERVICE_NOTIFY_2W {
             dwVersion: Services::SERVICE_NOTIFY_STATUS_CHANGE,
@@ -2061,17 +2115,469 @@ mod probes {
         r
     }
 
+    // P19-P22 =========================================================================================================
+
+    /// An attended window for "no delivery" and "no change" observations: the result is read by a
+    /// human as "none within this window", not as proof.
+    const ATTENDED_WINDOW: Duration = Duration::from_secs(5);
+
+    // SERVICE_NOTIFY_* bits.
+    const N_STOPPED: u32 = 0x1;
+    const N_START_PENDING: u32 = 0x2;
+    const N_STOP_PENDING: u32 = 0x4;
+    const N_RUNNING: u32 = 0x8;
+    const N_PAUSED: u32 = 0x40;
+
+    /// `ChangeServiceConfigW` with `SERVICE_NO_CHANGE` for everything but the start type.
+    fn change_start_type(svc: &Service, start_type: u32) -> String {
+        // SAFETY: a valid handle with SERVICE_CHANGE_CONFIG; every pointer argument is NULL (no change).
+        let ok = unsafe {
+            Services::ChangeServiceConfigW(
+                svc.raw_handle(),
+                Services::SERVICE_NO_CHANGE,
+                start_type,
+                Services::SERVICE_NO_CHANGE,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        if ok != 0 {
+            "Ok".to_string()
+        } else {
+            let e = std::io::Error::last_os_error();
+            format!("Err {:?} ({e})", e.raw_os_error())
+        }
+    }
+
+    /// `register_notify` + `await_notify` for one arm, logged: the return code, whether it was
+    /// delivered, and the delivered state (the line of the delivery itself has the rest).
+    fn arm_and_await(p: &Probe, h: &Service, what: &str, mask: u32) -> String {
+        let (rc, ctx) = register_notify(p, h, mask);
+        p.p(format_args!(
+            "{what}: NotifyServiceStatusChangeW(mask {mask:#x}) -> {rc}"
+        ));
+        let delivered = rc == 0 && await_notify(ctx, ATTENDED_WINDOW);
+        let r = if delivered {
+            format!(
+                "{what}: mask {mask:#x} rc {rc}; delivered state {} notification_status {}",
+                ctx.last.load(Ordering::SeqCst),
+                ctx.err.load(Ordering::SeqCst)
+            )
+        } else {
+            format!(
+                "{what}: mask {mask:#x} rc {rc}; no delivery within {}s (attended window)",
+                ATTENDED_WINDOW.as_secs()
+            )
+        };
+        p.p(&r);
+        r
+    }
+
+    /// `NotifyServiceStatusChangeW` on a handle opened before `DeleteService`, which stays open.
+    /// No failure actions; the probe holds no other handle. (a) the service is STOPPED when marked:
+    /// arm STOPPED|RUNNING. (b) RUNNING when marked: arm RUNNING|STOPPED, let it fire, re-arm for
+    /// STOPPED while still RUNNING, then stop it from the probe. (c) RUNNING when marked, stopped,
+    /// and only then armed (STOPPED|RUNNING).
+    fn p22(variant: &'static str) -> String {
+        let tag = format!("P22{variant}");
+        let mut p = Probe::with_observers(&tag, STAY_UP, "", false);
+        let _ = p.start();
+        p.connect(0, EXPECTED_BOUND);
+        let h = p.service(ServiceAccess::DELETE | ServiceAccess::STOP | ServiceAccess::QUERY_STATUS);
+        let running = wait_state_via(&h, Services::SERVICE_RUNNING, EXPECTED_BOUND);
+        p.p(format_args!("running: {running}; {}", query_via(&h)));
+        let mut parts = Vec::new();
+
+        let stop_and_wait = |p: &Probe, what: &str| {
+            let stop = control_stop(&h);
+            let stopped = wait_state_via(&h, Services::SERVICE_STOPPED, EXPECTED_BOUND);
+            p.p(format_args!(
+                "{what}: ControlService(STOP) {stop}; stopped {stopped}; {}",
+                query_via(&h)
+            ));
+        };
+        if variant == "a" {
+            stop_and_wait(&p, "clean stop before the mark");
+        }
+        let del = h.delete().map_err(|e| format!("{e:?}"));
+        p.p(format_args!(
+            "DeleteService -> {del:?}; status via h: {}",
+            query_via(&h)
+        ));
+        parts.push(format!("delete {del:?}"));
+
+        match variant {
+            "a" => parts.push(arm_and_await(
+                &p,
+                &h,
+                "arm on a STOPPED marked service",
+                N_STOPPED | N_RUNNING,
+            )),
+            "b" => {
+                let (rc1, ctx1) = register_notify(&p, &h, N_RUNNING | N_STOPPED);
+                p.p(format_args!("first arm (RUNNING|STOPPED) -> {rc1}"));
+                let d1 = rc1 == 0 && await_notify(ctx1, ATTENDED_WINDOW);
+                parts.push(format!(
+                    "first arm mask 0x9 rc {rc1}; delivered {d1} (state {}, notification_status {})",
+                    ctx1.last.load(Ordering::SeqCst),
+                    ctx1.err.load(Ordering::SeqCst)
+                ));
+                p.p(format_args!("status before the re-arm: {}", query_via(&h)));
+                // Still RUNNING: the re-arm masks out the delivered state, as the stream's notifier does.
+                let (rc2, ctx2) = register_notify(&p, &h, N_STOPPED);
+                p.p(format_args!("re-arm (STOPPED) while RUNNING -> {rc2}"));
+                let stop = control_stop(&h);
+                p.p(format_args!("ControlService(STOP) -> {stop}"));
+                let d2 = rc2 == 0 && await_notify(ctx2, ATTENDED_WINDOW);
+                let stopped = wait_state_via(&h, Services::SERVICE_STOPPED, EXPECTED_BOUND);
+                p.p(format_args!("stopped {stopped}; {}", query_via(&h)));
+                parts.push(format!(
+                    "re-arm mask 0x1 rc {rc2}; delivered {d2} (state {}, notification_status {}); first arm deliveries {}; ControlService {stop}; final {}",
+                    ctx2.last.load(Ordering::SeqCst),
+                    ctx2.err.load(Ordering::SeqCst),
+                    ctx1.count.load(Ordering::SeqCst),
+                    query_via(&h)
+                ));
+            }
+            "c" => {
+                stop_and_wait(&p, "stop after the mark");
+                parts.push(arm_and_await(
+                    &p,
+                    &h,
+                    "arm after STOPPED on a service marked while RUNNING",
+                    N_STOPPED | N_RUNNING,
+                ));
+            }
+            other => panic!("bad variant {other}"),
+        }
+
+        let with_handle = open_state(&p.name);
+        drop(h);
+        let after = open_state(&p.name);
+        p.p(format_args!(
+            "OpenService: with h open {with_handle}; right after h closed {after}"
+        ));
+        let r = parts.join("; ");
+        p.result(&r);
+        p.dump_scm_events(&tag);
+        r
+    }
+
+    /// Re-arms `NotifyServiceStatusChangeW(mask)` from this thread after every delivery, for
+    /// `window` (the service state does not change). One context and one `SERVICE_NOTIFY_2W`
+    /// are reused, so a storm leaks nothing.
+    fn count_rearms(p: &Probe, svc: &Service, mask: u32, window: Duration) -> String {
+        let ctx: &'static NotifyCtx = Box::leak(Box::new(NotifyCtx {
+            tag: p.tag.clone(),
+            t0: p.t0,
+            last: AtomicU32::new(0),
+            fired: AtomicBool::new(false),
+            err: AtomicU32::new(0),
+            count: AtomicU32::new(0),
+            at_ns: AtomicU64::new(0),
+        }));
+        let buf: *mut Services::SERVICE_NOTIFY_2W = Box::into_raw(Box::default());
+        let begun = Instant::now();
+        let deadline = begun + window;
+        let mut deliveries = 0u64;
+        let mut first_us = None;
+        let mut last_us = None;
+        let ended = 'arming: loop {
+            ctx.fired.store(false, Ordering::SeqCst);
+            // SAFETY: not registered at this point (the last delivery was consumed); leaked, so it
+            // outlives any registration still pending when the window ends.
+            unsafe {
+                buf.write(Services::SERVICE_NOTIFY_2W {
+                    dwVersion: Services::SERVICE_NOTIFY_STATUS_CHANGE,
+                    pfnNotifyCallback: Some(on_notify),
+                    pContext: (ctx as *const NotifyCtx).cast_mut().cast(),
+                    ..Default::default()
+                });
+            }
+            let rc = unsafe { Services::NotifyServiceStatusChangeW(svc.raw_handle(), mask, buf) };
+            if rc != 0 {
+                break format!("a registration returned {rc}");
+            }
+            while !ctx.fired.load(Ordering::SeqCst) {
+                if Instant::now() >= deadline {
+                    break 'arming "window over, one registration pending".to_string();
+                }
+                unsafe { SleepEx(100, 1) };
+            }
+            deliveries += 1;
+            let at = begun.elapsed().as_micros();
+            first_us.get_or_insert(at);
+            last_us = Some(at);
+            if ctx.err.load(Ordering::SeqCst) != 0 {
+                break format!(
+                    "a delivery carried notification_status {}",
+                    ctx.err.load(Ordering::SeqCst)
+                );
+            }
+        };
+        format!(
+            "mask {mask:#x}: {deliveries} deliveries in a {}s attended window (first at {first_us:?} us, last at {last_us:?} us after the first arm); last delivered state {}; ended: {ended}",
+            window.as_secs(),
+            ctx.last.load(Ordering::SeqCst)
+        )
+    }
+
+    /// Does re-arming on an unchanged state that is in the mask fire again at once? The host holds
+    /// the state until the probe fires the event. (a) RUNNING, mask RUNNING|STOPPED|PAUSED.
+    /// (b) STOP_PENDING after an accepted STOP, mask STOPPED|STOP_PENDING. (c) the host's own
+    /// START_PENDING (checkpoint 1), mask RUNNING|START_PENDING.
+    fn p20(variant: &'static str) -> String {
+        let tag = format!("P20{variant}");
+        let (script, mask) = match variant {
+            "a" => (
+                "run,connect,signal-wait,stopped:w32:0",
+                N_RUNNING | N_STOPPED | N_PAUSED,
+            ),
+            "b" => (
+                "run,connect,wait-stop,stoppending,signal-wait,stopped:w32:0",
+                N_STOPPED | N_STOP_PENDING,
+            ),
+            "c" => (
+                "pending,connect,signal-wait,run,wait-stop,stopped:w32:0",
+                N_RUNNING | N_START_PENDING,
+            ),
+            other => panic!("bad variant {other}"),
+        };
+        let mut p = Probe::with_observers(&tag, script, "", false);
+        let go = Signal::create(&p.name);
+        let _ = p.start();
+        p.connect(0, EXPECTED_BOUND);
+        let h = p.service(ServiceAccess::STOP | ServiceAccess::QUERY_STATUS);
+        match variant {
+            "a" => {
+                wait_state_via(&h, Services::SERVICE_RUNNING, EXPECTED_BOUND);
+            }
+            "b" => {
+                wait_state_via(&h, Services::SERVICE_RUNNING, EXPECTED_BOUND);
+                let stop = control_stop(&h);
+                p.p(format_args!("ControlService(STOP) -> {stop}"));
+                wait_state_via(&h, Services::SERVICE_STOP_PENDING, EXPECTED_BOUND);
+            }
+            _ => {
+                wait_state_via(&h, Services::SERVICE_START_PENDING, EXPECTED_BOUND);
+            }
+        }
+        p.p(format_args!("state held: {}", query_via(&h)));
+        let counted = count_rearms(&p, &h, mask, ATTENDED_WINDOW);
+        p.p(&counted);
+        p.p(format_args!("state after the window: {}", query_via(&h)));
+
+        go.fire();
+        match variant {
+            "c" => {
+                wait_state_via(&h, Services::SERVICE_RUNNING, EXPECTED_BOUND);
+                let stop = control_stop(&h);
+                p.p(format_args!("clean-up: ControlService(STOP) {stop}"));
+                wait_state_via(&h, Services::SERVICE_STOPPED, EXPECTED_BOUND);
+            }
+            _ => {
+                wait_state_via(&h, Services::SERVICE_STOPPED, EXPECTED_BOUND);
+            }
+        }
+        p.p(format_args!("final: {}", query_via(&h)));
+        p.result(&counted);
+        p.dump_scm_events(&tag);
+        counted
+    }
+
+    /// A service set to `SERVICE_DISABLED` (not deleted), failure actions restart, `failureflag` 1.
+    /// (a) disabled while RUNNING, then the host reports `STOPPED (1066, 7)`, delay 0. (b) delay
+    /// 2000 ms; the probe disables the service right after the STOPPED notification, inside the
+    /// delay. Both end with a `StartService` on the disabled, STOPPED service.
+    fn p21(variant: &'static str) -> String {
+        let delay = Duration::from_millis(match variant {
+            "a" => 0,
+            "b" => 2000,
+            other => panic!("bad variant {other}"),
+        });
+        let bound = absence_bound(delay);
+        let tag = format!("P21{variant}");
+        let mut p = Probe::new(
+            &tag,
+            &format!("run,connect,signal-wait,stopped:spec:7|{STAY_UP}"),
+            &format!("restart/{}", delay.as_millis()),
+        );
+        let go = Signal::create(&p.name);
+        let _ = p.start();
+        p.connect(0, EXPECTED_BOUND);
+        let h = p.service(ServiceAccess::STOP | ServiceAccess::QUERY_STATUS | ServiceAccess::CHANGE_CONFIG);
+        let running = wait_state_via(&h, Services::SERVICE_RUNNING, EXPECTED_BOUND);
+        p.p(format_args!("running: {running}; {}", query_via(&h)));
+
+        let disable_note;
+        if variant == "a" {
+            let d = change_start_type(&h, Services::SERVICE_DISABLED);
+            p.p(format_args!(
+                "ChangeServiceConfigW(SERVICE_DISABLED) while RUNNING -> {d}"
+            ));
+            p.p(format_args!("sc qc: {}", sc(&["qc", &p.name]).1));
+            disable_note = format!("disabled while RUNNING: {d}");
+            go.fire();
+        } else {
+            let (rc, ctx) = register_notify(&p, &h, N_STOPPED);
+            p.p(format_args!("STOPPED registration -> {rc}"));
+            go.fire();
+            let got = rc == 0 && await_notify(ctx, EXPECTED_BOUND);
+            let at = ctx.at_ns.load(Ordering::SeqCst);
+            let d = change_start_type(&h, Services::SERVICE_DISABLED);
+            let took = (p.t0.elapsed().as_nanos() as u64).saturating_sub(at);
+            p.p(format_args!(
+                "STOPPED notification delivered {got}; ChangeServiceConfigW(SERVICE_DISABLED) -> {d} {}us after the delivery",
+                took / 1000
+            ));
+            p.p(format_args!("sc qc: {}", sc(&["qc", &p.name]).1));
+            disable_note = format!("disabled {}us after the STOPPED notification: {d}", took / 1000);
+        }
+
+        let c1 = p.connect(1, bound).cloned();
+        p.p(format_args!("{}", describe(c1.as_ref(), bound)));
+        let status = query_via(&h);
+        p.p(format_args!(
+            "status via h after the bound: {status}; notifications fired: {}",
+            p.notify.count.load(Ordering::SeqCst)
+        ));
+        let start = p.start();
+        p.p(format_args!(
+            "P21c: StartService on the disabled service afterwards -> {start:?}"
+        ));
+        let mut stops = 1;
+        if raw_query(&h).is_ok_and(|s| s.dwCurrentState == Services::SERVICE_RUNNING) {
+            let stop = control_stop(&h);
+            let s = wait_state_via(&h, Services::SERVICE_STOPPED, EXPECTED_BOUND);
+            p.p(format_args!("clean-up of a running instance: {stop}; stopped {s}"));
+            stops = 2;
+        }
+        p.wait_logged_stopped(stops);
+        dump_host_trace(&p, "end");
+        p.quiesce();
+        let r = format!(
+            "{disable_note}; after: {}; status via h {status}; StartService afterwards {start:?}",
+            describe(c1.as_ref(), bound)
+        );
+        p.result(&r);
+        p.dump_scm_events(&tag);
+        r
+    }
+
+    /// `StartService` on a disabled, STOPPED service that never ran. No failure actions.
+    fn p21c() -> String {
+        let p = Probe::with_observers("P21c", STAY_UP, "", false);
+        let h = p.service(ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_STATUS);
+        let d = change_start_type(&h, Services::SERVICE_DISABLED);
+        p.p(format_args!(
+            "ChangeServiceConfigW(SERVICE_DISABLED) -> {d}; {}",
+            query_via(&h)
+        ));
+        p.p(format_args!("sc qc: {}", sc(&["qc", &p.name]).1));
+        let start = p.start();
+        let r = format!("disabled {d}; StartService {start:?}; status {}", query_via(&h));
+        p.result(&r);
+        p.dump_scm_events("P21c");
+        r
+    }
+
+    /// The disable-or-delete instant against a due restart (delay 0, a host that fails at once
+    /// when signalled). Per sample the probe waits for the failure's STOPPED notification, then
+    /// disables the service (a) or deletes it (b; the handle stays open), and records what follows.
+    fn p19(variant: &'static str) -> String {
+        const SAMPLES: u32 = 10;
+        const WINDOW: Duration = Duration::from_secs(3);
+        let mut took_us = Vec::new();
+        let mut restarted = 0u32;
+        let mut lines = Vec::new();
+        for i in 1..=SAMPLES {
+            let tag = format!("P19{variant}[{i}/{SAMPLES}]");
+            let mut p = Probe::new(
+                &tag,
+                &format!("run,connect,signal-wait,stopped:spec:7|{STAY_UP}"),
+                "restart/0",
+            );
+            let go = Signal::create(&p.name);
+            let _ = p.start();
+            p.connect(0, EXPECTED_BOUND);
+            let h = p.service(
+                ServiceAccess::DELETE
+                    | ServiceAccess::STOP
+                    | ServiceAccess::QUERY_STATUS
+                    | ServiceAccess::CHANGE_CONFIG,
+            );
+            wait_state_via(&h, Services::SERVICE_RUNNING, EXPECTED_BOUND);
+            let (rc, ctx) = register_notify(&p, &h, N_STOPPED);
+            go.fire();
+            let delivered = rc == 0 && await_notify(ctx, EXPECTED_BOUND);
+            let at = ctx.at_ns.load(Ordering::SeqCst);
+            let notified_at_action = p.notify.count.load(Ordering::SeqCst);
+            let action = match variant {
+                "a" => change_start_type(&h, Services::SERVICE_DISABLED),
+                _ => format!("{:?}", h.delete().map_err(|e| format!("{e:?}"))),
+            };
+            let took = (p.t0.elapsed().as_nanos() as u64).saturating_sub(at) / 1000;
+            took_us.push(took);
+            p.p(format_args!(
+                "STOPPED notification registered rc {rc}, delivered {delivered}; {} -> {action} {took}us after the delivery",
+                if variant == "a" { "disable" } else { "DeleteService" }
+            ));
+
+            let c1 = p.connect(1, WINDOW).cloned();
+            let status = query_via(&h);
+            let notified_end = p.notify.count.load(Ordering::SeqCst);
+            let events = p.event_counts();
+            let log_restarts = events.get("7036running").copied().unwrap_or(0).saturating_sub(1);
+            if c1.is_some() || log_restarts > 0 {
+                restarted += 1;
+            }
+            let line = format!(
+                "sample {i}/{SAMPLES}: action {action} {took}us after the STOPPED delivery; connect-back {} (within the {}s attended window); 7036 running events after run 0: {log_restarts}; probe notifications at the action {notified_at_action}, at the window end {notified_end}; status via h {status}; SCM events {events:?}",
+                c1.is_some(),
+                WINDOW.as_secs()
+            );
+            p.result(&line);
+            lines.push(line);
+            if raw_query(&h).is_ok_and(|s| s.dwCurrentState == Services::SERVICE_RUNNING) {
+                let stop = control_stop(&h);
+                let s = wait_state_via(&h, Services::SERVICE_STOPPED, EXPECTED_BOUND);
+                p.p(format_args!("clean-up of a running instance: {stop}; stopped {s}"));
+            }
+            p.quiesce();
+            drop(h);
+        }
+        took_us.sort_unstable();
+        format!(
+            "{SAMPLES} samples; {restarted} with a restart seen (connect-back or a second 7036 running); action latency after the STOPPED delivery, us: min {} median {} max {}; per sample: {}",
+            took_us[0],
+            took_us[took_us.len() / 2],
+            took_us[took_us.len() - 1],
+            lines.join(" || ")
+        )
+    }
+
     // Driver ==========================================================================================================
 
     pub fn run_all() {
         // Sequential: the System-log events of a probe must be its own.
         type Job = Box<dyn FnOnce() -> String + Send>;
         let jobs: Vec<(&'static str, Job)> = vec![
-            ("P17a", Box::new(|| p17("a"))),
-            ("P17b", Box::new(|| p17("b"))),
-            ("P18a", Box::new(|| p18("a"))),
-            ("P18b", Box::new(|| p18("b"))),
-            ("P18c", Box::new(|| p18("c"))),
+            ("P22a", Box::new(|| p22("a"))),
+            ("P22b", Box::new(|| p22("b"))),
+            ("P22c", Box::new(|| p22("c"))),
+            ("P20a", Box::new(|| p20("a"))),
+            ("P20b", Box::new(|| p20("b"))),
+            ("P20c", Box::new(|| p20("c"))),
+            ("P21c", Box::new(p21c)),
+            ("P21a", Box::new(|| p21("a"))),
+            ("P21b", Box::new(|| p21("b"))),
+            ("P19a", Box::new(|| p19("a"))),
+            ("P19b", Box::new(|| p19("b"))),
         ];
         println!("PROBE SUMMARY begin");
         for (name, job) in jobs {
