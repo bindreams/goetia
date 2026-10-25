@@ -7,46 +7,40 @@ fn joined(commands: &[Vec<String>]) -> Vec<String> {
 }
 
 #[skuld::test]
-fn the_directory_is_closed_to_everyone_but_system_and_administrators_and_the_service_account() {
-    let commands = dir_commands(Path::new(r"C:\ProgramData\Goetia\state"), Some("S-1-5-19"));
+fn the_state_directory_is_closed_to_everyone_but_system_and_administrators() {
+    // No service account can create, replace or delete anything directly under it: each service
+    // has a directory of its own, and a file in it is all the account may touch.
+    let commands = dir_commands(Path::new(r"C:\ProgramData\Goetia\state"));
 
     assert_eq!(
         joined(&commands),
         [
-            r"C:\ProgramData\Goetia\state /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-544:(OI)(CI)F /grant *S-1-5-19:(OI)(CI)M",
+            r"C:\ProgramData\Goetia\state /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-544:(OI)(CI)F",
             r"C:\ProgramData\Goetia\state /inheritance:r",
         ]
     );
 }
 
 #[skuld::test]
-fn a_local_system_service_needs_no_grant_beyond_system() {
-    let dir = dir_commands(Path::new("d"), None);
-    let file = file_commands(Path::new("f"), None);
+fn a_service_directory_is_reset_to_the_state_directorys_grants_then_given_to_its_account_alone() {
+    // The reset takes away the entry of an account the service no longer runs as, from the
+    // directory and from what is in it. Everything created in it afterwards, temporary files
+    // included, inherits exactly this.
+    let dir = r"C:\ProgramData\Goetia\state\svc-frpc";
+    let commands = service_dir_commands(Path::new(dir), Some("S-1-5-80-1-2-3"));
 
-    assert!(joined(&dir).iter().all(|c| !c.contains("S-1-5-19")), "{dir:?}");
     assert_eq!(
-        joined(&file),
+        joined(&commands),
         [
-            "f /reset",
-            "f /grant *S-1-5-18:F /grant *S-1-5-32-544:F",
-            "f /inheritance:r"
+            format!("{dir} /reset /T"),
+            format!("{dir} /grant *S-1-5-80-1-2-3:(OI)(CI)M")
         ]
     );
 }
 
 #[skuld::test]
-fn the_file_is_reset_then_granted_to_the_service_account_alone_then_cut_from_its_parent() {
-    // Reset first so an account the service no longer runs as loses its entry; inheritance last, so
-    // the service account never loses its access between the steps.
-    let commands = file_commands(Path::new(r"C:\ProgramData\Goetia\state\frpc"), Some("S-1-5-80-1-2-3"));
+fn a_local_system_service_needs_no_grant_beyond_what_the_state_directory_gives() {
+    let commands = service_dir_commands(Path::new("d"), None);
 
-    assert_eq!(
-        joined(&commands),
-        [
-            r"C:\ProgramData\Goetia\state\frpc /reset",
-            r"C:\ProgramData\Goetia\state\frpc /grant *S-1-5-18:F /grant *S-1-5-32-544:F /grant *S-1-5-80-1-2-3:M",
-            r"C:\ProgramData\Goetia\state\frpc /inheritance:r",
-        ]
-    );
+    assert_eq!(joined(&commands), ["d /reset /T"]);
 }

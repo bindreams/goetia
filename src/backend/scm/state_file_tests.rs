@@ -763,3 +763,69 @@ fn without_the_flag_a_non_crash_failure_queues_nothing() {
 fn without_a_restart_action_nothing_is_queued() {
     assert_eq!(restart_due_from(true, &[]), RestartDue::Never);
 }
+
+// The directory name of an id =========================================================================================
+
+/// Windows device names: opening one under any extension reaches the device, not a file.
+const RESERVED: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM0", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT0",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "CONIN$", "CONOUT$",
+];
+
+/// Ids that are valid (`1..=80` of `[A-Za-z0-9._-]`) and that Windows would read as something else
+/// than a plain file name.
+fn awkward_ids() -> Vec<String> {
+    let mut ids: Vec<String> = RESERVED.iter().map(|name| name.to_lowercase()).collect();
+    ids.extend(RESERVED.iter().map(|name| format!("{name}.txt")));
+    for id in [
+        ".",
+        "..",
+        "...",
+        "a",
+        "a.",
+        "a..",
+        "a. ",
+        ".a",
+        "a.b",
+        "a-b",
+        "a_b",
+        "nul.",
+        "x".repeat(80).as_str(),
+    ] {
+        ids.push(id.to_string());
+    }
+    ids.push(format!("{}.", "x".repeat(79)));
+    ids
+}
+
+#[skuld::test]
+fn every_id_gets_a_directory_name_that_windows_reads_as_that_one_plain_name() {
+    for id in awkward_ids() {
+        let name = dir_name(&id);
+
+        assert!(name != "." && name != "..", "{id:?} -> {name:?}");
+        assert!(
+            name.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'%')),
+            "{id:?} -> {name:?}: a character Windows may read as a separator, stream or dot"
+        );
+        let stem = name.split('.').next().unwrap_or_default().to_uppercase();
+        assert!(
+            !RESERVED.contains(&stem.as_str()),
+            "{id:?} -> {name:?} is a device name"
+        );
+        assert!(name.len() <= 255, "{id:?} -> {name:?}");
+    }
+}
+
+#[skuld::test]
+fn two_ids_never_share_a_directory_name() {
+    // `a` and `a.` are two SCM names that Windows reads as one path.
+    let ids = awkward_ids();
+    let mut seen = std::collections::HashMap::new();
+    for id in &ids {
+        if let Some(other) = seen.insert(dir_name(id).to_lowercase(), id) {
+            panic!("{id:?} and {other:?} share {:?}", dir_name(id));
+        }
+    }
+}

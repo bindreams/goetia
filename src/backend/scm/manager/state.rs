@@ -1,11 +1,13 @@
-//! Install-time provisioning of a `type: simple` service's state file
-//! ([`crate::backend::scm::state_file`]), and its release.
+//! Install-time provisioning of a `type: simple` service's state ([`crate::backend::scm::state_file`]),
+//! and its release.
 //!
-//! The shim writes the file as the service account, and replaces it by rename, so the account
-//! needs to create a file in the directory and to delete the one it replaces. The directory is
-//! closed to everyone but `SYSTEM`, the Administrators and the accounts services run as; each
-//! file is closed to the one account its service runs as. `LocalSystem` needs nothing beyond
-//! `SYSTEM`.
+//! Each service has a directory of its own under the state directory, holding its record, the
+//! temporary files a write goes through and its lock. The shim replaces the record by renaming a
+//! temporary over it, and a rename keeps the descriptor of the file it moves, so the ACL of
+//! everything the account creates in the directory is the directory's, inherited. That ACL is
+//! `SYSTEM`, the Administrators and the one account the service runs as; the state directory
+//! itself is closed to every service account, so none can create, replace or read another
+//! service's directory. `LocalSystem` needs nothing beyond `SYSTEM`.
 
 use std::path::Path;
 
@@ -20,46 +22,36 @@ fn path_argument(path: &Path) -> String {
     path.display().to_string()
 }
 
-/// The `icacls` invocations that fix the directory's ACL, in order. `account_sid` is the SID
-/// string of the account the service runs as, or `None` for `LocalSystem`.
-///
-/// Grants come before the inheritance cut, and nothing is reset: the directory holds the grants of
-/// every service, which are not this call's to take away.
-pub(super) fn dir_commands(dir: &Path, account_sid: Option<&str>) -> Vec<Vec<String>> {
-    let mut grants = vec![
-        path_argument(dir),
-        "/grant".to_string(),
-        format!("{SYSTEM}:(OI)(CI)F"),
-        "/grant".to_string(),
-        format!("{ADMINISTRATORS}:(OI)(CI)F"),
-    ];
-    if let Some(sid) = account_sid {
-        grants.push("/grant".to_string());
-        grants.push(format!("*{sid}:(OI)(CI)M"));
-    }
-    vec![grants, vec![path_argument(dir), "/inheritance:r".to_string()]]
+/// The `icacls` invocations that close the state directory to everyone but `SYSTEM` and the
+/// Administrators, in order. Nothing is reset: the directory holds every service's directory,
+/// which are not this call's to touch.
+pub(super) fn dir_commands(dir: &Path) -> Vec<Vec<String>> {
+    vec![
+        vec![
+            path_argument(dir),
+            "/grant".to_string(),
+            format!("{SYSTEM}:(OI)(CI)F"),
+            "/grant".to_string(),
+            format!("{ADMINISTRATORS}:(OI)(CI)F"),
+        ],
+        vec![path_argument(dir), "/inheritance:r".to_string()],
+    ]
 }
 
-/// The `icacls` invocations that fix one service's file ACL, in order. Reset first, so an account
-/// the service no longer runs as loses its entry; inheritance is cut last, so the service account
-/// is never without access in between (the reset leaves it the directory's inherited grant).
-pub(super) fn file_commands(file: &Path, account_sid: Option<&str>) -> Vec<Vec<String>> {
-    let mut grants = vec![
-        path_argument(file),
-        "/grant".to_string(),
-        format!("{SYSTEM}:F"),
-        "/grant".to_string(),
-        format!("{ADMINISTRATORS}:F"),
-    ];
+/// The `icacls` invocations that fix one service's directory, in order. The reset comes first, so an
+/// account the service no longer runs as loses its entry, in the directory and in what is in it;
+/// what it leaves is the state directory's `SYSTEM` and Administrators grants, inherited.
+/// `account_sid` is the SID string of the account the service runs as, or `None` for `LocalSystem`.
+pub(super) fn service_dir_commands(dir: &Path, account_sid: Option<&str>) -> Vec<Vec<String>> {
+    let mut commands = vec![vec![path_argument(dir), "/reset".to_string(), "/T".to_string()]];
     if let Some(sid) = account_sid {
-        grants.push("/grant".to_string());
-        grants.push(format!("*{sid}:M"));
+        commands.push(vec![
+            path_argument(dir),
+            "/grant".to_string(),
+            format!("*{sid}:(OI)(CI)M"),
+        ]);
     }
-    vec![
-        vec![path_argument(file), "/reset".to_string()],
-        grants,
-        vec![path_argument(file), "/inheritance:r".to_string()],
-    ]
+    commands
 }
 
 fn run_icacls(args: &[String]) -> Result<()> {
@@ -80,35 +72,41 @@ fn run_icacls(args: &[String]) -> Result<()> {
     }
 }
 
-/// Create the state directory and `id`'s file if absent, and fix their ACLs for the account the
-/// service runs as (`None`: `LocalSystem`). An existing file keeps its content, so a re-install
-/// does not forget a survivor or a pending restart. Idempotent.
+/// Create the state directory and `id`'s directory in it if absent, fix both ACLs for the account
+/// the service runs as (`None`: `LocalSystem`), and make sure the record exists. An existing
+/// record keeps its content, so a re-install does not forget a survivor or a pending restart.
+/// Idempotent.
 pub(super) fn provision(id: &str, account: Option<&str>) -> Result<()> {
     let account_sid = account.map(identity::account_sid_string).transpose()?;
     let account_sid = account_sid.as_deref();
 
     let dir = host::dir();
     std::fs::create_dir_all(&dir).map_err(|e| Error::Other(format!("create {}: {e}", dir.display())))?;
-    for command in dir_commands(&dir, account_sid) {
+    for command in dir_commands(&dir) {
         run_icacls(&command)?;
     }
 
+    let service_dir = host::service_dir(id);
+    std::fs::create_dir_all(&service_dir)
+        .map_err(|e| Error::Other(format!("create {}: {e}", service_dir.display())))?;
+    for command in service_dir_commands(&service_dir, account_sid) {
+        run_icacls(&command)?;
+    }
+
+    // After the ACLs, so what is created inherits them.
     let file = host::path(id);
     match std::fs::OpenOptions::new().write(true).create_new(true).open(&file) {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(Error::Other(format!("create {}: {e}", file.display()))),
     }
-    for command in file_commands(&file, account_sid) {
-        run_icacls(&command)?;
-    }
     Ok(())
 }
 
-/// Release `id`'s state file when its service goes away (or stops having a shim): delete it, and
-/// a temporary left beside it, unless it names a daemon that is still running. That one stays, with
+/// Release `id`'s state when its service goes away (or stops having a shim): delete it, and the
+/// temporaries left beside it, unless it names a daemon that is still running. That one stays, with
 /// only its failure dropped, so the same id registered again cannot start a second daemon beside
-/// it; a later [`provision`] reuses the file. Absent is fine.
+/// it; a later [`provision`] reuses it. Absent is fine.
 pub(super) fn release(id: &str) -> Result<()> {
     let file = host::path(id);
     state_file::release(&file).map_err(|e| Error::Other(format!("release {}: {e}", file.display())))

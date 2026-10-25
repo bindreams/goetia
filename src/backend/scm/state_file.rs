@@ -1,5 +1,5 @@
 //! The per-service state file `goetia-shim` writes and `goetia daemon stop`/`start` read, for
-//! `type: simple` services: `%ProgramData%\Goetia\state\<id>`.
+//! `type: simple` services: `%ProgramData%\Goetia\state\<dir_name(id)>\record`.
 //!
 //! SCM's status misleads about two things the CLI must know, and the file carries both:
 //!
@@ -230,6 +230,30 @@ impl ShimState {
     pub fn names_a_survivor(&self) -> bool {
         matches!(&self.loaded, Loaded::Record(record) if record.survivor.is_some())
     }
+}
+
+// The directory =======================================================================================================
+
+/// The file in a service's directory that holds its record.
+pub const RECORD: &str = "record";
+
+/// The name of the directory that holds service `id`'s state under the state directory.
+///
+/// An id is a service name, not a file name: Windows reads `a.` as `a`, reads `nul` as a device and
+/// `.` and `..` as directories. This name is always a plain, non-reserved one, and two ids never
+/// share one. It starts with `svc-`, which no device name does, and every byte outside
+/// `[A-Za-z0-9_-]` is written as `%XX`, so no name ends in a dot or a space, none can climb out of
+/// the directory, and `%` (not in an id) keeps the mapping one to one.
+pub fn dir_name(id: &str) -> String {
+    let mut name = String::from("svc-");
+    for byte in id.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-') {
+            name.push(char::from(byte));
+        } else {
+            name.push_str(&format!("%{byte:02x}"));
+        }
+    }
+    name
 }
 
 // The file ============================================================================================================

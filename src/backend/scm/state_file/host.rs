@@ -9,7 +9,7 @@ use windows_service::service::{ServiceAccess, ServiceActionType};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 
-use super::{Clock, RestartDue, restart_due_from};
+use super::{Clock, RECORD, RestartDue, dir_name, restart_due_from};
 
 /// `%ProgramData%\Goetia\state`, beside the `logs` directory the shim already uses.
 pub fn dir() -> PathBuf {
@@ -20,9 +20,14 @@ pub fn dir() -> PathBuf {
         .join("state")
 }
 
-/// The state file of service `id`.
+/// The directory of service `id`: its record, the temporaries a write goes through, and its lock.
+pub fn service_dir(id: &str) -> PathBuf {
+    dir().join(dir_name(id))
+}
+
+/// The record of service `id`.
 pub fn path(id: &str) -> PathBuf {
-    dir().join(id)
+    service_dir(id).join(RECORD)
 }
 
 /// The system process: it starts at boot and its creation time is an absolute timestamp, so it
