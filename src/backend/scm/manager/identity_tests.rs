@@ -51,6 +51,27 @@ fn sid_rejects_a_malformed_sid_string() {
     assert!(err.to_string().contains("not-a-sid"));
 }
 
+// account_sid_string ==================================================================================================
+
+#[skuld::test]
+fn the_built_in_service_accounts_resolve_to_their_well_known_sids() {
+    // Fixed on every Windows host; the string is what `icacls` takes after `*`.
+    for (account, sid) in [
+        (r"NT AUTHORITY\LocalService", "S-1-5-19"),
+        (r"NT AUTHORITY\NetworkService", "S-1-5-20"),
+        (r"BUILTIN\Administrators", "S-1-5-32-544"),
+    ] {
+        assert_eq!(account_sid_string(account).expect(account), sid, "{account}");
+    }
+}
+
+#[skuld::test]
+fn an_account_that_does_not_exist_has_no_sid_string() {
+    let err = account_sid_string(r".\goetia-no-such-account-xyz").expect_err("no such account");
+
+    assert!(err.to_string().contains("goetia-no-such-account-xyz"), "{err}");
+}
+
 // service_password ====================================================================================================
 
 #[skuld::test]
