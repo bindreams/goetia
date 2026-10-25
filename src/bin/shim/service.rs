@@ -323,6 +323,15 @@ fn start(cmd: &mut cosca::Command) -> Result<Child, cosca::error::Error> {
     Ok(child)
 }
 
+/// A stdio assignment `build_command` expects never to fail: asserted in debug builds, logged in
+/// release, where the daemon then runs with that stream unredirected.
+fn stdio_set<T, E: std::fmt::Display>(id: &str, assigned: Result<T, E>) {
+    if let Err(e) = assigned {
+        debug_assert!(false, "a stdio assignment build_command expects to succeed failed: {e}");
+        logging::log_failure(id, &format!("redirect the daemon's output: {e}"));
+    }
+}
+
 /// Build the (unspawned) command for `spec`: argv, cwd, env, Job Object
 /// containment, and stdout+stderr merged into the daemon's log file.
 fn build_command(spec: &DaemonSpec, id: &str) -> cosca::Command {
@@ -343,17 +352,16 @@ fn build_command(spec: &DaemonSpec, id: &str) -> cosca::Command {
             // slot whose target is itself ambiguous or another merge
             // (`Error::Unsupported`); neither applies to a concrete
             // `Stdio::from_file`/`Stdio::merge(Fd::STDOUT)` pair on
-            // stdout/stderr, so the discarded `Result`s below are believed
-            // infallible for this exact shape, not merely convenient to
-            // ignore.
-            let _ = cmd.stdout(Stdio::from_file(file));
-            let _ = cmd.stderr(Stdio::merge(Fd::STDOUT));
+            // stdout/stderr, so these are expected never to fail; `stdio_set`
+            // asserts that in debug builds and logs it in release.
+            stdio_set(id, cmd.stdout(Stdio::from_file(file)));
+            stdio_set(id, cmd.stderr(Stdio::merge(Fd::STDOUT)));
         }
         Err(e) => {
             logging::log_failure(id, &log_open_failed(&log_path, &e));
-            // Same infallibility reasoning as above, for `Stdio::null()`.
-            let _ = cmd.stdout(Stdio::null());
-            let _ = cmd.stderr(Stdio::null());
+            // Same reasoning as above, for `Stdio::null()`.
+            stdio_set(id, cmd.stdout(Stdio::null()));
+            stdio_set(id, cmd.stderr(Stdio::null()));
         }
     }
     cmd
