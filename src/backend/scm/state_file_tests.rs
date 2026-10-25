@@ -183,26 +183,9 @@ fn a_record_that_cannot_be_read_counts_as_an_unknown_delay() {
 #[skuld::test]
 fn a_record_with_only_a_survivor_has_no_restart_pending() {
     let mut record = StateRecord::empty();
-    record.survivor = Some(this_process());
+    record.daemon = Some(this_process());
 
     assert!(!shim_state(record, 100).restart_pending(true));
-}
-
-#[skuld::test]
-fn only_a_decoded_record_with_a_survivor_names_one() {
-    let mut with = StateRecord::empty();
-    with.survivor = Some(this_process());
-
-    assert!(shim_state(with, 100).names_a_survivor());
-    assert!(!shim_state(StateRecord::empty(), 100).names_a_survivor());
-    for loaded in [Loaded::Absent, Loaded::Unreadable("garbled".to_string())] {
-        let state = ShimState {
-            loaded,
-            now: at(100),
-            disabled: false,
-        };
-        assert!(!state.names_a_survivor());
-    }
 }
 
 // The format ==========================================================================================================
@@ -210,7 +193,7 @@ fn only_a_decoded_record_with_a_survivor_names_one() {
 #[skuld::test]
 fn a_record_round_trips_through_its_text() {
     let mut record = failed(123_456, RestartDue::After(2500));
-    record.survivor = Some(this_process());
+    record.daemon = Some(this_process());
 
     let decoded = StateRecord::decode(&record.encode()).expect("decode");
 
@@ -239,7 +222,7 @@ fn an_empty_file_is_an_empty_record() {
 
 #[skuld::test]
 fn a_record_of_another_version_or_garbage_does_not_decode() {
-    let future = r#"{"v":2,"failure":null,"survivor":null}"#;
+    let future = r#"{"v":2,"failure":null,"daemon":null}"#;
 
     assert!(StateRecord::decode(future).is_err());
     assert!(StateRecord::decode("{not json").is_err());
@@ -288,7 +271,7 @@ fn a_write_replaces_the_previous_record_whole() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("svc");
     let mut long = failed(42, RestartDue::After(7));
-    long.survivor = Some(this_process());
+    long.daemon = Some(this_process());
     write(&path, &long).expect("first write");
     let short = StateRecord::empty();
 
@@ -393,11 +376,11 @@ fn a_run_starting_clears_a_failure_from_an_earlier_boot() {
 #[skuld::test]
 fn a_run_starting_keeps_the_survivor_record_for_the_liveness_check_to_judge() {
     let mut record = StateRecord::empty();
-    record.survivor = Some(this_process());
+    record.daemon = Some(this_process());
 
     assert!(!record.after_start(at(1)));
 
-    assert!(record.survivor.is_some());
+    assert!(record.daemon.is_some());
 }
 
 fn begin(record: &StateRecord, now_ms: u64) -> (Begin, Loaded, std::path::PathBuf, tempfile::TempDir) {
@@ -422,7 +405,7 @@ fn a_start_with_no_file_proceeds_and_creates_none() {
 #[skuld::test]
 fn a_start_over_a_live_survivor_is_blocked_and_leaves_the_record_alone() {
     let mut record = failed(1000, RestartDue::After(6000));
-    record.survivor = Some(this_process());
+    record.daemon = Some(this_process());
 
     let (outcome, after, _path, _dir) = begin(&record, 1500);
 
@@ -441,12 +424,12 @@ fn a_start_over_a_survivor_that_has_gone_clears_it_and_proceeds() {
     let mut gone = this_process();
     gone.token += 1;
     let mut record = StateRecord::empty();
-    record.survivor = Some(gone);
+    record.daemon = Some(gone);
 
     let (outcome, after, _path, _dir) = begin(&record, 1);
 
     assert!(matches!(outcome, Begin::Proceed), "{outcome:?}");
-    assert!(matches!(after, Loaded::Record(r) if r.survivor.is_none()));
+    assert!(matches!(after, Loaded::Record(r) if r.daemon.is_none()));
 }
 
 #[skuld::test]
@@ -487,14 +470,14 @@ fn a_start_over_an_unreadable_file_replaces_it_and_says_why() {
 fn a_failure_is_recorded_beside_a_survivor_without_dropping_it() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("svc");
-    note_survivor(&path, &this_process()).expect("survivor");
+    note_launch(&path, &this_process()).expect("survivor");
 
     note_failure(&path, FailureRecord::new(BOOT, 9, RestartDue::Unknown)).expect("failure");
 
     let Loaded::Record(record) = read(&path).expect("read") else {
         panic!("a record");
     };
-    assert!(record.survivor.is_some());
+    assert!(record.daemon.is_some());
     assert_eq!(record.failure.expect("failure").at_ms, 9);
 }
 
@@ -547,12 +530,12 @@ fn the_failure_is_noted_beside_a_survivor_without_dropping_it() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("svc");
     let mut before = StateRecord::empty();
-    before.survivor = Some(this_process());
+    before.daemon = Some(this_process());
     write(&path, &before).expect("write");
 
     noting_failure_around(&path, &noted(9), || Ok(()), |_| true).expect("the act");
 
-    assert!(matches!(read(&path), Ok(Loaded::Record(r)) if r.survivor == before.survivor && r.failure.is_some()));
+    assert!(matches!(read(&path), Ok(Loaded::Record(r)) if r.daemon == before.daemon && r.failure.is_some()));
 }
 
 #[skuld::test]
@@ -576,7 +559,7 @@ fn an_act_that_did_not_take_effect_leaves_the_previous_record_in_place() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("svc");
     let mut before = StateRecord::empty();
-    before.survivor = Some(this_process());
+    before.daemon = Some(this_process());
     write(&path, &before).expect("write");
 
     noting_failure_around(&path, &noted(9), || Ok(false), |&took_effect| took_effect).expect("the act");
@@ -652,7 +635,7 @@ fn releasing_removes_a_file_whose_survivor_has_gone_or_that_does_not_decode() {
     let mut gone = this_process();
     gone.token += 1;
     let mut record = StateRecord::empty();
-    record.survivor = Some(gone);
+    record.daemon = Some(gone);
     write(&path, &record).expect("write");
     release(&path).expect("release");
     assert!(!path.exists());
@@ -668,7 +651,7 @@ fn releasing_keeps_a_live_survivor_and_drops_only_the_failure() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("svc");
     let mut record = failed(1, RestartDue::After(100));
-    record.survivor = Some(this_process());
+    record.daemon = Some(this_process());
     write(&path, &record).expect("write");
 
     release(&path).expect("release");
@@ -676,7 +659,7 @@ fn releasing_keeps_a_live_survivor_and_drops_only_the_failure() {
     let Loaded::Record(kept) = read(&path).expect("read") else {
         panic!("the file must stay while its survivor runs");
     };
-    assert_eq!(kept.survivor, record.survivor);
+    assert_eq!(kept.daemon, record.daemon);
     assert_eq!(kept.failure, None, "the service is gone, and so is its pending restart");
 }
 
@@ -710,7 +693,7 @@ fn only_a_survivor_that_lives_or_cannot_be_told_blocks() {
     assert_eq!(blocking_survivor(&Loaded::Record(record.clone())), None);
     assert_eq!(blocking_survivor(&Loaded::Absent), None);
 
-    record.survivor = Some(this_process());
+    record.daemon = Some(this_process());
     assert_eq!(
         blocking_survivor(&Loaded::Record(record.clone())),
         Some((std::process::id(), Survivor::Alive))
@@ -718,7 +701,7 @@ fn only_a_survivor_that_lives_or_cannot_be_told_blocks() {
 
     let mut gone = this_process();
     gone.token += 1;
-    record.survivor = Some(gone);
+    record.daemon = Some(gone);
     assert_eq!(blocking_survivor(&Loaded::Record(record)), None);
 }
 
@@ -960,7 +943,7 @@ fn a_restore_puts_back_the_failure_alone() {
         &path,
         &noted(9),
         || {
-            update(&path, |record| record.survivor = Some(this_process())).expect("the shim records a survivor");
+            update(&path, |record| record.daemon = Some(this_process())).expect("the shim records a survivor");
             Ok(false)
         },
         |&took_effect| took_effect,
@@ -971,7 +954,7 @@ fn a_restore_puts_back_the_failure_alone() {
         panic!("a record");
     };
     assert_eq!(after.failure, before.failure);
-    assert_eq!(after.survivor, Some(this_process()));
+    assert_eq!(after.daemon, Some(this_process()));
 }
 
 // The restart a failure queues ========================================================================================
@@ -1011,7 +994,7 @@ fn a_record_keeps_the_actions_install_configured_through_its_text() {
 
     assert_eq!(StateRecord::decode(&record.encode()).expect("decode"), record);
     // A record written before the actions were kept has none.
-    let older = r#"{"v":1,"failure":null,"survivor":null}"#;
+    let older = r#"{"v":1,"failure":null,"daemon":null}"#;
     assert_eq!(StateRecord::decode(older).expect("decode").configured, None);
 }
 
@@ -1027,14 +1010,14 @@ fn configuring_keeps_the_rest_of_the_record_and_makes_one_where_there_is_none() 
     );
 
     let mut busy = failed(1, RestartDue::After(100));
-    busy.survivor = Some(this_process());
+    busy.daemon = Some(this_process());
     write(&path, &busy).expect("write");
     configure(&path, Actions::default()).expect("configure again");
 
     let Loaded::Record(after) = read(&path).expect("read") else {
         panic!("a record");
     };
-    assert_eq!((after.failure, after.survivor), (busy.failure, busy.survivor));
+    assert_eq!((after.failure, after.daemon), (busy.failure, busy.daemon));
     assert_eq!(
         after.configured,
         Some(Actions::default()),
@@ -1130,4 +1113,62 @@ fn a_start_over_an_unknown_failure_of_this_boot_leaves_it_in_the_file() {
 
     assert!(matches!(outcome, Begin::Proceed));
     assert!(matches!(after, Loaded::Record(r) if r.failure.is_some()));
+}
+
+// The daemon the last run launched ====================================================================================
+
+fn with_daemon(daemon: cosca::identity::ProcessIdRecord) -> Loaded {
+    let mut record = StateRecord::empty();
+    record.daemon = Some(daemon);
+    Loaded::Record(record)
+}
+
+fn gone_process() -> cosca::identity::ProcessIdRecord {
+    let mut gone = this_process();
+    gone.token += 1;
+    gone
+}
+
+#[skuld::test]
+fn the_daemon_is_untracked_where_the_file_says_nothing_of_one() {
+    for loaded in [
+        Loaded::Absent,
+        Loaded::Unreadable("garbled".to_string()),
+        Loaded::Record(StateRecord::empty()),
+    ] {
+        assert_eq!(tracked(&loaded), Tracked::Untracked, "{loaded:?}");
+    }
+}
+
+#[skuld::test]
+fn a_recorded_daemon_is_running_or_gone_by_the_process_it_names() {
+    assert_eq!(
+        tracked(&with_daemon(this_process())),
+        Tracked::Running(std::process::id(), Survivor::Alive)
+    );
+    assert_eq!(tracked(&with_daemon(gone_process())), Tracked::Gone);
+}
+
+#[skuld::test]
+fn forgetting_a_launch_clears_the_daemon_it_names_and_no_other() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("svc");
+    note_launch(&path, &this_process()).expect("launch");
+
+    forget_launch(&path, &gone_process()).expect("another daemon");
+    assert!(matches!(read(&path), Ok(Loaded::Record(r)) if r.daemon == Some(this_process())));
+
+    forget_launch(&path, &this_process()).expect("this daemon");
+    assert!(matches!(read(&path), Ok(Loaded::Record(r)) if r.daemon.is_none()));
+}
+
+#[skuld::test]
+fn a_launch_replaces_the_daemon_an_earlier_run_left() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("svc");
+    note_launch(&path, &gone_process()).expect("the earlier run");
+
+    note_launch(&path, &this_process()).expect("this run");
+
+    assert!(matches!(read(&path), Ok(Loaded::Record(r)) if r.daemon == Some(this_process())));
 }

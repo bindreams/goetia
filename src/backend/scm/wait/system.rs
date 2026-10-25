@@ -23,7 +23,7 @@ use windows_sys::Win32::System::Services::{
 use windows_sys::Win32::System::Threading::{INFINITE, SleepEx};
 
 use crate::backend::scm::exit_status::RecordedExit;
-use crate::backend::scm::state_file::{self, ShimState, Survivor};
+use crate::backend::scm::state_file::{self, ShimState, Tracked};
 use crate::spec::Kind;
 
 use super::{ControlReply, Deadline, Observed, QueriedState, QueriedStatus, Recovery, StartReply, Waited, WantState};
@@ -469,9 +469,9 @@ impl super::ScmActor for SystemScmActor {
         }))
     }
 
-    fn survivor(&mut self) -> io::Result<Option<(u32, Survivor)>> {
+    fn launched(&mut self) -> io::Result<Tracked> {
         let loaded = state_file::read(&state_file::host::path(&self.name))?;
-        Ok(state_file::blocking_survivor(&loaded))
+        Ok(state_file::tracked(&loaded))
     }
 
     fn recovery(&mut self) -> io::Result<Recovery> {

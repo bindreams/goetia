@@ -108,8 +108,9 @@ fn run_service(id: &str) {
         &blob.spec,
         &stop_bus,
         id,
+        |daemon| state::record_launch(id, &store, daemon),
         || report_running(id, &status_handle),
-        |survivor| state::record_survivor(id, &store, survivor),
+        |daemon| state::forget_launch(id, &store, daemon),
     );
     finish(id, &status_handle, &store, reported);
 }
@@ -182,27 +183,46 @@ fn report_stopped(id: &str, handle: &ServiceStatusHandle, reported: Reported) {
 
 // One pass ============================================================================================================
 
-/// Launch the daemon, report `RUNNING` through `on_running`, wait for the daemon to end or for a
-/// stop, and say how it ended. Never respawns: SCM restarts the service from the status the caller
-/// reports.
+/// Launch the daemon, record it through `on_launched`, report `RUNNING` through `on_running`, wait
+/// for the daemon to end or for a stop, and say how it ended. Never respawns: SCM restarts the
+/// service from the status the caller reports.
 ///
-/// `on_running` is called exactly once, after the daemon is spawned and never when launching failed.
-/// A daemon that cannot start is therefore `STOPPED` with a non-zero Win32 code without ever having
-/// been `RUNNING`, which `start_via_notify` reads as a failed start under every restart policy.
+/// `on_launched` is called with the daemon's identity right after the spawn and before anything is
+/// reported. If it fails, the daemon is torn down as for a stop and the service fails with the
+/// error code it carries, without ever having been `RUNNING`: a daemon goetia cannot see is one
+/// that a start could run a second beside. Only if that teardown fails too is the daemon left, and
+/// the stop reported as incomplete.
 ///
-/// `on_survivor` is called, with the daemon's identity, only for a stop that could not kill it, and
-/// before the incomplete stop is returned to be reported.
+/// `on_running` is called exactly once, after the daemon is spawned and recorded, and never when
+/// launching or recording failed. A daemon that cannot start is therefore `STOPPED` with a non-zero
+/// Win32 code without ever having been `RUNNING`, which `start_via_notify` reads as a failed start
+/// under every restart policy.
+///
+/// `on_gone` is called, with the daemon's identity, once the daemon is known to have ended and
+/// before that is reported, so that the record does not outlive it. It is not called for a stop
+/// that could not kill the daemon: that record is what tells goetia the daemon survived.
 fn run_daemon(
     spec: &DaemonSpec,
     stop_bus: &Arc<StopBus>,
     id: &str,
+    on_launched: impl FnOnce(ProcessId) -> Result<(), Option<i32>>,
     on_running: impl FnOnce(),
-    on_survivor: impl FnOnce(ProcessId),
+    on_gone: impl FnOnce(ProcessId),
 ) -> Reported {
     let (child, waiter) = match launch(spec, stop_bus, id) {
         Ok(launched) => launched,
         Err(reported) => return reported,
     };
+    if let Err(os_error) = on_launched(child.id()) {
+        // Torn down by the path a commanded stop takes, which kills the tree and confirms it.
+        stop_bus.request_stop();
+        return match stop_bus.wait_for_child_or_stop(waiter, &child, id) {
+            WaitOutcome::StoppingUnkillable => Reported::incomplete_stop(),
+            WaitOutcome::ChildExited | WaitOutcome::WaitFailed { .. } | WaitOutcome::Stopping => {
+                Reported::shim_failure(os_error)
+            }
+        };
+    }
     on_running();
 
     // `wait_for_child_or_stop` kills and confirms the tree on a stop, so only `StoppingUnkillable`
@@ -222,16 +242,20 @@ fn run_daemon(
                     None
                 }
             };
+            on_gone(child.id());
             exit_report(stop_bus.is_stopping(), code)
         }
         // The failure is already logged; the daemon was torn down, so it is the shim that failed.
-        WaitOutcome::WaitFailed { os_error } => Reported::shim_failure(os_error),
-        WaitOutcome::Stopping => Reported::Clean,
-        // Still reports STOPPED so the service stays stoppable and uninstallable.
-        WaitOutcome::StoppingUnkillable => {
-            on_survivor(child.id());
-            Reported::incomplete_stop()
+        WaitOutcome::WaitFailed { os_error } => {
+            on_gone(child.id());
+            Reported::shim_failure(os_error)
         }
+        WaitOutcome::Stopping => {
+            on_gone(child.id());
+            Reported::Clean
+        }
+        // Still reports STOPPED so the service stays stoppable and uninstallable.
+        WaitOutcome::StoppingUnkillable => Reported::incomplete_stop(),
     }
 }
 

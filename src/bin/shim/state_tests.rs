@@ -12,6 +12,9 @@ const PREFIX: &str = "goetia-shim-state-test";
 
 const BOOT: u64 = 7;
 
+/// What the OS says of a path whose directory does not exist.
+const ERROR_PATH_NOT_FOUND: i32 = 3;
+
 fn clock(ms: u64) -> Clock {
     Clock { boot: BOOT, ms }
 }
@@ -52,7 +55,7 @@ fn a_start_over_a_running_survivor_is_a_shim_failure_that_names_the_process_and_
     let id = TestId::new(PREFIX);
     let (store, _dir) = store(100, Ok(RestartDue::Never));
     let mut record = StateRecord::empty();
-    record.survivor = Some(this_process());
+    record.daemon = Some(this_process());
     state_file::write(&store.path, &record).expect("write");
 
     let refused = begin(id.as_str(), &store);
@@ -65,7 +68,7 @@ fn a_start_over_a_running_survivor_is_a_shim_failure_that_names_the_process_and_
         &take(id.as_str()),
         id.as_str(),
         &format!(
-            "not starting the daemon: process {} is the daemon an earlier stop could not kill, and it is still running; a second one would run beside it. Stop that process, then start the service. If it is not running, delete the state file {}",
+            "not starting the daemon: process {} is the daemon an earlier run launched, and it is still running; a second one would run beside it. Stop that process, then start the service. If it is not running, delete the state file {}",
             std::process::id(),
             store.path.display()
         ),
@@ -84,7 +87,7 @@ fn a_start_over_a_survivor_that_has_gone_forgets_it_and_proceeds() {
     let mut gone = this_process();
     gone.token += 1;
     let mut record = StateRecord::empty();
-    record.survivor = Some(gone);
+    record.daemon = Some(gone);
     state_file::write(&store.path, &record).expect("write");
 
     assert_eq!(begin(id.as_str(), &store), Ok(()));
@@ -166,14 +169,14 @@ fn reports_that_queue_no_restart_record_nothing() {
 }
 
 #[skuld::test]
-fn a_failure_keeps_the_survivor_already_recorded() {
+fn a_failure_keeps_the_daemon_already_recorded() {
     let id = TestId::new(PREFIX);
     let (store, _dir) = store(5000, Ok(RestartDue::Never));
-    state_file::note_survivor(&store.path, &this_process()).expect("survivor");
+    state_file::note_launch(&store.path, &this_process()).expect("survivor");
 
     record_failure(id.as_str(), &store, Reported::DaemonExit(1));
 
-    assert!(record_of(&store).survivor.is_some());
+    assert!(record_of(&store).daemon.is_some());
 }
 
 #[skuld::test]
@@ -247,43 +250,95 @@ fn a_failure_that_cannot_be_written_is_logged_with_the_consequence() {
     );
 }
 
-// record_survivor =====================================================================================================
+// record_launch =======================================================================================================
 
 #[skuld::test]
-fn the_survivor_is_recorded_by_pid_and_creation_time() {
+fn the_daemon_is_recorded_by_pid_and_creation_time() {
     let id = TestId::new(PREFIX);
     let (store, _dir) = store(5000, Ok(RestartDue::Never));
 
-    record_survivor(id.as_str(), &store, ProcessId::current());
+    assert_eq!(record_launch(id.as_str(), &store, ProcessId::current()), Ok(()));
 
-    assert_eq!(record_of(&store).survivor, Some(this_process()));
+    assert_eq!(record_of(&store).daemon, Some(this_process()));
 }
 
 #[skuld::test]
-fn a_survivor_that_cannot_be_written_is_logged_with_the_consequence() {
+fn a_launch_replaces_the_daemon_an_earlier_run_left() {
+    let id = TestId::new(PREFIX);
+    let (store, _dir) = store(5000, Ok(RestartDue::Never));
+    let mut gone = this_process();
+    gone.token += 1;
+    state_file::note_launch(&store.path, &gone).expect("the earlier run");
+
+    assert_eq!(record_launch(id.as_str(), &store, ProcessId::current()), Ok(()));
+
+    assert_eq!(record_of(&store).daemon, Some(this_process()));
+}
+
+#[skuld::test]
+fn a_launch_that_cannot_be_written_is_logged_with_the_consequence_and_reports_the_os_error() {
     let id = TestId::new(PREFIX);
     let dir = tempfile::tempdir().expect("temp dir");
     let missing = dir.path().join("no-such-dir").join("svc");
     let store = Store::at(missing.clone(), clock(5000), Ok(RestartDue::Never));
 
-    record_survivor(id.as_str(), &store, ProcessId::current());
+    let failed = record_launch(id.as_str(), &store, ProcessId::current());
 
+    assert_eq!(failed, Err(Some(ERROR_PATH_NOT_FOUND)));
     let lines = take(id.as_str());
     let [line] = lines.as_slice() else {
         panic!("{lines:?}");
     };
     assert!(
         line.starts_with(&format!(
-            "goetia-shim[{}]: could not record the surviving daemon in {}: ",
+            "goetia-shim[{}]: could not record the daemon in {}: ",
             id.as_str(),
             missing.display()
         )),
         "{line}"
     );
     assert!(
-        line.ends_with(
-            "; goetia cannot tell when it is gone and treats the stop as incomplete: stop that process yourself, then start the service with `sc start`"
-        ),
+        line.ends_with("; the daemon is stopped rather than run where goetia cannot see it, and the service fails"),
+        "{line}"
+    );
+}
+
+// forget_launch =======================================================================================================
+
+#[skuld::test]
+fn a_daemon_that_has_ended_is_forgotten() {
+    let id = TestId::new(PREFIX);
+    let (store, _dir) = store(5000, Ok(RestartDue::Never));
+    state_file::note_launch(&store.path, &this_process()).expect("launch");
+
+    forget_launch(id.as_str(), &store, ProcessId::current());
+
+    assert_eq!(record_of(&store).daemon, None);
+}
+
+#[skuld::test]
+fn a_daemon_that_cannot_be_forgotten_is_logged_as_a_warning_that_says_what_goetia_will_read() {
+    let id = TestId::new(PREFIX);
+    let dir = tempfile::tempdir().expect("temp dir");
+    let missing = dir.path().join("no-such-dir").join("svc");
+    let store = Store::at(missing.clone(), clock(5000), Ok(RestartDue::Never));
+
+    forget_launch(id.as_str(), &store, ProcessId::current());
+
+    let warnings = take_warnings(id.as_str());
+    let [line] = warnings.as_slice() else {
+        panic!("{warnings:?}");
+    };
+    assert!(
+        line.starts_with(&format!(
+            "goetia-shim[{}]: could not clear the daemon from {}: ",
+            id.as_str(),
+            missing.display()
+        )),
+        "{line}"
+    );
+    assert!(
+        line.ends_with("; it names a process that has ended, which goetia reads as gone"),
         "{line}"
     );
 }

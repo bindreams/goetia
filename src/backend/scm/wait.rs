@@ -15,7 +15,7 @@
 use std::io;
 
 use crate::backend::scm::exit_status::RecordedExit;
-use crate::backend::scm::state_file::{ShimState, Survivor};
+use crate::backend::scm::state_file::{ShimState, Survivor, Tracked};
 use crate::manager::budget::Deadline;
 use crate::spec::Kind;
 
@@ -105,9 +105,12 @@ pub trait ScmActor {
     /// with no shim (`type: managed`), whose pending restarts are judged by its status alone.
     /// The file is read afresh by every call.
     fn shim_state(&mut self) -> io::Result<Option<ShimState>>;
-    /// The daemon an earlier incomplete stop could not kill, if the state file names one that is
-    /// still running (or cannot be told not to be): its pid, and which of the two it is.
-    fn survivor(&mut self) -> io::Result<Option<(u32, Survivor)>>;
+    /// What the state file says of the daemon the last run launched. Read for any service that has
+    /// one, whatever the kind it is judged as: the shim records the daemon before it reports the
+    /// service running, and forgets it once the daemon has ended, so a daemon that is recorded and
+    /// running while the service is stopped is one the shim could not kill. A service with no state
+    /// file, or one that does not decode, is [`Tracked::Untracked`].
+    fn launched(&mut self) -> io::Result<Tracked>;
 }
 
 /// The part of a service's failure-action configuration that decides whether a failure queues a
@@ -182,19 +185,19 @@ fn status_rule<A: ScmActor>(a: &mut A, exit: RecordedExit) -> io::Result<bool> {
 }
 
 /// Whether a daemon the shim could not kill may still be running after a `STOPPED` with `exit`.
-/// A `type: simple` service is judged by the survivor its shim recorded, which ends with the
-/// daemon; the status record of the incomplete stop outlives it. The shim records the survivor
-/// before it reports that status, but may fail to: with the status and no survivor in the file,
-/// nothing says the daemon is gone, so it may be running. A service with no shim is judged by the
-/// status alone. `kind` reads that status (see [`incomplete_stop`]).
+///
+/// The state file decides, for any service, whatever its kind: a daemon it records as running while
+/// the service is stopped is the one the shim could not kill, and one it records as gone is gone,
+/// whatever the status record of the incomplete stop says, since that outlives the daemon. With no
+/// daemon recorded nothing says it is gone, and the status record stands alone: the shim records
+/// the daemon before it reports the service running, so a file without it is one that was lost.
+/// `kind` reads that status (see [`incomplete_stop`]).
 fn daemon_may_still_run<A: ScmActor>(a: &mut A, exit: RecordedExit, kind: Kind) -> io::Result<bool> {
-    let Some(shim) = a.shim_state()? else {
-        return Ok(incomplete_stop(exit, kind));
-    };
-    if a.survivor()?.is_some() {
-        return Ok(true);
-    }
-    Ok(incomplete_stop(exit, kind) && !shim.names_a_survivor())
+    Ok(match a.launched()? {
+        Tracked::Running(..) => true,
+        Tracked::Gone => false,
+        Tracked::Untracked => incomplete_stop(exit, kind),
+    })
 }
 
 /// What a `STOPPED` with `exit` recorded settles a stop as: a daemon that may still be running, a
@@ -604,34 +607,30 @@ fn stop_unless_stopped_once<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Ki
     }
 }
 
-/// Refuse a start while the daemon an earlier incomplete stop could not kill is still running: SCM
-/// would accept the start, and a second daemon would run beside the first. The shim's state file
-/// names that daemon, so the refusal ends with the daemon and not with the status record the stop
-/// left, which outlives it. Read before every start, since a start cannot be told from the reply
-/// alone. (A start through `sc start` meets the same check in the shim.)
+/// Refuse a start of a stopped service while the daemon an earlier run launched is still running:
+/// SCM would accept the start, and a second daemon would run beside the first. The shim's state
+/// file names that daemon, so the refusal ends with the daemon and not with the status record the
+/// stop left, which outlives it. Read before every start, since a start cannot be told from the
+/// reply alone. (A start through `sc start` meets the same check in the shim.)
 ///
-/// With the status of the incomplete stop and no survivor in the file, nothing says the daemon is
-/// gone: the shim failed to record it, or there is no shim state to ask. `kind` reads that status
-/// (see [`incomplete_stop`]).
+/// A service that is not stopped has a shim of its own, and the daemon is that shim's. With the
+/// status of the incomplete stop and no daemon in the file, nothing says the daemon is gone: the
+/// shim failed to record it, or the file is lost. `kind` reads that status (see
+/// [`incomplete_stop`]).
 fn refuse_over_a_survivor<A: ScmActor>(a: &mut A, kind: Kind) -> io::Result<()> {
-    if let Some((pid, survivor)) = a.survivor()? {
-        return Err(io::Error::other(survivor_refusal(pid, survivor)));
+    let status = a.query_status()?;
+    if status.state != QueriedState::Stopped {
+        return Ok(());
     }
-    let unrecorded = match a.shim_state()? {
-        Some(shim) => !shim.names_a_survivor(),
-        None => true,
-    };
-    if unrecorded {
-        let status = a.query_status()?;
-        if status.state == QueriedState::Stopped && incomplete_stop(status.exit, kind) {
-            return Err(io::Error::other(
-                "goetia-shim could not kill the daemon at the last stop, which may still be running, and \
-                 has not recorded which process it is; a start would run a second one. Stop the daemon \
-                 yourself, then start the service with `sc start`",
-            ));
-        }
+    match a.launched()? {
+        Tracked::Running(pid, survivor) => Err(io::Error::other(survivor_refusal(pid, survivor))),
+        Tracked::Untracked if incomplete_stop(status.exit, kind) => Err(io::Error::other(
+            "goetia-shim could not kill the daemon at the last stop, which may still be running, and \
+             has not recorded which process it is; a start would run a second one. Stop the daemon \
+             yourself, then start the service with `sc start`",
+        )),
+        Tracked::Untracked | Tracked::Gone => Ok(()),
     }
-    Ok(())
 }
 
 /// Why a start is refused over the survivor `pid`, and what to do.

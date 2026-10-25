@@ -570,8 +570,8 @@ impl ScmActor for Scm {
         Ok(None)
     }
 
-    fn survivor(&mut self) -> io::Result<Option<(u32, crate::backend::scm::state_file::Survivor)>> {
-        Ok(None)
+    fn launched(&mut self) -> io::Result<crate::backend::scm::state_file::Tracked> {
+        Ok(crate::backend::scm::state_file::Tracked::Untracked)
     }
 }
 

@@ -263,6 +263,7 @@ fn no_running_report_when_no_thread_can_be_made() {
         &spec(dir.path(), id.as_str()),
         &stop_bus,
         id.as_str(),
+        |_| Ok(()),
         || running_reports += 1,
         |_| {},
     );
@@ -294,7 +295,14 @@ fn no_running_report_when_the_spawn_fails() {
     };
     let mut running_reports = 0;
 
-    let reported = run_daemon(&missing, &stop_bus, id.as_str(), || running_reports += 1, |_| {});
+    let reported = run_daemon(
+        &missing,
+        &stop_bus,
+        id.as_str(),
+        |_| Ok(()),
+        || running_reports += 1,
+        |_| {},
+    );
 
     assert_eq!(
         running_reports, 0,
@@ -318,21 +326,17 @@ fn running_is_reported_once_and_after_the_spawn() {
     let spawned_before = test_hook::spawns();
     let mut running_reports = Vec::new();
 
-    let mut survivors = Vec::new();
     // The stop ends the pass once the report is made; the daemon sleeps until then.
     let reported = run_daemon(
         &spec(dir.path(), id.as_str()),
         &stop_bus,
         id.as_str(),
+        |_| Ok(()),
         || {
             running_reports.push(test_hook::spawns() - spawned_before);
             stop_bus.request_stop();
         },
-        |survivor| survivors.push(survivor),
-    );
-    assert!(
-        survivors.is_empty(),
-        "a daemon the stop killed is no survivor: {survivors:?}"
+        |_| {},
     );
 
     assert_eq!(
@@ -361,7 +365,7 @@ fn a_daemon_that_exits_nonzero_is_one_pass() {
         ..powershell(dir.path(), id.as_str(), "exit 7")
     };
 
-    let reported = run_daemon(&daemon, &stop_bus, id.as_str(), || {}, |_| {});
+    let reported = run_daemon(&daemon, &stop_bus, id.as_str(), |_| Ok(()), || {}, |_| {});
 
     assert_eq!(reported, Reported::DaemonExit(7));
     assert_eq!(test_hook::spawns(), spawned_before + 1, "the daemon was spawned again");
@@ -378,6 +382,7 @@ fn a_daemon_that_exits_zero_is_clean() {
         &powershell(dir.path(), id.as_str(), "exit 0"),
         &stop_bus,
         id.as_str(),
+        |_| Ok(()),
         || {},
         |_| {},
     );
@@ -403,22 +408,29 @@ fn an_unkillable_daemon_reports_the_incomplete_stop_failure() {
         ),
     );
 
-    let mut survivors = Vec::new();
+    let mut launched = Vec::new();
+    let mut gone = Vec::new();
     let reported = {
         let _refused = kills(Kill::Refuse);
         run_daemon(
             &daemon,
             &stop_bus,
             id.as_str(),
+            |daemon| {
+                launched.push(daemon);
+                Ok(())
+            },
             || stop_bus.request_stop(),
-            |survivor| survivors.push(survivor),
+            |daemon| gone.push(daemon),
         )
     };
 
     assert_eq!(reported, Reported::incomplete_stop());
-    // The identity handed over is the daemon's own, and it is the process that outlived the stop.
-    assert_eq!(survivors.len(), 1, "{survivors:?}");
-    assert_eq!(survivors[0].is_alive(), Liveness::Alive, "{survivors:?}");
+    // The identity recorded at the launch is the daemon's own, it is the process that outlived the
+    // stop, and it is not forgotten: the record is what tells goetia a daemon survived.
+    assert_eq!(launched.len(), 1, "{launched:?}");
+    assert_eq!(launched[0].is_alive(), Liveness::Alive, "{launched:?}");
+    assert!(gone.is_empty(), "a daemon that still runs was forgotten: {gone:?}");
     std::fs::write(&release, "").expect("release the daemon");
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
     let lines = take(id.as_str());
@@ -602,4 +614,135 @@ fn nothing_is_logged_for_a_service_the_shim_has_no_notice_about() {
 
     assert!(take(id.as_str()).is_empty());
     assert!(take_warnings(id.as_str()).is_empty());
+}
+
+// the record of the daemon ============================================================================================
+
+#[skuld::test]
+fn the_daemon_is_recorded_before_the_service_is_reported_running_and_forgotten_after_it_ended() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+    let steps = std::cell::RefCell::new(Vec::new());
+    let mut launched = None;
+
+    let reported = run_daemon(
+        &spec(dir.path(), id.as_str()),
+        &stop_bus,
+        id.as_str(),
+        |daemon| {
+            steps.borrow_mut().push("launched");
+            launched = Some(daemon);
+            Ok(())
+        },
+        || {
+            steps.borrow_mut().push("running");
+            stop_bus.request_stop();
+        },
+        |daemon| {
+            // Forgotten only once it is dead: the record is what says it is not running.
+            assert_eq!(daemon.is_alive(), Liveness::Dead);
+            steps.borrow_mut().push("gone");
+        },
+    );
+
+    assert_eq!(reported, Reported::Clean);
+    assert_eq!(*steps.borrow(), ["launched", "running", "gone"]);
+}
+
+#[skuld::test]
+fn a_daemon_that_exits_on_its_own_is_forgotten_whatever_its_exit_code() {
+    for (script, expected) in [("exit 0", Reported::Clean), ("exit 7", Reported::DaemonExit(7))] {
+        let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+        let id = TestId::new(PREFIX);
+        let stop_bus = Arc::new(StopBus::new());
+        let mut gone = Vec::new();
+
+        let reported = run_daemon(
+            &powershell(dir.path(), id.as_str(), script),
+            &stop_bus,
+            id.as_str(),
+            |_| Ok(()),
+            || {},
+            |daemon| gone.push(daemon),
+        );
+
+        assert_eq!(reported, expected, "{script}");
+        assert_eq!(gone.len(), 1, "{script}: {gone:?}");
+    }
+}
+
+#[skuld::test]
+fn a_daemon_that_cannot_be_recorded_is_killed_and_the_service_fails_without_ever_running() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+    let mut launched = None;
+    let mut running_reports = 0;
+    let mut gone = 0;
+
+    let reported = run_daemon(
+        &spec(dir.path(), id.as_str()),
+        &stop_bus,
+        id.as_str(),
+        |daemon| {
+            launched = Some(daemon);
+            Err(Some(112))
+        },
+        || running_reports += 1,
+        |_| gone += 1,
+    );
+
+    assert_eq!(reported, Reported::shim_failure(Some(112)));
+    assert_eq!(
+        running_reports, 0,
+        "RUNNING was reported for a daemon goetia cannot see"
+    );
+    assert_eq!(gone, 0, "a daemon that was never recorded has nothing to forget");
+    let daemon = launched.expect("the daemon was launched");
+    assert_eq!(
+        daemon.is_alive(),
+        Liveness::Dead,
+        "an unrecorded daemon was left running"
+    );
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+#[skuld::test]
+fn a_daemon_that_cannot_be_recorded_nor_killed_is_the_incomplete_stop() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+    let release = dir.path().join("release");
+    let daemon = powershell(
+        dir.path(),
+        id.as_str(),
+        &format!(
+            "while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 100 }}",
+            release.display()
+        ),
+    );
+    let mut launched = None;
+
+    let reported = {
+        let _refused = kills(Kill::Refuse);
+        run_daemon(
+            &daemon,
+            &stop_bus,
+            id.as_str(),
+            |daemon| {
+                launched = Some(daemon);
+                Err(None)
+            },
+            || {},
+            |_| {},
+        )
+    };
+
+    // Nothing records the daemon and nothing kills it: the status record of the incomplete stop is
+    // all goetia has, and it reads that as a daemon that may be running.
+    assert_eq!(reported, Reported::incomplete_stop());
+    assert_eq!(launched.expect("launched").is_alive(), Liveness::Alive);
+    std::fs::write(&release, "").expect("release the daemon");
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }

@@ -8,9 +8,11 @@
 //!   later start hid it (59-probes.md rounds 2-6). The shim writes a [`FailureRecord`] just
 //!   before it reports such a `STOPPED`, and [`ShimState::restart_pending`] is the one rule that
 //!   reads it.
-//! - **Whether a daemon the shim could not kill is still running.** The shim writes a survivor
-//!   (a [`cosca::identity::ProcessIdRecord`]) before it reports the incomplete stop, and a start
-//!   is refused only while that process lives.
+//! - **Whether a daemon the shim could not kill is still running.** The shim writes the daemon it
+//!   launched (a [`cosca::identity::ProcessIdRecord`]) before it reports the service running, and
+//!   forgets it once the daemon is known to have ended, so a stop that could not kill the daemon
+//!   leaves it recorded. A start is refused only while that process lives, and a daemon the shim
+//!   could not record is killed instead of run.
 //!
 //! The shim, `goetia daemon kill` and `goetia daemon uninstall` all write, from different
 //! processes, each holding the service's lock for the whole of its read-modify-write; the record
@@ -225,9 +227,10 @@ pub struct StateRecord {
     pub v: u32,
     #[serde(default)]
     pub failure: Option<FailureRecord>,
-    /// The daemon the last incomplete stop could not kill.
+    /// The daemon the last run launched, from before the service was reported running until it was
+    /// known to have ended. Left in place by a stop that could not kill it.
     #[serde(default)]
-    pub survivor: Option<ProcessIdRecord>,
+    pub daemon: Option<ProcessIdRecord>,
     /// The failure actions `install` configured, for a shim that cannot read them itself. `None`
     /// where `install` has not written them (a service registered by an older goetia).
     #[serde(default)]
@@ -239,7 +242,7 @@ impl StateRecord {
         Self {
             v: VERSION,
             failure: None,
-            survivor: None,
+            daemon: None,
             configured: None,
         }
     }
@@ -316,12 +319,6 @@ impl ShimState {
                 .as_ref()
                 .is_some_and(|failure| failure.pending(self.now, stopped_failed)),
         }
-    }
-
-    /// Whether the file records a survivor, running or not. Without one, the status record of an
-    /// incomplete stop is all there is to say that a daemon may still be running.
-    pub fn names_a_survivor(&self) -> bool {
-        matches!(&self.loaded, Loaded::Record(record) if record.survivor.is_some())
     }
 }
 
@@ -518,7 +515,7 @@ fn remove_held(held: Held, path: &Path) -> io::Result<()> {
 }
 
 /// Remove the state of a service going away, except what must outlive it: while a recorded
-/// survivor is still running (or cannot be told not to be), only the failure is dropped, so a
+/// daemon is still running (or cannot be told not to be), only the failure is dropped, so a
 /// service registered again under the same id cannot start a second daemon beside it.
 pub fn release(path: &Path) -> io::Result<()> {
     let held = match lock_exclusive(path) {
@@ -531,7 +528,7 @@ pub fn release(path: &Path) -> io::Result<()> {
         return remove_held(held, path);
     }
     let Loaded::Record(mut record) = loaded else {
-        unreachable!("only a decoded record names a survivor");
+        unreachable!("only a decoded record names a daemon");
     };
     record.failure = None;
     write_unlocked(path, &record)
@@ -596,7 +593,7 @@ fn note_beforehand(path: &Path, failure: &NewFailure) -> io::Result<Option<(Stat
     Ok(Some((previous, failure)))
 }
 
-/// Record `failure`, replacing the previous failure and keeping the survivor.
+/// Record `failure`, replacing the previous failure and keeping the daemon.
 pub fn note_failure(path: &Path, failure: FailureRecord) -> io::Result<()> {
     update(path, |record| record.failure = Some(failure))
 }
@@ -617,9 +614,19 @@ pub fn configure(path: &Path, actions: Actions) -> io::Result<()> {
     update(path, |record| record.configured = Some(actions))
 }
 
-/// Record the daemon an incomplete stop could not kill. Called before the shim reports it.
-pub fn note_survivor(path: &Path, survivor: &ProcessIdRecord) -> io::Result<()> {
-    update(path, |record| record.survivor = Some(survivor.clone()))
+/// Record the daemon the shim has just launched, replacing the one an earlier run left. Called
+/// before the service is reported running.
+pub fn note_launch(path: &Path, daemon: &ProcessIdRecord) -> io::Result<()> {
+    update(path, |record| record.daemon = Some(daemon.clone()))
+}
+
+/// Forget `daemon`, which has ended. A record that names another daemon is left alone.
+pub fn forget_launch(path: &Path, daemon: &ProcessIdRecord) -> io::Result<()> {
+    update(path, |record| {
+        if record.daemon.as_ref() == Some(daemon) {
+            record.daemon = None;
+        }
+    })
 }
 
 // A run starting ======================================================================================================
@@ -638,7 +645,7 @@ pub enum Begin {
     },
 }
 
-/// Settle the file as a run starts: refuse over a live survivor, forget a dead one, and drop a
+/// Settle the file as a run starts: refuse over a live daemon of an earlier run, forget a dead one, and drop a
 /// failure the restart this run may be has spent. The file is written only if that changed it,
 /// and never created.
 pub fn begin_run(path: &Path, now: Clock) -> io::Result<Begin> {
@@ -656,15 +663,15 @@ pub fn begin_run(path: &Path, now: Clock) -> io::Result<Begin> {
         Loaded::Record(record) => record,
     };
     let mut changed = false;
-    if let Some(survivor) = &record.survivor {
-        match survivor_of(survivor) {
+    if let Some(daemon) = &record.daemon {
+        match survivor_of(daemon) {
             Survivor::Gone => {
-                record.survivor = None;
+                record.daemon = None;
                 changed = true;
             }
             alive => {
                 return Ok(Begin::Blocked {
-                    pid: survivor.pid,
+                    pid: daemon.pid,
                     survivor: alive,
                 });
             }
@@ -706,16 +713,37 @@ pub fn survivor_of(record: &ProcessIdRecord) -> Survivor {
     }
 }
 
-/// The survivor that stands in the way of a start: its pid, and whether it is known to be
-/// running or only cannot be told not to be.
-pub fn blocking_survivor(loaded: &Loaded) -> Option<(u32, Survivor)> {
+/// What a state file says of the daemon the last run launched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tracked {
+    /// Nothing: no file, no daemon in it, or a file that does not decode.
+    Untracked,
+    /// A daemon is recorded and the process it names has ended.
+    Gone,
+    /// A daemon is recorded and its process is running (or cannot be told not to be): its pid, and
+    /// which of the two.
+    Running(u32, Survivor),
+}
+
+pub fn tracked(loaded: &Loaded) -> Tracked {
     let Loaded::Record(record) = loaded else {
-        return None;
+        return Tracked::Untracked;
     };
-    let survivor = record.survivor.as_ref()?;
-    match survivor_of(survivor) {
-        Survivor::Gone => None,
-        alive => Some((survivor.pid, alive)),
+    let Some(daemon) = record.daemon.as_ref() else {
+        return Tracked::Untracked;
+    };
+    match survivor_of(daemon) {
+        Survivor::Gone => Tracked::Gone,
+        alive => Tracked::Running(daemon.pid, alive),
+    }
+}
+
+/// The daemon that stands in the way of a start: its pid, and whether it is known to be running or
+/// only cannot be told not to be.
+pub fn blocking_survivor(loaded: &Loaded) -> Option<(u32, Survivor)> {
+    match tracked(loaded) {
+        Tracked::Running(pid, survivor) => Some((pid, survivor)),
+        Tracked::Untracked | Tracked::Gone => None,
     }
 }
 

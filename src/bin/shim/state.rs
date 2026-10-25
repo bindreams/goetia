@@ -1,10 +1,12 @@
 //! What the shim writes to and reads from its state file
-//! (`goetia::backend::scm::state_file`): the failure it is about to report, the daemon it could
-//! not kill, and, as it starts, whether a daemon from an earlier incomplete stop still runs.
+//! (`goetia::backend::scm::state_file`): the failure it is about to report, the daemon it has
+//! launched, and, as it starts, whether the daemon of an earlier run still runs.
 //!
-//! Every error here is logged and none stops the daemon from running, except a live survivor:
-//! a file the shim cannot write costs `goetia daemon stop` its view of a queued restart, which is
-//! worse than a missing file but not worse than a service that does not run. The logs say so.
+//! An error here is logged, and stops nothing, in two cases: the failure record, whose loss costs
+//! `goetia daemon stop` its view of a queued restart, which is worse than a missing file but not
+//! worse than a service that does not run; and the end of a daemon, whose record then names a
+//! process that has ended. Two stop the run: a live daemon of an earlier run, and a launch that
+//! cannot be recorded, since a daemon goetia cannot see is one it could start a second beside.
 
 use std::path::PathBuf;
 
@@ -13,6 +15,7 @@ use goetia::backend::scm::exit_status::{ERROR_SERVICE_ALREADY_RUNNING, Reported}
 use goetia::backend::scm::state_file::{self, Begin, Cause, Clock, NewFailure, RestartDue, Survivor, host};
 
 use crate::logging;
+use crate::service::os_error_of;
 
 /// Where the state file is, what time it is, and what the failure actions say.
 pub struct Store {
@@ -93,14 +96,27 @@ pub fn record_failure(id: &str, store: &Store, reported: Reported) {
     }
 }
 
-/// Record the daemon an incomplete stop could not kill, before the stop is reported.
-pub fn record_survivor(id: &str, store: &Store, daemon: ProcessId) {
-    let recorded = daemon
+/// Record the daemon the shim has just launched, before the service is reported running. `Err`
+/// carries the OS error code of why not (logged here): the caller must not run the daemon.
+pub fn record_launch(id: &str, store: &Store, daemon: ProcessId) -> Result<(), Option<i32>> {
+    let record = daemon.to_record().map_err(|e| {
+        logging::log_failure(id, &launch_not_recorded(store, &e.to_string()));
+        os_error_of(&e)
+    })?;
+    state_file::note_launch(&store.path, &record).map_err(|e| {
+        logging::log_failure(id, &launch_not_recorded(store, &e.to_string()));
+        e.raw_os_error()
+    })
+}
+
+/// Forget the daemon, which is known to have ended, before the service is reported stopped.
+pub fn forget_launch(id: &str, store: &Store, daemon: ProcessId) {
+    let forgotten = daemon
         .to_record()
         .map_err(|e| e.to_string())
-        .and_then(|record| state_file::note_survivor(&store.path, &record).map_err(|e| e.to_string()));
-    if let Err(why) = recorded {
-        logging::log_failure(id, &survivor_not_recorded(store, &why));
+        .and_then(|record| state_file::forget_launch(&store.path, &record).map_err(|e| e.to_string()));
+    if let Err(why) = forgotten {
+        logging::log_warning(id, &launch_not_forgotten(store, &why));
     }
 }
 
@@ -119,7 +135,7 @@ fn blocked(store: &Store, pid: u32, survivor: Survivor) -> String {
         Survivor::Unknown | Survivor::Gone => "it could not be told not to be running",
     };
     format!(
-        "not starting the daemon: process {pid} is the daemon an earlier stop could not kill, and {state}; a second one would run beside it. Stop that process, then start the service. If it is not running, delete the state file {}",
+        "not starting the daemon: process {pid} is the daemon an earlier run launched, and {state}; a second one would run beside it. Stop that process, then start the service. If it is not running, delete the state file {}",
         store.path.display()
     )
 }
@@ -150,9 +166,16 @@ fn failure_not_recorded(store: &Store, e: &std::io::Error) -> String {
     )
 }
 
-fn survivor_not_recorded(store: &Store, why: &str) -> String {
+fn launch_not_recorded(store: &Store, why: &str) -> String {
     format!(
-        "could not record the surviving daemon in {}: {why}; goetia cannot tell when it is gone and treats the stop as incomplete: stop that process yourself, then start the service with `sc start`",
+        "could not record the daemon in {}: {why}; the daemon is stopped rather than run where goetia cannot see it, and the service fails",
+        store.path.display()
+    )
+}
+
+fn launch_not_forgotten(store: &Store, why: &str) -> String {
+    format!(
+        "could not clear the daemon from {}: {why}; it names a process that has ended, which goetia reads as gone",
         store.path.display()
     )
 }
