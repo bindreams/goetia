@@ -334,7 +334,7 @@ fn stop_re_arms_after_a_non_terminal_callback() {
 fn start_via_notify_arms_running_before_start_then_gates_on_running() {
     let mut fake = FakeScm::new([Some(Observed::Running)]);
     assert_eq!(
-        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        start_via_notify(&mut fake, unbounded(), Kind::Simple, Kind::Simple).unwrap(),
         Waited::Confirmed
     );
     // The critical ordering: arm RUNNING strictly BEFORE start, else a
@@ -349,7 +349,7 @@ fn start_re_arms_after_a_non_terminal_callback() {
     // re-arm.
     let mut fake = FakeScm::new([Some(Observed::Pending), Some(Observed::Running)]);
     assert_eq!(
-        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        start_via_notify(&mut fake, unbounded(), Kind::Simple, Kind::Simple).unwrap(),
         Waited::Confirmed
     );
     assert_eq!(
@@ -373,7 +373,7 @@ fn a_terminal_stopped_after_start_is_still_an_error_not_an_expiry() {
     // start*, not a wait that ran out of budget — the caller's remedy
     // differs, so the two must not collapse into one another.
     let mut fake = FakeScm::new([Some(Observed::Pending), Some(Observed::Stopped)]);
-    assert!(start_via_notify(&mut fake, unbounded(), Kind::Simple).is_err());
+    assert!(start_via_notify(&mut fake, unbounded(), Kind::Simple, Kind::Simple).is_err());
 }
 
 #[skuld::test]
@@ -387,7 +387,7 @@ fn a_daemon_that_exited_right_after_launch_is_a_started_service() {
     ] {
         let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(reported);
         assert_eq!(
-            start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+            start_via_notify(&mut fake, unbounded(), Kind::Simple, Kind::Simple).unwrap(),
             Waited::Confirmed,
             "{reported:?}"
         );
@@ -403,7 +403,7 @@ fn a_failed_scm_recovery_start_that_a_start_joined_is_a_failed_start() {
         .already_running(QueriedState::StartPending)
         .stopped_by_scm_with_wait_hint(2000);
 
-    let err = start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap_err();
+    let err = start_via_notify(&mut fake, unbounded(), Kind::Simple, Kind::Simple).unwrap_err();
 
     assert!(err.to_string().contains("failed start"), "{err}");
 }
@@ -416,7 +416,7 @@ fn a_clean_daemon_exit_that_a_start_joined_is_still_a_started_service() {
         .stopped_after(Reported::Clean);
 
     assert_eq!(
-        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        start_via_notify(&mut fake, unbounded(), Kind::Simple, Kind::Simple).unwrap(),
         Waited::Confirmed
     );
 }
@@ -425,7 +425,7 @@ fn a_clean_daemon_exit_that_a_start_joined_is_still_a_started_service() {
 fn a_shim_failure_before_launch_is_a_failed_start() {
     for reported in [Reported::shim_failure(None), Reported::shim_failure(Some(2))] {
         let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(reported);
-        let err = start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap_err();
+        let err = start_via_notify(&mut fake, unbounded(), Kind::Simple, Kind::Simple).unwrap_err();
         assert!(
             err.to_string().contains("failed start"),
             "{reported:?} gave an error that does not say so: {err}"
@@ -445,7 +445,7 @@ fn a_managed_service_that_stops_before_running_is_a_failed_start_whatever_it_rec
         Reported::shim_failure(Some(2)),
     ] {
         let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(reported);
-        let err = start_via_notify(&mut fake, unbounded(), Kind::Managed).unwrap_err();
+        let err = start_via_notify(&mut fake, unbounded(), Kind::Managed, Kind::Managed).unwrap_err();
         assert!(
             err.to_string().contains("failed start"),
             "{reported:?} gave an error that does not say so: {err}"
@@ -457,7 +457,7 @@ fn a_managed_service_that_stops_before_running_is_a_failed_start_whatever_it_rec
 fn a_managed_service_that_reaches_running_is_a_started_service() {
     let mut fake = FakeScm::new([Some(Observed::Running)]);
     assert_eq!(
-        start_via_notify(&mut fake, unbounded(), Kind::Managed).unwrap(),
+        start_via_notify(&mut fake, unbounded(), Kind::Managed, Kind::Managed).unwrap(),
         Waited::Confirmed
     );
 }
@@ -465,7 +465,7 @@ fn a_managed_service_that_reaches_running_is_a_started_service() {
 #[skuld::test]
 fn a_failed_start_names_the_recorded_code() {
     let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(Reported::shim_failure(Some(2)));
-    let err = start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap_err();
+    let err = start_via_notify(&mut fake, unbounded(), Kind::Simple, Kind::Simple).unwrap_err();
     assert!(err.to_string().contains("exit code 2"), "{err}");
 }
 
@@ -478,7 +478,7 @@ fn start_via_notify_rearms_on_pending_not_errs() {
         Some(Observed::Running),
     ]);
     assert_eq!(
-        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        start_via_notify(&mut fake, unbounded(), Kind::Simple, Kind::Simple).unwrap(),
         Waited::Confirmed
     );
     assert_eq!(fake.arm_count(), 3); // initial + 2 re-arms
@@ -488,7 +488,7 @@ fn start_via_notify_rearms_on_pending_not_errs() {
 fn a_start_wait_whose_deadline_expires_reports_expired() {
     let mut fake = FakeScm::new([Some(Observed::Pending), None]);
     assert_eq!(
-        start_via_notify(&mut fake, spent(), Kind::Simple).unwrap(),
+        start_via_notify(&mut fake, spent(), Kind::Simple, Kind::Simple).unwrap(),
         Waited::Expired
     );
 }
@@ -509,7 +509,7 @@ fn an_expired_deadline_still_issues_the_start_request() {
     // both answers.
     let mut fake = FakeScm::new([None]);
     assert_eq!(
-        start_via_notify(&mut fake, spent(), Kind::Simple).unwrap(),
+        start_via_notify(&mut fake, spent(), Kind::Simple, Kind::Simple).unwrap(),
         Waited::Expired
     );
     assert_eq!(fake.log, vec!["query", "arm_running", "start", "wait", "got_nothing"]);
@@ -535,7 +535,7 @@ fn a_pending_callback_rearms_under_the_same_deadline() {
         Some(Observed::Running),
     ]);
     assert_eq!(
-        start_via_notify(&mut fake, deadline, Kind::Simple).unwrap(),
+        start_via_notify(&mut fake, deadline, Kind::Simple, Kind::Simple).unwrap(),
         Waited::Confirmed
     );
     assert_eq!(fake.arm_count(), 3);
@@ -574,7 +574,7 @@ fn an_arm_that_keeps_lagging_returns_expired_instead_of_looping() {
     // still went out.
     let mut fake = FakeScm::new([]).arming(Waited::Expired);
     assert_eq!(
-        start_via_notify(&mut fake, spent(), Kind::Simple).unwrap(),
+        start_via_notify(&mut fake, spent(), Kind::Simple, Kind::Simple).unwrap(),
         Waited::Expired
     );
     assert_eq!(fake.log, vec!["query", "arm_running", "start"]);
@@ -587,7 +587,7 @@ fn a_start_the_scm_rejects_is_reported_as_a_failed_start() {
     // `start_re_arms_after_a_non_terminal_callback` for the related cases
     // this doesn't duplicate.
     let mut rejecting = FakeScm::new([]).rejecting_start();
-    assert!(start_via_notify(&mut rejecting, unbounded(), Kind::Simple).is_err());
+    assert!(start_via_notify(&mut rejecting, unbounded(), Kind::Simple, Kind::Simple).is_err());
 }
 
 #[skuld::test]
@@ -1787,7 +1787,7 @@ fn a_plain_start_over_a_running_service_is_a_start() {
 
     let mut fake = FakeScm::new([Some(Observed::Running)]).already_running(QueriedState::Running);
     assert_eq!(
-        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        start_via_notify(&mut fake, unbounded(), Kind::Simple, Kind::Simple).unwrap(),
         Waited::Confirmed
     );
 }
@@ -1800,7 +1800,7 @@ fn a_start_the_scm_answers_already_running_is_confirmed_whatever_the_deadline() 
     for (arm, deadline) in [(Waited::Expired, spent()), (Waited::Confirmed, unbounded())] {
         let mut fake = FakeScm::new([]).already_running(QueriedState::Running).arming(arm);
         assert_eq!(
-            start_via_notify(&mut fake, deadline, Kind::Simple).unwrap(),
+            start_via_notify(&mut fake, deadline, Kind::Simple, Kind::Simple).unwrap(),
             Waited::Confirmed
         );
         assert_eq!(
@@ -1818,7 +1818,7 @@ fn a_start_the_scm_answers_start_pending_still_expires_on_a_spent_deadline() {
         .already_running(QueriedState::StartPending)
         .arming(Waited::Expired);
     assert_eq!(
-        start_via_notify(&mut fake, spent(), Kind::Simple).unwrap(),
+        start_via_notify(&mut fake, spent(), Kind::Simple, Kind::Simple).unwrap(),
         Waited::Expired
     );
 }
@@ -1877,7 +1877,7 @@ fn a_start_after_an_unconfirmed_stop_that_the_scm_accepts_is_ok() {
 fn no_start_is_issued_over_the_record_of_an_incomplete_stop() {
     let found = |fake: FakeScm| fake.found(QueriedState::Stopped, incomplete_stop());
     let mut fake = found(FakeScm::new([]));
-    let e = start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap_err();
+    let e = start_via_notify(&mut fake, unbounded(), Kind::Simple, Kind::Simple).unwrap_err();
     assert!(e.to_string().contains("may still be running"), "{e}");
     assert_eq!(fake.log, vec!["query"]);
 
@@ -2059,14 +2059,47 @@ fn a_start_over_a_managed_service_with_the_shims_incomplete_pair_is_not_refused(
     request_start(&mut found(), Kind::Managed).unwrap();
     request_start_after_stop(&mut found(), Kind::Managed).unwrap();
     assert_eq!(
-        start_via_notify(&mut found(), unbounded(), Kind::Managed).unwrap(),
+        start_via_notify(&mut found(), unbounded(), Kind::Managed, Kind::Managed).unwrap(),
         Waited::Confirmed
     );
 
     // A `type: simple` service with the record still refuses: a second daemon would run.
     assert!(request_start(&mut found(), Kind::Simple).is_err());
     assert!(request_start_after_stop(&mut found(), Kind::Simple).is_err());
-    assert!(start_via_notify(&mut found(), unbounded(), Kind::Simple).is_err());
+    assert!(start_via_notify(&mut found(), unbounded(), Kind::Simple, Kind::Simple).is_err());
+}
+
+/// A start whose spec blob could not be read waits strictly (a `STOPPED` before `RUNNING` is a failed
+/// start, as for `type: managed`) but reads the exit record as the shim's: refusing a start over a
+/// daemon that may still run costs a refusal, and starting over it costs a second daemon.
+#[skuld::test]
+fn a_start_judged_strictly_still_refuses_over_the_shims_incomplete_record() {
+    let found = || FakeScm::new([Some(Observed::Running)]).found(QueriedState::Stopped, incomplete_stop());
+    let e = start_via_notify(&mut found(), unbounded(), Kind::Managed, Kind::Simple).unwrap_err();
+    assert!(e.to_string().contains("may still be running"), "{e}");
+
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(Reported::Clean);
+    let e = start_via_notify(&mut fake, unbounded(), Kind::Managed, Kind::Simple).unwrap_err();
+    assert!(e.to_string().contains("failed start"), "{e}");
+}
+
+/// The record of an incomplete stop is read as the shim's wherever the kind says so, whatever the
+/// service is read as otherwise.
+#[skuld::test]
+fn a_stop_that_reads_the_shims_vocabulary_reports_the_incomplete_record() {
+    let found = || FakeScm::new([]).found(QueriedState::Stopped, incomplete_stop());
+    assert_eq!(
+        stop_via_notify(&mut found(), unbounded(), Kind::Simple).unwrap(),
+        StopWaited::Incomplete
+    );
+    assert_eq!(
+        request_stop(&mut found(), Kind::Simple).unwrap(),
+        RequestedStop::Incomplete
+    );
+    assert_eq!(
+        uninstall_teardown(&mut found(), unbounded(), Kind::Simple).unwrap(),
+        StopWaited::Incomplete
+    );
 }
 
 // a refusal from a new run --------------------------------------------------------------------------------------------

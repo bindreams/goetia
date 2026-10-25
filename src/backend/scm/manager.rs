@@ -175,7 +175,7 @@ impl ServiceManager for ScmManager {
         // closing the handle it deletes through, and the record goes only when every handle to
         // the service has closed, this one included (trap 3).
         drop(service);
-        uninstall_locked(id, installed_kind(id).0)
+        uninstall_locked(id, installed_kinds(id).record)
     }
 
     fn enable(&self, id: &Id) -> Result<()> {
@@ -199,15 +199,19 @@ impl ServiceManager for ScmManager {
         drop(service);
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to start it: {e}")))?;
-        let (kind, unreadable) = installed_kind(id);
+        let Kinds {
+            start: kind,
+            record,
+            unreadable,
+        } = installed_kinds(id);
         if !budget.waits() {
             // Request-only: `StartServiceW` and return, arming no wait at
             // all. `Ok(())` then means the request was accepted and nothing
             // more, per the trait doc comment.
-            return super::wait::request_start(&mut actor, kind)
+            return super::wait::request_start(&mut actor, record)
                 .map_err(|e| Error::Other(format!("start `{id}`: {e}")));
         }
-        let waited = super::wait::start_via_notify(&mut actor, deadline, kind)
+        let waited = super::wait::start_via_notify(&mut actor, deadline, kind, record)
             .map_err(|e| failed_start(id, &e, unreadable.as_deref()))?;
         match waited {
             Waited::Confirmed => Ok(()),
@@ -224,7 +228,7 @@ impl ServiceManager for ScmManager {
         drop(service);
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to start it: {e}")))?;
-        super::wait::request_start_after_stop(&mut actor, installed_kind(id).0)
+        super::wait::request_start_after_stop(&mut actor, installed_kinds(id).record)
             .map_err(|e| Error::Other(format!("start `{id}`: {e}")))
     }
 
@@ -237,7 +241,7 @@ impl ServiceManager for ScmManager {
         drop(service);
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to stop it: {e}")))?;
-        let kind = installed_kind(id).0;
+        let kind = installed_kinds(id).record;
         if !budget.waits() {
             return match super::wait::request_stop(&mut actor, kind)
                 .map_err(|e| Error::Other(format!("stop `{id}`: {e}")))?
@@ -405,19 +409,40 @@ pub fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
     generate::extract(&params)
 }
 
-/// The kind `start_via_notify` reads a `Stopped`-before-`Running` by, and why the blob could not
-/// say. Only a decodable blob that says `type: simple` selects the shim's vocabulary; an unreadable
-/// one reads as strictly as `type: managed`, which is what a shim that cannot decode it reports
-/// anyway (a failed start).
-fn start_kind(blob: Result<Option<Blob>>) -> (Kind, Option<String>) {
+/// How the blob of an installed service says to read its SCM records.
+#[derive(Debug, PartialEq, Eq)]
+struct Kinds {
+    /// Reads a `Stopped` before `Running` in a start. Only a decodable blob that says `type: simple`
+    /// selects the shim's vocabulary: an unreadable one reads as strictly as `type: managed`, which
+    /// is what a shim that cannot decode it reports anyway (a failed start).
+    start: Kind,
+    /// Reads the exit record of a stopped service. `(0, 1003)`, the shim's record of a daemon it
+    /// could not kill, is read for everything but a blob that says `type: managed`: an unreadable
+    /// one is read as `type: simple`, so a start is refused and a stop reported rather than risk a
+    /// second daemon beside a survivor.
+    record: Kind,
+    /// Why the blob could not say.
+    unreadable: Option<String>,
+}
+
+fn read_kinds(blob: Result<Option<Blob>>) -> Kinds {
+    let unreadable = |why: String| Kinds {
+        start: Kind::Managed,
+        record: Kind::Simple,
+        unreadable: Some(why),
+    };
     match blob {
-        Ok(Some(blob)) => (blob.spec.kind, None),
-        Ok(None) => (Kind::Managed, Some("it carries no goetia metadata".to_string())),
-        Err(e) => (Kind::Managed, Some(e.to_string())),
+        Ok(Some(blob)) => Kinds {
+            start: blob.spec.kind,
+            record: blob.spec.kind,
+            unreadable: None,
+        },
+        Ok(None) => unreadable("it carries no goetia metadata".to_string()),
+        Err(e) => unreadable(e.to_string()),
     }
 }
 
-/// `start`'s error for a `start_via_notify` failure. When the blob was unreadable the start was
+/// `start`'s error for a `start_via_notify` failure. When the blob was unreadable the wait was
 /// judged as a `type: managed` service's, and the error says why, since that is not what a
 /// `type: simple` service would have been told.
 fn failed_start(id: &Id, e: &std::io::Error, unreadable: Option<&str>) -> Error {
@@ -430,8 +455,8 @@ fn failed_start(id: &Id, e: &std::io::Error, unreadable: Option<&str>) -> Error 
     }
 }
 
-fn installed_kind(id: &Id) -> (Kind, Option<String>) {
-    start_kind(read_spec_blob(id.as_str()))
+fn installed_kinds(id: &Id) -> Kinds {
+    read_kinds(read_spec_blob(id.as_str()))
 }
 
 // discover ============================================================================================================

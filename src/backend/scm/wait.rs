@@ -591,7 +591,9 @@ fn accept_as_started(reply: StartReply) -> io::Result<()> {
 /// the shim launched the daemon and the daemon then ended (the recorded exit is the shim's own
 /// vocabulary, see [`RecordedExit::daemon_ran`]). A `type: managed` service speaks SCM itself, and
 /// stopping with a service-specific code before `Running` is how it reports a failed start, so for
-/// it any `Stopped` before `Running` is a failed start.
+/// it any `Stopped` before `Running` is a failed start. `record` reads the exit record of a service
+/// found stopped, for the refusal over a survivor (see [`refuse_over_a_survivor`]); it differs from
+/// `kind` when the spec could not be read.
 ///
 /// Critical ordering: arm `RUNNING` strictly BEFORE issuing `start`, else the
 /// service can reach `RUNNING` before the arm and the notification only
@@ -601,8 +603,8 @@ fn accept_as_started(reply: StartReply) -> io::Result<()> {
 /// `Running` is the SCM's own answer that the goal is reached, so it is the
 /// confirmation, whatever is left of the deadline — as launchd's `print` of a
 /// running job is. The armed wait would only have immediate-fired on it.
-pub fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Kind) -> io::Result<Waited> {
-    refuse_over_a_survivor(a, kind)?;
+pub fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Kind, record: Kind) -> io::Result<Waited> {
+    refuse_over_a_survivor(a, record)?;
     let armed = a.arm(WantState::Running, deadline)?;
     // Issued even when the arm expired: only the *waiting* is bounded, and a
     // service left unstarted because goetia ran out of budget while arming

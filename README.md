@@ -807,7 +807,9 @@ and `restart` do not start a second copy (they exit `1`; once you have stopped
 the command yourself, `sc start` starts the service), and `uninstall` deletes the
 service and then exits `1` with the same message. This record is the shim's, so goetia
 reads it only for `type: simple`; the same pair from a `type: managed` service,
-which speaks to SCM itself, is judged like any other stop.
+which speaks to SCM itself, is judged like any other stop. A service whose spec
+goetia cannot read is taken for `type: simple` here, so a start is refused
+rather than risk a second copy.
 
 A service that refuses the stop control with no change of state to explain it,
 such as a `type: managed` service that reports running and answers `STOP` with an
