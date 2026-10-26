@@ -211,8 +211,8 @@ pub trait ServiceManager {
     /// own answer** and never off a state read before it, which would race the kill. Not an
     /// `Ok(())`: nothing was killed.
     ///
-    /// SCM returns once it has recorded the exit, so `status` straight after reads not-running;
-    /// systemd and launchd return once the signal is sent.
+    /// SCM returns once it has recorded the exit: the service is then stopped, or already restarted
+    /// by its restart policy. systemd and launchd return once the signal is sent.
     ///
     /// Takes no budget: what SCM is waited for is the exit of a process whose termination was
     /// delivered, which is not a wait to bound.

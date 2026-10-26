@@ -30,6 +30,29 @@ pub enum WantState {
     StoppedOnly,
 }
 
+impl WantState {
+    /// The states a registration for `self` fires on: the single definition of the notification
+    /// mask, which `system::want_to_mask` folds into bits and the unit tests' model of SCM reads.
+    ///
+    /// `started` is whether `start()` has been issued. For a start wait the `STOPPED` bit is included
+    /// ONLY after `start()`: the service is `Stopped` at the initial arm (a stop wait always precedes
+    /// a start wait in this crate's own usage), and `NotifyServiceStatusChangeW` immediate-fires on
+    /// the current state, so arming `STOPPED` before `start()` would misclassify that pre-start
+    /// `Stopped` as a failed start. After `start()` the service has entered `StartPending`, so a
+    /// later `StartPending -> Stopped` delivers a real `Stopped` that terminates the wait with `Err`.
+    pub fn states(self, started: bool) -> &'static [QueriedState] {
+        use QueriedState::{Paused, Running, StartPending, StopPending, Stopped};
+        match self {
+            WantState::Stopped => &[Stopped, StopPending],
+            WantState::Running if started => &[Running, Stopped, StartPending],
+            WantState::Running => &[Running, StartPending],
+            // No `START_PENDING`: a service starting at the arm must not fire it.
+            WantState::RunningPausedOrStopped => &[Running, Paused, Stopped],
+            WantState::StoppedOnly => &[Stopped],
+        }
+    }
+}
+
 /// The service state a `wait_callback` observed. Distinct from [`WantState`]:
 /// a callback can report a state that is neither what the caller wants nor
 /// its opposite. `Running`/`Stopped` are terminal; `Pending` is any
@@ -108,7 +131,7 @@ pub fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result
     if armed == Waited::Expired {
         return Ok(Waited::Expired);
     }
-    await_stopped(a, deadline)
+    await_stopped(a, deadline, " Run `stop` again.")
 }
 
 /// [`ScmActor::control_stop`], where a stop already under way counts as sent. A service in
@@ -143,24 +166,61 @@ fn control_stop_or_underway<A: ScmActor>(a: &mut A) -> io::Result<()> {
 
 /// What a STOP refused with 1052 while SCM starts the service is told, as a recovery restart does
 /// until the new shim reports `RUNNING`. SCM drops that STOP: nothing queues it (P13c).
-const STARTING: &str = "SCM is starting the service (for example a restart after a failure), so the STOP was not delivered and is not queued. The service will come up running; run `stop` again once it is running";
+const STARTING: &str = "SCM is starting the service (for example a restart after a failure), so the STOP was not delivered and is not queued; run `stop` again once the service is running";
 
-/// The wait half of a stop: the `Stopped`-mask arm is already in place. Re-arms after every
-/// non-terminal callback.
-fn await_stopped<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
+/// The wait half of a stop: the `Stopped` arm (`STOPPED` and `STOP_PENDING`) is already in place.
+///
+/// After a non-terminal callback, which is `STOP_PENDING`, it re-arms for `STOPPED` alone and then
+/// reads the status: a registration fires at once only on a state that is in its mask, so a service
+/// that moved on between the callback and the re-arm would never wake the wait. A failure that
+/// races the stop goes `STOPPED (1066)` and SCM restarts the service under its restart policy
+/// (P18a), which can reach `RUNNING` before the re-arm. The read decides:
+/// - `STOPPED`: confirmed. The re-arm's registration stays outstanding, which the actor's teardown
+///   drains ([`close_then_drain`]); nothing arms it again.
+/// - `STOP_PENDING`: wait on the registration, which fires on the `STOPPED` that ends it, even if a
+///   restart follows at once.
+/// - any other state: the service was running or starting again after it began to stop, so the stop
+///   did not leave it stopped; an error says so, ending in `advice`. It does not wait for the
+///   restart and does not send a second STOP.
+///
+/// `STOPPED` alone, not the first arm's mask again: a re-arm over a `STOP_PENDING` that is already
+/// reported is not measured to fire (P20) or to stay silent (P25), and nothing here needs it to.
+fn await_stopped<A: ScmActor>(a: &mut A, deadline: Deadline, advice: &str) -> io::Result<Waited> {
     loop {
         match a.wait_callback(deadline)? {
             None => return Ok(Waited::Expired),
             Some(Observed::Stopped) => return Ok(Waited::Confirmed),
-            // Running/Pending are non-terminal for a stop wait — re-arm and wait. `Paused` cannot
-            // arrive under the stop mask; it is treated as pending.
+            // Running/Paused cannot arrive under the stop mask; they are treated as pending.
             Some(Observed::Running | Observed::Paused | Observed::Pending) => {
-                if a.arm(WantState::Stopped, deadline)? == Waited::Expired {
+                if a.arm(WantState::StoppedOnly, deadline)? == Waited::Expired {
                     return Ok(Waited::Expired);
+                }
+                match a.query_status()?.state {
+                    QueriedState::Stopped => return Ok(Waited::Confirmed),
+                    QueriedState::StopPending => {}
+                    state => return Err(io::Error::other(not_left_stopped(state, advice))),
                 }
             }
         }
     }
+}
+
+/// What a stop is told when the service is `state` again after it began to stop, as when SCM restarts
+/// it after a failure under its restart policy.
+fn not_left_stopped(state: QueriedState, advice: &str) -> String {
+    let now = match state {
+        QueriedState::Running => "running",
+        QueriedState::StartPending => "starting",
+        QueriedState::Paused => "paused",
+        QueriedState::ContinuePending => "continuing",
+        QueriedState::PausePending => "pausing",
+        QueriedState::Stopped | QueriedState::StopPending => {
+            unreachable!("{state:?} is a stop, not a service left running")
+        }
+    };
+    format!(
+        "the service is {now} again after it began to stop (for example SCM restarted it after a failure, under its restart policy), so the stop did not leave it stopped.{advice}"
+    )
 }
 
 /// `ControlService(STOP)` answered `ERROR_INVALID_SERVICE_CONTROL`: the service is in a state that
@@ -183,6 +243,8 @@ const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
 /// is an error. A STOP SCM accepts is followed by the same wait as [`stop_via_notify`]'s, armed after
 /// the STOP; that holds once nothing can start the service again, which `uninstall` arranges by
 /// setting `SERVICE_DISABLED` first: a restart queued before that, or after it, does not start (P21).
+/// So the arm after the accepted STOP cannot miss a `STOPPED` that a restart follows: the STOP is sent
+/// only on a `RUNNING` notification, which an attempt in flight at the disable has already reached.
 /// A disable that lands while SCM's restart attempt is in flight does not stop it: the attempt runs
 /// to `RUNNING` and the status read right after the disable shows `START_PENDING` or `RUNNING`
 /// (P23), so the loop sees its `RUNNING` and stops it like any start.
@@ -209,7 +271,7 @@ pub fn settle_and_stop<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result
                 if a.arm(WantState::Stopped, deadline)? == Waited::Expired {
                     return Ok(Waited::Expired);
                 }
-                return await_stopped(a, deadline);
+                return await_stopped(a, deadline, "");
             }
             Err(e)
                 if matches!(

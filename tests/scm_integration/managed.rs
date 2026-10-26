@@ -233,8 +233,8 @@ fn a_killed_never_restart_daemon_stays_down() {
     });
 }
 
-/// `kill` returns once SCM has recorded the exit, so the first `status` after it reads not-running
-/// and has no pid. The shared `a_killed_daemon_that_never_restarts_stays_down` waits for that state
+/// `kill` returns once SCM has recorded the exit, so for a service that never restarts the first
+/// `status` after it reads not-running and has no pid. The shared `a_killed_daemon_that_never_restarts_stays_down` waits for that state
 /// instead; this is the contract it hides.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn kill_returns_once_scm_has_recorded_the_exit() {

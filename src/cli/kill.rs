@@ -12,7 +12,8 @@ use crate::manager::ServiceManager;
 pub struct Args {
     /// Daemon ids whose running process to kill, as a failure (SIGKILL, or the platform's
     /// equivalent). Returns once that is delivered (on Windows, once SCM has recorded the
-    /// exit); what follows is the daemon's restart policy. A daemon that is not running is an error.
+    /// exit: the service is then stopped, or already restarted by its restart policy); what follows
+    /// is the daemon's restart policy. A daemon that is not running is an error.
     #[arg(required = true)]
     pub ids: Vec<String>,
 }

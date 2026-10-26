@@ -765,9 +765,9 @@ someone else already marked for deletion is not disabled; if it will not stop,
 the error says so, and it is removed once it stops and its last handle closes.
 
 After upgrading goetia, run `goetia daemon install` again for every daemon
-installed by an older version. Services registered before this shim existed
-have no recovery actions until then, so the new shim runs them but SCM does
-not restart them. On every start, the shim logs one warning (in
+installed by an older version. `type: simple` services registered before this
+shim existed have no recovery actions until then, so the new shim runs them but
+SCM does not restart them. On every start, the shim logs one warning (in
 `%ProgramData%\Goetia\logs\<id>.log` and as a warning in the Windows Event
 Log) when it starts under a service that a different goetia version registered
 and `restart` is not `never`.
@@ -819,8 +819,10 @@ once the service has stopped; it does not queue a start behind the stop. A
 running service that does not accept one fails and names `goetia daemon kill`;
 it does not wait. A `stop` (or the stop of a `restart`) that arrives while SCM is
 starting the service, as in a restart after a failure, fails and says the STOP
-was not delivered and is not queued, that the service will come up running, and
-to run `stop` again once it is running. SCM treats the `STOPPED` that follows as
+was not delivered and is not queued, and to run `stop` again once the service is
+running. A `stop` that sees the service running or starting again after it began
+to stop (SCM restarted it after a failure, under its restart policy) fails and
+says so, and to run `stop` again; it does not wait for the restart. SCM treats the `STOPPED` that follows as
 it would one that follows `running`: a failure is restarted per `restart:`, a
 stop is not.
 
@@ -916,8 +918,8 @@ child is gone — which leaves the daemon stopped, at exit `4`. To restart a dae
 
 `goetia daemon kill <ID...>` ends each daemon's running process as a failure.
 On systemd and launchd it returns once the signal is sent; on Windows it returns
-once SCM has recorded the exit, so `status` straight after reads not-running.
-It takes no `--timeout` and does not change boot-enablement. What follows
+once SCM has recorded the exit: the service is then stopped, or already
+restarted by its restart policy. It takes no `--timeout` and does not change boot-enablement. What follows
 is the daemon's `restart` policy: an `always` or `on-failure` daemon comes
 back, a `never` one stays down. Like `stop`, it needs elevation, and `--json`
 is refused.

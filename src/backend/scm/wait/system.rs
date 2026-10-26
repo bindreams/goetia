@@ -12,9 +12,9 @@ use windows_service::service_manager::{ServiceManager as WinServiceManager, Serv
 use windows_sys::Win32::Foundation::{ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_NOT_ACTIVE, WAIT_IO_COMPLETION};
 use windows_sys::Win32::System::Services::{
     ControlService, NotifyServiceStatusChangeW, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_STOP, SERVICE_NOTIFY,
-    SERVICE_NOTIFY_2W, SERVICE_NOTIFY_PAUSED, SERVICE_NOTIFY_RUNNING, SERVICE_NOTIFY_START_PENDING,
-    SERVICE_NOTIFY_STATUS_CHANGE, SERVICE_NOTIFY_STOP_PENDING, SERVICE_NOTIFY_STOPPED, SERVICE_PAUSED, SERVICE_RUNNING,
-    SERVICE_STATUS, SERVICE_STOPPED,
+    SERVICE_NOTIFY_2W, SERVICE_NOTIFY_CONTINUE_PENDING, SERVICE_NOTIFY_PAUSE_PENDING, SERVICE_NOTIFY_PAUSED,
+    SERVICE_NOTIFY_RUNNING, SERVICE_NOTIFY_START_PENDING, SERVICE_NOTIFY_STATUS_CHANGE, SERVICE_NOTIFY_STOP_PENDING,
+    SERVICE_NOTIFY_STOPPED, SERVICE_PAUSED, SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STOPPED,
 };
 use windows_sys::Win32::System::Threading::{INFINITE, SleepEx};
 
@@ -95,25 +95,24 @@ unsafe extern "system" fn notify_callback(pparameter: *const c_void) {
     }
 }
 
-/// The `NotifyServiceStatusChangeW` mask for `want`, given whether
-/// `start()` has already been issued (`started`).
-///
-/// For a start wait the `STOPPED` bit is included ONLY after `start()`:
-/// the service is `Stopped` at the initial arm (a stop wait always
-/// precedes a start wait in this crate's own usage), and
-/// `NotifyServiceStatusChangeW` immediate-fires on the current state — so
-/// arming `STOPPED` before `start()` would misclassify that pre-start
-/// `Stopped` as a failed start. After `start()` the service has entered
-/// `StartPending`, so a later `StartPending -> Stopped` delivers a real
-/// `Stopped` callback that terminates the wait with `Err`.
+/// The `NotifyServiceStatusChangeW` mask for `want`, given whether `start()` has already been
+/// issued (`started`): the bits of [`WantState::states`].
 fn want_to_mask(want: WantState, started: bool) -> SERVICE_NOTIFY {
-    match want {
-        WantState::Stopped => SERVICE_NOTIFY_STOPPED | SERVICE_NOTIFY_STOP_PENDING,
-        WantState::Running if started => SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_STOPPED | SERVICE_NOTIFY_START_PENDING,
-        WantState::Running => SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_START_PENDING,
-        // No `START_PENDING`: a service starting at the arm must not fire it.
-        WantState::RunningPausedOrStopped => SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_PAUSED | SERVICE_NOTIFY_STOPPED,
-        WantState::StoppedOnly => SERVICE_NOTIFY_STOPPED,
+    want.states(started)
+        .iter()
+        .fold(0, |mask, state| mask | notify_bit(*state))
+}
+
+/// The mask bit of one state. One arm per variant and no `_` catch-all, like [`queried_state`].
+fn notify_bit(state: QueriedState) -> SERVICE_NOTIFY {
+    match state {
+        QueriedState::Stopped => SERVICE_NOTIFY_STOPPED,
+        QueriedState::StartPending => SERVICE_NOTIFY_START_PENDING,
+        QueriedState::StopPending => SERVICE_NOTIFY_STOP_PENDING,
+        QueriedState::Running => SERVICE_NOTIFY_RUNNING,
+        QueriedState::ContinuePending => SERVICE_NOTIFY_CONTINUE_PENDING,
+        QueriedState::PausePending => SERVICE_NOTIFY_PAUSE_PENDING,
+        QueriedState::Paused => SERVICE_NOTIFY_PAUSED,
     }
 }
 
