@@ -1,12 +1,13 @@
 //! THROWAWAY (issue #59, phase A): measures how the Windows SCM treats a
 //! service's reported exit, so the shim's design rests on measurements.
-//! Round 11: P22d (arming a mask that excludes a pending state on a delete-marked service) and P24 (re-arm after a STOP rejected in START_PENDING). Earlier rounds' probes stay in the file, unused. Never merges. Every observation is a `PROBE ...` line in the job log.
+//! Round 12: P25 (a service process that exits before it reports any status). Earlier rounds' probes stay in the file, unused. Never merges. Every observation is a `PROBE ...` line in the job log.
 //!
 //! This binary is also the service host: `<exe> --probe-host <name> <port> <scripts>`
 //! where `<scripts>` is `|`-separated, one script per run of the service
 //! (run index kept in `%ProgramData%\<name>.runs`; the last script repeats).
 //! A script is `,`-separated steps: `pending`, `run`, `connect`, `wait-stop`,
 //! `stopped:w32:<n>`, `stopped:spec:<n>`, `rawstopped:<w32>:<spec>`, `exit:<n>`,
+//! `preexit:<n>` (as the run's only step: connect back, then exit before `StartServiceCtrlDispatcherW`),
 //! `hold:<ms>` (stay in the state reported so far, e.g. START_PENDING), `stoppending` (report
 //! STOP_PENDING, checkpoint 1, tracing whether `SetServiceStatus` succeeded), `signal-wait` (block
 //! until the probe fires the named event `Global\<name>-go`).
@@ -32,7 +33,7 @@ mod host {
     use std::net::{Ipv4Addr, TcpStream};
     use std::os::windows::ffi::OsStrExt as _;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -48,6 +49,9 @@ mod host {
 
     static REFUSE_ONE_STOP: AtomicBool = AtomicBool::new(false);
 
+    /// This run's index, taken in `run_if_requested` (before the dispatcher is started).
+    static RUN_IDX: AtomicUsize = AtomicUsize::new(0);
+
     /// `Global\<name>-go`, NUL-terminated UTF-16: the event a `signal-wait` step blocks on.
     pub fn signal_name(name: &str) -> Vec<u16> {
         std::ffi::OsStr::new(&format!("Global\\{name}-go"))
@@ -61,8 +65,23 @@ mod host {
         if args.get(1).map(String::as_str) != Some(HOST) {
             return false;
         }
+        let idx = next_run_index(&args[2]);
+        let scripts: Vec<&str> = args[4].split('|').collect();
+        if let Some(n) = scripts[idx.min(scripts.len() - 1)].strip_prefix("preexit:") {
+            trace(&args[2], &format!("run={idx} preexit, exit {n}"));
+            connect_back(args[3].parse().expect("port"), idx);
+            std::process::exit(code(n) as i32);
+        }
+        RUN_IDX.store(idx, Ordering::SeqCst);
         service_dispatcher::start(&args[2], ffi_service_main).expect("connect to the SCM dispatcher");
         true
+    }
+
+    fn connect_back(port: u16, idx: usize) {
+        if let Ok(mut s) = TcpStream::connect((Ipv4Addr::LOCALHOST, port)) {
+            let _ = write!(s, "run={idx} pid={}", std::process::id());
+            let _ = s.shutdown(std::net::Shutdown::Write);
+        }
     }
 
     define_windows_service!(ffi_service_main, service_main);
@@ -174,7 +193,7 @@ mod host {
         let name = args[2].clone();
         let port: u16 = args[3].parse().expect("port");
         let scripts: Vec<&str> = args[4].split('|').collect();
-        let idx = next_run_index(&name);
+        let idx = RUN_IDX.load(Ordering::SeqCst);
         let script = scripts[idx.min(scripts.len() - 1)];
         let hook_name = name.clone();
         std::panic::set_hook(Box::new(move |info| {
@@ -234,12 +253,7 @@ mod host {
                     unsafe { Foundation::CloseHandle(ev) };
                     trace(&name, &format!("run={idx} signal-wait -> WaitForSingleObject {rc:#x}"));
                 }
-                ["connect"] => {
-                    if let Ok(mut s) = TcpStream::connect((Ipv4Addr::LOCALHOST, port)) {
-                        let _ = write!(s, "run={idx} pid={}", std::process::id());
-                        let _ = s.shutdown(std::net::Shutdown::Write);
-                    }
-                }
+                ["connect"] => connect_back(port, idx),
                 ["wait-stop"] => stop_rx.recv().expect("stop control"),
                 ["refuse-one-stop"] => REFUSE_ONE_STOP.store(true, Ordering::SeqCst),
                 ["hold", ms] => std::thread::sleep(Duration::from_millis(u64::from(code(ms)))),
@@ -3043,6 +3057,60 @@ mod probes {
         r
     }
 
+    // P25 =============================================================================================================
+
+    /// P25: the service process exits before it reports any status, with `restart/0` and
+    /// `failureflag` 1. `run0` is the first run's script (the second stays up, so its connect-back
+    /// is a recovery restart). A `RUNNING|PAUSED|STOPPED` notification is armed before the start;
+    /// on a STOPPED service it delivers at once, so it is re-armed after that delivery.
+    fn p25(tag: &str, run0: &str) -> String {
+        let mut p = Probe::new(tag, &format!("{run0}|{STAY_UP}"), "restart/0");
+        let h = p.service(ServiceAccess::STOP | ServiceAccess::QUERY_STATUS);
+        let mask = N_RUNNING | N_PAUSED | N_STOPPED;
+        let (rc1, ctx1) = register_notify(&p, &h, mask);
+        let at_once = rc1 == 0 && await_notify(ctx1, ATTENDED_WINDOW);
+        p.p(format_args!(
+            "arm before the start: rc {rc1}, delivered at once {at_once} (state {}, notification_status {})",
+            ctx1.last.load(Ordering::SeqCst),
+            ctx1.err.load(Ordering::SeqCst)
+        ));
+        let (rc, ctx) = if at_once {
+            register_notify(&p, &h, mask)
+        } else {
+            (rc1, ctx1)
+        };
+        p.p(format_args!("armed for the start: rc {rc}"));
+        let start = p.start();
+        let delivered = rc == 0 && await_notify(ctx, ATTENDED_WINDOW);
+        p.p(format_args!(
+            "notification delivered {delivered} (state {}, notification_status {}); status {}",
+            ctx.last.load(Ordering::SeqCst),
+            ctx.err.load(Ordering::SeqCst),
+            query_via(&h)
+        ));
+        let c0 = p.connect(0, ATTENDED_WINDOW).cloned();
+        let c1 = p.connect(1, ATTENDED_WINDOW).cloned();
+        // A restarted host stays up: a third connect-back would be a second failure.
+        let c2 = c1.as_ref().and_then(|_| p.connect(2, ATTENDED_WINDOW).cloned());
+        let status = query_via(&h);
+        p.p(format_args!(
+            "run 0 connect-back {}; restart {}; third run {}; final status {status}",
+            c0.as_ref().map_or("none".to_string(), |c| c.body.clone()),
+            describe(c1.as_ref(), ATTENDED_WINDOW),
+            describe(c2.as_ref(), ATTENDED_WINDOW),
+        ));
+        dump_host_trace(&p, "end");
+        let r = format!(
+            "StartService {start:?}; pre-start arm delivered {at_once}; notification delivered {delivered} (state {}); run 0 connected {}; restart: {}; final status {status}",
+            ctx.last.load(Ordering::SeqCst),
+            c0.is_some(),
+            describe(c1.as_ref(), ATTENDED_WINDOW)
+        );
+        p.result(&r);
+        p.dump_scm_events(tag);
+        r
+    }
+
     // Driver ==========================================================================================================
 
     pub fn run_all() {
@@ -3050,14 +3118,21 @@ mod probes {
         type Job = Box<dyn FnOnce() -> String + Send>;
         let jobs: Vec<(String, Job)> = vec![
             (
-                "P22d-stop-pending".to_string(),
-                Box::new(|| r11_samples("P22dSTOP", |t| p22d(true, t))),
+                "P25a-connect-exit-101".to_string(),
+                Box::new(|| r11_samples("P25a", |t| p25(t, "connect,exit:101"))),
             ),
             (
-                "P22d-start-pending".to_string(),
-                Box::new(|| r11_samples("P22dSTART", |t| p22d(false, t))),
+                "P25b-connect-exit-0".to_string(),
+                Box::new(|| r11_samples("P25b", |t| p25(t, "connect,exit:0"))),
             ),
-            ("P24".to_string(), Box::new(|| r11_samples("P24", p24))),
+            (
+                "P25c-preexit-101".to_string(),
+                Box::new(|| r11_samples("P25c", |t| p25(t, "preexit:101"))),
+            ),
+            (
+                "P25d-preexit-0".to_string(),
+                Box::new(|| r11_samples("P25d", |t| p25(t, "preexit:0"))),
+            ),
         ];
         println!("PROBE SUMMARY begin");
         for (name, job) in jobs {
