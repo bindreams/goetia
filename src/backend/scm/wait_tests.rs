@@ -383,114 +383,123 @@ fn a_stop_request_over_a_stop_under_way_is_accepted() {
     request_stop(&mut fake).unwrap();
     assert_eq!(fake.log, vec!["control_stop", "query_status"]);
 }
+/// What a refused STOP is told, by the state the status read after the refusal reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// A stop is under way (or done): `stop` waits for it, `request_stop` is done.
+    UnderWay,
+    /// The service was starting when the STOP was sent and accepts STOP now: not delivered, say so.
+    NotDelivered,
+    /// `RUNNING` or `PAUSED` with no `SERVICE_ACCEPT_STOP`: nothing is stopping it.
+    DoesNotAccept,
+    /// `START_PENDING`: the STOP was dropped, [`STARTING`].
+    Starting,
+    /// Any other state: the OS error, code intact.
+    Raw,
+}
 
-/// A 1061 is a stop under way only when the service says so: `STOP_PENDING`, a `RUNNING` (or
-/// `PAUSED`) service that still accepts STOP (a STOP delivered and not yet answered, P16a), or one
-/// that has stopped since. A `RUNNING` service that accepts no STOP (the `refuse-stop` fixture) also
-/// answers 1061, and waiting for it to stop would end in a timeout; so would any other state.
+/// A STOP refused with 1052 or 1061 means what the service's status says, not what the code says:
+/// no probe measured which code SCM gives a `RUNNING` service that accepts no STOP, and Microsoft
+/// documents 1052 for it. Every code-by-state cell is decided by the status read after the refusal.
+/// An error is not followed by a wait.
 #[skuld::test]
-fn a_refused_stop_is_under_way_only_in_a_state_that_is_stopping() {
-    for (state, accepts_stop, under_way) in [
-        (QueriedState::StopPending, false, true),
-        (QueriedState::Running, true, true),
-        (QueriedState::Paused, true, true),
-        (QueriedState::Stopped, false, true),
-        (QueriedState::Running, false, false),
-        (QueriedState::Paused, false, false),
-        (QueriedState::StartPending, true, false),
-        (QueriedState::StartPending, false, false),
-        (QueriedState::ContinuePending, false, false),
-        (QueriedState::PausePending, false, false),
+fn a_refused_stop_is_decided_by_the_status_read_after_it() {
+    use QueriedState::{ContinuePending, PausePending, Paused, Running, StartPending, StopPending, Stopped};
+    use Refusal::{DoesNotAccept, NotDelivered, Raw, Starting, UnderWay};
+    for (code, state, accepts_stop, expected) in [
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, StopPending, false, UnderWay),
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, Stopped, false, UnderWay),
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, Running, true, UnderWay),
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, Paused, true, UnderWay),
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, Running, false, DoesNotAccept),
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, Paused, false, DoesNotAccept),
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, StartPending, false, Starting),
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, StartPending, true, Starting),
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, ContinuePending, false, Raw),
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, PausePending, false, Raw),
+        (ERROR_INVALID_SERVICE_CONTROL, StopPending, false, UnderWay),
+        (ERROR_INVALID_SERVICE_CONTROL, Stopped, false, UnderWay),
+        (ERROR_INVALID_SERVICE_CONTROL, Running, true, NotDelivered),
+        (ERROR_INVALID_SERVICE_CONTROL, Paused, true, NotDelivered),
+        (ERROR_INVALID_SERVICE_CONTROL, Running, false, DoesNotAccept),
+        (ERROR_INVALID_SERVICE_CONTROL, Paused, false, DoesNotAccept),
+        (ERROR_INVALID_SERVICE_CONTROL, StartPending, false, Starting),
+        (ERROR_INVALID_SERVICE_CONTROL, StartPending, true, Starting),
+        (ERROR_INVALID_SERVICE_CONTROL, ContinuePending, false, Raw),
+        (ERROR_INVALID_SERVICE_CONTROL, PausePending, false, Raw),
     ] {
         let script = || {
             FakeScm::new([Some(Observed::Stopped)])
-                .stop_replies([StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL)])
+                .stop_replies([StopReply::Os(code)])
                 .queried(state, accepts_stop)
         };
-        let waiting = stop_via_notify(&mut script(), unbounded());
-        let immediate = request_stop(&mut script());
-        if under_way {
-            assert_eq!(waiting.unwrap(), Waited::Confirmed, "{state:?} accepts {accepts_stop}");
-            immediate.unwrap();
-        } else {
-            for err in [waiting.unwrap_err(), immediate.unwrap_err()] {
-                let text = err.to_string();
-                assert!(
+        let cell = format!("{code} then {state:?} accepting {accepts_stop}");
+        let mut waiting = script();
+        let mut immediate = script();
+        let results = [
+            stop_via_notify(&mut waiting, unbounded()).map(|waited| {
+                assert_eq!(waited, Waited::Confirmed, "{cell}");
+            }),
+            request_stop(&mut immediate),
+        ];
+        if expected == UnderWay {
+            for result in results {
+                result.unwrap_or_else(|e| panic!("{cell}: {e}"));
+            }
+            assert!(waiting.log.contains(&"wait"), "{cell}: {:?}", waiting.log);
+            continue;
+        }
+        assert_eq!(
+            waiting.log,
+            vec!["arm_stopped", "control_stop", "query_status"],
+            "{cell}"
+        );
+        assert_eq!(immediate.log, vec!["control_stop", "query_status"], "{cell}");
+        for result in results {
+            let err = result.expect_err(&cell);
+            let text = err.to_string();
+            match expected {
+                Refusal::DoesNotAccept => assert!(
                     text.contains("does not accept STOP") && text.contains("goetia daemon kill"),
-                    "{state:?} accepts {accepts_stop}: {text}"
-                );
+                    "{cell}: {text}"
+                ),
+                Refusal::NotDelivered => {
+                    for part in ["was not delivered", "accepts STOP now", "run `stop` again"] {
+                        assert!(text.contains(part), "{cell}: missing {part:?}: {text}");
+                    }
+                    assert!(!text.contains("os error"), "{cell}: {text}");
+                }
+                Refusal::Starting => {
+                    for part in [
+                        "SCM is starting the service",
+                        "was not delivered and is not queued",
+                        "run `stop` again once the service is running",
+                    ] {
+                        assert!(text.contains(part), "{cell}: missing {part:?}: {text}");
+                    }
+                    // Not measured: a restart can fail before RUNNING (P9).
+                    assert!(!text.contains("will come up"), "{cell}: {text}");
+                    assert!(!text.contains("os error"), "{cell}: {text}");
+                }
+                Refusal::Raw => assert_eq!(err.raw_os_error(), Some(code), "{cell}: {text}"),
+                Refusal::UnderWay => unreachable!(),
             }
         }
     }
 }
 
-/// An error is not followed by a wait: the refusal is final.
+/// Any other refusal is an error that keeps its OS code, without a status read.
 #[skuld::test]
-fn a_stop_refused_by_a_service_that_does_not_accept_it_waits_for_nothing() {
-    let mut fake = FakeScm::new([])
-        .stop_replies([StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL)])
-        .queried(QueriedState::Running, false);
-    stop_via_notify(&mut fake, unbounded()).unwrap_err();
-    assert_eq!(fake.log, vec!["arm_stopped", "control_stop", "query_status"]);
-}
-
-/// Only 1061 is a stop under way: any other refusal is an error that keeps its OS code. A 1052 from a
-/// service that is not starting has no better text than the OS's.
-#[skuld::test]
-fn stop_refusals_other_than_a_stop_under_way_are_errors() {
-    for (code, state) in [
-        (ERROR_INVALID_SERVICE_CONTROL, Some(QueriedState::Running)),
-        (ERROR_INVALID_SERVICE_CONTROL, Some(QueriedState::Paused)),
-        (ERROR_INVALID_SERVICE_CONTROL, Some(QueriedState::Stopped)),
-        (5, None),
-    ] {
-        let script = || {
-            let fake = FakeScm::new([Some(Observed::Stopped)]).stop_replies([StopReply::Os(code)]);
-            match state {
-                Some(state) => fake.queried(state, false),
-                None => fake,
-            }
-        };
-        let err = stop_via_notify(&mut script(), unbounded()).unwrap_err();
-        assert_eq!(err.raw_os_error(), Some(code), "{state:?}");
-        assert_eq!(
-            request_stop(&mut script()).unwrap_err().raw_os_error(),
-            Some(code),
-            "{state:?}"
-        );
-    }
-}
-
-/// A STOP refused with 1052 while SCM is starting the service (a recovery restart) is not delivered
-/// and not queued (P13c). The error says so, and promises no outcome. This reaches
-/// `stop`, `stop --timeout 0` and `restart`'s stop leg, which all go through these two.
-#[skuld::test]
-fn a_stop_refused_while_scm_is_starting_the_service_says_what_happened() {
-    let script = || {
-        FakeScm::new([])
-            .stop_replies([StopReply::Os(ERROR_INVALID_SERVICE_CONTROL)])
-            .queried(QueriedState::StartPending, false)
-    };
+fn a_stop_refused_with_another_code_is_the_os_error() {
+    let script = || FakeScm::new([Some(Observed::Stopped)]).stop_replies([StopReply::Os(5)]);
     let mut waiting = script();
     let mut immediate = script();
-    for err in [
-        stop_via_notify(&mut waiting, unbounded()).unwrap_err(),
-        request_stop(&mut immediate).unwrap_err(),
-    ] {
-        let text = err.to_string();
-        for part in [
-            "SCM is starting the service",
-            "was not delivered and is not queued",
-            "run `stop` again once the service is running",
-        ] {
-            assert!(text.contains(part), "missing {part:?}: {text}");
-        }
-        // Not measured: a restart can fail before RUNNING (P9).
-        assert!(!text.contains("will come up"), "{text}");
-        assert!(!text.contains("os error"), "{text}");
-    }
-    assert_eq!(waiting.log, vec!["arm_stopped", "control_stop", "query_status"]);
-    assert_eq!(immediate.log, vec!["control_stop", "query_status"]);
+    assert_eq!(
+        stop_via_notify(&mut waiting, unbounded()).unwrap_err().raw_os_error(),
+        Some(5)
+    );
+    assert_eq!(request_stop(&mut immediate).unwrap_err().raw_os_error(), Some(5));
+    assert_eq!(waiting.log, vec!["arm_stopped", "control_stop"]);
 }
 
 /// A failure that races the stop goes `STOPPED (1066)`, and SCM restarts the service under its

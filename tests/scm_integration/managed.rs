@@ -420,6 +420,39 @@ fn uninstall_errors_when_service_will_not_stop() {
     );
 }
 
+/// Measures which code SCM gives a STOP to a RUNNING service that accepts none (the unit tests
+/// script 1052 and 1061 alike): `stop` reads the status either way and returns the "does not accept
+/// STOP" error at once. The call returns or the CI watchdog ends the job; a wait would hang.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn stop_of_a_service_that_accepts_no_stop_says_so_without_waiting() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let started = ConnectBack::listen();
+    let spec = mk_spec(
+        &id,
+        fixture_command(&id, started.port(), 1, "refuse-stop"),
+        BTreeMap::new(),
+    );
+
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    started.accept("the fixture to report SERVICE_RUNNING");
+
+    for (what, budget) in [("stop", Budget::Unbounded), ("stop --timeout 0", Budget::Immediate)] {
+        let text = mgr
+            .stop(&spec.id, budget)
+            .expect_err("a service that declines SERVICE_CONTROL_STOP cannot be stopped")
+            .to_string();
+        assert!(
+            text.contains("does not accept STOP") && text.contains("goetia daemon kill"),
+            "{what}: {text}"
+        );
+    }
+
+    mgr.kill(&spec.id).expect("kill the service stop could not stop");
+}
+
 // Step 5: an install interrupted before the metadata write is recoverable =============================================
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]

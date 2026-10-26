@@ -782,8 +782,11 @@ failing:
 | the shim could not run the command, or its wait on it failed | a Win32 code: the OS error, `13` for an unreadable spec, `31` if there is none |
 | the shim could not show the command's tree terminated        | `0`, `1003`                                                                    |
 
-A shim that cannot report at all, because it was started without a service id
-or cannot connect to SCM, exits `160` or `1063`; SCM's record is then its own.
+A shim that cannot report at all exits `160` or `1063`; SCM's record is then its own.
+A shim started without a service id, or that cannot connect to SCM, dies before
+it has connected, and SCM does not restart it. A shim that connected and then
+cannot register its control handler exits `1063` after the connect: SCM records
+`1067` and restarts it under the restart policy.
 
 Under `on-failure` both failures are restarted, so a spec the shim cannot read
 or a command that is missing retries at `restart-delay` indefinitely, as it
@@ -820,10 +823,12 @@ running service that does not accept one fails and names `goetia daemon kill`;
 it does not wait. A `stop` (or the stop of a `restart`) that arrives while SCM is
 starting the service, as in a restart after a failure, fails and says the STOP
 was not delivered and is not queued, and to run `stop` again once the service is
-running. A `stop` that sees the service running or starting again after it began
-to stop (SCM restarted it after a failure, under its restart policy) fails and
-says so, and to run `stop` again; it does not wait for the restart. SCM treats the `STOPPED` that follows as
-it would one that follows `running`: a failure is restarted per `restart:`, a
+running; if the service accepts STOP by the time `stop` looks, it says the STOP
+was not delivered and to run `stop` again. A `stop` that sees the service
+running or starting again after it began to stop (SCM restarted it after a
+failure, under its restart policy) fails and says so, and to run `stop` again;
+it does not wait for the restart. SCM treats the `STOPPED` that follows as it
+would one that follows `running`: a failure is restarted per `restart:`, a
 stop is not.
 
 Nothing guards against a possible survivor afterwards: `stop` exits `0`,

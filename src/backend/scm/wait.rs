@@ -117,7 +117,7 @@ pub trait ScmActor {
     /// afterwards, for the reason [`Self::stopped_exit`] is.
     fn accepts_stop(&self) -> bool;
     /// A fresh `QueryServiceStatus`: the state and controls accepted now, for deciding what a
-    /// refused STOP (1061) meant. Not a wait and not read from a notification.
+    /// refused STOP (1052 or 1061) meant. Not a wait and not read from a notification.
     fn query_status(&mut self) -> io::Result<QueriedStatus>;
 }
 
@@ -134,38 +134,59 @@ pub fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result
     await_stopped(a, deadline, " Run `stop` again.")
 }
 
-/// [`ScmActor::control_stop`], where a stop already under way counts as sent. A service in
-/// `STOP_PENDING` (a shim tearing the daemon down) is refused by SCM with 1061 before it reaches the
-/// service (P18c), and the stop being asked for is the one in progress. So is a `RUNNING` (or
-/// `PAUSED`) service that still accepts STOP: a STOP was delivered and not yet answered (P16a), as
-/// [`settle_and_stop`] reads it. A service that has stopped since is done. A `RUNNING` service that
-/// accepts no STOP is also refused with 1061, and nothing is stopping it: that, any other state and
-/// any other refusal is an error. A 1052 from a `START_PENDING` service is told as what it is, see
-/// [`STARTING`].
+/// [`ScmActor::control_stop`], where a stop already under way counts as sent.
+///
+/// SCM refuses a STOP with 1061 (`ERROR_SERVICE_CANNOT_ACCEPT_CTRL`) or 1052
+/// (`ERROR_INVALID_SERVICE_CONTROL`). Which code goes with which state is measured only in part:
+/// 1061 for `STOP_PENDING` (P18c, P26) and for a second STOP after one was delivered (P16a), 1052
+/// for `START_PENDING` (P13c). Microsoft documents 1052 for a control the service does not accept,
+/// which nothing here has measured for a `RUNNING` service. So the code decides nothing: the status
+/// read after the refusal does, the same for both codes.
+/// - `STOP_PENDING` or `STOPPED`: a stop is under way or done. Sent.
+/// - `RUNNING` or `PAUSED`, accepting STOP: after 1061 a STOP was delivered and not yet answered
+///   (P16a), so it is under way: sent. After 1052 the service was not yet accepting STOP when the
+///   STOP was sent (a start was in progress) and is now: the STOP was not delivered, an error says
+///   so and nothing waits.
+/// - `RUNNING` or `PAUSED`, not accepting STOP: nothing is stopping it, and nothing will. An error
+///   names `goetia daemon kill`. `tests/scm_integration/managed.rs` (`stop` of the `refuse-stop`
+///   fixture) measures this on CI.
+/// - `START_PENDING`: told as [`STARTING`].
+/// - any other state: the OS error.
 fn control_stop_or_underway<A: ScmActor>(a: &mut A) -> io::Result<()> {
     match a.control_stop() {
-        Err(e) if e.raw_os_error() == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL) => {
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL | ERROR_INVALID_SERVICE_CONTROL)
+            ) =>
+        {
             let status = a.query_status()?;
             match (status.state, status.accepts_stop) {
-                (QueriedState::StopPending | QueriedState::Stopped, _)
-                | (QueriedState::Running | QueriedState::Paused, true) => Ok(()),
-                (state, _) => Err(io::Error::other(format!(
+                (QueriedState::StopPending | QueriedState::Stopped, _) => Ok(()),
+                (QueriedState::Running | QueriedState::Paused, true) => {
+                    if e.raw_os_error() == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL) {
+                        Ok(())
+                    } else {
+                        Err(io::Error::other(STOP_NOT_DELIVERED))
+                    }
+                }
+                (state @ (QueriedState::Running | QueriedState::Paused), false) => Err(io::Error::other(format!(
                     "the service is {state:?} and does not accept STOP; `goetia daemon kill` ends its process"
                 ))),
+                (QueriedState::StartPending, _) => Err(io::Error::other(STARTING)),
+                _ => Err(e),
             }
-        }
-        Err(e) if e.raw_os_error() == Some(ERROR_INVALID_SERVICE_CONTROL) => {
-            if a.query_status()?.state == QueriedState::StartPending {
-                return Err(io::Error::other(STARTING));
-            }
-            Err(e)
         }
         other => other,
     }
 }
 
-/// What a STOP refused with 1052 while SCM starts the service is told, as a recovery restart does
-/// until the new shim reports `RUNNING`. SCM drops that STOP: nothing queues it (P13c).
+/// What a STOP refused with 1052 is told when the service accepts STOP by the time the status is
+/// read: the STOP reached it before it did, and is gone.
+const STOP_NOT_DELIVERED: &str = "the STOP was not delivered: the service was not yet accepting STOP when it was sent, and accepts STOP now; run `stop` again";
+
+/// What a STOP refused while SCM starts the service is told, as a recovery restart does until the
+/// new shim reports `RUNNING`. SCM drops that STOP: nothing queues it (P13c, with 1052).
 const STARTING: &str = "SCM is starting the service (for example a restart after a failure), so the STOP was not delivered and is not queued; run `stop` again once the service is running";
 
 /// The wait half of a stop: the `Stopped` arm (`STOPPED` and `STOP_PENDING`) is already in place.

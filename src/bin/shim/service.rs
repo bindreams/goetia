@@ -228,8 +228,16 @@ fn report_stopped(id: &str, handle: StatusHandle, reported: Reported) {
     let ok = unsafe { SetServiceStatus(handle.0, &status) };
     if ok == 0 {
         let e = std::io::Error::last_os_error();
-        logging::log_failure(id, &format!("report SERVICE_STOPPED to SCM: {e}"));
+        logging::log_failure(id, &stopped_report_failure(&e));
     }
+}
+
+/// The shim exits after this, so SCM reads the exit as a crash: 1067, with the restart policy
+/// applied even after a commanded stop.
+fn stopped_report_failure(e: &std::io::Error) -> String {
+    format!(
+        "report SERVICE_STOPPED to SCM: {e}; the shim exits anyway, so SCM will record 1067 (a crash) and apply the restart policy"
+    )
 }
 
 // One pass ============================================================================================================
