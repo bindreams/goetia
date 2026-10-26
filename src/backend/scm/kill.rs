@@ -50,6 +50,17 @@ pub trait KillTarget {
 
     /// Terminate `process`, or report that it had already exited.
     fn terminate(&mut self, process: &Self::Process) -> io::Result<Termination>;
+
+    /// Block until `process` has exited. Unbounded: the exit is the event.
+    fn await_exit(&mut self, process: &Self::Process) -> io::Result<()>;
+
+    /// Register to be woken when SCM records the service `STOPPED`. A registration made while the
+    /// service is already `STOPPED` wakes at once; one made on any other state does not wake until
+    /// the next entry into `STOPPED`.
+    fn arm_release(&mut self) -> io::Result<()>;
+
+    /// Block until the registration [`Self::arm_release`] made wakes. Unbounded.
+    fn await_release(&mut self) -> io::Result<()>;
 }
 
 /// Terminate the service's process, or report that it has none.
@@ -57,7 +68,8 @@ pub trait KillTarget {
 /// Loops only when the service's state changed under it: the process was gone before it could be
 /// opened or terminated, or SCM no longer vouches for the pid it was opened by. Each round re-reads
 /// SCM, which settles on the new process or on none, so the loop follows the service rather than a
-/// count. Only a termination that was delivered is [`Killed::Terminated`].
+/// count. Only a termination that was delivered is [`Killed::Terminated`], and only once SCM has
+/// recorded the exit: the process has exited and SCM no longer reports its pid.
 pub fn kill_service<T: KillTarget>(target: &mut T) -> io::Result<Killed> {
     loop {
         let Some(pid) = target.service_pid()? else {
@@ -89,10 +101,32 @@ pub fn kill_service<T: KillTarget>(target: &mut T) -> io::Result<Killed> {
             continue;
         }
         match target.terminate(&process)? {
-            Termination::Terminated => return Ok(Killed::Terminated),
+            Termination::Terminated => {
+                target.await_exit(&process)?;
+                await_scm_released(target, pid)?;
+                return Ok(Killed::Terminated);
+            }
             // SCM has not yet noticed the exit; it will, and until then this re-reads it.
             Termination::AlreadyExited => std::thread::yield_now(),
         }
+    }
+}
+
+/// Block until SCM no longer reports `pid` as the service's process: it shows none, or a different
+/// one (a recovery restart).
+///
+/// SCM learns of the exit after the process object is signalled, so a read straight after the
+/// termination still shows the pid with the service `RUNNING`. The wake is the service entering
+/// `STOPPED`, which SCM records, with pid 0, before it lets go of the process. SCM wakes a
+/// registration at once only when the service is already in the wanted state, so the read follows
+/// every arm: a release that landed between an earlier read and the arm would never wake it.
+fn await_scm_released<T: KillTarget>(target: &mut T, pid: u32) -> io::Result<()> {
+    loop {
+        target.arm_release()?;
+        if target.service_pid()? != Some(pid) {
+            return Ok(());
+        }
+        target.await_release()?;
     }
 }
 
@@ -115,14 +149,45 @@ mod system {
         INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
     };
 
+    use crate::backend::scm::wait::{ScmActor, SystemScmActor, Waited, WantState};
+    use crate::manager::budget::Budget;
+
     use super::privilege::DebugPrivilege;
     use super::{KillTarget, Termination};
 
     /// The real SCM service; the process is a Win32 handle.
     pub struct SystemKillTarget {
-        pub service: Service,
-        /// The daemon's id, for the notice printed when a kill has to wait.
-        pub id: String,
+        service: Service,
+        /// The daemon's id: the service's name, and the label of the notice printed when a kill has
+        /// to wait.
+        id: String,
+        /// Opened by the first [`KillTarget::arm_release`], as a kill that finds SCM already
+        /// released never needs it.
+        notifier: Option<SystemScmActor>,
+    }
+
+    impl SystemKillTarget {
+        pub fn new(service: Service, id: String) -> Self {
+            Self {
+                service,
+                id,
+                notifier: None,
+            }
+        }
+
+        fn notice(&self, process: &Held) {
+            eprintln!(
+                "{}: process {} is already terminating; waiting for it to exit",
+                self.id, process.pid
+            );
+        }
+
+        fn notifier(&mut self) -> io::Result<&mut SystemScmActor> {
+            match &mut self.notifier {
+                Some(actor) => Ok(actor),
+                empty => Ok(empty.insert(SystemScmActor::open(&self.id)?)),
+            }
+        }
     }
 
     /// An opened service process and the pid it was opened by.
@@ -167,12 +232,30 @@ mod system {
         }
 
         fn terminate(&mut self, process: &Held) -> io::Result<Termination> {
-            terminate_process(&process.handle, || {
-                eprintln!(
-                    "{}: process {} is already terminating; waiting for it to exit",
-                    self.id, process.pid
-                );
-            })
+            terminate_process(&process.handle, || self.notice(process))
+        }
+
+        fn await_exit(&mut self, process: &Held) -> io::Result<()> {
+            wait_exit(&process.handle, || self.notice(process))
+        }
+
+        fn arm_release(&mut self) -> io::Result<()> {
+            // Unbounded, so the arm cannot expire.
+            match self
+                .notifier()?
+                .arm(WantState::StoppedOnly, Budget::Unbounded.start())?
+            {
+                Waited::Confirmed => Ok(()),
+                Waited::Expired => unreachable!("an unbounded deadline does not expire"),
+            }
+        }
+
+        fn await_release(&mut self) -> io::Result<()> {
+            match self.notifier()?.wait_callback(Budget::Unbounded.start())? {
+                // Whatever woke it, the caller re-reads SCM.
+                Some(_) => Ok(()),
+                None => unreachable!("an unbounded deadline does not expire"),
+            }
         }
     }
 
@@ -212,10 +295,17 @@ mod system {
         if e.raw_os_error() != Some(ERROR_ACCESS_DENIED as i32) {
             return Err(e);
         }
+        wait_exit(process, on_wait).map(|()| Termination::AlreadyExited)
+    }
+
+    /// Block until the process behind `process`, an [`open_process`] handle, has exited.
+    ///
+    /// `on_wait` runs once, just before blocking on a process that has not yet exited.
+    pub(super) fn wait_exit(process: &OwnedHandle, on_wait: impl FnOnce()) -> io::Result<()> {
         // A zero-timeout poll reads the state; it is not a wait. Already signalled: nothing to wait for.
-        // SAFETY: as above; `PROCESS_SYNCHRONIZE` was requested.
+        // SAFETY: `process` is a live handle with `PROCESS_SYNCHRONIZE`.
         match unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } {
-            WAIT_OBJECT_0 => return Ok(Termination::AlreadyExited),
+            WAIT_OBJECT_0 => return Ok(()),
             WAIT_TIMEOUT => {}
             _ => return Err(io::Error::last_os_error()),
         }
@@ -224,7 +314,7 @@ mod system {
         on_wait();
         // SAFETY: as above.
         match unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) } {
-            WAIT_OBJECT_0 => Ok(Termination::AlreadyExited),
+            WAIT_OBJECT_0 => Ok(()),
             _ => Err(io::Error::last_os_error()),
         }
     }

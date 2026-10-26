@@ -233,6 +233,30 @@ fn a_killed_never_restart_daemon_stays_down() {
     });
 }
 
+/// `kill` returns once SCM has recorded the exit, so the first `status` after it reads not-running
+/// and has no pid. The shared `a_killed_daemon_that_never_restarts_stays_down` waits for that state
+/// instead; this is the contract it hides.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn kill_returns_once_scm_has_recorded_the_exit() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let (started, stopped) = (ConnectBack::listen(), ConnectBack::listen());
+    let spec = reporting(&id, Restart::Never, &started, &stopped);
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    started.accept("the fixture to report SERVICE_RUNNING");
+
+    mgr.kill(&spec.id).expect("kill");
+
+    let status = mgr.status(&spec.id).expect("status straight after the kill");
+    assert!(
+        matches!(status.state, State::Stopped | State::Failed),
+        "kill returned before SCM recorded the exit ({status:?})"
+    );
+    assert_eq!(status.pid, None, "a killed daemon has no process ({status:?})");
+}
+
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn killing_a_stopped_service_is_not_running() {
     let mgr = ScmManager::new();

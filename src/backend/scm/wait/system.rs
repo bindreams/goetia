@@ -113,6 +113,7 @@ fn want_to_mask(want: WantState, started: bool) -> SERVICE_NOTIFY {
         WantState::Running => SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_START_PENDING,
         // No `START_PENDING`: a service starting at the arm must not fire it.
         WantState::RunningPausedOrStopped => SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_PAUSED | SERVICE_NOTIFY_STOPPED,
+        WantState::StoppedOnly => SERVICE_NOTIFY_STOPPED,
     }
 }
 

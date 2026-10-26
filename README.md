@@ -890,9 +890,10 @@ refused — for a `type: simple` daemon almost always, since its service reads
 
 ## Killing a daemon
 
-`goetia daemon kill <ID...>` ends each daemon's running process as a failure,
-and returns once that is delivered. It does not wait for the process to be
-gone, takes no `--timeout`, and does not change boot-enablement. What follows
+`goetia daemon kill <ID...>` ends each daemon's running process as a failure.
+On systemd and launchd it returns once the signal is sent; on Windows it returns
+once SCM has recorded the exit, so `status` straight after reads not-running.
+It takes no `--timeout` and does not change boot-enablement. What follows
 is the daemon's `restart` policy: an `always` or `on-failure` daemon comes
 back, a `never` one stays down. Like `stop`, it needs elevation, and `--json`
 is refused.
@@ -908,8 +909,9 @@ It addresses the service, never a bare pid:
 On Windows with `type: simple` the service's process is `goetia-shim`; its Job
 Object ends the daemon and its descendants with it.
 
-On Windows a process that is already terminating (a second `kill`, or a daemon
-dying on its own) is waited for until it exits, with no time limit. When that
+On Windows the process just terminated, or one already terminating (a second
+`kill`, or a daemon dying on its own), is waited for until it exits, with no
+time limit. When that
 wait begins goetia prints `<id>: process <pid> is already terminating; waiting
 for it to exit` to stderr; a process stuck in a driver request can keep it
 waiting.

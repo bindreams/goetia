@@ -32,6 +32,8 @@ struct Scripted {
     /// Which `service_pid` calls, counted from 1, fail instead of answering.
     failing_reads: Vec<usize>,
     reads: usize,
+    /// How many times the kill has blocked for SCM to let go.
+    releases: usize,
     log: Log,
 }
 
@@ -47,6 +49,7 @@ impl Scripted {
             terminates: terminates.into(),
             failing_reads: Vec::new(),
             reads: 0,
+            releases: 0,
             log: Log::default(),
         }
     }
@@ -110,6 +113,26 @@ impl KillTarget for Scripted {
             Terminate::Fails => Err(io::Error::other("terminate failed")),
         }
     }
+
+    fn await_exit(&mut self, process: &Held) -> io::Result<()> {
+        self.log.borrow_mut().push(format!("await_exit {}", process.pid));
+        Ok(())
+    }
+
+    fn arm_release(&mut self) -> io::Result<()> {
+        self.log.borrow_mut().push("arm_release".to_string());
+        Ok(())
+    }
+
+    fn await_release(&mut self) -> io::Result<()> {
+        self.log.borrow_mut().push("await_release".to_string());
+        self.releases += 1;
+        assert!(
+            self.releases <= 5,
+            "the script never released the pid; the wait would not end"
+        );
+        Ok(())
+    }
 }
 
 fn steps<const N: usize>(steps: [&str; N]) -> Vec<String> {
@@ -132,12 +155,21 @@ fn a_service_with_no_process_has_nothing_to_kill() {
 /// is still the service's, and only then is it terminated, through the handle still held.
 #[skuld::test]
 fn the_process_is_held_from_the_open_through_the_termination() {
-    let mut target = Scripted::new([Some(100)], [Open::Found], [Terminate::Done]);
+    let mut target = Scripted::new([Some(100), Some(100), None], [Open::Found], [Terminate::Done]);
 
     assert_eq!(kill_service(&mut target).unwrap(), Killed::Terminated);
     assert_eq!(
         target.log(),
-        steps(["service_pid", "open 100", "service_pid", "terminate 100", "close 100"])
+        steps([
+            "service_pid",
+            "open 100",
+            "service_pid",
+            "terminate 100",
+            "await_exit 100",
+            "arm_release",
+            "service_pid",
+            "close 100",
+        ])
     );
 }
 
@@ -146,7 +178,7 @@ fn the_process_is_held_from_the_open_through_the_termination() {
 #[skuld::test]
 fn a_restart_between_the_open_and_the_confirmation_lets_go_of_the_stale_process() {
     let mut target = Scripted::new(
-        [Some(100), Some(200), Some(200)],
+        [Some(100), Some(200), Some(200), Some(200), None],
         [Open::Found, Open::Found],
         [Terminate::Done],
     );
@@ -163,6 +195,9 @@ fn a_restart_between_the_open_and_the_confirmation_lets_go_of_the_stale_process(
             "open 200",
             "service_pid",
             "terminate 200",
+            "await_exit 200",
+            "arm_release",
+            "service_pid",
             "close 200",
         ])
     );
@@ -183,7 +218,7 @@ fn a_process_gone_before_it_was_opened_sends_the_question_back_to_scm() {
 #[skuld::test]
 fn a_process_gone_before_it_was_opened_is_followed_to_the_services_new_process() {
     let mut target = Scripted::new(
-        [Some(100), Some(200), Some(200)],
+        [Some(100), Some(200), Some(200), None],
         [Open::Gone, Open::Found],
         [Terminate::Done],
     );
@@ -198,6 +233,9 @@ fn a_process_gone_before_it_was_opened_is_followed_to_the_services_new_process()
             "open 200",
             "service_pid",
             "terminate 200",
+            "await_exit 200",
+            "arm_release",
+            "service_pid",
             "close 200",
         ])
     );
@@ -240,7 +278,7 @@ fn a_process_that_exited_before_the_termination_is_not_a_kill() {
 #[skuld::test]
 fn a_process_that_exited_before_the_termination_is_followed_to_the_services_new_process() {
     let mut target = Scripted::new(
-        [Some(100), Some(100), Some(200), Some(200)],
+        [Some(100), Some(100), Some(200), Some(200), None],
         [Open::Found, Open::Found],
         [Terminate::AlreadyExited, Terminate::Done],
     );
@@ -258,6 +296,9 @@ fn a_process_that_exited_before_the_termination_is_followed_to_the_services_new_
             "open 200",
             "service_pid",
             "terminate 200",
+            "await_exit 200",
+            "arm_release",
+            "service_pid",
             "close 200",
         ])
     );
@@ -268,7 +309,7 @@ fn a_process_that_exited_before_the_termination_is_followed_to_the_services_new_
 #[skuld::test]
 fn an_open_that_failed_on_a_pid_scm_moved_off_follows_the_service() {
     let mut target = Scripted::new(
-        [Some(100), Some(200), Some(200), Some(200)],
+        [Some(100), Some(200), Some(200), Some(200), None],
         [Open::Fails, Open::Found],
         [Terminate::Done],
     );
@@ -284,6 +325,9 @@ fn an_open_that_failed_on_a_pid_scm_moved_off_follows_the_service() {
             "open 200",
             "service_pid",
             "terminate 200",
+            "await_exit 200",
+            "arm_release",
+            "service_pid",
             "close 200",
         ])
     );
@@ -305,6 +349,62 @@ fn an_open_that_failed_on_the_services_own_pid_is_an_error() {
 
     assert_eq!(e.to_string(), "access denied");
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
+}
+
+/// SCM records the exit after the termination is delivered, so a read straight after it still shows
+/// the old pid and the old state (CI run 40262088279: `uninstall` straight after `kill` saw RUNNING).
+/// The kill is not done until SCM has let go: it blocks for the release and reads again.
+#[skuld::test]
+fn a_kill_waits_while_scm_still_reports_the_killed_pid() {
+    let mut target = Scripted::new(
+        [Some(100), Some(100), Some(100), Some(100), None],
+        [Open::Found],
+        [Terminate::Done],
+    );
+
+    assert_eq!(kill_service(&mut target).unwrap(), Killed::Terminated);
+    assert_eq!(
+        target.log(),
+        steps([
+            "service_pid",
+            "open 100",
+            "service_pid",
+            "terminate 100",
+            "await_exit 100",
+            "arm_release",
+            "service_pid",
+            "await_release",
+            "arm_release",
+            "service_pid",
+            "await_release",
+            "arm_release",
+            "service_pid",
+            "close 100",
+        ]),
+        "the read comes after each arm, so a change between a read and an arm is not missed"
+    );
+}
+
+/// A recovery action restarted the service: SCM has moved off the killed pid, so there is nothing
+/// to wait for, and the new process is not the kill's to touch.
+#[skuld::test]
+fn a_kill_is_done_when_scm_reports_a_new_pid() {
+    let mut target = Scripted::new([Some(100), Some(100), Some(200)], [Open::Found], [Terminate::Done]);
+
+    assert_eq!(kill_service(&mut target).unwrap(), Killed::Terminated);
+    assert_eq!(
+        target.log(),
+        steps([
+            "service_pid",
+            "open 100",
+            "service_pid",
+            "terminate 100",
+            "await_exit 100",
+            "arm_release",
+            "service_pid",
+            "close 100",
+        ])
+    );
 }
 
 // A failed read of SCM ------------------------------------------------------------------------------------------------
@@ -344,6 +444,29 @@ fn a_failed_confirming_read_closes_the_handle_and_terminates_nothing() {
     assert_eq!(
         target.log(),
         steps(["service_pid", "open 100", "service_pid", "close 100"])
+    );
+}
+
+/// The read after the termination: the kill cannot say SCM has let go, so it is an error.
+#[skuld::test]
+fn a_failed_read_after_the_termination_is_an_error() {
+    let mut target = Scripted::new([Some(100)], [Open::Found], [Terminate::Done]).failing_read(3);
+
+    let e = kill_service(&mut target).unwrap_err();
+
+    assert_eq!(e.to_string(), "scm read failed");
+    assert_eq!(
+        target.log(),
+        steps([
+            "service_pid",
+            "open 100",
+            "service_pid",
+            "terminate 100",
+            "await_exit 100",
+            "arm_release",
+            "service_pid",
+            "close 100",
+        ])
     );
 }
 

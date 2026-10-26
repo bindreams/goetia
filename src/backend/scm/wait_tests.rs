@@ -134,6 +134,7 @@ impl ScmActor for FakeScm {
             WantState::Stopped => "arm_stopped",
             WantState::Running => "arm_running",
             WantState::RunningPausedOrStopped => "arm_settle",
+            WantState::StoppedOnly => "arm_stopped_only",
         });
         Ok(self.what_arm_reports)
     }

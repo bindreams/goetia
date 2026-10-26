@@ -25,6 +25,9 @@ pub enum WantState {
     /// A state that is settled: `RUNNING`, `PAUSED` or `STOPPED`, and no pending one. Arming
     /// `START_PENDING` while the service is starting would not fire until the start had settled.
     RunningPausedOrStopped,
+    /// `STOPPED` alone, with no `STOP_PENDING`: a service already stopping at the arm does not fire
+    /// it, only the stop completing does.
+    StoppedOnly,
 }
 
 /// The service state a `wait_callback` observed. Distinct from [`WantState`]:

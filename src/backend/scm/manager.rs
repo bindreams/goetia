@@ -260,10 +260,7 @@ impl ServiceManager for ScmManager {
     fn kill(&self, id: &Id) -> Result<()> {
         let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
         require_ours(id)?;
-        let mut target = super::kill::SystemKillTarget {
-            service,
-            id: id.as_str().to_string(),
-        };
+        let mut target = super::kill::SystemKillTarget::new(service, id.as_str().to_string());
         match super::kill::kill_service(&mut target).map_err(|e| Error::Other(format!("kill `{id}`: {e}")))? {
             super::kill::Killed::Terminated => Ok(()),
             super::kill::Killed::NotRunning => Err(Error::NotRunning {
