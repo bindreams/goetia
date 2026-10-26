@@ -37,8 +37,9 @@
 //! `ERROR_SERVICE_MARKED_FOR_DELETE`. A restart policy adds a race: SCM can start the service
 //! between any read of its state and a later call. [`uninstall_locked`] therefore opens its wait
 //! actor first, sets the start type to `SERVICE_DISABLED` (a disabled service's recovery restart
-//! fails with `ERROR_SERVICE_DISABLED` and `StartService` is refused, so nothing new starts it),
-//! stops whatever runs, including a start that had already begun, and only then closes the actor
+//! fails with `ERROR_SERVICE_DISABLED` and `StartService` is refused, so a restart queued or made
+//! after the disable starts nothing; a disable that lands while a restart attempt is in flight is
+//! not promised to win), stops whatever runs, including a start that had already begun, and only then closes the actor
 //! and deletes through a fresh `DELETE` handle. The stop never relies on an earlier observation: it
 //! is sent on a notification and, when SCM rejects it because the state changed, the state is read
 //! again. The service is not marked during the stop, so notifications keep working on it. A failure
@@ -958,12 +959,20 @@ fn run_sc(args: &[&str]) -> Result<()> {
 /// `ERROR_SERVICE_MARKED_FOR_DELETE` (1072). Then the delete is skipped and a stopped service is
 /// success; the record goes with the last handle. A 1072 from the delete itself means the same, and
 /// is success too. Both rest on MSDN's description of 1072, not on a probe. A service that is gone
-/// (`ERROR_SERVICE_DOES_NOT_EXIST`, 1060) at the disable or the delete is success: the record is
-/// removed, which is what `uninstall` is for.
+/// (`ERROR_SERVICE_DOES_NOT_EXIST`, 1060) at any of the opens, the disable or the delete is success:
+/// the record is removed, which is what `uninstall` is for. A second `uninstall` racing the first
+/// can meet 1060 at the first open.
 fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
     // Opened first and kept through the stop: no state change slips between the disable and the wait.
-    let mut actor = super::wait::SystemScmActor::open(id.as_str())
-        .map_err(|e| Error::Other(format!("open `{id}` before uninstall: {e}; it was NOT deleted")))?;
+    let mut actor = match super::wait::SystemScmActor::open(id.as_str()) {
+        Ok(actor) => actor,
+        Err(e) if is_not_found_io(&e) => return Ok(()),
+        Err(e) => {
+            return Err(Error::Other(format!(
+                "open `{id}` before uninstall: {e}; it was NOT deleted"
+            )));
+        }
+    };
 
     let (marked, previous) = match disable_before_delete(scm, id)? {
         Disabled::Gone => return Ok(()),
@@ -1031,9 +1040,11 @@ fn disable_before_delete(scm: &WinServiceManager, id: &Id) -> Result<Disabled> {
             "{what}; `{id}` was NOT deleted and its start type is unchanged"
         ))
     };
-    let service = scm
-        .open_service(id.as_str(), ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG)
-        .map_err(|e| not_changed(service_detail(&format!("open `{id}` to disable it"), &e)))?;
+    let service = match scm.open_service(id.as_str(), ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG) {
+        Ok(service) => service,
+        Err(e) if is_not_found(&e) => return Ok(Disabled::Gone),
+        Err(e) => return Err(not_changed(service_detail(&format!("open `{id}` to disable it"), &e))),
+    };
     let previous = match service.query_config() {
         Ok(cfg) => Some(cfg.start_type),
         Err(e) if is_marked_for_delete(&e) => return Ok(Disabled::AlreadyMarked),
@@ -1081,24 +1092,23 @@ fn uninstall_failed_message(id: &Id, cause: &str, state: &UninstallFailure) -> S
 }
 
 /// The sentence naming the start type `uninstall` found and the command that sets it again, with its
-/// leading space; empty when the type could not be read.
+/// leading space; empty when the type could not be read. A `Disabled` found is not the original: an
+/// earlier `uninstall` probably set it, and nothing records what it replaced.
 fn previous_start_type(id: &Id, previous: Option<ServiceStartType>) -> String {
-    let Some(previous) = previous else {
-        return String::new();
+    let (name, command) = match previous {
+        None => return String::new(),
+        Some(ServiceStartType::Disabled) => {
+            return format!(
+                " Its original start type is unknown, because an earlier `uninstall` probably disabled it; \
+                 `goetia daemon enable {id}` or `goetia daemon disable {id}` sets one."
+            );
+        }
+        Some(ServiceStartType::AutoStart) => ("automatic", format!("`goetia daemon enable {id}`")),
+        Some(ServiceStartType::OnDemand) => ("manual", format!("`goetia daemon disable {id}`")),
+        Some(ServiceStartType::SystemStart) => ("system", format!("`sc.exe config {id} start= system`")),
+        Some(ServiceStartType::BootStart) => ("boot", format!("`sc.exe config {id} start= boot`")),
     };
-    let (name, command) = start_type_remedy(id, previous);
     format!(" Its start type was {name}; {command} sets it again.")
-}
-
-/// A start type's name and the command that sets it again.
-fn start_type_remedy(id: &Id, start_type: ServiceStartType) -> (&'static str, String) {
-    match start_type {
-        ServiceStartType::AutoStart => ("automatic", format!("`goetia daemon enable {id}`")),
-        ServiceStartType::OnDemand => ("manual", format!("`goetia daemon disable {id}`")),
-        ServiceStartType::Disabled => ("disabled", format!("`sc.exe config {id} start= disabled`")),
-        ServiceStartType::SystemStart => ("system", format!("`sc.exe config {id} start= system`")),
-        ServiceStartType::BootStart => ("boot", format!("`sc.exe config {id} start= boot`")),
-    }
 }
 
 // shared helpers ======================================================================================================

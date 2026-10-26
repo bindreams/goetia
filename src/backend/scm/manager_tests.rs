@@ -651,6 +651,37 @@ fn a_stop_failure_with_an_unknown_previous_start_type_omits_it() {
     }
 }
 
+/// A retry reads the `disabled` an earlier `uninstall` left, which is not the original type.
+#[skuld::test]
+fn a_previous_start_type_of_disabled_is_not_presented_as_the_original() {
+    for text in [
+        uninstall_failure(&UninstallFailure::Stop {
+            previous: Some(ServiceStartType::Disabled),
+        }),
+        uninstall_failure(&UninstallFailure::Delete {
+            previous: Some(ServiceStartType::Disabled),
+        }),
+    ] {
+        assert!(text.contains("NOT deleted"), "{text}");
+        assert!(text.contains("original start type is unknown"), "{text}");
+        assert!(text.contains("earlier `uninstall`"), "{text}");
+        assert!(text.contains("`goetia daemon enable frpc`"), "{text}");
+        assert!(text.contains("`goetia daemon disable frpc`"), "{text}");
+        for absent in ["start type was", "sets it again", "sc.exe"] {
+            assert!(
+                !text.contains(absent),
+                "`{absent}` misleads for a disabled service: {text}"
+            );
+        }
+    }
+}
+
+#[skuld::test]
+fn is_not_found_io_matches_the_actor_open_error_for_a_gone_service() {
+    assert!(is_not_found_io(&std::io::Error::from_raw_os_error(1060)));
+    assert!(!is_not_found_io(&std::io::Error::from_raw_os_error(5)));
+}
+
 #[skuld::test]
 fn a_delete_failure_says_stopped_disabled_not_deleted_and_names_the_previous_start_type() {
     let text = uninstall_failure(&UninstallFailure::Delete {

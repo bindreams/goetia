@@ -253,9 +253,12 @@ pub fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Kind) 
                 let exit = a.stopped_exit();
                 // An `AlreadyRunning` over `START_PENDING` joined a start that was not ours: SCM's
                 // own recovery start. When that fails SCM reports `STOPPED (0, 0)` with a wait
-                // hint, which the shim never sets; no shim ran.
-                let failed_scm_start =
-                    joined_a_start && (exit.win32, exit.specific) == (0, 0) && a.stopped_wait_hint() != 0;
+                // hint, which the shim never sets; no shim ran. Only `type: simple` has a shim: a
+                // managed host may leave a hint itself, and it did run.
+                let failed_scm_start = kind == Kind::Simple
+                    && joined_a_start
+                    && (exit.win32, exit.specific) == (0, 0)
+                    && a.stopped_wait_hint() != 0;
                 if failed_scm_start {
                     return Err(io::Error::other(
                         "service stopped before reaching Running (failed start): SCM's own start of it failed, so no shim or daemon ran",

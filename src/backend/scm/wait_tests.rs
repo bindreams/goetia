@@ -566,6 +566,21 @@ fn a_failed_scm_recovery_start_that_a_start_joined_is_a_failed_start() {
     assert!(err.to_string().contains("failed start"), "{err}");
 }
 
+/// A managed service's own host ran, so its `STOPPED (0, 0)` with a leftover wait hint is a failed
+/// start, but not one where "no shim or daemon ran".
+#[skuld::test]
+fn a_managed_stopped_with_a_wait_hint_that_a_start_joined_does_not_claim_nothing_ran() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)])
+        .already_running(QueriedState::StartPending)
+        .stopped_by_scm_with_wait_hint(2000);
+
+    let err = start_via_notify(&mut fake, unbounded(), Kind::Managed).unwrap_err();
+
+    let message = err.to_string();
+    assert!(message.contains("failed start"), "{message}");
+    assert!(!message.contains("no shim or daemon ran"), "{message}");
+}
+
 /// A start SCM accepted is ours, so `(0, 0)` with a wait hint is not SCM's failed attempt.
 #[skuld::test]
 fn a_stopped_with_a_wait_hint_after_an_accepted_start_is_a_started_service() {
