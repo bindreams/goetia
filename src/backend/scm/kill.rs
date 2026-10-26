@@ -36,6 +36,17 @@ pub enum Termination {
     AlreadyExited,
 }
 
+/// What [`KillTarget::arm_release`] came to.
+#[must_use = "a service SCM cannot watch has no registration to wait on"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseWatch {
+    /// A registration is outstanding.
+    Armed,
+    /// SCM refuses to watch the service, which is marked for deletion, and the status read in its place
+    /// is `STOPPED`: SCM has recorded the exit. Nothing is registered.
+    Stopped,
+}
+
 /// The three things [`kill_service`] needs of the world, so its ordering is testable without one.
 pub trait KillTarget {
     /// An opened process. Holding it keeps its pid from being reused; dropping it lets go.
@@ -63,7 +74,11 @@ pub trait KillTarget {
     /// SCM allows one registration per service handle, and the buffer it reports into cannot be
     /// reused until the registration has been woken or cancelled, so this is called only with none
     /// outstanding: after an [`Self::await_release`] or a [`Self::cancel_release`].
-    fn arm_release(&mut self) -> io::Result<()>;
+    ///
+    /// SCM refuses to watch a marked service it recorded `STOPPED`; that is [`ReleaseWatch::Stopped`],
+    /// with nothing registered. A marked service in any other state cannot be watched either, which
+    /// is an error: nothing will wake the kill.
+    fn arm_release(&mut self) -> io::Result<ReleaseWatch>;
 
     /// Block until the registration [`Self::arm_release`] made wakes. Unbounded.
     fn await_release(&mut self) -> io::Result<()>;
@@ -139,14 +154,26 @@ fn terminated_but(pid: u32, e: io::Error) -> io::Error {
 /// `STOPPED`, which SCM records, with pid 0, before it lets go of the process. SCM wakes a
 /// registration at once only when the service is already in the wanted state, so the read follows
 /// every arm: a release that landed between an earlier read and the arm would never wake it.
+///
+/// After a wake the pid is read before anything arms again, and only a pid still shown arms: SCM
+/// refuses to watch a marked service it recorded `STOPPED` (round 8), and the wake was that record. An
+/// arm it does refuse ([`ReleaseWatch::Stopped`]) is the release itself.
 fn await_scm_released<T: KillTarget>(target: &mut T, pid: u32) -> io::Result<()> {
+    if target.arm_release()? == ReleaseWatch::Stopped {
+        return Ok(());
+    }
     loop {
-        target.arm_release()?;
         if target.service_pid()? != Some(pid) {
             target.cancel_release();
             return Ok(());
         }
         target.await_release()?;
+        if target.service_pid()? != Some(pid) {
+            return Ok(());
+        }
+        if target.arm_release()? == ReleaseWatch::Stopped {
+            return Ok(());
+        }
     }
 }
 
@@ -169,11 +196,11 @@ mod system {
         INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
     };
 
-    use crate::backend::scm::wait::{Armed, ScmActor, SystemScmActor, WantState};
+    use crate::backend::scm::wait::{Armed, QueriedState, ScmActor, SystemScmActor, WantState, marked_for_deletion};
     use crate::manager::budget::Budget;
 
     use super::privilege::DebugPrivilege;
-    use super::{KillTarget, Termination};
+    use super::{KillTarget, ReleaseWatch, Termination};
 
     /// The real SCM service; the process is a Win32 handle.
     pub struct SystemKillTarget {
@@ -256,7 +283,7 @@ mod system {
             wait_exit(&process.handle, || self.notice(process))
         }
 
-        fn arm_release(&mut self) -> io::Result<()> {
+        fn arm_release(&mut self) -> io::Result<ReleaseWatch> {
             // Unbounded, so the arm cannot expire.
             match self
                 .notifier()?
@@ -264,7 +291,11 @@ mod system {
             {
                 // The status is not used: `await_scm_released` reads the service's pid after every
                 // arm, which is what decides.
-                Armed::Registered(_) => Ok(()),
+                Armed::Registered(_) => Ok(ReleaseWatch::Armed),
+                // SCM no longer reports a marked service's changes, so no wake is coming. `STOPPED` is
+                // its record of the exit, which is what the registration was for.
+                Armed::Unwatchable(status) if status.state == QueriedState::Stopped => Ok(ReleaseWatch::Stopped),
+                Armed::Unwatchable(status) => Err(marked_for_deletion(status.state)),
                 Armed::Expired => unreachable!("an unbounded deadline does not expire"),
             }
         }

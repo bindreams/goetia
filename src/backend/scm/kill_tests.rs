@@ -38,6 +38,10 @@ struct Scripted {
     failing_arm: bool,
     /// How many times the kill has blocked for SCM to let go.
     releases: usize,
+    /// How many `arm_release` calls have been made.
+    arms: usize,
+    /// From which `arm_release` call, counted from 0, SCM refuses to watch the service.
+    unwatchable_from: Option<usize>,
     /// Whether an `arm_release` is outstanding: made, and neither woken by `await_release` nor
     /// cancelled. SCM allows one per service handle and buffer.
     armed: bool,
@@ -59,6 +63,8 @@ impl Scripted {
             failing_exit: false,
             failing_arm: false,
             releases: 0,
+            arms: 0,
+            unwatchable_from: None,
             armed: false,
             log: Log::default(),
         }
@@ -79,6 +85,13 @@ impl Scripted {
     /// `arm_release` fails.
     fn failing_arm(mut self) -> Self {
         self.failing_arm = true;
+        self
+    }
+
+    /// SCM refuses every `arm_release` from the `n`th (from 0) with 1072, the service being marked for
+    /// deletion and `STOPPED`.
+    fn unwatchable_from(mut self, n: usize) -> Self {
+        self.unwatchable_from = Some(n);
         self
     }
 
@@ -144,7 +157,7 @@ impl KillTarget for Scripted {
         Ok(())
     }
 
-    fn arm_release(&mut self) -> io::Result<()> {
+    fn arm_release(&mut self) -> io::Result<ReleaseWatch> {
         self.log.borrow_mut().push("arm_release".to_string());
         if self.failing_arm {
             return Err(io::Error::other("notifier could not be opened"));
@@ -153,8 +166,14 @@ impl KillTarget for Scripted {
             !self.armed,
             "arm_release over an outstanding registration: SCM allows one per service and buffer"
         );
+        // A marked service that SCM recorded `STOPPED` refuses the registration: nothing is outstanding.
+        if self.unwatchable_from.is_some_and(|n| self.arms >= n) {
+            self.arms += 1;
+            return Ok(ReleaseWatch::Stopped);
+        }
+        self.arms += 1;
         self.armed = true;
-        Ok(())
+        Ok(ReleaseWatch::Armed)
     }
 
     fn cancel_release(&mut self) {
@@ -281,10 +300,72 @@ fn a_process_gone_before_it_was_opened_waits_for_scm_to_let_go_of_the_pid() {
             "arm_release",
             "service_pid",
             "await_release",
+            "service_pid",
+            "service_pid",
+        ])
+    );
+}
+
+/// A wake that shows SCM let go of the pid ends the wait: nothing arms again first. SCM answers an arm
+/// on a delete-marked, `STOPPED` service with 1072 (round 8), so an arm after that wake would fail a
+/// kill that worked.
+#[skuld::test]
+fn a_wake_that_shows_scm_let_go_of_the_pid_arms_nothing_again() {
+    let mut target = Scripted::new([Some(100), Some(100), None], [Open::Gone], []).unwatchable_from(1);
+
+    assert_eq!(kill_service(&mut target).unwrap(), Killed::NotRunning);
+    assert_eq!(
+        target.log(),
+        steps([
+            "service_pid",
+            "open 100",
             "arm_release",
             "service_pid",
-            "cancel_release",
+            "await_release",
             "service_pid",
+            "service_pid",
+        ])
+    );
+}
+
+/// SCM refuses to watch a marked service it recorded `STOPPED`, and that status is the release: the
+/// pid is not read again, and nothing waits on a registration that does not exist.
+#[skuld::test]
+fn a_service_scm_will_not_watch_and_shows_stopped_is_released() {
+    let mut target = Scripted::new([Some(100), None], [Open::Gone], []).unwatchable_from(0);
+
+    assert_eq!(kill_service(&mut target).unwrap(), Killed::NotRunning);
+    assert_eq!(
+        target.log(),
+        steps(["service_pid", "open 100", "arm_release", "service_pid"])
+    );
+}
+
+/// The same for the arm after a wake that still shows the pid.
+#[skuld::test]
+fn a_re_arm_scm_refuses_on_a_stopped_service_is_the_release() {
+    let mut target = Scripted::new(
+        [Some(100), Some(100), Some(100), Some(100), None],
+        [Open::Found],
+        [Terminate::Done],
+    )
+    .unwatchable_from(1);
+
+    assert_eq!(kill_service(&mut target).unwrap(), Killed::Terminated);
+    assert_eq!(
+        target.log(),
+        steps([
+            "service_pid",
+            "open 100",
+            "service_pid",
+            "terminate 100",
+            "await_exit 100",
+            "arm_release",
+            "service_pid",
+            "await_release",
+            "service_pid",
+            "arm_release",
+            "close 100",
         ])
     );
 }
@@ -379,9 +460,7 @@ fn a_process_that_exited_before_the_termination_waits_for_scm_to_let_go_of_the_p
             "arm_release",
             "service_pid",
             "await_release",
-            "arm_release",
             "service_pid",
-            "cancel_release",
             "close 100",
             "service_pid",
         ])
@@ -476,7 +555,7 @@ fn an_open_that_failed_on_the_services_own_pid_is_an_error() {
 #[skuld::test]
 fn a_kill_waits_while_scm_still_reports_the_killed_pid() {
     let mut target = Scripted::new(
-        [Some(100), Some(100), Some(100), Some(100), None],
+        [Some(100), Some(100), Some(100), Some(100), Some(100), None],
         [Open::Found],
         [Terminate::Done],
     );
@@ -493,15 +572,15 @@ fn a_kill_waits_while_scm_still_reports_the_killed_pid() {
             "arm_release",
             "service_pid",
             "await_release",
+            "service_pid",
             "arm_release",
             "service_pid",
             "await_release",
-            "arm_release",
             "service_pid",
-            "cancel_release",
             "close 100",
         ]),
-        "the read comes after each arm, so a change between a read and an arm is not missed"
+        "the read comes after each arm, so a change between a read and an arm is not missed, and after \
+         each wake, before any arm"
     );
 }
 

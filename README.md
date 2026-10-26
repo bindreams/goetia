@@ -747,11 +747,10 @@ nothing. A disable that lands after SCM has begun a restart attempt does not
 stop it: the attempt runs to a running service, even when the disable follows
 the failure by a fraction of a millisecond. `uninstall` then stops whatever is
 running, such an attempt included, waits for it to stop, and deletes the
-service. A
-stop that SCM rejects because the state changed is sent again on the next
-state. If the stop or the delete fails, the service is left disabled and not
-deleted; the start type is not put back. An interrupted `uninstall` (Ctrl-C, a
-killed `goetia`) leaves the service as it was before the disable, disabled and
+service. A stop that SCM rejects because the state changed is sent again on the
+next state. If the stop or the delete fails, the service is left disabled and
+not deleted; the start type is not put back. An interrupted `uninstall` (Ctrl-C,
+a killed `goetia`) leaves the service as it was before the disable, disabled and
 not deleted, or deleted, depending on where it stopped. In every case running
 `goetia daemon uninstall` again is the retry. The first failure's error names
 the start type the service had, when it could be read, and
@@ -760,9 +759,13 @@ service already reads as disabled, so a second failure says the original start
 type is unknown. `goetia daemon install` over a service that a failed
 `uninstall` left disabled keeps it disabled, so `start` fails with 1058 until
 `enable` or `disable` sets a start type. A service that does not accept a stop
-needs `goetia daemon kill <id>` first; `sc.exe stop` fails the same way. A service
-someone else already marked for deletion is not disabled; if it will not stop,
-the error says so, and it is removed once it stops and its last handle closes.
+needs `goetia daemon kill <id>` first; `sc.exe stop` fails the same way. A
+service someone else already marked for deletion is not disabled; if it will not
+stop, the error says so, and it is removed once it stops and its last handle
+closes. SCM no longer reports changes to a service marked for deletion, so
+`start`, `stop`, `uninstall` and `kill` decide on the state they read: the state
+they wait for ends the wait, and any other is an error that says the service is
+marked for deletion.
 
 After upgrading goetia, run `goetia daemon install` again for every daemon
 installed by an older version. `type: simple` services registered before this
@@ -782,12 +785,13 @@ failing:
 | the shim could not run the command, or its wait on it failed | a Win32 code: the OS error, `13` for an unreadable spec, `31` if there is none |
 | the shim could not show the command's tree terminated        | `0`, `1003`                                                                    |
 
-A shim that cannot report at all exits `160` or `1063`; SCM's record is then its own.
-A shim started without a service id, or that cannot connect to SCM, dies before
-it has connected, and SCM does not restart it. A shim that connected and then
-cannot register its control handler exits `1063` after the connect. That exact
-case is not measured; a service host that connected and exited without any
-report was, and SCM recorded `1067` and restarted it under the restart policy.
+A shim that cannot report at all exits `160` or `1063`; SCM's record is then
+its own. A shim started without a service id, or that cannot connect to SCM,
+dies before it has connected, and SCM does not restart it. A shim that connected
+and then cannot register its control handler exits `1063` after the connect.
+That exact case is not measured; a service host that connected and exited
+without any report was, and SCM recorded `1067` and restarted it under the
+restart policy.
 
 Under `on-failure` both failures are restarted, so a spec the shim cannot read
 or a command that is missing retries at `restart-delay` indefinitely, as it
@@ -917,18 +921,19 @@ taking down, may be going down, or may never have moved.
 restart it.** The start arrives while the service is still coming down and is
 refused — for a `type: simple` daemon almost always, since its service reads
 `RUNNING` until the shim has taken the stop, then `STOP_PENDING` until its
-child is gone — which leaves the daemon stopped, at exit `4`. To restart a daemon on Windows, let `restart` wait for the stop: leave
-`--timeout` at its default, or give it a duration other than `0`.
+child is gone — which leaves the daemon stopped, at exit `4`. To restart a
+daemon on Windows, let `restart` wait for the stop: leave `--timeout` at its
+default, or give it a duration other than `0`.
 
 ## Killing a daemon
 
 `goetia daemon kill <ID...>` ends each daemon's running process as a failure.
 On systemd and launchd it returns once the signal is sent; on Windows it returns
 once SCM has recorded the exit: the service is then stopped, or already
-restarted by its restart policy. It takes no `--timeout` and does not change boot-enablement. What follows
-is the daemon's `restart` policy: an `always` or `on-failure` daemon comes
-back, a `never` one stays down. Like `stop`, it needs elevation, and `--json`
-is refused.
+restarted by its restart policy. It takes no `--timeout` and does not change
+boot-enablement. What follows is the daemon's `restart` policy: an `always` or
+`on-failure` daemon comes back, a `never` one stays down. Like `stop`, it needs
+elevation, and `--json` is refused.
 
 It addresses the service, never a bare pid:
 
@@ -939,7 +944,9 @@ It addresses the service, never a bare pid:
 | Windows  | SCM has no kill-by-service call, so goetia terminates the service's process (exit code `1`), after confirming through SCM that it is still the service's. SCM sees an unexpected exit and applies the recovery actions, as for a crash. |
 
 On Windows with `type: simple` the service's process is `goetia-shim`; its Job
-Object ends the daemon and its descendants with it.
+Object ends the daemon and its descendants with it. Windows does not report when
+that termination has finished, so the daemon's processes can briefly outlive the
+return of `kill`, and a restart by SCM can overlap them.
 
 On Windows the process just terminated, or one already terminating (a second
 `kill`, or a daemon dying on its own), is waited for until it exits, with no

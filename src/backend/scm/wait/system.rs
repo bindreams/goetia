@@ -21,7 +21,7 @@ use windows_sys::Win32::System::Threading::{INFINITE, SleepEx};
 
 use crate::backend::scm::exit_status::RecordedExit;
 
-use super::{Armed, Deadline, Observed, QueriedState, QueriedStatus, StartReply, Waited, WantState};
+use super::{Armed, Deadline, Observed, QueriedState, QueriedStatus, Registration, StartReply, WantState};
 
 /// `windows-service`'s `Error` does not implement `Into<io::Error>` for
 /// every variant (it also carries parse errors this module never
@@ -96,12 +96,9 @@ unsafe extern "system" fn notify_callback(pparameter: *const c_void) {
     }
 }
 
-/// The `NotifyServiceStatusChangeW` mask for `want`, given whether `start()` has already been
-/// issued (`started`): the bits of [`WantState::states`].
-fn want_to_mask(want: WantState, started: bool) -> SERVICE_NOTIFY {
-    want.states(started)
-        .iter()
-        .fold(0, |mask, state| mask | notify_bit(*state))
+/// The `NotifyServiceStatusChangeW` mask for `want`: the bits of [`WantState::states`].
+fn want_to_mask(want: WantState) -> SERVICE_NOTIFY {
+    want.states().iter().fold(0, |mask, state| mask | notify_bit(*state))
 }
 
 /// The mask bit of one state. One arm per variant and no `_` catch-all, like [`queried_state`].
@@ -173,8 +170,6 @@ pub struct SystemScmActor {
     notify: Box<SERVICE_NOTIFY_2W>,
     /// The state most recently awaited, for `want_to_mask`.
     awaiting: WantState,
-    /// Whether `start()` has been issued. Gates the two-phase arm mask.
-    started: bool,
     /// Whether the most recent `arm()` succeeded and has not yet been
     /// drained by `wait_callback`. See [`Self::close_and_drain`].
     registration_outstanding: bool,
@@ -201,7 +196,6 @@ impl SystemScmActor {
             }),
             notify: Box::default(),
             awaiting: WantState::Stopped,
-            started: false,
             registration_outstanding: false,
         })
     }
@@ -288,7 +282,7 @@ impl Drop for SystemScmActor {
 /// caller's deadline.
 impl super::NotifyRegistrar for SystemScmActor {
     fn register(&mut self) -> io::Result<u32> {
-        let mask = want_to_mask(self.awaiting, self.started);
+        let mask = want_to_mask(self.awaiting);
         // SAFETY: `self.service()?.raw_handle()` was opened with
         // `SERVICE_QUERY_STATUS` access (required by this API);
         // `self.notify` is heap-pinned and outlives every wait the arm
@@ -321,8 +315,12 @@ impl super::ScmActor for SystemScmActor {
             pContext: (&mut *self.status as *mut LastStatus) as *mut c_void,
             ..Default::default()
         };
-        if super::register_until_deadline(self, deadline)? == Waited::Expired {
-            return Ok(Armed::Expired);
+        match super::register_until_deadline(self, deadline)? {
+            Registration::Registered => {}
+            Registration::Expired => return Ok(Armed::Expired),
+            // SCM no longer reports a marked service's changes. The status read in place of the
+            // registration is what the caller decides on; nothing is outstanding.
+            Registration::MarkedForDelete => return Ok(Armed::Unwatchable(super::ScmActor::query_status(self)?)),
         }
         // A notification may now be queued (immediately, if the
         // service already matched the mask) — see `close_then_drain`.
@@ -345,16 +343,14 @@ impl super::ScmActor for SystemScmActor {
             // query and this control, so the stop asked for has
             // happened — benign on both callers. `request_stop` armed
             // nothing and has nothing left to wait for; under
-            // `stop_via_notify` the STOPPED arm ran before this
-            // control, so the SCM has already queued that notification
-            // and the wait still completes.
+            // `stop_via_notify` the arm that follows reads `STOPPED`
+            // and the wait completes on it.
             Some(code) if code as u32 == ERROR_SERVICE_NOT_ACTIVE => Ok(()),
             _ => Err(err),
         }
     }
 
     fn start(&mut self) -> io::Result<StartReply> {
-        self.started = true;
         match self.service()?.start::<&std::ffi::OsStr>(&[]) {
             Ok(()) => Ok(StartReply::Accepted),
             // 1056 does not say which non-STOPPED state the service is in, so
