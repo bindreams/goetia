@@ -272,15 +272,16 @@ pub fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Kind) 
                 let exit = a.stopped_exit();
                 // An `AlreadyRunning` over `START_PENDING` joined a start that was not ours: SCM's
                 // own recovery start. When that fails SCM reports `STOPPED (0, 0)` with a wait
-                // hint, which the shim never sets; no shim ran. Only `type: simple` has a shim: a
-                // managed host may leave a hint itself, and it did run.
+                // hint (P10), which the shim never sets; no shim connected to SCM. Only
+                // `type: simple` has a shim: a managed host may leave a hint itself, and it did run.
+                // This test runs before `daemon_ran`, which `(0, 0)` would satisfy.
                 let failed_scm_start = kind == Kind::Simple
                     && joined_a_start
                     && (exit.win32, exit.specific) == (0, 0)
                     && a.stopped_wait_hint() != 0;
                 if failed_scm_start {
                     return Err(io::Error::other(
-                        "service stopped before reaching Running (failed start): SCM's own start of it failed, so no shim or daemon ran",
+                        "service stopped before reaching Running (failed start): the shim never connected to SCM, so no daemon ran",
                     ));
                 }
                 // The shim's `(0, 1003)` says it could not show the daemon's tree gone: not a launch
@@ -290,6 +291,10 @@ pub fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Kind) 
                         "service stopped with goetia-shim's incomplete-stop record (Win32 0, service-specific 1003; failed start): the shim could not show that the daemon's process tree was terminated, so the daemon may still be running; see the shim's log",
                     ));
                 }
+                // `daemon_ran` is safe to ask here: a host that exits before it connects also
+                // records `(0, 0)` with a wait hint (P25 c/d), and that is either our own start
+                // failing with `StartServiceW` 1053, which never reaches this wait, or a joined
+                // start, caught by `failed_scm_start` above.
                 if kind == Kind::Simple && exit.daemon_ran() {
                     return Ok(Waited::Confirmed);
                 }

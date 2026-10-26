@@ -925,9 +925,10 @@ fn a_stop_after_a_daemon_failure_was_decided_leaves_the_failure() {
 }
 
 /// SCM may deliver a control after `STOP`: the handler and the context `leak_handler_context` makes
-/// still answer it. That `register_control_handler` passes that context, and not `windows-service`'s
-/// `register`, which frees its closure after the first `Stop`, is not covered here: it needs a real
-/// SCM.
+/// still answer it. That `register_control_handler` passes that context, and not `windows-service`
+/// 0.8.1's `register`, is not covered here, or anywhere: `register` frees its closure after any
+/// Stop, Shutdown or Preshutdown whatever the handler returned (P16 observed it) while the
+/// registration stays live, and only a real SCM shows that. `clippy.toml` forbids the call.
 #[skuld::test]
 fn a_control_after_a_stop_still_reaches_the_bus() {
     let stop_bus = Arc::new(StopBus::new());

@@ -144,8 +144,10 @@ fn stopped_status(reported: Reported) -> SERVICE_STATUS {
 #[derive(Clone, Copy)]
 struct StatusHandle(SERVICE_STATUS_HANDLE);
 
-/// Registered directly rather than through `windows-service`'s `register`, which frees its closure
-/// after the first `Stop`: SCM can deliver a control after that, which would reach freed memory.
+/// Registered directly rather than through `windows-service` 0.8.1's `register`, which frees its
+/// closure after any Stop, Shutdown or Preshutdown whatever the handler returned (P16 observed it)
+/// while the registration stays live: SCM can deliver a control after that, which would reach freed
+/// memory. No test catches a revert; `clippy.toml` forbids the call.
 fn register_control_handler(id: &str, stop_bus: &Arc<StopBus>) -> std::io::Result<StatusHandle> {
     let name: Vec<u16> = OsStr::new(id).encode_wide().chain(std::iter::once(0)).collect();
     // SAFETY: `name` is NUL-terminated and outlives the call; the context is never freed.

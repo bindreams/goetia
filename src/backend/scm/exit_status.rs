@@ -90,7 +90,9 @@ impl Reported {
 }
 
 /// The exit codes SCM holds for a service that reached `STOPPED`: what the shim reported, or
-/// `ERROR_PROCESS_ABORTED` (1067) when its process ended without reporting.
+/// `ERROR_PROCESS_ABORTED` (1067) when its process connected to SCM and ended without reporting
+/// (P25 a/b; SCM also restarts it). A process that ends before connecting leaves another record,
+/// see [`RecordedExit::daemon_ran`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordedExit {
     pub win32: u32,
@@ -102,6 +104,10 @@ impl RecordedExit {
     /// Whether the shim launched the daemon: [`Reported::Clean`] and [`Reported::DaemonExit`], where
     /// it then ended, and [`Reported::IncompleteStop`], where it may still be running. Any other
     /// Win32 code is a shim failure before or around the launch.
+    ///
+    /// This reads the Win32 code alone, so it also accepts the record of a host that exits before
+    /// connecting to SCM: `(0, 0)` with wait hint 2000 (P25 c/d), the same as a failed SCM start
+    /// (P10). Callers must rule that out first; `start_via_notify` does, see there.
     pub fn daemon_ran(self) -> bool {
         self.win32 == 0 || self.win32 == ERROR_SERVICE_SPECIFIC_ERROR
     }

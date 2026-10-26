@@ -88,13 +88,10 @@ fn report_uid(port: u16) {
 mod windows {
     use std::ffi::OsString;
     use std::sync::mpsc;
-    use std::time::Duration;
 
-    use windows_service::service::{
-        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
-    };
-    use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
     use windows_service::{define_windows_service, service_dispatcher};
+
+    use super::super::service_ctrl;
 
     define_windows_service!(ffi_service_main, service_main);
 
@@ -111,39 +108,14 @@ mod windows {
         let stop_port: u16 = args[4].parse().expect("stop port");
 
         let (stop_tx, stop_rx) = mpsc::channel();
-        let handler = move |control| match control {
-            ServiceControl::Stop => {
-                let _ = stop_tx.send(());
-                ServiceControlHandlerResult::NoError
-            }
-            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-            _ => ServiceControlHandlerResult::NotImplemented,
-        };
-        let status_handle = service_control_handler::register(&name, handler).expect("register control handler");
-
-        let running = ServiceStatus {
-            service_type: ServiceType::OWN_PROCESS,
-            current_state: ServiceState::Running,
-            controls_accepted: ServiceControlAccept::STOP,
-            exit_code: ServiceExitCode::Win32(0),
-            checkpoint: 0,
-            wait_hint: Duration::default(),
-            process_id: None,
-        };
-        status_handle
-            .set_service_status(running.clone())
-            .expect("report RUNNING");
+        let status_handle = service_ctrl::register(&name, Some(stop_tx));
+        service_ctrl::report_running(status_handle, true);
         super::connect(start_port);
 
         // A real rendezvous with the control handler thread: the recv returns
         // when SCM delivers the stop, and not before.
         stop_rx.recv().expect("stop control");
-        let stopped = ServiceStatus {
-            current_state: ServiceState::Stopped,
-            controls_accepted: ServiceControlAccept::empty(),
-            ..running
-        };
-        status_handle.set_service_status(stopped).expect("report STOPPED");
+        service_ctrl::report_stopped(status_handle);
         super::connect(stop_port);
     }
 }

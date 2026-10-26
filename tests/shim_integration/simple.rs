@@ -2,9 +2,19 @@
 //! because they need a built shim. See `tests/scm_integration/managed.rs`
 //! for the `type: managed` analogues these mirror.
 
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
 use goetia::decide::Outcome;
 use goetia::manager::conformance;
 use goetia::manager::{Budget, Installed, ServiceManager as _, State};
+use windows_service::service::{Service, ServiceAccess};
+use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+use windows_sys::Win32::System::Services::{
+    NotifyServiceStatusChangeW, SERVICE_NOTIFY_2W, SERVICE_NOTIFY_STATUS_CHANGE, SERVICE_NOTIFY_STOP_PENDING,
+    SERVICE_NOTIFY_STOPPED, SERVICE_STOP_PENDING, SERVICE_STOPPED,
+};
+use windows_sys::Win32::System::Threading::{INFINITE, SleepEx};
 
 use crate::common::{conformance_mk, fixture_command, mk_spec};
 use crate::deny::Denied;
@@ -180,4 +190,94 @@ fn list_ignores_foreign_services() {
         }),
         "a foreign service must never appear in list"
     );
+}
+
+// Step 3: STOP_PENDING through teardown ===============================================================================
+
+/// What one `NotifyServiceStatusChangeW` delivery said, written by the APC and read by the waiter
+/// on the same thread.
+struct Delivery {
+    fired: AtomicBool,
+    state: AtomicU32,
+    controls_accepted: AtomicU32,
+}
+
+unsafe extern "system" fn record_delivery(parameter: *const c_void) {
+    let notify = parameter.cast::<SERVICE_NOTIFY_2W>();
+    // SAFETY: SCM hands back the buffer registered in `arm`, whose `pContext` is the leaked
+    // `Delivery`.
+    let (delivery, status) = unsafe { (&*(*notify).pContext.cast::<Delivery>(), &(*notify).ServiceStatus) };
+    delivery.state.store(status.dwCurrentState, Ordering::Release);
+    delivery
+        .controls_accepted
+        .store(status.dwControlsAccepted, Ordering::Release);
+    delivery.fired.store(true, Ordering::Release);
+}
+
+/// Arm `mask` on `service` and block, alertably, until SCM delivers it. Returns
+/// `(state, controls_accepted)` of the delivery. Armed on a state that does not match `mask` yet,
+/// so the delivery is the transition.
+fn arm_and_wait(service: &Service, mask: u32) -> impl FnOnce() -> (u32, u32) {
+    // Leaked: SCM may still hold the registration if the test panics before the delivery.
+    let delivery: &'static Delivery = Box::leak(Box::new(Delivery {
+        fired: AtomicBool::new(false),
+        state: AtomicU32::new(0),
+        controls_accepted: AtomicU32::new(0),
+    }));
+    let notify: &'static mut SERVICE_NOTIFY_2W = Box::leak(Box::new(SERVICE_NOTIFY_2W {
+        dwVersion: SERVICE_NOTIFY_STATUS_CHANGE,
+        pfnNotifyCallback: Some(record_delivery),
+        pContext: (delivery as *const Delivery as *mut Delivery).cast(),
+        ..Default::default()
+    }));
+    // SAFETY: the handle has `SERVICE_QUERY_STATUS`; `notify` is leaked and so outlives the
+    // registration.
+    let error = unsafe { NotifyServiceStatusChangeW(service.raw_handle(), mask, notify) };
+    assert_eq!(
+        error,
+        0,
+        "NotifyServiceStatusChangeW: {}",
+        std::io::Error::from_raw_os_error(error as i32)
+    );
+    move || {
+        while !delivery.fired.load(Ordering::Acquire) {
+            // SAFETY: plain FFI call; an alertable wait is what lets the APC run.
+            unsafe { SleepEx(INFINITE, 1) };
+        }
+        (
+            delivery.state.load(Ordering::Acquire),
+            delivery.controls_accepted.load(Ordering::Acquire),
+        )
+    }
+}
+
+/// The shim reports `STOP_PENDING`, accepting no controls, from the moment it takes a stop until it
+/// reports `STOPPED`; SCM would otherwise show the service as `RUNNING` throughout the teardown.
+/// Fails if the shim stops reporting `STOP_PENDING`, or reports it with controls still accepted.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn the_shim_reports_stop_pending_then_stopped() {
+    let mgr = goetia::backend::scm::manager::ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let started = support::ConnectBack::listen();
+    let spec = mk_spec(&id, fixture_command("report", &[&started.port().to_string()]));
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    started.accept("the fixture (spawned by the shim) to report running");
+
+    let scm = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .expect("connect to the service manager");
+    let service = scm
+        .open_service(&id, ServiceAccess::QUERY_STATUS | ServiceAccess::STOP)
+        .expect("open the service");
+
+    // Armed on RUNNING, before the stop, so the first delivery is the stop's own first state.
+    let first = arm_and_wait(&service, SERVICE_NOTIFY_STOP_PENDING | SERVICE_NOTIFY_STOPPED);
+    service.stop().expect("send stop");
+    let (state, controls_accepted) = first();
+    assert_eq!(state, SERVICE_STOP_PENDING, "the first state after a stop");
+    assert_eq!(controls_accepted, 0, "no control is accepted while stopping");
+
+    let (state, _) = arm_and_wait(&service, SERVICE_NOTIFY_STOPPED)();
+    assert_eq!(state, SERVICE_STOPPED);
 }

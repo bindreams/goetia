@@ -602,7 +602,7 @@ fn a_daemon_exiting_1003_is_still_a_started_service() {
 
 /// A `start` that lands as SCM's queued recovery start fires gets 1056 over `START_PENDING`. If
 /// that attempt fails (missing ImagePath, broken account) SCM reports `STOPPED (0, 0)` with a
-/// wait hint of 2000, and no shim ever ran.
+/// wait hint of 2000, and the shim never connected to SCM.
 #[skuld::test]
 fn a_failed_scm_recovery_start_that_a_start_joined_is_a_failed_start() {
     let mut fake = FakeScm::new([Some(Observed::Stopped)])
@@ -611,11 +611,16 @@ fn a_failed_scm_recovery_start_that_a_start_joined_is_a_failed_start() {
 
     let err = start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap_err();
 
-    assert!(err.to_string().contains("failed start"), "{err}");
+    let message = err.to_string();
+    assert!(message.contains("failed start"), "{message}");
+    assert!(
+        message.contains("the shim never connected to SCM, so no daemon ran"),
+        "{message}"
+    );
 }
 
 /// A managed service's own host ran, so its `STOPPED (0, 0)` with a leftover wait hint is a failed
-/// start, but not one where "no shim or daemon ran".
+/// start, but not one where "the shim never connected to SCM".
 #[skuld::test]
 fn a_managed_stopped_with_a_wait_hint_that_a_start_joined_does_not_claim_nothing_ran() {
     let mut fake = FakeScm::new([Some(Observed::Stopped)])
@@ -626,7 +631,7 @@ fn a_managed_stopped_with_a_wait_hint_that_a_start_joined_does_not_claim_nothing
 
     let message = err.to_string();
     assert!(message.contains("failed start"), "{message}");
-    assert!(!message.contains("no shim or daemon ran"), "{message}");
+    assert!(!message.contains("never connected to SCM"), "{message}");
 }
 
 /// A start SCM accepted is ours, so `(0, 0)` with a wait hint is not SCM's failed attempt.

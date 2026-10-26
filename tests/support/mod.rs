@@ -11,6 +11,8 @@ pub mod cmd;
 pub mod connect_back;
 pub mod kill;
 pub mod sentinel;
+#[cfg(windows)]
+pub mod service_ctrl;
 pub mod service_guard;
 
 use std::fs;

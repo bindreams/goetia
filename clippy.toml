@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "windows_service::service_control_handler::register", reason = "frees its closure after any Stop, Shutdown or Preshutdown whatever the handler returned, while the registration stays live, so a later control reaches freed memory; call RegisterServiceCtrlHandlerExW with a context that is never freed (see src/bin/shim/service.rs)" },
+]
