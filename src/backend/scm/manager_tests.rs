@@ -606,26 +606,14 @@ fn install_and_preview_install_refuse_restart_always() {
     }
 }
 
-// uninstall's stop failure ============================================================================================
+// uninstall's failures ================================================================================================
 
-fn stop_failure(state: &StopFailure) -> String {
-    stop_failed_message(&Id::try_from("frpc").unwrap(), "does not accept STOP", state)
+fn uninstall_failure(state: &UninstallFailure) -> String {
+    uninstall_failed_message(&Id::try_from("frpc").unwrap(), "does not accept STOP", state)
 }
 
 #[skuld::test]
-fn a_stop_failure_that_restored_the_start_type_says_the_service_is_as_it_was() {
-    let text = stop_failure(&StopFailure::Restored);
-    assert!(text.contains("does not accept STOP"), "{text}");
-    assert!(text.contains("NOT deleted"), "{text}");
-    assert!(text.contains("start type is as it was"), "{text}");
-    assert!(text.contains("goetia daemon uninstall frpc"), "{text}");
-    assert!(text.contains("goetia daemon kill frpc"), "{text}");
-    assert!(!text.contains("disabled"), "the start type was restored: {text}");
-    assert!(!text.contains("sc.exe"), "{text}");
-}
-
-#[skuld::test]
-fn a_stop_failure_that_could_not_restore_names_the_original_start_type_and_its_command() {
+fn a_stop_failure_leaves_the_service_disabled_and_names_the_previous_start_type_and_its_command() {
     for (previous, wants) in [
         (
             ServiceStartType::AutoStart,
@@ -633,24 +621,57 @@ fn a_stop_failure_that_could_not_restore_names_the_original_start_type_and_its_c
         ),
         (ServiceStartType::OnDemand, ("manual", "`goetia daemon disable frpc`")),
     ] {
-        let text = stop_failure(&StopFailure::RestoreFailed {
-            previous,
-            error: "Access is denied.".to_string(),
+        let text = uninstall_failure(&UninstallFailure::Stop {
+            previous: Some(previous),
         });
+        assert!(text.contains("does not accept STOP"), "{previous:?}: {text}");
         assert!(text.contains("NOT deleted"), "{previous:?}: {text}");
-        assert!(text.contains("still disabled"), "{previous:?}: {text}");
-        assert!(text.contains("Access is denied."), "{previous:?}: {text}");
+        assert!(text.contains("disabled"), "{previous:?}: {text}");
         assert!(
             text.contains(&format!("start type was {}", wants.0)),
             "{previous:?}: {text}"
         );
         assert!(text.contains(wants.1), "{previous:?}: {text}");
+        assert!(text.contains("goetia daemon uninstall frpc"), "{previous:?}: {text}");
+        assert!(text.contains("goetia daemon kill frpc"), "{previous:?}: {text}");
+        assert!(!text.contains("as it was"), "nothing is restored: {previous:?}: {text}");
     }
 }
 
 #[skuld::test]
+fn a_stop_failure_with_an_unknown_previous_start_type_omits_it() {
+    let text = uninstall_failure(&UninstallFailure::Stop { previous: None });
+    assert!(text.contains("does not accept STOP"), "{text}");
+    assert!(text.contains("NOT deleted"), "{text}");
+    assert!(text.contains("disabled"), "{text}");
+    assert!(text.contains("goetia daemon uninstall frpc"), "{text}");
+    assert!(text.contains("goetia daemon kill frpc"), "{text}");
+    for absent in ["start type was", "goetia daemon enable", "sets it again"] {
+        assert!(!text.contains(absent), "`{absent}` has nothing to name: {text}");
+    }
+}
+
+#[skuld::test]
+fn a_delete_failure_says_stopped_disabled_not_deleted_and_names_the_previous_start_type() {
+    let text = uninstall_failure(&UninstallFailure::Delete {
+        previous: Some(ServiceStartType::AutoStart),
+    });
+    assert!(text.contains("does not accept STOP"), "the cause leads: {text}");
+    assert!(text.contains("stopped and disabled"), "{text}");
+    assert!(text.contains("NOT deleted"), "{text}");
+    assert!(text.contains("goetia daemon uninstall frpc"), "{text}");
+    assert!(text.contains("start type was automatic"), "{text}");
+    assert!(text.contains("`goetia daemon enable frpc`"), "{text}");
+    assert!(!text.contains("goetia daemon kill"), "the service is stopped: {text}");
+
+    let unknown = uninstall_failure(&UninstallFailure::Delete { previous: None });
+    assert!(unknown.contains("NOT deleted"), "{unknown}");
+    assert!(!unknown.contains("start type was"), "{unknown}");
+}
+
+#[skuld::test]
 fn a_stop_failure_on_a_service_marked_by_someone_else_does_not_claim_a_disable() {
-    let text = stop_failure(&StopFailure::AlreadyMarked);
+    let text = uninstall_failure(&UninstallFailure::AlreadyMarked);
     assert!(text.contains("does not accept STOP"), "{text}");
     assert!(text.contains("already marked for deletion"), "{text}");
     assert!(text.contains("goetia daemon kill frpc"), "{text}");

@@ -743,12 +743,12 @@ nothing; a disable that lands while a restart attempt is in flight is not
 promised to beat it. `uninstall` then stops whatever is running, a restart that
 had already begun included, waits for it to stop, and deletes the service. A
 stop that SCM rejects because the state changed is sent again on the next
-state. If the stop cannot be done, `uninstall` sets the start type back to what
-it was and fails, saying the service was not deleted; it is as it was before,
-and running `goetia daemon uninstall` again is the retry. If setting the start
-type back fails too, the error says the service is still disabled, names the
-original start type and the `goetia daemon enable` or `goetia daemon disable`
-command that sets it. A service that does not accept a stop needs
+state. If the stop or the delete fails, or `uninstall` is interrupted (Ctrl-C,
+a killed `goetia`), the service is left disabled and not deleted; the start
+type is not put back. Running `goetia daemon uninstall` again is the retry.
+The error names the start type the service had, when it could be read, and
+`goetia daemon enable` or `goetia daemon disable` sets it again. A service
+that does not accept a stop needs
 `goetia daemon kill <id>` first; `sc.exe stop` fails the same way. A service
 someone else already marked for deletion is not disabled; if it will not stop,
 the error says so, and it is removed once it stops and its last handle closes.
