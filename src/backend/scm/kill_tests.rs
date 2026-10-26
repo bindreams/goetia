@@ -203,14 +203,39 @@ fn a_restart_between_the_open_and_the_confirmation_lets_go_of_the_stale_process(
     );
 }
 
-/// The process exited between the read and the open, so there is nothing to open: SCM is asked
-/// again, and reports the service stopped.
+/// The process exited between the read and the open, so there is nothing to open: the kill waits for
+/// SCM to let go of the pid, then asks it again, and it reports the service stopped.
 #[skuld::test]
 fn a_process_gone_before_it_was_opened_sends_the_question_back_to_scm() {
     let mut target = Scripted::new([Some(100), None], [Open::Gone], []);
 
     assert_eq!(kill_service(&mut target).unwrap(), Killed::NotRunning);
-    assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
+    assert_eq!(
+        target.log(),
+        steps(["service_pid", "open 100", "arm_release", "service_pid", "service_pid"])
+    );
+}
+
+/// SCM has not yet recorded the exit of a process that is already gone: the kill blocks for SCM's
+/// release rather than re-reading in a loop.
+#[skuld::test]
+fn a_process_gone_before_it_was_opened_waits_for_scm_to_let_go_of_the_pid() {
+    let mut target = Scripted::new([Some(100), Some(100), None], [Open::Gone], []);
+
+    assert_eq!(kill_service(&mut target).unwrap(), Killed::NotRunning);
+    assert_eq!(
+        target.log(),
+        steps([
+            "service_pid",
+            "open 100",
+            "arm_release",
+            "service_pid",
+            "await_release",
+            "arm_release",
+            "service_pid",
+            "service_pid",
+        ])
+    );
 }
 
 /// The same, with the service restarted: the process that vanished is not the answer, the service's
@@ -218,7 +243,7 @@ fn a_process_gone_before_it_was_opened_sends_the_question_back_to_scm() {
 #[skuld::test]
 fn a_process_gone_before_it_was_opened_is_followed_to_the_services_new_process() {
     let mut target = Scripted::new(
-        [Some(100), Some(200), Some(200), None],
+        [Some(100), Some(200), Some(200), Some(200), None],
         [Open::Gone, Open::Found],
         [Terminate::Done],
     );
@@ -229,6 +254,8 @@ fn a_process_gone_before_it_was_opened_is_followed_to_the_services_new_process()
         steps([
             "service_pid",
             "open 100",
+            "arm_release",
+            "service_pid",
             "service_pid",
             "open 200",
             "service_pid",
@@ -255,7 +282,8 @@ fn a_service_stopped_after_the_open_is_not_terminated_through_the_handle() {
 }
 
 /// The process exited between the confirmation and the termination, on its own: nothing was
-/// terminated, so the kill is not reported delivered. SCM is asked again, and has stopped the service.
+/// terminated, so the kill is not reported delivered. It waits for SCM to let go of the pid, then asks
+/// again, and SCM has stopped the service.
 #[skuld::test]
 fn a_process_that_exited_before_the_termination_is_not_a_kill() {
     let mut target = Scripted::new([Some(100), Some(100), None], [Open::Found], [Terminate::AlreadyExited]);
@@ -268,6 +296,37 @@ fn a_process_that_exited_before_the_termination_is_not_a_kill() {
             "open 100",
             "service_pid",
             "terminate 100",
+            "arm_release",
+            "service_pid",
+            "close 100",
+            "service_pid",
+        ])
+    );
+}
+
+/// As for a process gone before the open: SCM not yet having recorded the exit is waited out on its
+/// release, not re-read in a loop.
+#[skuld::test]
+fn a_process_that_exited_before_the_termination_waits_for_scm_to_let_go_of_the_pid() {
+    let mut target = Scripted::new(
+        [Some(100), Some(100), Some(100), None],
+        [Open::Found],
+        [Terminate::AlreadyExited],
+    );
+
+    assert_eq!(kill_service(&mut target).unwrap(), Killed::NotRunning);
+    assert_eq!(
+        target.log(),
+        steps([
+            "service_pid",
+            "open 100",
+            "service_pid",
+            "terminate 100",
+            "arm_release",
+            "service_pid",
+            "await_release",
+            "arm_release",
+            "service_pid",
             "close 100",
             "service_pid",
         ])
@@ -278,7 +337,7 @@ fn a_process_that_exited_before_the_termination_is_not_a_kill() {
 #[skuld::test]
 fn a_process_that_exited_before_the_termination_is_followed_to_the_services_new_process() {
     let mut target = Scripted::new(
-        [Some(100), Some(100), Some(200), Some(200), None],
+        [Some(100), Some(100), Some(200), Some(200), Some(200), None],
         [Open::Found, Open::Found],
         [Terminate::AlreadyExited, Terminate::Done],
     );
@@ -291,6 +350,8 @@ fn a_process_that_exited_before_the_termination_is_followed_to_the_services_new_
             "open 100",
             "service_pid",
             "terminate 100",
+            "arm_release",
+            "service_pid",
             "close 100",
             "service_pid",
             "open 200",

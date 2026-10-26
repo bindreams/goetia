@@ -739,9 +739,11 @@ failure does not change it. SCM acknowledges that stop anyway, whatever the
 shim answers, so `stop` exits `0` and SCM restarts the command as above.
 `goetia daemon uninstall` first sets the service's start type to disabled, so a
 restart SCM had queued before the disable, or queues after it, fails and starts
-nothing; a disable that lands while a restart attempt is in flight is not
-promised to beat it. `uninstall` then stops whatever is running, a restart that
-had already begun included, waits for it to stop, and deletes the service. A
+nothing. A disable that lands after SCM has begun a restart attempt does not
+stop it: the attempt runs to a running service, even when the disable follows
+the failure by a fraction of a millisecond. `uninstall` then stops whatever is
+running, such an attempt included, waits for it to stop, and deletes the
+service. A
 stop that SCM rejects because the state changed is sent again on the next
 state. If the stop or the delete fails, the service is left disabled and not
 deleted; the start type is not put back. An interrupted `uninstall` (Ctrl-C, a
@@ -911,10 +913,9 @@ Object ends the daemon and its descendants with it.
 
 On Windows the process just terminated, or one already terminating (a second
 `kill`, or a daemon dying on its own), is waited for until it exits, with no
-time limit. When that
-wait begins goetia prints `<id>: process <pid> is already terminating; waiting
-for it to exit` to stderr; a process stuck in a driver request can keep it
-waiting.
+time limit. When it has not exited yet, goetia prints
+`<id>: waiting for process <pid> to exit` to stderr; a process stuck in a
+driver request can keep it waiting.
 
 A daemon with no process, whether stopped or between runs, is an error: exit
 `1` and "is not running", because nothing was killed.

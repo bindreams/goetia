@@ -77,9 +77,9 @@ pub fn kill_service<T: KillTarget>(target: &mut T) -> io::Result<Killed> {
         };
         let process = match target.open(pid) {
             Ok(Some(process)) => process,
-            // SCM has not yet noticed the exit; it will, and until then this re-reads it.
+            // The process is gone and SCM has not yet recorded it; wait for SCM to move off the pid.
             Ok(None) => {
-                std::thread::yield_now();
+                await_scm_released(target, pid)?;
                 continue;
             }
             // A pid that cannot be opened is a refusal only while SCM still says it is the service's.
@@ -106,8 +106,8 @@ pub fn kill_service<T: KillTarget>(target: &mut T) -> io::Result<Killed> {
                 await_scm_released(target, pid)?;
                 return Ok(Killed::Terminated);
             }
-            // SCM has not yet noticed the exit; it will, and until then this re-reads it.
-            Termination::AlreadyExited => std::thread::yield_now(),
+            // As for `Ok(None)` above: gone, and not yet recorded by SCM.
+            Termination::AlreadyExited => await_scm_released(target, pid)?,
         }
     }
 }
@@ -176,10 +176,7 @@ mod system {
         }
 
         fn notice(&self, process: &Held) {
-            eprintln!(
-                "{}: process {} is already terminating; waiting for it to exit",
-                self.id, process.pid
-            );
+            eprintln!("{}: waiting for process {} to exit", self.id, process.pid);
         }
 
         fn notifier(&mut self) -> io::Result<&mut SystemScmActor> {

@@ -38,8 +38,8 @@
 //! between any read of its state and a later call. [`uninstall_locked`] therefore opens its wait
 //! actor first, sets the start type to `SERVICE_DISABLED` (a disabled service's recovery restart
 //! fails with `ERROR_SERVICE_DISABLED` and `StartService` is refused, so a restart queued or made
-//! after the disable starts nothing; a disable that lands while a restart attempt is in flight is
-//! not promised to win), stops whatever runs, including a start that had already begun, and only
+//! after the disable starts nothing; a disable that lands once an attempt has begun does not stop
+//! it, P23), stops whatever runs, including a start that had already begun, and only
 //! then closes the actor and deletes through a fresh `DELETE` handle. The stop never relies on an earlier observation: it
 //! is sent on a notification and, when SCM rejects it because the state changed, the state is read
 //! again. The service is not marked during the stop, so notifications keep working on it. A failure
@@ -935,15 +935,17 @@ fn run_sc(args: &[&str]) -> Result<()> {
 ///
 /// A disabled service is never started again: `StartService` fails with 1058, and a recovery restart
 /// fails with event 7032 / `%%1058` and no `START_PENDING`. Measured: a restart queued before the
-/// disable, or after it, does not start (P21), and a disable that landed 0.13-0.25 ms after a
-/// failure's `STOPPED` beat every restart attempt (P19a, 9 samples). A disable that lands while an
-/// attempt is in flight is not claimed either way. Once the start type is `SERVICE_DISABLED`, the
-/// wait in [`super::wait::settle_and_stop`] sends STOP on a notification. If a start had already
-/// begun, the wait lets it finish and then stops it. The service is not marked for deletion until
-/// then, so notifications work on it. With the wait actor closed and no other handle open, the
-/// delete removes the record at once (P12a). `Budget::Unbounded` throughout: `uninstall` has no
-/// `--timeout`, and bounding the stop would turn a slow-stopping service into a failed uninstall
-/// where today it succeeds.
+/// disable, or after it, does not start (P21). A disable that lands before SCM's attempt prevents
+/// it. One that lands while the attempt is in flight does not stop it: the attempt runs to
+/// `RUNNING`, even for a disable 0.12-0.22 ms after the failure (1 of 8), and the status read right
+/// after the disable returns shows `START_PENDING` or `RUNNING` (P23: the status told all 168
+/// samples apart), which the settle loop waits out and stops. Once the start type is
+/// `SERVICE_DISABLED`, the wait in [`super::wait::settle_and_stop`] sends STOP on a notification. If
+/// a start had already begun, the wait lets it finish and then stops it. The service is not marked
+/// for deletion until then, so notifications work on it. With the wait actor closed and no other
+/// handle open, the delete removes the record at once (P12a). `Budget::Unbounded` throughout:
+/// `uninstall` has no `--timeout`, and bounding the stop would turn a slow-stopping service into a
+/// failed uninstall where today it succeeds.
 ///
 /// The start type is not put back. A stop or a delete that fails leaves the service disabled. An
 /// interrupted `uninstall` (Ctrl-C, a killed goetia) leaves it unchanged, disabled, or deleted,
