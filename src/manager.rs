@@ -164,9 +164,9 @@ pub trait ServiceManager {
     /// **Unlike [`Self::start`], not idempotent over a service that is still
     /// up.** A manager answering "already running" here has refused the
     /// start, because the instance it sees may be the one the stop is still
-    /// taking down: a Windows `type: simple` service reads `RUNNING` for its
-    /// whole teardown (`goetia-shim` never reports `STOP_PENDING`), and
-    /// reading that answer as a start reports a restart that leaves the
+    /// taking down: a Windows `type: simple` service reads `RUNNING` until its
+    /// shim has taken the stop (`goetia-shim` reports `STOP_PENDING` from
+    /// then on), and reading that answer as a start reports a restart that leaves the
     /// daemon down. `Ok(())` means the manager accepted a start request and
     /// nothing more. Takes no budget: it never waits.
     fn request_start_after_stop(&self, id: &Id) -> Result<()>;

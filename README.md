@@ -804,6 +804,16 @@ behind. A `stop` terminates it the same way before it reports. If the job cannot
 be terminated, the shim reports `0`, `1003` as for a `stop` it could not
 complete, whatever `stop` follows.
 
+The shim reports the service as stopping (`STOP_PENDING`) from the moment the
+command's end or a `stop` is decided until it reports stopped, so the service
+never reads `running` while its job is being terminated. In that window
+`goetia daemon status` and `list` show `unknown`, the state they show for any
+transitional one. A `start` fails and says the service is stopping; it does not
+queue a start behind the stop, so run it again once the service has stopped. A
+`stop` waits for the stopping to finish and then exits `0`. SCM treats the
+`STOPPED` that follows as it would one that follows `running`: a failure is
+restarted per `restart:`, a stop is not.
+
 Nothing guards against a possible survivor afterwards: `stop` exits `0`,
 including the `stop` that produced the record, and a later `start`, `restart` or
 `sc start` launches a second copy beside it. `goetia daemon status` and `list`
@@ -886,8 +896,8 @@ taking down, may be going down, or may never have moved.
 **On Windows, `restart --timeout 0` will usually stop the daemon and not
 restart it.** The start arrives while the service is still coming down and is
 refused — for a `type: simple` daemon almost always, since its service reads
-`RUNNING` until its child is gone — which leaves the daemon stopped, at exit
-`4`. To restart a daemon on Windows, let `restart` wait for the stop: leave
+`RUNNING` until the shim has taken the stop, then `STOP_PENDING` until its
+child is gone — which leaves the daemon stopped, at exit `4`. To restart a daemon on Windows, let `restart` wait for the stop: leave
 `--timeout` at its default, or give it a duration other than `0`.
 
 ## Killing a daemon

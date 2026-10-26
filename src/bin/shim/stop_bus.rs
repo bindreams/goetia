@@ -240,6 +240,11 @@ impl StopBus {
     /// returning, and says in its return value whether that teardown
     /// succeeded.
     ///
+    /// `on_stopping` is called exactly once, as soon as the wait has ended for any reason (a stop,
+    /// the child exiting, a failed wait) and before anything is torn down, with no lock held. It
+    /// is where the service reports `STOP_PENDING`, so that SCM never reads it as running while
+    /// the tree is being terminated.
+    ///
     /// `waiter` is consumed here: it was made before `child` was spawned
     /// ([`Waiter`]), and this is where it is handed the daemon it was made
     /// for. Taking it by value is what makes "no waiter, no wait" checkable
@@ -300,8 +305,8 @@ impl StopBus {
     /// waiter's `child.wait()` cannot return and joining it would block for
     /// as long as that child lives: `run_service` would never reach
     /// `report_stopped`, SCM's stop would never complete, and the service —
-    /// which reads `RUNNING` throughout its own teardown, since this shim
-    /// never reports `STOP_PENDING` — could then be neither stopped nor
+    /// which reads `STOP_PENDING` throughout its own teardown (`on_stopping`),
+    /// accepting no stop — could then be neither stopped nor
     /// uninstalled for the daemon's whole remaining life. Skipping the join
     /// on that one arm bounds nothing and races nothing, because the wait it
     /// would wait for is already known not to resolve. What it gives up is the
@@ -328,7 +333,13 @@ impl StopBus {
     /// part of terminating it, so `wait_tree` afterwards always fails with "the job handle was
     /// already closed". "Terminated" means the kill succeeded, not that the kernel has finished
     /// releasing what the members held.
-    pub fn wait_for_child_or_stop(self: &Arc<Self>, waiter: Waiter, child: &Arc<Child>, id: &str) -> WaitOutcome {
+    pub fn wait_for_child_or_stop(
+        self: &Arc<Self>,
+        waiter: Waiter,
+        child: &Arc<Child>,
+        id: &str,
+        on_stopping: impl FnOnce(),
+    ) -> WaitOutcome {
         debug_assert!(
             Arc::ptr_eq(&waiter.bus, self),
             "this waiter was made for a different StopBus: it would report the child's exit to that one, \
@@ -350,15 +361,14 @@ impl StopBus {
             .expect("StopBus mutex poisoned");
         let stopping = g.fate == Fate::Stopped;
         let wait_failure = g.wait_failure;
+        // Release the lock before calling out — `on_stopping` and `kill_tree`/`kill` need it
+        // not, and holding it across a kernel call would block `request_stop()`/`settle()`
+        // callers (e.g. a second, redundant SCM stop control) for no reason.
+        drop(g);
+        on_stopping();
         let outcome = if !stopping && wait_failure.is_none() {
-            drop(g);
             WaitOutcome::ChildExited
         } else {
-            // Release the lock before calling into `child` — `kill_tree`/
-            // `kill` need it not, and holding it across a kernel call would
-            // block `request_stop()`/`settle()` callers (e.g. a
-            // second, redundant SCM stop control) for no reason.
-            drop(g);
             let teardown = kill_for_stop(child, id);
             match (teardown, wait_failure) {
                 // Returning here is what leaves `waiting` unjoined: nothing
@@ -488,6 +498,8 @@ fn exited_tree_unkilled(e: &cosca::error::Error) -> String {
 /// demand. See `test_hook::kills`.
 fn kill_tree(child: &Child) -> Result<(), cosca::error::Error> {
     #[cfg(test)]
+    test_hook::tree_kill_attempted();
+    #[cfg(test)]
     test_hook::killing(test_hook::Site::Tree)?;
     child.kill_tree()
 }
@@ -521,6 +533,17 @@ pub(crate) mod test_hook {
         static THREADS: Cell<Option<usize>> = const { Cell::new(None) };
         static KILLS: Cell<Option<Kill>> = const { Cell::new(None) };
         static WAITS: Cell<Option<Wait>> = const { Cell::new(None) };
+        static TREE_KILLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// How many times this thread has attempted [`super::kill_tree`], refused or not. A test reads
+    /// it inside a callback to show the tree was not yet being torn down.
+    pub(crate) fn tree_kills() -> usize {
+        TREE_KILLS.get()
+    }
+
+    pub(super) fn tree_kill_attempted() {
+        TREE_KILLS.set(TREE_KILLS.get() + 1);
     }
 
     /// What [`super::kill_tree`] and [`super::kill_child`] do instead of killing.

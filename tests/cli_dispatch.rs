@@ -3341,8 +3341,8 @@ fn restart_with_no_budget_issues_both_steps_without_confirming() {
 }
 
 /// `restart --timeout 0` over a daemon that is up, in the shape the Windows backend really meets:
-/// the stop request is accepted, and the service goes on reading `RUNNING` for its whole teardown —
-/// `goetia-shim` never reports `STOP_PENDING` — so the start that follows is answered "already
+/// the stop request is accepted, and the service goes on reading `RUNNING` until the shim has
+/// taken it (`STOP_PENDING` from then on) — so the start that follows is answered "already
 /// running". The `Fake` models exactly that: its request-only `stop` settles nothing, so the entry
 /// is still `Running` when the start arrives, and its plain `start` is idempotent over it, as SCM's
 /// is over a queried `RUNNING`.

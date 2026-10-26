@@ -223,7 +223,7 @@ impl ServiceManager for ScmManager {
 
     /// [`super::wait::request_start_after_stop`]: every
     /// `ERROR_SERVICE_ALREADY_RUNNING` is a refusal here, since a `type:
-    /// simple` service reads `RUNNING` for its whole teardown.
+    /// simple` service reads `RUNNING` until its shim has taken the stop.
     fn request_start_after_stop(&self, id: &Id) -> Result<()> {
         let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
         require_ours(id)?;

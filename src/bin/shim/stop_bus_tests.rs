@@ -43,7 +43,7 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
         let bus = Arc::clone(&bus);
         let id = id.as_str().to_string();
         std::thread::spawn(move || {
-            let outcome = bus.wait_for_child_or_stop(waiter, &child, &id);
+            let outcome = bus.wait_for_child_or_stop(waiter, &child, &id, || {});
             let _ = tx.send(outcome);
         });
     }
@@ -120,7 +120,7 @@ fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_k
             // Armed on the thread the kills happen on, which is not this test's — the hook is
             // thread-local, so the cleanup kill at the end of this test is unaffected by it.
             let _refused = test_hook::kills(test_hook::Kill::Refuse);
-            let outcome = bus.wait_for_child_or_stop(waiter, &child, &id);
+            let outcome = bus.wait_for_child_or_stop(waiter, &child, &id, || {});
             let _ = tx.send(outcome);
         });
     }
@@ -217,7 +217,7 @@ fn a_panic_on_the_stop_path_leaves_the_waiter_detached_and_the_daemon_untorn_dow
         std::thread::spawn(move || {
             let _panicking = test_hook::kills(test_hook::Kill::Panic);
             let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                bus.wait_for_child_or_stop(waiter, &child, &id);
+                bus.wait_for_child_or_stop(waiter, &child, &id, || {});
             }))
             .is_err();
             // Dropped before the send, so the reference count asserted below is not a race against
@@ -279,7 +279,7 @@ fn wait_for_child_or_stop_returns_child_exited_when_the_child_exits_on_its_own()
     // No stop requested: the child exiting on its own is the only wakeup
     // source, so this blocks only as long as the child itself takes to
     // start and exit.
-    let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str());
+    let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str(), || {});
     assert!(matches!(outcome, WaitOutcome::ChildExited));
     assert_eq!(
         take(id.as_str()),
@@ -332,7 +332,7 @@ fn a_failed_background_wait_kills_the_daemon_and_is_reported_as_a_wait_failure()
     };
     let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
 
-    let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str());
+    let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str(), || {});
 
     assert!(
         matches!(outcome, WaitOutcome::WaitFailed { os_error: None }),
@@ -373,7 +373,7 @@ fn a_failed_background_wait_over_an_unkillable_daemon_is_the_unkillable_outcome(
 
     let outcome = {
         let _refused = test_hook::kills(test_hook::Kill::Refuse);
-        bus.wait_for_child_or_stop(waiter, &child, id.as_str())
+        bus.wait_for_child_or_stop(waiter, &child, id.as_str(), || {})
     };
 
     assert!(matches!(outcome, WaitOutcome::DaemonMayRun));
@@ -402,7 +402,7 @@ fn a_panicked_waiter_is_logged_when_the_stop_path_joins_it() {
     let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
     bus.request_stop();
 
-    let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str());
+    let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str(), || {});
 
     assert!(
         matches!(outcome, WaitOutcome::Stopping),
@@ -436,7 +436,7 @@ fn a_stop_whose_kill_tree_fails_kills_the_child_and_reports_the_daemon_possibly_
 
     // The call runs on this thread, so the hook is armed on it; the guard drops with the test.
     let _refused = test_hook::kills(test_hook::Kill::RefuseTree);
-    let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str());
+    let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str(), || {});
 
     assert!(
         matches!(outcome, WaitOutcome::DaemonMayRun),
@@ -471,7 +471,7 @@ fn a_panicked_waiter_is_a_wait_failure_with_no_stop_requested() {
     };
     let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
 
-    let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str());
+    let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str(), || {});
 
     assert!(
         matches!(outcome, WaitOutcome::WaitFailed { os_error: None }),
@@ -498,7 +498,7 @@ fn a_failed_background_wait_carries_its_os_error() {
     };
     let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
 
-    let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str());
+    let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str(), || {});
 
     assert!(
         matches!(outcome, WaitOutcome::WaitFailed { os_error: Some(5) }),
@@ -526,7 +526,7 @@ fn a_stop_wins_over_a_failed_background_wait() {
     let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
     bus.request_stop();
 
-    let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str());
+    let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str(), || {});
 
     assert!(matches!(outcome, WaitOutcome::Stopping));
     assert_dead(&child);
@@ -553,7 +553,7 @@ fn a_failed_background_wait_whose_tree_kill_failed_is_not_a_restartable_failure(
 
     let outcome = {
         let _refused = test_hook::kills(test_hook::Kill::RefuseTree);
-        bus.wait_for_child_or_stop(waiter, &child, id.as_str())
+        bus.wait_for_child_or_stop(waiter, &child, id.as_str(), || {})
     };
 
     assert!(matches!(outcome, WaitOutcome::DaemonMayRun));
@@ -577,7 +577,7 @@ fn a_failed_wait_over_an_unkillable_daemon_refuses_a_later_stop() {
 
     let outcome = {
         let _refused = test_hook::kills(test_hook::Kill::Refuse);
-        bus.wait_for_child_or_stop(waiter, &child, id.as_str())
+        bus.wait_for_child_or_stop(waiter, &child, id.as_str(), || {})
     };
 
     assert!(matches!(outcome, WaitOutcome::DaemonMayRun));
@@ -604,7 +604,7 @@ fn a_failed_wait_whose_tree_kill_was_refused_refuses_a_later_stop() {
 
     let outcome = {
         let _refused = test_hook::kills(test_hook::Kill::RefuseTree);
-        bus.wait_for_child_or_stop(waiter, &child, id.as_str())
+        bus.wait_for_child_or_stop(waiter, &child, id.as_str(), || {})
     };
 
     assert!(matches!(outcome, WaitOutcome::DaemonMayRun));

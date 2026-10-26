@@ -15,7 +15,7 @@ use goetia::backend::scm::exit_status::{
 use goetia::spec::{Id, Kind, Restart, User};
 use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, NO_ERROR};
 use windows_sys::Win32::System::Services::{
-    SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_PAUSE, SERVICE_CONTROL_STOP, SERVICE_STOPPED,
+    SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_PAUSE, SERVICE_CONTROL_STOP, SERVICE_STOP_PENDING, SERVICE_STOPPED,
 };
 
 use super::*;
@@ -25,6 +25,11 @@ use crate::stop_bus::test_hook::{KILL_REFUSED, Kill, WAIT_FAILED, Wait, WaiterEn
 use crate::test_support::{TestId, assert_failures, assert_one_failure};
 
 const PREFIX: &str = "goetia-shim-launch-test";
+
+/// [`super::run_daemon`] for the tests that do not look at the `STOP_PENDING` report.
+fn run_daemon(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, on_running: impl FnOnce()) -> Reported {
+    super::run_daemon(spec, stop_bus, id, on_running, || {})
+}
 
 /// A `type: simple` daemon that keeps running until it is killed — the case where a lost waiter
 /// would leave a real orphan, rather than a process that was about to exit anyway.
@@ -582,6 +587,197 @@ fn fallback_refused_failure() -> String {
     format!(
         "fallback kill: {KILL_REFUSED}; the daemon was neither killed nor reaped and may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure"
     )
+}
+
+// STOP_PENDING --------------------------------------------------------------------------------------------------------
+
+/// `run_daemon` with both reports recorded: how many tree kills had been attempted at each
+/// `STOP_PENDING` report, so a test can tell whether teardown had begun.
+fn run_recording_stopping(
+    daemon: &DaemonSpec,
+    stop_bus: &Arc<StopBus>,
+    id: &str,
+    on_running: impl FnOnce(),
+) -> (Reported, Vec<usize>) {
+    let before = waiter_threads::tree_kills();
+    let mut stopping = Vec::new();
+    let reported = super::run_daemon(daemon, stop_bus, id, on_running, || {
+        stopping.push(waiter_threads::tree_kills() - before);
+    });
+    (reported, stopping)
+}
+
+/// The status held while the shim tears the daemon down. SCM refuses a second `STOP` and a `START`
+/// while a host holds it (measured), which is what keeps `start` from reading the service as up.
+#[skuld::test]
+fn the_stopping_status_accepts_no_control_and_records_no_exit() {
+    let status = stopping_status();
+
+    assert_eq!(status.dwCurrentState, SERVICE_STOP_PENDING);
+    assert_eq!(status.dwControlsAccepted, 0);
+    assert_eq!((status.dwWin32ExitCode, status.dwServiceSpecificExitCode), (0, 0));
+    assert_eq!((status.dwCheckPoint, status.dwWaitHint), (1, 10_000));
+}
+
+#[skuld::test]
+fn a_commanded_stop_reports_stopping_once_while_the_daemon_is_still_alive() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+    let before = waiter_threads::tree_kills();
+    let mut alive_when_stopping = Vec::new();
+
+    let reported = super::run_daemon(
+        &spec(dir.path(), id.as_str()),
+        &stop_bus,
+        id.as_str(),
+        || {
+            stop_bus.request_stop();
+        },
+        || {
+            alive_when_stopping.push((
+                waiter_threads::tree_kills() - before,
+                test_hook::spawned().expect("the daemon was spawned").is_alive(),
+            ));
+        },
+    );
+
+    assert_eq!(reported, Reported::Clean);
+    assert_eq!(
+        alive_when_stopping,
+        [(0, Liveness::Alive)],
+        "STOP_PENDING must be reported once, before the teardown begins"
+    );
+    assert_eq!(waiter_threads::tree_kills() - before, 1);
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+#[skuld::test]
+fn a_daemon_that_exits_reports_stopping_before_its_tree_is_terminated() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+    let before = waiter_threads::tree_kills();
+
+    let (reported, stopping) = run_recording_stopping(
+        &powershell(dir.path(), id.as_str(), "exit 7"),
+        &stop_bus,
+        id.as_str(),
+        || {},
+    );
+
+    assert_eq!(reported, Reported::DaemonExit(7));
+    assert_eq!(
+        stopping,
+        [0],
+        "STOP_PENDING must be reported once, before any tree kill"
+    );
+    assert_eq!(waiter_threads::tree_kills() - before, 1);
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+#[skuld::test]
+fn a_daemon_that_exits_cleanly_reports_stopping_before_its_tree_is_terminated() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+
+    let (reported, stopping) = run_recording_stopping(
+        &powershell(dir.path(), id.as_str(), "exit 0"),
+        &stop_bus,
+        id.as_str(),
+        || {},
+    );
+
+    assert_eq!(reported, Reported::Clean);
+    assert_eq!(stopping, [0]);
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+#[skuld::test]
+fn a_failed_wait_reports_stopping_before_the_daemon_is_killed() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+
+    let (reported, stopping) = {
+        let _failing = waits(Wait::Fail(Some(5)));
+        run_recording_stopping(&spec(dir.path(), id.as_str()), &stop_bus, id.as_str(), || {})
+    };
+
+    assert_eq!(reported, Reported::shim_failure(Some(5)));
+    assert_eq!(stopping, [0]);
+    assert_one_failure(
+        &take(id.as_str()),
+        id.as_str(),
+        &format!("background wait on child: {}", std::io::Error::from_raw_os_error(5)),
+    );
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+/// A teardown that fails is still a `STOP_PENDING` followed by the incomplete-stop `STOPPED`: the
+/// service must not read as up while the shim tries.
+#[skuld::test]
+fn a_teardown_that_fails_still_reports_stopping_first() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+
+    let (reported, stopping) = {
+        let _refused = kills(Kill::Refuse);
+        run_recording_stopping(
+            &powershell(dir.path(), id.as_str(), "exit 7"),
+            &stop_bus,
+            id.as_str(),
+            || {},
+        )
+    };
+
+    assert_eq!(reported, Reported::incomplete_stop());
+    assert_eq!(stopping, [0]);
+    assert_eq!(take(id.as_str()).len(), 1);
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+#[skuld::test]
+fn no_stopping_report_when_the_daemon_never_ran() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+    let missing = DaemonSpec {
+        command: vec!["goetia-shim-test-no-such-binary".to_string()],
+        ..spec(dir.path(), id.as_str())
+    };
+
+    let (_, stopping) = run_recording_stopping(&missing, &stop_bus, id.as_str(), || {});
+
+    assert_eq!(
+        stopping,
+        Vec::<usize>::new(),
+        "STOP_PENDING over a service never RUNNING"
+    );
+    assert_eq!(take(id.as_str()).len(), 1);
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+}
+
+#[skuld::test]
+fn no_stopping_report_over_an_uncontained_daemon() {
+    let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
+    let id = TestId::new(PREFIX);
+    let stop_bus = Arc::new(StopBus::new());
+
+    let (_, stopping) = {
+        let _degraded = test_hook::containment_is(Containment::TreeWalk);
+        run_recording_stopping(&spec(dir.path(), id.as_str()), &stop_bus, id.as_str(), || {})
+    };
+
+    assert_eq!(
+        stopping,
+        Vec::<usize>::new(),
+        "STOP_PENDING over a service never RUNNING"
+    );
+    assert_eq!(take(id.as_str()).len(), 1);
+    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }
 
 /// The line logged when the daemon is not job-contained, whatever the kill then does.

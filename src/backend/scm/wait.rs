@@ -101,11 +101,21 @@ pub trait ScmActor {
 pub fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
     let armed = a.arm(WantState::Stopped, deadline)?;
     // Issued even when the arm expired: only the *waiting* is bounded.
-    a.control_stop()?;
+    control_stop_or_underway(a)?;
     if armed == Waited::Expired {
         return Ok(Waited::Expired);
     }
     await_stopped(a, deadline)
+}
+
+/// [`ScmActor::control_stop`], where a stop already under way counts as sent. A service in
+/// `STOP_PENDING` (a shim tearing the daemon down) is refused by SCM with 1061 before it reaches the
+/// service (P18c), and the stop being asked for is the one in progress. Any other refusal is an error.
+fn control_stop_or_underway<A: ScmActor>(a: &mut A) -> io::Result<()> {
+    match a.control_stop() {
+        Err(e) if e.raw_os_error() == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL) => Ok(()),
+        other => other,
+    }
 }
 
 /// The wait half of a stop: the `Stopped`-mask arm is already in place. Re-arms after every
@@ -130,7 +140,7 @@ fn await_stopped<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waite
 /// does not accept it, `START_PENDING` among them (measured).
 const ERROR_INVALID_SERVICE_CONTROL: i32 = 1052;
 /// `ERROR_SERVICE_CANNOT_ACCEPT_CTRL`: a STOP is already delivered and the service has not yet
-/// reported `STOP_PENDING` (measured).
+/// reported `STOP_PENDING`, or reports it (measured).
 const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
 
 /// Stop the service, whatever state it is in, and wait for `STOPPED`. A STOP is sent only on a
@@ -201,12 +211,17 @@ fn accept_as_started(reply: StartReply) -> io::Result<()> {
     match reply {
         StartReply::Accepted => Ok(()),
         StartReply::AlreadyRunning(queried) if already_running_is_recoverable(queried) => Ok(()),
+        StartReply::AlreadyRunning(QueriedState::StopPending) => Err(io::Error::other(STOPPING)),
         StartReply::AlreadyRunning(queried) => Err(io::Error::other(format!(
             "StartServiceW reported ERROR_SERVICE_ALREADY_RUNNING, but the service is actually \
              {queried:?} — neither Running nor StartPending, so nothing is on its way to running"
         ))),
     }
 }
+
+/// What a start over a `STOP_PENDING` service is told. SCM refuses the start (1056) and the service
+/// then stops and stays down, so reporting it as started would be false.
+const STOPPING: &str = "the service is stopping (STOP_PENDING), so it cannot be started yet: it is going down and will stay down. Run the start again once it has stopped";
 
 /// Start the service, gated strictly on a real `RUNNING` callback; re-arms
 /// after a non-terminal callback, under the same `deadline` throughout —
@@ -303,10 +318,11 @@ pub fn request_start<A: ScmActor>(a: &mut A) -> io::Result<()> {
 
 /// `daemon restart --timeout 0`'s start: [`request_start`], except `ERROR_SERVICE_ALREADY_RUNNING`
 /// is always a refusal: the queried `Running` may be the instance the unconfirmed stop just before
-/// it is taking down.
+/// it is taking down, before the shim has reported `STOP_PENDING`.
 pub fn request_start_after_stop<A: ScmActor>(a: &mut A) -> io::Result<()> {
     match a.start()? {
         StartReply::Accepted => Ok(()),
+        StartReply::AlreadyRunning(QueriedState::StopPending) => Err(io::Error::other(STOPPING)),
         StartReply::AlreadyRunning(queried) => Err(io::Error::other(format!(
             "StartServiceW reported ERROR_SERVICE_ALREADY_RUNNING with the service {queried:?}: \
              the stop issued just before it has not taken effect, so the start was refused"
@@ -316,7 +332,7 @@ pub fn request_start_after_stop<A: ScmActor>(a: &mut A) -> io::Result<()> {
 
 /// [`request_start`]'s mirror: issue the stop control and return.
 pub fn request_stop<A: ScmActor>(a: &mut A) -> io::Result<()> {
-    a.control_stop()
+    control_stop_or_underway(a)
 }
 
 // handle teardown =====================================================================================================

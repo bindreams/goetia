@@ -225,6 +225,53 @@ fn stop_re_arms_after_a_non_terminal_callback() {
     );
 }
 
+/// A service in `STOP_PENDING` (a shim tearing the daemon down) refuses a second `STOP` with 1061
+/// without reaching the handler (P18c). That stop is under way, so `stop` waits for it to end.
+#[skuld::test]
+fn stop_waits_out_a_stop_already_under_way() {
+    let mut fake = FakeScm::new([Some(Observed::Pending), Some(Observed::Stopped)])
+        .stop_replies([StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL)]);
+    assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        fake.log,
+        vec![
+            "arm_stopped",
+            "control_stop",
+            "wait",
+            "got_pending",
+            "arm_stopped",
+            "wait",
+            "got_stopped",
+        ]
+    );
+}
+
+/// The wait stays bounded by the caller's deadline: a stop under way that outlasts it expires.
+#[skuld::test]
+fn stop_over_a_stop_under_way_still_expires_on_the_deadline() {
+    let mut fake = FakeScm::new([None]).stop_replies([StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL)]);
+    assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), Waited::Expired);
+}
+
+#[skuld::test]
+fn a_stop_request_over_a_stop_under_way_is_accepted() {
+    let mut fake = FakeScm::new([]).stop_replies([StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL)]);
+    request_stop(&mut fake).unwrap();
+    assert_eq!(fake.log, vec!["control_stop"]);
+}
+
+/// Only 1061 is a stop under way: a `START_PENDING` service (1052) or any other refusal is an error.
+#[skuld::test]
+fn stop_refusals_other_than_a_stop_under_way_are_errors() {
+    for code in [ERROR_INVALID_SERVICE_CONTROL, 5] {
+        let mut fake = FakeScm::new([Some(Observed::Stopped)]).stop_replies([StopReply::Os(code)]);
+        let err = stop_via_notify(&mut fake, unbounded()).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(code));
+        let mut fake = FakeScm::new([]).stop_replies([StopReply::Os(code)]);
+        assert_eq!(request_stop(&mut fake).unwrap_err().raw_os_error(), Some(code));
+    }
+}
+
 // settle_and_stop ----
 
 /// What one SCM interleaving must make [`settle_and_stop`] do.
@@ -926,10 +973,35 @@ fn a_plain_start_over_a_stopping_service_is_refused() {
     assert!(request_start(&mut fake).is_err());
 }
 
+/// Whatever the budget, a `start` over a stopping service is never a success, and the error says
+/// what to do: the service is going down and stays down, so `start` is run again once it has.
+#[skuld::test]
+fn a_start_over_a_stopping_service_says_it_is_stopping() {
+    let mut fake = FakeScm::new([]).already_running(QueriedState::StopPending);
+    let waiting = start_via_notify(&mut fake, unbounded(), Kind::Simple)
+        .unwrap_err()
+        .to_string();
+    assert_eq!(fake.log, vec!["arm_running", "start"], "nothing is waited for");
+    let immediate = request_start(&mut FakeScm::new([]).already_running(QueriedState::StopPending))
+        .unwrap_err()
+        .to_string();
+    for text in [waiting, immediate] {
+        assert!(text.contains("is stopping"), "{text}");
+        assert!(text.contains("once it has stopped"), "{text}");
+    }
+}
+
+#[skuld::test]
+fn a_start_after_an_unconfirmed_stop_over_a_stopping_service_says_so() {
+    let mut fake = FakeScm::new([]).already_running(QueriedState::StopPending);
+    let text = request_start_after_stop(&mut fake).unwrap_err().to_string();
+    assert!(text.contains("is stopping"), "{text}");
+}
+
 /// `restart --timeout 0`'s start, over the service the real `goetia-shim`
-/// presents after an unconfirmed stop: `RUNNING` for its whole teardown,
-/// never `STOP_PENDING`. That 1056 is a refusal — reading it as a start
-/// reports a restart that leaves the daemon down.
+/// presents between a stop request and its `STOP_PENDING` report: still
+/// `RUNNING`. That 1056 is a refusal — reading it as a start reports a
+/// restart that leaves the daemon down.
 #[skuld::test]
 fn a_start_after_an_unconfirmed_stop_refuses_a_service_still_reading_running() {
     let mut fake = FakeScm::new([]).already_running(QueriedState::Running);

@@ -19,8 +19,8 @@ use windows_service::{define_windows_service, service_dispatcher};
 use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, NO_ERROR};
 use windows_sys::Win32::System::Services::{
     RegisterServiceCtrlHandlerExW, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_STOP,
-    SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOPPED, SERVICE_WIN32_OWN_PROCESS,
-    SetServiceStatus,
+    SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOP_PENDING, SERVICE_STOPPED,
+    SERVICE_WIN32_OWN_PROCESS, SetServiceStatus,
 };
 
 use crate::logging;
@@ -91,7 +91,13 @@ fn run_service(id: &str) {
     };
 
     log_version_skew(id, &blob.spec, &blob.version, goetia::version());
-    let reported = run_daemon(&blob.spec, &stop_bus, id, || report_running(id, status_handle));
+    let reported = run_daemon(
+        &blob.spec,
+        &stop_bus,
+        id,
+        || report_running(id, status_handle),
+        || report_stopping(id, status_handle),
+    );
     finish(id, status_handle, reported);
 }
 
@@ -100,6 +106,22 @@ fn run_service(id: &str) {
 fn finish(id: &str, status_handle: StatusHandle, reported: Reported) -> ! {
     report_stopped(id, status_handle, reported);
     std::process::exit(reported.process_exit_code());
+}
+
+/// The `STOP_PENDING` status held while the shim tears the daemon down, accepting no control. SCM
+/// then refuses a second `STOP` (1061) and a `START` (1056) itself, and a `STOPPED` that follows
+/// restarts or not exactly as one that follows `RUNNING` (P18). The hint and checkpoint are those
+/// P18 measured; what SCM does when the hint expires or the checkpoint stalls is not.
+fn stopping_status() -> SERVICE_STATUS {
+    SERVICE_STATUS {
+        dwServiceType: SERVICE_WIN32_OWN_PROCESS,
+        dwCurrentState: SERVICE_STOP_PENDING,
+        dwControlsAccepted: 0,
+        dwWin32ExitCode: 0,
+        dwServiceSpecificExitCode: 0,
+        dwCheckPoint: 1,
+        dwWaitHint: 10_000,
+    }
 }
 
 /// The `STOPPED` status SCM is told for `reported`, with the exact `(win32, specific)` pair of
@@ -187,6 +209,16 @@ fn report_running(id: &str, handle: StatusHandle) {
     }
 }
 
+/// Report `STOP_PENDING`. A failure is logged: the teardown goes on and `STOPPED` is still reported.
+fn report_stopping(id: &str, handle: StatusHandle) {
+    let status = stopping_status();
+    // SAFETY: `handle` is live for the life of the process, and `status` outlives the call.
+    if unsafe { SetServiceStatus(handle.0, &status) } == 0 {
+        let e = std::io::Error::last_os_error();
+        logging::log_failure(id, &format!("report SERVICE_STOP_PENDING to SCM: {e}"));
+    }
+}
+
 fn report_stopped(id: &str, handle: StatusHandle, reported: Reported) {
     let status = stopped_status(reported);
     // SAFETY: `handle` is live for the life of the process, and `status` outlives the call.
@@ -202,11 +234,22 @@ fn report_stopped(id: &str, handle: StatusHandle, reported: Reported) {
 /// Launch the daemon, report `RUNNING` through `on_running`, wait for the daemon to end or for a
 /// stop, and say how it ended.
 ///
+/// `on_stopping` is called exactly once, after `on_running` and before the daemon's tree is torn
+/// down, whatever ends the run; never when `on_running` was not. The service reads `STOP_PENDING`
+/// through the teardown, so a `start` is refused rather than answered "running" for a service that
+/// is about to stop and stay down.
+///
 /// `on_running` is called exactly once, after the daemon is spawned and never when launching failed.
 /// A daemon that cannot start is therefore `STOPPED` without ever having been `RUNNING`, with a
 /// non-zero Win32 code or, when no Job Object contains it, the incomplete stop. `start_via_notify`
 /// reads both as a failed start under every restart policy.
-fn run_daemon(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, on_running: impl FnOnce()) -> Reported {
+fn run_daemon(
+    spec: &DaemonSpec,
+    stop_bus: &Arc<StopBus>,
+    id: &str,
+    on_running: impl FnOnce(),
+    on_stopping: impl FnOnce(),
+) -> Reported {
     let (child, waiter) = match launch(spec, stop_bus, id) {
         Ok(launched) => launched,
         Err(reported) => return reported,
@@ -215,7 +258,7 @@ fn run_daemon(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, on_running: 
 
     // `wait_for_child_or_stop` kills the tree on a stop or a failed wait, so only `DaemonMayRun`
     // leaves a daemon that may be running.
-    match stop_bus.wait_for_child_or_stop(waiter, &child, id) {
+    match stop_bus.wait_for_child_or_stop(waiter, &child, id, on_stopping) {
         WaitOutcome::ChildExited => {
             let code = match exit_status(&child) {
                 Ok(status) => {
