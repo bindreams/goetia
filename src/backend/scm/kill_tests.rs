@@ -32,6 +32,10 @@ struct Scripted {
     /// Which `service_pid` calls, counted from 1, fail instead of answering.
     failing_reads: Vec<usize>,
     reads: usize,
+    /// Whether `await_exit` fails.
+    failing_exit: bool,
+    /// Whether `arm_release` fails.
+    failing_arm: bool,
     /// How many times the kill has blocked for SCM to let go.
     releases: usize,
     /// Whether an `arm_release` is outstanding: made, and neither woken by `await_release` nor
@@ -52,6 +56,8 @@ impl Scripted {
             terminates: terminates.into(),
             failing_reads: Vec::new(),
             reads: 0,
+            failing_exit: false,
+            failing_arm: false,
             releases: 0,
             armed: false,
             log: Log::default(),
@@ -61,6 +67,18 @@ impl Scripted {
     /// The `n`th `service_pid` call (from 1) fails.
     fn failing_read(mut self, n: usize) -> Self {
         self.failing_reads.push(n);
+        self
+    }
+
+    /// `await_exit` fails.
+    fn failing_exit(mut self) -> Self {
+        self.failing_exit = true;
+        self
+    }
+
+    /// `arm_release` fails.
+    fn failing_arm(mut self) -> Self {
+        self.failing_arm = true;
         self
     }
 
@@ -120,11 +138,17 @@ impl KillTarget for Scripted {
 
     fn await_exit(&mut self, process: &Held) -> io::Result<()> {
         self.log.borrow_mut().push(format!("await_exit {}", process.pid));
+        if self.failing_exit {
+            return Err(io::Error::other("wait on the process failed"));
+        }
         Ok(())
     }
 
     fn arm_release(&mut self) -> io::Result<()> {
         self.log.borrow_mut().push("arm_release".to_string());
+        if self.failing_arm {
+            return Err(io::Error::other("notifier could not be opened"));
+        }
         assert!(
             !self.armed,
             "arm_release over an outstanding registration: SCM allows one per service and buffer"
@@ -544,14 +568,25 @@ fn a_failed_confirming_read_closes_the_handle_and_terminates_nothing() {
     );
 }
 
-/// The read after the termination: the kill cannot say SCM has let go, so it is an error.
+/// What a failure after a delivered termination reports: the process is dead, so the error must not
+/// read as a failed kill. The cause and its kind are kept.
+fn assert_terminated_but_unconfirmed(e: &io::Error, cause: &str) {
+    let text = e.to_string();
+    assert!(text.contains("was terminated"), "{text}");
+    assert!(text.contains("waiting for SCM to record the exit failed"), "{text}");
+    assert!(text.ends_with(cause), "{text}");
+    assert!(!text.contains("kill failed"), "{text}");
+    assert_eq!(e.kind(), io::ErrorKind::Other);
+}
+
+/// The read after the termination: the kill cannot say SCM has let go, but the process is gone.
 #[skuld::test]
-fn a_failed_read_after_the_termination_is_an_error() {
+fn a_failed_read_after_the_termination_says_the_process_was_terminated() {
     let mut target = Scripted::new([Some(100)], [Open::Found], [Terminate::Done]).failing_read(3);
 
     let e = kill_service(&mut target).unwrap_err();
 
-    assert_eq!(e.to_string(), "scm read failed");
+    assert_terminated_but_unconfirmed(&e, "scm read failed");
     assert_eq!(
         target.log(),
         steps([
@@ -565,6 +600,34 @@ fn a_failed_read_after_the_termination_is_an_error() {
             "close 100",
         ])
     );
+}
+
+#[skuld::test]
+fn a_failed_wait_for_the_exit_says_the_process_was_terminated() {
+    let mut target = Scripted::new([Some(100)], [Open::Found], [Terminate::Done]).failing_exit();
+
+    let e = kill_service(&mut target).unwrap_err();
+
+    assert_terminated_but_unconfirmed(&e, "wait on the process failed");
+}
+
+#[skuld::test]
+fn a_failed_registration_after_the_termination_says_the_process_was_terminated() {
+    let mut target = Scripted::new([Some(100)], [Open::Found], [Terminate::Done]).failing_arm();
+
+    let e = kill_service(&mut target).unwrap_err();
+
+    assert_terminated_but_unconfirmed(&e, "notifier could not be opened");
+}
+
+/// A process that was never terminated by this kill keeps the plain error: it is not a terminated one.
+#[skuld::test]
+fn a_failed_registration_for_a_process_found_gone_is_not_called_a_termination() {
+    let mut target = Scripted::new([Some(100)], [Open::Gone], []).failing_arm();
+
+    let e = kill_service(&mut target).unwrap_err();
+
+    assert_eq!(e.to_string(), "notifier could not be opened");
 }
 
 #[skuld::test]

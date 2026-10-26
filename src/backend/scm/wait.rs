@@ -117,7 +117,8 @@ pub fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result
 /// `PAUSED`) service that still accepts STOP: a STOP was delivered and not yet answered (P16a), as
 /// [`settle_and_stop`] reads it. A service that has stopped since is done. A `RUNNING` service that
 /// accepts no STOP is also refused with 1061, and nothing is stopping it: that, any other state and
-/// any other refusal is an error.
+/// any other refusal is an error. A 1052 from a `START_PENDING` service is told as what it is, see
+/// [`STARTING`].
 fn control_stop_or_underway<A: ScmActor>(a: &mut A) -> io::Result<()> {
     match a.control_stop() {
         Err(e) if e.raw_os_error() == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL) => {
@@ -130,9 +131,19 @@ fn control_stop_or_underway<A: ScmActor>(a: &mut A) -> io::Result<()> {
                 ))),
             }
         }
+        Err(e) if e.raw_os_error() == Some(ERROR_INVALID_SERVICE_CONTROL) => {
+            if a.query_status()?.state == QueriedState::StartPending {
+                return Err(io::Error::other(STARTING));
+            }
+            Err(e)
+        }
         other => other,
     }
 }
+
+/// What a STOP refused with 1052 while SCM starts the service is told, as a recovery restart does
+/// until the new shim reports `RUNNING`. SCM drops that STOP: nothing queues it (P13c).
+const STARTING: &str = "SCM is starting the service (for example a restart after a failure), so the STOP was not delivered and is not queued. The service will come up running; run `stop` again once it is running";
 
 /// The wait half of a stop: the `Stopped`-mask arm is already in place. Re-arms after every
 /// non-terminal callback.

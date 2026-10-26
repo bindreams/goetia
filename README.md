@@ -726,7 +726,9 @@ Windows restarts a daemon through the service manager's recovery actions, for
 reports how it ended as the service's exit, and exits. With `restart: on-failure`
 SCM then starts a new shim after `restart-delay` (1s by default), and that shim
 reads the spec as installed, so a daemon restarted after `goetia daemon install`
-runs the updated spec. A shim that is killed or crashes is restarted too. A
+runs the updated spec. A shim that is killed or crashes once it has connected to
+SCM is restarted too; one that dies before it connects (an early crash, or a
+dispatcher connect that fails) is not, and `start` reports the failure. A
 clean exit is never restarted, and a stop reports a clean exit. SCM stores
 `restart-delay` in whole milliseconds, so a finer delay (`1500us`) is rounded up
 (`2ms`), with a warning.
@@ -815,8 +817,12 @@ start it again itself under its restart policy, and to run the `start` again
 once the service has stopped; it does not queue a start behind the stop. A
 `stop` waits for the stopping to finish and then exits `0`. A `stop` of a
 running service that does not accept one fails and names `goetia daemon kill`;
-it does not wait. SCM treats the `STOPPED` that follows as it would one that
-follows `running`: a failure is restarted per `restart:`, a stop is not.
+it does not wait. A `stop` (or the stop of a `restart`) that arrives while SCM is
+starting the service, as in a restart after a failure, fails and says the STOP
+was not delivered and is not queued, that the service will come up running, and
+to run `stop` again once it is running. SCM treats the `STOPPED` that follows as
+it would one that follows `running`: a failure is restarted per `restart:`, a
+stop is not.
 
 Nothing guards against a possible survivor afterwards: `stop` exits `0`,
 including the `stop` that produced the record, and a later `start`, `restart` or

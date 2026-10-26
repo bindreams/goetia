@@ -110,14 +110,23 @@ pub fn kill_service<T: KillTarget>(target: &mut T) -> io::Result<Killed> {
         }
         match target.terminate(&process)? {
             Termination::Terminated => {
-                target.await_exit(&process)?;
-                await_scm_released(target, pid)?;
+                target.await_exit(&process).map_err(|e| terminated_but(pid, e))?;
+                await_scm_released(target, pid).map_err(|e| terminated_but(pid, e))?;
                 return Ok(Killed::Terminated);
             }
             // As for `Ok(None)` above: gone, and not yet recorded by SCM.
             Termination::AlreadyExited => await_scm_released(target, pid)?,
         }
     }
+}
+
+/// `e`, an error from the waits after the termination of `pid` was delivered: the process is dead
+/// and only the wait for SCM to record that failed, so the error must not read as a failed kill.
+fn terminated_but(pid: u32, e: io::Error) -> io::Error {
+    io::Error::new(
+        e.kind(),
+        format!("process {pid} was terminated, but waiting for SCM to record the exit failed: {e}"),
+    )
 }
 
 /// Block until SCM no longer reports `pid` as the service's process: it shows none, or a different
