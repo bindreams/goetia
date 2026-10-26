@@ -762,10 +762,12 @@ type is unknown. `goetia daemon install` over a service that a failed
 needs `goetia daemon kill <id>` first; `sc.exe stop` fails the same way. A
 service someone else already marked for deletion is not disabled; if it will not
 stop, the error says so, and it is removed once it stops and its last handle
-closes. SCM no longer reports changes to a service marked for deletion, so
-`start`, `stop`, `uninstall` and `kill` decide on the state they read: the state
-they wait for ends the wait, and any other is an error that says the service is
-marked for deletion.
+closes. SCM can refuse to watch a service marked for deletion (measured: a
+re-arm that excludes `STOPPED`, on a `STOPPED` service), so `start`, `stop`,
+`uninstall` and `kill` then decide on the state they read: the state they wait
+for ends the wait, and any other is an error that says SCM refused to watch the
+service because it is marked for deletion. A service deleted while a `stop` or
+`uninstall` waits counts as stopped.
 
 After upgrading goetia, run `goetia daemon install` again for every daemon
 installed by an older version. `type: simple` services registered before this

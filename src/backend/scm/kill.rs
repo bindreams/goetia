@@ -75,9 +75,10 @@ pub trait KillTarget {
     /// reused until the registration has been woken or cancelled, so this is called only with none
     /// outstanding: after an [`Self::await_release`] or a [`Self::cancel_release`].
     ///
-    /// SCM refuses to watch a marked service it recorded `STOPPED`; that is [`ReleaseWatch::Stopped`],
-    /// with nothing registered. A marked service in any other state cannot be watched either, which
-    /// is an error: nothing will wake the kill.
+    /// SCM refused to watch a marked service it recorded `STOPPED` (round 8: a re-arm whose mask
+    /// excludes `STOPPED`); that is [`ReleaseWatch::Stopped`], with nothing registered, as is a service
+    /// found deleted. A marked service refused in any other state is an error: nothing will wake the
+    /// kill.
     fn arm_release(&mut self) -> io::Result<ReleaseWatch>;
 
     /// Block until the registration [`Self::arm_release`] made wakes. Unbounded.
@@ -292,9 +293,11 @@ mod system {
                 // The status is not used: `await_scm_released` reads the service's pid after every
                 // arm, which is what decides.
                 Armed::Registered(_) => Ok(ReleaseWatch::Armed),
-                // SCM no longer reports a marked service's changes, so no wake is coming. `STOPPED` is
-                // its record of the exit, which is what the registration was for.
+                // SCM refused to watch the marked service, so no wake is coming. `STOPPED` is its
+                // record of the exit, which is what the registration was for. A deleted service was
+                // stopped when its last handle closed.
                 Armed::Unwatchable(status) if status.state == QueriedState::Stopped => Ok(ReleaseWatch::Stopped),
+                Armed::Gone => Ok(ReleaseWatch::Stopped),
                 Armed::Unwatchable(status) => Err(marked_for_deletion(status.state)),
                 Armed::Expired => unreachable!("an unbounded deadline does not expire"),
             }

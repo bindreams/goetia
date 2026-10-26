@@ -73,6 +73,8 @@ struct FakeScm {
     shifts: Vec<(&'static str, QueriedState)>,
     /// The states in which SCM refuses an `arm` with 1072 (`ERROR_SERVICE_MARKED_FOR_DELETE`).
     refusing: &'static [QueriedState],
+    /// The n-th `arm` (1-based) meets a service that is gone: opening its fresh handle failed with 1060.
+    gone_at_arm: Option<usize>,
 }
 
 /// What a scripted `control_stop` answers.
@@ -111,6 +113,7 @@ impl FakeScm {
             at_once: None,
             shifts: vec![],
             refusing: &[],
+            gone_at_arm: None,
         }
     }
 
@@ -131,10 +134,18 @@ impl FakeScm {
     }
 
     /// SCM refuses an `arm` with 1072 while the service is in one of `states`: it is marked for
-    /// deletion and cannot be watched. Round 8 measured it in `STOPPED`; arms in `RUNNING` and the
-    /// pending states returned 0 (P22b, P22d), so a test of another state is a model, not a measurement.
+    /// deletion. Round 8 measured it for a re-arm excluding `STOPPED` in `STOPPED`; arms in `RUNNING` and
+    /// the pending states returned 0 (P13, P22b, P22d), so a test of another state is a model, not a
+    /// measurement.
     fn refusing_arms_in(mut self, states: &'static [QueriedState]) -> Self {
         self.refusing = states;
+        self
+    }
+
+    /// The `n`-th `arm` (1-based) finds the service deleted: the cancel of the registration before it
+    /// could not open a fresh handle (1060).
+    fn gone_at_arm(mut self, n: usize) -> Self {
+        self.gone_at_arm = Some(n);
         self
     }
 
@@ -322,6 +333,10 @@ impl ScmActor for FakeScm {
             WantState::RunningPausedOrStopped => "arm_settle",
             WantState::StoppedOnly => "arm_stopped_only",
         });
+        if Some(self.arm_count()) == self.gone_at_arm {
+            self.armed = false;
+            return Ok(Armed::Gone);
+        }
         // An unconsumed registration is cancelled by reopening the handles, as `SystemScmActor` does.
         if std::mem::take(&mut self.armed) {
             self.fresh_handle = true;
@@ -1732,7 +1747,7 @@ fn an_arm_refused_on_a_marked_service_that_is_not_where_the_wait_wants_it_is_an_
     ];
     for (name, err) in errors {
         let text = err.to_string();
-        for part in ["marked for deletion", "no longer reports"] {
+        for part in ["marked for deletion", "refused to watch"] {
             assert!(text.contains(part), "{name}: missing {part:?}: {text}");
         }
     }
@@ -1755,9 +1770,36 @@ fn a_start_wait_is_confirmed_by_the_running_status_of_an_arm_refused_on_a_marked
 fn the_error_for_a_marked_service_names_the_state_read() {
     let text = marked_for_deletion(QueriedState::StopPending).to_string();
     assert!(
-        text.contains("marked for deletion") && text.contains("StopPending"),
+        text.contains("refused to watch") && text.contains("marked for deletion") && text.contains("StopPending"),
         "{text}"
     );
+    assert!(!text.contains("no longer reports"), "{text}");
+}
+
+/// A cancel that finds the service deleted (the open of its fresh handle met 1060) ends a stop wait as
+/// confirmed, as the delete that follows would.
+#[skuld::test]
+fn a_stop_wait_reads_a_service_gone_at_an_arm_as_stopped() {
+    let mut fake = FakeScm::new([Some(Observed::Pending)]).gone_at_arm(2);
+    assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        fake.log,
+        vec!["control_stop", "arm_stopped", "wait", "got_pending", "arm_stopped_only"]
+    );
+
+    let mut fake = FakeScm::new([Some(Observed::Pending)]).gone_at_arm(2);
+    assert_eq!(settle_and_stop(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(fake.log, vec!["arm_settle", "wait", "got_pending", "arm_settle"]);
+}
+
+/// A start is for `RUNNING`: a service that is gone is not that.
+#[skuld::test]
+fn a_start_wait_reads_a_service_gone_at_an_arm_as_an_error() {
+    let mut fake = FakeScm::new([Some(Observed::Pending)]).gone_at_arm(2);
+    let text = start_via_notify(&mut fake, unbounded(), Kind::Simple)
+        .unwrap_err()
+        .to_string();
+    assert!(text.contains("no longer exists"), "{text}");
 }
 
 // handle teardown -----------------------------------------------------------------------------------------------------
@@ -1806,6 +1848,100 @@ fn nothing_is_drained_when_no_registration_is_outstanding() {
     let mut fake = FakeHandles::new(false);
     close_then_drain(&mut fake);
     assert_eq!(fake.log, vec!["close"]);
+}
+
+/// A service marked for deletion, held by the actor's handles; it is deleted when the last closes.
+struct FakeSession {
+    log: Vec<&'static str>,
+    /// Open handles to the service: the actor's own before the cancel.
+    open: usize,
+    /// Whether closing the last handle deletes the service, as for a marked, `STOPPED` one (P12a).
+    marked_stopped: bool,
+    deleted: bool,
+    /// The error opening a fresh handle meets regardless of the service, if any.
+    open_error: Option<i32>,
+}
+
+impl FakeSession {
+    fn new(marked_stopped: bool) -> Self {
+        Self {
+            log: vec![],
+            open: 1,
+            marked_stopped,
+            deleted: false,
+            open_error: None,
+        }
+    }
+}
+
+impl ScmHandles for FakeSession {
+    fn close_handles(&mut self) {
+        self.log.push("close");
+        self.open -= 1;
+        if self.open == 0 && self.marked_stopped {
+            self.deleted = true;
+        }
+    }
+    fn registration_outstanding(&self) -> bool {
+        true
+    }
+    fn drain_queued_apc(&mut self) {
+        self.log.push("drain");
+    }
+}
+
+impl ReopenHandles for FakeSession {
+    type Fresh = ();
+    fn open_fresh(&mut self) -> std::io::Result<()> {
+        if self.deleted {
+            self.log.push("open_failed");
+            return Err(std::io::Error::from_raw_os_error(1060));
+        }
+        if let Some(code) = self.open_error {
+            self.log.push("open_failed");
+            return Err(std::io::Error::from_raw_os_error(code));
+        }
+        self.log.push("open");
+        self.open += 1;
+        Ok(())
+    }
+    fn install(&mut self, (): ()) {
+        self.log.push("install");
+    }
+}
+
+/// P12a, P13a/b: closing the last handle to a marked, `STOPPED` service deletes it, so the fresh handle
+/// is opened while the old one still holds the service. Closing first fails here with 1060.
+#[skuld::test]
+fn cancelling_a_registration_opens_the_fresh_handles_before_it_closes_the_old() {
+    let mut fake = FakeSession::new(true);
+    assert_eq!(cancel_registration(&mut fake).unwrap(), Cancelled::Reopened);
+    assert!(!fake.deleted, "the cancel deleted the service");
+    assert_eq!(fake.open, 1);
+    // The old handles still close before the drain (`close_then_drain`).
+    assert_eq!(fake.log, vec!["open", "close", "drain", "install"]);
+}
+
+/// Opening the fresh handle meets 1060: the service is gone. The old handles are closed and drained,
+/// nothing is installed, and the caller is told.
+#[skuld::test]
+fn a_cancel_whose_fresh_open_meets_1060_reports_the_service_gone() {
+    let mut fake = FakeSession::new(false);
+    fake.open_error = Some(1060);
+    assert_eq!(cancel_registration(&mut fake).unwrap(), Cancelled::ServiceGone);
+    assert_eq!(fake.log, vec!["open_failed", "close", "drain"]);
+}
+
+/// Any other error leaves the old handles and their registration as they were, for the actor's own
+/// teardown to close and drain.
+#[skuld::test]
+fn a_cancel_whose_fresh_open_fails_otherwise_touches_nothing() {
+    let mut fake = FakeSession::new(false);
+    fake.open_error = Some(5); // ERROR_ACCESS_DENIED
+    let err = cancel_registration(&mut fake).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(5));
+    assert_eq!(fake.log, vec!["open_failed"]);
+    assert_eq!(fake.open, 1);
 }
 
 // the already-running (1056) decision ---------------------------------------------------------------------------------

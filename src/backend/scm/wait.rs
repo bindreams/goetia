@@ -86,10 +86,12 @@ pub enum Armed {
     /// The notification is registered. The status was read after the registration, so a state that
     /// is already current is seen here and not waited for.
     Registered(QueriedStatus),
-    /// SCM refused the registration with `ERROR_SERVICE_MARKED_FOR_DELETE`: it no longer reports a
-    /// marked service's changes. Nothing is registered, and the status read in its place is all there
-    /// is to decide on.
+    /// SCM refused the registration with `ERROR_SERVICE_MARKED_FOR_DELETE`. Nothing is registered, and
+    /// the status read in its place is all there is to decide on.
     Unwatchable(QueriedStatus),
+    /// Cancelling the earlier registration found the service deleted (`ERROR_SERVICE_DOES_NOT_EXIST`
+    /// opening the fresh handle). Nothing is registered and no status can be read.
+    Gone,
 }
 
 /// The granular SCM operations [`stop_via_notify`]/[`start_via_notify`] need,
@@ -112,13 +114,16 @@ pub trait ScmActor {
     /// status and on the notifications that follow. A caller that issues none may ignore the status of
     /// its first arm on a fresh actor: it fires at once itself.
     ///
-    /// SCM refuses the registration of a service marked for deletion that is `STOPPED` with
-    /// `ERROR_SERVICE_MARKED_FOR_DELETE` (round 8), and arms in other states were accepted (P22b,
-    /// P22d). That refusal is [`Armed::Unwatchable`] with the status read in its place.
+    /// SCM refused a re-arm whose mask excludes `STOPPED`, on a marked `STOPPED` service, with
+    /// `ERROR_SERVICE_MARKED_FOR_DELETE` (round 8); arms on marked `RUNNING` or pending services, and
+    /// an arm whose mask includes `STOPPED` on a marked `STOPPED` one, were accepted (P13, P22a-d).
+    /// That refusal is [`Armed::Unwatchable`] with the status read in its place.
     ///
     /// An `arm` over a registration no [`Self::wait_callback`] has consumed cancels that one first,
     /// as a caller that acts on the status leaves one behind. The registration reports into a
-    /// buffer that cannot be reused until it has fired or been cancelled.
+    /// buffer that cannot be reused until it has fired or been cancelled. The cancel opens the fresh
+    /// handles before it closes the old: closing the last handle to a marked, `STOPPED` service
+    /// deletes it (P12a, P13). If the service is gone anyway, the arm is [`Armed::Gone`].
     ///
     /// `deadline` bounds the one loop here that is not the wait itself: the
     /// `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING` remedy, which reopens both
@@ -254,6 +259,7 @@ const STARTING: &str = "SCM is starting the service (for example a restart after
 ///   restart follows at once.
 /// - SCM refused the arm because the service is marked for deletion ([`Armed::Unwatchable`]): the
 ///   status it returned decides, `STOPPED` as confirmed and any other state as an error.
+/// - the service is gone ([`Armed::Gone`]): confirmed.
 /// - any other state: the service was running or starting again after it began to stop, so the stop
 ///   did not leave it stopped; an error says so, ending in `advice`. It does not wait for the
 ///   restart and does not send a second STOP.
@@ -472,15 +478,18 @@ fn wait_after_stop<A: ScmActor>(a: &mut A, deadline: Deadline, advice: &str) -> 
 
 /// What a wait makes of an [`ScmActor::arm`] before it looks at any status: the registered arm's
 /// status is `Ok`, and every other outcome ends the wait, as `Err(Waited)`. An expired arm is
-/// [`Waited::Expired`]. SCM refuses to watch a service marked for deletion ([`Armed::Unwatchable`]),
+/// [`Waited::Expired`]. SCM refused to watch a service marked for deletion ([`Armed::Unwatchable`]),
 /// so nothing can be waited for and the status read in the arm's place decides: the `wanted` state is
-/// [`Waited::Confirmed`], and any other is the error [`marked_for_deletion`] says.
+/// [`Waited::Confirmed`], and any other is the error [`marked_for_deletion`] says. A service that is gone
+/// ([`Armed::Gone`]) is stopped, so it confirms a wait for `STOPPED` and is [`service_gone`] to any other.
 fn decided_or_status(armed: Armed, wanted: QueriedState) -> io::Result<Result<QueriedStatus, Waited>> {
     match armed {
         Armed::Registered(status) => Ok(Ok(status)),
         Armed::Expired => Ok(Err(Waited::Expired)),
         Armed::Unwatchable(status) if status.state == wanted => Ok(Err(Waited::Confirmed)),
         Armed::Unwatchable(status) => Err(marked_for_deletion(status.state)),
+        Armed::Gone if wanted == QueriedState::Stopped => Ok(Err(Waited::Confirmed)),
+        Armed::Gone => Err(service_gone()),
     }
 }
 
@@ -680,6 +689,46 @@ pub fn close_then_drain<H: ScmHandles>(h: &mut H) {
     }
 }
 
+/// The fresh handles [`cancel_registration`] opens before it closes the old ones.
+pub trait ReopenHandles: ScmHandles {
+    /// What [`Self::open_fresh`] opens, held until [`Self::install`].
+    type Fresh;
+    /// Open handles to the service again. The actor's own handles stay open.
+    fn open_fresh(&mut self) -> io::Result<Self::Fresh>;
+    /// Take `fresh` as the actor's handles. The old ones are already closed.
+    fn install(&mut self, fresh: Self::Fresh);
+}
+
+/// What [`cancel_registration`] came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cancelled {
+    /// The old handles are closed and drained, and the fresh ones installed.
+    Reopened,
+    /// The service no longer exists. The old handles are closed and drained; nothing is installed.
+    ServiceGone,
+}
+
+/// Cancel the registration `h` holds by replacing its handles: the registration ends with them.
+///
+/// The fresh handles are opened BEFORE the old are closed. Closing the last handle to a service marked
+/// for deletion that is `STOPPED` deletes it (P12a, P13a/b), and the open after it would meet
+/// `ERROR_SERVICE_DOES_NOT_EXIST`. The old handles then close and drain in [`close_then_drain`]'s order.
+/// A 1060 from the open is [`Cancelled::ServiceGone`], after the same close and drain; any other error
+/// leaves the old handles and their registration as they were, for the actor's teardown.
+pub fn cancel_registration<H: ReopenHandles>(h: &mut H) -> io::Result<Cancelled> {
+    let fresh = match h.open_fresh() {
+        Ok(fresh) => fresh,
+        Err(e) if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) => {
+            close_then_drain(h);
+            return Ok(Cancelled::ServiceGone);
+        }
+        Err(e) => return Err(e),
+    };
+    close_then_drain(h);
+    h.install(fresh);
+    Ok(Cancelled::Reopened)
+}
+
 /// The state a follow-up `query_status` reported — one variant per
 /// `windows_service::service::ServiceState`, mirrored here so what an
 /// `ERROR_SERVICE_ALREADY_RUNNING` means is a decision about a plain enum and
@@ -731,9 +780,19 @@ pub const ERROR_SERVICE_MARKED_FOR_DELETE: u32 = 1072;
 /// not the one the wait is for.
 pub fn marked_for_deletion(state: QueriedState) -> io::Error {
     io::Error::other(format!(
-        "the service is marked for deletion, so SCM no longer reports its changes; it is {state:?}, not \
-         the state waited for"
+        "SCM refused to watch the service because it is marked for deletion; it is {state:?}, not the \
+         state waited for"
     ))
+}
+
+/// `ERROR_SERVICE_DOES_NOT_EXIST`.
+pub const ERROR_SERVICE_DOES_NOT_EXIST: u32 = 1060;
+
+/// The error for a wait for a state other than `STOPPED` over a service that was deleted meanwhile.
+pub fn service_gone() -> io::Error {
+    io::Error::other(
+        "the service no longer exists (it was deleted while goetia waited), so it cannot reach the state waited for",
+    )
 }
 
 /// The two steps [`register_until_deadline`] drives: one attempt to register

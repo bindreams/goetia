@@ -21,7 +21,7 @@ use windows_sys::Win32::System::Threading::{INFINITE, SleepEx};
 
 use crate::backend::scm::exit_status::RecordedExit;
 
-use super::{Armed, Deadline, Observed, QueriedState, QueriedStatus, Registration, StartReply, WantState};
+use super::{Armed, Cancelled, Deadline, Observed, QueriedState, QueriedStatus, Registration, StartReply, WantState};
 
 /// `windows-service`'s `Error` does not implement `Into<io::Error>` for
 /// every variant (it also carries parse errors this module never
@@ -227,17 +227,18 @@ impl SystemScmActor {
     }
 
     /// Cancel a registration no `wait_callback` has consumed, before the next `arm` reuses its buffer.
-    /// The registration ends with its handle, so this closes and drains as at teardown, then opens
-    /// new handles. A reopened handle's first arm fires at once for a current state in its mask
-    /// (P27 f); every caller decides on the status `arm` returns, so that is harmless. An actor whose
-    /// handles are already gone is left alone, so its next `arm` reports that it is inert.
-    fn cancel_unconsumed(&mut self) -> io::Result<()> {
+    /// The registration ends with its handle, so this replaces the handles through
+    /// [`super::cancel_registration`], which opens the new before it closes the old. A reopened
+    /// handle's first arm fires at once for a current state in its mask (P27 f); every caller decides
+    /// on the status `arm` returns, so that is harmless. An actor whose handles are already gone is
+    /// left alone, so its next `arm` reports that it is inert.
+    fn cancel_unconsumed(&mut self) -> io::Result<Cancelled> {
         if !self.registration_outstanding || self.service.is_none() {
-            return Ok(());
+            return Ok(Cancelled::Reopened);
         }
-        self.close_and_drain();
+        let cancelled = super::cancel_registration(self)?;
         self.registration_outstanding = false;
-        super::NotifyRegistrar::reopen(self)
+        Ok(cancelled)
     }
 }
 
@@ -272,6 +273,27 @@ impl super::ScmHandles for SystemScmActor {
     }
 }
 
+/// The handles [`super::cancel_registration`] and the lag remedy open.
+pub struct Fresh {
+    scm: WinServiceManager,
+    service: Service,
+}
+
+impl super::ReopenHandles for SystemScmActor {
+    type Fresh = Fresh;
+
+    fn open_fresh(&mut self) -> io::Result<Fresh> {
+        let scm = open_scm()?;
+        let service = open_handle(&scm, &self.name)?;
+        Ok(Fresh { scm, service })
+    }
+
+    fn install(&mut self, fresh: Fresh) {
+        self.scm = Some(fresh.scm);
+        self.service = Some(fresh.service);
+    }
+}
+
 impl Drop for SystemScmActor {
     fn drop(&mut self) {
         self.close_and_drain();
@@ -296,17 +318,17 @@ impl super::NotifyRegistrar for SystemScmActor {
     /// (closed via `Drop` when replaced) stay valid until their
     /// replacements are confirmed open.
     fn reopen(&mut self) -> io::Result<()> {
-        let scm = open_scm()?;
-        let service = open_handle(&scm, &self.name)?;
-        self.scm = Some(scm);
-        self.service = Some(service);
+        let fresh = super::ReopenHandles::open_fresh(self)?;
+        super::ReopenHandles::install(self, fresh);
         Ok(())
     }
 }
 
 impl super::ScmActor for SystemScmActor {
     fn arm(&mut self, want: WantState, deadline: Deadline) -> io::Result<Armed> {
-        self.cancel_unconsumed()?;
+        if self.cancel_unconsumed()? == Cancelled::ServiceGone {
+            return Ok(Armed::Gone);
+        }
         self.awaiting = want;
         self.status.fired.store(false, Ordering::Release);
         *self.notify = SERVICE_NOTIFY_2W {
@@ -318,8 +340,8 @@ impl super::ScmActor for SystemScmActor {
         match super::register_until_deadline(self, deadline)? {
             Registration::Registered => {}
             Registration::Expired => return Ok(Armed::Expired),
-            // SCM no longer reports a marked service's changes. The status read in place of the
-            // registration is what the caller decides on; nothing is outstanding.
+            // SCM refused to watch the marked service. The status read in place of the registration is
+            // what the caller decides on; nothing is outstanding.
             Registration::MarkedForDelete => return Ok(Armed::Unwatchable(super::ScmActor::query_status(self)?)),
         }
         // A notification may now be queued (immediately, if the
