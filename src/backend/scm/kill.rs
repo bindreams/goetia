@@ -54,9 +54,11 @@ pub trait KillTarget {
     /// Block until `process` has exited. Unbounded: the exit is the event.
     fn await_exit(&mut self, process: &Self::Process) -> io::Result<()>;
 
-    /// Register to be woken when SCM records the service `STOPPED`. A registration made while the
-    /// service is already `STOPPED` wakes at once; one made on any other state does not wake until
-    /// the next entry into `STOPPED`.
+    /// Register to be woken when SCM records the service `STOPPED`. A first registration on a fresh
+    /// handle made while the service is already `STOPPED` wakes at once; one made on any other state
+    /// does not wake until the next entry into `STOPPED`, and neither does a re-arm with the same
+    /// context and buffer on the same handle, whatever the state (P27 a). So the caller reads the
+    /// service after every arm, as [`kill_service`] does, and does not rely on a wake.
     ///
     /// SCM allows one registration per service handle, and the buffer it reports into cannot be
     /// reused until the registration has been woken or cancelled, so this is called only with none
@@ -167,7 +169,7 @@ mod system {
         INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
     };
 
-    use crate::backend::scm::wait::{ScmActor, SystemScmActor, Waited, WantState};
+    use crate::backend::scm::wait::{Armed, ScmActor, SystemScmActor, WantState};
     use crate::manager::budget::Budget;
 
     use super::privilege::DebugPrivilege;
@@ -260,8 +262,10 @@ mod system {
                 .notifier()?
                 .arm(WantState::StoppedOnly, Budget::Unbounded.start())?
             {
-                Waited::Confirmed => Ok(()),
-                Waited::Expired => unreachable!("an unbounded deadline does not expire"),
+                // The status is not used: `await_scm_released` reads the service's pid after every
+                // arm, which is what decides.
+                Armed::Registered(_) => Ok(()),
+                Armed::Expired => unreachable!("an unbounded deadline does not expire"),
             }
         }
 
