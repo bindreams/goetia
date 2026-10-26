@@ -1,6 +1,6 @@
 //! THROWAWAY (issue #59, phase A): measures how the Windows SCM treats a
 //! service's reported exit, so the shim's design rests on measurements.
-//! Round 10: P23 (a disable that lands while SCM's restart attempt is in flight). Earlier rounds' probes stay in the file, unused. Never merges. Every observation is a `PROBE ...` line in the job log.
+//! Round 11: P22d (arming a mask that excludes a pending state on a delete-marked service) and P24 (re-arm after a STOP rejected in START_PENDING). Earlier rounds' probes stay in the file, unused. Never merges. Every observation is a `PROBE ...` line in the job log.
 //!
 //! This binary is also the service host: `<exe> --probe-host <name> <port> <scripts>`
 //! where `<scripts>` is `|`-separated, one script per run of the service
@@ -2870,25 +2870,195 @@ mod probes {
         r
     }
 
+    // P22d, P24 =======================================================================================================
+
+    /// Samples per case in round 11.
+    const R11_SAMPLES: u32 = 5;
+
+    /// Runs `sample` `R11_SAMPLES` times, each with its own service; a panic costs that sample only.
+    fn r11_samples(label: &str, sample: fn(&str) -> String) -> String {
+        let mut out = Vec::new();
+        for i in 1..=R11_SAMPLES {
+            let tag = format!("{label}s{i}");
+            let r = match catch_unwind(AssertUnwindSafe(|| sample(&tag))) {
+                Ok(r) => r,
+                Err(e) => format!("PROBE-ERROR (panic) {:?}", panic_text(&e)),
+            };
+            out.push(format!("#{i}: {r}"));
+        }
+        out.join(" || ")
+    }
+
+    /// Opens a handle on the (marked) service for a post-mark arm; the open's outcome is logged.
+    fn open_for_arm(p: &Probe, what: &str) -> Option<Service> {
+        match manager().open_service(&p.name, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS) {
+            Ok(s) => {
+                p.p(format_args!("{what}: OpenService after the mark ok"));
+                Some(s)
+            }
+            Err(windows_service::Error::Winapi(e)) => {
+                p.p(format_args!(
+                    "{what}: OpenService after the mark error {:?} ({e})",
+                    e.raw_os_error()
+                ));
+                None
+            }
+            Err(e) => {
+                p.p(format_args!("{what}: OpenService after the mark error {e:?}"));
+                None
+            }
+        }
+    }
+
+    /// The host's own START_PENDING (checkpoint 1) is recorded, not SCM's initial one.
+    fn wait_host_start_pending(h: &Service) {
+        while raw_query(h).is_ok_and(|s| {
+            s.dwCurrentState == Services::SERVICE_STOPPED
+                || (s.dwCurrentState == Services::SERVICE_START_PENDING && s.dwCheckPoint == 0)
+        }) {
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// P22d: the service is delete-marked while the host holds a pending state; arm
+    /// `RUNNING|PAUSED|STOPPED` (excluding that state) on a handle opened before the mark and on one
+    /// opened after it; then release the host and see whether the next state is delivered.
+    /// `stop_pending`: the host holds STOP_PENDING; else START_PENDING (checkpoint 1).
+    fn p22d(stop_pending: bool, tag: &str) -> String {
+        let script = if stop_pending {
+            "run,connect,wait-stop,stoppending,signal-wait,stopped:w32:0"
+        } else {
+            "pending,signal-wait,run,connect,wait-stop,stopped:w32:0"
+        };
+        let mut p = Probe::with_observers(tag, script, "", false);
+        let go = Signal::create(&p.name);
+        let _ = p.start();
+        // h: opened before the mark and kept; hd: the handle that deletes, also kept.
+        let h = p.service(ServiceAccess::STOP | ServiceAccess::QUERY_STATUS);
+        let hd = p.service(ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS);
+        if stop_pending {
+            p.connect(0, EXPECTED_BOUND);
+            wait_state_via(&h, Services::SERVICE_RUNNING, EXPECTED_BOUND);
+            p.p(format_args!("ControlService(STOP) -> {}", control_stop(&h)));
+            let reached = wait_state_via(&h, Services::SERVICE_STOP_PENDING, EXPECTED_BOUND);
+            p.p(format_args!("STOP_PENDING reached: {reached}"));
+        } else {
+            wait_host_start_pending(&h);
+        }
+        p.p(format_args!("status before the mark: {}", query_via(&h)));
+        let del = hd.delete().map_err(|e| format!("{e:?}"));
+        p.p(format_args!(
+            "DeleteService via hd -> {del:?}; status via h: {}",
+            query_via(&h)
+        ));
+        let mask = N_RUNNING | N_PAUSED | N_STOPPED;
+        let (rc_old, ctx_old) = register_notify(&p, &h, mask);
+        p.p(format_args!("arm on h (opened before the mark) -> {rc_old}"));
+        let h_new = open_for_arm(&p, "post-mark handle");
+        let new_arm = h_new.as_ref().map(|s| {
+            let (rc, ctx) = register_notify(&p, s, mask);
+            p.p(format_args!("arm on the post-mark handle -> {rc}"));
+            (rc, ctx)
+        });
+        p.p(format_args!("status before the release: {}", query_via(&h)));
+        go.fire();
+        p.p(format_args!("host released"));
+        let d_old = rc_old == 0 && await_notify(ctx_old, ATTENDED_WINDOW);
+        let d_new = new_arm.map(|(rc, ctx)| rc == 0 && await_notify(ctx, ATTENDED_WINDOW));
+        let new_rc = new_arm.map(|(rc, _)| rc);
+        p.p(format_args!(
+            "old-handle arm rc {rc_old}, delivered {d_old} (state {}, notification_status {}); post-mark arm rc {new_rc:?} delivered {d_new:?}; status via h: {}",
+            ctx_old.last.load(Ordering::SeqCst),
+            ctx_old.err.load(Ordering::SeqCst),
+            query_via(&h)
+        ));
+        if !stop_pending {
+            // Back to STOPPED for the clean-up.
+            wait_state_via(&h, Services::SERVICE_RUNNING, EXPECTED_BOUND);
+            p.p(format_args!("ControlService(STOP) -> {}", control_stop(&h)));
+        }
+        let stopped = wait_state_via(&h, Services::SERVICE_STOPPED, EXPECTED_BOUND);
+        p.p(format_args!("stopped {stopped}; {}", query_via(&h)));
+        let r = format!(
+            "delete {del:?}; old arm rc {rc_old} delivered {d_old} (state {}); post-mark open {}, arm rc {new_rc:?} delivered {d_new:?}",
+            ctx_old.last.load(Ordering::SeqCst),
+            h_new.is_some(),
+        );
+        p.result(&r);
+        p.dump_scm_events(tag);
+        r
+    }
+
+    /// P24: a STOP rejected during START_PENDING, then a re-arm of `RUNNING|PAUSED|STOPPED` (as
+    /// `uninstall`'s settle loop does), the host released to RUNNING, a STOP, and a window for a
+    /// recovery restart (`restart/0`, `failureflag` 1; the second script would connect back).
+    fn p24(tag: &str) -> String {
+        let script = "pending,signal-wait,run,connect,wait-stop,stopped:w32:0";
+        let mut p = Probe::with_observers(tag, &format!("{script}|{STAY_UP}"), "restart/0", false);
+        let go = Signal::create(&p.name);
+        let _ = p.start();
+        let h = p.service(ServiceAccess::STOP | ServiceAccess::QUERY_STATUS);
+        wait_host_start_pending(&h);
+        p.p(format_args!("status before the first STOP: {}", query_via(&h)));
+        let stop1 = control_stop(&h);
+        p.p(format_args!("ControlService(STOP) during START_PENDING -> {stop1}"));
+        let (rc, ctx) = register_notify(&p, &h, N_RUNNING | N_PAUSED | N_STOPPED);
+        p.p(format_args!("re-arm (RUNNING|PAUSED|STOPPED) -> {rc}"));
+        go.fire();
+        p.p(format_args!("host released"));
+        let delivered = rc == 0 && await_notify(ctx, EXPECTED_BOUND);
+        p.p(format_args!(
+            "re-arm delivered {delivered} (state {}, notification_status {}); status {}",
+            ctx.last.load(Ordering::SeqCst),
+            ctx.err.load(Ordering::SeqCst),
+            query_via(&h)
+        ));
+        let running = wait_state_via(&h, Services::SERVICE_RUNNING, EXPECTED_BOUND);
+        let c0 = p.connect(0, EXPECTED_BOUND).cloned();
+        p.p(format_args!(
+            "RUNNING reached {running}; run 0 {}; status {}",
+            describe(c0.as_ref(), EXPECTED_BOUND),
+            query_via(&h)
+        ));
+        let stop2 = control_stop(&h);
+        p.p(format_args!("ControlService(STOP) after RUNNING -> {stop2}"));
+        let stopped = wait_state_via(&h, Services::SERVICE_STOPPED, EXPECTED_BOUND);
+        p.p(format_args!("stopped {stopped}; {}", query_via(&h)));
+        // Attended window for a recovery restart (the second script connects back).
+        let c1 = p.connect(1, ATTENDED_WINDOW).cloned();
+        p.p(format_args!(
+            "{}s after STOPPED: {}; status {}",
+            ATTENDED_WINDOW.as_secs(),
+            describe(c1.as_ref(), ATTENDED_WINDOW),
+            query_via(&h)
+        ));
+        dump_host_trace(&p, "end");
+        let r = format!(
+            "STOP#1 {stop1}; re-arm rc {rc} delivered {delivered} (state {}); RUNNING {running}; STOP#2 {stop2}; stopped {stopped}; restart: {}",
+            ctx.last.load(Ordering::SeqCst),
+            describe(c1.as_ref(), ATTENDED_WINDOW)
+        );
+        p.result(&r);
+        p.dump_scm_events(tag);
+        r
+    }
+
     // Driver ==========================================================================================================
 
     pub fn run_all() {
         // Sequential: the System-log events of a probe must be its own.
         type Job = Box<dyn FnOnce() -> String + Send>;
-        let mut jobs: Vec<(String, Job)> = vec![(
-            "P23base".to_string(),
-            Box::new(|| p23("base".to_string(), P23Kind::Baseline, 10)),
-        )];
-        for ms in 0..=20u64 {
-            jobs.push((
-                format!("P23o{ms:02}"),
-                Box::new(move || p23(format!("o{ms:02}"), P23Kind::DisableAfterMs(ms), 8)),
-            ));
-        }
-        jobs.push((
-            "P23b".to_string(),
-            Box::new(|| p23("b".to_string(), P23Kind::DisableAtStartPending, 10)),
-        ));
+        let jobs: Vec<(String, Job)> = vec![
+            (
+                "P22d-stop-pending".to_string(),
+                Box::new(|| r11_samples("P22dSTOP", |t| p22d(true, t))),
+            ),
+            (
+                "P22d-start-pending".to_string(),
+                Box::new(|| r11_samples("P22dSTART", |t| p22d(false, t))),
+            ),
+            ("P24".to_string(), Box::new(|| r11_samples("P24", p24))),
+        ];
         println!("PROBE SUMMARY begin");
         for (name, job) in jobs {
             let res = thread::spawn(move || catch_unwind(AssertUnwindSafe(job))).join();
