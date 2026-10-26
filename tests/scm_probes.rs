@@ -1,6 +1,6 @@
 //! THROWAWAY (issue #59, phase A): measures how the Windows SCM treats a
 //! service's reported exit, so the shim's design rests on measurements.
-//! Round 13: P26 (a STOP_PENDING held past its wait hint). Earlier rounds' probes stay in the file, unused. Never merges. Every observation is a `PROBE ...` line in the job log.
+//! Round 14: P27 (a re-arm on an unchanged state that is in the mask). Earlier rounds' probes stay in the file, unused. Never merges. Every observation is a `PROBE ...` line in the job log.
 //!
 //! This binary is also the service host: `<exe> --probe-host <name> <port> <scripts>`
 //! where `<scripts>` is `|`-separated, one script per run of the service
@@ -291,7 +291,7 @@ mod probes {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-    use std::sync::{Arc, mpsc};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -3253,6 +3253,263 @@ mod probes {
         r
     }
 
+    // P27 =============================================================================================================
+
+    const P27_MASK: u32 = N_RUNNING | N_PAUSED | N_STOPPED;
+
+    /// Time base of the `t=` stamps: moved to each arm, so a delivery is stamped relative to the
+    /// arm before it (negative: before it).
+    struct ArmClock {
+        origin: Instant,
+        base_ns: AtomicU64,
+        arm: AtomicU32,
+    }
+
+    impl ArmClock {
+        fn rebase(&self, arm: u32) {
+            self.base_ns
+                .store(self.origin.elapsed().as_nanos() as u64, Ordering::SeqCst);
+            self.arm.store(arm, Ordering::SeqCst);
+        }
+    }
+
+    /// Leaked: the SCM may still hold a pointer to it. Deliveries run in the arming thread's
+    /// alertable waits.
+    struct P27Ctx {
+        tag: String,
+        label: &'static str,
+        clock: &'static ArmClock,
+        /// Every delivery's record, in order.
+        records: Mutex<Vec<String>>,
+    }
+
+    impl P27Ctx {
+        fn records(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
+            self.records.lock().unwrap_or_else(|e| e.into_inner())
+        }
+    }
+
+    unsafe extern "system" fn on_notify_p27(p: *const c_void) {
+        // SAFETY: the SCM hands back the SERVICE_NOTIFY_2W registered in `p27_arm`, whose pContext
+        // is a leaked `P27Ctx`.
+        let n = unsafe { &*(p as *const Services::SERVICE_NOTIFY_2W) };
+        let ctx = unsafe { &*(n.pContext as *const P27Ctx) };
+        let us =
+            (ctx.clock.origin.elapsed().as_nanos() as i64 - ctx.clock.base_ns.load(Ordering::SeqCst) as i64) / 1000;
+        let record = format!(
+            "t={us}us since arm#{} triggered={:#x} notification_status={} {}",
+            ctx.clock.arm.load(Ordering::SeqCst),
+            n.dwNotificationTriggered,
+            n.dwNotificationStatus,
+            fmt_raw(&n.ServiceStatus)
+        );
+        let mut records = ctx.records();
+        records.push(record.clone());
+        println!(
+            "PROBE {} wall={} notify[{}] #{} ctx={ctx:p} buf={p:p} {record}",
+            ctx.tag,
+            iso_now(),
+            ctx.label,
+            records.len()
+        );
+    }
+
+    fn p27_ctx(
+        tag: &str,
+        label: &'static str,
+        clock: &'static ArmClock,
+    ) -> (&'static P27Ctx, *mut Services::SERVICE_NOTIFY_2W) {
+        let ctx: &'static P27Ctx = Box::leak(Box::new(P27Ctx {
+            tag: tag.to_string(),
+            label,
+            clock,
+            records: Mutex::new(Vec::new()),
+        }));
+        (ctx, Box::into_raw(Box::default()))
+    }
+
+    /// One `NotifyServiceStatusChangeW` with `P27_MASK` on `svc`. The buffer is rewritten to its
+    /// initial contents first (as P20 did), so a same-buffer re-arm is a clean one. The caller has
+    /// consumed the buffer's previous delivery.
+    fn p27_arm(p: &Probe, svc: &Service, ctx: &'static P27Ctx, buf: *mut Services::SERVICE_NOTIFY_2W, arm: u32) -> u32 {
+        ctx.clock.rebase(arm);
+        // SAFETY: not registered at this point; leaked, so it outlives a registration still pending.
+        unsafe {
+            buf.write(Services::SERVICE_NOTIFY_2W {
+                dwVersion: Services::SERVICE_NOTIFY_STATUS_CHANGE,
+                pfnNotifyCallback: Some(on_notify_p27),
+                pContext: (ctx as *const P27Ctx).cast_mut().cast(),
+                ..Default::default()
+            });
+        }
+        let t = Instant::now();
+        let rc = unsafe { Services::NotifyServiceStatusChangeW(svc.raw_handle(), P27_MASK, buf) };
+        p.p(format_args!(
+            "arm #{arm} (mask {P27_MASK:#x}, {}) ctx={ctx:p} buf={buf:p} -> {rc} after {}us",
+            ctx.label,
+            t.elapsed().as_micros()
+        ));
+        rc
+    }
+
+    /// Alertable waits: a delivery is an APC, run in this thread's alertable wait. `bound` is the
+    /// failure bound of an expected delivery.
+    fn p27_await(ctx: &P27Ctx, n: usize, bound: Duration) -> bool {
+        let deadline = Instant::now() + bound;
+        while ctx.records().len() < n {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            unsafe { SleepEx(100, 1) };
+        }
+        true
+    }
+
+    /// An attended window: the arming thread stays alertable for the whole of it.
+    fn p27_window(window: Duration) {
+        let deadline = Instant::now() + window;
+        while Instant::now() < deadline {
+            unsafe { SleepEx(100, 1) };
+        }
+    }
+
+    /// Until the independent tracer has been delivered RUNNING; at most `bound`.
+    fn p27_await_running(tracer: &NotifyCtx, bound: Duration) -> bool {
+        let deadline = Instant::now() + bound;
+        while tracer.last.load(Ordering::SeqCst) != Services::SERVICE_RUNNING {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            unsafe { SleepEx(100, 1) };
+        }
+        true
+    }
+
+    /// P27: does a second arm on a state that is unchanged and in the mask deliver again? Arm #1
+    /// (mask `RUNNING|PAUSED|STOPPED`) is delivered at once; arm #2 per `case`:
+    /// (a) STOPPED, same context and buffer, 5 s alertable window. (b) as (a), fresh context and
+    /// buffer. (c) the host holds RUNNING, fresh context and buffer, 5 s window. (d) as (a), then
+    /// `StartServiceW` from the arming thread, then an alertable wait until an independent tracer
+    /// (its own handle and thread) sees RUNNING. (e) as (d), but another thread starts the service
+    /// while the arming thread is blocked non-alertably. (f) as (a), arm #2 on a fresh handle.
+    fn p27(tag: &str, case: char) -> String {
+        let script = if case == 'c' {
+            "run,connect,signal-wait,stopped:w32:0"
+        } else {
+            STAY_UP
+        };
+        let mut p = Probe::with_observers(tag, script, "", false);
+        let go = (case == 'c').then(|| Signal::create(&p.name));
+        let h = p.service(ServiceAccess::STOP | ServiceAccess::QUERY_STATUS);
+        if case == 'c' {
+            let _ = p.start();
+            p.connect(0, EXPECTED_BOUND);
+            let running = wait_state_via(&h, Services::SERVICE_RUNNING, EXPECTED_BOUND);
+            p.p(format_args!("host holds RUNNING: {running}; {}", query_via(&h)));
+        } else {
+            p.p(format_args!("never started: {}", query_via(&h)));
+        }
+        let clock: &'static ArmClock = Box::leak(Box::new(ArmClock {
+            origin: Instant::now(),
+            base_ns: AtomicU64::new(0),
+            arm: AtomicU32::new(0),
+        }));
+
+        let (ctx1, buf1) = p27_ctx(&p.tag, "ctx1", clock);
+        let rc1 = p27_arm(&p, &h, ctx1, buf1, 1);
+        let d1 = rc1 == 0 && p27_await(ctx1, 1, EXPECTED_BOUND);
+        p.p(format_args!("arm #1 rc {rc1} delivered {d1}; status {}", query_via(&h)));
+
+        // The independent tracer of (d) and (e): its own handle, thread and context; it has seen
+        // the current state before arm #2.
+        let tracer = matches!(case, 'd' | 'e').then(|| {
+            let ctx: &'static NotifyCtx = Box::leak(Box::new(NotifyCtx {
+                tag: format!("{}-tracer", p.tag),
+                t0: p.t0,
+                last: AtomicU32::new(0),
+                fired: AtomicBool::new(false),
+                err: AtomicU32::new(0),
+                count: AtomicU32::new(0),
+                at_ns: AtomicU64::new(0),
+            }));
+            let run = Arc::new(AtomicBool::new(true));
+            let thread = spawn_notifier(ctx, p.name.clone(), run.clone());
+            let deadline = Instant::now() + EXPECTED_BOUND;
+            while ctx.count.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            p.p(format_args!(
+                "tracer deliveries before arm #2: {}",
+                ctx.count.load(Ordering::SeqCst)
+            ));
+            (ctx, run, thread)
+        });
+
+        let (ctx2, buf2) = if matches!(case, 'b' | 'c') {
+            p27_ctx(&p.tag, "ctx2", clock)
+        } else {
+            (ctx1, buf1)
+        };
+        let from = ctx2.records().len();
+        let h2 = (case == 'f').then(|| p.service(ServiceAccess::STOP | ServiceAccess::QUERY_STATUS));
+        let rc2 = p27_arm(&p, h2.as_ref().unwrap_or(&h), ctx2, buf2, 2);
+
+        let mut steps = Vec::new();
+        match case {
+            'a' | 'b' | 'c' | 'f' => p27_window(ATTENDED_WINDOW),
+            'd' | 'e' => {
+                let (tctx, _, _) = tracer.as_ref().expect("tracer");
+                if case == 'd' {
+                    steps.push(format!("StartService {:?}", p.start()));
+                } else {
+                    let (tx, rx) = mpsc::channel();
+                    let (name, tag, t0) = (p.name.clone(), p.tag.clone(), p.t0);
+                    let starter = thread::spawn(move || {
+                        let r = manager()
+                            .open_service(&name, ServiceAccess::START)
+                            .and_then(|s| s.start::<&str>(&[]))
+                            .map_err(|e| format!("{e:?}"));
+                        println!("PROBE {tag} {} starter thread: StartService returned {r:?}", stamp(t0));
+                        let _ = tx.send(r);
+                    });
+                    // Blocking, not alertable: no delivery runs until the start has returned.
+                    let r = rx.recv();
+                    let _ = starter.join();
+                    p.p(format_args!("starter thread reported {r:?}"));
+                    steps.push(format!("StartService from another thread {r:?}"));
+                }
+                let running = p27_await_running(tctx, EXPECTED_BOUND);
+                p.p(format_args!("tracer saw RUNNING: {running}; status {}", query_via(&h)));
+                steps.push(format!("RUNNING seen by the tracer {running}"));
+                // Arm #2's own delivery may follow the tracer's.
+                p27_window(ATTENDED_WINDOW);
+            }
+            other => panic!("bad case {other}"),
+        }
+        let records: Vec<String> = ctx2.records()[from..].to_vec();
+        let status = query_via(h2.as_ref().unwrap_or(&h));
+        p.p(format_args!(
+            "arm #2 rc {rc2}: {} deliveries; status {status}",
+            records.len()
+        ));
+        if let Some((_, run, thread)) = tracer {
+            run.store(false, Ordering::SeqCst);
+            let _ = thread.join();
+        }
+        if let Some(go) = &go {
+            go.fire();
+            wait_state_via(&h, Services::SERVICE_STOPPED, EXPECTED_BOUND);
+            p.p(format_args!("host released; {}", query_via(&h)));
+        }
+        let r = format!(
+            "case {case}: arm #1 rc {rc1} delivered {d1}; arm #2 rc {rc2}, {} deliveries {records:?}; {}; status {status}",
+            records.len(),
+            steps.join("; ")
+        );
+        p.result(&r);
+        r
+    }
+
     // Driver ==========================================================================================================
 
     pub fn run_all() {
@@ -3260,12 +3517,28 @@ mod probes {
         type Job = Box<dyn FnOnce() -> String + Send>;
         let jobs: Vec<(String, Job)> = vec![
             (
-                "P26a-stop-then-held-stop-pending".to_string(),
-                Box::new(|| r11_samples("P26a", |t| p26(t, "a"))),
+                "P27a-stopped-same-ctx".to_string(),
+                Box::new(|| r11_samples("P27a", |t| p27(t, 'a'))),
             ),
             (
-                "P26b-failure-held-stop-pending".to_string(),
-                Box::new(|| r11_samples("P26b", |t| p26(t, "b"))),
+                "P27b-stopped-fresh-ctx".to_string(),
+                Box::new(|| r11_samples("P27b", |t| p27(t, 'b'))),
+            ),
+            (
+                "P27c-running-fresh-ctx".to_string(),
+                Box::new(|| r11_samples("P27c", |t| p27(t, 'c'))),
+            ),
+            (
+                "P27d-stopped-start-same-thread".to_string(),
+                Box::new(|| r11_samples("P27d", |t| p27(t, 'd'))),
+            ),
+            (
+                "P27e-stopped-start-other-thread".to_string(),
+                Box::new(|| r11_samples("P27e", |t| p27(t, 'e'))),
+            ),
+            (
+                "P27f-stopped-fresh-handle".to_string(),
+                Box::new(|| r11_samples("P27f", |t| p27(t, 'f'))),
             ),
         ];
         println!("PROBE SUMMARY begin");
