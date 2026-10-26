@@ -705,6 +705,8 @@ fn a_stop_failure_on_a_service_marked_by_someone_else_does_not_claim_a_disable()
     let text = uninstall_failure(&UninstallFailure::AlreadyMarked);
     assert!(text.contains("does not accept STOP"), "{text}");
     assert!(text.contains("already marked for deletion"), "{text}");
+    assert!(text.contains("`uninstall` did not delete it"), "{text}");
+    assert!(!text.contains("changed nothing"), "a STOP may have been sent: {text}");
     assert!(text.contains("goetia daemon kill frpc"), "{text}");
     for stale in ["NOT deleted", "disabled", "goetia daemon enable", "goetia daemon start"] {
         assert!(!text.contains(stale), "`{stale}` is false for a marked service: {text}");

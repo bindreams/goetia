@@ -1063,7 +1063,8 @@ enum UninstallFailure {
     Stop { previous: Option<ServiceStartType> },
     /// The delete failed. The service is stopped and disabled; `previous` is its start type before.
     Delete { previous: Option<ServiceStartType> },
-    /// Someone else had marked the service for deletion; `uninstall` changed nothing.
+    /// Someone else had marked the service for deletion, so `uninstall` did not delete it. Its wait
+    /// may already have sent a STOP before it failed.
     AlreadyMarked,
 }
 
@@ -1084,7 +1085,7 @@ fn uninstall_failed_message(id: &Id, cause: &str, state: &UninstallFailure) -> S
         ),
         UninstallFailure::AlreadyMarked => format!(
             "`{id}` could not be stopped ({cause}). It was already marked for deletion by someone else, \
-             so `uninstall` changed nothing. It is removed once it stops and its last handle closes; \
+             so `uninstall` did not delete it. It is removed once it stops and its last handle closes; \
              {kill}"
         ),
     }

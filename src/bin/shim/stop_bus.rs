@@ -2,8 +2,8 @@
 //! service thread, and the composition that lets that thread block on either
 //! "the child exited" or "a stop was requested" without polling.
 //!
-//! Process-tree waiting is `cosca::Child`'s job (see `main.rs`'s module doc
-//! comment); this module supplies the piece `cosca` does not: a way to
+//! Process-tree waiting is `cosca::Child`'s job (`service.rs` spawns and
+//! contains the daemon with it); this module supplies the piece `cosca` does not: a way to
 //! interrupt a blocking `child.wait()` when SCM delivers `Stop`. It also
 //! performs the actual tree teardown once a stop is observed — see
 //! [`StopBus::wait_for_child_or_stop`]'s doc comment for why that has to

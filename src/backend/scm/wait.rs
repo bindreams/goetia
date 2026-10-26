@@ -137,16 +137,20 @@ pub fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result
 /// [`ScmActor::control_stop`], where a stop already under way counts as sent.
 ///
 /// SCM refuses a STOP with 1061 (`ERROR_SERVICE_CANNOT_ACCEPT_CTRL`) or 1052
-/// (`ERROR_INVALID_SERVICE_CONTROL`). Which code goes with which state is measured only in part:
-/// 1061 for `STOP_PENDING` (P18c, P26) and for a second STOP after one was delivered (P16a), 1052
-/// for `START_PENDING` (P13c). Microsoft documents 1052 for a control the service does not accept,
-/// which nothing here has measured for a `RUNNING` service. So the code decides nothing: the status
-/// read after the refusal does, the same for both codes.
+/// (`ERROR_INVALID_SERVICE_CONTROL`). Microsoft documents 1061 for a service that is `STOPPED`,
+/// `START_PENDING` or `STOP_PENDING`, even one that accepts STOP; P13c measured 1052 for
+/// `START_PENDING` with no STOP accepted, P18c and P26 1061 for `STOP_PENDING`, and P16a 1061 for
+/// every STOP after one was delivered, while the service stays `RUNNING`. So the code decides
+/// nothing; the status read after the refusal does, the same for both codes:
 /// - `STOP_PENDING` or `STOPPED`: a stop is under way or done. Sent.
-/// - `RUNNING` or `PAUSED`, accepting STOP: after 1061 a STOP was delivered and not yet answered
-///   (P16a), so it is under way: sent. After 1052 the service was not yet accepting STOP when the
-///   STOP was sent (a start was in progress) and is now: the STOP was not delivered, an error says
-///   so and nothing waits.
+/// - `RUNNING` or `PAUSED`, accepting STOP, after 1052: the service was not yet accepting STOP when
+///   the STOP was sent (a start was in progress) and is now. The STOP was not delivered: an error
+///   says so and nothing waits.
+/// - `RUNNING` or `PAUSED`, accepting STOP, after 1061: either a STOP was delivered earlier and is
+///   unanswered (P16a), or the service was `START_PENDING` when this one was sent and is not now
+///   (Microsoft's 1061), and nothing is stopping it. The read cannot tell them apart, so the STOP is
+///   sent once more. `Ok` means it is sent now; 1061 means one was already delivered, so it is under
+///   way. Any other refusal is decided by a fresh status read through this table, with no third STOP.
 /// - `RUNNING` or `PAUSED`, not accepting STOP: nothing is stopping it, and nothing will. An error
 ///   names `goetia daemon kill`. `tests/scm_integration/managed.rs` (`stop` of the `refuse-stop`
 ///   fixture) measures this on CI.
@@ -154,30 +158,41 @@ pub fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result
 /// - any other state: the OS error.
 fn control_stop_or_underway<A: ScmActor>(a: &mut A) -> io::Result<()> {
     match a.control_stop() {
-        Err(e)
-            if matches!(
-                e.raw_os_error(),
-                Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL | ERROR_INVALID_SERVICE_CONTROL)
-            ) =>
-        {
-            let status = a.query_status()?;
-            match (status.state, status.accepts_stop) {
-                (QueriedState::StopPending | QueriedState::Stopped, _) => Ok(()),
-                (QueriedState::Running | QueriedState::Paused, true) => {
-                    if e.raw_os_error() == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL) {
-                        Ok(())
-                    } else {
-                        Err(io::Error::other(STOP_NOT_DELIVERED))
-                    }
+        Err(e) if is_stop_refusal(&e) => decide_refused_stop(a, e, true),
+        other => other,
+    }
+}
+
+fn is_stop_refusal(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL | ERROR_INVALID_SERVICE_CONTROL)
+    )
+}
+
+/// What the refusal `e` of a STOP means, from a fresh status read. `may_resend` is false once the
+/// STOP was already sent a second time, so a refusal of that one is decided without a third.
+fn decide_refused_stop<A: ScmActor>(a: &mut A, e: io::Error, may_resend: bool) -> io::Result<()> {
+    let status = a.query_status()?;
+    match (status.state, status.accepts_stop) {
+        (QueriedState::StopPending | QueriedState::Stopped, _) => Ok(()),
+        (QueriedState::Running | QueriedState::Paused, true) => {
+            if e.raw_os_error() != Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL) {
+                Err(io::Error::other(STOP_NOT_DELIVERED))
+            } else if !may_resend {
+                Ok(())
+            } else {
+                match a.control_stop() {
+                    Err(e) if is_stop_refusal(&e) => decide_refused_stop(a, e, false),
+                    other => other,
                 }
-                (state @ (QueriedState::Running | QueriedState::Paused), false) => Err(io::Error::other(format!(
-                    "the service is {state:?} and does not accept STOP; `goetia daemon kill` ends its process"
-                ))),
-                (QueriedState::StartPending, _) => Err(io::Error::other(STARTING)),
-                _ => Err(e),
             }
         }
-        other => other,
+        (state @ (QueriedState::Running | QueriedState::Paused), false) => Err(io::Error::other(format!(
+            "the service is {state:?} and does not accept STOP; `goetia daemon kill` ends its process"
+        ))),
+        (QueriedState::StartPending, _) => Err(io::Error::other(STARTING)),
+        _ => Err(e),
     }
 }
 
