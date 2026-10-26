@@ -34,6 +34,9 @@ struct Scripted {
     reads: usize,
     /// How many times the kill has blocked for SCM to let go.
     releases: usize,
+    /// Whether an `arm_release` is outstanding: made, and neither woken by `await_release` nor
+    /// cancelled. SCM allows one per service handle and buffer.
+    armed: bool,
     log: Log,
 }
 
@@ -50,6 +53,7 @@ impl Scripted {
             failing_reads: Vec::new(),
             reads: 0,
             releases: 0,
+            armed: false,
             log: Log::default(),
         }
     }
@@ -121,11 +125,24 @@ impl KillTarget for Scripted {
 
     fn arm_release(&mut self) -> io::Result<()> {
         self.log.borrow_mut().push("arm_release".to_string());
+        assert!(
+            !self.armed,
+            "arm_release over an outstanding registration: SCM allows one per service and buffer"
+        );
+        self.armed = true;
         Ok(())
+    }
+
+    fn cancel_release(&mut self) {
+        self.log.borrow_mut().push("cancel_release".to_string());
+        assert!(self.armed, "cancel_release with no registration outstanding");
+        self.armed = false;
     }
 
     fn await_release(&mut self) -> io::Result<()> {
         self.log.borrow_mut().push("await_release".to_string());
+        assert!(self.armed, "await_release with no registration to wake");
+        self.armed = false;
         self.releases += 1;
         assert!(
             self.releases <= 5,
@@ -168,6 +185,7 @@ fn the_process_is_held_from_the_open_through_the_termination() {
             "await_exit 100",
             "arm_release",
             "service_pid",
+            "cancel_release",
             "close 100",
         ])
     );
@@ -198,6 +216,7 @@ fn a_restart_between_the_open_and_the_confirmation_lets_go_of_the_stale_process(
             "await_exit 200",
             "arm_release",
             "service_pid",
+            "cancel_release",
             "close 200",
         ])
     );
@@ -212,7 +231,14 @@ fn a_process_gone_before_it_was_opened_sends_the_question_back_to_scm() {
     assert_eq!(kill_service(&mut target).unwrap(), Killed::NotRunning);
     assert_eq!(
         target.log(),
-        steps(["service_pid", "open 100", "arm_release", "service_pid", "service_pid"])
+        steps([
+            "service_pid",
+            "open 100",
+            "arm_release",
+            "service_pid",
+            "cancel_release",
+            "service_pid"
+        ])
     );
 }
 
@@ -233,6 +259,7 @@ fn a_process_gone_before_it_was_opened_waits_for_scm_to_let_go_of_the_pid() {
             "await_release",
             "arm_release",
             "service_pid",
+            "cancel_release",
             "service_pid",
         ])
     );
@@ -256,6 +283,7 @@ fn a_process_gone_before_it_was_opened_is_followed_to_the_services_new_process()
             "open 100",
             "arm_release",
             "service_pid",
+            "cancel_release",
             "service_pid",
             "open 200",
             "service_pid",
@@ -263,6 +291,7 @@ fn a_process_gone_before_it_was_opened_is_followed_to_the_services_new_process()
             "await_exit 200",
             "arm_release",
             "service_pid",
+            "cancel_release",
             "close 200",
         ])
     );
@@ -298,6 +327,7 @@ fn a_process_that_exited_before_the_termination_is_not_a_kill() {
             "terminate 100",
             "arm_release",
             "service_pid",
+            "cancel_release",
             "close 100",
             "service_pid",
         ])
@@ -327,6 +357,7 @@ fn a_process_that_exited_before_the_termination_waits_for_scm_to_let_go_of_the_p
             "await_release",
             "arm_release",
             "service_pid",
+            "cancel_release",
             "close 100",
             "service_pid",
         ])
@@ -352,6 +383,7 @@ fn a_process_that_exited_before_the_termination_is_followed_to_the_services_new_
             "terminate 100",
             "arm_release",
             "service_pid",
+            "cancel_release",
             "close 100",
             "service_pid",
             "open 200",
@@ -360,6 +392,7 @@ fn a_process_that_exited_before_the_termination_is_followed_to_the_services_new_
             "await_exit 200",
             "arm_release",
             "service_pid",
+            "cancel_release",
             "close 200",
         ])
     );
@@ -389,6 +422,7 @@ fn an_open_that_failed_on_a_pid_scm_moved_off_follows_the_service() {
             "await_exit 200",
             "arm_release",
             "service_pid",
+            "cancel_release",
             "close 200",
         ])
     );
@@ -440,6 +474,7 @@ fn a_kill_waits_while_scm_still_reports_the_killed_pid() {
             "await_release",
             "arm_release",
             "service_pid",
+            "cancel_release",
             "close 100",
         ]),
         "the read comes after each arm, so a change between a read and an arm is not missed"
@@ -463,6 +498,7 @@ fn a_kill_is_done_when_scm_reports_a_new_pid() {
             "await_exit 100",
             "arm_release",
             "service_pid",
+            "cancel_release",
             "close 100",
         ])
     );

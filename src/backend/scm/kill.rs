@@ -57,10 +57,18 @@ pub trait KillTarget {
     /// Register to be woken when SCM records the service `STOPPED`. A registration made while the
     /// service is already `STOPPED` wakes at once; one made on any other state does not wake until
     /// the next entry into `STOPPED`.
+    ///
+    /// SCM allows one registration per service handle, and the buffer it reports into cannot be
+    /// reused until the registration has been woken or cancelled, so this is called only with none
+    /// outstanding: after an [`Self::await_release`] or a [`Self::cancel_release`].
     fn arm_release(&mut self) -> io::Result<()>;
 
     /// Block until the registration [`Self::arm_release`] made wakes. Unbounded.
     fn await_release(&mut self) -> io::Result<()>;
+
+    /// Cancel the registration [`Self::arm_release`] made, for a caller that no longer needs it
+    /// woken.
+    fn cancel_release(&mut self);
 }
 
 /// Terminate the service's process, or report that it has none.
@@ -124,6 +132,7 @@ fn await_scm_released<T: KillTarget>(target: &mut T, pid: u32) -> io::Result<()>
     loop {
         target.arm_release()?;
         if target.service_pid()? != Some(pid) {
+            target.cancel_release();
             return Ok(());
         }
         target.await_release()?;
@@ -162,7 +171,7 @@ mod system {
         /// to wait.
         id: String,
         /// Opened by the first [`KillTarget::arm_release`], as a kill that finds SCM already
-        /// released never needs it.
+        /// released never needs it, and dropped by [`KillTarget::cancel_release`].
         notifier: Option<SystemScmActor>,
     }
 
@@ -245,6 +254,12 @@ mod system {
                 Waited::Confirmed => Ok(()),
                 Waited::Expired => unreachable!("an unbounded deadline does not expire"),
             }
+        }
+
+        fn cancel_release(&mut self) {
+            // Dropping the actor closes its handles, which ends the registration, and drains a
+            // notification already queued; the next `arm_release` opens a fresh actor.
+            self.notifier = None;
         }
 
         fn await_release(&mut self) -> io::Result<()> {

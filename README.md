@@ -851,8 +851,10 @@ confirms differs:
   sees the service stopped first and a successful one if it sees it running
   first. A `start` that lands as SCM is restarting the command, and that
   restart fails (a missing `goetia-shim` or a broken account), is a failed start,
-  as is a service that stops with the shim's `0`, `1003` record, whether or not
-  it reported running first.
+  as is one where `start` sees the service stop with the shim's `0`, `1003`
+  record before it sees it running. A command no Job Object contains is always
+  seen that way, as the shim never reports running for it; for a command that
+  did run, the shim reports running first, so `start` succeeds if it sees that.
   For a `type: managed` daemon, which speaks to SCM itself, a
   service that stops before it reports running is a failed start.
 - **launchd** sits between the two: the pid `launchctl kickstart -p` reports

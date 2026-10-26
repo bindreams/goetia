@@ -44,6 +44,9 @@ struct FakeScm {
     /// Each `control_stop` that did not follow a `Running` or `Paused` notification accepting STOP.
     /// Only the settle tests read it; the stop and start waits send theirs without a notification.
     bad_stops: Vec<String>,
+    /// Whether an `arm` that registered has been neither delivered nor expired. SCM allows one
+    /// registration per service handle, and an actor serves one wait, so an `arm` over it is a bug.
+    armed: bool,
 }
 
 /// What a scripted `control_stop` answers.
@@ -70,6 +73,7 @@ impl FakeScm {
             stop_replies: VecDeque::new(),
             unanswered: None,
             bad_stops: vec![],
+            armed: false,
         }
     }
 
@@ -136,6 +140,8 @@ impl ScmActor for FakeScm {
             WantState::RunningPausedOrStopped => "arm_settle",
             WantState::StoppedOnly => "arm_stopped_only",
         });
+        assert!(!self.armed, "arm over an outstanding registration");
+        self.armed = self.what_arm_reports == Waited::Confirmed;
         Ok(self.what_arm_reports)
     }
     fn control_stop(&mut self) -> std::io::Result<()> {
@@ -158,6 +164,8 @@ impl ScmActor for FakeScm {
     }
     fn wait_callback(&mut self, deadline: Deadline) -> std::io::Result<Option<Observed>> {
         self.log.push("wait");
+        // Delivered, or expired: an expiry closes and drains the actor's handles.
+        self.armed = false;
         self.deadlines.push(deadline);
         let observed = self.waits.pop_front().expect("script ran dry");
         self.log.push(match observed {
