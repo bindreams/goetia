@@ -743,17 +743,18 @@ nothing; a disable that lands while a restart attempt is in flight is not
 promised to beat it. `uninstall` then stops whatever is running, a restart that
 had already begun included, waits for it to stop, and deletes the service. A
 stop that SCM rejects because the state changed is sent again on the next
-state. If the stop or the delete fails, or `uninstall` is interrupted (Ctrl-C,
-a killed `goetia`), the service is left disabled and not deleted; the start
-type is not put back. Running `goetia daemon uninstall` again is the retry.
-The first failure's error names the start type the service had, when it could
-be read, and `goetia daemon enable` or `goetia daemon disable` sets it again.
-On a retry the service already reads as disabled, so a second failure says the
-original start type is unknown. `goetia daemon install` over a service that a failed
+state. If the stop or the delete fails, the service is left disabled and not
+deleted; the start type is not put back. An interrupted `uninstall` (Ctrl-C, a
+killed `goetia`) leaves the service as it was before the disable, disabled and
+not deleted, or deleted, depending on where it stopped. In every case running
+`goetia daemon uninstall` again is the retry. The first failure's error names
+the start type the service had, when it could be read, and
+`goetia daemon enable` or `goetia daemon disable` sets it again. On a retry the
+service already reads as disabled, so a second failure says the original start
+type is unknown. `goetia daemon install` over a service that a failed
 `uninstall` left disabled keeps it disabled, so `start` fails with 1058 until
 `enable` or `disable` sets a start type. A service that does not accept a stop
-needs
-`goetia daemon kill <id>` first; `sc.exe stop` fails the same way. A service
+needs `goetia daemon kill <id>` first; `sc.exe stop` fails the same way. A service
 someone else already marked for deletion is not disabled; if it will not stop,
 the error says so, and it is removed once it stops and its last handle closes.
 

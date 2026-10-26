@@ -39,8 +39,8 @@
 //! actor first, sets the start type to `SERVICE_DISABLED` (a disabled service's recovery restart
 //! fails with `ERROR_SERVICE_DISABLED` and `StartService` is refused, so a restart queued or made
 //! after the disable starts nothing; a disable that lands while a restart attempt is in flight is
-//! not promised to win), stops whatever runs, including a start that had already begun, and only then closes the actor
-//! and deletes through a fresh `DELETE` handle. The stop never relies on an earlier observation: it
+//! not promised to win), stops whatever runs, including a start that had already begun, and only
+//! then closes the actor and deletes through a fresh `DELETE` handle. The stop never relies on an earlier observation: it
 //! is sent on a notification and, when SCM rejects it because the state changed, the state is read
 //! again. The service is not marked during the stop, so notifications keep working on it. A failure
 //! before the delete leaves the service in place and disabled, and re-running `uninstall` is the
@@ -948,9 +948,9 @@ fn run_sc(args: &[&str]) -> Result<()> {
 /// `--timeout`, and bounding the stop would turn a slow-stopping service into a failed uninstall
 /// where today it succeeds.
 ///
-/// The start type is not put back. A failed or interrupted `uninstall` (a stop that fails, a delete
-/// that fails, Ctrl-C, a killed goetia) leaves the service disabled, and re-running `uninstall` is
-/// the retry. Putting it back could not be kept as a promise: it is not reached when the process
+/// The start type is not put back. A stop or a delete that fails leaves the service disabled. An
+/// interrupted `uninstall` (Ctrl-C, a killed goetia) leaves it unchanged, disabled, or deleted,
+/// depending on where it stopped. Re-running `uninstall` is the retry in every case. Putting it back could not be kept as a promise: it is not reached when the process
 /// dies, and it would overwrite an `enable` or a second `uninstall` that ran in the meantime.
 /// Recording the old type on the machine would be new standing state. The error names the previous
 /// start type, when it could be read, and the command that sets it again.
