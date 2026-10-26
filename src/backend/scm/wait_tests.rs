@@ -38,6 +38,8 @@ struct FakeScm {
     last_accepts: bool,
     /// What each `control_stop` answers, front to back; `Ok` once it runs out.
     stop_replies: VecDeque<StopReply>,
+    /// What `query_status` answers; `None` fails the test, so a refused STOP's status is always scripted.
+    queried: Option<QueriedStatus>,
     /// The notification no `control_stop` has answered yet. `None` after a `control_stop` and after
     /// an expiry.
     unanswered: Option<(Observed, bool)>,
@@ -71,6 +73,7 @@ impl FakeScm {
             accepts: VecDeque::new(),
             last_accepts: true,
             stop_replies: VecDeque::new(),
+            queried: None,
             unanswered: None,
             bad_stops: vec![],
             armed: false,
@@ -86,6 +89,12 @@ impl FakeScm {
     /// The `control_stop` calls answer `replies` in order.
     fn stop_replies(mut self, replies: impl IntoIterator<Item = StopReply>) -> Self {
         self.stop_replies = replies.into_iter().collect();
+        self
+    }
+
+    /// A `query_status` answers that the service is in `state`, accepting STOP iff `accepts_stop`.
+    fn queried(mut self, state: QueriedState, accepts_stop: bool) -> Self {
+        self.queried = Some(QueriedStatus { state, accepts_stop });
         self
     }
 
@@ -182,6 +191,10 @@ impl ScmActor for FakeScm {
     fn accepts_stop(&self) -> bool {
         self.last_accepts
     }
+    fn query_status(&mut self) -> std::io::Result<QueriedStatus> {
+        self.log.push("query_status");
+        Ok(self.queried.expect("query_status was not scripted"))
+    }
     fn stopped_exit(&self) -> RecordedExit {
         self.recorded
     }
@@ -238,13 +251,15 @@ fn stop_re_arms_after_a_non_terminal_callback() {
 #[skuld::test]
 fn stop_waits_out_a_stop_already_under_way() {
     let mut fake = FakeScm::new([Some(Observed::Pending), Some(Observed::Stopped)])
-        .stop_replies([StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL)]);
+        .stop_replies([StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL)])
+        .queried(QueriedState::StopPending, false);
     assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
     assert_eq!(
         fake.log,
         vec![
             "arm_stopped",
             "control_stop",
+            "query_status",
             "wait",
             "got_pending",
             "arm_stopped",
@@ -257,15 +272,69 @@ fn stop_waits_out_a_stop_already_under_way() {
 /// The wait stays bounded by the caller's deadline: a stop under way that outlasts it expires.
 #[skuld::test]
 fn stop_over_a_stop_under_way_still_expires_on_the_deadline() {
-    let mut fake = FakeScm::new([None]).stop_replies([StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL)]);
+    let mut fake = FakeScm::new([None])
+        .stop_replies([StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL)])
+        .queried(QueriedState::StopPending, false);
     assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), Waited::Expired);
 }
 
 #[skuld::test]
 fn a_stop_request_over_a_stop_under_way_is_accepted() {
-    let mut fake = FakeScm::new([]).stop_replies([StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL)]);
+    let mut fake = FakeScm::new([])
+        .stop_replies([StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL)])
+        .queried(QueriedState::StopPending, false);
     request_stop(&mut fake).unwrap();
-    assert_eq!(fake.log, vec!["control_stop"]);
+    assert_eq!(fake.log, vec!["control_stop", "query_status"]);
+}
+
+/// A 1061 is a stop under way only when the service says so: `STOP_PENDING`, a `RUNNING` (or
+/// `PAUSED`) service that still accepts STOP (a STOP delivered and not yet answered, P16a), or one
+/// that has stopped since. A `RUNNING` service that accepts no STOP (the `refuse-stop` fixture) also
+/// answers 1061, and waiting for it to stop would end in a timeout; so would any other state.
+#[skuld::test]
+fn a_refused_stop_is_under_way_only_in_a_state_that_is_stopping() {
+    for (state, accepts_stop, under_way) in [
+        (QueriedState::StopPending, false, true),
+        (QueriedState::Running, true, true),
+        (QueriedState::Paused, true, true),
+        (QueriedState::Stopped, false, true),
+        (QueriedState::Running, false, false),
+        (QueriedState::Paused, false, false),
+        (QueriedState::StartPending, true, false),
+        (QueriedState::StartPending, false, false),
+        (QueriedState::ContinuePending, false, false),
+        (QueriedState::PausePending, false, false),
+    ] {
+        let script = || {
+            FakeScm::new([Some(Observed::Stopped)])
+                .stop_replies([StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL)])
+                .queried(state, accepts_stop)
+        };
+        let waiting = stop_via_notify(&mut script(), unbounded());
+        let immediate = request_stop(&mut script());
+        if under_way {
+            assert_eq!(waiting.unwrap(), Waited::Confirmed, "{state:?} accepts {accepts_stop}");
+            immediate.unwrap();
+        } else {
+            for err in [waiting.unwrap_err(), immediate.unwrap_err()] {
+                let text = err.to_string();
+                assert!(
+                    text.contains("does not accept STOP") && text.contains("goetia daemon kill"),
+                    "{state:?} accepts {accepts_stop}: {text}"
+                );
+            }
+        }
+    }
+}
+
+/// An error is not followed by a wait: the refusal is final.
+#[skuld::test]
+fn a_stop_refused_by_a_service_that_does_not_accept_it_waits_for_nothing() {
+    let mut fake = FakeScm::new([])
+        .stop_replies([StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL)])
+        .queried(QueriedState::Running, false);
+    stop_via_notify(&mut fake, unbounded()).unwrap_err();
+    assert_eq!(fake.log, vec!["arm_stopped", "control_stop", "query_status"]);
 }
 
 /// Only 1061 is a stop under way: a `START_PENDING` service (1052) or any other refusal is an error.
@@ -987,7 +1056,8 @@ fn a_plain_start_over_a_stopping_service_is_refused() {
 }
 
 /// Whatever the budget, a `start` over a stopping service is never a success, and the error says
-/// what to do: the service is going down and stays down, so `start` is run again once it has.
+/// what to do: the service is stopping, SCM may start it again itself, and `start` is run again once
+/// it has stopped.
 #[skuld::test]
 fn a_start_over_a_stopping_service_says_it_is_stopping() {
     let mut fake = FakeScm::new([]).already_running(QueriedState::StopPending);
@@ -1001,6 +1071,8 @@ fn a_start_over_a_stopping_service_says_it_is_stopping() {
     for text in [waiting, immediate] {
         assert!(text.contains("is stopping"), "{text}");
         assert!(text.contains("once it has stopped"), "{text}");
+        assert!(text.contains("restart policy"), "{text}");
+        assert!(!text.contains("stay down"), "{text}");
     }
 }
 

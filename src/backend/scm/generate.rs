@@ -48,7 +48,7 @@ use std::time::Duration;
 use crate::backend::Identity;
 use crate::blob::{self, Blob};
 use crate::error::Error;
-use crate::spec::{DaemonSpec, Kind, MAX_SC_ACTION_DELAY, Restart, User, windows_builtin};
+use crate::spec::{DaemonSpec, Kind, Restart, User, scm_restart_delay, windows_builtin};
 
 // Metadata field names ================================================================================================
 
@@ -124,10 +124,10 @@ pub struct FailureActions {
 
 // Building ============================================================================================================
 
-/// Build the [`ScmRegistration`] for `spec`. A `restart-delay` too large
-/// for `SC_ACTION.Delay` to express is clamped rather than left to panic at
-/// install time — see `MAX_SC_ACTION_DELAY`; the advisory for that now
-/// fires at resolve time, from `Backend::Scm.warn`, on every host, rather
+/// Build the [`ScmRegistration`] for `spec`. A `restart-delay` is rounded up to whole
+/// milliseconds and clamped to what `SC_ACTION.Delay` can express, rather than left to
+/// panic at install time — see `scm_restart_delay`; the advisories for those now
+/// fire at resolve time, from `Backend::Scm.warn`, on every host, rather
 /// than only when this effectful-install-time generator happens to run.
 ///
 /// `id` is the account already resolved by the effectful install path (see
@@ -158,7 +158,7 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> ScmRe
         Restart::OnFailure | Restart::Always => {
             let delay = spec.restart_delay.unwrap_or(DEFAULT_RESTART_DELAY);
             Some(FailureActions {
-                delay: bounded_restart_delay(delay),
+                delay: scm_restart_delay(delay),
                 reset_period: FAILURE_RESET_PERIOD,
                 on_non_crash_failures: true,
             })
@@ -198,12 +198,6 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> ScmRe
         failure_actions,
         parameters,
     }
-}
-
-/// Clamp `delay` to what `SC_ACTION.Delay` (a `DWORD` of milliseconds) can
-/// express. The advisory for a clamped value is `Backend::Scm.warn` (`spec/backend.rs`).
-fn bounded_restart_delay(delay: Duration) -> Duration {
-    delay.min(MAX_SC_ACTION_DELAY)
 }
 
 // Account canonicalisation ============================================================================================

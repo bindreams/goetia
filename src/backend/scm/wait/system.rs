@@ -7,7 +7,7 @@ use std::ffi::c_void;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use windows_service::service::{Service, ServiceAccess, ServiceState};
+use windows_service::service::{Service, ServiceAccess, ServiceControlAccept, ServiceState};
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_NOT_ACTIVE, WAIT_IO_COMPLETION};
 use windows_sys::Win32::System::Services::{
@@ -20,7 +20,7 @@ use windows_sys::Win32::System::Threading::{INFINITE, SleepEx};
 
 use crate::backend::scm::exit_status::RecordedExit;
 
-use super::{Deadline, Observed, QueriedState, StartReply, Waited, WantState};
+use super::{Deadline, Observed, QueriedState, QueriedStatus, StartReply, Waited, WantState};
 
 /// `windows-service`'s `Error` does not implement `Into<io::Error>` for
 /// every variant (it also carries parse errors this module never
@@ -395,6 +395,14 @@ impl super::ScmActor for SystemScmActor {
 
     fn stopped_wait_hint(&self) -> u32 {
         self.status.wait_hint.load(Ordering::Acquire)
+    }
+
+    fn query_status(&mut self) -> io::Result<QueriedStatus> {
+        let status = self.service()?.query_status().map_err(to_io_error)?;
+        Ok(QueriedStatus {
+            state: queried_state(status.current_state),
+            accepts_stop: status.controls_accepted.contains(ServiceControlAccept::STOP),
+        })
     }
 
     fn accepts_stop(&self) -> bool {

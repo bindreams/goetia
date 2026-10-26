@@ -111,7 +111,8 @@ fn finish(id: &str, status_handle: StatusHandle, reported: Reported) -> ! {
 /// The `STOP_PENDING` status held while the shim tears the daemon down, accepting no control. SCM
 /// then refuses a second `STOP` (1061) and a `START` (1056) itself, and a `STOPPED` that follows
 /// restarts or not exactly as one that follows `RUNNING` (P18). The hint and checkpoint are those
-/// P18 measured; what SCM does when the hint expires or the checkpoint stalls is not.
+/// P18 measured. SCM does nothing when the hint expires or the checkpoint stalls: the status, a refused
+/// STOP (1061) and a refused START (1056) held for 10 s past a 1 s hint (P26).
 fn stopping_status() -> SERVICE_STATUS {
     SERVICE_STATUS {
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
@@ -239,7 +240,7 @@ fn report_stopped(id: &str, handle: StatusHandle, reported: Reported) {
 /// `on_stopping` is called exactly once, after `on_running` and before the daemon's tree is torn
 /// down, whatever ends the run; never when `on_running` was not. The service reads `STOP_PENDING`
 /// through the teardown, so a `start` is refused rather than answered "running" for a service that
-/// is about to stop and stay down.
+/// is about to stop.
 ///
 /// `on_running` is called exactly once, after the daemon is spawned and never when launching failed.
 /// A daemon that cannot start is therefore `STOPPED` without ever having been `RUNNING`, with a

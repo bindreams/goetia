@@ -1,5 +1,5 @@
 use super::*;
-use crate::spec::{Builtin, Id};
+use crate::spec::{Builtin, Id, MAX_SC_ACTION_DELAY};
 
 // Fixtures ============================================================================================================
 
@@ -812,6 +812,50 @@ fn managed_kind_clamps_absurdly_long_restart_delay() {
     );
     // Warning coverage for an over-long delay lives in `spec::backend`'s
     // tests, gated by `Backend::Scm.warn` rather than by this generator.
+}
+
+#[skuld::test]
+fn a_sub_millisecond_restart_delay_rounds_up_to_the_whole_millisecond_scm_stores() {
+    for (delay, stored_ms) in [
+        (Duration::from_micros(1500), 2u64),
+        (Duration::from_micros(500), 1),
+        (Duration::from_nanos(1500), 1),
+        (Duration::from_nanos(1), 1),
+        (Duration::from_millis(7), 7),
+        (Duration::ZERO, 0),
+    ] {
+        let mut spec = managed_spec();
+        spec.restart_delay = Some(delay);
+        let reg = build(&spec);
+        let fa = reg.failure_actions.expect("on-failure configures recovery actions");
+        assert_eq!(fa.delay, Duration::from_millis(stored_ms), "delay {delay:?}");
+
+        // What `read_failure_actions` returns for the whole-ms value `apply_failure_actions` wrote.
+        let mut read_back = reg.clone();
+        read_back.failure_actions = Some(FailureActions {
+            delay: Duration::from_millis(u64::try_from(fa.delay.as_millis()).unwrap()),
+            ..fa
+        });
+        assert_eq!(
+            render(&reg),
+            render(&read_back),
+            "desired and read-back text must agree for {delay:?}, or every later install is a Conflict"
+        );
+    }
+}
+
+#[skuld::test]
+fn rounding_a_restart_delay_up_never_passes_the_scm_maximum() {
+    for delay in [
+        MAX_SC_ACTION_DELAY - Duration::from_millis(1) + Duration::from_nanos(1),
+        MAX_SC_ACTION_DELAY + Duration::from_nanos(1),
+        Duration::MAX,
+    ] {
+        let mut spec = managed_spec();
+        spec.restart_delay = Some(delay);
+        let fa = build(&spec).failure_actions.expect("recovery actions");
+        assert_eq!(fa.delay, MAX_SC_ACTION_DELAY, "delay {delay:?}");
+    }
 }
 
 #[skuld::test]

@@ -93,6 +93,9 @@ pub trait ScmActor {
     /// `SERVICE_ACCEPT_STOP` in its `dwControlsAccepted`. Read from that notification, not queried
     /// afterwards, for the reason [`Self::stopped_exit`] is.
     fn accepts_stop(&self) -> bool;
+    /// A fresh `QueryServiceStatus`: the state and controls accepted now, for deciding what a
+    /// refused STOP (1061) meant. Not a wait and not read from a notification.
+    fn query_status(&mut self) -> io::Result<QueriedStatus>;
 }
 
 /// Stop the service, gated strictly on a real `STOPPED` callback from
@@ -110,10 +113,23 @@ pub fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result
 
 /// [`ScmActor::control_stop`], where a stop already under way counts as sent. A service in
 /// `STOP_PENDING` (a shim tearing the daemon down) is refused by SCM with 1061 before it reaches the
-/// service (P18c), and the stop being asked for is the one in progress. Any other refusal is an error.
+/// service (P18c), and the stop being asked for is the one in progress. So is a `RUNNING` (or
+/// `PAUSED`) service that still accepts STOP: a STOP was delivered and not yet answered (P16a), as
+/// [`settle_and_stop`] reads it. A service that has stopped since is done. A `RUNNING` service that
+/// accepts no STOP is also refused with 1061, and nothing is stopping it: that, any other state and
+/// any other refusal is an error.
 fn control_stop_or_underway<A: ScmActor>(a: &mut A) -> io::Result<()> {
     match a.control_stop() {
-        Err(e) if e.raw_os_error() == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL) => {
+            let status = a.query_status()?;
+            match (status.state, status.accepts_stop) {
+                (QueriedState::StopPending | QueriedState::Stopped, _)
+                | (QueriedState::Running | QueriedState::Paused, true) => Ok(()),
+                (state, _) => Err(io::Error::other(format!(
+                    "the service is {state:?} and does not accept STOP; `goetia daemon kill` ends its process"
+                ))),
+            }
+        }
         other => other,
     }
 }
@@ -219,9 +235,10 @@ fn accept_as_started(reply: StartReply) -> io::Result<()> {
     }
 }
 
-/// What a start over a `STOP_PENDING` service is told. SCM refuses the start (1056) and the service
-/// then stops and stays down, so reporting it as started would be false.
-const STOPPING: &str = "the service is stopping (STOP_PENDING), so it cannot be started yet: it is going down and will stay down. Run the start again once it has stopped";
+/// What a start over a `STOP_PENDING` service is told. SCM refuses the start (1056), so reporting it
+/// as started would be false. What follows the stop is not known here: a failed daemon's teardown is
+/// restarted by SCM under the service's restart policy (P18a, P26).
+const STOPPING: &str = "the service is stopping (STOP_PENDING), so it cannot be started yet. SCM may start it again itself under its restart policy. Run the start again once it has stopped";
 
 /// Start the service, gated strictly on a real `RUNNING` callback; re-arms
 /// after a non-terminal callback, under the same `deadline` throughout —
@@ -395,6 +412,14 @@ pub enum QueriedState {
     ContinuePending,
     PausePending,
     Paused,
+}
+
+/// What `QueryServiceStatus` reported: the state and whether `SERVICE_ACCEPT_STOP` was among the
+/// controls accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueriedStatus {
+    pub state: QueriedState,
+    pub accepts_stop: bool,
 }
 
 /// Whether 1056 still counts as a start, for the plain `start` verb: `Running` and `StartPending`

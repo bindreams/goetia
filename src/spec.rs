@@ -36,10 +36,12 @@ pub(crate) use resolve::{
 // Read by `crate::backend::scm::generate`, which is not a descendant of
 // `spec` and so cannot see through a private `mod backend;`:
 // `windows_builtin` from `canonical_account` and `account_needs_password`,
-// `MAX_SC_ACTION_DELAY` from `registration`'s clamp. `windows_only_account`
-// stays out of this line — only `Backend::error` reads it, inside
-// `spec::backend` itself.
-pub(crate) use backend::{MAX_SC_ACTION_DELAY, windows_builtin};
+// `scm_restart_delay` from `registration`. `windows_only_account` stays out of
+// this line — only `Backend::error` reads it, inside `spec::backend` itself.
+pub(crate) use backend::{scm_restart_delay, windows_builtin};
+// `MAX_SC_ACTION_DELAY` is named through this path from `generate_tests.rs` alone.
+#[cfg(test)]
+pub(crate) use backend::MAX_SC_ACTION_DELAY;
 // `Builtin` is named through this path from `generate_tests.rs` alone;
 // production code only ever infers it, from `windows_builtin`'s return.
 #[allow(unused_imports)]

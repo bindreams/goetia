@@ -727,7 +727,9 @@ reports how it ended as the service's exit, and exits. With `restart: on-failure
 SCM then starts a new shim after `restart-delay` (1s by default), and that shim
 reads the spec as installed, so a daemon restarted after `goetia daemon install`
 runs the updated spec. A shim that is killed or crashes is restarted too. A
-clean exit is never restarted, and a stop reports a clean exit.
+clean exit is never restarted, and a stop reports a clean exit. SCM stores
+`restart-delay` in whole milliseconds, so a finer delay (`1500us`) is rounded up
+(`2ms`), with a warning.
 
 Nothing cancels a restart SCM has queued, and `goetia daemon stop` does not
 look for one. A command that failed and is waiting out `restart-delay` finds
@@ -808,11 +810,13 @@ The shim reports the service as stopping (`STOP_PENDING`) from the moment the
 command's end or a `stop` is decided until it reports stopped, so the service
 never reads `running` while its job is being terminated. In that window
 `goetia daemon status` and `list` show `unknown`, the state they show for any
-transitional one. A `start` fails and says the service is stopping; it does not
-queue a start behind the stop, so run it again once the service has stopped. A
-`stop` waits for the stopping to finish and then exits `0`. SCM treats the
-`STOPPED` that follows as it would one that follows `running`: a failure is
-restarted per `restart:`, a stop is not.
+transitional one. A `start` fails and says the service is stopping, that SCM may
+start it again itself under its restart policy, and to run the `start` again
+once the service has stopped; it does not queue a start behind the stop. A
+`stop` waits for the stopping to finish and then exits `0`. A `stop` of a
+running service that does not accept one fails and names `goetia daemon kill`;
+it does not wait. SCM treats the `STOPPED` that follows as it would one that
+follows `running`: a failure is restarted per `restart:`, a stop is not.
 
 Nothing guards against a possible survivor afterwards: `stop` exits `0`,
 including the `stop` that produced the record, and a later `start`, `restart` or

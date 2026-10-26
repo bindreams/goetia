@@ -158,6 +158,52 @@ fn the_scm_delay_advisory_is_gated_on_restart_alone() {
     assert!(warnings.is_empty(), "Restart::Never must not warn: {warnings:?}");
 }
 
+#[skuld::test]
+fn a_sub_millisecond_delay_warns_from_the_scm_arm_with_the_rounded_value() {
+    let mut spec = shaped_spec();
+    spec.kind = Shaped::Parsed(Kind::Managed);
+    spec.restart = Shaped::Parsed(Restart::OnFailure);
+    spec.restart_delay = Shaped::Parsed(Duration::from_micros(1500));
+
+    let mut warnings = Vec::new();
+    Backend::Scm.warn(&spec, &mut warnings);
+
+    let [warning] = warnings.as_slice() else {
+        panic!("expected exactly one warning, got {warnings:?}");
+    };
+    assert!(
+        warning.message.contains("restart-delay") && warning.message.contains("2ms"),
+        "warning should name the field and the rounded value: {}",
+        warning.message
+    );
+}
+
+#[skuld::test]
+fn the_sub_millisecond_advisory_is_silent_when_nothing_is_rounded_or_nothing_restarts() {
+    let mut whole = shaped_spec();
+    whole.restart = Shaped::Parsed(Restart::OnFailure);
+    whole.restart_delay = Shaped::Parsed(Duration::from_millis(7));
+    let mut warnings = Vec::new();
+    Backend::Scm.warn(&whole, &mut warnings);
+    assert!(warnings.is_empty(), "a whole-ms delay must not warn: {warnings:?}");
+
+    let mut never_restarts = shaped_spec();
+    never_restarts.restart = Shaped::Parsed(Restart::Never);
+    never_restarts.restart_delay = Shaped::Parsed(Duration::from_micros(1500));
+    let mut warnings = Vec::new();
+    Backend::Scm.warn(&never_restarts, &mut warnings);
+    assert!(warnings.is_empty(), "Restart::Never must not warn: {warnings:?}");
+
+    // Clamped, not rounded: the over-long advisory is the only one.
+    let mut over_long = shaped_spec();
+    over_long.restart = Shaped::Parsed(Restart::OnFailure);
+    over_long.restart_delay = Shaped::Parsed(MAX_SC_ACTION_DELAY + Duration::from_nanos(1));
+    let mut warnings = Vec::new();
+    Backend::Scm.warn(&over_long, &mut warnings);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].message.contains("clamped"), "{warnings:?}");
+}
+
 // `windows_only_account` ==============================================================================================
 
 #[skuld::test]
