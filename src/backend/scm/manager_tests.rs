@@ -605,3 +605,56 @@ fn install_and_preview_install_refuse_restart_always() {
         assert!(err.to_string().contains("restart: always"), "{err}");
     }
 }
+
+// uninstall's stop failure ============================================================================================
+
+fn stop_failure(state: &StopFailure) -> String {
+    stop_failed_message(&Id::try_from("frpc").unwrap(), "does not accept STOP", state)
+}
+
+#[skuld::test]
+fn a_stop_failure_that_restored_the_start_type_says_the_service_is_as_it_was() {
+    let text = stop_failure(&StopFailure::Restored);
+    assert!(text.contains("does not accept STOP"), "{text}");
+    assert!(text.contains("NOT deleted"), "{text}");
+    assert!(text.contains("start type is as it was"), "{text}");
+    assert!(text.contains("goetia daemon uninstall frpc"), "{text}");
+    assert!(text.contains("goetia daemon kill frpc"), "{text}");
+    assert!(!text.contains("disabled"), "the start type was restored: {text}");
+    assert!(!text.contains("sc.exe"), "{text}");
+}
+
+#[skuld::test]
+fn a_stop_failure_that_could_not_restore_names_the_original_start_type_and_its_command() {
+    for (previous, wants) in [
+        (
+            ServiceStartType::AutoStart,
+            ("automatic", "`goetia daemon enable frpc`"),
+        ),
+        (ServiceStartType::OnDemand, ("manual", "`goetia daemon disable frpc`")),
+    ] {
+        let text = stop_failure(&StopFailure::RestoreFailed {
+            previous,
+            error: "Access is denied.".to_string(),
+        });
+        assert!(text.contains("NOT deleted"), "{previous:?}: {text}");
+        assert!(text.contains("still disabled"), "{previous:?}: {text}");
+        assert!(text.contains("Access is denied."), "{previous:?}: {text}");
+        assert!(
+            text.contains(&format!("start type was {}", wants.0)),
+            "{previous:?}: {text}"
+        );
+        assert!(text.contains(wants.1), "{previous:?}: {text}");
+    }
+}
+
+#[skuld::test]
+fn a_stop_failure_on_a_service_marked_by_someone_else_does_not_claim_a_disable() {
+    let text = stop_failure(&StopFailure::AlreadyMarked);
+    assert!(text.contains("does not accept STOP"), "{text}");
+    assert!(text.contains("already marked for deletion"), "{text}");
+    assert!(text.contains("goetia daemon kill frpc"), "{text}");
+    for stale in ["NOT deleted", "disabled", "goetia daemon enable", "goetia daemon start"] {
+        assert!(!text.contains(stale), "`{stale}` is false for a marked service: {text}");
+    }
+}

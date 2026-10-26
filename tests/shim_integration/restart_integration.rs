@@ -169,7 +169,8 @@ fn on_failure_restarts_are_paced_new_shims() {
 /// A daemon that fails at once under `restart-delay: 0s` is `STOPPED`, `START_PENDING` or `RUNNING`
 /// at any moment, so `uninstall` meets a restart SCM has queued or just begun. Whatever it meets, the
 /// service must be gone when it returns: a restart that had begun must be stopped before the delete,
-/// or the delete would only mark it. The test holds no service handle across the `uninstall`, or the record would survive it.
+/// or the delete would only mark it. The test holds no service handle across the `uninstall`, or the
+/// record would survive it.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn uninstall_leaves_no_restarted_daemon_behind() {
     use windows_service::service::ServiceAccess;

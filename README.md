@@ -484,10 +484,14 @@ backend-specific:
 A service installed by an earlier release with `restart: always` on Windows
 still starts, stops and reports: `status`, `list`, `start`, `stop`, `restart`
 and `uninstall` read its embedded copy of the spec and never see this
-refusal. It is no longer restarted when the command exits, because the new
-`goetia-shim` leaves every restart to SCM and the service has no recovery
-actions. To get them, add the override above to the manifest and run
-`goetia daemon install`; `diff` and `install` read the manifest.
+refusal. What changes depends on its `type`. A `type: simple` service is no
+longer restarted when the command exits, because the new `goetia-shim` leaves
+every restart to SCM and the service has no recovery actions. A
+`type: managed` service is unchanged: it already had on-failure recovery
+actions, keeps them, and was never restarted after a clean exit. To give a
+`type: simple` service recovery actions, add the override above to the
+manifest and run `goetia daemon install`; `diff` and `install` read the
+manifest.
 
 `${VAR}` is substituted only in the override for the backend being
 installed. The other two are validated as authored, never substituted, so a
@@ -734,15 +738,20 @@ which SCM does not restart; a stop that arrives after it has decided on the
 failure does not change it. SCM acknowledges that stop anyway, whatever the
 shim answers, so `stop` exits `0` and SCM restarts the command as above.
 `goetia daemon uninstall` first sets the service's start type to disabled, so a
-restart SCM had queued, or queues later, fails and starts nothing. It then stops
-whatever is running, a restart that had already begun included, waits for it to
-stop, and deletes the service. A stop that SCM rejects because the state changed
-is sent again on the next state. If the stop cannot be done, `uninstall` fails
-and says the service was not deleted and is now disabled: `goetia daemon start`
-fails until `goetia daemon enable` or `goetia daemon disable` sets the start
-type again. Run `goetia daemon uninstall` again to retry. A service that does
-not accept a stop needs `goetia daemon kill <id>` first; `sc.exe stop` fails
-the same way.
+restart SCM had queued before the disable, or queues after it, fails and starts
+nothing; a disable that lands while a restart attempt is in flight is not
+promised to beat it. `uninstall` then stops whatever is running, a restart that
+had already begun included, waits for it to stop, and deletes the service. A
+stop that SCM rejects because the state changed is sent again on the next
+state. If the stop cannot be done, `uninstall` sets the start type back to what
+it was and fails, saying the service was not deleted; it is as it was before,
+and running `goetia daemon uninstall` again is the retry. If setting the start
+type back fails too, the error says the service is still disabled, names the
+original start type and the `goetia daemon enable` or `goetia daemon disable`
+command that sets it. A service that does not accept a stop needs
+`goetia daemon kill <id>` first; `sc.exe stop` fails the same way. A service
+someone else already marked for deletion is not disabled; if it will not stop,
+the error says so, and it is removed once it stops and its last handle closes.
 
 After upgrading goetia, run `goetia daemon install` again for every daemon
 installed by an older version. Services registered before this shim existed

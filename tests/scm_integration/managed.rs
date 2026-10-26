@@ -338,7 +338,7 @@ fn uninstall_then_immediate_reinstall_succeeds() {
     assert!(matches!(outcome, Outcome::Create), "{outcome:?}");
 }
 
-// Step 4: uninstall reports a service that will not stop, leaves it disabled, and is re-runnable ======================
+// Step 4: uninstall reports a service that will not stop, restores its start type, and is re-runnable =================
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn uninstall_errors_when_service_will_not_stop() {
@@ -367,20 +367,19 @@ fn uninstall_errors_when_service_will_not_stop() {
     assert!(
         text.contains("does not accept STOP")
             && text.contains("NOT deleted")
-            && text.contains("disabled")
+            && text.contains("start type is as it was")
             && text.contains("goetia daemon kill")
             && !text.contains("sc.exe"),
-        "error should say why, that the service was not deleted and is disabled, and the remedy: {err}"
+        "error should say why, that the service was not deleted and its start type is as it was, and the remedy: {err}"
     );
 
-    // The service is still there, running, and disabled.
+    // The service is still there, running, and with the start type it was installed with.
     let status = mgr.status(&spec.id).expect("status: the service must still exist");
     assert_eq!(status.state, State::Running);
     let config = support::cmd::run("sc.exe", &["qc", &id]).expect_ok();
     assert!(
-        config.stdout.contains("DISABLED"),
-        "start type should be disabled:
-{config}"
+        config.stdout.contains("DEMAND_START") && !config.stdout.contains("DISABLED"),
+        "start type should be the installed one (DEMAND_START), not DISABLED:\n{config}"
     );
 
     // The named remedy, then the retry: it succeeds and the record is gone (1060).

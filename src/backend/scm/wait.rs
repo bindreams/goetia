@@ -142,7 +142,9 @@ const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
 /// change, not with another STOP. No iteration limit and no timing; a settled state that refuses STOP
 /// is an error. A STOP SCM accepts is followed by the same wait as [`stop_via_notify`]'s, armed after
 /// the STOP; that holds once nothing can start the service again, which `uninstall` arranges by
-/// setting `SERVICE_DISABLED` first (P19a, P21).
+/// setting `SERVICE_DISABLED` first: a restart queued before that, or after it, does not start (P21),
+/// and a disable 0.13-0.25 ms after a failure's `STOPPED` beat every restart attempt (P19a). A
+/// disable that lands while an attempt is in flight is not claimed either way.
 pub fn settle_and_stop<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
     loop {
         if a.arm(WantState::RunningPausedOrStopped, deadline)? == Waited::Expired {
