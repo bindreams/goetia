@@ -88,14 +88,9 @@ fn a_killed_shim_is_restarted_by_scm() {
     kill_process(first_shim.pid());
     reported.accept("a daemon restarted by SCM after its shim was killed");
 
-    // The daemon is a child of the new shim, so SCM already knows that process.
-    let after = scm_status(&id);
-    let second_shim = after.process_id.expect("SCM has a process for the restarted service");
-    assert_ne!(second_shim, first_shim.pid(), "{after:?}");
-    assert!(
-        matches!(after.current_state, ServiceState::Running | ServiceState::StartPending),
-        "{after:?}"
-    );
+    // Waits for the new shim's RUNNING: SCM reports a process id only then.
+    let second_shim = ShimProcess::attach(&id);
+    assert_ne!(second_shim.pid(), first_shim.pid());
 }
 
 /// A killed shim is a crash to SCM, which restarts the service whatever the shim reported. The

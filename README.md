@@ -785,8 +785,9 @@ failing:
 A shim that cannot report at all exits `160` or `1063`; SCM's record is then its own.
 A shim started without a service id, or that cannot connect to SCM, dies before
 it has connected, and SCM does not restart it. A shim that connected and then
-cannot register its control handler exits `1063` after the connect: SCM records
-`1067` and restarts it under the restart policy.
+cannot register its control handler exits `1063` after the connect. That exact
+case is not measured; a service host that connected and exited without any
+report was, and SCM recorded `1067` and restarted it under the restart policy.
 
 Under `on-failure` both failures are restarted, so a spec the shim cannot read
 or a command that is missing retries at `restart-delay` indefinitely, as it

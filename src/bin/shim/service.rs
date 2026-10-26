@@ -232,11 +232,12 @@ fn report_stopped(id: &str, handle: StatusHandle, reported: Reported) {
     }
 }
 
-/// The shim exits after this, so SCM reads the exit as a crash: 1067, with the restart policy
-/// applied even after a commanded stop.
+/// The shim exits after this without a `STOPPED` report. SCM is expected to read that as a crash
+/// (1067) and may apply the restart policy, even after a commanded stop; exits without a report were
+/// measured from `START_PENDING`, after `RUNNING` and after connecting, not from `STOP_PENDING`.
 fn stopped_report_failure(e: &std::io::Error) -> String {
     format!(
-        "report SERVICE_STOPPED to SCM: {e}; the shim exits anyway, so SCM will record 1067 (a crash) and apply the restart policy"
+        "report SERVICE_STOPPED to SCM: {e}; the shim exits anyway; SCM is expected to record 1067 (a crash) and may apply the restart policy"
     )
 }
 

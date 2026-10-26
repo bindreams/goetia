@@ -1127,12 +1127,17 @@ fn nothing_is_logged_for_a_service_the_shim_has_no_notice_about() {
     assert!(take_warnings(id.as_str()).is_empty());
 }
 
-/// A `STOPPED` the shim could not report is a crash to SCM (1067), restarted under the restart
-/// policy even after a commanded stop; the log line says so, since SCM's record will not.
+/// A `STOPPED` the shim could not report is expected to read as a crash to SCM (1067), with the
+/// restart policy possibly applied; the log line says so as an expectation, not a measurement.
 #[skuld::test]
-fn a_failed_stopped_report_says_scm_will_read_a_crash() {
+fn a_failed_stopped_report_says_scm_is_expected_to_read_a_crash() {
     let text = stopped_report_failure(&std::io::Error::from_raw_os_error(6));
-    for part in ["report SERVICE_STOPPED to SCM", "1067", "restart policy"] {
+    for part in [
+        "report SERVICE_STOPPED to SCM",
+        "expected",
+        "1067",
+        "may apply the restart policy",
+    ] {
         assert!(text.contains(part), "missing {part:?}: {text}");
     }
 }
