@@ -31,9 +31,6 @@ pub enum WantState {
 /// a callback can report a state that is neither what the caller wants nor
 /// its opposite. `Running`/`Stopped` are terminal; `Pending` is any
 /// intermediate (`StartPending`/`StopPending`) and re-arms.
-/// [`start_via_notify`] reads a terminal `Stopped` of a `type: simple` service through the exit
-/// codes SCM recorded: the daemon having run is a start, the shim failing is a *failed* start
-/// returning `Err`, and neither blocks forever.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Observed {
     Running,
@@ -139,11 +136,13 @@ const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
 /// Loops over notifications of `RUNNING`, `PAUSED` and `STOPPED`; a pending state is not in the mask,
 /// so SCM does not report one until the service has settled. `STOPPED` ends the loop. On `RUNNING` or
 /// `PAUSED` the STOP is sent; SCM may have changed the state since that notification, and then it
-/// rejects the STOP with 1052 (a restart began) or 1061 (a STOP is already delivered). That is a new
-/// state to wait for, so the loop goes round. No iteration limit and no timing: each pass needs a
-/// state change SCM made, and a settled state that refuses STOP is an error. A STOP SCM accepts is
-/// followed by the same wait as [`stop_via_notify`]'s, armed after the STOP; that holds once nothing
-/// can start the service again, which `uninstall` guarantees by deleting it first.
+/// rejects the STOP with 1052 (a restart began) or 1061 (a STOP is already delivered). Either way the
+/// loop re-arms and waits: a re-arm on a state that has not changed does not deliver it again (P20,
+/// measured over an attended 5 s window), so after a 1061 the wait ends with the service's next
+/// change, not with another STOP. No iteration limit and no timing; a settled state that refuses STOP
+/// is an error. A STOP SCM accepts is followed by the same wait as [`stop_via_notify`]'s, armed after
+/// the STOP; that holds once nothing can start the service again, which `uninstall` arranges by
+/// setting `SERVICE_DISABLED` first (P19a, P21).
 pub fn settle_and_stop<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
     loop {
         if a.arm(WantState::RunningPausedOrStopped, deadline)? == Waited::Expired {
@@ -211,9 +210,10 @@ fn accept_as_started(reply: StartReply) -> io::Result<()> {
 /// A terminal `Stopped` before `Running` is read by `kind`. For `type: simple` it is a start when
 /// the shim launched the daemon and the daemon then ended (the recorded exit is the shim's own
 /// vocabulary, see [`RecordedExit::daemon_ran`]), except the incomplete-stop record: the daemon may
-/// still be running, so that is a failed start. A `type: managed` service speaks SCM itself, and
-/// stopping with a service-specific code before `Running` is how it reports a failed start, so for
-/// it any `Stopped` before `Running` is a failed start.
+/// still be running, so that is a failed start; a shim failure is a failed start returning `Err`. A
+/// `type: managed` service speaks SCM itself, and stopping with a service-specific code before
+/// `Running` is how it reports a failed start, so for it any `Stopped` before `Running` is a failed
+/// start. Neither blocks forever.
 ///
 /// Critical ordering: arm `RUNNING` strictly BEFORE issuing `start`, else the
 /// service can reach `RUNNING` before the arm and the notification only

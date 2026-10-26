@@ -311,7 +311,7 @@ fn settle_rows() -> Vec<Row> {
             ],
         },
         Row {
-            name: "running, a stop was already delivered (1061), then stopped",
+            name: "running, a stop was already delivered (1061), the re-arm waits without a second stop, then stopped",
             waits: vec![Some(Running), Some(Stopped)],
             accepts: vec![],
             replies: vec![StopReply::Os(CANNOT_ACCEPT_CTRL)],

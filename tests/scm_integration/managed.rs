@@ -338,7 +338,7 @@ fn uninstall_then_immediate_reinstall_succeeds() {
     assert!(matches!(outcome, Outcome::Create), "{outcome:?}");
 }
 
-// Step 4: uninstall reports a service that will not stop, which is marked for deletion by then ========================
+// Step 4: uninstall reports a service that will not stop, leaves it disabled, and is re-runnable ======================
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn uninstall_errors_when_service_will_not_stop() {
@@ -347,8 +347,8 @@ fn uninstall_errors_when_service_will_not_stop() {
     let _guard = ServiceGuard::new(&id);
     let started = ConnectBack::listen();
     // `refuse-stop`: the fixture reports RUNNING with an empty
-    // `controls_accepted`, so `ControlService(STOP)` fails *synchronously*
-    // with `ERROR_INVALID_SERVICE_CONTROL` — a real Win32 rejection, not a
+    // `controls_accepted`, so the service reads RUNNING without accepting
+    // STOP, and `uninstall` fails at once (a state it can see), not on a
     // wait that has to time out (this project forbids time-based sync).
     let spec = mk_spec(
         &id,
@@ -365,18 +365,34 @@ fn uninstall_errors_when_service_will_not_stop() {
         .expect_err("a service that declines SERVICE_CONTROL_STOP cannot be stopped by uninstall");
     let text = err.to_string();
     assert!(
-        text.contains("marked for deletion") && text.contains("does not accept STOP") && text.contains("sc.exe stop"),
-        "error should say the service is marked for deletion, why, and the remedy: {err}"
+        text.contains("does not accept STOP")
+            && text.contains("NOT deleted")
+            && text.contains("disabled")
+            && text.contains("goetia daemon kill")
+            && !text.contains("sc.exe"),
+        "error should say why, that the service was not deleted and is disabled, and the remedy: {err}"
     );
 
-    // The delete came first, so the service is marked and still running. Kill the process directly
-    // by pid (a stop would fail the same way); the record goes once it is gone.
-    let status = mgr
-        .status(&spec.id)
-        .expect("status: the marked service must still exist");
+    // The service is still there, running, and disabled.
+    let status = mgr.status(&spec.id).expect("status: the service must still exist");
     assert_eq!(status.state, State::Running);
-    let pid = status.pid.expect("a running service reports a pid");
-    support::cmd::run("taskkill.exe", &["/F", "/PID", &pid.to_string()]).expect_ok();
+    let config = support::cmd::run("sc.exe", &["qc", &id]).expect_ok();
+    assert!(
+        config.stdout.contains("DISABLED"),
+        "start type should be disabled:
+{config}"
+    );
+
+    // The named remedy, then the retry: it succeeds and the record is gone (1060).
+    mgr.kill(&spec.id).expect("kill the service uninstall could not stop");
+    mgr.uninstall(&spec.id).expect("re-running uninstall after the kill");
+    let query = support::cmd::run("sc.exe", &["query", &id]);
+    assert_eq!(
+        query.code,
+        Some(1060),
+        "the record should be gone:
+{query}"
+    );
 }
 
 // Step 5: an install interrupted before the metadata write is recoverable =============================================

@@ -733,13 +733,16 @@ once: a stop it accepts before it decides the exit is reported as a clean stop,
 which SCM does not restart; a stop that arrives after it has decided on the
 failure does not change it. SCM acknowledges that stop anyway, whatever the
 shim answers, so `stop` exits `0` and SCM restarts the command as above.
-`goetia daemon uninstall` deletes the service first, then stops whatever is
-running, a restart that had already begun included, and waits for it to stop.
-A restart queued before the delete does not fire. A stop that SCM rejects
-because the state changed is sent again on the next state. If the stop cannot
-be done, `uninstall` fails and says the service is marked for
-deletion and may still be running; `sc.exe stop <id>` stops it, and the
-service record goes once it stops.
+`goetia daemon uninstall` first sets the service's start type to disabled, so a
+restart SCM had queued, or queues later, fails and starts nothing. It then stops
+whatever is running, a restart that had already begun included, waits for it to
+stop, and deletes the service. A stop that SCM rejects because the state changed
+is sent again on the next state. If the stop cannot be done, `uninstall` fails
+and says the service was not deleted and is now disabled: `goetia daemon start`
+fails until `goetia daemon enable` or `goetia daemon disable` sets the start
+type again. Run `goetia daemon uninstall` again to retry. A service that does
+not accept a stop needs `goetia daemon kill <id>` first; `sc.exe stop` fails
+the same way.
 
 After upgrading goetia, run `goetia daemon install` again for every daemon
 installed by an older version. Services registered before this shim existed
