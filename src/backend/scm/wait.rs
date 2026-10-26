@@ -204,8 +204,13 @@ const STARTING: &str = "SCM is starting the service (for example a restart after
 ///   did not leave it stopped; an error says so, ending in `advice`. It does not wait for the
 ///   restart and does not send a second STOP.
 ///
-/// `STOPPED` alone, not the first arm's mask again: a re-arm over a `STOP_PENDING` that is already
-/// reported is not measured to fire (P20) or to stay silent (P25), and nothing here needs it to.
+/// `STOPPED` alone, not the first arm's mask again. A re-arm with the same context and buffer on the
+/// same handle is not delivered on an unchanged state (P20, P27 a); with a new context and buffer, or
+/// on a new handle, it is delivered at once (P27 b, c, f). `arm` rewrites `self.notify` in place with
+/// the same `self.status` context, so it is the first shape, except after a `reopen`
+/// (`ERROR_SERVICE_NOTIFY_CLIENT_LAGGING`), which is a new handle. Over a `STOP_PENDING` already
+/// reported, the first mask would therefore stay silent until the next change; nothing here depends
+/// on a delivery at arm time, because the status read after the arm decides.
 fn await_stopped<A: ScmActor>(a: &mut A, deadline: Deadline, advice: &str) -> io::Result<Waited> {
     loop {
         match a.wait_callback(deadline)? {
@@ -258,12 +263,13 @@ const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
 /// so SCM does not report one until the service has settled. `STOPPED` ends the loop. On `RUNNING` or
 /// `PAUSED` the STOP is sent; SCM may have changed the state since that notification, and then it
 /// rejects the STOP with 1052 (a restart began) or 1061 (a STOP is already delivered). Either way the
-/// loop re-arms and waits: a re-arm on a state that has not changed does not deliver it again (P20,
-/// measured over an attended 5 s window), so after a 1061 the wait ends with the service's next
-/// change, not with another STOP. No iteration limit and no timing; a settled state that refuses STOP
-/// is an error. A STOP SCM accepts is followed by the same wait as [`stop_via_notify`]'s, armed after
-/// the STOP; that holds once nothing can start the service again, which `uninstall` arranges by
-/// setting `SERVICE_DISABLED` first: a restart queued before that, or after it, does not start (P21).
+/// loop re-arms and waits: a re-arm with the same context and buffer on the same handle, which is
+/// what `arm` does, is not delivered on a state that has not changed (P20, P27 a; attended 5 s
+/// windows), so after a 1061 the wait ends with the service's next change, not with another STOP.
+/// No iteration limit and no timing; a settled state that refuses STOP is an error. A STOP SCM
+/// accepts is followed by the same wait as [`stop_via_notify`]'s, armed after the STOP; that holds
+/// once nothing can start the service again, which `uninstall` arranges by setting
+/// `SERVICE_DISABLED` first: a restart queued before that, or after it, does not start (P21).
 /// So the arm after the accepted STOP cannot miss a `STOPPED` that a restart follows: the STOP is sent
 /// only on a `RUNNING` notification, which an attempt in flight at the disable has already reached.
 /// A disable that lands while SCM's restart attempt is in flight does not stop it: the attempt runs

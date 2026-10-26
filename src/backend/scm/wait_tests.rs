@@ -56,8 +56,9 @@ struct FakeScm {
     state: Option<QueriedState>,
     /// The states the latest `arm` registered for.
     mask: &'static [QueriedState],
-    /// The state the latest notification reported. A re-arm on a state that has not changed does not
-    /// fire again, even with that state in the mask (P20).
+    /// The state the latest notification reported. A re-arm with the same context and buffer on the
+    /// same handle does not fire on a state that has not changed, even with that state in the mask
+    /// (P20, P27 a). This model has one handle and one context, so it is always that shape.
     last_delivered: Option<QueriedState>,
     /// How many notifications have been delivered.
     deliveries: usize,
@@ -132,9 +133,10 @@ impl FakeScm {
         }
     }
 
-    /// SCM's rule: a registration fires at once only on a current state in its mask that it has not
-    /// already reported (P20), and later only on a transition into the mask, which is the next
-    /// scripted notification. A wait with neither never returns; here it panics instead of hanging.
+    /// SCM's rule for this actor's shape (same handle, context and buffer): a registration fires at
+    /// once only on a current state in its mask that it has not already reported (P20, P27 a), and later
+    /// only on a transition into the mask, which is the next scripted notification. A wait with
+    /// neither never returns; here it panics instead of hanging.
     /// Not applied before the first notification, when the state is not scripted.
     fn assert_something_can_fire(&self) {
         let Some(state) = self.state else { return };

@@ -320,19 +320,19 @@ impl StopBus {
     /// **A failed wait is not evidence the daemon ended**, so the tree is killed as for a stop. The
     /// failure may be reported as one SCM restarts only if `kill_tree` succeeded; the daemon always
     /// runs in a Job Object (`service::launch` refuses any other containment), where `Ok` means
-    /// `TerminateJobObject` stopped every thread of every member, so nothing of the old daemon
-    /// executes. Otherwise (the tree kill failed, even if the direct child's fallback worked) the
-    /// outcome is [`WaitOutcome::DaemonMayRun`], and the bus refuses later stops: reporting a
-    /// restartable failure over a daemon that may still be running would start a second copy
-    /// beside it.
+    /// `TerminateJobObject` succeeded. Otherwise (the tree kill failed, even if the direct child's
+    /// fallback worked) the outcome is [`WaitOutcome::DaemonMayRun`], and the bus refuses later
+    /// stops: a refused termination leaves the members running indefinitely, and reporting a
+    /// restartable failure over them would start a second copy beside them.
     ///
     /// **A stop whose tree kill failed** is [`WaitOutcome::DaemonMayRun`] too, even when the direct
     /// child's fallback worked: its descendants may still run.
     ///
     /// **No drain after `kill_tree`.** `cosca`'s Job Object `hard_kill` closes the job handle as
     /// part of terminating it, so `wait_tree` afterwards always fails with "the job handle was
-    /// already closed". "Terminated" means the kill succeeded, not that the kernel has finished
-    /// releasing what the members held.
+    /// already closed". "Terminated" means the kill succeeded. Windows does not document
+    /// `TerminateJobObject` as synchronous with member teardown, so members may still be exiting
+    /// (and holding a port or a lock file) when STOPPED is reported.
     pub fn wait_for_child_or_stop(
         self: &Arc<Self>,
         waiter: Waiter,
@@ -438,8 +438,9 @@ pub(crate) enum Teardown {
 }
 
 /// Terminate the tree of a daemon that has already exited and is about to be reported `STOPPED`,
-/// so that neither SCM's restart nor a `start` overlaps what the previous run left behind. `false`
-/// (logged) means the tree may still be running and the stop must be reported as incomplete.
+/// so that a restart or `start` never runs beside a tree nobody told to end. `true` is `kill_tree`
+/// succeeding, which is not proof the members have finished exiting. `false` (logged) means the
+/// tree may still be running and the stop must be reported as incomplete.
 pub(crate) fn terminate_exited_tree(child: &Child, id: &str) -> bool {
     let Err(e) = kill_tree(child) else { return true };
     logging::log_failure(id, &exited_tree_unkilled(&e));

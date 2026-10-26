@@ -493,8 +493,8 @@ fn a_failed_wait_over_an_unkillable_daemon_is_the_incomplete_stop_record() {
 }
 
 /// The daemon has failed, so SCM will restart it: its tree is terminated first, so that the restart
-/// does not overlap descendants the previous run left. When the tree cannot be terminated the
-/// restart must not happen.
+/// never runs beside a tree nobody told to end. When the tree cannot be terminated the restart
+/// must not happen.
 #[skuld::test]
 fn a_failing_daemon_whose_tree_cannot_be_terminated_is_the_incomplete_stop_record() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");

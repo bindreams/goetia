@@ -806,9 +806,8 @@ descendants gone and SCM must not restart over a possible survivor. A `start`
 that sees the service stop with that record is a failed start.
 
 Before the shim reports the service stopped for any reason (the command exiting,
-cleanly or not, or the shim's own wait on it failing), it terminates the job, so
-neither SCM's restart nor a `start` overlaps descendants the previous run left
-behind. A `stop` terminates it the same way before it reports. If the job cannot
+cleanly or not, or the shim's own wait on it failing), it has the job terminated.
+A `stop` does the same before it reports. If the job cannot
 be terminated, the shim reports `0`, `1003` as for a `stop` it could not
 complete, whatever `stop` follows.
 
@@ -839,10 +838,11 @@ show such a service as `stopped`, and so they do one waiting out its
 `restart-delay`. `goetia daemon uninstall` does not read the record either: it
 deletes such a service, and a surviving command is left with no service.
 
-"Terminated" means the OS has stopped every thread of the command and its
-descendants, not that it has finished releasing what they held. A restarted
-command can briefly find a resource its predecessor held (a listening port, say)
-and fail; SCM retries it like any other failure.
+"Terminated" means the shim asked Windows to terminate the job and the call
+succeeded. Windows does not report when that termination has finished, so a
+restart or `start` can briefly overlap the previous run's processes while they
+exit, and a resource they held (a listening port, a lock file) may still be
+taken. Such a start fails like any other.
 
 ### What returning means
 
