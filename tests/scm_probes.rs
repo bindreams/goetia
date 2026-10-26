@@ -1,6 +1,6 @@
 //! THROWAWAY (issue #59, phase A): measures how the Windows SCM treats a
 //! service's reported exit, so the shim's design rests on measurements.
-//! Round 9: P22 (`NotifyServiceStatusChangeW` on a delete-marked service), P20 (re-arming on an unchanged state in the mask), P21 (a `SERVICE_DISABLED` service and recovery), P19 (the disable-or-delete instant against a due restart). Never merges. Every observation is a `PROBE ...` line in the job log.
+//! Round 10: P23 (a disable that lands while SCM's restart attempt is in flight). Earlier rounds' probes stay in the file, unused. Never merges. Every observation is a `PROBE ...` line in the job log.
 //!
 //! This binary is also the service host: `<exe> --probe-host <name> <port> <scripts>`
 //! where `<scripts>` is `|`-separated, one script per run of the service
@@ -2561,24 +2561,334 @@ mod probes {
         )
     }
 
+    // P23 =============================================================================================================
+
+    /// An attended window after the action: what happens "within it" is read by a human, not proof.
+    const P23_WINDOW: Duration = Duration::from_millis(500);
+
+    /// Epoch microseconds, to line a sample up with an event's `TimeCreated`.
+    fn epoch_us() -> i64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as i64
+    }
+
+    /// `2026-10-24T21:23:21.3623361Z` as microseconds since the epoch.
+    fn iso_to_us(t: &str) -> Option<i64> {
+        let ms = iso_to_ms(t)?;
+        let frac = t.trim_end_matches('Z').split_once('.').map_or("", |x| x.1);
+        let digits = format!("{:0<6}", &frac[..frac.len().min(6)]);
+        let sub: i64 = digits[3..6].parse().ok()?;
+        Some(ms * 1000 + sub)
+    }
+
+    #[derive(Clone, Copy)]
+    enum P23Kind {
+        /// No disable: the time from STOPPED to START_PENDING and to the connect-back.
+        Baseline,
+        /// Disable this many ms after the anchor (busy-wait on a high-resolution clock).
+        DisableAfterMs(u64),
+        /// Disable as soon as START_PENDING is visible in the status.
+        DisableAtStartPending,
+    }
+
+    struct P23Result {
+        anchor: String,
+        entered: bool,
+    }
+
+    /// One failure, one optional disable, one observation window, then back to a RUNNING host
+    /// waiting at `signal-wait` with the start type restored.
+    fn p23_sample(p: &mut Probe, go: &Signal, kind: P23Kind, label: &str, i: u32) -> P23Result {
+        const RUNNING: u32 = Services::SERVICE_RUNNING;
+        const STOPPED: u32 = Services::SERVICE_STOPPED;
+        const START_PENDING: u32 = Services::SERVICE_START_PENDING;
+        while p.connect(p.seen.len(), Duration::ZERO).is_some() {}
+        let k = p.seen.len();
+        let h = p.service(
+            ServiceAccess::START | ServiceAccess::STOP | ServiceAccess::QUERY_STATUS | ServiceAccess::CHANGE_CONFIG,
+        );
+        let (rc, ctx) = register_notify(p, &h, N_STOPPED);
+        let fired_at = Instant::now();
+        go.fire();
+
+        // The anchor: the STOPPED notification, or the status if that is seen first (or the
+        // notification never comes). The loop re-checks the real condition; the bound is only the
+        // failure surface for a host that never fails.
+        let how = loop {
+            unsafe { SleepEx(0, 1) };
+            if ctx.fired.load(Ordering::SeqCst) {
+                break "notify".to_string();
+            }
+            match raw_query(&h) {
+                Ok(s) if s.dwCurrentState == STOPPED => break "poll-stopped".to_string(),
+                Ok(s) if s.dwCurrentState != RUNNING => break format!("late-state-{}", s.dwCurrentState),
+                _ => {}
+            }
+            if fired_at.elapsed() >= EXPECTED_BOUND {
+                break "bound".to_string();
+            }
+        };
+        let anchor = Instant::now();
+        let anchor_after_fire_us = anchor.duration_since(fired_at).as_micros();
+
+        // (start, end, status-right-after) in microseconds after the anchor.
+        let disable = |h: &Service| {
+            let a = anchor.elapsed().as_micros();
+            let r = change_start_type(h, Services::SERVICE_DISABLED);
+            let b = anchor.elapsed().as_micros();
+            let st = raw_query(h);
+            let c = anchor.elapsed().as_micros();
+            (a, b, c, r, st)
+        };
+        let mut off_ms = "na".to_string();
+        let mut trigger = String::new();
+        let mut acted = None;
+        match kind {
+            P23Kind::Baseline => {}
+            P23Kind::DisableAfterMs(ms) => {
+                off_ms = ms.to_string();
+                let off = Duration::from_millis(ms);
+                while anchor.elapsed() < off {
+                    std::hint::spin_loop();
+                }
+                acted = Some(disable(&h));
+            }
+            P23Kind::DisableAtStartPending => {
+                let seen = loop {
+                    match raw_query(&h) {
+                        Ok(s) if s.dwCurrentState == START_PENDING => break Some(fmt_raw(&s)),
+                        Ok(s) if s.dwCurrentState == RUNNING => break None,
+                        _ => {}
+                    }
+                    if anchor.elapsed() >= EXPECTED_BOUND {
+                        break None;
+                    }
+                };
+                trigger = format!("START_PENDING seen: {seen:?}");
+                if seen.is_some() {
+                    acted = Some(disable(&h));
+                }
+            }
+        }
+
+        // The window: every change in the status, and the connect-back.
+        let after_state = acted.as_ref().and_then(|a| a.4.as_ref().ok()).map(|s| s.dwCurrentState);
+        let mut last = acted
+            .as_ref()
+            .and_then(|a| a.4.as_ref().ok())
+            .map(fmt_raw)
+            .unwrap_or_default();
+        let mut states = Vec::new();
+        let mut changes = Vec::new();
+        let mut connect_us: Option<i128> = None;
+        let anchor_since_t0 = anchor.duration_since(p.t0).as_micros() as i128;
+        let window_end = Instant::now() + P23_WINDOW;
+        while Instant::now() < window_end {
+            if let Ok(s) = raw_query(&h) {
+                let cur = fmt_raw(&s);
+                if cur != last {
+                    changes.push(format!("+{}us {cur}", anchor.elapsed().as_micros()));
+                    states.push(s.dwCurrentState);
+                    last = cur;
+                }
+            }
+            if connect_us.is_none() {
+                connect_us = p
+                    .connect(k, Duration::ZERO)
+                    .map(|c| c.at.as_micros() as i128 - anchor_since_t0);
+            }
+        }
+        let entered = after_state.is_some_and(|s| s == START_PENDING || s == RUNNING)
+            || states.iter().any(|s| *s == START_PENDING || *s == RUNNING)
+            || connect_us.is_some();
+
+        // Let an attempt still in flight finish before the start type is restored.
+        while raw_query(&h).is_ok_and(|s| s.dwCurrentState == START_PENDING) {
+            if anchor.elapsed() >= EXPECTED_BOUND {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let final_status = query_via(&h);
+        let restore = if acted.is_some() {
+            change_start_type(&h, Services::SERVICE_DEMAND_START)
+        } else {
+            "n/a".to_string()
+        };
+        let mut start = "n/a".to_string();
+        if raw_query(&h).is_ok_and(|s| s.dwCurrentState == STOPPED) {
+            start = format!("{:?}", h.start::<&str>(&[]).map_err(|e| format!("{e:?}")));
+        }
+        let reconnect = p.connect(k, EXPECTED_BOUND).is_some();
+        let running = wait_state_via(&h, RUNNING, EXPECTED_BOUND);
+
+        let (act_text, act_row) = match &acted {
+            None => ("no disable".to_string(), "disable_us=na after_state=na".to_string()),
+            Some((a, b, c, r, st)) => {
+                let st_text = match st {
+                    Ok(s) => fmt_raw(s),
+                    Err(e) => format!("query error {e}"),
+                };
+                (
+                    format!(
+                        "ChangeServiceConfigW(SERVICE_DISABLED) -> {r} from +{a}us to +{b}us after the anchor; QueryServiceStatusEx right after it (+{c}us): {st_text}"
+                    ),
+                    format!(
+                        "disable_us={a}..{b} disable_result={r} after_state={}",
+                        st.as_ref().map(|s| s.dwCurrentState).unwrap_or(0)
+                    ),
+                )
+            }
+        };
+        p.p(format_args!(
+            "P23 {label} sample {i}: STOPPED registration rc {rc}; anchor {how} {anchor_after_fire_us}us after the fire; {trigger} {act_text}; status changes in the {}ms window: [{}]; connect-back (us after the anchor): {connect_us:?}; final status {final_status}; start type restore {restore}; StartService {start}; reconnected {reconnect} running {running}",
+            P23_WINDOW.as_millis(),
+            changes.join("; ")
+        ));
+        p.p(format_args!(
+            "P23ROW label={label} i={i} off_ms={off_ms} anchor={how} {act_row} saw_states={states:?} connect_us={} entered={entered} final_state={}",
+            connect_us.map_or("none".to_string(), |c| c.to_string()),
+            raw_query(&h).map(|s| s.dwCurrentState).unwrap_or(0)
+        ));
+        drop(h);
+        P23Result { anchor: how, entered }
+    }
+
+    struct ScmEvent {
+        label: String,
+        created_us: i64,
+    }
+
+    /// This service's System-log events from the probe's lifetime. `label` is the EventID, with the
+    /// state for 7036 and the other `<Data>` values (minus the service's own names) for the rest.
+    fn p23_scm_events(p: &Probe) -> Vec<ScmEvent> {
+        let age_ms = p.t0.elapsed().as_millis() + 5000;
+        let query = format!(
+            "*[System[Provider[@Name='Service Control Manager'] and TimeCreated[timediff(@SystemTime) <= {age_ms}]]]"
+        );
+        let Ok(o) = Command::new("wevtutil")
+            .args(["qe", "System", &format!("/q:{query}"), "/f:xml", "/rd:false"])
+            .output()
+        else {
+            return Vec::new();
+        };
+        let text = String::from_utf8_lossy(&o.stdout).to_string();
+        let mut out = Vec::new();
+        for e in text.split("</Event>").filter(|s| s.contains("<Event")) {
+            if !(e.contains(&p.display) || e.contains(&p.name)) {
+                continue;
+            }
+            let id = e
+                .find("<EventID")
+                .and_then(|i| between(&e[i..], ">", "</EventID>"))
+                .unwrap_or("?");
+            let data: Vec<&str> = e
+                .split("<Data")
+                .skip(1)
+                .filter_map(|seg| between(seg, ">", "</Data>"))
+                .collect();
+            let label = if id == "7036" {
+                format!("7036{}", data.get(1).copied().unwrap_or("?"))
+            } else {
+                let extra: Vec<&str> = data
+                    .iter()
+                    .copied()
+                    .filter(|d| !d.contains(&p.display) && !d.contains(&p.name))
+                    .collect();
+                format!("{id}[{}]", extra.join("|"))
+            };
+            let created = between(e, "SystemTime='", "'").unwrap_or("?");
+            if let Some(created_us) = iso_to_us(created) {
+                out.push(ScmEvent { label, created_us });
+            }
+        }
+        out.sort_by_key(|e| e.created_us);
+        out
+    }
+
+    /// Prints the events grouped per sample: group n starts at the n-th 7036 "stopped" (the failure
+    /// of sample n; its 7024 and 7031 carry the same `TimeCreated`), offsets in ms from it.
+    fn p23_events(p: &Probe, label: &str, samples: u32) {
+        // 120 s is the failure bound for an event that never comes (the log lags by up to ~1.1 s).
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let events = loop {
+            let evs = p23_scm_events(p);
+            let stops = evs.iter().filter(|e| e.label == "7036stopped").count() as u32;
+            if stops >= samples {
+                break evs;
+            }
+            if Instant::now() >= deadline {
+                p.p(format_args!(
+                    "P23EV {label}: log showed {stops} stopped events, wanted {samples} (failure bound 120s)"
+                ));
+                break evs;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let starts: Vec<i64> = events
+            .iter()
+            .filter(|e| e.label == "7036stopped")
+            .map(|e| e.created_us)
+            .collect();
+        for g in 0..=starts.len() {
+            let base = if g == 0 {
+                events.first().map_or(0, |e| e.created_us)
+            } else {
+                starts[g - 1]
+            };
+            let mut parts = Vec::new();
+            for e in &events {
+                if starts.partition_point(|s| *s <= e.created_us) == g {
+                    parts.push(format!("{}@{:+.3}ms", e.label, (e.created_us - base) as f64 / 1000.0));
+                }
+            }
+            p.p(format_args!("P23EV {label} group {g}: {}", parts.join(" ")));
+        }
+    }
+
+    /// P23: a disable that lands while SCM's restart attempt (delay 0) is in flight. One service
+    /// per job; `samples` failures on it, each followed by the same restore.
+    fn p23(label: String, kind: P23Kind, samples: u32) -> String {
+        let tag = format!("P23{label}");
+        let mut p = Probe::with_observers(&tag, "run,connect,signal-wait,stopped:spec:7", "restart/0", false);
+        let go = Signal::create(&p.name);
+        let _ = p.start();
+        p.connect(0, EXPECTED_BOUND);
+        {
+            let h = p.service(ServiceAccess::QUERY_STATUS);
+            wait_state_via(&h, Services::SERVICE_RUNNING, EXPECTED_BOUND);
+        }
+        let mut entered = 0u32;
+        let mut anchors = std::collections::BTreeMap::<String, u32>::new();
+        for i in 1..=samples {
+            let r = p23_sample(&mut p, &go, kind, &label, i);
+            entered += u32::from(r.entered);
+            *anchors.entry(r.anchor).or_default() += 1;
+        }
+        p23_events(&p, &label, samples);
+        let r = format!("{samples} samples; attempt entered START_PENDING/RUNNING in {entered}; anchors {anchors:?}");
+        p.result(&r);
+        r
+    }
+
     // Driver ==========================================================================================================
 
     pub fn run_all() {
         // Sequential: the System-log events of a probe must be its own.
         type Job = Box<dyn FnOnce() -> String + Send>;
-        let jobs: Vec<(&'static str, Job)> = vec![
-            ("P22a", Box::new(|| p22("a"))),
-            ("P22b", Box::new(|| p22("b"))),
-            ("P22c", Box::new(|| p22("c"))),
-            ("P20a", Box::new(|| p20("a"))),
-            ("P20b", Box::new(|| p20("b"))),
-            ("P20c", Box::new(|| p20("c"))),
-            ("P21c", Box::new(p21c)),
-            ("P21a", Box::new(|| p21("a"))),
-            ("P21b", Box::new(|| p21("b"))),
-            ("P19a", Box::new(|| p19("a"))),
-            ("P19b", Box::new(|| p19("b"))),
-        ];
+        let mut jobs: Vec<(String, Job)> = vec![(
+            "P23base".to_string(),
+            Box::new(|| p23("base".to_string(), P23Kind::Baseline, 10)),
+        )];
+        for ms in 0..=20u64 {
+            jobs.push((
+                format!("P23o{ms:02}"),
+                Box::new(move || p23(format!("o{ms:02}"), P23Kind::DisableAfterMs(ms), 8)),
+            ));
+        }
+        jobs.push((
+            "P23b".to_string(),
+            Box::new(|| p23("b".to_string(), P23Kind::DisableAtStartPending, 10)),
+        ));
         println!("PROBE SUMMARY begin");
         for (name, job) in jobs {
             let res = thread::spawn(move || catch_unwind(AssertUnwindSafe(job))).join();
