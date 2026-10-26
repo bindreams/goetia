@@ -13,14 +13,12 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// `%ProgramData%\Goetia\logs\<id>.log` — derivable from `id` alone. This is
 /// also the design spec's own OS-default `logs:` path for `type: simple` on
 /// Windows when `goetia.yaml` sets none (§2, "`logs` default"), so a daemon
-/// that never overrides `logs:` has no fallback/real distinction at all —
-/// see `log_failure`'s doc comment for why that coincidence is load-bearing
-/// rather than accidental.
+/// that never overrides `logs:` has no fallback/real distinction at all.
 pub fn default_log_path(id: &str) -> PathBuf {
     programdata_dir().join("Goetia").join("logs").join(format!("{id}.log"))
 }
@@ -32,7 +30,7 @@ fn programdata_dir() -> PathBuf {
 }
 
 /// Open `path` for append, creating parent directories first.
-pub fn open_append(path: &std::path::Path) -> std::io::Result<File> {
+pub fn open_append(path: &Path) -> std::io::Result<File> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -115,11 +113,77 @@ pub mod eventlog {
 /// Event Log — both best-effort, so a decode or spawn failure is never lost
 /// just because one of the two channels is itself unavailable (see the
 /// module doc comment for why each can independently fail).
+///
+/// A test build journals the line instead; see `test_hook`.
 pub fn log_failure(id: &str, message: &str) {
-    let line = format!("goetia-shim[{id}]: {message}");
+    let line = failure_line(id, message);
     eprintln!("{line}");
-    if let Ok(mut f) = open_append(&default_log_path(id)) {
-        append_line(&mut f, &line);
-    }
-    eventlog::report_error(&line);
+    #[cfg(not(test))]
+    write_channels(id, &line, default_log_path, eventlog::report_error);
+    #[cfg(test)]
+    test_hook::report(id, line);
 }
+
+pub fn failure_line(id: &str, message: &str) -> String {
+    format!("goetia-shim[{id}]: {message}")
+}
+
+/// Compiled in every build so test builds still type-check the production channels. Takes the
+/// path derivation and the Event Log write as parameters so a test can drive the real composition
+/// against a temp path and a stub.
+fn write_channels(id: &str, line: &str, log_path: impl FnOnce(&str) -> PathBuf, event_log: impl FnOnce(&str)) {
+    write_fallback(&log_path(id), line);
+    event_log(line);
+}
+
+/// Best-effort: a failure to open or write is ignored.
+fn write_fallback(path: &Path, line: &str) {
+    if let Ok(mut f) = open_append(path) {
+        append_line(&mut f, line);
+    }
+}
+
+// test_hook ===========================================================================================================
+
+/// Lines a test build's `log_failure` records instead of writing, keyed by daemon id so a test can
+/// take lines logged on any thread once it has a happens-before with them.
+#[cfg(test)]
+pub(crate) mod test_hook {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, PoisonError};
+
+    /// Poison is recovered from: one panicking test must not make later `log_failure` calls panic.
+    pub(super) static REPORTED: Mutex<BTreeMap<String, Vec<String>>> = Mutex::new(BTreeMap::new());
+
+    pub(super) fn report(id: &str, line: String) {
+        REPORTED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(id.to_string())
+            .or_default()
+            .push(line);
+    }
+
+    /// `id`'s lines, oldest first, removed.
+    pub(crate) fn take(id: &str) -> Vec<String> {
+        REPORTED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id)
+            .unwrap_or_default()
+    }
+
+    /// `id`'s lines, oldest first, left in place.
+    pub(crate) fn peek(id: &str) -> Vec<String> {
+        REPORTED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+#[path = "logging_tests.rs"]
+mod logging_tests;

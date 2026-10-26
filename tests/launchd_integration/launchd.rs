@@ -277,8 +277,8 @@ fn hand_edit_is_detected_as_conflict() {
 
 /// The genuine TOCTOU race this guards against — a foreign write landing
 /// between `discover`'s read and the actual persist — is unit-tested
-/// directly against `write_new` in
-/// `src/backend/launchd/manager_tests.rs::write_new_does_not_clobber_existing_content`,
+/// directly against `persist_new` in
+/// `src/backend/launchd/manager_tests.rs::persist_new_does_not_clobber_existing_content`,
 /// where the target is a plain tempdir path and the timing is therefore
 /// deterministic rather than dependent on winning a race with the
 /// scheduler. This is the end-to-end complement, through the real
@@ -398,7 +398,7 @@ fn disable_returns_the_plist_to_staging() {
         State::Running,
         "disable must not stop a job that was loaded"
     );
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop"); // tidy up before the guard's uninstall
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
 }
 
 // Runtime behavior ====================================================================================================
@@ -433,6 +433,130 @@ fn start_stop_status_reflect_reality() {
 
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
     assert_ne!(mgr.status(&spec.id).unwrap().state, State::Running);
+}
+
+// kill ================================================================================================================
+
+/// The test binary as a daemon that reports in on every start, under `restart`.
+fn reporting(id: &str, restart: Restart, listener: &ConnectBack) -> DaemonSpec {
+    let mut spec = base_spec(
+        id,
+        vec![
+            support::current_exe_str(),
+            support::sentinel::RUN_UNTIL_KILLED.to_string(),
+            listener.port().to_string(),
+        ],
+    );
+    spec.restart = restart;
+    spec
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_killed_always_restart_daemon_comes_back_with_a_new_pid() {
+    let mgr = LaunchdManager::new();
+    let listener = ConnectBack::listen();
+    let spec = reporting(&support::random_test_id(), Restart::Always, &listener);
+    let _guard = Guard::install(&mgr, &spec);
+
+    support::kill::a_killed_daemon_comes_back_with_a_new_pid(&mgr, &spec.id, &listener);
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_killed_never_restart_daemon_stays_down() {
+    let mgr = LaunchdManager::new();
+    let listener = ConnectBack::listen();
+    let spec = reporting(&support::random_test_id(), Restart::Never, &listener);
+    let _guard = Guard::install(&mgr, &spec);
+
+    support::kill::a_killed_daemon_that_never_restarts_stays_down(&mgr, &spec.id, &listener, &|| {
+        let id = spec.id.as_str();
+        let plist = [enabled_path(id), staging_path(id)]
+            .into_iter()
+            .find_map(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_else(|| panic!("no plist of `{id}` to read"));
+        assert!(
+            !plist.contains("<key>KeepAlive</key>"),
+            "the job has a KeepAlive: {plist}"
+        );
+        let printed = cmd::run("launchctl", &["print", &format!("system/{id}")]);
+        assert!(
+            !printed.stdout.contains("state = running"),
+            "the job is running: {printed}"
+        );
+    });
+}
+
+/// Both ways a job has no process: never loaded, and loaded then booted out by `stop`. And the
+/// third, which only a job launchd keeps loaded can show: a `restart: never` job that was killed
+/// stays loaded with no process, and a second kill finds nothing to signal.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn killing_a_job_with_no_process_is_not_running() {
+    let mgr = LaunchdManager::new();
+    let listener = ConnectBack::listen();
+    let spec = reporting(&support::random_test_id(), Restart::Never, &listener);
+    let _guard = Guard::install(&mgr, &spec);
+    let get_manager = || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(LaunchdManager::new())) };
+
+    support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.id);
+
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    listener.accept("the daemon to report in after start");
+    mgr.kill(&spec.id).expect("kill");
+    support::kill::until(|| mgr.status(&spec.id).expect("status").state != State::Running);
+    support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.id);
+
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.id);
+}
+
+/// launchd cannot update a loaded job, so a changed spec over one is refused with the plist and the
+/// running daemon untouched, and goes through once the job has been stopped.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn install_refuses_a_changed_spec_while_the_job_is_loaded() {
+    let mgr = LaunchdManager::new();
+    let id = support::random_test_id();
+    let listener = ConnectBack::listen();
+    let mut spec = base_spec(
+        &id,
+        vec![
+            support::current_exe_str(),
+            support::sentinel::RUN_UNTIL_KILLED.to_string(),
+            listener.port().to_string(),
+        ],
+    );
+    let _guard = Guard::install(&mgr, &spec);
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    listener.accept("the daemon to report in after start");
+    let installed = std::fs::read_to_string(staging_path(&id)).unwrap();
+
+    spec.env.insert("GOETIA_TEST_REVISION".to_string(), "2".to_string());
+    let refused = mgr
+        .install(&spec, false)
+        .expect_err("a changed spec over a loaded job must be refused");
+    assert!(
+        refused.to_string().contains(&format!("goetia daemon stop {id}")),
+        "the refusal must give the remedy: {refused}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(staging_path(&id)).unwrap(),
+        installed,
+        "a refused install must leave the plist as it was"
+    );
+    assert_eq!(
+        mgr.status(&spec.id).unwrap().state,
+        State::Running,
+        "a refused install must not stop the daemon"
+    );
+
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    assert!(
+        matches!(mgr.install(&spec, false), Ok(Outcome::Update { .. })),
+        "the same install must go through once the job is not loaded"
+    );
+    assert_ne!(std::fs::read_to_string(staging_path(&id)).unwrap(), installed);
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start the updated daemon");
+    listener.accept("the updated daemon to report in");
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
 }
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -947,8 +1071,8 @@ fn a_start_with_no_budget_is_ok_for_a_restart_always_job() {
 
 // Parent directories ==================================================================================================
 
-/// `install` `create_dir_all`s `cwd` and the parent of `logs`, then hands
-/// each to the daemon's own account — otherwise a non-root daemon whose
+/// `install` creates a missing `cwd` and parent of `logs`, and hands each
+/// component it created to the daemon's own account — otherwise a non-root daemon whose
 /// `WorkingDirectory` or `StandardOutPath` names a directory only root can
 /// write into fails at launch with an opaque status.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -1017,12 +1141,12 @@ impl Drop for DirGuard {
 
 // Non-regular occupants ===============================================================================================
 
-/// Regression coverage for the `locate`/`write_new` classification
+/// Regression coverage for the `locate`/`persist_new` classification
 /// mismatch: `Path::is_file` (what `locate` used to check) is `false` for
 /// a directory, while `link`(2) (what `persist_noclobber` uses) refuses to
 /// create over one exactly as it would over a regular file. That mismatch
 /// made a directory sitting at a fresh id's staging path classify as
-/// `Absent` -> `Create` -> `write_new` -> `Raced` -> re-`install` -> the
+/// `Absent` -> `Create` -> `persist_new` -> `Raced` -> re-`install` -> the
 /// identical classification, an unbounded recursion that would eventually
 /// abort the process. `locate` now uses `symlink_metadata`, so a directory
 /// is "occupied" like anything else, and `discover`'s read classifies it

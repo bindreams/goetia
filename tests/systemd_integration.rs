@@ -22,5 +22,10 @@ mod no_manager;
 mod not_loaded;
 
 fn main() {
+    // Dispatched before the harness starts; see `support::sentinel`. This binary is itself the
+    // daemon the `kill` tests install and start.
+    if support::sentinel::run_if_requested() {
+        return;
+    }
     skuld::run_all();
 }

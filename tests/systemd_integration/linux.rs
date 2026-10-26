@@ -522,6 +522,76 @@ fn start_stop_status_reflect_reality() {
     assert!(status.pid.is_none(), "{status:?}");
 }
 
+// kill ================================================================================================================
+
+/// The test binary as a daemon that reports in on every start, under `restart`.
+fn reporting(id: &str, restart: Restart, listener: &support::ConnectBack) -> DaemonSpec {
+    let mut spec = mk(id);
+    spec.command = vec![
+        support::current_exe_str(),
+        support::sentinel::RUN_UNTIL_KILLED.to_string(),
+        listener.port().to_string(),
+    ];
+    spec.restart = restart;
+    spec
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_killed_always_restart_daemon_comes_back_with_a_new_pid() {
+    let guard = ServiceGuard::new(support::random_test_id());
+    let listener = support::ConnectBack::listen();
+    let spec = reporting(guard.id(), Restart::Always, &listener);
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+
+    support::kill::a_killed_daemon_comes_back_with_a_new_pid(&mgr, &spec.id, &listener);
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_killed_never_restart_daemon_stays_down() {
+    let guard = ServiceGuard::new(support::random_test_id());
+    let listener = support::ConnectBack::listen();
+    let spec = reporting(guard.id(), Restart::Never, &listener);
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+
+    let unit = format!("{}.service", spec.id);
+    support::kill::a_killed_daemon_that_never_restarts_stays_down(&mgr, &spec.id, &listener, &|| {
+        let shown = cmd::run(
+            "systemctl",
+            &["show", "--property=Restart,NRestarts,SubState", "--", &unit],
+        )
+        .expect_ok();
+        for expected in ["Restart=no", "NRestarts=0"] {
+            assert!(
+                shown.stdout.lines().any(|line| line == expected),
+                "no `{expected}` in {shown}"
+            );
+        }
+        assert!(
+            !shown.stdout.lines().any(|line| line == "SubState=auto-restart"),
+            "the unit is waiting to restart: {shown}"
+        );
+    });
+}
+
+/// An installed unit that was never started is not loaded; one that was stopped is loaded or not
+/// depending on what still refers to it. Both are `NotRunning`, off `systemctl kill`'s own answer.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn killing_a_stopped_unit_is_not_running() {
+    let guard = ServiceGuard::new(support::random_test_id());
+    let spec = mk(guard.id());
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+    let get_manager = || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(Systemd::new())) };
+
+    support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.id);
+
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.id);
+}
+
 /// `ActiveState` and `Job` as `systemctl show` reports them: the job is empty when none is queued.
 pub(crate) fn active_state_and_job(id: &str) -> (String, String) {
     let unit = format!("{id}.service");
@@ -1683,38 +1753,39 @@ fn install_creates_and_owns_fresh_cwd_and_logs_dirs_for_a_named_user() {
 }
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn install_refuses_a_preexisting_cwd_the_target_account_cannot_write() {
+fn install_accepts_preexisting_dirs_the_target_account_cannot_write() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
-    let cwd = std::env::temp_dir().join(format!("{}-preexisting-cwd", guard.id()));
-    fs::create_dir(&cwd).unwrap_or_else(|e| panic!("mkdir {}: {e}", cwd.display()));
-    fs::set_permissions(&cwd, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
-    let _rm = RmDirAll(cwd.clone());
+    let base = std::env::temp_dir().join(format!("{}-preexisting", guard.id()));
+    let cwd = base.join("work");
+    let log_dir = base.join("logs");
+    for dir in [&cwd, &log_dir] {
+        fs::create_dir_all(dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    }
+    let _rm = RmDirAll(base.clone());
 
     let mut spec = mk(guard.id());
     spec.user = User::Name("nobody".to_string());
     spec.cwd = Some(cwd.clone());
+    spec.logs = Some(log_dir.join("out.log"));
 
     let mgr = Systemd::new();
-    let err = mgr
-        .install(&spec, false)
-        .expect_err("install must refuse a cwd the target account cannot write");
-    assert!(err.to_string().contains("not writable"), "{err}");
+    mgr.install(&spec, false).expect("install");
 
-    let meta = fs::metadata(&cwd).expect("stat");
-    assert_eq!(
-        meta.permissions().mode() & 0o777,
-        0o700,
-        "a pre-existing directory's mode must not be widened, even on refusal"
-    );
-    assert_eq!(
-        meta.uid(),
-        0,
-        "a pre-existing directory's owner must not be reassigned, even on refusal"
-    );
+    for dir in [&cwd, &log_dir] {
+        let meta = fs::metadata(dir).expect("stat");
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o700,
+            "{}: mode must be untouched",
+            dir.display()
+        );
+        assert_eq!(meta.uid(), 0, "{}: owner must be untouched", dir.display());
+    }
 }
 
-/// The mixed case `ensure_writable_dir`'s own doc comment is about: an ancestor that already exists
+/// The mixed case `ensure_dir`'s own doc comment is about: an ancestor that already exists
 /// must never be touched, even when a deeper, freshly-created component under it is.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn install_leaves_a_preexisting_ancestor_directory_untouched() {

@@ -41,10 +41,13 @@
 //!    root-only, breaking the promise that `list`/`show`/`diff` need no elevation.
 //!    [`write::write_temp_unit`] `chmod`s 0644 before persisting.
 //! 5. **Parent directories.** [`dirs::ensure_parent_dirs`] creates and, for a non-root account,
-//!    `chown`s the parents of `logs` and `cwd` while still elevated — otherwise
-//!    `StandardOutput=append:` fails the unit at start with an opaque status. Only path components
-//!    this call actually creates are touched; an already-existing directory's mode and ownership are
-//!    left alone, and verified writable by the target account instead.
+//!    `chown`s the parents of `logs` and `cwd` while still elevated. A missing log directory fails
+//!    the unit at start (`ENOENT` opening `StandardOutput=append:`), and a missing `cwd` fails it
+//!    with `200/CHDIR`. Only path components this call actually creates are touched; an
+//!    already-existing directory is not checked, because install is not a start. systemd opens the
+//!    log file as root before it drops privileges, so an existing log directory is never a problem
+//!    for the account; it `chdir`s into `cwd` after the switch, so only a `cwd` the account cannot
+//!    traverse fails at start.
 //! 6. **Uninstall order** is stop -> `systemctl disable` -> remove -> `daemon-reload`. Disabling
 //!    after the fragment is gone is impossible (no `[Install]` section left to read), which would
 //!    leave exactly the `.wants` symlink `uninstall_leaves_nothing` checks for.
@@ -71,8 +74,8 @@ use std::path::{Path, PathBuf};
 
 use discover::{DROPIN_SEARCH_DIRS, RawState, absent_error, classify_and_read, discover, raw_state, require_installed};
 use systemctl::{
-    daemon_reload, daemon_reload_or_report, gate_scope, request_restart_impl, require_supported, run_systemctl,
-    start_impl, status_from_unit, stop_impl,
+    daemon_reload, daemon_reload_or_report, disable_impl, enable_impl, gate_scope, kill_impl, request_restart_impl,
+    require_supported, start_impl, status_from_unit, stop_impl,
 };
 use write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 
@@ -183,7 +186,6 @@ impl ServiceManager for Systemd {
     fn uninstall(&self, id: &Id) -> Result<()> {
         let id = id.as_str();
         let expected_text = require_installed(id)?;
-        let unit = unit_name(id);
         // One version gate for the stop, the `disable` and the `daemon-reload`: the stop's.
         let _gate = gate_scope();
 
@@ -194,13 +196,7 @@ impl ServiceManager for Systemd {
         // failed uninstall where today it succeeds.
         stop_impl(id, Budget::Unbounded, Budget::Unbounded.start())?;
 
-        let disabled = run_systemctl(&["disable", &unit])?;
-        if !disabled.status.success() {
-            return Err(Error::Other(format!(
-                "systemctl disable {unit} failed: {}",
-                String::from_utf8_lossy(&disabled.stderr)
-            )));
-        }
+        disable_impl(id)?;
 
         // Verified removal, mirroring `replace_unit_verified`: the gap since `require_installed`
         // spans two full `systemctl` round-trips, wide enough for something else to have replaced
@@ -235,31 +231,13 @@ impl ServiceManager for Systemd {
     fn enable(&self, id: &Id) -> Result<()> {
         let id = id.as_str();
         require_installed(id)?;
-        let unit = unit_name(id);
-        let output = run_systemctl(&["enable", &unit])?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(Error::Other(format!(
-                "systemctl enable {unit} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )))
-        }
+        enable_impl(id)
     }
 
     fn disable(&self, id: &Id) -> Result<()> {
         let id = id.as_str();
         require_installed(id)?;
-        let unit = unit_name(id);
-        let output = run_systemctl(&["disable", &unit])?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(Error::Other(format!(
-                "systemctl disable {unit} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )))
-        }
+        disable_impl(id)
     }
 
     fn start(&self, id: &Id, budget: Budget) -> Result<()> {
@@ -306,6 +284,12 @@ impl ServiceManager for Systemd {
 
     fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
         stop_with(id.as_str(), budget, &REAL_STEPS)
+    }
+
+    fn kill(&self, id: &Id) -> Result<()> {
+        let id = id.as_str();
+        require_installed(id)?;
+        kill_impl(id)
     }
 
     fn status(&self, id: &Id) -> Result<Status> {
