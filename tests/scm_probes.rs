@@ -1,6 +1,6 @@
 //! THROWAWAY (issue #59, phase A): measures how the Windows SCM treats a
 //! service's reported exit, so the shim's design rests on measurements.
-//! Round 12: P25 (a service process that exits before it reports any status). Earlier rounds' probes stay in the file, unused. Never merges. Every observation is a `PROBE ...` line in the job log.
+//! Round 13: P26 (a STOP_PENDING held past its wait hint). Earlier rounds' probes stay in the file, unused. Never merges. Every observation is a `PROBE ...` line in the job log.
 //!
 //! This binary is also the service host: `<exe> --probe-host <name> <port> <scripts>`
 //! where `<scripts>` is `|`-separated, one script per run of the service
@@ -8,8 +8,9 @@
 //! A script is `,`-separated steps: `pending`, `run`, `connect`, `wait-stop`,
 //! `stopped:w32:<n>`, `stopped:spec:<n>`, `rawstopped:<w32>:<spec>`, `exit:<n>`,
 //! `preexit:<n>` (as the run's only step: connect back, then exit before `StartServiceCtrlDispatcherW`),
-//! `hold:<ms>` (stay in the state reported so far, e.g. START_PENDING), `stoppending` (report
-//! STOP_PENDING, checkpoint 1, tracing whether `SetServiceStatus` succeeded), `signal-wait` (block
+//! `hold:<ms>` (stay in the state reported so far, e.g. START_PENDING), `stoppending[:<hint_ms>]`
+//! (report STOP_PENDING, checkpoint 1, hint 10000 ms unless given, tracing whether
+//! `SetServiceStatus` succeeded), `signal-wait` (block
 //! until the probe fires the named event `Global\<name>-go`).
 //!
 //! Absence is shown with a bound (a one-off attended measurement; the result
@@ -238,11 +239,12 @@ mod host {
                     0,
                 )
                 .expect("report RUNNING"),
-                ["stoppending"] => {
-                    let r = report(handle, Services::SERVICE_STOP_PENDING, 0, (0, 0), 1, 10_000);
+                ["stoppending"] | ["stoppending", _] => {
+                    let hint = parts.get(1).map_or(10_000, |ms| code(ms));
+                    let r = report(handle, Services::SERVICE_STOP_PENDING, 0, (0, 0), 1, hint);
                     trace(
                         &name,
-                        &format!("run={idx} SetServiceStatus(STOP_PENDING, checkpoint 1, waithint 10000) -> {r:?}"),
+                        &format!("run={idx} SetServiceStatus(STOP_PENDING, checkpoint 1, waithint {hint}) -> {r:?}"),
                     );
                 }
                 ["signal-wait"] => {
@@ -3111,6 +3113,146 @@ mod probes {
         r
     }
 
+    // P26 =============================================================================================================
+
+    const P26_HINT_MS: u32 = 1000;
+    const P26_HOLD: Duration = Duration::from_secs(10);
+    const P26_SAMPLE: Duration = Duration::from_millis(100);
+
+    fn host_process_state(proc: windows_sys::Win32::Foundation::HANDLE) -> String {
+        use windows_sys::Win32::System::Threading::GetExitCodeProcess;
+        if proc.is_null() {
+            return "no handle".to_string();
+        }
+        let mut exit = 0u32;
+        // SAFETY: `proc` is a live process handle with PROCESS_QUERY_LIMITED_INFORMATION.
+        if unsafe { GetExitCodeProcess(proc, &mut exit) } == 0 {
+            format!("GetExitCodeProcess error {}", std::io::Error::last_os_error())
+        } else if exit == 259 {
+            "alive".to_string()
+        } else {
+            format!("exited {exit:#x}")
+        }
+    }
+
+    /// P26: the host holds STOP_PENDING (checkpoint 1, hint `P26_HINT_MS`, accepts nothing, no
+    /// checkpoint change) for `P26_HOLD`, far past the hint, released by the named event. Every
+    /// 100 ms the status and the host process are recorded; once the hint has expired, one
+    /// `ControlService(STOP)` and one `StartService`. `restart/0`, `failureflag` 1.
+    /// (a) the probe sends STOP, the handler answers NO_ERROR, then STOPPED (0, 0).
+    /// (b) no STOP (the daemon failed): then STOPPED (1066, 7) and the recovery restart.
+    fn p26(tag: &str, variant: &str) -> String {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        let bound = absence_bound(Duration::ZERO);
+        let pending = format!("stoppending:{P26_HINT_MS}");
+        let script = match variant {
+            "a" => format!("run,connect,wait-stop,{pending},signal-wait,stopped:w32:0"),
+            "b" => format!("run,connect,{pending},signal-wait,stopped:spec:7"),
+            other => panic!("bad variant {other}"),
+        };
+        let mut p = Probe::new(tag, &format!("{script}|{STAY_UP}"), "restart/0");
+        let go = Signal::create(&p.name);
+        let started = p.start();
+        let started_at = p.t0.elapsed();
+        p.connect(0, EXPECTED_BOUND);
+        let h = p.service(ServiceAccess::STOP | ServiceAccess::QUERY_STATUS);
+        let mut steps = format!("StartService {started:?}");
+        if variant == "a" {
+            let running = wait_state_via(&h, Services::SERVICE_RUNNING, EXPECTED_BOUND);
+            p.p(format_args!("running: {running}; {}", query_via(&h)));
+            let stop = control_stop(&h);
+            p.p(format_args!("ControlService(STOP) -> {stop}"));
+            steps = format!("{steps}; STOP {stop}");
+        }
+        let reached = wait_state_via(&h, Services::SERVICE_STOP_PENDING, EXPECTED_BOUND);
+        let hold_start = Instant::now();
+        let pid = raw_query(&h).map_or(0, |s| s.dwProcessId);
+        // SAFETY: a plain open by pid; closed below.
+        let proc = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        p.p(format_args!(
+            "STOP_PENDING reached: {reached}; host pid {pid}, process handle opened: {}; {}",
+            !proc.is_null(),
+            query_via(&h)
+        ));
+
+        let mut probed = false;
+        loop {
+            let t = hold_start.elapsed();
+            p.p(format_args!(
+                "hold t+{}ms: {}; host process {}",
+                t.as_millis(),
+                query_via(&h),
+                host_process_state(proc)
+            ));
+            if !probed && t >= Duration::from_millis(u64::from(2 * P26_HINT_MS)) {
+                probed = true;
+                let stop2 = control_stop(&h);
+                p.p(format_args!(
+                    "t+{}ms (hint expired) ControlService(STOP) -> {stop2}",
+                    hold_start.elapsed().as_millis()
+                ));
+                let start2 = p.start();
+                let after = query_via(&h);
+                p.p(format_args!(
+                    "t+{}ms (hint expired) StartService -> {start2:?}; status after: {after}",
+                    hold_start.elapsed().as_millis()
+                ));
+                steps = format!("{steps}; after the hint: STOP {stop2}; StartService {start2:?}");
+            }
+            if t >= P26_HOLD {
+                break;
+            }
+            thread::sleep(P26_SAMPLE);
+        }
+        let held = query_via(&h);
+        go.fire();
+        p.p(format_args!(
+            "host signalled to leave STOP_PENDING; status before: {held}"
+        ));
+
+        if variant == "a" {
+            let stopped = wait_state_via(&h, Services::SERVICE_STOPPED, EXPECTED_BOUND);
+            p.p(format_args!("stopped via h: {stopped}; {}", query_via(&h)));
+        }
+        p.p(format_args!(
+            "host process after the release: {}",
+            host_process_state(proc)
+        ));
+        if !proc.is_null() {
+            // SAFETY: owned handle, closed once.
+            unsafe { CloseHandle(proc) };
+        }
+        let c1 = p.connect(1, bound).cloned();
+        let after = query_via(&h);
+        p.p(format_args!(
+            "{}ms after the start: {}; status via h {after}; notifications fired: {}",
+            (p.t0.elapsed() - started_at).as_millis(),
+            describe(c1.as_ref(), bound),
+            p.notify.count.load(Ordering::SeqCst)
+        ));
+        let mut stops = 1;
+        if c1.is_some() {
+            let running = wait_state_via(&h, Services::SERVICE_RUNNING, EXPECTED_BOUND);
+            let stop = control_stop(&h);
+            let s = wait_state_via(&h, Services::SERVICE_STOPPED, EXPECTED_BOUND);
+            p.p(format_args!(
+                "clean-up of the restarted instance: running {running}; ControlService {stop}; stopped {s}"
+            ));
+            stops = 2;
+        }
+        p.wait_logged_stopped(stops);
+        dump_host_trace(&p, "end");
+        p.quiesce();
+        let r = format!(
+            "{steps}; after: {}; status after the bound {after}",
+            describe(c1.as_ref(), bound)
+        );
+        p.result(&r);
+        p.dump_scm_events(tag);
+        r
+    }
+
     // Driver ==========================================================================================================
 
     pub fn run_all() {
@@ -3118,20 +3260,12 @@ mod probes {
         type Job = Box<dyn FnOnce() -> String + Send>;
         let jobs: Vec<(String, Job)> = vec![
             (
-                "P25a-connect-exit-101".to_string(),
-                Box::new(|| r11_samples("P25a", |t| p25(t, "connect,exit:101"))),
+                "P26a-stop-then-held-stop-pending".to_string(),
+                Box::new(|| r11_samples("P26a", |t| p26(t, "a"))),
             ),
             (
-                "P25b-connect-exit-0".to_string(),
-                Box::new(|| r11_samples("P25b", |t| p25(t, "connect,exit:0"))),
-            ),
-            (
-                "P25c-preexit-101".to_string(),
-                Box::new(|| r11_samples("P25c", |t| p25(t, "preexit:101"))),
-            ),
-            (
-                "P25d-preexit-0".to_string(),
-                Box::new(|| r11_samples("P25d", |t| p25(t, "preexit:0"))),
+                "P26b-failure-held-stop-pending".to_string(),
+                Box::new(|| r11_samples("P26b", |t| p26(t, "b"))),
             ),
         ];
         println!("PROBE SUMMARY begin");
