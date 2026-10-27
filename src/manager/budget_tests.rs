@@ -192,6 +192,39 @@ fn at_is_some_exactly_when_the_deadline_is_bounded() {
     assert!(t <= std::time::Instant::now());
 }
 
+/// `SleepEx` caps an interval at `u32::MAX - 1` ms (about 49.7 days); a longer
+/// deadline sees it return with nothing delivered and time still left.
+#[skuld::test]
+fn sleep_until_woken_sleeps_again_when_the_sleep_returns_before_the_deadline() {
+    let deadline = Budget::Bounded(Duration::from_secs(60 * 24 * 60 * 60)).start();
+    let mut asked = Vec::new();
+    let woken = deadline.sleep_until_woken(|millis| {
+        asked.push(millis);
+        asked.len() == 2
+    });
+    assert!(woken);
+    assert_eq!(asked, [Some(u32::MAX - 1), Some(u32::MAX - 1)]);
+}
+
+#[skuld::test]
+fn sleep_until_woken_on_a_spent_deadline_returns_without_sleeping() {
+    let woken = Budget::Immediate
+        .start()
+        .sleep_until_woken(|_| panic!("slept on a spent deadline"));
+    assert!(!woken);
+}
+
+#[skuld::test]
+fn sleep_until_woken_on_an_unbounded_deadline_sleeps_without_a_bound() {
+    let mut asked = Vec::new();
+    let woken = Budget::Unbounded.start().sleep_until_woken(|millis| {
+        asked.push(millis);
+        true
+    });
+    assert!(woken);
+    assert_eq!(asked, [None]);
+}
+
 // millis_ceil =========================================================================================================
 
 #[skuld::test]

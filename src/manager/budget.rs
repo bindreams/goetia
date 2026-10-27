@@ -162,6 +162,22 @@ impl Deadline {
         debug_assert!(millis != 0 || self.expired(), "a Some(0) return must imply expired()");
         Some(millis)
     }
+
+    /// Calls `sleep` with [`Self::remaining_millis_capped`] until it returns
+    /// `true` (woken) or the deadline passes (`false`). A `sleep` that returns
+    /// `false` with time left, as `SleepEx` does at its ~49.7-day cap, is
+    /// called again with what is left.
+    pub fn sleep_until_woken(&self, mut sleep: impl FnMut(Option<u32>) -> bool) -> bool {
+        loop {
+            let remaining = self.remaining_millis_capped();
+            if remaining == Some(0) {
+                return false;
+            }
+            if sleep(remaining) {
+                return true;
+            }
+        }
+    }
 }
 
 /// `d` in whole milliseconds, rounded **up**, saturating at `u32::MAX - 1`.
