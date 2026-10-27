@@ -293,12 +293,12 @@ fn a_variable_used_only_in_the_native_override_resolves_through_the_cli() {
             "daemons:\n  frpc:\n    command: [frpc]\n    backend-specific:\n      {native}:\n        restart: ${{R}}\n"
         ),
     );
-    std::fs::write(dir.path().join(".env"), "R=always\n").expect("write .env fixture");
+    std::fs::write(dir.path().join(".env"), "R=on-failure\n").expect("write .env fixture");
 
     let (code, out, err) = run_cli(&["daemon", "show", "-f", "goetia.yaml"], dir.path());
 
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
-    assert!(out.contains("restart: always"), "stdout:\n{out}");
+    assert!(out.contains("restart: on-failure"), "stdout:\n{out}");
 }
 
 // --json's clap-level carve-out =======================================================================================

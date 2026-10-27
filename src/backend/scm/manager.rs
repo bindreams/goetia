@@ -109,7 +109,7 @@ use crate::decide::{self, Outcome, Ownership};
 use crate::error::{Error, Result};
 use crate::manager::budget;
 use crate::manager::{Budget, Installed, ServiceManager, State, Status};
-use crate::spec::{DaemonSpec, Id, Kind};
+use crate::spec::{DaemonSpec, Id, Kind, Restart};
 
 // ScmManager ==========================================================================================================
 
@@ -127,6 +127,7 @@ impl ScmManager {
 
 impl ServiceManager for ScmManager {
     fn install(&self, spec: &DaemonSpec, force: bool) -> Result<Outcome> {
+        refuse_always(spec)?;
         let d = discover(spec)?;
         let outcome = decide::decide(
             &d.found,
@@ -153,6 +154,7 @@ impl ServiceManager for ScmManager {
     }
 
     fn preview_install(&self, spec: &DaemonSpec) -> Result<Outcome> {
+        refuse_always(spec)?;
         let d = discover(spec)?;
         Ok(decide::decide(
             &d.found,
@@ -431,6 +433,20 @@ fn shim_path() -> PathBuf {
         .ok()
         .and_then(|p| p.parent().map(|dir| dir.join("goetia-shim.exe")))
         .unwrap_or_else(|| PathBuf::from("goetia-shim.exe"))
+}
+
+/// `resolve` refuses `restart: always` for scm, but `generate` still accepts it
+/// to regenerate blobs installed by 0.1.0; a spec that did not come from
+/// `resolve` must not install with on-failure semantics.
+fn refuse_always(spec: &DaemonSpec) -> Result<()> {
+    if spec.restart == Restart::Always {
+        return Err(Error::Invalid {
+            daemon: spec.id.to_string(),
+            message: "`restart: always` cannot be honoured by the scm backend: SCM recovery actions never fire after a clean exit"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn discover(spec: &DaemonSpec) -> Result<Discovery> {
