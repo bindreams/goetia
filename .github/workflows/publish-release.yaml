@@ -177,7 +177,7 @@ jobs:
 
       - name: Install sigstore
         # renovate: datasource=pypi depName=sigstore
-        run: uv tool install sigstore==4.5.0
+        run: uv tool install sigstore==4.5.1
 
       # The same script Draft Release runs, so the two can never drift, and
       # the pins it applies describe the workflow that MINTED the bundle
