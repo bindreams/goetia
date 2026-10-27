@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use super::*;
@@ -192,18 +193,47 @@ fn at_is_some_exactly_when_the_deadline_is_bounded() {
     assert!(t <= std::time::Instant::now());
 }
 
-/// `SleepEx` caps an interval at `u32::MAX - 1` ms (about 49.7 days); a longer
-/// deadline sees it return with nothing delivered and time still left.
+/// A deadline past the interval cap makes the sleep return early; it is called again with what is left.
 #[skuld::test]
 fn sleep_until_woken_sleeps_again_when_the_sleep_returns_before_the_deadline() {
-    let deadline = Budget::Bounded(Duration::from_secs(60 * 24 * 60 * 60)).start();
+    let start = Instant::now();
+    let deadline = Budget::Bounded(Duration::from_secs(60 * 24 * 60 * 60)).start_at(start);
+    let clock = Cell::new(start);
     let mut asked = Vec::new();
-    let woken = deadline.sleep_until_woken(|millis| {
-        asked.push(millis);
-        asked.len() == 2
-    });
+    let woken = deadline.sleep_until_woken_at(
+        || clock.get(),
+        |millis| {
+            asked.push(millis);
+            clock.set(clock.get() + Duration::from_millis(millis.unwrap().into()));
+            asked.len() == 2
+        },
+    );
     assert!(woken);
-    assert_eq!(asked, [Some(u32::MAX - 1), Some(u32::MAX - 1)]);
+    assert_eq!(
+        asked,
+        [
+            Some(u32::MAX - 1),
+            Some((5_184_000_000_u64 - u64::from(u32::MAX - 1)) as u32)
+        ]
+    );
+}
+
+#[skuld::test]
+fn sleep_until_woken_returns_false_once_the_deadline_passes_unwoken() {
+    let start = Instant::now();
+    let deadline = Budget::Bounded(Duration::from_secs(10)).start_at(start);
+    let clock = Cell::new(start);
+    let mut asked = Vec::new();
+    let woken = deadline.sleep_until_woken_at(
+        || clock.get(),
+        |millis| {
+            asked.push(millis);
+            clock.set(clock.get() + Duration::from_secs(4));
+            false
+        },
+    );
+    assert!(!woken);
+    assert_eq!(asked, [Some(10_000), Some(6_000), Some(2_000)]);
 }
 
 #[skuld::test]

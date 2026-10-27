@@ -157,19 +157,36 @@ impl Deadline {
     /// `u32::MAX` (which means `INFINITE` to `SleepEx`). `None` = unbounded
     /// — pass `INFINITE` deliberately.
     pub fn remaining_millis_capped(&self) -> Option<u32> {
-        let millis = millis_ceil(self.remaining()?);
+        self.remaining_millis_capped_at(Instant::now())
+    }
+
+    fn remaining_millis_capped_at(&self, now: Instant) -> Option<u32> {
+        let remaining = self.remaining_at(now)?;
+        let millis = millis_ceil(remaining);
         debug_assert!(millis < u32::MAX, "must never collide with SleepEx's INFINITE");
-        debug_assert!(millis != 0 || self.expired(), "a Some(0) return must imply expired()");
+        debug_assert!(
+            millis != 0 || remaining.is_zero(),
+            "a Some(0) return must imply expired"
+        );
         Some(millis)
     }
 
     /// Calls `sleep` with [`Self::remaining_millis_capped`] until it returns
     /// `true` (woken) or the deadline passes (`false`). A `sleep` that returns
-    /// `false` with time left, as `SleepEx` does at its ~49.7-day cap, is
-    /// called again with what is left.
-    pub fn sleep_until_woken(&self, mut sleep: impl FnMut(Option<u32>) -> bool) -> bool {
+    /// `false` with time left (a capped interval) is called again with what is
+    /// left.
+    pub fn sleep_until_woken(&self, sleep: impl FnMut(Option<u32>) -> bool) -> bool {
+        self.sleep_until_woken_at(Instant::now, sleep)
+    }
+
+    /// [`Self::sleep_until_woken`] reading the time from `now`, so a test can advance it.
+    fn sleep_until_woken_at(
+        &self,
+        mut now: impl FnMut() -> Instant,
+        mut sleep: impl FnMut(Option<u32>) -> bool,
+    ) -> bool {
         loop {
-            let remaining = self.remaining_millis_capped();
+            let remaining = self.remaining_millis_capped_at(now());
             if remaining == Some(0) {
                 return false;
             }

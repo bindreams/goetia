@@ -397,15 +397,14 @@ impl super::ScmActor for SystemScmActor {
         // `Sleep(dwWaitHint/10)` poll: nothing is re-*asked*, and the
         // bound is the human-facing one the caller set.
         loop {
-            // `None` is unbounded: `INFINITE`. `sleep_until_woken` never
-            // passes `Some(0)`, so this is no `SleepEx(0)` poll.
+            // `sleep_until_woken` never passes `Some(0)`, so this is no
+            // `SleepEx(0)` poll.
             //
             // SAFETY: `SleepEx` takes no pointers; `1` (`TRUE`) makes it
             // alertable, which is the entire point of this wait.
             let woken = deadline
                 .sleep_until_woken(|millis| unsafe { SleepEx(millis.unwrap_or(INFINITE), 1) } == WAIT_IO_COMPLETION);
             if !woken {
-                // The deadline passed with nothing delivered.
                 // `registration_outstanding` stays true — nothing consumed
                 // this arm.
                 return self.expire();
