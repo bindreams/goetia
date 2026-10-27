@@ -14,16 +14,12 @@ pub(crate) struct TestId(String);
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
-fn compose(prefix: &str, random: u64, sequence: u64) -> String {
-    format!("{prefix}-{random:016x}-{sequence}")
-}
-
 impl TestId {
     pub(crate) fn new(prefix: &str) -> Self {
-        Self(compose(
-            prefix,
+        Self(format!(
+            "{prefix}-{:016x}-{}",
             rand::rng().random::<u64>(),
-            NEXT.fetch_add(1, Ordering::Relaxed),
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ))
     }
 
@@ -71,5 +67,9 @@ pub(crate) fn assert_one_failure(lines: &[String], id: &str, expected: &str) {
     assert_eq!(line, &format!("goetia-shim[{id}]: {expected}"));
 }
 
-#[path = "test_support_tests.rs"]
-mod test_support_tests;
+/// Asserts `lines` is exactly `expected`, in order: each one `log_failure` line for `id`, as
+/// [`assert_one_failure`] checks it.
+pub(crate) fn assert_failures(lines: &[String], id: &str, expected: &[String]) {
+    let expected: Vec<String> = expected.iter().map(|e| format!("goetia-shim[{id}]: {e}")).collect();
+    assert_eq!(lines, expected);
+}

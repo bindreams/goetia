@@ -11,13 +11,17 @@ use windows_service::service::{Service, ServiceAccess, ServiceState};
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_NOT_ACTIVE, WAIT_IO_COMPLETION};
 use windows_sys::Win32::System::Services::{
-    ControlService, NotifyServiceStatusChangeW, SERVICE_CONTROL_STOP, SERVICE_NOTIFY, SERVICE_NOTIFY_2W,
-    SERVICE_NOTIFY_RUNNING, SERVICE_NOTIFY_START_PENDING, SERVICE_NOTIFY_STATUS_CHANGE, SERVICE_NOTIFY_STOP_PENDING,
-    SERVICE_NOTIFY_STOPPED, SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STOPPED,
+    ControlService, NotifyServiceStatusChangeW, QueryServiceStatus, SERVICE_ACCEPT_STOP, SERVICE_CONTINUE_PENDING,
+    SERVICE_CONTROL_STOP, SERVICE_NOTIFY, SERVICE_NOTIFY_2W, SERVICE_NOTIFY_CONTINUE_PENDING,
+    SERVICE_NOTIFY_PAUSE_PENDING, SERVICE_NOTIFY_PAUSED, SERVICE_NOTIFY_RUNNING, SERVICE_NOTIFY_START_PENDING,
+    SERVICE_NOTIFY_STATUS_CHANGE, SERVICE_NOTIFY_STOP_PENDING, SERVICE_NOTIFY_STOPPED, SERVICE_PAUSE_PENDING,
+    SERVICE_PAUSED, SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STOP_PENDING, SERVICE_STOPPED,
 };
 use windows_sys::Win32::System::Threading::{INFINITE, SleepEx};
 
-use super::{Deadline, Observed, QueriedState, StartReply, Waited, WantState};
+use crate::backend::scm::exit_status::RecordedExit;
+
+use super::{Armed, Cancelled, Deadline, Observed, QueriedState, QueriedStatus, Registration, StartReply, WantState};
 
 /// `windows-service`'s `Error` does not implement `Into<io::Error>` for
 /// every variant (it also carries parse errors this module never
@@ -35,6 +39,10 @@ fn to_io_error(e: windows_service::Error) -> io::Error {
 /// the awaiting loop must not treat them as loop-invariant.
 struct LastStatus {
     current_state: AtomicU32,
+    exit_win32: AtomicU32,
+    exit_specific: AtomicU32,
+    wait_hint: AtomicU32,
+    controls_accepted: AtomicU32,
     fired: AtomicBool,
 }
 
@@ -72,29 +80,37 @@ unsafe extern "system" fn notify_callback(pparameter: *const c_void) {
     if slot.is_null() {
         return;
     }
-    let state = unsafe { (*buf).ServiceStatus.dwCurrentState };
+    let status = unsafe { &(*buf).ServiceStatus };
+    let state = status.dwCurrentState;
     unsafe {
+        (*slot).exit_win32.store(status.dwWin32ExitCode, Ordering::Release);
+        (*slot)
+            .exit_specific
+            .store(status.dwServiceSpecificExitCode, Ordering::Release);
+        (*slot).wait_hint.store(status.dwWaitHint, Ordering::Release);
+        (*slot)
+            .controls_accepted
+            .store(status.dwControlsAccepted, Ordering::Release);
         (*slot).current_state.store(state, Ordering::Release);
         (*slot).fired.store(true, Ordering::Release);
     }
 }
 
-/// The `NotifyServiceStatusChangeW` mask for `want`, given whether
-/// `start()` has already been issued (`started`).
-///
-/// For a start wait the `STOPPED` bit is included ONLY after `start()`:
-/// the service is `Stopped` at the initial arm (a stop wait always
-/// precedes a start wait in this crate's own usage), and
-/// `NotifyServiceStatusChangeW` immediate-fires on the current state — so
-/// arming `STOPPED` before `start()` would misclassify that pre-start
-/// `Stopped` as a failed start. After `start()` the service has entered
-/// `StartPending`, so a later `StartPending -> Stopped` delivers a real
-/// `Stopped` callback that terminates the wait with `Err`.
-fn want_to_mask(want: WantState, started: bool) -> SERVICE_NOTIFY {
-    match want {
-        WantState::Stopped => SERVICE_NOTIFY_STOPPED | SERVICE_NOTIFY_STOP_PENDING,
-        WantState::Running if started => SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_STOPPED | SERVICE_NOTIFY_START_PENDING,
-        WantState::Running => SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_START_PENDING,
+/// The `NotifyServiceStatusChangeW` mask for `want`: the bits of [`WantState::states`].
+fn want_to_mask(want: WantState) -> SERVICE_NOTIFY {
+    want.states().iter().fold(0, |mask, state| mask | notify_bit(*state))
+}
+
+/// The mask bit of one state. One arm per variant and no `_` catch-all, like [`queried_state`].
+fn notify_bit(state: QueriedState) -> SERVICE_NOTIFY {
+    match state {
+        QueriedState::Stopped => SERVICE_NOTIFY_STOPPED,
+        QueriedState::StartPending => SERVICE_NOTIFY_START_PENDING,
+        QueriedState::StopPending => SERVICE_NOTIFY_STOP_PENDING,
+        QueriedState::Running => SERVICE_NOTIFY_RUNNING,
+        QueriedState::ContinuePending => SERVICE_NOTIFY_CONTINUE_PENDING,
+        QueriedState::PausePending => SERVICE_NOTIFY_PAUSE_PENDING,
+        QueriedState::Paused => SERVICE_NOTIFY_PAUSED,
     }
 }
 
@@ -111,6 +127,24 @@ fn queried_state(state: ServiceState) -> QueriedState {
         ServiceState::ContinuePending => QueriedState::ContinuePending,
         ServiceState::PausePending => QueriedState::PausePending,
         ServiceState::Paused => QueriedState::Paused,
+    }
+}
+
+/// The state a raw `dwCurrentState` names. `windows-service` parses it too, but keeps that private,
+/// and its `ServiceStatus` cannot hold the exit record this module reads. One arm per state; any other
+/// value is an error rather than a guess.
+fn queried_state_of_raw(raw: u32) -> io::Result<QueriedState> {
+    match raw {
+        SERVICE_STOPPED => Ok(QueriedState::Stopped),
+        SERVICE_START_PENDING => Ok(QueriedState::StartPending),
+        SERVICE_STOP_PENDING => Ok(QueriedState::StopPending),
+        SERVICE_RUNNING => Ok(QueriedState::Running),
+        SERVICE_CONTINUE_PENDING => Ok(QueriedState::ContinuePending),
+        SERVICE_PAUSE_PENDING => Ok(QueriedState::PausePending),
+        SERVICE_PAUSED => Ok(QueriedState::Paused),
+        other => Err(io::Error::other(format!(
+            "SCM reported an unknown service state {other}"
+        ))),
     }
 }
 
@@ -136,8 +170,6 @@ pub struct SystemScmActor {
     notify: Box<SERVICE_NOTIFY_2W>,
     /// The state most recently awaited, for `want_to_mask`.
     awaiting: WantState,
-    /// Whether `start()` has been issued. Gates the two-phase arm mask.
-    started: bool,
     /// Whether the most recent `arm()` succeeded and has not yet been
     /// drained by `wait_callback`. See [`Self::close_and_drain`].
     registration_outstanding: bool,
@@ -156,11 +188,14 @@ impl SystemScmActor {
             service: Some(service),
             status: Box::new(LastStatus {
                 current_state: AtomicU32::new(0),
+                exit_win32: AtomicU32::new(0),
+                exit_specific: AtomicU32::new(0),
+                wait_hint: AtomicU32::new(0),
+                controls_accepted: AtomicU32::new(0),
                 fired: AtomicBool::new(false),
             }),
             notify: Box::default(),
             awaiting: WantState::Stopped,
-            started: false,
             registration_outstanding: false,
         })
     }
@@ -189,6 +224,21 @@ impl SystemScmActor {
     /// reason for it live.
     fn close_and_drain(&mut self) {
         super::close_then_drain(self);
+    }
+
+    /// Cancel a registration no `wait_callback` has consumed, before the next `arm` reuses its buffer.
+    /// The registration ends with its handle, so this replaces the handles through
+    /// [`super::cancel_registration`], which opens the new before it closes the old. A reopened
+    /// handle's first arm fires at once for a current state in its mask (P27 f); every caller decides
+    /// on the status `arm` returns, so that is harmless. An actor whose handles are already gone is
+    /// left alone, so its next `arm` reports that it is inert.
+    fn cancel_unconsumed(&mut self) -> io::Result<Cancelled> {
+        if !self.registration_outstanding || self.service.is_none() {
+            return Ok(Cancelled::Reopened);
+        }
+        let cancelled = super::cancel_registration(self)?;
+        self.registration_outstanding = false;
+        Ok(cancelled)
     }
 }
 
@@ -223,6 +273,27 @@ impl super::ScmHandles for SystemScmActor {
     }
 }
 
+/// The handles [`super::cancel_registration`] and the lag remedy open.
+pub struct Fresh {
+    scm: WinServiceManager,
+    service: Service,
+}
+
+impl super::ReopenHandles for SystemScmActor {
+    type Fresh = Fresh;
+
+    fn open_fresh(&mut self) -> io::Result<Fresh> {
+        let scm = open_scm()?;
+        let service = open_handle(&scm, &self.name)?;
+        Ok(Fresh { scm, service })
+    }
+
+    fn install(&mut self, fresh: Fresh) {
+        self.scm = Some(fresh.scm);
+        self.service = Some(fresh.service);
+    }
+}
+
 impl Drop for SystemScmActor {
     fn drop(&mut self) {
         self.close_and_drain();
@@ -233,7 +304,7 @@ impl Drop for SystemScmActor {
 /// caller's deadline.
 impl super::NotifyRegistrar for SystemScmActor {
     fn register(&mut self) -> io::Result<u32> {
-        let mask = want_to_mask(self.awaiting, self.started);
+        let mask = want_to_mask(self.awaiting);
         // SAFETY: `self.service()?.raw_handle()` was opened with
         // `SERVICE_QUERY_STATUS` access (required by this API);
         // `self.notify` is heap-pinned and outlives every wait the arm
@@ -247,16 +318,17 @@ impl super::NotifyRegistrar for SystemScmActor {
     /// (closed via `Drop` when replaced) stay valid until their
     /// replacements are confirmed open.
     fn reopen(&mut self) -> io::Result<()> {
-        let scm = open_scm()?;
-        let service = open_handle(&scm, &self.name)?;
-        self.scm = Some(scm);
-        self.service = Some(service);
+        let fresh = super::ReopenHandles::open_fresh(self)?;
+        super::ReopenHandles::install(self, fresh);
         Ok(())
     }
 }
 
 impl super::ScmActor for SystemScmActor {
-    fn arm(&mut self, want: WantState, deadline: Deadline) -> io::Result<Waited> {
+    fn arm(&mut self, want: WantState, deadline: Deadline) -> io::Result<Armed> {
+        if self.cancel_unconsumed()? == Cancelled::ServiceGone {
+            return Ok(Armed::Gone);
+        }
         self.awaiting = want;
         self.status.fired.store(false, Ordering::Release);
         *self.notify = SERVICE_NOTIFY_2W {
@@ -265,13 +337,18 @@ impl super::ScmActor for SystemScmActor {
             pContext: (&mut *self.status as *mut LastStatus) as *mut c_void,
             ..Default::default()
         };
-        let waited = super::register_until_deadline(self, deadline)?;
-        if waited == Waited::Confirmed {
-            // A notification may now be queued (immediately, if the
-            // service already matched the mask) — see `close_then_drain`.
-            self.registration_outstanding = true;
+        match super::register_until_deadline(self, deadline)? {
+            Registration::Registered => {}
+            Registration::Expired => return Ok(Armed::Expired),
+            // SCM refused to watch the marked service. The status read in place of the registration is
+            // what the caller decides on; nothing is outstanding.
+            Registration::MarkedForDelete => return Ok(Armed::Unwatchable(super::ScmActor::query_status(self)?)),
         }
-        Ok(waited)
+        // A notification may now be queued (immediately, if the
+        // service already matched the mask) — see `close_then_drain`.
+        self.registration_outstanding = true;
+        // After the registration, so a change after it is delivered and one before it is seen.
+        Ok(Armed::Registered(super::ScmActor::query_status(self)?))
     }
 
     fn control_stop(&mut self) -> io::Result<()> {
@@ -288,16 +365,14 @@ impl super::ScmActor for SystemScmActor {
             // query and this control, so the stop asked for has
             // happened — benign on both callers. `request_stop` armed
             // nothing and has nothing left to wait for; under
-            // `stop_via_notify` the STOPPED arm ran before this
-            // control, so the SCM has already queued that notification
-            // and the wait still completes.
+            // `stop_via_notify` the arm that follows reads `STOPPED`
+            // and the wait completes on it.
             Some(code) if code as u32 == ERROR_SERVICE_NOT_ACTIVE => Ok(()),
             _ => Err(err),
         }
     }
 
     fn start(&mut self) -> io::Result<StartReply> {
-        self.started = true;
         match self.service()?.start::<&std::ffi::OsStr>(&[]) {
             Ok(()) => Ok(StartReply::Accepted),
             // 1056 does not say which non-STOPPED state the service is in, so
@@ -354,10 +429,45 @@ impl super::ScmActor for SystemScmActor {
         let state = self.status.current_state.load(Ordering::Acquire);
         Ok(Some(if state == SERVICE_RUNNING {
             Observed::Running
+        } else if state == SERVICE_PAUSED {
+            Observed::Paused
         } else if state == SERVICE_STOPPED {
             Observed::Stopped
         } else {
             Observed::Pending
         }))
+    }
+
+    fn stopped_exit(&self) -> RecordedExit {
+        RecordedExit {
+            win32: self.status.exit_win32.load(Ordering::Acquire),
+            specific: self.status.exit_specific.load(Ordering::Acquire),
+        }
+    }
+
+    fn stopped_wait_hint(&self) -> u32 {
+        self.status.wait_hint.load(Ordering::Acquire)
+    }
+
+    fn query_status(&mut self) -> io::Result<QueriedStatus> {
+        let mut status = SERVICE_STATUS::default();
+        // SAFETY: `self.service()?.raw_handle()` was opened with `SERVICE_QUERY_STATUS` access;
+        // `status` is a valid, aligned out-param.
+        if unsafe { QueryServiceStatus(self.service()?.raw_handle(), &mut status) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(QueriedStatus {
+            state: queried_state_of_raw(status.dwCurrentState)?,
+            accepts_stop: status.dwControlsAccepted & SERVICE_ACCEPT_STOP != 0,
+            exit: RecordedExit {
+                win32: status.dwWin32ExitCode,
+                specific: status.dwServiceSpecificExitCode,
+            },
+            wait_hint: status.dwWaitHint,
+        })
+    }
+
+    fn accepts_stop(&self) -> bool {
+        self.status.controls_accepted.load(Ordering::Acquire) & SERVICE_ACCEPT_STOP != 0
     }
 }

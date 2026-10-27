@@ -31,13 +31,20 @@
 //! `super::wait`, which uses `NotifyServiceStatusChangeW` — a real kernel
 //! rendezvous, never a `Sleep`+`QueryServiceStatusEx` poll.
 //!
-//! **3. Uninstall must confirm a real stop before deleting.** `DeleteService`
-//! on a running service only *marks* it for deletion — the registry key
-//! survives until every `SC_HANDLE` closes and the service actually stops —
-//! so the next `install` would meet `ERROR_SERVICE_MARKED_FOR_DELETE`.
-//! [`uninstall_locked`] waits for a confirmed `STOPPED` (via `super::wait`)
-//! before opening a *fresh* handle for `DeleteService`, so the handle used
-//! to wait is always closed first.
+//! **3. Uninstall must disable, stop what runs, then delete.**
+//! `DeleteService` on a running service only *marks* it for deletion: the record survives until
+//! every `SC_HANDLE` closes and the service stops, so the next `install` would meet
+//! `ERROR_SERVICE_MARKED_FOR_DELETE`. A restart policy adds a race: SCM can start the service
+//! between any read of its state and a later call. [`uninstall_locked`] therefore opens its wait
+//! actor first, sets the start type to `SERVICE_DISABLED` (a disabled service's recovery restart
+//! fails with `ERROR_SERVICE_DISABLED` and `StartService` is refused, so a restart queued or made
+//! after the disable starts nothing; a disable that lands once an attempt has begun does not stop
+//! it, P23), stops whatever runs, including a start that had already begun, and only
+//! then closes the actor and deletes through a fresh `DELETE` handle. The stop never relies on an earlier observation: it
+//! is sent on a notification and, when SCM rejects it because the state changed, the state is read
+//! again. The service is not marked during the stop, so notifications keep working on it. A failure
+//! before the delete leaves the service in place and disabled, and re-running `uninstall` is the
+//! retry.
 //!
 //! **4. A real account needs `SeServiceLogonRight`.** `CreateServiceW`
 //! succeeds without it; the first start then fails with error 1069
@@ -98,7 +105,9 @@ use windows_service::service::{
     ServiceStartType, ServiceState as WinState, ServiceType,
 };
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SERVICE_DOES_NOT_EXIST, LocalFree};
+use windows_sys::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE, LocalFree,
+};
 use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHANGE};
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
@@ -115,7 +124,7 @@ use crate::spec::{DaemonSpec, Id, Kind, Restart};
 
 /// The Windows `ServiceManager` implementation. Holds no state of its own —
 /// every operation opens exactly the SCM/registry handles it needs and
-/// closes them again (see trap 3 above).
+/// closes them again.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ScmManager;
 
@@ -171,11 +180,7 @@ impl ServiceManager for ScmManager {
     fn uninstall(&self, id: &Id) -> Result<()> {
         let (scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
         require_ours(id)?;
-        // Close this handle before `uninstall_locked` opens (and eventually
-        // deletes through) its own — trap 3 is specifically that a
-        // still-open handle, of *any* access, defers `DeleteService`'s
-        // actual removal until every handle to the service has closed, not
-        // only the one `DeleteService` itself was called on.
+        // `uninstall_locked` opens its own handles, and its delete needs this one closed (trap 3).
         drop(service);
         uninstall_locked(&scm, id)
     }
@@ -207,8 +212,9 @@ impl ServiceManager for ScmManager {
             // more, per the trait doc comment.
             return super::wait::request_start(&mut actor).map_err(|e| Error::Other(format!("start `{id}`: {e}")));
         }
-        let waited = super::wait::start_via_notify(&mut actor, deadline)
-            .map_err(|e| Error::Other(format!("start `{id}`: {e}")))?;
+        let (kind, unreadable) = installed_kind(id);
+        let waited = super::wait::start_via_notify(&mut actor, deadline, kind)
+            .map_err(|e| failed_start(id, &e, unreadable.as_deref()))?;
         match waited {
             Waited::Confirmed => Ok(()),
             Waited::Expired => Err(budget::timed_out(id.as_str(), "running", budget)),
@@ -217,7 +223,7 @@ impl ServiceManager for ScmManager {
 
     /// [`super::wait::request_start_after_stop`]: every
     /// `ERROR_SERVICE_ALREADY_RUNNING` is a refusal here, since a `type:
-    /// simple` service reads `RUNNING` for its whole teardown.
+    /// simple` service reads `RUNNING` until its shim has taken the stop.
     fn request_start_after_stop(&self, id: &Id) -> Result<()> {
         let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
         require_ours(id)?;
@@ -254,10 +260,7 @@ impl ServiceManager for ScmManager {
     fn kill(&self, id: &Id) -> Result<()> {
         let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
         require_ours(id)?;
-        let mut target = super::kill::SystemKillTarget {
-            service,
-            id: id.as_str().to_string(),
-        };
+        let mut target = super::kill::SystemKillTarget::new(service, id.as_str().to_string());
         match super::kill::kill_service(&mut target).map_err(|e| Error::Other(format!("kill `{id}`: {e}")))? {
             super::kill::Killed::Terminated => Ok(()),
             super::kill::Killed::NotRunning => Err(Error::NotRunning {
@@ -395,6 +398,35 @@ pub fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
     generate::extract(&params)
 }
 
+/// The kind `start_via_notify` reads a `Stopped`-before-`Running` by, and why the blob could not
+/// say. Only a decodable blob that says `type: simple` selects the shim's vocabulary; an unreadable
+/// one reads as strictly as `type: managed`, which is what a shim that cannot decode it reports
+/// anyway (a failed start).
+fn start_kind(blob: Result<Option<Blob>>) -> (Kind, Option<String>) {
+    match blob {
+        Ok(Some(blob)) => (blob.spec.kind, None),
+        Ok(None) => (Kind::Managed, Some("it carries no goetia metadata".to_string())),
+        Err(e) => (Kind::Managed, Some(e.to_string())),
+    }
+}
+
+/// `start`'s error for a `start_via_notify` failure. When the blob was unreadable the start was
+/// judged as a `type: managed` service's, and the error says why, since that is not what a
+/// `type: simple` service would have been told.
+fn failed_start(id: &Id, e: &std::io::Error, unreadable: Option<&str>) -> Error {
+    match unreadable {
+        None => Error::Other(format!("start `{id}`: {e}")),
+        Some(why) => Error::Other(format!(
+            "start `{id}`: {e} (its spec blob could not be read, so the start was judged as a `type: managed` \
+             service's: {why})"
+        )),
+    }
+}
+
+fn installed_kind(id: &Id) -> (Kind, Option<String>) {
+    start_kind(read_spec_blob(id.as_str()))
+}
+
 // discover ============================================================================================================
 
 /// What `install`/`preview_install` need from a fresh read of the world:
@@ -435,9 +467,8 @@ fn shim_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("goetia-shim.exe"))
 }
 
-/// `resolve` refuses `restart: always` for scm, but `generate` still accepts it
-/// to regenerate blobs installed by 0.1.0; a spec that did not come from
-/// `resolve` must not install with on-failure semantics.
+/// `generate` still accepts `restart: always` so that blobs installed before `resolve` refused it
+/// regenerate; a spec that did not come from `resolve` must not install with on-failure semantics.
 fn refuse_always(spec: &DaemonSpec) -> Result<()> {
     if spec.restart == Restart::Always {
         return Err(Error::Invalid {
@@ -900,53 +931,184 @@ fn run_sc(args: &[&str]) -> Result<()> {
 
 // uninstall ===========================================================================================================
 
-/// Stop (waiting for a confirmed `STOPPED`, closing that handle), then
-/// delete via a fresh handle. See trap 3.
+/// Disable the service, stop whatever runs, then delete it. See trap 3.
+///
+/// A disabled service is never started again: `StartService` fails with 1058, and a recovery restart
+/// fails with event 7032 / `%%1058` and no `START_PENDING`. Measured: a restart queued before the
+/// disable, or after it, does not start (P21). A disable that lands before SCM's attempt prevents
+/// it. One that lands while the attempt is in flight does not stop it: the attempt runs to
+/// `RUNNING`, even for a disable 0.12-0.22 ms after the failure (1 of 8), and the status read right
+/// after the disable returns shows `START_PENDING` or `RUNNING` (P23: the status told all 168
+/// samples apart), which the settle loop waits out and stops. Once the start type is
+/// `SERVICE_DISABLED`, the wait in [`super::wait::settle_and_stop`] sends STOP on a notification. If
+/// a start had already begun, the wait lets it finish and then stops it. The service is not marked
+/// for deletion until then, so notifications work on it. With the wait actor closed and no other
+/// handle open, the delete removes the record at once (P12a). `Budget::Unbounded` throughout:
+/// `uninstall` has no `--timeout`, and bounding the stop would turn a slow-stopping service into a
+/// failed uninstall where today it succeeds.
+///
+/// The start type is not put back. A stop or a delete that fails leaves the service disabled. An
+/// interrupted `uninstall` (Ctrl-C, a killed goetia) leaves it unchanged, disabled, or deleted,
+/// depending on where it stopped. Re-running `uninstall` is the retry in every case. Putting it back could not be kept as a promise: it is not reached when the process
+/// dies, and it would overwrite an `enable` or a second `uninstall` that ran in the meantime.
+/// Recording the old type on the machine would be new standing state. The error names the previous
+/// start type, when it could be read, and the command that sets it again.
+///
+/// A service someone else already marked for deletion refuses the disable with
+/// `ERROR_SERVICE_MARKED_FOR_DELETE` (1072). Then the delete is skipped and a stopped service is
+/// success; the record goes with the last handle. A 1072 from the delete itself means the same, and
+/// is success too. Both rest on MSDN's description of 1072, not on a probe. A service that is gone
+/// (`ERROR_SERVICE_DOES_NOT_EXIST`, 1060) at any of the opens, the disable or the delete is success:
+/// the record is removed, which is what `uninstall` is for. A second `uninstall` racing the first
+/// can meet 1060 at the first open.
 fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
-    let needs_stop = {
-        let service = scm
-            .open_service(id.as_str(), ServiceAccess::QUERY_STATUS)
-            .map_err(|e| to_error(&format!("query status for `{id}` before uninstall"), e))?;
-        let status = service
-            .query_status()
-            .map_err(|e| to_error(&format!("query status for `{id}` before uninstall"), e))?;
-        status.current_state != WinState::Stopped
-        // `service`'s `SC_HANDLE` closes here, at the end of this block.
+    // Opened first and kept through the stop: no state change slips between the disable and the wait.
+    let mut actor = match super::wait::SystemScmActor::open(id.as_str()) {
+        Ok(actor) => actor,
+        Err(e) if is_not_found_io(&e) => return Ok(()),
+        Err(e) => {
+            return Err(Error::Other(format!(
+                "open `{id}` before uninstall: {e}; it was NOT deleted"
+            )));
+        }
     };
 
-    if needs_stop {
-        let mut actor = super::wait::SystemScmActor::open(id.as_str())
-            .map_err(|e| Error::Other(format!("open `{id}` to stop it before uninstall: {e}")))?;
-        // Deliberately `Budget::Unbounded`, and not the caller's: `uninstall` has no `--timeout`
-        // of its own, this stop is a means rather than an end, and bounding it would turn a
-        // slow-stopping service into a failed uninstall where today it succeeds. The message below
-        // already routes the user for every way this can actually fail.
-        let waited = super::wait::stop_via_notify(&mut actor, Budget::Unbounded.start()).map_err(|e| {
-            Error::Other(format!(
-                "`{id}` did not confirm SERVICE_STOPPED before uninstall ({e}); it was NOT deleted — \
-                 DeleteService on a running service only marks it for deletion, which the next install would \
-                 meet as ERROR_SERVICE_MARKED_FOR_DELETE. Stop it (or wait for it to stop) and re-run \
-                 `goetia daemon uninstall {id}`."
-            ))
-        })?;
-        match waited {
-            Waited::Confirmed => {}
-            // `let _ = …` is the write that turns an unreachable case into a silent one, and this
-            // is precisely the case where a later edit narrowing that budget must not pass quietly.
-            Waited::Expired => unreachable!("uninstall's stop is Unbounded; an unbounded deadline never expires"),
+    let (marked, previous) = match disable_before_delete(scm, id)? {
+        Disabled::Gone => return Ok(()),
+        Disabled::AlreadyMarked => (true, None),
+        Disabled::Now { previous } => (false, previous),
+    };
+
+    match super::wait::settle_and_stop(&mut actor, Budget::Unbounded.start()) {
+        Ok(Waited::Confirmed) => {}
+        // `let _ = ...` is the write that turns an unreachable case into a silent one, and this
+        // is precisely the case where a later edit narrowing that budget must not pass quietly.
+        Ok(Waited::Expired) => unreachable!("uninstall's wait is Unbounded; an unbounded deadline never expires"),
+        Err(e) => {
+            let state = if marked {
+                UninstallFailure::AlreadyMarked
+            } else {
+                UninstallFailure::Stop { previous }
+            };
+            return Err(Error::Other(uninstall_failed_message(id, &e.to_string(), &state)));
         }
-        // `actor`'s `SC_HANDLE` must close before the `DELETE` handle opens
-        // below — dropping it explicitly documents that ordering rather than
-        // relying on it falling out of scope at the end of the function.
-        drop(actor);
+    }
+    // Closed before the delete: an open handle would keep the record after it.
+    drop(actor);
+    if marked {
+        return Ok(());
     }
 
-    let service = scm
-        .open_service(id.as_str(), ServiceAccess::DELETE)
-        .map_err(|e| to_error(&format!("open `{id}` to delete it"), e))?;
-    service
-        .delete()
-        .map_err(|e| to_error(&format!("delete service `{id}`"), e))
+    let not_deleted = |context: String, e: windows_service::Error| {
+        Error::Other(uninstall_failed_message(
+            id,
+            &service_detail(&context, &e),
+            &UninstallFailure::Delete { previous },
+        ))
+    };
+    let service = match scm.open_service(id.as_str(), ServiceAccess::DELETE) {
+        Ok(service) => service,
+        Err(e) if is_not_found(&e) => return Ok(()),
+        Err(e) => return Err(not_deleted(format!("open `{id}` to delete it"), e)),
+    };
+    match service.delete() {
+        Ok(()) => Ok(()),
+        Err(e) if is_not_found(&e) || is_marked_for_delete(&e) => Ok(()),
+        Err(e) => Err(not_deleted(format!("delete service `{id}`"), e)),
+    }
+}
+
+/// What [`disable_before_delete`] did.
+enum Disabled {
+    /// The start type is now `SERVICE_DISABLED`. `previous` is what it was, or `None` when reading
+    /// it failed, which does not stop the uninstall.
+    Now { previous: Option<ServiceStartType> },
+    /// Someone else already marked the service for deletion (1072): nothing was changed.
+    AlreadyMarked,
+    /// The service no longer exists (1060).
+    Gone,
+}
+
+/// Read `id`'s start type, then set it to `SERVICE_DISABLED`. A service someone else marked for
+/// deletion (1072) is [`Disabled::AlreadyMarked`] and one that is gone (1060) is [`Disabled::Gone`];
+/// neither is an error. A start type that cannot be read is not an error either: only the message
+/// that names it needs it, so it is left out.
+fn disable_before_delete(scm: &WinServiceManager, id: &Id) -> Result<Disabled> {
+    let not_changed = |what: String| {
+        Error::Other(format!(
+            "{what}; `{id}` was NOT deleted and its start type is unchanged"
+        ))
+    };
+    let service = match scm.open_service(id.as_str(), ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG) {
+        Ok(service) => service,
+        Err(e) if is_not_found(&e) => return Ok(Disabled::Gone),
+        Err(e) => return Err(not_changed(service_detail(&format!("open `{id}` to disable it"), &e))),
+    };
+    let previous = match service.query_config() {
+        Ok(cfg) => Some(cfg.start_type),
+        Err(e) if is_marked_for_delete(&e) => return Ok(Disabled::AlreadyMarked),
+        Err(_) => None,
+    };
+    match set_start_type(&service, ServiceStartType::Disabled) {
+        Ok(()) => Ok(Disabled::Now { previous }),
+        Err(e) if is_marked_io(&e) => Ok(Disabled::AlreadyMarked),
+        Err(e) if is_not_found_io(&e) => Ok(Disabled::Gone),
+        Err(e) => Err(not_changed(format!("disable `{id}` before uninstall: {e}"))),
+    }
+}
+
+/// How a failed `uninstall` left the service, which decides what [`uninstall_failed_message`] may say.
+enum UninstallFailure {
+    /// The stop failed. The service is running and disabled; `previous` is its start type before.
+    Stop { previous: Option<ServiceStartType> },
+    /// The delete failed. The service is stopped and disabled; `previous` is its start type before.
+    Delete { previous: Option<ServiceStartType> },
+    /// Someone else had marked the service for deletion, so `uninstall` did not delete it. Its wait
+    /// may already have sent a STOP before it failed.
+    AlreadyMarked,
+}
+
+/// The error text for an `uninstall` that failed with `cause`. Every variant names the retry or the
+/// remedy that applies to its state, and none claims a state it is not in.
+fn uninstall_failed_message(id: &Id, cause: &str, state: &UninstallFailure) -> String {
+    let kill = format!("if the service does not accept STOP, run `goetia daemon kill {id}`");
+    match state {
+        UninstallFailure::Stop { previous } => format!(
+            "`{id}` could not be stopped ({cause}). It was NOT deleted and is now disabled, so \
+             `goetia daemon start {id}` fails.{} Re-run `goetia daemon uninstall {id}` to retry; {kill} first",
+            previous_start_type(id, *previous)
+        ),
+        UninstallFailure::Delete { previous } => format!(
+            "{cause}; `{id}` is stopped and disabled but was NOT deleted.{} Re-run \
+             `goetia daemon uninstall {id}` to retry",
+            previous_start_type(id, *previous)
+        ),
+        UninstallFailure::AlreadyMarked => format!(
+            "`{id}` could not be stopped ({cause}). It was already marked for deletion by someone else, \
+             so `uninstall` did not delete it. It is removed once it stops and its last handle closes; \
+             {kill}"
+        ),
+    }
+}
+
+/// The sentence naming the start type `uninstall` found and the command that sets it again, with its
+/// leading space; empty when the type could not be read. A `Disabled` found is not the original: an
+/// earlier `uninstall` probably set it, and nothing records what it replaced.
+fn previous_start_type(id: &Id, previous: Option<ServiceStartType>) -> String {
+    let (name, command) = match previous {
+        None => return String::new(),
+        Some(ServiceStartType::Disabled) => {
+            return format!(
+                " Its original start type is unknown, because an earlier `uninstall` probably disabled it; \
+                 `goetia daemon enable {id}` or `goetia daemon disable {id}` sets one."
+            );
+        }
+        Some(ServiceStartType::AutoStart) => ("automatic", format!("`goetia daemon enable {id}`")),
+        Some(ServiceStartType::OnDemand) => ("manual", format!("`goetia daemon disable {id}`")),
+        Some(ServiceStartType::SystemStart) => ("system", format!("`sc.exe config {id} start= system`")),
+        Some(ServiceStartType::BootStart) => ("boot", format!("`sc.exe config {id} start= boot`")),
+    };
+    format!(" Its start type was {name}; {command} sets it again.")
 }
 
 // shared helpers ======================================================================================================
@@ -980,10 +1142,20 @@ fn open_scm_to_classify(id: &str) -> Result<WinServiceManager> {
 }
 
 fn is_not_found(e: &windows_service::Error) -> bool {
-    matches!(
-        e,
-        windows_service::Error::Winapi(io) if io.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32)
-    )
+    matches!(e, windows_service::Error::Winapi(io) if is_not_found_io(io))
+}
+
+fn is_not_found_io(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32)
+}
+
+/// Whether `e` is `ERROR_SERVICE_MARKED_FOR_DELETE` (1072).
+fn is_marked_for_delete(e: &windows_service::Error) -> bool {
+    matches!(e, windows_service::Error::Winapi(io) if is_marked_io(io))
+}
+
+fn is_marked_io(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(ERROR_SERVICE_MARKED_FOR_DELETE as i32)
 }
 
 /// Whether `e` is `ERROR_ACCESS_DENIED` — the one thing the error code decides,

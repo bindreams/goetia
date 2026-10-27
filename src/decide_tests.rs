@@ -106,7 +106,7 @@ fn identical_is_up_to_date() {
 /// spec regenerates to (no hand-edit), but `new_spec` differs from the
 /// embedded spec. Pinned apart from `spec_change_with_hand_edit_conflicts`
 /// below, which looks identical except `on_disk` is *not*
-/// `regenerated` -- that's the row `decide` could not previously reach.
+/// `regenerated`.
 #[skuld::test]
 fn spec_change_updates() {
     let embedded = spec_fixture();
@@ -196,7 +196,7 @@ fn hand_edit_with_force_updates() {
     );
 }
 
-/// The row `decide` previously could not reach: the spec changed *and* the
+/// The spec changed *and* the
 /// artifact was hand-edited on top of the old spec. `on_disk` matches
 /// neither `desired` (generated from the new spec) nor `regenerated`
 /// (generated from the embedded spec) -- it must be a conflict, not a
@@ -313,6 +313,32 @@ fn unreadable_refuses_with_recovery() {
     }
 }
 
+/// A service registered by the released 0.1.0 must read as stale under this build, whatever the
+/// artifact looks like: the version string is the only thing that tells the two generators apart.
+#[skuld::test]
+fn a_registration_by_released_0_1_0_is_stale_under_this_build() {
+    let spec = spec_fixture();
+    let on_disk = "ARTIFACT WITHOUT RECOVERY ACTIONS";
+    let found = ours(&spec, "0.1.0", "REGENERATED WITH THE OLD GENERATOR");
+
+    let outcome = decide(
+        &found,
+        Some(on_disk),
+        "ARTIFACT WITH RECOVERY ACTIONS",
+        &spec,
+        crate::version(),
+        false,
+        &Overlay::default(),
+    );
+
+    assert_eq!(
+        outcome,
+        Outcome::Stale {
+            from_version: "0.1.0".to_owned()
+        }
+    );
+}
+
 #[skuld::test]
 fn older_version_is_stale_not_conflict() {
     let spec = spec_fixture();
@@ -327,6 +353,53 @@ fn older_version_is_stale_not_conflict() {
         &found,
         Some(on_disk),
         desired,
+        &spec,
+        RUNNING_VERSION,
+        false,
+        &Overlay::default(),
+    );
+
+    assert_eq!(
+        outcome,
+        Outcome::Stale {
+            from_version: "0.1.0".to_owned()
+        }
+    );
+}
+
+/// A rendering that differs from the desired one only in its recovery actions, as a `type: simple`
+/// service registered by 0.1.0 does, is a `Stale` refresh and never a `Conflict`, because the
+/// version is compared before the content. Pins that ordering only; that re-installing such a
+/// service really writes the actions is `reinstalling_an_earlier_version_simple_service_applies_the_recovery_actions`.
+#[skuld::test]
+fn a_version_difference_wins_over_a_difference_in_recovery_actions() {
+    use crate::backend::Identity;
+    use crate::backend::scm::generate::{ScmRegistration, registration, render};
+
+    let spec = spec_fixture();
+    let reg_now = registration(
+        &spec,
+        &Identity { user: "svc".to_owned() },
+        &PathBuf::from("goetia-shim.exe"),
+    );
+    assert!(
+        reg_now.failure_actions.is_some(),
+        "the fixture must be a policy that now gets recovery actions"
+    );
+    let reg_0_1_0 = ScmRegistration {
+        failure_actions: None,
+        ..reg_now.clone()
+    };
+    let on_disk = render(&reg_0_1_0);
+    assert!(on_disk.contains("FailureActions: none"));
+    let desired = render(&reg_now);
+    assert_ne!(on_disk, desired);
+    let found = ours(&spec, "0.1.0", &on_disk);
+
+    let outcome = decide(
+        &found,
+        Some(&on_disk),
+        &desired,
         &spec,
         RUNNING_VERSION,
         false,

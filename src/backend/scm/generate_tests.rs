@@ -1,5 +1,5 @@
 use super::*;
-use crate::spec::{Builtin, Id};
+use crate::spec::{Builtin, Id, MAX_SC_ACTION_DELAY};
 
 // Fixtures ============================================================================================================
 
@@ -677,13 +677,52 @@ fn windows_style_split_matches_real_command_line_to_argv_w() {
 // FailureActions ======================================================================================================
 
 #[skuld::test]
-fn simple_kind_has_no_failure_actions() {
-    let reg = build(&simple_spec());
-    assert_eq!(
-        reg.failure_actions, None,
-        "the shim supervises the child itself; SCM recovery must stay empty (matching `sc qfailure` for the \
-         nssm-based deployment this project is modeled on)"
+fn simple_kind_maps_restart_to_failure_actions_like_managed() {
+    let mut spec = simple_spec();
+    spec.restart = Restart::OnFailure;
+    spec.restart_delay = Some(Duration::from_secs(42));
+    let fa = build(&spec)
+        .failure_actions
+        .expect("restart: on-failure must configure recovery actions: SCM does every restart for a simple daemon");
+    assert_eq!(fa.delay, Duration::from_secs(42));
+    assert_eq!(fa.reset_period, FAILURE_RESET_PERIOD);
+    assert!(
+        fa.on_non_crash_failures,
+        "without the flag, a clean non-zero report never restarts"
     );
+
+    spec.restart = Restart::Never;
+    assert_eq!(build(&spec).failure_actions, None);
+}
+
+#[skuld::test]
+fn simple_kind_default_restart_delay_when_unset() {
+    let mut spec = simple_spec();
+    spec.restart = Restart::OnFailure;
+    spec.restart_delay = None;
+
+    let fa = build(&spec).failure_actions.expect("recovery actions");
+    assert_eq!(fa.delay, DEFAULT_RESTART_DELAY);
+}
+
+#[skuld::test]
+fn the_two_kinds_get_the_same_failure_actions_for_every_restart_value() {
+    for restart in [Restart::Never, Restart::OnFailure, Restart::Always] {
+        for restart_delay in [None, Some(Duration::from_secs(42))] {
+            let mut simple = simple_spec();
+            simple.restart = restart;
+            simple.restart_delay = restart_delay;
+            let mut managed = managed_spec();
+            managed.restart = restart;
+            managed.restart_delay = restart_delay;
+
+            assert_eq!(
+                build(&simple).failure_actions,
+                build(&managed).failure_actions,
+                "restart {restart:?}, delay {restart_delay:?}"
+            );
+        }
+    }
 }
 
 #[skuld::test]
@@ -748,7 +787,7 @@ fn managed_kind_restart_always_renders_as_on_failure() {
     let mut on_failure = build(&on_failure);
     assert!(
         always.failure_actions.is_some(),
-        "0.1.0 registered recovery actions for `always`"
+        "`always` keeps on-failure's recovery actions"
     );
     always.parameters.clear();
     on_failure.parameters.clear();
@@ -773,6 +812,50 @@ fn managed_kind_clamps_absurdly_long_restart_delay() {
     );
     // Warning coverage for an over-long delay lives in `spec::backend`'s
     // tests, gated by `Backend::Scm.warn` rather than by this generator.
+}
+
+#[skuld::test]
+fn a_sub_millisecond_restart_delay_rounds_up_to_the_whole_millisecond_scm_stores() {
+    for (delay, stored_ms) in [
+        (Duration::from_micros(1500), 2u64),
+        (Duration::from_micros(500), 1),
+        (Duration::from_nanos(1500), 1),
+        (Duration::from_nanos(1), 1),
+        (Duration::from_millis(7), 7),
+        (Duration::ZERO, 0),
+    ] {
+        let mut spec = managed_spec();
+        spec.restart_delay = Some(delay);
+        let reg = build(&spec);
+        let fa = reg.failure_actions.expect("on-failure configures recovery actions");
+        assert_eq!(fa.delay, Duration::from_millis(stored_ms), "delay {delay:?}");
+
+        // What `read_failure_actions` returns for the whole-ms value `apply_failure_actions` wrote.
+        let mut read_back = reg.clone();
+        read_back.failure_actions = Some(FailureActions {
+            delay: Duration::from_millis(u64::try_from(fa.delay.as_millis()).unwrap()),
+            ..fa
+        });
+        assert_eq!(
+            render(&reg),
+            render(&read_back),
+            "desired and read-back text must agree for {delay:?}, or every later install is a Conflict"
+        );
+    }
+}
+
+#[skuld::test]
+fn rounding_a_restart_delay_up_never_passes_the_scm_maximum() {
+    for delay in [
+        MAX_SC_ACTION_DELAY - Duration::from_millis(1) + Duration::from_nanos(1),
+        MAX_SC_ACTION_DELAY + Duration::from_nanos(1),
+        Duration::MAX,
+    ] {
+        let mut spec = managed_spec();
+        spec.restart_delay = Some(delay);
+        let fa = build(&spec).failure_actions.expect("recovery actions");
+        assert_eq!(fa.delay, MAX_SC_ACTION_DELAY, "delay {delay:?}");
+    }
 }
 
 #[skuld::test]

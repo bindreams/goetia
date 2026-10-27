@@ -1430,9 +1430,14 @@ fn list_reaches_the_manager() {
     assert!(out.contains("frpc"), "{out}");
 }
 
-/// A service installed by 0.1.0 may carry `restart: always` on the scm backend, which a manifest
+/// A service installed before `resolve` refused it may carry `restart: always` on the scm backend, which a manifest
 /// can no longer say. Reading its blob must not run the manifest refusal, or the service could
 /// not even be stopped or removed.
+///
+/// CLI-only: the verbs run against `Fake`, which has no scm refusal of its own to trip. The scm
+/// side is `a_blob_that_says_always_decodes_and_starts_as_its_kind` (`manager_tests.rs`) and
+/// `a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled`
+/// (`tests/shim_integration/restart_integration.rs`).
 #[skuld::test]
 fn a_service_installed_with_restart_always_stays_operable() {
     let fake = Fake::new();
@@ -1519,10 +1524,10 @@ fn install_exit_code_does_not_mask_an_error_behind_a_conflict() {
 }
 
 /// `--dry-run`'s preview must not silently drop a `Warning` (e.g. SCM
-/// clamping a too-large `restart-delay`). This advisory now fires at
+/// clamping a too-large `restart-delay`). This advisory fires at
 /// resolve time, from `Backend::Scm.warn`, through `load_and_warn` — on
 /// every host, not only from an effectful Windows install preview — which
-/// is the property this test now pins.
+/// is the property this test pins.
 #[skuld::test]
 fn install_dry_run_prints_generator_warnings() {
     let dir = tempfile::tempdir().unwrap();
@@ -1715,8 +1720,7 @@ fn diff_exits_five_for_a_hand_edited_artifact() {
 }
 
 /// `diff` must distinguish "absent" from "occupied by a stranger's
-/// service": both used to render identically as "would be created", which
-/// `install` would then immediately contradict by refusing. A second,
+/// service": the first is "would be created", the second a refusal. A second,
 /// drifting daemon in the same run must not lower the code to 3: `1`
 /// outranks `3` in the precedence rule.
 #[skuld::test]
@@ -3337,8 +3341,8 @@ fn restart_with_no_budget_issues_both_steps_without_confirming() {
 }
 
 /// `restart --timeout 0` over a daemon that is up, in the shape the Windows backend really meets:
-/// the stop request is accepted, and the service goes on reading `RUNNING` for its whole teardown —
-/// `goetia-shim` never reports `STOP_PENDING` — so the start that follows is answered "already
+/// the stop request is accepted, and the service goes on reading `RUNNING` until the shim has
+/// taken it (`STOP_PENDING` from then on) — so the start that follows is answered "already
 /// running". The `Fake` models exactly that: its request-only `stop` settles nothing, so the entry
 /// is still `Running` when the start arrives, and its plain `start` is idempotent over it, as SCM's
 /// is over a queried `RUNNING`.

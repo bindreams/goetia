@@ -482,9 +482,16 @@ backend-specific:
 ```
 
 A service installed by an earlier release with `restart: always` on Windows
-keeps working: `status`, `list`, `start`, `stop`, `restart` and `uninstall`
-read its embedded copy of the spec and never see this refusal. `diff` and
-`install` read the manifest, which needs the override above.
+still starts, stops and reports: `status`, `list`, `start`, `stop`, `restart`
+and `uninstall` read its embedded copy of the spec and never see this
+refusal. What changes depends on its `type`. A `type: simple` service is no
+longer restarted when the command exits, because the new `goetia-shim` leaves
+every restart to SCM and the service has no recovery actions. A
+`type: managed` service is unchanged: it already had on-failure recovery
+actions, keeps them, and was never restarted after a clean exit. To give a
+`type: simple` service recovery actions, add the override above to the
+manifest and run `goetia daemon install`; `diff` and `install` read the
+manifest.
 
 `${VAR}` is substituted only in the override for the backend being
 installed. The other two are validated as authored, never substituted, so a
@@ -712,6 +719,137 @@ quote it as a single argument. All four verbs take a variadic id list, so
 daemon id — and goetia then reports that a daemon called `30s` is not
 installed, which is a confusing answer to a typo the shell made.
 
+### Restarts on Windows
+
+Windows restarts a daemon through the service manager's recovery actions, for
+`type: simple` and `type: managed` alike. `goetia-shim` runs your command once,
+reports how it ended as the service's exit, and exits. With `restart: on-failure`
+SCM then starts a new shim after `restart-delay` (1s by default), and that shim
+reads the spec as installed, so a daemon restarted after `goetia daemon install`
+runs the updated spec. A shim that is killed or crashes once it has connected to
+SCM is restarted too; one that dies before it connects (an early crash, or a
+dispatcher connect that fails) is not, and `start` reports the failure. A
+clean exit is never restarted, and a stop reports a clean exit. SCM stores
+`restart-delay` in whole milliseconds, so a finer delay (`1500us`) is rounded up
+(`2ms`), with a warning.
+
+Nothing cancels a restart SCM has queued, and `goetia daemon stop` does not
+look for one. A command that failed and is waiting out `restart-delay` finds
+the service already stopped, so `stop` exits `0` and the daemon is started when
+the delay ends. When a command fails just as a `stop` arrives, the shim decides
+once: a stop it accepts before it decides the exit is reported as a clean stop,
+which SCM does not restart; a stop that arrives after it has decided on the
+failure does not change it. SCM acknowledges that stop anyway, whatever the
+shim answers, so `stop` exits `0` and SCM restarts the command as above.
+`goetia daemon uninstall` first sets the service's start type to disabled, so a
+restart SCM had queued before the disable, or queues after it, fails and starts
+nothing. A disable that lands after SCM has begun a restart attempt does not
+stop it: the attempt runs to a running service, even when the disable follows
+the failure by a fraction of a millisecond. `uninstall` then stops whatever is
+running, such an attempt included, waits for it to stop, and deletes the
+service. A stop that SCM rejects because the state changed is sent again on the
+next state. If the stop or the delete fails, the service is left disabled and
+not deleted; the start type is not put back. An interrupted `uninstall` (Ctrl-C,
+a killed `goetia`) leaves the service as it was before the disable, disabled and
+not deleted, or deleted, depending on where it stopped. In every case running
+`goetia daemon uninstall` again is the retry. The first failure's error names
+the start type the service had, when it could be read, and
+`goetia daemon enable` or `goetia daemon disable` sets it again. On a retry the
+service already reads as disabled, so a second failure says the original start
+type is unknown. `goetia daemon install` over a service that a failed
+`uninstall` left disabled keeps it disabled, so `start` fails with 1058 until
+`enable` or `disable` sets a start type. A service that does not accept a stop
+needs `goetia daemon kill <id>` first; `sc.exe stop` fails the same way. A
+service someone else already marked for deletion is not disabled; if it will not
+stop, the error says so, and it is removed once it stops and its last handle
+closes. SCM can refuse to watch a service marked for deletion (measured: a
+re-arm that excludes `STOPPED`, on a `STOPPED` service), so `start`, `stop`,
+`uninstall` and `kill` then decide on the state they read: the state they wait
+for ends the wait, and any other is an error that says SCM refused to watch the
+service because it is marked for deletion. A service deleted while a `stop` or
+`uninstall` waits counts as stopped.
+
+After upgrading goetia, run `goetia daemon install` again for every daemon
+installed by an older version. `type: simple` services registered before this
+shim existed have no recovery actions until then, so the new shim runs them but
+SCM does not restart them. On every start, the shim logs one warning (in
+`%ProgramData%\Goetia\logs\<id>.log` and as a warning in the Windows Event
+Log) when it starts under a service that a different goetia version registered
+and `restart` is not `never`.
+
+`sc query` shows the difference between your command failing and the shim
+failing:
+
+| What happened                                                | `WIN32_EXIT_CODE`, `SERVICE_EXIT_CODE` SCM records                             |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------ |
+| command exited `0`, or was stopped                           | `0`, `0`                                                                       |
+| command exited `n`, not `0`                                  | `1066`, `n` (a service-specific code)                                          |
+| the shim could not run the command, or its wait on it failed | a Win32 code: the OS error, `13` for an unreadable spec, `31` if there is none |
+| the shim could not show the command's tree terminated        | `0`, `1003`                                                                    |
+
+A shim that cannot report at all exits `160` or `1063`; SCM's record is then
+its own. A shim started without a service id, or that cannot connect to SCM,
+dies before it has connected, and SCM does not restart it. A shim that connected
+and then cannot register its control handler exits `1063` after the connect.
+That exact case is not measured; a service host that connected and exited
+without any report was, and SCM recorded `1067` and restarted it under the
+restart policy.
+
+Under `on-failure` both failures are restarted, so a spec the shim cannot read
+or a command that is missing retries at `restart-delay` indefinitely, as it
+does for `type: managed`. If the shim cannot terminate the command's job on
+`stop`, it logs why and reports the stop with Win32 code `0`, because a
+non-zero Win32 code would make SCM start a second copy; the service-specific
+code `1003` is the record that the command may still be running.
+
+The shim runs a `type: simple` command inside a Windows Job Object and requires
+one. The command is created suspended and assigned to the job before it runs;
+if the assignment fails, it is resumed anyway and runs outside any job until the
+shim notices and kills it, and anything it started in that time sits outside any
+job too. The shim then logs why and reports `0`, `1003`, as for a `stop` it
+could not complete, because no kill of a tree outside a job shows its
+descendants gone and SCM must not restart over a possible survivor. A `start`
+that sees the service stop with that record is a failed start.
+
+Before the shim reports the service stopped for any reason (the command exiting,
+cleanly or not, or the shim's own wait on it failing), it has the job terminated.
+A `stop` does the same before it reports. If the job cannot
+be terminated, the shim reports `0`, `1003` as for a `stop` it could not
+complete, whatever `stop` follows.
+
+The shim reports the service as stopping (`STOP_PENDING`) from the moment the
+command's end or a `stop` is decided until it reports stopped, so the service
+never reads `running` while its job is being terminated. In that window
+`goetia daemon status` and `list` show `unknown`, the state they show for any
+transitional one. A `start` fails and says the service is stopping, that SCM may
+start it again itself under its restart policy, and to run the `start` again
+once the service has stopped; it does not queue a start behind the stop. A
+`stop` waits for the stopping to finish and then exits `0`. A `stop` of a
+running service that does not accept one fails and names `goetia daemon kill`;
+it does not wait. A `stop` (or the stop of a `restart`) that arrives while SCM is
+starting the service, as in a restart after a failure, fails and says the STOP
+was not delivered and is not queued, and to run `stop` again once the service is
+running; if the service accepts STOP by the time `stop` looks, it says the STOP
+was not delivered and to run `stop` again. A `stop` that sees the service
+running or starting again after it began to stop (SCM restarted it after a
+failure, under its restart policy) fails and says so, and to run `stop` again;
+it does not wait for the restart. SCM treats the `STOPPED` that follows as it
+would one that follows `running`: a failure is restarted per `restart:`, a
+stop is not.
+
+Nothing guards against a possible survivor afterwards: `stop` exits `0`,
+including the `stop` that produced the record, and a later `start`, `restart` or
+`sc start` launches a second copy beside it. `goetia daemon status` and `list`
+show such a service as `stopped`, and so they do one waiting out its
+`restart-delay`. `goetia daemon uninstall` does not read the record either: it
+deletes such a service, and a surviving command is left with no service.
+
+"Terminated" means the shim asked Windows to terminate the job and the call
+succeeded. Windows does not report when that termination has finished, so a
+restart or `start` can briefly overlap the previous run's processes while they
+exit, and a resource they held (a listening port, a lock file) may still be
+taken. Such a start fails like any other.
+
 ### What returning means
 
 The platform's service manager reports the service as running, as far as it
@@ -727,10 +865,22 @@ confirms differs:
   `stop` of a unit systemd cannot load and that is not running: systemd
   answers it "not loaded" with no job, since there is nothing to stop, and
   that stop succeeds.
-- **SCM**, for a `type: simple` daemon, confirms that `goetia-shim` started.
-  Under `restart: on-failure` (or a 0.1.0 install's `always`) the shim reports
-  running before its first spawn, so your own command failing to start is not
-  part of what was confirmed.
+- **SCM**, for a `type: simple` daemon, confirms that `goetia-shim` started
+  your command: the shim reports running after the spawn, so a command that
+  cannot start is a failed start under every `restart:` policy. A command that
+  starts and then exits at once is a successful start, whatever its exit code,
+  as with `systemctl start`; it is the command's exit, not `start`, that
+  reports it. The shim itself failing after the spawn, with a failed wait on
+  the command or an exit status it cannot read, is a failed start if `start`
+  sees the service stopped first and a successful one if it sees it running
+  first. A `start` that lands as SCM is restarting the command, and that
+  restart fails (a missing `goetia-shim` or a broken account), is a failed start,
+  as is one where `start` sees the service stop with the shim's `0`, `1003`
+  record before it sees it running. A command no Job Object contains is always
+  seen that way, as the shim never reports running for it; for a command that
+  did run, the shim reports running first, so `start` succeeds if it sees that.
+  For a `type: managed` daemon, which speaks to SCM itself, a
+  service that stops before it reports running is a failed start.
 - **launchd** sits between the two: the pid `launchctl kickstart -p` reports
   is launchd's own fork, taken before the user process reaches its `exec`.
 
@@ -772,18 +922,20 @@ taking down, may be going down, or may never have moved.
 **On Windows, `restart --timeout 0` will usually stop the daemon and not
 restart it.** The start arrives while the service is still coming down and is
 refused — for a `type: simple` daemon almost always, since its service reads
-`RUNNING` until its child is gone — which leaves the daemon stopped, at exit
-`4`. To restart a daemon on Windows, let `restart` wait for the stop: leave
-`--timeout` at its default, or give it a duration other than `0`.
+`RUNNING` until the shim has taken the stop, then `STOP_PENDING` until its
+child is gone — which leaves the daemon stopped, at exit `4`. To restart a
+daemon on Windows, let `restart` wait for the stop: leave `--timeout` at its
+default, or give it a duration other than `0`.
 
 ## Killing a daemon
 
-`goetia daemon kill <ID...>` ends each daemon's running process as a failure,
-and returns once that is delivered. It does not wait for the process to be
-gone, takes no `--timeout`, and does not change boot-enablement. What follows
-is the daemon's `restart` policy: an `always` or `on-failure` daemon comes
-back, a `never` one stays down. Like `stop`, it needs elevation, and `--json`
-is refused.
+`goetia daemon kill <ID...>` ends each daemon's running process as a failure.
+On systemd and launchd it returns once the signal is sent; on Windows it returns
+once SCM has recorded the exit: the service is then stopped, or already
+restarted by its restart policy. It takes no `--timeout` and does not change
+boot-enablement. What follows is the daemon's `restart` policy: an `always` or
+`on-failure` daemon comes back, a `never` one stays down. Like `stop`, it needs
+elevation, and `--json` is refused.
 
 It addresses the service, never a bare pid:
 
@@ -794,13 +946,15 @@ It addresses the service, never a bare pid:
 | Windows  | SCM has no kill-by-service call, so goetia terminates the service's process (exit code `1`), after confirming through SCM that it is still the service's. SCM sees an unexpected exit and applies the recovery actions, as for a crash. |
 
 On Windows with `type: simple` the service's process is `goetia-shim`; its Job
-Object ends the daemon and its descendants with it.
+Object ends the daemon and its descendants with it. Windows does not report when
+that termination has finished, so the daemon's processes can briefly outlive the
+return of `kill`, and a restart by SCM can overlap them.
 
-On Windows a process that is already terminating (a second `kill`, or a daemon
-dying on its own) is waited for until it exits, with no time limit. When that
-wait begins goetia prints `<id>: process <pid> is already terminating; waiting
-for it to exit` to stderr; a process stuck in a driver request can keep it
-waiting.
+On Windows the process just terminated, or one already terminating (a second
+`kill`, or a daemon dying on its own), is waited for until it exits, with no
+time limit. When it has not exited yet, goetia prints
+`<id>: waiting for process <pid> to exit` to stderr; a process stuck in a
+driver request can keep it waiting.
 
 A daemon with no process, whether stopped or between runs, is an error: exit
 `1` and "is not running", because nothing was killed.

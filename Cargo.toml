@@ -1,6 +1,6 @@
 [package]
 name = "goetia"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # `cosca` uses `std::io::PipeReader`, stable since 1.87. That is already true
 # on Windows, where cosca has been a dependency all along, and the Unix

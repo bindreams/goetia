@@ -32,6 +32,19 @@ struct Scripted {
     /// Which `service_pid` calls, counted from 1, fail instead of answering.
     failing_reads: Vec<usize>,
     reads: usize,
+    /// Whether `await_exit` fails.
+    failing_exit: bool,
+    /// Whether `arm_release` fails.
+    failing_arm: bool,
+    /// How many times the kill has blocked for SCM to let go.
+    releases: usize,
+    /// How many `arm_release` calls have been made.
+    arms: usize,
+    /// From which `arm_release` call, counted from 0, SCM refuses to watch the service.
+    unwatchable_from: Option<usize>,
+    /// Whether an `arm_release` is outstanding: made, and neither woken by `await_release` nor
+    /// cancelled. SCM allows one per service handle and buffer.
+    armed: bool,
     log: Log,
 }
 
@@ -47,6 +60,12 @@ impl Scripted {
             terminates: terminates.into(),
             failing_reads: Vec::new(),
             reads: 0,
+            failing_exit: false,
+            failing_arm: false,
+            releases: 0,
+            arms: 0,
+            unwatchable_from: None,
+            armed: false,
             log: Log::default(),
         }
     }
@@ -54,6 +73,25 @@ impl Scripted {
     /// The `n`th `service_pid` call (from 1) fails.
     fn failing_read(mut self, n: usize) -> Self {
         self.failing_reads.push(n);
+        self
+    }
+
+    /// `await_exit` fails.
+    fn failing_exit(mut self) -> Self {
+        self.failing_exit = true;
+        self
+    }
+
+    /// `arm_release` fails.
+    fn failing_arm(mut self) -> Self {
+        self.failing_arm = true;
+        self
+    }
+
+    /// SCM refuses every `arm_release` from the `n`th (from 0) with 1072, the service being marked for
+    /// deletion and `STOPPED`.
+    fn unwatchable_from(mut self, n: usize) -> Self {
+        self.unwatchable_from = Some(n);
         self
     }
 
@@ -110,6 +148,51 @@ impl KillTarget for Scripted {
             Terminate::Fails => Err(io::Error::other("terminate failed")),
         }
     }
+
+    fn await_exit(&mut self, process: &Held) -> io::Result<()> {
+        self.log.borrow_mut().push(format!("await_exit {}", process.pid));
+        if self.failing_exit {
+            return Err(io::Error::other("wait on the process failed"));
+        }
+        Ok(())
+    }
+
+    fn arm_release(&mut self) -> io::Result<ReleaseWatch> {
+        self.log.borrow_mut().push("arm_release".to_string());
+        if self.failing_arm {
+            return Err(io::Error::other("notifier could not be opened"));
+        }
+        assert!(
+            !self.armed,
+            "arm_release over an outstanding registration: SCM allows one per service and buffer"
+        );
+        // A marked service that SCM recorded `STOPPED` refuses the registration: nothing is outstanding.
+        if self.unwatchable_from.is_some_and(|n| self.arms >= n) {
+            self.arms += 1;
+            return Ok(ReleaseWatch::Stopped);
+        }
+        self.arms += 1;
+        self.armed = true;
+        Ok(ReleaseWatch::Armed)
+    }
+
+    fn cancel_release(&mut self) {
+        self.log.borrow_mut().push("cancel_release".to_string());
+        assert!(self.armed, "cancel_release with no registration outstanding");
+        self.armed = false;
+    }
+
+    fn await_release(&mut self) -> io::Result<()> {
+        self.log.borrow_mut().push("await_release".to_string());
+        assert!(self.armed, "await_release with no registration to wake");
+        self.armed = false;
+        self.releases += 1;
+        assert!(
+            self.releases <= 5,
+            "the script never released the pid; the wait would not end"
+        );
+        Ok(())
+    }
 }
 
 fn steps<const N: usize>(steps: [&str; N]) -> Vec<String> {
@@ -132,12 +215,22 @@ fn a_service_with_no_process_has_nothing_to_kill() {
 /// is still the service's, and only then is it terminated, through the handle still held.
 #[skuld::test]
 fn the_process_is_held_from_the_open_through_the_termination() {
-    let mut target = Scripted::new([Some(100)], [Open::Found], [Terminate::Done]);
+    let mut target = Scripted::new([Some(100), Some(100), None], [Open::Found], [Terminate::Done]);
 
     assert_eq!(kill_service(&mut target).unwrap(), Killed::Terminated);
     assert_eq!(
         target.log(),
-        steps(["service_pid", "open 100", "service_pid", "terminate 100", "close 100"])
+        steps([
+            "service_pid",
+            "open 100",
+            "service_pid",
+            "terminate 100",
+            "await_exit 100",
+            "arm_release",
+            "service_pid",
+            "cancel_release",
+            "close 100",
+        ])
     );
 }
 
@@ -146,7 +239,7 @@ fn the_process_is_held_from_the_open_through_the_termination() {
 #[skuld::test]
 fn a_restart_between_the_open_and_the_confirmation_lets_go_of_the_stale_process() {
     let mut target = Scripted::new(
-        [Some(100), Some(200), Some(200)],
+        [Some(100), Some(200), Some(200), Some(200), None],
         [Open::Found, Open::Found],
         [Terminate::Done],
     );
@@ -163,19 +256,118 @@ fn a_restart_between_the_open_and_the_confirmation_lets_go_of_the_stale_process(
             "open 200",
             "service_pid",
             "terminate 200",
+            "await_exit 200",
+            "arm_release",
+            "service_pid",
+            "cancel_release",
             "close 200",
         ])
     );
 }
 
-/// The process exited between the read and the open, so there is nothing to open: SCM is asked
-/// again, and reports the service stopped.
+/// The process exited between the read and the open, so there is nothing to open: the kill waits for
+/// SCM to let go of the pid, then asks it again, and it reports the service stopped.
 #[skuld::test]
 fn a_process_gone_before_it_was_opened_sends_the_question_back_to_scm() {
     let mut target = Scripted::new([Some(100), None], [Open::Gone], []);
 
     assert_eq!(kill_service(&mut target).unwrap(), Killed::NotRunning);
-    assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
+    assert_eq!(
+        target.log(),
+        steps([
+            "service_pid",
+            "open 100",
+            "arm_release",
+            "service_pid",
+            "cancel_release",
+            "service_pid"
+        ])
+    );
+}
+
+/// SCM has not yet recorded the exit of a process that is already gone: the kill blocks for SCM's
+/// release rather than re-reading in a loop.
+#[skuld::test]
+fn a_process_gone_before_it_was_opened_waits_for_scm_to_let_go_of_the_pid() {
+    let mut target = Scripted::new([Some(100), Some(100), None], [Open::Gone], []);
+
+    assert_eq!(kill_service(&mut target).unwrap(), Killed::NotRunning);
+    assert_eq!(
+        target.log(),
+        steps([
+            "service_pid",
+            "open 100",
+            "arm_release",
+            "service_pid",
+            "await_release",
+            "service_pid",
+            "service_pid",
+        ])
+    );
+}
+
+/// A wake that shows SCM let go of the pid ends the wait: nothing arms again first. SCM answers an arm
+/// on a delete-marked, `STOPPED` service with 1072 (round 8), so an arm after that wake would fail a
+/// kill that worked.
+#[skuld::test]
+fn a_wake_that_shows_scm_let_go_of_the_pid_arms_nothing_again() {
+    let mut target = Scripted::new([Some(100), Some(100), None], [Open::Gone], []).unwatchable_from(1);
+
+    assert_eq!(kill_service(&mut target).unwrap(), Killed::NotRunning);
+    assert_eq!(
+        target.log(),
+        steps([
+            "service_pid",
+            "open 100",
+            "arm_release",
+            "service_pid",
+            "await_release",
+            "service_pid",
+            "service_pid",
+        ])
+    );
+}
+
+/// SCM refuses to watch a marked service it recorded `STOPPED`, and that status is the release: the
+/// pid is not read again, and nothing waits on a registration that does not exist.
+#[skuld::test]
+fn a_service_scm_will_not_watch_and_shows_stopped_is_released() {
+    let mut target = Scripted::new([Some(100), None], [Open::Gone], []).unwatchable_from(0);
+
+    assert_eq!(kill_service(&mut target).unwrap(), Killed::NotRunning);
+    assert_eq!(
+        target.log(),
+        steps(["service_pid", "open 100", "arm_release", "service_pid"])
+    );
+}
+
+/// The same for the arm after a wake that still shows the pid.
+#[skuld::test]
+fn a_re_arm_scm_refuses_on_a_stopped_service_is_the_release() {
+    let mut target = Scripted::new(
+        [Some(100), Some(100), Some(100), Some(100), None],
+        [Open::Found],
+        [Terminate::Done],
+    )
+    .unwatchable_from(1);
+
+    assert_eq!(kill_service(&mut target).unwrap(), Killed::Terminated);
+    assert_eq!(
+        target.log(),
+        steps([
+            "service_pid",
+            "open 100",
+            "service_pid",
+            "terminate 100",
+            "await_exit 100",
+            "arm_release",
+            "service_pid",
+            "await_release",
+            "service_pid",
+            "arm_release",
+            "close 100",
+        ])
+    );
 }
 
 /// The same, with the service restarted: the process that vanished is not the answer, the service's
@@ -183,7 +375,7 @@ fn a_process_gone_before_it_was_opened_sends_the_question_back_to_scm() {
 #[skuld::test]
 fn a_process_gone_before_it_was_opened_is_followed_to_the_services_new_process() {
     let mut target = Scripted::new(
-        [Some(100), Some(200), Some(200)],
+        [Some(100), Some(200), Some(200), Some(200), None],
         [Open::Gone, Open::Found],
         [Terminate::Done],
     );
@@ -194,10 +386,17 @@ fn a_process_gone_before_it_was_opened_is_followed_to_the_services_new_process()
         steps([
             "service_pid",
             "open 100",
+            "arm_release",
+            "service_pid",
+            "cancel_release",
             "service_pid",
             "open 200",
             "service_pid",
             "terminate 200",
+            "await_exit 200",
+            "arm_release",
+            "service_pid",
+            "cancel_release",
             "close 200",
         ])
     );
@@ -217,7 +416,8 @@ fn a_service_stopped_after_the_open_is_not_terminated_through_the_handle() {
 }
 
 /// The process exited between the confirmation and the termination, on its own: nothing was
-/// terminated, so the kill is not reported delivered. SCM is asked again, and has stopped the service.
+/// terminated, so the kill is not reported delivered. It waits for SCM to let go of the pid, then asks
+/// again, and SCM has stopped the service.
 #[skuld::test]
 fn a_process_that_exited_before_the_termination_is_not_a_kill() {
     let mut target = Scripted::new([Some(100), Some(100), None], [Open::Found], [Terminate::AlreadyExited]);
@@ -230,6 +430,37 @@ fn a_process_that_exited_before_the_termination_is_not_a_kill() {
             "open 100",
             "service_pid",
             "terminate 100",
+            "arm_release",
+            "service_pid",
+            "cancel_release",
+            "close 100",
+            "service_pid",
+        ])
+    );
+}
+
+/// As for a process gone before the open: SCM not yet having recorded the exit is waited out on its
+/// release, not re-read in a loop.
+#[skuld::test]
+fn a_process_that_exited_before_the_termination_waits_for_scm_to_let_go_of_the_pid() {
+    let mut target = Scripted::new(
+        [Some(100), Some(100), Some(100), None],
+        [Open::Found],
+        [Terminate::AlreadyExited],
+    );
+
+    assert_eq!(kill_service(&mut target).unwrap(), Killed::NotRunning);
+    assert_eq!(
+        target.log(),
+        steps([
+            "service_pid",
+            "open 100",
+            "service_pid",
+            "terminate 100",
+            "arm_release",
+            "service_pid",
+            "await_release",
+            "service_pid",
             "close 100",
             "service_pid",
         ])
@@ -240,7 +471,7 @@ fn a_process_that_exited_before_the_termination_is_not_a_kill() {
 #[skuld::test]
 fn a_process_that_exited_before_the_termination_is_followed_to_the_services_new_process() {
     let mut target = Scripted::new(
-        [Some(100), Some(100), Some(200), Some(200)],
+        [Some(100), Some(100), Some(200), Some(200), Some(200), None],
         [Open::Found, Open::Found],
         [Terminate::AlreadyExited, Terminate::Done],
     );
@@ -253,11 +484,18 @@ fn a_process_that_exited_before_the_termination_is_followed_to_the_services_new_
             "open 100",
             "service_pid",
             "terminate 100",
+            "arm_release",
+            "service_pid",
+            "cancel_release",
             "close 100",
             "service_pid",
             "open 200",
             "service_pid",
             "terminate 200",
+            "await_exit 200",
+            "arm_release",
+            "service_pid",
+            "cancel_release",
             "close 200",
         ])
     );
@@ -268,7 +506,7 @@ fn a_process_that_exited_before_the_termination_is_followed_to_the_services_new_
 #[skuld::test]
 fn an_open_that_failed_on_a_pid_scm_moved_off_follows_the_service() {
     let mut target = Scripted::new(
-        [Some(100), Some(200), Some(200), Some(200)],
+        [Some(100), Some(200), Some(200), Some(200), None],
         [Open::Fails, Open::Found],
         [Terminate::Done],
     );
@@ -284,6 +522,10 @@ fn an_open_that_failed_on_a_pid_scm_moved_off_follows_the_service() {
             "open 200",
             "service_pid",
             "terminate 200",
+            "await_exit 200",
+            "arm_release",
+            "service_pid",
+            "cancel_release",
             "close 200",
         ])
     );
@@ -305,6 +547,64 @@ fn an_open_that_failed_on_the_services_own_pid_is_an_error() {
 
     assert_eq!(e.to_string(), "access denied");
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
+}
+
+/// SCM records the exit after the termination is delivered, so a read straight after it still shows
+/// the old pid and the old state (CI run 40262088279: `uninstall` straight after `kill` saw RUNNING).
+/// The kill is not done until SCM has let go: it blocks for the release and reads again.
+#[skuld::test]
+fn a_kill_waits_while_scm_still_reports_the_killed_pid() {
+    let mut target = Scripted::new(
+        [Some(100), Some(100), Some(100), Some(100), Some(100), None],
+        [Open::Found],
+        [Terminate::Done],
+    );
+
+    assert_eq!(kill_service(&mut target).unwrap(), Killed::Terminated);
+    assert_eq!(
+        target.log(),
+        steps([
+            "service_pid",
+            "open 100",
+            "service_pid",
+            "terminate 100",
+            "await_exit 100",
+            "arm_release",
+            "service_pid",
+            "await_release",
+            "service_pid",
+            "arm_release",
+            "service_pid",
+            "await_release",
+            "service_pid",
+            "close 100",
+        ]),
+        "the read comes after each arm, so a change between a read and an arm is not missed, and after \
+         each wake, before any arm"
+    );
+}
+
+/// A recovery action restarted the service: SCM has moved off the killed pid, so there is nothing
+/// to wait for, and the new process is not the kill's to touch.
+#[skuld::test]
+fn a_kill_is_done_when_scm_reports_a_new_pid() {
+    let mut target = Scripted::new([Some(100), Some(100), Some(200)], [Open::Found], [Terminate::Done]);
+
+    assert_eq!(kill_service(&mut target).unwrap(), Killed::Terminated);
+    assert_eq!(
+        target.log(),
+        steps([
+            "service_pid",
+            "open 100",
+            "service_pid",
+            "terminate 100",
+            "await_exit 100",
+            "arm_release",
+            "service_pid",
+            "cancel_release",
+            "close 100",
+        ])
+    );
 }
 
 // A failed read of SCM ------------------------------------------------------------------------------------------------
@@ -345,6 +645,68 @@ fn a_failed_confirming_read_closes_the_handle_and_terminates_nothing() {
         target.log(),
         steps(["service_pid", "open 100", "service_pid", "close 100"])
     );
+}
+
+/// What a failure after a delivered termination reports: the process is dead, so the error must not
+/// read as a failed kill. The cause and its kind are kept.
+fn assert_terminated_but_unconfirmed(e: &io::Error, cause: &str) {
+    let text = e.to_string();
+    assert!(text.contains("was terminated"), "{text}");
+    assert!(text.contains("waiting for SCM to record the exit failed"), "{text}");
+    assert!(text.ends_with(cause), "{text}");
+    assert!(!text.contains("kill failed"), "{text}");
+    assert_eq!(e.kind(), io::ErrorKind::Other);
+}
+
+/// The read after the termination: the kill cannot say SCM has let go, but the process is gone.
+#[skuld::test]
+fn a_failed_read_after_the_termination_says_the_process_was_terminated() {
+    let mut target = Scripted::new([Some(100)], [Open::Found], [Terminate::Done]).failing_read(3);
+
+    let e = kill_service(&mut target).unwrap_err();
+
+    assert_terminated_but_unconfirmed(&e, "scm read failed");
+    assert_eq!(
+        target.log(),
+        steps([
+            "service_pid",
+            "open 100",
+            "service_pid",
+            "terminate 100",
+            "await_exit 100",
+            "arm_release",
+            "service_pid",
+            "close 100",
+        ])
+    );
+}
+
+#[skuld::test]
+fn a_failed_wait_for_the_exit_says_the_process_was_terminated() {
+    let mut target = Scripted::new([Some(100)], [Open::Found], [Terminate::Done]).failing_exit();
+
+    let e = kill_service(&mut target).unwrap_err();
+
+    assert_terminated_but_unconfirmed(&e, "wait on the process failed");
+}
+
+#[skuld::test]
+fn a_failed_registration_after_the_termination_says_the_process_was_terminated() {
+    let mut target = Scripted::new([Some(100)], [Open::Found], [Terminate::Done]).failing_arm();
+
+    let e = kill_service(&mut target).unwrap_err();
+
+    assert_terminated_but_unconfirmed(&e, "notifier could not be opened");
+}
+
+/// A process that was never terminated by this kill keeps the plain error: it is not a terminated one.
+#[skuld::test]
+fn a_failed_registration_for_a_process_found_gone_is_not_called_a_termination() {
+    let mut target = Scripted::new([Some(100)], [Open::Gone], []).failing_arm();
+
+    let e = kill_service(&mut target).unwrap_err();
+
+    assert_eq!(e.to_string(), "notifier could not be opened");
 }
 
 #[skuld::test]

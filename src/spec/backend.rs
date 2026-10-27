@@ -303,17 +303,28 @@ fn warn_on_sub_second_restart_delay(spec: &ShapedSpec, out: &mut Vec<Warning>) {
 /// that can drift; `backend::scm` depends on `spec`, never the reverse.
 pub(crate) const MAX_SC_ACTION_DELAY: Duration = Duration::from_millis(u32::MAX as u64);
 
-/// The advisory for `generate::registration`'s restart-delay clamp, fired at
+/// What SCM stores for an authored `restart-delay`: whole milliseconds, at most
+/// [`MAX_SC_ACTION_DELAY`]. A finer delay rounds up, as launchd's `ThrottleInterval`
+/// does to whole seconds, so what `generate::registration` renders is what a read-back
+/// of the stored value renders. A delay over the maximum is clamped to it.
+pub(crate) fn scm_restart_delay(delay: Duration) -> Duration {
+    let delay = delay.min(MAX_SC_ACTION_DELAY);
+    let sub_ms = Duration::from_nanos(u64::from(delay.subsec_nanos() % 1_000_000));
+    if sub_ms.is_zero() {
+        delay
+    } else {
+        // The maximum is a whole number of milliseconds, so a delay with a remainder is below it.
+        delay - sub_ms + Duration::from_millis(1)
+    }
+}
+
+/// The advisories for `generate::registration`'s restart-delay clamp and rounding, fired at
 /// resolve time on every host rather than only when an effectful Windows
 /// install runs the generator. Gated identically to the clamp itself:
-/// `Kind::Simple` builds no `FailureActions` at all and `Restart::Never`
-/// builds none either, so a `restart-delay` with neither `type: managed` nor
+/// `Restart::Never` builds no `FailureActions`, so a `restart-delay` without
 /// `restart: on-failure` warns about nothing. `always` never reaches here:
 /// [`Backend::reject_merged`] refuses it first.
 fn warn_on_over_long_restart_delay(spec: &ShapedSpec, out: &mut Vec<Warning>) {
-    if spec.kind.parsed() != Some(Kind::Managed) {
-        return;
-    }
     if spec.restart.parsed() != Some(Restart::OnFailure) {
         return;
     }
@@ -326,6 +337,17 @@ fn warn_on_over_long_restart_delay(spec: &ShapedSpec, out: &mut Vec<Warning>) {
             message: format!(
                 "restart-delay {delay:?} exceeds the ~49.71 days SC_ACTION.Delay (a DWORD of milliseconds) can \
                  express; clamped to {MAX_SC_ACTION_DELAY:?}"
+            ),
+        });
+        return;
+    }
+    let stored = scm_restart_delay(delay);
+    if stored != delay {
+        out.push(Warning {
+            id: Some(spec.id.clone()),
+            message: format!(
+                "restart-delay {delay:?} is not a whole number of milliseconds; SCM stores whole \
+                 milliseconds, so it will be rounded up to {stored:?}"
             ),
         });
     }

@@ -250,7 +250,7 @@ fn check_grammar_rejects_a_bare_dollar() {
 // The `spec` walk =====================================================================================================
 
 /// Parse a manifest fixture, substitute its one `frpc` daemon, and hand back
-/// the mutated `RawSpec` — the same walk `resolve` now does per daemon.
+/// the mutated `RawSpec` — the same walk `resolve` does per daemon.
 fn interpolate_yaml(yaml: &str, pairs: &[(&str, &str)]) -> Result<RawSpec, Error> {
     let mut raw: RawManifest = yaml_serde::from_str(yaml).expect("fixture yaml should parse");
     let mut entry = raw.daemons.remove("frpc").expect("fixture must declare `frpc`");
@@ -335,9 +335,9 @@ daemons:
 
 #[skuld::test]
 fn a_dollar_in_a_daemon_id_is_an_error() {
-    // `spec`/`interpolate_yaml` no longer see the daemon id at all — the
-    // rejection is `reject_interpolated_id`'s alone now. The end-to-end
-    // half (through `resolve`) lives in `resolve_tests.rs`.
+    // `spec`/`interpolate_yaml` never see the daemon id: the rejection is
+    // `reject_interpolated_id`'s alone. The end-to-end half (through `resolve`) lives in
+    // `resolve_tests.rs`.
     let err = reject_interpolated_id("${ID}").unwrap_err();
     assert!(
         err.to_string().contains("a daemon id cannot be interpolated"),

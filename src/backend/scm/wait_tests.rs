@@ -6,7 +6,9 @@
 use std::collections::VecDeque;
 
 use super::*;
+use crate::backend::scm::exit_status::{RecordedExit, Reported};
 use crate::manager::budget::{Budget, Deadline};
+use crate::spec::Kind;
 
 /// Records the granular SCM steps in call order and replays a scripted
 /// outcome for each `wait_callback` — `None` being "the deadline expired
@@ -25,19 +27,235 @@ struct FakeScm {
     deadlines: Vec<Deadline>,
     /// The deadline each `arm` was handed, in call order.
     arm_deadlines: Vec<Deadline>,
+    /// What SCM recorded for a `Stopped` the script delivers.
+    recorded: RecordedExit,
+    /// The `dwWaitHint` of a `Stopped` the script delivers.
+    wait_hint: u32,
+    /// Whether each notification the script delivers accepts `SERVICE_ACCEPT_STOP`, front to back;
+    /// `true` once it runs out.
+    accepts: VecDeque<bool>,
+    /// What the notification `wait_callback` returned last accepted.
+    last_accepts: bool,
+    /// What each `control_stop` answers, front to back; `Ok` once it runs out.
+    stop_replies: VecDeque<StopReply>,
+    /// What `query_status` answers, front to back, the last answer repeating; empty fails the test, so
+    /// a refused STOP's status is always scripted.
+    queried: VecDeque<QueriedStatus>,
+    /// The notification no `control_stop` has answered yet. `None` after a `control_stop` and after
+    /// an expiry.
+    unanswered: Option<(Observed, bool)>,
+    /// Each `control_stop` that did not follow a `Running` or `Paused` notification accepting STOP.
+    /// Only the settle tests read it; the stop and start waits send theirs without a notification.
+    bad_stops: Vec<String>,
+    /// Whether an `arm` that registered has been neither delivered nor expired. An `arm` over it
+    /// cancels it by reopening the handles, so the next one is the first on a fresh handle.
+    armed: bool,
+    /// The service's state as SCM would hold it: `None` until the first notification is delivered,
+    /// then the state that notification reported, moved by [`Self::drifting_after`].
+    state: Option<QueriedState>,
+    /// The states the latest `arm` registered for.
+    mask: &'static [QueriedState],
+    /// Whether no `arm` has been made on the current handle: the actor is fresh, or the last `arm`
+    /// cancelled an unconsumed registration by reopening the handles.
+    fresh_handle: bool,
+    /// Whether the latest `arm` was the first on its handle.
+    fresh_arm: bool,
+    /// How many notifications have been delivered.
+    deliveries: usize,
+    /// States the service moves to after the n-th notification, before the next `arm`.
+    drifts: Vec<(usize, QueriedState)>,
+    /// Whether [`Self::starting_in`] made this a model of SCM that queues a fresh arm's delivery.
+    modelled: bool,
+    /// The notification a fresh `arm` queued for the state current at the time: delivered by the next
+    /// `wait_callback` whatever the service has done since, as SCM's APC is.
+    at_once: Option<Observed>,
+    /// States the service moves to as an action starts: `(step, state)`, applied once.
+    shifts: Vec<(&'static str, QueriedState)>,
+    /// The states in which SCM refuses an `arm` with 1072 (`ERROR_SERVICE_MARKED_FOR_DELETE`).
+    refusing: &'static [QueriedState],
+    /// The n-th `arm` (1-based) meets a service that is gone: opening its fresh handle failed with 1060.
+    gone_at_arm: Option<usize>,
+}
+
+/// What a scripted `control_stop` answers.
+#[derive(Debug, Clone, Copy)]
+enum StopReply {
+    Ok,
+    Os(i32),
 }
 
 impl FakeScm {
-    fn new<const N: usize>(waits: [Option<Observed>; N]) -> Self {
+    fn new(waits: impl IntoIterator<Item = Option<Observed>>) -> Self {
         Self {
             log: vec![],
-            waits: waits.into(),
+            waits: waits.into_iter().collect(),
             what_arm_reports: Waited::Confirmed,
             start_fails: false,
             start_reply: StartReply::Accepted,
             deadlines: vec![],
             arm_deadlines: vec![],
+            recorded: shim_failed(),
+            wait_hint: 0,
+            accepts: VecDeque::new(),
+            last_accepts: true,
+            stop_replies: VecDeque::new(),
+            queried: VecDeque::new(),
+            unanswered: None,
+            bad_stops: vec![],
+            armed: false,
+            state: None,
+            mask: &[],
+            fresh_handle: true,
+            fresh_arm: false,
+            deliveries: 0,
+            drifts: vec![],
+            modelled: false,
+            at_once: None,
+            shifts: vec![],
+            refusing: &[],
+            gone_at_arm: None,
         }
+    }
+
+    /// The service is in `state` before any action, and a fresh `arm` queues a notification of the
+    /// state current in its mask (P20, P27 c, f), which the next `wait_callback` delivers whatever the
+    /// service has done since: a delivery made at the arm is not a report on what follows.
+    fn starting_in(mut self, state: QueriedState) -> Self {
+        self.state = Some(state);
+        self.modelled = true;
+        self
+    }
+
+    /// The service is in `state` as `step` (`control_stop` or `start`) runs: a recovery restart that
+    /// lands between goetia's arm and its request.
+    fn shifting_at(mut self, step: &'static str, state: QueriedState) -> Self {
+        self.shifts.push((step, state));
+        self
+    }
+
+    /// SCM refuses an `arm` with 1072 while the service is in one of `states`: it is marked for
+    /// deletion. Round 8 measured it for a re-arm excluding `STOPPED` in `STOPPED`; arms in `RUNNING` and
+    /// the pending states returned 0 (P13, P22b, P22d), so a test of another state is a model, not a
+    /// measurement.
+    fn refusing_arms_in(mut self, states: &'static [QueriedState]) -> Self {
+        self.refusing = states;
+        self
+    }
+
+    /// The `n`-th `arm` (1-based) finds the service deleted: the cancel of the registration before it
+    /// could not open a fresh handle (1060).
+    fn gone_at_arm(mut self, n: usize) -> Self {
+        self.gone_at_arm = Some(n);
+        self
+    }
+
+    fn shift(&mut self, step: &'static str) {
+        if let Some(at) = self.shifts.iter().position(|(s, _)| *s == step) {
+            self.state = Some(self.shifts.remove(at).1);
+        }
+    }
+
+    /// After the `n`-th notification the service moves on to `state`, before the next `arm`: a
+    /// restart that runs its course while goetia's thread is between a callback and its re-arm.
+    fn drifting_after(mut self, n: usize, state: QueriedState) -> Self {
+        self.drifts.push((n, state));
+        self
+    }
+
+    /// Whether the notification `observed` is one the latest `arm`'s mask admits. `Pending` is
+    /// either pending state.
+    fn mask_admits(&self, observed: Observed) -> bool {
+        use QueriedState::{Paused, Running, StartPending, StopPending, Stopped};
+        let admits = |state| self.mask.contains(&state);
+        match observed {
+            Observed::Running => admits(Running),
+            Observed::Paused => admits(Paused),
+            Observed::Stopped => admits(Stopped),
+            Observed::Pending => admits(StartPending) || admits(StopPending),
+        }
+    }
+
+    /// The state `observed` reports. `Pending` is read off the mask, which names one pending state
+    /// when a pending state can be delivered at all.
+    fn state_of(&self, observed: Observed) -> QueriedState {
+        match observed {
+            Observed::Running => QueriedState::Running,
+            Observed::Paused => QueriedState::Paused,
+            Observed::Stopped => QueriedState::Stopped,
+            Observed::Pending if self.mask.contains(&QueriedState::StopPending) => QueriedState::StopPending,
+            Observed::Pending => QueriedState::StartPending,
+        }
+    }
+
+    /// SCM's rule, as far as it is measured: the first registration on a handle fires at once on a
+    /// current state in its mask (P20, P27 c, f). A re-arm with the same context and buffer on the same
+    /// handle does not fire on a state already current at the arm, whether or not it changed since the
+    /// last delivery: P20 and P27 a measured the unchanged case, and the changed one is not measured,
+    /// so it is modelled as silent. Later a registration fires only on a transition into the mask,
+    /// which is the next scripted notification (P27 d, e). A wait with neither never returns; here it
+    /// panics instead of hanging.
+    /// Not applied before the first notification, when the state is not scripted.
+    fn assert_something_can_fire(&self) {
+        let Some(state) = self.state else { return };
+        let fires_now = self.fresh_arm && self.mask.contains(&state);
+        let fires_later = match self.waits.front() {
+            Some(Some(observed)) => self.mask_admits(*observed),
+            Some(None) => true,
+            None => false,
+        };
+        if fires_now || fires_later {
+            return;
+        }
+        let mask = self.mask;
+        if mask.contains(&state) {
+            panic!(
+                "lost wake-up: state {state:?} in mask {mask:?} was current at a same-handle re-arm, which does not fire, and nothing is scripted to change it"
+            );
+        }
+        panic!("lost wake-up: state {state:?} outside mask {mask:?}");
+    }
+
+    /// Notification `n` accepts `SERVICE_ACCEPT_STOP` iff `accepts[n]`.
+    fn accepting(mut self, accepts: impl IntoIterator<Item = bool>) -> Self {
+        self.accepts = accepts.into_iter().collect();
+        self
+    }
+
+    /// The `control_stop` calls answer `replies` in order.
+    fn stop_replies(mut self, replies: impl IntoIterator<Item = StopReply>) -> Self {
+        self.stop_replies = replies.into_iter().collect();
+        self
+    }
+
+    /// A `query_status` answers that the service is in `state`, accepting STOP iff `accepts_stop`.
+    fn queried(mut self, state: QueriedState, accepts_stop: bool) -> Self {
+        self.queried = [scripted(state, accepts_stop)].into();
+        self
+    }
+
+    /// The next `query_status` after the scripted ones answers that the service is in `state`,
+    /// accepting STOP iff `accepts_stop`: the service moved on between two reads.
+    fn then_queried(mut self, state: QueriedState, accepts_stop: bool) -> Self {
+        self.queried.push_back(scripted(state, accepts_stop));
+        self
+    }
+
+    fn stop_count(&self) -> usize {
+        self.log.iter().filter(|step| **step == "control_stop").count()
+    }
+
+    /// A delivered `Stopped` carries the record `reported` leaves in SCM.
+    fn stopped_after(mut self, reported: Reported) -> Self {
+        let (win32, specific) = reported.scm_codes();
+        self.recorded = RecordedExit { win32, specific };
+        self
+    }
+
+    /// A delivered `Stopped` is SCM's own: it records `(0, 0)` and leaves `wait_hint` behind.
+    fn stopped_by_scm_with_wait_hint(mut self, wait_hint: u32) -> Self {
+        self.recorded = RecordedExit { win32: 0, specific: 0 };
+        self.wait_hint = wait_hint;
+        self
     }
 
     /// Every `arm` reports `reports` rather than `Waited::Confirmed`.
@@ -62,40 +280,191 @@ impl FakeScm {
     fn arm_count(&self) -> usize {
         self.log.iter().filter(|step| step.starts_with("arm_")).count()
     }
+
+    /// The status SCM would report now, from the model: the state, with `SERVICE_ACCEPT_STOP` in
+    /// `RUNNING` and `PAUSED`, and the record and wait hint a delivered `Stopped` carries. Before the
+    /// first notification the state is not scripted, and the first arm's caller does not read it.
+    /// The status [`ScmActor::arm`] returns: the service's, or the scripted answer of a service not
+    /// yet modelled.
+    fn status_at_arm(&self) -> QueriedStatus {
+        match (self.state, self.queried.front()) {
+            (None, Some(scripted)) => *scripted,
+            _ => self.model_status(),
+        }
+    }
+
+    fn model_status(&self) -> QueriedStatus {
+        let state = self.state.unwrap_or(QueriedState::Stopped);
+        QueriedStatus {
+            state,
+            accepts_stop: matches!(state, QueriedState::Running | QueriedState::Paused),
+            exit: self.recorded,
+            wait_hint: self.wait_hint,
+        }
+    }
+}
+
+/// The notification of `state`; either pending state is [`Observed::Pending`].
+fn observed_in(state: QueriedState) -> Observed {
+    match state {
+        QueriedState::Running => Observed::Running,
+        QueriedState::Paused => Observed::Paused,
+        QueriedState::Stopped => Observed::Stopped,
+        _ => Observed::Pending,
+    }
+}
+
+/// A status a script gives to `query_status`, with no exit record.
+fn scripted(state: QueriedState, accepts_stop: bool) -> QueriedStatus {
+    QueriedStatus {
+        state,
+        accepts_stop,
+        exit: RecordedExit { win32: 0, specific: 0 },
+        wait_hint: 0,
+    }
 }
 
 impl ScmActor for FakeScm {
-    fn arm(&mut self, want: WantState, deadline: Deadline) -> std::io::Result<Waited> {
+    fn arm(&mut self, want: WantState, deadline: Deadline) -> std::io::Result<Armed> {
         self.arm_deadlines.push(deadline);
         self.log.push(match want {
             WantState::Stopped => "arm_stopped",
             WantState::Running => "arm_running",
+            WantState::RunningPausedOrStopped => "arm_settle",
+            WantState::StoppedOnly => "arm_stopped_only",
         });
-        Ok(self.what_arm_reports)
+        if Some(self.arm_count()) == self.gone_at_arm {
+            self.armed = false;
+            return Ok(Armed::Gone);
+        }
+        // An unconsumed registration is cancelled by reopening the handles, as `SystemScmActor` does.
+        if std::mem::take(&mut self.armed) {
+            self.fresh_handle = true;
+        }
+        if let Some(at) = self.drifts.iter().position(|(n, _)| *n == self.deliveries) {
+            self.state = Some(self.drifts.remove(at).1);
+        }
+        self.mask = want.states();
+        self.fresh_arm = std::mem::take(&mut self.fresh_handle);
+        self.at_once = None;
+        if self.what_arm_reports == Waited::Expired {
+            return Ok(Armed::Expired);
+        }
+        let status = self.status_at_arm();
+        if self.state.is_some() && self.refusing.contains(&status.state) {
+            return Ok(Armed::Unwatchable(status));
+        }
+        self.armed = true;
+        if let (true, true, Some(state)) = (self.modelled, self.fresh_arm, self.state)
+            && self.mask.contains(&state)
+        {
+            self.at_once = Some(observed_in(state));
+        }
+        // The settle arm is the one whose read is acted on: the STOP that follows answers it.
+        if want == WantState::RunningPausedOrStopped {
+            self.unanswered = match status.state {
+                QueriedState::Running => Some((Observed::Running, status.accepts_stop)),
+                QueriedState::Paused => Some((Observed::Paused, status.accepts_stop)),
+                _ => None,
+            };
+        }
+        Ok(Armed::Registered(status))
     }
     fn control_stop(&mut self) -> std::io::Result<()> {
         self.log.push("control_stop");
-        Ok(())
+        self.shift("control_stop");
+        match self.unanswered.take() {
+            Some((Observed::Running | Observed::Paused, true)) => {}
+            other => self.bad_stops.push(format!("after {other:?}")),
+        }
+        match self.stop_replies.pop_front().unwrap_or(StopReply::Ok) {
+            StopReply::Ok => {
+                // The STOP is taken: a service not yet modelled is stopping.
+                self.state.get_or_insert(QueriedState::StopPending);
+                Ok(())
+            }
+            StopReply::Os(code) => Err(std::io::Error::from_raw_os_error(code)),
+        }
     }
     fn start(&mut self) -> std::io::Result<StartReply> {
         self.log.push("start");
+        self.shift("start");
         if self.start_fails {
             return Err(std::io::Error::other("scripted start failure"));
+        }
+        // A start SCM accepts leaves a stopped service starting; one it answers 1056 leaves the state
+        // the answer carries.
+        match self.start_reply {
+            StartReply::Accepted if matches!(self.state, None | Some(QueriedState::Stopped)) => {
+                self.state = Some(QueriedState::StartPending);
+            }
+            StartReply::AlreadyRunning(queried) => {
+                self.state.get_or_insert(queried);
+            }
+            StartReply::Accepted => {}
         }
         Ok(self.start_reply)
     }
     fn wait_callback(&mut self, deadline: Deadline) -> std::io::Result<Option<Observed>> {
         self.log.push("wait");
+        // Delivered, or expired: an expiry closes and drains the actor's handles.
+        self.armed = false;
         self.deadlines.push(deadline);
-        let observed = self.waits.pop_front().expect("script ran dry");
+        let observed = match self.at_once.take() {
+            // Queued at the arm, so it reports the state then, not the one the service is in now.
+            Some(queued) => {
+                self.deliveries += 1;
+                Some(queued)
+            }
+            None => {
+                self.assert_something_can_fire();
+                let observed = self.waits.pop_front().expect("script ran dry");
+                if let Some(observed) = observed {
+                    self.state = Some(self.state_of(observed));
+                    self.deliveries += 1;
+                }
+                observed
+            }
+        };
         self.log.push(match observed {
             Some(Observed::Stopped) => "got_stopped",
             Some(Observed::Running) => "got_running",
+            Some(Observed::Paused) => "got_paused",
             Some(Observed::Pending) => "got_pending",
             None => "got_nothing",
         });
+        self.last_accepts = self.accepts.pop_front().unwrap_or(true);
+        self.unanswered = observed.map(|o| (o, self.last_accepts));
         Ok(observed)
     }
+    fn accepts_stop(&self) -> bool {
+        self.last_accepts
+    }
+    fn query_status(&mut self) -> std::io::Result<QueriedStatus> {
+        self.log.push("query_status");
+        // The service's state once a notification has told it, else the scripted answer.
+        if self.state.is_some() {
+            return Ok(self.model_status());
+        }
+        let answer = if self.queried.len() > 1 {
+            self.queried.pop_front()
+        } else {
+            self.queried.front().copied()
+        };
+        Ok(answer.expect("query_status was not scripted"))
+    }
+    fn stopped_exit(&self) -> RecordedExit {
+        self.recorded
+    }
+    fn stopped_wait_hint(&self) -> u32 {
+        self.wait_hint
+    }
+}
+
+/// The record of a service whose shim failed before launching the daemon.
+fn shim_failed() -> RecordedExit {
+    let (win32, specific) = Reported::shim_failure(None).scm_codes();
+    RecordedExit { win32, specific }
 }
 
 fn unbounded() -> Deadline {
@@ -109,10 +478,10 @@ fn spent() -> Deadline {
 }
 
 #[skuld::test]
-fn stop_via_notify_arms_stopped_then_gates_on_stopped() {
+fn stop_via_notify_sends_the_stop_then_arms_stopped_and_gates_on_stopped() {
     let mut fake = FakeScm::new([Some(Observed::Stopped)]);
     assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
-    assert_eq!(fake.log, vec!["arm_stopped", "control_stop", "wait", "got_stopped"]);
+    assert_eq!(fake.log, vec!["control_stop", "arm_stopped", "wait", "got_stopped"]);
 }
 
 #[skuld::test]
@@ -124,24 +493,718 @@ fn stop_re_arms_after_a_non_terminal_callback() {
     assert_eq!(
         fake.log,
         vec![
-            "arm_stopped",
             "control_stop",
+            "arm_stopped",
             "wait",
             "got_pending",
-            "arm_stopped", // re-arm: still waiting for STOPPED
+            "arm_stopped_only", // re-arm: only STOPPED is left to wait for; its status is read
             "wait",
             "got_stopped",
         ]
     );
 }
 
+/// A service in `STOP_PENDING` (a shim tearing the daemon down) refuses a second `STOP` with 1061
+/// without reaching the handler (P18c). That stop is under way, so `stop` waits for it to end.
 #[skuld::test]
-fn start_via_notify_arms_running_before_start_then_gates_on_running() {
+fn stop_waits_out_a_stop_already_under_way() {
+    let mut fake = FakeScm::new([Some(Observed::Pending), Some(Observed::Stopped)])
+        .stop_replies([StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL)])
+        .queried(QueriedState::StopPending, false);
+    assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        fake.log,
+        vec![
+            "control_stop",
+            "query_status",
+            "arm_stopped",
+            "wait",
+            "got_pending",
+            "arm_stopped_only",
+            "wait",
+            "got_stopped",
+        ]
+    );
+}
+
+/// The wait stays bounded by the caller's deadline: a stop under way that outlasts it expires.
+#[skuld::test]
+fn stop_over_a_stop_under_way_still_expires_on_the_deadline() {
+    let mut fake = FakeScm::new([None])
+        .stop_replies([StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL)])
+        .queried(QueriedState::StopPending, false);
+    assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), Waited::Expired);
+}
+
+#[skuld::test]
+fn a_stop_request_over_a_stop_under_way_is_accepted() {
+    let mut fake = FakeScm::new([])
+        .stop_replies([StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL)])
+        .queried(QueriedState::StopPending, false);
+    request_stop(&mut fake).unwrap();
+    assert_eq!(fake.log, vec!["control_stop", "query_status"]);
+}
+/// What a refused STOP is told, by the state the status read after the refusal reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// A stop is under way (or done): `stop` waits for it, `request_stop` is done.
+    UnderWay,
+    /// The service was starting when the STOP was sent and accepts STOP now: not delivered, say so.
+    NotDelivered,
+    /// `RUNNING` or `PAUSED` with no `SERVICE_ACCEPT_STOP`: nothing is stopping it.
+    DoesNotAccept,
+    /// `START_PENDING`: the STOP was dropped, [`STARTING`].
+    Starting,
+    /// Any other state: the OS error, code intact.
+    Raw,
+}
+
+/// A STOP refused with 1052 or 1061 means what the service's status says, not what the code says:
+/// no probe measured which code SCM gives a `RUNNING` service that accepts no STOP, and Microsoft
+/// documents 1052 for it. Every code-by-state cell is decided by the status read after the refusal.
+/// An error is not followed by a wait. A 1061 over `RUNNING` accepting STOP sends the STOP once more
+/// (the tests after this one); each script has a second refusal for it.
+#[skuld::test]
+fn a_refused_stop_is_decided_by_the_status_read_after_it() {
+    use QueriedState::{ContinuePending, PausePending, Paused, Running, StartPending, StopPending, Stopped};
+    use Refusal::{DoesNotAccept, NotDelivered, Raw, Starting, UnderWay};
+    for (code, state, accepts_stop, expected) in [
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, StopPending, false, UnderWay),
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, Stopped, false, UnderWay),
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, Running, true, UnderWay),
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, Paused, true, UnderWay),
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, Running, false, DoesNotAccept),
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, Paused, false, DoesNotAccept),
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, StartPending, false, Starting),
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, StartPending, true, Starting),
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, ContinuePending, false, Raw),
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, PausePending, false, Raw),
+        (ERROR_INVALID_SERVICE_CONTROL, StopPending, false, UnderWay),
+        (ERROR_INVALID_SERVICE_CONTROL, Stopped, false, UnderWay),
+        (ERROR_INVALID_SERVICE_CONTROL, Running, true, NotDelivered),
+        (ERROR_INVALID_SERVICE_CONTROL, Paused, true, NotDelivered),
+        (ERROR_INVALID_SERVICE_CONTROL, Running, false, DoesNotAccept),
+        (ERROR_INVALID_SERVICE_CONTROL, Paused, false, DoesNotAccept),
+        (ERROR_INVALID_SERVICE_CONTROL, StartPending, false, Starting),
+        (ERROR_INVALID_SERVICE_CONTROL, StartPending, true, Starting),
+        (ERROR_INVALID_SERVICE_CONTROL, ContinuePending, false, Raw),
+        (ERROR_INVALID_SERVICE_CONTROL, PausePending, false, Raw),
+    ] {
+        let script = || {
+            FakeScm::new([Some(Observed::Stopped)])
+                .stop_replies([StopReply::Os(code), StopReply::Os(code)])
+                .queried(state, accepts_stop)
+        };
+        let cell = format!("{code} then {state:?} accepting {accepts_stop}");
+        let mut waiting = script();
+        let mut immediate = script();
+        let results = [
+            stop_via_notify(&mut waiting, unbounded()).map(|waited| {
+                assert_eq!(waited, Waited::Confirmed, "{cell}");
+            }),
+            request_stop(&mut immediate),
+        ];
+        if expected == UnderWay {
+            for result in results {
+                result.unwrap_or_else(|e| panic!("{cell}: {e}"));
+            }
+            assert!(waiting.log.contains(&"arm_stopped"), "{cell}: {:?}", waiting.log);
+            continue;
+        }
+        assert_eq!(waiting.log, vec!["control_stop", "query_status"], "{cell}");
+        assert_eq!(immediate.log, vec!["control_stop", "query_status"], "{cell}");
+        for result in results {
+            assert_told(expected, &result.expect_err(&cell), code, &cell);
+        }
+    }
+}
+
+/// Asserts that `err` says what a refusal of kind `expected` is told. `code` is the refusal's OS code,
+/// which only [`Refusal::Raw`] keeps.
+fn assert_told(expected: Refusal, err: &std::io::Error, code: i32, cell: &str) {
+    let text = err.to_string();
+    match expected {
+        Refusal::DoesNotAccept => assert!(
+            text.contains("does not accept STOP") && text.contains("goetia daemon kill"),
+            "{cell}: {text}"
+        ),
+        Refusal::NotDelivered => {
+            for part in ["was not delivered", "accepts STOP now", "run `stop` again"] {
+                assert!(text.contains(part), "{cell}: missing {part:?}: {text}");
+            }
+            assert!(!text.contains("os error"), "{cell}: {text}");
+        }
+        Refusal::Starting => {
+            for part in [
+                "SCM is starting the service",
+                "was not delivered and is not queued",
+                "run `stop` again once the service is running",
+            ] {
+                assert!(text.contains(part), "{cell}: missing {part:?}: {text}");
+            }
+            // Not measured: a restart can fail before RUNNING (P9).
+            assert!(!text.contains("will come up"), "{cell}: {text}");
+            assert!(!text.contains("os error"), "{cell}: {text}");
+        }
+        Refusal::Raw => assert_eq!(err.raw_os_error(), Some(code), "{cell}: {text}"),
+        Refusal::UnderWay => unreachable!(),
+    }
+}
+
+/// SCM refuses a STOP with 1061 to a service in `START_PENDING` (Microsoft documents it), even one that
+/// already accepts STOP. If the service is `RUNNING` by the status read, that STOP was never delivered
+/// and nothing is stopping it, so the STOP is sent once more and this one is delivered.
+#[skuld::test]
+fn a_stop_refused_in_start_pending_is_sent_again_once_running() {
+    let script = || {
+        FakeScm::new([Some(Observed::Stopped)])
+            .stop_replies([StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL), StopReply::Ok])
+            .queried(QueriedState::Running, true)
+    };
+    let mut waiting = script();
+    assert_eq!(stop_via_notify(&mut waiting, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        waiting.log,
+        vec![
+            "control_stop",
+            "query_status",
+            "control_stop",
+            "arm_stopped",
+            "wait",
+            "got_stopped"
+        ]
+    );
+    let mut immediate = script();
+    request_stop(&mut immediate).unwrap();
+    assert_eq!(immediate.log, vec!["control_stop", "query_status", "control_stop"]);
+}
+
+/// After one delivered STOP, SCM refuses further STOPs with 1061 itself while the service stays
+/// `RUNNING` (P16a). The second STOP is refused too, so a STOP is under way: one more is not sent, and
+/// the wait goes on until the service stops.
+#[skuld::test]
+fn a_stop_refused_after_a_delivered_stop_waits_for_it() {
+    let script = || {
+        FakeScm::new([Some(Observed::Stopped)])
+            .stop_replies([
+                StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL),
+                StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL),
+            ])
+            .queried(QueriedState::Running, true)
+    };
+    let mut waiting = script();
+    assert_eq!(stop_via_notify(&mut waiting, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        waiting.log,
+        vec![
+            "control_stop",
+            "query_status",
+            "control_stop",
+            "query_status",
+            "arm_stopped",
+            "wait",
+            "got_stopped"
+        ]
+    );
+    let mut immediate = script();
+    request_stop(&mut immediate).unwrap();
+    assert_eq!(immediate.stop_count(), 2);
+}
+
+/// The resent STOP's refusal is decided by a fresh status read through the table of
+/// [`a_refused_stop_is_decided_by_the_status_read_after_it`], with no third STOP: the first read shows
+/// `RUNNING` accepting STOP, then the service moves to `state` before the second read.
+#[skuld::test]
+fn a_resent_stop_that_is_refused_is_decided_by_a_fresh_status_read() {
+    use QueriedState::{Paused, Running, StartPending, StopPending, Stopped};
+    use Refusal::{DoesNotAccept, NotDelivered, Starting, UnderWay};
+    for (code, state, accepts_stop, expected) in [
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, StopPending, false, UnderWay),
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, Stopped, false, UnderWay),
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, Running, true, UnderWay),
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, Paused, true, UnderWay),
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, Running, false, DoesNotAccept),
+        (ERROR_SERVICE_CANNOT_ACCEPT_CTRL, StartPending, false, Starting),
+        (ERROR_INVALID_SERVICE_CONTROL, StopPending, false, UnderWay),
+        (ERROR_INVALID_SERVICE_CONTROL, Running, true, NotDelivered),
+        (ERROR_INVALID_SERVICE_CONTROL, Running, false, DoesNotAccept),
+        (ERROR_INVALID_SERVICE_CONTROL, StartPending, false, Starting),
+    ] {
+        let script = || {
+            FakeScm::new([Some(Observed::Stopped)])
+                .stop_replies([StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL), StopReply::Os(code)])
+                .queried(Running, true)
+                .then_queried(state, accepts_stop)
+        };
+        let cell = format!("1061, then {code} and {state:?} accepting {accepts_stop}");
+        let mut waiting = script();
+        let mut immediate = script();
+        let results = [
+            stop_via_notify(&mut waiting, unbounded()).map(|waited| {
+                assert_eq!(waited, Waited::Confirmed, "{cell}");
+            }),
+            request_stop(&mut immediate),
+        ];
+        assert_eq!(waiting.stop_count(), 2, "{cell}: no third STOP: {:?}", waiting.log);
+        assert_eq!(immediate.stop_count(), 2, "{cell}: no third STOP: {:?}", immediate.log);
+        for result in results {
+            if expected == UnderWay {
+                result.unwrap_or_else(|e| panic!("{cell}: {e}"));
+            } else {
+                assert_told(expected, &result.expect_err(&cell), code, &cell);
+            }
+        }
+        assert!(waiting.log.contains(&"arm_stopped") == (expected == UnderWay), "{cell}");
+    }
+}
+
+/// A resent STOP refused for any other reason is that OS error.
+#[skuld::test]
+fn a_resent_stop_refused_with_another_code_is_the_os_error() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)])
+        .stop_replies([StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL), StopReply::Os(5)])
+        .queried(QueriedState::Running, true);
+    assert_eq!(
+        stop_via_notify(&mut fake, unbounded()).unwrap_err().raw_os_error(),
+        Some(5)
+    );
+    assert_eq!(fake.stop_count(), 2);
+}
+
+/// Any other refusal is an error that keeps its OS code, without a status read.
+#[skuld::test]
+fn a_stop_refused_with_another_code_is_the_os_error() {
+    let script = || FakeScm::new([Some(Observed::Stopped)]).stop_replies([StopReply::Os(5)]);
+    let mut waiting = script();
+    let mut immediate = script();
+    assert_eq!(
+        stop_via_notify(&mut waiting, unbounded()).unwrap_err().raw_os_error(),
+        Some(5)
+    );
+    assert_eq!(request_stop(&mut immediate).unwrap_err().raw_os_error(), Some(5));
+    assert_eq!(
+        waiting.log,
+        vec!["control_stop"],
+        "nothing is armed for a STOP that was not sent"
+    );
+}
+
+/// A failure that races the stop goes `STOPPED (1066)`, and SCM restarts the service under its
+/// restart policy. If the restart reaches `RUNNING` (or is `START_PENDING`) before the re-arm, no
+/// notification will ever come: the re-arm is read, and the service is reported as not stopped.
+/// Without the read the model panics with a lost wake-up, where a real wait would hang.
+#[skuld::test]
+fn a_stop_whose_service_restarted_before_the_re_arm_says_so_instead_of_waiting() {
+    for (state, said) in [
+        (QueriedState::Running, "is running again"),
+        (QueriedState::StartPending, "is starting again"),
+    ] {
+        let mut fake = FakeScm::new([Some(Observed::Pending)]).drifting_after(1, state);
+        let err = stop_via_notify(&mut fake, unbounded()).unwrap_err().to_string();
+        for part in [said, "after it began to stop", "restart policy", "Run `stop` again."] {
+            assert!(err.contains(part), "{state:?}: missing {part:?}: {err}");
+        }
+        assert_eq!(fake.stop_count(), 1, "{state:?}: no second STOP is sent");
+        assert_eq!(
+            fake.log,
+            vec!["control_stop", "arm_stopped", "wait", "got_pending", "arm_stopped_only"],
+            "{state:?}"
+        );
+    }
+}
+
+/// The same race when the service has stopped and stayed so: the re-arm reports `STOPPED` at once.
+#[skuld::test]
+fn a_stop_whose_service_stopped_before_the_re_arm_is_confirmed_by_the_read() {
+    let mut fake = FakeScm::new([Some(Observed::Pending)]).drifting_after(1, QueriedState::Stopped);
+    assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        fake.log,
+        vec!["control_stop", "arm_stopped", "wait", "got_pending", "arm_stopped_only"]
+    );
+}
+
+/// `settle_and_stop` waits with the same loop after its accepted STOP. Its error does not advise
+/// `stop`: `uninstall` words its own retry.
+#[skuld::test]
+fn uninstalls_stop_wait_also_reads_after_its_re_arm() {
+    let mut fake = FakeScm::new([Some(Observed::Running), Some(Observed::Pending)])
+        .stop_replies([StopReply::Ok])
+        .drifting_after(2, QueriedState::Running);
+    let err = settle_and_stop(&mut fake, unbounded()).unwrap_err().to_string();
+    assert!(
+        err.contains("is running again") && !err.contains("`stop` again"),
+        "{err}"
+    );
+}
+
+/// A recovery restart can run between an arm and the STOP: the service fails to `STOPPED` just before
+/// the arm, SCM restarts it, and the STOP lands on the new run. A `STOPPED` queued at an arm made before
+/// the STOP is not the STOP's answer, and taking it confirms a stop of a running service.
+#[skuld::test]
+fn a_stop_is_not_confirmed_by_a_stopped_the_service_left_before_the_stop() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)])
+        .starting_in(QueriedState::Stopped)
+        .shifting_at("control_stop", QueriedState::Running);
+    assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(fake.state, Some(QueriedState::Stopped), "confirmed on a stale STOPPED");
+    assert_eq!(fake.log, vec!["control_stop", "arm_stopped", "wait", "got_stopped"]);
+}
+
+/// The arm follows the STOP, so a service that is already `STOPPED` is seen in the status the arm
+/// returns, and nothing waits.
+#[skuld::test]
+fn a_stop_whose_service_stopped_before_the_arm_is_confirmed_by_the_read() {
+    let mut fake = FakeScm::new([]).drifting_after(0, QueriedState::Stopped);
+    assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(fake.log, vec!["control_stop", "arm_stopped"]);
+}
+
+/// The STOP is issued whatever is left of the budget; only the arm after it is bounded.
+#[skuld::test]
+fn a_stop_is_issued_even_when_the_arm_after_it_expires() {
+    let mut fake = FakeScm::new([]).arming(Waited::Expired);
+    assert_eq!(stop_via_notify(&mut fake, spent()).unwrap(), Waited::Expired);
+    assert_eq!(fake.log, vec!["control_stop", "arm_stopped"]);
+}
+
+// settle_and_stop ----
+
+/// What one SCM interleaving must make [`settle_and_stop`] do.
+enum Outcome {
+    Confirmed,
+    /// An error whose text contains this.
+    Fails(&'static str),
+}
+
+/// One SCM interleaving: the notifications SCM delivers, whether each accepts STOP, what each STOP
+/// is answered, and the steps the loop must take in response.
+struct Row {
+    name: &'static str,
+    waits: Vec<Option<Observed>>,
+    accepts: Vec<bool>,
+    replies: Vec<StopReply>,
+    outcome: Outcome,
+    log: Vec<&'static str>,
+}
+
+const INVALID_SERVICE_CONTROL: i32 = 1052;
+const CANNOT_ACCEPT_CTRL: i32 = 1061;
+
+fn settle_rows() -> Vec<Row> {
+    use Observed::{Paused, Pending, Running, Stopped};
+    vec![
+        Row {
+            name: "stopped at once",
+            waits: vec![Some(Stopped)],
+            accepts: vec![],
+            replies: vec![],
+            outcome: Outcome::Confirmed,
+            log: vec!["arm_settle", "wait", "got_stopped"],
+        },
+        Row {
+            name: "running, the stop is accepted, then stopped",
+            waits: vec![Some(Running), Some(Stopped)],
+            accepts: vec![],
+            replies: vec![StopReply::Ok],
+            outcome: Outcome::Confirmed,
+            log: vec![
+                "arm_settle",
+                "wait",
+                "got_running",
+                "control_stop",
+                "arm_stopped",
+                "wait",
+                "got_stopped",
+            ],
+        },
+        Row {
+            name: "paused, the stop is accepted, then stopped",
+            waits: vec![Some(Paused), Some(Stopped)],
+            accepts: vec![],
+            replies: vec![StopReply::Ok],
+            outcome: Outcome::Confirmed,
+            log: vec![
+                "arm_settle",
+                "wait",
+                "got_paused",
+                "control_stop",
+                "arm_stopped",
+                "wait",
+                "got_stopped",
+            ],
+        },
+        Row {
+            name: "running, a restart began (1052), running again by the re-arm, the stop is accepted, then stopped",
+            waits: vec![Some(Running), Some(Stopped)],
+            accepts: vec![],
+            replies: vec![StopReply::Os(INVALID_SERVICE_CONTROL), StopReply::Ok],
+            outcome: Outcome::Confirmed,
+            log: vec![
+                "arm_settle",
+                "wait",
+                "got_running",
+                "control_stop",
+                "arm_settle",
+                "control_stop",
+                "arm_stopped",
+                "wait",
+                "got_stopped",
+            ],
+        },
+        Row {
+            name: "running, a stop was already delivered (1061), sent once more and refused again: under way, then stopped",
+            waits: vec![Some(Running), Some(Stopped)],
+            accepts: vec![],
+            replies: vec![StopReply::Os(CANNOT_ACCEPT_CTRL), StopReply::Os(CANNOT_ACCEPT_CTRL)],
+            outcome: Outcome::Confirmed,
+            log: vec![
+                "arm_settle",
+                "wait",
+                "got_running",
+                "control_stop",
+                "arm_settle",
+                "control_stop",
+                "arm_stopped",
+                "wait",
+                "got_stopped",
+            ],
+        },
+        Row {
+            name: "running, 1061 because the service was starting, the STOP sent once more is accepted, then stopped",
+            waits: vec![Some(Running), Some(Stopped)],
+            accepts: vec![],
+            replies: vec![StopReply::Os(CANNOT_ACCEPT_CTRL), StopReply::Ok],
+            outcome: Outcome::Confirmed,
+            log: vec![
+                "arm_settle",
+                "wait",
+                "got_running",
+                "control_stop",
+                "arm_settle",
+                "control_stop",
+                "arm_stopped",
+                "wait",
+                "got_stopped",
+            ],
+        },
+        Row {
+            name: "1052, 1061 and an accepted stop in a row",
+            waits: vec![Some(Running), Some(Stopped)],
+            accepts: vec![],
+            replies: vec![
+                StopReply::Os(INVALID_SERVICE_CONTROL),
+                StopReply::Os(CANNOT_ACCEPT_CTRL),
+                StopReply::Ok,
+            ],
+            outcome: Outcome::Confirmed,
+            log: vec![
+                "arm_settle",
+                "wait",
+                "got_running",
+                "control_stop",
+                "arm_settle",
+                "control_stop",
+                "arm_settle",
+                "control_stop",
+                "arm_stopped",
+                "wait",
+                "got_stopped",
+            ],
+        },
+        Row {
+            name: "running and STOP not accepted",
+            waits: vec![Some(Running)],
+            accepts: vec![false],
+            replies: vec![],
+            outcome: Outcome::Fails("does not accept STOP"),
+            log: vec!["arm_settle", "wait", "got_running"],
+        },
+        Row {
+            name: "paused and STOP not accepted",
+            waits: vec![Some(Paused)],
+            accepts: vec![false],
+            replies: vec![],
+            outcome: Outcome::Fails("does not accept STOP"),
+            log: vec!["arm_settle", "wait", "got_paused"],
+        },
+        Row {
+            name: "running, then another error",
+            waits: vec![Some(Running)],
+            accepts: vec![],
+            replies: vec![StopReply::Os(5)],
+            outcome: Outcome::Fails("os error 5"),
+            log: vec!["arm_settle", "wait", "got_running", "control_stop"],
+        },
+        Row {
+            name: "running, the stop is accepted, stop pending, then stopped",
+            waits: vec![Some(Running), Some(Pending), Some(Stopped)],
+            accepts: vec![],
+            replies: vec![StopReply::Ok],
+            outcome: Outcome::Confirmed,
+            log: vec![
+                "arm_settle",
+                "wait",
+                "got_running",
+                "control_stop",
+                "arm_stopped",
+                "wait",
+                "got_pending",
+                "arm_stopped_only",
+                "wait",
+                "got_stopped",
+            ],
+        },
+        Row {
+            name: "a pending notification that accepts STOP is not stopped",
+            waits: vec![Some(Pending), Some(Stopped)],
+            accepts: vec![true, true],
+            replies: vec![],
+            outcome: Outcome::Confirmed,
+            log: vec!["arm_settle", "wait", "got_pending", "arm_settle", "wait", "got_stopped"],
+        },
+    ]
+}
+
+/// Every interleaving ends, returns `Confirmed` only on a `Stopped` observation, and sends a STOP
+/// only on a `Running` or `Paused` notification that accepts it. The fake runs dry, and panics, if
+/// the loop asks for a notification the row did not script.
+#[skuld::test]
+fn settle_and_stop_handles_every_scm_interleaving() {
+    for row in settle_rows() {
+        let mut fake = FakeScm::new(row.waits.clone())
+            .accepting(row.accepts.clone())
+            .stop_replies(row.replies.clone());
+        let result = settle_and_stop(&mut fake, unbounded());
+        match (&row.outcome, result) {
+            (Outcome::Confirmed, Ok(Waited::Confirmed)) => {
+                assert_eq!(
+                    fake.log.last(),
+                    Some(&"got_stopped"),
+                    "{}: Confirmed without a Stopped observation: {:?}",
+                    row.name,
+                    fake.log
+                );
+            }
+            (Outcome::Fails(text), Err(e)) => {
+                assert!(e.to_string().contains(text), "{}: {e}", row.name);
+            }
+            (_, other) => panic!("{}: unexpected {other:?}", row.name),
+        }
+        assert_eq!(fake.log, row.log, "{}", row.name);
+        assert!(fake.bad_stops.is_empty(), "{}: {:?}", row.name, fake.bad_stops);
+        assert!(fake.waits.is_empty(), "{}: unconsumed notifications", row.name);
+    }
+}
+
+/// A re-arm on the same handle is not delivered for a state already current at the arm, so each
+/// re-arm below is followed by a read that decides before any wait. The fake panics with a lost
+/// wake-up where the code would have waited on a registration that cannot fire.
+#[skuld::test]
+fn settle_and_stop_reads_after_the_re_arm_that_follows_a_pending_notification() {
+    use QueriedState::{Running, Stopped};
+    // Stopped before the re-arm: confirmed by the read.
+    let mut fake = FakeScm::new([Some(Observed::Pending)]).drifting_after(1, Stopped);
+    assert_eq!(settle_and_stop(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(fake.log, vec!["arm_settle", "wait", "got_pending", "arm_settle"]);
+
+    // Running before the re-arm: the STOP is sent as if it had been notified, and the service is
+    // STOPPED by the arm after it.
+    let mut fake = FakeScm::new([Some(Observed::Pending)])
+        .stop_replies([StopReply::Ok])
+        .drifting_after(1, Running)
+        .drifting_after(1, Stopped);
+    assert_eq!(settle_and_stop(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        fake.log,
+        vec![
+            "arm_settle",
+            "wait",
+            "got_pending",
+            "arm_settle",
+            "control_stop",
+            "arm_stopped"
+        ]
+    );
+    assert!(fake.bad_stops.is_empty(), "{:?}", fake.bad_stops);
+}
+
+/// After a 1052 the restart that began may be RUNNING again before the re-arm: the read says so and
+/// the STOP is sent as for a notified RUNNING.
+#[skuld::test]
+fn settle_and_stop_sends_the_stop_again_when_the_read_after_a_1052_shows_running() {
+    let mut fake = FakeScm::new([Some(Observed::Running), Some(Observed::Stopped)])
+        .stop_replies([StopReply::Os(INVALID_SERVICE_CONTROL), StopReply::Ok]);
+    assert_eq!(settle_and_stop(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(fake.stop_count(), 2);
+    assert!(fake.bad_stops.is_empty(), "{:?}", fake.bad_stops);
+}
+
+/// The service may be STOPPED before the re-arm that follows a refused STOP, whichever code refused.
+#[skuld::test]
+fn settle_and_stop_is_confirmed_by_a_read_of_stopped_after_a_refused_stop() {
+    for code in [INVALID_SERVICE_CONTROL, CANNOT_ACCEPT_CTRL] {
+        let mut fake = FakeScm::new([Some(Observed::Running)])
+            .stop_replies([StopReply::Os(code)])
+            .drifting_after(1, QueriedState::Stopped);
+        assert_eq!(
+            settle_and_stop(&mut fake, unbounded()).unwrap(),
+            Waited::Confirmed,
+            "{code}"
+        );
+        assert_eq!(
+            fake.log,
+            vec!["arm_settle", "wait", "got_running", "control_stop", "arm_settle"],
+            "{code}"
+        );
+    }
+}
+
+/// A STOP the SCM accepted can be followed by `STOPPED` before the arm that waits for it: the shim
+/// finishes its teardown first. The read after that arm confirms it.
+#[skuld::test]
+fn settle_and_stop_is_confirmed_by_a_read_of_stopped_after_an_accepted_stop() {
+    let mut fake = FakeScm::new([Some(Observed::Running)])
+        .stop_replies([StopReply::Ok])
+        .drifting_after(1, QueriedState::Stopped);
+    assert_eq!(settle_and_stop(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        fake.log,
+        vec!["arm_settle", "wait", "got_running", "control_stop", "arm_stopped"]
+    );
+}
+
+#[skuld::test]
+fn settle_and_stop_names_the_state_that_refuses_a_stop() {
+    let mut fake = FakeScm::new([Some(Observed::Paused)]).accepting([false]);
+    let err = settle_and_stop(&mut fake, unbounded()).unwrap_err().to_string();
+    assert!(err.contains("PAUSED"), "{err}");
+}
+
+/// A bounded wait that runs out is an expiry, never a confirmation.
+#[skuld::test]
+fn settle_and_stop_reports_each_kind_of_expiry() {
+    let mut fake = FakeScm::new([]).arming(Waited::Expired);
+    assert_eq!(settle_and_stop(&mut fake, spent()).unwrap(), Waited::Expired);
+    assert_eq!(fake.log, vec!["arm_settle"]);
+
+    let mut fake = FakeScm::new([None]);
+    assert_eq!(settle_and_stop(&mut fake, spent()).unwrap(), Waited::Expired);
+
+    let mut fake = FakeScm::new([Some(Observed::Running), None]);
+    assert_eq!(settle_and_stop(&mut fake, spent()).unwrap(), Waited::Expired);
+    assert_eq!(fake.stop_count(), 1);
+}
+
+#[skuld::test]
+fn start_via_notify_starts_then_arms_running_and_gates_on_running() {
     let mut fake = FakeScm::new([Some(Observed::Running)]);
-    assert_eq!(start_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
-    // The critical ordering: arm RUNNING strictly BEFORE start, else a
-    // RUNNING reached before the arm fires only on the NEXT entry — a hang.
-    assert_eq!(fake.log, vec!["arm_running", "start", "wait", "got_running"]);
+    assert_eq!(
+        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        Waited::Confirmed
+    );
+    // The critical ordering: arm RUNNING strictly AFTER start, so only what follows it decides.
+    assert_eq!(fake.log, vec!["start", "arm_running", "wait", "got_running"]);
 }
 
 #[skuld::test]
@@ -150,12 +1213,15 @@ fn start_re_arms_after_a_non_terminal_callback() {
     // for RUNNING, then RUNNING; the non-terminal callback must trigger a
     // re-arm.
     let mut fake = FakeScm::new([Some(Observed::Pending), Some(Observed::Running)]);
-    assert_eq!(start_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        Waited::Confirmed
+    );
     assert_eq!(
         fake.log,
         vec![
-            "arm_running",
             "start",
+            "arm_running",
             "wait",
             "got_pending",
             "arm_running", // re-arm: still waiting for RUNNING
@@ -165,13 +1231,310 @@ fn start_re_arms_after_a_non_terminal_callback() {
     );
 }
 
+/// The service can be RUNNING before the re-arm that follows a pending notification, and a re-arm
+/// is not delivered for a state already current: the read after it confirms the start.
+#[skuld::test]
+fn a_start_whose_service_is_running_before_the_re_arm_is_confirmed_by_the_read() {
+    let mut fake = FakeScm::new([Some(Observed::Pending)]).drifting_after(1, QueriedState::Running);
+    assert_eq!(
+        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        Waited::Confirmed
+    );
+    assert_eq!(
+        fake.log,
+        vec!["start", "arm_running", "wait", "got_pending", "arm_running"]
+    );
+}
+
+/// A service that stopped before the re-arm is read like a notified `STOPPED`, with the exit record
+/// and wait hint the read carries.
+#[skuld::test]
+fn a_start_whose_service_stopped_before_the_re_arm_is_judged_like_a_notified_stopped() {
+    type Script = fn(FakeScm) -> FakeScm;
+    let cases: [(&str, Kind, Script, Option<&str>); 5] = [
+        (
+            "daemon ended",
+            Kind::Simple,
+            |f| f.stopped_after(Reported::from_daemon_code(7)),
+            None,
+        ),
+        (
+            "shim failed",
+            Kind::Simple,
+            |f| f.stopped_after(Reported::shim_failure(Some(2))),
+            Some("exit code 2"),
+        ),
+        (
+            "incomplete stop",
+            Kind::Simple,
+            |f| f.stopped_after(Reported::incomplete_stop()),
+            Some("may still be running"),
+        ),
+        (
+            "SCM's failed start, joined",
+            Kind::Simple,
+            |f| {
+                f.already_running(QueriedState::StartPending)
+                    .stopped_by_scm_with_wait_hint(2000)
+            },
+            Some("the shim never connected to SCM"),
+        ),
+        (
+            "managed",
+            Kind::Managed,
+            |f| f.stopped_after(Reported::from_daemon_code(7)),
+            Some("failed start"),
+        ),
+    ];
+    for (name, kind, script, error) in cases {
+        let mut fake = script(FakeScm::new([Some(Observed::Pending)]).drifting_after(1, QueriedState::Stopped));
+        let result = start_via_notify(&mut fake, unbounded(), kind);
+        match error {
+            None => assert_eq!(result.unwrap(), Waited::Confirmed, "{name}"),
+            Some(text) => {
+                let err = result.unwrap_err().to_string();
+                assert!(err.contains("failed start") && err.contains(text), "{name}: {err}");
+            }
+        }
+        assert_eq!(
+            fake.log,
+            vec!["start", "arm_running", "wait", "got_pending", "arm_running"],
+            "{name}"
+        );
+    }
+}
+
+/// A `RUNNING` queued at an arm made before the start is not the start's answer: the run it reported
+/// failed, and the new one has reported nothing.
+#[skuld::test]
+fn a_start_is_not_confirmed_by_a_running_the_service_left_before_the_start() {
+    let mut fake = FakeScm::new([Some(Observed::Running)])
+        .starting_in(QueriedState::Running)
+        .shifting_at("start", QueriedState::Stopped);
+    assert_eq!(
+        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        Waited::Confirmed
+    );
+    assert_eq!(fake.state, Some(QueriedState::Running), "confirmed on a stale RUNNING");
+    assert_eq!(
+        fake.log,
+        vec![
+            "start",
+            "arm_running",
+            "wait",
+            "got_pending",
+            "arm_running",
+            "wait",
+            "got_running"
+        ]
+    );
+}
+
+/// The arm follows the start, so a service that is `RUNNING` by then is seen in the status the arm
+/// returns and nothing waits.
+#[skuld::test]
+fn a_start_whose_service_is_running_before_the_arm_is_confirmed_by_the_read() {
+    let mut fake = FakeScm::new([]).drifting_after(0, QueriedState::Running);
+    assert_eq!(
+        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        Waited::Confirmed
+    );
+    assert_eq!(fake.log, vec!["start", "arm_running"]);
+}
+
+/// A service that stopped before the arm is judged like a notified `STOPPED`, with the exit record
+/// the read carries.
+#[skuld::test]
+fn a_start_whose_service_stopped_before_the_arm_is_judged_by_the_read() {
+    let mut fake = FakeScm::new([])
+        .drifting_after(0, QueriedState::Stopped)
+        .stopped_after(Reported::from_daemon_code(7));
+    assert_eq!(
+        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        Waited::Confirmed
+    );
+    let mut fake = FakeScm::new([])
+        .drifting_after(0, QueriedState::Stopped)
+        .stopped_after(Reported::shim_failure(Some(2)));
+    let err = start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap_err();
+    assert!(err.to_string().contains("exit code 2"), "{err}");
+    assert_eq!(fake.log, vec!["start", "arm_running"]);
+}
+
 #[skuld::test]
 fn a_terminal_stopped_after_start_is_still_an_error_not_an_expiry() {
     // A service that stopped instead of reaching Running is a *failed
     // start*, not a wait that ran out of budget — the caller's remedy
     // differs, so the two must not collapse into one another.
     let mut fake = FakeScm::new([Some(Observed::Pending), Some(Observed::Stopped)]);
-    assert!(start_via_notify(&mut fake, unbounded()).is_err());
+    assert!(start_via_notify(&mut fake, unbounded(), Kind::Simple).is_err());
+}
+
+#[skuld::test]
+fn a_daemon_that_exited_right_after_launch_is_a_started_service() {
+    // `start` confirms the shim launched the daemon, as `systemctl start` confirms the exec: what
+    // the daemon does next is not the start's to judge, and racing it would make the answer vary.
+    for reported in [Reported::from_daemon_code(7), Reported::Clean] {
+        let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(reported);
+        assert_eq!(
+            start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+            Waited::Confirmed,
+            "{reported:?}"
+        );
+    }
+}
+
+/// The shim's `(0, 1003)` says it could not show the daemon's tree gone: not a launch to confirm,
+/// and the daemon may still be running. A `Stopped` notification can follow a `RUNNING` the wait
+/// never saw, so the message claims neither when the record was made nor why.
+#[skuld::test]
+fn an_incomplete_stop_record_is_a_failed_start() {
+    for joined in [None, Some(QueriedState::StartPending)] {
+        let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(Reported::incomplete_stop());
+        if let Some(queried) = joined {
+            fake = fake.already_running(queried);
+        }
+
+        let err = start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("failed start"), "{joined:?}: {message}");
+        assert!(message.contains("may still be running"), "{joined:?}: {message}");
+        assert!(!message.contains("before reaching Running"), "{joined:?}: {message}");
+        assert!(!message.contains("contained"), "{joined:?}: {message}");
+    }
+}
+
+/// A daemon that exits with code 1003 is `(1066, 1003)`, not the incomplete-stop record.
+#[skuld::test]
+fn a_daemon_exiting_1003_is_still_a_started_service() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(Reported::from_daemon_code(1003));
+
+    assert_eq!(
+        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        Waited::Confirmed
+    );
+}
+
+/// A `start` that lands as SCM's queued recovery start fires gets 1056 over `START_PENDING`. If
+/// that attempt fails (missing ImagePath, broken account) SCM reports `STOPPED (0, 0)` with a
+/// wait hint of 2000, and the shim never connected to SCM.
+#[skuld::test]
+fn a_failed_scm_recovery_start_that_a_start_joined_is_a_failed_start() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)])
+        .already_running(QueriedState::StartPending)
+        .stopped_by_scm_with_wait_hint(2000);
+
+    let err = start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap_err();
+
+    let message = err.to_string();
+    assert!(message.contains("failed start"), "{message}");
+    assert!(
+        message.contains("the shim never connected to SCM, so no daemon ran"),
+        "{message}"
+    );
+}
+
+/// A managed service's own host ran, so its `STOPPED (0, 0)` with a leftover wait hint is a failed
+/// start, but not one where "the shim never connected to SCM".
+#[skuld::test]
+fn a_managed_stopped_with_a_wait_hint_that_a_start_joined_does_not_claim_nothing_ran() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)])
+        .already_running(QueriedState::StartPending)
+        .stopped_by_scm_with_wait_hint(2000);
+
+    let err = start_via_notify(&mut fake, unbounded(), Kind::Managed).unwrap_err();
+
+    let message = err.to_string();
+    assert!(message.contains("failed start"), "{message}");
+    assert!(!message.contains("never connected to SCM"), "{message}");
+}
+
+/// A start SCM accepted is ours, so `(0, 0)` with a wait hint is not SCM's failed attempt.
+#[skuld::test]
+fn a_stopped_with_a_wait_hint_after_an_accepted_start_is_a_started_service() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_by_scm_with_wait_hint(2000);
+
+    assert_eq!(
+        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        Waited::Confirmed
+    );
+}
+
+/// The shim's own report of a daemon's exit is not `(0, 0)`, so a leftover wait hint does not make
+/// it a failed start.
+#[skuld::test]
+fn a_daemon_exit_record_with_a_wait_hint_that_a_start_joined_is_a_started_service() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)])
+        .already_running(QueriedState::StartPending)
+        .stopped_after(Reported::from_daemon_code(7));
+    fake.wait_hint = 2000;
+
+    assert_eq!(
+        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        Waited::Confirmed
+    );
+}
+
+/// `(0, 0)` with no wait hint is the shim's clean report: the daemon ran and ended.
+#[skuld::test]
+fn a_clean_daemon_exit_that_a_start_joined_is_still_a_started_service() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)])
+        .already_running(QueriedState::StartPending)
+        .stopped_after(Reported::Clean);
+
+    assert_eq!(
+        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        Waited::Confirmed
+    );
+}
+
+#[skuld::test]
+fn a_shim_failure_before_launch_is_a_failed_start() {
+    for reported in [Reported::shim_failure(None), Reported::shim_failure(Some(2))] {
+        let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(reported);
+        let err = start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap_err();
+        assert!(
+            err.to_string().contains("failed start"),
+            "{reported:?} gave an error that does not say so: {err}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_managed_service_that_stops_before_running_is_a_failed_start_whatever_it_recorded() {
+    // A managed service speaks SCM itself: STOPPED with a service-specific code before RUNNING is
+    // how it reports that it could not start. The shim's reading of a record (a daemon exit means
+    // the daemon was launched) does not apply to it.
+    for reported in [
+        Reported::from_daemon_code(7),
+        Reported::Clean,
+        Reported::incomplete_stop(),
+        Reported::shim_failure(Some(2)),
+    ] {
+        let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(reported);
+        let err = start_via_notify(&mut fake, unbounded(), Kind::Managed).unwrap_err();
+        assert!(
+            err.to_string().contains("failed start"),
+            "{reported:?} gave an error that does not say so: {err}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_managed_service_that_reaches_running_is_a_started_service() {
+    let mut fake = FakeScm::new([Some(Observed::Running)]);
+    assert_eq!(
+        start_via_notify(&mut fake, unbounded(), Kind::Managed).unwrap(),
+        Waited::Confirmed
+    );
+}
+
+#[skuld::test]
+fn a_failed_start_names_the_recorded_code() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(Reported::shim_failure(Some(2)));
+    let err = start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap_err();
+    assert!(err.to_string().contains("exit code 2"), "{err}");
 }
 
 #[skuld::test]
@@ -182,14 +1545,20 @@ fn start_via_notify_rearms_on_pending_not_errs() {
         Some(Observed::Pending),
         Some(Observed::Running),
     ]);
-    assert_eq!(start_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        Waited::Confirmed
+    );
     assert_eq!(fake.arm_count(), 3); // initial + 2 re-arms
 }
 
 #[skuld::test]
 fn a_start_wait_whose_deadline_expires_reports_expired() {
     let mut fake = FakeScm::new([Some(Observed::Pending), None]);
-    assert_eq!(start_via_notify(&mut fake, spent()).unwrap(), Waited::Expired);
+    assert_eq!(
+        start_via_notify(&mut fake, spent(), Kind::Simple).unwrap(),
+        Waited::Expired
+    );
 }
 
 #[skuld::test]
@@ -204,8 +1573,11 @@ fn an_expired_deadline_still_issues_the_start_request() {
     // goetia ran out of budget while watching for it would be the worst of
     // both answers.
     let mut fake = FakeScm::new([None]);
-    assert_eq!(start_via_notify(&mut fake, spent()).unwrap(), Waited::Expired);
-    assert_eq!(fake.log, vec!["arm_running", "start", "wait", "got_nothing"]);
+    assert_eq!(
+        start_via_notify(&mut fake, spent(), Kind::Simple).unwrap(),
+        Waited::Expired
+    );
+    assert_eq!(fake.log, vec!["start", "arm_running", "wait", "got_nothing"]);
 }
 
 /// A deadline no re-derivation inside the wait can reproduce: an hour out,
@@ -227,7 +1599,10 @@ fn a_pending_callback_rearms_under_the_same_deadline() {
         Some(Observed::Pending),
         Some(Observed::Running),
     ]);
-    assert_eq!(start_via_notify(&mut fake, deadline).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        start_via_notify(&mut fake, deadline, Kind::Simple).unwrap(),
+        Waited::Confirmed
+    );
     assert_eq!(fake.arm_count(), 3);
     assert_eq!(fake.arm_deadlines, vec![deadline; 3]);
     assert_eq!(fake.deadlines, vec![deadline; 3]);
@@ -237,15 +1612,11 @@ fn a_pending_callback_rearms_under_the_same_deadline() {
 #[skuld::test]
 fn a_pending_stop_callback_rearms_under_the_same_deadline() {
     let deadline = an_hour_out();
-    let mut fake = FakeScm::new([
-        Some(Observed::Pending),
-        Some(Observed::Running),
-        Some(Observed::Stopped),
-    ]);
+    let mut fake = FakeScm::new([Some(Observed::Pending), Some(Observed::Stopped)]);
     assert_eq!(stop_via_notify(&mut fake, deadline).unwrap(), Waited::Confirmed);
-    assert_eq!(fake.arm_count(), 3);
-    assert_eq!(fake.arm_deadlines, vec![deadline; 3]);
-    assert_eq!(fake.deadlines, vec![deadline; 3]);
+    assert_eq!(fake.arm_count(), 2);
+    assert_eq!(fake.arm_deadlines, vec![deadline; 2]);
+    assert_eq!(fake.deadlines, vec![deadline; 2]);
 }
 
 #[skuld::test]
@@ -255,8 +1626,11 @@ fn an_arm_that_keeps_lagging_returns_expired_instead_of_looping() {
     // empty script proves no wait was entered; the log proves the request
     // still went out.
     let mut fake = FakeScm::new([]).arming(Waited::Expired);
-    assert_eq!(start_via_notify(&mut fake, spent()).unwrap(), Waited::Expired);
-    assert_eq!(fake.log, vec!["arm_running", "start"]);
+    assert_eq!(
+        start_via_notify(&mut fake, spent(), Kind::Simple).unwrap(),
+        Waited::Expired
+    );
+    assert_eq!(fake.log, vec!["start", "arm_running"]);
 }
 
 #[skuld::test]
@@ -266,7 +1640,7 @@ fn a_start_the_scm_rejects_is_reported_as_a_failed_start() {
     // `start_re_arms_after_a_non_terminal_callback` for the related cases
     // this doesn't duplicate.
     let mut rejecting = FakeScm::new([]).rejecting_start();
-    assert!(start_via_notify(&mut rejecting, unbounded()).is_err());
+    assert!(start_via_notify(&mut rejecting, unbounded(), Kind::Simple).is_err());
 }
 
 #[skuld::test]
@@ -281,6 +1655,151 @@ fn request_stop_arms_nothing_and_waits_for_nothing() {
     let mut fake = FakeScm::new([]);
     request_stop(&mut fake).unwrap();
     assert_eq!(fake.log, vec!["control_stop"]);
+}
+
+// a service marked for deletion ---------------------------------------------------------------------------------------
+
+const STOPPED_ONLY: &[QueriedState] = &[QueriedState::Stopped];
+const RUNNING_ONLY: &[QueriedState] = &[QueriedState::Running];
+
+/// Round 8: an arm on a delete-marked, `STOPPED` service is refused with 1072. The service is where
+/// every stop wants it, so each arm site ends its wait as confirmed on the status read in the arm's
+/// place.
+#[skuld::test]
+fn a_stop_wait_is_confirmed_by_the_status_of_an_arm_refused_on_a_marked_service() {
+    // The arm after the STOP.
+    let mut fake = FakeScm::new([])
+        .drifting_after(0, QueriedState::Stopped)
+        .refusing_arms_in(STOPPED_ONLY);
+    assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(fake.log, vec!["control_stop", "arm_stopped"]);
+
+    // The re-arm after a `STOP_PENDING` delivery.
+    let mut fake = FakeScm::new([Some(Observed::Pending)])
+        .drifting_after(1, QueriedState::Stopped)
+        .refusing_arms_in(STOPPED_ONLY);
+    assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        fake.log,
+        vec!["control_stop", "arm_stopped", "wait", "got_pending", "arm_stopped_only"]
+    );
+}
+
+#[skuld::test]
+fn settle_and_stop_is_confirmed_by_the_status_of_an_arm_refused_on_a_marked_service() {
+    // The first arm.
+    let mut fake = FakeScm::new([])
+        .starting_in(QueriedState::Stopped)
+        .refusing_arms_in(STOPPED_ONLY);
+    assert_eq!(settle_and_stop(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(fake.log, vec!["arm_settle"]);
+
+    // The re-arm after a notification outside the mask.
+    let mut fake = FakeScm::new([Some(Observed::Pending)])
+        .drifting_after(1, QueriedState::Stopped)
+        .refusing_arms_in(STOPPED_ONLY);
+    assert_eq!(settle_and_stop(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(fake.log, vec!["arm_settle", "wait", "got_pending", "arm_settle"]);
+
+    // The re-arm after a refused STOP.
+    let mut fake = FakeScm::new([Some(Observed::Running)])
+        .stop_replies([StopReply::Os(INVALID_SERVICE_CONTROL)])
+        .drifting_after(1, QueriedState::Stopped)
+        .refusing_arms_in(STOPPED_ONLY);
+    assert_eq!(settle_and_stop(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        fake.log,
+        vec!["arm_settle", "wait", "got_running", "control_stop", "arm_settle"]
+    );
+
+    // The arm after an accepted STOP.
+    let mut fake = FakeScm::new([Some(Observed::Running)])
+        .drifting_after(1, QueriedState::Stopped)
+        .refusing_arms_in(STOPPED_ONLY);
+    assert_eq!(settle_and_stop(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        fake.log,
+        vec!["arm_settle", "wait", "got_running", "control_stop", "arm_stopped"]
+    );
+}
+
+/// Any state but the wanted one, read where SCM refused to watch, ends the wait with an error that
+/// says why nothing is waited for. Round 8 measured the refusal only in `STOPPED`; the other states
+/// are modelled, and the answer is never a wait on a registration SCM refused.
+#[skuld::test]
+fn an_arm_refused_on_a_marked_service_that_is_not_where_the_wait_wants_it_is_an_error() {
+    let mut stop = FakeScm::new([])
+        .starting_in(QueriedState::Running)
+        .refusing_arms_in(RUNNING_ONLY);
+    let mut start = FakeScm::new([])
+        .drifting_after(0, QueriedState::Stopped)
+        .refusing_arms_in(STOPPED_ONLY);
+    let mut settle = FakeScm::new([Some(Observed::Pending)])
+        .drifting_after(1, QueriedState::Running)
+        .refusing_arms_in(RUNNING_ONLY);
+    let errors = [
+        ("stop", stop_via_notify(&mut stop, unbounded()).unwrap_err()),
+        (
+            "start",
+            start_via_notify(&mut start, unbounded(), Kind::Simple).unwrap_err(),
+        ),
+        ("settle", settle_and_stop(&mut settle, unbounded()).unwrap_err()),
+    ];
+    for (name, err) in errors {
+        let text = err.to_string();
+        for part in ["marked for deletion", "refused to watch"] {
+            assert!(text.contains(part), "{name}: missing {part:?}: {text}");
+        }
+    }
+}
+
+/// A start wants `RUNNING`: a marked service read as that is started.
+#[skuld::test]
+fn a_start_wait_is_confirmed_by_the_running_status_of_an_arm_refused_on_a_marked_service() {
+    let mut fake = FakeScm::new([])
+        .drifting_after(0, QueriedState::Running)
+        .refusing_arms_in(RUNNING_ONLY);
+    assert_eq!(
+        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        Waited::Confirmed
+    );
+    assert_eq!(fake.log, vec!["start", "arm_running"]);
+}
+
+#[skuld::test]
+fn the_error_for_a_marked_service_names_the_state_read() {
+    let text = marked_for_deletion(QueriedState::StopPending).to_string();
+    assert!(
+        text.contains("refused to watch") && text.contains("marked for deletion") && text.contains("StopPending"),
+        "{text}"
+    );
+    assert!(!text.contains("no longer reports"), "{text}");
+}
+
+/// A cancel that finds the service deleted (the open of its fresh handle met 1060) ends a stop wait as
+/// confirmed, as the delete that follows would.
+#[skuld::test]
+fn a_stop_wait_reads_a_service_gone_at_an_arm_as_stopped() {
+    let mut fake = FakeScm::new([Some(Observed::Pending)]).gone_at_arm(2);
+    assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        fake.log,
+        vec!["control_stop", "arm_stopped", "wait", "got_pending", "arm_stopped_only"]
+    );
+
+    let mut fake = FakeScm::new([Some(Observed::Pending)]).gone_at_arm(2);
+    assert_eq!(settle_and_stop(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(fake.log, vec!["arm_settle", "wait", "got_pending", "arm_settle"]);
+}
+
+/// A start is for `RUNNING`: a service that is gone is not that.
+#[skuld::test]
+fn a_start_wait_reads_a_service_gone_at_an_arm_as_an_error() {
+    let mut fake = FakeScm::new([Some(Observed::Pending)]).gone_at_arm(2);
+    let text = start_via_notify(&mut fake, unbounded(), Kind::Simple)
+        .unwrap_err()
+        .to_string();
+    assert!(text.contains("no longer exists"), "{text}");
 }
 
 // handle teardown -----------------------------------------------------------------------------------------------------
@@ -331,6 +1850,100 @@ fn nothing_is_drained_when_no_registration_is_outstanding() {
     assert_eq!(fake.log, vec!["close"]);
 }
 
+/// A service marked for deletion, held by the actor's handles; it is deleted when the last closes.
+struct FakeSession {
+    log: Vec<&'static str>,
+    /// Open handles to the service: the actor's own before the cancel.
+    open: usize,
+    /// Whether closing the last handle deletes the service, as for a marked, `STOPPED` one (P12a).
+    marked_stopped: bool,
+    deleted: bool,
+    /// The error opening a fresh handle meets regardless of the service, if any.
+    open_error: Option<i32>,
+}
+
+impl FakeSession {
+    fn new(marked_stopped: bool) -> Self {
+        Self {
+            log: vec![],
+            open: 1,
+            marked_stopped,
+            deleted: false,
+            open_error: None,
+        }
+    }
+}
+
+impl ScmHandles for FakeSession {
+    fn close_handles(&mut self) {
+        self.log.push("close");
+        self.open -= 1;
+        if self.open == 0 && self.marked_stopped {
+            self.deleted = true;
+        }
+    }
+    fn registration_outstanding(&self) -> bool {
+        true
+    }
+    fn drain_queued_apc(&mut self) {
+        self.log.push("drain");
+    }
+}
+
+impl ReopenHandles for FakeSession {
+    type Fresh = ();
+    fn open_fresh(&mut self) -> std::io::Result<()> {
+        if self.deleted {
+            self.log.push("open_failed");
+            return Err(std::io::Error::from_raw_os_error(1060));
+        }
+        if let Some(code) = self.open_error {
+            self.log.push("open_failed");
+            return Err(std::io::Error::from_raw_os_error(code));
+        }
+        self.log.push("open");
+        self.open += 1;
+        Ok(())
+    }
+    fn install(&mut self, (): ()) {
+        self.log.push("install");
+    }
+}
+
+/// P12a, P13a/b: closing the last handle to a marked, `STOPPED` service deletes it, so the fresh handle
+/// is opened while the old one still holds the service. Closing first fails here with 1060.
+#[skuld::test]
+fn cancelling_a_registration_opens_the_fresh_handles_before_it_closes_the_old() {
+    let mut fake = FakeSession::new(true);
+    assert_eq!(cancel_registration(&mut fake).unwrap(), Cancelled::Reopened);
+    assert!(!fake.deleted, "the cancel deleted the service");
+    assert_eq!(fake.open, 1);
+    // The old handles still close before the drain (`close_then_drain`).
+    assert_eq!(fake.log, vec!["open", "close", "drain", "install"]);
+}
+
+/// Opening the fresh handle meets 1060: the service is gone. The old handles are closed and drained,
+/// nothing is installed, and the caller is told.
+#[skuld::test]
+fn a_cancel_whose_fresh_open_meets_1060_reports_the_service_gone() {
+    let mut fake = FakeSession::new(false);
+    fake.open_error = Some(1060);
+    assert_eq!(cancel_registration(&mut fake).unwrap(), Cancelled::ServiceGone);
+    assert_eq!(fake.log, vec!["open_failed", "close", "drain"]);
+}
+
+/// Any other error leaves the old handles and their registration as they were, for the actor's own
+/// teardown to close and drain.
+#[skuld::test]
+fn a_cancel_whose_fresh_open_fails_otherwise_touches_nothing() {
+    let mut fake = FakeSession::new(false);
+    fake.open_error = Some(5); // ERROR_ACCESS_DENIED
+    let err = cancel_registration(&mut fake).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(5));
+    assert_eq!(fake.log, vec!["open_failed"]);
+    assert_eq!(fake.open, 1);
+}
+
 // the already-running (1056) decision ---------------------------------------------------------------------------------
 
 #[skuld::test]
@@ -342,8 +1955,8 @@ fn a_queried_running_recovers_an_already_running_start() {
 
 #[skuld::test]
 fn a_queried_start_pending_recovers_an_already_running_start() {
-    // `want_to_mask` arms SERVICE_NOTIFY_START_PENDING in BOTH of its
-    // `WantState::Running` branches, so a service something else started a
+    // `want_to_mask` arms SERVICE_NOTIFY_START_PENDING for
+    // `WantState::Running`, so a service something else started a
     // moment ago immediate-fires and resolves through the wait. Rejecting it
     // failed a start that was going to succeed — narrowing this predicate
     // back to `Running`-only fails here.
@@ -377,7 +1990,10 @@ fn a_plain_start_over_a_running_service_is_a_start() {
     request_start(&mut fake).unwrap();
 
     let mut fake = FakeScm::new([Some(Observed::Running)]).already_running(QueriedState::Running);
-    assert_eq!(start_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
+        Waited::Confirmed
+    );
 }
 
 /// A 1056 over a service the query reports `Running` is the SCM saying the goal is reached, so the
@@ -385,10 +2001,13 @@ fn a_plain_start_over_a_running_service_is_a_start() {
 /// other two backends agree: launchd reads a running job as started under any budget.
 #[skuld::test]
 fn a_start_the_scm_answers_already_running_is_confirmed_whatever_the_deadline() {
-    for (arm, deadline) in [(Waited::Expired, spent()), (Waited::Confirmed, unbounded())] {
-        let mut fake = FakeScm::new([]).already_running(QueriedState::Running).arming(arm);
-        assert_eq!(start_via_notify(&mut fake, deadline).unwrap(), Waited::Confirmed);
-        assert_eq!(fake.log, vec!["arm_running", "start"], "nothing left to wait for");
+    for deadline in [spent(), unbounded()] {
+        let mut fake = FakeScm::new([]).already_running(QueriedState::Running);
+        assert_eq!(
+            start_via_notify(&mut fake, deadline, Kind::Simple).unwrap(),
+            Waited::Confirmed
+        );
+        assert_eq!(fake.log, vec!["start"], "nothing left to wait for");
     }
 }
 
@@ -398,7 +2017,10 @@ fn a_start_the_scm_answers_start_pending_still_expires_on_a_spent_deadline() {
     let mut fake = FakeScm::new([])
         .already_running(QueriedState::StartPending)
         .arming(Waited::Expired);
-    assert_eq!(start_via_notify(&mut fake, spent()).unwrap(), Waited::Expired);
+    assert_eq!(
+        start_via_notify(&mut fake, spent(), Kind::Simple).unwrap(),
+        Waited::Expired
+    );
 }
 
 #[skuld::test]
@@ -407,10 +2029,38 @@ fn a_plain_start_over_a_stopping_service_is_refused() {
     assert!(request_start(&mut fake).is_err());
 }
 
+/// Whatever the budget, a `start` over a stopping service is never a success, and the error says
+/// what to do: the service is stopping, SCM may start it again itself, and `start` is run again once
+/// it has stopped.
+#[skuld::test]
+fn a_start_over_a_stopping_service_says_it_is_stopping() {
+    let mut fake = FakeScm::new([]).already_running(QueriedState::StopPending);
+    let waiting = start_via_notify(&mut fake, unbounded(), Kind::Simple)
+        .unwrap_err()
+        .to_string();
+    assert_eq!(fake.log, vec!["start"], "nothing is waited for");
+    let immediate = request_start(&mut FakeScm::new([]).already_running(QueriedState::StopPending))
+        .unwrap_err()
+        .to_string();
+    for text in [waiting, immediate] {
+        assert!(text.contains("is stopping"), "{text}");
+        assert!(text.contains("once it has stopped"), "{text}");
+        assert!(text.contains("restart policy"), "{text}");
+        assert!(!text.contains("stay down"), "{text}");
+    }
+}
+
+#[skuld::test]
+fn a_start_after_an_unconfirmed_stop_over_a_stopping_service_says_so() {
+    let mut fake = FakeScm::new([]).already_running(QueriedState::StopPending);
+    let text = request_start_after_stop(&mut fake).unwrap_err().to_string();
+    assert!(text.contains("is stopping"), "{text}");
+}
+
 /// `restart --timeout 0`'s start, over the service the real `goetia-shim`
-/// presents after an unconfirmed stop: `RUNNING` for its whole teardown,
-/// never `STOP_PENDING`. That 1056 is a refusal — reading it as a start
-/// reports a restart that leaves the daemon down.
+/// presents between a stop request and its `STOP_PENDING` report: still
+/// `RUNNING`. That 1056 is a refusal — reading it as a start reports a
+/// restart that leaves the daemon down.
 #[skuld::test]
 fn a_start_after_an_unconfirmed_stop_refuses_a_service_still_reading_running() {
     let mut fake = FakeScm::new([]).already_running(QueriedState::Running);
@@ -485,7 +2135,10 @@ fn a_registrar_that_keeps_lagging_returns_expired_instead_of_looping() {
     // `python3 .github/scripts/run-with-timeout.py 120 cargo test <name>`
     // and expect exit 124.
     let mut fake = FakeRegistrar::new([], ERROR_SERVICE_NOTIFY_CLIENT_LAGGING);
-    assert_eq!(register_until_deadline(&mut fake, spent()).unwrap(), Waited::Expired);
+    assert_eq!(
+        register_until_deadline(&mut fake, spent()).unwrap(),
+        Registration::Expired
+    );
     // The check sits at the TOP of the loop, so a deadline that is already
     // spent does not even attempt a registration.
     assert!(fake.log.is_empty());
@@ -497,9 +2150,19 @@ fn a_lagging_registration_reopens_the_handles_and_arms_again() {
     let mut fake = FakeRegistrar::new([ERROR_SERVICE_NOTIFY_CLIENT_LAGGING], 0);
     assert_eq!(
         register_until_deadline(&mut fake, unbounded()).unwrap(),
-        Waited::Confirmed
+        Registration::Registered
     );
     assert_eq!(fake.log, vec!["register", "reopen", "register"]);
+}
+
+#[skuld::test]
+fn a_registration_refused_for_a_marked_service_is_reported_not_retried() {
+    let mut fake = FakeRegistrar::new([], ERROR_SERVICE_MARKED_FOR_DELETE);
+    assert_eq!(
+        register_until_deadline(&mut fake, unbounded()).unwrap(),
+        Registration::MarkedForDelete
+    );
+    assert_eq!(fake.log, vec!["register"]);
 }
 
 #[skuld::test]

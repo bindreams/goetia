@@ -16,9 +16,9 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 /// `%ProgramData%\Goetia\logs\<id>.log` — derivable from `id` alone. This is
-/// also the design spec's own OS-default `logs:` path for `type: simple` on
-/// Windows when `goetia.yaml` sets none (§2, "`logs` default"), so a daemon
-/// that never overrides `logs:` has no fallback/real distinction at all.
+/// also the OS-default `logs:` path for `type: simple` on Windows when
+/// `goetia.yaml` sets none, so a daemon that never overrides `logs:` has no
+/// fallback/real distinction at all.
 pub fn default_log_path(id: &str) -> PathBuf {
     programdata_dir().join("Goetia").join("logs").join(format!("{id}.log"))
 }
@@ -48,8 +48,10 @@ pub mod eventlog {
     use std::os::windows::ffi::OsStrExt as _;
 
     use windows_sys::Win32::System::EventLog::{
-        DeregisterEventSource, EVENTLOG_ERROR_TYPE, RegisterEventSourceW, ReportEventW,
+        DeregisterEventSource, EVENTLOG_ERROR_TYPE, EVENTLOG_WARNING_TYPE, RegisterEventSourceW, ReportEventW,
     };
+
+    use super::Severity;
 
     const SOURCE: &str = "Goetia";
 
@@ -58,8 +60,8 @@ pub mod eventlog {
     /// message without Goetia shipping a compiled message catalogue.
     const EVENT_ID: u32 = 1;
 
-    /// Best-effort: nothing here panics or bubbles an error, because this is
-    /// itself a failure-reporting path — an event log write that could fail
+    /// Writes `message` as an event of `severity`'s type. Best-effort: nothing here panics or
+    /// bubbles an error, because this is itself a failure-reporting path — an event log write that could fail
     /// the caller would just relocate the "cannot report why" problem
     /// rather than solve it.
     ///
@@ -73,7 +75,11 @@ pub mod eventlog {
     ///
     /// `EVENT_ID` is 1 because registration points `EventMessageFile` at
     /// `EventCreate.exe`, whose message 1 is a bare `%1` passthrough.
-    pub fn report_error(message: &str) {
+    pub fn report(severity: Severity, message: &str) {
+        let event_type = match severity {
+            Severity::Error => EVENTLOG_ERROR_TYPE,
+            Severity::Warning => EVENTLOG_WARNING_TYPE,
+        };
         let wide_source = wide_null(SOURCE);
         // SAFETY: `wide_source` is a valid, null-terminated UTF-16 string,
         // and `RegisterEventSourceW` does not retain it past this call.
@@ -91,7 +97,7 @@ pub mod eventlog {
         unsafe {
             ReportEventW(
                 handle,
-                EVENTLOG_ERROR_TYPE,
+                event_type,
                 0,
                 EVENT_ID,
                 std::ptr::null_mut(),
@@ -109,19 +115,37 @@ pub mod eventlog {
     }
 }
 
+/// How a line is reported to the Event Log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Error,
+    /// The daemon runs, but something about its registration needs the administrator.
+    Warning,
+}
+
 /// Write `message` to the id-derived fallback log path and the Windows
-/// Event Log — both best-effort, so a decode or spawn failure is never lost
+/// Event Log as an error — both best-effort, so a decode or spawn failure is never lost
 /// just because one of the two channels is itself unavailable (see the
 /// module doc comment for why each can independently fail).
 ///
 /// A test build journals the line instead; see `test_hook`.
 pub fn log_failure(id: &str, message: &str) {
+    log(id, Severity::Error, message);
+}
+
+/// [`log_failure`] for a condition that does not stop the daemon from running: the Event Log entry
+/// is a warning.
+pub fn log_warning(id: &str, message: &str) {
+    log(id, Severity::Warning, message);
+}
+
+fn log(id: &str, severity: Severity, message: &str) {
     let line = failure_line(id, message);
     eprintln!("{line}");
     #[cfg(not(test))]
-    write_channels(id, &line, default_log_path, eventlog::report_error);
+    write_channels(id, &line, default_log_path, |line| eventlog::report(severity, line));
     #[cfg(test)]
-    test_hook::report(id, line);
+    test_hook::report(id, severity, line);
 }
 
 pub fn failure_line(id: &str, message: &str) -> String {
@@ -145,18 +169,30 @@ fn write_fallback(path: &Path, line: &str) {
 
 // test_hook ===========================================================================================================
 
-/// Lines a test build's `log_failure` records instead of writing, keyed by daemon id so a test can
-/// take lines logged on any thread once it has a happens-before with them.
+/// Lines a test build's `log_failure` and `log_warning` record instead of writing, keyed by daemon
+/// id so a test can take lines logged on any thread once it has a happens-before with them.
 #[cfg(test)]
 pub(crate) mod test_hook {
     use std::collections::BTreeMap;
     use std::sync::{Mutex, PoisonError};
 
-    /// Poison is recovered from: one panicking test must not make later `log_failure` calls panic.
-    pub(super) static REPORTED: Mutex<BTreeMap<String, Vec<String>>> = Mutex::new(BTreeMap::new());
+    use super::Severity;
 
-    pub(super) fn report(id: &str, line: String) {
-        REPORTED
+    type Journal = Mutex<BTreeMap<String, Vec<String>>>;
+
+    /// Poison is recovered from: one panicking test must not make later log calls panic.
+    static ERRORS: Journal = Mutex::new(BTreeMap::new());
+    static WARNINGS: Journal = Mutex::new(BTreeMap::new());
+
+    fn journal(severity: Severity) -> &'static Journal {
+        match severity {
+            Severity::Error => &ERRORS,
+            Severity::Warning => &WARNINGS,
+        }
+    }
+
+    pub(super) fn report(id: &str, severity: Severity, line: String) {
+        journal(severity)
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .entry(id.to_string())
@@ -164,23 +200,37 @@ pub(crate) mod test_hook {
             .push(line);
     }
 
-    /// `id`'s lines, oldest first, removed.
+    /// `id`'s error lines, oldest first, removed.
     pub(crate) fn take(id: &str) -> Vec<String> {
-        REPORTED
+        take_of(Severity::Error, id)
+    }
+
+    /// `id`'s warning lines, oldest first, removed.
+    pub(crate) fn take_warnings(id: &str) -> Vec<String> {
+        take_of(Severity::Warning, id)
+    }
+
+    fn take_of(severity: Severity, id: &str) -> Vec<String> {
+        journal(severity)
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(id)
             .unwrap_or_default()
     }
 
-    /// `id`'s lines, oldest first, left in place.
+    /// `id`'s lines of both severities, oldest first within each, left in place.
     pub(crate) fn peek(id: &str) -> Vec<String> {
-        REPORTED
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(id)
-            .cloned()
-            .unwrap_or_default()
+        [Severity::Error, Severity::Warning]
+            .into_iter()
+            .flat_map(|severity| {
+                journal(severity)
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect()
     }
 }
 

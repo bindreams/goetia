@@ -48,7 +48,7 @@ use std::time::Duration;
 use crate::backend::Identity;
 use crate::blob::{self, Blob};
 use crate::error::Error;
-use crate::spec::{DaemonSpec, Kind, MAX_SC_ACTION_DELAY, Restart, User, windows_builtin};
+use crate::spec::{DaemonSpec, Kind, Restart, User, scm_restart_delay, windows_builtin};
 
 // Metadata field names ================================================================================================
 
@@ -114,20 +114,20 @@ pub struct FailureActions {
     pub reset_period: Duration,
     /// Must be `true`. Without `SERVICE_CONFIG_FAILURE_ACTIONS_FLAG`, SCM
     /// runs recovery actions only when a process terminates *without*
-    /// reporting `SERVICE_STOPPED` to SCM first — so a `type: managed`
-    /// daemon that fails to bind a port and exits 1 *cleanly* (a
-    /// well-behaved failure report, not a crash) would never restart, ever,
-    /// including at boot. `hole`'s bridge service sets the same flag in
-    /// `apply_failure_actions`, for the same reason.
+    /// reporting `SERVICE_STOPPED` to SCM first — so a daemon that fails to
+    /// bind a port and exits 1 *cleanly* (a well-behaved failure report, not
+    /// a crash) would never restart, ever, including at boot. `hole`'s bridge
+    /// service sets the same flag in `apply_failure_actions`, for the same
+    /// reason.
     pub on_non_crash_failures: bool,
 }
 
 // Building ============================================================================================================
 
-/// Build the [`ScmRegistration`] for `spec`. A `restart-delay` too large
-/// for `SC_ACTION.Delay` to express is clamped rather than left to panic at
-/// install time — see `MAX_SC_ACTION_DELAY`; the advisory for that now
-/// fires at resolve time, from `Backend::Scm.warn`, on every host, rather
+/// Build the [`ScmRegistration`] for `spec`. A `restart-delay` is rounded up to whole
+/// milliseconds and clamped to what `SC_ACTION.Delay` can express, rather than left to
+/// panic at install time — see `scm_restart_delay`; the advisories for those now
+/// fire at resolve time, from `Backend::Scm.warn`, on every host, rather
 /// than only when this effectful-install-time generator happens to run.
 ///
 /// `id` is the account already resolved by the effectful install path (see
@@ -136,9 +136,9 @@ pub struct FailureActions {
 /// is what SCM launches.
 pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> ScmRegistration {
     let (executable, arguments) = match spec.kind {
-        // The shim supervises the child itself; SCM only ever launches the
-        // shim, with the daemon id as its sole argument. The spec's own
-        // command never appears here.
+        // SCM only ever launches the shim, with the daemon id as its sole
+        // argument; the shim spawns the daemon once. The spec's own command
+        // never appears here.
         Kind::Simple => (shim_path.to_path_buf(), vec![spec.id.as_str().to_string()]),
         Kind::Managed => {
             let mut argv = spec.command.iter();
@@ -150,26 +150,19 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> ScmRe
         }
     };
 
-    let failure_actions = match spec.kind {
-        // The shim supervises the child and implements restart itself
-        // (matching the nssm-based deployment this project is modeled on,
-        // where `sc qfailure` is deliberately empty) — SCM never restarts
-        // it directly.
-        Kind::Simple => None,
-        Kind::Managed => match spec.restart {
-            Restart::Never => None,
-            // Unreachable from a manifest (`resolve` refuses it), but `classify`
-            // regenerates from installed blobs that may carry it; keep
-            // on-failure's actions so they don't read as modified.
-            Restart::OnFailure | Restart::Always => {
-                let delay = spec.restart_delay.unwrap_or(DEFAULT_RESTART_DELAY);
-                Some(FailureActions {
-                    delay: bounded_restart_delay(delay),
-                    reset_period: FAILURE_RESET_PERIOD,
-                    on_non_crash_failures: true,
-                })
-            }
-        },
+    // SCM does every restart, for both kinds: the shim spawns the daemon once and reports its exit.
+    let failure_actions = match spec.restart {
+        Restart::Never => None,
+        // Unreachable from a manifest (`resolve` refuses it), but `classify` regenerates from
+        // installed blobs that may carry it; keep on-failure's actions so they don't read as modified.
+        Restart::OnFailure | Restart::Always => {
+            let delay = spec.restart_delay.unwrap_or(DEFAULT_RESTART_DELAY);
+            Some(FailureActions {
+                delay: scm_restart_delay(delay),
+                reset_period: FAILURE_RESET_PERIOD,
+                on_non_crash_failures: true,
+            })
+        }
     };
 
     // `User::Root` is a universal token every backend maps for itself
@@ -205,14 +198,6 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> ScmRe
         failure_actions,
         parameters,
     }
-}
-
-/// Clamp `delay` to what `SC_ACTION.Delay` (a `DWORD` of milliseconds) can
-/// express. The advisory for when this actually changes the value lives in
-/// `Backend::Scm.warn` now (`spec/backend.rs`), not here — generation, not
-/// validation.
-fn bounded_restart_delay(delay: Duration) -> Duration {
-    delay.min(MAX_SC_ACTION_DELAY)
 }
 
 // Account canonicalisation ============================================================================================

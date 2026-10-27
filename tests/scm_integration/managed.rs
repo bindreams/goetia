@@ -233,6 +233,30 @@ fn a_killed_never_restart_daemon_stays_down() {
     });
 }
 
+/// `kill` returns once SCM has recorded the exit, so for a service that never restarts the first
+/// `status` after it reads not-running and has no pid. The shared `a_killed_daemon_that_never_restarts_stays_down` waits for that state
+/// instead; this is the contract it hides.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn kill_returns_once_scm_has_recorded_the_exit() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let (started, stopped) = (ConnectBack::listen(), ConnectBack::listen());
+    let spec = reporting(&id, Restart::Never, &started, &stopped);
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    started.accept("the fixture to report SERVICE_RUNNING");
+
+    mgr.kill(&spec.id).expect("kill");
+
+    let status = mgr.status(&spec.id).expect("status straight after the kill");
+    assert!(
+        matches!(status.state, State::Stopped | State::Failed),
+        "kill returned before SCM recorded the exit ({status:?})"
+    );
+    assert_eq!(status.pid, None, "a killed daemon has no process ({status:?})");
+}
+
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn killing_a_stopped_service_is_not_running() {
     let mgr = ScmManager::new();
@@ -338,16 +362,17 @@ fn uninstall_then_immediate_reinstall_succeeds() {
     assert!(matches!(outcome, Outcome::Create), "{outcome:?}");
 }
 
-// Step 4: uninstall must not proceed if the service will not stop =====================================================
+// Step 4: uninstall reports a service that will not stop, leaves it disabled, and is re-runnable ======================
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn uninstall_errors_when_service_will_not_stop() {
     let mgr = ScmManager::new();
     let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
     let started = ConnectBack::listen();
     // `refuse-stop`: the fixture reports RUNNING with an empty
-    // `controls_accepted`, so `ControlService(STOP)` fails *synchronously*
-    // with `ERROR_INVALID_SERVICE_CONTROL` — a real Win32 rejection, not a
+    // `controls_accepted`, so the service reads RUNNING without accepting
+    // STOP, and `uninstall` fails at once (a state it can see), not on a
     // wait that has to time out (this project forbids time-based sync).
     let spec = mk_spec(
         &id,
@@ -361,20 +386,71 @@ fn uninstall_errors_when_service_will_not_stop() {
 
     let err = mgr
         .uninstall(&spec.id)
-        .expect_err("a service that declines SERVICE_CONTROL_STOP must not be deleted");
+        .expect_err("a service that declines SERVICE_CONTROL_STOP cannot be stopped by uninstall");
+    let text = err.to_string();
     assert!(
-        err.to_string().contains("NOT deleted"),
-        "error should explain the service was not deleted: {err}"
+        text.contains("does not accept STOP")
+            && text.contains("NOT deleted")
+            && text.contains("now disabled")
+            && text.contains("start type was manual")
+            && text.contains(&format!("goetia daemon disable {id}"))
+            && text.contains("goetia daemon kill"),
+        "error should say why, that the service was not deleted and is disabled, the installed start type \
+         (DEMAND_START is `manual`) with its command, and the remedy: {err}"
     );
 
-    // Confirm it is really still there, then clean up without ever asking
-    // it to stop (which would fail the exact same way): kill the process
-    // directly by pid, then delete the now-dead service entry.
+    // The service is still there, running, and left disabled: `uninstall` does not put the start type back.
     let status = mgr.status(&spec.id).expect("status: the service must still exist");
     assert_eq!(status.state, State::Running);
-    let pid = status.pid.expect("a running service reports a pid");
-    support::cmd::run("taskkill.exe", &["/F", "/PID", &pid.to_string()]).expect_ok();
-    support::cmd::run("sc.exe", &["delete", &id]).expect_ok();
+    let config = support::cmd::run("sc.exe", &["qc", &id]).expect_ok();
+    assert!(
+        config.stdout.contains("DISABLED"),
+        "start type should be left DISABLED after the failed uninstall:\n{config}"
+    );
+
+    // The named remedy, then the retry: it succeeds and the record is gone (1060).
+    mgr.kill(&spec.id).expect("kill the service uninstall could not stop");
+    mgr.uninstall(&spec.id).expect("re-running uninstall after the kill");
+    let query = support::cmd::run("sc.exe", &["query", &id]);
+    assert_eq!(
+        query.code,
+        Some(1060),
+        "the record should be gone:
+{query}"
+    );
+}
+
+/// Measures which code SCM gives a STOP to a RUNNING service that accepts none (the unit tests
+/// script 1052 and 1061 alike): `stop` reads the status either way and returns the "does not accept
+/// STOP" error at once. The call returns or the CI watchdog ends the job; a wait would hang.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn stop_of_a_service_that_accepts_no_stop_says_so_without_waiting() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let started = ConnectBack::listen();
+    let spec = mk_spec(
+        &id,
+        fixture_command(&id, started.port(), 1, "refuse-stop"),
+        BTreeMap::new(),
+    );
+
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    started.accept("the fixture to report SERVICE_RUNNING");
+
+    for (what, budget) in [("stop", Budget::Unbounded), ("stop --timeout 0", Budget::Immediate)] {
+        let text = mgr
+            .stop(&spec.id, budget)
+            .expect_err("a service that declines SERVICE_CONTROL_STOP cannot be stopped")
+            .to_string();
+        assert!(
+            text.contains("does not accept STOP") && text.contains("goetia daemon kill"),
+            "{what}: {text}"
+        );
+    }
+
+    mgr.kill(&spec.id).expect("kill the service stop could not stop");
 }
 
 // Step 5: an install interrupted before the metadata write is recoverable =============================================

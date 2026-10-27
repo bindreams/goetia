@@ -5,8 +5,13 @@
 use goetia::decide::Outcome;
 use goetia::manager::conformance;
 use goetia::manager::{Budget, Installed, ServiceManager as _, State};
+use windows_service::service::ServiceAccess;
+use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+use windows_sys::Win32::System::Services::{
+    SERVICE_NOTIFY_STOP_PENDING, SERVICE_NOTIFY_STOPPED, SERVICE_STOP_PENDING, SERVICE_STOPPED,
+};
 
-use crate::common::{conformance_mk, fixture_command, mk_spec};
+use crate::common::{arm_and_wait, conformance_mk, fixture_command, mk_spec};
 use crate::deny::Denied;
 use crate::support::{self, ELEVATED, ServiceGuard};
 
@@ -113,7 +118,7 @@ fn start_stop_status_reflect_reality() {
     let pid = status.pid.expect("type: simple reports the shim's own pid");
 
     // `Status.pid`'s own doc comment (`src/manager.rs`) promises this is
-    // `goetia-shim.exe`'s pid, not the supervised daemon's — SCM knows no
+    // `goetia-shim.exe`'s pid, not the daemon's — SCM knows no
     // other process for this service. Confirm it names the shim, not the
     // fixture.
     let tasklist = support::cmd::run("tasklist.exe", &["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);
@@ -180,4 +185,37 @@ fn list_ignores_foreign_services() {
         }),
         "a foreign service must never appear in list"
     );
+}
+
+// Step 3: STOP_PENDING through teardown ===============================================================================
+
+/// The shim reports `STOP_PENDING`, accepting no controls, from the moment it takes a stop until it
+/// reports `STOPPED`; SCM would otherwise show the service as `RUNNING` throughout the teardown.
+/// Fails if the shim stops reporting `STOP_PENDING`, or reports it with controls still accepted.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn the_shim_reports_stop_pending_then_stopped() {
+    let mgr = goetia::backend::scm::manager::ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let started = support::ConnectBack::listen();
+    let spec = mk_spec(&id, fixture_command("report", &[&started.port().to_string()]));
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    started.accept("the fixture (spawned by the shim) to report running");
+
+    let scm = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .expect("connect to the service manager");
+    let service = scm
+        .open_service(&id, ServiceAccess::QUERY_STATUS | ServiceAccess::STOP)
+        .expect("open the service");
+
+    // Armed on RUNNING, before the stop, so the first delivery is the stop's own first state.
+    let first = arm_and_wait(&service, SERVICE_NOTIFY_STOP_PENDING | SERVICE_NOTIFY_STOPPED);
+    service.stop().expect("send stop");
+    let (state, controls_accepted) = first();
+    assert_eq!(state, SERVICE_STOP_PENDING, "the first state after a stop");
+    assert_eq!(controls_accepted, 0, "no control is accepted while stopping");
+
+    let (state, _) = arm_and_wait(&service, SERVICE_NOTIFY_STOPPED)();
+    assert_eq!(state, SERVICE_STOPPED);
 }

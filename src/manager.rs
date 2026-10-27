@@ -15,7 +15,7 @@ pub mod fake;
 
 pub use budget::Budget;
 
-// All three supported platforms now return a real `ServiceManager`, so
+// All three supported platforms return a real `ServiceManager`, so
 // `Error::UnsupportedPlatform` is referenced only by the catch-all arm.
 // Gating the import keeps every supported target from warning about it.
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -164,9 +164,9 @@ pub trait ServiceManager {
     /// **Unlike [`Self::start`], not idempotent over a service that is still
     /// up.** A manager answering "already running" here has refused the
     /// start, because the instance it sees may be the one the stop is still
-    /// taking down: a Windows `type: simple` service reads `RUNNING` for its
-    /// whole teardown (`goetia-shim` never reports `STOP_PENDING`), and
-    /// reading that answer as a start reports a restart that leaves the
+    /// taking down: a Windows `type: simple` service reads `RUNNING` until its
+    /// shim has taken the stop (`goetia-shim` reports `STOP_PENDING` from
+    /// then on), and reading that answer as a start reports a restart that leaves the
     /// daemon down. `Ok(())` means the manager accepted a start request and
     /// nothing more. Takes no budget: it never waits.
     fn request_start_after_stop(&self, id: &Id) -> Result<()>;
@@ -211,7 +211,11 @@ pub trait ServiceManager {
     /// own answer** and never off a state read before it, which would race the kill. Not an
     /// `Ok(())`: nothing was killed.
     ///
-    /// Takes no budget, as it waits for nothing.
+    /// SCM returns once it has recorded the exit: the service is then stopped, or already restarted
+    /// by its restart policy. systemd and launchd return once the signal is sent.
+    ///
+    /// Takes no budget: what SCM is waited for is the exit of a process whose termination was
+    /// delivered, which is not a wait to bound.
     ///
     /// [`Error::NotRunning`]: crate::Error::NotRunning
     fn kill(&self, id: &Id) -> Result<()>;
@@ -368,7 +372,7 @@ impl Installed {
 pub struct Status {
     pub state: State,
     /// For `type: simple` on Windows this is `goetia-shim.exe`'s pid, not
-    /// the supervised child's — SCM knows no other process for that
+    /// the daemon's — SCM knows no other process for that
     /// service. Documented here rather than left as a surprise.
     pub pid: Option<u32>,
     /// Whether the service is enabled at boot: systemd's `.wants` symlink,
