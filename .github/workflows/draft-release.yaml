@@ -386,7 +386,7 @@ jobs:
 
       - name: Install sigstore
         # renovate: datasource=pypi depName=sigstore
-        run: uv tool install sigstore==4.5.0
+        run: uv tool install sigstore==4.5.1
 
       # The pins, the loop and the zero-archive guard live in
       # verify-sigstore-bundle.sh, which Publish Release calls identically
