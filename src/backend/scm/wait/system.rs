@@ -397,28 +397,20 @@ impl super::ScmActor for SystemScmActor {
         // `Sleep(dwWaitHint/10)` poll: nothing is re-*asked*, and the
         // bound is the human-facing one the caller set.
         loop {
-            // `None` is unbounded — `INFINITE`, exactly as before there
-            // was a deadline. `Some(0)` can only mean an already-spent
-            // deadline, because `remaining_millis_capped` rounds up: a
-            // live deadline never converts to zero, and `SleepEx(0)` in
-            // a loop is the 100%-CPU poll this module exists to avoid.
-            let remaining = deadline.remaining_millis_capped();
-            if remaining == Some(0) {
-                return self.expire();
-            }
+            // `sleep_until_woken` never passes `Some(0)`, so this is no
+            // `SleepEx(0)` poll.
+            //
             // SAFETY: `SleepEx` takes no pointers; `1` (`TRUE`) makes it
             // alertable, which is the entire point of this wait.
-            let rc = unsafe { SleepEx(remaining.unwrap_or(INFINITE), 1) };
-            if self.status.fired.load(Ordering::Acquire) {
-                // The notify APC ran — whether or not the interval also
-                // elapsed on the way out, the state was delivered.
-                break;
-            }
-            if rc != WAIT_IO_COMPLETION {
-                // `SleepEx`'s only other return: the interval elapsed
-                // with nothing delivered. `registration_outstanding`
-                // stays true — nothing consumed this arm.
+            let woken = deadline
+                .sleep_until_woken(|millis| unsafe { SleepEx(millis.unwrap_or(INFINITE), 1) } == WAIT_IO_COMPLETION);
+            if !woken {
+                // `registration_outstanding` stays true — nothing consumed
+                // this arm.
                 return self.expire();
+            }
+            if self.status.fired.load(Ordering::Acquire) {
+                break;
             }
             // An unrelated APC woke us; re-enter on what is left.
         }
