@@ -264,7 +264,8 @@ impl Backend for ScmManager {
     fn uninstall(&self, id: &Id) -> Result<()> {
         let (scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
         flow::owned(self, id)?;
-        // `uninstall_locked` opens its own handles, and its delete needs this one closed: an open handle leaves the service only marked for deletion.
+        // `uninstall_locked` opens its own handles, and its delete needs this one closed: an open
+        // handle leaves the service only marked for deletion.
         drop(service);
         uninstall_locked(&scm, id)
     }
@@ -355,7 +356,8 @@ impl Backend for ScmManager {
 }
 
 /// What the `Parameters` of a service goetia could open say about its ownership. No marker is
-/// foreign, with the stock remedy: nothing but deleting the orphan recovers it: `type: managed` has no second proof of ownership.
+/// foreign, with the stock remedy: nothing but deleting the orphan recovers it, since `type: managed`
+/// has no second proof of ownership.
 fn read_marker(parameters: BTreeMap<String, String>, service: Option<Service>) -> ReadOutcome<ScmSnapshot> {
     let blob = match generate::extract(&parameters) {
         Ok(None) => return ReadOutcome::Foreign { recovery: None },
@@ -756,8 +758,8 @@ fn run_sc(args: &[&str]) -> Result<()> {
 
 // uninstall ===========================================================================================================
 
-/// Disable the service, stop whatever runs, then delete it: `DeleteService` on a running service only marks it, and the next `install` meets
-/// `ERROR_SERVICE_MARKED_FOR_DELETE`.
+/// Disable the service, stop whatever runs, then delete it: `DeleteService` on a running service
+/// only marks it, and the next `install` meets `ERROR_SERVICE_MARKED_FOR_DELETE`.
 ///
 /// A disabled service is never started again: `StartService` fails with 1058, and a recovery restart
 /// fails with event 7032 / `%%1058` and no `START_PENDING`. Measured: a restart queued before the

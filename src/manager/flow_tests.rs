@@ -95,11 +95,7 @@ fn install_refuses_a_failed_comparison_with_its_error_alone() {
 #[skuld::test]
 fn a_write_that_loses_to_a_foreign_entry_refuses_and_overwrites_nothing() {
     let fake = Fake::new();
-    fake.seed_write_interloper(
-        "frpc",
-        "some pre-existing, unrelated service
-",
-    );
+    fake.seed_write_interloper("frpc", "some pre-existing, unrelated service\n");
 
     let outcome = fake.install(&mk("frpc"), false).unwrap();
 
@@ -114,11 +110,7 @@ fn a_write_that_loses_to_a_foreign_entry_refuses_and_overwrites_nothing() {
 fn a_write_that_loses_to_an_ours_entry_follows_that_entry() {
     let theirs = mk("frpc");
     let mine = mk_as("frpc", "svc");
-    let hand_edited = format!(
-        "{}# hand-added directive
-",
-        generate(&theirs)
-    );
+    let hand_edited = format!("{}# hand-added directive\n", generate(&theirs));
 
     // Same spec: nothing is left to write.
     let fake = Fake::new();
@@ -151,11 +143,7 @@ fn external_configuration_is_carried_into_the_outcome() {
     let recovery = "remove /etc/drop-in by hand".to_string();
 
     let hand_edited = Fake::new();
-    hand_edited.install_then_hand_edit(
-        &mk("frpc"),
-        "# hand-added directive
-",
-    );
+    hand_edited.install_then_hand_edit(&mk("frpc"), "# hand-added directive\n");
     hand_edited.seed_external(
         "frpc",
         ExternalConfig::Unclearable {

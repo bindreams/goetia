@@ -48,10 +48,11 @@ pub(super) enum ReplaceOutcome {
 }
 
 /// Overwrite `id`'s unit with `text`, but only if the fragment currently at `unit_path(id)` still has
-/// exactly the content `expected_text` names — closing the same TOCTOU `create_unit` closes, reached here from the `Update`/`Stale` arm instead: the gap between
-/// classification and this write spans `decide`, `ensure_parent_dirs` (which can spawn a `chown`
-/// subprocess), and building the replacement's contents, wide enough for something else to land at
-/// this exact path in between (e.g. a concurrent `systemctl mask` on this same, already-managed id).
+/// exactly the content `expected_text` names — closing the same TOCTOU `create_unit` closes, reached
+/// here from the `Update`/`Stale` arm instead: the gap between classification and this write spans
+/// `decide`, `ensure_parent_dirs` (which can spawn a `chown` subprocess), and building the
+/// replacement's contents, wide enough for something else to land at this exact path in between
+/// (e.g. a concurrent `systemctl mask` on this same, already-managed id).
 ///
 /// There is no kernel-level "replace only if identity X" primitive, so this is done in two safe
 /// `rename`s: quarantine the current occupant under a private name and verify its content
@@ -207,12 +208,12 @@ pub(super) fn restore_quarantine(backup_path: &Path, final_path: &Path) -> Resul
 // write_temp_unit / fsync_unit_dir ====================================================================================
 
 /// A temp file in `UNIT_DIR` itself (so the later `persist`/`persist_noclobber` is a same-filesystem
-/// link, never a cross-device copy), containing `text`, already `chmod`ed 0644 (so `list`/`show`/`diff` need no elevation) and
-/// `fsync`ed to stable storage — `NamedTempFile`'s `Write` impl forwards `flush()` straight to
-/// `std::fs::File`, whose `flush` is a documented no-op, so without a real `sync_all()` here a crash
-/// between this write and the later rename can leave the fragment on disk fully or partially
-/// zero-filled: no `[X-Goetia]` marker, `extract` returns `Ok(None)`, and every verb then refuses an
-/// id goetia itself created.
+/// link, never a cross-device copy), containing `text`, already `chmod`ed 0644 (so
+/// `list`/`show`/`diff` need no elevation) and `fsync`ed to stable storage — `NamedTempFile`'s
+/// `Write` impl forwards `flush()` straight to `std::fs::File`, whose `flush` is a documented no-op,
+/// so without a real `sync_all()` here a crash between this write and the later rename can leave the
+/// fragment on disk fully or partially zero-filled: no `[X-Goetia]` marker, `extract` returns
+/// `Ok(None)`, and every verb then refuses an id goetia itself created.
 pub(super) fn write_temp_unit(id: &str, text: &str) -> Result<tempfile::NamedTempFile> {
     let dir = Path::new(UNIT_DIR);
     let mut tmp = tempfile::Builder::new()

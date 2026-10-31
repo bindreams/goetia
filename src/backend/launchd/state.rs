@@ -21,7 +21,7 @@ use crate::manager::State;
 /// pid attached. Reporting that as `Stopped` — a bare `Some(_) =>
 /// State::Stopped` catch-all once did exactly that — is the same
 /// confidently-wrong answer the permission-failure branch in
-/// `query_live_state` above this call already refuses to give: a job that
+/// `classified`, which calls this, already refuses to give: a job that
 /// is in fact starting, reported as one that definitely is not.
 pub(crate) fn classify(print_body: &str) -> (State, Option<u32>) {
     let pid = find_field(print_body, "pid").and_then(|s| s.trim().parse().ok());
