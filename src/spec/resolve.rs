@@ -72,7 +72,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::backend::{Backend, Shaped, ShapedSpec};
+use super::backend::{BackendKind, Shaped, ShapedSpec};
 use super::interpolate::{self, Unresolved};
 use super::overrides::Supplied;
 use super::raw::RawManifest;
@@ -118,13 +118,13 @@ enum Phase {
 /// produce `Warning`s for properties that are accepted but cannot be
 /// faithfully honored on every platform.
 pub fn resolve(raw: RawManifest, base_dir: &Path) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
-    resolve_as(raw, base_dir, Backend::native())
+    resolve_as(raw, base_dir, BackendKind::native())
 }
 
 /// [`resolve`], with the native backend named rather than detected.
 ///
 /// Production has exactly one caller, [`resolve`], which passes
-/// [`Backend::native`]. Tests pass any of the three, because the native arm
+/// [`BackendKind::native`]. Tests pass any of the three, because the native arm
 /// of steps 4 and 5 — the skip, the verdict, the advisory — is otherwise
 /// only reachable from the one platform that runs it. A test that names a
 /// non-native backend as `native` exercises the same code an install on
@@ -132,7 +132,7 @@ pub fn resolve(raw: RawManifest, base_dir: &Path) -> Result<(Vec<DaemonSpec>, Ve
 fn resolve_as(
     raw: RawManifest,
     base_dir: &Path,
-    native: Option<Backend>,
+    native: Option<BackendKind>,
 ) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
     // Declared before `absolutize` runs, not after: `absolutize` itself can
     // push a manifest-level advisory (a drive-relative `-f`), and
@@ -212,21 +212,21 @@ fn resolve_as(
         // attribution, because a base-spec error is not any backend's
         // fault, and base errors therefore always win on precedence. Its
         // warnings are dropped: a later pass re-derives every one of them
-        // from the same authored values. No `Backend` verdict runs here:
+        // from the same authored values. No `BackendKind` verdict runs here:
         // the base spec is nobody's override.
         let base = raw.without_overrides();
         interpolate::check_spec_grammar(&base, &path)?;
         resolve_shape(&id, base, base_dir, Phase::Authored)?;
 
-        // Step 4: the all-backends sweep, and errors only. Backend
+        // Step 4: the all-backends sweep, and errors only. BackendKind
         // annotation covers the whole iteration, not just `resolve_shape`:
         // every `Error` raised anywhere in this pass — from shape or from
-        // `Backend::error` — is annotated with `backend` before it
+        // `BackendKind::error` — is annotated with `backend` before it
         // propagates. Each non-native backend's shaped spec is kept for
         // step 5, which owns every advisory and reads each field the checks
         // need from the substituted base where it can.
-        let mut swept: Vec<(Backend, ShapedSpec)> = Vec::with_capacity(Backend::ALL.len());
-        for backend in Backend::ALL {
+        let mut swept: Vec<(BackendKind, ShapedSpec)> = Vec::with_capacity(BackendKind::ALL.len());
+        for backend in BackendKind::ALL {
             let (merged, supplied) = raw.merged_for(backend);
             let has_entry = raw.backend_specific.contains_key(&backend);
             let sweep: Result<Option<ShapedSpec>, Error> = (|| {
@@ -283,7 +283,7 @@ fn resolve_as(
         // so this is the *first* pass to apply a per-backend rule to the
         // native spec, and "after substituting from .env" would be a claim
         // about a pass that never ran — naming a `.env` that need not exist.
-        // `Backend::error` reads only fields `native_supplied` marks, so
+        // `BackendKind::error` reads only fields `native_supplied` marks, so
         // `backend-specific.<native>` is where the value was written, the
         // same attribution its non-native twin gets.
         if let Some(b) = native {
@@ -425,7 +425,7 @@ fn determinable_path(id: &Id, field: &str, raw: Option<String>, trusted: bool, b
 }
 
 /// Backend annotation for step 4. `Error::Invalid` (from `resolve_shape` or
-/// `Backend::error`) always gains the `backend-specific.<backend>: `
+/// `BackendKind::error`) always gains the `backend-specific.<backend>: `
 /// message prefix: this pass's spec is `merged_for(backend)`, and the base
 /// pass (step 3) already validated the value's base form, so a failure here
 /// can only be attributable to this backend's override — `has_entry` is
@@ -433,7 +433,7 @@ fn determinable_path(id: &Id, field: &str, raw: Option<String>, trusted: bool, b
 /// `check_spec_grammar`) gets a path suffix instead, gated on `has_entry`
 /// explicitly rather than relying on that same reasoning to make the
 /// ungated case unreachable.
-fn annotate_sweep_error(err: Error, backend: Backend, has_entry: bool) -> Error {
+fn annotate_sweep_error(err: Error, backend: BackendKind, has_entry: bool) -> Error {
     match err {
         Error::Interpolate { path, message } if has_entry => Error::Interpolate {
             path: format!("{path} (backend-specific.{backend})"),
@@ -446,7 +446,7 @@ fn annotate_sweep_error(err: Error, backend: Backend, has_entry: bool) -> Error 
 /// `backend-specific.<backend>: ` on an `Error::Invalid`, and nothing on any
 /// other variant. Shared by step 4's sweep and step 5's native verdict so
 /// the two spell one attribution one way.
-fn attribute_to(err: Error, backend: Backend) -> Error {
+fn attribute_to(err: Error, backend: BackendKind) -> Error {
     match err {
         Error::Invalid { daemon, message } => Error::Invalid {
             daemon,
@@ -459,7 +459,7 @@ fn attribute_to(err: Error, backend: Backend) -> Error {
 /// Backend annotation for step 5. `Error::Interpolate` (from
 /// `interpolate::spec`'s substitution) gains a "merged with" path suffix,
 /// gated on `native_entry` — `Supplied` answers "which fields did this
-/// override write" and gates `Backend::error`; `native_entry` (`raw`'s
+/// override write" and gates `BackendKind::error`; `native_entry` (`raw`'s
 /// `backend_specific.contains_key`) answers "was this backend mentioned at
 /// all" and gates this annotation; the two are not interchangeable, since
 /// `scm: {}` is an entry that sets no field and its `Supplied` is
@@ -472,10 +472,10 @@ fn attribute_to(err: Error, backend: Backend) -> Error {
 /// variable.
 ///
 /// Applied to the substitution and shape half of step 5 only. The native
-/// `Backend::error` verdict is annotated by `attribute_to` at its own call
+/// `BackendKind::error` verdict is annotated by `attribute_to` at its own call
 /// site: step 4 never ran it, so the premise this prefix rests on does not
 /// hold for it.
-fn annotate_step5_error(err: Error, native_entry: Option<Backend>) -> Error {
+fn annotate_step5_error(err: Error, native_entry: Option<BackendKind>) -> Error {
     match err {
         Error::Interpolate { path, message } => {
             let path = match native_entry {
@@ -499,7 +499,7 @@ fn annotate_step5_error(err: Error, native_entry: Option<Backend>) -> Error {
 /// spec produces the identical warning in every pass that keeps warnings —
 /// collapsing those duplicates to one is this function's whole job.
 ///
-/// Only that advisory ever reaches here twice: a `Backend::warn` advisory
+/// Only that advisory ever reaches here twice: a `BackendKind::warn` advisory
 /// belongs to one backend, which exactly one pass owns. So this call site
 /// is exercised only on Windows, by
 /// `a_base_drive_relative_path_warns_once_not_once_per_backend_pass`.
@@ -639,7 +639,7 @@ fn shape<T>(id: &Id, raw: Option<String>, parse: fn(&Id, &str) -> Result<T, Erro
 /// deferred parse that fails here, which carries post-substitution text and
 /// is not provably anyone's fault in particular, so it is reported
 /// verbatim.
-fn require_complete(shaped: ShapedSpec, backend: Option<Backend>) -> Result<DaemonSpec, Error> {
+fn require_complete(shaped: ShapedSpec, backend: Option<BackendKind>) -> Result<DaemonSpec, Error> {
     let ShapedSpec {
         id,
         name,
@@ -699,7 +699,7 @@ fn require_complete(shaped: ShapedSpec, backend: Option<Backend>) -> Result<Daem
     })
 }
 
-fn missing_command_error(id: &Id, backend: Option<Backend>) -> Error {
+fn missing_command_error(id: &Id, backend: Option<BackendKind>) -> Error {
     match backend {
         Some(b) => invalid(
             id,
@@ -1263,7 +1263,7 @@ pub(crate) fn reject_relative_path(id: &Id, field: &str, path: &Path) -> Result<
 
 /// `pub(super)`: `spec::backend` (a sibling module, not a descendant of
 /// `resolve`) constructs the same `Error::Invalid` shape for its own
-/// rejections (`Backend::error`), and this is the one place that shape is
+/// rejections (`BackendKind::error`), and this is the one place that shape is
 /// spelled.
 pub(super) fn invalid(id: &Id, message: &str) -> Error {
     Error::Invalid {

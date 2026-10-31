@@ -794,14 +794,14 @@ fn show_absent_id_outranks_unreadable_id_regardless_of_argument_order() {
 // rather than special-casing per platform, and skipping is neither needed
 // nor permitted.
 
-/// A backend that is not this host's native one. `Backend::ALL` always has
-/// at least two such entries (`Backend::native()` names at most one), so
+/// A backend that is not this host's native one. `BackendKind::ALL` always has
+/// at least two such entries (`BackendKind::native()` names at most one), so
 /// the first match is deterministic and always exists. Mirrors
 /// `non_native_backend` in `src/spec/resolve_tests.rs`.
-fn non_native_backend() -> goetia::spec::Backend {
-    goetia::spec::Backend::ALL
+fn non_native_backend() -> goetia::spec::BackendKind {
+    goetia::spec::BackendKind::ALL
         .into_iter()
-        .find(|&b| Some(b) != goetia::spec::Backend::native())
+        .find(|&b| Some(b) != goetia::spec::BackendKind::native())
         .expect("ALL has 3 entries; native() names at most 1")
 }
 
@@ -812,7 +812,7 @@ fn non_native_backend() -> goetia::spec::Backend {
 #[skuld::test]
 fn install_applies_the_native_backend_override() {
     let dir = tempfile::tempdir().unwrap();
-    let native = goetia::spec::Backend::native().expect("native() is Some on every CI platform");
+    let native = goetia::spec::BackendKind::native().expect("native() is Some on every CI platform");
     let fake = Fake::new();
     let manifest = write_manifest(
         dir.path(),
@@ -842,8 +842,8 @@ fn install_applies_the_native_backend_override() {
 /// `scm` override keeping the manifest valid everywhere. On a Windows host the `scm` override wins.
 #[skuld::test]
 fn always_survives_install_and_show_on_hosts_that_can_honour_it() {
-    let native = goetia::spec::Backend::native().expect("native() is Some on every CI platform");
-    let expected = if native == goetia::spec::Backend::Scm {
+    let native = goetia::spec::BackendKind::native().expect("native() is Some on every CI platform");
+    let expected = if native == goetia::spec::BackendKind::Scm {
         "restart: on-failure"
     } else {
         "restart: always"
@@ -902,7 +902,7 @@ fn always_survives_install_and_show_on_hosts_that_can_honour_it() {
 #[skuld::test]
 fn changing_only_a_non_native_override_leaves_the_install_up_to_date() {
     let dir = tempfile::tempdir().unwrap();
-    let native = goetia::spec::Backend::native().expect("native() is Some on every CI platform");
+    let native = goetia::spec::BackendKind::native().expect("native() is Some on every CI platform");
     let non_native = non_native_backend();
     let fake = Fake::new();
     let manifest_text = |non_native_delay: &str| {
@@ -939,7 +939,7 @@ fn changing_only_a_non_native_override_leaves_the_install_up_to_date() {
 #[skuld::test]
 fn changing_the_native_override_is_an_update() {
     let dir = tempfile::tempdir().unwrap();
-    let native = goetia::spec::Backend::native().expect("native() is Some on every CI platform");
+    let native = goetia::spec::BackendKind::native().expect("native() is Some on every CI platform");
     let fake = Fake::new();
     let manifest_text = |restart: &str| {
         format!(
@@ -1525,7 +1525,7 @@ fn install_exit_code_does_not_mask_an_error_behind_a_conflict() {
 
 /// `--dry-run`'s preview must not silently drop a `Warning` (e.g. SCM
 /// clamping a too-large `restart-delay`). This advisory fires at
-/// resolve time, from `Backend::Scm.warn`, through `load_and_warn` — on
+/// resolve time, from `BackendKind::Scm.warn`, through `load_and_warn` — on
 /// every host, not only from an effectful Windows install preview — which
 /// is the property this test pins.
 #[skuld::test]

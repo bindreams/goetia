@@ -301,7 +301,7 @@ fn preview_artifact(spec: &DaemonSpec, err: &mut dyn Write) -> String {
     #[cfg(windows)]
     {
         // The SCM generator's own warning (a too-large `restart-delay`) now
-        // fires at resolve time, from `Backend::Scm.warn`, before this ever
+        // fires at resolve time, from `BackendKind::Scm.warn`, before this ever
         // runs — see `spec/backend.rs`. `err` stays threaded through and
         // unused so a future generator warning cannot be dropped silently.
         let _ = err;
