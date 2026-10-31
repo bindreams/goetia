@@ -65,14 +65,24 @@ pub fn run(
     };
 
     if args.dry_run {
+        // A daemon whose generator refuses it is reported and does not hide the previews of the rest.
+        let mut refused = false;
         for (i, spec) in selected.iter().enumerate() {
             if i > 0 {
                 let _ = writeln!(out);
             }
             let _ = writeln!(out, "# {}", spec.id);
-            let _ = write!(out, "{}", preview_artifact(spec, err));
+            match preview_artifact(spec, err) {
+                Ok(artifact) => {
+                    let _ = write!(out, "{artifact}");
+                }
+                Err(e) => {
+                    let _ = writeln!(err, "error: {e}");
+                    refused = true;
+                }
+            }
         }
-        return 0;
+        return i32::from(refused);
     }
 
     if let Err(code) = require_elevation("daemon install", is_elevated, err) {
@@ -282,25 +292,27 @@ fn preview_root_account() -> String {
     "root".to_string()
 }
 
+/// The generated artifact for `spec`, or the generator's refusal of it (scm refuses `restart: always`).
+///
 /// `err` is unused on every platform but Windows today — the systemd and
 /// launchd generators never produce a [`crate::spec::Warning`] — but it is
 /// threaded through unconditionally so a future one cannot be dropped.
-fn preview_artifact(spec: &DaemonSpec, err: &mut dyn Write) -> String {
+fn preview_artifact(spec: &DaemonSpec, err: &mut dyn Write) -> Result<String> {
     let identity = preview_identity(&spec.user);
 
     #[cfg(target_os = "linux")]
     {
         let _ = err;
-        crate::backend::systemd::generate::unit(spec, &identity)
+        Ok(crate::backend::systemd::generate::unit(spec, &identity))
     }
     #[cfg(target_os = "macos")]
     {
         let _ = err;
-        crate::backend::launchd::generate::plist(spec, &identity)
+        Ok(crate::backend::launchd::generate::plist(spec, &identity))
     }
     #[cfg(windows)]
     {
-        // The SCM generator's own warning (a too-large `restart-delay`) now
+        // The SCM generator's own warning (a too-large `restart-delay`)
         // fires at resolve time, from `BackendKind::Scm.warn`, before this ever
         // runs — see `spec/backend.rs`. `err` stays threaded through and
         // unused so a future generator warning cannot be dropped silently.
@@ -308,13 +320,13 @@ fn preview_artifact(spec: &DaemonSpec, err: &mut dyn Write) -> String {
         // The real shim path is an open packaging question — this placeholder
         // is only ever shown in a preview, never installed.
         let shim_path = PathBuf::from("goetia-shim.exe");
-        let registration = crate::backend::scm::generate::registration(spec, &identity, &shim_path);
-        crate::backend::scm::generate::render(&registration)
+        let registration = crate::backend::scm::generate::registration(spec, &identity, &shim_path)?;
+        Ok(crate::backend::scm::generate::render(&registration))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = err;
-        "# no dry-run preview generator for this platform\n".to_string()
+        Ok("# no dry-run preview generator for this platform\n".to_string())
     }
 }
 

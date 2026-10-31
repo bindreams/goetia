@@ -1435,7 +1435,8 @@ fn list_reaches_the_manager() {
 /// not even be stopped or removed.
 ///
 /// CLI-only: the verbs run against `Fake`, which has no scm refusal of its own to trip. The scm
-/// side is `a_blob_that_says_always_decodes_and_starts_as_its_kind` (`manager_tests.rs`) and
+/// generator refuses `always` (`registration_refuses_restart_always`); the scm side of operability is
+/// `a_blob_that_says_always_decodes_and_starts_as_its_kind` (`manager_tests.rs`) and
 /// `a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled`
 /// (`tests/shim_integration/restart_integration.rs`).
 #[skuld::test]

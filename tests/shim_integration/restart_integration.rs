@@ -438,8 +438,8 @@ fn a_new_shim_runs_a_service_registered_by_an_earlier_version() {
 }
 
 /// A service installed before `resolve` refused `restart: always` keeps a blob that says so. Only
-/// `install` refuses `always` for scm, so the service must stay operable: started, listed, queried,
-/// restarted, stopped and uninstalled.
+/// `install` regenerates from a blob, and the scm generator refuses `always`, so the service must
+/// stay operable: started, listed, queried, restarted, stopped and uninstalled.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled() {
     let mgr = ScmManager::new();

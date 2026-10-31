@@ -39,7 +39,7 @@ fn simple_spec() -> DaemonSpec {
         cwd: None,
         env: BTreeMap::new(),
         user: User::Root,
-        restart: Restart::Always,
+        restart: Restart::OnFailure,
         restart_delay: None,
         logs: None,
         kind: Kind::Simple,
@@ -57,7 +57,7 @@ fn shim_path() -> PathBuf {
 }
 
 fn build(spec: &DaemonSpec) -> ScmRegistration {
-    registration(spec, &identity(), &shim_path())
+    registration(spec, &identity(), &shim_path()).unwrap()
 }
 
 // executable/arguments per Kind =======================================================================================
@@ -101,7 +101,7 @@ fn named_user_account_uses_resolved_identity() {
     let mut spec = managed_spec();
     spec.user = User::Name("bindreams".to_string());
     let id = identity();
-    let reg = registration(&spec, &id, &shim_path());
+    let reg = registration(&spec, &id, &shim_path()).unwrap();
 
     assert_eq!(
         reg.account,
@@ -215,7 +215,7 @@ fn registration_canonicalizes_a_builtin_account() {
     let id = Identity {
         user: "LocalService".to_string(),
     };
-    let reg = registration(&spec, &id, &shim_path());
+    let reg = registration(&spec, &id, &shim_path()).unwrap();
 
     assert_eq!(reg.account, Some(r"NT AUTHORITY\LocalService".to_string()));
 }
@@ -230,7 +230,7 @@ fn registration_for_root_uses_the_default_account_with_an_empty_identity() {
     // the empty-string path an unguarded `canonical_account` would map to
     // `Some("")` (see `windows_builtin("")`'s doc comment).
     let id = Identity { user: String::new() };
-    let reg = registration(&spec, &id, &shim_path());
+    let reg = registration(&spec, &id, &shim_path()).unwrap();
 
     assert_eq!(reg.account, None);
 }
@@ -707,7 +707,7 @@ fn simple_kind_default_restart_delay_when_unset() {
 
 #[skuld::test]
 fn the_two_kinds_get_the_same_failure_actions_for_every_restart_value() {
-    for restart in [Restart::Never, Restart::OnFailure, Restart::Always] {
+    for restart in [Restart::Never, Restart::OnFailure] {
         for restart_delay in [None, Some(Duration::from_secs(42))] {
             let mut simple = simple_spec();
             simple.restart = restart;
@@ -773,25 +773,33 @@ fn managed_kind_with_restart_never_has_no_failure_actions() {
     );
 }
 
-/// The generator must neither panic nor emit anything but on-failure's recovery
-/// actions for `Always` (installed blobs may carry it). Only the blob, which
-/// records the authored `restart`, may differ.
 #[skuld::test]
-fn managed_kind_restart_always_renders_as_on_failure() {
-    let mut always = managed_spec();
-    always.restart = Restart::Always;
-    let mut on_failure = managed_spec();
-    on_failure.restart = Restart::OnFailure;
+fn registration_refuses_restart_always() {
+    for spec in [managed_spec(), simple_spec()] {
+        let spec = DaemonSpec {
+            restart: Restart::Always,
+            ..spec
+        };
+        let err = registration(&spec, &identity(), &shim_path()).expect_err("`restart: always` must be refused");
 
-    let mut always = build(&always);
-    let mut on_failure = build(&on_failure);
-    assert!(
-        always.failure_actions.is_some(),
-        "`always` keeps on-failure's recovery actions"
-    );
-    always.parameters.clear();
-    on_failure.parameters.clear();
-    assert_eq!(render(&always), render(&on_failure));
+        assert!(
+            matches!(&err, Error::Invalid { daemon, .. } if daemon.as_str() == "frpc"),
+            "{err:?}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("restart: always"), "{text}");
+        assert!(text.contains("backend-specific: scm"), "the remedy is missing: {text}");
+    }
+}
+
+#[skuld::test]
+fn registration_accepts_never_and_on_failure() {
+    for restart in [Restart::Never, Restart::OnFailure] {
+        for spec in [managed_spec(), simple_spec()] {
+            let spec = DaemonSpec { restart, ..spec };
+            registration(&spec, &identity(), &shim_path()).unwrap_or_else(|e| panic!("{restart:?}: {e}"));
+        }
+    }
 }
 
 #[skuld::test]
@@ -800,7 +808,7 @@ fn managed_kind_clamps_absurdly_long_restart_delay() {
     // One millisecond past what a DWORD of milliseconds (SC_ACTION.Delay)
     // can express.
     spec.restart_delay = Some(MAX_SC_ACTION_DELAY + Duration::from_millis(1));
-    let reg = registration(&spec, &identity(), &shim_path());
+    let reg = registration(&spec, &identity(), &shim_path()).unwrap();
 
     let fa = reg
         .failure_actions
@@ -862,7 +870,7 @@ fn rounding_a_restart_delay_up_never_passes_the_scm_maximum() {
 fn managed_kind_restart_delay_within_bound_does_not_clamp() {
     let mut spec = managed_spec();
     spec.restart_delay = Some(Duration::from_secs(42));
-    let reg = registration(&spec, &identity(), &shim_path());
+    let reg = registration(&spec, &identity(), &shim_path()).unwrap();
 
     let fa = reg
         .failure_actions
@@ -895,9 +903,9 @@ fn render_is_the_generation_invariant() {
     let id = identity();
     let shim = shim_path();
 
-    let original = registration(&spec, &id, &shim);
+    let original = registration(&spec, &id, &shim).unwrap();
     let recovered_spec = extract(&original.parameters).unwrap().unwrap().spec;
-    let regenerated = registration(&recovered_spec, &id, &shim);
+    let regenerated = registration(&recovered_spec, &id, &shim).unwrap();
 
     assert_eq!(
         render(&original),

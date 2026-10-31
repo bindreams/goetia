@@ -381,7 +381,8 @@ fn a_version_difference_wins_over_a_difference_in_recovery_actions() {
         &spec,
         &Identity { user: "svc".to_owned() },
         &PathBuf::from("goetia-shim.exe"),
-    );
+    )
+    .unwrap();
     assert!(
         reg_now.failure_actions.is_some(),
         "the fixture must be a policy that now gets recovery actions"

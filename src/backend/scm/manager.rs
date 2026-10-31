@@ -118,7 +118,7 @@ use crate::decide::{self, Outcome, Ownership};
 use crate::error::{Error, Result};
 use crate::manager::budget;
 use crate::manager::{Budget, Installed, ServiceManager, State, Status};
-use crate::spec::{DaemonSpec, Id, Kind, Restart};
+use crate::spec::{DaemonSpec, Id, Kind};
 
 // ScmManager ==========================================================================================================
 
@@ -136,7 +136,6 @@ impl ScmManager {
 
 impl ServiceManager for ScmManager {
     fn install(&self, spec: &DaemonSpec, force: bool) -> Result<Outcome> {
-        refuse_always(spec)?;
         let d = discover(spec)?;
         let outcome = decide::decide(
             &d.found,
@@ -163,7 +162,6 @@ impl ServiceManager for ScmManager {
     }
 
     fn preview_install(&self, spec: &DaemonSpec) -> Result<Outcome> {
-        refuse_always(spec)?;
         let d = discover(spec)?;
         Ok(decide::decide(
             &d.found,
@@ -467,22 +465,9 @@ fn shim_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("goetia-shim.exe"))
 }
 
-/// `generate` still accepts `restart: always` so that blobs installed before `resolve` refused it
-/// regenerate; a spec that did not come from `resolve` must not install with on-failure semantics.
-fn refuse_always(spec: &DaemonSpec) -> Result<()> {
-    if spec.restart == Restart::Always {
-        return Err(Error::Invalid {
-            daemon: spec.id.to_string(),
-            message: "`restart: always` cannot be honoured by the scm backend: SCM recovery actions never fire after a clean exit"
-                .to_string(),
-        });
-    }
-    Ok(())
-}
-
 fn discover(spec: &DaemonSpec) -> Result<Discovery> {
     let identity = identity::resolve(&spec.user)?;
-    let reg = generate::registration(spec, &identity, &shim_path());
+    let reg = generate::registration(spec, &identity, &shim_path())?;
     let desired = generate::render(&reg);
 
     let scm = open_scm_to_classify(spec.id.as_str())?;
@@ -523,18 +508,19 @@ fn discover(spec: &DaemonSpec) -> Result<Discovery> {
 /// since deleted) is [`Ownership::OursUnreadable`]: `decide` cannot compute
 /// `regenerated` without a working `Identity`, so this backend genuinely
 /// cannot regenerate that spec on this host — the same situation a future
-/// schema or bit-rotted blob puts it in.
+/// schema or bit-rotted blob puts it in. So is a blob the generator refuses,
+/// such as one installed with `restart: always` before `resolve` refused it.
 fn classify(params: &BTreeMap<String, String>) -> Ownership {
     match generate::extract(params) {
         Ok(None) => Ownership::Foreign,
         Ok(Some(blob)) => match identity::resolve(&blob.spec.user) {
-            Ok(blob_identity) => {
-                let blob_reg = generate::registration(&blob.spec, &blob_identity, &shim_path());
-                Ownership::Ours {
+            Ok(blob_identity) => match generate::registration(&blob.spec, &blob_identity, &shim_path()) {
+                Ok(blob_reg) => Ownership::Ours {
                     regenerated: generate::render(&blob_reg),
                     blob,
-                }
-            }
+                },
+                Err(e) => Ownership::OursUnreadable { reason: e.to_string() },
+            },
             Err(e) => Ownership::OursUnreadable {
                 reason: format!("cannot resolve the account the embedded spec was installed for: {e}"),
             },

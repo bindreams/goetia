@@ -14,7 +14,7 @@ use goetia::spec::{AccountId, DaemonSpec, Id, Restart, User};
 use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use winreg::RegKey;
-use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
 
 use crate::common::{self, conformance_mk, fixture_command, mk_spec};
 use crate::deny::Denied;
@@ -871,6 +871,37 @@ fn deleted_account_makes_the_service_oursunreadable() {
             panic!("expected OursUnreadable once the account backing `user.id` is deleted")
         }
     }
+}
+
+/// A service installed before `resolve` refused `restart: always` keeps a blob that says so, and the
+/// generator now refuses to regenerate it: an install over it is unreadable, not a silent rewrite.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn install_refuses_an_always_blob_as_unreadable() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = install_plain(&mgr, &id);
+
+    let always = DaemonSpec {
+        restart: Restart::Always,
+        ..spec.clone()
+    };
+    let path = format!(r"{}\{id}\Parameters", support::SCM_SERVICES_KEY);
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(&path, KEY_WRITE)
+        .unwrap_or_else(|e| panic!(r"open HKLM\{path}: {e}"))
+        .set_value("Spec", &goetia::blob::encode(&always))
+        .expect("write Spec");
+
+    let outcome = mgr.preview_install(&spec).expect("preview_install");
+    let Outcome::RefuseUnreadable { reason, recovery } = &outcome else {
+        panic!("expected RefuseUnreadable for an always blob, got {outcome:?}");
+    };
+    assert!(reason.contains("restart: always"), "{reason}");
+    assert!(
+        recovery.contains(&format!("goetia daemon uninstall {id}")),
+        "{recovery}"
+    );
 }
 
 // A read that did not complete: the aggregate, and the two objects that produce it ====================================

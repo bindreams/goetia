@@ -145,8 +145,8 @@ pub struct DaemonSpec {
 /// produced — a derived `Deserialize` would fail at YAML-parse time on an
 /// unresolved placeholder, before interpolation gets a chance to run.
 ///
-/// `resolve` refuses `Always` for scm, whose recovery actions never fire after a
-/// clean exit. It survives for scm only in blobs installed before that refusal.
+/// `resolve` and the scm generator refuse `Always` for scm, whose recovery actions never fire
+/// after a clean exit. It survives for scm only in blobs installed before that refusal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Restart {
     Never,

@@ -126,15 +126,17 @@ pub struct FailureActions {
 
 /// Build the [`ScmRegistration`] for `spec`. A `restart-delay` is rounded up to whole
 /// milliseconds and clamped to what `SC_ACTION.Delay` can express, rather than left to
-/// panic at install time — see `scm_restart_delay`; the advisories for those now
-/// fire at resolve time, from `BackendKind::Scm.warn`, on every host, rather
-/// than only when this effectful-install-time generator happens to run.
+/// panic at install time — see `scm_restart_delay`; the advisories for those
+/// fire at resolve time, from `BackendKind::Scm.warn`, on every host.
 ///
 /// `id` is the account already resolved by the effectful install path (see
 /// [`Identity`]) — this function does no lookup of its own. `shim_path` is
 /// only used for `Kind::Simple`, where the shim (not the spec's own command)
 /// is what SCM launches.
-pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> ScmRegistration {
+///
+/// Refuses `restart: always` with [`Error::Invalid`]: SCM recovery actions never fire after a
+/// clean exit, so the registration could only run on-failure semantics.
+pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> Result<ScmRegistration, Error> {
     let (executable, arguments) = match spec.kind {
         // SCM only ever launches the shim, with the daemon id as its sole
         // argument; the shim spawns the daemon once. The spec's own command
@@ -153,15 +155,22 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> ScmRe
     // SCM does every restart, for both kinds: the shim spawns the daemon once and reports its exit.
     let failure_actions = match spec.restart {
         Restart::Never => None,
-        // Unreachable from a manifest (`resolve` refuses it), but `classify` regenerates from
-        // installed blobs that may carry it; keep on-failure's actions so they don't read as modified.
-        Restart::OnFailure | Restart::Always => {
+        Restart::OnFailure => {
             let delay = spec.restart_delay.unwrap_or(DEFAULT_RESTART_DELAY);
             Some(FailureActions {
                 delay: scm_restart_delay(delay),
                 reset_period: FAILURE_RESET_PERIOD,
                 on_non_crash_failures: true,
             })
+        }
+        Restart::Always => {
+            return Err(Error::Invalid {
+                daemon: spec.id.to_string(),
+                message: "`restart: always` cannot be honoured by the scm backend: SCM recovery actions never fire \
+                          after a clean exit. To keep `always` on systemd and launchd, set \
+                          `backend-specific: scm: { restart: on-failure }`"
+                    .to_string(),
+            });
         }
     };
 
@@ -189,7 +198,7 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> ScmRe
     parameters.insert(FIELD_VERSION.to_string(), crate::version().to_string());
     parameters.insert(FIELD_SPEC.to_string(), blob::encode(spec));
 
-    ScmRegistration {
+    Ok(ScmRegistration {
         name: spec.id.as_str().to_string(),
         display_name: spec.name.clone(),
         executable,
@@ -197,7 +206,7 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> ScmRe
         account,
         failure_actions,
         parameters,
-    }
+    })
 }
 
 // Account canonicalisation ============================================================================================
