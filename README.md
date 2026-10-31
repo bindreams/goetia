@@ -493,10 +493,10 @@ embedded copy of the spec and SCM now refuses it. `start`, `stop`, `restart`
 and `uninstall` do not render it and keep working. What changes while it runs
 depends on its `type`. A `type: simple` service is no longer restarted when
 the command exits, because the new `goetia-shim` leaves every restart to SCM
-and the service has no recovery actions. A `type: managed` service is unchanged: it already had
-on-failure recovery actions, keeps them, and was never restarted after a clean
-exit. To give a `type: simple` service recovery actions, add the override above
-to the manifest, run `goetia daemon uninstall <id>`, then
+and the service has no recovery actions. A `type: managed` service is unchanged:
+it already had on-failure recovery actions, keeps them, and was never restarted
+after a clean exit. To give a `type: simple` service recovery actions, add the
+override above to the manifest, run `goetia daemon uninstall <id>`, then
 `goetia daemon install`.
 
 `${VAR}` is substituted only in the override for the backend being

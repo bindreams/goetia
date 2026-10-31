@@ -105,7 +105,7 @@ pub(super) enum RawState {
     /// class because it is one claim — and `Ownership::Foreign` is the answer to both:
     ///
     /// - Not a regular file: a symlink (`systemctl mask` points the fragment at `/dev/null`), a
-    ///   FIFO, a device node, a directory — obligation 2. Contents are never read; reading through
+    ///   FIFO, a device node, a directory. Contents are never read; reading through
     ///   a masked unit's target would look identical to "nothing here".
     /// - A regular file whose bytes are not UTF-8. `generate::unit` writes UTF-8 ini and nothing
     ///   else, so bytes that will not decode are a positive identification of a format goetia never
@@ -146,7 +146,7 @@ pub(super) enum RawState {
 /// Step 1 opens `O_PATH | O_NOFOLLOW`. That needs no read permission, never blocks, and is the
 /// documented case that yields a descriptor for the *symlink itself*, so a masked unit (`systemctl
 /// mask` points the fragment at `/dev/null`), a FIFO, a device node and a `.d` directory are all
-/// classified [`RawState::NotOurs`] without ever being opened for reading — obligation 2. It is
+/// classified [`RawState::NotOurs`] without ever being opened for reading, so none reads as absent. It is
 /// also what keeps `list` answerable at all: opening for reading first means `open(FIFO, O_RDONLY)`
 /// blocks until a writer arrives, and one `mkfifo x.service` would wedge the listing for every
 /// daemon on the host.
@@ -347,11 +347,8 @@ pub(super) fn fragmentless(id: &str) -> ReadResult<ReadOutcome<String>> {
 }
 
 /// The fragment `text` of a marked `id` with the drop-in content folded in, and what systemd's
-/// drop-in directories hold for it — obligation 3. The fold is only what `decide` compares: neither
-/// `desired` nor `regenerated` (both pure `generate()` output) can contain its marker, so a
-/// non-empty drop-in forces `Conflict` whenever `decide` reaches a text comparison at all. The one
-/// branch that doesn't (a stale version, checked before any text comparison) is `decide::decide`'s
-/// own `external` parameter's job.
+/// drop-in directories hold for it. Drop-in content is folded into the compared text, so any drop-in
+/// reads as `Conflict`; the stale-version branch (no text comparison) uses `external` instead.
 ///
 /// A drop-in that could not be read is `Error::Other`, never [`Error::Undetermined`]: the fragment
 /// is open and its marker decoded, so installation and ownership are both established, and what the

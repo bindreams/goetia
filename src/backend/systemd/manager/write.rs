@@ -1,4 +1,4 @@
-//! Writing the fragment itself, with the non-clobbering guarantees obligation 1 requires: a brand-new
+//! Writing the fragment itself, with the non-clobbering guarantees it needs: a brand-new
 //! unit must never replace something it never classified, and an update/regenerate must never replace
 //! a fragment that changed underneath it since classification.
 
@@ -17,13 +17,13 @@ use super::{UNIT_DIR, io_err, remove_file_if_present, unit_path};
 
 pub(super) enum CreateOutcome {
     Created,
-    /// Something now exists at the target path that wasn't there when `install` classified it —
-    /// obligation 1. The caller re-discovers and re-decides rather than clobbering it.
+    /// Something now exists at the target path that wasn't there when `install` classified it.
+    /// The caller re-discovers and re-decides rather than clobbering it.
     Raced,
 }
 
-/// Write `text` as a brand-new unit at `id`, never replacing an existing file — see the module doc
-/// comment's obligation 1. [`tempfile::NamedTempFile::persist_noclobber`] is `linkat(2)` without
+/// Write `text` as a brand-new unit at `id`, never replacing an existing file.
+/// [`tempfile::NamedTempFile::persist_noclobber`] is `linkat(2)` without
 /// replace semantics, so this fails rather than clobbers if anything now occupies `unit_path(id)`.
 pub(super) fn create_unit(id: &str, text: &str) -> Result<CreateOutcome> {
     let final_path = unit_path(id);
@@ -48,8 +48,7 @@ pub(super) enum ReplaceOutcome {
 }
 
 /// Overwrite `id`'s unit with `text`, but only if the fragment currently at `unit_path(id)` still has
-/// exactly the content `expected_text` names — closing the same TOCTOU obligation 1 already closes
-/// for `create_unit`, reached here from the `Update`/`Stale` arm instead: the gap between
+/// exactly the content `expected_text` names — closing the same TOCTOU `create_unit` closes, reached here from the `Update`/`Stale` arm instead: the gap between
 /// classification and this write spans `decide`, `ensure_parent_dirs` (which can spawn a `chown`
 /// subprocess), and building the replacement's contents, wide enough for something else to land at
 /// this exact path in between (e.g. a concurrent `systemctl mask` on this same, already-managed id).
@@ -184,7 +183,7 @@ fn unique_quarantine_path(id: &str) -> PathBuf {
 
 /// Move the quarantined `backup_path` back to `final_path`, without clobbering anything that might
 /// now be there — the restore needs the exact same non-clobber guarantee as any other write in this
-/// module (obligation 1). `link` rather than `rename`, deliberately: unlike `rename(2)`, `link(2)`
+/// module. `link` rather than `rename`, deliberately: unlike `rename(2)`, `link(2)`
 /// fails rather than replacing an existing destination. On success `backup_path` no longer exists; on
 /// failure because something now occupies `final_path`, `backup_path` is left in place (still holding
 /// the original content) and the returned error names it, so the situation is diagnosable rather than
@@ -208,7 +207,7 @@ pub(super) fn restore_quarantine(backup_path: &Path, final_path: &Path) -> Resul
 // write_temp_unit / fsync_unit_dir ====================================================================================
 
 /// A temp file in `UNIT_DIR` itself (so the later `persist`/`persist_noclobber` is a same-filesystem
-/// link, never a cross-device copy), containing `text`, already `chmod`ed 0644 (obligation 4) and
+/// link, never a cross-device copy), containing `text`, already `chmod`ed 0644 (so `list`/`show`/`diff` need no elevation) and
 /// `fsync`ed to stable storage — `NamedTempFile`'s `Write` impl forwards `flush()` straight to
 /// `std::fs::File`, whose `flush` is a documented no-op, so without a real `sync_all()` here a crash
 /// between this write and the later rename can leave the fragment on disk fully or partially

@@ -259,7 +259,7 @@ pub(crate) struct IdVerbCall<'a> {
     /// it sees an error variant, never the backend's own evidence — so a
     /// backend reporting it too eagerly makes `uninstall x && echo
     /// "confirmed gone"` print for an id its own `install` would refuse as
-    /// foreign. See `backend::systemd::manager`'s obligation 7.
+    /// foreign. See `backend::systemd::manager`'s "absence is about the id" item.
     pub absent_is_success: bool,
 }
 

@@ -21,7 +21,6 @@ pub(crate) trait Backend {
     type Definition: std::fmt::Display;
     /// What `read` saw; only this backend looks inside.
     type Snapshot;
-    /// Held for one install, across retries.
     type InstallScope;
 
     // Primitives ------------------------------------------------------------------------------------------------------

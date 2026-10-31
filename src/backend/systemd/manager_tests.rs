@@ -71,7 +71,7 @@ fn mk(id: &str) -> DaemonSpec {
     }
 }
 
-// create_unit: obligation 1 (create case) =============================================================================
+// create_unit: a create never clobbers ================================================================================
 
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn create_does_not_clobber_a_unit_that_appears_after_classification() {
@@ -103,7 +103,7 @@ fn create_does_not_clobber_a_unit_that_appears_after_classification() {
     );
 }
 
-// quarantine_if_still_ours: obligation 1 (update/stale case) ==========================================================
+// quarantine_if_still_ours: an update never clobbers ==================================================================
 
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn quarantine_detects_a_swap_that_happened_after_classification() {
@@ -166,7 +166,7 @@ fn quarantine_succeeds_when_nothing_raced() {
 /// would truncate-then-write even after `install` has already committed its own content, clobbering a
 /// legitimate `Create` result the racer arrived too late to actually contest — `create_new` only ever
 /// succeeds once, against whichever of the two genuinely got to the empty path first, which is the
-/// only interleaving obligation 1 is about.
+/// only interleaving a non-clobbering write is about.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn install_never_corrupts_state_when_something_races_the_first_create() {
     let id = test_id();
@@ -213,7 +213,7 @@ fn install_never_corrupts_state_when_something_races_the_first_create() {
     });
 }
 
-// ensure_dir: obligation 5 ============================================================================================
+// ensure_dir: parent directories ======================================================================================
 
 /// RAII cleanup for a directory tree.
 struct RmDir(PathBuf);
@@ -269,7 +269,7 @@ fn ensure_dir_refuses_a_preexisting_file() {
 
 // replace_unit_verified / quarantine_if_still_ours: the remaining race branches =======================================
 
-/// The one obligation-1 branch none of the other tests reach: a *third* file appearing at
+/// The one non-clobber branch none of the other tests reach: a *third* file appearing at
 /// `unit_path(id)` in the moment between `quarantine_if_still_ours` emptying it and
 /// `replace_unit_verified`'s own write claiming it. Real threads racing real filesystem calls, same
 /// join discipline as `install_never_corrupts_state_when_something_races_the_first_create`.
@@ -326,7 +326,7 @@ fn replace_reports_raced_twice_rather_than_guessing_which_file_wins() {
     });
 }
 
-/// `uninstall`'s own instance of obligation 1: the fragment can change between `flow::owned`'s read
+/// `uninstall`'s own instance of the non-clobber race: the fragment can change between `flow::owned`'s read
 /// and the removal, since two full `systemctl` round-trips run in between. Unlike the
 /// `install` paths, this needs no live daemon lifecycle, so it is exercised directly at the
 /// `quarantine_if_still_ours` level rather than through a real `stop`/`disable` cycle.

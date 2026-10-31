@@ -186,7 +186,7 @@ impl Backend for Systemd {
                 let read = discover::read_at(&id, &path);
                 (id, read)
             })
-            // Obligation 7 again: what occupies an id is not the fragment file, so an id whose
+            // Absence is about the id, not the fragment file: an id whose
             // *drop-in* could not be read is exactly as unclassified as one whose fragment could not
             // be — and `status` says so for both.
             .chain(host.dropin_only.into_iter().map(|id| {
@@ -228,7 +228,7 @@ impl Backend for Systemd {
 
         // Verified removal, mirroring `replace_unit_verified`: the gap since `flow::owned` read the
         // fragment spans two full `systemctl` round-trips, wide enough for something else to have
-        // replaced the fragment in the meantime (obligation 1's TOCTOU class again).
+        // replaced the fragment in the meantime (the same TOCTOU as `create_unit`'s).
         match quarantine_if_still_ours(id, &expected_text)? {
             Some(backup_path) => remove_file_if_present(&backup_path)?,
             None => {
@@ -359,8 +359,8 @@ fn stop_with(id: &Id, budget: Budget, steps: &VerbSteps<'_>) -> Result<()> {
 /// # Which ids those are
 ///
 /// The names `discover::read` and `discover::residue` treat as this id's artifact, in the same
-/// directories they read: `<id>.service` in [`UNIT_DIR`] alone, the only fragment path this backend ever reads or
-/// writes, and `<id>.service.d` under every root of [`DROPIN_SEARCH_DIRS`], since
+/// directories they read: `<id>.service` in [`UNIT_DIR`] alone, the only fragment path this backend
+/// ever reads or writes, and `<id>.service.d` under every root of [`DROPIN_SEARCH_DIRS`], since
 /// `discover::residue` counts one there as much as one in `/etc`.
 ///
 /// Reaching exactly as far as `residue` is the point. An id whose drop-in could not be read is
@@ -480,7 +480,7 @@ fn scan_unit_dir(dir: &Path) -> UnitScan {
 /// Windows account SID: `spec::resolve` only checks it for unemittable characters, never for
 /// platform applicability, so a manifest naming `user: {id: "S-1-5-..."}` would otherwise reach
 /// `generate::unit` and be written verbatim into `User=`, failing the unit at start with an opaque
-/// status — exactly what obligation 5 goes out of its way to avoid for directory permissions.
+/// status — exactly what `ensure_parent_dirs` goes out of its way to avoid for directory permissions.
 fn identity_for(user: &User) -> Result<Identity> {
     let name = match user {
         User::Root => "0".to_string(),
