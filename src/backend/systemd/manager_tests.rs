@@ -19,7 +19,6 @@ use super::dirs::ensure_dir;
 use super::discover::{RawState, raw_state};
 use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 use super::*;
-use crate::manager::ServiceManager;
 use crate::spec::{Kind, Restart};
 
 #[skuld::label]
@@ -80,7 +79,7 @@ fn create_does_not_clobber_a_unit_that_appears_after_classification() {
     let path = unit_path(&id);
     let _cleanup = Cleanup(path.clone());
 
-    // "Classification" (what `install`'s `discover` does) sees nothing here yet.
+    // "Classification" (what `install`'s `read` does) sees nothing here yet.
     assert!(matches!(raw_state(&id).expect("raw_state"), RawState::Absent));
 
     // Something else — a package postinst, or a concurrent invocation — drops a foreign unit into
@@ -189,7 +188,7 @@ fn install_never_corrupts_state_when_something_races_the_first_create() {
         });
 
         let mgr = Systemd::new();
-        let outcome = mgr.install(&spec, false);
+        let outcome = flow::install(&mgr, &spec, false);
         done.store(true, Ordering::Release);
         racer.join().expect("racer thread panicked");
 
@@ -371,9 +370,27 @@ fn a_unit_directory_that_cannot_be_opened_is_reported_not_propagated() {
     let scan = scan_unit_dir(&dir);
 
     assert!(scan.units.is_empty(), "nothing was enumerated: {scan:?}");
-    assert!(
-        matches!(&scan.incomplete, Some(Installed::Undetermined { name: None, .. })),
-        "{scan:?}"
+    match &scan.incomplete {
+        Some(Installed::Undetermined { name: None, reason }) => {
+            assert!(reason.contains("failed to read directory: "), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The text of a pass that stopped part-way, which `flow::scan` hands `scan_detail` as `enumerate`.
+/// Injected here because no real `readdir` fails on request.
+#[skuld::test]
+fn a_directory_entry_that_cannot_be_read_is_worded_as_such() {
+    let e = io::Error::other("injected mid-scan failure");
+
+    assert_eq!(
+        scan_detail("enumerate", &e),
+        "failed to read a directory entry: injected mid-scan failure"
+    );
+    assert_eq!(
+        scan_detail("open", &e),
+        "failed to read directory: injected mid-scan failure"
     );
 }
 
@@ -442,7 +459,7 @@ fn a_drop_in_name_that_is_not_a_directory_still_names_its_id() {
 fn prepared_steps_need_nothing_made_later() {
     let mgr = Systemd::new();
     for (steps, watched) in [(&[Step::Stop, Step::Start][..], 2), (&[Step::Install, Step::Start], 1)] {
-        let _prepared = ServiceManager::prepare(&mgr, steps, Budget::DEFAULT).expect("prepare");
+        let _prepared = mgr.prepare(steps, Budget::DEFAULT).expect("prepare");
         let _no_thread = bounded::test_hook::threads(0);
         let _no_file = bounded::test_hook::temp_files(0);
         for _ in 0..watched {
@@ -468,7 +485,7 @@ fn prepared_steps_need_nothing_made_later() {
     ];
     for (i, allowance) in shortfalls.into_iter().enumerate() {
         let _short = allowance();
-        let e = ServiceManager::prepare(&mgr, &[Step::Stop, Step::Start], Budget::DEFAULT).err();
+        let e = mgr.prepare(&[Step::Stop, Step::Start], Budget::DEFAULT).err();
         if i < 2 {
             let e = e.expect("threads short");
             assert!(e.to_string().contains("so none was sent"), "{e}");
@@ -486,7 +503,7 @@ fn a_budget_that_watches_nothing_prepares_nothing() {
     let _no_file = bounded::test_hook::temp_files(0);
     for budget in [Budget::Immediate, Budget::Unbounded] {
         assert!(
-            ServiceManager::prepare(&Systemd::new(), &[Step::Stop, Step::Start], budget).is_ok(),
+            Systemd::new().prepare(&[Step::Stop, Step::Start], budget).is_ok(),
             "{budget:?}"
         );
     }
@@ -503,7 +520,9 @@ fn prepared_steps_share_one_version_gate() {
     };
     for budget in [Budget::DEFAULT, Budget::Immediate, Budget::Unbounded] {
         asked.set(0);
-        let prepared = ServiceManager::prepare(&Systemd::new(), &[Step::Stop, Step::Start], budget).expect("prepare");
+        let prepared = Systemd::new()
+            .prepare(&[Step::Stop, Step::Start], budget)
+            .expect("prepare");
         systemctl::gated(count).unwrap();
         systemctl::gated(count).unwrap();
         assert_eq!(asked.get(), 1, "{budget:?}: the two legs asked twice");

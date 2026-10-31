@@ -1370,7 +1370,8 @@ fn status_does_not_call_an_id_with_a_stray_dropin_not_installed() {
 }
 
 /// The refusal for an id with no fragment names what is left, so the user has the paths to remove
-/// without hunting for them: the same text `install`'s refusal would need, now pinned for `status`.
+/// without hunting for them. (`install` over the same state is `decide`'s generic foreign refusal;
+/// only `status` and the other verbs carry this recovery.)
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn status_of_residue_names_the_leftover_paths() {
     let id = support::random_test_id();
@@ -1468,7 +1469,7 @@ fn status_reports_undetermined_for_a_dropin_directory_it_cannot_read() {
     );
 }
 
-/// The same absence path `status` takes above, reached through `discover` instead: with no fragment,
+/// The same absence path `status` takes above, reached through `diff` instead: with no fragment,
 /// `residue`'s drop-in scan is what would have answered "is anything at this id", and it did not
 /// complete. `4`, not the `1` `diff`'s catch-all `Err` arm gives: it was asked a question and could
 /// not determine the answer — the same reasoning that already puts `Outcome::RefuseUnreadable` at

@@ -358,7 +358,7 @@ fn stop_with(id: &Id, budget: Budget, steps: &VerbSteps<'_>) -> Result<()> {
 ///
 /// # Which ids those are
 ///
-/// The same two names `discover` calls this id's artifact, asked of the same directories `discover`
+/// The same two names [`discover`] calls this id's artifact, asked of the same directories it
 /// asks: `<id>.service` in [`UNIT_DIR`] alone, the only fragment path this backend ever reads or
 /// writes, and `<id>.service.d` under every root of [`DROPIN_SEARCH_DIRS`], since
 /// `discover::residue` counts one there as much as one in `/etc`.
@@ -447,7 +447,7 @@ fn scan_unit_dir(dir: &Path) -> UnitScan {
         &dir.display().to_string(),
         fs::read_dir(dir),
         |entries| Box::new(entries.map(|entry| entry.map(|entry| entry.path()))),
-        |op, e| format!("failed to {op} the directory: {e}"),
+        scan_detail,
         |path: PathBuf| {
             // Lossy: a non-UTF-8 unit name still has to be reported, and every read goes through
             // `path` itself rather than through this rendering of it.
@@ -468,6 +468,15 @@ fn scan_unit_dir(dir: &Path) -> UnitScan {
         units,
         dropins,
         incomplete,
+    }
+}
+
+/// What [`flow::scan`] reports of a unit directory it could not finish: `op` is `"open"` or
+/// `"enumerate"`.
+fn scan_detail(op: &'static str, e: &io::Error) -> String {
+    match op {
+        "open" => format!("failed to read directory: {e}"),
+        _ => format!("failed to read a directory entry: {e}"),
     }
 }
 
