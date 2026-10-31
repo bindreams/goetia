@@ -16,7 +16,9 @@ pub mod launchd;
 pub mod scm;
 pub mod systemd;
 
-pub(crate) use contract::{Backend, InstalledDefinition, ReadOutcome, Scan, WriteOutcome};
+pub(crate) use contract::{
+    Backend, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, WriteOutcome,
+};
 
 /// A platform account, already resolved from [`crate::spec::User`] by the
 /// effectful install path.

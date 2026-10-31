@@ -7,8 +7,7 @@
 
 use std::io;
 
-use crate::backend::{Backend, ReadOutcome, WriteOutcome};
-use crate::blob::Blob;
+use crate::backend::{Backend, InstalledService, ReadOutcome, WriteOutcome};
 use crate::decide::{self, ExternalConfig, Outcome, Ownership};
 use crate::error::{Error, Result};
 use crate::manager::{Installed, Status};
@@ -24,14 +23,15 @@ struct Found<S> {
 }
 
 /// Classify `read` as `decide` wants it. A foreign id is never compared.
-fn classify<B: Backend>(b: &B, id: &Id, read: ReadOutcome<B::Snapshot>) -> Found<B::Snapshot> {
+fn classify<B: Backend>(b: &B, read: ReadOutcome<B::Snapshot>) -> Found<B::Snapshot> {
     let (ownership, external, snapshot) = match read {
         ReadOutcome::Absent => (Ownership::Absent, ExternalConfig::Absent, None),
         ReadOutcome::Foreign { .. } => (Ownership::Foreign, ExternalConfig::Absent, None),
-        ReadOutcome::Marked { blob, snapshot } => {
-            let (ownership, external) = judge(b, id, blob, &snapshot);
+        ReadOutcome::Marked(snapshot) => {
+            let (ownership, external) = judge(b, &snapshot);
             (ownership, external, Some(snapshot))
         }
+        ReadOutcome::Misnamed { .. } => unreachable!("`read` is asked about an id, which is a valid name"),
     };
     Found {
         ownership,
@@ -40,12 +40,13 @@ fn classify<B: Backend>(b: &B, id: &Id, read: ReadOutcome<B::Snapshot>) -> Found
     }
 }
 
-/// A marked id's ownership: its embedded spec is rendered, and compared with what is installed.
-fn judge<B: Backend>(b: &B, id: &Id, blob: Result<Blob>, snapshot: &B::Snapshot) -> (Ownership, ExternalConfig) {
+/// A marked service's ownership: its embedded spec is rendered, and compared with what is installed.
+fn judge<B: Backend>(b: &B, snapshot: &B::Snapshot) -> (Ownership, ExternalConfig) {
+    let id = snapshot.id();
     let unreadable = |reason, recovery| (Ownership::OursUnreadable { reason, recovery }, ExternalConfig::Absent);
     let uninstall_advice = || Some(decide::unreadable_recovery(id.as_str()));
 
-    let blob = match blob {
+    let blob = match snapshot.blob() {
         Ok(blob) => blob,
         Err(e) => return unreadable(e.to_string(), uninstall_advice()),
     };
@@ -55,12 +56,12 @@ fn judge<B: Backend>(b: &B, id: &Id, blob: Result<Blob>, snapshot: &B::Snapshot)
             return unreadable(format!("cannot regenerate the embedded spec: {e}"), uninstall_advice());
         }
     };
-    match b.installed(id, snapshot) {
+    match b.installed(snapshot) {
         // No goetia action unblocks a comparison that could not be read.
         Err(e) => unreadable(e.to_string(), None),
         Ok(on_disk) => (
             Ownership::Ours {
-                blob,
+                blob: blob.clone(),
                 regenerated,
                 on_disk: on_disk.definition.to_string(),
             },
@@ -69,8 +70,8 @@ fn judge<B: Backend>(b: &B, id: &Id, blob: Result<Blob>, snapshot: &B::Snapshot)
     }
 }
 
-/// The marked id's blob and snapshot, or the error an id that is not marked means.
-pub(crate) fn require_marked<S>(id: &Id, read: ReadOutcome<S>) -> Result<(Result<Blob>, S)> {
+/// The marked id's snapshot, or the error an id that is not marked means.
+pub(crate) fn require_marked<S>(id: &Id, read: ReadOutcome<S>) -> Result<S> {
     match read {
         ReadOutcome::Absent => Err(Error::NotInstalled {
             id: id.as_str().to_string(),
@@ -79,15 +80,19 @@ pub(crate) fn require_marked<S>(id: &Id, read: ReadOutcome<S>) -> Result<(Result
             id: id.as_str().to_string(),
             recovery: recovery.unwrap_or_else(|| decide::foreign_recovery(id.as_str())),
         }),
-        ReadOutcome::Marked { blob, snapshot } => Ok((blob, snapshot)),
+        ReadOutcome::Marked(snapshot) => Ok(snapshot),
+        // `id` is a valid name, so a read of it never says otherwise.
+        ReadOutcome::Misnamed { name, .. } => Err(name),
     }
 }
 
 /// The ownership gate of every verb but `install`: the id's snapshot if goetia's marker is on it,
 /// otherwise the error that says why not. A blob that will not decode still passes: the marker
-/// alone is proof of ownership, and `uninstall` is the way out of an unreadable one.
+/// alone is proof of ownership, and `uninstall` is the way out of an unreadable one. The blanket
+/// [`ServiceManager`](crate::manager::ServiceManager) impl is the only caller, so a verb that
+/// takes a snapshot has been gated.
 pub(crate) fn owned<B: Backend>(b: &B, id: &Id) -> Result<B::Snapshot> {
-    require_marked(id, b.read(id)?).map(|(_, snapshot)| snapshot)
+    require_marked(id, b.read(id)?)
 }
 
 // install and preview =================================================================================================
@@ -99,7 +104,7 @@ pub(crate) fn install<B: Backend>(b: &B, spec: &DaemonSpec, force: bool) -> Resu
 
     // No cap: `Raced` is a state change the backend detected, not a wait for time to pass.
     loop {
-        let found = classify(b, &spec.id, b.read(&spec.id)?);
+        let found = classify(b, b.read(&spec.id)?);
         let outcome = decide::decide(
             &found.ownership,
             &desired_text,
@@ -127,7 +132,7 @@ pub(crate) fn install<B: Backend>(b: &B, spec: &DaemonSpec, force: bool) -> Resu
 /// to let a user decide about.
 pub(crate) fn preview<B: Backend>(b: &B, spec: &DaemonSpec) -> Result<Outcome> {
     let desired = b.render(spec)?.to_string();
-    let found = classify(b, &spec.id, b.read(&spec.id)?);
+    let found = classify(b, b.read(&spec.id)?);
     Ok(decide::decide(
         &found.ownership,
         &desired,
@@ -141,20 +146,23 @@ pub(crate) fn preview<B: Backend>(b: &B, spec: &DaemonSpec) -> Result<Outcome> {
 // status and list =====================================================================================================
 
 pub(crate) fn status<B: Backend>(b: &B, id: &Id) -> Result<Status> {
-    let (blob, snapshot) = require_marked(id, b.read(id)?)?;
-    let blob = blob?;
+    let snapshot = owned(b, id)?;
+    let blob = snapshot.blob().map_err(|e| Error::Other(e.to_string()))?;
     b.render(&blob.spec)
         .map_err(|e| Error::Other(format!("`{id}`'s embedded spec cannot be regenerated: {e}")))?;
-    b.live_status(id, &snapshot)
+    b.live_status(&snapshot)
 }
 
 pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
     let scan = b.scan();
     let mut out = Vec::new();
     for (name, read) in scan.entries {
-        let (blob, snapshot) = match read {
+        // A name that is no id has no snapshot to ask for its live state, which is reported after
+        // the checks any marked entry gets.
+        let (blob, snapshot) = match &read {
             ReadOutcome::Absent | ReadOutcome::Foreign { .. } => continue,
-            ReadOutcome::Marked { blob, snapshot } => (blob, snapshot),
+            ReadOutcome::Marked(snapshot) => (snapshot.blob(), Ok(snapshot)),
+            ReadOutcome::Misnamed { blob, name } => (blob.as_ref(), Err(name)),
         };
         let unreadable = |reason: String| Installed::OursUnreadable {
             name: name.clone(),
@@ -175,8 +183,8 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
         }
         // One entry's failure must not take down the listing of every other daemon, except that
         // no manager to ask is every entry's.
-        let id = match Id::try_from(name.as_str()) {
-            Ok(id) => id,
+        let snapshot = match snapshot {
+            Ok(snapshot) => snapshot,
             Err(e) => {
                 out.push(unreadable(format!(
                     "marked ours, but its name is not a valid daemon id: {e}"
@@ -184,9 +192,9 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
                 continue;
             }
         };
-        match b.live_status(&id, &snapshot) {
+        match b.live_status(snapshot) {
             Ok(status) => out.push(Installed::Ours {
-                spec: blob.spec,
+                spec: blob.spec.clone(),
                 state: status.state,
                 pid: status.pid,
                 enabled: status.enabled,

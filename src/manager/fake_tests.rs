@@ -715,13 +715,15 @@ fn kill_of_an_absent_id_is_not_installed() {
 }
 
 #[skuld::test]
-fn kill_is_recorded_as_asked_even_when_it_fails() {
+fn kill_is_recorded_once_gated_even_when_it_fails() {
     let fake = Fake::new();
-    let id = Id::try_from("ghost").unwrap();
+    let spec = mk("idle");
+    fake.install(&spec, false).unwrap();
 
-    let _ = fake.kill(&id);
+    let result = fake.kill(&spec.id);
 
-    assert_eq!(fake.calls(), [("kill", "ghost".to_string())]);
+    assert!(matches!(result, Err(Error::NotRunning { .. })), "{result:?}");
+    assert_eq!(fake.calls(), [("kill", "idle".to_string())]);
 }
 
 #[skuld::test]

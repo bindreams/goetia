@@ -36,9 +36,11 @@ use nix::fcntl::{OFlag, openat};
 use nix::sys::stat::Mode;
 
 use crate::backend::systemd::generate;
-use crate::backend::{InstalledDefinition, ReadOutcome};
+use crate::backend::{InstalledDefinition, InstalledService, ReadOutcome};
+use crate::blob::Blob;
 use crate::decide::ExternalConfig;
 use crate::error::{Error, Result};
+use crate::spec::Id;
 
 use super::{UNIT_DIR, io_err, unit_path};
 
@@ -300,44 +302,64 @@ pub(super) fn raw_state(id: &str) -> Result<RawState> {
 
 // read / installed ====================================================================================================
 
-/// What `raw` says about `id`: a marked fragment is [`ReadOutcome::Marked`] with its text as the
-/// snapshot, and a missing one is asked what else occupies the id ([`fragmentless`]).
-fn classified(id: &str, raw: RawState) -> ReadResult<ReadOutcome<String>> {
+/// A marked unit fragment, as `read` saw it. Its text is the identity a later write or removal
+/// verifies the fragment against (see `super::write::replace_unit_verified` and
+/// `super::write::quarantine_if_still_ours`): content, not inode, since the kernel can reuse an
+/// inode number moments after its file is unlinked.
+pub(crate) struct Fragment {
+    id: Id,
+    blob: Result<Blob>,
+    text: String,
+}
+
+impl Fragment {
+    pub(super) fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+impl InstalledService for Fragment {
+    fn id(&self) -> &Id {
+        &self.id
+    }
+
+    fn blob(&self) -> std::result::Result<&Blob, &Error> {
+        self.blob.as_ref()
+    }
+}
+
+/// What `raw` says about `id`: a marked fragment is [`ReadOutcome::Marked`] as a [`Fragment`], and a
+/// missing one is asked what else occupies the id ([`fragmentless`]).
+fn classified(id: &str, raw: RawState) -> ReadResult<ReadOutcome<Fragment>> {
     Ok(match raw {
         RawState::Absent => return fragmentless(id),
         RawState::NotOurs => ReadOutcome::Foreign { recovery: None },
-        RawState::Regular(text) => match generate::extract(&text) {
-            Ok(None) => ReadOutcome::Foreign { recovery: None },
-            Ok(Some(blob)) => ReadOutcome::Marked {
-                blob: Ok(blob),
-                snapshot: text,
-            },
-            Err(e) => ReadOutcome::Marked {
-                blob: Err(e),
-                snapshot: text,
-            },
-        },
+        RawState::Regular(text) => {
+            let blob = match generate::extract(&text) {
+                Ok(None) => return Ok(ReadOutcome::Foreign { recovery: None }),
+                Ok(Some(blob)) => Ok(blob),
+                Err(e) => Err(e),
+            };
+            ReadOutcome::marked(id, blob, |id, blob| Fragment { id, blob, text })
+        }
     })
 }
 
-/// What `Backend::read` answers for `id`. The fragment's own text is the snapshot: content, not
-/// inode, is the identity a later write or removal verifies against (see
-/// `super::write::quarantine_if_still_ours`), since the kernel can reuse an inode number moments
-/// after its file is unlinked.
-pub(super) fn read(id: &str) -> Result<ReadOutcome<String>> {
+/// What `Backend::read` answers for `id`.
+pub(super) fn read(id: &str) -> Result<ReadOutcome<Fragment>> {
     classified(id, raw_state(id)?).map_err(|failure| failure.undetermined(id))
 }
 
 /// [`read`] for a fragment `Systemd::scan` found at `path`. The failure stays a [`ReadFailure`]: the
 /// scan reports it by name, where `read` makes it an [`Error::Undetermined`].
-pub(super) fn read_at(id: &str, path: &Path) -> ReadResult<ReadOutcome<String>> {
+pub(super) fn read_at(id: &str, path: &Path) -> ReadResult<ReadOutcome<Fragment>> {
     classify_and_read(path).and_then(|raw| classified(id, raw))
 }
 
 /// `id` read with no fragment of its own: absent when nothing occupies it, foreign when a drop-in or
 /// an enablement link does. Such an id is never silently adopted as `Create`, or the resulting unit
 /// would inherit overrides and boot-enrollment goetia never wrote and cannot show.
-pub(super) fn fragmentless(id: &str) -> ReadResult<ReadOutcome<String>> {
+pub(super) fn fragmentless(id: &str) -> ReadResult<ReadOutcome<Fragment>> {
     Ok(match residue(id)? {
         None => ReadOutcome::Absent,
         Some(residue) => ReadOutcome::Foreign {

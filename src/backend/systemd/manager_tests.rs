@@ -7,9 +7,7 @@
 //! Most of these are elevated (they write real files under `/etc/systemd/system`), so they opt into
 //! the same `elevated` precondition/label convention `tests/support/mod.rs` uses, duplicated locally
 //! rather than shared: a plain library unit test cannot depend on the `tests/` integration-test
-//! support crate. The two deadline-ordering tests (`start_derives_its_deadline_before_owned_runs`
-//! and its `stop_` mirror) are the exception: they drive only the `VerbSteps` seam, touch nothing on
-//! disk, and run unelevated.
+//! support crate.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
@@ -326,8 +324,7 @@ fn replace_reports_raced_twice_rather_than_guessing_which_file_wins() {
     });
 }
 
-/// `uninstall`'s own instance of the non-clobber race: the fragment can change between `flow::owned`'s read
-/// and the removal, since two full `systemctl` round-trips run in between. Unlike the
+/// `uninstall`'s own instance of the non-clobber race: the fragment can change between `read` and the removal, since two full `systemctl` round-trips run in between. Unlike the
 /// `install` paths, this needs no live daemon lifecycle, so it is exercised directly at the
 /// `quarantine_if_still_ours` level rather than through a real `stop`/`disable` cycle.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
@@ -336,10 +333,10 @@ fn quarantine_used_by_uninstall_reports_a_race_instead_of_removing_the_wrong_fil
     let path = unit_path(&id);
     let _cleanup = Cleanup(path.clone());
 
-    let classified_text = "[Unit]\nDescription=goetia, as flow::owned saw it\n";
+    let classified_text = "[Unit]\nDescription=goetia, as read saw it\n";
     std::fs::write(&path, classified_text).expect("write");
 
-    // Something changes the fragment after `flow::owned` would have read it, before
+    // Something changes the fragment after `read` saw it, before
     // `uninstall` reaches its own `quarantine_if_still_ours` call.
     let changed_text = "[Unit]\nDescription=changed after classification\n";
     std::fs::write(&path, changed_text).expect("overwrite");
@@ -430,11 +427,8 @@ fn a_drop_in_name_that_is_not_a_directory_still_names_its_id() {
     assert_eq!(scan.dropins, ["blocked"], "{scan:?}");
 }
 
-// start/stop: the deadline comes first ================================================================================
+// prepare =============================================================================================================
 
-/// The steps `verb` took, in order, with every step a recording fake — so, unlike the rest of this
-/// file, no elevation and no real systemd. The step that talks to systemd also checks that it was
-/// handed the deadline `start_clock` derived, not one of its own.
 /// Under a bounded budget `restart`'s legs, and `install --start`'s start, each run one watched
 /// `systemctl`, and `prepare` makes what every one of them needs before either sends anything: once
 /// it succeeded, no leg can fail for want of a thread or a file. It fails as a whole when one is
@@ -514,48 +508,4 @@ fn prepared_steps_share_one_version_gate() {
         systemctl::gated(count).unwrap();
         assert_eq!(asked.get(), 2, "{budget:?}: the answer outlived the preparation");
     }
-}
-
-fn steps_taken(verb: fn(&Id, Budget, &VerbSteps<'_>) -> Result<()>) -> Vec<&'static str> {
-    let log = std::cell::RefCell::new(Vec::new());
-    let derived = std::cell::Cell::new(None);
-    let act = |step: &'static str, deadline: Deadline| {
-        log.borrow_mut().push(step);
-        assert_eq!(
-            Some(deadline),
-            derived.get(),
-            "{step} must run under the deadline derived at entry"
-        );
-        Ok(())
-    };
-    let steps = VerbSteps {
-        start_clock: &|budget| {
-            log.borrow_mut().push("start_clock");
-            let deadline = budget.start();
-            derived.set(Some(deadline));
-            deadline
-        },
-        owned: &|_| {
-            log.borrow_mut().push("owned");
-            Ok(String::new())
-        },
-        start: &|_, _, deadline| act("start", deadline),
-        stop: &|_, _, deadline| act("stop", deadline),
-    };
-    verb(&Id::try_from("x").expect("valid id"), Budget::DEFAULT, &steps).expect("every step succeeds");
-    log.into_inner()
-}
-
-/// `--timeout` counts from verb entry only if the deadline exists before the ownership read runs.
-/// Derived after it, the read runs outside the budget and nothing else observable changes, which is
-/// why the order is pinned here rather than left to the elevated suite. What the read spends never
-/// keeps the request from systemd — see `systemctl::run_verb`.
-#[skuld::test]
-fn start_derives_its_deadline_before_owned_runs() {
-    assert_eq!(steps_taken(start_with), ["start_clock", "owned", "start"]);
-}
-
-#[skuld::test]
-fn stop_derives_its_deadline_before_owned_runs() {
-    assert_eq!(steps_taken(stop_with), ["start_clock", "owned", "stop"]);
 }

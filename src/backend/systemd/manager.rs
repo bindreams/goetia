@@ -72,7 +72,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use discover::DROPIN_SEARCH_DIRS;
+use discover::{DROPIN_SEARCH_DIRS, Fragment};
 use systemctl::{
     GateScope, daemon_reload, daemon_reload_or_report, disable_impl, enable_impl, gate_scope, kill_impl,
     request_restart_impl, require_supported, start_impl, status_from_unit, stop_impl,
@@ -80,10 +80,11 @@ use systemctl::{
 use write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 
 use crate::backend::systemd::generate;
-use crate::backend::{Backend, Identity, InstalledDefinition, ReadOutcome, Scan, WriteOutcome, bounded};
+use crate::backend::{
+    Backend, Identity, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, WriteOutcome, bounded,
+};
 use crate::decide::Outcome;
 use crate::error::{Error, Result};
-use crate::manager::budget::Deadline;
 use crate::manager::{Budget, Installed, Prepared, Status, Step, flow};
 use crate::spec::{AccountId, DaemonSpec, Id, User};
 
@@ -107,9 +108,7 @@ impl Systemd {
 
 impl Backend for Systemd {
     type Definition = String;
-    /// The fragment's own text, which `replace_unit_verified` and `quarantine_if_still_ours` verify
-    /// the fragment against before they touch it.
-    type Snapshot = String;
+    type Snapshot = Fragment;
     type InstallScope = GateScope;
 
     /// Before anything is read or written: the gate is where no manager to ask refuses too. Its
@@ -124,12 +123,12 @@ impl Backend for Systemd {
         Ok(generate::unit(spec, &identity_for(&spec.user)?))
     }
 
-    fn read(&self, id: &Id) -> Result<ReadOutcome<String>> {
+    fn read(&self, id: &Id) -> Result<ReadOutcome<Fragment>> {
         discover::read(id.as_str())
     }
 
-    fn installed(&self, id: &Id, snapshot: &String) -> Result<InstalledDefinition<String>> {
-        discover::installed(id.as_str(), snapshot)
+    fn installed(&self, snapshot: &Fragment) -> Result<InstalledDefinition<String>> {
+        discover::installed(snapshot.id().as_str(), snapshot.text())
     }
 
     fn write(
@@ -137,7 +136,7 @@ impl Backend for Systemd {
         spec: &DaemonSpec,
         definition: &String,
         outcome: &Outcome,
-        snapshot: Option<&String>,
+        snapshot: Option<&Fragment>,
         _scope: &mut GateScope,
     ) -> Result<WriteOutcome> {
         let id = spec.id.as_str();
@@ -151,8 +150,8 @@ impl Backend for Systemd {
                 CreateOutcome::Raced => Ok(WriteOutcome::Raced),
             },
             Outcome::Update { .. } | Outcome::Stale { .. } => {
-                let expected_text = snapshot.expect("an id `decide` chose to update was read as marked");
-                match replace_unit_verified(id, definition, expected_text)? {
+                let expected = snapshot.expect("an id `decide` chose to update was read as marked");
+                match replace_unit_verified(id, definition, expected.text())? {
                     ReplaceOutcome::Replaced => {
                         // Only after the write has actually committed: clearing the drop-in
                         // first (before the write) would delete an admin's overrides even on a
@@ -170,14 +169,14 @@ impl Backend for Systemd {
         }
     }
 
-    fn live_status(&self, id: &Id, _snapshot: &String) -> Result<Status> {
-        status_from_unit(&unit_name(id.as_str()))
+    fn live_status(&self, snapshot: &Fragment) -> Result<Status> {
+        status_from_unit(&unit_name(snapshot.id().as_str()))
     }
 
     /// Each id the unit directories name, read as `read` would. An id whose read did not complete
     /// establishes nothing about it — least of all that it is absent, which is what omitting it from
     /// the enumeration would say — so it is reported by name instead.
-    fn scan(&self) -> Scan<String> {
+    fn scan(&self) -> Scan<Fragment> {
         let host = scan_host();
         let reads = host
             .units
@@ -211,9 +210,8 @@ impl Backend for Systemd {
         Scan { entries, reported }
     }
 
-    fn uninstall(&self, id: &Id) -> Result<()> {
-        let expected_text = flow::owned(self, id)?;
-        let id = id.as_str();
+    fn uninstall(&self, snapshot: Fragment) -> Result<()> {
+        let id = snapshot.id().as_str();
         // One version gate for the stop, the `disable` and the `daemon-reload`: the stop's.
         let _gate = gate_scope();
 
@@ -226,10 +224,10 @@ impl Backend for Systemd {
 
         disable_impl(id)?;
 
-        // Verified removal, mirroring `replace_unit_verified`: the gap since `flow::owned` read the
+        // Verified removal, mirroring `replace_unit_verified`: the gap since `read` saw the
         // fragment spans two full `systemctl` round-trips, wide enough for something else to have
         // replaced the fragment in the meantime (the same TOCTOU as `create_unit`'s).
-        match quarantine_if_still_ours(id, &expected_text)? {
+        match quarantine_if_still_ours(id, snapshot.text())? {
             Some(backup_path) => remove_file_if_present(&backup_path)?,
             None => {
                 return Err(Error::Other(format!(
@@ -256,18 +254,19 @@ impl Backend for Systemd {
         }
     }
 
-    fn enable(&self, id: &Id) -> Result<()> {
-        flow::owned(self, id)?;
-        enable_impl(id.as_str())
+    fn enable(&self, snapshot: Fragment) -> Result<()> {
+        enable_impl(snapshot.id().as_str())
     }
 
-    fn disable(&self, id: &Id) -> Result<()> {
-        flow::owned(self, id)?;
-        disable_impl(id.as_str())
+    fn disable(&self, snapshot: Fragment) -> Result<()> {
+        disable_impl(snapshot.id().as_str())
     }
 
-    fn start(&self, id: &Id, budget: Budget) -> Result<()> {
-        start_with(id, budget, &REAL_STEPS)
+    fn start(&self, snapshot: Fragment, budget: Budget) -> Result<()> {
+        // Derived at verb entry. It bounds only the wait for the job, never whether the job is
+        // enqueued — see `run_verb`.
+        let deadline = budget.start();
+        start_impl(snapshot.id().as_str(), budget, deadline)
     }
 
     /// Makes ready now what each start or stop in `steps` needs to watch its one `systemctl` under
@@ -296,59 +295,26 @@ impl Backend for Systemd {
     /// the stop. systemd stops the unit and starts it again, or, while it is
     /// still activating, folds the restart into the start already running —
     /// see `request_restart_impl`.
-    fn request_restart(&self, id: &Id) -> Option<Result<()>> {
-        Some(flow::owned(self, id).and_then(|_| request_restart_impl(id.as_str())))
+    fn request_restart(&self) -> Option<NativeRestart<Self>> {
+        Some(|_, snapshot| request_restart_impl(snapshot.id().as_str()))
     }
 
     /// The plain request-only start. `restart` never issues it here — see
     /// [`Self::request_restart`] — since after a stop nobody waited for, it
     /// replaces a stop job systemd has not yet run.
-    fn request_start_after_stop(&self, id: &Id) -> Result<()> {
-        start_with(id, Budget::Immediate, &REAL_STEPS)
+    fn request_start_after_stop(&self, snapshot: Fragment) -> Result<()> {
+        Backend::start(self, snapshot, Budget::Immediate)
     }
 
-    fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
-        stop_with(id, budget, &REAL_STEPS)
+    fn stop(&self, snapshot: Fragment, budget: Budget) -> Result<()> {
+        // Derived at verb entry, as for `start`.
+        let deadline = budget.start();
+        stop_impl(snapshot.id().as_str(), budget, deadline)
     }
 
-    fn kill(&self, id: &Id) -> Result<()> {
-        flow::owned(self, id)?;
-        kill_impl(id.as_str())
+    fn kill(&self, snapshot: Fragment) -> Result<()> {
+        kill_impl(snapshot.id().as_str())
     }
-}
-
-// start/stop ==========================================================================================================
-
-/// The steps `start`/`stop` take, behind a seam so their ORDER is assertable without a real systemd
-/// — the precedent is `cli::restart`'s `start_clock`. `manager_tests.rs` pins it.
-struct VerbSteps<'a> {
-    start_clock: &'a dyn Fn(Budget) -> Deadline,
-    owned: &'a dyn Fn(&Id) -> Result<String>,
-    start: &'a dyn Fn(&str, Budget, Deadline) -> Result<()>,
-    stop: &'a dyn Fn(&str, Budget, Deadline) -> Result<()>,
-}
-
-const REAL_STEPS: VerbSteps<'static> = VerbSteps {
-    start_clock: &Budget::start,
-    owned: &|id: &Id| flow::owned(&Systemd, id),
-    start: &start_impl,
-    stop: &stop_impl,
-};
-
-fn start_with(id: &Id, budget: Budget, steps: &VerbSteps<'_>) -> Result<()> {
-    // Derived at verb entry, so discovery spends the budget too. It bounds only the wait for the job,
-    // never whether the job is enqueued — see `run_verb`.
-    let deadline = (steps.start_clock)(budget);
-    (steps.owned)(id)?;
-    (steps.start)(id.as_str(), budget, deadline)
-}
-
-fn stop_with(id: &Id, budget: Budget, steps: &VerbSteps<'_>) -> Result<()> {
-    // Derived at verb entry, so discovery spends the budget too. It bounds only the wait for the job,
-    // never whether the job is enqueued — see `run_verb`.
-    let deadline = (steps.start_clock)(budget);
-    (steps.owned)(id)?;
-    (steps.stop)(id.as_str(), budget, deadline)
 }
 
 // Enumeration =========================================================================================================

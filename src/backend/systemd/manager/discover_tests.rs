@@ -483,12 +483,19 @@ fn a_read_fragment_is_foreign_unless_it_carries_the_marker() {
     assert!(matches!(not_ours, ReadOutcome::Foreign { recovery: None }));
 
     match classified("x", RawState::Regular(text.clone())).expect("classify") {
-        ReadOutcome::Marked { blob: Ok(_), snapshot } => assert_eq!(snapshot, text),
+        ReadOutcome::Marked(fragment) => {
+            assert!(fragment.blob().is_ok());
+            assert_eq!(fragment.id().as_str(), "x");
+            assert_eq!(fragment.text(), text);
+        }
         _ => panic!("a fragment goetia wrote is marked, with its own text as the snapshot"),
     }
 
     match classified("x", RawState::Regular(corrupt.to_string())).expect("classify") {
-        ReadOutcome::Marked { blob: Err(_), snapshot } => assert_eq!(snapshot, corrupt),
+        ReadOutcome::Marked(fragment) => {
+            assert!(fragment.blob().is_err());
+            assert_eq!(fragment.text(), corrupt);
+        }
         _ => panic!("a marker that will not decode is still goetia's"),
     }
 }

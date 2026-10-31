@@ -109,12 +109,12 @@ use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use super::wait::Waited;
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
-use crate::backend::{Backend, InstalledDefinition, ReadOutcome, Scan, WriteOutcome};
+use crate::backend::{Backend, InstalledDefinition, InstalledService, ReadOutcome, Scan, WriteOutcome};
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Result};
 use crate::manager::budget;
-use crate::manager::{Budget, Installed, State, Status, flow};
+use crate::manager::{Budget, Installed, State, Status};
 use crate::spec::{DaemonSpec, Id, Kind};
 
 // ScmManager ==========================================================================================================
@@ -131,8 +131,10 @@ impl ScmManager {
     }
 }
 
-/// What `read` saw of a service.
+/// What `read` saw of a service goetia marked.
 pub(crate) struct ScmSnapshot {
+    id: Id,
+    blob: Result<Blob>,
     /// Its `Parameters` values, which hold the only proof of ownership `type: managed` has.
     parameters: BTreeMap<String, String>,
     /// The object `read` opened to classify it, so `installed` and `live_status` ask that object:
@@ -141,25 +143,29 @@ pub(crate) struct ScmSnapshot {
     service: Option<Service>,
 }
 
+impl InstalledService for ScmSnapshot {
+    fn id(&self) -> &Id {
+        &self.id
+    }
+
+    fn blob(&self) -> std::result::Result<&Blob, &Error> {
+        self.blob.as_ref()
+    }
+}
+
 impl ScmSnapshot {
     /// Runs `ask` on the service `read` opened, or on one opened by name with `access` where the
     /// snapshot holds none; a service gone by then is [`Error::NotInstalled`].
-    fn ask<T>(
-        &self,
-        id: &Id,
-        access: ServiceAccess,
-        context: &str,
-        ask: impl FnOnce(&Service) -> Result<T>,
-    ) -> Result<T> {
+    fn ask<T>(&self, access: ServiceAccess, context: &str, ask: impl FnOnce(&Service) -> Result<T>) -> Result<T> {
         match &self.service {
             Some(service) => ask(service),
             None => {
                 let service = open_scm(ServiceManagerAccess::CONNECT)?
-                    .open_service(id.as_str(), access)
+                    .open_service(self.id.as_str(), access)
                     .map_err(|e| {
                         if is_not_found(&e) || is_marked_for_delete(&e) {
                             Error::NotInstalled {
-                                id: id.as_str().to_string(),
+                                id: self.id.as_str().to_string(),
                             }
                         } else {
                             to_error(context, e)
@@ -168,6 +174,12 @@ impl ScmSnapshot {
                 ask(&service)
             }
         }
+    }
+
+    /// The id, with the service `read` opened closed: a verb that deletes the service, or waits on
+    /// it through a handle of its own, must not leave this one open.
+    fn into_id(self) -> Id {
+        self.id
     }
 }
 
@@ -195,13 +207,18 @@ impl Backend for ScmManager {
             Err(e) if is_not_found(&e) => return Ok(ReadOutcome::Absent),
             Err(e) => return Err(service_undetermined(id.as_str(), &format!("open service `{id}`"), &e)),
         };
-        Ok(read_marker(registry::read_parameters(id.as_str())?, Some(service)))
+        Ok(read_marker(
+            id.as_str(),
+            registry::read_parameters(id.as_str())?,
+            Some(service),
+        ))
     }
 
     /// SCM has no drop-in mechanism: everything goetia writes lives under the service's own key.
-    fn installed(&self, id: &Id, snapshot: &ScmSnapshot) -> Result<InstalledDefinition<ScmRegistration>> {
+    fn installed(&self, snapshot: &ScmSnapshot) -> Result<InstalledDefinition<ScmRegistration>> {
+        let id = snapshot.id();
         let context = format!("open `{id}` to read its configuration");
-        let (definition, _) = snapshot.ask(id, ServiceAccess::QUERY_CONFIG, &context, |service| {
+        let (definition, _) = snapshot.ask(ServiceAccess::QUERY_CONFIG, &context, |service| {
             read_live_registration(service, id.as_str(), &snapshot.parameters)
         })?;
         Ok(InstalledDefinition {
@@ -222,10 +239,10 @@ impl Backend for ScmManager {
         Ok(WriteOutcome::Done)
     }
 
-    fn live_status(&self, id: &Id, snapshot: &ScmSnapshot) -> Result<Status> {
+    fn live_status(&self, snapshot: &ScmSnapshot) -> Result<Status> {
+        let id = snapshot.id();
         let context = format!("open `{id}` to query its live status");
         let (state, pid, enabled) = snapshot.ask(
-            id,
             ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG,
             &context,
             |service| query_live(service, id.as_str()),
@@ -248,7 +265,10 @@ impl Backend for ScmManager {
             // `unreadable_aggregate`, which names the id, the failure and its remedy when it turns
             // out to be the only one.
             match registry::read_parameters(&name) {
-                Ok(params) => entries.push((name, read_marker(params, None))),
+                Ok(params) => {
+                    let read = read_marker(&name, params, None);
+                    entries.push((name, read));
+                }
                 Err(e) => unreadable.push(unreadable_parts(name, e)),
             }
         });
@@ -261,34 +281,32 @@ impl Backend for ScmManager {
         }
     }
 
-    fn uninstall(&self, id: &Id) -> Result<()> {
-        let (scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
-        flow::owned(self, id)?;
+    fn uninstall(&self, snapshot: ScmSnapshot) -> Result<()> {
         // `uninstall_locked` opens its own handles, and its delete needs this one closed: an open
         // handle leaves the service only marked for deletion.
-        drop(service);
-        uninstall_locked(&scm, id)
+        let id = snapshot.into_id();
+        let scm = open_scm_to_classify(id.as_str())?;
+        uninstall_locked(&scm, &id)
     }
 
-    fn enable(&self, id: &Id) -> Result<()> {
+    fn enable(&self, snapshot: ScmSnapshot) -> Result<()> {
+        let id = snapshot.id();
         let (_scm, service) = open_existing(id, ServiceAccess::CHANGE_CONFIG)?;
-        flow::owned(self, id)?;
         set_start_type(&service, ServiceStartType::AutoStart).map_err(|e| Error::Other(format!("enable `{id}`: {e}")))
     }
 
-    fn disable(&self, id: &Id) -> Result<()> {
+    fn disable(&self, snapshot: ScmSnapshot) -> Result<()> {
+        let id = snapshot.id();
         let (_scm, service) = open_existing(id, ServiceAccess::CHANGE_CONFIG)?;
-        flow::owned(self, id)?;
         set_start_type(&service, ServiceStartType::OnDemand).map_err(|e| Error::Other(format!("disable `{id}`: {e}")))
     }
 
-    fn start(&self, id: &Id, budget: Budget) -> Result<()> {
-        // First, so discovery spends the budget too. What it bounds is the
-        // wait: `start_via_notify` issues the start whatever is left of it.
+    fn start(&self, snapshot: ScmSnapshot, budget: Budget) -> Result<()> {
+        // First, so the wait is counted from the verb's entry. What it bounds is the wait:
+        // `start_via_notify` issues the start whatever is left of it.
         let deadline = budget.start();
-        let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
-        flow::owned(self, id)?;
-        drop(service);
+        let (kind, unreadable) = start_kind(snapshot.blob());
+        let id = snapshot.into_id();
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to start it: {e}")))?;
         if !budget.waits() {
@@ -297,9 +315,8 @@ impl Backend for ScmManager {
             // more, per the trait doc comment.
             return super::wait::request_start(&mut actor).map_err(|e| Error::Other(format!("start `{id}`: {e}")));
         }
-        let (kind, unreadable) = installed_kind(id);
         let waited = super::wait::start_via_notify(&mut actor, deadline, kind)
-            .map_err(|e| failed_start(id, &e, unreadable.as_deref()))?;
+            .map_err(|e| failed_start(&id, &e, unreadable.as_deref()))?;
         match waited {
             Waited::Confirmed => Ok(()),
             Waited::Expired => Err(budget::timed_out(id.as_str(), "running", budget)),
@@ -309,22 +326,18 @@ impl Backend for ScmManager {
     /// [`super::wait::request_start_after_stop`]: every
     /// `ERROR_SERVICE_ALREADY_RUNNING` is a refusal here, since a `type:
     /// simple` service reads `RUNNING` until its shim has taken the stop.
-    fn request_start_after_stop(&self, id: &Id) -> Result<()> {
-        let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
-        flow::owned(self, id)?;
-        drop(service);
+    fn request_start_after_stop(&self, snapshot: ScmSnapshot) -> Result<()> {
+        let id = snapshot.into_id();
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to start it: {e}")))?;
         super::wait::request_start_after_stop(&mut actor).map_err(|e| Error::Other(format!("start `{id}`: {e}")))
     }
 
-    fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
-        // First, so discovery spends the budget too; `stop_via_notify` issues
-        // the stop whatever is left of it.
+    fn stop(&self, snapshot: ScmSnapshot, budget: Budget) -> Result<()> {
+        // First, so the wait is counted from the verb's entry; `stop_via_notify` issues the stop
+        // whatever is left of it.
         let deadline = budget.start();
-        let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
-        flow::owned(self, id)?;
-        drop(service);
+        let id = snapshot.into_id();
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to stop it: {e}")))?;
         if !budget.waits() {
@@ -342,9 +355,9 @@ impl Backend for ScmManager {
     /// (`TerminateProcess`): SCM sees an unexpected exit and applies the recovery actions, as for a
     /// crash. For `type: simple` the process is `goetia-shim`, whose Job Object takes the daemon's
     /// tree with it.
-    fn kill(&self, id: &Id) -> Result<()> {
-        let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
-        flow::owned(self, id)?;
+    fn kill(&self, snapshot: ScmSnapshot) -> Result<()> {
+        let id = snapshot.into_id();
+        let (_scm, service) = open_existing(&id, ServiceAccess::QUERY_STATUS)?;
         let mut target = super::kill::SystemKillTarget::new(service, id.as_str().to_string());
         match super::kill::kill_service(&mut target).map_err(|e| Error::Other(format!("kill `{id}`: {e}")))? {
             super::kill::Killed::Terminated => Ok(()),
@@ -358,16 +371,18 @@ impl Backend for ScmManager {
 /// What the `Parameters` of a service goetia could open say about its ownership. No marker is
 /// foreign, with the stock remedy: nothing but deleting the orphan recovers it, since `type: managed`
 /// has no second proof of ownership.
-fn read_marker(parameters: BTreeMap<String, String>, service: Option<Service>) -> ReadOutcome<ScmSnapshot> {
+fn read_marker(name: &str, parameters: BTreeMap<String, String>, service: Option<Service>) -> ReadOutcome<ScmSnapshot> {
     let blob = match generate::extract(&parameters) {
         Ok(None) => return ReadOutcome::Foreign { recovery: None },
         Ok(Some(blob)) => Ok(blob),
         Err(e) => Err(e),
     };
-    ReadOutcome::Marked {
+    ReadOutcome::marked(name, blob, |id, blob| ScmSnapshot {
+        id,
         blob,
-        snapshot: ScmSnapshot { parameters, service },
-    }
+        parameters,
+        service,
+    })
 }
 
 // shim support ========================================================================================================
@@ -398,10 +413,9 @@ pub fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
 /// say. Only a decodable blob that says `type: simple` selects the shim's vocabulary; an unreadable
 /// one reads as strictly as `type: managed`, which is what a shim that cannot decode it reports
 /// anyway (a failed start).
-fn start_kind(blob: Result<Option<Blob>>) -> (Kind, Option<String>) {
+fn start_kind(blob: std::result::Result<&Blob, &Error>) -> (Kind, Option<String>) {
     match blob {
-        Ok(Some(blob)) => (blob.spec.kind, None),
-        Ok(None) => (Kind::Managed, Some("it carries no goetia metadata".to_string())),
+        Ok(blob) => (blob.spec.kind, None),
         Err(e) => (Kind::Managed, Some(e.to_string())),
     }
 }
@@ -417,10 +431,6 @@ fn failed_start(id: &Id, e: &std::io::Error, unreadable: Option<&str>) -> Error 
              service's: {why})"
         )),
     }
-}
-
-fn installed_kind(id: &Id) -> (Kind, Option<String>) {
-    start_kind(read_spec_blob(id.as_str()))
 }
 
 // shim path ===========================================================================================================
@@ -1066,16 +1076,12 @@ fn service_undetermined(id: &str, context: &str, e: &windows_service::Error) -> 
     undetermined(id, service_detail(context, e), is_access_denied(e))
 }
 
-/// Open `id` with `access`, translating "no such service" into
-/// [`Error::NotInstalled`] rather than a raw Win32 message — every verb but
-/// `install` needs this before it can even ask whether `id` is *ours* (see
-/// [`flow::owned`]).
+/// Open `id` with the `access` a verb needs beyond what `read` asked for, translating "no such
+/// service" into [`Error::NotInstalled`] rather than a raw Win32 message.
 ///
-/// Every other failure is [`undetermined`], because this open is upstream of
-/// the marker: a service object whose DACL denies `QUERY_CONFIG`/`QUERY_STATUS`
-/// is a service whose marker was never read, so neither `NotInstalled`
-/// (absence) nor `Error::Other`'s downstream `Kind::Unreadable` (ownership) is
-/// a claim goetia is entitled to make about it.
+/// Every other failure is [`undetermined`], like `read`'s: a service object whose DACL denies the
+/// access is one the verb cannot act on, and that establishes neither absence nor anything about
+/// its marker.
 fn open_existing(id: &Id, access: ServiceAccess) -> Result<(WinServiceManager, Service)> {
     let scm = open_scm_to_classify(id.as_str())?;
     let service = scm.open_service(id.as_str(), access).map_err(|e| {

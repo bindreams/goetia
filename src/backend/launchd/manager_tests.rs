@@ -719,9 +719,10 @@ fn a_marked_plist_is_scanned_as_marked_in_the_directory_it_was_found_in() {
 
     assert!(scan.reported.is_empty(), "{:?}", scan.reported);
     match scan.entries.as_slice() {
-        [(name, ReadOutcome::Marked { blob, snapshot })] => {
+        [(name, ReadOutcome::Marked(snapshot))] => {
             assert_eq!(name, "ours");
-            assert!(blob.is_ok(), "the marker decodes");
+            assert_eq!(snapshot.id().as_str(), "ours");
+            assert!(snapshot.blob().is_ok(), "the marker decodes");
             assert!(snapshot.location.enabled);
             assert_eq!(snapshot.location.path, path);
             assert_eq!(snapshot.text, sample_plist("ours"));
@@ -795,6 +796,7 @@ fn a_write_over_a_plist_that_vanished_before_any_call_is_raced() {
             enabled: false,
         },
         text: on_disk,
+        ..marked_plist(&spec.id)
     };
     let stale = Outcome::Stale {
         from_version: "0.0.1".to_string(),
@@ -812,10 +814,28 @@ fn a_write_over_a_plist_that_vanished_before_any_call_is_raced() {
 
 // Reapers: a sequence never fails halfway for want of one =============================================================
 
-/// An id nothing is installed at: a verb that gets past its reapers stops at discovery, before any
-/// `launchctl` runs, so these tests touch nothing on the host.
+/// An id nothing is installed at.
 fn never_installed() -> Id {
     Id::try_from("goetia-reaper-probe-never-installed").unwrap()
+}
+
+/// A marked plist for `id` that no file backs, as the ownership gate would hand a verb. A verb that
+/// gets past its reapers and temp files makes its first `launchctl` call, so these tests run it
+/// under a [`Scripted`] stand-in that refuses every call, and touch nothing on the host.
+fn marked_plist(id: &Id) -> Plist {
+    let text = sample_plist(id.as_str());
+    let blob = generate::extract(&text)
+        .transpose()
+        .expect("sample_plist carries the marker");
+    Plist {
+        id: id.clone(),
+        blob,
+        location: Location {
+            path: PathBuf::from("/nonexistent/goetia-marked.plist"),
+            enabled: false,
+        },
+        text,
+    }
 }
 
 /// Whether `result` is the failure of a verb that could not make its reapers — as opposed to one that
@@ -824,11 +844,13 @@ fn refused_for_want_of_a_reaper<T: std::fmt::Debug>(result: &Result<T>) -> bool 
     matches!(result, Err(e) if e.to_string().contains("no thread could be made to reap a `launchctl` request, so none was sent"))
 }
 
-/// Every verb makes every reaper it can need before anything else — discovery included, so before
-/// any `launchctl` runs: one short, and the verb fails having sent nothing. `start`'s corrective
-/// cycle is its fourth and fifth requests, so four reapers are one short.
+/// Every verb makes every reaper it can need before anything else, so before any `launchctl` runs:
+/// one short, and the verb fails having sent nothing. `start`'s corrective cycle is its fourth and
+/// fifth requests, so four reapers are one short.
 #[skuld::test]
 fn a_verb_one_reaper_short_sends_nothing() {
+    use crate::backend::Backend;
+
     let mgr = LaunchdManager::new();
     let id = never_installed();
     let spec = DaemonSpec {
@@ -846,30 +868,52 @@ fn a_verb_one_reaper_short_sends_nothing() {
     for budget in [Budget::DEFAULT, Budget::Immediate] {
         let _four = bounded::test_hook::threads(START_REQUESTS - 1);
         assert!(
-            refused_for_want_of_a_reaper(&mgr.start(&id, budget)),
+            refused_for_want_of_a_reaper(&Backend::start(&mgr, marked_plist(&id), budget)),
             "start {budget:?}"
         );
     }
     let _four = bounded::test_hook::threads(START_REQUESTS - 1);
-    assert!(refused_for_want_of_a_reaper(&mgr.request_start_after_stop(&id)));
+    assert!(refused_for_want_of_a_reaper(&Backend::request_start_after_stop(
+        &mgr,
+        marked_plist(&id)
+    )));
     let _none = bounded::test_hook::threads(0);
-    assert!(refused_for_want_of_a_reaper(&mgr.stop(&id, Budget::DEFAULT)));
-    assert!(refused_for_want_of_a_reaper(&mgr.kill(&id)));
-    assert!(refused_for_want_of_a_reaper(&mgr.uninstall(&id)));
+    assert!(refused_for_want_of_a_reaper(&Backend::stop(
+        &mgr,
+        marked_plist(&id),
+        Budget::DEFAULT
+    )));
+    assert!(refused_for_want_of_a_reaper(&Backend::kill(&mgr, marked_plist(&id))));
+    assert!(refused_for_want_of_a_reaper(&Backend::uninstall(
+        &mgr,
+        marked_plist(&id)
+    )));
     assert!(refused_for_want_of_a_reaper(&mgr.install(&spec, false)));
 }
 
-/// With every reaper made, the same verbs go on to discovery, which finds nothing installed.
+/// With every reaper made, the same verbs go on to their first `launchctl` call, which the stand-in
+/// refuses.
 #[skuld::test]
-fn a_verb_with_its_reapers_goes_on_to_discovery() {
+fn a_verb_with_its_reapers_goes_on_to_its_first_call() {
+    use crate::backend::Backend;
+
     let mgr = LaunchdManager::new();
     let id = never_installed();
+    let _refused = Scripted::new(&[]);
     let _five = bounded::test_hook::threads(START_REQUESTS);
-    assert!(!refused_for_want_of_a_reaper(&mgr.start(&id, Budget::DEFAULT)));
+    assert!(!refused_for_want_of_a_reaper(&Backend::start(
+        &mgr,
+        marked_plist(&id),
+        Budget::DEFAULT
+    )));
     let _one = bounded::test_hook::threads(STOP_REQUESTS);
-    assert!(!refused_for_want_of_a_reaper(&mgr.stop(&id, Budget::DEFAULT)));
+    assert!(!refused_for_want_of_a_reaper(&Backend::stop(
+        &mgr,
+        marked_plist(&id),
+        Budget::DEFAULT
+    )));
     let _one = bounded::test_hook::threads(KILL_REQUESTS);
-    assert!(!refused_for_want_of_a_reaper(&mgr.kill(&id)));
+    assert!(!refused_for_want_of_a_reaper(&Backend::kill(&mgr, marked_plist(&id))));
 }
 
 /// Whether `result` is the failure of a verb that could not make the temp files its `launchctl`
@@ -882,6 +926,8 @@ fn refused_for_want_of_a_file<T: std::fmt::Debug>(result: &Result<T>) -> bool {
 /// alike, before anything else: one short, and the verb fails having sent nothing.
 #[skuld::test]
 fn a_verb_one_temp_file_short_sends_nothing() {
+    use crate::backend::Backend;
+
     let mgr = LaunchdManager::new();
     let id = never_installed();
     let spec = DaemonSpec {
@@ -899,22 +945,37 @@ fn a_verb_one_temp_file_short_sends_nothing() {
     let short = |calls: usize| bounded::test_hook::temp_files(calls * FILES_PER_CALL - 1);
     for budget in [Budget::DEFAULT, Budget::Immediate] {
         let _short = short(START_CALLS);
-        assert!(refused_for_want_of_a_file(&mgr.start(&id, budget)), "start {budget:?}");
+        assert!(
+            refused_for_want_of_a_file(&Backend::start(&mgr, marked_plist(&id), budget)),
+            "start {budget:?}"
+        );
     }
     {
         let _short = short(START_CALLS);
-        assert!(refused_for_want_of_a_file(&mgr.request_start_after_stop(&id)));
+        assert!(refused_for_want_of_a_file(&Backend::request_start_after_stop(
+            &mgr,
+            marked_plist(&id)
+        )));
     }
     let _short = short(STOP_CALLS);
-    assert!(refused_for_want_of_a_file(&mgr.stop(&id, Budget::DEFAULT)));
+    assert!(refused_for_want_of_a_file(&Backend::stop(
+        &mgr,
+        marked_plist(&id),
+        Budget::DEFAULT
+    )));
     let _short = short(STOP_CALLS);
-    assert!(refused_for_want_of_a_file(&mgr.uninstall(&id)));
+    assert!(refused_for_want_of_a_file(&Backend::uninstall(&mgr, marked_plist(&id))));
     let _short = short(KILL_CALLS);
-    assert!(refused_for_want_of_a_file(&mgr.kill(&id)));
+    assert!(refused_for_want_of_a_file(&Backend::kill(&mgr, marked_plist(&id))));
     let _short = short(INSTALL_CALLS);
     assert!(refused_for_want_of_a_file(&mgr.install(&spec, false)));
+    let _refused = Scripted::new(&[]);
     let _enough = bounded::test_hook::temp_files(START_CALLS * FILES_PER_CALL);
-    assert!(!refused_for_want_of_a_file(&mgr.start(&id, Budget::DEFAULT)));
+    assert!(!refused_for_want_of_a_file(&Backend::start(
+        &mgr,
+        marked_plist(&id),
+        Budget::DEFAULT
+    )));
 }
 
 /// `restart`'s two legs, and `install --start`'s, draw on reapers and temp files `prepare` made
@@ -923,8 +984,11 @@ fn a_verb_one_temp_file_short_sends_nothing() {
 /// takes one reaper, and no more temp files than the install.
 #[skuld::test]
 fn prepared_steps_need_nothing_made_later() {
+    use crate::backend::Backend;
+
     let mgr = LaunchdManager::new();
     let id = never_installed();
+    let _refused = Scripted::new(&[]);
     for (steps, reapers, calls) in [
         (
             [Step::Stop, Step::Start],
@@ -941,23 +1005,29 @@ fn prepared_steps_need_nothing_made_later() {
         for budget in [Budget::DEFAULT, Budget::Immediate, Budget::Unbounded] {
             {
                 let _short = bounded::test_hook::threads(reapers - 1);
-                assert!(mgr.prepare(&steps, budget).is_err(), "{steps:?} {budget:?}");
+                assert!(
+                    ServiceManager::prepare(&mgr, &steps, budget).is_err(),
+                    "{steps:?} {budget:?}"
+                );
             }
             let _short = bounded::test_hook::temp_files(calls * FILES_PER_CALL - 1);
-            assert!(mgr.prepare(&steps, budget).is_err(), "{steps:?} {budget:?}");
+            assert!(
+                ServiceManager::prepare(&mgr, &steps, budget).is_err(),
+                "{steps:?} {budget:?}"
+            );
         }
-        let prepared = mgr.prepare(&steps, Budget::DEFAULT).expect("prepare");
+        let prepared = ServiceManager::prepare(&mgr, &steps, Budget::DEFAULT).expect("prepare");
         let _no_thread = bounded::test_hook::threads(0);
         let _no_file = bounded::test_hook::temp_files(0);
         let first = if steps[0] == Step::Stop {
-            mgr.stop(&id, Budget::DEFAULT)
+            Backend::stop(&mgr, marked_plist(&id), Budget::DEFAULT)
         } else {
-            mgr.uninstall(&id)
+            Backend::uninstall(&mgr, marked_plist(&id))
         };
-        assert!(first.is_err(), "{steps:?}: nothing is installed");
+        assert!(first.is_err(), "{steps:?}: the stand-in refuses every call");
         assert!(!refused_for_want_of_a_reaper(&first), "{steps:?}");
         assert!(!refused_for_want_of_a_file(&first), "{steps:?}");
-        let started = mgr.start(&id, Budget::DEFAULT);
+        let started = Backend::start(&mgr, marked_plist(&id), Budget::DEFAULT);
         assert!(!refused_for_want_of_a_reaper(&started), "{steps:?}");
         assert!(!refused_for_want_of_a_file(&started), "{steps:?}");
         drop(prepared);
@@ -1012,9 +1082,10 @@ fn a_live_status_whose_launchctl_cannot_be_run_is_an_error() {
             enabled: false,
         },
         text: String::new(),
+        ..marked_plist(&never_installed())
     };
 
-    let result = LaunchdManager::new().live_status(&never_installed(), &snapshot);
+    let result = LaunchdManager::new().live_status(&snapshot);
 
     assert!(matches!(result, Err(Error::CommandFailed { .. })), "{result:?}");
 }

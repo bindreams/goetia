@@ -415,21 +415,22 @@ fn read_marker_sorts_parameters_into_foreign_and_marked() {
     let torn = BTreeMap::from([("Marker".to_string(), crate::blob::MARKER.to_string())]);
 
     assert!(matches!(
-        read_marker(BTreeMap::new(), None),
+        read_marker("frpc", BTreeMap::new(), None),
         ReadOutcome::Foreign { recovery: None }
     ));
-    match read_marker(ours.clone(), None) {
-        ReadOutcome::Marked {
-            blob: Ok(blob),
-            snapshot,
-        } => {
-            assert_eq!(blob.spec, spec);
+    match read_marker("frpc", ours.clone(), None) {
+        ReadOutcome::Marked(snapshot) => {
+            assert_eq!(snapshot.id().as_str(), "frpc");
+            assert_eq!(snapshot.blob().expect("decoded").spec, spec);
             assert_eq!(snapshot.parameters, ours);
         }
         _ => panic!("a complete marker is goetia's, decoded"),
     }
-    match read_marker(torn.clone(), None) {
-        ReadOutcome::Marked { blob: Err(_), snapshot } => assert_eq!(snapshot.parameters, torn),
+    match read_marker("frpc", torn.clone(), None) {
+        ReadOutcome::Marked(snapshot) => {
+            assert!(snapshot.blob().is_err());
+            assert_eq!(snapshot.parameters, torn);
+        }
         _ => panic!("the marker alone is proof of ownership, decodable or not"),
     }
 }
@@ -474,12 +475,9 @@ fn blob_of(kind: Kind) -> Blob {
 
 #[skuld::test]
 fn start_reads_a_simple_service_by_the_shims_vocabulary_and_anything_else_strictly() {
-    assert_eq!(start_kind(Ok(Some(blob_of(Kind::Simple)))), (Kind::Simple, None));
-    assert_eq!(start_kind(Ok(Some(blob_of(Kind::Managed)))), (Kind::Managed, None));
-    let (kind, why) = start_kind(Ok(None));
-    assert_eq!(kind, Kind::Managed);
-    assert!(why.is_some());
-    let (kind, why) = start_kind(Err(Error::Blob("corrupt".to_string())));
+    assert_eq!(start_kind(Ok(&blob_of(Kind::Simple))), (Kind::Simple, None));
+    assert_eq!(start_kind(Ok(&blob_of(Kind::Managed))), (Kind::Managed, None));
+    let (kind, why) = start_kind(Err(&Error::Blob("corrupt".to_string())));
     assert_eq!(kind, Kind::Managed);
     assert!(why.unwrap().contains("corrupt"));
 }
@@ -521,7 +519,7 @@ fn a_blob_that_says_always_decodes_and_starts_as_its_kind() {
         .expect("the blob is ours");
 
     assert_eq!(blob.spec.restart, Restart::Always);
-    assert_eq!(start_kind(Ok(Some(blob))), (Kind::Simple, None));
+    assert_eq!(start_kind(Ok(&blob)), (Kind::Simple, None));
 }
 
 // The generator's refusal at its call sites ---------------------------------------------------------------------------

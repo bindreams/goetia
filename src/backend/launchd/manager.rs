@@ -67,7 +67,8 @@ use std::{fs, io};
 
 use crate::backend::bounded::{self, Reaper, Role};
 use crate::backend::launchd::{generate, refuse, state};
-use crate::backend::{self, Identity, InstalledDefinition, ReadOutcome, Scan, WriteOutcome};
+use crate::backend::{self, Identity, InstalledDefinition, InstalledService, ReadOutcome, Scan, WriteOutcome};
+use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Result};
 use crate::manager::budget::{self, Deadline};
@@ -409,10 +410,22 @@ fn read_artifact(path: &Path, id: &str) -> Result<String> {
     }
 }
 
-/// What `read` saw at an id: where its plist is, and the plist's text.
+/// A marked plist, as `read` saw it: where it is, and its text.
 pub(crate) struct Plist {
+    id: Id,
+    blob: Result<Blob>,
     location: Location,
     text: String,
+}
+
+impl InstalledService for Plist {
+    fn id(&self) -> &Id {
+        &self.id
+    }
+
+    fn blob(&self) -> std::result::Result<&Blob, &Error> {
+        self.blob.as_ref()
+    }
 }
 
 /// What is at `location`: no marker is `Foreign`, a marker is `Marked` whether or not its blob
@@ -423,10 +436,12 @@ fn read_at(id: &str, location: Location) -> Result<ReadOutcome<Plist>> {
     let Some(blob) = generate::extract(&text).transpose() else {
         return Ok(ReadOutcome::Foreign { recovery: None });
     };
-    Ok(ReadOutcome::Marked {
+    Ok(ReadOutcome::marked(id, blob, |id, blob| Plist {
+        id,
         blob,
-        snapshot: Plist { location, text },
-    })
+        location,
+        text,
+    }))
 }
 
 // Account resolution ==================================================================================================
@@ -866,9 +881,8 @@ fn command_failed(args: &[&str], ran: &Ran) -> Error {
     }
 }
 
-/// The one [`Deadline`] a budgeted verb derives, first thing at entry so
-/// that discovery spends the budget too — and the reason it is not simply
-/// `budget.start()`.
+/// The one [`Deadline`] a budgeted verb derives, first thing at entry —
+/// and the reason it is not simply `budget.start()`.
 ///
 /// A budget that does not wait gets an explicitly **unbounded** deadline.
 /// `launchctl` exposes no non-blocking `bootout`, so for that call issuing
@@ -1196,7 +1210,7 @@ impl backend::Backend for LaunchdManager {
         }
     }
 
-    fn installed(&self, _id: &Id, snapshot: &Plist) -> Result<InstalledDefinition<String>> {
+    fn installed(&self, snapshot: &Plist) -> Result<InstalledDefinition<String>> {
         Ok(InstalledDefinition {
             definition: snapshot.text.clone(),
             // launchd has no drop-in or override mechanism that alters a job without touching its
@@ -1291,11 +1305,11 @@ impl backend::Backend for LaunchdManager {
         Ok(WriteOutcome::Done)
     }
 
-    fn live_status(&self, id: &Id, snapshot: &Plist) -> Result<Status> {
+    fn live_status(&self, snapshot: &Plist) -> Result<Status> {
         // `status` and `list` have no budget of their own: unbounded.
         // Read as `UncountedQuery`: neither verb counted this read, so it never draws on a
         // reservation a library caller may hold.
-        let (state, pid) = read_live_state(id.as_str(), Budget::Unbounded.start(), Role::UncountedQuery)?;
+        let (state, pid) = read_live_state(snapshot.id.as_str(), Budget::Unbounded.start(), Role::UncountedQuery)?;
         Ok(Status {
             state,
             pid,
@@ -1307,10 +1321,10 @@ impl backend::Backend for LaunchdManager {
         scan_in([(STAGING_DIR, false), (ENABLED_DIR, true)])
     }
 
-    fn uninstall(&self, id: &Id) -> Result<()> {
-        let [reaper] = reapers::<STOP_REQUESTS>(id)?;
-        let _files = files(id, STOP_CALLS)?;
-        let Plist { location, .. } = flow::owned(self, id)?;
+    fn uninstall(&self, snapshot: Plist) -> Result<()> {
+        let Plist { id, location, .. } = snapshot;
+        let [reaper] = reapers::<STOP_REQUESTS>(&id)?;
+        let _files = files(&id, STOP_CALLS)?;
 
         // Unbounded, like `install`'s: `uninstall` has no `--timeout` of its
         // own, and bounding this would turn a slow-stopping job into a
@@ -1319,8 +1333,8 @@ impl backend::Backend for LaunchdManager {
         fs::remove_file(&location.path).map_err(io_err(&location.path))
     }
 
-    fn enable(&self, id: &Id) -> Result<()> {
-        let Plist { location, .. } = flow::owned(self, id)?;
+    fn enable(&self, snapshot: Plist) -> Result<()> {
+        let Plist { id, location, .. } = snapshot;
 
         if location.enabled {
             return Ok(());
@@ -1340,8 +1354,8 @@ impl backend::Backend for LaunchdManager {
     /// orthogonal here, exactly as the trait contract requires.
     ///
     /// [`ServiceManager::disable`]: crate::manager::ServiceManager::disable
-    fn disable(&self, id: &Id) -> Result<()> {
-        let Plist { location, .. } = flow::owned(self, id)?;
+    fn disable(&self, snapshot: Plist) -> Result<()> {
+        let Plist { id, location, .. } = snapshot;
 
         if !location.enabled {
             return Ok(());
@@ -1351,10 +1365,12 @@ impl backend::Backend for LaunchdManager {
         move_no_clobber(&location.path, &dest)
     }
 
-    fn start(&self, id: &Id, budget: Budget) -> Result<()> {
-        // First, so discovery spends the budget too — see `verb_deadline`,
+    fn start(&self, snapshot: Plist, budget: Budget) -> Result<()> {
+        // First, so the wait is counted from the verb's entry — see `verb_deadline`,
         // and for why a non-waiting budget gets an unbounded one.
         let deadline = verb_deadline(budget);
+        let Plist { id, blob, location, .. } = snapshot;
+        let id = &id;
         let [
             bootstrap_reaper,
             kickstart_reaper,
@@ -1363,9 +1379,7 @@ impl backend::Backend for LaunchdManager {
             corrective_kickstart,
         ] = reapers::<START_REQUESTS>(id)?;
         let _files = files(id, START_CALLS)?;
-        let Plist { location, text } = flow::owned(self, id)?;
-        // `owned` passed these bytes as carrying the marker, so `extract` finds one.
-        let blob = generate::extract(&text)?.expect("`flow::owned` found the marker in this text");
+        let blob = blob?;
         let timed_out = || budget::timed_out(id.as_str(), "running", budget);
         // What issuing the request takes: which of `bootstrap`/`kickstart` it
         // needs, and the `bootstrap` itself. None of it is bounded — the
@@ -1483,12 +1497,12 @@ impl backend::Backend for LaunchdManager {
     /// The plain request-only start. The stop before it had no request-only
     /// form and ran `bootout` to completion, so the instance it stopped is
     /// gone and cannot be what answers for the label here.
-    fn request_start_after_stop(&self, id: &Id) -> Result<()> {
-        backend::Backend::start(self, id, Budget::Immediate)
+    fn request_start_after_stop(&self, snapshot: Plist) -> Result<()> {
+        backend::Backend::start(self, snapshot, Budget::Immediate)
     }
 
-    fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
-        // First, so discovery spends the budget too. Under a budget that
+    fn stop(&self, snapshot: Plist, budget: Budget) -> Result<()> {
+        // First, so the wait is counted from the verb's entry. Under a budget that
         // does not wait this is an explicitly UNBOUNDED deadline, not
         // `budget.start()` — see `verb_deadline`. `launchctl` exposes no
         // non-blocking `bootout`, so issuing the request *is* the blocking
@@ -1497,16 +1511,16 @@ impl backend::Backend for LaunchdManager {
         // bounded budget an expiry leaves the `bootout` running rather than
         // killing it (see `launchctl`), so the request still goes out.
         let deadline = verb_deadline(budget);
+        let id = snapshot.id();
         let [reaper] = reapers::<STOP_REQUESTS>(id)?;
         let _files = files(id, STOP_CALLS)?;
-        flow::owned(self, id)?;
         bootout(id.as_str(), deadline, reaper)?.ok_or_else(|| budget::timed_out(id.as_str(), "stopped", budget))
     }
 
-    fn kill(&self, id: &Id) -> Result<()> {
+    fn kill(&self, snapshot: Plist) -> Result<()> {
+        let id = snapshot.id();
         let [reaper] = reapers::<KILL_REQUESTS>(id)?;
         let _files = files(id, KILL_CALLS)?;
-        flow::owned(self, id)?;
         never_expires(kill_job(id.as_str(), Budget::Unbounded.start(), reaper)?);
         Ok(())
     }

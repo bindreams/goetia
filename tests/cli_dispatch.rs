@@ -3524,7 +3524,7 @@ fn a_refused_request_only_restart_is_a_failure_that_changed_nothing() {
 
     assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
     assert!(!err.contains("not established"), "{err}");
-    assert_eq!(fake.calls(), vec![("restart", "stranger".to_string())]);
+    assert_eq!(fake.calls(), vec![], "the gate refused it before the manager was asked");
 }
 
 /// A budget that waits confirms each leg, which the request-only restart cannot: it is never used.

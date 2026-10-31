@@ -8,10 +8,10 @@
 //! compare, the same role each real backend's own generator plays.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::backend::{InstalledDefinition, ReadOutcome, Scan, WriteOutcome};
+use crate::backend::{InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, WriteOutcome};
 use crate::blob::{self, Blob};
 use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Result};
@@ -41,6 +41,23 @@ const OPAQUE_REASON: &str = "the artifact could not be read (seeded opaque by Fa
 /// one query function, and nothing but this helper would give it to `Fake`.
 fn pid_for(state: State) -> Option<u32> {
     if state == State::Running { Some(FAKE_PID) } else { None }
+}
+
+/// What [`Fake`]'s `read` and `scan` saw at a marked id.
+pub(crate) struct Artifact {
+    id: Id,
+    blob: Result<Blob>,
+    entry: Entry,
+}
+
+impl InstalledService for Artifact {
+    fn id(&self) -> &Id {
+        &self.id
+    }
+
+    fn blob(&self) -> std::result::Result<&Blob, &Error> {
+        self.blob.as_ref()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -136,12 +153,12 @@ impl Store {
 
     /// What is at `id`, as [`Backend::read`] reports it. An opaque id fails
     /// first: the read that would have found an entry is the one that failed.
-    fn read(&self, id: &Id) -> Result<ReadOutcome<Entry>> {
+    fn read(&self, id: &Id) -> Result<ReadOutcome<Artifact>> {
         if self.opaque.contains(id.as_str()) {
             return Err(Self::undetermined(id));
         }
         Ok(match self.entries.get(id.as_str()) {
-            Some(entry) => Self::classify(entry),
+            Some(entry) => Self::classify(id.as_str(), entry),
             // Never absent: whatever the platform still applies here is
             // configuration goetia did not write and cannot show, and
             // `NotInstalled` is the one error `cli::uninstall` renders as
@@ -155,18 +172,17 @@ impl Store {
         })
     }
 
-    fn classify(entry: &Entry) -> ReadOutcome<Entry> {
-        match extract(&entry.text) {
-            Ok(None) => ReadOutcome::Foreign { recovery: None },
-            Ok(Some(blob)) => ReadOutcome::Marked {
-                blob: Ok(blob),
-                snapshot: entry.clone(),
-            },
-            Err(e) => ReadOutcome::Marked {
-                blob: Err(e),
-                snapshot: entry.clone(),
-            },
-        }
+    fn classify(name: &str, entry: &Entry) -> ReadOutcome<Artifact> {
+        let blob = match extract(&entry.text) {
+            Ok(None) => return ReadOutcome::Foreign { recovery: None },
+            Ok(Some(blob)) => Ok(blob),
+            Err(e) => Err(e),
+        };
+        ReadOutcome::marked(name, blob, |id, blob| Artifact {
+            id,
+            blob,
+            entry: entry.clone(),
+        })
     }
 
     /// The fake's single [`Error::Undetermined`] constructor: one wording
@@ -477,8 +493,8 @@ impl Fake {
         state.prepare_fails = true;
     }
 
-    /// Every `start`/`stop`/`restart`/`kill` this Fake was asked to perform, in order,
-    /// recorded when it was *asked* rather than when it succeeded.
+    /// Every `start`/`stop`/`restart`/`kill` this Fake was asked to perform, in order, recorded
+    /// once the ownership gate passed rather than when it succeeded.
     ///
     /// Exists because some assertions are about the **absence** of a call,
     /// which no state read can express: the fake's `start` on an
@@ -612,8 +628,18 @@ impl Drop for Held {
 // Backend =============================================================================================================
 
 impl Store {
-    /// The entry at `id`, which `gated` has just found marked under the same lock.
-    fn entry_mut(&mut self, id: &Id) -> Result<&mut Entry> {
+    /// The entry `snapshot` was read from, which must still be there, still marked and still the
+    /// text the snapshot saw, as of this lock: no clone can change the id between the gate and
+    /// the verb. Ownership errors beat [`Error::NoManager`].
+    fn confirm(&mut self, snapshot: &Artifact) -> Result<&mut Entry> {
+        let id = snapshot.id();
+        let current = flow::require_marked(id, self.read(id)?)?;
+        if current.entry.text != snapshot.entry.text {
+            return Err(Error::Other(format!(
+                "`{id}` changed after being confirmed installed; nothing was done"
+            )));
+        }
+        self.manager()?;
         self.entries.get_mut(id.as_str()).ok_or_else(|| Error::NotInstalled {
             id: id.as_str().to_string(),
         })
@@ -621,21 +647,18 @@ impl Store {
 }
 
 impl Fake {
-    /// The store, locked, for a verb whose id is marked ours and that has a manager to ask. The
-    /// gate runs under the guard it returns, so no clone can change the id between the two.
-    /// Ownership errors beat [`Error::NoManager`]. Not reentrant: a verb records what it must,
-    /// releases its guard, and only then calls this.
-    fn gated(&self, id: &Id) -> Result<MutexGuard<'_, Store>> {
-        let state = self.state.lock().expect("Fake mutex poisoned");
-        flow::require_marked(id, state.read(id)?).map(drop)?;
-        state.manager()?;
-        Ok(state)
+    /// [`Fake::seed_native_restart`]'s restart of a service the gate passed. Recorded as `restart`.
+    fn restart_natively(&self, snapshot: Artifact) -> Result<()> {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.calls.push(("restart", snapshot.id().as_str().to_string()));
+        state.asked("restart", snapshot.id());
+        state.confirm(&snapshot).map(drop)
     }
 }
 
 impl crate::backend::Backend for Fake {
     type Definition = String;
-    type Snapshot = Entry;
+    type Snapshot = Artifact;
     type InstallScope = ();
 
     /// Records the install once, however many times the flow retries; then an opaque id, then no
@@ -659,18 +682,19 @@ impl crate::backend::Backend for Fake {
         Ok(generate(spec))
     }
 
-    fn read(&self, id: &Id) -> Result<ReadOutcome<Entry>> {
+    fn read(&self, id: &Id) -> Result<ReadOutcome<Artifact>> {
         let state = self.state.lock().expect("Fake mutex poisoned");
         state.read(id)
     }
 
-    fn installed(&self, id: &Id, snapshot: &Entry) -> Result<InstalledDefinition<String>> {
+    fn installed(&self, snapshot: &Artifact) -> Result<InstalledDefinition<String>> {
+        let id = snapshot.id();
         let state = self.state.lock().expect("Fake mutex poisoned");
         if let Some(detail) = state.installed_fails.get(id.as_str()) {
             return Err(Error::Other(detail.clone()));
         }
         Ok(InstalledDefinition {
-            definition: snapshot.text.clone(),
+            definition: snapshot.entry.text.clone(),
             external: state
                 .externals
                 .get(id.as_str())
@@ -686,7 +710,7 @@ impl crate::backend::Backend for Fake {
         spec: &DaemonSpec,
         definition: &String,
         _outcome: &Outcome,
-        snapshot: Option<&Entry>,
+        snapshot: Option<&Artifact>,
         _scope: &mut (),
     ) -> Result<WriteOutcome> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
@@ -708,7 +732,7 @@ impl crate::backend::Backend for Fake {
             }
         }
         let current = state.entries.get(spec.id.as_str());
-        if current.map(|e| &e.text) != snapshot.map(|e| &e.text) {
+        if current.map(|e| &e.text) != snapshot.map(|s| &s.entry.text) {
             return Ok(WriteOutcome::Raced);
         }
         let (enabled, run_state) = current.map(|e| (e.enabled, e.state)).unwrap_or((false, State::Stopped));
@@ -723,7 +747,8 @@ impl crate::backend::Backend for Fake {
         Ok(WriteOutcome::Done)
     }
 
-    fn live_status(&self, id: &Id, snapshot: &Entry) -> Result<Status> {
+    fn live_status(&self, snapshot: &Artifact) -> Result<Status> {
+        let id = snapshot.id();
         let state = self.state.lock().expect("Fake mutex poisoned");
         state.manager()?;
         if let Some(detail) = state.live_status_fails.get(id.as_str()) {
@@ -735,9 +760,9 @@ impl crate::backend::Backend for Fake {
             });
         }
         Ok(Status {
-            state: snapshot.state,
-            pid: pid_for(snapshot.state),
-            enabled: snapshot.enabled,
+            state: snapshot.entry.state,
+            pid: pid_for(snapshot.entry.state),
+            enabled: snapshot.entry.enabled,
         })
     }
 
@@ -745,7 +770,7 @@ impl crate::backend::Backend for Fake {
     /// ordering at all, so a caller that renders this order instead of imposing its own must fail
     /// a test rather than pass by luck. An opaque id is never classified from the entry its failed
     /// read would have found.
-    fn scan(&self) -> Scan<Entry> {
+    fn scan(&self) -> Scan<Artifact> {
         let state = self.state.lock().expect("Fake mutex poisoned");
         let aggregates = state.aggregates.iter().map(|reason| Installed::Undetermined {
             name: None,
@@ -760,40 +785,41 @@ impl crate::backend::Backend for Fake {
                 .entries
                 .iter()
                 .filter(|(name, _)| !state.opaque.contains(*name))
-                .map(|(name, entry)| (name.clone(), Store::classify(entry)))
+                .map(|(name, entry)| (name.clone(), Store::classify(name, entry)))
                 .collect(),
             reported: aggregates.chain(opaque).collect(),
         }
     }
 
-    fn uninstall(&self, id: &Id) -> Result<()> {
-        self.gated(id)?.entries.remove(id.as_str());
+    fn uninstall(&self, snapshot: Artifact) -> Result<()> {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.confirm(&snapshot)?;
+        state.entries.remove(snapshot.id().as_str());
         Ok(())
     }
 
-    fn enable(&self, id: &Id) -> Result<()> {
-        self.gated(id)?.entry_mut(id)?.enabled = true;
+    fn enable(&self, snapshot: Artifact) -> Result<()> {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.confirm(&snapshot)?.enabled = true;
         Ok(())
     }
 
-    fn disable(&self, id: &Id) -> Result<()> {
-        self.gated(id)?.entry_mut(id)?.enabled = false;
+    fn disable(&self, snapshot: Artifact) -> Result<()> {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.confirm(&snapshot)?.enabled = false;
         Ok(())
     }
 
-    fn start(&self, id: &Id, budget: Budget) -> Result<()> {
-        let stalls = {
-            let mut state = self.state.lock().expect("Fake mutex poisoned");
-            // Recorded on being *asked*, ahead of every check below: `calls`
-            // answers "was this attempted", which is a different question from
-            // whether it succeeded or changed anything.
-            state.calls.push(("start", id.as_str().to_string()));
-            state.asked("start", id);
-            in_doubt(&state, id)?;
-            state.start_stalls.contains(id.as_str())
-        };
-        let mut state = self.gated(id)?;
-        let entry = state.entry_mut(id)?;
+    fn start(&self, snapshot: Artifact, budget: Budget) -> Result<()> {
+        let id = snapshot.id();
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        // Recorded once the gate has passed, ahead of every check below: `calls` answers "was this
+        // attempted", which is a different question from whether it succeeded or changed anything.
+        state.calls.push(("start", id.as_str().to_string()));
+        state.asked("start", id);
+        in_doubt(&state, id)?;
+        let stalls = state.start_stalls.contains(id.as_str());
+        let entry = state.confirm(&snapshot)?;
         if stalls {
             // No confirmation is coming, so none is invented: the state is
             // left exactly as it was on every branch `stalled` can take.
@@ -829,30 +855,23 @@ impl crate::backend::Backend for Fake {
 
     /// Only once [`Fake::seed_native_restart`]ed. Request-only, so it settles
     /// nothing, as for `start`.
-    fn request_restart(&self, id: &Id) -> Option<Result<()>> {
-        {
-            let mut state = self.state.lock().expect("Fake mutex poisoned");
-            if !state.native_restart {
-                return None;
-            }
-            state.calls.push(("restart", id.as_str().to_string()));
-            state.asked("restart", id);
-        }
-        Some(self.gated(id).map(drop))
+    fn request_restart(&self) -> Option<NativeRestart<Self>> {
+        let state = self.state.lock().expect("Fake mutex poisoned");
+        state
+            .native_restart
+            .then_some(Fake::restart_natively as NativeRestart<Self>)
     }
 
     /// Models the strictest manager the contract allows, SCM's: a service
     /// still `Running` refuses the start, since the request-only `stop` before
     /// it settled nothing. Recorded as `start`, which is what it asks for.
-    fn request_start_after_stop(&self, id: &Id) -> Result<()> {
-        {
-            let mut state = self.state.lock().expect("Fake mutex poisoned");
-            state.calls.push(("start", id.as_str().to_string()));
-            state.asked("start", id);
-            in_doubt(&state, id)?;
-        }
-        let mut state = self.gated(id)?;
-        if state.entry_mut(id)?.state == State::Running {
+    fn request_start_after_stop(&self, snapshot: Artifact) -> Result<()> {
+        let id = snapshot.id();
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.calls.push(("start", id.as_str().to_string()));
+        state.asked("start", id);
+        in_doubt(&state, id)?;
+        if state.confirm(&snapshot)?.state == State::Running {
             return Err(Error::Other(format!(
                 "start `{id}`: refused as already running — the stop issued before it has not taken effect"
             )));
@@ -860,16 +879,14 @@ impl crate::backend::Backend for Fake {
         Ok(())
     }
 
-    fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
-        let stalls = {
-            let mut state = self.state.lock().expect("Fake mutex poisoned");
-            state.calls.push(("stop", id.as_str().to_string()));
-            state.asked("stop", id);
-            lost(&state.stop_in_doubt, "stop", id)?;
-            state.stop_stalls.contains(id.as_str())
-        };
-        let mut state = self.gated(id)?;
-        let entry = state.entry_mut(id)?;
+    fn stop(&self, snapshot: Artifact, budget: Budget) -> Result<()> {
+        let id = snapshot.id();
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.calls.push(("stop", id.as_str().to_string()));
+        state.asked("stop", id);
+        lost(&state.stop_in_doubt, "stop", id)?;
+        let stalls = state.stop_stalls.contains(id.as_str());
+        let entry = state.confirm(&snapshot)?;
         if stalls {
             return stalled(id, "stopped", budget);
         }
@@ -886,14 +903,12 @@ impl crate::backend::Backend for Fake {
 
     /// A running entry becomes [`State::Failed`], with no pid: the Fake models the kill and nothing
     /// of the restart policy that follows it. Any other state has no process to end.
-    fn kill(&self, id: &Id) -> Result<()> {
-        {
-            let mut state = self.state.lock().expect("Fake mutex poisoned");
-            state.calls.push(("kill", id.as_str().to_string()));
-            state.asked("kill", id);
-        }
-        let mut state = self.gated(id)?;
-        let entry = state.entry_mut(id)?;
+    fn kill(&self, snapshot: Artifact) -> Result<()> {
+        let id = snapshot.id();
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.calls.push(("kill", id.as_str().to_string()));
+        state.asked("kill", id);
+        let entry = state.confirm(&snapshot)?;
         if entry.state != State::Running {
             return Err(Error::NotRunning {
                 id: id.as_str().to_string(),
