@@ -1052,7 +1052,7 @@ fn spec_restarting(restart: Restart) -> DaemonSpec {
 
 #[skuld::test]
 fn an_earlier_registration_under_on_failure_names_the_daemon_and_the_remedy() {
-    let notice = version_skew_notice(&spec_restarting(Restart::OnFailure), "0.1.0", "0.2.0");
+    let notice = version_skew_notice("frpc", &spec_restarting(Restart::OnFailure), "0.1.0", "0.2.0");
 
     assert_eq!(
         notice.as_deref(),
@@ -1064,19 +1064,19 @@ fn an_earlier_registration_under_on_failure_names_the_daemon_and_the_remedy() {
 
 #[skuld::test]
 fn an_earlier_registration_under_always_names_the_override_and_the_reinstall() {
-    let notice = version_skew_notice(&spec_restarting(Restart::Always), "0.1.0", "0.2.0");
+    let notice = version_skew_notice("frpc", &spec_restarting(Restart::Always), "0.1.0", "0.2.0");
 
     assert_eq!(
         notice.as_deref(),
         Some(
-            r#"daemon "goetia-shim launch test" was registered by goetia 0.1.0 and this goetia-shim is 0.2.0: its SCM recovery actions may be missing, so it may not restart after a failure. After setting `backend-specific: scm: { restart: on-failure }` in the manifest, run `goetia daemon uninstall <id>` and `goetia daemon install` to apply them: `restart: always` is not supported for scm, so `install` refuses this service as it is"#
+            r#"daemon "goetia-shim launch test" was registered by goetia 0.1.0 and this goetia-shim is 0.2.0: its SCM recovery actions may be missing, so it may not restart after a failure. After setting `backend-specific: scm: { restart: on-failure }` in the manifest, run `goetia daemon uninstall frpc` and `goetia daemon install` to apply them: `restart: always` is not supported for scm, so `install` refuses this service as it is"#
         )
     );
 }
 
 #[skuld::test]
 fn a_registration_by_released_0_1_0_warns_under_this_build() {
-    let notice = version_skew_notice(&spec_restarting(Restart::OnFailure), "0.1.0", goetia::version());
+    let notice = version_skew_notice("frpc", &spec_restarting(Restart::OnFailure), "0.1.0", goetia::version());
 
     assert!(notice.is_some(), "a service registered by 0.1.0 must get the warning");
 }
@@ -1084,7 +1084,7 @@ fn a_registration_by_released_0_1_0_warns_under_this_build() {
 #[skuld::test]
 fn no_notice_for_a_daemon_that_is_never_restarted() {
     assert_eq!(
-        version_skew_notice(&spec_restarting(Restart::Never), "0.1.0", "0.2.0"),
+        version_skew_notice("frpc", &spec_restarting(Restart::Never), "0.1.0", "0.2.0"),
         None
     );
 }
@@ -1093,7 +1093,7 @@ fn no_notice_for_a_daemon_that_is_never_restarted() {
 fn no_notice_when_the_shim_is_the_version_that_registered_the_service() {
     for restart in [Restart::Never, Restart::OnFailure, Restart::Always] {
         assert_eq!(
-            version_skew_notice(&spec_restarting(restart), "0.2.0", "0.2.0"),
+            version_skew_notice("frpc", &spec_restarting(restart), "0.2.0", "0.2.0"),
             None,
             "{restart:?}"
         );

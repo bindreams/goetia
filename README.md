@@ -477,7 +477,7 @@ error: daemon `frpc`: `restart: always` cannot be honoured by the scm backend: S
 it, `install` over a manifest with several daemons installs the others and
 reports the refused one, exiting `1`; under `--start` the refused daemon is not
 started and the others are.
-Override it for Windows:
+Override `restart: always` for Windows:
 
 ```yaml
 restart: always
