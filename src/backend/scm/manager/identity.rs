@@ -84,7 +84,7 @@ fn parse_password_var(var: std::result::Result<String, std::env::VarError>) -> R
     }
 }
 
-fn wide_null(s: &str) -> Vec<u16> {
+pub(super) fn wide_null(s: &str) -> Vec<u16> {
     std::ffi::OsStr::new(s)
         .encode_wide()
         .chain(std::iter::once(0))
@@ -250,7 +250,7 @@ fn nt_error(context: &str, status: i32) -> Error {
 /// Grant `account_name` the right to log on as a service
 /// (`SeServiceLogonRight`), via `LsaAddAccountRights`. Idempotent: an
 /// account that already has the right is unaffected, so this is safe to
-/// call on every install, not just the first one for a given account.
+/// call again on a later install of the same account.
 pub fn grant_service_logon_right(account_name: &str) -> Result<()> {
     let sid_buf = sid_for_account_name(account_name)?;
 

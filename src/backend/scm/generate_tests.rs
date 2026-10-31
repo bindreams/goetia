@@ -39,7 +39,7 @@ fn simple_spec() -> DaemonSpec {
         cwd: None,
         env: BTreeMap::new(),
         user: User::Root,
-        restart: Restart::Always,
+        restart: Restart::OnFailure,
         restart_delay: None,
         logs: None,
         kind: Kind::Simple,
@@ -57,7 +57,7 @@ fn shim_path() -> PathBuf {
 }
 
 fn build(spec: &DaemonSpec) -> ScmRegistration {
-    registration(spec, &identity(), &shim_path())
+    registration(spec, &identity(), &shim_path()).unwrap()
 }
 
 // executable/arguments per Kind =======================================================================================
@@ -85,6 +85,64 @@ fn managed_kind_executable_is_own_command() {
     assert_eq!(reg.arguments, spec.command[1..].to_vec());
 }
 
+// Environment =========================================================================================================
+
+#[skuld::test]
+fn managed_kind_renders_its_environment_lines() {
+    let mut spec = managed_spec();
+    spec.env.insert("B".to_string(), "2".to_string());
+    spec.env.insert("A".to_string(), "1".to_string());
+    let reg = build(&spec);
+
+    assert_eq!(reg.environment, ["A=1", "B=2"]);
+    assert!(
+        render(&reg).contains("Environment:\n  \"A=1\"\n  \"B=2\"\n"),
+        "the compared text must show each line:\n{}",
+        render(&reg)
+    );
+}
+
+#[skuld::test]
+fn simple_kind_renders_no_environment() {
+    // SCM applies `Environment` to the shim, not the daemon (the shim applies `spec.env` itself), so
+    // the registration carries none for `Kind::Simple`.
+    let mut spec = simple_spec();
+    spec.env.insert("A".to_string(), "1".to_string());
+    let reg = build(&spec);
+
+    assert!(reg.environment.is_empty(), "{:?}", reg.environment);
+    assert!(
+        render(&reg).contains("Environment:\nParameters:\n"),
+        "an empty environment renders as a bare header:\n{}",
+        render(&reg)
+    );
+}
+
+#[skuld::test]
+fn format_environment_lines_is_key_equals_value_per_entry() {
+    let mut env = BTreeMap::new();
+    env.insert("B".to_string(), "2".to_string());
+    env.insert("A".to_string(), "1".to_string());
+    // `BTreeMap` iterates key-sorted, so the lines come out deterministically
+    // ordered regardless of insertion order.
+    assert_eq!(
+        format_environment_lines(&env),
+        vec!["A=1".to_string(), "B=2".to_string()]
+    );
+}
+
+#[skuld::test]
+fn format_environment_lines_is_empty_for_empty_env() {
+    assert!(format_environment_lines(&BTreeMap::new()).is_empty());
+}
+
+#[skuld::test]
+fn format_environment_lines_preserves_equals_signs_in_the_value() {
+    let mut env = BTreeMap::new();
+    env.insert("URL".to_string(), "http://x/a=b".to_string());
+    assert_eq!(format_environment_lines(&env), vec!["URL=http://x/a=b".to_string()]);
+}
+
 // Account =============================================================================================================
 
 #[skuld::test]
@@ -101,7 +159,7 @@ fn named_user_account_uses_resolved_identity() {
     let mut spec = managed_spec();
     spec.user = User::Name("bindreams".to_string());
     let id = identity();
-    let reg = registration(&spec, &id, &shim_path());
+    let reg = registration(&spec, &id, &shim_path()).unwrap();
 
     assert_eq!(
         reg.account,
@@ -215,7 +273,7 @@ fn registration_canonicalizes_a_builtin_account() {
     let id = Identity {
         user: "LocalService".to_string(),
     };
-    let reg = registration(&spec, &id, &shim_path());
+    let reg = registration(&spec, &id, &shim_path()).unwrap();
 
     assert_eq!(reg.account, Some(r"NT AUTHORITY\LocalService".to_string()));
 }
@@ -230,7 +288,7 @@ fn registration_for_root_uses_the_default_account_with_an_empty_identity() {
     // the empty-string path an unguarded `canonical_account` would map to
     // `Some("")` (see `windows_builtin("")`'s doc comment).
     let id = Identity { user: String::new() };
-    let reg = registration(&spec, &id, &shim_path());
+    let reg = registration(&spec, &id, &shim_path()).unwrap();
 
     assert_eq!(reg.account, None);
 }
@@ -707,7 +765,7 @@ fn simple_kind_default_restart_delay_when_unset() {
 
 #[skuld::test]
 fn the_two_kinds_get_the_same_failure_actions_for_every_restart_value() {
-    for restart in [Restart::Never, Restart::OnFailure, Restart::Always] {
+    for restart in [Restart::Never, Restart::OnFailure] {
         for restart_delay in [None, Some(Duration::from_secs(42))] {
             let mut simple = simple_spec();
             simple.restart = restart;
@@ -773,25 +831,33 @@ fn managed_kind_with_restart_never_has_no_failure_actions() {
     );
 }
 
-/// The generator must neither panic nor emit anything but on-failure's recovery
-/// actions for `Always` (installed blobs may carry it). Only the blob, which
-/// records the authored `restart`, may differ.
 #[skuld::test]
-fn managed_kind_restart_always_renders_as_on_failure() {
-    let mut always = managed_spec();
-    always.restart = Restart::Always;
-    let mut on_failure = managed_spec();
-    on_failure.restart = Restart::OnFailure;
+fn registration_refuses_restart_always() {
+    for spec in [managed_spec(), simple_spec()] {
+        let spec = DaemonSpec {
+            restart: Restart::Always,
+            ..spec
+        };
+        let err = registration(&spec, &identity(), &shim_path()).expect_err("`restart: always` must be refused");
 
-    let mut always = build(&always);
-    let mut on_failure = build(&on_failure);
-    assert!(
-        always.failure_actions.is_some(),
-        "`always` keeps on-failure's recovery actions"
-    );
-    always.parameters.clear();
-    on_failure.parameters.clear();
-    assert_eq!(render(&always), render(&on_failure));
+        assert!(
+            matches!(&err, Error::Invalid { daemon, .. } if daemon.as_str() == "frpc"),
+            "{err:?}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("restart: always"), "{text}");
+        assert!(text.contains("backend-specific: scm"), "the remedy is missing: {text}");
+    }
+}
+
+#[skuld::test]
+fn registration_accepts_never_and_on_failure() {
+    for restart in [Restart::Never, Restart::OnFailure] {
+        for spec in [managed_spec(), simple_spec()] {
+            let spec = DaemonSpec { restart, ..spec };
+            registration(&spec, &identity(), &shim_path()).unwrap_or_else(|e| panic!("{restart:?}: {e}"));
+        }
+    }
 }
 
 #[skuld::test]
@@ -800,7 +866,7 @@ fn managed_kind_clamps_absurdly_long_restart_delay() {
     // One millisecond past what a DWORD of milliseconds (SC_ACTION.Delay)
     // can express.
     spec.restart_delay = Some(MAX_SC_ACTION_DELAY + Duration::from_millis(1));
-    let reg = registration(&spec, &identity(), &shim_path());
+    let reg = registration(&spec, &identity(), &shim_path()).unwrap();
 
     let fa = reg
         .failure_actions
@@ -862,7 +928,7 @@ fn rounding_a_restart_delay_up_never_passes_the_scm_maximum() {
 fn managed_kind_restart_delay_within_bound_does_not_clamp() {
     let mut spec = managed_spec();
     spec.restart_delay = Some(Duration::from_secs(42));
-    let reg = registration(&spec, &identity(), &shim_path());
+    let reg = registration(&spec, &identity(), &shim_path()).unwrap();
 
     let fa = reg
         .failure_actions
@@ -895,9 +961,9 @@ fn render_is_the_generation_invariant() {
     let id = identity();
     let shim = shim_path();
 
-    let original = registration(&spec, &id, &shim);
+    let original = registration(&spec, &id, &shim).unwrap();
     let recovered_spec = extract(&original.parameters).unwrap().unwrap().spec;
-    let regenerated = registration(&recovered_spec, &id, &shim);
+    let regenerated = registration(&recovered_spec, &id, &shim).unwrap();
 
     assert_eq!(
         render(&original),
@@ -1080,6 +1146,7 @@ fn render_output_format_is_pinned() {
             reset_period: Duration::from_secs(86_400),
             on_non_crash_failures: true,
         }),
+        environment: vec!["A=1".to_string(), "B=x y".to_string()],
         parameters: BTreeMap::from([
             ("Marker".to_string(), "goetia".to_string()),
             ("Schema".to_string(), "1".to_string()),
@@ -1105,6 +1172,9 @@ fn render_output_format_is_pinned() {
         format!("  Delay: {delay_text}"),
         format!("  ResetPeriod: {reset_period_text}"),
         "  OnNonCrashFailures: true".to_string(),
+        "Environment:".to_string(),
+        "  \"A=1\"".to_string(),
+        "  \"B=x y\"".to_string(),
         "Parameters:".to_string(),
         "  Marker: \"goetia\"".to_string(),
         "  Schema: \"1\"".to_string(),

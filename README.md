@@ -430,7 +430,7 @@ override's `env`. A base key and an override of the same key are not a
 repeat — that is the merge, and it is the point.
 
 **Only the backend native to this host is installed, but every backend's
-merged spec is validated on every host.** So the manifest above renders on
+override is validated on every host.** So the manifest above renders on
 Linux as the systemd-effective spec, with the `scm:` block validated and
 then discarded:
 
@@ -461,19 +461,23 @@ $ goetia daemon show -f goetia.yaml
 error: daemon `frpc`: backend-specific.scm: `1000` is a numeric uid, which is never a Windows account
 ```
 
-**`restart: always` is refused for `scm`, from whichever layer it comes.**
-SCM recovery actions fire only on a failure, never after a clean exit, so a
-Windows service cannot be made to restart "always". Unlike the rule above
-this does not need a `scm:` block to trigger it: a base `restart: always`
-is what the `scm` backend would install, so a Linux or macOS run fails too,
-for both `type: simple` and `type: managed`:
+**`restart: always` is valid in the base spec, and refused when installing on
+Windows.** SCM recovery actions fire only on a failure, never after a clean
+exit, so a Windows service cannot be made to restart "always". Every host
+resolves the manifest, so `show` works anywhere, for both `type: simple` and
+`type: managed`; the `scm` backend refuses it when it generates the service,
+in `install` and `install --dry-run`:
 
 ```console
-$ goetia daemon show -f goetia.yaml
+$ goetia daemon install --dry-run -f goetia.yaml
 error: daemon `frpc`: `restart: always` cannot be honoured by the scm backend: SCM recovery actions never fire after a clean exit. To keep `always` on systemd and launchd, set `backend-specific: scm: { restart: on-failure }`
 ```
 
-Override it for Windows:
+`--dry-run` still previews the manifest's other daemons and exits `1`. Without
+it, `install` over a manifest with several daemons installs the others and
+reports the refused one, exiting `1`; under `--start` the refused daemon is not
+started and the others are.
+Override `restart: always` for Windows:
 
 ```yaml
 restart: always
@@ -482,16 +486,17 @@ backend-specific:
 ```
 
 A service installed by an earlier release with `restart: always` on Windows
-still starts, stops and reports: `status`, `list`, `start`, `stop`, `restart`
-and `uninstall` read its embedded copy of the spec and never see this
-refusal. What changes depends on its `type`. A `type: simple` service is no
-longer restarted when the command exits, because the new `goetia-shim` leaves
-every restart to SCM and the service has no recovery actions. A
-`type: managed` service is unchanged: it already had on-failure recovery
-actions, keeps them, and was never restarted after a clean exit. To give a
-`type: simple` service recovery actions, add the override above to the
-manifest and run `goetia daemon install`; `diff` and `install` read the
-manifest.
+is refused by `install` and `diff` as an unreadable artifact, until you run
+`goetia daemon uninstall <id>` and then `goetia daemon install`. `status`,
+`list`, `start`, `stop`, `restart` and `uninstall` read its embedded copy of
+the spec and keep working. What changes while it runs depends on its `type`.
+A `type: simple` service is no longer restarted when the command exits,
+because the new `goetia-shim` leaves every restart to SCM and the service has
+no recovery actions. A `type: managed` service is unchanged: it already had
+on-failure recovery actions, keeps them, and was never restarted after a clean
+exit. To give a `type: simple` service recovery actions, add the override above
+to the manifest, run `goetia daemon uninstall <id>`, then
+`goetia daemon install`.
 
 `${VAR}` is substituted only in the override for the backend being
 installed. The other two are validated as authored, never substituted, so a
@@ -500,13 +505,14 @@ from Linux, `scm: {user: "${ACCT}"}` is unresolvable and therefore
 unchecked, while `systemd: {user: "${ACCT}"}` is substituted and checked
 like any other native value.
 
-A _base_ field is the other case: it is substituted for the backend being
-installed, so it is the resolved value every backend's advisories read.
-Moving `type`, `restart` or `restart-delay` into `.env` does not silence a
-warning or an error the literal would have produced.
-A field that cannot be resolved (an undefined variable, a value its own
-field rejects, or an unreadable `.env`) is skipped on its own: it never changes
-what a check says about another field.
+A host warns only about its native backend, and reads the warning from the
+substituted native spec, base fields included. Moving `type`, `restart` or
+`restart-delay` into `.env` does not silence a warning or an error the
+literal would have produced. systemd has no warnings. launchd warns about a
+`restart-delay` that is not a whole number of seconds. scm warns about
+`type: managed` with `cwd` or `logs`, and about a `restart-delay` it must
+clamp or round. A value written under a backend's own block is still
+checked, and refused, from any host.
 
 ## Machine-readable output
 

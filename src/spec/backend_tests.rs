@@ -301,10 +301,7 @@ fn a_spelling_that_is_not_in_the_table_is_an_ordinary_account() {
 #[skuld::test]
 fn a_templated_user_name_is_not_checked_against_the_builtin_table() {
     let mut spec = shaped_spec();
-    let supplied = Supplied {
-        user: true,
-        ..Supplied::NONE
-    };
+    let supplied = Supplied { user: true };
 
     spec.user = User::Name("${ACCT}".to_string());
     assert!(
@@ -328,10 +325,7 @@ fn a_templated_user_name_is_not_checked_against_the_builtin_table() {
 fn a_numeric_uid_is_rejected_under_scm() {
     let mut spec = shaped_spec();
     spec.user = User::Id(AccountId::Uid(1000));
-    let supplied = Supplied {
-        user: true,
-        ..Supplied::NONE
-    };
+    let supplied = Supplied { user: true };
     assert!(BackendKind::Scm.error(&spec, supplied).is_err());
     assert!(BackendKind::Scm.error(&spec, Supplied::NONE).is_ok());
 }
@@ -340,10 +334,7 @@ fn a_numeric_uid_is_rejected_under_scm() {
 fn a_sid_is_rejected_under_a_posix_backend() {
     let mut spec = shaped_spec();
     spec.user = User::Id(AccountId::Sid("S-1-5-19".to_string()));
-    let supplied = Supplied {
-        user: true,
-        ..Supplied::NONE
-    };
+    let supplied = Supplied { user: true };
     assert!(BackendKind::Systemd.error(&spec, supplied).is_err());
     assert!(BackendKind::Launchd.error(&spec, supplied).is_err());
     assert!(

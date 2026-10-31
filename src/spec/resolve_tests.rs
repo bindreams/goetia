@@ -213,11 +213,7 @@ fn resolve_parses_each_restart_policy() {
         ("on-failure", Restart::OnFailure),
         ("always", Restart::Always),
     ] {
-        // `scm` refuses `always`, so the override keeps this about parsing on any host.
-        let yaml = format!(
-            "daemons:\n  frpc:\n    command: [bin/frpc]\n    restart: {raw}\n    backend-specific:\n      \
-             scm: {{ restart: on-failure }}\n"
-        );
+        let yaml = format!("daemons:\n  frpc:\n    command: [bin/frpc]\n    restart: {raw}\n");
         let (specs, _) = resolve_yaml_as(BackendKind::Systemd, &yaml)
             .unwrap_or_else(|e| panic!("`restart: {raw}` should resolve: {e}"));
         assert_eq!(specs[0].restart, expected, "restart: {raw}");
@@ -276,7 +272,7 @@ daemons:
     logs: "logs/svc.log"
     type: managed
 "#;
-    let (specs, warnings) = resolve_yaml(yaml).expect("accepted with a warning, not rejected");
+    let (specs, warnings) = resolve_yaml_as(BackendKind::Scm, yaml).expect("accepted with a warning, not rejected");
     assert_eq!(specs[0].kind, Kind::Managed);
     assert_eq!(warnings.len(), 1);
     assert_eq!(warnings[0].id.as_ref().map(Id::as_str), Some("svc"));
@@ -293,7 +289,7 @@ daemons:
     logs: "logs/svc.log"
     type: managed
 "#;
-    let (_specs, warnings) = resolve_yaml(yaml).expect("accepted with a warning, not rejected");
+    let (_specs, warnings) = resolve_yaml_as(BackendKind::Scm, yaml).expect("accepted with a warning, not rejected");
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].message.contains("System32"));
     assert!(warnings[0].message.contains("argument"));
@@ -309,64 +305,17 @@ daemons:
     logs: "logs/svc.log"
     type: simple
 "#;
-    let (_specs, warnings) = resolve_yaml(yaml).unwrap();
+    let (_specs, warnings) = resolve_yaml_as(BackendKind::Scm, yaml).unwrap();
     assert!(warnings.is_empty());
 }
 
-// `restart: always` is refused for scm ================================================================================
-
-/// The three things the refusal must tell the author: which daemon, why,
-/// and what to write instead.
-fn assert_names_daemon_reason_and_remedy(err: &Error) {
-    let text = err.to_string();
-    assert!(text.contains("daemon `svc`"), "{text}");
-    assert!(text.contains("never fire after a clean exit"), "{text}");
-    assert!(
-        text.contains("backend-specific: scm: { restart: on-failure }"),
-        "{text}"
-    );
-}
+// `restart: always` ===================================================================================================
+//
+// Resolution accepts it everywhere: whether a backend can honour it is the generator's verdict, at install and
+// preview (`backend::scm::generate::registration`).
 
 #[skuld::test]
-fn managed_always_restart_is_refused() {
-    let yaml = r#"
-daemons:
-  svc:
-    command: [bin/svc.exe]
-    type: managed
-    restart: always
-"#;
-    assert_names_daemon_reason_and_remedy(&resolve_yaml(yaml).unwrap_err());
-}
-
-#[skuld::test]
-fn simple_always_restart_is_refused() {
-    let yaml = r#"
-daemons:
-  svc:
-    command: [bin/svc.exe]
-    type: simple
-    restart: always
-"#;
-    assert_names_daemon_reason_and_remedy(&resolve_yaml(yaml).unwrap_err());
-}
-
-#[skuld::test]
-fn always_is_refused_whichever_backend_is_native_when_scm_inherits_it() {
-    let yaml = r#"
-daemons:
-  svc:
-    command: [bin/svc.exe]
-    restart: always
-"#;
-    for native in BackendKind::ALL {
-        let err = resolve_yaml_as(native, yaml).unwrap_err();
-        assert_names_daemon_reason_and_remedy(&err);
-    }
-}
-
-#[skuld::test]
-fn an_scm_override_of_on_failure_lets_always_through_elsewhere() {
+fn an_scm_override_of_on_failure_applies_only_where_scm_is_native() {
     let yaml = r#"
 daemons:
   svc:
@@ -376,7 +325,7 @@ daemons:
       scm: { restart: on-failure }
 "#;
     for native in BackendKind::ALL {
-        let (specs, warnings) = resolve_yaml_as(native, yaml).expect("the scm override removes the refusal");
+        let (specs, warnings) = resolve_yaml_as(native, yaml).expect("resolves");
         let expected = if native == BackendKind::Scm {
             Restart::OnFailure
         } else {
@@ -388,7 +337,7 @@ daemons:
 }
 
 #[skuld::test]
-fn an_scm_override_that_writes_always_is_refused() {
+fn an_scm_override_that_writes_always_resolves_on_every_native_backend() {
     let yaml = r#"
 daemons:
   svc:
@@ -397,27 +346,18 @@ daemons:
       scm: { restart: always }
 "#;
     for native in BackendKind::ALL {
-        assert_names_daemon_reason_and_remedy(&resolve_yaml_as(native, yaml).unwrap_err());
+        let (specs, _warnings) = resolve_yaml_as(native, yaml).unwrap_or_else(|e| panic!("native {native}: {e}"));
+        let expected = if native == BackendKind::Scm {
+            Restart::Always
+        } else {
+            Restart::Never
+        };
+        assert_eq!(specs[0].restart, expected, "native {native}");
     }
 }
 
 #[skuld::test]
-fn always_in_another_backends_override_is_not_scms_business() {
-    let yaml = r#"
-daemons:
-  svc:
-    command: [bin/svc.exe]
-    backend-specific:
-      systemd: { restart: always }
-      launchd: { restart: always }
-"#;
-    for native in BackendKind::ALL {
-        resolve_yaml_as(native, yaml).expect("only scm refuses always");
-    }
-}
-
-#[skuld::test]
-fn a_templated_always_is_refused_once_substituted() {
+fn a_templated_always_resolves_on_every_native_backend() {
     let yaml = r#"
 daemons:
   svc:
@@ -426,49 +366,10 @@ daemons:
 "#;
     let dir = fixture_dir(yaml, Some("R=always\n"));
     for native in BackendKind::ALL {
-        let err = resolve_as(parse_manifest(yaml), dir.path(), Some(native)).unwrap_err();
-        assert_names_daemon_reason_and_remedy(&err);
+        let (specs, _warnings) = resolve_as(parse_manifest(yaml), dir.path(), Some(native))
+            .unwrap_or_else(|e| panic!("native {native}: {e}"));
+        assert_eq!(specs[0].restart, Restart::Always, "native {native}");
     }
-}
-
-#[skuld::test]
-fn an_undefined_variable_in_an_overridden_base_field_does_not_hide_a_templated_always() {
-    // `${CMD}` is undefined, but every backend replaces `command`, so it can
-    // never reach an installed spec. It must not stop `${R}` from being read.
-    let yaml = r#"
-daemons:
-  svc:
-    command: ["${CMD}"]
-    restart: ${R}
-    backend-specific:
-      systemd: { command: [/bin/a] }
-      launchd: { command: [/bin/a] }
-      scm:     { command: [/bin/a] }
-"#;
-    let dir = fixture_dir(yaml, Some("R=always\n"));
-    for native in BackendKind::ALL {
-        let err = resolve_as(parse_manifest(yaml), dir.path(), Some(native)).unwrap_err();
-        assert_names_daemon_reason_and_remedy(&err);
-    }
-}
-
-#[skuld::test]
-fn an_undefined_variable_in_an_overridden_base_field_does_not_hide_an_advisory() {
-    // Same, for an advisory: a resolvable `${DELAY}` warns like the literal `500ms`.
-    let literal = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    restart-delay: 500ms\n";
-    let templated = "daemons:\n  frpc:\n    command: [\"${CMD}\"]\n    restart-delay: ${DELAY}\n    \
-                     backend-specific:\n      systemd: { command: [/bin/frpc] }\n      \
-                     launchd: { command: [/bin/frpc] }\n      scm: { command: [/bin/frpc] }\n";
-    let dir = fixture_dir("", Some("DELAY=500ms\n"));
-    let native = Some(BackendKind::Systemd);
-    let (_specs, from_literal) = resolve_as(parse_manifest(literal), dir.path(), native).expect("resolves");
-    let (_specs, from_env) = resolve_as(parse_manifest(templated), dir.path(), native).expect("resolves");
-    assert_eq!(
-        from_literal.len(),
-        1,
-        "launchd's rounding advisory is owed: {from_literal:?}"
-    );
-    assert_eq!(from_env, from_literal);
 }
 
 #[skuld::test]
@@ -479,7 +380,7 @@ daemons:
     command: ["bin/frpc"]
     restart-delay: "1.5s"
 "#;
-    let (specs, warnings) = resolve_yaml(yaml).expect("accepted with a warning, not rejected");
+    let (specs, warnings) = resolve_yaml_as(BackendKind::Launchd, yaml).expect("accepted with a warning, not rejected");
 
     // The blob keeps the authored value unrounded, so generation stays
     // deterministic; only `backend::launchd::generate` rounds up.
@@ -500,7 +401,7 @@ daemons:
     command: ["bin/frpc"]
     restart-delay: "2s"
 "#;
-    let (specs, warnings) = resolve_yaml(yaml).unwrap();
+    let (specs, warnings) = resolve_yaml_as(BackendKind::Launchd, yaml).unwrap();
     assert_eq!(specs[0].restart_delay, Some(Duration::from_secs(2)));
     assert!(warnings.is_empty());
 }
@@ -510,7 +411,7 @@ daemons:
 #[skuld::test]
 fn a_sub_second_restart_delay_still_warns() {
     let yaml = "daemons:\n  frpc:\n    command: [bin/frpc]\n    restart-delay: 500ms\n";
-    let (specs, warnings) = resolve_yaml(yaml).expect("accepted with a warning, not rejected");
+    let (specs, warnings) = resolve_yaml_as(BackendKind::Launchd, yaml).expect("accepted with a warning, not rejected");
     assert_eq!(specs[0].restart_delay, Some(Duration::from_millis(500)));
     assert_eq!(warnings.len(), 1);
     // Not just "some warning fired": pin that it is *this* warning, not an
@@ -526,7 +427,7 @@ fn a_sub_second_restart_delay_still_warns() {
 #[skuld::test]
 fn a_whole_second_restart_delay_still_does_not_warn() {
     let yaml = "daemons:\n  frpc:\n    command: [bin/frpc]\n    restart-delay: 3s\n";
-    let (specs, warnings) = resolve_yaml(yaml).unwrap();
+    let (specs, warnings) = resolve_yaml_as(BackendKind::Launchd, yaml).unwrap();
     assert_eq!(specs[0].restart_delay, Some(Duration::from_secs(3)));
     assert!(warnings.is_empty());
 }
@@ -687,7 +588,8 @@ fn huge_restart_delay_saturates_instead_of_overflowing() {
         "daemons:\n  frpc:\n    command: [/bin/frpc]\n    restart-delay: {}s 1ns\n",
         u64::MAX
     );
-    let (specs, warnings) = resolve_yaml(&yaml).expect("a near-`Duration::MAX` delay is accepted, with a warning");
+    let (specs, warnings) =
+        resolve_yaml_as(BackendKind::Launchd, &yaml).expect("a near-`Duration::MAX` delay is accepted, with a warning");
 
     assert_eq!(specs[0].restart_delay, Some(Duration::new(u64::MAX, 1)));
     let [warning] = warnings.as_slice() else {
@@ -1177,15 +1079,8 @@ fn load_does_not_read_the_env_file_when_the_manifest_has_no_dollar() {
 }
 
 #[skuld::test]
-fn an_unreadable_env_file_silences_advisories_rather_than_failing_the_manifest() {
-    // The step-2 gate's two halves, and the reason they are two predicates
-    // rather than one. `.env` is a directory in both manifests below, so
-    // `Vars::load` fails in both.
-    //
-    // Here only the *base* half wants it — the native override replaces the
-    // one `${VAR}` the base writes — and what the base half feeds is
-    // advisories about backends this host cannot install. An advisory it
-    // cannot compute is silent, so the manifest still resolves.
+fn an_unreadable_env_file_fails_only_a_manifest_whose_native_spec_needs_it() {
+    // An unreadable `.env` fails a manifest only when the native spec needs it.
     let dir = fixture_dir("", None);
     std::fs::create_dir(dir.path().join(".env")).expect("fixture directory should be creatable");
     let overridden = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    restart-delay: ${DELAY}\n    \
@@ -1195,8 +1090,6 @@ fn an_unreadable_env_file_silences_advisories_rather_than_failing_the_manifest()
     assert_eq!(specs[0].restart_delay, Some(Duration::from_secs(1)));
     assert!(warnings.is_empty(), "{warnings:?}");
 
-    // Drop the override and the *native* half wants it too — and that half
-    // decides what gets installed, so an unreadable `.env` there is fatal.
     let bare = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    restart-delay: ${DELAY}\n";
     let err = resolve_as(parse_manifest(bare), dir.path(), Some(BackendKind::Systemd)).unwrap_err();
     assert!(matches!(err, Error::Io { .. }), "expected Io, got: {err:?}");
@@ -1551,48 +1444,13 @@ fn windows_style_absolute_paths_in_an_scm_override_are_accepted_on_any_host() {
     resolve_yaml(yaml).expect("a Windows-style absolute path under a non-native `scm:` override must resolve");
 }
 
-#[skuld::test]
-fn dedup_keeps_first_occurrence_and_preserves_order() {
-    let id = Id::try_from("frpc").unwrap();
-    let a = Warning {
-        id: Some(id.clone()),
-        message: "a".to_string(),
-    };
-    let b = Warning {
-        id: Some(id.clone()),
-        message: "b".to_string(),
-    };
-    let warnings = vec![a.clone(), b.clone(), a.clone()];
-    assert_eq!(dedup_warnings(warnings), vec![a, b]);
-}
-
-#[skuld::test]
-fn dedup_does_not_merge_warnings_differing_only_by_id() {
-    let a = Id::try_from("frpc").unwrap();
-    let b = Id::try_from("websocat").unwrap();
-    let w1 = Warning {
-        id: Some(a),
-        message: "same text".to_string(),
-    };
-    let w2 = Warning {
-        id: Some(b),
-        message: "same text".to_string(),
-    };
-    let warnings = vec![w1.clone(), w2.clone()];
-    assert_eq!(dedup_warnings(warnings), vec![w1, w2]);
-}
-
 #[cfg(windows)]
 #[skuld::test]
-fn a_base_drive_relative_path_warns_once_not_once_per_backend_pass() {
-    // The guard on `dedup_warnings`'s call site, and the only one there can
-    // be: three passes keep warnings (step 4's two non-native sweeps and
-    // step 5), `resolve_shape` emits this advisory in each of them for a
-    // base path, and it is the sole warning any two passes ever produce
-    // identically. Deleting the `dedup_warnings` call leaves three. It
-    // cannot fire off Windows — `std::path::absolute` leaves a path
-    // relative only for a Windows prefix without a root — so this stays a
-    // `cfg(windows)` assertion rather than a portable one.
+fn a_base_drive_relative_path_warns_once() {
+    // The native pass is the only one that keeps warnings, so a base path
+    // warns once however many backends the host sweeps. Windows-only: the
+    // advisory fires only where `std::path::absolute` leaves a path
+    // relative, a Windows prefix-without-root property.
     let yaml = "daemons:\n  frpc:\n    command: [\"C:bin/frpc.exe\"]\n";
     let (_specs, warnings) = resolve(parse_manifest(yaml), &base_dir()).expect("resolves");
     assert_eq!(warnings.len(), 1, "{warnings:?}");
@@ -1602,7 +1460,7 @@ fn a_base_drive_relative_path_warns_once_not_once_per_backend_pass() {
 fn windows_divergence_warning_follows_the_scm_merged_spec() {
     let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    type: managed\n    cwd: .\n    backend-specific:\n      \
                 scm:\n        type: simple\n";
-    let (_specs, warnings) = resolve_yaml(yaml).expect("resolves");
+    let (_specs, warnings) = resolve_yaml_as(BackendKind::Scm, yaml).expect("resolves");
     assert!(warnings.is_empty(), "{warnings:?}");
 }
 
@@ -1610,7 +1468,7 @@ fn windows_divergence_warning_follows_the_scm_merged_spec() {
 fn windows_divergence_warning_fires_for_an_scm_only_managed_type() {
     let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    type: simple\n    cwd: .\n    backend-specific:\n      \
                 scm:\n        type: managed\n";
-    let (_specs, warnings) = resolve_yaml(yaml).expect("resolves");
+    let (_specs, warnings) = resolve_yaml_as(BackendKind::Scm, yaml).expect("resolves");
     assert_eq!(warnings.len(), 1, "{warnings:?}");
 }
 
@@ -1618,116 +1476,79 @@ fn windows_divergence_warning_fires_for_an_scm_only_managed_type() {
 fn sub_second_delay_warning_follows_the_launchd_merged_spec() {
     let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    restart-delay: 500ms\n    backend-specific:\n      \
                 launchd:\n        restart-delay: 2s\n";
-    let (_specs, warnings) = resolve_yaml(yaml).expect("resolves");
+    let (_specs, warnings) = resolve_yaml_as(BackendKind::Launchd, yaml).expect("resolves");
     assert!(warnings.is_empty(), "{warnings:?}");
 }
 
 #[skuld::test]
-fn a_backend_advisory_is_emitted_by_exactly_one_pass() {
-    // Named for what it can actually catch: the launchd advisory is emitted
-    // by whichever single pass owns launchd (step 4 where it is non-native,
-    // step 5 where it is), so this fails if some pass emits it twice — but
-    // it is *not* the guard on `dedup_warnings`'s call site. Collapsing
-    // duplicates is only ever exercised by the drive-relative advisory,
-    // which `resolve_shape` emits in every pass that keeps warnings and
-    // which can only fire on Windows: see
-    // `a_base_drive_relative_path_warns_once_not_once_per_backend_pass`.
-    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    restart-delay: 500ms\n";
-    let (_specs, warnings) = resolve_yaml(yaml).expect("resolves");
-    assert_eq!(warnings.len(), 1, "{warnings:?}");
-}
-
-#[skuld::test]
-fn the_native_backend_advisory_comes_from_the_substituted_pass() {
-    // Step 4 skips the native backend entirely, so step 5's `warn` is the
-    // only thing that can produce a native advisory. Driven through
-    // `resolve_as` for every backend in turn, because on any one host two
-    // of the three arms are otherwise unreachable — and the Systemd arm
-    // emits nothing at all, which is why the assertion is keyed on the
-    // advisory each backend actually has.
+fn native_pass_alone_emits_every_native_advisory() {
+    // One row per advisory `BackendKind::warn` can produce. Driven through
+    // `resolve_as` for every backend in turn, because on any one host two of
+    // the three arms are otherwise unreachable.
     let cases = [
+        // `warn_on_sub_second_restart_delay`
         (BackendKind::Launchd, "restart-delay: 500ms", "ThrottleInterval"),
+        // `warn_on_windows_divergences`
         (BackendKind::Scm, "type: managed\n    cwd: .", "silently unavailable"),
+        // `warn_on_over_long_restart_delay`: the clamp, then the rounding.
+        (
+            BackendKind::Scm,
+            "restart: on-failure\n    restart-delay: 100d",
+            "exceeds the ~49.71 days",
+        ),
+        (
+            BackendKind::Scm,
+            "restart: on-failure\n    restart-delay: 1500us",
+            "not a whole number of milliseconds",
+        ),
     ];
     for (native, fields, expected) in cases {
         let yaml = format!("daemons:\n  frpc:\n    command: [/bin/frpc]\n    {fields}\n");
         let (_specs, warnings) = resolve_yaml_as(native, &yaml).expect("resolves");
-        assert_eq!(warnings.len(), 1, "native `{native}`: {warnings:?}");
+        assert_eq!(warnings.len(), 1, "native `{native}`, `{fields}`: {warnings:?}");
         assert!(
             warnings[0].message.contains(expected),
-            "native `{native}`: {warnings:?}"
+            "native `{native}`, `{fields}`: {warnings:?}"
         );
     }
 }
 
 #[skuld::test]
-fn a_templated_base_field_reaches_every_backends_advisories() {
-    // A base `type`/`restart`/`restart-delay` written as `${VAR}` is
-    // `Shaped::Deferred` in the authored sweep, so an advisory computed
-    // there reads `None` and stays silent — while step 5 substitutes that
-    // same base value and returns it in the resolved spec. Moving one field
-    // into `.env` must not delete a warning about the value that is
-    // installed either way, so the two manifests are asserted equal rather
-    // than counted: they resolve to the same spec, so they owe the same
-    // advisories.
-    //
-    // Both halves of that line are driven: a base whose `${VAR}` fields the
-    // native override leaves alone, and one whose every `${VAR}` field it
-    // replaces. The second is why the step-2 `.env` gate must ask the base
-    // spec too — with the merged native spec left literal, a gate reading
-    // only that skips `.env`, and every advisory computed from the
-    // substituted base falls back to the deferred authored spec and vanishes.
-    let dir = fixture_dir("", Some("KIND=managed\nRESTART=on-failure\nDELAY=60d\nSUB=500ms\n"));
-
-    // `systemd` native, so every warning below comes from the two
-    // non-native backends: `Systemd.warn` has no advisories of its own —
-    // which is also why the `systemd:` override below cannot be what
-    // silences anything.
-    let native = Some(BackendKind::Systemd);
-    let owed_alike = |literal: &str, templated: &str, expected: usize| {
-        let (_specs, from_literal) =
-            resolve_as(parse_manifest(literal), dir.path(), native).expect("resolves, with advisories");
-        let (_specs, from_env) =
-            resolve_as(parse_manifest(templated), dir.path(), native).expect("resolves, with advisories");
-        assert_eq!(
-            from_literal.len(),
-            expected,
-            "the literal manifest owes {expected}: {from_literal:?}"
-        );
-        assert_eq!(
-            from_env, from_literal,
-            "a base field moved into `.env` must keep every advisory it had as a literal"
-        );
-    };
-
+fn a_templated_base_field_keeps_the_native_advisories_it_had_as_a_literal() {
+    // The native advisories read the substituted native spec, so moving a
+    // base `type`/`restart`/`restart-delay` into `.env` must not delete a
+    // warning about the value that is installed either way. The two
+    // manifests resolve to the same spec, so they owe the same advisories.
+    let dir = fixture_dir("", Some("KIND=managed\nRESTART=on-failure\nDELAY=500500us\n"));
     let fields = |kind: &str, restart: &str, delay: &str| {
         format!(
             "daemons:\n  frpc:\n    command: [/bin/frpc]\n    cwd: .\n    type: {kind}\n    \
              restart: {restart}\n    restart-delay: {delay}\n"
         )
     };
-    owed_alike(
-        &fields("managed", "on-failure", "60d"),
-        &fields("${KIND}", "${RESTART}", "${DELAY}"),
-        2,
-    );
-
-    // The same pair, with a `systemd:` override replacing every field the
-    // templated base writes a `${VAR}` in, so the merged native spec is
-    // `$`-free. `500ms` rather than `60d` so the second advisory comes from
-    // launchd's `ThrottleInterval` rounding: two backends, not one.
-    let overridden = |kind: &str, restart: &str, delay: &str| {
-        format!(
-            "{}    backend-specific:\n      systemd:\n        type: simple\n        restart: never\n        \
-             restart-delay: 1s\n",
-            fields(kind, restart, delay)
+    for (native, expected) in [(BackendKind::Launchd, 1), (BackendKind::Scm, 2)] {
+        let (_specs, from_literal) = resolve_as(
+            parse_manifest(&fields("managed", "on-failure", "500500us")),
+            dir.path(),
+            Some(native),
         )
-    };
-    owed_alike(
-        &overridden("managed", "on-failure", "500ms"),
-        &overridden("${KIND}", "${RESTART}", "${SUB}"),
-        2,
-    );
+        .expect("resolves, with advisories");
+        let (_specs, from_env) = resolve_as(
+            parse_manifest(&fields("${KIND}", "${RESTART}", "${DELAY}")),
+            dir.path(),
+            Some(native),
+        )
+        .expect("resolves, with advisories");
+        assert_eq!(
+            from_literal.len(),
+            expected,
+            "native `{native}`: the literal manifest owes {expected}: {from_literal:?}"
+        );
+        assert_eq!(
+            from_env, from_literal,
+            "native `{native}`: a base field moved into `.env` must keep every advisory it had as a literal"
+        );
+    }
 }
 
 #[skuld::test]
@@ -1740,14 +1561,14 @@ fn an_unrelated_daemon_cannot_change_a_daemons_advisories() {
     // `other` is there, and whether or not `other` is the daemon whose
     // `${VAR}` forces `.env` to be read.
     let frpc = "  frpc:\n    command: [/bin/frpc]\n    restart-delay: ${DELAY}\n    backend-specific:\n      \
-                systemd:\n        restart-delay: 1s\n";
+                launchd:\n        restart-delay: 500ms\n";
     let other = "  other:\n    command: [/bin/other]\n    name: ${DELAY}\n";
     let alone = format!("daemons:\n{frpc}");
     let with_sibling = format!("daemons:\n{frpc}{other}");
-    let dir = fixture_dir("", Some("DELAY=500ms\n"));
+    let dir = fixture_dir("", Some("DELAY=2s\n"));
 
     let owed_by_frpc = |yaml: &str| {
-        let (_specs, warnings) = resolve_as(parse_manifest(yaml), dir.path(), Some(BackendKind::Systemd))
+        let (_specs, warnings) = resolve_as(parse_manifest(yaml), dir.path(), Some(BackendKind::Launchd))
             .expect("resolves, with advisories");
         warnings
             .into_iter()
@@ -1761,23 +1582,6 @@ fn an_unrelated_daemon_cannot_change_a_daemons_advisories() {
         owed_by_frpc(&with_sibling),
         solo,
         "adding an unrelated daemon must not change what `frpc` is owed"
-    );
-}
-
-#[skuld::test]
-fn a_templated_override_field_stays_unchecked_on_a_backend_that_cannot_resolve_it() {
-    // The other half of the line above, and the one that must stay silent:
-    // a value the *override itself* supplied is never substituted for a
-    // non-native backend, so it is genuinely unresolvable from here — the
-    // honest "cannot resolve" case `spec::backend`'s module doc names.
-    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    cwd: .\n    backend-specific:\n      scm:\n        \
-                type: ${KIND}\n";
-    let dir = fixture_dir(yaml, Some("KIND=managed\n"));
-    let (_specs, warnings) =
-        resolve_as(parse_manifest(yaml), dir.path(), Some(BackendKind::Systemd)).expect("resolves");
-    assert!(
-        warnings.is_empty(),
-        "`scm` is not substituted for from a systemd host: {warnings:?}"
     );
 }
 
@@ -1820,11 +1624,11 @@ fn a_host_with_no_native_backend_resolves_the_base_spec_alone() {
     let (specs, _warnings) = resolve_as(parse_manifest(yaml), &base_dir(), None).expect("resolves");
     assert_eq!(specs[0].name, "base");
 
-    // No backend is native, so none is skipped: every advisory still fires.
+    // No backend is native, so no backend's advisories are this host's to give.
     let advisory = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    cwd: .\n    type: managed\n    \
                     restart: on-failure\n    restart-delay: 60d\n";
     let (_specs, warnings) = resolve_as(parse_manifest(advisory), &base_dir(), None).expect("resolves");
-    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    assert!(warnings.is_empty(), "{warnings:?}");
 }
 
 #[skuld::test]
@@ -1989,13 +1793,13 @@ fn a_base_named_system_account_resolves_under_every_backend() {
 }
 
 #[skuld::test]
-fn an_over_long_restart_delay_warns_on_every_host() {
+fn an_over_long_restart_delay_warns_when_scm_is_native() {
     // `restart: on-failure` is load-bearing: the advisory is unreachable for `Restart::Never`.
     let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    type: managed\n    restart: on-failure\n    restart-delay: 100d\n";
-    let (_specs, warnings) = resolve_yaml(yaml).expect("resolves, with a warning");
+    let (_specs, warnings) = resolve_yaml_as(BackendKind::Scm, yaml).expect("resolves, with a warning");
     assert!(
         warnings.iter().any(|w| w.message.contains("restart-delay")),
-        "expected the SCM clamp advisory on every host: {warnings:?}"
+        "expected the SCM clamp advisory: {warnings:?}"
     );
 }
 
@@ -2008,7 +1812,7 @@ fn over_long_restart_delay_warns_for_simple_too() {
     restart: on-failure
     restart-delay: 100d
 ";
-    let (_specs, warnings) = resolve_yaml(yaml).expect("resolves, with a warning");
+    let (_specs, warnings) = resolve_yaml_as(BackendKind::Scm, yaml).expect("resolves, with a warning");
     assert!(
         warnings.iter().any(|w| w.message.contains("SC_ACTION")),
         "a simple daemon's restart-delay is an SC_ACTION.Delay now and is clamped like a managed one: {warnings:?}"
@@ -2024,7 +1828,7 @@ fn an_over_long_restart_delay_with_no_type_does_not_warn() {
         "daemons:\n  frpc:\n    command: [/bin/frpc]\n    restart-delay: {}s 1ns\n",
         u64::MAX
     );
-    let (_specs, warnings) = resolve_yaml(&yaml).expect("resolves");
+    let (_specs, warnings) = resolve_yaml_as(BackendKind::Scm, &yaml).expect("resolves");
     assert!(
         !warnings.iter().any(|w| w.message.contains("SC_ACTION")),
         "the SCM clamp advisory is unreachable with no `restart:`: {warnings:?}"
@@ -2222,4 +2026,85 @@ fn a_dollar_in_a_user_id_is_rejected_under_every_backend() {
     );
     let err = resolve_yaml(&yaml).unwrap_err();
     assert!(err.to_string().contains(interpolate::USER_ID_MESSAGE), "{err}");
+}
+
+// A host warns only about its native backend ==========================================================================
+
+#[skuld::test]
+fn base_restart_always_resolves_on_every_native_backend() {
+    // Whether a backend can honour `always` is its generator's verdict, at install and preview: the
+    // base spec is nobody's override, so resolution accepts it.
+    let yaml = "daemons:
+  svc:
+    command: [/bin/svc]
+    restart: always
+";
+    for native in BackendKind::ALL {
+        let (specs, _warnings) = resolve_yaml_as(native, yaml).unwrap_or_else(|e| panic!("native `{native}`: {e}"));
+        assert_eq!(specs[0].restart, Restart::Always, "native `{native}`");
+    }
+}
+
+#[skuld::test]
+fn a_host_warns_only_about_its_native_backend() {
+    // One manifest that trips every advisory: `type: managed` with a `cwd` (SCM divergence), `on-failure` with
+    // a delay that is neither whole seconds (launchd) nor whole milliseconds (SCM).
+    let yaml = "daemons:
+  frpc:
+    command: [/bin/frpc]
+    type: managed
+    cwd: .
+    restart: on-failure
+    restart-delay: 500500us
+";
+
+    let (_specs, warnings) = resolve_yaml_as(BackendKind::Systemd, yaml).expect("resolves");
+    assert!(warnings.is_empty(), "systemd has no advisories: {warnings:?}");
+
+    let (_specs, warnings) = resolve_yaml_as(BackendKind::Launchd, yaml).expect("resolves");
+    let [launchd] = warnings.as_slice() else {
+        panic!("launchd owes exactly its own advisory: {warnings:?}");
+    };
+    assert!(launchd.message.contains("not a whole number of seconds"), "{launchd:?}");
+
+    let (_specs, warnings) = resolve_yaml_as(BackendKind::Scm, yaml).expect("resolves");
+    let [divergence, rounding] = warnings.as_slice() else {
+        panic!("scm owes exactly its own two advisories: {warnings:?}");
+    };
+    assert!(divergence.message.contains("silently unavailable"), "{divergence:?}");
+    assert!(
+        rounding.message.contains("not a whole number of milliseconds"),
+        "{rounding:?}"
+    );
+}
+
+#[skuld::test]
+fn a_supplied_non_native_value_is_still_refused() {
+    let yaml = "daemons:
+  frpc:
+    command: [/bin/frpc]
+    backend-specific:
+      scm:
+        user: { id: 1000 }
+";
+    let err = resolve_yaml_as(BackendKind::Systemd, yaml).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "daemon `frpc`: backend-specific.scm: `1000` is a numeric uid, which is never a Windows account"
+    );
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn a_non_native_overrides_drive_relative_path_does_not_warn() {
+    // The advisory is about a path the installed spec would carry; the systemd override is not it.
+    let yaml = "daemons:
+  frpc:
+    command: [/bin/frpc]
+    backend-specific:
+      systemd:
+        command: [\"C:bin/frpc.exe\"]
+";
+    let (_specs, warnings) = resolve_yaml_as(BackendKind::Scm, yaml).expect("resolves");
+    assert!(warnings.is_empty(), "{warnings:?}");
 }

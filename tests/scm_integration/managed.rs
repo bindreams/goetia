@@ -10,11 +10,12 @@ use goetia::backend::scm::manager::ScmManager;
 use goetia::decide::Outcome;
 use goetia::manager::conformance;
 use goetia::manager::{Budget, Installed, ServiceManager as _, State};
-use goetia::spec::{AccountId, DaemonSpec, Id, Restart, User};
+use goetia::spec::{AccountId, DaemonSpec, Id, Kind, Restart, User};
 use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
+use windows_sys::Win32::System::Registry::RegSetValueExW;
 use winreg::RegKey;
-use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
 
 use crate::common::{self, conformance_mk, fixture_command, mk_spec};
 use crate::deny::Denied;
@@ -532,6 +533,187 @@ fn managed_kind_environment_availability() {
     );
 }
 
+// `Environment` is part of the compared registration ==================================================================
+
+fn environment_key(id: &str, access: u32) -> RegKey {
+    let path = format!(r"{}\{id}", support::SCM_SERVICES_KEY);
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(&path, access)
+        .unwrap_or_else(|e| panic!(r"open HKLM\{path}: {e}"))
+}
+
+fn environment_of(id: &str) -> Option<Vec<String>> {
+    match environment_key(id, KEY_READ).get_value::<Vec<String>, _>("Environment") {
+        Ok(lines) => Some(lines),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => panic!("read Environment of {id}: {e}"),
+    }
+}
+
+/// A drifted registration previews as a `Conflict`, `install --force` restores it, and the next
+/// preview is `UpToDate`. Returns the conflict's diff.
+fn assert_conflict_cleared_by_force(mgr: &ScmManager, spec: &DaemonSpec) -> String {
+    let outcome = mgr.preview_install(spec).expect("preview_install");
+    let Outcome::Conflict { artifact_diff, .. } = outcome else {
+        panic!("expected Conflict for a hand-edited registration, got {outcome:?}");
+    };
+
+    let forced = mgr.install(spec, true).expect("forced install");
+    assert!(!matches!(forced, Outcome::Conflict { .. }), "{forced:?}");
+    let again = mgr.preview_install(spec).expect("preview_install after force");
+    assert!(matches!(again, Outcome::UpToDate), "{again:?}");
+    artifact_diff
+}
+
+const INSTALLED_ENVIRONMENT: &str = "GOETIA_TEST_KEY=value";
+
+/// An installed `type: managed` service whose spec sets one environment variable.
+fn install_with_environment(mgr: &ScmManager, id: &str) -> DaemonSpec {
+    let env = BTreeMap::from([("GOETIA_TEST_KEY".to_string(), "value".to_string())]);
+    let spec = mk_spec(id, fixture_command(id, 1, 1, "plain"), env);
+    mgr.install(&spec, false).expect("install");
+    spec
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_hand_edited_environment_is_a_conflict() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = install_with_environment(&mgr, &id);
+
+    environment_key(&id, KEY_WRITE)
+        .set_value("Environment", &vec!["HAND_EDITED=1".to_string()])
+        .expect("overwrite Environment");
+
+    let diff = assert_conflict_cleared_by_force(&mgr, &spec);
+    assert!(diff.contains("HAND_EDITED=1"), "{diff}");
+    assert_eq!(environment_of(&id), Some(vec![INSTALLED_ENVIRONMENT.to_string()]));
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_deleted_environment_is_a_conflict() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = install_with_environment(&mgr, &id);
+
+    environment_key(&id, KEY_WRITE)
+        .delete_value("Environment")
+        .expect("delete Environment");
+
+    assert_conflict_cleared_by_force(&mgr, &spec);
+    assert_eq!(environment_of(&id), Some(vec![INSTALLED_ENVIRONMENT.to_string()]));
+}
+
+/// Failure actions are compared too, and `sc.exe` is how they are edited by hand.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn reset_failure_actions_are_a_conflict() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = common::mk_spec_full(
+        &id,
+        fixture_command(&id, 1, 1, "plain"),
+        BTreeMap::new(),
+        User::Root,
+        Restart::OnFailure,
+        Some(Duration::from_secs(3)),
+    );
+    mgr.install(&spec, false).expect("install");
+
+    support::cmd::run("sc.exe", &["failureflag", &id, "0"]).expect_ok();
+    support::cmd::run("sc.exe", &["failure", &id, "reset=", "0", "actions=", ""]).expect_ok();
+
+    let diff = assert_conflict_cleared_by_force(&mgr, &spec);
+    assert!(diff.contains("FailureActions"), "{diff}");
+}
+
+/// A wrong-typed `Environment` is a hand edit too: a `Conflict` that `--force` clears, not an error.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_wrong_typed_environment_is_a_conflict() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = install_with_environment(&mgr, &id);
+
+    environment_key(&id, KEY_WRITE)
+        .set_value("Environment", &INSTALLED_ENVIRONMENT)
+        .expect("overwrite Environment with a REG_SZ");
+
+    let diff = assert_conflict_cleared_by_force(&mgr, &spec);
+    assert!(diff.contains("REG_SZ"), "{diff}");
+    assert_eq!(environment_of(&id), Some(vec![INSTALLED_ENVIRONMENT.to_string()]));
+}
+
+/// The registry stores any type number; `winreg` cannot read one above `REG_QWORD` (11).
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn an_environment_of_an_unknown_registry_type_is_a_conflict() {
+    const UNKNOWN_TYPE: u32 = 12;
+
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = install_with_environment(&mgr, &id);
+
+    let key = environment_key(&id, KEY_WRITE);
+    let name: Vec<u16> = "Environment\0".encode_utf16().collect();
+    let data = INSTALLED_ENVIRONMENT.as_bytes();
+    // SAFETY: `key` holds an open handle with write access; `name` is NUL-terminated and `data` is
+    // `data.len()` readable bytes, both outliving the call.
+    let status = unsafe {
+        RegSetValueExW(
+            key.raw_handle(),
+            name.as_ptr(),
+            0,
+            UNKNOWN_TYPE,
+            data.as_ptr(),
+            data.len() as u32,
+        )
+    };
+    assert_eq!(status, 0, "write an Environment of type {UNKNOWN_TYPE}: error {status}");
+
+    let diff = assert_conflict_cleared_by_force(&mgr, &spec);
+    assert!(diff.contains(&format!("type {UNKNOWN_TYPE}")), "{diff}");
+    assert_eq!(environment_of(&id), Some(vec![INSTALLED_ENVIRONMENT.to_string()]));
+}
+
+/// An `UpToDate` install writes nothing, so a second install of either kind must compare equal on
+/// everything the first wrote: failure actions, `Environment`, `Parameters`. A `type: simple`
+/// service's `Environment` is empty on both sides, whatever its spec's `env` says. It is registered
+/// but never started, so no shim binary is needed.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn install_twice_is_up_to_date_for_both_kinds() {
+    let mgr = ScmManager::new();
+    for kind in [Kind::Managed, Kind::Simple] {
+        let id = support::random_test_id();
+        let _guard = ServiceGuard::new(&id);
+        let env = BTreeMap::from([("GOETIA_TEST_KEY".to_string(), "value".to_string())]);
+        let spec = DaemonSpec {
+            kind,
+            ..common::mk_spec_full(
+                &id,
+                fixture_command(&id, 1, 1, "plain"),
+                env,
+                User::Root,
+                Restart::OnFailure,
+                Some(Duration::from_secs(3)),
+            )
+        };
+
+        let first = mgr.install(&spec, false).expect("install");
+        assert!(matches!(first, Outcome::Create), "{kind:?}: {first:?}");
+        let second = mgr.install(&spec, false).expect("reinstall, unchanged spec");
+        assert!(matches!(second, Outcome::UpToDate), "{kind:?}: {second:?}");
+
+        let expected = match kind {
+            Kind::Managed => Some(vec!["GOETIA_TEST_KEY=value".to_string()]),
+            Kind::Simple => None,
+        };
+        assert_eq!(environment_of(&id), expected, "{kind:?}");
+    }
+}
+
 // Step 7: a real account gets SeServiceLogonRight =====================================================================
 
 struct LocalUserGuard {
@@ -777,6 +959,68 @@ fn a_builtin_account_is_never_given_a_stale_password() {
     let _ = mgr.stop(&target, Budget::DEFAULT);
 }
 
+// A precondition that fails fails the install before any service write ================================================
+
+/// One `install` of `id` as `account`, with a password set, in a child process (see `install_helper.rs`).
+fn install_as(id: &str, account: &str) -> std::process::Output {
+    Command::new(support::current_exe_str())
+        .arg(INSTALL_AS)
+        .arg(id)
+        .arg(account)
+        .env("GOETIA_SERVICE_PASSWORD", "Goetia!Test12")
+        .output()
+        .expect("spawn the install-as-account helper")
+}
+
+/// A `user.name` is not resolved at install time, so an account that does not exist reaches the
+/// `SeServiceLogonRight` grant, which cannot look it up: the first precondition of `apply` fails.
+fn missing_account() -> String {
+    format!("gtnone{:08x}", rand::random::<u32>())
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_failed_precondition_creates_no_service() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let account = missing_account();
+
+    let output = install_as(guard.id(), &format!(r".\{account}"));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "install as a missing account succeeded: {stdout}"
+    );
+    assert!(stdout.contains(&account), "the error must name the account: {stdout}");
+    let query = support::cmd::run("sc.exe", &["query", guard.id()]);
+    assert!(
+        !query.ok(),
+        "no service may exist after a failed precondition:\n{query}"
+    );
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_failed_precondition_leaves_an_installed_service_unchanged() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = install_plain(&mgr, &id);
+    let account_before = common::query_account_name(&id);
+
+    let account = missing_account();
+    let output = install_as(&id, &format!(r".\{account}"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        !output.status.success(),
+        "install as a missing account succeeded: {stdout}"
+    );
+    assert!(stdout.contains(&account), "the error must name the account: {stdout}");
+    assert_eq!(common::query_account_name(&id), account_before);
+    let after = mgr.preview_install(&spec).expect("preview_install");
+    assert!(matches!(after, Outcome::UpToDate), "{after:?}");
+}
+
 // Round-tripping restart: on-failure (the Some(fa) branch of apply_failure_actions/read_failure_actions) ==============
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -871,6 +1115,37 @@ fn deleted_account_makes_the_service_oursunreadable() {
             panic!("expected OursUnreadable once the account backing `user.id` is deleted")
         }
     }
+}
+
+/// The generator refuses to regenerate a blob that says `restart: always`: an install over it is
+/// unreadable, not a silent rewrite.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn install_refuses_an_always_blob_as_unreadable() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = install_plain(&mgr, &id);
+
+    let always = DaemonSpec {
+        restart: Restart::Always,
+        ..spec.clone()
+    };
+    let path = format!(r"{}\{id}\Parameters", support::SCM_SERVICES_KEY);
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(&path, KEY_WRITE)
+        .unwrap_or_else(|e| panic!(r"open HKLM\{path}: {e}"))
+        .set_value("Spec", &goetia::blob::encode(&always))
+        .expect("write Spec");
+
+    let outcome = mgr.preview_install(&spec).expect("preview_install");
+    let Outcome::RefuseUnreadable { reason, recovery } = &outcome else {
+        panic!("expected RefuseUnreadable for an always blob, got {outcome:?}");
+    };
+    assert!(reason.contains("restart: always"), "{reason}");
+    assert!(
+        recovery.contains(&format!("goetia daemon uninstall {id}")),
+        "{recovery}"
+    );
 }
 
 // A read that did not complete: the aggregate, and the two objects that produce it ====================================

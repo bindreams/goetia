@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use super::*;
+use crate::spec::Restart;
 
 fn dummy_reg(account: Option<&str>) -> ScmRegistration {
     ScmRegistration {
@@ -15,6 +16,7 @@ fn dummy_reg(account: Option<&str>) -> ScmRegistration {
         arguments: vec![],
         account: account.map(str::to_string),
         failure_actions: None,
+        environment: vec![],
         parameters: BTreeMap::new(),
     }
 }
@@ -499,21 +501,6 @@ fn daemon_spec(restart: crate::spec::Restart) -> DaemonSpec {
     }
 }
 
-/// A `DaemonSpec` that did not come from `resolve` must not install with on-failure semantics.
-#[skuld::test]
-fn install_refuses_restart_always_before_touching_the_scm() {
-    let err = refuse_always(&daemon_spec(crate::spec::Restart::Always)).unwrap_err();
-    let text = err.to_string();
-    assert!(text.contains("frpc") && text.contains("restart: always"), "{text}");
-}
-
-#[skuld::test]
-fn install_accepts_every_other_restart() {
-    for restart in [crate::spec::Restart::Never, crate::spec::Restart::OnFailure] {
-        refuse_always(&daemon_spec(restart)).unwrap();
-    }
-}
-
 // start_kind ----------------------------------------------------------------------------------------------------------
 
 fn blob_of(kind: Kind) -> Blob {
@@ -563,23 +550,23 @@ fn a_failed_start_names_the_blob_read_error_that_made_it_strict() {
     assert!(strict.contains("invalid blob JSON: EOF"), "{strict}");
 }
 
-/// A service installed before `resolve` refused `restart: always` keeps a blob that says so. It decodes, and
-/// a `type: simple` one starts by the shim's vocabulary like any other.
+/// A blob that says `restart: always` decodes, and a `type: simple` one starts by the shim's vocabulary like
+/// any other.
 #[skuld::test]
 fn a_blob_that_says_always_decodes_and_starts_as_its_kind() {
     let spec = DaemonSpec {
         restart: Restart::Always,
         ..blob_of(Kind::Simple).spec
     };
-    let reg = generate::registration(
-        &spec,
-        &crate::backend::Identity {
-            user: "svc-frpc".to_string(),
-        },
-        &PathBuf::from(r"C:\shim\goetia-shim.exe"),
-    );
+    // Hand-write the blob: `registration` refuses `always`.
+    let parameters = BTreeMap::from([
+        ("Marker".to_string(), crate::blob::MARKER.to_string()),
+        ("Schema".to_string(), crate::blob::SCHEMA.to_string()),
+        ("Version".to_string(), crate::version().to_string()),
+        ("Spec".to_string(), crate::blob::encode(&spec)),
+    ]);
 
-    let blob = generate::extract(&reg.parameters)
+    let blob = generate::extract(&parameters)
         .expect("the blob decodes")
         .expect("the blob is ours");
 
@@ -587,10 +574,10 @@ fn a_blob_that_says_always_decodes_and_starts_as_its_kind() {
     assert_eq!(start_kind(Ok(Some(blob))), (Kind::Simple, None));
 }
 
-// refuse_always at its call sites -------------------------------------------------------------------------------------
+// The generator's refusal at its call sites ---------------------------------------------------------------------------
 
-/// `install` and `preview_install` refuse `always` before anything reads the SCM, so the refusal is
-/// reachable without one.
+/// `install` and `preview_install` regenerate the desired registration before anything reads the SCM,
+/// so the generator's refusal is reachable without one.
 #[skuld::test]
 fn install_and_preview_install_refuse_restart_always() {
     let mgr = ScmManager::new();
