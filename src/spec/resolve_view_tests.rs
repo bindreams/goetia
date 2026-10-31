@@ -2,8 +2,8 @@
 //! value the install for that backend would read, and one field's failure
 //! never changes another field's verdict.
 //!
-//! The fields the checks read are exactly those `Backend::reject_merged` and
-//! `Backend::warn` (and the advisories they call) read off a `ShapedSpec`:
+//! The fields the checks read are exactly those `BackendKind::reject_merged` and
+//! `BackendKind::warn` (and the advisories they call) read off a `ShapedSpec`:
 //! `restart` (the `scm` refusal, the over-long-delay advisory), `restart-delay`
 //! (launchd rounding, the over-long-delay advisory), `type` (both `scm`
 //! advisories), and `cwd` and `logs` (presence only, for the managed
@@ -27,7 +27,7 @@ fn env_dir(env: Option<&str>) -> tempfile::TempDir {
     dir
 }
 
-fn run(yaml: &str, dir: &Path, native: Backend) -> Result<Vec<Warning>, String> {
+fn run(yaml: &str, dir: &Path, native: BackendKind) -> Result<Vec<Warning>, String> {
     resolve_as(parse_manifest(yaml), dir, Some(native))
         .map(|(_specs, warnings)| warnings)
         .map_err(|e| e.to_string())
@@ -114,7 +114,7 @@ impl Field {
 
 /// A one-daemon manifest: `base` lines (a `command` is added unless `base`
 /// sets one) and one `backend-specific.<native>` override.
-fn manifest(base: &[(Field, String)], native: Backend, overrides: &[(Field, String)]) -> String {
+fn manifest(base: &[(Field, String)], native: BackendKind, overrides: &[(Field, String)]) -> String {
     let mut yaml = String::from("daemons:\n  svc:\n");
     if base.iter().all(|(field, _)| *field != Field::Command) {
         yaml.push_str("    command: [\"/bin/svc\"]\n");
@@ -261,7 +261,7 @@ impl Scenario {
 #[skuld::test]
 fn an_unrelated_field_that_fails_never_changes_the_verdict_on_a_field_the_checks_read() {
     for scenario in &SCENARIOS {
-        for native in Backend::ALL {
+        for native in BackendKind::ALL {
             for unrelated in FIELDS.into_iter().filter(|f| !scenario.reads(*f)) {
                 for (mode, template, env_bad) in [
                     ("unsubstitutable", "${NOPE}", false),
@@ -307,7 +307,7 @@ fn a_field_under_test_that_cannot_be_determined_is_unjudged() {
     // Nothing may be judged on it: the verdict is that of the manifest with the
     // field not written at all.
     for scenario in &SCENARIOS {
-        for native in Backend::ALL {
+        for native in BackendKind::ALL {
             for (mode, template, env) in [
                 ("undefined", "${NOPE}".to_string(), Some("X=1\n".to_string())),
                 (
@@ -346,8 +346,8 @@ fn a_templated_field_in_a_non_native_override_is_unjudged() {
     // A backend this host cannot install never has its override substituted,
     // so the `$` stays deferred: the verdict is that of the unwritten field.
     for scenario in &SCENARIOS {
-        for native in Backend::ALL {
-            for other in Backend::ALL.into_iter().filter(|b| *b != native) {
+        for native in BackendKind::ALL {
+            for other in BackendKind::ALL.into_iter().filter(|b| *b != native) {
                 let label = format!("{} / native {native} / templated in {other}", scenario.name);
                 let dir = env_dir(Some(&format!("V={}\n", scenario.value)));
 
@@ -380,7 +380,7 @@ fn a_restart_delay_that_substitutes_to_garbage_does_not_hide_a_templated_always(
     let yaml = "daemons:\n  svc:\n    command: [/bin/svc]\n    restart: ${R}\n    restart-delay: ${D}\n    \
                 backend-specific:\n      systemd: { restart-delay: 5s }\n      launchd: { restart-delay: 5s }\n";
     let dir = env_dir(Some("R=always\nD=garbage\n"));
-    for native in [Backend::Systemd, Backend::Launchd] {
+    for native in [BackendKind::Systemd, BackendKind::Launchd] {
         assert_refused(&run(yaml, dir.path(), native), &format!("native {native}"));
     }
 }
@@ -390,7 +390,7 @@ fn an_empty_cwd_that_substitutes_does_not_hide_a_templated_always() {
     let yaml = "daemons:\n  svc:\n    command: [/bin/svc]\n    restart: ${R}\n    cwd: ${C}\n    \
                 backend-specific:\n      systemd: { cwd: /srv/s }\n      launchd: { cwd: /srv/s }\n";
     let dir = env_dir(Some("R=always\nC=\n"));
-    for native in [Backend::Systemd, Backend::Launchd] {
+    for native in [BackendKind::Systemd, BackendKind::Launchd] {
         assert_refused(&run(yaml, dir.path(), native), &format!("native {native}"));
     }
 }
@@ -401,8 +401,8 @@ fn an_unknown_type_that_substitutes_does_not_hide_an_advisory() {
                      backend-specific:\n      systemd: { type: simple }\n      scm: { type: simple }\n";
     let literal = "daemons:\n  svc:\n    command: [/bin/svc]\n    restart-delay: 500ms\n    type: simple\n";
     let dir = env_dir(Some("D=500ms\nK=bogus\n"));
-    let from_env = run(templated, dir.path(), Backend::Systemd).expect("resolves");
-    let from_literal = run(literal, dir.path(), Backend::Systemd).expect("resolves");
+    let from_env = run(templated, dir.path(), BackendKind::Systemd).expect("resolves");
+    let from_literal = run(literal, dir.path(), BackendKind::Systemd).expect("resolves");
     assert!(
         from_literal.iter().any(|w| w.message.contains("ThrottleInterval")),
         "{from_literal:?}"
@@ -415,7 +415,7 @@ fn a_path_that_substitutes_to_a_value_with_a_dollar_is_still_determined() {
     // A real path can contain `$`; only a failed substitution makes a field
     // undeterminable, never the text it resolved to.
     for (field, line) in [(Field::Cwd, "cwd"), (Field::Logs, "logs")] {
-        for native in [Backend::Systemd, Backend::Launchd] {
+        for native in [BackendKind::Systemd, BackendKind::Launchd] {
             let label = format!("{field:?} / native {native}");
             let templated = format!(
                 "daemons:\n  svc:\n    command: [/bin/svc]\n    type: managed\n    {line}: ${{P}}\n    \
@@ -441,7 +441,7 @@ fn a_default_is_not_the_resolved_value_when_env_cannot_be_read() {
     let yaml = "daemons:\n  svc:\n    command: [/bin/svc]\n    restart: ${R:-always}\n    \
                 backend-specific:\n      systemd: { restart: on-failure }\n      launchd: { restart: on-failure }\n";
     let dir = env_dir(Some("this is not valid\n"));
-    for native in [Backend::Systemd, Backend::Launchd] {
+    for native in [BackendKind::Systemd, BackendKind::Launchd] {
         run(yaml, dir.path(), native).unwrap_or_else(|e| panic!("native {native}: judged on a guess: {e}"));
     }
 }

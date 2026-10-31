@@ -127,7 +127,7 @@ pub struct FailureActions {
 /// Build the [`ScmRegistration`] for `spec`. A `restart-delay` is rounded up to whole
 /// milliseconds and clamped to what `SC_ACTION.Delay` can express, rather than left to
 /// panic at install time — see `scm_restart_delay`; the advisories for those now
-/// fire at resolve time, from `Backend::Scm.warn`, on every host, rather
+/// fire at resolve time, from `BackendKind::Scm.warn`, on every host, rather
 /// than only when this effectful-install-time generator happens to run.
 ///
 /// `id` is the account already resolved by the effectful install path (see
@@ -207,7 +207,7 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> ScmRe
 /// `User::Root` already renders.
 ///
 /// Reads `spec::backend::windows_builtin` — the recognition half of this
-/// table, which lives in `spec` because `Backend::error` must apply it
+/// table, which lives in `spec` because `BackendKind::error` must apply it
 /// from every host (see that module's doc comment). This is the spelling
 /// half: `Builtin::canonical` supplies the byte-exact output
 /// `CreateServiceW` accepts, and this function is the whole of the
