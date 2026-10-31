@@ -8,7 +8,7 @@ use crate::spec::{Id, Kind, Restart, User};
 
 // Fixtures ============================================================================================================
 
-fn mk(id: &str) -> DaemonSpec {
+pub(in crate::manager) fn mk(id: &str) -> DaemonSpec {
     DaemonSpec {
         id: Id::try_from(id).unwrap(),
         name: id.to_string(),

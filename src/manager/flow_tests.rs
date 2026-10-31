@@ -1,28 +1,12 @@
-use std::collections::BTreeMap;
-
 use super::*;
 use crate::decide::{self, Outcome};
 use crate::error::Error;
 use crate::manager::fake::Fake;
+use crate::manager::fake::fake_tests::mk;
 use crate::manager::{Installed, ServiceManager};
-use crate::spec::{DaemonSpec, Id, Kind, Restart, User};
+use crate::spec::{DaemonSpec, Id, User};
 
 // Fixtures ============================================================================================================
-
-fn mk(id: &str) -> DaemonSpec {
-    DaemonSpec {
-        id: Id::try_from(id).unwrap(),
-        name: id.to_string(),
-        command: vec!["daemon".to_owned()],
-        cwd: None,
-        env: BTreeMap::new(),
-        user: User::Root,
-        restart: Restart::OnFailure,
-        restart_delay: None,
-        logs: None,
-        kind: Kind::Simple,
-    }
-}
 
 fn mk_as(id: &str, user: &str) -> DaemonSpec {
     DaemonSpec {
