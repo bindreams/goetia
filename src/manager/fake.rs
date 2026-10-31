@@ -100,6 +100,8 @@ struct Store {
     installed_fails: BTreeMap<String, String>,
     live_status_fails: BTreeMap<String, String>,
     write_races: BTreeMap<String, usize>,
+    /// Ids whose service is gone by the time its live state is queried.
+    live_status_gone: BTreeSet<String>,
     /// Text another process puts at an id just before this Fake's next write there, by id.
     interlopers: BTreeMap<String, String>,
     /// What the manager applies to an id from outside its artifact, by id; absent means none.
@@ -445,6 +447,14 @@ impl Fake {
         state.write_races.insert(id.to_string(), times);
     }
 
+    /// Test-only seeding: `id` is found gone when its live state is queried, as when a concurrent
+    /// uninstall removes it after `read` or `scan` saw it. The query completes and says
+    /// [`Error::NotInstalled`].
+    pub fn seed_live_status_gone(&self, id: &str) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.live_status_gone.insert(id.to_string());
+    }
+
     /// Test-only seeding: just before the next write at `id`, another process places `text` there,
     /// as [`Fake::seed_foreign`] does. That write then finds the id changed since it was read, so
     /// it writes nothing and loses the race for real.
@@ -718,6 +728,11 @@ impl crate::backend::Backend for Fake {
         state.manager()?;
         if let Some(detail) = state.live_status_fails.get(id.as_str()) {
             return Err(Error::Other(detail.clone()));
+        }
+        if state.live_status_gone.contains(id.as_str()) {
+            return Err(Error::NotInstalled {
+                id: id.as_str().to_string(),
+            });
         }
         Ok(Status {
             state: snapshot.state,

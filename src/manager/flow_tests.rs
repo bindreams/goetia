@@ -292,6 +292,22 @@ fn list_reports_a_name_that_is_not_an_id_without_querying_it() {
 }
 
 #[skuld::test]
+fn list_omits_an_entry_that_vanished_before_its_live_query() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.install(&mk("other"), false).unwrap();
+    fake.seed_live_status_gone("frpc");
+
+    let listed = fake.list().unwrap();
+
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert!(
+        matches!(&listed[0], Installed::Ours { spec, .. } if spec.id.as_str() == "other"),
+        "{listed:?}"
+    );
+}
+
+#[skuld::test]
 fn list_aborts_on_no_manager() {
     let fake = Fake::new();
     fake.install(&mk("frpc"), false).unwrap();

@@ -143,7 +143,7 @@ pub(crate) struct ScmSnapshot {
 
 impl ScmSnapshot {
     /// Runs `ask` on the service `read` opened, or on one opened by name with `access` where the
-    /// snapshot holds none.
+    /// snapshot holds none; a service gone by then is [`Error::NotInstalled`].
     fn ask<T>(
         &self,
         id: &Id,
@@ -156,7 +156,15 @@ impl ScmSnapshot {
             None => {
                 let service = open_scm(ServiceManagerAccess::CONNECT)?
                     .open_service(id.as_str(), access)
-                    .map_err(|e| to_error(context, e))?;
+                    .map_err(|e| {
+                        if is_not_found(&e) || is_marked_for_delete(&e) {
+                            Error::NotInstalled {
+                                id: id.as_str().to_string(),
+                            }
+                        } else {
+                            to_error(context, e)
+                        }
+                    })?;
                 ask(&service)
             }
         }

@@ -192,6 +192,8 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
                 enabled: status.enabled,
             }),
             Err(e @ Error::NoManager { .. }) => return Err(e),
+            // The query completed and found the service gone: absence is established.
+            Err(Error::NotInstalled { .. }) => {}
             Err(e) => out.push(unreadable(format!(
                 "marked ours, but its live state could not be queried: {e}"
             ))),

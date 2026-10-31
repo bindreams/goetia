@@ -52,7 +52,8 @@ pub(crate) trait Backend {
         scope: &mut Self::InstallScope,
     ) -> Result<WriteOutcome>;
 
-    /// The live state of an id `read` found marked.
+    /// The live state of an id `read` found marked. `Error::NotInstalled` where the query completed
+    /// and found the service gone, which `list` omits; never for one that is present.
     fn live_status(&self, id: &Id, snapshot: &Self::Snapshot) -> Result<Status>;
 
     /// Every id this backend can enumerate, as `read` would classify it, and what the enumeration
