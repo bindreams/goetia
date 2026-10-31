@@ -998,6 +998,27 @@ fn a_launchctl_request_that_may_have_run_is_in_doubt() {
     assert!(matches!(e, Error::CommandFailed { .. }), "{e:?}");
 }
 
+/// A `launchctl` that cannot be run says nothing about the job: `status` fails, and `list` (via
+/// `flow`) reports the entry unreadable, rather than either showing a plausible `Unknown` state.
+#[skuld::test]
+fn a_live_status_whose_launchctl_cannot_be_run_is_an_error() {
+    use crate::backend::Backend as _;
+
+    let _stand_in = launchctl_stand_in::set(DONE.to_string());
+    bounded::test_hook::spawn_fails(|| io::Error::from_raw_os_error(libc::EAGAIN).into());
+    let snapshot = Plist {
+        location: Location {
+            path: PathBuf::from("/nonexistent/goetia-live-status.plist"),
+            enabled: false,
+        },
+        text: String::new(),
+    };
+
+    let result = LaunchdManager::new().live_status(&never_installed(), &snapshot);
+
+    assert!(matches!(result, Err(Error::CommandFailed { .. })), "{result:?}");
+}
+
 // Every verb path stays inside its reservation ========================================================================
 
 #[skuld::label]

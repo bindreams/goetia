@@ -393,15 +393,9 @@ fn classify(bytes: Vec<u8>) -> ClassifyOutcome {
 /// truth about the id. Every read that did not complete is [`undetermined`].
 ///
 /// Bytes that are not goetia's ([`ClassifyOutcome::NotOurs`]), and anything that is
-/// not a regular file at all, read as the empty string. That is a statement,
-/// not a fallback: the marker lives in an XML comment, a binary plist has no
-/// comments, bytes that are not UTF-8 are not the UTF-8 XML `generate::plist`
-/// writes, a FIFO is not a plist in the first place — so "text carrying no
-/// marker" is precisely what has been established in each case, and `extract`
-/// turns it into the `Foreign` refusal that is the right answer for all of them.
-/// It is also what keeps `install` over one of these from erroring: `decide`
-/// reaches `Outcome::RefuseForeign`, which names the remedy, instead of a bare
-/// `Err`.
+/// not a regular file at all, read as the empty string. No marker is established in any of these
+/// cases, so all read as `Foreign`; `install` then reaches `RefuseForeign` with a remedy instead of a
+/// bare `Err`.
 fn read_artifact(path: &Path, id: &str) -> Result<String> {
     let bytes = match obtain(path) {
         Obtained::Bytes(bytes) => bytes,
@@ -1097,15 +1091,6 @@ fn files(id: &Id, calls: usize) -> Result<bounded::Spares> {
     })
 }
 
-/// Best-effort live state for `status` and `list`: [`live_state`], with a
-/// `launchctl` that cannot be run at all degraded to `(State::Unknown,
-/// None)` rather than taking down `status`/`list` for every other entry. A
-/// read neither verb counted, so it never draws on a reservation a library
-/// caller may hold ([`Role::UncountedQuery`]).
-fn query_live_state(id: &str, deadline: Deadline) -> (State, Option<u32>) {
-    read_live_state(id, deadline, Role::UncountedQuery).unwrap_or((State::Unknown, None))
-}
-
 /// Live state, read from `launchctl print`'s body — the one place this
 /// backend does read it, since there is no filesystem signal for "is this
 /// job currently running" (see the module doc comment). Output in a shape
@@ -1176,7 +1161,6 @@ fn recheck_after_write(id: &Id, deadline: Deadline, target: &Path, wrote: &str, 
     }
 }
 
-/// Held for one `install`, across its retries.
 pub(crate) struct InstallScope {
     /// For the one request `install` can send, the `bootout` of a job under a `Create`'s label.
     /// `None` once that `bootout` has taken it, and every path that does ends the install.
@@ -1309,7 +1293,9 @@ impl backend::Backend for LaunchdManager {
 
     fn live_status(&self, id: &Id, snapshot: &Plist) -> Result<Status> {
         // `status` and `list` have no budget of their own: unbounded.
-        let (state, pid) = query_live_state(id.as_str(), Budget::Unbounded.start());
+        // Read as `UncountedQuery`: neither verb counted this read, so it never draws on a
+        // reservation a library caller may hold.
+        let (state, pid) = read_live_state(id.as_str(), Budget::Unbounded.start(), Role::UncountedQuery)?;
         Ok(Status {
             state,
             pid,
@@ -1528,7 +1514,6 @@ impl backend::Backend for LaunchdManager {
     /// Makes every reaper and temp file `steps` can need now, so that no step fails for want of one
     /// after an earlier step has sent something: `restart`'s start after its stop, `install
     /// --start`'s start after the install's `bootout`.
-    /// Every budget: `launchctl` is waited on under all of them.
     fn prepare(&self, steps: &[Step], _budget: Budget) -> Result<Prepared> {
         let (reapers, calls) = steps
             .iter()
@@ -1575,12 +1560,8 @@ fn scan_in(dirs: [(&str, bool); 2]) -> Scan<Plist> {
     let mut entries = Vec::new();
     let mut reported = Vec::new();
     for (id, locations) in by_id {
-        // `locations` is what the two passes *reached*. If one stopped before this id and the other
-        // found it, the id is classified from the one directory reached while the both-directories
-        // anomaly goes unreported: a positive claim narrowed by an incomplete scan, and the
-        // aggregate in the same listing is the signal that says so. No negative conclusion is
-        // affected either way, which is the property that has to hold. Deliberately untested:
-        // forcing it needs a real mid-`readdir` fault on macOS.
+        // A partial scan can narrow a positive claim but never supports absence: `reported` forbids
+        // that. Untested: needs a mid-`readdir` fault on macOS.
         let [location] = match <[Location; 1]>::try_from(locations) {
             Ok(only) => only,
             Err(_) => {
