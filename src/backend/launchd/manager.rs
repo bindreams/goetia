@@ -6,7 +6,7 @@
 //!
 //! - `install` writes/updates the plist in [`STAGING_DIR`] (or, for an
 //!   update, wherever the existing artifact already lives — see
-//!   [`discover`]). launchd never scans either directory on its own, so
+//!   [`locate`]). launchd never scans either directory on its own, so
 //!   nothing loads and nothing runs. A plist that would change what a job
 //!   launchd has loaded reads is refused instead, and nothing is written
 //!   (see [`refuse`]). A `Create` over a loaded job of the same label boots
@@ -58,19 +58,20 @@
 //! database entries the former creates cannot be removed, and `bootstrap`
 //! refuses a `Disabled` plist outright (see the crate-level design notes).
 
+use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{fs, io};
 
-use crate::backend::Identity;
 use crate::backend::bounded::{self, Reaper, Role};
 use crate::backend::launchd::{generate, refuse, state};
-use crate::decide::{self, Outcome, Ownership};
+use crate::backend::{self, Identity, InstalledDefinition, ReadOutcome, Scan, WriteOutcome};
+use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Result};
 use crate::manager::budget::{self, Deadline};
-use crate::manager::{Budget, Installed, Prepared, ServiceManager, State, Status, Step};
+use crate::manager::{Budget, Installed, Prepared, State, Status, Step, flow};
 use crate::spec::{AccountId, DaemonSpec, Id, Restart, User};
 
 /// Where `install` writes a plist that is not (yet, or any longer) enabled
@@ -247,7 +248,7 @@ const BINARY_PLIST_MAGIC: &[u8] = b"bplist00";
 /// `fstat`'d as regular and read to the end, so presence is established
 /// whichever variant comes out. That is why neither of them is
 /// [`Error::Undetermined`], which means presence was *not* established.
-enum Classified {
+enum ClassifyOutcome {
     /// Valid UTF-8 — the only form `generate::plist` ever writes, and the
     /// only one `generate::extract`'s `goetia:begin` comment can be looked
     /// for in.
@@ -373,32 +374,31 @@ fn obtain(path: &Path) -> Obtained {
 /// small binary plist can be valid UTF-8 (its trailer is mostly NUL bytes), and
 /// identifying it by the eight bytes Apple's format begins with does not depend
 /// on which of its object markers happen to fall outside ASCII.
-fn classify(bytes: Vec<u8>) -> Classified {
+fn classify(bytes: Vec<u8>) -> ClassifyOutcome {
     if bytes.starts_with(BINARY_PLIST_MAGIC) {
-        return Classified::NotOurs;
+        return ClassifyOutcome::NotOurs;
     }
     match String::from_utf8(bytes) {
-        Ok(text) => Classified::Text(text),
-        Err(_) => Classified::NotOurs,
+        Ok(text) => ClassifyOutcome::Text(text),
+        Err(_) => ClassifyOutcome::NotOurs,
     }
 }
 
-/// Read the artifact `locate` found for `id`, for the three callers that go
-/// on to look for a marker in it (`discover`, `located_and_ours`, `status`).
+/// Read the artifact `locate` found for `id`, for the callers that go on to
+/// look for a marker in it ([`read_at`], through `read` and `scan`).
 ///
 /// An absent path is [`Error::NotInstalled`], not a failure to determine:
 /// the plist was there when `locate` stat'd it and is gone now, which is an
 /// uninstall that completed between the two syscalls, and absence is the
 /// truth about the id. Every read that did not complete is [`undetermined`].
 ///
-/// Bytes that are not goetia's ([`Classified::NotOurs`]), and anything that is
+/// Bytes that are not goetia's ([`ClassifyOutcome::NotOurs`]), and anything that is
 /// not a regular file at all, read as the empty string. That is a statement,
 /// not a fallback: the marker lives in an XML comment, a binary plist has no
 /// comments, bytes that are not UTF-8 are not the UTF-8 XML `generate::plist`
 /// writes, a FIFO is not a plist in the first place — so "text carrying no
-/// marker" is precisely what has been established in each case, and every
-/// caller's `extract` turns it into the `Foreign` refusal that is the right
-/// answer for all of them. It is also what keeps `install` over one of these
+/// marker" is precisely what has been established in each case, and `extract`
+/// turns it into the `Foreign` refusal that is the right answer for all of them. It is also what keeps `install` over one of these
 /// from erroring: `decide` reaches `Outcome::RefuseForeign`, which names the
 /// remedy, instead of a bare `Err`.
 fn read_artifact(path: &Path, id: &str) -> Result<String> {
@@ -409,99 +409,33 @@ fn read_artifact(path: &Path, id: &str) -> Result<String> {
         Obtained::Failed(e) => return Err(undetermined(id, "read", path, &e)),
     };
     match classify(bytes) {
-        Classified::Text(text) => Ok(text),
-        Classified::NotOurs => Ok(String::new()),
+        ClassifyOutcome::Text(text) => Ok(text),
+        ClassifyOutcome::NotOurs => Ok(String::new()),
     }
 }
 
-/// What [`install`](ServiceManager::install) needs to decide anything:
-/// [`decide::decide`]'s input, plus the location discovery already
-/// had to read to produce it (so a subsequent write does not have to
-/// re-derive it).
-struct Discovery {
-    found: Ownership,
-    location: Option<Location>,
+/// What `read` saw at an id: where its plist is, and the plist's text.
+pub(crate) struct Plist {
+    location: Location,
+    text: String,
 }
 
-/// Classify what's at `id`, exactly as [`decide::decide`] needs it.
+/// Classify the plist at `location`, as every verb, `install` and `list` need it.
 ///
-/// A marked artifact whose blob decodes is `Ownership::Ours` only if the
-/// account *its own* `user` field names can still be resolved on this host
-/// — `regenerated` has to be `generate(blob.spec)` under the identity that
-/// spec's own user resolves to, not under whatever identity the caller is
-/// currently installing, since those two can differ (see
-/// `resolve_account`'s doc comment). An account that no longer exists (a
-/// user deleted after install) is exactly the same kind of "ours, but we
-/// cannot fully process it" situation an undecodable blob is — bricking
-/// `list`/`status`/`uninstall` for a service the account gap doesn't stop
-/// existing would be strictly worse than surfacing it as
-/// `OursUnreadable`.
-fn discover(id: &str) -> Result<Discovery> {
-    let Some(location) = locate(id)? else {
-        return Ok(Discovery {
-            found: Ownership::Absent,
-            location: None,
-        });
-    };
+/// A marked plist is [`ReadOutcome::Marked`] whether or not its blob decodes: the marker alone is
+/// proof of ownership. Whether its spec can still be rendered here (the account *its own* `user`
+/// field names may have been deleted since) is `flow`'s question, answered with `render`.
+fn read_at(id: &str, location: Location) -> Result<ReadOutcome<Plist>> {
     let text = read_artifact(&location.path, id)?;
-    let found = match generate::extract(&text) {
-        Ok(None) => Ownership::Foreign,
-        Ok(Some(blob)) => match resolve_account(&blob.spec.user) {
-            Ok(account) => Ownership::Ours {
-                regenerated: generate::plist(&blob.spec, &account.identity()),
-                blob,
-                on_disk: text,
-            },
-            Err(e) => Ownership::OursUnreadable {
-                reason: e.to_string(),
-                recovery: Some(decide::unreadable_recovery(id)),
-            },
-        },
-        Err(e) => Ownership::OursUnreadable {
-            reason: e.to_string(),
-            recovery: Some(decide::unreadable_recovery(id)),
-        },
+    let blob = match generate::extract(&text) {
+        Ok(None) => return Ok(ReadOutcome::Foreign { recovery: None }),
+        Ok(Some(blob)) => Ok(blob),
+        Err(e) => Err(e),
     };
-    Ok(Discovery {
-        found,
-        location: Some(location),
+    Ok(ReadOutcome::Marked {
+        blob,
+        snapshot: Plist { location, text },
     })
-}
-
-/// The narrower "is this even ours" gate every verb but `install` needs —
-/// a marked-but-undecodable artifact still passes, since the marker alone
-/// is proof of ownership (and `uninstall` in particular has to be able to
-/// operate on one; see `decide::Outcome::RefuseUnreadable`'s recovery
-/// text). Only a plist with no Goetia marker at all is refused.
-fn require_ours(text: &str, id: &Id) -> Result<()> {
-    match generate::extract(text) {
-        Ok(None) => Err(foreign(id)),
-        Ok(Some(_)) | Err(_) => Ok(()),
-    }
-}
-
-fn foreign(id: &Id) -> Error {
-    Error::Foreign {
-        id: id.as_str().to_string(),
-        recovery: decide::foreign_recovery(id.as_str()),
-    }
-}
-
-fn not_installed(id: &Id) -> Error {
-    Error::NotInstalled {
-        id: id.as_str().to_string(),
-    }
-}
-
-/// Shared preamble for every verb but `install`: locate `id`, read its
-/// artifact, and confirm it's ours. Factored out so the five call sites
-/// (`uninstall`/`enable`/`disable`/`start`/`stop`) cannot independently
-/// drift on what "found and ours" means.
-fn located_and_ours(id: &Id) -> Result<(Location, String)> {
-    let location = locate(id.as_str())?.ok_or_else(|| not_installed(id))?;
-    let text = read_artifact(&location.path, id.as_str())?;
-    require_ours(&text, id)?;
-    Ok((location, text))
 }
 
 // Account resolution ==================================================================================================
@@ -682,7 +616,7 @@ fn lint(path: &Path) -> Result<()> {
     require_success("plutil", &["-lint", path_str])
 }
 
-enum WriteNew {
+enum PersistOutcome {
     Written,
     /// Something appeared at the target path between discovery and this
     /// write (see `install`'s doc comment on non-clobbering create).
@@ -699,10 +633,10 @@ enum WriteNew {
 /// means the destination genuinely did not exist a moment ago and does
 /// now, not that this code lost a filesystem-level race it should have
 /// won.
-fn persist_new(staged: tempfile::NamedTempFile, target: &Path) -> Result<WriteNew> {
+fn persist_new(staged: tempfile::NamedTempFile, target: &Path) -> Result<PersistOutcome> {
     match staged.persist_noclobber(target) {
-        Ok(_file) => Ok(WriteNew::Written),
-        Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => Ok(WriteNew::Raced),
+        Ok(_file) => Ok(PersistOutcome::Written),
+        Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => Ok(PersistOutcome::Raced),
         Err(e) => Err(Error::Io {
             path: target.to_path_buf(),
             source: e.error,
@@ -711,8 +645,8 @@ fn persist_new(staged: tempfile::NamedTempFile, target: &Path) -> Result<WriteNe
 }
 
 /// Overwrite the plist already at `target` — used only for `Update`/`Stale`,
-/// where `discover` has already established the id is `Ownership::Ours`, so
-/// replacing it is exactly what was asked for.
+/// where `read` has already established the id is marked, so replacing it is exactly what was
+/// asked for.
 fn write_existing(target: &Path, content: &str) -> Result<()> {
     let tmp = staged_tempfile(target.parent().expect("plist path always has a parent"), content)?;
     tmp.persist(target).map(drop).map_err(|e| Error::Io {
@@ -1224,110 +1158,7 @@ fn classified(ran: &Ran) -> (State, Option<u32>) {
     state::classify(&text)
 }
 
-// ServiceManager ======================================================================================================
-
-impl LaunchdManager {
-    /// `install`, with the reaper for its one request made. A re-derivation after a race that made no
-    /// `launchctl` call passes the same reaper on; once a pass has made one, a race ends the install.
-    ///
-    /// `install` has no `--timeout` of its own, so its own `launchctl` calls are deliberately unbounded.
-    fn install_reaping(&self, spec: &DaemonSpec, force: bool, reaper: Reaper) -> Result<Outcome> {
-        let account = resolve_account(&spec.user)?;
-        let desired = generate::plist(spec, &account.identity());
-        let discovery = discover(spec.id.as_str())?;
-        let outcome = decide::decide(
-            &discovery.found,
-            &desired,
-            spec,
-            crate::version(),
-            force,
-            // launchd has no drop-in or override mechanism that alters a job
-            // without touching its plist. Enablement lives in the plist's
-            // *directory*, which is deliberately outside the compared surface.
-            &decide::ExternalConfig::Absent,
-        );
-        let deadline = Budget::Unbounded.start();
-
-        match &outcome {
-            Outcome::Create => {
-                // A job may already answer to this label with no plist of ours (a hand-installed
-                // predecessor, or a booted-out one still tearing down). `start` would see it loaded and
-                // running and return Ok while our daemon never ran, and label-scoped checks cannot tell
-                // whose job it is, so boot it out here, where the artifact is known to be new.
-                //
-                // Staging comes first, so a failure there stops nothing. A read or `bootout` that fails
-                // leaves no plist, so a rerun is a `Create` again and reaches the stale job; after a
-                // plist is written the rerun would read `UpToDate` and never look.
-                let target = staging_path(spec.id.as_str());
-                prepare_parent_dirs(spec, &account)?;
-                let staged = staged_tempfile(target.parent().expect("plist path always has a parent"), &desired)?;
-                let reaper = if never_expires(is_loaded(spec.id.as_str(), deadline)?) {
-                    never_expires(bootout(spec.id.as_str(), deadline, reaper)?);
-                    None
-                } else {
-                    Some(reaper)
-                };
-                match persist_new(staged, &target)? {
-                    WriteNew::Written => {}
-                    // Something now exists where discovery saw nothing. This pass has already made a
-                    // call (`is_loaded`), so a second pass could make more than the verb reserved:
-                    // it reports instead.
-                    WriteNew::Raced => {
-                        return Err(match reaper {
-                            Some(_) => refuse::changed_during_install(&spec.id, &target),
-                            None => refuse::slot_taken_after_bootout(&spec.id, &target, &describe_at(&target)),
-                        });
-                    }
-                }
-                recheck_after_write(&spec.id, deadline, &target, &desired, None)?;
-            }
-            Outcome::Update { .. } | Outcome::Stale { .. } => {
-                let Ownership::Ours { on_disk: previous, .. } = &discovery.found else {
-                    unreachable!("Update and Stale come only from Ownership::Ours");
-                };
-                let previous = previous.as_str();
-                // `Stale` is checked too: a release can change what the generator renders.
-                let changes_job = refuse::changes_loaded_job(&outcome, Some(previous), &desired);
-                if changes_job && never_expires(is_loaded(spec.id.as_str(), deadline)?) {
-                    return Err(refuse::loaded_refusal(&spec.id));
-                }
-                prepare_parent_dirs(spec, &account)?;
-                let target = discovery
-                    .location
-                    .as_ref()
-                    .expect("Ownership::Ours implies discovery found a location")
-                    .path
-                    .clone();
-                // `target` was captured by `discover`, before `decide` ran. If a concurrent
-                // `enable`/`disable`/`uninstall` has since moved or removed the artifact, writing here
-                // would recreate a plist at the now-vacated path, landing it in *both* directories, the
-                // ambiguous state `locate` hard-errors on. Checking immediately before the write narrows
-                // the race to the few instructions between the check and `write_existing`'s own open.
-                // On a detected vanish, `install` runs again and re-derives the outcome against
-                // whatever is there now, unless this pass already made its `is_loaded` call
-                // (`changes_job`): a second pass could make more calls than the verb reserved, so it
-                // reports instead.
-                if !still_present(&target)? {
-                    return if changes_job {
-                        Err(refuse::changed_during_install(&spec.id, &target))
-                    } else {
-                        self.install_reaping(spec, force, reaper)
-                    };
-                }
-                write_existing(&target, &desired)?;
-                if changes_job {
-                    recheck_after_write(&spec.id, deadline, &target, &desired, Some(previous))?;
-                }
-            }
-            Outcome::UpToDate
-            | Outcome::Conflict { .. }
-            | Outcome::RefuseForeign { .. }
-            | Outcome::RefuseUnreadable { .. } => {}
-        }
-
-        Ok(outcome)
-    }
-}
+// Backend =============================================================================================================
 
 /// The read after `install` wrote `wrote` to `target`, where `previous` was (`None` after a create).
 ///
@@ -1348,58 +1179,155 @@ fn recheck_after_write(id: &Id, deadline: Deadline, target: &Path, wrote: &str, 
     }
 }
 
-impl ServiceManager for LaunchdManager {
-    fn install(&self, spec: &DaemonSpec, force: bool) -> Result<Outcome> {
+/// Held for one `install`, across its retries.
+pub(crate) struct InstallScope {
+    /// For the one request `install` can send, the `bootout` of a job under a `Create`'s label.
+    /// `None` once that `bootout` has taken it, and every path that does ends the install.
+    reaper: Option<Reaper>,
+    _files: bounded::Spares,
+}
+
+impl backend::Backend for LaunchdManager {
+    type Definition = String;
+    type Snapshot = Plist;
+    type InstallScope = InstallScope;
+
+    /// Made before anything is read, so no `launchctl` call fails for want of a reaper or a temp
+    /// file once `install` has sent something.
+    fn begin_install(&self, spec: &DaemonSpec) -> Result<InstallScope> {
         let [reaper] = reapers::<INSTALL_REQUESTS>(&spec.id)?;
-        let _files = files(&spec.id, INSTALL_CALLS)?;
-        self.install_reaping(spec, force, reaper)
-    }
-
-    /// Makes every reaper and temp file `steps` can need now, so that no step fails for want of one
-    /// after an earlier step has sent something: `restart`'s start after its stop, `install
-    /// --start`'s start after the install's `bootout`.
-    /// Every budget: `launchctl` is waited on under all of them.
-    fn prepare(&self, steps: &[Step], _budget: Budget) -> Result<Prepared> {
-        let (reapers, calls) = steps
-            .iter()
-            .map(|step| match step {
-                Step::Install => (INSTALL_REQUESTS, INSTALL_CALLS),
-                Step::Start => (START_REQUESTS, START_CALLS),
-                Step::Stop => (STOP_REQUESTS, STOP_CALLS),
-            })
-            .fold((0, 0), |(reapers, calls), (r, c)| (reapers + r, calls + c));
-        let spares = bounded::spare(bounded::Needs {
-            reapers,
-            files: calls * FILES_PER_CALL,
-            ..bounded::Needs::default()
+        let files = files(&spec.id, INSTALL_CALLS)?;
+        Ok(InstallScope {
+            reaper: Some(reaper),
+            _files: files,
         })
-        .map_err(|e| {
-            Error::Other(format!(
-                "no thread or temp file could be made for a `launchctl` request, so none was sent: {e}"
-            ))
-        })?;
-        Ok(Prepared::holding(spares))
     }
 
-    fn preview_install(&self, spec: &DaemonSpec) -> Result<Outcome> {
+    fn render(&self, spec: &DaemonSpec) -> Result<String> {
         let account = resolve_account(&spec.user)?;
-        let desired = generate::plist(spec, &account.identity());
-        let discovery = discover(spec.id.as_str())?;
-        Ok(decide::decide(
-            &discovery.found,
-            &desired,
-            spec,
-            crate::version(),
-            false,
-            // launchd has no drop-in mechanism; see the `install` call site.
-            &decide::ExternalConfig::Absent,
-        ))
+        Ok(generate::plist(spec, &account.identity()))
+    }
+
+    fn read(&self, id: &Id) -> Result<ReadOutcome<Plist>> {
+        match locate(id.as_str())? {
+            None => Ok(ReadOutcome::Absent),
+            Some(location) => read_at(id.as_str(), location),
+        }
+    }
+
+    fn installed(&self, _id: &Id, snapshot: &Plist) -> Result<InstalledDefinition<String>> {
+        Ok(InstalledDefinition {
+            definition: snapshot.text.clone(),
+            // launchd has no drop-in or override mechanism that alters a job without touching its
+            // plist. Enablement lives in the plist's *directory*, which is deliberately outside
+            // the compared surface.
+            external: ExternalConfig::Absent,
+        })
+    }
+
+    /// `install` has no `--timeout` of its own, so its own `launchctl` calls are deliberately
+    /// unbounded.
+    ///
+    /// `Raced` only where no `launchctl` call has been made yet: another pass could then make more
+    /// calls than the verb reserved ([`INSTALL_CALLS`]), so a race after one is an error instead.
+    fn write(
+        &self,
+        spec: &DaemonSpec,
+        desired: &String,
+        outcome: &Outcome,
+        snapshot: Option<&Plist>,
+        scope: &mut InstallScope,
+    ) -> Result<WriteOutcome> {
+        // Resolved again: `render` kept only the plist, which names the account, and launchd
+        // resolves that name at launch too.
+        let account = resolve_account(&spec.user)?;
+        let deadline = Budget::Unbounded.start();
+
+        match outcome {
+            Outcome::Create => {
+                // A job may already answer to this label with no plist of ours (a hand-installed
+                // predecessor, or a booted-out one still tearing down). `start` would see it loaded and
+                // running and return Ok while our daemon never ran, and label-scoped checks cannot tell
+                // whose job it is, so boot it out here, where the artifact is known to be new.
+                //
+                // Staging comes first, so a failure there stops nothing. A read or `bootout` that fails
+                // leaves no plist, so a rerun is a `Create` again and reaches the stale job; after a
+                // plist is written the rerun would read `UpToDate` and never look.
+                let target = staging_path(spec.id.as_str());
+                prepare_parent_dirs(spec, &account)?;
+                let staged = staged_tempfile(target.parent().expect("plist path always has a parent"), desired)?;
+                let loaded = never_expires(is_loaded(spec.id.as_str(), deadline)?);
+                if loaded {
+                    let reaper = scope
+                        .reaper
+                        .take()
+                        .expect("a pass that took the reaper ended the install");
+                    never_expires(bootout(spec.id.as_str(), deadline, reaper)?);
+                }
+                match persist_new(staged, &target)? {
+                    PersistOutcome::Written => {}
+                    // Something now exists where `read` saw nothing, and `is_loaded` has been called.
+                    PersistOutcome::Raced => {
+                        return Err(if loaded {
+                            refuse::slot_taken_after_bootout(&spec.id, &target, &describe_at(&target))
+                        } else {
+                            refuse::changed_during_install(&spec.id, &target)
+                        });
+                    }
+                }
+                recheck_after_write(&spec.id, deadline, &target, desired, None)?;
+            }
+            Outcome::Update { .. } | Outcome::Stale { .. } => {
+                let snapshot = snapshot.expect("an id `decide` chose to update was read as marked");
+                let previous = snapshot.text.as_str();
+                // `Stale` is checked too: a release can change what the generator renders.
+                let changes_job = refuse::changes_loaded_job(previous, desired);
+                if changes_job && never_expires(is_loaded(spec.id.as_str(), deadline)?) {
+                    return Err(refuse::loaded_refusal(&spec.id));
+                }
+                prepare_parent_dirs(spec, &account)?;
+                let target = snapshot.location.path.as_path();
+                // `target` was captured by `read`, before `decide` ran. If a concurrent
+                // `enable`/`disable`/`uninstall` has since moved or removed the artifact, writing here
+                // would recreate a plist at the now-vacated path, landing it in *both* directories, the
+                // ambiguous state `locate` hard-errors on. Checking immediately before the write narrows
+                // the race to the few instructions between the check and `write_existing`'s own open.
+                if !still_present(target)? {
+                    return if changes_job {
+                        // `is_loaded` has been called.
+                        Err(refuse::changed_during_install(&spec.id, target))
+                    } else {
+                        Ok(WriteOutcome::Raced)
+                    };
+                }
+                write_existing(target, desired)?;
+                if changes_job {
+                    recheck_after_write(&spec.id, deadline, target, desired, Some(previous))?;
+                }
+            }
+            other => unreachable!("`flow::install` writes only `Create`, `Update` and `Stale`, got {other:?}"),
+        }
+        Ok(WriteOutcome::Done)
+    }
+
+    fn live_status(&self, id: &Id, snapshot: &Plist) -> Result<Status> {
+        // `status` and `list` have no budget of their own: unbounded.
+        let (state, pid) = query_live_state(id.as_str(), Budget::Unbounded.start());
+        Ok(Status {
+            state,
+            pid,
+            enabled: snapshot.location.enabled,
+        })
+    }
+
+    fn scan(&self) -> Scan<Plist> {
+        scan_in([(STAGING_DIR, false), (ENABLED_DIR, true)])
     }
 
     fn uninstall(&self, id: &Id) -> Result<()> {
         let [reaper] = reapers::<STOP_REQUESTS>(id)?;
         let _files = files(id, STOP_CALLS)?;
-        let (location, _text) = located_and_ours(id)?;
+        let Plist { location, .. } = flow::owned(self, id)?;
 
         // Unbounded, like `install`'s: `uninstall` has no `--timeout` of its
         // own, and bounding this would turn a slow-stopping job into a
@@ -1409,7 +1337,7 @@ impl ServiceManager for LaunchdManager {
     }
 
     fn enable(&self, id: &Id) -> Result<()> {
-        let (location, _text) = located_and_ours(id)?;
+        let Plist { location, .. } = flow::owned(self, id)?;
 
         if location.enabled {
             return Ok(());
@@ -1430,7 +1358,7 @@ impl ServiceManager for LaunchdManager {
     ///
     /// [`ServiceManager::disable`]: crate::manager::ServiceManager::disable
     fn disable(&self, id: &Id) -> Result<()> {
-        let (location, _text) = located_and_ours(id)?;
+        let Plist { location, .. } = flow::owned(self, id)?;
 
         if !location.enabled {
             return Ok(());
@@ -1452,8 +1380,9 @@ impl ServiceManager for LaunchdManager {
             corrective_kickstart,
         ] = reapers::<START_REQUESTS>(id)?;
         let _files = files(id, START_CALLS)?;
-        let (location, text) = located_and_ours(id)?;
-        let blob = generate::extract(&text)?.ok_or_else(|| foreign(id))?;
+        let Plist { location, text } = flow::owned(self, id)?;
+        // `owned` passed these bytes as carrying the marker, so `extract` finds one.
+        let blob = generate::extract(&text)?.expect("`flow::owned` found the marker in this text");
         let timed_out = || budget::timed_out(id.as_str(), "running", budget);
         // What issuing the request takes: which of `bootstrap`/`kickstart` it
         // needs, and the `bootstrap` itself. None of it is bounded — the
@@ -1572,7 +1501,7 @@ impl ServiceManager for LaunchdManager {
     /// form and ran `bootout` to completion, so the instance it stopped is
     /// gone and cannot be what answers for the label here.
     fn request_start_after_stop(&self, id: &Id) -> Result<()> {
-        self.start(id, Budget::Immediate)
+        backend::Backend::start(self, id, Budget::Immediate)
     }
 
     fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
@@ -1587,137 +1516,108 @@ impl ServiceManager for LaunchdManager {
         let deadline = verb_deadline(budget);
         let [reaper] = reapers::<STOP_REQUESTS>(id)?;
         let _files = files(id, STOP_CALLS)?;
-        located_and_ours(id)?;
+        flow::owned(self, id)?;
         bootout(id.as_str(), deadline, reaper)?.ok_or_else(|| budget::timed_out(id.as_str(), "stopped", budget))
     }
 
     fn kill(&self, id: &Id) -> Result<()> {
         let [reaper] = reapers::<KILL_REQUESTS>(id)?;
         let _files = files(id, KILL_CALLS)?;
-        located_and_ours(id)?;
+        flow::owned(self, id)?;
         never_expires(kill_job(id.as_str(), Budget::Unbounded.start(), reaper)?);
         Ok(())
     }
 
-    fn status(&self, id: &Id) -> Result<Status> {
-        let location = locate(id.as_str())?.ok_or_else(|| not_installed(id))?;
-        let text = read_artifact(&location.path, id.as_str())?;
-        match generate::extract(&text) {
-            Ok(None) => Err(foreign(id)),
-            Err(e) => Err(e),
-            Ok(Some(_)) => {
-                // `status` has no budget of its own: unbounded, as before.
-                let (state, pid) = query_live_state(id.as_str(), Budget::Unbounded.start());
-                Ok(Status {
-                    state,
-                    pid,
-                    enabled: location.enabled,
-                })
-            }
+    /// Makes every reaper and temp file `steps` can need now, so that no step fails for want of one
+    /// after an earlier step has sent something: `restart`'s start after its stop, `install
+    /// --start`'s start after the install's `bootout`.
+    /// Every budget: `launchctl` is waited on under all of them.
+    fn prepare(&self, steps: &[Step], _budget: Budget) -> Result<Prepared> {
+        let (reapers, calls) = steps
+            .iter()
+            .map(|step| match step {
+                Step::Install => (INSTALL_REQUESTS, INSTALL_CALLS),
+                Step::Start => (START_REQUESTS, START_CALLS),
+                Step::Stop => (STOP_REQUESTS, STOP_CALLS),
+            })
+            .fold((0, 0), |(reapers, calls), (r, c)| (reapers + r, calls + c));
+        let spares = bounded::spare(bounded::Needs {
+            reapers,
+            files: calls * FILES_PER_CALL,
+            ..bounded::Needs::default()
+        })
+        .map_err(|e| {
+            Error::Other(format!(
+                "no thread or temp file could be made for a `launchctl` request, so none was sent: {e}"
+            ))
+        })?;
+        Ok(Prepared::holding(spares))
+    }
+}
+
+// Enumeration =========================================================================================================
+
+/// Every plist in `dirs` (each with whether it is the enabled one), as `read` would classify it.
+///
+/// A pass that stopped in one directory does not stop the other. They are two separate locations,
+/// and what the staging directory refused to yield establishes nothing about `/Library/LaunchDaemons`
+/// — so scanning on can only add ids goetia has actually established, while the aggregate in
+/// `reported` already forbids concluding absence for anything either pass missed. Two aggregates is
+/// the honest report when both stop.
+fn scan_in(dirs: [(&str, bool); 2]) -> Scan<Plist> {
+    let mut by_id: BTreeMap<String, Vec<Location>> = BTreeMap::new();
+    let mut incomplete = Vec::new();
+    for (dir, enabled) in dirs {
+        let pass = scan_plists(dir);
+        for (id, path) in pass.plists {
+            by_id.entry(id).or_default().push(Location { path, enabled });
         }
+        incomplete.extend(pass.incomplete);
     }
 
-    fn list(&self) -> Result<Vec<Installed>> {
-        let mut by_id: std::collections::BTreeMap<String, Vec<(PathBuf, bool)>> = std::collections::BTreeMap::new();
-        let mut incomplete = Vec::new();
-        for (dir, enabled) in [(STAGING_DIR, false), (ENABLED_DIR, true)] {
-            // A pass that stopped in one directory does not stop the other. They are two separate
-            // locations, and what the staging directory refused to yield establishes nothing about
-            // `/Library/LaunchDaemons` — so scanning on can only add ids goetia has actually
-            // established, while the aggregate below already forbids concluding absence for
-            // anything either pass missed. Two aggregates is the honest report when both stop.
-            let scan = scan_plists(dir);
-            for (id, path) in scan.plists {
-                by_id.entry(id).or_default().push((path, enabled));
-            }
-            incomplete.extend(scan.incomplete);
-        }
-
-        let mut out = Vec::new();
-        for (id, locations) in by_id {
-            // `locations` is what the two passes *reached*, which is what an aggregate above costs
-            // this branch. If one pass stopped before this id and the other found it, the id is
-            // reported as an ordinary `Ours` carrying the `enabled` of the directory that was
-            // reached — itself established, since the plist really is there — while the
-            // both-directories anomaly goes unreported. A positive claim narrowed by an incomplete
-            // scan, and the aggregate in the same listing is precisely the signal that says so:
-            // while one is present, this listing is not a complete account of any id's locations.
-            // No negative conclusion is affected either way, which is the property that has to
-            // hold. Deliberately untested — forcing it needs a real mid-`readdir` fault on macOS.
-            if locations.len() > 1 {
-                out.push(Installed::OursUnreadable {
+    let mut entries = Vec::new();
+    let mut reported = Vec::new();
+    for (id, locations) in by_id {
+        // `locations` is what the two passes *reached*. If one stopped before this id and the other
+        // found it, the id is classified from the one directory reached while the both-directories
+        // anomaly goes unreported: a positive claim narrowed by an incomplete scan, and the
+        // aggregate in the same listing is the signal that says so. No negative conclusion is
+        // affected either way, which is the property that has to hold. Deliberately untested:
+        // forcing it needs a real mid-`readdir` fault on macOS.
+        let [location] = match <[Location; 1]>::try_from(locations) {
+            Ok(only) => only,
+            Err(_) => {
+                reported.push(Installed::OursUnreadable {
                     name: id,
                     reason: format!("present in both {STAGING_DIR} and {ENABLED_DIR}"),
                 });
                 continue;
             }
-            let (path, enabled) = &locations[0];
-            // A failed read leaves zero evidence of whether this plist ever
-            // carried a Goetia marker at all — unlike a decode failure
-            // below, which only happens *after* confirming the marker is
-            // present. Claiming `OursUnreadable` without that evidence would
-            // misreport an unreadable *foreign* plist (routine on
-            // `/Library/LaunchDaemons`, which holds every vendor's daemons,
-            // not just Goetia's) as one of ours. `Installed::Undetermined`
-            // is the state that reasoning was missing: it claims neither,
-            // which is exactly what was established. Omitting the id instead
-            // claims the other thing goetia does not know — that nothing is
-            // there.
-            let classified = match obtain(path) {
-                Obtained::Bytes(bytes) => classify(bytes),
-                // Gone between the scan above and this read: an uninstall
-                // that completed, observed one syscall later — now the only
-                // cause, since a dangling symlink is classified `NonRegular`
-                // rather than absent. Absence is established, so this is a
-                // skip rather than a blind spot: reporting it would let a
-                // benign concurrent uninstall raise `list`'s host-wide exit
-                // code.
-                Obtained::Absent => continue,
-                // A FIFO, a directory, a socket: nothing goetia ever wrote,
-                // and established as such rather than merely unread — so it
-                // is omitted like any other foreign entry, not reported.
-                Obtained::NonRegular => continue,
-                Obtained::Failed(e) => {
-                    out.push(Installed::Undetermined {
-                        name: Some(id),
-                        reason: read_detail("read", path, &e),
-                    });
-                    continue;
-                }
-            };
-            let text = match classified {
-                Classified::Text(text) => text,
-                // Foreign by positive identification, so omitted exactly as
-                // an unmarked XML plist is — see `Classified::NotOurs`.
-                Classified::NotOurs => continue,
-            };
-            match generate::extract(&text) {
-                Ok(None) => {} // foreign: not Goetia-managed, omitted per the trait doc comment
-                Ok(Some(blob)) => {
-                    // `list` has no budget of its own: unbounded, exactly
-                    // as `status`'s own live read is.
-                    let (state, pid) = query_live_state(&id, Budget::Unbounded.start());
-                    out.push(Installed::Ours {
-                        spec: blob.spec,
-                        state,
-                        pid,
-                        enabled: *enabled,
-                    });
-                }
-                Err(e) => out.push(Installed::OursUnreadable {
-                    name: id,
-                    reason: e.to_string(),
-                }),
+        };
+        match read_at(&id, location) {
+            Ok(read) => entries.push((id, read)),
+            // Gone between the scan above and this read: an uninstall that completed, observed one
+            // syscall later. Absence is established, so this is a skip rather than a blind spot:
+            // reporting it would let a benign concurrent uninstall raise `list`'s host-wide exit code.
+            Err(Error::NotInstalled { .. }) => {}
+            // A failed read leaves zero evidence of whether this plist ever carried a Goetia marker
+            // at all, and `/Library/LaunchDaemons` holds every vendor's daemons, not just Goetia's.
+            // `Installed::Undetermined` claims neither ownership nor absence, which is exactly what
+            // was established.
+            Err(Error::Undetermined { reason, .. }) => {
+                reported.push(Installed::Undetermined { name: Some(id), reason })
             }
+            Err(e) => reported.push(Installed::Undetermined {
+                name: Some(id),
+                reason: e.to_string(),
+            }),
         }
-        // Last, so a pass that got some way in still reports what it named before what it could
-        // not — the order `cli::support::partition_installed` imposes on the rendered output too.
-        out.extend(incomplete);
-        Ok(out)
     }
+    // Last, so a pass that got some way in still reports what it named before what it could
+    // not — the order `cli::support::partition_installed` imposes on the rendered output too.
+    reported.extend(incomplete);
+    Scan { entries, reported }
 }
-
-// Enumeration =========================================================================================================
 
 /// What one pass over one of `list`'s two directories found: the `<id>.plist` files it reached,
 /// and — when the pass stopped early — the entry standing for whatever it never did.
@@ -1730,59 +1630,28 @@ struct PlistScan {
 /// Enumerate `dir`. A pass that cannot start, or cannot finish, is *reported* rather than
 /// propagated: an `Err` out of `list` throws away everything the same call already classified —
 /// including, here, a whole other directory that was scanned successfully — and reaches the CLI as
-/// an empty document on exit `1`, which is `list` saying the host has no daemons.
+/// an empty document on exit `1`, which is `list` saying the host has no daemons. See [`flow::scan`].
 ///
-/// `dir` not existing is left as it was, a silent skip: the staging directory does not exist until
-/// the first `install` ever creates it, and that establishes that nothing is staged rather than
-/// leaving it unread.
+/// `dir` not existing is a silent skip: the staging directory does not exist until the first
+/// `install` ever creates it, and that establishes that nothing is staged rather than leaving it
+/// unread.
 fn scan_plists(dir: &str) -> PlistScan {
-    match fs::read_dir(dir) {
-        Ok(entries) => collect_plists(dir, entries.map(|entry| entry.map(|entry| entry.path()))),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => PlistScan {
-            plists: Vec::new(),
-            incomplete: None,
-        },
-        Err(e) => PlistScan {
-            plists: Vec::new(),
-            incomplete: Some(Installed::scan_incomplete(
-                dir,
-                &format!("failed to read directory: {e}"),
-            )),
-        },
-    }
-}
-
-/// The pass itself, over an iterator of paths rather than [`fs::read_dir`] directly — which is what
-/// makes the mid-pass fault reachable from a test, since no `readdir` fails on request. That fault
-/// is the half that matters: everything already collected comes back alongside the aggregate,
-/// rather than being discarded because a *later* dirent could not be read.
-fn collect_plists(dir: &str, entries: impl Iterator<Item = io::Result<PathBuf>>) -> PlistScan {
     let mut plists = Vec::new();
-    for entry in entries {
-        let path = match entry {
-            Ok(path) => path,
-            Err(e) => {
-                return PlistScan {
-                    plists,
-                    incomplete: Some(Installed::scan_incomplete(
-                        dir,
-                        &format!("failed to read a directory entry: {e}"),
-                    )),
-                };
+    let incomplete = flow::scan(
+        dir,
+        fs::read_dir(dir),
+        |entries| Box::new(entries.map(|entry| entry.map(|entry| entry.path()))),
+        flow::directory_detail,
+        |path: PathBuf| {
+            if path.extension().and_then(|e| e.to_str()) != Some("plist") {
+                return;
             }
-        };
-        if path.extension().and_then(|e| e.to_str()) != Some("plist") {
-            continue;
-        }
-        let Some(id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else {
-            continue;
-        };
-        plists.push((id, path));
-    }
-    PlistScan {
-        plists,
-        incomplete: None,
-    }
+            if let Some(id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) {
+                plists.push((id, path));
+            }
+        },
+    );
+    PlistScan { plists, incomplete }
 }
 
 #[cfg(test)]

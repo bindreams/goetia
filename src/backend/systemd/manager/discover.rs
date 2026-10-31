@@ -109,7 +109,7 @@ pub(super) enum RawState {
     ///   a masked unit's target would look identical to "nothing here".
     /// - A regular file whose bytes are not UTF-8. `generate::unit` writes UTF-8 ini and nothing
     ///   else, so bytes that will not decode are a positive identification of a format goetia never
-    ///   emits — the same claim launchd's `Classified::NotOurs` makes about a plist, and it gets the
+    ///   emits — the same claim launchd's `ClassifyOutcome::NotOurs` makes about a plist, and it gets the
     ///   same answer.
     ///
     /// The accepted cost of the second: a fragment goetia *did* write, corrupted after the fact,

@@ -9,29 +9,17 @@
 use std::path::Path;
 
 use crate::backend::launchd::generate;
-use crate::decide::Outcome;
 use crate::error::{Error, Result};
 use crate::spec::Id;
 
-/// Whether carrying out `outcome` would give the plist other content than the one on disk, which is
-/// what a loaded job was bootstrapped from.
+/// Whether writing `desired` over `on_disk` would give the plist other content, which is what a
+/// loaded job was bootstrapped from. `install` asks it of an `Update` or `Stale` write; `--force`
+/// turns a `Conflict` into an `Update`.
 ///
 /// Compared without goetia's metadata comment ([`generate::without_metadata`]), which holds the spec
 /// and version: the check follows the rendering, not the spec.
-pub(crate) fn changes_loaded_job(outcome: &Outcome, on_disk: Option<&str>, desired: &str) -> bool {
-    match outcome {
-        // `Update` is also what `--force` turns a `Conflict` into. Both are `Ours`, so there is
-        // text on disk; none read as a change.
-        Outcome::Update { .. } | Outcome::Stale { .. } => match on_disk {
-            Some(on_disk) => generate::without_metadata(on_disk) != generate::without_metadata(desired),
-            None => true,
-        },
-        Outcome::Create
-        | Outcome::UpToDate
-        | Outcome::Conflict { .. }
-        | Outcome::RefuseForeign { .. }
-        | Outcome::RefuseUnreadable { .. } => false,
-    }
+pub(crate) fn changes_loaded_job(on_disk: &str, desired: &str) -> bool {
+    generate::without_metadata(on_disk) != generate::without_metadata(desired)
 }
 
 /// The error for a changed plist over a loaded job. Says "loaded", not "running": a job that has

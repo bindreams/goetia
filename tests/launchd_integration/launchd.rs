@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use goetia::backend::Identity;
+use goetia::backend::launchd::generate;
 use goetia::backend::launchd::manager::{ENABLED_DIR, LaunchdManager, STAGING_DIR};
 use goetia::decide::Outcome;
 use goetia::manager::{self, Budget, Installed, ServiceManager, State};
@@ -597,6 +599,45 @@ fn list_ignores_foreign_plists() {
             .iter()
             .any(|e| matches!(e, Installed::OursUnreadable { name, .. } if name == &id)),
         "a foreign plist carries no marker at all, so it must not even be OursUnreadable"
+    );
+}
+
+/// A plist goetia wrote for a user who has since been deleted carries goetia's marker, so it is
+/// goetia's, but its spec can no longer be rendered: it is `OursUnreadable` in `list` and an error in
+/// `status`, never a plausible-looking daemon.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn list_reports_a_deleted_user_as_ours_unreadable() {
+    let mgr = LaunchdManager::new();
+    let id = support::random_test_id();
+    let user = "goetia-no-such-user-xyz";
+    let mut spec = sleepy(&id);
+    spec.user = User::Name(user.to_string());
+    let path = staging_path(&id);
+    write_plist(&path, &generate::plist(&spec, &Identity { user: user.to_string() }));
+    let _cleanup = FileGuard(path);
+    let cannot_render = format!("account lookup failed: no such user `{user}` on this host");
+
+    let listed = mgr
+        .list()
+        .expect("one unrenderable plist must not take down the listing");
+    let reason = listed
+        .iter()
+        .find_map(|entry| match entry {
+            Installed::OursUnreadable { name, reason } if name == &id => Some(reason),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("a marked plist is ours even when its spec cannot be rendered: {listed:?}"));
+    assert_eq!(
+        *reason,
+        format!("marked ours, but its embedded spec cannot be regenerated: {cannot_render}")
+    );
+
+    let err = mgr
+        .status(&Id::try_from(id.clone()).expect("valid id"))
+        .expect_err("a spec that cannot be rendered has no status to report");
+    assert_eq!(
+        err.to_string(),
+        format!("`{id}`'s embedded spec cannot be regenerated: {cannot_render}")
     );
 }
 

@@ -447,7 +447,7 @@ fn scan_unit_dir(dir: &Path) -> UnitScan {
         &dir.display().to_string(),
         fs::read_dir(dir),
         |entries| Box::new(entries.map(|entry| entry.map(|entry| entry.path()))),
-        scan_detail,
+        flow::directory_detail,
         |path: PathBuf| {
             // Lossy: a non-UTF-8 unit name still has to be reported, and every read goes through
             // `path` itself rather than through this rendering of it.
@@ -468,15 +468,6 @@ fn scan_unit_dir(dir: &Path) -> UnitScan {
         units,
         dropins,
         incomplete,
-    }
-}
-
-/// What [`flow::scan`] reports of a unit directory it could not finish: `op` is `"open"` or
-/// `"enumerate"`.
-fn scan_detail(op: &'static str, e: &io::Error) -> String {
-    match op {
-        "open" => format!("failed to read directory: {e}"),
-        _ => format!("failed to read a directory entry: {e}"),
     }
 }
 

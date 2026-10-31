@@ -42,46 +42,25 @@ fn renamed(spec: &DaemonSpec) -> DaemonSpec {
     }
 }
 
-fn update() -> Outcome {
-    Outcome::Update {
-        spec_diff: String::new(),
-    }
-}
-
-fn stale() -> Outcome {
-    Outcome::Stale {
-        from_version: "0.0.1".to_owned(),
-    }
-}
-
 // changes_loaded_job ==================================================================================================
 
-/// `Update` is also what `--force` turns a `Conflict` into, so this covers the forced overwrite.
+/// An `Update` (also what `--force` turns a `Conflict` into) or a `Stale` artifact, which `decide`
+/// returns for a version mismatch before it compares anything else, so it can carry a changed spec.
 #[skuld::test]
-fn an_update_that_changes_the_rendering_changes_the_loaded_job() {
+fn a_changed_rendering_changes_the_loaded_job() {
     let spec = spec_fixture();
     let on_disk = rendered(&spec, "root");
     let desired = rendered(&changed(&spec), "root");
-    assert!(changes_loaded_job(&update(), Some(&on_disk), &desired));
-}
-
-/// `decide` returns `Stale` for a version mismatch before it compares anything else, so a stale
-/// artifact can carry a changed spec; the write then changes what the next bootstrap runs.
-#[skuld::test]
-fn a_stale_artifact_with_a_changed_rendering_changes_the_loaded_job() {
-    let spec = spec_fixture();
-    let on_disk = rendered(&spec, "root");
-    let desired = rendered(&changed(&spec), "root");
-    assert!(changes_loaded_job(&stale(), Some(&on_disk), &desired));
+    assert!(changes_loaded_job(&on_disk, &desired));
 }
 
 /// A release that changes the generator changes what launchd reads though the spec is the same.
 #[skuld::test]
-fn a_stale_artifact_with_the_same_spec_but_another_rendering_changes_the_loaded_job() {
+fn the_same_spec_with_another_rendering_changes_the_loaded_job() {
     let spec = spec_fixture();
     let on_disk = rendered(&spec, "root").replace("<key>Label</key>", "<key>Label </key>");
     let desired = rendered(&spec, "root");
-    assert!(changes_loaded_job(&stale(), Some(&on_disk), &desired));
+    assert!(changes_loaded_job(&on_disk, &desired));
 }
 
 /// The same `user: {id: ...}` resolves to another account name when the uid's name has changed.
@@ -90,61 +69,27 @@ fn another_resolved_account_changes_the_loaded_job() {
     let spec = spec_fixture();
     let on_disk = rendered(&spec, "svc-old");
     let desired = rendered(&spec, "svc-new");
-    assert!(changes_loaded_job(&stale(), Some(&on_disk), &desired));
-    assert!(changes_loaded_job(&update(), Some(&on_disk), &desired));
+    assert!(changes_loaded_job(&on_disk, &desired));
 }
 
 /// A pure version bump: only the embedded metadata differs.
 #[skuld::test]
-fn a_stale_artifact_with_an_identical_rendering_does_not() {
+fn an_identical_rendering_with_another_version_does_not() {
     let spec = spec_fixture();
     let desired = rendered(&spec, "root");
     let on_disk = desired.replace(&format!("Version: {}", crate::version()), "Version: 0.0.1");
     assert_ne!(on_disk, desired);
-    assert!(!changes_loaded_job(&stale(), Some(&on_disk), &desired));
+    assert!(!changes_loaded_job(&on_disk, &desired));
 }
 
 /// Launchd reads nothing of `name`, so the loaded job is as the new plist would have it.
 #[skuld::test]
-fn an_update_whose_rendering_is_identical_does_not() {
+fn a_spec_change_the_rendering_does_not_show_does_not() {
     let spec = spec_fixture();
     let on_disk = rendered(&spec, "root");
     let desired = rendered(&renamed(&spec), "root");
     assert_ne!(on_disk, desired);
-    assert!(!changes_loaded_job(&update(), Some(&on_disk), &desired));
-}
-
-#[skuld::test]
-fn outcomes_that_write_nothing_over_an_installed_plist_do_not() {
-    let spec = spec_fixture();
-    let on_disk = rendered(&spec, "root");
-    let desired = rendered(&changed(&spec), "root");
-    for outcome in [
-        Outcome::UpToDate,
-        Outcome::Conflict {
-            artifact_diff: String::new(),
-            unclearable_recovery: None,
-        },
-        Outcome::RefuseForeign {
-            recovery: String::new(),
-        },
-        Outcome::RefuseUnreadable {
-            reason: String::new(),
-            recovery: Some(String::new()),
-        },
-    ] {
-        assert!(!changes_loaded_job(&outcome, Some(&on_disk), &desired), "{outcome:?}");
-    }
-}
-
-/// `Create` writes a new artifact; a job under its label is booted out before the write, not refused.
-#[skuld::test]
-fn a_create_does_not() {
-    assert!(!changes_loaded_job(
-        &Outcome::Create,
-        None,
-        &rendered(&spec_fixture(), "root")
-    ));
+    assert!(!changes_loaded_job(&on_disk, &desired));
 }
 
 // loaded_refusal ======================================================================================================

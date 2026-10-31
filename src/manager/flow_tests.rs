@@ -342,3 +342,19 @@ fn scan_that_finishes_reports_nothing() {
     assert_eq!(kept, ["a", "b"]);
     assert_eq!(reported, None);
 }
+
+/// The text of a directory pass that stopped, which every directory-scanning backend hands
+/// `scan` as its `detail`. Injected here because no real `readdir` fails on request.
+#[skuld::test]
+fn a_directory_pass_that_stopped_is_worded_by_where_it_stopped() {
+    let e = std::io::Error::other("injected mid-scan failure");
+
+    assert_eq!(
+        directory_detail("enumerate", &e),
+        "failed to read a directory entry: injected mid-scan failure"
+    );
+    assert_eq!(
+        directory_detail("open", &e),
+        "failed to read directory: injected mid-scan failure"
+    );
+}

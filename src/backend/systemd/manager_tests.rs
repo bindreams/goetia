@@ -378,22 +378,6 @@ fn a_unit_directory_that_cannot_be_opened_is_reported_not_propagated() {
     }
 }
 
-/// The text of a pass that stopped part-way, which `flow::scan` hands `scan_detail` as `enumerate`.
-/// Injected here because no real `readdir` fails on request.
-#[skuld::test]
-fn a_directory_entry_that_cannot_be_read_is_worded_as_such() {
-    let e = io::Error::other("injected mid-scan failure");
-
-    assert_eq!(
-        scan_detail("enumerate", &e),
-        "failed to read a directory entry: injected mid-scan failure"
-    );
-    assert_eq!(
-        scan_detail("open", &e),
-        "failed to read directory: injected mid-scan failure"
-    );
-}
-
 /// The case that is deliberately *not* this one: an absent unit directory establishes that nothing
 /// is installed. A determinate answer is reported as one — an empty listing on exit `0`, never an
 /// `Err` that renders as "goetia could not answer".

@@ -3,11 +3,12 @@
 //! `write_existing` take an arbitrary target path, so the non-clobbering
 //! race and the `plutil -lint` gate are both fully testable against a
 //! `tempfile::tempdir()`. Everything that genuinely needs elevation and the
-//! real filesystem locations (`locate`/`discover`, `enable`/`disable`,
+//! real filesystem locations (`locate`/`read`, `enable`/`disable`,
 //! `start`/`stop` against real launchd) lives in
 //! `tests/launchd_integration.rs` instead.
 
 use super::*;
+use crate::manager::ServiceManager;
 use crate::spec::{Id, Kind, Restart, User};
 
 fn sample_plist(id: &str) -> String {
@@ -41,7 +42,7 @@ fn persist_new_creates_when_absent() {
 
     let staged = staged_tempfile(dir.path(), &content).unwrap();
     let result = persist_new(staged, &target).expect("persist_new over an absent target");
-    assert!(matches!(result, WriteNew::Written));
+    assert!(matches!(result, PersistOutcome::Written));
     assert_eq!(std::fs::read_to_string(&target).unwrap(), content);
 }
 
@@ -62,7 +63,7 @@ fn persist_new_does_not_clobber_existing_content() {
 
     let staged = staged_tempfile(dir.path(), &sample_plist("raced")).unwrap();
     let result = persist_new(staged, &target).expect("persist_new over a raced target");
-    assert!(matches!(result, WriteNew::Raced));
+    assert!(matches!(result, PersistOutcome::Raced));
     assert_eq!(
         std::fs::read_to_string(&target).unwrap(),
         "not a goetia artifact\n",
@@ -590,7 +591,7 @@ fn bytes_that_are_not_utf8_xml_are_foreign_not_undetermined() {
         fs::write(&path, &bytes).expect("write the vendor plist");
 
         assert!(
-            matches!(classify(bytes), Classified::NotOurs),
+            matches!(classify(bytes), ClassifyOutcome::NotOurs),
             "{label}: not the UTF-8 XML goetia writes, so not goetia's"
         );
 
@@ -642,41 +643,9 @@ fn the_launchd_undetermined_recovery_names_both_causes_and_not_uninstall() {
 
 // Enumeration: a scan that did not finish =============================================================================
 
-/// The mid-pass fault, and the reason `list` no longer propagates one: a dirent that could not be
-/// read must not take down the ids the very same pass already named — nor, since the two
-/// directories are scanned in one call, a directory that was read to the end before it. Injected
-/// through `collect_plists`' iterator because no real `readdir` fails on request.
-#[skuld::test]
-fn a_dirent_that_cannot_be_read_keeps_what_the_scan_already_named() {
-    let dir = Path::new(ENABLED_DIR);
-    let entries = vec![
-        Ok(dir.join("named-before-the-fault.plist")),
-        Err(io::Error::other("injected mid-scan failure")),
-        Ok(dir.join("never-reached.plist")),
-    ];
-
-    let scan = collect_plists(ENABLED_DIR, entries.into_iter());
-
-    assert_eq!(
-        scan.plists.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
-        ["named-before-the-fault"],
-        "what the pass named before the fault survives it, and the pass stops there: {scan:?}"
-    );
-    match &scan.incomplete {
-        Some(Installed::Undetermined { name, reason }) => {
-            assert_eq!(*name, None, "the pass cannot name what it never reached");
-            assert!(reason.contains("injected mid-scan failure"), "{reason}");
-            assert!(
-                reason.contains(ENABLED_DIR),
-                "the reason must name what was being scanned: {reason}"
-            );
-        }
-        other => panic!("a pass that stopped early must say so: {other:?}"),
-    }
-}
-
-/// The same fault one syscall earlier. An `Err` here reaches the CLI as `Kind::Unavailable` — exit
-/// `1` over an empty document, which is `list` reporting a populated host as having nothing on it.
+/// A plist directory that will not open is reported, not propagated (see `flow::scan`): an `Err` here
+/// reaches the CLI as `Kind::Unavailable` — exit `1` over an empty document, which is `list`
+/// reporting a populated host as having nothing on it.
 #[skuld::test]
 fn a_plist_directory_that_cannot_be_opened_is_reported_not_propagated() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -689,10 +658,12 @@ fn a_plist_directory_that_cannot_be_opened_is_reported_not_propagated() {
     let scan = scan_plists(&dir.to_string_lossy());
 
     assert!(scan.plists.is_empty(), "nothing was enumerated: {scan:?}");
-    assert!(
-        matches!(&scan.incomplete, Some(Installed::Undetermined { name: None, .. })),
-        "{scan:?}"
-    );
+    match &scan.incomplete {
+        Some(Installed::Undetermined { name: None, reason }) => {
+            assert!(reason.contains("failed to read directory: "), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 /// The case that is deliberately *not* this one: an absent directory — the staging one does not
@@ -728,6 +699,115 @@ fn a_pass_that_finishes_names_every_plist_and_nothing_else() {
         scan.incomplete.is_none(),
         "a pass that finished has nothing to report: {scan:?}"
     );
+}
+
+/// Two directories, scanned as the real ones are: the second is the enabled one.
+fn scanned(staging: &Path, enabled: &Path) -> Scan<Plist> {
+    scan_in([(&staging.to_string_lossy(), false), (&enabled.to_string_lossy(), true)])
+}
+
+#[skuld::test]
+fn a_marked_plist_is_scanned_as_marked_in_the_directory_it_was_found_in() {
+    let (staging, enabled) = (
+        tempfile::tempdir().expect("tempdir"),
+        tempfile::tempdir().expect("tempdir"),
+    );
+    let path = enabled.path().join("ours.plist");
+    fs::write(&path, sample_plist("ours")).expect("write the plist");
+
+    let scan = scanned(staging.path(), enabled.path());
+
+    assert!(scan.reported.is_empty(), "{:?}", scan.reported);
+    match scan.entries.as_slice() {
+        [(name, ReadOutcome::Marked { blob, snapshot })] => {
+            assert_eq!(name, "ours");
+            assert!(blob.is_ok(), "the marker decodes");
+            assert!(snapshot.location.enabled);
+            assert_eq!(snapshot.location.path, path);
+            assert_eq!(snapshot.text, sample_plist("ours"));
+        }
+        _ => panic!("one marked entry expected, got {} entries", scan.entries.len()),
+    }
+}
+
+#[skuld::test]
+fn a_plist_without_the_marker_is_scanned_as_foreign() {
+    let (staging, enabled) = (
+        tempfile::tempdir().expect("tempdir"),
+        tempfile::tempdir().expect("tempdir"),
+    );
+    fs::write(staging.path().join("theirs.plist"), "<plist/>").expect("write the plist");
+
+    let scan = scanned(staging.path(), enabled.path());
+
+    assert!(scan.reported.is_empty(), "{:?}", scan.reported);
+    assert!(
+        matches!(scan.entries.as_slice(), [(name, ReadOutcome::Foreign { .. })] if name == "theirs"),
+        "{} entries",
+        scan.entries.len()
+    );
+}
+
+/// A state none of this backend's operations produces, and one `locate` refuses for every verb: the
+/// listing names it rather than choosing a directory.
+#[skuld::test]
+fn a_plist_in_both_directories_is_reported_not_classified() {
+    let (staging, enabled) = (
+        tempfile::tempdir().expect("tempdir"),
+        tempfile::tempdir().expect("tempdir"),
+    );
+    for dir in [staging.path(), enabled.path()] {
+        fs::write(dir.join("twice.plist"), sample_plist("twice")).expect("write the plist");
+    }
+
+    let scan = scanned(staging.path(), enabled.path());
+
+    assert!(scan.entries.is_empty(), "{} entries", scan.entries.len());
+    assert_eq!(
+        scan.reported,
+        [Installed::OursUnreadable {
+            name: "twice".to_string(),
+            reason: format!("present in both {STAGING_DIR} and {ENABLED_DIR}"),
+        }]
+    );
+}
+
+// Writing: a race that has cost no call ===============================================================================
+
+/// A plist that vanished between `read` and `write` — a concurrent `uninstall` — before `install`
+/// made any `launchctl` call is `Raced`, so the flow reads again. The rendering is unchanged (only the
+/// version differs), so no `is_loaded` was asked: a second pass stays inside the reservation. The
+/// counterpart, a vanish after that call, is
+/// `a_plist_removed_after_a_read_fails_the_install_without_further_launchctl_calls`.
+#[skuld::test]
+fn a_write_over_a_plist_that_vanished_before_any_call_is_raced() {
+    use crate::backend::Backend as _;
+
+    let mgr = LaunchdManager::new();
+    let spec = spec_named("goetia-raced-before-any-call");
+    let desired = mgr.render(&spec).expect("render");
+    let on_disk = desired.replace(&format!("Version: {}", crate::version()), "Version: 0.0.1");
+    assert_ne!(on_disk, desired);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("gone.plist");
+    let snapshot = Plist {
+        location: Location {
+            path: path.clone(),
+            enabled: false,
+        },
+        text: on_disk,
+    };
+    let stale = Outcome::Stale {
+        from_version: "0.0.1".to_string(),
+    };
+    let mut scope = mgr.begin_install(&spec).expect("begin_install");
+
+    let written = mgr
+        .write(&spec, &desired, &stale, Some(&snapshot), &mut scope)
+        .expect("write");
+
+    assert!(matches!(written, WriteOutcome::Raced));
+    assert!(!path.exists(), "a raced write puts nothing back");
 }
 
 // Reapers: a sequence never fails halfway for want of one =============================================================
