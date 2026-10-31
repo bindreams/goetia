@@ -286,7 +286,7 @@ fn warnings_still_fire_once_with_backend_overrides_present() {
 #[skuld::test]
 fn a_variable_used_only_in_the_native_override_resolves_through_the_cli() {
     let dir = tempfile::tempdir().unwrap();
-    let native = goetia::spec::Backend::native().expect("native() is Some on every CI platform");
+    let native = goetia::spec::BackendKind::native().expect("native() is Some on every CI platform");
     write_manifest(
         dir.path(),
         &format!(

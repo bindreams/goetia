@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use super::{RawOverride, Supplied};
-use crate::spec::{Backend, RawManifest, RawUser};
+use crate::spec::{BackendKind, RawManifest, RawUser};
 
 fn parse(yaml: &str) -> Result<RawManifest, yaml_serde::Error> {
     RawManifest::parse(yaml)
@@ -35,7 +35,9 @@ daemons:
 ";
     let manifest = parse(yaml).expect("valid manifest should parse");
     let overrides = &manifest.daemons["frpc"].backend_specific;
-    let scm = overrides.get(&Backend::Scm).expect("scm override should be present");
+    let scm = overrides
+        .get(&BackendKind::Scm)
+        .expect("scm override should be present");
 
     assert_eq!(scm.user, Some(RawUser::Scalar("svc-frpc".to_string())));
     assert_eq!(
@@ -126,7 +128,7 @@ daemons:
           PORT: \"9090\"
 ";
     let manifest = parse(yaml).expect("an override of a base env key is not a duplicate");
-    let scm = manifest.daemons["frpc"].backend_specific[&Backend::Scm]
+    let scm = manifest.daemons["frpc"].backend_specific[&BackendKind::Scm]
         .env
         .as_ref()
         .expect("the override sets `env`");
@@ -203,7 +205,7 @@ daemons:
         type: managed
 ";
     let manifest = parse(yaml).expect("valid manifest should parse");
-    let scm = &manifest.daemons["frpc"].backend_specific[&Backend::Scm];
+    let scm = &manifest.daemons["frpc"].backend_specific[&BackendKind::Scm];
 
     assert!(scm.name.is_some());
     assert!(scm.command.is_some());
@@ -391,7 +393,7 @@ daemons:
           A: \"\"
 ";
     let manifest = parse(yaml).expect("an empty env value should parse");
-    let env = manifest.daemons["frpc"].backend_specific[&Backend::Scm]
+    let env = manifest.daemons["frpc"].backend_specific[&BackendKind::Scm]
         .env
         .as_ref()
         .expect("env should be present");
@@ -461,7 +463,7 @@ daemons:
           \"null\": v
 ";
     let manifest = parse(yaml).expect("a quoted `null` key should parse");
-    let env = manifest.daemons["frpc"].backend_specific[&Backend::Scm]
+    let env = manifest.daemons["frpc"].backend_specific[&BackendKind::Scm]
         .env
         .as_ref()
         .expect("env should be present");
@@ -479,7 +481,10 @@ daemons:
 ";
     let manifest = parse(yaml).expect("a manifest with no `command` anywhere should still parse");
     assert_eq!(manifest.daemons["frpc"].command, None);
-    assert_eq!(manifest.daemons["frpc"].backend_specific[&Backend::Scm].command, None);
+    assert_eq!(
+        manifest.daemons["frpc"].backend_specific[&BackendKind::Scm].command,
+        None
+    );
 }
 
 #[skuld::test]
@@ -502,7 +507,7 @@ daemons:
           PORT: 8080
 ";
     let manifest = parse(yaml).expect("unquoted scalars should coerce, not fail");
-    let scm = &manifest.daemons["frpc"].backend_specific[&Backend::Scm];
+    let scm = &manifest.daemons["frpc"].backend_specific[&BackendKind::Scm];
 
     assert_eq!(scm.name.as_deref(), Some("42"));
     assert_eq!(
@@ -540,7 +545,7 @@ daemons:
 ";
     let manifest = parse(yaml).expect("valid manifest should parse");
     let spec = &manifest.daemons["frpc"];
-    let (merged, _supplied) = spec.merged_for(Backend::Scm);
+    let (merged, _supplied) = spec.merged_for(BackendKind::Scm);
     assert_eq!(merged.name.as_deref(), Some("scm-name"));
     assert_eq!(merged.user, Some(RawUser::Scalar("scm-user".to_string())));
 }
@@ -557,7 +562,7 @@ daemons:
 ";
     let manifest = parse(yaml).expect("valid manifest should parse");
     let spec = &manifest.daemons["frpc"];
-    let (merged, _supplied) = spec.merged_for(Backend::Scm);
+    let (merged, _supplied) = spec.merged_for(BackendKind::Scm);
     assert_eq!(merged.command.as_deref(), Some(&["/bin/frpc-scm".to_string()][..]));
 }
 
@@ -578,7 +583,7 @@ daemons:
 ";
     let manifest = parse(yaml).expect("valid manifest should parse");
     let spec = &manifest.daemons["frpc"];
-    let (merged, _supplied) = spec.merged_for(Backend::Scm);
+    let (merged, _supplied) = spec.merged_for(BackendKind::Scm);
     let expected: BTreeMap<String, String> = [("A", "1"), ("B", "3"), ("C", "4")]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -599,7 +604,7 @@ daemons:
 ";
     let manifest = parse(yaml).expect("valid manifest should parse");
     let spec = &manifest.daemons["frpc"];
-    let (merged, _supplied) = spec.merged_for(Backend::Scm);
+    let (merged, _supplied) = spec.merged_for(BackendKind::Scm);
     assert_eq!(merged.cwd.as_deref(), Some("/opt/frpc"));
 }
 
@@ -615,7 +620,7 @@ daemons:
 ";
     let manifest = parse(yaml).expect("valid manifest should parse");
     let spec = &manifest.daemons["frpc"];
-    let (merged, supplied) = spec.merged_for(Backend::Systemd);
+    let (merged, supplied) = spec.merged_for(BackendKind::Systemd);
     assert_eq!(merged, spec.without_overrides());
     assert_eq!(supplied, Supplied::NONE);
 }
@@ -632,7 +637,7 @@ daemons:
 ";
     let manifest = parse(yaml).expect("valid manifest should parse");
     let spec = &manifest.daemons["frpc"];
-    let (merged, _supplied) = spec.merged_for(Backend::Scm);
+    let (merged, _supplied) = spec.merged_for(BackendKind::Scm);
     assert!(merged.backend_specific.is_empty());
     assert!(spec.without_overrides().backend_specific.is_empty());
 }
@@ -656,7 +661,7 @@ daemons:
 ";
     let manifest = parse(yaml).expect("valid manifest should parse");
     let spec = &manifest.daemons["frpc"];
-    let (_merged, supplied) = spec.merged_for(Backend::Scm);
+    let (_merged, supplied) = spec.merged_for(BackendKind::Scm);
     assert_eq!(
         supplied,
         Supplied {
@@ -670,7 +675,7 @@ daemons:
 // The direct guard on the defect `Supplied` exists to prevent: without it,
 // every field of this base spec — including `user: {id: 1000}`, the
 // published-interface example from `README.md` — would be handed to
-// `Backend::Systemd.error` as if `systemd:` had written it.
+// `BackendKind::Systemd.error` as if `systemd:` had written it.
 #[skuld::test]
 fn supplied_is_none_for_a_backend_with_no_block() {
     let yaml = "
@@ -693,7 +698,7 @@ daemons:
 ";
     let manifest = parse(yaml).expect("valid manifest should parse");
     let spec = &manifest.daemons["frpc"];
-    let (_merged, supplied) = spec.merged_for(Backend::Systemd);
+    let (_merged, supplied) = spec.merged_for(BackendKind::Systemd);
     assert_eq!(supplied, Supplied::NONE);
 }
 
@@ -709,6 +714,6 @@ daemons:
 ";
     let manifest = parse(yaml).expect("valid manifest should parse");
     let spec = &manifest.daemons["frpc"];
-    let (_merged, supplied) = spec.merged_for(Backend::Scm);
+    let (_merged, supplied) = spec.merged_for(BackendKind::Scm);
     assert!(supplied.env);
 }

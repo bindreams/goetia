@@ -1,4 +1,4 @@
-//! The `backend-specific:` manifest key: a per-[`Backend`] set of field
+//! The `backend-specific:` manifest key: a per-[`BackendKind`] set of field
 //! overrides.
 //!
 //! A manifest author's reference:
@@ -32,11 +32,11 @@ use std::fmt;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
-use super::Backend;
+use super::BackendKind;
 use super::raw::{EnvVisitor, RawSpec};
 use super::user::RawUser;
 
-pub type BackendOverrides = BTreeMap<Backend, RawOverride>;
+pub type BackendOverrides = BTreeMap<BackendKind, RawOverride>;
 
 /// One `backend-specific.<backend>` entry: every field optional, since an
 /// override only needs to name the fields it actually overrides. Merging
@@ -67,7 +67,7 @@ pub struct RawOverride {
 
 /// Which of the nine fields a backend's override actually supplied.
 /// Provenance the merged spec cannot carry: after the merge a `restart`
-/// value is just a value, and `Backend::error` must not reject a base
+/// value is just a value, and `BackendKind::error` must not reject a base
 /// value for a backend the author never wrote a line for.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Supplied {
@@ -127,7 +127,7 @@ impl RawSpec {
     /// paired with `Supplied::NONE` — see the module-level guard this
     /// exists to hold: a per-backend rejection may only ever be applied to
     /// a field the returned `Supplied` marks `true`.
-    pub fn merged_for(&self, backend: Backend) -> (RawSpec, Supplied) {
+    pub fn merged_for(&self, backend: BackendKind) -> (RawSpec, Supplied) {
         let Some(ovr) = self.backend_specific.get(&backend) else {
             return (self.without_overrides(), Supplied::NONE);
         };
@@ -172,7 +172,7 @@ impl RawSpec {
 
 /// `RawSpec::backend_specific`: a hand-written `Visitor` over `MapAccess`,
 /// in the shape of `raw.rs`'s `DaemonsVisitor` — a plain
-/// `BTreeMap<Backend, RawOverride>` would silently keep the last of two
+/// `BTreeMap<BackendKind, RawOverride>` would silently keep the last of two
 /// `scm:` blocks rather than rejecting the duplicate.
 pub(super) fn deserialize_overrides<'de, D>(d: D) -> Result<BackendOverrides, D::Error>
 where
@@ -196,7 +196,7 @@ impl<'de> Visitor<'de> for OverridesVisitor {
     {
         let mut overrides = BTreeMap::new();
 
-        while let Some(backend) = map.next_key::<Backend>()? {
+        while let Some(backend) = map.next_key::<BackendKind>()? {
             if overrides.contains_key(&backend) {
                 return Err(de::Error::custom(format!("duplicate backend key `{backend}`")));
             }

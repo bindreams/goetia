@@ -218,8 +218,8 @@ fn resolve_parses_each_restart_policy() {
             "daemons:\n  frpc:\n    command: [bin/frpc]\n    restart: {raw}\n    backend-specific:\n      \
              scm: {{ restart: on-failure }}\n"
         );
-        let (specs, _) =
-            resolve_yaml_as(Backend::Systemd, &yaml).unwrap_or_else(|e| panic!("`restart: {raw}` should resolve: {e}"));
+        let (specs, _) = resolve_yaml_as(BackendKind::Systemd, &yaml)
+            .unwrap_or_else(|e| panic!("`restart: {raw}` should resolve: {e}"));
         assert_eq!(specs[0].restart, expected, "restart: {raw}");
     }
 }
@@ -359,7 +359,7 @@ daemons:
     command: [bin/svc.exe]
     restart: always
 "#;
-    for native in Backend::ALL {
+    for native in BackendKind::ALL {
         let err = resolve_yaml_as(native, yaml).unwrap_err();
         assert_names_daemon_reason_and_remedy(&err);
     }
@@ -375,9 +375,9 @@ daemons:
     backend-specific:
       scm: { restart: on-failure }
 "#;
-    for native in Backend::ALL {
+    for native in BackendKind::ALL {
         let (specs, warnings) = resolve_yaml_as(native, yaml).expect("the scm override removes the refusal");
-        let expected = if native == Backend::Scm {
+        let expected = if native == BackendKind::Scm {
             Restart::OnFailure
         } else {
             Restart::Always
@@ -396,7 +396,7 @@ daemons:
     backend-specific:
       scm: { restart: always }
 "#;
-    for native in Backend::ALL {
+    for native in BackendKind::ALL {
         assert_names_daemon_reason_and_remedy(&resolve_yaml_as(native, yaml).unwrap_err());
     }
 }
@@ -411,7 +411,7 @@ daemons:
       systemd: { restart: always }
       launchd: { restart: always }
 "#;
-    for native in Backend::ALL {
+    for native in BackendKind::ALL {
         resolve_yaml_as(native, yaml).expect("only scm refuses always");
     }
 }
@@ -425,7 +425,7 @@ daemons:
     restart: ${R}
 "#;
     let dir = fixture_dir(yaml, Some("R=always\n"));
-    for native in Backend::ALL {
+    for native in BackendKind::ALL {
         let err = resolve_as(parse_manifest(yaml), dir.path(), Some(native)).unwrap_err();
         assert_names_daemon_reason_and_remedy(&err);
     }
@@ -446,7 +446,7 @@ daemons:
       scm:     { command: [/bin/a] }
 "#;
     let dir = fixture_dir(yaml, Some("R=always\n"));
-    for native in Backend::ALL {
+    for native in BackendKind::ALL {
         let err = resolve_as(parse_manifest(yaml), dir.path(), Some(native)).unwrap_err();
         assert_names_daemon_reason_and_remedy(&err);
     }
@@ -460,7 +460,7 @@ fn an_undefined_variable_in_an_overridden_base_field_does_not_hide_an_advisory()
                      backend-specific:\n      systemd: { command: [/bin/frpc] }\n      \
                      launchd: { command: [/bin/frpc] }\n      scm: { command: [/bin/frpc] }\n";
     let dir = fixture_dir("", Some("DELAY=500ms\n"));
-    let native = Some(Backend::Systemd);
+    let native = Some(BackendKind::Systemd);
     let (_specs, from_literal) = resolve_as(parse_manifest(literal), dir.path(), native).expect("resolves");
     let (_specs, from_env) = resolve_as(parse_manifest(templated), dir.path(), native).expect("resolves");
     assert_eq!(
@@ -1190,7 +1190,7 @@ fn an_unreadable_env_file_silences_advisories_rather_than_failing_the_manifest()
     std::fs::create_dir(dir.path().join(".env")).expect("fixture directory should be creatable");
     let overridden = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    restart-delay: ${DELAY}\n    \
                       backend-specific:\n      systemd:\n        restart-delay: 1s\n";
-    let (specs, warnings) = resolve_as(parse_manifest(overridden), dir.path(), Some(Backend::Systemd))
+    let (specs, warnings) = resolve_as(parse_manifest(overridden), dir.path(), Some(BackendKind::Systemd))
         .expect("an unreadable `.env` must not fail a manifest whose native spec has no `$`");
     assert_eq!(specs[0].restart_delay, Some(Duration::from_secs(1)));
     assert!(warnings.is_empty(), "{warnings:?}");
@@ -1198,7 +1198,7 @@ fn an_unreadable_env_file_silences_advisories_rather_than_failing_the_manifest()
     // Drop the override and the *native* half wants it too — and that half
     // decides what gets installed, so an unreadable `.env` there is fatal.
     let bare = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    restart-delay: ${DELAY}\n";
-    let err = resolve_as(parse_manifest(bare), dir.path(), Some(Backend::Systemd)).unwrap_err();
+    let err = resolve_as(parse_manifest(bare), dir.path(), Some(BackendKind::Systemd)).unwrap_err();
     assert!(matches!(err, Error::Io { .. }), "expected Io, got: {err:?}");
 }
 
@@ -1360,31 +1360,31 @@ fn an_interpolated_value_cannot_create_a_daemon_or_a_field() {
 
 // backend-specific overrides ==========================================================================================
 
-/// A backend that is not this host's native one. `Backend::ALL` always has
-/// at least two such entries (`Backend::native()` names at most one), so the
+/// A backend that is not this host's native one. `BackendKind::ALL` always has
+/// at least two such entries (`BackendKind::native()` names at most one), so the
 /// first match is deterministic and always exists.
-fn non_native_backend() -> Backend {
-    Backend::ALL
+fn non_native_backend() -> BackendKind {
+    BackendKind::ALL
         .into_iter()
-        .find(|&b| Some(b) != Backend::native())
+        .find(|&b| Some(b) != BackendKind::native())
         .expect("ALL has 3 entries; native() names at most 1")
 }
 
-/// A `user:` value `Backend::error` rejects for `backend`, on any host — so
+/// A `user:` value `BackendKind::error` rejects for `backend`, on any host — so
 /// a test can aim a per-backend verdict at whichever backend it is naming
 /// as native.
-fn user_rejected_by(backend: Backend) -> &'static str {
+fn user_rejected_by(backend: BackendKind) -> &'static str {
     match backend {
         // A numeric uid is never a Windows account.
-        Backend::Scm => "{id: 1000}",
+        BackendKind::Scm => "{id: 1000}",
         // A SID is never a POSIX account.
-        Backend::Systemd | Backend::Launchd => "{id: \"S-1-5-18\"}",
+        BackendKind::Systemd | BackendKind::Launchd => "{id: \"S-1-5-18\"}",
     }
 }
 
 /// `resolve`, with `native` named rather than detected — the seam that puts
 /// every host's native arm within reach of every other host's test runner.
-fn resolve_yaml_as(native: Backend, yaml: &str) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
+fn resolve_yaml_as(native: BackendKind, yaml: &str) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
     resolve_as(parse_manifest(yaml), &base_dir(), Some(native))
 }
 
@@ -1420,7 +1420,7 @@ fn a_templated_user_is_judged_under_the_native_backend_and_nowhere_else() {
                 user: ${ACCT}\n      launchd:\n        user: ${ACCT}\n";
     let dir = fixture_dir(yaml, Some("ACCT=NT AUTHORITY\\SYSTEM\n"));
 
-    for native in [Backend::Systemd, Backend::Launchd] {
+    for native in [BackendKind::Systemd, BackendKind::Launchd] {
         let err = resolve_as(parse_manifest(yaml), dir.path(), Some(native)).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("Windows built-in"), "native `{native}`: {msg}");
@@ -1433,7 +1433,7 @@ fn a_templated_user_is_judged_under_the_native_backend_and_nowhere_else() {
     // The other direction: with
     // `scm` native, neither `${ACCT}` is substituted, so neither is judged
     // — and `.env` is not read at all.
-    resolve_as(parse_manifest(yaml), dir.path(), Some(Backend::Scm))
+    resolve_as(parse_manifest(yaml), dir.path(), Some(BackendKind::Scm))
         .expect("a template under a non-native backend is unresolvable, and so unchecked");
 }
 
@@ -1443,7 +1443,7 @@ fn a_native_backend_verdict_names_the_override_that_caused_it() {
     // pass to apply a per-backend rule to the native spec — there is no
     // earlier pass whose success would make substitution the only suspect,
     // and this manifest carries no `$` and sits beside no `.env` file.
-    for native in Backend::ALL {
+    for native in BackendKind::ALL {
         let yaml = format!(
             "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      {native}:\n        user: {}\n",
             user_rejected_by(native)
@@ -1463,7 +1463,7 @@ fn a_native_backend_verdict_names_the_override_that_caused_it() {
 
 #[skuld::test]
 fn resolve_applies_the_native_backends_override() {
-    let native = Backend::native().expect("native() is Some on every CI platform");
+    let native = BackendKind::native().expect("native() is Some on every CI platform");
     let yaml = format!(
         "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user: root\n    backend-specific:\n      {native}:\n        \
          user: bindreams\n"
@@ -1499,7 +1499,7 @@ fn an_invalid_non_native_override_fails_the_whole_manifest() {
 
 #[skuld::test]
 fn an_invalid_native_override_fails_the_whole_manifest() {
-    let native = Backend::native().expect("native() is Some on every CI platform");
+    let native = BackendKind::native().expect("native() is Some on every CI platform");
     // The pass whose spec is actually installed, and the one whose failure
     // has a production consequence.
     let yaml = format!(
@@ -1522,7 +1522,7 @@ fn an_override_error_names_the_backend_that_caused_it() {
         "non-native: {err}"
     );
 
-    let native = Backend::native().expect("native() is Some on every CI platform");
+    let native = BackendKind::native().expect("native() is Some on every CI platform");
     let yaml = format!(
         "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      {native}:\n        \
          user: \"evil\\nUser=0\"\n"
@@ -1646,8 +1646,8 @@ fn the_native_backend_advisory_comes_from_the_substituted_pass() {
     // emits nothing at all, which is why the assertion is keyed on the
     // advisory each backend actually has.
     let cases = [
-        (Backend::Launchd, "restart-delay: 500ms", "ThrottleInterval"),
-        (Backend::Scm, "type: managed\n    cwd: .", "silently unavailable"),
+        (BackendKind::Launchd, "restart-delay: 500ms", "ThrottleInterval"),
+        (BackendKind::Scm, "type: managed\n    cwd: .", "silently unavailable"),
     ];
     for (native, fields, expected) in cases {
         let yaml = format!("daemons:\n  frpc:\n    command: [/bin/frpc]\n    {fields}\n");
@@ -1683,7 +1683,7 @@ fn a_templated_base_field_reaches_every_backends_advisories() {
     // non-native backends: `Systemd.warn` has no advisories of its own —
     // which is also why the `systemd:` override below cannot be what
     // silences anything.
-    let native = Some(Backend::Systemd);
+    let native = Some(BackendKind::Systemd);
     let owed_alike = |literal: &str, templated: &str, expected: usize| {
         let (_specs, from_literal) =
             resolve_as(parse_manifest(literal), dir.path(), native).expect("resolves, with advisories");
@@ -1747,8 +1747,8 @@ fn an_unrelated_daemon_cannot_change_a_daemons_advisories() {
     let dir = fixture_dir("", Some("DELAY=500ms\n"));
 
     let owed_by_frpc = |yaml: &str| {
-        let (_specs, warnings) =
-            resolve_as(parse_manifest(yaml), dir.path(), Some(Backend::Systemd)).expect("resolves, with advisories");
+        let (_specs, warnings) = resolve_as(parse_manifest(yaml), dir.path(), Some(BackendKind::Systemd))
+            .expect("resolves, with advisories");
         warnings
             .into_iter()
             .filter(|w| w.id.as_ref().is_some_and(|id| id.as_str() == "frpc"))
@@ -1773,7 +1773,8 @@ fn a_templated_override_field_stays_unchecked_on_a_backend_that_cannot_resolve_i
     let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    cwd: .\n    backend-specific:\n      scm:\n        \
                 type: ${KIND}\n";
     let dir = fixture_dir(yaml, Some("KIND=managed\n"));
-    let (_specs, warnings) = resolve_as(parse_manifest(yaml), dir.path(), Some(Backend::Systemd)).expect("resolves");
+    let (_specs, warnings) =
+        resolve_as(parse_manifest(yaml), dir.path(), Some(BackendKind::Systemd)).expect("resolves");
     assert!(
         warnings.is_empty(),
         "`scm` is not substituted for from a systemd host: {warnings:?}"
@@ -1788,12 +1789,12 @@ fn a_native_backends_verdict_does_not_pre_empt_the_sweep() {
     // deferred to step 5 — where it judges the values that will actually be
     // installed, substituted, rather than the text they were written as.
     //
-    // The native backend must come *first* in `Backend::ALL` for this to
+    // The native backend must come *first* in `BackendKind::ALL` for this to
     // distinguish anything: were it swept, its verdict would be raised
     // before the other's. `ALL[0]`/`ALL[1]` rather than two names, so the
     // pairing cannot rot if that order changes.
-    let native = Backend::ALL[0];
-    let swept = Backend::ALL[1];
+    let native = BackendKind::ALL[0];
+    let swept = BackendKind::ALL[1];
     let yaml = format!(
         "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      {native}:\n        user: {}\n      \
          {swept}:\n        user: {}\n",
@@ -1809,7 +1810,7 @@ fn a_native_backends_verdict_does_not_pre_empt_the_sweep() {
 #[skuld::test]
 fn a_host_with_no_native_backend_resolves_the_base_spec_alone() {
     // `resolve_as`'s fourth legal `native`, and the one no platform this
-    // crate builds for produces — `Backend::native()` is `Some` on all
+    // crate builds for produces — `BackendKind::native()` is `Some` on all
     // three, which is exactly why the seam has to be driven here. With no
     // backend to merge for, `merged_native` falls back to
     // `without_overrides` and every override is ignored.
@@ -1844,7 +1845,7 @@ fn a_missing_command_with_no_native_backend_names_no_backend() {
             !msg.contains("backend-specific"),
             "no backend to offer as a remedy: {msg}"
         );
-        for backend in Backend::ALL {
+        for backend in BackendKind::ALL {
             assert!(!msg.contains(&backend.to_string()), "no backend to name: {msg}");
         }
     }
@@ -1859,7 +1860,7 @@ fn an_override_on_every_backend_resolves() {
 
 #[skuld::test]
 fn a_command_only_under_the_native_backend_installs() {
-    let native = Backend::native().expect("native() is Some on every CI platform");
+    let native = BackendKind::native().expect("native() is Some on every CI platform");
     let yaml = format!("daemons:\n  frpc:\n    backend-specific:\n      {native}:\n        command: [/bin/frpc]\n");
     let (specs, _warnings) = resolve_yaml(&yaml).expect("resolves");
     assert!(!specs[0].command.is_empty());
@@ -1867,7 +1868,7 @@ fn a_command_only_under_the_native_backend_installs() {
 
 #[skuld::test]
 fn a_command_missing_for_the_native_backend_is_an_error() {
-    let native = Backend::native().expect("native() is Some on every CI platform");
+    let native = BackendKind::native().expect("native() is Some on every CI platform");
     let yaml = "daemons:\n  frpc:\n    name: frpc\n";
     let err = resolve_yaml(yaml).unwrap_err();
     let msg = err.to_string();
@@ -1881,7 +1882,7 @@ fn a_command_missing_for_the_native_backend_is_an_error() {
 
 #[skuld::test]
 fn a_command_missing_for_a_non_native_backend_resolves() {
-    let native = Backend::native().expect("native() is Some on every CI platform");
+    let native = BackendKind::native().expect("native() is Some on every CI platform");
     // A command present only for the native backend: completeness is
     // per-install, not per-backend, and a Windows-less manifest is usable
     // on Linux.
@@ -1891,7 +1892,7 @@ fn a_command_missing_for_a_non_native_backend_resolves() {
 
 #[skuld::test]
 fn an_empty_command_is_rejected_like_a_missing_one() {
-    let native = Backend::native().expect("native() is Some on every CI platform");
+    let native = BackendKind::native().expect("native() is Some on every CI platform");
     let yaml = format!("daemons:\n  frpc:\n    backend-specific:\n      {native}:\n        command: []\n");
     let err = resolve_yaml(&yaml).unwrap_err();
     assert!(err.to_string().contains("command"));
@@ -2127,7 +2128,7 @@ fn a_templated_restart_delay_resolves() {
 
 #[skuld::test]
 fn a_templated_restart_in_the_native_override_resolves() {
-    let native = Backend::native().expect("native() is Some on every CI platform");
+    let native = BackendKind::native().expect("native() is Some on every CI platform");
     let yaml = format!(
         "daemons:\n  frpc:\n    command: [/bin/frpc]\n    backend-specific:\n      {native}:\n        restart: ${{R}}\n"
     );

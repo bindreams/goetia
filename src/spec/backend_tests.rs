@@ -1,19 +1,19 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::{Backend, Builtin, MAX_SC_ACTION_DELAY, Shaped, ShapedSpec, windows_builtin, windows_only_account};
+use super::{BackendKind, Builtin, MAX_SC_ACTION_DELAY, Shaped, ShapedSpec, windows_builtin, windows_only_account};
 use crate::spec::overrides::Supplied;
 use crate::spec::{AccountId, Id, Kind, Restart, User};
 
-fn parse(yaml: &str) -> Result<Backend, yaml_serde::Error> {
+fn parse(yaml: &str) -> Result<BackendKind, yaml_serde::Error> {
     yaml_serde::from_str(yaml)
 }
 
 #[skuld::test]
 fn backend_keys_are_the_lowercase_backend_names() {
-    assert_eq!(parse("systemd").unwrap(), Backend::Systemd);
-    assert_eq!(parse("launchd").unwrap(), Backend::Launchd);
-    assert_eq!(parse("scm").unwrap(), Backend::Scm);
+    assert_eq!(parse("systemd").unwrap(), BackendKind::Systemd);
+    assert_eq!(parse("launchd").unwrap(), BackendKind::Launchd);
+    assert_eq!(parse("scm").unwrap(), BackendKind::Scm);
 }
 
 #[skuld::test]
@@ -40,9 +40,9 @@ fn backend_keys_are_case_sensitive() {
 
 #[skuld::test]
 fn all_round_trips_through_as_str() {
-    assert_eq!(Backend::ALL.len(), 3, "ALL should have one entry per variant");
+    assert_eq!(BackendKind::ALL.len(), 3, "ALL should have one entry per variant");
 
-    for backend in Backend::ALL {
+    for backend in BackendKind::ALL {
         assert_eq!(
             parse(backend.as_str()).unwrap(),
             backend,
@@ -54,9 +54,9 @@ fn all_round_trips_through_as_str() {
 #[skuld::test]
 fn native_backend_agrees_with_the_platforms_that_have_a_service_manager() {
     assert_eq!(
-        Backend::native().is_some(),
+        BackendKind::native().is_some(),
         crate::manager::native().is_ok(),
-        "Backend::native() and manager::native() must agree on which platforms have a service manager"
+        "BackendKind::native() and manager::native() must agree on which platforms have a service manager"
     );
 }
 
@@ -89,7 +89,7 @@ fn shaped_spec() -> ShapedSpec {
     }
 }
 
-// `Backend::warn` =====================================================================================================
+// `BackendKind::warn` =================================================================================================
 
 #[skuld::test]
 fn each_backend_emits_only_its_own_warnings() {
@@ -99,17 +99,17 @@ fn each_backend_emits_only_its_own_warnings() {
     spec.restart_delay = Shaped::Parsed(Duration::from_millis(500));
 
     let mut launchd_warnings = Vec::new();
-    Backend::Launchd.warn(&spec, &mut launchd_warnings);
+    BackendKind::Launchd.warn(&spec, &mut launchd_warnings);
     assert_eq!(launchd_warnings.len(), 1, "launchd: {launchd_warnings:?}");
     assert!(launchd_warnings[0].message.contains("not a whole number of seconds"));
 
     let mut scm_warnings = Vec::new();
-    Backend::Scm.warn(&spec, &mut scm_warnings);
+    BackendKind::Scm.warn(&spec, &mut scm_warnings);
     assert_eq!(scm_warnings.len(), 1, "scm: {scm_warnings:?}");
     assert!(scm_warnings[0].message.contains("System32"));
 
     let mut systemd_warnings = Vec::new();
-    Backend::Systemd.warn(&spec, &mut systemd_warnings);
+    BackendKind::Systemd.warn(&spec, &mut systemd_warnings);
     assert!(systemd_warnings.is_empty(), "systemd: {systemd_warnings:?}");
 }
 
@@ -121,7 +121,7 @@ fn an_over_long_delay_warns_from_the_scm_arm() {
     spec.restart_delay = Shaped::Parsed(MAX_SC_ACTION_DELAY + Duration::from_millis(1));
 
     let mut warnings = Vec::new();
-    Backend::Scm.warn(&spec, &mut warnings);
+    BackendKind::Scm.warn(&spec, &mut warnings);
 
     let [warning] = warnings.as_slice() else {
         panic!("expected exactly one warning, got {warnings:?}");
@@ -142,7 +142,7 @@ fn the_scm_delay_advisory_is_gated_on_restart_alone() {
     simple.restart = Shaped::Parsed(Restart::OnFailure);
     simple.restart_delay = Shaped::Parsed(over_long);
     let mut warnings = Vec::new();
-    Backend::Scm.warn(&simple, &mut warnings);
+    BackendKind::Scm.warn(&simple, &mut warnings);
     assert_eq!(
         warnings.len(),
         1,
@@ -154,7 +154,7 @@ fn the_scm_delay_advisory_is_gated_on_restart_alone() {
     never_restarts.restart = Shaped::Parsed(Restart::Never);
     never_restarts.restart_delay = Shaped::Parsed(over_long);
     let mut warnings = Vec::new();
-    Backend::Scm.warn(&never_restarts, &mut warnings);
+    BackendKind::Scm.warn(&never_restarts, &mut warnings);
     assert!(warnings.is_empty(), "Restart::Never must not warn: {warnings:?}");
 }
 
@@ -166,7 +166,7 @@ fn a_sub_millisecond_delay_warns_from_the_scm_arm_with_the_rounded_value() {
     spec.restart_delay = Shaped::Parsed(Duration::from_micros(1500));
 
     let mut warnings = Vec::new();
-    Backend::Scm.warn(&spec, &mut warnings);
+    BackendKind::Scm.warn(&spec, &mut warnings);
 
     let [warning] = warnings.as_slice() else {
         panic!("expected exactly one warning, got {warnings:?}");
@@ -184,14 +184,14 @@ fn the_sub_millisecond_advisory_is_silent_when_nothing_is_rounded_or_nothing_res
     whole.restart = Shaped::Parsed(Restart::OnFailure);
     whole.restart_delay = Shaped::Parsed(Duration::from_millis(7));
     let mut warnings = Vec::new();
-    Backend::Scm.warn(&whole, &mut warnings);
+    BackendKind::Scm.warn(&whole, &mut warnings);
     assert!(warnings.is_empty(), "a whole-ms delay must not warn: {warnings:?}");
 
     let mut never_restarts = shaped_spec();
     never_restarts.restart = Shaped::Parsed(Restart::Never);
     never_restarts.restart_delay = Shaped::Parsed(Duration::from_micros(1500));
     let mut warnings = Vec::new();
-    Backend::Scm.warn(&never_restarts, &mut warnings);
+    BackendKind::Scm.warn(&never_restarts, &mut warnings);
     assert!(warnings.is_empty(), "Restart::Never must not warn: {warnings:?}");
 
     // Clamped, not rounded: the over-long advisory is the only one.
@@ -199,7 +199,7 @@ fn the_sub_millisecond_advisory_is_silent_when_nothing_is_rounded_or_nothing_res
     over_long.restart = Shaped::Parsed(Restart::OnFailure);
     over_long.restart_delay = Shaped::Parsed(MAX_SC_ACTION_DELAY + Duration::from_nanos(1));
     let mut warnings = Vec::new();
-    Backend::Scm.warn(&over_long, &mut warnings);
+    BackendKind::Scm.warn(&over_long, &mut warnings);
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert!(warnings[0].message.contains("clamped"), "{warnings:?}");
 }
@@ -296,7 +296,7 @@ fn a_spelling_that_is_not_in_the_table_is_an_ordinary_account() {
     }
 }
 
-// `Backend::error` ====================================================================================================
+// `BackendKind::error` ================================================================================================
 
 #[skuld::test]
 fn a_templated_user_name_is_not_checked_against_the_builtin_table() {
@@ -308,18 +308,18 @@ fn a_templated_user_name_is_not_checked_against_the_builtin_table() {
 
     spec.user = User::Name("${ACCT}".to_string());
     assert!(
-        Backend::Systemd.error(&spec, supplied).is_ok(),
+        BackendKind::Systemd.error(&spec, supplied).is_ok(),
         "a `$`-bearing name cannot be classified from this host and must not be guessed at"
     );
 
     spec.user = User::Name("LocalService".to_string());
     assert!(
-        Backend::Systemd.error(&spec, supplied).is_err(),
+        BackendKind::Systemd.error(&spec, supplied).is_err(),
         "the rule still fires for a value that needs no resolution"
     );
 
     assert!(
-        Backend::Systemd.error(&spec, Supplied::NONE).is_ok(),
+        BackendKind::Systemd.error(&spec, Supplied::NONE).is_ok(),
         "`Supplied::NONE` means this value came from the base spec, not the override, and must not be rejected"
     );
 }
@@ -332,8 +332,8 @@ fn a_numeric_uid_is_rejected_under_scm() {
         user: true,
         ..Supplied::NONE
     };
-    assert!(Backend::Scm.error(&spec, supplied).is_err());
-    assert!(Backend::Scm.error(&spec, Supplied::NONE).is_ok());
+    assert!(BackendKind::Scm.error(&spec, supplied).is_err());
+    assert!(BackendKind::Scm.error(&spec, Supplied::NONE).is_ok());
 }
 
 #[skuld::test]
@@ -344,10 +344,10 @@ fn a_sid_is_rejected_under_a_posix_backend() {
         user: true,
         ..Supplied::NONE
     };
-    assert!(Backend::Systemd.error(&spec, supplied).is_err());
-    assert!(Backend::Launchd.error(&spec, supplied).is_err());
+    assert!(BackendKind::Systemd.error(&spec, supplied).is_err());
+    assert!(BackendKind::Launchd.error(&spec, supplied).is_err());
     assert!(
-        Backend::Scm.error(&spec, supplied).is_ok(),
+        BackendKind::Scm.error(&spec, supplied).is_ok(),
         "a SID is a Windows account"
     );
 }

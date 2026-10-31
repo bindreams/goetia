@@ -11,19 +11,19 @@
 //! Also home to the per-backend cross-validation `resolve` runs over every
 //! backend's merged spec: [`ShapedSpec`]/[`Shaped`] (a spec that
 //! has passed the shape gate but may not yet be complete),
-//! [`Backend::warn`]/[`Backend::error`]/[`Backend::reject_merged`] (the
+//! [`BackendKind::warn`]/[`BackendKind::error`]/[`BackendKind::reject_merged`] (the
 //! advisory and rejection rules), and the Windows built-in account
 //! vocabulary (`windows_builtin`) both read.
 //!
-//! [`Backend::error`] rejects only a field the override actually supplied
+//! [`BackendKind::error`] rejects only a field the override actually supplied
 //! (`Supplied`, from `overrides.rs`) — a base value is never a per-backend
-//! verdict, since nobody wrote it for that backend. [`Backend::warn`] is
+//! verdict, since nobody wrote it for that backend. [`BackendKind::warn`] is
 //! not scoped that way: an advisory is information this host may give
 //! about any value it can read, base or overridden, which is what lets a
 //! Linux host warn about a Windows-only divergence in a manifest with no
 //! `backend-specific:` block at all.
 //!
-//! [`Backend::reject_merged`] is the one rejection that is *not* scoped to a
+//! [`BackendKind::reject_merged`] is the one rejection that is *not* scoped to a
 //! supplied field: a backend that cannot honour a value refuses it whoever
 //! wrote it, base included, because the base is what that backend would
 //! install. It is what makes the README's "every backend's merged spec is
@@ -34,8 +34,8 @@
 //! caught from any host — a uid is never a substituted string — while
 //! `scm: {user: "${ACCT}"}` is not checkable from Linux: substitution runs
 //! for the native backend only, and goetia does not claim to check what it
-//! cannot resolve. The base underneath it concerns [`Backend::warn`]
-//! alone, since `Supplied` masks a base field out of [`Backend::error`]
+//! cannot resolve. The base underneath it concerns [`BackendKind::warn`]
+//! alone, since `Supplied` masks a base field out of [`BackendKind::error`]
 //! entirely, and `warn` reads it *substituted* (`resolve`'s step 5a): a
 //! base field is substituted for the returned spec from the same `.env`, so
 //! moving one there must not delete an advisory about the value that
@@ -60,19 +60,19 @@ use crate::error::Error;
 ///
 /// Declared in alphabetical order: serde's `unknown_variant` error lists
 /// variants in declaration order, and this order also fixes the order
-/// [`Backend::ALL`] iterates in, which in turn fixes the order any warning
+/// [`BackendKind::ALL`] iterates in, which in turn fixes the order any warning
 /// keyed off it is emitted in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Backend {
+pub enum BackendKind {
     Launchd,
     Scm,
     Systemd,
 }
 
-impl Backend {
+impl BackendKind {
     /// Every variant, in the same alphabetical order they are declared in.
-    pub const ALL: [Backend; 3] = [Backend::Launchd, Backend::Scm, Backend::Systemd];
+    pub const ALL: [BackendKind; 3] = [BackendKind::Launchd, BackendKind::Scm, BackendKind::Systemd];
 
     /// The backend for the platform this binary is running on, or `None` on
     /// a platform with no service manager Goetia supports.
@@ -80,18 +80,18 @@ impl Backend {
     /// Must agree with [`crate::manager::native`]'s supported set — see
     /// `native_backend_agrees_with_the_platforms_that_have_a_service_manager`
     /// in `backend_tests.rs`.
-    pub const fn native() -> Option<Backend> {
+    pub const fn native() -> Option<BackendKind> {
         #[cfg(target_os = "linux")]
         {
-            Some(Backend::Systemd)
+            Some(BackendKind::Systemd)
         }
         #[cfg(target_os = "macos")]
         {
-            Some(Backend::Launchd)
+            Some(BackendKind::Launchd)
         }
         #[cfg(target_os = "windows")]
         {
-            Some(Backend::Scm)
+            Some(BackendKind::Scm)
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         {
@@ -103,14 +103,14 @@ impl Backend {
     /// `scm`. Round-trips through [`Deserialize`].
     pub const fn as_str(self) -> &'static str {
         match self {
-            Backend::Launchd => "launchd",
-            Backend::Scm => "scm",
-            Backend::Systemd => "systemd",
+            BackendKind::Launchd => "launchd",
+            BackendKind::Scm => "scm",
+            BackendKind::Systemd => "systemd",
         }
     }
 }
 
-impl std::fmt::Display for Backend {
+impl std::fmt::Display for BackendKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
@@ -166,16 +166,16 @@ pub(crate) struct ShapedSpec {
 
 // Advisories and rejections ===========================================================================================
 
-impl Backend {
+impl BackendKind {
     /// Advisories this backend has about `spec`, appended to `out`.
     /// Reads the whole merged spec: an advisory is information this host
     /// may give about any value it can read, on any backend, regardless of
     /// which one wrote it.
     pub(crate) fn warn(self, spec: &ShapedSpec, out: &mut Vec<Warning>) {
         match self {
-            Backend::Systemd => {}
-            Backend::Launchd => warn_on_sub_second_restart_delay(spec, out),
-            Backend::Scm => {
+            BackendKind::Systemd => {}
+            BackendKind::Launchd => warn_on_sub_second_restart_delay(spec, out),
+            BackendKind::Scm => {
                 warn_on_windows_divergences(spec, out);
                 warn_on_over_long_restart_delay(spec, out);
             }
@@ -191,7 +191,7 @@ impl Backend {
             return Ok(());
         }
         match self {
-            Backend::Scm => match &spec.user {
+            BackendKind::Scm => match &spec.user {
                 // A numeric uid is never a Windows account.
                 User::Id(AccountId::Uid(uid)) => Err(invalid(
                     &spec.id,
@@ -199,7 +199,7 @@ impl Backend {
                 )),
                 _ => Ok(()),
             },
-            Backend::Systemd | Backend::Launchd => match &spec.user {
+            BackendKind::Systemd | BackendKind::Launchd => match &spec.user {
                 // Neither a SID nor a Windows built-in name is ever a POSIX
                 // account.
                 User::Id(AccountId::Sid(sid)) => Err(invalid(
@@ -227,7 +227,7 @@ impl Backend {
     }
 
     /// Values this backend cannot honour, whichever layer wrote them. Reads
-    /// the whole merged spec, unlike [`Backend::error`]: the base is what a
+    /// the whole merged spec, unlike [`BackendKind::error`]: the base is what a
     /// backend installs when it has no override, so it is judged too.
     ///
     /// Only `scm` has one today: `restart: always` (SCM recovery actions never
@@ -237,13 +237,13 @@ impl Backend {
     /// reads as unknown and passes.
     pub(crate) fn reject_merged(self, spec: &ShapedSpec) -> Result<(), Error> {
         match self {
-            Backend::Scm if spec.restart.parsed() == Some(Restart::Always) => Err(invalid(
+            BackendKind::Scm if spec.restart.parsed() == Some(Restart::Always) => Err(invalid(
                 &spec.id,
                 "`restart: always` cannot be honoured by the scm backend: SCM recovery actions never fire \
                  after a clean exit. To keep `always` on systemd and launchd, set \
                  `backend-specific: scm: { restart: on-failure }`",
             )),
-            Backend::Scm | Backend::Systemd | Backend::Launchd => Ok(()),
+            BackendKind::Scm | BackendKind::Systemd | BackendKind::Launchd => Ok(()),
         }
     }
 }
@@ -323,7 +323,7 @@ pub(crate) fn scm_restart_delay(delay: Duration) -> Duration {
 /// install runs the generator. Gated identically to the clamp itself:
 /// `Restart::Never` builds no `FailureActions`, so a `restart-delay` without
 /// `restart: on-failure` warns about nothing. `always` never reaches here:
-/// [`Backend::reject_merged`] refuses it first.
+/// [`BackendKind::reject_merged`] refuses it first.
 fn warn_on_over_long_restart_delay(spec: &ShapedSpec, out: &mut Vec<Warning>) {
     if spec.restart.parsed() != Some(Restart::OnFailure) {
         return;
@@ -402,7 +402,7 @@ impl Builtin {
 ///
 /// `windows_builtin("")` is `Some(Builtin::LocalSystem)`: `canonical_account`
 /// maps an empty authored account to `LocalSystem`, and both halves must
-/// agree. `Backend::error` never sees an empty name —
+/// agree. `BackendKind::error` never sees an empty name —
 /// `reject_blank` fails first in `resolve_shape` — so this row is
 /// unreachable from that direction; do not "simplify" it away, or
 /// `User::Root`'s behaviour on Windows changes.
@@ -420,7 +420,7 @@ pub(crate) fn windows_builtin(name: &str) -> Option<Builtin> {
 }
 
 /// [`windows_builtin`], narrowed to the spellings that can name *only* a
-/// Windows account — the predicate `Backend::error` uses to reject a
+/// Windows account — the predicate `BackendKind::error` uses to reject a
 /// Windows built-in under a POSIX backend. Defined in terms of
 /// `windows_builtin`, never as a second table.
 ///

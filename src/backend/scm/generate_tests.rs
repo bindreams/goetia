@@ -811,7 +811,7 @@ fn managed_kind_clamps_absurdly_long_restart_delay() {
          inside windows-service's ServiceAction::to_raw"
     );
     // Warning coverage for an over-long delay lives in `spec::backend`'s
-    // tests, gated by `Backend::Scm.warn` rather than by this generator.
+    // tests, gated by `BackendKind::Scm.warn` rather than by this generator.
 }
 
 #[skuld::test]

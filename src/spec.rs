@@ -8,7 +8,7 @@
 //! the crate; `resolve` is both parse and validate.
 //!
 //! A daemon may also carry a `backend-specific:` block overriding its
-//! fields per [`Backend`]; see `overrides`'s module doc for the
+//! fields per [`BackendKind`]; see `overrides`'s module doc for the
 //! manifest-facing reference.
 
 mod backend;
@@ -20,7 +20,7 @@ mod resolve;
 mod user;
 mod vars;
 
-pub use backend::Backend;
+pub use backend::BackendKind;
 pub use overrides::{BackendOverrides, RawOverride, Supplied};
 pub use raw::{RawManifest, RawSpec};
 pub use resolve::{load, resolve};
@@ -37,7 +37,7 @@ pub(crate) use resolve::{
 // `spec` and so cannot see through a private `mod backend;`:
 // `windows_builtin` from `canonical_account` and `account_needs_password`,
 // `scm_restart_delay` from `registration`. `windows_only_account` stays out of
-// this line — only `Backend::error` reads it, inside `spec::backend` itself.
+// this line — only `BackendKind::error` reads it, inside `spec::backend` itself.
 pub(crate) use backend::{scm_restart_delay, windows_builtin};
 // `MAX_SC_ACTION_DELAY` is named through this path from `generate_tests.rs` alone.
 #[cfg(test)]
