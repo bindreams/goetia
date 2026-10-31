@@ -1007,13 +1007,12 @@ fn a_failed_precondition_leaves_an_installed_service_unchanged() {
     let spec = install_plain(&mgr, &id);
     let account_before = common::query_account_name(&id);
 
-    let output = install_as(&id, &format!(r".\{}", missing_account()));
+    let account = missing_account();
+    let output = install_as(&id, &format!(r".\{account}"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert!(
-        !output.status.success(),
-        "install as a missing account succeeded: {}",
-        String::from_utf8_lossy(&output.stdout)
-    );
+    assert!(!output.status.success(), "install as a missing account succeeded: {stdout}");
+    assert!(stdout.contains(&account), "the error must name the account: {stdout}");
     assert_eq!(common::query_account_name(&id), account_before);
     let after = mgr.preview_install(&spec).expect("preview_install");
     assert!(matches!(after, Outcome::UpToDate), "{after:?}");

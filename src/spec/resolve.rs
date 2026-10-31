@@ -186,9 +186,9 @@ fn resolve_as(
 
         // Step 4: the all-backends sweep, and errors only: every backend's
         // merged spec is checked as authored, and `BackendKind::error` judges
-        // the fields its override supplied. A non-native backend's
-        // advisories are not this host's to give, so the shape
-        // pass's warnings are dropped. The native arm runs the grammar and
+        // the fields its override supplied. A non-native backend's advisories
+        // are not this host's to give, so the shape pass's warnings are
+        // dropped. The native arm runs the grammar and
         // shape checks and no verdict: `error` runs in step 5 instead, on
         // the substituted text it is entitled to. This pass is not redundant
         // even so: it is what makes step 5's failures provably substitution's
