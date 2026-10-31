@@ -4,14 +4,17 @@
 //! systemd/launchd/SCM.
 //!
 //! The trait exists so the CLI is written once and tested without touching a
-//! real machine — not for runtime backend swapping. Every implementation's
-//! `install` must call [`crate::decide::decide`] rather than restate any row
-//! of its policy table itself; see [`conformance::run`], which asserts that
-//! contract against any `&dyn ServiceManager`.
+//! real machine — not for runtime backend swapping. `install`, `preview_install`,
+//! `status` and `list` are written once, in [`flow`]; a backend supplies only the
+//! primitives of [`crate::backend::Backend`] and gets them through a blanket impl,
+//! so it cannot restate any row of the policy table in [`crate::decide::decide`]
+//! itself. [`conformance::run`] asserts that contract against any
+//! `&dyn ServiceManager`.
 
 pub mod budget;
 pub mod conformance;
 pub mod fake;
+pub(crate) mod flow;
 
 pub use budget::Budget;
 

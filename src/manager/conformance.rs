@@ -3,9 +3,9 @@
 //! [`run`] is the deliverable, not the fake it is first exercised against:
 //! every real backend — systemd, launchd, SCM — calls it too, from its own elevated
 //! integration test, so a real backend's `install` is checked against the
-//! exact same behavioral contract as the fake's — the whole point of routing
-//! every implementation through [`crate::decide::decide`] instead of letting
-//! each restate the policy table.
+//! exact same behavioral contract as the fake's — the whole point of one
+//! shared flow over [`crate::decide::decide`] (see [`crate::manager::flow`])
+//! instead of each implementation restating the policy table.
 //!
 //! ## Cleanup
 //!
