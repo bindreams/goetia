@@ -1,10 +1,10 @@
 //! Policy assertions runnable against any [`ServiceManager`].
 //!
 //! [`run`] is the deliverable, not the fake it is first exercised against:
-//! every real backend calls it too, from its own elevated integration test, so a real backend is checked against the exact same
-//! behavioral contract as the fake. The install policy is not part of what a
-//! backend can get wrong: it lives once, in [`crate::manager::flow`], which
-//! is the only caller of [`crate::decide::decide`].
+//! every real backend calls it too, from its own elevated integration test, so a real backend is
+//! checked against the exact same behavioral contract as the fake. The install policy is not part
+//! of what a backend can get wrong: it lives once, in `crate::manager::flow`, which is the only
+//! caller of [`crate::decide::decide`].
 //!
 //! ## Cleanup
 //!

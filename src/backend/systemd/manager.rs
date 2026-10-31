@@ -358,8 +358,8 @@ fn stop_with(id: &Id, budget: Budget, steps: &VerbSteps<'_>) -> Result<()> {
 ///
 /// # Which ids those are
 ///
-/// The same two names [`discover`] calls this id's artifact, asked of the same directories it
-/// asks: `<id>.service` in [`UNIT_DIR`] alone, the only fragment path this backend ever reads or
+/// The names `discover::read` and `discover::residue` treat as this id's artifact, in the same
+/// directories they read: `<id>.service` in [`UNIT_DIR`] alone, the only fragment path this backend ever reads or
 /// writes, and `<id>.service.d` under every root of [`DROPIN_SEARCH_DIRS`], since
 /// `discover::residue` counts one there as much as one in `/etc`.
 ///

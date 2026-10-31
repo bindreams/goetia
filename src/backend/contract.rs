@@ -109,7 +109,8 @@ pub(crate) enum ReadOutcome<S> {
     Absent,
     /// Something is here that carries no Goetia marker, or a trace the platform still applies
     /// without an artifact of its own. `recovery` is the backend's own remedy where it has one;
-    /// `None` means [`crate::decide::foreign_recovery`].
+    /// `None` means [`crate::decide::foreign_recovery`]. `status` and the ownership gate use it;
+    /// `install` always uses `foreign_recovery`.
     Foreign { recovery: Option<String> },
     /// Goetia's marker is here. `blob` is its decoded metadata, or why it will not decode.
     Marked { blob: Result<Blob>, snapshot: S },

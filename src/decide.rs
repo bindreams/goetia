@@ -56,10 +56,9 @@ pub enum Ownership {
 /// architecturally systemd-specific: any backend that grows an analogous side-channel (a launchd
 /// override, say) needs the same questions answered, and answering them here — once — is what keeps
 /// them from being reinvented per backend.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalConfig {
     /// None exists.
-    #[default]
     Absent,
     /// Some exists, and a successful write by this backend removes all of it. Changes exactly one
     /// thing in [`decide`]: a stale artifact that also carries it is `Conflict`, not a

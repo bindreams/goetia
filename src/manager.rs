@@ -4,9 +4,9 @@
 //!
 //! The trait exists so the CLI is written once and tested without touching a
 //! real machine — not for runtime backend swapping. No backend implements it
-//! by hand: each implements [`crate::backend::Backend`], and a blanket impl
+//! by hand: each implements the crate-private `Backend` trait, and a blanket impl
 //! makes every `Backend` a `ServiceManager`. `install`, `preview_install`,
-//! `status` and `list` are therefore written once, in [`flow`], and
+//! `status` and `list` are therefore written once, in `flow`, and
 //! [`crate::decide::decide`] is called only from there. [`conformance::run`]
 //! asserts the contract against any `&dyn ServiceManager`.
 

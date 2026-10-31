@@ -454,8 +454,8 @@ fn every_conflict_carries_the_external_configs_unclearable_recovery() {
 #[skuld::test]
 fn stale_with_external_config_conflicts_not_stale() {
     let spec = spec_fixture();
-    // `regenerated` and `on_disk` deliberately differ, mirroring how a real backend's `discover`
-    // folds a marker for the external configuration onto `on_disk` without ever including it in
+    // `regenerated` and `on_disk` deliberately differ, mirroring how a real backend folds
+    // a marker for the external configuration onto `on_disk` without ever including it in
     // `regenerated`: an identical pair here would make the conflict diff trivially (and wrongly) empty.
     let regenerated = "ARTIFACT WRITTEN BY 0.1.0";
     let on_disk = "ARTIFACT WRITTEN BY 0.1.0\n# --- external config marker ---\n";

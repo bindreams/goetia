@@ -775,10 +775,10 @@ fn a_plist_in_both_directories_is_reported_not_classified() {
 // Writing: a race that has cost no call ===============================================================================
 
 /// A plist that vanished between `read` and `write` — a concurrent `uninstall` — before `install`
-/// made any `launchctl` call is `Raced`, so the flow reads again. The rendering is unchanged (only the
-/// version differs), so no `is_loaded` was asked, and the empty script fails the test if any
-/// `launchctl` call is made: a second pass stays inside the reservation. The counterpart, a vanish after that call, is
-/// `a_plist_removed_after_a_read_fails_the_install_without_further_launchctl_calls`.
+/// made any `launchctl` call is `Raced`, so the flow reads again. The rendering is unchanged (only
+/// the version differs), so no `is_loaded` was asked, and the empty script fails the test if any
+/// `launchctl` call is made: a second pass stays inside the reservation. The counterpart, a vanish
+/// after that call, is `a_plist_removed_after_a_read_fails_the_install_without_further_launchctl_calls`.
 #[skuld::test]
 fn a_write_over_a_plist_that_vanished_before_any_call_is_raced() {
     use crate::backend::Backend as _;

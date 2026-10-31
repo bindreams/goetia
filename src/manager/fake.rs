@@ -1,8 +1,8 @@
-//! [`Fake`]: an in-memory [`Backend`](crate::backend::Backend) with no real I/O, and so a [`ServiceManager`].
+//! [`Fake`]: an in-memory `Backend` with no real I/O, and so a [`ServiceManager`].
 //!
 //! Every CLI test in this crate runs against `Fake`, never a real backend —
 //! see `manager.rs`'s module doc comment. Its `install`, `status` and `list`
-//! are the shared flows in [`crate::manager::flow`], as for every backend:
+//! are the shared flows in `crate::manager::flow`, as for every backend:
 //! its own tiny `generate`/`extract` pair below (not any real
 //! systemd/launchd/SCM format) exists only so `decide` has something to
 //! compare, the same role each real backend's own generator plays.

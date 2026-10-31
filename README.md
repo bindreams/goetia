@@ -487,12 +487,13 @@ backend-specific:
 
 A service installed by an earlier release with `restart: always` on Windows
 is refused by `install` and `diff` as an unreadable artifact, until you run
-`goetia daemon uninstall <id>` and then `goetia daemon install`. `status`,
-`list`, `start`, `stop`, `restart` and `uninstall` read its embedded copy of
-the spec and keep working. What changes while it runs depends on its `type`.
-A `type: simple` service is no longer restarted when the command exits,
-because the new `goetia-shim` leaves every restart to SCM and the service has
-no recovery actions. A `type: managed` service is unchanged: it already had
+`goetia daemon uninstall <id>` and then `goetia daemon install`. `status`
+fails for it and `list` reports it as `unreadable`, because both render the
+embedded copy of the spec and SCM now refuses it. `start`, `stop`, `restart`
+and `uninstall` do not render it and keep working. What changes while it runs
+depends on its `type`. A `type: simple` service is no longer restarted when
+the command exits, because the new `goetia-shim` leaves every restart to SCM
+and the service has no recovery actions. A `type: managed` service is unchanged: it already had
 on-failure recovery actions, keeps them, and was never restarted after a clean
 exit. To give a `type: simple` service recovery actions, add the override above
 to the manifest, run `goetia daemon uninstall <id>`, then
@@ -572,7 +573,7 @@ worse than sending you to `goetia daemon show`.
 | --------------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `not-installed` | 1         | Nothing is installed at that id. Only from `status <id>`.                                                                                                                                                                                                                                                                                                                                       |
 | `foreign`       | 1         | A read that _completed_ established that what is there is not goetia's: an artifact carrying no marker, or a masked unit's symlink. Never inferred from a read that failed. Only from `status <id>`.                                                                                                                                                                                            |
-| `unreadable`    | 4         | Goetia read enough to know the id is its own, but cannot report on it — a blob it cannot decode, or a live state it could not query, as of a unit systemd has not loaded. `message` says which.                                                                                                                                                                                                 |
+| `unreadable`    | 4         | Goetia read enough to know the id is its own, but cannot report on it — a blob it cannot decode, an embedded spec it can no longer render (an account that no longer resolves, or a spec the backend now refuses), or a live state it could not query, as of a unit systemd has not loaded. `message` says which.                                                                                                                                                                                                 |
 | `undetermined`  | 4         | Goetia could not determine **whether** anything is installed at that id: a read it needed failed. Claims no ownership — that is the whole difference from `unreadable`. `message` names what would not read — a path, or on Windows a registry key or service object — and what would make it readable. Only from `status <id>`; out of `list()` the same fact is the `undetermined` key below. |
 | `invalid-id`    | 1         | A command-line argument was not a valid daemon id. Fix the argument.                                                                                                                                                                                                                                                                                                                            |
 | `unavailable`   | 1         | Obtaining the manager, or listing, failed, so **no** answer was obtained for any daemon — `id` is `null`. Or, under a daemon's `id`, goetia would not ask systemd about that daemon: offline, from a chroot, or where systemd did not boot.                                                                                                                                                     |
@@ -1309,16 +1310,18 @@ its plist taken
 sources are not interchangeable, and the remedies do not transfer:
 
 - **`unreadable`** — goetia's own daemon that goetia cannot use or report
-  on. The marker was read; the blob would not decode, or the manager gave
-  no live state for it — on systemd, a unit file the running manager
-  cannot see. `goetia daemon uninstall <id>` is the remedy for a blob that
-  would not decode, and needs neither the blob nor a live state. It is not
-  a remedy for the other: its `disable` goes through the manager too, and
-  fails the same way, exit `1`, leaving the artifact where it was. Nor is
-  `systemctl daemon-reload`, and the reason is what the case is: systemd
-  loads a unit file it can see on demand, so having none for a name goetia
-  found a file for means the two are not reading the same directory —
-  goetia's own mount namespace, say — which no goetia verb changes.
+  on. The marker was read; the blob would not decode, the spec in it can no
+  longer be rendered — an account that no longer resolves, or a spec the
+  backend now refuses — or the manager gave no live state for it — on
+  systemd, a unit file the running manager cannot see.
+  `goetia daemon uninstall <id>` is the remedy for the first two, and needs
+  neither the blob nor a live state. It is not a remedy for the other: its
+  `disable` goes through the manager too, and fails the same way, exit `1`,
+  leaving the artifact where it was. Nor is `systemctl daemon-reload`, and
+  the reason is what the case is: systemd loads a unit file it can see on
+  demand, so having none for a name goetia found a file for means the two
+  are not reading the same directory — goetia's own mount namespace, say —
+  which no goetia verb changes.
 - **`undetermined`** — a name goetia could not classify at all. The read
   that would have said whose it is never completed, so ownership is
   unestablished. Remedy: read it with more privilege.

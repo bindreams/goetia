@@ -87,7 +87,7 @@ const FAILURE_RESET_PERIOD: Duration = Duration::from_secs(86_400);
 /// Deliberately has no start-type field. Boot enablement (`SERVICE_DEMAND_START`
 /// vs. `SERVICE_AUTO_START`) is a property of the installation, not the service,
 /// so it is excluded here and therefore excluded from its `Display` text and from every
-/// drift comparison built on it — see `render_excludes_boot_enablement`.
+/// drift comparison built on it — see `display_excludes_boot_enablement`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScmRegistration {
     pub name: String,
@@ -402,7 +402,7 @@ fn missing_field_error(field: &str) -> Error {
 /// (`^[A-Za-z0-9._-]{1,80}$`) cannot contain a newline by construction.
 ///
 /// Never mentions boot enablement — `ScmRegistration` has no such field, so
-/// there is nothing here to render for it. See `render_excludes_boot_enablement`.
+/// there is nothing here to render for it. See `display_excludes_boot_enablement`.
 impl fmt::Display for ScmRegistration {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(out, "Name: {}", self.name)?;

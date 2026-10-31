@@ -23,7 +23,7 @@
 //! `install` can recover it. `interrupted_install_is_recoverable` in
 //! `tests/scm_integration.rs` pins this. `uninstall`, meanwhile, still does
 //! not need a *decodable* blob — only the `Marker` field, so a corrupted
-//! (but present) `Spec` value never wedges an id; see [`flow::owned`].
+//! (but present) `Spec` value never wedges an id.
 //!
 //! **2. Stopping (and starting) must not poll.** `windows-service`'s
 //! `stop()`/`start()` return as soon as SCM accepts the request, not once
@@ -119,7 +119,7 @@ use crate::spec::{DaemonSpec, Id, Kind};
 
 // ScmManager ==========================================================================================================
 
-/// The Windows [`Backend`]. Holds no state of its own —
+/// The Windows service manager. Holds no state of its own —
 /// every operation opens exactly the SCM/registry handles it needs and
 /// closes them again.
 #[derive(Debug, Default, Clone, Copy)]
