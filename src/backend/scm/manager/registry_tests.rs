@@ -20,14 +20,14 @@ fn parameters_key_path_is_the_service_key_plus_parameters() {
 
 #[skuld::test]
 fn an_absent_environment_value_is_no_lines() {
-    assert_eq!(environment_lines(None).unwrap(), Vec::<String>::new());
+    assert_eq!(environment_lines(None), Vec::<String>::new());
 }
 
 #[skuld::test]
 fn a_multi_string_environment_value_is_its_lines() {
     let lines = vec!["A=1".to_string(), "B=x y".to_string()];
     let value = lines.to_reg_value();
-    assert_eq!(environment_lines(Some(value)).unwrap(), ["A=1", "B=x y"]);
+    assert_eq!(environment_lines(Some(value)), ["A=1", "B=x y"]);
 }
 
 /// `winreg` reads an empty `REG_MULTI_SZ` as one empty string; it is no lines, as `write_environment`
@@ -36,13 +36,19 @@ fn a_multi_string_environment_value_is_its_lines() {
 fn an_empty_multi_string_environment_value_is_no_lines() {
     let lines = Vec::<String>::new();
     let value = lines.to_reg_value();
-    assert_eq!(environment_lines(Some(value)).unwrap(), Vec::<String>::new());
+    assert_eq!(environment_lines(Some(value)), Vec::<String>::new());
 }
 
+/// A rendered line is always `NAME=value`, so a line without `=` can never equal desired text: a
+/// value of the wrong type is a `Conflict` that names its type, and `--force` rewrites it.
 #[skuld::test]
-fn an_environment_value_of_another_type_is_an_error() {
+fn an_environment_value_of_another_type_is_one_marker_line_naming_its_type() {
     let value = "A=1".to_reg_value();
-    environment_lines(Some(value)).expect_err("a REG_SZ is not a REG_MULTI_SZ");
+    let lines = environment_lines(Some(value));
+
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(!lines[0].contains('='), "{lines:?}");
+    assert!(lines[0].contains("REG_SZ"), "{lines:?}");
 }
 
 /// The `Parameters` half of this backend's [`Error::Undetermined`] keying. `winreg` surfaces

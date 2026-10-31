@@ -575,6 +575,33 @@ fn a_hand_edited_environment_is_a_conflict() {
     assert!(matches!(again, Outcome::UpToDate), "{again:?}");
 }
 
+/// A wrong-typed `Environment` is a hand edit too: a `Conflict` that `--force` clears, not an error.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_wrong_typed_environment_is_a_conflict() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let env = BTreeMap::from([("GOETIA_TEST_KEY".to_string(), "value".to_string())]);
+    let spec = mk_spec(&id, fixture_command(&id, 1, 1, "plain"), env);
+    mgr.install(&spec, false).expect("install");
+
+    environment_key(&id, KEY_WRITE)
+        .set_value("Environment", &"GOETIA_TEST_KEY=value")
+        .expect("overwrite Environment with a REG_SZ");
+
+    let outcome = mgr.preview_install(&spec).expect("preview_install");
+    let Outcome::Conflict { artifact_diff, .. } = &outcome else {
+        panic!("expected Conflict for a REG_SZ Environment, got {outcome:?}");
+    };
+    assert!(artifact_diff.contains("REG_SZ"), "{artifact_diff}");
+
+    let forced = mgr.install(&spec, true).expect("forced install");
+    assert!(!matches!(forced, Outcome::Conflict { .. }), "{forced:?}");
+    assert_eq!(environment_of(&id), Some(vec!["GOETIA_TEST_KEY=value".to_string()]));
+    let again = mgr.preview_install(&spec).expect("preview_install after force");
+    assert!(matches!(again, Outcome::UpToDate), "{again:?}");
+}
+
 /// An `UpToDate` install writes nothing, so a second install of either kind must compare equal on
 /// everything the first wrote: failure actions, `Environment`, `Parameters`. A `type: simple`
 /// service's `Environment` is empty on both sides, whatever its spec's `env` says. It is registered

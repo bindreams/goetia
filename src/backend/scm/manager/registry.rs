@@ -122,31 +122,37 @@ pub fn write_parameters(name: &str, params: &BTreeMap<String, String>) -> Result
 
 // Environment =========================================================================================================
 
-/// The lines of `Services\<name>\Environment`; empty when the value is absent. A value of any type
-/// but `REG_MULTI_SZ` is an error rather than "no lines": `Environment` is compared, and a hand edit
-/// to another type must not read as up to date.
+/// The lines of `Services\<name>\Environment`; empty when the value is absent. Errs only when the
+/// value cannot be read at all; one of another type reads as the marker line [`environment_lines`]
+/// describes.
 pub fn read_environment(name: &str) -> Result<Vec<String>> {
     let path = service_key_path(name);
     let key = RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(&path, KEY_READ)
         .map_err(|e| registry_error("open", &path, e))?;
-    let value = match key.get_raw_value(ENVIRONMENT_VALUE) {
-        Ok(value) => Some(value),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(registry_error(&format!("read {ENVIRONMENT_VALUE} under"), &path, e)),
-    };
-    environment_lines(value).map_err(|e| registry_error(&format!("parse {ENVIRONMENT_VALUE} under"), &path, e))
+    match key.get_raw_value(ENVIRONMENT_VALUE) {
+        Ok(value) => Ok(environment_lines(Some(value))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(environment_lines(None)),
+        Err(e) => Err(registry_error(&format!("read {ENVIRONMENT_VALUE} under"), &path, e)),
+    }
 }
 
 /// [`read_environment`]'s parsing, apart from the registry so it is testable without one.
-fn environment_lines(value: Option<RegValue>) -> std::io::Result<Vec<String>> {
+///
+/// A value that is not a `REG_MULTI_SZ` reads as one line naming its type. A rendered line is always
+/// `NAME=value`, so a line without `=` never equals desired text: the hand edit is a `Conflict` the
+/// diff shows, and `install --force` overwrites it, type included.
+fn environment_lines(value: Option<RegValue>) -> Vec<String> {
     let Some(value) = value else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
-    let lines = Vec::<String>::from_reg_value(&value)?;
-    // `winreg` splits an empty `REG_MULTI_SZ` into one empty string; the registry cannot tell it
-    // from an empty list, and `write_environment` writes an empty list as no value at all.
-    Ok(if lines == [""] { Vec::new() } else { lines })
+    match Vec::<String>::from_reg_value(&value) {
+        // `winreg` splits an empty `REG_MULTI_SZ` into one empty string; the registry cannot tell it
+        // from an empty list, and `write_environment` writes an empty list as no value at all.
+        Ok(lines) if lines == [""] => Vec::new(),
+        Ok(lines) => lines,
+        Err(_) => vec![format!("(value of type {:?}, not REG_MULTI_SZ)", value.vtype)],
+    }
 }
 
 /// Write `lines` as `Services\<name>\Environment`. No lines deletes the value rather than writing
