@@ -119,7 +119,7 @@ use crate::spec::{DaemonSpec, Id, Kind};
 
 // ScmManager ==========================================================================================================
 
-/// The Windows `ServiceManager` implementation. Holds no state of its own —
+/// The Windows [`Backend`]. Holds no state of its own —
 /// every operation opens exactly the SCM/registry handles it needs and
 /// closes them again.
 #[derive(Debug, Default, Clone, Copy)]
@@ -969,12 +969,6 @@ fn to_error(context: &str, e: windows_service::Error) -> Error {
     Error::Other(service_detail(context, &e))
 }
 
-fn not_installed(id: &Id) -> Error {
-    Error::NotInstalled {
-        id: id.as_str().to_string(),
-    }
-}
-
 // undetermined ========================================================================================================
 
 /// This backend's single [`Error::Undetermined`] constructor — the SCM twin of
@@ -1039,7 +1033,9 @@ fn open_existing(id: &Id, access: ServiceAccess) -> Result<(WinServiceManager, S
     let scm = open_scm_to_classify(id.as_str())?;
     let service = scm.open_service(id.as_str(), access).map_err(|e| {
         if is_not_found(&e) {
-            not_installed(id)
+            Error::NotInstalled {
+                id: id.as_str().to_string(),
+            }
         } else {
             service_undetermined(id.as_str(), &format!("open service `{id}`"), &e)
         }

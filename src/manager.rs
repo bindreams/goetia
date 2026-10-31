@@ -31,7 +31,7 @@ use crate::spec::{DaemonSpec, Id};
 ///
 /// `install`/`uninstall`/`enable`/`disable`/`start`/`stop`/`kill` are the mutating
 /// verbs; `status`/`list` are read-only. The CLI checks elevation itself
-/// before calling any mutating verb — implementations do not re-check it.
+/// before calling any mutating verb — backends do not re-check it.
 pub trait ServiceManager {
     /// Install (create or update) the service for `spec`. Never starts and
     /// never enables it at boot — see the crate-level design notes on
