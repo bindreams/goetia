@@ -643,33 +643,24 @@ daemons:
 }
 
 #[skuld::test]
-fn supplied_names_exactly_the_fields_the_override_wrote() {
+fn supplied_records_user_only_when_the_override_wrote_it() {
     let yaml = "
 daemons:
   frpc:
-    name: base-name
     command: [/bin/frpc]
-    cwd: /opt/frpc
-    env:
-      A: \"1\"
-    logs: /var/log/frpc.log
-    type: simple
+    user: base-user
     backend-specific:
       scm:
         user: svc-frpc
-        name: scm-name
+      systemd:
+        cwd: /opt/frpc
 ";
     let manifest = parse(yaml).expect("valid manifest should parse");
     let spec = &manifest.daemons["frpc"];
     let (_merged, supplied) = spec.merged_for(BackendKind::Scm);
-    assert_eq!(
-        supplied,
-        Supplied {
-            user: true,
-            name: true,
-            ..Supplied::NONE
-        }
-    );
+    assert_eq!(supplied, Supplied { user: true });
+    let (_merged, supplied) = spec.merged_for(BackendKind::Systemd);
+    assert_eq!(supplied, Supplied::NONE);
 }
 
 // The direct guard on the defect `Supplied` exists to prevent: without it,
@@ -700,20 +691,4 @@ daemons:
     let spec = &manifest.daemons["frpc"];
     let (_merged, supplied) = spec.merged_for(BackendKind::Systemd);
     assert_eq!(supplied, Supplied::NONE);
-}
-
-#[skuld::test]
-fn an_empty_env_block_counts_as_supplied() {
-    let yaml = "
-daemons:
-  frpc:
-    command: [/bin/frpc]
-    backend-specific:
-      scm:
-        env: {}
-";
-    let manifest = parse(yaml).expect("valid manifest should parse");
-    let spec = &manifest.daemons["frpc"];
-    let (_merged, supplied) = spec.merged_for(BackendKind::Scm);
-    assert!(supplied.env);
 }

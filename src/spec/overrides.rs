@@ -72,32 +72,18 @@ pub struct RawOverride {
 /// read today; a field is added back when a check needs it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Supplied {
-    pub name: bool,
-    pub command: bool,
-    pub env: bool,
     pub user: bool,
 }
 
 impl Supplied {
     /// No override at all: every field is a base value.
-    pub const NONE: Supplied = Supplied {
-        name: false,
-        command: false,
-        env: false,
-        user: false,
-    };
+    pub const NONE: Supplied = Supplied { user: false };
 }
 
 impl RawOverride {
-    /// Which of the recorded fields (see [`Supplied`]) this override sets. One
-    /// `is_some()` per field, and `env` counts as supplied when the key is present even
-    /// if the map it holds is empty — an empty `env:` under a backend is
-    /// still something the author wrote.
+    /// Which of the recorded fields (see [`Supplied`]) this override sets.
     pub fn supplied(&self) -> Supplied {
         Supplied {
-            name: self.name.is_some(),
-            command: self.command.is_some(),
-            env: self.env.is_some(),
             user: self.user.is_some(),
         }
     }
