@@ -402,7 +402,7 @@ fn classify_fragment(id: &str, text: &str, on_disk: String) -> Ownership {
             // can regenerate — surfaced the same way any other blob invariant violation is.
             Err(e) => Ownership::OursUnreadable {
                 reason: e.to_string(),
-                recovery: None,
+                recovery: Some(decide::unreadable_recovery(id)),
             },
         },
         Err(e) => Ownership::OursUnreadable {

@@ -290,7 +290,7 @@ fn unreadable_carries_its_recovery_through() {
 
     for recovery in [Some("run the exact remedy".to_owned()), None] {
         let found = Ownership::OursUnreadable {
-            reason: "the account no longer resolves".to_owned(),
+            reason: "a drop-in could not be read".to_owned(),
             recovery: recovery.clone(),
         };
 
@@ -306,7 +306,7 @@ fn unreadable_carries_its_recovery_through() {
         assert_eq!(
             outcome,
             Outcome::RefuseUnreadable {
-                reason: "the account no longer resolves".to_owned(),
+                reason: "a drop-in could not be read".to_owned(),
                 recovery,
             }
         );
@@ -493,8 +493,8 @@ fn stale_with_external_config_and_force_is_stale() {
     );
 }
 
-/// Every refusal names a recovery, except an unreadable one whose discovery had none to name (an
-/// account that no longer resolves has no `uninstall`-shaped remedy).
+/// Every refusal names a recovery, except an unreadable one whose discovery had none to name (a
+/// drop-in that could not be read).
 #[skuld::test]
 fn every_refusal_names_a_recovery_command_except_a_recoveryless_unreadable() {
     let spec = spec_fixture();
@@ -520,7 +520,7 @@ fn every_refusal_names_a_recovery_command_except_a_recoveryless_unreadable() {
         ),
         decide(
             &Ownership::OursUnreadable {
-                reason: "account gone".to_owned(),
+                reason: "a drop-in could not be read".to_owned(),
                 recovery: None,
             },
             "GENERATED",

@@ -506,8 +506,7 @@ fn discover(spec: &DaemonSpec) -> Result<Discovery> {
 /// schema or bit-rotted blob puts it in. So is a blob the generator refuses,
 /// such as one that says `restart: always`.
 ///
-/// A blob that will not decode, or one the generator refuses, carries the
-/// `uninstall` recovery; an account that no longer resolves carries none.
+/// Every unreadable blob carries the `uninstall` recovery.
 fn classify(params: &BTreeMap<String, String>, id: &Id, on_disk: &str) -> Ownership {
     match generate::extract(params) {
         Ok(None) => Ownership::Foreign,
@@ -525,7 +524,7 @@ fn classify(params: &BTreeMap<String, String>, id: &Id, on_disk: &str) -> Owners
             },
             Err(e) => Ownership::OursUnreadable {
                 reason: format!("cannot resolve the account the embedded spec was installed for: {e}"),
-                recovery: None,
+                recovery: Some(decide::unreadable_recovery(id.as_str())),
             },
         },
         Err(e) => Ownership::OursUnreadable {

@@ -42,8 +42,7 @@ pub enum Ownership {
     /// behind a message that misleadingly says "this isn't mine".
     ///
     /// `recovery` is the action that unblocks the id, or `None` when
-    /// discovery names none — an account that no longer resolves, or a
-    /// drop-in that cannot be read.
+    /// discovery names none — a drop-in that cannot be read.
     OursUnreadable { reason: String, recovery: Option<String> },
     /// Something exists at this id and carries no Goetia marker at all.
     /// Refused unconditionally — see `decide`.

@@ -454,7 +454,7 @@ fn discover(id: &str) -> Result<Discovery> {
             },
             Err(e) => Ownership::OursUnreadable {
                 reason: e.to_string(),
-                recovery: None,
+                recovery: Some(decide::unreadable_recovery(id)),
             },
         },
         Err(e) => Ownership::OursUnreadable {

@@ -527,53 +527,23 @@ fn install_offers_force_only_for_a_conflict_force_can_resolve() {
 #[skuld::test]
 fn an_unreadable_refusal_without_a_recovery_ends_at_the_reason() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(
-        dir.path(),
-        "daemons:
-  frpc:
-    command: [daemon]
-",
-    );
+    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
     let mgr = FlakyManager {
-        recoveryless_unreadable: Some("the account no longer resolves".to_string()),
+        recoveryless_unreadable: Some("a drop-in could not be read".to_string()),
         ..Default::default()
     };
 
     let args = ["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()];
     let (code, out, err) = dispatch_with(&args, &mgr, &|| true);
-    assert_eq!(
-        code, 1,
-        "stdout:
-{out}"
-    );
-    assert_eq!(
-        out,
-        "frpc: refused: the account no longer resolves
-"
-    );
-    assert_eq!(
-        err,
-        "error: frpc: refused: the account no longer resolves
-"
-    );
+    assert_eq!(code, 1, "stdout:\n{out}");
+    assert_eq!(out, "frpc: refused: a drop-in could not be read\n");
+    assert_eq!(err, "error: frpc: refused: a drop-in could not be read\n");
 
     let args = ["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()];
     let (code, out, err) = dispatch_with(&args, &mgr, &never_elevated);
-    assert_eq!(
-        code, 4,
-        "stdout:
-{out}"
-    );
-    assert_eq!(
-        out,
-        "frpc: would be refused: the account no longer resolves
-"
-    );
-    assert_eq!(
-        err,
-        "error: frpc: would be refused: the account no longer resolves
-"
-    );
+    assert_eq!(code, 4, "stdout:\n{out}");
+    assert_eq!(out, "frpc: would be refused: a drop-in could not be read\n");
+    assert_eq!(err, "error: frpc: would be refused: a drop-in could not be read\n");
 }
 
 /// `diff` renders the same two flavours in the subjunctive, and must not offer what `install` will
