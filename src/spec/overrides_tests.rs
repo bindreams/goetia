@@ -657,7 +657,7 @@ daemons:
     backend-specific:
       scm:
         user: svc-frpc
-        restart: always
+        name: scm-name
 ";
     let manifest = parse(yaml).expect("valid manifest should parse");
     let spec = &manifest.daemons["frpc"];
@@ -666,7 +666,7 @@ daemons:
         supplied,
         Supplied {
             user: true,
-            restart: true,
+            name: true,
             ..Supplied::NONE
         }
     );

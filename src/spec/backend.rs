@@ -290,8 +290,8 @@ pub(crate) fn scm_restart_delay(delay: Duration) -> Duration {
 }
 
 /// The advisories for `generate::registration`'s restart-delay clamp and rounding, fired at
-/// resolve time on every host rather than only when an effectful Windows
-/// install runs the generator. Gated identically to the clamp itself:
+/// resolve time when scm is the native backend, rather than only when an effectful install
+/// runs the generator. Gated identically to the clamp itself:
 /// `Restart::Never` builds no `FailureActions`, so a `restart-delay` without
 /// `restart: on-failure` warns about nothing. `always` warns about nothing
 /// either: the generator refuses it.

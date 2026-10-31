@@ -17,7 +17,7 @@
 //!   `Slot` routes one exactly like the daemon it overrides.
 //! - `${VAR}` is substituted only in the override for the backend actually
 //!   being installed to; the other two are checked as authored, never
-//!   substituted. Every backend's merged spec is validated on every host,
+//!   substituted. A backend's own override is validated on every host,
 //!   but only the native one is completed and installed.
 //!
 //! Every field here is copied from `RawSpec` (`raw.rs`), not from
@@ -65,21 +65,17 @@ pub struct RawOverride {
     pub kind: Option<String>,
 }
 
-/// Which of the nine fields a backend's override actually supplied.
-/// Provenance the merged spec cannot carry: after the merge a `restart`
+/// Which fields a backend's override actually supplied.
+/// Provenance the merged spec cannot carry: after the merge a `user`
 /// value is just a value, and `BackendKind::error` must not reject a base
-/// value for a backend the author never wrote a line for.
+/// value for a backend the author never wrote a line for. Only `user` is
+/// read today; a field is added back when a check needs it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Supplied {
     pub name: bool,
     pub command: bool,
-    pub cwd: bool,
     pub env: bool,
     pub user: bool,
-    pub restart: bool,
-    pub restart_delay: bool,
-    pub logs: bool,
-    pub kind: bool,
 }
 
 impl Supplied {
@@ -87,32 +83,22 @@ impl Supplied {
     pub const NONE: Supplied = Supplied {
         name: false,
         command: false,
-        cwd: false,
         env: false,
         user: false,
-        restart: false,
-        restart_delay: false,
-        logs: false,
-        kind: false,
     };
 }
 
 impl RawOverride {
-    /// Which of the nine fields this override sets. One `is_some()` per
-    /// field, and `env` counts as supplied when the key is present even
+    /// Which of the recorded fields (see [`Supplied`]) this override sets. One
+    /// `is_some()` per field, and `env` counts as supplied when the key is present even
     /// if the map it holds is empty — an empty `env:` under a backend is
     /// still something the author wrote.
     pub fn supplied(&self) -> Supplied {
         Supplied {
             name: self.name.is_some(),
             command: self.command.is_some(),
-            cwd: self.cwd.is_some(),
             env: self.env.is_some(),
             user: self.user.is_some(),
-            restart: self.restart.is_some(),
-            restart_delay: self.restart_delay.is_some(),
-            logs: self.logs.is_some(),
-            kind: self.kind.is_some(),
         }
     }
 }

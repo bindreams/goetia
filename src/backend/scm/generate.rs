@@ -127,7 +127,7 @@ pub struct FailureActions {
 /// Build the [`ScmRegistration`] for `spec`. A `restart-delay` is rounded up to whole
 /// milliseconds and clamped to what `SC_ACTION.Delay` can express, rather than left to
 /// panic at install time — see `scm_restart_delay`; the advisories for those
-/// fire at resolve time, from `BackendKind::Scm.warn`, on every host.
+/// fire at resolve time, from `BackendKind::Scm.warn`, when scm is the native backend.
 ///
 /// `id` is the account already resolved by the effectful install path (see
 /// [`Identity`]) — this function does no lookup of its own. `shim_path` is
