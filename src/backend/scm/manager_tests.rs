@@ -415,21 +415,21 @@ fn read_marker_sorts_parameters_into_foreign_and_marked() {
     let torn = BTreeMap::from([("Marker".to_string(), crate::blob::MARKER.to_string())]);
 
     assert!(matches!(
-        read_marker(BTreeMap::new()),
+        read_marker(BTreeMap::new(), None),
         ReadOutcome::Foreign { recovery: None }
     ));
-    match read_marker(ours.clone()) {
+    match read_marker(ours.clone(), None) {
         ReadOutcome::Marked {
             blob: Ok(blob),
             snapshot,
         } => {
             assert_eq!(blob.spec, spec);
-            assert_eq!(snapshot, ours);
+            assert_eq!(snapshot.parameters, ours);
         }
         _ => panic!("a complete marker is goetia's, decoded"),
     }
-    match read_marker(torn.clone()) {
-        ReadOutcome::Marked { blob: Err(_), snapshot } => assert_eq!(snapshot, torn),
+    match read_marker(torn.clone(), None) {
+        ReadOutcome::Marked { blob: Err(_), snapshot } => assert_eq!(snapshot.parameters, torn),
         _ => panic!("the marker alone is proof of ownership, decodable or not"),
     }
 }

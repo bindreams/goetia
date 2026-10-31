@@ -131,11 +131,41 @@ impl ScmManager {
     }
 }
 
+/// What `read` saw of a service.
+pub(crate) struct ScmSnapshot {
+    /// Its `Parameters` values, which hold the only proof of ownership `type: managed` has.
+    parameters: BTreeMap<String, String>,
+    /// The object `read` opened to classify it, so `installed` and `live_status` ask that object:
+    /// a service deleted since then does not turn into an unreadable one. `None` for what `scan`
+    /// saw, which opens no service.
+    service: Option<Service>,
+}
+
+impl ScmSnapshot {
+    /// Runs `ask` on the service `read` opened, or on one opened by name with `access` where the
+    /// snapshot holds none.
+    fn ask<T>(
+        &self,
+        id: &Id,
+        access: ServiceAccess,
+        context: &str,
+        ask: impl FnOnce(&Service) -> Result<T>,
+    ) -> Result<T> {
+        match &self.service {
+            Some(service) => ask(service),
+            None => {
+                let service = open_scm(ServiceManagerAccess::CONNECT)?
+                    .open_service(id.as_str(), access)
+                    .map_err(|e| to_error(context, e))?;
+                ask(&service)
+            }
+        }
+    }
+}
+
 impl Backend for ScmManager {
     type Definition = ScmRegistration;
-    /// The service's `Parameters` values, which hold the only proof of ownership `type: managed`
-    /// has.
-    type Snapshot = BTreeMap<String, String>;
+    type Snapshot = ScmSnapshot;
     type InstallScope = ();
 
     /// SCM has nothing to hold across an install: its preconditions are `apply`'s, before any write.
@@ -150,22 +180,22 @@ impl Backend for ScmManager {
 
     /// Upstream of the marker, so a service that will not open leaves `id` undetermined: neither
     /// absent nor goetia's.
-    fn read(&self, id: &Id) -> Result<ReadOutcome<BTreeMap<String, String>>> {
+    fn read(&self, id: &Id) -> Result<ReadOutcome<ScmSnapshot>> {
         let scm = open_scm_to_classify(id.as_str())?;
-        match scm.open_service(id.as_str(), ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG) {
-            Ok(_) => {}
+        let service = match scm.open_service(id.as_str(), ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG) {
+            Ok(service) => service,
             Err(e) if is_not_found(&e) => return Ok(ReadOutcome::Absent),
             Err(e) => return Err(service_undetermined(id.as_str(), &format!("open service `{id}`"), &e)),
-        }
-        Ok(read_marker(registry::read_parameters(id.as_str())?))
+        };
+        Ok(read_marker(registry::read_parameters(id.as_str())?, Some(service)))
     }
 
     /// SCM has no drop-in mechanism: everything goetia writes lives under the service's own key.
-    fn installed(&self, id: &Id, snapshot: &BTreeMap<String, String>) -> Result<InstalledDefinition<ScmRegistration>> {
-        let service = open_scm(ServiceManagerAccess::CONNECT)?
-            .open_service(id.as_str(), ServiceAccess::QUERY_CONFIG)
-            .map_err(|e| to_error(&format!("open `{id}` to read its configuration"), e))?;
-        let (definition, _) = read_live_registration(&service, id.as_str(), snapshot)?;
+    fn installed(&self, id: &Id, snapshot: &ScmSnapshot) -> Result<InstalledDefinition<ScmRegistration>> {
+        let context = format!("open `{id}` to read its configuration");
+        let (definition, _) = snapshot.ask(id, ServiceAccess::QUERY_CONFIG, &context, |service| {
+            read_live_registration(service, id.as_str(), &snapshot.parameters)
+        })?;
         Ok(InstalledDefinition {
             definition,
             external: ExternalConfig::Absent,
@@ -177,15 +207,21 @@ impl Backend for ScmManager {
         spec: &DaemonSpec,
         definition: &ScmRegistration,
         _outcome: &Outcome,
-        snapshot: Option<&BTreeMap<String, String>>,
+        snapshot: Option<&ScmSnapshot>,
         _scope: &mut (),
     ) -> Result<WriteOutcome> {
         apply(spec, definition, snapshot.is_none())?;
         Ok(WriteOutcome::Done)
     }
 
-    fn live_status(&self, id: &Id, _snapshot: &BTreeMap<String, String>) -> Result<Status> {
-        let (state, pid, enabled) = query_live(id.as_str())?;
+    fn live_status(&self, id: &Id, snapshot: &ScmSnapshot) -> Result<Status> {
+        let context = format!("open `{id}` to query its live status");
+        let (state, pid, enabled) = snapshot.ask(
+            id,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG,
+            &context,
+            |service| query_live(service, id.as_str()),
+        )?;
         Ok(Status { state, pid, enabled })
     }
 
@@ -193,7 +229,7 @@ impl Backend for ScmManager {
     /// `SC_MANAGER_ENUMERATE_SERVICE`/`EnumServicesStatusExW` need no more privilege than reading
     /// this key does, and one pass here avoids an `OpenService` round trip per candidate on a host
     /// with hundreds of unrelated services.
-    fn scan(&self) -> Scan<BTreeMap<String, String>> {
+    fn scan(&self) -> Scan<ScmSnapshot> {
         let mut entries = Vec::new();
         let mut unreadable: Vec<Unreadable> = Vec::new();
         let incomplete = registry::scan_services(|name| {
@@ -204,7 +240,7 @@ impl Backend for ScmManager {
             // `unreadable_aggregate`, which names the id, the failure and its remedy when it turns
             // out to be the only one.
             match registry::read_parameters(&name) {
-                Ok(params) => entries.push((name, read_marker(params))),
+                Ok(params) => entries.push((name, read_marker(params, None))),
                 Err(e) => unreadable.push(unreadable_parts(name, e)),
             }
         });
@@ -220,7 +256,7 @@ impl Backend for ScmManager {
     fn uninstall(&self, id: &Id) -> Result<()> {
         let (scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
         flow::owned(self, id)?;
-        // `uninstall_locked` opens its own handles, and its delete needs this one closed (trap 3).
+        // `uninstall_locked` opens its own handles, and its delete needs this one closed: an open handle leaves the service only marked for deletion.
         drop(service);
         uninstall_locked(&scm, id)
     }
@@ -311,14 +347,17 @@ impl Backend for ScmManager {
 }
 
 /// What the `Parameters` of a service goetia could open say about its ownership. No marker is
-/// foreign, with the stock remedy: nothing but deleting the orphan recovers it (trap 1).
-fn read_marker(params: BTreeMap<String, String>) -> ReadOutcome<BTreeMap<String, String>> {
-    let blob = match generate::extract(&params) {
+/// foreign, with the stock remedy: nothing but deleting the orphan recovers it: `type: managed` has no second proof of ownership.
+fn read_marker(parameters: BTreeMap<String, String>, service: Option<Service>) -> ReadOutcome<ScmSnapshot> {
+    let blob = match generate::extract(&parameters) {
         Ok(None) => return ReadOutcome::Foreign { recovery: None },
         Ok(Some(blob)) => Ok(blob),
         Err(e) => Err(e),
     };
-    ReadOutcome::Marked { blob, snapshot: params }
+    ReadOutcome::Marked {
+        blob,
+        snapshot: ScmSnapshot { parameters, service },
+    }
 }
 
 // shim support ========================================================================================================
@@ -524,7 +563,7 @@ fn split_command_line(cmdline: &str) -> (PathBuf, Vec<String>) {
 /// that fails fails the install before any service write, leaving no new
 /// service and an existing one unchanged, so the next `install` retries as a
 /// create or an update, as systemd and launchd do. `Parameters` follows
-/// create/update immediately, minimizing trap 1's crash window; a failure in
+/// create/update immediately, minimizing the window in which a crash leaves a service with no marker; a failure in
 /// the two writes after it leaves a registration the next `install` reads as
 /// hand-edited (`Conflict`, cleared by `--force`). An update restates the
 /// start type the service has, rather than resetting it; see `service_info`.
@@ -556,10 +595,9 @@ fn apply(spec: &DaemonSpec, reg: &ScmRegistration, create: bool) -> Result<()> {
         );
         let pw = identity::service_password()?;
         if pw.is_none() {
-            // Trap 4's own failure shape, one step earlier: install
-            // would otherwise report success and the service would
-            // fail every future start with error 1069. Refuse instead
-            // of creating a service that cannot start.
+            // Install would otherwise report success and the service would
+            // fail every future start with error 1069 (no `SeServiceLogonRight`).
+            // Refuse instead of creating a service that cannot start.
             return Err(Error::Other(format!(
                 "service account `{account}` needs a password (it is not LocalSystem/LocalService/\
                  NetworkService, nor an `NT SERVICE\\`/`NT AUTHORITY\\` account); set \
@@ -617,7 +655,7 @@ fn apply(spec: &DaemonSpec, reg: &ScmRegistration, create: bool) -> Result<()> {
 /// **`current_start_type` matters for `start_type`.** `windows-service`'s
 /// `change_config` always sends `dwStartType` as a real value, never
 /// `SERVICE_NO_CHANGE` — so a create always uses `SERVICE_DEMAND_START`
-/// (trap 5: never `SERVICE_DISABLED`/`SERVICE_AUTO_START`), but an update
+/// (never `SERVICE_DISABLED`, which would block an explicit `start`, nor `SERVICE_AUTO_START`), but an update
 /// must restate whatever is *already there* (`current_start_type`), or a
 /// routine spec-driven `install` would silently reset a `SERVICE_AUTO_START`
 /// `enable` had set. `enable`/`disable` themselves go through
@@ -659,9 +697,7 @@ fn service_info(
 /// **Why not the WinAPI call.** `ChangeServiceConfig2W(SERVICE_CONFIG_FAILURE_ACTIONS)`
 /// returned `ERROR_ACCESS_DENIED` from this process on GitHub Actions'
 /// Windows runner even with `SeShutdownPrivilege` explicitly enabled via
-/// `AdjustTokenPrivileges` beforehand — confirmed empirically; an
-/// unresolved upstream report from a mature Windows service tool
-/// (winsw#893) hits the identical failure in the identical environment.
+/// `AdjustTokenPrivileges` beforehand — confirmed empirically.
 /// `sc.exe` — a *separate* process, with its own freshly-derived token —
 /// does not: `tests/marker_inertness/scm.rs`'s `scm_parameters_values_survive`
 /// probe already calls `sc.exe failure` successfully on this same CI.
@@ -712,7 +748,8 @@ fn run_sc(args: &[&str]) -> Result<()> {
 
 // uninstall ===========================================================================================================
 
-/// Disable the service, stop whatever runs, then delete it. See trap 3.
+/// Disable the service, stop whatever runs, then delete it: `DeleteService` on a running service only marks it, and the next `install` meets
+/// `ERROR_SERVICE_MARKED_FOR_DELETE`.
 ///
 /// A disabled service is never started again: `StartService` fails with 1058, and a recovery restart
 /// fails with event 7032 / `%%1058` and no `START_PENDING`. Measured: a restart queued before the
@@ -1065,11 +1102,7 @@ fn map_state(s: WinState) -> State {
     }
 }
 
-fn query_live(name: &str) -> Result<(State, Option<u32>, bool)> {
-    let scm = open_scm(ServiceManagerAccess::CONNECT)?;
-    let service = scm
-        .open_service(name, ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG)
-        .map_err(|e| to_error(&format!("open `{name}` to query its live status"), e))?;
+fn query_live(service: &Service, name: &str) -> Result<(State, Option<u32>, bool)> {
     let status = service
         .query_status()
         .map_err(|e| to_error(&format!("query status for `{name}`"), e))?;
