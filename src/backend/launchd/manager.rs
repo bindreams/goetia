@@ -43,7 +43,7 @@
 //!   holds a bootstrapped job by label regardless of which directory its
 //!   plist currently lives in, so moving the file has no effect on a job
 //!   already loaded.
-//! - Discovery (`list`, and every verb's ownership check) scans both
+//! - Reading (`list`, and every verb's ownership check) scans both
 //!   directories directly — never `launchctl print`, whose textual format
 //!   Apple does not guarantee. `status`'s live run state is the one
 //!   exception: there is no filesystem signal for "is this job currently

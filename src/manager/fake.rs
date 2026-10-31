@@ -204,8 +204,8 @@ impl Fake {
     }
 
     /// Test-only seeding: place `text`, carrying no Goetia marker, at `id`
-    /// — simulating a pre-existing service Goetia did not create. Discovery
-    /// then classifies it as [`ReadOutcome::Foreign`]. See
+    /// — simulating a pre-existing service Goetia did not create. The shared
+    /// flow then classifies it as [`ReadOutcome::Foreign`]. See
     /// `manager::conformance`'s module doc comment.
     pub fn seed_foreign(&self, id: &str, text: impl Into<String>) {
         let mut state = self.state.lock().expect("Fake mutex poisoned");

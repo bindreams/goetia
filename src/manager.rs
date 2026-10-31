@@ -1,15 +1,14 @@
-//! The `ServiceManager` seam: one trait implemented by each real backend
-//! and by [`fake::Fake`], the in-memory test double every CLI
-//! and policy test in this crate runs against instead of a real
-//! systemd/launchd/SCM.
+//! The `ServiceManager` seam: the trait the CLI is written against, and
+//! [`fake::Fake`], the in-memory test double every CLI and policy test in this
+//! crate runs against instead of a real systemd/launchd/SCM.
 //!
 //! The trait exists so the CLI is written once and tested without touching a
-//! real machine — not for runtime backend swapping. `install`, `preview_install`,
-//! `status` and `list` are written once, in [`flow`]; a backend supplies only the
-//! primitives of [`crate::backend::Backend`] and gets them through a blanket impl,
-//! so it cannot restate any row of the policy table in [`crate::decide::decide`]
-//! itself. [`conformance::run`] asserts that contract against any
-//! `&dyn ServiceManager`.
+//! real machine — not for runtime backend swapping. No backend implements it
+//! by hand: each implements [`crate::backend::Backend`], and a blanket impl
+//! makes every `Backend` a `ServiceManager`. `install`, `preview_install`,
+//! `status` and `list` are therefore written once, in [`flow`], and
+//! [`crate::decide::decide`] is called only from there. [`conformance::run`]
+//! asserts the contract against any `&dyn ServiceManager`.
 
 pub mod budget;
 pub mod conformance;
@@ -36,7 +35,7 @@ use crate::spec::{DaemonSpec, Id};
 pub trait ServiceManager {
     /// Install (create or update) the service for `spec`. Never starts and
     /// never enables it at boot — see the crate-level design notes on
-    /// install-off-by-default. Routes through [`crate::decide::decide`]; see
+    /// install-off-by-default. [`crate::decide::decide`] chooses the outcome; see
     /// that function's doc comment for what each [`crate::decide::Outcome`]
     /// means and when `force` is honored.
     ///
@@ -55,12 +54,11 @@ pub trait ServiceManager {
     /// What [`Self::install`] would do for `spec`, without doing it —
     /// always as if `force` were `false`, since showing the forced outcome
     /// would hide the very conflict `--force` exists to let a user decide
-    /// about. Backs `goetia daemon diff`: routing through the exact same
-    /// [`crate::decide::decide`] call `install` uses (rather than `diff`
-    /// reimplementing a partial version of that policy against `list()`'s
-    /// output) is what keeps the two from being able to disagree — `diff`
-    /// saying "up to date" or "would be created" about something `install`
-    /// would actually refuse or conflict on.
+    /// about. Backs `goetia daemon diff`. It is the same flow as `install`,
+    /// minus the write, rather than `diff` reimplementing a partial version
+    /// of that policy against `list()`'s output: that is what keeps the two
+    /// from disagreeing — `diff` saying "up to date" or "would be created"
+    /// about something `install` would actually refuse or conflict on.
     fn preview_install(&self, spec: &DaemonSpec) -> Result<crate::decide::Outcome>;
 
     /// Stop the service if running, remove the artifact, and reload the
@@ -303,7 +301,7 @@ pub enum Installed {
         state: State,
         /// The same number [`ServiceManager::status`] would report for
         /// this id at this moment — not a cached or independently derived
-        /// value. See each backend's `list` for how it obtains this.
+        /// value. See [`crate::backend::Backend::live_status`].
         pid: Option<u32>,
         enabled: bool,
     },
