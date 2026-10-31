@@ -218,7 +218,7 @@ fn resolve_as(
         interpolate::check_spec_grammar(&base, &path)?;
         resolve_shape(&id, base, base_dir, Phase::Authored)?;
 
-        // Step 4: the all-backends sweep, and errors only. BackendKind
+        // Step 4: the all-backends sweep, and errors only. Backend
         // annotation covers the whole iteration, not just `resolve_shape`:
         // every `Error` raised anywhere in this pass — from shape or from
         // `BackendKind::error` — is annotated with `backend` before it
