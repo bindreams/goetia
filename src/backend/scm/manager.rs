@@ -672,8 +672,9 @@ fn split_command_line(cmdline: &str) -> (PathBuf, Vec<String>) {
 
 /// Write `reg`: the preconditions first (`SeServiceLogonRight` for a real
 /// account, the event source), then the service itself (create or update),
-/// then `Parameters`, `Environment` and the failure actions. A failed
-/// precondition leaves no new service, so the next `install` retries as a
+/// then `Parameters`, `Environment` and the failure actions. A precondition
+/// that fails fails the install before any service write, leaving no new
+/// service and an existing one unchanged, so the next `install` retries as a
 /// create or an update, as systemd and launchd do. `Parameters` follows
 /// create/update immediately, minimizing trap 1's crash window; a failure in
 /// the two writes after it leaves a registration the next `install` reads as
@@ -730,9 +731,9 @@ fn apply(
         None
     };
 
-    // Best-effort, and deliberately here rather than in the shim: it writes
-    // under HKLM, and the shim may run as an unprivileged account.
-    registry::register_event_source();
+    // Here rather than in the shim: it writes under HKLM, and the shim may run as an unprivileged
+    // account.
+    registry::register_event_source()?;
 
     if create {
         let scm = open_scm(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;

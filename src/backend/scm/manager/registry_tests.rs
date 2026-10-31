@@ -196,3 +196,26 @@ fn a_services_key_that_will_not_open_leaves_the_pass_unfinished() {
         "the detail must name what was being scanned: {detail}"
     );
 }
+
+#[skuld::test]
+fn the_event_message_file_is_eventcreate_under_system_root() {
+    assert_eq!(
+        event_message_file(Ok(r"C:\Windows".to_string())).expect("a set SystemRoot"),
+        r"C:\Windows\System32\EventCreate.exe"
+    );
+}
+
+/// A registration with no message file is the one Event Viewer cannot render, so a missing
+/// `SystemRoot` fails the install instead of leaving it.
+#[skuld::test]
+fn an_event_message_file_needs_a_system_root() {
+    for missing in [
+        std::env::VarError::NotPresent,
+        std::env::VarError::NotUnicode(std::ffi::OsString::new()),
+    ] {
+        let Err(Error::Other(message)) = event_message_file(Err(missing)) else {
+            panic!("a SystemRoot that cannot be read must be an error");
+        };
+        assert!(message.contains("SystemRoot"), "{message}");
+    }
+}

@@ -271,23 +271,30 @@ mod registry_tests;
 /// catalogue (which is what `~/src/windows-service-manager` does instead, at
 /// the cost of a build-time `mc.exe` step).
 ///
-/// Idempotent, and best-effort by contract: a failure here must not fail an
-/// install, since the daemon itself is fine either way.
-pub fn register_event_source() {
+/// Idempotent. `apply` runs it before it writes the service, and a failure there fails the install
+/// with nothing written, so the next install retries it.
+pub fn register_event_source() -> Result<()> {
     const KEY: &str = r"SYSTEM\CurrentControlSet\Services\EventLog\Application\Goetia";
     const TYPES_SUPPORTED: u32 = 7; // ERROR | WARNING | INFORMATION
 
-    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-    let Ok((key, _)) = hklm.create_subkey(KEY) else {
-        return;
-    };
-    // Expanded here rather than stored as `%SystemRoot%\...`: that form needs
-    // `REG_EXPAND_SZ`, and `winreg`'s `set_value` for `&str` writes `REG_SZ`,
-    // which nothing would expand — leaving a message file that never resolves.
-    let Ok(system_root) = std::env::var("SystemRoot") else {
-        return;
-    };
-    let message_file = format!(r"{system_root}\System32\EventCreate.exe");
-    let _ = key.set_value("EventMessageFile", &message_file);
-    let _ = key.set_value("TypesSupported", &TYPES_SUPPORTED);
+    let message_file = event_message_file(std::env::var("SystemRoot"))?;
+    let (key, _) = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .create_subkey(KEY)
+        .map_err(|e| registry_error("create", KEY, e))?;
+    key.set_value("EventMessageFile", &message_file)
+        .map_err(|e| registry_error("write EventMessageFile under", KEY, e))?;
+    key.set_value("TypesSupported", &TYPES_SUPPORTED)
+        .map_err(|e| registry_error("write TypesSupported under", KEY, e))
+}
+
+/// The message file path, expanded here rather than stored as `%SystemRoot%\...`: that form needs
+/// `REG_EXPAND_SZ`, and `winreg`'s `set_value` for `&str` writes `REG_SZ`, which nothing would
+/// expand — leaving a message file that never resolves.
+fn event_message_file(system_root: std::result::Result<String, std::env::VarError>) -> Result<String> {
+    let system_root = system_root.map_err(|e| {
+        Error::Other(format!(
+            "register the Goetia event source: SystemRoot is not readable: {e}"
+        ))
+    })?;
+    Ok(format!(r"{system_root}\System32\EventCreate.exe"))
 }
