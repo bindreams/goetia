@@ -89,7 +89,7 @@ fn shaped_spec() -> ShapedSpec {
     }
 }
 
-// `BackendKind::warn` =====================================================================================================
+// `BackendKind::warn` =================================================================================================
 
 #[skuld::test]
 fn each_backend_emits_only_its_own_warnings() {
@@ -296,7 +296,7 @@ fn a_spelling_that_is_not_in_the_table_is_an_ordinary_account() {
     }
 }
 
-// `BackendKind::error` ====================================================================================================
+// `BackendKind::error` ================================================================================================
 
 #[skuld::test]
 fn a_templated_user_name_is_not_checked_against_the_builtin_table() {
