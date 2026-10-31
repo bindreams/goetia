@@ -851,6 +851,7 @@ fn refused_for_want_of_a_reaper<T: std::fmt::Debug>(result: &Result<T>) -> bool 
 fn a_verb_one_reaper_short_sends_nothing() {
     use crate::backend::Backend;
 
+    let _refused = Scripted::new(&[]);
     let mgr = LaunchdManager::new();
     let id = never_installed();
     let spec = DaemonSpec {
@@ -928,6 +929,7 @@ fn refused_for_want_of_a_file<T: std::fmt::Debug>(result: &Result<T>) -> bool {
 fn a_verb_one_temp_file_short_sends_nothing() {
     use crate::backend::Backend;
 
+    let _refused = Scripted::new(&[]);
     let mgr = LaunchdManager::new();
     let id = never_installed();
     let spec = DaemonSpec {
@@ -969,7 +971,6 @@ fn a_verb_one_temp_file_short_sends_nothing() {
     assert!(refused_for_want_of_a_file(&Backend::kill(&mgr, marked_plist(&id))));
     let _short = short(INSTALL_CALLS);
     assert!(refused_for_want_of_a_file(&mgr.install(&spec, false)));
-    let _refused = Scripted::new(&[]);
     let _enough = bounded::test_hook::temp_files(START_CALLS * FILES_PER_CALL);
     assert!(!refused_for_want_of_a_file(&Backend::start(
         &mgr,
