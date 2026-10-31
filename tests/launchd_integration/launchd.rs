@@ -604,7 +604,7 @@ fn list_ignores_foreign_plists() {
 
 /// A plist goetia wrote for a user who has since been deleted carries goetia's marker, so it is
 /// goetia's, but its spec can no longer be rendered: it is `OursUnreadable` in `list` and an error in
-/// `status`, never a plausible-looking daemon.
+/// `status`.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_reports_a_deleted_user_as_ours_unreadable() {
     let mgr = LaunchdManager::new();
@@ -615,7 +615,10 @@ fn list_reports_a_deleted_user_as_ours_unreadable() {
     let path = staging_path(&id);
     write_plist(&path, &generate::plist(&spec, &Identity { user: user.to_string() }));
     let _cleanup = FileGuard(path);
-    let cannot_render = format!("account lookup failed: no such user `{user}` on this host");
+    let cannot_render = mgr
+        .preview_install(&spec)
+        .expect_err("a spec naming a deleted user cannot be rendered")
+        .to_string();
 
     let listed = mgr
         .list()

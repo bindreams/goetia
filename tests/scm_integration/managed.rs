@@ -382,8 +382,8 @@ fn uninstall_then_immediate_reinstall_succeeds() {
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     started.accept("the fixture to report SERVICE_RUNNING");
 
-    // Uninstalling a *running* service is the real test of trap 3: `delete`
-    // must not run until a confirmed stop, or the registry key survives
+    // Uninstalling a *running* service is the real test of
+    // delete-after-stop: `delete` must not run until a confirmed stop, or the registry key survives
     // and the immediate reinstall below meets `ERROR_SERVICE_MARKED_FOR_DELETE`.
     mgr.uninstall(&spec.id).expect("uninstall a running service");
     stopped.accept("the fixture to handle SERVICE_CONTROL_STOP as part of uninstall");
