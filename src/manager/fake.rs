@@ -89,47 +89,29 @@ struct Store {
     /// [`Fake::seed_aggregate_undetermined`]. Not a set of ids: an
     /// aggregate is precisely the case where the ids are not known.
     aggregates: Vec<String>,
-    /// Ids whose manager never confirms a start — see
-    /// [`Fake::seed_start_stalls`].
     start_stalls: BTreeSet<String>,
-    /// [`Fake::seed_stop_stalls`]'s mirror of `start_stalls`.
     stop_stalls: BTreeSet<String>,
-    /// Ids whose start request ends in doubt — see [`Fake::seed_start_in_doubt`].
     start_in_doubt: BTreeSet<String>,
-    /// [`Fake::seed_stop_in_doubt`]'s mirror of `start_in_doubt`.
     stop_in_doubt: BTreeSet<String>,
-    /// Whether this Fake has a request-only restart — see
-    /// [`Fake::seed_native_restart`].
     native_restart: bool,
-    /// Whether [`ServiceManager::prepare`] fails — see
-    /// [`Fake::seed_prepare_fails`].
     prepare_fails: bool,
-    /// Whether no manager can be asked — see [`Fake::seed_no_manager`].
     no_manager: bool,
-    /// Accounts `render` cannot resolve — see [`Fake::seed_unresolvable_account`].
     unresolvable: BTreeSet<String>,
-    /// Ids whose installed definition cannot be read back, with why — see
-    /// [`Fake::seed_installed_fails`].
     installed_fails: BTreeMap<String, String>,
-    /// Ids whose live state cannot be queried, with why — see [`Fake::seed_live_status_fails`].
     live_status_fails: BTreeMap<String, String>,
-    /// Writes left to lose a race, by id — see [`Fake::seed_write_races`].
     write_races: BTreeMap<String, usize>,
-    /// Every `write` attempted, raced or not — see [`Fake::writes`].
+    /// Text another process puts at an id just before this Fake's next write there, by id.
+    interlopers: BTreeMap<String, String>,
+    /// What the manager applies to an id from outside its artifact, by id; absent means none.
+    externals: BTreeMap<String, ExternalConfig>,
     writes: usize,
-    /// Every `start`/`stop`/`restart`/`kill` this Fake was asked to perform, in
-    /// order — see [`Fake::calls`].
     calls: Vec<(&'static str, String)>,
-    /// The steps and budget each [`ServiceManager::prepare`] was given, in
-    /// order — see [`Fake::prepared`].
     prepared: Vec<(Vec<Step>, Budget)>,
     /// The steps of every guard `prepare` returned that has not been
     /// dropped, by guard number.
     live: Vec<(u64, Vec<Step>)>,
     /// The number the next guard `prepare` returns is known by.
     next_guard: u64,
-    /// Every request, with the steps of the guards live when it was asked —
-    /// see [`Fake::guarded`].
     guarded: Vec<(&'static str, String, Vec<Step>)>,
 }
 
@@ -205,7 +187,7 @@ impl Fake {
 
     /// Test-only seeding: place `text`, carrying no Goetia marker, at `id`
     /// — simulating a pre-existing service Goetia did not create. The shared
-    /// flow then classifies it as [`ReadOutcome::Foreign`]. See
+    /// flow then classifies it as `ReadOutcome::Foreign`. See
     /// `manager::conformance`'s module doc comment.
     pub fn seed_foreign(&self, id: &str, text: impl Into<String>) {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
@@ -463,6 +445,21 @@ impl Fake {
         state.write_races.insert(id.to_string(), times);
     }
 
+    /// Test-only seeding: just before the next write at `id`, another process places `text` there,
+    /// as [`Fake::seed_foreign`] does. That write then finds the id changed since it was read, so
+    /// it writes nothing and loses the race for real.
+    pub fn seed_write_interloper(&self, id: &str, text: impl Into<String>) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.interlopers.insert(id.to_string(), text.into());
+    }
+
+    /// Test-only seeding: the manager applies `external` to `id` from outside its artifact, as
+    /// systemd's drop-ins are. Reported by reading back what is installed.
+    pub fn seed_external(&self, id: &str, external: ExternalConfig) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.externals.insert(id.to_string(), external);
+    }
+
     /// Test-only seeding: make [`ServiceManager::prepare`] fail, as launchd's
     /// does when no thread can be made to reap a request.
     pub fn seed_prepare_fails(&self) {
@@ -522,7 +519,7 @@ impl Fake {
 
 // generate/extract ====================================================================================================
 
-fn generate(spec: &DaemonSpec) -> String {
+pub(in crate::manager) fn generate(spec: &DaemonSpec) -> String {
     format!("{FAKE_MARKER}\nSpec: {}\n", blob::encode(spec))
 }
 
@@ -605,7 +602,7 @@ impl Drop for Held {
 // Backend =============================================================================================================
 
 impl Store {
-    /// The entry at `id`. Absent only if it vanished since the ownership gate passed.
+    /// The entry at `id`, which `gated` has just found marked under the same lock.
     fn entry_mut(&mut self, id: &Id) -> Result<&mut Entry> {
         self.entries.get_mut(id.as_str()).ok_or_else(|| Error::NotInstalled {
             id: id.as_str().to_string(),
@@ -614,12 +611,13 @@ impl Store {
 }
 
 impl Fake {
-    /// The store, locked, for a verb that has passed the ownership gate ([`flow::owned`]) and has a
-    /// manager to ask. Ownership errors beat [`Error::NoManager`]. Not reentrant: a verb records
-    /// what it must, releases its guard, and only then calls this.
+    /// The store, locked, for a verb whose id is marked ours and that has a manager to ask. The
+    /// gate runs under the guard it returns, so no clone can change the id between the two.
+    /// Ownership errors beat [`Error::NoManager`]. Not reentrant: a verb records what it must,
+    /// releases its guard, and only then calls this.
     fn gated(&self, id: &Id) -> Result<MutexGuard<'_, Store>> {
-        flow::owned(self, id)?;
         let state = self.state.lock().expect("Fake mutex poisoned");
+        flow::require_marked(id, state.read(id)?).map(drop)?;
         state.manager()?;
         Ok(state)
     }
@@ -656,8 +654,6 @@ impl crate::backend::Backend for Fake {
         state.read(id)
     }
 
-    /// The fake has no concept of external configuration (systemd's drop-in directory, or an
-    /// analogous future backend's equivalent), so it is always absent.
     fn installed(&self, id: &Id, snapshot: &Entry) -> Result<InstalledDefinition<String>> {
         let state = self.state.lock().expect("Fake mutex poisoned");
         if let Some(detail) = state.installed_fails.get(id.as_str()) {
@@ -665,11 +661,16 @@ impl crate::backend::Backend for Fake {
         }
         Ok(InstalledDefinition {
             definition: snapshot.text.clone(),
-            external: ExternalConfig::Absent,
+            external: state
+                .externals
+                .get(id.as_str())
+                .cloned()
+                .unwrap_or(ExternalConfig::Absent),
         })
     }
 
-    /// Keeps the entry's enablement and run state across an update.
+    /// Keeps the entry's enablement and run state across an update. Writes nothing and returns
+    /// `Raced` unless the entry is still the text `snapshot` saw (`None`: still absent).
     fn write(
         &self,
         spec: &DaemonSpec,
@@ -679,6 +680,16 @@ impl crate::backend::Backend for Fake {
         _scope: &mut (),
     ) -> Result<WriteOutcome> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
+        if let Some(text) = state.interlopers.remove(spec.id.as_str()) {
+            state.entries.insert(
+                spec.id.as_str().to_string(),
+                Entry {
+                    text,
+                    enabled: false,
+                    state: State::Stopped,
+                },
+            );
+        }
         state.writes += 1;
         if let Some(left) = state.write_races.get_mut(spec.id.as_str()) {
             if *left > 0 {
@@ -686,9 +697,11 @@ impl crate::backend::Backend for Fake {
                 return Ok(WriteOutcome::Raced);
             }
         }
-        let (enabled, run_state) = snapshot
-            .map(|e| (e.enabled, e.state))
-            .unwrap_or((false, State::Stopped));
+        let current = state.entries.get(spec.id.as_str());
+        if current.map(|e| &e.text) != snapshot.map(|e| &e.text) {
+            return Ok(WriteOutcome::Raced);
+        }
+        let (enabled, run_state) = current.map(|e| (e.enabled, e.state)).unwrap_or((false, State::Stopped));
         state.entries.insert(
             spec.id.as_str().to_string(),
             Entry {

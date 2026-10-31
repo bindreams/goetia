@@ -1,8 +1,8 @@
 use super::*;
-use crate::decide::{self, Outcome};
+use crate::decide::{self, ExternalConfig, Outcome};
 use crate::error::Error;
-use crate::manager::fake::Fake;
 use crate::manager::fake::fake_tests::mk;
+use crate::manager::fake::{Fake, generate};
 use crate::manager::{Installed, ServiceManager};
 use crate::spec::{DaemonSpec, Id, User};
 
@@ -90,15 +90,107 @@ fn install_refuses_a_failed_comparison_with_its_error_alone() {
     }
 }
 
+/// The write must notice the id changed since it was read. A flow that retried the write with the
+/// stale read would overwrite what appeared.
 #[skuld::test]
-fn install_refuses_foreign_without_comparing() {
+fn a_write_that_loses_to_a_foreign_entry_refuses_and_overwrites_nothing() {
     let fake = Fake::new();
-    fake.seed_foreign("frpc", "some pre-existing, unrelated service\n");
-    fake.seed_installed_fails("frpc", "must not be asked");
+    fake.seed_write_interloper(
+        "frpc",
+        "some pre-existing, unrelated service
+",
+    );
 
     let outcome = fake.install(&mk("frpc"), false).unwrap();
 
     assert!(matches!(outcome, Outcome::RefuseForeign { .. }), "{outcome:?}");
+    assert_eq!(fake.writes(), 1, "the raced write is not retried over a foreign entry");
+    let after = fake.preview_install(&mk("frpc")).unwrap();
+    assert!(matches!(after, Outcome::RefuseForeign { .. }), "{after:?}");
+}
+
+/// What the interloper wrote is read afresh and decided on, whichever of `decide`'s rows it hits.
+#[skuld::test]
+fn a_write_that_loses_to_an_ours_entry_follows_that_entry() {
+    let theirs = mk("frpc");
+    let mine = mk_as("frpc", "svc");
+    let hand_edited = format!(
+        "{}# hand-added directive
+",
+        generate(&theirs)
+    );
+
+    // Same spec: nothing is left to write.
+    let fake = Fake::new();
+    fake.seed_write_interloper("frpc", generate(&theirs));
+    assert_eq!(fake.install(&theirs, false).unwrap(), Outcome::UpToDate);
+    assert_eq!(fake.writes(), 1);
+
+    // A clean entry of another spec: updated, and the update lands.
+    let fake = Fake::new();
+    fake.seed_write_interloper("frpc", generate(&theirs));
+    let outcome = fake.install(&mine, false).unwrap();
+    assert!(matches!(outcome, Outcome::Update { .. }), "{outcome:?}");
+    assert_eq!(fake.writes(), 2, "the raced write, then the one over the new state");
+    assert_eq!(fake.preview_install(&mine).unwrap(), Outcome::UpToDate);
+
+    // A hand-edited entry: refused as a conflict, and the edit survives.
+    let fake = Fake::new();
+    fake.seed_write_interloper("frpc", hand_edited);
+    let outcome = fake.install(&mine, false).unwrap();
+    assert!(matches!(outcome, Outcome::Conflict { .. }), "{outcome:?}");
+    assert_eq!(fake.writes(), 1);
+    let after = fake.preview_install(&mine).unwrap();
+    assert!(matches!(after, Outcome::Conflict { .. }), "{after:?}");
+}
+
+/// The recovery for configuration a write will not remove reaches the user from `install` and
+/// `preview_install`; only `--force` over what a write does remove goes through.
+#[skuld::test]
+fn external_configuration_is_carried_into_the_outcome() {
+    let recovery = "remove /etc/drop-in by hand".to_string();
+
+    let hand_edited = Fake::new();
+    hand_edited.install_then_hand_edit(
+        &mk("frpc"),
+        "# hand-added directive
+",
+    );
+    hand_edited.seed_external(
+        "frpc",
+        ExternalConfig::Unclearable {
+            recovery: recovery.clone(),
+        },
+    );
+    for outcome in [
+        hand_edited.install(&mk_as("frpc", "svc"), false).unwrap(),
+        hand_edited.preview_install(&mk_as("frpc", "svc")).unwrap(),
+    ] {
+        match outcome {
+            Outcome::Conflict {
+                unclearable_recovery, ..
+            } => assert_eq!(unclearable_recovery, Some(recovery.clone())),
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    // A stale entry that carries external configuration is a conflict unless forced.
+    let stale = Fake::new();
+    stale.seed_stale(&mk("frpc"), "0.0.1");
+    stale.seed_external("frpc", ExternalConfig::Clearable);
+    for outcome in [
+        stale.install(&mk("frpc"), false).unwrap(),
+        stale.preview_install(&mk("frpc")).unwrap(),
+    ] {
+        match outcome {
+            Outcome::Conflict {
+                unclearable_recovery, ..
+            } => assert_eq!(unclearable_recovery, None),
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+    let forced = stale.install(&mk("frpc"), true).unwrap();
+    assert!(matches!(forced, Outcome::Stale { .. }), "{forced:?}");
 }
 
 // status and list =====================================================================================================
@@ -171,6 +263,32 @@ fn list_reports_a_failed_live_status_as_ours_unreadable() {
         Err(Error::Other(message)) => assert_eq!(message, "state unavailable"),
         other => panic!("status of the same id must return the error, got {other:?}"),
     }
+}
+
+#[skuld::test]
+fn list_reports_a_name_that_is_not_an_id_without_querying_it() {
+    let fake = Fake::new();
+    let name = "not a valid id";
+    fake.seed_foreign(name, generate(&mk("frpc")));
+    fake.install(&mk("other"), false).unwrap();
+    let invalid = Id::try_from(name).unwrap_err();
+
+    let listed = fake.list().unwrap();
+
+    assert_eq!(listed.len(), 2, "{listed:?}");
+    assert!(
+        listed.contains(&Installed::OursUnreadable {
+            name: name.to_string(),
+            reason: format!("marked ours, but its name is not a valid daemon id: {invalid}"),
+        }),
+        "{listed:?}"
+    );
+    assert!(
+        listed
+            .iter()
+            .any(|e| matches!(e, Installed::Ours { spec, .. } if spec.id.as_str() == "other")),
+        "{listed:?}"
+    );
 }
 
 #[skuld::test]

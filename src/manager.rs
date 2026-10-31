@@ -301,7 +301,7 @@ pub enum Installed {
         state: State,
         /// The same number [`ServiceManager::status`] would report for
         /// this id at this moment — not a cached or independently derived
-        /// value. See [`crate::backend::Backend::live_status`].
+        /// value. See `Backend::live_status`.
         pid: Option<u32>,
         enabled: bool,
     },
