@@ -49,6 +49,12 @@ fn install_retries_a_raced_write_until_it_lands() {
     assert_eq!(fake.writes(), 3, "two raced writes, then the one that landed");
     fake.status(&Id::try_from("frpc").unwrap())
         .expect("the artifact must be present");
+    let installs = fake
+        .guarded()
+        .into_iter()
+        .filter(|(verb, ..)| *verb == "install")
+        .count();
+    assert_eq!(installs, 1, "one install scope is held across every retry");
 }
 
 #[skuld::test]
@@ -148,6 +154,39 @@ fn list_reports_an_unresolvable_account_as_ours_unreadable() {
             ),
         }]
     );
+}
+
+#[skuld::test]
+fn list_reports_a_failed_live_status_as_ours_unreadable() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.install(&mk("other"), false).unwrap();
+    fake.seed_live_status_fails("frpc", "state unavailable");
+
+    let listed = fake.list().unwrap();
+
+    assert_eq!(
+        listed.len(),
+        2,
+        "one entry's failure must not take down the others: {listed:?}"
+    );
+    assert!(
+        listed.contains(&Installed::OursUnreadable {
+            name: "frpc".to_string(),
+            reason: "marked ours, but its live state could not be queried: state unavailable".to_string(),
+        }),
+        "{listed:?}"
+    );
+    assert!(
+        listed
+            .iter()
+            .any(|e| matches!(e, Installed::Ours { spec, .. } if spec.id.as_str() == "other")),
+        "{listed:?}"
+    );
+    match fake.status(&Id::try_from("frpc").unwrap()) {
+        Err(Error::Other(message)) => assert_eq!(message, "state unavailable"),
+        other => panic!("status of the same id must return the error, got {other:?}"),
+    }
 }
 
 #[skuld::test]

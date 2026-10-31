@@ -251,7 +251,7 @@ fn list_omits_an_id_that_has_only_a_residual_artifact() {
 // Opaque artifacts ====================================================================================================
 
 /// Every verb's answer for `spec`'s id, labelled — including `install` and
-/// `preview_install`, the two that never reach `Store::get` and so are
+/// `preview_install`, the two that skip the ownership gate (`flow::owned`) and so are
 /// exactly the ones a partial implementation leaves disagreeing with the
 /// other six.
 fn every_verb(fake: &Fake, spec: &DaemonSpec) -> Vec<(&'static str, Result<()>)> {
@@ -344,7 +344,7 @@ fn an_opaque_id_shadows_an_entry_at_the_same_id() {
     }
 }
 
-/// `list` must agree with `Store::get` about a shadowed id: exactly one
+/// `list` must agree with `Store::read` about a shadowed id: exactly one
 /// entry, and not the `Ours` the failed read would have found. Nothing else
 /// reaches it — the shadowing test above never calls `list`, and every other
 /// test that does (the two opaque-`list` tests, and `fake_passes_conformance`

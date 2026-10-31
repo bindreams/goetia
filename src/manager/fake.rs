@@ -111,6 +111,8 @@ struct Store {
     /// Ids whose installed definition cannot be read back, with why — see
     /// [`Fake::seed_installed_fails`].
     installed_fails: BTreeMap<String, String>,
+    /// Ids whose live state cannot be queried, with why — see [`Fake::seed_live_status_fails`].
+    live_status_fails: BTreeMap<String, String>,
     /// Writes left to lose a race, by id — see [`Fake::seed_write_races`].
     write_races: BTreeMap<String, usize>,
     /// Every `write` attempted, raced or not — see [`Fake::writes`].
@@ -336,8 +338,8 @@ impl Fake {
     /// (systemd's names the leftover paths): `status` and the ownership gate carry `recovery`
     /// instead of [`crate::decide::foreign_recovery`].
     pub fn seed_residual_recovery(&self, id: &str, recovery: &str) {
+        self.seed_residual_artifact(id);
         let mut state = self.state.lock().expect("Fake mutex poisoned");
-        state.entries.remove(id);
         state.residual.insert(id.to_string(), Some(recovery.to_string()));
     }
 
@@ -444,6 +446,14 @@ impl Fake {
     pub fn seed_installed_fails(&self, id: &str, detail: &str) {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.installed_fails.insert(id.to_string(), detail.to_string());
+    }
+
+    /// Test-only seeding: the live state of `id` cannot be queried, failing with `detail` as a
+    /// backend's does when the tool it asks is down. Not [`Error::NoManager`], which refuses
+    /// every id at once: this is one entry's failure.
+    pub fn seed_live_status_fails(&self, id: &str, detail: &str) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.live_status_fails.insert(id.to_string(), detail.to_string());
     }
 
     /// Test-only seeding: the next `times` writes at `id` lose a race and write nothing, as when
@@ -690,9 +700,12 @@ impl crate::backend::Backend for Fake {
         Ok(WriteOutcome::Done)
     }
 
-    fn live_status(&self, _id: &Id, snapshot: &Entry) -> Result<Status> {
+    fn live_status(&self, id: &Id, snapshot: &Entry) -> Result<Status> {
         let state = self.state.lock().expect("Fake mutex poisoned");
         state.manager()?;
+        if let Some(detail) = state.live_status_fails.get(id.as_str()) {
+            return Err(Error::Other(detail.clone()));
+        }
         Ok(Status {
             state: snapshot.state,
             pid: pid_for(snapshot.state),
