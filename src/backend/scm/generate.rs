@@ -99,6 +99,10 @@ pub struct ScmRegistration {
     /// `None` => `LocalSystem`.
     pub account: Option<String>,
     pub failure_actions: Option<FailureActions>,
+    /// The `Services\<name>\Environment` `REG_MULTI_SZ` lines, as written and as read back: raw,
+    /// so a hand-reordered or malformed value compares as it stands. Empty for `Kind::Simple`
+    /// — see [`registration`].
+    pub environment: Vec<String>,
     /// The `Services\<name>\Parameters` values, including the metadata blob
     /// (`Marker`/`Schema`/`Version`/`Spec`).
     pub parameters: BTreeMap<String, String>,
@@ -192,6 +196,15 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> Resul
         _ => canonical_account(&id.user),
     };
 
+    // SCM applies `Environment` to the process it launches: the daemon for `Kind::Managed`, the shim
+    // for `Kind::Simple`. The shim already applies `spec.env` to the daemon it spawns, and an `env:`
+    // key that collides with one the shim or `cosca` reads (`__COSCA_GROUP_ROOT`) would corrupt the
+    // shim's own containment, so `Kind::Simple` registers none.
+    let environment = match spec.kind {
+        Kind::Managed => format_environment_lines(&spec.env),
+        Kind::Simple => Vec::new(),
+    };
+
     let mut parameters = BTreeMap::new();
     parameters.insert(FIELD_MARKER.to_string(), blob::MARKER.to_string());
     parameters.insert(FIELD_SCHEMA.to_string(), blob::SCHEMA.to_string());
@@ -205,8 +218,15 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> Resul
         arguments,
         account,
         failure_actions,
+        environment,
         parameters,
     })
+}
+
+/// `env` as the `REG_MULTI_SZ` lines `Services\<name>\Environment` needs: the format SCM reads
+/// when it starts the service process, `NAME=value` per entry in key order.
+pub fn format_environment_lines(env: &BTreeMap<String, String>) -> Vec<String> {
+    env.iter().map(|(k, v)| format!("{k}={v}")).collect()
 }
 
 // Account canonicalisation ============================================================================================
@@ -403,6 +423,10 @@ pub fn render(reg: &ScmRegistration) -> String {
             let _ = writeln!(out, "  ResetPeriod: {}", humantime::format_duration(fa.reset_period));
             let _ = writeln!(out, "  OnNonCrashFailures: {}", fa.on_non_crash_failures);
         }
+    }
+    let _ = writeln!(out, "Environment:");
+    for line in &reg.environment {
+        let _ = writeln!(out, "  {line:?}");
     }
     let _ = writeln!(out, "Parameters:");
     for (key, value) in &reg.parameters {

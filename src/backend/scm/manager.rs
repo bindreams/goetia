@@ -49,9 +49,9 @@
 //! **4. A real account needs `SeServiceLogonRight`.** `CreateServiceW`
 //! succeeds without it; the first start then fails with error 1069
 //! (`ERROR_LOGON_FAILURE`) while `install` has already reported success. See
-//! `identity::grant_service_logon_right`, called on every `install` for
-//! every account [`generate::account_needs_password`] says needs a
-//! password — every other account (`LocalSystem`, a built-in, or an
+//! `identity::grant_service_logon_right`, called before the service is
+//! created or changed, for every account [`generate::account_needs_password`]
+//! says needs a password — every other account (`LocalSystem`, a built-in, or an
 //! `NT SERVICE\<id>` virtual account) already holds the right, and
 //! `LookupAccountNameW` (which the grant goes through) does not even
 //! resolve the first three by those spellings.
@@ -70,16 +70,13 @@
 //! Per-service environment variables **are** supported for `type: managed`,
 //! via the documented (if obscure) `Services\<name>\Environment`
 //! `REG_MULTI_SZ` value — a list of `NAME=value` lines SCM adds to the
-//! environment of the service process at launch. This is not part of
-//! `ScmRegistration`/`render()` (§8's answer arrived after that module was
-//! reviewed and hardened as pure, host-independent code — see `generate.rs`'s
-//! own doc comment), so `env` sits outside the drift-compared artifact
-//! surface: a hand-edit to `Environment` alone is not detected as a
-//! conflict, and `env` is unconditionally rewritten to match `new_spec` on
-//! every `Create`/`Update`/`Stale`. `managed_kind_environment_availability`
-//! in `tests/scm_integration.rs` verifies the mechanism empirically, on the
-//! real (elevated) Windows CI runner. This amends the design spec's §2
-//! mapping table, which had marked this cell "must verify (#5)".
+//! environment of the service process at launch. It is part of
+//! `ScmRegistration`/`render()`, so a hand-edit to `Environment` alone is a
+//! conflict, and an up-to-date install writes nothing.
+//! `managed_kind_environment_availability` in `tests/scm_integration.rs`
+//! verifies the mechanism empirically, on the real (elevated) Windows CI
+//! runner. This amends the design spec's §2 mapping table, which had marked
+//! this cell "must verify (#5)".
 //!
 //! ## Passwords
 //!
@@ -145,17 +142,13 @@ impl ServiceManager for ScmManager {
             crate::version(),
             force,
             // SCM has no drop-in mechanism: everything Goetia writes lives
-            // under the service's own key. See `env_is_outside_the_compared
-            // _surface` in the module docs for the one value that is not yet
-            // in `render()`'s surface.
+            // under the service's own key.
             &decide::Overlay::default(),
         );
         match outcome {
             Outcome::Create | Outcome::Update { .. } | Outcome::Stale { .. } => {
                 apply(spec, &d.reg, matches!(d.found, Ownership::Absent), d.current_start_type)?;
             }
-            // See `reapply_uncompared_effects`'s own doc comment.
-            Outcome::UpToDate => reapply_uncompared_effects(spec, &d.reg)?,
             _ => {}
         }
         Ok(outcome)
@@ -584,6 +577,7 @@ fn read_live_registration(
         // one-off `LocalSystem`-only filter.
         .and_then(|a| generate::canonical_account(&a));
     let failure_actions = read_failure_actions(service, name)?;
+    let environment = registry::read_environment(name)?;
 
     Ok((
         ScmRegistration {
@@ -593,6 +587,7 @@ fn read_live_registration(
             arguments,
             account,
             failure_actions,
+            environment,
             parameters: live_params.clone(),
         },
         cfg.start_type,
@@ -675,10 +670,14 @@ fn split_command_line(cmdline: &str) -> (PathBuf, Vec<String>) {
 
 // apply (write path) ==================================================================================================
 
-/// Write `reg` (create or update), then everything outside `ScmRegistration`
-/// itself: the metadata blob, failure actions, `env`, and — for a real
-/// account — `SeServiceLogonRight`. The blob write comes immediately after
-/// create/update, minimizing trap 1's crash window. `current_start_type` is
+/// Write `reg`: the preconditions first (`SeServiceLogonRight` for a real
+/// account, the event source), then the service itself (create or update),
+/// then `Parameters`, `Environment` and the failure actions. A failed
+/// precondition leaves no new service, so the next `install` retries as a
+/// create or an update, as systemd and launchd do. `Parameters` follows
+/// create/update immediately, minimizing trap 1's crash window; a failure in
+/// the two writes after it leaves a registration the next `install` reads as
+/// hand-edited (`Conflict`, cleared by `--force`). `current_start_type` is
 /// `Discovery::current_start_type` — `None` for a fresh create, `Some(_)`
 /// (preserved rather than reset) for an update; see `service_info`.
 fn apply(
@@ -691,10 +690,10 @@ fn apply(
     // `reg.account` is `Some`: a canonicalised built-in
     // (`NT AUTHORITY\LocalService`) or virtual (`NT SERVICE\<id>`) account
     // is `Some`, yet needs no password at all — see that function's own
-    // doc comment for the exact table. `reapply_uncompared_effects` below
-    // keys its `grant_service_logon_right` skip off the same predicate, so
-    // the two can no longer disagree about which accounts are
-    // password-free.
+    // doc comment for the exact table. `LookupAccountNameW`, which the
+    // `SeServiceLogonRight` grant goes through, does not resolve
+    // `LocalSystem`, `LocalService` or `NetworkService` by those spellings
+    // at all, and every such account already holds the right.
     //
     // The `false` arm must never call `identity::service_password()`:
     // `service_password` is a bare read of `GOETIA_SERVICE_PASSWORD` with
@@ -725,10 +724,15 @@ fn apply(
                 spec.id
             )));
         }
+        identity::grant_service_logon_right(account)?;
         pw
     } else {
         None
     };
+
+    // Best-effort, and deliberately here rather than in the shim: it writes
+    // under HKLM, and the shim may run as an unprivileged account.
+    registry::register_event_source();
 
     if create {
         let scm = open_scm(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
@@ -747,64 +751,8 @@ fn apply(
     }
 
     registry::write_parameters(&reg.name, &reg.parameters)?;
-
-    // Best-effort, and deliberately here rather than in the shim: it writes
-    // under HKLM, and the shim may run as an unprivileged account.
-    registry::register_event_source();
-
-    reapply_uncompared_effects(spec, reg)?;
-
-    Ok(())
-}
-
-/// Failure actions, `env`, and `SeServiceLogonRight` — everything `apply`
-/// writes that is not part of `ScmRegistration`/`render()`, so none of it
-/// is covered by `decide::decide`'s comparison (see the module doc
-/// comment). A caller that only reaches this via `apply` (i.e. only on
-/// `Create`/`Update`/`Stale`) would leave a partial failure of any of these
-/// permanently invisible to a retry: once the *compared* surface matches,
-/// `decide` reports `UpToDate` forever after, regardless of `--force`.
-/// `ServiceManager::install`'s `UpToDate` arm calls this too, so a plain
-/// re-`install` converges even without a spec change to force `apply` to
-/// run again. (Failure actions ride along here as well: a fresh service's
-/// default "no actions" state can coincidentally already match a
-/// `None`-desired one, hiding a failed `apply_failure_actions` the same
-/// way.)
-fn reapply_uncompared_effects(spec: &DaemonSpec, reg: &ScmRegistration) -> Result<()> {
-    apply_failure_actions(&reg.name, reg.failure_actions.as_ref())?;
-    // `Services\<name>\Environment` is applied by SCM to the *service host*
-    // process — the daemon itself for `Kind::Managed`, but `goetia-shim.exe`
-    // for `Kind::Simple` (see `generate::registration`'s `Kind::Simple` arm:
-    // SCM only ever launches the shim). Writing `spec.env` here for
-    // `Kind::Simple` would leak the daemon's configured environment into
-    // the SHIM's own process instead of the daemon's — pointless on its
-    // own (the shim already applies `spec.env` to the child it spawns, in
-    // `src/bin/shim/service.rs`'s `build_command`), and actively harmful if
-    // an `env:` key happens to collide with something the shim or its
-    // `cosca` dependency reads from its own environment (e.g. `cosca`'s
-    // reserved `__COSCA_GROUP_ROOT` nesting marker, which would silently
-    // downgrade the shim's own process-tree containment). An empty map for
-    // `Kind::Simple` makes `write_environment` delete any existing value
-    // rather than write one, so an id whose `type:` flips from `managed`
-    // to `simple` still converges.
-    let env_for_host = match spec.kind {
-        Kind::Managed => spec.env.clone(),
-        Kind::Simple => BTreeMap::new(),
-    };
-    registry::write_environment(&reg.name, &env_for_host)?;
-    // Only for an account that actually needs it (see `apply`'s identical
-    // predicate above): `LookupAccountNameW`, which the grant goes
-    // through, does not resolve `LocalSystem`, `LocalService`, or
-    // `NetworkService` by those spellings at all, and every built-in or
-    // virtual (`NT SERVICE\<id>`) account already holds
-    // `SeServiceLogonRight` on the merits.
-    if generate::account_needs_password(reg.account.as_deref()) {
-        let account = reg.account.as_deref().expect(
-            "account_needs_password(None) is always false (LocalSystem), so this branch is only reached for Some",
-        );
-        identity::grant_service_logon_right(account)?;
-    }
-    Ok(())
+    registry::write_environment(&reg.name, &reg.environment)?;
+    apply_failure_actions(&reg.name, reg.failure_actions.as_ref())
 }
 
 /// `ServiceInfo` for `reg`, for either `create_service` or `change_config`.

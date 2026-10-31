@@ -85,6 +85,64 @@ fn managed_kind_executable_is_own_command() {
     assert_eq!(reg.arguments, spec.command[1..].to_vec());
 }
 
+// Environment =========================================================================================================
+
+#[skuld::test]
+fn managed_kind_renders_its_environment_lines() {
+    let mut spec = managed_spec();
+    spec.env.insert("B".to_string(), "2".to_string());
+    spec.env.insert("A".to_string(), "1".to_string());
+    let reg = build(&spec);
+
+    assert_eq!(reg.environment, ["A=1", "B=2"]);
+    assert!(
+        render(&reg).contains("Environment:\n  \"A=1\"\n  \"B=2\"\n"),
+        "the compared text must show each line:\n{}",
+        render(&reg)
+    );
+}
+
+#[skuld::test]
+fn simple_kind_renders_no_environment() {
+    // SCM applies `Environment` to the shim, not the daemon (the shim applies `spec.env` itself), so
+    // the registration carries none for `Kind::Simple`.
+    let mut spec = simple_spec();
+    spec.env.insert("A".to_string(), "1".to_string());
+    let reg = build(&spec);
+
+    assert!(reg.environment.is_empty(), "{:?}", reg.environment);
+    assert!(
+        render(&reg).contains("Environment:\nParameters:\n"),
+        "an empty environment renders as a bare header:\n{}",
+        render(&reg)
+    );
+}
+
+#[skuld::test]
+fn format_environment_lines_is_key_equals_value_per_entry() {
+    let mut env = BTreeMap::new();
+    env.insert("B".to_string(), "2".to_string());
+    env.insert("A".to_string(), "1".to_string());
+    // `BTreeMap` iterates key-sorted, so the lines come out deterministically
+    // ordered regardless of insertion order.
+    assert_eq!(
+        format_environment_lines(&env),
+        vec!["A=1".to_string(), "B=2".to_string()]
+    );
+}
+
+#[skuld::test]
+fn format_environment_lines_is_empty_for_empty_env() {
+    assert!(format_environment_lines(&BTreeMap::new()).is_empty());
+}
+
+#[skuld::test]
+fn format_environment_lines_preserves_equals_signs_in_the_value() {
+    let mut env = BTreeMap::new();
+    env.insert("URL".to_string(), "http://x/a=b".to_string());
+    assert_eq!(format_environment_lines(&env), vec!["URL=http://x/a=b".to_string()]);
+}
+
 // Account =============================================================================================================
 
 #[skuld::test]
@@ -1088,6 +1146,7 @@ fn render_output_format_is_pinned() {
             reset_period: Duration::from_secs(86_400),
             on_non_crash_failures: true,
         }),
+        environment: vec!["A=1".to_string(), "B=x y".to_string()],
         parameters: BTreeMap::from([
             ("Marker".to_string(), "goetia".to_string()),
             ("Schema".to_string(), "1".to_string()),
@@ -1113,6 +1172,9 @@ fn render_output_format_is_pinned() {
         format!("  Delay: {delay_text}"),
         format!("  ResetPeriod: {reset_period_text}"),
         "  OnNonCrashFailures: true".to_string(),
+        "Environment:".to_string(),
+        "  \"A=1\"".to_string(),
+        "  \"B=x y\"".to_string(),
         "Parameters:".to_string(),
         "  Marker: \"goetia\"".to_string(),
         "  Schema: \"1\"".to_string(),

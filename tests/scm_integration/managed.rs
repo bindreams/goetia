@@ -10,7 +10,7 @@ use goetia::backend::scm::manager::ScmManager;
 use goetia::decide::Outcome;
 use goetia::manager::conformance;
 use goetia::manager::{Budget, Installed, ServiceManager as _, State};
-use goetia::spec::{AccountId, DaemonSpec, Id, Restart, User};
+use goetia::spec::{AccountId, DaemonSpec, Id, Kind, Restart, User};
 use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use winreg::RegKey;
@@ -530,6 +530,85 @@ fn managed_kind_environment_availability() {
         "type: managed env support (design spec §8 must-verify #5): the daemon process did not see its \
          configured environment variable"
     );
+}
+
+// `Environment` is part of the compared registration ==================================================================
+
+fn environment_key(id: &str, access: u32) -> RegKey {
+    let path = format!(r"{}\{id}", support::SCM_SERVICES_KEY);
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(&path, access)
+        .unwrap_or_else(|e| panic!(r"open HKLM\{path}: {e}"))
+}
+
+fn environment_of(id: &str) -> Option<Vec<String>> {
+    match environment_key(id, KEY_READ).get_value::<Vec<String>, _>("Environment") {
+        Ok(lines) => Some(lines),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => panic!("read Environment of {id}: {e}"),
+    }
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_hand_edited_environment_is_a_conflict() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let env = BTreeMap::from([("GOETIA_TEST_KEY".to_string(), "value".to_string())]);
+    let spec = mk_spec(&id, fixture_command(&id, 1, 1, "plain"), env);
+    mgr.install(&spec, false).expect("install");
+
+    environment_key(&id, KEY_WRITE)
+        .set_value("Environment", &vec!["HAND_EDITED=1".to_string()])
+        .expect("overwrite Environment");
+
+    let outcome = mgr.preview_install(&spec).expect("preview_install");
+    let Outcome::Conflict { artifact_diff, .. } = &outcome else {
+        panic!("expected Conflict for a hand-edited Environment, got {outcome:?}");
+    };
+    assert!(artifact_diff.contains("HAND_EDITED=1"), "{artifact_diff}");
+
+    let forced = mgr.install(&spec, true).expect("forced install");
+    assert!(!matches!(forced, Outcome::Conflict { .. }), "{forced:?}");
+    assert_eq!(environment_of(&id), Some(vec!["GOETIA_TEST_KEY=value".to_string()]));
+    let again = mgr.install(&spec, false).expect("install after force");
+    assert!(matches!(again, Outcome::UpToDate), "{again:?}");
+}
+
+/// An `UpToDate` install writes nothing, so a second install of either kind must compare equal on
+/// everything the first wrote: failure actions, `Environment`, `Parameters`. A `type: simple`
+/// service's `Environment` is empty on both sides, whatever its spec's `env` says. It is registered
+/// but never started, so no shim binary is needed.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn install_twice_is_up_to_date_for_both_kinds() {
+    let mgr = ScmManager::new();
+    for kind in [Kind::Managed, Kind::Simple] {
+        let id = support::random_test_id();
+        let _guard = ServiceGuard::new(&id);
+        let env = BTreeMap::from([("GOETIA_TEST_KEY".to_string(), "value".to_string())]);
+        let spec = DaemonSpec {
+            kind,
+            ..common::mk_spec_full(
+                &id,
+                fixture_command(&id, 1, 1, "plain"),
+                env,
+                User::Root,
+                Restart::OnFailure,
+                Some(Duration::from_secs(3)),
+            )
+        };
+
+        let first = mgr.install(&spec, false).expect("install");
+        assert!(matches!(first, Outcome::Create), "{kind:?}: {first:?}");
+        let second = mgr.install(&spec, false).expect("reinstall, unchanged spec");
+        assert!(matches!(second, Outcome::UpToDate), "{kind:?}: {second:?}");
+
+        let expected = match kind {
+            Kind::Managed => Some(vec!["GOETIA_TEST_KEY=value".to_string()]),
+            Kind::Simple => None,
+        };
+        assert_eq!(environment_of(&id), expected, "{kind:?}");
+    }
 }
 
 // Step 7: a real account gets SeServiceLogonRight =====================================================================

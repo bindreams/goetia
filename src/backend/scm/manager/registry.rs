@@ -2,8 +2,7 @@
 //! `ServiceConfig` cannot read back at all: the `Services\<name>\Parameters`
 //! metadata blob (`Marker`/`Schema`/`Version`/`Spec` — see
 //! `backend::scm::generate`), and the `Services\<name>\Environment`
-//! `REG_MULTI_SZ` (see the module doc comment on `manager` for why this
-//! carries `env` outside the drift-compared `ScmRegistration` surface).
+//! `REG_MULTI_SZ` (see the module doc comment on `manager`).
 //!
 //! Both live under `HKLM\SYSTEM\CurrentControlSet\Services\<name>`, the same
 //! tree `tests/marker_inertness/scm.rs`'s `scm_parameters_values_survive`
@@ -11,9 +10,9 @@
 
 use std::collections::BTreeMap;
 
-use winreg::RegKey;
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
 use winreg::types::FromRegValue as _;
+use winreg::{RegKey, RegValue};
 
 use crate::error::{Error, Result};
 
@@ -123,33 +122,49 @@ pub fn write_parameters(name: &str, params: &BTreeMap<String, String>) -> Result
 
 // Environment =========================================================================================================
 
-/// `env` as the `REG_MULTI_SZ` lines `Services\<name>\Environment` needs —
-/// the format SCM itself reads when starting the service process (see the
-/// module doc comment on `manager` for the empirical basis). Pure, so the
-/// one interesting decision here (what an empty `env` produces) is
-/// unit-testable without a registry.
-fn format_environment_lines(env: &BTreeMap<String, String>) -> Vec<String> {
-    env.iter().map(|(k, v)| format!("{k}={v}")).collect()
+/// The lines of `Services\<name>\Environment`; empty when the value is absent. A value of any type
+/// but `REG_MULTI_SZ` is an error rather than "no lines": `Environment` is compared, and a hand edit
+/// to another type must not read as up to date.
+pub fn read_environment(name: &str) -> Result<Vec<String>> {
+    let path = service_key_path(name);
+    let key = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(&path, KEY_READ)
+        .map_err(|e| registry_error("open", &path, e))?;
+    let value = match key.get_raw_value(ENVIRONMENT_VALUE) {
+        Ok(value) => Some(value),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(registry_error(&format!("read {ENVIRONMENT_VALUE} under"), &path, e)),
+    };
+    environment_lines(value).map_err(|e| registry_error(&format!("parse {ENVIRONMENT_VALUE} under"), &path, e))
 }
 
-/// Write `env` as `Services\<name>\Environment`. An empty `env` deletes the
-/// value rather than writing an empty `REG_MULTI_SZ`, so a spec with no
-/// `env` leaves nothing behind to misreport as "this daemon sets an
-/// environment variable" on a later inspection with a native tool.
-pub fn write_environment(name: &str, env: &BTreeMap<String, String>) -> Result<()> {
+/// [`read_environment`]'s parsing, apart from the registry so it is testable without one.
+fn environment_lines(value: Option<RegValue>) -> std::io::Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let lines = Vec::<String>::from_reg_value(&value)?;
+    // `winreg` splits an empty `REG_MULTI_SZ` into one empty string; the registry cannot tell it
+    // from an empty list, and `write_environment` writes an empty list as no value at all.
+    Ok(if lines == [""] { Vec::new() } else { lines })
+}
+
+/// Write `lines` as `Services\<name>\Environment`. No lines deletes the value rather than writing
+/// an empty `REG_MULTI_SZ`, so a spec with no `env` leaves nothing behind to misreport as "this
+/// daemon sets an environment variable" on a later inspection with a native tool.
+pub fn write_environment(name: &str, lines: &[String]) -> Result<()> {
     let path = service_key_path(name);
     let key = RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(&path, KEY_READ | KEY_WRITE)
         .map_err(|e| registry_error("open", &path, e))?;
-    if env.is_empty() {
+    if lines.is_empty() {
         match key.delete_value(ENVIRONMENT_VALUE) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(registry_error(&format!("delete {ENVIRONMENT_VALUE} under"), &path, e)),
         }
     } else {
-        let lines = format_environment_lines(env);
-        key.set_value(ENVIRONMENT_VALUE, &lines)
+        key.set_value(ENVIRONMENT_VALUE, &lines.to_vec())
             .map_err(|e| registry_error(&format!("write {ENVIRONMENT_VALUE} under"), &path, e))
     }
 }

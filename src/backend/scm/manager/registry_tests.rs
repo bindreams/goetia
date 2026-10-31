@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
-
 use super::*;
+
+use winreg::types::ToRegValue as _;
 
 #[skuld::test]
 fn service_key_path_is_under_current_control_set_services() {
@@ -19,21 +19,30 @@ fn parameters_key_path_is_the_service_key_plus_parameters() {
 }
 
 #[skuld::test]
-fn format_environment_lines_is_key_equals_value_per_entry() {
-    let mut env = BTreeMap::new();
-    env.insert("B".to_string(), "2".to_string());
-    env.insert("A".to_string(), "1".to_string());
-    // `BTreeMap` iterates key-sorted, so the lines come out deterministically
-    // ordered regardless of insertion order.
-    assert_eq!(
-        format_environment_lines(&env),
-        vec!["A=1".to_string(), "B=2".to_string()]
-    );
+fn an_absent_environment_value_is_no_lines() {
+    assert_eq!(environment_lines(None).unwrap(), Vec::<String>::new());
 }
 
 #[skuld::test]
-fn format_environment_lines_is_empty_for_empty_env() {
-    assert!(format_environment_lines(&BTreeMap::new()).is_empty());
+fn a_multi_string_environment_value_is_its_lines() {
+    let lines = vec!["A=1".to_string(), "B=x y".to_string()];
+    let value = lines.to_reg_value();
+    assert_eq!(environment_lines(Some(value)).unwrap(), ["A=1", "B=x y"]);
+}
+
+/// `winreg` reads an empty `REG_MULTI_SZ` as one empty string; it is no lines, as `write_environment`
+/// treats it (an empty list deletes the value).
+#[skuld::test]
+fn an_empty_multi_string_environment_value_is_no_lines() {
+    let lines = Vec::<String>::new();
+    let value = lines.to_reg_value();
+    assert_eq!(environment_lines(Some(value)).unwrap(), Vec::<String>::new());
+}
+
+#[skuld::test]
+fn an_environment_value_of_another_type_is_an_error() {
+    let value = "A=1".to_reg_value();
+    environment_lines(Some(value)).expect_err("a REG_SZ is not a REG_MULTI_SZ");
 }
 
 /// The `Parameters` half of this backend's [`Error::Undetermined`] keying. `winreg` surfaces
@@ -63,13 +72,6 @@ fn a_parameters_read_that_did_not_complete_is_undetermined() {
             "{rendered}: {recovery}"
         );
     }
-}
-
-#[skuld::test]
-fn format_environment_lines_preserves_equals_signs_in_the_value() {
-    let mut env = BTreeMap::new();
-    env.insert("URL".to_string(), "http://x/a=b".to_string());
-    assert_eq!(format_environment_lines(&env), vec!["URL=http://x/a=b".to_string()]);
 }
 
 /// The mid-pass fault, and the reason `list` no longer propagates one: a key that could not be
