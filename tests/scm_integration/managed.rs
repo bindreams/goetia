@@ -979,7 +979,7 @@ fn deleted_account_makes_the_service_oursunreadable() {
     }
 }
 
-/// A service installed before `resolve` refused `restart: always` keeps a blob that says so, and the
+/// A service installed before the generator refused `restart: always` keeps a blob that says so, and the
 /// generator now refuses to regenerate it: an install over it is unreadable, not a silent rewrite.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn install_refuses_an_always_blob_as_unreadable() {

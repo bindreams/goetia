@@ -431,16 +431,15 @@ fn version_skew_notice(spec: &DaemonSpec, registered_by: &str, running: &str) ->
     if registered_by == running || spec.restart == Restart::Never {
         return None;
     }
-    let mut notice = format!(
-        "daemon {:?} was registered by goetia {registered_by} and this goetia-shim is {running}: its SCM recovery actions may be missing, so it may not restart after a failure. Run `goetia daemon install` to apply them",
+    let remedy = if spec.restart == Restart::Always {
+        "After setting `backend-specific: scm: { restart: on-failure }` in the manifest, run `goetia daemon uninstall <id>` and `goetia daemon install` to apply them: `restart: always` is not supported for scm, so `install` refuses this service as it is"
+    } else {
+        "Run `goetia daemon install` to apply them"
+    };
+    Some(format!(
+        "daemon {:?} was registered by goetia {registered_by} and this goetia-shim is {running}: its SCM recovery actions may be missing, so it may not restart after a failure. {remedy}",
         spec.name
-    );
-    if spec.restart == Restart::Always {
-        notice.push_str(
-            ", after setting `backend-specific: scm: { restart: on-failure }` in the manifest: `restart: always` is not supported for scm",
-        );
-    }
-    Some(notice)
+    ))
 }
 
 fn log_open_failed(path: &std::path::Path, e: &std::io::Error) -> String {

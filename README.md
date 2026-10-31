@@ -473,7 +473,10 @@ $ goetia daemon install --dry-run -f goetia.yaml
 error: daemon `frpc`: `restart: always` cannot be honoured by the scm backend: SCM recovery actions never fire after a clean exit. To keep `always` on systemd and launchd, set `backend-specific: scm: { restart: on-failure }`
 ```
 
-`--dry-run` still previews the manifest's other daemons and exits `1`.
+`--dry-run` still previews the manifest's other daemons and exits `1`. Without
+it, `install` over a manifest with several daemons installs the others and
+reports the refused one, exiting `1`; under `--start` the refused daemon is not
+started and the others are.
 Override it for Windows:
 
 ```yaml

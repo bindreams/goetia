@@ -502,7 +502,7 @@ fn discover(spec: &DaemonSpec) -> Result<Discovery> {
 /// `regenerated` without a working `Identity`, so this backend genuinely
 /// cannot regenerate that spec on this host — the same situation a future
 /// schema or bit-rotted blob puts it in. So is a blob the generator refuses,
-/// such as one installed with `restart: always` before `resolve` refused it.
+/// such as one installed with `restart: always` before the generator refused it.
 fn classify(params: &BTreeMap<String, String>) -> Ownership {
     match generate::extract(params) {
         Ok(None) => Ownership::Foreign,

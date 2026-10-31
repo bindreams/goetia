@@ -437,7 +437,7 @@ fn a_new_shim_runs_a_service_registered_by_an_earlier_version() {
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
 }
 
-/// A service installed before `resolve` refused `restart: always` keeps a blob that says so. Only
+/// A service installed before the generator refused `restart: always` keeps a blob that says so. Only
 /// `install` regenerates from a blob, and the scm generator refuses `always`, so the service must
 /// stay operable: started, listed, queried, restarted, stopped and uninstalled.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]

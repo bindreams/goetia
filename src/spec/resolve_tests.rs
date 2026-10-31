@@ -213,11 +213,7 @@ fn resolve_parses_each_restart_policy() {
         ("on-failure", Restart::OnFailure),
         ("always", Restart::Always),
     ] {
-        // `scm` refuses `always`, so the override keeps this about parsing on any host.
-        let yaml = format!(
-            "daemons:\n  frpc:\n    command: [bin/frpc]\n    restart: {raw}\n    backend-specific:\n      \
-             scm: {{ restart: on-failure }}\n"
-        );
+        let yaml = format!("daemons:\n  frpc:\n    command: [bin/frpc]\n    restart: {raw}\n");
         let (specs, _) = resolve_yaml_as(BackendKind::Systemd, &yaml)
             .unwrap_or_else(|e| panic!("`restart: {raw}` should resolve: {e}"));
         assert_eq!(specs[0].restart, expected, "restart: {raw}");

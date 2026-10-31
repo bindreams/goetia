@@ -1063,13 +1063,13 @@ fn an_earlier_registration_under_on_failure_names_the_daemon_and_the_remedy() {
 }
 
 #[skuld::test]
-fn an_earlier_registration_under_always_also_names_the_manifest_change() {
+fn an_earlier_registration_under_always_names_the_override_and_the_reinstall() {
     let notice = version_skew_notice(&spec_restarting(Restart::Always), "0.1.0", "0.2.0");
 
     assert_eq!(
         notice.as_deref(),
         Some(
-            r#"daemon "goetia-shim launch test" was registered by goetia 0.1.0 and this goetia-shim is 0.2.0: its SCM recovery actions may be missing, so it may not restart after a failure. Run `goetia daemon install` to apply them, after setting `backend-specific: scm: { restart: on-failure }` in the manifest: `restart: always` is not supported for scm"#
+            r#"daemon "goetia-shim launch test" was registered by goetia 0.1.0 and this goetia-shim is 0.2.0: its SCM recovery actions may be missing, so it may not restart after a failure. After setting `backend-specific: scm: { restart: on-failure }` in the manifest, run `goetia daemon uninstall <id>` and `goetia daemon install` to apply them: `restart: always` is not supported for scm, so `install` refuses this service as it is"#
         )
     );
 }
