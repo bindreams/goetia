@@ -116,8 +116,10 @@ winreg = "0.56"
 # The handful of Win32 calls `windows-service` does not wrap: a real
 # `NotifyServiceStatusChangeW` wait (`scm::wait`, replacing a
 # checkpoint/`Sleep` poll), `SeServiceLogonRight` provisioning
-# (`manager::identity`), and `CommandLineToArgvW` for readback (SCM stores
-# `executable`+`arguments` pre-joined into one command line).
+# (`manager::identity`), `CommandLineToArgvW` for readback (SCM stores
+# `executable`+`arguments` pre-joined into one command line), and
+# `RegQueryValueExW`, which reads an `Environment` value of any type where
+# `winreg` fails on one above `REG_QWORD` (`manager::registry`).
 #
 # The shim (`src/bin/shim/`, same crate/dependency graph — see the
 # `goetia-shim` `[[bin]]` above) adds `Win32_System_EventLog`, the
@@ -132,6 +134,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Authorization",
     "Win32_Security_Authentication_Identity",
     "Win32_System_EventLog",
+    "Win32_System_Registry",
     "Win32_System_Services",
     "Win32_System_Threading",
     "Win32_UI_Shell",

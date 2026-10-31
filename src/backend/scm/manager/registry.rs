@@ -10,9 +10,14 @@
 
 use std::collections::BTreeMap;
 
+use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
+use windows_sys::Win32::System::Registry::{
+    REG_BINARY, REG_DWORD, REG_DWORD_BIG_ENDIAN, REG_EXPAND_SZ, REG_FULL_RESOURCE_DESCRIPTOR, REG_LINK, REG_MULTI_SZ,
+    REG_NONE, REG_QWORD, REG_RESOURCE_LIST, REG_RESOURCE_REQUIREMENTS_LIST, REG_SZ, RegQueryValueExW,
+};
+use winreg::RegKey;
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
 use winreg::types::FromRegValue as _;
-use winreg::{RegKey, RegValue};
 
 use crate::error::{Error, Result};
 
@@ -122,42 +127,156 @@ pub fn write_parameters(name: &str, params: &BTreeMap<String, String>) -> Result
 
 // Environment =========================================================================================================
 
+/// A registry value as stored: its type number and bytes, unconverted. `winreg`'s `RegValue` cannot
+/// hold a type above `REG_QWORD`, and its `get_raw_value` fails on one.
+struct RawValue {
+    vtype: u32,
+    bytes: Vec<u8>,
+}
+
 /// The lines of `Services\<name>\Environment`; empty when the value is absent. Errs only when the
-/// value cannot be read at all; one of another type reads as the marker line [`environment_lines`]
-/// describes.
+/// value cannot be read at all; anything that is not what [`write_environment`] writes reads as the
+/// marker lines [`environment_lines`] describes.
 pub fn read_environment(name: &str) -> Result<Vec<String>> {
     let path = service_key_path(name);
     let key = RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(&path, KEY_READ)
         .map_err(|e| registry_error("open", &path, e))?;
-    match key.get_raw_value(ENVIRONMENT_VALUE) {
+    match query_raw_value(&key, ENVIRONMENT_VALUE) {
         Ok(value) => Ok(environment_lines(Some(value))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(environment_lines(None)),
         Err(e) => Err(registry_error(&format!("read {ENVIRONMENT_VALUE} under"), &path, e)),
     }
 }
 
-/// [`read_environment`]'s parsing, apart from the registry so it is testable without one.
-///
-/// A value that is not a `REG_MULTI_SZ` reads as one line naming its type. A rendered line is always
-/// `NAME=value`, so a line without `=` never equals desired text: the hand edit is a `Conflict` the
-/// diff shows, and `install --force` overwrites it, type included.
-fn environment_lines(value: Option<RegValue>) -> Vec<String> {
-    let Some(value) = value else {
-        return Vec::new();
-    };
-    match Vec::<String>::from_reg_value(&value) {
-        // `winreg` splits an empty `REG_MULTI_SZ` into one empty string; the registry cannot tell it
-        // from an empty list, and `write_environment` writes an empty list as no value at all.
-        Ok(lines) if lines == [""] => Vec::new(),
-        Ok(lines) => lines,
-        Err(_) => vec![format!("(value of type {:?}, not REG_MULTI_SZ)", value.vtype)],
+/// `RegQueryValueExW` for `name` under `key`, whatever its type.
+fn query_raw_value(key: &RegKey, name: &str) -> std::io::Result<RawValue> {
+    let wide_name = super::identity::wide_null(name);
+    let mut bytes = vec![0u8; 1024];
+    loop {
+        let mut vtype = 0u32;
+        let mut len = bytes.len() as u32;
+        // SAFETY: `key` holds an open handle; `wide_name` is a NUL-terminated UTF-16 string that
+        // outlives the call; `vtype` and `len` are valid out-params, and `bytes` is `len` writable
+        // bytes.
+        let status = unsafe {
+            RegQueryValueExW(
+                key.raw_handle(),
+                wide_name.as_ptr(),
+                std::ptr::null(),
+                &mut vtype,
+                bytes.as_mut_ptr(),
+                &mut len,
+            )
+        };
+        match status {
+            ERROR_SUCCESS => {
+                bytes.truncate(len as usize);
+                return Ok(RawValue { vtype, bytes });
+            }
+            // `len` is now the size the value needs; it grows only if the value was rewritten meanwhile.
+            ERROR_MORE_DATA => bytes.resize(len as usize, 0),
+            err => return Err(std::io::Error::from_raw_os_error(err as i32)),
+        }
     }
 }
 
+/// [`read_environment`]'s parsing, apart from the registry so it is testable without one.
+///
+/// Only a value byte-identical to what [`write_environment`] writes reads as the lines it was
+/// written from. Anything else yields at least one line without `=`, and a desired line is always
+/// `NAME=value`, so that line never equals desired text: the hand edit is a `Conflict` the diff
+/// shows, and `install --force` overwrites it, type included.
+///
+/// - A value that is not a `REG_MULTI_SZ` is one line naming its type.
+/// - `write_environment` writes each line followed by a NUL, then one more NUL, and writes an empty
+///   list as no value. Any other NUL layout, an odd trailing byte or a present empty value adds a
+///   line naming what differs, after the lines that could be read.
+/// - A line that is not valid UTF-16 is shown with each unpaired surrogate and every `=` escaped.
+fn environment_lines(value: Option<RawValue>) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    if value.vtype != REG_MULTI_SZ {
+        return vec![format!("(value of type {}, not REG_MULTI_SZ)", type_name(value.vtype))];
+    }
+
+    let units: Vec<u16> = value
+        .bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    let mut problems = Vec::new();
+    if let [last] = value.bytes.chunks_exact(2).remainder() {
+        problems.push(format!("a trailing odd byte 0x{last:02X}"));
+    }
+    let body = match units.as_slice() {
+        [body @ .., 0, 0] => body,
+        all => {
+            problems.push("no closing pair of NULs".to_string());
+            all
+        }
+    };
+    let segments: Vec<&[u16]> = body.split(|unit| *unit == 0).collect();
+    if body.is_empty() {
+        problems.push("no strings".to_string());
+    } else if segments.iter().any(|segment| segment.is_empty()) {
+        problems.push("an empty string".to_string());
+    }
+
+    let mut lines: Vec<String> = segments
+        .into_iter()
+        .filter(|segment| !segment.is_empty())
+        .map(line_from_utf16)
+        .collect();
+    if !problems.is_empty() {
+        lines.push(format!(
+            "(REG_MULTI_SZ not laid out as goetia writes it: {})",
+            problems.join(", ")
+        ));
+    }
+    lines
+}
+
+/// One line, exactly. A line that is not valid UTF-16 shows as a line without `=`.
+fn line_from_utf16(units: &[u16]) -> String {
+    let decoded: Vec<_> = char::decode_utf16(units.iter().copied()).collect();
+    if decoded.iter().all(|c| c.is_ok()) {
+        return decoded.into_iter().flatten().collect();
+    }
+    let mut shown = String::from("(not valid UTF-16: ");
+    for c in decoded {
+        match c {
+            Ok('=') => shown.push_str(r"\x3D"),
+            Ok(c) => shown.extend(c.escape_debug()),
+            Err(e) => shown.push_str(&format!(r"\u{{{:04X}}}", e.unpaired_surrogate())),
+        }
+    }
+    shown.push(')');
+    shown
+}
+
+/// The registry's own name for a value type, or its number when it has none.
+fn type_name(vtype: u32) -> String {
+    match vtype {
+        REG_NONE => "REG_NONE",
+        REG_SZ => "REG_SZ",
+        REG_EXPAND_SZ => "REG_EXPAND_SZ",
+        REG_BINARY => "REG_BINARY",
+        REG_DWORD => "REG_DWORD",
+        REG_DWORD_BIG_ENDIAN => "REG_DWORD_BIG_ENDIAN",
+        REG_LINK => "REG_LINK",
+        REG_RESOURCE_LIST => "REG_RESOURCE_LIST",
+        REG_FULL_RESOURCE_DESCRIPTOR => "REG_FULL_RESOURCE_DESCRIPTOR",
+        REG_RESOURCE_REQUIREMENTS_LIST => "REG_RESOURCE_REQUIREMENTS_LIST",
+        REG_QWORD => "REG_QWORD",
+        other => return other.to_string(),
+    }
+    .to_string()
+}
+
 /// Write `lines` as `Services\<name>\Environment`. No lines deletes the value rather than writing
-/// an empty `REG_MULTI_SZ`, so a spec with no `env` leaves nothing behind to misreport as "this
-/// daemon sets an environment variable" on a later inspection with a native tool.
+/// an empty `REG_MULTI_SZ`.
 pub fn write_environment(name: &str, lines: &[String]) -> Result<()> {
     let path = service_key_path(name);
     let key = RegKey::predef(HKEY_LOCAL_MACHINE)

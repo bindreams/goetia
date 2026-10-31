@@ -84,7 +84,7 @@ fn parse_password_var(var: std::result::Result<String, std::env::VarError>) -> R
     }
 }
 
-fn wide_null(s: &str) -> Vec<u16> {
+pub(super) fn wide_null(s: &str) -> Vec<u16> {
     std::ffi::OsStr::new(s)
         .encode_wide()
         .chain(std::iter::once(0))
