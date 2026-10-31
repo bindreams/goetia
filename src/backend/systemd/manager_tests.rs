@@ -324,8 +324,9 @@ fn replace_reports_raced_twice_rather_than_guessing_which_file_wins() {
     });
 }
 
-/// `uninstall`'s own instance of the non-clobber race: the fragment can change between `read` and the removal, since two full `systemctl` round-trips run in between. Unlike the
-/// `install` paths, this needs no live daemon lifecycle, so it is exercised directly at the
+/// `uninstall`'s own instance of the non-clobber race: the fragment can change between `read` and
+/// the removal, since two full `systemctl` round-trips run in between. Unlike the `install` paths,
+/// this needs no live daemon lifecycle, so it is exercised directly at the
 /// `quarantine_if_still_ours` level rather than through a real `stop`/`disable` cycle.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn quarantine_used_by_uninstall_reports_a_race_instead_of_removing_the_wrong_file() {

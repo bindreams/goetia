@@ -1384,8 +1384,7 @@ impl backend::Backend for LaunchdManager {
         // What issuing the request takes: which of `bootstrap`/`kickstart` it
         // needs, and the `bootstrap` itself. None of it is bounded — the
         // budget bounds waiting for launchd's answer, never whether the
-        // request is sent — so a budget discovery used up still reaches
-        // launchd.
+        // request is sent — so a spent budget still reaches launchd.
         let issuing = Budget::Unbounded.start();
 
         if !never_expires(is_loaded(id.as_str(), issuing)?) {

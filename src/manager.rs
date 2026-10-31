@@ -83,10 +83,10 @@ pub trait ServiceManager {
     /// the failure this whole signature exists to prevent.
     ///
     /// **`budget` bounds waiting for that confirmation, never whether the
-    /// request is sent.** Every real backend starts the clock at verb
-    /// entry, so discovery spends the budget too — and then issues the
-    /// request whatever is left of it, cutting short only the wait for the
-    /// manager's answer. A budget discovery used up still reaches the
+    /// request is sent.** Every real backend starts the clock when the verb
+    /// itself begins, after the ownership read, and issues the request
+    /// whatever is left of it, cutting short only the wait for the
+    /// manager's answer. A budget that is already spent still reaches the
     /// manager.
     ///
     /// [`Budget::Immediate`] issues the request and returns without waiting,
