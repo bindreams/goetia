@@ -348,6 +348,52 @@ fn owned_maps_absent_foreign_and_marked() {
     );
 }
 
+/// A verb takes the snapshot the gate yields, so the blanket impl alone gates every verb: on an id
+/// that is not goetia's each says why, and the backend is never asked to act.
+#[skuld::test]
+fn every_verb_on_an_id_that_is_not_ours_reports_why_and_performs_nothing() {
+    let fake = Fake::new();
+    fake.seed_native_restart();
+    fake.seed_foreign("stranger", "not a goetia artifact\n");
+    let absent = Id::try_from("nobody").unwrap();
+    let foreign = Id::try_from("stranger").unwrap();
+    let budget = crate::manager::Budget::DEFAULT;
+    let mgr: &dyn ServiceManager = &fake;
+    type Verb<'a> = (&'a str, &'a dyn Fn(&Id) -> Result<()>);
+    let verbs: [Verb; 9] = [
+        ("uninstall", &|id| mgr.uninstall(id)),
+        ("enable", &|id| mgr.enable(id)),
+        ("disable", &|id| mgr.disable(id)),
+        ("start", &|id| mgr.start(id, budget)),
+        ("stop", &|id| mgr.stop(id, budget)),
+        ("kill", &|id| mgr.kill(id)),
+        ("request_restart", &|id| {
+            mgr.request_restart(id).expect("this fake restarts natively")
+        }),
+        ("request_start_after_stop", &|id| mgr.request_start_after_stop(id)),
+        ("status", &|id| mgr.status(id).map(drop)),
+    ];
+
+    for (verb, run) in verbs {
+        let result = run(&absent);
+        assert!(
+            matches!(&result, Err(Error::NotInstalled { id }) if id == "nobody"),
+            "{verb} of an absent id: {result:?}"
+        );
+        let result = run(&foreign);
+        assert!(
+            matches!(&result, Err(Error::Foreign { id, .. }) if id == "stranger"),
+            "{verb} of a foreign id: {result:?}"
+        );
+    }
+
+    assert_eq!(fake.calls(), [], "no verb reached the backend");
+    assert!(fake.guarded().is_empty());
+    assert_eq!(fake.writes(), 0);
+    let after = fake.preview_install(&mk("stranger")).unwrap();
+    assert!(matches!(after, Outcome::RefuseForeign { .. }), "{after:?}");
+}
+
 // scan ================================================================================================================
 
 type Names = std::vec::IntoIter<std::io::Result<String>>;
