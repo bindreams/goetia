@@ -20,7 +20,7 @@
 //! `executable_path`, which makes reconstructing an argv the only way to compare
 //! against a desired [`ScmRegistration`] for drift. Keeping the fields unquoted
 //! here defers escaping to the one place that already owns it (`windows-service`,
-//! at effectful-install time) and keeps `render()` diffable field-by-field rather
+//! at effectful-install time) and keeps its `Display` text diffable field-by-field rather
 //! than as one opaque quoted string.
 //!
 //! **That readback path has a real, residual limitation.** Real
@@ -86,7 +86,7 @@ const FAILURE_RESET_PERIOD: Duration = Duration::from_secs(86_400);
 ///
 /// Deliberately has no start-type field. Boot enablement (`SERVICE_DEMAND_START`
 /// vs. `SERVICE_AUTO_START`) is a property of the installation, not the service,
-/// so it is excluded here and therefore excluded from [`render`] and from every
+/// so it is excluded here and therefore excluded from its `Display` text and from every
 /// drift comparison built on it — see `render_excludes_boot_enablement`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScmRegistration {
@@ -181,7 +181,7 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> Resul
     // `User::Root` is a universal token every backend maps for itself
     // (`User=0` on systemd, `root` on launchd); SCM's mapping is
     // `LocalSystem`, expressed here as `None` rather than the literal
-    // string, so `render` controls its own spelling. Every other variant
+    // string, so `Display` controls its own spelling. Every other variant
     // was already resolved to a platform account name upstream (a
     // `LookupAccountSid` call for `User::Id(Sid)` is I/O, which this
     // function must not do) — `id.user` carries that resolved name, which
@@ -432,11 +432,6 @@ impl fmt::Display for ScmRegistration {
         }
         Ok(())
     }
-}
-
-/// [`ScmRegistration`]'s `Display` text.
-pub fn render(reg: &ScmRegistration) -> String {
-    reg.to_string()
 }
 
 #[cfg(test)]

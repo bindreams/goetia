@@ -325,7 +325,7 @@ fn preview_artifact(spec: &DaemonSpec, err: &mut dyn Write) -> Result<String> {
         // is only ever shown in a preview, never installed.
         let shim_path = PathBuf::from("goetia-shim.exe");
         let registration = crate::backend::scm::generate::registration(spec, &identity, &shim_path)?;
-        Ok(crate::backend::scm::generate::render(&registration))
+        Ok(registration.to_string())
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {

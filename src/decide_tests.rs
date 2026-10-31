@@ -376,7 +376,7 @@ fn older_version_is_stale_not_conflict() {
 #[skuld::test]
 fn a_version_difference_wins_over_a_difference_in_recovery_actions() {
     use crate::backend::Identity;
-    use crate::backend::scm::generate::{ScmRegistration, registration, render};
+    use crate::backend::scm::generate::{ScmRegistration, registration};
 
     let spec = spec_fixture();
     let reg_now = registration(
@@ -393,9 +393,9 @@ fn a_version_difference_wins_over_a_difference_in_recovery_actions() {
         failure_actions: None,
         ..reg_now.clone()
     };
-    let on_disk = render(&reg_0_1_0);
+    let on_disk = reg_0_1_0.to_string();
     assert!(on_disk.contains("FailureActions: none"));
-    let desired = render(&reg_now);
+    let desired = reg_now.to_string();
     assert_ne!(on_disk, desired);
     let found = ours(&spec, "0.1.0", &on_disk, &on_disk);
 

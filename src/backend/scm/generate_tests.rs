@@ -96,9 +96,9 @@ fn managed_kind_renders_its_environment_lines() {
 
     assert_eq!(reg.environment, ["A=1", "B=2"]);
     assert!(
-        render(&reg).contains("Environment:\n  \"A=1\"\n  \"B=2\"\n"),
+        reg.to_string().contains("Environment:\n  \"A=1\"\n  \"B=2\"\n"),
         "the compared text must show each line:\n{}",
-        render(&reg)
+        reg
     );
 }
 
@@ -112,9 +112,9 @@ fn simple_kind_renders_no_environment() {
 
     assert!(reg.environment.is_empty(), "{:?}", reg.environment);
     assert!(
-        render(&reg).contains("Environment:\nParameters:\n"),
+        reg.to_string().contains("Environment:\nParameters:\n"),
         "an empty environment renders as a bare header:\n{}",
-        render(&reg)
+        reg
     );
 }
 
@@ -903,8 +903,8 @@ fn a_sub_millisecond_restart_delay_rounds_up_to_the_whole_millisecond_scm_stores
             ..fa
         });
         assert_eq!(
-            render(&reg),
-            render(&read_back),
+            reg.to_string(),
+            read_back.to_string(),
             "desired and read-back text must agree for {delay:?}, or every later install is a Conflict"
         );
     }
@@ -966,8 +966,8 @@ fn render_is_the_generation_invariant() {
     let regenerated = registration(&recovered_spec, &id, &shim).unwrap();
 
     assert_eq!(
-        render(&original),
-        render(&regenerated),
+        original.to_string(),
+        regenerated.to_string(),
         "regenerating from the extracted spec must render identically to the original"
     );
 }
@@ -1094,7 +1094,7 @@ fn extract_errors_on_case_insensitive_field_collision() {
 #[skuld::test]
 fn render_excludes_boot_enablement() {
     let reg = build(&managed_spec());
-    let text = render(&reg);
+    let text = reg.to_string();
     let lower = text.to_lowercase();
 
     for forbidden in ["boot", "auto_start", "demand_start", "startup", "enable"] {
@@ -1112,7 +1112,7 @@ fn render_escapes_display_name_and_parameter_values_for_injectivity() {
     reg.display_name = "line one\nline two".to_string();
     reg.parameters.insert("Extra".to_string(), "a\nb".to_string());
 
-    let text = render(&reg);
+    let text = reg.to_string();
 
     // Readback data (`ServiceConfig::display_name`, an arbitrary
     // `Parameters` value) is not covered by the injection gate that keeps
@@ -1183,7 +1183,7 @@ fn render_output_format_is_pinned() {
     .map(|line| format!("{line}\n"))
     .collect::<String>();
 
-    assert_eq!(render(&reg), expected);
+    assert_eq!(reg.to_string(), expected);
 }
 
 /// `decide` compares the `Display` text, so it is the canonical text itself, not a second rendering.
@@ -1205,5 +1205,4 @@ fn a_registration_displays_as_its_canonical_text() {
         "Name: x\nDisplayName: \"X\"\nAccount: \"LocalSystem\"\nExecutable: \"a\"\nArguments:\n\
          FailureActions: none\nEnvironment:\nParameters:\n  k: \"v\"\n"
     );
-    assert_eq!(reg.to_string(), render(&reg));
 }

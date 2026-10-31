@@ -64,7 +64,7 @@ fn seed_foreign(id: &str) {
 }
 
 /// A hand-edit `sc config` can make without touching `Parameters`: append an
-/// argument to the command line. Changes `render()`'s `Arguments` line,
+/// argument to the command line. Changes the registration's `Arguments` line,
 /// which the embedded blob cannot explain — the Windows analogue of a
 /// unit-file `MemoryMax=8G` a spec-level diff would render invisible.
 fn hand_edit(id: &str) {
@@ -129,6 +129,35 @@ fn install_then_list_round_trips_without_the_source_file() {
     let status = mgr.status(&spec.id).expect("status");
     assert_eq!(status.state, State::Stopped);
     assert!(!status.enabled);
+}
+
+/// `apply` restates the start type the service has when it updates one, because `change_config`
+/// always sends a real `dwStartType`. An update that restated the create default instead would undo
+/// `enable` here, silently. `enable` rather than `disable` is the one to pin: a fresh service is
+/// already demand-start, so a service reset to the default would still read as disabled.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn an_update_keeps_the_start_type_enable_set() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let command = fixture_command(&id, 1, 1, "plain");
+    let spec = mk_spec(&id, command.clone(), BTreeMap::new());
+    mgr.install(&spec, false).expect("install");
+    mgr.enable(&spec.id).expect("enable");
+    assert!(mgr.status(&spec.id).expect("status after enable").enabled);
+
+    let changed = mk_spec(
+        &id,
+        command,
+        BTreeMap::from([("GOETIA_TEST_KEY".to_string(), "value".to_string())]),
+    );
+    let outcome = mgr.install(&changed, false).expect("install the changed spec");
+    assert!(matches!(outcome, Outcome::Update { .. }), "{outcome:?}");
+
+    assert!(
+        mgr.status(&spec.id).expect("status after the update").enabled,
+        "the update must not reset the start type `enable` set"
+    );
 }
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -1278,7 +1307,7 @@ fn list_reports_a_denied_parameters_read_with_the_cause_it_established() {
 /// The service-object boundary, which the `Parameters` test cannot reach: every verb but `install`
 /// opens the service object first, so a DACL denying `SERVICE_QUERY_CONFIG`/`SERVICE_QUERY_STATUS`
 /// stops goetia before it ever looks at the metadata. Fixing `read_parameters` alone would leave
-/// this path — and therefore `status` and `discover` — still claiming ownership it never proved.
+/// this path — and therefore `status` and `install` — still claiming ownership it never proved.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn status_of_a_service_whose_object_denies_querying_is_undetermined() {
     let mgr = ScmManager::new();

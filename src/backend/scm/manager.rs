@@ -71,7 +71,7 @@
 //! via the documented (if obscure) `Services\<name>\Environment`
 //! `REG_MULTI_SZ` value — a list of `NAME=value` lines SCM adds to the
 //! environment of the service process at launch. It is part of
-//! `ScmRegistration`/`render()`, so a hand-edit to `Environment` alone is a
+//! `ScmRegistration`'s `Display` text, so a hand-edit to `Environment` alone is a
 //! conflict, and an up-to-date install writes nothing.
 //! `managed_kind_environment_availability` in `tests/scm_integration.rs`
 //! verifies the mechanism empirically, on the real (elevated) Windows CI
@@ -398,7 +398,7 @@ fn shim_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("goetia-shim.exe"))
 }
 
-/// Read back everything `render()` needs from the service actually
+/// Read back everything `ScmRegistration`'s `Display` text needs from the service actually
 /// installed at `name`, for the `on_disk` side of `decide`'s comparison —
 /// SCM's "artifact" for diffing, since there is no file (see the
 /// crate-level design notes on this).
