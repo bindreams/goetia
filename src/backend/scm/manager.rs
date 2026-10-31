@@ -75,8 +75,7 @@
 //! conflict, and an up-to-date install writes nothing.
 //! `managed_kind_environment_availability` in `tests/scm_integration.rs`
 //! verifies the mechanism empirically, on the real (elevated) Windows CI
-//! runner. This amends the design spec's §2 mapping table, which had marked
-//! this cell "must verify (#5)".
+//! runner.
 //!
 //! ## Passwords
 //!
@@ -332,7 +331,10 @@ fn classify_scan(scan: registry::ServiceScan) -> Result<Vec<Installed>> {
         // `classify`'s identical check on the `install`/`diff` side.
         // `list`/`status` must agree with `install` about which ids are
         // "genuinely ours and readable", or a daemon `list` reports
-        // healthy could refuse the very next `install`.
+        // healthy could refuse the very next `install`. The exception:
+        // `list`/`status` do not regenerate, so a blob the generator refuses
+        // (`restart: always`) still lists as `Ours` while `install`/`diff`
+        // refuse it.
         if let Err(e) = identity::resolve(&blob.spec.user) {
             out.push(Installed::OursUnreadable {
                 name,
@@ -502,7 +504,7 @@ fn discover(spec: &DaemonSpec) -> Result<Discovery> {
 /// `regenerated` without a working `Identity`, so this backend genuinely
 /// cannot regenerate that spec on this host — the same situation a future
 /// schema or bit-rotted blob puts it in. So is a blob the generator refuses,
-/// such as one installed with `restart: always` before the generator refused it.
+/// such as one that says `restart: always`.
 fn classify(params: &BTreeMap<String, String>) -> Ownership {
     match generate::extract(params) {
         Ok(None) => Ownership::Foreign,

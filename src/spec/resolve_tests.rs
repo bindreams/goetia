@@ -1080,11 +1080,7 @@ fn load_does_not_read_the_env_file_when_the_manifest_has_no_dollar() {
 
 #[skuld::test]
 fn an_unreadable_env_file_fails_only_a_manifest_whose_native_spec_needs_it() {
-    // The step-2 gate reads the merged native spec alone. `.env` is a
-    // directory in both manifests below, so `Vars::load` fails in both.
-    //
-    // Here the native override replaces the one `${VAR}` the base writes, so
-    // the spec that gets installed has no `$` and `.env` is never read.
+    // An unreadable `.env` fails a manifest only when the native spec needs it.
     let dir = fixture_dir("", None);
     std::fs::create_dir(dir.path().join(".env")).expect("fixture directory should be creatable");
     let overridden = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    restart-delay: ${DELAY}\n    \
@@ -1094,8 +1090,6 @@ fn an_unreadable_env_file_fails_only_a_manifest_whose_native_spec_needs_it() {
     assert_eq!(specs[0].restart_delay, Some(Duration::from_secs(1)));
     assert!(warnings.is_empty(), "{warnings:?}");
 
-    // Drop the override and the native spec needs `.env`: what gets
-    // installed cannot be computed without it, so that is fatal.
     let bare = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    restart-delay: ${DELAY}\n";
     let err = resolve_as(parse_manifest(bare), dir.path(), Some(BackendKind::Systemd)).unwrap_err();
     assert!(matches!(err, Error::Io { .. }), "expected Io, got: {err:?}");

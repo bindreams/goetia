@@ -550,15 +550,15 @@ fn a_failed_start_names_the_blob_read_error_that_made_it_strict() {
     assert!(strict.contains("invalid blob JSON: EOF"), "{strict}");
 }
 
-/// A service installed before the generator refused `restart: always` keeps a blob that says so. It decodes, and
-/// a `type: simple` one starts by the shim's vocabulary like any other.
+/// A blob that says `restart: always` decodes, and a `type: simple` one starts by the shim's vocabulary like
+/// any other.
 #[skuld::test]
 fn a_blob_that_says_always_decodes_and_starts_as_its_kind() {
     let spec = DaemonSpec {
         restart: Restart::Always,
         ..blob_of(Kind::Simple).spec
     };
-    // `registration` refuses `always`, so write the blob the way an earlier release did.
+    // Hand-write the blob: `registration` refuses `always`.
     let parameters = BTreeMap::from([
         ("Marker".to_string(), crate::blob::MARKER.to_string()),
         ("Schema".to_string(), crate::blob::SCHEMA.to_string()),

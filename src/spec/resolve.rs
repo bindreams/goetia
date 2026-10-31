@@ -186,11 +186,8 @@ fn resolve_as(
 
         // Step 4: the all-backends sweep, and errors only: every backend's
         // merged spec is checked as authored, and `BackendKind::error` judges
-        // the fields its override supplied. Annotation covers the whole
-        // iteration, not just `resolve_shape`: every `Error` raised anywhere
-        // in this pass — from shape or from `BackendKind::error` — is
-        // annotated with `backend` before it propagates. A non-native
-        // backend's advisories are not this host's to give, so the shape
+        // the fields its override supplied. A non-native backend's
+        // advisories are not this host's to give, so the shape
         // pass's warnings are dropped. The native arm runs the grammar and
         // shape checks and no verdict: `error` runs in step 5 instead, on
         // the substituted text it is entitled to. This pass is not redundant
@@ -223,15 +220,9 @@ fn resolve_as(
         })();
         let (shaped, mut daemon_warnings) = substituted.map_err(|e| annotate_step5_error(e, native_entry))?;
 
-        // The native backend's own verdict and advisories, annotated like
-        // step 4's rather than like the substitution above it: step 4
-        // skipped this backend, so this is the *first* pass to apply a
-        // per-backend rule to the native spec, and "after substituting from
-        // .env" would be a claim about a pass that never ran — naming a
-        // `.env` that need not exist. `BackendKind::error` reads only fields
-        // `native_supplied` marks, so `backend-specific.<native>` is where
-        // the value was written, the same attribution its non-native twin
-        // gets.
+        // Annotated like step 4, not like the substitution: the first per-backend rule applied to the
+        // native spec, so a `.env` attribution would be wrong. `error` reads only `native_supplied`
+        // fields, i.e. `backend-specific.<native>`.
         if let Some(b) = native {
             b.error(&shaped, native_supplied).map_err(|e| attribute_to(e, b))?;
             b.warn(&shaped, &mut daemon_warnings);

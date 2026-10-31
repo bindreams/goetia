@@ -69,7 +69,7 @@ pub struct RawOverride {
 /// Provenance the merged spec cannot carry: after the merge a `user`
 /// value is just a value, and `BackendKind::error` must not reject a base
 /// value for a backend the author never wrote a line for. Only `user` is
-/// read today; a field is added back when a check needs it.
+/// read today.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Supplied {
     pub user: bool,

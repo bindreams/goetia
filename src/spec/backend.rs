@@ -24,10 +24,10 @@
 //! backend on every host, on the override as authored: `scm: {user: {id:
 //! 1000}}` is caught from any host — a uid is never a substituted string —
 //! while `scm: {user: "${ACCT}"}` is not checkable from Linux: substitution
-//! runs for the native backend only, and goetia does not claim to check what
-//! it cannot resolve. The native backend's override is substituted too, in
-//! `resolve`'s step 5, and is both checked and warned on there — which is why
-//! the example above names `scm` rather than `systemd`.
+//! runs for the native backend only. The native backend's override is
+//! substituted too, in `resolve`'s step 5, and is both checked and warned on
+//! there; the example above names `scm` because a non-native override is
+//! never substituted.
 //!
 //! [`BackendKind::warn`] runs for the native backend only, on its substituted
 //! merged spec, base values included: an advisory describes what the native

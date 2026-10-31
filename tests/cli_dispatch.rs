@@ -1430,9 +1430,8 @@ fn list_reaches_the_manager() {
     assert!(out.contains("frpc"), "{out}");
 }
 
-/// A manifest may say `restart: always`, but the scm generator refuses it at install, so a service installed
-/// before that refusal may still carry it. Reading its blob must not run the generator's refusal, or the
-/// service could not even be stopped or removed.
+/// Reading an installed `restart: always` blob must not run the scm generator's refusal, or the service
+/// could not even be stopped or removed.
 ///
 /// CLI-only: the verbs run against `Fake`, which has no scm refusal of its own to trip. The scm
 /// generator refuses `always` (`registration_refuses_restart_always`); the scm side of operability is
