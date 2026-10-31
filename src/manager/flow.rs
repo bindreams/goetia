@@ -5,6 +5,8 @@
 //! calls these. [`crate::decide::decide`] is reached only from here, so no backend can restate a
 //! row of the install policy.
 
+use std::io;
+
 use crate::backend::{Backend, ReadOutcome, WriteOutcome};
 use crate::blob::Blob;
 use crate::decide::{self, ExternalConfig, Outcome, Ownership};
@@ -195,6 +197,41 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
     }
     out.extend(scan.reported);
     Ok(out)
+}
+
+// scan ================================================================================================================
+
+/// One pass over a backend's container of services (a directory, a registry key): hands each
+/// entry to `keep`, and returns the entry for what the pass did not reach, if anything.
+///
+/// - `opened` not found: the container is not there, which establishes absence. `None`.
+/// - `opened` failed otherwise: nothing was enumerated and no absence is established.
+///   `detail("open", e)` names the failure.
+/// - The first entry that faults ends the pass with `detail("enumerate", e)`. What `keep` was
+///   given before it stays: returning an error instead discards every one of those, reporting each
+///   id absent.
+///
+/// `entries` borrows the opened resource mutably because the iterator it makes borrows it
+/// (`RegKey::enum_keys`, `&mut ReadDir`).
+pub(crate) fn scan<R, T>(
+    location: &str,
+    opened: io::Result<R>,
+    entries: impl for<'r> FnOnce(&'r mut R) -> Box<dyn Iterator<Item = io::Result<T>> + 'r>,
+    detail: impl Fn(&'static str, &io::Error) -> String,
+    mut keep: impl FnMut(T),
+) -> Option<Installed> {
+    let mut resource = match opened {
+        Ok(resource) => resource,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(Installed::scan_incomplete(location, &detail("open", &e))),
+    };
+    for entry in entries(&mut resource) {
+        match entry {
+            Ok(item) => keep(item),
+            Err(e) => return Some(Installed::scan_incomplete(location, &detail("enumerate", &e))),
+        }
+    }
+    None
 }
 
 #[cfg(test)]

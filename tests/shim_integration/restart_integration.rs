@@ -14,7 +14,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use goetia::backend::scm::exit_status::{ERROR_SERVICE_SPECIFIC_ERROR, RecordedExit};
 use goetia::backend::scm::manager::ScmManager;
 use goetia::decide::Outcome;
-use goetia::manager::{Budget, Installed, ServiceManager as _, State, Step};
+use goetia::manager::{Budget, Installed, ServiceManager as _, Step};
 use goetia::spec::{DaemonSpec, Restart};
 use windows_service::service::{ServiceExitCode, ServiceState};
 
@@ -437,9 +437,10 @@ fn a_new_shim_runs_a_service_registered_by_an_earlier_version() {
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
 }
 
-/// A service whose blob says `restart: always` must stay operable, because only `install` regenerates from
-/// a blob and the scm generator refuses `always`: started, listed, queried, restarted, stopped and
-/// uninstalled.
+/// A service whose blob says `restart: always` must stay operable, because the verbs that act on a
+/// service do not regenerate from its blob and the scm generator refuses `always`: started,
+/// restarted, stopped and uninstalled. What does regenerate (`install`, `status`, `list`) reports it
+/// as unreadable, since a service that cannot be regenerated cannot be compared or vouched for.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled() {
     let mgr = ScmManager::new();
@@ -458,14 +459,26 @@ fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     reported.accept("the daemon of a service whose blob says always to report in");
 
-    let status = mgr.status(&spec.id).expect("status");
-    assert_eq!(status.state, State::Running, "{status:?}");
-    let listed = mgr.list().expect("list");
+    let status = mgr
+        .status(&spec.id)
+        .expect_err("status regenerates the spec, which scm refuses");
     assert!(
-        listed
-            .iter()
-            .any(|entry| matches!(entry, Installed::Ours { spec: s, .. } if s.id == spec.id)),
-        "the service is missing from `list`, or listed as unreadable: {listed:?}"
+        matches!(&status, goetia::Error::Other(message) if message.contains("restart: always")),
+        "{status:?}"
+    );
+    let listed = mgr.list().expect("list");
+    let entry = listed.iter().find(|entry| match entry {
+        Installed::Ours { spec: s, .. } => s.id == spec.id,
+        Installed::OursUnreadable { name, .. } => name == &id,
+        Installed::Undetermined { name, .. } => name.as_deref() == Some(id.as_str()),
+    });
+    assert!(
+        matches!(
+            entry,
+            Some(Installed::OursUnreadable { reason, .. })
+                if reason.contains("cannot be regenerated") && reason.contains("restart: always")
+        ),
+        "`list` must report the service as unreadable, not vouch for it: {listed:?}"
     );
 
     // The same steps `daemon restart` runs.

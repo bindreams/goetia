@@ -241,3 +241,104 @@ fn owned_maps_absent_foreign_and_marked() {
         "the marker alone is proof of ownership"
     );
 }
+
+// scan ================================================================================================================
+
+type Names = std::vec::IntoIter<std::io::Result<String>>;
+
+fn named(items: Vec<std::io::Result<String>>) -> std::io::Result<Names> {
+    Ok(items.into_iter())
+}
+
+fn op_and_cause(op: &'static str, e: &std::io::Error) -> String {
+    format!("{op} failed: {e}")
+}
+
+/// Collecting into a `Result` instead would discard every name enumerated before a later one
+/// faulted, which reports each of them absent.
+#[skuld::test]
+fn scan_keeps_entries_before_a_mid_pass_fault() {
+    let items = vec![
+        Ok("named-before-the-fault".to_string()),
+        Err(std::io::Error::other("injected mid-scan failure")),
+        Ok("never-reached".to_string()),
+    ];
+    let mut kept = Vec::new();
+
+    let reported = scan(
+        "the place",
+        named(items),
+        |names| Box::new(names),
+        op_and_cause,
+        |name| kept.push(name),
+    );
+
+    assert_eq!(kept, ["named-before-the-fault"], "the pass stops at the fault");
+    match reported {
+        Some(Installed::Undetermined { name: None, reason }) => {
+            assert!(reason.contains("the place"), "{reason}");
+            assert!(
+                reason.contains("enumerate failed: injected mid-scan failure"),
+                "{reason}"
+            );
+        }
+        other => panic!("a pass that stopped early must say what it did not reach, got {other:?}"),
+    }
+}
+
+/// Absence is established: an empty scan with nothing outstanding, not an unfinished one.
+#[skuld::test]
+fn scan_treats_a_missing_location_as_empty() {
+    let mut kept = Vec::new();
+
+    let reported = scan::<Names, String>(
+        "the place",
+        Err(std::io::ErrorKind::NotFound.into()),
+        |names| Box::new(names),
+        op_and_cause,
+        |name| kept.push(name),
+    );
+
+    assert!(kept.is_empty(), "{kept:?}");
+    assert_eq!(reported, None);
+}
+
+/// The outcome that must never be confused with the one above: a location that is there and will
+/// not open leaves the pass unfinished, so no id may be concluded absent.
+#[skuld::test]
+fn scan_reports_a_location_that_will_not_open() {
+    let mut kept = Vec::new();
+
+    let reported = scan::<Names, String>(
+        "the place",
+        Err(std::io::ErrorKind::PermissionDenied.into()),
+        |names| Box::new(names),
+        op_and_cause,
+        |name| kept.push(name),
+    );
+
+    assert!(kept.is_empty(), "{kept:?}");
+    match reported {
+        Some(Installed::Undetermined { name: None, reason }) => {
+            assert!(reason.contains("the place"), "{reason}");
+            assert!(reason.contains("open failed:"), "{reason}");
+        }
+        other => panic!("a location that exists and will not open establishes no absence, got {other:?}"),
+    }
+}
+
+#[skuld::test]
+fn scan_that_finishes_reports_nothing() {
+    let mut kept = Vec::new();
+
+    let reported = scan(
+        "the place",
+        named(vec![Ok("a".to_string()), Ok("b".to_string())]),
+        |names| Box::new(names),
+        op_and_cause,
+        |name| kept.push(name),
+    );
+
+    assert_eq!(kept, ["a", "b"]);
+    assert_eq!(reported, None);
+}

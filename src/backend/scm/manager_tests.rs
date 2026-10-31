@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use super::*;
+use crate::manager::ServiceManager;
 use crate::spec::Restart;
 
 fn dummy_reg(account: Option<&str>) -> ScmRegistration {
@@ -109,50 +110,6 @@ fn is_not_found_matches_only_error_service_does_not_exist() {
 
     let access_denied = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(5));
     assert!(!is_not_found(&access_denied));
-}
-
-// discover ============================================================================================================
-
-/// `discover` reads the drift text for every ownership, but [`decide::decide`] consults it only for
-/// `Ours`. So when the marker's demonstrable *absence* has already settled the answer, a failure to
-/// read that text must not overwrite the refusal with a claim of ownership goetia has just
-/// disproved — which is what `to_error`'s `Error::Other` does, via
-/// `cli::report::status_error`'s catch-all `Kind::Unreadable` ("goetia owns this and cannot report
-/// on it").
-#[skuld::test]
-fn a_failed_drift_read_over_a_foreign_service_stays_foreign() {
-    let id = Id::try_from("x").expect("valid id");
-    let failure = || {
-        to_error(
-            "query configuration for `x`",
-            windows_service::Error::Winapi(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)),
-        )
-    };
-
-    let over_foreign = drift_read_failure(&Ownership::Foreign, &id, failure());
-    let Error::Foreign { id: reported, recovery } = &over_foreign else {
-        panic!(
-            "a missing marker proves the id is not goetia's, and a failed read does not un-prove it: {over_foreign:?}"
-        );
-    };
-    assert_eq!(reported, "x");
-    assert_eq!(
-        recovery,
-        &decide::foreign_recovery("x"),
-        "the identical remedy `Outcome::RefuseForeign` would have carried"
-    );
-
-    // Ownership *is* established here — the marker is present, merely undecodable — so
-    // `Kind::Unreadable` is a true statement about the id and the original error stands.
-    let over_ours = drift_read_failure(
-        &Ownership::OursUnreadable {
-            reason: "a newer schema".to_string(),
-            recovery: None,
-        },
-        &id,
-        failure(),
-    );
-    assert!(matches!(over_ours, Error::Other(_)), "{over_ours:?}");
 }
 
 // undetermined ========================================================================================================
@@ -444,45 +401,37 @@ fn unreadable_notice_is_one_line_and_says_what_it_stands_for() {
     }
 }
 
-/// The wiring that turns "the enumeration stopped early" into the entry a caller sees. Distinct
-/// from `unreadable_aggregate`'s entry above — that one stands for services this pass *reached* and
-/// could not read, this one for services it never reached — and both have to appear, since only
-/// reporting them separately keeps each count honest.
-///
-/// Handed a scan rather than reading one: the `Services` key opens and enumerates on every host
-/// that boots (`registry_tests.rs::the_services_key_enumerates_and_finishes`), so `list` itself
-/// cannot be made to produce this without breaking the machine under the test.
+/// What the `Parameters` of an openable service say about ownership. The snapshot is the map as it
+/// was read, so `installed` compares what `read` saw.
 #[skuld::test]
-fn a_scan_that_stopped_early_becomes_an_unnamed_entry_in_the_listing() {
-    let scan = registry::ServiceScan {
-        names: Vec::new(),
-        incomplete: Some("registry enumerate HKLM\\...: injected".to_string()),
-    };
+fn read_marker_sorts_parameters_into_foreign_and_marked() {
+    let spec = blob_of(Kind::Managed).spec;
+    let ours = BTreeMap::from([
+        ("Marker".to_string(), crate::blob::MARKER.to_string()),
+        ("Schema".to_string(), crate::blob::SCHEMA.to_string()),
+        ("Version".to_string(), crate::version().to_string()),
+        ("Spec".to_string(), crate::blob::encode(&spec)),
+    ]);
+    let torn = BTreeMap::from([("Marker".to_string(), crate::blob::MARKER.to_string())]);
 
-    let listed = classify_scan(scan).expect("a pass that stopped early reports, it does not fail");
-
-    match listed.as_slice() {
-        [Installed::Undetermined { name: None, reason }] => {
-            assert!(reason.contains("injected"), "the detail must survive: {reason}");
-            assert!(
-                reason.contains(registry::SERVICES_KEY),
-                "the entry must name what was being scanned: {reason}"
-            );
+    assert!(matches!(
+        read_marker(BTreeMap::new()),
+        ReadOutcome::Foreign { recovery: None }
+    ));
+    match read_marker(ours.clone()) {
+        ReadOutcome::Marked {
+            blob: Ok(blob),
+            snapshot,
+        } => {
+            assert_eq!(blob.spec, spec);
+            assert_eq!(snapshot, ours);
         }
-        other => panic!("what a pass never reached is one unnamed entry, not {other:?}"),
+        _ => panic!("a complete marker is goetia's, decoded"),
     }
-}
-
-/// The other half: a pass that finished over an empty host adds nothing at all, so an ordinary
-/// `daemon list` is an empty document at exit `0` rather than a permanent `4`.
-#[skuld::test]
-fn a_scan_that_finished_over_nothing_adds_no_entry() {
-    let scan = registry::ServiceScan {
-        names: Vec::new(),
-        incomplete: None,
-    };
-
-    assert!(classify_scan(scan).expect("list").is_empty());
+    match read_marker(torn.clone()) {
+        ReadOutcome::Marked { blob: Err(_), snapshot } => assert_eq!(snapshot, torn),
+        _ => panic!("the marker alone is proof of ownership, decodable or not"),
+    }
 }
 
 // Install refuses `restart: always` ===================================================================================

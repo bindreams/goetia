@@ -41,7 +41,7 @@
 //! rejection (systemd reads a trailing `\` as a line continuation).
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -385,7 +385,7 @@ fn missing_field_error(field: &str) -> Error {
 
 // Rendering ===========================================================================================================
 
-/// Render `reg` as canonical text for diffing (`crate::diff::artifact_diff`'s
+/// A registration's canonical text for diffing (`crate::diff::artifact_diff`'s
 /// `was`/`now`), one field per line so a one-field change shows as a
 /// one-line diff. Deterministic: `parameters` is already sorted by key, and
 /// no other field's rendering depends on anything but its own value.
@@ -397,42 +397,46 @@ fn missing_field_error(field: &str) -> Error {
 /// values SCM never validates) is not covered by the injection gate that
 /// keeps goetia-authored strings newline-free. Rendering it raw would let a
 /// value containing a newline reproduce lines indistinguishable from real
-/// fields, defeating the line-based diff this function exists to support.
+/// fields, defeating the line-based diff this text exists to support.
 /// `Name` is exempt: it is always `spec.id`, whose pattern
 /// (`^[A-Za-z0-9._-]{1,80}$`) cannot contain a newline by construction.
 ///
 /// Never mentions boot enablement — `ScmRegistration` has no such field, so
 /// there is nothing here to render for it. See `render_excludes_boot_enablement`.
+impl fmt::Display for ScmRegistration {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(out, "Name: {}", self.name)?;
+        writeln!(out, "DisplayName: {:?}", self.display_name)?;
+        writeln!(out, "Account: {:?}", self.account.as_deref().unwrap_or("LocalSystem"))?;
+        writeln!(out, "Executable: {:?}", self.executable)?;
+        writeln!(out, "Arguments:")?;
+        for arg in &self.arguments {
+            writeln!(out, "  - {arg:?}")?;
+        }
+        match &self.failure_actions {
+            None => writeln!(out, "FailureActions: none")?,
+            Some(fa) => {
+                writeln!(out, "FailureActions:")?;
+                writeln!(out, "  Delay: {}", humantime::format_duration(fa.delay))?;
+                writeln!(out, "  ResetPeriod: {}", humantime::format_duration(fa.reset_period))?;
+                writeln!(out, "  OnNonCrashFailures: {}", fa.on_non_crash_failures)?;
+            }
+        }
+        writeln!(out, "Environment:")?;
+        for line in &self.environment {
+            writeln!(out, "  {line:?}")?;
+        }
+        writeln!(out, "Parameters:")?;
+        for (key, value) in &self.parameters {
+            writeln!(out, "  {key}: {value:?}")?;
+        }
+        Ok(())
+    }
+}
+
+/// [`ScmRegistration`]'s `Display` text.
 pub fn render(reg: &ScmRegistration) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "Name: {}", reg.name);
-    let _ = writeln!(out, "DisplayName: {:?}", reg.display_name);
-    let _ = writeln!(out, "Account: {:?}", reg.account.as_deref().unwrap_or("LocalSystem"));
-    let _ = writeln!(out, "Executable: {:?}", reg.executable);
-    let _ = writeln!(out, "Arguments:");
-    for arg in &reg.arguments {
-        let _ = writeln!(out, "  - {arg:?}");
-    }
-    match &reg.failure_actions {
-        None => {
-            let _ = writeln!(out, "FailureActions: none");
-        }
-        Some(fa) => {
-            let _ = writeln!(out, "FailureActions:");
-            let _ = writeln!(out, "  Delay: {}", humantime::format_duration(fa.delay));
-            let _ = writeln!(out, "  ResetPeriod: {}", humantime::format_duration(fa.reset_period));
-            let _ = writeln!(out, "  OnNonCrashFailures: {}", fa.on_non_crash_failures);
-        }
-    }
-    let _ = writeln!(out, "Environment:");
-    for line in &reg.environment {
-        let _ = writeln!(out, "  {line:?}");
-    }
-    let _ = writeln!(out, "Parameters:");
-    for (key, value) in &reg.parameters {
-        let _ = writeln!(out, "  {key}: {value:?}");
-    }
-    out
+    reg.to_string()
 }
 
 #[cfg(test)]

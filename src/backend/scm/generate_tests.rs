@@ -1185,3 +1185,25 @@ fn render_output_format_is_pinned() {
 
     assert_eq!(render(&reg), expected);
 }
+
+/// `decide` compares the `Display` text, so it is the canonical text itself, not a second rendering.
+#[skuld::test]
+fn a_registration_displays_as_its_canonical_text() {
+    let reg = ScmRegistration {
+        name: "x".to_string(),
+        display_name: "X".to_string(),
+        executable: PathBuf::from("a"),
+        arguments: vec![],
+        account: None,
+        failure_actions: None,
+        environment: vec![],
+        parameters: BTreeMap::from([("k".to_string(), "v".to_string())]),
+    };
+
+    assert_eq!(
+        format!("{reg}"),
+        "Name: x\nDisplayName: \"X\"\nAccount: \"LocalSystem\"\nExecutable: \"a\"\nArguments:\n\
+         FailureActions: none\nEnvironment:\nParameters:\n  k: \"v\"\n"
+    );
+    assert_eq!(reg.to_string(), render(&reg));
+}
