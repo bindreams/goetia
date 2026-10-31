@@ -448,3 +448,60 @@ fn a_socket_swapped_in_is_classified_not_a_failed_read() {
         ),
     }
 }
+
+// read / installed ----------------------------------------------------------------------------------------------------
+
+fn unit_text() -> String {
+    let spec = crate::spec::DaemonSpec {
+        id: crate::spec::Id::try_from("x").expect("valid id"),
+        name: "x".to_string(),
+        command: vec!["/bin/true".to_string()],
+        cwd: None,
+        env: Default::default(),
+        user: crate::spec::User::Root,
+        restart: crate::spec::Restart::Never,
+        restart_delay: None,
+        logs: None,
+        kind: crate::spec::Kind::Simple,
+    };
+    generate::unit(&spec, &crate::backend::Identity { user: "0".to_string() })
+}
+
+/// What `classified` makes of a fragment that was read, by what the marker says: no marker is a
+/// stranger's, a marker is goetia's with the text as the snapshot, and a marker that will not decode
+/// is still goetia's, carrying why — the marker alone is proof of ownership.
+#[skuld::test]
+fn a_read_fragment_is_foreign_unless_it_carries_the_marker() {
+    let text = unit_text();
+    let corrupt =
+        "[Unit]\nDescription=x\n\n[X-Goetia]\nMarker=goetia\nSchema=1\nVersion=0.1.0\nSpec=not-valid-base64!!!\n";
+
+    let foreign = classified("x", RawState::Regular("[Unit]\nDescription=not ours\n".to_string())).expect("classify");
+    assert!(matches!(foreign, ReadOutcome::Foreign { recovery: None }));
+
+    let not_ours = classified("x", RawState::NotOurs).expect("classify");
+    assert!(matches!(not_ours, ReadOutcome::Foreign { recovery: None }));
+
+    match classified("x", RawState::Regular(text.clone())).expect("classify") {
+        ReadOutcome::Marked { blob: Ok(_), snapshot } => assert_eq!(snapshot, text),
+        _ => panic!("a fragment goetia wrote is marked, with its own text as the snapshot"),
+    }
+
+    match classified("x", RawState::Regular(corrupt.to_string())).expect("classify") {
+        ReadOutcome::Marked { blob: Err(_), snapshot } => assert_eq!(snapshot, corrupt),
+        _ => panic!("a marker that will not decode is still goetia's"),
+    }
+}
+
+/// With no drop-in anywhere for the id, nothing is folded into the text `decide` compares and
+/// nothing is applied from outside.
+#[skuld::test]
+fn an_id_with_no_dropin_installs_as_its_fragment_alone() {
+    let id = super::super::test_id();
+    let text = unit_text();
+
+    let read = installed(&id, &text).expect("no drop-in directory to read");
+
+    assert_eq!(read.definition, text);
+    assert!(matches!(read.external, ExternalConfig::Absent));
+}

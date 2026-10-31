@@ -7,9 +7,9 @@
 //! Most of these are elevated (they write real files under `/etc/systemd/system`), so they opt into
 //! the same `elevated` precondition/label convention `tests/support/mod.rs` uses, duplicated locally
 //! rather than shared: a plain library unit test cannot depend on the `tests/` integration-test
-//! support crate. The two deadline-ordering tests (`start_derives_its_deadline_before_require_
-//! installed_runs` and its `stop_` mirror) are the exception: they drive only the `VerbSteps` seam,
-//! touch nothing on disk, and run unelevated.
+//! support crate. The two deadline-ordering tests (`start_derives_its_deadline_before_owned_runs`
+//! and its `stop_` mirror) are the exception: they drive only the `VerbSteps` seam, touch nothing on
+//! disk, and run unelevated.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
@@ -19,6 +19,7 @@ use super::dirs::ensure_dir;
 use super::discover::{RawState, raw_state};
 use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 use super::*;
+use crate::manager::ServiceManager;
 use crate::spec::{Kind, Restart};
 
 #[skuld::label]
@@ -326,8 +327,8 @@ fn replace_reports_raced_twice_rather_than_guessing_which_file_wins() {
     });
 }
 
-/// `uninstall`'s own instance of obligation 1: the fragment can change between `require_installed`'s
-/// classification and the removal, since two full `systemctl` round-trips run in between. Unlike the
+/// `uninstall`'s own instance of obligation 1: the fragment can change between `flow::owned`'s read
+/// and the removal, since two full `systemctl` round-trips run in between. Unlike the
 /// `install` paths, this needs no live daemon lifecycle, so it is exercised directly at the
 /// `quarantine_if_still_ours` level rather than through a real `stop`/`disable` cycle.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
@@ -336,10 +337,10 @@ fn quarantine_used_by_uninstall_reports_a_race_instead_of_removing_the_wrong_fil
     let path = unit_path(&id);
     let _cleanup = Cleanup(path.clone());
 
-    let classified_text = "[Unit]\nDescription=goetia, as require_installed saw it\n";
+    let classified_text = "[Unit]\nDescription=goetia, as flow::owned saw it\n";
     std::fs::write(&path, classified_text).expect("write");
 
-    // Something changes the fragment after `require_installed` would have read it, before
+    // Something changes the fragment after `flow::owned` would have read it, before
     // `uninstall` reaches its own `quarantine_if_still_ours` call.
     let changed_text = "[Unit]\nDescription=changed after classification\n";
     std::fs::write(&path, changed_text).expect("overwrite");
@@ -355,40 +356,9 @@ fn quarantine_used_by_uninstall_reports_a_race_instead_of_removing_the_wrong_fil
 
 // Enumeration: a scan that did not finish =============================================================================
 
-/// The mid-pass fault, and the reason `list` no longer propagates one: a dirent that could not be
-/// read must not take down the ids the very same pass already named. Injected through
-/// `collect_units`' iterator because no real `readdir` fails on request.
-#[skuld::test]
-fn a_dirent_that_cannot_be_read_keeps_what_the_scan_already_named() {
-    let dir = Path::new(UNIT_DIR);
-    let entries = vec![
-        Ok(dir.join("named-before-the-fault.service")),
-        Err(io::Error::other("injected mid-scan failure")),
-        Ok(dir.join("never-reached.service")),
-    ];
-
-    let scan = collect_units(dir, entries.into_iter());
-
-    assert_eq!(
-        scan.units.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
-        ["named-before-the-fault"],
-        "what the pass named before the fault survives it, and the pass stops there: {scan:?}"
-    );
-    match &scan.incomplete {
-        Some(Installed::Undetermined { name, reason }) => {
-            assert_eq!(*name, None, "the pass cannot name what it never reached");
-            assert!(reason.contains("injected mid-scan failure"), "{reason}");
-            assert!(
-                reason.contains(UNIT_DIR),
-                "the reason must name what was being scanned: {reason}"
-            );
-        }
-        other => panic!("a pass that stopped early must say so: {other:?}"),
-    }
-}
-
-/// The same fault one syscall earlier. An `Err` here reaches the CLI as `Kind::Unavailable` — exit
-/// `1` over an empty document, which is `list` reporting a populated host as having nothing on it.
+/// A unit directory that will not open is reported, not propagated (see `flow::scan`): an `Err` here
+/// reaches the CLI as `Kind::Unavailable` — exit `1` over an empty document, which is `list`
+/// reporting a populated host as having nothing on it.
 #[skuld::test]
 fn a_unit_directory_that_cannot_be_opened_is_reported_not_propagated() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -472,7 +442,7 @@ fn a_drop_in_name_that_is_not_a_directory_still_names_its_id() {
 fn prepared_steps_need_nothing_made_later() {
     let mgr = Systemd::new();
     for (steps, watched) in [(&[Step::Stop, Step::Start][..], 2), (&[Step::Install, Step::Start], 1)] {
-        let _prepared = mgr.prepare(steps, Budget::DEFAULT).expect("prepare");
+        let _prepared = ServiceManager::prepare(&mgr, steps, Budget::DEFAULT).expect("prepare");
         let _no_thread = bounded::test_hook::threads(0);
         let _no_file = bounded::test_hook::temp_files(0);
         for _ in 0..watched {
@@ -498,7 +468,7 @@ fn prepared_steps_need_nothing_made_later() {
     ];
     for (i, allowance) in shortfalls.into_iter().enumerate() {
         let _short = allowance();
-        let e = mgr.prepare(&[Step::Stop, Step::Start], Budget::DEFAULT).err();
+        let e = ServiceManager::prepare(&mgr, &[Step::Stop, Step::Start], Budget::DEFAULT).err();
         if i < 2 {
             let e = e.expect("threads short");
             assert!(e.to_string().contains("so none was sent"), "{e}");
@@ -516,7 +486,7 @@ fn a_budget_that_watches_nothing_prepares_nothing() {
     let _no_file = bounded::test_hook::temp_files(0);
     for budget in [Budget::Immediate, Budget::Unbounded] {
         assert!(
-            Systemd::new().prepare(&[Step::Stop, Step::Start], budget).is_ok(),
+            ServiceManager::prepare(&Systemd::new(), &[Step::Stop, Step::Start], budget).is_ok(),
             "{budget:?}"
         );
     }
@@ -533,9 +503,7 @@ fn prepared_steps_share_one_version_gate() {
     };
     for budget in [Budget::DEFAULT, Budget::Immediate, Budget::Unbounded] {
         asked.set(0);
-        let prepared = Systemd::new()
-            .prepare(&[Step::Stop, Step::Start], budget)
-            .expect("prepare");
+        let prepared = ServiceManager::prepare(&Systemd::new(), &[Step::Stop, Step::Start], budget).expect("prepare");
         systemctl::gated(count).unwrap();
         systemctl::gated(count).unwrap();
         assert_eq!(asked.get(), 1, "{budget:?}: the two legs asked twice");
@@ -545,7 +513,7 @@ fn prepared_steps_share_one_version_gate() {
     }
 }
 
-fn steps_taken(verb: fn(&str, Budget, &VerbSteps<'_>) -> Result<()>) -> Vec<&'static str> {
+fn steps_taken(verb: fn(&Id, Budget, &VerbSteps<'_>) -> Result<()>) -> Vec<&'static str> {
     let log = std::cell::RefCell::new(Vec::new());
     let derived = std::cell::Cell::new(None);
     let act = |step: &'static str, deadline: Deadline| {
@@ -564,27 +532,27 @@ fn steps_taken(verb: fn(&str, Budget, &VerbSteps<'_>) -> Result<()>) -> Vec<&'st
             derived.set(Some(deadline));
             deadline
         },
-        require_installed: &|_| {
-            log.borrow_mut().push("require_installed");
+        owned: &|_| {
+            log.borrow_mut().push("owned");
             Ok(String::new())
         },
         start: &|_, _, deadline| act("start", deadline),
         stop: &|_, _, deadline| act("stop", deadline),
     };
-    verb("x", Budget::DEFAULT, &steps).expect("every step succeeds");
+    verb(&Id::try_from("x").expect("valid id"), Budget::DEFAULT, &steps).expect("every step succeeds");
     log.into_inner()
 }
 
-/// `--timeout` counts from verb entry only if the deadline exists before `require_installed`'s scan
-/// runs. Derived after it, the scan runs outside the budget and nothing else observable changes,
-/// which is why the order is pinned here rather than left to the elevated suite. What the scan
-/// spends never keeps the request from systemd — see `systemctl::run_verb`.
+/// `--timeout` counts from verb entry only if the deadline exists before the ownership read runs.
+/// Derived after it, the read runs outside the budget and nothing else observable changes, which is
+/// why the order is pinned here rather than left to the elevated suite. What the read spends never
+/// keeps the request from systemd — see `systemctl::run_verb`.
 #[skuld::test]
-fn start_derives_its_deadline_before_require_installed_runs() {
-    assert_eq!(steps_taken(start_with), ["start_clock", "require_installed", "start"]);
+fn start_derives_its_deadline_before_owned_runs() {
+    assert_eq!(steps_taken(start_with), ["start_clock", "owned", "start"]);
 }
 
 #[skuld::test]
-fn stop_derives_its_deadline_before_require_installed_runs() {
-    assert_eq!(steps_taken(stop_with), ["start_clock", "require_installed", "stop"]);
+fn stop_derives_its_deadline_before_owned_runs() {
+    assert_eq!(steps_taken(stop_with), ["start_clock", "owned", "stop"]);
 }

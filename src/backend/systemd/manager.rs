@@ -25,7 +25,7 @@
 //! 3. **Drop-ins are drift.** `systemctl edit` — the officially recommended way to add exactly the
 //!    `MemoryMax=`/`After=` the design cites — writes `<id>.service.d/override.conf` and leaves the
 //!    fragment itself byte-identical, so drift detection over the fragment alone misses it entirely.
-//!    [`discover::dropin_dirs`] folds `<id>.service.d`'s `*.conf` contents — across every root of
+//!    [`discover::installed`] folds `<id>.service.d`'s `*.conf` contents — across every root of
 //!    systemd's system unit search path, `/etc/systemd/system.control` included — into the text
 //!    handed to `decide` (never into what is actually written); `decide::decide`'s own
 //!    `external` parameter — never a backend-local override of its `Outcome` — closes the one
@@ -55,12 +55,12 @@
 //!    [`Error::NotInstalled`] — and only that variant — to exit `0` and "nothing to do", so a
 //!    backend reporting it off `<id>.service`'s absence alone would certify "confirmed gone" for an
 //!    id systemd still applies a drop-in to, or still enrolls at boot through a
-//!    `multi-user.target.wants` link. `discover::residue` is the one predicate both `install`'s
-//!    `discover` and every other verb's `require_installed`/`status` ask, so no two verbs can
-//!    describe one filesystem state differently — `list` included, which asks it (through
-//!    `discover::residue_read`) of every id it enumerates with no readable fragment. A listing that
-//!    asked less would leave out an id `status` answers `Error::Undetermined` for, and leaving an
-//!    id out is how a listing says nothing is there.
+//!    `multi-user.target.wants` link. `discover::residue` is the one predicate behind
+//!    [`discover::fragmentless`], which every read of an id with no fragment asks — `install`'s and
+//!    every other verb's through `read`, so no two verbs can describe one filesystem state
+//!    differently, and `list`'s through `scan`, for every id it enumerates with no readable
+//!    fragment. A listing that asked less would leave out an id `status` answers
+//!    `Error::Undetermined` for, and leaving an id out is how a listing says nothing is there.
 
 mod dirs;
 mod discover;
@@ -72,19 +72,19 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use discover::{DROPIN_SEARCH_DIRS, RawState, absent_error, classify_and_read, discover, raw_state, require_installed};
+use discover::DROPIN_SEARCH_DIRS;
 use systemctl::{
-    daemon_reload, daemon_reload_or_report, disable_impl, enable_impl, gate_scope, kill_impl, request_restart_impl,
-    require_supported, start_impl, status_from_unit, stop_impl,
+    GateScope, daemon_reload, daemon_reload_or_report, disable_impl, enable_impl, gate_scope, kill_impl,
+    request_restart_impl, require_supported, start_impl, status_from_unit, stop_impl,
 };
 use write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 
 use crate::backend::systemd::generate;
-use crate::backend::{Identity, bounded};
-use crate::decide::{self, Outcome};
+use crate::backend::{Backend, Identity, InstalledDefinition, ReadOutcome, Scan, WriteOutcome, bounded};
+use crate::decide::Outcome;
 use crate::error::{Error, Result};
 use crate::manager::budget::Deadline;
-use crate::manager::{Budget, Installed, Prepared, ServiceManager, Status, Step};
+use crate::manager::{Budget, Installed, Prepared, Status, Step, flow};
 use crate::spec::{AccountId, DaemonSpec, Id, User};
 
 /// Where systemd looks for system unit files. Never overridden — the integration tests run for real
@@ -93,8 +93,9 @@ const UNIT_DIR: &str = "/etc/systemd/system";
 
 // Systemd =============================================================================================================
 
-/// The Linux [`ServiceManager`]. Holds no state of its own: every operation re-derives what it needs
-/// from the filesystem and `systemctl`, so nothing here can go stale between calls.
+/// The Linux [`ServiceManager`](crate::manager::ServiceManager). Holds no state of its own: every
+/// operation re-derives what it needs from the filesystem and `systemctl`, so nothing here can go
+/// stale between calls.
 #[derive(Debug, Default)]
 pub struct Systemd;
 
@@ -104,79 +105,115 @@ impl Systemd {
     }
 }
 
-impl ServiceManager for Systemd {
-    fn install(&self, spec: &DaemonSpec, force: bool) -> Result<Outcome> {
-        // Before anything is written: the gate is where no manager to ask refuses too. Its answer
-        // holds for the `daemon-reload` after the write.
-        let _gate = gate_scope();
+impl Backend for Systemd {
+    type Definition = String;
+    /// The fragment's own text, which `replace_unit_verified` and `quarantine_if_still_ours` verify
+    /// the fragment against before they touch it.
+    type Snapshot = String;
+    type InstallScope = GateScope;
+
+    /// Before anything is read or written: the gate is where no manager to ask refuses too. Its
+    /// answer holds for the `daemon-reload` after the write.
+    fn begin_install(&self, _spec: &DaemonSpec) -> Result<GateScope> {
+        let gate = gate_scope();
         require_supported()?;
-        let identity = identity_for(&spec.user)?;
-        let desired = generate::unit(spec, &identity);
+        Ok(gate)
+    }
 
-        // Looping rather than a single attempt: a `Raced` result means something appeared at this id
-        // between classification and the write below (obligation 1). That is a real, detected state
-        // change to react to — not a wait for time to pass — so re-classifying and trying again is
-        // bounded by actual system state, not a chosen number of attempts.
-        loop {
-            let d = discover(spec.id.as_str())?;
-            let outcome = decide::decide(&d.ownership, &desired, spec, crate::version(), force, &d.external);
+    fn render(&self, spec: &DaemonSpec) -> Result<String> {
+        Ok(generate::unit(spec, &identity_for(&spec.user)?))
+    }
 
-            match &outcome {
-                Outcome::Create => {
-                    dirs::ensure_parent_dirs(spec)?;
-                    match create_unit(spec.id.as_str(), &desired)? {
-                        CreateOutcome::Created => {
-                            daemon_reload_or_report(spec.id.as_str())?;
-                            return Ok(outcome);
-                        }
-                        CreateOutcome::Raced => continue,
-                    }
+    fn read(&self, id: &Id) -> Result<ReadOutcome<String>> {
+        discover::read(id.as_str())
+    }
+
+    fn installed(&self, id: &Id, snapshot: &String) -> Result<InstalledDefinition<String>> {
+        discover::installed(id.as_str(), snapshot)
+    }
+
+    fn write(
+        &self,
+        spec: &DaemonSpec,
+        definition: &String,
+        outcome: &Outcome,
+        snapshot: Option<&String>,
+        _scope: &mut GateScope,
+    ) -> Result<WriteOutcome> {
+        let id = spec.id.as_str();
+        dirs::ensure_parent_dirs(spec)?;
+        match outcome {
+            Outcome::Create => match create_unit(id, definition)? {
+                CreateOutcome::Created => {
+                    daemon_reload_or_report(id)?;
+                    Ok(WriteOutcome::Done)
                 }
-                Outcome::Update { .. } | Outcome::Stale { .. } => {
-                    dirs::ensure_parent_dirs(spec)?;
-                    let expected_text = d
-                        .fragment_text
-                        .as_deref()
-                        .expect("Ownership::Ours implies discover classified a regular file");
-                    match replace_unit_verified(spec.id.as_str(), &desired, expected_text)? {
-                        ReplaceOutcome::Replaced => {
-                            // Only after the write has actually committed: clearing the drop-in
-                            // first (before the write) would delete an admin's overrides even on a
-                            // path that turns out `Raced` and never writes anything, or errors out
-                            // partway through — `uninstall` clears its own fragment before its
-                            // drop-in for the identical reason.
-                            remove_dir_if_present(&dropin_dir(spec.id.as_str()))?;
-                            daemon_reload_or_report(spec.id.as_str())?;
-                            return Ok(outcome);
-                        }
-                        ReplaceOutcome::Raced => continue,
+                CreateOutcome::Raced => Ok(WriteOutcome::Raced),
+            },
+            Outcome::Update { .. } | Outcome::Stale { .. } => {
+                let expected_text = snapshot.expect("an id `decide` chose to update was read as marked");
+                match replace_unit_verified(id, definition, expected_text)? {
+                    ReplaceOutcome::Replaced => {
+                        // Only after the write has actually committed: clearing the drop-in
+                        // first (before the write) would delete an admin's overrides even on a
+                        // path that turns out `Raced` and never writes anything, or errors out
+                        // partway through — `uninstall` clears its own fragment before its
+                        // drop-in for the identical reason.
+                        remove_dir_if_present(&dropin_dir(id))?;
+                        daemon_reload_or_report(id)?;
+                        Ok(WriteOutcome::Done)
                     }
+                    ReplaceOutcome::Raced => Ok(WriteOutcome::Raced),
                 }
-                // `UpToDate` / `Conflict` (without force) / `RefuseForeign` / `RefuseUnreadable`:
-                // nothing to write.
-                _ => return Ok(outcome),
             }
+            other => unreachable!("`flow::install` writes only `Create`, `Update` and `Stale`, got {other:?}"),
         }
     }
 
-    fn preview_install(&self, spec: &DaemonSpec) -> Result<Outcome> {
-        let identity = identity_for(&spec.user)?;
-        let desired = generate::unit(spec, &identity);
-        let d = discover(spec.id.as_str())?;
-        // Always previewed without `force` — see the trait doc comment.
-        Ok(decide::decide(
-            &d.ownership,
-            &desired,
-            spec,
-            crate::version(),
-            false,
-            &d.external,
-        ))
+    fn live_status(&self, id: &Id, _snapshot: &String) -> Result<Status> {
+        status_from_unit(&unit_name(id.as_str()))
+    }
+
+    /// Each id the unit directories name, read as `read` would. An id whose read did not complete
+    /// establishes nothing about it — least of all that it is absent, which is what omitting it from
+    /// the enumeration would say — so it is reported by name instead.
+    fn scan(&self) -> Scan<String> {
+        let host = scan_host();
+        let reads = host
+            .units
+            .into_iter()
+            .map(|(id, path)| {
+                let read = discover::read_at(&id, &path);
+                (id, read)
+            })
+            // Obligation 7 again: what occupies an id is not the fragment file, so an id whose
+            // *drop-in* could not be read is exactly as unclassified as one whose fragment could not
+            // be — and `status` says so for both.
+            .chain(host.dropin_only.into_iter().map(|id| {
+                let read = discover::fragmentless(&id);
+                (id, read)
+            }));
+
+        let mut entries = Vec::new();
+        let mut reported = Vec::new();
+        for (id, read) in reads {
+            match read {
+                Ok(read) => entries.push((id, read)),
+                Err(failure) => reported.push(Installed::Undetermined {
+                    name: Some(id),
+                    reason: failure.detail(),
+                }),
+            }
+        }
+        // Last, so a scan that got some way in still reports what it named before what it could
+        // not — the order `cli::support::partition_installed` imposes on the rendered output too.
+        reported.extend(host.incomplete);
+        Scan { entries, reported }
     }
 
     fn uninstall(&self, id: &Id) -> Result<()> {
+        let expected_text = flow::owned(self, id)?;
         let id = id.as_str();
-        let expected_text = require_installed(id)?;
         // One version gate for the stop, the `disable` and the `daemon-reload`: the stop's.
         let _gate = gate_scope();
 
@@ -189,9 +226,9 @@ impl ServiceManager for Systemd {
 
         disable_impl(id)?;
 
-        // Verified removal, mirroring `replace_unit_verified`: the gap since `require_installed`
-        // spans two full `systemctl` round-trips, wide enough for something else to have replaced
-        // the fragment in the meantime (obligation 1's TOCTOU class again).
+        // Verified removal, mirroring `replace_unit_verified`: the gap since `flow::owned` read the
+        // fragment spans two full `systemctl` round-trips, wide enough for something else to have
+        // replaced the fragment in the meantime (obligation 1's TOCTOU class again).
         match quarantine_if_still_ours(id, &expected_text)? {
             Some(backup_path) => remove_file_if_present(&backup_path)?,
             None => {
@@ -220,19 +257,17 @@ impl ServiceManager for Systemd {
     }
 
     fn enable(&self, id: &Id) -> Result<()> {
-        let id = id.as_str();
-        require_installed(id)?;
-        enable_impl(id)
+        flow::owned(self, id)?;
+        enable_impl(id.as_str())
     }
 
     fn disable(&self, id: &Id) -> Result<()> {
-        let id = id.as_str();
-        require_installed(id)?;
-        disable_impl(id)
+        flow::owned(self, id)?;
+        disable_impl(id.as_str())
     }
 
     fn start(&self, id: &Id, budget: Budget) -> Result<()> {
-        start_with(id.as_str(), budget, &REAL_STEPS)
+        start_with(id, budget, &REAL_STEPS)
     }
 
     /// Makes ready now what each start or stop in `steps` needs to watch its one `systemctl` under
@@ -262,128 +297,24 @@ impl ServiceManager for Systemd {
     /// still activating, folds the restart into the start already running —
     /// see `request_restart_impl`.
     fn request_restart(&self, id: &Id) -> Option<Result<()>> {
-        let id = id.as_str();
-        Some(require_installed(id).and_then(|_| request_restart_impl(id)))
+        Some(flow::owned(self, id).and_then(|_| request_restart_impl(id.as_str())))
     }
 
     /// The plain request-only start. `restart` never issues it here — see
     /// [`Self::request_restart`] — since after a stop nobody waited for, it
     /// replaces a stop job systemd has not yet run.
     fn request_start_after_stop(&self, id: &Id) -> Result<()> {
-        start_with(id.as_str(), Budget::Immediate, &REAL_STEPS)
+        start_with(id, Budget::Immediate, &REAL_STEPS)
     }
 
     fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
-        stop_with(id.as_str(), budget, &REAL_STEPS)
+        stop_with(id, budget, &REAL_STEPS)
     }
 
     fn kill(&self, id: &Id) -> Result<()> {
-        let id = id.as_str();
-        require_installed(id)?;
-        kill_impl(id)
+        flow::owned(self, id)?;
+        kill_impl(id.as_str())
     }
-
-    fn status(&self, id: &Id) -> Result<Status> {
-        let id = id.as_str();
-        match raw_state(id)? {
-            RawState::Absent => Err(absent_error(id)?),
-            RawState::NotOurs => Err(Error::Foreign {
-                id: id.to_string(),
-                recovery: decide::foreign_recovery(id),
-            }),
-            RawState::Regular(text) => match generate::extract(&text) {
-                Ok(None) => Err(Error::Foreign {
-                    id: id.to_string(),
-                    recovery: decide::foreign_recovery(id),
-                }),
-                // A decode failure must not fabricate a plausible-looking `Status` — see
-                // `ServiceManager::status`'s doc comment.
-                Err(e) => Err(e),
-                Ok(Some(_blob)) => status_from_unit(&unit_name(id)),
-            },
-        }
-    }
-
-    fn list(&self) -> Result<Vec<Installed>> {
-        let scan = scan_host();
-
-        let mut out = Vec::new();
-        for (id, path) in &scan.units {
-            let id = id.as_str();
-
-            // The same classification `status` performs, so the two cannot describe one machine
-            // differently.
-            let text = match classify_and_read(path) {
-                Ok(RawState::Regular(text)) => text,
-                // Established as nothing goetia wrote (a masked unit's symlink, a FIFO, a `.d`
-                // directory, bytes that are not UTF-8): obligations 2 and 3, and foreign entries
-                // are what `list` omits.
-                Ok(RawState::NotOurs) => continue,
-                // Gone between the scan and the open. That settles the *fragment*, not the id —
-                // obligation 7 — so it takes the same question every other fragmentless id gets.
-                Ok(RawState::Absent) => {
-                    out.extend(residue_entry(id));
-                    continue;
-                }
-                // A read that did not complete establishes nothing about the id — least of all that
-                // it is absent, which is what omitting it from the enumeration would say.
-                Err(failure) => {
-                    out.push(Installed::Undetermined {
-                        name: Some(id.to_string()),
-                        reason: failure.detail(),
-                    });
-                    continue;
-                }
-            };
-
-            match generate::extract(&text) {
-                Ok(None) => {} // foreign: `list` reports only what Goetia owns.
-                // A `systemctl show` failure for this one unit must not take down the listing of
-                // every other Goetia-managed service on the host — the same per-entry fault
-                // tolerance the decode-failure arm just below already provides, extended to a
-                // status-query failure instead of a marker-decode failure.
-                Ok(Some(blob)) => match status_from_unit(&unit_name(id)) {
-                    Ok(status) => out.push(Installed::Ours {
-                        spec: blob.spec,
-                        state: status.state,
-                        pid: status.pid,
-                        enabled: status.enabled,
-                    }),
-                    // Not this entry's failure: no manager can be asked about any of them.
-                    Err(e @ Error::NoManager { .. }) => return Err(e),
-                    Err(e) => out.push(Installed::OursUnreadable {
-                        name: id.to_string(),
-                        reason: format!("decoded, but its live state could not be queried: {e}"),
-                    }),
-                },
-                Err(e) => out.push(Installed::OursUnreadable {
-                    name: id.to_string(),
-                    reason: e.to_string(),
-                }),
-            }
-        }
-        // The ids with no fragment of their own. Obligation 7 again: what occupies an id is not the
-        // fragment file, so an id whose *drop-in* could not be read is exactly as unclassified as
-        // one whose fragment could not be — and `status` says so for both.
-        for id in &scan.dropin_only {
-            out.extend(residue_entry(id));
-        }
-        // Last, so a scan that got some way in still reports what it named before what it could
-        // not — the order `cli::support::partition_installed` imposes on the rendered output too.
-        out.extend(scan.incomplete);
-        Ok(out)
-    }
-}
-
-/// What `list` reports for an id with no readable fragment. Both determinate outcomes are reported
-/// by omission, which is why what the scan found is discarded: no residue is an unoccupied id, and
-/// residue under an absent fragment is `Ownership::Foreign`, which `list` leaves out like any other
-/// foreign id. Only a read that did not complete gets an entry, because omission would claim it.
-fn residue_entry(id: &str) -> Option<Installed> {
-    discover::residue_read(id).err().map(|failure| Installed::Undetermined {
-        name: Some(id.to_string()),
-        reason: failure.detail(),
-    })
 }
 
 // start/stop ==========================================================================================================
@@ -392,32 +323,32 @@ fn residue_entry(id: &str) -> Option<Installed> {
 /// — the precedent is `cli::restart`'s `start_clock`. `manager_tests.rs` pins it.
 struct VerbSteps<'a> {
     start_clock: &'a dyn Fn(Budget) -> Deadline,
-    require_installed: &'a dyn Fn(&str) -> Result<String>,
+    owned: &'a dyn Fn(&Id) -> Result<String>,
     start: &'a dyn Fn(&str, Budget, Deadline) -> Result<()>,
     stop: &'a dyn Fn(&str, Budget, Deadline) -> Result<()>,
 }
 
 const REAL_STEPS: VerbSteps<'static> = VerbSteps {
     start_clock: &Budget::start,
-    require_installed: &require_installed,
+    owned: &|id: &Id| flow::owned(&Systemd, id),
     start: &start_impl,
     stop: &stop_impl,
 };
 
-fn start_with(id: &str, budget: Budget, steps: &VerbSteps<'_>) -> Result<()> {
+fn start_with(id: &Id, budget: Budget, steps: &VerbSteps<'_>) -> Result<()> {
     // Derived at verb entry, so discovery spends the budget too. It bounds only the wait for the job,
     // never whether the job is enqueued — see `run_verb`.
     let deadline = (steps.start_clock)(budget);
-    (steps.require_installed)(id)?;
-    (steps.start)(id, budget, deadline)
+    (steps.owned)(id)?;
+    (steps.start)(id.as_str(), budget, deadline)
 }
 
-fn stop_with(id: &str, budget: Budget, steps: &VerbSteps<'_>) -> Result<()> {
+fn stop_with(id: &Id, budget: Budget, steps: &VerbSteps<'_>) -> Result<()> {
     // Derived at verb entry, so discovery spends the budget too. It bounds only the wait for the job,
     // never whether the job is enqueued — see `run_verb`.
     let deadline = (steps.start_clock)(budget);
-    (steps.require_installed)(id)?;
-    (steps.stop)(id, budget, deadline)
+    (steps.owned)(id)?;
+    (steps.stop)(id.as_str(), budget, deadline)
 }
 
 // Enumeration =========================================================================================================
@@ -507,72 +438,36 @@ struct UnitScan {
 /// Enumerate `dir`. A pass that cannot start, or cannot finish, is *reported* rather than
 /// propagated: an `Err` out of `list` would throw away every id this same call already classified
 /// and reach the CLI as an empty document on exit `1`, which is `list` saying the host has no
-/// daemons — the one claim a scan that did not finish cannot support.
-///
-/// `dir` not existing is neither: absence is *established* there, so it is an empty scan with
-/// nothing outstanding — the answer [`ServiceManager::list`]'s doc comment requires of every
-/// backend, and the one launchd already gave for its own missing staging directory.
+/// daemons — the one claim a scan that did not finish cannot support. `dir` not existing is neither:
+/// absence is *established* there. See [`flow::scan`].
 fn scan_unit_dir(dir: &Path) -> UnitScan {
-    match fs::read_dir(dir) {
-        Ok(entries) => collect_units(dir, entries.map(|entry| entry.map(|entry| entry.path()))),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => UnitScan {
-            units: Vec::new(),
-            dropins: Vec::new(),
-            incomplete: None,
-        },
-        Err(e) => UnitScan {
-            units: Vec::new(),
-            dropins: Vec::new(),
-            incomplete: Some(Installed::scan_incomplete(
-                &dir.display().to_string(),
-                &format!("failed to read directory: {e}"),
-            )),
-        },
-    }
-}
-
-/// The pass itself, over an iterator of paths rather than [`fs::read_dir`] directly — which is what
-/// makes the mid-pass fault reachable from a test, since no `readdir` fails on demand. That fault
-/// is the half that matters: everything already collected comes back alongside the aggregate,
-/// rather than being discarded because a *later* dirent could not be read.
-fn collect_units(dir: &Path, entries: impl Iterator<Item = io::Result<PathBuf>>) -> UnitScan {
     let mut units = Vec::new();
     let mut dropins = Vec::new();
-    for entry in entries {
-        let path = match entry {
-            Ok(path) => path,
-            Err(e) => {
-                return UnitScan {
-                    units,
-                    dropins,
-                    incomplete: Some(Installed::scan_incomplete(
-                        &dir.display().to_string(),
-                        &format!("failed to read a directory entry: {e}"),
-                    )),
-                };
+    let incomplete = flow::scan(
+        &dir.display().to_string(),
+        fs::read_dir(dir),
+        |entries| Box::new(entries.map(|entry| entry.map(|entry| entry.path()))),
+        |op, e| format!("failed to {op} the directory: {e}"),
+        |path: PathBuf| {
+            // Lossy: a non-UTF-8 unit name still has to be reported, and every read goes through
+            // `path` itself rather than through this rendering of it.
+            let Some(file_name) = path.file_name().map(|name| name.to_string_lossy().into_owned()) else {
+                return;
+            };
+            // The name alone, with nothing stat'd: a drop-in directory that is not one — the regular
+            // file `install_refuses_an_unreadable_dropin_over_our_own_fragment` seeds, whose
+            // `read_dir` answers `ENOTDIR` for every uid — is exactly an id this pass must not drop.
+            if let Some(id) = file_name.strip_suffix(".service.d") {
+                dropins.push(id.to_string());
+            } else if let Some(id) = file_name.strip_suffix(".service") {
+                units.push((id.to_string(), path));
             }
-        };
-        // Lossy, exactly as before: a non-UTF-8 unit name still has to be reported, and every read
-        // below goes through `path` itself rather than through this rendering of it.
-        let Some(file_name) = path.file_name().map(|name| name.to_string_lossy().into_owned()) else {
-            continue;
-        };
-        // The name alone, with nothing stat'd: a drop-in directory that is not one — the regular
-        // file `install_refuses_an_unreadable_dropin_over_our_own_fragment` seeds, whose `read_dir`
-        // answers `ENOTDIR` for every uid — is exactly an id this pass must not drop.
-        if let Some(id) = file_name.strip_suffix(".service.d") {
-            dropins.push(id.to_string());
-            continue;
-        }
-        let Some(id) = file_name.strip_suffix(".service") else {
-            continue;
-        };
-        units.push((id.to_string(), path));
-    }
+        },
+    );
     UnitScan {
         units,
         dropins,
-        incomplete: None,
+        incomplete,
     }
 }
 

@@ -12,10 +12,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use goetia::backend::Identity;
+use goetia::backend::systemd::generate;
 use goetia::backend::systemd::manager::Systemd;
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, Installed, ServiceManager, State, conformance};
-use goetia::spec::{DaemonSpec, Id, Kind, Restart, User};
+use goetia::spec::{AccountId, DaemonSpec, Id, Kind, Restart, User};
 
 use crate::support::{self, ELEVATED, ServiceGuard, cmd};
 
@@ -1364,6 +1366,68 @@ fn status_does_not_call_an_id_with_a_stray_dropin_not_installed() {
     assert!(
         matches!(err, goetia::Error::Foreign { .. }),
         "must not be NotInstalled: {err:?}"
+    );
+}
+
+/// The refusal for an id with no fragment names what is left, so the user has the paths to remove
+/// without hunting for them: the same text `install`'s refusal would need, now pinned for `status`.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn status_of_residue_names_the_leftover_paths() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    write_dropin(guard.id());
+
+    let err = Systemd::new()
+        .status(&Id::try_from(guard.id().to_string()).expect("valid id"))
+        .expect_err("a stray drop-in is not a reportable daemon");
+    let goetia::Error::Foreign { recovery, .. } = &err else {
+        panic!("residue is foreign, not absent and not undetermined: {err:?}");
+    };
+    assert!(
+        recovery.contains(&dropin_dir(guard.id()).display().to_string()),
+        "the recovery must name the leftover directory: {recovery}"
+    );
+}
+
+/// A fragment goetia wrote for a spec naming a Windows account (a SID) carries goetia's marker, so
+/// it is goetia's, but the systemd backend cannot render that spec: it is `OursUnreadable` in `list`
+/// and an error in `status`, never a plausible-looking running daemon.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn list_reports_a_sid_account_as_ours_unreadable() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let mut spec = mk(guard.id());
+    spec.user = User::Id(AccountId::Sid("S-1-5-21-1-2-3-1001".to_string()));
+    let text = generate::unit(&spec, &Identity { user: "0".to_string() });
+    fs::write(unit_path(guard.id()), text).expect("seed a unit whose spec names a SID");
+    cmd::run("systemctl", &["daemon-reload"]).expect_ok();
+    let cannot_render = "a Windows account id (SID) is not a valid user for the systemd backend";
+
+    let mgr = Systemd::new();
+    let listed = mgr
+        .list()
+        .expect("one unrenderable unit must not take down the listing");
+    let reason = listed
+        .iter()
+        .find_map(|entry| match entry {
+            Installed::OursUnreadable { name, reason } if name == guard.id() => Some(reason),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("a marked fragment is ours even when its spec cannot be rendered: {listed:?}"));
+    assert_eq!(
+        *reason,
+        format!("marked ours, but its embedded spec cannot be regenerated: {cannot_render}")
+    );
+
+    let err = mgr
+        .status(&Id::try_from(guard.id().to_string()).expect("valid id"))
+        .expect_err("a spec that cannot be rendered has no status to report");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "`{}`'s embedded spec cannot be regenerated: {cannot_render}",
+            guard.id()
+        )
     );
 }
 

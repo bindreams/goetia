@@ -117,8 +117,8 @@ fn restore_or_chain(backup_path: &Path, final_path: &Path, primary: Error) -> Er
 // quarantine_if_still_ours / restore_quarantine =======================================================================
 
 /// Rename `unit_path(id)` to a private, per-attempt-unique backup name, then confirm the moved file's
-/// content is still exactly `expected_text` — the same content `discover`/`require_installed`
-/// classified as ours. If it is not (or the path no longer exists at all), the backup is restored to
+/// content is still exactly `expected_text` — the same content `discover::read`
+/// found marked. If it is not (or the path no longer exists at all), the backup is restored to
 /// where it came from and this returns `Ok(None)`: something changed after classification, which the
 /// caller must treat as a race, not a license to keep going. On a match, `Ok(Some(backup_path))` — the
 /// verified former occupant, now safely out of the way for the caller to finish with (replace it with
@@ -137,7 +137,7 @@ fn restore_or_chain(backup_path: &Path, final_path: &Path, primary: Error) -> Er
 /// grow the read buffer without bound; a directory fails with `EISDIR`, stranding it under the
 /// hidden quarantine name since `restore_quarantine`'s `link` then also fails; a symlink would be
 /// silently followed, unlike every other read in this module). None of those is something a fragment
-/// `discover` ever classified as `Ours` could have been, so any of them showing up here is itself
+/// `discover::read` ever found marked could have been, so any of them showing up here is itself
 /// proof of a race — treated exactly like a content mismatch. Bytes that will not decode arrive in
 /// the same arm and get the same answer: `expected_text` is UTF-8 by construction, so they cannot be
 /// the file this was asked to verify.

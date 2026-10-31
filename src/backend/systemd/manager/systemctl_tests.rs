@@ -232,7 +232,7 @@ const ANNOUNCES_THEN_BLOCKS: &str =
     "touch \"$0\"; echo 'Enqueued anchor job 1 x.service/start.' >&2; exec sleep 2147483647";
 
 /// The bounded path waits on the `deadline` it is handed — derived at verb entry, so it already
-/// covers `require_installed`'s scan and the spawn — never on one re-derived from `budget`.
+/// covers `flow::owned`'s read and the spawn — never on one re-derived from `budget`.
 ///
 /// The child cannot exit on its own and the deadline is spent, so `Expired` is the only answer and
 /// no timing is bet on. `Bounded(Duration::MAX)` is what makes a re-derivation fail: it overflows

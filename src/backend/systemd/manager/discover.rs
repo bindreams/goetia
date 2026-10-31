@@ -1,5 +1,6 @@
-//! Classifying what's currently at an id: reading the fragment, folding in any drop-in drift, and
-//! turning that into the [`Ownership`] `decide` needs.
+//! Reading what's currently at an id: the fragment, what else systemd applies to the id, and the
+//! drop-in drift folded into the text `decide` compares. [`crate::manager::flow`] turns these reads
+//! into the ownership `decide` needs.
 //!
 //! # What counts as this id's artifact
 //!
@@ -35,10 +36,11 @@ use nix::fcntl::{OFlag, openat};
 use nix::sys::stat::Mode;
 
 use crate::backend::systemd::generate;
-use crate::decide::{self, ExternalConfig, Ownership};
+use crate::backend::{InstalledDefinition, ReadOutcome};
+use crate::decide::ExternalConfig;
 use crate::error::{Error, Result};
 
-use super::{UNIT_DIR, identity_for, io_err, unit_path};
+use super::{UNIT_DIR, io_err, unit_path};
 
 // ReadFailure =========================================================================================================
 
@@ -49,8 +51,8 @@ use super::{UNIT_DIR, identity_for, io_err, unit_path};
 /// was found, a failed read leaves goetia unable to say whether *anything* is installed
 /// ([`Error::Undetermined`]). On the path where the fragment has already been opened, read and had
 /// its `[X-Goetia]` marker decoded, the same failure leaves an id goetia demonstrably owns merely
-/// impossible to report on ([`Ownership::OursUnreadable`]). A reader that picked one class for all
-/// its callers would put that claim on the other's id — which is exactly the rule
+/// impossible to report on ([`crate::decide::Ownership::OursUnreadable`]). A reader that picked one
+/// class for all its callers would put that claim on the other's id — which is exactly the rule
 /// [`Error::Undetermined`] exists to enforce: choose by what was established, never by what failed.
 #[derive(Debug)]
 pub(super) struct ReadFailure {
@@ -87,7 +89,7 @@ impl ReadFailure {
 
     /// The reading for a caller that already knows goetia owns the id, so "unreadable" is a true
     /// statement about it: `super::write::quarantine_if_still_ours`, which reaches this only after
-    /// `discover`/`require_installed` classified the fragment as ours.
+    /// `read` found the fragment marked.
     pub(super) fn into_io_error(self) -> Error {
         io_err(self.op, &self.path, self.source)
     }
@@ -296,120 +298,76 @@ pub(super) fn raw_state(id: &str) -> Result<RawState> {
     classify_and_read(&unit_path(id)).map_err(|failure| failure.undetermined(id))
 }
 
-// Discovery / discover ================================================================================================
+// read / installed ====================================================================================================
 
-/// What `install`/`preview_install` classified at `id`: an [`Ownership`] plus everything specific to
-/// this backend that `decide` cannot see on its own.
-pub(super) struct Discovery {
-    pub(super) ownership: Ownership,
-    /// The fragment's own raw text — distinct from `Ownership::Ours`'s `on_disk`, which has a drop-in
-    /// marker folded in — present iff `ownership` came from a regular file (`Ours` or `OursUnreadable`).
-    /// Used to verify identity before a later write/removal touches this exact fragment; see
-    /// `super::write::quarantine_if_still_ours`. Content, not inode, is the identity that matters
-    /// here: an inode number can be reused by the kernel moments after its file is unlinked, so two
-    /// genuinely different files can share one.
-    pub(super) fragment_text: Option<String>,
-    /// What systemd's drop-in search directories currently hold for this id — obligation 3.
-    /// `decide` cannot see this: its vocabulary is artifact *text*, and this is filesystem structure
-    /// alongside it.
-    pub(super) external: ExternalConfig,
-}
-
-pub(super) fn discover(id: &str) -> Result<Discovery> {
-    match raw_state(id)? {
-        RawState::Absent => match residue(id).map_err(|failure| failure.undetermined(id))? {
-            None => Ok(Discovery {
-                ownership: Ownership::Absent,
-                fragment_text: None,
-                external: ExternalConfig::Absent,
-            }),
-            // A drop-in directory or an enablement link with no fragment at all: never silently
-            // adopt it as `Create`, or the resulting unit inherits overrides and boot-enrollment
-            // goetia never wrote and cannot show — refuse it the same way any other pre-existing,
-            // unmarked artifact is refused.
-            Some(residue) => Ok(Discovery {
-                ownership: Ownership::Foreign,
-                fragment_text: None,
-                external: dropin_external_config(id, &residue.dropin),
-            }),
-        },
-        RawState::NotOurs => Ok(Discovery {
-            ownership: Ownership::Foreign,
-            fragment_text: None,
-            external: ExternalConfig::Absent,
-        }),
-        RawState::Regular(text) => {
-            // Obligation 3: fold any drop-in content into the text `decide` compares, without ever
-            // writing that folded text back. Neither `desired` nor `regenerated` (both pure
-            // `generate()` output) can ever contain this marker, so a non-empty drop-in forces
-            // `Conflict` whenever `decide` reaches a text comparison at all — the one branch that
-            // doesn't (a stale version, checked before any text comparison) is `decide::decide`'s own
-            // `external` parameter's job.
-            match dropin_dirs(id) {
-                Ok(dirs) => {
-                    let marker: String = dirs.iter().map(|(_, text)| text.as_str()).collect();
-                    Ok(Discovery {
-                        ownership: classify_fragment(id, &text, format!("{text}{marker}")),
-                        external: dropin_external_config(id, &dirs),
-                        fragment_text: Some(text),
-                    })
-                }
-                // Installation is established (the fragment is open and read) and so is ownership
-                // (its marker is decoded, or demonstrably absent), so [`Error::Undetermined`] —
-                // "cannot determine whether daemon `X` is installed" — would deny two facts about an
-                // id goetia just decoded. What the failed read actually costs is the ability to
-                // report on the id, which is what `Ownership::OursUnreadable` says.
-                Err(failure) => Ok(Discovery {
-                    ownership: if matches!(classify_fragment(id, &text, text.clone()), Ownership::Foreign) {
-                        // Established by the fragment's own missing marker, and untouched by a
-                        // drop-in nobody could read: `Foreign` refuses on the absent marker alone.
-                        Ownership::Foreign
-                    } else {
-                        Ownership::OursUnreadable {
-                            reason: format!(
-                                "a drop-in directory could not be read, so what systemd applies to it cannot be \
-                                 compared: {}",
-                                failure.detail()
-                            ),
-                            recovery: None,
-                        }
-                    },
-                    fragment_text: Some(text),
-                    // Unknown, and unread: `decide` consults the external configuration only on the
-                    // `Ours` path, which neither arm above can reach.
-                    external: ExternalConfig::Absent,
-                }),
-            }
-        }
-    }
-}
-
-/// Ownership comes from the fragment alone, never from a drop-in: the marker is already in `text`.
-/// `on_disk` is the text `decide` compares, which only [`Ownership::Ours`] keeps.
-fn classify_fragment(id: &str, text: &str, on_disk: String) -> Ownership {
-    match generate::extract(text) {
-        Ok(None) => Ownership::Foreign,
-        Ok(Some(blob)) => match identity_for(&blob.spec.user) {
-            Ok(identity) => {
-                let regenerated = generate::unit(&blob.spec, &identity);
-                Ownership::Ours {
-                    blob,
-                    regenerated,
-                    on_disk,
-                }
-            }
-            // An embedded spec naming a SID user is not decodable into anything this backend
-            // can regenerate — surfaced the same way any other blob invariant violation is.
-            Err(e) => Ownership::OursUnreadable {
-                reason: e.to_string(),
-                recovery: Some(decide::unreadable_recovery(id)),
+/// What `raw` says about `id`: a marked fragment is [`ReadOutcome::Marked`] with its text as the
+/// snapshot, and a missing one is asked what else occupies the id ([`fragmentless`]).
+fn classified(id: &str, raw: RawState) -> ReadResult<ReadOutcome<String>> {
+    Ok(match raw {
+        RawState::Absent => return fragmentless(id),
+        RawState::NotOurs => ReadOutcome::Foreign { recovery: None },
+        RawState::Regular(text) => match generate::extract(&text) {
+            Ok(None) => ReadOutcome::Foreign { recovery: None },
+            Ok(Some(blob)) => ReadOutcome::Marked {
+                blob: Ok(blob),
+                snapshot: text,
+            },
+            Err(e) => ReadOutcome::Marked {
+                blob: Err(e),
+                snapshot: text,
             },
         },
-        Err(e) => Ownership::OursUnreadable {
-            reason: e.to_string(),
-            recovery: Some(decide::unreadable_recovery(id)),
+    })
+}
+
+/// What `Backend::read` answers for `id`. The fragment's own text is the snapshot: content, not
+/// inode, is the identity a later write or removal verifies against (see
+/// `super::write::quarantine_if_still_ours`), since the kernel can reuse an inode number moments
+/// after its file is unlinked.
+pub(super) fn read(id: &str) -> Result<ReadOutcome<String>> {
+    classified(id, raw_state(id)?).map_err(|failure| failure.undetermined(id))
+}
+
+/// [`read`] for a fragment `Systemd::scan` found at `path`. The failure stays a [`ReadFailure`]: the
+/// scan reports it by name, where `read` makes it an [`Error::Undetermined`].
+pub(super) fn read_at(id: &str, path: &Path) -> ReadResult<ReadOutcome<String>> {
+    classify_and_read(path).and_then(|raw| classified(id, raw))
+}
+
+/// `id` read with no fragment of its own: absent when nothing occupies it, foreign when a drop-in or
+/// an enablement link does. Such an id is never silently adopted as `Create`, or the resulting unit
+/// would inherit overrides and boot-enrollment goetia never wrote and cannot show.
+pub(super) fn fragmentless(id: &str) -> ReadResult<ReadOutcome<String>> {
+    Ok(match residue(id)? {
+        None => ReadOutcome::Absent,
+        Some(residue) => ReadOutcome::Foreign {
+            recovery: Some(residue_recovery(id, &residue)),
         },
-    }
+    })
+}
+
+/// The fragment `text` of a marked `id` with the drop-in content folded in, and what systemd's
+/// drop-in directories hold for it — obligation 3. The fold is only what `decide` compares: neither
+/// `desired` nor `regenerated` (both pure `generate()` output) can contain its marker, so a
+/// non-empty drop-in forces `Conflict` whenever `decide` reaches a text comparison at all. The one
+/// branch that doesn't (a stale version, checked before any text comparison) is `decide::decide`'s
+/// own `external` parameter's job.
+///
+/// A drop-in that could not be read is `Error::Other`, never [`Error::Undetermined`]: the fragment
+/// is open and its marker decoded, so installation and ownership are both established, and what the
+/// failed read costs is the ability to report on the id.
+pub(super) fn installed(id: &str, text: &str) -> Result<InstalledDefinition<String>> {
+    let dirs = dropin_dirs(id).map_err(|failure| {
+        Error::Other(format!(
+            "a drop-in directory could not be read, so what systemd applies to it cannot be compared: {}",
+            failure.detail()
+        ))
+    })?;
+    let marker: String = dirs.iter().map(|(_, text)| text.as_str()).collect();
+    Ok(InstalledDefinition {
+        definition: format!("{text}{marker}"),
+        external: dropin_external_config(id, &dirs),
+    })
 }
 
 // undetermined ========================================================================================================
@@ -417,8 +375,9 @@ fn classify_fragment(id: &str, text: &str, on_disk: String) -> Ownership {
 /// The error for a failed read that was supposed to tell this backend whether anything is at `id`:
 /// the fragment's own open/read ([`raw_state`]), and — where that found no fragment — the drop-in
 /// scan and the `.wants` link stat ([`residue`]). Never for a read that failed *after* the fragment
-/// was decoded: see [`ReadFailure`] and `discover`'s `RawState::Regular` arm, which has established
-/// both the installation and its ownership by then and reports `Ownership::OursUnreadable` instead.
+/// was decoded: see [`ReadFailure`] and [`installed`], which has established both the installation
+/// and its ownership by then and reports a drop-in it cannot read as `Ownership::OursUnreadable`
+/// instead.
 ///
 /// [`Error::Undetermined`], never [`io_err`]'s `Error::Other`: `Other` reaches
 /// `cli::report::status_error`'s catch-all as `Kind::Unreadable`, which *asserts* that goetia owns
@@ -523,7 +482,7 @@ fn dropin_recovery(unclearable: &[&Path]) -> String {
 
 /// `<id>.service.d`'s `*.conf` files under every root in [`DROPIN_SEARCH_DIRS`], per directory so a
 /// caller that has to *name* them for a human ([`residue`], [`dropin_recovery`]) and one that has to
-/// *compare their content* ([`discover`]) cannot drift on which files count as drop-ins. One scan
+/// *compare their content* ([`installed`]) cannot drift on which files count as drop-ins. One scan
 /// for all of them: what is this id's artifact and what occupies this id are the same set of
 /// directories, which is what keeps `install` and `uninstall` from describing one filesystem state
 /// differently. Only that directory name: see the module doc comment for the family-wide ones
@@ -624,13 +583,12 @@ impl Residue {
 /// What is left at `id` besides the fragment, `None` when the id is genuinely unoccupied, or a
 /// [`ReadFailure`] when a read this answer depends on did not complete. What that failure *means*
 /// stays the caller's, as everywhere else in this module: [`Error::Undetermined`] for the verbs
-/// (see [`undetermined`]), a named `Installed::Undetermined` entry for `Systemd::list` (see
-/// [`residue_read`]).
+/// (see [`undetermined`]), a named `Installed::Undetermined` entry for `Systemd::scan`.
 ///
-/// The single source of "is this id really empty" for both [`discover`] (so `install` never
-/// silently adopts what it did not write) and [`require_installed`] (so `uninstall` never reports
-/// [`Error::NotInstalled`] — which the CLI renders as success, exit `0` — for an id that still has
-/// something on it). Two verbs answering that question from different evidence is exactly how
+/// The single source of "is this id really empty" for [`fragmentless`], which every verb and `scan`
+/// read an id with no fragment through: `install` never silently adopts what it did not write, and
+/// `uninstall` never reports [`Error::NotInstalled`] — which the CLI renders as success, exit `0` —
+/// for an id that still has something on it. Two verbs answering that question from different evidence is exactly how
 /// `uninstall x && echo "confirmed gone"` came to print for a unit still loaded, still running and
 /// still `.wants`-linked.
 fn residue(id: &str) -> ReadResult<Option<Residue>> {
@@ -652,36 +610,6 @@ fn residue(id: &str) -> ReadResult<Option<Residue>> {
     Ok(Some(Residue { dropin, links }))
 }
 
-/// The [`residue`] reads on their own, for `Systemd::list`: `Err` exactly when what would have
-/// settled whether anything occupies `id` did not complete.
-///
-/// What the scan *found* is not `list`'s business — residue under an absent fragment is
-/// `Ownership::Foreign` (see [`discover`]), and `list` omits foreign ids the same as it omits an
-/// unoccupied one. The *failure* is, and for the reason the whole class exists: leaving the id out
-/// of the enumeration is how a listing says it is not there, and this read established no such
-/// thing. `Systemd::status` answers [`Error::Undetermined`] off the identical failure, so this is
-/// also what keeps the two from describing one filesystem state differently.
-pub(super) fn residue_read(id: &str) -> ReadResult<()> {
-    residue(id).map(drop)
-}
-
-/// The error for an id whose fragment [`raw_state`] found absent: [`Error::NotInstalled`] only when
-/// nothing goetia-attributable is there at all, [`Error::Foreign`] otherwise — or, when the scan
-/// itself could not be completed, [`residue`]'s own [`Error::Undetermined`], which claims neither.
-/// Every verb that has to
-/// answer "is anything at this id" — [`require_installed`] for the mutating ones, `Systemd::status`
-/// for the read-only one — goes through here, so none of them can disagree with [`discover`] about
-/// one filesystem state.
-pub(super) fn absent_error(id: &str) -> Result<Error> {
-    Ok(match residue(id).map_err(|failure| failure.undetermined(id))? {
-        None => Error::NotInstalled { id: id.to_string() },
-        Some(residue) => Error::Foreign {
-            id: id.to_string(),
-            recovery: residue_recovery(id, &residue),
-        },
-    })
-}
-
 /// How to empty an id whose fragment is gone but whose [`Residue`] is not. Goetia removes none of
 /// it itself: `<id>.service.d` in `/run` or `/usr/lib` — and, for that matter, in `/etc` — is just
 /// as plausibly an administrator's override of a unit *shipped elsewhere* as it is goetia's own
@@ -699,36 +627,6 @@ fn residue_recovery(id: &str, residue: &Residue) -> String {
          enablement link and a drop-in directory has to go by hand. Then run `systemctl \
          daemon-reload` and re-run."
     )
-}
-
-// require_installed ===================================================================================================
-
-/// The narrower "is this even ours" gate every verb but `install` needs: the marker alone is proof of
-/// ownership, matching [`crate::manager::fake::Fake`]'s `require_ours` (an undecodable blob still
-/// passes — `uninstall`'s recovery text names exactly that verb as the way out). Returns the
-/// fragment's own text for a caller that goes on to remove or replace it — see
-/// `super::write::quarantine_if_still_ours`.
-///
-/// [`Error::NotInstalled`] means *nothing goetia-attributable is at this id*, not merely "the
-/// fragment file is missing": `cli::uninstall` maps that one variant to exit `0` and "nothing to
-/// do", so anything narrower would report success over a residual artifact — and would disagree
-/// with [`discover`], which refuses the identical filesystem state as `Ownership::Foreign`. See
-/// [`residue`].
-pub(super) fn require_installed(id: &str) -> Result<String> {
-    match raw_state(id)? {
-        RawState::Absent => Err(absent_error(id)?),
-        RawState::NotOurs => Err(Error::Foreign {
-            id: id.to_string(),
-            recovery: crate::decide::foreign_recovery(id),
-        }),
-        RawState::Regular(text) => match generate::extract(&text) {
-            Ok(None) => Err(Error::Foreign {
-                id: id.to_string(),
-                recovery: crate::decide::foreign_recovery(id),
-            }),
-            Ok(Some(_)) | Err(_) => Ok(text),
-        },
-    }
 }
 
 #[cfg(test)]

@@ -591,7 +591,7 @@ thread_local! {
 /// of the budget. Scopes nest and end in any order; the answer is forgotten when the last one ends,
 /// so nothing outlives the invocation that opened them, and a manager that changes between two is
 /// asked again.
-pub(super) struct GateScope {
+pub(crate) struct GateScope {
     this_thread: PhantomData<*const ()>,
 }
 
