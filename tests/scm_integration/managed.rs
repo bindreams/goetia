@@ -1142,6 +1142,7 @@ fn install_refuses_an_always_blob_as_unreadable() {
         panic!("expected RefuseUnreadable for an always blob, got {outcome:?}");
     };
     assert!(reason.contains("restart: always"), "{reason}");
+    let recovery = recovery.as_deref().expect("a refused blob carries a recovery");
     assert!(
         recovery.contains(&format!("goetia daemon uninstall {id}")),
         "{recovery}"

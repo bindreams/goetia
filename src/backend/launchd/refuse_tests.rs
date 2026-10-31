@@ -130,7 +130,7 @@ fn outcomes_that_write_nothing_over_an_installed_plist_do_not() {
         },
         Outcome::RefuseUnreadable {
             reason: String::new(),
-            recovery: String::new(),
+            recovery: Some(String::new()),
         },
     ] {
         assert!(!changes_loaded_job(&outcome, Some(&on_disk), &desired), "{outcome:?}");

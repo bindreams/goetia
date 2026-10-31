@@ -250,8 +250,12 @@ fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn
             OutcomeClass::Refused
         }
         Outcome::RefuseUnreadable { reason, recovery } => {
-            let _ = writeln!(out, "{id}: refused: {reason}. {recovery}");
-            let _ = writeln!(err, "error: {id}: refused: {reason}. {recovery}");
+            let line = match recovery {
+                Some(recovery) => format!("{id}: refused: {reason}. {recovery}"),
+                None => format!("{id}: refused: {reason}"),
+            };
+            let _ = writeln!(out, "{line}");
+            let _ = writeln!(err, "error: {line}");
             OutcomeClass::Refused
         }
     }

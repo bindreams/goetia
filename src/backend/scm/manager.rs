@@ -135,14 +135,13 @@ impl ServiceManager for ScmManager {
         let d = discover(spec)?;
         let outcome = decide::decide(
             &d.found,
-            d.on_disk.as_deref(),
             &d.desired,
             spec,
             crate::version(),
             force,
             // SCM has no drop-in mechanism: everything Goetia writes lives
             // under the service's own key.
-            &decide::Overlay::default(),
+            &decide::ExternalConfig::Absent,
         );
         match outcome {
             Outcome::Create | Outcome::Update { .. } | Outcome::Stale { .. } => {
@@ -157,13 +156,12 @@ impl ServiceManager for ScmManager {
         let d = discover(spec)?;
         Ok(decide::decide(
             &d.found,
-            d.on_disk.as_deref(),
             &d.desired,
             spec,
             crate::version(),
             false,
             // SCM has no drop-in mechanism; see the `install` call site.
-            &decide::Overlay::default(),
+            &decide::ExternalConfig::Absent,
         ))
     }
 
@@ -429,7 +427,6 @@ struct Discovery {
     reg: ScmRegistration,
     desired: String,
     found: Ownership,
-    on_disk: Option<String>,
     /// `Some(dwStartType)` when the service already exists — threaded into
     /// `apply`'s update path so a routine spec-driven `ChangeServiceConfigW`
     /// preserves whatever `enable`/`disable` last set, rather than
@@ -467,8 +464,8 @@ fn discover(spec: &DaemonSpec) -> Result<Discovery> {
 
     let scm = open_scm_to_classify(spec.id.as_str())?;
     let existing = scm.open_service(spec.id.as_str(), ServiceAccess::QUERY_CONFIG);
-    let (found, on_disk, current_start_type) = match existing {
-        Err(e) if is_not_found(&e) => (Ownership::Absent, None, None),
+    let (found, current_start_type) = match existing {
+        Err(e) if is_not_found(&e) => (Ownership::Absent, None),
         // Upstream of the marker, exactly as in `open_existing`: `install` and
         // `diff` must reach the same verdict about one service as `status`
         // does, or two subcommands disagree about one machine.
@@ -481,10 +478,13 @@ fn discover(spec: &DaemonSpec) -> Result<Discovery> {
         }
         Ok(service) => {
             let params = registry::read_parameters(spec.id.as_str())?;
-            let found = classify(&params);
-            let (live, start_type) = read_live_registration(&service, spec.id.as_str(), &params)
-                .map_err(|e| drift_read_failure(&found, &spec.id, e))?;
-            (found, Some(generate::render(&live)), Some(start_type))
+            let (live, start_type) = match read_live_registration(&service, spec.id.as_str(), &params) {
+                Ok(read) => read,
+                // `drift_read_failure` looks at the marker alone, which does not depend on the text
+                // that could not be read.
+                Err(e) => return Err(drift_read_failure(&classify(&params, &spec.id, ""), &spec.id, e)),
+            };
+            (classify(&params, &spec.id, &generate::render(&live)), Some(start_type))
         }
     };
 
@@ -492,20 +492,23 @@ fn discover(spec: &DaemonSpec) -> Result<Discovery> {
         reg,
         desired,
         found,
-        on_disk,
         current_start_type,
     })
 }
 
 /// Classify what's under `Services\<id>\Parameters`, exactly as `discover`
-/// needs it for [`decide::decide`]. A blob that decodes but whose account
+/// needs it for [`decide::decide`]; `on_disk` is the live registration's text,
+/// which only [`Ownership::Ours`] keeps. A blob that decodes but whose account
 /// can no longer be resolved (e.g. `user.id` names a SID for an account
 /// since deleted) is [`Ownership::OursUnreadable`]: `decide` cannot compute
 /// `regenerated` without a working `Identity`, so this backend genuinely
 /// cannot regenerate that spec on this host — the same situation a future
 /// schema or bit-rotted blob puts it in. So is a blob the generator refuses,
 /// such as one that says `restart: always`.
-fn classify(params: &BTreeMap<String, String>) -> Ownership {
+///
+/// A blob that will not decode, or one the generator refuses, carries the
+/// `uninstall` recovery; an account that no longer resolves carries none.
+fn classify(params: &BTreeMap<String, String>, id: &Id, on_disk: &str) -> Ownership {
     match generate::extract(params) {
         Ok(None) => Ownership::Foreign,
         Ok(Some(blob)) => match identity::resolve(&blob.spec.user) {
@@ -513,14 +516,22 @@ fn classify(params: &BTreeMap<String, String>) -> Ownership {
                 Ok(blob_reg) => Ownership::Ours {
                     regenerated: generate::render(&blob_reg),
                     blob,
+                    on_disk: on_disk.to_owned(),
                 },
-                Err(e) => Ownership::OursUnreadable { reason: e.to_string() },
+                Err(e) => Ownership::OursUnreadable {
+                    reason: e.to_string(),
+                    recovery: Some(decide::unreadable_recovery(id.as_str())),
+                },
             },
             Err(e) => Ownership::OursUnreadable {
                 reason: format!("cannot resolve the account the embedded spec was installed for: {e}"),
+                recovery: None,
             },
         },
-        Err(e) => Ownership::OursUnreadable { reason: e.to_string() },
+        Err(e) => Ownership::OursUnreadable {
+            reason: e.to_string(),
+            recovery: Some(decide::unreadable_recovery(id.as_str())),
+        },
     }
 }
 

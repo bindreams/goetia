@@ -28,7 +28,7 @@
 //!    [`discover::dropin_dirs`] folds `<id>.service.d`'s `*.conf` contents — across every root of
 //!    systemd's system unit search path, `/etc/systemd/system.control` included — into the text
 //!    handed to `decide` (never into what is actually written); `decide::decide`'s own
-//!    `foreign_overlay` parameter — never a backend-local override of its `Outcome` — closes the one
+//!    `external` parameter — never a backend-local override of its `Outcome` — closes the one
 //!    branch the folded text can't reach on its own (a stale artifact, whose version-mismatch check
 //!    fires before any text comparison at all). Every successful write clears goetia's own
 //!    `UNIT_DIR/<id>.service.d`, so a resolved conflict there cannot wedge the id in permanent
@@ -119,15 +119,7 @@ impl ServiceManager for Systemd {
         // bounded by actual system state, not a chosen number of attempts.
         loop {
             let d = discover(spec.id.as_str())?;
-            let outcome = decide::decide(
-                &d.ownership,
-                d.on_disk.as_deref(),
-                &desired,
-                spec,
-                crate::version(),
-                force,
-                &d.overlay,
-            );
+            let outcome = decide::decide(&d.ownership, &desired, spec, crate::version(), force, &d.external);
 
             match &outcome {
                 Outcome::Create => {
@@ -174,12 +166,11 @@ impl ServiceManager for Systemd {
         // Always previewed without `force` — see the trait doc comment.
         Ok(decide::decide(
             &d.ownership,
-            d.on_disk.as_deref(),
             &desired,
             spec,
             crate::version(),
             false,
-            &d.overlay,
+            &d.external,
         ))
     }
 

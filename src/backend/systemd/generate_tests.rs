@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::*;
-use crate::decide::{Outcome, Overlay, Ownership, decide};
+use crate::decide::{ExternalConfig, Outcome, Ownership, decide};
 use crate::spec::{Id, Kind, User};
 
 // Fixtures ============================================================================================================
@@ -199,13 +199,16 @@ fn a_unit_written_by_an_older_goetia_is_stale_not_a_conflict() {
 
     let regenerated = unit(&blob.spec, &id);
     let outcome = decide(
-        &Ownership::Ours { blob, regenerated },
-        Some(on_disk.as_str()),
+        &Ownership::Ours {
+            blob,
+            regenerated,
+            on_disk,
+        },
         &today,
         &spec,
         crate::version(),
         false,
-        &Overlay::default(),
+        &ExternalConfig::Absent,
     );
 
     assert_eq!(

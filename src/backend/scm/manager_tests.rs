@@ -147,6 +147,7 @@ fn a_failed_drift_read_over_a_foreign_service_stays_foreign() {
     let over_ours = drift_read_failure(
         &Ownership::OursUnreadable {
             reason: "a newer schema".to_string(),
+            recovery: None,
         },
         &id,
         failure(),

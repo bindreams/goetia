@@ -415,12 +415,11 @@ fn read_artifact(path: &Path, id: &str) -> Result<String> {
 }
 
 /// What [`install`](ServiceManager::install) needs to decide anything:
-/// [`decide::decide`]'s three inputs, plus the location discovery already
-/// had to read to produce them (so a subsequent write does not have to
+/// [`decide::decide`]'s input, plus the location discovery already
+/// had to read to produce it (so a subsequent write does not have to
 /// re-derive it).
 struct Discovery {
     found: Ownership,
-    on_disk: Option<String>,
     location: Option<Location>,
 }
 
@@ -441,7 +440,6 @@ fn discover(id: &str) -> Result<Discovery> {
     let Some(location) = locate(id)? else {
         return Ok(Discovery {
             found: Ownership::Absent,
-            on_disk: None,
             location: None,
         });
     };
@@ -452,14 +450,20 @@ fn discover(id: &str) -> Result<Discovery> {
             Ok(account) => Ownership::Ours {
                 regenerated: generate::plist(&blob.spec, &account.identity()),
                 blob,
+                on_disk: text,
             },
-            Err(e) => Ownership::OursUnreadable { reason: e.to_string() },
+            Err(e) => Ownership::OursUnreadable {
+                reason: e.to_string(),
+                recovery: None,
+            },
         },
-        Err(e) => Ownership::OursUnreadable { reason: e.to_string() },
+        Err(e) => Ownership::OursUnreadable {
+            reason: e.to_string(),
+            recovery: Some(decide::unreadable_recovery(id)),
+        },
     };
     Ok(Discovery {
         found,
-        on_disk: Some(text),
         location: Some(location),
     })
 }
@@ -1233,7 +1237,6 @@ impl LaunchdManager {
         let discovery = discover(spec.id.as_str())?;
         let outcome = decide::decide(
             &discovery.found,
-            discovery.on_disk.as_deref(),
             &desired,
             spec,
             crate::version(),
@@ -1241,7 +1244,7 @@ impl LaunchdManager {
             // launchd has no drop-in or override mechanism that alters a job
             // without touching its plist. Enablement lives in the plist's
             // *directory*, which is deliberately outside the compared surface.
-            &decide::Overlay::default(),
+            &decide::ExternalConfig::Absent,
         );
         let deadline = Budget::Unbounded.start();
 
@@ -1279,8 +1282,12 @@ impl LaunchdManager {
                 recheck_after_write(&spec.id, deadline, &target, &desired, None)?;
             }
             Outcome::Update { .. } | Outcome::Stale { .. } => {
+                let Ownership::Ours { on_disk: previous, .. } = &discovery.found else {
+                    unreachable!("Update and Stale come only from Ownership::Ours");
+                };
+                let previous = previous.as_str();
                 // `Stale` is checked too: a release can change what the generator renders.
-                let changes_job = refuse::changes_loaded_job(&outcome, discovery.on_disk.as_deref(), &desired);
+                let changes_job = refuse::changes_loaded_job(&outcome, Some(previous), &desired);
                 if changes_job && never_expires(is_loaded(spec.id.as_str(), deadline)?) {
                     return Err(refuse::loaded_refusal(&spec.id));
                 }
@@ -1309,10 +1316,6 @@ impl LaunchdManager {
                 }
                 write_existing(&target, &desired)?;
                 if changes_job {
-                    let previous = discovery
-                        .on_disk
-                        .as_deref()
-                        .expect("Ownership::Ours implies discovery read the artifact");
                     recheck_after_write(&spec.id, deadline, &target, &desired, Some(previous))?;
                 }
             }
@@ -1384,13 +1387,12 @@ impl ServiceManager for LaunchdManager {
         let discovery = discover(spec.id.as_str())?;
         Ok(decide::decide(
             &discovery.found,
-            discovery.on_disk.as_deref(),
             &desired,
             spec,
             crate::version(),
             false,
             // launchd has no drop-in mechanism; see the `install` call site.
-            &decide::Overlay::default(),
+            &decide::ExternalConfig::Absent,
         ))
     }
 

@@ -35,7 +35,7 @@ use nix::fcntl::{OFlag, openat};
 use nix::sys::stat::Mode;
 
 use crate::backend::systemd::generate;
-use crate::decide::{Overlay, Ownership};
+use crate::decide::{self, ExternalConfig, Ownership};
 use crate::error::{Error, Result};
 
 use super::{UNIT_DIR, identity_for, io_err, unit_path};
@@ -302,11 +302,9 @@ pub(super) fn raw_state(id: &str) -> Result<RawState> {
 /// this backend that `decide` cannot see on its own.
 pub(super) struct Discovery {
     pub(super) ownership: Ownership,
-    /// `None` iff `ownership` is `Ownership::Absent`.
-    pub(super) on_disk: Option<String>,
-    /// The fragment's own raw text — distinct from `on_disk`, which may have a drop-in marker folded
-    /// in — present iff `ownership` came from a regular file (`Ours` or `OursUnreadable`). Used to
-    /// verify identity before a later write/removal touches this exact fragment; see
+    /// The fragment's own raw text — distinct from `Ownership::Ours`'s `on_disk`, which has a drop-in
+    /// marker folded in — present iff `ownership` came from a regular file (`Ours` or `OursUnreadable`).
+    /// Used to verify identity before a later write/removal touches this exact fragment; see
     /// `super::write::quarantine_if_still_ours`. Content, not inode, is the identity that matters
     /// here: an inode number can be reused by the kernel moments after its file is unlinked, so two
     /// genuinely different files can share one.
@@ -314,7 +312,7 @@ pub(super) struct Discovery {
     /// What systemd's drop-in search directories currently hold for this id — obligation 3.
     /// `decide` cannot see this: its vocabulary is artifact *text*, and this is filesystem structure
     /// alongside it.
-    pub(super) overlay: Overlay,
+    pub(super) external: ExternalConfig,
 }
 
 pub(super) fn discover(id: &str) -> Result<Discovery> {
@@ -322,9 +320,8 @@ pub(super) fn discover(id: &str) -> Result<Discovery> {
         RawState::Absent => match residue(id).map_err(|failure| failure.undetermined(id))? {
             None => Ok(Discovery {
                 ownership: Ownership::Absent,
-                on_disk: None,
                 fragment_text: None,
-                overlay: Overlay::default(),
+                external: ExternalConfig::Absent,
             }),
             // A drop-in directory or an enablement link with no fragment at all: never silently
             // adopt it as `Create`, or the resulting unit inherits overrides and boot-enrollment
@@ -332,47 +329,28 @@ pub(super) fn discover(id: &str) -> Result<Discovery> {
             // unmarked artifact is refused.
             Some(residue) => Ok(Discovery {
                 ownership: Ownership::Foreign,
-                on_disk: Some(residue.text()),
                 fragment_text: None,
-                overlay: dropin_overlay(id, &residue.dropin),
+                external: dropin_external_config(id, &residue.dropin),
             }),
         },
         RawState::NotOurs => Ok(Discovery {
             ownership: Ownership::Foreign,
-            on_disk: Some(String::new()),
             fragment_text: None,
-            overlay: Overlay::default(),
+            external: ExternalConfig::Absent,
         }),
         RawState::Regular(text) => {
-            // Ownership comes from the fragment alone, and is settled before any drop-in is
-            // touched: the marker is already in the text this arm was handed.
-            let ownership = match generate::extract(&text) {
-                Ok(None) => Ownership::Foreign,
-                Ok(Some(blob)) => match identity_for(&blob.spec.user) {
-                    Ok(identity) => {
-                        let regenerated = generate::unit(&blob.spec, &identity);
-                        Ownership::Ours { blob, regenerated }
-                    }
-                    // An embedded spec naming a SID user is not decodable into anything this backend
-                    // can regenerate — surfaced the same way any other blob invariant violation is.
-                    Err(e) => Ownership::OursUnreadable { reason: e.to_string() },
-                },
-                Err(e) => Ownership::OursUnreadable { reason: e.to_string() },
-            };
-
             // Obligation 3: fold any drop-in content into the text `decide` compares, without ever
             // writing that folded text back. Neither `desired` nor `regenerated` (both pure
             // `generate()` output) can ever contain this marker, so a non-empty drop-in forces
             // `Conflict` whenever `decide` reaches a text comparison at all — the one branch that
             // doesn't (a stale version, checked before any text comparison) is `decide::decide`'s own
-            // `foreign_overlay` parameter's job.
+            // `external` parameter's job.
             match dropin_dirs(id) {
                 Ok(dirs) => {
                     let marker: String = dirs.iter().map(|(_, text)| text.as_str()).collect();
                     Ok(Discovery {
-                        ownership,
-                        on_disk: Some(format!("{text}{marker}")),
-                        overlay: dropin_overlay(id, &dirs),
+                        ownership: classify_fragment(id, &text, format!("{text}{marker}")),
+                        external: dropin_external_config(id, &dirs),
                         fragment_text: Some(text),
                     })
                 }
@@ -382,7 +360,7 @@ pub(super) fn discover(id: &str) -> Result<Discovery> {
                 // id goetia just decoded. What the failed read actually costs is the ability to
                 // report on the id, which is what `Ownership::OursUnreadable` says.
                 Err(failure) => Ok(Discovery {
-                    ownership: if matches!(ownership, Ownership::Foreign) {
+                    ownership: if matches!(classify_fragment(id, &text, text.clone()), Ownership::Foreign) {
                         // Established by the fragment's own missing marker, and untouched by a
                         // drop-in nobody could read: `Foreign` refuses on the absent marker alone.
                         Ownership::Foreign
@@ -393,16 +371,44 @@ pub(super) fn discover(id: &str) -> Result<Discovery> {
                                  compared: {}",
                                 failure.detail()
                             ),
+                            recovery: None,
                         }
                     },
-                    on_disk: Some(text.clone()),
                     fragment_text: Some(text),
-                    // Unknown, and unread: `decide` consults the overlay only on the `Ours` path,
-                    // which neither arm above can reach.
-                    overlay: Overlay::default(),
+                    // Unknown, and unread: `decide` consults the external configuration only on the
+                    // `Ours` path, which neither arm above can reach.
+                    external: ExternalConfig::Absent,
                 }),
             }
         }
+    }
+}
+
+/// Ownership comes from the fragment alone, never from a drop-in: the marker is already in `text`.
+/// `on_disk` is the text `decide` compares, which only [`Ownership::Ours`] keeps.
+fn classify_fragment(id: &str, text: &str, on_disk: String) -> Ownership {
+    match generate::extract(text) {
+        Ok(None) => Ownership::Foreign,
+        Ok(Some(blob)) => match identity_for(&blob.spec.user) {
+            Ok(identity) => {
+                let regenerated = generate::unit(&blob.spec, &identity);
+                Ownership::Ours {
+                    blob,
+                    regenerated,
+                    on_disk,
+                }
+            }
+            // An embedded spec naming a SID user is not decodable into anything this backend
+            // can regenerate — surfaced the same way any other blob invariant violation is.
+            Err(e) => Ownership::OursUnreadable {
+                reason: e.to_string(),
+                recovery: None,
+            },
+        },
+        Err(e) => Ownership::OursUnreadable {
+            reason: e.to_string(),
+            recovery: Some(decide::unreadable_recovery(id)),
+        },
     }
 }
 
@@ -482,16 +488,21 @@ pub(super) const DROPIN_SEARCH_DIRS: [&str; 12] = [
 /// survives a `--force` overwrite untouched, and the run after it reports the identical conflict.
 /// Naming those directories here, where the scan already has them, is what keeps the CLI from
 /// re-reading the filesystem to find out whether its own published remedy applies.
-fn dropin_overlay(id: &str, dirs: &[(PathBuf, String)]) -> Overlay {
+fn dropin_external_config(id: &str, dirs: &[(PathBuf, String)]) -> ExternalConfig {
     let ours = Path::new(UNIT_DIR).join(format!("{id}.service.d"));
     let unclearable: Vec<&Path> = dirs
         .iter()
         .map(|(dir, _)| dir.as_path())
         .filter(|dir| *dir != ours)
         .collect();
-    Overlay {
-        present: !dirs.is_empty(),
-        unclearable_recovery: (!unclearable.is_empty()).then(|| dropin_recovery(&unclearable)),
+    if dirs.is_empty() {
+        ExternalConfig::Absent
+    } else if unclearable.is_empty() {
+        ExternalConfig::Clearable
+    } else {
+        ExternalConfig::Unclearable {
+            recovery: dropin_recovery(&unclearable),
+        }
     }
 }
 
@@ -600,17 +611,6 @@ struct Residue {
 }
 
 impl Residue {
-    /// The `on_disk` text `decide` is handed for this id. Never empty — [`residue`] returns `None`
-    /// rather than an empty `Residue` — which is what keeps [`Discovery::on_disk`]'s "`None` iff
-    /// `Ownership::Absent`" invariant true.
-    fn text(&self) -> String {
-        let mut text: String = self.dropin.iter().map(|(_, marker)| marker.as_str()).collect();
-        for link in &self.links {
-            text.push_str(&format!("\n# --- enablement link: {} ---\n", link.display()));
-        }
-        text
-    }
-
     /// Every path a human has to deal with to empty this id, for the refusal message.
     fn paths(&self) -> Vec<&Path> {
         self.dropin

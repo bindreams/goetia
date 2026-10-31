@@ -28,12 +28,6 @@ const FAKE_MARKER: &str = "FAKE-GOETIA-ARTIFACT";
 /// running. Never a real process.
 const FAKE_PID: u32 = 1;
 
-/// The `on_disk` text `decide` is handed for an id carrying only a residual
-/// artifact — see [`Fake::seed_residual_artifact`]. Deliberately carries no
-/// [`FAKE_MARKER`]: residue is exactly what goetia cannot attribute, and
-/// `decide` must reach `RefuseForeign` from it.
-const RESIDUAL_TEXT: &str = "residual artifact, no primary artifact\n";
-
 /// Why an opaque id could not be classified — see [`Fake::seed_opaque`].
 /// Shared by [`Store::undetermined`] and [`Fake::list`] so the error and the
 /// `list` entry cannot describe the same condition differently.
@@ -545,32 +539,31 @@ fn stalled(id: &Id, awaited: &'static str, budget: Budget) -> Result<()> {
 }
 
 /// Classify what's at `id` in `state`, exactly as `install` would discover
-/// it, plus the raw on-disk text `decide` needs alongside the
-/// classification. Shared by `install` and `preview_install` so the two can
-/// never disagree about what `decide` sees — `preview_install` exists
-/// precisely so `diff` can ask "what would `install` do" without either
-/// duplicating this logic or being able to drift from it.
-fn discover(state: &Store, id: &str) -> (Ownership, Option<String>) {
-    let existing = state.entries.get(id).cloned();
-    let found = match &existing {
+/// it. Shared by `install` and `preview_install` so the two can never
+/// disagree about what `decide` sees — `preview_install` exists precisely so
+/// `diff` can ask "what would `install` do" without either duplicating this
+/// logic or being able to drift from it.
+fn discover(state: &Store, id: &str) -> Ownership {
+    match state.entries.get(id) {
         // Never silently adopted as `Create`: whatever the platform still
         // applies here is configuration goetia did not write and cannot
         // show — the same refusal systemd's own `discover` gives a
         // fragmentless `<id>.service.d` drop-in.
-        None if state.residual.contains(id) => {
-            return (Ownership::Foreign, Some(RESIDUAL_TEXT.to_string()));
-        }
+        None if state.residual.contains(id) => Ownership::Foreign,
         None => Ownership::Absent,
         Some(entry) => match extract(&entry.text) {
             Ok(Some(blob)) => Ownership::Ours {
                 regenerated: generate(&blob.spec),
                 blob,
+                on_disk: entry.text.clone(),
             },
             Ok(None) => Ownership::Foreign,
-            Err(e) => Ownership::OursUnreadable { reason: e.to_string() },
+            Err(e) => Ownership::OursUnreadable {
+                reason: e.to_string(),
+                recovery: Some(decide::unreadable_recovery(id)),
+            },
         },
-    };
-    (found, existing.map(|e| e.text))
+    }
 }
 
 /// [`Fake::seed_start_in_doubt`]'s failure, for a start of `id`.
@@ -617,19 +610,18 @@ impl ServiceManager for Fake {
         }
         state.manager()?;
         let desired = generate(spec);
-        let (found, on_disk) = discover(&state, spec.id.as_str());
+        let found = discover(&state, spec.id.as_str());
 
-        // The fake has no concept of an overlay (systemd's drop-in
-        // directory, or an analogous future backend's equivalent), so it
-        // always passes `decide` the empty one.
+        // The fake has no concept of external configuration (systemd's
+        // drop-in directory, or an analogous future backend's equivalent),
+        // so it always passes `decide` the absent one.
         let outcome = decide::decide(
             &found,
-            on_disk.as_deref(),
             &desired,
             spec,
             crate::version(),
             force,
-            &decide::Overlay::default(),
+            &decide::ExternalConfig::Absent,
         );
 
         // `Create`/`Update`/`Stale` are the outcomes `decide` recommends
@@ -666,18 +658,17 @@ impl ServiceManager for Fake {
             return Err(Store::undetermined(&spec.id));
         }
         let desired = generate(spec);
-        let (found, on_disk) = discover(&state, spec.id.as_str());
+        let found = discover(&state, spec.id.as_str());
         // Always previewed without `force`: showing the forced outcome would
         // hide the very conflict `--force` exists to let a user decide
         // about, and `diff` has no `--force` flag of its own to justify it.
         Ok(decide::decide(
             &found,
-            on_disk.as_deref(),
             &desired,
             spec,
             crate::version(),
             false,
-            &decide::Overlay::default(),
+            &decide::ExternalConfig::Absent,
         ))
     }
 
