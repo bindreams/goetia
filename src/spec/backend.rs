@@ -11,37 +11,29 @@
 //! Also home to the per-backend cross-validation `resolve` runs over every
 //! backend's merged spec: [`ShapedSpec`]/[`Shaped`] (a spec that
 //! has passed the shape gate but may not yet be complete),
-//! [`BackendKind::warn`]/[`BackendKind::error`]/[`BackendKind::reject_merged`] (the
-//! advisory and rejection rules), and the Windows built-in account
-//! vocabulary (`windows_builtin`) both read.
+//! [`BackendKind::warn`]/[`BackendKind::error`] (the advisory and rejection
+//! rules), and the Windows built-in account vocabulary (`windows_builtin`)
+//! both read.
+//!
+//! A host validates only what the manifest wrote under a backend's own
+//! `backend-specific:` key, and warns only about its native backend.
 //!
 //! [`BackendKind::error`] rejects only a field the override actually supplied
 //! (`Supplied`, from `overrides.rs`) — a base value is never a per-backend
-//! verdict, since nobody wrote it for that backend. [`BackendKind::warn`] is
-//! not scoped that way: an advisory is information this host may give
-//! about any value it can read, base or overridden, which is what lets a
-//! Linux host warn about a Windows-only divergence in a manifest with no
-//! `backend-specific:` block at all.
-//!
-//! [`BackendKind::reject_merged`] is the one rejection that is *not* scoped to a
-//! supplied field: a backend that cannot honour a value refuses it whoever
-//! wrote it, base included, because the base is what that backend would
-//! install. It is what makes the README's "every backend's merged spec is
-//! validated on every host" true of `restart: always` on `scm`.
-//!
-//! What a non-native backend is judged *on* splits along one seam. Its
-//! override is read as authored by both, so `scm: {user: {id: 1000}}` is
-//! caught from any host — a uid is never a substituted string — while
-//! `scm: {user: "${ACCT}"}` is not checkable from Linux: substitution runs
-//! for the native backend only, and goetia does not claim to check what it
-//! cannot resolve. The base underneath it concerns [`BackendKind::warn`]
-//! alone, since `Supplied` masks a base field out of [`BackendKind::error`]
-//! entirely, and `warn` reads it *substituted* (`resolve`'s step 5a): a
-//! base field is substituted for the returned spec from the same `.env`, so
-//! moving one there must not delete an advisory about the value that
-//! actually gets installed. The native backend's override is substituted
-//! too, in step 5b, and is both warned on and checked there — which is why
+//! verdict, since nobody wrote it for that backend. It runs for every
+//! backend on every host, on the override as authored: `scm: {user: {id:
+//! 1000}}` is caught from any host — a uid is never a substituted string —
+//! while `scm: {user: "${ACCT}"}` is not checkable from Linux: substitution
+//! runs for the native backend only, and goetia does not claim to check what
+//! it cannot resolve. The native backend's override is substituted too, in
+//! `resolve`'s step 5, and is both checked and warned on there — which is why
 //! the example above names `scm` rather than `systemd`.
+//!
+//! [`BackendKind::warn`] runs for the native backend only, on its substituted
+//! merged spec, base values included: an advisory describes what the native
+//! install does with the value it reads. A backend this host cannot install
+//! gets none, and a base value that backend cannot honour is its generator's
+//! to refuse at install (`restart: always` on `scm`), not resolution's.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -167,10 +159,10 @@ pub(crate) struct ShapedSpec {
 // Advisories and rejections ===========================================================================================
 
 impl BackendKind {
-    /// Advisories this backend has about `spec`, appended to `out`.
-    /// Reads the whole merged spec: an advisory is information this host
-    /// may give about any value it can read, on any backend, regardless of
-    /// which one wrote it.
+    /// Advisories this backend has about `spec`, appended to `out`. Called
+    /// for the native backend only, on its substituted merged spec, and reads
+    /// the whole of it: an advisory describes what the native install does
+    /// with a value, whichever layer wrote it.
     pub(crate) fn warn(self, spec: &ShapedSpec, out: &mut Vec<Warning>) {
         match self {
             BackendKind::Systemd => {}
@@ -223,27 +215,6 @@ impl BackendKind {
                 }
                 _ => Ok(()),
             },
-        }
-    }
-
-    /// Values this backend cannot honour, whichever layer wrote them. Reads
-    /// the whole merged spec, unlike [`BackendKind::error`]: the base is what a
-    /// backend installs when it has no override, so it is judged too.
-    ///
-    /// Only `scm` has one today: `restart: always` (SCM recovery actions never
-    /// fire after a clean exit).
-    ///
-    /// A `restart` that is [`Shaped::Deferred`] (its `$` not yet substituted)
-    /// reads as unknown and passes.
-    pub(crate) fn reject_merged(self, spec: &ShapedSpec) -> Result<(), Error> {
-        match self {
-            BackendKind::Scm if spec.restart.parsed() == Some(Restart::Always) => Err(invalid(
-                &spec.id,
-                "`restart: always` cannot be honoured by the scm backend: SCM recovery actions never fire \
-                 after a clean exit. To keep `always` on systemd and launchd, set \
-                 `backend-specific: scm: { restart: on-failure }`",
-            )),
-            BackendKind::Scm | BackendKind::Systemd | BackendKind::Launchd => Ok(()),
         }
     }
 }
@@ -322,8 +293,8 @@ pub(crate) fn scm_restart_delay(delay: Duration) -> Duration {
 /// resolve time on every host rather than only when an effectful Windows
 /// install runs the generator. Gated identically to the clamp itself:
 /// `Restart::Never` builds no `FailureActions`, so a `restart-delay` without
-/// `restart: on-failure` warns about nothing. `always` never reaches here:
-/// [`BackendKind::reject_merged`] refuses it first.
+/// `restart: on-failure` warns about nothing. `always` warns about nothing
+/// either: the generator refuses it.
 fn warn_on_over_long_restart_delay(spec: &ShapedSpec, out: &mut Vec<Warning>) {
     if spec.restart.parsed() != Some(Restart::OnFailure) {
         return;

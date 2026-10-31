@@ -173,14 +173,21 @@ fn validation_failure_installs_nothing() {
     assert!(!err.is_empty(), "a validation failure should explain itself on stderr");
 }
 
+/// Manifest fields that trip the native backend's advisory on `restart-delay`: launchd's ThrottleInterval rounding,
+/// or SCM's clamp of a delay past `SC_ACTION.Delay`. systemd has no advisories, so no Linux test can observe a
+/// warning through the CLI.
+#[cfg(target_os = "macos")]
+const NATIVE_ADVISORY_FIELDS: &str = "    restart-delay: 500ms\n";
+#[cfg(windows)]
+const NATIVE_ADVISORY_FIELDS: &str = "    restart: on-failure\n    restart-delay: 60d\n";
+
+#[cfg(any(target_os = "macos", windows))]
 #[skuld::test]
 fn warnings_are_printed_to_stderr() {
     let dir = tempfile::tempdir().unwrap();
-    // A sub-second restart-delay: `spec::resolve` accepts it but warns that
-    // launchd's ThrottleInterval will round it up.
     write_manifest(
         dir.path(),
-        "daemons:\n  frpc:\n    command: [frpc]\n    restart-delay: 500ms\n",
+        &format!("daemons:\n  frpc:\n    command: [frpc]\n{NATIVE_ADVISORY_FIELDS}"),
     );
 
     let (code, out, err) = run_cli(&["daemon", "show", "-f", "goetia.yaml"], dir.path());
@@ -256,17 +263,19 @@ fn an_unknown_backend_key_is_a_manifest_error() {
 
 /// The same shape as `warnings_are_printed_to_stderr`, with an unrelated
 /// backend override present: a `backend-specific:` block that touches a
-/// field the sub-second-restart-delay advisory does not read must not
-/// duplicate that warning across the all-backends sweep (see
-/// `spec::resolve`'s step 4) — stderr still carries exactly one
-/// `warning:` line.
+/// field the advisory does not read must not duplicate that warning across
+/// the all-backends sweep (see `spec::resolve`'s step 4) — stderr still
+/// carries exactly one `warning:` line.
+#[cfg(any(target_os = "macos", windows))]
 #[skuld::test]
 fn warnings_still_fire_once_with_backend_overrides_present() {
     let dir = tempfile::tempdir().unwrap();
     write_manifest(
         dir.path(),
-        "daemons:\n  frpc:\n    command: [frpc]\n    restart-delay: 500ms\n    backend-specific:\n      systemd:\n        \
-         cwd: /var/lib/frpc\n",
+        &format!(
+            "daemons:\n  frpc:\n    command: [frpc]\n{NATIVE_ADVISORY_FIELDS}    backend-specific:\n      systemd:\n        \
+             cwd: /var/lib/frpc\n"
+        ),
     );
 
     let (code, out, err) = run_cli(&["daemon", "show", "-f", "goetia.yaml"], dir.path());

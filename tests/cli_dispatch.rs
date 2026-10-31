@@ -1524,19 +1524,24 @@ fn install_exit_code_does_not_mask_an_error_behind_a_conflict() {
     );
 }
 
-/// `--dry-run`'s preview must not silently drop a `Warning` (e.g. SCM
-/// clamping a too-large `restart-delay`). This advisory fires at
-/// resolve time, from `BackendKind::Scm.warn`, through `load_and_warn` — on
-/// every host, not only from an effectful Windows install preview — which
-/// is the property this test pins.
+/// Manifest fields that trip the native backend's advisory: launchd's ThrottleInterval rounding, or SCM's clamp of a
+/// `restart-delay` past `SC_ACTION.Delay`'s ~49.71-day DWORD-milliseconds ceiling. systemd has no advisories.
+#[cfg(target_os = "macos")]
+const NATIVE_ADVISORY_FIELDS: &str = "    restart-delay: 500ms\n";
+#[cfg(windows)]
+const NATIVE_ADVISORY_FIELDS: &str = "    type: managed\n    restart: on-failure\n    restart-delay: 60d\n";
+
+/// `--dry-run`'s preview must not silently drop a `Warning`. The native
+/// backend's advisory fires at resolve time, from `BackendKind::warn`,
+/// through `load_and_warn` — not from an effectful install — which is the
+/// property this test pins.
+#[cfg(any(target_os = "macos", windows))]
 #[skuld::test]
 fn install_dry_run_prints_generator_warnings() {
     let dir = tempfile::tempdir().unwrap();
-    // A restart-delay past SC_ACTION.Delay's ~49.71-day DWORD-milliseconds
-    // ceiling.
     write_manifest(
         dir.path(),
-        "daemons:\n  frpc:\n    command: [frpc]\n    type: managed\n    restart: on-failure\n    restart-delay: 60d\n",
+        &format!("daemons:\n  frpc:\n    command: [frpc]\n{NATIVE_ADVISORY_FIELDS}"),
     );
     let cli = Cli::try_parse_from([
         "goetia",
@@ -1557,6 +1562,51 @@ fn install_dry_run_prints_generator_warnings() {
     assert_eq!(code, 0);
     let err = String::from_utf8_lossy(&err);
     assert!(err.contains("warning:"), "stderr:\n{err}");
+}
+
+/// A daemon the generator refuses is reported on stderr and does not hide the preview of the rest. Only the
+/// SCM generator refuses today (`restart: always`), so elsewhere both daemons preview.
+#[skuld::test]
+fn dry_run_reports_a_refused_daemon_and_previews_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    write_manifest(
+        dir.path(),
+        "daemons:\n  alpha:\n    command: [alpha]\n    restart: always\n  beta:\n    command: [beta]\n",
+    );
+    let cli = Cli::try_parse_from([
+        "goetia",
+        "daemon",
+        "install",
+        "-f",
+        dir.path().to_str().unwrap(),
+        "--dry-run",
+    ])
+    .expect("parse");
+    let get_manager = || -> goetia::Result<Box<dyn ServiceManager>> { panic!("dry-run must never touch the manager") };
+    let is_elevated = || -> bool { panic!("dry-run must never check elevation") };
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+
+    let code = cli::dispatch(&cli, &get_manager, &is_elevated, &mut out, &mut err);
+
+    let out = String::from_utf8_lossy(&out);
+    let err = String::from_utf8_lossy(&err);
+    let beta_preview = out.split_once("# beta\n").map(|(_, preview)| preview);
+    assert!(
+        beta_preview.is_some_and(|preview| preview.contains("beta")),
+        "beta must be previewed:\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    if cfg!(windows) {
+        assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+        assert!(
+            err.contains("error: daemon `alpha`: `restart: always` cannot be honoured by the scm backend"),
+            "stderr:\n{err}"
+        );
+    } else {
+        assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+        assert!(out.contains("# alpha\n"), "stdout:\n{out}");
+        assert!(!err.contains("error:"), "stderr:\n{err}");
+    }
 }
 
 /// The `list`/`status`/`show`/`diff` partitioning helper must warn about an
