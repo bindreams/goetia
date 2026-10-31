@@ -2034,7 +2034,7 @@ fn a_dollar_in_a_user_id_is_rejected_under_every_backend() {
     assert!(err.to_string().contains(interpolate::USER_ID_MESSAGE), "{err}");
 }
 
-// A host warns only about its native backend =========================================================================
+// A host warns only about its native backend ==========================================================================
 
 #[skuld::test]
 fn base_restart_always_resolves_on_every_native_backend() {
