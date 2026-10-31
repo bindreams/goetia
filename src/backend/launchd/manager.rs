@@ -398,9 +398,10 @@ fn classify(bytes: Vec<u8>) -> ClassifyOutcome {
 /// comments, bytes that are not UTF-8 are not the UTF-8 XML `generate::plist`
 /// writes, a FIFO is not a plist in the first place — so "text carrying no
 /// marker" is precisely what has been established in each case, and `extract`
-/// turns it into the `Foreign` refusal that is the right answer for all of them. It is also what keeps `install` over one of these
-/// from erroring: `decide` reaches `Outcome::RefuseForeign`, which names the
-/// remedy, instead of a bare `Err`.
+/// turns it into the `Foreign` refusal that is the right answer for all of them.
+/// It is also what keeps `install` over one of these from erroring: `decide`
+/// reaches `Outcome::RefuseForeign`, which names the remedy, instead of a bare
+/// `Err`.
 fn read_artifact(path: &Path, id: &str) -> Result<String> {
     let bytes = match obtain(path) {
         Obtained::Bytes(bytes) => bytes,
@@ -420,17 +421,13 @@ pub(crate) struct Plist {
     text: String,
 }
 
-/// Classify the plist at `location`, as every verb, `install` and `list` need it.
-///
-/// A marked plist is [`ReadOutcome::Marked`] whether or not its blob decodes: the marker alone is
-/// proof of ownership. Whether its spec can still be rendered here (the account *its own* `user`
-/// field names may have been deleted since) is `flow`'s question, answered with `render`.
+/// What is at `location`: no marker is `Foreign`, a marker is `Marked` whether or not its blob
+/// decodes, since the marker alone is proof of ownership. Whether the spec can still be rendered
+/// here is `flow`'s question, answered with `render`.
 fn read_at(id: &str, location: Location) -> Result<ReadOutcome<Plist>> {
     let text = read_artifact(&location.path, id)?;
-    let blob = match generate::extract(&text) {
-        Ok(None) => return Ok(ReadOutcome::Foreign { recovery: None }),
-        Ok(Some(blob)) => Ok(blob),
-        Err(e) => Err(e),
+    let Some(blob) = generate::extract(&text).transpose() else {
+        return Ok(ReadOutcome::Foreign { recovery: None });
     };
     Ok(ReadOutcome::Marked {
         blob,

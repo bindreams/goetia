@@ -236,7 +236,7 @@ pub(crate) fn scan<R, T>(
 
 /// What [`scan`] reports of a directory it could not finish: `op` is `"open"` or `"enumerate"`.
 /// One wording for every backend whose container is a directory.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg(unix)]
 pub(crate) fn directory_detail(op: &'static str, e: &io::Error) -> String {
     match op {
         "open" => format!("failed to read directory: {e}"),

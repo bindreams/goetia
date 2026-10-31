@@ -776,8 +776,8 @@ fn a_plist_in_both_directories_is_reported_not_classified() {
 
 /// A plist that vanished between `read` and `write` — a concurrent `uninstall` — before `install`
 /// made any `launchctl` call is `Raced`, so the flow reads again. The rendering is unchanged (only the
-/// version differs), so no `is_loaded` was asked: a second pass stays inside the reservation. The
-/// counterpart, a vanish after that call, is
+/// version differs), so no `is_loaded` was asked, and the empty script fails the test if any
+/// `launchctl` call is made: a second pass stays inside the reservation. The counterpart, a vanish after that call, is
 /// `a_plist_removed_after_a_read_fails_the_install_without_further_launchctl_calls`.
 #[skuld::test]
 fn a_write_over_a_plist_that_vanished_before_any_call_is_raced() {
@@ -789,10 +789,9 @@ fn a_write_over_a_plist_that_vanished_before_any_call_is_raced() {
     let on_disk = desired.replace(&format!("Version: {}", crate::version()), "Version: 0.0.1");
     assert_ne!(on_disk, desired);
     let tmp = tempfile::tempdir().expect("tempdir");
-    let path = tmp.path().join("gone.plist");
     let snapshot = Plist {
         location: Location {
-            path: path.clone(),
+            path: tmp.path().join("gone.plist"),
             enabled: false,
         },
         text: on_disk,
@@ -801,13 +800,14 @@ fn a_write_over_a_plist_that_vanished_before_any_call_is_raced() {
         from_version: "0.0.1".to_string(),
     };
     let mut scope = mgr.begin_install(&spec).expect("begin_install");
+    let script = Scripted::new(&[]);
 
     let written = mgr
         .write(&spec, &desired, &stale, Some(&snapshot), &mut scope)
         .expect("write");
 
     assert!(matches!(written, WriteOutcome::Raced));
-    assert!(!path.exists(), "a raced write puts nothing back");
+    script.assert_driven("a race before any call makes none");
 }
 
 // Reapers: a sequence never fails halfway for want of one =============================================================

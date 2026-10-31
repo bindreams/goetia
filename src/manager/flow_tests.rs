@@ -345,6 +345,7 @@ fn scan_that_finishes_reports_nothing() {
 
 /// The text of a directory pass that stopped, which every directory-scanning backend hands
 /// `scan` as its `detail`. Injected here because no real `readdir` fails on request.
+#[cfg(unix)]
 #[skuld::test]
 fn a_directory_pass_that_stopped_is_worded_by_where_it_stopped() {
     let e = std::io::Error::other("injected mid-scan failure");

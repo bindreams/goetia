@@ -278,7 +278,7 @@ fn hand_edit_is_detected_as_conflict() {
 }
 
 /// The genuine TOCTOU race this guards against — a foreign write landing
-/// between `discover`'s read and the actual persist — is unit-tested
+/// between `read` and the actual persist — is unit-tested
 /// directly against `persist_new` in
 /// `src/backend/launchd/manager_tests.rs::persist_new_does_not_clobber_existing_content`,
 /// where the target is a plain tempdir path and the timing is therefore
@@ -787,7 +787,7 @@ fn list_stays_clean_on_a_host_carrying_binary_plists() {
     );
 }
 
-/// The `discover` path — the one `install`/`preview_install` reads through, and therefore what
+/// The `read` path — the one `install`/`preview_install` reads through, and therefore what
 /// `goetia daemon diff` answers from — reaching the same verdict as `status` and `list` about one
 /// file. A plist that is not goetia's format is a stranger's artifact at this id, so `install`
 /// refuses it with the remedy `Outcome::RefuseForeign` names, rather than erroring.
@@ -1190,7 +1190,7 @@ impl Drop for DirGuard {
 /// `Absent` -> `Create` -> `persist_new` -> `Raced` -> re-`install` -> the
 /// identical classification, an unbounded recursion that would eventually
 /// abort the process. `locate` now uses `symlink_metadata`, so a directory
-/// is "occupied" like anything else, and `discover`'s read classifies it
+/// is "occupied" like anything else, and `read` classifies it
 /// before opening it.
 ///
 /// The refusal is `RefuseForeign`, not an `Err`: a directory at a plist path
