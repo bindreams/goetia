@@ -1848,7 +1848,7 @@ fn a_variable_used_only_in_a_non_native_override_does_not_read_the_env_file() {
     assert_eq!(spec.id.as_str(), "frpc");
 }
 
-// The relocated key-position rules ====================================================================================
+// The rules that reject `$` outright ==================================================================================
 
 #[skuld::test]
 fn an_interpolated_id_is_refused() {
@@ -1865,7 +1865,7 @@ fn an_interpolated_id_is_refused() {
     );
     assert!(
         !err.to_string().contains("does not match the required pattern"),
-        "the id-is-a-key rejection must run first: {err}"
+        "the no-interpolation rejection must run first: {err}"
     );
 }
 

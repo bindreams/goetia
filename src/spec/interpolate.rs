@@ -353,8 +353,8 @@ pub(crate) fn spec(raw: &mut RawSpec, vars: &Vars) -> Result<()> {
 /// Same walk [`spec`] does, same field paths, no [`Vars`] — grammar only,
 /// so it can run on a merged spec no `.env` has been loaded for yet.
 /// The daemon id, `env` names, and `user.id` need no grammar check here: a
-/// `$` anywhere in them is rejected outright by the key-position rules
-/// (`reject_interpolated_id`, and the two moved into `resolve_shape`).
+/// `$` anywhere in them is rejected outright (`reject_interpolated_id`, and
+/// the two rules moved into `resolve_shape`).
 pub(crate) fn check_spec_grammar(raw: &RawSpec) -> Result<()> {
     let RawSpec {
         id: _,
@@ -405,8 +405,8 @@ pub(crate) fn check_spec_grammar(raw: &RawSpec) -> Result<()> {
 fn check_user_grammar(user: &Option<RawUser>) -> Result<()> {
     match user {
         // `Id` needs no grammar check: a `Uid` is a number substitution
-        // never touches, and a `$` in a `Sid` is rejected outright by the
-        // key-position rule, before this ever runs.
+        // never touches, and a `$` in a `Sid` is rejected outright by
+        // `resolve_shape`, before this ever runs.
         None | Some(RawUser::Id(_)) => Ok(()),
         Some(RawUser::Scalar(text)) => check_grammar(text, "user"),
         Some(RawUser::Name(name)) => check_grammar(name, "user.name"),

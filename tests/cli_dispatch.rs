@@ -47,9 +47,7 @@ fn write_manifest(dir: &Path, yaml: &str) -> PathBuf {
 }
 
 // One `(Fake, manifest)` builder per `decide::Outcome` class `diff` can see,
-// shared by every test that only needs that one outcome for a single
-// daemon — the tests that mix several outcomes in one run build their own
-// manifest instead, since what they exercise is precisely the combination.
+// shared by every test that only needs that one outcome.
 
 /// `id` absent from the store: `diff` reports `Outcome::Create`.
 fn absent_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
@@ -174,7 +172,7 @@ fn dispatch_read_only(args: &[&str], fake: &Fake) -> (i32, String, String) {
 /// - `fail_preview_for` is the "the manager could not even answer whether
 ///   this daemon would change" path — `Fake` itself can never fail
 ///   `preview_install`, so this is the only way to put a genuine `Err(_)`
-///   in the same `diff` run as a `Conflict`/drift outcome.
+///   in a `diff` run.
 /// - `hidden_from_list` models the opposite asymmetry from `unqueryable`:
 ///   an id `list()` cannot enumerate at all (as if this privilege level
 ///   lacked the read access needed to see it in a directory listing —
@@ -646,65 +644,42 @@ fn install_without_flags_does_not_start_or_enable() {
 
 // show ================================================================================================================
 
+/// `show -f <dir>`, `show` and `show frpc` render byte-identical output:
+/// the file path and the installed path, named or not, and neither checks
+/// elevation. A commitment test over already-correct behaviour — all three
+/// render through the same `crate::diff::render_yaml` today — so a renderer
+/// added to only one path in the future fails it.
 #[skuld::test]
-fn show_from_file_and_show_from_installed_agree() {
+fn show_from_file_and_from_installed_agree() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(
+    write_manifest(
         dir.path(),
         "id: frpc\ncommand: [frpc, -c, frpc.toml]\nrestart: on-failure\n",
     );
     let fake = Fake::new();
     let (install_code, _, install_err) = dispatch_elevated(
-        &["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()],
+        &["goetia", "daemon", "install", "-f", dir.path().to_str().unwrap()],
         &fake,
     );
     assert_eq!(install_code, 0, "{install_err}");
 
     let (code_file, out_file, _) =
-        dispatch_read_only(&["goetia", "daemon", "show", "-f", manifest.to_str().unwrap()], &fake);
-    let (code_installed, out_installed, _) = dispatch_read_only(&["goetia", "daemon", "show"], &fake);
+        dispatch_read_only(&["goetia", "daemon", "show", "-f", dir.path().to_str().unwrap()], &fake);
+    let (code_all, out_all, _) = dispatch_read_only(&["goetia", "daemon", "show"], &fake);
+    let (code_named, out_named, _) = dispatch_read_only(&["goetia", "daemon", "show", "frpc"], &fake);
 
     assert_eq!(code_file, 0);
-    assert_eq!(code_installed, 0);
+    assert_eq!(code_all, 0);
+    assert_eq!(code_named, 0);
     assert_eq!(
-        out_file, out_installed,
+        out_file, out_all,
         "show -f and show (from installed) must render identically"
     );
-    assert!(out_file.contains("frpc"), "{out_file}");
-}
-
-/// The named counterpart to `show_from_file_and_show_from_installed_agree`
-/// above: `show -f <file>` and `show frpc` render byte-identical output
-/// through either path, and neither path checks elevation. This is a
-/// commitment test over already-correct behaviour — both paths render
-/// through the same `crate::diff::render_yaml` today — so it is expected to
-/// pass on first write; its job is to make that agreement a declared
-/// contract rather than an accident, so a renderer added to only one path
-/// in the future fails it.
-#[skuld::test]
-fn show_per_id_from_file_and_from_installed_agree() {
-    let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(
-        dir.path(),
-        "id: frpc\ncommand: [frpc, -c, frpc.toml]\nrestart: on-failure\n",
-    );
-    let fake = Fake::new();
-    let (install_code, _, install_err) = dispatch_elevated(
-        &["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()],
-        &fake,
-    );
-    assert_eq!(install_code, 0, "{install_err}");
-
-    let (code_file, out_file, _) =
-        dispatch_read_only(&["goetia", "daemon", "show", "-f", manifest.to_str().unwrap()], &fake);
-    let (code_installed, out_installed, _) = dispatch_read_only(&["goetia", "daemon", "show", "frpc"], &fake);
-
-    assert_eq!(code_file, 0);
-    assert_eq!(code_installed, 0);
     assert_eq!(
-        out_file, out_installed,
+        out_file, out_named,
         "show -f and show frpc (from installed) must render identically"
     );
+    assert!(out_file.contains("frpc"), "{out_file}");
 }
 
 /// `show` without `-f` only ever consults `list()` — never `status(&id)`
@@ -1569,7 +1544,7 @@ fn install_dry_run_prints_generator_warnings() {
 /// A daemon the generator refuses is reported on stderr. Only the SCM generator refuses today
 /// (`restart: always`), so elsewhere the daemon previews.
 #[skuld::test]
-fn dry_run_reports_a_refused_daemon_and_previews_the_rest() {
+fn dry_run_reports_a_refused_daemon() {
     let dir = tempfile::tempdir().unwrap();
     write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\nrestart: always\n");
     let cli = Cli::try_parse_from([
@@ -1782,6 +1757,28 @@ fn diff_exits_one_for_a_foreign_id() {
     assert!(!frpc_line.contains("would be created"), "{frpc_line}");
 }
 
+/// A manager that cannot say whether the daemon would change is an error,
+/// not a diff outcome: exit `1`, with the id on stderr.
+#[skuld::test]
+fn diff_exits_one_when_the_manager_cannot_answer() {
+    let mgr = FlakyManager {
+        fail_preview_for: Some("frpc".to_string()),
+        ..Default::default()
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\n");
+
+    let (code, out, err) = dispatch_with(
+        &["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()],
+        &mgr,
+        &never_elevated,
+    );
+
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.contains("frpc"), "the failing id is named:\n{err}");
+}
+
 /// `state_str`'s `Failed`/`Unknown` arms are otherwise unreachable from any
 /// test — `Fake::start`/`stop` can only ever produce `Running`/`Stopped` —
 /// so nothing would catch a wrong string or a swapped arm there.
@@ -1871,7 +1868,7 @@ fn diff_exits_three_when_a_daemon_would_be_updated() {
 /// An up-to-date daemon contributes no code, so the result must still be
 /// 0 — not "0 unless the list is empty" or some other accidental default.
 #[skuld::test]
-fn diff_exits_zero_only_when_everything_is_up_to_date() {
+fn diff_exits_zero_for_an_up_to_date_daemon() {
     let dir = tempfile::tempdir().unwrap();
     let (fake, manifest) = up_to_date_fixture(dir.path(), "frpc");
 

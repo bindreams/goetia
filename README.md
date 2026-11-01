@@ -269,8 +269,8 @@ Every manifest field is interpolable except `id`, mapping keys and
 - **`id`** is never interpolated, because it names the installed service. A
   `$` in it is an error: an interpolated id could change which service this
   manifest installs.
-- **`env` names** are map keys too, for the same reason — an interpolated
-  name could silently overwrite another entry. `env` _values_ interpolate
+- **`env` names** are map keys, so an interpolated name could silently
+  overwrite another entry. `env` _values_ interpolate
   normally.
 - **`user.id`** is not interpolable. Under `user: {id: 1000}` the value is a
   YAML number, so there is nothing a string could be substituted into; a
