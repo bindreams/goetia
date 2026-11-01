@@ -22,7 +22,7 @@ mod vars;
 
 pub use backend::BackendKind;
 pub use overrides::{BackendOverrides, RawOverride, Supplied};
-pub use raw::{RawManifest, RawSpec};
+pub use raw::RawSpec;
 pub use resolve::{load, resolve};
 pub use user::{AccountId, RawUser, User};
 
@@ -172,11 +172,11 @@ pub enum Kind {
 /// transformed (e.g. a sub-second `restart-delay` rounded up for launchd).
 /// Every CLI command that parses a manifest prints these to stderr.
 ///
-/// `id` is `None` for a manifest-level advisory that belongs to no single
-/// daemon — e.g. a drive-relative `-f` argument, resolved once by
-/// `resolve::absolutize` before the daemon loop even starts. Attributing it
-/// to an arbitrary daemon would be a lie, and repeating it under every
-/// daemon would say the same manifest-level thing N times.
+/// `id` is `None` for a manifest-level advisory that belongs to the file
+/// rather than the daemon — e.g. a drive-relative `-f` argument, resolved
+/// by `resolve::absolutize` before any check of the daemon runs. Prefixing
+/// it with the daemon's id would say the daemon is what the advisory is
+/// about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Warning {
     pub id: Option<Id>,

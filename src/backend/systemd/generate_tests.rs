@@ -479,14 +479,14 @@ fn manifest_dollar_escape_survives_into_exec_start() {
     let dir = tempfile::tempdir().expect("tempdir should be creatable");
     std::fs::write(
         dir.path().join("goetia.yaml"),
-        "daemons:\n  frpc:\n    command: [/bin/frpc, $$ARGS]\n",
+        "id: frpc\ncommand: [/bin/frpc, $$ARGS]\n",
     )
     .expect("fixture manifest should be writable");
 
-    let (specs, _warnings) = crate::spec::load(dir.path()).expect("manifest should load");
-    assert_eq!(specs[0].command[1], "$ARGS");
+    let (spec, _warnings) = crate::spec::load(dir.path()).expect("manifest should load");
+    assert_eq!(spec.command[1], "$ARGS");
 
-    let text = unit(&specs[0], &minimal_identity());
+    let text = unit(&spec, &minimal_identity());
     let exec_start = text.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
     assert!(
         exec_start.ends_with(" $$ARGS"),

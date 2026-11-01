@@ -14,7 +14,7 @@
 //! - An explicit YAML `null` is an error for all nine fields and for every
 //!   leaf under them. That is `no_null`'s scan, not this module: the scan
 //!   is schema-blind, so it walks an override like any other subtree, and
-//!   `Slot` routes one exactly like the daemon it overrides.
+//!   `Slot` routes one exactly like the document it overrides.
 //! - `${VAR}` is substituted only in the override for the backend actually
 //!   being installed to; the other two are checked as authored, never
 //!   substituted. A backend's own override is validated on every host,
@@ -110,6 +110,7 @@ impl RawSpec {
         }
 
         let merged = RawSpec {
+            id: self.id.clone(),
             name: ovr.name.clone().or_else(|| self.name.clone()),
             command: ovr.command.clone().or_else(|| self.command.clone()),
             cwd: ovr.cwd.clone().or_else(|| self.cwd.clone()),
@@ -128,6 +129,7 @@ impl RawSpec {
     /// `self` with every override stripped and nothing else changed.
     pub fn without_overrides(&self) -> RawSpec {
         RawSpec {
+            id: self.id.clone(),
             name: self.name.clone(),
             command: self.command.clone(),
             cwd: self.cwd.clone(),
@@ -143,7 +145,7 @@ impl RawSpec {
 }
 
 /// `RawSpec::backend_specific`: a hand-written `Visitor` over `MapAccess`,
-/// in the shape of `raw.rs`'s `DaemonsVisitor` — a plain
+/// in the shape of `raw.rs`'s `EnvVisitor` — a plain
 /// `BTreeMap<BackendKind, RawOverride>` would silently keep the last of two
 /// `scm:` blocks rather than rejecting the duplicate.
 pub(super) fn deserialize_overrides<'de, D>(d: D) -> Result<BackendOverrides, D::Error>

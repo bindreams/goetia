@@ -75,7 +75,6 @@ use std::time::Duration;
 use super::backend::{BackendKind, Shaped, ShapedSpec};
 use super::interpolate;
 use super::overrides::Supplied;
-use super::raw::RawManifest;
 use super::user::{AccountId, RawUser, User};
 use super::vars::Vars;
 use super::{DaemonSpec, Id, Kind, RawSpec, Restart, Warning};
@@ -83,29 +82,28 @@ use crate::error::Error;
 
 const MANIFEST_FILE_NAME: &str = "goetia.yaml";
 
-/// Turn a parsed manifest into resolved daemon specs.
+/// Turn a parsed manifest into a resolved daemon spec.
 ///
-/// Substitution happens inside `resolve`, per daemon, on the merged native
-/// spec — see step 5 below. That is what lets `resolve` promise that no
-/// `${VAR}` survives into a returned spec: were it a separate step a caller
-/// had to remember, a manifest reaching this one directly would resolve
-/// with its references intact, and systemd applies its *own* `${...}`
-/// expansion to `ExecStart=` — turning an unsubstituted reference into an
-/// empty string inside a privileged unit. That guarantee holds of every
-/// spec `resolve` *returns*; it does not hold of a non-native backend's
-/// override, which is validated as written (uninterpolated) and then
-/// discarded — the best any host can honestly do for a backend it cannot
-/// install.
+/// Substitution happens inside `resolve`, on the merged native spec — see
+/// step 5 below. That is what lets `resolve` promise that no `${VAR}`
+/// survives into a returned spec: were it a separate step a caller had to
+/// remember, a manifest reaching this one directly would resolve with its
+/// references intact, and systemd applies its *own* `${...}` expansion to
+/// `ExecStart=` — turning an unsubstituted reference into an empty string
+/// inside a privileged unit. That guarantee holds of every spec `resolve`
+/// *returns*; it does not hold of a non-native backend's override, which is
+/// validated as written (uninterpolated) and then discarded — the best any
+/// host can honestly do for a backend it cannot install.
 ///
 /// A host judges a non-native backend only by what the manifest wrote under
 /// that backend's own `backend-specific:` key (steps 3-4), and warns only
 /// about its native backend (step 5). Only the native backend's merged spec —
 /// substituted, shaped, and completed — becomes the returned `DaemonSpec`.
 /// Relative `command[0]`, `cwd`, and `logs` paths are resolved against
-/// `base_dir` and written back absolute. Fails on the first invalid daemon; a
-/// valid manifest may still produce `Warning`s for properties that are
-/// accepted but cannot be faithfully honored by the native backend.
-pub fn resolve(raw: RawManifest, base_dir: &Path) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
+/// `base_dir` and written back absolute. A valid manifest may still produce
+/// `Warning`s for properties that are accepted but cannot be faithfully
+/// honored by the native backend.
+pub fn resolve(raw: RawSpec, base_dir: &Path) -> Result<(DaemonSpec, Vec<Warning>), Error> {
     resolve_as(raw, base_dir, BackendKind::native())
 }
 
@@ -117,16 +115,10 @@ pub fn resolve(raw: RawManifest, base_dir: &Path) -> Result<(Vec<DaemonSpec>, Ve
 /// only reachable from the one platform that runs it. A test that names a
 /// non-native backend as `native` exercises the same code an install on
 /// that platform would.
-fn resolve_as(
-    raw: RawManifest,
-    base_dir: &Path,
-    native: Option<BackendKind>,
-) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
+fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Result<(DaemonSpec, Vec<Warning>), Error> {
     // Declared before `absolutize` runs, not after: `absolutize` itself can
-    // push a manifest-level advisory (a drive-relative `-f`), and
-    // `Vec::new()` reads nothing, so hoisting the declaration up is safe by
-    // inspection. The alternative — a second vector concatenated in after
-    // the daemon loop — would get the asserted warning order wrong.
+    // push a manifest-level advisory (a drive-relative `-f`), and the
+    // spec's own advisories are appended to it after.
     let mut warnings = Vec::new();
 
     // `DaemonSpec` documents every path as absolute and `blob::decode`
@@ -138,15 +130,11 @@ fn resolve_as(
     let base_dir = absolutize(base_dir, &mut warnings)?;
     let base_dir = base_dir.as_path();
 
-    // Step 1: ids. Must run before `Id::try_from`, or the id-pattern check
+    // Step 1: the id. Must run before `Id::try_from`, or the id-pattern check
     // (whose charset already excludes `$`) answers first with its generic
-    // message. The id is not overridable, so this runs once per daemon.
-    let mut entries: Vec<(Id, RawSpec)> = Vec::with_capacity(raw.daemons.len());
-    for (key, raw_spec) in raw.daemons {
-        interpolate::reject_interpolated_id(&key)?;
-        let id = Id::try_from(key)?;
-        entries.push((id, raw_spec));
-    }
+    // message. The id is not overridable, so this runs once.
+    interpolate::reject_interpolated_id(&raw.id)?;
+    let id = Id::try_from(raw.id.clone())?;
 
     // Step 2: the `.env` gate, computed from the spec substitution will
     // actually run on: the merged native spec of step 5. Reading it from
@@ -154,92 +142,79 @@ fn resolve_as(
     // override (it would fail "no value for X" while `.env` defines it) or
     // lets an unrelated/unreadable `.env` break a host whose native backend
     // has no `$` anywhere.
-    let merged_native: Vec<(RawSpec, Supplied)> = entries
-        .iter()
-        .map(|(_, raw)| match native {
-            Some(b) => raw.merged_for(b),
-            None => (raw.without_overrides(), Supplied::NONE),
-        })
-        .collect();
-    let vars = if merged_native
-        .iter()
-        .any(|(spec, _)| interpolate::spec_would_change(spec))
-    {
+    let (mut native_merged, native_supplied) = match native {
+        Some(b) => raw.merged_for(b),
+        None => (raw.without_overrides(), Supplied::NONE),
+    };
+    let vars = if interpolate::spec_would_change(&native_merged) {
         Vars::load(base_dir)?
     } else {
         Vars::empty()
     };
 
-    let mut specs = Vec::with_capacity(entries.len());
+    // Step 3: the base pass. Reported verbatim — no backend
+    // attribution, because a base-spec error is not any backend's
+    // fault, and base errors therefore always win on precedence. No
+    // `BackendKind` verdict runs here: the base spec is nobody's
+    // override.
+    let base = raw.without_overrides();
+    interpolate::check_spec_grammar(&base)?;
+    resolve_shape(&id, base, base_dir)?;
 
-    for ((id, raw), (mut native_merged, native_supplied)) in entries.into_iter().zip(merged_native) {
-        let path = format!("daemons.{id}");
-
-        // Step 3: the base pass. Reported verbatim — no backend
-        // attribution, because a base-spec error is not any backend's
-        // fault, and base errors therefore always win on precedence. No
-        // `BackendKind` verdict runs here: the base spec is nobody's
-        // override.
-        let base = raw.without_overrides();
-        interpolate::check_spec_grammar(&base, &path)?;
-        resolve_shape(&id, base, base_dir)?;
-
-        // Step 4: the all-backends sweep, and errors only: every backend's
-        // merged spec is checked as authored, and `BackendKind::error` judges
-        // the fields its override supplied. A non-native backend's advisories
-        // are not this host's to give, so the shape pass's warnings are
-        // dropped. The native arm runs the grammar and
-        // shape checks and no verdict: `error` runs in step 5 instead, on
-        // the substituted text it is entitled to. This pass is not redundant
-        // even so: it is what makes step 5's failures provably substitution's
-        // fault, and it is where a *literal* control character in the native
-        // override is caught and attributed here.
-        for backend in BackendKind::ALL {
-            let (merged, supplied) = raw.merged_for(backend);
-            let has_entry = raw.backend_specific.contains_key(&backend);
-            let sweep: Result<(), Error> = (|| {
-                interpolate::check_spec_grammar(&merged, &path)?;
-                let (shaped, _dropped_warnings) = resolve_shape(&id, merged, base_dir)?;
-                if Some(backend) == native {
-                    return Ok(());
-                }
-                backend.error(&shaped, supplied)
-            })();
-            sweep.map_err(|e| annotate_sweep_error(e, backend, has_entry))?;
-        }
-
-        // Step 5: the native pass, and the substitution whose result is
-        // kept. Authoritative: it is where the injection gate inspects
-        // final values, and its `ShapedSpec` is the one that becomes a
-        // `DaemonSpec`. No `check_spec_grammar` here — the text is
-        // substituted, and a `.env` value may legally carry a literal `$`.
-        let native_entry = native.filter(|b| raw.backend_specific.contains_key(b));
-        let substituted: Result<(ShapedSpec, Vec<Warning>), Error> = (|| {
-            interpolate::spec(&mut native_merged, &path, &vars)?;
-            resolve_shape(&id, native_merged, base_dir)
+    // Step 4: the all-backends sweep, and errors only: every backend's
+    // merged spec is checked as authored, and `BackendKind::error` judges
+    // the fields its override supplied. A non-native backend's advisories
+    // are not this host's to give, so the shape pass's warnings are
+    // dropped. The native arm runs the grammar and
+    // shape checks and no verdict: `error` runs in step 5 instead, on
+    // the substituted text it is entitled to. This pass is not redundant
+    // even so: it is what makes step 5's failures provably substitution's
+    // fault, and it is where a *literal* control character in the native
+    // override is caught and attributed here.
+    for backend in BackendKind::ALL {
+        let (merged, supplied) = raw.merged_for(backend);
+        let has_entry = raw.backend_specific.contains_key(&backend);
+        let sweep: Result<(), Error> = (|| {
+            interpolate::check_spec_grammar(&merged)?;
+            let (shaped, _dropped_warnings) = resolve_shape(&id, merged, base_dir)?;
+            if Some(backend) == native {
+                return Ok(());
+            }
+            backend.error(&shaped, supplied)
         })();
-        let (shaped, mut daemon_warnings) = substituted.map_err(|e| annotate_step5_error(e, native_entry))?;
-
-        // Annotated like step 4, not like the substitution: the first per-backend rule applied to the
-        // native spec, so a `.env` attribution would be wrong. `error` reads only `native_supplied`
-        // fields, i.e. `backend-specific.<native>`.
-        if let Some(b) = native {
-            b.error(&shaped, native_supplied).map_err(|e| attribute_to(e, b))?;
-            b.warn(&shaped, &mut daemon_warnings);
-        }
-
-        // Step 6: complete.
-        let spec = require_complete(shaped, native)?;
-        specs.push(spec);
-        warnings.extend(daemon_warnings);
+        sweep.map_err(|e| annotate_sweep_error(e, backend, has_entry))?;
     }
 
-    Ok((specs, warnings))
+    // Step 5: the native pass, and the substitution whose result is
+    // kept. Authoritative: it is where the injection gate inspects
+    // final values, and its `ShapedSpec` is the one that becomes a
+    // `DaemonSpec`. No `check_spec_grammar` here — the text is
+    // substituted, and a `.env` value may legally carry a literal `$`.
+    let native_entry = native.filter(|b| raw.backend_specific.contains_key(b));
+    let substituted: Result<(ShapedSpec, Vec<Warning>), Error> = (|| {
+        interpolate::spec(&mut native_merged, &vars)?;
+        resolve_shape(&id, native_merged, base_dir)
+    })();
+    let (shaped, mut daemon_warnings) = substituted.map_err(|e| annotate_step5_error(e, native_entry))?;
+
+    // Annotated like step 4, not like the substitution: the first per-backend rule applied to the
+    // native spec, so a `.env` attribution would be wrong. `error` reads only `native_supplied`
+    // fields, i.e. `backend-specific.<native>`.
+    if let Some(b) = native {
+        b.error(&shaped, native_supplied).map_err(|e| attribute_to(e, b))?;
+        b.warn(&shaped, &mut daemon_warnings);
+    }
+
+    // Step 6: complete.
+    let spec = require_complete(shaped, native)?;
+    warnings.extend(daemon_warnings);
+
+    Ok((spec, warnings))
 }
 
 /// Read and resolve a manifest from `path`. `path` may name the manifest
 /// file itself, or a directory containing `goetia.yaml`.
-pub fn load(path: &Path) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
+pub fn load(path: &Path) -> Result<(DaemonSpec, Vec<Warning>), Error> {
     let (file_path, base_dir) = if path.is_dir() {
         (path.join(MANIFEST_FILE_NAME), path.to_path_buf())
     } else {
@@ -259,7 +234,7 @@ pub fn load(path: &Path) -> Result<(Vec<DaemonSpec>, Vec<Warning>), Error> {
     // field — comes from here, on the file exactly as written. `resolve`
     // interpolates after it, on the typed result, so a `${VAR}` cannot move
     // a position or change a message.
-    let raw = RawManifest::parse(&text)?;
+    let raw = RawSpec::parse(&text)?;
 
     resolve(raw, &base_dir)
 }
@@ -618,7 +593,7 @@ fn resolve_optional_path(
 /// Every check here is deterministic given `(value, base_dir, process
 /// state)` — `std::path::absolute`'s drive-relative fallback reads the
 /// per-drive current directory, so this is not a pure function of `(value,
-/// base_dir)` alone — but every pass `resolve` runs per daemon runs in one
+/// base_dir)` alone — but every pass `resolve` makes runs in one
 /// process against one unchanging process state, so identical values get
 /// identical verdicts across passes. That is what makes "the base pass
 /// passed, therefore this failure is the override's" sound.

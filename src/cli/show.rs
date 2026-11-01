@@ -1,4 +1,4 @@
-//! `goetia daemon show [ID...] [-f FILE]`
+//! `goetia daemon show [ID...]` / `goetia daemon show -f FILE`
 //!
 //! Read-only: never checks elevation. With `-f`, renders straight from a
 //! manifest and touches no manager at all. Without it, reads the spec back
@@ -7,7 +7,7 @@
 //! rather than merely inherited by accident:
 //!
 //! 1. **When both paths can see the daemon**, `show <id>` and
-//!    `show -f <file> <id>` render the same resolved spec identically,
+//!    `show -f <file>` render the same resolved spec identically,
 //!    byte for byte, because both go through [`crate::diff::render_yaml`]
 //!    and neither may grow a renderer of its own. Conditional, not
 //!    unconditional agreement: without `-f`, `show` reads
@@ -15,13 +15,13 @@
 //!    level could not read. Such a unit reaches `show` as
 //!    [`crate::manager::Installed::Undetermined`], so `show <id>` reports
 //!    that it could not determine the id's state and exits `4`, while
-//!    `show -f <file> <id>` still renders it straight from the manifest.
+//!    `show -f <file>` still renders it straight from the manifest.
 //!    On a manifest with a `backend-specific:` block, the spec `show`
 //!    renders is the merged, host-effective one — `show -f` is
 //!    deliberately not a transcription of the file, because it renders
 //!    what would be installed *here*. Guarantee 1 survives that
 //!    unchanged: both paths merge for the same host's native backend, so
-//!    `show <id>` and `show -f <file> <id>` still agree byte for byte,
+//!    `show <id>` and `show -f <file>` still agree byte for byte,
 //!    which is exactly what it claims and all it ever claimed.
 //! 2. Neither path ever checks elevation.
 //! 3. `show -f` touches no manager; `show` without `-f` touches no
@@ -48,16 +48,16 @@ use std::path::{Path, PathBuf};
 use clap::Args as ClapArgs;
 
 use super::report;
-use super::support::{
-    load_and_warn, partition_installed, print_undetermined_warnings, print_unreadable_warnings, select_by_ids,
-};
+use super::support::{load_and_warn, partition_installed, print_undetermined_warnings, print_unreadable_warnings};
 use crate::error::Result;
 use crate::manager::ServiceManager;
 use crate::spec::DaemonSpec;
 
 #[derive(ClapArgs, Debug)]
 pub struct Args {
-    /// Daemon ids to show. With none, shows every matching daemon.
+    /// Daemon ids to show. With none, shows every matching daemon. Not
+    /// combinable with `-f`: a manifest is one daemon.
+    #[arg(conflicts_with = "file")]
     pub ids: Vec<String>,
     /// Render from this manifest (a file, or a directory containing
     /// goetia.yaml) instead of from what is actually installed.
@@ -72,27 +72,20 @@ pub fn run(
     err: &mut dyn Write,
 ) -> i32 {
     match &args.file {
-        Some(file) => show_from_file(file, &args.ids, out, err),
+        Some(file) => show_from_file(file, out, err),
         None => show_from_installed(&args.ids, get_manager, out, err),
     }
 }
 
-fn show_from_file(file: &Path, ids: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    let specs = match load_and_warn(file, err) {
-        Ok(specs) => specs,
+fn show_from_file(file: &Path, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let spec = match load_and_warn(file, err) {
+        Ok(spec) => spec,
         Err(e) => {
             let _ = writeln!(err, "error: {e}");
             return 1;
         }
     };
-    let selected = match select_by_ids(&specs, ids) {
-        Ok(s) => s,
-        Err(msg) => {
-            let _ = writeln!(err, "error: {msg}");
-            return 1;
-        }
-    };
-    print_specs(selected.into_iter(), out);
+    print_specs(std::iter::once(&spec), out);
     0
 }
 
@@ -129,7 +122,7 @@ fn show_from_installed(
 
     // Each id contributes at most one exit-code class, combined by
     // `report::precedence` — the same rule and function `list`/`status`
-    // and `diff` use, reused rather than re-derived here (see `dispatch`'s
+    // use, reused rather than re-derived here (see `dispatch`'s
     // doc comment for the vocabulary and the precedence order itself).
     // Never `max()` on the codes themselves: `1` must outrank `4` even
     // though it is the smaller number, so a later unreadable id cannot

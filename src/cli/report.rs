@@ -376,8 +376,8 @@ pub(crate) fn exit_code(report: &Report) -> i32 {
 }
 
 /// Where an exit code sits in the design spec's `1 > 4 > 5 > 3 > 0`
-/// precedence order. Higher wins. `pub(crate)`, not private: `cli::diff`
-/// combines its own per-daemon exit codes by this identical rule, and must
+/// precedence order. Higher wins. `pub(crate)`, not private: `install`, `show`
+/// and the id verbs combine their own codes by this identical rule, and must
 /// not grow a second copy of it.
 pub(crate) fn precedence(code: i32) -> u8 {
     match code {

@@ -132,6 +132,24 @@ Use `unzip -Z1`, not `unzip -l`: `-l` starts with a banner reading
 `Archive:  <filename>`, which echoes back the name you typed. That name is
 the untrusted claim being checked, so a check that reads it proves nothing.
 
+## The manifest
+
+A `goetia.yaml` describes one daemon: its top level is the daemon's fields.
+`id:` is required and is the name of the installed service.
+
+```yaml
+id: frpc
+command: [bin/frpc, -c, frpc.toml]
+restart: on-failure
+backend-specific:
+  scm: { restart: on-failure }
+```
+
+`-f` takes a manifest file, or a directory holding `goetia.yaml`. Several
+daemons are several manifests, each installed with its own
+`goetia daemon install -f <file>`; manifests in one directory share its
+`.env`.
+
 ## Interpolation
 
 Fields of `goetia.yaml` may reference variables defined in a `.env` file
@@ -245,13 +263,14 @@ Four rules diverge from docker-compose on purpose:
 
 ### What is and is not interpolable
 
-Every manifest field is interpolable except mapping keys and `user.id`:
+Every manifest field is interpolable except `id`, mapping keys and
+`user.id`:
 
-- **Daemon ids** are map keys and are never interpolated. A `$` in one is an
-  error: an interpolated id could collide with another daemon, or change
-  which installed service an artifact belongs to.
-- **`env` names** are map keys too, for the same reason — an interpolated
-  name could silently overwrite another entry. `env` _values_ interpolate
+- **`id`** is never interpolated, because it names the installed service. A
+  `$` in it is an error: an interpolated id could change which service this
+  manifest installs.
+- **`env` names** are map keys, so an interpolated name could silently
+  overwrite another entry. `env` _values_ interpolate
   normally.
 - **`user.id`** is not interpolable. Under `user: {id: 1000}` the value is a
   YAML number, so there is nothing a string could be substituted into; a
@@ -311,21 +330,18 @@ The rejection exists because YAML's `null` was not reaching the manifest as
   applied the default. What the author explicitly wrote was discarded with
   no diagnostic.
 - **A string that is not a field** — an `env` key or value, a `command`
-  element, `user.name`, a daemon id — became the four-character text
+  element, `user.name`, the daemon `id` — became the four-character text
   `null`. `env: {DEBUG: null}` installed a service whose `DEBUG` was the
-  string `null`; `daemons: {null: …}` produced a daemon installed as
-  `null.service`.
-- **A container** — `daemons:`, `env:` or `command:` with nothing under it —
-  became an _empty_ container. A manifest whose `daemons:` key had lost its
-  body installed nothing and exited 0.
+  string `null`; `id: null` produced a daemon installed as `null.service`.
+- **A container** — `env:` or `command:` with nothing under it — became an
+  _empty_ container.
 
 ## An `env` key may not repeat
 
 An `env` key that repeats, or that differs from another only in case, is
 rejected rather than silently keeping one of the two. Case counts because
 Windows looks an environment variable up case-insensitively, so
-`{Path: a, PATH: b}` would reach the daemon as one variable — daemon ids
-have been compared the same way, for the same reason, since before this.
+`{Path: a, PATH: b}` would reach the daemon as one variable.
 
 ## Paths in `command`
 
@@ -390,29 +406,24 @@ account or a service name is rarely the same on all three. A daemon's
 by `systemd`, `launchd` or `scm`:
 
 ```yaml
-daemons:
-  frpc:
-    command: [/opt/frpc/bin/frpc, -c, /opt/frpc/host/frpc.toml]
-    cwd: /opt/frpc
+id: frpc
+command: [/opt/frpc/bin/frpc, -c, /opt/frpc/host/frpc.toml]
+cwd: /opt/frpc
+env:
+  RUST_LOG: info
+restart: on-failure
+backend-specific:
+  systemd:
+    user: frpc
+  launchd:
+    user: frpc
+  scm:
+    command:
+      ['C:\Program Files\frpc\frpc.exe', -c, 'C:\ProgramData\frpc\frpc.toml']
+    cwd: 'C:\ProgramData\frpc'
+    user: 'NT AUTHORITY\LocalService'
     env:
-      RUST_LOG: info
-    restart: on-failure
-    backend-specific:
-      systemd:
-        user: frpc
-      launchd:
-        user: frpc
-      scm:
-        command:
-          [
-            'C:\Program Files\frpc\frpc.exe',
-            -c,
-            'C:\ProgramData\frpc\frpc.toml',
-          ]
-        cwd: 'C:\ProgramData\frpc'
-        user: 'NT AUTHORITY\LocalService'
-        env:
-          RUST_LOG: debug
+      RUST_LOG: debug
 ```
 
 Every field but the daemon's id is overridable: `name`, `command`, `cwd`,
@@ -473,10 +484,6 @@ $ goetia daemon install --dry-run -f goetia.yaml
 error: daemon `frpc`: `restart: always` cannot be honoured by the scm backend: SCM recovery actions never fire after a clean exit. To keep `always` on systemd and launchd, set `backend-specific: scm: { restart: on-failure }`
 ```
 
-`--dry-run` still previews the manifest's other daemons and exits `1`. Without
-it, `install` over a manifest with several daemons installs the others and
-reports the refused one, exiting `1`; under `--start` the refused daemon is not
-started and the others are.
 Override `restart: always` for Windows:
 
 ```yaml
@@ -1024,15 +1031,9 @@ alone and forces unconditionally can loop. Read the message.
 
 **`diff`** returns `0`, `3`, `4`, `5`, or `1`.
 
-- It exits `0` **if and only if** every selected daemon already matches the
-  manifest.
-- It exits `3` when at least one selected daemon would change **and nothing
-  was indeterminate, conflicting, or errored**.
-
-`3` is therefore **not a "drift is present" signal**. One daemon that would
-be created alongside one that conflicts returns `5`, not `3`, because `5`
-outranks `3`. A script that branches on `3` as "is there drift" silently
-skips the conflicting daemon.
+- It exits `0` **if and only if** the daemon already matches the manifest.
+- It exits `3` when the daemon would change, and `5`, `4` or `1` when it
+  would conflict, could not be determined, or errored.
 
 **Id verbs.** `uninstall` alone treats an already-absent artifact as
 success; the other six keep it as a plain failure.
@@ -1106,23 +1107,24 @@ an absent id and an unreadable one exits `1`, not `4`.
 
 ## `show`
 
-`goetia daemon show [ID...] [-f FILE]` renders a daemon's resolved spec as
-YAML. With `-f` it reads a manifest; without, it reads the spec back out of
-what is actually installed. Four guarantees:
+`goetia daemon show [ID...]` and `goetia daemon show -f FILE` render a
+daemon's resolved spec as YAML. With `-f` it reads a manifest, which names one
+daemon, so `-f` takes no id; without, it reads the spec back out of what is
+actually installed. Four guarantees:
 
 1. **When both paths can see the daemon**, `show <id>` and
-   `show -f <file> <id>` render the same resolved spec identically, byte for
+   `show -f <file>` render the same resolved spec identically, byte for
    byte. The agreement is conditional, not unconditional: without `-f`,
    `show` enumerates installed services, which cannot describe a unit this
    privilege level could not read. Such a unit reaches `show` as an
    `undetermined` entry, so `show <id>` reports that it could not determine
-   the id's state and exits `4`, while `show -f <file> <id>` still renders
+   the id's state and exits `4`, while `show -f <file>` still renders
    it from the manifest. On a manifest with a `backend-specific:` block,
    the spec `show` renders is the merged, host-effective one — `show -f`
    is deliberately not a transcription of the file, because it renders
    what would be installed _here_. Guarantee 1 survives that unchanged:
    both paths merge for the same host's native backend, so `show <id>`
-   and `show -f <file> <id>` still agree byte for byte.
+   and `show -f <file>` still agree byte for byte.
 2. Neither path ever checks elevation.
 3. `show -f` touches no service manager; `show` without `-f` touches no
    manifest.

@@ -29,9 +29,9 @@ pub enum Error {
     Interpolate { path: String, message: String },
 
     /// The document is not valid YAML, or fails a shape-level constraint
-    /// checked during deserialization: a duplicate or case-insensitively
-    /// colliding daemon id, or a malformed `user` field. `yaml_serde`
-    /// attaches a line/column to the message.
+    /// checked during deserialization: a missing or duplicate `id`, an
+    /// unknown field such as a leftover `daemons:`, or a malformed `user`
+    /// field. `yaml_serde` attaches a line/column to the message.
     #[error(transparent)]
     Yaml(#[from] yaml_serde::Error),
 

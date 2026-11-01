@@ -1,64 +1,73 @@
-use super::RawManifest;
+use super::RawSpec;
 
-fn parse(yaml: &str) -> Result<RawManifest, yaml_serde::Error> {
-    RawManifest::parse(yaml)
+fn parse(yaml: &str) -> Result<RawSpec, yaml_serde::Error> {
+    RawSpec::parse(yaml)
 }
 
-#[skuld::test]
-fn raw_parse_rejects_duplicate_daemon_ids() {
-    let yaml = "
-daemons:
-  frpc:
-    command: [bin/frpc]
-  frpc:
-    command: [bin/frpc2]
-";
-    let err = parse(yaml).unwrap_err();
-    assert!(
-        err.to_string().contains("frpc"),
-        "error should name the offending id: {err}"
-    );
-}
-
-#[skuld::test]
-fn rejects_case_insensitively_colliding_ids() {
-    let yaml = "
-daemons:
-  Frpc:
-    command: [bin/frpc]
-  frpc:
-    command: [bin/frpc2]
-";
-    let err = parse(yaml).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("Frpc") && msg.contains("frpc"),
-        "error should name both colliding ids: {msg}"
-    );
-}
+// The document is one daemon ==========================================================================================
 
 #[skuld::test]
 fn accepts_a_single_daemon() {
     let yaml = "
-daemons:
-  frpc:
-    command: [bin/frpc]
+id: frpc
+command: [bin/frpc]
 ";
-    let manifest = parse(yaml).expect("valid manifest should parse");
-    assert_eq!(manifest.daemons.len(), 1);
-    assert!(manifest.daemons.contains_key("frpc"));
+    let spec = parse(yaml).expect("valid manifest should parse");
+    assert_eq!(spec.id, "frpc");
 }
 
 #[skuld::test]
-fn rejects_missing_daemons_key() {
-    let err = parse("{}").unwrap_err();
-    assert!(err.to_string().contains("daemons"));
+fn an_old_format_manifest_is_refused_naming_daemons() {
+    let err = parse("daemons: {frpc: {command: [frpc]}}").unwrap_err();
+    assert!(err.to_string().contains("daemons"), "{err}");
+}
+
+#[skuld::test]
+fn a_missing_id_is_refused() {
+    for yaml in ["command: [frpc]\n", ""] {
+        let err = parse(yaml).unwrap_err();
+        assert!(err.to_string().contains("`id`"), "{yaml:?}: {err}");
+    }
+}
+
+#[skuld::test]
+fn a_null_id_is_refused_at_its_line() {
+    // `id: null` and an empty `id:` both reach the scan as a `String` the
+    // typed parse accepted; the refusal carries the line of the `id` key.
+    for spelling in ["id: null", "id: ~", "id:"] {
+        let yaml = format!("command: [frpc]\n{spelling}\n");
+        let err = parse(&yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("an explicit `null` is not a daemon id; quote the value to use its literal text"),
+            "`{spelling}`: {err}"
+        );
+        assert!(err.contains("line 2"), "`{spelling}`: {err}");
+    }
+}
+
+#[skuld::test]
+fn a_duplicate_id_key_is_refused() {
+    let err = parse("id: frpc\nid: other\ncommand: [frpc]\n").unwrap_err();
+    assert!(err.to_string().contains("duplicate field"), "{err}");
+}
+
+#[skuld::test]
+fn an_id_in_an_override_is_an_unknown_field() {
+    let err = parse("id: frpc\nbackend-specific: {systemd: {id: x}}\n").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("unknown field `id`"), "{msg}");
+}
+
+#[skuld::test]
+fn a_quoted_null_id_is_accepted() {
+    let spec = parse("id: \"null\"\ncommand: [bin/frpc]\n").expect("a quoted `null` id should parse");
+    assert_eq!(spec.id, "null");
 }
 
 #[skuld::test]
 fn rejects_unknown_top_level_key() {
     let yaml = "
-daemons: {}
+id: frpc
 extra: true
 ";
     let err = parse(yaml).unwrap_err();
@@ -68,10 +77,9 @@ extra: true
 #[skuld::test]
 fn rejects_unknown_daemon_field() {
     let yaml = "
-daemons:
-  frpc:
-    command: [bin/frpc]
-    bogus: true
+id: frpc
+command: [bin/frpc]
+bogus: true
 ";
     let err = parse(yaml).unwrap_err();
     assert!(err.to_string().contains("bogus"));
@@ -100,7 +108,7 @@ fn explicit_null_is_rejected_for_every_base_field() {
         // `command` is `Option` here — a missing one is a backend's problem,
         // not the document's — so no row needs a fixed `command:` line, and
         // the `command` row would collide with one as a duplicate field.
-        let yaml = format!("daemons:\n  frpc:\n    {field}: null\n");
+        let yaml = format!("id: frpc\n{field}: null\n");
 
         let err = parse(&yaml).unwrap_err();
         let msg = err.to_string();
@@ -124,10 +132,9 @@ fn an_explicit_null_restart_is_rejected() {
     // be re-typed to its parsed form, and the null-rejection is easiest to
     // lose in exactly that change.
     let yaml = "
-daemons:
-  frpc:
-    command: [bin/frpc]
-    restart: null
+id: frpc
+command: [bin/frpc]
+restart: null
 ";
     let err = parse(yaml).unwrap_err();
     assert!(
@@ -140,10 +147,9 @@ daemons:
 fn an_explicit_null_type_is_rejected() {
     // See `an_explicit_null_restart_is_rejected`: `type` is the `Kind` half.
     let yaml = "
-daemons:
-  frpc:
-    command: [bin/frpc]
-    type: null
+id: frpc
+command: [bin/frpc]
+type: null
 ";
     let err = parse(yaml).unwrap_err();
     assert!(
@@ -157,10 +163,9 @@ fn an_explicit_null_restart_delay_is_rejected() {
     // See `an_explicit_null_restart_is_rejected`: a `Duration` via
     // `humantime_serde::option` swallows a `null` silently.
     let yaml = "
-daemons:
-  frpc:
-    command: [bin/frpc]
-    restart-delay: null
+id: frpc
+command: [bin/frpc]
+restart-delay: null
 ";
     let err = parse(yaml).unwrap_err();
     assert!(
@@ -178,9 +183,8 @@ fn a_null_command_element_is_rejected() {
     for command in ["[null]", "[/bin/frpc, null]", "[/bin/frpc, ~]"] {
         let yaml = format!(
             "
-daemons:
-  frpc:
-    command: {command}
+id: frpc
+command: {command}
 "
         );
         let err = parse(&yaml).unwrap_err();
@@ -196,13 +200,12 @@ fn an_empty_command_element_is_accepted() {
     // Only `null` is refused: an empty argv element is legitimate on POSIX,
     // and every generator quotes it — see `reject_empty`'s doc comment.
     let yaml = "
-daemons:
-  frpc:
-    command: [bin/frpc, \"\"]
+id: frpc
+command: [bin/frpc, \"\"]
 ";
-    let manifest = parse(yaml).expect("an empty argv element should parse");
+    let spec = parse(yaml).expect("an empty argv element should parse");
     assert_eq!(
-        manifest.daemons["frpc"].command.as_deref(),
+        spec.command.as_deref(),
         Some(["bin/frpc".to_string(), String::new()].as_slice())
     );
 }
@@ -212,11 +215,10 @@ fn null_env_values_are_rejected() {
     for spelling in ["null", "~", ""] {
         let yaml = format!(
             "
-daemons:
-  frpc:
-    command: [bin/frpc]
-    env:
-      A: {spelling}
+id: frpc
+command: [bin/frpc]
+env:
+  A: {spelling}
 "
         );
         let err = parse(&yaml).unwrap_err();
@@ -231,14 +233,13 @@ daemons:
 #[skuld::test]
 fn an_empty_env_value_is_accepted() {
     let yaml = "
-daemons:
-  frpc:
-    command: [bin/frpc]
-    env:
-      A: \"\"
+id: frpc
+command: [bin/frpc]
+env:
+  A: \"\"
 ";
-    let manifest = parse(yaml).expect("an empty env value should parse");
-    assert_eq!(manifest.daemons["frpc"].env.get("A"), Some(&String::new()));
+    let spec = parse(yaml).expect("an empty env value should parse");
+    assert_eq!(spec.env.get("A"), Some(&String::new()));
 }
 
 #[skuld::test]
@@ -246,32 +247,29 @@ fn null_env_keys_are_rejected() {
     let cases = [
         (
             "
-daemons:
-  frpc:
-    command: [bin/frpc]
-    env:
-      null: v
+id: frpc
+command: [bin/frpc]
+env:
+  null: v
 ",
             "unquoted `null` key",
         ),
         (
             "
-daemons:
-  frpc:
-    command: [bin/frpc]
-    env:
-      ~: v
+id: frpc
+command: [bin/frpc]
+env:
+  ~: v
 ",
             "unquoted `~` key",
         ),
         (
             "
-daemons:
-  frpc:
-    command: [bin/frpc]
-    env:
-      ?
-      : v
+id: frpc
+command: [bin/frpc]
+env:
+  ?
+  : v
 ",
             "explicit empty key",
         ),
@@ -292,14 +290,13 @@ fn a_quoted_null_env_key_and_value_are_accepted() {
     // guard that rejected both would pass every test above and still be
     // wrong.
     let yaml = "
-daemons:
-  frpc:
-    command: [bin/frpc]
-    env:
-      \"null\": \"null\"
+id: frpc
+command: [bin/frpc]
+env:
+  \"null\": \"null\"
 ";
-    let manifest = parse(yaml).expect("a quoted `null` key and value should parse");
-    assert_eq!(manifest.daemons["frpc"].env.get("null"), Some(&"null".to_string()));
+    let spec = parse(yaml).expect("a quoted `null` key and value should parse");
+    assert_eq!(spec.env.get("null"), Some(&"null".to_string()));
 }
 
 #[skuld::test]
@@ -309,12 +306,11 @@ fn duplicate_env_key_is_rejected() {
     // loss this manifest surface cannot afford: the daemon would run with
     // an environment the author never wrote and cannot see they lost.
     let yaml = "
-daemons:
-  frpc:
-    command: [bin/frpc]
-    env:
-      PORT: \"8080\"
-      PORT: \"9090\"
+id: frpc
+command: [bin/frpc]
+env:
+  PORT: \"8080\"
+  PORT: \"9090\"
 ";
     let err = parse(yaml).unwrap_err();
     assert!(err.to_string().contains("PORT"), "error should name `PORT`: {err}");
@@ -329,15 +325,12 @@ fn env_keys_that_differ_only_in_case_are_rejected() {
     // child as one variable, exactly the outcome the byte-exact check was
     // written to stop. Refused on every platform, because a manifest is
     // portable and the author gets no warning on the host where it bites.
-    // `DaemonsVisitor` has refused a case collision in daemon ids for the
-    // same reason since before this check existed.
     let yaml = "
-daemons:
-  frpc:
-    command: [bin/frpc]
-    env:
-      Path: a
-      PATH: b
+id: frpc
+command: [bin/frpc]
+env:
+  Path: a
+  PATH: b
 ";
     let err = parse(yaml).unwrap_err().to_string();
     assert!(
@@ -354,17 +347,16 @@ daemons:
 fn env_keys_that_differ_by_more_than_case_are_accepted() {
     // The other half of the rule: nothing but a case fold is collapsed.
     let yaml = "
-daemons:
-  frpc:
-    command: [bin/frpc]
-    env:
-      A: \"1\"
-      AB: \"2\"
-      A_: \"3\"
-      B: \"4\"
+id: frpc
+command: [bin/frpc]
+env:
+  A: \"1\"
+  AB: \"2\"
+  A_: \"3\"
+  B: \"4\"
 ";
-    let manifest = parse(yaml).expect("distinct keys should parse");
-    assert_eq!(manifest.daemons["frpc"].env.len(), 4);
+    let spec = parse(yaml).expect("distinct keys should parse");
+    assert_eq!(spec.env.len(), 4);
 }
 
 #[skuld::test]
@@ -382,67 +374,17 @@ fn a_null_user_name_or_id_is_rejected() {
         for spelling in ["null", "~", ""] {
             let yaml = format!(
                 "
-daemons:
-  frpc:
-    command: [bin/frpc]
-    user:
-      {field}: {spelling}
+id: frpc
+command: [bin/frpc]
+user:
+  {field}: {spelling}
 "
             );
             let err = parse(&yaml).unwrap_err().to_string();
             assert!(err.contains(expected), "`{field}: {spelling}`: {err}");
-            assert!(err.contains("daemons.frpc.user"), "should name the position: {err}");
+            assert!(err.contains("user"), "should name the position: {err}");
         }
     }
-}
-
-#[skuld::test]
-fn a_null_daemon_id_is_rejected() {
-    let cases = [
-        (
-            "
-daemons:
-  null:
-    command: [bin/frpc]
-",
-            "unquoted `null` id",
-        ),
-        (
-            "
-daemons:
-  ~:
-    command: [bin/frpc]
-",
-            "unquoted `~` id",
-        ),
-        (
-            "
-daemons:
-  ?
-  :
-    command: [bin/frpc]
-",
-            "explicit empty id",
-        ),
-    ];
-    for (yaml, label) in cases {
-        let err = parse(yaml).unwrap_err();
-        assert!(
-            err.to_string().contains("an explicit `null` is not a daemon id"),
-            "{label}: got {err}"
-        );
-    }
-}
-
-#[skuld::test]
-fn a_quoted_null_daemon_id_is_accepted() {
-    let yaml = "
-daemons:
-  \"null\":
-    command: [bin/frpc]
-";
-    let manifest = parse(yaml).expect("a quoted `null` id should parse");
-    assert!(manifest.daemons.contains_key("null"));
 }
 
 #[skuld::test]
@@ -451,15 +393,13 @@ fn unquoted_scalars_still_coerce_through_the_null_guards() {
     // the unquoted-scalar coercion, which is why they deserialize
     // `Option<T>` rather than sniffing the scalar's text.
     let yaml = "
-daemons:
-  frpc:
-    name: 42
-    command: [/bin/sleep, 30]
-    env:
-      PORT: 8080
+id: frpc
+name: 42
+command: [/bin/sleep, 30]
+env:
+  PORT: 8080
 ";
-    let manifest = parse(yaml).expect("unquoted scalars should coerce, not fail");
-    let spec = &manifest.daemons["frpc"];
+    let spec = parse(yaml).expect("unquoted scalars should coerce, not fail");
 
     assert_eq!(spec.name.as_deref(), Some("42"));
     assert_eq!(
@@ -478,81 +418,65 @@ daemons:
 /// container's own start position onto it.
 #[skuld::test]
 fn a_rejection_points_at_the_offending_node_and_names_it() {
-    let cases: [(&str, &str, &str); 6] = [
+    let cases: [(&str, &str, &str); 5] = [
         (
             "\
-daemons:
-  frpc:
-    command: [bin/frpc]
-    cwd: /tmp
-    logs: /tmp/l.log
-    name: hello
-    type: simple
-    restart-delay: 5s
-    restart: null
+id: frpc
+command: [bin/frpc]
+cwd: /tmp
+logs: /tmp/l.log
+name: hello
+type: simple
+restart-delay: 5s
+restart: null
 ",
-            "daemons.frpc.restart",
-            "line 9",
+            "restart",
+            "line 8",
         ),
         (
             "\
-daemons:
-  frpc:
-    command: [bin/frpc]
-    env:
-      A: \"1\"
-      B: \"2\"
-      C: null
-      D: \"4\"
+id: frpc
+command: [bin/frpc]
+env:
+  A: \"1\"
+  B: \"2\"
+  C: null
+  D: \"4\"
 ",
-            "daemons.frpc.env.C",
-            "line 7",
-        ),
-        (
-            "\
-daemons:
-  frpc:
-    command: [bin/frpc]
-    env:
-      A: \"1\"
-      B: \"2\"
-      ~: \"3\"
-",
-            "daemons.frpc.env",
-            "line 7",
-        ),
-        (
-            "\
-daemons:
-  frpc:
-    command:
-      - bin/frpc
-      - --config
-      - null
-",
-            "daemons.frpc.command[2]",
+            "env.C",
             "line 6",
         ),
         (
             "\
-daemons:
-  frpc:
-    command: [bin/frpc]
-    user:
-      name: null
+id: frpc
+command: [bin/frpc]
+env:
+  A: \"1\"
+  B: \"2\"
+  ~: \"3\"
 ",
-            "daemons.frpc.user.name",
+            "env",
+            "line 6",
+        ),
+        (
+            "\
+id: frpc
+command:
+  - bin/frpc
+  - --config
+  - null
+",
+            "command[2]",
             "line 5",
         ),
         (
             "\
-daemons:
-  frpc:
-    command: [bin/frpc]
-  ~:
-    command: [bin/other]
+id: frpc
+command: [bin/frpc]
+user:
+  name: null
 ",
-            "daemons",
+            "user.name",
             "line 4",
         ),
     ];
@@ -573,24 +497,21 @@ daemons:
 fn a_tag_resolved_null_is_rejected_wherever_a_plain_one_is() {
     let positions: [(&str, &str); 6] = [
         (
-            "daemons:\n  frpc:\n    command: [bin/frpc]\n    name: {null}\n",
+            "id: frpc\ncommand: [bin/frpc]\nname: {null}\n",
             "not a way to unset this field",
         ),
         (
-            "daemons:\n  frpc:\n    command: [bin/frpc]\n    env:\n      {null}: v\n",
+            "id: frpc\ncommand: [bin/frpc]\nenv:\n  {null}: v\n",
             "not an environment variable name",
         ),
         (
-            "daemons:\n  frpc:\n    command: [bin/frpc]\n    env:\n      A: {null}\n",
+            "id: frpc\ncommand: [bin/frpc]\nenv:\n  A: {null}\n",
             "not an environment value",
         ),
+        ("id: frpc\ncommand: [bin/frpc, {null}]\n", "not a command element"),
+        ("id: {null}\ncommand: [bin/frpc]\n", "not a daemon id"),
         (
-            "daemons:\n  frpc:\n    command: [bin/frpc, {null}]\n",
-            "not a command element",
-        ),
-        ("daemons:\n  {null}:\n    command: [bin/frpc]\n", "not a daemon id"),
-        (
-            "daemons:\n  frpc:\n    command: [bin/frpc]\n    user:\n      name: {null}\n",
+            "id: frpc\ncommand: [bin/frpc]\nuser:\n  name: {null}\n",
             "not a username",
         ),
     ];
@@ -619,29 +540,21 @@ fn a_tag_resolved_null_is_rejected_wherever_a_plain_one_is() {
 /// An empty value is a YAML null, and `null` is refused *wherever a
 /// manifest value is expected* — including where the expected value is a
 /// container. `yaml_serde` maps an empty plain scalar onto an empty map
-/// or sequence when asked for one, so without a guard `daemons:` with no
-/// body installs nothing and exits 0. Written out as `null`, a container
-/// the typed parse insists on — `daemons`, `env` — is a type error it
+/// or sequence when asked for one, so without a guard `env:` with no body
+/// would install with an empty environment. Written out as `null`, a
+/// container the typed parse insists on — `env` — is a type error it
 /// refuses first, naming the field and the container it wanted; `command`
 /// is an `Option` here, so both spellings reach the scan.
 #[skuld::test]
 fn an_empty_container_body_is_rejected() {
-    let cases: [(&str, &str); 6] = [
-        ("daemons:\n", "not a set of daemons"),
+    let cases: [(&str, &str); 4] = [
+        ("id: frpc\ncommand: [bin/frpc]\nenv:\n", "not an environment block"),
         (
-            "daemons: null\n",
-            "invalid type: unit value, expected a mapping of daemon id to daemon spec",
-        ),
-        (
-            "daemons:\n  frpc:\n    command: [bin/frpc]\n    env:\n",
-            "not an environment block",
-        ),
-        (
-            "daemons:\n  frpc:\n    command: [bin/frpc]\n    env: null\n",
+            "id: frpc\ncommand: [bin/frpc]\nenv: null\n",
             "invalid type: unit value, expected a mapping of environment variable name to value",
         ),
-        ("daemons:\n  frpc:\n    command:\n", "not a command"),
-        ("daemons:\n  frpc:\n    command: null\n", "not a command"),
+        ("id: frpc\ncommand:\n", "not a command"),
+        ("id: frpc\ncommand: null\n", "not a command"),
     ];
     for (yaml, expected) in cases {
         let err = parse(yaml).unwrap_err().to_string();
@@ -653,11 +566,8 @@ fn an_empty_container_body_is_rejected() {
 /// container is a value the author chose, and stays legal.
 #[skuld::test]
 fn an_explicitly_empty_container_is_accepted() {
-    let manifest = parse("daemons: {}\n").expect("`daemons: {}` should parse");
-    assert!(manifest.daemons.is_empty());
-
-    let manifest = parse("daemons:\n  frpc:\n    command: [bin/frpc]\n    env: {}\n").expect("`env: {}` should parse");
-    assert!(manifest.daemons["frpc"].env.is_empty());
+    let spec = parse("id: frpc\ncommand: [bin/frpc]\nenv: {}\n").expect("`env: {}` should parse");
+    assert!(spec.env.is_empty());
 }
 
 // What the typed parse owns ===========================================================================================
@@ -669,7 +579,7 @@ fn an_explicitly_empty_container_is_accepted() {
 #[skuld::test]
 fn a_typo_is_named_as_a_typo_even_when_its_value_is_null() {
     for value in ["null", "~", "{a: {b: null}}", "[null]"] {
-        let yaml = format!("daemons:\n  frpc:\n    command: [bin/frpc]\n    bogus: {value}\n");
+        let yaml = format!("id: frpc\ncommand: [bin/frpc]\nbogus: {value}\n");
         let err = parse(&yaml).unwrap_err().to_string();
         assert!(err.contains("unknown field `bogus`"), "`bogus: {value}`: {err}");
     }
@@ -683,16 +593,14 @@ fn a_null_key_is_named_as_an_unknown_field() {
     let err = parse("~: 1\n").unwrap_err().to_string();
     assert!(err.contains("unknown field `~`"), "{err}");
 
-    let err = parse("daemons:\n  frpc:\n    command: [bin/frpc]\n    ~: 1\n")
-        .unwrap_err()
-        .to_string();
+    let err = parse("id: frpc\ncommand: [bin/frpc]\n~: 1\n").unwrap_err().to_string();
     assert!(err.contains("unknown field `~`"), "{err}");
-    assert!(err.contains("line 4"), "should name the position: {err}");
+    assert!(err.contains("line 3"), "should name the position: {err}");
 }
 
 #[skuld::test]
 fn a_duplicate_field_whose_repeat_is_null_is_named_as_a_duplicate() {
-    let err = parse("daemons:\n  frpc:\n    command: [bin/frpc]\n    logs: /a\n    logs: null\n")
+    let err = parse("id: frpc\ncommand: [bin/frpc]\nlogs: /a\nlogs: null\n")
         .unwrap_err()
         .to_string();
     assert!(err.contains("duplicate field `logs`"), "{err}");
@@ -701,12 +609,8 @@ fn a_duplicate_field_whose_repeat_is_null_is_named_as_a_duplicate() {
 #[skuld::test]
 fn a_container_of_the_wrong_type_is_named_as_a_type_error() {
     for (yaml, expected) in [
-        ("daemons: [null]\n", "invalid type: sequence"),
-        (
-            "daemons:\n  frpc:\n    command: [bin/frpc]\n    env: [null]\n",
-            "invalid type: sequence",
-        ),
-        ("daemons:\n  frpc:\n    command: {a: null}\n", "invalid type: map"),
+        ("id: frpc\ncommand: [bin/frpc]\nenv: [null]\n", "invalid type: sequence"),
+        ("id: frpc\ncommand: {a: null}\n", "invalid type: map"),
     ] {
         let err = parse(yaml).unwrap_err().to_string();
         assert!(err.contains(expected), "expected `{expected}`, got: {err}");
@@ -729,24 +633,23 @@ fn a_standard_tag_the_typed_parse_ignores_is_not_a_parse_error() {
         ("!!null \"x\"", "x"),
         ("!!str 5", "5"),
     ] {
-        let yaml = format!("daemons:\n  frpc:\n    command: [bin/frpc]\n    env:\n      V: {value}\n");
-        let manifest = parse(&yaml).unwrap_or_else(|err| panic!("`{value}` holds no null: {err}"));
-        assert_eq!(manifest.daemons["frpc"].env["V"], text, "`{value}`");
+        let yaml = format!("id: frpc\ncommand: [bin/frpc]\nenv:\n  V: {value}\n");
+        let spec = parse(&yaml).unwrap_or_else(|err| panic!("`{value}` holds no null: {err}"));
+        assert_eq!(spec.env["V"], text, "`{value}`");
     }
 }
 
 #[skuld::test]
 fn a_null_behind_a_tag_the_scan_cannot_read_is_still_refused() {
     let yaml = "
-daemons:
-  frpc:
-    command: [bin/frpc]
-    env: {V: !!int abc}
-    restart: null
+id: frpc
+command: [bin/frpc]
+env: {V: !!int abc}
+restart: null
 ";
     let err = parse(yaml).unwrap_err().to_string();
     assert!(err.contains("an explicit `null`"), "{err}");
-    assert!(err.contains("daemons.frpc.restart"), "should name the position: {err}");
+    assert!(err.contains("restart"), "should name the position: {err}");
 }
 
 #[skuld::test]
@@ -754,17 +657,17 @@ fn a_locally_tagged_key_is_the_field_it_names() {
     // The typed parse resolves the tag away and honours `!mine env` as
     // `env`; the scan has to agree, or its message contradicts its own key
     // path.
-    let err = parse("daemons:\n  frpc:\n    command: [bin/frpc]\n    !mine env:\n      A: null\n")
+    let err = parse("id: frpc\ncommand: [bin/frpc]\n!mine env:\n  A: null\n")
         .unwrap_err()
         .to_string();
     assert!(err.contains("is not an environment value"), "{err}");
-    assert!(err.contains("daemons.frpc.env.A"), "should name the position: {err}");
+    assert!(err.contains("env.A"), "should name the position: {err}");
 }
 
 #[skuld::test]
 fn a_null_user_is_refused_as_a_user() {
     for spelling in ["null", "~", ""] {
-        let yaml = format!("daemons:\n  frpc:\n    command: [bin/frpc]\n    user: {spelling}\n");
+        let yaml = format!("id: frpc\ncommand: [bin/frpc]\nuser: {spelling}\n");
         let err = parse(&yaml).unwrap_err().to_string();
         assert!(err.contains("an explicit `null` is not a user"), "`{spelling}`: {err}");
     }

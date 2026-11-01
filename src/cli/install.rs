@@ -1,4 +1,4 @@
-//! `goetia daemon install [ID...] [-f FILE] [--force] [--start] [--enable] [--dry-run]`
+//! `goetia daemon install [-f FILE] [--force] [--start] [--enable] [--dry-run]`
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use clap::Args as ClapArgs;
 
 use super::report;
-use super::support::{load_and_warn, require_elevation, select_by_ids};
+use super::support::{load_and_warn, require_elevation};
 use super::wait::WaitArgs;
 use crate::backend::Identity;
 use crate::decide::Outcome;
@@ -16,18 +16,16 @@ use crate::spec::{AccountId, DaemonSpec, Id, User};
 
 #[derive(ClapArgs, Debug)]
 pub struct Args {
-    /// Daemon ids to install. With none, installs every daemon in the file.
-    pub ids: Vec<String>,
     /// Path to goetia.yaml, or a directory containing it.
     #[arg(short = 'f', long = "file", default_value = ".")]
     pub file: PathBuf,
     /// Overwrite an artifact hand-edited outside Goetia.
     #[arg(long)]
     pub force: bool,
-    /// Also start each daemon after installing it.
+    /// Also start the daemon after installing it.
     #[arg(long)]
     pub start: bool,
-    /// Also enable each daemon at boot after installing it.
+    /// Also enable the daemon at boot after installing it.
     #[arg(long)]
     pub enable: bool,
     /// Print the artifact text install would write for this host, then
@@ -49,40 +47,26 @@ pub fn run(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
-    let specs = match load_and_warn(&args.file, err) {
-        Ok(specs) => specs,
+    let spec = match load_and_warn(&args.file, err) {
+        Ok(spec) => spec,
         Err(e) => {
             let _ = writeln!(err, "error: {e}");
             return 1;
         }
     };
-    let selected = match select_by_ids(&specs, &args.ids) {
-        Ok(s) => s,
-        Err(msg) => {
-            let _ = writeln!(err, "error: {msg}");
-            return 1;
-        }
-    };
 
     if args.dry_run {
-        // A daemon whose generator refuses it is reported and does not hide the previews of the rest.
-        let mut refused = false;
-        for (i, spec) in selected.iter().enumerate() {
-            if i > 0 {
-                let _ = writeln!(out);
+        let _ = writeln!(out, "# {}", spec.id);
+        return match preview_artifact(&spec, err) {
+            Ok(artifact) => {
+                let _ = write!(out, "{artifact}");
+                0
             }
-            let _ = writeln!(out, "# {}", spec.id);
-            match preview_artifact(spec, err) {
-                Ok(artifact) => {
-                    let _ = write!(out, "{artifact}");
-                }
-                Err(e) => {
-                    let _ = writeln!(err, "error: {e}");
-                    refused = true;
-                }
+            Err(e) => {
+                let _ = writeln!(err, "error: {e}");
+                1
             }
-        }
-        return i32::from(refused);
+        };
     }
 
     if let Err(code) = require_elevation("daemon install", is_elevated, err) {
@@ -96,63 +80,54 @@ pub fn run(
         }
     };
 
-    // Each daemon contributes at most one exit-code class per step, combined
-    // by `report::precedence` — the same rule and function `list`/`status`,
-    // `diff` and `show` use, reused rather than re-derived here (see
-    // `dispatch`'s doc comment for the vocabulary and the ordering itself).
-    // Never `max()` on the codes themselves: `1` (a refusal or a hard
-    // failure) must outrank `5` even though it is the smaller number, or a
-    // real error hides behind a conflict — and `5` specifically promises
+    // Each step (install, `--enable`, `--start`) contributes at most one
+    // exit-code class, combined by `report::precedence` — the same rule and
+    // function `list`/`status` and `show` use, reused rather than re-derived
+    // here (see `dispatch`'s doc comment for the vocabulary and the ordering
+    // itself). Never `max()` on the codes themselves: `1` (a refusal or a
+    // hard failure) must outrank `5` even though it is the smaller number, or
+    // a real error hides behind a conflict — and `5` specifically promises
     // "every failure here is force-resolvable", which stops being true the
-    // moment one daemon in the same run hard-failed.
+    // moment another step in the same run hard-failed.
     let mut codes: Vec<i32> = Vec::new();
-    for spec in &selected {
-        // Before the install sends anything, so that nothing the start needs
-        // can run out after the install booted a loaded job out.
-        let _prepared = if args.start {
-            match mgr.prepare(&[Step::Install, Step::Start], args.wait.budget()) {
-                Ok(prepared) => prepared,
-                Err(e) => {
-                    let _ = writeln!(err, "error: {}: {e}", spec.id);
-                    codes.push(failure_code(&e));
-                    continue;
-                }
-            }
-        } else {
-            Prepared::nothing()
-        };
-        match mgr.install(spec, args.force) {
-            Ok(outcome) => {
-                match report_outcome(&spec.id, &outcome, out, err) {
-                    OutcomeClass::Ok => codes.push(0),
-                    OutcomeClass::Conflict => {
-                        // Nothing was (re)written: neither flag below has
-                        // anything to act on.
-                        codes.push(5);
-                        continue;
-                    }
-                    OutcomeClass::Refused => {
-                        codes.push(1);
-                        continue;
-                    }
-                }
-                if args.enable {
-                    if let Err(e) = mgr.enable(&spec.id) {
-                        let _ = writeln!(err, "error: {}: enable: {e}", spec.id);
-                        codes.push(failure_code(&e));
-                    }
-                }
-                if args.start {
-                    if let Err(e) = mgr.start(&spec.id, args.wait.budget()) {
-                        let _ = writeln!(err, "error: {}: start: {e}", spec.id);
-                        codes.push(failure_code(&e));
-                    }
-                }
-            }
+    // Before the install sends anything, so that nothing the start needs
+    // can run out after the install booted a loaded job out.
+    let _prepared = if args.start {
+        match mgr.prepare(&[Step::Install, Step::Start], args.wait.budget()) {
+            Ok(prepared) => prepared,
             Err(e) => {
                 let _ = writeln!(err, "error: {}: {e}", spec.id);
-                codes.push(failure_code(&e));
+                return failure_code(&e);
             }
+        }
+    } else {
+        Prepared::nothing()
+    };
+    match mgr.install(&spec, args.force) {
+        Ok(outcome) => {
+            match report_outcome(&spec.id, &outcome, out, err) {
+                OutcomeClass::Ok => codes.push(0),
+                // Nothing was (re)written: neither flag below has anything to
+                // act on.
+                OutcomeClass::Conflict => return 5,
+                OutcomeClass::Refused => return 1,
+            }
+            if args.enable {
+                if let Err(e) = mgr.enable(&spec.id) {
+                    let _ = writeln!(err, "error: {}: enable: {e}", spec.id);
+                    codes.push(failure_code(&e));
+                }
+            }
+            if args.start {
+                if let Err(e) = mgr.start(&spec.id, args.wait.budget()) {
+                    let _ = writeln!(err, "error: {}: start: {e}", spec.id);
+                    codes.push(failure_code(&e));
+                }
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(err, "error: {}: {e}", spec.id);
+            codes.push(failure_code(&e));
         }
     }
     codes
