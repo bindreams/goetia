@@ -149,22 +149,11 @@ fn f_flag_accepts_a_directory() {
 #[skuld::test]
 fn install_refuses_a_positional_id() {
     let dir = tempfile::tempdir().unwrap();
-    write_manifest(
-        dir.path(),
-        "id: frpc
-command: [frpc]
-",
-    );
+    write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\n");
 
     let (code, out, err) = run_cli(&["daemon", "install", "--dry-run", "frpc"], dir.path());
 
-    assert_eq!(
-        code, 2,
-        "stdout:
-{out}
-stderr:
-{err}"
-    );
+    assert_eq!(code, 2, "stdout:\n{out}\nstderr:\n{err}");
     assert!(out.is_empty(), "a refused command line prints no artifact: {out}");
 }
 

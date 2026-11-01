@@ -1163,11 +1163,9 @@ fn an_interpolated_value_cannot_create_a_field() {
     assert_eq!(raw.command.as_deref(), Some(&["/bin/frpc".to_string()][..]));
     assert_eq!(raw.name.as_deref(), Some(evil));
 
-    // `resolve` runs the injection gate on the substituted value once, not
-    // that a second substitution is a no-op, inside `resolve`,
-    // on the merged native spec: `evil` holds no `$`, so `resolve`'s own
-    // substitution pass leaves it untouched and the injection gate is what
-    // actually rejects it.
+    // `resolve` runs the injection gate once, on the merged native spec.
+    // Its own substitution pass is a no-op here: `evil` holds no `$`, so it
+    // is left untouched and the injection gate is what actually rejects it.
     let err = resolve(raw, &base_dir()).unwrap_err();
     assert!(
         err.to_string().contains("control character"),

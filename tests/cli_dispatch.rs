@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Parser as _;
+use clap::error::ErrorKind;
 use goetia::cli::{self, Cli, Command, DaemonCommand};
 use goetia::manager::fake::Fake;
 use goetia::manager::{Budget, Installed, ServiceManager, State, Status, Step};
@@ -454,7 +455,7 @@ fn install_refuses_a_positional_id() {
         dir.path().to_str().unwrap(),
     ]);
 
-    assert!(parsed.is_err(), "`install frpc` must be a usage error");
+    assert_eq!(parsed.unwrap_err().kind(), ErrorKind::UnknownArgument);
 }
 
 #[skuld::test]
@@ -463,7 +464,7 @@ fn diff_refuses_a_positional_id() {
 
     let parsed = Cli::try_parse_from(["goetia", "daemon", "diff", "frpc", "-f", dir.path().to_str().unwrap()]);
 
-    assert!(parsed.is_err(), "`diff frpc` must be a usage error");
+    assert_eq!(parsed.unwrap_err().kind(), ErrorKind::UnknownArgument);
 }
 
 /// Not a silent drop of the id: `show -f FILE` renders the file's one daemon, so a named id
@@ -474,7 +475,7 @@ fn show_from_file_refuses_an_id() {
 
     let parsed = Cli::try_parse_from(["goetia", "daemon", "show", "-f", dir.path().to_str().unwrap(), "frpc"]);
 
-    assert!(parsed.is_err(), "`show -f FILE frpc` must be a usage error");
+    assert_eq!(parsed.unwrap_err().kind(), ErrorKind::ArgumentConflict);
 }
 
 /// The remedy `--force` is published as has to be one that works. When part of what makes the
@@ -1705,6 +1706,44 @@ fn install_reports_enable_and_start_failures_and_exits_nonzero() {
     assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
     assert!(err.contains("enable"), "{err}");
     assert!(err.contains("start"), "{err}");
+}
+
+/// `install` combines its own steps by `report::precedence`, not by the integers: a hard failure
+/// (`1`) outranks an unanswered question (`4`) whichever step it comes from.
+#[skuld::test]
+fn install_combines_its_steps_by_precedence() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\n");
+    let frpc = Some("frpc".to_string());
+
+    for mgr in [
+        FlakyManager {
+            undetermined_enable_for: frpc.clone(),
+            fail_start_for: frpc.clone(),
+            ..Default::default()
+        },
+        FlakyManager {
+            fail_enable_for: frpc.clone(),
+            undetermined_start_for: frpc.clone(),
+            ..Default::default()
+        },
+    ] {
+        let (code, out, err) = dispatch_with(
+            &[
+                "goetia",
+                "daemon",
+                "install",
+                "-f",
+                manifest.to_str().unwrap(),
+                "--enable",
+                "--start",
+            ],
+            &mgr,
+            &|| true,
+        );
+
+        assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    }
 }
 
 /// `-v`/`-q` are still reserved (see `Cli`'s doc comments) rather than wired
