@@ -591,7 +591,7 @@ thread_local! {
 /// of the budget. Scopes nest and end in any order; the answer is forgotten when the last one ends,
 /// so nothing outlives the invocation that opened them, and a manager that changes between two is
 /// asked again.
-pub(super) struct GateScope {
+pub(crate) struct GateScope {
     this_thread: PhantomData<*const ()>,
 }
 
@@ -766,11 +766,11 @@ fn enqueued(stderr: &[u8]) -> bool {
 /// `Command::output()`, because neither has anything to bound — cosca enters this module only where
 /// a bound is actually required, which is the third path and only the third.
 ///
-/// That third path waits on `deadline`, which the caller derived at verb entry, so discovery spends
-/// the budget too — but the deadline bounds only the wait for the job, never whether it is
-/// enqueued: until `systemctl` announces the job ([`enqueued`]) the wait is unbounded, so a budget
-/// that discovery used up, or one a few milliseconds long, still reaches systemd, and an expiry is
-/// then exactly what `budget::timed_out` says it is. `budget` only picks the path and the wording.
+/// That third path waits on `deadline`, which the caller derived at verb entry — but the deadline
+/// bounds only the wait for the job, never whether it is enqueued: until `systemctl` announces the
+/// job ([`enqueued`]) the wait is unbounded, so a budget a few milliseconds long still reaches
+/// systemd, and an expiry is then exactly what `budget::timed_out` says it is. `budget` only picks
+/// the path and the wording.
 fn run_verb(verb: &str, unit: &str, budget: Budget, deadline: Deadline) -> Result<Finished> {
     door(Purpose::Request)?;
     let program = program();

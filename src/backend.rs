@@ -11,9 +11,14 @@
 
 #[cfg(unix)]
 pub(crate) mod bounded;
+mod contract;
 pub mod launchd;
 pub mod scm;
 pub mod systemd;
+
+pub(crate) use contract::{
+    Backend, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
+};
 
 /// A platform account, already resolved from [`crate::spec::User`] by the
 /// effectful install path.

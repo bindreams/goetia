@@ -1,17 +1,19 @@
-//! The `ServiceManager` seam: one trait implemented by each real backend
-//! and by [`fake::Fake`], the in-memory test double every CLI
-//! and policy test in this crate runs against instead of a real
-//! systemd/launchd/SCM.
+//! The `ServiceManager` seam: the trait the CLI is written against, and
+//! [`fake::Fake`], the in-memory test double every CLI and policy test in this
+//! crate runs against instead of a real systemd/launchd/SCM.
 //!
 //! The trait exists so the CLI is written once and tested without touching a
-//! real machine — not for runtime backend swapping. Every implementation's
-//! `install` must call [`crate::decide::decide`] rather than restate any row
-//! of its policy table itself; see [`conformance::run`], which asserts that
-//! contract against any `&dyn ServiceManager`.
+//! real machine — not for runtime backend swapping. No backend implements it
+//! by hand: each implements the crate-private `Backend` trait, and a blanket impl
+//! makes every `Backend` a `ServiceManager`. `install`, `preview_install`,
+//! `status` and `list` are therefore written once, in `flow`, and
+//! [`crate::decide::decide`] is called only from there. [`conformance::run`]
+//! asserts the contract against any `&dyn ServiceManager`.
 
 pub mod budget;
 pub mod conformance;
 pub mod fake;
+pub(crate) mod flow;
 
 pub use budget::Budget;
 
@@ -29,11 +31,11 @@ use crate::spec::{DaemonSpec, Id};
 ///
 /// `install`/`uninstall`/`enable`/`disable`/`start`/`stop`/`kill` are the mutating
 /// verbs; `status`/`list` are read-only. The CLI checks elevation itself
-/// before calling any mutating verb — implementations do not re-check it.
+/// before calling any mutating verb — backends do not re-check it.
 pub trait ServiceManager {
     /// Install (create or update) the service for `spec`. Never starts and
     /// never enables it at boot — see the crate-level design notes on
-    /// install-off-by-default. Routes through [`crate::decide::decide`]; see
+    /// install-off-by-default. [`crate::decide::decide`] chooses the outcome; see
     /// that function's doc comment for what each [`crate::decide::Outcome`]
     /// means and when `force` is honored.
     ///
@@ -52,12 +54,11 @@ pub trait ServiceManager {
     /// What [`Self::install`] would do for `spec`, without doing it —
     /// always as if `force` were `false`, since showing the forced outcome
     /// would hide the very conflict `--force` exists to let a user decide
-    /// about. Backs `goetia daemon diff`: routing through the exact same
-    /// [`crate::decide::decide`] call `install` uses (rather than `diff`
-    /// reimplementing a partial version of that policy against `list()`'s
-    /// output) is what keeps the two from being able to disagree — `diff`
-    /// saying "up to date" or "would be created" about something `install`
-    /// would actually refuse or conflict on.
+    /// about. Backs `goetia daemon diff`. It is the same flow as `install`,
+    /// minus the write, rather than `diff` reimplementing a partial version
+    /// of that policy against `list()`'s output: that is what keeps the two
+    /// from disagreeing — `diff` saying "up to date" or "would be created"
+    /// about something `install` would actually refuse or conflict on.
     fn preview_install(&self, spec: &DaemonSpec) -> Result<crate::decide::Outcome>;
 
     /// Stop the service if running, remove the artifact, and reload the
@@ -82,10 +83,10 @@ pub trait ServiceManager {
     /// the failure this whole signature exists to prevent.
     ///
     /// **`budget` bounds waiting for that confirmation, never whether the
-    /// request is sent.** Every real backend starts the clock at verb
-    /// entry, so discovery spends the budget too — and then issues the
-    /// request whatever is left of it, cutting short only the wait for the
-    /// manager's answer. A budget discovery used up still reaches the
+    /// request is sent.** Every real backend starts the clock when the verb
+    /// itself begins, after the ownership read, and issues the request
+    /// whatever is left of it, cutting short only the wait for the
+    /// manager's answer. A budget that is already spent still reaches the
     /// manager.
     ///
     /// [`Budget::Immediate`] issues the request and returns without waiting,
@@ -300,7 +301,7 @@ pub enum Installed {
         state: State,
         /// The same number [`ServiceManager::status`] would report for
         /// this id at this moment — not a cached or independently derived
-        /// value. See each backend's `list` for how it obtains this.
+        /// value. See `Backend::live_status`.
         pid: Option<u32>,
         enabled: bool,
     },

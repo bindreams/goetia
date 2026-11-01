@@ -123,7 +123,10 @@ pub fn run(
                 // determine the answer — indeterminate, not a failure.
                 // `install` genuinely fails to install here instead, which
                 // is the one row this deliberately differs from `install`.
-                let line = format!("{}: would be refused: {reason}. {recovery}", spec.id);
+                let line = match recovery {
+                    Some(recovery) => format!("{}: would be refused: {reason}. {recovery}", spec.id),
+                    None => format!("{}: would be refused: {reason}", spec.id),
+                };
                 let _ = writeln!(out, "{line}");
                 let _ = writeln!(err, "error: {line}");
                 codes.push(4);

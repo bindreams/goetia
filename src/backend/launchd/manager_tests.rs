@@ -3,11 +3,12 @@
 //! `write_existing` take an arbitrary target path, so the non-clobbering
 //! race and the `plutil -lint` gate are both fully testable against a
 //! `tempfile::tempdir()`. Everything that genuinely needs elevation and the
-//! real filesystem locations (`locate`/`discover`, `enable`/`disable`,
+//! real filesystem locations (`locate`/`read`, `enable`/`disable`,
 //! `start`/`stop` against real launchd) lives in
 //! `tests/launchd_integration.rs` instead.
 
 use super::*;
+use crate::manager::ServiceManager;
 use crate::spec::{Id, Kind, Restart, User};
 
 fn sample_plist(id: &str) -> String {
@@ -41,7 +42,7 @@ fn persist_new_creates_when_absent() {
 
     let staged = staged_tempfile(dir.path(), &content).unwrap();
     let result = persist_new(staged, &target).expect("persist_new over an absent target");
-    assert!(matches!(result, WriteNew::Written));
+    assert!(matches!(result, PersistOutcome::Written));
     assert_eq!(std::fs::read_to_string(&target).unwrap(), content);
 }
 
@@ -62,7 +63,7 @@ fn persist_new_does_not_clobber_existing_content() {
 
     let staged = staged_tempfile(dir.path(), &sample_plist("raced")).unwrap();
     let result = persist_new(staged, &target).expect("persist_new over a raced target");
-    assert!(matches!(result, WriteNew::Raced));
+    assert!(matches!(result, PersistOutcome::Raced));
     assert_eq!(
         std::fs::read_to_string(&target).unwrap(),
         "not a goetia artifact\n",
@@ -590,7 +591,7 @@ fn bytes_that_are_not_utf8_xml_are_foreign_not_undetermined() {
         fs::write(&path, &bytes).expect("write the vendor plist");
 
         assert!(
-            matches!(classify(bytes), Classified::NotOurs),
+            matches!(classify(bytes), ClassifyOutcome::NotOurs),
             "{label}: not the UTF-8 XML goetia writes, so not goetia's"
         );
 
@@ -642,41 +643,9 @@ fn the_launchd_undetermined_recovery_names_both_causes_and_not_uninstall() {
 
 // Enumeration: a scan that did not finish =============================================================================
 
-/// The mid-pass fault, and the reason `list` no longer propagates one: a dirent that could not be
-/// read must not take down the ids the very same pass already named — nor, since the two
-/// directories are scanned in one call, a directory that was read to the end before it. Injected
-/// through `collect_plists`' iterator because no real `readdir` fails on request.
-#[skuld::test]
-fn a_dirent_that_cannot_be_read_keeps_what_the_scan_already_named() {
-    let dir = Path::new(ENABLED_DIR);
-    let entries = vec![
-        Ok(dir.join("named-before-the-fault.plist")),
-        Err(io::Error::other("injected mid-scan failure")),
-        Ok(dir.join("never-reached.plist")),
-    ];
-
-    let scan = collect_plists(ENABLED_DIR, entries.into_iter());
-
-    assert_eq!(
-        scan.plists.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
-        ["named-before-the-fault"],
-        "what the pass named before the fault survives it, and the pass stops there: {scan:?}"
-    );
-    match &scan.incomplete {
-        Some(Installed::Undetermined { name, reason }) => {
-            assert_eq!(*name, None, "the pass cannot name what it never reached");
-            assert!(reason.contains("injected mid-scan failure"), "{reason}");
-            assert!(
-                reason.contains(ENABLED_DIR),
-                "the reason must name what was being scanned: {reason}"
-            );
-        }
-        other => panic!("a pass that stopped early must say so: {other:?}"),
-    }
-}
-
-/// The same fault one syscall earlier. An `Err` here reaches the CLI as `Kind::Unavailable` — exit
-/// `1` over an empty document, which is `list` reporting a populated host as having nothing on it.
+/// A plist directory that will not open is reported, not propagated (see `flow::scan`): an `Err` here
+/// reaches the CLI as `Kind::Unavailable` — exit `1` over an empty document, which is `list`
+/// reporting a populated host as having nothing on it.
 #[skuld::test]
 fn a_plist_directory_that_cannot_be_opened_is_reported_not_propagated() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -689,10 +658,12 @@ fn a_plist_directory_that_cannot_be_opened_is_reported_not_propagated() {
     let scan = scan_plists(&dir.to_string_lossy());
 
     assert!(scan.plists.is_empty(), "nothing was enumerated: {scan:?}");
-    assert!(
-        matches!(&scan.incomplete, Some(Installed::Undetermined { name: None, .. })),
-        "{scan:?}"
-    );
+    match &scan.incomplete {
+        Some(Installed::Undetermined { name: None, reason }) => {
+            assert!(reason.contains("failed to read directory: "), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 /// The case that is deliberately *not* this one: an absent directory — the staging one does not
@@ -730,12 +701,141 @@ fn a_pass_that_finishes_names_every_plist_and_nothing_else() {
     );
 }
 
+/// Two directories, scanned as the real ones are: the second is the enabled one.
+fn scanned(staging: &Path, enabled: &Path) -> Scan<Plist> {
+    scan_in([(&staging.to_string_lossy(), false), (&enabled.to_string_lossy(), true)])
+}
+
+#[skuld::test]
+fn a_marked_plist_is_scanned_as_marked_in_the_directory_it_was_found_in() {
+    let (staging, enabled) = (
+        tempfile::tempdir().expect("tempdir"),
+        tempfile::tempdir().expect("tempdir"),
+    );
+    let path = enabled.path().join("ours.plist");
+    fs::write(&path, sample_plist("ours")).expect("write the plist");
+
+    let scan = scanned(staging.path(), enabled.path());
+
+    assert!(scan.reported.is_empty(), "{:?}", scan.reported);
+    match scan.entries.as_slice() {
+        [(name, ScanEntry::Read(ReadOutcome::Marked(snapshot)))] => {
+            assert_eq!(name, "ours");
+            assert_eq!(snapshot.id().as_str(), "ours");
+            assert!(snapshot.blob().is_ok(), "the marker decodes");
+            assert!(snapshot.location.enabled);
+            assert_eq!(snapshot.location.path, path);
+            assert_eq!(snapshot.text, sample_plist("ours"));
+        }
+        _ => panic!("one marked entry expected, got {} entries", scan.entries.len()),
+    }
+}
+
+#[skuld::test]
+fn a_plist_without_the_marker_is_scanned_as_foreign() {
+    let (staging, enabled) = (
+        tempfile::tempdir().expect("tempdir"),
+        tempfile::tempdir().expect("tempdir"),
+    );
+    fs::write(staging.path().join("theirs.plist"), "<plist/>").expect("write the plist");
+
+    let scan = scanned(staging.path(), enabled.path());
+
+    assert!(scan.reported.is_empty(), "{:?}", scan.reported);
+    assert!(
+        matches!(scan.entries.as_slice(), [(name, ScanEntry::Read(ReadOutcome::Foreign { .. }))] if name == "theirs"),
+        "{} entries",
+        scan.entries.len()
+    );
+}
+
+/// A state none of this backend's operations produces, and one `locate` refuses for every verb: the
+/// listing names it rather than choosing a directory.
+#[skuld::test]
+fn a_plist_in_both_directories_is_reported_not_classified() {
+    let (staging, enabled) = (
+        tempfile::tempdir().expect("tempdir"),
+        tempfile::tempdir().expect("tempdir"),
+    );
+    for dir in [staging.path(), enabled.path()] {
+        fs::write(dir.join("twice.plist"), sample_plist("twice")).expect("write the plist");
+    }
+
+    let scan = scanned(staging.path(), enabled.path());
+
+    assert!(scan.entries.is_empty(), "{} entries", scan.entries.len());
+    assert_eq!(
+        scan.reported,
+        [Installed::OursUnreadable {
+            name: "twice".to_string(),
+            reason: format!("present in both {STAGING_DIR} and {ENABLED_DIR}"),
+        }]
+    );
+}
+
+// Writing: a race that has cost no call ===============================================================================
+
+/// A plist that vanished between `read` and `write` — a concurrent `uninstall` — before `install`
+/// made any `launchctl` call is `Raced`, so the flow reads again. The rendering is unchanged (only
+/// the version differs), so no `is_loaded` was asked, and the empty script fails the test if any
+/// `launchctl` call is made: a second pass stays inside the reservation. The counterpart, a vanish
+/// after that call, is `a_plist_removed_after_a_read_fails_the_install_without_further_launchctl_calls`.
+#[skuld::test]
+fn a_write_over_a_plist_that_vanished_before_any_call_is_raced() {
+    use crate::backend::Backend as _;
+
+    let mgr = LaunchdManager::new();
+    let spec = spec_named("goetia-raced-before-any-call");
+    let desired = mgr.render(&spec).expect("render");
+    let on_disk = desired.replace(&format!("Version: {}", crate::version()), "Version: 0.0.1");
+    assert_ne!(on_disk, desired);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let snapshot = Plist {
+        location: Location {
+            path: tmp.path().join("gone.plist"),
+            enabled: false,
+        },
+        text: on_disk,
+        ..marked_plist(&spec.id)
+    };
+    let stale = Outcome::Stale {
+        from_version: "0.0.1".to_string(),
+    };
+    let mut scope = mgr.begin_install(&spec).expect("begin_install");
+    let script = Scripted::new(&[]);
+
+    let written = mgr
+        .write(&spec, &desired, &stale, Some(&snapshot), &mut scope)
+        .expect("write");
+
+    assert!(matches!(written, WriteOutcome::Raced));
+    script.assert_driven("a race before any call makes none");
+}
+
 // Reapers: a sequence never fails halfway for want of one =============================================================
 
-/// An id nothing is installed at: a verb that gets past its reapers stops at discovery, before any
-/// `launchctl` runs, so these tests touch nothing on the host.
+/// An id nothing is installed at.
 fn never_installed() -> Id {
     Id::try_from("goetia-reaper-probe-never-installed").unwrap()
+}
+
+/// A marked plist for `id` that no file backs, as the ownership gate would hand a verb. A verb that
+/// gets past its reapers and temp files makes its first `launchctl` call, so these tests run it
+/// under a [`Scripted`] stand-in that refuses every call, and touch nothing on the host.
+fn marked_plist(id: &Id) -> Plist {
+    let text = sample_plist(id.as_str());
+    let blob = generate::extract(&text)
+        .transpose()
+        .expect("sample_plist carries the marker");
+    Plist {
+        id: id.clone(),
+        blob,
+        location: Location {
+            path: PathBuf::from("/nonexistent/goetia-marked.plist"),
+            enabled: false,
+        },
+        text,
+    }
 }
 
 /// Whether `result` is the failure of a verb that could not make its reapers — as opposed to one that
@@ -744,11 +844,14 @@ fn refused_for_want_of_a_reaper<T: std::fmt::Debug>(result: &Result<T>) -> bool 
     matches!(result, Err(e) if e.to_string().contains("no thread could be made to reap a `launchctl` request, so none was sent"))
 }
 
-/// Every verb makes every reaper it can need before anything else — discovery included, so before
-/// any `launchctl` runs: one short, and the verb fails having sent nothing. `start`'s corrective
-/// cycle is its fourth and fifth requests, so four reapers are one short.
+/// Every verb makes every reaper it can need before anything else, so before any `launchctl` runs:
+/// one short, and the verb fails having sent nothing. `start`'s corrective cycle is its fourth and
+/// fifth requests, so four reapers are one short.
 #[skuld::test]
 fn a_verb_one_reaper_short_sends_nothing() {
+    use crate::backend::Backend;
+
+    let _refused = Scripted::new(&[]);
     let mgr = LaunchdManager::new();
     let id = never_installed();
     let spec = DaemonSpec {
@@ -766,30 +869,52 @@ fn a_verb_one_reaper_short_sends_nothing() {
     for budget in [Budget::DEFAULT, Budget::Immediate] {
         let _four = bounded::test_hook::threads(START_REQUESTS - 1);
         assert!(
-            refused_for_want_of_a_reaper(&mgr.start(&id, budget)),
+            refused_for_want_of_a_reaper(&Backend::start(&mgr, marked_plist(&id), budget)),
             "start {budget:?}"
         );
     }
     let _four = bounded::test_hook::threads(START_REQUESTS - 1);
-    assert!(refused_for_want_of_a_reaper(&mgr.request_start_after_stop(&id)));
+    assert!(refused_for_want_of_a_reaper(&Backend::request_start_after_stop(
+        &mgr,
+        marked_plist(&id)
+    )));
     let _none = bounded::test_hook::threads(0);
-    assert!(refused_for_want_of_a_reaper(&mgr.stop(&id, Budget::DEFAULT)));
-    assert!(refused_for_want_of_a_reaper(&mgr.kill(&id)));
-    assert!(refused_for_want_of_a_reaper(&mgr.uninstall(&id)));
+    assert!(refused_for_want_of_a_reaper(&Backend::stop(
+        &mgr,
+        marked_plist(&id),
+        Budget::DEFAULT
+    )));
+    assert!(refused_for_want_of_a_reaper(&Backend::kill(&mgr, marked_plist(&id))));
+    assert!(refused_for_want_of_a_reaper(&Backend::uninstall(
+        &mgr,
+        marked_plist(&id)
+    )));
     assert!(refused_for_want_of_a_reaper(&mgr.install(&spec, false)));
 }
 
-/// With every reaper made, the same verbs go on to discovery, which finds nothing installed.
+/// With every reaper made, the same verbs go on to their first `launchctl` call, which the stand-in
+/// refuses.
 #[skuld::test]
-fn a_verb_with_its_reapers_goes_on_to_discovery() {
+fn a_verb_with_its_reapers_goes_on_to_its_first_call() {
+    use crate::backend::Backend;
+
     let mgr = LaunchdManager::new();
     let id = never_installed();
+    let _refused = Scripted::new(&[]);
     let _five = bounded::test_hook::threads(START_REQUESTS);
-    assert!(!refused_for_want_of_a_reaper(&mgr.start(&id, Budget::DEFAULT)));
+    assert!(!refused_for_want_of_a_reaper(&Backend::start(
+        &mgr,
+        marked_plist(&id),
+        Budget::DEFAULT
+    )));
     let _one = bounded::test_hook::threads(STOP_REQUESTS);
-    assert!(!refused_for_want_of_a_reaper(&mgr.stop(&id, Budget::DEFAULT)));
+    assert!(!refused_for_want_of_a_reaper(&Backend::stop(
+        &mgr,
+        marked_plist(&id),
+        Budget::DEFAULT
+    )));
     let _one = bounded::test_hook::threads(KILL_REQUESTS);
-    assert!(!refused_for_want_of_a_reaper(&mgr.kill(&id)));
+    assert!(!refused_for_want_of_a_reaper(&Backend::kill(&mgr, marked_plist(&id))));
 }
 
 /// Whether `result` is the failure of a verb that could not make the temp files its `launchctl`
@@ -802,6 +927,9 @@ fn refused_for_want_of_a_file<T: std::fmt::Debug>(result: &Result<T>) -> bool {
 /// alike, before anything else: one short, and the verb fails having sent nothing.
 #[skuld::test]
 fn a_verb_one_temp_file_short_sends_nothing() {
+    use crate::backend::Backend;
+
+    let _refused = Scripted::new(&[]);
     let mgr = LaunchdManager::new();
     let id = never_installed();
     let spec = DaemonSpec {
@@ -819,22 +947,36 @@ fn a_verb_one_temp_file_short_sends_nothing() {
     let short = |calls: usize| bounded::test_hook::temp_files(calls * FILES_PER_CALL - 1);
     for budget in [Budget::DEFAULT, Budget::Immediate] {
         let _short = short(START_CALLS);
-        assert!(refused_for_want_of_a_file(&mgr.start(&id, budget)), "start {budget:?}");
+        assert!(
+            refused_for_want_of_a_file(&Backend::start(&mgr, marked_plist(&id), budget)),
+            "start {budget:?}"
+        );
     }
     {
         let _short = short(START_CALLS);
-        assert!(refused_for_want_of_a_file(&mgr.request_start_after_stop(&id)));
+        assert!(refused_for_want_of_a_file(&Backend::request_start_after_stop(
+            &mgr,
+            marked_plist(&id)
+        )));
     }
     let _short = short(STOP_CALLS);
-    assert!(refused_for_want_of_a_file(&mgr.stop(&id, Budget::DEFAULT)));
+    assert!(refused_for_want_of_a_file(&Backend::stop(
+        &mgr,
+        marked_plist(&id),
+        Budget::DEFAULT
+    )));
     let _short = short(STOP_CALLS);
-    assert!(refused_for_want_of_a_file(&mgr.uninstall(&id)));
+    assert!(refused_for_want_of_a_file(&Backend::uninstall(&mgr, marked_plist(&id))));
     let _short = short(KILL_CALLS);
-    assert!(refused_for_want_of_a_file(&mgr.kill(&id)));
+    assert!(refused_for_want_of_a_file(&Backend::kill(&mgr, marked_plist(&id))));
     let _short = short(INSTALL_CALLS);
     assert!(refused_for_want_of_a_file(&mgr.install(&spec, false)));
     let _enough = bounded::test_hook::temp_files(START_CALLS * FILES_PER_CALL);
-    assert!(!refused_for_want_of_a_file(&mgr.start(&id, Budget::DEFAULT)));
+    assert!(!refused_for_want_of_a_file(&Backend::start(
+        &mgr,
+        marked_plist(&id),
+        Budget::DEFAULT
+    )));
 }
 
 /// `restart`'s two legs, and `install --start`'s, draw on reapers and temp files `prepare` made
@@ -843,8 +985,11 @@ fn a_verb_one_temp_file_short_sends_nothing() {
 /// takes one reaper, and no more temp files than the install.
 #[skuld::test]
 fn prepared_steps_need_nothing_made_later() {
+    use crate::backend::Backend;
+
     let mgr = LaunchdManager::new();
     let id = never_installed();
+    let _refused = Scripted::new(&[]);
     for (steps, reapers, calls) in [
         (
             [Step::Stop, Step::Start],
@@ -861,23 +1006,29 @@ fn prepared_steps_need_nothing_made_later() {
         for budget in [Budget::DEFAULT, Budget::Immediate, Budget::Unbounded] {
             {
                 let _short = bounded::test_hook::threads(reapers - 1);
-                assert!(mgr.prepare(&steps, budget).is_err(), "{steps:?} {budget:?}");
+                assert!(
+                    ServiceManager::prepare(&mgr, &steps, budget).is_err(),
+                    "{steps:?} {budget:?}"
+                );
             }
             let _short = bounded::test_hook::temp_files(calls * FILES_PER_CALL - 1);
-            assert!(mgr.prepare(&steps, budget).is_err(), "{steps:?} {budget:?}");
+            assert!(
+                ServiceManager::prepare(&mgr, &steps, budget).is_err(),
+                "{steps:?} {budget:?}"
+            );
         }
-        let prepared = mgr.prepare(&steps, Budget::DEFAULT).expect("prepare");
+        let prepared = ServiceManager::prepare(&mgr, &steps, Budget::DEFAULT).expect("prepare");
         let _no_thread = bounded::test_hook::threads(0);
         let _no_file = bounded::test_hook::temp_files(0);
         let first = if steps[0] == Step::Stop {
-            mgr.stop(&id, Budget::DEFAULT)
+            Backend::stop(&mgr, marked_plist(&id), Budget::DEFAULT)
         } else {
-            mgr.uninstall(&id)
+            Backend::uninstall(&mgr, marked_plist(&id))
         };
-        assert!(first.is_err(), "{steps:?}: nothing is installed");
+        assert!(first.is_err(), "{steps:?}: the stand-in refuses every call");
         assert!(!refused_for_want_of_a_reaper(&first), "{steps:?}");
         assert!(!refused_for_want_of_a_file(&first), "{steps:?}");
-        let started = mgr.start(&id, Budget::DEFAULT);
+        let started = Backend::start(&mgr, marked_plist(&id), Budget::DEFAULT);
         assert!(!refused_for_want_of_a_reaper(&started), "{steps:?}");
         assert!(!refused_for_want_of_a_file(&started), "{steps:?}");
         drop(prepared);
@@ -916,6 +1067,28 @@ fn a_launchctl_request_that_may_have_run_is_in_doubt() {
     bounded::test_hook::spawn_fails(|| io::Error::from_raw_os_error(libc::EAGAIN).into());
     let e = launchctl(&args, deadline, request()).err().expect("injected");
     assert!(matches!(e, Error::CommandFailed { .. }), "{e:?}");
+}
+
+/// A `launchctl` that cannot be run says nothing about the job: `status` fails, and `list` (via
+/// `flow`) reports the entry unreadable, rather than either showing a plausible `Unknown` state.
+#[skuld::test]
+fn a_live_status_whose_launchctl_cannot_be_run_is_an_error() {
+    use crate::backend::Backend as _;
+
+    let _stand_in = launchctl_stand_in::set(DONE.to_string());
+    bounded::test_hook::spawn_fails(|| io::Error::from_raw_os_error(libc::EAGAIN).into());
+    let snapshot = Plist {
+        location: Location {
+            path: PathBuf::from("/nonexistent/goetia-live-status.plist"),
+            enabled: false,
+        },
+        text: String::new(),
+        ..marked_plist(&never_installed())
+    };
+
+    let result = LaunchdManager::new().live_status(&snapshot);
+
+    assert!(matches!(result, Err(Error::CommandFailed { .. })), "{result:?}");
 }
 
 // Every verb path stays inside its reservation ========================================================================

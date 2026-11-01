@@ -24,52 +24,73 @@ pub enum Ownership {
     Absent,
     /// A Goetia-marked artifact exists and its blob decoded successfully.
     /// `regenerated` is `generate(blob.spec)` — the caller's own generator
-    /// applied to the *embedded* spec, not the new one. Bundling it into
-    /// this variant, rather than passing it as a separate parameter,
-    /// means a caller cannot forget to compute it: the three-way
-    /// comparison against `on_disk`/`desired` this module needs is always
-    /// available.
-    Ours { blob: Blob, regenerated: String },
+    /// applied to the *embedded* spec, not the new one — and `on_disk` is
+    /// the artifact's raw text. Bundling both into this variant, rather than
+    /// passing them as separate parameters, means a caller cannot forget
+    /// either, and cannot pass `on_disk` for an ownership that never reads
+    /// it: the three-way comparison of `on_disk`, `regenerated` and
+    /// `desired` this module needs is always available.
+    Ours {
+        blob: Blob,
+        regenerated: String,
+        on_disk: String,
+    },
     /// A Goetia-marked artifact exists but its blob will not decode — a
     /// future schema, or corruption. Still *ours*: the marker was written
     /// by some Goetia. Treating this as `Foreign` would mean downgrading
     /// Goetia bricks management of a service this very tool created,
     /// behind a message that misleadingly says "this isn't mine".
-    OursUnreadable { reason: String },
+    ///
+    /// `recovery` is the action that unblocks the id, or `None` when
+    /// discovery names none — a drop-in that cannot be read.
+    OursUnreadable { reason: String, recovery: Option<String> },
     /// Something exists at this id and carries no Goetia marker at all.
     /// Refused unconditionally — see `decide`.
     Foreign,
 }
 
-// Overlay =============================================================================================================
+// ExternalConfig ======================================================================================================
 
-/// Configuration the platform applies to an artifact through a channel outside the artifact text
-/// itself. Systemd's `<id>.service.d` drop-in directories are the only one that exists today, but
-/// this is not architecturally systemd-specific: any backend that grows an analogous side-channel
-/// (a launchd override, say) needs the same two questions answered, and answering them here — once
-/// — is what keeps them from being reinvented per backend.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Overlay {
-    /// Whether any overlay is present at all. Changes exactly one thing in [`decide`]: a stale
-    /// artifact that also carries one is `Conflict`, not a silently-regenerated `Stale`.
-    pub present: bool,
-    /// The recovery text for the part of the overlay a successful write by this backend will *not*
-    /// remove, or `None` when there is none — which is exactly when `--force` really does resolve a
-    /// conflict.
+/// Configuration the manager applies to a service from outside the artifact goetia wrote. Systemd's
+/// `<id>.service.d` drop-in directories are the only one that exists today, but this is not
+/// architecturally systemd-specific: any backend that grows an analogous side-channel (a launchd
+/// override, say) needs the same questions answered, and answering them here — once — is what keeps
+/// them from being reinvented per backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalConfig {
+    /// None exists.
+    Absent,
+    /// Some exists, and a successful write by this backend removes all of it. Changes exactly one
+    /// thing in [`decide`]: a stale artifact that also carries it is `Conflict`, not a
+    /// silently-regenerated `Stale`.
+    Clearable,
+    /// Some exists that a successful write will *not* remove, so `--force` cannot resolve the
+    /// conflict. `recovery` is the way out.
     ///
     /// Rendered by the backend rather than here: only the backend knows which locations it writes,
     /// and the way out is in its own vocabulary. [`decide`] carries it into [`Outcome::Conflict`]
     /// without interpreting it.
-    pub unclearable_recovery: Option<String>,
+    Unclearable { recovery: String },
+}
+
+impl ExternalConfig {
+    /// The recovery to carry into [`Outcome::Conflict`]: `Some` only for [`Self::Unclearable`].
+    fn unclearable_recovery(&self) -> Option<String> {
+        match self {
+            Self::Absent | Self::Clearable => None,
+            Self::Unclearable { recovery } => Some(recovery.clone()),
+        }
+    }
 }
 
 // Outcome =============================================================================================================
 
 /// What `decide` recommends doing. Every refusing variant names the exact
 /// action that unblocks it — an install interrupted at the wrong moment must
-/// never wedge an id with no in-tool remedy. For `Conflict` that action is
-/// `--force` only where `--force` can actually take it; see
-/// `unclearable_recovery`.
+/// never wedge an id with no in-tool remedy — except a `RefuseUnreadable`
+/// whose `recovery` is `None`, where no goetia action unblocks it. For
+/// `Conflict` that action is `--force` only where `--force` can actually
+/// take it; see `unclearable_recovery`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// Nothing exists yet: write the artifact.
@@ -86,9 +107,9 @@ pub enum Outcome {
     /// overwrites (see `decide`); without it, this is refused with exit
     /// code 5.
     ///
-    /// `unclearable_recovery` is [`Overlay::unclearable_recovery`] carried
-    /// through: `None` when `--force` genuinely resolves this, `Some` — with
-    /// the text saying what to do instead — when part of what makes the
+    /// `unclearable_recovery` is [`ExternalConfig::Unclearable`]'s recovery
+    /// carried through: `None` when `--force` genuinely resolves this, `Some`
+    /// — with the text saying what to do instead — when part of what makes the
     /// artifact differ is outside the directory the backend writes, so
     /// overwriting the artifact would leave it in place and the next run
     /// would report the identical conflict. A caller must not re-derive that
@@ -109,8 +130,10 @@ pub enum Outcome {
     /// under `--force` is how a typo'd id destroys a hand-configured
     /// production service.
     RefuseForeign { recovery: String },
-    /// A Goetia-marked artifact whose blob will not decode.
-    RefuseUnreadable { reason: String, recovery: String },
+    /// A Goetia-marked artifact whose blob will not decode, or whose
+    /// ownership could not be established. `recovery` is
+    /// [`Ownership::OursUnreadable`]'s, carried through.
+    RefuseUnreadable { reason: String, recovery: Option<String> },
 }
 
 // decide ==============================================================================================================
@@ -130,11 +153,19 @@ pub fn foreign_recovery(id: &str) -> String {
     )
 }
 
+/// The recovery text for an id whose blob will not decode. Its own function, like
+/// [`foreign_recovery`], so a backend's discovery and the CLI can give the identical wording.
+pub fn unreadable_recovery(id: &str) -> String {
+    format!(
+        "run `goetia daemon uninstall {id}` to remove the unreadable artifact (uninstall does \
+         not need to decode it), then re-run install",
+    )
+}
+
 /// The install policy, in one place.
 ///
-/// - `found` is what discovery saw at the target id.
-/// - `on_disk` is that artifact's raw text; `None` iff `found` is
-///   `Ownership::Absent`, `Some` otherwise.
+/// - `found` is what discovery saw at the target id; for `Ownership::Ours`
+///   it includes the artifact's raw text.
 /// - `desired` is `generate(new_spec)` — the artifact text the calling
 ///   backend's generator would write right now, under the identity and
 ///   crate version currently running.
@@ -144,12 +175,12 @@ pub fn foreign_recovery(id: &str) -> String {
 ///   artifact (regenerate silently) from a hand-edited one (conflict).
 /// - `force` allows overwriting a genuine hand-edit. It never overrides a
 ///   `Foreign` or `OursUnreadable` refusal.
-/// - `overlay` is what the platform applies to this artifact from outside
-///   its text — see [`Overlay`]. Its `present` flag changes one row: a stale
-///   artifact carrying one is `Conflict`, not a silently-regenerated
-///   `Stale`. Its `unclearable_recovery` changes no row at all, and is
-///   carried into [`Outcome::Conflict`] so the CLI can say whether `--force`
-///   is the way out.
+/// - `external` is what the manager applies to this artifact from outside
+///   its text — see [`ExternalConfig`]. Any but `Absent` changes one row: a
+///   stale artifact carrying it is `Conflict`, not a
+///   silently-regenerated `Stale`. `Unclearable`'s recovery changes no row at
+///   all, and is carried into [`Outcome::Conflict`] so the CLI can say whether
+///   `--force` is the way out.
 ///
 /// For `Ownership::Ours`, the three-way comparison this needs is: does
 /// `on_disk` match `desired` (nothing to do), does it match
@@ -157,19 +188,12 @@ pub fn foreign_recovery(id: &str) -> String {
 /// neither (a hand-edit, present whether or not the spec also changed)?
 pub fn decide(
     found: &Ownership,
-    on_disk: Option<&str>,
     desired: &str,
     new_spec: &DaemonSpec,
     running_version: &str,
     force: bool,
-    overlay: &Overlay,
+    external: &ExternalConfig,
 ) -> Outcome {
-    debug_assert_eq!(
-        matches!(found, Ownership::Absent),
-        on_disk.is_none(),
-        "on_disk must be Some(_) for every Ownership except Absent, and None for Absent",
-    );
-
     match found {
         Ownership::Absent => Outcome::Create,
 
@@ -177,21 +201,19 @@ pub fn decide(
             recovery: foreign_recovery(new_spec.id.as_str()),
         },
 
-        Ownership::OursUnreadable { reason } => Outcome::RefuseUnreadable {
+        Ownership::OursUnreadable { reason, recovery } => Outcome::RefuseUnreadable {
             reason: reason.clone(),
-            recovery: format!(
-                "run `goetia daemon uninstall {id}` to remove the unreadable artifact (uninstall does \
-                 not need to decode it), then re-run install",
-                id = new_spec.id.as_str(),
-            ),
+            recovery: recovery.clone(),
         },
 
-        Ownership::Ours { blob, regenerated } => {
-            let on_disk = on_disk.expect("Ownership::Ours implies discovery read the artifact's text");
-
+        Ownership::Ours {
+            blob,
+            regenerated,
+            on_disk,
+        } => {
             // A version mismatch always means "stale, regenerate" — checked
             // before anything else, and never subject to `force` — *unless*
-            // a foreign overlay is present and unforced, in which case it is
+            // foreign external configuration is present and unforced, in which case it is
             // exactly as much a conflict as a hand-edited fragment is: the
             // artifact was not solely goetia's own doing, so silently
             // regenerating it would destroy something outside goetia without
@@ -200,10 +222,10 @@ pub fn decide(
             // would present itself as a hand-edit on every already-installed
             // service — that half of the rule is unconditional.
             if blob.version != running_version {
-                if overlay.present && !force {
+                if *external != ExternalConfig::Absent && !force {
                     return Outcome::Conflict {
                         artifact_diff: diff::artifact_diff(regenerated, on_disk),
-                        unclearable_recovery: overlay.unclearable_recovery.clone(),
+                        unclearable_recovery: external.unclearable_recovery(),
                     };
                 }
                 return Outcome::Stale {
@@ -245,7 +267,7 @@ pub fn decide(
                     // which is exactly the conflation the two-level diff
                     // design exists to avoid.
                     artifact_diff: diff::artifact_diff(regenerated, on_disk),
-                    unclearable_recovery: overlay.unclearable_recovery.clone(),
+                    unclearable_recovery: external.unclearable_recovery(),
                 }
             }
         }

@@ -20,10 +20,9 @@ use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
 use winreg::types::FromRegValue as _;
 
 use crate::error::{Error, Result};
+use crate::manager::{Installed, flow};
 
-/// Also the `location` `manager::list` names in its aggregate entry when a pass over this key
-/// stops early.
-pub const SERVICES_KEY: &str = r"SYSTEM\CurrentControlSet\Services";
+const SERVICES_KEY: &str = r"SYSTEM\CurrentControlSet\Services";
 const ENVIRONMENT_VALUE: &str = "Environment";
 
 fn service_key_path(name: &str) -> String {
@@ -294,81 +293,24 @@ pub fn write_environment(name: &str, lines: &[String]) -> Result<()> {
     }
 }
 
-// Discovery for `list` ================================================================================================
+// Enumeration for `list` ==============================================================================================
 
-/// What one pass over the `Services` key found: the names it reached, and — when the pass stopped
-/// early — what did not complete there. `manager::list` turns the latter into the aggregate entry
-/// standing for every service the pass never got to.
-#[derive(Debug)]
-pub struct ServiceScan {
-    pub names: Vec<String>,
-    /// `Some` when the enumeration stopped before the end. The names collected up to that point
-    /// stay in `names`: dropping them reports every one of them as absent, which is precisely what
-    /// a pass that did not finish cannot establish.
-    pub incomplete: Option<String>,
+/// Hands every service currently registered with SCM to `keep`, and returns the entry for what the
+/// pass did not reach, if anything (see [`flow::scan`]).
+pub fn scan_services(keep: impl FnMut(String)) -> Option<Installed> {
+    scan_names_under(SERVICES_KEY, keep)
 }
 
-/// Every service currently registered with SCM, paired with its
-/// `Parameters` map (empty when absent — see [`read_parameters`]). The
-/// caller (`manager::list`) runs `generate::extract` over each to decide
-/// which are Goetia's.
-///
-/// Read directly from the registry rather than `windows-service`'s
-/// enumeration API: `SC_MANAGER_ENUMERATE_SERVICE`/`EnumServicesStatusExW`
-/// need no more privilege than reading this key does, and going through the
-/// registry once here avoids an `OpenService` round trip per candidate on a
-/// host with hundreds of unrelated services.
-/// No `Services` key at all is neither a failure nor an unfinished pass: absence is *established*
-/// there, so it is an empty scan with nothing outstanding — see [`crate::manager::ServiceManager::list`].
-pub fn list_service_names() -> ServiceScan {
-    scan_names_under(SERVICES_KEY)
-}
-
-/// The pass over one named key rather than over [`SERVICES_KEY`] directly — the seam
-/// [`collect_service_names`] is for the mid-pass fault, applied to the *open*. `Services` exists and
-/// opens on every host that boots, so pointing the same code at another key is the only way a test
-/// reaches the two outcomes that are not "it opened": see `registry_tests.rs`.
-fn scan_names_under(path: &str) -> ServiceScan {
-    let key = match RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(path, KEY_READ) {
-        Ok(key) => key,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return ServiceScan {
-                names: Vec::new(),
-                incomplete: None,
-            };
-        }
-        Err(e) => {
-            return ServiceScan {
-                names: Vec::new(),
-                incomplete: Some(registry_detail("open", path, &e)),
-            };
-        }
-    };
-    collect_service_names(path, key.enum_keys())
-}
-
-/// The pass itself, over an iterator rather than the `RegKey` directly — which is what makes the
-/// mid-pass fault reachable from a test, since no `enum_keys` fails on request. That fault is the
-/// half that matters: stop, keep, report. Collecting into a `Result` instead discards every name
-/// already enumerated because a *later* one faulted, leaving `list` nothing to return but an error
-/// — an empty document on exit `1`, which says this host runs no daemons.
-fn collect_service_names(path: &str, keys: impl Iterator<Item = std::io::Result<String>>) -> ServiceScan {
-    let mut names = Vec::new();
-    for key in keys {
-        match key {
-            Ok(name) => names.push(name),
-            Err(e) => {
-                return ServiceScan {
-                    names,
-                    incomplete: Some(registry_detail("enumerate", path, &e)),
-                };
-            }
-        }
-    }
-    ServiceScan {
-        names,
-        incomplete: None,
-    }
+/// [`scan_services`] over another key: `Services` opens on every host that boots, so another key
+/// is the only way a test reaches an open that fails, or finds nothing.
+fn scan_names_under(path: &str, keep: impl FnMut(String)) -> Option<Installed> {
+    flow::scan(
+        path,
+        RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(path, KEY_READ),
+        |key| Box::new(key.enum_keys()),
+        |op, source| registry_detail(op, path, source),
+        keep,
+    )
 }
 
 #[cfg(test)]

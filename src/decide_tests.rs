@@ -7,20 +7,16 @@ use crate::spec::{DaemonSpec, Id, Kind, Restart, User};
 
 // Fixtures ============================================================================================================
 
-/// An overlay that is present but entirely within the backend's own writable root — the only kind
-/// that existed before `Overlay` carried a recovery, and the one `--force` really does resolve.
-fn present() -> Overlay {
-    Overlay {
-        present: true,
-        unclearable_recovery: None,
-    }
+/// External configuration entirely within the backend's own writable root, which `--force` really
+/// does resolve.
+fn clearable() -> ExternalConfig {
+    ExternalConfig::Clearable
 }
 
-/// The same overlay with a part the backend's own write will not remove.
-fn unclearable() -> Overlay {
-    Overlay {
-        present: true,
-        unclearable_recovery: Some("remove /usr/lib/systemd/system/frpc.service.d by hand".to_string()),
+/// External configuration with a part the backend's own write will not remove.
+fn unclearable() -> ExternalConfig {
+    ExternalConfig::Unclearable {
+        recovery: "remove /usr/lib/systemd/system/frpc.service.d by hand".to_string(),
     }
 }
 
@@ -52,13 +48,14 @@ fn blob_for(spec: &DaemonSpec, version: &str) -> Blob {
 }
 
 /// Builds the `Ours` ownership a real backend would report: the decoded
-/// blob, plus `regenerated` -- what that backend's own generator produces
+/// blob, `regenerated` -- what that backend's own generator produces
 /// from the *embedded* spec (`generate(blob.spec)`), computed by the
-/// caller, never by `decide` itself.
-fn ours(spec: &DaemonSpec, version: &str, regenerated: &str) -> Ownership {
+/// caller, never by `decide` itself -- and the artifact's `on_disk` text.
+fn ours(spec: &DaemonSpec, version: &str, regenerated: &str, on_disk: &str) -> Ownership {
     Ownership::Ours {
         blob: blob_for(spec, version),
         regenerated: regenerated.to_owned(),
+        on_disk: on_disk.to_owned(),
     }
 }
 
@@ -72,12 +69,11 @@ fn absent_creates() {
 
     let outcome = decide(
         &Ownership::Absent,
-        None,
         "GENERATED",
         &spec,
         RUNNING_VERSION,
         false,
-        &Overlay::default(),
+        &ExternalConfig::Absent,
     );
 
     assert_eq!(outcome, Outcome::Create);
@@ -87,17 +83,9 @@ fn absent_creates() {
 fn identical_is_up_to_date() {
     let spec = spec_fixture();
     let artifact = "GENERATED ARTIFACT TEXT";
-    let found = ours(&spec, RUNNING_VERSION, artifact);
+    let found = ours(&spec, RUNNING_VERSION, artifact, artifact);
 
-    let outcome = decide(
-        &found,
-        Some(artifact),
-        artifact,
-        &spec,
-        RUNNING_VERSION,
-        false,
-        &Overlay::default(),
-    );
+    let outcome = decide(&found, artifact, &spec, RUNNING_VERSION, false, &ExternalConfig::Absent);
 
     assert_eq!(outcome, Outcome::UpToDate);
 }
@@ -113,16 +101,15 @@ fn spec_change_updates() {
     let mut new_spec = spec_fixture();
     new_spec.restart = Restart::Always;
     let regenerated = "ARTIFACT FROM EMBEDDED SPEC";
-    let found = ours(&embedded, RUNNING_VERSION, regenerated);
+    let found = ours(&embedded, RUNNING_VERSION, regenerated, regenerated);
 
     let outcome = decide(
         &found,
-        Some(regenerated),
         "ARTIFACT FROM NEW SPEC",
         &new_spec,
         RUNNING_VERSION,
         false,
-        &Overlay::default(),
+        &ExternalConfig::Absent,
     );
 
     match outcome {
@@ -140,21 +127,13 @@ fn spec_change_updates() {
 fn hand_edit_conflicts() {
     let spec = spec_fixture();
     let regenerated = "GENERATED\n";
-    let found = ours(&spec, RUNNING_VERSION, regenerated);
     // A hand-added directive the spec cannot express: the embedded spec is
     // unchanged, so this can only be a hand-edit, not a spec change.
     let on_disk = "GENERATED\nMemoryMax=8G\n";
+    let found = ours(&spec, RUNNING_VERSION, regenerated, on_disk);
     let desired = "GENERATED\n";
 
-    let outcome = decide(
-        &found,
-        Some(on_disk),
-        desired,
-        &spec,
-        RUNNING_VERSION,
-        false,
-        &Overlay::default(),
-    );
+    let outcome = decide(&found, desired, &spec, RUNNING_VERSION, false, &ExternalConfig::Absent);
 
     match outcome {
         Outcome::Conflict { artifact_diff, .. } => {
@@ -176,19 +155,11 @@ fn hand_edit_conflicts() {
 fn hand_edit_with_force_updates() {
     let spec = spec_fixture();
     let regenerated = "GENERATED\n";
-    let found = ours(&spec, RUNNING_VERSION, regenerated);
     let on_disk = "GENERATED\nMemoryMax=8G\n";
+    let found = ours(&spec, RUNNING_VERSION, regenerated, on_disk);
     let desired = "GENERATED\n";
 
-    let outcome = decide(
-        &found,
-        Some(on_disk),
-        desired,
-        &spec,
-        RUNNING_VERSION,
-        true,
-        &Overlay::default(),
-    );
+    let outcome = decide(&found, desired, &spec, RUNNING_VERSION, true, &ExternalConfig::Absent);
 
     assert!(
         matches!(outcome, Outcome::Update { .. }),
@@ -207,20 +178,19 @@ fn spec_change_with_hand_edit_conflicts() {
     let mut new_spec = spec_fixture();
     new_spec.restart = Restart::Always;
     let regenerated = "ARTIFACT FROM EMBEDDED SPEC\n";
-    let found = ours(&embedded, RUNNING_VERSION, regenerated);
     // Hand-edited on top of the old (embedded-spec) artifact: differs from
     // both `regenerated` and `desired`.
     let on_disk = "ARTIFACT FROM EMBEDDED SPEC\nMemoryMax=8G\n";
+    let found = ours(&embedded, RUNNING_VERSION, regenerated, on_disk);
     let desired = "ARTIFACT FROM NEW SPEC\n";
 
     let outcome = decide(
         &found,
-        Some(on_disk),
         desired,
         &new_spec,
         RUNNING_VERSION,
         false,
-        &Overlay::default(),
+        &ExternalConfig::Absent,
     );
 
     match outcome {
@@ -240,18 +210,17 @@ fn spec_change_with_hand_edit_and_force_updates() {
     let mut new_spec = spec_fixture();
     new_spec.restart = Restart::Always;
     let regenerated = "ARTIFACT FROM EMBEDDED SPEC\n";
-    let found = ours(&embedded, RUNNING_VERSION, regenerated);
     let on_disk = "ARTIFACT FROM EMBEDDED SPEC\nMemoryMax=8G\n";
+    let found = ours(&embedded, RUNNING_VERSION, regenerated, on_disk);
     let desired = "ARTIFACT FROM NEW SPEC\n";
 
     let outcome = decide(
         &found,
-        Some(on_disk),
         desired,
         &new_spec,
         RUNNING_VERSION,
         true,
-        &Overlay::default(),
+        &ExternalConfig::Absent,
     );
 
     assert!(
@@ -267,12 +236,11 @@ fn foreign_refuses_even_with_force() {
     for force in [false, true] {
         let outcome = decide(
             &Ownership::Foreign,
-            Some("some pre-existing, unrelated service"),
             "GENERATED",
             &spec,
             RUNNING_VERSION,
             force,
-            &Overlay::default(),
+            &ExternalConfig::Absent,
         );
 
         match outcome {
@@ -291,26 +259,69 @@ fn unreadable_refuses_with_recovery() {
     for force in [false, true] {
         let found = Ownership::OursUnreadable {
             reason: "schema 2 is not understood by this build".to_owned(),
+            recovery: Some(unreadable_recovery("frpc")),
         };
 
         let outcome = decide(
             &found,
-            Some("some artifact"),
             "GENERATED",
             &spec,
             RUNNING_VERSION,
             force,
-            &Overlay::default(),
+            &ExternalConfig::Absent,
         );
 
         match outcome {
             Outcome::RefuseUnreadable { reason, recovery } => {
                 assert_eq!(reason, "schema 2 is not understood by this build");
+                let recovery = recovery.expect("a decode failure carries a recovery");
                 assert!(!recovery.is_empty(), "recovery must be non-empty (force={force})");
             }
             other => panic!("expected RefuseUnreadable regardless of force={force}, got {other:?}"),
         }
     }
+}
+
+/// `decide` hands the recovery on exactly as discovery gave it: a recovery stays, and no recovery
+/// stays none, rather than `decide` inventing one for a refusal that has no action to name.
+#[skuld::test]
+fn unreadable_carries_its_recovery_through() {
+    let spec = spec_fixture();
+
+    for recovery in [Some("run the exact remedy".to_owned()), None] {
+        let found = Ownership::OursUnreadable {
+            reason: "a drop-in could not be read".to_owned(),
+            recovery: recovery.clone(),
+        };
+
+        let outcome = decide(
+            &found,
+            "GENERATED",
+            &spec,
+            RUNNING_VERSION,
+            false,
+            &ExternalConfig::Absent,
+        );
+
+        assert_eq!(
+            outcome,
+            Outcome::RefuseUnreadable {
+                reason: "a drop-in could not be read".to_owned(),
+                recovery,
+            }
+        );
+    }
+}
+
+/// The text a decode failure carries names the exact `uninstall` that unblocks the id.
+#[skuld::test]
+fn unreadable_recovery_names_the_uninstall() {
+    let recovery = unreadable_recovery("frpc");
+
+    assert!(
+        recovery.contains("goetia daemon uninstall frpc"),
+        "the recovery must name the exact command: {recovery}"
+    );
 }
 
 /// A service registered by the released 0.1.0 must read as stale under this build, whatever the
@@ -319,16 +330,15 @@ fn unreadable_refuses_with_recovery() {
 fn a_registration_by_released_0_1_0_is_stale_under_this_build() {
     let spec = spec_fixture();
     let on_disk = "ARTIFACT WITHOUT RECOVERY ACTIONS";
-    let found = ours(&spec, "0.1.0", "REGENERATED WITH THE OLD GENERATOR");
+    let found = ours(&spec, "0.1.0", "REGENERATED WITH THE OLD GENERATOR", on_disk);
 
     let outcome = decide(
         &found,
-        Some(on_disk),
         "ARTIFACT WITH RECOVERY ACTIONS",
         &spec,
         crate::version(),
         false,
-        &Overlay::default(),
+        &ExternalConfig::Absent,
     );
 
     assert_eq!(
@@ -347,17 +357,9 @@ fn older_version_is_stale_not_conflict() {
     // first and win outright.
     let on_disk = "ARTIFACT WRITTEN BY 0.1.0";
     let desired = "ARTIFACT AS 1.2.3 WOULD WRITE IT";
-    let found = ours(&spec, "0.1.0", on_disk);
+    let found = ours(&spec, "0.1.0", on_disk, on_disk);
 
-    let outcome = decide(
-        &found,
-        Some(on_disk),
-        desired,
-        &spec,
-        RUNNING_VERSION,
-        false,
-        &Overlay::default(),
-    );
+    let outcome = decide(&found, desired, &spec, RUNNING_VERSION, false, &ExternalConfig::Absent);
 
     assert_eq!(
         outcome,
@@ -374,7 +376,7 @@ fn older_version_is_stale_not_conflict() {
 #[skuld::test]
 fn a_version_difference_wins_over_a_difference_in_recovery_actions() {
     use crate::backend::Identity;
-    use crate::backend::scm::generate::{ScmRegistration, registration, render};
+    use crate::backend::scm::generate::{ScmRegistration, registration};
 
     let spec = spec_fixture();
     let reg_now = registration(
@@ -391,21 +393,13 @@ fn a_version_difference_wins_over_a_difference_in_recovery_actions() {
         failure_actions: None,
         ..reg_now.clone()
     };
-    let on_disk = render(&reg_0_1_0);
+    let on_disk = reg_0_1_0.to_string();
     assert!(on_disk.contains("FailureActions: none"));
-    let desired = render(&reg_now);
+    let desired = reg_now.to_string();
     assert_ne!(on_disk, desired);
-    let found = ours(&spec, "0.1.0", &on_disk);
+    let found = ours(&spec, "0.1.0", &on_disk, &on_disk);
 
-    let outcome = decide(
-        &found,
-        Some(&on_disk),
-        &desired,
-        &spec,
-        RUNNING_VERSION,
-        false,
-        &Overlay::default(),
-    );
+    let outcome = decide(&found, &desired, &spec, RUNNING_VERSION, false, &ExternalConfig::Absent);
 
     assert_eq!(
         outcome,
@@ -415,63 +409,60 @@ fn a_version_difference_wins_over_a_difference_in_recovery_actions() {
     );
 }
 
-/// A stale artifact that also carries a foreign overlay (systemd's drop-in
-/// directory, or any future backend's equivalent) must not be silently
-/// regenerated: the overlay is exactly as much "not solely goetia's doing"
-/// Both places `decide` returns `Conflict` — a hand-edited artifact, and a stale one carrying an
-/// overlay — have to carry the overlay's recovery through. Losing it on either leaves the CLI
+/// Both places `decide` returns `Conflict` -- a hand-edited artifact, and a stale one carrying
+/// external configuration -- have to carry its recovery through. Losing it on either leaves the CLI
 /// offering `--force` for a conflict `--force` rewrites the artifact for and leaves exactly as it
 /// found it, so the operator forces, is told to force, and forces again.
 #[skuld::test]
-fn every_conflict_carries_the_overlays_unclearable_recovery() {
+fn every_conflict_carries_the_external_configs_unclearable_recovery() {
     let spec = spec_fixture();
     let regenerated = "ARTIFACT WRITTEN BY GOETIA";
     let on_disk = "ARTIFACT WRITTEN BY GOETIA\n# --- drop-in: /usr/lib/... ---\n";
     let desired = "ARTIFACT AS 1.2.3 WOULD WRITE IT";
 
     for (case, found) in [
-        ("hand-edited", ours(&spec, RUNNING_VERSION, regenerated)),
-        ("stale under an overlay", ours(&spec, "0.1.0", regenerated)),
+        ("hand-edited", ours(&spec, RUNNING_VERSION, regenerated, on_disk)),
+        (
+            "stale under external config",
+            ours(&spec, "0.1.0", regenerated, on_disk),
+        ),
     ] {
-        for (flavour, overlay) in [("clearable", present()), ("unclearable", unclearable())] {
-            let outcome = decide(&found, Some(on_disk), desired, &spec, RUNNING_VERSION, false, &overlay);
+        for (flavour, external) in [("clearable", clearable()), ("unclearable", unclearable())] {
+            let outcome = decide(&found, desired, &spec, RUNNING_VERSION, false, &external);
             let Outcome::Conflict {
                 unclearable_recovery, ..
             } = outcome
             else {
                 panic!("{case}/{flavour}: expected Conflict, got {outcome:?}");
             };
+            let expected = match &external {
+                ExternalConfig::Unclearable { recovery } => Some(recovery.clone()),
+                ExternalConfig::Absent | ExternalConfig::Clearable => None,
+            };
             assert_eq!(
-                unclearable_recovery, overlay.unclearable_recovery,
+                unclearable_recovery, expected,
                 "{case}/{flavour}: the CLI decides whether to offer `--force` from this alone"
             );
         }
     }
 }
 
-/// as a hand-edited fragment is, and `decide`'s version check runs before
-/// any text comparison, so without this the overlay would be destroyed
-/// without ever being reported.
+/// A stale artifact that also carries external configuration (systemd's drop-in directory, or any
+/// future backend's equivalent) must not be silently regenerated: the configuration is exactly as
+/// much "not solely goetia's doing" as a hand-edited fragment is, and `decide`'s version check runs
+/// before any text comparison, so without this it would be destroyed without ever being reported.
 #[skuld::test]
-fn stale_with_foreign_overlay_conflicts_not_stale() {
+fn stale_with_external_config_conflicts_not_stale() {
     let spec = spec_fixture();
-    // `regenerated` and `on_disk` deliberately differ, mirroring how a real backend's `discover`
-    // folds an overlay marker onto `on_disk` without ever including it in `regenerated`: an
-    // identical pair here would make the conflict diff trivially (and wrongly) empty.
+    // `regenerated` and `on_disk` deliberately differ, mirroring how a real backend folds
+    // a marker for the external configuration onto `on_disk` without ever including it in
+    // `regenerated`: an identical pair here would make the conflict diff trivially (and wrongly) empty.
     let regenerated = "ARTIFACT WRITTEN BY 0.1.0";
-    let on_disk = "ARTIFACT WRITTEN BY 0.1.0\n# --- overlay marker ---\n";
+    let on_disk = "ARTIFACT WRITTEN BY 0.1.0\n# --- external config marker ---\n";
     let desired = "ARTIFACT AS 1.2.3 WOULD WRITE IT";
-    let found = ours(&spec, "0.1.0", regenerated);
+    let found = ours(&spec, "0.1.0", regenerated, on_disk);
 
-    let outcome = decide(
-        &found,
-        Some(on_disk),
-        desired,
-        &spec,
-        RUNNING_VERSION,
-        false,
-        &present(),
-    );
+    let outcome = decide(&found, desired, &spec, RUNNING_VERSION, false, &clearable());
 
     match outcome {
         Outcome::Conflict { artifact_diff, .. } => {
@@ -481,18 +472,18 @@ fn stale_with_foreign_overlay_conflicts_not_stale() {
     }
 }
 
-/// `force` still lets a stale-plus-overlay artifact regenerate, exactly as
-/// it does for a plain hand-edit conflict — `foreign_overlay` only changes
-/// what happens when nothing overrides the refusal.
+/// `force` still lets a stale-plus-external-config artifact regenerate, exactly as it does for a
+/// plain hand-edit conflict: the external configuration only changes what happens when nothing
+/// overrides the refusal.
 #[skuld::test]
-fn stale_with_foreign_overlay_and_force_is_stale() {
+fn stale_with_external_config_and_force_is_stale() {
     let spec = spec_fixture();
     let regenerated = "ARTIFACT WRITTEN BY 0.1.0";
-    let on_disk = "ARTIFACT WRITTEN BY 0.1.0\n# --- overlay marker ---\n";
+    let on_disk = "ARTIFACT WRITTEN BY 0.1.0\n# --- external config marker ---\n";
     let desired = "ARTIFACT AS 1.2.3 WOULD WRITE IT";
-    let found = ours(&spec, "0.1.0", regenerated);
+    let found = ours(&spec, "0.1.0", regenerated, on_disk);
 
-    let outcome = decide(&found, Some(on_disk), desired, &spec, RUNNING_VERSION, true, &present());
+    let outcome = decide(&found, desired, &spec, RUNNING_VERSION, true, &clearable());
 
     assert_eq!(
         outcome,
@@ -502,37 +493,54 @@ fn stale_with_foreign_overlay_and_force_is_stale() {
     );
 }
 
+/// Every refusal names a recovery, except an unreadable one whose discovery had none to name (a
+/// drop-in that could not be read).
 #[skuld::test]
-fn every_refusal_names_a_recovery_command() {
+fn every_refusal_names_a_recovery_command_except_a_recoveryless_unreadable() {
     let spec = spec_fixture();
     let refusals = [
         decide(
             &Ownership::Foreign,
-            Some("x"),
             "GENERATED",
             &spec,
             RUNNING_VERSION,
             false,
-            &Overlay::default(),
+            &ExternalConfig::Absent,
         ),
         decide(
             &Ownership::OursUnreadable {
                 reason: "corrupt".to_owned(),
+                recovery: Some(unreadable_recovery("frpc")),
             },
-            Some("x"),
             "GENERATED",
             &spec,
             RUNNING_VERSION,
             false,
-            &Overlay::default(),
+            &ExternalConfig::Absent,
+        ),
+        decide(
+            &Ownership::OursUnreadable {
+                reason: "a drop-in could not be read".to_owned(),
+                recovery: None,
+            },
+            "GENERATED",
+            &spec,
+            RUNNING_VERSION,
+            false,
+            &ExternalConfig::Absent,
         ),
     ];
 
     for outcome in refusals {
         match outcome {
-            Outcome::RefuseForeign { recovery } | Outcome::RefuseUnreadable { recovery, .. } => {
+            Outcome::RefuseForeign { recovery }
+            | Outcome::RefuseUnreadable {
+                recovery: Some(recovery),
+                ..
+            } => {
                 assert!(!recovery.is_empty(), "every refusal must name a recovery command");
             }
+            Outcome::RefuseUnreadable { recovery: None, .. } => {}
             other => panic!("expected a refusing variant, got {other:?}"),
         }
     }

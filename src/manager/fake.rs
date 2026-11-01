@@ -1,9 +1,9 @@
-//! [`Fake`]: an in-memory [`ServiceManager`] with no real I/O.
+//! [`Fake`]: an in-memory `Backend` with no real I/O, and so a [`ServiceManager`].
 //!
 //! Every CLI test in this crate runs against `Fake`, never a real backend —
-//! see `manager.rs`'s module doc comment. `Fake` still routes every
-//! `install` through [`crate::decide::decide`], exactly as a real backend
-//! must: its own tiny `generate`/`extract` pair below (not any real
+//! see `manager.rs`'s module doc comment. Its `install`, `status` and `list`
+//! are the shared flows in `crate::manager::flow`, as for every backend:
+//! its own tiny `generate`/`extract` pair below (not any real
 //! systemd/launchd/SCM format) exists only so `decide` has something to
 //! compare, the same role each real backend's own generator plays.
 
@@ -11,12 +11,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::backend::{
+    InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
+};
 use crate::blob::{self, Blob};
-use crate::decide::{self, Outcome, Ownership};
+use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Result};
 use crate::manager::budget;
+use crate::manager::flow;
 use crate::manager::{Budget, Installed, Prepared, ServiceManager, State, Status, Step};
-use crate::spec::{DaemonSpec, Id};
+use crate::spec::{DaemonSpec, Id, User};
 
 /// The fake's own artifact marker. Deliberately not any of the real
 /// `Marker`/`Schema`/`Version`/`Spec` field names — this is not a format any
@@ -28,14 +32,8 @@ const FAKE_MARKER: &str = "FAKE-GOETIA-ARTIFACT";
 /// running. Never a real process.
 const FAKE_PID: u32 = 1;
 
-/// The `on_disk` text `decide` is handed for an id carrying only a residual
-/// artifact — see [`Fake::seed_residual_artifact`]. Deliberately carries no
-/// [`FAKE_MARKER`]: residue is exactly what goetia cannot attribute, and
-/// `decide` must reach `RefuseForeign` from it.
-const RESIDUAL_TEXT: &str = "residual artifact, no primary artifact\n";
-
 /// Why an opaque id could not be classified — see [`Fake::seed_opaque`].
-/// Shared by [`Store::undetermined`] and [`Fake::list`] so the error and the
+/// Shared by [`Store::undetermined`] and [`Fake::scan`] so the error and the
 /// `list` entry cannot describe the same condition differently.
 const OPAQUE_REASON: &str = "the artifact could not be read (seeded opaque by Fake::seed_opaque)";
 
@@ -47,8 +45,31 @@ fn pid_for(state: State) -> Option<u32> {
     if state == State::Running { Some(FAKE_PID) } else { None }
 }
 
+/// What [`Fake`]'s `read` and `scan` saw at a marked id.
+pub(crate) struct Artifact {
+    id: Id,
+    blob: Result<Blob>,
+    entry: Entry,
+}
+
+impl Artifact {
+    fn new(id: Id, blob: Result<Blob>, entry: Entry) -> Self {
+        Self { id, blob, entry }
+    }
+}
+
+impl InstalledService for Artifact {
+    fn id(&self) -> &Id {
+        &self.id
+    }
+
+    fn blob(&self) -> std::result::Result<&Blob, &Error> {
+        self.blob.as_ref()
+    }
+}
+
 #[derive(Debug, Clone)]
-struct Entry {
+pub(crate) struct Entry {
     /// The fake's own "artifact" text: either what `generate` produced
     /// (ours), or arbitrary seeded text (foreign).
     text: String,
@@ -82,8 +103,9 @@ pub struct Fake {
 struct Store {
     entries: BTreeMap<String, Entry>,
     /// Ids with no artifact of their own but some goetia-attributable trace
-    /// the platform still applies — see [`Fake::seed_residual_artifact`].
-    residual: BTreeSet<String>,
+    /// the platform still applies, each with the backend's own remedy if it
+    /// has one — see [`Fake::seed_residual_artifact`].
+    residual: BTreeMap<String, Option<String>>,
     /// Ids whose artifact this process cannot read at all — see
     /// [`Fake::seed_opaque`]. Consulted before `entries`, because the read
     /// that would have found an entry is the one that failed.
@@ -92,36 +114,31 @@ struct Store {
     /// [`Fake::seed_aggregate_undetermined`]. Not a set of ids: an
     /// aggregate is precisely the case where the ids are not known.
     aggregates: Vec<String>,
-    /// Ids whose manager never confirms a start — see
-    /// [`Fake::seed_start_stalls`].
     start_stalls: BTreeSet<String>,
-    /// [`Fake::seed_stop_stalls`]'s mirror of `start_stalls`.
     stop_stalls: BTreeSet<String>,
-    /// Ids whose start request ends in doubt — see [`Fake::seed_start_in_doubt`].
     start_in_doubt: BTreeSet<String>,
-    /// [`Fake::seed_stop_in_doubt`]'s mirror of `start_in_doubt`.
     stop_in_doubt: BTreeSet<String>,
-    /// Whether this Fake has a request-only restart — see
-    /// [`Fake::seed_native_restart`].
     native_restart: bool,
-    /// Whether [`ServiceManager::prepare`] fails — see
-    /// [`Fake::seed_prepare_fails`].
     prepare_fails: bool,
-    /// Whether no manager can be asked — see [`Fake::seed_no_manager`].
     no_manager: bool,
-    /// Every `start`/`stop`/`restart`/`kill` this Fake was asked to perform, in
-    /// order — see [`Fake::calls`].
+    unresolvable: BTreeSet<String>,
+    installed_fails: BTreeMap<String, String>,
+    live_status_fails: BTreeMap<String, String>,
+    write_races: BTreeMap<String, usize>,
+    /// Ids whose service is gone by the time its live state is queried.
+    live_status_gone: BTreeSet<String>,
+    /// Text another process puts at an id just before this Fake's next write there, by id.
+    interlopers: BTreeMap<String, String>,
+    /// What the manager applies to an id from outside its artifact, by id; absent means none.
+    externals: BTreeMap<String, ExternalConfig>,
+    writes: usize,
     calls: Vec<(&'static str, String)>,
-    /// The steps and budget each [`ServiceManager::prepare`] was given, in
-    /// order — see [`Fake::prepared`].
     prepared: Vec<(Vec<Step>, Budget)>,
     /// The steps of every guard `prepare` returned that has not been
     /// dropped, by guard number.
     live: Vec<(u64, Vec<Step>)>,
     /// The number the next guard `prepare` returns is known by.
     next_guard: u64,
-    /// Every request, with the steps of the guards live when it was asked —
-    /// see [`Fake::guarded`].
     guarded: Vec<(&'static str, String, Vec<Step>)>,
 }
 
@@ -142,28 +159,37 @@ impl Store {
         self.guarded.push((verb, id.as_str().to_string(), steps));
     }
 
-    /// The artifact at `id`, or the error its absence means *there* — never
-    /// a bare [`Error::NotInstalled`] read off the map lookup alone. Every
-    /// verb goes through this or [`Store::get_mut`], so none of them can
-    /// disagree with [`discover`] about one id.
-    fn get(&self, id: &Id) -> Result<&Entry> {
+    /// What is at `id`, as [`Backend::read`] reports it. An opaque id fails
+    /// first: the read that would have found an entry is the one that failed.
+    fn read(&self, id: &Id) -> Result<ReadOutcome<Artifact>> {
         if self.opaque.contains(id.as_str()) {
             return Err(Self::undetermined(id));
         }
-        match self.entries.get(id.as_str()) {
-            Some(entry) => Ok(entry),
-            None => Err(self.absent_error(id)),
-        }
+        Ok(match self.entries.get(id.as_str()) {
+            Some(entry) => Self::classify(entry).named(id, Artifact::new),
+            // Never absent: whatever the platform still applies here is
+            // configuration goetia did not write and cannot show, and
+            // `NotInstalled` is the one error `cli::uninstall` renders as
+            // success.
+            None => match self.residual.get(id.as_str()) {
+                Some(recovery) => ReadOutcome::Foreign {
+                    recovery: recovery.clone(),
+                },
+                None => ReadOutcome::Absent,
+            },
+        })
     }
 
-    fn get_mut(&mut self, id: &Id) -> Result<&mut Entry> {
-        if self.opaque.contains(id.as_str()) {
-            return Err(Self::undetermined(id));
-        }
-        if !self.entries.contains_key(id.as_str()) {
-            return Err(self.absent_error(id));
-        }
-        Ok(self.entries.get_mut(id.as_str()).expect("present, checked just above"))
+    fn classify(entry: &Entry) -> ReadOutcome<Unnamed<Entry>> {
+        let blob = match extract(&entry.text) {
+            Ok(None) => return ReadOutcome::Foreign { recovery: None },
+            Ok(Some(blob)) => Ok(blob),
+            Err(e) => Err(e),
+        };
+        ReadOutcome::Marked(Unnamed {
+            blob,
+            body: entry.clone(),
+        })
     }
 
     /// The fake's single [`Error::Undetermined`] constructor: one wording
@@ -177,23 +203,6 @@ impl Store {
                 .to_string(),
         }
     }
-
-    /// [`Error::NotInstalled`] only when nothing at all is at `id`. A
-    /// residual artifact makes it [`Error::Foreign`] instead: `cli::
-    /// uninstall` maps `NotInstalled` — and only that variant — to exit `0`
-    /// and "nothing to do", which must not be the answer for an id the
-    /// platform is still acting on.
-    fn absent_error(&self, id: &Id) -> Error {
-        if self.residual.contains(id.as_str()) {
-            return Error::Foreign {
-                id: id.as_str().to_string(),
-                recovery: decide::foreign_recovery(id.as_str()),
-            };
-        }
-        Error::NotInstalled {
-            id: id.as_str().to_string(),
-        }
-    }
 }
 
 impl Fake {
@@ -202,8 +211,8 @@ impl Fake {
     }
 
     /// Test-only seeding: place `text`, carrying no Goetia marker, at `id`
-    /// — simulating a pre-existing service Goetia did not create. Discovery
-    /// then classifies it as [`Ownership::Foreign`]. See
+    /// — simulating a pre-existing service Goetia did not create. The shared
+    /// flow then classifies it as `ReadOutcome::Foreign`. See
     /// `manager::conformance`'s module doc comment.
     pub fn seed_foreign(&self, id: &str, text: impl Into<String>) {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
@@ -329,7 +338,16 @@ impl Fake {
     pub fn seed_residual_artifact(&self, id: &str) {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.entries.remove(id);
-        state.residual.insert(id.to_string());
+        state.residual.insert(id.to_string(), None);
+    }
+
+    /// [`Fake::seed_residual_artifact`] for a backend that has its own remedy for the residue
+    /// (systemd's names the leftover paths): `status` and the ownership gate carry `recovery`
+    /// instead of [`crate::decide::foreign_recovery`].
+    pub fn seed_residual_recovery(&self, id: &str, recovery: &str) {
+        self.seed_residual_artifact(id);
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.residual.insert(id.to_string(), Some(recovery.to_string()));
     }
 
     /// Test-only seeding: make `id`'s artifact unreadable to this process —
@@ -423,6 +441,58 @@ impl Fake {
         state.no_manager = true;
     }
 
+    /// Test-only seeding: `render` fails for a spec whose `user` is `User::Name(user)`, as a
+    /// backend's does for an account the platform cannot resolve.
+    pub fn seed_unresolvable_account(&self, user: &str) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.unresolvable.insert(user.to_string());
+    }
+
+    /// Test-only seeding: reading back what is installed at `id` fails with `detail`, as a
+    /// backend's does for a drop-in directory it cannot list.
+    pub fn seed_installed_fails(&self, id: &str, detail: &str) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.installed_fails.insert(id.to_string(), detail.to_string());
+    }
+
+    /// Test-only seeding: the live state of `id` cannot be queried, failing with `detail` as a
+    /// backend's does when the tool it asks is down. Not [`Error::NoManager`], which refuses
+    /// every id at once: this is one entry's failure.
+    pub fn seed_live_status_fails(&self, id: &str, detail: &str) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.live_status_fails.insert(id.to_string(), detail.to_string());
+    }
+
+    /// Test-only seeding: the next `times` writes at `id` lose a race and write nothing, as when
+    /// something appears at the id between a backend's read and its write.
+    pub fn seed_write_races(&self, id: &str, times: usize) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.write_races.insert(id.to_string(), times);
+    }
+
+    /// Test-only seeding: `id` is found gone when its live state is queried, as when a concurrent
+    /// uninstall removes it after `read` or `scan` saw it. The query completes and says
+    /// [`Error::NotInstalled`].
+    pub fn seed_live_status_gone(&self, id: &str) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.live_status_gone.insert(id.to_string());
+    }
+
+    /// Test-only seeding: just before the next write at `id`, another process places `text` there,
+    /// as [`Fake::seed_foreign`] does. That write then finds the id changed since it was read, so
+    /// it writes nothing and loses the race for real.
+    pub fn seed_write_interloper(&self, id: &str, text: impl Into<String>) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.interlopers.insert(id.to_string(), text.into());
+    }
+
+    /// Test-only seeding: the manager applies `external` to `id` from outside its artifact, as
+    /// systemd's drop-ins are. Reported by reading back what is installed.
+    pub fn seed_external(&self, id: &str, external: ExternalConfig) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.externals.insert(id.to_string(), external);
+    }
+
     /// Test-only seeding: make [`ServiceManager::prepare`] fail, as launchd's
     /// does when no thread can be made to reap a request.
     pub fn seed_prepare_fails(&self) {
@@ -430,8 +500,8 @@ impl Fake {
         state.prepare_fails = true;
     }
 
-    /// Every `start`/`stop`/`restart`/`kill` this Fake was asked to perform, in order,
-    /// recorded when it was *asked* rather than when it succeeded.
+    /// Every `start`/`stop`/`restart`/`kill` this Fake was asked to perform, in order, recorded
+    /// once the ownership gate passed rather than when it succeeded.
     ///
     /// Exists because some assertions are about the **absence** of a call,
     /// which no state read can express: the fake's `start` on an
@@ -443,6 +513,12 @@ impl Fake {
     pub fn calls(&self) -> Vec<(&'static str, String)> {
         let state = self.state.lock().expect("Fake mutex poisoned");
         state.calls.clone()
+    }
+
+    /// How many writes were attempted, the raced ones included.
+    pub fn writes(&self) -> usize {
+        let state = self.state.lock().expect("Fake mutex poisoned");
+        state.writes
     }
 
     /// The steps and budget every [`ServiceManager::prepare`] was given, in
@@ -476,7 +552,7 @@ impl Fake {
 
 // generate/extract ====================================================================================================
 
-fn generate(spec: &DaemonSpec) -> String {
+pub(in crate::manager) fn generate(spec: &DaemonSpec) -> String {
     format!("{FAKE_MARKER}\nSpec: {}\n", blob::encode(spec))
 }
 
@@ -493,24 +569,6 @@ fn extract(text: &str) -> Result<Option<Blob>> {
         .ok_or_else(|| Error::Blob(format!("fake artifact's second line is not `Spec: ...`: {spec_line}")))?;
     let blob = blob::decode(encoded)?;
     Ok(Some(blob))
-}
-
-/// Refuse an operation against a *foreign* (unmarked) entry — the same
-/// "goetia never touches a service it did not create" rule `install`
-/// enforces via `decide`. A marked-but-undecodable entry still passes:
-/// the marker alone is proof of ownership, and `uninstall` in particular
-/// documents this as the way out of `decide::Outcome::RefuseUnreadable`
-/// (its `recovery` text names exactly this verb). Only `install` itself
-/// needs the full three-way `Ownership` distinction (via `decide`); every
-/// other verb only needs this narrower "is this even ours" gate.
-fn require_ours(entry: &Entry, id: &Id) -> Result<()> {
-    match extract(&entry.text) {
-        Ok(None) => Err(Error::Foreign {
-            id: id.as_str().to_string(),
-            recovery: decide::foreign_recovery(id.as_str()),
-        }),
-        Ok(Some(_)) | Err(_) => Ok(()),
-    }
 }
 
 /// What a **stalled** entry's `start`/`stop` reports for `budget`, without
@@ -544,35 +602,6 @@ fn stalled(id: &Id, awaited: &'static str, budget: Budget) -> Result<()> {
     }
 }
 
-/// Classify what's at `id` in `state`, exactly as `install` would discover
-/// it, plus the raw on-disk text `decide` needs alongside the
-/// classification. Shared by `install` and `preview_install` so the two can
-/// never disagree about what `decide` sees — `preview_install` exists
-/// precisely so `diff` can ask "what would `install` do" without either
-/// duplicating this logic or being able to drift from it.
-fn discover(state: &Store, id: &str) -> (Ownership, Option<String>) {
-    let existing = state.entries.get(id).cloned();
-    let found = match &existing {
-        // Never silently adopted as `Create`: whatever the platform still
-        // applies here is configuration goetia did not write and cannot
-        // show — the same refusal systemd's own `discover` gives a
-        // fragmentless `<id>.service.d` drop-in.
-        None if state.residual.contains(id) => {
-            return (Ownership::Foreign, Some(RESIDUAL_TEXT.to_string()));
-        }
-        None => Ownership::Absent,
-        Some(entry) => match extract(&entry.text) {
-            Ok(Some(blob)) => Ownership::Ours {
-                regenerated: generate(&blob.spec),
-                blob,
-            },
-            Ok(None) => Ownership::Foreign,
-            Err(e) => Ownership::OursUnreadable { reason: e.to_string() },
-        },
-    };
-    (found, existing.map(|e| e.text))
-}
-
 /// [`Fake::seed_start_in_doubt`]'s failure, for a start of `id`.
 fn in_doubt(state: &Store, id: &Id) -> Result<()> {
     lost(&state.start_in_doubt, "start", id)
@@ -603,126 +632,201 @@ impl Drop for Held {
     }
 }
 
-// ServiceManager ======================================================================================================
+// Backend =============================================================================================================
 
-impl ServiceManager for Fake {
-    fn install(&self, spec: &DaemonSpec, force: bool) -> Result<Outcome> {
+impl Store {
+    /// The entry `snapshot` was read from, which must still be there, still marked and still the
+    /// text the snapshot saw, as of this lock: no clone can change the id between the gate and
+    /// the verb. Ownership errors beat [`Error::NoManager`].
+    fn confirm(&mut self, snapshot: &Artifact) -> Result<&mut Entry> {
+        let id = snapshot.id();
+        let current = flow::require_marked(id, self.read(id)?)?;
+        if current.entry.text != snapshot.entry.text {
+            return Err(Error::Other(format!(
+                "`{id}` changed after being confirmed installed; nothing was done"
+            )));
+        }
+        self.manager()?;
+        self.entries.get_mut(id.as_str()).ok_or_else(|| Error::NotInstalled {
+            id: id.as_str().to_string(),
+        })
+    }
+}
+
+impl Fake {
+    /// [`Fake::seed_native_restart`]'s restart of a service the gate passed. Recorded as `restart`.
+    fn restart_natively(&self, snapshot: Artifact) -> Result<()> {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.calls.push(("restart", snapshot.id().as_str().to_string()));
+        state.asked("restart", snapshot.id());
+        state.confirm(&snapshot).map(drop)
+    }
+}
+
+impl crate::backend::Backend for Fake {
+    type Definition = String;
+    type Snapshot = Artifact;
+    type InstallScope = ();
+
+    /// Records the install once, however many times the flow retries; then an opaque id, then no
+    /// manager. Before `read`, which has no way to say a manager is missing.
+    fn begin_install(&self, spec: &DaemonSpec) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.asked("install", &spec.id);
-        // Before `discover`, which has no error channel: an artifact whose
-        // bytes were never read supplies none of `decide`'s inputs, so this
-        // is an input failure ahead of policy, not a fifth `Ownership`.
         if state.opaque.contains(spec.id.as_str()) {
             return Err(Store::undetermined(&spec.id));
         }
-        state.manager()?;
-        let desired = generate(spec);
-        let (found, on_disk) = discover(&state, spec.id.as_str());
+        state.manager()
+    }
 
-        // The fake has no concept of an overlay (systemd's drop-in
-        // directory, or an analogous future backend's equivalent), so it
-        // always passes `decide` the empty one.
-        let outcome = decide::decide(
-            &found,
-            on_disk.as_deref(),
-            &desired,
-            spec,
-            crate::version(),
-            force,
-            &decide::Overlay::default(),
-        );
+    fn render(&self, spec: &DaemonSpec) -> Result<String> {
+        if let User::Name(user) = &spec.user {
+            let state = self.state.lock().expect("Fake mutex poisoned");
+            if state.unresolvable.contains(user) {
+                return Err(Error::Other(format!("account `{user}` cannot be resolved (seeded)")));
+            }
+        }
+        Ok(generate(spec))
+    }
 
-        // `Create`/`Update`/`Stale` are the outcomes `decide` recommends
-        // actually writing for; every refusing variant (`Conflict` without
-        // force, `RefuseForeign`, `RefuseUnreadable`) and `UpToDate` leave
-        // the store untouched.
-        if matches!(
-            outcome,
-            Outcome::Create | Outcome::Update { .. } | Outcome::Stale { .. }
-        ) {
-            let (enabled, run_state) = state
-                .entries
-                .get(spec.id.as_str())
-                .map(|e| (e.enabled, e.state))
-                .unwrap_or((false, State::Stopped));
+    fn read(&self, id: &Id) -> Result<ReadOutcome<Artifact>> {
+        let state = self.state.lock().expect("Fake mutex poisoned");
+        state.read(id)
+    }
+
+    fn installed(&self, snapshot: &Artifact) -> Result<InstalledDefinition<String>> {
+        let id = snapshot.id();
+        let state = self.state.lock().expect("Fake mutex poisoned");
+        if let Some(detail) = state.installed_fails.get(id.as_str()) {
+            return Err(Error::Other(detail.clone()));
+        }
+        Ok(InstalledDefinition {
+            definition: snapshot.entry.text.clone(),
+            external: state
+                .externals
+                .get(id.as_str())
+                .cloned()
+                .unwrap_or(ExternalConfig::Absent),
+        })
+    }
+
+    /// Keeps the entry's enablement and run state across an update. Writes nothing and returns
+    /// `Raced` unless the entry is still the text `snapshot` saw (`None`: still absent).
+    fn write(
+        &self,
+        spec: &DaemonSpec,
+        definition: &String,
+        _outcome: &Outcome,
+        snapshot: Option<&Artifact>,
+        _scope: &mut (),
+    ) -> Result<WriteOutcome> {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        if let Some(text) = state.interlopers.remove(spec.id.as_str()) {
             state.entries.insert(
                 spec.id.as_str().to_string(),
                 Entry {
-                    text: desired,
-                    enabled,
-                    state: run_state,
+                    text,
+                    enabled: false,
+                    state: State::Stopped,
                 },
             );
         }
-
-        Ok(outcome)
-    }
-
-    fn preview_install(&self, spec: &DaemonSpec) -> Result<Outcome> {
-        let state = self.state.lock().expect("Fake mutex poisoned");
-        // Same pre-check as `install`, for the same reason: `diff` must not
-        // predict an outcome from an artifact nobody read.
-        if state.opaque.contains(spec.id.as_str()) {
-            return Err(Store::undetermined(&spec.id));
+        state.writes += 1;
+        if let Some(left) = state.write_races.get_mut(spec.id.as_str()) {
+            if *left > 0 {
+                *left -= 1;
+                return Ok(WriteOutcome::Raced);
+            }
         }
-        let desired = generate(spec);
-        let (found, on_disk) = discover(&state, spec.id.as_str());
-        // Always previewed without `force`: showing the forced outcome would
-        // hide the very conflict `--force` exists to let a user decide
-        // about, and `diff` has no `--force` flag of its own to justify it.
-        Ok(decide::decide(
-            &found,
-            on_disk.as_deref(),
-            &desired,
-            spec,
-            crate::version(),
-            false,
-            &decide::Overlay::default(),
-        ))
+        let current = state.entries.get(spec.id.as_str());
+        if current.map(|e| &e.text) != snapshot.map(|s| &s.entry.text) {
+            return Ok(WriteOutcome::Raced);
+        }
+        let (enabled, run_state) = current.map(|e| (e.enabled, e.state)).unwrap_or((false, State::Stopped));
+        state.entries.insert(
+            spec.id.as_str().to_string(),
+            Entry {
+                text: definition.clone(),
+                enabled,
+                state: run_state,
+            },
+        );
+        Ok(WriteOutcome::Done)
     }
 
-    fn uninstall(&self, id: &Id) -> Result<()> {
-        let mut state = self.state.lock().expect("Fake mutex poisoned");
-        let entry = state.get(id)?;
-        require_ours(entry, id)?;
+    fn live_status(&self, snapshot: &Artifact) -> Result<Status> {
+        let id = snapshot.id();
+        let state = self.state.lock().expect("Fake mutex poisoned");
         state.manager()?;
-        state.entries.remove(id.as_str());
+        if let Some(detail) = state.live_status_fails.get(id.as_str()) {
+            return Err(Error::Other(detail.clone()));
+        }
+        if state.live_status_gone.contains(id.as_str()) {
+            return Err(Error::NotInstalled {
+                id: id.as_str().to_string(),
+            });
+        }
+        Ok(Status {
+            state: snapshot.entry.state,
+            pid: pid_for(snapshot.entry.state),
+            enabled: snapshot.entry.enabled,
+        })
+    }
+
+    /// Aggregates first, then the opaque ids last-to-first: `ServiceManager::list` promises no
+    /// ordering at all, so a caller that renders this order instead of imposing its own must fail
+    /// a test rather than pass by luck. An opaque id is never classified from the entry its failed
+    /// read would have found.
+    fn scan(&self) -> Scan<Artifact> {
+        let state = self.state.lock().expect("Fake mutex poisoned");
+        let aggregates = state.aggregates.iter().map(|reason| Installed::Undetermined {
+            name: None,
+            reason: reason.clone(),
+        });
+        let opaque = state.opaque.iter().rev().map(|name| Installed::Undetermined {
+            name: Some(name.clone()),
+            reason: OPAQUE_REASON.to_string(),
+        });
+        Scan {
+            entries: state
+                .entries
+                .iter()
+                .filter(|(name, _)| !state.opaque.contains(*name))
+                .map(|(name, entry)| (name.clone(), ScanEntry::of(name, Store::classify(entry), Artifact::new)))
+                .collect(),
+            reported: aggregates.chain(opaque).collect(),
+        }
+    }
+
+    fn uninstall(&self, snapshot: Artifact) -> Result<()> {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.confirm(&snapshot)?;
+        state.entries.remove(snapshot.id().as_str());
         Ok(())
     }
 
-    fn enable(&self, id: &Id) -> Result<()> {
+    fn enable(&self, snapshot: Artifact) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
-        let manager = state.manager();
-        let entry = state.get_mut(id)?;
-        require_ours(entry, id)?;
-        manager?;
-        entry.enabled = true;
+        state.confirm(&snapshot)?.enabled = true;
         Ok(())
     }
 
-    fn disable(&self, id: &Id) -> Result<()> {
+    fn disable(&self, snapshot: Artifact) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
-        let manager = state.manager();
-        let entry = state.get_mut(id)?;
-        require_ours(entry, id)?;
-        manager?;
-        entry.enabled = false;
+        state.confirm(&snapshot)?.enabled = false;
         Ok(())
     }
 
-    fn start(&self, id: &Id, budget: Budget) -> Result<()> {
+    fn start(&self, snapshot: Artifact, budget: Budget) -> Result<()> {
+        let id = snapshot.id();
         let mut state = self.state.lock().expect("Fake mutex poisoned");
-        // Recorded on being *asked*, ahead of every check below: `calls`
-        // answers "was this attempted", which is a different question from
-        // whether it succeeded or changed anything.
+        // Recorded once the gate has passed, ahead of every check below: `calls` answers "was this
+        // attempted", which is a different question from whether it succeeded or changed anything.
         state.calls.push(("start", id.as_str().to_string()));
         state.asked("start", id);
         in_doubt(&state, id)?;
         let stalls = state.start_stalls.contains(id.as_str());
-        let manager = state.manager();
-        let entry = state.get_mut(id)?;
-        require_ours(entry, id)?;
-        manager?;
+        let entry = state.confirm(&snapshot)?;
         if stalls {
             // No confirmation is coming, so none is invented: the state is
             // left exactly as it was on every branch `stalled` can take.
@@ -758,30 +862,23 @@ impl ServiceManager for Fake {
 
     /// Only once [`Fake::seed_native_restart`]ed. Request-only, so it settles
     /// nothing, as for `start`.
-    fn request_restart(&self, id: &Id) -> Option<Result<()>> {
-        let mut state = self.state.lock().expect("Fake mutex poisoned");
-        if !state.native_restart {
-            return None;
-        }
-        state.calls.push(("restart", id.as_str().to_string()));
-        state.asked("restart", id);
-        let manager = state.manager();
-        Some(state.get_mut(id).and_then(|entry| require_ours(entry, id)).and(manager))
+    fn request_restart(&self) -> Option<NativeRestart<Self>> {
+        let state = self.state.lock().expect("Fake mutex poisoned");
+        state
+            .native_restart
+            .then_some(Fake::restart_natively as NativeRestart<Self>)
     }
 
     /// Models the strictest manager the contract allows, SCM's: a service
     /// still `Running` refuses the start, since the request-only `stop` before
     /// it settled nothing. Recorded as `start`, which is what it asks for.
-    fn request_start_after_stop(&self, id: &Id) -> Result<()> {
+    fn request_start_after_stop(&self, snapshot: Artifact) -> Result<()> {
+        let id = snapshot.id();
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.calls.push(("start", id.as_str().to_string()));
         state.asked("start", id);
         in_doubt(&state, id)?;
-        let manager = state.manager();
-        let entry = state.get_mut(id)?;
-        require_ours(entry, id)?;
-        manager?;
-        if entry.state == State::Running {
+        if state.confirm(&snapshot)?.state == State::Running {
             return Err(Error::Other(format!(
                 "start `{id}`: refused as already running — the stop issued before it has not taken effect"
             )));
@@ -789,16 +886,14 @@ impl ServiceManager for Fake {
         Ok(())
     }
 
-    fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
+    fn stop(&self, snapshot: Artifact, budget: Budget) -> Result<()> {
+        let id = snapshot.id();
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.calls.push(("stop", id.as_str().to_string()));
         state.asked("stop", id);
         lost(&state.stop_in_doubt, "stop", id)?;
         let stalls = state.stop_stalls.contains(id.as_str());
-        let manager = state.manager();
-        let entry = state.get_mut(id)?;
-        require_ours(entry, id)?;
-        manager?;
+        let entry = state.confirm(&snapshot)?;
         if stalls {
             return stalled(id, "stopped", budget);
         }
@@ -815,14 +910,12 @@ impl ServiceManager for Fake {
 
     /// A running entry becomes [`State::Failed`], with no pid: the Fake models the kill and nothing
     /// of the restart policy that follows it. Any other state has no process to end.
-    fn kill(&self, id: &Id) -> Result<()> {
+    fn kill(&self, snapshot: Artifact) -> Result<()> {
+        let id = snapshot.id();
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.calls.push(("kill", id.as_str().to_string()));
         state.asked("kill", id);
-        let manager = state.manager();
-        let entry = state.get_mut(id)?;
-        require_ours(entry, id)?;
-        manager?;
+        let entry = state.confirm(&snapshot)?;
         if entry.state != State::Running {
             return Err(Error::NotRunning {
                 id: id.as_str().to_string(),
@@ -831,77 +924,8 @@ impl ServiceManager for Fake {
         entry.state = State::Failed;
         Ok(())
     }
-
-    fn status(&self, id: &Id) -> Result<Status> {
-        let state = self.state.lock().expect("Fake mutex poisoned");
-        let entry = state.get(id)?;
-        // Unlike the mutating verbs, `status`'s only job is to report the
-        // truth: an unreadable entry has no trustworthy `enabled`/`state` to
-        // report, so this deliberately does not use `require_ours` (which
-        // would let it through) — it surfaces the decode failure instead of
-        // fabricating a `Stopped`/`enabled: false` answer for it.
-        match extract(&entry.text) {
-            Ok(None) => Err(Error::Foreign {
-                id: id.as_str().to_string(),
-                recovery: decide::foreign_recovery(id.as_str()),
-            }),
-            Err(e) => Err(e),
-            Ok(Some(_)) => state.manager().map(|()| Status {
-                state: entry.state,
-                pid: pid_for(entry.state),
-                enabled: entry.enabled,
-            }),
-        }
-    }
-
-    fn list(&self) -> Result<Vec<Installed>> {
-        let state = self.state.lock().expect("Fake mutex poisoned");
-        let mut out = Vec::new();
-        // Aggregates first, and the named entries last-to-first:
-        // `ServiceManager::list` promises no ordering at all, so a caller
-        // that renders this order instead of imposing its own must fail a
-        // test rather than pass by luck.
-        for reason in state.aggregates.iter() {
-            out.push(Installed::Undetermined {
-                name: None,
-                reason: reason.clone(),
-            });
-        }
-        for name in state.opaque.iter().rev() {
-            out.push(Installed::Undetermined {
-                name: Some(name.clone()),
-                reason: OPAQUE_REASON.to_string(),
-            });
-        }
-        for (name, entry) in state.entries.iter() {
-            // An id whose read failed is not classifiable from the entry
-            // that read would have found — `Store::get` refuses it too.
-            if state.opaque.contains(name) {
-                continue;
-            }
-            match extract(&entry.text) {
-                // A foreign entry is not Goetia-managed at all: `list`
-                // reports only what Goetia owns, per the trait doc comment.
-                Ok(None) => {}
-                Ok(Some(blob)) => {
-                    state.manager()?;
-                    out.push(Installed::Ours {
-                        spec: blob.spec,
-                        state: entry.state,
-                        pid: pid_for(entry.state),
-                        enabled: entry.enabled,
-                    });
-                }
-                Err(e) => out.push(Installed::OursUnreadable {
-                    name: name.clone(),
-                    reason: e.to_string(),
-                }),
-            }
-        }
-        Ok(out)
-    }
 }
 
 #[cfg(test)]
 #[path = "fake_tests.rs"]
-mod fake_tests;
+pub(in crate::manager) mod fake_tests;

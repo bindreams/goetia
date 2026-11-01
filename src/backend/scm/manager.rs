@@ -15,15 +15,15 @@
 //! other service that happens to run the same executable, so it cannot serve
 //! that role. This means the crash window between `CreateServiceW` and the
 //! `Parameters` write (see point 5) has no in-tool escape route for
-//! `type: managed` the way it does for `type: simple`: `discover` classifies
-//! such an orphan as [`Ownership::Foreign`] (no marker at all), and the next
-//! `install` refuses with [`decide::foreign_recovery`]'s named command — the
+//! `type: managed` the way it does for `type: simple`: `read` classifies
+//! such an orphan as foreign (no marker at all), and the next
+//! `install` refuses with [`crate::decide::foreign_recovery`]'s named command — the
 //! real Windows analogue of `sc.exe delete <id>` (or Services MMC), which is
 //! in fact the exact remedy: nothing but deleting the orphan and re-running
 //! `install` can recover it. `interrupted_install_is_recoverable` in
 //! `tests/scm_integration.rs` pins this. `uninstall`, meanwhile, still does
 //! not need a *decodable* blob — only the `Marker` field, so a corrupted
-//! (but present) `Spec` value never wedges an id; see [`require_ours`].
+//! (but present) `Spec` value never wedges an id.
 //!
 //! **2. Stopping (and starting) must not poll.** `windows-service`'s
 //! `stop()`/`start()` return as soon as SCM accepts the request, not once
@@ -71,7 +71,7 @@
 //! via the documented (if obscure) `Services\<name>\Environment`
 //! `REG_MULTI_SZ` value — a list of `NAME=value` lines SCM adds to the
 //! environment of the service process at launch. It is part of
-//! `ScmRegistration`/`render()`, so a hand-edit to `Environment` alone is a
+//! `ScmRegistration`'s `Display` text, so a hand-edit to `Environment` alone is a
 //! conflict, and an up-to-date install writes nothing.
 //! `managed_kind_environment_availability` in `tests/scm_integration.rs`
 //! verifies the mechanism empirically, on the real (elevated) Windows CI
@@ -109,16 +109,19 @@ use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use super::wait::Waited;
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
+use crate::backend::{
+    Backend, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
+};
 use crate::blob::Blob;
-use crate::decide::{self, Outcome, Ownership};
+use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Result};
 use crate::manager::budget;
-use crate::manager::{Budget, Installed, ServiceManager, State, Status};
+use crate::manager::{Budget, Installed, State, Status};
 use crate::spec::{DaemonSpec, Id, Kind};
 
 // ScmManager ==========================================================================================================
 
-/// The Windows `ServiceManager` implementation. Holds no state of its own —
+/// The Windows service manager. Holds no state of its own —
 /// every operation opens exactly the SCM/registry handles it needs and
 /// closes them again.
 #[derive(Debug, Default, Clone, Copy)]
@@ -130,70 +133,192 @@ impl ScmManager {
     }
 }
 
-impl ServiceManager for ScmManager {
-    fn install(&self, spec: &DaemonSpec, force: bool) -> Result<Outcome> {
-        let d = discover(spec)?;
-        let outcome = decide::decide(
-            &d.found,
-            d.on_disk.as_deref(),
-            &d.desired,
-            spec,
-            crate::version(),
-            force,
-            // SCM has no drop-in mechanism: everything Goetia writes lives
-            // under the service's own key.
-            &decide::Overlay::default(),
-        );
-        match outcome {
-            Outcome::Create | Outcome::Update { .. } | Outcome::Stale { .. } => {
-                apply(spec, &d.reg, matches!(d.found, Ownership::Absent), d.current_start_type)?;
-            }
-            _ => {}
+/// What `read` saw of a service goetia marked.
+pub(crate) struct ScmSnapshot {
+    id: Id,
+    blob: Result<Blob>,
+    /// Its `Parameters` values, which hold the only proof of ownership `type: managed` has.
+    parameters: BTreeMap<String, String>,
+    /// The object `read` opened to classify it, so `installed` and `live_status` ask that object:
+    /// a service deleted since then does not turn into an unreadable one. `None` for what `scan`
+    /// saw, which opens no service.
+    service: Option<Service>,
+}
+
+/// What `read_marker` hands on of a service: its `Parameters` and the object `read` opened.
+type Opened = (BTreeMap<String, String>, Option<Service>);
+
+impl ScmSnapshot {
+    fn new(id: Id, blob: Result<Blob>, (parameters, service): Opened) -> Self {
+        Self {
+            id,
+            blob,
+            parameters,
+            service,
         }
-        Ok(outcome)
+    }
+}
+
+impl InstalledService for ScmSnapshot {
+    fn id(&self) -> &Id {
+        &self.id
     }
 
-    fn preview_install(&self, spec: &DaemonSpec) -> Result<Outcome> {
-        let d = discover(spec)?;
-        Ok(decide::decide(
-            &d.found,
-            d.on_disk.as_deref(),
-            &d.desired,
-            spec,
-            crate::version(),
-            false,
-            // SCM has no drop-in mechanism; see the `install` call site.
-            &decide::Overlay::default(),
-        ))
+    fn blob(&self) -> std::result::Result<&Blob, &Error> {
+        self.blob.as_ref()
+    }
+}
+
+impl ScmSnapshot {
+    /// Runs `ask` on the service `read` opened, or on one opened by name with `access` where the
+    /// snapshot holds none; a service gone by then is [`Error::NotInstalled`].
+    fn ask<T>(&self, access: ServiceAccess, context: &str, ask: impl FnOnce(&Service) -> Result<T>) -> Result<T> {
+        match &self.service {
+            Some(service) => ask(service),
+            None => {
+                let service = open_scm(ServiceManagerAccess::CONNECT)?
+                    .open_service(self.id.as_str(), access)
+                    .map_err(|e| {
+                        if is_not_found(&e) || is_marked_for_delete(&e) {
+                            Error::NotInstalled {
+                                id: self.id.as_str().to_string(),
+                            }
+                        } else {
+                            to_error(context, e)
+                        }
+                    })?;
+                ask(&service)
+            }
+        }
     }
 
-    fn uninstall(&self, id: &Id) -> Result<()> {
-        let (scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
-        require_ours(id)?;
-        // `uninstall_locked` opens its own handles, and its delete needs this one closed (trap 3).
-        drop(service);
-        uninstall_locked(&scm, id)
+    /// The id, with the service `read` opened closed: a verb that deletes the service, or waits on
+    /// it through a handle of its own, must not leave this one open.
+    fn into_id(self) -> Id {
+        self.id
+    }
+}
+
+impl Backend for ScmManager {
+    type Definition = ScmRegistration;
+    type Snapshot = ScmSnapshot;
+    type InstallScope = ();
+
+    /// SCM has nothing to hold across an install: its preconditions are `apply`'s, before any write.
+    fn begin_install(&self, _spec: &DaemonSpec) -> Result<()> {
+        Ok(())
     }
 
-    fn enable(&self, id: &Id) -> Result<()> {
+    fn render(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
+        let identity = identity::resolve(&spec.user)?;
+        generate::registration(spec, &identity, &shim_path())
+    }
+
+    /// Upstream of the marker, so a service that will not open leaves `id` undetermined: neither
+    /// absent nor goetia's.
+    fn read(&self, id: &Id) -> Result<ReadOutcome<ScmSnapshot>> {
+        let scm = open_scm_to_classify(id.as_str())?;
+        let service = match scm.open_service(id.as_str(), ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG) {
+            Ok(service) => service,
+            Err(e) if is_not_found(&e) => return Ok(ReadOutcome::Absent),
+            Err(e) => return Err(service_undetermined(id.as_str(), &format!("open service `{id}`"), &e)),
+        };
+        Ok(read_marker(registry::read_parameters(id.as_str())?, Some(service)).named(id, ScmSnapshot::new))
+    }
+
+    /// SCM has no drop-in mechanism: everything goetia writes lives under the service's own key.
+    fn installed(&self, snapshot: &ScmSnapshot) -> Result<InstalledDefinition<ScmRegistration>> {
+        let id = snapshot.id();
+        let context = format!("open `{id}` to read its configuration");
+        let (definition, _) = snapshot.ask(ServiceAccess::QUERY_CONFIG, &context, |service| {
+            read_live_registration(service, id.as_str(), &snapshot.parameters)
+        })?;
+        Ok(InstalledDefinition {
+            definition,
+            external: ExternalConfig::Absent,
+        })
+    }
+
+    fn write(
+        &self,
+        spec: &DaemonSpec,
+        definition: &ScmRegistration,
+        _outcome: &Outcome,
+        snapshot: Option<&ScmSnapshot>,
+        _scope: &mut (),
+    ) -> Result<WriteOutcome> {
+        apply(spec, definition, snapshot.is_none())?;
+        Ok(WriteOutcome::Done)
+    }
+
+    fn live_status(&self, snapshot: &ScmSnapshot) -> Result<Status> {
+        let id = snapshot.id();
+        let context = format!("open `{id}` to query its live status");
+        let (state, pid, enabled) = snapshot.ask(
+            ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG,
+            &context,
+            |service| query_live(service, id.as_str()),
+        )?;
+        Ok(Status { state, pid, enabled })
+    }
+
+    /// Read directly from the registry rather than `windows-service`'s enumeration API:
+    /// `SC_MANAGER_ENUMERATE_SERVICE`/`EnumServicesStatusExW` need no more privilege than reading
+    /// this key does, and one pass here avoids an `OpenService` round trip per candidate on a host
+    /// with hundreds of unrelated services.
+    fn scan(&self) -> Scan<ScmSnapshot> {
+        let mut entries = Vec::new();
+        let mut unreadable: Vec<Unreadable> = Vec::new();
+        let incomplete = registry::scan_services(|name| {
+            // A registry read failure for one unrelated service (e.g. a driver whose `Parameters`
+            // key carries a restrictive ACL) must not take `list` down for every other daemon. It
+            // leaves us unable to tell whether `name` carries goetia's marker at all, so it is
+            // neither omitted nor claimed: collected whole here, reported by
+            // `unreadable_aggregate`, which names the id, the failure and its remedy when it turns
+            // out to be the only one.
+            match registry::read_parameters(&name) {
+                Ok(params) => {
+                    let entry = ScanEntry::of(&name, read_marker(params, None), ScmSnapshot::new);
+                    entries.push((name, entry));
+                }
+                Err(e) => unreadable.push(unreadable_parts(name, e)),
+            }
+        });
+        // Two aggregates, kept apart: the first stands for services this pass reached and could
+        // not read, the second for services it never reached. Both carry no name, so either alone
+        // forbids concluding any id absent; separately, each count stays honest.
+        Scan {
+            entries,
+            reported: unreadable_aggregate(unreadable).into_iter().chain(incomplete).collect(),
+        }
+    }
+
+    fn uninstall(&self, snapshot: ScmSnapshot) -> Result<()> {
+        // `uninstall_locked` opens its own handles, and its delete needs this one closed: an open
+        // handle leaves the service only marked for deletion.
+        let id = snapshot.into_id();
+        let scm = open_scm_to_classify(id.as_str())?;
+        uninstall_locked(&scm, &id)
+    }
+
+    fn enable(&self, snapshot: ScmSnapshot) -> Result<()> {
+        let id = snapshot.id();
         let (_scm, service) = open_existing(id, ServiceAccess::CHANGE_CONFIG)?;
-        require_ours(id)?;
         set_start_type(&service, ServiceStartType::AutoStart).map_err(|e| Error::Other(format!("enable `{id}`: {e}")))
     }
 
-    fn disable(&self, id: &Id) -> Result<()> {
+    fn disable(&self, snapshot: ScmSnapshot) -> Result<()> {
+        let id = snapshot.id();
         let (_scm, service) = open_existing(id, ServiceAccess::CHANGE_CONFIG)?;
-        require_ours(id)?;
         set_start_type(&service, ServiceStartType::OnDemand).map_err(|e| Error::Other(format!("disable `{id}`: {e}")))
     }
 
-    fn start(&self, id: &Id, budget: Budget) -> Result<()> {
-        // First, so discovery spends the budget too. What it bounds is the
-        // wait: `start_via_notify` issues the start whatever is left of it.
+    fn start(&self, snapshot: ScmSnapshot, budget: Budget) -> Result<()> {
+        // First, so the wait is counted from the verb's entry. What it bounds is the wait:
+        // `start_via_notify` issues the start whatever is left of it.
         let deadline = budget.start();
-        let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
-        require_ours(id)?;
-        drop(service);
+        let (kind, unreadable) = start_kind(snapshot.blob());
+        let id = snapshot.into_id();
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to start it: {e}")))?;
         if !budget.waits() {
@@ -202,9 +327,8 @@ impl ServiceManager for ScmManager {
             // more, per the trait doc comment.
             return super::wait::request_start(&mut actor).map_err(|e| Error::Other(format!("start `{id}`: {e}")));
         }
-        let (kind, unreadable) = installed_kind(id);
         let waited = super::wait::start_via_notify(&mut actor, deadline, kind)
-            .map_err(|e| failed_start(id, &e, unreadable.as_deref()))?;
+            .map_err(|e| failed_start(&id, &e, unreadable.as_deref()))?;
         match waited {
             Waited::Confirmed => Ok(()),
             Waited::Expired => Err(budget::timed_out(id.as_str(), "running", budget)),
@@ -214,22 +338,18 @@ impl ServiceManager for ScmManager {
     /// [`super::wait::request_start_after_stop`]: every
     /// `ERROR_SERVICE_ALREADY_RUNNING` is a refusal here, since a `type:
     /// simple` service reads `RUNNING` until its shim has taken the stop.
-    fn request_start_after_stop(&self, id: &Id) -> Result<()> {
-        let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
-        require_ours(id)?;
-        drop(service);
+    fn request_start_after_stop(&self, snapshot: ScmSnapshot) -> Result<()> {
+        let id = snapshot.into_id();
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to start it: {e}")))?;
         super::wait::request_start_after_stop(&mut actor).map_err(|e| Error::Other(format!("start `{id}`: {e}")))
     }
 
-    fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
-        // First, so discovery spends the budget too; `stop_via_notify` issues
-        // the stop whatever is left of it.
+    fn stop(&self, snapshot: ScmSnapshot, budget: Budget) -> Result<()> {
+        // First, so the wait is counted from the verb's entry; `stop_via_notify` issues the stop
+        // whatever is left of it.
         let deadline = budget.start();
-        let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
-        require_ours(id)?;
-        drop(service);
+        let id = snapshot.into_id();
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::Other(format!("open `{id}` to stop it: {e}")))?;
         if !budget.waits() {
@@ -247,9 +367,9 @@ impl ServiceManager for ScmManager {
     /// (`TerminateProcess`): SCM sees an unexpected exit and applies the recovery actions, as for a
     /// crash. For `type: simple` the process is `goetia-shim`, whose Job Object takes the daemon's
     /// tree with it.
-    fn kill(&self, id: &Id) -> Result<()> {
-        let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS)?;
-        require_ours(id)?;
+    fn kill(&self, snapshot: ScmSnapshot) -> Result<()> {
+        let id = snapshot.into_id();
+        let (_scm, service) = open_existing(&id, ServiceAccess::QUERY_STATUS)?;
         let mut target = super::kill::SystemKillTarget::new(service, id.as_str().to_string());
         match super::kill::kill_service(&mut target).map_err(|e| Error::Other(format!("kill `{id}`: {e}")))? {
             super::kill::Killed::Terminated => Ok(()),
@@ -258,113 +378,21 @@ impl ServiceManager for ScmManager {
             }),
         }
     }
-
-    fn status(&self, id: &Id) -> Result<Status> {
-        let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG)?;
-        // Stricter than `require_ours`: an undecodable blob (or one whose
-        // account can no longer be resolved — see `classify`) must not
-        // fabricate a plausible-looking `Status` — see the trait doc
-        // comment on `ServiceManager::status`.
-        let params = registry::read_parameters(id.as_str())?;
-        let blob = generate::extract(&params)?.ok_or_else(|| foreign(id))?;
-        identity::resolve(&blob.spec.user)
-            .map_err(|e| Error::Other(format!("`{id}`'s account could not be resolved: {e}")))?;
-
-        let st = service
-            .query_status()
-            .map_err(|e| to_error(&format!("query status for `{id}`"), e))?;
-        let cfg = service
-            .query_config()
-            .map_err(|e| to_error(&format!("query configuration for `{id}`"), e))?;
-        Ok(Status {
-            state: map_state(st.current_state),
-            pid: st.process_id,
-            enabled: cfg.start_type == ServiceStartType::AutoStart,
-        })
-    }
-
-    fn list(&self) -> Result<Vec<Installed>> {
-        classify_scan(registry::list_service_names())
-    }
 }
 
-/// [`ScmManager::list`]'s body, over a [`registry::ServiceScan`] rather than reading one — the seam
-/// `registry::collect_service_names` is for the mid-pass fault, one level up. The `Services` key
-/// opens and enumerates on every host that boots (`registry_tests.rs` pins that), so a scan that
-/// stopped early cannot be produced here; handing one in is what reaches the wiring below, which is
-/// where "the enumeration stopped" becomes the entry a caller sees.
-fn classify_scan(scan: registry::ServiceScan) -> Result<Vec<Installed>> {
-    let mut out = Vec::new();
-    let mut unreadable: Vec<Unreadable> = Vec::new();
-    for name in scan.names {
-        // A registry read failure for one unrelated service (e.g. a
-        // driver whose `Parameters` key carries a restrictive ACL) must
-        // not take `list` down for every other daemon — the same
-        // per-entry fault tolerance `Installed::OursUnreadable` exists
-        // for on the decode side. And since it leaves us unable to tell
-        // whether `name` carries Goetia's marker at all, it is neither
-        // omitted nor claimed: collected here, reported by
-        // `unreadable_aggregate` below.
-        let params = match registry::read_parameters(&name) {
-            Ok(p) => p,
-            Err(e) => {
-                // Kept whole, not counted: `unreadable_aggregate` names the id — and says what
-                // failed, and how that failure clears — when it turns out to be the only one, and
-                // neither a count nor a discarded error can be recovered afterwards.
-                unreadable.push(unreadable_parts(name, e));
-                continue;
-            }
-        };
-        let blob = match generate::extract(&params) {
-            Ok(None) => continue,
-            Ok(Some(blob)) => blob,
-            Err(e) => {
-                out.push(Installed::OursUnreadable {
-                    name,
-                    reason: e.to_string(),
-                });
-                continue;
-            }
-        };
-        // A blob can decode perfectly and still name an account (e.g. a
-        // `user.id` SID) that no longer exists on this host — see
-        // `classify`'s identical check on the `install`/`diff` side.
-        // `list`/`status` must agree with `install` about which ids are
-        // "genuinely ours and readable", or a daemon `list` reports
-        // healthy could refuse the very next `install`. The exception:
-        // `list`/`status` do not regenerate, so a blob the generator refuses
-        // (`restart: always`) still lists as `Ours` while `install`/`diff`
-        // refuse it.
-        if let Err(e) = identity::resolve(&blob.spec.user) {
-            out.push(Installed::OursUnreadable {
-                name,
-                reason: format!("marked ours, but its account could not be resolved: {e}"),
-            });
-            continue;
-        }
-        match query_live(&name) {
-            Ok((state, pid, enabled)) => out.push(Installed::Ours {
-                spec: blob.spec,
-                state,
-                pid,
-                enabled,
-            }),
-            Err(e) => out.push(Installed::OursUnreadable {
-                name,
-                reason: format!("marked ours, but its live status could not be read: {e}"),
-            }),
-        }
-    }
-    out.extend(unreadable_aggregate(unreadable));
-    // A second aggregate, and distinct from the one above: that one stands for services this
-    // pass reached and could not read, this one for services it never reached at all. Both
-    // carry no name, so either alone already forbids concluding any id absent; reporting them
-    // separately is what keeps each one's count honest.
-    out.extend(
-        scan.incomplete
-            .map(|detail| Installed::scan_incomplete(registry::SERVICES_KEY, &detail)),
-    );
-    Ok(out)
+/// What the `Parameters` of a service goetia could open say about its ownership. No marker is
+/// foreign, with the stock remedy: nothing but deleting the orphan recovers it, since `type: managed`
+/// has no second proof of ownership.
+fn read_marker(parameters: BTreeMap<String, String>, service: Option<Service>) -> ReadOutcome<Unnamed<Opened>> {
+    let blob = match generate::extract(&parameters) {
+        Ok(None) => return ReadOutcome::Foreign { recovery: None },
+        Ok(Some(blob)) => Ok(blob),
+        Err(e) => Err(e),
+    };
+    ReadOutcome::Marked(Unnamed {
+        blob,
+        body: (parameters, service),
+    })
 }
 
 // shim support ========================================================================================================
@@ -373,7 +401,7 @@ fn classify_scan(scan: registry::ServiceScan) -> Result<Vec<Installed>> {
 /// `Services\<id>\Parameters`. `goetia-shim` (`src/bin/shim/`, a separate
 /// `[[bin]]` target and therefore a separate crate that only ever sees this
 /// module's `pub` surface) calls this: it knows only its service id
-/// (`argv[1]`), not a `DaemonSpec` to hand to [`discover`], and must not
+/// (`argv[1]`), not a `DaemonSpec` to hand to `render`, and must not
 /// pull in `ServiceManager`'s effectful install path just to read one
 /// value. `registry` itself stays private — this is the one read the shim
 /// needs, not the whole module.
@@ -395,10 +423,9 @@ pub fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
 /// say. Only a decodable blob that says `type: simple` selects the shim's vocabulary; an unreadable
 /// one reads as strictly as `type: managed`, which is what a shim that cannot decode it reports
 /// anyway (a failed start).
-fn start_kind(blob: Result<Option<Blob>>) -> (Kind, Option<String>) {
+fn start_kind(blob: std::result::Result<&Blob, &Error>) -> (Kind, Option<String>) {
     match blob {
-        Ok(Some(blob)) => (blob.spec.kind, None),
-        Ok(None) => (Kind::Managed, Some("it carries no goetia metadata".to_string())),
+        Ok(blob) => (blob.spec.kind, None),
         Err(e) => (Kind::Managed, Some(e.to_string())),
     }
 }
@@ -416,27 +443,7 @@ fn failed_start(id: &Id, e: &std::io::Error, unreadable: Option<&str>) -> Error 
     }
 }
 
-fn installed_kind(id: &Id) -> (Kind, Option<String>) {
-    start_kind(read_spec_blob(id.as_str()))
-}
-
-// discover ============================================================================================================
-
-/// What `install`/`preview_install` need from a fresh read of the world:
-/// the registration this run would write, its canonical text, and how the
-/// existing service (if any) is classified.
-struct Discovery {
-    reg: ScmRegistration,
-    desired: String,
-    found: Ownership,
-    on_disk: Option<String>,
-    /// `Some(dwStartType)` when the service already exists — threaded into
-    /// `apply`'s update path so a routine spec-driven `ChangeServiceConfigW`
-    /// preserves whatever `enable`/`disable` last set, rather than
-    /// resetting it. `None` when absent (a fresh `Create` always uses
-    /// `SERVICE_DEMAND_START`; see trap 5).
-    current_start_type: Option<ServiceStartType>,
-}
+// shim path ===========================================================================================================
 
 /// The shim's expected location: a sibling of the currently running
 /// `goetia` binary. Only consulted for `Kind::Simple` — `generate::registration`
@@ -460,99 +467,7 @@ fn shim_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("goetia-shim.exe"))
 }
 
-fn discover(spec: &DaemonSpec) -> Result<Discovery> {
-    let identity = identity::resolve(&spec.user)?;
-    let reg = generate::registration(spec, &identity, &shim_path())?;
-    let desired = generate::render(&reg);
-
-    let scm = open_scm_to_classify(spec.id.as_str())?;
-    let existing = scm.open_service(spec.id.as_str(), ServiceAccess::QUERY_CONFIG);
-    let (found, on_disk, current_start_type) = match existing {
-        Err(e) if is_not_found(&e) => (Ownership::Absent, None, None),
-        // Upstream of the marker, exactly as in `open_existing`: `install` and
-        // `diff` must reach the same verdict about one service as `status`
-        // does, or two subcommands disagree about one machine.
-        Err(e) => {
-            return Err(service_undetermined(
-                spec.id.as_str(),
-                &format!("open service `{}` for discovery", spec.id),
-                &e,
-            ));
-        }
-        Ok(service) => {
-            let params = registry::read_parameters(spec.id.as_str())?;
-            let found = classify(&params);
-            let (live, start_type) = read_live_registration(&service, spec.id.as_str(), &params)
-                .map_err(|e| drift_read_failure(&found, &spec.id, e))?;
-            (found, Some(generate::render(&live)), Some(start_type))
-        }
-    };
-
-    Ok(Discovery {
-        reg,
-        desired,
-        found,
-        on_disk,
-        current_start_type,
-    })
-}
-
-/// Classify what's under `Services\<id>\Parameters`, exactly as `discover`
-/// needs it for [`decide::decide`]. A blob that decodes but whose account
-/// can no longer be resolved (e.g. `user.id` names a SID for an account
-/// since deleted) is [`Ownership::OursUnreadable`]: `decide` cannot compute
-/// `regenerated` without a working `Identity`, so this backend genuinely
-/// cannot regenerate that spec on this host — the same situation a future
-/// schema or bit-rotted blob puts it in. So is a blob the generator refuses,
-/// such as one that says `restart: always`.
-fn classify(params: &BTreeMap<String, String>) -> Ownership {
-    match generate::extract(params) {
-        Ok(None) => Ownership::Foreign,
-        Ok(Some(blob)) => match identity::resolve(&blob.spec.user) {
-            Ok(blob_identity) => match generate::registration(&blob.spec, &blob_identity, &shim_path()) {
-                Ok(blob_reg) => Ownership::Ours {
-                    regenerated: generate::render(&blob_reg),
-                    blob,
-                },
-                Err(e) => Ownership::OursUnreadable { reason: e.to_string() },
-            },
-            Err(e) => Ownership::OursUnreadable {
-                reason: format!("cannot resolve the account the embedded spec was installed for: {e}"),
-            },
-        },
-        Err(e) => Ownership::OursUnreadable { reason: e.to_string() },
-    }
-}
-
-/// How a failure to read the drift text is classified, given what [`classify`]
-/// has already established about the id.
-///
-/// `discover` reads the live registration for every ownership, but
-/// [`decide::decide`] consults `on_disk` only for [`Ownership::Ours`]:
-/// `Foreign` and `OursUnreadable` are answered from the marker alone. So on the
-/// `Foreign` path this read can only ever *lose* an answer goetia already has,
-/// and [`to_error`] loses it in the worst available way — `Error::Other`
-/// reaches `cli::report::status_error`'s catch-all as `Kind::Unreadable`,
-/// "goetia owns the id but cannot report on it", about an id whose missing
-/// marker just **disproved** exactly that. Not merely a claim goetia has not
-/// established: one it has refuted.
-///
-/// [`Error::Foreign`] instead, which states what *was* established — something
-/// is here, it is not goetia's — and carries the identical remedy
-/// [`Outcome::RefuseForeign`] would have. Same exit code (`1`), same advice,
-/// no invented ownership.
-///
-/// Every other ownership keeps the error unchanged: the marker is present,
-/// decoded or not, so ownership *is* established and `Kind::Unreadable` is a
-/// true statement about the id.
-fn drift_read_failure(found: &Ownership, id: &Id, e: Error) -> Error {
-    match found {
-        Ownership::Foreign => foreign(id),
-        _ => e,
-    }
-}
-
-/// Read back everything `render()` needs from the service actually
+/// Read back everything `ScmRegistration`'s `Display` text needs from the service actually
 /// installed at `name`, for the `on_disk` side of `decide`'s comparison —
 /// SCM's "artifact" for diffing, since there is no file (see the
 /// crate-level design notes on this).
@@ -678,17 +593,11 @@ fn split_command_line(cmdline: &str) -> (PathBuf, Vec<String>) {
 /// that fails fails the install before any service write, leaving no new
 /// service and an existing one unchanged, so the next `install` retries as a
 /// create or an update, as systemd and launchd do. `Parameters` follows
-/// create/update immediately, minimizing trap 1's crash window; a failure in
+/// create/update immediately, minimizing the window in which a crash leaves a service with no marker; a failure in
 /// the two writes after it leaves a registration the next `install` reads as
-/// hand-edited (`Conflict`, cleared by `--force`). `current_start_type` is
-/// `Discovery::current_start_type` — `None` for a fresh create, `Some(_)`
-/// (preserved rather than reset) for an update; see `service_info`.
-fn apply(
-    spec: &DaemonSpec,
-    reg: &ScmRegistration,
-    create: bool,
-    current_start_type: Option<ServiceStartType>,
-) -> Result<()> {
+/// hand-edited (`Conflict`, cleared by `--force`). An update restates the
+/// start type the service has, rather than resetting it; see `service_info`.
+fn apply(spec: &DaemonSpec, reg: &ScmRegistration, create: bool) -> Result<()> {
     // Driven by `generate::account_needs_password`, not merely whether
     // `reg.account` is `Some`: a canonicalised built-in
     // (`NT AUTHORITY\LocalService`) or virtual (`NT SERVICE\<id>`) account
@@ -716,10 +625,9 @@ fn apply(
         );
         let pw = identity::service_password()?;
         if pw.is_none() {
-            // Trap 4's own failure shape, one step earlier: install
-            // would otherwise report success and the service would
-            // fail every future start with error 1069. Refuse instead
-            // of creating a service that cannot start.
+            // Install would otherwise report success and the service would
+            // fail every future start with error 1069 (no `SeServiceLogonRight`).
+            // Refuse instead of creating a service that cannot start.
             return Err(Error::Other(format!(
                 "service account `{account}` needs a password (it is not LocalSystem/LocalService/\
                  NetworkService, nor an `NT SERVICE\\`/`NT AUTHORITY\\` account); set \
@@ -747,7 +655,11 @@ fn apply(
         let service = scm
             .open_service(&reg.name, ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG)
             .map_err(|e| to_error(&format!("open service `{}` to update it", reg.name), e))?;
-        let info = service_info(reg, password, current_start_type);
+        let current_start_type = service
+            .query_config()
+            .map_err(|e| to_error(&format!("query configuration for `{}` to update it", reg.name), e))?
+            .start_type;
+        let info = service_info(reg, password, Some(current_start_type));
         service
             .change_config(&info)
             .map_err(|e| to_error(&format!("update service `{}`", reg.name), e))?;
@@ -773,7 +685,7 @@ fn apply(
 /// **`current_start_type` matters for `start_type`.** `windows-service`'s
 /// `change_config` always sends `dwStartType` as a real value, never
 /// `SERVICE_NO_CHANGE` — so a create always uses `SERVICE_DEMAND_START`
-/// (trap 5: never `SERVICE_DISABLED`/`SERVICE_AUTO_START`), but an update
+/// (never `SERVICE_DISABLED`, which would block an explicit `start`, nor `SERVICE_AUTO_START`), but an update
 /// must restate whatever is *already there* (`current_start_type`), or a
 /// routine spec-driven `install` would silently reset a `SERVICE_AUTO_START`
 /// `enable` had set. `enable`/`disable` themselves go through
@@ -815,9 +727,7 @@ fn service_info(
 /// **Why not the WinAPI call.** `ChangeServiceConfig2W(SERVICE_CONFIG_FAILURE_ACTIONS)`
 /// returned `ERROR_ACCESS_DENIED` from this process on GitHub Actions'
 /// Windows runner even with `SeShutdownPrivilege` explicitly enabled via
-/// `AdjustTokenPrivileges` beforehand — confirmed empirically; an
-/// unresolved upstream report from a mature Windows service tool
-/// (winsw#893) hits the identical failure in the identical environment.
+/// `AdjustTokenPrivileges` beforehand — confirmed empirically.
 /// `sc.exe` — a *separate* process, with its own freshly-derived token —
 /// does not: `tests/marker_inertness/scm.rs`'s `scm_parameters_values_survive`
 /// probe already calls `sc.exe failure` successfully on this same CI.
@@ -868,7 +778,8 @@ fn run_sc(args: &[&str]) -> Result<()> {
 
 // uninstall ===========================================================================================================
 
-/// Disable the service, stop whatever runs, then delete it. See trap 3.
+/// Disable the service, stop whatever runs, then delete it: `DeleteService` on a running service
+/// only marks it, and the next `install` meets `ERROR_SERVICE_MARKED_FOR_DELETE`.
 ///
 /// A disabled service is never started again: `StartService` fails with 1058, and a recovery restart
 /// fails with event 7032 / `%%1058` and no `START_PENDING`. Measured: a restart queued before the
@@ -1055,7 +966,7 @@ fn open_scm(access: ServiceManagerAccess) -> Result<WinServiceManager> {
 }
 
 /// [`open_scm`] for the two callers that are about to *classify* `id`
-/// ([`open_existing`], [`discover`]). A manager that would not open leaves that
+/// ([`open_existing`], [`Backend::read`]). A manager that would not open leaves that
 /// id exactly as unclassified as a service object that would not open does, so
 /// it takes the same class — `Error::Other` here would reach
 /// `cli::report::status_error`'s catch-all as `Kind::Unreadable` and claim
@@ -1125,19 +1036,6 @@ fn to_error(context: &str, e: windows_service::Error) -> Error {
     Error::Other(service_detail(context, &e))
 }
 
-fn not_installed(id: &Id) -> Error {
-    Error::NotInstalled {
-        id: id.as_str().to_string(),
-    }
-}
-
-fn foreign(id: &Id) -> Error {
-    Error::Foreign {
-        id: id.as_str().to_string(),
-        recovery: decide::foreign_recovery(id.as_str()),
-    }
-}
-
 // undetermined ========================================================================================================
 
 /// This backend's single [`Error::Undetermined`] constructor — the SCM twin of
@@ -1148,7 +1046,7 @@ fn foreign(id: &Id) -> Error {
 /// Neither read that reaches it is a file, and the two are not even the same
 /// kind of object: one is the `Services\<id>\Parameters` registry key
 /// ([`registry::read_parameters`]), the other an SCM service object
-/// ([`open_existing`], [`discover`]). Only the caller knows which, so `reason`
+/// ([`open_existing`], [`Backend::read`]). Only the caller knows which, so `reason`
 /// arrives already rendered and this decides the class and the remedy.
 ///
 /// [`Error::Undetermined`], never the `Error::Other` [`to_error`] and
@@ -1188,42 +1086,24 @@ fn service_undetermined(id: &str, context: &str, e: &windows_service::Error) -> 
     undetermined(id, service_detail(context, e), is_access_denied(e))
 }
 
-/// Open `id` with `access`, translating "no such service" into
-/// [`Error::NotInstalled`] rather than a raw Win32 message — every verb but
-/// `install` needs this before it can even ask whether `id` is *ours* (see
-/// [`require_ours`]).
+/// Open `id` with the `access` a verb needs beyond what `read` asked for, translating "no such
+/// service" into [`Error::NotInstalled`] rather than a raw Win32 message.
 ///
-/// Every other failure is [`undetermined`], because this open is upstream of
-/// the marker: a service object whose DACL denies `QUERY_CONFIG`/`QUERY_STATUS`
-/// is a service whose marker was never read, so neither `NotInstalled`
-/// (absence) nor `Error::Other`'s downstream `Kind::Unreadable` (ownership) is
-/// a claim goetia is entitled to make about it.
+/// Every other failure is [`undetermined`], like `read`'s: a service object whose DACL denies the
+/// access is one the verb cannot act on, and that establishes neither absence nor anything about
+/// its marker.
 fn open_existing(id: &Id, access: ServiceAccess) -> Result<(WinServiceManager, Service)> {
     let scm = open_scm_to_classify(id.as_str())?;
     let service = scm.open_service(id.as_str(), access).map_err(|e| {
         if is_not_found(&e) {
-            not_installed(id)
+            Error::NotInstalled {
+                id: id.as_str().to_string(),
+            }
         } else {
             service_undetermined(id.as_str(), &format!("open service `{id}`"), &e)
         }
     })?;
     Ok((scm, service))
-}
-
-/// The narrower "is this even ours" gate every verb but `install`/`status`
-/// needs (see `manager::fake`'s `require_ours`, which this mirrors exactly):
-/// a marker that fails to *decode* still passes — `uninstall`'s `recovery`
-/// text (`decide::Outcome::RefuseUnreadable`) promises exactly this, since
-/// forcing a decode here would turn a corrupted `Spec` value into an id no
-/// verb can ever touch again. Only a wholly absent `Marker` — a foreign
-/// service, or (trap 1) a `type: managed` install interrupted before this
-/// backend's one ownership proof was ever written — is refused.
-fn require_ours(id: &Id) -> Result<()> {
-    let params = registry::read_parameters(id.as_str())?;
-    match generate::extract(&params) {
-        Ok(None) => Err(foreign(id)),
-        Ok(Some(_)) | Err(_) => Ok(()),
-    }
 }
 
 fn map_state(s: WinState) -> State {
@@ -1248,11 +1128,7 @@ fn map_state(s: WinState) -> State {
     }
 }
 
-fn query_live(name: &str) -> Result<(State, Option<u32>, bool)> {
-    let scm = open_scm(ServiceManagerAccess::CONNECT)?;
-    let service = scm
-        .open_service(name, ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG)
-        .map_err(|e| to_error(&format!("open `{name}` to query its live status"), e))?;
+fn query_live(service: &Service, name: &str) -> Result<(State, Option<u32>, bool)> {
     let status = service
         .query_status()
         .map_err(|e| to_error(&format!("query status for `{name}`"), e))?;

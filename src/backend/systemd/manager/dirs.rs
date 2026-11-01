@@ -1,4 +1,4 @@
-//! Creating and owning the parent directories `logs` and `cwd` need — obligation 5. Only path
+//! Creating and owning the parent directories `logs` and `cwd` need, which a unit fails at start without. Only path
 //! components a call actually creates are touched; an already-existing directory's mode and
 //! ownership are left alone.
 
@@ -13,8 +13,8 @@ use crate::spec::{AccountId, DaemonSpec, User};
 
 use super::io_err;
 
-/// Create (and, for a non-root account, `chown`) the parent of `logs` and the `cwd` directory itself
-/// — obligation 5. Runs while still elevated.
+/// Create (and, for a non-root account, `chown`) the parent of `logs` and the `cwd` directory itself.
+/// Runs while still elevated.
 pub(super) fn ensure_parent_dirs(spec: &DaemonSpec) -> Result<()> {
     if let Some(logs) = &spec.logs {
         if let Some(parent) = logs.parent() {

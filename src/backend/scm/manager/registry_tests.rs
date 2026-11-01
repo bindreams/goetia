@@ -180,69 +180,25 @@ fn a_parameters_read_that_did_not_complete_is_undetermined() {
     }
 }
 
-/// The mid-pass fault, and the reason `list` no longer propagates one: a key that could not be
-/// enumerated must not take down the services the very same pass already named. Injected through
-/// `collect_service_names`' iterator because no real `enum_keys` fails on request.
-#[skuld::test]
-fn a_key_that_cannot_be_enumerated_keeps_what_the_scan_already_named() {
-    let keys = vec![
-        Ok("named-before-the-fault".to_string()),
-        Err(std::io::Error::other("injected mid-scan failure")),
-        Ok("never-reached".to_string()),
-    ];
-
-    let scan = collect_service_names(SERVICES_KEY, keys.into_iter());
-
-    assert_eq!(
-        scan.names,
-        ["named-before-the-fault"],
-        "what the pass named before the fault survives it, and the pass stops there: {scan:?}"
-    );
-    let detail = scan.incomplete.expect("a pass that stopped early must say so");
-    assert!(detail.contains("injected mid-scan failure"), "{detail}");
-    assert!(
-        detail.contains(SERVICES_KEY),
-        "the detail must name what was being scanned: {detail}"
-    );
-}
-
-#[skuld::test]
-fn a_pass_that_finishes_reports_nothing_undetermined() {
-    let keys = vec![Ok("a".to_string()), Ok("b".to_string())];
-
-    let scan = collect_service_names(SERVICES_KEY, keys.into_iter());
-
-    assert_eq!(scan.names, ["a", "b"]);
-    assert!(
-        scan.incomplete.is_none(),
-        "a pass that finished has nothing to report: {scan:?}"
-    );
-}
-
 // The open, through the real `RegKey` =================================================================================
 //
-// `collect_service_names` above covers the mid-pass fault with a hand-built iterator. These three
-// cover the outcome *before* it — what `scan_names_under` makes of the open itself — through the
-// real `RegOpenKeyEx`, because the arm that decides "empty and settled" against "empty and
-// unfinished" is exactly the one this branch exists to get right, and a hand-built value cannot
-// reach it.
+// The mid-pass fault and the shape of a finished pass are `flow_tests.rs`'s, over plain iterators.
+// These cover what only the real `RegOpenKeyEx` can: which `io::ErrorKind` each open outcome
+// reaches `flow::scan` as.
 
 /// The production call, against the production key. Every Windows host that boots has `Services`,
 /// with services under it, readable at any privilege level — so a pass over it names some and
 /// reports nothing outstanding. Without this, no test opens that key at all.
 #[skuld::test]
 fn the_services_key_enumerates_and_finishes() {
-    let scan = list_service_names();
+    let mut names = Vec::new();
 
+    let incomplete = scan_services(|name| names.push(name));
+
+    assert!(!names.is_empty(), "every Windows host runs services: {names:?}");
     assert!(
-        !scan.names.is_empty(),
-        "every Windows host runs services: {:?}",
-        scan.names
-    );
-    assert!(
-        scan.incomplete.is_none(),
-        "the `Services` key opens and enumerates for any caller: {:?}",
-        scan.incomplete
+        incomplete.is_none(),
+        "the `Services` key opens and enumerates for any caller: {incomplete:?}"
     );
 }
 
@@ -251,13 +207,16 @@ fn the_services_key_enumerates_and_finishes() {
 /// exit `4`. `ServiceManager::list`'s doc comment requires this of every backend's absent container.
 #[skuld::test]
 fn a_services_key_that_does_not_exist_is_an_empty_settled_scan() {
-    let scan = scan_names_under(&format!(r"{SERVICES_KEY}\goetia-no-such-key-b6f0a1c2"));
+    let mut names = Vec::new();
 
-    assert!(scan.names.is_empty(), "{:?}", scan.names);
+    let incomplete = scan_names_under(&format!(r"{SERVICES_KEY}\goetia-no-such-key-b6f0a1c2"), |name| {
+        names.push(name)
+    });
+
+    assert!(names.is_empty(), "{names:?}");
     assert!(
-        scan.incomplete.is_none(),
-        "nothing is registered under a key that does not exist, and that is an answer: {:?}",
-        scan.incomplete
+        incomplete.is_none(),
+        "nothing is registered under a key that does not exist, and that is an answer: {incomplete:?}"
     );
 }
 
@@ -284,17 +243,20 @@ fn a_services_key_that_will_not_open_leaves_the_pass_unfinished() {
         std::io::ErrorKind::NotFound,
         r"HKLM\SECURITY exists on every Windows host: {refusal}"
     );
+    let mut names = Vec::new();
 
-    let scan = scan_names_under("SECURITY");
+    let incomplete = scan_names_under("SECURITY", |name| names.push(name));
 
-    assert!(scan.names.is_empty(), "{:?}", scan.names);
-    let detail = scan
-        .incomplete
-        .expect("a key that exists and would not open established no absence");
-    assert!(
-        detail.contains("SECURITY"),
-        "the detail must name what was being scanned: {detail}"
-    );
+    assert!(names.is_empty(), "{names:?}");
+    match incomplete {
+        Some(Installed::Undetermined { name: None, reason }) => {
+            assert!(
+                reason.contains("SECURITY"),
+                "the entry must name what was being scanned: {reason}"
+            );
+        }
+        other => panic!("a key that exists and would not open established no absence, got {other:?}"),
+    }
 }
 
 #[skuld::test]

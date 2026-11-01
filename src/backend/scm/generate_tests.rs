@@ -96,9 +96,9 @@ fn managed_kind_renders_its_environment_lines() {
 
     assert_eq!(reg.environment, ["A=1", "B=2"]);
     assert!(
-        render(&reg).contains("Environment:\n  \"A=1\"\n  \"B=2\"\n"),
+        reg.to_string().contains("Environment:\n  \"A=1\"\n  \"B=2\"\n"),
         "the compared text must show each line:\n{}",
-        render(&reg)
+        reg
     );
 }
 
@@ -112,9 +112,9 @@ fn simple_kind_renders_no_environment() {
 
     assert!(reg.environment.is_empty(), "{:?}", reg.environment);
     assert!(
-        render(&reg).contains("Environment:\nParameters:\n"),
+        reg.to_string().contains("Environment:\nParameters:\n"),
         "an empty environment renders as a bare header:\n{}",
-        render(&reg)
+        reg
     );
 }
 
@@ -903,8 +903,8 @@ fn a_sub_millisecond_restart_delay_rounds_up_to_the_whole_millisecond_scm_stores
             ..fa
         });
         assert_eq!(
-            render(&reg),
-            render(&read_back),
+            reg.to_string(),
+            read_back.to_string(),
             "desired and read-back text must agree for {delay:?}, or every later install is a Conflict"
         );
     }
@@ -956,7 +956,7 @@ fn parameters_round_trip_through_extract() {
 }
 
 #[skuld::test]
-fn render_is_the_generation_invariant() {
+fn display_is_the_generation_invariant() {
     let spec = managed_spec();
     let id = identity();
     let shim = shim_path();
@@ -966,8 +966,8 @@ fn render_is_the_generation_invariant() {
     let regenerated = registration(&recovered_spec, &id, &shim).unwrap();
 
     assert_eq!(
-        render(&original),
-        render(&regenerated),
+        original.to_string(),
+        regenerated.to_string(),
         "regenerating from the extracted spec must render identically to the original"
     );
 }
@@ -1089,34 +1089,34 @@ fn extract_errors_on_case_insensitive_field_collision() {
     assert!(err.to_string().contains(FIELD_MARKER));
 }
 
-// render ==============================================================================================================
+// Display =============================================================================================================
 
 #[skuld::test]
-fn render_excludes_boot_enablement() {
+fn display_excludes_boot_enablement() {
     let reg = build(&managed_spec());
-    let text = render(&reg);
+    let text = reg.to_string();
     let lower = text.to_lowercase();
 
     for forbidden in ["boot", "auto_start", "demand_start", "startup", "enable"] {
         assert!(
             !lower.contains(forbidden),
-            "render() must not mention boot enablement (found `{forbidden}` in:\n{text}\n) — it is a property \
+            "the text must not mention boot enablement (found `{forbidden}` in:\n{text}\n) — it is a property \
              of the installation, not the service, and excluded from every drift comparison"
         );
     }
 }
 
 #[skuld::test]
-fn render_escapes_display_name_and_parameter_values_for_injectivity() {
+fn display_escapes_display_name_and_parameter_values_for_injectivity() {
     let mut reg = build(&managed_spec());
     reg.display_name = "line one\nline two".to_string();
     reg.parameters.insert("Extra".to_string(), "a\nb".to_string());
 
-    let text = render(&reg);
+    let text = reg.to_string();
 
     // Readback data (`ServiceConfig::display_name`, an arbitrary
     // `Parameters` value) is not covered by the injection gate that keeps
-    // goetia-authored strings newline-free, so `render` must escape it
+    // goetia-authored strings newline-free, so `Display` must escape it
     // itself rather than let it forge extra lines indistinguishable from
     // real fields.
     assert!(
@@ -1134,7 +1134,7 @@ fn render_escapes_display_name_and_parameter_values_for_injectivity() {
 }
 
 #[skuld::test]
-fn render_output_format_is_pinned() {
+fn display_output_format_is_pinned() {
     let reg = ScmRegistration {
         name: "frpc".to_string(),
         display_name: "FRP tunnel client".to_string(),
@@ -1153,11 +1153,11 @@ fn render_output_format_is_pinned() {
         ]),
     };
 
-    // Every line render() itself controls (labels, order, indentation,
+    // Every line `Display` itself controls (labels, order, indentation,
     // `{:?}` quoting) is pinned literally; the two duration substrings
     // are computed through the same `humantime::format_duration` call
-    // render() uses, since that formatting is humantime's contract, not
-    // render()'s.
+    // `Display` uses, since that formatting is humantime's contract, not
+    // `Display`'s.
     let delay_text = humantime::format_duration(Duration::from_secs(1));
     let reset_period_text = humantime::format_duration(Duration::from_secs(86_400));
     let expected = [
@@ -1183,5 +1183,26 @@ fn render_output_format_is_pinned() {
     .map(|line| format!("{line}\n"))
     .collect::<String>();
 
-    assert_eq!(render(&reg), expected);
+    assert_eq!(reg.to_string(), expected);
+}
+
+/// `decide` compares the `Display` text, so it is the canonical text itself, not a second rendering.
+#[skuld::test]
+fn a_registration_displays_as_its_canonical_text() {
+    let reg = ScmRegistration {
+        name: "x".to_string(),
+        display_name: "X".to_string(),
+        executable: PathBuf::from("a"),
+        arguments: vec![],
+        account: None,
+        failure_actions: None,
+        environment: vec![],
+        parameters: BTreeMap::from([("k".to_string(), "v".to_string())]),
+    };
+
+    assert_eq!(
+        format!("{reg}"),
+        "Name: x\nDisplayName: \"X\"\nAccount: \"LocalSystem\"\nExecutable: \"a\"\nArguments:\n\
+         FailureActions: none\nEnvironment:\nParameters:\n  k: \"v\"\n"
+    );
 }

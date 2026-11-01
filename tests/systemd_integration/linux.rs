@@ -12,10 +12,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use goetia::backend::Identity;
+use goetia::backend::systemd::generate;
 use goetia::backend::systemd::manager::Systemd;
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, Installed, ServiceManager, State, conformance};
-use goetia::spec::{DaemonSpec, Id, Kind, Restart, User};
+use goetia::spec::{AccountId, DaemonSpec, Id, Kind, Restart, User};
 
 use crate::support::{self, ELEVATED, ServiceGuard, cmd};
 
@@ -381,7 +383,7 @@ fn systemd_passes_conformance() {
     conformance::run(&mgr, &mk);
 }
 
-// Step 2: obligation-specific scenarios ===============================================================================
+// Step 2: scenarios for each correctness property =====================================================================
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn install_then_show_round_trips_without_the_source_file() {
@@ -1287,7 +1289,7 @@ fn uninstall_leaves_nothing() {
     );
 }
 
-// Residual artifacts: absence is about the id, not about the fragment file — obligation 7 =============================
+// Residual artifacts: absence is about the id, not about the fragment file ============================================
 
 /// The state `uninstall`'s own partial-failure path leaves behind when removing the drop-in
 /// directory fails after the fragment is already gone: the retry it tells you to run must not then
@@ -1313,7 +1315,7 @@ fn uninstall_refuses_an_id_whose_fragment_is_gone_but_whose_dropin_remains() {
 }
 
 /// The same for the other artifact that outlives the fragment. `systemctl disable` is impossible
-/// once the `[Install]` section is gone (obligation 6), so this link keeps the id enrolled at boot
+/// once the `[Install]` section is gone, so this link keeps the id enrolled at boot
 /// — the very reason the exit-code table gives for `disable` returning `1` here.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn uninstall_refuses_an_id_whose_fragment_is_gone_but_whose_enablement_link_remains() {
@@ -1367,7 +1369,73 @@ fn status_does_not_call_an_id_with_a_stray_dropin_not_installed() {
     );
 }
 
-// Obligation 7: a read that failed establishes no ownership ===========================================================
+/// The refusal for an id with no fragment names what is left, so the user has the paths to remove
+/// without hunting for them. (`install` over the same state is `decide`'s generic foreign refusal;
+/// only `status` and the other verbs carry this recovery.)
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn status_of_residue_names_the_leftover_paths() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    write_dropin(guard.id());
+
+    let err = Systemd::new()
+        .status(&Id::try_from(guard.id().to_string()).expect("valid id"))
+        .expect_err("a stray drop-in is not a reportable daemon");
+    let goetia::Error::Foreign { recovery, .. } = &err else {
+        panic!("residue is foreign, not absent and not undetermined: {err:?}");
+    };
+    assert!(
+        recovery.contains(&dropin_dir(guard.id()).display().to_string()),
+        "the recovery must name the leftover directory: {recovery}"
+    );
+}
+
+/// A fragment goetia wrote for a spec naming a Windows account (a SID) carries goetia's marker, so
+/// it is goetia's, but the systemd backend cannot render that spec: it is `OursUnreadable` in `list`
+/// and an error in `status`.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn list_reports_a_sid_account_as_ours_unreadable() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let mut spec = mk(guard.id());
+    spec.user = User::Id(AccountId::Sid("S-1-5-21-1-2-3-1001".to_string()));
+    let text = generate::unit(&spec, &Identity { user: "0".to_string() });
+    fs::write(unit_path(guard.id()), text).expect("seed a unit whose spec names a SID");
+    cmd::run("systemctl", &["daemon-reload"]).expect_ok();
+
+    let mgr = Systemd::new();
+    let cannot_render = mgr
+        .preview_install(&spec)
+        .expect_err("a spec naming a SID cannot be rendered")
+        .to_string();
+    let listed = mgr
+        .list()
+        .expect("one unrenderable unit must not take down the listing");
+    let reason = listed
+        .iter()
+        .find_map(|entry| match entry {
+            Installed::OursUnreadable { name, reason } if name == guard.id() => Some(reason),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("a marked fragment is ours even when its spec cannot be rendered: {listed:?}"));
+    assert_eq!(
+        *reason,
+        format!("marked ours, but its embedded spec cannot be regenerated: {cannot_render}")
+    );
+
+    let err = mgr
+        .status(&Id::try_from(guard.id().to_string()).expect("valid id"))
+        .expect_err("a spec that cannot be rendered has no status to report");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "`{}`'s embedded spec cannot be regenerated: {cannot_render}",
+            guard.id()
+        )
+    );
+}
+
+// A read that failed establishes no ownership =========================================================================
 
 /// A drop-in directory the caller cannot open leaves goetia unable to say whether *anything* is
 /// installed at the id. Reporting `unreadable` for it — "goetia owns the id but cannot report on
@@ -1404,7 +1472,7 @@ fn status_reports_undetermined_for_a_dropin_directory_it_cannot_read() {
     );
 }
 
-/// The same absence path `status` takes above, reached through `discover` instead: with no fragment,
+/// The same absence path `status` takes above, reached through `diff` instead: with no fragment,
 /// `residue`'s drop-in scan is what would have answered "is anything at this id", and it did not
 /// complete. `4`, not the `1` `diff`'s catch-all `Err` arm gives: it was asked a question and could
 /// not determine the answer — the same reasoning that already puts `Outcome::RefuseUnreadable` at
@@ -1532,7 +1600,7 @@ fn status_reports_undetermined_for_a_fragment_it_cannot_read() {
     assert!(stdout.contains("re-run as root"), "{context}");
 }
 
-// Obligation 3: every drop-in systemd reads is drift ==================================================================
+// Every drop-in systemd reads is drift ================================================================================
 
 /// `/etc/systemd/system.control` is where `systemctl set-property UNIT PROPERTY=VALUE` writes, and
 /// `systemd.unit(5)`'s System Unit Search Path puts it *above* `/etc/systemd/system`. Leaving it
@@ -1724,7 +1792,7 @@ fn unelevated_list_works() {
     assert!(stdout.contains(guard.id()), "stdout:\n{stdout}");
 }
 
-// Obligation 5: parent directories ====================================================================================
+// Parent directories ==================================================================================================
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn install_creates_and_owns_fresh_cwd_and_logs_dirs_for_a_named_user() {
@@ -1826,7 +1894,7 @@ fn install_leaves_a_preexisting_ancestor_directory_untouched() {
     );
 }
 
-// Obligation 4/2: a unit `list` could not read is reported, never omitted =============================================
+// A unit `list` could not read is reported, never omitted =============================================================
 
 /// `list` runs unelevated by design, and a unit shipped non-world-readable (those carrying
 /// `LoadCredential=` commonly are 0600) is what it meets. Skipping it certifies "no such daemon" off
@@ -1894,7 +1962,7 @@ fn unelevated_list_reports_a_root_only_unit_as_undetermined() {
     );
 }
 
-/// The sibling half of the same obligation, on the path `residue` exists for: **the fragment is not
+/// The sibling half of the same property, on the path `residue` exists for: **the fragment is not
 /// the id**. An `<id>.service.d` goetia cannot read, with no `<id>.service` at all, is an id whose
 /// classification never completed — `status` says exactly that, exit `4` — so a listing that
 /// enumerates fragments alone leaves it out and lets `show` answer "is not installed", a negative

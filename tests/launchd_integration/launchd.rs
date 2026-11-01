@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use goetia::backend::Identity;
+use goetia::backend::launchd::generate;
 use goetia::backend::launchd::manager::{ENABLED_DIR, LaunchdManager, STAGING_DIR};
 use goetia::decide::Outcome;
 use goetia::manager::{self, Budget, Installed, ServiceManager, State};
@@ -276,7 +278,7 @@ fn hand_edit_is_detected_as_conflict() {
 }
 
 /// The genuine TOCTOU race this guards against — a foreign write landing
-/// between `discover`'s read and the actual persist — is unit-tested
+/// between `read` and the actual persist — is unit-tested
 /// directly against `persist_new` in
 /// `src/backend/launchd/manager_tests.rs::persist_new_does_not_clobber_existing_content`,
 /// where the target is a plain tempdir path and the timing is therefore
@@ -600,6 +602,48 @@ fn list_ignores_foreign_plists() {
     );
 }
 
+/// A plist goetia wrote for a user who has since been deleted carries goetia's marker, so it is
+/// goetia's, but its spec can no longer be rendered: it is `OursUnreadable` in `list` and an error in
+/// `status`.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn list_reports_a_deleted_user_as_ours_unreadable() {
+    let mgr = LaunchdManager::new();
+    let id = support::random_test_id();
+    let user = "goetia-no-such-user-xyz";
+    let mut spec = sleepy(&id);
+    spec.user = User::Name(user.to_string());
+    let path = staging_path(&id);
+    write_plist(&path, &generate::plist(&spec, &Identity { user: user.to_string() }));
+    let _cleanup = FileGuard(path);
+    let cannot_render = mgr
+        .preview_install(&spec)
+        .expect_err("a spec naming a deleted user cannot be rendered")
+        .to_string();
+
+    let listed = mgr
+        .list()
+        .expect("one unrenderable plist must not take down the listing");
+    let reason = listed
+        .iter()
+        .find_map(|entry| match entry {
+            Installed::OursUnreadable { name, reason } if name == &id => Some(reason),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("a marked plist is ours even when its spec cannot be rendered: {listed:?}"));
+    assert_eq!(
+        *reason,
+        format!("marked ours, but its embedded spec cannot be regenerated: {cannot_render}")
+    );
+
+    let err = mgr
+        .status(&Id::try_from(id.clone()).expect("valid id"))
+        .expect_err("a spec that cannot be rendered has no status to report");
+    assert_eq!(
+        err.to_string(),
+        format!("`{id}`'s embedded spec cannot be regenerated: {cannot_render}")
+    );
+}
+
 /// `list`/`status`/`show` need no elevation (design spec §4): every plist
 /// and every ancestor directory `install` creates is world-readable, so a
 /// completely unprivileged process must be able to run `goetia daemon
@@ -746,7 +790,7 @@ fn list_stays_clean_on_a_host_carrying_binary_plists() {
     );
 }
 
-/// The `discover` path — the one `install`/`preview_install` reads through, and therefore what
+/// The `read` path — the one `install`/`preview_install` reads through, and therefore what
 /// `goetia daemon diff` answers from — reaching the same verdict as `status` and `list` about one
 /// file. A plist that is not goetia's format is a stranger's artifact at this id, so `install`
 /// refuses it with the remedy `Outcome::RefuseForeign` names, rather than erroring.
@@ -1149,7 +1193,7 @@ impl Drop for DirGuard {
 /// `Absent` -> `Create` -> `persist_new` -> `Raced` -> re-`install` -> the
 /// identical classification, an unbounded recursion that would eventually
 /// abort the process. `locate` now uses `symlink_metadata`, so a directory
-/// is "occupied" like anything else, and `discover`'s read classifies it
+/// is "occupied" like anything else, and `read` classifies it
 /// before opening it.
 ///
 /// The refusal is `RefuseForeign`, not an `Err`: a directory at a plist path

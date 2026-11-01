@@ -250,8 +250,12 @@ fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn
             OutcomeClass::Refused
         }
         Outcome::RefuseUnreadable { reason, recovery } => {
-            let _ = writeln!(out, "{id}: refused: {reason}. {recovery}");
-            let _ = writeln!(err, "error: {id}: refused: {reason}. {recovery}");
+            let line = match recovery {
+                Some(recovery) => format!("{id}: refused: {reason}. {recovery}"),
+                None => format!("{id}: refused: {reason}"),
+            };
+            let _ = writeln!(out, "{line}");
+            let _ = writeln!(err, "error: {line}");
             OutcomeClass::Refused
         }
     }
@@ -321,7 +325,7 @@ fn preview_artifact(spec: &DaemonSpec, err: &mut dyn Write) -> Result<String> {
         // is only ever shown in a preview, never installed.
         let shim_path = PathBuf::from("goetia-shim.exe");
         let registration = crate::backend::scm::generate::registration(spec, &identity, &shim_path)?;
-        Ok(crate::backend::scm::generate::render(&registration))
+        Ok(registration.to_string())
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {

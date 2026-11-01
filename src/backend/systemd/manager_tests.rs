@@ -7,9 +7,7 @@
 //! Most of these are elevated (they write real files under `/etc/systemd/system`), so they opt into
 //! the same `elevated` precondition/label convention `tests/support/mod.rs` uses, duplicated locally
 //! rather than shared: a plain library unit test cannot depend on the `tests/` integration-test
-//! support crate. The two deadline-ordering tests (`start_derives_its_deadline_before_require_
-//! installed_runs` and its `stop_` mirror) are the exception: they drive only the `VerbSteps` seam,
-//! touch nothing on disk, and run unelevated.
+//! support crate.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
@@ -71,7 +69,7 @@ fn mk(id: &str) -> DaemonSpec {
     }
 }
 
-// create_unit: obligation 1 (create case) =============================================================================
+// create_unit: a create never clobbers ================================================================================
 
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn create_does_not_clobber_a_unit_that_appears_after_classification() {
@@ -79,7 +77,7 @@ fn create_does_not_clobber_a_unit_that_appears_after_classification() {
     let path = unit_path(&id);
     let _cleanup = Cleanup(path.clone());
 
-    // "Classification" (what `install`'s `discover` does) sees nothing here yet.
+    // "Classification" (what `install`'s `read` does) sees nothing here yet.
     assert!(matches!(raw_state(&id).expect("raw_state"), RawState::Absent));
 
     // Something else — a package postinst, or a concurrent invocation — drops a foreign unit into
@@ -103,7 +101,7 @@ fn create_does_not_clobber_a_unit_that_appears_after_classification() {
     );
 }
 
-// quarantine_if_still_ours: obligation 1 (update/stale case) ==========================================================
+// quarantine_if_still_ours: an update never clobbers ==================================================================
 
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn quarantine_detects_a_swap_that_happened_after_classification() {
@@ -166,7 +164,7 @@ fn quarantine_succeeds_when_nothing_raced() {
 /// would truncate-then-write even after `install` has already committed its own content, clobbering a
 /// legitimate `Create` result the racer arrived too late to actually contest — `create_new` only ever
 /// succeeds once, against whichever of the two genuinely got to the empty path first, which is the
-/// only interleaving obligation 1 is about.
+/// only interleaving a non-clobbering write is about.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn install_never_corrupts_state_when_something_races_the_first_create() {
     let id = test_id();
@@ -188,7 +186,7 @@ fn install_never_corrupts_state_when_something_races_the_first_create() {
         });
 
         let mgr = Systemd::new();
-        let outcome = mgr.install(&spec, false);
+        let outcome = flow::install(&mgr, &spec, false);
         done.store(true, Ordering::Release);
         racer.join().expect("racer thread panicked");
 
@@ -213,7 +211,7 @@ fn install_never_corrupts_state_when_something_races_the_first_create() {
     });
 }
 
-// ensure_dir: obligation 5 ============================================================================================
+// ensure_dir: parent directories ======================================================================================
 
 /// RAII cleanup for a directory tree.
 struct RmDir(PathBuf);
@@ -269,7 +267,7 @@ fn ensure_dir_refuses_a_preexisting_file() {
 
 // replace_unit_verified / quarantine_if_still_ours: the remaining race branches =======================================
 
-/// The one obligation-1 branch none of the other tests reach: a *third* file appearing at
+/// The one non-clobber branch none of the other tests reach: a *third* file appearing at
 /// `unit_path(id)` in the moment between `quarantine_if_still_ours` emptying it and
 /// `replace_unit_verified`'s own write claiming it. Real threads racing real filesystem calls, same
 /// join discipline as `install_never_corrupts_state_when_something_races_the_first_create`.
@@ -326,9 +324,9 @@ fn replace_reports_raced_twice_rather_than_guessing_which_file_wins() {
     });
 }
 
-/// `uninstall`'s own instance of obligation 1: the fragment can change between `require_installed`'s
-/// classification and the removal, since two full `systemctl` round-trips run in between. Unlike the
-/// `install` paths, this needs no live daemon lifecycle, so it is exercised directly at the
+/// `uninstall`'s own instance of the non-clobber race: the fragment can change between `read` and
+/// the removal, since two full `systemctl` round-trips run in between. Unlike the `install` paths,
+/// this needs no live daemon lifecycle, so it is exercised directly at the
 /// `quarantine_if_still_ours` level rather than through a real `stop`/`disable` cycle.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn quarantine_used_by_uninstall_reports_a_race_instead_of_removing_the_wrong_file() {
@@ -336,10 +334,10 @@ fn quarantine_used_by_uninstall_reports_a_race_instead_of_removing_the_wrong_fil
     let path = unit_path(&id);
     let _cleanup = Cleanup(path.clone());
 
-    let classified_text = "[Unit]\nDescription=goetia, as require_installed saw it\n";
+    let classified_text = "[Unit]\nDescription=goetia, as read saw it\n";
     std::fs::write(&path, classified_text).expect("write");
 
-    // Something changes the fragment after `require_installed` would have read it, before
+    // Something changes the fragment after `read` saw it, before
     // `uninstall` reaches its own `quarantine_if_still_ours` call.
     let changed_text = "[Unit]\nDescription=changed after classification\n";
     std::fs::write(&path, changed_text).expect("overwrite");
@@ -355,40 +353,9 @@ fn quarantine_used_by_uninstall_reports_a_race_instead_of_removing_the_wrong_fil
 
 // Enumeration: a scan that did not finish =============================================================================
 
-/// The mid-pass fault, and the reason `list` no longer propagates one: a dirent that could not be
-/// read must not take down the ids the very same pass already named. Injected through
-/// `collect_units`' iterator because no real `readdir` fails on request.
-#[skuld::test]
-fn a_dirent_that_cannot_be_read_keeps_what_the_scan_already_named() {
-    let dir = Path::new(UNIT_DIR);
-    let entries = vec![
-        Ok(dir.join("named-before-the-fault.service")),
-        Err(io::Error::other("injected mid-scan failure")),
-        Ok(dir.join("never-reached.service")),
-    ];
-
-    let scan = collect_units(dir, entries.into_iter());
-
-    assert_eq!(
-        scan.units.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
-        ["named-before-the-fault"],
-        "what the pass named before the fault survives it, and the pass stops there: {scan:?}"
-    );
-    match &scan.incomplete {
-        Some(Installed::Undetermined { name, reason }) => {
-            assert_eq!(*name, None, "the pass cannot name what it never reached");
-            assert!(reason.contains("injected mid-scan failure"), "{reason}");
-            assert!(
-                reason.contains(UNIT_DIR),
-                "the reason must name what was being scanned: {reason}"
-            );
-        }
-        other => panic!("a pass that stopped early must say so: {other:?}"),
-    }
-}
-
-/// The same fault one syscall earlier. An `Err` here reaches the CLI as `Kind::Unavailable` — exit
-/// `1` over an empty document, which is `list` reporting a populated host as having nothing on it.
+/// A unit directory that will not open is reported, not propagated (see `flow::scan`): an `Err` here
+/// reaches the CLI as `Kind::Unavailable` — exit `1` over an empty document, which is `list`
+/// reporting a populated host as having nothing on it.
 #[skuld::test]
 fn a_unit_directory_that_cannot_be_opened_is_reported_not_propagated() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -401,10 +368,12 @@ fn a_unit_directory_that_cannot_be_opened_is_reported_not_propagated() {
     let scan = scan_unit_dir(&dir);
 
     assert!(scan.units.is_empty(), "nothing was enumerated: {scan:?}");
-    assert!(
-        matches!(&scan.incomplete, Some(Installed::Undetermined { name: None, .. })),
-        "{scan:?}"
-    );
+    match &scan.incomplete {
+        Some(Installed::Undetermined { name: None, reason }) => {
+            assert!(reason.contains("failed to read directory: "), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 /// The case that is deliberately *not* this one: an absent unit directory establishes that nothing
@@ -459,11 +428,8 @@ fn a_drop_in_name_that_is_not_a_directory_still_names_its_id() {
     assert_eq!(scan.dropins, ["blocked"], "{scan:?}");
 }
 
-// start/stop: the deadline comes first ================================================================================
+// prepare =============================================================================================================
 
-/// The steps `verb` took, in order, with every step a recording fake — so, unlike the rest of this
-/// file, no elevation and no real systemd. The step that talks to systemd also checks that it was
-/// handed the deadline `start_clock` derived, not one of its own.
 /// Under a bounded budget `restart`'s legs, and `install --start`'s start, each run one watched
 /// `systemctl`, and `prepare` makes what every one of them needs before either sends anything: once
 /// it succeeded, no leg can fail for want of a thread or a file. It fails as a whole when one is
@@ -543,48 +509,4 @@ fn prepared_steps_share_one_version_gate() {
         systemctl::gated(count).unwrap();
         assert_eq!(asked.get(), 2, "{budget:?}: the answer outlived the preparation");
     }
-}
-
-fn steps_taken(verb: fn(&str, Budget, &VerbSteps<'_>) -> Result<()>) -> Vec<&'static str> {
-    let log = std::cell::RefCell::new(Vec::new());
-    let derived = std::cell::Cell::new(None);
-    let act = |step: &'static str, deadline: Deadline| {
-        log.borrow_mut().push(step);
-        assert_eq!(
-            Some(deadline),
-            derived.get(),
-            "{step} must run under the deadline derived at entry"
-        );
-        Ok(())
-    };
-    let steps = VerbSteps {
-        start_clock: &|budget| {
-            log.borrow_mut().push("start_clock");
-            let deadline = budget.start();
-            derived.set(Some(deadline));
-            deadline
-        },
-        require_installed: &|_| {
-            log.borrow_mut().push("require_installed");
-            Ok(String::new())
-        },
-        start: &|_, _, deadline| act("start", deadline),
-        stop: &|_, _, deadline| act("stop", deadline),
-    };
-    verb("x", Budget::DEFAULT, &steps).expect("every step succeeds");
-    log.into_inner()
-}
-
-/// `--timeout` counts from verb entry only if the deadline exists before `require_installed`'s scan
-/// runs. Derived after it, the scan runs outside the budget and nothing else observable changes,
-/// which is why the order is pinned here rather than left to the elevated suite. What the scan
-/// spends never keeps the request from systemd — see `systemctl::run_verb`.
-#[skuld::test]
-fn start_derives_its_deadline_before_require_installed_runs() {
-    assert_eq!(steps_taken(start_with), ["start_clock", "require_installed", "start"]);
-}
-
-#[skuld::test]
-fn stop_derives_its_deadline_before_require_installed_runs() {
-    assert_eq!(steps_taken(stop_with), ["start_clock", "require_installed", "stop"]);
 }

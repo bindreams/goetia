@@ -223,9 +223,12 @@ struct FlakyManager {
     /// Makes `install`/`preview_install` return the `Conflict` flavour whose
     /// cause lies outside the directory the backend writes — systemd's
     /// `<id>.service.d` under `/usr/lib` or `.control`. `Fake` has no
-    /// overlay of its own (see its `decide` call site), so this is the only
+    /// external configuration of its own (see its `decide` call site), so this is the only
     /// way to reach the branch where `--force` is not the remedy.
     unclearable_conflict: Option<String>,
+    /// Makes `install`/`preview_install` return `RefuseUnreadable` with this reason and no recovery,
+    /// the refusal discovery gives when no goetia action unblocks the id. `Fake` always names one.
+    recoveryless_unreadable: Option<String>,
 }
 
 /// The failure [`FlakyManager`] injects for `fail_list`/`unqueryable`: the
@@ -274,6 +277,14 @@ fn unclearable_conflict(recovery: &str) -> goetia::decide::Outcome {
     }
 }
 
+/// The `RefuseUnreadable` [`FlakyManager::recoveryless_unreadable`] injects.
+fn recoveryless_unreadable(reason: &str) -> goetia::decide::Outcome {
+    goetia::decide::Outcome::RefuseUnreadable {
+        reason: reason.to_string(),
+        recovery: None,
+    }
+}
+
 impl FlakyManager {
     /// The failure a `start`-shaped call is seeded to report — shared by `start` and
     /// `request_start_after_stop`, which are two ways of asking for the same thing.
@@ -296,6 +307,9 @@ impl ServiceManager for FlakyManager {
         if let Some(recovery) = &self.unclearable_conflict {
             return Ok(unclearable_conflict(recovery));
         }
+        if let Some(reason) = &self.recoveryless_unreadable {
+            return Ok(recoveryless_unreadable(reason));
+        }
         self.inner.install(spec, force)
     }
     fn preview_install(&self, spec: &DaemonSpec) -> goetia::Result<goetia::decide::Outcome> {
@@ -304,6 +318,9 @@ impl ServiceManager for FlakyManager {
         }
         if let Some(recovery) = &self.unclearable_conflict {
             return Ok(unclearable_conflict(recovery));
+        }
+        if let Some(reason) = &self.recoveryless_unreadable {
+            return Ok(recoveryless_unreadable(reason));
         }
         self.inner.preview_install(spec)
     }
@@ -503,6 +520,30 @@ fn install_offers_force_only_for_a_conflict_force_can_resolve() {
         !out.contains("re-run with --force to overwrite"),
         "`--force` rewrites the artifact and leaves the cause, so offering it wedges the operator:\n{out}"
     );
+}
+
+/// A refusal with no recovery to name ends at the reason: no trailing period and no empty sentence,
+/// in `install` and in `diff`'s subjunctive alike.
+#[skuld::test]
+fn an_unreadable_refusal_without_a_recovery_ends_at_the_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let mgr = FlakyManager {
+        recoveryless_unreadable: Some("a drop-in could not be read".to_string()),
+        ..Default::default()
+    };
+
+    let args = ["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()];
+    let (code, out, err) = dispatch_with(&args, &mgr, &|| true);
+    assert_eq!(code, 1, "stdout:\n{out}");
+    assert_eq!(out, "frpc: refused: a drop-in could not be read\n");
+    assert_eq!(err, "error: frpc: refused: a drop-in could not be read\n");
+
+    let args = ["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()];
+    let (code, out, err) = dispatch_with(&args, &mgr, &never_elevated);
+    assert_eq!(code, 4, "stdout:\n{out}");
+    assert_eq!(out, "frpc: would be refused: a drop-in could not be read\n");
+    assert_eq!(err, "error: frpc: would be refused: a drop-in could not be read\n");
 }
 
 /// `diff` renders the same two flavours in the subjunctive, and must not offer what `install` will
@@ -3483,7 +3524,7 @@ fn a_refused_request_only_restart_is_a_failure_that_changed_nothing() {
 
     assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
     assert!(!err.contains("not established"), "{err}");
-    assert_eq!(fake.calls(), vec![("restart", "stranger".to_string())]);
+    assert_eq!(fake.calls(), vec![], "the gate refused it before the manager was asked");
 }
 
 /// A budget that waits confirms each leg, which the request-only restart cannot: it is never used.
