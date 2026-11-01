@@ -1901,7 +1901,6 @@ fn dry_run_and_diff_ask_launchd_nothing_and_install_start_is_refused_before_it_s
     let get_manager = || -> Result<Box<dyn ServiceManager>> { Ok(Box::new(LaunchdManager::new())) };
     let run_install = |start: bool, dry_run: bool| {
         let args = install::Args {
-            ids: vec![],
             file: dir.path().to_path_buf(),
             force: false,
             start,
@@ -1923,7 +1922,6 @@ fn dry_run_and_diff_ask_launchd_nothing_and_install_start_is_refused_before_it_s
     let script = Scripted::new(&[]);
     assert_eq!(run_install(false, true).0, 0, "install --dry-run");
     let args = diff::Args {
-        ids: vec![],
         file: dir.path().to_path_buf(),
     };
     let code = diff::run(&args, &get_manager, &mut Vec::new(), &mut Vec::new());

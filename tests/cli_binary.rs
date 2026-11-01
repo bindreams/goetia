@@ -145,20 +145,27 @@ fn f_flag_accepts_a_directory() {
     assert!(out.contains("frpc"), "{out}");
 }
 
+/// A manifest is one daemon, so `install` takes no id: clap refuses it, and no artifact is printed.
 #[skuld::test]
-fn positional_is_always_an_id_never_a_path() {
+fn install_refuses_a_positional_id() {
     let dir = tempfile::tempdir().unwrap();
-    write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\n");
-    // A directory that happens to share a name with the id below. If a
-    // positional were ever mistaken for a path, `-f`'s default (".") would
-    // get overridden by this empty directory instead of finding
-    // `goetia.yaml` in `dir` itself, and `frpc` would fail to load.
-    std::fs::create_dir(dir.path().join("frpc")).unwrap();
+    write_manifest(
+        dir.path(),
+        "id: frpc
+command: [frpc]
+",
+    );
 
     let (code, out, err) = run_cli(&["daemon", "install", "--dry-run", "frpc"], dir.path());
 
-    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
-    assert!(out.contains("frpc"), "{out}");
+    assert_eq!(
+        code, 2,
+        "stdout:
+{out}
+stderr:
+{err}"
+    );
+    assert!(out.is_empty(), "a refused command line prints no artifact: {out}");
 }
 
 #[skuld::test]

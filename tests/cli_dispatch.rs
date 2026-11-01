@@ -439,27 +439,42 @@ fn install_of_an_old_format_manifest_installs_nothing() {
     );
 }
 
+/// A manifest is one daemon, so the id is never an argument: clap refuses it (exit `2`) before
+/// anything is loaded or reached.
 #[skuld::test]
-fn install_unknown_named_id_installs_nothing() {
+fn install_refuses_a_positional_id() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\n");
-    let fake = Fake::new();
 
-    let (code, _out, err) = dispatch_elevated(
-        &[
-            "goetia",
-            "daemon",
-            "install",
-            "-f",
-            manifest.to_str().unwrap(),
-            "nonexistent",
-        ],
-        &fake,
-    );
+    let parsed = Cli::try_parse_from([
+        "goetia",
+        "daemon",
+        "install",
+        "frpc",
+        "-f",
+        dir.path().to_str().unwrap(),
+    ]);
 
-    assert_eq!(code, 1);
-    assert!(err.contains("nonexistent"), "{err}");
-    assert!(installed_ids(&fake).is_empty(), "a bad selection must install nothing");
+    assert!(parsed.is_err(), "`install frpc` must be a usage error");
+}
+
+#[skuld::test]
+fn diff_refuses_a_positional_id() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let parsed = Cli::try_parse_from(["goetia", "daemon", "diff", "frpc", "-f", dir.path().to_str().unwrap()]);
+
+    assert!(parsed.is_err(), "`diff frpc` must be a usage error");
+}
+
+/// Not a silent drop of the id: `show -f FILE` renders the file's one daemon, so a named id
+/// could only be ignored.
+#[skuld::test]
+fn show_from_file_refuses_an_id() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let parsed = Cli::try_parse_from(["goetia", "daemon", "show", "-f", dir.path().to_str().unwrap(), "frpc"]);
+
+    assert!(parsed.is_err(), "`show -f FILE frpc` must be a usage error");
 }
 
 /// The remedy `--force` is published as has to be one that works. When part of what makes the

@@ -965,7 +965,7 @@ fn a_coloured_environment_does_not_fail_the_version_gate() {
         );
     };
 
-    succeeds("1", &["daemon", "install", "--file", manifest, guard.id()]);
+    succeeds("1", &["daemon", "install", "--file", manifest]);
     for colors in ["1", "true", "16", "256", "24bit"] {
         for verb in ["start", "restart", "stop"] {
             succeeds(colors, &["daemon", verb, guard.id()]);
@@ -1037,7 +1037,7 @@ fn an_older_systemd_is_refused_before_anything_is_written_or_run() {
         }
     };
 
-    refused(&["daemon", "install", "--file", manifest, guard.id()]);
+    refused(&["daemon", "install", "--file", manifest]);
     assert!(!unit_path(guard.id()).exists(), "a refused install wrote the unit");
 
     let mgr = Systemd::new();
@@ -1078,7 +1078,6 @@ fn a_running_systemd_that_cannot_be_asked_is_refused() {
             "install",
             "--file",
             manifest.to_str().expect("utf-8 temp path"),
-            guard.id(),
         ])
         .output()
         .expect("spawn unshare");
@@ -1153,7 +1152,7 @@ fn the_version_gate_probes_once_per_daemon_per_verb() {
     };
 
     for args in [
-        &["daemon", "install", "--file", manifest, "--start", guard.id()][..],
+        &["daemon", "install", "--file", manifest, "--start"][..],
         &["daemon", "restart", guard.id()],
         &["daemon", "restart", guard.id(), "--timeout", "0"],
         &["daemon", "start", guard.id()],
@@ -1161,7 +1160,7 @@ fn the_version_gate_probes_once_per_daemon_per_verb() {
         &["daemon", "enable", guard.id()],
         &["daemon", "disable", guard.id()],
         &["daemon", "uninstall", guard.id()],
-        &["daemon", "install", "--file", manifest, guard.id()],
+        &["daemon", "install", "--file", manifest],
     ] {
         assert_eq!(probes(args), (1, 1), "{args:?}");
     }
@@ -1473,13 +1472,7 @@ fn diff_reports_a_dropin_directory_it_cannot_read_as_indeterminate() {
     write_unreadable_dropin(guard.id());
     let (_tempdir, manifest) = world_readable_manifest(guard.id());
 
-    let output = run_unelevated(&[
-        "daemon",
-        "diff",
-        "-f",
-        manifest.to_str().expect("a UTF-8 temp path"),
-        guard.id(),
-    ]);
+    let output = run_unelevated(&["daemon", "diff", "-f", manifest.to_str().expect("a UTF-8 temp path")]);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let context = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
@@ -1539,13 +1532,7 @@ fn diff_refuses_our_own_fragment_with_an_unreadable_dropin() {
     write_unreadable_dropin(guard.id());
     let (_tempdir, manifest) = world_readable_manifest(guard.id());
 
-    let output = run_unelevated(&[
-        "daemon",
-        "diff",
-        "-f",
-        manifest.to_str().expect("a UTF-8 temp path"),
-        guard.id(),
-    ]);
+    let output = run_unelevated(&["daemon", "diff", "-f", manifest.to_str().expect("a UTF-8 temp path")]);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let context = format!("stdout:\n{stdout}\nstderr:\n{stderr}");

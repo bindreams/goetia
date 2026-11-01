@@ -1031,15 +1031,9 @@ alone and forces unconditionally can loop. Read the message.
 
 **`diff`** returns `0`, `3`, `4`, `5`, or `1`.
 
-- It exits `0` **if and only if** every selected daemon already matches the
-  manifest.
-- It exits `3` when at least one selected daemon would change **and nothing
-  was indeterminate, conflicting, or errored**.
-
-`3` is therefore **not a "drift is present" signal**. One daemon that would
-be created alongside one that conflicts returns `5`, not `3`, because `5`
-outranks `3`. A script that branches on `3` as "is there drift" silently
-skips the conflicting daemon.
+- It exits `0` **if and only if** the daemon already matches the manifest.
+- It exits `3` when the daemon would change, and `5`, `4` or `1` when it
+  would conflict, could not be determined, or errored.
 
 **Id verbs.** `uninstall` alone treats an already-absent artifact as
 success; the other six keep it as a plain failure.
@@ -1113,23 +1107,24 @@ an absent id and an unreadable one exits `1`, not `4`.
 
 ## `show`
 
-`goetia daemon show [ID...] [-f FILE]` renders a daemon's resolved spec as
-YAML. With `-f` it reads a manifest; without, it reads the spec back out of
-what is actually installed. Four guarantees:
+`goetia daemon show [ID...]` and `goetia daemon show -f FILE` render a
+daemon's resolved spec as YAML. With `-f` it reads a manifest, which names one
+daemon, so `-f` takes no id; without, it reads the spec back out of what is
+actually installed. Four guarantees:
 
 1. **When both paths can see the daemon**, `show <id>` and
-   `show -f <file> <id>` render the same resolved spec identically, byte for
+   `show -f <file>` render the same resolved spec identically, byte for
    byte. The agreement is conditional, not unconditional: without `-f`,
    `show` enumerates installed services, which cannot describe a unit this
    privilege level could not read. Such a unit reaches `show` as an
    `undetermined` entry, so `show <id>` reports that it could not determine
-   the id's state and exits `4`, while `show -f <file> <id>` still renders
+   the id's state and exits `4`, while `show -f <file>` still renders
    it from the manifest. On a manifest with a `backend-specific:` block,
    the spec `show` renders is the merged, host-effective one — `show -f`
    is deliberately not a transcription of the file, because it renders
    what would be installed _here_. Guarantee 1 survives that unchanged:
    both paths merge for the same host's native backend, so `show <id>`
-   and `show -f <file> <id>` still agree byte for byte.
+   and `show -f <file>` still agree byte for byte.
 2. Neither path ever checks elevation.
 3. `show -f` touches no service manager; `show` without `-f` touches no
    manifest.

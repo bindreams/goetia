@@ -32,30 +32,7 @@ pub(crate) fn print_warnings(warnings: &[Warning], err: &mut dyn Write) {
     }
 }
 
-/// Select the entries of `specs` named by `ids`, in `ids`' order. Empty
-/// `ids` selects every entry — the "no ids given means every daemon in the
-/// file" rule `install`/`show`/`diff` share. Errors naming the first id
-/// with no matching entry, so nothing downstream ever silently operates on
-/// a subset smaller than what was actually requested.
-pub(crate) fn select_by_ids<'a>(
-    specs: &'a [DaemonSpec],
-    ids: &[String],
-) -> std::result::Result<Vec<&'a DaemonSpec>, String> {
-    if ids.is_empty() {
-        return Ok(specs.iter().collect());
-    }
-    ids.iter()
-        .map(|id| {
-            specs
-                .iter()
-                .find(|spec| spec.id.as_str() == id)
-                .ok_or_else(|| format!("no daemon `{id}` in the manifest"))
-        })
-        .collect()
-}
-
-/// Parse a CLI-supplied id string, positionally — never a path. See
-/// `positional_is_always_an_id_never_a_path`.
+/// Parse a CLI-supplied id string, positionally — never a path.
 pub(crate) fn parse_id(s: &str) -> Result<crate::spec::Id> {
     crate::spec::Id::try_from(s.to_string())
 }
@@ -267,17 +244,16 @@ pub(crate) struct IdVerbCall<'a> {
 /// `stop`, `kill`, `enable`, `disable`, `restart`): check elevation once, obtain
 /// the manager once, then call `verb` per id, printing one result line per
 /// id and combining what each id contributed by [`super::report::precedence`] —
-/// the same rule `install`, `diff` and `show` use — except that when
+/// the same rule `install` and `show` use — except that when
 /// `call.absent_is_success` and `verb` returns `Error::NotInstalled`, the
 /// id counts as succeeded rather than failed; see
 /// [`IdVerbCall::absent_is_success`].
 ///
-/// Every id is parsed *before* `verb` is called for any of them — the same
-/// all-or-nothing rule `select_by_ids` documents above. Parsing lazily,
-/// inside the loop, would mean a bad id at position N only surfaces after
-/// ids `1..N-1` have already been mutated (e.g. uninstalled): a partially
-/// executed, irreversible operation the caller never asked for and the
-/// nonzero exit code alone does not disclose.
+/// Every id is parsed *before* `verb` is called for any of them. Parsing
+/// lazily, inside the loop, would mean a bad id at position N only surfaces
+/// after ids `1..N-1` have already been mutated (e.g. uninstalled): a
+/// partially executed, irreversible operation the caller never asked for and
+/// the nonzero exit code alone does not disclose.
 pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let ids: std::result::Result<Vec<Id>, Error> = call.ids.iter().map(|s| parse_id(s)).collect();
     let ids = match ids {
