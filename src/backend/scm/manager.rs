@@ -109,7 +109,9 @@ use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use super::wait::Waited;
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
-use crate::backend::{Backend, InstalledDefinition, InstalledService, ReadOutcome, Scan, WriteOutcome};
+use crate::backend::{
+    Backend, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
+};
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Result};
@@ -141,6 +143,20 @@ pub(crate) struct ScmSnapshot {
     /// a service deleted since then does not turn into an unreadable one. `None` for what `scan`
     /// saw, which opens no service.
     service: Option<Service>,
+}
+
+/// What `read_marker` hands on of a service: its `Parameters` and the object `read` opened.
+type Opened = (BTreeMap<String, String>, Option<Service>);
+
+impl ScmSnapshot {
+    fn new(id: Id, blob: Result<Blob>, (parameters, service): Opened) -> Self {
+        Self {
+            id,
+            blob,
+            parameters,
+            service,
+        }
+    }
 }
 
 impl InstalledService for ScmSnapshot {
@@ -207,11 +223,7 @@ impl Backend for ScmManager {
             Err(e) if is_not_found(&e) => return Ok(ReadOutcome::Absent),
             Err(e) => return Err(service_undetermined(id.as_str(), &format!("open service `{id}`"), &e)),
         };
-        Ok(read_marker(
-            id.as_str(),
-            registry::read_parameters(id.as_str())?,
-            Some(service),
-        ))
+        Ok(read_marker(registry::read_parameters(id.as_str())?, Some(service)).named(id, ScmSnapshot::new))
     }
 
     /// SCM has no drop-in mechanism: everything goetia writes lives under the service's own key.
@@ -266,8 +278,8 @@ impl Backend for ScmManager {
             // out to be the only one.
             match registry::read_parameters(&name) {
                 Ok(params) => {
-                    let read = read_marker(&name, params, None);
-                    entries.push((name, read));
+                    let entry = ScanEntry::of(&name, read_marker(params, None), ScmSnapshot::new);
+                    entries.push((name, entry));
                 }
                 Err(e) => unreadable.push(unreadable_parts(name, e)),
             }
@@ -371,17 +383,15 @@ impl Backend for ScmManager {
 /// What the `Parameters` of a service goetia could open say about its ownership. No marker is
 /// foreign, with the stock remedy: nothing but deleting the orphan recovers it, since `type: managed`
 /// has no second proof of ownership.
-fn read_marker(name: &str, parameters: BTreeMap<String, String>, service: Option<Service>) -> ReadOutcome<ScmSnapshot> {
+fn read_marker(parameters: BTreeMap<String, String>, service: Option<Service>) -> ReadOutcome<Unnamed<Opened>> {
     let blob = match generate::extract(&parameters) {
         Ok(None) => return ReadOutcome::Foreign { recovery: None },
         Ok(Some(blob)) => Ok(blob),
         Err(e) => Err(e),
     };
-    ReadOutcome::marked(name, blob, |id, blob| ScmSnapshot {
-        id,
+    ReadOutcome::Marked(Unnamed {
         blob,
-        parameters,
-        service,
+        body: (parameters, service),
     })
 }
 

@@ -11,7 +11,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::backend::{InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, WriteOutcome};
+use crate::backend::{
+    InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
+};
 use crate::blob::{self, Blob};
 use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Result};
@@ -48,6 +50,12 @@ pub(crate) struct Artifact {
     id: Id,
     blob: Result<Blob>,
     entry: Entry,
+}
+
+impl Artifact {
+    fn new(id: Id, blob: Result<Blob>, entry: Entry) -> Self {
+        Self { id, blob, entry }
+    }
 }
 
 impl InstalledService for Artifact {
@@ -158,7 +166,7 @@ impl Store {
             return Err(Self::undetermined(id));
         }
         Ok(match self.entries.get(id.as_str()) {
-            Some(entry) => Self::classify(id.as_str(), entry),
+            Some(entry) => Self::classify(entry).named(id, Artifact::new),
             // Never absent: whatever the platform still applies here is
             // configuration goetia did not write and cannot show, and
             // `NotInstalled` is the one error `cli::uninstall` renders as
@@ -172,16 +180,15 @@ impl Store {
         })
     }
 
-    fn classify(name: &str, entry: &Entry) -> ReadOutcome<Artifact> {
+    fn classify(entry: &Entry) -> ReadOutcome<Unnamed<Entry>> {
         let blob = match extract(&entry.text) {
             Ok(None) => return ReadOutcome::Foreign { recovery: None },
             Ok(Some(blob)) => Ok(blob),
             Err(e) => Err(e),
         };
-        ReadOutcome::marked(name, blob, |id, blob| Artifact {
-            id,
+        ReadOutcome::Marked(Unnamed {
             blob,
-            entry: entry.clone(),
+            body: entry.clone(),
         })
     }
 
@@ -785,7 +792,7 @@ impl crate::backend::Backend for Fake {
                 .entries
                 .iter()
                 .filter(|(name, _)| !state.opaque.contains(*name))
-                .map(|(name, entry)| (name.clone(), Store::classify(name, entry)))
+                .map(|(name, entry)| (name.clone(), ScanEntry::of(name, Store::classify(entry), Artifact::new)))
                 .collect(),
             reported: aggregates.chain(opaque).collect(),
         }

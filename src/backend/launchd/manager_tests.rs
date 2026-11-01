@@ -719,7 +719,7 @@ fn a_marked_plist_is_scanned_as_marked_in_the_directory_it_was_found_in() {
 
     assert!(scan.reported.is_empty(), "{:?}", scan.reported);
     match scan.entries.as_slice() {
-        [(name, ReadOutcome::Marked(snapshot))] => {
+        [(name, ScanEntry::Read(ReadOutcome::Marked(snapshot)))] => {
             assert_eq!(name, "ours");
             assert_eq!(snapshot.id().as_str(), "ours");
             assert!(snapshot.blob().is_ok(), "the marker decodes");
@@ -743,7 +743,7 @@ fn a_plist_without_the_marker_is_scanned_as_foreign() {
 
     assert!(scan.reported.is_empty(), "{:?}", scan.reported);
     assert!(
-        matches!(scan.entries.as_slice(), [(name, ReadOutcome::Foreign { .. })] if name == "theirs"),
+        matches!(scan.entries.as_slice(), [(name, ScanEntry::Read(ReadOutcome::Foreign { .. }))] if name == "theirs"),
         "{} entries",
         scan.entries.len()
     );

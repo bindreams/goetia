@@ -482,7 +482,10 @@ fn a_read_fragment_is_foreign_unless_it_carries_the_marker() {
     let not_ours = classified("x", RawState::NotOurs).expect("classify");
     assert!(matches!(not_ours, ReadOutcome::Foreign { recovery: None }));
 
-    match classified("x", RawState::Regular(text.clone())).expect("classify") {
+    let id = Id::try_from("x").unwrap();
+    let named = |raw| classified("x", raw).expect("classify").named(&id, Fragment::new);
+
+    match named(RawState::Regular(text.clone())) {
         ReadOutcome::Marked(fragment) => {
             assert!(fragment.blob().is_ok());
             assert_eq!(fragment.id().as_str(), "x");
@@ -491,7 +494,7 @@ fn a_read_fragment_is_foreign_unless_it_carries_the_marker() {
         _ => panic!("a fragment goetia wrote is marked, with its own text as the snapshot"),
     }
 
-    match classified("x", RawState::Regular(corrupt.to_string())).expect("classify") {
+    match named(RawState::Regular(corrupt.to_string())) {
         ReadOutcome::Marked(fragment) => {
             assert!(fragment.blob().is_err());
             assert_eq!(fragment.text(), corrupt);

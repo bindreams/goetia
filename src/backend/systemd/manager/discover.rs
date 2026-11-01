@@ -36,7 +36,7 @@ use nix::fcntl::{OFlag, openat};
 use nix::sys::stat::Mode;
 
 use crate::backend::systemd::generate;
-use crate::backend::{InstalledDefinition, InstalledService, ReadOutcome};
+use crate::backend::{InstalledDefinition, InstalledService, ReadOutcome, Unnamed};
 use crate::blob::Blob;
 use crate::decide::ExternalConfig;
 use crate::error::{Error, Result};
@@ -313,6 +313,10 @@ pub(crate) struct Fragment {
 }
 
 impl Fragment {
+    pub(super) fn new(id: Id, blob: Result<Blob>, text: String) -> Self {
+        Self { id, blob, text }
+    }
+
     pub(super) fn text(&self) -> &str {
         &self.text
     }
@@ -328,9 +332,9 @@ impl InstalledService for Fragment {
     }
 }
 
-/// What `raw` says about `id`: a marked fragment is [`ReadOutcome::Marked`] as a [`Fragment`], and a
+/// What `raw` says about `id`: a marked fragment is [`ReadOutcome::Marked`] with its text, and a
 /// missing one is asked what else occupies the id ([`fragmentless`]).
-fn classified(id: &str, raw: RawState) -> ReadResult<ReadOutcome<Fragment>> {
+fn classified(id: &str, raw: RawState) -> ReadResult<ReadOutcome<Unnamed<String>>> {
     Ok(match raw {
         RawState::Absent => return fragmentless(id),
         RawState::NotOurs => ReadOutcome::Foreign { recovery: None },
@@ -340,26 +344,29 @@ fn classified(id: &str, raw: RawState) -> ReadResult<ReadOutcome<Fragment>> {
                 Ok(Some(blob)) => Ok(blob),
                 Err(e) => Err(e),
             };
-            ReadOutcome::marked(id, blob, |id, blob| Fragment { id, blob, text })
+            ReadOutcome::Marked(Unnamed { blob, body: text })
         }
     })
 }
 
 /// What `Backend::read` answers for `id`.
-pub(super) fn read(id: &str) -> Result<ReadOutcome<Fragment>> {
-    classified(id, raw_state(id)?).map_err(|failure| failure.undetermined(id))
+pub(super) fn read(id: &Id) -> Result<ReadOutcome<Fragment>> {
+    let id_str = id.as_str();
+    classified(id_str, raw_state(id_str)?)
+        .map(|found| found.named(id, Fragment::new))
+        .map_err(|failure| failure.undetermined(id_str))
 }
 
 /// [`read`] for a fragment `Systemd::scan` found at `path`. The failure stays a [`ReadFailure`]: the
 /// scan reports it by name, where `read` makes it an [`Error::Undetermined`].
-pub(super) fn read_at(id: &str, path: &Path) -> ReadResult<ReadOutcome<Fragment>> {
+pub(super) fn read_at(id: &str, path: &Path) -> ReadResult<ReadOutcome<Unnamed<String>>> {
     classify_and_read(path).and_then(|raw| classified(id, raw))
 }
 
 /// `id` read with no fragment of its own: absent when nothing occupies it, foreign when a drop-in or
 /// an enablement link does. Such an id is never silently adopted as `Create`, or the resulting unit
 /// would inherit overrides and boot-enrollment goetia never wrote and cannot show.
-pub(super) fn fragmentless(id: &str) -> ReadResult<ReadOutcome<Fragment>> {
+pub(super) fn fragmentless<S>(id: &str) -> ReadResult<ReadOutcome<S>> {
     Ok(match residue(id)? {
         None => ReadOutcome::Absent,
         Some(residue) => ReadOutcome::Foreign {

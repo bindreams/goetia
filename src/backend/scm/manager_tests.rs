@@ -414,11 +414,12 @@ fn read_marker_sorts_parameters_into_foreign_and_marked() {
     ]);
     let torn = BTreeMap::from([("Marker".to_string(), crate::blob::MARKER.to_string())]);
 
+    let id = Id::try_from("frpc").unwrap();
     assert!(matches!(
-        read_marker("frpc", BTreeMap::new(), None),
+        read_marker(BTreeMap::new(), None),
         ReadOutcome::Foreign { recovery: None }
     ));
-    match read_marker("frpc", ours.clone(), None) {
+    match read_marker(ours.clone(), None).named(&id, ScmSnapshot::new) {
         ReadOutcome::Marked(snapshot) => {
             assert_eq!(snapshot.id().as_str(), "frpc");
             assert_eq!(snapshot.blob().expect("decoded").spec, spec);
@@ -426,7 +427,7 @@ fn read_marker_sorts_parameters_into_foreign_and_marked() {
         }
         _ => panic!("a complete marker is goetia's, decoded"),
     }
-    match read_marker("frpc", torn.clone(), None) {
+    match read_marker(torn.clone(), None).named(&id, ScmSnapshot::new) {
         ReadOutcome::Marked(snapshot) => {
             assert!(snapshot.blob().is_err());
             assert_eq!(snapshot.parameters, torn);

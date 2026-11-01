@@ -7,7 +7,7 @@
 
 use std::io;
 
-use crate::backend::{Backend, InstalledService, ReadOutcome, WriteOutcome};
+use crate::backend::{Backend, InstalledService, ReadOutcome, ScanEntry, WriteOutcome};
 use crate::decide::{self, ExternalConfig, Outcome, Ownership};
 use crate::error::{Error, Result};
 use crate::manager::{Installed, Status};
@@ -31,7 +31,6 @@ fn classify<B: Backend>(b: &B, read: ReadOutcome<B::Snapshot>) -> Found<B::Snaps
             let (ownership, external) = judge(b, &snapshot);
             (ownership, external, Some(snapshot))
         }
-        ReadOutcome::Misnamed { .. } => unreachable!("`read` is asked about an id, which is a valid name"),
     };
     Found {
         ownership,
@@ -81,8 +80,6 @@ pub(crate) fn require_marked<S>(id: &Id, read: ReadOutcome<S>) -> Result<S> {
             recovery: recovery.unwrap_or_else(|| decide::foreign_recovery(id.as_str())),
         }),
         ReadOutcome::Marked(snapshot) => Ok(snapshot),
-        // `id` is a valid name, so a read of it never says otherwise.
-        ReadOutcome::Misnamed { name, .. } => Err(name),
     }
 }
 
@@ -156,13 +153,13 @@ pub(crate) fn status<B: Backend>(b: &B, id: &Id) -> Result<Status> {
 pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
     let scan = b.scan();
     let mut out = Vec::new();
-    for (name, read) in scan.entries {
+    for (name, entry) in scan.entries {
         // A name that is no id has no snapshot to ask for its live state, which is reported after
         // the checks any marked entry gets.
-        let (blob, snapshot) = match &read {
-            ReadOutcome::Absent | ReadOutcome::Foreign { .. } => continue,
-            ReadOutcome::Marked(snapshot) => (snapshot.blob(), Ok(snapshot)),
-            ReadOutcome::Misnamed { blob, name } => (blob.as_ref(), Err(name)),
+        let (blob, snapshot) = match &entry {
+            ScanEntry::Read(ReadOutcome::Absent | ReadOutcome::Foreign { .. }) => continue,
+            ScanEntry::Read(ReadOutcome::Marked(snapshot)) => (snapshot.blob(), Ok(snapshot)),
+            ScanEntry::Misnamed { blob, name } => (blob.as_ref(), Err(name)),
         };
         let unreadable = |reason: String| Installed::OursUnreadable {
             name: name.clone(),

@@ -81,7 +81,8 @@ use write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours
 
 use crate::backend::systemd::generate;
 use crate::backend::{
-    Backend, Identity, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, WriteOutcome, bounded,
+    Backend, Identity, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry,
+    WriteOutcome, bounded,
 };
 use crate::decide::Outcome;
 use crate::error::{Error, Result};
@@ -124,7 +125,7 @@ impl Backend for Systemd {
     }
 
     fn read(&self, id: &Id) -> Result<ReadOutcome<Fragment>> {
-        discover::read(id.as_str())
+        discover::read(id)
     }
 
     fn installed(&self, snapshot: &Fragment) -> Result<InstalledDefinition<String>> {
@@ -182,14 +183,14 @@ impl Backend for Systemd {
             .units
             .into_iter()
             .map(|(id, path)| {
-                let read = discover::read_at(&id, &path);
+                let read = discover::read_at(&id, &path).map(|found| ScanEntry::of(&id, found, Fragment::new));
                 (id, read)
             })
             // Absence is about the id, not the fragment file: an id whose
             // *drop-in* could not be read is exactly as unclassified as one whose fragment could not
             // be — and `status` says so for both.
             .chain(host.dropin_only.into_iter().map(|id| {
-                let read = discover::fragmentless(&id);
+                let read = discover::fragmentless(&id).map(ScanEntry::Read);
                 (id, read)
             }));
 

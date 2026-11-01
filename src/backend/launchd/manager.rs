@@ -67,7 +67,9 @@ use std::{fs, io};
 
 use crate::backend::bounded::{self, Reaper, Role};
 use crate::backend::launchd::{generate, refuse, state};
-use crate::backend::{self, Identity, InstalledDefinition, InstalledService, ReadOutcome, Scan, WriteOutcome};
+use crate::backend::{
+    self, Identity, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
+};
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Result};
@@ -418,6 +420,17 @@ pub(crate) struct Plist {
     text: String,
 }
 
+impl Plist {
+    fn new(id: Id, blob: Result<Blob>, (location, text): (Location, String)) -> Self {
+        Self {
+            id,
+            blob,
+            location,
+            text,
+        }
+    }
+}
+
 impl InstalledService for Plist {
     fn id(&self) -> &Id {
         &self.id
@@ -431,16 +444,14 @@ impl InstalledService for Plist {
 /// What is at `location`: no marker is `Foreign`, a marker is `Marked` whether or not its blob
 /// decodes, since the marker alone is proof of ownership. Whether the spec can still be rendered
 /// here is `flow`'s question, answered with `render`.
-fn read_at(id: &str, location: Location) -> Result<ReadOutcome<Plist>> {
+fn read_at(id: &str, location: Location) -> Result<ReadOutcome<Unnamed<(Location, String)>>> {
     let text = read_artifact(&location.path, id)?;
     let Some(blob) = generate::extract(&text).transpose() else {
         return Ok(ReadOutcome::Foreign { recovery: None });
     };
-    Ok(ReadOutcome::marked(id, blob, |id, blob| Plist {
-        id,
+    Ok(ReadOutcome::Marked(Unnamed {
         blob,
-        location,
-        text,
+        body: (location, text),
     }))
 }
 
@@ -1206,7 +1217,7 @@ impl backend::Backend for LaunchdManager {
     fn read(&self, id: &Id) -> Result<ReadOutcome<Plist>> {
         match locate(id.as_str())? {
             None => Ok(ReadOutcome::Absent),
-            Some(location) => read_at(id.as_str(), location),
+            Some(location) => read_at(id.as_str(), location).map(|found| found.named(id, Plist::new)),
         }
     }
 
@@ -1586,7 +1597,10 @@ fn scan_in(dirs: [(&str, bool); 2]) -> Scan<Plist> {
             }
         };
         match read_at(&id, location) {
-            Ok(read) => entries.push((id, read)),
+            Ok(found) => {
+                let entry = ScanEntry::of(&id, found, Plist::new);
+                entries.push((id, entry));
+            }
             // Gone between the scan above and this read: an uninstall that completed, observed one
             // syscall later. Absence is established, so this is a skip rather than a blind spot:
             // reporting it would let a benign concurrent uninstall raise `list`'s host-wide exit code.

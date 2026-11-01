@@ -137,19 +137,53 @@ pub(crate) enum ReadOutcome<S> {
     Foreign { recovery: Option<String> },
     /// Goetia's marker is here, whether or not its metadata decodes.
     Marked(S),
-    /// `scan` only: goetia's marker is here, at a name that is no id, so no snapshot can be made
-    /// (it names its id). `blob` is the metadata as [`InstalledService::blob`] would say, and
-    /// `name` why the name is no id.
+}
+
+/// A marked artifact as a backend's classifier found it, before its name is checked to be an id:
+/// what `read` and `scan` share, and each turns into a snapshot by naming it ([`ReadOutcome::named`],
+/// [`ScanEntry::of`]).
+pub(crate) struct Unnamed<B> {
+    pub blob: Result<Blob>,
+    /// What only this backend looks at: the snapshot minus its id and blob.
+    pub body: B,
+}
+
+impl<B> ReadOutcome<Unnamed<B>> {
+    /// The outcome at `id`, with a marked artifact made into the snapshot `make` builds.
+    pub(crate) fn named<S>(self, id: &Id, make: impl FnOnce(Id, Result<Blob>, B) -> S) -> ReadOutcome<S> {
+        match self {
+            Self::Absent => ReadOutcome::Absent,
+            Self::Foreign { recovery } => ReadOutcome::Foreign { recovery },
+            Self::Marked(Unnamed { blob, body }) => ReadOutcome::Marked(make(id.clone(), blob, body)),
+        }
+    }
+}
+
+/// One name [`Backend::scan`] classified.
+// `Misnamed` holds a whole `Blob`, as `ReadOutcome::Marked` does through its snapshot; same call.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum ScanEntry<S> {
+    /// As [`Backend::read`] would have.
+    Read(ReadOutcome<S>),
+    /// Goetia's marker is here, at a name that is no id, so there is no snapshot to make (a snapshot
+    /// names its id). `blob` is the metadata as [`InstalledService::blob`] would say, and `name`
+    /// why the name is no id.
     Misnamed { blob: Result<Blob>, name: Error },
 }
 
-impl<S> ReadOutcome<S> {
-    /// The marked artifact at `name`: the snapshot `snapshot` makes of the id and `blob`, or
-    /// [`Self::Misnamed`] where `name` is no id.
-    pub(crate) fn marked(name: &str, blob: Result<Blob>, snapshot: impl FnOnce(Id, Result<Blob>) -> S) -> Self {
-        match Id::try_from(name) {
-            Ok(id) => Self::Marked(snapshot(id, blob)),
-            Err(name) => Self::Misnamed { blob, name },
+impl<S> ScanEntry<S> {
+    /// `found` at `name`: named an id where it is one, and otherwise [`Self::Misnamed`] if it is
+    /// marked.
+    pub(crate) fn of<B>(
+        name: &str,
+        found: ReadOutcome<Unnamed<B>>,
+        make: impl FnOnce(Id, Result<Blob>, B) -> S,
+    ) -> Self {
+        match (Id::try_from(name), found) {
+            (Ok(id), found) => Self::Read(found.named(&id, make)),
+            (Err(name), ReadOutcome::Marked(Unnamed { blob, .. })) => Self::Misnamed { blob, name },
+            (Err(_), ReadOutcome::Absent) => Self::Read(ReadOutcome::Absent),
+            (Err(_), ReadOutcome::Foreign { recovery }) => Self::Read(ReadOutcome::Foreign { recovery }),
         }
     }
 }
@@ -170,7 +204,7 @@ pub(crate) enum WriteOutcome {
 /// What [`Backend::scan`] enumerated.
 pub(crate) struct Scan<S> {
     /// Every id the scan classified, by name.
-    pub entries: Vec<(String, ReadOutcome<S>)>,
+    pub entries: Vec<(String, ScanEntry<S>)>,
     /// What the scan itself reports, listed after the classified entries.
     pub reported: Vec<Installed>,
 }

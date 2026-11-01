@@ -279,6 +279,27 @@ fn list_reports_a_name_that_is_not_an_id_without_querying_it() {
     );
 }
 
+/// The reasons a marked entry is unreadable come in a fixed order: its blob first, its name last.
+#[skuld::test]
+fn list_reports_an_undecodable_blob_before_a_name_that_is_not_an_id() {
+    let fake = Fake::new();
+    let name = "not a valid id";
+    fake.seed_unreadable(name);
+
+    let listed = fake.list().unwrap();
+
+    match listed.as_slice() {
+        [Installed::OursUnreadable { name: got, reason }] => {
+            assert_eq!(got, name);
+            assert!(
+                reason.starts_with("blob: "),
+                "the blob's reason, not the name's: {reason}"
+            );
+        }
+        other => panic!("one unreadable entry expected, got {other:?}"),
+    }
+}
+
 #[skuld::test]
 fn list_omits_an_entry_that_vanished_before_its_live_query() {
     let fake = Fake::new();
