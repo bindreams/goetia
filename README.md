@@ -132,6 +132,24 @@ Use `unzip -Z1`, not `unzip -l`: `-l` starts with a banner reading
 `Archive:  <filename>`, which echoes back the name you typed. That name is
 the untrusted claim being checked, so a check that reads it proves nothing.
 
+## The manifest
+
+A `goetia.yaml` describes one daemon: its top level is the daemon's fields.
+`id:` is required and is the name of the installed service.
+
+```yaml
+id: frpc
+command: [bin/frpc, -c, frpc.toml]
+restart: on-failure
+backend-specific:
+  scm: { restart: on-failure }
+```
+
+`-f` takes a manifest file, or a directory holding `goetia.yaml`. Several
+daemons are several manifests, each installed with its own
+`goetia daemon install -f <file>`; manifests in one directory share its
+`.env`.
+
 ## Interpolation
 
 Fields of `goetia.yaml` may reference variables defined in a `.env` file
@@ -245,11 +263,12 @@ Four rules diverge from docker-compose on purpose:
 
 ### What is and is not interpolable
 
-Every manifest field is interpolable except mapping keys and `user.id`:
+Every manifest field is interpolable except `id`, mapping keys and
+`user.id`:
 
-- **Daemon ids** are map keys and are never interpolated. A `$` in one is an
-  error: an interpolated id could collide with another daemon, or change
-  which installed service an artifact belongs to.
+- **`id`** is never interpolated, because it names the installed service. A
+  `$` in it is an error: an interpolated id could change which service this
+  manifest installs.
 - **`env` names** are map keys too, for the same reason — an interpolated
   name could silently overwrite another entry. `env` _values_ interpolate
   normally.
@@ -311,21 +330,18 @@ The rejection exists because YAML's `null` was not reaching the manifest as
   applied the default. What the author explicitly wrote was discarded with
   no diagnostic.
 - **A string that is not a field** — an `env` key or value, a `command`
-  element, `user.name`, a daemon id — became the four-character text
+  element, `user.name`, the daemon `id` — became the four-character text
   `null`. `env: {DEBUG: null}` installed a service whose `DEBUG` was the
-  string `null`; `daemons: {null: …}` produced a daemon installed as
-  `null.service`.
-- **A container** — `daemons:`, `env:` or `command:` with nothing under it —
-  became an _empty_ container. A manifest whose `daemons:` key had lost its
-  body installed nothing and exited 0.
+  string `null`; `id: null` produced a daemon installed as `null.service`.
+- **A container** — `env:` or `command:` with nothing under it — became an
+  _empty_ container.
 
 ## An `env` key may not repeat
 
 An `env` key that repeats, or that differs from another only in case, is
 rejected rather than silently keeping one of the two. Case counts because
 Windows looks an environment variable up case-insensitively, so
-`{Path: a, PATH: b}` would reach the daemon as one variable — daemon ids
-have been compared the same way, for the same reason, since before this.
+`{Path: a, PATH: b}` would reach the daemon as one variable.
 
 ## Paths in `command`
 
@@ -390,29 +406,24 @@ account or a service name is rarely the same on all three. A daemon's
 by `systemd`, `launchd` or `scm`:
 
 ```yaml
-daemons:
-  frpc:
-    command: [/opt/frpc/bin/frpc, -c, /opt/frpc/host/frpc.toml]
-    cwd: /opt/frpc
+id: frpc
+command: [/opt/frpc/bin/frpc, -c, /opt/frpc/host/frpc.toml]
+cwd: /opt/frpc
+env:
+  RUST_LOG: info
+restart: on-failure
+backend-specific:
+  systemd:
+    user: frpc
+  launchd:
+    user: frpc
+  scm:
+    command:
+      ['C:\Program Files\frpc\frpc.exe', -c, 'C:\ProgramData\frpc\frpc.toml']
+    cwd: 'C:\ProgramData\frpc'
+    user: 'NT AUTHORITY\LocalService'
     env:
-      RUST_LOG: info
-    restart: on-failure
-    backend-specific:
-      systemd:
-        user: frpc
-      launchd:
-        user: frpc
-      scm:
-        command:
-          [
-            'C:\Program Files\frpc\frpc.exe',
-            -c,
-            'C:\ProgramData\frpc\frpc.toml',
-          ]
-        cwd: 'C:\ProgramData\frpc'
-        user: 'NT AUTHORITY\LocalService'
-        env:
-          RUST_LOG: debug
+      RUST_LOG: debug
 ```
 
 Every field but the daemon's id is overridable: `name`, `command`, `cwd`,
@@ -473,10 +484,6 @@ $ goetia daemon install --dry-run -f goetia.yaml
 error: daemon `frpc`: `restart: always` cannot be honoured by the scm backend: SCM recovery actions never fire after a clean exit. To keep `always` on systemd and launchd, set `backend-specific: scm: { restart: on-failure }`
 ```
 
-`--dry-run` still previews the manifest's other daemons and exits `1`. Without
-it, `install` over a manifest with several daemons installs the others and
-reports the refused one, exiting `1`; under `--start` the refused daemon is not
-started and the others are.
 Override `restart: always` for Windows:
 
 ```yaml

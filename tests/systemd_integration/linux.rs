@@ -172,11 +172,7 @@ pub(crate) fn world_readable_manifest(id: &str) -> (tempfile::TempDir, PathBuf) 
     let dir = tempfile::tempdir().expect("tempdir");
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).expect("chmod the tempdir 0755");
     let path = dir.path().join("goetia.yaml");
-    fs::write(
-        &path,
-        format!("daemons:\n  {id}:\n    command: [\"/bin/sleep\", \"infinity\"]\n"),
-    )
-    .expect("write manifest");
+    fs::write(&path, format!("id: {id}\ncommand: [\"/bin/sleep\", \"infinity\"]\n")).expect("write manifest");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod the manifest 0644");
     (dir, path)
 }
@@ -184,18 +180,11 @@ pub(crate) fn world_readable_manifest(id: &str) -> (tempfile::TempDir, PathBuf) 
 fn load_from_temp_manifest(id: &str) -> DaemonSpec {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("goetia.yaml");
-    fs::write(
-        &path,
-        format!("daemons:\n  {id}:\n    command: [\"/bin/sleep\", \"infinity\"]\n"),
-    )
-    .expect("write manifest");
-    let (specs, _warnings) = goetia::spec::load(&path).expect("load manifest");
+    fs::write(&path, format!("id: {id}\ncommand: [\"/bin/sleep\", \"infinity\"]\n")).expect("write manifest");
+    let (spec, _warnings) = goetia::spec::load(&path).expect("load manifest");
     // `dir` (and the manifest inside it) is dropped here, before the caller ever installs the
     // spec - the whole point of `install_then_show_round_trips_without_the_source_file`.
-    specs
-        .into_iter()
-        .find(|s| s.id.as_str() == id)
-        .expect("spec present in manifest")
+    spec
 }
 
 fn find_ours(installed: Vec<Installed>, id: &str) -> Option<DaemonSpec> {

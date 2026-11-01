@@ -2,11 +2,11 @@ use super::{check_spec_grammar, reject_interpolated_id, scalar, spec, spec_would
 use crate::error::Error;
 use crate::spec::resolve::resolve_user;
 use crate::spec::vars::Vars;
-use crate::spec::{AccountId, RawManifest, RawSpec, RawUser, User};
+use crate::spec::{AccountId, RawSpec, RawUser, User};
 
 /// Substitute `input` against `vars` at a fixed test path.
 fn sub(input: &str, vars: &Vars) -> Result<String, Error> {
-    scalar(input, "daemons.frpc.env[\"LOG\"]", vars)
+    scalar(input, "env[\"LOG\"]", vars)
 }
 
 // Basic substitution ==================================================================================================
@@ -84,7 +84,7 @@ fn a_dollar_in_a_default_is_an_error() {
     let err = sub("${NAME:-$X}", &vars).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "daemons.frpc.env[\"LOG\"]: `$` is not allowed inside a `:-` default"
+        "env[\"LOG\"]: `$` is not allowed inside a `:-` default"
     );
 }
 
@@ -97,7 +97,7 @@ fn a_dollar_in_a_discarded_default_is_still_an_error() {
     let err = sub("${SET:-$X}", &vars).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "daemons.frpc.env[\"LOG\"]: `$` is not allowed inside a `:-` default"
+        "env[\"LOG\"]: `$` is not allowed inside a `:-` default"
     );
 }
 
@@ -118,7 +118,7 @@ fn an_unset_variable_without_a_default_names_the_variable() {
     let err = sub("${MISSING}", &vars).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "daemons.frpc.env[\"LOG\"]: no value for `MISSING`; define it in the `.env` file beside the manifest, or write `${MISSING:-default}`"
+        "env[\"LOG\"]: no value for `MISSING`; define it in the `.env` file beside the manifest, or write `${MISSING:-default}`"
     );
 }
 
@@ -133,7 +133,7 @@ fn a_bare_dollar_variable_is_an_error() {
     );
     assert_eq!(
         message,
-        "daemons.frpc.env[\"LOG\"]: `$` at byte 0 is not part of `${...}`; write `$$` for a literal `$`"
+        "env[\"LOG\"]: `$` at byte 0 is not part of `${...}`; write `$$` for a literal `$`"
     );
 }
 
@@ -143,7 +143,7 @@ fn a_trailing_lone_dollar_is_an_error() {
     let err = sub("abc$", &vars).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "daemons.frpc.env[\"LOG\"]: `$` at byte 3 is not part of `${...}`; write `$$` for a literal `$`"
+        "env[\"LOG\"]: `$` at byte 3 is not part of `${...}`; write `$$` for a literal `$`"
     );
 }
 
@@ -153,10 +153,7 @@ fn a_trailing_lone_dollar_is_an_error() {
 fn an_unterminated_brace_is_an_error() {
     let vars = Vars::empty();
     let err = sub("${NAME", &vars).unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "daemons.frpc.env[\"LOG\"]: unterminated `${`: no closing `}`"
-    );
+    assert_eq!(err.to_string(), "env[\"LOG\"]: unterminated `${`: no closing `}`");
 }
 
 #[skuld::test]
@@ -164,19 +161,13 @@ fn an_empty_variable_name_is_an_error() {
     let vars = Vars::empty();
 
     let err = sub("${}", &vars).unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "daemons.frpc.env[\"LOG\"]: empty variable name in `${}`"
-    );
+    assert_eq!(err.to_string(), "env[\"LOG\"]: empty variable name in `${}`");
 
     // `:` here opens a `:-` default, not an invalid character — the real
     // defect is the empty name preceding it, so this must report the same
     // message as `${}`, not `invalid character `:``.
     let err = sub("${:-fallback}", &vars).unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "daemons.frpc.env[\"LOG\"]: empty variable name in `${}`"
-    );
+    assert_eq!(err.to_string(), "env[\"LOG\"]: empty variable name in `${}`");
 }
 
 #[skuld::test]
@@ -186,13 +177,13 @@ fn an_invalid_character_in_a_variable_name_is_an_error() {
     let err = sub("${1A}", &vars).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "daemons.frpc.env[\"LOG\"]: invalid character `1` in a variable name; names match [A-Za-z_][A-Za-z0-9_]*"
+        "env[\"LOG\"]: invalid character `1` in a variable name; names match [A-Za-z_][A-Za-z0-9_]*"
     );
 
     let err = sub("${A-B}", &vars).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "daemons.frpc.env[\"LOG\"]: invalid character `-` in a variable name; names match [A-Za-z_][A-Za-z0-9_]*"
+        "env[\"LOG\"]: invalid character `-` in a variable name; names match [A-Za-z_][A-Za-z0-9_]*"
     );
 }
 
@@ -218,9 +209,9 @@ fn would_substitution_change_is_true_for_an_escaped_dollar() {
 #[skuld::test]
 fn errors_carry_the_supplied_path() {
     let vars = Vars::empty();
-    let err = scalar("${MISSING}", "daemons.example.name", &vars).unwrap_err();
+    let err = scalar("${MISSING}", "name", &vars).unwrap_err();
     match err {
-        Error::Interpolate { path, .. } => assert_eq!(path, "daemons.example.name"),
+        Error::Interpolate { path, .. } => assert_eq!(path, "name"),
         other => panic!("expected Error::Interpolate, got: {other:?}"),
     }
 }
@@ -232,44 +223,42 @@ fn check_grammar_accepts_a_well_formed_reference_without_resolving_it() {
     // Grammar only: no variable is resolved, so an undefined name is not an
     // error here — the whole reason `check_grammar` exists rather than
     // reusing `scalar` with an empty `Vars`.
-    assert!(super::check_grammar("${UNDEFINED}", "daemons.frpc.name").is_ok());
+    assert!(super::check_grammar("${UNDEFINED}", "name").is_ok());
 }
 
 #[skuld::test]
 fn check_grammar_rejects_a_bare_dollar() {
-    let err = super::check_grammar("$HOME", "daemons.frpc.name").unwrap_err();
+    let err = super::check_grammar("$HOME", "name").unwrap_err();
     assert_eq!(
         err.to_string(),
-        "daemons.frpc.name: `$` at byte 0 is not part of `${...}`; write `$$` for a literal `$`"
+        "name: `$` at byte 0 is not part of `${...}`; write `$$` for a literal `$`"
     );
 }
 
 // The `spec` walk =====================================================================================================
 
-/// Parse a manifest fixture, substitute its one `frpc` daemon, and hand back
-/// the mutated `RawSpec` — the same walk `resolve` does per daemon.
+/// Parse a manifest fixture, substitute it, and hand back the mutated
+/// `RawSpec` — the same walk `resolve` does.
 fn interpolate_yaml(yaml: &str, pairs: &[(&str, &str)]) -> Result<RawSpec, Error> {
-    let mut raw: RawManifest = yaml_serde::from_str(yaml).expect("fixture yaml should parse");
-    let mut entry = raw.daemons.remove("frpc").expect("fixture must declare `frpc`");
-    spec(&mut entry, "daemons.frpc", &Vars::from_pairs(pairs))?;
-    Ok(entry)
+    let mut raw: RawSpec = yaml_serde::from_str(yaml).expect("fixture yaml should parse");
+    spec(&mut raw, &Vars::from_pairs(pairs))?;
+    Ok(raw)
 }
 
 #[skuld::test]
 fn substitutes_every_string_leaf() {
     let yaml = r#"
-daemons:
-  frpc:
-    name: ${NAME}
-    command: ["${BIN}", "--flag=${FLAG}"]
-    cwd: ${CWD}
-    logs: ${LOGS}
-    env:
-      LOG: ${LEVEL}
-    user: ${USER_NAME}
-    restart: ${RESTART}
-    restart-delay: ${DELAY}
-    type: ${TYPE}
+id: frpc
+name: ${NAME}
+command: ["${BIN}", "--flag=${FLAG}"]
+cwd: ${CWD}
+logs: ${LOGS}
+env:
+  LOG: ${LEVEL}
+user: ${USER_NAME}
+restart: ${RESTART}
+restart-delay: ${DELAY}
+type: ${TYPE}
 "#;
     let spec = interpolate_yaml(
         yaml,
@@ -304,19 +293,20 @@ daemons:
 
 #[skuld::test]
 fn a_dollar_in_a_daemon_id_is_an_error() {
-    // `spec`/`interpolate_yaml` never see the daemon id: the rejection is
-    // `reject_interpolated_id`'s alone. The end-to-end half (through `resolve`) lives in
+    // `spec` skips the id: the rejection is `reject_interpolated_id`'s
+    // alone. The end-to-end half (through `resolve`) lives in
     // `resolve_tests.rs`.
     let err = reject_interpolated_id("${ID}").unwrap_err();
-    assert!(
-        err.to_string().contains("a daemon id cannot be interpolated"),
-        "expected an id-is-a-key rejection, got: {err}"
+    assert_eq!(
+        err.to_string(),
+        "id: a daemon id cannot be interpolated: it names the installed service, so an interpolated one \
+         could change which service this manifest installs; write the id literally"
     );
 }
 
 #[skuld::test]
 fn a_dollar_in_an_env_name_is_an_error() {
-    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    env:\n      ${KEY}: value\n";
+    let yaml = "id: frpc\ncommand: [/bin/frpc]\nenv:\n  ${KEY}: value\n";
     let err = interpolate_yaml(yaml, &[("KEY", "LOG")]).unwrap_err();
     assert!(
         err.to_string().contains("an `env` name cannot be interpolated"),
@@ -329,30 +319,30 @@ fn an_env_name_containing_a_dot_is_not_mistaken_for_user_id() {
     // The walk dispatches on the struct, never on a rendered field path, so
     // an `env` key that happens to spell one cannot pick up that field's
     // rule.
-    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    env:\n      MY_user.id: ${TOKEN}\n";
+    let yaml = "id: frpc\ncommand: [/bin/frpc]\nenv:\n  MY_user.id: ${TOKEN}\n";
     let spec = interpolate_yaml(yaml, &[("TOKEN", "s3cret")]).unwrap();
     assert_eq!(spec.env["MY_user.id"], "s3cret");
 }
 
 #[skuld::test]
 fn a_dollar_under_user_id_is_an_error() {
-    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user:\n      id: \"${SID}\"\n";
+    let yaml = "id: frpc\ncommand: [/bin/frpc]\nuser:\n  id: \"${SID}\"\n";
     let err = interpolate_yaml(yaml, &[("SID", "S-1-5-21-1")]).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "daemons.frpc.user.id: `user.id` cannot be interpolated: a substituted value is always a string, \
+        "user.id: `user.id` cannot be interpolated: a substituted value is always a string, \
          so it would be read as a Windows SID; write the uid literally, or use `user: <name>`"
     );
 }
 
 #[skuld::test]
 fn a_numeric_user_id_is_untouched() {
-    let yaml = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user:\n      id: 1001\n";
+    let yaml = "id: frpc\ncommand: [/bin/frpc]\nuser:\n  id: 1001\n";
     let spec = interpolate_yaml(yaml, &[]).unwrap();
     assert_eq!(spec.user, Some(RawUser::Id(AccountId::Uid(1001))));
 }
 
-/// The `user:` of `yaml`'s single `frpc` daemon, substituted and then
+/// The `user:` of `yaml`'s daemon, substituted and then
 /// resolved — the two halves `load` runs back to back.
 fn interpolated_user(yaml: &str, pairs: &[(&str, &str)]) -> User {
     let spec = interpolate_yaml(yaml, pairs).unwrap();
@@ -365,8 +355,8 @@ fn an_interpolated_user_of_root_normalises_to_the_root_variant() {
     // and a substituted value must mean what the same text typed by hand
     // means: `User::Name("root")` would make systemd emit `User=root`
     // rather than `User=0`, and Windows resolve a nonexistent account.
-    let interpolated = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user: ${U}\n";
-    let literal = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user: root\n";
+    let interpolated = "id: frpc\ncommand: [/bin/frpc]\nuser: ${U}\n";
+    let literal = "id: frpc\ncommand: [/bin/frpc]\nuser: root\n";
 
     assert_eq!(interpolated_user(interpolated, &[("U", "root")]), User::Root);
     assert_eq!(interpolated_user(literal, &[]), User::Root);
@@ -380,8 +370,8 @@ fn an_interpolated_user_name_of_root_stays_a_literal_account() {
     // `root`, so `{name: ${U}}` with `U=root` must mean exactly what
     // `{name: root}` means. Collapsing it to `Root` would silently install
     // as LocalSystem on Windows where the authored form fails closed.
-    let interpolated = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user:\n      name: ${U}\n";
-    let literal = "daemons:\n  frpc:\n    command: [/bin/frpc]\n    user:\n      name: root\n";
+    let interpolated = "id: frpc\ncommand: [/bin/frpc]\nuser:\n  name: ${U}\n";
+    let literal = "id: frpc\ncommand: [/bin/frpc]\nuser:\n  name: root\n";
     let expected = User::Name("root".to_string());
 
     assert_eq!(interpolated_user(interpolated, &[("U", "root")]), expected);
@@ -393,29 +383,25 @@ fn spec_would_change_is_true_for_an_escaped_dollar_only() {
     // The over-approximation, pinned at spec level: a `$$` escape has no
     // reference to resolve, yet still reports `true`. See the module doc
     // comment — narrowing this is a defect, not an optimisation.
-    let escaped: RawManifest = yaml_serde::from_str("daemons:\n  frpc:\n    command: [/bin/frpc, $$ARGS]\n").unwrap();
-    assert!(spec_would_change(&escaped.daemons["frpc"]));
+    let escaped: RawSpec = yaml_serde::from_str("id: frpc\ncommand: [/bin/frpc, $$ARGS]\n").unwrap();
+    assert!(spec_would_change(&escaped));
 
-    let dollarless: RawManifest =
-        yaml_serde::from_str("daemons:\n  frpc:\n    command: [/bin/frpc, --flag]\n").unwrap();
-    assert!(!spec_would_change(&dollarless.daemons["frpc"]));
+    let dollarless: RawSpec = yaml_serde::from_str("id: frpc\ncommand: [/bin/frpc, --flag]\n").unwrap();
+    assert!(!spec_would_change(&dollarless));
 }
 
 // `check_spec_grammar` ================================================================================================
 
 #[skuld::test]
 fn check_spec_grammar_accepts_a_well_formed_manifest() {
-    let raw: RawManifest =
-        yaml_serde::from_str("daemons:\n  frpc:\n    name: ${NAME}\n    command: [\"${BIN}\"]\n    restart: ${R}\n")
-            .unwrap();
-    assert!(check_spec_grammar(&raw.daemons["frpc"], "daemons.frpc").is_ok());
+    let raw: RawSpec = yaml_serde::from_str("id: frpc\nname: ${NAME}\ncommand: [\"${BIN}\"]\nrestart: ${R}\n").unwrap();
+    assert!(check_spec_grammar(&raw).is_ok());
 }
 
 #[skuld::test]
 fn check_spec_grammar_rejects_a_bare_dollar_in_name() {
-    let raw: RawManifest =
-        yaml_serde::from_str("daemons:\n  frpc:\n    name: a$b\n    command: [/bin/frpc]\n").unwrap();
-    let err = check_spec_grammar(&raw.daemons["frpc"], "daemons.frpc").unwrap_err();
+    let raw: RawSpec = yaml_serde::from_str("id: frpc\nname: a$b\ncommand: [/bin/frpc]\n").unwrap();
+    let err = check_spec_grammar(&raw).unwrap_err();
     assert!(
         err.to_string().contains("not part of"),
         "expected the bare-`$` grammar rejection, got: {err}"
@@ -427,7 +413,6 @@ fn check_spec_grammar_does_not_require_a_defined_variable() {
     // Grammar only, never resolution — an undefined `${UNDEFINED}` must not
     // fail here; that is `interpolate::spec`'s job, once `.env` is actually
     // consulted.
-    let raw: RawManifest =
-        yaml_serde::from_str("daemons:\n  frpc:\n    name: ${UNDEFINED}\n    command: [/bin/frpc]\n").unwrap();
-    assert!(check_spec_grammar(&raw.daemons["frpc"], "daemons.frpc").is_ok());
+    let raw: RawSpec = yaml_serde::from_str("id: frpc\nname: ${UNDEFINED}\ncommand: [/bin/frpc]\n").unwrap();
+    assert!(check_spec_grammar(&raw).is_ok());
 }

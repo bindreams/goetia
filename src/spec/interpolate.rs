@@ -97,7 +97,7 @@ enum Mode<'a> {
 }
 
 /// Substitute one scalar. `path` is the manifest field path used in
-/// errors, e.g. `daemons.frpc.env["LOG"]`. See the module doc comment for
+/// errors, e.g. `env["LOG"]`. See the module doc comment for
 /// the grammar and for why this must run before `resolve_shape`.
 pub(crate) fn scalar(input: &str, path: &str, vars: &Vars) -> Result<String> {
     scan(input, path, Mode::Substitute(vars))
@@ -262,7 +262,7 @@ fn interpolate_error(path: &str, message: String) -> Error {
     }
 }
 
-// The per-daemon walk =================================================================================================
+// The per-field walk ==================================================================================================
 
 /// The `user.id` rejection, byte-exact: a test pins it. `pub(super)` (not
 /// private) so `resolve_shape` can raise the identical message when it
@@ -282,38 +282,36 @@ pub(super) const ENV_NAME_MESSAGE: &str = "an `env` name cannot be interpolated:
 /// [`USER_ID_MESSAGE`] and [`ENV_NAME_MESSAGE`]. `reject_interpolated_id`
 /// below is the only caller; the constant exists so the message lives in
 /// exactly one place regardless.
-const DAEMON_ID_MESSAGE: &str = "a daemon id cannot be interpolated: ids are map keys, so an interpolated one could \
-                                  collide with another daemon or change which installed service an artifact \
-                                  belongs to; write the id literally";
+const DAEMON_ID_MESSAGE: &str = "a daemon id cannot be interpolated: it names the installed service, so an \
+                                  interpolated one could change which service this manifest installs; write the \
+                                  id literally";
 
-/// The `$`-in-a-map-key rule for a daemon id. `id` is the raw YAML key, not
-/// yet checked against [`super::is_valid_id`]'s pattern — this must run
+/// The no-interpolation rule for the daemon id. `id` is the raw `id:` text,
+/// not yet checked against [`super::is_valid_id`]'s pattern — this must run
 /// *before* that check, or the id-pattern rejection (whose charset already
 /// excludes `$`) answers first with its more generic message. `resolve`'s
-/// step 1 is this rule's only caller, once per daemon; the id is never
-/// overridable, so there is no per-backend echo of it the way there is for
-/// the `env`-name and `user.id` rules below.
+/// step 1 is this rule's only caller; the id is never overridable, so there
+/// is no per-backend echo of it the way there is for the `env`-name and
+/// `user.id` rules below.
 pub(crate) fn reject_interpolated_id(id: &str) -> Result<()> {
     if would_substitution_change(id) {
-        return Err(interpolate_error(
-            &format!("daemons.{id}"),
-            DAEMON_ID_MESSAGE.to_string(),
-        ));
+        return Err(interpolate_error("id", DAEMON_ID_MESSAGE.to_string()));
     }
     Ok(())
 }
 
-/// Substitute every `String` leaf of one daemon entry in place. `path` is
-/// that entry's manifest path (`daemons.<id>`), prefixed onto every error.
-/// Runs only on a spec carrying no overrides: `resolve` calls it on the
-/// native backend's `merged_for` result, which becomes the returned spec.
-pub(crate) fn spec(raw: &mut RawSpec, path: &str, vars: &Vars) -> Result<()> {
+/// Substitute every `String` leaf of the manifest in place. Runs only on a
+/// spec carrying no overrides: `resolve` calls it on the native backend's
+/// `merged_for` result, which becomes the returned spec.
+pub(crate) fn spec(raw: &mut RawSpec, vars: &Vars) -> Result<()> {
     // Destructured rather than field-accessed on purpose: a field added to
     // `RawSpec` stops compiling here until someone decides whether it
     // interpolates. A walk that reads fields by name would silently skip
     // the new one, and a silently skipped field is a literal `${VAR}` in a
     // generated service artifact.
     let RawSpec {
+        // Checked by `reject_interpolated_id` before this ever runs.
+        id: _,
         name,
         command,
         cwd,
@@ -327,38 +325,39 @@ pub(crate) fn spec(raw: &mut RawSpec, path: &str, vars: &Vars) -> Result<()> {
     } = raw;
     debug_assert!(backend_specific.is_empty(), "interpolation runs on merged specs only");
 
-    substitute_option(name, &format!("{path}.name"), vars)?;
+    substitute_option(name, "name", vars)?;
     for (index, arg) in command.iter_mut().flatten().enumerate() {
-        *arg = scalar(arg, &format!("{path}.command[{index}]"), vars)?;
+        *arg = scalar(arg, &format!("command[{index}]"), vars)?;
     }
-    substitute_option(cwd, &format!("{path}.cwd"), vars)?;
-    substitute_option(logs, &format!("{path}.logs"), vars)?;
+    substitute_option(cwd, "cwd", vars)?;
+    substitute_option(logs, "logs", vars)?;
 
     for (key, value) in env.iter_mut() {
-        let key_path = format!("{path}.env[{key:?}]");
+        let key_path = format!("env[{key:?}]");
         if would_substitution_change(key) {
             return Err(interpolate_error(&key_path, ENV_NAME_MESSAGE.to_string()));
         }
         *value = scalar(value, &key_path, vars)?;
     }
 
-    substitute_user(user, path, vars)?;
+    substitute_user(user, vars)?;
 
-    substitute_option(restart, &format!("{path}.restart"), vars)?;
-    substitute_option(restart_delay, &format!("{path}.restart-delay"), vars)?;
-    substitute_option(kind, &format!("{path}.type"), vars)?;
+    substitute_option(restart, "restart", vars)?;
+    substitute_option(restart_delay, "restart-delay", vars)?;
+    substitute_option(kind, "type", vars)?;
 
     Ok(())
 }
 
 /// Every substitutable `String` leaf of `raw` passes [`check_grammar`].
-/// Same walk [`spec`] does, same `path` prefixes, no [`Vars`] — grammar
-/// only, so it can run on a merged spec no `.env` has been loaded for yet.
+/// Same walk [`spec`] does, same field paths, no [`Vars`] — grammar only,
+/// so it can run on a merged spec no `.env` has been loaded for yet.
 /// The daemon id, `env` names, and `user.id` need no grammar check here: a
 /// `$` anywhere in them is rejected outright by the key-position rules
 /// (`reject_interpolated_id`, and the two moved into `resolve_shape`).
-pub(crate) fn check_spec_grammar(raw: &RawSpec, path: &str) -> Result<()> {
+pub(crate) fn check_spec_grammar(raw: &RawSpec) -> Result<()> {
     let RawSpec {
+        id: _,
         name,
         command,
         cwd,
@@ -376,41 +375,41 @@ pub(crate) fn check_spec_grammar(raw: &RawSpec, path: &str) -> Result<()> {
     );
 
     if let Some(name) = name {
-        check_grammar(name, &format!("{path}.name"))?;
+        check_grammar(name, "name")?;
     }
     for (index, arg) in command.iter().flatten().enumerate() {
-        check_grammar(arg, &format!("{path}.command[{index}]"))?;
+        check_grammar(arg, &format!("command[{index}]"))?;
     }
     if let Some(cwd) = cwd {
-        check_grammar(cwd, &format!("{path}.cwd"))?;
+        check_grammar(cwd, "cwd")?;
     }
     if let Some(logs) = logs {
-        check_grammar(logs, &format!("{path}.logs"))?;
+        check_grammar(logs, "logs")?;
     }
     for (key, value) in env {
-        check_grammar(value, &format!("{path}.env[{key:?}]"))?;
+        check_grammar(value, &format!("env[{key:?}]"))?;
     }
-    check_user_grammar(user, path)?;
+    check_user_grammar(user)?;
     if let Some(restart) = restart {
-        check_grammar(restart, &format!("{path}.restart"))?;
+        check_grammar(restart, "restart")?;
     }
     if let Some(restart_delay) = restart_delay {
-        check_grammar(restart_delay, &format!("{path}.restart-delay"))?;
+        check_grammar(restart_delay, "restart-delay")?;
     }
     if let Some(kind) = kind {
-        check_grammar(kind, &format!("{path}.type"))?;
+        check_grammar(kind, "type")?;
     }
     Ok(())
 }
 
-fn check_user_grammar(user: &Option<RawUser>, path: &str) -> Result<()> {
+fn check_user_grammar(user: &Option<RawUser>) -> Result<()> {
     match user {
         // `Id` needs no grammar check: a `Uid` is a number substitution
         // never touches, and a `$` in a `Sid` is rejected outright by the
         // key-position rule, before this ever runs.
         None | Some(RawUser::Id(_)) => Ok(()),
-        Some(RawUser::Scalar(text)) => check_grammar(text, &format!("{path}.user")),
-        Some(RawUser::Name(name)) => check_grammar(name, &format!("{path}.user.name")),
+        Some(RawUser::Scalar(text)) => check_grammar(text, "user"),
+        Some(RawUser::Name(name)) => check_grammar(name, "user.name"),
     }
 }
 
@@ -423,12 +422,13 @@ fn check_user_grammar(user: &Option<RawUser>, path: &str) -> Result<()> {
 /// itself, with a message naming the reason, and answering `true` here
 /// would make `resolve` read `.env` first and possibly replace that message
 /// with an unrelated IO failure. The daemon id is checked before this is
-/// ever called (`resolve`'s step 1), so it never reaches `RawSpec` at all.
+/// ever called (`resolve`'s step 1), so it is skipped here.
 pub(crate) fn spec_would_change(raw: &RawSpec) -> bool {
     // Exhaustive for the same reason `spec` is: a new field must be
     // considered here too, or `resolve` decides whether to read `.env` from
     // a stale view of the manifest.
     let RawSpec {
+        id: _,
         name,
         command,
         cwd,
@@ -455,26 +455,23 @@ pub(crate) fn spec_would_change(raw: &RawSpec) -> bool {
 /// authored text, so `user: ${U}` with `U=root` means what `user: root`
 /// means, and `{name: ${U}}` means what `{name: root}` means — a literal
 /// account named `root`, which is that form's entire purpose.
-fn substitute_user(user: &mut Option<RawUser>, path: &str, vars: &Vars) -> Result<()> {
+fn substitute_user(user: &mut Option<RawUser>, vars: &Vars) -> Result<()> {
     match user {
         // A `Uid` is a number the YAML parser already produced — nothing a
         // string could be substituted into.
         None | Some(RawUser::Id(AccountId::Uid(_))) => Ok(()),
         Some(RawUser::Id(AccountId::Sid(sid))) => {
             if would_substitution_change(sid) {
-                return Err(interpolate_error(
-                    &format!("{path}.user.id"),
-                    USER_ID_MESSAGE.to_string(),
-                ));
+                return Err(interpolate_error("user.id", USER_ID_MESSAGE.to_string()));
             }
             Ok(())
         }
         Some(RawUser::Scalar(text)) => {
-            *text = scalar(text, &format!("{path}.user"), vars)?;
+            *text = scalar(text, "user", vars)?;
             Ok(())
         }
         Some(RawUser::Name(name)) => {
-            *name = scalar(name, &format!("{path}.user.name"), vars)?;
+            *name = scalar(name, "user.name", vars)?;
             Ok(())
         }
     }

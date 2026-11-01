@@ -54,7 +54,7 @@ fn write_manifest(dir: &Path, yaml: &str) -> PathBuf {
 /// `id` absent from the store: `diff` reports `Outcome::Create`.
 fn absent_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
     let fake = Fake::new();
-    let manifest = write_manifest(dir, &format!("daemons:\n  {id}:\n    command: [daemon]\n"));
+    let manifest = write_manifest(dir, &format!("id: {id}\ncommand: [daemon]\n"));
     (fake, manifest)
 }
 
@@ -66,10 +66,7 @@ fn update_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
     let mut old = mk(id);
     old.restart = Restart::Never;
     fake.install(&old, false).unwrap();
-    let manifest = write_manifest(
-        dir,
-        &format!("daemons:\n  {id}:\n    command: [daemon]\n    restart: on-failure\n"),
-    );
+    let manifest = write_manifest(dir, &format!("id: {id}\ncommand: [daemon]\nrestart: on-failure\n"));
     (fake, manifest)
 }
 
@@ -78,7 +75,7 @@ fn update_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
 fn hand_edited_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
     let fake = Fake::new();
     fake.install_then_hand_edit(&mk(id), "# hand-added directive\n");
-    let manifest = write_manifest(dir, &format!("daemons:\n  {id}:\n    command: [daemon]\n"));
+    let manifest = write_manifest(dir, &format!("id: {id}\ncommand: [daemon]\n"));
     (fake, manifest)
 }
 
@@ -86,7 +83,7 @@ fn hand_edited_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
 fn foreign_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
     let fake = Fake::new();
     fake.seed_foreign(id, "not a goetia artifact at all\n");
-    let manifest = write_manifest(dir, &format!("daemons:\n  {id}:\n    command: [daemon]\n"));
+    let manifest = write_manifest(dir, &format!("id: {id}\ncommand: [daemon]\n"));
     (fake, manifest)
 }
 
@@ -95,7 +92,7 @@ fn foreign_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
 fn unreadable_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
     let fake = Fake::new();
     fake.seed_unreadable(id);
-    let manifest = write_manifest(dir, &format!("daemons:\n  {id}:\n    command: [daemon]\n"));
+    let manifest = write_manifest(dir, &format!("id: {id}\ncommand: [daemon]\n"));
     (fake, manifest)
 }
 
@@ -105,12 +102,9 @@ fn unreadable_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
 /// against the manifest's directory.
 fn up_to_date_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
     let fake = Fake::new();
-    let manifest = write_manifest(
-        dir,
-        &format!("daemons:\n  {id}:\n    command: [{id}]\n    restart: on-failure\n"),
-    );
-    let (specs, _warnings) = goetia::spec::load(&manifest).expect("load fixture manifest");
-    fake.install(&specs[0], false).expect("seed install");
+    let manifest = write_manifest(dir, &format!("id: {id}\ncommand: [{id}]\nrestart: on-failure\n"));
+    let (spec, _warnings) = goetia::spec::load(&manifest).expect("load fixture manifest");
+    fake.install(&spec, false).expect("seed install");
     (fake, manifest)
 }
 
@@ -427,13 +421,11 @@ fn installed_ids(fake: &Fake) -> Vec<String> {
 
 // install =============================================================================================================
 
+/// A pre-one-daemon manifest fails loudly, names the field it no longer has, and installs nothing.
 #[skuld::test]
-fn install_all_daemons_when_no_ids_given() {
+fn install_of_an_old_format_manifest_installs_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(
-        dir.path(),
-        "daemons:\n  frpc:\n    command: [frpc]\n  websocat:\n    command: [websocat]\n",
-    );
+    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [frpc]\n");
     let fake = Fake::new();
 
     let (code, out, err) = dispatch_elevated(
@@ -441,32 +433,18 @@ fn install_all_daemons_when_no_ids_given() {
         &fake,
     );
 
-    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
-    assert_eq!(installed_ids(&fake), vec!["frpc".to_string(), "websocat".to_string()]);
-}
-
-#[skuld::test]
-fn install_selects_named_ids() {
-    let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(
-        dir.path(),
-        "daemons:\n  frpc:\n    command: [frpc]\n  websocat:\n    command: [websocat]\n",
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.contains("daemons"), "{err}");
+    assert!(
+        installed_ids(&fake).is_empty(),
+        "an old-format manifest must install nothing"
     );
-    let fake = Fake::new();
-
-    let (code, out, err) = dispatch_elevated(
-        &["goetia", "daemon", "install", "-f", manifest.to_str().unwrap(), "frpc"],
-        &fake,
-    );
-
-    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
-    assert_eq!(installed_ids(&fake), vec!["frpc".to_string()]);
 }
 
 #[skuld::test]
 fn install_unknown_named_id_installs_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [frpc]\n");
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\n");
     let fake = Fake::new();
 
     let (code, _out, err) = dispatch_elevated(
@@ -494,7 +472,7 @@ fn install_unknown_named_id_installs_nothing() {
 #[skuld::test]
 fn install_offers_force_only_for_a_conflict_force_can_resolve() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
     let args = ["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()];
 
     let fake = Fake::new();
@@ -527,7 +505,7 @@ fn install_offers_force_only_for_a_conflict_force_can_resolve() {
 #[skuld::test]
 fn an_unreadable_refusal_without_a_recovery_ends_at_the_reason() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
     let mgr = FlakyManager {
         recoveryless_unreadable: Some("a drop-in could not be read".to_string()),
         ..Default::default()
@@ -551,7 +529,7 @@ fn an_unreadable_refusal_without_a_recovery_ends_at_the_reason() {
 #[skuld::test]
 fn diff_offers_force_only_for_a_conflict_force_can_resolve() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
     let args = ["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()];
 
     let fake = Fake::new();
@@ -581,7 +559,7 @@ fn conflict_exits_five() {
     fake.install_then_hand_edit(&mk("frpc"), "# hand-added directive\n");
 
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
 
     let (code, out, _err) = dispatch_elevated(
         &["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()],
@@ -595,7 +573,7 @@ fn conflict_exits_five() {
 #[skuld::test]
 fn install_start_and_enable_flags_reach_the_manager() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [frpc]\n");
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\n");
     let fake = Fake::new();
 
     let (code, out, err) = dispatch_elevated(
@@ -627,7 +605,7 @@ fn install_start_and_enable_flags_reach_the_manager() {
 #[skuld::test]
 fn install_dry_run_does_not_check_elevation_or_touch_the_manager() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [frpc]\n");
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\n");
     let cli = Cli::try_parse_from([
         "goetia",
         "daemon",
@@ -652,7 +630,7 @@ fn install_dry_run_does_not_check_elevation_or_touch_the_manager() {
 #[skuld::test]
 fn install_without_flags_does_not_start_or_enable() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [frpc]\n");
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\n");
     let fake = Fake::new();
 
     let (code, _out, _err) = dispatch_elevated(
@@ -673,7 +651,7 @@ fn show_from_file_and_show_from_installed_agree() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = write_manifest(
         dir.path(),
-        "daemons:\n  frpc:\n    command: [frpc, -c, frpc.toml]\n    restart: on-failure\n",
+        "id: frpc\ncommand: [frpc, -c, frpc.toml]\nrestart: on-failure\n",
     );
     let fake = Fake::new();
     let (install_code, _, install_err) = dispatch_elevated(
@@ -695,21 +673,20 @@ fn show_from_file_and_show_from_installed_agree() {
     assert!(out_file.contains("frpc"), "{out_file}");
 }
 
-/// The per-id counterpart to `show_from_file_and_show_from_installed_agree`
-/// above: with two daemons installed from one manifest, naming each one
-/// individually still renders byte-identical output through either path,
-/// and neither path checks elevation. This is a commitment test over
-/// already-correct behaviour — both paths render through the same
-/// `crate::diff::render_yaml` today — so it is expected to pass on first
-/// write; its job is to make that agreement a declared contract rather than
-/// an accident, so a renderer added to only one path in the future fails
-/// it.
+/// The named counterpart to `show_from_file_and_show_from_installed_agree`
+/// above: `show -f <file>` and `show frpc` render byte-identical output
+/// through either path, and neither path checks elevation. This is a
+/// commitment test over already-correct behaviour — both paths render
+/// through the same `crate::diff::render_yaml` today — so it is expected to
+/// pass on first write; its job is to make that agreement a declared
+/// contract rather than an accident, so a renderer added to only one path
+/// in the future fails it.
 #[skuld::test]
 fn show_per_id_from_file_and_from_installed_agree() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = write_manifest(
         dir.path(),
-        "daemons:\n  frpc:\n    command: [frpc, -c, frpc.toml]\n    restart: on-failure\n  websocat:\n    command: [websocat]\n",
+        "id: frpc\ncommand: [frpc, -c, frpc.toml]\nrestart: on-failure\n",
     );
     let fake = Fake::new();
     let (install_code, _, install_err) = dispatch_elevated(
@@ -718,20 +695,16 @@ fn show_per_id_from_file_and_from_installed_agree() {
     );
     assert_eq!(install_code, 0, "{install_err}");
 
-    for id in ["frpc", "websocat"] {
-        let (code_file, out_file, _) = dispatch_read_only(
-            &["goetia", "daemon", "show", "-f", manifest.to_str().unwrap(), id],
-            &fake,
-        );
-        let (code_installed, out_installed, _) = dispatch_read_only(&["goetia", "daemon", "show", id], &fake);
+    let (code_file, out_file, _) =
+        dispatch_read_only(&["goetia", "daemon", "show", "-f", manifest.to_str().unwrap()], &fake);
+    let (code_installed, out_installed, _) = dispatch_read_only(&["goetia", "daemon", "show", "frpc"], &fake);
 
-        assert_eq!(code_file, 0);
-        assert_eq!(code_installed, 0);
-        assert_eq!(
-            out_file, out_installed,
-            "show -f {id} and show {id} (from installed) must render identically"
-        );
-    }
+    assert_eq!(code_file, 0);
+    assert_eq!(code_installed, 0);
+    assert_eq!(
+        out_file, out_installed,
+        "show -f and show frpc (from installed) must render identically"
+    );
 }
 
 /// `show` without `-f` only ever consults `list()` — never `status(&id)`
@@ -858,7 +831,7 @@ fn install_applies_the_native_backend_override() {
     let manifest = write_manifest(
         dir.path(),
         &format!(
-            "daemons:\n  frpc:\n    command: [frpc]\n    restart: never\n    backend-specific:\n      {native}:\n        \
+            "id: frpc\ncommand: [frpc]\nrestart: never\nbackend-specific:\n  {native}:\n    \
              restart: on-failure\n"
         ),
     );
@@ -889,21 +862,21 @@ fn always_survives_install_and_show_on_hosts_that_can_honour_it() {
     } else {
         "restart: always"
     };
-    let scm = "      scm:\n        restart: on-failure\n";
+    let scm = "  scm:\n    restart: on-failure\n";
     let manifests = [
         (
             "literal",
-            format!("daemons:\n  frpc:\n    command: [frpc]\n    restart: always\n    backend-specific:\n{scm}"),
+            format!("id: frpc\ncommand: [frpc]\nrestart: always\nbackend-specific:\n{scm}"),
         ),
         (
             "templated",
-            format!("daemons:\n  frpc:\n    command: [frpc]\n    restart: ${{R}}\n    backend-specific:\n{scm}"),
+            format!("id: frpc\ncommand: [frpc]\nrestart: ${{R}}\nbackend-specific:\n{scm}"),
         ),
         (
             "native override",
             format!(
-                "daemons:\n  frpc:\n    command: [frpc]\n    restart: never\n    backend-specific:\n      \
-                 systemd:\n        restart: always\n      launchd:\n        restart: always\n{scm}"
+                "id: frpc\ncommand: [frpc]\nrestart: never\nbackend-specific:\n  \
+                 systemd:\n    restart: always\n  launchd:\n    restart: always\n{scm}"
             ),
         ),
     ];
@@ -948,8 +921,8 @@ fn changing_only_a_non_native_override_leaves_the_install_up_to_date() {
     let fake = Fake::new();
     let manifest_text = |non_native_delay: &str| {
         format!(
-            "daemons:\n  frpc:\n    command: [frpc]\n    backend-specific:\n      {native}:\n        restart: on-failure\n      \
-             {non_native}:\n        restart-delay: {non_native_delay}\n"
+            "id: frpc\ncommand: [frpc]\nbackend-specific:\n  {native}:\n    restart: on-failure\n  \
+             {non_native}:\n    restart-delay: {non_native_delay}\n"
         )
     };
     let manifest = write_manifest(dir.path(), &manifest_text("2s"));
@@ -982,11 +955,8 @@ fn changing_the_native_override_is_an_update() {
     let dir = tempfile::tempdir().unwrap();
     let native = goetia::spec::BackendKind::native().expect("native() is Some on every CI platform");
     let fake = Fake::new();
-    let manifest_text = |restart: &str| {
-        format!(
-            "daemons:\n  frpc:\n    command: [frpc]\n    backend-specific:\n      {native}:\n        restart: {restart}\n"
-        )
-    };
+    let manifest_text =
+        |restart: &str| format!("id: frpc\ncommand: [frpc]\nbackend-specific:\n  {native}:\n    restart: {restart}\n");
     let manifest = write_manifest(dir.path(), &manifest_text("on-failure"));
 
     let (first_code, first_out, first_err) = dispatch_elevated(
@@ -1496,10 +1466,7 @@ fn a_service_installed_with_restart_always_stays_operable() {
 
     // `diff -f` with the migrated manifest still shows the installed `always`.
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(
-        dir.path(),
-        "daemons:\n  frpc:\n    command: [daemon]\n    restart: on-failure\n",
-    );
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\nrestart: on-failure\n");
     let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
     assert_eq!(code, 3, "diff: stdout:\n{out}\nstderr:\n{err}");
     assert!(
@@ -1538,20 +1505,15 @@ fn cli_refuses_a_foreign_id_for_every_verb() {
     assert_eq!(status_code, 1, "{status_err}");
 }
 
-/// Exit code 5 must mean "every failure here is force-resolvable". A batch
-/// mixing a conflict (force-resolvable) with a foreign refusal (not) must
-/// not let the refusal hide behind the conflict's higher numeric code.
+/// A foreign refusal is `1`, not the conflict's `5`: `--force` cannot
+/// resolve it, so exit code 5 must not be offered for it.
 #[skuld::test]
-fn install_exit_code_does_not_mask_an_error_behind_a_conflict() {
+fn install_exits_one_for_a_foreign_id() {
     let fake = Fake::new();
-    fake.install_then_hand_edit(&mk("conflicted"), "# hand-added directive\n");
     fake.seed_foreign("stranger", "not a goetia artifact at all\n");
 
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(
-        dir.path(),
-        "daemons:\n  conflicted:\n    command: [daemon]\n  stranger:\n    command: [daemon]\n",
-    );
+    let manifest = write_manifest(dir.path(), "id: stranger\ncommand: [daemon]\n");
 
     let (code, out, _err) = dispatch_elevated(
         &["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()],
@@ -1560,16 +1522,16 @@ fn install_exit_code_does_not_mask_an_error_behind_a_conflict() {
 
     assert_eq!(
         code, 1,
-        "an unresolvable refusal must win over a resolvable conflict:\n{out}"
+        "an unresolvable refusal is not a force-resolvable conflict:\n{out}"
     );
 }
 
 /// Manifest fields that trip the native backend's advisory: launchd's ThrottleInterval rounding, or SCM's clamp of a
 /// `restart-delay` past `SC_ACTION.Delay`'s ~49.71-day DWORD-milliseconds ceiling. systemd has no advisories.
 #[cfg(target_os = "macos")]
-const NATIVE_ADVISORY_FIELDS: &str = "    restart-delay: 500ms\n";
+const NATIVE_ADVISORY_FIELDS: &str = "restart-delay: 500ms\n";
 #[cfg(windows)]
-const NATIVE_ADVISORY_FIELDS: &str = "    type: managed\n    restart: on-failure\n    restart-delay: 60d\n";
+const NATIVE_ADVISORY_FIELDS: &str = "type: managed\nrestart: on-failure\nrestart-delay: 60d\n";
 
 /// `--dry-run`'s preview must not silently drop a `Warning`. The native
 /// backend's advisory fires at resolve time, from `BackendKind::warn`,
@@ -1581,7 +1543,7 @@ fn install_dry_run_prints_generator_warnings() {
     let dir = tempfile::tempdir().unwrap();
     write_manifest(
         dir.path(),
-        &format!("daemons:\n  frpc:\n    command: [frpc]\n{NATIVE_ADVISORY_FIELDS}"),
+        &format!("id: frpc\ncommand: [frpc]\n{NATIVE_ADVISORY_FIELDS}"),
     );
     let cli = Cli::try_parse_from([
         "goetia",
@@ -1604,15 +1566,12 @@ fn install_dry_run_prints_generator_warnings() {
     assert!(err.contains("warning:"), "stderr:\n{err}");
 }
 
-/// A daemon the generator refuses is reported on stderr and does not hide the preview of the rest. Only the
-/// SCM generator refuses today (`restart: always`), so elsewhere both daemons preview.
+/// A daemon the generator refuses is reported on stderr. Only the SCM generator refuses today
+/// (`restart: always`), so elsewhere the daemon previews.
 #[skuld::test]
 fn dry_run_reports_a_refused_daemon_and_previews_the_rest() {
     let dir = tempfile::tempdir().unwrap();
-    write_manifest(
-        dir.path(),
-        "daemons:\n  alpha:\n    command: [alpha]\n    restart: always\n  beta:\n    command: [beta]\n",
-    );
+    write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\nrestart: always\n");
     let cli = Cli::try_parse_from([
         "goetia",
         "daemon",
@@ -1631,20 +1590,15 @@ fn dry_run_reports_a_refused_daemon_and_previews_the_rest() {
 
     let out = String::from_utf8_lossy(&out);
     let err = String::from_utf8_lossy(&err);
-    let beta_preview = out.split_once("# beta\n").map(|(_, preview)| preview);
-    assert!(
-        beta_preview.is_some_and(|preview| preview.contains("beta")),
-        "beta must be previewed:\nstdout:\n{out}\nstderr:\n{err}"
-    );
     if cfg!(windows) {
         assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
         assert!(
-            err.contains("error: daemon `alpha`: `restart: always` cannot be honoured by the scm backend"),
+            err.contains("error: daemon `frpc`: `restart: always` cannot be honoured by the scm backend"),
             "stderr:\n{err}"
         );
     } else {
         assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
-        assert!(out.contains("# alpha\n"), "stdout:\n{out}");
+        assert!(out.contains("# frpc\n"), "stdout:\n{out}");
         assert!(!err.contains("error:"), "stderr:\n{err}");
     }
 }
@@ -1737,7 +1691,7 @@ fn diff_reports_not_installed_for_an_id_absent_from_the_manager() {
 #[skuld::test]
 fn install_reports_enable_and_start_failures_and_exits_nonzero() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [frpc]\n");
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\n");
     let mgr = FlakyManager {
         fail_enable_for: Some("frpc".to_string()),
         fail_start_for: Some("frpc".to_string()),
@@ -1811,19 +1765,14 @@ fn diff_exits_five_for_a_hand_edited_artifact() {
 }
 
 /// `diff` must distinguish "absent" from "occupied by a stranger's
-/// service": the first is "would be created", the second a refusal. A second,
-/// drifting daemon in the same run must not lower the code to 3: `1`
-/// outranks `3` in the precedence rule.
+/// service": the first is "would be created", the second a refusal.
 #[skuld::test]
 fn diff_exits_one_for_a_foreign_id() {
     let fake = Fake::new();
     fake.seed_foreign("frpc", "not a goetia artifact at all\n");
 
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(
-        dir.path(),
-        "daemons:\n  frpc:\n    command: [frpc]\n  drifting:\n    command: [daemon]\n",
-    );
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\n");
 
     let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
 
@@ -1831,10 +1780,6 @@ fn diff_exits_one_for_a_foreign_id() {
     let frpc_line = out.lines().find(|l| l.starts_with("frpc:")).expect("frpc's own line");
     assert!(frpc_line.contains("would be refused"), "{frpc_line}");
     assert!(!frpc_line.contains("would be created"), "{frpc_line}");
-    assert!(
-        out.contains("drifting: not installed (would be created)"),
-        "the drifting daemon must still be reported:\n{out}"
-    );
 }
 
 /// `state_str`'s `Failed`/`Unknown` arms are otherwise unreachable from any
@@ -1923,136 +1868,26 @@ fn diff_exits_three_when_a_daemon_would_be_updated() {
     assert_eq!(code, 3, "{out}");
 }
 
-/// Two up-to-date daemons in the same run: neither alone contributes a
-/// code, so the combined result must still be 0 — not "0 unless the list
-/// is empty" or some other accidental default.
+/// An up-to-date daemon contributes no code, so the result must still be
+/// 0 — not "0 unless the list is empty" or some other accidental default.
 #[skuld::test]
 fn diff_exits_zero_only_when_everything_is_up_to_date() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(
-        dir.path(),
-        "daemons:\n  frpc:\n    command: [frpc]\n    restart: on-failure\n  websocat:\n    command: [websocat]\n    restart: on-failure\n",
-    );
-    let (specs, _warnings) = goetia::spec::load(&manifest).expect("load fixture manifest");
-    let fake = Fake::new();
-    for spec in &specs {
-        fake.install(spec, false).expect("seed install");
-    }
+    let (fake, manifest) = up_to_date_fixture(dir.path(), "frpc");
 
     let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
 
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
     // `UpToDate` pushes nothing to the codes vec, so the assertion above
     // holds just as well when zero daemons were diffed at all. Pin that
-    // both were actually reached.
+    // it was actually reached.
     assert!(out.contains("frpc"), "frpc should appear in stdout:\n{out}");
-    assert!(out.contains("websocat"), "websocat should appear in stdout:\n{out}");
-}
-
-/// An unreadable artifact alongside a hand-edited one returns 4: the
-/// precedence rule's most surprising step, since `5` is the larger number.
-/// A script branching on "conflict" (5) would otherwise run `--force` on an
-/// incomplete picture, having missed that some other daemon in the same
-/// run could not even be classified.
-#[skuld::test]
-fn diff_indeterminate_beats_conflict() {
-    let fake = Fake::new();
-    fake.seed_unreadable("corrupt");
-    fake.install_then_hand_edit(&mk("conflicted"), "# hand-added directive\n");
-
-    let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(
-        dir.path(),
-        "daemons:\n  corrupt:\n    command: [daemon]\n  conflicted:\n    command: [daemon]\n",
-    );
-
-    let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
-
-    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
-    // Both outcomes must actually have been diffed — the point of this test
-    // is the *mixing*, not just the arithmetic 4 beating 5 in the abstract.
-    assert!(
-        out.contains("corrupt: would be refused"),
-        "unreadable outcome missing:\n{out}"
-    );
-    assert!(
-        out.contains("conflicted: would conflict"),
-        "conflict outcome missing:\n{out}"
-    );
-}
-
-/// A `Create` plus a `Conflict` returns 5, not 3: `3` is not a "drift is
-/// present" signal, since a conflicting daemon can ride along with it and
-/// outrank it.
-#[skuld::test]
-fn diff_conflict_beats_drift() {
-    let fake = Fake::new();
-    fake.install_then_hand_edit(&mk("conflicted"), "# hand-added directive\n");
-
-    let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(
-        dir.path(),
-        "daemons:\n  created:\n    command: [daemon]\n  conflicted:\n    command: [daemon]\n",
-    );
-
-    let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
-
-    assert_eq!(code, 5, "stdout:\n{out}\nstderr:\n{err}");
-    // Both outcomes must actually have been diffed — the point of this test
-    // is the *mixing*, not just the arithmetic 5 beating 3 in the abstract.
-    assert!(
-        out.contains("created: not installed (would be created)"),
-        "drift outcome missing:\n{out}"
-    );
-    assert!(
-        out.contains("conflicted: would conflict"),
-        "conflict outcome missing:\n{out}"
-    );
-}
-
-/// All three non-zero classes in one run — drift, conflict, and a hard
-/// `Err(_)` from the manager — must return 1: an error always wins.
-#[skuld::test]
-fn diff_error_beats_conflict_beats_drift() {
-    let inner = Fake::new();
-    inner.install_then_hand_edit(&mk("conflicted"), "# hand-added directive\n");
-    let mgr = FlakyManager {
-        inner,
-        fail_preview_for: Some("errored".to_string()),
-        ..Default::default()
-    };
-
-    let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(
-        dir.path(),
-        "daemons:\n  created:\n    command: [daemon]\n  conflicted:\n    command: [daemon]\n  errored:\n    command: [daemon]\n",
-    );
-
-    let (code, out, err) = dispatch_with(
-        &["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()],
-        &mgr,
-        &never_elevated,
-    );
-
-    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
-    // All three outcomes must actually have been diffed, not just the
-    // `errored` one that alone would already force 1.
-    assert!(
-        out.contains("created: not installed (would be created)"),
-        "drift outcome missing:\n{out}"
-    );
-    assert!(
-        out.contains("conflicted: would conflict"),
-        "conflict outcome missing:\n{out}"
-    );
-    assert!(err.contains("errored"), "error outcome missing:\n{err}");
 }
 
 /// The only biconditional the contract makes: over one fixture per
 /// `decide::Outcome` variant, `diff` exits 0 exactly when the daemon is
 /// already up to date. The reverse direction of `3` is deliberately *not*
-/// under test here — `diff_conflict_beats_drift` above is what pins that
-/// `3` alone does not mean "drift is present".
+/// under test here.
 #[skuld::test]
 fn diff_exits_zero_iff_install_would_report_up_to_date() {
     // For each fixture: run `diff`, then ask `install` itself (through the
@@ -2066,9 +1901,9 @@ fn diff_exits_zero_iff_install_would_report_up_to_date() {
     let check = |fake: &Fake, manifest: &Path, label: &str| -> i32 {
         let (code, out, err) =
             dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], fake);
-        let (specs, _warnings) = goetia::spec::load(manifest).expect("reload fixture manifest");
+        let (spec, _warnings) = goetia::spec::load(manifest).expect("reload fixture manifest");
         let install_outcome = fake
-            .install(&specs[0], false)
+            .install(&spec, false)
             .expect("install must not error for a diff fixture");
         let install_up_to_date = matches!(install_outcome, goetia::decide::Outcome::UpToDate);
         assert_eq!(
@@ -2094,7 +1929,7 @@ fn diff_exits_zero_iff_install_would_report_up_to_date() {
     let dir = tempfile::tempdir().unwrap();
     let fake = Fake::new();
     fake.seed_stale(&mk("frpc"), "0.0.0-stale");
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
     let code = check(&fake, &manifest, "Stale");
     // Pinned exactly, not just `!= 0`: `Stale` is drift like `Create`/
     // `Update`, so it must be 3, not (say) a `Conflict`'s 5 — nothing else
@@ -2673,7 +2508,7 @@ fn uninstall_does_not_report_success_over_a_residual_artifact() {
 #[skuld::test]
 fn install_and_uninstall_agree_about_an_id_with_only_a_residual_artifact() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  leftover:\n    command: [leftover]\n");
+    let manifest = write_manifest(dir.path(), "id: leftover\ncommand: [leftover]\n");
     let fake = Fake::new();
     fake.seed_residual_artifact("leftover");
 
@@ -3073,7 +2908,7 @@ fn an_id_verb_reports_error_over_indeterminate() {
 #[skuld::test]
 fn install_exits_four_for_an_undetermined_id() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  opaque:\n    command: [daemon]\n");
+    let manifest = write_manifest(dir.path(), "id: opaque\ncommand: [daemon]\n");
     let fake = Fake::new();
     fake.seed_opaque("opaque");
 
@@ -3092,7 +2927,7 @@ fn install_exits_four_for_an_undetermined_id() {
 #[skuld::test]
 fn install_exits_four_when_the_enable_leg_cannot_be_determined() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
     let mgr = FlakyManager {
         undetermined_enable_for: Some("frpc".to_string()),
         ..Default::default()
@@ -3121,7 +2956,7 @@ fn install_exits_four_when_the_enable_leg_cannot_be_determined() {
 #[skuld::test]
 fn install_exits_four_when_the_start_leg_cannot_be_determined() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
     let mgr = FlakyManager {
         undetermined_start_for: Some("frpc".to_string()),
         ..Default::default()
@@ -3150,7 +2985,7 @@ fn install_exits_four_when_the_start_leg_cannot_be_determined() {
 #[skuld::test]
 fn install_exits_four_when_the_start_leg_timed_out() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
     let mgr = FlakyManager {
         wait_timeout_start_for: Some("frpc".to_string()),
         ..Default::default()
@@ -3171,34 +3006,6 @@ fn install_exits_four_when_the_start_leg_timed_out() {
 
     assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
     assert!(err.contains("start"), "the failing step is named: {err}");
-}
-
-/// `install`'s three classes through the one precedence rule: a refusal outranks an unanswered
-/// question, which outranks a conflict.
-#[skuld::test]
-fn install_error_beats_indeterminate_beats_conflict() {
-    let two_dir = tempfile::tempdir().unwrap();
-    let three_dir = tempfile::tempdir().unwrap();
-    let two = write_manifest(
-        two_dir.path(),
-        "daemons:\n  opaque:\n    command: [daemon]\n  edited:\n    command: [daemon]\n",
-    );
-    let three = write_manifest(
-        three_dir.path(),
-        "daemons:\n  opaque:\n    command: [daemon]\n  edited:\n    command: [daemon]\n  stranger:\n    command: [daemon]\n",
-    );
-    let fake = Fake::new();
-    fake.seed_opaque("opaque");
-    fake.install_then_hand_edit(&mk("edited"), "# hand-added directive\n");
-    fake.seed_foreign("stranger", "not a goetia artifact at all\n");
-
-    let (two_code, _, two_err) =
-        dispatch_elevated(&["goetia", "daemon", "install", "-f", two.to_str().unwrap()], &fake);
-    let (three_code, _, three_err) =
-        dispatch_elevated(&["goetia", "daemon", "install", "-f", three.to_str().unwrap()], &fake);
-
-    assert_eq!(two_code, 4, "indeterminate outranks conflict: {two_err}");
-    assert_eq!(three_code, 1, "a refusal outranks both: {three_err}");
 }
 
 // --timeout / --no-timeout ============================================================================================
@@ -3552,7 +3359,7 @@ fn a_restart_that_waits_never_takes_the_request_only_restart() {
 #[skuld::test]
 fn a_start_in_doubt_exits_4_through_every_verb_that_starts() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
     let manifest = manifest.to_str().unwrap();
     for (args, disclosed) in [
         (&["goetia", "daemon", "start", "frpc"][..], ""),
@@ -3639,7 +3446,7 @@ fn restart_that_cannot_prepare_sends_nothing() {
 #[skuld::test]
 fn install_start_that_cannot_prepare_installs_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
     let fake = Fake::new();
     fake.seed_prepare_fails();
 
@@ -3668,7 +3475,7 @@ fn install_start_that_cannot_prepare_installs_nothing() {
 #[skuld::test]
 fn install_without_start_prepares_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
     let fake = Fake::new();
     fake.seed_prepare_fails();
 
@@ -3733,15 +3540,11 @@ fn restart_holds_what_it_prepared_for_both_legs_until_both_are_sent() {
 }
 
 /// `install --start` prepares the install and the start, under the start's budget, before the
-/// install sends anything, and holds what it prepared until the start is sent, then releases it
-/// before the next daemon's.
+/// install sends anything, and holds what it prepared until the start is sent.
 #[skuld::test]
 fn install_start_holds_what_it_prepared_until_the_start_is_sent() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(
-        dir.path(),
-        "daemons:\n  frpc:\n    command: [daemon]\n  web:\n    command: [daemon]\n",
-    );
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
     let fake = Fake::new();
 
     let (code, out, err) = dispatch_elevated(
@@ -3761,25 +3564,14 @@ fn install_start_holds_what_it_prepared_until_the_start_is_sent() {
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
     let both = [Step::Install, Step::Start];
     let given = Budget::Bounded(Duration::from_secs(5));
-    assert_eq!(fake.prepared(), vec![(both.to_vec(), given), (both.to_vec(), given)]);
-    assert_eq!(
-        fake.guarded(),
-        under(
-            &both,
-            &[
-                ("install", "frpc"),
-                ("start", "frpc"),
-                ("install", "web"),
-                ("start", "web")
-            ]
-        )
-    );
+    assert_eq!(fake.prepared(), vec![(both.to_vec(), given)]);
+    assert_eq!(fake.guarded(), under(&both, &[("install", "frpc"), ("start", "frpc")]));
 }
 
 #[skuld::test]
 fn install_start_that_times_out_exits_4() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
     let fake = Fake::new();
     fake.seed_start_stalls("frpc");
 
@@ -3806,7 +3598,7 @@ fn install_start_that_times_out_exits_4() {
 #[skuld::test]
 fn install_refuses_a_timeout_without_start() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
     let fake = Fake::new();
 
     let (code, out, err) = dispatch_elevated(
@@ -3848,7 +3640,7 @@ fn install_refuses_a_timeout_without_start() {
 #[skuld::test]
 fn install_dry_run_ignores_the_wait_flags() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
     let fake = Fake::new();
 
     let (plain_code, plain_out, _) = dispatch_elevated(
@@ -3891,7 +3683,7 @@ fn install_dry_run_ignores_the_wait_flags() {
 #[skuld::test]
 fn install_dry_run_ignores_a_timeout_without_start() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
     let fake = Fake::new();
 
     let (code, out, err) = dispatch_elevated(
@@ -4015,7 +3807,7 @@ fn json_returns_its_own_code_when_stdout_accepts_the_document() {
 #[skuld::test]
 fn where_no_manager_can_be_asked_every_verb_that_reaches_it_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [daemon]\n");
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
     let manifest = manifest.to_str().unwrap();
     let fake = || {
         let fake = Fake::new();

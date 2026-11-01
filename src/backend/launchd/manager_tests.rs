@@ -1894,7 +1894,7 @@ fn dry_run_and_diff_ask_launchd_nothing_and_install_start_is_refused_before_it_s
     let manifest = |seconds: &str| {
         std::fs::write(
             dir.path().join("goetia.yaml"),
-            format!("daemons:\n  {name}:\n    command: [/bin/sleep, \"{seconds}\"]\n"),
+            format!("id: {name}\ncommand: [/bin/sleep, \"{seconds}\"]\n"),
         )
         .unwrap();
     };

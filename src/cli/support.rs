@@ -12,10 +12,10 @@ use crate::spec::{DaemonSpec, Id, Warning};
 /// `err`. Every subcommand that parses a manifest calls this rather than
 /// `spec::load` directly, so a warning is never silently dropped — see the
 /// crate-level design notes on why `Warning`s must reach stderr.
-pub(crate) fn load_and_warn(file: &Path, err: &mut dyn Write) -> Result<Vec<DaemonSpec>> {
-    let (specs, warnings) = crate::spec::load(file)?;
+pub(crate) fn load_and_warn(file: &Path, err: &mut dyn Write) -> Result<DaemonSpec> {
+    let (spec, warnings) = crate::spec::load(file)?;
     print_warnings(&warnings, err);
-    Ok(specs)
+    Ok(spec)
 }
 
 /// Renders `warning: <id>: <message>` for a daemon's advisory and

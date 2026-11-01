@@ -122,7 +122,7 @@ const UNIT_DIR_EXCLUSIVE: skuld::Label;
 #[skuld::test]
 fn dry_run_needs_no_elevation() {
     let dir = tempfile::tempdir().unwrap();
-    write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [frpc]\n");
+    write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\n");
 
     let (code, out, err) = run_cli(&["daemon", "install", "--dry-run"], dir.path());
 
@@ -133,7 +133,7 @@ fn dry_run_needs_no_elevation() {
 #[skuld::test]
 fn f_flag_accepts_a_directory() {
     let dir = tempfile::tempdir().unwrap();
-    write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [frpc]\n");
+    write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\n");
 
     // `-f` names the directory itself, not `goetia.yaml` inside it.
     let (code, out, err) = run_cli(
@@ -148,7 +148,7 @@ fn f_flag_accepts_a_directory() {
 #[skuld::test]
 fn positional_is_always_an_id_never_a_path() {
     let dir = tempfile::tempdir().unwrap();
-    write_manifest(dir.path(), "daemons:\n  frpc:\n    command: [frpc]\n");
+    write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\n");
     // A directory that happens to share a name with the id below. If a
     // positional were ever mistaken for a path, `-f`'s default (".") would
     // get overridden by this empty directory instead of finding
@@ -165,7 +165,7 @@ fn positional_is_always_an_id_never_a_path() {
 fn validation_failure_installs_nothing() {
     let dir = tempfile::tempdir().unwrap();
     // An empty `command` fails `resolve()`'s validation outright.
-    write_manifest(dir.path(), "daemons:\n  frpc:\n    command: []\n");
+    write_manifest(dir.path(), "id: frpc\ncommand: []\n");
 
     let (code, out, err) = run_cli(&["daemon", "install"], dir.path());
 
@@ -177,9 +177,9 @@ fn validation_failure_installs_nothing() {
 /// or SCM's clamp of a delay past `SC_ACTION.Delay`. systemd has no advisories, so no Linux test can observe a
 /// warning through the CLI.
 #[cfg(target_os = "macos")]
-const NATIVE_ADVISORY_FIELDS: &str = "    restart-delay: 500ms\n";
+const NATIVE_ADVISORY_FIELDS: &str = "restart-delay: 500ms\n";
 #[cfg(windows)]
-const NATIVE_ADVISORY_FIELDS: &str = "    restart: on-failure\n    restart-delay: 60d\n";
+const NATIVE_ADVISORY_FIELDS: &str = "restart: on-failure\nrestart-delay: 60d\n";
 
 #[cfg(any(target_os = "macos", windows))]
 #[skuld::test]
@@ -187,7 +187,7 @@ fn warnings_are_printed_to_stderr() {
     let dir = tempfile::tempdir().unwrap();
     write_manifest(
         dir.path(),
-        &format!("daemons:\n  frpc:\n    command: [frpc]\n{NATIVE_ADVISORY_FIELDS}"),
+        &format!("id: frpc\ncommand: [frpc]\n{NATIVE_ADVISORY_FIELDS}"),
     );
 
     let (code, out, err) = run_cli(&["daemon", "show", "-f", "goetia.yaml"], dir.path());
@@ -225,7 +225,7 @@ fn a_manifest_level_warning_prints_with_no_daemon_id() {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir(&project).expect("create the manifest directory");
-    write_manifest(&project, "daemons:\n  frpc:\n    command: [frpc.exe]\n");
+    write_manifest(&project, "id: frpc\ncommand: [frpc.exe]\n");
 
     // `<drive>:proj`, which `GetFullPathNameW` anchors to that drive's
     // current directory — `dir`, since that is where the child runs.
@@ -252,7 +252,7 @@ fn an_unknown_backend_key_is_a_manifest_error() {
     let dir = tempfile::tempdir().unwrap();
     write_manifest(
         dir.path(),
-        "daemons:\n  frpc:\n    command: [frpc]\n    backend-specific:\n      windwos:\n        user: svc\n",
+        "id: frpc\ncommand: [frpc]\nbackend-specific:\n  windwos:\n    user: svc\n",
     );
 
     let (code, out, err) = run_cli(&["daemon", "show", "-f", "goetia.yaml"], dir.path());
@@ -273,7 +273,7 @@ fn warnings_still_fire_once_with_backend_overrides_present() {
     write_manifest(
         dir.path(),
         &format!(
-            "daemons:\n  frpc:\n    command: [frpc]\n{NATIVE_ADVISORY_FIELDS}    backend-specific:\n      systemd:\n        \
+            "id: frpc\ncommand: [frpc]\n{NATIVE_ADVISORY_FIELDS}backend-specific:\n  systemd:\n    \
              cwd: /var/lib/frpc\n"
         ),
     );
@@ -298,9 +298,7 @@ fn a_variable_used_only_in_the_native_override_resolves_through_the_cli() {
     let native = goetia::spec::BackendKind::native().expect("native() is Some on every CI platform");
     write_manifest(
         dir.path(),
-        &format!(
-            "daemons:\n  frpc:\n    command: [frpc]\n    backend-specific:\n      {native}:\n        restart: ${{R}}\n"
-        ),
+        &format!("id: frpc\ncommand: [frpc]\nbackend-specific:\n  {native}:\n    restart: ${{R}}\n"),
     );
     std::fs::write(dir.path().join(".env"), "R=on-failure\n").expect("write .env fixture");
 

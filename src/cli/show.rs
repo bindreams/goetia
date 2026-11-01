@@ -78,14 +78,14 @@ pub fn run(
 }
 
 fn show_from_file(file: &Path, ids: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    let specs = match load_and_warn(file, err) {
-        Ok(specs) => specs,
+    let spec = match load_and_warn(file, err) {
+        Ok(spec) => spec,
         Err(e) => {
             let _ = writeln!(err, "error: {e}");
             return 1;
         }
     };
-    let selected = match select_by_ids(&specs, ids) {
+    let selected = match select_by_ids(std::slice::from_ref(&spec), ids) {
         Ok(s) => s,
         Err(msg) => {
             let _ = writeln!(err, "error: {msg}");
