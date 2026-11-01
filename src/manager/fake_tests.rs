@@ -738,3 +738,85 @@ fn kill_is_refused_where_no_manager_can_be_asked() {
 
     assert!(matches!(result, Err(Error::NoManager { .. })), "{result:?}");
 }
+
+// A snapshot that went stale ==========================================================================================
+
+/// A verb is handed the snapshot the gate read, and the entry can change before it runs. Whatever
+/// it changed to, the verb refuses and does nothing: an entry that is gone is `NotInstalled`, one
+/// that is no longer goetia's is `Foreign`, and one that is another artifact of goetia's is a change
+/// the verb was not confirmed against.
+#[skuld::test]
+fn a_verb_on_a_snapshot_that_went_stale_refuses_and_performs_nothing() {
+    use crate::backend::Backend;
+
+    type Verb = fn(&Fake, Artifact) -> Result<()>;
+    let verbs: [(&str, Verb); 8] = [
+        ("uninstall", |fake, snapshot| Backend::uninstall(fake, snapshot)),
+        ("enable", |fake, snapshot| Backend::enable(fake, snapshot)),
+        ("disable", |fake, snapshot| Backend::disable(fake, snapshot)),
+        ("start", |fake, snapshot| {
+            Backend::start(fake, snapshot, Budget::DEFAULT)
+        }),
+        ("stop", |fake, snapshot| Backend::stop(fake, snapshot, Budget::DEFAULT)),
+        ("kill", |fake, snapshot| Backend::kill(fake, snapshot)),
+        ("request_restart", |fake, snapshot| {
+            Backend::request_restart(fake).expect("this fake restarts natively")(fake, snapshot)
+        }),
+        ("request_start_after_stop", |fake, snapshot| {
+            Backend::request_start_after_stop(fake, snapshot)
+        }),
+    ];
+    let spec = mk("frpc");
+    let other = DaemonSpec {
+        name: "another artifact".to_string(),
+        ..mk("frpc")
+    };
+
+    for stale in ["gone", "foreign", "another artifact of goetia's"] {
+        let fake = Fake::new();
+        fake.seed_native_restart();
+        fake.install(&spec, false).unwrap();
+        let snapshots: Vec<Artifact> = verbs
+            .iter()
+            .map(|_| match Backend::read(&fake, &spec.id).unwrap() {
+                ReadOutcome::Marked(snapshot) => snapshot,
+                _ => panic!("installed, so marked"),
+            })
+            .collect();
+        match stale {
+            "gone" => ServiceManager::uninstall(&fake, &spec.id).unwrap(),
+            "foreign" => fake.seed_foreign("frpc", "someone else's\n"),
+            _ => fake.seed_foreign("frpc", generate(&other)),
+        }
+
+        for ((verb, run), snapshot) in verbs.iter().zip(snapshots) {
+            let result = run(&fake, snapshot);
+            match (stale, &result) {
+                ("gone", Err(Error::NotInstalled { id })) | ("foreign", Err(Error::Foreign { id, .. })) => {
+                    assert_eq!(id, "frpc", "{stale}: {verb}");
+                }
+                ("another artifact of goetia's", Err(Error::Other(message))) => {
+                    assert!(
+                        message.contains("changed after being confirmed installed"),
+                        "{verb}: {message}"
+                    );
+                }
+                _ => panic!("{stale}: {verb} must refuse, got {result:?}"),
+            }
+        }
+
+        match stale {
+            "gone" => assert!(matches!(Backend::read(&fake, &spec.id), Ok(ReadOutcome::Absent))),
+            "foreign" => assert!(matches!(
+                Backend::read(&fake, &spec.id),
+                Ok(ReadOutcome::Foreign { .. })
+            )),
+            _ => {
+                let status = fake.status(&spec.id).unwrap();
+                assert_eq!(status.state, State::Stopped, "no verb acted on what replaced it");
+                assert!(!status.enabled, "no verb acted on what replaced it");
+                assert_eq!(fake.preview_install(&other).unwrap(), Outcome::UpToDate);
+            }
+        }
+    }
+}
