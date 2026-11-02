@@ -60,9 +60,9 @@ use crate::error::Error;
 /// letters, digits, `.`, `_`, `-`, 1 to 80 characters. Loose enough for a
 /// docker-compose-style key, tight enough that the id is always usable
 /// unescaped as a systemd unit name, a launchd label component, and an SCM
-/// service name — and case-insensitively distinct, since a launchd label
-/// and an SCM service name both live on case-insensitive filesystems/stores
-/// on some hosts.
+/// service name. Ids differing only in case are both valid; where the manager
+/// does not tell them apart, `install` refuses the second (see
+/// [`crate::decide::Outcome::RefuseOtherDaemon`]).
 fn is_valid_id(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 80
