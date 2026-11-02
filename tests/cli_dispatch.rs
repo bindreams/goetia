@@ -1517,6 +1517,51 @@ fn install_exits_one_for_a_foreign_id() {
     );
 }
 
+/// `frpc`'s service found at the case-differing id `FRPC`, as a case-insensitive manager answers.
+fn other_daemon_fixture(dir: &Path) -> (Fake, PathBuf) {
+    let fake = Fake::new();
+    fake.seed_installed_as("FRPC", &mk("frpc"));
+    let manifest = write_manifest(dir, "id: FRPC\ncommand: [daemon]\n");
+    (fake, manifest)
+}
+
+const OTHER_DAEMON_REFUSAL: &str = "the service manager finds the installed daemon `frpc` at this id, and installing \
+     would replace it. Give this daemon a different id, or uninstall `frpc` first.";
+
+/// Refused for every backend and under `--force`, like a foreign id: exit `1`, not `5`.
+#[skuld::test]
+fn install_exits_one_for_a_service_installed_under_another_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fake, manifest) = other_daemon_fixture(dir.path());
+
+    for force in [false, true] {
+        let mut args = vec!["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()];
+        if force {
+            args.push("--force");
+        }
+        let (code, out, err) = dispatch_elevated(&args, &fake);
+
+        let line = format!("FRPC: refused: {OTHER_DAEMON_REFUSAL}");
+        assert_eq!(code, 1, "force={force}: stdout:\n{out}\nstderr:\n{err}");
+        assert_eq!(out, format!("{line}\n"), "force={force}");
+        assert_eq!(err, format!("error: {line}\n"), "force={force}");
+    }
+    assert_eq!(fake.writes(), 0);
+}
+
+#[skuld::test]
+fn diff_exits_one_for_a_service_installed_under_another_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fake, manifest) = other_daemon_fixture(dir.path());
+
+    let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
+
+    let line = format!("FRPC: would be refused: {OTHER_DAEMON_REFUSAL}");
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(out, format!("{line}\n"));
+    assert_eq!(err, format!("error: {line}\n"));
+}
+
 /// Manifest fields that trip the native backend's advisory: launchd's ThrottleInterval rounding, or SCM's clamp of a
 /// `restart-delay` past `SC_ACTION.Delay`'s ~49.71-day DWORD-milliseconds ceiling. systemd has no advisories.
 #[cfg(target_os = "macos")]

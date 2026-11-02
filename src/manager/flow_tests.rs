@@ -105,6 +105,24 @@ fn a_write_that_loses_to_a_foreign_entry_refuses_and_overwrites_nothing() {
     assert!(matches!(after, Outcome::RefuseForeign { .. }), "{after:?}");
 }
 
+/// A manager that matches ids case-insensitively answers a request for `FRPC` with `frpc`'s
+/// service. The snapshot is named `FRPC`; its blob says `frpc`. No flag lets a write replace it.
+#[skuld::test]
+fn install_and_preview_refuse_a_service_the_manager_finds_for_another_daemon() {
+    let fake = Fake::new();
+    fake.seed_installed_as("FRPC", &mk("frpc"));
+    let requested = mk("FRPC");
+    let expected = Outcome::RefuseOtherDaemon {
+        installed: Id::try_from("frpc").unwrap(),
+    };
+
+    for force in [false, true] {
+        assert_eq!(fake.install(&requested, force).unwrap(), expected, "force={force}");
+    }
+    assert_eq!(fake.preview_install(&requested).unwrap(), expected);
+    assert_eq!(fake.writes(), 0, "the installed service must not be written over");
+}
+
 /// What the interloper wrote is read afresh and decided on, whichever of `decide`'s rows it hits.
 #[skuld::test]
 fn a_write_that_loses_to_an_ours_entry_follows_that_entry() {

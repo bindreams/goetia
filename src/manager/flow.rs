@@ -39,7 +39,8 @@ fn classify<B: Backend>(b: &B, read: ReadOutcome<B::Snapshot>) -> Found<B::Snaps
     }
 }
 
-/// A marked service's ownership: its embedded spec is rendered, and compared with what is installed.
+/// A marked service's ownership: its embedded spec must name the requested id, and is rendered and
+/// compared with what is installed.
 fn judge<B: Backend>(b: &B, snapshot: &B::Snapshot) -> (Ownership, ExternalConfig) {
     let id = snapshot.id();
     let unreadable = |reason, recovery| (Ownership::OursUnreadable { reason, recovery }, ExternalConfig::Absent);
@@ -49,6 +50,16 @@ fn judge<B: Backend>(b: &B, snapshot: &B::Snapshot) -> (Ownership, ExternalConfi
         Ok(blob) => blob,
         Err(e) => return unreadable(e.to_string(), uninstall_advice()),
     };
+    // A manager that matches ids case-insensitively finds `frpc`'s service for `FRPC`. Nothing else
+    // is read: writing would replace that daemon's service.
+    if blob.spec.id != *id {
+        return (
+            Ownership::OtherDaemon {
+                installed: blob.spec.id.clone(),
+            },
+            ExternalConfig::Absent,
+        );
+    }
     let regenerated = match b.render(&blob.spec) {
         Ok(regenerated) => regenerated.to_string(),
         Err(e) => {
@@ -120,6 +131,7 @@ pub(crate) fn install<B: Backend>(b: &B, spec: &DaemonSpec, force: bool) -> Resu
             Outcome::UpToDate
             | Outcome::Conflict { .. }
             | Outcome::RefuseForeign { .. }
+            | Outcome::RefuseOtherDaemon { .. }
             | Outcome::RefuseUnreadable { .. } => return Ok(outcome),
         }
     }

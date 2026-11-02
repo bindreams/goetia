@@ -135,7 +135,10 @@ the untrusted claim being checked, so a check that reads it proves nothing.
 ## The manifest
 
 A `goetia.yaml` describes one daemon: its top level is the daemon's fields.
-`id:` is required and is the name of the installed service.
+`id:` is required and is the name of the installed service. `install` and
+`diff` refuse, even with `--force`, when the service manager finds a different
+daemon's service at that id, as Windows and case-insensitive macOS do for `FRPC`
+and an installed `frpc`. Exit `1`; rename the daemon or uninstall the other one.
 
 ```yaml
 id: frpc

@@ -9,7 +9,7 @@ use super::report;
 use super::support::{load_and_warn, require_elevation};
 use super::wait::WaitArgs;
 use crate::backend::Identity;
-use crate::decide::Outcome;
+use crate::decide::{self, Outcome};
 use crate::error::{Error, Result};
 use crate::manager::{Prepared, ServiceManager, Step};
 use crate::spec::{AccountId, DaemonSpec, Id, User};
@@ -222,6 +222,12 @@ fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn
         Outcome::RefuseForeign { recovery } => {
             let _ = writeln!(out, "{id}: refused: not a goetia-managed service. {recovery}");
             let _ = writeln!(err, "error: {id}: refused: not a goetia-managed service. {recovery}");
+            OutcomeClass::Refused
+        }
+        Outcome::RefuseOtherDaemon { installed } => {
+            let line = format!("{id}: refused: {}", decide::other_daemon_refusal(installed.as_str()));
+            let _ = writeln!(out, "{line}");
+            let _ = writeln!(err, "error: {line}");
             OutcomeClass::Refused
         }
         Outcome::RefuseUnreadable { reason, recovery } => {

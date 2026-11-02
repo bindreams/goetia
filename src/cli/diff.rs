@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use clap::Args as ClapArgs;
 
 use super::support::load_and_warn;
-use crate::decide::Outcome;
+use crate::decide::{self, Outcome};
 use crate::error::{Error, Result};
 use crate::manager::ServiceManager;
 
@@ -95,6 +95,16 @@ pub fn run(
             let line = format!(
                 "{}: would be refused: not a goetia-managed service. {recovery}",
                 spec.id
+            );
+            let _ = writeln!(out, "{line}");
+            let _ = writeln!(err, "error: {line}");
+            1
+        }
+        Ok(Outcome::RefuseOtherDaemon { installed }) => {
+            let line = format!(
+                "{}: would be refused: {}",
+                spec.id,
+                decide::other_daemon_refusal(installed.as_str())
             );
             let _ = writeln!(out, "{line}");
             let _ = writeln!(err, "error: {line}");
