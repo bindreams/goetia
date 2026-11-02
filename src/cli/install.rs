@@ -81,14 +81,12 @@ pub fn run(
     };
 
     // Each step (install, `--enable`, `--start`) contributes at most one
-    // exit-code class, combined by `report::precedence` — the same rule and
-    // function `list`/`status` and `show` use, reused rather than re-derived
-    // here (see `dispatch`'s doc comment for the vocabulary and the ordering
-    // itself). Never `max()` on the codes themselves: `1` (a refusal or a
-    // hard failure) must outrank `5` even though it is the smaller number, or
-    // a real error hides behind a conflict — and `5` specifically promises
-    // "every failure here is force-resolvable", which stops being true the
-    // moment another step in the same run hard-failed.
+    // exit-code class, combined by `report::precedence`. Never `max()` on the
+    // codes themselves: `1` (a refusal or a hard failure) must outrank `5`
+    // even though it is the smaller number, or a real error hides behind a
+    // conflict — and `5` specifically promises "every failure here is
+    // force-resolvable", which stops being true the moment another step in the
+    // same run hard-failed.
     let mut codes: Vec<i32> = Vec::new();
     // Before the install sends anything, so that nothing the start needs
     // can run out after the install booted a loaded job out.

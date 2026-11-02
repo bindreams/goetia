@@ -662,9 +662,7 @@ fn install_without_flags_does_not_start_or_enable() {
 
 /// `show -f <dir>`, `show` and `show frpc` render byte-identical output:
 /// the file path and the installed path, named or not, and neither checks
-/// elevation. A commitment test over already-correct behaviour — all three
-/// render through the same `crate::diff::render_yaml` today — so a renderer
-/// added to only one path in the future fails it.
+/// elevation.
 #[skuld::test]
 fn show_from_file_and_from_installed_agree() {
     let dir = tempfile::tempdir().unwrap();

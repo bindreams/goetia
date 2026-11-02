@@ -77,12 +77,8 @@ fn a_null_after_a_tag_the_scan_cannot_read_is_still_refused() {
 
 #[skuld::test]
 fn the_slot_table_answers_the_positions_the_typed_parse_takes_first() {
-    // A null `user.id`, `command` or `env` and a null field name are the
-    // typed parse's to refuse — `AccountId` guards its own unit, `command`
-    // and `env` want a container, and a null key is an unknown field — so
-    // these sentences are the ones the scan *would* give. They are pinned
-    // here because nothing else reaches them, and because a field of that
-    // shape added to `RawSpec` would make them live again.
+    // Unreachable through `RawSpec::parse` (the typed parse refuses first);
+    // pinned in case a field of that shape is added.
     for (yaml, expected) in [
         ("id: frpc\ncommand: [/x]\nuser:\n  id: null\n", "is not an account id"),
         ("id: frpc\ncommand: null\n", "is not a command"),

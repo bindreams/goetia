@@ -197,9 +197,7 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
     })();
     let (shaped, mut daemon_warnings) = substituted.map_err(|e| annotate_step5_error(e, native_entry))?;
 
-    // Annotated like step 4, not like the substitution: the first per-backend rule applied to the
-    // native spec, so a `.env` attribution would be wrong. `error` reads only `native_supplied`
-    // fields, i.e. `backend-specific.<native>`.
+    // `error` reads only `native_supplied` fields, so attribute to the backend, not `.env`.
     if let Some(b) = native {
         b.error(&shaped, native_supplied).map_err(|e| attribute_to(e, b))?;
         b.warn(&shaped, &mut daemon_warnings);

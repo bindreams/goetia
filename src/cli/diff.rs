@@ -111,10 +111,7 @@ pub fn run(
             1
         }
         Ok(Outcome::RefuseUnreadable { reason, recovery }) => {
-            // `4`, not `1`: `diff` was asked a question and could not
-            // determine the answer — indeterminate, not a failure.
-            // `install` genuinely fails to install here instead, which
-            // is the one row this deliberately differs from `install`.
+            // Indeterminate, not a failure: `4`.
             let line = match recovery {
                 Some(recovery) => format!("{}: would be refused: {reason}. {recovery}", spec.id),
                 None => format!("{}: would be refused: {reason}", spec.id),
@@ -123,15 +120,7 @@ pub fn run(
             let _ = writeln!(err, "error: {line}");
             4
         }
-        // `4`, for the same reason `RefuseUnreadable` above is `4`:
-        // nothing was attempted and nothing refused — a read
-        // `preview_install` needed in order to answer failed, so the
-        // question stands unanswered. `1` would claim an operation ran
-        // and failed. `install` returns `4` here too, through its own
-        // `failure_code`: the two verbs agree about *this* error and
-        // disagree only about `Outcome::RefuseUnreadable`, where
-        // `install` genuinely did fail to install. See `dispatch`'s doc
-        // comment, which owns the vocabulary.
+        // Unanswered question, not a failure: `4` (see `dispatch`).
         Err(e @ Error::Undetermined { .. }) => {
             let _ = writeln!(err, "error: {}: {e}", spec.id);
             4
