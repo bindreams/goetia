@@ -19,7 +19,7 @@ command: [bin/frpc]
 #[skuld::test]
 fn an_old_format_manifest_is_refused_naming_daemons() {
     let err = parse("daemons: {frpc: {command: [frpc]}}").unwrap_err();
-    assert!(err.to_string().contains("daemons"), "{err}");
+    assert!(err.to_string().contains("unknown field `daemons`"), "{err}");
 }
 
 #[skuld::test]

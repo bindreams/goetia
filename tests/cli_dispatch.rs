@@ -433,7 +433,7 @@ fn install_of_an_old_format_manifest_installs_nothing() {
     );
 
     assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
-    assert!(err.contains("daemons"), "{err}");
+    assert!(err.contains("unknown field `daemons`"), "{err}");
     assert!(
         installed_ids(&fake).is_empty(),
         "an old-format manifest must install nothing"
