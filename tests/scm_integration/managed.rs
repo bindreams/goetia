@@ -131,6 +131,44 @@ fn install_then_list_round_trips_without_the_source_file() {
     assert!(!status.enabled);
 }
 
+/// SCM matches service names case-insensitively, so a request for `ID` reaches the service
+/// installed as `id`. Neither `install` (forced or not) nor `preview_install` may write over it.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_differently_cased_id_is_refused_and_leaves_the_service_unchanged() {
+    let mgr = ScmManager::new();
+    let id = support::random_test_id();
+    let upper = id.to_uppercase();
+    let _guard = ServiceGuard::new(&id);
+    let _upper_guard = ServiceGuard::new(&upper);
+    let installed = install_plain(&mgr, &id);
+
+    let requested = DaemonSpec {
+        id: id_of(&upper),
+        ..installed.clone()
+    };
+    let expected = Outcome::RefuseOtherDaemon { installed: id_of(&id) };
+
+    assert_eq!(mgr.preview_install(&requested).expect("preview_install"), expected);
+    for force in [false, true] {
+        assert_eq!(
+            mgr.install(&requested, force).expect("install"),
+            expected,
+            "force={force}"
+        );
+    }
+
+    let after = mgr
+        .list()
+        .expect("list")
+        .into_iter()
+        .find_map(|entry| match entry {
+            Installed::Ours { spec, .. } if spec.id.as_str().eq_ignore_ascii_case(&id) => Some(spec),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{id} did not appear in list"));
+    assert_eq!(after, installed, "the installed service must not be written over");
+}
+
 /// `apply` restates the start type the service has when it updates one, because `change_config`
 /// always sends a real `dwStartType`. An update that restated the create default instead would undo
 /// `enable` here, silently. `enable` rather than `disable` is the one to pin: a fresh service is

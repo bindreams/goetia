@@ -277,6 +277,54 @@ fn hand_edit_is_detected_as_conflict() {
     }
 }
 
+/// The plist directories of a default macOS volume are case-insensitive, so a request for `ID`
+/// reaches the plist installed as `id`. Neither `install` (forced or not) nor `preview_install`
+/// may write over it.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_differently_cased_id_is_refused_and_leaves_the_service_unchanged() {
+    let mgr = LaunchdManager::new();
+    let spec = sleepy(&support::random_test_id());
+    let _guard = Guard::install(&mgr, &spec);
+    let upper = spec.id.as_str().to_uppercase();
+    let _upper_guard = Guard(Id::try_from(upper.as_str()).expect("an uppercased valid id is valid"));
+    assert!(
+        staging_path(&upper).exists(),
+        "this test needs a case-insensitive filesystem at {}, and {} is not found there",
+        staging_dir().display(),
+        staging_path(&upper).display()
+    );
+
+    let requested = DaemonSpec {
+        id: Id::try_from(upper.as_str()).unwrap(),
+        ..spec.clone()
+    };
+    let expected = Outcome::RefuseOtherDaemon {
+        installed: spec.id.clone(),
+    };
+    let before = std::fs::read(staging_path(spec.id.as_str())).unwrap();
+
+    assert_eq!(mgr.preview_install(&requested).expect("preview_install"), expected);
+    for force in [false, true] {
+        assert_eq!(
+            mgr.install(&requested, force).expect("install"),
+            expected,
+            "force={force}"
+        );
+    }
+
+    assert_eq!(
+        std::fs::read(staging_path(spec.id.as_str())).unwrap(),
+        before,
+        "the installed plist must not be written over"
+    );
+    match mgr.list().expect("list").into_iter().find(
+        |entry| matches!(entry, Installed::Ours { spec: s, .. } if s.id.as_str().eq_ignore_ascii_case(spec.id.as_str())),
+    ) {
+        Some(Installed::Ours { spec: got, .. }) => assert_eq!(got, spec),
+        other => panic!("expected the installed spec back from list(), got {other:?}"),
+    }
+}
+
 /// The genuine TOCTOU race this guards against — a foreign write landing
 /// between `read` and the actual persist — is unit-tested
 /// directly against `persist_new` in
