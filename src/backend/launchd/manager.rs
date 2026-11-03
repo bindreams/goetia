@@ -1583,9 +1583,9 @@ fn scan_in(dirs: [(&str, bool); 2]) -> Scan<Plist> {
 
     let mut entries = Vec::new();
     let mut reported = Vec::new();
+    // A partial scan can narrow a positive claim but never supports absence: `reported` forbids
+    // that. Untested: needs a mid-`readdir` fault on macOS.
     for (id, locations) in by_id {
-        // A partial scan can narrow a positive claim but never supports absence: `reported` forbids
-        // that. Untested: needs a mid-`readdir` fault on macOS.
         // Each location is read, because `/Library/LaunchDaemons` holds every vendor's daemons: a
         // stem found in both is goetia's only if one of the two carries the marker.
         let mut found = Vec::new();
@@ -1601,8 +1601,12 @@ fn scan_in(dirs: [(&str, bool); 2]) -> Scan<Plist> {
                 // A failed read leaves zero evidence of whether this plist ever carried a Goetia
                 // marker at all. `Installed::Undetermined` claims neither ownership nor absence,
                 // which is exactly what was established.
-                Err(Error::Undetermined { reason, .. }) => unestablished = unestablished.or(Some(reason)),
-                Err(e) => unestablished = unestablished.or(Some(e.to_string())),
+                Err(Error::Undetermined { reason, .. }) => {
+                    unestablished.get_or_insert(reason);
+                }
+                Err(e) => {
+                    unestablished.get_or_insert(e.to_string());
+                }
             }
         }
         if let Some(reason) = unestablished {

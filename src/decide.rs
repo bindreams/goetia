@@ -47,8 +47,8 @@ pub enum Ownership {
     ///    only).
     /// 4. A marked entry sits at a name that is not a valid daemon id (`list` only).
     /// 5. The live-state query failed (`list` and `status`).
-    /// 6. On launchd, the plist is present in both the staging and the enabled directory, so the
-    ///    installation is ambiguous (`list` only).
+    /// 6. On launchd, the plist is present in both the staging and the enabled directory and at least
+    ///    one carries the marker, so the installation is ambiguous (`list` only).
     ///
     /// `recovery` is the action that unblocks the id, or `None` when discovery names none — a
     /// drop-in that cannot be read.
