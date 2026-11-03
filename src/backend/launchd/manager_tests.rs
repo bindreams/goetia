@@ -773,6 +773,47 @@ fn a_plist_in_both_directories_is_reported_not_classified() {
     );
 }
 
+/// `/Library/LaunchDaemons` holds every vendor's daemons: a stem it shares with a goetia plist in
+/// staging does not make the vendor's plist goetia's, but the marked one is still a state to name.
+#[skuld::test]
+fn a_marked_plist_beside_an_unmarked_one_of_the_same_stem_is_reported() {
+    let (staging, enabled) = (
+        tempfile::tempdir().expect("tempdir"),
+        tempfile::tempdir().expect("tempdir"),
+    );
+    fs::write(staging.path().join("twice.plist"), sample_plist("twice")).expect("write the marked plist");
+    fs::write(enabled.path().join("twice.plist"), "<plist/>").expect("write the unmarked plist");
+
+    let scan = scanned(staging.path(), enabled.path());
+
+    assert!(scan.entries.is_empty(), "{} entries", scan.entries.len());
+    assert_eq!(
+        scan.reported,
+        [Installed::OursUnusable {
+            name: "twice".to_string(),
+            reason: format!("present in both {STAGING_DIR} and {ENABLED_DIR}"),
+        }]
+    );
+}
+
+/// Nothing at the stem is goetia's, and `list` omits foreign entries, so neither an entry nor a
+/// report is made.
+#[skuld::test]
+fn an_unmarked_plist_in_both_directories_is_not_reported() {
+    let (staging, enabled) = (
+        tempfile::tempdir().expect("tempdir"),
+        tempfile::tempdir().expect("tempdir"),
+    );
+    for dir in [staging.path(), enabled.path()] {
+        fs::write(dir.join("theirs.plist"), "<plist/>").expect("write the plist");
+    }
+
+    let scan = scanned(staging.path(), enabled.path());
+
+    assert!(scan.entries.is_empty(), "{} entries", scan.entries.len());
+    assert!(scan.reported.is_empty(), "{:?}", scan.reported);
+}
+
 // Writing: a race that has cost no call ===============================================================================
 
 /// A plist that vanished between `read` and `write` — a concurrent `uninstall` — before `install`
