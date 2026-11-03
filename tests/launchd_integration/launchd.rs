@@ -1,4 +1,4 @@
-//! Elevated end-to-end coverage for [`LaunchdManager`] against the real
+//! Elevated end-to-end coverage for [`Launchd`] against the real
 //! `/Library/Application Support/Goetia/daemons` and `/Library/LaunchDaemons`
 //! directories and a real `launchctl`.
 //!
@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use goetia::backend::Identity;
 use goetia::backend::launchd::generate;
-use goetia::backend::launchd::manager::{ENABLED_DIR, LaunchdManager, STAGING_DIR};
+use goetia::backend::launchd::manager::{ENABLED_DIR, Launchd, STAGING_DIR};
 use goetia::decide::Outcome;
 use goetia::manager::{self, Budget, Installed, ServiceManager, State};
 use goetia::spec::{DaemonSpec, Id, Kind, Restart, User};
@@ -161,7 +161,7 @@ fn may_account_for(listed: &[Installed], id: &str) -> bool {
 struct Guard(Id);
 
 impl Guard {
-    fn install(mgr: &LaunchdManager, spec: &DaemonSpec) -> Self {
+    fn install(mgr: &Launchd, spec: &DaemonSpec) -> Self {
         mgr.install(spec, false).expect("seed install");
         Self(spec.id.clone())
     }
@@ -169,7 +169,7 @@ impl Guard {
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        match LaunchdManager::new().uninstall(&self.0) {
+        match Launchd::new().uninstall(&self.0) {
             Ok(()) | Err(goetia::Error::NotInstalled { .. }) => {}
             Err(e) => eprintln!("Guard[{}]: cleanup failed: {e}", self.0),
         }
@@ -198,7 +198,7 @@ impl Drop for FileGuard {
 /// elsewhere in this file (and `tests/cli_binary.rs`'s real `daemon list`) are about.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn launchd_passes_conformance() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
 
     // Seed `FOREIGN_ID`: non-Goetia content the conformance suite itself
     // never writes to or removes (see `manager::conformance`'s module doc
@@ -239,7 +239,7 @@ fn launchd_passes_conformance() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn install_round_trips_without_a_source_file() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
     let _guard = Guard::install(&mgr, &spec);
 
@@ -259,7 +259,7 @@ fn install_round_trips_without_a_source_file() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn hand_edit_is_detected_as_conflict() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
     let _guard = Guard::install(&mgr, &spec);
 
@@ -282,7 +282,7 @@ fn hand_edit_is_detected_as_conflict() {
 /// may write over it.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_differently_cased_id_is_refused_and_leaves_the_service_unchanged() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
     let _guard = Guard::install(&mgr, &spec);
     let upper = spec.id.as_str().to_uppercase();
@@ -336,7 +336,7 @@ fn a_differently_cased_id_is_refused_and_leaves_the_service_unchanged() {
 /// sitting where it is about to write.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn create_does_not_clobber_a_unit_that_appears_after_classification() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let id = support::random_test_id();
     let path = staging_path(&id);
     let foreign_content = "not a goetia artifact, seeded directly\n";
@@ -362,7 +362,7 @@ fn create_does_not_clobber_a_unit_that_appears_after_classification() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn install_does_not_start_the_daemon() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
     let _guard = Guard::install(&mgr, &spec);
 
@@ -374,7 +374,7 @@ fn install_does_not_start_the_daemon() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn start_does_not_enable() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
     let _guard = Guard::install(&mgr, &spec);
 
@@ -392,7 +392,7 @@ fn start_does_not_enable() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn enable_does_not_start() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
     let _guard = Guard::install(&mgr, &spec);
 
@@ -411,7 +411,7 @@ fn enable_does_not_start() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn disable_returns_the_plist_to_staging() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let id = support::random_test_id();
     let listener = ConnectBack::listen();
     let spec = base_spec(
@@ -455,7 +455,7 @@ fn disable_returns_the_plist_to_staging() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn start_stop_status_reflect_reality() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let id = support::random_test_id();
     let listener = ConnectBack::listen();
     // `RUN_UNTIL_KILLED`, not `sleepy`'s plain `/bin/sleep`: connecting back
@@ -503,7 +503,7 @@ fn reporting(id: &str, restart: Restart, listener: &ConnectBack) -> DaemonSpec {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_killed_always_restart_daemon_comes_back_with_a_new_pid() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let listener = ConnectBack::listen();
     let spec = reporting(&support::random_test_id(), Restart::Always, &listener);
     let _guard = Guard::install(&mgr, &spec);
@@ -513,7 +513,7 @@ fn a_killed_always_restart_daemon_comes_back_with_a_new_pid() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_killed_never_restart_daemon_stays_down() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let listener = ConnectBack::listen();
     let spec = reporting(&support::random_test_id(), Restart::Never, &listener);
     let _guard = Guard::install(&mgr, &spec);
@@ -541,11 +541,11 @@ fn a_killed_never_restart_daemon_stays_down() {
 /// stays loaded with no process, and a second kill finds nothing to signal.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn killing_a_job_with_no_process_is_not_running() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let listener = ConnectBack::listen();
     let spec = reporting(&support::random_test_id(), Restart::Never, &listener);
     let _guard = Guard::install(&mgr, &spec);
-    let get_manager = || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(LaunchdManager::new())) };
+    let get_manager = || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(Launchd::new())) };
 
     support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.id);
 
@@ -563,7 +563,7 @@ fn killing_a_job_with_no_process_is_not_running() {
 /// running daemon untouched, and goes through once the job has been stopped.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn install_refuses_a_changed_spec_while_the_job_is_loaded() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let id = support::random_test_id();
     let listener = ConnectBack::listen();
     let mut spec = base_spec(
@@ -611,7 +611,7 @@ fn install_refuses_a_changed_spec_while_the_job_is_loaded() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn uninstall_leaves_nothing() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let id = support::random_test_id();
     let spec = sleepy(&id);
     // `Guard::drop` re-running `uninstall` after the explicit call below is
@@ -629,7 +629,7 @@ fn uninstall_leaves_nothing() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn list_ignores_foreign_plists() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let id = support::random_test_id();
     let path = staging_path(&id);
     write_plist(&path, &foreign_plist(&id));
@@ -655,7 +655,7 @@ fn list_ignores_foreign_plists() {
 /// `status`.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_reports_a_deleted_user_as_ours_unusable() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let id = support::random_test_id();
     let user = "goetia-no-such-user-xyz";
     let mut spec = sleepy(&id);
@@ -710,7 +710,7 @@ fn list_reports_a_deleted_user_as_ours_unusable() {
 /// failing a test that is not about it.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn unelevated_list_works() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
     let _guard = Guard::install(&mgr, &spec);
 
@@ -750,7 +750,7 @@ fn unelevated_list_works() {
 /// that would have said so is precisely what went unread.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn unelevated_list_reports_a_root_only_plist_as_undetermined() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
     let _guard = Guard::install(&mgr, &spec);
     std::fs::set_permissions(staging_path(spec.id.as_str()), std::fs::Permissions::from_mode(0o600))
@@ -780,7 +780,7 @@ fn unelevated_list_reports_a_root_only_plist_as_undetermined() {
 /// UTF-16.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_omits_a_non_utf8_plist_as_foreign() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let readable = sleepy(&support::random_test_id());
     let _guard = Guard::install(&mgr, &readable);
 
@@ -814,7 +814,7 @@ fn list_omits_a_non_utf8_plist_as_foreign() {
 /// a service that is in no way goetia's business.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_stays_clean_on_a_host_carrying_binary_plists() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let id = support::random_test_id();
     let path = enabled_path(&id);
     write_bytes(&path, &binary_plist(&id));
@@ -844,7 +844,7 @@ fn list_stays_clean_on_a_host_carrying_binary_plists() {
 /// refuses it with the remedy `Outcome::RefuseForeign` names, rather than erroring.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn preview_install_over_a_non_utf8_plist_refuses_it_as_foreign() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let id = support::random_test_id();
     let path = staging_path(&id);
     write_bytes(&path, &NON_UTF8_PLIST);
@@ -1047,7 +1047,7 @@ impl ListJson {
 /// resolved account actually runs the job, for the most consequential case.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn root_user_runs_as_uid_zero() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let id = support::random_test_id();
     let listener = ConnectBack::listen();
     let spec = base_spec(
@@ -1079,7 +1079,7 @@ fn root_user_runs_as_uid_zero() {
 /// stopping anything, or trips `budget::timed_out`'s `debug_assert!` outright in a debug build.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_stop_with_no_budget_runs_bootout_to_completion() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
     let _guard = Guard::install(&mgr, &spec);
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
@@ -1118,7 +1118,7 @@ fn a_stop_with_no_budget_runs_bootout_to_completion() {
 /// variant carries the outcome.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let id = support::random_test_id();
     // Exits immediately, so `restart: always` puts launchd into the respawn loop it throttles.
     let mut spec = base_spec(&id, vec!["/usr/bin/true".to_string()]);
@@ -1149,7 +1149,7 @@ fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout() {
 /// block that asserts state cannot run on a budget that established none.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_start_with_no_budget_is_ok_for_a_restart_always_job() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let id = support::random_test_id();
     let mut spec = sleepy(&id);
     spec.restart = Restart::Always;
@@ -1180,7 +1180,7 @@ fn install_creates_and_owns_cwd_and_logs_parent_for_a_non_root_account() {
         .parse()
         .expect("nobody's gid");
 
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let id = support::random_test_id();
     let cwd = Path::new("/tmp").join(format!("{id}-cwd"));
     let logs = Path::new("/tmp").join(format!("{id}-logs")).join("out.log");
@@ -1250,7 +1250,7 @@ impl Drop for DirGuard {
 /// systemd backend reaches for a non-regular file at a fragment path.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn install_over_a_directory_refuses_instead_of_recursing() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let id = support::random_test_id();
     let path = staging_path(&id);
     std::fs::create_dir_all(&path).expect("seed a directory at the staging path");
@@ -1283,7 +1283,7 @@ fn list_does_not_hang_on_a_fifo_in_the_plist_directory() {
     mkfifo(&path);
     let _cleanup = FileGuard(path);
 
-    let listed = without_blocking("LaunchdManager::list", || LaunchdManager::new().list()).expect("list");
+    let listed = without_blocking("Launchd::list", || Launchd::new().list()).expect("list");
 
     assert!(
         !may_account_for(&listed, &id),
@@ -1331,7 +1331,7 @@ fn without_blocking<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send 
 /// stopped while the command reported success.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn start_is_not_fooled_by_a_stale_job_holding_the_label() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let id = support::random_test_id();
 
     // Ours: `restart: always`, so launchd guarantees it runs once loaded.

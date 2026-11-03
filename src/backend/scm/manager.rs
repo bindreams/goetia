@@ -119,15 +119,15 @@ use crate::manager::budget;
 use crate::manager::{Budget, Installed, State, Status};
 use crate::spec::{DaemonSpec, Id, Kind};
 
-// ScmManager ==========================================================================================================
+// Scm =================================================================================================================
 
 /// The Windows service manager. Holds no state of its own —
 /// every operation opens exactly the SCM/registry handles it needs and
 /// closes them again.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct ScmManager;
+pub struct Scm;
 
-impl ScmManager {
+impl Scm {
     pub fn new() -> Self {
         Self
     }
@@ -199,7 +199,7 @@ impl ScmSnapshot {
     }
 }
 
-impl Backend for ScmManager {
+impl Backend for Scm {
     type Definition = ScmRegistration;
     type Snapshot = ScmSnapshot;
     type InstallScope = ();

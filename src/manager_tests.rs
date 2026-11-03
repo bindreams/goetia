@@ -39,9 +39,9 @@ fn native_returns_the_launchd_backend() {
 #[skuld::test]
 #[cfg(target_os = "windows")]
 fn native_returns_a_working_backend_on_windows() {
-    let mgr = native().expect("Windows has a real `ScmManager` backend");
+    let mgr = native().expect("Windows has a real `Scm` backend");
     // A cheap, unelevated call: proves `native()` actually wired up
-    // `ScmManager` rather than, say, a `Box::new(())`-shaped stub that
+    // `Scm` rather than, say, a `Box::new(())`-shaped stub that
     // happens to satisfy the trait's types but panics the instant anything
     // calls it.
     mgr.list().expect("list needs no elevation and no installed services");

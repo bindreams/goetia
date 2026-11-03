@@ -1,5 +1,5 @@
 //! Elevated integration tests for the effectful launchd backend
-//! ([`goetia::backend::launchd::manager::LaunchdManager`]), plus the shared
+//! ([`goetia::backend::launchd::manager::Launchd`]), plus the shared
 //! conformance suite run against it for real.
 //!
 //! `fn main` is unconditional (never `#![cfg(target_os = "macos")]`'d at the

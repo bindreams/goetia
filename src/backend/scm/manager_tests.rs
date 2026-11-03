@@ -529,7 +529,7 @@ fn a_blob_that_says_always_decodes_and_starts_as_its_kind() {
 /// so the generator's refusal is reachable without one.
 #[skuld::test]
 fn install_and_preview_install_refuse_restart_always() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let spec = daemon_spec(Restart::Always);
 
     for result in [
