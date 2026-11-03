@@ -86,8 +86,8 @@ pub enum Command {
 
 #[derive(Subcommand, Debug)]
 pub enum DaemonCommand {
-    /// Register the services in goetia.yaml. Neither starts nor enables
-    /// them at boot; see --start/--enable.
+    /// Register the service in goetia.yaml. Neither starts nor enables
+    /// it at boot; see --start/--enable.
     Install(install::Args),
     /// Stop, remove, and reload — for daemon ids no longer present in any
     /// manifest, so this needs no file.
@@ -139,12 +139,8 @@ pub enum DaemonCommand {
 ///   deliberately keeps calling `Cli::parse()` un-overridden and lets clap
 ///   return `2` on its own; the absence of an override *is* the decision.
 /// - `3` drift: a determinate "installed state differs from the manifest"
-///   answer — `diff` returns it whenever at least one selected daemon would
-///   change and nothing was indeterminate, conflicting or errored
-///   (`cli::diff::run`, the only place this code is returned). Not a
-///   "drift is present" signal on its
-///   own: one `Create` plus one `Conflict` returns `5`, not `3`, since `5`
-///   outranks `3` in the precedence rule below.
+///   answer — `diff` returns it when the daemon would change
+///   (`cli::diff::run`, the only place this code is returned).
 /// - `4` indeterminate: a question Goetia could not answer about an id.
 ///   Two classes, by what was established:
 ///   an id Goetia owns whose *state* it could not determine, or
@@ -206,11 +202,12 @@ pub enum DaemonCommand {
 ///
 /// `list` and `status` compute their code as the precedence-max over every
 /// error kind their `Report` collected, and over its `undetermined`
-/// entries: `1 > 4 > 5 > 3 > 0`. `diff`, `show`, `install` and every id verb
+/// entries: `1 > 4 > 5 > 3 > 0`. `show`, `install` and every id verb
 /// (`support::run_id_verb`) apply the same rule over the classes each
-/// selected daemon contributes, through the same [`report::precedence`]
+/// id or step contributes, through the same [`report::precedence`]
 /// function — no verb re-derives the ordering, not even for the two codes
-/// `show` can produce.
+/// `show` can produce. `diff` answers about one daemon and has nothing to
+/// combine.
 /// That is a rule about which outcome wins when more than one applies at
 /// once, not an ordering of the integers — `5` outranks `3` despite being
 /// the larger number. `2` never enters that ladder: both refusals that

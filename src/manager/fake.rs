@@ -226,6 +226,13 @@ impl Fake {
         );
     }
 
+    /// Test-only seeding: place `spec`'s artifact at `id`, whatever `spec.id` says. This is the
+    /// answer a case-insensitive manager (SCM, launchd on APFS) gives for a request that differs
+    /// from the installed id only in case: the service of `frpc` found at `FRPC`.
+    pub fn seed_installed_as(&self, id: &str, spec: &DaemonSpec) {
+        self.seed_foreign(id, generate(spec));
+    }
+
     /// Test-only seeding: place a Goetia-marked entry at `id` whose blob will
     /// not decode — simulating a newer-schema artifact or one that bit-rotted.
     /// `install_then_hand_edit` cannot produce this state: `extract` only

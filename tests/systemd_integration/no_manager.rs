@@ -260,7 +260,7 @@ fn an_install_where_no_manager_can_be_asked_writes_nothing() {
 
     for way in EVERY_WAY {
         for start in [&[][..], &["--start"], &["--enable"]] {
-            let mut args = vec!["daemon", "install", "--file", manifest, guard.id()];
+            let mut args = vec!["daemon", "install", "--file", manifest];
             args.extend_from_slice(start);
             way.refuses(&args);
             assert!(!unit_path(guard.id()).exists(), "{way:?} {args:?} wrote the unit");
@@ -388,7 +388,7 @@ fn the_verbs_that_never_reach_the_manager_are_untouched() {
     let manifest = manifest.to_str().expect("utf-8 temp path");
     // From the same manifest, so `diff` has nothing to report.
     let online = Command::new(env!("CARGO_BIN_EXE_goetia"))
-        .args(["daemon", "install", "--file", manifest, guard.id()])
+        .args(["daemon", "install", "--file", manifest])
         .output()
         .expect("spawn goetia");
     assert!(online.status.success(), "{}", String::from_utf8_lossy(&online.stderr));
@@ -396,9 +396,9 @@ fn the_verbs_that_never_reach_the_manager_are_untouched() {
 
     for way in EVERY_WAY {
         for args in [
-            &["daemon", "install", "--dry-run", "--file", manifest, guard.id()][..],
-            &["daemon", "diff", "--file", manifest, guard.id()],
-            &["daemon", "show", "--file", manifest, guard.id()],
+            &["daemon", "install", "--dry-run", "--file", manifest][..],
+            &["daemon", "diff", "--file", manifest],
+            &["daemon", "show", "--file", manifest],
         ] {
             let output = way.goetia(args);
             assert_eq!(
@@ -486,19 +486,11 @@ fn every_verb_in_a_real_chroot_is_refused_before_anything_runs() {
     let unit = unit.to_str().expect("utf-8 unit path");
     let copied = format!("chroot units: {}.service \n", guard.id());
 
-    let installs = ["daemon", "install", "--file", "/tmp/goetia.yaml", guard.id()];
+    let installs = ["daemon", "install", "--file", "/tmp/goetia.yaml"];
     for (args, unit, units) in [
         (&installs[..], "-", "chroot units: \n"),
         (
-            &[
-                "daemon",
-                "install",
-                "--file",
-                "/tmp/goetia.yaml",
-                "--enable",
-                "--start",
-                guard.id(),
-            ],
+            &["daemon", "install", "--file", "/tmp/goetia.yaml", "--enable", "--start"],
             "-",
             "chroot units: \n",
         ),

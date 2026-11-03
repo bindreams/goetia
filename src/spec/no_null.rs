@@ -2,9 +2,8 @@
 //! typed parse has already accepted.
 //!
 //! An explicit `null` is an error wherever a manifest value is expected:
-//! the `daemons` mapping and every daemon under it, all nine
-//! `daemons.<id>` fields, the daemon id itself, the keys and the values of
-//! `env`, the elements of `command`, and `user`'s `name` and `id`.
+//! the nine daemon fields, the daemon `id` itself, the keys and the values
+//! of `env`, the elements of `command`, and `user`'s `name` and `id`.
 //! `env: {A: ""}`, `env: {}` and `command: [/bin/frpc, ""]` stay legal —
 //! only `null` is refused, not emptiness — and a *quoted* `"null"` is
 //! ordinary text everywhere.
@@ -67,9 +66,9 @@
 //! is `invalid type: unit value, expected a sequence` — which names the
 //! field and is what `goetia` said before this rule existed. The positions
 //! the typed parse *accepts* are the ones this module answers: every
-//! `Option` field, `env` keys and values, `command` elements, a daemon id,
-//! `user`, `user.name`, and a container written empty rather than `null`
-//! (`daemons:` with no body deserializes to an empty mapping).
+//! `Option` field, `env` keys and values, `command` elements, the daemon
+//! `id`, `user`, `user.name`, and a container written empty rather than
+//! `null` (`env:` with no body deserializes to an empty mapping).
 
 use std::cell::Cell;
 use std::fmt;
@@ -100,10 +99,9 @@ pub(super) const NULL_ACCOUNT_ID: &str = "an explicit `null` is not an account i
 /// just with the generic wording.
 #[derive(Clone, Copy)]
 enum Slot {
+    /// The whole manifest, which is the daemon.
     Document,
-    Daemons,
-    DaemonId,
-    Daemon,
+    Id,
     BackendSpecific,
     Override,
     Field,
@@ -126,12 +124,10 @@ impl Slot {
     fn message(self) -> Option<&'static str> {
         Some(match self {
             // A `null` *document* is not this scan's to diagnose: the typed
-            // parse answers it with `expected a mapping with a \`daemons\`
-            // key`, which is more use than anything about `null` would be.
+            // parse answers it with a type error naming what it wanted,
+            // which is more use than anything about `null` would be.
             Slot::Document => return None,
-            Slot::Daemons => "an explicit `null` is not a set of daemons; write at least one `<id>:` entry under it",
-            Slot::DaemonId => "an explicit `null` is not a daemon id; quote the key to use its literal text",
-            Slot::Daemon => "an explicit `null` is not a daemon; give it at least a `command:`",
+            Slot::Id => "an explicit `null` is not a daemon id; quote the value to use its literal text",
             Slot::BackendSpecific => {
                 "an explicit `null` is not a set of backend overrides; write at least one `<backend>:` entry under it"
             }
@@ -160,13 +156,12 @@ impl Slot {
     /// The slot of the value stored under `key` in this mapping.
     fn value(self, key: &str) -> Slot {
         match (self, key) {
-            (Slot::Document, "daemons") => Slot::Daemons,
-            (Slot::Daemons, _) => Slot::Daemon,
-            (Slot::Daemon, "backend-specific") => Slot::BackendSpecific,
+            (Slot::Document, "id") => Slot::Id,
+            (Slot::Document, "backend-specific") => Slot::BackendSpecific,
             (Slot::BackendSpecific, _) => Slot::Override,
-            (Slot::Daemon | Slot::Override, "env") => Slot::Env,
-            (Slot::Daemon | Slot::Override, "command") => Slot::Command,
-            (Slot::Daemon | Slot::Override, "user") => Slot::User,
+            (Slot::Document | Slot::Override, "env") => Slot::Env,
+            (Slot::Document | Slot::Override, "command") => Slot::Command,
+            (Slot::Document | Slot::Override, "user") => Slot::User,
             (Slot::Env, _) => Slot::EnvValue,
             (Slot::User, "name") => Slot::UserName,
             (Slot::User, "id") => Slot::UserId,
@@ -174,12 +169,11 @@ impl Slot {
         }
     }
 
-    /// The slot of a key of this mapping. Only `daemons` and `env` name
-    /// their keys; everywhere else a key is a field name, and a `null` one
-    /// has no field to unset.
+    /// The slot of a key of this mapping. Only `env` names its keys;
+    /// everywhere else a key is a field name, and a `null` one has no field
+    /// to unset.
     fn key(self) -> Slot {
         match self {
-            Slot::Daemons => Slot::DaemonId,
             Slot::Env => Slot::EnvKey,
             _ => Slot::Key,
         }
@@ -240,7 +234,7 @@ impl<'de> Visitor<'de> for Scan<'_> {
     }
 
     /// An empty document, which `yaml_serde` reports as `Event::Void`.
-    /// The typed parse's `missing field \`daemons\`` says more about it
+    /// The typed parse's `missing field \`id\`` says more about it
     /// than this scan could.
     fn visit_none<E: de::Error>(self) -> Result<(), E> {
         Ok(())

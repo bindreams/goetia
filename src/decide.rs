@@ -7,7 +7,7 @@
 
 use crate::blob::Blob;
 use crate::diff;
-use crate::spec::DaemonSpec;
+use crate::spec::{DaemonSpec, Id};
 
 // Ownership ===========================================================================================================
 
@@ -44,6 +44,10 @@ pub enum Ownership {
     /// `recovery` is the action that unblocks the id, or `None` when
     /// discovery names none — a drop-in that cannot be read.
     OursUnreadable { reason: String, recovery: Option<String> },
+    /// A Goetia-marked service the manager found at this id, whose embedded spec names the
+    /// different daemon `installed`: a manager that matches ids case-insensitively answers a
+    /// request for `FRPC` with `frpc`'s service. Refused unconditionally — see `decide`.
+    OtherDaemon { installed: Id },
     /// Something exists at this id and carries no Goetia marker at all.
     /// Refused unconditionally — see `decide`.
     Foreign,
@@ -134,6 +138,9 @@ pub enum Outcome {
     /// ownership could not be established. `recovery` is
     /// [`Ownership::OursUnreadable`]'s, carried through.
     RefuseUnreadable { reason: String, recovery: Option<String> },
+    /// The service found at the requested id is another daemon's, `installed`. No flag overrides
+    /// this: installing would replace that daemon's service. [`other_daemon_refusal`] says what to do.
+    RefuseOtherDaemon { installed: Id },
 }
 
 // decide ==============================================================================================================
@@ -162,6 +169,16 @@ pub fn unreadable_recovery(id: &str) -> String {
     )
 }
 
+/// Why, and what to do, for [`Outcome::RefuseOtherDaemon`]. Its own function, like
+/// [`foreign_recovery`], so `install` and `diff` give the identical wording after their own
+/// `<id>: refused:` / `<id>: would be refused:` prefix.
+pub fn other_daemon_refusal(installed: &str) -> String {
+    format!(
+        "the service manager finds the installed daemon `{installed}` at this id, and installing \
+         would replace it. Give this daemon a different id, or uninstall `{installed}` first.",
+    )
+}
+
 /// The install policy, in one place.
 ///
 /// - `found` is what discovery saw at the target id; for `Ownership::Ours`
@@ -174,7 +191,7 @@ pub fn unreadable_recovery(id: &str) -> String {
 ///   compared against the embedded blob's `version` to tell a stale
 ///   artifact (regenerate silently) from a hand-edited one (conflict).
 /// - `force` allows overwriting a genuine hand-edit. It never overrides a
-///   `Foreign` or `OursUnreadable` refusal.
+///   `Foreign`, `OtherDaemon` or `OursUnreadable` refusal.
 /// - `external` is what the manager applies to this artifact from outside
 ///   its text — see [`ExternalConfig`]. Any but `Absent` changes one row: a
 ///   stale artifact carrying it is `Conflict`, not a
@@ -199,6 +216,10 @@ pub fn decide(
 
         Ownership::Foreign => Outcome::RefuseForeign {
             recovery: foreign_recovery(new_spec.id.as_str()),
+        },
+
+        Ownership::OtherDaemon { installed } => Outcome::RefuseOtherDaemon {
+            installed: installed.clone(),
         },
 
         Ownership::OursUnreadable { reason, recovery } => Outcome::RefuseUnreadable {

@@ -97,7 +97,7 @@
 //!   value.
 //! - A duplicate `NAME` is an error naming the line it first appeared
 //!   on. This diverges from compose's last-wins: goetia already rejects
-//!   a duplicate daemon id rather than silently keeping the second, and
+//!   a duplicate `env` key rather than silently keeping the second, and
 //!   a repeated key in a hand-edited `.env` is a mistake, not an
 //!   override.
 //! - A missing file is not an error and yields `Vars::empty()`. Only

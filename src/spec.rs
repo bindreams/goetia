@@ -22,7 +22,7 @@ mod vars;
 
 pub use backend::BackendKind;
 pub use overrides::{BackendOverrides, RawOverride, Supplied};
-pub use raw::{RawManifest, RawSpec};
+pub use raw::RawSpec;
 pub use resolve::{load, resolve};
 pub use user::{AccountId, RawUser, User};
 
@@ -60,9 +60,9 @@ use crate::error::Error;
 /// letters, digits, `.`, `_`, `-`, 1 to 80 characters. Loose enough for a
 /// docker-compose-style key, tight enough that the id is always usable
 /// unescaped as a systemd unit name, a launchd label component, and an SCM
-/// service name — and case-insensitively distinct, since a launchd label
-/// and an SCM service name both live on case-insensitive filesystems/stores
-/// on some hosts.
+/// service name. Ids differing only in case are both valid; where the manager
+/// does not tell them apart, `install` refuses the second (see
+/// [`crate::decide::Outcome::RefuseOtherDaemon`]).
 fn is_valid_id(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 80
@@ -172,11 +172,11 @@ pub enum Kind {
 /// transformed (e.g. a sub-second `restart-delay` rounded up for launchd).
 /// Every CLI command that parses a manifest prints these to stderr.
 ///
-/// `id` is `None` for a manifest-level advisory that belongs to no single
-/// daemon — e.g. a drive-relative `-f` argument, resolved once by
-/// `resolve::absolutize` before the daemon loop even starts. Attributing it
-/// to an arbitrary daemon would be a lie, and repeating it under every
-/// daemon would say the same manifest-level thing N times.
+/// `id` is `None` for a manifest-level advisory that belongs to the file
+/// rather than the daemon — e.g. a drive-relative `-f` argument, resolved
+/// by `resolve::absolutize` before any check of the daemon runs. Prefixing
+/// it with the daemon's id would say the daemon is what the advisory is
+/// about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Warning {
     pub id: Option<Id>,

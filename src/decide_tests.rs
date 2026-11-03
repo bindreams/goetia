@@ -253,6 +253,36 @@ fn foreign_refuses_even_with_force() {
 }
 
 #[skuld::test]
+fn other_daemon_refuses_even_with_force() {
+    let spec = DaemonSpec {
+        id: Id::try_from("FRPC").unwrap(),
+        ..spec_fixture()
+    };
+    let installed = Id::try_from("frpc").unwrap();
+
+    for force in [false, true] {
+        let outcome = decide(
+            &Ownership::OtherDaemon {
+                installed: installed.clone(),
+            },
+            "GENERATED",
+            &spec,
+            RUNNING_VERSION,
+            force,
+            &ExternalConfig::Absent,
+        );
+
+        assert_eq!(
+            outcome,
+            Outcome::RefuseOtherDaemon {
+                installed: installed.clone()
+            },
+            "force={force}"
+        );
+    }
+}
+
+#[skuld::test]
 fn unreadable_refuses_with_recovery() {
     let spec = spec_fixture();
 
