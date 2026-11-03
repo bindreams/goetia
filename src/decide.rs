@@ -144,9 +144,8 @@ pub enum Outcome {
     /// under `--force` is how a typo'd id destroys a hand-configured
     /// production service.
     RefuseForeign { recovery: String },
-    /// A Goetia-marked artifact whose blob will not decode, or whose
-    /// ownership could not be established. `recovery` is
-    /// [`Ownership::OursUnusable`]'s, carried through.
+    /// A Goetia-marked artifact goetia cannot compare; the causes are on
+    /// [`Ownership::OursUnusable`], whose `recovery` is carried through.
     RefuseUnusable { reason: String, recovery: Option<String> },
     /// The service found at the requested id is another daemon's, `installed`. No flag overrides
     /// this: installing would replace that daemon's service. [`other_daemon_refusal`] says what to do.

@@ -26,7 +26,7 @@ pub(crate) trait InstalledService {
 
     /// The metadata as `read` decoded it, or why it will not decode. Kept as the failure: the
     /// marker alone is proof of ownership, so `uninstall` and the other verbs must still work on a
-    /// service whose blob is unreadable.
+    /// service whose blob will not decode.
     fn blob(&self) -> std::result::Result<&Blob, &Error>;
 }
 
