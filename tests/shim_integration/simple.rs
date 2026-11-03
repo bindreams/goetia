@@ -56,7 +56,7 @@ fn hand_edit(id: &str) {
 /// `list()` — including the ones `tests/scm_integration/managed.rs` asserts are clean.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn simple_passes_conformance() {
-    let mgr = goetia::backend::scm::manager::ScmManager::new();
+    let mgr = goetia::backend::scm::manager::Scm::new();
 
     seed_foreign(conformance::FOREIGN_ID);
     let _foreign_guard = ServiceGuard::new(conformance::FOREIGN_ID);
@@ -79,7 +79,7 @@ fn simple_passes_conformance() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn install_then_list_round_trips_without_the_source_file() {
-    let mgr = goetia::backend::scm::manager::ScmManager::new();
+    let mgr = goetia::backend::scm::manager::Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let spec = mk_spec(&id, fixture_command("report", &["1"]));
@@ -104,7 +104,7 @@ fn install_then_list_round_trips_without_the_source_file() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn start_stop_status_reflect_reality() {
-    let mgr = goetia::backend::scm::manager::ScmManager::new();
+    let mgr = goetia::backend::scm::manager::Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let started = support::ConnectBack::listen();
@@ -134,7 +134,7 @@ fn start_stop_status_reflect_reality() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn uninstall_leaves_nothing() {
-    let mgr = goetia::backend::scm::manager::ScmManager::new();
+    let mgr = goetia::backend::scm::manager::Scm::new();
     let id = support::random_test_id();
     let spec = mk_spec(&id, fixture_command("report", &["1"]));
     mgr.install(&spec, false).expect("install");
@@ -169,7 +169,7 @@ fn list_ignores_foreign_services() {
     let guard = ServiceGuard::new(&id);
     seed_foreign(guard.id());
 
-    let mgr = goetia::backend::scm::manager::ScmManager::new();
+    let mgr = goetia::backend::scm::manager::Scm::new();
     let installed = mgr.list().expect("list");
     assert!(
         installed.iter().all(|entry| match entry {
@@ -194,7 +194,7 @@ fn list_ignores_foreign_services() {
 /// Fails if the shim stops reporting `STOP_PENDING`, or reports it with controls still accepted.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn the_shim_reports_stop_pending_then_stopped() {
-    let mgr = goetia::backend::scm::manager::ScmManager::new();
+    let mgr = goetia::backend::scm::manager::Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let started = support::ConnectBack::listen();

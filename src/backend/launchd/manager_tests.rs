@@ -784,7 +784,7 @@ fn a_plist_in_both_directories_is_reported_not_classified() {
 fn a_write_over_a_plist_that_vanished_before_any_call_is_raced() {
     use crate::backend::Backend as _;
 
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let spec = spec_named("goetia-raced-before-any-call");
     let desired = mgr.render(&spec).expect("render");
     let on_disk = desired.replace(&format!("Version: {}", crate::version()), "Version: 0.0.1");
@@ -852,7 +852,7 @@ fn a_verb_one_reaper_short_sends_nothing() {
     use crate::backend::Backend;
 
     let _refused = Scripted::new(&[]);
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let id = never_installed();
     let spec = DaemonSpec {
         id: id.clone(),
@@ -898,7 +898,7 @@ fn a_verb_one_reaper_short_sends_nothing() {
 fn a_verb_with_its_reapers_goes_on_to_its_first_call() {
     use crate::backend::Backend;
 
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let id = never_installed();
     let _refused = Scripted::new(&[]);
     let _five = bounded::test_hook::threads(START_REQUESTS);
@@ -930,7 +930,7 @@ fn a_verb_one_temp_file_short_sends_nothing() {
     use crate::backend::Backend;
 
     let _refused = Scripted::new(&[]);
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let id = never_installed();
     let spec = DaemonSpec {
         id: id.clone(),
@@ -987,7 +987,7 @@ fn a_verb_one_temp_file_short_sends_nothing() {
 fn prepared_steps_need_nothing_made_later() {
     use crate::backend::Backend;
 
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let id = never_installed();
     let _refused = Scripted::new(&[]);
     for (steps, reapers, calls) in [
@@ -1086,7 +1086,7 @@ fn a_live_status_whose_launchctl_cannot_be_run_is_an_error() {
         ..marked_plist(&never_installed())
     };
 
-    let result = LaunchdManager::new().live_status(&snapshot);
+    let result = Launchd::new().live_status(&snapshot);
 
     assert!(matches!(result, Err(Error::CommandFailed { .. })), "{result:?}");
 }
@@ -1217,7 +1217,7 @@ impl Drop for Plists {
 /// among them — are driven deterministically, and no job is ever loaded.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn every_launchd_verb_path_stays_inside_its_reservation() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let name = format!("goetia-reservation-{:x}", std::process::id());
     let _plists = Plists(name.clone());
     let id = Id::try_from(name.as_str()).unwrap();
@@ -1363,7 +1363,7 @@ fn kill_refused_for_any_other_reason_is_a_plain_failure() {
 /// `print` only: a `bootout` of the loaded job would be an unscripted call and fail the test.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_changed_spec_is_refused_while_the_job_is_loaded() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let name = format!("goetia-refuse-{:x}", std::process::id());
     let _plists = Plists(name.clone());
     let mut spec = DaemonSpec {
@@ -1429,7 +1429,7 @@ fn spec_named(name: &str) -> DaemonSpec {
 /// or a `bootstrap` would be an unscripted call, and `assert_driven` would see it.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_print_that_fails_otherwise_is_an_error_not_a_job_that_is_not_loaded() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let name = format!("goetia-unreadable-{:x}", std::process::id());
     let _plists = Plists(name.clone());
     let mut spec = spec_named(&name);
@@ -1486,7 +1486,7 @@ fn a_print_that_fails_otherwise_is_an_error_not_a_job_that_is_not_loaded() {
 }
 
 /// After an exit-`4` install a rerun is refused, not read as `UpToDate`.
-fn assert_restored_and_rerun_refused(mgr: &LaunchdManager, spec: &DaemonSpec, name: &str, installed: &str) {
+fn assert_restored_and_rerun_refused(mgr: &Launchd, spec: &DaemonSpec, name: &str, installed: &str) {
     assert_eq!(
         std::fs::read_to_string(staging_path(name)).unwrap(),
         installed,
@@ -1506,7 +1506,7 @@ fn assert_restored_and_rerun_refused(mgr: &LaunchdManager, spec: &DaemonSpec, na
 /// ([`Error::LoadedJobInDoubt`], exit `4`), and the previous plist is put back.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_job_loaded_between_the_check_and_the_write_leaves_the_install_in_doubt() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let name = format!("goetia-indoubt-{:x}", std::process::id());
     let _plists = Plists(name.clone());
     let mut spec = spec_named(&name);
@@ -1539,7 +1539,7 @@ fn a_job_loaded_between_the_check_and_the_write_leaves_the_install_in_doubt() {
 /// plist is put back.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn an_unreadable_recheck_after_the_write_leaves_the_install_in_doubt() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let name = format!("goetia-recheck-{:x}", std::process::id());
     let _plists = Plists(name.clone());
     let mut spec = spec_named(&name);
@@ -1573,7 +1573,7 @@ fn an_unreadable_recheck_after_the_write_leaves_the_install_in_doubt() {
 /// `launchctl` call, and the loaded job is as the new plist would have it.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_spec_change_the_plist_does_not_render_is_written_over_a_loaded_job() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let name = format!("goetia-samerender-{:x}", std::process::id());
     let _plists = Plists(name.clone());
     let mut spec = spec_named(&name);
@@ -1599,7 +1599,7 @@ fn a_spec_change_the_plist_does_not_render_is_written_over_a_loaded_job() {
 /// Installs a spec, then a changed one whose read after the write first runs `during` (as a shell
 /// snippet, standing for something else on the host) and then answers "loaded". Returns that install's
 /// error and the text of the changed plist it wrote.
-fn install_loaded_after_write(mgr: &LaunchdManager, name: &str, during: &str) -> (Error, String) {
+fn install_loaded_after_write(mgr: &Launchd, name: &str, during: &str) -> (Error, String) {
     let mut spec = spec_named(name);
     let script = Scripted::new(&CREATED);
     assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
@@ -1634,7 +1634,7 @@ fn restore_failure_of(e: &Error) -> &str {
 /// owns the path, and a put-back over it would destroy that write.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_put_back_does_not_overwrite_a_plist_that_is_no_longer_ours() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let name = format!("goetia-putback-{:x}", std::process::id());
     let _plists = Plists(name.clone());
     let target = staging_path(&name);
@@ -1651,7 +1651,7 @@ fn a_put_back_does_not_overwrite_a_plist_that_is_no_longer_ours() {
 /// plist back to staging would leave one in both directories, which `locate` refuses for every verb.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_put_back_does_not_recreate_a_plist_that_was_enabled_meanwhile() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let name = format!("goetia-putback-enabled-{:x}", std::process::id());
     let _plists = Plists(name.clone());
 
@@ -1671,7 +1671,7 @@ fn a_put_back_does_not_recreate_a_plist_that_was_enabled_meanwhile() {
 /// resurrect a daemon that was just uninstalled.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_put_back_does_not_resurrect_a_plist_that_was_uninstalled_meanwhile() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let name = format!("goetia-putback-removed-{:x}", std::process::id());
     let _plists = Plists(name.clone());
 
@@ -1686,7 +1686,7 @@ fn a_put_back_does_not_resurrect_a_plist_that_was_uninstalled_meanwhile() {
 /// refreshes the metadata, without asking launchd anything.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_stale_plist_is_refused_over_a_loaded_job_only_when_its_rendering_differs() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let name = format!("goetia-stale-{:x}", std::process::id());
     let _plists = Plists(name.clone());
     let spec = spec_named(&name);
@@ -1736,7 +1736,7 @@ fn a_stale_plist_is_refused_over_a_loaded_job_only_when_its_rendering_differs() 
 /// the predecessor running.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_create_that_cannot_stage_its_plist_boots_nothing_out() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let name = format!("goetia-unstaged-{:x}", std::process::id());
     let _plists = Plists(name.clone());
     let dir = tempfile::tempdir().unwrap();
@@ -1757,7 +1757,7 @@ fn a_create_that_cannot_stage_its_plist_boots_nothing_out() {
 /// removed, and the rerun is a `Create` again, not `UpToDate`. Reading the job back fails the same way.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_job_loaded_after_a_create_leaves_the_install_in_doubt_with_no_plist() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let name = format!("goetia-create-indoubt-{:x}", std::process::id());
     let _plists = Plists(name.clone());
     let spec = spec_named(&name);
@@ -1813,7 +1813,7 @@ fn a_job_loaded_after_a_create_leaves_the_install_in_doubt_with_no_plist() {
 /// booted out and what is at the path (exit `4`), and leaves what is there.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_plist_taken_after_the_bootout_is_reported_without_further_launchctl_calls() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let name = format!("goetia-taken-{:x}", std::process::id());
     let _plists = Plists(name.clone());
     let spec = spec_named(&name);
@@ -1836,7 +1836,7 @@ fn a_plist_taken_after_the_bootout_is_reported_without_further_launchctl_calls()
 /// run it again, and leaves what is at the path.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_plist_taken_after_a_read_fails_the_install_without_further_launchctl_calls() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let name = format!("goetia-taken-early-{:x}", std::process::id());
     let _plists = Plists(name.clone());
     let spec = spec_named(&name);
@@ -1858,7 +1858,7 @@ fn a_plist_taken_after_a_read_fails_the_install_without_further_launchctl_calls(
 /// verb reserved. It fails (exit `1`) and writes nothing.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_plist_removed_after_a_read_fails_the_install_without_further_launchctl_calls() {
-    let mgr = LaunchdManager::new();
+    let mgr = Launchd::new();
     let name = format!("goetia-vanished-{:x}", std::process::id());
     let _plists = Plists(name.clone());
     let mut spec = spec_named(&name);
@@ -1898,7 +1898,7 @@ fn dry_run_and_diff_ask_launchd_nothing_and_install_start_is_refused_before_it_s
         )
         .unwrap();
     };
-    let get_manager = || -> Result<Box<dyn ServiceManager>> { Ok(Box::new(LaunchdManager::new())) };
+    let get_manager = || -> Result<Box<dyn ServiceManager>> { Ok(Box::new(Launchd::new())) };
     let run_install = |start: bool, dry_run: bool| {
         let args = install::Args {
             file: dir.path().to_path_buf(),

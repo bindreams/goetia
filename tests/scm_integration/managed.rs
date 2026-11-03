@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::process::Command;
 use std::time::Duration;
 
-use goetia::backend::scm::manager::ScmManager;
+use goetia::backend::scm::manager::Scm;
 use goetia::decide::Outcome;
 use goetia::manager::conformance;
 use goetia::manager::{Budget, Installed, ServiceManager as _, State};
@@ -42,7 +42,7 @@ fn id_of(s: &str) -> Id {
 }
 
 /// A fresh, installed `type: managed` service at `id`, with no ports wired up.
-fn install_plain(mgr: &ScmManager, id: &str) -> DaemonSpec {
+fn install_plain(mgr: &Scm, id: &str) -> DaemonSpec {
     let spec = mk_spec(id, fixture_command(id, 1, 1, "plain"), BTreeMap::new());
     mgr.install(&spec, false).expect("install");
     spec
@@ -82,7 +82,7 @@ fn scm_passes_conformance() {
     seed_foreign(conformance::FOREIGN_ID);
     let _foreign_guard = ServiceGuard::new(conformance::FOREIGN_ID);
 
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     mgr.install(&conformance_mk(conformance::HAND_EDITED_ID), false)
         .expect("seed install for the hand-edit scenario");
     hand_edit(conformance::HAND_EDITED_ID);
@@ -103,7 +103,7 @@ fn scm_passes_conformance() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn install_then_list_round_trips_without_the_source_file() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
 
@@ -135,7 +135,7 @@ fn install_then_list_round_trips_without_the_source_file() {
 /// installed as `id`. Neither `install` (forced or not) nor `preview_install` may write over it.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_differently_cased_id_is_refused_and_leaves_the_service_unchanged() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let upper = id.to_uppercase();
     let _guard = ServiceGuard::new(&id);
@@ -175,7 +175,7 @@ fn a_differently_cased_id_is_refused_and_leaves_the_service_unchanged() {
 /// already demand-start, so a service reset to the default would still read as disabled.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn an_update_keeps_the_start_type_enable_set() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let command = fixture_command(&id, 1, 1, "plain");
@@ -200,7 +200,7 @@ fn an_update_keeps_the_start_type_enable_set() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn sc_config_binpath_change_is_detected_as_conflict() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let spec = mk_spec(&id, fixture_command(&id, 1, 1, "plain"), BTreeMap::new());
@@ -225,7 +225,7 @@ fn sc_config_binpath_change_is_detected_as_conflict() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn start_stop_status_reflect_reality() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let started = ConnectBack::listen();
@@ -269,7 +269,7 @@ fn reporting(id: &str, restart: Restart, started: &ConnectBack, stopped: &Connec
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_killed_on_failure_daemon_comes_back_with_a_new_pid() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let (started, stopped) = (ConnectBack::listen(), ConnectBack::listen());
@@ -281,7 +281,7 @@ fn a_killed_on_failure_daemon_comes_back_with_a_new_pid() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_killed_never_restart_daemon_stays_down() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let (started, stopped) = (ConnectBack::listen(), ConnectBack::listen());
@@ -306,7 +306,7 @@ fn a_killed_never_restart_daemon_stays_down() {
 /// instead; this is the contract it hides.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn kill_returns_once_scm_has_recorded_the_exit() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let (started, stopped) = (ConnectBack::listen(), ConnectBack::listen());
@@ -327,14 +327,13 @@ fn kill_returns_once_scm_has_recorded_the_exit() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn killing_a_stopped_service_is_not_running() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let (started, stopped) = (ConnectBack::listen(), ConnectBack::listen());
     let spec = reporting(&id, Restart::Never, &started, &stopped);
     mgr.install(&spec, false).expect("install");
-    let get_manager =
-        || -> goetia::Result<Box<dyn goetia::manager::ServiceManager>> { Ok(Box::new(ScmManager::new())) };
+    let get_manager = || -> goetia::Result<Box<dyn goetia::manager::ServiceManager>> { Ok(Box::new(Scm::new())) };
 
     support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.id);
 
@@ -347,7 +346,7 @@ fn killing_a_stopped_service_is_not_running() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn uninstall_leaves_nothing() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let spec = mk_spec(&id, fixture_command(&id, 1, 1, "plain"), BTreeMap::new());
     mgr.install(&spec, false).expect("install");
@@ -383,7 +382,7 @@ fn list_ignores_foreign_services() {
     let guard = ServiceGuard::new(&id);
     seed_foreign(guard.id());
 
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let installed = mgr.list().expect("list");
     assert!(
         installed.iter().all(|entry| match entry {
@@ -405,7 +404,7 @@ fn list_ignores_foreign_services() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn uninstall_then_immediate_reinstall_succeeds() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let started = ConnectBack::listen();
@@ -434,7 +433,7 @@ fn uninstall_then_immediate_reinstall_succeeds() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn uninstall_errors_when_service_will_not_stop() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let started = ConnectBack::listen();
@@ -493,7 +492,7 @@ fn uninstall_errors_when_service_will_not_stop() {
 /// STOP" error at once. The call returns or the CI watchdog ends the job; a wait would hang.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn stop_of_a_service_that_accepts_no_stop_says_so_without_waiting() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let started = ConnectBack::listen();
@@ -525,7 +524,7 @@ fn stop_of_a_service_that_accepts_no_stop_says_so_without_waiting() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn interrupted_install_is_recoverable() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let spec = mk_spec(&id, fixture_command(&id, 1, 1, "plain"), BTreeMap::new());
@@ -569,7 +568,7 @@ fn managed_kind_environment_availability() {
     const VAR: &str = "GOETIA_SCM_ENV_PROBE";
     const VALUE: &str = "goetia-managed-env-probe-value";
 
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let started = ConnectBack::listen();
@@ -619,7 +618,7 @@ fn environment_of(id: &str) -> Option<Vec<String>> {
 
 /// A drifted registration previews as a `Conflict`, `install --force` restores it, and the next
 /// preview is `UpToDate`. Returns the conflict's diff.
-fn assert_conflict_cleared_by_force(mgr: &ScmManager, spec: &DaemonSpec) -> String {
+fn assert_conflict_cleared_by_force(mgr: &Scm, spec: &DaemonSpec) -> String {
     let outcome = mgr.preview_install(spec).expect("preview_install");
     let Outcome::Conflict { artifact_diff, .. } = outcome else {
         panic!("expected Conflict for a hand-edited registration, got {outcome:?}");
@@ -635,7 +634,7 @@ fn assert_conflict_cleared_by_force(mgr: &ScmManager, spec: &DaemonSpec) -> Stri
 const INSTALLED_ENVIRONMENT: &str = "GOETIA_TEST_KEY=value";
 
 /// An installed `type: managed` service whose spec sets one environment variable.
-fn install_with_environment(mgr: &ScmManager, id: &str) -> DaemonSpec {
+fn install_with_environment(mgr: &Scm, id: &str) -> DaemonSpec {
     let env = BTreeMap::from([("GOETIA_TEST_KEY".to_string(), "value".to_string())]);
     let spec = mk_spec(id, fixture_command(id, 1, 1, "plain"), env);
     mgr.install(&spec, false).expect("install");
@@ -644,7 +643,7 @@ fn install_with_environment(mgr: &ScmManager, id: &str) -> DaemonSpec {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_hand_edited_environment_is_a_conflict() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let spec = install_with_environment(&mgr, &id);
@@ -660,7 +659,7 @@ fn a_hand_edited_environment_is_a_conflict() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_deleted_environment_is_a_conflict() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let spec = install_with_environment(&mgr, &id);
@@ -676,7 +675,7 @@ fn a_deleted_environment_is_a_conflict() {
 /// Failure actions are compared too, and `sc.exe` is how they are edited by hand.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn reset_failure_actions_are_a_conflict() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let spec = common::mk_spec_full(
@@ -699,7 +698,7 @@ fn reset_failure_actions_are_a_conflict() {
 /// A wrong-typed `Environment` is a hand edit too: a `Conflict` that `--force` clears, not an error.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_wrong_typed_environment_is_a_conflict() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let spec = install_with_environment(&mgr, &id);
@@ -718,7 +717,7 @@ fn a_wrong_typed_environment_is_a_conflict() {
 fn an_environment_of_an_unknown_registry_type_is_a_conflict() {
     const UNKNOWN_TYPE: u32 = 12;
 
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let spec = install_with_environment(&mgr, &id);
@@ -751,7 +750,7 @@ fn an_environment_of_an_unknown_registry_type_is_a_conflict() {
 /// but never started, so no shim binary is needed.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn install_twice_is_up_to_date_for_both_kinds() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     for kind in [Kind::Managed, Kind::Simple] {
         let id = support::random_test_id();
         let _guard = ServiceGuard::new(&id);
@@ -838,7 +837,7 @@ fn real_account_gets_service_logon_right() {
     // error 1069 (`ERROR_LOGON_FAILURE`) — `start` uses a real
     // `NotifyServiceStatusChangeW` wait (`scm_wait`), so this either
     // observes RUNNING or fails immediately, never hanging on a poll.
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let target = id_of(&id);
     // `Budget::Unbounded`, not `DEFAULT`: the subject here is the logon right, not latency. A
     // first logon under a freshly created account builds a user profile, which routinely outruns
@@ -868,7 +867,7 @@ fn real_account_gets_service_logon_right() {
 /// all.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_well_known_sid_resolves_without_a_name_lookup() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let spec = common::mk_spec_as(
@@ -891,7 +890,7 @@ fn a_well_known_sid_resolves_without_a_name_lookup() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn local_service_account_installs_and_round_trips() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let spec = common::mk_spec_as(
@@ -919,7 +918,7 @@ fn local_service_account_installs_and_round_trips() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_local_service_daemon_actually_runs() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     // Held past the `install`/`start`/`stop` calls below and dropped (which
@@ -952,7 +951,7 @@ fn a_local_service_daemon_actually_runs() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn local_system_by_name_installs_like_root() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let by_name = common::mk_spec_as(
@@ -1014,7 +1013,7 @@ fn a_builtin_account_is_never_given_a_stale_password() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let target = id_of(&id);
     // Unbounded for the reason `real_account_gets_service_logon_right` gives: a timeout here would
     // blame a stale password for what was only a slow start.
@@ -1068,7 +1067,7 @@ fn a_failed_precondition_creates_no_service() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_failed_precondition_leaves_an_installed_service_unchanged() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let spec = install_plain(&mgr, &id);
@@ -1092,7 +1091,7 @@ fn a_failed_precondition_leaves_an_installed_service_unchanged() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn restart_on_failure_round_trips_failure_actions() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let spec = common::mk_spec_full(
@@ -1165,7 +1164,7 @@ fn deleted_account_makes_the_service_oursunreadable() {
     // delete).
     drop(user_guard);
 
-    let installed = ScmManager::new().list().expect("list after the account is gone");
+    let installed = Scm::new().list().expect("list after the account is gone");
     let entry = installed
         .into_iter()
         .find(|entry| match entry {
@@ -1188,7 +1187,7 @@ fn deleted_account_makes_the_service_oursunreadable() {
 /// unreadable, not a silent rewrite.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn install_refuses_an_always_blob_as_unreadable() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let spec = install_plain(&mgr, &id);
@@ -1229,7 +1228,7 @@ fn install_refuses_an_always_blob_as_unreadable() {
 /// emitted unconditionally); what this uniquely pins is the claim about the runner.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn an_elevated_list_leaves_nothing_undetermined() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     install_plain(&mgr, guard.id());
@@ -1261,7 +1260,7 @@ fn an_elevated_list_leaves_nothing_undetermined() {
 /// service.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn status_of_a_service_whose_parameters_deny_reading_is_undetermined() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let spec = install_plain(&mgr, guard.id());
@@ -1305,7 +1304,7 @@ fn status_of_a_service_whose_parameters_deny_reading_is_undetermined() {
 /// denial is the only unreadable `Parameters` on the host, so the aggregate takes its named form.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_reports_a_denied_parameters_read_with_the_cause_it_established() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     install_plain(&mgr, guard.id());
@@ -1348,7 +1347,7 @@ fn list_reports_a_denied_parameters_read_with_the_cause_it_established() {
 /// this path — and therefore `status` and `install` — still claiming ownership it never proved.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn status_of_a_service_whose_object_denies_querying_is_undetermined() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let spec = install_plain(&mgr, guard.id());

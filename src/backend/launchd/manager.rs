@@ -1,4 +1,4 @@
-//! The effectful launchd backend: [`LaunchdManager`].
+//! The effectful launchd backend: [`Launchd`].
 //!
 //! Every verb is described in full in the crate-level design notes on
 //! launchd enablement; the short version is that the plist's *directory* is
@@ -88,15 +88,15 @@ pub const STAGING_DIR: &str = "/Library/Application Support/Goetia/daemons";
 /// whole backend is built around.
 pub const ENABLED_DIR: &str = "/Library/LaunchDaemons";
 
-pub struct LaunchdManager;
+pub struct Launchd;
 
-impl LaunchdManager {
+impl Launchd {
     pub fn new() -> Self {
         Self
     }
 }
 
-impl Default for LaunchdManager {
+impl Default for Launchd {
     fn default() -> Self {
         Self::new()
     }
@@ -1103,7 +1103,7 @@ fn no_reaper(id: &Id, e: io::Error) -> Error {
 
 /// Every temp file a verb's `calls` can need, ready in this thread's pool before it sends anything,
 /// until the returned guard drops: a read between two requests must not fail for want of one either.
-/// Only the shortfall is made — a sequence [`LaunchdManager::prepare`]d may have made them already.
+/// Only the shortfall is made — a sequence [`Launchd::prepare`]d may have made them already.
 fn files(id: &Id, calls: usize) -> Result<bounded::Spares> {
     bounded::top_up(bounded::Needs {
         files: calls * FILES_PER_CALL,
@@ -1193,7 +1193,7 @@ pub(crate) struct InstallScope {
     _files: bounded::Spares,
 }
 
-impl backend::Backend for LaunchdManager {
+impl backend::Backend for Launchd {
     type Definition = String;
     type Snapshot = Plist;
     type InstallScope = InstallScope;

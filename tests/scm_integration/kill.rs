@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::time::Duration;
 
-use goetia::backend::scm::manager::ScmManager;
+use goetia::backend::scm::manager::Scm;
 use goetia::manager::{Budget, ServiceManager as _, State};
 use goetia::spec::{Restart, User};
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, GetLastError, LUID};
@@ -94,7 +94,7 @@ impl Drop for DebugPrivilegeDisabled {
 
 /// Install `user`'s daemon, start it, kill it with the privilege disabled, and see it end.
 fn kill_with_the_privilege_disabled(user: User) {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     // LocalService cannot execute the repo's own build tree; see `WorldReadableExe`.
