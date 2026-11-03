@@ -402,8 +402,8 @@ pub enum State {
 /// The platform's [`ServiceManager`] implementation.
 ///
 /// Linux returns [`Systemd`](crate::backend::systemd::manager::Systemd),
-/// macOS [`LaunchdManager`](crate::backend::launchd::manager::LaunchdManager),
-/// Windows [`ScmManager`](crate::backend::scm::manager::ScmManager). Any other
+/// macOS [`Launchd`](crate::backend::launchd::manager::Launchd),
+/// Windows [`Scm`](crate::backend::scm::manager::Scm). Any other
 /// target returns [`Error::UnsupportedPlatform`] rather than panicking, so a
 /// CLI user gets a diagnosable message instead of a crash.
 pub fn native() -> Result<Box<dyn ServiceManager>> {
@@ -413,11 +413,11 @@ pub fn native() -> Result<Box<dyn ServiceManager>> {
     }
     #[cfg(target_os = "macos")]
     {
-        Ok(Box::new(crate::backend::launchd::manager::LaunchdManager::new()))
+        Ok(Box::new(crate::backend::launchd::manager::Launchd::new()))
     }
     #[cfg(target_os = "windows")]
     {
-        Ok(Box::new(crate::backend::scm::manager::ScmManager::new()))
+        Ok(Box::new(crate::backend::scm::manager::Scm::new()))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {

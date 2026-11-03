@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use goetia::backend::scm::exit_status::{ERROR_SERVICE_SPECIFIC_ERROR, RecordedExit};
-use goetia::backend::scm::manager::ScmManager;
+use goetia::backend::scm::manager::Scm;
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, Installed, ServiceManager as _, Step};
 use goetia::spec::{DaemonSpec, Restart};
@@ -45,7 +45,7 @@ fn on_failure(id: &str, command: Vec<String>, restart_delay: Option<Duration>) -
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_restart_after_an_update_runs_the_updated_spec() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let old = ConnectBack::listen();
@@ -68,7 +68,7 @@ fn a_restart_after_an_update_runs_the_updated_spec() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_killed_shim_is_restarted_by_scm() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let reported = ConnectBack::listen();
@@ -97,7 +97,7 @@ fn a_killed_shim_is_restarted_by_scm() {
 /// restarted service runs a new shim, so the daemon comes back as a different process.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_killed_on_failure_simple_daemon_comes_back_with_a_new_pid() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let started = ConnectBack::listen();
@@ -113,7 +113,7 @@ fn a_killed_on_failure_simple_daemon_comes_back_with_a_new_pid() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn on_failure_restarts_are_paced_new_shims() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let reported = ConnectBack::listen();
@@ -171,7 +171,7 @@ fn uninstall_leaves_no_restarted_daemon_behind() {
     use windows_service::service::ServiceAccess;
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let reported = ConnectBack::listen();
@@ -210,7 +210,7 @@ fn uninstall_leaves_no_restarted_daemon_behind() {
 /// the `ServiceExitCode` view and both raw codes of `sc query`.
 fn exit_records(child_code: i32) -> (ServiceExitCode, RecordedExit) {
     let reported = ConnectBack::listen();
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
 
@@ -275,7 +275,7 @@ fn a_daemon_exit_code_round_trips_through_the_recorded_pair() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_daemon_that_cannot_be_spawned_fails_start_under_every_policy() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let missing = vec![r"C:\goetia-test-no-such-dir\no-such-binary.exe".to_string()];
     // A restart delay that cannot elapse during the test, so the record read below is the first
     // failure's and not a restarted run's.
@@ -316,7 +316,7 @@ fn a_daemon_that_cannot_be_spawned_fails_start_under_every_policy() {
 /// service whether the wait sees `RUNNING` or the `STOPPED` after it.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn start_confirms_the_launch_of_a_daemon_that_exits_at_once() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     // A delay that cannot elapse during the test, so `on-failure` does not restart the daemon.
     let hour = Some(Duration::from_secs(3600));
 
@@ -343,7 +343,7 @@ fn start_confirms_the_launch_of_a_daemon_that_exits_at_once() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_commanded_stop_reports_win32_zero() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let reported = ConnectBack::listen();
@@ -411,7 +411,7 @@ fn register_as_earlier_version(id: &str, current_version: &str) {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_new_shim_runs_a_service_registered_by_an_earlier_version() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let reported = ConnectBack::listen();
@@ -443,7 +443,7 @@ fn a_new_shim_runs_a_service_registered_by_an_earlier_version() {
 /// as unreadable, since a service that cannot be regenerated cannot be compared or vouched for.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let reported = ConnectBack::listen();
@@ -498,7 +498,7 @@ fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn reinstalling_an_earlier_version_simple_service_applies_the_recovery_actions() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
 

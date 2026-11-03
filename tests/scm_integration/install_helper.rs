@@ -19,7 +19,7 @@
 //! `User::Name` account never fails to re-resolve (no lookup at all), so
 //! only the SID path can actually exercise `Ownership::OursUnreadable`.
 
-use goetia::backend::scm::manager::ScmManager;
+use goetia::backend::scm::manager::Scm;
 use goetia::manager::ServiceManager as _;
 use goetia::spec::{AccountId, User};
 
@@ -45,7 +45,7 @@ pub fn run_if_requested() -> bool {
         user,
     );
 
-    match ScmManager::new().install(&spec, false) {
+    match Scm::new().install(&spec, false) {
         Ok(outcome) => {
             println!("OK {outcome:?}");
             std::process::exit(0);

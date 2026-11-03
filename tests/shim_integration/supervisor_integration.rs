@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use goetia::backend::scm::exit_status::{ERROR_INVALID_DATA, RecordedExit};
-use goetia::backend::scm::manager::ScmManager;
+use goetia::backend::scm::manager::Scm;
 use goetia::manager::{Budget, ServiceManager as _};
 use windows_service::service::{ServiceExitCode, ServiceState};
 
@@ -18,7 +18,7 @@ use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn shim_runs_child_with_cwd_and_env() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let reported = ConnectBack::listen();
@@ -58,7 +58,7 @@ fn shim_runs_child_with_cwd_and_env() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn shim_captures_stdout_to_logs_path() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let reported = ConnectBack::listen();
@@ -92,7 +92,7 @@ fn shim_captures_stdout_to_logs_path() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn stop_kills_the_whole_process_tree() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let child_reported = ConnectBack::listen();
@@ -157,7 +157,7 @@ fn pid_is_alive(pid: &str) -> bool {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn unreadable_blob_logs_to_fallback_path_and_event_log() {
-    let mgr = ScmManager::new();
+    let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
 
