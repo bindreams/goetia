@@ -68,20 +68,20 @@ fn exit_code_is_the_precedence_max_over_error_kinds() {
     // Not a hand-list standing in for completeness: `Kind::code` is an
     // exhaustive match, so a kind added without a code does not compile.
     for (kinds, expected) in [
-        (&[][..], 0),
-        (&[Kind::Unusable][..], 4),
-        (&[Kind::Undetermined][..], 4),
-        (&[Kind::NotInstalled][..], 1),
-        (&[Kind::Foreign][..], 1),
-        (&[Kind::Other][..], 1),
-        (&[Kind::Unavailable][..], 1),
-        (&[Kind::InvalidId][..], 1),
-        (&[Kind::Unsupported][..], 2),
+        (&[][..], ExitCode::Success),
+        (&[Kind::Unusable][..], ExitCode::Indeterminate),
+        (&[Kind::Undetermined][..], ExitCode::Indeterminate),
+        (&[Kind::NotInstalled][..], ExitCode::Error),
+        (&[Kind::Foreign][..], ExitCode::Error),
+        (&[Kind::Other][..], ExitCode::Error),
+        (&[Kind::Unavailable][..], ExitCode::Error),
+        (&[Kind::InvalidId][..], ExitCode::Error),
+        (&[Kind::Unsupported][..], ExitCode::Usage),
         // 1 outranks 4, in either order.
-        (&[Kind::Unusable, Kind::NotInstalled][..], 1),
-        (&[Kind::NotInstalled, Kind::Unusable][..], 1),
+        (&[Kind::Unusable, Kind::NotInstalled][..], ExitCode::Error),
+        (&[Kind::NotInstalled, Kind::Unusable][..], ExitCode::Error),
         // Repeats of the same kind stay that kind's code.
-        (&[Kind::Unusable, Kind::Unusable][..], 4),
+        (&[Kind::Unusable, Kind::Unusable][..], ExitCode::Indeterminate),
     ] {
         assert_eq!(exit_code(&report(kinds)), expected, "for {kinds:?}");
     }
@@ -95,7 +95,7 @@ fn an_undetermined_entry_alone_yields_four() {
     let mut report = report(&[]);
     report.undetermined.push(undetermined_entry());
 
-    assert_eq!(exit_code(&report), 4);
+    assert_eq!(exit_code(&report), ExitCode::Indeterminate);
 }
 
 /// The precedence rule spans both keys: a determinate failure outranks an
@@ -105,7 +105,7 @@ fn an_error_beside_an_undetermined_entry_yields_one() {
     let mut report = report(&[Kind::NotInstalled]);
     report.undetermined.push(undetermined_entry());
 
-    assert_eq!(exit_code(&report), 1);
+    assert_eq!(exit_code(&report), ExitCode::Error);
 }
 
 /// The wire spelling is the stable contract, and `Serialize` goes through
@@ -147,7 +147,7 @@ fn an_undetermined_error_is_not_reported_as_unusable() {
     assert_eq!(report.kind, Kind::Undetermined);
     assert_eq!(
         report.kind.code(),
-        4,
+        ExitCode::Indeterminate,
         "still indeterminate, just not an ownership claim"
     );
     assert!(!report.message.contains("uninstall"), "{}", report.message);
@@ -195,12 +195,16 @@ impl std::io::Write for FailingFlush {
 #[skuld::test]
 fn emit_exits_one_when_only_the_flush_fails() {
     let report = report(&[]);
-    assert_eq!(exit_code(&report), 0, "the report's own code, before the flush fails");
+    assert_eq!(
+        exit_code(&report),
+        ExitCode::Success,
+        "the report's own code, before the flush fails"
+    );
 
     let mut err = Vec::new();
     let code = emit(&report, &mut FailingFlush, &mut err);
 
-    assert_eq!(code, 1);
+    assert_eq!(code, ExitCode::Error);
     let text = String::from_utf8(err).expect("stderr is UTF-8");
     assert!(text.contains("injected flush failure"), "{text}");
 }
@@ -211,18 +215,22 @@ fn emit_exits_one_when_only_the_flush_fails() {
 #[skuld::test]
 fn emit_exits_one_when_the_document_cannot_be_written() {
     let report = report(&[]);
-    assert_eq!(exit_code(&report), 0, "the report's own code, before the write fails");
+    assert_eq!(
+        exit_code(&report),
+        ExitCode::Success,
+        "the report's own code, before the write fails"
+    );
 
     let mut err = Vec::new();
     let code = emit(&report, &mut FailingWriter, &mut err);
 
-    assert_eq!(code, 1);
+    assert_eq!(code, ExitCode::Error);
     let text = String::from_utf8(err).expect("stderr is UTF-8");
     assert!(text.contains("injected write failure"), "{text}");
 }
 
-/// A write failure outranks whatever the report would have said on its own — including `2`, which
-/// [`precedence`] otherwise ranks above everything.
+/// A write failure outranks whatever the report would have said on its own — including `Usage`, which
+/// otherwise ranks above everything.
 #[skuld::test]
 fn a_write_failure_replaces_the_reports_own_code_whatever_it_was() {
     for kinds in [
@@ -232,7 +240,7 @@ fn a_write_failure_replaces_the_reports_own_code_whatever_it_was() {
     ] {
         let report = report(kinds);
         let code = emit(&report, &mut FailingWriter, &mut Vec::new());
-        assert_eq!(code, 1, "{:?}", kinds[0]);
+        assert_eq!(code, ExitCode::Error, "{:?}", kinds[0]);
     }
 }
 
@@ -245,7 +253,7 @@ fn emit_returns_the_reports_own_code_when_the_write_succeeds() {
     let code = emit(&report, &mut out, &mut err);
 
     assert_eq!(code, exit_code(&report));
-    assert_eq!(code, 4);
+    assert_eq!(code, ExitCode::Indeterminate);
     assert!(!out.is_empty(), "the document is on stdout");
     assert!(err.is_empty(), "nothing is said about a write that worked");
 }

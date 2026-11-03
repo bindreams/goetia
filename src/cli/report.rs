@@ -29,6 +29,7 @@
 
 use std::io::Write;
 
+use super::ExitCode;
 use super::support::{InstalledIndex, state_str};
 use crate::error::Error;
 use crate::manager::Status;
@@ -154,18 +155,18 @@ impl Kind {
     /// rejecting `bad`, so `2` would mislead exactly the consumer that
     /// anchor is for. `unsupported` is `2` because there the refusal really
     /// does happen before anything runs.
-    fn code(self) -> i32 {
+    fn code(self) -> ExitCode {
         match self {
             // The question was not answered: the partial-answer case `4`
             // exists for. Whether goetia owns the id (`unusable`) or
             // could not even find that out (`undetermined`) changes the
             // remedy, not the code.
-            Kind::Unusable | Kind::Undetermined => 4,
-            Kind::Unsupported => 2,
+            Kind::Unusable | Kind::Undetermined => ExitCode::Indeterminate,
+            Kind::Unsupported => ExitCode::Usage,
             // A determinate answer that the command failed, or
             // (`unavailable`) no answer at all — nothing partial about
             // either.
-            Kind::NotInstalled | Kind::Foreign | Kind::Other | Kind::Unavailable | Kind::InvalidId => 1,
+            Kind::NotInstalled | Kind::Foreign | Kind::Other | Kind::Unavailable | Kind::InvalidId => ExitCode::Error,
         }
     }
 }
@@ -336,8 +337,8 @@ pub(crate) fn write(report: &Report, out: &mut dyn Write) -> std::io::Result<()>
 }
 
 /// Write `report` as the `--json` document and return the process exit code
-/// for it: [`exit_code`] when the document actually reached `out`, or `1`
-/// — with a diagnostic on `err` — when it did not.
+/// for it: [`exit_code`] when the document actually reached `out`, or
+/// [`ExitCode::Error`] — with a diagnostic on `err` — when it did not.
 ///
 /// The single funnel every `--json` call site goes through, so none of them
 /// can render the document and compute the exit code independently. A
@@ -345,24 +346,24 @@ pub(crate) fn write(report: &Report, out: &mut dyn Write) -> std::io::Result<()>
 /// `errors`" would otherwise meet an empty stdout beside exit `0` on a
 /// broken pipe or a full disk, and `json.loads` would raise on the empty
 /// string — the exact failure `--json` exists to remove. The write failure
-/// bypasses the precedence computation entirely rather than joining it as
+/// bypasses the combination entirely rather than joining it as
 /// another kind: the kinds describe daemons, and there is no document left
 /// to carry one.
-pub(crate) fn emit(report: &Report, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+pub(crate) fn emit(report: &Report, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     match write(report, out) {
         Ok(()) => exit_code(report),
         Err(e) => {
             let _ = writeln!(err, "error: failed to write the --json document to stdout: {e}");
-            1
+            ExitCode::Error
         }
     }
 }
 
-/// The process exit code for `report`: the precedence-max over its
+/// The process exit code for `report`: the greatest [`ExitCode`] over its
 /// `errors[].kind` *and* its `undetermined` entries, never "1 if non-empty".
 /// Called with the same `Report` in both output modes — see the module doc
 /// comment.
-pub(crate) fn exit_code(report: &Report) -> i32 {
+pub(crate) fn exit_code(report: &Report) -> ExitCode {
     report
         .errors
         .iter()
@@ -372,28 +373,8 @@ pub(crate) fn exit_code(report: &Report) -> i32 {
         // cannot exist without a code (see `Kind`'s doc comment), and a
         // second assignment site here would quietly retire the guarantee.
         .chain(report.undetermined.iter().map(|_| Kind::Undetermined.code()))
-        .max_by_key(|code| precedence(*code))
-        .unwrap_or(0)
-}
-
-/// Where an exit code sits in the design spec's `1 > 4 > 5 > 3 > 0`
-/// precedence order. Higher wins. `pub(crate)`, not private: `install`, `show`
-/// and the id verbs combine their own codes by this identical rule, and must
-/// not grow a second copy of it.
-pub(crate) fn precedence(code: i32) -> u8 {
-    match code {
-        1 => 4,
-        4 => 3,
-        5 => 2,
-        3 => 1,
-        0 => 0,
-        // `2` is the only other code [`Kind::code`] produces, and the
-        // refusal that yields it happens before any subcommand runs, so it
-        // is always alone in its report. Ranking it top anyway means a
-        // hypothetical combination could never silently demote a usage
-        // error.
-        _ => u8::MAX,
-    }
+        .max()
+        .unwrap_or(ExitCode::Success)
 }
 
 #[cfg(test)]

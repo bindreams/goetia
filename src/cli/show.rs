@@ -47,7 +47,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Args as ClapArgs;
 
-use super::report;
+use super::ExitCode;
 use super::support::{load_and_warn, partition_installed, print_undetermined_warnings, print_unusable_warnings};
 use crate::error::Result;
 use crate::manager::ServiceManager;
@@ -70,23 +70,23 @@ pub fn run(
     get_manager: &dyn Fn() -> Result<Box<dyn ServiceManager>>,
     out: &mut dyn Write,
     err: &mut dyn Write,
-) -> i32 {
+) -> ExitCode {
     match &args.file {
         Some(file) => show_from_file(file, out, err),
         None => show_from_installed(&args.ids, get_manager, out, err),
     }
 }
 
-fn show_from_file(file: &Path, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+fn show_from_file(file: &Path, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     let spec = match load_and_warn(file, err) {
         Ok(spec) => spec,
         Err(e) => {
             let _ = writeln!(err, "error: {e}");
-            return 1;
+            return ExitCode::Error;
         }
     };
     print_specs(std::iter::once(&spec), out);
-    0
+    ExitCode::Success
 }
 
 fn show_from_installed(
@@ -94,19 +94,19 @@ fn show_from_installed(
     get_manager: &dyn Fn() -> Result<Box<dyn ServiceManager>>,
     out: &mut dyn Write,
     err: &mut dyn Write,
-) -> i32 {
+) -> ExitCode {
     let mgr = match get_manager() {
         Ok(mgr) => mgr,
         Err(e) => {
             let _ = writeln!(err, "error: {e}");
-            return 1;
+            return ExitCode::Error;
         }
     };
     let installed = match mgr.list() {
         Ok(v) => v,
         Err(e) => {
             let _ = writeln!(err, "error: {e}");
-            return 1;
+            return ExitCode::Error;
         }
     };
 
@@ -120,14 +120,9 @@ fn show_from_installed(
         ids.to_vec()
     };
 
-    // Each id contributes at most one exit-code class, combined by
-    // `report::precedence` — the same rule and function `list`/`status`
-    // use, reused rather than re-derived here (see `dispatch`'s
-    // doc comment for the vocabulary and the precedence order itself).
-    // Never `max()` on the codes themselves: `1` must outrank `4` even
-    // though it is the smaller number, so a later unusable id cannot
-    // downgrade an already-seen absent one.
-    let mut codes: Vec<i32> = Vec::new();
+    // Each id contributes at most one code; the greatest wins (see `dispatch`'s doc comment), so a
+    // later unusable id cannot downgrade an already-seen absent one.
+    let mut codes: Vec<ExitCode> = Vec::new();
 
     // With no ids given, neither an unusable nor an undetermined entry
     // enters `wanted` at all (neither has a spec to show), so the loop below
@@ -135,7 +130,7 @@ fn show_from_installed(
     // same way. Without this, `show` prints a complete-looking dump and
     // exits `0` on a host where it could not read half the daemons.
     if ids.is_empty() && (!index.unusable.is_empty() || !index.undetermined.is_empty()) {
-        codes.push(4);
+        codes.push(ExitCode::Indeterminate);
     }
 
     let mut specs = Vec::new();
@@ -144,7 +139,7 @@ fn show_from_installed(
             specs.push(entry.spec.clone());
         } else if index.unusable.contains_key(id) {
             let _ = writeln!(err, "error: daemon `{id}` is installed but unusable");
-            codes.push(4);
+            codes.push(ExitCode::Indeterminate);
         } else if let Some(entry) = index.undetermined_for(id) {
             // Either the listing named this id as one it could not classify,
             // or it carries an aggregate entry that may stand for it. Both
@@ -154,17 +149,14 @@ fn show_from_installed(
                 "error: daemon `{id}`: installation state could not be determined: {}",
                 entry.reason
             );
-            codes.push(4);
+            codes.push(ExitCode::Indeterminate);
         } else {
             let _ = writeln!(err, "error: daemon `{id}` is not installed");
-            codes.push(1);
+            codes.push(ExitCode::Error);
         }
     }
     print_specs(specs.iter(), out);
-    codes
-        .into_iter()
-        .max_by_key(|code| report::precedence(*code))
-        .unwrap_or(0)
+    codes.into_iter().max().unwrap_or(ExitCode::Success)
 }
 
 fn print_specs<'a>(specs: impl Iterator<Item = &'a DaemonSpec>, out: &mut dyn Write) {

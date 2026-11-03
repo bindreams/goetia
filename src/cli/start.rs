@@ -4,6 +4,7 @@ use std::io::Write;
 
 use clap::Args as ClapArgs;
 
+use super::ExitCode;
 use super::support::{IdVerbCall, run_id_verb};
 use super::wait::{self, WaitArgs};
 use crate::error::Result;
@@ -24,7 +25,7 @@ pub fn run(
     is_elevated: &dyn Fn() -> bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
-) -> i32 {
+) -> ExitCode {
     let budget = args.wait.budget();
     run_id_verb(
         IdVerbCall {

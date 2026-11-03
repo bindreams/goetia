@@ -4,6 +4,7 @@
 
 use std::io::Write;
 
+use super::ExitCode;
 use super::report;
 use super::support::{
     InstalledIndex, partition_installed, print_undetermined_warnings, print_unusable_warnings, state_str,
@@ -16,7 +17,7 @@ pub fn run(
     get_manager: &dyn Fn() -> Result<Box<dyn ServiceManager>>,
     out: &mut dyn Write,
     err: &mut dyn Write,
-) -> i32 {
+) -> ExitCode {
     // The `Report` is built in both modes, and both take their exit code
     // from it — see [`report`]'s module doc comment.
     let index = get_manager().and_then(|mgr| mgr.list()).map(partition_installed);

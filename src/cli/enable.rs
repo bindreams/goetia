@@ -4,6 +4,7 @@ use std::io::Write;
 
 use clap::Args as ClapArgs;
 
+use super::ExitCode;
 use super::support::{IdVerbCall, run_id_verb};
 use crate::error::Result;
 use crate::manager::ServiceManager;
@@ -21,7 +22,7 @@ pub fn run(
     is_elevated: &dyn Fn() -> bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
-) -> i32 {
+) -> ExitCode {
     run_id_verb(
         IdVerbCall {
             subcommand: "daemon enable",

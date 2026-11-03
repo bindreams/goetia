@@ -203,7 +203,7 @@ struct FlakyManager {
     undetermined_start_for: Option<String>,
     /// `enable` fails with `Error::Undetermined` — the `--enable` twin of
     /// `undetermined_start_for`, and a third independent decision:
-    /// `install`'s three `failure_code` call sites each classify their own
+    /// `install`'s `ExitCode::of` calls each classify their own
     /// step.
     undetermined_enable_for: Option<String>,
     /// `start` fails with `Error::WaitTimeout`. A fourth independent
@@ -1751,7 +1751,7 @@ fn install_reports_enable_and_start_failures_and_exits_nonzero() {
     assert!(err.contains("start"), "{err}");
 }
 
-/// `install` combines its own steps by `report::precedence`, not by the integers: a hard failure
+/// `install` combines its own steps by the greatest `ExitCode`, not by the integers: a hard failure
 /// (`1`) outranks an unanswered question (`4`) whichever step it comes from.
 #[skuld::test]
 fn install_combines_its_steps_by_precedence() {
@@ -1939,7 +1939,7 @@ fn enable_aggregates_across_multiple_ids() {
 // `diff`'s exit code is not one severity ladder over a single number: `0`
 // success, `1` error, `3` drift, `4` indeterminate, `5` conflict, combined
 // by the `1 > 4 > 5 > 3 > 0` precedence rule (see `dispatch`'s doc comment
-// and `cli::report::precedence`) — never `max()`. The tests below pin each
+// and `cli::ExitCode`) — never `max()` on the integers. The tests below pin each
 // class in isolation and every precedence-relevant pairing.
 
 #[skuld::test]
@@ -3074,7 +3074,7 @@ fn install_exits_four_when_the_start_leg_cannot_be_determined() {
 }
 
 /// `install --start`'s own classifier, and the same rule as the undetermined case above: it
-/// classifies its own step. `failure_code`'s catch-all would report `1` — "the start determinately
+/// classifies its own step. A catch-all classifier would report `1` — "the start determinately
 /// failed" — for a request that was issued, accepted and simply not waited out.
 #[skuld::test]
 fn install_exits_four_when_the_start_leg_timed_out() {
