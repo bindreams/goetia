@@ -307,8 +307,7 @@ pub enum Installed {
     },
     /// Ours by marker, but goetia cannot report on it; `reason` says why. The causes are listed on
     /// [`Ownership::OursUnusable`]. Kept distinct from a silent omission: one such artifact must
-    /// not take down `list`/`status` for every other daemon, which is exactly what dropping this
-    /// entry silently would do.
+    /// not take down `list`/`status` for every other daemon.
     ///
     /// [`Ownership::OursUnusable`]: crate::decide::Ownership::OursUnusable
     OursUnusable { name: String, reason: String },

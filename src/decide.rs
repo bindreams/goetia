@@ -35,10 +35,9 @@ pub enum Ownership {
         regenerated: String,
         on_disk: String,
     },
-    /// A Goetia-marked artifact exists, and goetia cannot use it for what was asked: compare,
-    /// report or render it. Still *ours*: the marker was written by some Goetia. Treating this
-    /// as `Foreign` would mean downgrading Goetia bricks management of a service this very tool
-    /// created, behind a message that misleadingly says "this isn't mine".
+    /// A Goetia-marked artifact exists, and goetia cannot use it: compare, report or render it.
+    /// Still *ours*: the marker was written by some Goetia. Treating it as `Foreign` would deny
+    /// ownership of a service goetia created.
     ///
     /// The causes:
     /// 1. The embedded blob does not decode: a newer schema, or corruption.
@@ -47,7 +46,7 @@ pub enum Ownership {
     /// 3. The read of the installed definition, for comparison, failed (`install` and `diff`
     ///    only).
     /// 4. A marked entry sits at a name that is not a valid daemon id (`list` only).
-    /// 5. The live-state query failed (`list`, and `status` errors).
+    /// 5. The live-state query failed (`list` and `status`).
     /// 6. On launchd, the plist is present in both the staging and the enabled directory, so the
     ///    installation is ambiguous (`list` only).
     ///
