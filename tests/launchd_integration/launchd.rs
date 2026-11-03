@@ -147,7 +147,7 @@ fn write_bytes(path: &Path, bytes: &[u8]) {
 fn may_account_for(listed: &[Installed], id: &str) -> bool {
     listed.iter().any(|entry| match entry {
         Installed::Ours { spec, .. } => spec.id.as_str() == id,
-        Installed::OursUnreadable { name, .. } => name == id,
+        Installed::OursUnusable { name, .. } => name == id,
         Installed::Undetermined { name, .. } => name.is_none() || name.as_deref() == Some(id),
     })
 }
@@ -645,16 +645,16 @@ fn list_ignores_foreign_plists() {
     assert!(
         !listed
             .iter()
-            .any(|e| matches!(e, Installed::OursUnreadable { name, .. } if name == &id)),
-        "a foreign plist carries no marker at all, so it must not even be OursUnreadable"
+            .any(|e| matches!(e, Installed::OursUnusable { name, .. } if name == &id)),
+        "a foreign plist carries no marker at all, so it must not even be OursUnusable"
     );
 }
 
 /// A plist goetia wrote for a user who has since been deleted carries goetia's marker, so it is
-/// goetia's, but its spec can no longer be rendered: it is `OursUnreadable` in `list` and an error in
+/// goetia's, but its spec can no longer be rendered: it is `OursUnusable` in `list` and an error in
 /// `status`.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn list_reports_a_deleted_user_as_ours_unreadable() {
+fn list_reports_a_deleted_user_as_ours_unusable() {
     let mgr = LaunchdManager::new();
     let id = support::random_test_id();
     let user = "goetia-no-such-user-xyz";
@@ -674,7 +674,7 @@ fn list_reports_a_deleted_user_as_ours_unreadable() {
     let reason = listed
         .iter()
         .find_map(|entry| match entry {
-            Installed::OursUnreadable { name, reason } if name == &id => Some(reason),
+            Installed::OursUnusable { name, reason } if name == &id => Some(reason),
             _ => None,
         })
         .unwrap_or_else(|| panic!("a marked plist is ours even when its spec cannot be rendered: {listed:?}"));

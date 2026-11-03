@@ -364,7 +364,7 @@ fn uninstall_leaves_nothing() {
     assert!(
         installed.iter().all(|entry| match entry {
             Installed::Ours { spec: s, .. } => s.id.as_str() != id,
-            Installed::OursUnreadable { name, .. } => name != &id,
+            Installed::OursUnusable { name, .. } => name != &id,
             Installed::Undetermined { name, .. } => match name {
                 Some(n) => n != &id,
                 // An aggregate may stand for this id, so its absence cannot
@@ -388,7 +388,7 @@ fn list_ignores_foreign_services() {
     assert!(
         installed.iter().all(|entry| match entry {
             Installed::Ours { spec, .. } => spec.id.as_str() != id,
-            Installed::OursUnreadable { name, .. } => name != &id,
+            Installed::OursUnusable { name, .. } => name != &id,
             Installed::Undetermined { name, .. } => match name {
                 Some(n) => n != &id,
                 // An aggregate may stand for this id, so its absence cannot
@@ -1125,10 +1125,10 @@ fn restart_on_failure_round_trips_failure_actions() {
     assert_eq!(found.restart_delay, Some(Duration::from_secs(3)));
 }
 
-// Ownership::OursUnreadable: a blob that decodes but whose account can no longer be resolved ==========================
+// Ownership::OursUnusable: a blob that decodes but whose account can no longer be resolved ============================
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn deleted_account_makes_the_service_oursunreadable() {
+fn deleted_account_makes_the_service_oursunusable() {
     let suffix = format!("{:08x}", rand::random::<u32>());
     let account = format!("gt{suffix}");
     // <=14 chars: longer passwords make `net user ... /add` prompt
@@ -1143,7 +1143,7 @@ fn deleted_account_makes_the_service_oursunreadable() {
 
     // `user: {id: <sid>}` — a `User::Name` account never fails to
     // re-resolve (`identity::resolve` does no lookup for it at all), so
-    // only the SID path can reach `Ownership::OursUnreadable` once the
+    // only the SID path can reach `Ownership::OursUnusable` once the
     // account is gone.
     let output = Command::new(support::current_exe_str())
         .arg(INSTALL_AS)
@@ -1170,24 +1170,24 @@ fn deleted_account_makes_the_service_oursunreadable() {
         .into_iter()
         .find(|entry| match entry {
             Installed::Ours { spec, .. } => spec.id.as_str() == id,
-            Installed::OursUnreadable { name, .. } => name == &id,
+            Installed::OursUnusable { name, .. } => name == &id,
             Installed::Undetermined { name, .. } => name.as_deref() == Some(id.as_str()),
         })
-        .unwrap_or_else(|| panic!("{id} disappeared from list entirely instead of becoming OursUnreadable"));
+        .unwrap_or_else(|| panic!("{id} disappeared from list entirely instead of becoming OursUnusable"));
     match entry {
-        Installed::OursUnreadable { reason, .. } => {
+        Installed::OursUnusable { reason, .. } => {
             assert!(!reason.is_empty());
         }
         Installed::Ours { .. } | Installed::Undetermined { .. } => {
-            panic!("expected OursUnreadable once the account backing `user.id` is deleted")
+            panic!("expected OursUnusable once the account backing `user.id` is deleted")
         }
     }
 }
 
 /// The generator refuses to regenerate a blob that says `restart: always`: an install over it is
-/// unreadable, not a silent rewrite.
+/// unusable, not a silent rewrite.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn install_refuses_an_always_blob_as_unreadable() {
+fn install_refuses_an_always_blob_as_unusable() {
     let mgr = ScmManager::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -1205,8 +1205,8 @@ fn install_refuses_an_always_blob_as_unreadable() {
         .expect("write Spec");
 
     let outcome = mgr.preview_install(&spec).expect("preview_install");
-    let Outcome::RefuseUnreadable { reason, recovery } = &outcome else {
-        panic!("expected RefuseUnreadable for an always blob, got {outcome:?}");
+    let Outcome::RefuseUnusable { reason, recovery } = &outcome else {
+        panic!("expected RefuseUnusable for an always blob, got {outcome:?}");
     };
     assert!(reason.contains("restart: always"), "{reason}");
     let recovery = recovery.as_deref().expect("a refused blob carries a recovery");
@@ -1257,7 +1257,7 @@ fn an_elevated_list_leaves_nothing_undetermined() {
 
 /// The `Parameters` boundary. A service whose metadata key denies reading is a service whose marker
 /// was never read, so goetia established neither that it owns the id nor that it does not — and
-/// `Kind::Unreadable` would put goetia's name and `uninstall`'s advice on what may be a stranger's
+/// `Kind::Unusable` would put goetia's name and `uninstall`'s advice on what may be a stranger's
 /// service.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn status_of_a_service_whose_parameters_deny_reading_is_undetermined() {
@@ -1374,7 +1374,7 @@ fn status_of_a_service_whose_object_denies_querying_is_undetermined() {
         id: reported, recovery, ..
     } = &err
     else {
-        panic!("`NotInstalled` would claim absence, `Unreadable` ownership; neither was established: {err:?}");
+        panic!("`NotInstalled` would claim absence, `Unusable` ownership; neither was established: {err:?}");
     };
     assert_eq!(reported, &id);
     assert!(

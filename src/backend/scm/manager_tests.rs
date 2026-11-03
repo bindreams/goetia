@@ -120,7 +120,7 @@ fn is_not_found_matches_only_error_service_does_not_exist() {
 /// function. Split across the cause rather than crammed into one sentence — elevation is advice only
 /// a permission boundary earns, and offering it for a failing disk sends the reader somewhere
 /// useless — so "both causes" means the pair covers both, one each. Never `uninstall`, in any of
-/// them: that is `Outcome::RefuseUnreadable`'s remedy, and it certifies the ownership this read
+/// them: that is `Outcome::RefuseUnusable`'s remedy, and it certifies the ownership this read
 /// never established.
 #[skuld::test]
 fn the_scm_undetermined_recovery_names_both_causes_and_not_uninstall() {

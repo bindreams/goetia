@@ -87,10 +87,10 @@ fn foreign_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
 }
 
 /// An undecodable Goetia-marked entry at `id`: `diff` reports
-/// `Outcome::RefuseUnreadable`.
-fn unreadable_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
+/// `Outcome::RefuseUnusable`.
+fn unusable_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
     let fake = Fake::new();
-    fake.seed_unreadable(id);
+    fake.seed_unusable(id);
     let manifest = write_manifest(dir, &format!("id: {id}\ncommand: [daemon]\n"));
     (fake, manifest)
 }
@@ -167,9 +167,9 @@ fn dispatch_read_only(args: &[&str], fake: &Fake) -> (i32, String, String) {
 /// - `fail_list` is the "the manager answered, but the listing did not"
 ///   path.
 /// - `unqueryable` models a unit that decodes but whose *live state* cannot
-///   be read: `list` reports it as `OursUnreadable` while `status` fails
+///   be read: `list` reports it as `OursUnusable` while `status` fails
 ///   with `CommandFailed`, exactly as a real backend does. That asymmetry is
-///   the one the JSON envelope's `unreadable` kind exists to close.
+///   the one the JSON envelope's `unusable` kind exists to close.
 /// - `fail_preview_for` is the "the manager could not even answer whether
 ///   this daemon would change" path — `Fake` itself can never fail
 ///   `preview_install`, so this is the only way to put a genuine `Err(_)`
@@ -219,9 +219,9 @@ struct FlakyManager {
     /// external configuration of its own (see its `decide` call site), so this is the only
     /// way to reach the branch where `--force` is not the remedy.
     unclearable_conflict: Option<String>,
-    /// Makes `install`/`preview_install` return `RefuseUnreadable` with this reason and no recovery,
+    /// Makes `install`/`preview_install` return `RefuseUnusable` with this reason and no recovery,
     /// the refusal discovery gives when no goetia action unblocks the id. `Fake` always names one.
-    recoveryless_unreadable: Option<String>,
+    recoveryless_unusable: Option<String>,
 }
 
 /// The failure [`FlakyManager`] injects for `fail_list`/`unqueryable`: the
@@ -270,9 +270,9 @@ fn unclearable_conflict(recovery: &str) -> goetia::decide::Outcome {
     }
 }
 
-/// The `RefuseUnreadable` [`FlakyManager::recoveryless_unreadable`] injects.
-fn recoveryless_unreadable(reason: &str) -> goetia::decide::Outcome {
-    goetia::decide::Outcome::RefuseUnreadable {
+/// The `RefuseUnusable` [`FlakyManager::recoveryless_unusable`] injects.
+fn recoveryless_unusable(reason: &str) -> goetia::decide::Outcome {
+    goetia::decide::Outcome::RefuseUnusable {
         reason: reason.to_string(),
         recovery: None,
     }
@@ -300,8 +300,8 @@ impl ServiceManager for FlakyManager {
         if let Some(recovery) = &self.unclearable_conflict {
             return Ok(unclearable_conflict(recovery));
         }
-        if let Some(reason) = &self.recoveryless_unreadable {
-            return Ok(recoveryless_unreadable(reason));
+        if let Some(reason) = &self.recoveryless_unusable {
+            return Ok(recoveryless_unusable(reason));
         }
         self.inner.install(spec, force)
     }
@@ -312,8 +312,8 @@ impl ServiceManager for FlakyManager {
         if let Some(recovery) = &self.unclearable_conflict {
             return Ok(unclearable_conflict(recovery));
         }
-        if let Some(reason) = &self.recoveryless_unreadable {
-            return Ok(recoveryless_unreadable(reason));
+        if let Some(reason) = &self.recoveryless_unusable {
+            return Ok(recoveryless_unusable(reason));
         }
         self.inner.preview_install(spec)
     }
@@ -359,7 +359,7 @@ impl ServiceManager for FlakyManager {
         let mut installed = self.inner.list()?;
         for entry in &mut installed {
             if matches!(entry, Installed::Ours { spec, .. } if Some(spec.id.as_str()) == self.unqueryable.as_deref()) {
-                *entry = Installed::OursUnreadable {
+                *entry = Installed::OursUnusable {
                     name: self.unqueryable.clone().expect("matched against Some just above"),
                     reason: unqueryable_failure().to_string(),
                 };
@@ -368,7 +368,7 @@ impl ServiceManager for FlakyManager {
         if let Some(hidden) = &self.hidden_from_list {
             installed.retain(|entry| match entry {
                 Installed::Ours { spec, .. } => spec.id.as_str() != hidden,
-                Installed::OursUnreadable { name, .. } => name != hidden,
+                Installed::OursUnusable { name, .. } => name != hidden,
                 // A `None` name stands for ids this entry could not
                 // separate, so it says nothing about `hidden` and is kept.
                 // Dropping it here would be the fixture concluding the very
@@ -401,7 +401,7 @@ fn installed_ids(fake: &Fake) -> Vec<String> {
             // dropping this made that flatly false rather than merely
             // unsound: the id demonstrably *is* installed. `Fake` keys the
             // entry by the id it was seeded with, so the name is the answer.
-            Installed::OursUnreadable { name, .. } => name,
+            Installed::OursUnusable { name, .. } => name,
             // Three callers ask this `is_empty()` and read the answer as
             // "nothing is installed". That conclusion is unsound while an
             // undetermined entry is present — it may stand for the very id
@@ -517,11 +517,11 @@ fn install_offers_force_only_for_a_conflict_force_can_resolve() {
 /// A refusal with no recovery to name ends at the reason: no trailing period and no empty sentence,
 /// in `install` and in `diff`'s subjunctive alike.
 #[skuld::test]
-fn an_unreadable_refusal_without_a_recovery_ends_at_the_reason() {
+fn an_unusable_refusal_without_a_recovery_ends_at_the_reason() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
     let mgr = FlakyManager {
-        recoveryless_unreadable: Some("a drop-in could not be read".to_string()),
+        recoveryless_unusable: Some("a drop-in could not be read".to_string()),
         ..Default::default()
     };
 
@@ -730,57 +730,57 @@ fn show_reports_indeterminacy_for_a_daemon_list_cannot_see() {
     assert!(err.contains("ghost"), "{err}");
 }
 
-/// Both of `show`'s "installed but unreadable" paths — naming the id
+/// Both of `show`'s "installed but unusable" paths — naming the id
 /// directly, and asking for everything with none named — must return `4`
 /// (indeterminate: goetia owns this id and could not determine its state),
 /// distinguished from the `1` a genuinely absent id returns rather than
 /// merely being non-zero.
 #[skuld::test]
-fn show_exits_four_for_an_installed_but_unreadable_daemon() {
+fn show_exits_four_for_an_installed_but_unusable_daemon() {
     let fake = Fake::new();
-    fake.seed_unreadable("corrupt");
+    fake.seed_unusable("corrupt");
     fake.install(&mk("readable"), false).unwrap();
 
-    // Per-id form. `err` also carries the unconditional unreadable-entry
-    // warning `print_unreadable_warnings` prints for every form (see
-    // `list_reports_an_unreadable_entry_and_exits_nonzero`), so this checks
+    // Per-id form. `err` also carries the unconditional unusable-entry
+    // warning `print_unusable_warnings` prints for every form (see
+    // `list_reports_an_unusable_entry_and_exits_nonzero`), so this checks
     // for the per-id error line rather than asserting `err` in full.
     let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "show", "corrupt"], &fake);
     assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
     assert_eq!(out, "", "nothing to render for an id with no decodable spec: {out}");
     assert!(
-        err.contains("error: daemon `corrupt` is installed but unreadable"),
+        err.contains("error: daemon `corrupt` is installed but unusable"),
         "{err}"
     );
 
-    // No-ids form: still escalates from `index.unreadable`, and still
+    // No-ids form: still escalates from `index.unusable`, and still
     // renders the one daemon it *can* read.
     let (code_all, out_all, err_all) = dispatch_read_only(&["goetia", "daemon", "show"], &fake);
     assert_eq!(code_all, 4, "stdout:\n{out_all}\nstderr:\n{err_all}");
     assert!(out_all.contains("# readable"), "{out_all}");
     assert!(
         !out_all.contains("corrupt"),
-        "an unreadable entry has no spec to show: {out_all}"
+        "an unusable entry has no spec to show: {out_all}"
     );
     assert!(err_all.contains("corrupt"), "{err_all}");
-    assert!(err_all.contains("unreadable"), "{err_all}");
+    assert!(err_all.contains("unusable"), "{err_all}");
 
     // Distinguished from a genuinely absent id, which stays at `1` — a
     // determinate answer, not an indeterminate one.
     let (code_absent, _, err_absent) = dispatch_read_only(&["goetia", "daemon", "show", "nonexistent"], &fake);
     assert_eq!(code_absent, 1, "{err_absent}");
-    assert_ne!(code, code_absent, "unreadable (4) must not collapse into absent (1)");
+    assert_ne!(code, code_absent, "unusable (4) must not collapse into absent (1)");
 }
 
-/// Splitting the "unreadable" and "not installed" branches onto different
+/// Splitting the "unusable" and "not installed" branches onto different
 /// codes (`4` vs `1`) means a `show` call naming both must pick one
 /// consistently — not whichever happened to run last. `1` outranks `4`
 /// here, matching `cli::dispatch`'s published precedence rule
 /// (`1 > 4 > 5 > 3 > 0`), regardless of which id was named first.
 #[skuld::test]
-fn show_absent_id_outranks_unreadable_id_regardless_of_argument_order() {
+fn show_absent_id_outranks_unusable_id_regardless_of_argument_order() {
     let fake = Fake::new();
-    fake.seed_unreadable("corrupt");
+    fake.seed_unusable("corrupt");
 
     let (code_a, _, _) = dispatch_read_only(&["goetia", "daemon", "show", "corrupt", "nonexistent"], &fake);
     let (code_b, _, _) = dispatch_read_only(&["goetia", "daemon", "show", "nonexistent", "corrupt"], &fake);
@@ -1470,7 +1470,7 @@ fn a_service_installed_with_restart_always_stays_operable() {
     assert!(installed_ids(&fake).is_empty());
 }
 
-// Foreign-id refusal and unreadable-entry regression coverage =========================================================
+// Foreign-id refusal and unusable-entry regression coverage ===========================================================
 
 /// "Goetia never touches a service it did not create" (§5) must hold for
 /// every verb reachable through the CLI, not just `install`.
@@ -1638,12 +1638,12 @@ fn dry_run_reports_a_refused_daemon() {
 }
 
 /// The `list`/`status`/`show`/`diff` partitioning helper must warn about an
-/// `OursUnreadable` entry and escalate the exit code for every one of those
+/// `OursUnusable` entry and escalate the exit code for every one of those
 /// subcommands.
 #[skuld::test]
-fn list_reports_an_unreadable_entry_and_exits_nonzero() {
+fn list_reports_an_unusable_entry_and_exits_nonzero() {
     let fake = Fake::new();
-    fake.seed_unreadable("corrupt");
+    fake.seed_unusable("corrupt");
     fake.install(&mk("readable"), false).unwrap();
 
     let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "list"], &fake);
@@ -1653,14 +1653,14 @@ fn list_reports_an_unreadable_entry_and_exits_nonzero() {
     // `--json` — see `cli::report::exit_code`.
     assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
     assert!(err.contains("corrupt"), "{err}");
-    assert!(err.contains("unreadable"), "{err}");
+    assert!(err.contains("unusable"), "{err}");
     assert!(out.contains("readable"), "{out}");
 }
 
 #[skuld::test]
-fn status_all_reports_an_unreadable_entry_and_exits_nonzero() {
+fn status_all_reports_an_unusable_entry_and_exits_nonzero() {
     let fake = Fake::new();
-    fake.seed_unreadable("corrupt");
+    fake.seed_unusable("corrupt");
     fake.install(&mk("readable"), false).unwrap();
 
     let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "status"], &fake);
@@ -1681,19 +1681,19 @@ fn show_unknown_id_is_not_installed() {
     assert!(err.contains("not installed"), "{err}");
 }
 
-/// An unreadable id must be reported as unreadable, never as "not installed
-/// (would be created)". `4`, not `1`: `RefuseUnreadable` is indeterminate —
+/// An unusable id must be reported as unusable, never as "not installed
+/// (would be created)". `4`, not `1`: `RefuseUnusable` is indeterminate —
 /// `diff` was asked a question and could not determine the answer — unlike
 /// `install`, which exits `1` here because it genuinely failed to install.
 #[skuld::test]
 fn diff_exits_four_when_the_installed_artifact_cannot_be_read() {
     let dir = tempfile::tempdir().unwrap();
-    let (fake, manifest) = unreadable_fixture(dir.path(), "corrupt");
+    let (fake, manifest) = unusable_fixture(dir.path(), "corrupt");
 
     let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
 
     assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
-    assert!(err.contains("unreadable"), "{err}");
+    assert!(err.contains("unusable"), "{err}");
     assert!(!out.contains("would be created"), "stdout:\n{out}");
 }
 
@@ -1811,9 +1811,9 @@ fn cli_accepts_verbose_and_quiet_as_currently_inert() {
 /// `state`/`enabled` trustworthy. `status` (no ids), `list`, and `diff` all
 /// already refuse to invent an answer for the same case.
 #[skuld::test]
-fn status_single_id_errors_on_an_unreadable_entry_instead_of_fabricating_state() {
+fn status_single_id_errors_on_an_unusable_entry_instead_of_fabricating_state() {
     let fake = Fake::new();
-    fake.seed_unreadable("corrupt");
+    fake.seed_unusable("corrupt");
 
     let (code, _out, err) = dispatch_read_only(&["goetia", "daemon", "status", "corrupt"], &fake);
 
@@ -2039,8 +2039,8 @@ fn diff_exits_zero_iff_install_would_report_up_to_date() {
     check(&fake, &manifest, "RefuseForeign");
 
     let dir = tempfile::tempdir().unwrap();
-    let (fake, manifest) = unreadable_fixture(dir.path(), "frpc");
-    check(&fake, &manifest, "RefuseUnreadable");
+    let (fake, manifest) = unusable_fixture(dir.path(), "frpc");
+    check(&fake, &manifest, "RefuseUnusable");
 }
 
 // --json ==============================================================================================================
@@ -2161,9 +2161,9 @@ fn list_json_with_no_daemons_emits_empty_arrays() {
 }
 
 #[skuld::test]
-fn list_json_reports_an_unreadable_entry_as_kind_unreadable() {
+fn list_json_reports_an_unusable_entry_as_kind_unusable() {
     let fake = Fake::new();
-    fake.seed_unreadable("corrupt");
+    fake.seed_unusable("corrupt");
     fake.install(&mk("readable"), false).unwrap();
 
     let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
@@ -2178,7 +2178,7 @@ fn list_json_reports_an_unreadable_entry_as_kind_unreadable() {
         ["readable"],
         "the readable entry must still be reported"
     );
-    assert_eq!(error_kinds(&doc), ["unreadable"]);
+    assert_eq!(error_kinds(&doc), ["unusable"]);
     assert_eq!(errors(&doc)[0]["id"], "corrupt");
 }
 
@@ -2188,10 +2188,10 @@ fn list_json_reports_an_unreadable_entry_as_kind_unreadable() {
 fn list_exit_code_is_the_same_with_and_without_json() {
     let clean = Fake::new();
     clean.install(&mk("frpc"), false).unwrap();
-    let unreadable = Fake::new();
-    unreadable.seed_unreadable("corrupt");
+    let unusable = Fake::new();
+    unusable.seed_unusable("corrupt");
 
-    for (fake, expected) in [(&clean, 0), (&unreadable, 4)] {
+    for (fake, expected) in [(&clean, 0), (&unusable, 4)] {
         let (plain, _, _) = dispatch_read_only(&["goetia", "daemon", "list"], fake);
         let (json, _, _) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], fake);
 
@@ -2248,11 +2248,11 @@ fn list_json_emits_a_document_when_list_fails() {
 
 /// The channel rule: with `--json`, the document is all of stdout and the
 /// subcommand writes no diagnostics of its own to stderr — not even the
-/// unreadable-entry warning its text mode prints.
+/// unusable-entry warning its text mode prints.
 #[skuld::test]
 fn list_json_is_the_only_thing_on_stdout_and_stderr_stays_empty() {
     let fake = Fake::new();
-    fake.seed_unreadable("corrupt");
+    fake.seed_unusable("corrupt");
     fake.install(&mk("readable"), false).unwrap();
 
     let (code, out, err) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
@@ -2306,7 +2306,7 @@ fn status_json_with_no_ids_equals_list_json() {
     fake.install(&mk("frpc"), false).unwrap();
     fake.start(&Id::try_from("frpc").unwrap(), Budget::DEFAULT).unwrap();
     fake.install(&mk("websocat"), false).unwrap();
-    fake.seed_unreadable("corrupt");
+    fake.seed_unusable("corrupt");
     fake.seed_opaque("opaque");
 
     let (list_code, list_out, _) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
@@ -2322,15 +2322,15 @@ fn status_json_with_no_ids_equals_list_json() {
 }
 
 /// Three states with opposite remedies, which text mode renders as one
-/// undifferentiated `error:` line each. The `unreadable` here comes from a
+/// undifferentiated `error:` line each. The `unusable` here comes from a
 /// blob that fails to decode at all (`Error::Blob`); the
 /// `Error::Invalid`-producing case is
-/// `status_json_reports_invalid_blob_content_as_unreadable_not_invalid_id`.
+/// `status_json_reports_invalid_blob_content_as_unusable_not_invalid_id`.
 #[skuld::test]
-fn status_json_distinguishes_not_installed_foreign_and_unreadable() {
+fn status_json_distinguishes_not_installed_foreign_and_unusable() {
     let fake = Fake::new();
     fake.seed_foreign("stranger", "not a goetia artifact at all\n");
-    fake.seed_unreadable("corrupt");
+    fake.seed_unusable("corrupt");
 
     let (code, out, _err) = dispatch_read_only(
         &["goetia", "--json", "daemon", "status", "missing", "stranger", "corrupt"],
@@ -2340,17 +2340,17 @@ fn status_json_distinguishes_not_installed_foreign_and_unreadable() {
     let doc = parse_json(&out);
     assert_eq!(
         error_kinds(&doc),
-        ["not-installed", "foreign", "unreadable"],
+        ["not-installed", "foreign", "unusable"],
         "in argument order"
     );
     assert_eq!(field_strings(errors(&doc), "id"), ["missing", "stranger", "corrupt"]);
     assert!(daemons(&doc).is_empty(), "{doc}");
-    assert_eq!(code, 1, "`not-installed`'s 1 outranks `unreadable`'s 4: {out}");
+    assert_eq!(code, 1, "`not-installed`'s 1 outranks `unusable`'s 4: {out}");
 }
 
 /// The disagreement this task exists to close: for a unit that decodes but
-/// whose live state cannot be queried, `list` sees `Installed::OursUnreadable`
-/// and `status` sees `Error::CommandFailed`. Both must report `unreadable`.
+/// whose live state cannot be queried, `list` sees `Installed::OursUnusable`
+/// and `status` sees `Error::CommandFailed`. Both must report `unusable`.
 #[skuld::test]
 fn list_and_status_report_the_same_kind_for_an_unqueryable_daemon() {
     let inner = Fake::new();
@@ -2365,8 +2365,8 @@ fn list_and_status_report_the_same_kind_for_an_unqueryable_daemon() {
     let (status_code, status_out, _) =
         dispatch_with(&["goetia", "--json", "daemon", "status", "frpc"], &mgr, &never_elevated);
 
-    assert_eq!(error_kinds(&parse_json(&list_out)), ["unreadable"], "{list_out}");
-    assert_eq!(error_kinds(&parse_json(&status_out)), ["unreadable"], "{status_out}");
+    assert_eq!(error_kinds(&parse_json(&list_out)), ["unusable"], "{list_out}");
+    assert_eq!(error_kinds(&parse_json(&status_out)), ["unusable"], "{status_out}");
     assert_eq!(list_code, 4);
     assert_eq!(status_code, 4);
 }
@@ -2374,7 +2374,7 @@ fn list_and_status_report_the_same_kind_for_an_unqueryable_daemon() {
 /// `parse_id` rejecting an argument and blob-content validation both produce
 /// `Error::Invalid`, so the kind comes from which operation failed, not from
 /// the variant: this one is `invalid-id`, and the one in
-/// `status_json_distinguishes_not_installed_foreign_and_unreadable` is not.
+/// `status_json_distinguishes_not_installed_foreign_and_unusable` is not.
 #[skuld::test]
 fn status_json_reports_an_invalid_id_as_kind_invalid_id() {
     let fake = Fake::new();
@@ -2408,15 +2408,15 @@ fn status_json_mixes_good_and_bad_ids() {
 #[skuld::test]
 fn json_exit_code_follows_the_precedence_rule() {
     let fake = Fake::new();
-    fake.seed_unreadable("corrupt");
+    fake.seed_unusable("corrupt");
 
     let (alone, alone_out, _) = dispatch_read_only(&["goetia", "--json", "daemon", "status", "corrupt"], &fake);
-    assert_eq!(error_kinds(&parse_json(&alone_out)), ["unreadable"]);
-    assert_eq!(alone, 4, "an unreadable entry alone is 4, neither 1 nor 0: {alone_out}");
+    assert_eq!(error_kinds(&parse_json(&alone_out)), ["unusable"]);
+    assert_eq!(alone, 4, "an unusable entry alone is 4, neither 1 nor 0: {alone_out}");
 
     let (combined, combined_out, _) =
         dispatch_read_only(&["goetia", "--json", "daemon", "status", "corrupt", "missing"], &fake);
-    assert_eq!(error_kinds(&parse_json(&combined_out)), ["unreadable", "not-installed"]);
+    assert_eq!(error_kinds(&parse_json(&combined_out)), ["unusable", "not-installed"]);
     assert_eq!(combined, 1, "1 outranks 4: {combined_out}");
 }
 
@@ -2425,7 +2425,7 @@ fn json_exit_code_is_zero_exactly_when_errors_is_empty() {
     let clean = Fake::new();
     clean.install(&mk("frpc"), false).unwrap();
     let dirty = Fake::new();
-    dirty.seed_unreadable("corrupt");
+    dirty.seed_unusable("corrupt");
 
     for fake in [&clean, &dirty] {
         for args in [
@@ -2478,9 +2478,9 @@ fn json_on_an_unsupported_subcommand_runs_nothing() {
 /// produced by `support::parse_id` *and* by blob-content validation, so a
 /// classifier keyed on the variant would report an id goetia owns but cannot
 /// decode as `invalid-id` with exit 1 — telling the user to fix a command
-/// line that is perfectly correct — instead of `unreadable` with exit 4.
+/// line that is perfectly correct — instead of `unusable` with exit 4.
 #[skuld::test]
-fn status_json_reports_invalid_blob_content_as_unreadable_not_invalid_id() {
+fn status_json_reports_invalid_blob_content_as_unusable_not_invalid_id() {
     let fake = Fake::new();
     fake.seed_invalid_content("frpc");
 
@@ -2489,7 +2489,7 @@ fn status_json_reports_invalid_blob_content_as_unreadable_not_invalid_id() {
     let doc = parse_json(&out);
     assert_eq!(
         error_kinds(&doc),
-        ["unreadable"],
+        ["unusable"],
         "the argument was a valid id; the *artifact* is what goetia cannot read: {doc}"
     );
     assert_eq!(errors(&doc)[0]["id"], "frpc");
@@ -2497,15 +2497,15 @@ fn status_json_reports_invalid_blob_content_as_unreadable_not_invalid_id() {
 }
 
 /// `list` must classify the same artifact the same way — it reaches
-/// `Installed::OursUnreadable` rather than an `Error` at all.
+/// `Installed::OursUnusable` rather than an `Error` at all.
 #[skuld::test]
-fn list_json_reports_invalid_blob_content_as_unreadable() {
+fn list_json_reports_invalid_blob_content_as_unusable() {
     let fake = Fake::new();
     fake.seed_invalid_content("frpc");
 
     let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
 
-    assert_eq!(error_kinds(&parse_json(&out)), ["unreadable"], "{out}");
+    assert_eq!(error_kinds(&parse_json(&out)), ["unusable"], "{out}");
     assert_eq!(code, 4, "{out}");
 }
 
@@ -2527,12 +2527,12 @@ fn status_json_repeats_an_id_given_twice() {
 }
 
 /// The channel rule holds for `status` too, on a fixture whose text mode
-/// writes both a `warning:` (the unreadable entry) and an `error:` line.
+/// writes both a `warning:` (the unusable entry) and an `error:` line.
 #[skuld::test]
 fn status_json_is_the_only_thing_on_stdout_and_stderr_stays_empty() {
     let fake = Fake::new();
     fake.install(&mk("frpc"), false).unwrap();
-    fake.seed_unreadable("corrupt");
+    fake.seed_unusable("corrupt");
 
     for args in [
         ["goetia", "--json", "daemon", "status"].as_slice(),
@@ -2757,15 +2757,15 @@ fn list_json_undetermined_is_not_an_errors_entry() {
 /// goetia owns and cannot report on, and an id it could not classify at all — still combine to the
 /// one partial-answer code.
 #[skuld::test]
-fn list_exits_four_when_an_unreadable_entry_accompanies_an_undetermined_one() {
+fn list_exits_four_when_an_unusable_entry_accompanies_an_undetermined_one() {
     let fake = Fake::new();
-    fake.seed_unreadable("corrupt");
+    fake.seed_unusable("corrupt");
     fake.seed_opaque("opaque");
 
     let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
 
     let doc = parse_json(&out);
-    assert_eq!(error_kinds(&doc), ["unreadable"], "{doc}");
+    assert_eq!(error_kinds(&doc), ["unusable"], "{doc}");
     assert_eq!(undetermined_names(&doc), [Some("opaque".to_string())], "{doc}");
     assert_eq!(code, 4, "{out}");
 }
@@ -3895,7 +3895,7 @@ fn json_returns_its_own_code_when_stdout_accepts_the_document() {
 
 /// Where no manager can be asked, every verb that reaches it is refused: exit `1`, with the one
 /// message. `status` and `list` included, whose refusal is `unavailable` and never a daemon's own
-/// `unreadable`, exit `4` — for the whole listing, which is one question, and per id for `status`
+/// `unusable`, exit `4` — for the whole listing, which is one question, and per id for `status`
 /// by id, as every other verb given ids answers per id. The verbs that never reach the manager are
 /// untouched.
 #[skuld::test]

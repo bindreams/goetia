@@ -33,7 +33,7 @@ fn goetia_seeing(unit: &std::path::Path, args: &[&str]) -> std::process::Output 
 }
 
 /// `status` by id, `status` and `list` report a unit systemd has not loaded as what it is — goetia's
-/// own, whose live state systemd does not have: `unreadable`, exit `4`, as for any live state it
+/// own, whose live state systemd does not have: `unusable`, exit `4`, as for any live state it
 /// could not read. Never "stopped, not enabled", which is what systemd answers for a name it has no
 /// file for.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]

@@ -51,9 +51,9 @@ fn install_refuses_an_unresolvable_account_with_uninstall_advice() {
 
     assert_eq!(
         outcome,
-        Outcome::RefuseUnreadable {
+        Outcome::RefuseUnusable {
             reason: format!("cannot regenerate the embedded spec: {}", unresolvable("gone")),
-            recovery: Some(decide::unreadable_recovery("frpc")),
+            recovery: Some(decide::unusable_recovery("frpc")),
         }
     );
 }
@@ -61,15 +61,15 @@ fn install_refuses_an_unresolvable_account_with_uninstall_advice() {
 #[skuld::test]
 fn install_refuses_an_undecodable_blob_with_uninstall_advice() {
     let fake = Fake::new();
-    fake.seed_unreadable("frpc");
+    fake.seed_unusable("frpc");
 
     let outcome = fake.install(&mk("frpc"), false).unwrap();
 
     match outcome {
-        Outcome::RefuseUnreadable { recovery, .. } => {
-            assert_eq!(recovery, Some(decide::unreadable_recovery("frpc")));
+        Outcome::RefuseUnusable { recovery, .. } => {
+            assert_eq!(recovery, Some(decide::unusable_recovery("frpc")));
         }
-        other => panic!("expected RefuseUnreadable, got {other:?}"),
+        other => panic!("expected RefuseUnusable, got {other:?}"),
     }
 }
 
@@ -82,11 +82,11 @@ fn install_refuses_a_failed_comparison_with_its_error_alone() {
     let outcome = fake.install(&mk("frpc"), false).unwrap();
 
     match outcome {
-        Outcome::RefuseUnreadable { reason, recovery } => {
+        Outcome::RefuseUnusable { reason, recovery } => {
             assert!(reason.contains("the unit could not be read back"), "{reason}");
             assert_eq!(recovery, None);
         }
-        other => panic!("expected RefuseUnreadable, got {other:?}"),
+        other => panic!("expected RefuseUnusable, got {other:?}"),
     }
 }
 
@@ -219,7 +219,7 @@ fn status_reports_an_unresolvable_account_as_an_error() {
 }
 
 #[skuld::test]
-fn list_reports_an_unresolvable_account_as_ours_unreadable() {
+fn list_reports_an_unresolvable_account_as_ours_unusable() {
     let fake = Fake::new();
     fake.install(&mk_as("frpc", "gone"), false).unwrap();
     fake.seed_unresolvable_account("gone");
@@ -228,7 +228,7 @@ fn list_reports_an_unresolvable_account_as_ours_unreadable() {
 
     assert_eq!(
         listed,
-        [Installed::OursUnreadable {
+        [Installed::OursUnusable {
             name: "frpc".to_string(),
             reason: format!(
                 "marked ours, but its embedded spec cannot be regenerated: {}",
@@ -239,7 +239,7 @@ fn list_reports_an_unresolvable_account_as_ours_unreadable() {
 }
 
 #[skuld::test]
-fn list_reports_a_failed_live_status_as_ours_unreadable() {
+fn list_reports_a_failed_live_status_as_ours_unusable() {
     let fake = Fake::new();
     fake.install(&mk("frpc"), false).unwrap();
     fake.install(&mk("other"), false).unwrap();
@@ -253,7 +253,7 @@ fn list_reports_a_failed_live_status_as_ours_unreadable() {
         "one entry's failure must not take down the others: {listed:?}"
     );
     assert!(
-        listed.contains(&Installed::OursUnreadable {
+        listed.contains(&Installed::OursUnusable {
             name: "frpc".to_string(),
             reason: "marked ours, but its live state could not be queried: state unavailable".to_string(),
         }),
@@ -283,7 +283,7 @@ fn list_reports_a_name_that_is_not_an_id_without_querying_it() {
 
     assert_eq!(listed.len(), 2, "{listed:?}");
     assert!(
-        listed.contains(&Installed::OursUnreadable {
+        listed.contains(&Installed::OursUnusable {
             name: name.to_string(),
             reason: format!("marked ours, but its name is not a valid daemon id: {invalid}"),
         }),
@@ -297,24 +297,24 @@ fn list_reports_a_name_that_is_not_an_id_without_querying_it() {
     );
 }
 
-/// The reasons a marked entry is unreadable come in a fixed order: its blob first, its name last.
+/// The reasons a marked entry is unusable come in a fixed order: its blob first, its name last.
 #[skuld::test]
 fn list_reports_an_undecodable_blob_before_a_name_that_is_not_an_id() {
     let fake = Fake::new();
     let name = "not a valid id";
-    fake.seed_unreadable(name);
+    fake.seed_unusable(name);
 
     let listed = fake.list().unwrap();
 
     match listed.as_slice() {
-        [Installed::OursUnreadable { name: got, reason }] => {
+        [Installed::OursUnusable { name: got, reason }] => {
             assert_eq!(got, name);
             assert!(
                 reason.starts_with("blob: "),
                 "the blob's reason, not the name's: {reason}"
             );
         }
-        other => panic!("one unreadable entry expected, got {other:?}"),
+        other => panic!("one unusable entry expected, got {other:?}"),
     }
 }
 
@@ -375,7 +375,7 @@ fn owned_maps_absent_foreign_and_marked() {
     let fake = Fake::new();
     fake.seed_foreign("stranger", "not a goetia artifact\n");
     fake.install(&mk("ours"), false).unwrap();
-    fake.seed_unreadable("corrupt");
+    fake.seed_unusable("corrupt");
     let id = |s: &str| Id::try_from(s).unwrap();
 
     assert!(matches!(owned(&fake, &id("nobody")), Err(Error::NotInstalled { .. })));

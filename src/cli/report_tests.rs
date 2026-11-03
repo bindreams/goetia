@@ -38,7 +38,7 @@ fn write_emits_one_compact_line_terminated_by_a_newline() {
         }],
         errors: vec![ErrorReport {
             id: Some("corrupt".to_string()),
-            kind: Kind::Unreadable,
+            kind: Kind::Unusable,
             message: "why".to_string(),
         }],
         undetermined: Vec::new(),
@@ -52,7 +52,7 @@ fn write_emits_one_compact_line_terminated_by_a_newline() {
         text,
         concat!(
             r#"{"daemons":[{"id":"frpc","state":"running","enabled":true,"pid":1234}],"#,
-            r#""errors":[{"id":"corrupt","kind":"unreadable","message":"why"}],"#,
+            r#""errors":[{"id":"corrupt","kind":"unusable","message":"why"}],"#,
             r#""undetermined":[]}"#,
             "\n"
         ),
@@ -69,7 +69,7 @@ fn exit_code_is_the_precedence_max_over_error_kinds() {
     // exhaustive match, so a kind added without a code does not compile.
     for (kinds, expected) in [
         (&[][..], 0),
-        (&[Kind::Unreadable][..], 4),
+        (&[Kind::Unusable][..], 4),
         (&[Kind::Undetermined][..], 4),
         (&[Kind::NotInstalled][..], 1),
         (&[Kind::Foreign][..], 1),
@@ -78,10 +78,10 @@ fn exit_code_is_the_precedence_max_over_error_kinds() {
         (&[Kind::InvalidId][..], 1),
         (&[Kind::Unsupported][..], 2),
         // 1 outranks 4, in either order.
-        (&[Kind::Unreadable, Kind::NotInstalled][..], 1),
-        (&[Kind::NotInstalled, Kind::Unreadable][..], 1),
+        (&[Kind::Unusable, Kind::NotInstalled][..], 1),
+        (&[Kind::NotInstalled, Kind::Unusable][..], 1),
         // Repeats of the same kind stay that kind's code.
-        (&[Kind::Unreadable, Kind::Unreadable][..], 4),
+        (&[Kind::Unusable, Kind::Unusable][..], 4),
     ] {
         assert_eq!(exit_code(&report(kinds)), expected, "for {kinds:?}");
     }
@@ -115,7 +115,7 @@ fn every_kind_serializes_to_its_documented_wire_spelling() {
     for (kind, spelling) in [
         (Kind::NotInstalled, "not-installed"),
         (Kind::Foreign, "foreign"),
-        (Kind::Unreadable, "unreadable"),
+        (Kind::Unusable, "unusable"),
         (Kind::Undetermined, "undetermined"),
         (Kind::InvalidId, "invalid-id"),
         (Kind::Unavailable, "unavailable"),
@@ -131,11 +131,11 @@ fn every_kind_serializes_to_its_documented_wire_spelling() {
 }
 
 /// The defect this kind exists for: `status_error`'s catch-all sent every non-`NotInstalled`,
-/// non-`Foreign` error to `unreadable`, whose published meaning is "goetia owns the id but cannot
+/// non-`Foreign` error to `unusable`, whose published meaning is "goetia owns the id but cannot
 /// report on it" and whose remedy is `uninstall`. A read that never completed establishes no
 /// ownership, so it must not borrow that claim — nor the advice attached to it.
 #[skuld::test]
-fn an_undetermined_error_is_not_reported_as_unreadable() {
+fn an_undetermined_error_is_not_reported_as_unusable() {
     let e = Error::Undetermined {
         id: "frpc".to_string(),
         reason: "failed to read /run/systemd/system/frpc.service.d: Permission denied".to_string(),
@@ -227,7 +227,7 @@ fn emit_exits_one_when_the_document_cannot_be_written() {
 fn a_write_failure_replaces_the_reports_own_code_whatever_it_was() {
     for kinds in [
         &[Kind::Unsupported][..],
-        &[Kind::Unreadable][..],
+        &[Kind::Unusable][..],
         &[Kind::NotInstalled][..],
     ] {
         let report = report(kinds);
@@ -238,7 +238,7 @@ fn a_write_failure_replaces_the_reports_own_code_whatever_it_was() {
 
 #[skuld::test]
 fn emit_returns_the_reports_own_code_when_the_write_succeeds() {
-    let report = report(&[Kind::Unreadable]);
+    let report = report(&[Kind::Unusable]);
     let mut out = Vec::new();
     let mut err = Vec::new();
 

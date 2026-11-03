@@ -9,7 +9,7 @@ use std::io::Write;
 use clap::Args as ClapArgs;
 
 use super::report::{self, DaemonReport, Report};
-use super::support::{parse_id, partition_installed, print_undetermined_warnings, print_unreadable_warnings};
+use super::support::{parse_id, partition_installed, print_undetermined_warnings, print_unusable_warnings};
 use crate::error::{Error, Result};
 use crate::manager::ServiceManager;
 
@@ -88,10 +88,10 @@ fn status_all(mgr: &dyn ServiceManager, json: bool, out: &mut dyn Write, err: &m
 
     match &index {
         Ok(index) => {
-            // An unreadable entry is a `warning:` here rather than an
+            // An unusable entry is a `warning:` here rather than an
             // `error:` line, as it has been since `list` and `status` first
             // shared `partition_installed`.
-            print_unreadable_warnings(&index.unreadable, err);
+            print_unusable_warnings(&index.unusable, err);
             print_undetermined_warnings(&index.undetermined, err);
             print_daemons(&report, out);
         }

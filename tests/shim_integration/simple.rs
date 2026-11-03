@@ -150,7 +150,7 @@ fn uninstall_leaves_nothing() {
     assert!(
         installed.iter().all(|entry| match entry {
             Installed::Ours { spec: s, .. } => s.id.as_str() != id,
-            Installed::OursUnreadable { name, .. } => name != &id,
+            Installed::OursUnusable { name, .. } => name != &id,
             Installed::Undetermined { name, .. } => match name {
                 Some(n) => n != &id,
                 // An aggregate may stand for this id, so its absence cannot
@@ -174,7 +174,7 @@ fn list_ignores_foreign_services() {
     assert!(
         installed.iter().all(|entry| match entry {
             Installed::Ours { spec, .. } => spec.id.as_str() != id,
-            Installed::OursUnreadable { name, .. } => name != &id,
+            Installed::OursUnusable { name, .. } => name != &id,
             Installed::Undetermined { name, .. } => match name {
                 Some(n) => n != &id,
                 // An aggregate may stand for this id, so its absence cannot

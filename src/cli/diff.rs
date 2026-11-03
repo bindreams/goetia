@@ -110,7 +110,7 @@ pub fn run(
             let _ = writeln!(err, "error: {line}");
             1
         }
-        Ok(Outcome::RefuseUnreadable { reason, recovery }) => {
+        Ok(Outcome::RefuseUnusable { reason, recovery }) => {
             // Indeterminate, not a failure: `4`.
             let line = match recovery {
                 Some(recovery) => format!("{}: would be refused: {reason}. {recovery}", spec.id),

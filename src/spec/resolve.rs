@@ -978,7 +978,7 @@ pub(crate) fn reject_empty(id: &Id, field: &str, value: &str) -> Result<(), Erro
 /// `pub(crate)`: also called by `blob::decode`.
 ///
 /// An already-installed artifact whose blob carries an empty or
-/// whitespace-only `user.name` decodes as `Installed::OursUnreadable`
+/// whitespace-only `user.name` decodes as `Installed::OursUnusable`
 /// rather than silently as root — the correct disclosure, and goetia has
 /// no release yet whose compatibility that would break.
 ///

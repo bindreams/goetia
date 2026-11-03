@@ -201,7 +201,7 @@ fn find_ours(installed: Vec<Installed>, id: &str) -> Option<DaemonSpec> {
 fn may_account_for(listed: &[Installed], id: &str) -> bool {
     listed.iter().any(|entry| match entry {
         Installed::Ours { spec, .. } => spec.id.as_str() == id,
-        Installed::OursUnreadable { name, .. } => name == id,
+        Installed::OursUnusable { name, .. } => name == id,
         Installed::Undetermined { name, .. } => name.is_none() || name.as_deref() == Some(id),
     })
 }
@@ -1379,10 +1379,10 @@ fn status_of_residue_names_the_leftover_paths() {
 }
 
 /// A fragment goetia wrote for a spec naming a Windows account (a SID) carries goetia's marker, so
-/// it is goetia's, but the systemd backend cannot render that spec: it is `OursUnreadable` in `list`
+/// it is goetia's, but the systemd backend cannot render that spec: it is `OursUnusable` in `list`
 /// and an error in `status`.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn list_reports_a_sid_account_as_ours_unreadable() {
+fn list_reports_a_sid_account_as_ours_unusable() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let mut spec = mk(guard.id());
@@ -1402,7 +1402,7 @@ fn list_reports_a_sid_account_as_ours_unreadable() {
     let reason = listed
         .iter()
         .find_map(|entry| match entry {
-            Installed::OursUnreadable { name, reason } if name == guard.id() => Some(reason),
+            Installed::OursUnusable { name, reason } if name == guard.id() => Some(reason),
             _ => None,
         })
         .unwrap_or_else(|| panic!("a marked fragment is ours even when its spec cannot be rendered: {listed:?}"));
@@ -1426,7 +1426,7 @@ fn list_reports_a_sid_account_as_ours_unreadable() {
 // A read that failed establishes no ownership =========================================================================
 
 /// A drop-in directory the caller cannot open leaves goetia unable to say whether *anything* is
-/// installed at the id. Reporting `unreadable` for it — "goetia owns the id but cannot report on
+/// installed at the id. Reporting `unusable` for it — "goetia owns the id but cannot report on
 /// it", whose published remedy is `uninstall` — would put goetia's name and destructive advice on
 /// what is just as plausibly an administrator's override of a unit shipped elsewhere.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -1463,7 +1463,7 @@ fn status_reports_undetermined_for_a_dropin_directory_it_cannot_read() {
 /// The same absence path `status` takes above, reached through `diff` instead: with no fragment,
 /// `residue`'s drop-in scan is what would have answered "is anything at this id", and it did not
 /// complete. `4`, not the `1` `diff`'s catch-all `Err` arm gives: it was asked a question and could
-/// not determine the answer — the same reasoning that already puts `Outcome::RefuseUnreadable` at
+/// not determine the answer — the same reasoning that already puts `Outcome::RefuseUnusable` at
 /// `4` there.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn diff_reports_a_dropin_directory_it_cannot_read_as_indeterminate() {
@@ -1486,7 +1486,7 @@ fn diff_reports_a_dropin_directory_it_cannot_read_as_indeterminate() {
 /// The fragment is open, read and decoded, so goetia's ownership of this id is an established fact
 /// — and `Error::Undetermined` ("cannot determine whether daemon `X` is installed") would deny it
 /// about an id goetia just decoded. What the unreadable drop-in directory actually costs is the
-/// ability to report on the id, which is `Outcome::RefuseUnreadable`.
+/// ability to report on the id, which is `Outcome::RefuseUnusable`.
 ///
 /// `ENOTDIR` rather than `EACCES`, so this runs as root without a second uid: a regular file where
 /// `<id>.service.d` has to be fails `read_dir` identically for everyone, and is exactly the shape an
@@ -1505,7 +1505,7 @@ fn install_refuses_an_unreadable_dropin_over_our_own_fragment() {
     let outcome = mgr
         .install(&mk(guard.id()), false)
         .expect("a drop-in read that failed is not a failure to determine whether the id is installed");
-    let Outcome::RefuseUnreadable { reason, .. } = &outcome else {
+    let Outcome::RefuseUnusable { reason, .. } = &outcome else {
         panic!("goetia owns this id and cannot report on it, got {outcome:?}");
     };
     assert!(

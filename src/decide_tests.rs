@@ -283,13 +283,13 @@ fn other_daemon_refuses_even_with_force() {
 }
 
 #[skuld::test]
-fn unreadable_refuses_with_recovery() {
+fn unusable_refuses_with_recovery() {
     let spec = spec_fixture();
 
     for force in [false, true] {
-        let found = Ownership::OursUnreadable {
+        let found = Ownership::OursUnusable {
             reason: "schema 2 is not understood by this build".to_owned(),
-            recovery: Some(unreadable_recovery("frpc")),
+            recovery: Some(unusable_recovery("frpc")),
         };
 
         let outcome = decide(
@@ -302,12 +302,12 @@ fn unreadable_refuses_with_recovery() {
         );
 
         match outcome {
-            Outcome::RefuseUnreadable { reason, recovery } => {
+            Outcome::RefuseUnusable { reason, recovery } => {
                 assert_eq!(reason, "schema 2 is not understood by this build");
                 let recovery = recovery.expect("a decode failure carries a recovery");
                 assert!(!recovery.is_empty(), "recovery must be non-empty (force={force})");
             }
-            other => panic!("expected RefuseUnreadable regardless of force={force}, got {other:?}"),
+            other => panic!("expected RefuseUnusable regardless of force={force}, got {other:?}"),
         }
     }
 }
@@ -315,11 +315,11 @@ fn unreadable_refuses_with_recovery() {
 /// `decide` hands the recovery on exactly as discovery gave it: a recovery stays, and no recovery
 /// stays none, rather than `decide` inventing one for a refusal that has no action to name.
 #[skuld::test]
-fn unreadable_carries_its_recovery_through() {
+fn unusable_carries_its_recovery_through() {
     let spec = spec_fixture();
 
     for recovery in [Some("run the exact remedy".to_owned()), None] {
-        let found = Ownership::OursUnreadable {
+        let found = Ownership::OursUnusable {
             reason: "a drop-in could not be read".to_owned(),
             recovery: recovery.clone(),
         };
@@ -335,7 +335,7 @@ fn unreadable_carries_its_recovery_through() {
 
         assert_eq!(
             outcome,
-            Outcome::RefuseUnreadable {
+            Outcome::RefuseUnusable {
                 reason: "a drop-in could not be read".to_owned(),
                 recovery,
             }
@@ -345,8 +345,8 @@ fn unreadable_carries_its_recovery_through() {
 
 /// The text a decode failure carries names the exact `uninstall` that unblocks the id.
 #[skuld::test]
-fn unreadable_recovery_names_the_uninstall() {
-    let recovery = unreadable_recovery("frpc");
+fn unusable_recovery_names_the_uninstall() {
+    let recovery = unusable_recovery("frpc");
 
     assert!(
         recovery.contains("goetia daemon uninstall frpc"),
@@ -523,10 +523,10 @@ fn stale_with_external_config_and_force_is_stale() {
     );
 }
 
-/// Every refusal names a recovery, except an unreadable one whose discovery had none to name (a
+/// Every refusal names a recovery, except an unusable one whose discovery had none to name (a
 /// drop-in that could not be read).
 #[skuld::test]
-fn every_refusal_names_a_recovery_command_except_a_recoveryless_unreadable() {
+fn every_refusal_names_a_recovery_command_except_a_recoveryless_unusable() {
     let spec = spec_fixture();
     let refusals = [
         decide(
@@ -538,9 +538,9 @@ fn every_refusal_names_a_recovery_command_except_a_recoveryless_unreadable() {
             &ExternalConfig::Absent,
         ),
         decide(
-            &Ownership::OursUnreadable {
+            &Ownership::OursUnusable {
                 reason: "corrupt".to_owned(),
-                recovery: Some(unreadable_recovery("frpc")),
+                recovery: Some(unusable_recovery("frpc")),
             },
             "GENERATED",
             &spec,
@@ -549,7 +549,7 @@ fn every_refusal_names_a_recovery_command_except_a_recoveryless_unreadable() {
             &ExternalConfig::Absent,
         ),
         decide(
-            &Ownership::OursUnreadable {
+            &Ownership::OursUnusable {
                 reason: "a drop-in could not be read".to_owned(),
                 recovery: None,
             },
@@ -564,13 +564,13 @@ fn every_refusal_names_a_recovery_command_except_a_recoveryless_unreadable() {
     for outcome in refusals {
         match outcome {
             Outcome::RefuseForeign { recovery }
-            | Outcome::RefuseUnreadable {
+            | Outcome::RefuseUnusable {
                 recovery: Some(recovery),
                 ..
             } => {
                 assert!(!recovery.is_empty(), "every refusal must name a recovery command");
             }
-            Outcome::RefuseUnreadable { recovery: None, .. } => {}
+            Outcome::RefuseUnusable { recovery: None, .. } => {}
             other => panic!("expected a refusing variant, got {other:?}"),
         }
     }

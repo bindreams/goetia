@@ -548,7 +548,7 @@ pub fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, m
     assert!(
         listed.iter().any(|entry| match entry {
             Installed::Undetermined { name, .. } => name.is_none() || name.as_deref() == Some(id.as_str()),
-            Installed::Ours { .. } | Installed::OursUnreadable { .. } => false,
+            Installed::Ours { .. } | Installed::OursUnusable { .. } => false,
         }),
         "id {id} is neither reported undetermined nor covered by an aggregate entry, so list() \
          silently says it does not exist: {listed:?}"
@@ -556,7 +556,7 @@ pub fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, m
     assert!(
         !listed.iter().any(|entry| match entry {
             Installed::Ours { spec, .. } => spec.id == *id,
-            Installed::OursUnreadable { name, .. } => name == id.as_str(),
+            Installed::OursUnusable { name, .. } => name == id.as_str(),
             Installed::Undetermined { .. } => false,
         }),
         "the read that would have classified id {id} never completed, so no ownership was \

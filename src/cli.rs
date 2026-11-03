@@ -171,20 +171,20 @@ pub enum DaemonCommand {
 ///   `report::Kind::Undetermined`, and out of `list()` through the
 ///   document's third key, `undetermined`, rather than as an
 ///   `errors[].kind` — both codes come from `report::Kind::code`, the one
-///   kind-to-code map. `diff` returns it for `Outcome::RefuseUnreadable`
+///   kind-to-code map. `diff` returns it for `Outcome::RefuseUnusable`
 ///   and for `Error::Undetermined` (`cli::diff::run`); `install` returns it
 ///   for `Error::Undetermined` from `mgr.install`/`enable`/`start`, and for
 ///   `Error::WaitTimeout`, `Error::RequestInDoubt`, `Error::LoadedJobInDoubt`,
 ///   `Error::LoadedStateInDoubt` and `Error::StaleJobBootedOut` from its steps, so the two verbs
 ///   agree about `Undetermined` and disagree only about
-///   `Outcome::RefuseUnreadable`, which `install` reports as `1` because it
+///   `Outcome::RefuseUnusable`, which `install` reports as `1` because it
 ///   genuinely failed to install. All seven id verbs return it through
 ///   `support::run_id_verb`, for four conditions: `Undetermined`, where
 ///   goetia could not determine what is at the id, and — from the verbs that
 ///   act — `WaitTimeout`, `Unestablished` and `RequestInDoubt`, where it
 ///   acted, or may have, and could not determine the outcome.
 ///   `show` returns it too (`cli::show::run`), in both its per-id and
-///   no-ids forms — for an "installed but unreadable" id, for an id
+///   no-ids forms — for an "installed but unusable" id, for an id
 ///   `list()` reported as undetermined, and for *any* id it cannot find
 ///   while an aggregate undetermined entry is present, since a null-named
 ///   entry makes "not installed" unsound for every id at once. Anchored to

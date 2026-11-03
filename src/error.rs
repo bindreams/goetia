@@ -91,16 +91,16 @@ pub enum Error {
     /// The distinguishing property is what this variant does **not** claim.
     /// [`NotInstalled`](Error::NotInstalled) is proof that nothing
     /// goetia-attributable is at the id; [`Foreign`](Error::Foreign) — and
-    /// `cli::report::Kind::Unreadable`, whose published meaning is "goetia
+    /// `cli::report::Kind::Unusable`, whose published meaning is "goetia
     /// owns the id but cannot report on it" — is proof that something is.
     /// A failed read is the absence of both proofs, so reporting either one
-    /// invents evidence: "installed but unreadable" over an
+    /// invents evidence: "installed but unusable" over an
     /// `/etc/systemd/system/<id>.service.d` an unelevated caller merely
     /// could not open puts goetia's name, and `uninstall`'s recovery
     /// advice, on what may be a stranger's override. Choose between the
     /// three by what was established, never by which is closest to hand.
     ///
-    /// Exit `4` (indeterminate), like `Unreadable`: the code is about
+    /// Exit `4` (indeterminate), like `Unusable`: the code is about
     /// whether the question was answered, and this one was not.
     #[error("cannot determine whether daemon `{id}` is installed: {reason}. {recovery}")]
     Undetermined {

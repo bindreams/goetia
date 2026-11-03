@@ -205,7 +205,7 @@ fn locate(id: &str) -> Result<Option<Location>> {
 /// identically, since the two describe one condition on two platforms.
 ///
 /// [`Error::Undetermined`], never [`Error::Io`]: `Io` reaches
-/// `cli::report::status_error`'s catch-all as `Kind::Unreadable`, which
+/// `cli::report::status_error`'s catch-all as `Kind::Unusable`, which
 /// *asserts* that goetia owns the id — the one thing a read that never
 /// completed cannot establish. `/Library/LaunchDaemons` holds every vendor's
 /// daemons, so that claim is routinely about a stranger's service.
@@ -1589,7 +1589,7 @@ fn scan_in(dirs: [(&str, bool); 2]) -> Scan<Plist> {
         let [location] = match <[Location; 1]>::try_from(locations) {
             Ok(only) => only,
             Err(_) => {
-                reported.push(Installed::OursUnreadable {
+                reported.push(Installed::OursUnusable {
                     name: id,
                     reason: format!("present in both {STAGING_DIR} and {ENABLED_DIR}"),
                 });

@@ -95,16 +95,17 @@ pub(crate) enum Kind {
     /// failed, which is [`Kind::Undetermined`]'s case. Only from
     /// `status(&id)`.
     Foreign,
-    /// Goetia owns the id but cannot report on it; `message` says why — a
-    /// blob it cannot decode, a live state it could not query, or an
-    /// ambiguous installation. From [`Installed::OursUnreadable`] out of
-    /// `list()`, and from every other `status(&id)` error.
+    /// Goetia owns the id but cannot report on it; `message` says why. The causes are listed on
+    /// [`Ownership::OursUnusable`]. From [`Installed::OursUnusable`] out of `list()`, and from
+    /// every other `status(&id)` error.
     ///
-    /// [`Installed::OursUnreadable`]: crate::manager::Installed::OursUnreadable
-    Unreadable,
+    /// [`Ownership::OursUnusable`]: crate::decide::Ownership::OursUnusable
+    ///
+    /// [`Installed::OursUnusable`]: crate::manager::Installed::OursUnusable
+    Unusable,
     /// Goetia could not determine *whether* anything is installed at that
     /// id: a read the answer depends on failed. Claims no ownership, which
-    /// is the whole difference from [`Kind::Unreadable`] — see
+    /// is the whole difference from [`Kind::Unusable`] — see
     /// [`Error::Undetermined`], which is the only thing that produces an
     /// `errors[]` entry of this kind. The `undetermined[]` key is fed
     /// separately, from [`Installed::Undetermined`] out of `list()`; both
@@ -136,7 +137,7 @@ impl Kind {
         match self {
             Kind::NotInstalled => "not-installed",
             Kind::Foreign => "foreign",
-            Kind::Unreadable => "unreadable",
+            Kind::Unusable => "unusable",
             Kind::Undetermined => "undetermined",
             Kind::InvalidId => "invalid-id",
             Kind::Unavailable => "unavailable",
@@ -156,10 +157,10 @@ impl Kind {
     fn code(self) -> i32 {
         match self {
             // The question was not answered: the partial-answer case `4`
-            // exists for. Whether goetia owns the id (`unreadable`) or
+            // exists for. Whether goetia owns the id (`unusable`) or
             // could not even find that out (`undetermined`) changes the
             // remedy, not the code.
-            Kind::Unreadable | Kind::Undetermined => 4,
+            Kind::Unusable | Kind::Undetermined => 4,
             Kind::Unsupported => 2,
             // A determinate answer that the command failed, or
             // (`unavailable`) no answer at all — nothing partial about
@@ -178,13 +179,13 @@ impl serde::Serialize for Kind {
 // Constructors ========================================================================================================
 
 /// The report for a whole-host listing: every decoded entry a daemon, every
-/// [`Installed::OursUnreadable`] an `unreadable` error, and everything
+/// [`Installed::OursUnusable`] an `unusable` error, and everything
 /// goetia could not classify an entry in the third key. `list` and `status`
 /// with no ids both build their report through here, which is what makes the
 /// two emit the identical document for the same machine. Both of
 /// [`InstalledIndex`]'s maps are `BTreeMap`s, so the ordering is by id.
 ///
-/// [`Installed::OursUnreadable`]: crate::manager::Installed::OursUnreadable
+/// [`Installed::OursUnusable`]: crate::manager::Installed::OursUnusable
 pub(crate) fn from_index(index: &InstalledIndex) -> Report {
     Report {
         daemons: index
@@ -198,12 +199,12 @@ pub(crate) fn from_index(index: &InstalledIndex) -> Report {
             })
             .collect(),
         errors: index
-            .unreadable
+            .unusable
             .iter()
             .map(|(name, reason)| ErrorReport {
                 id: Some(name.clone()),
-                kind: Kind::Unreadable,
-                message: format!("installed but unreadable: {reason}"),
+                kind: Kind::Unusable,
+                message: format!("installed but unusable: {reason}"),
             })
             .collect(),
         // Already ordered: `partition_installed` sorts as it builds, so the
@@ -233,10 +234,10 @@ pub(crate) fn daemon(id: &str, status: &Status) -> DaemonReport {
 /// else. `NotInstalled` and `Foreign` are two determinate answers, and
 /// `Undetermined` is the backend saying it established neither; every
 /// remaining error means goetia owns the id and could not report on it,
-/// which is precisely what `list` calls `OursUnreadable`. Routing the
-/// remainder to `unreadable` is what makes the two subcommands agree about
+/// which is precisely what `list` calls `OursUnusable`. Routing the
+/// remainder to `unusable` is what makes the two subcommands agree about
 /// one machine: a unit that decodes but whose live state cannot be queried
-/// reaches `list` as `Installed::OursUnreadable` and `status` as a failure
+/// reaches `list` as `Installed::OursUnusable` and `status` as a failure
 /// of its own — [`Error::CommandFailed`] on launchd, [`Error::Other`] on
 /// systemd.
 ///
@@ -255,7 +256,7 @@ pub(crate) fn status_error(id: &str, e: &Error) -> ErrorReport {
         Error::NotInstalled { .. } => Kind::NotInstalled,
         Error::Foreign { .. } => Kind::Foreign,
         Error::Undetermined { .. } => Kind::Undetermined,
-        _ => Kind::Unreadable,
+        _ => Kind::Unusable,
     };
     ErrorReport {
         id: Some(id.to_string()),

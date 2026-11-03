@@ -96,19 +96,19 @@ fn list_reports_the_same_pid_as_status() {
 }
 
 #[skuld::test]
-fn list_reports_unreadable_entries_without_erroring() {
+fn list_reports_unusable_entries_without_erroring() {
     let fake = Fake::new();
     fake.seed_foreign("corrupt", format!("{FAKE_MARKER}\nSpec: not-valid-base64!!!\n"));
     fake.install_then_hand_edit(&mk("readable"), "# extra\n");
 
     let listed = fake.list().unwrap();
 
-    let unreadable = listed
+    let unusable = listed
         .iter()
-        .find(|entry| matches!(entry, Installed::OursUnreadable { name, .. } if name == "corrupt"));
+        .find(|entry| matches!(entry, Installed::OursUnusable { name, .. } if name == "corrupt"));
     assert!(
-        unreadable.is_some(),
-        "a marked-but-undecodable entry must appear as OursUnreadable: {listed:?}"
+        unusable.is_some(),
+        "a marked-but-undecodable entry must appear as OursUnusable: {listed:?}"
     );
     let readable = listed
         .iter()
@@ -176,10 +176,10 @@ fn mutating_verbs_refuse_a_foreign_id() {
 
 /// The marker alone is proof of ownership: an entry Goetia marked but can
 /// no longer decode is still *ours*, so `uninstall` — the documented
-/// recovery for `decide::Outcome::RefuseUnreadable` — must still work on
+/// recovery for `decide::Outcome::RefuseUnusable` — must still work on
 /// it, unlike a truly foreign entry.
 #[skuld::test]
-fn uninstall_accepts_an_unreadable_entry() {
+fn uninstall_accepts_an_unusable_entry() {
     let fake = Fake::new();
     fake.seed_foreign("corrupt", format!("{FAKE_MARKER}\nSpec: not-valid-base64!!!\n"));
     let id = Id::try_from("corrupt").unwrap();
@@ -268,7 +268,7 @@ fn every_verb(fake: &Fake, spec: &DaemonSpec) -> Vec<(&'static str, Result<()>)>
 }
 
 /// An artifact whose bytes could not be read proves neither presence nor
-/// absence, so it is neither `Ours` nor `OursUnreadable` — the latter would
+/// absence, so it is neither `Ours` nor `OursUnusable` — the latter would
 /// put goetia's name on what may be a stranger's service.
 #[skuld::test]
 fn list_reports_an_opaque_entry_as_undetermined() {
@@ -288,7 +288,7 @@ fn list_reports_an_opaque_entry_as_undetermined() {
     assert!(
         !listed
             .iter()
-            .any(|entry| matches!(entry, Installed::Ours { .. } | Installed::OursUnreadable { .. })),
+            .any(|entry| matches!(entry, Installed::Ours { .. } | Installed::OursUnusable { .. })),
         "an unread artifact must not be claimed as goetia's: {listed:?}"
     );
 }
@@ -367,7 +367,7 @@ fn an_opaque_id_is_listed_once_and_not_as_ours() {
     );
 }
 
-/// Both ways out, and not the third: `uninstall` is `RefuseUnreadable`'s
+/// Both ways out, and not the third: `uninstall` is `RefuseUnusable`'s
 /// remedy and certifies ownership, which is precisely what was not
 /// established here.
 #[skuld::test]
