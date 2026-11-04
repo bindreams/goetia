@@ -201,7 +201,7 @@ impl Backend for Systemd {
                 Ok(read) => entries.push((id, read)),
                 Err(failure) => reported.push(Installed::Undetermined {
                     name: Some(id),
-                    reason: Reason::failed(failure.into_io_error()),
+                    reason: Reason::failed(failure.into_os_error()),
                 }),
             }
         }

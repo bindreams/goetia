@@ -75,7 +75,7 @@ impl ReadFailure {
     }
 
     /// The operation and the path it failed on, with no claim about the id attached, as text for
-    /// a test to read. `Systemd::scan` keeps the error itself ([`ReadFailure::into_io_error`]).
+    /// a test to read. `Systemd::scan` keeps the error itself ([`ReadFailure::into_os_error`]).
     #[cfg(test)]
     pub(super) fn detail(&self) -> String {
         format!(
@@ -94,7 +94,7 @@ impl ReadFailure {
     /// The reading for a caller that already knows goetia owns the id, so "unusable" is a true
     /// statement about it: `super::write::quarantine_if_still_ours`, which reaches this only after
     /// `read` found the fragment marked.
-    pub(super) fn into_io_error(self) -> Error {
+    pub(super) fn into_os_error(self) -> Error {
         Error::os_at(self.op, self.path, self.source)
     }
 }
@@ -386,7 +386,7 @@ pub(super) fn fragmentless<S>(id: &str) -> ReadResult<ReadOutcome<S>> {
 pub(super) fn installed(id: &str, text: &str) -> Result<InstalledDefinition<String>> {
     let dirs = dropin_dirs(id).map_err(|failure| Error::Step {
         what: "a drop-in directory could not be read, so what systemd applies to it cannot be compared".to_string(),
-        source: Box::new(failure.into_io_error()),
+        source: Box::new(failure.into_os_error()),
     })?;
     let marker: String = dirs.iter().map(|(_, text)| text.as_str()).collect();
     Ok(InstalledDefinition {

@@ -4,12 +4,22 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod reason;
+mod report;
+mod within;
+
+pub use reason::Reason;
+pub(crate) use report::Chain;
+pub(crate) use within::within;
+
+use report::Report;
+
 /// What a variant's `#[source]` holds when the cause is another library's error.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// A source that can be cloned with the error that holds it: a snapshot keeps its blob's failure
 /// and hands out copies of it (see `manager::flow::owned_failure`).
-pub type SharedError = std::sync::Arc<dyn std::error::Error + Send + Sync>;
+pub type SharedError = Arc<dyn std::error::Error + Send + Sync>;
 
 /// Every goetia error. A variant is named for the layer that raised it, and its `Display` is its
 /// own context only, never its source's text: print the whole chain with [`Error::report`].
@@ -423,7 +433,7 @@ pub enum Error {
          could be created, so the daemon is not installed: re-run install, which decides against what is there",
         path = path.display()
     )]
-    StaleJobBootedOut { id: String, path: PathBuf, found: String },
+    StaleJobBootedOut { id: String, path: PathBuf, found: Occupant },
 
     /// goetia will ask no service manager here, on positive evidence: systemd's offline mode, a
     /// chroot, or a system systemd did not boot. `evidence` says which. goetia refuses there
@@ -470,7 +480,7 @@ pub enum Error {
     /// `source` is the failed start.
     #[error(
         "its spec blob could not be read, so the start was judged as a `type: managed` service's ({})",
-        blob.report()
+        Chain(&**blob)
     )]
     StartAsManaged {
         blob: Box<Error>,
@@ -621,7 +631,7 @@ impl Error {
     ) -> Self {
         Error::Blob {
             message: message.into(),
-            source: Some(std::sync::Arc::new(source)),
+            source: Some(Arc::new(source)),
         }
     }
 
@@ -661,119 +671,6 @@ impl Error {
     }
 }
 
-/// Why goetia says what it does about an id it cannot use or classify: a refused install, or a
-/// `list` entry. It is cheap to clone, and two reasons are equal when they read the same.
-///
-/// `Display` prints it as [`Error::report`] prints an error.
-#[derive(Debug, Clone)]
-pub enum Reason {
-    /// goetia's own words, with no error under them.
-    Said(String),
-    /// The error goetia failed on, and nothing else.
-    Failed(Arc<Error>),
-    /// The error goetia failed on, set inside its own words: `before`, the error's report, `after`.
-    Around {
-        before: String,
-        error: Arc<Error>,
-        after: String,
-    },
-}
-
-impl Reason {
-    pub fn said(text: impl Into<String>) -> Self {
-        Reason::Said(text.into())
-    }
-
-    pub fn failed(error: Error) -> Self {
-        Reason::Failed(Arc::new(error))
-    }
-
-    /// `what`, then the error under it: `what: error`.
-    pub fn because(what: impl Into<String>, error: Error) -> Self {
-        Reason::failed(Error::Step {
-            what: what.into(),
-            source: Box::new(error),
-        })
-    }
-
-    pub fn around(before: impl Into<String>, error: Error, after: impl Into<String>) -> Self {
-        Reason::Around {
-            before: before.into(),
-            error: Arc::new(error),
-            after: after.into(),
-        }
-    }
-
-    /// The error classification reads (see [`Error::cause`]), when there is one.
-    pub fn cause(&self) -> Option<&Error> {
-        match self {
-            Reason::Said(_) => None,
-            Reason::Failed(error) | Reason::Around { error, .. } => Some(error.cause()),
-        }
-    }
-}
-
-impl fmt::Display for Reason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Reason::Said(text) => f.write_str(text),
-            Reason::Failed(error) => write!(f, "{}", error.report()),
-            Reason::Around { before, error, after } => write!(f, "{before}{}{after}", error.report()),
-        }
-    }
-}
-
-impl PartialEq for Reason {
-    fn eq(&self, other: &Self) -> bool {
-        self.to_string() == other.to_string()
-    }
-}
-
-impl Eq for Reason {}
-
-/// What [`Error::report`] returns: the chain, formatted on `Display`.
-struct Report<'a>(&'a Error);
-
-impl fmt::Display for Report<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut remedies = Vec::new();
-        write_chain(self.0, f, &mut remedies)?;
-        for remedy in remedies {
-            write!(f, ". {remedy}")?;
-        }
-        Ok(())
-    }
-}
-
-/// Writes `e` and its causes, collecting the remedies met on the way into `remedies`, outermost
-/// first and each once: a [`Both`](Error::Both)'s halves can carry the same one.
-fn write_chain<'a>(
-    e: &'a (dyn std::error::Error + 'static),
-    f: &mut fmt::Formatter<'_>,
-    remedies: &mut Vec<&'a str>,
-) -> fmt::Result {
-    // A `#[source]` of type `Box<Error>` reaches here as the box.
-    let ours = e
-        .downcast_ref::<Error>()
-        .or_else(|| e.downcast_ref::<Box<Error>>().map(|b| &**b));
-    if let Some(Error::Both { first, then }) = ours {
-        write_chain(first.as_ref(), f, remedies)?;
-        f.write_str("; then: ")?;
-        return write_chain(then.as_ref(), f, remedies);
-    }
-    if let Some(remedy) = ours.and_then(Error::remedy) {
-        if !remedies.contains(&remedy) {
-            remedies.push(remedy);
-        }
-    }
-    write!(f, "{e}")?;
-    if let Some(source) = e.source() {
-        f.write_str(": ")?;
-        write_chain(source, f, remedies)?;
-    }
-    Ok(())
-}
-
 /// What `install`'s put-back found at the plist's path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PutBackFound {
@@ -781,6 +678,31 @@ pub enum PutBackFound {
     Gone,
     /// A plist other than the one `install` wrote.
     Replaced,
+}
+
+/// What `install` found where it was about to create a plist ([`Error::StaleJobBootedOut`]).
+#[derive(Debug)]
+pub enum Occupant {
+    File,
+    Directory,
+    Symlink,
+    /// A device, socket or the like.
+    Special,
+    /// The path could not be inspected. The error is part of the message, not the error's
+    /// [`source`](std::error::Error::source), which would print it a second time.
+    Unreadable(std::io::Error),
+}
+
+impl fmt::Display for Occupant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Occupant::File => f.write_str("a file"),
+            Occupant::Directory => f.write_str("a directory"),
+            Occupant::Symlink => f.write_str("a symlink"),
+            Occupant::Special => f.write_str("a special file"),
+            Occupant::Unreadable(e) => write!(f, "something that could not be read ({})", Chain(e)),
+        }
+    }
 }
 
 /// [`Error::PutBackBlocked`]'s predicate.
@@ -903,7 +825,7 @@ fn loaded_in_doubt(id: &str, read_failed: Option<&Error>, restore_failed: bool) 
         Some(read) => {
             format!(
                 "`{id}`'s plist was written, but whether launchd has its job loaded could not be read ({})",
-                read.report()
+                Chain(read)
             )
         }
     };

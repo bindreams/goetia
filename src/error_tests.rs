@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::{BoxError, Error, PutBackFound, Reason, VersionReading};
+use super::{BoxError, Error, Occupant, PutBackFound, VersionReading};
 
 #[skuld::test]
 fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
@@ -40,7 +40,7 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
         Error::StaleJobBootedOut {
             id: id(),
             path: PathBuf::new(),
-            found: String::new(),
+            found: Occupant::File,
         },
         Error::StartUnconfirmed { id: id() },
     ];
@@ -168,7 +168,7 @@ pub(crate) fn exit_status(code: i32) -> std::process::ExitStatus {
     std::os::windows::process::ExitStatusExt::from_raw(code as u32)
 }
 
-fn os(what: &str, path: &str, cause: &str) -> Error {
+pub(crate) fn os(what: &str, path: &str, cause: &str) -> Error {
     Error::Os {
         what: what.to_string(),
         path: Some(PathBuf::from(path)),
@@ -176,7 +176,7 @@ fn os(what: &str, path: &str, cause: &str) -> Error {
     }
 }
 
-fn not_installed() -> Error {
+pub(crate) fn not_installed() -> Error {
     Error::NotInstalled { id: "x".to_string() }
 }
 
@@ -284,7 +284,7 @@ fn a_step_over_an_indeterminate_error_is_indeterminate() {
 
 // Wording of each variant's report ====================================================================================
 
-fn id() -> String {
+pub(crate) fn id() -> String {
     "x".to_string()
 }
 
@@ -568,7 +568,7 @@ fn report_of_an_undetermined_id_names_the_failed_read_and_then_the_remedy() {
     ));
 }
 
-fn undetermined(recovery: &str) -> Error {
+pub(crate) fn undetermined(recovery: &str) -> Error {
     Error::Undetermined {
         id: id(),
         reason: Box::new(os("read", "/p", "denied")),
@@ -692,50 +692,6 @@ fn report_of_a_start_judged_as_managed_names_the_unreadable_blob_and_then_the_fa
          JSON: EOF): failed to start /p: stopped"
     );
     assert!(!e.is_indeterminate());
-}
-
-// Reason ==============================================================================================================
-
-#[skuld::test]
-fn a_reason_reads_as_its_words_and_its_error_report() {
-    assert_eq!(Reason::said("present in both").to_string(), "present in both");
-    assert_eq!(
-        Reason::failed(os("read", "/p", "denied")).to_string(),
-        "failed to read /p: denied"
-    );
-    assert_eq!(
-        Reason::because("cannot regenerate", os("read", "/p", "denied")).to_string(),
-        "cannot regenerate: failed to read /p: denied"
-    );
-    assert_eq!(
-        Reason::around("scan failed (", os("read", "/p", "denied"), "). Ownership is unknown.").to_string(),
-        "scan failed (failed to read /p: denied). Ownership is unknown."
-    );
-}
-
-#[skuld::test]
-fn a_reason_prints_the_remedy_of_the_error_it_holds_last() {
-    assert_eq!(
-        Reason::failed(undetermined("re-run as root")).to_string(),
-        "cannot determine whether daemon `x` is installed: failed to read /p: denied. re-run as root"
-    );
-}
-
-#[skuld::test]
-fn a_reason_gives_the_error_classification_reads() {
-    assert!(Reason::said("words").cause().is_none());
-    let step = Reason::because("outer", not_installed());
-    assert!(matches!(step.cause(), Some(Error::NotInstalled { .. })));
-    let around = Reason::around("(", not_installed(), ")");
-    assert!(matches!(around.cause(), Some(Error::NotInstalled { .. })));
-}
-
-#[skuld::test]
-fn two_reasons_are_equal_when_they_read_the_same() {
-    let reason = || Reason::failed(os("read", "/p", "denied"));
-    assert_eq!(reason(), reason().clone());
-    assert_ne!(reason(), Reason::said("something else"));
-    assert_eq!(Reason::said("failed to read /p: denied"), reason());
 }
 
 #[skuld::test]

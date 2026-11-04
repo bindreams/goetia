@@ -627,9 +627,10 @@ fn a_failed_read_after_a_refused_open_reports_both_errors() {
 
     let e = kill_service(&mut target).unwrap_err();
 
-    let msg = e.to_string();
-    assert!(msg.contains("scm read failed"), "{msg}");
-    assert!(msg.contains("access denied"), "{msg}");
+    assert_eq!(
+        e.to_string(),
+        "scm read failed (after the service's process could not be opened: access denied)"
+    );
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
 }
 
@@ -650,7 +651,7 @@ fn a_failed_confirming_read_closes_the_handle_and_terminates_nothing() {
 /// What a failure after a delivered termination reports: the process is dead, so the error must not
 /// read as a failed kill. The cause and its kind are kept.
 fn assert_terminated_but_unconfirmed(e: &io::Error, cause: &str) {
-    let text = e.to_string();
+    let text = crate::error::Chain(e).to_string();
     assert!(text.contains("was terminated"), "{text}");
     assert!(text.contains("waiting for SCM to record the exit failed"), "{text}");
     assert!(text.ends_with(cause), "{text}");

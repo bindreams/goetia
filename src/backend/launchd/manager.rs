@@ -73,7 +73,7 @@ use crate::backend::{
 };
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
-use crate::error::{Error, PutBackFound, Reason, Result};
+use crate::error::{Error, Occupant, PutBackFound, Reason, Result};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, Installed, Prepared, State, Status, Step, flow};
 use crate::spec::{AccountId, DaemonSpec, Id, Restart, User};
@@ -726,13 +726,13 @@ fn undo_write(target: &Path, wrote: &str, previous: Option<&str>) -> Result<()> 
 }
 
 /// What is at `path`, for a message.
-fn describe_at(path: &Path) -> String {
+fn describe_at(path: &Path) -> Occupant {
     match fs::symlink_metadata(path) {
-        Ok(m) if m.is_file() => "a file".to_owned(),
-        Ok(m) if m.is_dir() => "a directory".to_owned(),
-        Ok(m) if m.is_symlink() => "a symlink".to_owned(),
-        Ok(_) => "a special file".to_owned(),
-        Err(e) => format!("something that could not be read ({e})"),
+        Ok(m) if m.is_file() => Occupant::File,
+        Ok(m) if m.is_dir() => Occupant::Directory,
+        Ok(m) if m.is_symlink() => Occupant::Symlink,
+        Ok(_) => Occupant::Special,
+        Err(e) => Occupant::Unreadable(e),
     }
 }
 
@@ -1246,7 +1246,7 @@ impl backend::Backend for Launchd {
                     // Something now exists where `read` saw nothing, and `is_loaded` has been called.
                     PersistOutcome::Raced => {
                         return Err(if loaded {
-                            refuse::slot_taken_after_bootout(&spec.id, &target, &describe_at(&target))
+                            refuse::slot_taken_after_bootout(&spec.id, &target, describe_at(&target))
                         } else {
                             refuse::changed_during_install(&spec.id, &target)
                         });

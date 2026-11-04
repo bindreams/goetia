@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use crate::backend::launchd::generate;
-use crate::error::{Error, Result};
+use crate::error::{Error, Occupant, Result};
 use crate::spec::Id;
 
 /// Whether writing `desired` over `on_disk` would give the plist other content, which is what a
@@ -51,11 +51,11 @@ pub(crate) fn state_unknown_after_write(id: &Id, read: Error, restore: Result<()
 
 /// The error for a plist that was taken from `Create` after a stale job was booted out: `found` is
 /// what is at `path` now.
-pub(crate) fn slot_taken_after_bootout(id: &Id, path: &Path, found: &str) -> Error {
+pub(crate) fn slot_taken_after_bootout(id: &Id, path: &Path, found: Occupant) -> Error {
     Error::StaleJobBootedOut {
         id: id.to_string(),
         path: path.to_path_buf(),
-        found: found.to_owned(),
+        found,
     }
 }
 

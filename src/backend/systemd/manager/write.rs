@@ -153,7 +153,7 @@ pub(super) fn quarantine_if_still_ours(id: &str, expected_text: &str) -> Result<
         Err(e) => return Err(Error::os_at("quarantine", &final_path, e)),
     }
 
-    let actual = match classify_and_read(&backup_path).map_err(ReadFailure::into_io_error) {
+    let actual = match classify_and_read(&backup_path).map_err(ReadFailure::into_os_error) {
         Ok(RawState::Regular(text)) => text,
         Ok(RawState::Absent | RawState::NotOurs) => {
             restore_quarantine(id, &backup_path, &final_path)?;

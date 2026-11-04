@@ -26,6 +26,7 @@ pub(crate) use spares::{Needs, Reaper, spare};
 #[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
 pub(crate) use spares::{Spares, reapers, top_up};
 
+use crate::error::within;
 use crate::manager::budget::Deadline;
 
 // command =============================================================================================================
@@ -242,26 +243,6 @@ fn may_have_run(e: &cosca::error::Error) -> bool {
 /// The failure to make `what` before a spawn, which is therefore never attempted.
 fn not_run(what: &'static str) -> impl Fn(io::Error) -> cosca::error::Error {
     move |e| cosca::error::Error::Io(within(format!("no {what} could be made, so it was not run"), e))
-}
-
-/// `source` said in `context`, with its kind kept. The failure under `context` is the error's
-/// [`source`](std::error::Error::source), which [`Error::report`](crate::Error::report) prints
-/// after it: `context: source`.
-fn within(context: impl Into<String>, source: io::Error) -> io::Error {
-    #[derive(Debug, thiserror::Error)]
-    #[error("{context}")]
-    struct Within {
-        context: String,
-        #[source]
-        source: io::Error,
-    }
-    io::Error::new(
-        source.kind(),
-        Within {
-            context: context.into(),
-            source,
-        },
-    )
 }
 
 /// How [`wait_bounded`] lost its child, and whether the child had announced first.
