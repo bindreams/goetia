@@ -5,7 +5,6 @@
 //! itself, to exist as a real directory entry, not just resolve lexically. A real file avoids the
 //! problem entirely, matching `tests/marker_inertness.rs`'s own structure.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
@@ -35,16 +34,9 @@ const UNIT_DIR_EXCLUSIVE: skuld::Label;
 /// A minimal, real, long-running daemon: `sleep infinity` exists on every coreutils Ubuntu ships.
 pub(crate) fn mk(id: &str) -> DaemonSpec {
     DaemonSpec {
-        id: Id::try_from(id.to_string()).expect("valid id"),
-        name: id.to_string(),
-        command: vec!["/bin/sleep".to_string(), "infinity".to_string()],
-        cwd: None,
-        env: BTreeMap::new(),
-        user: User::Root,
         restart: Restart::OnFailure,
-        restart_delay: None,
-        logs: None,
         kind: Kind::Simple,
+        ..support::spec(id, vec!["/bin/sleep".to_string(), "infinity".to_string()])
     }
 }
 
