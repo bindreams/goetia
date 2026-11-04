@@ -1,20 +1,21 @@
 //! Thin wrappers over `systemctl` subprocess invocations: reload, start/stop, and reading a unit's
-//! live state back — every one through the manager boundary, [`door`] and [`answered`].
+//! live state back — every one through the manager boundary, [`Systemctl::door`] and [`answered`].
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
-use std::process::Command;
+use std::process::ExitStatus;
 
-use crate::backend::bounded::{self, Capture, Finished, Role};
+use crate::backend::bounded::{Capture, Finished, Role};
+use crate::backend::client::{Client, ClientError, Real, Wait};
 use crate::error::{Error, Result};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, State, Status};
 
 // The manager boundary ================================================================================================
 
-/// What one `systemctl` run is for: what [`door`] establishes before it runs, and what a failure to
-/// run it says.
+/// What one `systemctl` run is for: what [`Systemctl::door`] establishes before it runs, and what a
+/// failure to run it says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Purpose {
     /// One of the version gate's own probes.
@@ -26,20 +27,92 @@ enum Purpose {
     Request,
 }
 
-/// Where every `systemctl` goetia runs is refused before it is spawned: on evidence, known without
-/// asking, that no manager can be asked here ([`Host::evidence`]); and for a request, until the
-/// manager has passed the version gate. The gate's `show` is what finds out, before anything acts,
-/// a chroot goetia could not see for itself: `enable` and `disable` act on unit files offline, in a
-/// chroot and on a system systemd did not boot, and say nothing about it (measured on 257).
-/// [`answered`] is the other half.
-fn door(purpose: Purpose) -> Result<()> {
-    if let Some(evidence) = host().evidence() {
-        return Err(no_manager(evidence));
+/// `systemctl`, reached through a [`Client`], on the system `host` reads. Every run goes through
+/// [`Systemctl::door`] and [`answered`].
+pub(super) struct Systemctl {
+    client: Box<dyn Client>,
+    /// Read at every [`Systemctl::door`], never kept: the evidence is the system as it is at the run.
+    host: Box<dyn Fn() -> Host + Send + Sync>,
+}
+
+impl Systemctl {
+    pub(super) fn new(client: Box<dyn Client>, host: Box<dyn Fn() -> Host + Send + Sync>) -> Systemctl {
+        Systemctl { client, host }
     }
-    if purpose == Purpose::Request {
-        require_supported()?;
+
+    /// The real `systemctl`, on this system.
+    pub(super) fn native() -> Systemctl {
+        Systemctl::new(
+            Box::new(Real::new(vec!["systemctl".to_string()], environment)),
+            Box::new(Host::this),
+        )
     }
-    Ok(())
+
+    /// Where every `systemctl` goetia runs is refused before it is spawned: on evidence, known
+    /// without asking, that no manager can be asked here ([`Host::evidence`]); and for a request,
+    /// until the manager has passed the version gate. The gate's `show` is what finds out, before
+    /// anything acts, a chroot goetia could not see for itself: `enable` and `disable` act on unit
+    /// files offline, in a chroot and on a system systemd did not boot, and say nothing about it
+    /// (measured on 257). [`answered`] is the other half.
+    fn door(&self, purpose: Purpose) -> Result<()> {
+        if let Some(evidence) = (self.host)().evidence() {
+            return Err(no_manager(evidence));
+        }
+        if purpose == Purpose::Request {
+            self.require_supported()?;
+        }
+        Ok(())
+    }
+
+    /// `systemctl <args>` for `purpose`, through [`Systemctl::door`], waited on as `wait`, and
+    /// [`answered`]. A failure to run it is [`unran`].
+    fn run(&self, purpose: Purpose, args: &[&str], wait: Wait) -> Result<Finished> {
+        self.door(purpose)?;
+        let finished = self
+            .client
+            .run(args, wait)
+            .map_err(|error| unran(purpose, args, error))?;
+        if let Finished::Exited { capture, .. } = &finished {
+            answered(&capture.stdout, &capture.stderr)?;
+        }
+        Ok(finished)
+    }
+
+    /// [`Systemctl::run`] to completion, which never expires.
+    fn completed(&self, purpose: Purpose, args: &[&str]) -> Result<(ExitStatus, Capture)> {
+        match self.run(purpose, args, Wait::ToCompletion)? {
+            Finished::Exited { status, capture } => Ok((status, capture)),
+            Finished::Expired => unreachable!("a run to completion does not expire"),
+        }
+    }
+}
+
+/// What a `systemctl` that failed to complete says, by what it was for. A request's two ways to
+/// fail are kept apart: one never run was never sent, and one that may have run, or was lost after
+/// it did, may have reached the manager ([`Error::RequestInDoubt`], with `reached` as far as the
+/// client announced it). Anything else that fails to run is a plain failure, since it changes
+/// nothing.
+fn unran(purpose: Purpose, args: &[&str], error: ClientError) -> Error {
+    let request = format!("systemctl {}", args.join(" "));
+    match (purpose, error) {
+        (Purpose::Request, ClientError::NotRun(e)) => {
+            Error::Other(format!("could not run `{request}`, so it was not sent: {e}"))
+        }
+        (Purpose::Request, ClientError::MayHaveRun(e)) => Error::RequestInDoubt {
+            request,
+            reached: false,
+            detail: e.to_string(),
+        },
+        (Purpose::Request, ClientError::Lost { error, announced }) => Error::RequestInDoubt {
+            request,
+            reached: announced,
+            detail: error.to_string(),
+        },
+        (
+            Purpose::Probe | Purpose::Read,
+            ClientError::NotRun(e) | ClientError::MayHaveRun(e) | ClientError::Lost { error: e, .. },
+        ) => Error::Other(format!("failed to run `{request}`: {e}")),
+    }
 }
 
 /// What `systemctl` says when it asked no manager and did nothing, exiting `0`: "Running in chroot,
@@ -50,15 +123,17 @@ const IGNORED: [&str; 2] = ["ignoring command", "ignoring request"];
 
 /// Every `systemctl` answer, checked before anything reads it as one: an answer saying it ignored
 /// what it was asked ([`IGNORED`]) is the refusal on every path, and never a success: the backstop
-/// for what [`door`] could not see.
+/// for what [`Systemctl::door`] could not see.
 ///
-/// It is the last line in a chroot with no `/proc` at all — `/proc/1/root` and both mount tables
-/// are `ENOENT`, so goetia establishes nothing, while `systemctl` reports the chroot from that same
-/// absence (MEASURED, 255 and 257). Nothing in the environment can put it there instead: every
-/// switch that would declare a chroot is taken off the child ([`DENIED`]), so what reaches this is
-/// always the child's own detection. Where PID 1 is hidden from goetia rather than absent, as under
-/// a `hidepid` `/proc`, `systemctl` runs with goetia's credentials and hits the same wall: it
-/// reports nothing, and this backstop does not fire either.
+/// It is the last line against a chroot that `systemctl`'s own detection (`running_in_chroot()`, run
+/// in the child) finds and [`Host::evidence`], which reads `/` and `/proc` for itself, does not:
+/// wherever goetia's readings establish nothing, the child's can still decide. An unresolvable
+/// `/proc/self` is no longer such a case, since goetia reads it itself ([`Chroot::NoProc`]) and
+/// refuses before it spawns. No environment switch can stand in for that detection: every one that
+/// would declare a chroot is taken off the child ([`DENIED`]), so what reaches this is always the
+/// child's own. Where PID 1 is hidden from goetia rather than absent, as under a `hidepid` `/proc`,
+/// `systemctl` runs with goetia's credentials and hits the same wall: it reports nothing, and this
+/// backstop does not fire either.
 fn answered(stdout: &[u8], stderr: &[u8]) -> Result<()> {
     let ignored = |stream: &[u8]| {
         String::from_utf8_lossy(stream)
@@ -99,9 +174,11 @@ const ENVIRONMENT: [(&str, &str); 3] = [
 /// `SYSTEMCTL_*`. *Three* of the `SYSTEMD_*` turn off, each on its own, the chroot report
 /// [`answered`] is the last line against. Naming them is what missed the next one twice.
 ///
-/// The three, MEASURED on 255 and 257 in a chroot with no `/proc`, where goetia establishes nothing
-/// of its own: `SYSTEMD_IGNORE_CHROOT` true; `SYSTEMD_IN_CHROOT` false, on 257 on; and
-/// `SYSTEMD_OFFLINE` false, on every supported version — `running_in_chroot_or_offline()`
+/// The three, MEASURED on 255 and 257 in a chroot with no `/proc`, where `systemctl` ran and goetia
+/// established nothing of its own (it refuses there now, before a spawn, so these names matter only
+/// where `systemctl` still runs and detects a chroot itself): `SYSTEMD_IGNORE_CHROOT` true;
+/// `SYSTEMD_IN_CHROOT` false, on 257 on; and `SYSTEMD_OFFLINE` false, on every supported version —
+/// `running_in_chroot_or_offline()`
 /// (systemd's `src/shared/verbs.c`) consults that one first and returns it whenever it *parses*, so
 /// a false value discards the chroot check as surely as `SYSTEMD_IGNORE_CHROOT=1` does. With any of
 /// the three inherited, `install` from such a chroot exited `0` and wrote the unit into it.
@@ -145,144 +222,26 @@ const ENVIRONMENT: [(&str, &str); 3] = [
 /// `libsystemd-shared-257.so`.
 const DENIED: [&str; 2] = ["SYSTEMD_", "SYSTEMCTL_"];
 
-/// A child's environment, as each of the two `Command` types goetia spawns a `systemctl` through
-/// offers it: [`environment`] is applied through this, so neither path can be given one and not the
-/// other.
-trait Environment {
-    fn set(&mut self, key: &str, value: &str);
-    fn remove(&mut self, key: &str);
-}
-
-impl Environment for Command {
-    fn set(&mut self, key: &str, value: &str) {
-        self.env(key, value);
-    }
-
-    fn remove(&mut self, key: &str) {
-        self.env_remove(key);
-    }
-}
-
-impl Environment for cosca::Command {
-    fn set(&mut self, key: &str, value: &str) {
-        self.env(key, value);
-    }
-
-    fn remove(&mut self, key: &str) {
-        self.env_remove(key);
-    }
-}
-
-/// `cmd`'s environment as every `systemctl` goetia runs gets it: every [`DENIED`] name `inherited`
-/// carries removed from it, and [`ENVIRONMENT`] set on it. The two are kept disjoint here — a name
-/// goetia sets is never also removed — rather than by the order the calls happen to be made in, so
-/// neither `Command`'s own rule for a key both set and removed can decide what the child gets.
-fn environment_from(cmd: &mut impl Environment, inherited: impl Iterator<Item = String>) {
+/// The inherited names that are removed from a `systemctl`'s environment: every [`DENIED`] one that
+/// [`ENVIRONMENT`] does not set. The two are kept disjoint here — a name goetia sets is never also
+/// removed — rather than by the order the calls happen to be made in, so `Command`'s own rule for a
+/// key both set and removed cannot decide what the child gets.
+fn removals(inherited: impl Iterator<Item = String>) -> Vec<String> {
     let given = |key: &str| ENVIRONMENT.iter().any(|(name, _)| *name == key);
     let denied = |key: &str| DENIED.iter().any(|prefix| key.starts_with(prefix));
-    for key in inherited.filter(|key| denied(key) && !given(key)) {
-        cmd.remove(&key);
+    inherited.filter(|key| denied(key) && !given(key)).collect()
+}
+
+/// `cmd`'s environment as every `systemctl` goetia runs gets it: every inherited [`DENIED`] name
+/// [removed](removals), and [`ENVIRONMENT`] set. The names are those this process would pass a
+/// child of its own; one that is not UTF-8 is skipped, because `getenv` finds a switch by its exact
+/// ASCII name, so a name that does not decode is not one of them.
+fn environment(cmd: &mut cosca::Command) {
+    for key in removals(std::env::vars_os().filter_map(|(key, _)| key.into_string().ok())) {
+        cmd.env_remove(key);
     }
     for (key, value) in ENVIRONMENT {
-        cmd.set(key, value);
-    }
-}
-
-/// [`environment_from`] over the names this process would pass a child of its own. A name that is
-/// not UTF-8 is skipped: `getenv` finds a switch by its exact ASCII name, so a name that does not
-/// decode is not one of them.
-fn environment(cmd: &mut impl Environment) {
-    environment_from(cmd, std::env::vars_os().filter_map(|(key, _)| key.into_string().ok()));
-}
-
-/// `systemctl <args>` for `purpose`, through [`door`], run to completion, and [`answered`].
-fn systemctl(purpose: Purpose, args: &[&str]) -> Result<std::process::Output> {
-    door(purpose)?;
-    let program = program();
-    ran(purpose, &program.iter().map(String::as_str).collect::<Vec<_>>(), args)
-}
-
-/// [`systemctl`] past its door: `program` then `args`, run to completion, and [`answered`]. A
-/// request's two ways to fail are kept apart ([`requested`]); anything else that fails to run is a
-/// plain failure, since it changes nothing.
-fn ran(purpose: Purpose, program: &[&str], args: &[&str]) -> Result<std::process::Output> {
-    let (bin, prefix) = program.split_first().expect("a program to run");
-    let mut cmd = Command::new(bin);
-    cmd.args(prefix).args(args);
-    environment(&mut cmd);
-    let output = match purpose {
-        Purpose::Request => requested(&mut cmd, "systemctl", args)?,
-        Purpose::Probe | Purpose::Read => cmd
-            .output()
-            .map_err(|e| Error::Other(format!("failed to run `systemctl {}`: {e}", args.join(" "))))?,
-    };
-    answered(&output.stdout, &output.stderr)?;
-    Ok(output)
-}
-
-/// The argv every `systemctl` starts with: `systemctl`, or on a test's thread its stand-in.
-fn program() -> Vec<String> {
-    #[cfg(test)]
-    if let Some(program) = stand_in::program() {
-        return program;
-    }
-    vec!["systemctl".to_string()]
-}
-
-/// What goetia reads of this system without asking `systemctl`, or on a test's thread what it
-/// stands in.
-fn host() -> Host {
-    #[cfg(test)]
-    if let Some(host) = stand_in::host() {
-        return host;
-    }
-    Host::this()
-}
-
-/// A stand-in for `systemctl`, and for the host it runs on, on this thread: every `systemctl` goetia
-/// runs is `sh -c <script> systemctl <args>`, so a test can drive every path without a systemd.
-/// Never a file on disk — `exec`ing one just written races every `fork` another test thread makes
-/// (`ETXTBSY`).
-#[cfg(test)]
-pub(super) mod stand_in {
-    use std::cell::RefCell;
-
-    use super::Host;
-
-    thread_local! {
-        static STAND_IN: RefCell<Option<(Option<String>, Host)>> = const { RefCell::new(None) };
-    }
-
-    /// Until the returned guard drops, run `script` in place of `systemctl` — the real one for
-    /// `None` — on `host`.
-    pub(in crate::backend::systemd) fn set(script: Option<&str>, host: Host) -> Guard {
-        STAND_IN.set(Some((script.map(str::to_string), host)));
-        Guard(())
-    }
-
-    /// See [`set`].
-    pub(in crate::backend::systemd) struct Guard(());
-
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            STAND_IN.set(None);
-        }
-    }
-
-    pub(super) fn program() -> Option<Vec<String>> {
-        STAND_IN.with_borrow(|stand_in| {
-            let script = stand_in.as_ref()?.0.as_ref()?;
-            Some(vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                script.clone(),
-                "systemctl".to_string(),
-            ])
-        })
-    }
-
-    pub(super) fn host() -> Option<Host> {
-        STAND_IN.with_borrow(|stand_in| stand_in.as_ref().map(|(_, host)| host.clone()))
+        cmd.env(key, value);
     }
 }
 
@@ -295,10 +254,11 @@ enum Evidence {
     /// `/run/systemd/system` does not exist, which systemd makes when it boots a system
     /// (`sd_booted()`): not booted with systemd, or a chroot with no `/run` of the host's.
     NotBooted,
-    /// `/` is established to be a root of goetia's own rather than this system's, found as this
-    /// says: either it is not PID 1's root — a chroot (`running_in_chroot()`), or a container
-    /// sharing the host's PID namespace — or it is no mount at all, which only `chroot(2)` leaves,
-    /// and which PID 1's table has no say in.
+    /// `/` is established to be a root of goetia's own rather than this system's, by one of:
+    /// - it is not PID 1's root, by directory or by mount: a chroot (`running_in_chroot()`), or a
+    ///   container sharing the host's PID namespace;
+    /// - it is no mount at all, which only `chroot(2)` leaves, and which PID 1's table has no say in;
+    /// - `/proc/self` does not resolve, so no `/proc` of goetia's own is mounted.
     Chroot(Chroot),
     /// `systemctl` said, in this line, that it ignored what it was asked: its chroot report.
     Ignored(String),
@@ -321,6 +281,10 @@ impl std::fmt::Display for Evidence {
                 f,
                 "no mount is at `/` (`{OWN_MOUNTS}`): `/` is a directory inside one, so goetia runs in a chroot"
             ),
+            Evidence::Chroot(Chroot::NoProc) => write!(
+                f,
+                "`{PROC_SELF}` does not resolve (no `/proc` of goetia's own is mounted), which systemd treats as a chroot"
+            ),
             Evidence::Ignored(line) => write!(f, "`systemctl` said {line:?}"),
         }
     }
@@ -340,6 +304,12 @@ const INIT_ROOT: &str = "/proc/1/root";
 const OWN_MOUNTS: &str = "/proc/self/mountinfo";
 const INIT_MOUNTS: &str = "/proc/1/mountinfo";
 
+/// goetia's own entry in `/proc`. It resolves only in a `/proc` of goetia's own PID namespace, so
+/// `ENOENT` on it establishes that none is mounted: a `/proc` belonging to another PID namespace,
+/// where goetia has no pid, and an empty `/proc` directory both give it. systemd treats that as a
+/// chroot (`running_in_chroot()` falls back to `proc_mounted()`).
+const PROC_SELF: &str = "/proc/self";
+
 /// How goetia established that its `/` is a root of its own rather than this system's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Chroot {
@@ -351,6 +321,10 @@ enum Chroot {
     /// No mount is at `/`: `/` is a directory inside one, which only `chroot(2)` makes a root — see
     /// [`mounts_differ`]. Readable unelevated, and without PID 1's table.
     NoMount,
+    /// [`PROC_SELF`] is established absent: no `/proc` of goetia's own is mounted, which systemd
+    /// treats as a chroot. Nothing else can then be read, and cosca kills any child whose identity
+    /// it cannot read from `/proc`, so no `systemctl` could run to report the chroot itself.
+    NoProc,
 }
 
 /// What goetia reads of this system without asking `systemctl`: a seam, so a test can stand any
@@ -371,12 +345,17 @@ impl Host {
         Host {
             offline: std::env::var("SYSTEMD_OFFLINE").ok(),
             unbooted: established_absent(std::path::Path::new(SD_BOOTED)),
-            chroot: chroot_from(identity("/"), identity(INIT_ROOT), || {
-                (
-                    std::fs::read_to_string(OWN_MOUNTS),
-                    std::fs::read_to_string(INIT_MOUNTS),
-                )
-            }),
+            chroot: chroot_from(
+                identity("/"),
+                identity(INIT_ROOT),
+                established_absent(std::path::Path::new(PROC_SELF)),
+                || {
+                    (
+                        std::fs::read_to_string(OWN_MOUNTS),
+                        std::fs::read_to_string(INIT_MOUNTS),
+                    )
+                },
+            ),
         }
     }
 
@@ -400,11 +379,12 @@ fn identity(path: &str) -> std::io::Result<(u64, u64)> {
     std::fs::metadata(path).map(|meta| (meta.dev(), meta.ino()))
 }
 
-/// How `/` is established to be a root of goetia's own, if it is. `root` and `init_root`, both
-/// read, decide, either way: that is `running_in_chroot()`'s own check. A stat that failed —
-/// `EACCES` on `/proc/1/root` for a caller that may not trace PID 1, or no `/proc` — establishes
-/// nothing, and leaves it to the mount `tables` ([`mounts_differ`]); where they establish nothing
-/// either, the other checks and systemctl's own report ([`answered`]) decide.
+/// How `/` is established to be a root of goetia's own, if it is. `proc_absent` decides first:
+/// with no `/proc` of goetia's own mounted, none of the rest can be read. Then `root` and `init_root`, both read,
+/// decide, either way: that is `running_in_chroot()`'s own check. A stat that failed — `EACCES` on
+/// `/proc/1/root` for a caller that may not trace PID 1 — establishes nothing, and leaves it to the
+/// mount `tables` ([`mounts_differ`]); where they establish nothing either, the other checks and
+/// systemctl's own report ([`answered`]) decide.
 ///
 /// Read regardless of what the environment declares about a chroot: this is goetia's own evidence,
 /// and a declaration is evidence of nothing. The child is not left to trust one either — [`DENIED`]
@@ -412,8 +392,12 @@ fn identity(path: &str) -> std::io::Result<(u64, u64)> {
 fn chroot_from(
     root: std::io::Result<(u64, u64)>,
     init_root: std::io::Result<(u64, u64)>,
+    proc_absent: bool,
     tables: impl FnOnce() -> (std::io::Result<String>, std::io::Result<String>),
 ) -> Option<Chroot> {
+    if proc_absent {
+        return Some(Chroot::NoProc);
+    }
     match (root, init_root) {
         (Ok(root), Ok(init_root)) => (root != init_root).then_some(Chroot::Root),
         _ => {
@@ -485,81 +469,40 @@ fn is_true(value: &str) -> bool {
 
 // Requests ============================================================================================================
 
-/// `systemctl <args>`, a request — `daemon-reload`, `enable`, `disable` — run to completion. See
-/// [`requested`] for what a failure to run it says.
-pub(super) fn run_systemctl(args: &[&str]) -> Result<std::process::Output> {
-    systemctl(Purpose::Request, args)
-}
-
-/// `cmd`, a request, run to completion, with its two ways to fail kept apart. std's `spawn` fails
-/// only before the program runs — `fork`, or an `exec` the child reports back — so that is a
-/// request never sent. Reading its output or waiting on it fails only after, when the request may
-/// already be out: [`Error::RequestInDoubt`], never the plain failure that says it was not sent.
-/// `Command::output()` would merge the two; its stdin, `/dev/null`, is kept.
-fn requested(cmd: &mut Command, program: &str, args: &[&str]) -> Result<std::process::Output> {
-    requested_with(cmd, program, args, |child| {
-        #[cfg(test)]
-        if let Some(e) = bounded::test_hook::waiting() {
-            child.wait_with_output()?;
-            return Err(std::io::Error::other(e.to_string()));
+impl Systemctl {
+    pub(super) fn daemon_reload(&self) -> Result<()> {
+        let (status, capture) = self.completed(Purpose::Request, &["daemon-reload"])?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(Error::Other(format!(
+                "systemctl daemon-reload failed: {}",
+                String::from_utf8_lossy(&capture.stderr)
+            )))
         }
-        child.wait_with_output()
-    })
-}
-
-/// [`requested`], with how the running child is waited on named, so a test can make that fail.
-fn requested_with(
-    cmd: &mut Command,
-    program: &str,
-    args: &[&str],
-    wait: impl FnOnce(std::process::Child) -> std::io::Result<std::process::Output>,
-) -> Result<std::process::Output> {
-    let request = format!("{program} {}", args.join(" "));
-    let child = cmd
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| Error::Other(format!("could not run `{request}`, so it was not sent: {e}")))?;
-    wait(child).map_err(|e| Error::RequestInDoubt {
-        request,
-        reached: false,
-        detail: e.to_string(),
-    })
-}
-
-pub(super) fn daemon_reload() -> Result<()> {
-    let output = run_systemctl(&["daemon-reload"])?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(Error::Other(format!(
-            "systemctl daemon-reload failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )))
     }
-}
 
-/// `daemon-reload` after a unit file write that itself succeeded. A failure here must not be reported
-/// as a successful install — the on-disk artifact and systemd's loaded view of it may have diverged
-/// — and says the unit was written. A reload in doubt stays in doubt, exit `4`; any other failure
-/// is exit `1`.
-pub(super) fn daemon_reload_or_report(id: &str) -> Result<()> {
-    daemon_reload().map_err(|e| match e {
-        Error::RequestInDoubt {
-            request,
-            reached,
-            detail,
-        } => Error::RequestInDoubt {
-            request,
-            reached,
-            detail: format!("wrote the unit for `{id}`, so systemd may not have picked it up yet: {detail}"),
-        },
-        e => Error::Other(format!(
-            "wrote the unit for `{id}` but `systemctl daemon-reload` failed, so systemd may not have \
-             picked it up yet: {e}"
-        )),
-    })
+    /// `daemon-reload` after a unit file write that itself succeeded. A failure here must not be
+    /// reported as a successful install — the on-disk artifact and systemd's loaded view of it may
+    /// have diverged — and says the unit was written. A reload in doubt stays in doubt, exit `4`;
+    /// any other failure is exit `1`.
+    pub(super) fn daemon_reload_or_report(&self, id: &str) -> Result<()> {
+        self.daemon_reload().map_err(|e| match e {
+            Error::RequestInDoubt {
+                request,
+                reached,
+                detail,
+            } => Error::RequestInDoubt {
+                request,
+                reached,
+                detail: format!("wrote the unit for `{id}`, so systemd may not have picked it up yet: {detail}"),
+            },
+            e => Error::Other(format!(
+                "wrote the unit for `{id}` but `systemctl daemon-reload` failed, so systemd may not have \
+                 picked it up yet: {e}"
+            )),
+        })
+    }
 }
 
 // The version gate ====================================================================================================
@@ -571,12 +514,14 @@ const SYSTEMD_FLOOR: u32 = 242;
 /// The oldest systemd that parses the `Type=exec` generated units declare.
 const TYPE_EXEC: u32 = 240;
 
-/// Refuse a systemd older than [`SYSTEMD_FLOOR`]. Asked before goetia writes a unit, and by
-/// [`door`] before every request: an older systemd does not reject `Type=exec` but logs that it
-/// cannot parse it and runs the unit as `Type=simple`, silently losing the failed-exec detection
-/// the directive is there for. Asked once per [`GateScope`].
-pub(super) fn require_supported() -> Result<()> {
-    gated(supported)
+impl Systemctl {
+    /// Refuse a systemd older than [`SYSTEMD_FLOOR`]. Asked before goetia writes a unit, and by
+    /// [`Systemctl::door`] before every request: an older systemd does not reject `Type=exec` but
+    /// logs that it cannot parse it and runs the unit as `Type=simple`, silently losing the
+    /// failed-exec detection the directive is there for. Asked once per [`GateScope`].
+    pub(super) fn require_supported(&self) -> Result<()> {
+        gated(|| self.supported())
+    }
 }
 
 thread_local! {
@@ -622,7 +567,7 @@ pub(super) fn gated(check: impl FnOnce() -> Result<()>) -> Result<()> {
     Ok(())
 }
 
-/// Whose version [`supported`] judges.
+/// Whose version [`Systemctl::supported`] judges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Source {
     /// The running manager's `Version` property. PID 1 is what parses `Type=exec` and answers
@@ -633,39 +578,42 @@ enum Source {
     Client,
 }
 
-/// The gate itself: both the running manager and the client must be new enough. Where no manager
-/// can be asked there is no gate to pass — the probes' own [`door`] and [`answered`] refuse there —
-/// and any other failure to read the manager's version is a refusal too: a manager that is running
-/// and could not be asked is not one goetia can vouch for.
-fn supported() -> Result<()> {
-    let client = systemctl(Purpose::Probe, &["--version"])?;
-    if !client.status.success() {
-        return Err(Error::Other(format!(
-            "`systemctl --version` failed, so goetia cannot tell whether this is systemd {SYSTEMD_FLOOR}+: {}",
-            String::from_utf8_lossy(&client.stderr)
-        )));
+impl Systemctl {
+    /// The gate itself: both the running manager and the client must be new enough. Where no
+    /// manager can be asked there is no gate to pass — the probes' own [`Systemctl::door`] and
+    /// [`answered`] refuse there — and any other failure to read the manager's version is a
+    /// refusal too: a manager that is running and could not be asked is not one goetia can vouch
+    /// for.
+    fn supported(&self) -> Result<()> {
+        let (status, capture) = self.completed(Purpose::Probe, &["--version"])?;
+        if !status.success() {
+            return Err(Error::Other(format!(
+                "`systemctl --version` failed, so goetia cannot tell whether this is systemd {SYSTEMD_FLOOR}+: {}",
+                String::from_utf8_lossy(&capture.stderr)
+            )));
+        }
+        let client = String::from_utf8_lossy(&capture.stdout);
+        let client = client.lines().next().unwrap_or_default();
+        let (status, capture) = self.completed(Purpose::Probe, &["show", "--property=Version", "--value"])?;
+        let reported = String::from_utf8_lossy(&capture.stdout);
+        if !status.success() || reported.trim().is_empty() {
+            let how = if status.success() {
+                "printed no version".to_string()
+            } else {
+                format!("failed ({status})")
+            };
+            return Err(Error::Other(format!(
+                "`systemctl show --property=Version` {how}, so goetia cannot tell whether the running systemd is \
+                 {SYSTEMD_FLOOR}+: {}",
+                String::from_utf8_lossy(&capture.stderr)
+            )));
+        }
+        let verdicts = [
+            verdict(Source::Manager, reported.trim()),
+            verdict(Source::Client, client),
+        ];
+        refusal(verdicts.into_iter().flatten().collect())
     }
-    let client = String::from_utf8_lossy(&client.stdout);
-    let client = client.lines().next().unwrap_or_default();
-    let manager = systemctl(Purpose::Probe, &["show", "--property=Version", "--value"])?;
-    let reported = String::from_utf8_lossy(&manager.stdout);
-    if !manager.status.success() || reported.trim().is_empty() {
-        let how = if manager.status.success() {
-            "printed no version".to_string()
-        } else {
-            format!("failed ({})", manager.status)
-        };
-        return Err(Error::Other(format!(
-            "`systemctl show --property=Version` {how}, so goetia cannot tell whether the running systemd is \
-             {SYSTEMD_FLOOR}+: {}",
-            String::from_utf8_lossy(&manager.stderr)
-        )));
-    }
-    let verdicts = [
-        verdict(Source::Manager, reported.trim()),
-        verdict(Source::Client, client),
-    ];
-    refusal(verdicts.into_iter().flatten().collect())
 }
 
 /// The major version in what `source` reported: the `Version` property (`257.13-1~deb13u1`,
@@ -758,72 +706,37 @@ fn enqueued(stderr: &[u8]) -> bool {
     stderr.windows(LINE.len()).any(|w| w == LINE)
 }
 
-/// One `systemctl <verb> <unit>` under `budget`, as three deliberately different paths.
-///
-/// A budget that does not wait becomes `systemctl <verb> --no-block`, the exact native expression
-/// of "issue the request and return": systemd enqueues the job and `systemctl` exits without
-/// waiting for it to complete. `Budget::Unbounded` is the plain blocking call. Both keep
-/// `Command::output()`, because neither has anything to bound — cosca enters this module only where
-/// a bound is actually required, which is the third path and only the third.
-///
-/// That third path waits on `deadline`, which the caller derived at verb entry — but the deadline
-/// bounds only the wait for the job, never whether it is enqueued: until `systemctl` announces the
-/// job ([`enqueued`]) the wait is unbounded, so a budget a few milliseconds long still reaches
-/// systemd, and an expiry is then exactly what `budget::timed_out` says it is. `budget` only picks
-/// the path and the wording.
-fn run_verb(verb: &str, unit: &str, budget: Budget, deadline: Deadline) -> Result<Finished> {
-    door(Purpose::Request)?;
-    let program = program();
-    let program: Vec<&str> = program.iter().map(String::as_str).collect();
-    run_verb_via(&program, &verb_args(verb, unit, budget), budget, deadline)
-}
-
-/// Whether [`run_verb`] takes its bounded path under `budget` — the one whose `systemctl` goetia
-/// watches, and which needs a thread for each of its streams to do it.
+/// Whether [`Systemctl::run_verb`] takes its bounded path under `budget` — the one whose
+/// `systemctl` goetia watches, and which needs a thread for each of its streams to do it.
 pub(super) fn watched(budget: Budget) -> bool {
     budget.waits() && budget != Budget::Unbounded
 }
 
-/// [`run_verb`] past its [`door`], with the program named — the argv `args` follow — so its bounded
-/// path is testable against a child that cannot exit on its own. What either path answers is
-/// [`answered`].
-fn run_verb_via(program: &[&str], args: &[&str], budget: Budget, deadline: Deadline) -> Result<Finished> {
-    let failed = |e: String| Error::Other(format!("failed to run `systemctl {}`: {e}", args.join(" ")));
-    let in_doubt = |e: String, reached: bool| Error::RequestInDoubt {
-        request: format!("systemctl {}", args.join(" ")),
-        reached,
-        detail: e,
-    };
-    if !watched(budget) {
-        let output = ran(Purpose::Request, program, args)?;
-        // `output()` reads both pipes to EOF before returning, so on either
-        // unbounded path nothing was cut short and `complete` is simply true.
-        return Ok(Finished::Exited {
-            status: output.status,
-            capture: Capture {
-                stdout: output.stdout,
-                stderr: output.stderr,
-                complete: true,
-            },
-        });
+impl Systemctl {
+    /// One `systemctl <verb> <unit>` under `budget`, as two deliberately different paths.
+    ///
+    /// A budget that does not wait becomes `systemctl <verb> --no-block`, the exact native
+    /// expression of "issue the request and return": systemd enqueues the job and `systemctl` exits
+    /// without waiting for it to complete. `Budget::Unbounded` is the plain blocking call. Both run
+    /// to completion, because neither has anything to bound: a bound is required only on the
+    /// second path.
+    ///
+    /// That path waits on `deadline`, which the caller derived at verb entry — but the deadline
+    /// bounds only the wait for the job, never whether it is enqueued: until `systemctl` announces
+    /// the job ([`enqueued`]) the wait is unbounded, so a budget a few milliseconds long still
+    /// reaches systemd, and an expiry is then exactly what `budget::timed_out` says it is. `budget`
+    /// only picks the path and the wording.
+    fn run_verb(&self, verb: &str, unit: &str, budget: Budget, deadline: Deadline) -> Result<Finished> {
+        let wait = if watched(budget) {
+            Wait::Bounded {
+                role: Role::AnnouncedRequest(enqueued),
+                deadline,
+            }
+        } else {
+            Wait::ToCompletion
+        };
+        self.run(Purpose::Request, &verb_args(verb, unit, budget), wait)
     }
-
-    let (bin, prefix) = program.split_first().expect("a program to run");
-    let argv: Vec<&str> = prefix.iter().chain(args).copied().collect();
-    let mut cmd = bounded::command(bin, &argv).map_err(|e| failed(e.to_string()))?;
-    environment(&mut cmd);
-    let spawned = bounded::spawn(&mut cmd, Role::AnnouncedRequest(enqueued)).map_err(|e| match e {
-        bounded::SpawnError::NotRun(e) => failed(e.to_string()),
-        bounded::SpawnError::MayHaveRun(e) => in_doubt(e.to_string(), false),
-    })?;
-    // Past the spawn, `systemctl` is running, and a failure to watch it leaves its request in doubt —
-    // one it had announced reached systemd.
-    let finished =
-        bounded::wait_bounded(spawned, deadline).map_err(|lost| in_doubt(lost.error.to_string(), lost.announced))?;
-    if let Finished::Exited { capture, .. } = &finished {
-        answered(&capture.stdout, &capture.stderr)?;
-    }
-    Ok(finished)
 }
 
 /// Whether `line` is one `systemctl` writes on success as much as on failure — the transaction
@@ -905,34 +818,36 @@ fn took(verb: &str, unit: &str, capture: &Capture) -> Result<()> {
     )))
 }
 
-/// `systemctl start` blocks until its job completes — the real synchronization primitive, no polling
-/// needed. Idempotent: starting an already-active unit is a no-op that still exits 0. An expiry
-/// means the job was enqueued and not waited out — see [`run_verb`]. That holds for an active unit
-/// too: systemd answers the start with a job, not a state, so a budget shorter than that no-op job's
-/// round trip expires where launchd and SCM report started (see `ServiceManager::start`).
-///
-/// Every generated unit carries `Type=exec` (see `generate::unit`'s doc comment for why), so a
-/// bounded `systemctl start` confirms the `exec` itself succeeded — not merely that systemd forked
-/// the process. A missing executable or missing user comes back as a failed start.
-pub(super) fn start_impl(id: &str, budget: Budget, deadline: Deadline) -> Result<()> {
-    let unit = super::unit_name(id);
-    match run_verb("start", &unit, budget, deadline)? {
-        Finished::Exited { status, capture } if status.success() => took("start", &unit, &capture),
-        Finished::Exited { capture, .. } => Err(failed("start", &unit, &capture)),
-        Finished::Expired => Err(budget::timed_out(id, "running", budget)),
+impl Systemctl {
+    /// `systemctl start` blocks until its job completes — the real synchronization primitive, no polling
+    /// needed. Idempotent: starting an already-active unit is a no-op that still exits 0. An expiry
+    /// means the job was enqueued and not waited out — see [`Systemctl::run_verb`]. That holds for an active unit
+    /// too: systemd answers the start with a job, not a state, so a budget shorter than that no-op job's
+    /// round trip expires where launchd and SCM report started (see `ServiceManager::start`).
+    ///
+    /// Every generated unit carries `Type=exec` (see `generate::unit`'s doc comment for why), so a
+    /// bounded `systemctl start` confirms the `exec` itself succeeded — not merely that systemd forked
+    /// the process. A missing executable or missing user comes back as a failed start.
+    pub(super) fn start_impl(&self, id: &str, budget: Budget, deadline: Deadline) -> Result<()> {
+        let unit = super::unit_name(id);
+        match self.run_verb("start", &unit, budget, deadline)? {
+            Finished::Exited { status, capture } if status.success() => took("start", &unit, &capture),
+            Finished::Exited { capture, .. } => Err(failed("start", &unit, &capture)),
+            Finished::Expired => Err(budget::timed_out(id, "running", budget)),
+        }
     }
-}
 
-/// Idempotent per `ServiceManager::stop`'s doc comment. Exit code 5 ("unit not loaded") means there
-/// was nothing to stop — the same convention `tests/support/service_guard.rs` already uses for
-/// cleanup — which is success here, not a failure to stop something that was never running.
-pub(super) fn stop_impl(id: &str, budget: Budget, deadline: Deadline) -> Result<()> {
-    let unit = super::unit_name(id);
-    match run_verb("stop", &unit, budget, deadline)? {
-        Finished::Exited { status, capture } if status.success() => took("stop", &unit, &capture),
-        Finished::Exited { status, .. } if status.code() == Some(5) => Ok(()),
-        Finished::Exited { capture, .. } => Err(failed("stop", &unit, &capture)),
-        Finished::Expired => Err(budget::timed_out(id, "stopped", budget)),
+    /// Idempotent per `ServiceManager::stop`'s doc comment. Exit code 5 ("unit not loaded") means there
+    /// was nothing to stop — the same convention `tests/support/service_guard.rs` already uses for
+    /// cleanup — which is success here, not a failure to stop something that was never running.
+    pub(super) fn stop_impl(&self, id: &str, budget: Budget, deadline: Deadline) -> Result<()> {
+        let unit = super::unit_name(id);
+        match self.run_verb("stop", &unit, budget, deadline)? {
+            Finished::Exited { status, capture } if status.success() => took("stop", &unit, &capture),
+            Finished::Exited { status, .. } if status.code() == Some(5) => Ok(()),
+            Finished::Exited { capture, .. } => Err(failed("stop", &unit, &capture)),
+            Finished::Expired => Err(budget::timed_out(id, "stopped", budget)),
+        }
     }
 }
 
@@ -953,127 +868,122 @@ fn no_process(stderr: &str, unit: &str) -> bool {
     stderr.contains(&format!("Unit {unit} not loaded.")) || stderr.contains("No main process to kill")
 }
 
-/// `Ok` means the signal was delivered: systemd sends it before it answers, and goetia does not wait
-/// for the process to be gone.
-pub(super) fn kill_impl(id: &str) -> Result<()> {
-    let unit = super::unit_name(id);
-    let output = run_systemctl(&unit_args(&KILL_ARGS, &unit))?;
-    if output.status.success() {
-        return Ok(());
+impl Systemctl {
+    /// `Ok` means the signal was delivered: systemd sends it before it answers, and goetia does not wait
+    /// for the process to be gone.
+    pub(super) fn kill_impl(&self, id: &str) -> Result<()> {
+        let unit = super::unit_name(id);
+        let (status, capture) = self.completed(Purpose::Request, &unit_args(&KILL_ARGS, &unit))?;
+        if status.success() {
+            return Ok(());
+        }
+        if no_process(&String::from_utf8_lossy(&capture.stderr), &unit) {
+            return Err(Error::NotRunning { id: id.to_string() });
+        }
+        Err(failed("kill", &unit, &capture))
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if no_process(&stderr, &unit) {
-        return Err(Error::NotRunning { id: id.to_string() });
+
+    /// `systemctl enable` for `id`'s unit; a failure carries systemd's words.
+    pub(super) fn enable_impl(&self, id: &str) -> Result<()> {
+        self.unit_file_verb("enable", id)
     }
-    Err(failed(
-        "kill",
-        &unit,
-        &Capture {
-            stdout: output.stdout,
-            stderr: output.stderr,
-            complete: true,
-        },
-    ))
-}
 
-/// `systemctl enable` for `id`'s unit; a failure carries systemd's words.
-pub(super) fn enable_impl(id: &str) -> Result<()> {
-    unit_file_verb("enable", id)
-}
-
-/// `systemctl disable` for `id`'s unit, as [`enable_impl`]: `Systemd::disable` and `uninstall` both.
-pub(super) fn disable_impl(id: &str) -> Result<()> {
-    unit_file_verb("disable", id)
-}
-
-fn unit_file_verb(verb: &str, id: &str) -> Result<()> {
-    let unit = super::unit_name(id);
-    let output = run_systemctl(&unit_args(&[verb], &unit))?;
-    if output.status.success() {
-        return Ok(());
+    /// `systemctl disable` for `id`'s unit, as [`enable_impl`]: `Systemd::disable` and `uninstall` both.
+    pub(super) fn disable_impl(&self, id: &str) -> Result<()> {
+        self.unit_file_verb("disable", id)
     }
-    Err(Error::Other(format!(
-        "systemctl {verb} {unit} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    )))
-}
 
-/// `systemctl restart --no-block`: one job, where a stop and a separate start leave a window in
-/// which the start replaces the stop. It stops the unit and then starts it — unless the unit is
-/// still activating, when systemd folds the restart into the start job already running: nothing is
-/// stopped, and the daemon comes up fresh from that start. [`took`] as for `start`: an exit of `0`
-/// with no job is a restart nobody made.
-pub(super) fn request_restart_impl(id: &str) -> Result<()> {
-    let unit = super::unit_name(id);
-    match run_verb("restart", &unit, Budget::Immediate, Budget::Immediate.start())? {
-        Finished::Exited { status, capture } if status.success() => took("restart", &unit, &capture),
-        Finished::Exited { capture, .. } => Err(failed("restart", &unit, &capture)),
-        Finished::Expired => unreachable!("a budget that does not wait never takes the bounded path"),
+    fn unit_file_verb(&self, verb: &str, id: &str) -> Result<()> {
+        let unit = super::unit_name(id);
+        let (status, capture) = self.completed(Purpose::Request, &unit_args(&[verb], &unit))?;
+        if status.success() {
+            return Ok(());
+        }
+        Err(Error::Other(format!(
+            "systemctl {verb} {unit} failed: {}",
+            String::from_utf8_lossy(&capture.stderr)
+        )))
     }
-}
 
-/// `props` of `unit`, every one of them: systemd answers each property `status_from_unit` asks for
-/// on any unit name, loaded or not (an empty `UnitFileState=` included), so an answer without one
-/// is no answer, and never the state its absence would default to.
-fn show_properties(unit: &str, props: &[&str]) -> Result<BTreeMap<String, String>> {
-    let joined = props.join(",");
-    let output = systemctl(Purpose::Read, &unit_args(&["show", "--property", &joined], unit))?;
-    if !output.status.success() {
-        return Err(Error::Other(format!(
-            "systemctl show {unit} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut map = BTreeMap::new();
-    for line in stdout.lines() {
-        if let Some((k, v)) = line.split_once('=') {
-            map.insert(k.to_string(), v.to_string());
+    /// `systemctl restart --no-block`: one job, where a stop and a separate start leave a window in
+    /// which the start replaces the stop. It stops the unit and then starts it — unless the unit is
+    /// still activating, when systemd folds the restart into the start job already running: nothing is
+    /// stopped, and the daemon comes up fresh from that start. [`took`] as for `start`: an exit of `0`
+    /// with no job is a restart nobody made.
+    pub(super) fn request_restart_impl(&self, id: &str) -> Result<()> {
+        let unit = super::unit_name(id);
+        match self.run_verb("restart", &unit, Budget::Immediate, Budget::Immediate.start())? {
+            Finished::Exited { status, capture } if status.success() => took("restart", &unit, &capture),
+            Finished::Exited { capture, .. } => Err(failed("restart", &unit, &capture)),
+            Finished::Expired => unreachable!("a budget that does not wait never takes the bounded path"),
         }
     }
-    let missing: Vec<&str> = props.iter().copied().filter(|prop| !map.contains_key(*prop)).collect();
-    if !missing.is_empty() {
-        return Err(Error::Other(format!(
-            "`systemctl show {unit}` answered without {}, so goetia cannot tell its live state",
-            missing.join(", ")
-        )));
-    }
-    Ok(map)
 }
 
-/// `UnitFileState` is the same install-state systemd derives for `systemctl is-enabled` — one query
-/// covers state, pid, and boot-enablement together.
-///
-/// Asked only about a unit goetia finds installed, so `LoadState=not-found` — systemd has no unit
-/// file for the name — is a unit file systemd cannot see, one goetia's own mount namespace holds,
-/// say. Not one merely written and not yet reloaded: the manager picks a unit file up on demand and
-/// reports `loaded` for one written a moment earlier (MEASURED, 255). What systemd reports for such
-/// a name is not that unit's state, and never read as one.
-pub(super) fn status_from_unit(unit: &str) -> Result<Status> {
-    let props = show_properties(unit, &["ActiveState", "MainPID", "UnitFileState", "LoadState"])?;
-    if props.get("LoadState").map(String::as_str) == Some("not-found") {
-        return Err(Error::Other(format!(
-            "systemd has not loaded the unit file goetia finds installed for `{unit}` (`LoadState=not-found`), so \
-             what it reports is not that unit's state"
-        )));
+impl Systemctl {
+    /// `props` of `unit`, every one of them: systemd answers each property `status_from_unit` asks for
+    /// on any unit name, loaded or not (an empty `UnitFileState=` included), so an answer without one
+    /// is no answer, and never the state its absence would default to.
+    fn show_properties(&self, unit: &str, props: &[&str]) -> Result<BTreeMap<String, String>> {
+        let joined = props.join(",");
+        let (status, capture) = self.completed(Purpose::Read, &unit_args(&["show", "--property", &joined], unit))?;
+        if !status.success() {
+            return Err(Error::Other(format!(
+                "systemctl show {unit} failed: {}",
+                String::from_utf8_lossy(&capture.stderr)
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&capture.stdout);
+        let mut map = BTreeMap::new();
+        for line in stdout.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                map.insert(k.to_string(), v.to_string());
+            }
+        }
+        let missing: Vec<&str> = props.iter().copied().filter(|prop| !map.contains_key(*prop)).collect();
+        if !missing.is_empty() {
+            return Err(Error::Other(format!(
+                "`systemctl show {unit}` answered without {}, so goetia cannot tell its live state",
+                missing.join(", ")
+            )));
+        }
+        Ok(map)
     }
-    let state = match props.get("ActiveState").map(String::as_str) {
-        Some("active") => State::Running,
-        Some("inactive") => State::Stopped,
-        Some("failed") => State::Failed,
-        // `activating`/`deactivating` land here, along with anything else
-        // systemd reports. One of three places a `State::Starting` would be
-        // produced if goetia grows one (routed post-0.1.0) — the other two
-        // are `state::classify` in `src/backend/launchd/state.rs` and
-        // `map_state` in `src/backend/scm/manager.rs`.
-        _ => State::Unknown,
-    };
-    let pid = props
-        .get("MainPID")
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|&p| p != 0);
-    let enabled = props.get("UnitFileState").is_some_and(|s| s == "enabled");
-    Ok(Status { state, pid, enabled })
+
+    /// `UnitFileState` is the same install-state systemd derives for `systemctl is-enabled` — one query
+    /// covers state, pid, and boot-enablement together.
+    ///
+    /// Asked only about a unit goetia finds installed, so `LoadState=not-found` — systemd has no unit
+    /// file for the name — is a unit file systemd cannot see, one goetia's own mount namespace holds,
+    /// say. Not one merely written and not yet reloaded: the manager picks a unit file up on demand and
+    /// reports `loaded` for one written a moment earlier (MEASURED, 255). What systemd reports for such
+    /// a name is not that unit's state, and never read as one.
+    pub(super) fn status_from_unit(&self, unit: &str) -> Result<Status> {
+        let props = self.show_properties(unit, &["ActiveState", "MainPID", "UnitFileState", "LoadState"])?;
+        if props.get("LoadState").map(String::as_str) == Some("not-found") {
+            return Err(Error::Other(format!(
+                "systemd has not loaded the unit file goetia finds installed for `{unit}` (`LoadState=not-found`), so \
+                 what it reports is not that unit's state"
+            )));
+        }
+        let state = match props.get("ActiveState").map(String::as_str) {
+            Some("active") => State::Running,
+            Some("inactive") => State::Stopped,
+            Some("failed") => State::Failed,
+            // `activating`/`deactivating` land here, along with anything else
+            // systemd reports. One of three places a `State::Starting` would be
+            // produced if goetia grows one (routed post-0.1.0) — the other two
+            // are `state::classify` in `src/backend/launchd/state.rs` and
+            // `map_state` in `src/backend/scm/manager.rs`.
+            _ => State::Unknown,
+        };
+        let pid = props
+            .get("MainPID")
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&p| p != 0);
+        let enabled = props.get("UnitFileState").is_some_and(|s| s == "enabled");
+        Ok(Status { state, pid, enabled })
+    }
 }
 
 #[cfg(test)]

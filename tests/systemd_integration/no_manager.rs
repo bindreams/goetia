@@ -420,8 +420,9 @@ fn the_verbs_that_never_reach_the_manager_are_untouched() {
 /// `/etc/systemd/system` (unless `-`), runs `goetia <args>` there — as `user`, a `chroot
 /// --userspec`, unless `-` — then lists that directory and its `multi-user.target.wants` on
 /// stderr. The root is a tmpfs for `shape` `tmpfs`, and for `dir` the directory itself, no mount;
-/// for `bare` a tmpfs with no `/run` bound in, as a `debootstrap` chroot has none; and for
-/// `dir-hidepid` a directory whose `/proc` is mounted `hidepid=2`, hiding PID 1 from other users.
+/// for `bare` a tmpfs with no `/run` bound in, as a `debootstrap` chroot has none; for
+/// `dir-hidepid` a directory whose `/proc` is mounted `hidepid=2`, hiding PID 1 from other users;
+/// and for `noproc` a tmpfs whose `/proc` is an empty directory, nothing mounted on it.
 const IN_A_CHROOT: &str = r#"set -e
 root=$1 goetia=$2 manifest=$3 unit=$4 user=$5 shape=$6; shift 6
 case $shape in dir*) ;; *) mount -t tmpfs goetia-chroot "$root" ;; esac
@@ -433,7 +434,11 @@ mount -o remount,bind,ro "$root/usr"
 mount --rbind /dev "$root/dev"
 [ "$shape" = bare ] || mount --rbind /run "$root/run"
 mount --rbind /sys "$root/sys"
-case $shape in dir-hidepid) mount -t proc -o hidepid=2 proc "$root/proc" ;; *) mount -t proc proc "$root/proc" ;; esac
+case $shape in
+    dir-hidepid) mount -t proc -o hidepid=2 proc "$root/proc" ;;
+    noproc) ;;
+    *) mount -t proc proc "$root/proc" ;;
+esac
 cp /etc/passwd /etc/group /etc/nsswitch.conf "$root/etc/"
 cp "$goetia" "$root/goetia"
 cp "$manifest" "$root/tmp/goetia.yaml"
@@ -569,6 +574,49 @@ fn an_unelevated_state_read_in_a_real_chroot_is_refused_before_anything_runs() {
         }
     }
     assert!(!unit_path(guard.id()).exists(), "the host has no such unit");
+}
+
+/// A chroot with no `/proc` mounted is refused as the chroot it is, before any `systemctl` is
+/// spawned: cosca kills a child whose identity it cannot read from `/proc`, so a spawned `systemctl`
+/// would fail to run (`failed to run`) instead of the refusal, and a spawned real one would report
+/// the chroot itself ("Running in chroot"). Neither appears, and nothing is written.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_chroot_without_proc_is_refused_before_anything_is_spawned() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let (_manifest_dir, manifest) = world_readable_manifest(guard.id());
+    installed(&guard);
+    let unit = unit_path(guard.id());
+    let unit = unit.to_str().expect("utf-8 unit path");
+    let copied = format!("chroot units: {}.service \n", guard.id());
+
+    let installs = ["daemon", "install", "--file", "/tmp/goetia.yaml"];
+    for (user, args, unit, units) in [
+        ("-", &installs[..], "-", "chroot units: \n"),
+        ("-", &["daemon", "start", guard.id()], unit, &copied),
+        ("-", &["daemon", "status", guard.id()], unit, &copied),
+        ("65534:65534", &["daemon", "status", guard.id()], unit, &copied),
+    ] {
+        let root = tempfile::tempdir().expect("tempdir");
+        let output = in_a_chroot(root.path(), &manifest, unit, user, "noproc", args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let context = format!("{user} {args:?}\nstderr:\n{stderr}");
+        assert_eq!(output.status.code(), Some(1), "{context}");
+        assert!(
+            stderr.contains(&format!(
+                "{REFUSAL}`/proc/self` does not resolve (no `/proc` of goetia's own is mounted), which systemd treats as a chroot"
+            )),
+            "{context}"
+        );
+        assert!(!stderr.contains("failed to run"), "systemctl was spawned: {context}");
+        assert!(!stderr.contains("Running in chroot"), "systemctl ran: {context}");
+        assert!(stderr.contains(units), "{context}");
+        assert!(stderr.contains("chroot links: \n"), "{context}");
+    }
+    assert_eq!(
+        active_state_and_job(guard.id()),
+        ("inactive".to_string(), String::new())
+    );
 }
 
 /// A chroot with no `/run` bound in, as a `debootstrap` one has none, is refused as the chroot it
