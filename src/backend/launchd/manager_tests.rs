@@ -19,16 +19,9 @@ fn sample_plist(id: &str) -> String {
 
 fn sample_plist_restarting(id: &str, restart: Restart) -> String {
     let spec = DaemonSpec {
-        id: Id::try_from(id).unwrap(),
-        name: id.to_string(),
-        command: vec!["/bin/true".to_string()],
-        cwd: None,
-        env: Default::default(),
-        user: User::Root,
         restart,
-        restart_delay: None,
-        logs: None,
         kind: Kind::Simple,
+        ..DaemonSpec::for_test(id, vec!["/bin/true".to_string()])
     };
     generate::plist(
         &spec,
@@ -1473,16 +1466,9 @@ fn every_launchd_verb_path_stays_inside_its_reservation() {
     let _plists = Plists(name.clone());
     let id = Id::try_from(name.as_str()).unwrap();
     let mut spec = DaemonSpec {
-        id: id.clone(),
-        name: name.clone(),
-        command: vec!["/bin/sleep".to_string(), "300".to_string()],
-        cwd: None,
-        env: Default::default(),
-        user: User::Root,
         restart: Restart::Always,
-        restart_delay: None,
-        logs: None,
         kind: Kind::Simple,
+        ..DaemonSpec::for_test(&name, vec!["/bin/sleep".to_string(), "300".to_string()])
     };
     let exhausted = |reservation: &Reservation| {
         assert_eq!(
@@ -1719,18 +1705,7 @@ fn kill_refused_for_any_other_reason_is_a_plain_failure() {
 fn a_changed_spec_is_refused_while_the_job_is_loaded() {
     let name = format!("goetia-refuse-{:x}", std::process::id());
     let _plists = Plists(name.clone());
-    let mut spec = DaemonSpec {
-        id: Id::try_from(name.as_str()).unwrap(),
-        name: name.clone(),
-        command: vec!["/bin/sleep".to_string(), "300".to_string()],
-        cwd: None,
-        env: Default::default(),
-        user: User::Root,
-        restart: Restart::Never,
-        restart_delay: None,
-        logs: None,
-        kind: Kind::Simple,
-    };
+    let mut spec = spec_named(&name);
 
     let (mgr, script) = scripted(&CREATED);
     assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
@@ -1763,16 +1738,8 @@ fn a_changed_spec_is_refused_while_the_job_is_loaded() {
 /// one process, so each needs plists no other writes.
 fn spec_named(name: &str) -> DaemonSpec {
     DaemonSpec {
-        id: Id::try_from(name).unwrap(),
-        name: name.to_owned(),
-        command: vec!["/bin/sleep".to_string(), "300".to_string()],
-        cwd: None,
-        env: Default::default(),
-        user: User::Root,
-        restart: Restart::Never,
-        restart_delay: None,
-        logs: None,
         kind: Kind::Simple,
+        ..DaemonSpec::for_test(name, vec!["/bin/sleep".to_string(), "300".to_string()])
     }
 }
 

@@ -1,25 +1,17 @@
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use super::*;
 use crate::manager::Budget;
 use crate::manager::conformance;
-use crate::spec::{Id, Kind, Restart, User};
+use crate::spec::{Id, Kind, Restart};
 
 // Fixtures ============================================================================================================
 
 pub(in crate::manager) fn mk(id: &str) -> DaemonSpec {
     DaemonSpec {
-        id: Id::try_from(id).unwrap(),
-        name: id.to_string(),
-        command: vec!["daemon".to_owned()],
-        cwd: None,
-        env: BTreeMap::new(),
-        user: User::Root,
         restart: Restart::OnFailure,
-        restart_delay: None,
-        logs: None,
         kind: Kind::Simple,
+        ..DaemonSpec::for_test(id, vec!["daemon".to_owned()])
     }
 }
 
