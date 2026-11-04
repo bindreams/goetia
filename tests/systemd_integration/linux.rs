@@ -1198,7 +1198,10 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
             assert!(!stderr.contains("panicked"), "{args:?} TasksMax={tasks}: {stderr}");
             match output.status.code() {
                 Some(0) => {
-                    assert!(tasks > 1, "{args:?} succeeded with a single task, so the sweep tested nothing");
+                    assert!(
+                        tasks > 1,
+                        "{args:?} succeeded with a single task, so the sweep tested nothing"
+                    );
                     return;
                 }
                 Some(1) => untouched(tasks),
@@ -1224,7 +1227,11 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
             "a restart short of tasks touched the daemon: TasksMax={tasks}"
         );
     });
-    assert_ne!(main_pid(guard.id()), before, "the provisioned restart restarted nothing");
+    assert_ne!(
+        main_pid(guard.id()),
+        before,
+        "the provisioned restart restarted nothing"
+    );
 
     // A restart that does not wait sends its stop before its start, so a failure may have touched
     // the daemon: only "never panics, and works when provisioned" holds for it.
