@@ -723,7 +723,7 @@ fn an_environment_of_an_unknown_registry_type_is_a_conflict() {
     let spec = install_with_environment(&mgr, &id);
 
     let key = environment_key(&id, KEY_WRITE);
-    let name: Vec<u16> = "Environment\0".encode_utf16().collect();
+    let name = support::wide_null("Environment");
     let data = INSTALLED_ENVIRONMENT.as_bytes();
     // SAFETY: `key` holds an open handle with write access; `name` is NUL-terminated and `data` is
     // `data.len()` readable bytes, both outliving the call.
