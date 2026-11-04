@@ -35,7 +35,12 @@ const FAKE_PID: u32 = 1;
 /// Why an opaque id could not be classified — see [`Fake::seed_opaque`].
 /// Shared by [`Store::undetermined`] and [`Fake::scan`] so the error and the
 /// `list` entry cannot describe the same condition differently.
-const OPAQUE_REASON: &str = "the artifact could not be read (seeded opaque by Fake::seed_opaque)";
+fn opaque_reason() -> Error {
+    Error::os(
+        "read the artifact",
+        std::io::Error::other("seeded opaque by Fake::seed_opaque"),
+    )
+}
 
 /// The pid `Fake` reports for a given state. `status` and `list` must never
 /// disagree about the same entry, so they share this rule rather than each
@@ -206,7 +211,7 @@ impl Store {
     fn undetermined(id: &Id) -> Error {
         Error::Undetermined {
             id: id.as_str().to_string(),
-            reason: OPAQUE_REASON.to_string(),
+            reason: Box::new(opaque_reason()),
             recovery: "re-run with enough privilege to read the artifact; if it is unreadable at \
                        any privilege level, repair or remove it out of band"
                 .to_string(),
@@ -629,7 +634,8 @@ fn lost(ids: &BTreeSet<String>, verb: &str, id: &Id) -> Result<()> {
         return Err(Error::RequestInDoubt {
             request: format!("fake {verb} {id}"),
             reached: false,
-            detail: "lost (seeded)".to_string(),
+            note: None,
+            source: std::io::Error::other("lost (seeded)").into(),
         });
     }
     Ok(())
@@ -702,6 +708,7 @@ impl crate::backend::Backend for Fake {
             if state.unresolvable.contains(user) {
                 return Err(Error::AccountLookup {
                     detail: format!("account `{user}` cannot be resolved (seeded)"),
+                    source: None,
                 });
             }
         }
@@ -804,7 +811,7 @@ impl crate::backend::Backend for Fake {
         });
         let opaque = state.opaque.iter().rev().map(|name| Installed::Undetermined {
             name: Some(name.clone()),
-            reason: OPAQUE_REASON.to_string(),
+            reason: opaque_reason().report().to_string(),
         });
         Scan {
             entries: state

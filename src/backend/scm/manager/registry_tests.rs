@@ -163,11 +163,12 @@ fn a_parameters_read_that_did_not_complete_is_undetermined() {
         (std::io::Error::other("the hive is corrupt"), false),
     ] {
         let rendered = format!("{source:?}");
-        let Error::Undetermined { id, reason, recovery } = registry_undetermined("x", "open", &path, &source) else {
+        let Error::Undetermined { id, reason, recovery } = registry_undetermined("x", "open", &path, source) else {
             panic!("{rendered}: a read that did not complete establishes nothing about the id");
         };
 
         assert_eq!(id, "x");
+        let reason = reason.report().to_string();
         assert!(
             reason.contains(&path),
             "{rendered}: the reason must name the key: {reason}"

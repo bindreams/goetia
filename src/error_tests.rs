@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::{Error, PutBackFound, VersionReading};
+use super::{BoxError, Error, PutBackFound, VersionReading};
 
 #[skuld::test]
 fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
@@ -9,7 +9,7 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
     let in_doubt = [
         Error::Undetermined {
             id: id(),
-            reason: String::new(),
+            reason: Box::new(os("read", "/p", "x")),
             recovery: String::new(),
         },
         Error::WaitTimeout {
@@ -20,12 +20,13 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
         },
         Error::Unestablished {
             id: id(),
-            detail: String::new(),
+            refused: Box::new(not_installed()),
         },
         Error::RequestInDoubt {
             request: String::new(),
             reached: false,
-            detail: String::new(),
+            note: None,
+            source: std::io::Error::other("x").into(),
         },
         Error::LoadedJobInDoubt {
             id: id(),
@@ -33,7 +34,7 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
         },
         Error::LoadedStateInDoubt {
             id: id(),
-            detail: String::new(),
+            read_failed: Box::new(not_installed()),
             restore_failed: None,
         },
         Error::StaleJobBootedOut {
@@ -92,7 +93,14 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             command: String::new(),
             source: std::io::Error::other("x").into(),
         },
-        Error::AccountLookup { detail: String::new() },
+        Error::AccountLookup {
+            detail: String::new(),
+            source: None,
+        },
+        Error::StartAsManaged {
+            blob: Box::new(Error::Blob(String::new())),
+            source: Box::new(not_installed()),
+        },
         Error::AlreadyExists { path: PathBuf::new() },
         Error::ConcurrentChange { id: id(), path: None },
         Error::QuarantineStranded {
@@ -493,11 +501,11 @@ fn report_of_a_blocked_put_back_says_gone_or_replaced() {
 
 #[skuld::test]
 fn report_of_a_loaded_state_in_doubt_prints_each_cause_once() {
-    const OPEN: &str = "`x`'s plist was written, but whether launchd has its job loaded could not be read (read boom), \
-         so goetia cannot tell whether a loaded job holds the old definition or the new one. ";
+    const OPEN: &str = "`x`'s plist was written, but whether launchd has its job loaded could not be read (failed to \
+         read /r: read boom), so goetia cannot tell whether a loaded job holds the old definition or the new one. ";
     let backed_out = Error::LoadedStateInDoubt {
         id: id(),
-        detail: "read boom".to_string(),
+        read_failed: Box::new(os("read", "/r", "read boom")),
         restore_failed: None,
     };
     assert_eq!(
@@ -510,7 +518,7 @@ fn report_of_a_loaded_state_in_doubt_prints_each_cause_once() {
 
     let stuck = Error::LoadedStateInDoubt {
         id: id(),
-        detail: "read boom".to_string(),
+        read_failed: Box::new(os("read", "/r", "read boom")),
         restore_failed: Some(Box::new(os("write", "/p", "disk full"))),
     };
     let text = stuck.report().to_string();
@@ -523,4 +531,111 @@ fn report_of_a_loaded_state_in_doubt_prints_each_cause_once() {
     );
     assert_eq!(text.matches("disk full").count(), 1, "{text}");
     assert_eq!(text.matches("read boom").count(), 1, "{text}");
+}
+
+#[skuld::test]
+fn report_of_an_undetermined_id_ends_in_the_failed_read() {
+    let e = Error::Undetermined {
+        id: id(),
+        reason: Box::new(os("read", "/p", "denied")),
+        recovery: "re-run as root".to_string(),
+    };
+    assert_eq!(
+        e.report().to_string(),
+        "cannot determine whether daemon `x` is installed. re-run as root: failed to read /p: denied"
+    );
+    assert!(matches!(
+        std::error::Error::source(&e)
+            .and_then(|s| s.downcast_ref::<Box<Error>>())
+            .map(|b| &**b),
+        Some(Error::Os { .. })
+    ));
+}
+
+#[skuld::test]
+fn report_of_a_request_in_doubt_keeps_its_note_before_its_cause() {
+    let e = |note: Option<&str>, reached| Error::RequestInDoubt {
+        request: "systemctl start x".to_string(),
+        reached,
+        note: note.map(str::to_string),
+        source: std::io::Error::other("lost").into(),
+    };
+    assert_eq!(
+        e(None, true).report().to_string(),
+        "`systemctl start x` reached the service manager, but goetia lost track of it before its outcome was \
+         confirmed: lost"
+    );
+    assert_eq!(
+        e(Some("wrote the unit"), false).report().to_string(),
+        "`systemctl start x` may have started before it failed, so it may or may not have reached the service \
+         manager: wrote the unit: lost"
+    );
+    assert!(std::error::Error::source(&e(None, true)).is_some());
+}
+
+#[skuld::test]
+fn a_request_in_doubt_takes_a_context_ahead_of_its_note() {
+    let e = Error::RequestInDoubt {
+        request: "r".to_string(),
+        reached: false,
+        note: None,
+        source: std::io::Error::other("lost").into(),
+    };
+    let once = e.in_doubt_context("first".to_string());
+    let twice = once.in_doubt_context("second".to_string());
+    assert!(twice.is_indeterminate());
+    assert!(
+        twice.report().to_string().ends_with("manager: second: first: lost"),
+        "{}",
+        twice.report()
+    );
+    assert!(matches!(
+        not_installed().in_doubt_context("x".to_string()),
+        Error::NotInstalled { .. }
+    ));
+}
+
+#[skuld::test]
+fn report_of_an_unestablished_restart_ends_in_the_refusal() {
+    let e = Error::Unestablished {
+        id: id(),
+        refused: Box::new(os("start", "/p", "refused")),
+    };
+    assert_eq!(
+        e.report().to_string(),
+        "`x` was not restarted, and where it ended up is not established: the stop was issued without waiting for \
+         it, and the start that followed was refused (`goetia daemon status x` shows the manager's current view): \
+         failed to start /p: refused"
+    );
+    assert!(e.is_indeterminate());
+}
+
+#[skuld::test]
+fn report_of_an_account_lookup_ends_in_its_cause_when_it_has_one() {
+    let e = |source: Option<BoxError>| Error::AccountLookup {
+        detail: "look up user `bob`".to_string(),
+        source,
+    };
+    assert_eq!(
+        e(Some(std::io::Error::other("EPERM").into())).report().to_string(),
+        "account lookup failed: look up user `bob`: EPERM"
+    );
+    assert_eq!(
+        e(None).report().to_string(),
+        "account lookup failed: look up user `bob`"
+    );
+}
+
+#[skuld::test]
+fn report_of_a_start_judged_as_managed_names_the_unreadable_blob_and_then_the_failure() {
+    let e = Error::StartAsManaged {
+        blob: Box::new(Error::Blob("invalid blob JSON: EOF".to_string())),
+        source: Box::new(os("start", "/p", "stopped")),
+    };
+    assert_eq!(
+        e.report().to_string(),
+        "its spec blob could not be read, so the start was judged as a `type: managed` service's (blob: invalid blob \
+         JSON: EOF): failed to start /p: stopped"
+    );
+    assert!(!e.is_indeterminate());
 }

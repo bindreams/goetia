@@ -217,7 +217,8 @@ fn in_doubt() -> Error {
     Error::RequestInDoubt {
         request: "systemctl start x.service".to_string(),
         reached: true,
-        detail: "lost".to_string(),
+        note: None,
+        source: std::io::Error::other("lost").into(),
     }
 }
 
@@ -238,4 +239,59 @@ fn a_leg_in_doubt_stays_in_doubt_under_every_budget() {
             );
         }
     }
+}
+
+/// What the stop leg established is said ahead of the cause, and the cause stays the typed source.
+#[skuld::test]
+fn a_start_leg_in_doubt_says_what_the_stop_established_and_keeps_its_cause() {
+    let id = Id::try_from("frpc").unwrap();
+
+    let e = after_start_failed(&id, Budget::DEFAULT, in_doubt());
+
+    assert!(
+        e.report()
+            .to_string()
+            .ends_with("`frpc` was stopped, and this start was attempted after it: lost"),
+        "{}",
+        e.report()
+    );
+    assert!(std::error::Error::source(&e).is_some());
+}
+
+/// A start leg whose read of the id failed after the stop is still `Undetermined`, with the stop's
+/// clause between the id and the failed read.
+#[skuld::test]
+fn an_undetermined_start_leg_keeps_its_read_under_the_stop_clause() {
+    let id = Id::try_from("frpc").unwrap();
+    let undetermined = Error::Undetermined {
+        id: "frpc".to_string(),
+        reason: Box::new(Error::os("read", std::io::Error::other("denied"))),
+        recovery: "re-run as root".to_string(),
+    };
+
+    let e = after_start_failed(&id, Budget::DEFAULT, undetermined);
+
+    assert!(matches!(e, Error::Undetermined { .. }), "{e:?}");
+    assert_eq!(
+        e.report().to_string(),
+        "cannot determine whether daemon `frpc` is installed. re-run as root: stopped but failed to restart: failed \
+         to read: denied"
+    );
+}
+
+/// A refused start after a stop nobody waited for keeps the refusal as the cause.
+#[skuld::test]
+fn a_refused_start_after_an_unwaited_stop_is_unestablished_with_the_refusal_as_its_cause() {
+    let id = Id::try_from("frpc").unwrap();
+    let refused = Error::os("start `frpc`", std::io::Error::other("refused"));
+
+    let e = after_start_failed(&id, Budget::Immediate, refused);
+
+    assert!(matches!(e, Error::Unestablished { .. }), "{e:?}");
+    assert!(e.is_indeterminate());
+    assert!(
+        e.report().to_string().ends_with(": failed to start `frpc`: refused"),
+        "{}",
+        e.report()
+    );
 }

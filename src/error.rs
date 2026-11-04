@@ -240,8 +240,8 @@ pub enum Error {
     Foreign { id: String, recovery: String },
 
     /// A read that would have said whether anything is installed at `id`
-    /// failed, so goetia does not know. `reason` names the path and the
-    /// failure; `recovery` says what would make that read succeed.
+    /// failed, so goetia does not know. `reason` is the failed read, which
+    /// the chain ends in; `recovery` says what would make that read succeed.
     ///
     /// The distinguishing property is what this variant does **not** claim.
     /// [`NotInstalled`](Error::NotInstalled) is proof that nothing
@@ -257,10 +257,11 @@ pub enum Error {
     ///
     /// Exit `4` (indeterminate), like `Unusable`: the code is about
     /// whether the question was answered, and this one was not.
-    #[error("cannot determine whether daemon `{id}` is installed: {reason}. {recovery}")]
+    #[error("cannot determine whether daemon `{id}` is installed. {recovery}")]
     Undetermined {
         id: String,
-        reason: String,
+        #[source]
+        reason: Box<Error>,
         recovery: String,
     },
 
@@ -319,13 +320,25 @@ pub enum Error {
     ///
     /// Exit `4` (indeterminate), like the two above: the code is about
     /// whether the question was answered, and this one was not.
-    #[error("`{id}` was not restarted, and where it ended up is not established: {detail}")]
-    Unestablished { id: String, detail: String },
+    ///
+    /// `refused` is the start's refusal, which the chain ends in.
+    #[error(
+        "`{id}` was not restarted, and where it ended up is not established: the stop was issued without waiting \
+         for it, and the start that followed was refused (`goetia daemon status {id}` shows the manager's current \
+         view)"
+    )]
+    Unestablished {
+        id: String,
+        #[source]
+        refused: Box<Error>,
+    },
 
     /// A request goetia lost track of before its outcome was established: the
     /// tool carrying it — `systemctl`, `launchctl` — may have started when it
     /// failed, so whatever it sends may already be sent. `request` is the
-    /// tool's command line. `reached` is whether goetia knows the request
+    /// tool's command line; `source` is how it was lost, and `note` is what a
+    /// caller that knows more says before it ([`Error::in_doubt_context`]).
+    /// `reached` is whether goetia knows the request
     /// reached the manager: systemd says so (`Enqueued anchor job`) once it
     /// has enqueued the job, which may already be running, and a request lost
     /// after that had reached it.
@@ -339,11 +352,13 @@ pub enum Error {
     ///
     /// Exit `4` (indeterminate), like the three above: whether the manager
     /// acted is the question, and it was not answered.
-    #[error("{}", in_doubt(request, *reached, detail))]
+    #[error("{}", in_doubt(request, *reached, note))]
     RequestInDoubt {
         request: String,
         reached: bool,
-        detail: String,
+        note: Option<String>,
+        #[source]
+        source: BoxError,
     },
 
     /// `install` rewrote the plist of a daemon whose job launchd now has loaded, though it was not
@@ -365,14 +380,15 @@ pub enum Error {
 
     /// `install` wrote the plist of a daemon and could not read whether launchd has its job loaded
     /// afterwards, so which definition a job loaded meanwhile read is not established either.
-    /// `detail` is the failed read; `restore_failed` is as in
-    /// [`LoadedJobInDoubt`](Error::LoadedJobInDoubt). launchd only.
+    /// `read_failed` is the failed read, printed in the message; `restore_failed` is the
+    /// [`source`](std::error::Error::source), as in [`LoadedJobInDoubt`](Error::LoadedJobInDoubt).
+    /// launchd only.
     ///
     /// Exit `4` (indeterminate).
-    #[error("{}", loaded_in_doubt(id, Some(detail), restore_failed.is_some()))]
+    #[error("{}", loaded_in_doubt(id, Some(read_failed), restore_failed.is_some()))]
     LoadedStateInDoubt {
         id: String,
-        detail: String,
+        read_failed: Box<Error>,
         #[source]
         restore_failed: Option<Box<Error>>,
     },
@@ -420,9 +436,27 @@ pub enum Error {
     UnsupportedPlatform { platform: String },
 
     /// Resolving a [`crate::spec::User`] to a real platform account failed:
-    /// no such user/uid, or the lookup itself errored.
+    /// no such user/uid, or the lookup itself errored. `source` is the
+    /// lookup's own error, when it had one.
     #[error("account lookup failed: {detail}")]
-    AccountLookup { detail: String },
+    AccountLookup {
+        detail: String,
+        #[source]
+        source: Option<BoxError>,
+    },
+
+    /// A `start` was judged as a `type: managed` service's, because the service's spec blob could not
+    /// be read, and then failed. `blob` is the unreadable blob's error, printed in the message;
+    /// `source` is the failed start.
+    #[error(
+        "its spec blob could not be read, so the start was judged as a `type: managed` service's ({})",
+        blob.report()
+    )]
+    StartAsManaged {
+        blob: Box<Error>,
+        #[source]
+        source: Box<Error>,
+    },
 
     /// A backend tried to create or move an artifact to `path`, but
     /// something already occupies it — a state none of that backend's own
@@ -480,6 +514,7 @@ impl Error {
             | Error::ElevationRequired { .. }
             | Error::UnsupportedPlatform { .. }
             | Error::AccountLookup { .. }
+            | Error::StartAsManaged { .. }
             | Error::AlreadyExists { .. } => false,
         }
     }
@@ -499,6 +534,29 @@ impl Error {
     /// alone is the outermost context.
     pub fn report(&self) -> impl fmt::Display + '_ {
         Report(self)
+    }
+
+    /// A [`RequestInDoubt`](Error::RequestInDoubt) with `context` said ahead of any note it
+    /// already has: what the caller that holds it knows of the request. Any other error is returned
+    /// as it is.
+    pub(crate) fn in_doubt_context(self, context: String) -> Self {
+        match self {
+            Error::RequestInDoubt {
+                request,
+                reached,
+                note,
+                source,
+            } => Error::RequestInDoubt {
+                request,
+                reached,
+                note: Some(match note {
+                    Some(note) => format!("{context}: {note}"),
+                    None => context,
+                }),
+                source,
+            },
+            e => e,
+        }
     }
 
     /// An OS call failed with no path to name.
@@ -672,27 +730,29 @@ fn id_prefix(id: &Option<String>) -> String {
 
 /// [`Error::RequestInDoubt`]'s message: what goetia knows of how far the
 /// request got, and no more.
-fn in_doubt(request: &str, reached: bool, detail: &str) -> String {
+fn in_doubt(request: &str, reached: bool, note: &Option<String>) -> String {
+    let note = note.as_deref().map(|note| format!(": {note}")).unwrap_or_default();
     if reached {
         format!(
-            "`{request}` reached the service manager, but goetia lost track of it before its outcome was confirmed: \
-             {detail}"
+            "`{request}` reached the service manager, but goetia lost track of it before its outcome was confirmed{note}"
         )
     } else {
         format!(
-            "`{request}` may have started before it failed, so it may or may not have reached the service manager: \
-             {detail}"
+            "`{request}` may have started before it failed, so it may or may not have reached the service manager{note}"
         )
     }
 }
 
 /// The message of both in-doubt variants. `read_failed` is the failed read (second variant only);
 /// `restore_failed` is whether the put-back of the plist failed, whose error is the variant's source.
-fn loaded_in_doubt(id: &str, read_failed: Option<&str>, restore_failed: bool) -> String {
+fn loaded_in_doubt(id: &str, read_failed: Option<&Error>, restore_failed: bool) -> String {
     let cause = match read_failed {
         None => format!("`{id}` was loaded in launchd while its plist was written"),
-        Some(detail) => {
-            format!("`{id}`'s plist was written, but whether launchd has its job loaded could not be read ({detail})")
+        Some(read) => {
+            format!(
+                "`{id}`'s plist was written, but whether launchd has its job loaded could not be read ({})",
+                read.report()
+            )
         }
     };
     let remedy = if restore_failed {

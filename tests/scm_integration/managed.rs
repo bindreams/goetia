@@ -1175,8 +1175,8 @@ fn deleted_account_makes_the_service_oursunusable() {
         })
         .unwrap_or_else(|| panic!("{id} disappeared from list entirely instead of becoming OursUnusable"));
     match entry {
-        Installed::OursUnusable { reason, .. } => {
-            assert!(!reason.is_empty());
+        entry @ Installed::OursUnusable { .. } => {
+            assert!(!entry.unusable_reason().unwrap_or_default().is_empty());
         }
         Installed::Ours { .. } | Installed::Undetermined { .. } => {
             panic!("expected OursUnusable once the account backing `user.id` is deleted")

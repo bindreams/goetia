@@ -614,6 +614,7 @@ fn read_artifact_maps_an_unreadable_plist_to_undetermined() {
         panic!("`Error::Os` reaches `status` as `unusable`, which claims goetia owns the id: {err:?}");
     };
     assert_eq!(id, "opaque");
+    let reason = reason.report().to_string();
     assert!(
         reason.contains(&path.display().to_string()),
         "the reason must name the path that could not be read: {reason}"
@@ -683,11 +684,12 @@ fn the_launchd_undetermined_recovery_names_both_causes_and_not_uninstall() {
         (io::Error::from(io::ErrorKind::Other), false),
     ] {
         let rendered = format!("{source:?}");
-        let Error::Undetermined { id, reason, recovery } = undetermined("x", "read", &path, &source) else {
+        let Error::Undetermined { id, reason, recovery } = undetermined("x", "read", &path, source) else {
             panic!("{rendered}: every non-`NotFound` failure is undetermined, not just a permission denial");
         };
 
         assert_eq!(id, "x");
+        let reason = reason.report().to_string();
         assert!(reason.contains(&path.display().to_string()), "{rendered}: {reason}");
         assert!(recovery.contains("re-run"), "{rendered}: {recovery}");
         assert_eq!(
@@ -810,6 +812,17 @@ fn a_plist_without_the_marker_is_scanned_as_foreign() {
     );
 }
 
+fn assert_reported_in_both(reported: &[Installed]) {
+    let [entry @ Installed::OursUnusable { name, cause: None, .. }] = reported else {
+        panic!("one unusable entry with no cause expected, got {reported:?}");
+    };
+    assert_eq!(name, "twice");
+    assert_eq!(
+        entry.unusable_reason(),
+        Some(format!("present in both {STAGING_DIR} and {ENABLED_DIR}"))
+    );
+}
+
 /// A state none of this backend's operations produces, and one `locate` refuses for every verb: the
 /// listing names it rather than choosing a directory.
 #[skuld::test]
@@ -825,13 +838,7 @@ fn a_plist_in_both_directories_is_reported_not_classified() {
     let scan = scanned(staging.path(), enabled.path());
 
     assert!(scan.entries.is_empty(), "{} entries", scan.entries.len());
-    assert_eq!(
-        scan.reported,
-        [Installed::OursUnusable {
-            name: "twice".to_string(),
-            reason: format!("present in both {STAGING_DIR} and {ENABLED_DIR}"),
-        }]
-    );
+    assert_reported_in_both(&scan.reported);
 }
 
 /// `/Library/LaunchDaemons` holds every vendor's daemons: a stem it shares with a goetia plist in
@@ -848,13 +855,7 @@ fn a_marked_plist_beside_an_unmarked_one_of_the_same_stem_is_reported() {
     let scan = scanned(staging.path(), enabled.path());
 
     assert!(scan.entries.is_empty(), "{} entries", scan.entries.len());
-    assert_eq!(
-        scan.reported,
-        [Installed::OursUnusable {
-            name: "twice".to_string(),
-            reason: format!("present in both {STAGING_DIR} and {ENABLED_DIR}"),
-        }]
-    );
+    assert_reported_in_both(&scan.reported);
 }
 
 /// Nothing at the stem is goetia's, and `list` omits foreign entries, so neither an entry nor a

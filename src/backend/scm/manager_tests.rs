@@ -128,11 +128,12 @@ fn the_scm_undetermined_recovery_names_both_causes_and_not_uninstall() {
     // fixes, so the class must not be keyed on the denial even though the advice is.
     for (raw, wants_elevation) in [(ERROR_ACCESS_DENIED as i32, true), (1117, false)] {
         let e = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(raw));
-        let Error::Undetermined { id, reason, recovery } = service_undetermined("x", "open service `x`", &e) else {
+        let Error::Undetermined { id, reason, recovery } = service_undetermined("x", "open service `x`", e) else {
             panic!("{raw}: every non-`is_not_found` failure is undetermined, not just a denial");
         };
 
         assert_eq!(id, "x");
+        let reason = reason.report().to_string();
         assert!(reason.contains("open service `x`"), "{raw}: {reason}");
         assert!(recovery.contains("re-run"), "{raw}: {recovery}");
         assert_eq!(
@@ -167,16 +168,20 @@ fn names(items: &[&str]) -> Vec<Unreadable> {
     items.iter().map(|name| denied(name)).collect()
 }
 
+/// What a failed open of `name`'s `Parameters` key was, for [`undetermined`] to wrap.
+fn registry_failure(name: &str, cause: &str) -> Error {
+    Error::os(
+        format!("open HKLM\\...\\{name}\\Parameters"),
+        std::io::Error::other(cause.to_string()),
+    )
+}
+
 /// The [`Unreadable`] a denied `Parameters` read produces, built through the same [`undetermined`]
 /// the production path uses so the remedy under test is the one `status` would render, not a copy.
 fn denied(name: &str) -> Unreadable {
     unreadable_parts(
         name.to_string(),
-        undetermined(
-            name,
-            format!("registry open HKLM\\...\\{name}\\Parameters: denied"),
-            true,
-        ),
+        undetermined(name, registry_failure(name, "denied"), true),
     )
 }
 
@@ -226,11 +231,7 @@ fn an_aggregate_standing_for_one_service_names_it() {
 fn a_named_entry_carries_the_remedy_the_errno_earned_not_elevation() {
     let hive = unreadable_parts(
         "MsSecFlt".to_string(),
-        undetermined(
-            "MsSecFlt",
-            r"registry open HKLM\...\MsSecFlt\Parameters: the hive is corrupt".to_string(),
-            false,
-        ),
+        undetermined("MsSecFlt", registry_failure("MsSecFlt", "the hive is corrupt"), false),
     );
     let Some(Installed::Undetermined { reason, .. }) = unreadable_aggregate(vec![hive]) else {
         panic!("one unreadable service is undetermined, named");
@@ -252,11 +253,7 @@ fn a_named_entry_carries_the_remedy_the_errno_earned_not_elevation() {
 #[skuld::test]
 fn a_named_entry_offers_the_same_remedy_status_renders() {
     for access_denied in [true, false] {
-        let e = undetermined(
-            "MsSecFlt",
-            r"registry open HKLM\...\Parameters: failed".to_string(),
-            access_denied,
-        );
+        let e = undetermined("MsSecFlt", registry_failure("MsSecFlt", "failed"), access_denied);
         let Error::Undetermined { recovery, .. } = &e else {
             panic!("`undetermined` builds that variant and no other");
         };
@@ -306,10 +303,10 @@ fn a_named_entry_does_not_carry_the_aggregate_claim() {
     let Some(Installed::Undetermined { reason, .. }) = unreadable_aggregate(vec![denied("MsSecFlt")]) else {
         panic!("one unreadable service is undetermined");
     };
-    // The cause is kept: `service_detail`'s own doc comment calls a static sentence useless for
+    // The cause is kept: `to_error`'s own doc comment calls a static sentence useless for
     // diagnosing a real Win32 failure.
     assert!(
-        reason.contains(r"registry open HKLM\...\MsSecFlt\Parameters: denied"),
+        reason.contains(r"failed to open HKLM\...\MsSecFlt\Parameters: denied"),
         "the read that failed is the diagnosable part, and one entry has room for it: {reason}"
     );
     assert!(
@@ -336,14 +333,17 @@ fn a_failed_parameters_read_keeps_its_rendered_cause() {
         "MsSecFlt".to_string(),
         undetermined(
             "MsSecFlt",
-            r"registry open HKLM\SYSTEM\CurrentControlSet\Services\MsSecFlt\Parameters: denied".to_string(),
+            Error::os(
+                r"open HKLM\SYSTEM\CurrentControlSet\Services\MsSecFlt\Parameters",
+                std::io::Error::other("denied"),
+            ),
             true,
         ),
     );
     assert_eq!(carried.name, "MsSecFlt");
     assert_eq!(
         carried.detail,
-        r"registry open HKLM\SYSTEM\CurrentControlSet\Services\MsSecFlt\Parameters: denied"
+        r"failed to open HKLM\SYSTEM\CurrentControlSet\Services\MsSecFlt\Parameters: denied"
     );
     assert!(
         carried.recovery.is_some_and(|r| r.contains("re-run as Administrator")),
@@ -363,12 +363,16 @@ fn a_failed_parameters_read_keeps_its_rendered_cause() {
 fn a_wrapped_parameters_read_failure_keeps_the_inner_cause_and_remedy() {
     let wrapped = Error::Step {
         what: "read the parameters".to_string(),
-        source: Box::new(undetermined("MsSecFlt", "the key is unreadable".to_string(), true)),
+        source: Box::new(undetermined(
+            "MsSecFlt",
+            Error::os("read the key", std::io::Error::other("unreadable")),
+            true,
+        )),
     };
 
     let parts = unreadable_parts("MsSecFlt".to_string(), wrapped);
 
-    assert_eq!(parts.detail, "the key is unreadable");
+    assert_eq!(parts.detail, "failed to read the key: unreadable");
     assert!(
         parts.recovery.is_some_and(|r| r.contains("re-run as Administrator")),
         "the remedy of the inner `Undetermined` travels"
@@ -500,11 +504,14 @@ fn blob_of(kind: Kind) -> Blob {
 
 #[skuld::test]
 fn start_reads_a_simple_service_by_the_shims_vocabulary_and_anything_else_strictly() {
-    assert_eq!(start_kind(Ok(&blob_of(Kind::Simple))), (Kind::Simple, None));
-    assert_eq!(start_kind(Ok(&blob_of(Kind::Managed))), (Kind::Managed, None));
+    for kind in [Kind::Simple, Kind::Managed] {
+        let (read, why) = start_kind(Ok(&blob_of(kind)));
+        assert_eq!(read, kind);
+        assert!(why.is_none(), "{why:?}");
+    }
     let (kind, why) = start_kind(Err(&Error::Blob("corrupt".to_string())));
     assert_eq!(kind, Kind::Managed);
-    assert!(why.unwrap().contains("corrupt"));
+    assert!(matches!(why, Some(Error::Blob(message)) if message == "corrupt"));
 }
 
 /// A start judged strictly because the blob could not be read says why, so the user is not told a
@@ -517,7 +524,7 @@ fn a_failed_start_names_the_blob_read_error_that_made_it_strict() {
     let plain = failed_start(&id, e(), None).report().to_string();
     assert!(!plain.contains("blob"), "{plain}");
 
-    let strict = failed_start(&id, e(), Some("invalid blob JSON: EOF"))
+    let strict = failed_start(&id, e(), Some(Error::Blob("invalid blob JSON: EOF".to_string())))
         .report()
         .to_string();
     assert!(strict.contains("service stopped before reaching Running"), "{strict}");
@@ -546,7 +553,9 @@ fn a_blob_that_says_always_decodes_and_starts_as_its_kind() {
         .expect("the blob is ours");
 
     assert_eq!(blob.spec.restart, Restart::Always);
-    assert_eq!(start_kind(Ok(&blob)), (Kind::Simple, None));
+    let (kind, why) = start_kind(Ok(&blob));
+    assert_eq!(kind, Kind::Simple);
+    assert!(why.is_none(), "{why:?}");
 }
 
 // The generator's refusal at its call sites ---------------------------------------------------------------------------

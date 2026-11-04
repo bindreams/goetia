@@ -138,7 +138,11 @@ fn every_kind_serializes_to_its_documented_wire_spelling() {
 fn an_undetermined_error_is_not_reported_as_unusable() {
     let e = Error::Undetermined {
         id: "frpc".to_string(),
-        reason: "failed to read /run/systemd/system/frpc.service.d: Permission denied".to_string(),
+        reason: Box::new(Error::os_at(
+            "read",
+            "/run/systemd/system/frpc.service.d",
+            std::io::Error::other("Permission denied"),
+        )),
         recovery: "re-run as root".to_string(),
     };
 

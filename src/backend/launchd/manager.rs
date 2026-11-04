@@ -185,8 +185,8 @@ fn locate(id: &str) -> Result<Option<Location>> {
         // location is a fact about both directories at once, and the
         // remaining three answers — absent, staged, enabled — each claim
         // something about the directory that was never read.
-        (Presence::Undetermined { source }, _) => Err(undetermined(id, "stat", &staging, &source)),
-        (_, Presence::Undetermined { source }) => Err(undetermined(id, "stat", &enabled, &source)),
+        (Presence::Undetermined { source }, _) => Err(undetermined(id, "stat", &staging, source)),
+        (_, Presence::Undetermined { source }) => Err(undetermined(id, "stat", &enabled, source)),
         (Presence::Absent, Presence::Absent) => Ok(None),
         (Presence::Present, Presence::Absent) => Ok(Some(Location {
             path: staging,
@@ -218,7 +218,7 @@ fn locate(id: &str) -> Result<Option<Location>> {
 /// What the errno does choose is `recovery` — re-running elevated is advice
 /// only a permission boundary earns, and offering it for a failing disk
 /// sends the user somewhere useless.
-fn undetermined(id: &str, op: &str, path: &Path, source: &io::Error) -> Error {
+fn undetermined(id: &str, op: &str, path: &Path, source: io::Error) -> Error {
     let recovery = if source.kind() == io::ErrorKind::PermissionDenied {
         "re-run as root (or under sudo): that read is what tells goetia whether anything is \
          installed at this id"
@@ -228,17 +228,9 @@ fn undetermined(id: &str, op: &str, path: &Path, source: &io::Error) -> Error {
     };
     Error::Undetermined {
         id: id.to_string(),
-        reason: read_detail(op, path, source),
+        reason: Box::new(Error::os_at(op, path, source)),
         recovery: recovery.to_string(),
     }
-}
-
-/// What did not complete, as facts — which operation, which path, which
-/// failure — with no claim about the id attached. Shared by [`undetermined`]
-/// and by `list`'s [`Installed::Undetermined`] entry, so the error and the
-/// entry cannot describe one failure differently.
-fn read_detail(op: &str, path: &Path, source: &dyn std::fmt::Display) -> String {
-    format!("failed to {op} {path}: {source}", path = path.display())
 }
 
 /// The magic every binary property list begins with. `plutil -convert
@@ -407,7 +399,7 @@ fn read_artifact(path: &Path, id: &str) -> Result<String> {
         Obtained::Bytes(bytes) => bytes,
         Obtained::Absent => return Err(Error::NotInstalled { id: id.to_string() }),
         Obtained::NonRegular => return Ok(String::new()),
-        Obtained::Failed(e) => return Err(undetermined(id, "read", path, &e)),
+        Obtained::Failed(e) => return Err(undetermined(id, "read", path, e)),
     };
     match classify(bytes) {
         ClassifyOutcome::Text(text) => Ok(text),
@@ -500,15 +492,18 @@ fn resolve_account(user: &User) -> Result<Account> {
         User::Root => account_from_uid(0),
         User::Name(name) => nix::unistd::User::from_name(name)
             .map_err(|e| Error::AccountLookup {
-                detail: format!("look up user `{name}`: {e}"),
+                detail: format!("look up user `{name}`"),
+                source: Some(e.into()),
             })?
             .map(Account::from)
             .ok_or_else(|| Error::AccountLookup {
                 detail: format!("no such user `{name}` on this host"),
+                source: None,
             }),
         User::Id(AccountId::Uid(uid)) => account_from_uid(*uid),
         User::Id(AccountId::Sid(sid)) => Err(Error::AccountLookup {
             detail: format!("user `{{id: {sid}}}` names a Windows SID, which is not meaningful on macOS"),
+            source: None,
         }),
     }
 }
@@ -516,11 +511,13 @@ fn resolve_account(user: &User) -> Result<Account> {
 fn account_from_uid(uid: u32) -> Result<Account> {
     nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
         .map_err(|e| Error::AccountLookup {
-            detail: format!("look up uid {uid}: {e}"),
+            detail: format!("look up uid {uid}"),
+            source: Some(e.into()),
         })?
         .map(Account::from)
         .ok_or_else(|| Error::AccountLookup {
             detail: format!("no such uid {uid} on this host"),
+            source: None,
         })
 }
 
@@ -809,7 +806,8 @@ fn failed(args: &[&str], request: bool, error: ClientError) -> Error {
             request: command,
             // `launchctl` never says when launchd has it.
             reached: false,
-            detail: source.to_string(),
+            note: None,
+            source: source.into(),
         }
     } else {
         Error::spawn(command, source)
@@ -1152,7 +1150,7 @@ impl Launchd {
             Ok(_) => Err(refuse::loaded_after_write(id, undo_write(target, wrote, previous))),
             Err(read) => Err(refuse::state_unknown_after_write(
                 id,
-                &read,
+                read,
                 undo_write(target, wrote, previous),
             )),
         }
@@ -1590,7 +1588,7 @@ fn scan_in(dirs: [(&str, bool); 2]) -> Scan<Plist> {
                     // Goetia marker at all. `Installed::Undetermined` claims neither ownership nor
                     // absence, which is exactly what was established.
                     Error::Undetermined { reason, .. } => {
-                        unestablished.get_or_insert(reason.clone());
+                        unestablished.get_or_insert(reason.report().to_string());
                     }
                     _ => {
                         unestablished.get_or_insert(e.report().to_string());
@@ -1612,7 +1610,8 @@ fn scan_in(dirs: [(&str, bool); 2]) -> Scan<Plist> {
                 if found.iter().any(|f| matches!(f, ReadOutcome::Marked(_))) {
                     reported.push(Installed::OursUnusable {
                         name: id,
-                        reason: format!("present in both {STAGING_DIR} and {ENABLED_DIR}"),
+                        reason: Some(format!("present in both {STAGING_DIR} and {ENABLED_DIR}")),
+                        cause: None,
                     });
                 }
             }

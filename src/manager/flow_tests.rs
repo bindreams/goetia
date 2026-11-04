@@ -231,15 +231,27 @@ fn list_reports_an_unresolvable_account_as_ours_unusable() {
 
     let listed = fake.list().unwrap();
 
+    let [entry @ Installed::OursUnusable { name, reason, cause }] = listed.as_slice() else {
+        panic!("one unusable entry expected, got {listed:?}");
+    };
+    assert_eq!(name, "frpc");
     assert_eq!(
-        listed,
-        [Installed::OursUnusable {
-            name: "frpc".to_string(),
-            reason: format!(
+        reason.as_deref(),
+        Some("marked ours, but its embedded spec cannot be regenerated")
+    );
+    assert!(
+        matches!(cause.as_deref(), Some(Error::AccountLookup { .. })),
+        "{cause:?}"
+    );
+    assert_eq!(
+        entry.unusable_reason().as_deref(),
+        Some(
+            format!(
                 "marked ours, but its embedded spec cannot be regenerated: {}",
                 unresolvable("gone")
-            ),
-        }]
+            )
+            .as_str()
+        )
     );
 }
 
@@ -260,11 +272,15 @@ fn list_reports_a_failed_live_status_as_ours_unusable() {
         "one entry's failure must not take down the others: {listed:?}"
     );
     assert!(
-        listed.contains(&Installed::OursUnusable {
-            name: "frpc".to_string(),
-            reason: "marked ours, but its live state could not be queried: failed to query the live state: state unavailable"
-                .to_string(),
-        }),
+        listed
+            .iter()
+            .any(|e| matches!(e, Installed::OursUnusable { name, cause: Some(cause), .. }
+                if name == "frpc" && matches!(**cause, Error::Os { .. }))
+                && e.unusable_reason().as_deref()
+                    == Some(
+                        "marked ours, but its live state could not be queried: failed to query the live state: state \
+                     unavailable"
+                    )),
         "{listed:?}"
     );
     assert!(
@@ -294,10 +310,12 @@ fn list_reports_a_name_that_is_not_an_id_without_querying_it() {
 
     assert_eq!(listed.len(), 2, "{listed:?}");
     assert!(
-        listed.contains(&Installed::OursUnusable {
-            name: name.to_string(),
-            reason: format!("marked ours, but its name is not a valid daemon id: {invalid}"),
-        }),
+        listed.iter().any(
+            |e| matches!(e, Installed::OursUnusable { name: got, cause: Some(cause), .. }
+                if got == name && matches!(**cause, Error::Invalid { .. }))
+                && e.unusable_reason()
+                    == Some(format!("marked ours, but its name is not a valid daemon id: {invalid}"))
+        ),
         "{listed:?}"
     );
     assert!(
@@ -318,8 +336,9 @@ fn list_reports_an_undecodable_blob_before_a_name_that_is_not_an_id() {
     let listed = fake.list().unwrap();
 
     match listed.as_slice() {
-        [Installed::OursUnusable { name: got, reason }] => {
+        [entry @ Installed::OursUnusable { name: got, .. }] => {
             assert_eq!(got, name);
+            let reason = entry.unusable_reason().expect("an unusable entry has a reason");
             assert!(
                 reason.starts_with("blob: "),
                 "the blob's reason, not the name's: {reason}"
@@ -502,7 +521,7 @@ fn scan_treats_a_missing_location_as_empty() {
     );
 
     assert!(kept.is_empty(), "{kept:?}");
-    assert_eq!(reported, None);
+    assert!(reported.is_none(), "{reported:?}");
 }
 
 /// The outcome that must never be confused with the one above: a location that is there and will
@@ -542,7 +561,7 @@ fn scan_that_finishes_reports_nothing() {
     );
 
     assert_eq!(kept, ["a", "b"]);
-    assert_eq!(reported, None);
+    assert!(reported.is_none(), "{reported:?}");
 }
 
 /// The text of a directory pass that stopped, which every directory-scanning backend hands

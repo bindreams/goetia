@@ -525,7 +525,8 @@ fn requested_with(
     wait(child).map_err(|e| Error::RequestInDoubt {
         request,
         reached: false,
-        detail: e.to_string(),
+        note: None,
+        source: e.into(),
     })
 }
 
@@ -544,15 +545,9 @@ pub(super) fn daemon_reload() -> Result<()> {
 /// is exit `1`.
 pub(super) fn daemon_reload_or_report(id: &str) -> Result<()> {
     daemon_reload().map_err(|e| match e {
-        Error::RequestInDoubt {
-            request,
-            reached,
-            detail,
-        } => Error::RequestInDoubt {
-            request,
-            reached,
-            detail: format!("wrote the unit for `{id}`, so systemd may not have picked it up yet: {detail}"),
-        },
+        e @ Error::RequestInDoubt { .. } => {
+            e.in_doubt_context(format!("wrote the unit for `{id}`, so systemd may not have picked it up yet"))
+        }
         e => Error::Step {
             what: format!(
                 "wrote the unit for `{id}` but `systemctl daemon-reload` failed, so systemd may not have picked it up yet"
@@ -759,10 +754,11 @@ pub(super) fn watched(budget: Budget) -> bool {
 /// [`answered`].
 fn run_verb_via(program: &[&str], args: &[&str], budget: Budget, deadline: Deadline) -> Result<Finished> {
     let failed = |e: cosca::error::Error| Error::spawn(format!("systemctl {}", args.join(" ")), e);
-    let in_doubt = |e: String, reached: bool| Error::RequestInDoubt {
+    let in_doubt = |e: cosca::error::Error, reached: bool| Error::RequestInDoubt {
         request: format!("systemctl {}", args.join(" ")),
         reached,
-        detail: e,
+        note: None,
+        source: e.into(),
     };
     if !watched(budget) {
         let output = ran(Purpose::Request, program, args)?;
@@ -784,12 +780,11 @@ fn run_verb_via(program: &[&str], args: &[&str], budget: Budget, deadline: Deadl
     environment(&mut cmd);
     let spawned = bounded::spawn(&mut cmd, Role::AnnouncedRequest(enqueued)).map_err(|e| match e {
         bounded::SpawnError::NotRun(e) => failed(e),
-        bounded::SpawnError::MayHaveRun(e) => in_doubt(e.to_string(), false),
+        bounded::SpawnError::MayHaveRun(e) => in_doubt(e, false),
     })?;
     // Past the spawn, `systemctl` is running, and a failure to watch it leaves its request in doubt —
     // one it had announced reached systemd.
-    let finished =
-        bounded::wait_bounded(spawned, deadline).map_err(|lost| in_doubt(lost.error.to_string(), lost.announced))?;
+    let finished = bounded::wait_bounded(spawned, deadline).map_err(|lost| in_doubt(lost.error, lost.announced))?;
     if let Finished::Exited { capture, .. } = &finished {
         answered(&capture.stdout, &capture.stderr)?;
     }

@@ -192,19 +192,10 @@ fn abandoned_before_start(id: &Id, e: Error, budget: Budget) -> Error {
             id,
             awaited,
         },
-        Error::RequestInDoubt {
-            request,
-            reached,
-            detail,
-        } => Error::RequestInDoubt {
-            request,
-            reached,
-            detail: format!(
-                "the restart was abandoned: no start was issued, so `{id}` may be left stopped. `goetia daemon \
-                 status {id}` shows the manager's current view, and `goetia daemon start {id}` brings it back up: \
-                 {detail}"
-            ),
-        },
+        e @ Error::RequestInDoubt { .. } => e.in_doubt_context(format!(
+            "the restart was abandoned: no start was issued, so `{id}` may be left stopped. `goetia daemon \
+             status {id}` shows the manager's current view, and `goetia daemon start {id}` brings it back up"
+        )),
         other => other,
     }
 }
@@ -251,21 +242,16 @@ fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
         // established differs.
         Error::Undetermined { id, reason, recovery } => Error::Undetermined {
             id,
-            reason: format!("{}: {reason}", after_stop_clause(budget)),
+            reason: Box::new(Error::Step {
+                what: after_stop_clause(budget).to_string(),
+                source: reason,
+            }),
             recovery,
         },
         // The start may have reached the manager: kept as it is, ahead of the
         // non-waiting arm below, whose "refused" it was not, and never called a
         // failure to restart, which is what it did not establish.
-        Error::RequestInDoubt {
-            request,
-            reached,
-            detail,
-        } => Error::RequestInDoubt {
-            request,
-            reached,
-            detail: format!("{}: {detail}", start_after_stop_clause(id, budget)),
-        },
+        e @ Error::RequestInDoubt { .. } => e.in_doubt_context(start_after_stop_clause(id, budget)),
         // The stop was issued and not waited for, and the start that
         // followed was refused — determinately (a launchd `bootstrap` that
         // fails outright) or not (SCM's `ERROR_SERVICE_ALREADY_RUNNING` over a
@@ -275,11 +261,7 @@ fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
         // the daemon ended up is what nobody established.
         e if !budget.waits() => Error::Unestablished {
             id: id.as_str().to_string(),
-            detail: format!(
-                "the stop was issued without waiting for it, and the start that followed was \
-                 refused: {}. `goetia daemon status {id}` shows the manager's current view.",
-                e.report()
-            ),
+            refused: Box::new(e),
         },
         Error::WaitTimeout {
             id,

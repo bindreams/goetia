@@ -48,12 +48,9 @@ fn registry_error(op: &str, path: &str, source: std::io::Error) -> Error {
 /// goetia's at all — see [`super::undetermined`], whose doc comment carries the
 /// whole argument, including why the class is not keyed on the denial while the
 /// recovery is.
-fn registry_undetermined(name: &str, op: &str, path: &str, source: &std::io::Error) -> Error {
-    super::undetermined(
-        name,
-        registry_detail(op, path, source),
-        source.kind() == std::io::ErrorKind::PermissionDenied,
-    )
+fn registry_undetermined(name: &str, op: &str, path: &str, source: std::io::Error) -> Error {
+    let access_denied = source.kind() == std::io::ErrorKind::PermissionDenied;
+    super::undetermined(name, registry_error(op, path, source), access_denied)
 }
 
 // Parameters (the metadata blob) ======================================================================================
@@ -80,12 +77,12 @@ pub fn read_parameters(name: &str) -> Result<BTreeMap<String, String>> {
     let key = match RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(&path, KEY_READ) {
         Ok(k) => k,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(e) => return Err(registry_undetermined(name, "open", &path, &e)),
+        Err(e) => return Err(registry_undetermined(name, "open", &path, e)),
     };
 
     let mut out = BTreeMap::new();
     for entry in key.enum_values() {
-        let (field, value) = entry.map_err(|e| registry_undetermined(name, "enumerate", &path, &e))?;
+        let (field, value) = entry.map_err(|e| registry_undetermined(name, "enumerate", &path, e))?;
         if let Ok(s) = String::from_reg_value(&value) {
             out.insert(field, s);
         }

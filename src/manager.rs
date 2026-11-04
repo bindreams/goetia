@@ -17,12 +17,7 @@ pub(crate) mod flow;
 
 pub use budget::Budget;
 
-// All three supported platforms return a real `ServiceManager`, so
-// `Error::UnsupportedPlatform` is referenced only by the catch-all arm.
-// Gating the import keeps every supported target from warning about it.
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-use crate::error::Error;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::spec::{DaemonSpec, Id};
 
 // ServiceManager ======================================================================================================
@@ -293,7 +288,7 @@ impl Prepared {
 // Installed / Status / State ==========================================================================================
 
 /// One entry from [`ServiceManager::list`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Installed {
     /// A Goetia-marked service whose blob decoded successfully.
     Ours {
@@ -305,12 +300,18 @@ pub enum Installed {
         pid: Option<u32>,
         enabled: bool,
     },
-    /// Ours by marker, but goetia cannot report on it; `reason` says why. The causes are listed on
-    /// [`Ownership::OursUnusable`]. Kept distinct from a silent omission: one such artifact must
-    /// not take down `list`/`status` for every other daemon.
+    /// Ours by marker, but goetia cannot report on it. `reason` is goetia's own words for why and
+    /// `cause` the error under them; at least one is set, and [`Installed::unusable_reason`] reads
+    /// them as one text. The causes are listed on [`Ownership::OursUnusable`]. Kept distinct from a
+    /// silent omission: one such artifact must not take down `list`/`status` for every other
+    /// daemon.
     ///
     /// [`Ownership::OursUnusable`]: crate::decide::Ownership::OursUnusable
-    OursUnusable { name: String, reason: String },
+    OursUnusable {
+        name: String,
+        reason: Option<String>,
+        cause: Option<Box<Error>>,
+    },
     /// Neither proof: the read that would have classified this id did not
     /// complete, so goetia established neither its absence nor its
     /// presence. The `list`-side counterpart of [`Error::Undetermined`],
@@ -346,6 +347,17 @@ pub enum Installed {
 }
 
 impl Installed {
+    /// What `list` prints for an [`OursUnusable`](Installed::OursUnusable) entry, as
+    /// `reason: cause`, or whichever of the two it has; `None` for any other entry.
+    pub fn unusable_reason(&self) -> Option<String> {
+        let Installed::OursUnusable { reason, cause, .. } = self else {
+            return None;
+        };
+        let cause = cause.as_ref().map(|cause| cause.report().to_string());
+        let parts: Vec<String> = reason.iter().cloned().chain(cause).collect();
+        Some(parts.join(": "))
+    }
+
     /// The aggregate entry an enumeration that stopped early leaves behind: `location` is what
     /// was being scanned, `detail` what did not complete there. Every backend builds it here, so
     /// a scan cut short in a unit directory, a `LaunchDaemons` directory or the SCM registry key

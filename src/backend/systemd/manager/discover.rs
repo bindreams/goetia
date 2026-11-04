@@ -85,8 +85,8 @@ impl ReadFailure {
     }
 
     /// The absence-path reading — see [`undetermined`].
-    fn undetermined(&self, id: &str) -> Error {
-        undetermined(id, self.op, &self.path, &self.source)
+    fn undetermined(self, id: &str) -> Error {
+        undetermined(id, self.op, &self.path, self.source)
     }
 
     /// The reading for a caller that already knows goetia owns the id, so "unusable" is a true
@@ -412,7 +412,7 @@ pub(super) fn installed(id: &str, text: &str) -> Result<InstalledDefinition<Stri
 /// errno would restore the false ownership claim for the narrower input while the fix looked
 /// complete. What the errno does choose is `recovery`: re-running elevated is advice only a
 /// permission boundary earns, and offering it for a failing disk sends the user somewhere useless.
-fn undetermined(id: &str, op: &str, path: &Path, source: &io::Error) -> Error {
+fn undetermined(id: &str, op: &str, path: &Path, source: io::Error) -> Error {
     let recovery = if source.kind() == io::ErrorKind::PermissionDenied {
         "re-run as root (or under sudo): that read is what tells goetia whether anything is \
          installed at this id"
@@ -422,7 +422,7 @@ fn undetermined(id: &str, op: &str, path: &Path, source: &io::Error) -> Error {
     };
     Error::Undetermined {
         id: id.to_string(),
-        reason: format!("failed to {op} {}: {source}", path.display()),
+        reason: Box::new(Error::os_at(op, path, source)),
         recovery: recovery.to_string(),
     }
 }

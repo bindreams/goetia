@@ -159,7 +159,7 @@ pub(crate) fn preview<B: Backend>(b: &B, spec: &DaemonSpec) -> Result<Outcome> {
 
 pub(crate) fn status<B: Backend>(b: &B, id: &Id) -> Result<Status> {
     let snapshot = owned(b, id)?;
-    let blob = snapshot.blob().map_err(blob_failure)?;
+    let blob = snapshot.blob().map_err(owned_failure)?;
     b.render(&blob.spec).map_err(|e| Error::Step {
         what: format!("`{id}`'s embedded spec cannot be regenerated"),
         source: Box::new(e),
@@ -167,19 +167,17 @@ pub(crate) fn status<B: Backend>(b: &B, id: &Id) -> Result<Status> {
     b.live_status(&snapshot)
 }
 
-/// The failure a snapshot kept of its blob, as an owned error. Only [`Error::Blob`] and
-/// [`Error::Invalid`] are ever kept, and each is its whole text, so it is rebuilt as itself.
-fn blob_failure(e: &Error) -> Error {
+/// A failure a snapshot or a scan kept (its blob's, or why its name is no id), as an owned error.
+/// Only [`Error::Blob`] and [`Error::Invalid`] are ever kept, and each is its whole text, so it is
+/// rebuilt as itself.
+pub(crate) fn owned_failure(e: &Error) -> Error {
     match e {
         Error::Blob(message) => Error::Blob(message.clone()),
         Error::Invalid { daemon, message } => Error::Invalid {
             daemon: daemon.clone(),
             message: message.clone(),
         },
-        other => {
-            debug_assert!(false, "a snapshot keeps only Blob and Invalid, got {other:?}");
-            Error::Blob(other.report().to_string())
-        }
+        other => unreachable!("a snapshot and a scan keep only Blob and Invalid, got {other:?}"),
     }
 }
 
@@ -194,22 +192,23 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
             ScanEntry::Read(ReadOutcome::Marked(snapshot)) => (snapshot.blob(), Ok(snapshot)),
             ScanEntry::Misnamed { blob, name } => (blob.as_ref(), Err(name)),
         };
-        let unusable = |reason: String| Installed::OursUnusable {
+        let unusable = |reason: Option<&str>, cause: Error| Installed::OursUnusable {
             name: name.clone(),
-            reason,
+            reason: reason.map(str::to_string),
+            cause: Some(Box::new(cause)),
         };
         let blob = match blob {
             Ok(blob) => blob,
             Err(e) => {
-                out.push(unusable(e.report().to_string()));
+                out.push(unusable(None, owned_failure(e)));
                 continue;
             }
         };
         if let Err(e) = b.render(&blob.spec) {
-            out.push(unusable(format!(
-                "marked ours, but its embedded spec cannot be regenerated: {}",
-                e.report()
-            )));
+            out.push(unusable(
+                Some("marked ours, but its embedded spec cannot be regenerated"),
+                e,
+            ));
             continue;
         }
         // One entry's failure must not take down the listing of every other daemon, except that
@@ -217,9 +216,10 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
         let snapshot = match snapshot {
             Ok(snapshot) => snapshot,
             Err(e) => {
-                out.push(unusable(format!(
-                    "marked ours, but its name is not a valid daemon id: {e}"
-                )));
+                out.push(unusable(
+                    Some("marked ours, but its name is not a valid daemon id"),
+                    owned_failure(e),
+                ));
                 continue;
             }
         };
@@ -234,10 +234,10 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
                 Error::NoManager { .. } => return Err(e),
                 // The query completed and found the service gone: absence is established.
                 Error::NotInstalled { .. } => {}
-                _ => out.push(unusable(format!(
-                    "marked ours, but its live state could not be queried: {}",
-                    e.report()
-                ))),
+                _ => out.push(unusable(
+                    Some("marked ours, but its live state could not be queried"),
+                    e,
+                )),
             },
         }
     }

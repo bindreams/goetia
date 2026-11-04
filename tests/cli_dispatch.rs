@@ -258,7 +258,11 @@ fn injected_failure(id: &Id) -> goetia::Error {
 fn injected_indeterminacy(id: &Id) -> goetia::Error {
     goetia::Error::Undetermined {
         id: id.as_str().to_string(),
-        reason: "the artifact could not be read (injected test failure)".to_string(),
+        reason: Box::new(goetia::Error::Os {
+            what: "read the artifact".to_string(),
+            path: None,
+            source: std::io::Error::other("injected test failure").into(),
+        }),
         recovery: "re-run with enough privilege to read the artifact".to_string(),
     }
 }
@@ -386,7 +390,8 @@ impl ServiceManager for FlakyManager {
             if matches!(entry, Installed::Ours { spec, .. } if Some(spec.id.as_str()) == self.unqueryable.as_deref()) {
                 *entry = Installed::OursUnusable {
                     name: self.unqueryable.clone().expect("matched against Some just above"),
-                    reason: unqueryable_failure().to_string(),
+                    reason: None,
+                    cause: Some(Box::new(unqueryable_failure())),
                 };
             }
         }

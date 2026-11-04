@@ -454,6 +454,7 @@ fn identity_for(user: &User) -> Result<Identity> {
         User::Id(AccountId::Sid(_)) => {
             return Err(Error::AccountLookup {
                 detail: "a Windows account id (SID) is not a valid user for the systemd backend".to_string(),
+                source: None,
             });
         }
     };

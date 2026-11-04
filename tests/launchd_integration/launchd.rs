@@ -675,12 +675,12 @@ fn list_reports_a_deleted_user_as_ours_unusable() {
     let reason = listed
         .iter()
         .find_map(|entry| match entry {
-            Installed::OursUnusable { name, reason } if name == &id => Some(reason),
+            Installed::OursUnusable { name, .. } if name == &id => entry.unusable_reason(),
             _ => None,
         })
         .unwrap_or_else(|| panic!("a marked plist is ours even when its spec cannot be rendered: {listed:?}"));
     assert_eq!(
-        *reason,
+        reason,
         format!("marked ours, but its embedded spec cannot be regenerated: {cannot_render}")
     );
 

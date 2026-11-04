@@ -161,7 +161,7 @@ fn a_job_in_doubt_whose_plist_could_not_be_restored_carries_the_failure() {
 #[skuld::test]
 fn an_unreadable_recheck_is_in_doubt_and_names_the_remedy_and_the_failure() {
     let read = failed_print();
-    let e = state_unknown_after_write(&Id::try_from("frpc").unwrap(), &read, Ok(()));
+    let e = state_unknown_after_write(&Id::try_from("frpc").unwrap(), read, Ok(()));
     assert!(matches!(e, Error::LoadedStateInDoubt { .. }), "{e:?}");
     let message = e.to_string();
     assert!(message.contains("`frpc`"), "{message}");
@@ -175,7 +175,7 @@ fn an_unreadable_recheck_is_in_doubt_and_names_the_remedy_and_the_failure() {
 #[skuld::test]
 fn an_unreadable_recheck_whose_plist_could_not_be_restored_carries_both_failures() {
     let read = failed_print();
-    let e = state_unknown_after_write(&Id::try_from("frpc").unwrap(), &read, Err(restore_failure()));
+    let e = state_unknown_after_write(&Id::try_from("frpc").unwrap(), read, Err(restore_failure()));
     assert!(matches!(e, Error::LoadedStateInDoubt { .. }), "{e:?}");
     let message = e.report().to_string();
     assert!(message.contains("Input/output error"), "{message}");
