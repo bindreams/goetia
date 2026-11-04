@@ -298,7 +298,7 @@ fn a_daemon_that_cannot_be_spawned_fails_start_under_every_policy() {
         let err = mgr
             .start(&spec.id, Budget::DEFAULT)
             .expect_err("a daemon that cannot be spawned must fail the start");
-        assert!(err.to_string().contains("failed start"), "{restart:?}: {err}");
+        assert!(err.report().to_string().contains("failed start"), "{restart:?}: {err}");
 
         let status = scm_status(&id);
         assert_eq!(status.current_state, ServiceState::Stopped, "{restart:?}: {status:?}");

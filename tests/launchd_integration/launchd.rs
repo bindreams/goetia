@@ -666,6 +666,7 @@ fn list_reports_a_deleted_user_as_ours_unusable() {
     let cannot_render = mgr
         .preview_install(&spec)
         .expect_err("a spec naming a deleted user cannot be rendered")
+        .report()
         .to_string();
 
     let listed = mgr
@@ -687,7 +688,7 @@ fn list_reports_a_deleted_user_as_ours_unusable() {
         .status(&Id::try_from(id.clone()).expect("valid id"))
         .expect_err("a spec that cannot be rendered has no status to report");
     assert_eq!(
-        err.to_string(),
+        err.report().to_string(),
         format!("`{id}`'s embedded spec cannot be regenerated: {cannot_render}")
     );
 }
