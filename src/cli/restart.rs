@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use clap::Args as ClapArgs;
 
+use super::ExitCode;
 use super::support::{IdVerbCall, run_id_verb};
 use super::wait::{self, WaitArgs};
 use crate::error::{Error, Result};
@@ -42,7 +43,7 @@ pub fn run(
     is_elevated: &dyn Fn() -> bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
-) -> i32 {
+) -> ExitCode {
     run_with(args, get_manager, is_elevated, &Budget::start, out, err)
 }
 
@@ -62,7 +63,7 @@ fn run_with(
     start_clock: &dyn Fn(Budget) -> Deadline,
     out: &mut dyn Write,
     err: &mut dyn Write,
-) -> i32 {
+) -> ExitCode {
     let budget = args.wait.budget();
     run_id_verb(
         IdVerbCall {

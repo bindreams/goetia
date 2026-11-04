@@ -15,6 +15,7 @@ use std::time::Duration;
 use goetia::backend::Identity;
 use goetia::backend::systemd::generate;
 use goetia::backend::systemd::manager::Systemd;
+use goetia::cli::ExitCode;
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, Installed, ServiceManager, State, conformance};
 use goetia::spec::{AccountId, DaemonSpec, Id, Kind, Restart, User};
@@ -327,7 +328,7 @@ impl Drop for RmPath {
 /// Drive `daemon uninstall` through the CLI rather than calling `Systemd::uninstall` directly: the
 /// thing under test is the exit code a shell sees, and `IdVerbCall::absent_is_success` turns
 /// `Error::NotInstalled` — and only that variant — into `0` and "nothing to do" on the way there.
-fn uninstall_via_cli(id: &str) -> (i32, String, String) {
+fn uninstall_via_cli(id: &str) -> (ExitCode, String, String) {
     let args = goetia::cli::uninstall::Args {
         ids: vec![id.to_string()],
     };
@@ -886,7 +887,7 @@ fn a_restart_with_no_budget_restarts_behind_a_stop_that_has_to_wait() {
     let code = goetia::cli::restart::run(&args, &get_manager, &|| true, &mut out, &mut err);
 
     let (out, err) = (String::from_utf8_lossy(&out), String::from_utf8_lossy(&err));
-    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(code, ExitCode::Success, "stdout:\n{out}\nstderr:\n{err}");
     assert_eq!(
         queued_job_types(guard.id()),
         ["restart"],
@@ -1293,7 +1294,7 @@ fn uninstall_refuses_an_id_whose_fragment_is_gone_but_whose_dropin_remains() {
 
     let (code, out, err) = uninstall_via_cli(guard.id());
 
-    assert_ne!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert_ne!(code, ExitCode::Success, "stdout:\n{out}\nstderr:\n{err}");
     assert!(!out.contains("not installed (nothing to do)"), "{out}");
     assert!(
         dropin_dir(guard.id()).exists(),
@@ -1315,7 +1316,7 @@ fn uninstall_refuses_an_id_whose_fragment_is_gone_but_whose_enablement_link_rema
 
     let (code, out, err) = uninstall_via_cli(&id);
 
-    assert_ne!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert_ne!(code, ExitCode::Success, "stdout:\n{out}\nstderr:\n{err}");
     assert!(!out.contains("not installed (nothing to do)"), "{out}");
     assert!(fs::symlink_metadata(&link).is_ok(), "and the link survives, unremoved");
 }
@@ -1630,7 +1631,7 @@ fn uninstall_refuses_an_id_whose_only_artifact_is_a_control_dropin() {
 
     // Non-vacuity: with nothing at the id at all, this is the `0` the assertion below rejects.
     let (code, _out, _err) = uninstall_via_cli(guard.id());
-    assert_eq!(code, 0, "an empty id is `nothing to do`");
+    assert_eq!(code, ExitCode::Success, "an empty id is `nothing to do`");
 
     // The `/run` root this time, so the two `.control` tests never share a directory to clean up.
     let (dir, _cleanup) = seed_control_dropin("/run/systemd/system.control", guard.id());
@@ -1638,7 +1639,8 @@ fn uninstall_refuses_an_id_whose_only_artifact_is_a_control_dropin() {
     let (code, out, err) = uninstall_via_cli(guard.id());
     let context = format!("stdout:\n{out}\nstderr:\n{err}");
     assert_ne!(
-        code, 0,
+        code,
+        ExitCode::Success,
         "`uninstall && echo confirmed gone` must not print here: {context}"
     );
     assert!(

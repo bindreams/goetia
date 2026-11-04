@@ -2,7 +2,9 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use super::{Args, Leg, SPENT, WaitArgs, abandoned_before_start, after_start_failed, leg, run_with, stop_leg};
+use super::{
+    Args, ExitCode, Leg, SPENT, WaitArgs, abandoned_before_start, after_start_failed, leg, run_with, stop_leg,
+};
 use crate::error::{Error, Result};
 use crate::manager::fake::Fake;
 use crate::manager::{Budget, ServiceManager};
@@ -109,7 +111,7 @@ fn deadlines_derived(ids: &[&str]) -> usize {
 
     assert_eq!(
         code,
-        0,
+        ExitCode::Success,
         "the fixture must restart cleanly, or the count is of a path nobody takes: {}",
         String::from_utf8_lossy(&err)
     );
@@ -135,7 +137,7 @@ fn every_id_derives_a_deadline_of_its_own() {
 
 /// `daemon restart frpc --timeout 30s` with the clock injected already spent, so nothing here
 /// depends on how long the run takes. Returns the exit code and stderr.
-fn restart_on_a_spent_clock(fake: &Fake) -> (i32, String, String) {
+fn restart_on_a_spent_clock(fake: &Fake) -> (ExitCode, String, String) {
     let args = Args {
         ids: vec!["frpc".to_string()],
         wait: WaitArgs {
@@ -172,7 +174,7 @@ fn a_bounded_budget_spent_before_an_unconfirmed_stop_is_a_timeout_and_starts_not
 
     let (code, out, err) = restart_on_a_spent_clock(&fake);
 
-    assert_eq!(code, 4, "{err}");
+    assert_eq!(code, ExitCode::Indeterminate, "{err}");
     assert_eq!(
         fake.calls(),
         vec![("stop", "frpc".to_string())],
@@ -196,7 +198,7 @@ fn a_bounded_budget_spent_before_a_confirmed_stop_reports_it_stopped_and_starts_
 
     let (code, out, err) = restart_on_a_spent_clock(&fake);
 
-    assert_eq!(code, 4, "{err}");
+    assert_eq!(code, ExitCode::Indeterminate, "{err}");
     assert_eq!(
         fake.calls(),
         vec![("start", "frpc".to_string()), ("stop", "frpc".to_string())],

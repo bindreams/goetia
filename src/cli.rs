@@ -22,6 +22,7 @@ pub mod diff;
 pub mod disable;
 mod elevation;
 pub mod enable;
+mod exit;
 pub mod install;
 pub mod kill;
 pub mod list;
@@ -40,6 +41,7 @@ use std::io::Write;
 use clap::{Parser, Subcommand};
 
 pub use elevation::is_elevated;
+pub use exit::ExitCode;
 
 use crate::error::Result;
 use crate::manager::ServiceManager;
@@ -118,7 +120,8 @@ pub enum DaemonCommand {
 
 /// Dispatch a parsed [`Cli`] to its subcommand, returning the process exit
 /// code. This doc comment is the one place the whole exit-code vocabulary
-/// is written down; nothing else in the crate should re-derive it.
+/// is written down; nothing else in the crate should re-derive it. Each name
+/// below is an [`ExitCode`] variant.
 ///
 /// - `0` success. `uninstall` alone also counts an already-absent artifact
 ///   as success — `Error::NotInstalled` says nothing about the *process*,
@@ -141,55 +144,21 @@ pub enum DaemonCommand {
 /// - `3` drift: a determinate "installed state differs from the manifest"
 ///   answer — `diff` returns it when the daemon would change
 ///   (`cli::diff::run`, the only place this code is returned).
-/// - `4` indeterminate: a question Goetia could not answer about an id.
-///   Two classes, by what was established:
-///   an id Goetia owns whose *state* it could not determine, or
-///   — [`Error::Undetermined`](crate::error::Error::Undetermined) — an id
-///   where the read that would have said whether anything is installed at
-///   all failed, leaving even ownership unestablished.
-///   A wait that ran out of budget
-///   ([`Error::WaitTimeout`](crate::error::Error::WaitTimeout)) is an
-///   instance of the first and deliberately **not** of the second: what is
-///   installed at the id was settled before the wait began, and Goetia
-///   stopped waiting rather than cancelling anything, so a request it issued
-///   stands and the daemon may still arrive. `restart` also reports a start
-///   leg its budget ran out before this way, having issued no start, and its
-///   message says so.
-///   [`Error::Unestablished`](crate::error::Error::Unestablished) joins it
-///   there, for `restart` under a budget that does not wait — an unconfirmed
-///   stop followed by a refused start — and so does
-///   [`Error::RequestInDoubt`](crate::error::Error::RequestInDoubt), for a
-///   request goetia lost track of, which may or may not have reached the
-///   manager, or reached it with its outcome unconfirmed. Reporting the first as `1` would
-///   claim the operation determinately failed, which it did not establish;
-///   reporting the second as `1` would make the refusal the whole answer,
-///   when the unconfirmed stop before it leaves where the daemon ended up
-///   open — even when the refusal itself was determinate.
-///   `list`/`status` compute theirs via [`report::exit_code`]
-///   (see the design spec's §4), in *both* output modes: out of
-///   `status(&id)` the second producer reaches them as
-///   `report::Kind::Undetermined`, and out of `list()` through the
-///   document's third key, `undetermined`, rather than as an
-///   `errors[].kind` — both codes come from `report::Kind::code`, the one
-///   kind-to-code map. `diff` returns it for `Outcome::RefuseUnusable`
-///   and for `Error::Undetermined` (`cli::diff::run`); `install` returns it
-///   for `Error::Undetermined` from `mgr.install`/`enable`/`start`, and for
-///   `Error::WaitTimeout`, `Error::RequestInDoubt`, `Error::LoadedJobInDoubt`,
-///   `Error::LoadedStateInDoubt` and `Error::StaleJobBootedOut` from its steps, so the two verbs
-///   agree about `Undetermined` and disagree only about
-///   `Outcome::RefuseUnusable`, which `install` reports as `1` because it
-///   genuinely failed to install. All seven id verbs return it through
-///   `support::run_id_verb`, for four conditions: `Undetermined`, where
-///   goetia could not determine what is at the id, and — from the verbs that
-///   act — `WaitTimeout`, `Unestablished` and `RequestInDoubt`, where it
-///   acted, or may have, and could not determine the outcome.
-///   `show` returns it too (`cli::show::run`), in both its per-id and
-///   no-ids forms — for an "installed but unusable" id, for an id
-///   `list()` reported as undetermined, and for *any* id it cannot find
-///   while an aggregate undetermined entry is present, since a null-named
-///   entry makes "not installed" unsound for every id at once. Anchored to
-///   the LSB init-script convention's "service status unknown", the one
-///   other exit-code vocabulary this one deliberately agrees with.
+/// - `4` indeterminate: a question Goetia could not answer, or an operation
+///   whose outcome it could not establish. For the id verbs, `install` and
+///   `diff`, a failed operation is this exactly when
+///   [`Error::is_indeterminate`](crate::error::Error::is_indeterminate).
+///   `status <id>` instead maps its errors through `report::status_error`, where
+///   anything it cannot attribute is `unusable` (`4`). The rest come
+///   from the answer itself: `list`/`status` report an id they own but cannot
+///   report on, and an entry `list()` could not classify, as `4`; `diff` and
+///   `show` do the same for an "installed but unusable" id, and `show` also for
+///   *any* id it cannot find while an aggregate undetermined entry is present,
+///   since a null-named entry makes "not installed" unsound for every id at
+///   once. `install` reports `Outcome::RefuseUnusable` as `1` because it
+///   genuinely failed to install. Anchored to the LSB init-script convention's
+///   "service status unknown", the one other exit-code vocabulary this one
+///   deliberately agrees with.
 /// - `5` conflict: an installed artifact was modified outside Goetia and
 ///   `--force` was not given. Returned by `cli::install::run` and by
 ///   `cli::diff::run` for the identical `Outcome::Conflict` — the two places
@@ -200,17 +169,12 @@ pub enum DaemonCommand {
 ///   consistent while giving up all three to preserve one number nothing
 ///   outside Goetia agrees on.
 ///
-/// `list` and `status` compute their code as the precedence-max over every
-/// error kind their `Report` collected, and over its `undetermined`
-/// entries: `1 > 4 > 5 > 3 > 0`. `show`, `install` and every id verb
-/// (`support::run_id_verb`) apply the same rule over the classes each
-/// id or step contributes, through the same [`report::precedence`]
-/// function — no verb re-derives the ordering, not even for the two codes
-/// `show` can produce. `diff` answers about one daemon and has nothing to
-/// combine.
-/// That is a rule about which outcome wins when more than one applies at
-/// once, not an ordering of the integers — `5` outranks `3` despite being
-/// the larger number. `2` never enters that ladder: both refusals that
+/// When more than one outcome applies at once (several ids, or the steps of
+/// one `install`), the verb returns the greatest [`ExitCode`], which is
+/// declared in precedence order: `1 > 4 > 5 > 3 > 0`. That is a rule about
+/// which outcome wins, not an ordering of the integers — `5` outranks `3`
+/// despite being the larger number. `diff` answers about one daemon and has
+/// nothing to combine. `2` never enters that ladder: both refusals that
 /// produce it there (`--json` on a subcommand that does not implement it,
 /// and a wait flag on an `install` with no `--start`) always happen alone,
 /// before any other kind could exist in the same report.
@@ -235,6 +199,16 @@ pub fn dispatch(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
+    run(cli, get_manager, is_elevated, out, err).code()
+}
+
+fn run(
+    cli: &Cli,
+    get_manager: &dyn Fn() -> Result<Box<dyn ServiceManager>>,
+    is_elevated: &dyn Fn() -> bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
     let Command::Daemon(cmd) = &cli.command;
 
     // Checked before the match, so a refused `--json` runs nothing at all —
@@ -258,7 +232,7 @@ pub fn dispatch(
             "error: `--timeout`/`--no-timeout` need `--start`: `daemon install` on its own starts \
              nothing, so there is nothing to wait for"
         );
-        return 2;
+        return ExitCode::Usage;
     }
 
     match cmd {

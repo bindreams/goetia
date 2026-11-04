@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 
+use super::ExitCode;
 use crate::error::{Error, Result};
 use crate::manager::{Installed, ServiceManager, State};
 use crate::spec::{DaemonSpec, Id, Warning};
@@ -176,13 +177,13 @@ pub(crate) fn state_str(state: State) -> &'static str {
     }
 }
 
-/// The message every mutating subcommand prints and the exit code (`1`) it
-/// returns when `is_elevated` reports `false`.
+/// The message every mutating subcommand prints and the exit code
+/// ([`ExitCode::Error`]) it returns when `is_elevated` reports `false`.
 pub(crate) fn require_elevation(
     subcommand: &str,
     is_elevated: &dyn Fn() -> bool,
     err: &mut dyn Write,
-) -> std::result::Result<(), i32> {
+) -> std::result::Result<(), ExitCode> {
     if is_elevated() {
         return Ok(());
     }
@@ -193,7 +194,7 @@ pub(crate) fn require_elevation(
             subcommand: subcommand.to_string()
         }
     );
-    Err(1)
+    Err(ExitCode::Error)
 }
 
 /// Bundles [`run_id_verb`]'s parameters — it has more of them than clippy's
@@ -243,8 +244,8 @@ pub(crate) struct IdVerbCall<'a> {
 /// Shared shape for the id-list mutating verbs (`uninstall`, `start`,
 /// `stop`, `kill`, `enable`, `disable`, `restart`): check elevation once, obtain
 /// the manager once, then call `verb` per id, printing one result line per
-/// id and combining what each id contributed by [`super::report::precedence`] —
-/// the same rule `install` and `show` use — except that when
+/// id and returning the greatest [`ExitCode`] any id contributed — the same
+/// rule `install` and `show` use — except that when
 /// `call.absent_is_success` and `verb` returns `Error::NotInstalled`, the
 /// id counts as succeeded rather than failed; see
 /// [`IdVerbCall::absent_is_success`].
@@ -254,13 +255,13 @@ pub(crate) struct IdVerbCall<'a> {
 /// after ids `1..N-1` have already been mutated (e.g. uninstalled): a
 /// partially executed, irreversible operation the caller never asked for and
 /// the nonzero exit code alone does not disclose.
-pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     let ids: std::result::Result<Vec<Id>, Error> = call.ids.iter().map(|s| parse_id(s)).collect();
     let ids = match ids {
         Ok(ids) => ids,
         Err(e) => {
             let _ = writeln!(err, "error: {e}");
-            return 1;
+            return ExitCode::Error;
         }
     };
 
@@ -271,16 +272,16 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
         Ok(mgr) => mgr,
         Err(e) => {
             let _ = writeln!(err, "error: {e}");
-            return 1;
+            return ExitCode::Error;
         }
     };
 
-    let mut codes: Vec<i32> = Vec::new();
+    let mut codes: Vec<ExitCode> = Vec::new();
     for id in &ids {
         match (call.verb)(mgr.as_ref(), id) {
             Ok(()) => {
                 let _ = writeln!(out, "{id}: {}", call.verb_past_tense);
-                codes.push(0);
+                codes.push(ExitCode::Success);
             }
             // Absence already satisfies this verb's goal (`uninstall`
             // alone — see `absent_is_success`'s doc comment). Stdout only,
@@ -289,58 +290,15 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
             // another. Does not affect the aggregated exit code.
             Err(Error::NotInstalled { .. }) if call.absent_is_success => {
                 let _ = writeln!(out, "{id}: not installed (nothing to do)");
-                codes.push(0);
-            }
-            // What is at the id was not established, which is one condition
-            // with one remedy for every verb here — including `uninstall`,
-            // whose exemption is about absence, not about the question going
-            // unanswered. Not "nothing was done": `restart` keeps an
-            // `Undetermined` start leg as it is after a stop it did issue
-            // (`restart::after_start_failed`), and its reason says so.
-            Err(e @ Error::Undetermined { .. }) => {
-                let _ = writeln!(err, "error: {id}: {e}");
-                codes.push(4);
-            }
-            // A wait that ran out of budget. The same class as the arm
-            // above, for the same reason — the code is about whether the
-            // question was answered — but a different condition: this one
-            // answered what is at the id and left the *outcome* open. The
-            // catch-all below would report `1`, which says the verb
-            // determinately failed, and nothing goetia issued was cancelled,
-            // so that is exactly what was not established. `restart`'s start
-            // leg is the one expiry with no request behind it — its budget ran
-            // out before it — and it is still a timeout, not a failure (see
-            // `restart::spent_before_start`).
-            Err(e @ Error::WaitTimeout { .. }) => {
-                let _ = writeln!(err, "error: {id}: {e}");
-                codes.push(4);
-            }
-            // Steps that were issued and whose outcome nobody established —
-            // `restart` with no budget, whose start leg was refused. The same
-            // class again, and again a different condition: here both steps
-            // were issued and neither settled where the daemon ended up, even
-            // when the start's refusal was itself determinate.
-            Err(e @ Error::Unestablished { .. }) => {
-                let _ = writeln!(err, "error: {id}: {e}");
-                codes.push(4);
-            }
-            // A request goetia lost track of: it may or may not have reached the manager, or did
-            // and its outcome is unconfirmed. The same class once more: `1` says the verb was
-            // attempted and failed, or was refused, and neither is what was established.
-            Err(e @ Error::RequestInDoubt { .. }) => {
-                let _ = writeln!(err, "error: {id}: {e}");
-                codes.push(4);
+                codes.push(ExitCode::Success);
             }
             Err(e) => {
                 let _ = writeln!(err, "error: {id}: {e}");
-                codes.push(1);
+                codes.push(ExitCode::of(&e));
             }
         }
     }
-    codes
-        .into_iter()
-        .max_by_key(|code| super::report::precedence(*code))
-        .unwrap_or(0)
+    codes.into_iter().max().unwrap_or(ExitCode::Success)
 }
 
 #[cfg(test)]
