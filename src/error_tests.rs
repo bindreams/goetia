@@ -139,12 +139,12 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
 }
 
 #[cfg(unix)]
-fn exit_status(code: i32) -> std::process::ExitStatus {
+pub(crate) fn exit_status(code: i32) -> std::process::ExitStatus {
     std::os::unix::process::ExitStatusExt::from_raw(code << 8)
 }
 
 #[cfg(windows)]
-fn exit_status(code: i32) -> std::process::ExitStatus {
+pub(crate) fn exit_status(code: i32) -> std::process::ExitStatus {
     std::os::windows::process::ExitStatusExt::from_raw(code as u32)
 }
 
@@ -266,6 +266,36 @@ fn a_step_over_an_indeterminate_error_is_indeterminate() {
 
 fn id() -> String {
     "x".to_string()
+}
+
+#[skuld::test]
+fn report_of_a_failed_command_ends_in_its_stderr_only_when_it_wrote_some() {
+    let status = exit_status(1);
+    let e = |stderr: &str| Error::Command {
+        command: "systemctl start x".to_string(),
+        status,
+        stderr: stderr.to_string(),
+    };
+    assert_eq!(
+        e("").report().to_string(),
+        format!("`systemctl start x` failed ({status})")
+    );
+    assert_eq!(
+        e("Access denied").report().to_string(),
+        format!("`systemctl start x` failed ({status}): Access denied")
+    );
+}
+
+#[skuld::test]
+fn report_of_a_command_that_could_not_run_prints_its_cause_once() {
+    let e = Error::Spawn {
+        command: "systemctl start x".to_string(),
+        source: std::io::Error::other("no such file").into(),
+    };
+    assert_eq!(
+        e.report().to_string(),
+        "failed to run `systemctl start x`: no such file"
+    );
 }
 
 #[skuld::test]

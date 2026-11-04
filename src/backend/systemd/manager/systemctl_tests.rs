@@ -324,6 +324,7 @@ fn a_request_nothing_could_watch_is_never_sent() {
         .expect_err(what);
 
         assert!(matches!(e, Error::Spawn { .. }), "{what}: {e:?}");
+        assert!(!e.is_indeterminate(), "{what}: {e:?}");
         assert!(e.report().to_string().contains(what), "{}", e.report());
         assert_eq!(bounded::test_hook::spawns(), spawns, "{what}: systemctl was spawned");
         assert!(!request.exists(), "{what}: the request was sent");
@@ -358,6 +359,7 @@ fn a_watched_request_that_may_have_run_is_in_doubt() {
     bounded::test_hook::spawn_fails(|| std::io::Error::from_raw_os_error(libc::EAGAIN).into());
     let e = spawn().expect_err("injected");
     assert!(matches!(e, Error::Spawn { .. }), "{e:?}");
+    assert!(!e.is_indeterminate(), "{e:?}");
 
     // Past the spawn `systemctl` runs, so a wait that fails leaves its request in doubt too.
     bounded::test_hook::wait_fails(|| std::io::Error::other("the wait failed").into());
@@ -398,6 +400,7 @@ fn a_request_run_to_completion_is_in_doubt_only_once_it_ran() {
     )
     .expect_err("no such program");
     assert!(matches!(e, Error::Spawn { .. }), "{e:?}");
+    assert!(!e.is_indeterminate(), "{e:?}");
 
     let dir = tempfile::tempdir().unwrap();
     let ran = dir.path().join("ran");
@@ -434,6 +437,7 @@ fn a_reload_in_doubt_after_the_write_stays_in_doubt() {
     let _stand_in = stand_in::set(Some(&gate_passes_then("echo 'Access denied' >&2; exit 1")), booted());
     let e = daemon_reload_or_report("x").expect_err("refused");
     assert!(matches!(e, Error::Step { .. }), "{e:?}");
+    assert!(!e.is_indeterminate(), "{e:?}");
     let msg = e.report().to_string();
     assert!(msg.contains("wrote the unit for `x`"), "{msg}");
     assert!(msg.contains("Access denied"), "{msg}");

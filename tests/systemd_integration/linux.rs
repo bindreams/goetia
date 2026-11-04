@@ -1183,7 +1183,7 @@ fn goetia_with_tasks(tasks: u32, args: &[&str]) -> std::process::Output {
 /// limit until it succeeds; the cutoff is goetia's business and is not asserted.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
-    // "Generously provisioned", not a retry cap.
+    // Generously provisioned; the sweep ends at the first success, not at this value.
     const ENOUGH: u32 = 64;
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1198,8 +1198,8 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
             assert!(!stderr.contains("panicked"), "{args:?} TasksMax={tasks}: {stderr}");
             match output.status.code() {
                 Some(0) => {
-                    // goetia alone is one task, so a single one must fail: that failure is what
-                    // proves the sweep exercised a starved verb at all.
+                    // One task is below goetia's own need, so a success here means the sweep never
+                    // starved the verb.
                     assert!(
                         tasks > 1,
                         "{args:?} succeeded with a single task, so the sweep tested nothing"
@@ -1237,10 +1237,8 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
         "the provisioned restart restarted nothing"
     );
 
-    // A restart that does not wait is one `systemctl restart --no-block`, so a failure sends
-    // nothing, as for the waited one. Its success is checked as
-    // `a_start_with_no_budget_reaches_systemd` checks one: once systemd has the restart, the unit is
-    // never at rest where a restart that did nothing would leave it, however far the job has got.
+    // A no-wait restart is one `systemctl restart --no-block`: a failure sends nothing. Success is
+    // checked as in `a_start_with_no_budget_reaches_systemd`.
     let before = main_pid(guard.id());
     sweep(&["daemon", "restart", guard.id(), "--timeout", "0"], &|tasks| {
         assert_eq!(

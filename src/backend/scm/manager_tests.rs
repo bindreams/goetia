@@ -553,10 +553,11 @@ fn install_and_preview_install_refuse_restart_always() {
 // uninstall's failures ================================================================================================
 
 fn uninstall_failure(state: &UninstallFailure) -> String {
-    Error::Step {
-        what: uninstall_failed_message(&Id::try_from("frpc").unwrap(), state),
-        source: Box::new(Error::os("stop `frpc`", std::io::Error::other("does not accept STOP"))),
-    }
+    uninstall_failed(
+        &Id::try_from("frpc").unwrap(),
+        state,
+        Error::os("stop `frpc`", std::io::Error::other("does not accept STOP")),
+    )
     .report()
     .to_string()
 }

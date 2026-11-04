@@ -380,8 +380,7 @@ pub(super) fn fragmentless<S>(id: &str) -> ReadResult<ReadOutcome<S>> {
 /// reads as `Conflict`; the stale-version branch (no text comparison) uses `external` instead.
 ///
 /// A drop-in that could not be read is an [`Error::Step`] over an [`Error::Os`], never [`Error::Undetermined`]: the fragment
-/// is open and its marker decoded, so installation and ownership are both established, and what the
-/// failed read costs is the ability to report on the id.
+/// is open and its marker decoded, so installation and ownership are both established.
 pub(super) fn installed(id: &str, text: &str) -> Result<InstalledDefinition<String>> {
     let dirs = dropin_dirs(id).map_err(|failure| Error::Step {
         what: "a drop-in directory could not be read, so what systemd applies to it cannot be compared".to_string(),

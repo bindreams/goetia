@@ -1148,10 +1148,12 @@ fn a_launchctl_request_that_may_have_run_is_in_doubt() {
         });
         let e = launchctl(&args, deadline, Role::Query).err().expect("injected");
         assert!(matches!(e, Error::Spawn { .. }), "{e:?}");
+        assert!(!e.is_indeterminate(), "{e:?}");
     }
     bounded::test_hook::spawn_fails(|| io::Error::from_raw_os_error(libc::EAGAIN).into());
     let e = launchctl(&args, deadline, request()).err().expect("injected");
     assert!(matches!(e, Error::Spawn { .. }), "{e:?}");
+    assert!(!e.is_indeterminate(), "{e:?}");
 }
 
 /// A `launchctl` that cannot be run says nothing about the job: `status` fails, and `list` (via

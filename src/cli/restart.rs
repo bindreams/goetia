@@ -272,8 +272,7 @@ fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
         // service still coming down). systemd never gets here: its restart is
         // one request. Either way nothing confirmed the stop,
         // which may be in flight, done, or have had nothing to do, so where
-        // the daemon ended up is what nobody established — not a plain failure,
-        // exit `1`, whose answer a refusal alone would be.
+        // the daemon ended up is what nobody established.
         e if !budget.waits() => Error::Unestablished {
             id: id.as_str().to_string(),
             detail: format!(

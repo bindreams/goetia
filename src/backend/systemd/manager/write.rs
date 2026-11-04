@@ -102,8 +102,7 @@ pub(super) fn replace_unit_verified(id: &str, text: &str, expected_text: &str) -
 
 /// Restore the quarantined original before reporting `primary` — unless the restore *itself* fails,
 /// in which case both failures are reported as one [`Error::Both`] rather than letting the restore's
-/// own error silently replace `primary` (a real, reachable double failure: an out-of-space device
-/// can fail both the original write and the subsequent `link`-based restore in the same call).
+/// own error silently replace `primary`.
 fn restore_or_chain(id: &str, backup_path: &Path, final_path: &Path, primary: Error) -> Error {
     match restore_quarantine(id, backup_path, final_path) {
         Ok(()) => primary,

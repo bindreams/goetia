@@ -116,6 +116,15 @@ fn restore_failure() -> Error {
     )
 }
 
+/// The failed `launchctl print` the recheck reads, as `launchctl` returns it.
+fn failed_print() -> Error {
+    Error::command(
+        "launchctl print system/frpc",
+        crate::error::error_tests::exit_status(5),
+        b"Could not print: 5: Input/output error\n",
+    )
+}
+
 /// The job was not loaded at the first check and is loaded now: goetia cannot tell which definition
 /// it read, so the install is in doubt (exit `4`), not a success and not a refusal. The plist is
 /// back as it was, so the remedy is the one for a refusal: stop, install again, start.
@@ -151,10 +160,7 @@ fn a_job_in_doubt_whose_plist_could_not_be_restored_carries_the_failure() {
 /// same exit `4` and the same remedy, and the message carries the read's own failure.
 #[skuld::test]
 fn an_unreadable_recheck_is_in_doubt_and_names_the_remedy_and_the_failure() {
-    let read = Error::os(
-        "print system/frpc",
-        std::io::Error::other("Could not print: 5: Input/output error"),
-    );
+    let read = failed_print();
     let e = state_unknown_after_write(&Id::try_from("frpc").unwrap(), &read, Ok(()));
     assert!(matches!(e, Error::LoadedStateInDoubt { .. }), "{e:?}");
     let message = e.to_string();
@@ -168,10 +174,7 @@ fn an_unreadable_recheck_is_in_doubt_and_names_the_remedy_and_the_failure() {
 
 #[skuld::test]
 fn an_unreadable_recheck_whose_plist_could_not_be_restored_carries_both_failures() {
-    let read = Error::os(
-        "print system/frpc",
-        std::io::Error::other("Could not print: 5: Input/output error"),
-    );
+    let read = failed_print();
     let e = state_unknown_after_write(&Id::try_from("frpc").unwrap(), &read, Err(restore_failure()));
     assert!(matches!(e, Error::LoadedStateInDoubt { .. }), "{e:?}");
     let message = e.report().to_string();

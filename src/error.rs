@@ -29,8 +29,7 @@ pub enum Error {
         stderr: String,
     },
 
-    /// A tool goetia runs could not be run, or its run was lost. `source` is the spawn or wait
-    /// error.
+    /// A tool goetia runs could not be run, or its run was lost.
     #[error("failed to run `{command}`")]
     Spawn {
         command: String,
@@ -46,8 +45,7 @@ pub enum Error {
         source: Box<Error>,
     },
 
-    /// A step failed, and so did the one after it. `report()` prints both, `first` then `then`;
-    /// `source()` is `first`.
+    /// A step failed, and so did the one after it. `report()` prints both, `first` then `then`.
     #[error("a step failed, and so did the one after it")]
     Both {
         #[source]
@@ -532,7 +530,7 @@ impl Error {
     }
 }
 
-/// [`Error::report`]'s value.
+/// What [`Error::report`] returns: the chain, formatted on `Display`.
 struct Report<'a>(&'a Error);
 
 impl fmt::Display for Report<'_> {
@@ -585,7 +583,7 @@ fn keep_alive_note(keep_alive: bool) -> &'static str {
     }
 }
 
-/// What a version source reported, kept as the source gave it.
+/// What a version source reported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VersionReading {
     /// The major version it reported.
@@ -621,13 +619,16 @@ fn unsupported_manager(client: &VersionReading, manager: &VersionReading) -> Str
         )),
     };
     let sentences: Vec<String> = [manager, client].into_iter().flatten().collect();
+    debug_assert!(
+        !sentences.is_empty(),
+        "UnsupportedManager is raised only for a reading below the floor"
+    );
     format!(
         "goetia requires systemd {SYSTEMD_FLOOR} or newer. {}",
         sentences.join(" ")
     )
 }
 
-/// ` /path`, or nothing.
 fn path_suffix(path: &Option<PathBuf>) -> String {
     path.as_deref()
         .map(Path::display)
@@ -635,7 +636,6 @@ fn path_suffix(path: &Option<PathBuf>) -> String {
         .unwrap_or_default()
 }
 
-/// ` at /path`, or nothing.
 fn read_at(path: &Option<PathBuf>) -> String {
     path.as_deref()
         .map(Path::display)
@@ -643,7 +643,6 @@ fn read_at(path: &Option<PathBuf>) -> String {
         .unwrap_or_default()
 }
 
-/// `: stderr`, or nothing when the tool said nothing.
 fn stderr_suffix(stderr: &str) -> String {
     if stderr.is_empty() {
         String::new()
@@ -660,7 +659,6 @@ fn why(diagnostic: &Option<String>) -> String {
     }
 }
 
-/// `` `id`: ``, or nothing.
 fn id_prefix(id: &Option<String>) -> String {
     id.as_deref().map(|id| format!("`{id}`: ")).unwrap_or_default()
 }
@@ -708,4 +706,4 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
 #[path = "error_tests.rs"]
-mod error_tests;
+pub(crate) mod error_tests;

@@ -176,7 +176,10 @@ fn blob_failure(e: &Error) -> Error {
             daemon: daemon.clone(),
             message: message.clone(),
         },
-        other => Error::Blob(other.report().to_string()),
+        other => {
+            debug_assert!(false, "a snapshot keeps only Blob and Invalid, got {other:?}");
+            Error::Blob(other.report().to_string())
+        }
     }
 }
 
@@ -227,13 +230,15 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
                 pid: status.pid,
                 enabled: status.enabled,
             }),
-            Err(e @ Error::NoManager { .. }) => return Err(e),
-            // The query completed and found the service gone: absence is established.
-            Err(Error::NotInstalled { .. }) => {}
-            Err(e) => out.push(unusable(format!(
-                "marked ours, but its live state could not be queried: {}",
-                e.report()
-            ))),
+            Err(e) => match e.cause() {
+                Error::NoManager { .. } => return Err(e),
+                // The query completed and found the service gone: absence is established.
+                Error::NotInstalled { .. } => {}
+                _ => out.push(unusable(format!(
+                    "marked ours, but its live state could not be queried: {}",
+                    e.report()
+                ))),
+            },
         }
     }
     out.extend(scan.reported);

@@ -204,11 +204,9 @@ fn locate(id: &str) -> Result<Option<Location>> {
 /// twin of `backend::systemd::manager::discover::undetermined`, and worded
 /// identically, since the two describe one condition on two platforms.
 ///
-/// [`Error::Undetermined`], never [`Error::Os`]: `Os` reaches
-/// `cli::report::status_error`'s catch-all as `Kind::Unusable`, which
-/// *asserts* that goetia owns the id — the one thing a read that never
-/// completed cannot establish. `/Library/LaunchDaemons` holds every vendor's
-/// daemons, so that claim is routinely about a stranger's service.
+/// [`Error::Undetermined`], never [`Error::Os`], for the reason given on [`Error::Undetermined`].
+/// `/Library/LaunchDaemons` holds every vendor's daemons, so that claim is routinely about a
+/// stranger's service.
 ///
 /// Every failure but `NotFound` lands here, not `PermissionDenied` alone: an
 /// `EIO` leaves goetia exactly as ignorant of the id as an `EACCES` does.
@@ -1574,20 +1572,22 @@ fn scan_in(dirs: [(&str, bool); 2]) -> Scan<Plist> {
         for location in locations {
             match read_at(&id, location) {
                 Ok(found_here) => found.push(found_here),
-                // Gone between the scan above and this read: an uninstall that completed, observed
-                // one syscall later. Absence is established, so this is a skip rather than a blind
-                // spot: reporting it would let a benign concurrent uninstall raise `list`'s
-                // host-wide exit code.
-                Err(Error::NotInstalled { .. }) => {}
-                // A failed read leaves zero evidence of whether this plist ever carried a Goetia
-                // marker at all. `Installed::Undetermined` claims neither ownership nor absence,
-                // which is exactly what was established.
-                Err(Error::Undetermined { reason, .. }) => {
-                    unestablished.get_or_insert(reason);
-                }
-                Err(e) => {
-                    unestablished.get_or_insert(e.report().to_string());
-                }
+                Err(e) => match e.cause() {
+                    // Gone between the scan above and this read: an uninstall that completed,
+                    // observed one syscall later. Absence is established, so this is a skip rather
+                    // than a blind spot: reporting it would let a benign concurrent uninstall raise
+                    // `list`'s host-wide exit code.
+                    Error::NotInstalled { .. } => {}
+                    // A failed read leaves zero evidence of whether this plist ever carried a
+                    // Goetia marker at all. `Installed::Undetermined` claims neither ownership nor
+                    // absence, which is exactly what was established.
+                    Error::Undetermined { reason, .. } => {
+                        unestablished.get_or_insert(reason.clone());
+                    }
+                    _ => {
+                        unestablished.get_or_insert(e.report().to_string());
+                    }
+                },
             }
         }
         if let Some(reason) = unestablished {

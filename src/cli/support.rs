@@ -288,7 +288,7 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
             // never the past-tense line: claiming e.g. "uninstalled" for a
             // daemon that was never there trades one wrong report for
             // another. Does not affect the aggregated exit code.
-            Err(Error::NotInstalled { .. }) if call.absent_is_success => {
+            Err(e) if call.absent_is_success && matches!(e.cause(), Error::NotInstalled { .. }) => {
                 let _ = writeln!(out, "{id}: not installed (nothing to do)");
                 codes.push(ExitCode::Success);
             }

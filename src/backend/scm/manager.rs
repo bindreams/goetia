@@ -838,10 +838,7 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
             } else {
                 UninstallFailure::Stop { previous }
             };
-            return Err(Error::Step {
-                what: uninstall_failed_message(id, &state),
-                source: Box::new(Error::os(format!("stop `{id}`"), e)),
-            });
+            return Err(uninstall_failed(id, &state, Error::os(format!("stop `{id}`"), e)));
         }
     }
     // Closed before the delete: an open handle would keep the record after it.
@@ -850,9 +847,8 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
         return Ok(());
     }
 
-    let not_deleted = |context: String, e: windows_service::Error| Error::Step {
-        what: uninstall_failed_message(id, &UninstallFailure::Delete { previous }),
-        source: Box::new(to_error(&context, e)),
+    let not_deleted = |context: String, e: windows_service::Error| {
+        uninstall_failed(id, &UninstallFailure::Delete { previous }, to_error(&context, e))
     };
     let service = match scm.open_service(id.as_str(), ServiceAccess::DELETE) {
         Ok(service) => service,
@@ -904,7 +900,7 @@ fn disable_before_delete(scm: &WinServiceManager, id: &Id) -> Result<Disabled> {
     }
 }
 
-/// How a failed `uninstall` left the service, which decides what [`uninstall_failed_message`] may say.
+/// How a failed `uninstall` left the service, which decides what [`uninstall_failed`] may say.
 enum UninstallFailure {
     /// The stop failed. The service is running and disabled; `previous` is its start type before.
     Stop { previous: Option<ServiceStartType> },
@@ -915,11 +911,11 @@ enum UninstallFailure {
     AlreadyMarked,
 }
 
-/// The error text for an `uninstall` that failed, which leads into the cause. Every variant names
-/// the retry or the remedy that applies to its state, and none claims a state it is not in.
-fn uninstall_failed_message(id: &Id, state: &UninstallFailure) -> String {
+/// An `uninstall` that failed with `cause`, led by what it left behind. Every state names the retry
+/// or the remedy that applies to it, and none claims a state it is not in.
+fn uninstall_failed(id: &Id, state: &UninstallFailure, cause: Error) -> Error {
     let kill = format!("if the service does not accept STOP, run `goetia daemon kill {id}`");
-    match state {
+    let what = match state {
         UninstallFailure::Stop { previous } => format!(
             "`{id}` could not be stopped. It was NOT deleted and is now disabled, so \
              `goetia daemon start {id}` fails.{} Re-run `goetia daemon uninstall {id}` to retry; {kill} first",
@@ -935,6 +931,10 @@ fn uninstall_failed_message(id: &Id, state: &UninstallFailure) -> String {
              so `uninstall` did not delete it. It is removed once it stops and its last handle closes; \
              {kill}"
         ),
+    };
+    Error::Step {
+        what,
+        source: Box::new(cause),
     }
 }
 
@@ -967,9 +967,8 @@ fn open_scm(access: ServiceManagerAccess) -> Result<WinServiceManager> {
 /// [`open_scm`] for the two callers that are about to *classify* `id`
 /// ([`open_existing`], [`Backend::read`]). A manager that would not open leaves that
 /// id exactly as unclassified as a service object that would not open does, so
-/// it takes the same class — [`to_error`] here would reach
-/// `cli::report::status_error`'s catch-all as `Kind::Unusable` and claim
-/// goetia owns an id it never got as far as looking at. Every other caller
+/// it takes the same class: an `Os` error here would reach `status_error`'s catch-all as
+/// `Kind::Unusable`, which claims ownership. Every other caller
 /// reaches [`open_scm`] only after ownership is settled, where `Os` is the
 /// true statement.
 ///
@@ -1053,9 +1052,8 @@ fn to_error(context: &str, e: windows_service::Error) -> Error {
 ///
 /// [`Error::Undetermined`], never the `Error::Os` [`to_error`] and
 /// `registry`'s own `registry_error` produce: `Os` reaches
-/// `cli::report::status_error`'s catch-all as `Kind::Unusable`, which
-/// *asserts* that goetia owns the id — the one thing a read that never
-/// completed cannot establish. `HKLM\SYSTEM\CurrentControlSet\Services` holds
+/// `cli::report::status_error`'s catch-all as `Kind::Unusable` (see [`Error::Undetermined`]).
+/// `HKLM\SYSTEM\CurrentControlSet\Services` holds
 /// every vendor's service, so on this platform that claim is routinely about a
 /// stranger's, and it publishes `uninstall` as the remedy for one.
 ///
@@ -1247,15 +1245,15 @@ struct Unreadable {
 /// `registry_undetermined`, so the first arm is the whole story; the second exists because the
 /// `Result` type does not say so, and has no conditioned remedy to offer rather than a default one.
 fn unreadable_parts(name: String, e: Error) -> Unreadable {
-    match e {
+    match e.cause() {
         Error::Undetermined { reason, recovery, .. } => Unreadable {
             name,
-            detail: reason,
-            recovery: Some(recovery),
+            detail: reason.clone(),
+            recovery: Some(recovery.clone()),
         },
-        other => Unreadable {
+        _ => Unreadable {
             name,
-            detail: other.report().to_string(),
+            detail: e.report().to_string(),
             recovery: None,
         },
     }

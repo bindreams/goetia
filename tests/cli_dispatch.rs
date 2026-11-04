@@ -206,6 +206,9 @@ struct FlakyManager {
     /// `start` fails with an `Error::Step` over `Error::Undetermined`: an operation that failed
     /// because a step under it did, where the step's own answer is that the outcome is open.
     step_over_undetermined_start_for: Option<String>,
+    /// `uninstall` fails with an `Error::Step` over `Error::NotInstalled`: absence, found by a step
+    /// under the operation.
+    step_over_not_installed_uninstall_for: Option<String>,
     /// `enable` fails with `Error::Undetermined` — the `--enable` twin of
     /// `undetermined_start_for`, exercising `install`'s enable step.
     undetermined_enable_for: Option<String>,
@@ -332,6 +335,14 @@ impl ServiceManager for FlakyManager {
         self.inner.preview_install(spec)
     }
     fn uninstall(&self, id: &Id) -> goetia::Result<()> {
+        if self.step_over_not_installed_uninstall_for.as_deref() == Some(id.as_str()) {
+            return Err(goetia::Error::Step {
+                what: "uninstall".to_string(),
+                source: Box::new(goetia::Error::NotInstalled {
+                    id: id.as_str().to_string(),
+                }),
+            });
+        }
         self.inner.uninstall(id)
     }
     fn enable(&self, id: &Id) -> goetia::Result<()> {
@@ -1128,6 +1139,22 @@ fn an_absent_id_is_reported_on_stdout_not_stderr() {
     assert_eq!(err, "", "nothing goes to stderr for an absent id: {err}");
     assert!(!out.contains("uninstalled"), "{out}");
     assert!(!err.contains("uninstalled"), "{err}");
+}
+
+/// Absence is what the step failed on, not the step: `uninstall` treats a step over `NotInstalled`
+/// as it treats `NotInstalled`.
+#[skuld::test]
+fn uninstall_exits_zero_for_a_step_over_not_installed() {
+    let mgr = FlakyManager {
+        step_over_not_installed_uninstall_for: Some("frpc".to_string()),
+        ..Default::default()
+    };
+
+    let (code, out, err) = dispatch_with(&["goetia", "daemon", "uninstall", "frpc"], &mgr, &|| true);
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(out, "frpc: not installed (nothing to do)\n");
+    assert_eq!(err, "");
 }
 
 #[skuld::test]
@@ -3010,8 +3037,7 @@ fn restart_exits_four_for_an_undetermined_id() {
     );
 }
 
-/// An `Error::Step` is what its source is: over an unanswered question it is exit `4`, and its
-/// whole chain is printed.
+/// A step over an unanswered question is exit `4`, and its whole chain is printed.
 #[skuld::test]
 fn start_exits_four_for_a_step_over_an_undetermined_error() {
     let inner = Fake::new();
@@ -3046,6 +3072,25 @@ fn status_reports_a_step_over_not_installed_as_not_installed() {
 
     assert_eq!(error_kinds(&parse_json(&out)), ["not-installed"], "{out}");
     assert_eq!(code, 1, "{out}");
+}
+
+/// `list` reads a step over `NotInstalled` as `status` does: the daemon is absent, so it is
+/// skipped, not reported as `unusable` (which claims goetia owns it).
+#[skuld::test]
+fn list_skips_a_step_over_not_installed() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_live_status_fails("frpc", || goetia::Error::Step {
+        what: "query the live state".to_string(),
+        source: Box::new(goetia::Error::NotInstalled { id: "frpc".to_string() }),
+    });
+
+    let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
+
+    let doc = parse_json(&out);
+    assert!(daemons(&doc).is_empty(), "{out}");
+    assert!(errors(&doc).is_empty(), "{out}");
+    assert_eq!(code, 0, "{out}");
 }
 
 /// A wait that ran out is the same *class* as an unanswered question — the code is about whether
