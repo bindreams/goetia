@@ -469,7 +469,8 @@ impl Systemctl {
                 detail: format!("wrote the unit for `{id}`, so systemd may not have picked it up yet: {detail}"),
             },
             e => Error::Other(format!(
-                "wrote the unit for `{id}` but `systemctl daemon-reload` failed, so systemd may not have                  picked it up yet: {e}"
+                "wrote the unit for `{id}` but `systemctl daemon-reload` failed, so systemd may not have \
+                 picked it up yet: {e}"
             )),
         })
     }
@@ -573,7 +574,8 @@ impl Systemctl {
                 format!("failed ({status})")
             };
             return Err(Error::Other(format!(
-                "`systemctl show --property=Version` {how}, so goetia cannot tell whether the running systemd is                  {SYSTEMD_FLOOR}+: {}",
+                "`systemctl show --property=Version` {how}, so goetia cannot tell whether the running systemd is \
+                 {SYSTEMD_FLOOR}+: {}",
                 String::from_utf8_lossy(&capture.stderr)
             )));
         }
