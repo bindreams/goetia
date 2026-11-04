@@ -241,7 +241,8 @@ pub enum Error {
 
     /// A read that would have said whether anything is installed at `id`
     /// failed, so goetia does not know. `reason` is the failed read, which
-    /// the chain ends in; `recovery` says what would make that read succeed.
+    /// the chain ends in; `recovery` says what would make that read succeed,
+    /// and [`report`](Error::report) prints it last, as [`remedy`](Error::remedy).
     ///
     /// The distinguishing property is what this variant does **not** claim.
     /// [`NotInstalled`](Error::NotInstalled) is proof that nothing
@@ -257,7 +258,7 @@ pub enum Error {
     ///
     /// Exit `4` (indeterminate), like `Unusable`: the code is about
     /// whether the question was answered, and this one was not.
-    #[error("cannot determine whether daemon `{id}` is installed. {recovery}")]
+    #[error("cannot determine whether daemon `{id}` is installed")]
     Undetermined {
         id: String,
         #[source]
@@ -483,7 +484,7 @@ impl Error {
             | Error::LoadedStateInDoubt { .. }
             | Error::StaleJobBootedOut { .. }
             | Error::StartUnconfirmed { .. } => true,
-            Error::Step { source, .. } => source.is_indeterminate(),
+            Error::Step { source, .. } | Error::StartAsManaged { source, .. } => source.is_indeterminate(),
             Error::Both { first, then } => first.is_indeterminate() && then.is_indeterminate(),
             Error::Os { .. }
             | Error::Command { .. }
@@ -514,7 +515,6 @@ impl Error {
             | Error::ElevationRequired { .. }
             | Error::UnsupportedPlatform { .. }
             | Error::AccountLookup { .. }
-            | Error::StartAsManaged { .. }
             | Error::AlreadyExists { .. } => false,
         }
     }
@@ -529,8 +529,21 @@ impl Error {
         }
     }
 
-    /// The error and its causes, joined as `context: cause: cause`; a [`Both`](Error::Both) prints
-    /// as `first; then: then`. What the CLI prints and `--json` carries: [`Display`](fmt::Display)
+    /// What would clear this failure, when it is written to follow the failure's cause: a remedy
+    /// says "that read", so it cannot lead. [`report`](Error::report) prints it after the whole
+    /// chain, and this variant's [`Display`](fmt::Display) leaves it out.
+    ///
+    /// A variant with no source keeps its remedy in its `Display`, where nothing follows it.
+    pub fn remedy(&self) -> Option<&str> {
+        match self {
+            Error::Undetermined { recovery, .. } => Some(recovery),
+            _ => None,
+        }
+    }
+
+    /// The error and its causes, joined as `context: cause: cause`, then each [`remedy`](Error::remedy)
+    /// found along the chain, outermost first, as `. remedy`; a [`Both`](Error::Both) prints as
+    /// `first; then: then`. What the CLI prints and `--json` carries: [`Display`](fmt::Display)
     /// alone is the outermost context.
     pub fn report(&self) -> impl fmt::Display + '_ {
         Report(self)
@@ -600,24 +613,40 @@ struct Report<'a>(&'a Error);
 
 impl fmt::Display for Report<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_chain(self.0, f)
+        let mut remedies = Vec::new();
+        write_chain(self.0, f, &mut remedies)?;
+        for remedy in remedies {
+            write!(f, ". {remedy}")?;
+        }
+        Ok(())
     }
 }
 
-fn write_chain(e: &(dyn std::error::Error + 'static), f: &mut fmt::Formatter<'_>) -> fmt::Result {
+/// Writes `e` and its causes, collecting the remedies met on the way into `remedies`, outermost
+/// first and each once: a [`Both`](Error::Both)'s halves can carry the same one.
+fn write_chain<'a>(
+    e: &'a (dyn std::error::Error + 'static),
+    f: &mut fmt::Formatter<'_>,
+    remedies: &mut Vec<&'a str>,
+) -> fmt::Result {
     // A `#[source]` of type `Box<Error>` reaches here as the box.
     let ours = e
         .downcast_ref::<Error>()
         .or_else(|| e.downcast_ref::<Box<Error>>().map(|b| &**b));
     if let Some(Error::Both { first, then }) = ours {
-        write_chain(first.as_ref(), f)?;
+        write_chain(first.as_ref(), f, remedies)?;
         f.write_str("; then: ")?;
-        return write_chain(then.as_ref(), f);
+        return write_chain(then.as_ref(), f, remedies);
+    }
+    if let Some(remedy) = ours.and_then(Error::remedy) {
+        if !remedies.contains(&remedy) {
+            remedies.push(remedy);
+        }
     }
     write!(f, "{e}")?;
     if let Some(source) = e.source() {
         f.write_str(": ")?;
-        write_chain(source, f)?;
+        write_chain(source, f, remedies)?;
     }
     Ok(())
 }

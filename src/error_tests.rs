@@ -147,6 +147,16 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
     }
 }
 
+#[skuld::test]
+fn a_start_judged_as_managed_is_indeterminate_when_the_failed_start_is() {
+    let over = |source: Error| Error::StartAsManaged {
+        blob: Box::new(Error::Blob(String::new())),
+        source: Box::new(source),
+    };
+    assert!(over(in_doubt()).is_indeterminate());
+    assert!(!over(not_installed()).is_indeterminate());
+}
+
 #[cfg(unix)]
 pub(crate) fn exit_status(code: i32) -> std::process::ExitStatus {
     std::os::unix::process::ExitStatusExt::from_raw(code << 8)
@@ -534,7 +544,7 @@ fn report_of_a_loaded_state_in_doubt_prints_each_cause_once() {
 }
 
 #[skuld::test]
-fn report_of_an_undetermined_id_ends_in_the_failed_read() {
+fn report_of_an_undetermined_id_names_the_failed_read_and_then_the_remedy() {
     let e = Error::Undetermined {
         id: id(),
         reason: Box::new(os("read", "/p", "denied")),
@@ -542,7 +552,12 @@ fn report_of_an_undetermined_id_ends_in_the_failed_read() {
     };
     assert_eq!(
         e.report().to_string(),
-        "cannot determine whether daemon `x` is installed. re-run as root: failed to read /p: denied"
+        "cannot determine whether daemon `x` is installed: failed to read /p: denied. re-run as root"
+    );
+    assert_eq!(e.remedy(), Some("re-run as root"));
+    assert!(
+        !e.to_string().contains("re-run as root"),
+        "Display drops the remedy: {e}"
     );
     assert!(matches!(
         std::error::Error::source(&e)
@@ -550,6 +565,44 @@ fn report_of_an_undetermined_id_ends_in_the_failed_read() {
             .map(|b| &**b),
         Some(Error::Os { .. })
     ));
+}
+
+fn undetermined(recovery: &str) -> Error {
+    Error::Undetermined {
+        id: id(),
+        reason: Box::new(os("read", "/p", "denied")),
+        recovery: recovery.to_string(),
+    }
+}
+
+#[skuld::test]
+fn a_step_over_an_undetermined_id_prints_the_remedy_after_the_whole_chain() {
+    let e = Error::Step {
+        what: "check `x`".to_string(),
+        source: Box::new(undetermined("re-run as root")),
+    };
+    assert_eq!(
+        e.report().to_string(),
+        "check `x`: cannot determine whether daemon `x` is installed: failed to read /p: denied. re-run as root"
+    );
+    assert_eq!(e.remedy(), None, "a step has no remedy of its own");
+}
+
+#[skuld::test]
+fn a_remedy_is_printed_once_however_many_halves_carry_it() {
+    let e = Error::Both {
+        first: Box::new(undetermined("re-run as root")),
+        then: Box::new(undetermined("re-run as root")),
+    };
+    let text = e.report().to_string();
+    assert_eq!(text.matches("re-run as root").count(), 1, "{text}");
+    assert!(text.ends_with(". re-run as root"), "{text}");
+}
+
+#[skuld::test]
+fn report_of_a_failure_without_a_remedy_ends_in_its_cause() {
+    assert_eq!(os("read", "/p", "denied").remedy(), None);
+    assert_eq!(not_installed().remedy(), None);
 }
 
 #[skuld::test]

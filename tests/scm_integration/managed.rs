@@ -1272,8 +1272,8 @@ fn status_of_a_service_whose_parameters_deny_reading_is_undetermined() {
 /// The same boundary on the `list` side, and what the entry standing for it is allowed to say. One
 /// denied `Parameters` read is one entry that names its service — and carries the *rendered cause*
 /// `registry::read_parameters` built: the key, the operation and the Win32 message. `list` used to
-/// match `Err(_)` and hand the entry a static sentence instead, which `service_detail`'s own doc
-/// comment calls useless for diagnosing a real Win32 failure.
+/// match `Err(_)` and hand the entry a static sentence instead, which says nothing of a real Win32
+/// failure.
 ///
 /// `an_elevated_list_leaves_nothing_undetermined` is what makes the count exactly one here: this
 /// denial is the only unreadable `Parameters` on the host, so the aggregate takes its named form.

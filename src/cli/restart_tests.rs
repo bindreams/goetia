@@ -259,7 +259,7 @@ fn a_start_leg_in_doubt_says_what_the_stop_established_and_keeps_its_cause() {
 }
 
 /// A start leg whose read of the id failed after the stop is still `Undetermined`, with the stop's
-/// clause between the id and the failed read.
+/// clause ahead of the failed read, and the remedy last.
 #[skuld::test]
 fn an_undetermined_start_leg_keeps_its_read_under_the_stop_clause() {
     let id = Id::try_from("frpc").unwrap();
@@ -274,8 +274,28 @@ fn an_undetermined_start_leg_keeps_its_read_under_the_stop_clause() {
     assert!(matches!(e, Error::Undetermined { .. }), "{e:?}");
     assert_eq!(
         e.report().to_string(),
-        "cannot determine whether daemon `frpc` is installed. re-run as root: stopped but failed to restart: failed \
-         to read: denied"
+        "cannot determine whether daemon `frpc` is installed: stopped but failed to restart: failed to read: \
+         denied. re-run as root"
+    );
+}
+
+/// Under a budget that does not wait, the clause is the stop-leg fact the user most needs: it comes
+/// before the failed read, and the remedy after it.
+#[skuld::test]
+fn an_undetermined_start_leg_after_an_unwaited_stop_says_so_before_the_read_and_the_remedy_last() {
+    let id = Id::try_from("frpc").unwrap();
+    let undetermined = Error::Undetermined {
+        id: "frpc".to_string(),
+        reason: Box::new(Error::os("read", std::io::Error::other("denied"))),
+        recovery: "re-run as root".to_string(),
+    };
+
+    let e = after_start_failed(&id, Budget::Immediate, undetermined);
+
+    assert_eq!(
+        e.report().to_string(),
+        "cannot determine whether daemon `frpc` is installed: the stop was issued without waiting for it, and the \
+         start that followed was not determined: failed to read: denied. re-run as root"
     );
 }
 

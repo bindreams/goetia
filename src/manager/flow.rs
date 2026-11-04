@@ -177,7 +177,10 @@ pub(crate) fn owned_failure(e: &Error) -> Error {
             daemon: daemon.clone(),
             message: message.clone(),
         },
-        other => unreachable!("a snapshot and a scan keep only Blob and Invalid, got {other:?}"),
+        other => {
+            debug_assert!(false, "a snapshot and a scan keep only Blob and Invalid, got {other:?}");
+            Error::Blob(other.report().to_string())
+        }
     }
 }
 
