@@ -1237,12 +1237,18 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
         "the provisioned restart restarted nothing"
     );
 
-    // A restart that does not wait sends its stop before its start, so a failure may have touched
-    // the daemon. Its success is checked as `a_start_with_no_budget_reaches_systemd` checks one:
-    // once systemd has the restart, the unit is never at rest where a restart that did nothing
-    // would leave it, however far the job has got.
+    // A restart that does not wait is one `systemctl restart --no-block`, so a failure sends
+    // nothing, as for the waited one. Its success is checked as
+    // `a_start_with_no_budget_reaches_systemd` checks one: once systemd has the restart, the unit is
+    // never at rest where a restart that did nothing would leave it, however far the job has got.
     let before = main_pid(guard.id());
-    sweep(&["daemon", "restart", guard.id(), "--timeout", "0"], &|_| {});
+    sweep(&["daemon", "restart", guard.id(), "--timeout", "0"], &|tasks| {
+        assert_eq!(
+            (active_state_and_job(guard.id()), main_pid(guard.id())),
+            (("active".to_string(), String::new()), before.clone()),
+            "an unwatched restart short of tasks touched the daemon: TasksMax={tasks}"
+        );
+    });
     let (state, job) = active_state_and_job(guard.id());
     assert!(
         !job.is_empty() || !(state == "inactive" || (state == "active" && main_pid(guard.id()) == before)),
