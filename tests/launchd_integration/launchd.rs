@@ -10,7 +10,6 @@
 //! foreign plist, a hand-edited artifact); those use the narrower
 //! [`FileGuard`] instead, since `uninstall` would refuse to touch them.
 
-use std::collections::BTreeMap;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -43,18 +42,11 @@ const UNIT_DIR_EXCLUSIVE: skuld::Label;
 
 // Fixtures ============================================================================================================
 
+/// [`support::spec`] as a `simple` daemon: every spec this suite installs is one.
 fn base_spec(id: &str, command: Vec<String>) -> DaemonSpec {
     DaemonSpec {
-        id: Id::try_from(id).expect("valid id"),
-        name: id.to_string(),
-        command,
-        cwd: None,
-        env: BTreeMap::new(),
-        user: User::Root,
-        restart: Restart::Never,
-        restart_delay: None,
-        logs: None,
         kind: Kind::Simple,
+        ..support::spec(id, command)
     }
 }
 

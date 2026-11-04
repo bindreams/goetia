@@ -1,7 +1,8 @@
-//! Shared support for the marker-inertness probe.
+//! Shared support for the integration suites.
 //!
-//! Pulled in with `#[path = "support/mod.rs"] mod support;`. Nothing here
-//! depends on the `goetia` crate: the probe runs before any backend exists.
+//! Pulled in with `#[path = "support/mod.rs"] mod support;`. Only
+//! `daemon_spec` depends on the `goetia` crate; the marker-inertness probe uses
+//! the rest, which runs before any backend exists.
 
 #![allow(dead_code, unused_imports)]
 // Each probe module is `#[cfg]`-gated to one platform, so most of this is
@@ -9,6 +10,7 @@
 
 pub mod cmd;
 pub mod connect_back;
+pub mod daemon_spec;
 pub mod kill;
 pub mod sentinel;
 #[cfg(windows)]
@@ -24,6 +26,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use rand::RngExt as _;
 
 pub use connect_back::ConnectBack;
+pub use daemon_spec::spec;
 pub use service_guard::ServiceGuard;
 
 // Artifact locations --------------------------------------------------------------------------------------------------

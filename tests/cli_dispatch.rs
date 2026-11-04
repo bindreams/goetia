@@ -9,7 +9,6 @@
 //! that need no manager at all run the real compiled binary instead; see
 //! `tests/cli_binary.rs`.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -18,7 +17,10 @@ use clap::error::ErrorKind;
 use goetia::cli::{self, Cli, Command, DaemonCommand};
 use goetia::manager::fake::Fake;
 use goetia::manager::{Budget, Installed, ServiceManager, State, Status, Step};
-use goetia::spec::{DaemonSpec, Id, Kind, Restart, User};
+use goetia::spec::{DaemonSpec, Id, Kind, Restart};
+
+#[path = "support/mod.rs"]
+mod support;
 
 fn main() {
     skuld::run_all();
@@ -28,16 +30,9 @@ fn main() {
 
 fn mk(id: &str) -> DaemonSpec {
     DaemonSpec {
-        id: Id::try_from(id).unwrap(),
-        name: id.to_string(),
-        command: vec!["daemon".to_owned()],
-        cwd: None,
-        env: BTreeMap::new(),
-        user: User::Root,
         restart: Restart::OnFailure,
-        restart_delay: None,
-        logs: None,
         kind: Kind::Simple,
+        ..support::spec(id, vec!["daemon".to_owned()])
     }
 }
 

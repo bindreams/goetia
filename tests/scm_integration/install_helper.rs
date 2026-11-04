@@ -21,9 +21,9 @@
 
 use goetia::backend::scm::manager::Scm;
 use goetia::manager::ServiceManager as _;
-use goetia::spec::{AccountId, User};
+use goetia::spec::{AccountId, DaemonSpec, User};
 
-use crate::common;
+use crate::{common, support};
 
 pub const INSTALL_AS: &str = "--goetia-install-as";
 
@@ -38,12 +38,10 @@ pub fn run_if_requested() -> bool {
         Some(sid) => User::Id(AccountId::Sid(sid.clone())),
         None => User::Name(account),
     };
-    let spec = common::mk_spec_as(
-        &id,
-        common::fixture_command(&id, 1, 1, "plain"),
-        Default::default(),
+    let spec = DaemonSpec {
         user,
-    );
+        ..support::spec(&id, common::fixture_command(&id, 1, 1, "plain"))
+    };
 
     match Scm::new().install(&spec, false) {
         Ok(outcome) => {

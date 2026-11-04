@@ -5,7 +5,6 @@
 //! itself, to exist as a real directory entry, not just resolve lexically. A real file avoids the
 //! problem entirely, matching `tests/marker_inertness.rs`'s own structure.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
@@ -35,16 +34,9 @@ const UNIT_DIR_EXCLUSIVE: skuld::Label;
 /// A minimal, real, long-running daemon: `sleep infinity` exists on every coreutils Ubuntu ships.
 pub(crate) fn mk(id: &str) -> DaemonSpec {
     DaemonSpec {
-        id: Id::try_from(id.to_string()).expect("valid id"),
-        name: id.to_string(),
-        command: vec!["/bin/sleep".to_string(), "infinity".to_string()],
-        cwd: None,
-        env: BTreeMap::new(),
-        user: User::Root,
         restart: Restart::OnFailure,
-        restart_delay: None,
-        logs: None,
         kind: Kind::Simple,
+        ..support::spec(id, vec!["/bin/sleep".to_string(), "infinity".to_string()])
     }
 }
 
@@ -1183,16 +1175,12 @@ fn goetia_with_tasks(tasks: u32, args: &[&str]) -> std::process::Output {
 /// limit until it succeeds; the cutoff is goetia's business and is not asserted.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
-    // Generously provisioned; the sweep ends at the first success, not at this value.
-    const ENOUGH: u32 = 64;
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     Systemd::new().install(&mk(guard.id()), false).expect("install");
 
-    // `untouched` checks the daemon after each failure.
     let sweep = |args: &[&str], untouched: &dyn Fn(u32)| {
-        let mut last = String::new();
-        for tasks in 1..=ENOUGH {
+        for tasks in 1.. {
             let output = goetia_with_tasks(tasks, args);
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
             assert!(!stderr.contains("panicked"), "{args:?} TasksMax={tasks}: {stderr}");
@@ -1207,12 +1195,12 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
                     return;
                 }
                 // goetia's own refusal, not `systemd-run` failing to make the scope.
-                Some(1) if stderr.contains("error: ") => untouched(tasks),
+                Some(1) if stderr.contains("error: ") && !stderr.contains("Failed to start transient scope unit") => {
+                    untouched(tasks)
+                }
                 other => panic!("{args:?} TasksMax={tasks}: exit {other:?}: {stderr}"),
             }
-            last = stderr;
         }
-        panic!("{args:?} did not succeed even with TasksMax={ENOUGH}; last stderr: {last}");
     };
 
     sweep(&["daemon", "start", guard.id()], &|tasks| {
