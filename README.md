@@ -31,7 +31,8 @@ system's, seen in `/proc/1/root` — one other than PID 1's root: a chroot, or
 a container sharing the host's PID namespace — or, only where that cannot be
 read, in the mount tables: a `/` whose mount is none of PID 1's, or one with
 no mount at all, which only `chroot(2)` leaves and which goetia's own table
-shows without PID 1's; `/run/systemd/system` missing; or `systemctl`
+shows without PID 1's; no `/proc` mounted, where none of that can be read;
+`/run/systemd/system` missing; or `systemctl`
 reporting a chroot — a verb that would reach systemd exits `1` before it
 writes or sends anything, with one message naming the first of these it
 found. No switch under either prefix systemd gives this binary can turn that

@@ -744,6 +744,14 @@ fn evidence_known_without_asking_refuses_every_path_before_anything_runs() {
             "no mount is at `/` (`/proc/self/mountinfo`): `/` is a directory inside one, so goetia runs in a \
              chroot",
         ),
+        (
+            Host {
+                offline: None,
+                unbooted: false,
+                chroot: Some(Chroot::NoProc),
+            },
+            "`/proc/self` does not exist (no `/proc` is mounted), so goetia runs in a chroot",
+        ),
     ];
     for (host, evidence) in hosts {
         let fake = Fake::new([]);
@@ -1181,34 +1189,55 @@ fn only_a_stat_that_finds_no_directory_is_evidence_of_no_systemd() {
 
 /// `/` and PID 1's root, both read, decide, either way — the check `running_in_chroot()` makes, so
 /// two equal roots are no chroot whatever the mount tables say. A stat that failed establishes
-/// nothing — `EACCES`, as `/proc/1/root` answers a caller that may not trace PID 1, or `ENOENT`,
-/// with no `/proc` — and leaves it to the mount tables.
+/// nothing — `EACCES`, as `/proc/1/root` answers a caller that may not trace PID 1, or `ENOENT` —
+/// and leaves it to the mount tables, with `/proc` present: its absence is decided before either.
 #[skuld::test]
 fn two_roots_read_decide_and_the_mount_tables_only_where_they_could_not_be() {
     let failed = |errno| Err(std::io::Error::from_raw_os_error(errno));
     let differ = || (table(&[("0:131", "/", "/")]), table(&[("8:1", "/", "/")]));
     let agree = || (table(&[("8:1", "/", "/")]), table(&[("8:1", "/", "/")]));
-    assert_eq!(chroot_from(Ok((1, 2)), Ok((1, 3)), agree), Some(Chroot::Root));
-    assert_eq!(chroot_from(Ok((1, 2)), Ok((4, 2)), agree), Some(Chroot::Root));
+    assert_eq!(chroot_from(Ok((1, 2)), Ok((1, 3)), false, agree), Some(Chroot::Root));
+    assert_eq!(chroot_from(Ok((1, 2)), Ok((4, 2)), false, agree), Some(Chroot::Root));
     assert_eq!(
-        chroot_from(Ok((1, 2)), Ok((1, 2)), differ),
+        chroot_from(Ok((1, 2)), Ok((1, 2)), false, differ),
         None,
         "equal roots are final"
     );
     for errno in [libc::EACCES, libc::ENOENT] {
-        assert_eq!(chroot_from(Ok((1, 2)), failed(errno), agree), None, "{errno}");
-        assert_eq!(chroot_from(failed(errno), Ok((1, 2)), agree), None, "{errno}");
+        assert_eq!(chroot_from(Ok((1, 2)), failed(errno), false, agree), None, "{errno}");
+        assert_eq!(chroot_from(failed(errno), Ok((1, 2)), false, agree), None, "{errno}");
         assert_eq!(
-            chroot_from(Ok((1, 2)), failed(errno), differ),
+            chroot_from(Ok((1, 2)), failed(errno), false, differ),
             Some(Chroot::Mount),
             "{errno}"
         );
         assert_eq!(
-            chroot_from(failed(errno), Ok((1, 2)), differ),
+            chroot_from(failed(errno), Ok((1, 2)), false, differ),
             Some(Chroot::Mount),
             "{errno}"
         );
     }
+}
+
+/// With no `/proc` mounted nothing of PID 1's or goetia's own can be read, so every other check
+/// establishes nothing: that absence is the evidence, and no table or stat is consulted for it.
+#[skuld::test]
+fn an_established_absent_proc_is_evidence_of_a_chroot_whatever_else_could_not_be_read() {
+    let failed = |errno| Err(std::io::Error::from_raw_os_error(errno));
+    let unreadable = || {
+        let gone = || Err(std::io::Error::from_raw_os_error(libc::ENOENT));
+        (gone(), gone())
+    };
+    assert_eq!(
+        chroot_from(Ok((1, 2)), failed(libc::ENOENT), true, unreadable),
+        Some(Chroot::NoProc)
+    );
+    assert_eq!(
+        chroot_from(failed(libc::ENOENT), failed(libc::ENOENT), true, unreadable),
+        Some(Chroot::NoProc)
+    );
+    // A `/proc` that is there but hides PID 1 is the `hidepid` shape, which establishes nothing.
+    assert_eq!(chroot_from(Ok((1, 2)), failed(libc::EACCES), false, unreadable), None);
 }
 
 /// A mount table: one line for each `(device, root, mount point)`, the other fields as a real one
@@ -1347,8 +1376,7 @@ fn systemd_offline_is_evidence_only_when_true() {
     }
 }
 
-/// The chroot `systemctl` itself detects — `/proc/1/root` against `/`, or the absence that leaves
-/// neither readable — as it reports it: `show` exits `0`, prints nothing, and says why on stderr,
+/// The chroot `systemctl` itself detects — `/proc/1/root` against `/` — as it reports it: `show` exits `0`, prints nothing, and says why on stderr,
 /// in 246's words and newer ones' (measured on 257), 242 to 245's, or those with no verb to name
 /// (see [`IGNORED`]). The gate refuses it, naming the report. A chroot the *environment* declares
 /// is not among the causes: [`DENIED`] takes every such switch off the child.
