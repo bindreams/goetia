@@ -5,12 +5,12 @@ use std::path::PathBuf;
 
 use clap::Args as ClapArgs;
 
-use super::report;
+use super::ExitCode;
 use super::support::{load_and_warn, require_elevation};
 use super::wait::WaitArgs;
 use crate::backend::Identity;
 use crate::decide::{self, Outcome};
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::manager::{Prepared, ServiceManager, Step};
 use crate::spec::{AccountId, DaemonSpec, Id, User};
 
@@ -46,12 +46,12 @@ pub fn run(
     is_elevated: &dyn Fn() -> bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
-) -> i32 {
+) -> ExitCode {
     let spec = match load_and_warn(&args.file, err) {
         Ok(spec) => spec,
         Err(e) => {
             let _ = writeln!(err, "error: {e}");
-            return 1;
+            return ExitCode::Error;
         }
     };
 
@@ -60,11 +60,11 @@ pub fn run(
         return match preview_artifact(&spec, err) {
             Ok(artifact) => {
                 let _ = write!(out, "{artifact}");
-                0
+                ExitCode::Success
             }
             Err(e) => {
                 let _ = writeln!(err, "error: {e}");
-                1
+                ExitCode::Error
             }
         };
     }
@@ -76,18 +76,12 @@ pub fn run(
         Ok(mgr) => mgr,
         Err(e) => {
             let _ = writeln!(err, "error: {e}");
-            return 1;
+            return ExitCode::Error;
         }
     };
 
-    // Each step (install, `--enable`, `--start`) contributes at most one
-    // exit-code class, combined by `report::precedence`. Never `max()` on the
-    // codes themselves: `1` (a refusal or a hard failure) must outrank `5`
-    // even though it is the smaller number, or a real error hides behind a
-    // conflict — and `5` specifically promises "every failure here is
-    // force-resolvable", which stops being true the moment another step in the
-    // same run hard-failed.
-    let mut codes: Vec<i32> = Vec::new();
+    // Each step (install, `--enable`, `--start`) contributes at most one code; see `ExitCode` for which wins.
+    let mut codes: Vec<ExitCode> = Vec::new();
     // Before the install sends anything, so that nothing the start needs
     // can run out after the install booted a loaded job out.
     let _prepared = if args.start {
@@ -95,7 +89,7 @@ pub fn run(
             Ok(prepared) => prepared,
             Err(e) => {
                 let _ = writeln!(err, "error: {}: {e}", spec.id);
-                return failure_code(&e);
+                return ExitCode::of(&e);
             }
         }
     } else {
@@ -104,72 +98,33 @@ pub fn run(
     match mgr.install(&spec, args.force) {
         Ok(outcome) => {
             match report_outcome(&spec.id, &outcome, out, err) {
-                OutcomeClass::Ok => codes.push(0),
+                ExitCode::Success => codes.push(ExitCode::Success),
                 // Nothing was (re)written: neither flag below has anything to
                 // act on.
-                OutcomeClass::Conflict => return 5,
-                OutcomeClass::Refused => return 1,
+                other => {
+                    debug_assert!(matches!(other, ExitCode::Conflict | ExitCode::Error), "{other:?}");
+                    return other;
+                }
             }
             if args.enable {
                 if let Err(e) = mgr.enable(&spec.id) {
                     let _ = writeln!(err, "error: {}: enable: {e}", spec.id);
-                    codes.push(failure_code(&e));
+                    codes.push(ExitCode::of(&e));
                 }
             }
             if args.start {
                 if let Err(e) = mgr.start(&spec.id, args.wait.budget()) {
                     let _ = writeln!(err, "error: {}: start: {e}", spec.id);
-                    codes.push(failure_code(&e));
+                    codes.push(ExitCode::of(&e));
                 }
             }
         }
         Err(e) => {
             let _ = writeln!(err, "error: {}: {e}", spec.id);
-            codes.push(failure_code(&e));
+            codes.push(ExitCode::of(&e));
         }
     }
-    codes
-        .into_iter()
-        .max_by_key(|code| report::precedence(*code))
-        .unwrap_or(0)
-}
-
-/// The class a failed step contributes: `4` when goetia could not
-/// determine the answer, `1` when the step determinately failed. This is
-/// what makes `install` agree with `diff` about one artifact — see
-/// `dispatch`'s doc comment for the vocabulary.
-fn failure_code(e: &Error) -> i32 {
-    match e {
-        // Two conditions, one class. `Undetermined` left it open what is at
-        // the id; `WaitTimeout` answered that and left the *outcome* open,
-        // the request having been issued and not cancelled. Neither is a
-        // step that determinately failed, which is what `1` would claim.
-        // `RequestInDoubt` left open whether a request `install` or `--start`
-        // sent reached the manager, or what came of one that did.
-        // `LoadedJobInDoubt`, `LoadedStateInDoubt`: the plist was written (and put back unless that
-        // failed), and which definition a job started meanwhile read is open. `StaleJobBootedOut`: a
-        // job was booted out and a concurrent writer then took the plist's place.
-        Error::Undetermined { .. }
-        | Error::WaitTimeout { .. }
-        | Error::RequestInDoubt { .. }
-        | Error::LoadedJobInDoubt { .. }
-        | Error::LoadedStateInDoubt { .. }
-        | Error::StaleJobBootedOut { .. } => 4,
-        // `Error::Unestablished` belongs in the arm above and is missing
-        // from it only because it cannot arrive here: `cli::restart` is its
-        // only producer, and `install` never calls it. `Error` is not
-        // `#[non_exhaustive]`, so a second producer reached from one of
-        // `install`'s own steps would land here and report `1` — "the step
-        // determinately failed" — silently. Add it above if one ever does.
-        _ => 1,
-    }
-}
-
-/// Which of the three exit-code buckets an [`Outcome`] belongs to.
-enum OutcomeClass {
-    Ok,
-    Refused,
-    Conflict,
+    codes.into_iter().max().unwrap_or(ExitCode::Success)
 }
 
 /// Print one outcome and classify it for the exit code. The full text
@@ -179,24 +134,24 @@ enum OutcomeClass {
 /// `status`, `diff` all put failures on stderr) — a script that only
 /// captures stderr for errors must still learn that this exit-1/5 run had
 /// one.
-fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn Write) -> OutcomeClass {
+fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     match outcome {
         Outcome::Create => {
             let _ = writeln!(out, "{id}: created");
-            OutcomeClass::Ok
+            ExitCode::Success
         }
         Outcome::UpToDate => {
             let _ = writeln!(out, "{id}: up to date");
-            OutcomeClass::Ok
+            ExitCode::Success
         }
         Outcome::Update { spec_diff } => {
             let _ = writeln!(out, "{id}: updated");
             let _ = write!(out, "{spec_diff}");
-            OutcomeClass::Ok
+            ExitCode::Success
         }
         Outcome::Stale { from_version } => {
             let _ = writeln!(out, "{id}: regenerated (was built by goetia {from_version})");
-            OutcomeClass::Ok
+            ExitCode::Success
         }
         Outcome::Conflict {
             artifact_diff,
@@ -215,18 +170,18 @@ fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn
             let _ = writeln!(out, "{line}");
             let _ = write!(out, "{artifact_diff}");
             let _ = writeln!(err, "error: {line}");
-            OutcomeClass::Conflict
+            ExitCode::Conflict
         }
         Outcome::RefuseForeign { recovery } => {
             let _ = writeln!(out, "{id}: refused: not a goetia-managed service. {recovery}");
             let _ = writeln!(err, "error: {id}: refused: not a goetia-managed service. {recovery}");
-            OutcomeClass::Refused
+            ExitCode::Error
         }
         Outcome::RefuseOtherDaemon { installed } => {
             let line = format!("{id}: refused: {}", decide::other_daemon_refusal(installed.as_str()));
             let _ = writeln!(out, "{line}");
             let _ = writeln!(err, "error: {line}");
-            OutcomeClass::Refused
+            ExitCode::Error
         }
         Outcome::RefuseUnusable { reason, recovery } => {
             let line = match recovery {
@@ -235,7 +190,7 @@ fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn
             };
             let _ = writeln!(out, "{line}");
             let _ = writeln!(err, "error: {line}");
-            OutcomeClass::Refused
+            ExitCode::Error
         }
     }
 }
@@ -312,7 +267,3 @@ fn preview_artifact(spec: &DaemonSpec, err: &mut dyn Write) -> Result<String> {
         Ok("# no dry-run preview generator for this platform\n".to_string())
     }
 }
-
-#[cfg(test)]
-#[path = "install_tests.rs"]
-mod install_tests;

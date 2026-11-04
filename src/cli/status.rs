@@ -8,6 +8,7 @@ use std::io::Write;
 
 use clap::Args as ClapArgs;
 
+use super::ExitCode;
 use super::report::{self, DaemonReport, Report};
 use super::support::{parse_id, partition_installed, print_undetermined_warnings, print_unusable_warnings};
 use crate::error::{Error, Result};
@@ -25,7 +26,7 @@ pub fn run(
     get_manager: &dyn Fn() -> Result<Box<dyn ServiceManager>>,
     out: &mut dyn Write,
     err: &mut dyn Write,
-) -> i32 {
+) -> ExitCode {
     let mgr = match get_manager() {
         Ok(mgr) => mgr,
         Err(e) => return unavailable(&e, json, out, err),
@@ -66,7 +67,7 @@ pub fn run(
 
 /// `report::unavailable` always maps to exit 1; taken from
 /// `report::exit_code` here so json and text agree.
-fn unavailable(e: &Error, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+fn unavailable(e: &Error, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     let report = report::unavailable(e);
     if json {
         return report::emit(&report, out, err);
@@ -75,7 +76,7 @@ fn unavailable(e: &Error, json: bool, out: &mut dyn Write, err: &mut dyn Write) 
     report::exit_code(&report)
 }
 
-fn status_all(mgr: &dyn ServiceManager, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+fn status_all(mgr: &dyn ServiceManager, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     let index = mgr.list().map(partition_installed);
     let report = match &index {
         Ok(index) => report::from_index(index),

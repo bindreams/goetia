@@ -290,6 +290,41 @@ pub enum Error {
     Other(String),
 }
 
+impl Error {
+    /// Whether this failure left the outcome open: what is at the id, whether a request reached the
+    /// manager, or where the daemon ended up. `false` means goetia established that the operation
+    /// failed or was refused. The CLI exits `4` for the first and `1` for the second.
+    ///
+    /// Exhaustive on purpose: a new variant must be classified here before it compiles.
+    pub fn is_indeterminate(&self) -> bool {
+        match self {
+            Error::Undetermined { .. }
+            | Error::WaitTimeout { .. }
+            | Error::Unestablished { .. }
+            | Error::RequestInDoubt { .. }
+            | Error::LoadedJobInDoubt { .. }
+            | Error::LoadedStateInDoubt { .. }
+            | Error::StaleJobBootedOut { .. } => true,
+            Error::Io { .. }
+            | Error::EnvFile { .. }
+            | Error::Interpolate { .. }
+            | Error::Yaml(_)
+            | Error::Invalid { .. }
+            | Error::Blob(_)
+            | Error::NotInstalled { .. }
+            | Error::Foreign { .. }
+            | Error::NotRunning { .. }
+            | Error::NoManager { .. }
+            | Error::ElevationRequired { .. }
+            | Error::UnsupportedPlatform { .. }
+            | Error::CommandFailed { .. }
+            | Error::AccountLookup { .. }
+            | Error::AlreadyExists { .. }
+            | Error::Other(_) => false,
+        }
+    }
+}
+
 /// [`Error::RequestInDoubt`]'s message: what goetia knows of how far the
 /// request got, and no more.
 fn in_doubt(request: &str, reached: bool, detail: &str) -> String {
@@ -329,3 +364,7 @@ fn loaded_in_doubt(id: &str, read_failed: Option<&str>, restore_failed: Option<&
 /// This crate's `Result` alias, used throughout [`crate::manager`] and
 /// [`crate::cli`].
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+#[path = "error_tests.rs"]
+mod error_tests;

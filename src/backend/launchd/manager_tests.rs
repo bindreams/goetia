@@ -1927,7 +1927,7 @@ fn a_plist_removed_after_a_read_fails_the_install_without_further_launchctl_call
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn dry_run_and_diff_ask_launchd_nothing_and_install_start_is_refused_before_it_starts() {
     use crate::cli::wait::WaitArgs;
-    use crate::cli::{diff, install};
+    use crate::cli::{ExitCode, diff, install};
 
     let name = format!("goetia-cli-{:x}", std::process::id());
     let _plists = Plists(name.clone());
@@ -1956,22 +1956,22 @@ fn dry_run_and_diff_ask_launchd_nothing_and_install_start_is_refused_before_it_s
 
     manifest("300");
     let script = Scripted::new(&CREATED);
-    assert_eq!(run_install(false, false).0, 0);
+    assert_eq!(run_install(false, false).0, ExitCode::Success);
     script.assert_driven("the first install");
 
     manifest("299");
     let script = Scripted::new(&[]);
-    assert_eq!(run_install(false, true).0, 0, "install --dry-run");
+    assert_eq!(run_install(false, true).0, ExitCode::Success, "install --dry-run");
     let args = diff::Args {
         file: dir.path().to_path_buf(),
     };
     let code = diff::run(&args, &get_manager, &mut Vec::new(), &mut Vec::new());
-    assert_eq!(code, 3, "diff reports the drift");
+    assert_eq!(code, ExitCode::Drift, "diff reports the drift");
     script.assert_driven("neither --dry-run nor diff asks launchd");
 
     let script = Scripted::new(&[("print", RUNNING)]);
     let (code, err) = run_install(true, false);
-    assert_eq!(code, 1, "{err}");
+    assert_eq!(code, ExitCode::Error, "{err}");
     assert!(err.contains(&format!("goetia daemon stop {name}")), "{err}");
     script.assert_driven("install --start is refused after one read, before any bootstrap");
 }

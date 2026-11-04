@@ -17,9 +17,10 @@ use std::path::PathBuf;
 
 use clap::Args as ClapArgs;
 
+use super::ExitCode;
 use super::support::load_and_warn;
 use crate::decide::{self, Outcome};
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::manager::ServiceManager;
 
 #[derive(ClapArgs, Debug)]
@@ -34,12 +35,12 @@ pub fn run(
     get_manager: &dyn Fn() -> Result<Box<dyn ServiceManager>>,
     out: &mut dyn Write,
     err: &mut dyn Write,
-) -> i32 {
+) -> ExitCode {
     let spec = match load_and_warn(&args.file, err) {
         Ok(spec) => spec,
         Err(e) => {
             let _ = writeln!(err, "error: {e}");
-            return 1;
+            return ExitCode::Error;
         }
     };
 
@@ -47,23 +48,23 @@ pub fn run(
         Ok(mgr) => mgr,
         Err(e) => {
             let _ = writeln!(err, "error: {e}");
-            return 1;
+            return ExitCode::Error;
         }
     };
 
     match mgr.preview_install(&spec) {
         Ok(Outcome::Create) => {
             let _ = writeln!(out, "{}: not installed (would be created)", spec.id);
-            3
+            ExitCode::Drift
         }
         Ok(Outcome::UpToDate) => {
             let _ = writeln!(out, "{}: up to date", spec.id);
-            0
+            ExitCode::Success
         }
         Ok(Outcome::Update { spec_diff }) => {
             let _ = writeln!(out, "{}:", spec.id);
             let _ = write!(out, "{spec_diff}");
-            3
+            ExitCode::Drift
         }
         Ok(Outcome::Stale { from_version }) => {
             let _ = writeln!(
@@ -71,7 +72,7 @@ pub fn run(
                 "{}: would be regenerated (built by goetia {from_version})",
                 spec.id
             );
-            3
+            ExitCode::Drift
         }
         // The same two flavours `install` renders, in the subjunctive:
         // `--force` is named only where it would actually resolve this.
@@ -89,7 +90,7 @@ pub fn run(
             let _ = writeln!(out, "{line}");
             let _ = write!(out, "{artifact_diff}");
             let _ = writeln!(err, "error: {line}");
-            5
+            ExitCode::Conflict
         }
         Ok(Outcome::RefuseForeign { recovery }) => {
             let line = format!(
@@ -98,7 +99,7 @@ pub fn run(
             );
             let _ = writeln!(out, "{line}");
             let _ = writeln!(err, "error: {line}");
-            1
+            ExitCode::Error
         }
         Ok(Outcome::RefuseOtherDaemon { installed }) => {
             let line = format!(
@@ -108,26 +109,20 @@ pub fn run(
             );
             let _ = writeln!(out, "{line}");
             let _ = writeln!(err, "error: {line}");
-            1
+            ExitCode::Error
         }
         Ok(Outcome::RefuseUnusable { reason, recovery }) => {
-            // Indeterminate, not a failure: `4`.
             let line = match recovery {
                 Some(recovery) => format!("{}: would be refused: {reason}. {recovery}", spec.id),
                 None => format!("{}: would be refused: {reason}", spec.id),
             };
             let _ = writeln!(out, "{line}");
             let _ = writeln!(err, "error: {line}");
-            4
-        }
-        // Unanswered question, not a failure: `4` (see `dispatch`).
-        Err(e @ Error::Undetermined { .. }) => {
-            let _ = writeln!(err, "error: {}: {e}", spec.id);
-            4
+            ExitCode::Indeterminate
         }
         Err(e) => {
             let _ = writeln!(err, "error: {}: {e}", spec.id);
-            1
+            ExitCode::of(&e)
         }
     }
 }
