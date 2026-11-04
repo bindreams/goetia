@@ -295,3 +295,37 @@ fn a_refused_start_after_an_unwaited_stop_is_unestablished_with_the_refusal_as_i
         e.report()
     );
 }
+
+/// A leg that failed as a step over a request in doubt is in doubt as the bare request is: the
+/// re-wording reaches the request under the step, and the step stays outermost in the report.
+#[skuld::test]
+fn a_step_over_a_leg_in_doubt_is_reworded_under_the_step() {
+    let id = Id::try_from("frpc").unwrap();
+    let step = || Error::Step {
+        what: "start".to_string(),
+        source: Box::new(in_doubt()),
+    };
+
+    for budget in [Budget::Immediate, Budget::Unbounded, Budget::DEFAULT] {
+        let started = after_start_failed(&id, budget, step());
+        assert!(matches!(started, Error::Step { .. }), "{budget:?}: {started:?}");
+        assert!(
+            matches!(started.cause(), Error::RequestInDoubt { .. }),
+            "{budget:?}: {started:?}"
+        );
+        let text = started.report().to_string();
+        assert!(text.starts_with("start: `systemctl start x.service` reached"), "{text}");
+        assert!(text.contains("this start was attempted after it"), "{text}");
+
+        let stopped = abandoned_before_start(&id, step(), budget);
+        assert!(
+            matches!(stopped.cause(), Error::RequestInDoubt { .. }),
+            "{budget:?}: {stopped:?}"
+        );
+        assert!(
+            stopped.report().to_string().contains("the restart was abandoned"),
+            "{}",
+            stopped.report()
+        );
+    }
+}

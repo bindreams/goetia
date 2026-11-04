@@ -177,7 +177,7 @@ fn stop_leg(requested: Budget, left: Budget) -> Budget {
 /// [`as_given`]). Every other failure passes through untouched: a stop that
 /// determinately failed changed nothing and is still exit `1`.
 fn abandoned_before_start(id: &Id, e: Error, budget: Budget) -> Error {
-    match e {
+    through_steps(e, |leaf| match leaf {
         Error::WaitTimeout {
             id, awaited, waited, ..
         } => Error::WaitTimeout {
@@ -197,7 +197,7 @@ fn abandoned_before_start(id: &Id, e: Error, budget: Budget) -> Error {
              status {id}` shows the manager's current view, and `goetia daemon start {id}` brings it back up"
         )),
         other => other,
-    }
+    })
 }
 
 /// The start leg's [`Leg::Spent`]: the stop *succeeded* — confirmed, under a
@@ -233,13 +233,42 @@ fn spent_before_start(id: &Id, budget: Budget) -> Error {
 /// start leg erased here would exit `1` in the states where the distinction
 /// matters most — stopped and not back up, or stopped and still on its way.
 fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
-    match e {
+    let reworded = |leaf| rewrapped_start_leg(id, budget, leaf);
+    match e.cause() {
         // First, and ahead of the non-waiting arm below, so that both paths
         // preserve it. [`Error::Unestablished`] says in as many words that
         // what is installed at the id was never in doubt; absorbing an
         // `Undetermined` start leg into it makes that false. Only the clause
         // differs between the paths, because only what the stop leg
         // established differs.
+        //
+        // The start may have reached the manager: kept as it is, ahead of the
+        // non-waiting arm below, whose "refused" it was not, and never called a
+        // failure to restart, which is what it did not establish.
+        Error::Undetermined { .. } | Error::RequestInDoubt { .. } => through_steps(e, reworded),
+        // The stop was issued and not waited for, and the start that
+        // followed was refused — determinately (a launchd `bootstrap` that
+        // fails outright) or not (SCM's `ERROR_SERVICE_ALREADY_RUNNING` over a
+        // service still coming down). systemd never gets here: its restart is
+        // one request. Either way nothing confirmed the stop,
+        // which may be in flight, done, or have had nothing to do, so where
+        // the daemon ended up is what nobody established.
+        _ if !budget.waits() => Error::Unestablished {
+            id: id.as_str().to_string(),
+            refused: Box::new(e),
+        },
+        Error::WaitTimeout { .. } => through_steps(e, reworded),
+        _ => Error::Step {
+            what: "stopped but failed to restart".to_string(),
+            source: Box::new(e),
+        },
+    }
+}
+
+/// The error a start leg's failure ends in, re-worded to say what the stop leg established; any
+/// other error is returned as it is.
+fn rewrapped_start_leg(id: &Id, budget: Budget, leaf: Error) -> Error {
+    match leaf {
         Error::Undetermined { id, reason, recovery } => Error::Undetermined {
             id,
             reason: Box::new(Error::Step {
@@ -248,21 +277,7 @@ fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
             }),
             recovery,
         },
-        // The start may have reached the manager: kept as it is, ahead of the
-        // non-waiting arm below, whose "refused" it was not, and never called a
-        // failure to restart, which is what it did not establish.
         e @ Error::RequestInDoubt { .. } => e.in_doubt_context(start_after_stop_clause(id, budget)),
-        // The stop was issued and not waited for, and the start that
-        // followed was refused — determinately (a launchd `bootstrap` that
-        // fails outright) or not (SCM's `ERROR_SERVICE_ALREADY_RUNNING` over a
-        // service still coming down). systemd never gets here: its restart is
-        // one request. Either way nothing confirmed the stop,
-        // which may be in flight, done, or have had nothing to do, so where
-        // the daemon ended up is what nobody established.
-        e if !budget.waits() => Error::Unestablished {
-            id: id.as_str().to_string(),
-            refused: Box::new(e),
-        },
         Error::WaitTimeout {
             id,
             awaited,
@@ -274,10 +289,20 @@ fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
             id,
             awaited,
         },
-        other => Error::Step {
-            what: "stopped but failed to restart".to_string(),
-            source: Box::new(other),
+        other => other,
+    }
+}
+
+/// `e` with `f` applied to the error its [`Error::Step`] chain ends in, the steps kept around it:
+/// the variant a failure is classified by (see [`Error::cause`]) is the one re-worded, and the
+/// operation that failed on it stays in the report.
+fn through_steps(e: Error, f: impl FnOnce(Error) -> Error) -> Error {
+    match e {
+        Error::Step { what, source } => Error::Step {
+            what,
+            source: Box::new(through_steps(*source, f)),
         },
+        leaf => f(leaf),
     }
 }
 

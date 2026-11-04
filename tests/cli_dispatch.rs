@@ -3528,6 +3528,67 @@ fn restart_with_no_budget_keeps_an_undetermined_start_undetermined() {
     assert_eq!(out, "", "nothing may claim the daemon was restarted: {out}");
 }
 
+/// A start leg that failed as a step over an `Undetermined` read is classified by that read, as the
+/// bare `Undetermined` is: not absorbed into `Unestablished`, which says what is installed was never
+/// in doubt. The step stays outermost, and the stop leg's clause sits inside it.
+#[skuld::test]
+fn restart_with_no_budget_keeps_a_step_over_an_undetermined_start_undetermined() {
+    let inner = Fake::new();
+    inner.install(&mk("frpc"), false).unwrap();
+    let mgr = FlakyManager {
+        inner,
+        step_over_undetermined_start_for: Some("frpc".to_string()),
+        ..Default::default()
+    };
+
+    let (code, out, err) = dispatch_with(
+        &["goetia", "daemon", "restart", "frpc", "--timeout", "0"],
+        &mgr,
+        &|| true,
+    );
+
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        err.starts_with("error: frpc: start: cannot determine whether daemon `frpc` is installed"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("where it ended up is not established"),
+        "an `Unestablished` denies the doubt about what is installed: {err}"
+    );
+    assert!(
+        err.contains("without waiting for it"),
+        "what the stop leg did and did not establish is still disclosed: {err}"
+    );
+    assert_eq!(out, "", "nothing may claim the daemon was restarted: {out}");
+}
+
+/// The same step over an `Undetermined` read, under a budget that waits: still the read, with the
+/// stop leg's clause inside the step, not a "failed to restart" wrapped around the whole.
+#[skuld::test]
+fn a_waited_restart_keeps_a_step_over_an_undetermined_start_undetermined() {
+    let inner = Fake::new();
+    inner.install(&mk("frpc"), false).unwrap();
+    let mgr = FlakyManager {
+        inner,
+        step_over_undetermined_start_for: Some("frpc".to_string()),
+        ..Default::default()
+    };
+
+    let (code, out, err) = dispatch_with(&["goetia", "daemon", "restart", "frpc", "--no-timeout"], &mgr, &|| true);
+
+    assert_eq!(code, 4, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        err.starts_with("error: frpc: start: cannot determine whether daemon `frpc` is installed"),
+        "{err}"
+    );
+    assert!(
+        err.contains("stopped but failed to restart"),
+        "what the stop leg established is still disclosed: {err}"
+    );
+    assert_eq!(out, "", "nothing may claim the daemon was restarted: {out}");
+}
+
 /// Where the manager has a request-only restart, `restart --timeout 0` is that one request and
 /// nothing else: a stop and a separate start leave the window systemd closes by replacing the stop.
 /// Over a daemon still up, where the two-step path reports a refused start, the one request is
