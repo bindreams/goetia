@@ -22,9 +22,9 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError, Sender, TryRecvError};
 #[cfg(test)]
 pub(crate) use spares::test_hook;
-pub(crate) use spares::{Needs, Reaper, spare};
-#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
-pub(crate) use spares::{Spares, reapers, top_up};
+pub(crate) use spares::{Reaper, Reservation};
+#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
+pub(crate) use spares::{Spares, spare};
 
 use crate::manager::budget::Deadline;
 
@@ -42,6 +42,11 @@ pub(crate) fn command(program: &str, args: &[&str]) -> Result<cosca::Command, co
 }
 
 // wait_bounded ========================================================================================================
+
+/// The streams a child's output is captured from, and so the temp files a [`Role::Query`] or
+/// [`Role::Request`] draws: stdout and stderr.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) const STREAMS: usize = 2;
 
 /// What the child wrote, and whether that is all of it.
 #[derive(Debug)]
@@ -87,8 +92,8 @@ pub(crate) enum Role {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Query,
     /// A read no verb counted — launchd's `status` and `list` — as [`Role::Query`], except that its
-    /// files are made for it on the spot, whatever reservation is live: it never draws on one,
-    /// which only the requests' steps counted for, and failing to make one sends nothing.
+    /// files are made for it on the spot, whatever reservation it is handed: it never draws on one,
+    /// which only the verbs' steps counted for, and failing to make one sends nothing.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     UncountedQuery,
     /// A request that says on stderr when the manager has it: `issued` holds once it has. Until
@@ -132,14 +137,17 @@ enum Ready {
 }
 
 impl Ready {
-    /// A temp file, or for a [`Role::AnnouncedRequest`] a thread to read a pipe: see [`Role`].
-    fn for_role(role: &Role) -> Result<Ready, cosca::error::Error> {
+    /// A temp file, drawn from `reservation`, or for a [`Role::AnnouncedRequest`] a thread to read a
+    /// pipe: see [`Role`].
+    fn for_role(role: &Role, reservation: &mut Reservation) -> Result<Ready, cosca::error::Error> {
         Ok(match role {
             Role::AnnouncedRequest(_) => {
                 Ready::Listener(spares::listener().map_err(not_run("thread to read its output"))?)
             }
-            Role::Query | Role::Request(_) => Ready::File(spares::file().map_err(not_run("temp file for its output"))?),
-            Role::UncountedQuery => Ready::File(spares::own_file().map_err(not_run("temp file for its output"))?),
+            Role::Query | Role::Request(_) => {
+                Ready::File(reservation.file().map_err(not_run("temp file for its output"))?)
+            }
+            Role::UncountedQuery => Ready::File(spares::make_file().map_err(not_run("temp file for its output"))?),
         })
     }
 
@@ -184,11 +192,16 @@ impl std::fmt::Display for SpawnError {
 /// stream — or, for a [`Role::AnnouncedRequest`], a thread to read each as it is written, since it
 /// announces on stderr and must not depend on a writable temp directory. A failure to make one is
 /// [`SpawnError::NotRun`], and says so. A [`Role::Request`] brings its [`Reaper`], made before the
-/// caller sent anything — see [`reapers`].
-pub(crate) fn spawn(cmd: &mut cosca::Command, role: Role) -> Result<Spawned, SpawnError> {
+/// caller sent anything — see [`Reservation`]. Its files are drawn from `reservation`, [`STREAMS`] for
+/// each [`Role::Query`] and [`Role::Request`]; a call that draws none is handed an empty one.
+pub(crate) fn spawn(
+    cmd: &mut cosca::Command,
+    role: Role,
+    reservation: &mut Reservation,
+) -> Result<Spawned, SpawnError> {
     let prepared = (|| {
-        let stdout = Ready::for_role(&role)?;
-        let stderr = Ready::for_role(&role)?;
+        let stdout = Ready::for_role(&role, reservation)?;
+        let stderr = Ready::for_role(&role, reservation)?;
         cmd.stdout(stdout.stdio()?)?;
         cmd.stderr(stderr.stdio()?)?;
         Ok((stdout, stderr))

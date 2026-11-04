@@ -19,7 +19,7 @@ use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Result};
 use crate::manager::budget;
 use crate::manager::flow;
-use crate::manager::{Budget, Installed, Prepared, ServiceManager, State, Status, Step};
+use crate::manager::{Budget, Installed, ServiceManager, State, Status, Step};
 use crate::spec::{DaemonSpec, Id, User};
 
 /// The fake's own artifact marker. Deliberately not any of the real
@@ -143,12 +143,6 @@ struct Store {
     writes: usize,
     calls: Vec<(&'static str, String)>,
     prepared: Vec<(Vec<Step>, Budget)>,
-    /// The steps of every guard `prepare` returned that has not been
-    /// dropped, by guard number.
-    live: Vec<(u64, Vec<Step>)>,
-    /// The number the next guard `prepare` returns is known by.
-    next_guard: u64,
-    guarded: Vec<(&'static str, String, Vec<Step>)>,
 }
 
 impl Store {
@@ -160,12 +154,6 @@ impl Store {
             });
         }
         Ok(())
-    }
-
-    /// Record a request for [`Fake::guarded`], under the guards live now.
-    fn asked(&mut self, verb: &'static str, id: &Id) {
-        let steps = self.live.iter().flat_map(|(_, steps)| steps.iter().copied()).collect();
-        self.guarded.push((verb, id.as_str().to_string(), steps));
     }
 
     /// What is at `id`, as [`Backend::read`] reports it. An opaque id fails
@@ -537,20 +525,12 @@ impl Fake {
         state.writes
     }
 
-    /// The steps and budget every [`ServiceManager::prepare`] was given, in
-    /// order — failed ones included.
+    /// The steps and budget every reservation was asked for, in order, failed
+    /// ones included: [`ServiceManager::prepare`]'s, and one for each verb run
+    /// outside a sequence.
     pub fn prepared(&self) -> Vec<(Vec<Step>, Budget)> {
         let state = self.state.lock().expect("Fake mutex poisoned");
         state.prepared.clone()
-    }
-
-    /// Every `install`/`start`/`stop`/`restart`/`kill` this Fake was asked for, in
-    /// order, each with the steps of every [`Prepared`] still held when it
-    /// was asked: whether the preparation that should cover a request did —
-    /// the right steps, not yet released.
-    pub fn guarded(&self) -> Vec<(&'static str, String, Vec<Step>)> {
-        let state = self.state.lock().expect("Fake mutex poisoned");
-        state.guarded.clone()
     }
 
     /// Test-only: force `id`'s reported [`State`] directly, bypassing
@@ -635,19 +615,6 @@ fn lost(ids: &BTreeSet<String>, verb: &str, id: &Id) -> Result<()> {
     Ok(())
 }
 
-/// What [`Fake`]'s `prepare` holds: its steps stay live until this drops.
-struct Held {
-    store: Arc<Mutex<Store>>,
-    guard: u64,
-}
-
-impl Drop for Held {
-    fn drop(&mut self) {
-        let mut state = self.store.lock().expect("Fake mutex poisoned");
-        state.live.retain(|(guard, _)| *guard != self.guard);
-    }
-}
-
 // Backend =============================================================================================================
 
 impl Store {
@@ -675,7 +642,6 @@ impl Fake {
     fn restart_natively(&self, snapshot: Artifact) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.calls.push(("restart", snapshot.id().as_str().to_string()));
-        state.asked("restart", snapshot.id());
         state.confirm(&snapshot).map(drop)
     }
 }
@@ -684,12 +650,25 @@ impl crate::backend::Backend for Fake {
     type Definition = String;
     type Snapshot = Artifact;
     type InstallScope = ();
+    type Reservation = ();
 
-    /// Records the install once, however many times the flow retries; then an opaque id, then no
-    /// manager. Before `read`, which has no way to say a manager is missing.
-    fn begin_install(&self, spec: &DaemonSpec) -> Result<()> {
+    /// Records the steps asked for, and fails once [`Fake::seed_prepare_fails`]ed. Makes nothing
+    /// ready: the fake draws nothing.
+    fn reserve(&self, steps: &[Step], budget: Budget) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
-        state.asked("install", &spec.id);
+        state.prepared.push((steps.to_vec(), budget));
+        if state.prepare_fails {
+            return Err(Error::Reservation {
+                id: None,
+                source: std::io::Error::other("injected test failure"),
+            });
+        }
+        Ok(())
+    }
+
+    /// An opaque id, then no manager. Before `read`, which has no way to say a manager is missing.
+    fn begin_install(&self, spec: &DaemonSpec) -> Result<()> {
+        let state = self.state.lock().expect("Fake mutex poisoned");
         if state.opaque.contains(spec.id.as_str()) {
             return Err(Store::undetermined(&spec.id));
         }
@@ -738,6 +717,7 @@ impl crate::backend::Backend for Fake {
         _outcome: &Outcome,
         snapshot: Option<&Artifact>,
         _scope: &mut (),
+        _reservation: &mut (),
     ) -> Result<WriteOutcome> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         if let Some(text) = state.interlopers.remove(spec.id.as_str()) {
@@ -817,7 +797,7 @@ impl crate::backend::Backend for Fake {
         }
     }
 
-    fn uninstall(&self, snapshot: Artifact) -> Result<()> {
+    fn uninstall(&self, snapshot: Artifact, _reservation: &mut ()) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.confirm(&snapshot)?;
         state.entries.remove(snapshot.id().as_str());
@@ -836,13 +816,12 @@ impl crate::backend::Backend for Fake {
         Ok(())
     }
 
-    fn start(&self, snapshot: Artifact, budget: Budget) -> Result<()> {
+    fn start(&self, snapshot: Artifact, budget: Budget, _reservation: &mut ()) -> Result<()> {
         let id = snapshot.id();
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         // Recorded once the gate has passed, ahead of every check below: `calls` answers "was this
         // attempted", which is a different question from whether it succeeded or changed anything.
         state.calls.push(("start", id.as_str().to_string()));
-        state.asked("start", id);
         in_doubt(&state, id)?;
         let stalls = state.start_stalls.contains(id.as_str());
         let entry = state.confirm(&snapshot)?;
@@ -859,27 +838,6 @@ impl crate::backend::Backend for Fake {
         Ok(())
     }
 
-    /// Fails only once [`Fake::seed_prepare_fails`]ed. Makes nothing ready,
-    /// but records `steps`, and holds them live for [`Fake::guarded`] until
-    /// the guard drops.
-    fn prepare(&self, steps: &[Step], budget: Budget) -> Result<Prepared> {
-        let mut state = self.state.lock().expect("Fake mutex poisoned");
-        state.prepared.push((steps.to_vec(), budget));
-        if state.prepare_fails {
-            return Err(Error::Reservation {
-                id: None,
-                source: std::io::Error::other("injected test failure"),
-            });
-        }
-        let guard = state.next_guard;
-        state.next_guard += 1;
-        state.live.push((guard, steps.to_vec()));
-        Ok(Prepared::holding(Held {
-            store: Arc::clone(&self.state),
-            guard,
-        }))
-    }
-
     /// Only once [`Fake::seed_native_restart`]ed. Request-only, so it settles
     /// nothing, as for `start`.
     fn request_restart(&self) -> Option<NativeRestart<Self>> {
@@ -892,11 +850,10 @@ impl crate::backend::Backend for Fake {
     /// Models the strictest manager the contract allows, SCM's: a service
     /// still `Running` refuses the start, since the request-only `stop` before
     /// it settled nothing. Recorded as `start`, which is what it asks for.
-    fn request_start_after_stop(&self, snapshot: Artifact) -> Result<()> {
+    fn request_start_after_stop(&self, snapshot: Artifact, _reservation: &mut ()) -> Result<()> {
         let id = snapshot.id();
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.calls.push(("start", id.as_str().to_string()));
-        state.asked("start", id);
         in_doubt(&state, id)?;
         if state.confirm(&snapshot)?.state == State::Running {
             return Err(Error::os(
@@ -909,11 +866,10 @@ impl crate::backend::Backend for Fake {
         Ok(())
     }
 
-    fn stop(&self, snapshot: Artifact, budget: Budget) -> Result<()> {
+    fn stop(&self, snapshot: Artifact, budget: Budget, _reservation: &mut ()) -> Result<()> {
         let id = snapshot.id();
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.calls.push(("stop", id.as_str().to_string()));
-        state.asked("stop", id);
         lost(&state.stop_in_doubt, "stop", id)?;
         let stalls = state.stop_stalls.contains(id.as_str());
         let entry = state.confirm(&snapshot)?;
@@ -933,11 +889,10 @@ impl crate::backend::Backend for Fake {
 
     /// A running entry becomes [`State::Failed`], with no pid: the Fake models the kill and nothing
     /// of the restart policy that follows it. Any other state has no process to end.
-    fn kill(&self, snapshot: Artifact) -> Result<()> {
+    fn kill(&self, snapshot: Artifact, _reservation: &mut ()) -> Result<()> {
         let id = snapshot.id();
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.calls.push(("kill", id.as_str().to_string()));
-        state.asked("kill", id);
         let entry = state.confirm(&snapshot)?;
         if entry.state != State::Running {
             return Err(Error::NotRunning {

@@ -482,11 +482,13 @@ fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled
     );
 
     // The same steps `daemon restart` runs.
-    let _prepared = mgr
+    let mut sequence = mgr
         .prepare(&[Step::Stop, Step::Start], Budget::DEFAULT)
         .expect("prepare a restart");
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop for the restart");
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start for the restart");
+    sequence.stop(&spec.id, Budget::DEFAULT).expect("stop for the restart");
+    sequence
+        .start(&spec.id, Budget::DEFAULT)
+        .expect("start for the restart");
     reported.accept("the daemon of the restarted service to report in");
 
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");

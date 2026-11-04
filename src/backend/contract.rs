@@ -14,7 +14,7 @@
 use crate::blob::Blob;
 use crate::decide::ExternalConfig;
 use crate::error::{Error, Result};
-use crate::manager::{Budget, Installed, Prepared, ServiceManager, Status, Step, flow};
+use crate::manager::{Budget, Installed, Sequence, ServiceManager, Status, Step, flow};
 use crate::spec::{DaemonSpec, Id};
 
 // Backend =============================================================================================================
@@ -38,13 +38,23 @@ pub(crate) trait Backend {
     /// What `read` saw at a marked id; only this backend looks inside. Built only by `read` and
     /// `scan`.
     type Snapshot: InstalledService;
+    /// What an install needs before it reads anything that is not a [`Self::Reservation`].
     type InstallScope;
+    /// What the verbs that send requests draw on: the threads and temp files their requests are
+    /// watched with, made by [`Self::reserve`] before anything is sent. Handed to every verb that
+    /// draws, never ambient, so a verb that needs more than was counted for it is a miscount at the
+    /// draw.
+    type Reservation: 'static;
 
     // Primitives ------------------------------------------------------------------------------------------------------
 
     /// Everything an install needs before it reads anything, held until it ends: a version gate, a
     /// lock, the check that a manager can be asked. Fails before anything is read or written.
     fn begin_install(&self, spec: &DaemonSpec) -> Result<Self::InstallScope>;
+
+    /// Make ready, all or none, what each of `steps` can draw under `budget`, before the first of
+    /// them sends anything: a failure here means nothing was sent. See [`ServiceManager::prepare`].
+    fn reserve(&self, steps: &[Step], budget: Budget) -> Result<Self::Reservation>;
 
     /// `spec` in this manager's form. Fails where the platform cannot express it (an account that
     /// does not resolve).
@@ -67,6 +77,7 @@ pub(crate) trait Backend {
         outcome: &crate::decide::Outcome,
         snapshot: Option<&Self::Snapshot>,
         scope: &mut Self::InstallScope,
+        reservation: &mut Self::Reservation,
     ) -> Result<WriteOutcome>;
 
     /// The live state of a service `read` found marked. `Error::NotInstalled` where the query
@@ -84,7 +95,7 @@ pub(crate) trait Backend {
     // what the snapshot holds when it must (SCM's open handle keeps a deleted service alive).
 
     /// See [`ServiceManager::uninstall`].
-    fn uninstall(&self, snapshot: Self::Snapshot) -> Result<()>;
+    fn uninstall(&self, snapshot: Self::Snapshot, reservation: &mut Self::Reservation) -> Result<()>;
 
     /// See [`ServiceManager::enable`].
     fn enable(&self, snapshot: Self::Snapshot) -> Result<()>;
@@ -93,12 +104,7 @@ pub(crate) trait Backend {
     fn disable(&self, snapshot: Self::Snapshot) -> Result<()>;
 
     /// See [`ServiceManager::start`].
-    fn start(&self, snapshot: Self::Snapshot, budget: Budget) -> Result<()>;
-
-    /// See [`ServiceManager::prepare`].
-    fn prepare(&self, _steps: &[Step], _budget: Budget) -> Result<Prepared> {
-        Ok(Prepared::nothing())
-    }
+    fn start(&self, snapshot: Self::Snapshot, budget: Budget, reservation: &mut Self::Reservation) -> Result<()>;
 
     /// The manager's own restart for [`ServiceManager::request_restart`], where it has one. `None`
     /// where it has none, so that the gate is not run for a request that cannot be made.
@@ -107,13 +113,13 @@ pub(crate) trait Backend {
     }
 
     /// See [`ServiceManager::request_start_after_stop`].
-    fn request_start_after_stop(&self, snapshot: Self::Snapshot) -> Result<()>;
+    fn request_start_after_stop(&self, snapshot: Self::Snapshot, reservation: &mut Self::Reservation) -> Result<()>;
 
     /// See [`ServiceManager::stop`].
-    fn stop(&self, snapshot: Self::Snapshot, budget: Budget) -> Result<()>;
+    fn stop(&self, snapshot: Self::Snapshot, budget: Budget, reservation: &mut Self::Reservation) -> Result<()>;
 
     /// See [`ServiceManager::kill`].
-    fn kill(&self, snapshot: Self::Snapshot) -> Result<()>;
+    fn kill(&self, snapshot: Self::Snapshot, reservation: &mut Self::Reservation) -> Result<()>;
 }
 
 /// One [`Backend`]'s native restart of a service the gate passed.
@@ -221,7 +227,10 @@ impl<B: Backend> ServiceManager for B {
     }
 
     fn uninstall(&self, id: &Id) -> Result<()> {
-        Backend::uninstall(self, flow::owned(self, id)?)
+        let snapshot = flow::owned(self, id)?;
+        // `uninstall` has no `--timeout` of its own: its stop is unbounded.
+        let mut reservation = flow::reserved(self, id, Step::Uninstall, Budget::Unbounded)?;
+        Backend::uninstall(self, snapshot, &mut reservation)
     }
 
     fn enable(&self, id: &Id) -> Result<()> {
@@ -233,11 +242,16 @@ impl<B: Backend> ServiceManager for B {
     }
 
     fn start(&self, id: &Id, budget: Budget) -> Result<()> {
-        Backend::start(self, flow::owned(self, id)?, budget)
+        let snapshot = flow::owned(self, id)?;
+        let mut reservation = flow::reserved(self, id, Step::Start, budget)?;
+        Backend::start(self, snapshot, budget, &mut reservation)
     }
 
-    fn prepare(&self, steps: &[Step], budget: Budget) -> Result<Prepared> {
-        Backend::prepare(self, steps, budget)
+    fn prepare(&self, steps: &[Step], budget: Budget) -> Result<Box<dyn Sequence + '_>> {
+        Ok(Box::new(Reserved {
+            backend: self,
+            reservation: Backend::reserve(self, steps, budget)?,
+        }))
     }
 
     fn request_restart(&self, id: &Id) -> Option<Result<()>> {
@@ -246,15 +260,21 @@ impl<B: Backend> ServiceManager for B {
     }
 
     fn request_start_after_stop(&self, id: &Id) -> Result<()> {
-        Backend::request_start_after_stop(self, flow::owned(self, id)?)
+        let snapshot = flow::owned(self, id)?;
+        let mut reservation = flow::reserved(self, id, Step::RequestStartAfterStop, Budget::Immediate)?;
+        Backend::request_start_after_stop(self, snapshot, &mut reservation)
     }
 
     fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
-        Backend::stop(self, flow::owned(self, id)?, budget)
+        let snapshot = flow::owned(self, id)?;
+        let mut reservation = flow::reserved(self, id, Step::Stop, budget)?;
+        Backend::stop(self, snapshot, budget, &mut reservation)
     }
 
     fn kill(&self, id: &Id) -> Result<()> {
-        Backend::kill(self, flow::owned(self, id)?)
+        let snapshot = flow::owned(self, id)?;
+        let mut reservation = flow::reserved(self, id, Step::Kill, Budget::Unbounded)?;
+        Backend::kill(self, snapshot, &mut reservation)
     }
 
     fn status(&self, id: &Id) -> Result<Status> {
@@ -263,5 +283,38 @@ impl<B: Backend> ServiceManager for B {
 
     fn list(&self) -> Result<Vec<Installed>> {
         flow::list(self)
+    }
+}
+
+// Sequence ============================================================================================================
+
+/// [`ServiceManager::prepare`]'s sequence over a backend: the verbs the ownership gate lets through,
+/// each drawing on the reservation made for the sequence.
+struct Reserved<'a, B: Backend> {
+    backend: &'a B,
+    reservation: B::Reservation,
+}
+
+impl<B: Backend> Sequence for Reserved<'_, B> {
+    fn stop(&mut self, id: &Id, budget: Budget) -> Result<()> {
+        Backend::stop(
+            self.backend,
+            flow::owned(self.backend, id)?,
+            budget,
+            &mut self.reservation,
+        )
+    }
+
+    fn start(&mut self, id: &Id, budget: Budget) -> Result<()> {
+        Backend::start(
+            self.backend,
+            flow::owned(self.backend, id)?,
+            budget,
+            &mut self.reservation,
+        )
+    }
+
+    fn request_start_after_stop(&mut self, id: &Id) -> Result<()> {
+        Backend::request_start_after_stop(self.backend, flow::owned(self.backend, id)?, &mut self.reservation)
     }
 }

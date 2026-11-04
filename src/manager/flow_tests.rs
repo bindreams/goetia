@@ -3,7 +3,7 @@ use crate::decide::{self, ExternalConfig, Outcome};
 use crate::error::Error;
 use crate::manager::fake::fake_tests::mk;
 use crate::manager::fake::{Fake, generate};
-use crate::manager::{Installed, ServiceManager};
+use crate::manager::{Budget, Installed, ServiceManager, Step};
 use crate::spec::{DaemonSpec, Id, User};
 
 // Fixtures ============================================================================================================
@@ -33,12 +33,11 @@ fn install_retries_a_raced_write_until_it_lands() {
     assert_eq!(fake.writes(), 3, "two raced writes, then the one that landed");
     fake.status(&Id::try_from("frpc").unwrap())
         .expect("the artifact must be present");
-    let installs = fake
-        .guarded()
-        .into_iter()
-        .filter(|(verb, ..)| *verb == "install")
-        .count();
-    assert_eq!(installs, 1, "one install scope is held across every retry");
+    assert_eq!(
+        fake.prepared(),
+        [(vec![Step::Install], Budget::Unbounded)],
+        "one reservation is made for every retry"
+    );
 }
 
 #[skuld::test]
@@ -438,7 +437,7 @@ fn every_verb_on_an_id_that_is_not_ours_reports_why_and_performs_nothing() {
     }
 
     assert_eq!(fake.calls(), [], "no verb reached the backend");
-    assert!(fake.guarded().is_empty());
+    assert_eq!(fake.prepared(), [], "no verb reserved anything before the gate passed");
     assert_eq!(fake.writes(), 0);
     let after = fake.preview_install(&mk("stranger")).unwrap();
     assert!(matches!(after, Outcome::RefuseForeign { .. }), "{after:?}");

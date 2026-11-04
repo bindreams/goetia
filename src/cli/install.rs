@@ -11,7 +11,7 @@ use super::wait::WaitArgs;
 use crate::backend::Identity;
 use crate::decide::{self, Outcome};
 use crate::error::Result;
-use crate::manager::{Prepared, ServiceManager, Step};
+use crate::manager::{ServiceManager, Step};
 use crate::spec::{AccountId, DaemonSpec, Id, User};
 
 #[derive(ClapArgs, Debug)]
@@ -83,17 +83,18 @@ pub fn run(
     // Each step (install, `--enable`, `--start`) contributes at most one code; see `ExitCode` for which wins.
     let mut codes: Vec<ExitCode> = Vec::new();
     // Before the install sends anything, so that nothing the start needs
-    // can run out after the install booted a loaded job out.
-    let _prepared = if args.start {
-        match mgr.prepare(&[Step::Install, Step::Start], args.wait.budget()) {
-            Ok(prepared) => prepared,
-            Err(e) => {
-                let _ = writeln!(err, "error: {}: {}", spec.id, e.report());
-                return ExitCode::of(&e);
-            }
+    // can run out after the install booted a loaded job out. The install
+    // reserves for itself.
+    let mut sequence = match args
+        .start
+        .then(|| mgr.prepare(&[Step::Start], args.wait.budget()))
+        .transpose()
+    {
+        Ok(sequence) => sequence,
+        Err(e) => {
+            let _ = writeln!(err, "error: {}: {}", spec.id, e.report());
+            return ExitCode::of(&e);
         }
-    } else {
-        Prepared::nothing()
     };
     match mgr.install(&spec, args.force) {
         Ok(outcome) => {
@@ -112,8 +113,8 @@ pub fn run(
                     codes.push(ExitCode::of(&e));
                 }
             }
-            if args.start {
-                if let Err(e) = mgr.start(&spec.id, args.wait.budget()) {
+            if let Some(sequence) = sequence.as_mut() {
+                if let Err(e) = sequence.start(&spec.id, args.wait.budget()) {
                     let _ = writeln!(err, "error: {}: start: {}", spec.id, e.report());
                     codes.push(ExitCode::of(&e));
                 }

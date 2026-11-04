@@ -7,9 +7,14 @@ use std::time::Duration;
 use super::*;
 use crate::manager::budget::Budget;
 
+/// A reservation holding the temp files one child's streams draw.
+fn files() -> Reservation {
+    Reservation::make(0, STREAMS).unwrap()
+}
+
 /// `cmd`, spawned under `role`.
 fn spawned(mut cmd: cosca::Command, role: Role) -> Spawned {
-    spawn(&mut cmd, role).unwrap()
+    spawn(&mut cmd, role, &mut files()).unwrap()
 }
 
 /// `/bin/sh -c <script>`, as [`command`] builds it.
@@ -481,16 +486,26 @@ fn marks(marker: &std::path::Path) -> cosca::Command {
 
 /// Whatever a role's output needs is made before the child is spawned, and a failure to make it
 /// means the child never ran: never a panic, and never a request out with nothing to watch it.
-/// Each allowance fails a different one: the stdout file, the stderr file, the stderr thread.
+/// Each allowance fails a different one: an uncounted read's stdout and stderr files, an announced
+/// request's stderr and stdout threads. A counted read or request has its files before it is
+/// spawned: see [`a_reservation_is_made_whole_or_not_at_all`].
 #[skuld::test]
 fn a_child_whose_output_nothing_could_take_is_never_run() {
     type Allowance = fn() -> test_hook::Allowance;
     type Case = (&'static str, fn() -> Role, Allowance, &'static str);
-    let cases: [Case; 6] = [
-        ("query stdout", || Role::Query, || test_hook::temp_files(0), "temp file"),
-        ("query stderr", || Role::Query, || test_hook::temp_files(1), "temp file"),
-        ("request stdout", request, || test_hook::temp_files(0), "temp file"),
-        ("request stderr", request, || test_hook::temp_files(1), "temp file"),
+    let cases: [Case; 4] = [
+        (
+            "uncounted stdout",
+            || Role::UncountedQuery,
+            || test_hook::temp_files(0),
+            "temp file",
+        ),
+        (
+            "uncounted stderr",
+            || Role::UncountedQuery,
+            || test_hook::temp_files(1),
+            "temp file",
+        ),
         (
             "announced stdout",
             || Role::AnnouncedRequest(announced),
@@ -511,7 +526,9 @@ fn a_child_whose_output_nothing_could_take_is_never_run() {
         let _short = allowance();
         let spawns = test_hook::spawns();
 
-        let e = spawn(&mut marks(&marker), role).err().expect(case);
+        let e = spawn(&mut marks(&marker), role, &mut Reservation::default())
+            .err()
+            .expect(case);
 
         assert!(e.to_string().contains(&format!("no {what} ")), "{case}: {e}");
         assert!(e.to_string().contains("so it was not run"), "{case}: {e}");
@@ -525,13 +542,13 @@ fn a_child_whose_output_nothing_could_take_is_never_run() {
 #[skuld::test]
 fn an_announced_request_needs_no_temp_file() {
     let _no_file = test_hook::temp_files(0);
-    let finished = wait_bounded(
-        spawned(
-            sh("echo out; echo 'request issued' >&2"),
-            Role::AnnouncedRequest(announced),
-        ),
-        Budget::Unbounded.start(),
-    );
+    let spawned = spawn(
+        &mut sh("echo out; echo 'request issued' >&2"),
+        Role::AnnouncedRequest(announced),
+        &mut Reservation::default(),
+    )
+    .unwrap();
+    let finished = wait_bounded(spawned, Budget::Unbounded.start());
     match finished {
         Ok(Finished::Exited { capture, .. }) => {
             assert_eq!(capture.stdout, b"out\n");
@@ -540,10 +557,6 @@ fn an_announced_request_needs_no_temp_file() {
         }
         other => panic!("expected Exited, got {other:?}"),
     }
-}
-
-fn request() -> Role {
-    Role::Request(Reaper::with(cosca::Child::wait, |_| {}).unwrap())
 }
 
 /// A spawn that failed is placed before the child ran only when cosca's error says so: an `Io`
@@ -602,7 +615,7 @@ fn a_failed_spawn_is_not_run_only_on_evidence() {
     ];
     for (case, error, may_have_run) in cases {
         test_hook::spawn_fails(error);
-        match spawn(&mut sh("true"), Role::Query) {
+        match spawn(&mut sh("true"), Role::Query, &mut files()) {
             Err(SpawnError::MayHaveRun(_)) => assert!(may_have_run, "{case}: placed after exec"),
             Err(SpawnError::NotRun(_)) => assert!(!may_have_run, "{case}: placed before exec"),
             Ok(_) => panic!("{case}: the injected failure was not returned"),
@@ -610,204 +623,185 @@ fn a_failed_spawn_is_not_run_only_on_evidence() {
     }
 }
 
-/// A sequence's spares are what its children's output is given, so nothing need be made for them.
-#[skuld::test]
-fn a_child_takes_its_output_from_the_spares() {
-    let spares = spare(Needs {
-        listeners: 2,
-        files: 2,
-        ..Needs::default()
-    })
-    .unwrap();
-    let _no_thread = test_hook::threads(0);
-    let _no_file = test_hook::temp_files(0);
-
-    for role in [Role::AnnouncedRequest(announced), Role::Query] {
-        let finished = wait_bounded(
-            spawned(sh("echo 'request issued' >&2"), role),
-            Budget::Unbounded.start(),
-        );
-        assert!(matches!(finished, Ok(Finished::Exited { .. })), "{finished:?}");
-    }
-    assert_eq!(test_hook::pooled(), Needs::default(), "the spares are spent");
-    drop(spares);
-}
-
-fn files(n: usize) -> Needs {
-    Needs {
-        files: n,
-        ..Needs::default()
-    }
-}
+// Reservation =========================================================================================================
 
 /// Whether `f` panics — the debug assertion every build of the test suites carries.
 fn panics(f: impl FnOnce()) -> bool {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err()
 }
 
-/// While a reservation is live on this thread, everything its verbs need was to have been made in
-/// it: a thread or file made on the spot instead means one needed more than was counted, and fails
-/// loudly — every way one is made. With none live, making on the spot is how a lone verb gets what
-/// it needs.
+/// A reservation is the whole of what a child draws: its files are taken from the reservation it is
+/// handed, so nothing need be made for them, and a spawn leaves what it did not take.
 #[skuld::test]
-fn making_on_the_spot_inside_a_reservation_is_loud() {
-    let spent = || spare(Needs::default()).unwrap();
-    assert!(panics(|| drop((spent(), spares::file()))), "a temp file");
-    assert!(panics(|| drop((spent(), spares::listener()))), "a listener");
-    assert!(panics(|| drop((spent(), reapers::<1>()))), "a reaper");
-    assert!(
-        panics(|| drop((spent(), top_up(files(1))))),
-        "a top-up that falls short"
-    );
+fn a_child_takes_its_output_from_the_reservation_it_is_handed() {
+    let mut reservation = Reservation::make(0, 3 * STREAMS).unwrap();
+    let _no_file = test_hook::temp_files(0);
 
-    drop(spares::file().expect("no reservation is live"));
-    drop(reapers::<1>().expect("no reservation is live"));
-    drop(top_up(files(1)).expect("no reservation is live"));
+    for role in [Role::Query, Role::Query] {
+        let mut cmd = sh("echo hi");
+        let finished = wait_bounded(
+            spawn(&mut cmd, role, &mut reservation).unwrap(),
+            Budget::Unbounded.start(),
+        );
+        assert!(
+            matches!(&finished, Ok(Finished::Exited { capture, .. }) if capture.stdout == b"hi\n"),
+            "{finished:?}"
+        );
+    }
+
+    assert_eq!(test_hook::left(&reservation), (0, STREAMS));
 }
 
-/// A read no verb counted — launchd's `status` and `list`, which a library caller may run while it
-/// holds a preparation — makes its own files on the spot: inside a reservation with spares left, or
-/// one already spent, it draws nothing from the pool and trips no assertion. A file it cannot make
-/// fails it before it runs, and leaves the pool as it was.
+/// A reservation hands out what it made: each reaper and file, with nothing made meanwhile.
+#[skuld::test]
+fn a_reservation_hands_out_what_it_made() {
+    let mut reservation = Reservation::make(2, 2).unwrap();
+    let _no_thread = test_hook::threads(0);
+    let _no_file = test_hook::temp_files(0);
+
+    drop((reservation.reaper().unwrap(), reservation.reaper().unwrap()));
+    drop((reservation.file().unwrap(), reservation.file().unwrap()));
+
+    assert_eq!(test_hook::left(&reservation), (0, 0));
+}
+
+/// A reservation is made whole or not at all, so a verb whose last request could have no reaper
+/// never sends its first: `make` fails as a whole when any one thread or file cannot be made.
+#[skuld::test]
+fn a_reservation_is_made_whole_or_not_at_all() {
+    type Case = (&'static str, fn() -> test_hook::Allowance, (usize, usize), &'static str);
+    let cases: [Case; 4] = [
+        ("third reaper", || test_hook::threads(2), (3, 0), "no thread"),
+        ("first reaper", || test_hook::threads(0), (1, 2), "no thread"),
+        ("second file", || test_hook::temp_files(1), (0, 2), "no temp file"),
+        (
+            "file after the reapers",
+            || test_hook::temp_files(0),
+            (1, 1),
+            "no temp file",
+        ),
+    ];
+    for (case, allowance, (reapers, files), what) in cases {
+        let _short = allowance();
+
+        let e = Reservation::make(reapers, files).expect_err(case);
+
+        assert!(e.to_string().contains(what), "{case}: {e}");
+    }
+}
+
+/// A draw past what the reservation made is a miscount: loud in every debug build, the test
+/// suites' included, so an undercount fails them.
+#[skuld::test]
+fn a_draw_past_the_reservation_is_loud() {
+    assert!(panics(|| drop(Reservation::default().reaper())), "a reaper");
+    assert!(panics(|| drop(Reservation::default().file())), "a temp file");
+    assert!(
+        panics(|| drop(spawn(
+            &mut sh("true"),
+            Role::Query,
+            &mut Reservation::make(0, 1).unwrap()
+        ))),
+        "the second stream's file"
+    );
+}
+
+/// A read no verb counted — launchd's `status` and `list` — makes its own files on the spot,
+/// whatever it is handed: it draws nothing from the reservation, trips no assertion, and a file it
+/// cannot make fails it before it runs.
 #[skuld::test]
 fn an_uncounted_query_never_draws_on_a_reservation() {
-    for spares_left in [2, 0] {
-        let _reserved = spare(files(spares_left)).unwrap();
-        let pooled = test_hook::pooled();
+    for files_left in [STREAMS, 0] {
+        let mut reservation = Reservation::make(0, files_left).unwrap();
 
-        let finished = wait_bounded(spawned(sh("echo hi"), Role::UncountedQuery), Budget::Unbounded.start()).unwrap();
+        let mut cmd = sh("echo hi");
+        let spawned = spawn(&mut cmd, Role::UncountedQuery, &mut reservation).unwrap();
+        let finished = wait_bounded(spawned, Budget::Unbounded.start()).unwrap();
+
         assert!(
             matches!(&finished, Finished::Exited { capture, .. } if capture.stdout == b"hi\n"),
-            "{spares_left}: {finished:?}"
+            "{files_left}: {finished:?}"
         );
         assert_eq!(
-            test_hook::pooled(),
-            pooled,
-            "{spares_left}: the read drew on the reservation"
-        );
-
-        let _no_file = test_hook::temp_files(0);
-        let spawns = test_hook::spawns();
-        match spawn(&mut sh("true"), Role::UncountedQuery) {
-            Err(SpawnError::NotRun(e)) => assert!(e.to_string().contains("temp file"), "{e}"),
-            other => panic!("{spares_left}: {:?}", other.map(|_| "spawned")),
-        }
-        assert_eq!(test_hook::spawns(), spawns, "{spares_left}: the read ran");
-        assert_eq!(
-            test_hook::pooled(),
-            pooled,
-            "{spares_left}: the failed read touched the pool"
+            test_hook::left(&reservation),
+            (0, files_left),
+            "{files_left}: the read drew on the reservation"
         );
     }
 }
 
 // Spares ==============================================================================================================
 
-fn reapers_only(n: usize) -> Needs {
-    Needs {
-        reapers: n,
-        ..Needs::default()
-    }
-}
-
-/// A verb's reapers are all made before any is handed out, so a verb whose third request could have
-/// none never sends its first.
+/// A sequence's spares are what its announced requests' threads are taken from, so nothing need be
+/// made for them.
 #[skuld::test]
-fn reapers_are_all_made_or_none_are() {
-    let _only_two = test_hook::threads(2);
+fn an_announced_request_takes_its_threads_from_the_spares() {
+    let spares = spare(2).unwrap();
+    let _no_thread = test_hook::threads(0);
 
-    let made = reapers::<3>();
+    let finished = wait_bounded(
+        spawned(sh("echo 'request issued' >&2"), Role::AnnouncedRequest(announced)),
+        Budget::Unbounded.start(),
+    );
 
-    let e = made.expect_err("a third reaper could not be made");
-    assert!(e.to_string().contains("no thread may be made"), "{e}");
-}
-
-/// A sequence's spares are taken before anything is made: its later verbs need no new thread, so
-/// cannot fail for want of one after an earlier verb has sent something.
-#[skuld::test]
-fn spares_are_taken_before_any_reaper_is_made() {
-    let spares = spare(reapers_only(3)).unwrap();
-    let _none = test_hook::threads(0);
-
-    assert!(reapers::<1>().is_ok(), "the stop's reaper is a spare");
-    assert!(reapers::<2>().is_ok(), "the start's reapers are spares");
-    assert_eq!(test_hook::pooled(), Needs::default(), "the spares are spent");
+    assert!(matches!(finished, Ok(Finished::Exited { .. })), "{finished:?}");
+    assert_eq!(test_hook::pooled(), 0, "the spares are spent");
     drop(spares);
+}
+
+/// While a reservation is live on this thread, everything its verbs need was to have been made in
+/// it: a listener made on the spot instead means one needed more than was counted, and fails
+/// loudly. With none live, making on the spot is how a lone verb gets what it needs.
+#[skuld::test]
+fn making_a_listener_on_the_spot_inside_a_reservation_is_loud() {
+    assert!(panics(|| drop((spare(0).unwrap(), spares::listener()))));
+
+    drop(spares::listener().expect("no reservation is live"));
 }
 
 /// Sparing is all or nothing: a guard that could not make everything leaves nothing behind.
 #[skuld::test]
 fn a_spare_that_cannot_be_made_whole_spares_nothing() {
     {
-        let _no_file = test_hook::temp_files(0);
-        let e = spare(Needs {
-            reapers: 1,
-            files: 1,
-            ..Needs::default()
-        })
-        .expect_err("no file may be made");
-        assert!(e.to_string().contains("no temp file may be made"), "{e}");
+        let _one = test_hook::threads(1);
+        let e = spare(2).expect_err("a second thread may not be made");
+        assert!(e.to_string().contains("no thread may be made"), "{e}");
     }
     assert_eq!(
         test_hook::pooled(),
-        Needs::default(),
-        "the reaper made before the failure was pooled"
+        0,
+        "the listener made before the failure was pooled"
     );
-}
-
-/// Topping up makes only what the pool lacks: a verb inside a prepared sequence makes nothing, and
-/// a lone verb makes all it needs.
-#[skuld::test]
-fn a_top_up_makes_only_what_the_pool_lacks() {
-    let prepared = spare(files(4)).unwrap();
-    let _no_file = test_hook::temp_files(0);
-    drop(top_up(files(4)).expect("the pool holds four"));
-    drop(prepared);
-
-    let _four = test_hook::temp_files(4);
-    let lone = top_up(files(4)).expect("four may be made");
-    assert_eq!(test_hook::pooled(), files(4));
-    drop(lone);
 }
 
 /// Dropping the guard drops what it left: nothing lingers for a later, unrelated verb.
 #[skuld::test]
 fn spares_are_released_with_their_guard() {
-    drop(spare(reapers_only(2)).unwrap());
+    drop(spare(2).unwrap());
     let _none = test_hook::threads(0);
 
-    assert!(reapers::<1>().is_err(), "a released spare was still handed out");
+    assert!(spares::listener().is_err(), "a released spare was still handed out");
 }
 
 /// A guard releases only the spares it made: an inner one dropped first leaves the outer one's for
 /// the verbs the outer one still covers.
 #[skuld::test]
 fn an_inner_guard_releases_only_its_own_spares() {
-    let outer = spare(reapers_only(2)).unwrap();
-    drop(spare(reapers_only(1)).unwrap());
-    let _none = test_hook::threads(0);
+    let outer = spare(2).unwrap();
+    drop(spare(1).unwrap());
 
-    assert_eq!(
-        test_hook::pooled(),
-        reapers_only(2),
-        "only the inner guard's spare goes with it"
-    );
+    assert_eq!(test_hook::pooled(), 2, "only the inner guard's spare goes with it");
     drop(outer);
 }
 
 /// Guards may also end out of order: dropping the outer one first leaves the inner one's spares.
 #[skuld::test]
 fn an_outer_guard_dropped_first_leaves_the_inner_guards_spares() {
-    let outer = spare(reapers_only(2)).unwrap();
-    let inner = spare(reapers_only(1)).unwrap();
+    let outer = spare(2).unwrap();
+    let inner = spare(1).unwrap();
     drop(outer);
-    let _none = test_hook::threads(0);
 
-    assert_eq!(
-        test_hook::pooled(),
-        reapers_only(1),
-        "only the outer guard's spares go with it"
-    );
+    assert_eq!(test_hook::pooled(), 1, "only the outer guard's spares go with it");
     drop(inner);
 }
 
