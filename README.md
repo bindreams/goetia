@@ -1011,8 +1011,9 @@ When more than one outcome applies in the same run, the winner is:
 **This is a rule about which outcome wins, not an ordering of the
 integers** — `5` outranks `3` despite being the larger number, and `1`
 outranks `4` despite being the smaller. The precedence is the declaration
-order of `ExitCode`. Never take `max()` over the integers. `2` never enters the ladder: the refusals that produce it always
-happen alone, before anything else could occur in the same run.
+order of `ExitCode`. Never take `max()` over the integers. `2` never
+enters the ladder: the refusals that produce it always happen alone,
+before anything else could occur in the same run.
 
 **Indeterminate outranks conflict** on purpose. A script that branches on
 conflict re-runs with `--force`, and forcing on an incomplete picture is

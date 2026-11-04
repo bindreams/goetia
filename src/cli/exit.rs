@@ -5,8 +5,8 @@ use crate::error::Error;
 /// The process exit code, named as in the README's exit-code table.
 ///
 /// Declared in precedence order, so `max()` combines the codes of several ids or steps: `Error` beats
-/// `Indeterminate`, which beats `Conflict`, `Drift` and `Success`. `Error` outranks `Conflict` because `5`
-/// promises that every failure in the run is force-resolvable, and an error alongside breaks that promise.
+/// `Indeterminate`, which beats `Conflict`, `Drift` and `Success`. `Usage` never combines with
+/// another code; it is declared last only so the order is total.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ExitCode {
     Success,
