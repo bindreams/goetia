@@ -78,6 +78,82 @@ fn real_expires_on_a_spent_deadline() {
     assert!(matches!(finished, Finished::Expired), "{finished:?}");
 }
 
+// Real, failures ------------------------------------------------------------------------------------------------------
+
+const ISSUED: &[u8] = b"request issued";
+
+fn announced(stderr: &[u8]) -> bool {
+    stderr.windows(ISSUED.len()).any(|w| w == ISSUED)
+}
+
+/// A spawn that fails before the child ran says so, and one that may have run it says that: which
+/// of the two is what a caller sending a request must not confuse. The cases are `bounded`'s own
+/// for each side of `exec`.
+#[skuld::test]
+fn real_tells_a_spawn_that_failed_before_exec_from_one_that_may_have_run() {
+    type Case = (&'static str, fn() -> cosca::error::Error, bool);
+    let cases: [Case; 4] = [
+        (
+            "fork: EAGAIN",
+            || std::io::Error::from_raw_os_error(libc::EAGAIN).into(),
+            false,
+        ),
+        (
+            "exec: ENOENT",
+            || std::io::Error::from_raw_os_error(libc::ENOENT).into(),
+            false,
+        ),
+        (
+            "SharedChild::new: ECHILD",
+            || std::io::Error::from_raw_os_error(libc::ECHILD).into(),
+            true,
+        ),
+        (
+            "attach",
+            || cosca::error::Error::Containment {
+                detail: "forced".into(),
+            },
+            true,
+        ),
+    ];
+    for (case, error, may_have_run) in cases {
+        bounded::test_hook::spawn_fails(error);
+        match sh("true").run(&[], under_deadline()) {
+            Err(ClientError::MayHaveRun(_)) => assert!(may_have_run, "{case}: placed after exec"),
+            Err(ClientError::NotRun(_)) => assert!(!may_have_run, "{case}: placed before exec"),
+            other => panic!("{case}: the injected failure was not mapped to a spawn error: {other:?}"),
+        }
+    }
+}
+
+/// A wait that fails leaves the child lost, and `announced` is whether it had said the manager has
+/// its request: true only for the role that listens, and only if the child said it before the loss.
+#[skuld::test]
+fn real_loses_a_child_and_says_whether_it_announced() {
+    for (script, role, expected) in [
+        (
+            "echo 'request issued' >&2; exec sleep 2147483647",
+            Role::AnnouncedRequest(announced),
+            true,
+        ),
+        ("exit 0", Role::AnnouncedRequest(announced), false),
+        ("echo 'request issued' >&2; exit 0", Role::Query, false),
+    ] {
+        bounded::test_hook::wait_fails(|| std::io::Error::other("the wait failed").into());
+        let wait = Wait::Bounded {
+            role,
+            deadline: Budget::Unbounded.start(),
+        };
+        match sh(script).run(&[], wait) {
+            Err(ClientError::Lost { error, announced }) => {
+                assert_eq!(announced, expected, "{script}");
+                assert!(error.to_string().contains("the wait failed"), "{script}: {error:?}");
+            }
+            other => panic!("{script}: expected the child to be lost: {other:?}"),
+        }
+    }
+}
+
 // Fake ================================================================================================================
 
 #[skuld::test]

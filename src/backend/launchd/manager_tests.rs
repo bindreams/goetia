@@ -922,7 +922,7 @@ fn never_installed() -> Id {
 
 /// A marked plist for `id` that no file backs, as the ownership gate would hand a verb. A verb that
 /// gets past its reapers and temp files makes its first `launchctl` call, so these tests run it
-/// over a `launchctl` that refuses every call ([`launchd_refusing`]), and touch nothing on the host.
+/// over a `launchctl` that refuses every call (`over_sh(&[])`), and touch nothing on the host.
 fn marked_plist(id: &Id) -> Plist {
     let text = sample_plist(id.as_str());
     let blob = generate::extract(&text)
@@ -952,7 +952,7 @@ fn refused_for_want_of_a_reaper<T: std::fmt::Debug>(result: &Result<T>) -> bool 
 fn a_verb_one_reaper_short_sends_nothing() {
     use crate::backend::Backend;
 
-    let mgr = launchd_refusing();
+    let (mgr, _refused) = over_sh(&[]);
     let id = never_installed();
     let spec = DaemonSpec {
         id: id.clone(),
@@ -992,14 +992,14 @@ fn a_verb_one_reaper_short_sends_nothing() {
     assert!(refused_for_want_of_a_reaper(&mgr.install(&spec, false)));
 }
 
-/// With every reaper made, the same verbs go on to their first `launchctl` call, which [`launchd_refusing`]
+/// With every reaper made, the same verbs go on to their first `launchctl` call, which `over_sh(&[])`
 /// refuses.
 #[skuld::test]
 fn a_verb_with_its_reapers_goes_on_to_its_first_call() {
     use crate::backend::Backend;
 
     let id = never_installed();
-    let mgr = launchd_refusing();
+    let (mgr, _refused) = over_sh(&[]);
     let _five = bounded::test_hook::threads(START_REQUESTS);
     assert!(!refused_for_want_of_a_reaper(&Backend::start(
         &mgr,
@@ -1028,7 +1028,7 @@ fn refused_for_want_of_a_file<T: std::fmt::Debug>(result: &Result<T>) -> bool {
 fn a_verb_one_temp_file_short_sends_nothing() {
     use crate::backend::Backend;
 
-    let mgr = launchd_refusing();
+    let (mgr, _refused) = over_sh(&[]);
     let id = never_installed();
     let spec = DaemonSpec {
         id: id.clone(),
@@ -1086,7 +1086,7 @@ fn prepared_steps_need_nothing_made_later() {
     use crate::backend::Backend;
 
     let id = never_installed();
-    let mgr = launchd_refusing();
+    let (mgr, _refused) = over_sh(&[]);
     for (steps, reapers, calls) in [
         (
             [Step::Stop, Step::Start],
@@ -1122,7 +1122,7 @@ fn prepared_steps_need_nothing_made_later() {
         } else {
             Backend::uninstall(&mgr, marked_plist(&id))
         };
-        assert!(first.is_err(), "{steps:?}: the stand-in refuses every call");
+        assert!(first.is_err(), "{steps:?}: `over_sh(&[])` refuses every call");
         assert!(!refused_for_want_of_a_reaper(&first), "{steps:?}");
         assert!(!refused_for_want_of_a_file(&first), "{steps:?}");
         let started = Backend::start(&mgr, marked_plist(&id), Budget::DEFAULT);
@@ -1341,22 +1341,6 @@ impl OverSh {
             .collect();
         assert_eq!(made, self.expected, "{what}: the calls made");
     }
-}
-
-/// A launchd whose `launchctl` is a real child that refuses every call: for a test of what a verb draws
-/// from its reservation before its first call, or by making it.
-fn launchd_refusing() -> Launchd {
-    launchd_over(Real::new(
-        [
-            "/bin/sh",
-            "-c",
-            "echo 'unscripted launchctl call' >&2; exit 99",
-            "launchctl",
-        ]
-        .map(String::from)
-        .to_vec(),
-        |_| {},
-    ))
 }
 
 /// Removes the plists a test's install wrote, if a failure left them.

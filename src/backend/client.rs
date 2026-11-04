@@ -1,6 +1,6 @@
 //! A service manager's command-line client (`launchctl`, and `systemctl` once it moves here) as the
 //! backends reach it: one trait, [`Client`], real over [`bounded`] and `cosca` ([`Real`]) and, in
-//! tests, a table of stated replies ([`fake::Fake`]).
+//! tests, a table of stated replies (`fake::Fake`).
 //!
 //! A backend decides what a reply means; the client only runs the program and says how it ended.
 
