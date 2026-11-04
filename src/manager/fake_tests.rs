@@ -7,7 +7,7 @@ use crate::spec::{Id, Kind, Restart};
 
 // Fixtures ============================================================================================================
 
-pub(in crate::manager) fn mk(id: &str) -> DaemonSpec {
+pub(crate) fn mk(id: &str) -> DaemonSpec {
     DaemonSpec {
         restart: Restart::OnFailure,
         kind: Kind::Simple,

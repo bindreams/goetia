@@ -6,8 +6,9 @@ use super::{
 };
 use crate::error::{Error, Result};
 use crate::manager::fake::Fake;
+use crate::manager::fake::fake_tests::mk;
 use crate::manager::{Budget, ServiceManager};
-use crate::spec::{DaemonSpec, Id, Kind, Restart};
+use crate::spec::Id;
 
 const THIRTY: Budget = Budget::Bounded(Duration::from_secs(30));
 
@@ -54,14 +55,6 @@ fn a_stop_leg_whose_bounded_budget_is_spent_still_gets_a_bound() {
 }
 
 // deadline threading ==================================================================================================
-
-fn mk(id: &str) -> DaemonSpec {
-    DaemonSpec {
-        restart: Restart::OnFailure,
-        kind: Kind::Simple,
-        ..DaemonSpec::for_test(id, vec!["daemon".to_owned()])
-    }
-}
 
 /// How many deadlines `daemon restart --no-timeout <ids>` derives against a
 /// `Fake` where every id is installed and every leg succeeds.
