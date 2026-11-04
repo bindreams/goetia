@@ -11,9 +11,10 @@ use std::collections::BTreeMap;
 use goetia::backend::scm::exit_status::{ERROR_INVALID_DATA, RecordedExit};
 use goetia::backend::scm::manager::Scm;
 use goetia::manager::{Budget, ServiceManager as _};
+use goetia::spec::{DaemonSpec, Restart};
 use windows_service::service::{ServiceExitCode, ServiceState};
 
-use crate::common::{fallback_log, fixture_command, mk_spec_full, recorded_exit, scm_status};
+use crate::common::{fallback_log, fixture_command, recorded_exit, scm_status, simple_spec};
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -26,15 +27,14 @@ fn shim_runs_child_with_cwd_and_env() {
 
     let mut env = BTreeMap::new();
     env.insert("GOETIA_SHIM_ENV_PROBE".to_string(), "probe-value".to_string());
-    let spec = mk_spec_full(
-        &id,
-        fixture_command("cwd-env", &[&reported.port().to_string(), "GOETIA_SHIM_ENV_PROBE"]),
-        Some(tmp.path().to_path_buf()),
+    let spec = DaemonSpec {
+        cwd: Some(tmp.path().to_path_buf()),
         env,
-        goetia::spec::Restart::Never,
-        None,
-        None,
-    );
+        ..simple_spec(
+            &id,
+            fixture_command("cwd-env", &[&reported.port().to_string(), "GOETIA_SHIM_ENV_PROBE"]),
+        )
+    };
     mgr.install(&spec, false).expect("install");
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
 
@@ -66,15 +66,13 @@ fn shim_captures_stdout_to_logs_path() {
     let log_path = tmp.path().join("daemon.log");
     const MARKER: &str = "goetia-shim-log-capture-probe";
 
-    let spec = mk_spec_full(
-        &id,
-        fixture_command("write-log", &[&reported.port().to_string(), MARKER]),
-        None,
-        BTreeMap::new(),
-        goetia::spec::Restart::Never,
-        None,
-        Some(log_path.clone()),
-    );
+    let spec = DaemonSpec {
+        logs: Some(log_path.clone()),
+        ..simple_spec(
+            &id,
+            fixture_command("write-log", &[&reported.port().to_string(), MARKER]),
+        )
+    };
     mgr.install(&spec, false).expect("install");
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     reported.accept("the fixture to finish writing its log lines");
@@ -98,21 +96,19 @@ fn stop_kills_the_whole_process_tree() {
     let child_reported = ConnectBack::listen();
     let grandchild_reported = ConnectBack::listen();
 
-    let spec = mk_spec_full(
-        &id,
-        fixture_command(
-            "spawn-grandchild",
-            &[
-                &child_reported.port().to_string(),
-                &grandchild_reported.port().to_string(),
-            ],
-        ),
-        None,
-        BTreeMap::new(),
-        goetia::spec::Restart::OnFailure,
-        None,
-        None,
-    );
+    let spec = DaemonSpec {
+        restart: Restart::OnFailure,
+        ..simple_spec(
+            &id,
+            fixture_command(
+                "spawn-grandchild",
+                &[
+                    &child_reported.port().to_string(),
+                    &grandchild_reported.port().to_string(),
+                ],
+            ),
+        )
+    };
     mgr.install(&spec, false).expect("install");
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     let child_pid = child_reported.accept_line("the direct child to start and report its pid");
@@ -161,15 +157,7 @@ fn unreadable_blob_logs_to_fallback_path_and_event_log() {
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
 
-    let spec = mk_spec_full(
-        &id,
-        fixture_command("report", &["1"]),
-        None,
-        BTreeMap::new(),
-        goetia::spec::Restart::Never,
-        None,
-        None,
-    );
+    let spec = simple_spec(&id, fixture_command("report", &["1"]));
     mgr.install(&spec, false).expect("install");
 
     corrupt_spec_value(&id);
