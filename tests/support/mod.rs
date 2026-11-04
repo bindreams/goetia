@@ -70,6 +70,16 @@ pub fn random_test_id() -> String {
     format!("goetia-test-{:016x}", rand::rng().random::<u64>())
 }
 
+/// `s` as NUL-terminated UTF-16, for the wide Win32 entry points.
+#[cfg(windows)]
+pub fn wide_null(s: &str) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt as _;
+    std::ffi::OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
 /// Base64 the size of a worst-case spec blob. systemd historically applied a
 /// 2048-byte `LINE_MAX` to unit-file lines and truncated past it, and `Spec=`
 /// is a single line whose length grows with `env` — so a token-sized value

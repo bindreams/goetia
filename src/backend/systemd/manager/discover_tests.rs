@@ -507,7 +507,7 @@ fn a_read_fragment_is_foreign_unless_it_carries_the_marker() {
 /// nothing is applied from outside.
 #[skuld::test]
 fn an_id_with_no_dropin_installs_as_its_fragment_alone() {
-    let id = super::super::test_id();
+    let id = crate::manager::conformance::fresh_id("systemd");
     let text = unit_text();
 
     let read = installed(&id, &text).expect("no drop-in directory to read");

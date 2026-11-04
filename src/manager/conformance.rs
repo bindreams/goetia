@@ -144,7 +144,7 @@ pub fn run(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
 /// call to collide with.
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn fresh_id(label: &str) -> String {
+pub(crate) fn fresh_id(label: &str) -> String {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("goetia-conformance-{label}-{pid:x}-{n:x}", pid = std::process::id())
 }

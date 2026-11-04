@@ -500,18 +500,6 @@ fn io_err(op: &str, path: &Path, source: io::Error) -> Error {
     Error::Other(format!("failed to {op} {}: {source}", path.display()))
 }
 
-// Test-only id generator, mirroring `manager::conformance`'s: unique enough for a single test binary
-// run given `manager_tests.rs`'s own RAII cleanup, without pulling in a dev-only randomness crate for
-// a plain library unit test.
-#[cfg(test)]
-static TEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-#[cfg(test)]
-fn test_id() -> String {
-    let n = TEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("goetia-test-{pid:x}-{n:x}", pid = std::process::id())
-}
-
 #[cfg(test)]
 #[path = "manager_tests.rs"]
 mod manager_tests;

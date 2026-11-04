@@ -35,6 +35,8 @@ use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, TcpStream};
 use std::sync::mpsc;
 
+use crate::support::sentinel::{connect, send_line};
+
 pub const FIXTURE: &str = "--goetia-shim-fixture";
 
 pub fn run_if_requested() -> bool {
@@ -119,18 +121,4 @@ fn block_forever() -> ! {
     let (_tx, rx) = mpsc::channel::<()>();
     let _ = rx.recv();
     unreachable!("nobody ever sends on this channel; killed externally before recv returns");
-}
-
-/// Reporting in is best-effort: a failure to connect is indistinguishable
-/// to this process from never having been started, and it is the test —
-/// which holds the listener — that decides what that means.
-fn connect(port: u16) {
-    drop(TcpStream::connect((Ipv4Addr::LOCALHOST, port)));
-}
-
-fn send_line(port: u16, value: &str) {
-    if let Ok(mut stream) = TcpStream::connect((Ipv4Addr::LOCALHOST, port)) {
-        let _ = stream.write_all(value.as_bytes());
-        let _ = stream.shutdown(std::net::Shutdown::Write);
-    }
 }
