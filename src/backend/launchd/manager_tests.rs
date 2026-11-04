@@ -138,6 +138,21 @@ fn undo_write_leaves_a_plist_that_is_no_longer_what_install_wrote() {
     }
 }
 
+/// A waited start read back as stopped or failed did not start; one read back as `Unknown`
+/// (`spawn scheduled`, or a read that failed) is not established either way, so it is exit `4`.
+#[skuld::test]
+fn a_start_read_back_as_unknown_is_unconfirmed_not_failed() {
+    let id = Id::try_from("x").unwrap();
+    for state in [State::Stopped, State::Failed] {
+        let e = not_started(&id, state, false);
+        assert!(matches!(e, Error::NotStarted { .. }), "{state:?}: {e:?}");
+        assert!(!e.is_indeterminate(), "{state:?}");
+    }
+    let e = not_started(&id, State::Unknown, true);
+    assert!(matches!(e, Error::StartUnconfirmed { .. }), "{e:?}");
+    assert!(e.is_indeterminate());
+}
+
 /// `install` writes a regular file, so a symlink at the path, even a dangling one, is someone
 /// else's: replaced, never "no longer exists", and left in place.
 #[skuld::test]

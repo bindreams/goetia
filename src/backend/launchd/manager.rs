@@ -675,6 +675,19 @@ fn still_present(target: &Path) -> Result<bool> {
     }
 }
 
+/// A waited start that launchd accepted, read back as `state` (not `Running`) before the deadline:
+/// a stopped or failed job did not start, and `Unknown` (`spawn scheduled`, or a read that failed)
+/// establishes nothing either way.
+fn not_started(id: &Id, state: State, keep_alive: bool) -> Error {
+    match state {
+        State::Unknown => Error::StartUnconfirmed { id: id.to_string() },
+        State::Stopped | State::Failed | State::Running => Error::NotStarted {
+            id: id.to_string(),
+            keep_alive,
+        },
+    }
+}
+
 /// Undo `install`'s write to `target`: put `previous` back, or remove the plist if there was none.
 /// Only over the plist `install` wrote (`wrote`). The path can have changed since: a concurrent
 /// `enable` or `uninstall` moved or removed it, or a concurrent install wrote after ours, and a write
@@ -1411,17 +1424,15 @@ impl backend::Backend for Launchd {
                 // will trust. Never observed (250/250 runs named one), and
                 // not guessed at either: one bounded read decides it.
                 Kickstarted::NoPid if budget.waits() => {
-                    if live_state(id.as_str(), deadline)?.0 != State::Running {
+                    let state = live_state(id.as_str(), deadline)?.0;
+                    if state != State::Running {
                         // Checked after the read too: one the deadline cut
                         // short reads `Unknown`, which is an expiry, not a
                         // job that failed to start.
                         return Err(if deadline.expired() {
                             timed_out()
                         } else {
-                            Error::NotStarted {
-                                id: id.to_string(),
-                                keep_alive: blob.spec.restart == Restart::Always,
-                            }
+                            not_started(id, state, blob.spec.restart == Restart::Always)
                         });
                     }
                 }
@@ -1474,14 +1485,12 @@ impl backend::Backend for Launchd {
             if live_state(id.as_str(), issuing)?.0 != State::Running {
                 kickstart(id.as_str(), budget, deadline, corrective_kickstart)?.ok_or_else(timed_out)?;
             }
-            if live_state(id.as_str(), deadline)?.0 != State::Running {
+            let state = live_state(id.as_str(), deadline)?.0;
+            if state != State::Running {
                 if deadline.expired() {
                     return Err(timed_out());
                 }
-                return Err(Error::NotStarted {
-                    id: id.to_string(),
-                    keep_alive: true,
-                });
+                return Err(not_started(id, state, true));
             }
         }
         Ok(())

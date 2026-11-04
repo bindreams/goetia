@@ -41,6 +41,7 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             path: PathBuf::new(),
             found: String::new(),
         },
+        Error::StartUnconfirmed { id: id() },
     ];
     for e in &in_doubt {
         assert!(e.is_indeterminate(), "{e:?}");
@@ -361,6 +362,14 @@ fn report_of_a_start_that_left_no_process() {
         .to_string(),
         "`x` did not start: the manager accepted the start, but no process is running, and `restart: always` means \
          it should have one"
+    );
+}
+
+#[skuld::test]
+fn report_of_a_start_whose_state_is_not_established() {
+    assert_eq!(
+        Error::StartUnconfirmed { id: id() }.report().to_string(),
+        "`x` may not have started: the manager accepted the start, but its state is not established"
     );
 }
 

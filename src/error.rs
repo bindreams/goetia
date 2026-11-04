@@ -91,6 +91,12 @@ pub enum Error {
     )]
     NotStarted { id: String, keep_alive: bool },
 
+    /// The manager accepted a start, but what it reported afterwards, before the deadline,
+    /// establishes neither that a process runs nor that none does (launchd's `spawn scheduled`, or
+    /// a read that failed). Indeterminate, unlike [`NotStarted`](Error::NotStarted).
+    #[error("`{id}` may not have started: the manager accepted the start, but its state is not established")]
+    StartUnconfirmed { id: String },
+
     /// launchd cannot update a loaded job, so the changed definition was not installed.
     #[error(
         "`{id}` is loaded in launchd, which cannot update a loaded job, so the changed plist was not installed and \
@@ -441,7 +447,8 @@ impl Error {
             | Error::RequestInDoubt { .. }
             | Error::LoadedJobInDoubt { .. }
             | Error::LoadedStateInDoubt { .. }
-            | Error::StaleJobBootedOut { .. } => true,
+            | Error::StaleJobBootedOut { .. }
+            | Error::StartUnconfirmed { .. } => true,
             Error::Step { source, .. } => source.is_indeterminate(),
             Error::Both { first, then } => first.is_indeterminate() && then.is_indeterminate(),
             Error::Os { .. }
