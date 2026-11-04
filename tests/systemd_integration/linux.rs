@@ -1178,37 +1178,41 @@ fn goetia_with_tasks(tasks: u32, args: &[&str]) -> std::process::Output {
         .expect("spawn systemd-run")
 }
 
-/// goetia never panics for want of a task, and a verb that could not have what its request needs
-/// exits `1` with the daemon untouched. Each verb is swept over a rising task limit until it
-/// succeeds: below that it must fail cleanly, at it the verb works. How many tasks a verb needs is
-/// goetia's business, so the cutoff itself is not asserted, only that one limit is too few and a
-/// generous one is enough.
+/// goetia never panics for want of a task; a verb that cannot get what its request needs exits `1`,
+/// and `start` and a waited `restart` then leave the daemon untouched. Each verb sweeps a rising
+/// limit until it succeeds; the cutoff is goetia's business and is not asserted.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
+    // "Generously provisioned", not a retry cap.
     const ENOUGH: u32 = 64;
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     Systemd::new().install(&mk(guard.id()), false).expect("install");
 
-    // Runs `args` at each limit from 1 until it exits `0`, checking every failure with `untouched`.
+    // `untouched` checks the daemon after each failure.
     let sweep = |args: &[&str], untouched: &dyn Fn(u32)| {
+        let mut last = String::new();
         for tasks in 1..=ENOUGH {
             let output = goetia_with_tasks(tasks, args);
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
             assert!(!stderr.contains("panicked"), "{args:?} TasksMax={tasks}: {stderr}");
             match output.status.code() {
                 Some(0) => {
+                    // goetia alone is one task, so a single one must fail: that failure is what
+                    // proves the sweep exercised a starved verb at all.
                     assert!(
                         tasks > 1,
                         "{args:?} succeeded with a single task, so the sweep tested nothing"
                     );
                     return;
                 }
-                Some(1) => untouched(tasks),
+                // goetia's own refusal, not `systemd-run` failing to make the scope.
+                Some(1) if stderr.contains("error: ") => untouched(tasks),
                 other => panic!("{args:?} TasksMax={tasks}: exit {other:?}: {stderr}"),
             }
+            last = stderr;
         }
-        panic!("{args:?} did not succeed even with TasksMax={ENOUGH}");
+        panic!("{args:?} did not succeed even with TasksMax={ENOUGH}; last stderr: {last}");
     };
 
     sweep(&["daemon", "start", guard.id()], &|tasks| {
@@ -1234,8 +1238,16 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
     );
 
     // A restart that does not wait sends its stop before its start, so a failure may have touched
-    // the daemon: only "never panics, and works when provisioned" holds for it.
+    // the daemon. Its success is checked as `a_start_with_no_budget_reaches_systemd` checks one:
+    // once systemd has the restart, the unit is never at rest where a restart that did nothing
+    // would leave it, however far the job has got.
+    let before = main_pid(guard.id());
     sweep(&["daemon", "restart", guard.id(), "--timeout", "0"], &|_| {});
+    let (state, job) = active_state_and_job(guard.id());
+    assert!(
+        !job.is_empty() || !(state == "inactive" || (state == "active" && main_pid(guard.id()) == before)),
+        "the provisioned restart --timeout 0 never reached systemd: ActiveState={state} Job={job:?}"
+    );
 }
 
 /// `Type=exec` is what makes `systemctl start` report failure here at all — under `Type=simple` the
