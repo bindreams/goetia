@@ -687,8 +687,13 @@ fn undo_write(target: &Path, wrote: &str, previous: Option<&str>) -> Result<()> 
         path: target.to_path_buf(),
         found,
     };
-    if !still_present(target)? {
-        return Err(blocked(PutBackFound::Gone));
+    // `install` writes a regular file, so anything else at the path (a symlink, dangling or not, a
+    // directory) is someone else's.
+    match fs::symlink_metadata(target) {
+        Ok(meta) if !meta.file_type().is_file() => return Err(blocked(PutBackFound::Replaced)),
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(blocked(PutBackFound::Gone)),
+        Err(e) => return Err(Error::os_at("stat", target, e)),
     }
     match fs::read_to_string(target) {
         Ok(on_disk) if on_disk == wrote => {}
@@ -1417,7 +1422,7 @@ impl backend::Backend for Launchd {
                         } else {
                             Error::NotStarted {
                                 id: id.to_string(),
-                                keep_alive: false,
+                                keep_alive: blob.spec.restart == Restart::Always,
                             }
                         });
                     }

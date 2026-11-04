@@ -138,6 +138,32 @@ fn undo_write_leaves_a_plist_that_is_no_longer_what_install_wrote() {
     }
 }
 
+/// `install` writes a regular file, so a symlink at the path, even a dangling one, is someone
+/// else's: replaced, never "no longer exists", and left in place.
+#[skuld::test]
+fn undo_write_calls_a_symlink_at_the_path_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("id.plist");
+    let wrote = sample_plist("id");
+    std::os::unix::fs::symlink(dir.path().join("nowhere"), &target).unwrap();
+
+    let err = undo_write(&target, &wrote, None).expect_err("a symlink is not what install wrote");
+    assert!(
+        matches!(
+            err,
+            Error::PutBackBlocked {
+                found: PutBackFound::Replaced,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(
+        std::fs::symlink_metadata(&target).is_ok(),
+        "the symlink was left in place"
+    );
+}
+
 /// A concurrent `uninstall` or `enable` took the plist from this path; writing it back would resurrect
 /// it, or put a plist in both directories.
 #[skuld::test]
