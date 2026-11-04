@@ -72,7 +72,7 @@ use crate::backend::{
 };
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
-use crate::error::{Error, Result};
+use crate::error::{Error, PutBackFound, Result};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, Installed, Prepared, State, Status, Step, flow};
 use crate::spec::{AccountId, DaemonSpec, Id, Restart, User};
@@ -191,10 +191,10 @@ fn locate(id: &str) -> Result<Option<Location>> {
             path: enabled,
             enabled: true,
         })),
-        (Presence::Present, Presence::Present) => Err(Error::Other(format!(
-            "daemon `{id}` has a plist in both {STAGING_DIR} and {ENABLED_DIR}; remove one by hand \
-             (they should never both exist) before retrying"
-        ))),
+        (Presence::Present, Presence::Present) => Err(Error::AmbiguousInstall {
+            id: id.to_string(),
+            paths: [staging, enabled],
+        }),
     }
 }
 
@@ -204,11 +204,9 @@ fn locate(id: &str) -> Result<Option<Location>> {
 /// twin of `backend::systemd::manager::discover::undetermined`, and worded
 /// identically, since the two describe one condition on two platforms.
 ///
-/// [`Error::Undetermined`], never [`Error::Io`]: `Io` reaches
-/// `cli::report::status_error`'s catch-all as `Kind::Unusable`, which
-/// *asserts* that goetia owns the id — the one thing a read that never
-/// completed cannot establish. `/Library/LaunchDaemons` holds every vendor's
-/// daemons, so that claim is routinely about a stranger's service.
+/// [`Error::Undetermined`], never [`Error::Os`], for the reason given on [`Error::Undetermined`].
+/// `/Library/LaunchDaemons` holds every vendor's daemons, so that claim is routinely about a
+/// stranger's service.
 ///
 /// Every failure but `NotFound` lands here, not `PermissionDenied` alone: an
 /// `EIO` leaves goetia exactly as ignorant of the id as an `EACCES` does.
@@ -523,18 +521,13 @@ fn account_from_uid(uid: u32) -> Result<Account> {
 
 // Writing the plist ===================================================================================================
 
-fn io_err(path: impl Into<PathBuf>) -> impl FnOnce(io::Error) -> Error {
-    let path = path.into();
-    move |source| Error::Io { path, source }
-}
-
 /// `create_dir_all` the directory a plist is about to be written into, then
 /// make sure it is `0755` regardless of the caller's umask — `list`/
 /// `status`/`show` must work unelevated (see the design spec's §4), which
 /// needs every ancestor to stay world-readable+searchable.
 fn ensure_dir(dir: &Path) -> Result<()> {
-    fs::create_dir_all(dir).map_err(io_err(dir))?;
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).map_err(io_err(dir))
+    fs::create_dir_all(dir).map_err(|e| Error::os_at("create directory", dir, e))?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).map_err(|e| Error::os_at("chmod", dir, e))
 }
 
 /// Create `cwd` itself (its own contents are what `WorkingDirectory`
@@ -582,7 +575,7 @@ fn missing_components(dir: &Path) -> Result<Vec<&Path>> {
                     _ => break,
                 }
             }
-            Err(e) => return Err(io_err(cursor)(e)),
+            Err(e) => return Err(Error::os_at("stat", cursor, e)),
         }
     }
     missing.reverse();
@@ -595,12 +588,13 @@ fn create_owned(missing: &[&Path], account: &Account) -> Result<()> {
     for path in missing {
         match fs::DirBuilder::new().mode(0o755).create(path) {
             Ok(()) => {
-                fs::set_permissions(path, fs::Permissions::from_mode(0o755)).map_err(io_err(*path))?;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+                    .map_err(|e| Error::os_at("chmod", *path, e))?;
                 nix::unistd::chown(*path, Some(account.uid), Some(account.gid))
-                    .map_err(|e| Error::Other(format!("chown {} to {}: {e}", path.display(), account.name)))?;
+                    .map_err(|e| Error::os_at(format!("chown to {}", account.name), *path, e))?;
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(io_err(*path)(e)),
+            Err(e) => return Err(Error::os_at("create directory", *path, e)),
         }
     }
     Ok(())
@@ -619,9 +613,11 @@ fn staged_tempfile(dir: &Path, content: &str) -> Result<tempfile::NamedTempFile>
         .prefix(".goetia-")
         .suffix(".plist.tmp")
         .tempfile_in(dir)
-        .map_err(io_err(dir))?;
-    tmp.write_all(content.as_bytes()).map_err(io_err(tmp.path()))?;
-    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o644)).map_err(io_err(tmp.path()))?;
+        .map_err(|e| Error::os_at("create a temp file in", dir, e))?;
+    tmp.write_all(content.as_bytes())
+        .map_err(|e| Error::os_at("write", tmp.path(), e))?;
+    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o644))
+        .map_err(|e| Error::os_at("chmod", tmp.path(), e))?;
     lint(tmp.path())?;
     Ok(tmp)
 }
@@ -654,10 +650,7 @@ fn persist_new(staged: tempfile::NamedTempFile, target: &Path) -> Result<Persist
     match staged.persist_noclobber(target) {
         Ok(_file) => Ok(PersistOutcome::Written),
         Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => Ok(PersistOutcome::Raced),
-        Err(e) => Err(Error::Io {
-            path: target.to_path_buf(),
-            source: e.error,
-        }),
+        Err(e) => Err(Error::os_at("create", target, e.error)),
     }
 }
 
@@ -666,23 +659,32 @@ fn persist_new(staged: tempfile::NamedTempFile, target: &Path) -> Result<Persist
 /// asked for.
 fn write_existing(target: &Path, content: &str) -> Result<()> {
     let tmp = staged_tempfile(target.parent().expect("plist path always has a parent"), content)?;
-    tmp.persist(target).map(drop).map_err(|e| Error::Io {
-        path: target.to_path_buf(),
-        source: e.error,
-    })
+    tmp.persist(target)
+        .map(drop)
+        .map_err(|e| Error::os_at("replace", target, e.error))
 }
 
-/// Whether a plist is still at `target`. [`Error::Io`] if the stat could not tell, not
+/// Whether a plist is still at `target`. [`Error::Os`] if the stat could not tell, not
 /// [`undetermined`]: the callers have already read an artifact at this id, so "is anything installed
 /// here" is not the question the stat left open.
 fn still_present(target: &Path) -> Result<bool> {
     match occupied(target) {
         Presence::Present => Ok(true),
         Presence::Absent => Ok(false),
-        Presence::Undetermined { source } => Err(Error::Io {
-            path: target.to_path_buf(),
-            source,
-        }),
+        Presence::Undetermined { source } => Err(Error::os_at("stat", target, source)),
+    }
+}
+
+/// A waited start that launchd accepted, read back as `state` (not `Running`) before the deadline:
+/// a stopped or failed job did not start, and `Unknown` (`spawn scheduled`, or a read that failed)
+/// establishes nothing either way.
+fn not_started(id: &Id, state: State, keep_alive: bool) -> Error {
+    match state {
+        State::Unknown => Error::StartUnconfirmed { id: id.to_string() },
+        State::Stopped | State::Failed | State::Running => Error::NotStarted {
+            id: id.to_string(),
+            keep_alive,
+        },
     }
 }
 
@@ -692,24 +694,33 @@ fn still_present(target: &Path) -> Result<bool> {
 /// here would put a plist in both directories, resurrect a removed one, or destroy the other's.
 /// The `Err` says what is on disk.
 fn undo_write(target: &Path, wrote: &str, previous: Option<&str>) -> Result<()> {
-    let path = target.display();
-    if !still_present(target)? {
-        return Err(Error::Other(format!("{path} no longer exists")));
+    let blocked = |found| Error::PutBackBlocked {
+        path: target.to_path_buf(),
+        found,
+    };
+    // `install` writes a regular file, so anything else at the path (a symlink, dangling or not, a
+    // directory) is someone else's.
+    match fs::symlink_metadata(target) {
+        Ok(meta) if !meta.file_type().is_file() => return Err(blocked(PutBackFound::Replaced)),
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(blocked(PutBackFound::Gone)),
+        Err(e) => return Err(Error::os_at("stat", target, e)),
     }
     match fs::read_to_string(target) {
         Ok(on_disk) if on_disk == wrote => {}
-        Ok(_) => return Err(Error::Other(format!("{path} no longer holds what install wrote"))),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Error::Other(format!("{path} no longer exists"))),
-        Err(e) if e.kind() == io::ErrorKind::InvalidData => {
-            return Err(Error::Other(format!("{path} no longer holds what install wrote")));
-        }
-        Err(e) => return Err(io_err(target)(e)),
+        Ok(_) => return Err(blocked(PutBackFound::Replaced)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(blocked(PutBackFound::Gone)),
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => return Err(blocked(PutBackFound::Replaced)),
+        Err(e) => return Err(Error::os_at("read", target, e)),
     }
     let undone = match previous {
         Some(previous) => write_existing(target, previous),
-        None => fs::remove_file(target).map_err(io_err(target)),
+        None => fs::remove_file(target).map_err(|e| Error::os_at("remove", target, e)),
     };
-    undone.map_err(|e| Error::Other(format!("{e}; {path} still holds what install wrote")))
+    undone.map_err(|e| Error::Step {
+        what: format!("{} still holds what install wrote", target.display()),
+        source: Box::new(e),
+    })
 }
 
 /// What is at `path`, for a message.
@@ -742,14 +753,9 @@ fn move_no_clobber(src: &Path, dest: &Path) -> Result<()> {
                 path: dest.to_path_buf(),
             });
         }
-        Err(e) => {
-            return Err(Error::Io {
-                path: dest.to_path_buf(),
-                source: e,
-            });
-        }
+        Err(e) => return Err(Error::os_at("move to", dest, e)),
     }
-    fs::remove_file(src).map_err(io_err(src))
+    fs::remove_file(src).map_err(|e| Error::os_at("remove", src, e))
 }
 
 // launchctl ===========================================================================================================
@@ -762,24 +768,22 @@ fn run(command: &str, args: &[&str]) -> Result<std::process::Output> {
     Command::new(command)
         .args(args)
         .output()
-        .map_err(|e| Error::CommandFailed {
-            command: format!("{command} {}", args.join(" ")),
-            stderr: e.to_string(),
-        })
+        .map_err(|e| Error::spawn(format!("{command} {}", args.join(" ")), e))
 }
 
 /// [`run`], but for a caller that only cares whether it succeeded
 /// (`bootstrap`, `kickstart`, `plutil -lint`) — spawn failure and a
-/// non-zero exit both become the same [`Error::CommandFailed`].
+/// non-zero exit are an [`Error::Spawn`] and an [`Error::Command`].
 fn require_success(command: &str, args: &[&str]) -> Result<()> {
     let out = run(command, args)?;
     if out.status.success() {
         Ok(())
     } else {
-        Err(Error::CommandFailed {
-            command: format!("{command} {}", args.join(" ")),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        })
+        Err(Error::command(
+            format!("{command} {}", args.join(" ")),
+            out.status,
+            &out.stderr,
+        ))
     }
 }
 
@@ -802,15 +806,12 @@ struct Ran {
 /// failure of the command — the request is out, or on its way in a
 /// `launchctl` goetia left running — and what it means differs per verb, so
 /// the verb decides rather than this function. A failure before `launchctl`
-/// ran is [`Error::CommandFailed`], and says it was not run. One after it may
+/// ran is an [`Error::Spawn`]. One after it may
 /// have — cosca failing past `exec`, or the wait failing — is the same for a
 /// read, and [`Error::RequestInDoubt`] for a request, which may have reached
 /// launchd.
 fn launchctl(args: &[&str], deadline: Deadline, role: Role) -> Result<Option<Ran>> {
-    let failed = |e: cosca::error::Error| Error::CommandFailed {
-        command: format!("launchctl {}", args.join(" ")),
-        stderr: e.to_string(),
-    };
+    let failed = |e: cosca::error::Error| Error::spawn(format!("launchctl {}", args.join(" ")), e);
     // A request whose `launchctl` may have started is in doubt, not failed: it may have reached
     // launchd. A read changes nothing either way.
     let request = matches!(role, Role::Request(_));
@@ -886,10 +887,7 @@ pub(super) mod launchctl_stand_in {
 
 /// The failure for a `launchctl` call that ran and exited non-zero.
 fn command_failed(args: &[&str], ran: &Ran) -> Error {
-    Error::CommandFailed {
-        command: format!("launchctl {}", args.join(" ")),
-        stderr: String::from_utf8_lossy(&ran.capture.stderr).into_owned(),
-    }
+    Error::command(format!("launchctl {}", args.join(" ")), ran.status, &ran.capture.stderr)
 }
 
 /// The one [`Deadline`] a budgeted verb derives, first thing at entry —
@@ -1092,13 +1090,10 @@ const FILES_PER_CALL: usize = 2;
 /// [`bounded::reapers`], as the verb's own failure: nothing was sent, so exit `1` with the daemon
 /// untouched.
 fn reapers<const N: usize>(id: &Id) -> Result<[Reaper; N]> {
-    bounded::reapers::<N>().map_err(|e| no_reaper(id, e))
-}
-
-fn no_reaper(id: &Id, e: io::Error) -> Error {
-    Error::Other(format!(
-        "`{id}`: no thread could be made to reap a `launchctl` request, so none was sent: {e}"
-    ))
+    bounded::reapers::<N>().map_err(|source| Error::Reservation {
+        id: Some(id.to_string()),
+        source,
+    })
 }
 
 /// Every temp file a verb's `calls` can need, ready in this thread's pool before it sends anything,
@@ -1109,10 +1104,9 @@ fn files(id: &Id, calls: usize) -> Result<bounded::Spares> {
         files: calls * FILES_PER_CALL,
         ..bounded::Needs::default()
     })
-    .map_err(|e| {
-        Error::Other(format!(
-            "`{id}`: no temp file could be made for a `launchctl` call's output, so nothing was sent: {e}"
-        ))
+    .map_err(|source| Error::Reservation {
+        id: Some(id.to_string()),
+        source,
     })
 }
 
@@ -1341,7 +1335,7 @@ impl backend::Backend for Launchd {
         // own, and bounding this would turn a slow-stopping job into a
         // failed uninstall where today it succeeds.
         never_expires(bootout(id.as_str(), Budget::Unbounded.start(), reaper)?);
-        fs::remove_file(&location.path).map_err(io_err(&location.path))
+        fs::remove_file(&location.path).map_err(|e| Error::os_at("remove", &location.path, e))
     }
 
     fn enable(&self, snapshot: Plist) -> Result<()> {
@@ -1430,16 +1424,15 @@ impl backend::Backend for Launchd {
                 // will trust. Never observed (250/250 runs named one), and
                 // not guessed at either: one bounded read decides it.
                 Kickstarted::NoPid if budget.waits() => {
-                    if live_state(id.as_str(), deadline)?.0 != State::Running {
+                    let state = live_state(id.as_str(), deadline)?.0;
+                    if state != State::Running {
                         // Checked after the read too: one the deadline cut
                         // short reads `Unknown`, which is an expiry, not a
                         // job that failed to start.
                         return Err(if deadline.expired() {
                             timed_out()
                         } else {
-                            Error::Other(format!(
-                                "`{id}` did not start: launchd accepted the kickstart but reported neither a pid nor a running state"
-                            ))
+                            not_started(id, state, blob.spec.restart == Restart::Always)
                         });
                     }
                 }
@@ -1492,13 +1485,12 @@ impl backend::Backend for Launchd {
             if live_state(id.as_str(), issuing)?.0 != State::Running {
                 kickstart(id.as_str(), budget, deadline, corrective_kickstart)?.ok_or_else(timed_out)?;
             }
-            if live_state(id.as_str(), deadline)?.0 != State::Running {
+            let state = live_state(id.as_str(), deadline)?.0;
+            if state != State::Running {
                 if deadline.expired() {
                     return Err(timed_out());
                 }
-                return Err(Error::Other(format!(
-                    "`{id}` did not start: its plist is loaded but launchd reports no running process, and `restart: always` means it should have one"
-                )));
+                return Err(not_started(id, state, true));
             }
         }
         Ok(())
@@ -1552,11 +1544,7 @@ impl backend::Backend for Launchd {
             files: calls * FILES_PER_CALL,
             ..bounded::Needs::default()
         })
-        .map_err(|e| {
-            Error::Other(format!(
-                "no thread or temp file could be made for a `launchctl` request, so none was sent: {e}"
-            ))
-        })?;
+        .map_err(|source| Error::Reservation { id: None, source })?;
         Ok(Prepared::holding(spares))
     }
 }
@@ -1593,20 +1581,22 @@ fn scan_in(dirs: [(&str, bool); 2]) -> Scan<Plist> {
         for location in locations {
             match read_at(&id, location) {
                 Ok(found_here) => found.push(found_here),
-                // Gone between the scan above and this read: an uninstall that completed, observed
-                // one syscall later. Absence is established, so this is a skip rather than a blind
-                // spot: reporting it would let a benign concurrent uninstall raise `list`'s
-                // host-wide exit code.
-                Err(Error::NotInstalled { .. }) => {}
-                // A failed read leaves zero evidence of whether this plist ever carried a Goetia
-                // marker at all. `Installed::Undetermined` claims neither ownership nor absence,
-                // which is exactly what was established.
-                Err(Error::Undetermined { reason, .. }) => {
-                    unestablished.get_or_insert(reason);
-                }
-                Err(e) => {
-                    unestablished.get_or_insert(e.to_string());
-                }
+                Err(e) => match e.cause() {
+                    // Gone between the scan above and this read: an uninstall that completed,
+                    // observed one syscall later. Absence is established, so this is a skip rather
+                    // than a blind spot: reporting it would let a benign concurrent uninstall raise
+                    // `list`'s host-wide exit code.
+                    Error::NotInstalled { .. } => {}
+                    // A failed read leaves zero evidence of whether this plist ever carried a
+                    // Goetia marker at all. `Installed::Undetermined` claims neither ownership nor
+                    // absence, which is exactly what was established.
+                    Error::Undetermined { reason, .. } => {
+                        unestablished.get_or_insert(reason.clone());
+                    }
+                    _ => {
+                        unestablished.get_or_insert(e.report().to_string());
+                    }
+                },
             }
         }
         if let Some(reason) = unestablished {

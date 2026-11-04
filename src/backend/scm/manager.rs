@@ -241,13 +241,13 @@ impl Backend for Scm {
 
     fn write(
         &self,
-        spec: &DaemonSpec,
+        _spec: &DaemonSpec,
         definition: &ScmRegistration,
         _outcome: &Outcome,
         snapshot: Option<&ScmSnapshot>,
         _scope: &mut (),
     ) -> Result<WriteOutcome> {
-        apply(spec, definition, snapshot.is_none())?;
+        apply(definition, snapshot.is_none())?;
         Ok(WriteOutcome::Done)
     }
 
@@ -304,13 +304,13 @@ impl Backend for Scm {
     fn enable(&self, snapshot: ScmSnapshot) -> Result<()> {
         let id = snapshot.id();
         let (_scm, service) = open_existing(id, ServiceAccess::CHANGE_CONFIG)?;
-        set_start_type(&service, ServiceStartType::AutoStart).map_err(|e| Error::Other(format!("enable `{id}`: {e}")))
+        set_start_type(&service, ServiceStartType::AutoStart).map_err(|e| Error::os(format!("enable `{id}`"), e))
     }
 
     fn disable(&self, snapshot: ScmSnapshot) -> Result<()> {
         let id = snapshot.id();
         let (_scm, service) = open_existing(id, ServiceAccess::CHANGE_CONFIG)?;
-        set_start_type(&service, ServiceStartType::OnDemand).map_err(|e| Error::Other(format!("disable `{id}`: {e}")))
+        set_start_type(&service, ServiceStartType::OnDemand).map_err(|e| Error::os(format!("disable `{id}`"), e))
     }
 
     fn start(&self, snapshot: ScmSnapshot, budget: Budget) -> Result<()> {
@@ -320,15 +320,15 @@ impl Backend for Scm {
         let (kind, unreadable) = start_kind(snapshot.blob());
         let id = snapshot.into_id();
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
-            .map_err(|e| Error::Other(format!("open `{id}` to start it: {e}")))?;
+            .map_err(|e| Error::os(format!("open `{id}` to start it"), e))?;
         if !budget.waits() {
             // Request-only: `StartServiceW` and return, arming no wait at
             // all. `Ok(())` then means the request was accepted and nothing
             // more, per the trait doc comment.
-            return super::wait::request_start(&mut actor).map_err(|e| Error::Other(format!("start `{id}`: {e}")));
+            return super::wait::request_start(&mut actor).map_err(|e| Error::os(format!("start `{id}`"), e));
         }
         let waited = super::wait::start_via_notify(&mut actor, deadline, kind)
-            .map_err(|e| failed_start(&id, &e, unreadable.as_deref()))?;
+            .map_err(|e| failed_start(&id, e, unreadable.as_deref()))?;
         match waited {
             Waited::Confirmed => Ok(()),
             Waited::Expired => Err(budget::timed_out(id.as_str(), "running", budget)),
@@ -341,8 +341,8 @@ impl Backend for Scm {
     fn request_start_after_stop(&self, snapshot: ScmSnapshot) -> Result<()> {
         let id = snapshot.into_id();
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
-            .map_err(|e| Error::Other(format!("open `{id}` to start it: {e}")))?;
-        super::wait::request_start_after_stop(&mut actor).map_err(|e| Error::Other(format!("start `{id}`: {e}")))
+            .map_err(|e| Error::os(format!("open `{id}` to start it"), e))?;
+        super::wait::request_start_after_stop(&mut actor).map_err(|e| Error::os(format!("start `{id}`"), e))
     }
 
     fn stop(&self, snapshot: ScmSnapshot, budget: Budget) -> Result<()> {
@@ -351,12 +351,12 @@ impl Backend for Scm {
         let deadline = budget.start();
         let id = snapshot.into_id();
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
-            .map_err(|e| Error::Other(format!("open `{id}` to stop it: {e}")))?;
+            .map_err(|e| Error::os(format!("open `{id}` to stop it"), e))?;
         if !budget.waits() {
-            return super::wait::request_stop(&mut actor).map_err(|e| Error::Other(format!("stop `{id}`: {e}")));
+            return super::wait::request_stop(&mut actor).map_err(|e| Error::os(format!("stop `{id}`"), e));
         }
-        let waited = super::wait::stop_via_notify(&mut actor, deadline)
-            .map_err(|e| Error::Other(format!("stop `{id}`: {e}")))?;
+        let waited =
+            super::wait::stop_via_notify(&mut actor, deadline).map_err(|e| Error::os(format!("stop `{id}`"), e))?;
         match waited {
             Waited::Confirmed => Ok(()),
             Waited::Expired => Err(budget::timed_out(id.as_str(), "stopped", budget)),
@@ -371,7 +371,7 @@ impl Backend for Scm {
         let id = snapshot.into_id();
         let (_scm, service) = open_existing(&id, ServiceAccess::QUERY_STATUS)?;
         let mut target = super::kill::SystemKillTarget::new(service, id.as_str().to_string());
-        match super::kill::kill_service(&mut target).map_err(|e| Error::Other(format!("kill `{id}`: {e}")))? {
+        match super::kill::kill_service(&mut target).map_err(|e| Error::os(format!("kill `{id}`"), e))? {
             super::kill::Killed::Terminated => Ok(()),
             super::kill::Killed::NotRunning => Err(Error::NotRunning {
                 id: id.as_str().to_string(),
@@ -426,20 +426,23 @@ pub fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
 fn start_kind(blob: std::result::Result<&Blob, &Error>) -> (Kind, Option<String>) {
     match blob {
         Ok(blob) => (blob.spec.kind, None),
-        Err(e) => (Kind::Managed, Some(e.to_string())),
+        Err(e) => (Kind::Managed, Some(e.report().to_string())),
     }
 }
 
 /// `start`'s error for a `start_via_notify` failure. When the blob was unreadable the start was
 /// judged as a `type: managed` service's, and the error says why, since that is not what a
 /// `type: simple` service would have been told.
-fn failed_start(id: &Id, e: &std::io::Error, unreadable: Option<&str>) -> Error {
+fn failed_start(id: &Id, e: std::io::Error, unreadable: Option<&str>) -> Error {
+    let failed = Error::os(format!("start `{id}`"), e);
     match unreadable {
-        None => Error::Other(format!("start `{id}`: {e}")),
-        Some(why) => Error::Other(format!(
-            "start `{id}`: {e} (its spec blob could not be read, so the start was judged as a `type: managed` \
-             service's: {why})"
-        )),
+        None => failed,
+        Some(why) => Error::Step {
+            what: format!(
+                "its spec blob could not be read, so the start was judged as a `type: managed` service's ({why})"
+            ),
+            source: Box::new(failed),
+        },
     }
 }
 
@@ -597,7 +600,7 @@ fn split_command_line(cmdline: &str) -> (PathBuf, Vec<String>) {
 /// the two writes after it leaves a registration the next `install` reads as
 /// hand-edited (`Conflict`, cleared by `--force`). An update restates the
 /// start type the service has, rather than resetting it; see `service_info`.
-fn apply(spec: &DaemonSpec, reg: &ScmRegistration, create: bool) -> Result<()> {
+fn apply(reg: &ScmRegistration, create: bool) -> Result<()> {
     // Driven by `generate::account_needs_password`, not merely whether
     // `reg.account` is `Some`: a canonicalised built-in
     // (`NT AUTHORITY\LocalService`) or virtual (`NT SERVICE\<id>`) account
@@ -628,12 +631,9 @@ fn apply(spec: &DaemonSpec, reg: &ScmRegistration, create: bool) -> Result<()> {
             // Install would otherwise report success and the service would
             // fail every future start with error 1069 (no `SeServiceLogonRight`).
             // Refuse instead of creating a service that cannot start.
-            return Err(Error::Other(format!(
-                "service account `{account}` needs a password (it is not LocalSystem/LocalService/\
-                 NetworkService, nor an `NT SERVICE\\`/`NT AUTHORITY\\` account); set \
-                 GOETIA_SERVICE_PASSWORD before installing `{}`",
-                spec.id
-            )));
+            return Err(Error::PasswordRequired {
+                account: account.to_string(),
+            });
         }
         identity::grant_service_logon_right(account)?;
         pw
@@ -762,17 +762,16 @@ fn run_sc(args: &[&str]) -> Result<()> {
     let output = std::process::Command::new("sc.exe")
         .args(args)
         .output()
-        .map_err(|e| Error::Other(format!("spawn `sc.exe {}`: {e}", args.join(" "))))?;
+        .map_err(|e| Error::spawn(format!("sc.exe {}", args.join(" ")), e))?;
     if output.status.success() {
         Ok(())
     } else {
-        Err(Error::Other(format!(
-            "`sc.exe {}` failed ({:?}): {}{}",
-            args.join(" "),
-            output.status.code(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        )))
+        // `sc.exe` reports its errors on stdout.
+        Err(Error::command(
+            format!("sc.exe {}", args.join(" ")),
+            output.status,
+            &[output.stdout, output.stderr].concat(),
+        ))
     }
 }
 
@@ -815,9 +814,10 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
         Ok(actor) => actor,
         Err(e) if is_not_found_io(&e) => return Ok(()),
         Err(e) => {
-            return Err(Error::Other(format!(
-                "open `{id}` before uninstall: {e}; it was NOT deleted"
-            )));
+            return Err(Error::Step {
+                what: format!("`{id}` was NOT deleted"),
+                source: Box::new(Error::os(format!("open `{id}` before uninstall"), e)),
+            });
         }
     };
 
@@ -838,7 +838,7 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
             } else {
                 UninstallFailure::Stop { previous }
             };
-            return Err(Error::Other(uninstall_failed_message(id, &e.to_string(), &state)));
+            return Err(uninstall_failed(id, &state, Error::os(format!("stop `{id}`"), e)));
         }
     }
     // Closed before the delete: an open handle would keep the record after it.
@@ -848,11 +848,7 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
     }
 
     let not_deleted = |context: String, e: windows_service::Error| {
-        Error::Other(uninstall_failed_message(
-            id,
-            &service_detail(&context, &e),
-            &UninstallFailure::Delete { previous },
-        ))
+        uninstall_failed(id, &UninstallFailure::Delete { previous }, to_error(&context, e))
     };
     let service = match scm.open_service(id.as_str(), ServiceAccess::DELETE) {
         Ok(service) => service,
@@ -882,15 +878,14 @@ enum Disabled {
 /// neither is an error. A start type that cannot be read is not an error either: only the message
 /// that names it needs it, so it is left out.
 fn disable_before_delete(scm: &WinServiceManager, id: &Id) -> Result<Disabled> {
-    let not_changed = |what: String| {
-        Error::Other(format!(
-            "{what}; `{id}` was NOT deleted and its start type is unchanged"
-        ))
+    let not_changed = |source: Error| Error::Step {
+        what: format!("`{id}` was NOT deleted and its start type is unchanged"),
+        source: Box::new(source),
     };
     let service = match scm.open_service(id.as_str(), ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG) {
         Ok(service) => service,
         Err(e) if is_not_found(&e) => return Ok(Disabled::Gone),
-        Err(e) => return Err(not_changed(service_detail(&format!("open `{id}` to disable it"), &e))),
+        Err(e) => return Err(not_changed(to_error(&format!("open `{id}` to disable it"), e))),
     };
     let previous = match service.query_config() {
         Ok(cfg) => Some(cfg.start_type),
@@ -901,11 +896,11 @@ fn disable_before_delete(scm: &WinServiceManager, id: &Id) -> Result<Disabled> {
         Ok(()) => Ok(Disabled::Now { previous }),
         Err(e) if is_marked_io(&e) => Ok(Disabled::AlreadyMarked),
         Err(e) if is_not_found_io(&e) => Ok(Disabled::Gone),
-        Err(e) => Err(not_changed(format!("disable `{id}` before uninstall: {e}"))),
+        Err(e) => Err(not_changed(Error::os(format!("disable `{id}` before uninstall"), e))),
     }
 }
 
-/// How a failed `uninstall` left the service, which decides what [`uninstall_failed_message`] may say.
+/// How a failed `uninstall` left the service, which decides what [`uninstall_failed`] may say.
 enum UninstallFailure {
     /// The stop failed. The service is running and disabled; `previous` is its start type before.
     Stop { previous: Option<ServiceStartType> },
@@ -916,26 +911,30 @@ enum UninstallFailure {
     AlreadyMarked,
 }
 
-/// The error text for an `uninstall` that failed with `cause`. Every variant names the retry or the
-/// remedy that applies to its state, and none claims a state it is not in.
-fn uninstall_failed_message(id: &Id, cause: &str, state: &UninstallFailure) -> String {
+/// An `uninstall` that failed with `cause`, led by what it left behind. Every state names the retry
+/// or the remedy that applies to it, and none claims a state it is not in.
+fn uninstall_failed(id: &Id, state: &UninstallFailure, cause: Error) -> Error {
     let kill = format!("if the service does not accept STOP, run `goetia daemon kill {id}`");
-    match state {
+    let what = match state {
         UninstallFailure::Stop { previous } => format!(
-            "`{id}` could not be stopped ({cause}). It was NOT deleted and is now disabled, so \
+            "`{id}` could not be stopped. It was NOT deleted and is now disabled, so \
              `goetia daemon start {id}` fails.{} Re-run `goetia daemon uninstall {id}` to retry; {kill} first",
             previous_start_type(id, *previous)
         ),
         UninstallFailure::Delete { previous } => format!(
-            "{cause}; `{id}` is stopped and disabled but was NOT deleted.{} Re-run \
+            "`{id}` is stopped and disabled but was NOT deleted.{} Re-run \
              `goetia daemon uninstall {id}` to retry",
             previous_start_type(id, *previous)
         ),
         UninstallFailure::AlreadyMarked => format!(
-            "`{id}` could not be stopped ({cause}). It was already marked for deletion by someone else, \
+            "`{id}` could not be stopped. It was already marked for deletion by someone else, \
              so `uninstall` did not delete it. It is removed once it stops and its last handle closes; \
              {kill}"
         ),
+    };
+    Error::Step {
+        what,
+        source: Box::new(cause),
     }
 }
 
@@ -968,10 +967,9 @@ fn open_scm(access: ServiceManagerAccess) -> Result<WinServiceManager> {
 /// [`open_scm`] for the two callers that are about to *classify* `id`
 /// ([`open_existing`], [`Backend::read`]). A manager that would not open leaves that
 /// id exactly as unclassified as a service object that would not open does, so
-/// it takes the same class — `Error::Other` here would reach
-/// `cli::report::status_error`'s catch-all as `Kind::Unusable` and claim
-/// goetia owns an id it never got as far as looking at. Every other caller
-/// reaches [`open_scm`] only after ownership is settled, where `Other` is the
+/// it takes the same class: an `Os` error here would reach `status_error`'s catch-all as
+/// `Kind::Unusable`, which claims ownership. Every other caller
+/// reaches [`open_scm`] only after ownership is settled, where `Os` is the
 /// true statement.
 ///
 /// Deliberately untested, and stated rather than contrived: `SC_MANAGER_CONNECT` is granted to every
@@ -1033,7 +1031,10 @@ fn service_detail(context: &str, e: &windows_service::Error) -> String {
 }
 
 fn to_error(context: &str, e: windows_service::Error) -> Error {
-    Error::Other(service_detail(context, &e))
+    match e {
+        windows_service::Error::Winapi(io_err) => Error::os(context, io_err),
+        other => Error::os(context, other),
+    }
 }
 
 // undetermined ========================================================================================================
@@ -1049,11 +1050,10 @@ fn to_error(context: &str, e: windows_service::Error) -> Error {
 /// ([`open_existing`], [`Backend::read`]). Only the caller knows which, so `reason`
 /// arrives already rendered and this decides the class and the remedy.
 ///
-/// [`Error::Undetermined`], never the `Error::Other` [`to_error`] and
-/// `registry`'s own `registry_error` produce: `Other` reaches
-/// `cli::report::status_error`'s catch-all as `Kind::Unusable`, which
-/// *asserts* that goetia owns the id — the one thing a read that never
-/// completed cannot establish. `HKLM\SYSTEM\CurrentControlSet\Services` holds
+/// [`Error::Undetermined`], never the `Error::Os` [`to_error`] and
+/// `registry`'s own `registry_error` produce: `Os` reaches
+/// `cli::report::status_error`'s catch-all as `Kind::Unusable` (see [`Error::Undetermined`]).
+/// `HKLM\SYSTEM\CurrentControlSet\Services` holds
 /// every vendor's service, so on this platform that claim is routinely about a
 /// stranger's, and it publishes `uninstall` as the remedy for one.
 ///
@@ -1245,15 +1245,15 @@ struct Unreadable {
 /// `registry_undetermined`, so the first arm is the whole story; the second exists because the
 /// `Result` type does not say so, and has no conditioned remedy to offer rather than a default one.
 fn unreadable_parts(name: String, e: Error) -> Unreadable {
-    match e {
+    match e.cause() {
         Error::Undetermined { reason, recovery, .. } => Unreadable {
             name,
-            detail: reason,
-            recovery: Some(recovery),
+            detail: reason.clone(),
+            recovery: Some(recovery.clone()),
         },
-        other => Unreadable {
+        _ => Unreadable {
             name,
-            detail: other.to_string(),
+            detail: e.report().to_string(),
             recovery: None,
         },
     }

@@ -11,8 +11,6 @@ use std::process::Command;
 use crate::error::{Error, Result};
 use crate::spec::{AccountId, DaemonSpec, User};
 
-use super::io_err;
-
 /// Create (and, for a non-root account, `chown`) the parent of `logs` and the `cwd` directory itself.
 /// Runs while still elevated.
 pub(super) fn ensure_parent_dirs(spec: &DaemonSpec) -> Result<()> {
@@ -49,7 +47,7 @@ pub(super) fn ensure_dir(dir: &Path, user: &User) -> Result<()> {
                     _ => break,
                 }
             }
-            Err(e) => return Err(io_err("stat", cursor, e)),
+            Err(e) => return Err(Error::os_at("stat", cursor, e)),
         }
     }
 
@@ -72,7 +70,8 @@ pub(super) fn ensure_dir(dir: &Path, user: &User) -> Result<()> {
         // change here only ever narrows the window, from "up to 0777" down to "at most 0755".
         match fs::DirBuilder::new().mode(0o755).create(path) {
             Ok(()) => {
-                fs::set_permissions(path, fs::Permissions::from_mode(0o755)).map_err(|e| io_err("chmod", path, e))?;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+                    .map_err(|e| Error::os_at("chmod", path, e))?;
                 if let Some(owner) = &owner {
                     chown(path, owner)?;
                 }
@@ -85,18 +84,16 @@ pub(super) fn ensure_dir(dir: &Path, user: &User) -> Result<()> {
             // it. The loser must not fail outright — nor may it chmod/chown a component it did not
             // itself create, per this function's own do-not-touch-existing-dirs rule above.
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(io_err("create directory", path, e)),
+            Err(e) => return Err(Error::os_at("create directory", path, e)),
         }
     }
 
     if !created_dir {
-        let meta = fs::metadata(dir).map_err(|e| io_err("stat", dir, e))?;
+        let meta = fs::metadata(dir).map_err(|e| Error::os_at("stat", dir, e))?;
         if !meta.is_dir() {
-            return Err(Error::Other(format!(
-                "{} already exists and is not a directory; goetia cannot use it as a daemon's cwd \
-                 or as its log directory",
-                dir.display()
-            )));
+            return Err(Error::NotADirectory {
+                path: dir.to_path_buf(),
+            });
         }
     }
     Ok(())
@@ -113,13 +110,13 @@ fn chown(path: &Path, owner: &str) -> Result<()> {
         .arg(owner)
         .arg(path)
         .output()
-        .map_err(|e| Error::Other(format!("failed to spawn chown for {}: {e}", path.display())))?;
+        .map_err(|e| Error::spawn(format!("chown {owner} {}", path.display()), e))?;
     if !output.status.success() {
-        return Err(Error::Other(format!(
-            "chown {owner} {} failed: {}",
-            path.display(),
-            String::from_utf8_lossy(&output.stderr)
-        )));
+        return Err(Error::command(
+            format!("chown {owner} {}", path.display()),
+            output.status,
+            &output.stderr,
+        ));
     }
     Ok(())
 }

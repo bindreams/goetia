@@ -223,10 +223,7 @@ pub fn load(path: &Path) -> Result<(DaemonSpec, Vec<Warning>), Error> {
         (path.to_path_buf(), base)
     };
 
-    let text = fs::read_to_string(&file_path).map_err(|source| Error::Io {
-        path: file_path.clone(),
-        source,
-    })?;
+    let text = fs::read_to_string(&file_path).map_err(|source| Error::os_at("read", &file_path, source))?;
     // The one and only place a manifest is read: every diagnostic a
     // manifest can produce — line, column, `null`, duplicate key, unknown
     // field — comes from here, on the file exactly as written. `resolve`
@@ -649,24 +646,9 @@ fn resolve_path_string(
         }
         resolved
     };
-    // Assert the post-condition rather than assume the fallback achieved it.
-    // Provably unreachable under every current `Prefix` variant, not merely
-    // untested: `std`'s own `Prefix::has_implicit_root` is `true` for every
-    // prefix except `Disk`, so a verbatim prefix (`Verbatim`, `VerbatimDisk`,
-    // `VerbatimUNC`) is already absolute before `p.is_absolute()` above ever
-    // reaches this fallback — `\\?\C:` included, despite reading as rootless.
-    // The one prefix that genuinely lacks a root, plain `Disk` (`C:bin`), is
-    // not verbatim, so `std::path::absolute` never returns it unchanged; it
-    // always resolves it via `GetFullPathNameW` into an absolute path (the
-    // drive-relative branch above). No known input reaches here; the check
-    // stays as a defensive invariant in case a future `std` changes that
-    // mapping.
-    if !joined.is_absolute() {
-        return Err(invalid(
-            id,
-            &format!("field `{field}` is `{raw}`, which cannot be resolved to an absolute path"),
-        ));
-    }
+    // `std::path::absolute` returns an absolute path or an error, and a verbatim prefix is already
+    // absolute above, so no input reaches here with a relative path.
+    debug_assert!(joined.is_absolute(), "`std::path::absolute` returned a relative path");
     Ok(joined.to_string_lossy().into_owned())
 }
 
@@ -691,15 +673,14 @@ fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error>
     if dir.is_absolute() {
         return Ok(normalize(dir));
     }
-    // Not `Error::Io`: that variant means "reading `path` from disk failed",
-    // and nothing was read from `dir` here. Reporting `failed to read
-    // <manifest dir>` would send someone chasing permissions on a directory
-    // that is fine, when the real fault is the process's own cwd being gone.
+    // Not an `Error::Os` at `dir`: nothing was read from `dir` here, and naming it would send
+    // someone chasing permissions on a directory that is fine, when the real fault is the process's
+    // own cwd being gone.
     let cwd = std::env::current_dir().map_err(|source| {
-        Error::Other(format!(
-            "failed to read the current directory while resolving `{}`: {source}",
-            dir.display()
-        ))
+        Error::os(
+            format!("read the current directory while resolving `{}`", dir.display()),
+            source,
+        )
     })?;
     let cwd = canonicalize_cwd(&cwd)?;
     let joined = normalize(&cwd.join(dir));
@@ -713,10 +694,10 @@ fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error>
         joined
     } else {
         let resolved = std::path::absolute(&joined).map_err(|source| {
-            Error::Other(format!(
-                "manifest directory `{}` cannot be resolved to an absolute path: {source}",
-                dir.display()
-            ))
+            Error::os(
+                format!("resolve manifest directory `{}` to an absolute path", dir.display()),
+                source,
+            )
         })?;
         if resolved.is_absolute() {
             warnings.push(Warning {
@@ -732,12 +713,7 @@ fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error>
         }
         resolved
     };
-    if !joined.is_absolute() {
-        return Err(Error::Other(format!(
-            "manifest directory `{}` cannot be resolved to an absolute path",
-            dir.display()
-        )));
-    }
+    debug_assert!(joined.is_absolute(), "`std::path::absolute` returned a relative path");
     Ok(joined)
 }
 
@@ -779,13 +755,11 @@ fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error>
 /// intuitive guess: it fails earlier, in `std::env::current_dir`, and never
 /// reaches this function. Do not put it back in the message below.
 fn canonicalize_cwd(cwd: &Path) -> Result<PathBuf, Error> {
-    let canonical = fs::canonicalize(cwd).map_err(|source| {
-        Error::Other(format!(
-            "canonicalising the current directory {} failed; it may be unreadable, or on a volume \
-             with no drive letter or mount point: {source}. Pass `-f` with an absolute path to \
-             skip resolving it",
-            cwd.display()
-        ))
+    let canonical = fs::canonicalize(cwd).map_err(|source| Error::Step {
+        what: "the current directory could not be canonicalised; it may be unreadable, or on a volume with no drive \
+               letter or mount point. Pass `-f` with an absolute path to skip resolving it"
+            .to_string(),
+        source: Box::new(Error::os_at("canonicalise", cwd, source)),
     })?;
     Ok(strip_verbatim_prefix(canonical))
 }

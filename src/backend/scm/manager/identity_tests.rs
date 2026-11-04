@@ -48,7 +48,7 @@ fn sid_resolves_a_well_known_sid_to_an_account_name() {
 #[skuld::test]
 fn sid_rejects_a_malformed_sid_string() {
     let err = resolve(&User::Id(AccountId::Sid("not-a-sid".to_string()))).expect_err("not a valid SID string");
-    assert!(err.to_string().contains("not-a-sid"));
+    assert_eq!(err.to_string(), "failed to parse `user.id` `not-a-sid` as a SID string");
 }
 
 // service_password ====================================================================================================
@@ -74,5 +74,9 @@ fn password_var_not_unicode_errs_rather_than_downgrading_to_none() {
     let not_unicode = std::ffi::OsString::from_wide(&[0xD800]);
     let err = parse_password_var(Err(std::env::VarError::NotUnicode(not_unicode)))
         .expect_err("malformed password must not silently become \"no password\"");
-    assert!(err.to_string().contains("GOETIA_SERVICE_PASSWORD"));
+    assert!(matches!(err, Error::InvalidPassword { .. }), "{err:?}");
+    assert_eq!(
+        err.report().to_string(),
+        "`GOETIA_SERVICE_PASSWORD` is set but its value is not valid Unicode"
+    );
 }

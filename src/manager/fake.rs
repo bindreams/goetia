@@ -82,6 +82,15 @@ pub(crate) struct Entry {
     state: State,
 }
 
+/// A seeded failure: made afresh at each use, since an [`Error`] cannot be cloned.
+struct Failure(Arc<dyn Fn() -> Error + Send + Sync>);
+
+impl std::fmt::Debug for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Failure")
+    }
+}
+
 /// An in-memory [`ServiceManager`]. See the module doc comment.
 ///
 /// Cheaply `Clone`: every clone shares the same underlying store through an
@@ -122,8 +131,8 @@ struct Store {
     prepare_fails: bool,
     no_manager: bool,
     unresolvable: BTreeSet<String>,
-    installed_fails: BTreeMap<String, String>,
-    live_status_fails: BTreeMap<String, String>,
+    installed_fails: BTreeMap<String, Failure>,
+    live_status_fails: BTreeMap<String, Failure>,
     write_races: BTreeMap<String, usize>,
     /// Ids whose service is gone by the time its live state is queried.
     live_status_gone: BTreeSet<String>,
@@ -455,19 +464,19 @@ impl Fake {
         state.unresolvable.insert(user.to_string());
     }
 
-    /// Test-only seeding: reading back what is installed at `id` fails with `detail`, as a
+    /// Test-only seeding: reading back what is installed at `id` fails with what `error` makes, as a
     /// backend's does for a drop-in directory it cannot list.
-    pub fn seed_installed_fails(&self, id: &str, detail: &str) {
+    pub fn seed_installed_fails(&self, id: &str, error: impl Fn() -> Error + Send + Sync + 'static) {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
-        state.installed_fails.insert(id.to_string(), detail.to_string());
+        state.installed_fails.insert(id.to_string(), Failure(Arc::new(error)));
     }
 
-    /// Test-only seeding: the live state of `id` cannot be queried, failing with `detail` as a
-    /// backend's does when the tool it asks is down. Not [`Error::NoManager`], which refuses
+    /// Test-only seeding: the live state of `id` cannot be queried, failing with what `error` makes
+    /// as a backend's does when the tool it asks is down. Not [`Error::NoManager`], which refuses
     /// every id at once: this is one entry's failure.
-    pub fn seed_live_status_fails(&self, id: &str, detail: &str) {
+    pub fn seed_live_status_fails(&self, id: &str, error: impl Fn() -> Error + Send + Sync + 'static) {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
-        state.live_status_fails.insert(id.to_string(), detail.to_string());
+        state.live_status_fails.insert(id.to_string(), Failure(Arc::new(error)));
     }
 
     /// Test-only seeding: the next `times` writes at `id` lose a race and write nothing, as when
@@ -649,9 +658,10 @@ impl Store {
         let id = snapshot.id();
         let current = flow::require_marked(id, self.read(id)?)?;
         if current.entry.text != snapshot.entry.text {
-            return Err(Error::Other(format!(
-                "`{id}` changed after being confirmed installed; nothing was done"
-            )));
+            return Err(Error::ConcurrentChange {
+                id: id.as_str().to_string(),
+                path: None,
+            });
         }
         self.manager()?;
         self.entries.get_mut(id.as_str()).ok_or_else(|| Error::NotInstalled {
@@ -690,7 +700,9 @@ impl crate::backend::Backend for Fake {
         if let User::Name(user) = &spec.user {
             let state = self.state.lock().expect("Fake mutex poisoned");
             if state.unresolvable.contains(user) {
-                return Err(Error::Other(format!("account `{user}` cannot be resolved (seeded)")));
+                return Err(Error::AccountLookup {
+                    detail: format!("account `{user}` cannot be resolved (seeded)"),
+                });
             }
         }
         Ok(generate(spec))
@@ -704,8 +716,8 @@ impl crate::backend::Backend for Fake {
     fn installed(&self, snapshot: &Artifact) -> Result<InstalledDefinition<String>> {
         let id = snapshot.id();
         let state = self.state.lock().expect("Fake mutex poisoned");
-        if let Some(detail) = state.installed_fails.get(id.as_str()) {
-            return Err(Error::Other(detail.clone()));
+        if let Some(failure) = state.installed_fails.get(id.as_str()) {
+            return Err(failure.0());
         }
         Ok(InstalledDefinition {
             definition: snapshot.entry.text.clone(),
@@ -765,8 +777,8 @@ impl crate::backend::Backend for Fake {
         let id = snapshot.id();
         let state = self.state.lock().expect("Fake mutex poisoned");
         state.manager()?;
-        if let Some(detail) = state.live_status_fails.get(id.as_str()) {
-            return Err(Error::Other(detail.clone()));
+        if let Some(failure) = state.live_status_fails.get(id.as_str()) {
+            return Err(failure.0());
         }
         if state.live_status_gone.contains(id.as_str()) {
             return Err(Error::NotInstalled {
@@ -854,9 +866,10 @@ impl crate::backend::Backend for Fake {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.prepared.push((steps.to_vec(), budget));
         if state.prepare_fails {
-            return Err(Error::Other(
-                "nothing could be prepared (injected test failure)".to_string(),
-            ));
+            return Err(Error::Reservation {
+                id: None,
+                source: std::io::Error::other("injected test failure"),
+            });
         }
         let guard = state.next_guard;
         state.next_guard += 1;
@@ -886,9 +899,12 @@ impl crate::backend::Backend for Fake {
         state.asked("start", id);
         in_doubt(&state, id)?;
         if state.confirm(&snapshot)?.state == State::Running {
-            return Err(Error::Other(format!(
-                "start `{id}`: refused as already running — the stop issued before it has not taken effect"
-            )));
+            return Err(Error::os(
+                format!("start `{id}`"),
+                std::io::Error::other(
+                    "ERROR_SERVICE_ALREADY_RUNNING: the stop issued before the start has not taken effect",
+                ),
+            ));
         }
         Ok(())
     }

@@ -239,8 +239,7 @@ pub(crate) fn daemon(id: &str, status: &Status) -> DaemonReport {
 /// remainder to `unusable` is what makes the two subcommands agree about
 /// one machine: a unit that decodes but whose live state cannot be queried
 /// reaches `list` as `Installed::OursUnusable` and `status` as a failure
-/// of its own — [`Error::CommandFailed`] on launchd, [`Error::Other`] on
-/// systemd.
+/// of its own — an [`Error::Command`] or [`Error::Os`], say.
 ///
 /// Three of the named arms are still the operation's own vocabulary, not a
 /// classification by error variant: `status(&id)` is the one operation that
@@ -252,7 +251,7 @@ pub(crate) fn daemon(id: &str, status: &Status) -> DaemonReport {
 /// `unavailable` under the id, exit `1` — per id, as every verb given ids
 /// answers each one.
 pub(crate) fn status_error(id: &str, e: &Error) -> ErrorReport {
-    let kind = match e {
+    let kind = match e.cause() {
         Error::NoManager { .. } => Kind::Unavailable,
         Error::NotInstalled { .. } => Kind::NotInstalled,
         Error::Foreign { .. } => Kind::Foreign,
@@ -262,7 +261,7 @@ pub(crate) fn status_error(id: &str, e: &Error) -> ErrorReport {
     ErrorReport {
         id: Some(id.to_string()),
         kind,
-        message: e.to_string(),
+        message: e.report().to_string(),
     }
 }
 
@@ -276,7 +275,7 @@ pub(crate) fn status_error(id: &str, e: &Error) -> ErrorReport {
 pub(crate) fn invalid_id(id: &str, e: &Error) -> ErrorReport {
     let message = match e {
         Error::Invalid { message, .. } => message.clone(),
-        other => other.to_string(),
+        other => other.report().to_string(),
     };
     ErrorReport {
         id: Some(id.to_string()),
@@ -295,7 +294,7 @@ pub(crate) fn unavailable(e: &Error) -> Report {
         errors: vec![ErrorReport {
             id: None,
             kind: Kind::Unavailable,
-            message: e.to_string(),
+            message: e.report().to_string(),
         }],
         undetermined: Vec::new(),
     }

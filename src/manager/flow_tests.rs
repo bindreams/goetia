@@ -17,7 +17,7 @@ fn mk_as(id: &str, user: &str) -> DaemonSpec {
 
 /// What `Fake::render` fails with for a seeded unresolvable account.
 fn unresolvable(user: &str) -> String {
-    format!("account `{user}` cannot be resolved (seeded)")
+    format!("account lookup failed: account `{user}` cannot be resolved (seeded)")
 }
 
 // install =============================================================================================================
@@ -77,7 +77,12 @@ fn install_refuses_an_undecodable_blob_with_uninstall_advice() {
 fn install_refuses_a_failed_comparison_with_its_error_alone() {
     let fake = Fake::new();
     fake.install(&mk("frpc"), false).unwrap();
-    fake.seed_installed_fails("frpc", "the unit could not be read back");
+    fake.seed_installed_fails("frpc", || {
+        Error::os(
+            "read back the unit",
+            std::io::Error::other("the unit could not be read back"),
+        )
+    });
 
     let outcome = fake.install(&mk("frpc"), false).unwrap();
 
@@ -209,12 +214,12 @@ fn status_reports_an_unresolvable_account_as_an_error() {
 
     let err = fake.status(&Id::try_from("frpc").unwrap()).unwrap_err();
 
-    match err {
-        Error::Other(message) => assert_eq!(
-            message,
+    match &err {
+        Error::Step { .. } => assert_eq!(
+            err.report().to_string(),
             format!("`frpc`'s embedded spec cannot be regenerated: {}", unresolvable("gone"))
         ),
-        other => panic!("expected Error::Other, got {other:?}"),
+        other => panic!("expected Error::Step, got {other:?}"),
     }
 }
 
@@ -243,7 +248,9 @@ fn list_reports_a_failed_live_status_as_ours_unusable() {
     let fake = Fake::new();
     fake.install(&mk("frpc"), false).unwrap();
     fake.install(&mk("other"), false).unwrap();
-    fake.seed_live_status_fails("frpc", "state unavailable");
+    fake.seed_live_status_fails("frpc", || {
+        Error::os("query the live state", std::io::Error::other("state unavailable"))
+    });
 
     let listed = fake.list().unwrap();
 
@@ -255,7 +262,8 @@ fn list_reports_a_failed_live_status_as_ours_unusable() {
     assert!(
         listed.contains(&Installed::OursUnusable {
             name: "frpc".to_string(),
-            reason: "marked ours, but its live state could not be queried: state unavailable".to_string(),
+            reason: "marked ours, but its live state could not be queried: failed to query the live state: state unavailable"
+                .to_string(),
         }),
         "{listed:?}"
     );
@@ -266,7 +274,10 @@ fn list_reports_a_failed_live_status_as_ours_unusable() {
         "{listed:?}"
     );
     match fake.status(&Id::try_from("frpc").unwrap()) {
-        Err(Error::Other(message)) => assert_eq!(message, "state unavailable"),
+        Err(e @ Error::Os { .. }) => assert_eq!(
+            e.report().to_string(),
+            "failed to query the live state: state unavailable"
+        ),
         other => panic!("status of the same id must return the error, got {other:?}"),
     }
 }

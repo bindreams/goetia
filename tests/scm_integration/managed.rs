@@ -454,7 +454,7 @@ fn uninstall_errors_when_service_will_not_stop() {
     let err = mgr
         .uninstall(&spec.id)
         .expect_err("a service that declines SERVICE_CONTROL_STOP cannot be stopped by uninstall");
-    let text = err.to_string();
+    let text = err.report().to_string();
     assert!(
         text.contains("does not accept STOP")
             && text.contains("NOT deleted")
@@ -510,6 +510,7 @@ fn stop_of_a_service_that_accepts_no_stop_says_so_without_waiting() {
         let text = mgr
             .stop(&spec.id, budget)
             .expect_err("a service that declines SERVICE_CONTROL_STOP cannot be stopped")
+            .report()
             .to_string();
         assert!(
             text.contains("does not accept STOP") && text.contains("goetia daemon kill"),
