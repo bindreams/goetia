@@ -125,14 +125,15 @@ const IGNORED: [&str; 2] = ["ignoring command", "ignoring request"];
 /// what it was asked ([`IGNORED`]) is the refusal on every path, and never a success: the backstop
 /// for what [`Systemctl::door`] could not see.
 ///
-/// It is the last line against a refusal `systemctl` reaches by its own detection and
-/// [`Host::evidence`] does not: a chroot with no `/proc` is no longer one of them, since goetia
-/// reads that absence itself ([`Chroot::NoProc`]) and refuses before it spawns. Nothing in the
-/// environment can put the report there instead: every switch that would declare a chroot is taken
-/// off the child ([`DENIED`]), so what reaches this is always the child's own detection. Where PID 1
-/// is hidden from goetia rather than absent, as under a `hidepid` `/proc`, `systemctl` runs with
-/// goetia's credentials and hits the same wall: it reports nothing, and this backstop does not fire
-/// either.
+/// It is the last line against a chroot that `systemctl`'s own detection (`running_in_chroot()`, run
+/// in the child) finds and [`Host::evidence`], which reads `/` and `/proc` for itself, does not:
+/// wherever goetia's readings establish nothing, the child's can still decide. An unresolvable
+/// `/proc/self` is no longer such a case, since goetia reads it itself ([`Chroot::NoProc`]) and
+/// refuses before it spawns. No environment switch can stand in for that detection: every one that
+/// would declare a chroot is taken off the child ([`DENIED`]), so what reaches this is always the
+/// child's own. Where PID 1 is hidden from goetia rather than absent, as under a `hidepid` `/proc`,
+/// `systemctl` runs with goetia's credentials and hits the same wall: it reports nothing, and this
+/// backstop does not fire either.
 fn answered(stdout: &[u8], stderr: &[u8]) -> Result<()> {
     let ignored = |stream: &[u8]| {
         String::from_utf8_lossy(stream)
@@ -175,8 +176,9 @@ const ENVIRONMENT: [(&str, &str); 3] = [
 ///
 /// The three, MEASURED on 255 and 257 in a chroot with no `/proc`, where `systemctl` ran and goetia
 /// established nothing of its own (it refuses there now, before a spawn, so these names matter only
-/// where `systemctl` still runs and detects a chroot itself): `SYSTEMD_IGNORE_CHROOT` true; `SYSTEMD_IN_CHROOT` false, on 257 on; and
-/// `SYSTEMD_OFFLINE` false, on every supported version — `running_in_chroot_or_offline()`
+/// where `systemctl` still runs and detects a chroot itself): `SYSTEMD_IGNORE_CHROOT` true;
+/// `SYSTEMD_IN_CHROOT` false, on 257 on; and `SYSTEMD_OFFLINE` false, on every supported version —
+/// `running_in_chroot_or_offline()`
 /// (systemd's `src/shared/verbs.c`) consults that one first and returns it whenever it *parses*, so
 /// a false value discards the chroot check as surely as `SYSTEMD_IGNORE_CHROOT=1` does. With any of
 /// the three inherited, `install` from such a chroot exited `0` and wrote the unit into it.
@@ -252,10 +254,11 @@ enum Evidence {
     /// `/run/systemd/system` does not exist, which systemd makes when it boots a system
     /// (`sd_booted()`): not booted with systemd, or a chroot with no `/run` of the host's.
     NotBooted,
-    /// `/` is established to be a root of goetia's own rather than this system's, found as this
-    /// says: either it is not PID 1's root — a chroot (`running_in_chroot()`), or a container
-    /// sharing the host's PID namespace — or it is no mount at all, which only `chroot(2)` leaves,
-    /// and which PID 1's table has no say in — or there is no `/proc` to read any of it from.
+    /// `/` is established to be a root of goetia's own rather than this system's, by one of:
+    /// - it is not PID 1's root, by directory or by mount: a chroot (`running_in_chroot()`), or a
+    ///   container sharing the host's PID namespace;
+    /// - it is no mount at all, which only `chroot(2)` leaves, and which PID 1's table has no say in;
+    /// - `/proc/self` does not resolve, so no `/proc` of goetia's own is mounted.
     Chroot(Chroot),
     /// `systemctl` said, in this line, that it ignored what it was asked: its chroot report.
     Ignored(String),
@@ -280,7 +283,7 @@ impl std::fmt::Display for Evidence {
             ),
             Evidence::Chroot(Chroot::NoProc) => write!(
                 f,
-                "`{PROC_SELF}` does not exist (no `/proc` is mounted), so goetia runs in a chroot"
+                "`{PROC_SELF}` does not resolve (no `/proc` of goetia's own is mounted), which systemd treats as a chroot"
             ),
             Evidence::Ignored(line) => write!(f, "`systemctl` said {line:?}"),
         }
@@ -299,11 +302,13 @@ const INIT_ROOT: &str = "/proc/1/root";
 
 /// goetia's mount table, and PID 1's: each lists the mounts its process sees, `/` included.
 const OWN_MOUNTS: &str = "/proc/self/mountinfo";
-
-/// Present in every mounted `/proc`, so `ENOENT` on it means none is mounted — an empty `/proc`
-/// directory with nothing on it included.
-const PROC_SELF: &str = "/proc/self";
 const INIT_MOUNTS: &str = "/proc/1/mountinfo";
+
+/// goetia's own entry in `/proc`. It resolves only in a `/proc` of goetia's own PID namespace, so
+/// `ENOENT` on it establishes that none is mounted: a `/proc` belonging to another PID namespace,
+/// where goetia has no pid, and an empty `/proc` directory both give it. systemd treats that as a
+/// chroot (`running_in_chroot()` falls back to `proc_mounted()`).
+const PROC_SELF: &str = "/proc/self";
 
 /// How goetia established that its `/` is a root of its own rather than this system's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,9 +321,9 @@ enum Chroot {
     /// No mount is at `/`: `/` is a directory inside one, which only `chroot(2)` makes a root — see
     /// [`mounts_differ`]. Readable unelevated, and without PID 1's table.
     NoMount,
-    /// [`PROC_SELF`] is established absent: no `/proc` is mounted, which is how a chroot without one
-    /// looks. Nothing else can then be read, and cosca kills any child whose identity it cannot read
-    /// from `/proc`, so no `systemctl` could run to report the chroot itself.
+    /// [`PROC_SELF`] is established absent: no `/proc` of goetia's own is mounted, which systemd
+    /// treats as a chroot. Nothing else can then be read, and cosca kills any child whose identity
+    /// it cannot read from `/proc`, so no `systemctl` could run to report the chroot itself.
     NoProc,
 }
 
@@ -375,7 +380,7 @@ fn identity(path: &str) -> std::io::Result<(u64, u64)> {
 }
 
 /// How `/` is established to be a root of goetia's own, if it is. `proc_absent` decides first:
-/// with no `/proc` mounted, none of the rest can be read. Then `root` and `init_root`, both read,
+/// with no `/proc` of goetia's own mounted, none of the rest can be read. Then `root` and `init_root`, both read,
 /// decide, either way: that is `running_in_chroot()`'s own check. A stat that failed — `EACCES` on
 /// `/proc/1/root` for a caller that may not trace PID 1 — establishes nothing, and leaves it to the
 /// mount `tables` ([`mounts_differ`]); where they establish nothing either, the other checks and

@@ -604,7 +604,7 @@ fn a_chroot_without_proc_is_refused_before_anything_is_spawned() {
         assert_eq!(output.status.code(), Some(1), "{context}");
         assert!(
             stderr.contains(&format!(
-                "{REFUSAL}`/proc/self` does not exist (no `/proc` is mounted), so goetia runs in a chroot"
+                "{REFUSAL}`/proc/self` does not resolve (no `/proc` of goetia's own is mounted), which systemd treats as a chroot"
             )),
             "{context}"
         );

@@ -750,7 +750,7 @@ fn evidence_known_without_asking_refuses_every_path_before_anything_runs() {
                 unbooted: false,
                 chroot: Some(Chroot::NoProc),
             },
-            "`/proc/self` does not exist (no `/proc` is mounted), so goetia runs in a chroot",
+            "`/proc/self` does not resolve (no `/proc` of goetia's own is mounted), which systemd treats as a chroot",
         ),
     ];
     for (host, evidence) in hosts {
@@ -1219,8 +1219,9 @@ fn two_roots_read_decide_and_the_mount_tables_only_where_they_could_not_be() {
     }
 }
 
-/// With no `/proc` mounted nothing of PID 1's or goetia's own can be read, so every other check
-/// establishes nothing: that absence is the evidence, and no table or stat is consulted for it.
+/// With no `/proc` of goetia's own mounted nothing of PID 1's or goetia's can be read, so every
+/// other check establishes nothing: that absence is the evidence, and no table or stat is consulted
+/// for it.
 #[skuld::test]
 fn an_established_absent_proc_is_evidence_of_a_chroot_whatever_else_could_not_be_read() {
     let failed = |errno| Err(std::io::Error::from_raw_os_error(errno));
@@ -1305,7 +1306,7 @@ fn only_a_mount_table_without_pid_1s_mount_at_root_is_evidence_of_a_chroot() {
     );
     for (init, why) in [
         (failed(libc::EACCES), "PID 1's unreadable"),
-        (failed(libc::ENOENT), "no /proc"),
+        (failed(libc::ENOENT), "PID 1's table is gone"),
         (table(&[("8:1", "/usr", "/usr")]), "PID 1 with no mount at /"),
     ] {
         assert_eq!(mounts_differ(table(&[("0:131", "/", "/")]), init), None, "{why}");
@@ -1376,10 +1377,11 @@ fn systemd_offline_is_evidence_only_when_true() {
     }
 }
 
-/// The chroot `systemctl` itself detects — `/proc/1/root` against `/` — as it reports it: `show` exits `0`, prints nothing, and says why on stderr,
-/// in 246's words and newer ones' (measured on 257), 242 to 245's, or those with no verb to name
-/// (see [`IGNORED`]). The gate refuses it, naming the report. A chroot the *environment* declares
-/// is not among the causes: [`DENIED`] takes every such switch off the child.
+/// The chroot `systemctl` itself detects — `/proc/1/root` against `/` — as it reports it: `show`
+/// exits `0`, prints nothing, and says why on stderr, in 246's words and newer ones' (measured on
+/// 257), 242 to 245's, or those with no verb to name (see [`IGNORED`]). The gate refuses it, naming
+/// the report. A chroot the *environment* declares is not among the causes: [`DENIED`] takes every
+/// such switch off the child.
 ///
 /// Five settings stop a real one reporting it, MEASURED in that chroot on 255 and 257:
 /// `SYSTEMD_LOG_LEVEL=emerg` or `SYSTEMD_LOG_TARGET=null`, which discard the line rather than the
