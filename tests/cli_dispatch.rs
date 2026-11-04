@@ -203,6 +203,9 @@ struct FlakyManager {
     /// failure, and so the only way to reach that re-wrap with a variant
     /// that has to survive it. Also `install --start`'s start leg.
     undetermined_start_for: Option<String>,
+    /// `start` fails with an `Error::Step` over `Error::Undetermined`: an operation that failed
+    /// because a step under it did, where the step's own answer is that the outcome is open.
+    step_over_undetermined_start_for: Option<String>,
     /// `enable` fails with `Error::Undetermined` — the `--enable` twin of
     /// `undetermined_start_for`, exercising `install`'s enable step.
     undetermined_enable_for: Option<String>,
@@ -289,6 +292,12 @@ impl FlakyManager {
         }
         if self.wait_timeout_start_for.as_deref() == Some(id.as_str()) {
             return Err(injected_wait_timeout(id));
+        }
+        if self.step_over_undetermined_start_for.as_deref() == Some(id.as_str()) {
+            return Err(goetia::Error::Step {
+                what: "start".to_string(),
+                source: Box::new(injected_indeterminacy(id)),
+            });
         }
         Ok(())
     }
@@ -2999,6 +3008,44 @@ fn restart_exits_four_for_an_undetermined_id() {
         err.contains("stopped but failed to restart"),
         "the context the wrap exists for survives it: {err}"
     );
+}
+
+/// An `Error::Step` is what its source is: over an unanswered question it is exit `4`, and its
+/// whole chain is printed.
+#[skuld::test]
+fn start_exits_four_for_a_step_over_an_undetermined_error() {
+    let inner = Fake::new();
+    inner.install(&mk("frpc"), false).unwrap();
+    let mgr = FlakyManager {
+        inner,
+        step_over_undetermined_start_for: Some("frpc".to_string()),
+        ..Default::default()
+    };
+
+    let (code, _out, err) = dispatch_with(&["goetia", "daemon", "start", "frpc"], &mgr, &|| true);
+
+    assert_eq!(code, 4, "{err}");
+    assert!(
+        err.contains("start: cannot determine whether daemon `frpc` is installed"),
+        "the step and its cause are one line: {err}"
+    );
+}
+
+/// `status <id>` classifies by what a step failed on, not by the step: over `NotInstalled` it is
+/// `not-installed`, never `unusable`, which claims goetia owns the id.
+#[skuld::test]
+fn status_reports_a_step_over_not_installed_as_not_installed() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_live_status_fails("frpc", || goetia::Error::Step {
+        what: "query the live state".to_string(),
+        source: Box::new(goetia::Error::NotInstalled { id: "frpc".to_string() }),
+    });
+
+    let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "status", "frpc"], &fake);
+
+    assert_eq!(error_kinds(&parse_json(&out)), ["not-installed"], "{out}");
+    assert_eq!(code, 1, "{out}");
 }
 
 /// A wait that ran out is the same *class* as an unanswered question — the code is about whether

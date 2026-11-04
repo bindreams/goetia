@@ -526,7 +526,11 @@ impl fmt::Display for Report<'_> {
 }
 
 fn write_chain(e: &(dyn std::error::Error + 'static), f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    if let Some(Error::Both { first, then }) = e.downcast_ref::<Error>() {
+    // A `#[source]` of type `Box<Error>` reaches here as the box.
+    let ours = e
+        .downcast_ref::<Error>()
+        .or_else(|| e.downcast_ref::<Box<Error>>().map(|b| &**b));
+    if let Some(Error::Both { first, then }) = ours {
         write_chain(first.as_ref(), f)?;
         f.write_str("; then: ")?;
         return write_chain(then.as_ref(), f);
