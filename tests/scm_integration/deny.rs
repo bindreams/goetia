@@ -19,8 +19,6 @@
 
 #![allow(dead_code)]
 
-use std::os::windows::ffi::OsStrExt as _;
-
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_OBJECT_TYPE, SE_REGISTRY_KEY, SE_SERVICE,
@@ -28,7 +26,7 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PSECURITY_DESCRIPTOR};
 
-use crate::support;
+use crate::support::{self, wide_null};
 
 // SDDL ================================================================================================================
 //
@@ -64,13 +62,6 @@ fn key_dacl(deny: Option<&str>) -> String {
 }
 
 // SetNamedSecurityInfoW ===============================================================================================
-
-fn wide_null(s: &str) -> Vec<u16> {
-    std::ffi::OsStr::new(s)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
-}
 
 /// Replace `object`'s explicit DACL with the one `sddl` describes.
 ///

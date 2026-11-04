@@ -4,8 +4,7 @@
 //! Preshutdown whatever the handler returned, while the registration stays live; `clippy.toml`
 //! forbids it. The context here is leaked and so outlives every control.
 
-use std::ffi::{OsStr, c_void};
-use std::os::windows::ffi::OsStrExt as _;
+use std::ffi::c_void;
 use std::sync::mpsc::Sender;
 
 use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, NO_ERROR};
@@ -25,7 +24,7 @@ pub struct StatusHandle(SERVICE_STATUS_HANDLE);
 
 /// Register the handler for `name`. A `Some` sender is signalled on `STOP`.
 pub fn register(name: &str, stop: Option<Sender<()>>) -> StatusHandle {
-    let name: Vec<u16> = OsStr::new(name).encode_wide().chain(std::iter::once(0)).collect();
+    let name = super::wide_null(name);
     let context: *mut HandlerContext = Box::into_raw(Box::new(HandlerContext { stop }));
     // SAFETY: `name` is NUL-terminated and outlives the call; the context is never freed.
     let handle = unsafe { RegisterServiceCtrlHandlerExW(name.as_ptr(), Some(handler), context.cast()) };

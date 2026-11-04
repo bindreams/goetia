@@ -646,7 +646,7 @@ fn executable_trailing_backslash_does_not_round_trip_through_argv0() {
 #[cfg(windows)]
 mod real_win32 {
     use std::ffi::OsString;
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::os::windows::ffi::OsStringExt;
 
     #[link(name = "shell32")]
     unsafe extern "system" {
@@ -665,10 +665,7 @@ mod real_win32 {
     /// platform where that is possible, rather than exclusively against
     /// itself.
     pub fn split(cmdline: &str) -> Vec<String> {
-        let wide: Vec<u16> = std::ffi::OsStr::new(cmdline)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
+        let wide = crate::backend::scm::manager::identity::wide_null(cmdline);
         let mut argc: i32 = 0;
         // SAFETY: `wide` is a valid null-terminated UTF-16 string that
         // outlives this call; `argc` is a valid, aligned `i32` out-param.

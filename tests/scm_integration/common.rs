@@ -7,6 +7,7 @@ use goetia::spec::{DaemonSpec, Id, Kind, Restart, User};
 use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 
+use crate::support::wide_null;
 use crate::{fixture, support};
 
 /// [`fixture_command`], parameterized on the executable path. Needed by
@@ -152,18 +153,9 @@ pub fn conformance_mk(id: &str) -> DaemonSpec {
 // counterpart — sanctioned here the same way `fixture.rs` already uses raw
 // FFI for SCM dispatch.
 
-use std::os::windows::ffi::OsStrExt as _;
-
 use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, LocalFree};
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::{LookupAccountNameW, PSID};
-
-fn wide_null(s: &str) -> Vec<u16> {
-    std::ffi::OsStr::new(s)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
-}
 
 /// `LookupAccountNameW` + `ConvertSidToStringSidW`: the string SID for a
 /// local account name (e.g. one this test just created with `net user`).

@@ -22,11 +22,11 @@
 //!   directly by its PID during that test's own cleanup, never via `stop`.
 
 use std::ffi::OsString;
-use std::net::{Ipv4Addr, TcpStream};
 use std::sync::mpsc;
 
 use windows_service::{define_windows_service, service_dispatcher};
 
+use crate::support::sentinel::{connect, send_line};
 use crate::support::service_ctrl;
 
 pub const FIXTURE: &str = "--goetia-scm-fixture";
@@ -78,19 +78,4 @@ fn service_main(_scm_arguments: Vec<OsString>) {
     stop_rx.recv().expect("stop control");
     service_ctrl::report_stopped(status_handle);
     connect(stop_port);
-}
-
-/// Reporting in is best-effort: a failure to connect is indistinguishable to
-/// this process from never having been started, and it is the test — which
-/// holds the listener — that decides what that means.
-fn connect(port: u16) {
-    drop(TcpStream::connect((Ipv4Addr::LOCALHOST, port)));
-}
-
-fn send_line(port: u16, value: &str) {
-    use std::io::Write as _;
-    if let Ok(mut stream) = TcpStream::connect((Ipv4Addr::LOCALHOST, port)) {
-        let _ = stream.write_all(value.as_bytes());
-        let _ = stream.shutdown(std::net::Shutdown::Write);
-    }
 }

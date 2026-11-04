@@ -17,6 +17,7 @@ use super::dirs::ensure_dir;
 use super::discover::{RawState, raw_state};
 use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 use super::*;
+use crate::manager::conformance::fresh_id;
 use crate::spec::{Kind, Restart};
 
 #[skuld::label]
@@ -73,7 +74,7 @@ fn mk(id: &str) -> DaemonSpec {
 
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn create_does_not_clobber_a_unit_that_appears_after_classification() {
-    let id = test_id();
+    let id = fresh_id("systemd");
     let path = unit_path(&id);
     let _cleanup = Cleanup(path.clone());
 
@@ -105,7 +106,7 @@ fn create_does_not_clobber_a_unit_that_appears_after_classification() {
 
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn quarantine_detects_a_swap_that_happened_after_classification() {
-    let id = test_id();
+    let id = fresh_id("systemd");
     let path = unit_path(&id);
     let _cleanup = Cleanup(path.clone());
 
@@ -130,7 +131,7 @@ fn quarantine_detects_a_swap_that_happened_after_classification() {
 
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn quarantine_succeeds_when_nothing_raced() {
-    let id = test_id();
+    let id = fresh_id("systemd");
     let path = unit_path(&id);
     let _cleanup = Cleanup(path.clone());
 
@@ -167,7 +168,7 @@ fn quarantine_succeeds_when_nothing_raced() {
 /// only interleaving a non-clobbering write is about.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn install_never_corrupts_state_when_something_races_the_first_create() {
-    let id = test_id();
+    let id = fresh_id("systemd");
     let path = unit_path(&id);
     let _cleanup = Cleanup(path.clone());
 
@@ -224,7 +225,7 @@ impl Drop for RmDir {
 
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn ensure_dir_leaves_a_preexisting_directory_untouched() {
-    let dir = std::env::temp_dir().join(format!("{}-preexisting", test_id()));
+    let dir = std::env::temp_dir().join(format!("{}-preexisting", fresh_id("systemd")));
     std::fs::create_dir(&dir).expect("create pre-existing dir");
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
     let _cleanup = RmDir(dir.clone());
@@ -243,7 +244,7 @@ fn ensure_dir_leaves_a_preexisting_directory_untouched() {
 fn ensure_dir_accepts_a_preexisting_directory_the_account_cannot_write() {
     use std::os::unix::fs::MetadataExt as _;
 
-    let dir = std::env::temp_dir().join(format!("{}-unwritable", test_id()));
+    let dir = std::env::temp_dir().join(format!("{}-unwritable", fresh_id("systemd")));
     std::fs::create_dir(&dir).expect("create pre-existing dir");
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
     let _cleanup = RmDir(dir.clone());
@@ -257,7 +258,7 @@ fn ensure_dir_accepts_a_preexisting_directory_the_account_cannot_write() {
 
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn ensure_dir_refuses_a_preexisting_file() {
-    let path = std::env::temp_dir().join(format!("{}-a-file", test_id()));
+    let path = std::env::temp_dir().join(format!("{}-a-file", fresh_id("systemd")));
     std::fs::write(&path, b"").expect("create file");
     let _cleanup = Cleanup(path.clone());
 
@@ -273,7 +274,7 @@ fn ensure_dir_refuses_a_preexisting_file() {
 /// join discipline as `install_never_corrupts_state_when_something_races_the_first_create`.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn replace_reports_raced_twice_rather_than_guessing_which_file_wins() {
-    let id = test_id();
+    let id = fresh_id("systemd");
     let path = unit_path(&id);
     let _cleanup = Cleanup(path.clone());
 
@@ -330,7 +331,7 @@ fn replace_reports_raced_twice_rather_than_guessing_which_file_wins() {
 /// `quarantine_if_still_ours` level rather than through a real `stop`/`disable` cycle.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn quarantine_used_by_uninstall_reports_a_race_instead_of_removing_the_wrong_file() {
-    let id = test_id();
+    let id = fresh_id("systemd");
     let path = unit_path(&id);
     let _cleanup = Cleanup(path.clone());
 

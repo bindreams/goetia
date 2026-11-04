@@ -88,12 +88,12 @@
 //! reach `CreateServiceW`/`ChangeServiceConfigW` for one that needs none —
 //! Windows rejects a password outright for those accounts.
 
-mod identity;
+pub(in crate::backend::scm) mod identity;
 mod registry;
 
 use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
-use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+use std::ffi::OsString;
+use std::os::windows::ffi::OsStringExt as _;
 use std::path::PathBuf;
 
 use windows_service::service::{
@@ -547,7 +547,7 @@ fn read_failure_actions(service: &Service, name: &str) -> Result<Option<GenFailu
 /// `CommandLineToArgvW`, the same authority `generate_tests.rs`'s
 /// `windows_style_split` is checked against.
 fn split_command_line(cmdline: &str) -> (PathBuf, Vec<String>) {
-    let wide: Vec<u16> = OsStr::new(cmdline).encode_wide().chain(std::iter::once(0)).collect();
+    let wide = identity::wide_null(cmdline);
     let mut argc: i32 = 0;
     // SAFETY: `wide` is a valid null-terminated UTF-16 string that outlives
     // this call; `argc` is a valid, aligned `i32` out-param.
