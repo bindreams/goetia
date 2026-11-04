@@ -798,7 +798,11 @@ fn failed(args: &[&str], request: bool, error: ClientError) -> Error {
     let command = format!("launchctl {}", args.join(" "));
     let (source, may_have_run) = match error {
         ClientError::NotRun(source) => (source, false),
-        ClientError::MayHaveRun(source) | ClientError::Lost { error: source, .. } => (source, true),
+        ClientError::MayHaveRun(source) => (source, true),
+        ClientError::Lost { error, announced } => {
+            debug_assert!(!announced, "launchd sends no announced requests");
+            (error, true)
+        }
     };
     if request && may_have_run {
         Error::RequestInDoubt {
@@ -879,8 +883,8 @@ impl Launchctl {
 
     /// `launchctl` with `args`, spawned and waited under `deadline` in `role`.
     ///
-    /// **Every** `launchctl` call the budgeted verbs make goes through here
-    /// (D6a), and `role` is what keeps the budget from deciding whether a
+    /// **Every** `launchctl` call the budgeted verbs make goes through here,
+    /// and `role` is what keeps the budget from deciding whether a
     /// request is sent: a [`Role::Request`] that expires is left running, never
     /// killed, since `launchctl` never says when launchd has the request. Its
     /// [`Reaper`] was made before the verb sent anything — see [`reapers`] — and
@@ -897,7 +901,11 @@ impl Launchctl {
     fn run(&self, args: &[&str], deadline: Deadline, role: Role) -> Result<Finished> {
         // A request whose `launchctl` may have started is in doubt, not failed: it may have reached
         // launchd. A read changes nothing either way.
-        let request = matches!(role, Role::Request(_));
+        let request = match role {
+            Role::Query | Role::UncountedQuery => false,
+            Role::Request(_) => true,
+            Role::AnnouncedRequest(_) => unreachable!("launchd sends no announced requests"),
+        };
         self.client
             .run(args, Wait::Bounded { role, deadline })
             .map_err(|error| failed(args, request, error))

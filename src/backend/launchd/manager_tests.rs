@@ -8,7 +8,7 @@
 //! `tests/launchd_integration.rs` instead.
 
 use super::*;
-use crate::backend::client::fake::{Entry, Fake, exited, fail, reply};
+use crate::backend::client::fake::{Entry, Fake, RoleKind, Waited, exited, fail, reply};
 use crate::backend::client::{Client, ClientError, Real};
 use crate::manager::ServiceManager;
 use crate::spec::{Id, Kind, Restart, User};
@@ -1446,6 +1446,103 @@ fn every_launchd_verb_path_stays_inside_its_reservation() {
     assert!(!staging_path(&name).exists(), "uninstall left the plist");
 }
 
+// roles and expiry ====================================================================================================
+
+/// A [`Launchctl`] over a fake that answers its one call, to `verb`, with `finished`, and the fake.
+fn launchctl_replying(verb: &str, finished: Finished) -> (Launchctl, Fake) {
+    let fake = Fake::new([reply(&[verb], finished)]);
+    (Launchctl::new(Box::new(fake.clone())), fake)
+}
+
+/// A call that changes the job goes out as a request, and one that only reads goes out as a query:
+/// the role is what decides whether an expiry leaves the child running or kills it. `status` and
+/// `list` read as an uncounted query. (`kill_job`'s role is pinned with its argv, below.)
+#[skuld::test]
+fn launchctl_sends_requests_as_requests_and_reads_as_queries() {
+    let id = never_installed();
+    let id = id.as_str();
+    let deadline = Budget::DEFAULT.start();
+    let path = Path::new("/nonexistent/goetia-roles.plist");
+    let [bootstrap, bootout, kickstart] = reapers::<3>(&never_installed()).unwrap();
+    let done = |verb| launchctl_replying(verb, exited(0, "", ""));
+    let waited = |role| [Waited { role, bounded: true }];
+
+    let (launchctl, fake) = done("bootstrap");
+    launchctl.bootstrap(path, deadline, bootstrap).unwrap();
+    assert_eq!(fake.waits(), waited(RoleKind::Request));
+
+    let (launchctl, fake) = done("bootout");
+    launchctl.bootout(id, deadline, bootout).unwrap();
+    assert_eq!(fake.waits(), waited(RoleKind::Request));
+
+    let (launchctl, fake) = done("kickstart");
+    launchctl.kickstart(id, Budget::DEFAULT, deadline, kickstart).unwrap();
+    assert_eq!(fake.waits(), waited(RoleKind::Request));
+
+    let (launchctl, fake) = done("print");
+    launchctl.is_loaded(id, deadline).unwrap();
+    assert_eq!(fake.waits(), waited(RoleKind::Query));
+
+    let (launchctl, fake) = done("print");
+    launchctl.read_live_state(id, deadline, Role::Query).unwrap();
+    assert_eq!(fake.waits(), waited(RoleKind::Query));
+
+    let (launchctl, fake) = done("print");
+    launchctl.read_live_state(id, deadline, Role::UncountedQuery).unwrap();
+    assert_eq!(fake.waits(), waited(RoleKind::UncountedQuery));
+}
+
+/// A deadline that expired before `launchctl` finished is neither a success nor a failure of the
+/// call: each call says so as `Ok(None)`, and a read of live state as `Unknown`, which the verb
+/// above it turns into a wait timeout or a state it does not know.
+#[skuld::test]
+fn launchctl_calls_that_expire_report_the_expiry() {
+    let id = never_installed();
+    let id = id.as_str();
+    let deadline = Budget::DEFAULT.start();
+    let path = Path::new("/nonexistent/goetia-expiry.plist");
+    let [bootstrap, bootout, kickstart, kill] = reapers::<4>(&never_installed()).unwrap();
+    let expired = |verb| launchctl_replying(verb, Finished::Expired).0;
+
+    let loaded = expired("print").is_loaded(id, deadline);
+    assert!(loaded.expect("an expiry is not a failure").is_none());
+    let bootstrapped = expired("bootstrap").bootstrap(path, deadline, bootstrap);
+    assert!(bootstrapped.expect("an expiry is not a failure").is_none());
+    let started = expired("kickstart").kickstart(id, Budget::DEFAULT, deadline, kickstart);
+    assert!(started.expect("an expiry is not a failure").is_none());
+    let booted_out = expired("bootout").bootout(id, deadline, bootout);
+    assert!(booted_out.expect("an expiry is not a failure").is_none());
+    let killed = expired("kill").kill_job(id, deadline, kill);
+    assert!(killed.expect("an expiry is not a failure").is_none());
+
+    for role in [Role::Query, Role::UncountedQuery] {
+        let live = expired("print").read_live_state(id, deadline, role);
+        assert!(
+            matches!(live, Ok((State::Unknown, None))),
+            "a state not fully read is not known: {live:?}"
+        );
+    }
+}
+
+/// `stop` over a `bootout` that outlasts a bounded budget is a wait timeout, not a success: the
+/// request is out, and goetia says it stopped waiting.
+#[skuld::test]
+fn a_stop_whose_bootout_expires_is_a_wait_timeout() {
+    use crate::backend::Backend;
+
+    let id = never_installed();
+    let fake = Fake::new([reply(&["bootout"], Finished::Expired)]);
+    let mgr = launchd_over(fake.clone());
+
+    let e = Backend::stop(&mgr, marked_plist(&id), Budget::DEFAULT).expect_err("expired");
+
+    assert!(
+        matches!(&e, Error::WaitTimeout { id: named, awaited: "stopped", .. } if named == id.as_str()),
+        "{e:?}"
+    );
+    fake.assert_spent("the bootout was sent");
+}
+
 // kill ================================================================================================================
 
 /// `kill_job` over `id`, with `answer` standing in for what `launchctl kill` says.
@@ -1467,6 +1564,13 @@ fn kill_sends_sigkill_to_the_job_in_the_system_domain() {
 
     assert!(matches!(result, Ok(Some(()))), "{result:?}");
     assert_eq!(script.calls(), [["kill", "SIGKILL", format!("system/{id}").as_str()]]);
+    assert_eq!(
+        script.waits(),
+        [Waited {
+            role: RoleKind::Request,
+            bounded: false
+        }]
+    );
 }
 
 /// The two ways launchd says there is no process to signal: the job is not loaded (113), or it is

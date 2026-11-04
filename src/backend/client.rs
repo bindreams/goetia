@@ -1,19 +1,18 @@
-//! A service manager's command-line client (`launchctl`, and `systemctl` once it moves here) as the
-//! backends reach it: one trait, [`Client`], real over [`bounded`] and `cosca` ([`Real`]) and, in
-//! tests, a table of stated replies (`fake::Fake`).
+//! A service manager's command-line client (`launchctl`) as the backends reach it: one trait,
+//! [`Client`], real over [`bounded`] and `cosca` ([`Real`]) and, in tests, a table of stated replies
+//! (`fake::Fake`).
 //!
 //! A backend decides what a reply means; the client only runs the program and says how it ended.
 
 use crate::backend::bounded::{self, Finished, Role, SpawnError};
 use crate::manager::budget::Deadline;
 
-/// A service manager's command-line client, run once per call.
+/// A service manager's command-line client.
 pub(crate) trait Client: Send + Sync {
     /// Run the client with `args`, waiting as `wait` says.
     fn run(&self, args: &[&str], wait: Wait) -> Result<Finished, ClientError>;
 }
 
-/// How a call is waited on.
 pub(crate) enum Wait {
     /// Under `deadline`, as [`bounded`] does it for `role`.
     Bounded { role: Role, deadline: Deadline },
@@ -46,12 +45,7 @@ impl From<SpawnError> for ClientError {
     }
 }
 
-// Real ================================================================================================================
-
 /// The real client: `program` (`["launchctl"]`) run with `environment` applied to every child.
-///
-/// What the program is stands in for nothing: a test of what a real child does builds one with
-/// `["/bin/sh", "-c", script, "launchctl"]`.
 pub(crate) struct Real {
     program: Vec<String>,
     environment: fn(&mut cosca::Command),
@@ -87,8 +81,6 @@ impl Client for Real {
     }
 }
 
-// Fake ================================================================================================================
-
 /// A test client: a table of stated replies, with no process behind it.
 #[cfg(test)]
 pub(crate) mod fake {
@@ -97,7 +89,7 @@ pub(crate) mod fake {
     use std::process::ExitStatus;
     use std::sync::{Arc, Mutex};
 
-    use super::{Client, ClientError, Finished, Wait};
+    use super::{Client, ClientError, Finished, Role, Wait};
     use crate::backend::bounded::Capture;
 
     /// Replies consumed in order. Each entry names the argv prefix it expects, and may carry an
@@ -112,6 +104,40 @@ pub(crate) mod fake {
     struct State {
         entries: VecDeque<Entry>,
         calls: Vec<Vec<String>>,
+        waits: Vec<Waited>,
+    }
+
+    /// How a call was waited on: the kind of its [`Role`], and whether its deadline can expire.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct Waited {
+        pub(crate) role: RoleKind,
+        pub(crate) bounded: bool,
+    }
+
+    /// Which [`Role`] a call had, without its [`Reaper`].
+    ///
+    /// [`Reaper`]: crate::backend::bounded::Reaper
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum RoleKind {
+        Query,
+        UncountedQuery,
+        AnnouncedRequest,
+        Request,
+    }
+
+    impl Waited {
+        fn of(wait: &Wait) -> Waited {
+            let Wait::Bounded { role, deadline } = wait;
+            Waited {
+                role: match role {
+                    Role::Query => RoleKind::Query,
+                    Role::UncountedQuery => RoleKind::UncountedQuery,
+                    Role::AnnouncedRequest(_) => RoleKind::AnnouncedRequest,
+                    Role::Request(_) => RoleKind::Request,
+                },
+                bounded: deadline.at().is_some(),
+            }
+        }
     }
 
     /// One stated reply: see [`reply`] and [`fail`].
@@ -129,12 +155,10 @@ pub(crate) mod fake {
         }
     }
 
-    /// A call starting with `prefix` finishes as `finished`.
     pub(crate) fn reply(prefix: &[&str], finished: Finished) -> Entry {
         entry(prefix, Ok(finished))
     }
 
-    /// A call starting with `prefix` fails as `error`.
     pub(crate) fn fail(prefix: &[&str], error: ClientError) -> Entry {
         entry(prefix, Err(error))
     }
@@ -165,13 +189,18 @@ pub(crate) mod fake {
                 state: Arc::new(Mutex::new(State {
                     entries: entries.into_iter().collect(),
                     calls: Vec::new(),
+                    waits: Vec::new(),
                 })),
             }
         }
 
-        /// The argv of every call so far, in order.
         pub(crate) fn calls(&self) -> Vec<Vec<String>> {
             self.state.lock().unwrap().calls.clone()
+        }
+
+        /// How every call so far was waited on, in the order of [`Self::calls`].
+        pub(crate) fn waits(&self) -> Vec<Waited> {
+            self.state.lock().unwrap().waits.clone()
         }
 
         /// Panics, naming `what`, unless every entry has been called: the path was driven end to end.
@@ -183,11 +212,12 @@ pub(crate) mod fake {
     }
 
     impl Client for Fake {
-        fn run(&self, args: &[&str], _wait: Wait) -> Result<Finished, ClientError> {
+        fn run(&self, args: &[&str], wait: Wait) -> Result<Finished, ClientError> {
             let argv: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
             let next = {
                 let mut state = self.state.lock().unwrap();
                 state.calls.push(argv.clone());
+                state.waits.push(Waited::of(&wait));
                 state.entries.pop_front()
             };
             let Some(entry) = next else {
