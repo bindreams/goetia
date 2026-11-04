@@ -9,6 +9,9 @@ use super::*;
 
 type Log = Rc<RefCell<Vec<String>>>;
 
+/// The kind of a failed `service_pid`: not `Other`, so a test sees whether a kind is kept.
+const READ_FAILED_KIND: io::ErrorKind = io::ErrorKind::TimedOut;
+
 /// What opening a pid finds.
 enum Open {
     Found,
@@ -119,7 +122,7 @@ impl KillTarget for Scripted {
         self.log.borrow_mut().push("service_pid".to_string());
         self.reads += 1;
         if self.failing_reads.contains(&self.reads) {
-            return Err(io::Error::other("scm read failed"));
+            return Err(io::Error::new(READ_FAILED_KIND, "scm read failed"));
         }
         Ok(if self.pids.len() > 1 {
             self.pids.pop_front().unwrap()
@@ -627,9 +630,14 @@ fn a_failed_read_after_a_refused_open_reports_both_errors() {
 
     let e = kill_service(&mut target).unwrap_err();
 
-    let msg = e.to_string();
-    assert!(msg.contains("scm read failed"), "{msg}");
-    assert!(msg.contains("access denied"), "{msg}");
+    assert_eq!(
+        e.to_string(),
+        "scm read failed (after the service's process could not be opened: access denied)"
+    );
+    assert_eq!(e.kind(), READ_FAILED_KIND);
+    let report = crate::error::Error::os("kill", e).report().to_string();
+    assert_eq!(report.matches("scm read failed").count(), 1, "{report}");
+    assert_eq!(report.matches("access denied").count(), 1, "{report}");
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
 }
 
@@ -649,13 +657,13 @@ fn a_failed_confirming_read_closes_the_handle_and_terminates_nothing() {
 
 /// What a failure after a delivered termination reports: the process is dead, so the error must not
 /// read as a failed kill. The cause and its kind are kept.
-fn assert_terminated_but_unconfirmed(e: &io::Error, cause: &str) {
-    let text = e.to_string();
+fn assert_terminated_but_unconfirmed(e: &io::Error, cause: &str, kind: io::ErrorKind) {
+    let text = crate::error::Chain(e).to_string();
     assert!(text.contains("was terminated"), "{text}");
     assert!(text.contains("waiting for SCM to record the exit failed"), "{text}");
     assert!(text.ends_with(cause), "{text}");
     assert!(!text.contains("kill failed"), "{text}");
-    assert_eq!(e.kind(), io::ErrorKind::Other);
+    assert_eq!(e.kind(), kind);
 }
 
 /// The read after the termination: the kill cannot say SCM has let go, but the process is gone.
@@ -665,7 +673,7 @@ fn a_failed_read_after_the_termination_says_the_process_was_terminated() {
 
     let e = kill_service(&mut target).unwrap_err();
 
-    assert_terminated_but_unconfirmed(&e, "scm read failed");
+    assert_terminated_but_unconfirmed(&e, "scm read failed", READ_FAILED_KIND);
     assert_eq!(
         target.log(),
         steps([
@@ -687,7 +695,7 @@ fn a_failed_wait_for_the_exit_says_the_process_was_terminated() {
 
     let e = kill_service(&mut target).unwrap_err();
 
-    assert_terminated_but_unconfirmed(&e, "wait on the process failed");
+    assert_terminated_but_unconfirmed(&e, "wait on the process failed", io::ErrorKind::Other);
 }
 
 #[skuld::test]
@@ -696,7 +704,7 @@ fn a_failed_registration_after_the_termination_says_the_process_was_terminated()
 
     let e = kill_service(&mut target).unwrap_err();
 
-    assert_terminated_but_unconfirmed(&e, "notifier could not be opened");
+    assert_terminated_but_unconfirmed(&e, "notifier could not be opened", io::ErrorKind::Other);
 }
 
 /// A process that was never terminated by this kill keeps the plain error: it is not a terminated one.

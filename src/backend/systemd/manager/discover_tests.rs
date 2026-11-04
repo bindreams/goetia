@@ -58,6 +58,7 @@ fn an_unreadable_dropin_directory_is_undetermined_not_other() {
     match &err {
         Error::Undetermined { id, reason, .. } => {
             assert_eq!(id, "x");
+            let reason = reason.report().to_string();
             assert!(
                 reason.contains(&dir.display().to_string()),
                 "the reason must name the path that could not be read: {reason}"
@@ -102,9 +103,10 @@ fn only_a_permission_denial_recommends_elevation() {
         (io::Error::from(io::ErrorKind::Other), false),
     ] {
         let rendered = format!("{source:?}");
-        let Error::Undetermined { reason, recovery, .. } = undetermined("x", "read", path, &source) else {
+        let Error::Undetermined { reason, recovery, .. } = undetermined("x", "read", path, source) else {
             panic!("every non-`NotFound` failure is undetermined, not just a permission denial");
         };
+        let reason = reason.report().to_string();
         assert!(reason.contains("x.service.d"), "{rendered}: {reason}");
         assert_eq!(
             recovery.contains("re-run as root"),

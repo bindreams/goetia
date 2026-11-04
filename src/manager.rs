@@ -17,12 +17,7 @@ pub(crate) mod flow;
 
 pub use budget::Budget;
 
-// All three supported platforms return a real `ServiceManager`, so
-// `Error::UnsupportedPlatform` is referenced only by the catch-all arm.
-// Gating the import keeps every supported target from warning about it.
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-use crate::error::Error;
-use crate::error::Result;
+use crate::error::{Error, Reason, Result};
 use crate::spec::{DaemonSpec, Id};
 
 // ServiceManager ======================================================================================================
@@ -287,7 +282,7 @@ pub trait Sequence {
 // Installed / Status / State ==========================================================================================
 
 /// One entry from [`ServiceManager::list`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Installed {
     /// A Goetia-marked service whose blob decoded successfully.
     Ours {
@@ -299,12 +294,13 @@ pub enum Installed {
         pid: Option<u32>,
         enabled: bool,
     },
-    /// Ours by marker, but goetia cannot report on it; `reason` says why. The causes are listed on
-    /// [`Ownership::OursUnusable`]. Kept distinct from a silent omission: one such artifact must
-    /// not take down `list`/`status` for every other daemon.
+    /// Ours by marker, but goetia cannot report on it. `reason` is why: goetia's own words, the
+    /// error under them, or both. The causes are listed on [`Ownership::OursUnusable`]. Kept
+    /// distinct from a silent omission: one such artifact must not take down `list`/`status` for
+    /// every other daemon.
     ///
     /// [`Ownership::OursUnusable`]: crate::decide::Ownership::OursUnusable
-    OursUnusable { name: String, reason: String },
+    OursUnusable { name: String, reason: Reason },
     /// Neither proof: the read that would have classified this id did not
     /// complete, so goetia established neither its absence nor its
     /// presence. The `list`-side counterpart of [`Error::Undetermined`],
@@ -336,10 +332,19 @@ pub enum Installed {
     /// on one condition.
     ///
     /// [`Error::Undetermined`]: crate::Error::Undetermined
-    Undetermined { name: Option<String>, reason: String },
+    Undetermined { name: Option<String>, reason: Reason },
 }
 
 impl Installed {
+    /// What `list` prints for an [`OursUnusable`](Installed::OursUnusable) entry; `None` for any
+    /// other entry.
+    pub fn unusable_reason(&self) -> Option<String> {
+        match self {
+            Installed::OursUnusable { reason, .. } => Some(reason.to_string()),
+            _ => None,
+        }
+    }
+
     /// The aggregate entry an enumeration that stopped early leaves behind: `location` is what
     /// was being scanned, `detail` what did not complete there. Every backend builds it here, so
     /// a scan cut short in a unit directory, a `LaunchDaemons` directory or the SCM registry key
@@ -349,13 +354,14 @@ impl Installed {
     /// dropping it, which is what returning `Err` from `list` amounts to, reports every one of
     /// those ids as absent. And the wording names no cause: a scan stops on a denial, a corrupt
     /// directory or an I/O fault alike, and only the `detail` handed in was established.
-    pub(crate) fn scan_incomplete(location: &str, detail: &str) -> Self {
+    pub(crate) fn scan_incomplete(location: &str, detail: Error) -> Self {
         Installed::Undetermined {
             name: None,
-            reason: format!(
-                "{location} could not be enumerated to the end ({detail}). Ownership is unknown \
-                 for whatever the scan did not reach, so a Goetia daemon may be missing from this \
-                 list."
+            reason: Reason::around(
+                format!("{location} could not be enumerated to the end ("),
+                detail,
+                "). Ownership is unknown for whatever the scan did not reach, so a Goetia daemon may be missing \
+                 from this list.",
             ),
         }
     }

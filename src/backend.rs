@@ -20,7 +20,8 @@ pub mod scm;
 pub mod systemd;
 
 pub(crate) use contract::{
-    Backend, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
+    Backend, Decoded, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, Unnamed,
+    WriteOutcome,
 };
 
 /// A platform account, already resolved from [`crate::spec::User`] by the

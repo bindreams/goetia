@@ -114,10 +114,13 @@ pub(crate) fn partition_installed(installed: Vec<Installed>) -> InstalledIndex {
                 );
             }
             Installed::OursUnusable { name, reason } => {
-                unusable.insert(name, reason);
+                unusable.insert(name, reason.to_string());
             }
             Installed::Undetermined { name, reason } => {
-                undetermined.push(UndeterminedEntry { name, reason });
+                undetermined.push(UndeterminedEntry {
+                    name,
+                    reason: reason.to_string(),
+                });
             }
         }
     }

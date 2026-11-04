@@ -1149,8 +1149,8 @@ fn deleted_account_makes_the_service_oursunusable() {
         })
         .unwrap_or_else(|| panic!("{id} disappeared from list entirely instead of becoming OursUnusable"));
     match entry {
-        Installed::OursUnusable { reason, .. } => {
-            assert!(!reason.is_empty());
+        entry @ Installed::OursUnusable { .. } => {
+            assert!(!entry.unusable_reason().unwrap_or_default().is_empty());
         }
         Installed::Ours { .. } | Installed::Undetermined { .. } => {
             panic!("expected OursUnusable once the account backing `user.id` is deleted")
@@ -1182,6 +1182,7 @@ fn install_refuses_an_always_blob_as_unusable() {
     let Outcome::RefuseUnusable { reason, recovery } = &outcome else {
         panic!("expected RefuseUnusable for an always blob, got {outcome:?}");
     };
+    let reason = reason.to_string();
     assert!(reason.contains("restart: always"), "{reason}");
     let recovery = recovery.as_deref().expect("a refused blob carries a recovery");
     assert!(
@@ -1272,8 +1273,8 @@ fn status_of_a_service_whose_parameters_deny_reading_is_undetermined() {
 /// The same boundary on the `list` side, and what the entry standing for it is allowed to say. One
 /// denied `Parameters` read is one entry that names its service — and carries the *rendered cause*
 /// `registry::read_parameters` built: the key, the operation and the Win32 message. `list` used to
-/// match `Err(_)` and hand the entry a static sentence instead, which `service_detail`'s own doc
-/// comment calls useless for diagnosing a real Win32 failure.
+/// match `Err(_)` and hand the entry a static sentence instead, which says nothing of a real Win32
+/// failure.
 ///
 /// `an_elevated_list_leaves_nothing_undetermined` is what makes the count exactly one here: this
 /// denial is the only unreadable `Parameters` on the host, so the aggregate takes its named form.
@@ -1303,7 +1304,8 @@ fn list_reports_a_denied_parameters_read_with_the_cause_it_established() {
             Installed::Undetermined { name, reason } if name.as_deref() == Some(id.as_str()) => Some(reason),
             _ => None,
         })
-        .unwrap_or_else(|| panic!("a service whose marker was never read is neither claimed nor omitted: {listed:?}"));
+        .unwrap_or_else(|| panic!("a service whose marker was never read is neither claimed nor omitted: {listed:?}"))
+        .to_string();
     assert!(
         reason.contains(&format!(r"{}\{id}\Parameters", support::SCM_SERVICES_KEY)),
         "the entry must name the key whose read did not complete: {reason}"

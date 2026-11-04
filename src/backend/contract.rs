@@ -11,11 +11,17 @@
 //! marker, so a backend cannot act on a service goetia did not create. The blanket impl is the one
 //! place that turns an id into a snapshot.
 
+use std::sync::Arc;
+
 use crate::blob::Blob;
 use crate::decide::ExternalConfig;
 use crate::error::{Error, Result};
 use crate::manager::{Budget, Installed, Sequence, ServiceManager, Status, Step, flow};
 use crate::spec::{DaemonSpec, Id};
+
+/// A marked artifact's metadata as `read` decoded it, or the failure kept in its place. Shared, so
+/// every verb that reports the failure hands out the one error.
+pub(crate) type Decoded = std::result::Result<Blob, Arc<Error>>;
 
 // Backend =============================================================================================================
 
@@ -27,7 +33,7 @@ pub(crate) trait InstalledService {
     /// The metadata as `read` decoded it, or why it will not decode. Kept as the failure: the
     /// marker alone is proof of ownership, so `uninstall` and the other verbs must still work on a
     /// service whose blob will not decode.
-    fn blob(&self) -> std::result::Result<&Blob, &Error>;
+    fn blob(&self) -> std::result::Result<&Blob, &Arc<Error>>;
 }
 
 /// One platform's primitives. See the module doc.
@@ -147,14 +153,14 @@ pub(crate) enum ReadOutcome<S> {
 /// what `read` and `scan` share, and each turns into a snapshot by naming it ([`ReadOutcome::named`],
 /// [`ScanEntry::of`]).
 pub(crate) struct Unnamed<B> {
-    pub blob: Result<Blob>,
+    pub blob: Decoded,
     /// What only this backend looks at: the snapshot minus its id and blob.
     pub body: B,
 }
 
 impl<B> ReadOutcome<Unnamed<B>> {
     /// The outcome at `id`, with a marked artifact made into the snapshot `make` builds.
-    pub(crate) fn named<S>(self, id: &Id, make: impl FnOnce(Id, Result<Blob>, B) -> S) -> ReadOutcome<S> {
+    pub(crate) fn named<S>(self, id: &Id, make: impl FnOnce(Id, Decoded, B) -> S) -> ReadOutcome<S> {
         match self {
             Self::Absent => ReadOutcome::Absent,
             Self::Foreign { recovery } => ReadOutcome::Foreign { recovery },
@@ -172,20 +178,19 @@ pub(crate) enum ScanEntry<S> {
     /// Goetia's marker is here, at a name that is no id, so there is no snapshot to make (a snapshot
     /// names its id). `blob` is the metadata as [`InstalledService::blob`] would say, and `name`
     /// why the name is no id.
-    Misnamed { blob: Result<Blob>, name: Error },
+    Misnamed { blob: Decoded, name: Arc<Error> },
 }
 
 impl<S> ScanEntry<S> {
     /// `found` at `name`: named an id where it is one, and otherwise [`Self::Misnamed`] if it is
     /// marked.
-    pub(crate) fn of<B>(
-        name: &str,
-        found: ReadOutcome<Unnamed<B>>,
-        make: impl FnOnce(Id, Result<Blob>, B) -> S,
-    ) -> Self {
+    pub(crate) fn of<B>(name: &str, found: ReadOutcome<Unnamed<B>>, make: impl FnOnce(Id, Decoded, B) -> S) -> Self {
         match (Id::try_from(name), found) {
             (Ok(id), found) => Self::Read(found.named(&id, make)),
-            (Err(name), ReadOutcome::Marked(Unnamed { blob, .. })) => Self::Misnamed { blob, name },
+            (Err(name), ReadOutcome::Marked(Unnamed { blob, .. })) => Self::Misnamed {
+                blob,
+                name: Arc::new(name),
+            },
             (Err(_), ReadOutcome::Absent) => Self::Read(ReadOutcome::Absent),
             (Err(_), ReadOutcome::Foreign { recovery }) => Self::Read(ReadOutcome::Foreign { recovery }),
         }

@@ -258,9 +258,14 @@ fn annotate_sweep_error(err: Error, backend: BackendKind, has_entry: bool) -> Er
 /// the two spell one attribution one way.
 fn attribute_to(err: Error, backend: BackendKind) -> Error {
     match err {
-        Error::Invalid { daemon, message } => Error::Invalid {
+        Error::Invalid {
+            daemon,
+            message,
+            source,
+        } => Error::Invalid {
             daemon,
             message: format!("backend-specific.{backend}: {message}"),
+            source,
         },
         other => other,
     }
@@ -294,9 +299,14 @@ fn annotate_step5_error(err: Error, native_entry: Option<BackendKind>) -> Error 
             };
             Error::Interpolate { path, message }
         }
-        Error::Invalid { daemon, message } => Error::Invalid {
+        Error::Invalid {
+            daemon,
+            message,
+            source,
+        } => Error::Invalid {
             daemon,
             message: format!("after substituting from .env: {message}"),
+            source,
         },
         other => other,
     }
@@ -554,9 +564,10 @@ pub(crate) fn parse_kind(id: &Id, raw: &str) -> Result<Kind, Error> {
 /// `humantime::parse_duration`). `pub(crate)`: see [`parse_restart`].
 pub(crate) fn parse_restart_delay(id: &Id, raw: &str) -> Result<Duration, Error> {
     humantime::parse_duration(raw).map_err(|source| {
-        invalid(
+        invalid_from(
             id,
-            &format!("field `restart-delay` is `{raw}`, which is not a duration (e.g. `30s`, `1m 30s`): {source}"),
+            &format!("field `restart-delay` is `{raw}`, which is not a duration (e.g. `30s`, `1m 30s`)"),
+            source,
         )
     })
 }
@@ -622,9 +633,10 @@ fn resolve_path_string(
         // `GetFullPathNameW` does: against the per-drive current directory
         // of *this* process.
         let resolved = std::path::absolute(&joined).map_err(|source| {
-            invalid(
+            invalid_from(
                 id,
-                &format!("field `{field}` is `{raw}`, which cannot be resolved to an absolute path: {source}"),
+                &format!("field `{field}` is `{raw}`, which cannot be resolved to an absolute path"),
+                source,
             )
         })?;
         if resolved.is_absolute() {
@@ -1002,6 +1014,17 @@ pub(super) fn invalid(id: &Id, message: &str) -> Error {
     Error::Invalid {
         daemon: id.as_str().to_string(),
         message: message.to_string(),
+        source: None,
+    }
+}
+
+/// [`invalid`], for a rejection that is `source` failing to parse or resolve what the manifest
+/// holds.
+fn invalid_from(id: &Id, message: &str, source: impl std::error::Error + Send + Sync + 'static) -> Error {
+    Error::Invalid {
+        daemon: id.as_str().to_string(),
+        message: message.to_string(),
+        source: Some(std::sync::Arc::new(source)),
     }
 }
 

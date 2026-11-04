@@ -7,6 +7,7 @@
 
 use crate::blob::Blob;
 use crate::diff;
+use crate::error::Reason;
 use crate::spec::{DaemonSpec, Id};
 
 // Ownership ===========================================================================================================
@@ -50,9 +51,9 @@ pub enum Ownership {
     /// 6. On launchd, the plist is present in both the staging and the enabled directory and at least
     ///    one carries the marker, so the installation is ambiguous (`list` only).
     ///
-    /// `recovery` is the action that unblocks the id, or `None` when discovery names none — a
-    /// drop-in that cannot be read.
-    OursUnusable { reason: String, recovery: Option<String> },
+    /// `reason` is the failure itself, so its chain stays typed; `recovery` is the action that
+    /// unblocks the id, or `None` when discovery names none — a drop-in that cannot be read.
+    OursUnusable { reason: Reason, recovery: Option<String> },
     /// A Goetia-marked service the manager found at this id, whose embedded spec names the
     /// different daemon `installed`: a manager that matches ids case-insensitively answers a
     /// request for `FRPC` with `frpc`'s service. Refused unconditionally — see `decide`.
@@ -145,7 +146,7 @@ pub enum Outcome {
     RefuseForeign { recovery: String },
     /// A Goetia-marked artifact goetia cannot compare; the causes are on
     /// [`Ownership::OursUnusable`], whose `recovery` is carried through.
-    RefuseUnusable { reason: String, recovery: Option<String> },
+    RefuseUnusable { reason: Reason, recovery: Option<String> },
     /// The service found at the requested id is another daemon's, `installed`. No flag overrides
     /// this: installing would replace that daemon's service. [`other_daemon_refusal`] says what to do.
     RefuseOtherDaemon { installed: Id },

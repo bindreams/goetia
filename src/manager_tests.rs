@@ -55,13 +55,23 @@ fn native_returns_a_working_backend_on_windows() {
 fn a_scan_that_stopped_early_reports_an_aggregate_that_claims_no_cause() {
     let entry = Installed::scan_incomplete(
         "/etc/systemd/system",
-        "failed to read a directory entry: Input/output error (os error 5)",
+        Error::os(
+            "read a directory entry",
+            std::io::Error::other("Input/output error (os error 5)"),
+        ),
     );
 
     let Installed::Undetermined { name, reason } = entry else {
         panic!("a scan that did not finish established neither absence nor ownership");
     };
     assert_eq!(name, None, "a scan cannot name what it never reached");
+    assert_eq!(
+        reason.to_string(),
+        "/etc/systemd/system could not be enumerated to the end (failed to read a directory entry: Input/output \
+         error (os error 5)). Ownership is unknown for whatever the scan did not reach, so a Goetia daemon may be \
+         missing from this list."
+    );
+    let reason = reason.to_string();
     assert!(reason.contains("/etc/systemd/system"), "{reason}");
     assert!(reason.contains("Input/output error"), "{reason}");
     assert!(

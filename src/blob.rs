@@ -83,12 +83,12 @@ pub(crate) fn encode_with_version(spec: &DaemonSpec, version: &str) -> String {
 pub fn decode(encoded: &str) -> Result<Blob, Error> {
     let bytes = BASE64
         .decode(encoded)
-        .map_err(|source| Error::Blob(format!("invalid base64: {source}")))?;
+        .map_err(|source| Error::blob_from("invalid base64", source))?;
     let envelope: WireEnvelope =
-        serde_json::from_slice(&bytes).map_err(|source| Error::Blob(format!("invalid blob JSON: {source}")))?;
+        serde_json::from_slice(&bytes).map_err(|source| Error::blob_from("invalid blob JSON", source))?;
 
     if envelope.schema != SCHEMA {
-        return Err(Error::Blob(format!(
+        return Err(Error::blob(format!(
             "unsupported blob schema {found} (this build of goetia understands schema {supported})",
             found = envelope.schema,
             supported = SCHEMA,
@@ -388,6 +388,7 @@ fn duration_from_wire(id: &Id, wire: WireDuration) -> Result<Duration, Error> {
                 "restart_delay nanos {n} is not a valid sub-second fraction (must be < 1_000_000_000)",
                 n = wire.nanos
             ),
+            source: None,
         });
     }
     Ok(Duration::new(wire.secs, wire.nanos))

@@ -33,13 +33,9 @@ fn parameters_key_path(name: &str) -> String {
     format!(r"{SERVICES_KEY}\{name}\Parameters")
 }
 
-/// What did not complete, as facts, with no claim about any id attached.
-/// Shared by [`registry_error`] and [`registry_undetermined`], so one failure
-/// cannot be described two ways depending on which class it lands in.
-fn registry_detail(op: &str, path: &str, source: &std::io::Error) -> String {
-    format!(r"registry {op} HKLM\{path}: {source}")
-}
-
+/// What did not complete, as facts, with no claim about any id attached. Every registry failure
+/// is built here — single-id reads, [`registry_undetermined`] and the `list` scan — so one
+/// failure cannot be described two ways depending on which class it lands in.
 fn registry_error(op: &str, path: &str, source: std::io::Error) -> Error {
     Error::os(format!(r"{op} HKLM\{path}"), source)
 }
@@ -48,12 +44,9 @@ fn registry_error(op: &str, path: &str, source: std::io::Error) -> Error {
 /// goetia's at all — see [`super::undetermined`], whose doc comment carries the
 /// whole argument, including why the class is not keyed on the denial while the
 /// recovery is.
-fn registry_undetermined(name: &str, op: &str, path: &str, source: &std::io::Error) -> Error {
-    super::undetermined(
-        name,
-        registry_detail(op, path, source),
-        source.kind() == std::io::ErrorKind::PermissionDenied,
-    )
+fn registry_undetermined(name: &str, op: &str, path: &str, source: std::io::Error) -> Error {
+    let access_denied = source.kind() == std::io::ErrorKind::PermissionDenied;
+    super::undetermined(name, registry_error(op, path, source), access_denied)
 }
 
 // Parameters (the metadata blob) ======================================================================================
@@ -80,12 +73,12 @@ pub fn read_parameters(name: &str) -> Result<BTreeMap<String, String>> {
     let key = match RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(&path, KEY_READ) {
         Ok(k) => k,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(e) => return Err(registry_undetermined(name, "open", &path, &e)),
+        Err(e) => return Err(registry_undetermined(name, "open", &path, e)),
     };
 
     let mut out = BTreeMap::new();
     for entry in key.enum_values() {
-        let (field, value) = entry.map_err(|e| registry_undetermined(name, "enumerate", &path, &e))?;
+        let (field, value) = entry.map_err(|e| registry_undetermined(name, "enumerate", &path, e))?;
         if let Ok(s) = String::from_reg_value(&value) {
             out.insert(field, s);
         }
@@ -308,7 +301,7 @@ fn scan_names_under(path: &str, keep: impl FnMut(String)) -> Option<Installed> {
         path,
         RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(path, KEY_READ),
         |key| Box::new(key.enum_keys()),
-        |op, source| registry_detail(op, path, source),
+        |op, source| registry_error(op, path, source),
         keep,
     )
 }

@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use crate::backend::launchd::generate;
-use crate::error::{Error, Result};
+use crate::error::{Error, Occupant, Result};
 use crate::spec::Id;
 
 /// Whether writing `desired` over `on_disk` would give the plist other content, which is what a
@@ -41,21 +41,21 @@ pub(crate) fn loaded_after_write(id: &Id, restore: Result<()>) -> Error {
 /// The error for a recheck after the write that could not tell whether the job is loaded: `read` is
 /// the failed read. As in doubt as [`loaded_after_write`], and not a failure that left nothing
 /// written, which exit `1` would claim.
-pub(crate) fn state_unknown_after_write(id: &Id, read: &Error, restore: Result<()>) -> Error {
+pub(crate) fn state_unknown_after_write(id: &Id, read: Error, restore: Result<()>) -> Error {
     Error::LoadedStateInDoubt {
         id: id.to_string(),
-        detail: read.report().to_string(),
+        read_failed: Box::new(read),
         restore_failed: restore.err().map(Box::new),
     }
 }
 
 /// The error for a plist that was taken from `Create` after a stale job was booted out: `found` is
 /// what is at `path` now.
-pub(crate) fn slot_taken_after_bootout(id: &Id, path: &Path, found: &str) -> Error {
+pub(crate) fn slot_taken_after_bootout(id: &Id, path: &Path, found: Occupant) -> Error {
     Error::StaleJobBootedOut {
         id: id.to_string(),
         path: path.to_path_buf(),
-        found: found.to_owned(),
+        found,
     }
 }
 
