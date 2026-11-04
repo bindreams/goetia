@@ -11,6 +11,10 @@
 
 #[cfg(unix)]
 pub(crate) mod bounded;
+// Only systemd reaches its manager through it so far, so macOS builds see it unused.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) mod client;
 mod contract;
 pub mod launchd;
 pub mod scm;

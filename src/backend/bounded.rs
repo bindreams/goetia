@@ -172,6 +172,17 @@ pub(crate) enum SpawnError {
     MayHaveRun(cosca::error::Error),
 }
 
+impl SpawnError {
+    /// `e`, as `cosca::Command::spawn` failed with it: placed by [`may_have_run`].
+    pub(crate) fn of_spawn(e: cosca::error::Error) -> SpawnError {
+        if may_have_run(&e) {
+            SpawnError::MayHaveRun(e)
+        } else {
+            SpawnError::NotRun(e)
+        }
+    }
+}
+
 impl std::fmt::Display for SpawnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -194,13 +205,7 @@ pub(crate) fn spawn(cmd: &mut cosca::Command, role: Role) -> Result<Spawned, Spa
         Ok((stdout, stderr))
     })();
     let (stdout, stderr) = prepared.map_err(SpawnError::NotRun)?;
-    let mut child = start(cmd).map_err(|e| {
-        if may_have_run(&e) {
-            SpawnError::MayHaveRun(e)
-        } else {
-            SpawnError::NotRun(e)
-        }
-    })?;
+    let mut child = start(cmd).map_err(SpawnError::of_spawn)?;
     let (out, err) = (child.stdout(), child.stderr());
     Ok(Spawned {
         child,
