@@ -2,7 +2,8 @@
 //! nothing could take must not be sent, and a thread or file that could not be made once it was
 //! sent would leave it unwatched — or, in a sequence of requests, stop the sequence halfway.
 //!
-//! Each is taken from this thread's [`Spares`] first, and made on the spot only for the rest.
+//! A launchd verb is handed a [`Reservation`] and draws its reapers and temp files from it. systemd's
+//! listener threads come from this thread's [`Spares`].
 
 use std::cell::{Cell, RefCell};
 use std::fmt;
@@ -53,7 +54,7 @@ impl<T: Send + 'static> Standby<T> {
 
 /// A thread made before a [`super::Role::Request`] is sent, which reaps it if an expiry leaves it
 /// running: it still exits, and a caller that outlives it must not collect one zombie per expiry.
-/// See [`reapers`].
+/// See [`Reservation`].
 ///
 /// The thread never kills the child, not even after the reap. It [`cosca::Child::detach`]es the
 /// reaped child rather than dropping it, because `Drop` tears a contained tree down, and after the
@@ -67,6 +68,8 @@ pub(crate) struct Reaper(Standby<cosca::Child>);
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl Reaper {
     fn new() -> io::Result<Reaper> {
+        // A failed reap is dropped on purpose: the caller has already reported the expiry, the
+        // crate has no log, and the child is detached whatever the wait said.
         Reaper::with(cosca::Child::wait, |_| {})
     }
 
@@ -123,36 +126,78 @@ impl Listener {
     }
 }
 
+// Reservation =========================================================================================================
+
+/// What one launchd verb, or a sequence of them, draws: a [`Reaper`] for each request and a temp
+/// file for each stream of each `launchctl` call, all made before anything is sent. Handed to every
+/// call that draws, never ambient: a draw past what was made is a miscount, which fails a debug
+/// assertion and is made on the spot in a release build.
+#[derive(Debug, Default)]
+pub(crate) struct Reservation {
+    reapers: Vec<Reaper>,
+    files: Vec<File>,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl Reservation {
+    /// `reapers` and `files`, all or none: a failure to make one makes nothing, so the verb that
+    /// asked sends nothing.
+    pub(crate) fn make(reapers: usize, files: usize) -> io::Result<Reservation> {
+        Ok(Reservation {
+            reapers: made(reapers, Reaper::new)?,
+            files: made(files, make_file)?,
+        })
+    }
+
+    /// The reaper for one request.
+    pub(crate) fn reaper(&mut self) -> io::Result<Reaper> {
+        match self.reapers.pop() {
+            Some(reaper) => Ok(reaper),
+            None => {
+                miscounted("reaper");
+                Reaper::new()
+            }
+        }
+    }
+
+    /// An empty anonymous temp file for one stream of one call.
+    pub(crate) fn file(&mut self) -> io::Result<File> {
+        match self.files.pop() {
+            Some(file) => Ok(file),
+            None => {
+                miscounted("temp file");
+                make_file()
+            }
+        }
+    }
+}
+
+fn miscounted(what: &str) {
+    debug_assert!(
+        false,
+        "a {what} was drawn past the reservation: a verb needed more than was counted for it"
+    );
+}
+
+fn made<T>(n: usize, make: fn() -> io::Result<T>) -> io::Result<Vec<T>> {
+    (0..n).map(|_| make()).collect()
+}
+
 // Spares ==============================================================================================================
 
-/// How many of each a sequence of verbs can need — see [`spare`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct Needs {
-    /// One per [`super::Role::Request`].
-    pub reapers: usize,
-    /// Two per [`super::Role::AnnouncedRequest`], one for each stream.
-    pub listeners: usize,
-    /// Two per [`super::Role::Query`] or [`super::Role::Request`], one for each stream.
-    pub files: usize,
-}
-
-/// What the [`Spares`] guards on this thread made ready, each tagged with its guard's number.
-#[derive(Default)]
-struct Pool {
-    reapers: Vec<(u64, Reaper)>,
-    listeners: Vec<(u64, Listener)>,
-    files: Vec<(u64, File)>,
-}
+/// The listener threads the [`Spares`] guards on this thread made ready, each tagged with its
+/// guard's number.
+type Pool = Vec<(u64, Listener)>;
 
 thread_local! {
-    static SPARES: RefCell<Pool> = RefCell::default();
+    static SPARES: RefCell<Pool> = const { RefCell::new(Vec::new()) };
     /// The number the next [`Spares`] guard on this thread tags what it makes with.
     static NEXT_GUARD: Cell<u64> = const { Cell::new(0) };
     /// How many [`Spares`] guards are live on this thread.
     static RESERVATIONS: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Called wherever something is made on the spot rather than taken from this thread's [`Spares`]:
+/// Called wherever a listener is made on the spot rather than taken from this thread's [`Spares`]:
 /// while a reservation is live, everything its verbs need was to have been made in it, so making
 /// one here means a verb needed more than was counted for it — a request could then fail halfway
 /// through a sequence for want of it. Loud in every debug build, the test suites' included, so an
@@ -164,50 +209,24 @@ fn made_on_the_spot(what: &str) {
     );
 }
 
-/// Make `needs` ready now, all or none, for the verbs this thread runs while the returned guard lives
-/// — a sequence, such as `restart`'s stop and start, whose later verbs must not fail for want of a
-/// thread or a file once an earlier one has sent something. Any step run on this thread meanwhile
-/// may draw on them; a read no step counted never does ([`super::Role::UncountedQuery`]). Dropping
-/// the guard drops what is left of its own, and only that: guards nest, and end in any order.
-pub(crate) fn spare(needs: Needs) -> io::Result<Spares> {
-    let reapers = made(needs.reapers, Reaper::new)?;
-    let listeners = made(needs.listeners, Listener::new)?;
-    let files = made(needs.files, make_file)?;
+/// Make `listeners` threads ready, all or none, for the verbs this thread runs while the guard lives.
+/// Dropping it drops only its own unspent threads; guards nest and may end in any order.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn spare(listeners: usize) -> io::Result<Spares> {
+    let listeners = made(listeners, Listener::new)?;
     let tag = NEXT_GUARD.get();
     NEXT_GUARD.set(tag + 1);
     RESERVATIONS.set(RESERVATIONS.get() + 1);
-    SPARES.with_borrow_mut(|pool| {
-        pool.reapers.extend(reapers.into_iter().map(|r| (tag, r)));
-        pool.listeners.extend(listeners.into_iter().map(|l| (tag, l)));
-        pool.files.extend(files.into_iter().map(|f| (tag, f)));
-    });
+    SPARES.with_borrow_mut(|pool| pool.extend(listeners.into_iter().map(|l| (tag, l))));
     Ok(Spares {
         tag,
         this_thread: PhantomData,
     })
 }
 
-/// [`spare`], less what this thread's pool already holds: for a verb that needs `needs` itself, and
-/// may be running inside a sequence that made them ready already.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) fn top_up(needs: Needs) -> io::Result<Spares> {
-    let short = SPARES.with_borrow(|pool| Needs {
-        reapers: needs.reapers.saturating_sub(pool.reapers.len()),
-        listeners: needs.listeners.saturating_sub(pool.listeners.len()),
-        files: needs.files.saturating_sub(pool.files.len()),
-    });
-    if short != Needs::default() {
-        made_on_the_spot("spare");
-    }
-    spare(short)
-}
-
-fn made<T>(n: usize, make: fn() -> io::Result<T>) -> io::Result<Vec<T>> {
-    (0..n).map(|_| make()).collect()
-}
-
 /// See [`spare`]. Not `Send`: what it releases is this thread's.
 #[derive(Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct Spares {
     tag: u64,
     this_thread: PhantomData<*const ()>,
@@ -216,36 +235,13 @@ pub(crate) struct Spares {
 impl Drop for Spares {
     fn drop(&mut self) {
         RESERVATIONS.set(RESERVATIONS.get() - 1);
-        SPARES.with_borrow_mut(|pool| {
-            pool.reapers.retain(|(tag, _)| *tag != self.tag);
-            pool.listeners.retain(|(tag, _)| *tag != self.tag);
-            pool.files.retain(|(tag, _)| *tag != self.tag);
-        });
+        SPARES.with_borrow_mut(|pool| pool.retain(|(tag, _)| *tag != self.tag));
     }
-}
-
-/// Every reaper a verb's requests can need, made before it sends any: a sequence of requests must
-/// not fail between two of them for want of a thread, so a failure here means nothing was sent.
-/// Taken from this thread's [`Spares`] first, and made for the rest.
-///
-/// An array, so each request is handed a reaper of its own by name, and a verb that sends one more
-/// request than it reserved for does not compile.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) fn reapers<const N: usize>() -> io::Result<[Reaper; N]> {
-    let mut got: Vec<Reaper> = SPARES.with_borrow_mut(|pool| {
-        let keep = pool.reapers.len().saturating_sub(N);
-        pool.reapers.split_off(keep).into_iter().map(|(_, r)| r).collect()
-    });
-    while got.len() < N {
-        made_on_the_spot("reaper");
-        got.push(Reaper::new()?);
-    }
-    Ok(got.try_into().expect("exactly N reapers were gathered"))
 }
 
 /// A thread to read a pipe with: a spare, or made now.
 pub(super) fn listener() -> io::Result<Listener> {
-    match SPARES.with_borrow_mut(|pool| pool.listeners.pop()) {
+    match SPARES.with_borrow_mut(|pool| pool.pop()) {
         Some((_, listener)) => Ok(listener),
         None => {
             made_on_the_spot("listener");
@@ -254,24 +250,9 @@ pub(super) fn listener() -> io::Result<Listener> {
     }
 }
 
-/// An empty anonymous temp file for a stream: a spare, or made now.
-pub(super) fn file() -> io::Result<File> {
-    match SPARES.with_borrow_mut(|pool| pool.files.pop()) {
-        Some((_, file)) => Ok(file),
-        None => {
-            made_on_the_spot("temp file");
-            make_file()
-        }
-    }
-}
-
-/// An empty anonymous temp file for a stream of a read no verb counted: made now, never a spare,
-/// wherever a reservation is live — see [`super::Role::UncountedQuery`].
-pub(super) fn own_file() -> io::Result<File> {
-    make_file()
-}
-
-fn make_file() -> io::Result<File> {
+/// An empty anonymous temp file. A read no verb counted ([`super::Role::UncountedQuery`]) makes its
+/// own, whatever reservation it is handed.
+pub(super) fn make_file() -> io::Result<File> {
     #[cfg(test)]
     test_hook::make(test_hook::Kind::TempFile)?;
     tempfile::tempfile()
@@ -318,13 +299,14 @@ pub(crate) mod test_hook {
         SPAWN_FAILS.set(Some(error));
     }
 
-    /// What this thread's pool holds now.
-    pub(crate) fn pooled() -> super::Needs {
-        super::SPARES.with_borrow(|pool| super::Needs {
-            reapers: pool.reapers.len(),
-            listeners: pool.listeners.len(),
-            files: pool.files.len(),
-        })
+    /// How many listeners this thread's pool holds now.
+    pub(crate) fn pooled() -> usize {
+        super::SPARES.with_borrow(|pool| pool.len())
+    }
+
+    /// What `reservation` holds now: its reapers and its temp files.
+    pub(crate) fn left(reservation: &super::Reservation) -> (usize, usize) {
+        (reservation.reapers.len(), reservation.files.len())
     }
 
     /// How many children this thread has spawned through [`super::super::spawn`], or tried to.

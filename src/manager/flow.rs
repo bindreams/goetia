@@ -10,7 +10,7 @@ use std::io;
 use crate::backend::{Backend, InstalledService, ReadOutcome, ScanEntry, WriteOutcome};
 use crate::decide::{self, ExternalConfig, Outcome, Ownership};
 use crate::error::{Error, Result};
-use crate::manager::{Installed, Status};
+use crate::manager::{Budget, Installed, Status, Step};
 use crate::spec::{DaemonSpec, Id};
 
 // Ownership ===========================================================================================================
@@ -106,9 +106,24 @@ pub(crate) fn owned<B: Backend>(b: &B, id: &Id) -> Result<B::Snapshot> {
     require_marked(id, b.read(id)?)
 }
 
+/// What a verb run outside a sequence draws on: reserved for its own `step`, as
+/// [`ServiceManager::prepare`](crate::manager::ServiceManager::prepare) would, and failing as that
+/// verb for `id`.
+pub(crate) fn reserved<B: Backend>(b: &B, id: &Id, step: Step, budget: Budget) -> Result<B::Reservation> {
+    b.reserve(&[step], budget).map_err(|e| match e {
+        Error::Reservation { id: None, source } => Error::Reservation {
+            id: Some(id.to_string()),
+            source,
+        },
+        other => other,
+    })
+}
+
 // install and preview =================================================================================================
 
 pub(crate) fn install<B: Backend>(b: &B, spec: &DaemonSpec, force: bool) -> Result<Outcome> {
+    // `install` has no `--timeout` of its own: its calls are unbounded.
+    let mut reservation = reserved(b, &spec.id, Step::Install, Budget::Unbounded)?;
     let mut scope = b.begin_install(spec)?;
     let desired = b.render(spec)?;
     let desired_text = desired.to_string();
@@ -126,7 +141,14 @@ pub(crate) fn install<B: Backend>(b: &B, spec: &DaemonSpec, force: bool) -> Resu
         );
         match outcome {
             Outcome::Create | Outcome::Update { .. } | Outcome::Stale { .. } => {
-                match b.write(spec, &desired, &outcome, found.snapshot.as_ref(), &mut scope)? {
+                match b.write(
+                    spec,
+                    &desired,
+                    &outcome,
+                    found.snapshot.as_ref(),
+                    &mut scope,
+                    &mut reservation,
+                )? {
                     WriteOutcome::Done => return Ok(outcome),
                     WriteOutcome::Raced => {}
                 }
