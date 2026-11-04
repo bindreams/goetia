@@ -25,6 +25,11 @@ use crate::test_support::{TestId, assert_failures, assert_one_failure};
 
 const PREFIX: &str = "goetia-shim-launch-test";
 
+// The shim is its own crate and cannot reach `DaemonSpec::for_test`; share the integration suites'
+// constructor.
+#[path = "../../../tests/support/daemon_spec.rs"]
+mod daemon_spec;
+
 /// [`super::run_daemon`] for the tests that do not look at the `STOP_PENDING` report.
 fn run_daemon(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, on_running: impl FnOnce()) -> Reported {
     super::run_daemon(spec, stop_bus, id, on_running, || {})
@@ -37,11 +42,6 @@ fn run_daemon(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, on_running: 
 /// test must not append to the path a really-installed daemon of the same id logs to. That covers
 /// the daemon's own output only: `launch`'s failure reporting goes through `logging::log_failure`,
 /// which never consults `spec.logs`.
-/// The integration suites' one `DaemonSpec` constructor: the shim is its own crate, so it cannot
-/// reach the library's test-only one.
-#[path = "../../../tests/support/daemon_spec.rs"]
-mod daemon_spec;
-
 fn spec(dir: &Path, id: &str) -> DaemonSpec {
     let command = [
         "powershell",

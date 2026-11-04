@@ -140,8 +140,8 @@ pub struct DaemonSpec {
 #[cfg(test)]
 impl DaemonSpec {
     /// A plain, valid `DaemonSpec` named `id`: root, `restart: never`, `type: managed`, everything
-    /// else unset. Panics if `id` is not a valid [`Id`]. Mirrors `tests/support/daemon_spec.rs`,
-    /// which integration tests cannot replace with this: they cannot reach `#[cfg(test)]` code.
+    /// else unset. Panics if `id` is not a valid [`Id`]. Mirrors `tests/support/daemon_spec.rs`
+    /// (integration tests cannot reach `#[cfg(test)]` code).
     ///
     /// A test that needs anything else says so with struct-update syntax:
     /// `DaemonSpec { restart, ..DaemonSpec::for_test("frpc", command) }`. Built literally, never
