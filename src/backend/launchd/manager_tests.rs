@@ -950,7 +950,7 @@ fn marked_plist_restarting(id: &Id, restart: Restart) -> Plist {
 
 /// A reservation of the stated size: `requests` reapers and the files of `calls` calls.
 fn reservation(requests: usize, calls: usize) -> Reservation {
-    Reservation::make(requests, calls * bounded::STREAMS).expect("make a reservation")
+    Reservation::make(requests, calls * Role::COUNTED_FILES).expect("make a reservation")
 }
 
 /// What [`Launchd::reserve`] makes for `steps`.
@@ -962,7 +962,7 @@ fn reserved(steps: &[Step]) -> Reservation {
 /// paths, summed over a sequence. The numbers are written out so that changing a count is deliberate.
 #[skuld::test]
 fn a_reservation_holds_what_its_steps_count() {
-    let cases: [(&[Step], (usize, usize)); 8] = [
+    let cases: [(&[Step], (usize, usize)); 7] = [
         (&[Step::Install], (1, 6)),
         (&[Step::Start], (5, 24)),
         (&[Step::Stop], (1, 2)),
@@ -970,7 +970,6 @@ fn a_reservation_holds_what_its_steps_count() {
         (&[Step::Uninstall], (1, 2)),
         (&[Step::RequestStartAfterStop], (5, 24)),
         (&[Step::Stop, Step::Start], (6, 26)),
-        (&[Step::Install, Step::Start], (6, 30)),
     ];
     for (steps, held) in cases {
         assert_eq!(bounded::test_hook::left(&reserved(steps)), held, "{steps:?}");
@@ -978,19 +977,16 @@ fn a_reservation_holds_what_its_steps_count() {
 }
 
 /// A reservation one reaper or one file short of what a sequence counts is refused as a whole, so a
-/// `restart` or an `install --start` that cannot have everything sends nothing — under every
-/// budget, since `launchctl` is waited on under all of them.
+/// `restart` (`[Stop, Start]`) or an `install --start` (`[Start]`) that cannot have everything sends
+/// nothing — under every budget, since `launchctl` is waited on under all of them.
 #[skuld::test]
 fn a_reservation_that_cannot_be_made_whole_is_refused() {
     use crate::backend::Backend;
 
     type Allowance = fn(usize) -> bounded::test_hook::Allowance;
     let mgr = Launchd::new();
-    for (steps, (reapers, files)) in [
-        (&[Step::Stop, Step::Start][..], (6, 26)),
-        (&[Step::Install, Step::Start], (6, 30)),
-        (&[Step::Start], (5, 24)),
-    ] {
+    for steps in [&[Step::Stop, Step::Start][..], &[Step::Start]] {
+        let (reapers, files) = counted(steps);
         for budget in [Budget::DEFAULT, Budget::Immediate, Budget::Unbounded] {
             let shortfalls: [(Allowance, usize, &str); 2] = [
                 (bounded::test_hook::threads, reapers - 1, "no thread"),
@@ -1062,7 +1058,17 @@ fn drawings() -> [Drawing; 5] {
             restart: Restart::Never,
             calls: &BOOTOUT,
             drew: (STOP_REQUESTS, STOP_CALLS),
-            run: |mgr, plist, reservation| Backend::uninstall(mgr, plist, reservation).or(Ok(())),
+            run: |mgr, plist, reservation| match Backend::uninstall(mgr, plist, reservation) {
+                Err(Error::Os { what, source, .. })
+                    if what == "remove"
+                        && source
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    Ok(())
+                }
+                other => other,
+            },
         },
     ]
 }
@@ -1087,7 +1093,7 @@ fn every_verb_draws_what_its_step_counts() {
             bounded::test_hook::left(&held),
             (
                 counted_requests - drawing.drew.0,
-                (counted_calls - drawing.drew.1) * bounded::STREAMS
+                (counted_calls - drawing.drew.1) * Role::COUNTED_FILES
             ),
             "{:?}",
             drawing.step
@@ -1103,8 +1109,8 @@ fn a_verb_handed_one_item_too_few_trips_the_assertion() {
     for drawing in drawings() {
         let (requests, calls) = drawing.drew;
         for (what, (reapers, files)) in [
-            ("reaper", (requests - 1, calls * bounded::STREAMS)),
-            ("temp file", (requests, calls * bounded::STREAMS - 1)),
+            ("reaper", (requests - 1, calls * Role::COUNTED_FILES)),
+            ("temp file", (requests, calls * Role::COUNTED_FILES - 1)),
         ] {
             let (mgr, _script) = scripted(drawing.calls);
             let mut short = Reservation::make(reapers, files).expect("make a reservation");
@@ -1137,7 +1143,11 @@ fn a_restart_that_cannot_reserve_sends_nothing() {
     use crate::cli::{ExitCode, restart};
 
     type Allowance = fn(usize) -> bounded::test_hook::Allowance;
-    let shortfalls: [(Allowance, usize); 2] = [(bounded::test_hook::threads, 5), (bounded::test_hook::temp_files, 25)];
+    let (reapers, files) = counted(&[Step::Stop, Step::Start]);
+    let shortfalls: [(Allowance, usize); 2] = [
+        (bounded::test_hook::threads, reapers - 1),
+        (bounded::test_hook::temp_files, files - 1),
+    ];
     for (allow, n) in shortfalls {
         let script = table(&[]);
         let args = restart::Args {
@@ -1167,7 +1177,11 @@ fn a_restart_that_cannot_reserve_sends_nothing() {
 #[skuld::test]
 fn an_install_that_cannot_reserve_sends_nothing_and_names_its_id() {
     type Allowance = fn(usize) -> bounded::test_hook::Allowance;
-    let shortfalls: [(Allowance, usize); 2] = [(bounded::test_hook::threads, 0), (bounded::test_hook::temp_files, 5)];
+    let (reapers, files) = counted(&[Step::Install]);
+    let shortfalls: [(Allowance, usize); 2] = [
+        (bounded::test_hook::threads, reapers - 1),
+        (bounded::test_hook::temp_files, files - 1),
+    ];
     for (allow, n) in shortfalls {
         let (mgr, script) = scripted(&[]);
         let spec = spec_named("goetia-reservation-refused");

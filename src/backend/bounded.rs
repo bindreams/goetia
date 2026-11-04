@@ -90,9 +90,8 @@ pub(crate) enum Role {
     /// temp files, read once it has exited, taken from the verb's reservation.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Query,
-    /// A read no verb counted — launchd's `status` and `list` — as [`Role::Query`], except that its
-    /// files are made for it on the spot, whatever reservation it is handed: it never draws on one,
-    /// which only the verbs' steps counted for, and failing to make one sends nothing.
+    /// A read no verb counted — launchd's `status` and `list`. As [`Role::Query`], but its files are
+    /// made on the spot, never drawn from a reservation; failing to make one sends nothing.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     UncountedQuery,
     /// A request that says on stderr when the manager has it: `issued` holds once it has. Until
@@ -114,12 +113,15 @@ pub(crate) enum Role {
 }
 
 impl Role {
-    /// The temp files a [`spawn`] under this role draws from its reservation: [`STREAMS`] for a
-    /// [`Role::Query`] and a [`Role::Request`], none for the others. The one definition of it:
-    /// `spawn` draws by it, and what counts a verb's calls and the test `Fake` read it.
+    /// The temp files each call that draws from a reservation ([`Role::Query`] or [`Role::Request`])
+    /// draws: a verb's call count is turned into files by it.
+    pub(crate) const COUNTED_FILES: usize = STREAMS;
+
+    /// The temp files a [`spawn`] under this role draws from its reservation. The one definition:
+    /// `spawn`, the verbs' call counts and the test `Fake` all read it.
     pub(crate) fn files(&self) -> usize {
         match self {
-            Role::Query | Role::Request(_) => STREAMS,
+            Role::Query | Role::Request(_) => Self::COUNTED_FILES,
             Role::UncountedQuery | Role::AnnouncedRequest(_) => 0,
         }
     }

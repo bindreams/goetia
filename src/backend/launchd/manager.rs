@@ -883,12 +883,11 @@ impl Launchctl {
 
     /// `launchctl` with `args`, spawned and waited under `deadline` in `role`.
     ///
-    /// **Every** `launchctl` call the budgeted verbs make goes through here,
-    /// and `role` is what keeps the budget from deciding whether a
+    /// `role` is what keeps the budget from deciding whether a
     /// request is sent: a [`Role::Request`] that expires is left running, never
     /// killed, since `launchctl` never says when launchd has the request. Its
     /// reaper (see [`request`]) and the temp files its output goes to are drawn from
-    /// `reservation`, made before the verb sent anything.
+    /// `reservation`.
     ///
     /// [`Finished::Expired`] iff the deadline expired first. For a request that is not a
     /// failure of the command — the request is out, or on its way in a
@@ -1081,22 +1080,15 @@ fn request(reservation: &mut Reservation) -> Result<Role> {
 
 // Reservation =========================================================================================================
 
-/// The most `launchctl` requests each verb sends — every one draws a reaper from the verb's
-/// [`Reservation`], made before it sends the first. `install`: the `bootout` of a stale job under a
-/// new artifact. `start`: `bootstrap` and `kickstart`, then the corrective cycle's `bootout`,
-/// `bootstrap` and `kickstart`. `stop` and `uninstall`: one `bootout`. `kill`: one `launchctl kill`.
+/// Most requests each verb sends; each draws a reaper from the verb's [`Reservation`].
+/// `start`: bootstrap+kickstart, then the corrective cycle's bootout+bootstrap+kickstart.
 const INSTALL_REQUESTS: usize = 1;
 const START_REQUESTS: usize = 5;
 const STOP_REQUESTS: usize = 1;
 const KILL_REQUESTS: usize = 1;
 
-/// The most `launchctl` calls each verb makes, requests and reads alike — every one draws a temp
-/// file for each of its [`bounded::STREAMS`] from the same reservation, so a read between two requests
-/// does not fail for want of one either. `install`: a `Create`'s `is_loaded`, `bootout` and the
-/// `is_loaded` after the write, or an `Update`'s two `is_loaded`s, before the write and after it. A
-/// pass is repeated only when the one before it made no call, so this is one pass's longest path.
-/// `start`: its five requests, two `is_loaded`s and five `live_state`s. `stop`, `uninstall` and `kill`:
-/// their request.
+/// Most `launchctl` calls per verb, reads included: each draws its role's temp files from the same
+/// reservation. `install` adds two `is_loaded`s; `start` two `is_loaded`s and five `live_state`s.
 const INSTALL_CALLS: usize = INSTALL_REQUESTS + 2;
 const START_CALLS: usize = START_REQUESTS + 7;
 const STOP_CALLS: usize = STOP_REQUESTS;
@@ -1114,6 +1106,15 @@ fn needs(step: Step) -> (usize, usize) {
         Step::Stop | Step::Uninstall => (STOP_REQUESTS, STOP_CALLS),
         Step::Kill => (KILL_REQUESTS, KILL_CALLS),
     }
+}
+
+/// The reapers and temp files `steps` draw, summed: what [`Launchd::reserve`] makes.
+fn counted(steps: &[Step]) -> (usize, usize) {
+    let (requests, calls) = steps
+        .iter()
+        .map(|&step| needs(step))
+        .fold((0, 0), |(requests, calls), (r, c)| (requests + r, calls + c));
+    (requests, calls * Role::COUNTED_FILES)
 }
 
 /// What a `launchctl print` that ran says about the job's live state.
@@ -1179,7 +1180,6 @@ impl backend::Backend for Launchd {
     type InstallScope = ();
     type Reservation = Reservation;
 
-    /// launchd holds nothing across an install but its reservation.
     fn begin_install(&self, _spec: &DaemonSpec) -> Result<()> {
         Ok(())
     }
@@ -1188,11 +1188,8 @@ impl backend::Backend for Launchd {
     /// after an earlier step has sent something: `restart`'s start after its stop, `install
     /// --start`'s start after the install's `bootout`.
     fn reserve(&self, steps: &[Step], _budget: Budget) -> Result<Reservation> {
-        let (requests, calls) = steps
-            .iter()
-            .map(|&step| needs(step))
-            .fold((0, 0), |(requests, calls), (r, c)| (requests + r, calls + c));
-        Reservation::make(requests, calls * bounded::STREAMS).map_err(|source| Error::Reservation { id: None, source })
+        let (reapers, files) = counted(steps);
+        Reservation::make(reapers, files).map_err(|source| Error::Reservation { id: None, source })
     }
 
     fn render(&self, spec: &DaemonSpec) -> Result<String> {

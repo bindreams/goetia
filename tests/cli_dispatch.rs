@@ -3667,7 +3667,9 @@ fn restart_that_cannot_prepare_sends_nothing() {
         let fake = Fake::new();
         fake.install(&mk("frpc"), false).unwrap();
         fake.seed_state("frpc", State::Running);
-        fake.seed_prepare_fails();
+        // Only the start's reservation fails: the stop's would have been made, and sent, if the
+        // legs were not reserved together first.
+        fake.seed_prepare_fails(Step::Start);
         let mut args = vec!["goetia", "daemon", "restart", "frpc"];
         args.extend_from_slice(budget);
 
@@ -3690,7 +3692,9 @@ fn install_start_that_cannot_prepare_installs_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
     let fake = Fake::new();
-    fake.seed_prepare_fails();
+    // Only the start's reservation fails: the install's own would succeed, and install, if the
+    // start were reserved after it.
+    fake.seed_prepare_fails(Step::Start);
 
     let (code, out, err) = dispatch_elevated(
         &[

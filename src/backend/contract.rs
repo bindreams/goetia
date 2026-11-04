@@ -40,10 +40,8 @@ pub(crate) trait Backend {
     type Snapshot: InstalledService;
     /// What an install needs before it reads anything that is not a [`Self::Reservation`].
     type InstallScope;
-    /// What the verbs that send requests draw on: the threads and temp files their requests are
-    /// watched with, made by [`Self::reserve`] before anything is sent. Handed to every verb that
-    /// draws, never ambient, so a verb that needs more than was counted for it is a miscount at the
-    /// draw.
+    /// What the verbs that send requests draw on, made by [`Self::reserve`] before anything is
+    /// sent: see `bounded::Reservation`.
     type Reservation: 'static;
 
     // Primitives ------------------------------------------------------------------------------------------------------
@@ -299,9 +297,7 @@ struct Reserved<'a, B: Backend> {
 }
 
 impl<B: Backend> Reserved<'_, B> {
-    /// Use up one of `steps`, the first that is still unspent. A verb with none draws on a
-    /// reservation that was not counted for it: in a release build the draw is made on the spot and
-    /// can fail between legs, which breaks the promise of [`ServiceManager::prepare`].
+    /// Use up one of `steps`, the first that is still unspent: see [`Sequence`].
     fn spend(&mut self, steps: &[Step]) {
         let found = steps
             .iter()
@@ -318,30 +314,23 @@ impl<B: Backend> Reserved<'_, B> {
 
 impl<B: Backend> Sequence for Reserved<'_, B> {
     fn stop(&mut self, id: &Id, budget: Budget) -> Result<()> {
+        let snapshot = flow::owned(self.backend, id)?;
         self.spend(&[Step::Stop]);
-        Backend::stop(
-            self.backend,
-            flow::owned(self.backend, id)?,
-            budget,
-            &mut self.reservation,
-        )
+        Backend::stop(self.backend, snapshot, budget, &mut self.reservation)
     }
 
     fn start(&mut self, id: &Id, budget: Budget) -> Result<()> {
+        let snapshot = flow::owned(self.backend, id)?;
         self.spend(&[Step::Start]);
-        Backend::start(
-            self.backend,
-            flow::owned(self.backend, id)?,
-            budget,
-            &mut self.reservation,
-        )
+        Backend::start(self.backend, snapshot, budget, &mut self.reservation)
     }
 
     /// Spends [`Step::RequestStartAfterStop`] or, failing that, [`Step::Start`], which counts the
     /// longest start: `restart` prepares `Start` and runs this in its place under a budget that does
     /// not wait.
     fn request_start_after_stop(&mut self, id: &Id) -> Result<()> {
+        let snapshot = flow::owned(self.backend, id)?;
         self.spend(&[Step::RequestStartAfterStop, Step::Start]);
-        Backend::request_start_after_stop(self.backend, flow::owned(self.backend, id)?, &mut self.reservation)
+        Backend::request_start_after_stop(self.backend, snapshot, &mut self.reservation)
     }
 }

@@ -128,7 +128,7 @@ struct Store {
     start_in_doubt: BTreeSet<String>,
     stop_in_doubt: BTreeSet<String>,
     native_restart: bool,
-    prepare_fails: bool,
+    prepare_fails: Option<Step>,
     no_manager: bool,
     unresolvable: BTreeSet<String>,
     installed_fails: BTreeMap<String, Failure>,
@@ -497,11 +497,12 @@ impl Fake {
         state.externals.insert(id.to_string(), external);
     }
 
-    /// Test-only seeding: make [`ServiceManager::prepare`] fail, as launchd's
-    /// does when no thread can be made to reap a request.
-    pub fn seed_prepare_fails(&self) {
+    /// Test-only seeding: make every reservation that includes `step` fail, as launchd's does when
+    /// no thread can be made to reap a request. Any other reservation succeeds, so a test can tell
+    /// whether the failing one was made before the verbs ahead of `step` sent anything.
+    pub fn seed_prepare_fails(&self, step: Step) {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
-        state.prepare_fails = true;
+        state.prepare_fails = Some(step);
     }
 
     /// Every `start`/`stop`/`restart`/`kill` this Fake was asked to perform, in order, recorded
@@ -652,12 +653,12 @@ impl crate::backend::Backend for Fake {
     type InstallScope = ();
     type Reservation = ();
 
-    /// Records the steps asked for, and fails once [`Fake::seed_prepare_fails`]ed. Makes nothing
-    /// ready: the fake draws nothing.
+    /// Records the steps asked for, and fails if they include the step [`Fake::seed_prepare_fails`]
+    /// named. Makes nothing ready: the fake draws nothing.
     fn reserve(&self, steps: &[Step], budget: Budget) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.prepared.push((steps.to_vec(), budget));
-        if state.prepare_fails {
+        if state.prepare_fails.is_some_and(|failing| steps.contains(&failing)) {
             return Err(Error::Reservation {
                 id: None,
                 source: std::io::Error::other("injected test failure"),

@@ -107,8 +107,8 @@ impl Systemd {
     }
 }
 
-/// What a systemd [`Backend::reserve`] holds until it drops: the listener threads of its watched
-/// requests, in this thread's pool, and a share of one version gate.
+/// What [`Backend::reserve`] holds for systemd: pooled listener threads and a share of the version
+/// gate.
 pub(crate) struct Held {
     _spares: bounded::Spares,
     _gate: GateScope,
@@ -128,12 +128,9 @@ impl Backend for Systemd {
         Ok(gate)
     }
 
-    /// Makes ready now what each start or stop in `steps` needs to watch its one `systemctl` under
-    /// `budget`: a thread for each of its two streams, the stderr it announces its job on and its
-    /// stdout — never a temp file. `install` runs no watched `systemctl`, and a budget that does not wait, or never
-    /// stops waiting, watches none. While it is held, the steps also share one version gate — see
-    /// `systemctl::GateScope`. The verbs still take the threads from this thread's pool, not from
-    /// what they are handed.
+    /// Two listener threads (stderr, stdout; no temp files) per watched start or stop in `steps`,
+    /// plus a share of one version gate. `install` and unwatched budgets need none. Verbs take the
+    /// threads from this thread's pool, not from the `Held` they are handed.
     fn reserve(&self, steps: &[Step], budget: Budget) -> Result<Held> {
         let watched = steps
             .iter()

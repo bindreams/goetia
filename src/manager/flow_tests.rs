@@ -626,10 +626,11 @@ fn a_single_verb_that_cannot_reserve_sends_nothing_and_names_its_id() {
     let fake = Fake::new();
     fake.install(&spec, false).unwrap();
     let (calls, writes) = (fake.calls(), fake.writes());
-    fake.seed_prepare_fails();
     let mgr: &dyn ServiceManager = &fake;
 
-    for (verb, _, _, run) in single_verbs(mgr, &id, &spec) {
+    for (verb, step, _, run) in single_verbs(mgr, &id, &spec) {
+        fake.seed_prepare_fails(step);
+
         let result = run();
 
         assert!(
@@ -646,8 +647,11 @@ fn a_single_verb_that_cannot_reserve_sends_nothing_and_names_its_id() {
 
 /// A prepared step is used once, and only a prepared step: a verb that was not prepared for cannot
 /// have had anything reserved, so it is a miscount, loud in every debug build.
+#[cfg(debug_assertions)]
 #[skuld::test]
-#[should_panic(expected = "was not prepared for, or already ran")]
+#[should_panic(
+    expected = "[Start] was not prepared for, or already ran: it would draw on a reservation not counted for it"
+)]
 fn a_sequence_refuses_a_verb_it_was_not_prepared_for() {
     let fake = Fake::new();
     fake.install(&mk("frpc"), false).unwrap();
@@ -657,8 +661,11 @@ fn a_sequence_refuses_a_verb_it_was_not_prepared_for() {
     drop(sequence.start(&id, Budget::DEFAULT));
 }
 
+#[cfg(debug_assertions)]
 #[skuld::test]
-#[should_panic(expected = "was not prepared for, or already ran")]
+#[should_panic(
+    expected = "[Stop] was not prepared for, or already ran: it would draw on a reservation not counted for it"
+)]
 fn a_sequence_refuses_a_step_run_twice() {
     let fake = Fake::new();
     fake.install(&mk("frpc"), false).unwrap();
@@ -680,4 +687,53 @@ fn a_prepared_start_covers_a_start_requested_after_a_stop() {
 
     sequence.stop(&id, Budget::Immediate).unwrap();
     sequence.request_start_after_stop(&id).unwrap();
+}
+
+/// A request for a start spends the step made for exactly that before it falls back to `Start`,
+/// so a sequence prepared for both can still start afterwards.
+#[cfg(debug_assertions)]
+#[skuld::test]
+fn a_requested_start_spends_its_own_step_before_start() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    let id = Id::try_from("frpc").unwrap();
+    let mut sequence = fake
+        .prepare(&[Step::RequestStartAfterStop, Step::Start], Budget::Immediate)
+        .unwrap();
+
+    sequence.request_start_after_stop(&id).unwrap();
+
+    sequence.start(&id, Budget::Immediate).unwrap();
+}
+
+/// The cover goes one way: a step prepared for the request alone does not count a start.
+#[cfg(debug_assertions)]
+#[skuld::test]
+#[should_panic(
+    expected = "[Start] was not prepared for, or already ran: it would draw on a reservation not counted for it"
+)]
+fn a_step_prepared_for_a_requested_start_does_not_cover_a_start() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    let id = Id::try_from("frpc").unwrap();
+    let mut sequence = fake.prepare(&[Step::RequestStartAfterStop], Budget::Immediate).unwrap();
+
+    drop(sequence.start(&id, Budget::DEFAULT));
+}
+
+/// A verb the ownership gate refuses draws nothing, so it spends nothing: the sequence still holds
+/// every step, the refused one included, and runs it once the gate lets it through.
+#[cfg(debug_assertions)]
+#[skuld::test]
+fn a_verb_the_gate_refuses_spends_no_step() {
+    let fake = Fake::new();
+    let id = Id::try_from("frpc").unwrap();
+    let mut sequence = fake.prepare(&[Step::Stop, Step::Start], Budget::DEFAULT).unwrap();
+
+    let refused = sequence.stop(&id, Budget::DEFAULT);
+
+    assert!(matches!(refused, Err(Error::NotInstalled { .. })), "{refused:?}");
+    fake.install(&mk("frpc"), false).unwrap();
+    sequence.stop(&id, Budget::DEFAULT).unwrap();
+    sequence.start(&id, Budget::DEFAULT).unwrap();
 }

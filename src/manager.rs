@@ -128,22 +128,11 @@ pub trait ServiceManager {
     /// [`Error::Undetermined`]: crate::Error::Undetermined
     fn start(&self, id: &Id, budget: Budget) -> Result<()>;
 
-    /// Make ready, before the first of `steps` sends anything, whatever
-    /// they can need under `budget` — the one their verbs will be given —
-    /// that could otherwise run out between two of them — so
-    /// that a failure here means nothing was sent, where the same failure
-    /// later would strand the daemon halfway: stopped by `restart`'s stop
-    /// with its start never sent, or booted out by `install --start`'s
-    /// install with the start never sent.
-    ///
-    /// The verbs of the returned [`Sequence`] draw on what it made, and
-    /// nothing else does; it is released when the sequence is dropped. A
-    /// verb run outside a sequence makes what it needs itself, before it
-    /// sends anything.
-    ///
-    /// Each prepared step is used once, and only a prepared step: the
-    /// reservation counts exactly `steps`, so a verb the sequence was not
-    /// prepared for, or a second run of one, fails a debug assertion.
+    /// Make ready, before the first of `steps` sends anything, whatever they could need under
+    /// `budget` that might run out between two of them. A failure here means nothing was sent;
+    /// later it would strand the daemon halfway (e.g. stopped by `restart` with no start sent). The
+    /// returned [`Sequence`] draws on it, nothing else does; dropping it releases it. A verb outside
+    /// a sequence reserves for itself. Each prepared step is used once (see [`Sequence`]).
     fn prepare(&self, steps: &[Step], budget: Budget) -> Result<Box<dyn Sequence + '_>>;
 
     /// `daemon restart --timeout 0` as one request, where the platform has
@@ -281,7 +270,8 @@ pub enum Step {
 /// A verb may be run only for a step that was prepared, and each prepared step once: [`Step::Stop`]
 /// by `stop`, [`Step::Start`] by `start` or, where the start is only requested, by
 /// `request_start_after_stop`. Anything else was not counted for and fails a debug assertion; in a
-/// release build it makes what it needs on the spot, which can fail between legs.
+/// release build it makes what it needs on the spot, which can fail between legs. A verb the
+/// ownership gate refuses draws nothing, so its step stays unspent.
 #[must_use = "what was prepared is released as soon as this is dropped"]
 pub trait Sequence {
     /// See [`ServiceManager::stop`].

@@ -3,8 +3,7 @@
 //! sent would leave it unwatched — or, in a sequence of requests, stop the sequence halfway.
 //!
 //! A launchd verb is handed a [`Reservation`] and draws its reapers and temp files from it. systemd's
-//! listener threads are still taken from this thread's [`Spares`] first, and made on the spot only
-//! for the rest.
+//! listener threads come from this thread's [`Spares`].
 
 use std::cell::{Cell, RefCell};
 use std::fmt;
@@ -69,6 +68,8 @@ pub(crate) struct Reaper(Standby<cosca::Child>);
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl Reaper {
     fn new() -> io::Result<Reaper> {
+        // A failed reap is dropped on purpose: the caller has already reported the expiry, the
+        // crate has no log, and the child is detached whatever the wait said.
         Reaper::with(cosca::Child::wait, |_| {})
     }
 
@@ -208,11 +209,8 @@ fn made_on_the_spot(what: &str) {
     );
 }
 
-/// Make `listeners` threads ready now, all or none, for the verbs this thread runs while the returned
-/// guard lives — a sequence, such as `restart`'s stop and start, whose later verbs must not fail for
-/// want of a thread once an earlier one has sent something. Any step run on this thread meanwhile may
-/// draw on them. Dropping the guard drops what is left of its own, and only that: guards nest, and
-/// end in any order.
+/// Make `listeners` threads ready, all or none, for the verbs this thread runs while the guard lives.
+/// Dropping it drops only its own unspent threads; guards nest and may end in any order.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn spare(listeners: usize) -> io::Result<Spares> {
     let listeners = made(listeners, Listener::new)?;

@@ -82,9 +82,8 @@ pub fn run(
 
     // Each step (install, `--enable`, `--start`) contributes at most one code; see `ExitCode` for which wins.
     let mut codes: Vec<ExitCode> = Vec::new();
-    // Before the install sends anything, so that nothing the start needs
-    // can run out after the install booted a loaded job out. The install
-    // reserves for itself.
+    // Prepared before the install sends anything: a start that ran out of threads or files after
+    // the install's bootout would strand the daemon. The install reserves its own.
     let mut sequence = match args
         .start
         .then(|| mgr.prepare(&[Step::Start], args.wait.budget()))
