@@ -42,10 +42,12 @@ pub fn resolve(user: &User) -> Result<Identity> {
         User::Id(AccountId::Sid(sid)) => Ok(Identity {
             user: account_name_from_sid_string(sid)?,
         }),
-        User::Id(AccountId::Uid(uid)) => Err(Error::Other(format!(
-            "user.id `{uid}` is a numeric UID, which Windows SCM has no account mapping for; use `user.name` \
-             (an account name) or `user.id` with a SID string instead"
-        ))),
+        User::Id(AccountId::Uid(uid)) => Err(Error::AccountLookup {
+            detail: format!(
+                "user.id `{uid}` is a numeric UID, which Windows SCM has no account mapping for; use `user.name` \
+                 (an account name) or `user.id` with a SID string instead"
+            ),
+        }),
     }
 }
 
@@ -78,8 +80,10 @@ fn parse_password_var(var: std::result::Result<String, std::env::VarError>) -> R
     match var {
         Ok(v) => Ok(Some(v)),
         Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(Error::Other(
-            "GOETIA_SERVICE_PASSWORD is set but is not valid Unicode".to_string(),
+        // The `VarError` is not the source: its `Display` quotes the value, which is the password.
+        Err(std::env::VarError::NotUnicode(_)) => Err(Error::os(
+            "read GOETIA_SERVICE_PASSWORD",
+            std::io::Error::other("the variable is set but its value is not valid Unicode"),
         )),
     }
 }
@@ -92,7 +96,7 @@ pub(in crate::backend::scm) fn wide_null(s: &str) -> Vec<u16> {
 }
 
 fn last_error(context: &str) -> Error {
-    Error::Other(format!("{context}: {}", std::io::Error::last_os_error()))
+    Error::os(context, std::io::Error::last_os_error())
 }
 
 // SID <-> account name ================================================================================================
@@ -138,13 +142,13 @@ fn lookup_account_sid(psid: PSID, sid_str: &str) -> Result<String> {
         )
     };
     if sizing_ok != 0 {
-        return Err(Error::Other(format!(
-            "LookupAccountSidW for `{sid_str}` unexpectedly succeeded on a zero-sized buffer"
-        )));
+        return Err(Error::AccountLookup {
+            detail: format!("LookupAccountSidW for `{sid_str}` unexpectedly succeeded on a zero-sized buffer"),
+        });
     }
     let err = std::io::Error::last_os_error();
     if err.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
-        return Err(Error::Other(format!("resolve account name for SID `{sid_str}`: {err}")));
+        return Err(Error::os(format!("resolve account name for SID `{sid_str}`"), err));
     }
 
     let mut name_buf = vec![0u16; name_len as usize];
@@ -205,13 +209,13 @@ fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
         )
     };
     if sizing_ok != 0 {
-        return Err(Error::Other(format!(
-            "LookupAccountNameW for `{account_name}` unexpectedly succeeded on a zero-sized buffer"
-        )));
+        return Err(Error::AccountLookup {
+            detail: format!("LookupAccountNameW for `{account_name}` unexpectedly succeeded on a zero-sized buffer"),
+        });
     }
     let err = std::io::Error::last_os_error();
     if err.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
-        return Err(Error::Other(format!("resolve SID for account `{account_name}`: {err}")));
+        return Err(Error::os(format!("resolve SID for account `{account_name}`"), err));
     }
 
     let mut sid_buf = vec![0u8; sid_len as usize];
@@ -241,10 +245,7 @@ fn nt_error(context: &str, status: i32) -> Error {
     // SAFETY: `LsaNtStatusToWinError` takes a plain `NTSTATUS` value and
     // cannot fail.
     let win32 = unsafe { LsaNtStatusToWinError(status) };
-    Error::Other(format!(
-        "{context}: {}",
-        std::io::Error::from_raw_os_error(win32 as i32)
-    ))
+    Error::os(context, std::io::Error::from_raw_os_error(win32 as i32))
 }
 
 /// Grant `account_name` the right to log on as a service

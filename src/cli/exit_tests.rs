@@ -33,7 +33,7 @@ fn of_maps_an_error_by_whether_it_left_the_outcome_open() {
         waited: std::time::Duration::ZERO,
         recovery: String::new(),
     };
-    let failed = crate::Error::Other("failed".to_string());
+    let failed = crate::Error::NotInstalled { id: "x".to_string() };
 
     assert_eq!(ExitCode::of(&in_doubt), ExitCode::Indeterminate);
     assert_eq!(ExitCode::of(&failed), ExitCode::Error);

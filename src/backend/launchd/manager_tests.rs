@@ -94,7 +94,7 @@ fn undo_write_puts_the_previous_plist_over_what_install_wrote() {
     let wrote = previous.replace("/bin/true", "/bin/false");
     std::fs::write(&target, &wrote).unwrap();
 
-    undo_write(&target, &wrote, Some(&previous)).expect("undo over what install wrote");
+    undo_write(&Id::try_from("id").unwrap(), &target, &wrote, Some(&previous)).expect("undo over what install wrote");
 
     assert_eq!(std::fs::read_to_string(&target).unwrap(), previous);
 }
@@ -107,7 +107,7 @@ fn undo_write_removes_a_plist_that_install_created() {
     let wrote = sample_plist("id");
     std::fs::write(&target, &wrote).unwrap();
 
-    undo_write(&target, &wrote, None).expect("undo of a create");
+    undo_write(&Id::try_from("id").unwrap(), &target, &wrote, None).expect("undo of a create");
 
     assert!(!target.exists());
 }
@@ -122,8 +122,9 @@ fn undo_write_leaves_a_plist_that_is_no_longer_what_install_wrote() {
     std::fs::write(&target, "someone else's plist\n").unwrap();
 
     for previous in [Some(wrote.as_str()), None] {
-        let err = undo_write(&target, &wrote, previous).expect_err("not what install wrote");
-        assert!(err.to_string().contains("no longer holds"), "{err}");
+        let err =
+            undo_write(&Id::try_from("id").unwrap(), &target, &wrote, previous).expect_err("not what install wrote");
+        assert!(matches!(err, Error::ConcurrentChange { .. }), "{err:?}");
         assert!(err.to_string().contains(&target.display().to_string()), "{err}");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "someone else's plist\n");
     }
@@ -138,8 +139,8 @@ fn undo_write_does_not_recreate_a_plist_that_is_gone() {
     let wrote = sample_plist("id");
 
     for previous in [Some(wrote.as_str()), None] {
-        let err = undo_write(&target, &wrote, previous).expect_err("nothing there");
-        assert!(err.to_string().contains("no longer"), "{err}");
+        let err = undo_write(&Id::try_from("id").unwrap(), &target, &wrote, previous).expect_err("nothing there");
+        assert!(matches!(err, Error::ConcurrentChange { .. }), "{err:?}");
         assert!(!target.exists(), "the put-back recreated the plist");
     }
 }
@@ -550,7 +551,7 @@ fn read_artifact_maps_an_unreadable_plist_to_undetermined() {
     let err = read_artifact(&path, "opaque").expect_err("`ENOTDIR` is not a readable artifact");
 
     let Error::Undetermined { id, reason, .. } = &err else {
-        panic!("`Error::Io` reaches `status` as `unusable`, which claims goetia owns the id: {err:?}");
+        panic!("`Error::Os` reaches `status` as `unusable`, which claims goetia owns the id: {err:?}");
     };
     assert_eq!(id, "opaque");
     assert!(
@@ -882,7 +883,7 @@ fn marked_plist(id: &Id) -> Plist {
 /// Whether `result` is the failure of a verb that could not make its reapers — as opposed to one that
 /// made them and went on to discovery.
 fn refused_for_want_of_a_reaper<T: std::fmt::Debug>(result: &Result<T>) -> bool {
-    matches!(result, Err(e) if e.to_string().contains("no thread could be made to reap a `launchctl` request, so none was sent"))
+    matches!(result, Err(e @ Error::Reservation { .. }) if e.report().to_string().contains("no thread may be made"))
 }
 
 /// Every verb makes every reaper it can need before anything else, so before any `launchctl` runs:
@@ -961,7 +962,7 @@ fn a_verb_with_its_reapers_goes_on_to_its_first_call() {
 /// Whether `result` is the failure of a verb that could not make the temp files its `launchctl`
 /// calls write to — as opposed to one that made them and went on to discovery.
 fn refused_for_want_of_a_file<T: std::fmt::Debug>(result: &Result<T>) -> bool {
-    matches!(result, Err(e) if e.to_string().contains("no temp file could be made for a `launchctl` call's output, so nothing was sent"))
+    matches!(result, Err(e @ Error::Reservation { .. }) if e.report().to_string().contains("no temp file may be made"))
 }
 
 /// Every verb makes the temp files every `launchctl` call it can make writes to, reads and requests
@@ -1103,11 +1104,11 @@ fn a_launchctl_request_that_may_have_run_is_in_doubt() {
             detail: "forced".into(),
         });
         let e = launchctl(&args, deadline, Role::Query).err().expect("injected");
-        assert!(matches!(e, Error::CommandFailed { .. }), "{e:?}");
+        assert!(matches!(e, Error::Spawn { .. }), "{e:?}");
     }
     bounded::test_hook::spawn_fails(|| io::Error::from_raw_os_error(libc::EAGAIN).into());
     let e = launchctl(&args, deadline, request()).err().expect("injected");
-    assert!(matches!(e, Error::CommandFailed { .. }), "{e:?}");
+    assert!(matches!(e, Error::Spawn { .. }), "{e:?}");
 }
 
 /// A `launchctl` that cannot be run says nothing about the job: `status` fails, and `list` (via
@@ -1129,7 +1130,7 @@ fn a_live_status_whose_launchctl_cannot_be_run_is_an_error() {
 
     let result = Launchd::new().live_status(&snapshot);
 
-    assert!(matches!(result, Err(Error::CommandFailed { .. })), "{result:?}");
+    assert!(matches!(result, Err(Error::Spawn { .. })), "{result:?}");
 }
 
 // Every verb path stays inside its reservation ========================================================================
@@ -1392,7 +1393,7 @@ fn kill_refused_for_any_other_reason_is_a_plain_failure() {
 
     let e = result.expect_err("refused");
     assert!(
-        matches!(&e, Error::CommandFailed { stderr, .. } if stderr.contains("Operation not permitted")),
+        matches!(&e, Error::Command { stderr, .. } if stderr.contains("Operation not permitted")),
         "{e:?}"
     );
 }
@@ -1474,8 +1475,7 @@ fn a_print_that_fails_otherwise_is_an_error_not_a_job_that_is_not_loaded() {
     let name = format!("goetia-unreadable-{:x}", std::process::id());
     let _plists = Plists(name.clone());
     let mut spec = spec_named(&name);
-    let names_print =
-        |e: &Error| matches!(e, Error::CommandFailed { command, .. } if command.starts_with("launchctl print"));
+    let names_print = |e: &Error| matches!(e, Error::Command { command, .. } if command.starts_with("launchctl print"));
 
     // `Create`: the stale-job check, which comes before anything is written.
     let script = Scripted::new(&[("print", UNREADABLE)]);
@@ -1491,7 +1491,7 @@ fn a_print_that_fails_otherwise_is_an_error_not_a_job_that_is_not_loaded() {
     // `Create` again and reaches the stale job.
     let script = Scripted::new(&[("print", DONE), ("bootout", REFUSED)]);
     let e = mgr.install(&spec, false).expect_err("a refused bootout");
-    assert!(matches!(e, Error::CommandFailed { .. }), "{e:?}");
+    assert!(matches!(e, Error::Command { .. }), "{e:?}");
     script.assert_driven("create, refused bootout");
     assert!(
         !staging_path(&name).exists(),
@@ -1536,7 +1536,8 @@ fn assert_restored_and_rerun_refused(mgr: &Launchd, spec: &DaemonSpec, name: &st
     let script = Scripted::new(&[("print", RUNNING)]);
     let refused = mgr.install(spec, false).expect_err("the rerun, job loaded");
     assert!(
-        matches!(refused, Error::Other(_)) && refused.to_string().contains(&format!("goetia daemon stop {name}")),
+        matches!(refused, Error::LoadedJob { .. })
+            && refused.to_string().contains(&format!("goetia daemon stop {name}")),
         "a refusal, not an exit-4 or an up-to-date: {refused}"
     );
     script.assert_driven("the rerun reads the job and is refused");
@@ -1661,12 +1662,12 @@ fn install_loaded_after_write(mgr: &Launchd, name: &str, during: &str) -> (Error
 }
 
 /// The failed put-back of an install that ended in doubt, or a panic.
-fn restore_failure_of(e: &Error) -> &str {
+fn restore_failure_of(e: &Error) -> &Error {
     match e {
         Error::LoadedJobInDoubt {
-            restore_failed: Some(detail),
+            restore_failed: Some(cause),
             ..
-        } => detail,
+        } => cause,
         other => panic!("expected an exit-4 error whose put-back failed: {other:?}"),
     }
 }
@@ -1682,8 +1683,8 @@ fn a_put_back_does_not_overwrite_a_plist_that_is_no_longer_ours() {
 
     let (e, _) = install_loaded_after_write(&mgr, &name, &format!("echo 'someone else' > '{}'", target.display()));
 
-    assert!(restore_failure_of(&e).contains("no longer holds"), "{e}");
-    assert!(e.to_string().contains(&target.display().to_string()), "{e}");
+    assert!(matches!(restore_failure_of(&e), Error::ConcurrentChange { .. }), "{e}");
+    assert!(e.report().to_string().contains(&target.display().to_string()), "{e}");
     assert!(!e.to_string().contains("plist is back as it was"), "{e}");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "someone else\n");
 }
@@ -1703,7 +1704,7 @@ fn a_put_back_does_not_recreate_a_plist_that_was_enabled_meanwhile() {
     );
     let (e, changed) = install_loaded_after_write(&mgr, &name, &during);
 
-    assert!(restore_failure_of(&e).contains("no longer"), "{e}");
+    assert!(matches!(restore_failure_of(&e), Error::ConcurrentChange { .. }), "{e}");
     assert!(!staging_path(&name).exists(), "the put-back recreated the staged plist");
     assert_eq!(std::fs::read_to_string(enabled_path(&name)).unwrap(), changed);
 }
@@ -1718,7 +1719,7 @@ fn a_put_back_does_not_resurrect_a_plist_that_was_uninstalled_meanwhile() {
 
     let (e, _) = install_loaded_after_write(&mgr, &name, &format!("rm '{}'", staging_path(&name).display()));
 
-    assert!(restore_failure_of(&e).contains("no longer"), "{e}");
+    assert!(matches!(restore_failure_of(&e), Error::ConcurrentChange { .. }), "{e}");
     assert!(!staging_path(&name).exists(), "the put-back resurrected the plist");
 }
 
@@ -1754,7 +1755,8 @@ fn a_stale_plist_is_refused_over_a_loaded_job_only_when_its_rendering_differs() 
         .install(&spec, false)
         .expect_err("a stale plist that renders differently");
     assert!(
-        matches!(refused, Error::Other(_)) && refused.to_string().contains(&format!("goetia daemon stop {name}")),
+        matches!(refused, Error::LoadedJob { .. })
+            && refused.to_string().contains(&format!("goetia daemon stop {name}")),
         "{refused}"
     );
     script.assert_driven("the stale plist's rendering differs, so launchd is asked");
@@ -1788,7 +1790,7 @@ fn a_create_that_cannot_stage_its_plist_boots_nothing_out() {
 
     let script = Scripted::new(&[]);
     let e = mgr.install(&spec, false).expect_err("a cwd that cannot be created");
-    assert!(matches!(e, Error::Io { .. }), "{e:?}");
+    assert!(matches!(e, Error::Os { .. }), "{e:?}");
     script.assert_driven("a create that cannot stage asks launchd nothing");
     assert!(!staging_path(&name).exists());
 }
@@ -1886,7 +1888,7 @@ fn a_plist_taken_after_a_read_fails_the_install_without_further_launchctl_calls(
     let take = format!("echo 'someone else' > '{}'; exit 113", target.display());
     let script = Scripted::new(&[("print", &take)]);
     let e = mgr.install(&spec, false).expect_err("the plist was taken after a read");
-    assert!(matches!(e, Error::Other(_)), "{e:?}");
+    assert!(matches!(e, Error::ConcurrentChange { .. }), "{e:?}");
     assert!(e.to_string().contains("re-run"), "{e}");
     assert!(e.to_string().contains(&target.display().to_string()), "{e}");
     script.assert_driven("nothing is sent after the race");
@@ -1915,7 +1917,7 @@ fn a_plist_removed_after_a_read_fails_the_install_without_further_launchctl_call
     let e = mgr
         .install(&spec, false)
         .expect_err("the plist was removed after a read");
-    assert!(matches!(e, Error::Other(_)), "{e:?}");
+    assert!(matches!(e, Error::ConcurrentChange { .. }), "{e:?}");
     assert!(e.to_string().contains("re-run"), "{e}");
     script.assert_driven("nothing is sent after the vanish");
     assert!(!target.exists(), "the install wrote a plist over the vanished one");

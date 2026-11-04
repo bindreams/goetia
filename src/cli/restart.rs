@@ -237,7 +237,7 @@ fn spent_before_start(id: &Id, budget: Budget) -> Error {
 
 /// The start leg's failure, re-wrapped to say what the stop leg established.
 ///
-/// Re-wrapped variant by variant rather than flattened to [`Error::Other`]:
+/// Re-wrapped variant by variant rather than flattened to an [`Error::Step`]:
 /// `run_id_verb` reads the variant, and an `Undetermined` or `WaitTimeout`
 /// start leg erased here would exit `1` in the states where the distinction
 /// matters most — stopped and not back up, or stopped and still on its way.
@@ -272,13 +272,14 @@ fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
         // service still coming down). systemd never gets here: its restart is
         // one request. Either way nothing confirmed the stop,
         // which may be in flight, done, or have had nothing to do, so where
-        // the daemon ended up is what nobody established — not `Other`,
+        // the daemon ended up is what nobody established — not a plain failure,
         // exit `1`, whose answer a refusal alone would be.
         e if !budget.waits() => Error::Unestablished {
             id: id.as_str().to_string(),
             detail: format!(
                 "the stop was issued without waiting for it, and the start that followed was \
-                 refused: {e}. `goetia daemon status {id}` shows the manager's current view."
+                 refused: {}. `goetia daemon status {id}` shows the manager's current view.",
+                e.report()
             ),
         },
         Error::WaitTimeout {
@@ -292,7 +293,10 @@ fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
             id,
             awaited,
         },
-        other => Error::Other(format!("stopped but failed to restart: {other}")),
+        other => Error::Step {
+            what: "stopped but failed to restart".to_string(),
+            source: Box::new(other),
+        },
     }
 }
 

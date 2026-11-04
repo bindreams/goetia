@@ -463,7 +463,7 @@ fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled
         .status(&spec.id)
         .expect_err("status regenerates the spec, which scm refuses");
     assert!(
-        matches!(&status, goetia::Error::Other(message) if message.contains("restart: always")),
+        matches!(&status, goetia::Error::Step { .. }) && status.report().to_string().contains("restart: always"),
         "{status:?}"
     );
     let listed = mgr.list().expect("list");

@@ -448,7 +448,7 @@ fn load_reports_io_error_for_missing_path() {
     let missing = dir.path().join("does-not-exist.yaml");
 
     let err = load(&missing).unwrap_err();
-    assert!(matches!(err, Error::Io { .. }), "expected an Io error, got: {err:?}");
+    assert!(matches!(err, Error::Os { .. }), "expected an Os error, got: {err:?}");
 }
 
 // Emission hardening ==================================================================================================
@@ -1030,7 +1030,7 @@ fn an_unreadable_env_file_fails_only_a_manifest_whose_native_spec_needs_it() {
 
     let bare = "id: frpc\ncommand: [/bin/frpc]\nrestart-delay: ${DELAY}\n";
     let err = resolve_as(parse_manifest(bare), dir.path(), Some(BackendKind::Systemd)).unwrap_err();
-    assert!(matches!(err, Error::Io { .. }), "expected Io, got: {err:?}");
+    assert!(matches!(err, Error::Os { .. }), "expected Os, got: {err:?}");
 }
 
 #[skuld::test]
@@ -1043,7 +1043,7 @@ fn load_reads_the_env_file_for_an_escaped_dollar_only() {
     std::fs::create_dir(dir.path().join(".env")).expect("fixture directory should be creatable");
 
     let err = load(dir.path()).unwrap_err();
-    assert!(matches!(err, Error::Io { .. }), "expected Io, got: {err:?}");
+    assert!(matches!(err, Error::Os { .. }), "expected Os, got: {err:?}");
 }
 
 #[skuld::test]

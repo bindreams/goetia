@@ -109,10 +109,11 @@ fn the_refusal_names_the_daemon_and_the_remedy() {
 // loaded_after_write ==================================================================================================
 
 fn restore_failure() -> Error {
-    Error::Io {
-        path: "/Library/LaunchDaemons/frpc.plist".into(),
-        source: std::io::Error::from_raw_os_error(5),
-    }
+    Error::os_at(
+        "write",
+        "/Library/LaunchDaemons/frpc.plist",
+        std::io::Error::from_raw_os_error(5),
+    )
 }
 
 /// The job was not loaded at the first check and is loaded now: goetia cannot tell which definition
@@ -136,7 +137,7 @@ fn a_job_loaded_after_the_write_is_in_doubt_and_names_the_remedy() {
 fn a_job_in_doubt_whose_plist_could_not_be_restored_carries_the_failure() {
     let e = loaded_after_write(&Id::try_from("frpc").unwrap(), Err(restore_failure()));
     assert!(matches!(e, Error::LoadedJobInDoubt { .. }), "{e:?}");
-    let message = e.to_string();
+    let message = e.report().to_string();
     assert!(message.contains("could not be put back"), "{message}");
     assert!(message.contains("/Library/LaunchDaemons/frpc.plist"), "{message}");
     assert!(message.contains("goetia daemon stop frpc"), "{message}");
@@ -150,10 +151,10 @@ fn a_job_in_doubt_whose_plist_could_not_be_restored_carries_the_failure() {
 /// same exit `4` and the same remedy, and the message carries the read's own failure.
 #[skuld::test]
 fn an_unreadable_recheck_is_in_doubt_and_names_the_remedy_and_the_failure() {
-    let read = Error::CommandFailed {
-        command: "launchctl print system/frpc".to_owned(),
-        stderr: "Could not print: 5: Input/output error".to_owned(),
-    };
+    let read = Error::os(
+        "print system/frpc",
+        std::io::Error::other("Could not print: 5: Input/output error"),
+    );
     let e = state_unknown_after_write(&Id::try_from("frpc").unwrap(), &read, Ok(()));
     assert!(matches!(e, Error::LoadedStateInDoubt { .. }), "{e:?}");
     let message = e.to_string();
@@ -167,13 +168,13 @@ fn an_unreadable_recheck_is_in_doubt_and_names_the_remedy_and_the_failure() {
 
 #[skuld::test]
 fn an_unreadable_recheck_whose_plist_could_not_be_restored_carries_both_failures() {
-    let read = Error::CommandFailed {
-        command: "launchctl print system/frpc".to_owned(),
-        stderr: "Could not print: 5: Input/output error".to_owned(),
-    };
+    let read = Error::os(
+        "print system/frpc",
+        std::io::Error::other("Could not print: 5: Input/output error"),
+    );
     let e = state_unknown_after_write(&Id::try_from("frpc").unwrap(), &read, Err(restore_failure()));
     assert!(matches!(e, Error::LoadedStateInDoubt { .. }), "{e:?}");
-    let message = e.to_string();
+    let message = e.report().to_string();
     assert!(message.contains("Input/output error"), "{message}");
     assert!(message.contains("could not be put back"), "{message}");
     assert!(!message.contains("plist is back as it was"), "{message}");
@@ -199,16 +200,14 @@ fn a_plist_taken_after_the_bootout_says_what_was_done_and_what_is_there() {
 
 // changed_during_install ==============================================================================================
 
-/// A plist that changed under `install` after a read: a plain failure that says no plist was written and
-/// to run `install` again.
+/// A plist that changed under `install` after a read: a plain failure that says to run `install` again.
 #[skuld::test]
 fn a_plist_changed_during_install_is_a_plain_failure_that_says_to_rerun() {
     let path = std::path::Path::new("/Library/Application Support/Goetia/daemons/frpc.plist");
     let e = changed_during_install(&Id::try_from("frpc").unwrap(), path);
-    assert!(matches!(e, Error::Other(_)), "{e:?}");
+    assert!(matches!(e, Error::ConcurrentChange { .. }), "{e:?}");
     let message = e.to_string();
     assert!(message.contains("`frpc`"), "{message}");
     assert!(message.contains(&path.display().to_string()), "{message}");
-    assert!(message.contains("no plist was written"), "{message}");
     assert!(message.contains("re-run"), "{message}");
 }

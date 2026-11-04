@@ -795,11 +795,8 @@ fn a_verb_on_a_snapshot_that_went_stale_refuses_and_performs_nothing() {
                 ("gone", Err(Error::NotInstalled { id })) | ("foreign", Err(Error::Foreign { id, .. })) => {
                     assert_eq!(id, "frpc", "{stale}: {verb}");
                 }
-                ("another artifact of goetia's", Err(Error::Other(message))) => {
-                    assert!(
-                        message.contains("changed after being confirmed installed"),
-                        "{verb}: {message}"
-                    );
+                ("another artifact of goetia's", Err(Error::ConcurrentChange { id, .. })) => {
+                    assert_eq!(id, "frpc", "{verb}");
                 }
                 _ => panic!("{stale}: {verb} must refuse, got {result:?}"),
             }

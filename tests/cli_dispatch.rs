@@ -168,7 +168,7 @@ fn dispatch_read_only(args: &[&str], fake: &Fake) -> (i32, String, String) {
 ///   path.
 /// - `unqueryable` models a unit that decodes but whose *live state* cannot
 ///   be read: `list` reports it as `OursUnusable` while `status` fails
-///   with `CommandFailed`, exactly as a real backend does. That asymmetry is
+///   with `Spawn`, exactly as a real backend does. That asymmetry is
 ///   the one the JSON envelope's `unusable` kind exists to close.
 /// - `fail_preview_for` is the "the manager could not even answer whether
 ///   this daemon would change" path — `Fake` itself can never fail
@@ -227,9 +227,9 @@ struct FlakyManager {
 /// shape a real backend produces when the tool it shells out to cannot
 /// answer.
 fn unqueryable_failure() -> goetia::Error {
-    goetia::Error::CommandFailed {
+    goetia::Error::Spawn {
         command: "query-live-state".to_string(),
-        stderr: "live state unavailable (injected test failure)".to_string(),
+        source: std::io::Error::other("live state unavailable (injected test failure)").into(),
     }
 }
 
@@ -2388,7 +2388,7 @@ fn status_json_distinguishes_not_installed_foreign_and_unusable() {
 
 /// The disagreement this task exists to close: for a unit that decodes but
 /// whose live state cannot be queried, `list` sees `Installed::OursUnusable`
-/// and `status` sees `Error::CommandFailed`. Both must report `unusable`.
+/// and `status` sees `Error::Spawn`. Both must report `unusable`.
 #[skuld::test]
 fn list_and_status_report_the_same_kind_for_an_unqueryable_daemon() {
     let inner = Fake::new();
@@ -3252,8 +3252,8 @@ fn stop_that_times_out_exits_4() {
 }
 
 /// `cli::restart` re-wraps its start leg's error variant by variant. A flattened `WaitTimeout`
-/// becomes `Error::Other` and silently exits `1` — "the start determinately failed", which is the
-/// one thing an expiry did not establish.
+/// would drop the `awaited` and `waited` an expiry carries, and lose the recovery that says the stop
+/// was issued.
 #[skuld::test]
 fn restart_whose_start_leg_times_out_exits_4_not_1() {
     let inner = Fake::new();
@@ -3562,7 +3562,7 @@ fn restart_that_cannot_prepare_sends_nothing() {
         let (code, out, err) = dispatch_elevated(&args, &fake);
 
         assert_eq!(code, 1, "{budget:?}\nstdout:\n{out}\nstderr:\n{err}");
-        assert!(err.contains("nothing could be prepared"), "{err}");
+        assert!(err.contains("so none was sent"), "{err}");
         assert_eq!(fake.calls(), vec![], "{budget:?}: nothing may be sent");
         assert_eq!(
             fake.status(&Id::try_from("frpc").unwrap()).unwrap().state,
@@ -3593,7 +3593,7 @@ fn install_start_that_cannot_prepare_installs_nothing() {
     );
 
     assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
-    assert!(err.contains("nothing could be prepared"), "{err}");
+    assert!(err.contains("so none was sent"), "{err}");
     assert_eq!(fake.calls(), vec![]);
     assert!(
         fake.status(&Id::try_from("frpc").unwrap()).is_err(),

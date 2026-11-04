@@ -45,7 +45,7 @@ fn a_directory_at_the_env_path_is_an_error() {
     let dir = tempfile::tempdir().expect("tempdir should be creatable");
     std::fs::create_dir(dir.path().join(".env")).expect("fixture directory should be creatable");
     let err = Vars::load(dir.path()).unwrap_err();
-    assert!(matches!(err, Error::Io { .. }), "expected Io, got: {err:?}");
+    assert!(matches!(err, Error::Os { .. }), "expected Os, got: {err:?}");
 }
 
 // Blank lines, comments, whitespace ===================================================================================

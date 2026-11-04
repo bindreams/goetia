@@ -55,7 +55,7 @@
 //!   that the bytes are not valid UTF-8, naming neither the file's real
 //!   problem nor the fix. Anything else is decoded as UTF-8, and a decode
 //!   failure produces that same dedicated error rather than a bare
-//!   `Error::Io`.
+//!   `Error::Os`.
 //! - Line terminators are `\n` and `\r\n`.
 //! - A line that is entirely whitespace, or whose first non-whitespace
 //!   character is `#`, is ignored.
@@ -103,7 +103,7 @@
 //! - A missing file is not an error and yields `Vars::empty()`. Only
 //!   `io::ErrorKind::NotFound` means "absent"; every other IO failure
 //!   (for example a directory sitting at the `.env` path) propagates as
-//!   `Error::Io`, so a real failure is never mistaken for a benign
+//!   `Error::Os`, so a real failure is never mistaken for a benign
 //!   absence.
 
 use std::collections::BTreeMap;
@@ -123,7 +123,7 @@ pub(crate) struct Vars(BTreeMap<String, String>);
 
 impl Vars {
     /// Read `<base_dir>/.env`. A missing file yields an empty set; any
-    /// other read failure is `Error::Io`; a file that exists but does not
+    /// other read failure is `Error::Os`; a file that exists but does not
     /// follow the grammar in the module doc comment is `Error::EnvFile`.
     pub(crate) fn load(base_dir: &Path) -> Result<Self> {
         let path = base_dir.join(ENV_FILE_NAME);
@@ -131,7 +131,7 @@ impl Vars {
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Self::empty()),
-            Err(source) => return Err(Error::Io { path, source }),
+            Err(source) => return Err(Error::os_at("read", path, source)),
         };
 
         let bytes = strip_bom(&bytes, &path)?;

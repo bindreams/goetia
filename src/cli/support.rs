@@ -260,7 +260,7 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
     let ids = match ids {
         Ok(ids) => ids,
         Err(e) => {
-            let _ = writeln!(err, "error: {e}");
+            let _ = writeln!(err, "error: {}", e.report());
             return ExitCode::Error;
         }
     };
@@ -271,7 +271,7 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
     let mgr = match (call.get_manager)() {
         Ok(mgr) => mgr,
         Err(e) => {
-            let _ = writeln!(err, "error: {e}");
+            let _ = writeln!(err, "error: {}", e.report());
             return ExitCode::Error;
         }
     };
@@ -293,7 +293,7 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
                 codes.push(ExitCode::Success);
             }
             Err(e) => {
-                let _ = writeln!(err, "error: {id}: {e}");
+                let _ = writeln!(err, "error: {id}: {}", e.report());
                 codes.push(ExitCode::of(&e));
             }
         }

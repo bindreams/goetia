@@ -1,21 +1,158 @@
 //! Crate-wide error type.
 
-use std::path::PathBuf;
+use std::fmt;
+use std::path::{Path, PathBuf};
 
-/// Errors produced while reading, parsing, or resolving a `goetia.yaml`
-/// manifest.
+/// What a variant's `#[source]` holds when the cause is another library's error.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Every goetia error. A variant is named for the layer that raised it, and its `Display` is its
+/// own context only, never its source's text: print the whole chain with [`Error::report`].
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Reading `path` from disk failed.
-    #[error("failed to read {path}: {source}", path = path.display())]
-    Io {
-        path: PathBuf,
+    /// An OS call (filesystem, registry, Win32, a syscall) failed. `what` is the action
+    /// (`"read"`, `"enable `x`"`), and `path` is what it acted on, where there is one.
+    #[error("failed to {what}{}", path_suffix(path))]
+    Os {
+        what: String,
+        path: Option<PathBuf>,
+        #[source]
+        source: BoxError,
+    },
+
+    /// A tool goetia runs (`systemctl`, `launchctl`, `plutil`, `sc.exe`) ran and exited
+    /// unsuccessfully. `stderr` is its own diagnostic, trimmed.
+    #[error("`{command}` failed ({status}){}", stderr_suffix(stderr))]
+    Command {
+        command: String,
+        status: std::process::ExitStatus,
+        stderr: String,
+    },
+
+    /// A tool goetia runs could not be run, or its run was lost. `source` is the spawn or wait
+    /// error.
+    #[error("failed to run `{command}`")]
+    Spawn {
+        command: String,
+        #[source]
+        source: BoxError,
+    },
+
+    /// A goetia operation failed because a step under it did.
+    #[error("{what}")]
+    Step {
+        what: String,
+        #[source]
+        source: Box<Error>,
+    },
+
+    /// A step failed, and so did the one after it. `report()` prints both, `first` then `then`;
+    /// `source()` is `first`.
+    #[error("a step failed, and so did the one after it")]
+    Both {
+        #[source]
+        first: Box<Error>,
+        then: Box<Error>,
+    },
+
+    /// What goetia read at `id` changed before it acted on it, so it did nothing further: re-run.
+    #[error(
+        "`{id}` changed after goetia read it{}, so goetia did nothing further: re-run the command",
+        read_at(path)
+    )]
+    ConcurrentChange { id: String, path: Option<PathBuf> },
+
+    /// goetia's quarantined original of `id` could not go back, because another file holds the
+    /// unit path. Resolve by hand.
+    #[error(
+        "the original fragment of `{id}` is quarantined at {quarantine}, but a different file occupies {occupied}, so \
+         it cannot go back: resolve manually",
+        quarantine = quarantine.display(),
+        occupied = occupied.display()
+    )]
+    QuarantineStranded {
+        id: String,
+        quarantine: PathBuf,
+        occupied: PathBuf,
+    },
+
+    /// A daemon's definition exists in two places at once, which no goetia operation produces.
+    #[error(
+        "daemon `{id}` has a plist in both {} and {}; remove one by hand (they should never both exist) before retrying",
+        paths[0].display(),
+        paths[1].display()
+    )]
+    AmbiguousInstall { id: String, paths: [PathBuf; 2] },
+
+    /// The manager accepted a start, and goetia established that no process runs, before the
+    /// deadline. Determinate, unlike [`WaitTimeout`](Error::WaitTimeout).
+    #[error("`{id}` did not start: the manager accepted the start, but no process is running")]
+    NotStarted { id: String },
+
+    /// launchd cannot update a loaded job, so the changed definition was not installed.
+    #[error(
+        "`{id}` is loaded in launchd, which cannot update a loaded job, so the changed plist was not installed and \
+         the installed plist is untouched: run `goetia daemon stop {id}` (a job that has exited is still loaded), \
+         re-run install, then start it"
+    )]
+    LoadedJob { id: String },
+
+    /// A real account needs a password that was not given.
+    #[error(
+        "service account `{account}` needs a password (it is not LocalSystem/LocalService/NetworkService, nor an \
+         `NT SERVICE\\`/`NT AUTHORITY\\` account); set GOETIA_SERVICE_PASSWORD before installing"
+    )]
+    PasswordRequired { account: String },
+
+    /// goetia cannot confirm the manager or its client is at least its floor; nothing was sent.
+    /// The sentences are written from what each source reported.
+    #[error("{}", unsupported_manager(client, manager))]
+    UnsupportedManager {
+        client: VersionReading,
+        manager: VersionReading,
+    },
+
+    /// The manager's client exited `0` but announced no job, so the manager did nothing.
+    #[error(
+        "`{request}` exited 0 without enqueuing a job, so the manager did not act on it{}",
+        why(diagnostic)
+    )]
+    NotEnqueued {
+        request: String,
+        diagnostic: Option<String>,
+    },
+
+    /// The manager answered without properties goetia asked for.
+    #[error("`{command}` answered without {}, so goetia cannot tell its live state", missing.join(", "))]
+    IncompleteAnswer { command: String, missing: Vec<String> },
+
+    /// The manager does not know a unit goetia finds installed.
+    #[error(
+        "systemd has not loaded the unit file goetia finds installed for `{unit}` (`LoadState=not-found`), so what it \
+         reports is not that unit's state"
+    )]
+    UnitNotLoaded { unit: String },
+
+    /// A thread or temp file a request needs could not be made, so nothing was sent.
+    #[error(
+        "{}no thread or temp file could be made for a request, so none was sent",
+        id_prefix(id)
+    )]
+    Reservation {
+        id: Option<String>,
         #[source]
         source: std::io::Error,
     },
 
+    /// A path goetia needs as a directory exists and is not one. No OS call failed.
+    #[error(
+        "{} already exists and is not a directory; goetia cannot use it as a daemon's cwd or as its log directory",
+        path.display()
+    )]
+    NotADirectory { path: PathBuf },
+
     /// A `.env` file beside the manifest could not be parsed. Distinct from
-    /// `Io`, which means the file could not be read at all.
+    /// [`Os`](Error::Os), which means the file could not be read at all.
     #[error("{path}:{line}: {message}", path = path.display())]
     EnvFile {
         path: PathBuf,
@@ -154,7 +291,7 @@ pub enum Error {
     /// only that the service is not stopped. Either way the stop was never
     /// confirmed: it may still be in flight, may have completed, or may have
     /// had nothing to do, so what is unestablished is where the daemon ended
-    /// up. Not [`Other`](Error::Other), exit `1`: a refusal, even a
+    /// up. Not a plain failure, exit `1`: a refusal, even a
     /// determinate one, answers whether the start went out, not that
     /// question. (A plain `start --timeout 0` of the same service is exit
     /// `1`: with no stop before it, the refusal is the whole answer.) Not
@@ -201,8 +338,12 @@ pub enum Error {
     /// when it failed, and says what is on disk.
     ///
     /// Exit `4` (indeterminate).
-    #[error("{}", loaded_in_doubt(id, None, restore_failed.as_deref()))]
-    LoadedJobInDoubt { id: String, restore_failed: Option<String> },
+    #[error("{}", loaded_in_doubt(id, None, restore_failed.is_some()))]
+    LoadedJobInDoubt {
+        id: String,
+        #[source]
+        restore_failed: Option<Box<Error>>,
+    },
 
     /// `install` wrote the plist of a daemon and could not read whether launchd has its job loaded
     /// afterwards, so which definition a job loaded meanwhile read is not established either.
@@ -210,11 +351,12 @@ pub enum Error {
     /// [`LoadedJobInDoubt`](Error::LoadedJobInDoubt). launchd only.
     ///
     /// Exit `4` (indeterminate).
-    #[error("{}", loaded_in_doubt(id, Some(detail), restore_failed.as_deref()))]
+    #[error("{}", loaded_in_doubt(id, Some(detail), restore_failed.is_some()))]
     LoadedStateInDoubt {
         id: String,
         detail: String,
-        restore_failed: Option<String>,
+        #[source]
+        restore_failed: Option<Box<Error>>,
     },
 
     /// `install` booted out a job that answered to the label, then found `found` at `path`, where it
@@ -259,15 +401,6 @@ pub enum Error {
     #[error("no backend for {platform} yet")]
     UnsupportedPlatform { platform: String },
 
-    /// An external tool a backend shells out to (`launchctl`, `plutil`,
-    /// `systemctl`, `sc.exe`, ...) either could not be spawned at all or
-    /// exited non-zero. `stderr` carries whatever diagnostic text it
-    /// produced (or the spawn error itself, for the "could not run it at
-    /// all" case) — one variant for both, since neither backend nor caller
-    /// needs to tell them apart.
-    #[error("`{command}` failed: {stderr}")]
-    CommandFailed { command: String, stderr: String },
-
     /// Resolving a [`crate::spec::User`] to a real platform account failed:
     /// no such user/uid, or the lookup itself errored.
     #[error("account lookup failed: {detail}")]
@@ -280,14 +413,6 @@ pub enum Error {
     /// expected outcome.
     #[error("{path} already exists (this should never happen)", path = path.display())]
     AlreadyExists { path: PathBuf },
-
-    /// A lower-level failure, annotated with context a call site adds
-    /// rather than a dedicated variant of its own — e.g. `daemon restart`
-    /// disclosing that a daemon is now stopped, not merely that starting it
-    /// back up failed. Not a catch-all for new call sites to reach for by
-    /// default: prefer a real variant when the failure recurs anywhere else.
-    #[error("{0}")]
-    Other(String),
 }
 
 impl Error {
@@ -305,7 +430,23 @@ impl Error {
             | Error::LoadedJobInDoubt { .. }
             | Error::LoadedStateInDoubt { .. }
             | Error::StaleJobBootedOut { .. } => true,
-            Error::Io { .. }
+            Error::Step { source, .. } => source.is_indeterminate(),
+            Error::Both { first, then } => first.is_indeterminate() && then.is_indeterminate(),
+            Error::Os { .. }
+            | Error::Command { .. }
+            | Error::Spawn { .. }
+            | Error::ConcurrentChange { .. }
+            | Error::QuarantineStranded { .. }
+            | Error::AmbiguousInstall { .. }
+            | Error::NotStarted { .. }
+            | Error::LoadedJob { .. }
+            | Error::PasswordRequired { .. }
+            | Error::UnsupportedManager { .. }
+            | Error::NotEnqueued { .. }
+            | Error::IncompleteAnswer { .. }
+            | Error::UnitNotLoaded { .. }
+            | Error::Reservation { .. }
+            | Error::NotADirectory { .. }
             | Error::EnvFile { .. }
             | Error::Interpolate { .. }
             | Error::Yaml(_)
@@ -317,12 +458,165 @@ impl Error {
             | Error::NoManager { .. }
             | Error::ElevationRequired { .. }
             | Error::UnsupportedPlatform { .. }
-            | Error::CommandFailed { .. }
             | Error::AccountLookup { .. }
-            | Error::AlreadyExists { .. }
-            | Error::Other(_) => false,
+            | Error::AlreadyExists { .. } => false,
         }
     }
+
+    /// The error a [`Step`](Error::Step) chain ends in, which classification reads: a step over
+    /// [`NotInstalled`](Error::NotInstalled) is still "not installed". Not unwrapped through
+    /// [`Both`](Error::Both), which has two causes.
+    pub fn cause(&self) -> &Error {
+        match self {
+            Error::Step { source, .. } => source.cause(),
+            e => e,
+        }
+    }
+
+    /// The error and its causes, joined as `context: cause: cause`; a [`Both`](Error::Both) prints
+    /// as `first; then: then`. What the CLI prints and `--json` carries: [`Display`](fmt::Display)
+    /// alone is the outermost context.
+    pub fn report(&self) -> impl fmt::Display + '_ {
+        Report(self)
+    }
+
+    /// An OS call failed with no path to name.
+    pub(crate) fn os(what: impl Into<String>, source: impl Into<BoxError>) -> Self {
+        Error::Os {
+            what: what.into(),
+            path: None,
+            source: source.into(),
+        }
+    }
+
+    /// `command` exited unsuccessfully with `status`, having written `stderr`.
+    pub(crate) fn command(command: impl Into<String>, status: std::process::ExitStatus, stderr: &[u8]) -> Self {
+        Error::Command {
+            command: command.into(),
+            status,
+            stderr: String::from_utf8_lossy(stderr).trim().to_string(),
+        }
+    }
+
+    /// `command` could not be run, or its run was lost.
+    pub(crate) fn spawn(command: impl Into<String>, source: impl Into<BoxError>) -> Self {
+        Error::Spawn {
+            command: command.into(),
+            source: source.into(),
+        }
+    }
+
+    /// An OS call failed on `path`.
+    pub(crate) fn os_at(what: impl Into<String>, path: impl Into<PathBuf>, source: impl Into<BoxError>) -> Self {
+        Error::Os {
+            what: what.into(),
+            path: Some(path.into()),
+            source: source.into(),
+        }
+    }
+}
+
+/// [`Error::report`]'s value.
+struct Report<'a>(&'a Error);
+
+impl fmt::Display for Report<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_chain(self.0, f)
+    }
+}
+
+fn write_chain(e: &(dyn std::error::Error + 'static), f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    if let Some(Error::Both { first, then }) = e.downcast_ref::<Error>() {
+        write_chain(first.as_ref(), f)?;
+        f.write_str("; then: ")?;
+        return write_chain(then.as_ref(), f);
+    }
+    write!(f, "{e}")?;
+    if let Some(source) = e.source() {
+        f.write_str(": ")?;
+        write_chain(source, f)?;
+    }
+    Ok(())
+}
+
+/// What a version source reported, kept as the source gave it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionReading {
+    /// The major version it reported.
+    Major(u32),
+    /// The text it reported, which has no version goetia can read.
+    Unreadable(String),
+}
+
+/// [`Error::UnsupportedManager`]'s message: one sentence for each of the manager and its client
+/// that is below the floor or unreadable.
+fn unsupported_manager(client: &VersionReading, manager: &VersionReading) -> String {
+    use crate::backend::systemd::{SYSTEMD_FLOOR, TYPE_EXEC};
+    const ANSWER: &str = "cannot answer the `systemctl --show-transaction` every start and stop runs";
+    const TYPE_SIMPLE: &str = "runs goetia's `Type=exec` units as `Type=simple`, which cannot report a failed exec";
+    let manager = match manager {
+        VersionReading::Major(n) if *n >= SYSTEMD_FLOOR => None,
+        VersionReading::Major(n) if *n >= TYPE_EXEC => Some(format!("The running systemd is {n}, which {ANSWER}.")),
+        VersionReading::Major(n) => Some(format!(
+            "The running systemd is {n}, which {ANSWER}, and {TYPE_SIMPLE}."
+        )),
+        VersionReading::Unreadable(text) => Some(format!(
+            "goetia cannot read the version the running systemd reports ({text:?}), so cannot tell whether it is."
+        )),
+    };
+    let client = match client {
+        VersionReading::Major(n) if *n >= SYSTEMD_FLOOR => None,
+        VersionReading::Major(n) => Some(format!(
+            "The `systemctl` client is {n}, which does not accept the `--show-transaction` option every start and \
+             stop passes it."
+        )),
+        VersionReading::Unreadable(text) => Some(format!(
+            "goetia cannot read the version `systemctl --version` reports ({text:?}), so cannot tell whether it is."
+        )),
+    };
+    let sentences: Vec<String> = [manager, client].into_iter().flatten().collect();
+    format!(
+        "goetia requires systemd {SYSTEMD_FLOOR} or newer. {}",
+        sentences.join(" ")
+    )
+}
+
+/// ` /path`, or nothing.
+fn path_suffix(path: &Option<PathBuf>) -> String {
+    path.as_deref()
+        .map(Path::display)
+        .map(|p| format!(" {p}"))
+        .unwrap_or_default()
+}
+
+/// ` at /path`, or nothing.
+fn read_at(path: &Option<PathBuf>) -> String {
+    path.as_deref()
+        .map(Path::display)
+        .map(|p| format!(" at {p}"))
+        .unwrap_or_default()
+}
+
+/// `: stderr`, or nothing when the tool said nothing.
+fn stderr_suffix(stderr: &str) -> String {
+    if stderr.is_empty() {
+        String::new()
+    } else {
+        format!(": {stderr}")
+    }
+}
+
+/// The reason a request announced no job: the client's diagnostic, or that it gave none.
+fn why(diagnostic: &Option<String>) -> String {
+    match diagnostic {
+        Some(diagnostic) => format!(": {diagnostic}"),
+        None => " and said nothing about why".to_string(),
+    }
+}
+
+/// `` `id`: ``, or nothing.
+fn id_prefix(id: &Option<String>) -> String {
+    id.as_deref().map(|id| format!("`{id}`: ")).unwrap_or_default()
 }
 
 /// [`Error::RequestInDoubt`]'s message: what goetia knows of how far the
@@ -342,21 +636,22 @@ fn in_doubt(request: &str, reached: bool, detail: &str) -> String {
 }
 
 /// The message of both in-doubt variants. `read_failed` is the failed read (second variant only);
-/// `restore_failed` is the failed put-back of the plist.
-fn loaded_in_doubt(id: &str, read_failed: Option<&str>, restore_failed: Option<&str>) -> String {
+/// `restore_failed` is whether the put-back of the plist failed, whose error is the variant's source.
+fn loaded_in_doubt(id: &str, read_failed: Option<&str>, restore_failed: bool) -> String {
     let cause = match read_failed {
         None => format!("`{id}` was loaded in launchd while its plist was written"),
         Some(detail) => {
             format!("`{id}`'s plist was written, but whether launchd has its job loaded could not be read ({detail})")
         }
     };
-    let remedy = match restore_failed {
-        None => format!(
+    let remedy = if restore_failed {
+        format!(
+            "Check what is on disk, then run `goetia daemon stop {id}`, re-run install, then `goetia daemon start {id}`. The plist could not be put back as it was before this install"
+        )
+    } else {
+        format!(
             "The plist is back as it was before this install, so the change is not installed: run `goetia daemon stop {id}`, re-run install, then `goetia daemon start {id}`"
-        ),
-        Some(detail) => format!(
-            "The plist could not be put back as it was before this install ({detail}): check what is on disk, then run `goetia daemon stop {id}`, re-run install, then `goetia daemon start {id}`"
-        ),
+        )
     };
     format!("{cause}, so goetia cannot tell whether a loaded job holds the old definition or the new one. {remedy}")
 }

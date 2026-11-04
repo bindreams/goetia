@@ -278,7 +278,10 @@ fn a_named_entry_offers_the_same_remedy_status_renders() {
 /// what it pins is that the fallback stays honest rather than defaulting to the elevation advice.
 #[skuld::test]
 fn a_cause_that_carries_no_remedy_is_given_none() {
-    let parts = unreadable_parts("MsSecFlt".to_string(), Error::Other("the hive is corrupt".to_string()));
+    let parts = unreadable_parts(
+        "MsSecFlt".to_string(),
+        Error::os("read the hive", std::io::Error::other("the hive is corrupt")),
+    );
     assert_eq!(parts.recovery, None, "no remedy was established, so none is offered");
 
     let Some(Installed::Undetermined { reason, .. }) = unreadable_aggregate(vec![parts]) else {
@@ -347,7 +350,10 @@ fn a_failed_parameters_read_keeps_its_rendered_cause() {
         "the remedy the errno earned travels with the cause"
     );
 
-    let other = unreadable_parts("MsSecFlt".to_string(), Error::Other("the hive is corrupt".to_string()));
+    let other = unreadable_parts(
+        "MsSecFlt".to_string(),
+        Error::os("read the hive", std::io::Error::other("the hive is corrupt")),
+    );
     assert!(other.detail.contains("the hive is corrupt"));
 }
 
@@ -488,12 +494,14 @@ fn start_reads_a_simple_service_by_the_shims_vocabulary_and_anything_else_strict
 #[skuld::test]
 fn a_failed_start_names_the_blob_read_error_that_made_it_strict() {
     let id = Id::try_from("frpc").unwrap();
-    let e = std::io::Error::other("service stopped before reaching Running");
+    let e = || std::io::Error::other("service stopped before reaching Running");
 
-    let plain = failed_start(&id, &e, None).to_string();
+    let plain = failed_start(&id, e(), None).report().to_string();
     assert!(!plain.contains("blob"), "{plain}");
 
-    let strict = failed_start(&id, &e, Some("invalid blob JSON: EOF")).to_string();
+    let strict = failed_start(&id, e(), Some("invalid blob JSON: EOF"))
+        .report()
+        .to_string();
     assert!(strict.contains("service stopped before reaching Running"), "{strict}");
     assert!(strict.contains("could not be read"), "{strict}");
     assert!(strict.contains("invalid blob JSON: EOF"), "{strict}");
@@ -545,7 +553,12 @@ fn install_and_preview_install_refuse_restart_always() {
 // uninstall's failures ================================================================================================
 
 fn uninstall_failure(state: &UninstallFailure) -> String {
-    uninstall_failed_message(&Id::try_from("frpc").unwrap(), "does not accept STOP", state)
+    Error::Step {
+        what: uninstall_failed_message(&Id::try_from("frpc").unwrap(), state),
+        source: Box::new(Error::os("stop `frpc`", std::io::Error::other("does not accept STOP"))),
+    }
+    .report()
+    .to_string()
 }
 
 #[skuld::test]
