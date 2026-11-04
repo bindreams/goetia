@@ -9,6 +9,7 @@
 
 pub mod cmd;
 pub mod connect_back;
+pub mod daemon_spec;
 pub mod kill;
 pub mod sentinel;
 #[cfg(windows)]
@@ -24,6 +25,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use rand::RngExt as _;
 
 pub use connect_back::ConnectBack;
+pub use daemon_spec::spec;
 pub use service_guard::ServiceGuard;
 
 // Artifact locations --------------------------------------------------------------------------------------------------

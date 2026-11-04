@@ -1,9 +1,8 @@
 //! Shared `DaemonSpec` construction for the SCM integration tests.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use goetia::spec::{DaemonSpec, Id, Kind, Restart, User};
+use goetia::spec::DaemonSpec;
 use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 
@@ -99,48 +98,12 @@ impl Drop for WorldReadableExe {
     }
 }
 
-/// A `type: managed` `DaemonSpec`, every field spelled out. Built literally
-/// (never via `spec::resolve`) since these tests run only on Windows and
-/// construct `command`/paths for this host directly.
-#[allow(clippy::too_many_arguments)]
-pub fn mk_spec_full(
-    id: &str,
-    command: Vec<String>,
-    env: BTreeMap<String, String>,
-    user: User,
-    restart: Restart,
-    restart_delay: Option<std::time::Duration>,
-) -> DaemonSpec {
-    DaemonSpec {
-        id: Id::try_from(id).expect("random_test_id produces a valid Id"),
-        name: id.to_string(),
-        command,
-        cwd: None,
-        env,
-        user,
-        restart,
-        restart_delay,
-        logs: None,
-        kind: Kind::Managed,
-    }
-}
-
-/// A minimal, valid `type: managed` `DaemonSpec` running as `user`, with no
-/// SCM recovery actions (`restart: never`).
-pub fn mk_spec_as(id: &str, command: Vec<String>, env: BTreeMap<String, String>, user: User) -> DaemonSpec {
-    mk_spec_full(id, command, env, user, Restart::Never, None)
-}
-
-pub fn mk_spec(id: &str, command: Vec<String>, env: BTreeMap<String, String>) -> DaemonSpec {
-    mk_spec_as(id, command, env, User::Root)
-}
-
 /// The `mk` [`goetia::manager::conformance::run`] needs: a fresh, valid
 /// `type: managed` spec for any `id`. Ports are dummy — the fixture reports
 /// in on a best-effort basis regardless of whether anything listens (see
 /// `fixture.rs`'s `connect`), and no conformance scenario reads the report.
 pub fn conformance_mk(id: &str) -> DaemonSpec {
-    mk_spec(id, fixture_command(id, 1, 1, "plain"), BTreeMap::new())
+    support::spec(id, fixture_command(id, 1, 1, "plain"))
 }
 
 // Account SID lookup ==================================================================================================

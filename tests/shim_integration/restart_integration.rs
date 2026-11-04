@@ -6,7 +6,6 @@
 //! Not testable here: an incomplete stop (both kills refused). The refusal is a unit-test hook in
 //! the shim, so `service_tests.rs` covers it.
 
-use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -15,12 +14,10 @@ use goetia::backend::scm::exit_status::{ERROR_SERVICE_SPECIFIC_ERROR, RecordedEx
 use goetia::backend::scm::manager::Scm;
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, Installed, ServiceManager as _, Step};
-use goetia::spec::{DaemonSpec, Restart};
+use goetia::spec::{DaemonSpec, Kind, Restart};
 use windows_service::service::{ServiceExitCode, ServiceState};
 
-use crate::common::{
-    ShimProcess, fallback_log, fixture_command, kill_process, mk_spec_full, recorded_exit, scm_status,
-};
+use crate::common::{ShimProcess, fallback_log, fixture_command, kill_process, recorded_exit, scm_status};
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
 
 const ONE_SECOND: Option<Duration> = Some(Duration::from_secs(1));
@@ -30,15 +27,12 @@ const ONE_SECOND: Option<Duration> = Some(Duration::from_secs(1));
 const EARLIER_VERSION: &str = "0.0.0";
 
 fn on_failure(id: &str, command: Vec<String>, restart_delay: Option<Duration>) -> DaemonSpec {
-    mk_spec_full(
-        id,
-        command,
-        None,
-        BTreeMap::new(),
-        Restart::OnFailure,
+    DaemonSpec {
+        kind: Kind::Simple,
+        restart: Restart::OnFailure,
         restart_delay,
-        None,
-    )
+        ..support::spec(id, command)
+    }
 }
 
 // SCM restarts ========================================================================================================
@@ -214,18 +208,16 @@ fn exit_records(child_code: i32) -> (ServiceExitCode, RecordedExit) {
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
 
-    let spec = mk_spec_full(
-        &id,
-        fixture_command(
-            "exit-on-close",
-            &[&reported.port().to_string(), &child_code.to_string()],
-        ),
-        None,
-        BTreeMap::new(),
-        Restart::Never,
-        None,
-        None,
-    );
+    let spec = DaemonSpec {
+        kind: Kind::Simple,
+        ..support::spec(
+            &id,
+            fixture_command(
+                "exit-on-close",
+                &[&reported.port().to_string(), &child_code.to_string()],
+            ),
+        )
+    };
     mgr.install(&spec, false).expect("install");
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     let stream = reported.accept_stream("the fixture to connect and wait for the test to close its end");
@@ -284,15 +276,12 @@ fn a_daemon_that_cannot_be_spawned_fails_start_under_every_policy() {
     for (restart, restart_delay) in [(Restart::Never, None), (Restart::OnFailure, hour)] {
         let id = support::random_test_id();
         let _guard = ServiceGuard::new(&id);
-        let spec = mk_spec_full(
-            &id,
-            missing.clone(),
-            None,
-            BTreeMap::new(),
+        let spec = DaemonSpec {
+            kind: Kind::Simple,
             restart,
             restart_delay,
-            None,
-        );
+            ..support::spec(&id, missing.clone())
+        };
         mgr.install(&spec, false).expect("install");
 
         let err = mgr
@@ -324,15 +313,15 @@ fn start_confirms_the_launch_of_a_daemon_that_exits_at_once() {
         let id = support::random_test_id();
         let _guard = ServiceGuard::new(&id);
         let reported = ConnectBack::listen();
-        let spec = mk_spec_full(
-            &id,
-            fixture_command("exit", &[&reported.port().to_string(), &code.to_string()]),
-            None,
-            BTreeMap::new(),
+        let spec = DaemonSpec {
+            kind: Kind::Simple,
             restart,
-            hour,
-            None,
-        );
+            restart_delay: hour,
+            ..support::spec(
+                &id,
+                fixture_command("exit", &[&reported.port().to_string(), &code.to_string()]),
+            )
+        };
         mgr.install(&spec, false).expect("install");
 
         mgr.start(&spec.id, Budget::DEFAULT)
