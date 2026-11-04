@@ -17,8 +17,8 @@ use report::Report;
 /// What a variant's `#[source]` holds when the cause is another library's error.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// A source that can be cloned with the error that holds it: a snapshot keeps its blob's failure
-/// and hands out copies of it (see `manager::flow::owned_failure`).
+/// A source that can be cloned with the error that holds it, so the error that keeps it (a
+/// snapshot's blob failure, held as an `Arc<Error>`) can be handed out again.
 pub type SharedError = Arc<dyn std::error::Error + Send + Sync>;
 
 /// Every goetia error. A variant is named for the layer that raised it, and its `Display` is its
@@ -59,6 +59,12 @@ pub enum Error {
         #[source]
         source: Box<Error>,
     },
+
+    /// An error a snapshot kept (its blob's failure), handed out again as it was: its text, source,
+    /// remedy and indeterminacy are the kept error's. Neither [`cause`](Error::cause) nor
+    /// [`map_cause`](Error::map_cause) goes into it.
+    #[error(transparent)]
+    Kept(Arc<Error>),
 
     /// A step failed, and so did the one after it. `report()` prints both, `first` then `then`.
     #[error("a step failed, and so did the one after it")]
@@ -483,7 +489,7 @@ pub enum Error {
         Chain(&**blob)
     )]
     StartAsManaged {
-        blob: Box<Error>,
+        blob: Arc<Error>,
         #[source]
         source: Box<Error>,
     },
@@ -514,6 +520,7 @@ impl Error {
             | Error::StaleJobBootedOut { .. }
             | Error::StartUnconfirmed { .. } => true,
             Error::Step { source, .. } | Error::StartAsManaged { source, .. } => source.is_indeterminate(),
+            Error::Kept(kept) => kept.is_indeterminate(),
             Error::Both { first, then } => first.is_indeterminate() && then.is_indeterminate(),
             Error::Os { .. }
             | Error::Command { .. }
@@ -548,29 +555,47 @@ impl Error {
         }
     }
 
-    /// The error a [`Step`](Error::Step) chain ends in, which classification reads: a step over
-    /// [`NotInstalled`](Error::NotInstalled) is still "not installed". Not unwrapped through
-    /// [`Both`](Error::Both), which has two causes.
+    /// The error a chain of [`Step`](Error::Step)s and [`StartAsManaged`](Error::StartAsManaged)s
+    /// ends in, which classification reads: a step over [`NotInstalled`](Error::NotInstalled) is
+    /// still "not installed". [`Both`](Error::Both) has two causes, so it is itself the cause.
+    /// [`map_cause`](Error::map_cause) walks the same chain.
     pub fn cause(&self) -> &Error {
         match self {
-            Error::Step { source, .. } => source.cause(),
+            Error::Step { source, .. } | Error::StartAsManaged { source, .. } => source.cause(),
             e => e,
         }
     }
 
-    /// The failed read and its recovery, when this [`Step`](Error::Step) chain ends in an
-    /// [`Undetermined`](Error::Undetermined); any other error comes back as it is, steps and all.
-    /// Only the launchd and SCM `list` scans take an `Undetermined` apart.
+    /// This error with `f` applied to its [`cause`](Error::cause), the wrappers kept around the
+    /// result: the operation that failed on the cause stays in the report.
+    pub fn map_cause(self, f: impl FnOnce(Error) -> Error) -> Error {
+        match self {
+            Error::Step { what, source } => Error::Step {
+                what,
+                source: Box::new(source.map_cause(f)),
+            },
+            Error::StartAsManaged { blob, source } => Error::StartAsManaged {
+                blob,
+                source: Box::new(source.map_cause(f)),
+            },
+            cause => f(cause),
+        }
+    }
+
+    /// The failed read and its recovery, when this error's [`cause`](Error::cause) is an
+    /// [`Undetermined`](Error::Undetermined); any other error comes back as it is. The wrappers
+    /// stay around the read. Only the launchd and SCM `list` scans take an `Undetermined` apart.
     #[cfg(any(target_os = "macos", windows, test))]
     pub(crate) fn into_undetermined(self) -> std::result::Result<(Box<Error>, String), Error> {
-        match self {
-            Error::Undetermined { reason, recovery, .. } => Ok((reason, recovery)),
-            Error::Step { what, source } => (*source).into_undetermined().map_err(|source| Error::Step {
-                what,
-                source: Box::new(source),
-            }),
-            e => Err(e),
-        }
+        let Error::Undetermined { recovery, .. } = self.cause() else {
+            return Err(self);
+        };
+        let recovery = recovery.clone();
+        let read = self.map_cause(|cause| match cause {
+            Error::Undetermined { reason, .. } => *reason,
+            other => other,
+        });
+        Ok((Box::new(read), recovery))
     }
 
     /// What would clear this failure, when it is written to follow the failure's cause: a remedy
@@ -581,7 +606,61 @@ impl Error {
     pub fn remedy(&self) -> Option<&str> {
         match self {
             Error::Undetermined { recovery, .. } => Some(recovery),
+            Error::Kept(kept) => kept.remedy(),
             _ => None,
+        }
+    }
+
+    /// The error this one writes into its own `Display`, which is not its
+    /// [`source`](std::error::Error::source). [`report`](Error::report) collects the remedies of
+    /// what it names, so a variant that writes an error with [`Chain`] must name it here.
+    ///
+    /// Exhaustive on purpose, like [`is_indeterminate`](Error::is_indeterminate): a new variant must
+    /// be classified here before it compiles.
+    pub(crate) fn embedded(&self) -> Option<&Error> {
+        match self {
+            Error::LoadedStateInDoubt { read_failed, .. } => Some(read_failed),
+            Error::StartAsManaged { blob, .. } => Some(blob),
+            Error::Kept(kept) => kept.embedded(),
+            Error::Os { .. }
+            | Error::Command { .. }
+            | Error::Spawn { .. }
+            | Error::Step { .. }
+            | Error::Both { .. }
+            | Error::ConcurrentChange { .. }
+            | Error::QuarantineStranded { .. }
+            | Error::AmbiguousInstall { .. }
+            | Error::NotStarted { .. }
+            | Error::StartUnconfirmed { .. }
+            | Error::LoadedJob { .. }
+            | Error::PutBackBlocked { .. }
+            | Error::InvalidPassword { .. }
+            | Error::PasswordRequired { .. }
+            | Error::UnsupportedManager { .. }
+            | Error::NotEnqueued { .. }
+            | Error::IncompleteAnswer { .. }
+            | Error::UnitNotLoaded { .. }
+            | Error::Reservation { .. }
+            | Error::NotADirectory { .. }
+            | Error::EnvFile { .. }
+            | Error::Interpolate { .. }
+            | Error::Yaml(_)
+            | Error::Invalid { .. }
+            | Error::Blob { .. }
+            | Error::NotInstalled { .. }
+            | Error::Foreign { .. }
+            | Error::Undetermined { .. }
+            | Error::WaitTimeout { .. }
+            | Error::NotRunning { .. }
+            | Error::Unestablished { .. }
+            | Error::RequestInDoubt { .. }
+            | Error::LoadedJobInDoubt { .. }
+            | Error::StaleJobBootedOut { .. }
+            | Error::NoManager { .. }
+            | Error::ElevationRequired { .. }
+            | Error::UnsupportedPlatform { .. }
+            | Error::AccountLookup { .. }
+            | Error::AlreadyExists { .. } => None,
         }
     }
 

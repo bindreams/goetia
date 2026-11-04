@@ -349,3 +349,29 @@ fn a_step_over_a_leg_in_doubt_is_reworded_under_the_step() {
         );
     }
 }
+
+/// A start judged as a managed service's is its failed start for the wording too: the request in
+/// doubt under it is reworded, and the unreadable blob stays in the report.
+#[skuld::test]
+fn a_start_judged_as_managed_over_a_leg_in_doubt_is_reworded_under_it() {
+    let id = Id::try_from("frpc").unwrap();
+    let judged = || Error::StartAsManaged {
+        blob: std::sync::Arc::new(Error::blob("corrupt")),
+        source: Box::new(in_doubt()),
+    };
+
+    for budget in [Budget::Immediate, Budget::Unbounded, Budget::DEFAULT] {
+        let started = after_start_failed(&id, budget, judged());
+        assert!(
+            matches!(started, Error::StartAsManaged { .. }),
+            "{budget:?}: {started:?}"
+        );
+        assert!(
+            matches!(started.cause(), Error::RequestInDoubt { .. }),
+            "{budget:?}: {started:?}"
+        );
+        let text = started.report().to_string();
+        assert!(text.contains("this start was attempted after it"), "{budget:?}: {text}");
+        assert!(text.contains("(blob: corrupt)"), "{budget:?}: {text}");
+    }
+}

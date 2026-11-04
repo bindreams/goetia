@@ -29,8 +29,8 @@ impl Reason {
         Reason::Said(text.into())
     }
 
-    pub fn failed(error: Error) -> Self {
-        Reason::Failed(Arc::new(error))
+    pub fn failed(error: impl Into<Arc<Error>>) -> Self {
+        Reason::Failed(error.into())
     }
 
     /// `what`, then the error under it: `what: error`.
@@ -41,10 +41,10 @@ impl Reason {
         })
     }
 
-    pub fn around(before: impl Into<String>, error: Error, after: impl Into<String>) -> Self {
+    pub fn around(before: impl Into<String>, error: impl Into<Arc<Error>>, after: impl Into<String>) -> Self {
         Reason::Around {
             before: before.into(),
-            error: Arc::new(error),
+            error: error.into(),
             after: after.into(),
         }
     }

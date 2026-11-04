@@ -18,6 +18,10 @@ impl fmt::Display for Report<'_> {
 /// An error and its causes, without the remedies [`Report`] prints after them: how an error that
 /// sits inside another's sentence is written. The outer [`write_chain`] collects the remedies of
 /// what it embeds, so they still print once, last.
+///
+/// Only an [`Error`] embeds through [`Error::embedded`]. The other users, `Occupant::Unreadable` and
+/// the SCM kill's `ReadAfterRefusedOpen`, hold `io::Error`s, which carry no remedy: a remedy lives
+/// on [`Error::Undetermined`], and no goetia error is wrapped in an `io::Error`.
 pub(crate) struct Chain<'a>(pub(crate) &'a (dyn std::error::Error + 'static));
 
 impl fmt::Display for Chain<'_> {
@@ -49,7 +53,7 @@ pub(super) fn write_chain<'a>(
         }
     }
     write!(out, "{e}")?;
-    if let Some(inner) = ours.and_then(embedded) {
+    if let Some(inner) = ours.and_then(Error::embedded) {
         write_chain(inner, &mut Discard, remedies)?;
     }
     if let Some(source) = e.source() {
@@ -67,17 +71,6 @@ pub(super) fn write_remedies(out: &mut dyn fmt::Write, remedies: &[&str]) -> fmt
     Ok(())
 }
 
-/// The error `e` writes into its own `Display`, which is not its [`source`](std::error::Error::source).
-/// A variant that embeds an error must write it with [`Chain`] and be listed here.
-fn embedded(e: &Error) -> Option<&Error> {
-    match e {
-        Error::LoadedStateInDoubt { read_failed, .. } => Some(read_failed),
-        Error::StartAsManaged { blob, .. } => Some(blob),
-        _ => None,
-    }
-}
-
-/// A writer that keeps nothing.
 struct Discard;
 
 impl fmt::Write for Discard {

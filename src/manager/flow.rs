@@ -6,6 +6,7 @@
 //! row of the install policy.
 
 use std::io;
+use std::sync::Arc;
 
 use crate::backend::{Backend, InstalledService, ReadOutcome, ScanEntry, WriteOutcome};
 use crate::decide::{self, ExternalConfig, Outcome, Ownership};
@@ -48,7 +49,7 @@ fn judge<B: Backend>(b: &B, snapshot: &B::Snapshot) -> (Ownership, ExternalConfi
 
     let blob = match snapshot.blob() {
         Ok(blob) => blob,
-        Err(e) => return unusable(Reason::failed(owned_failure(e)), uninstall_advice()),
+        Err(e) => return unusable(Reason::failed(Arc::clone(e)), uninstall_advice()),
     };
     // A manager that matches ids case-insensitively finds `frpc`'s service for `FRPC`. Nothing else
     // is read: writing would replace that daemon's service.
@@ -159,37 +160,12 @@ pub(crate) fn preview<B: Backend>(b: &B, spec: &DaemonSpec) -> Result<Outcome> {
 
 pub(crate) fn status<B: Backend>(b: &B, id: &Id) -> Result<Status> {
     let snapshot = owned(b, id)?;
-    let blob = snapshot.blob().map_err(owned_failure)?;
+    let blob = snapshot.blob().map_err(|e| Error::Kept(Arc::clone(e)))?;
     b.render(&blob.spec).map_err(|e| Error::Step {
         what: format!("`{id}`'s embedded spec cannot be regenerated"),
         source: Box::new(e),
     })?;
     b.live_status(&snapshot)
-}
-
-/// A failure a snapshot or a scan kept (its blob's, or why its name is no id), as an owned error.
-/// Only [`Error::Blob`] and [`Error::Invalid`] are ever kept, and each is cloned whole, shared
-/// source included.
-pub(crate) fn owned_failure(e: &Error) -> Error {
-    match e {
-        Error::Blob { message, source } => Error::Blob {
-            message: message.clone(),
-            source: source.clone(),
-        },
-        Error::Invalid {
-            daemon,
-            message,
-            source,
-        } => Error::Invalid {
-            daemon: daemon.clone(),
-            message: message.clone(),
-            source: source.clone(),
-        },
-        other => {
-            debug_assert!(false, "a snapshot and a scan keep only Blob and Invalid, got {other:?}");
-            Error::blob(other.report().to_string())
-        }
-    }
 }
 
 pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
@@ -203,22 +179,22 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
             ScanEntry::Read(ReadOutcome::Marked(snapshot)) => (snapshot.blob(), Ok(snapshot)),
             ScanEntry::Misnamed { blob, name } => (blob.as_ref(), Err(name)),
         };
-        let unusable = |why: &str, cause: Error| Installed::OursUnusable {
+        let unusable = |reason| Installed::OursUnusable {
             name: name.clone(),
-            reason: Reason::because(why, cause),
+            reason,
         };
         let blob = match blob {
             Ok(blob) => blob,
             Err(e) => {
-                out.push(Installed::OursUnusable {
-                    name: name.clone(),
-                    reason: Reason::failed(owned_failure(e)),
-                });
+                out.push(unusable(Reason::failed(Arc::clone(e))));
                 continue;
             }
         };
         if let Err(e) = b.render(&blob.spec) {
-            out.push(unusable("marked ours, but its embedded spec cannot be regenerated", e));
+            out.push(unusable(Reason::because(
+                "marked ours, but its embedded spec cannot be regenerated",
+                e,
+            )));
             continue;
         }
         // One entry's failure must not take down the listing of every other daemon, except that
@@ -226,10 +202,11 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
         let snapshot = match snapshot {
             Ok(snapshot) => snapshot,
             Err(e) => {
-                out.push(unusable(
-                    "marked ours, but its name is not a valid daemon id",
-                    owned_failure(e),
-                ));
+                out.push(unusable(Reason::around(
+                    "marked ours, but its name is not a valid daemon id: ",
+                    Arc::clone(e),
+                    "",
+                )));
                 continue;
             }
         };
@@ -244,7 +221,10 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
                 Error::NoManager { .. } => return Err(e),
                 // The query completed and found the service gone: absence is established.
                 Error::NotInstalled { .. } => {}
-                _ => out.push(unusable("marked ours, but its live state could not be queried", e)),
+                _ => out.push(unusable(Reason::because(
+                    "marked ours, but its live state could not be queried",
+                    e,
+                ))),
             },
         }
     }

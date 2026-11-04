@@ -19,3 +19,7 @@ pub(crate) fn within(context: impl Into<String>, source: io::Error) -> io::Error
         },
     )
 }
+
+#[cfg(test)]
+#[path = "within_tests.rs"]
+mod within_tests;

@@ -63,13 +63,14 @@ use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::{fs, io};
 
 use crate::backend::bounded::{self, Finished, Reaper, Role};
 use crate::backend::client::{Client, ClientError, Real, Wait};
 use crate::backend::launchd::{generate, refuse, state};
 use crate::backend::{
-    self, Identity, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
+    self, Decoded, Identity, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
 };
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
@@ -410,13 +411,13 @@ fn read_artifact(path: &Path, id: &str) -> Result<String> {
 /// A marked plist, as `read` saw it: where it is, and its text.
 pub(crate) struct Plist {
     id: Id,
-    blob: Result<Blob>,
+    blob: Decoded,
     location: Location,
     text: String,
 }
 
 impl Plist {
-    fn new(id: Id, blob: Result<Blob>, (location, text): (Location, String)) -> Self {
+    fn new(id: Id, blob: Decoded, (location, text): (Location, String)) -> Self {
         Self {
             id,
             blob,
@@ -431,7 +432,7 @@ impl InstalledService for Plist {
         &self.id
     }
 
-    fn blob(&self) -> std::result::Result<&Blob, &Error> {
+    fn blob(&self) -> std::result::Result<&Blob, &Arc<Error>> {
         self.blob.as_ref()
     }
 }
@@ -444,6 +445,7 @@ fn read_at(id: &str, location: Location) -> Result<ReadOutcome<Unnamed<(Location
     let Some(blob) = generate::extract(&text).transpose() else {
         return Ok(ReadOutcome::Foreign { recovery: None });
     };
+    let blob = blob.map_err(Arc::new);
     Ok(ReadOutcome::Marked(Unnamed {
         blob,
         body: (location, text),
@@ -700,8 +702,9 @@ fn undo_write(target: &Path, wrote: &str, previous: Option<&str>) -> Result<()> 
         path: target.to_path_buf(),
         found,
     };
-    // `install` writes a regular file, so anything else at the path (a symlink, dangling or not, a
-    // directory) is someone else's.
+    // `install` writes a regular file, so anything else found here (a symlink, dangling or not, a
+    // directory) is someone else's. This reports what the check found; the read below looks the
+    // path up again.
     match fs::symlink_metadata(target) {
         Ok(meta) if !meta.file_type().is_file() => return Err(blocked(PutBackFound::Replaced)),
         Ok(_) => {}
@@ -1134,9 +1137,8 @@ impl Launchd {
     ///
     /// The check before the write and the write are not atomic, and launchd relaunches a loaded job from
     /// the definition it was loaded with, not the plist on disk. A job loaded in between may hold either,
-    /// and goetia takes no lock, so it reports doubt rather than success. A failed read leaves the same
-    /// question open. Put the plist back as it was first: with the new one on disk a rerun reads
-    /// `UpToDate` and never reaches the loaded job.
+    /// and goetia takes no lock, so it reports doubt rather than success. Put the plist back as it was
+    /// first: with the new one on disk a rerun reads `UpToDate` and never reaches the loaded job.
     fn recheck_after_write(
         &self,
         id: &Id,
@@ -1363,7 +1365,7 @@ impl backend::Backend for Launchd {
             corrective_kickstart,
         ] = reapers::<START_REQUESTS>(id)?;
         let _files = files(id, START_CALLS)?;
-        let blob = blob?;
+        let blob = blob.map_err(Error::Kept)?;
         let timed_out = || budget::timed_out(id.as_str(), "running", budget);
         // What issuing the request takes: which of `bootstrap`/`kickstart` it
         // needs, and the `bootstrap` itself. None of it is bounded — the
@@ -1583,21 +1585,28 @@ fn scan_in(dirs: [(&str, bool); 2]) -> Scan<Plist> {
                 // than a blind spot: reporting it would let a benign concurrent uninstall raise
                 // `list`'s host-wide exit code.
                 Err(e) if matches!(e.cause(), Error::NotInstalled { .. }) => {}
-                // A failed read leaves zero evidence of whether this plist ever carried a
-                // Goetia marker at all. `Installed::Undetermined` claims neither ownership nor
-                // absence, which is exactly what was established. The entry says it by name, so
-                // the read is its reason and the recovery (written for `status`) is left out.
+                // Undetermined, not absence or ownership: the failed read established neither. The
+                // read is its reason; the `status` recovery is left out.
                 Err(e) => {
                     let failed = match e.into_undetermined() {
                         Ok((read, _recovery)) => *read,
                         Err(e) => e,
                     };
-                    unestablished.get_or_insert(Reason::failed(failed));
+                    unestablished = Some(match unestablished {
+                        None => failed,
+                        Some(first) => Error::Both {
+                            first: Box::new(first),
+                            then: Box::new(failed),
+                        },
+                    });
                 }
             }
         }
-        if let Some(reason) = unestablished {
-            reported.push(Installed::Undetermined { name: Some(id), reason });
+        if let Some(failed) = unestablished {
+            reported.push(Installed::Undetermined {
+                name: Some(id),
+                reason: Reason::failed(failed),
+            });
             continue;
         }
         match <[_; 1]>::try_from(found) {

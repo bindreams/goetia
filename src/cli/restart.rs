@@ -177,7 +177,7 @@ fn stop_leg(requested: Budget, left: Budget) -> Budget {
 /// [`as_given`]). Every other failure passes through untouched: a stop that
 /// determinately failed changed nothing and is still exit `1`.
 fn abandoned_before_start(id: &Id, e: Error, budget: Budget) -> Error {
-    through_steps(e, |leaf| match leaf {
+    e.map_cause(|leaf| match leaf {
         Error::WaitTimeout {
             id, awaited, waited, ..
         } => Error::WaitTimeout {
@@ -228,7 +228,6 @@ fn spent_before_start(id: &Id, budget: Budget) -> Error {
 
 /// The start leg's failure, re-wrapped to say what the stop leg established.
 ///
-/// Re-wrapped variant by variant rather than flattened to an [`Error::Step`]:
 /// `run_id_verb` reads the variant, and an `Undetermined` or `WaitTimeout`
 /// start leg erased here would exit `1` in the states where the distinction
 /// matters most — stopped and not back up, or stopped and still on its way.
@@ -245,7 +244,7 @@ fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
         // The start may have reached the manager: kept as it is, ahead of the
         // non-waiting arm below, whose "refused" it was not, and never called a
         // failure to restart, which is what it did not establish.
-        Error::Undetermined { .. } | Error::RequestInDoubt { .. } => through_steps(e, reworded),
+        Error::Undetermined { .. } | Error::RequestInDoubt { .. } => e.map_cause(reworded),
         // The stop was issued and not waited for, and the start that
         // followed was refused — determinately (a launchd `bootstrap` that
         // fails outright) or not (SCM's `ERROR_SERVICE_ALREADY_RUNNING` over a
@@ -257,7 +256,7 @@ fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
             id: id.as_str().to_string(),
             refused: Box::new(e),
         },
-        Error::WaitTimeout { .. } => through_steps(e, reworded),
+        Error::WaitTimeout { .. } => e.map_cause(reworded),
         _ => Error::Step {
             what: "stopped but failed to restart".to_string(),
             source: Box::new(e),
@@ -265,8 +264,8 @@ fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
     }
 }
 
-/// The error a start leg's failure ends in, re-worded to say what the stop leg established; any
-/// other error is returned as it is.
+/// The cause of a start leg's failure, re-worded to say what the stop leg established. Called only
+/// for the three it re-words.
 fn rewrapped_start_leg(id: &Id, budget: Budget, leaf: Error) -> Error {
     match leaf {
         Error::Undetermined { id, reason, recovery } => Error::Undetermined {
@@ -289,20 +288,13 @@ fn rewrapped_start_leg(id: &Id, budget: Budget, leaf: Error) -> Error {
             id,
             awaited,
         },
-        other => other,
-    }
-}
-
-/// `e` with `f` applied to the error its [`Error::Step`] chain ends in, the steps kept around it:
-/// the variant a failure is classified by (see [`Error::cause`]) is the one re-worded, and the
-/// operation that failed on it stays in the report.
-fn through_steps(e: Error, f: impl FnOnce(Error) -> Error) -> Error {
-    match e {
-        Error::Step { what, source } => Error::Step {
-            what,
-            source: Box::new(through_steps(*source, f)),
-        },
-        leaf => f(leaf),
+        other => {
+            debug_assert!(
+                false,
+                "only the causes `after_start_failed` re-words reach here, got {other:?}"
+            );
+            other
+        }
     }
 }
 

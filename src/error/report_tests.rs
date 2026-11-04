@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::*;
 use crate::error::error_tests::{id, os, undetermined};
 
@@ -12,7 +14,7 @@ fn an_embedded_errors_remedy_prints_last_not_inside_the_sentence() {
             restore_failed: Some(Box::new(os("write", "/q", "disk full"))),
         },
         Error::StartAsManaged {
-            blob: Box::new(undetermined("re-run as root")),
+            blob: Arc::new(undetermined("re-run as root")),
             source: Box::new(os("start", "/q", "stopped")),
         },
     ];
@@ -29,7 +31,7 @@ fn an_embedded_errors_remedy_prints_last_not_inside_the_sentence() {
 #[skuld::test]
 fn a_remedy_met_both_embedded_and_down_the_chain_prints_once() {
     let e = Error::StartAsManaged {
-        blob: Box::new(undetermined("re-run as root")),
+        blob: Arc::new(undetermined("re-run as root")),
         source: Box::new(undetermined("re-run as root")),
     };
     let text = e.report().to_string();

@@ -30,13 +30,14 @@ use std::io;
 use std::io::Read as _;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, openat};
 use nix::sys::stat::Mode;
 
 use crate::backend::systemd::generate;
-use crate::backend::{InstalledDefinition, InstalledService, ReadOutcome, Unnamed};
+use crate::backend::{Decoded, InstalledDefinition, InstalledService, ReadOutcome, Unnamed};
 use crate::blob::Blob;
 use crate::decide::ExternalConfig;
 use crate::error::{Error, Result};
@@ -310,12 +311,12 @@ pub(super) fn raw_state(id: &str) -> Result<RawState> {
 /// inode number moments after its file is unlinked.
 pub(crate) struct Fragment {
     id: Id,
-    blob: Result<Blob>,
+    blob: Decoded,
     text: String,
 }
 
 impl Fragment {
-    pub(super) fn new(id: Id, blob: Result<Blob>, text: String) -> Self {
+    pub(super) fn new(id: Id, blob: Decoded, text: String) -> Self {
         Self { id, blob, text }
     }
 
@@ -329,7 +330,7 @@ impl InstalledService for Fragment {
         &self.id
     }
 
-    fn blob(&self) -> std::result::Result<&Blob, &Error> {
+    fn blob(&self) -> std::result::Result<&Blob, &Arc<Error>> {
         self.blob.as_ref()
     }
 }
@@ -344,7 +345,7 @@ fn classified(id: &str, raw: RawState) -> ReadResult<ReadOutcome<Unnamed<String>
             let blob = match generate::extract(&text) {
                 Ok(None) => return Ok(ReadOutcome::Foreign { recovery: None }),
                 Ok(Some(blob)) => Ok(blob),
-                Err(e) => Err(e),
+                Err(e) => Err(Arc::new(e)),
             };
             ReadOutcome::Marked(Unnamed { blob, body: text })
         }

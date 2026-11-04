@@ -330,10 +330,9 @@ fn a_named_entry_does_not_carry_the_aggregate_claim() {
     assert!(reason.contains("re-run as Administrator"), "{reason}");
 }
 
-/// Both arms of the unwrapping that keeps the cause: the `Undetermined` `read_parameters` actually
-/// builds is split into the cause and the remedy it chose, without the variant's own `id` prose —
-/// which `cli::support` would render a second time after the name it already prints — and anything
-/// else still says what it was rather than nothing.
+/// The `Undetermined` `read_parameters` actually builds is split into the cause and the remedy it
+/// chose, without the variant's own `id` prose, which `cli::support` would render a second time
+/// after the name it already prints.
 #[skuld::test]
 fn a_failed_parameters_read_keeps_its_rendered_cause() {
     let carried = unreadable_parts(
@@ -356,16 +355,10 @@ fn a_failed_parameters_read_keeps_its_rendered_cause() {
         carried.recovery.is_some_and(|r| r.contains("re-run as Administrator")),
         "the remedy the errno earned travels with the cause"
     );
-
-    let other = unreadable_parts(
-        "MsSecFlt".to_string(),
-        Error::os("read the hive", std::io::Error::other("the hive is corrupt")),
-    );
-    assert!(other.detail.report().to_string().contains("the hive is corrupt"));
 }
 
-/// A failure the read was wrapped in on its way up is looked through: the cause and the remedy
-/// are the inner `Undetermined`'s, not the wrapper's prose and no remedy.
+/// A failure the read was wrapped in on its way up is looked through: the remedy is the inner
+/// `Undetermined`'s, and the wrapper stays around its read.
 #[skuld::test]
 fn a_wrapped_parameters_read_failure_keeps_the_inner_cause_and_remedy() {
     let wrapped = Error::Step {
@@ -379,7 +372,10 @@ fn a_wrapped_parameters_read_failure_keeps_the_inner_cause_and_remedy() {
 
     let parts = unreadable_parts("MsSecFlt".to_string(), wrapped);
 
-    assert_eq!(parts.detail.report().to_string(), "failed to read the key: unreadable");
+    assert_eq!(
+        parts.detail.report().to_string(),
+        "read the parameters: failed to read the key: unreadable"
+    );
     assert!(
         parts.recovery.is_some_and(|r| r.contains("re-run as Administrator")),
         "the remedy of the inner `Undetermined` travels"
@@ -516,9 +512,9 @@ fn start_reads_a_simple_service_by_the_shims_vocabulary_and_anything_else_strict
         assert_eq!(read, kind);
         assert!(why.is_none(), "{why:?}");
     }
-    let (kind, why) = start_kind(Err(&Error::blob("corrupt")));
+    let (kind, why) = start_kind(Err(&Arc::new(Error::blob("corrupt"))));
     assert_eq!(kind, Kind::Managed);
-    assert!(matches!(why, Some(Error::Blob { message, .. }) if message == "corrupt"));
+    assert!(matches!(why.as_deref(), Some(Error::Blob { message, .. }) if message == "corrupt"));
 }
 
 /// A start judged strictly because the blob could not be read says why, so the user is not told a
@@ -531,7 +527,7 @@ fn a_failed_start_names_the_blob_read_error_that_made_it_strict() {
     let plain = failed_start(&id, e(), None).report().to_string();
     assert!(!plain.contains("blob"), "{plain}");
 
-    let strict = failed_start(&id, e(), Some(Error::blob("invalid blob JSON: EOF")))
+    let strict = failed_start(&id, e(), Some(Arc::new(Error::blob("invalid blob JSON: EOF"))))
         .report()
         .to_string();
     assert!(strict.contains("service stopped before reaching Running"), "{strict}");

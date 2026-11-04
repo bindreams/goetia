@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::{BoxError, Error, Occupant, PutBackFound, VersionReading};
@@ -99,7 +100,7 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             source: None,
         },
         Error::StartAsManaged {
-            blob: Box::new(Error::blob(String::new())),
+            blob: Arc::new(Error::blob(String::new())),
             source: Box::new(not_installed()),
         },
         Error::AlreadyExists { path: PathBuf::new() },
@@ -151,7 +152,7 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
 #[skuld::test]
 fn a_start_judged_as_managed_is_indeterminate_when_the_failed_start_is() {
     let over = |source: Error| Error::StartAsManaged {
-        blob: Box::new(Error::blob(String::new())),
+        blob: Arc::new(Error::blob(String::new())),
         source: Box::new(source),
     };
     assert!(over(in_doubt()).is_indeterminate());
@@ -258,6 +259,99 @@ fn cause_reads_through_step() {
     };
     assert!(matches!(e.cause(), Error::NotInstalled { .. }), "{:?}", e.cause());
     assert!(matches!(not_installed().cause(), Error::NotInstalled { .. }));
+}
+
+fn step(what: &str, source: Error) -> Error {
+    Error::Step {
+        what: what.to_string(),
+        source: Box::new(source),
+    }
+}
+
+fn start_as_managed(source: Error) -> Error {
+    Error::StartAsManaged {
+        blob: Arc::new(Error::blob("corrupt")),
+        source: Box::new(source),
+    }
+}
+
+/// A start judged as managed is its failed start, as `is_indeterminate` already reads it.
+#[skuld::test]
+fn cause_reads_through_a_start_judged_as_managed() {
+    let e = step("start", start_as_managed(step("wait", in_doubt())));
+    assert!(matches!(e.cause(), Error::WaitTimeout { .. }), "{:?}", e.cause());
+}
+
+#[skuld::test]
+fn map_cause_replaces_the_cause_and_keeps_every_wrapper() {
+    let e = step("start", start_as_managed(step("wait", in_doubt())));
+
+    let mapped = e.map_cause(|leaf| {
+        assert!(matches!(leaf, Error::WaitTimeout { .. }), "{leaf:?}");
+        not_installed()
+    });
+
+    assert!(matches!(mapped.cause(), Error::NotInstalled { .. }), "{mapped:?}");
+    assert_eq!(
+        mapped.report().to_string(),
+        "start: its spec blob could not be read, so the start was judged as a `type: managed` service's (blob: \
+         corrupt): wait: daemon `x` is not installed"
+    );
+}
+
+/// `Both` has two causes, so it is a cause itself: neither walk goes into it.
+#[skuld::test]
+fn neither_walk_goes_into_a_both() {
+    let both = || Error::Both {
+        first: Box::new(in_doubt()),
+        then: Box::new(not_installed()),
+    };
+    assert!(matches!(both().cause(), Error::Both { .. }));
+    let mapped = both().map_cause(|leaf| {
+        assert!(matches!(leaf, Error::Both { .. }), "{leaf:?}");
+        not_installed()
+    });
+    assert!(matches!(mapped, Error::NotInstalled { .. }), "{mapped:?}");
+}
+
+/// An error a snapshot kept is handed out as it was: the same text, source, remedy and class.
+#[skuld::test]
+fn a_kept_error_reads_as_the_error_it_keeps() {
+    let kept = Arc::new(Error::blob_from("invalid blob JSON", std::io::Error::other("EOF")));
+    let owned = Error::Kept(Arc::clone(&kept));
+
+    assert!(std::error::Error::source(&owned).is_some(), "{owned:?}");
+    assert_eq!(owned.report().to_string(), "blob: invalid blob JSON: EOF");
+    assert_eq!(owned.report().to_string(), kept.report().to_string());
+    assert_eq!(owned.remedy(), kept.remedy());
+    assert_eq!(owned.is_indeterminate(), kept.is_indeterminate());
+
+    let undetermined = Error::Kept(Arc::new(undetermined("re-run as root")));
+    assert_eq!(undetermined.remedy(), Some("re-run as root"));
+    assert!(undetermined.is_indeterminate());
+}
+
+/// The errors written into a variant's own `Display` are exactly those `embedded` names, so
+/// `report` can collect their remedies.
+#[skuld::test]
+fn embedded_names_the_error_a_variant_writes_into_its_own_text() {
+    let inner = || undetermined("re-run as root");
+    let loaded = Error::LoadedStateInDoubt {
+        id: id(),
+        read_failed: Box::new(inner()),
+        restore_failed: None,
+    };
+    assert!(matches!(loaded.embedded(), Some(Error::Undetermined { .. })));
+    assert!(matches!(
+        start_as_managed(not_installed()).embedded(),
+        Some(Error::Blob { .. })
+    ));
+    assert!(matches!(
+        Error::Kept(Arc::new(loaded)).embedded(),
+        Some(Error::Undetermined { .. })
+    ));
+    assert!(not_installed().embedded().is_none());
+    assert!(step("a", inner()).embedded().is_none());
 }
 
 #[skuld::test]
@@ -683,7 +777,7 @@ fn report_of_an_account_lookup_ends_in_its_cause_when_it_has_one() {
 #[skuld::test]
 fn report_of_a_start_judged_as_managed_names_the_unreadable_blob_and_then_the_failure() {
     let e = Error::StartAsManaged {
-        blob: Box::new(Error::blob("invalid blob JSON: EOF".to_string())),
+        blob: Arc::new(Error::blob("invalid blob JSON: EOF".to_string())),
         source: Box::new(os("start", "/p", "stopped")),
     };
     assert_eq!(
@@ -701,7 +795,7 @@ fn an_undetermined_step_chain_gives_up_its_read_and_recovery() {
         source: Box::new(undetermined("re-run as root")),
     };
     let (reason, recovery) = step.into_undetermined().expect("the chain ends in Undetermined");
-    assert_eq!(reason.report().to_string(), "failed to read /p: denied");
+    assert_eq!(reason.report().to_string(), "check: failed to read /p: denied");
     assert_eq!(recovery, "re-run as root");
 
     let other = Error::Step {

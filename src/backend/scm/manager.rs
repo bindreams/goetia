@@ -95,6 +95,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt as _;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use windows_service::service::{
     Service, ServiceAccess, ServiceActionType, ServiceErrorControl, ServiceFailureResetPeriod, ServiceInfo,
@@ -110,12 +111,12 @@ use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 use super::wait::Waited;
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::backend::{
-    Backend, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
+    Backend, Decoded, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
 };
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Reason, Result};
-use crate::manager::{Budget, Installed, State, Status, budget, flow};
+use crate::manager::{Budget, Installed, State, Status, budget};
 use crate::spec::{DaemonSpec, Id, Kind};
 
 // Scm =================================================================================================================
@@ -135,7 +136,7 @@ impl Scm {
 /// What `read` saw of a service goetia marked.
 pub(crate) struct ScmSnapshot {
     id: Id,
-    blob: Result<Blob>,
+    blob: Decoded,
     /// Its `Parameters` values, which hold the only proof of ownership `type: managed` has.
     parameters: BTreeMap<String, String>,
     /// The object `read` opened to classify it, so `installed` and `live_status` ask that object:
@@ -148,7 +149,7 @@ pub(crate) struct ScmSnapshot {
 type Opened = (BTreeMap<String, String>, Option<Service>);
 
 impl ScmSnapshot {
-    fn new(id: Id, blob: Result<Blob>, (parameters, service): Opened) -> Self {
+    fn new(id: Id, blob: Decoded, (parameters, service): Opened) -> Self {
         Self {
             id,
             blob,
@@ -163,7 +164,7 @@ impl InstalledService for ScmSnapshot {
         &self.id
     }
 
-    fn blob(&self) -> std::result::Result<&Blob, &Error> {
+    fn blob(&self) -> std::result::Result<&Blob, &Arc<Error>> {
         self.blob.as_ref()
     }
 }
@@ -386,7 +387,7 @@ fn read_marker(parameters: BTreeMap<String, String>, service: Option<Service>) -
     let blob = match generate::extract(&parameters) {
         Ok(None) => return ReadOutcome::Foreign { recovery: None },
         Ok(Some(blob)) => Ok(blob),
-        Err(e) => Err(e),
+        Err(e) => Err(Arc::new(e)),
     };
     ReadOutcome::Marked(Unnamed {
         blob,
@@ -422,22 +423,22 @@ pub fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
 /// say. Only a decodable blob that says `type: simple` selects the shim's vocabulary; an unreadable
 /// one reads as strictly as `type: managed`, which is what a shim that cannot decode it reports
 /// anyway (a failed start).
-fn start_kind(blob: std::result::Result<&Blob, &Error>) -> (Kind, Option<Error>) {
+fn start_kind(blob: std::result::Result<&Blob, &Arc<Error>>) -> (Kind, Option<Arc<Error>>) {
     match blob {
         Ok(blob) => (blob.spec.kind, None),
-        Err(e) => (Kind::Managed, Some(flow::owned_failure(e))),
+        Err(e) => (Kind::Managed, Some(Arc::clone(e))),
     }
 }
 
 /// `start`'s error for a `start_via_notify` failure. When the blob was unreadable the start was
 /// judged as a `type: managed` service's, and the error says why, since that is not what a
 /// `type: simple` service would have been told.
-fn failed_start(id: &Id, e: std::io::Error, unreadable: Option<Error>) -> Error {
+fn failed_start(id: &Id, e: std::io::Error, unreadable: Option<Arc<Error>>) -> Error {
     let failed = Error::os(format!("start `{id}`"), e);
     match unreadable {
         None => failed,
         Some(blob) => Error::StartAsManaged {
-            blob: Box::new(blob),
+            blob,
             source: Box::new(failed),
         },
     }
@@ -1068,9 +1069,7 @@ fn undetermined(id: &str, reason: Error, access_denied: bool) -> Error {
     }
 }
 
-/// [`undetermined`] for a service object goetia could not open: [`to_error`]'s
-/// twin, over the same cause, for the reads that establish nothing rather than the ones that fail
-/// after ownership is known.
+/// As above, for reads that establish nothing (before ownership is known).
 fn service_undetermined(id: &str, context: &str, e: windows_service::Error) -> Error {
     let access_denied = is_access_denied(&e);
     undetermined(id, to_error(context, e), access_denied)
@@ -1229,8 +1228,8 @@ struct Unreadable {
 /// The remedy travels for the reason the cause does: at a count of one this entry and
 /// `status <same-id>` report the same single failed read, so answering it twice, differently, would
 /// put two answers on one condition. `read_parameters` builds every failure it has through
-/// `registry_undetermined`, so the first arm is the whole story; the second exists because the
-/// `Result` type does not say so, and has no conditioned remedy to offer rather than a default one.
+/// `registry_undetermined`, so the first arm is the whole story; the second is for a `Result` type
+/// that does not say so, and has no conditioned remedy to offer rather than a default one.
 fn unreadable_parts(name: String, e: Error) -> Unreadable {
     match e.into_undetermined() {
         Ok((reason, recovery)) => Unreadable {
@@ -1238,11 +1237,14 @@ fn unreadable_parts(name: String, e: Error) -> Unreadable {
             detail: *reason,
             recovery: Some(recovery),
         },
-        Err(e) => Unreadable {
-            name,
-            detail: e,
-            recovery: None,
-        },
+        Err(e) => {
+            debug_assert!(false, "`read_parameters` fails only as Undetermined, got {e:?}");
+            Unreadable {
+                name,
+                detail: e,
+                recovery: None,
+            }
+        }
     }
 }
 

@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::backend::{
-    InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
+    Decoded, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
 };
 use crate::blob::{self, Blob};
 use crate::decide::{ExternalConfig, Outcome};
@@ -53,12 +53,12 @@ fn pid_for(state: State) -> Option<u32> {
 /// What [`Fake`]'s `read` and `scan` saw at a marked id.
 pub(crate) struct Artifact {
     id: Id,
-    blob: Result<Blob>,
+    blob: Decoded,
     entry: Entry,
 }
 
 impl Artifact {
-    fn new(id: Id, blob: Result<Blob>, entry: Entry) -> Self {
+    fn new(id: Id, blob: Decoded, entry: Entry) -> Self {
         Self { id, blob, entry }
     }
 }
@@ -68,7 +68,7 @@ impl InstalledService for Artifact {
         &self.id
     }
 
-    fn blob(&self) -> std::result::Result<&Blob, &Error> {
+    fn blob(&self) -> std::result::Result<&Blob, &Arc<Error>> {
         self.blob.as_ref()
     }
 }
@@ -198,7 +198,7 @@ impl Store {
         let blob = match extract(&entry.text) {
             Ok(None) => return ReadOutcome::Foreign { recovery: None },
             Ok(Some(blob)) => Ok(blob),
-            Err(e) => Err(e),
+            Err(e) => Err(Arc::new(e)),
         };
         ReadOutcome::Marked(Unnamed {
             blob,

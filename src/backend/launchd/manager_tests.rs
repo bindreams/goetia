@@ -795,6 +795,36 @@ fn a_marked_plist_is_scanned_as_marked_in_the_directory_it_was_found_in() {
     }
 }
 
+/// A plist that cannot be read in either directory is one entry, whose reason holds both failed
+/// reads. A symlink loop fails the read for root and everyone else alike.
+#[skuld::test]
+fn a_plist_unreadable_in_both_directories_reports_both_failures() {
+    let (staging, enabled) = (
+        tempfile::tempdir().expect("tempdir"),
+        tempfile::tempdir().expect("tempdir"),
+    );
+    for dir in [&staging, &enabled] {
+        let path = dir.path().join("looped.plist");
+        std::os::unix::fs::symlink(&path, &path).expect("make the symlink loop");
+    }
+
+    let scan = scanned(staging.path(), enabled.path());
+
+    assert!(scan.entries.is_empty());
+    match scan.reported.as_slice() {
+        [Installed::Undetermined { name, reason }] => {
+            assert_eq!(name.as_deref(), Some("looped"));
+            let reason = reason.to_string();
+            for dir in [&staging, &enabled] {
+                let path = dir.path().join("looped.plist");
+                assert_eq!(reason.matches(&*path.to_string_lossy()).count(), 1, "{reason}");
+            }
+            assert!(reason.contains("; then: "), "{reason}");
+        }
+        other => panic!("one undetermined entry expected, got {other:?}"),
+    }
+}
+
 #[skuld::test]
 fn a_plist_without_the_marker_is_scanned_as_foreign() {
     let (staging, enabled) = (
@@ -936,7 +966,7 @@ fn marked_plist(id: &Id) -> Plist {
         .expect("sample_plist carries the marker");
     Plist {
         id: id.clone(),
-        blob,
+        blob: blob.map_err(Arc::new),
         location: Location {
             path: PathBuf::from("/nonexistent/goetia-marked.plist"),
             enabled: false,
