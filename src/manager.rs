@@ -128,22 +128,12 @@ pub trait ServiceManager {
     /// [`Error::Undetermined`]: crate::Error::Undetermined
     fn start(&self, id: &Id, budget: Budget) -> Result<()>;
 
-    /// Make ready, before the first of `steps` sends anything, whatever
-    /// they can need under `budget` — the one their verbs will be given —
-    /// that could otherwise run out between two of them — so
-    /// that a failure here means nothing was sent, where the same failure
-    /// later would strand the daemon halfway: stopped by `restart`'s stop
-    /// with its start never sent, or booted out by `install --start`'s
-    /// install with the start never sent. Held for as long as the returned
-    /// [`Prepared`] lives, for verbs run on this thread — any step of them,
-    /// for any id, may draw on it meanwhile; `status` and `list` never do,
-    /// and make what they need for themselves. Preparations nest and may be
-    /// dropped in any order: dropping one releases only what it made.
-    /// Nothing, by default — so a wrapper around another manager forwards
-    /// it.
-    fn prepare(&self, _steps: &[Step], _budget: Budget) -> Result<Prepared> {
-        Ok(Prepared::nothing())
-    }
+    /// Make ready, before the first of `steps` sends anything, whatever they could need under
+    /// `budget` that might run out between two of them. A failure here means nothing was sent;
+    /// later it would strand the daemon halfway (e.g. stopped by `restart` with no start sent). The
+    /// returned [`Sequence`] draws on it, nothing else does; dropping it releases it. A verb outside
+    /// a sequence reserves for itself. Each prepared step is used once (see [`Sequence`]).
+    fn prepare(&self, steps: &[Step], budget: Budget) -> Result<Box<dyn Sequence + '_>>;
 
     /// `daemon restart --timeout 0` as one request, where the platform has
     /// one: the manager's own restart, confirming nothing. `None`,
@@ -260,34 +250,38 @@ pub trait ServiceManager {
     fn list(&self) -> Result<Vec<Installed>>;
 }
 
-// Prepared ============================================================================================================
+// Sequence ============================================================================================================
 
-/// One verb of a sequence a caller runs back to back — see
-/// [`ServiceManager::prepare`].
+/// One verb that can draw on a reservation — see [`ServiceManager::prepare`]. A verb outside a
+/// sequence reserves for its own step; one inside draws on what the sequence made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     Install,
     Start,
     Stop,
+    Kill,
+    Uninstall,
+    RequestStartAfterStop,
 }
 
-/// What [`ServiceManager::prepare`] made ready, released when dropped.
+/// What [`ServiceManager::prepare`] made ready, and the verbs that draw on it, with the contracts
+/// of the [`ServiceManager`] verbs of the same names. Releases what it did not spend when dropped.
+///
+/// A verb may be run only for a step that was prepared, and each prepared step once: [`Step::Stop`]
+/// by `stop`, [`Step::Start`] by `start` or, where the start is only requested, by
+/// `request_start_after_stop`. Anything else was not counted for and fails a debug assertion; in a
+/// release build it makes what it needs on the spot, which can fail between legs. A verb the
+/// ownership gate refuses draws nothing, so its step stays unspent.
 #[must_use = "what was prepared is released as soon as this is dropped"]
-pub struct Prepared {
-    _held: Option<Box<dyn std::any::Any>>,
-}
+pub trait Sequence {
+    /// See [`ServiceManager::stop`].
+    fn stop(&mut self, id: &Id, budget: Budget) -> Result<()>;
 
-impl Prepared {
-    /// Nothing made ready: a backend with nothing that can run out.
-    pub fn nothing() -> Self {
-        Prepared { _held: None }
-    }
+    /// See [`ServiceManager::start`].
+    fn start(&mut self, id: &Id, budget: Budget) -> Result<()>;
 
-    pub(crate) fn holding(held: impl std::any::Any) -> Self {
-        Prepared {
-            _held: Some(Box::new(held)),
-        }
-    }
+    /// See [`ServiceManager::request_start_after_stop`].
+    fn request_start_after_stop(&mut self, id: &Id) -> Result<()>;
 }
 
 // Installed / Status / State ==========================================================================================

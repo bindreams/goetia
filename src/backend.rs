@@ -11,7 +11,6 @@
 
 #[cfg(unix)]
 pub(crate) mod bounded;
-// Used by launchd only; the allow below covers other targets.
 #[cfg(unix)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) mod client;

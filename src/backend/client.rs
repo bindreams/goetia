@@ -4,13 +4,14 @@
 //!
 //! A backend decides what a reply means; the client only runs the program and says how it ended.
 
-use crate::backend::bounded::{self, Finished, Role, SpawnError};
+use crate::backend::bounded::{self, Finished, Reservation, Role, SpawnError};
 use crate::manager::budget::Deadline;
 
 /// A service manager's command-line client.
 pub(crate) trait Client: Send + Sync {
-    /// Run the client with `args`, waiting as `wait` says.
-    fn run(&self, args: &[&str], wait: Wait) -> Result<Finished, ClientError>;
+    /// Run the client with `args`, waiting as `wait` says. What the call's output needs is drawn
+    /// from `reservation`: see [`bounded::spawn`].
+    fn run(&self, args: &[&str], wait: Wait, reservation: &mut Reservation) -> Result<Finished, ClientError>;
 }
 
 pub(crate) enum Wait {
@@ -68,12 +69,12 @@ impl Real {
 }
 
 impl Client for Real {
-    fn run(&self, args: &[&str], wait: Wait) -> Result<Finished, ClientError> {
+    fn run(&self, args: &[&str], wait: Wait, reservation: &mut Reservation) -> Result<Finished, ClientError> {
         let Wait::Bounded { role, deadline } = wait;
         let argv = self.argv(args);
         let mut cmd = bounded::command(argv[0], &argv[1..]).map_err(ClientError::NotRun)?;
         (self.environment)(&mut cmd);
-        let spawned = bounded::spawn(&mut cmd, role)?;
+        let spawned = bounded::spawn(&mut cmd, role, reservation)?;
         bounded::wait_bounded(spawned, deadline).map_err(|lost| ClientError::Lost {
             error: lost.error,
             announced: lost.announced,
@@ -89,7 +90,7 @@ pub(crate) mod fake {
     use std::process::ExitStatus;
     use std::sync::{Arc, Mutex};
 
-    use super::{Client, ClientError, Finished, Role, Wait};
+    use super::{Client, ClientError, Finished, Reservation, Role, Wait};
     use crate::backend::bounded::Capture;
 
     /// Replies consumed in order. Each entry names the argv prefix it expects, and may carry an
@@ -212,12 +213,19 @@ pub(crate) mod fake {
     }
 
     impl Client for Fake {
-        fn run(&self, args: &[&str], wait: Wait) -> Result<Finished, ClientError> {
+        /// Draws the files the real client's spawn would, so a verb that counted too few trips the
+        /// assertion in every test that drives it.
+        fn run(&self, args: &[&str], wait: Wait, reservation: &mut Reservation) -> Result<Finished, ClientError> {
+            let waited = Waited::of(&wait);
+            let Wait::Bounded { role, .. } = &wait;
+            for _ in 0..role.files() {
+                reservation.file().map_err(|e| ClientError::NotRun(e.into()))?;
+            }
             let argv: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
             let next = {
                 let mut state = self.state.lock().unwrap();
                 state.calls.push(argv.clone());
-                state.waits.push(Waited::of(&wait));
+                state.waits.push(waited);
                 state.entries.pop_front()
             };
             let Some(entry) = next else {

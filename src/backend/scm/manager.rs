@@ -116,7 +116,7 @@ use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Result};
 use crate::manager::budget;
-use crate::manager::{Budget, Installed, State, Status};
+use crate::manager::{Budget, Installed, State, Status, Step};
 use crate::spec::{DaemonSpec, Id, Kind};
 
 // Scm =================================================================================================================
@@ -203,9 +203,15 @@ impl Backend for Scm {
     type Definition = ScmRegistration;
     type Snapshot = ScmSnapshot;
     type InstallScope = ();
+    type Reservation = ();
 
     /// SCM has nothing to hold across an install: its preconditions are `apply`'s, before any write.
     fn begin_install(&self, _spec: &DaemonSpec) -> Result<()> {
+        Ok(())
+    }
+
+    /// SCM sends its requests through the OS, with no thread or file of ours to run out.
+    fn reserve(&self, _steps: &[Step], _budget: Budget) -> Result<()> {
         Ok(())
     }
 
@@ -246,6 +252,7 @@ impl Backend for Scm {
         _outcome: &Outcome,
         snapshot: Option<&ScmSnapshot>,
         _scope: &mut (),
+        _reservation: &mut (),
     ) -> Result<WriteOutcome> {
         apply(definition, snapshot.is_none())?;
         Ok(WriteOutcome::Done)
@@ -293,7 +300,7 @@ impl Backend for Scm {
         }
     }
 
-    fn uninstall(&self, snapshot: ScmSnapshot) -> Result<()> {
+    fn uninstall(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
         // `uninstall_locked` opens its own handles, and its delete needs this one closed: an open
         // handle leaves the service only marked for deletion.
         let id = snapshot.into_id();
@@ -313,7 +320,7 @@ impl Backend for Scm {
         set_start_type(&service, ServiceStartType::OnDemand).map_err(|e| Error::os(format!("disable `{id}`"), e))
     }
 
-    fn start(&self, snapshot: ScmSnapshot, budget: Budget) -> Result<()> {
+    fn start(&self, snapshot: ScmSnapshot, budget: Budget, _reservation: &mut ()) -> Result<()> {
         // First, so the wait is counted from the verb's entry. What it bounds is the wait:
         // `start_via_notify` issues the start whatever is left of it.
         let deadline = budget.start();
@@ -338,14 +345,14 @@ impl Backend for Scm {
     /// [`super::wait::request_start_after_stop`]: every
     /// `ERROR_SERVICE_ALREADY_RUNNING` is a refusal here, since a `type:
     /// simple` service reads `RUNNING` until its shim has taken the stop.
-    fn request_start_after_stop(&self, snapshot: ScmSnapshot) -> Result<()> {
+    fn request_start_after_stop(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
         let id = snapshot.into_id();
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::os(format!("open `{id}` to start it"), e))?;
         super::wait::request_start_after_stop(&mut actor).map_err(|e| Error::os(format!("start `{id}`"), e))
     }
 
-    fn stop(&self, snapshot: ScmSnapshot, budget: Budget) -> Result<()> {
+    fn stop(&self, snapshot: ScmSnapshot, budget: Budget, _reservation: &mut ()) -> Result<()> {
         // First, so the wait is counted from the verb's entry; `stop_via_notify` issues the stop
         // whatever is left of it.
         let deadline = budget.start();
@@ -367,7 +374,7 @@ impl Backend for Scm {
     /// (`TerminateProcess`): SCM sees an unexpected exit and applies the recovery actions, as for a
     /// crash. For `type: simple` the process is `goetia-shim`, whose Job Object takes the daemon's
     /// tree with it.
-    fn kill(&self, snapshot: ScmSnapshot) -> Result<()> {
+    fn kill(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
         let id = snapshot.into_id();
         let (_scm, service) = open_existing(&id, ServiceAccess::QUERY_STATUS)?;
         let mut target = super::kill::SystemKillTarget::new(service, id.as_str().to_string());
