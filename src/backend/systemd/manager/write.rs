@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::error::{Error, Result};
 
 use super::discover::{RawState, ReadFailure, classify_and_read};
-use super::{UNIT_DIR, io_err, remove_file_if_present, unit_path};
+use super::{UNIT_DIR, remove_file_if_present, unit_path};
 
 // CreateOutcome / create_unit =========================================================================================
 
@@ -34,7 +34,7 @@ pub(super) fn create_unit(id: &str, text: &str) -> Result<CreateOutcome> {
             Ok(CreateOutcome::Created)
         }
         Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => Ok(CreateOutcome::Raced),
-        Err(e) => Err(io_err("create", &final_path, e.error)),
+        Err(e) => Err(Error::os_at("create", &final_path, e.error)),
     }
 }
 
@@ -70,7 +70,7 @@ pub(super) fn replace_unit_verified(id: &str, text: &str, expected_text: &str) -
     // already-installed service into a silent uninstall.
     let tmp = match write_temp_unit(id, text) {
         Ok(tmp) => tmp,
-        Err(e) => return Err(restore_or_chain(&backup_path, &final_path, e)),
+        Err(e) => return Err(restore_or_chain(id, &backup_path, &final_path, e)),
     };
 
     match tmp.persist_noclobber(&final_path) {
@@ -85,32 +85,34 @@ pub(super) fn replace_unit_verified(id: &str, text: &str, expected_text: &str) -
             // clobber that third file — exactly the bug this function exists to prevent — so this
             // reports the situation (naming the quarantine path) instead of guessing which side
             // should win.
-            Err(Error::Other(format!(
-                "install for `{id}` raced twice: the original fragment is safely quarantined at {}, \
-                 but a different file has since appeared at {}; resolve manually and re-run install",
-                backup_path.display(),
-                final_path.display(),
-            )))
+            Err(Error::QuarantineStranded {
+                id: id.to_string(),
+                quarantine: backup_path,
+                occupied: final_path,
+            })
         }
         Err(e) => Err(restore_or_chain(
+            id,
             &backup_path,
             &final_path,
-            io_err("replace", &final_path, e.error),
+            Error::os_at("replace", &final_path, e.error),
         )),
     }
 }
 
 /// Restore the quarantined original before reporting `primary` — unless the restore *itself* fails,
-/// in which case both failures are folded into one message rather than letting the restore's own
-/// error silently replace `primary` (a real, reachable double failure: an out-of-space device can
-/// fail both the original write and the subsequent `link`-based restore in the same call).
-fn restore_or_chain(backup_path: &Path, final_path: &Path, primary: Error) -> Error {
-    match restore_quarantine(backup_path, final_path) {
+/// in which case both failures are reported as one [`Error::Both`] rather than letting the restore's
+/// own error silently replace `primary`.
+fn restore_or_chain(id: &str, backup_path: &Path, final_path: &Path, primary: Error) -> Error {
+    match restore_quarantine(id, backup_path, final_path) {
         Ok(()) => primary,
-        Err(restore_err) => Error::Other(format!(
-            "{primary}; additionally, restoring the quarantined original at {} failed: {restore_err}",
-            backup_path.display()
-        )),
+        Err(restore_err) => Error::Both {
+            first: Box::new(primary),
+            then: Box::new(Error::Step {
+                what: format!("restoring the quarantined original at {} failed", backup_path.display()),
+                source: Box::new(restore_err),
+            }),
+        },
     }
 }
 
@@ -148,23 +150,23 @@ pub(super) fn quarantine_if_still_ours(id: &str, expected_text: &str) -> Result<
     match fs::rename(&final_path, &backup_path) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(io_err("quarantine", &final_path, e)),
+        Err(e) => return Err(Error::os_at("quarantine", &final_path, e)),
     }
 
     let actual = match classify_and_read(&backup_path).map_err(ReadFailure::into_io_error) {
         Ok(RawState::Regular(text)) => text,
         Ok(RawState::Absent | RawState::NotOurs) => {
-            restore_quarantine(&backup_path, &final_path)?;
+            restore_quarantine(id, &backup_path, &final_path)?;
             return Ok(None);
         }
         // Whatever went wrong reading it back, the file is real and must not be stranded under a
         // hidden name — restore it before reporting the read failure.
-        Err(e) => return Err(restore_or_chain(&backup_path, &final_path, e)),
+        Err(e) => return Err(restore_or_chain(id, &backup_path, &final_path, e)),
     };
     if actual == expected_text {
         Ok(Some(backup_path))
     } else {
-        restore_quarantine(&backup_path, &final_path)?;
+        restore_quarantine(id, &backup_path, &final_path)?;
         Ok(None)
     }
 }
@@ -189,19 +191,18 @@ fn unique_quarantine_path(id: &str) -> PathBuf {
 /// failure because something now occupies `final_path`, `backup_path` is left in place (still holding
 /// the original content) and the returned error names it, so the situation is diagnosable rather than
 /// silently destructive either way.
-pub(super) fn restore_quarantine(backup_path: &Path, final_path: &Path) -> Result<()> {
+pub(super) fn restore_quarantine(id: &str, backup_path: &Path, final_path: &Path) -> Result<()> {
     match fs::hard_link(backup_path, final_path) {
         Ok(()) => {
             remove_file_if_present(backup_path)?;
             Ok(())
         }
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(Error::Other(format!(
-            "could not restore the fragment quarantined at {}: a different file now occupies {}; \
-             resolve manually",
-            backup_path.display(),
-            final_path.display(),
-        ))),
-        Err(e) => Err(io_err("restore", final_path, e)),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(Error::QuarantineStranded {
+            id: id.to_string(),
+            quarantine: backup_path.to_path_buf(),
+            occupied: final_path.to_path_buf(),
+        }),
+        Err(e) => Err(Error::os_at("restore", final_path, e)),
     }
 }
 
@@ -220,13 +221,15 @@ pub(super) fn write_temp_unit(id: &str, text: &str) -> Result<tempfile::NamedTem
         .prefix(&format!(".goetia-{id}-"))
         .suffix(".service.tmp")
         .tempfile_in(dir)
-        .map_err(|e| io_err("create a temp file in", dir, e))?;
+        .map_err(|e| Error::os_at("create a temp file in", dir, e))?;
     tmp.write_all(text.as_bytes())
-        .map_err(|e| io_err("write", tmp.path(), e))?;
-    tmp.as_file().sync_all().map_err(|e| io_err("fsync", tmp.path(), e))?;
+        .map_err(|e| Error::os_at("write", tmp.path(), e))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| Error::os_at("fsync", tmp.path(), e))?;
     tmp.as_file()
         .set_permissions(fs::Permissions::from_mode(0o644))
-        .map_err(|e| io_err("chmod", tmp.path(), e))?;
+        .map_err(|e| Error::os_at("chmod", tmp.path(), e))?;
     Ok(tmp)
 }
 
@@ -234,6 +237,6 @@ pub(super) fn write_temp_unit(id: &str, text: &str) -> Result<tempfile::NamedTem
 /// own `fsync` (see `write_temp_unit`) says nothing about the directory entry pointing to it.
 pub(super) fn fsync_unit_dir() -> Result<()> {
     let dir = Path::new(UNIT_DIR);
-    let f = fs::File::open(dir).map_err(|e| io_err("open", dir, e))?;
-    f.sync_all().map_err(|e| io_err("fsync", dir, e))
+    let f = fs::File::open(dir).map_err(|e| Error::os_at("open", dir, e))?;
+    f.sync_all().map_err(|e| Error::os_at("fsync", dir, e))
 }

@@ -268,7 +268,7 @@ fn foreign_refuses_every_verb(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> Dae
     );
     let killed = mgr.kill(&spec.id);
     assert!(
-        matches!(&killed, Err(Error::Foreign { id, .. }) if id == spec.id.as_str()),
+        matches!(killed.as_ref().err().map(Error::cause), Some(Error::Foreign { id, .. }) if id == spec.id.as_str()),
         "kill must refuse a foreign id as Foreign, not as NotRunning or anything else: {killed:?}"
     );
     assert!(
@@ -363,7 +363,7 @@ fn kill_of_a_service_that_is_not_running_says_so(
 
     let never_started = mgr.kill(&spec.id);
     assert!(
-        matches!(&never_started, Err(Error::NotRunning { id }) if id == spec.id.as_str()),
+        matches!(never_started.as_ref().err().map(Error::cause), Some(Error::NotRunning { id }) if id == spec.id.as_str()),
         "kill of a never-started service must be NotRunning, got {never_started:?}"
     );
 
@@ -371,7 +371,7 @@ fn kill_of_a_service_that_is_not_running_says_so(
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
     let stopped = mgr.kill(&spec.id);
     assert!(
-        matches!(&stopped, Err(Error::NotRunning { id }) if id == spec.id.as_str()),
+        matches!(stopped.as_ref().err().map(Error::cause), Some(Error::NotRunning { id }) if id == spec.id.as_str()),
         "kill of a stopped service must be NotRunning, got {stopped:?}"
     );
 }
@@ -577,7 +577,10 @@ pub fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, m
     .chain(mgr.request_restart(id).map(|result| ("request_restart", result)))
     {
         assert!(
-            matches!(&result, Err(Error::Undetermined { .. })),
+            matches!(
+                result.as_ref().err().map(Error::cause),
+                Some(Error::Undetermined { .. })
+            ),
             "{verb} on an id goetia cannot classify must be Undetermined, got {result:?}"
         );
     }
@@ -595,7 +598,10 @@ pub fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, m
         ("preview_install", mgr.preview_install(&spec).map(drop)),
     ] {
         assert!(
-            matches!(&result, Err(Error::Undetermined { .. })),
+            matches!(
+                result.as_ref().err().map(Error::cause),
+                Some(Error::Undetermined { .. })
+            ),
             "{verb} over an id goetia cannot classify must be Undetermined, got {result:?}"
         );
     }

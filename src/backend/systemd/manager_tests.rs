@@ -309,7 +309,7 @@ fn replace_reports_raced_twice_rather_than_guessing_which_file_wins() {
             ),
             Err(e) => {
                 let message = e.to_string();
-                assert!(message.contains("raced twice"), "{message}");
+                assert!(matches!(e, Error::QuarantineStranded { .. }), "{e:?}");
                 assert!(message.contains("quarantined"), "{message}");
                 let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
                 assert_eq!(

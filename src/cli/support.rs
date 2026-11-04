@@ -260,7 +260,7 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
     let ids = match ids {
         Ok(ids) => ids,
         Err(e) => {
-            let _ = writeln!(err, "error: {e}");
+            let _ = writeln!(err, "error: {}", e.report());
             return ExitCode::Error;
         }
     };
@@ -271,7 +271,7 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
     let mgr = match (call.get_manager)() {
         Ok(mgr) => mgr,
         Err(e) => {
-            let _ = writeln!(err, "error: {e}");
+            let _ = writeln!(err, "error: {}", e.report());
             return ExitCode::Error;
         }
     };
@@ -288,12 +288,12 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
             // never the past-tense line: claiming e.g. "uninstalled" for a
             // daemon that was never there trades one wrong report for
             // another. Does not affect the aggregated exit code.
-            Err(Error::NotInstalled { .. }) if call.absent_is_success => {
+            Err(e) if call.absent_is_success && matches!(e.cause(), Error::NotInstalled { .. }) => {
                 let _ = writeln!(out, "{id}: not installed (nothing to do)");
                 codes.push(ExitCode::Success);
             }
             Err(e) => {
-                let _ = writeln!(err, "error: {id}: {e}");
+                let _ = writeln!(err, "error: {id}: {}", e.report());
                 codes.push(ExitCode::of(&e));
             }
         }

@@ -42,7 +42,7 @@ use crate::decide::ExternalConfig;
 use crate::error::{Error, Result};
 use crate::spec::Id;
 
-use super::{UNIT_DIR, io_err, unit_path};
+use super::{UNIT_DIR, unit_path};
 
 // ReadFailure =========================================================================================================
 
@@ -93,7 +93,7 @@ impl ReadFailure {
     /// statement about it: `super::write::quarantine_if_still_ours`, which reaches this only after
     /// `read` found the fragment marked.
     pub(super) fn into_io_error(self) -> Error {
-        io_err(self.op, &self.path, self.source)
+        Error::os_at(self.op, self.path, self.source)
     }
 }
 
@@ -379,15 +379,12 @@ pub(super) fn fragmentless<S>(id: &str) -> ReadResult<ReadOutcome<S>> {
 /// drop-in directories hold for it. Drop-in content is folded into the compared text, so any drop-in
 /// reads as `Conflict`; the stale-version branch (no text comparison) uses `external` instead.
 ///
-/// A drop-in that could not be read is `Error::Other`, never [`Error::Undetermined`]: the fragment
-/// is open and its marker decoded, so installation and ownership are both established, and what the
-/// failed read costs is the ability to report on the id.
+/// A drop-in that could not be read is an [`Error::Step`] over an [`Error::Os`], never [`Error::Undetermined`]: the fragment
+/// is open and its marker decoded, so installation and ownership are both established.
 pub(super) fn installed(id: &str, text: &str) -> Result<InstalledDefinition<String>> {
-    let dirs = dropin_dirs(id).map_err(|failure| {
-        Error::Other(format!(
-            "a drop-in directory could not be read, so what systemd applies to it cannot be compared: {}",
-            failure.detail()
-        ))
+    let dirs = dropin_dirs(id).map_err(|failure| Error::Step {
+        what: "a drop-in directory could not be read, so what systemd applies to it cannot be compared".to_string(),
+        source: Box::new(failure.into_io_error()),
     })?;
     let marker: String = dirs.iter().map(|(_, text)| text.as_str()).collect();
     Ok(InstalledDefinition {
@@ -405,7 +402,7 @@ pub(super) fn installed(id: &str, text: &str) -> Result<InstalledDefinition<Stri
 /// and its ownership by then and reports a drop-in it cannot read as `Ownership::OursUnusable`
 /// instead.
 ///
-/// [`Error::Undetermined`], never [`io_err`]'s `Error::Other`: `Other` reaches
+/// [`Error::Undetermined`], never an [`Error::Os`]: it reaches
 /// `cli::report::status_error`'s catch-all as `Kind::Unusable`, which *asserts* that goetia owns
 /// the id — the one thing a read that never completed cannot establish. See
 /// [`Error::Undetermined`]'s doc comment for why that claim is worth a variant of its own.

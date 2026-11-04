@@ -39,7 +39,7 @@ pub fn run(
     let spec = match load_and_warn(&args.file, err) {
         Ok(spec) => spec,
         Err(e) => {
-            let _ = writeln!(err, "error: {e}");
+            let _ = writeln!(err, "error: {}", e.report());
             return ExitCode::Error;
         }
     };
@@ -47,7 +47,7 @@ pub fn run(
     let mgr = match get_manager() {
         Ok(mgr) => mgr,
         Err(e) => {
-            let _ = writeln!(err, "error: {e}");
+            let _ = writeln!(err, "error: {}", e.report());
             return ExitCode::Error;
         }
     };
@@ -121,7 +121,7 @@ pub fn run(
             ExitCode::Indeterminate
         }
         Err(e) => {
-            let _ = writeln!(err, "error: {}: {e}", spec.id);
+            let _ = writeln!(err, "error: {}: {}", spec.id, e.report());
             ExitCode::of(&e)
         }
     }

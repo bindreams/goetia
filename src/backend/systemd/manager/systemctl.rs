@@ -4,10 +4,11 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 
 use crate::backend::bounded::{self, Capture, Finished, Role};
-use crate::error::{Error, Result};
+use crate::backend::systemd::SYSTEMD_FLOOR;
+use crate::error::{Error, Result, VersionReading};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, State, Status};
 
@@ -214,7 +215,7 @@ fn ran(purpose: Purpose, program: &[&str], args: &[&str]) -> Result<std::process
         Purpose::Request => requested(&mut cmd, "systemctl", args)?,
         Purpose::Probe | Purpose::Read => cmd
             .output()
-            .map_err(|e| Error::Other(format!("failed to run `systemctl {}`: {e}", args.join(" "))))?,
+            .map_err(|e| Error::spawn(format!("systemctl {}", args.join(" ")), e))?,
     };
     answered(&output.stdout, &output.stderr)?;
     Ok(output)
@@ -520,7 +521,7 @@ fn requested_with(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| Error::Other(format!("could not run `{request}`, so it was not sent: {e}")))?;
+        .map_err(|e| Error::spawn(request.clone(), e))?;
     wait(child).map_err(|e| Error::RequestInDoubt {
         request,
         reached: false,
@@ -533,10 +534,7 @@ pub(super) fn daemon_reload() -> Result<()> {
     if output.status.success() {
         Ok(())
     } else {
-        Err(Error::Other(format!(
-            "systemctl daemon-reload failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )))
+        Err(Error::command("systemctl daemon-reload", output.status, &output.stderr))
     }
 }
 
@@ -555,21 +553,16 @@ pub(super) fn daemon_reload_or_report(id: &str) -> Result<()> {
             reached,
             detail: format!("wrote the unit for `{id}`, so systemd may not have picked it up yet: {detail}"),
         },
-        e => Error::Other(format!(
-            "wrote the unit for `{id}` but `systemctl daemon-reload` failed, so systemd may not have \
-             picked it up yet: {e}"
-        )),
+        e => Error::Step {
+            what: format!(
+                "wrote the unit for `{id}` but `systemctl daemon-reload` failed, so systemd may not have picked it up yet"
+            ),
+            source: Box::new(e),
+        },
     })
 }
 
 // The version gate ====================================================================================================
-
-/// The oldest systemd goetia runs against: every start and stop runs `systemctl --show-transaction`
-/// (242).
-const SYSTEMD_FLOOR: u32 = 242;
-
-/// The oldest systemd that parses the `Type=exec` generated units declare.
-const TYPE_EXEC: u32 = 240;
 
 /// Refuse a systemd older than [`SYSTEMD_FLOOR`]. Asked before goetia writes a unit, and by
 /// [`door`] before every request: an older systemd does not reject `Type=exec` but logs that it
@@ -640,32 +633,29 @@ enum Source {
 fn supported() -> Result<()> {
     let client = systemctl(Purpose::Probe, &["--version"])?;
     if !client.status.success() {
-        return Err(Error::Other(format!(
-            "`systemctl --version` failed, so goetia cannot tell whether this is systemd {SYSTEMD_FLOOR}+: {}",
-            String::from_utf8_lossy(&client.stderr)
-        )));
+        return Err(Error::Step {
+            what: format!("goetia cannot tell whether this is systemd {SYSTEMD_FLOOR}+"),
+            source: Box::new(Error::command("systemctl --version", client.status, &client.stderr)),
+        });
     }
     let client = String::from_utf8_lossy(&client.stdout);
     let client = client.lines().next().unwrap_or_default();
     let manager = systemctl(Purpose::Probe, &["show", "--property=Version", "--value"])?;
-    let reported = String::from_utf8_lossy(&manager.stdout);
-    if !manager.status.success() || reported.trim().is_empty() {
-        let how = if manager.status.success() {
-            "printed no version".to_string()
-        } else {
-            format!("failed ({})", manager.status)
-        };
-        return Err(Error::Other(format!(
-            "`systemctl show --property=Version` {how}, so goetia cannot tell whether the running systemd is \
-             {SYSTEMD_FLOOR}+: {}",
-            String::from_utf8_lossy(&manager.stderr)
-        )));
+    if !manager.status.success() {
+        return Err(Error::Step {
+            what: format!("goetia cannot tell whether the running systemd is {SYSTEMD_FLOOR}+"),
+            source: Box::new(Error::command(
+                "systemctl show --property=Version --value",
+                manager.status,
+                &manager.stderr,
+            )),
+        });
     }
-    let verdicts = [
-        verdict(Source::Manager, reported.trim()),
-        verdict(Source::Client, client),
-    ];
-    refusal(verdicts.into_iter().flatten().collect())
+    let reported = String::from_utf8_lossy(&manager.stdout);
+    refusal(
+        reading(Source::Client, client),
+        reading(Source::Manager, reported.trim()),
+    )
 }
 
 /// The major version in what `source` reported: the `Version` property (`257.13-1~deb13u1`,
@@ -683,41 +673,21 @@ fn major(source: Source, reported: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
-/// Why the version `source` reported is refused, as one sentence; `None` if it is not.
-fn verdict(source: Source, reported: &str) -> Option<String> {
-    const ANSWER: &str = "cannot answer the `systemctl --show-transaction` every start and stop runs";
-    const TYPE_SIMPLE: &str = "runs goetia's `Type=exec` units as `Type=simple`, which cannot report a failed exec";
-    let Some(n) = major(source, reported) else {
-        let asked = match source {
-            Source::Manager => "the running systemd reports",
-            Source::Client => "`systemctl --version` reports",
-        };
-        return Some(format!(
-            "goetia cannot read the version {asked} ({reported:?}), so cannot tell whether it is."
-        ));
-    };
-    if n >= SYSTEMD_FLOOR {
-        return None;
+/// What `source` reported, as [`Error::UnsupportedManager`] keeps it.
+fn reading(source: Source, reported: &str) -> VersionReading {
+    match major(source, reported) {
+        Some(n) => VersionReading::Major(n),
+        None => VersionReading::Unreadable(reported.to_string()),
     }
-    Some(match source {
-        Source::Client => format!(
-            "The `systemctl` client is {n}, which does not accept the `--show-transaction` option every start and \
-             stop passes it."
-        ),
-        Source::Manager if n >= TYPE_EXEC => format!("The running systemd is {n}, which {ANSWER}."),
-        Source::Manager => format!("The running systemd is {n}, which {ANSWER}, and {TYPE_SIMPLE}."),
-    })
 }
 
-/// `Ok` for no verdicts; otherwise the refusal naming every one.
-fn refusal(verdicts: Vec<String>) -> Result<()> {
-    if verdicts.is_empty() {
+/// `Ok` when both are at the floor; otherwise the refusal.
+fn refusal(client: VersionReading, manager: VersionReading) -> Result<()> {
+    let at_floor = |reading: &VersionReading| matches!(reading, VersionReading::Major(n) if *n >= SYSTEMD_FLOOR);
+    if at_floor(&client) && at_floor(&manager) {
         return Ok(());
     }
-    Err(Error::Other(format!(
-        "goetia requires systemd {SYSTEMD_FLOOR} or newer. {}",
-        verdicts.join(" ")
-    )))
+    Err(Error::UnsupportedManager { client, manager })
 }
 
 // Verbs ===============================================================================================================
@@ -788,7 +758,7 @@ pub(super) fn watched(budget: Budget) -> bool {
 /// path is testable against a child that cannot exit on its own. What either path answers is
 /// [`answered`].
 fn run_verb_via(program: &[&str], args: &[&str], budget: Budget, deadline: Deadline) -> Result<Finished> {
-    let failed = |e: String| Error::Other(format!("failed to run `systemctl {}`: {e}", args.join(" ")));
+    let failed = |e: cosca::error::Error| Error::spawn(format!("systemctl {}", args.join(" ")), e);
     let in_doubt = |e: String, reached: bool| Error::RequestInDoubt {
         request: format!("systemctl {}", args.join(" ")),
         reached,
@@ -810,10 +780,10 @@ fn run_verb_via(program: &[&str], args: &[&str], budget: Budget, deadline: Deadl
 
     let (bin, prefix) = program.split_first().expect("a program to run");
     let argv: Vec<&str> = prefix.iter().chain(args).copied().collect();
-    let mut cmd = bounded::command(bin, &argv).map_err(|e| failed(e.to_string()))?;
+    let mut cmd = bounded::command(bin, &argv).map_err(failed)?;
     environment(&mut cmd);
     let spawned = bounded::spawn(&mut cmd, Role::AnnouncedRequest(enqueued)).map_err(|e| match e {
-        bounded::SpawnError::NotRun(e) => failed(e.to_string()),
+        bounded::SpawnError::NotRun(e) => failed(e),
         bounded::SpawnError::MayHaveRun(e) => in_doubt(e.to_string(), false),
     })?;
     // Past the spawn, `systemctl` is running, and a failure to watch it leaves its request in doubt —
@@ -861,27 +831,22 @@ fn diagnostic(capture: &Capture) -> String {
 ///
 /// `systemctl_tests.rs` covers every shape a capture arrives in; nothing else can, since reaching
 /// this through a real `systemctl` needs one that actually fails.
-fn failed(verb: &str, unit: &str, capture: &Capture) -> Error {
+fn failed(verb: &str, unit: &str, status: ExitStatus, capture: &Capture) -> Error {
     let diagnostic = diagnostic(capture);
     // Ahead of the `complete` branch, not inside the truncated one: both
     // streams can be empty either way, and trailing off after a colon is
     // just as uninformative when the read did finish. Only the *reason* it
     // is empty differs.
-    if diagnostic.is_empty() {
-        let why = if capture.complete {
-            "and wrote no diagnostic"
-        } else {
-            "and no diagnostic was captured before goetia's budget expired"
-        };
-        return Error::Other(format!("systemctl {verb} {unit} failed, {why}"));
-    }
-    if capture.complete {
-        return Error::Other(format!("systemctl {verb} {unit} failed: {diagnostic}"));
-    }
-    Error::Other(format!(
-        "systemctl {verb} {unit} failed: {diagnostic} (goetia's budget expired before it read the \
-         diagnostic to its end, so this may be only a prefix of what systemd wrote)"
-    ))
+    let stderr = match (diagnostic.is_empty(), capture.complete) {
+        (true, true) => String::new(),
+        (true, false) => "no diagnostic was captured before goetia's budget expired".to_string(),
+        (false, true) => diagnostic,
+        (false, false) => format!(
+            "{diagnostic} (goetia's budget expired before it read the diagnostic to its end, so this may be only a \
+             prefix of what systemd wrote)"
+        ),
+    };
+    Error::command(format!("systemctl {verb} {unit}"), status, stderr.as_bytes())
 }
 
 /// A `systemctl` that exited `0`: `Ok` only if systemd answered with a job. One that said it asked
@@ -895,14 +860,10 @@ fn took(verb: &str, unit: &str, capture: &Capture) -> Result<()> {
         return Ok(());
     }
     let diagnostic = diagnostic(capture);
-    let why = if diagnostic.is_empty() {
-        " and said nothing about why".to_string()
-    } else {
-        format!(": {diagnostic}")
-    };
-    Err(Error::Other(format!(
-        "systemctl {verb} {unit} exited 0 without enqueuing a job, so systemd did not act on it{why}"
-    )))
+    Err(Error::NotEnqueued {
+        request: format!("systemctl {verb} {unit}"),
+        diagnostic: (!diagnostic.is_empty()).then_some(diagnostic),
+    })
 }
 
 /// `systemctl start` blocks until its job completes — the real synchronization primitive, no polling
@@ -918,7 +879,7 @@ pub(super) fn start_impl(id: &str, budget: Budget, deadline: Deadline) -> Result
     let unit = super::unit_name(id);
     match run_verb("start", &unit, budget, deadline)? {
         Finished::Exited { status, capture } if status.success() => took("start", &unit, &capture),
-        Finished::Exited { capture, .. } => Err(failed("start", &unit, &capture)),
+        Finished::Exited { status, capture } => Err(failed("start", &unit, status, &capture)),
         Finished::Expired => Err(budget::timed_out(id, "running", budget)),
     }
 }
@@ -931,7 +892,7 @@ pub(super) fn stop_impl(id: &str, budget: Budget, deadline: Deadline) -> Result<
     match run_verb("stop", &unit, budget, deadline)? {
         Finished::Exited { status, capture } if status.success() => took("stop", &unit, &capture),
         Finished::Exited { status, .. } if status.code() == Some(5) => Ok(()),
-        Finished::Exited { capture, .. } => Err(failed("stop", &unit, &capture)),
+        Finished::Exited { status, capture } => Err(failed("stop", &unit, status, &capture)),
         Finished::Expired => Err(budget::timed_out(id, "stopped", budget)),
     }
 }
@@ -968,6 +929,7 @@ pub(super) fn kill_impl(id: &str) -> Result<()> {
     Err(failed(
         "kill",
         &unit,
+        output.status,
         &Capture {
             stdout: output.stdout,
             stderr: output.stderr,
@@ -992,10 +954,11 @@ fn unit_file_verb(verb: &str, id: &str) -> Result<()> {
     if output.status.success() {
         return Ok(());
     }
-    Err(Error::Other(format!(
-        "systemctl {verb} {unit} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    )))
+    Err(Error::command(
+        format!("systemctl {verb} {unit}"),
+        output.status,
+        &output.stderr,
+    ))
 }
 
 /// `systemctl restart --no-block`: one job, where a stop and a separate start leave a window in
@@ -1007,7 +970,7 @@ pub(super) fn request_restart_impl(id: &str) -> Result<()> {
     let unit = super::unit_name(id);
     match run_verb("restart", &unit, Budget::Immediate, Budget::Immediate.start())? {
         Finished::Exited { status, capture } if status.success() => took("restart", &unit, &capture),
-        Finished::Exited { capture, .. } => Err(failed("restart", &unit, &capture)),
+        Finished::Exited { status, capture } => Err(failed("restart", &unit, status, &capture)),
         Finished::Expired => unreachable!("a budget that does not wait never takes the bounded path"),
     }
 }
@@ -1019,10 +982,11 @@ fn show_properties(unit: &str, props: &[&str]) -> Result<BTreeMap<String, String
     let joined = props.join(",");
     let output = systemctl(Purpose::Read, &unit_args(&["show", "--property", &joined], unit))?;
     if !output.status.success() {
-        return Err(Error::Other(format!(
-            "systemctl show {unit} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
+        return Err(Error::command(
+            format!("systemctl show {unit}"),
+            output.status,
+            &output.stderr,
+        ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut map = BTreeMap::new();
@@ -1033,10 +997,10 @@ fn show_properties(unit: &str, props: &[&str]) -> Result<BTreeMap<String, String
     }
     let missing: Vec<&str> = props.iter().copied().filter(|prop| !map.contains_key(*prop)).collect();
     if !missing.is_empty() {
-        return Err(Error::Other(format!(
-            "`systemctl show {unit}` answered without {}, so goetia cannot tell its live state",
-            missing.join(", ")
-        )));
+        return Err(Error::IncompleteAnswer {
+            command: format!("systemctl show {unit}"),
+            missing: missing.into_iter().map(str::to_string).collect(),
+        });
     }
     Ok(map)
 }
@@ -1052,10 +1016,7 @@ fn show_properties(unit: &str, props: &[&str]) -> Result<BTreeMap<String, String
 pub(super) fn status_from_unit(unit: &str) -> Result<Status> {
     let props = show_properties(unit, &["ActiveState", "MainPID", "UnitFileState", "LoadState"])?;
     if props.get("LoadState").map(String::as_str) == Some("not-found") {
-        return Err(Error::Other(format!(
-            "systemd has not loaded the unit file goetia finds installed for `{unit}` (`LoadState=not-found`), so \
-             what it reports is not that unit's state"
-        )));
+        return Err(Error::UnitNotLoaded { unit: unit.to_string() });
     }
     let state = match props.get("ActiveState").map(String::as_str) {
         Some("active") => State::Running,

@@ -666,6 +666,7 @@ fn list_reports_a_deleted_user_as_ours_unusable() {
     let cannot_render = mgr
         .preview_install(&spec)
         .expect_err("a spec naming a deleted user cannot be rendered")
+        .report()
         .to_string();
 
     let listed = mgr
@@ -687,7 +688,7 @@ fn list_reports_a_deleted_user_as_ours_unusable() {
         .status(&Id::try_from(id.clone()).expect("valid id"))
         .expect_err("a spec that cannot be rendered has no status to report");
     assert_eq!(
-        err.to_string(),
+        err.report().to_string(),
         format!("`{id}`'s embedded spec cannot be regenerated: {cannot_render}")
     );
 }
@@ -1142,7 +1143,7 @@ fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout() {
 /// `Budget::Immediate` leaves the job in launchd's `spawn scheduled` /
 /// `xpcproxy` window, which `state::classify`'s catch-all folds into `Unknown` — so a
 /// `restart: always` verification block that runs unconditionally fails here with
-/// `Error::Other("… did not start …")` or a `WaitTimeout`, for a request that was accepted exactly
+/// `Error::NotStarted` or a `WaitTimeout`, for a request that was accepted exactly
 /// as asked. This test is the regression guard for exactly that.
 ///
 /// **No assertion about the resulting state follows**: `Immediate` establishes none, and a

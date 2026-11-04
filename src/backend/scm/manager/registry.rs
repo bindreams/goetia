@@ -41,7 +41,7 @@ fn registry_detail(op: &str, path: &str, source: &std::io::Error) -> String {
 }
 
 fn registry_error(op: &str, path: &str, source: std::io::Error) -> Error {
-    Error::Other(registry_detail(op, path, &source))
+    Error::os(format!(r"{op} HKLM\{path}"), source)
 }
 
 /// The same failure, for a read that was supposed to say whether `name` is
@@ -352,10 +352,6 @@ pub fn register_event_source() -> Result<()> {
 /// `REG_EXPAND_SZ`, and `winreg`'s `set_value` for `&str` writes `REG_SZ`, which nothing would
 /// expand — leaving a message file that never resolves.
 fn event_message_file(system_root: std::result::Result<String, std::env::VarError>) -> Result<String> {
-    let system_root = system_root.map_err(|e| {
-        Error::Other(format!(
-            "register the Goetia event source: SystemRoot is not readable: {e}"
-        ))
-    })?;
+    let system_root = system_root.map_err(|e| Error::os("read SystemRoot to register the Goetia event source", e))?;
     Ok(format!(r"{system_root}\System32\EventCreate.exe"))
 }

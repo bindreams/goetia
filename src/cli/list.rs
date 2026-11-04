@@ -33,7 +33,7 @@ pub fn run(
     match &index {
         Ok(index) => print_text(index, out, err),
         Err(e) => {
-            let _ = writeln!(err, "error: {e}");
+            let _ = writeln!(err, "error: {}", e.report());
         }
     }
 

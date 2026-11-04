@@ -168,7 +168,7 @@ fn dispatch_read_only(args: &[&str], fake: &Fake) -> (i32, String, String) {
 ///   path.
 /// - `unqueryable` models a unit that decodes but whose *live state* cannot
 ///   be read: `list` reports it as `OursUnusable` while `status` fails
-///   with `CommandFailed`, exactly as a real backend does. That asymmetry is
+///   with `Spawn`, exactly as a real backend does. That asymmetry is
 ///   the one the JSON envelope's `unusable` kind exists to close.
 /// - `fail_preview_for` is the "the manager could not even answer whether
 ///   this daemon would change" path — `Fake` itself can never fail
@@ -203,6 +203,12 @@ struct FlakyManager {
     /// failure, and so the only way to reach that re-wrap with a variant
     /// that has to survive it. Also `install --start`'s start leg.
     undetermined_start_for: Option<String>,
+    /// `start` fails with an `Error::Step` over `Error::Undetermined`: an operation that failed
+    /// because a step under it did, where the step's own answer is that the outcome is open.
+    step_over_undetermined_start_for: Option<String>,
+    /// `uninstall` fails with an `Error::Step` over `Error::NotInstalled`: absence, found by a step
+    /// under the operation.
+    step_over_not_installed_uninstall_for: Option<String>,
     /// `enable` fails with `Error::Undetermined` — the `--enable` twin of
     /// `undetermined_start_for`, exercising `install`'s enable step.
     undetermined_enable_for: Option<String>,
@@ -227,9 +233,9 @@ struct FlakyManager {
 /// shape a real backend produces when the tool it shells out to cannot
 /// answer.
 fn unqueryable_failure() -> goetia::Error {
-    goetia::Error::CommandFailed {
+    goetia::Error::Spawn {
         command: "query-live-state".to_string(),
-        stderr: "live state unavailable (injected test failure)".to_string(),
+        source: std::io::Error::other("live state unavailable (injected test failure)").into(),
     }
 }
 
@@ -290,6 +296,12 @@ impl FlakyManager {
         if self.wait_timeout_start_for.as_deref() == Some(id.as_str()) {
             return Err(injected_wait_timeout(id));
         }
+        if self.step_over_undetermined_start_for.as_deref() == Some(id.as_str()) {
+            return Err(goetia::Error::Step {
+                what: "start".to_string(),
+                source: Box::new(injected_indeterminacy(id)),
+            });
+        }
         Ok(())
     }
 }
@@ -323,6 +335,14 @@ impl ServiceManager for FlakyManager {
         self.inner.preview_install(spec)
     }
     fn uninstall(&self, id: &Id) -> goetia::Result<()> {
+        if self.step_over_not_installed_uninstall_for.as_deref() == Some(id.as_str()) {
+            return Err(goetia::Error::Step {
+                what: "uninstall".to_string(),
+                source: Box::new(goetia::Error::NotInstalled {
+                    id: id.as_str().to_string(),
+                }),
+            });
+        }
         self.inner.uninstall(id)
     }
     fn enable(&self, id: &Id) -> goetia::Result<()> {
@@ -1119,6 +1139,22 @@ fn an_absent_id_is_reported_on_stdout_not_stderr() {
     assert_eq!(err, "", "nothing goes to stderr for an absent id: {err}");
     assert!(!out.contains("uninstalled"), "{out}");
     assert!(!err.contains("uninstalled"), "{err}");
+}
+
+/// Absence is what the step failed on, not the step: `uninstall` treats a step over `NotInstalled`
+/// as it treats `NotInstalled`.
+#[skuld::test]
+fn uninstall_exits_zero_for_a_step_over_not_installed() {
+    let mgr = FlakyManager {
+        step_over_not_installed_uninstall_for: Some("frpc".to_string()),
+        ..Default::default()
+    };
+
+    let (code, out, err) = dispatch_with(&["goetia", "daemon", "uninstall", "frpc"], &mgr, &|| true);
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(out, "frpc: not installed (nothing to do)\n");
+    assert_eq!(err, "");
 }
 
 #[skuld::test]
@@ -2388,7 +2424,7 @@ fn status_json_distinguishes_not_installed_foreign_and_unusable() {
 
 /// The disagreement this task exists to close: for a unit that decodes but
 /// whose live state cannot be queried, `list` sees `Installed::OursUnusable`
-/// and `status` sees `Error::CommandFailed`. Both must report `unusable`.
+/// and `status` sees `Error::Spawn`. Both must report `unusable`.
 #[skuld::test]
 fn list_and_status_report_the_same_kind_for_an_unqueryable_daemon() {
     let inner = Fake::new();
@@ -3001,6 +3037,62 @@ fn restart_exits_four_for_an_undetermined_id() {
     );
 }
 
+/// A step over an unanswered question is exit `4`, and its whole chain is printed.
+#[skuld::test]
+fn start_exits_four_for_a_step_over_an_undetermined_error() {
+    let inner = Fake::new();
+    inner.install(&mk("frpc"), false).unwrap();
+    let mgr = FlakyManager {
+        inner,
+        step_over_undetermined_start_for: Some("frpc".to_string()),
+        ..Default::default()
+    };
+
+    let (code, _out, err) = dispatch_with(&["goetia", "daemon", "start", "frpc"], &mgr, &|| true);
+
+    assert_eq!(code, 4, "{err}");
+    assert!(
+        err.contains("start: cannot determine whether daemon `frpc` is installed"),
+        "the step and its cause are one line: {err}"
+    );
+}
+
+/// `status <id>` classifies by what a step failed on, not by the step: over `NotInstalled` it is
+/// `not-installed`, never `unusable`, which claims goetia owns the id.
+#[skuld::test]
+fn status_reports_a_step_over_not_installed_as_not_installed() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_live_status_fails("frpc", || goetia::Error::Step {
+        what: "query the live state".to_string(),
+        source: Box::new(goetia::Error::NotInstalled { id: "frpc".to_string() }),
+    });
+
+    let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "status", "frpc"], &fake);
+
+    assert_eq!(error_kinds(&parse_json(&out)), ["not-installed"], "{out}");
+    assert_eq!(code, 1, "{out}");
+}
+
+/// `list` reads a step over `NotInstalled` as `status` does: the daemon is absent, so it is
+/// skipped, not reported as `unusable` (which claims goetia owns it).
+#[skuld::test]
+fn list_skips_a_step_over_not_installed() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_live_status_fails("frpc", || goetia::Error::Step {
+        what: "query the live state".to_string(),
+        source: Box::new(goetia::Error::NotInstalled { id: "frpc".to_string() }),
+    });
+
+    let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
+
+    let doc = parse_json(&out);
+    assert!(daemons(&doc).is_empty(), "{out}");
+    assert!(errors(&doc).is_empty(), "{out}");
+    assert_eq!(code, 0, "{out}");
+}
+
 /// A wait that ran out is the same *class* as an unanswered question — the code is about whether
 /// the question was answered — but a different condition, so `run_id_verb` needs its own arm.
 /// Without one it falls to the catch-all and reports `1`, which says the start determinately
@@ -3252,8 +3344,8 @@ fn stop_that_times_out_exits_4() {
 }
 
 /// `cli::restart` re-wraps its start leg's error variant by variant. A flattened `WaitTimeout`
-/// becomes `Error::Other` and silently exits `1` — "the start determinately failed", which is the
-/// one thing an expiry did not establish.
+/// would drop the `awaited` and `waited` an expiry carries, and lose the recovery that says the stop
+/// was issued.
 #[skuld::test]
 fn restart_whose_start_leg_times_out_exits_4_not_1() {
     let inner = Fake::new();
@@ -3562,7 +3654,7 @@ fn restart_that_cannot_prepare_sends_nothing() {
         let (code, out, err) = dispatch_elevated(&args, &fake);
 
         assert_eq!(code, 1, "{budget:?}\nstdout:\n{out}\nstderr:\n{err}");
-        assert!(err.contains("nothing could be prepared"), "{err}");
+        assert!(err.contains("so none was sent"), "{err}");
         assert_eq!(fake.calls(), vec![], "{budget:?}: nothing may be sent");
         assert_eq!(
             fake.status(&Id::try_from("frpc").unwrap()).unwrap().state,
@@ -3593,7 +3685,7 @@ fn install_start_that_cannot_prepare_installs_nothing() {
     );
 
     assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
-    assert!(err.contains("nothing could be prepared"), "{err}");
+    assert!(err.contains("so none was sent"), "{err}");
     assert_eq!(fake.calls(), vec![]);
     assert!(
         fake.status(&Id::try_from("frpc").unwrap()).is_err(),

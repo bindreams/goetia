@@ -25,11 +25,7 @@ pub(crate) fn changes_loaded_job(on_disk: &str, desired: &str) -> bool {
 /// The error for a changed plist over a loaded job. Says "loaded", not "running": a job that has
 /// exited is still loaded until it is booted out.
 pub(crate) fn loaded_refusal(id: &Id) -> Error {
-    Error::Other(format!(
-        "`{id}` is loaded in launchd, which cannot update a loaded job, so the changed plist was not \
-         installed and the installed plist is untouched: run `goetia daemon stop {id}` (a job that has \
-         exited is still loaded), re-run install, then start it"
-    ))
+    Error::LoadedJob { id: id.to_string() }
 }
 
 /// The error for a job that is loaded after `install` wrote its plist, though it was not before.
@@ -38,7 +34,7 @@ pub(crate) fn loaded_refusal(id: &Id) -> Error {
 pub(crate) fn loaded_after_write(id: &Id, restore: Result<()>) -> Error {
     Error::LoadedJobInDoubt {
         id: id.to_string(),
-        restore_failed: restore.err().map(|e| e.to_string()),
+        restore_failed: restore.err().map(Box::new),
     }
 }
 
@@ -48,8 +44,8 @@ pub(crate) fn loaded_after_write(id: &Id, restore: Result<()>) -> Error {
 pub(crate) fn state_unknown_after_write(id: &Id, read: &Error, restore: Result<()>) -> Error {
     Error::LoadedStateInDoubt {
         id: id.to_string(),
-        detail: read.to_string(),
-        restore_failed: restore.err().map(|e| e.to_string()),
+        detail: read.report().to_string(),
+        restore_failed: restore.err().map(Box::new),
     }
 }
 
@@ -67,11 +63,10 @@ pub(crate) fn slot_taken_after_bootout(id: &Id, path: &Path, found: &str) -> Err
 /// call but before it sent a request. A second pass would need more calls than `install` reserved, so
 /// the install ends: nothing was sent and no plist written.
 pub(crate) fn changed_during_install(id: &Id, path: &Path) -> Error {
-    Error::Other(format!(
-        "`{id}`: the plist at {} changed while `install` was running, so no plist was written and nothing \
-         was sent to launchd: re-run install",
-        path.display()
-    ))
+    Error::ConcurrentChange {
+        id: id.to_string(),
+        path: Some(path.to_path_buf()),
+    }
 }
 
 #[cfg(test)]
