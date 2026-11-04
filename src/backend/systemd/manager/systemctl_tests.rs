@@ -429,7 +429,7 @@ fn a_reload_in_doubt_after_the_write_stays_in_doubt() {
         matches!(&e, Error::RequestInDoubt { request, reached: false, .. } if request == "systemctl daemon-reload"),
         "{e:?}"
     );
-    let msg = e.to_string();
+    let msg = e.report().to_string();
     assert!(msg.contains("wrote the unit for `x`"), "{msg}");
     assert!(msg.contains("the wait failed"), "{msg}");
 
