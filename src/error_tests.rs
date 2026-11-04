@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::{Error, VersionReading};
+use super::{Error, PutBackFound, VersionReading};
 
 #[skuld::test]
 fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
@@ -103,7 +103,10 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             id: id(),
             paths: [PathBuf::new(), PathBuf::new()],
         },
-        Error::NotStarted { id: id() },
+        Error::NotStarted {
+            id: id(),
+            keep_alive: false,
+        },
         Error::LoadedJob { id: id() },
         Error::PasswordRequired { account: id() },
         Error::UnsupportedManager {
@@ -124,6 +127,11 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             source: std::io::Error::other("x"),
         },
         Error::NotADirectory { path: PathBuf::new() },
+        Error::InvalidPassword { variable: id() },
+        Error::PutBackBlocked {
+            path: PathBuf::new(),
+            found: PutBackFound::Gone,
+        },
     ];
     for e in &settled {
         assert!(!e.is_indeterminate(), "{e:?}");
@@ -252,4 +260,228 @@ fn a_step_over_an_indeterminate_error_is_indeterminate() {
     };
     assert!(step(in_doubt()).is_indeterminate());
     assert!(!step(not_installed()).is_indeterminate());
+}
+
+// Wording of each variant's report ====================================================================================
+
+fn id() -> String {
+    "x".to_string()
+}
+
+#[skuld::test]
+fn report_of_a_concurrent_change_names_where_it_was_read() {
+    assert_eq!(
+        Error::ConcurrentChange { id: id(), path: None }.report().to_string(),
+        "`x` changed after goetia read it, so goetia did nothing further: re-run the command"
+    );
+    assert_eq!(
+        Error::ConcurrentChange {
+            id: id(),
+            path: Some(PathBuf::from("/p"))
+        }
+        .report()
+        .to_string(),
+        "`x` changed after goetia read it at /p, so goetia did nothing further: re-run the command"
+    );
+}
+
+#[skuld::test]
+fn report_of_a_stranded_quarantine() {
+    let e = Error::QuarantineStranded {
+        id: id(),
+        quarantine: PathBuf::from("/q"),
+        occupied: PathBuf::from("/u"),
+    };
+    assert_eq!(
+        e.report().to_string(),
+        "the original fragment of `x` is quarantined at /q, but a different file occupies /u, so it cannot go back: \
+         resolve manually"
+    );
+}
+
+#[skuld::test]
+fn report_of_an_ambiguous_install() {
+    let e = Error::AmbiguousInstall {
+        id: id(),
+        paths: [PathBuf::from("/a"), PathBuf::from("/b")],
+    };
+    assert_eq!(
+        e.report().to_string(),
+        "daemon `x` has a plist in both /a and /b; remove one by hand (they should never both exist) before retrying"
+    );
+}
+
+#[skuld::test]
+fn report_of_a_start_that_left_no_process() {
+    assert_eq!(
+        Error::NotStarted {
+            id: id(),
+            keep_alive: false
+        }
+        .report()
+        .to_string(),
+        "`x` did not start: the manager accepted the start, but no process is running"
+    );
+    assert_eq!(
+        Error::NotStarted {
+            id: id(),
+            keep_alive: true
+        }
+        .report()
+        .to_string(),
+        "`x` did not start: the manager accepted the start, but no process is running, and `restart: always` means \
+         it should have one"
+    );
+}
+
+#[skuld::test]
+fn report_of_a_loaded_job() {
+    assert_eq!(
+        Error::LoadedJob { id: id() }.report().to_string(),
+        "`x` is loaded in launchd, which cannot update a loaded job, so the changed plist was not installed and the \
+         installed plist is untouched: run `goetia daemon stop x` (a job that has exited is still loaded), re-run \
+         install, then start it"
+    );
+}
+
+#[skuld::test]
+fn report_of_a_missing_password() {
+    assert_eq!(
+        Error::PasswordRequired {
+            account: "DOM\\bob".to_string()
+        }
+        .report()
+        .to_string(),
+        "service account `DOM\\bob` needs a password (it is not LocalSystem/LocalService/NetworkService, nor an \
+         `NT SERVICE\\`/`NT AUTHORITY\\` account); set GOETIA_SERVICE_PASSWORD before installing"
+    );
+}
+
+#[skuld::test]
+fn report_of_a_request_that_enqueued_nothing() {
+    let e = |diagnostic: Option<&str>| Error::NotEnqueued {
+        request: "systemctl start x".to_string(),
+        diagnostic: diagnostic.map(str::to_string),
+    };
+    assert_eq!(
+        e(Some("no such unit")).report().to_string(),
+        "`systemctl start x` exited 0 without enqueuing a job, so the manager did not act on it: no such unit"
+    );
+    assert_eq!(
+        e(None).report().to_string(),
+        "`systemctl start x` exited 0 without enqueuing a job, so the manager did not act on it and said nothing \
+         about why"
+    );
+}
+
+#[skuld::test]
+fn report_of_an_incomplete_answer() {
+    let e = Error::IncompleteAnswer {
+        command: "systemctl show x".to_string(),
+        missing: vec!["LoadState".to_string(), "ActiveState".to_string()],
+    };
+    assert_eq!(
+        e.report().to_string(),
+        "`systemctl show x` answered without LoadState, ActiveState, so goetia cannot tell its live state"
+    );
+}
+
+#[skuld::test]
+fn report_of_a_unit_the_manager_has_not_loaded() {
+    assert_eq!(
+        Error::UnitNotLoaded {
+            unit: "x.service".to_string()
+        }
+        .report()
+        .to_string(),
+        "systemd has not loaded the unit file goetia finds installed for `x.service` (`LoadState=not-found`), so what \
+         it reports is not that unit's state"
+    );
+}
+
+#[skuld::test]
+fn report_of_a_reservation_prints_its_cause_once() {
+    let e = |id: Option<&str>| Error::Reservation {
+        id: id.map(str::to_string),
+        source: std::io::Error::other("boom"),
+    };
+    assert_eq!(
+        e(Some("x")).report().to_string(),
+        "`x`: no thread or temp file could be made for a request, so none was sent: boom"
+    );
+    assert_eq!(
+        e(None).report().to_string(),
+        "no thread or temp file could be made for a request, so none was sent: boom"
+    );
+}
+
+#[skuld::test]
+fn report_of_a_path_that_is_not_a_directory() {
+    assert_eq!(
+        Error::NotADirectory {
+            path: PathBuf::from("/p")
+        }
+        .report()
+        .to_string(),
+        "/p already exists and is not a directory; goetia cannot use it as a daemon's cwd or as its log directory"
+    );
+}
+
+#[skuld::test]
+fn report_of_an_invalid_password_variable_has_no_source() {
+    let e = Error::InvalidPassword {
+        variable: "GOETIA_SERVICE_PASSWORD".to_string(),
+    };
+    assert_eq!(
+        e.report().to_string(),
+        "`GOETIA_SERVICE_PASSWORD` is set but its value is not valid Unicode"
+    );
+    assert!(std::error::Error::source(&e).is_none());
+}
+
+#[skuld::test]
+fn report_of_a_blocked_put_back_says_gone_or_replaced() {
+    let e = |found| Error::PutBackBlocked {
+        path: PathBuf::from("/p"),
+        found,
+    };
+    assert_eq!(e(PutBackFound::Gone).report().to_string(), "/p no longer exists");
+    assert_eq!(
+        e(PutBackFound::Replaced).report().to_string(),
+        "/p no longer holds what install wrote"
+    );
+}
+
+#[skuld::test]
+fn report_of_a_loaded_state_in_doubt_prints_each_cause_once() {
+    const OPEN: &str = "`x`'s plist was written, but whether launchd has its job loaded could not be read (read boom), \
+         so goetia cannot tell whether a loaded job holds the old definition or the new one. ";
+    let backed_out = Error::LoadedStateInDoubt {
+        id: id(),
+        detail: "read boom".to_string(),
+        restore_failed: None,
+    };
+    assert_eq!(
+        backed_out.report().to_string(),
+        format!(
+            "{OPEN}The plist is back as it was before this install, so the change is not installed: run `goetia \
+             daemon stop x`, re-run install, then `goetia daemon start x`"
+        )
+    );
+
+    let stuck = Error::LoadedStateInDoubt {
+        id: id(),
+        detail: "read boom".to_string(),
+        restore_failed: Some(Box::new(os("write", "/p", "disk full"))),
+    };
+    let text = stuck.report().to_string();
+    assert_eq!(
+        text,
+        format!(
+            "{OPEN}Check what is on disk, then run `goetia daemon stop x`, re-run install, then `goetia daemon start \
+             x`. The plist could not be put back as it was before this install: failed to write /p: disk full"
+        )
+    );
+    assert_eq!(text.matches("disk full").count(), 1, "{text}");
+    assert_eq!(text.matches("read boom").count(), 1, "{text}");
 }

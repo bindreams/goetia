@@ -80,7 +80,7 @@ fn run_service(id: &str) {
             );
         }
         Err(e) => {
-            logging::log_failure(id, &format!("decode metadata blob: {e}"));
+            logging::log_failure(id, &format!("decode metadata blob: {}", e.report()));
             finish(
                 id,
                 status_handle,

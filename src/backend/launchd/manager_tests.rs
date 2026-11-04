@@ -94,7 +94,7 @@ fn undo_write_puts_the_previous_plist_over_what_install_wrote() {
     let wrote = previous.replace("/bin/true", "/bin/false");
     std::fs::write(&target, &wrote).unwrap();
 
-    undo_write(&Id::try_from("id").unwrap(), &target, &wrote, Some(&previous)).expect("undo over what install wrote");
+    undo_write(&target, &wrote, Some(&previous)).expect("undo over what install wrote");
 
     assert_eq!(std::fs::read_to_string(&target).unwrap(), previous);
 }
@@ -107,7 +107,7 @@ fn undo_write_removes_a_plist_that_install_created() {
     let wrote = sample_plist("id");
     std::fs::write(&target, &wrote).unwrap();
 
-    undo_write(&Id::try_from("id").unwrap(), &target, &wrote, None).expect("undo of a create");
+    undo_write(&target, &wrote, None).expect("undo of a create");
 
     assert!(!target.exists());
 }
@@ -122,9 +122,17 @@ fn undo_write_leaves_a_plist_that_is_no_longer_what_install_wrote() {
     std::fs::write(&target, "someone else's plist\n").unwrap();
 
     for previous in [Some(wrote.as_str()), None] {
-        let err =
-            undo_write(&Id::try_from("id").unwrap(), &target, &wrote, previous).expect_err("not what install wrote");
-        assert!(matches!(err, Error::ConcurrentChange { .. }), "{err:?}");
+        let err = undo_write(&target, &wrote, previous).expect_err("not what install wrote");
+        assert!(
+            matches!(
+                err,
+                Error::PutBackBlocked {
+                    found: PutBackFound::Replaced,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
         assert!(err.to_string().contains(&target.display().to_string()), "{err}");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "someone else's plist\n");
     }
@@ -139,8 +147,17 @@ fn undo_write_does_not_recreate_a_plist_that_is_gone() {
     let wrote = sample_plist("id");
 
     for previous in [Some(wrote.as_str()), None] {
-        let err = undo_write(&Id::try_from("id").unwrap(), &target, &wrote, previous).expect_err("nothing there");
-        assert!(matches!(err, Error::ConcurrentChange { .. }), "{err:?}");
+        let err = undo_write(&target, &wrote, previous).expect_err("nothing there");
+        assert!(
+            matches!(
+                err,
+                Error::PutBackBlocked {
+                    found: PutBackFound::Gone,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
         assert!(!target.exists(), "the put-back recreated the plist");
     }
 }
@@ -1683,7 +1700,16 @@ fn a_put_back_does_not_overwrite_a_plist_that_is_no_longer_ours() {
 
     let (e, _) = install_loaded_after_write(&mgr, &name, &format!("echo 'someone else' > '{}'", target.display()));
 
-    assert!(matches!(restore_failure_of(&e), Error::ConcurrentChange { .. }), "{e}");
+    assert!(
+        matches!(
+            restore_failure_of(&e),
+            Error::PutBackBlocked {
+                found: PutBackFound::Replaced,
+                ..
+            }
+        ),
+        "{e}"
+    );
     assert!(e.report().to_string().contains(&target.display().to_string()), "{e}");
     assert!(!e.to_string().contains("plist is back as it was"), "{e}");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "someone else\n");
@@ -1704,7 +1730,16 @@ fn a_put_back_does_not_recreate_a_plist_that_was_enabled_meanwhile() {
     );
     let (e, changed) = install_loaded_after_write(&mgr, &name, &during);
 
-    assert!(matches!(restore_failure_of(&e), Error::ConcurrentChange { .. }), "{e}");
+    assert!(
+        matches!(
+            restore_failure_of(&e),
+            Error::PutBackBlocked {
+                found: PutBackFound::Gone,
+                ..
+            }
+        ),
+        "{e}"
+    );
     assert!(!staging_path(&name).exists(), "the put-back recreated the staged plist");
     assert_eq!(std::fs::read_to_string(enabled_path(&name)).unwrap(), changed);
 }
@@ -1719,7 +1754,16 @@ fn a_put_back_does_not_resurrect_a_plist_that_was_uninstalled_meanwhile() {
 
     let (e, _) = install_loaded_after_write(&mgr, &name, &format!("rm '{}'", staging_path(&name).display()));
 
-    assert!(matches!(restore_failure_of(&e), Error::ConcurrentChange { .. }), "{e}");
+    assert!(
+        matches!(
+            restore_failure_of(&e),
+            Error::PutBackBlocked {
+                found: PutBackFound::Gone,
+                ..
+            }
+        ),
+        "{e}"
+    );
     assert!(!staging_path(&name).exists(), "the put-back resurrected the plist");
 }
 

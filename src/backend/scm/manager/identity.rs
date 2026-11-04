@@ -81,10 +81,9 @@ fn parse_password_var(var: std::result::Result<String, std::env::VarError>) -> R
         Ok(v) => Ok(Some(v)),
         Err(std::env::VarError::NotPresent) => Ok(None),
         // The `VarError` is not the source: its `Display` quotes the value, which is the password.
-        Err(std::env::VarError::NotUnicode(_)) => Err(Error::os(
-            "read GOETIA_SERVICE_PASSWORD",
-            std::io::Error::other("the variable is set but its value is not valid Unicode"),
-        )),
+        Err(std::env::VarError::NotUnicode(_)) => Err(Error::InvalidPassword {
+            variable: "GOETIA_SERVICE_PASSWORD".to_string(),
+        }),
     }
 }
 
@@ -112,7 +111,7 @@ fn account_name_from_sid_string(sid_str: &str) -> Result<String> {
     // valid out-param. On success, `psid` must be freed with `LocalFree`.
     let ok = unsafe { ConvertStringSidToSidW(wide_sid.as_ptr(), &mut psid) };
     if ok == 0 {
-        return Err(last_error(&format!("user.id `{sid_str}` is not a valid SID string")));
+        return Err(last_error(&format!("parse `user.id` `{sid_str}` as a SID string")));
     }
     let result = lookup_account_sid(psid, sid_str);
     // SAFETY: `psid` was allocated by `ConvertStringSidToSidW` above and is

@@ -72,7 +72,7 @@ use crate::backend::{
 };
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
-use crate::error::{Error, Result};
+use crate::error::{Error, PutBackFound, Result};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, Installed, Prepared, State, Status, Step, flow};
 use crate::spec::{AccountId, DaemonSpec, Id, Restart, User};
@@ -682,20 +682,19 @@ fn still_present(target: &Path) -> Result<bool> {
 /// `enable` or `uninstall` moved or removed it, or a concurrent install wrote after ours, and a write
 /// here would put a plist in both directories, resurrect a removed one, or destroy the other's.
 /// The `Err` says what is on disk.
-fn undo_write(id: &Id, target: &Path, wrote: &str, previous: Option<&str>) -> Result<()> {
-    let changed = || Error::ConcurrentChange {
-        id: id.to_string(),
-        path: Some(target.to_path_buf()),
+fn undo_write(target: &Path, wrote: &str, previous: Option<&str>) -> Result<()> {
+    let blocked = |found| Error::PutBackBlocked {
+        path: target.to_path_buf(),
+        found,
     };
     if !still_present(target)? {
-        return Err(changed());
+        return Err(blocked(PutBackFound::Gone));
     }
     match fs::read_to_string(target) {
         Ok(on_disk) if on_disk == wrote => {}
-        Ok(_) => return Err(changed()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound || e.kind() == io::ErrorKind::InvalidData => {
-            return Err(changed());
-        }
+        Ok(_) => return Err(blocked(PutBackFound::Replaced)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(blocked(PutBackFound::Gone)),
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => return Err(blocked(PutBackFound::Replaced)),
         Err(e) => return Err(Error::os_at("read", target, e)),
     }
     let undone = match previous {
@@ -1156,11 +1155,11 @@ fn classified(ran: &Ran) -> (State, Option<u32>) {
 fn recheck_after_write(id: &Id, deadline: Deadline, target: &Path, wrote: &str, previous: Option<&str>) -> Result<()> {
     match is_loaded(id.as_str(), deadline) {
         Ok(loaded) if !never_expires(loaded) => Ok(()),
-        Ok(_) => Err(refuse::loaded_after_write(id, undo_write(id, target, wrote, previous))),
+        Ok(_) => Err(refuse::loaded_after_write(id, undo_write(target, wrote, previous))),
         Err(read) => Err(refuse::state_unknown_after_write(
             id,
             &read,
-            undo_write(id, target, wrote, previous),
+            undo_write(target, wrote, previous),
         )),
     }
 }
@@ -1416,7 +1415,10 @@ impl backend::Backend for Launchd {
                         return Err(if deadline.expired() {
                             timed_out()
                         } else {
-                            Error::NotStarted { id: id.to_string() }
+                            Error::NotStarted {
+                                id: id.to_string(),
+                                keep_alive: false,
+                            }
                         });
                     }
                 }
@@ -1473,7 +1475,10 @@ impl backend::Backend for Launchd {
                 if deadline.expired() {
                     return Err(timed_out());
                 }
-                return Err(Error::NotStarted { id: id.to_string() });
+                return Err(Error::NotStarted {
+                    id: id.to_string(),
+                    keep_alive: true,
+                });
             }
         }
         Ok(())

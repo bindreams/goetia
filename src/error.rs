@@ -85,9 +85,13 @@ pub enum Error {
     AmbiguousInstall { id: String, paths: [PathBuf; 2] },
 
     /// The manager accepted a start, and goetia established that no process runs, before the
-    /// deadline. Determinate, unlike [`WaitTimeout`](Error::WaitTimeout).
-    #[error("`{id}` did not start: the manager accepted the start, but no process is running")]
-    NotStarted { id: String },
+    /// deadline. Determinate, unlike [`WaitTimeout`](Error::WaitTimeout). `keep_alive` is whether
+    /// the daemon is `restart: always`, for which a missing process is abnormal.
+    #[error(
+        "`{id}` did not start: the manager accepted the start, but no process is running{}",
+        keep_alive_note(*keep_alive)
+    )]
+    NotStarted { id: String, keep_alive: bool },
 
     /// launchd cannot update a loaded job, so the changed definition was not installed.
     #[error(
@@ -96,6 +100,16 @@ pub enum Error {
          re-run install, then start it"
     )]
     LoadedJob { id: String },
+
+    /// `install`'s put-back of a plist found `found` at `path` instead of the plist `install` wrote,
+    /// so it left the path alone. launchd only; it is the `restore_failed` of the in-doubt variants.
+    #[error("{} {}", path.display(), put_back_found(*found))]
+    PutBackBlocked { path: PathBuf, found: PutBackFound },
+
+    /// An environment variable holds a value goetia cannot read as text, and no OS call failed. The
+    /// value is never kept, because it is a password.
+    #[error("`{variable}` is set but its value is not valid Unicode")]
+    InvalidPassword { variable: String },
 
     /// A real account needs a password that was not given.
     #[error(
@@ -440,6 +454,8 @@ impl Error {
             | Error::AmbiguousInstall { .. }
             | Error::NotStarted { .. }
             | Error::LoadedJob { .. }
+            | Error::PutBackBlocked { .. }
+            | Error::InvalidPassword { .. }
             | Error::PasswordRequired { .. }
             | Error::UnsupportedManager { .. }
             | Error::NotEnqueued { .. }
@@ -541,6 +557,32 @@ fn write_chain(e: &(dyn std::error::Error + 'static), f: &mut fmt::Formatter<'_>
         write_chain(source, f)?;
     }
     Ok(())
+}
+
+/// What `install`'s put-back found at the plist's path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutBackFound {
+    /// Nothing: the plist was removed or moved.
+    Gone,
+    /// A plist other than the one `install` wrote.
+    Replaced,
+}
+
+/// [`Error::PutBackBlocked`]'s predicate.
+fn put_back_found(found: PutBackFound) -> &'static str {
+    match found {
+        PutBackFound::Gone => "no longer exists",
+        PutBackFound::Replaced => "no longer holds what install wrote",
+    }
+}
+
+/// [`Error::NotStarted`]'s tail for a `restart: always` daemon, or nothing.
+fn keep_alive_note(keep_alive: bool) -> &'static str {
+    if keep_alive {
+        ", and `restart: always` means it should have one"
+    } else {
+        ""
+    }
 }
 
 /// What a version source reported, kept as the source gave it.
