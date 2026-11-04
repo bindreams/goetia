@@ -65,7 +65,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{fs, io};
 
-use crate::backend::bounded::{self, Reaper, Role};
+use crate::backend::bounded::{self, Finished, Reaper, Role};
+use crate::backend::client::{Client, ClientError, Real, Wait};
 use crate::backend::launchd::{generate, refuse, state};
 use crate::backend::{
     self, Identity, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
@@ -88,11 +89,15 @@ pub const STAGING_DIR: &str = "/Library/Application Support/Goetia/daemons";
 /// whole backend is built around.
 pub const ENABLED_DIR: &str = "/Library/LaunchDaemons";
 
-pub struct Launchd;
+pub struct Launchd {
+    launchctl: Launchctl,
+}
 
 impl Launchd {
     pub fn new() -> Self {
-        Self
+        Self {
+            launchctl: Launchctl::new(Box::new(Real::new(vec!["launchctl".to_string()], |_| {}))),
+        }
     }
 }
 
@@ -761,7 +766,7 @@ fn move_no_clobber(src: &Path, dest: &Path) -> Result<()> {
 // launchctl ===========================================================================================================
 
 /// Spawn `command` with `args` — a tool other than `launchctl`, which goes
-/// through [`launchctl`] — giving back the full `Output`. Only the spawn
+/// through [`Launchctl`] — giving back the full `Output`. Only the spawn
 /// failure — the process could not be started at all — is an `Err` here; a
 /// non-zero exit is reported through the returned `Output`.
 fn run(command: &str, args: &[&str]) -> Result<std::process::Output> {
@@ -787,107 +792,33 @@ fn require_success(command: &str, args: &[&str]) -> Result<()> {
     }
 }
 
-/// What one bounded `launchctl` invocation produced.
-struct Ran {
-    status: std::process::ExitStatus,
-    capture: bounded::Capture,
-}
-
-/// `launchctl` with `args`, spawned and waited under `deadline` in `role`.
-///
-/// **Every** `launchctl` call the budgeted verbs make goes through here
-/// (D6a), and `role` is what keeps the budget from deciding whether a
-/// request is sent: a [`Role::Request`] that expires is left running, never
-/// killed, since `launchctl` never says when launchd has the request. Its
-/// [`Reaper`] was made before the verb sent anything — see [`reapers`] — and
-/// so were the temp files its output goes to — see [`files`].
-///
-/// `Ok(None)` iff the deadline expired first. For a request that is not a
-/// failure of the command — the request is out, or on its way in a
-/// `launchctl` goetia left running — and what it means differs per verb, so
-/// the verb decides rather than this function. A failure before `launchctl`
-/// ran is an [`Error::Spawn`]. One after it may
-/// have — cosca failing past `exec`, or the wait failing — is the same for a
-/// read, and [`Error::RequestInDoubt`] for a request, which may have reached
-/// launchd.
-fn launchctl(args: &[&str], deadline: Deadline, role: Role) -> Result<Option<Ran>> {
-    let failed = |e: cosca::error::Error| Error::spawn(format!("launchctl {}", args.join(" ")), e);
-    // A request whose `launchctl` may have started is in doubt, not failed: it may have reached
-    // launchd. A read changes nothing either way.
-    let request = matches!(role, Role::Request(_));
-    let in_doubt = |e: cosca::error::Error| {
-        if request {
-            Error::RequestInDoubt {
-                request: format!("launchctl {}", args.join(" ")),
-                // `launchctl` never says when launchd has it.
-                reached: false,
-                detail: e.to_string(),
-            }
-        } else {
-            failed(e)
+/// The failure of a `launchctl` call that did not complete: a [`Error::RequestInDoubt`] for a
+/// `request` whose `launchctl` may have started, an [`Error::Spawn`] for anything else.
+fn failed(args: &[&str], request: bool, error: ClientError) -> Error {
+    let command = format!("launchctl {}", args.join(" "));
+    let (source, may_have_run) = match error {
+        ClientError::NotRun(source) => (source, false),
+        ClientError::MayHaveRun(source) => (source, true),
+        ClientError::Lost { error, announced } => {
+            debug_assert!(!announced, "launchd sends no announced requests");
+            (error, true)
         }
     };
-    #[cfg(not(test))]
-    let mut cmd = bounded::command("launchctl", args).map_err(failed)?;
-    #[cfg(test)]
-    let mut cmd = launchctl_stand_in::command(args).map_err(failed)?;
-    let spawned = bounded::spawn(&mut cmd, role).map_err(|e| match e {
-        bounded::SpawnError::NotRun(e) => failed(e),
-        bounded::SpawnError::MayHaveRun(e) => in_doubt(e),
-    })?;
-    Ok(
-        match bounded::wait_bounded(spawned, deadline).map_err(|lost| in_doubt(lost.error))? {
-            bounded::Finished::Exited { status, capture } => Some(Ran { status, capture }),
-            bounded::Finished::Expired => None,
-        },
-    )
-}
-
-/// A stand-in for `launchctl` on this thread: a shell script run as `sh -c <script> launchctl
-/// <args>`, so that a test can drive every verb down every path without a real launchd. Never a
-/// file on disk — `exec`ing one just written races every `fork` another test thread makes.
-#[cfg(test)]
-pub(super) mod launchctl_stand_in {
-    use std::cell::RefCell;
-
-    use crate::backend::bounded;
-
-    thread_local! {
-        static SCRIPT: RefCell<Option<String>> = const { RefCell::new(None) };
-    }
-
-    /// Run `script` in place of `launchctl` on this thread until the returned guard drops.
-    pub(in crate::backend::launchd) fn set(script: String) -> Guard {
-        SCRIPT.set(Some(script));
-        Guard(())
-    }
-
-    /// See [`set`].
-    pub(in crate::backend::launchd) struct Guard(());
-
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            SCRIPT.set(None);
+    if request && may_have_run {
+        Error::RequestInDoubt {
+            request: command,
+            // `launchctl` never says when launchd has it.
+            reached: false,
+            detail: source.to_string(),
         }
-    }
-
-    pub(super) fn command(args: &[&str]) -> Result<cosca::Command, cosca::error::Error> {
-        match SCRIPT.with_borrow(Clone::clone) {
-            Some(script) => {
-                let argv: Vec<&str> = ["-c", script.as_str(), "launchctl"]
-                    .into_iter()
-                    .chain(args.iter().copied())
-                    .collect();
-                bounded::command("/bin/sh", &argv)
-            }
-            None => bounded::command("launchctl", args),
-        }
+    } else {
+        Error::spawn(command, source)
     }
 }
 
 /// The failure for a `launchctl` call that ran and exited non-zero.
-fn command_failed(args: &[&str], ran: &Ran) -> Error {
-    Error::command(format!("launchctl {}", args.join(" ")), ran.status, &ran.capture.stderr)
+fn command_failed(args: &[&str], status: std::process::ExitStatus, stderr: &[u8]) -> Error {
+    Error::command(format!("launchctl {}", args.join(" ")), status, stderr)
 }
 
 /// The one [`Deadline`] a budgeted verb derives, first thing at entry —
@@ -917,41 +848,6 @@ fn never_expires<T>(step: Option<T>) -> T {
     step.expect("this call passed an unbounded deadline, which never expires")
 }
 
-/// Whether launchd has `id` loaded. `Ok(None)` iff `deadline` expired.
-///
-/// Only success and the not-found codes in [`is_not_found`] answer the question; any other failure is
-/// an `Err`, since callers act on "not loaded" by writing or bootstrapping.
-fn is_loaded(id: &str, deadline: Deadline) -> Result<Option<bool>> {
-    // Not "structured data" parsing (see the module doc comment): this only
-    // ever looks at the exit code, never the body of `print`'s output.
-    let target = target(id);
-    let args = ["print", target.as_str()];
-    let Some(ran) = launchctl(&args, deadline, Role::Query)? else {
-        return Ok(None);
-    };
-    if ran.status.success() {
-        Ok(Some(true))
-    } else if is_not_found(ran.status.code()) {
-        Ok(Some(false))
-    } else {
-        Err(command_failed(&args, &ran))
-    }
-}
-
-/// `Ok(None)` iff `deadline` expired.
-fn bootstrap(path: &Path, deadline: Deadline, reaper: Reaper) -> Result<Option<()>> {
-    let path_str = path.to_str().expect("plist path is UTF-8 (see generate::path_str)");
-    let args = ["bootstrap", "system", path_str];
-    let Some(ran) = launchctl(&args, deadline, Role::Request(reaper))? else {
-        return Ok(None);
-    };
-    if ran.status.success() {
-        Ok(Some(()))
-    } else {
-        Err(command_failed(&args, &ran))
-    }
-}
-
 /// What a `kickstart` established about the job.
 enum Kickstarted {
     /// launchd forked the job and named a pid on a capture that was whole.
@@ -966,51 +862,6 @@ enum Kickstarted {
     NoPid,
 }
 
-/// `launchctl kickstart` for `id`, under `deadline`. `Ok(None)` iff the
-/// deadline expired.
-///
-/// **Never `-k`.** It force-restarts the job and blocks ~10.02s on launchd's
-/// respawn throttle, every single time — it is the obvious wrong reach
-/// here, and restarting a running job is not what `start` means.
-///
-/// `budget.waits()` picks the form. A budget that waits uses **`-p`**, which
-/// returns only once launchd has forked the job and assigned it a pid, and
-/// writes that bare decimal pid on stdout. That is launchd's complete
-/// answer — there is nothing further to subscribe to — so a pid parsed
-/// out of a successful `-p` *is* the confirmation, and no follow-up `print`
-/// is needed or wanted. A budget that does not wait uses the plain form,
-/// which only requests the spawn.
-fn kickstart(id: &str, budget: Budget, deadline: Deadline, reaper: Reaper) -> Result<Option<Kickstarted>> {
-    let target = target(id);
-    let args: Vec<&str> = if budget.waits() {
-        vec!["kickstart", "-p", &target]
-    } else {
-        vec!["kickstart", &target]
-    };
-    let Some(ran) = launchctl(&args, deadline, Role::Request(reaper))? else {
-        return Ok(None);
-    };
-    if !ran.status.success() {
-        return Err(command_failed(&args, &ran));
-    }
-    // The pid is read only from a COMPLETE capture. A partial read turns
-    // `"4766\n"` into `"47"`, which parses — a *wrong* pid, quite possibly
-    // live and someone else's, handed back as the confirmation. `launchctl`
-    // writes to files read once it has exited, so a capture that reached
-    // here is whole; this guard, and `state::kickstart_pid`'s own (it
-    // requires the whole `<digits>\n` line), keep a partial one from ever
-    // becoming a confident answer.
-    let pid = ran
-        .capture
-        .complete
-        .then(|| state::kickstart_pid(&String::from_utf8_lossy(&ran.capture.stdout)))
-        .flatten();
-    Ok(Some(match pid {
-        Some(_) => Kickstarted::Confirmed,
-        None => Kickstarted::NoPid,
-    }))
-}
-
 /// Exit codes `launchctl` uses for "no such job" — established empirically
 /// in `tests/support/service_guard.rs`'s cleanup, which needs the same
 /// distinction for the same underlying label lookup `bootout`/`print`
@@ -1020,44 +871,186 @@ fn is_not_found(code: Option<i32>) -> bool {
     matches!(code, Some(3 | 113))
 }
 
-/// `bootout`, unconditionally — no `is_loaded` pre-check. A separate check
-/// then act would leave a window for the job to unload between the two
-/// (a concurrent `stop`, an operator's own `launchctl bootout`, ...), which
-/// would fail this call for a service that is, in fact, already stopped —
-/// breaking the idempotency [`ServiceManager::stop`] declares mandatory.
-/// Calling `bootout` directly and classifying *its own* result — success,
-/// or the "no such job" codes [`is_not_found`] names, both `Ok` — covers
-/// the already-gone case by construction instead of by timing.
-///
-/// [`ServiceManager::stop`]: crate::manager::ServiceManager::stop
-fn bootout(id: &str, deadline: Deadline, reaper: Reaper) -> Result<Option<()>> {
-    let target = target(id);
-    let args = ["bootout", target.as_str()];
-    let Some(ran) = launchctl(&args, deadline, Role::Request(reaper))? else {
-        return Ok(None);
-    };
-    if ran.status.success() || is_not_found(ran.status.code()) {
-        Ok(Some(()))
-    } else {
-        Err(command_failed(&args, &ran))
-    }
+/// `launchctl`, reached through a [`Client`]. Every call the verbs make goes through [`Launchctl::run`].
+struct Launchctl {
+    client: Box<dyn Client>,
 }
 
-/// `launchctl kill SIGKILL` on the job, never a pid; what happens next is the plist's `KeepAlive`.
-/// Exit 113 (not loaded) and 3 (loaded, no process) are both [`Error::NotRunning`], the codes
-/// [`is_not_found`] already names. `Ok(None)` iff the deadline expired.
-fn kill_job(id: &str, deadline: Deadline, reaper: Reaper) -> Result<Option<()>> {
-    let target = target(id);
-    let args = ["kill", "SIGKILL", target.as_str()];
-    let Some(ran) = launchctl(&args, deadline, Role::Request(reaper))? else {
-        return Ok(None);
-    };
-    if ran.status.success() {
-        Ok(Some(()))
-    } else if is_not_found(ran.status.code()) {
-        Err(Error::NotRunning { id: id.to_string() })
-    } else {
-        Err(command_failed(&args, &ran))
+impl Launchctl {
+    fn new(client: Box<dyn Client>) -> Launchctl {
+        Launchctl { client }
+    }
+
+    /// `launchctl` with `args`, spawned and waited under `deadline` in `role`.
+    ///
+    /// **Every** `launchctl` call the budgeted verbs make goes through here,
+    /// and `role` is what keeps the budget from deciding whether a
+    /// request is sent: a [`Role::Request`] that expires is left running, never
+    /// killed, since `launchctl` never says when launchd has the request. Its
+    /// [`Reaper`] was made before the verb sent anything — see [`reapers`] — and
+    /// so were the temp files its output goes to — see [`files`].
+    ///
+    /// [`Finished::Expired`] iff the deadline expired first. For a request that is not a
+    /// failure of the command — the request is out, or on its way in a
+    /// `launchctl` goetia left running — and what it means differs per verb, so
+    /// the verb decides rather than this function. A failure before `launchctl`
+    /// ran is an [`Error::Spawn`]. One after it may
+    /// have — cosca failing past `exec`, or the wait failing — is the same for a
+    /// read, and [`Error::RequestInDoubt`] for a request, which may have reached
+    /// launchd.
+    fn run(&self, args: &[&str], deadline: Deadline, role: Role) -> Result<Finished> {
+        // A request whose `launchctl` may have started is in doubt, not failed: it may have reached
+        // launchd. A read changes nothing either way.
+        let request = match role {
+            Role::Query | Role::UncountedQuery => false,
+            Role::Request(_) => true,
+            Role::AnnouncedRequest(_) => unreachable!("launchd sends no announced requests"),
+        };
+        self.client
+            .run(args, Wait::Bounded { role, deadline })
+            .map_err(|error| failed(args, request, error))
+    }
+
+    /// Whether launchd has `id` loaded. `Ok(None)` iff `deadline` expired.
+    ///
+    /// Only success and the not-found codes in [`is_not_found`] answer the question; any other failure is
+    /// an `Err`, since callers act on "not loaded" by writing or bootstrapping.
+    fn is_loaded(&self, id: &str, deadline: Deadline) -> Result<Option<bool>> {
+        // Not "structured data" parsing (see the module doc comment): this only
+        // ever looks at the exit code, never the body of `print`'s output.
+        let target = target(id);
+        let args = ["print", target.as_str()];
+        let Finished::Exited { status, capture } = self.run(&args, deadline, Role::Query)? else {
+            return Ok(None);
+        };
+        if status.success() {
+            Ok(Some(true))
+        } else if is_not_found(status.code()) {
+            Ok(Some(false))
+        } else {
+            Err(command_failed(&args, status, &capture.stderr))
+        }
+    }
+
+    /// `Ok(None)` iff `deadline` expired.
+    fn bootstrap(&self, path: &Path, deadline: Deadline, reaper: Reaper) -> Result<Option<()>> {
+        let path_str = path.to_str().expect("plist path is UTF-8 (see generate::path_str)");
+        let args = ["bootstrap", "system", path_str];
+        let Finished::Exited { status, capture } = self.run(&args, deadline, Role::Request(reaper))? else {
+            return Ok(None);
+        };
+        if status.success() {
+            Ok(Some(()))
+        } else {
+            Err(command_failed(&args, status, &capture.stderr))
+        }
+    }
+
+    /// `launchctl kickstart` for `id`, under `deadline`. `Ok(None)` iff the
+    /// deadline expired.
+    ///
+    /// **Never `-k`.** It force-restarts the job and blocks ~10.02s on launchd's
+    /// respawn throttle, every single time — it is the obvious wrong reach
+    /// here, and restarting a running job is not what `start` means.
+    ///
+    /// `budget.waits()` picks the form. A budget that waits uses **`-p`**, which
+    /// returns only once launchd has forked the job and assigned it a pid, and
+    /// writes that bare decimal pid on stdout. That is launchd's complete
+    /// answer — there is nothing further to subscribe to — so a pid parsed
+    /// out of a successful `-p` *is* the confirmation, and no follow-up `print`
+    /// is needed or wanted. A budget that does not wait uses the plain form,
+    /// which only requests the spawn.
+    fn kickstart(&self, id: &str, budget: Budget, deadline: Deadline, reaper: Reaper) -> Result<Option<Kickstarted>> {
+        let target = target(id);
+        let args: Vec<&str> = if budget.waits() {
+            vec!["kickstart", "-p", &target]
+        } else {
+            vec!["kickstart", &target]
+        };
+        let Finished::Exited { status, capture } = self.run(&args, deadline, Role::Request(reaper))? else {
+            return Ok(None);
+        };
+        if !status.success() {
+            return Err(command_failed(&args, status, &capture.stderr));
+        }
+        // The pid is read only from a COMPLETE capture. A partial read turns
+        // `"4766\n"` into `"47"`, which parses — a *wrong* pid, quite possibly
+        // live and someone else's, handed back as the confirmation. `launchctl`
+        // writes to files read once it has exited, so a capture that reached
+        // here is whole; this guard, and `state::kickstart_pid`'s own (it
+        // requires the whole `<digits>\n` line), keep a partial one from ever
+        // becoming a confident answer.
+        let pid = capture
+            .complete
+            .then(|| state::kickstart_pid(&String::from_utf8_lossy(&capture.stdout)))
+            .flatten();
+        Ok(Some(match pid {
+            Some(_) => Kickstarted::Confirmed,
+            None => Kickstarted::NoPid,
+        }))
+    }
+
+    /// `bootout`, unconditionally — no `is_loaded` pre-check. A separate check
+    /// then act would leave a window for the job to unload between the two
+    /// (a concurrent `stop`, an operator's own `launchctl bootout`, ...), which
+    /// would fail this call for a service that is, in fact, already stopped —
+    /// breaking the idempotency [`ServiceManager::stop`] declares mandatory.
+    /// Calling `bootout` directly and classifying *its own* result — success,
+    /// or the "no such job" codes [`is_not_found`] names, both `Ok` — covers
+    /// the already-gone case by construction instead of by timing.
+    ///
+    /// [`ServiceManager::stop`]: crate::manager::ServiceManager::stop
+    fn bootout(&self, id: &str, deadline: Deadline, reaper: Reaper) -> Result<Option<()>> {
+        let target = target(id);
+        let args = ["bootout", target.as_str()];
+        let Finished::Exited { status, capture } = self.run(&args, deadline, Role::Request(reaper))? else {
+            return Ok(None);
+        };
+        if status.success() || is_not_found(status.code()) {
+            Ok(Some(()))
+        } else {
+            Err(command_failed(&args, status, &capture.stderr))
+        }
+    }
+
+    /// `launchctl kill SIGKILL` on the job, never a pid; what happens next is the plist's `KeepAlive`.
+    /// Exit 113 (not loaded) and 3 (loaded, no process) are both [`Error::NotRunning`], the codes
+    /// [`is_not_found`] already names. `Ok(None)` iff the deadline expired.
+    fn kill_job(&self, id: &str, deadline: Deadline, reaper: Reaper) -> Result<Option<()>> {
+        let target = target(id);
+        let args = ["kill", "SIGKILL", target.as_str()];
+        let Finished::Exited { status, capture } = self.run(&args, deadline, Role::Request(reaper))? else {
+            return Ok(None);
+        };
+        if status.success() {
+            Ok(Some(()))
+        } else if is_not_found(status.code()) {
+            Err(Error::NotRunning { id: id.to_string() })
+        } else {
+            Err(command_failed(&args, status, &capture.stderr))
+        }
+    }
+
+    /// Live state, read from `launchctl print`'s body — the one place this
+    /// backend does read it, since there is no filesystem signal for "is this
+    /// job currently running" (see the module doc comment). Output in a shape
+    /// this does not recognize degrades to `(State::Unknown, None)`; `Err` iff
+    /// `launchctl` could not be run at all, which `start` must not mistake for a
+    /// job that is not running: it would act on it.
+    fn live_state(&self, id: &str, deadline: Deadline) -> Result<(State, Option<u32>)> {
+        self.read_live_state(id, deadline, Role::Query)
+    }
+
+    /// [`Self::live_state`], read as `role`.
+    fn read_live_state(&self, id: &str, deadline: Deadline, role: Role) -> Result<(State, Option<u32>)> {
+        // An expiry degrades to `Unknown`, as a capture that is not whole would:
+        // a state this did not fully read is a state it does not know. The two
+        // budgeted verbs check the deadline themselves wherever an `Unknown`
+        // would otherwise become a wrong error.
+        let Finished::Exited { status, capture } = self.run(&["print", &target(id)], deadline, role)? else {
+            return Ok((State::Unknown, None));
+        };
+        Ok(classified(status, &capture))
     }
 }
 
@@ -1110,35 +1103,12 @@ fn files(id: &Id, calls: usize) -> Result<bounded::Spares> {
     })
 }
 
-/// Live state, read from `launchctl print`'s body — the one place this
-/// backend does read it, since there is no filesystem signal for "is this
-/// job currently running" (see the module doc comment). Output in a shape
-/// this does not recognize degrades to `(State::Unknown, None)`; `Err` iff
-/// `launchctl` could not be run at all, which `start` must not mistake for a
-/// job that is not running: it would act on it.
-fn live_state(id: &str, deadline: Deadline) -> Result<(State, Option<u32>)> {
-    read_live_state(id, deadline, Role::Query)
-}
-
-/// [`live_state`], read as `role`.
-fn read_live_state(id: &str, deadline: Deadline, role: Role) -> Result<(State, Option<u32>)> {
-    // An expiry degrades to `Unknown`, as a capture that is not whole would:
-    // a state this did not fully read is a state it does not know. The two
-    // budgeted verbs check the deadline themselves wherever an `Unknown`
-    // would otherwise become a wrong error.
-    let Some(ran) = launchctl(&["print", &target(id)], deadline, role)? else {
-        return Ok((State::Unknown, None));
-    };
-    Ok(classified(&ran))
-}
-
 /// What a `launchctl print` that ran says about the job's live state.
-fn classified(ran: &Ran) -> (State, Option<u32>) {
-    if !ran.capture.complete {
+fn classified(status: std::process::ExitStatus, capture: &bounded::Capture) -> (State, Option<u32>) {
+    if !capture.complete {
         return (State::Unknown, None);
     }
-    let out = &ran.capture;
-    if !ran.status.success() {
+    if !status.success() {
         // `is_not_found` (established for `bootout`'s use of the same
         // label lookup): a clean "not running", the state a service left
         // staged-but-never-started, or bootout'd, is expected to report.
@@ -1149,34 +1119,43 @@ fn classified(ran: &Ran) -> (State, Option<u32>) {
         // is in fact running as `Stopped` because the caller merely
         // couldn't ask is exactly the confidently-wrong answer the lenient
         // parse below exists to avoid.
-        return if is_not_found(ran.status.code()) {
+        return if is_not_found(status.code()) {
             (State::Stopped, None)
         } else {
             (State::Unknown, None)
         };
     }
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = String::from_utf8_lossy(&capture.stdout);
     state::classify(&text)
 }
 
 // Backend =============================================================================================================
 
-/// The read after `install` wrote `wrote` to `target`, where `previous` was (`None` after a create).
-///
-/// The check before the write and the write are not atomic, and launchd relaunches a loaded job from
-/// the definition it was loaded with, not the plist on disk. A job loaded in between may hold either,
-/// and goetia takes no lock, so it reports doubt rather than success. A failed read leaves the same
-/// question open. Put the plist back as it was first: with the new one on disk a rerun reads
-/// `UpToDate` and never reaches the loaded job.
-fn recheck_after_write(id: &Id, deadline: Deadline, target: &Path, wrote: &str, previous: Option<&str>) -> Result<()> {
-    match is_loaded(id.as_str(), deadline) {
-        Ok(loaded) if !never_expires(loaded) => Ok(()),
-        Ok(_) => Err(refuse::loaded_after_write(id, undo_write(target, wrote, previous))),
-        Err(read) => Err(refuse::state_unknown_after_write(
-            id,
-            &read,
-            undo_write(target, wrote, previous),
-        )),
+impl Launchd {
+    /// The read after `install` wrote `wrote` to `target`, where `previous` was (`None` after a create).
+    ///
+    /// The check before the write and the write are not atomic, and launchd relaunches a loaded job from
+    /// the definition it was loaded with, not the plist on disk. A job loaded in between may hold either,
+    /// and goetia takes no lock, so it reports doubt rather than success. A failed read leaves the same
+    /// question open. Put the plist back as it was first: with the new one on disk a rerun reads
+    /// `UpToDate` and never reaches the loaded job.
+    fn recheck_after_write(
+        &self,
+        id: &Id,
+        deadline: Deadline,
+        target: &Path,
+        wrote: &str,
+        previous: Option<&str>,
+    ) -> Result<()> {
+        match self.launchctl.is_loaded(id.as_str(), deadline) {
+            Ok(loaded) if !never_expires(loaded) => Ok(()),
+            Ok(_) => Err(refuse::loaded_after_write(id, undo_write(target, wrote, previous))),
+            Err(read) => Err(refuse::state_unknown_after_write(
+                id,
+                &read,
+                undo_write(target, wrote, previous),
+            )),
+        }
     }
 }
 
@@ -1256,13 +1235,13 @@ impl backend::Backend for Launchd {
                 let target = staging_path(spec.id.as_str());
                 prepare_parent_dirs(spec, &account)?;
                 let staged = staged_tempfile(target.parent().expect("plist path always has a parent"), desired)?;
-                let loaded = never_expires(is_loaded(spec.id.as_str(), deadline)?);
+                let loaded = never_expires(self.launchctl.is_loaded(spec.id.as_str(), deadline)?);
                 if loaded {
                     let reaper = scope
                         .reaper
                         .take()
                         .expect("a pass that took the reaper ended the install");
-                    never_expires(bootout(spec.id.as_str(), deadline, reaper)?);
+                    never_expires(self.launchctl.bootout(spec.id.as_str(), deadline, reaper)?);
                 }
                 match persist_new(staged, &target)? {
                     PersistOutcome::Written => {}
@@ -1275,14 +1254,14 @@ impl backend::Backend for Launchd {
                         });
                     }
                 }
-                recheck_after_write(&spec.id, deadline, &target, desired, None)?;
+                self.recheck_after_write(&spec.id, deadline, &target, desired, None)?;
             }
             Outcome::Update { .. } | Outcome::Stale { .. } => {
                 let snapshot = snapshot.expect("an id `decide` chose to update was read as marked");
                 let previous = snapshot.text.as_str();
                 // `Stale` is checked too: a release can change what the generator renders.
                 let changes_job = refuse::changes_loaded_job(previous, desired);
-                if changes_job && never_expires(is_loaded(spec.id.as_str(), deadline)?) {
+                if changes_job && never_expires(self.launchctl.is_loaded(spec.id.as_str(), deadline)?) {
                     return Err(refuse::loaded_refusal(&spec.id));
                 }
                 prepare_parent_dirs(spec, &account)?;
@@ -1302,7 +1281,7 @@ impl backend::Backend for Launchd {
                 }
                 write_existing(target, desired)?;
                 if changes_job {
-                    recheck_after_write(&spec.id, deadline, target, desired, Some(previous))?;
+                    self.recheck_after_write(&spec.id, deadline, target, desired, Some(previous))?;
                 }
             }
             other => unreachable!("`flow::install` writes only `Create`, `Update` and `Stale`, got {other:?}"),
@@ -1314,7 +1293,9 @@ impl backend::Backend for Launchd {
         // `status` and `list` have no budget of their own: unbounded.
         // Read as `UncountedQuery`: neither verb counted this read, so it never draws on a
         // reservation a library caller may hold.
-        let (state, pid) = read_live_state(snapshot.id.as_str(), Budget::Unbounded.start(), Role::UncountedQuery)?;
+        let (state, pid) =
+            self.launchctl
+                .read_live_state(snapshot.id.as_str(), Budget::Unbounded.start(), Role::UncountedQuery)?;
         Ok(Status {
             state,
             pid,
@@ -1334,7 +1315,7 @@ impl backend::Backend for Launchd {
         // Unbounded, like `install`'s: `uninstall` has no `--timeout` of its
         // own, and bounding this would turn a slow-stopping job into a
         // failed uninstall where today it succeeds.
-        never_expires(bootout(id.as_str(), Budget::Unbounded.start(), reaper)?);
+        never_expires(self.launchctl.bootout(id.as_str(), Budget::Unbounded.start(), reaper)?);
         fs::remove_file(&location.path).map_err(|e| Error::os_at("remove", &location.path, e))
     }
 
@@ -1392,12 +1373,16 @@ impl backend::Backend for Launchd {
         // request is sent — so a spent budget still reaches launchd.
         let issuing = Budget::Unbounded.start();
 
-        if !never_expires(is_loaded(id.as_str(), issuing)?) {
-            if let Err(e) = bootstrap(&location.path, issuing, bootstrap_reaper).map(never_expires) {
+        if !never_expires(self.launchctl.is_loaded(id.as_str(), issuing)?) {
+            if let Err(e) = self
+                .launchctl
+                .bootstrap(&location.path, issuing, bootstrap_reaper)
+                .map(never_expires)
+            {
                 // A concurrent `start` may have loaded it between the check
                 // above and this call; only propagate the error if the job
                 // genuinely is not loaded now either.
-                if !never_expires(is_loaded(id.as_str(), issuing)?) {
+                if !never_expires(self.launchctl.is_loaded(id.as_str(), issuing)?) {
                     return Err(e);
                 }
             }
@@ -1411,11 +1396,15 @@ impl backend::Backend for Launchd {
         // than lean on an undocumented guarantee that a plain (non-`-k`)
         // `kickstart` never touches a running instance, checking first
         // makes that guarantee this code's own, not launchd's.
-        if live_state(id.as_str(), issuing)?.0 != State::Running {
+        if self.launchctl.live_state(id.as_str(), issuing)?.0 != State::Running {
             // Bounded by `deadline`: `-p` is the wait for the pid. An expiry
             // leaves the `launchctl` running rather than killing it (see
             // `launchctl`), so the request still goes out.
-            match kickstart(id.as_str(), budget, deadline, kickstart_reaper)?.ok_or_else(timed_out)? {
+            match self
+                .launchctl
+                .kickstart(id.as_str(), budget, deadline, kickstart_reaper)?
+                .ok_or_else(timed_out)?
+            {
                 // launchd forked the job and named the pid. That *is* the
                 // confirmation — there is nothing further to subscribe
                 // to — so no follow-up `print` is needed or wanted.
@@ -1424,7 +1413,7 @@ impl backend::Backend for Launchd {
                 // will trust. Never observed (250/250 runs named one), and
                 // not guessed at either: one bounded read decides it.
                 Kickstarted::NoPid if budget.waits() => {
-                    let state = live_state(id.as_str(), deadline)?.0;
+                    let state = self.launchctl.live_state(id.as_str(), deadline)?.0;
                     if state != State::Running {
                         // Checked after the read too: one the deadline cut
                         // short reads `Unknown`, which is an expiry, not a
@@ -1472,7 +1461,7 @@ impl backend::Backend for Launchd {
         // none.
         if budget.waits()
             && blob.spec.restart == Restart::Always
-            && live_state(id.as_str(), issuing)?.0 != State::Running
+            && self.launchctl.live_state(id.as_str(), issuing)?.0 != State::Running
         {
             // One corrective cycle, not a retry loop: tear the stale job
             // down by label and load ours from the path we just confirmed.
@@ -1480,12 +1469,17 @@ impl backend::Backend for Launchd {
             // when a stale job answered to the label, this cycle *is* the
             // request, and skipping it on a spent budget would report a
             // start that was never sent as one that may still arrive.
-            never_expires(bootout(id.as_str(), issuing, corrective_bootout)?);
-            never_expires(bootstrap(&location.path, issuing, corrective_bootstrap)?);
-            if live_state(id.as_str(), issuing)?.0 != State::Running {
-                kickstart(id.as_str(), budget, deadline, corrective_kickstart)?.ok_or_else(timed_out)?;
+            never_expires(self.launchctl.bootout(id.as_str(), issuing, corrective_bootout)?);
+            never_expires(
+                self.launchctl
+                    .bootstrap(&location.path, issuing, corrective_bootstrap)?,
+            );
+            if self.launchctl.live_state(id.as_str(), issuing)?.0 != State::Running {
+                self.launchctl
+                    .kickstart(id.as_str(), budget, deadline, corrective_kickstart)?
+                    .ok_or_else(timed_out)?;
             }
-            let state = live_state(id.as_str(), deadline)?.0;
+            let state = self.launchctl.live_state(id.as_str(), deadline)?.0;
             if state != State::Running {
                 if deadline.expired() {
                     return Err(timed_out());
@@ -1516,14 +1510,19 @@ impl backend::Backend for Launchd {
         let id = snapshot.id();
         let [reaper] = reapers::<STOP_REQUESTS>(id)?;
         let _files = files(id, STOP_CALLS)?;
-        bootout(id.as_str(), deadline, reaper)?.ok_or_else(|| budget::timed_out(id.as_str(), "stopped", budget))
+        self.launchctl
+            .bootout(id.as_str(), deadline, reaper)?
+            .ok_or_else(|| budget::timed_out(id.as_str(), "stopped", budget))
     }
 
     fn kill(&self, snapshot: Plist) -> Result<()> {
         let id = snapshot.id();
         let [reaper] = reapers::<KILL_REQUESTS>(id)?;
         let _files = files(id, KILL_CALLS)?;
-        never_expires(kill_job(id.as_str(), Budget::Unbounded.start(), reaper)?);
+        never_expires(
+            self.launchctl
+                .kill_job(id.as_str(), Budget::Unbounded.start(), reaper)?,
+        );
         Ok(())
     }
 
