@@ -19,7 +19,7 @@ use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_sti
 use super::*;
 use crate::manager::ServiceManager;
 use crate::manager::conformance::fresh_id;
-use crate::spec::{Kind, Restart};
+use crate::spec::Kind;
 
 #[skuld::label]
 const ELEVATED: skuld::Label;
@@ -58,16 +58,8 @@ fn sweep_quarantine_files(id: &str) {
 
 fn mk(id: &str) -> DaemonSpec {
     DaemonSpec {
-        id: Id::try_from(id.to_string()).expect("valid id"),
-        name: id.to_string(),
-        command: vec!["/bin/true".to_string()],
-        cwd: None,
-        env: Default::default(),
-        user: User::Root,
-        restart: Restart::Never,
-        restart_delay: None,
-        logs: None,
         kind: Kind::Simple,
+        ..DaemonSpec::for_test(id, vec!["/bin/true".to_string()])
     }
 }
 
