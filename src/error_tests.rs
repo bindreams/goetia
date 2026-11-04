@@ -67,8 +67,9 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
         Error::Invalid {
             daemon: id(),
             message: String::new(),
+            source: None,
         },
-        Error::Blob(String::new()),
+        Error::blob(String::new()),
         Error::NotInstalled { id: id() },
         Error::Foreign {
             id: id(),
@@ -98,7 +99,7 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             source: None,
         },
         Error::StartAsManaged {
-            blob: Box::new(Error::Blob(String::new())),
+            blob: Box::new(Error::blob(String::new())),
             source: Box::new(not_installed()),
         },
         Error::AlreadyExists { path: PathBuf::new() },
@@ -150,7 +151,7 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
 #[skuld::test]
 fn a_start_judged_as_managed_is_indeterminate_when_the_failed_start_is() {
     let over = |source: Error| Error::StartAsManaged {
-        blob: Box::new(Error::Blob(String::new())),
+        blob: Box::new(Error::blob(String::new())),
         source: Box::new(source),
     };
     assert!(over(in_doubt()).is_indeterminate());
@@ -682,7 +683,7 @@ fn report_of_an_account_lookup_ends_in_its_cause_when_it_has_one() {
 #[skuld::test]
 fn report_of_a_start_judged_as_managed_names_the_unreadable_blob_and_then_the_failure() {
     let e = Error::StartAsManaged {
-        blob: Box::new(Error::Blob("invalid blob JSON: EOF".to_string())),
+        blob: Box::new(Error::blob("invalid blob JSON: EOF".to_string())),
         source: Box::new(os("start", "/p", "stopped")),
     };
     assert_eq!(

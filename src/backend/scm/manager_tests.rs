@@ -516,9 +516,9 @@ fn start_reads_a_simple_service_by_the_shims_vocabulary_and_anything_else_strict
         assert_eq!(read, kind);
         assert!(why.is_none(), "{why:?}");
     }
-    let (kind, why) = start_kind(Err(&Error::Blob("corrupt".to_string())));
+    let (kind, why) = start_kind(Err(&Error::blob("corrupt")));
     assert_eq!(kind, Kind::Managed);
-    assert!(matches!(why, Some(Error::Blob(message)) if message == "corrupt"));
+    assert!(matches!(why, Some(Error::Blob { message, .. }) if message == "corrupt"));
 }
 
 /// A start judged strictly because the blob could not be read says why, so the user is not told a
@@ -531,7 +531,7 @@ fn a_failed_start_names_the_blob_read_error_that_made_it_strict() {
     let plain = failed_start(&id, e(), None).report().to_string();
     assert!(!plain.contains("blob"), "{plain}");
 
-    let strict = failed_start(&id, e(), Some(Error::Blob("invalid blob JSON: EOF".to_string())))
+    let strict = failed_start(&id, e(), Some(Error::blob("invalid blob JSON: EOF")))
         .report()
         .to_string();
     assert!(strict.contains("service stopped before reaching Running"), "{strict}");

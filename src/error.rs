@@ -7,6 +7,10 @@ use std::sync::Arc;
 /// What a variant's `#[source]` holds when the cause is another library's error.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// A source that can be cloned with the error that holds it: a snapshot keeps its blob's failure
+/// and hands out copies of it (see `manager::flow::owned_failure`).
+pub type SharedError = std::sync::Arc<dyn std::error::Error + Send + Sync>;
+
 /// Every goetia error. A variant is named for the layer that raised it, and its `Display` is its
 /// own context only, never its source's text: print the whole chain with [`Error::report`].
 #[derive(Debug, thiserror::Error)]
@@ -197,15 +201,29 @@ pub enum Error {
     /// `restart-delay`. Also produced by `blob::decode`, which re-runs
     /// these same checks against a spec deserialized from an untrusted
     /// artifact.
+    ///
+    /// `source` is the parser's own error when one failed (`humantime`, an
+    /// absolute-path resolution), printed by [`report`](Error::report).
     #[error("daemon `{daemon}`: {message}")]
-    Invalid { daemon: String, message: String },
+    Invalid {
+        daemon: String,
+        message: String,
+        #[source]
+        source: Option<SharedError>,
+    },
 
     /// A metadata blob (`blob::decode`) is not usable: malformed base64,
     /// malformed JSON, or a schema this build does not understand.
     /// Distinct from `Invalid`, which a *structurally valid* blob can
     /// still trigger once its envelope decodes cleanly.
-    #[error("blob: {0}")]
-    Blob(String),
+    ///
+    /// `source` is the decoder's own error when one failed.
+    #[error("blob: {message}")]
+    Blob {
+        message: String,
+        #[source]
+        source: Option<SharedError>,
+    },
 
     /// No daemon named `id` is managed by Goetia, per a [`ServiceManager`]
     /// mutating or querying verb (`uninstall`/`start`/`stop`/`enable`/
@@ -508,7 +526,7 @@ impl Error {
             | Error::Interpolate { .. }
             | Error::Yaml(_)
             | Error::Invalid { .. }
-            | Error::Blob(_)
+            | Error::Blob { .. }
             | Error::NotInstalled { .. }
             | Error::Foreign { .. }
             | Error::NotRunning { .. }
@@ -585,6 +603,25 @@ impl Error {
                 source,
             },
             e => e,
+        }
+    }
+
+    /// A metadata blob that is not usable, for a reason that is goetia's own to state.
+    pub(crate) fn blob(message: impl Into<String>) -> Self {
+        Error::Blob {
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// A metadata blob that is not usable because `source` failed to decode it.
+    pub(crate) fn blob_from(
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Error::Blob {
+            message: message.into(),
+            source: Some(std::sync::Arc::new(source)),
         }
     }
 

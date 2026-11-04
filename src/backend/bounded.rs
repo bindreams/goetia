@@ -241,12 +241,27 @@ fn may_have_run(e: &cosca::error::Error) -> bool {
 
 /// The failure to make `what` before a spawn, which is therefore never attempted.
 fn not_run(what: &'static str) -> impl Fn(io::Error) -> cosca::error::Error {
-    move |e| {
-        cosca::error::Error::Io(io::Error::new(
-            e.kind(),
-            format!("no {what} could be made, so it was not run: {e}"),
-        ))
+    move |e| cosca::error::Error::Io(within(format!("no {what} could be made, so it was not run"), e))
+}
+
+/// `source` said in `context`, with its kind kept. The failure under `context` is the error's
+/// [`source`](std::error::Error::source), which [`Error::report`](crate::Error::report) prints
+/// after it: `context: source`.
+fn within(context: impl Into<String>, source: io::Error) -> io::Error {
+    #[derive(Debug, thiserror::Error)]
+    #[error("{context}")]
+    struct Within {
+        context: String,
+        #[source]
+        source: io::Error,
     }
+    io::Error::new(
+        source.kind(),
+        Within {
+            context: context.into(),
+            source,
+        },
+    )
 }
 
 /// How [`wait_bounded`] lost its child, and whether the child had announced first.
@@ -374,7 +389,7 @@ fn read_back(mut file: File, stream: &str) -> Result<Vec<u8>, cosca::error::Erro
     let mut bytes = Vec::new();
     file.rewind()
         .and_then(|()| file.read_to_end(&mut bytes))
-        .map_err(|e| cosca::error::Error::Io(io::Error::new(e.kind(), format!("{stream}: {e}"))))?;
+        .map_err(|e| cosca::error::Error::Io(within(stream, e)))?;
     Ok(bytes)
 }
 
@@ -492,7 +507,7 @@ fn collect(rx: impl ChunkSource, deadline: Deadline, stream: &str) -> std::io::R
 fn absorb(chunk: Chunk, bytes: &mut Vec<u8>, stream: &str) -> std::io::Result<()> {
     match chunk {
         Chunk::Bytes(chunk) => bytes.extend_from_slice(&chunk),
-        Chunk::Failed(e) => return Err(std::io::Error::new(e.kind(), format!("{stream}: {e}"))),
+        Chunk::Failed(e) => return Err(within(stream, e)),
     }
     Ok(())
 }

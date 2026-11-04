@@ -886,9 +886,12 @@ fn collect_turns_a_reader_failure_into_an_error() {
     drop(tx);
 
     let e = collect(rx, Budget::Unbounded.start(), "stderr").unwrap_err();
+    assert_eq!(e.to_string(), "stderr", "the failing stream is named");
+    assert_eq!(e.kind(), ErrorKind::BrokenPipe, "the kind of the failure is kept");
+    let reported = crate::Error::spawn("client", e).report().to_string();
     assert!(
-        e.to_string().starts_with("stderr: "),
-        "the failing stream is named: {e}"
+        reported.starts_with("failed to run `client`: stderr: "),
+        "the failure under the stream's name is the source: {reported}"
     );
 }
 

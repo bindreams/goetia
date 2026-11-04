@@ -584,10 +584,10 @@ fn extract(text: &str) -> Result<Option<Blob>> {
     }
     let spec_line = lines
         .next()
-        .ok_or_else(|| Error::Blob("fake artifact has no Spec line".to_string()))?;
+        .ok_or_else(|| Error::blob("fake artifact has no Spec line".to_string()))?;
     let encoded = spec_line
         .strip_prefix("Spec: ")
-        .ok_or_else(|| Error::Blob(format!("fake artifact's second line is not `Spec: ...`: {spec_line}")))?;
+        .ok_or_else(|| Error::blob(format!("fake artifact's second line is not `Spec: ...`: {spec_line}")))?;
     let blob = blob::decode(encoded)?;
     Ok(Some(blob))
 }

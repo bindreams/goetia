@@ -208,6 +208,16 @@ fn external_configuration_is_carried_into_the_outcome() {
 // status and list =====================================================================================================
 
 #[skuld::test]
+fn a_kept_failure_is_handed_out_with_its_source() {
+    let kept = Error::blob_from("invalid blob JSON", std::io::Error::other("EOF"));
+
+    let owned = owned_failure(&kept);
+
+    assert!(std::error::Error::source(&owned).is_some(), "{owned:?}");
+    assert_eq!(owned.report().to_string(), "blob: invalid blob JSON: EOF");
+}
+
+#[skuld::test]
 fn status_reports_an_unresolvable_account_as_an_error() {
     let fake = Fake::new();
     fake.install(&mk_as("frpc", "gone"), false).unwrap();

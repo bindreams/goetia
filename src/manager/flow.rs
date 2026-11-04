@@ -168,18 +168,26 @@ pub(crate) fn status<B: Backend>(b: &B, id: &Id) -> Result<Status> {
 }
 
 /// A failure a snapshot or a scan kept (its blob's, or why its name is no id), as an owned error.
-/// Only [`Error::Blob`] and [`Error::Invalid`] are ever kept, and each is its whole text, so it is
-/// rebuilt as itself.
+/// Only [`Error::Blob`] and [`Error::Invalid`] are ever kept, and each is cloned whole, shared
+/// source included.
 pub(crate) fn owned_failure(e: &Error) -> Error {
     match e {
-        Error::Blob(message) => Error::Blob(message.clone()),
-        Error::Invalid { daemon, message } => Error::Invalid {
+        Error::Blob { message, source } => Error::Blob {
+            message: message.clone(),
+            source: source.clone(),
+        },
+        Error::Invalid {
+            daemon,
+            message,
+            source,
+        } => Error::Invalid {
             daemon: daemon.clone(),
             message: message.clone(),
+            source: source.clone(),
         },
         other => {
             debug_assert!(false, "a snapshot and a scan keep only Blob and Invalid, got {other:?}");
-            Error::Blob(other.report().to_string())
+            Error::blob(other.report().to_string())
         }
     }
 }
