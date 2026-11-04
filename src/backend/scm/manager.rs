@@ -95,6 +95,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt as _;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use windows_service::service::{
     Service, ServiceAccess, ServiceActionType, ServiceErrorControl, ServiceFailureResetPeriod, ServiceInfo,
@@ -110,13 +111,12 @@ use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 use super::wait::Waited;
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::backend::{
-    Backend, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
+    Backend, Decoded, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
 };
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
-use crate::error::{Error, Result};
-use crate::manager::budget;
-use crate::manager::{Budget, Installed, State, Status, Step};
+use crate::error::{Error, Reason, Result};
+use crate::manager::{Budget, Installed, State, Status, Step, budget};
 use crate::spec::{DaemonSpec, Id, Kind};
 
 // Scm =================================================================================================================
@@ -136,7 +136,7 @@ impl Scm {
 /// What `read` saw of a service goetia marked.
 pub(crate) struct ScmSnapshot {
     id: Id,
-    blob: Result<Blob>,
+    blob: Decoded,
     /// Its `Parameters` values, which hold the only proof of ownership `type: managed` has.
     parameters: BTreeMap<String, String>,
     /// The object `read` opened to classify it, so `installed` and `live_status` ask that object:
@@ -149,7 +149,7 @@ pub(crate) struct ScmSnapshot {
 type Opened = (BTreeMap<String, String>, Option<Service>);
 
 impl ScmSnapshot {
-    fn new(id: Id, blob: Result<Blob>, (parameters, service): Opened) -> Self {
+    fn new(id: Id, blob: Decoded, (parameters, service): Opened) -> Self {
         Self {
             id,
             blob,
@@ -164,7 +164,7 @@ impl InstalledService for ScmSnapshot {
         &self.id
     }
 
-    fn blob(&self) -> std::result::Result<&Blob, &Error> {
+    fn blob(&self) -> std::result::Result<&Blob, &Arc<Error>> {
         self.blob.as_ref()
     }
 }
@@ -227,7 +227,7 @@ impl Backend for Scm {
         let service = match scm.open_service(id.as_str(), ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG) {
             Ok(service) => service,
             Err(e) if is_not_found(&e) => return Ok(ReadOutcome::Absent),
-            Err(e) => return Err(service_undetermined(id.as_str(), &format!("open service `{id}`"), &e)),
+            Err(e) => return Err(service_undetermined(id.as_str(), &format!("open service `{id}`"), e)),
         };
         Ok(read_marker(registry::read_parameters(id.as_str())?, Some(service)).named(id, ScmSnapshot::new))
     }
@@ -334,8 +334,8 @@ impl Backend for Scm {
             // more, per the trait doc comment.
             return super::wait::request_start(&mut actor).map_err(|e| Error::os(format!("start `{id}`"), e));
         }
-        let waited = super::wait::start_via_notify(&mut actor, deadline, kind)
-            .map_err(|e| failed_start(&id, e, unreadable.as_deref()))?;
+        let waited =
+            super::wait::start_via_notify(&mut actor, deadline, kind).map_err(|e| failed_start(&id, e, unreadable))?;
         match waited {
             Waited::Confirmed => Ok(()),
             Waited::Expired => Err(budget::timed_out(id.as_str(), "running", budget)),
@@ -394,7 +394,7 @@ fn read_marker(parameters: BTreeMap<String, String>, service: Option<Service>) -
     let blob = match generate::extract(&parameters) {
         Ok(None) => return ReadOutcome::Foreign { recovery: None },
         Ok(Some(blob)) => Ok(blob),
-        Err(e) => Err(e),
+        Err(e) => Err(Arc::new(e)),
     };
     ReadOutcome::Marked(Unnamed {
         blob,
@@ -430,24 +430,22 @@ pub fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
 /// say. Only a decodable blob that says `type: simple` selects the shim's vocabulary; an unreadable
 /// one reads as strictly as `type: managed`, which is what a shim that cannot decode it reports
 /// anyway (a failed start).
-fn start_kind(blob: std::result::Result<&Blob, &Error>) -> (Kind, Option<String>) {
+fn start_kind(blob: std::result::Result<&Blob, &Arc<Error>>) -> (Kind, Option<Arc<Error>>) {
     match blob {
         Ok(blob) => (blob.spec.kind, None),
-        Err(e) => (Kind::Managed, Some(e.report().to_string())),
+        Err(e) => (Kind::Managed, Some(Arc::clone(e))),
     }
 }
 
 /// `start`'s error for a `start_via_notify` failure. When the blob was unreadable the start was
 /// judged as a `type: managed` service's, and the error says why, since that is not what a
 /// `type: simple` service would have been told.
-fn failed_start(id: &Id, e: std::io::Error, unreadable: Option<&str>) -> Error {
+fn failed_start(id: &Id, e: std::io::Error, unreadable: Option<Arc<Error>>) -> Error {
     let failed = Error::os(format!("start `{id}`"), e);
     match unreadable {
         None => failed,
-        Some(why) => Error::Step {
-            what: format!(
-                "its spec blob could not be read, so the start was judged as a `type: managed` service's ({why})"
-            ),
+        Some(blob) => Error::StartAsManaged {
+            blob,
             source: Box::new(failed),
         },
     }
@@ -984,14 +982,14 @@ fn open_scm(access: ServiceManagerAccess) -> Result<WinServiceManager> {
 /// security descriptor — which stops `services.msc`, the test harness's own `ServiceGuard` cleanup
 /// and every other service operation on the runner, and is not restorable by a `Drop` that may not
 /// run. What is covered instead is the mapping this line performs, in full: the same
-/// [`service_undetermined`] over the same [`service_detail`] text, at
+/// [`service_undetermined`] over the same [`to_error`] cause, at
 /// `manager_tests.rs::the_scm_undetermined_recovery_names_both_causes_and_not_uninstall` for both
 /// causes, and end to end against a real denial at
 /// `tests/scm_integration/managed.rs::status_of_a_service_whose_object_denies_querying_is_undetermined`,
 /// which reaches it through [`open_existing`]'s service-object open instead.
 fn open_scm_to_classify(id: &str) -> Result<WinServiceManager> {
     WinServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-        .map_err(|e| service_undetermined(id, "open the Service Control Manager", &e))
+        .map_err(|e| service_undetermined(id, "open the Service Control Manager", e))
 }
 
 fn is_not_found(e: &windows_service::Error) -> bool {
@@ -1020,8 +1018,7 @@ fn is_access_denied(e: &windows_service::Error) -> bool {
     )
 }
 
-/// What a `windows_service` failure was, as facts, with no claim about the id
-/// attached. Shared by [`to_error`] and [`service_undetermined`], so one
+/// A `windows_service` failure as an [`Error::Os`], shared with [`service_undetermined`] so one
 /// failure cannot be described two ways depending on which class it lands in.
 ///
 /// `windows_service::Error`'s own `Display` for its `Winapi` variant is the
@@ -1030,13 +1027,6 @@ fn is_access_denied(e: &windows_service::Error) -> bool {
 /// through `to_error` read that and nothing else, useless for diagnosing an
 /// actual Win32 failure). Unwrap to the inner `io::Error` first, whose
 /// `Display` does carry `FormatMessage`'s real text.
-fn service_detail(context: &str, e: &windows_service::Error) -> String {
-    match e {
-        windows_service::Error::Winapi(io_err) => format!("{context}: {io_err}"),
-        other => format!("{context}: {other}"),
-    }
-}
-
 fn to_error(context: &str, e: windows_service::Error) -> Error {
     match e {
         windows_service::Error::Winapi(io_err) => Error::os(context, io_err),
@@ -1055,10 +1045,10 @@ fn to_error(context: &str, e: windows_service::Error) -> Error {
 /// kind of object: one is the `Services\<id>\Parameters` registry key
 /// ([`registry::read_parameters`]), the other an SCM service object
 /// ([`open_existing`], [`Backend::read`]). Only the caller knows which, so `reason`
-/// arrives already rendered and this decides the class and the remedy.
+/// arrives already built, as the `Error::Os` [`to_error`] or `registry`'s `registry_error` makes,
+/// and this decides the class and the remedy.
 ///
-/// [`Error::Undetermined`], never the `Error::Os` [`to_error`] and
-/// `registry`'s own `registry_error` produce: `Os` reaches
+/// [`Error::Undetermined`] over that `Os`, never the `Os` alone: `Os` reaches
 /// `cli::report::status_error`'s catch-all as `Kind::Unusable` (see [`Error::Undetermined`]).
 /// `HKLM\SYSTEM\CurrentControlSet\Services` holds
 /// every vendor's service, so on this platform that claim is routinely about a
@@ -1071,7 +1061,7 @@ fn to_error(context: &str, e: windows_service::Error) -> Error {
 /// looked complete. What `access_denied` does choose is `recovery` — elevation
 /// is advice only a permission boundary earns, and offering it for a failing
 /// disk sends the reader somewhere useless.
-fn undetermined(id: &str, reason: String, access_denied: bool) -> Error {
+fn undetermined(id: &str, reason: Error, access_denied: bool) -> Error {
     let recovery = if access_denied {
         "re-run as Administrator: that read is what tells goetia whether anything is installed at \
          this id"
@@ -1081,16 +1071,15 @@ fn undetermined(id: &str, reason: String, access_denied: bool) -> Error {
     };
     Error::Undetermined {
         id: id.to_string(),
-        reason,
+        reason: Box::new(reason),
         recovery: recovery.to_string(),
     }
 }
 
-/// [`undetermined`] for a service object goetia could not open: [`to_error`]'s
-/// twin, over the same [`service_detail`] text, for the reads that establish
-/// nothing rather than the ones that fail after ownership is known.
-fn service_undetermined(id: &str, context: &str, e: &windows_service::Error) -> Error {
-    undetermined(id, service_detail(context, e), is_access_denied(e))
+/// As above, for reads that establish nothing (before ownership is known).
+fn service_undetermined(id: &str, context: &str, e: windows_service::Error) -> Error {
+    let access_denied = is_access_denied(&e);
+    undetermined(id, to_error(context, e), access_denied)
 }
 
 /// Open `id` with the `access` a verb needs beyond what `read` asked for, translating "no such
@@ -1107,7 +1096,7 @@ fn open_existing(id: &Id, access: ServiceAccess) -> Result<(WinServiceManager, S
                 id: id.as_str().to_string(),
             }
         } else {
-            service_undetermined(id.as_str(), &format!("open service `{id}`"), &e)
+            service_undetermined(id.as_str(), &format!("open service `{id}`"), e)
         }
     })?;
     Ok((scm, service))
@@ -1215,16 +1204,13 @@ fn unreadable_aggregate(unreadable: Vec<Unreadable>) -> Option<Installed> {
     // The name and the reason are one report: an entry that names its service and then says a
     // daemon may be missing from the list contradicts itself in a single rendered line.
     Some(match count {
-        1 => {
-            let reason = named_unreadable_notice(&first.detail, first.recovery.as_deref());
-            Installed::Undetermined {
-                name: Some(first.name),
-                reason,
-            }
-        }
+        1 => Installed::Undetermined {
+            name: Some(first.name),
+            reason: named_unreadable_notice(first.detail, first.recovery.as_deref()),
+        },
         _ => Installed::Undetermined {
             name: None,
-            reason: unreadable_notice(count),
+            reason: Reason::said(unreadable_notice(count)),
         },
     })
 }
@@ -1234,9 +1220,9 @@ fn unreadable_aggregate(unreadable: Vec<Unreadable>) -> Option<Installed> {
 /// neither the name, nor the cause, nor which remedy that cause earned.
 struct Unreadable {
     name: String,
-    /// [`registry::read_parameters`]'s own rendering of what failed: the key,
+    /// [`registry::read_parameters`]'s own error for what failed: the key,
     /// the operation and the OS error.
-    detail: String,
+    detail: Error,
     /// The remedy [`undetermined`] chose from that failure's errno, or `None`
     /// for one that arrived without a conditioned remedy to carry.
     recovery: Option<String>,
@@ -1249,20 +1235,23 @@ struct Unreadable {
 /// The remedy travels for the reason the cause does: at a count of one this entry and
 /// `status <same-id>` report the same single failed read, so answering it twice, differently, would
 /// put two answers on one condition. `read_parameters` builds every failure it has through
-/// `registry_undetermined`, so the first arm is the whole story; the second exists because the
-/// `Result` type does not say so, and has no conditioned remedy to offer rather than a default one.
+/// `registry_undetermined`, so the first arm is the whole story; the second is for a `Result` type
+/// that does not say so, and has no conditioned remedy to offer rather than a default one.
 fn unreadable_parts(name: String, e: Error) -> Unreadable {
-    match e.cause() {
-        Error::Undetermined { reason, recovery, .. } => Unreadable {
+    match e.into_undetermined() {
+        Ok((reason, recovery)) => Unreadable {
             name,
-            detail: reason.clone(),
-            recovery: Some(recovery.clone()),
+            detail: *reason,
+            recovery: Some(recovery),
         },
-        _ => Unreadable {
-            name,
-            detail: e.report().to_string(),
-            recovery: None,
-        },
+        Err(e) => {
+            debug_assert!(false, "`read_parameters` fails only as Undetermined, got {e:?}");
+            Unreadable {
+                name,
+                detail: e,
+                recovery: None,
+            }
+        }
     }
 }
 
@@ -1285,13 +1274,12 @@ fn unreadable_parts(name: String, e: Error) -> Unreadable {
 /// re-run elevated over a corrupt hive, while `status <same-id>` told it to fix the hive.
 /// [`unreadable_notice`]'s hedge is reasoning about a *count* — hundreds of causes, one entry — and
 /// does not reach a count of one.
-fn named_unreadable_notice(detail: &str, recovery: Option<&str>) -> String {
-    match recovery {
-        Some(recovery) => {
-            format!("{detail} — so whether this service is one of goetia's is unknown; {recovery}.")
-        }
-        None => format!("{detail} — so whether this service is one of goetia's is unknown."),
-    }
+fn named_unreadable_notice(detail: Error, recovery: Option<&str>) -> Reason {
+    let after = match recovery {
+        Some(recovery) => format!(" — so whether this service is one of goetia's is unknown; {recovery}."),
+        None => " — so whether this service is one of goetia's is unknown.".to_string(),
+    };
+    Reason::around("", detail, after)
 }
 
 /// The text [`unreadable_aggregate`]'s *unnamed* entry carries: how many

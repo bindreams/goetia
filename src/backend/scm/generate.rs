@@ -174,6 +174,7 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> Resul
                           after a clean exit. To keep `always` on systemd and launchd, set \
                           `backend-specific: scm: { restart: on-failure }`"
                     .to_string(),
+                source: None,
             });
         }
     };
@@ -310,7 +311,7 @@ pub fn extract(parameters: &BTreeMap<String, String>) -> Result<Option<Blob>, Er
         return Ok(None);
     };
     if marker != blob::MARKER {
-        return Err(Error::Blob(format!(
+        return Err(Error::blob(format!(
             "Parameters\\{FIELD_MARKER} is `{marker}`, not `{expected}`",
             expected = blob::MARKER
         )));
@@ -318,9 +319,10 @@ pub fn extract(parameters: &BTreeMap<String, String>) -> Result<Option<Blob>, Er
 
     let schema_text = get_field(parameters, FIELD_SCHEMA)?.ok_or_else(|| missing_field_error(FIELD_SCHEMA))?;
     let schema: u32 = schema_text.parse().map_err(|source| {
-        Error::Blob(format!(
-            "Parameters\\{FIELD_SCHEMA} `{schema_text}` is not an integer: {source}"
-        ))
+        Error::blob_from(
+            format!("Parameters\\{FIELD_SCHEMA} `{schema_text}` is not an integer"),
+            source,
+        )
     })?;
 
     let version_text = get_field(parameters, FIELD_VERSION)?.ok_or_else(|| missing_field_error(FIELD_VERSION))?;
@@ -335,13 +337,13 @@ pub fn extract(parameters: &BTreeMap<String, String>) -> Result<Option<Blob>, Er
     // with the blob sitting beside them would be exactly the "partially
     // trusted" outcome this function's contract above already rules out.
     if schema != blob.schema {
-        return Err(Error::Blob(format!(
+        return Err(Error::blob(format!(
             "Parameters\\{FIELD_SCHEMA} is `{schema}`, but Parameters\\{FIELD_SPEC} decodes to schema `{actual}`",
             actual = blob.schema
         )));
     }
     if version_text != blob.version {
-        return Err(Error::Blob(format!(
+        return Err(Error::blob(format!(
             "Parameters\\{FIELD_VERSION} is `{version_text}`, but Parameters\\{FIELD_SPEC} decodes to version \
              `{actual}`",
             actual = blob.version
@@ -367,7 +369,7 @@ fn get_field<'a>(parameters: &'a BTreeMap<String, String>, field: &str) -> Resul
     for (key, value) in parameters {
         if key.eq_ignore_ascii_case(field) {
             if found.is_some() {
-                return Err(Error::Blob(format!(
+                return Err(Error::blob(format!(
                     "Parameters has more than one value spelled `{field}` case-insensitively"
                 )));
             }
@@ -378,7 +380,7 @@ fn get_field<'a>(parameters: &'a BTreeMap<String, String>, field: &str) -> Resul
 }
 
 fn missing_field_error(field: &str) -> Error {
-    Error::Blob(format!(
+    Error::blob(format!(
         "Parameters\\{FIELD_MARKER} is present but Parameters\\{field} is missing"
     ))
 }

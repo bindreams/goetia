@@ -288,7 +288,7 @@ fn unusable_refuses_with_recovery() {
 
     for force in [false, true] {
         let found = Ownership::OursUnusable {
-            reason: "schema 2 is not understood by this build".to_owned(),
+            reason: Reason::said("schema 2 is not understood by this build"),
             recovery: Some(unusable_recovery("frpc")),
         };
 
@@ -303,7 +303,7 @@ fn unusable_refuses_with_recovery() {
 
         match outcome {
             Outcome::RefuseUnusable { reason, recovery } => {
-                assert_eq!(reason, "schema 2 is not understood by this build");
+                assert_eq!(reason.to_string(), "schema 2 is not understood by this build");
                 let recovery = recovery.expect("a decode failure carries a recovery");
                 assert!(!recovery.is_empty(), "recovery must be non-empty (force={force})");
             }
@@ -320,7 +320,7 @@ fn unusable_carries_its_recovery_through() {
 
     for recovery in [Some("run the exact remedy".to_owned()), None] {
         let found = Ownership::OursUnusable {
-            reason: "a drop-in could not be read".to_owned(),
+            reason: Reason::said("a drop-in could not be read"),
             recovery: recovery.clone(),
         };
 
@@ -336,7 +336,7 @@ fn unusable_carries_its_recovery_through() {
         assert_eq!(
             outcome,
             Outcome::RefuseUnusable {
-                reason: "a drop-in could not be read".to_owned(),
+                reason: Reason::said("a drop-in could not be read"),
                 recovery,
             }
         );
@@ -539,7 +539,7 @@ fn every_refusal_names_a_recovery_command_except_a_recoveryless_unusable() {
         ),
         decide(
             &Ownership::OursUnusable {
-                reason: "corrupt".to_owned(),
+                reason: Reason::said("corrupt"),
                 recovery: Some(unusable_recovery("frpc")),
             },
             "GENERATED",
@@ -550,7 +550,7 @@ fn every_refusal_names_a_recovery_command_except_a_recoveryless_unusable() {
         ),
         decide(
             &Ownership::OursUnusable {
-                reason: "a drop-in could not be read".to_owned(),
+                reason: Reason::said("a drop-in could not be read"),
                 recovery: None,
             },
             "GENERATED",

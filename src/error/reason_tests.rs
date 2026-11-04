@@ -1,0 +1,59 @@
+use super::*;
+use crate::error::error_tests::{not_installed, os, undetermined};
+
+#[skuld::test]
+fn a_reason_reads_as_its_words_and_its_error_report() {
+    assert_eq!(Reason::said("present in both").to_string(), "present in both");
+    assert_eq!(
+        Reason::failed(os("read", "/p", "denied")).to_string(),
+        "failed to read /p: denied"
+    );
+    assert_eq!(
+        Reason::because("cannot regenerate", os("read", "/p", "denied")).to_string(),
+        "cannot regenerate: failed to read /p: denied"
+    );
+    assert_eq!(
+        Reason::around("scan failed (", os("read", "/p", "denied"), "). Ownership is unknown.").to_string(),
+        "scan failed (failed to read /p: denied). Ownership is unknown."
+    );
+}
+
+#[skuld::test]
+fn a_reason_prints_the_remedy_of_the_error_it_holds_last() {
+    assert_eq!(
+        Reason::failed(undetermined("re-run as root")).to_string(),
+        "cannot determine whether daemon `x` is installed: failed to read /p: denied. re-run as root"
+    );
+}
+
+/// The error sits inside the reason's own words, so its remedy waits for the end of them.
+#[skuld::test]
+fn a_reason_around_an_error_prints_the_remedy_after_its_closing_words() {
+    assert_eq!(
+        Reason::around(
+            "scan failed (",
+            undetermined("re-run as root"),
+            "). Ownership is unknown."
+        )
+        .to_string(),
+        "scan failed (cannot determine whether daemon `x` is installed: failed to read /p: denied). Ownership is \
+         unknown.. re-run as root"
+    );
+}
+
+#[skuld::test]
+fn a_reason_gives_the_error_classification_reads() {
+    assert!(Reason::said("words").cause().is_none());
+    let step = Reason::because("outer", not_installed());
+    assert!(matches!(step.cause(), Some(Error::NotInstalled { .. })));
+    let around = Reason::around("(", not_installed(), ")");
+    assert!(matches!(around.cause(), Some(Error::NotInstalled { .. })));
+}
+
+#[skuld::test]
+fn two_reasons_are_equal_when_they_read_the_same() {
+    let reason = || Reason::failed(os("read", "/p", "denied"));
+    assert_eq!(reason(), reason().clone());
+    assert_ne!(reason(), Reason::said("something else"));
+    assert_eq!(Reason::said("failed to read /p: denied"), reason());
+}

@@ -163,11 +163,12 @@ fn a_parameters_read_that_did_not_complete_is_undetermined() {
         (std::io::Error::other("the hive is corrupt"), false),
     ] {
         let rendered = format!("{source:?}");
-        let Error::Undetermined { id, reason, recovery } = registry_undetermined("x", "open", &path, &source) else {
+        let Error::Undetermined { id, reason, recovery } = registry_undetermined("x", "open", &path, source) else {
             panic!("{rendered}: a read that did not complete establishes nothing about the id");
         };
 
         assert_eq!(id, "x");
+        let reason = reason.report().to_string();
         assert!(
             reason.contains(&path),
             "{rendered}: the reason must name the key: {reason}"
@@ -250,6 +251,7 @@ fn a_services_key_that_will_not_open_leaves_the_pass_unfinished() {
     assert!(names.is_empty(), "{names:?}");
     match incomplete {
         Some(Installed::Undetermined { name: None, reason }) => {
+            let reason = reason.to_string();
             assert!(
                 reason.contains("SECURITY"),
                 "the entry must name what was being scanned: {reason}"

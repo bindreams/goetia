@@ -178,7 +178,7 @@ fn stop_leg(requested: Budget, left: Budget) -> Budget {
 /// [`as_given`]). Every other failure passes through untouched: a stop that
 /// determinately failed changed nothing and is still exit `1`.
 fn abandoned_before_start(id: &Id, e: Error, budget: Budget) -> Error {
-    match e {
+    e.map_cause(|leaf| match leaf {
         Error::WaitTimeout {
             id, awaited, waited, ..
         } => Error::WaitTimeout {
@@ -193,21 +193,12 @@ fn abandoned_before_start(id: &Id, e: Error, budget: Budget) -> Error {
             id,
             awaited,
         },
-        Error::RequestInDoubt {
-            request,
-            reached,
-            detail,
-        } => Error::RequestInDoubt {
-            request,
-            reached,
-            detail: format!(
-                "the restart was abandoned: no start was issued, so `{id}` may be left stopped. `goetia daemon \
-                 status {id}` shows the manager's current view, and `goetia daemon start {id}` brings it back up: \
-                 {detail}"
-            ),
-        },
+        e @ Error::RequestInDoubt { .. } => e.in_doubt_context(format!(
+            "the restart was abandoned: no start was issued, so `{id}` may be left stopped. `goetia daemon \
+             status {id}` shows the manager's current view, and `goetia daemon start {id}` brings it back up"
+        )),
         other => other,
-    }
+    })
 }
 
 /// The start leg's [`Leg::Spent`]: the stop *succeeded* — confirmed, under a
@@ -238,35 +229,23 @@ fn spent_before_start(id: &Id, budget: Budget) -> Error {
 
 /// The start leg's failure, re-wrapped to say what the stop leg established.
 ///
-/// Re-wrapped variant by variant rather than flattened to an [`Error::Step`]:
 /// `run_id_verb` reads the variant, and an `Undetermined` or `WaitTimeout`
 /// start leg erased here would exit `1` in the states where the distinction
 /// matters most — stopped and not back up, or stopped and still on its way.
 fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
-    match e {
+    let reworded = |leaf| rewrapped_start_leg(id, budget, leaf);
+    match e.cause() {
         // First, and ahead of the non-waiting arm below, so that both paths
         // preserve it. [`Error::Unestablished`] says in as many words that
         // what is installed at the id was never in doubt; absorbing an
         // `Undetermined` start leg into it makes that false. Only the clause
         // differs between the paths, because only what the stop leg
         // established differs.
-        Error::Undetermined { id, reason, recovery } => Error::Undetermined {
-            id,
-            reason: format!("{}: {reason}", after_stop_clause(budget)),
-            recovery,
-        },
+        //
         // The start may have reached the manager: kept as it is, ahead of the
         // non-waiting arm below, whose "refused" it was not, and never called a
         // failure to restart, which is what it did not establish.
-        Error::RequestInDoubt {
-            request,
-            reached,
-            detail,
-        } => Error::RequestInDoubt {
-            request,
-            reached,
-            detail: format!("{}: {detail}", start_after_stop_clause(id, budget)),
-        },
+        Error::Undetermined { .. } | Error::RequestInDoubt { .. } => e.map_cause(reworded),
         // The stop was issued and not waited for, and the start that
         // followed was refused — determinately (a launchd `bootstrap` that
         // fails outright) or not (SCM's `ERROR_SERVICE_ALREADY_RUNNING` over a
@@ -274,14 +253,31 @@ fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
         // one request. Either way nothing confirmed the stop,
         // which may be in flight, done, or have had nothing to do, so where
         // the daemon ended up is what nobody established.
-        e if !budget.waits() => Error::Unestablished {
+        _ if !budget.waits() => Error::Unestablished {
             id: id.as_str().to_string(),
-            detail: format!(
-                "the stop was issued without waiting for it, and the start that followed was \
-                 refused: {}. `goetia daemon status {id}` shows the manager's current view.",
-                e.report()
-            ),
+            refused: Box::new(e),
         },
+        Error::WaitTimeout { .. } => e.map_cause(reworded),
+        _ => Error::Step {
+            what: "stopped but failed to restart".to_string(),
+            source: Box::new(e),
+        },
+    }
+}
+
+/// The cause of a start leg's failure, re-worded to say what the stop leg established. Called only
+/// for the three it re-words.
+fn rewrapped_start_leg(id: &Id, budget: Budget, leaf: Error) -> Error {
+    match leaf {
+        Error::Undetermined { id, reason, recovery } => Error::Undetermined {
+            id,
+            reason: Box::new(Error::Step {
+                what: after_stop_clause(budget).to_string(),
+                source: reason,
+            }),
+            recovery,
+        },
+        e @ Error::RequestInDoubt { .. } => e.in_doubt_context(start_after_stop_clause(id, budget)),
         Error::WaitTimeout {
             id,
             awaited,
@@ -293,10 +289,13 @@ fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
             id,
             awaited,
         },
-        other => Error::Step {
-            what: "stopped but failed to restart".to_string(),
-            source: Box::new(other),
-        },
+        other => {
+            debug_assert!(
+                false,
+                "only the causes `after_start_failed` re-words reach here, got {other:?}"
+            );
+            other
+        }
     }
 }
 

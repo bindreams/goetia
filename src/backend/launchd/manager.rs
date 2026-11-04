@@ -63,17 +63,18 @@ use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::{fs, io};
 
 use crate::backend::bounded::{self, Finished, Reservation, Role};
 use crate::backend::client::{Client, ClientError, Real, Wait};
 use crate::backend::launchd::{generate, refuse, state};
 use crate::backend::{
-    self, Identity, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
+    self, Decoded, Identity, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
 };
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
-use crate::error::{Error, PutBackFound, Result};
+use crate::error::{Error, Occupant, PutBackFound, Reason, Result};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, Installed, State, Status, Step, flow};
 use crate::spec::{AccountId, DaemonSpec, Id, Restart, User};
@@ -185,8 +186,8 @@ fn locate(id: &str) -> Result<Option<Location>> {
         // location is a fact about both directories at once, and the
         // remaining three answers — absent, staged, enabled — each claim
         // something about the directory that was never read.
-        (Presence::Undetermined { source }, _) => Err(undetermined(id, "stat", &staging, &source)),
-        (_, Presence::Undetermined { source }) => Err(undetermined(id, "stat", &enabled, &source)),
+        (Presence::Undetermined { source }, _) => Err(undetermined(id, "stat", &staging, source)),
+        (_, Presence::Undetermined { source }) => Err(undetermined(id, "stat", &enabled, source)),
         (Presence::Absent, Presence::Absent) => Ok(None),
         (Presence::Present, Presence::Absent) => Ok(Some(Location {
             path: staging,
@@ -218,7 +219,7 @@ fn locate(id: &str) -> Result<Option<Location>> {
 /// What the errno does choose is `recovery` — re-running elevated is advice
 /// only a permission boundary earns, and offering it for a failing disk
 /// sends the user somewhere useless.
-fn undetermined(id: &str, op: &str, path: &Path, source: &io::Error) -> Error {
+fn undetermined(id: &str, op: &str, path: &Path, source: io::Error) -> Error {
     let recovery = if source.kind() == io::ErrorKind::PermissionDenied {
         "re-run as root (or under sudo): that read is what tells goetia whether anything is \
          installed at this id"
@@ -228,17 +229,9 @@ fn undetermined(id: &str, op: &str, path: &Path, source: &io::Error) -> Error {
     };
     Error::Undetermined {
         id: id.to_string(),
-        reason: read_detail(op, path, source),
+        reason: Box::new(Error::os_at(op, path, source)),
         recovery: recovery.to_string(),
     }
-}
-
-/// What did not complete, as facts — which operation, which path, which
-/// failure — with no claim about the id attached. Shared by [`undetermined`]
-/// and by `list`'s [`Installed::Undetermined`] entry, so the error and the
-/// entry cannot describe one failure differently.
-fn read_detail(op: &str, path: &Path, source: &dyn std::fmt::Display) -> String {
-    format!("failed to {op} {path}: {source}", path = path.display())
 }
 
 /// The magic every binary property list begins with. `plutil -convert
@@ -407,7 +400,7 @@ fn read_artifact(path: &Path, id: &str) -> Result<String> {
         Obtained::Bytes(bytes) => bytes,
         Obtained::Absent => return Err(Error::NotInstalled { id: id.to_string() }),
         Obtained::NonRegular => return Ok(String::new()),
-        Obtained::Failed(e) => return Err(undetermined(id, "read", path, &e)),
+        Obtained::Failed(e) => return Err(undetermined(id, "read", path, e)),
     };
     match classify(bytes) {
         ClassifyOutcome::Text(text) => Ok(text),
@@ -418,13 +411,13 @@ fn read_artifact(path: &Path, id: &str) -> Result<String> {
 /// A marked plist, as `read` saw it: where it is, and its text.
 pub(crate) struct Plist {
     id: Id,
-    blob: Result<Blob>,
+    blob: Decoded,
     location: Location,
     text: String,
 }
 
 impl Plist {
-    fn new(id: Id, blob: Result<Blob>, (location, text): (Location, String)) -> Self {
+    fn new(id: Id, blob: Decoded, (location, text): (Location, String)) -> Self {
         Self {
             id,
             blob,
@@ -439,7 +432,7 @@ impl InstalledService for Plist {
         &self.id
     }
 
-    fn blob(&self) -> std::result::Result<&Blob, &Error> {
+    fn blob(&self) -> std::result::Result<&Blob, &Arc<Error>> {
         self.blob.as_ref()
     }
 }
@@ -452,6 +445,7 @@ fn read_at(id: &str, location: Location) -> Result<ReadOutcome<Unnamed<(Location
     let Some(blob) = generate::extract(&text).transpose() else {
         return Ok(ReadOutcome::Foreign { recovery: None });
     };
+    let blob = blob.map_err(Arc::new);
     Ok(ReadOutcome::Marked(Unnamed {
         blob,
         body: (location, text),
@@ -500,15 +494,18 @@ fn resolve_account(user: &User) -> Result<Account> {
         User::Root => account_from_uid(0),
         User::Name(name) => nix::unistd::User::from_name(name)
             .map_err(|e| Error::AccountLookup {
-                detail: format!("look up user `{name}`: {e}"),
+                detail: format!("look up user `{name}`"),
+                source: Some(e.into()),
             })?
             .map(Account::from)
             .ok_or_else(|| Error::AccountLookup {
                 detail: format!("no such user `{name}` on this host"),
+                source: None,
             }),
         User::Id(AccountId::Uid(uid)) => account_from_uid(*uid),
         User::Id(AccountId::Sid(sid)) => Err(Error::AccountLookup {
             detail: format!("user `{{id: {sid}}}` names a Windows SID, which is not meaningful on macOS"),
+            source: None,
         }),
     }
 }
@@ -516,11 +513,13 @@ fn resolve_account(user: &User) -> Result<Account> {
 fn account_from_uid(uid: u32) -> Result<Account> {
     nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
         .map_err(|e| Error::AccountLookup {
-            detail: format!("look up uid {uid}: {e}"),
+            detail: format!("look up uid {uid}"),
+            source: Some(e.into()),
         })?
         .map(Account::from)
         .ok_or_else(|| Error::AccountLookup {
             detail: format!("no such uid {uid} on this host"),
+            source: None,
         })
 }
 
@@ -703,8 +702,9 @@ fn undo_write(target: &Path, wrote: &str, previous: Option<&str>) -> Result<()> 
         path: target.to_path_buf(),
         found,
     };
-    // `install` writes a regular file, so anything else at the path (a symlink, dangling or not, a
-    // directory) is someone else's.
+    // `install` writes a regular file, so anything else found here (a symlink, dangling or not, a
+    // directory) is someone else's. This reports what the check found; the read below looks the
+    // path up again.
     match fs::symlink_metadata(target) {
         Ok(meta) if !meta.file_type().is_file() => return Err(blocked(PutBackFound::Replaced)),
         Ok(_) => {}
@@ -729,13 +729,13 @@ fn undo_write(target: &Path, wrote: &str, previous: Option<&str>) -> Result<()> 
 }
 
 /// What is at `path`, for a message.
-fn describe_at(path: &Path) -> String {
+fn describe_at(path: &Path) -> Occupant {
     match fs::symlink_metadata(path) {
-        Ok(m) if m.is_file() => "a file".to_owned(),
-        Ok(m) if m.is_dir() => "a directory".to_owned(),
-        Ok(m) if m.is_symlink() => "a symlink".to_owned(),
-        Ok(_) => "a special file".to_owned(),
-        Err(e) => format!("something that could not be read ({e})"),
+        Ok(m) if m.is_file() => Occupant::File,
+        Ok(m) if m.is_dir() => Occupant::Directory,
+        Ok(m) if m.is_symlink() => Occupant::Symlink,
+        Ok(_) => Occupant::Special,
+        Err(e) => Occupant::Unreadable(e),
     }
 }
 
@@ -809,7 +809,8 @@ fn failed(args: &[&str], request: bool, error: ClientError) -> Error {
             request: command,
             // `launchctl` never says when launchd has it.
             reached: false,
-            detail: source.to_string(),
+            note: None,
+            source: source.into(),
         }
     } else {
         Error::spawn(command, source)
@@ -1150,9 +1151,8 @@ impl Launchd {
     ///
     /// The check before the write and the write are not atomic, and launchd relaunches a loaded job from
     /// the definition it was loaded with, not the plist on disk. A job loaded in between may hold either,
-    /// and goetia takes no lock, so it reports doubt rather than success. A failed read leaves the same
-    /// question open. Put the plist back as it was first: with the new one on disk a rerun reads
-    /// `UpToDate` and never reaches the loaded job.
+    /// and goetia takes no lock, so it reports doubt rather than success. Put the plist back as it was
+    /// first: with the new one on disk a rerun reads `UpToDate` and never reaches the loaded job.
     fn recheck_after_write(
         &self,
         id: &Id,
@@ -1167,7 +1167,7 @@ impl Launchd {
             Ok(_) => Err(refuse::loaded_after_write(id, undo_write(target, wrote, previous))),
             Err(read) => Err(refuse::state_unknown_after_write(
                 id,
-                &read,
+                read,
                 undo_write(target, wrote, previous),
             )),
         }
@@ -1255,7 +1255,7 @@ impl backend::Backend for Launchd {
                     // Something now exists where `read` saw nothing, and `is_loaded` has been called.
                     PersistOutcome::Raced => {
                         return Err(if loaded {
-                            refuse::slot_taken_after_bootout(&spec.id, &target, &describe_at(&target))
+                            refuse::slot_taken_after_bootout(&spec.id, &target, describe_at(&target))
                         } else {
                             refuse::changed_during_install(&spec.id, &target)
                         });
@@ -1368,7 +1368,7 @@ impl backend::Backend for Launchd {
         let deadline = verb_deadline(budget);
         let Plist { id, blob, location, .. } = snapshot;
         let id = &id;
-        let blob = blob?;
+        let blob = blob.map_err(Error::Kept)?;
         let timed_out = || budget::timed_out(id.as_str(), "running", budget);
         // What issuing the request takes: which of `bootstrap`/`kickstart` it
         // needs, and the `bootstrap` itself. None of it is bounded — the
@@ -1555,26 +1555,33 @@ fn scan_in(dirs: [(&str, bool); 2]) -> Scan<Plist> {
         for location in locations {
             match read_at(&id, location) {
                 Ok(found_here) => found.push(found_here),
-                Err(e) => match e.cause() {
-                    // Gone between the scan above and this read: an uninstall that completed,
-                    // observed one syscall later. Absence is established, so this is a skip rather
-                    // than a blind spot: reporting it would let a benign concurrent uninstall raise
-                    // `list`'s host-wide exit code.
-                    Error::NotInstalled { .. } => {}
-                    // A failed read leaves zero evidence of whether this plist ever carried a
-                    // Goetia marker at all. `Installed::Undetermined` claims neither ownership nor
-                    // absence, which is exactly what was established.
-                    Error::Undetermined { reason, .. } => {
-                        unestablished.get_or_insert(reason.clone());
-                    }
-                    _ => {
-                        unestablished.get_or_insert(e.report().to_string());
-                    }
-                },
+                // Gone between the scan above and this read: an uninstall that completed,
+                // observed one syscall later. Absence is established, so this is a skip rather
+                // than a blind spot: reporting it would let a benign concurrent uninstall raise
+                // `list`'s host-wide exit code.
+                Err(e) if matches!(e.cause(), Error::NotInstalled { .. }) => {}
+                // Undetermined, not absence or ownership: the failed read established neither. The
+                // read is its reason; the `status` recovery is left out.
+                Err(e) => {
+                    let failed = match e.into_undetermined() {
+                        Ok((read, _recovery)) => *read,
+                        Err(e) => e,
+                    };
+                    unestablished = Some(match unestablished {
+                        None => failed,
+                        Some(first) => Error::Both {
+                            first: Box::new(first),
+                            then: Box::new(failed),
+                        },
+                    });
+                }
             }
         }
-        if let Some(reason) = unestablished {
-            reported.push(Installed::Undetermined { name: Some(id), reason });
+        if let Some(failed) = unestablished {
+            reported.push(Installed::Undetermined {
+                name: Some(id),
+                reason: Reason::failed(failed),
+            });
             continue;
         }
         match <[_; 1]>::try_from(found) {
@@ -1587,7 +1594,7 @@ fn scan_in(dirs: [(&str, bool); 2]) -> Scan<Plist> {
                 if found.iter().any(|f| matches!(f, ReadOutcome::Marked(_))) {
                     reported.push(Installed::OursUnusable {
                         name: id,
-                        reason: format!("present in both {STAGING_DIR} and {ENABLED_DIR}"),
+                        reason: Reason::said(format!("present in both {STAGING_DIR} and {ENABLED_DIR}")),
                     });
                 }
             }

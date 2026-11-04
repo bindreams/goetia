@@ -1,3 +1,4 @@
+use std::error::Error as _;
 use std::io::{self, BufRead, ErrorKind, Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
@@ -559,6 +560,58 @@ fn an_announced_request_needs_no_temp_file() {
     }
 }
 
+/// Where a failed `cosca::error::Error::Io` is unwrapped in the two tests below.
+fn io_of(e: cosca::error::Error) -> io::Error {
+    match e {
+        cosca::error::Error::Io(e) => e,
+        other => panic!("expected Io, got {other:?}"),
+    }
+}
+
+/// A failure to make a stream's file keeps the OS error's kind, says only that the child was not
+/// run, and has the OS error as its source: `report` prints each once.
+#[skuld::test]
+fn a_failure_to_make_what_a_spawn_needs_says_it_was_not_run_and_keeps_its_cause() {
+    let cause = io::Error::from_raw_os_error(libc::EACCES);
+    let cause_text = cause.to_string();
+
+    let e = io_of(not_run("temp file")(cause));
+
+    assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(e.to_string(), "no temp file could be made, so it was not run");
+    assert_eq!(e.source().expect("the cause is the source").to_string(), cause_text);
+    assert_eq!(
+        crate::error::Error::spawn("cmd", e).report().to_string(),
+        format!("failed to run `cmd`: no temp file could be made, so it was not run: {cause_text}")
+    );
+}
+
+/// A temp file that cannot be read back fails as the stream it holds, with the OS error's kind and
+/// the OS error as its source: `report` prints each once.
+#[skuld::test]
+fn a_stream_file_that_cannot_be_read_back_names_the_stream_and_keeps_its_cause() {
+    let dir = tempfile::tempdir().unwrap();
+    // Opened for writing only, so reading it fails with `EBADF`.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dir.path().join("stdout"))
+        .unwrap();
+    let cause = io::Error::from_raw_os_error(libc::EBADF);
+    let cause_text = cause.to_string();
+
+    let e = io_of(read_back(file, "stdout").unwrap_err());
+
+    assert_eq!(e.kind(), cause.kind());
+    assert_eq!(e.to_string(), "stdout");
+    assert_eq!(e.source().expect("the cause is the source").to_string(), cause_text);
+    assert_eq!(
+        crate::error::Error::spawn("cmd", e).report().to_string(),
+        format!("failed to run `cmd`: stdout: {cause_text}")
+    );
+}
+
 /// A spawn that failed is placed before the child ran only when cosca's error says so: an `Io`
 /// carrying an OS error from a pipe, `fork` or `exec`. Everything else — cosca's identity read and
 /// `SharedChild::new` after `exec`, and the variants it raises on both sides of it — may have run
@@ -903,9 +956,12 @@ fn collect_turns_a_reader_failure_into_an_error() {
     drop(tx);
 
     let e = collect(rx, Budget::Unbounded.start(), "stderr").unwrap_err();
+    assert_eq!(e.to_string(), "stderr", "the failing stream is named");
+    assert_eq!(e.kind(), ErrorKind::BrokenPipe, "the kind of the failure is kept");
+    let reported = crate::Error::spawn("client", e).report().to_string();
     assert!(
-        e.to_string().starts_with("stderr: "),
-        "the failing stream is named: {e}"
+        reported.starts_with("failed to run `client`: stderr: "),
+        "the failure under the stream's name is the source: {reported}"
     );
 }
 

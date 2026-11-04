@@ -206,7 +206,7 @@ pub fn extract(unit_text: &str) -> Result<Option<Blob>, Error> {
         [] => return Ok(None),
         [only] => *only + 1,
         _ => {
-            return Err(Error::Blob(format!(
+            return Err(Error::blob(format!(
                 "unit text has {n} [X-Goetia] sections, expected at most one",
                 n = section_starts.len()
             )));
@@ -229,14 +229,14 @@ pub fn extract(unit_text: &str) -> Result<Option<Blob>, Error> {
         let trimmed = line.trim();
         if let Some(value) = trimmed.strip_prefix("Marker=") {
             if marker.is_some() {
-                return Err(Error::Blob(
+                return Err(Error::blob(
                     "[X-Goetia] section has more than one Marker= line".to_string(),
                 ));
             }
             marker = Some(value);
         } else if let Some(value) = trimmed.strip_prefix("Spec=") {
             if spec_value.is_some() {
-                return Err(Error::Blob(
+                return Err(Error::blob(
                     "[X-Goetia] section has more than one Spec= line".to_string(),
                 ));
             }
@@ -244,14 +244,14 @@ pub fn extract(unit_text: &str) -> Result<Option<Blob>, Error> {
         }
     }
 
-    let marker = marker.ok_or_else(|| Error::Blob("[X-Goetia] section has no Marker= line".to_string()))?;
+    let marker = marker.ok_or_else(|| Error::blob("[X-Goetia] section has no Marker= line".to_string()))?;
     if marker != MARKER {
-        return Err(Error::Blob(format!(
+        return Err(Error::blob(format!(
             "[X-Goetia] section has unexpected Marker value `{marker}`"
         )));
     }
 
-    let spec_value = spec_value.ok_or_else(|| Error::Blob("[X-Goetia] section has no Spec= line".to_string()))?;
+    let spec_value = spec_value.ok_or_else(|| Error::blob("[X-Goetia] section has no Spec= line".to_string()))?;
 
     // Our own generator never emits whitespace or a backslash inside
     // `Spec=`'s base64 value. Either one means the line was hand-edited
@@ -259,7 +259,7 @@ pub fn extract(unit_text: &str) -> Result<Option<Blob>, Error> {
     // literal embedded space) that this line-based reader does not
     // follow — reject rather than silently decode a truncated value.
     if spec_value.chars().any(|c| c.is_whitespace() || c == '\\') {
-        return Err(Error::Blob(
+        return Err(Error::blob(
             "[X-Goetia] Spec= value contains whitespace or a line continuation".to_string(),
         ));
     }

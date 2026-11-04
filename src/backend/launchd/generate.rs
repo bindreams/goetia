@@ -66,7 +66,7 @@ fn find_metadata_blocks(text: &str) -> Result<Vec<&str>, Error> {
     while let Some(begin_rel) = text[cursor..].find(COMMENT_BEGIN) {
         let content_start = cursor + begin_rel + COMMENT_BEGIN.len();
         let Some(end_rel) = text[content_start..].find(COMMENT_END) else {
-            return Err(Error::Blob(
+            return Err(Error::blob(
                 "goetia metadata comment has a `goetia:begin` with no matching `goetia:end`".to_string(),
             ));
         };
@@ -104,13 +104,13 @@ fn parse_metadata_block(content: &str) -> Result<Blob, Error> {
         // contains whitespace, so an embedded newline (or anything else
         // that produced a further line) is a hand-edit or bit-rot. Reject
         // it outright rather than silently decoding a truncated prefix.
-        return Err(Error::Blob(
+        return Err(Error::blob(
             "goetia metadata comment has content after `Spec`".to_string(),
         ));
     }
 
     if marker != blob::MARKER {
-        return Err(Error::Blob(format!(
+        return Err(Error::blob(format!(
             "goetia metadata comment names marker `{marker}`, expected `{}`",
             blob::MARKER
         )));
@@ -122,10 +122,10 @@ fn parse_metadata_block(content: &str) -> Result<Blob, Error> {
 fn read_field<'a>(lines: &mut std::str::Lines<'a>, name: &str) -> Result<&'a str, Error> {
     let line = lines
         .next()
-        .ok_or_else(|| Error::Blob(format!("goetia metadata comment is missing `{name}`")))?;
+        .ok_or_else(|| Error::blob(format!("goetia metadata comment is missing `{name}`")))?;
     let prefix = format!("{name}: ");
     line.strip_prefix(prefix.as_str())
-        .ok_or_else(|| Error::Blob(format!("goetia metadata comment: expected `{name}: ...`, got `{line}`")))
+        .ok_or_else(|| Error::blob(format!("goetia metadata comment: expected `{name}: ...`, got `{line}`")))
 }
 
 /// Extract the metadata blob embedded in a generated plist, if any.
@@ -142,7 +142,7 @@ pub fn extract(plist_text: &str) -> Result<Option<Blob>, Error> {
     match blocks.as_slice() {
         [] => Ok(None),
         [only] => parse_metadata_block(only).map(Some),
-        _ => Err(Error::Blob(format!(
+        _ => Err(Error::blob(format!(
             "plist carries {} goetia metadata comments, expected at most one",
             blocks.len()
         ))),

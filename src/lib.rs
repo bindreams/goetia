@@ -14,7 +14,7 @@ pub mod spec;
 #[cfg(test)]
 mod version_tests;
 
-pub use error::{Error, Result};
+pub use error::{Error, Reason, Result};
 
 /// The running crate version, as declared in `Cargo.toml`.
 pub fn version() -> &'static str {

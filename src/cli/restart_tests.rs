@@ -217,7 +217,8 @@ fn in_doubt() -> Error {
     Error::RequestInDoubt {
         request: "systemctl start x.service".to_string(),
         reached: true,
-        detail: "lost".to_string(),
+        note: None,
+        source: std::io::Error::other("lost").into(),
     }
 }
 
@@ -237,5 +238,140 @@ fn a_leg_in_doubt_stays_in_doubt_under_every_budget() {
                 "{budget:?}: {e:?}"
             );
         }
+    }
+}
+
+/// What the stop leg established is said ahead of the cause, and the cause stays the typed source.
+#[skuld::test]
+fn a_start_leg_in_doubt_says_what_the_stop_established_and_keeps_its_cause() {
+    let id = Id::try_from("frpc").unwrap();
+
+    let e = after_start_failed(&id, Budget::DEFAULT, in_doubt());
+
+    assert!(
+        e.report()
+            .to_string()
+            .ends_with("`frpc` was stopped, and this start was attempted after it: lost"),
+        "{}",
+        e.report()
+    );
+    assert!(std::error::Error::source(&e).is_some());
+}
+
+/// A start leg whose read of the id failed after the stop is still `Undetermined`, with the stop's
+/// clause ahead of the failed read, and the remedy last.
+#[skuld::test]
+fn an_undetermined_start_leg_keeps_its_read_under_the_stop_clause() {
+    let id = Id::try_from("frpc").unwrap();
+    let undetermined = Error::Undetermined {
+        id: "frpc".to_string(),
+        reason: Box::new(Error::os("read", std::io::Error::other("denied"))),
+        recovery: "re-run as root".to_string(),
+    };
+
+    let e = after_start_failed(&id, Budget::DEFAULT, undetermined);
+
+    assert!(matches!(e, Error::Undetermined { .. }), "{e:?}");
+    assert_eq!(
+        e.report().to_string(),
+        "cannot determine whether daemon `frpc` is installed: stopped but failed to restart: failed to read: \
+         denied. re-run as root"
+    );
+}
+
+/// Under a budget that does not wait, the clause is the stop-leg fact the user most needs: it comes
+/// before the failed read, and the remedy after it.
+#[skuld::test]
+fn an_undetermined_start_leg_after_an_unwaited_stop_says_so_before_the_read_and_the_remedy_last() {
+    let id = Id::try_from("frpc").unwrap();
+    let undetermined = Error::Undetermined {
+        id: "frpc".to_string(),
+        reason: Box::new(Error::os("read", std::io::Error::other("denied"))),
+        recovery: "re-run as root".to_string(),
+    };
+
+    let e = after_start_failed(&id, Budget::Immediate, undetermined);
+
+    assert_eq!(
+        e.report().to_string(),
+        "cannot determine whether daemon `frpc` is installed: the stop was issued without waiting for it, and the \
+         start that followed was not determined: failed to read: denied. re-run as root"
+    );
+}
+
+/// A refused start after a stop nobody waited for keeps the refusal as the cause.
+#[skuld::test]
+fn a_refused_start_after_an_unwaited_stop_is_unestablished_with_the_refusal_as_its_cause() {
+    let id = Id::try_from("frpc").unwrap();
+    let refused = Error::os("start `frpc`", std::io::Error::other("refused"));
+
+    let e = after_start_failed(&id, Budget::Immediate, refused);
+
+    assert!(matches!(e, Error::Unestablished { .. }), "{e:?}");
+    assert!(e.is_indeterminate());
+    assert!(
+        e.report().to_string().ends_with(": failed to start `frpc`: refused"),
+        "{}",
+        e.report()
+    );
+}
+
+/// A leg that failed as a step over a request in doubt is in doubt as the bare request is: the
+/// re-wording reaches the request under the step, and the step stays outermost in the report.
+#[skuld::test]
+fn a_step_over_a_leg_in_doubt_is_reworded_under_the_step() {
+    let id = Id::try_from("frpc").unwrap();
+    let step = || Error::Step {
+        what: "start".to_string(),
+        source: Box::new(in_doubt()),
+    };
+
+    for budget in [Budget::Immediate, Budget::Unbounded, Budget::DEFAULT] {
+        let started = after_start_failed(&id, budget, step());
+        assert!(matches!(started, Error::Step { .. }), "{budget:?}: {started:?}");
+        assert!(
+            matches!(started.cause(), Error::RequestInDoubt { .. }),
+            "{budget:?}: {started:?}"
+        );
+        let text = started.report().to_string();
+        assert!(text.starts_with("start: `systemctl start x.service` reached"), "{text}");
+        assert!(text.contains("this start was attempted after it"), "{text}");
+
+        let stopped = abandoned_before_start(&id, step(), budget);
+        assert!(
+            matches!(stopped.cause(), Error::RequestInDoubt { .. }),
+            "{budget:?}: {stopped:?}"
+        );
+        assert!(
+            stopped.report().to_string().contains("the restart was abandoned"),
+            "{}",
+            stopped.report()
+        );
+    }
+}
+
+/// A start judged as a managed service's is its failed start for the wording too: the request in
+/// doubt under it is reworded, and the unreadable blob stays in the report.
+#[skuld::test]
+fn a_start_judged_as_managed_over_a_leg_in_doubt_is_reworded_under_it() {
+    let id = Id::try_from("frpc").unwrap();
+    let judged = || Error::StartAsManaged {
+        blob: std::sync::Arc::new(Error::blob("corrupt")),
+        source: Box::new(in_doubt()),
+    };
+
+    for budget in [Budget::Immediate, Budget::Unbounded, Budget::DEFAULT] {
+        let started = after_start_failed(&id, budget, judged());
+        assert!(
+            matches!(started, Error::StartAsManaged { .. }),
+            "{budget:?}: {started:?}"
+        );
+        assert!(
+            matches!(started.cause(), Error::RequestInDoubt { .. }),
+            "{budget:?}: {started:?}"
+        );
+        let text = started.report().to_string();
+        assert!(text.contains("this start was attempted after it"), "{budget:?}: {text}");
+        assert!(text.contains("(blob: corrupt)"), "{budget:?}: {text}");
     }
 }

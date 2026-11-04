@@ -161,7 +161,7 @@ fn a_job_in_doubt_whose_plist_could_not_be_restored_carries_the_failure() {
 #[skuld::test]
 fn an_unreadable_recheck_is_in_doubt_and_names_the_remedy_and_the_failure() {
     let read = failed_print();
-    let e = state_unknown_after_write(&Id::try_from("frpc").unwrap(), &read, Ok(()));
+    let e = state_unknown_after_write(&Id::try_from("frpc").unwrap(), read, Ok(()));
     assert!(matches!(e, Error::LoadedStateInDoubt { .. }), "{e:?}");
     let message = e.to_string();
     assert!(message.contains("`frpc`"), "{message}");
@@ -175,7 +175,7 @@ fn an_unreadable_recheck_is_in_doubt_and_names_the_remedy_and_the_failure() {
 #[skuld::test]
 fn an_unreadable_recheck_whose_plist_could_not_be_restored_carries_both_failures() {
     let read = failed_print();
-    let e = state_unknown_after_write(&Id::try_from("frpc").unwrap(), &read, Err(restore_failure()));
+    let e = state_unknown_after_write(&Id::try_from("frpc").unwrap(), read, Err(restore_failure()));
     assert!(matches!(e, Error::LoadedStateInDoubt { .. }), "{e:?}");
     let message = e.report().to_string();
     assert!(message.contains("Input/output error"), "{message}");
@@ -190,7 +190,7 @@ fn an_unreadable_recheck_whose_plist_could_not_be_restored_carries_both_failures
 #[skuld::test]
 fn a_plist_taken_after_the_bootout_says_what_was_done_and_what_is_there() {
     let path = std::path::Path::new("/Library/Application Support/Goetia/daemons/frpc.plist");
-    let e = slot_taken_after_bootout(&Id::try_from("frpc").unwrap(), path, "a directory");
+    let e = slot_taken_after_bootout(&Id::try_from("frpc").unwrap(), path, Occupant::Directory);
     assert!(matches!(e, Error::StaleJobBootedOut { .. }), "{e:?}");
     let message = e.to_string();
     assert!(message.contains("`frpc`"), "{message}");
@@ -199,6 +199,26 @@ fn a_plist_taken_after_the_bootout_says_what_was_done_and_what_is_there() {
     assert!(message.contains(&path.display().to_string()), "{message}");
     assert!(message.contains("re-run install"), "{message}");
     assert!(!message.contains("nothing was"), "{message}");
+}
+
+/// A path that could not be inspected keeps the error that said so, and its text is in the message.
+#[skuld::test]
+fn a_plist_taken_after_the_bootout_that_could_not_be_inspected_keeps_the_error() {
+    let path = std::path::Path::new("/p");
+    let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+    let e = slot_taken_after_bootout(&Id::try_from("frpc").unwrap(), path, Occupant::Unreadable(denied));
+    assert!(
+        e.to_string()
+            .contains("something that could not be read (denied) appeared at /p"),
+        "{e}"
+    );
+    assert!(matches!(
+        e,
+        Error::StaleJobBootedOut {
+            found: Occupant::Unreadable(ref denied),
+            ..
+        } if denied.kind() == std::io::ErrorKind::PermissionDenied
+    ));
 }
 
 // changed_during_install ==============================================================================================
