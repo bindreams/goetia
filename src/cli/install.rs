@@ -80,7 +80,7 @@ pub fn run(
         }
     };
 
-    // Each step (install, `--enable`, `--start`) contributes at most one code; the greatest wins.
+    // Each step (install, `--enable`, `--start`) contributes at most one code; see `ExitCode` for which wins.
     let mut codes: Vec<ExitCode> = Vec::new();
     // Before the install sends anything, so that nothing the start needs
     // can run out after the install booted a loaded job out.
@@ -101,7 +101,10 @@ pub fn run(
                 ExitCode::Success => codes.push(ExitCode::Success),
                 // Nothing was (re)written: neither flag below has anything to
                 // act on.
-                other => return other,
+                other => {
+                    debug_assert!(matches!(other, ExitCode::Conflict | ExitCode::Error), "{other:?}");
+                    return other;
+                }
             }
             if args.enable {
                 if let Err(e) = mgr.enable(&spec.id) {

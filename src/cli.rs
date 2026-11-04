@@ -121,7 +121,7 @@ pub enum DaemonCommand {
 /// Dispatch a parsed [`Cli`] to its subcommand, returning the process exit
 /// code. This doc comment is the one place the whole exit-code vocabulary
 /// is written down; nothing else in the crate should re-derive it. Each name
-/// below is an [`ExitCode`] variant (`success` is `ExitCode::Success`).
+/// below is an [`ExitCode`] variant.
 ///
 /// - `0` success. `uninstall` alone also counts an already-absent artifact
 ///   as success — `Error::NotInstalled` says nothing about the *process*,
@@ -145,9 +145,11 @@ pub enum DaemonCommand {
 ///   answer — `diff` returns it when the daemon would change
 ///   (`cli::diff::run`, the only place this code is returned).
 /// - `4` indeterminate: a question Goetia could not answer, or an operation
-///   whose outcome it could not establish. A failed operation is this exactly
-///   when [`Error::is_indeterminate`](crate::error::Error::is_indeterminate);
-///   every verb classifies its errors through that one function. The rest come
+///   whose outcome it could not establish. For the id verbs, `install` and
+///   `diff`, a failed operation is this exactly when
+///   [`Error::is_indeterminate`](crate::error::Error::is_indeterminate).
+///   `status <id>` instead maps its errors through `report::status_error`, where
+///   anything it cannot attribute is `unusable` (`4`). The rest come
 ///   from the answer itself: `list`/`status` report an id they own but cannot
 ///   report on, and an entry `list()` could not classify, as `4`; `diff` and
 ///   `show` do the same for an "installed but unusable" id, and `show` also for

@@ -189,6 +189,10 @@ struct FlakyManager {
     fail_list: bool,
     unqueryable: Option<String>,
     fail_preview_for: Option<String>,
+    /// `preview_install` fails with `Error::Undetermined`: the `diff` twin of `undetermined_start_for`.
+    undetermined_preview_for: Option<String>,
+    /// `preview_install` fails with `Error::WaitTimeout`.
+    wait_timeout_preview_for: Option<String>,
     hidden_from_list: Option<String>,
     /// The same id as `hidden_from_list`, reported honestly: `list()` emits
     /// `Installed::Undetermined` for it instead of dropping it. The pair is
@@ -197,21 +201,15 @@ struct FlakyManager {
     /// `stop` succeeds and `start` then fails with `Error::Undetermined`.
     /// The only order in which `restart`'s closure re-wraps the start leg's
     /// failure, and so the only way to reach that re-wrap with a variant
-    /// that has to survive it. Also `install --start`'s own leg, which
-    /// classifies its failure itself rather than inheriting anything from
-    /// the `install` that preceded it.
+    /// that has to survive it. Also `install --start`'s start leg.
     undetermined_start_for: Option<String>,
-    /// `enable` fails with `Error::Undetermined` — the `--enable` twin of
-    /// `undetermined_start_for`, and a third independent decision:
-    /// `install`'s `ExitCode::of` calls each classify their own
-    /// step.
+    /// `enable` fails with `Error::Undetermined` — the `--enable` twin of `undetermined_start_for`, exercising `install`'s enable step.
     undetermined_enable_for: Option<String>,
-    /// `start` fails with `Error::WaitTimeout`. A fourth independent
-    /// decision, and a different *condition* from the two above: the
+    /// `start` fails with `Error::WaitTimeout`, a different *condition* from the two above: the
     /// request was issued and accepted, and goetia stopped waiting for its
     /// outcome. `Fake` reaches this only for an entry seeded stalled, which
     /// no `install`-path fixture has, so injecting it is the only way to
-    /// put it in front of `run_id_verb` and `install`'s own classifier.
+    /// put it in front of `run_id_verb` and `install`.
     wait_timeout_start_for: Option<String>,
     /// Makes `install`/`preview_install` return the `Conflict` flavour whose
     /// cause lies outside the directory the backend writes — systemd's
@@ -308,6 +306,12 @@ impl ServiceManager for FlakyManager {
     fn preview_install(&self, spec: &DaemonSpec) -> goetia::Result<goetia::decide::Outcome> {
         if self.fail_preview_for.as_deref() == Some(spec.id.as_str()) {
             return Err(injected_failure(&spec.id));
+        }
+        if self.undetermined_preview_for.as_deref() == Some(spec.id.as_str()) {
+            return Err(injected_indeterminacy(&spec.id));
+        }
+        if self.wait_timeout_preview_for.as_deref() == Some(spec.id.as_str()) {
+            return Err(injected_wait_timeout(&spec.id));
         }
         if let Some(recovery) = &self.unclearable_conflict {
             return Ok(unclearable_conflict(recovery));
@@ -1876,6 +1880,78 @@ fn diff_exits_one_when_the_manager_cannot_answer() {
     assert!(err.contains("frpc"), "the failing id is named:\n{err}");
 }
 
+/// A `diff` whose manager failed in a way that leaves the answer open is exit `4`, not `1`.
+#[skuld::test]
+fn diff_exits_four_when_the_manager_cannot_determine() {
+    let mgr = FlakyManager {
+        undetermined_preview_for: Some("frpc".to_string()),
+        ..Default::default()
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(
+        dir.path(),
+        "id: frpc
+command: [frpc]
+",
+    );
+
+    let (code, out, err) = dispatch_with(
+        &["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()],
+        &mgr,
+        &never_elevated,
+    );
+
+    assert_eq!(
+        code, 4,
+        "stdout:
+{out}
+stderr:
+{err}"
+    );
+    assert!(
+        err.contains("frpc"),
+        "the failing id is named:
+{err}"
+    );
+}
+
+/// A `diff` whose manager ran out of wait budget is exit `4`, not `1`.
+#[skuld::test]
+fn diff_exits_four_when_the_manager_times_out() {
+    let mgr = FlakyManager {
+        wait_timeout_preview_for: Some("frpc".to_string()),
+        ..Default::default()
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(
+        dir.path(),
+        "id: frpc
+command: [frpc]
+",
+    );
+
+    let (code, out, err) = dispatch_with(
+        &["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()],
+        &mgr,
+        &never_elevated,
+    );
+
+    assert_eq!(
+        code, 4,
+        "stdout:
+{out}
+stderr:
+{err}"
+    );
+    assert!(
+        err.contains("frpc"),
+        "the failing id is named:
+{err}"
+    );
+}
+
 /// `state_str`'s `Failed`/`Unknown` arms are otherwise unreachable from any
 /// test — `Fake::start`/`stop` can only ever produce `Running`/`Stopped` —
 /// so nothing would catch a wrong string or a swapped arm there.
@@ -3016,7 +3092,7 @@ fn install_exits_four_for_an_undetermined_id() {
 }
 
 /// The artifact was written and the id is goetia's beyond doubt, and then the *enable* could not be
-/// answered — a distinct call site from the `mgr.install` failure above, classifying its own step.
+/// answered.
 /// Reporting `1` here would say the enable determinately failed, which is what nobody established.
 #[skuld::test]
 fn install_exits_four_when_the_enable_leg_cannot_be_determined() {
@@ -3044,9 +3120,8 @@ fn install_exits_four_when_the_enable_leg_cannot_be_determined() {
     assert!(err.contains("enable"), "the failing step is named: {err}");
 }
 
-/// The third call site, and the same rule: `install --start` classifies its own step. Every other
-/// test that reaches an undetermined `start` goes through `restart`, which is a different path
-/// entirely.
+/// `install --start`'s start leg. Every other test that reaches an undetermined `start` goes
+/// through `restart`, a different path entirely.
 #[skuld::test]
 fn install_exits_four_when_the_start_leg_cannot_be_determined() {
     let dir = tempfile::tempdir().unwrap();
@@ -3073,9 +3148,8 @@ fn install_exits_four_when_the_start_leg_cannot_be_determined() {
     assert!(err.contains("start"), "the failing step is named: {err}");
 }
 
-/// `install --start`'s own classifier, and the same rule as the undetermined case above: it
-/// classifies its own step. A catch-all classifier would report `1` — "the start determinately
-/// failed" — for a request that was issued, accepted and simply not waited out.
+/// `install --start`'s start leg timing out is exit `4`: the request was issued, accepted and
+/// simply not waited out, so `1` ("determinately failed") would be wrong.
 #[skuld::test]
 fn install_exits_four_when_the_start_leg_timed_out() {
     let dir = tempfile::tempdir().unwrap();

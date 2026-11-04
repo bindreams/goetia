@@ -4,16 +4,13 @@ use super::*;
 fn exit_codes_combine_by_precedence() {
     use ExitCode::*;
 
-    assert_eq!(
-        [Success, Drift, Conflict, Indeterminate, Error].iter().max(),
-        Some(&Error)
+    assert!(
+        [Success, Drift, Conflict, Indeterminate, Error, Usage]
+            .windows(2)
+            .all(|w| w[0] < w[1])
     );
-    assert_eq!(Drift.max(Conflict), Conflict);
-    assert_eq!(Conflict.max(Indeterminate), Indeterminate);
-    assert_eq!(Success.max(Drift), Drift);
 }
 
-/// The README's exit-code table.
 #[skuld::test]
 fn exit_code_numbers_are_the_documented_ones() {
     for (code, number) in [

@@ -292,7 +292,6 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
                 let _ = writeln!(out, "{id}: not installed (nothing to do)");
                 codes.push(ExitCode::Success);
             }
-            // `uninstall`'s exemption is about absence, so an `Undetermined` id lands here too.
             Err(e) => {
                 let _ = writeln!(err, "error: {id}: {e}");
                 codes.push(ExitCode::of(&e));
