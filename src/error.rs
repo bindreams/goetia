@@ -17,8 +17,8 @@ use report::Report;
 /// What a variant's `#[source]` holds when the cause is another library's error.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// A source that can be cloned with the error that holds it, so the error that keeps it (a
-/// snapshot's blob failure, held as an `Arc<Error>`) can be handed out again.
+/// A foreign source shared rather than owned, so the `Blob` and `Invalid` errors that hold one stay
+/// cheap to share inside the `Arc<Error>` a snapshot keeps.
 pub type SharedError = Arc<dyn std::error::Error + Send + Sync>;
 
 /// Every goetia error. A variant is named for the layer that raised it, and its `Display` is its
