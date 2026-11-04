@@ -120,8 +120,8 @@ pub enum DaemonCommand {
 
 /// Dispatch a parsed [`Cli`] to its subcommand, returning the process exit
 /// code. This doc comment is the one place the whole exit-code vocabulary
-/// is written down; nothing else in the crate should re-derive it. Each code
-/// is a variant of [`ExitCode`], named as below.
+/// is written down; nothing else in the crate should re-derive it. Each name
+/// below is an [`ExitCode`] variant (`success` is `ExitCode::Success`).
 ///
 /// - `0` success. `uninstall` alone also counts an already-absent artifact
 ///   as success — `Error::NotInstalled` says nothing about the *process*,

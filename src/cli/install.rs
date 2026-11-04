@@ -101,7 +101,7 @@ pub fn run(
                 ExitCode::Success => codes.push(ExitCode::Success),
                 // Nothing was (re)written: neither flag below has anything to
                 // act on.
-                refused => return refused,
+                other => return other,
             }
             if args.enable {
                 if let Err(e) = mgr.enable(&spec.id) {
