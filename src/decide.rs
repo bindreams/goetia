@@ -35,15 +35,24 @@ pub enum Ownership {
         regenerated: String,
         on_disk: String,
     },
-    /// A Goetia-marked artifact exists but its blob will not decode — a
-    /// future schema, or corruption. Still *ours*: the marker was written
-    /// by some Goetia. Treating this as `Foreign` would mean downgrading
-    /// Goetia bricks management of a service this very tool created,
-    /// behind a message that misleadingly says "this isn't mine".
+    /// A Goetia-marked artifact exists, and goetia cannot use it: compare, report or render it.
+    /// Still *ours*: the marker was written by some Goetia. Treating it as `Foreign` would deny
+    /// ownership of a service goetia created.
     ///
-    /// `recovery` is the action that unblocks the id, or `None` when
-    /// discovery names none — a drop-in that cannot be read.
-    OursUnreadable { reason: String, recovery: Option<String> },
+    /// The causes:
+    /// 1. The embedded blob does not decode: a newer schema, or corruption.
+    /// 2. The embedded spec no longer renders: its account no longer resolves, or SCM refuses
+    ///    an older `restart: always` blob.
+    /// 3. The read of the installed definition, for comparison, failed (`install` and `diff`
+    ///    only).
+    /// 4. A marked entry sits at a name that is not a valid daemon id (`list` only).
+    /// 5. The live-state query failed (`list` and `status`).
+    /// 6. On launchd, the plist is present in both the staging and the enabled directory and at least
+    ///    one carries the marker, so the installation is ambiguous (`list` only).
+    ///
+    /// `recovery` is the action that unblocks the id, or `None` when discovery names none — a
+    /// drop-in that cannot be read.
+    OursUnusable { reason: String, recovery: Option<String> },
     /// A Goetia-marked service the manager found at this id, whose embedded spec names the
     /// different daemon `installed`: a manager that matches ids case-insensitively answers a
     /// request for `FRPC` with `frpc`'s service. Refused unconditionally — see `decide`.
@@ -91,7 +100,7 @@ impl ExternalConfig {
 
 /// What `decide` recommends doing. Every refusing variant names the exact
 /// action that unblocks it — an install interrupted at the wrong moment must
-/// never wedge an id with no in-tool remedy — except a `RefuseUnreadable`
+/// never wedge an id with no in-tool remedy — except a `RefuseUnusable`
 /// whose `recovery` is `None`, where no goetia action unblocks it. For
 /// `Conflict` that action is `--force` only where `--force` can actually
 /// take it; see `unclearable_recovery`.
@@ -134,10 +143,9 @@ pub enum Outcome {
     /// under `--force` is how a typo'd id destroys a hand-configured
     /// production service.
     RefuseForeign { recovery: String },
-    /// A Goetia-marked artifact whose blob will not decode, or whose
-    /// ownership could not be established. `recovery` is
-    /// [`Ownership::OursUnreadable`]'s, carried through.
-    RefuseUnreadable { reason: String, recovery: Option<String> },
+    /// A Goetia-marked artifact goetia cannot compare; the causes are on
+    /// [`Ownership::OursUnusable`], whose `recovery` is carried through.
+    RefuseUnusable { reason: String, recovery: Option<String> },
     /// The service found at the requested id is another daemon's, `installed`. No flag overrides
     /// this: installing would replace that daemon's service. [`other_daemon_refusal`] says what to do.
     RefuseOtherDaemon { installed: Id },
@@ -162,9 +170,9 @@ pub fn foreign_recovery(id: &str) -> String {
 
 /// The recovery text for an id whose blob will not decode. Its own function, like
 /// [`foreign_recovery`], so a backend's discovery and the CLI can give the identical wording.
-pub fn unreadable_recovery(id: &str) -> String {
+pub fn unusable_recovery(id: &str) -> String {
     format!(
-        "run `goetia daemon uninstall {id}` to remove the unreadable artifact (uninstall does \
+        "run `goetia daemon uninstall {id}` to remove the unusable artifact (uninstall does \
          not need to decode it), then re-run install",
     )
 }
@@ -191,7 +199,7 @@ pub fn other_daemon_refusal(installed: &str) -> String {
 ///   compared against the embedded blob's `version` to tell a stale
 ///   artifact (regenerate silently) from a hand-edited one (conflict).
 /// - `force` allows overwriting a genuine hand-edit. It never overrides a
-///   `Foreign`, `OtherDaemon` or `OursUnreadable` refusal.
+///   `Foreign`, `OtherDaemon` or `OursUnusable` refusal.
 /// - `external` is what the manager applies to this artifact from outside
 ///   its text — see [`ExternalConfig`]. Any but `Absent` changes one row: a
 ///   stale artifact carrying it is `Conflict`, not a
@@ -222,7 +230,7 @@ pub fn decide(
             installed: installed.clone(),
         },
 
-        Ownership::OursUnreadable { reason, recovery } => Outcome::RefuseUnreadable {
+        Ownership::OursUnusable { reason, recovery } => Outcome::RefuseUnusable {
             reason: reason.clone(),
             recovery: recovery.clone(),
         },

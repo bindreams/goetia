@@ -140,7 +140,7 @@ pub(crate) struct ScmSnapshot {
     /// Its `Parameters` values, which hold the only proof of ownership `type: managed` has.
     parameters: BTreeMap<String, String>,
     /// The object `read` opened to classify it, so `installed` and `live_status` ask that object:
-    /// a service deleted since then does not turn into an unreadable one. `None` for what `scan`
+    /// a service deleted since then does not turn into an unusable one. `None` for what `scan`
     /// saw, which opens no service.
     service: Option<Service>,
 }
@@ -969,7 +969,7 @@ fn open_scm(access: ServiceManagerAccess) -> Result<WinServiceManager> {
 /// ([`open_existing`], [`Backend::read`]). A manager that would not open leaves that
 /// id exactly as unclassified as a service object that would not open does, so
 /// it takes the same class — `Error::Other` here would reach
-/// `cli::report::status_error`'s catch-all as `Kind::Unreadable` and claim
+/// `cli::report::status_error`'s catch-all as `Kind::Unusable` and claim
 /// goetia owns an id it never got as far as looking at. Every other caller
 /// reaches [`open_scm`] only after ownership is settled, where `Other` is the
 /// true statement.
@@ -1051,7 +1051,7 @@ fn to_error(context: &str, e: windows_service::Error) -> Error {
 ///
 /// [`Error::Undetermined`], never the `Error::Other` [`to_error`] and
 /// `registry`'s own `registry_error` produce: `Other` reaches
-/// `cli::report::status_error`'s catch-all as `Kind::Unreadable`, which
+/// `cli::report::status_error`'s catch-all as `Kind::Unusable`, which
 /// *asserts* that goetia owns the id — the one thing a read that never
 /// completed cannot establish. `HKLM\SYSTEM\CurrentControlSet\Services` holds
 /// every vendor's service, so on this platform that claim is routinely about a

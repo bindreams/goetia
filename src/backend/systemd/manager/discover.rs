@@ -53,7 +53,7 @@ use super::{UNIT_DIR, io_err, unit_path};
 /// was found, a failed read leaves goetia unable to say whether *anything* is installed
 /// ([`Error::Undetermined`]). On the path where the fragment has already been opened, read and had
 /// its `[X-Goetia]` marker decoded, the same failure leaves an id goetia demonstrably owns merely
-/// impossible to report on ([`crate::decide::Ownership::OursUnreadable`]). A reader that picked one
+/// impossible to report on ([`crate::decide::Ownership::OursUnusable`]). A reader that picked one
 /// class for all its callers would put that claim on the other's id — which is exactly the rule
 /// [`Error::Undetermined`] exists to enforce: choose by what was established, never by what failed.
 #[derive(Debug)]
@@ -89,7 +89,7 @@ impl ReadFailure {
         undetermined(id, self.op, &self.path, &self.source)
     }
 
-    /// The reading for a caller that already knows goetia owns the id, so "unreadable" is a true
+    /// The reading for a caller that already knows goetia owns the id, so "unusable" is a true
     /// statement about it: `super::write::quarantine_if_still_ours`, which reaches this only after
     /// `read` found the fragment marked.
     pub(super) fn into_io_error(self) -> Error {
@@ -402,11 +402,11 @@ pub(super) fn installed(id: &str, text: &str) -> Result<InstalledDefinition<Stri
 /// the fragment's own open/read ([`raw_state`]), and — where that found no fragment — the drop-in
 /// scan and the `.wants` link stat ([`residue`]). Never for a read that failed *after* the fragment
 /// was decoded: see [`ReadFailure`] and [`installed`], which has established both the installation
-/// and its ownership by then and reports a drop-in it cannot read as `Ownership::OursUnreadable`
+/// and its ownership by then and reports a drop-in it cannot read as `Ownership::OursUnusable`
 /// instead.
 ///
 /// [`Error::Undetermined`], never [`io_err`]'s `Error::Other`: `Other` reaches
-/// `cli::report::status_error`'s catch-all as `Kind::Unreadable`, which *asserts* that goetia owns
+/// `cli::report::status_error`'s catch-all as `Kind::Unusable`, which *asserts* that goetia owns
 /// the id — the one thing a read that never completed cannot establish. See
 /// [`Error::Undetermined`]'s doc comment for why that claim is worth a variant of its own.
 ///

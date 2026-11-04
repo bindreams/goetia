@@ -238,11 +238,11 @@ impl Fake {
     /// `install_then_hand_edit` cannot produce this state: `extract` only
     /// ever reads the marker and `Spec` line, so appending trailing text
     /// never breaks decoding. This is the only way to reach
-    /// `Ownership::OursUnreadable`/[`Installed::OursUnreadable`] from outside
+    /// `Ownership::OursUnusable`/[`Installed::OursUnusable`] from outside
     /// the crate — every CLI test that exercises that path needs it.
     ///
-    /// [`Installed::OursUnreadable`]: crate::manager::Installed::OursUnreadable
-    pub fn seed_unreadable(&self, id: &str) {
+    /// [`Installed::OursUnusable`]: crate::manager::Installed::OursUnusable
+    pub fn seed_unusable(&self, id: &str) {
         self.seed_foreign(id, format!("{FAKE_MARKER}\nSpec: not-valid-base64!!!\n"));
     }
 
@@ -251,7 +251,7 @@ impl Fake {
     /// [`blob::decode`] rejects it with [`Error::Invalid`] rather than
     /// [`Error::Blob`].
     ///
-    /// [`Fake::seed_unreadable`] cannot reach this: malformed base64 fails
+    /// [`Fake::seed_unusable`] cannot reach this: malformed base64 fails
     /// at the envelope and yields `Error::Blob`. `Error::Invalid` is the
     /// variant `spec::Id::try_from` *also* produces, so it is the one a CLI
     /// classifying failures by error variant instead of by which operation

@@ -224,7 +224,7 @@ pub trait ServiceManager {
     /// The live state of one installed service. `Err` for an id whose blob
     /// will not decode — this must not fabricate a plausible-looking
     /// `Status` for state it cannot actually determine (see the crate-level
-    /// design notes on `Installed::OursUnreadable`, which exists for the
+    /// design notes on `Installed::OursUnusable`, which exists for the
     /// same reason on the `list` side) — and [`Error::Undetermined`] for an
     /// id whose artifact could not be read at all, where not even ownership
     /// was established. [`Error::NoManager`] where no manager can be asked
@@ -252,7 +252,7 @@ pub trait ServiceManager {
     /// [`Installed::Undetermined`] exists to end, arrived at from the other
     /// side. A scan that *started* and did not finish is the opposite case
     /// and does report (see `Installed::scan_incomplete`). So does an entry
-    /// whose live state could not be queried, as `OursUnreadable` — except
+    /// whose live state could not be queried, as `OursUnusable` — except
     /// where no manager can be asked for any entry's: that is
     /// [`Error::NoManager`], for the whole listing.
     ///
@@ -305,18 +305,18 @@ pub enum Installed {
         pid: Option<u32>,
         enabled: bool,
     },
-    /// Ours by marker, but the blob will not decode — a newer schema, or
-    /// corruption. Kept distinct from a silent omission: a single artifact
-    /// written by a newer Goetia must not take down `list`/`status` for
-    /// every other daemon, which is exactly what dropping this entry
-    /// silently would do.
-    OursUnreadable { name: String, reason: String },
+    /// Ours by marker, but goetia cannot report on it; `reason` says why. The causes are listed on
+    /// [`Ownership::OursUnusable`]. Kept distinct from a silent omission: one such artifact must
+    /// not take down `list`/`status` for every other daemon.
+    ///
+    /// [`Ownership::OursUnusable`]: crate::decide::Ownership::OursUnusable
+    OursUnusable { name: String, reason: String },
     /// Neither proof: the read that would have classified this id did not
     /// complete, so goetia established neither its absence nor its
     /// presence. The `list`-side counterpart of [`Error::Undetermined`],
     /// and separated from the two variants above by the same rule — what
     /// goetia *established*, never what went wrong. Reporting
-    /// `OursUnreadable` for a unit file an unelevated caller merely could
+    /// `OursUnusable` for a unit file an unelevated caller merely could
     /// not open claims ownership of what may be a stranger's service;
     /// omitting it claims it does not exist.
     ///

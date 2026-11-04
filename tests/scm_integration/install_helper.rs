@@ -15,9 +15,9 @@
 //!
 //! With a trailing `<sid-string>`, installs `user: {id: <sid-string>}`
 //! (`User::Id(AccountId::Sid)`) instead of `user: {name: <account-name>}` —
-//! `deleted_account_makes_the_service_oursunreadable` needs this: a
+//! `deleted_account_makes_the_service_oursunusable` needs this: a
 //! `User::Name` account never fails to re-resolve (no lookup at all), so
-//! only the SID path can actually exercise `Ownership::OursUnreadable`.
+//! only the SID path can actually exercise `Ownership::OursUnusable`.
 
 use goetia::backend::scm::manager::Scm;
 use goetia::manager::ServiceManager as _;

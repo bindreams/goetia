@@ -496,9 +496,9 @@ backend-specific:
 ```
 
 A service installed by an earlier release with `restart: always` on Windows
-is refused by `install` and `diff` as an unreadable artifact, until you run
+is refused by `install` and `diff` as an unusable artifact, until you run
 `goetia daemon uninstall <id>` and then `goetia daemon install`. `status`
-fails for it and `list` reports it as `unreadable`, because both render the
+fails for it and `list` reports it as `unusable`, because both render the
 embedded copy of the spec and SCM now refuses it. `start`, `stop`, `restart`
 and `uninstall` do not render it and keep working. What changes while it runs
 depends on its `type`. A `type: simple` service is no longer restarted when
@@ -579,16 +579,16 @@ worse than sending you to `goetia daemon show`.
 
 `errors[].kind` is one of eight values:
 
-| `kind`          | Exit code | Meaning                                                                                                                                                                                                                                                                                                                                                                                         |
-| --------------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `not-installed` | 1         | Nothing is installed at that id. Only from `status <id>`.                                                                                                                                                                                                                                                                                                                                       |
-| `foreign`       | 1         | A read that _completed_ established that what is there is not goetia's: an artifact carrying no marker, or a masked unit's symlink. Never inferred from a read that failed. Only from `status <id>`.                                                                                                                                                                                            |
-| `unreadable`    | 4         | Goetia read enough to know the id is its own, but cannot report on it — a blob it cannot decode, an embedded spec it can no longer render (an account that no longer resolves, or a spec the backend now refuses), or a live state it could not query, as of a unit systemd has not loaded. `message` says which.                                                                               |
-| `undetermined`  | 4         | Goetia could not determine **whether** anything is installed at that id: a read it needed failed. Claims no ownership — that is the whole difference from `unreadable`. `message` names what would not read — a path, or on Windows a registry key or service object — and what would make it readable. Only from `status <id>`; out of `list()` the same fact is the `undetermined` key below. |
-| `invalid-id`    | 1         | A command-line argument was not a valid daemon id. Fix the argument.                                                                                                                                                                                                                                                                                                                            |
-| `unavailable`   | 1         | Obtaining the manager, or listing, failed, so **no** answer was obtained for any daemon — `id` is `null`. Or, under a daemon's `id`, goetia would not ask systemd about that daemon: offline, from a chroot, or where systemd did not boot.                                                                                                                                                     |
-| `unsupported`   | 2         | `--json` was given to a subcommand that does not implement it.                                                                                                                                                                                                                                                                                                                                  |
-| `other`         | 1         | Unreachable today; reserved so an unclassified failure has a home rather than being silently dropped.                                                                                                                                                                                                                                                                                           |
+| `kind`          | Exit code | Meaning                                                                                                                                                                                                                                                                                                                                                                                       |
+| --------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `not-installed` | 1         | Nothing is installed at that id. Only from `status <id>`.                                                                                                                                                                                                                                                                                                                                     |
+| `foreign`       | 1         | A read that _completed_ established that what is there is not goetia's: an artifact carrying no marker, or a masked unit's symlink. Never inferred from a read that failed. Only from `status <id>`.                                                                                                                                                                                          |
+| `unusable`      | 4         | Goetia read enough to know the id is its own, but cannot report on it. `message` says why.                                                                                                                                                                                                                                                                                                    |
+| `undetermined`  | 4         | Goetia could not determine **whether** anything is installed at that id: a read it needed failed. Claims no ownership — that is the whole difference from `unusable`. `message` names what would not read — a path, or on Windows a registry key or service object — and what would make it readable. Only from `status <id>`; out of `list()` the same fact is the `undetermined` key below. |
+| `invalid-id`    | 1         | A command-line argument was not a valid daemon id. Fix the argument.                                                                                                                                                                                                                                                                                                                          |
+| `unavailable`   | 1         | Obtaining the manager, or listing, failed, so **no** answer was obtained for any daemon — `id` is `null`. Or, under a daemon's `id`, goetia would not ask systemd about that daemon: offline, from a chroot, or where systemd did not boot.                                                                                                                                                   |
+| `unsupported`   | 2         | `--json` was given to a subcommand that does not implement it.                                                                                                                                                                                                                                                                                                                                |
+| `other`         | 1         | Unreachable today; reserved so an unclassified failure has a home rather than being silently dropped.                                                                                                                                                                                                                                                                                         |
 
 ### `undetermined`
 
@@ -1100,13 +1100,13 @@ happen.
 
 These classes are **disjoint, and they are separated by what goetia
 _established_, not by what went wrong.** `not-installed` means absence was
-proven; `foreign` and `unreadable` mean presence was proven; `undetermined`
+proven; `foreign` and `unusable` mean presence was proven; `undetermined`
 means neither was — the read that would have settled it did not complete, so
 goetia claims nothing either way. A permission denial is therefore never
 `foreign`: proving that a file exists is not proving whose it is, and the
 read that would have said — the fragment's own, or a drop-in directory's —
 is the one that did not complete. `foreign` needs a read that finished. And an error always wins — a run naming both
-an absent id and an unreadable one exits `1`, not `4`.
+an absent id and an unusable one exits `1`, not `4`.
 
 ## `show`
 
@@ -1314,7 +1314,7 @@ its plist taken
 ([above](#install-never-changes-whether-a-daemon-runs)). The two
 sources are not interchangeable, and the remedies do not transfer:
 
-- **`unreadable`** — goetia's own daemon that goetia cannot use or report
+- **`unusable`** — goetia's own daemon that goetia cannot use or report
   on. The marker was read; the blob would not decode, the spec in it can no
   longer be rendered — an account that no longer resolves, or a spec the
   backend now refuses — or the manager gave no live state for it — on

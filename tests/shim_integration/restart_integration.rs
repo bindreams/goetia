@@ -440,7 +440,7 @@ fn a_new_shim_runs_a_service_registered_by_an_earlier_version() {
 /// A service whose blob says `restart: always` must stay operable, because the verbs that act on a
 /// service do not regenerate from its blob and the scm generator refuses `always`: started,
 /// restarted, stopped and uninstalled. What does regenerate (`install`, `status`, `list`) reports it
-/// as unreadable, since a service that cannot be regenerated cannot be compared or vouched for.
+/// as unusable, since a service that cannot be regenerated cannot be compared or vouched for.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled() {
     let mgr = Scm::new();
@@ -469,16 +469,16 @@ fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled
     let listed = mgr.list().expect("list");
     let entry = listed.iter().find(|entry| match entry {
         Installed::Ours { spec: s, .. } => s.id == spec.id,
-        Installed::OursUnreadable { name, .. } => name == &id,
+        Installed::OursUnusable { name, .. } => name == &id,
         Installed::Undetermined { name, .. } => name.as_deref() == Some(id.as_str()),
     });
     assert!(
         matches!(
             entry,
-            Some(Installed::OursUnreadable { reason, .. })
+            Some(Installed::OursUnusable { reason, .. })
                 if reason.contains("cannot be regenerated") && reason.contains("restart: always")
         ),
-        "`list` must report the service as unreadable, not vouch for it: {listed:?}"
+        "`list` must report the service as unusable, not vouch for it: {listed:?}"
     );
 
     // The same steps `daemon restart` runs.

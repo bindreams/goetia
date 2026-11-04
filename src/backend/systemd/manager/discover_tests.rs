@@ -63,7 +63,7 @@ fn an_unreadable_dropin_directory_is_undetermined_not_other() {
                 "the reason must name the path that could not be read: {reason}"
             );
         }
-        other => panic!("`Error::Other` here reaches `status` as `unreadable`, which claims ownership: {other:?}"),
+        other => panic!("`Error::Other` here reaches `status` as `unusable`, which claims ownership: {other:?}"),
     }
     assert!(
         !err.to_string().contains("uninstall"),

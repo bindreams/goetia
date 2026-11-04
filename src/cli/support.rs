@@ -63,7 +63,7 @@ pub(crate) struct UndeterminedEntry {
 /// `match`.
 pub(crate) struct InstalledIndex {
     pub ours: BTreeMap<String, InstalledEntry>,
-    pub unreadable: BTreeMap<String, String>,
+    pub unusable: BTreeMap<String, String>,
     /// What goetia could not classify at all: named entries first, sorted
     /// by name, then any aggregate. Not a map — an entry may stand for more
     /// than one id and so carry no name (see [`Installed::Undetermined`]),
@@ -86,13 +86,13 @@ impl InstalledIndex {
 }
 
 /// Partition `installed` into [`InstalledIndex`]. Prints nothing — call
-/// [`print_unreadable_warnings`] to report the `unreadable` half, which
-/// every caller must do somewhere: an `OursUnreadable` entry silently
+/// [`print_unusable_warnings`] to report the `unusable` half, which
+/// every caller must do somewhere: an `OursUnusable` entry silently
 /// vanishing is exactly the failure mode that variant exists to prevent
-/// (see [`Installed::OursUnreadable`]'s doc comment).
+/// (see [`Installed::OursUnusable`]'s doc comment).
 pub(crate) fn partition_installed(installed: Vec<Installed>) -> InstalledIndex {
     let mut ours = BTreeMap::new();
-    let mut unreadable = BTreeMap::new();
+    let mut unusable = BTreeMap::new();
     let mut undetermined = Vec::new();
     for entry in installed {
         match entry {
@@ -112,8 +112,8 @@ pub(crate) fn partition_installed(installed: Vec<Installed>) -> InstalledIndex {
                     },
                 );
             }
-            Installed::OursUnreadable { name, reason } => {
-                unreadable.insert(name, reason);
+            Installed::OursUnusable { name, reason } => {
+                unusable.insert(name, reason);
             }
             Installed::Undetermined { name, reason } => {
                 undetermined.push(UndeterminedEntry { name, reason });
@@ -126,32 +126,32 @@ pub(crate) fn partition_installed(installed: Vec<Installed>) -> InstalledIndex {
     // drift, and the ordering is what makes either output stable.
     undetermined.sort_by(|a, b| (a.name.is_none(), a.name.as_deref()).cmp(&(b.name.is_none(), b.name.as_deref())));
     // The three classes are mutually exclusive claims about one id —
-    // decoded, ours-but-unreadable, unclassifiable — so a backend reporting
+    // decoded, ours-but-unusable, unclassifiable — so a backend reporting
     // an id in two of them has answered its own question twice. Nothing else
     // checks it, and without this the winner would be whichever branch a
     // caller happens to test first.
     debug_assert!(
-        ours.keys().all(|id| !unreadable.contains_key(id))
+        ours.keys().all(|id| !unusable.contains_key(id))
             && undetermined
                 .iter()
                 .filter_map(|entry| entry.name.as_deref())
-                .all(|name| !ours.contains_key(name) && !unreadable.contains_key(name)),
+                .all(|name| !ours.contains_key(name) && !unusable.contains_key(name)),
         "a backend put one id in two of list()'s classes"
     );
     InstalledIndex {
         ours,
-        unreadable,
+        unusable,
         undetermined,
     }
 }
 
-pub(crate) fn print_unreadable_warnings(unreadable: &BTreeMap<String, String>, err: &mut dyn Write) {
-    for (name, reason) in unreadable {
-        let _ = writeln!(err, "warning: {name}: installed but unreadable: {reason}");
+pub(crate) fn print_unusable_warnings(unusable: &BTreeMap<String, String>, err: &mut dyn Write) {
+    for (name, reason) in unusable {
+        let _ = writeln!(err, "warning: {name}: installed but unusable: {reason}");
     }
 }
 
-/// Report the `undetermined` half, as [`print_unreadable_warnings`] does
+/// Report the `undetermined` half, as [`print_unusable_warnings`] does
 /// the other. An aggregate's `reason` is a complete sentence and stands
 /// alone: there is no name to prefix it with.
 pub(crate) fn print_undetermined_warnings(undetermined: &[UndeterminedEntry], err: &mut dyn Write) {

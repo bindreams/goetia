@@ -550,7 +550,7 @@ fn read_artifact_maps_an_unreadable_plist_to_undetermined() {
     let err = read_artifact(&path, "opaque").expect_err("`ENOTDIR` is not a readable artifact");
 
     let Error::Undetermined { id, reason, .. } = &err else {
-        panic!("`Error::Io` reaches `status` as `unreadable`, which claims goetia owns the id: {err:?}");
+        panic!("`Error::Io` reaches `status` as `unusable`, which claims goetia owns the id: {err:?}");
     };
     assert_eq!(id, "opaque");
     assert!(
@@ -612,7 +612,7 @@ fn bytes_that_are_not_utf8_xml_are_foreign_not_undetermined() {
 /// Split across the errno rather than crammed into a single sentence — elevation is advice only a
 /// permission boundary earns, and offering it for a failing disk sends the reader somewhere useless
 /// — so "both causes" means the pair covers both, one each. Never `uninstall`, in either: that is
-/// `Outcome::RefuseUnreadable`'s remedy and it certifies the ownership this read never established.
+/// `Outcome::RefuseUnusable`'s remedy and it certifies the ownership this read never established.
 #[skuld::test]
 fn the_launchd_undetermined_recovery_names_both_causes_and_not_uninstall() {
     let path = Path::new(ENABLED_DIR).join("x.plist");
@@ -766,11 +766,52 @@ fn a_plist_in_both_directories_is_reported_not_classified() {
     assert!(scan.entries.is_empty(), "{} entries", scan.entries.len());
     assert_eq!(
         scan.reported,
-        [Installed::OursUnreadable {
+        [Installed::OursUnusable {
             name: "twice".to_string(),
             reason: format!("present in both {STAGING_DIR} and {ENABLED_DIR}"),
         }]
     );
+}
+
+/// `/Library/LaunchDaemons` holds every vendor's daemons: a stem it shares with a goetia plist in
+/// staging does not make the vendor's plist goetia's, but the marked one is still a state to name.
+#[skuld::test]
+fn a_marked_plist_beside_an_unmarked_one_of_the_same_stem_is_reported() {
+    let (staging, enabled) = (
+        tempfile::tempdir().expect("tempdir"),
+        tempfile::tempdir().expect("tempdir"),
+    );
+    fs::write(staging.path().join("twice.plist"), sample_plist("twice")).expect("write the marked plist");
+    fs::write(enabled.path().join("twice.plist"), "<plist/>").expect("write the unmarked plist");
+
+    let scan = scanned(staging.path(), enabled.path());
+
+    assert!(scan.entries.is_empty(), "{} entries", scan.entries.len());
+    assert_eq!(
+        scan.reported,
+        [Installed::OursUnusable {
+            name: "twice".to_string(),
+            reason: format!("present in both {STAGING_DIR} and {ENABLED_DIR}"),
+        }]
+    );
+}
+
+/// Nothing at the stem is goetia's, and `list` omits foreign entries, so neither an entry nor a
+/// report is made.
+#[skuld::test]
+fn an_unmarked_plist_in_both_directories_is_not_reported() {
+    let (staging, enabled) = (
+        tempfile::tempdir().expect("tempdir"),
+        tempfile::tempdir().expect("tempdir"),
+    );
+    for dir in [staging.path(), enabled.path()] {
+        fs::write(dir.join("theirs.plist"), "<plist/>").expect("write the plist");
+    }
+
+    let scan = scanned(staging.path(), enabled.path());
+
+    assert!(scan.entries.is_empty(), "{} entries", scan.entries.len());
+    assert!(scan.reported.is_empty(), "{:?}", scan.reported);
 }
 
 // Writing: a race that has cost no call ===============================================================================
@@ -1070,7 +1111,7 @@ fn a_launchctl_request_that_may_have_run_is_in_doubt() {
 }
 
 /// A `launchctl` that cannot be run says nothing about the job: `status` fails, and `list` (via
-/// `flow`) reports the entry unreadable, rather than either showing a plausible `Unknown` state.
+/// `flow`) reports the entry unusable, rather than either showing a plausible `Unknown` state.
 #[skuld::test]
 fn a_live_status_whose_launchctl_cannot_be_run_is_an_error() {
     use crate::backend::Backend as _;

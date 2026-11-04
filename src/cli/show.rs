@@ -48,7 +48,7 @@ use std::path::{Path, PathBuf};
 use clap::Args as ClapArgs;
 
 use super::report;
-use super::support::{load_and_warn, partition_installed, print_undetermined_warnings, print_unreadable_warnings};
+use super::support::{load_and_warn, partition_installed, print_undetermined_warnings, print_unusable_warnings};
 use crate::error::Result;
 use crate::manager::ServiceManager;
 use crate::spec::DaemonSpec;
@@ -111,7 +111,7 @@ fn show_from_installed(
     };
 
     let index = partition_installed(installed);
-    print_unreadable_warnings(&index.unreadable, err);
+    print_unusable_warnings(&index.unusable, err);
     print_undetermined_warnings(&index.undetermined, err);
 
     let wanted: Vec<String> = if ids.is_empty() {
@@ -125,16 +125,16 @@ fn show_from_installed(
     // use, reused rather than re-derived here (see `dispatch`'s
     // doc comment for the vocabulary and the precedence order itself).
     // Never `max()` on the codes themselves: `1` must outrank `4` even
-    // though it is the smaller number, so a later unreadable id cannot
+    // though it is the smaller number, so a later unusable id cannot
     // downgrade an already-seen absent one.
     let mut codes: Vec<i32> = Vec::new();
 
-    // With no ids given, neither an unreadable nor an undetermined entry
+    // With no ids given, neither an unusable nor an undetermined entry
     // enters `wanted` at all (neither has a spec to show), so the loop below
     // can't be what flags it — unlike `list`/`status`, which escalate the
     // same way. Without this, `show` prints a complete-looking dump and
     // exits `0` on a host where it could not read half the daemons.
-    if ids.is_empty() && (!index.unreadable.is_empty() || !index.undetermined.is_empty()) {
+    if ids.is_empty() && (!index.unusable.is_empty() || !index.undetermined.is_empty()) {
         codes.push(4);
     }
 
@@ -142,8 +142,8 @@ fn show_from_installed(
     for id in &wanted {
         if let Some(entry) = index.ours.get(id) {
             specs.push(entry.spec.clone());
-        } else if index.unreadable.contains_key(id) {
-            let _ = writeln!(err, "error: daemon `{id}` is installed but unreadable");
+        } else if index.unusable.contains_key(id) {
+            let _ = writeln!(err, "error: daemon `{id}` is installed but unusable");
             codes.push(4);
         } else if let Some(entry) = index.undetermined_for(id) {
             // Either the listing named this id as one it could not classify,

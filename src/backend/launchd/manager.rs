@@ -205,7 +205,7 @@ fn locate(id: &str) -> Result<Option<Location>> {
 /// identically, since the two describe one condition on two platforms.
 ///
 /// [`Error::Undetermined`], never [`Error::Io`]: `Io` reaches
-/// `cli::report::status_error`'s catch-all as `Kind::Unreadable`, which
+/// `cli::report::status_error`'s catch-all as `Kind::Unusable`, which
 /// *asserts* that goetia owns the id — the one thing a read that never
 /// completed cannot establish. `/Library/LaunchDaemons` holds every vendor's
 /// daemons, so that claim is routinely about a stranger's service.
@@ -1583,39 +1583,50 @@ fn scan_in(dirs: [(&str, bool); 2]) -> Scan<Plist> {
 
     let mut entries = Vec::new();
     let mut reported = Vec::new();
+    // A partial scan can narrow a positive claim but never supports absence: `reported` forbids
+    // that. Untested: needs a mid-`readdir` fault on macOS.
     for (id, locations) in by_id {
-        // A partial scan can narrow a positive claim but never supports absence: `reported` forbids
-        // that. Untested: needs a mid-`readdir` fault on macOS.
-        let [location] = match <[Location; 1]>::try_from(locations) {
-            Ok(only) => only,
-            Err(_) => {
-                reported.push(Installed::OursUnreadable {
-                    name: id,
-                    reason: format!("present in both {STAGING_DIR} and {ENABLED_DIR}"),
-                });
-                continue;
+        // Each location is read, because `/Library/LaunchDaemons` holds every vendor's daemons: a
+        // stem found in both is goetia's only if one of the two carries the marker.
+        let mut found = Vec::new();
+        let mut unestablished = None;
+        for location in locations {
+            match read_at(&id, location) {
+                Ok(found_here) => found.push(found_here),
+                // Gone between the scan above and this read: an uninstall that completed, observed
+                // one syscall later. Absence is established, so this is a skip rather than a blind
+                // spot: reporting it would let a benign concurrent uninstall raise `list`'s
+                // host-wide exit code.
+                Err(Error::NotInstalled { .. }) => {}
+                // A failed read leaves zero evidence of whether this plist ever carried a Goetia
+                // marker at all. `Installed::Undetermined` claims neither ownership nor absence,
+                // which is exactly what was established.
+                Err(Error::Undetermined { reason, .. }) => {
+                    unestablished.get_or_insert(reason);
+                }
+                Err(e) => {
+                    unestablished.get_or_insert(e.to_string());
+                }
             }
-        };
-        match read_at(&id, location) {
-            Ok(found) => {
-                let entry = ScanEntry::of(&id, found, Plist::new);
+        }
+        if let Some(reason) = unestablished {
+            reported.push(Installed::Undetermined { name: Some(id), reason });
+            continue;
+        }
+        match <[_; 1]>::try_from(found) {
+            Ok([only]) => {
+                let entry = ScanEntry::of(&id, only, Plist::new);
                 entries.push((id, entry));
             }
-            // Gone between the scan above and this read: an uninstall that completed, observed one
-            // syscall later. Absence is established, so this is a skip rather than a blind spot:
-            // reporting it would let a benign concurrent uninstall raise `list`'s host-wide exit code.
-            Err(Error::NotInstalled { .. }) => {}
-            // A failed read leaves zero evidence of whether this plist ever carried a Goetia marker
-            // at all, and `/Library/LaunchDaemons` holds every vendor's daemons, not just Goetia's.
-            // `Installed::Undetermined` claims neither ownership nor absence, which is exactly what
-            // was established.
-            Err(Error::Undetermined { reason, .. }) => {
-                reported.push(Installed::Undetermined { name: Some(id), reason })
+            // Two plists, or none left: only a marker among them makes the id goetia's.
+            Err(found) => {
+                if found.iter().any(|f| matches!(f, ReadOutcome::Marked(_))) {
+                    reported.push(Installed::OursUnusable {
+                        name: id,
+                        reason: format!("present in both {STAGING_DIR} and {ENABLED_DIR}"),
+                    });
+                }
             }
-            Err(e) => reported.push(Installed::Undetermined {
-                name: Some(id),
-                reason: e.to_string(),
-            }),
         }
     }
     // Last, so a pass that got some way in still reports what it named before what it could

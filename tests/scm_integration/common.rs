@@ -144,9 +144,9 @@ pub fn conformance_mk(id: &str) -> DaemonSpec {
 
 // Account SID lookup ==================================================================================================
 //
-// `deleted_account_makes_the_service_oursunreadable` needs the SID string of
+// `deleted_account_makes_the_service_oursunusable` needs the SID string of
 // a real (temporary) local account, so it can install `user: {id: <sid>}`,
-// delete the account, and observe `Ownership::OursUnreadable`. Raw
+// delete the account, and observe `Ownership::OursUnusable`. Raw
 // `windows-sys` FFI, mirroring `identity::sid_for_account_name` +
 // `identity::account_name_from_sid_string`'s `ConvertStringSidToSidW`
 // counterpart — sanctioned here the same way `fixture.rs` already uses raw

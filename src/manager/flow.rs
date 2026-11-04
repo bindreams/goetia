@@ -43,12 +43,12 @@ fn classify<B: Backend>(b: &B, read: ReadOutcome<B::Snapshot>) -> Found<B::Snaps
 /// compared with what is installed.
 fn judge<B: Backend>(b: &B, snapshot: &B::Snapshot) -> (Ownership, ExternalConfig) {
     let id = snapshot.id();
-    let unreadable = |reason, recovery| (Ownership::OursUnreadable { reason, recovery }, ExternalConfig::Absent);
-    let uninstall_advice = || Some(decide::unreadable_recovery(id.as_str()));
+    let unusable = |reason, recovery| (Ownership::OursUnusable { reason, recovery }, ExternalConfig::Absent);
+    let uninstall_advice = || Some(decide::unusable_recovery(id.as_str()));
 
     let blob = match snapshot.blob() {
         Ok(blob) => blob,
-        Err(e) => return unreadable(e.to_string(), uninstall_advice()),
+        Err(e) => return unusable(e.to_string(), uninstall_advice()),
     };
     // A manager that matches ids case-insensitively finds `frpc`'s service for `FRPC`. Nothing else
     // is read: writing would replace that daemon's service.
@@ -63,12 +63,12 @@ fn judge<B: Backend>(b: &B, snapshot: &B::Snapshot) -> (Ownership, ExternalConfi
     let regenerated = match b.render(&blob.spec) {
         Ok(regenerated) => regenerated.to_string(),
         Err(e) => {
-            return unreadable(format!("cannot regenerate the embedded spec: {e}"), uninstall_advice());
+            return unusable(format!("cannot regenerate the embedded spec: {e}"), uninstall_advice());
         }
     };
     match b.installed(snapshot) {
         // No goetia action unblocks a comparison that could not be read.
-        Err(e) => unreadable(e.to_string(), None),
+        Err(e) => unusable(e.to_string(), None),
         Ok(on_disk) => (
             Ownership::Ours {
                 blob: blob.clone(),
@@ -96,7 +96,7 @@ pub(crate) fn require_marked<S>(id: &Id, read: ReadOutcome<S>) -> Result<S> {
 
 /// The ownership gate of every verb but `install`: the id's snapshot if goetia's marker is on it,
 /// otherwise the error that says why not. A blob that will not decode still passes: the marker
-/// alone is proof of ownership, and `uninstall` is the way out of an unreadable one. The blanket
+/// alone is proof of ownership, and `uninstall` is the way out of an unusable one. The blanket
 /// [`ServiceManager`](crate::manager::ServiceManager) impl is the only caller, so a verb that
 /// takes a snapshot has been gated.
 pub(crate) fn owned<B: Backend>(b: &B, id: &Id) -> Result<B::Snapshot> {
@@ -132,7 +132,7 @@ pub(crate) fn install<B: Backend>(b: &B, spec: &DaemonSpec, force: bool) -> Resu
             | Outcome::Conflict { .. }
             | Outcome::RefuseForeign { .. }
             | Outcome::RefuseOtherDaemon { .. }
-            | Outcome::RefuseUnreadable { .. } => return Ok(outcome),
+            | Outcome::RefuseUnusable { .. } => return Ok(outcome),
         }
     }
 }
@@ -173,19 +173,19 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
             ScanEntry::Read(ReadOutcome::Marked(snapshot)) => (snapshot.blob(), Ok(snapshot)),
             ScanEntry::Misnamed { blob, name } => (blob.as_ref(), Err(name)),
         };
-        let unreadable = |reason: String| Installed::OursUnreadable {
+        let unusable = |reason: String| Installed::OursUnusable {
             name: name.clone(),
             reason,
         };
         let blob = match blob {
             Ok(blob) => blob,
             Err(e) => {
-                out.push(unreadable(e.to_string()));
+                out.push(unusable(e.to_string()));
                 continue;
             }
         };
         if let Err(e) = b.render(&blob.spec) {
-            out.push(unreadable(format!(
+            out.push(unusable(format!(
                 "marked ours, but its embedded spec cannot be regenerated: {e}"
             )));
             continue;
@@ -195,7 +195,7 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
         let snapshot = match snapshot {
             Ok(snapshot) => snapshot,
             Err(e) => {
-                out.push(unreadable(format!(
+                out.push(unusable(format!(
                     "marked ours, but its name is not a valid daemon id: {e}"
                 )));
                 continue;
@@ -211,7 +211,7 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
             Err(e @ Error::NoManager { .. }) => return Err(e),
             // The query completed and found the service gone: absence is established.
             Err(Error::NotInstalled { .. }) => {}
-            Err(e) => out.push(unreadable(format!(
+            Err(e) => out.push(unusable(format!(
                 "marked ours, but its live state could not be queried: {e}"
             ))),
         }
