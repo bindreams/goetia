@@ -138,10 +138,8 @@ pub fn run(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
 /// `#[cfg(test)]`-gated) so that each real backend's own integration test —
 /// a separate crate under `tests/`, linking only against `goetia`'s public
 /// API — can call [`run`]. That rules out a dev-only randomness crate here;
-/// a process-wide counter plus the pid is unique enough for this module's
-/// only need (an id `run` has never used before), especially now that `run`
-/// uninstalls everything it creates rather than leaving it for a future
-/// call to collide with.
+/// a process-wide counter plus the pid is unique enough, since callers clean
+/// up what they create.
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn fresh_id(label: &str) -> String {

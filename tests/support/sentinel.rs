@@ -75,7 +75,7 @@ pub fn connect(port: u16) {
     drop(TcpStream::connect((Ipv4Addr::LOCALHOST, port)));
 }
 
-/// [`connect`], then send `value` and close the write half. Best-effort, like [`connect`].
+/// [`connect`], then send `value` as the payload.
 pub fn send_line(port: u16, value: &str) {
     if let Ok(mut stream) = TcpStream::connect((Ipv4Addr::LOCALHOST, port)) {
         let _ = stream.write_all(value.as_bytes());
