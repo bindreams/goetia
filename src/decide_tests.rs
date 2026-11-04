@@ -1,9 +1,8 @@
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use super::*;
 use crate::blob::{self, Blob};
-use crate::spec::{DaemonSpec, Id, Kind, Restart, User};
+use crate::spec::{DaemonSpec, Kind, Restart};
 
 // Fixtures ============================================================================================================
 
@@ -26,16 +25,12 @@ fn unclearable() -> ExternalConfig {
 // component for the same reason (see `diff_tests.rs`).
 fn spec_fixture() -> DaemonSpec {
     DaemonSpec {
-        id: Id::try_from("frpc").unwrap(),
         name: "FRP tunnel client".to_owned(),
-        command: vec!["frpc".to_owned(), "-c".to_owned(), "frpc.toml".to_owned()],
         cwd: Some(PathBuf::from("app")),
-        env: BTreeMap::new(),
-        user: User::Root,
         restart: Restart::OnFailure,
-        restart_delay: None,
         logs: Some(PathBuf::from("frpc.log")),
         kind: Kind::Simple,
+        ..DaemonSpec::for_test("frpc", vec!["frpc".to_owned(), "-c".to_owned(), "frpc.toml".to_owned()])
     }
 }
 

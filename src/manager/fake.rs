@@ -914,4 +914,4 @@ impl crate::backend::Backend for Fake {
 
 #[cfg(test)]
 #[path = "fake_tests.rs"]
-pub(in crate::manager) mod fake_tests;
+pub(crate) mod fake_tests;

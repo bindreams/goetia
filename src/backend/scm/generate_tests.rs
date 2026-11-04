@@ -1,5 +1,5 @@
 use super::*;
-use crate::spec::{Builtin, Id, MAX_SC_ACTION_DELAY};
+use crate::spec::{Builtin, MAX_SC_ACTION_DELAY};
 
 // Fixtures ============================================================================================================
 
@@ -14,35 +14,29 @@ fn abs(p: &str) -> PathBuf {
 
 fn managed_spec() -> DaemonSpec {
     DaemonSpec {
-        id: Id::try_from("frpc").unwrap(),
         name: "FRP tunnel client".to_string(),
-        command: vec!["frpc-agent".to_string(), "-c".to_string(), "frpc.toml".to_string()],
-        cwd: None,
-        env: BTreeMap::new(),
-        user: User::Root,
         restart: Restart::OnFailure,
         restart_delay: Some(Duration::from_secs(5)),
-        logs: None,
-        kind: Kind::Managed,
+        ..DaemonSpec::for_test(
+            "frpc",
+            vec!["frpc-agent".to_string(), "-c".to_string(), "frpc.toml".to_string()],
+        )
     }
 }
 
 fn simple_spec() -> DaemonSpec {
     DaemonSpec {
-        id: Id::try_from("frpc").unwrap(),
         name: "FRP tunnel client".to_string(),
-        // Deliberately not named `frpc` (the id) — `simple_kind_executable_is_shim`
-        // asserts this string is absent from `arguments`, which would be
+        restart: Restart::OnFailure,
+        kind: Kind::Simple,
+        // The command is deliberately not named `frpc` (the id) — `simple_kind_executable_is_shim`
+        // asserts `frpc-agent` is absent from `arguments`, which would be
         // vacuously true if it happened to equal the id (also `frpc`, and
         // always present as the shim's sole argument).
-        command: vec!["frpc-agent".to_string(), "-c".to_string(), "frpc.toml".to_string()],
-        cwd: None,
-        env: BTreeMap::new(),
-        user: User::Root,
-        restart: Restart::OnFailure,
-        restart_delay: None,
-        logs: None,
-        kind: Kind::Simple,
+        ..DaemonSpec::for_test(
+            "frpc",
+            vec!["frpc-agent".to_string(), "-c".to_string(), "frpc.toml".to_string()],
+        )
     }
 }
 

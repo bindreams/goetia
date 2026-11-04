@@ -471,16 +471,8 @@ fn read_marker_sorts_parameters_into_foreign_and_marked() {
 
 fn daemon_spec(restart: crate::spec::Restart) -> DaemonSpec {
     DaemonSpec {
-        id: Id::try_from("frpc").unwrap(),
-        name: "frpc".to_string(),
-        command: vec![r"C:\bin\frpc.exe".to_string()],
-        cwd: None,
-        env: BTreeMap::new(),
-        user: crate::spec::User::Root,
         restart,
-        restart_delay: None,
-        logs: None,
-        kind: Kind::Managed,
+        ..DaemonSpec::for_test("frpc", vec![r"C:\bin\frpc.exe".to_string()])
     }
 }
 
@@ -491,16 +483,8 @@ fn blob_of(kind: Kind) -> Blob {
         schema: 1,
         version: "0.1.0".to_string(),
         spec: DaemonSpec {
-            id: Id::try_from("frpc").unwrap(),
-            name: "frpc".to_string(),
-            command: vec!["frpc".to_string()],
-            cwd: None,
-            env: BTreeMap::new(),
-            user: crate::spec::User::Root,
-            restart: Restart::Never,
-            restart_delay: None,
-            logs: None,
             kind,
+            ..DaemonSpec::for_test("frpc", vec!["frpc".to_string()])
         },
     }
 }
