@@ -1160,6 +1160,29 @@ fn a_restart_that_cannot_reserve_sends_nothing() {
     }
 }
 
+/// An `install` that cannot reserve sends nothing, and fails as the install of its id. It is the one
+/// single verb reachable here: the others pass the ownership gate first, which reads the host's real
+/// `/Library` paths. What each single verb reserves for, and how each refuses, is `flow_tests`' over
+/// the test `Fake`, since the blanket impl is the same for every backend.
+#[skuld::test]
+fn an_install_that_cannot_reserve_sends_nothing_and_names_its_id() {
+    type Allowance = fn(usize) -> bounded::test_hook::Allowance;
+    let shortfalls: [(Allowance, usize); 2] = [(bounded::test_hook::threads, 0), (bounded::test_hook::temp_files, 5)];
+    for (allow, n) in shortfalls {
+        let (mgr, script) = scripted(&[]);
+        let spec = spec_named("goetia-reservation-refused");
+        let _short = allow(n);
+
+        let result = ServiceManager::install(&mgr, &spec, false);
+
+        assert!(
+            matches!(&result, Err(Error::Reservation { id: Some(id), .. }) if id == "goetia-reservation-refused"),
+            "{result:?}"
+        );
+        assert_eq!(script.calls(), Vec::<Vec<String>>::new(), "nothing may be sent");
+    }
+}
+
 // A request in doubt ==================================================================================================
 
 /// A `launchctl` request that may have started before goetia lost it — cosca failing past `exec`,

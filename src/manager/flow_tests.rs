@@ -560,3 +560,124 @@ fn a_directory_pass_that_stopped_is_worded_by_where_it_stopped() {
         "failed to read directory: injected mid-scan failure"
     );
 }
+
+// single verbs reserve ================================================================================================
+
+/// The verbs that draw on a reservation, each run on `mgr` as the blanket impl runs it outside a
+/// sequence, with the step it reserves for and the budget it reserves under.
+#[allow(clippy::type_complexity)]
+fn single_verbs<'a>(
+    mgr: &'a dyn ServiceManager,
+    id: &'a Id,
+    spec: &'a DaemonSpec,
+) -> Vec<(&'static str, Step, Budget, Box<dyn Fn() -> Result<()> + 'a>)> {
+    let budget = Budget::DEFAULT;
+    vec![
+        (
+            "install",
+            Step::Install,
+            Budget::Unbounded,
+            Box::new(|| mgr.install(spec, true).map(drop)),
+        ),
+        ("start", Step::Start, budget, Box::new(move || mgr.start(id, budget))),
+        ("stop", Step::Stop, budget, Box::new(move || mgr.stop(id, budget))),
+        ("kill", Step::Kill, Budget::Unbounded, Box::new(|| mgr.kill(id))),
+        (
+            "uninstall",
+            Step::Uninstall,
+            Budget::Unbounded,
+            Box::new(|| mgr.uninstall(id)),
+        ),
+        (
+            "request_start_after_stop",
+            Step::RequestStartAfterStop,
+            Budget::Immediate,
+            Box::new(|| mgr.request_start_after_stop(id)),
+        ),
+    ]
+}
+
+/// Each verb run outside a sequence reserves for its own step, under the budget it runs with. `kill`
+/// and `uninstall` count what `stop` does on a real backend, so only the step recorded tells them
+/// apart.
+#[skuld::test]
+fn a_single_verb_reserves_for_its_own_step() {
+    let spec = mk("frpc");
+    let id = spec.id.clone();
+    let fake = Fake::new();
+    let mgr: &dyn ServiceManager = &fake;
+    for (verb, step, budget, run) in single_verbs(mgr, &id, &spec) {
+        fake.install(&spec, true).unwrap();
+        let before = fake.prepared().len();
+
+        // Whether the verb then succeeds is not the question: its reservation comes first.
+        drop(run());
+
+        assert_eq!(fake.prepared()[before..], [(vec![step], budget)], "{verb}");
+    }
+}
+
+/// A single verb whose reservation cannot be made sends nothing and fails as `Error::Reservation`
+/// carrying its id, whichever verb it is.
+#[skuld::test]
+fn a_single_verb_that_cannot_reserve_sends_nothing_and_names_its_id() {
+    let spec = mk("frpc");
+    let id = spec.id.clone();
+    let fake = Fake::new();
+    fake.install(&spec, false).unwrap();
+    let (calls, writes) = (fake.calls(), fake.writes());
+    fake.seed_prepare_fails();
+    let mgr: &dyn ServiceManager = &fake;
+
+    for (verb, _, _, run) in single_verbs(mgr, &id, &spec) {
+        let result = run();
+
+        assert!(
+            matches!(&result, Err(Error::Reservation { id: Some(named), .. }) if named == "frpc"),
+            "{verb}: {result:?}"
+        );
+        assert_eq!(fake.calls(), calls, "{verb} reached the backend");
+        assert_eq!(fake.writes(), writes, "{verb} wrote");
+        assert!(fake.status(&id).is_ok(), "{verb} removed the service");
+    }
+}
+
+// sequence ============================================================================================================
+
+/// A prepared step is used once, and only a prepared step: a verb that was not prepared for cannot
+/// have had anything reserved, so it is a miscount, loud in every debug build.
+#[skuld::test]
+#[should_panic(expected = "was not prepared for, or already ran")]
+fn a_sequence_refuses_a_verb_it_was_not_prepared_for() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    let id = Id::try_from("frpc").unwrap();
+    let mut sequence = fake.prepare(&[Step::Stop], Budget::DEFAULT).unwrap();
+
+    drop(sequence.start(&id, Budget::DEFAULT));
+}
+
+#[skuld::test]
+#[should_panic(expected = "was not prepared for, or already ran")]
+fn a_sequence_refuses_a_step_run_twice() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    let id = Id::try_from("frpc").unwrap();
+    let mut sequence = fake.prepare(&[Step::Stop], Budget::DEFAULT).unwrap();
+
+    sequence.stop(&id, Budget::DEFAULT).unwrap();
+    drop(sequence.stop(&id, Budget::DEFAULT));
+}
+
+/// `restart --timeout 0` prepares `Start` and runs `request_start_after_stop`: a request for a start
+/// spends the step a start does.
+#[skuld::test]
+fn a_prepared_start_covers_a_start_requested_after_a_stop() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    let id = Id::try_from("frpc").unwrap();
+    let mut sequence = fake.prepare(&[Step::Stop, Step::Start], Budget::Immediate).unwrap();
+
+    sequence.stop(&id, Budget::Immediate).unwrap();
+    sequence.request_start_after_stop(&id).unwrap();
+}

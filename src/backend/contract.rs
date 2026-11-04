@@ -251,6 +251,7 @@ impl<B: Backend> ServiceManager for B {
         Ok(Box::new(Reserved {
             backend: self,
             reservation: Backend::reserve(self, steps, budget)?,
+            unspent: steps.to_vec(),
         }))
     }
 
@@ -293,10 +294,31 @@ impl<B: Backend> ServiceManager for B {
 struct Reserved<'a, B: Backend> {
     backend: &'a B,
     reservation: B::Reservation,
+    /// The prepared steps no verb has used yet.
+    unspent: Vec<Step>,
+}
+
+impl<B: Backend> Reserved<'_, B> {
+    /// Use up one of `steps`, the first that is still unspent. A verb with none draws on a
+    /// reservation that was not counted for it: in a release build the draw is made on the spot and
+    /// can fail between legs, which breaks the promise of [`ServiceManager::prepare`].
+    fn spend(&mut self, steps: &[Step]) {
+        let found = steps
+            .iter()
+            .find_map(|step| self.unspent.iter().position(|unspent| unspent == step));
+        debug_assert!(
+            found.is_some(),
+            "{steps:?} was not prepared for, or already ran: it would draw on a reservation not counted for it"
+        );
+        if let Some(found) = found {
+            self.unspent.swap_remove(found);
+        }
+    }
 }
 
 impl<B: Backend> Sequence for Reserved<'_, B> {
     fn stop(&mut self, id: &Id, budget: Budget) -> Result<()> {
+        self.spend(&[Step::Stop]);
         Backend::stop(
             self.backend,
             flow::owned(self.backend, id)?,
@@ -306,6 +328,7 @@ impl<B: Backend> Sequence for Reserved<'_, B> {
     }
 
     fn start(&mut self, id: &Id, budget: Budget) -> Result<()> {
+        self.spend(&[Step::Start]);
         Backend::start(
             self.backend,
             flow::owned(self.backend, id)?,
@@ -314,7 +337,11 @@ impl<B: Backend> Sequence for Reserved<'_, B> {
         )
     }
 
+    /// Spends [`Step::RequestStartAfterStop`] or, failing that, [`Step::Start`], which counts the
+    /// longest start: `restart` prepares `Start` and runs this in its place under a budget that does
+    /// not wait.
     fn request_start_after_stop(&mut self, id: &Id) -> Result<()> {
+        self.spend(&[Step::RequestStartAfterStop, Step::Start]);
         Backend::request_start_after_stop(self.backend, flow::owned(self.backend, id)?, &mut self.reservation)
     }
 }

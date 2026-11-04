@@ -140,6 +140,10 @@ pub trait ServiceManager {
     /// nothing else does; it is released when the sequence is dropped. A
     /// verb run outside a sequence makes what it needs itself, before it
     /// sends anything.
+    ///
+    /// Each prepared step is used once, and only a prepared step: the
+    /// reservation counts exactly `steps`, so a verb the sequence was not
+    /// prepared for, or a second run of one, fails a debug assertion.
     fn prepare(&self, steps: &[Step], budget: Budget) -> Result<Box<dyn Sequence + '_>>;
 
     /// `daemon restart --timeout 0` as one request, where the platform has
@@ -273,6 +277,11 @@ pub enum Step {
 
 /// What [`ServiceManager::prepare`] made ready, and the verbs that draw on it, with the contracts
 /// of the [`ServiceManager`] verbs of the same names. Releases what it did not spend when dropped.
+///
+/// A verb may be run only for a step that was prepared, and each prepared step once: [`Step::Stop`]
+/// by `stop`, [`Step::Start`] by `start` or, where the start is only requested, by
+/// `request_start_after_stop`. Anything else was not counted for and fails a debug assertion; in a
+/// release build it makes what it needs on the spot, which can fail between legs.
 #[must_use = "what was prepared is released as soon as this is dropped"]
 pub trait Sequence {
     /// See [`ServiceManager::stop`].
