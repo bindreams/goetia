@@ -371,6 +371,7 @@ fn a_unit_directory_that_cannot_be_opened_is_reported_not_propagated() {
     assert!(scan.units.is_empty(), "nothing was enumerated: {scan:?}");
     match &scan.incomplete {
         Some(Installed::Undetermined { name: None, reason }) => {
+            let reason = reason.to_string();
             assert!(reason.contains("failed to read directory: "), "{reason}");
         }
         other => panic!("{other:?}"),

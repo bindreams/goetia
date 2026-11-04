@@ -33,13 +33,9 @@ fn parameters_key_path(name: &str) -> String {
     format!(r"{SERVICES_KEY}\{name}\Parameters")
 }
 
-/// What did not complete, as facts, with no claim about any id attached.
-/// Shared by [`registry_error`] and [`registry_undetermined`], so one failure
-/// cannot be described two ways depending on which class it lands in.
-fn registry_detail(op: &str, path: &str, source: &std::io::Error) -> String {
-    format!(r"registry {op} HKLM\{path}: {source}")
-}
-
+/// What did not complete, as facts, with no claim about any id attached. Every registry failure
+/// is built here — single-id reads, [`registry_undetermined`] and the `list` scan — so one
+/// failure cannot be described two ways depending on which class it lands in.
 fn registry_error(op: &str, path: &str, source: std::io::Error) -> Error {
     Error::os(format!(r"{op} HKLM\{path}"), source)
 }
@@ -305,7 +301,7 @@ fn scan_names_under(path: &str, keep: impl FnMut(String)) -> Option<Installed> {
         path,
         RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(path, KEY_READ),
         |key| Box::new(key.enum_keys()),
-        |op, source| registry_detail(op, path, source),
+        |op, source| registry_error(op, path, source),
         keep,
     )
 }

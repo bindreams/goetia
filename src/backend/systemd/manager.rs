@@ -85,7 +85,7 @@ use crate::backend::{
     WriteOutcome, bounded,
 };
 use crate::decide::Outcome;
-use crate::error::{Error, Result};
+use crate::error::{Error, Reason, Result};
 use crate::manager::{Budget, Installed, Prepared, Status, Step, flow};
 use crate::spec::{AccountId, DaemonSpec, Id, User};
 
@@ -201,7 +201,7 @@ impl Backend for Systemd {
                 Ok(read) => entries.push((id, read)),
                 Err(failure) => reported.push(Installed::Undetermined {
                     name: Some(id),
-                    reason: failure.detail(),
+                    reason: Reason::failed(failure.into_io_error()),
                 }),
             }
         }

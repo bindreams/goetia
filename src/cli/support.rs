@@ -96,7 +96,6 @@ pub(crate) fn partition_installed(installed: Vec<Installed>) -> InstalledIndex {
     let mut unusable = BTreeMap::new();
     let mut undetermined = Vec::new();
     for entry in installed {
-        let reason = entry.unusable_reason();
         match entry {
             Installed::Ours {
                 spec,
@@ -114,11 +113,14 @@ pub(crate) fn partition_installed(installed: Vec<Installed>) -> InstalledIndex {
                     },
                 );
             }
-            Installed::OursUnusable { name, .. } => {
-                unusable.insert(name, reason.expect("an OursUnusable entry has a reason"));
+            Installed::OursUnusable { name, reason } => {
+                unusable.insert(name, reason.to_string());
             }
             Installed::Undetermined { name, reason } => {
-                undetermined.push(UndeterminedEntry { name, reason });
+                undetermined.push(UndeterminedEntry {
+                    name,
+                    reason: reason.to_string(),
+                });
             }
         }
     }

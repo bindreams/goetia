@@ -723,6 +723,7 @@ fn a_plist_directory_that_cannot_be_opened_is_reported_not_propagated() {
     assert!(scan.plists.is_empty(), "nothing was enumerated: {scan:?}");
     match &scan.incomplete {
         Some(Installed::Undetermined { name: None, reason }) => {
+            let reason = reason.to_string();
             assert!(reason.contains("failed to read directory: "), "{reason}");
         }
         other => panic!("{other:?}"),
@@ -813,10 +814,14 @@ fn a_plist_without_the_marker_is_scanned_as_foreign() {
 }
 
 fn assert_reported_in_both(reported: &[Installed]) {
-    let [entry @ Installed::OursUnusable { name, cause: None, .. }] = reported else {
-        panic!("one unusable entry with no cause expected, got {reported:?}");
+    let [entry @ Installed::OursUnusable { name, reason }] = reported else {
+        panic!("one unusable entry expected, got {reported:?}");
     };
     assert_eq!(name, "twice");
+    assert!(
+        reason.cause().is_none(),
+        "goetia's own words, no error under them: {reason:?}"
+    );
     assert_eq!(
         entry.unusable_reason(),
         Some(format!("present in both {STAGING_DIR} and {ENABLED_DIR}"))

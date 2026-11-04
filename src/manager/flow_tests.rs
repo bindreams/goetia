@@ -52,7 +52,7 @@ fn install_refuses_an_unresolvable_account_with_uninstall_advice() {
     assert_eq!(
         outcome,
         Outcome::RefuseUnusable {
-            reason: format!("cannot regenerate the embedded spec: {}", unresolvable("gone")),
+            reason: Reason::said(format!("cannot regenerate the embedded spec: {}", unresolvable("gone"))),
             recovery: Some(decide::unusable_recovery("frpc")),
         }
     );
@@ -88,6 +88,7 @@ fn install_refuses_a_failed_comparison_with_its_error_alone() {
 
     match outcome {
         Outcome::RefuseUnusable { reason, recovery } => {
+            let reason = reason.to_string();
             assert!(reason.contains("the unit could not be read back"), "{reason}");
             assert_eq!(recovery, None);
         }
@@ -231,17 +232,13 @@ fn list_reports_an_unresolvable_account_as_ours_unusable() {
 
     let listed = fake.list().unwrap();
 
-    let [entry @ Installed::OursUnusable { name, reason, cause }] = listed.as_slice() else {
+    let [entry @ Installed::OursUnusable { name, reason }] = listed.as_slice() else {
         panic!("one unusable entry expected, got {listed:?}");
     };
     assert_eq!(name, "frpc");
-    assert_eq!(
-        reason.as_deref(),
-        Some("marked ours, but its embedded spec cannot be regenerated")
-    );
     assert!(
-        matches!(cause.as_deref(), Some(Error::AccountLookup { .. })),
-        "{cause:?}"
+        matches!(reason.cause(), Some(Error::AccountLookup { .. })),
+        "{reason:?}"
     );
     assert_eq!(
         entry.unusable_reason().as_deref(),
@@ -274,8 +271,8 @@ fn list_reports_a_failed_live_status_as_ours_unusable() {
     assert!(
         listed
             .iter()
-            .any(|e| matches!(e, Installed::OursUnusable { name, cause: Some(cause), .. }
-                if name == "frpc" && matches!(**cause, Error::Os { .. }))
+            .any(|e| matches!(e, Installed::OursUnusable { name, reason }
+                if name == "frpc" && matches!(reason.cause(), Some(Error::Os { .. })))
                 && e.unusable_reason().as_deref()
                     == Some(
                         "marked ours, but its live state could not be queried: failed to query the live state: state \
@@ -310,12 +307,12 @@ fn list_reports_a_name_that_is_not_an_id_without_querying_it() {
 
     assert_eq!(listed.len(), 2, "{listed:?}");
     assert!(
-        listed.iter().any(
-            |e| matches!(e, Installed::OursUnusable { name: got, cause: Some(cause), .. }
-                if got == name && matches!(**cause, Error::Invalid { .. }))
+        listed
+            .iter()
+            .any(|e| matches!(e, Installed::OursUnusable { name: got, reason }
+                if got == name && matches!(reason.cause(), Some(Error::Invalid { .. })))
                 && e.unusable_reason()
-                    == Some(format!("marked ours, but its name is not a valid daemon id: {invalid}"))
-        ),
+                    == Some(format!("marked ours, but its name is not a valid daemon id: {invalid}"))),
         "{listed:?}"
     );
     assert!(
@@ -471,8 +468,8 @@ fn named(items: Vec<std::io::Result<String>>) -> std::io::Result<Names> {
     Ok(items.into_iter())
 }
 
-fn op_and_cause(op: &'static str, e: &std::io::Error) -> String {
-    format!("{op} failed: {e}")
+fn op_and_cause(op: &'static str, e: std::io::Error) -> Error {
+    Error::os(op, e)
 }
 
 /// Collecting into a `Result` instead would discard every name enumerated before a later one
@@ -497,9 +494,10 @@ fn scan_keeps_entries_before_a_mid_pass_fault() {
     assert_eq!(kept, ["named-before-the-fault"], "the pass stops at the fault");
     match reported {
         Some(Installed::Undetermined { name: None, reason }) => {
+            let reason = reason.to_string();
             assert!(reason.contains("the place"), "{reason}");
             assert!(
-                reason.contains("enumerate failed: injected mid-scan failure"),
+                reason.contains("failed to enumerate: injected mid-scan failure"),
                 "{reason}"
             );
         }
@@ -541,8 +539,9 @@ fn scan_reports_a_location_that_will_not_open() {
     assert!(kept.is_empty(), "{kept:?}");
     match reported {
         Some(Installed::Undetermined { name: None, reason }) => {
+            let reason = reason.to_string();
             assert!(reason.contains("the place"), "{reason}");
-            assert!(reason.contains("open failed:"), "{reason}");
+            assert!(reason.contains("failed to open:"), "{reason}");
         }
         other => panic!("a location that exists and will not open establishes no absence, got {other:?}"),
     }
@@ -571,12 +570,14 @@ fn scan_that_finishes_reports_nothing() {
 fn a_directory_pass_that_stopped_is_worded_by_where_it_stopped() {
     let e = std::io::Error::other("injected mid-scan failure");
 
+    let again = || std::io::Error::other("injected mid-scan failure");
+
     assert_eq!(
-        directory_detail("enumerate", &e),
+        directory_detail("enumerate", e).report().to_string(),
         "failed to read a directory entry: injected mid-scan failure"
     );
     assert_eq!(
-        directory_detail("open", &e),
+        directory_detail("open", again()).report().to_string(),
         "failed to read directory: injected mid-scan failure"
     );
 }

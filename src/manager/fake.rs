@@ -16,7 +16,7 @@ use crate::backend::{
 };
 use crate::blob::{self, Blob};
 use crate::decide::{ExternalConfig, Outcome};
-use crate::error::{Error, Result};
+use crate::error::{Error, Reason, Result};
 use crate::manager::budget;
 use crate::manager::flow;
 use crate::manager::{Budget, Installed, Prepared, ServiceManager, State, Status, Step};
@@ -807,11 +807,11 @@ impl crate::backend::Backend for Fake {
         let state = self.state.lock().expect("Fake mutex poisoned");
         let aggregates = state.aggregates.iter().map(|reason| Installed::Undetermined {
             name: None,
-            reason: reason.clone(),
+            reason: Reason::said(reason.clone()),
         });
         let opaque = state.opaque.iter().rev().map(|name| Installed::Undetermined {
             name: Some(name.clone()),
-            reason: opaque_reason().report().to_string(),
+            reason: Reason::failed(opaque_reason()),
         });
         Scan {
             entries: state

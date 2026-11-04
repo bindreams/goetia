@@ -284,7 +284,7 @@ fn list_reports_an_opaque_entry_as_undetermined() {
             _ => None,
         })
         .unwrap_or_else(|| panic!("an unreadable artifact must appear as Undetermined: {listed:?}"));
-    assert!(!reason.is_empty(), "Undetermined must say why: {listed:?}");
+    assert!(!reason.to_string().is_empty(), "Undetermined must say why: {listed:?}");
     assert!(
         !listed
             .iter()

@@ -9,7 +9,7 @@ use std::io;
 
 use crate::backend::{Backend, InstalledService, ReadOutcome, ScanEntry, WriteOutcome};
 use crate::decide::{self, ExternalConfig, Outcome, Ownership};
-use crate::error::{Error, Result};
+use crate::error::{Error, Reason, Result};
 use crate::manager::{Installed, Status};
 use crate::spec::{DaemonSpec, Id};
 
@@ -48,7 +48,7 @@ fn judge<B: Backend>(b: &B, snapshot: &B::Snapshot) -> (Ownership, ExternalConfi
 
     let blob = match snapshot.blob() {
         Ok(blob) => blob,
-        Err(e) => return unusable(e.report().to_string(), uninstall_advice()),
+        Err(e) => return unusable(Reason::failed(owned_failure(e)), uninstall_advice()),
     };
     // A manager that matches ids case-insensitively finds `frpc`'s service for `FRPC`. Nothing else
     // is read: writing would replace that daemon's service.
@@ -64,14 +64,14 @@ fn judge<B: Backend>(b: &B, snapshot: &B::Snapshot) -> (Ownership, ExternalConfi
         Ok(regenerated) => regenerated.to_string(),
         Err(e) => {
             return unusable(
-                format!("cannot regenerate the embedded spec: {}", e.report()),
+                Reason::because("cannot regenerate the embedded spec", e),
                 uninstall_advice(),
             );
         }
     };
     match b.installed(snapshot) {
         // No goetia action unblocks a comparison that could not be read.
-        Err(e) => unusable(e.report().to_string(), None),
+        Err(e) => unusable(Reason::failed(e), None),
         Ok(on_disk) => (
             Ownership::Ours {
                 blob: blob.clone(),
@@ -195,23 +195,22 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
             ScanEntry::Read(ReadOutcome::Marked(snapshot)) => (snapshot.blob(), Ok(snapshot)),
             ScanEntry::Misnamed { blob, name } => (blob.as_ref(), Err(name)),
         };
-        let unusable = |reason: Option<&str>, cause: Error| Installed::OursUnusable {
+        let unusable = |why: &str, cause: Error| Installed::OursUnusable {
             name: name.clone(),
-            reason: reason.map(str::to_string),
-            cause: Some(Box::new(cause)),
+            reason: Reason::because(why, cause),
         };
         let blob = match blob {
             Ok(blob) => blob,
             Err(e) => {
-                out.push(unusable(None, owned_failure(e)));
+                out.push(Installed::OursUnusable {
+                    name: name.clone(),
+                    reason: Reason::failed(owned_failure(e)),
+                });
                 continue;
             }
         };
         if let Err(e) = b.render(&blob.spec) {
-            out.push(unusable(
-                Some("marked ours, but its embedded spec cannot be regenerated"),
-                e,
-            ));
+            out.push(unusable("marked ours, but its embedded spec cannot be regenerated", e));
             continue;
         }
         // One entry's failure must not take down the listing of every other daemon, except that
@@ -220,7 +219,7 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
             Ok(snapshot) => snapshot,
             Err(e) => {
                 out.push(unusable(
-                    Some("marked ours, but its name is not a valid daemon id"),
+                    "marked ours, but its name is not a valid daemon id",
                     owned_failure(e),
                 ));
                 continue;
@@ -237,10 +236,7 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
                 Error::NoManager { .. } => return Err(e),
                 // The query completed and found the service gone: absence is established.
                 Error::NotInstalled { .. } => {}
-                _ => out.push(unusable(
-                    Some("marked ours, but its live state could not be queried"),
-                    e,
-                )),
+                _ => out.push(unusable("marked ours, but its live state could not be queried", e)),
             },
         }
     }
@@ -255,7 +251,7 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
 ///
 /// - `opened` not found: the container is not there, which establishes absence. `None`.
 /// - `opened` failed otherwise: nothing was enumerated and no absence is established.
-///   `detail("open", e)` names the failure.
+///   `detail("open", e)` is the failure.
 /// - The first entry that faults ends the pass with `detail("enumerate", e)`. What `keep` was
 ///   given before it stays: returning an error instead discards every one of those, reporting each
 ///   id absent.
@@ -266,18 +262,18 @@ pub(crate) fn scan<R, T>(
     location: &str,
     opened: io::Result<R>,
     entries: impl for<'r> FnOnce(&'r mut R) -> Box<dyn Iterator<Item = io::Result<T>> + 'r>,
-    detail: impl Fn(&'static str, &io::Error) -> String,
+    detail: impl Fn(&'static str, io::Error) -> Error,
     mut keep: impl FnMut(T),
 ) -> Option<Installed> {
     let mut resource = match opened {
         Ok(resource) => resource,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
-        Err(e) => return Some(Installed::scan_incomplete(location, &detail("open", &e))),
+        Err(e) => return Some(Installed::scan_incomplete(location, detail("open", e))),
     };
     for entry in entries(&mut resource) {
         match entry {
             Ok(item) => keep(item),
-            Err(e) => return Some(Installed::scan_incomplete(location, &detail("enumerate", &e))),
+            Err(e) => return Some(Installed::scan_incomplete(location, detail("enumerate", e))),
         }
     }
     None
@@ -286,10 +282,10 @@ pub(crate) fn scan<R, T>(
 /// What [`scan`] reports of a directory it could not finish: `op` is `"open"` or `"enumerate"`.
 /// One wording for every backend whose container is a directory.
 #[cfg(unix)]
-pub(crate) fn directory_detail(op: &'static str, e: &io::Error) -> String {
+pub(crate) fn directory_detail(op: &'static str, e: io::Error) -> Error {
     match op {
-        "open" => format!("failed to read directory: {e}"),
-        _ => format!("failed to read a directory entry: {e}"),
+        "open" => Error::os("read directory", e),
+        _ => Error::os("read a directory entry", e),
     }
 }
 

@@ -195,7 +195,11 @@ fn an_aggregate_undetermined_entry_has_a_null_name_and_names_its_count() {
                 name, None,
                 "one entry stands for 3 ids, so there is no single id to name"
             );
-            assert_eq!(reason, unreadable_notice(3), "the entry carries the notice verbatim");
+            assert_eq!(
+                reason.to_string(),
+                unreadable_notice(3),
+                "the entry carries the notice verbatim"
+            );
         }
         other => panic!("services goetia could not classify establish neither presence nor absence: {other:?}"),
     }
@@ -213,7 +217,7 @@ fn an_aggregate_standing_for_one_service_names_it() {
             assert_eq!(name.as_deref(), Some("MsSecFlt"));
             assert_eq!(
                 reason,
-                named_unreadable_notice(&one.detail, one.recovery.as_deref()),
+                named_unreadable_notice(one.detail, one.recovery.as_deref()),
                 "the entry carries the notice verbatim"
             );
         }
@@ -236,6 +240,7 @@ fn a_named_entry_carries_the_remedy_the_errno_earned_not_elevation() {
     let Some(Installed::Undetermined { reason, .. }) = unreadable_aggregate(vec![hive]) else {
         panic!("one unreadable service is undetermined, named");
     };
+    let reason = reason.to_string();
     assert!(
         reason.contains("resolve that failure and re-run"),
         "a failure that was not a denial gets the remedy `undetermined` chose for it: {reason}"
@@ -263,6 +268,7 @@ fn a_named_entry_offers_the_same_remedy_status_renders() {
         else {
             panic!("one unreadable service is undetermined, named");
         };
+        let reason = reason.to_string();
         assert!(
             reason.contains(&recovery),
             "`list` and `status` answer one condition once (access_denied={access_denied}): {reason}"
@@ -284,6 +290,7 @@ fn a_cause_that_carries_no_remedy_is_given_none() {
     let Some(Installed::Undetermined { reason, .. }) = unreadable_aggregate(vec![parts]) else {
         panic!("one unreadable service is undetermined, named");
     };
+    let reason = reason.to_string();
     assert!(
         reason.contains("the hive is corrupt"),
         "the cause still travels: {reason}"
@@ -303,8 +310,8 @@ fn a_named_entry_does_not_carry_the_aggregate_claim() {
     let Some(Installed::Undetermined { reason, .. }) = unreadable_aggregate(vec![denied("MsSecFlt")]) else {
         panic!("one unreadable service is undetermined");
     };
-    // The cause is kept: `to_error`'s own doc comment calls a static sentence useless for
-    // diagnosing a real Win32 failure.
+    let reason = reason.to_string();
+    // The cause is kept: a static sentence says nothing of a real Win32 failure.
     assert!(
         reason.contains(r"failed to open HKLM\...\MsSecFlt\Parameters: denied"),
         "the read that failed is the diagnosable part, and one entry has room for it: {reason}"
@@ -342,7 +349,7 @@ fn a_failed_parameters_read_keeps_its_rendered_cause() {
     );
     assert_eq!(carried.name, "MsSecFlt");
     assert_eq!(
-        carried.detail,
+        carried.detail.report().to_string(),
         r"failed to open HKLM\SYSTEM\CurrentControlSet\Services\MsSecFlt\Parameters: denied"
     );
     assert!(
@@ -354,7 +361,7 @@ fn a_failed_parameters_read_keeps_its_rendered_cause() {
         "MsSecFlt".to_string(),
         Error::os("read the hive", std::io::Error::other("the hive is corrupt")),
     );
-    assert!(other.detail.contains("the hive is corrupt"));
+    assert!(other.detail.report().to_string().contains("the hive is corrupt"));
 }
 
 /// A failure the read was wrapped in on its way up is looked through: the cause and the remedy
@@ -372,7 +379,7 @@ fn a_wrapped_parameters_read_failure_keeps_the_inner_cause_and_remedy() {
 
     let parts = unreadable_parts("MsSecFlt".to_string(), wrapped);
 
-    assert_eq!(parts.detail, "failed to read the key: unreadable");
+    assert_eq!(parts.detail.report().to_string(), "failed to read the key: unreadable");
     assert!(
         parts.recovery.is_some_and(|r| r.contains("re-run as Administrator")),
         "the remedy of the inner `Undetermined` travels"
@@ -393,7 +400,7 @@ fn unreadable_notice_is_one_line_and_says_what_it_stands_for() {
     // is *unknown*, not that the services are foreign — so pin it rather than
     // let a later reword quietly turn it into a reassuring lie.
     let denied = denied("MsSecFlt");
-    let one = named_unreadable_notice(&denied.detail, denied.recovery.as_deref());
+    let one = named_unreadable_notice(denied.detail, denied.recovery.as_deref()).to_string();
     assert!(
         !one.contains("could not be inspected"),
         "a named entry is about its own service, not about a count of them: {one}"

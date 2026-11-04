@@ -73,7 +73,7 @@ use crate::backend::{
 };
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
-use crate::error::{Error, PutBackFound, Result};
+use crate::error::{Error, PutBackFound, Reason, Result};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, Installed, Prepared, State, Status, Step, flow};
 use crate::spec::{AccountId, DaemonSpec, Id, Restart, User};
@@ -1578,22 +1578,22 @@ fn scan_in(dirs: [(&str, bool); 2]) -> Scan<Plist> {
         for location in locations {
             match read_at(&id, location) {
                 Ok(found_here) => found.push(found_here),
-                Err(e) => match e.cause() {
-                    // Gone between the scan above and this read: an uninstall that completed,
-                    // observed one syscall later. Absence is established, so this is a skip rather
-                    // than a blind spot: reporting it would let a benign concurrent uninstall raise
-                    // `list`'s host-wide exit code.
-                    Error::NotInstalled { .. } => {}
-                    // A failed read leaves zero evidence of whether this plist ever carried a
-                    // Goetia marker at all. `Installed::Undetermined` claims neither ownership nor
-                    // absence, which is exactly what was established.
-                    Error::Undetermined { reason, .. } => {
-                        unestablished.get_or_insert(reason.report().to_string());
-                    }
-                    _ => {
-                        unestablished.get_or_insert(e.report().to_string());
-                    }
-                },
+                // Gone between the scan above and this read: an uninstall that completed,
+                // observed one syscall later. Absence is established, so this is a skip rather
+                // than a blind spot: reporting it would let a benign concurrent uninstall raise
+                // `list`'s host-wide exit code.
+                Err(e) if matches!(e.cause(), Error::NotInstalled { .. }) => {}
+                // A failed read leaves zero evidence of whether this plist ever carried a
+                // Goetia marker at all. `Installed::Undetermined` claims neither ownership nor
+                // absence, which is exactly what was established. The entry says it by name, so
+                // the read is its reason and the recovery (written for `status`) is left out.
+                Err(e) => {
+                    let failed = match e.into_undetermined() {
+                        Ok((read, _recovery)) => *read,
+                        Err(e) => e,
+                    };
+                    unestablished.get_or_insert(Reason::failed(failed));
+                }
             }
         }
         if let Some(reason) = unestablished {
@@ -1610,8 +1610,7 @@ fn scan_in(dirs: [(&str, bool); 2]) -> Scan<Plist> {
                 if found.iter().any(|f| matches!(f, ReadOutcome::Marked(_))) {
                     reported.push(Installed::OursUnusable {
                         name: id,
-                        reason: Some(format!("present in both {STAGING_DIR} and {ENABLED_DIR}")),
-                        cause: None,
+                        reason: Reason::said(format!("present in both {STAGING_DIR} and {ENABLED_DIR}")),
                     });
                 }
             }

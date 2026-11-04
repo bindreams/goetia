@@ -17,7 +17,7 @@ pub(crate) mod flow;
 
 pub use budget::Budget;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Reason, Result};
 use crate::spec::{DaemonSpec, Id};
 
 // ServiceManager ======================================================================================================
@@ -300,18 +300,13 @@ pub enum Installed {
         pid: Option<u32>,
         enabled: bool,
     },
-    /// Ours by marker, but goetia cannot report on it. `reason` is goetia's own words for why and
-    /// `cause` the error under them; at least one is set, and [`Installed::unusable_reason`] reads
-    /// them as one text. The causes are listed on [`Ownership::OursUnusable`]. Kept distinct from a
-    /// silent omission: one such artifact must not take down `list`/`status` for every other
-    /// daemon.
+    /// Ours by marker, but goetia cannot report on it. `reason` is why: goetia's own words, the
+    /// error under them, or both. The causes are listed on [`Ownership::OursUnusable`]. Kept
+    /// distinct from a silent omission: one such artifact must not take down `list`/`status` for
+    /// every other daemon.
     ///
     /// [`Ownership::OursUnusable`]: crate::decide::Ownership::OursUnusable
-    OursUnusable {
-        name: String,
-        reason: Option<String>,
-        cause: Option<Box<Error>>,
-    },
+    OursUnusable { name: String, reason: Reason },
     /// Neither proof: the read that would have classified this id did not
     /// complete, so goetia established neither its absence nor its
     /// presence. The `list`-side counterpart of [`Error::Undetermined`],
@@ -343,19 +338,17 @@ pub enum Installed {
     /// on one condition.
     ///
     /// [`Error::Undetermined`]: crate::Error::Undetermined
-    Undetermined { name: Option<String>, reason: String },
+    Undetermined { name: Option<String>, reason: Reason },
 }
 
 impl Installed {
-    /// What `list` prints for an [`OursUnusable`](Installed::OursUnusable) entry, as
-    /// `reason: cause`, or whichever of the two it has; `None` for any other entry.
+    /// What `list` prints for an [`OursUnusable`](Installed::OursUnusable) entry; `None` for any
+    /// other entry.
     pub fn unusable_reason(&self) -> Option<String> {
-        let Installed::OursUnusable { reason, cause, .. } = self else {
-            return None;
-        };
-        let cause = cause.as_ref().map(|cause| cause.report().to_string());
-        let parts: Vec<String> = reason.iter().cloned().chain(cause).collect();
-        Some(parts.join(": "))
+        match self {
+            Installed::OursUnusable { reason, .. } => Some(reason.to_string()),
+            _ => None,
+        }
     }
 
     /// The aggregate entry an enumeration that stopped early leaves behind: `location` is what
@@ -367,13 +360,14 @@ impl Installed {
     /// dropping it, which is what returning `Err` from `list` amounts to, reports every one of
     /// those ids as absent. And the wording names no cause: a scan stops on a denial, a corrupt
     /// directory or an I/O fault alike, and only the `detail` handed in was established.
-    pub(crate) fn scan_incomplete(location: &str, detail: &str) -> Self {
+    pub(crate) fn scan_incomplete(location: &str, detail: Error) -> Self {
         Installed::Undetermined {
             name: None,
-            reason: format!(
-                "{location} could not be enumerated to the end ({detail}). Ownership is unknown \
-                 for whatever the scan did not reach, so a Goetia daemon may be missing from this \
-                 list."
+            reason: Reason::around(
+                format!("{location} could not be enumerated to the end ("),
+                detail,
+                "). Ownership is unknown for whatever the scan did not reach, so a Goetia daemon may be missing \
+                 from this list.",
             ),
         }
     }

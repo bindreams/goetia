@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// What a variant's `#[source]` holds when the cause is another library's error.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -529,6 +530,21 @@ impl Error {
         }
     }
 
+    /// The failed read and its recovery, when this [`Step`](Error::Step) chain ends in an
+    /// [`Undetermined`](Error::Undetermined); any other error comes back as it is, steps and all.
+    /// Only the launchd and SCM `list` scans take an `Undetermined` apart.
+    #[cfg(any(target_os = "macos", windows, test))]
+    pub(crate) fn into_undetermined(self) -> std::result::Result<(Box<Error>, String), Error> {
+        match self {
+            Error::Undetermined { reason, recovery, .. } => Ok((reason, recovery)),
+            Error::Step { what, source } => (*source).into_undetermined().map_err(|source| Error::Step {
+                what,
+                source: Box::new(source),
+            }),
+            e => Err(e),
+        }
+    }
+
     /// What would clear this failure, when it is written to follow the failure's cause: a remedy
     /// says "that read", so it cannot lead. [`report`](Error::report) prints it after the whole
     /// chain, and this variant's [`Display`](fmt::Display) leaves it out.
@@ -607,6 +623,76 @@ impl Error {
         }
     }
 }
+
+/// Why goetia says what it does about an id it cannot use or classify: a refused install, or a
+/// `list` entry. It is cheap to clone, and two reasons are equal when they read the same.
+///
+/// `Display` prints it as [`Error::report`] prints an error.
+#[derive(Debug, Clone)]
+pub enum Reason {
+    /// goetia's own words, with no error under them.
+    Said(String),
+    /// The error goetia failed on, and nothing else.
+    Failed(Arc<Error>),
+    /// The error goetia failed on, set inside its own words: `before`, the error's report, `after`.
+    Around {
+        before: String,
+        error: Arc<Error>,
+        after: String,
+    },
+}
+
+impl Reason {
+    pub fn said(text: impl Into<String>) -> Self {
+        Reason::Said(text.into())
+    }
+
+    pub fn failed(error: Error) -> Self {
+        Reason::Failed(Arc::new(error))
+    }
+
+    /// `what`, then the error under it: `what: error`.
+    pub fn because(what: impl Into<String>, error: Error) -> Self {
+        Reason::failed(Error::Step {
+            what: what.into(),
+            source: Box::new(error),
+        })
+    }
+
+    pub fn around(before: impl Into<String>, error: Error, after: impl Into<String>) -> Self {
+        Reason::Around {
+            before: before.into(),
+            error: Arc::new(error),
+            after: after.into(),
+        }
+    }
+
+    /// The error classification reads (see [`Error::cause`]), when there is one.
+    pub fn cause(&self) -> Option<&Error> {
+        match self {
+            Reason::Said(_) => None,
+            Reason::Failed(error) | Reason::Around { error, .. } => Some(error.cause()),
+        }
+    }
+}
+
+impl fmt::Display for Reason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Reason::Said(text) => f.write_str(text),
+            Reason::Failed(error) => write!(f, "{}", error.report()),
+            Reason::Around { before, error, after } => write!(f, "{before}{}{after}", error.report()),
+        }
+    }
+}
+
+impl PartialEq for Reason {
+    fn eq(&self, other: &Self) -> bool {
+        self.to_string() == other.to_string()
+    }
+}
+
+impl Eq for Reason {}
 
 /// What [`Error::report`] returns: the chain, formatted on `Display`.
 struct Report<'a>(&'a Error);

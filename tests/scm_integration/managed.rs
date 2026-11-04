@@ -1182,6 +1182,7 @@ fn install_refuses_an_always_blob_as_unusable() {
     let Outcome::RefuseUnusable { reason, recovery } = &outcome else {
         panic!("expected RefuseUnusable for an always blob, got {outcome:?}");
     };
+    let reason = reason.to_string();
     assert!(reason.contains("restart: always"), "{reason}");
     let recovery = recovery.as_deref().expect("a refused blob carries a recovery");
     assert!(
@@ -1303,7 +1304,8 @@ fn list_reports_a_denied_parameters_read_with_the_cause_it_established() {
             Installed::Undetermined { name, reason } if name.as_deref() == Some(id.as_str()) => Some(reason),
             _ => None,
         })
-        .unwrap_or_else(|| panic!("a service whose marker was never read is neither claimed nor omitted: {listed:?}"));
+        .unwrap_or_else(|| panic!("a service whose marker was never read is neither claimed nor omitted: {listed:?}"))
+        .to_string();
     assert!(
         reason.contains(&format!(r"{}\{id}\Parameters", support::SCM_SERVICES_KEY)),
         "the entry must name the key whose read did not complete: {reason}"

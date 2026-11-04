@@ -74,7 +74,9 @@ impl ReadFailure {
         }
     }
 
-    /// The operation and the path it failed on, with no claim about the id attached.
+    /// The operation and the path it failed on, with no claim about the id attached, as text for
+    /// a test to read. `Systemd::scan` keeps the error itself ([`ReadFailure::into_io_error`]).
+    #[cfg(test)]
     pub(super) fn detail(&self) -> String {
         format!(
             "failed to {op} {path}: {source}",

@@ -277,7 +277,7 @@ fn unclearable_conflict(recovery: &str) -> goetia::decide::Outcome {
 /// The `RefuseUnusable` [`FlakyManager::recoveryless_unusable`] injects.
 fn recoveryless_unusable(reason: &str) -> goetia::decide::Outcome {
     goetia::decide::Outcome::RefuseUnusable {
-        reason: reason.to_string(),
+        reason: goetia::Reason::said(reason),
         recovery: None,
     }
 }
@@ -385,8 +385,7 @@ impl ServiceManager for FlakyManager {
             if matches!(entry, Installed::Ours { spec, .. } if Some(spec.id.as_str()) == self.unqueryable.as_deref()) {
                 *entry = Installed::OursUnusable {
                     name: self.unqueryable.clone().expect("matched against Some just above"),
-                    reason: None,
-                    cause: Some(Box::new(unqueryable_failure())),
+                    reason: goetia::Reason::failed(unqueryable_failure()),
                 };
             }
         }
@@ -407,7 +406,7 @@ impl ServiceManager for FlakyManager {
         if let Some(name) = &self.undetermined_in_list {
             installed.push(Installed::Undetermined {
                 name: Some(name.clone()),
-                reason: UNDETERMINED_IN_LIST_REASON.to_string(),
+                reason: goetia::Reason::said(UNDETERMINED_IN_LIST_REASON),
             });
         }
         Ok(installed)

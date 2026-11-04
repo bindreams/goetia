@@ -251,6 +251,7 @@ fn a_services_key_that_will_not_open_leaves_the_pass_unfinished() {
     assert!(names.is_empty(), "{names:?}");
     match incomplete {
         Some(Installed::Undetermined { name: None, reason }) => {
+            let reason = reason.to_string();
             assert!(
                 reason.contains("SECURITY"),
                 "the entry must name what was being scanned: {reason}"

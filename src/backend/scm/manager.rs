@@ -114,7 +114,7 @@ use crate::backend::{
 };
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
-use crate::error::{Error, Result};
+use crate::error::{Error, Reason, Result};
 use crate::manager::{Budget, Installed, State, Status, budget, flow};
 use crate::spec::{DaemonSpec, Id, Kind};
 
@@ -1198,16 +1198,13 @@ fn unreadable_aggregate(unreadable: Vec<Unreadable>) -> Option<Installed> {
     // The name and the reason are one report: an entry that names its service and then says a
     // daemon may be missing from the list contradicts itself in a single rendered line.
     Some(match count {
-        1 => {
-            let reason = named_unreadable_notice(&first.detail, first.recovery.as_deref());
-            Installed::Undetermined {
-                name: Some(first.name),
-                reason,
-            }
-        }
+        1 => Installed::Undetermined {
+            name: Some(first.name),
+            reason: named_unreadable_notice(first.detail, first.recovery.as_deref()),
+        },
         _ => Installed::Undetermined {
             name: None,
-            reason: unreadable_notice(count),
+            reason: Reason::said(unreadable_notice(count)),
         },
     })
 }
@@ -1217,9 +1214,9 @@ fn unreadable_aggregate(unreadable: Vec<Unreadable>) -> Option<Installed> {
 /// neither the name, nor the cause, nor which remedy that cause earned.
 struct Unreadable {
     name: String,
-    /// [`registry::read_parameters`]'s own rendering of what failed: the key,
+    /// [`registry::read_parameters`]'s own error for what failed: the key,
     /// the operation and the OS error.
-    detail: String,
+    detail: Error,
     /// The remedy [`undetermined`] chose from that failure's errno, or `None`
     /// for one that arrived without a conditioned remedy to carry.
     recovery: Option<String>,
@@ -1235,15 +1232,15 @@ struct Unreadable {
 /// `registry_undetermined`, so the first arm is the whole story; the second exists because the
 /// `Result` type does not say so, and has no conditioned remedy to offer rather than a default one.
 fn unreadable_parts(name: String, e: Error) -> Unreadable {
-    match e.cause() {
-        Error::Undetermined { reason, recovery, .. } => Unreadable {
+    match e.into_undetermined() {
+        Ok((reason, recovery)) => Unreadable {
             name,
-            detail: reason.report().to_string(),
-            recovery: Some(recovery.clone()),
+            detail: *reason,
+            recovery: Some(recovery),
         },
-        _ => Unreadable {
+        Err(e) => Unreadable {
             name,
-            detail: e.report().to_string(),
+            detail: e,
             recovery: None,
         },
     }
@@ -1268,13 +1265,12 @@ fn unreadable_parts(name: String, e: Error) -> Unreadable {
 /// re-run elevated over a corrupt hive, while `status <same-id>` told it to fix the hive.
 /// [`unreadable_notice`]'s hedge is reasoning about a *count* — hundreds of causes, one entry — and
 /// does not reach a count of one.
-fn named_unreadable_notice(detail: &str, recovery: Option<&str>) -> String {
-    match recovery {
-        Some(recovery) => {
-            format!("{detail} — so whether this service is one of goetia's is unknown; {recovery}.")
-        }
-        None => format!("{detail} — so whether this service is one of goetia's is unknown."),
-    }
+fn named_unreadable_notice(detail: Error, recovery: Option<&str>) -> Reason {
+    let after = match recovery {
+        Some(recovery) => format!(" — so whether this service is one of goetia's is unknown; {recovery}."),
+        None => " — so whether this service is one of goetia's is unknown.".to_string(),
+    };
+    Reason::around("", detail, after)
 }
 
 /// The text [`unreadable_aggregate`]'s *unnamed* entry carries: how many

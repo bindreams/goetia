@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::{BoxError, Error, PutBackFound, VersionReading};
+use super::{BoxError, Error, PutBackFound, Reason, VersionReading};
 
 #[skuld::test]
 fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
@@ -691,4 +691,66 @@ fn report_of_a_start_judged_as_managed_names_the_unreadable_blob_and_then_the_fa
          JSON: EOF): failed to start /p: stopped"
     );
     assert!(!e.is_indeterminate());
+}
+
+// Reason ==============================================================================================================
+
+#[skuld::test]
+fn a_reason_reads_as_its_words_and_its_error_report() {
+    assert_eq!(Reason::said("present in both").to_string(), "present in both");
+    assert_eq!(
+        Reason::failed(os("read", "/p", "denied")).to_string(),
+        "failed to read /p: denied"
+    );
+    assert_eq!(
+        Reason::because("cannot regenerate", os("read", "/p", "denied")).to_string(),
+        "cannot regenerate: failed to read /p: denied"
+    );
+    assert_eq!(
+        Reason::around("scan failed (", os("read", "/p", "denied"), "). Ownership is unknown.").to_string(),
+        "scan failed (failed to read /p: denied). Ownership is unknown."
+    );
+}
+
+#[skuld::test]
+fn a_reason_prints_the_remedy_of_the_error_it_holds_last() {
+    assert_eq!(
+        Reason::failed(undetermined("re-run as root")).to_string(),
+        "cannot determine whether daemon `x` is installed: failed to read /p: denied. re-run as root"
+    );
+}
+
+#[skuld::test]
+fn a_reason_gives_the_error_classification_reads() {
+    assert!(Reason::said("words").cause().is_none());
+    let step = Reason::because("outer", not_installed());
+    assert!(matches!(step.cause(), Some(Error::NotInstalled { .. })));
+    let around = Reason::around("(", not_installed(), ")");
+    assert!(matches!(around.cause(), Some(Error::NotInstalled { .. })));
+}
+
+#[skuld::test]
+fn two_reasons_are_equal_when_they_read_the_same() {
+    let reason = || Reason::failed(os("read", "/p", "denied"));
+    assert_eq!(reason(), reason().clone());
+    assert_ne!(reason(), Reason::said("something else"));
+    assert_eq!(Reason::said("failed to read /p: denied"), reason());
+}
+
+#[skuld::test]
+fn an_undetermined_step_chain_gives_up_its_read_and_recovery() {
+    let step = Error::Step {
+        what: "check".to_string(),
+        source: Box::new(undetermined("re-run as root")),
+    };
+    let (reason, recovery) = step.into_undetermined().expect("the chain ends in Undetermined");
+    assert_eq!(reason.report().to_string(), "failed to read /p: denied");
+    assert_eq!(recovery, "re-run as root");
+
+    let other = Error::Step {
+        what: "check".to_string(),
+        source: Box::new(not_installed()),
+    };
+    let back = other.into_undetermined().expect_err("not an Undetermined");
+    assert_eq!(back.report().to_string(), "check: daemon `x` is not installed");
 }
