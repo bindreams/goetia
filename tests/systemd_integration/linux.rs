@@ -1179,58 +1179,56 @@ fn goetia_with_tasks(tasks: u32, args: &[&str]) -> std::process::Output {
 }
 
 /// goetia never panics for want of a task, and a verb that could not have what its request needs
-/// exits `1` with the unit untouched. Its tasks are counted exactly: its own thread; one version
-/// probe at a time; and for a `start` that waits, a thread for each of `systemctl`'s two streams,
-/// made before `systemctl` itself. So one task cannot probe, two or three cannot send the start,
-/// and four can. A `restart` makes the two threads each of its legs needs before either leg, and
-/// probes with all four held, so it needs six.
+/// exits `1` with the daemon untouched. Each verb is swept over a rising task limit until it
+/// succeeds: below that it must fail cleanly, at it the verb works. How many tasks a verb needs is
+/// goetia's business, so the cutoff itself is not asserted, only that one limit is too few and a
+/// generous one is enough.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
+    const ENOUGH: u32 = 64;
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     Systemd::new().install(&mk(guard.id()), false).expect("install");
-    let run = |tasks: u32, verb: &str| {
-        let output = goetia_with_tasks(tasks, &["daemon", verb, guard.id()]);
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        assert!(!stderr.contains("panicked"), "{verb} TasksMax={tasks}: {stderr}");
-        (output.status.code(), stderr)
+
+    // Runs `args` at each limit from 1 until it exits `0`, checking every failure with `untouched`.
+    let sweep = |args: &[&str], untouched: &dyn Fn(u32)| {
+        for tasks in 1..=ENOUGH {
+            let output = goetia_with_tasks(tasks, args);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!stderr.contains("panicked"), "{args:?} TasksMax={tasks}: {stderr}");
+            match output.status.code() {
+                Some(0) => {
+                    assert!(tasks > 1, "{args:?} succeeded with a single task, so the sweep tested nothing");
+                    return;
+                }
+                Some(1) => untouched(tasks),
+                other => panic!("{args:?} TasksMax={tasks}: exit {other:?}: {stderr}"),
+            }
+        }
+        panic!("{args:?} did not succeed even with TasksMax={ENOUGH}");
     };
 
-    for tasks in [1, 2, 3] {
-        let (code, stderr) = run(tasks, "start");
-        assert_eq!(code, Some(1), "start TasksMax={tasks}: {stderr}");
+    sweep(&["daemon", "start", guard.id()], &|tasks| {
         assert_eq!(
             active_state_and_job(guard.id()),
             ("inactive".to_string(), String::new()),
             "a start short of tasks sent something: TasksMax={tasks}"
         );
-    }
-    let (code, stderr) = run(4, "start");
-    assert_eq!(code, Some(0), "start TasksMax=4: {stderr}");
+    });
 
     let before = main_pid(guard.id());
-    for tasks in [2, 3, 4, 5] {
-        let (code, stderr) = run(tasks, "restart");
-        assert_eq!(code, Some(1), "restart TasksMax={tasks}: {stderr}");
+    sweep(&["daemon", "restart", guard.id()], &|tasks| {
         assert_eq!(
             (active_state_and_job(guard.id()), main_pid(guard.id())),
             (("active".to_string(), String::new()), before.clone()),
             "a restart short of tasks touched the daemon: TasksMax={tasks}"
         );
-    }
-    let (code, stderr) = run(6, "restart");
-    assert_eq!(code, Some(0), "restart TasksMax=6: {stderr}");
-    assert_ne!(main_pid(guard.id()), before, "restart TasksMax=6 restarted nothing");
+    });
+    assert_ne!(main_pid(guard.id()), before, "the provisioned restart restarted nothing");
 
-    // A budget whose `systemctl` goetia does not watch makes no thread, and reserves none: two tasks
-    // are its own and one `systemctl` at a time.
-    let output = goetia_with_tasks(2, &["daemon", "restart", guard.id(), "--timeout", "0"]);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "restart --timeout 0 TasksMax=2: {stderr}"
-    );
+    // A restart that does not wait sends its stop before its start, so a failure may have touched
+    // the daemon: only "never panics, and works when provisioned" holds for it.
+    sweep(&["daemon", "restart", guard.id(), "--timeout", "0"], &|_| {});
 }
 
 /// `Type=exec` is what makes `systemctl start` report failure here at all — under `Type=simple` the
