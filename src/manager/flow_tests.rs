@@ -3,7 +3,7 @@ use crate::decide::{self, ExternalConfig, Outcome};
 use crate::error::Error;
 use crate::manager::fake::fake_tests::mk;
 use crate::manager::fake::{Fake, generate};
-use crate::manager::{Installed, ServiceManager};
+use crate::manager::{Budget, Installed, ServiceManager, Step};
 use crate::spec::{DaemonSpec, Id, User};
 
 // Fixtures ============================================================================================================
@@ -33,12 +33,11 @@ fn install_retries_a_raced_write_until_it_lands() {
     assert_eq!(fake.writes(), 3, "two raced writes, then the one that landed");
     fake.status(&Id::try_from("frpc").unwrap())
         .expect("the artifact must be present");
-    let installs = fake
-        .guarded()
-        .into_iter()
-        .filter(|(verb, ..)| *verb == "install")
-        .count();
-    assert_eq!(installs, 1, "one install scope is held across every retry");
+    assert_eq!(
+        fake.prepared(),
+        [(vec![Step::Install], Budget::Unbounded)],
+        "one reservation is made for every retry"
+    );
 }
 
 #[skuld::test]
@@ -454,7 +453,7 @@ fn every_verb_on_an_id_that_is_not_ours_reports_why_and_performs_nothing() {
     }
 
     assert_eq!(fake.calls(), [], "no verb reached the backend");
-    assert!(fake.guarded().is_empty());
+    assert_eq!(fake.prepared(), [], "no verb reserved anything before the gate passed");
     assert_eq!(fake.writes(), 0);
     let after = fake.preview_install(&mk("stranger")).unwrap();
     assert!(matches!(after, Outcome::RefuseForeign { .. }), "{after:?}");
@@ -580,4 +579,181 @@ fn a_directory_pass_that_stopped_is_worded_by_where_it_stopped() {
         directory_detail("open", again()).report().to_string(),
         "failed to read directory: injected mid-scan failure"
     );
+}
+
+// single verbs reserve ================================================================================================
+
+/// The verbs that draw on a reservation, each run on `mgr` as the blanket impl runs it outside a
+/// sequence, with the step it reserves for and the budget it reserves under.
+#[allow(clippy::type_complexity)]
+fn single_verbs<'a>(
+    mgr: &'a dyn ServiceManager,
+    id: &'a Id,
+    spec: &'a DaemonSpec,
+) -> Vec<(&'static str, Step, Budget, Box<dyn Fn() -> Result<()> + 'a>)> {
+    let budget = Budget::DEFAULT;
+    vec![
+        (
+            "install",
+            Step::Install,
+            Budget::Unbounded,
+            Box::new(|| mgr.install(spec, true).map(drop)),
+        ),
+        ("start", Step::Start, budget, Box::new(move || mgr.start(id, budget))),
+        ("stop", Step::Stop, budget, Box::new(move || mgr.stop(id, budget))),
+        ("kill", Step::Kill, Budget::Unbounded, Box::new(|| mgr.kill(id))),
+        (
+            "uninstall",
+            Step::Uninstall,
+            Budget::Unbounded,
+            Box::new(|| mgr.uninstall(id)),
+        ),
+        (
+            "request_start_after_stop",
+            Step::RequestStartAfterStop,
+            Budget::Immediate,
+            Box::new(|| mgr.request_start_after_stop(id)),
+        ),
+    ]
+}
+
+/// Each verb run outside a sequence reserves for its own step, under the budget it runs with. `kill`
+/// and `uninstall` count what `stop` does on a real backend, so only the step recorded tells them
+/// apart.
+#[skuld::test]
+fn a_single_verb_reserves_for_its_own_step() {
+    let spec = mk("frpc");
+    let id = spec.id.clone();
+    let fake = Fake::new();
+    let mgr: &dyn ServiceManager = &fake;
+    for (verb, step, budget, run) in single_verbs(mgr, &id, &spec) {
+        fake.install(&spec, true).unwrap();
+        let before = fake.prepared().len();
+
+        // Whether the verb then succeeds is not the question: its reservation comes first.
+        drop(run());
+
+        assert_eq!(fake.prepared()[before..], [(vec![step], budget)], "{verb}");
+    }
+}
+
+/// A single verb whose reservation cannot be made sends nothing and fails as `Error::Reservation`
+/// carrying its id, whichever verb it is.
+#[skuld::test]
+fn a_single_verb_that_cannot_reserve_sends_nothing_and_names_its_id() {
+    let spec = mk("frpc");
+    let id = spec.id.clone();
+    let fake = Fake::new();
+    fake.install(&spec, false).unwrap();
+    let (calls, writes) = (fake.calls(), fake.writes());
+    let mgr: &dyn ServiceManager = &fake;
+
+    for (verb, step, _, run) in single_verbs(mgr, &id, &spec) {
+        fake.seed_prepare_fails(step);
+
+        let result = run();
+
+        assert!(
+            matches!(&result, Err(Error::Reservation { id: Some(named), .. }) if named == "frpc"),
+            "{verb}: {result:?}"
+        );
+        assert_eq!(fake.calls(), calls, "{verb} reached the backend");
+        assert_eq!(fake.writes(), writes, "{verb} wrote");
+        assert!(fake.status(&id).is_ok(), "{verb} removed the service");
+    }
+}
+
+// sequence ============================================================================================================
+
+/// A prepared step is used once, and only a prepared step: a verb that was not prepared for cannot
+/// have had anything reserved, so it is a miscount, loud in every debug build.
+#[cfg(debug_assertions)]
+#[skuld::test]
+#[should_panic(
+    expected = "[Start] was not prepared for, or already ran: it would draw on a reservation not counted for it"
+)]
+fn a_sequence_refuses_a_verb_it_was_not_prepared_for() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    let id = Id::try_from("frpc").unwrap();
+    let mut sequence = fake.prepare(&[Step::Stop], Budget::DEFAULT).unwrap();
+
+    drop(sequence.start(&id, Budget::DEFAULT));
+}
+
+#[cfg(debug_assertions)]
+#[skuld::test]
+#[should_panic(
+    expected = "[Stop] was not prepared for, or already ran: it would draw on a reservation not counted for it"
+)]
+fn a_sequence_refuses_a_step_run_twice() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    let id = Id::try_from("frpc").unwrap();
+    let mut sequence = fake.prepare(&[Step::Stop], Budget::DEFAULT).unwrap();
+
+    sequence.stop(&id, Budget::DEFAULT).unwrap();
+    drop(sequence.stop(&id, Budget::DEFAULT));
+}
+
+/// `restart --timeout 0` prepares `Start` and runs `request_start_after_stop`: a request for a start
+/// spends the step a start does.
+#[skuld::test]
+fn a_prepared_start_covers_a_start_requested_after_a_stop() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    let id = Id::try_from("frpc").unwrap();
+    let mut sequence = fake.prepare(&[Step::Stop, Step::Start], Budget::Immediate).unwrap();
+
+    sequence.stop(&id, Budget::Immediate).unwrap();
+    sequence.request_start_after_stop(&id).unwrap();
+}
+
+/// A request for a start spends the step made for exactly that before it falls back to `Start`,
+/// so a sequence prepared for both can still start afterwards.
+#[cfg(debug_assertions)]
+#[skuld::test]
+fn a_requested_start_spends_its_own_step_before_start() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    let id = Id::try_from("frpc").unwrap();
+    let mut sequence = fake
+        .prepare(&[Step::RequestStartAfterStop, Step::Start], Budget::Immediate)
+        .unwrap();
+
+    sequence.request_start_after_stop(&id).unwrap();
+
+    sequence.start(&id, Budget::Immediate).unwrap();
+}
+
+/// The cover goes one way: a step prepared for the request alone does not count a start.
+#[cfg(debug_assertions)]
+#[skuld::test]
+#[should_panic(
+    expected = "[Start] was not prepared for, or already ran: it would draw on a reservation not counted for it"
+)]
+fn a_step_prepared_for_a_requested_start_does_not_cover_a_start() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    let id = Id::try_from("frpc").unwrap();
+    let mut sequence = fake.prepare(&[Step::RequestStartAfterStop], Budget::Immediate).unwrap();
+
+    drop(sequence.start(&id, Budget::DEFAULT));
+}
+
+/// A verb the ownership gate refuses draws nothing, so it spends nothing: the sequence still holds
+/// every step, the refused one included, and runs it once the gate lets it through.
+#[cfg(debug_assertions)]
+#[skuld::test]
+fn a_verb_the_gate_refuses_spends_no_step() {
+    let fake = Fake::new();
+    let id = Id::try_from("frpc").unwrap();
+    let mut sequence = fake.prepare(&[Step::Stop, Step::Start], Budget::DEFAULT).unwrap();
+
+    let refused = sequence.stop(&id, Budget::DEFAULT);
+
+    assert!(matches!(refused, Err(Error::NotInstalled { .. })), "{refused:?}");
+    fake.install(&mk("frpc"), false).unwrap();
+    sequence.stop(&id, Budget::DEFAULT).unwrap();
+    sequence.start(&id, Budget::DEFAULT).unwrap();
 }

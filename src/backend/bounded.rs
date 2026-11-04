@@ -22,9 +22,9 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError, Sender, TryRecvError};
 #[cfg(test)]
 pub(crate) use spares::test_hook;
-pub(crate) use spares::{Needs, Reaper, spare};
-#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
-pub(crate) use spares::{Spares, reapers, top_up};
+pub(crate) use spares::{Reaper, Reservation};
+#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
+pub(crate) use spares::{Spares, spare};
 
 use crate::error::within;
 use crate::manager::budget::Deadline;
@@ -43,6 +43,10 @@ pub(crate) fn command(program: &str, args: &[&str]) -> Result<cosca::Command, co
 }
 
 // wait_bounded ========================================================================================================
+
+/// The streams a child's output is captured from, and so the temp files a [`Role::Query`] or
+/// [`Role::Request`] draws: stdout and stderr. What a role draws is [`Role::files`].
+pub(crate) const STREAMS: usize = 2;
 
 /// What the child wrote, and whether that is all of it.
 #[derive(Debug)]
@@ -87,9 +91,8 @@ pub(crate) enum Role {
     /// temp files, read once it has exited, taken from the verb's reservation.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Query,
-    /// A read no verb counted — launchd's `status` and `list` — as [`Role::Query`], except that its
-    /// files are made for it on the spot, whatever reservation is live: it never draws on one,
-    /// which only the requests' steps counted for, and failing to make one sends nothing.
+    /// A read no verb counted — launchd's `status` and `list`. As [`Role::Query`], but its files are
+    /// made on the spot, never drawn from a reservation; failing to make one sends nothing.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     UncountedQuery,
     /// A request that says on stderr when the manager has it: `issued` holds once it has. Until
@@ -108,6 +111,21 @@ pub(crate) enum Role {
     /// exiting — kills the writer with `SIGPIPE`, and a file does not.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Request(Reaper),
+}
+
+impl Role {
+    /// The temp files each call that draws from a reservation ([`Role::Query`] or [`Role::Request`])
+    /// draws: a verb's call count is turned into files by it.
+    pub(crate) const COUNTED_FILES: usize = STREAMS;
+
+    /// The temp files a [`spawn`] under this role draws from its reservation. The one definition:
+    /// `spawn`, the verbs' call counts and the test `Fake` all read it.
+    pub(crate) fn files(&self) -> usize {
+        match self {
+            Role::Query | Role::Request(_) => Self::COUNTED_FILES,
+            Role::UncountedQuery | Role::AnnouncedRequest(_) => 0,
+        }
+    }
 }
 
 /// A child [`spawn`]ed under its [`Role`], with where its output went.
@@ -133,14 +151,15 @@ enum Ready {
 }
 
 impl Ready {
-    /// A temp file, or for a [`Role::AnnouncedRequest`] a thread to read a pipe: see [`Role`].
-    fn for_role(role: &Role) -> Result<Ready, cosca::error::Error> {
+    /// A temp file, drawn from `reservation`, or for a [`Role::AnnouncedRequest`] a thread to read a
+    /// pipe: see [`Role`].
+    fn for_role(role: &Role, reservation: &mut Reservation) -> Result<Ready, cosca::error::Error> {
         Ok(match role {
             Role::AnnouncedRequest(_) => {
                 Ready::Listener(spares::listener().map_err(not_run("thread to read its output"))?)
             }
-            Role::Query | Role::Request(_) => Ready::File(spares::file().map_err(not_run("temp file for its output"))?),
-            Role::UncountedQuery => Ready::File(spares::own_file().map_err(not_run("temp file for its output"))?),
+            _ if role.files() > 0 => Ready::File(reservation.file().map_err(not_run("temp file for its output"))?),
+            _ => Ready::File(spares::make_file().map_err(not_run("temp file for its output"))?),
         })
     }
 
@@ -185,11 +204,20 @@ impl std::fmt::Display for SpawnError {
 /// stream — or, for a [`Role::AnnouncedRequest`], a thread to read each as it is written, since it
 /// announces on stderr and must not depend on a writable temp directory. A failure to make one is
 /// [`SpawnError::NotRun`], and says so. A [`Role::Request`] brings its [`Reaper`], made before the
-/// caller sent anything — see [`reapers`].
-pub(crate) fn spawn(cmd: &mut cosca::Command, role: Role) -> Result<Spawned, SpawnError> {
+/// caller sent anything — see [`Reservation`]. Its files are drawn from `reservation`, [`STREAMS`] for
+/// each [`Role::Query`] and [`Role::Request`]; a call that draws none is handed an empty one.
+pub(crate) fn spawn(
+    cmd: &mut cosca::Command,
+    role: Role,
+    reservation: &mut Reservation,
+) -> Result<Spawned, SpawnError> {
     let prepared = (|| {
-        let stdout = Ready::for_role(&role)?;
-        let stderr = Ready::for_role(&role)?;
+        let streams = (0..STREAMS)
+            .map(|_| Ready::for_role(&role, reservation))
+            .collect::<Result<Vec<_>, _>>()?;
+        let Ok([stdout, stderr]) = <[Ready; STREAMS]>::try_from(streams) else {
+            unreachable!("STREAMS is the number of streams a child has");
+        };
         cmd.stdout(stdout.stdio()?)?;
         cmd.stderr(stderr.stdio()?)?;
         Ok((stdout, stderr))

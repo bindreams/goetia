@@ -86,7 +86,7 @@ use crate::backend::{
 };
 use crate::decide::Outcome;
 use crate::error::{Error, Reason, Result};
-use crate::manager::{Budget, Installed, Prepared, Status, Step, flow};
+use crate::manager::{Budget, Installed, Status, Step, flow};
 use crate::spec::{AccountId, DaemonSpec, Id, User};
 
 /// Where systemd looks for system unit files. Never overridden — the integration tests run for real
@@ -107,10 +107,18 @@ impl Systemd {
     }
 }
 
+/// What [`Backend::reserve`] holds for systemd: pooled listener threads and a share of the version
+/// gate.
+pub(crate) struct Held {
+    _spares: bounded::Spares,
+    _gate: GateScope,
+}
+
 impl Backend for Systemd {
     type Definition = String;
     type Snapshot = Fragment;
     type InstallScope = GateScope;
+    type Reservation = Held;
 
     /// Before anything is read or written: the gate is where no manager to ask refuses too. Its
     /// answer holds for the `daemon-reload` after the write.
@@ -118,6 +126,21 @@ impl Backend for Systemd {
         let gate = gate_scope();
         require_supported()?;
         Ok(gate)
+    }
+
+    /// Two listener threads (stderr, stdout; no temp files) per watched start or stop in `steps`,
+    /// plus a share of one version gate. `install` and unwatched budgets need none. Verbs take the
+    /// threads from this thread's pool, not from the `Held` they are handed.
+    fn reserve(&self, steps: &[Step], budget: Budget) -> Result<Held> {
+        let watched = steps
+            .iter()
+            .filter(|step| matches!(step, Step::Start | Step::Stop) && systemctl::watched(budget))
+            .count();
+        let spares = bounded::spare(2 * watched).map_err(|source| Error::Reservation { id: None, source })?;
+        Ok(Held {
+            _spares: spares,
+            _gate: gate_scope(),
+        })
     }
 
     fn render(&self, spec: &DaemonSpec) -> Result<String> {
@@ -139,6 +162,7 @@ impl Backend for Systemd {
         outcome: &Outcome,
         snapshot: Option<&Fragment>,
         _scope: &mut GateScope,
+        _reservation: &mut Held,
     ) -> Result<WriteOutcome> {
         let id = spec.id.as_str();
         dirs::ensure_parent_dirs(spec)?;
@@ -211,7 +235,7 @@ impl Backend for Systemd {
         Scan { entries, reported }
     }
 
-    fn uninstall(&self, snapshot: Fragment) -> Result<()> {
+    fn uninstall(&self, snapshot: Fragment, _reservation: &mut Held) -> Result<()> {
         let id = snapshot.id().as_str();
         // One version gate for the stop, the `disable` and the `daemon-reload`: the stop's.
         let _gate = gate_scope();
@@ -265,29 +289,11 @@ impl Backend for Systemd {
         disable_impl(snapshot.id().as_str())
     }
 
-    fn start(&self, snapshot: Fragment, budget: Budget) -> Result<()> {
+    fn start(&self, snapshot: Fragment, budget: Budget, _reservation: &mut Held) -> Result<()> {
         // Derived at verb entry. It bounds only the wait for the job, never whether the job is
         // enqueued — see `run_verb`.
         let deadline = budget.start();
         start_impl(snapshot.id().as_str(), budget, deadline)
-    }
-
-    /// Makes ready now what each start or stop in `steps` needs to watch its one `systemctl` under
-    /// `budget`: a thread for each of its two streams, the stderr it announces its job on and its
-    /// stdout — never a temp file. `install` runs no watched `systemctl`, and a budget that does not wait, or never
-    /// stops waiting, watches none. While it is held, the steps also share one version gate — see
-    /// `systemctl::GateScope`.
-    fn prepare(&self, steps: &[Step], budget: Budget) -> Result<Prepared> {
-        let watched = steps
-            .iter()
-            .filter(|step| matches!(step, Step::Start | Step::Stop) && systemctl::watched(budget))
-            .count();
-        let spares = bounded::spare(bounded::Needs {
-            listeners: 2 * watched,
-            ..bounded::Needs::default()
-        })
-        .map_err(|source| Error::Reservation { id: None, source })?;
-        Ok(Prepared::holding((spares, gate_scope())))
     }
 
     /// One `systemctl restart --no-block`: one job, so no start can overtake
@@ -301,17 +307,17 @@ impl Backend for Systemd {
     /// The plain request-only start. `restart` never issues it here — see
     /// [`Self::request_restart`] — since after a stop nobody waited for, it
     /// replaces a stop job systemd has not yet run.
-    fn request_start_after_stop(&self, snapshot: Fragment) -> Result<()> {
-        Backend::start(self, snapshot, Budget::Immediate)
+    fn request_start_after_stop(&self, snapshot: Fragment, reservation: &mut Held) -> Result<()> {
+        Backend::start(self, snapshot, Budget::Immediate, reservation)
     }
 
-    fn stop(&self, snapshot: Fragment, budget: Budget) -> Result<()> {
+    fn stop(&self, snapshot: Fragment, budget: Budget, _reservation: &mut Held) -> Result<()> {
         // Derived at verb entry, as for `start`.
         let deadline = budget.start();
         stop_impl(snapshot.id().as_str(), budget, deadline)
     }
 
-    fn kill(&self, snapshot: Fragment) -> Result<()> {
+    fn kill(&self, snapshot: Fragment, _reservation: &mut Held) -> Result<()> {
         kill_impl(snapshot.id().as_str())
     }
 }

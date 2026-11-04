@@ -14,6 +14,10 @@ use crate::manager::ServiceManager;
 use crate::spec::{Id, Kind, Restart, User};
 
 fn sample_plist(id: &str) -> String {
+    sample_plist_restarting(id, Restart::Never)
+}
+
+fn sample_plist_restarting(id: &str, restart: Restart) -> String {
     let spec = DaemonSpec {
         id: Id::try_from(id).unwrap(),
         name: id.to_string(),
@@ -21,7 +25,7 @@ fn sample_plist(id: &str) -> String {
         cwd: None,
         env: Default::default(),
         user: User::Root,
-        restart: Restart::Never,
+        restart,
         restart_delay: None,
         logs: None,
         kind: Kind::Simple,
@@ -939,28 +943,33 @@ fn a_write_over_a_plist_that_vanished_before_any_call_is_raced() {
     let stale = Outcome::Stale {
         from_version: "0.0.1".to_string(),
     };
-    let mut scope = mgr.begin_install(&spec).expect("begin_install");
+    mgr.begin_install(&spec).expect("begin_install");
+    let mut reservation = reserved(&[Step::Install]);
 
     let written = mgr
-        .write(&spec, &desired, &stale, Some(&snapshot), &mut scope)
+        .write(&spec, &desired, &stale, Some(&snapshot), &mut (), &mut reservation)
         .expect("write");
 
     assert!(matches!(written, WriteOutcome::Raced));
     script.assert_spent("a race before any call makes none");
 }
 
-// Reapers: a sequence never fails halfway for want of one =============================================================
+// Reservation: a verb never fails halfway for want of a reaper or a file ==============================================
 
 /// An id nothing is installed at.
 fn never_installed() -> Id {
     Id::try_from("goetia-reaper-probe-never-installed").unwrap()
 }
 
-/// A marked plist for `id` that no file backs, as the ownership gate would hand a verb. A verb that
-/// gets past its reapers and temp files makes its first `launchctl` call, so these tests run it
-/// over a `launchctl` that refuses every call (`over_sh(&[])`), and touch nothing on the host.
+/// A marked plist for `id` that no file backs, as the ownership gate would hand a verb. The verbs
+/// run over a fake `launchctl` (`scripted`), so these tests touch nothing on the host.
 fn marked_plist(id: &Id) -> Plist {
-    let text = sample_plist(id.as_str());
+    marked_plist_restarting(id, Restart::Never)
+}
+
+/// [`marked_plist`] of a job with `restart`: `Always` is the one `start`'s corrective cycle runs for.
+fn marked_plist_restarting(id: &Id, restart: Restart) -> Plist {
+    let text = sample_plist_restarting(id.as_str(), restart);
     let blob = generate::extract(&text)
         .transpose()
         .expect("sample_plist carries the marker");
@@ -975,196 +984,252 @@ fn marked_plist(id: &Id) -> Plist {
     }
 }
 
-/// Whether `result` is the failure of a verb that could not make its reapers — as opposed to one that
-/// made them and went on to discovery.
-fn refused_for_want_of_a_reaper<T: std::fmt::Debug>(result: &Result<T>) -> bool {
-    matches!(result, Err(e @ Error::Reservation { .. }) if e.report().to_string().contains("no thread may be made"))
+/// A reservation of the stated size: `requests` reapers and the files of `calls` calls.
+fn reservation(requests: usize, calls: usize) -> Reservation {
+    Reservation::make(requests, calls * Role::COUNTED_FILES).expect("make a reservation")
 }
 
-/// Every verb makes every reaper it can need before anything else, so before any `launchctl` runs:
-/// one short, and the verb fails having sent nothing. `start`'s corrective cycle is its fourth and
-/// fifth requests, so four reapers are one short.
-#[skuld::test]
-fn a_verb_one_reaper_short_sends_nothing() {
-    use crate::backend::Backend;
+/// What [`Launchd::reserve`] makes for `steps`.
+fn reserved(steps: &[Step]) -> Reservation {
+    backend::Backend::reserve(&Launchd::new(), steps, Budget::DEFAULT).expect("reserve")
+}
 
-    let (mgr, _refused) = over_sh(&[]);
-    let id = never_installed();
-    let spec = DaemonSpec {
-        id: id.clone(),
-        name: id.to_string(),
-        command: vec!["/bin/true".to_string()],
-        cwd: None,
-        env: Default::default(),
-        user: User::Root,
-        restart: Restart::Always,
-        restart_delay: None,
-        logs: None,
-        kind: Kind::Simple,
-    };
-    for budget in [Budget::DEFAULT, Budget::Immediate] {
-        let _four = bounded::test_hook::threads(START_REQUESTS - 1);
-        assert!(
-            refused_for_want_of_a_reaper(&Backend::start(&mgr, marked_plist(&id), budget)),
-            "start {budget:?}"
-        );
+/// `reserve` makes what the steps count, and nothing else: the reapers and files of their longest
+/// paths, summed over a sequence. The numbers are written out so that changing a count is deliberate.
+#[skuld::test]
+fn a_reservation_holds_what_its_steps_count() {
+    let cases: [(&[Step], (usize, usize)); 7] = [
+        (&[Step::Install], (1, 6)),
+        (&[Step::Start], (5, 24)),
+        (&[Step::Stop], (1, 2)),
+        (&[Step::Kill], (1, 2)),
+        (&[Step::Uninstall], (1, 2)),
+        (&[Step::RequestStartAfterStop], (5, 24)),
+        (&[Step::Stop, Step::Start], (6, 26)),
+    ];
+    for (steps, held) in cases {
+        assert_eq!(bounded::test_hook::left(&reserved(steps)), held, "{steps:?}");
     }
-    let _four = bounded::test_hook::threads(START_REQUESTS - 1);
-    assert!(refused_for_want_of_a_reaper(&Backend::request_start_after_stop(
-        &mgr,
-        marked_plist(&id)
-    )));
-    let _none = bounded::test_hook::threads(0);
-    assert!(refused_for_want_of_a_reaper(&Backend::stop(
-        &mgr,
-        marked_plist(&id),
-        Budget::DEFAULT
-    )));
-    assert!(refused_for_want_of_a_reaper(&Backend::kill(&mgr, marked_plist(&id))));
-    assert!(refused_for_want_of_a_reaper(&Backend::uninstall(
-        &mgr,
-        marked_plist(&id)
-    )));
-    assert!(refused_for_want_of_a_reaper(&mgr.install(&spec, false)));
 }
 
-/// With every reaper made, the same verbs go on to their first `launchctl` call, which `over_sh(&[])`
-/// refuses.
+/// A reservation one reaper or one file short of what a sequence counts is refused as a whole, so a
+/// `restart` (`[Stop, Start]`) or an `install --start` (`[Start]`) that cannot have everything sends
+/// nothing — under every budget, since `launchctl` is waited on under all of them.
 #[skuld::test]
-fn a_verb_with_its_reapers_goes_on_to_its_first_call() {
+fn a_reservation_that_cannot_be_made_whole_is_refused() {
     use crate::backend::Backend;
 
-    let id = never_installed();
-    let (mgr, _refused) = over_sh(&[]);
-    let _five = bounded::test_hook::threads(START_REQUESTS);
-    assert!(!refused_for_want_of_a_reaper(&Backend::start(
-        &mgr,
-        marked_plist(&id),
-        Budget::DEFAULT
-    )));
-    let _one = bounded::test_hook::threads(STOP_REQUESTS);
-    assert!(!refused_for_want_of_a_reaper(&Backend::stop(
-        &mgr,
-        marked_plist(&id),
-        Budget::DEFAULT
-    )));
-    let _one = bounded::test_hook::threads(KILL_REQUESTS);
-    assert!(!refused_for_want_of_a_reaper(&Backend::kill(&mgr, marked_plist(&id))));
-}
-
-/// Whether `result` is the failure of a verb that could not make the temp files its `launchctl`
-/// calls write to — as opposed to one that made them and went on to discovery.
-fn refused_for_want_of_a_file<T: std::fmt::Debug>(result: &Result<T>) -> bool {
-    matches!(result, Err(e @ Error::Reservation { .. }) if e.report().to_string().contains("no temp file may be made"))
-}
-
-/// Every verb makes the temp files every `launchctl` call it can make writes to, reads and requests
-/// alike, before anything else: one short, and the verb fails having sent nothing.
-#[skuld::test]
-fn a_verb_one_temp_file_short_sends_nothing() {
-    use crate::backend::Backend;
-
-    let (mgr, _refused) = over_sh(&[]);
-    let id = never_installed();
-    let spec = DaemonSpec {
-        id: id.clone(),
-        name: id.to_string(),
-        command: vec!["/bin/true".to_string()],
-        cwd: None,
-        env: Default::default(),
-        user: User::Root,
-        restart: Restart::Always,
-        restart_delay: None,
-        logs: None,
-        kind: Kind::Simple,
-    };
-    let short = |calls: usize| bounded::test_hook::temp_files(calls * FILES_PER_CALL - 1);
-    for budget in [Budget::DEFAULT, Budget::Immediate] {
-        let _short = short(START_CALLS);
-        assert!(
-            refused_for_want_of_a_file(&Backend::start(&mgr, marked_plist(&id), budget)),
-            "start {budget:?}"
-        );
-    }
-    {
-        let _short = short(START_CALLS);
-        assert!(refused_for_want_of_a_file(&Backend::request_start_after_stop(
-            &mgr,
-            marked_plist(&id)
-        )));
-    }
-    let _short = short(STOP_CALLS);
-    assert!(refused_for_want_of_a_file(&Backend::stop(
-        &mgr,
-        marked_plist(&id),
-        Budget::DEFAULT
-    )));
-    let _short = short(STOP_CALLS);
-    assert!(refused_for_want_of_a_file(&Backend::uninstall(&mgr, marked_plist(&id))));
-    let _short = short(KILL_CALLS);
-    assert!(refused_for_want_of_a_file(&Backend::kill(&mgr, marked_plist(&id))));
-    let _short = short(INSTALL_CALLS);
-    assert!(refused_for_want_of_a_file(&mgr.install(&spec, false)));
-    let _enough = bounded::test_hook::temp_files(START_CALLS * FILES_PER_CALL);
-    assert!(!refused_for_want_of_a_file(&Backend::start(
-        &mgr,
-        marked_plist(&id),
-        Budget::DEFAULT
-    )));
-}
-
-/// `restart`'s two legs, and `install --start`'s, draw on reapers and temp files `prepare` made
-/// before either sent anything: once it succeeded, neither leg can fail for want of one. It fails as
-/// a whole when one is short. `uninstall` stands in for the install, which would write a plist: each
-/// takes one reaper, and no more temp files than the install.
-#[skuld::test]
-fn prepared_steps_need_nothing_made_later() {
-    use crate::backend::Backend;
-
-    let id = never_installed();
-    let (mgr, _refused) = over_sh(&[]);
-    for (steps, reapers, calls) in [
-        (
-            [Step::Stop, Step::Start],
-            STOP_REQUESTS + START_REQUESTS,
-            STOP_CALLS + START_CALLS,
-        ),
-        (
-            [Step::Install, Step::Start],
-            INSTALL_REQUESTS + START_REQUESTS,
-            INSTALL_CALLS + START_CALLS,
-        ),
-    ] {
-        // Every budget: `launchctl` is waited on under all of them.
+    type Allowance = fn(usize) -> bounded::test_hook::Allowance;
+    let mgr = Launchd::new();
+    for steps in [&[Step::Stop, Step::Start][..], &[Step::Start]] {
+        let (reapers, files) = counted(steps);
         for budget in [Budget::DEFAULT, Budget::Immediate, Budget::Unbounded] {
-            {
-                let _short = bounded::test_hook::threads(reapers - 1);
+            let shortfalls: [(Allowance, usize, &str); 2] = [
+                (bounded::test_hook::threads, reapers - 1, "no thread"),
+                (bounded::test_hook::temp_files, files - 1, "no temp file"),
+            ];
+            for (allow, n, what) in shortfalls {
+                let _short = allow(n);
+
+                let e = mgr.reserve(steps, budget).expect_err("one short");
+
                 assert!(
-                    ServiceManager::prepare(&mgr, &steps, budget).is_err(),
-                    "{steps:?} {budget:?}"
+                    matches!(&e, Error::Reservation { .. }) && e.report().to_string().contains(what),
+                    "{steps:?} {budget:?}: {e:?}"
                 );
             }
-            let _short = bounded::test_hook::temp_files(calls * FILES_PER_CALL - 1);
+        }
+    }
+}
+
+/// One verb over a table of stated replies, and what it draws.
+struct Drawing {
+    /// The step it is counted under.
+    step: Step,
+    restart: Restart,
+    /// Its longest path, call for call.
+    calls: &'static [(&'static str, Answer)],
+    /// The requests and calls that path makes: what `needs` counts when it is `step`'s longest.
+    drew: (usize, usize),
+    run: fn(&Launchd, Plist, &mut Reservation) -> Result<()>,
+}
+
+/// Every verb that draws, down its longest path.
+fn drawings() -> [Drawing; 5] {
+    use crate::backend::Backend;
+
+    [
+        Drawing {
+            step: Step::Start,
+            restart: Restart::Always,
+            calls: &START_LONGEST,
+            drew: (START_REQUESTS, START_CALLS),
+            run: |mgr, plist, reservation| Backend::start(mgr, plist, Budget::DEFAULT, reservation),
+        },
+        // `start` under a budget that does not wait: counted as `start` is, and so over-reserved.
+        Drawing {
+            step: Step::RequestStartAfterStop,
+            restart: Restart::Always,
+            calls: &START_NOT_WAITING,
+            drew: (2, 5),
+            run: |mgr, plist, reservation| Backend::request_start_after_stop(mgr, plist, reservation),
+        },
+        Drawing {
+            step: Step::Stop,
+            restart: Restart::Never,
+            calls: &BOOTOUT,
+            drew: (STOP_REQUESTS, STOP_CALLS),
+            run: |mgr, plist, reservation| Backend::stop(mgr, plist, Budget::DEFAULT, reservation),
+        },
+        Drawing {
+            step: Step::Kill,
+            restart: Restart::Never,
+            calls: &[("kill", DONE)],
+            drew: (KILL_REQUESTS, KILL_CALLS),
+            run: |mgr, plist, reservation| Backend::kill(mgr, plist, reservation),
+        },
+        // The `bootout`, and then the removal of a plist nothing backs, which fails.
+        Drawing {
+            step: Step::Uninstall,
+            restart: Restart::Never,
+            calls: &BOOTOUT,
+            drew: (STOP_REQUESTS, STOP_CALLS),
+            run: |mgr, plist, reservation| match Backend::uninstall(mgr, plist, reservation) {
+                Err(Error::Os { what, source, .. })
+                    if what == "remove"
+                        && source
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    Ok(())
+                }
+                other => other,
+            },
+        },
+    ]
+}
+
+/// The fake `launchctl` draws as the real one does, so every verb run over it checks its step's count:
+/// a verb that draws more than was counted fails the debug assertion, and one that draws less than the
+/// longest path leaves exactly the difference. The longest paths themselves are the elevated test's, over
+/// a real child.
+#[skuld::test]
+fn every_verb_draws_what_its_step_counts() {
+    let id = never_installed();
+    for drawing in drawings() {
+        let (mgr, script) = scripted(drawing.calls);
+        let mut held = reserved(&[drawing.step]);
+
+        let result = (drawing.run)(&mgr, marked_plist_restarting(&id, drawing.restart), &mut held);
+
+        result.unwrap_or_else(|e| panic!("{:?}: {e:?}", drawing.step));
+        script.assert_spent(&format!("{:?}'s longest path", drawing.step));
+        let (counted_requests, counted_calls) = needs(drawing.step);
+        assert_eq!(
+            bounded::test_hook::left(&held),
+            (
+                counted_requests - drawing.drew.0,
+                (counted_calls - drawing.drew.1) * Role::COUNTED_FILES
+            ),
+            "{:?}",
+            drawing.step
+        );
+    }
+}
+
+/// A verb handed one reaper or one file fewer than its step counts fails at the draw, in every
+/// build that has debug assertions: an undercount cannot pass an ordinary test.
+#[skuld::test]
+fn a_verb_handed_one_item_too_few_trips_the_assertion() {
+    let id = never_installed();
+    for drawing in drawings() {
+        let (requests, calls) = drawing.drew;
+        for (what, (reapers, files)) in [
+            ("reaper", (requests - 1, calls * Role::COUNTED_FILES)),
+            ("temp file", (requests, calls * Role::COUNTED_FILES - 1)),
+        ] {
+            let (mgr, _script) = scripted(drawing.calls);
+            let mut short = Reservation::make(reapers, files).expect("make a reservation");
+
+            let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                drop((drawing.run)(
+                    &mgr,
+                    marked_plist_restarting(&id, drawing.restart),
+                    &mut short,
+                ));
+            }));
+
+            let payload = drawn.expect_err(&format!("{:?}: a {what} short went unnoticed", drawing.step));
+            let message = payload.downcast_ref::<String>().cloned().unwrap_or_default();
             assert!(
-                ServiceManager::prepare(&mgr, &steps, budget).is_err(),
-                "{steps:?} {budget:?}"
+                message.contains(&format!("a {what} was drawn past the reservation")),
+                "{:?}: {message}",
+                drawing.step
             );
         }
-        let prepared = ServiceManager::prepare(&mgr, &steps, Budget::DEFAULT).expect("prepare");
-        let _no_thread = bounded::test_hook::threads(0);
-        let _no_file = bounded::test_hook::temp_files(0);
-        let first = if steps[0] == Step::Stop {
-            Backend::stop(&mgr, marked_plist(&id), Budget::DEFAULT)
-        } else {
-            Backend::uninstall(&mgr, marked_plist(&id))
+    }
+}
+
+/// `restart` reserves both legs before the stop goes out, and when it cannot, nothing is sent:
+/// exit `1`, no `launchctl` called, so a daemon is never left stopped for want of a thread or a
+/// file its start needed. One reaper and one file short each fail it.
+#[skuld::test]
+fn a_restart_that_cannot_reserve_sends_nothing() {
+    use crate::cli::wait::WaitArgs;
+    use crate::cli::{ExitCode, restart};
+
+    type Allowance = fn(usize) -> bounded::test_hook::Allowance;
+    let (reapers, files) = counted(&[Step::Stop, Step::Start]);
+    let shortfalls: [(Allowance, usize); 2] = [
+        (bounded::test_hook::threads, reapers - 1),
+        (bounded::test_hook::temp_files, files - 1),
+    ];
+    for (allow, n) in shortfalls {
+        let script = table(&[]);
+        let args = restart::Args {
+            ids: vec![never_installed().to_string()],
+            wait: WaitArgs::default(),
         };
-        assert!(first.is_err(), "{steps:?}: `over_sh(&[])` refuses every call");
-        assert!(!refused_for_want_of_a_reaper(&first), "{steps:?}");
-        assert!(!refused_for_want_of_a_file(&first), "{steps:?}");
-        let started = Backend::start(&mgr, marked_plist(&id), Budget::DEFAULT);
-        assert!(!refused_for_want_of_a_reaper(&started), "{steps:?}");
-        assert!(!refused_for_want_of_a_file(&started), "{steps:?}");
-        drop(prepared);
+        let manager = {
+            let script = script.clone();
+            move || -> Result<Box<dyn ServiceManager>> { Ok(Box::new(launchd_over(script.clone()))) }
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let _short = allow(n);
+
+        let code = restart::run(&args, &manager, &|| true, &mut out, &mut err);
+
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(code, ExitCode::Error, "{err}");
+        assert!(err.contains("so none was sent"), "{err}");
+        assert_eq!(script.calls(), Vec::<Vec<String>>::new(), "nothing may be sent");
+    }
+}
+
+/// An `install` that cannot reserve sends nothing, and fails as the install of its id. It is the one
+/// single verb reachable here: the others pass the ownership gate first, which reads the host's real
+/// `/Library` paths. What each single verb reserves for, and how each refuses, is `flow_tests`' over
+/// the test `Fake`, since the blanket impl is the same for every backend.
+#[skuld::test]
+fn an_install_that_cannot_reserve_sends_nothing_and_names_its_id() {
+    type Allowance = fn(usize) -> bounded::test_hook::Allowance;
+    let (reapers, files) = counted(&[Step::Install]);
+    let shortfalls: [(Allowance, usize); 2] = [
+        (bounded::test_hook::threads, reapers - 1),
+        (bounded::test_hook::temp_files, files - 1),
+    ];
+    for (allow, n) in shortfalls {
+        let (mgr, script) = scripted(&[]);
+        let spec = spec_named("goetia-reservation-refused");
+        let _short = allow(n);
+
+        let result = ServiceManager::install(&mgr, &spec, false);
+
+        assert!(
+            matches!(&result, Err(Error::Reservation { id: Some(id), .. }) if id == "goetia-reservation-refused"),
+            "{result:?}"
+        );
+        assert_eq!(script.calls(), Vec::<Vec<String>>::new(), "nothing may be sent");
     }
 }
 
@@ -1178,7 +1243,6 @@ fn prepared_steps_need_nothing_made_later() {
 fn a_launchctl_request_that_may_have_run_is_in_doubt() {
     let args = ["bootout", "system/goetia-reaper-probe-never-installed"];
     let deadline = Budget::Unbounded.start();
-    let request = || Role::Request(bounded::reapers::<1>().unwrap().into_iter().next().unwrap());
     fn forced() -> cosca::error::Error {
         cosca::error::Error::Containment {
             detail: "forced".into(),
@@ -1193,15 +1257,23 @@ fn a_launchctl_request_that_may_have_run_is_in_doubt() {
         },
     ];
     for error in after_exec {
-        let e = failing(error()).run(&args, deadline, request()).expect_err("failed");
+        let mut held = reservation(1, 1);
+        let role = request(&mut held).unwrap();
+        let e = failing(error())
+            .run(&args, deadline, role, &mut held)
+            .expect_err("failed");
         assert!(matches!(e, Error::RequestInDoubt { reached: false, .. }), "{e:?}");
 
-        let e = failing(error()).run(&args, deadline, Role::Query).expect_err("failed");
+        let e = failing(error())
+            .run(&args, deadline, Role::Query, &mut reservation(0, 1))
+            .expect_err("failed");
         assert!(matches!(e, Error::Spawn { .. }), "{e:?}");
         assert!(!e.is_indeterminate(), "{e:?}");
     }
+    let mut held = reservation(1, 1);
+    let role = request(&mut held).unwrap();
     let e = failing(ClientError::NotRun(forced()))
-        .run(&args, deadline, request())
+        .run(&args, deadline, role, &mut held)
         .expect_err("failed");
     assert!(matches!(e, Error::Spawn { .. }), "{e:?}");
     assert!(!e.is_indeterminate(), "{e:?}");
@@ -1327,8 +1399,8 @@ fn then<'a>(steps: &[&[(&'a str, Answer)]]) -> Vec<(&'a str, Answer)> {
 }
 
 /// A launchd whose `launchctl` is a real `sh` child that answers the calls it gets, in order, from
-/// `calls`, and fails any call past the last. For the tests that count what a real child draws from
-/// the reservation, which a [`Fake`] never does. The script is never a file on disk: `exec`ing one just
+/// `calls`, and fails any call past the last. For the tests that drive the real spawn, which draws
+/// from the reservation as the [`Fake`] does. The script is never a file on disk: `exec`ing one just
 /// written races every `fork` another test thread makes.
 fn over_sh(calls: &[(&'static str, Answer)]) -> (Launchd, OverSh) {
     let dir = tempfile::tempdir().unwrap();
@@ -1389,12 +1461,12 @@ impl Drop for Plists {
     }
 }
 
-/// Every launchd verb, down its longest path, makes no thread and no temp file outside the
-/// reservation it made at entry — or that `prepare` made for its sequence: one made on the spot
-/// while a reservation is live fails a debug assertion, so a count one short fails here. Under
-/// `prepare`, what the sequence reserved is spent exactly, so a count one over fails too. A
-/// real `sh` child answers every call in place of `launchctl`, so the longest paths — `start`'s corrective cycle
-/// among them — are driven deterministically, and no job is ever loaded.
+/// Every launchd verb, down its longest path, draws no more than the reservation it made at entry —
+/// or that a sequence made: a draw past it fails a debug assertion, so a count one short fails here.
+/// Under a sequence, what it reserved is spent exactly, so a count one over fails too. A real `sh`
+/// child answers every call in place of `launchctl`, so the real spawn draws too, and the longest
+/// paths — `start`'s corrective cycle among them — are driven deterministically, and no job is ever
+/// loaded.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn every_launchd_verb_path_stays_inside_its_reservation() {
     let name = format!("goetia-reservation-{:x}", std::process::id());
@@ -1412,10 +1484,10 @@ fn every_launchd_verb_path_stays_inside_its_reservation() {
         logs: None,
         kind: Kind::Simple,
     };
-    let exhausted = || {
+    let exhausted = |reservation: &Reservation| {
         assert_eq!(
-            bounded::test_hook::pooled(),
-            bounded::Needs::default(),
+            bounded::test_hook::left(reservation),
+            (0, 0),
             "the sequence reserved more than its steps spent"
         );
     };
@@ -1444,37 +1516,30 @@ fn every_launchd_verb_path_stays_inside_its_reservation() {
 
     // `restart`: the stop and the start under one reservation, spent exactly.
     let (mgr, script) = over_sh(&then(&[&BOOTOUT, &START_LONGEST]));
-    let prepared = mgr.prepare(&[Step::Stop, Step::Start], Budget::DEFAULT).unwrap();
-    mgr.stop(&id, Budget::DEFAULT).expect("restart's stop");
-    mgr.start(&id, Budget::DEFAULT).expect("restart's start");
-    exhausted();
-    drop(prepared);
+    let mut held = backend::Backend::reserve(&mgr, &[Step::Stop, Step::Start], Budget::DEFAULT).unwrap();
+    backend::Backend::stop(&mgr, flow::owned(&mgr, &id).unwrap(), Budget::DEFAULT, &mut held).expect("restart's stop");
+    backend::Backend::start(&mgr, flow::owned(&mgr, &id).unwrap(), Budget::DEFAULT, &mut held)
+        .expect("restart's start");
+    exhausted(&held);
     script.assert_driven("restart");
 
-    // `install --start`: the install and the start under one reservation, spent exactly. The install
-    // is a `Create` over a stale loaded job, the one install path that sends a request.
+    // `install --start`: the start's reservation is made first, and the install reserves for itself;
+    // each is spent exactly. The install is a `Create` over a stale loaded job, the one install path
+    // that sends a request.
     std::fs::remove_file(staging_path(&name)).expect("remove the plist so the install creates it");
     let (mgr, script) = over_sh(&then(&[&INSTALL_LONGEST, &START_LONGEST]));
-    let prepared = mgr.prepare(&[Step::Install, Step::Start], Budget::DEFAULT).unwrap();
+    let mut held = backend::Backend::reserve(&mgr, &[Step::Start], Budget::DEFAULT).unwrap();
     assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
-    mgr.start(&id, Budget::DEFAULT).expect("install --start's start");
-    exhausted();
-    drop(prepared);
+    backend::Backend::start(&mgr, flow::owned(&mgr, &id).unwrap(), Budget::DEFAULT, &mut held)
+        .expect("install --start's start");
+    exhausted(&held);
     script.assert_driven("install --start");
 
-    // `status` counts nothing, so it draws on no reservation: inside one with spares left, and one
-    // spent, it makes its own files, trips no assertion, and leaves the pool as it was.
-    let (mgr, script) = over_sh(&[("print", RUNNING), ("bootout", DONE), ("print", RUNNING)]);
-    let prepared = mgr.prepare(&[Step::Stop], Budget::DEFAULT).unwrap();
-    let pooled = bounded::test_hook::pooled();
+    // `status` counts nothing and is handed no reservation: it makes its own files, over a real child
+    // too, and trips no assertion.
+    let (mgr, script) = over_sh(&[("print", RUNNING)]);
     assert_eq!(mgr.status(&id).expect("status").state, State::Running);
-    assert_eq!(bounded::test_hook::pooled(), pooled, "status drew on the reservation");
-    mgr.stop(&id, Budget::DEFAULT).expect("stop");
-    exhausted();
-    assert_eq!(mgr.status(&id).expect("status").state, State::Running);
-    exhausted();
-    drop(prepared);
-    script.assert_driven("status inside a reservation");
+    script.assert_driven("status");
 
     let (mgr, script) = over_sh(&BOOTOUT);
     mgr.uninstall(&id).expect("uninstall");
@@ -1499,33 +1564,40 @@ fn launchctl_sends_requests_as_requests_and_reads_as_queries() {
     let id = id.as_str();
     let deadline = Budget::DEFAULT.start();
     let path = Path::new("/nonexistent/goetia-roles.plist");
-    let [bootstrap, bootout, kickstart] = reapers::<3>(&never_installed()).unwrap();
+    let mut held = reservation(3, 5);
     let done = |verb| launchctl_replying(verb, exited(0, "", ""));
     let waited = |role| [Waited { role, bounded: true }];
 
     let (launchctl, fake) = done("bootstrap");
-    launchctl.bootstrap(path, deadline, bootstrap).unwrap();
+    launchctl.bootstrap(path, deadline, &mut held).unwrap();
     assert_eq!(fake.waits(), waited(RoleKind::Request));
 
     let (launchctl, fake) = done("bootout");
-    launchctl.bootout(id, deadline, bootout).unwrap();
+    launchctl.bootout(id, deadline, &mut held).unwrap();
     assert_eq!(fake.waits(), waited(RoleKind::Request));
 
     let (launchctl, fake) = done("kickstart");
-    launchctl.kickstart(id, Budget::DEFAULT, deadline, kickstart).unwrap();
+    launchctl.kickstart(id, Budget::DEFAULT, deadline, &mut held).unwrap();
     assert_eq!(fake.waits(), waited(RoleKind::Request));
 
     let (launchctl, fake) = done("print");
-    launchctl.is_loaded(id, deadline).unwrap();
+    launchctl.is_loaded(id, deadline, &mut held).unwrap();
     assert_eq!(fake.waits(), waited(RoleKind::Query));
 
     let (launchctl, fake) = done("print");
-    launchctl.read_live_state(id, deadline, Role::Query).unwrap();
+    launchctl.read_live_state(id, deadline, Role::Query, &mut held).unwrap();
     assert_eq!(fake.waits(), waited(RoleKind::Query));
 
     let (launchctl, fake) = done("print");
-    launchctl.read_live_state(id, deadline, Role::UncountedQuery).unwrap();
+    launchctl
+        .read_live_state(id, deadline, Role::UncountedQuery, &mut held)
+        .unwrap();
     assert_eq!(fake.waits(), waited(RoleKind::UncountedQuery));
+    assert_eq!(
+        bounded::test_hook::left(&held),
+        (0, 0),
+        "three requests and five counted calls, and the uncounted read drew nothing"
+    );
 }
 
 /// A deadline that expired before `launchctl` finished is neither a success nor a failure of the
@@ -1537,22 +1609,22 @@ fn launchctl_calls_that_expire_report_the_expiry() {
     let id = id.as_str();
     let deadline = Budget::DEFAULT.start();
     let path = Path::new("/nonexistent/goetia-expiry.plist");
-    let [bootstrap, bootout, kickstart, kill] = reapers::<4>(&never_installed()).unwrap();
+    let mut held = reservation(4, 6);
     let expired = |verb| launchctl_replying(verb, Finished::Expired).0;
 
-    let loaded = expired("print").is_loaded(id, deadline);
+    let loaded = expired("print").is_loaded(id, deadline, &mut held);
     assert!(loaded.expect("an expiry is not a failure").is_none());
-    let bootstrapped = expired("bootstrap").bootstrap(path, deadline, bootstrap);
+    let bootstrapped = expired("bootstrap").bootstrap(path, deadline, &mut held);
     assert!(bootstrapped.expect("an expiry is not a failure").is_none());
-    let started = expired("kickstart").kickstart(id, Budget::DEFAULT, deadline, kickstart);
+    let started = expired("kickstart").kickstart(id, Budget::DEFAULT, deadline, &mut held);
     assert!(started.expect("an expiry is not a failure").is_none());
-    let booted_out = expired("bootout").bootout(id, deadline, bootout);
+    let booted_out = expired("bootout").bootout(id, deadline, &mut held);
     assert!(booted_out.expect("an expiry is not a failure").is_none());
-    let killed = expired("kill").kill_job(id, deadline, kill);
+    let killed = expired("kill").kill_job(id, deadline, &mut held);
     assert!(killed.expect("an expiry is not a failure").is_none());
 
     for role in [Role::Query, Role::UncountedQuery] {
-        let live = expired("print").read_live_state(id, deadline, role);
+        let live = expired("print").read_live_state(id, deadline, role, &mut held);
         assert!(
             matches!(live, Ok((State::Unknown, None))),
             "a state not fully read is not known: {live:?}"
@@ -1570,7 +1642,7 @@ fn a_stop_whose_bootout_expires_is_a_wait_timeout() {
     let fake = Fake::new([reply(&["bootout"], Finished::Expired)]);
     let mgr = launchd_over(fake.clone());
 
-    let e = Backend::stop(&mgr, marked_plist(&id), Budget::DEFAULT).expect_err("expired");
+    let e = Backend::stop(&mgr, marked_plist(&id), Budget::DEFAULT, &mut reserved(&[Step::Stop])).expect_err("expired");
 
     assert!(
         matches!(&e, Error::WaitTimeout { id: named, awaited: "stopped", .. } if named == id.as_str()),
@@ -1585,9 +1657,8 @@ fn a_stop_whose_bootout_expires_is_a_wait_timeout() {
 fn kill_answered(answer: Answer) -> (Result<Option<()>>, Fake) {
     let script = table(&[("kill", answer)]);
     let launchctl = Launchctl::new(Box::new(script.clone()));
-    let [reaper] = reapers::<KILL_REQUESTS>(&never_installed()).unwrap();
-    let _files = files(&never_installed(), KILL_CALLS).unwrap();
-    let result = launchctl.kill_job(never_installed().as_str(), Budget::Unbounded.start(), reaper);
+    let mut held = reserved(&[Step::Kill]);
+    let result = launchctl.kill_job(never_installed().as_str(), Budget::Unbounded.start(), &mut held);
     (result, script)
 }
 

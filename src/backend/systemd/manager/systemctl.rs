@@ -778,7 +778,13 @@ fn run_verb_via(program: &[&str], args: &[&str], budget: Budget, deadline: Deadl
     let argv: Vec<&str> = prefix.iter().chain(args).copied().collect();
     let mut cmd = bounded::command(bin, &argv).map_err(failed)?;
     environment(&mut cmd);
-    let spawned = bounded::spawn(&mut cmd, Role::AnnouncedRequest(enqueued)).map_err(|e| match e {
+    // An announced request draws a listener thread, never a temp file: nothing to hand it.
+    let spawned = bounded::spawn(
+        &mut cmd,
+        Role::AnnouncedRequest(enqueued),
+        &mut bounded::Reservation::default(),
+    )
+    .map_err(|e| match e {
         bounded::SpawnError::NotRun(e) => failed(e),
         bounded::SpawnError::MayHaveRun(e) => in_doubt(e, false),
     })?;

@@ -94,7 +94,7 @@ fn restart(mgr: &dyn ServiceManager, id: &Id, budget: Budget, start_clock: &dyn 
     let deadline = start_clock(budget);
     // Before either leg sends anything, so that nothing either leg needs can
     // run out between the stop and the start and leave the daemon stopped.
-    let _prepared = mgr.prepare(&[Step::Stop, Step::Start], budget)?;
+    let mut sequence = mgr.prepare(&[Step::Stop, Step::Start], budget)?;
     if !budget.waits() {
         // One request where the manager has one: nothing then happens
         // between the stop and the start, and a refusal changed nothing, so
@@ -103,15 +103,16 @@ fn restart(mgr: &dyn ServiceManager, id: &Id, budget: Budget, start_clock: &dyn 
             return requested;
         }
     }
-    mgr.stop(id, stop_leg(budget, budget_for(deadline)))
+    sequence
+        .stop(id, stop_leg(budget, budget_for(deadline)))
         .map_err(|e| abandoned_before_start(id, e, budget))?;
 
     let started = match leg(budget, budget_for(deadline)) {
-        Leg::Under(left) if left.waits() => mgr.start(id, left),
+        Leg::Under(left) if left.waits() => sequence.start(id, left),
         // Not the idempotent `start`: over a stop nobody confirmed, a manager
         // answering "already running" may be seeing the instance that stop is
         // taking down, and that answer must not read as a restart.
-        Leg::Under(_) => mgr.request_start_after_stop(id),
+        Leg::Under(_) => sequence.request_start_after_stop(id),
         Leg::Spent => return Err(spent_before_start(id, budget)),
     };
     started.map_err(|e| after_start_failed(id, budget, e))

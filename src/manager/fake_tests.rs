@@ -751,19 +751,23 @@ fn a_verb_on_a_snapshot_that_went_stale_refuses_and_performs_nothing() {
 
     type Verb = fn(&Fake, Artifact) -> Result<()>;
     let verbs: [(&str, Verb); 8] = [
-        ("uninstall", |fake, snapshot| Backend::uninstall(fake, snapshot)),
+        ("uninstall", |fake, snapshot| {
+            Backend::uninstall(fake, snapshot, &mut ())
+        }),
         ("enable", |fake, snapshot| Backend::enable(fake, snapshot)),
         ("disable", |fake, snapshot| Backend::disable(fake, snapshot)),
         ("start", |fake, snapshot| {
-            Backend::start(fake, snapshot, Budget::DEFAULT)
+            Backend::start(fake, snapshot, Budget::DEFAULT, &mut ())
         }),
-        ("stop", |fake, snapshot| Backend::stop(fake, snapshot, Budget::DEFAULT)),
-        ("kill", |fake, snapshot| Backend::kill(fake, snapshot)),
+        ("stop", |fake, snapshot| {
+            Backend::stop(fake, snapshot, Budget::DEFAULT, &mut ())
+        }),
+        ("kill", |fake, snapshot| Backend::kill(fake, snapshot, &mut ())),
         ("request_restart", |fake, snapshot| {
             Backend::request_restart(fake).expect("this fake restarts natively")(fake, snapshot)
         }),
         ("request_start_after_stop", |fake, snapshot| {
-            Backend::request_start_after_stop(fake, snapshot)
+            Backend::request_start_after_stop(fake, snapshot, &mut ())
         }),
     ];
     let spec = mk("frpc");

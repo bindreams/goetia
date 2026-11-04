@@ -16,7 +16,7 @@ use clap::Parser as _;
 use clap::error::ErrorKind;
 use goetia::cli::{self, Cli, Command, DaemonCommand};
 use goetia::manager::fake::Fake;
-use goetia::manager::{Budget, Installed, ServiceManager, State, Status, Step};
+use goetia::manager::{Budget, Installed, Sequence, ServiceManager, State, Status, Step};
 use goetia::spec::{DaemonSpec, Id, Kind, Restart};
 
 #[path = "support/mod.rs"]
@@ -305,7 +305,26 @@ impl FlakyManager {
     }
 }
 
+/// A sequence that reserves nothing: its verbs are the manager's own, so a wrapper's injected
+/// failures apply to the legs of a `restart` as they do to the verbs alone.
+struct Direct<'a>(&'a dyn ServiceManager);
+
+impl Sequence for Direct<'_> {
+    fn stop(&mut self, id: &Id, budget: Budget) -> goetia::Result<()> {
+        self.0.stop(id, budget)
+    }
+    fn start(&mut self, id: &Id, budget: Budget) -> goetia::Result<()> {
+        self.0.start(id, budget)
+    }
+    fn request_start_after_stop(&mut self, id: &Id) -> goetia::Result<()> {
+        self.0.request_start_after_stop(id)
+    }
+}
+
 impl ServiceManager for FlakyManager {
+    fn prepare(&self, _steps: &[Step], _budget: Budget) -> goetia::Result<Box<dyn Sequence + '_>> {
+        Ok(Box::new(Direct(self)))
+    }
     fn install(&self, spec: &DaemonSpec, force: bool) -> goetia::Result<goetia::decide::Outcome> {
         if let Some(recovery) = &self.unclearable_conflict {
             return Ok(unclearable_conflict(recovery));
@@ -1082,6 +1101,9 @@ fn restart_exits_one_when_the_daemon_is_absent() {
 struct PanicsOnStart(Fake);
 
 impl ServiceManager for PanicsOnStart {
+    fn prepare(&self, _steps: &[Step], _budget: Budget) -> goetia::Result<Box<dyn Sequence + '_>> {
+        Ok(Box::new(Direct(self)))
+    }
     fn install(&self, spec: &DaemonSpec, force: bool) -> goetia::Result<goetia::decide::Outcome> {
         self.0.install(spec, force)
     }
@@ -3238,6 +3260,9 @@ fn install_exits_four_when_the_start_leg_timed_out() {
 struct PanicsOnStatus(Fake);
 
 impl ServiceManager for PanicsOnStatus {
+    fn prepare(&self, _steps: &[Step], _budget: Budget) -> goetia::Result<Box<dyn Sequence + '_>> {
+        Ok(Box::new(Direct(self)))
+    }
     fn install(&self, spec: &DaemonSpec, force: bool) -> goetia::Result<goetia::decide::Outcome> {
         self.0.install(spec, force)
     }
@@ -3707,7 +3732,9 @@ fn restart_that_cannot_prepare_sends_nothing() {
         let fake = Fake::new();
         fake.install(&mk("frpc"), false).unwrap();
         fake.seed_state("frpc", State::Running);
-        fake.seed_prepare_fails();
+        // Only the start's reservation fails: the stop's would have been made, and sent, if the
+        // legs were not reserved together first.
+        fake.seed_prepare_fails(Step::Start);
         let mut args = vec!["goetia", "daemon", "restart", "frpc"];
         args.extend_from_slice(budget);
 
@@ -3730,7 +3757,9 @@ fn install_start_that_cannot_prepare_installs_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
     let fake = Fake::new();
-    fake.seed_prepare_fails();
+    // Only the start's reservation fails: the install's own would succeed, and install, if the
+    // start were reserved after it.
+    fake.seed_prepare_fails(Step::Start);
 
     let (code, out, err) = dispatch_elevated(
         &[
@@ -3753,13 +3782,12 @@ fn install_start_that_cannot_prepare_installs_nothing() {
     );
 }
 
-/// Without `--start` there is no sequence, and nothing is prepared.
+/// Without `--start` there is no sequence: the install reserves for itself alone.
 #[skuld::test]
-fn install_without_start_prepares_nothing() {
+fn install_without_start_prepares_no_sequence() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
     let fake = Fake::new();
-    fake.seed_prepare_fails();
 
     let (code, out, err) = dispatch_elevated(
         &["goetia", "daemon", "install", "--file", manifest.to_str().unwrap()],
@@ -3767,23 +3795,13 @@ fn install_without_start_prepares_nothing() {
     );
 
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
-    assert_eq!(fake.prepared(), vec![]);
-    assert_eq!(fake.guarded(), vec![("install", "frpc".to_string(), vec![])]);
+    assert_eq!(fake.prepared(), vec![(vec![Step::Install], Budget::Unbounded)]);
 }
 
-/// Builds what [`Fake::guarded`] compares against: each (verb, id) paired with the steps held
-/// during it.
-fn under(steps: &[Step], sent: &[(&'static str, &str)]) -> Vec<(&'static str, String, Vec<Step>)> {
-    sent.iter()
-        .map(|(verb, id)| (*verb, id.to_string(), steps.to_vec()))
-        .collect()
-}
-
-/// `restart` prepares both of its legs, under the budget it was given, before either sends anything,
-/// and holds what it prepared until both are sent, then releases it before the next id's — under
-/// every budget, the one-request restart included.
+/// `restart` prepares both of its legs, once for each id, under the budget it was given — under
+/// every budget, the one-request restart included — and each leg draws on it.
 #[skuld::test]
-fn restart_holds_what_it_prepared_for_both_legs_until_both_are_sent() {
+fn restart_prepares_both_legs_under_its_budget() {
     let both = [Step::Stop, Step::Start];
     let two_legs: &[(&str, &str)] = &[("stop", "frpc"), ("start", "frpc"), ("stop", "web"), ("start", "web")];
     let native: &[(&str, &str)] = &[("restart", "frpc"), ("restart", "web")];
@@ -3805,7 +3823,7 @@ fn restart_holds_what_it_prepared_for_both_legs_until_both_are_sent() {
         if one_request {
             fake.seed_native_restart();
         }
-        let seeded = fake.guarded().len();
+        let installed = fake.prepared().len();
         let mut args = vec!["goetia", "daemon", "restart", "frpc", "web"];
         args.extend_from_slice(budget);
 
@@ -3813,18 +3831,19 @@ fn restart_holds_what_it_prepared_for_both_legs_until_both_are_sent() {
 
         assert_eq!(code, 0, "{budget:?}\nstdout:\n{out}\nstderr:\n{err}");
         assert_eq!(
-            fake.prepared(),
+            fake.prepared()[installed..],
             vec![(both.to_vec(), given), (both.to_vec(), given)],
-            "{budget:?}"
+            "{budget:?}: one sequence for each id, and no verb reserves again"
         );
-        assert_eq!(fake.guarded()[seeded..], under(&both, sent), "{budget:?}");
+        let verbs: Vec<(&str, String)> = sent.iter().map(|(verb, id)| (*verb, id.to_string())).collect();
+        assert_eq!(fake.calls(), verbs, "{budget:?}");
     }
 }
 
-/// `install --start` prepares the install and the start, under the start's budget, before the
-/// install sends anything, and holds what it prepared until the start is sent.
+/// `install --start` prepares the start, under its budget, before the install sends anything; the
+/// install reserves for itself.
 #[skuld::test]
-fn install_start_holds_what_it_prepared_until_the_start_is_sent() {
+fn install_start_prepares_the_start_before_the_install() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
     let fake = Fake::new();
@@ -3844,10 +3863,13 @@ fn install_start_holds_what_it_prepared_until_the_start_is_sent() {
     );
 
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
-    let both = [Step::Install, Step::Start];
     let given = Budget::Bounded(Duration::from_secs(5));
-    assert_eq!(fake.prepared(), vec![(both.to_vec(), given)]);
-    assert_eq!(fake.guarded(), under(&both, &[("install", "frpc"), ("start", "frpc")]));
+    assert_eq!(
+        fake.prepared(),
+        vec![(vec![Step::Start], given), (vec![Step::Install], Budget::Unbounded),],
+        "the start's reservation is made before the install's"
+    );
+    assert_eq!(fake.calls(), vec![("start", "frpc".to_string())]);
 }
 
 #[skuld::test]

@@ -17,6 +17,7 @@ use super::dirs::ensure_dir;
 use super::discover::{RawState, raw_state};
 use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 use super::*;
+use crate::manager::ServiceManager;
 use crate::manager::conformance::fresh_id;
 use crate::spec::{Kind, Restart};
 
@@ -447,13 +448,14 @@ fn prepared_steps_need_nothing_made_later() {
             let spawned = bounded::spawn(
                 &mut bounded::command("/bin/true", &[]).unwrap(),
                 bounded::Role::AnnouncedRequest(|_| true),
+                &mut bounded::Reservation::default(),
             )
             .expect("its threads were prepared");
             bounded::wait_bounded(spawned, Budget::Unbounded.start()).expect("wait");
         }
         assert_eq!(
             bounded::test_hook::pooled(),
-            bounded::Needs::default(),
+            0,
             "{steps:?}: prepared more than its steps watch"
         );
     }
@@ -499,11 +501,10 @@ fn prepared_steps_share_one_version_gate() {
         asked.set(asked.get() + 1);
         Ok(())
     };
+    let mgr = Systemd::new();
     for budget in [Budget::DEFAULT, Budget::Immediate, Budget::Unbounded] {
         asked.set(0);
-        let prepared = Systemd::new()
-            .prepare(&[Step::Stop, Step::Start], budget)
-            .expect("prepare");
+        let prepared = mgr.prepare(&[Step::Stop, Step::Start], budget).expect("prepare");
         systemctl::gated(count).unwrap();
         systemctl::gated(count).unwrap();
         assert_eq!(asked.get(), 1, "{budget:?}: the two legs asked twice");

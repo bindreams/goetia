@@ -66,7 +66,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::{fs, io};
 
-use crate::backend::bounded::{self, Finished, Reaper, Role};
+use crate::backend::bounded::{self, Finished, Reservation, Role};
 use crate::backend::client::{Client, ClientError, Real, Wait};
 use crate::backend::launchd::{generate, refuse, state};
 use crate::backend::{
@@ -76,7 +76,7 @@ use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Occupant, PutBackFound, Reason, Result};
 use crate::manager::budget::{self, Deadline};
-use crate::manager::{Budget, Installed, Prepared, State, Status, Step, flow};
+use crate::manager::{Budget, Installed, State, Status, Step, flow};
 use crate::spec::{AccountId, DaemonSpec, Id, Restart, User};
 
 /// Where `install` writes a plist that is not (yet, or any longer) enabled
@@ -884,12 +884,11 @@ impl Launchctl {
 
     /// `launchctl` with `args`, spawned and waited under `deadline` in `role`.
     ///
-    /// **Every** `launchctl` call the budgeted verbs make goes through here,
-    /// and `role` is what keeps the budget from deciding whether a
+    /// `role` is what keeps the budget from deciding whether a
     /// request is sent: a [`Role::Request`] that expires is left running, never
     /// killed, since `launchctl` never says when launchd has the request. Its
-    /// [`Reaper`] was made before the verb sent anything — see [`reapers`] — and
-    /// so were the temp files its output goes to — see [`files`].
+    /// reaper (see [`request`]) and the temp files its output goes to are drawn from
+    /// `reservation`.
     ///
     /// [`Finished::Expired`] iff the deadline expired first. For a request that is not a
     /// failure of the command — the request is out, or on its way in a
@@ -899,7 +898,7 @@ impl Launchctl {
     /// have — cosca failing past `exec`, or the wait failing — is the same for a
     /// read, and [`Error::RequestInDoubt`] for a request, which may have reached
     /// launchd.
-    fn run(&self, args: &[&str], deadline: Deadline, role: Role) -> Result<Finished> {
+    fn run(&self, args: &[&str], deadline: Deadline, role: Role, reservation: &mut Reservation) -> Result<Finished> {
         // A request whose `launchctl` may have started is in doubt, not failed: it may have reached
         // launchd. A read changes nothing either way.
         let request = match role {
@@ -908,7 +907,7 @@ impl Launchctl {
             Role::AnnouncedRequest(_) => unreachable!("launchd sends no announced requests"),
         };
         self.client
-            .run(args, Wait::Bounded { role, deadline })
+            .run(args, Wait::Bounded { role, deadline }, reservation)
             .map_err(|error| failed(args, request, error))
     }
 
@@ -916,12 +915,12 @@ impl Launchctl {
     ///
     /// Only success and the not-found codes in [`is_not_found`] answer the question; any other failure is
     /// an `Err`, since callers act on "not loaded" by writing or bootstrapping.
-    fn is_loaded(&self, id: &str, deadline: Deadline) -> Result<Option<bool>> {
+    fn is_loaded(&self, id: &str, deadline: Deadline, reservation: &mut Reservation) -> Result<Option<bool>> {
         // Not "structured data" parsing (see the module doc comment): this only
         // ever looks at the exit code, never the body of `print`'s output.
         let target = target(id);
         let args = ["print", target.as_str()];
-        let Finished::Exited { status, capture } = self.run(&args, deadline, Role::Query)? else {
+        let Finished::Exited { status, capture } = self.run(&args, deadline, Role::Query, reservation)? else {
             return Ok(None);
         };
         if status.success() {
@@ -934,10 +933,11 @@ impl Launchctl {
     }
 
     /// `Ok(None)` iff `deadline` expired.
-    fn bootstrap(&self, path: &Path, deadline: Deadline, reaper: Reaper) -> Result<Option<()>> {
+    fn bootstrap(&self, path: &Path, deadline: Deadline, reservation: &mut Reservation) -> Result<Option<()>> {
         let path_str = path.to_str().expect("plist path is UTF-8 (see generate::path_str)");
         let args = ["bootstrap", "system", path_str];
-        let Finished::Exited { status, capture } = self.run(&args, deadline, Role::Request(reaper))? else {
+        let role = request(reservation)?;
+        let Finished::Exited { status, capture } = self.run(&args, deadline, role, reservation)? else {
             return Ok(None);
         };
         if status.success() {
@@ -961,14 +961,21 @@ impl Launchctl {
     /// out of a successful `-p` *is* the confirmation, and no follow-up `print`
     /// is needed or wanted. A budget that does not wait uses the plain form,
     /// which only requests the spawn.
-    fn kickstart(&self, id: &str, budget: Budget, deadline: Deadline, reaper: Reaper) -> Result<Option<Kickstarted>> {
+    fn kickstart(
+        &self,
+        id: &str,
+        budget: Budget,
+        deadline: Deadline,
+        reservation: &mut Reservation,
+    ) -> Result<Option<Kickstarted>> {
         let target = target(id);
         let args: Vec<&str> = if budget.waits() {
             vec!["kickstart", "-p", &target]
         } else {
             vec!["kickstart", &target]
         };
-        let Finished::Exited { status, capture } = self.run(&args, deadline, Role::Request(reaper))? else {
+        let role = request(reservation)?;
+        let Finished::Exited { status, capture } = self.run(&args, deadline, role, reservation)? else {
             return Ok(None);
         };
         if !status.success() {
@@ -1001,10 +1008,11 @@ impl Launchctl {
     /// the already-gone case by construction instead of by timing.
     ///
     /// [`ServiceManager::stop`]: crate::manager::ServiceManager::stop
-    fn bootout(&self, id: &str, deadline: Deadline, reaper: Reaper) -> Result<Option<()>> {
+    fn bootout(&self, id: &str, deadline: Deadline, reservation: &mut Reservation) -> Result<Option<()>> {
         let target = target(id);
         let args = ["bootout", target.as_str()];
-        let Finished::Exited { status, capture } = self.run(&args, deadline, Role::Request(reaper))? else {
+        let role = request(reservation)?;
+        let Finished::Exited { status, capture } = self.run(&args, deadline, role, reservation)? else {
             return Ok(None);
         };
         if status.success() || is_not_found(status.code()) {
@@ -1017,10 +1025,11 @@ impl Launchctl {
     /// `launchctl kill SIGKILL` on the job, never a pid; what happens next is the plist's `KeepAlive`.
     /// Exit 113 (not loaded) and 3 (loaded, no process) are both [`Error::NotRunning`], the codes
     /// [`is_not_found`] already names. `Ok(None)` iff the deadline expired.
-    fn kill_job(&self, id: &str, deadline: Deadline, reaper: Reaper) -> Result<Option<()>> {
+    fn kill_job(&self, id: &str, deadline: Deadline, reservation: &mut Reservation) -> Result<Option<()>> {
         let target = target(id);
         let args = ["kill", "SIGKILL", target.as_str()];
-        let Finished::Exited { status, capture } = self.run(&args, deadline, Role::Request(reaper))? else {
+        let role = request(reservation)?;
+        let Finished::Exited { status, capture } = self.run(&args, deadline, role, reservation)? else {
             return Ok(None);
         };
         if status.success() {
@@ -1038,70 +1047,75 @@ impl Launchctl {
     /// this does not recognize degrades to `(State::Unknown, None)`; `Err` iff
     /// `launchctl` could not be run at all, which `start` must not mistake for a
     /// job that is not running: it would act on it.
-    fn live_state(&self, id: &str, deadline: Deadline) -> Result<(State, Option<u32>)> {
-        self.read_live_state(id, deadline, Role::Query)
+    fn live_state(&self, id: &str, deadline: Deadline, reservation: &mut Reservation) -> Result<(State, Option<u32>)> {
+        self.read_live_state(id, deadline, Role::Query, reservation)
     }
 
     /// [`Self::live_state`], read as `role`.
-    fn read_live_state(&self, id: &str, deadline: Deadline, role: Role) -> Result<(State, Option<u32>)> {
+    fn read_live_state(
+        &self,
+        id: &str,
+        deadline: Deadline,
+        role: Role,
+        reservation: &mut Reservation,
+    ) -> Result<(State, Option<u32>)> {
         // An expiry degrades to `Unknown`, as a capture that is not whole would:
         // a state this did not fully read is a state it does not know. The two
         // budgeted verbs check the deadline themselves wherever an `Unknown`
         // would otherwise become a wrong error.
-        let Finished::Exited { status, capture } = self.run(&["print", &target(id)], deadline, role)? else {
+        let Finished::Exited { status, capture } = self.run(&["print", &target(id)], deadline, role, reservation)?
+        else {
             return Ok((State::Unknown, None));
         };
         Ok(classified(status, &capture))
     }
 }
 
-// Reapers and files ===================================================================================================
+/// The role of a request: a [`Role::Request`] with its reaper drawn from `reservation`.
+fn request(reservation: &mut Reservation) -> Result<Role> {
+    reservation
+        .reaper()
+        .map(Role::Request)
+        .map_err(|source| Error::Reservation { id: None, source })
+}
 
-/// The most `launchctl` requests each verb sends — every one needs a [`Reaper`], and a verb makes all
-/// of its reapers before it sends the first (see [`reapers`]). `install`: the `bootout` of a stale job
-/// under a new artifact. `start`: `bootstrap` and `kickstart`, then the corrective cycle's `bootout`,
-/// `bootstrap` and `kickstart`. `stop` and `uninstall`: one `bootout`. `kill`: one `launchctl kill`.
+// Reservation =========================================================================================================
+
+/// Most requests each verb sends; each draws a reaper from the verb's [`Reservation`].
+/// `start`: bootstrap+kickstart, then the corrective cycle's bootout+bootstrap+kickstart.
 const INSTALL_REQUESTS: usize = 1;
 const START_REQUESTS: usize = 5;
 const STOP_REQUESTS: usize = 1;
 const KILL_REQUESTS: usize = 1;
 
-/// The most `launchctl` calls each verb makes, requests and reads alike — every one needs a temp
-/// file for each of its two streams, and a verb makes them all before it sends anything (see
-/// [`files`]). `install`: a `Create`'s `is_loaded`, `bootout` and the `is_loaded` after the write, or an
-/// `Update`'s two `is_loaded`s, before the write and after it. A pass is repeated only when the one before
-/// it made no call, so this is one pass's longest path.
-/// `start`: its five requests, two `is_loaded`s and five `live_state`s. `stop`, `uninstall` and `kill`:
-/// their request.
+/// Most `launchctl` calls per verb, reads included: each draws its role's temp files from the same
+/// reservation. `install` adds two `is_loaded`s; `start` two `is_loaded`s and five `live_state`s.
 const INSTALL_CALLS: usize = INSTALL_REQUESTS + 2;
 const START_CALLS: usize = START_REQUESTS + 7;
 const STOP_CALLS: usize = STOP_REQUESTS;
 const KILL_CALLS: usize = KILL_REQUESTS;
 
-/// The temp files one `launchctl` call writes its output to: stdout and stderr.
-const FILES_PER_CALL: usize = 2;
-
-/// [`bounded::reapers`], as the verb's own failure: nothing was sent, so exit `1` with the daemon
-/// untouched.
-fn reapers<const N: usize>(id: &Id) -> Result<[Reaper; N]> {
-    bounded::reapers::<N>().map_err(|source| Error::Reservation {
-        id: Some(id.to_string()),
-        source,
-    })
+/// The most `step` draws, as `(requests, calls)`. A draw past it is a miscount, caught by the
+/// assertion in [`Reservation`] in every test that runs the verb.
+///
+/// `request_start_after_stop` is `start` under a budget that does not wait: it draws no more than
+/// `start` does, and so is counted as it is.
+fn needs(step: Step) -> (usize, usize) {
+    match step {
+        Step::Install => (INSTALL_REQUESTS, INSTALL_CALLS),
+        Step::Start | Step::RequestStartAfterStop => (START_REQUESTS, START_CALLS),
+        Step::Stop | Step::Uninstall => (STOP_REQUESTS, STOP_CALLS),
+        Step::Kill => (KILL_REQUESTS, KILL_CALLS),
+    }
 }
 
-/// Every temp file a verb's `calls` can need, ready in this thread's pool before it sends anything,
-/// until the returned guard drops: a read between two requests must not fail for want of one either.
-/// Only the shortfall is made — a sequence [`Launchd::prepare`]d may have made them already.
-fn files(id: &Id, calls: usize) -> Result<bounded::Spares> {
-    bounded::top_up(bounded::Needs {
-        files: calls * FILES_PER_CALL,
-        ..bounded::Needs::default()
-    })
-    .map_err(|source| Error::Reservation {
-        id: Some(id.to_string()),
-        source,
-    })
+/// The reapers and temp files `steps` draw, summed: what [`Launchd::reserve`] makes.
+fn counted(steps: &[Step]) -> (usize, usize) {
+    let (requests, calls) = steps
+        .iter()
+        .map(|&step| needs(step))
+        .fold((0, 0), |(requests, calls), (r, c)| (requests + r, calls + c));
+    (requests, calls * Role::COUNTED_FILES)
 }
 
 /// What a `launchctl print` that ran says about the job's live state.
@@ -1146,8 +1160,9 @@ impl Launchd {
         target: &Path,
         wrote: &str,
         previous: Option<&str>,
+        reservation: &mut Reservation,
     ) -> Result<()> {
-        match self.launchctl.is_loaded(id.as_str(), deadline) {
+        match self.launchctl.is_loaded(id.as_str(), deadline, reservation) {
             Ok(loaded) if !never_expires(loaded) => Ok(()),
             Ok(_) => Err(refuse::loaded_after_write(id, undo_write(target, wrote, previous))),
             Err(read) => Err(refuse::state_unknown_after_write(
@@ -1159,27 +1174,22 @@ impl Launchd {
     }
 }
 
-pub(crate) struct InstallScope {
-    /// For the one request `install` can send, the `bootout` of a job under a `Create`'s label.
-    /// `None` once that `bootout` has taken it, and every path that does ends the install.
-    reaper: Option<Reaper>,
-    _files: bounded::Spares,
-}
-
 impl backend::Backend for Launchd {
     type Definition = String;
     type Snapshot = Plist;
-    type InstallScope = InstallScope;
+    type InstallScope = ();
+    type Reservation = Reservation;
 
-    /// Made before anything is read, so no `launchctl` call fails for want of a reaper or a temp
-    /// file once `install` has sent something.
-    fn begin_install(&self, spec: &DaemonSpec) -> Result<InstallScope> {
-        let [reaper] = reapers::<INSTALL_REQUESTS>(&spec.id)?;
-        let files = files(&spec.id, INSTALL_CALLS)?;
-        Ok(InstallScope {
-            reaper: Some(reaper),
-            _files: files,
-        })
+    fn begin_install(&self, _spec: &DaemonSpec) -> Result<()> {
+        Ok(())
+    }
+
+    /// Makes every reaper and temp file `steps` can draw now, so that no step fails for want of one
+    /// after an earlier step has sent something: `restart`'s start after its stop, `install
+    /// --start`'s start after the install's `bootout`.
+    fn reserve(&self, steps: &[Step], _budget: Budget) -> Result<Reservation> {
+        let (reapers, files) = counted(steps);
+        Reservation::make(reapers, files).map_err(|source| Error::Reservation { id: None, source })
     }
 
     fn render(&self, spec: &DaemonSpec) -> Result<String> {
@@ -1215,7 +1225,8 @@ impl backend::Backend for Launchd {
         desired: &String,
         outcome: &Outcome,
         snapshot: Option<&Plist>,
-        scope: &mut InstallScope,
+        _scope: &mut (),
+        reservation: &mut Reservation,
     ) -> Result<WriteOutcome> {
         // Resolved again: `render` kept only the plist, which names the account, and launchd
         // resolves that name at launch too.
@@ -1235,13 +1246,9 @@ impl backend::Backend for Launchd {
                 let target = staging_path(spec.id.as_str());
                 prepare_parent_dirs(spec, &account)?;
                 let staged = staged_tempfile(target.parent().expect("plist path always has a parent"), desired)?;
-                let loaded = never_expires(self.launchctl.is_loaded(spec.id.as_str(), deadline)?);
+                let loaded = never_expires(self.launchctl.is_loaded(spec.id.as_str(), deadline, reservation)?);
                 if loaded {
-                    let reaper = scope
-                        .reaper
-                        .take()
-                        .expect("a pass that took the reaper ended the install");
-                    never_expires(self.launchctl.bootout(spec.id.as_str(), deadline, reaper)?);
+                    never_expires(self.launchctl.bootout(spec.id.as_str(), deadline, reservation)?);
                 }
                 match persist_new(staged, &target)? {
                     PersistOutcome::Written => {}
@@ -1254,14 +1261,14 @@ impl backend::Backend for Launchd {
                         });
                     }
                 }
-                self.recheck_after_write(&spec.id, deadline, &target, desired, None)?;
+                self.recheck_after_write(&spec.id, deadline, &target, desired, None, reservation)?;
             }
             Outcome::Update { .. } | Outcome::Stale { .. } => {
                 let snapshot = snapshot.expect("an id `decide` chose to update was read as marked");
                 let previous = snapshot.text.as_str();
                 // `Stale` is checked too: a release can change what the generator renders.
                 let changes_job = refuse::changes_loaded_job(previous, desired);
-                if changes_job && never_expires(self.launchctl.is_loaded(spec.id.as_str(), deadline)?) {
+                if changes_job && never_expires(self.launchctl.is_loaded(spec.id.as_str(), deadline, reservation)?) {
                     return Err(refuse::loaded_refusal(&spec.id));
                 }
                 prepare_parent_dirs(spec, &account)?;
@@ -1281,7 +1288,7 @@ impl backend::Backend for Launchd {
                 }
                 write_existing(target, desired)?;
                 if changes_job {
-                    self.recheck_after_write(&spec.id, deadline, target, desired, Some(previous))?;
+                    self.recheck_after_write(&spec.id, deadline, target, desired, Some(previous), reservation)?;
                 }
             }
             other => unreachable!("`flow::install` writes only `Create`, `Update` and `Stale`, got {other:?}"),
@@ -1291,11 +1298,14 @@ impl backend::Backend for Launchd {
 
     fn live_status(&self, snapshot: &Plist) -> Result<Status> {
         // `status` and `list` have no budget of their own: unbounded.
-        // Read as `UncountedQuery`: neither verb counted this read, so it never draws on a
-        // reservation a library caller may hold.
-        let (state, pid) =
-            self.launchctl
-                .read_live_state(snapshot.id.as_str(), Budget::Unbounded.start(), Role::UncountedQuery)?;
+        // Read as `UncountedQuery`: neither verb counted this read, so it draws on no reservation
+        // and is handed an empty one.
+        let (state, pid) = self.launchctl.read_live_state(
+            snapshot.id.as_str(),
+            Budget::Unbounded.start(),
+            Role::UncountedQuery,
+            &mut Reservation::default(),
+        )?;
         Ok(Status {
             state,
             pid,
@@ -1307,15 +1317,16 @@ impl backend::Backend for Launchd {
         scan_in([(STAGING_DIR, false), (ENABLED_DIR, true)])
     }
 
-    fn uninstall(&self, snapshot: Plist) -> Result<()> {
+    fn uninstall(&self, snapshot: Plist, reservation: &mut Reservation) -> Result<()> {
         let Plist { id, location, .. } = snapshot;
-        let [reaper] = reapers::<STOP_REQUESTS>(&id)?;
-        let _files = files(&id, STOP_CALLS)?;
 
         // Unbounded, like `install`'s: `uninstall` has no `--timeout` of its
         // own, and bounding this would turn a slow-stopping job into a
         // failed uninstall where today it succeeds.
-        never_expires(self.launchctl.bootout(id.as_str(), Budget::Unbounded.start(), reaper)?);
+        never_expires(
+            self.launchctl
+                .bootout(id.as_str(), Budget::Unbounded.start(), reservation)?,
+        );
         fs::remove_file(&location.path).map_err(|e| Error::os_at("remove", &location.path, e))
     }
 
@@ -1351,20 +1362,12 @@ impl backend::Backend for Launchd {
         move_no_clobber(&location.path, &dest)
     }
 
-    fn start(&self, snapshot: Plist, budget: Budget) -> Result<()> {
+    fn start(&self, snapshot: Plist, budget: Budget, reservation: &mut Reservation) -> Result<()> {
         // First, so the wait is counted from the verb's entry — see `verb_deadline`,
         // and for why a non-waiting budget gets an unbounded one.
         let deadline = verb_deadline(budget);
         let Plist { id, blob, location, .. } = snapshot;
         let id = &id;
-        let [
-            bootstrap_reaper,
-            kickstart_reaper,
-            corrective_bootout,
-            corrective_bootstrap,
-            corrective_kickstart,
-        ] = reapers::<START_REQUESTS>(id)?;
-        let _files = files(id, START_CALLS)?;
         let blob = blob.map_err(Error::Kept)?;
         let timed_out = || budget::timed_out(id.as_str(), "running", budget);
         // What issuing the request takes: which of `bootstrap`/`kickstart` it
@@ -1373,16 +1376,16 @@ impl backend::Backend for Launchd {
         // request is sent — so a spent budget still reaches launchd.
         let issuing = Budget::Unbounded.start();
 
-        if !never_expires(self.launchctl.is_loaded(id.as_str(), issuing)?) {
+        if !never_expires(self.launchctl.is_loaded(id.as_str(), issuing, reservation)?) {
             if let Err(e) = self
                 .launchctl
-                .bootstrap(&location.path, issuing, bootstrap_reaper)
+                .bootstrap(&location.path, issuing, reservation)
                 .map(never_expires)
             {
                 // A concurrent `start` may have loaded it between the check
                 // above and this call; only propagate the error if the job
                 // genuinely is not loaded now either.
-                if !never_expires(self.launchctl.is_loaded(id.as_str(), issuing)?) {
+                if !never_expires(self.launchctl.is_loaded(id.as_str(), issuing, reservation)?) {
                     return Err(e);
                 }
             }
@@ -1396,13 +1399,13 @@ impl backend::Backend for Launchd {
         // than lean on an undocumented guarantee that a plain (non-`-k`)
         // `kickstart` never touches a running instance, checking first
         // makes that guarantee this code's own, not launchd's.
-        if self.launchctl.live_state(id.as_str(), issuing)?.0 != State::Running {
+        if self.launchctl.live_state(id.as_str(), issuing, reservation)?.0 != State::Running {
             // Bounded by `deadline`: `-p` is the wait for the pid. An expiry
             // leaves the `launchctl` running rather than killing it (see
             // `launchctl`), so the request still goes out.
             match self
                 .launchctl
-                .kickstart(id.as_str(), budget, deadline, kickstart_reaper)?
+                .kickstart(id.as_str(), budget, deadline, reservation)?
                 .ok_or_else(timed_out)?
             {
                 // launchd forked the job and named the pid. That *is* the
@@ -1413,7 +1416,7 @@ impl backend::Backend for Launchd {
                 // will trust. Never observed (250/250 runs named one), and
                 // not guessed at either: one bounded read decides it.
                 Kickstarted::NoPid if budget.waits() => {
-                    let state = self.launchctl.live_state(id.as_str(), deadline)?.0;
+                    let state = self.launchctl.live_state(id.as_str(), deadline, reservation)?.0;
                     if state != State::Running {
                         // Checked after the read too: one the deadline cut
                         // short reads `Unknown`, which is an expiry, not a
@@ -1461,7 +1464,7 @@ impl backend::Backend for Launchd {
         // none.
         if budget.waits()
             && blob.spec.restart == Restart::Always
-            && self.launchctl.live_state(id.as_str(), issuing)?.0 != State::Running
+            && self.launchctl.live_state(id.as_str(), issuing, reservation)?.0 != State::Running
         {
             // One corrective cycle, not a retry loop: tear the stale job
             // down by label and load ours from the path we just confirmed.
@@ -1469,17 +1472,14 @@ impl backend::Backend for Launchd {
             // when a stale job answered to the label, this cycle *is* the
             // request, and skipping it on a spent budget would report a
             // start that was never sent as one that may still arrive.
-            never_expires(self.launchctl.bootout(id.as_str(), issuing, corrective_bootout)?);
-            never_expires(
+            never_expires(self.launchctl.bootout(id.as_str(), issuing, reservation)?);
+            never_expires(self.launchctl.bootstrap(&location.path, issuing, reservation)?);
+            if self.launchctl.live_state(id.as_str(), issuing, reservation)?.0 != State::Running {
                 self.launchctl
-                    .bootstrap(&location.path, issuing, corrective_bootstrap)?,
-            );
-            if self.launchctl.live_state(id.as_str(), issuing)?.0 != State::Running {
-                self.launchctl
-                    .kickstart(id.as_str(), budget, deadline, corrective_kickstart)?
+                    .kickstart(id.as_str(), budget, deadline, reservation)?
                     .ok_or_else(timed_out)?;
             }
-            let state = self.launchctl.live_state(id.as_str(), deadline)?.0;
+            let state = self.launchctl.live_state(id.as_str(), deadline, reservation)?.0;
             if state != State::Running {
                 if deadline.expired() {
                     return Err(timed_out());
@@ -1493,11 +1493,11 @@ impl backend::Backend for Launchd {
     /// The plain request-only start. The stop before it had no request-only
     /// form and ran `bootout` to completion, so the instance it stopped is
     /// gone and cannot be what answers for the label here.
-    fn request_start_after_stop(&self, snapshot: Plist) -> Result<()> {
-        backend::Backend::start(self, snapshot, Budget::Immediate)
+    fn request_start_after_stop(&self, snapshot: Plist, reservation: &mut Reservation) -> Result<()> {
+        backend::Backend::start(self, snapshot, Budget::Immediate, reservation)
     }
 
-    fn stop(&self, snapshot: Plist, budget: Budget) -> Result<()> {
+    fn stop(&self, snapshot: Plist, budget: Budget, reservation: &mut Reservation) -> Result<()> {
         // First, so the wait is counted from the verb's entry. Under a budget that
         // does not wait this is an explicitly UNBOUNDED deadline, not
         // `budget.start()` — see `verb_deadline`. `launchctl` exposes no
@@ -1508,43 +1508,18 @@ impl backend::Backend for Launchd {
         // killing it (see `launchctl`), so the request still goes out.
         let deadline = verb_deadline(budget);
         let id = snapshot.id();
-        let [reaper] = reapers::<STOP_REQUESTS>(id)?;
-        let _files = files(id, STOP_CALLS)?;
         self.launchctl
-            .bootout(id.as_str(), deadline, reaper)?
+            .bootout(id.as_str(), deadline, reservation)?
             .ok_or_else(|| budget::timed_out(id.as_str(), "stopped", budget))
     }
 
-    fn kill(&self, snapshot: Plist) -> Result<()> {
+    fn kill(&self, snapshot: Plist, reservation: &mut Reservation) -> Result<()> {
         let id = snapshot.id();
-        let [reaper] = reapers::<KILL_REQUESTS>(id)?;
-        let _files = files(id, KILL_CALLS)?;
         never_expires(
             self.launchctl
-                .kill_job(id.as_str(), Budget::Unbounded.start(), reaper)?,
+                .kill_job(id.as_str(), Budget::Unbounded.start(), reservation)?,
         );
         Ok(())
-    }
-
-    /// Makes every reaper and temp file `steps` can need now, so that no step fails for want of one
-    /// after an earlier step has sent something: `restart`'s start after its stop, `install
-    /// --start`'s start after the install's `bootout`.
-    fn prepare(&self, steps: &[Step], _budget: Budget) -> Result<Prepared> {
-        let (reapers, calls) = steps
-            .iter()
-            .map(|step| match step {
-                Step::Install => (INSTALL_REQUESTS, INSTALL_CALLS),
-                Step::Start => (START_REQUESTS, START_CALLS),
-                Step::Stop => (STOP_REQUESTS, STOP_CALLS),
-            })
-            .fold((0, 0), |(reapers, calls), (r, c)| (reapers + r, calls + c));
-        let spares = bounded::spare(bounded::Needs {
-            reapers,
-            files: calls * FILES_PER_CALL,
-            ..bounded::Needs::default()
-        })
-        .map_err(|source| Error::Reservation { id: None, source })?;
-        Ok(Prepared::holding(spares))
     }
 }
 
