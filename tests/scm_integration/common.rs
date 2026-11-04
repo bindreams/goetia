@@ -98,10 +98,10 @@ impl Drop for WorldReadableExe {
     }
 }
 
-/// The `mk` [`goetia::manager::conformance::run`] needs: a fresh, valid
-/// `type: managed` spec for any `id`. Ports are dummy — the fixture reports
-/// in on a best-effort basis regardless of whether anything listens (see
-/// `fixture.rs`'s `connect`), and no conformance scenario reads the report.
+/// The `mk` [`goetia::manager::conformance::run`] needs. Ports are dummy — the
+/// fixture reports in on a best-effort basis regardless of whether anything
+/// listens (see `fixture.rs`'s `connect`), and no conformance scenario reads
+/// the report.
 pub fn conformance_mk(id: &str) -> DaemonSpec {
     support::spec(id, fixture_command(id, 1, 1, "plain"))
 }

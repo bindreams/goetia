@@ -14,10 +14,10 @@ use goetia::backend::scm::exit_status::{ERROR_SERVICE_SPECIFIC_ERROR, RecordedEx
 use goetia::backend::scm::manager::Scm;
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, Installed, ServiceManager as _, Step};
-use goetia::spec::{DaemonSpec, Kind, Restart};
+use goetia::spec::{DaemonSpec, Restart};
 use windows_service::service::{ServiceExitCode, ServiceState};
 
-use crate::common::{ShimProcess, fallback_log, fixture_command, kill_process, recorded_exit, scm_status};
+use crate::common::{ShimProcess, fallback_log, fixture_command, kill_process, recorded_exit, scm_status, simple_spec};
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
 
 const ONE_SECOND: Option<Duration> = Some(Duration::from_secs(1));
@@ -28,10 +28,9 @@ const EARLIER_VERSION: &str = "0.0.0";
 
 fn on_failure(id: &str, command: Vec<String>, restart_delay: Option<Duration>) -> DaemonSpec {
     DaemonSpec {
-        kind: Kind::Simple,
         restart: Restart::OnFailure,
         restart_delay,
-        ..support::spec(id, command)
+        ..simple_spec(id, command)
     }
 }
 
@@ -208,16 +207,13 @@ fn exit_records(child_code: i32) -> (ServiceExitCode, RecordedExit) {
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
 
-    let spec = DaemonSpec {
-        kind: Kind::Simple,
-        ..support::spec(
-            &id,
-            fixture_command(
-                "exit-on-close",
-                &[&reported.port().to_string(), &child_code.to_string()],
-            ),
-        )
-    };
+    let spec = simple_spec(
+        &id,
+        fixture_command(
+            "exit-on-close",
+            &[&reported.port().to_string(), &child_code.to_string()],
+        ),
+    );
     mgr.install(&spec, false).expect("install");
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     let stream = reported.accept_stream("the fixture to connect and wait for the test to close its end");
@@ -277,10 +273,9 @@ fn a_daemon_that_cannot_be_spawned_fails_start_under_every_policy() {
         let id = support::random_test_id();
         let _guard = ServiceGuard::new(&id);
         let spec = DaemonSpec {
-            kind: Kind::Simple,
             restart,
             restart_delay,
-            ..support::spec(&id, missing.clone())
+            ..simple_spec(&id, missing.clone())
         };
         mgr.install(&spec, false).expect("install");
 
@@ -314,10 +309,9 @@ fn start_confirms_the_launch_of_a_daemon_that_exits_at_once() {
         let _guard = ServiceGuard::new(&id);
         let reported = ConnectBack::listen();
         let spec = DaemonSpec {
-            kind: Kind::Simple,
             restart,
             restart_delay: hour,
-            ..support::spec(
+            ..simple_spec(
                 &id,
                 fixture_command("exit", &[&reported.port().to_string(), &code.to_string()]),
             )

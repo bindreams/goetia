@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 
 use goetia::spec::{DaemonSpec, Id, Kind, Restart, User};
 
-/// A plain, valid `DaemonSpec`: `name` is `id`, `user` is root, `restart` is `never`, and `cwd`, `env`,
-/// `restart_delay` and `logs` are unset. `kind` is `Managed`; a test of a `simple` daemon overrides it.
+/// A plain, valid `DaemonSpec` named `id`: root, `restart: never`, `type: managed`, everything else
+/// unset. Panics if `id` is not a valid `Id`.
 ///
 /// A test that needs anything else says so with struct-update syntax:
 /// `DaemonSpec { env, user, ..support::spec(&id, command) }`. Built literally, never through

@@ -1,4 +1,4 @@
-//! Shared `DaemonSpec` construction for the `type: simple` integration tests.
+//! Shared helpers for the `type: simple` integration tests.
 
 use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
@@ -29,15 +29,20 @@ pub fn fixture_command(mode: &str, args: &[&str]) -> Vec<String> {
     v
 }
 
+/// [`support::spec`] with `type: simple`.
+pub fn simple_spec(id: &str, command: Vec<String>) -> DaemonSpec {
+    DaemonSpec {
+        kind: Kind::Simple,
+        ..support::spec(id, command)
+    }
+}
+
 /// The `mk` [`goetia::manager::conformance::run`] needs: a fresh, valid
 /// `type: simple` spec for any `id`. The port is dummy — the fixture
 /// reports in on a best-effort basis regardless of whether anything
 /// listens, and no conformance scenario reads the report.
 pub fn conformance_mk(id: &str) -> DaemonSpec {
-    DaemonSpec {
-        kind: Kind::Simple,
-        ..support::spec(id, fixture_command("report", &["1"]))
-    }
+    simple_spec(id, fixture_command("report", &["1"]))
 }
 
 // SCM records and the shim process ====================================================================================
