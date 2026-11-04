@@ -1215,6 +1215,9 @@ const UNREADABLE: &str = "echo 'Could not print: 5: Input/output error' >&2; exi
 const RUNNING: &str = "printf '\\tstate = running\\n\\tpid = 4242\\n'";
 const NOT_RUNNING: &str = "printf '\\tstate = not running\\n'";
 const PID: &str = "echo 4242";
+/// A `print` that `state::classify` reads as `Unknown`: launchd has decided to start the job and not
+/// yet forked it.
+const SPAWN_SCHEDULED: &str = "printf '\\tstate = spawn scheduled\\n'";
 
 /// `start`'s longest path, every one of its [`START_CALLS`] `launchctl` calls: not loaded; a
 /// `bootstrap` refused, by a concurrent start that loaded it meanwhile; a `kickstart -p` that names
@@ -1584,6 +1587,110 @@ fn a_print_that_fails_otherwise_is_an_error_not_a_job_that_is_not_loaded() {
         installed,
         "an install that could not tell whether the job is loaded left the plist as it was"
     );
+}
+
+/// Installs a job named `name` with `restart` (no job loaded), then runs a waited `start` over the
+/// stand-in `calls` and returns the error it failed with, having made every call scripted.
+fn failed_start(name: &str, restart: Restart, calls: &[(&'static str, &str)]) -> Error {
+    let mgr = Launchd::new();
+    let mut spec = spec_named(name);
+    spec.restart = restart;
+
+    let script = Scripted::new(&CREATED);
+    assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
+    script.assert_driven("install");
+
+    let script = Scripted::new(calls);
+    let e = mgr
+        .start(&spec.id, Budget::DEFAULT)
+        .expect_err("a start that never read Running");
+    script.assert_driven("start");
+    e
+}
+
+/// `kickstart -p` named no pid and the bounded read decides: a job read back as `spawn scheduled` is
+/// not established either way (exit `4`), one read back as stopped did not start (exit `1`).
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_kickstart_that_names_no_pid_and_reads_back_unknown_is_unconfirmed() {
+    let name = format!("goetia-nopid-unknown-{:x}", std::process::id());
+    let _plists = Plists(name.clone());
+
+    let e = failed_start(
+        &name,
+        Restart::Never,
+        &[
+            ("print", DONE),
+            ("print", NOT_RUNNING),
+            ("kickstart", DONE),
+            ("print", SPAWN_SCHEDULED),
+        ],
+    );
+
+    assert!(matches!(e, Error::StartUnconfirmed { .. }), "{e:?}");
+    assert!(e.is_indeterminate());
+}
+
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_kickstart_that_names_no_pid_and_reads_back_stopped_did_not_start() {
+    let name = format!("goetia-nopid-stopped-{:x}", std::process::id());
+    let _plists = Plists(name.clone());
+
+    let e = failed_start(
+        &name,
+        Restart::Never,
+        &[
+            ("print", DONE),
+            ("print", NOT_RUNNING),
+            ("kickstart", DONE),
+            ("print", NOT_RUNNING),
+        ],
+    );
+
+    assert!(matches!(e, Error::NotStarted { keep_alive: false, .. }), "{e:?}");
+    assert!(!e.is_indeterminate());
+}
+
+/// A `restart: always` start down to the corrective cycle's `kickstart`, ahead of its closing read:
+/// a pid named, then not running, so `bootout`, `bootstrap` and `kickstart` again.
+const CORRECTIVE_CYCLE: [(&str, &str); 8] = [
+    ("print", DONE),
+    ("print", NOT_RUNNING),
+    ("kickstart", PID),
+    ("print", NOT_RUNNING),
+    ("bootout", DONE),
+    ("bootstrap", DONE),
+    ("print", NOT_RUNNING),
+    ("kickstart", PID),
+];
+
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_corrective_cycle_that_reads_back_unknown_is_unconfirmed() {
+    let name = format!("goetia-cycle-unknown-{:x}", std::process::id());
+    let _plists = Plists(name.clone());
+
+    let e = failed_start(
+        &name,
+        Restart::Always,
+        &then(&[&CORRECTIVE_CYCLE, &[("print", SPAWN_SCHEDULED)]]),
+    );
+
+    assert!(matches!(e, Error::StartUnconfirmed { .. }), "{e:?}");
+    assert!(e.is_indeterminate());
+}
+
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_corrective_cycle_that_reads_back_stopped_did_not_start() {
+    let name = format!("goetia-cycle-stopped-{:x}", std::process::id());
+    let _plists = Plists(name.clone());
+
+    let e = failed_start(
+        &name,
+        Restart::Always,
+        &then(&[&CORRECTIVE_CYCLE, &[("print", NOT_RUNNING)]]),
+    );
+
+    assert!(matches!(e, Error::NotStarted { keep_alive: true, .. }), "{e:?}");
+    assert!(!e.is_indeterminate());
 }
 
 /// After an exit-`4` install a rerun is refused, not read as `UpToDate`.

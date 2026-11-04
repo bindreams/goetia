@@ -997,7 +997,6 @@ fn show_properties(unit: &str, props: &[&str]) -> Result<BTreeMap<String, String
     }
     let missing: Vec<&str> = props.iter().copied().filter(|prop| !map.contains_key(*prop)).collect();
     if !missing.is_empty() {
-        debug_assert!(!missing.is_empty(), "IncompleteAnswer's message names what is missing");
         return Err(Error::IncompleteAnswer {
             command: format!("systemctl show {unit}"),
             missing: missing.into_iter().map(str::to_string).collect(),

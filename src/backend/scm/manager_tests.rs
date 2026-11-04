@@ -357,6 +357,24 @@ fn a_failed_parameters_read_keeps_its_rendered_cause() {
     assert!(other.detail.contains("the hive is corrupt"));
 }
 
+/// A failure the read was wrapped in on its way up is looked through: the cause and the remedy
+/// are the inner `Undetermined`'s, not the wrapper's prose and no remedy.
+#[skuld::test]
+fn a_wrapped_parameters_read_failure_keeps_the_inner_cause_and_remedy() {
+    let wrapped = Error::Step {
+        what: "read the parameters".to_string(),
+        source: Box::new(undetermined("MsSecFlt", "the key is unreadable".to_string(), true)),
+    };
+
+    let parts = unreadable_parts("MsSecFlt".to_string(), wrapped);
+
+    assert_eq!(parts.detail, "the key is unreadable");
+    assert!(
+        parts.recovery.is_some_and(|r| r.contains("re-run as Administrator")),
+        "the remedy of the inner `Undetermined` travels"
+    );
+}
+
 /// The other half, and the one an over-eager fix would break: a host every one of whose services
 /// goetia read leaves nothing undetermined, so `list` must add no entry and `daemon list` must not
 /// exit `4` forever.
