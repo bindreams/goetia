@@ -44,8 +44,7 @@ pub(crate) fn command(program: &str, args: &[&str]) -> Result<cosca::Command, co
 // wait_bounded ========================================================================================================
 
 /// The streams a child's output is captured from, and so the temp files a [`Role::Query`] or
-/// [`Role::Request`] draws: stdout and stderr.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+/// [`Role::Request`] draws: stdout and stderr. What a role draws is [`Role::files`].
 pub(crate) const STREAMS: usize = 2;
 
 /// What the child wrote, and whether that is all of it.
@@ -114,6 +113,18 @@ pub(crate) enum Role {
     Request(Reaper),
 }
 
+impl Role {
+    /// The temp files a [`spawn`] under this role draws from its reservation: [`STREAMS`] for a
+    /// [`Role::Query`] and a [`Role::Request`], none for the others. The one definition of it:
+    /// `spawn` draws by it, and what counts a verb's calls and the test `Fake` read it.
+    pub(crate) fn files(&self) -> usize {
+        match self {
+            Role::Query | Role::Request(_) => STREAMS,
+            Role::UncountedQuery | Role::AnnouncedRequest(_) => 0,
+        }
+    }
+}
+
 /// A child [`spawn`]ed under its [`Role`], with where its output went.
 pub(crate) struct Spawned {
     child: cosca::Child,
@@ -144,10 +155,8 @@ impl Ready {
             Role::AnnouncedRequest(_) => {
                 Ready::Listener(spares::listener().map_err(not_run("thread to read its output"))?)
             }
-            Role::Query | Role::Request(_) => {
-                Ready::File(reservation.file().map_err(not_run("temp file for its output"))?)
-            }
-            Role::UncountedQuery => Ready::File(spares::make_file().map_err(not_run("temp file for its output"))?),
+            _ if role.files() > 0 => Ready::File(reservation.file().map_err(not_run("temp file for its output"))?),
+            _ => Ready::File(spares::make_file().map_err(not_run("temp file for its output"))?),
         })
     }
 
@@ -200,8 +209,12 @@ pub(crate) fn spawn(
     reservation: &mut Reservation,
 ) -> Result<Spawned, SpawnError> {
     let prepared = (|| {
-        let stdout = Ready::for_role(&role, reservation)?;
-        let stderr = Ready::for_role(&role, reservation)?;
+        let streams = (0..STREAMS)
+            .map(|_| Ready::for_role(&role, reservation))
+            .collect::<Result<Vec<_>, _>>()?;
+        let Ok([stdout, stderr]) = <[Ready; STREAMS]>::try_from(streams) else {
+            unreachable!("STREAMS is the number of streams a child has");
+        };
         cmd.stdout(stdout.stdio()?)?;
         cmd.stderr(stderr.stdio()?)?;
         Ok((stdout, stderr))

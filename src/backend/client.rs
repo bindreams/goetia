@@ -91,7 +91,7 @@ pub(crate) mod fake {
     use std::sync::{Arc, Mutex};
 
     use super::{Client, ClientError, Finished, Reservation, Role, Wait};
-    use crate::backend::bounded::{self, Capture};
+    use crate::backend::bounded::Capture;
 
     /// Replies consumed in order. Each entry names the argv prefix it expects, and may carry an
     /// action the test runs at the instant of the call, such as moving a file, to state a
@@ -217,10 +217,9 @@ pub(crate) mod fake {
         /// assertion in every test that drives it.
         fn run(&self, args: &[&str], wait: Wait, reservation: &mut Reservation) -> Result<Finished, ClientError> {
             let waited = Waited::of(&wait);
-            if matches!(waited.role, RoleKind::Query | RoleKind::Request) {
-                for _ in 0..bounded::STREAMS {
-                    reservation.file().map_err(|e| ClientError::NotRun(e.into()))?;
-                }
+            let Wait::Bounded { role, .. } = &wait;
+            for _ in 0..role.files() {
+                reservation.file().map_err(|e| ClientError::NotRun(e.into()))?;
             }
             let argv: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
             let next = {

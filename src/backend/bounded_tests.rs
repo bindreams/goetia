@@ -706,6 +706,29 @@ fn a_draw_past_the_reservation_is_loud() {
     );
 }
 
+/// `Role::files` is what a spawn under that role draws from its reservation, for every role: the one
+/// number the verbs' counts and the test `Fake` read, so none of them can drift from the real spawn.
+#[skuld::test]
+fn a_role_names_the_files_its_spawn_draws() {
+    let roles: [fn() -> Role; 4] = [
+        || Role::Query,
+        || Role::UncountedQuery,
+        || Role::AnnouncedRequest(|_| true),
+        || Role::Request(Reservation::make(1, 0).unwrap().reaper().unwrap()),
+    ];
+    for make in roles {
+        let role = make();
+        let name = format!("{role:?}");
+        let files = role.files();
+        let mut reservation = Reservation::make(0, STREAMS + 1).unwrap();
+
+        let spawned = spawn(&mut sh("true"), role, &mut reservation).unwrap();
+        drop(spawned);
+
+        assert_eq!(test_hook::left(&reservation), (0, STREAMS + 1 - files), "{name}");
+    }
+}
+
 /// A read no verb counted — launchd's `status` and `list` — makes its own files on the spot,
 /// whatever it is handed: it draws nothing from the reservation, trips no assertion, and a file it
 /// cannot make fails it before it runs.
