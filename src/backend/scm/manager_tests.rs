@@ -276,16 +276,16 @@ fn a_named_entry_offers_the_same_remedy_status_renders() {
     }
 }
 
-/// A failure that arrived without a conditioned remedy gets none invented for it. `read_parameters`
-/// builds every failure it has through `registry_undetermined`, so this arm is unreachable there;
-/// what it pins is that the fallback stays honest rather than defaulting to the elevation advice.
+/// A failure that arrived without a conditioned remedy gets none invented for it. `unreadable_parts`
+/// never makes one (`read_parameters` builds every failure through `registry_undetermined`); what
+/// this pins is that the aggregate stays honest rather than defaulting to the elevation advice.
 #[skuld::test]
 fn a_cause_that_carries_no_remedy_is_given_none() {
-    let parts = unreadable_parts(
-        "MsSecFlt".to_string(),
-        Error::os("read the hive", std::io::Error::other("the hive is corrupt")),
-    );
-    assert_eq!(parts.recovery, None, "no remedy was established, so none is offered");
+    let parts = Unreadable {
+        name: "MsSecFlt".to_string(),
+        detail: Error::os("read the hive", std::io::Error::other("the hive is corrupt")),
+        recovery: None,
+    };
 
     let Some(Installed::Undetermined { reason, .. }) = unreadable_aggregate(vec![parts]) else {
         panic!("one unreadable service is undetermined, named");
