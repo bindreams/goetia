@@ -75,11 +75,8 @@ impl ShimGuard {
         match Scm::new().uninstall(&id) {
             Ok(()) | Err(Error::NotInstalled { .. }) => Fate::Remove,
             // Not goetia's, so nothing confirms its shim stopped; the `sc` guard owns the service.
-            // Only the conformance seed is foreign by design; any other id is reported.
             Err(e @ Error::Foreign { .. }) => {
-                if self.id != goetia::manager::conformance::FOREIGN_ID {
-                    eprintln!("ShimGuard[{}]: uninstall: {}", self.id, e.report());
-                }
+                eprintln!("ShimGuard[{}]: uninstall: {}", self.id, e.report());
                 Fate::Keep("the service is not goetia's".to_string())
             }
             Err(e) => fail("uninstall", &e),

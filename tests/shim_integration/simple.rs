@@ -61,10 +61,15 @@ fn hand_edit(id: &str) {
 fn simple_passes_conformance() {
     let logs = LogDir::new();
     let mgr = Scm::new();
+    // A foreign service runs no shim, so it needs no `ShimGuard`.
+    let _foreign = support::ServiceGuard::new(conformance::FOREIGN_ID);
     // These guards drop after `run`'s uninstall and remove the pre-decode logs; make each before
     // its id's first write.
     let guards = std::cell::RefCell::new(BTreeMap::new());
     let guard = |id: &str| {
+        if id == conformance::FOREIGN_ID {
+            return;
+        }
         guards
             .borrow_mut()
             .entry(id.to_string())
@@ -75,7 +80,6 @@ fn simple_passes_conformance() {
         conformance_mk(&logs, id)
     };
 
-    guard(conformance::FOREIGN_ID);
     seed_foreign(conformance::FOREIGN_ID);
 
     mgr.install(&mk(conformance::HAND_EDITED_ID), false)
