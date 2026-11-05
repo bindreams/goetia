@@ -2,46 +2,22 @@
 //! manifest.
 //!
 //! Every value `Vars` produces is exactly the bytes written after `=` in
-//! the file, quoting aside — nothing is expanded and the process
-//! environment never participates, in either direction. That is not a
-//! feature gap; it is the whole point. `goetia` stores a resolved spec
-//! inside each installed artifact and re-derives it later, from the same
-//! manifest and `.env`, to detect drift. `install` runs elevated and
-//! `diff` runs unelevated, and the two processes' ambient environments
-//! are not guaranteed to agree even when nothing about the daemon has
-//! changed. A variable source that consulted the process environment
-//! would make drift detection depend on who ran the command, reporting a
-//! spurious difference on an artifact nobody touched.
+//! the file, quoting aside: nothing is expanded and the process
+//! environment never participates. `goetia` stores a resolved spec inside
+//! each installed artifact and re-derives it later from the same manifest
+//! and `.env` to detect drift. `install` runs elevated and `diff`
+//! unelevated, and their ambient environments need not agree, so a source
+//! that consulted the process environment would report spurious drift on
+//! an artifact nobody touched.
 //!
 //! # Why hand-written rather than a crate
 //!
-//! The repo otherwise prefers a dependency to a reimplementation. That is
-//! deliberately not followed here, because no published crate provides
-//! the required semantics, and the two closest were measured against
-//! this file's grammar rather than assumed:
-//!
-//! - `dotenvy` 0.15.7 performs its own `$`/`${}` expansion, *consulting
-//!   the process environment* — precisely the input this design
-//!   excludes — and substitutes an empty string for an unset name
-//!   (`LOG=$MISSING/app.log` reads back `/app.log`, `B=${NOPE}` reads
-//!   back `""`, `A=$$` reads back `""`). It also scans a variable name
-//!   with `char::is_alphanumeric()`, so `_` terminates one where this
-//!   grammar's `^[A-Za-z_][A-Za-z0-9_]*$` continues it, and it joins
-//!   physical lines inside a quoted value, so a raw-text pre-guard
-//!   against multi-line values is bypassable. Its `remove_bom` helper is
-//!   private and unreachable from its own non-mutating iterator API.
-//! - `dotenv-parser` 0.1.3 gets the literal semantics right — `$MISSING`,
-//!   `${NOPE}`, and `$$` all stay literal — but turns a BOM-prefixed file
-//!   into a hard error instead of stripping it, silently drops a
-//!   duplicate key instead of rejecting it, silently declines to
-//!   unescape `\n` where docker-compose and python-dotenv both do, and
-//!   surfaces `pest`'s internal `ParsingError { positives: [...], ... }`
-//!   as its public error type.
-//!
-//! This module is the input path to a tool that writes privileged system
-//! services, so both gaps are disqualifying rather than cosmetic. See
-//! `raw.rs` for the same rationale applied to a hand-written
-//! `Deserialize`.
+//! No published crate provides these semantics. `dotenvy` expands `$`
+//! against the process environment and reads unset names as empty;
+//! `dotenv-parser` is literal but errors on a BOM, silently drops a
+//! duplicate key, does not unescape `\n`, and exposes `pest`'s error type.
+//! The input path to a tool that writes privileged services cannot accept
+//! either.
 //!
 //! # Grammar
 //!
@@ -67,28 +43,23 @@
 //! - `NAME=VALUE`, where `NAME` matches `^[A-Za-z_][A-Za-z0-9_]*$` — the
 //!   same charset a manifest `${VAR}` reference can name, so an
 //!   unreferenceable name is an error rather than silent dead weight.
-//! - Whitespace around `=` is an error, not trimmed. python-dotenv
+//! - Whitespace around `=` is an error, not trimmed: python-dotenv
 //!   accepts `A = 1` and a shell does not, so accepting it would let one
-//!   file mean two different things to two readers of it. The check runs
-//!   on what an unquoted value reduces to once its comment and trailing
-//!   whitespace are removed, because those are removed whatever else the
-//!   line turns out to mean: `A= `, `A= # c` and `A=\t#c` are all `A=`,
-//!   an empty value. `A= 1`, `A =1`, `A = 1` and `A= 1 # c` still error,
-//!   since each still has whitespace against the `=` after the reduction.
-//!   A value opening with a quote is left whole, so `A= "x"` — whose
-//!   whitespace is before the quote, not inside it — errors too.
+//!   file mean two things. The check runs on what an unquoted value reduces
+//!   to once its comment and trailing whitespace are removed, so `A= `,
+//!   `A= # c` and `A=\t#c` are all `A=`, an empty value, while `A= 1`,
+//!   `A =1`, `A = 1` and `A= 1 # c` still error. A value opening with a
+//!   quote is left whole, so `A= "x"` errors too.
 //! - `VALUE` is one of: single-quoted (literal up to the closing `'`, no
 //!   escapes); double-quoted (only `\\` and `\"` are decoded); or
 //!   unquoted (trailing whitespace trimmed; a `#` preceded by whitespace
 //!   starts a comment, a `#` not preceded by whitespace is part of the
 //!   value, matching compose).
 //! - `\n`, `\r`, `\t`, and every other escape in a double-quoted value
-//!   are errors. Decoding one would only ever produce a control
-//!   character, which `resolve::reject_control_chars` rejects far
-//!   downstream with no `.env` line number; rejecting it here is the
-//!   same refusal with a better message, and it keeps a compose-authored
-//!   file from silently meaning something different. A literal
-//!   backslash-then-`n` is written `"a\\nb"`.
+//!   are errors. Decoding one would only produce a control character, which
+//!   `resolve::reject_control_chars` rejects downstream with no `.env` line
+//!   number, and a compose-authored file would silently mean something
+//!   different. A literal backslash-then-`n` is written `"a\\nb"`.
 //! - A quoted value must close on the same line; multi-line values are
 //!   not supported, for the same reason.
 //! - Anything other than whitespace or a `#` comment after a closing
@@ -96,10 +67,8 @@
 //! - No expansion: `$`, `${...}`, and `$$` are literal characters in a
 //!   value.
 //! - A duplicate `NAME` is an error naming the line it first appeared
-//!   on. This diverges from compose's last-wins: goetia already rejects
-//!   a duplicate `env` key rather than silently keeping the second, and
-//!   a repeated key in a hand-edited `.env` is a mistake, not an
-//!   override.
+//!   on. This diverges from compose's last-wins, as goetia also rejects a
+//!   duplicate `env` key.
 //! - A missing file is not an error and yields `Vars::empty()`. Only
 //!   `io::ErrorKind::NotFound` means "absent"; every other IO failure
 //!   (for example a directory sitting at the `.env` path) propagates as
@@ -116,8 +85,8 @@ pub(crate) const ENV_FILE_NAME: &str = ".env";
 
 /// A `.env` file's variables, fully resolved: every value is exactly the
 /// literal text after `=` (quoting aside), with no `$` expansion and no
-/// contribution from or to the process environment. See the module doc
-/// comment for the full grammar and the rationale for both properties.
+/// contribution from or to the process environment. See the module doc for the
+/// grammar and the rationale.
 #[derive(Debug, Clone)]
 pub(crate) struct Vars(BTreeMap<String, String>);
 
@@ -138,9 +107,7 @@ impl Vars {
         let text =
             std::str::from_utf8(bytes).map_err(|_| env_error(&path, 1, "file is not valid UTF-8".to_string()))?;
 
-        // Keyed by name to `(line it was first defined on, its value)`, so
-        // a duplicate can be reported without a second map tracking the
-        // same keys.
+        // Name -> (line first defined on, value), so a duplicate can name the line.
         let mut vars: BTreeMap<String, (usize, String)> = BTreeMap::new();
         for (index, raw_line) in text.split('\n').enumerate() {
             let line = index + 1;
@@ -188,13 +155,11 @@ impl Vars {
 
 // BOM and decoding ====================================================================================================
 
-/// Strip a UTF-8 BOM, or reject a UTF-16/UTF-32 BOM by name. `line` 1 is
-/// used for every error here since the problem is with the file's
-/// encoding, not with any one line of text within it.
+/// Strip a UTF-8 BOM, or reject a UTF-16/UTF-32 BOM by name. Errors report line 1: the problem
+/// is the file's encoding.
 ///
-/// The 4-byte UTF-32LE BOM (`FF FE 00 00`) starts with the same two bytes
-/// as the UTF-16LE BOM (`FF FE`), so the 4-byte patterns are checked
-/// first — otherwise a UTF-32LE file would be misreported as UTF-16LE.
+/// The UTF-32LE BOM (`FF FE 00 00`) starts with the UTF-16LE BOM (`FF FE`), so the 4-byte
+/// patterns are checked first.
 fn strip_bom<'a>(bytes: &'a [u8], path: &Path) -> Result<&'a [u8]> {
     if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
         Ok(rest)
@@ -255,12 +220,9 @@ fn parse_line(raw_line: &str, line: usize, path: &Path) -> Result<Option<(String
     };
 
     let name = &rest[..eq];
-    // Reduce an unquoted value before checking for whitespace against the
-    // `=`, since its comment and trailing whitespace are dropped whatever
-    // the line turns out to mean: `A= # c` must reduce to `A=` exactly as
-    // `A= ` does, rather than be reported as `A = 1`, an error it does not
-    // have and whose suggested fix does not apply. A quoted value is left
-    // whole; `check_trailing` handles what follows its closing quote.
+    // Reduce an unquoted value before the whitespace check, so `A= # c` reduces to `A=` like
+    // `A= ` rather than being reported as `A = 1`, whose suggested fix does not apply.
+    // A quoted value is left whole; `check_trailing` handles what follows its closing quote.
     let value_text = &rest[eq + 1..];
     let value_text = match value_text.as_bytes().first() {
         Some(b'\'' | b'"') => value_text,
@@ -285,10 +247,8 @@ fn parse_line(raw_line: &str, line: usize, path: &Path) -> Result<Option<(String
     Ok(Some((name.to_string(), value)))
 }
 
-/// Strip a leading `export` from `s`, but only when it is followed by
-/// whitespace — `export=1` must fall through untouched, naming the
-/// variable `export`. Any further whitespace before the name is trimmed
-/// too, same as leading whitespace at the start of the line.
+/// Strip a leading `export` from `s`, but only when followed by whitespace:
+/// `export=1` names the variable `export`. Whitespace before the name is trimmed too.
 fn strip_export_prefix(s: &str) -> &str {
     match s.strip_prefix("export") {
         Some(after) if after.starts_with(is_ws) => after.trim_start_matches(is_ws),
@@ -327,9 +287,7 @@ fn parse_single_quoted(s: &str, path: &Path, line: usize) -> Result<String> {
     Ok(inner[..end].to_string())
 }
 
-/// `"..."`: only `\\` and `\"` decode; every other escape is an error,
-/// named with the offending character rather than deferred to
-/// `resolve::reject_control_chars`.
+/// `"..."`: only `\\` and `\"` decode; every other escape is an error naming the character.
 fn parse_double_quoted(s: &str, path: &Path, line: usize) -> Result<String> {
     let inner = &s[1..];
     let mut value = String::new();

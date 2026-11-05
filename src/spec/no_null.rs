@@ -13,62 +13,47 @@
 //! Two properties are wanted from one rejection, and no single
 //! `Deserializer` call gives both.
 //!
-//! - **Position.** `yaml_serde` attaches the offending node's line and
-//!   its key path in `error::fix_mark`, which each `deserialize_*` method
-//!   applies to whatever error came out of it, filling a position in only
-//!   if one is not set already — so the innermost one wins.
-//!   `deserialize_option` is one of the two methods that never calls it.
-//!   A refusal built after `Option::<T>::deserialize` has returned
-//!   `Ok(None)` has therefore already left the deserializer that knew the
-//!   position, and the enclosing container stamps its *own* start line on
-//!   it instead: `restart: null` on line 9 reported the `command:` line
-//!   six lines above it. Only `deserialize_any`, whose `visit_unit` is
-//!   reached from inside `fix_mark`'s reach, can report the real one.
-//! - **Authored text.** `deserialize_any` resolves a *plain* scalar
-//!   through `visit_untagged_scalar` and hands the visitor the resulting
-//!   bool or number, not the characters: `env: {C: 0x10}` arrives as
-//!   `16`, `name: +5` as `5`, `env: {E: True}` as `true`. `resolve_tests`'
-//!   `load_preserves_authored_scalar_text_alongside_interpolation` pins
-//!   the opposite, and it is right to: an environment variable must carry
-//!   what the author wrote.
+//! - **Position.** An error raised after `deserialize_option` has returned
+//!   `Ok(None)` has lost the node's position, and the enclosing container
+//!   stamps its own start line on it. Only `deserialize_any` reports the real
+//!   one.
+//! - **Authored text.** `deserialize_any` hands the visitor a plain scalar
+//!   already coerced to a bool or number (`0x10` arrives as `16`), but an
+//!   environment variable must carry what the author wrote
+//!   (`resolve_tests`' `load_preserves_authored_scalar_text_alongside_interpolation`).
 //!
 //! So the two jobs are split across two walks of the same text. The typed
 //! parse reads each scalar as a string, so the authored text survives;
 //! this scan reads every node with `deserialize_any`, which sees a null
-//! exactly and reports it from the right place — and throws every value
-//! away, so its coercion costs nothing. Both walk the same unmodified
-//! text, so neither can move a position or change a message.
+//! exactly and reports it from the right place, and throws every value
+//! away. Both walk the same unmodified text, so neither can move a position
+//! or change a message.
 //!
 //! # Why it runs second, and may only ever report a `null`
 //!
-//! The scan is schema-blind: it walks whatever YAML is written and knows
-//! nothing about which keys are fields. Running it first therefore handed
-//! it errors that are not its business. `bogus: null` was refused as a
-//! null rather than as ``unknown field `bogus` ``, and the author's actual
-//! mistake was never named; so were a wrong container type and a duplicate
-//! key. And `env: {V: !!int abc}`, which the typed parse accepts as the
-//! text `abc`, became a hard parse error, because `deserialize_any` checks
-//! a standard tag's content against the tag.
+//! The scan is schema-blind, so run first it would be handed errors that are
+//! not its business: `bogus: null` refused as a null instead of as ``unknown
+//! field `bogus` ``, and `env: {V: !!int abc}`, which the typed parse accepts
+//! as the text `abc`, turned into a hard error because `deserialize_any`
+//! checks a standard tag's content.
 //!
 //! So the typed parse goes first and owns unknown fields, duplicate keys
-//! and type errors, with the positions and messages it always had, and
-//! only a structurally valid document reaches the scan. Anything the scan
-//! can still object to other than a `null` is therefore something the
-//! typed parse has already accepted, and is discarded — the tag check
-//! happens inside `yaml_serde` before the visitor is reached, so the
-//! scan cannot decline to see it, only decline to report it. Discarding
-//! means *keep walking*: a `null` sitting after a tag the scan could not
-//! read must still be found, so each container skips the node it could not
-//! read and carries on with the next one.
+//! and type errors, and only a structurally valid document reaches the scan.
+//! Anything else the scan objects to is something the typed parse already
+//! accepted, and is discarded, not avoided: `yaml_serde` checks a standard
+//! tag's content against the tag before the visitor is reached, so the
+//! scan cannot decline to see that kind of complaint, only decline to
+//! report it. Discarding means *keep walking*: each container skips the
+//! node it could not read and carries on, so a `null` after a tag the scan
+//! could not read is still found.
 //!
-//! One consequence is deliberate. A `null` in a position the typed parse
-//! rejects for its own reasons now reports that reason — `command: null`
-//! is `invalid type: unit value, expected a sequence` — which names the
-//! field and is what `goetia` said before this rule existed. The positions
-//! the typed parse *accepts* are the ones this module answers: every
-//! `Option` field, `env` keys and values, `command` elements, the daemon
-//! `id`, `user`, `user.name`, and a container written empty rather than
-//! `null` (`env:` with no body deserializes to an empty mapping).
+//! A `null` in a position the typed parse rejects for its own reasons
+//! reports that reason (`command: null` is `invalid type: unit value,
+//! expected a sequence`). The positions this module answers are those the
+//! typed parse *accepts*: every `Option` field, `env` keys and values,
+//! `command` elements, the daemon `id`, `user`, `user.name`, and a container
+//! written empty rather than `null` (`env:` with no body is an empty
+//! mapping).
 
 use std::cell::Cell;
 use std::fmt;
@@ -76,9 +61,8 @@ use std::fmt;
 use serde::de::{self, DeserializeSeed, EnumAccess, IgnoredAny, MapAccess, SeqAccess, VariantAccess, Visitor};
 
 /// Refuse every explicit `null` in `yaml`, naming the first one found.
-/// `yaml` must be a document the typed parse has accepted: every other
-/// complaint this walk can raise belongs to that parse and is discarded
-/// here — see the module doc comment.
+/// `yaml` must be a document the typed parse has accepted; any other complaint
+/// this walk raises is discarded (see the module doc).
 pub(super) fn reject_nulls(yaml: &str) -> Result<(), yaml_serde::Error> {
     let found = Cell::new(false);
     let scan = Scan(Slot::Document, &found);
@@ -88,15 +72,13 @@ pub(super) fn reject_nulls(yaml: &str) -> Result<(), yaml_serde::Error> {
     }
 }
 
-/// What a `null` `user.id` is refused with. It is `user`'s own
-/// `Deserialize` that raises it, not this scan: the typed parse rejects a
-/// `null` there, so the scan never sees one — see [`AccountId`](super::user::AccountId).
+/// What a `null` `user.id` is refused with. Raised by `user`'s own `Deserialize`, not this scan,
+/// which never sees one — see [`AccountId`](super::user::AccountId).
 pub(super) const NULL_ACCOUNT_ID: &str = "an explicit `null` is not an account id; omit the `user:` key instead";
 
-/// Where in a manifest a node sits. It decides what a refusal says, and
-/// nothing else — a slot this table does not know becomes [`Slot::Field`],
-/// so a field added to `RawSpec` without a line here is still refused,
-/// just with the generic wording.
+/// Where in a manifest a node sits. It decides only what a refusal says: an unknown slot
+/// becomes [`Slot::Field`], so a field added to `RawSpec` without a line here is still refused,
+/// with the generic wording.
 #[derive(Clone, Copy)]
 enum Slot {
     /// The whole manifest, which is the daemon.
@@ -118,14 +100,11 @@ enum Slot {
 
 impl Slot {
     /// What a `null` in this slot is refused with, if this scan is the one
-    /// to refuse it. Each names what the author meant to write instead,
-    /// because "omit the key" is the right remedy for a field with a
-    /// default and the wrong one for a required key or a map entry.
+    /// to refuse it. Each names the right remedy: "omit the key" suits a
+    /// field with a default, not a required key or a map entry.
     fn message(self) -> Option<&'static str> {
         Some(match self {
-            // A `null` *document* is not this scan's to diagnose: the typed
-            // parse answers it with a type error naming what it wanted,
-            // which is more use than anything about `null` would be.
+            // A `null` document gets the typed parse's type error, which names what it wanted.
             Slot::Document => return None,
             Slot::Id => "an explicit `null` is not a daemon id; quote the value to use its literal text",
             Slot::BackendSpecific => {
@@ -170,8 +149,7 @@ impl Slot {
     }
 
     /// The slot of a key of this mapping. Only `env` names its keys;
-    /// everywhere else a key is a field name, and a `null` one has no field
-    /// to unset.
+    /// elsewhere a key is a field name.
     fn key(self) -> Slot {
         match self {
             Slot::Env => Slot::EnvKey,
@@ -188,16 +166,12 @@ impl Slot {
     }
 }
 
-/// One node of the scan. `deserialize_any` is the whole point: it is what
-/// reaches `visit_unit` for a `null`, from inside the position the error
-/// needs, and what resolves `!!null "null"` — `deserialize_option` decides
-/// null-ness from the scalar's *style*, so it sees a tagged null only when
-/// the scalar is unquoted.
+/// One node of the scan. `deserialize_any` reaches `visit_unit` for a `null` from inside the
+/// position the error needs, and resolves `!!null "null"`, which `deserialize_option` sees only
+/// when the scalar is unquoted.
 ///
-/// The flag says whether the error currently travelling up the stack is
-/// this scan's own refusal. Any other one belongs to the typed parse,
-/// which has already accepted this document, so it is dropped and the walk
-/// carries on — see the module doc comment.
+/// The flag says whether the error travelling up the stack is this scan's own refusal; any other
+/// is dropped and the walk carries on (see the module doc).
 #[derive(Clone, Copy)]
 struct Scan<'a>(Slot, &'a Cell<bool>);
 
@@ -233,9 +207,7 @@ impl<'de> Visitor<'de> for Scan<'_> {
         }
     }
 
-    /// An empty document, which `yaml_serde` reports as `Event::Void`.
-    /// The typed parse's `missing field \`id\`` says more about it
-    /// than this scan could.
+    /// An empty document (`Event::Void`); the typed parse's `missing field \`id\`` says more.
     fn visit_none<E: de::Error>(self) -> Result<(), E> {
         Ok(())
     }
@@ -285,13 +257,9 @@ impl<'de> Visitor<'de> for Scan<'_> {
                 Ok(Some(key)) => key,
                 Ok(None) => return Ok(()),
                 Err(error) if self.refused_a_null() => return Err(error),
-                // The key is consumed even when it cannot be read, so
-                // the value beside it must still be taken, or the walk
-                // falls out of step and starts reading values as keys.
-                // It is taken as a *value*, not skipped: the typed parse
-                // read that key as a field, so a `null` under it is part
-                // of the manifest. Only the key's own text is lost, and
-                // with it the slot that text would have chosen.
+                // The key is consumed even when unreadable, so take the value beside it or the
+                // walk reads values as keys. Take it as a value, not skip it: a `null` under it
+                // is part of the manifest. Only the slot the key's text would have chosen is lost.
                 Err(_) => String::new(),
             };
             match map.next_value_seed(Scan(self.0.value(&key), self.1)) {
@@ -302,21 +270,17 @@ impl<'de> Visitor<'de> for Scan<'_> {
         }
     }
 
-    /// A node carrying a local tag (`name: !mine text`) arrives as an
-    /// enum, since that is how `yaml_serde` offers `!Tag` syntax.
-    /// Recursing into the content rather than ignoring it keeps
-    /// `!mine null` refused.
+    /// A node carrying a local tag (`name: !mine text`) arrives as an enum.
+    /// Recursing into the content keeps `!mine null` refused.
     fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<(), A::Error> {
         let (_tag, variant) = data.variant::<IgnoredAny>()?;
         variant.newtype_variant_seed(self)
     }
 }
 
-/// A mapping key. Same refusal as [`Scan`], plus the key's text, which
-/// picks the slot of the value beside it. The text is used for that and
-/// discarded, so the coercion `deserialize_any` performs on a plain
-/// numeric key is invisible: `env`'s keys reach `RawSpec` from the typed
-/// parse, not from here.
+/// A mapping key. Same refusal as [`Scan`], plus the key's text, which picks the slot of the
+/// value beside it. The text is then discarded, so the coercion of a plain numeric key is
+/// harmless: `env`'s keys reach `RawSpec` from the typed parse.
 struct ScanKey<'a>(Scan<'a>);
 
 impl<'de> DeserializeSeed<'de> for ScanKey<'_> {
@@ -374,11 +338,9 @@ impl<'de> Visitor<'de> for ScanKey<'_> {
         self.0.visit_map(map).map(|()| String::new())
     }
 
-    /// A key carrying a local tag (`!mine env:`) arrives as an enum. The
-    /// typed parse resolves the tag away and honours it as the field it
-    /// names, so this has to hand back the same text: dropping it puts the
-    /// value beside it in the wrong slot, and the refusal then contradicts
-    /// its own key path.
+    /// A key carrying a local tag (`!mine env:`) arrives as an enum. The typed parse honours
+    /// it as the field it names, so hand back the same text; dropping it puts the value in the
+    /// wrong slot and the refusal contradicts its own key path.
     fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<String, A::Error> {
         let (_tag, variant) = data.variant::<IgnoredAny>()?;
         variant.newtype_variant_seed(self)
