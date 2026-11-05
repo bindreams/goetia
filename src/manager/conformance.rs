@@ -14,8 +14,9 @@
 //! RAII guard so a mid-scenario assertion failure still cleans up. Ids are
 //! process- and call-unique (a pid plus a monotonic counter), not
 //! cryptographically random: sufficient given cleanup runs on normal return and
-//! on panic. The guard knows each id before `install` runs, so an `install` that
-//! fails after writing is still cleaned up. Cleanup does not run if the process
+//! on panic. The guard knows each fresh id before `install` runs, so an
+//! `install` that fails after writing is still cleaned up; the seeded ids the
+//! caller installs before `run` are the caller's to guard. Cleanup does not run if the process
 //! is killed or aborts, which leaves a straggler to remove by hand.
 //!
 //! ## The seeded ids
@@ -77,8 +78,11 @@ struct Cleanup<'a> {
 impl Drop for Cleanup<'_> {
     fn drop(&mut self) {
         for id in &self.ids {
-            if let Err(e) = self.mgr.uninstall(id) {
-                eprintln!("manager::conformance cleanup: uninstall({id}) failed: {e}");
+            // `NotInstalled`: an id registered before an `install` that never wrote.
+            match self.mgr.uninstall(id) {
+                Ok(()) => {}
+                Err(e) if matches!(e.cause(), crate::Error::NotInstalled { .. }) => {}
+                Err(e) => eprintln!("manager::conformance cleanup: uninstall({id}) failed: {e}"),
             }
         }
     }
@@ -558,7 +562,8 @@ pub fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, m
 /// enumerates every service on the host, so a second call would cost a real
 /// sweep.
 ///
-/// `installed` is every id installed through `mgr` so far — `run`'s own, plus
+/// `installed` is every id installed through `mgr` so far (a registered id whose
+/// `install` failed has already panicked the scenario) — `run`'s own, plus
 /// the [`HAND_EDITED_ID`] the *caller* installed. Each must be in `list()` as
 /// `Ours`, not just `id`: an enumeration that drops one it could read is
 /// indistinguishable from one where that daemon does not exist.
