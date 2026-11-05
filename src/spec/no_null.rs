@@ -22,9 +22,6 @@
 //!   environment variable must carry what the author wrote
 //!   (`resolve_tests`' `load_preserves_authored_scalar_text_alongside_interpolation`).
 //!
-//! The measurements behind both are in the knowledge base note on
-//! `yaml_serde`'s `deserialize_any` and `deserialize_option`.
-//!
 //! So the two jobs are split across two walks of the same text. The typed
 //! parse reads each scalar as a string, so the authored text survives;
 //! this scan reads every node with `deserialize_any`, which sees a null

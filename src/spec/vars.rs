@@ -17,8 +17,7 @@
 //! `dotenv-parser` is literal but errors on a BOM, silently drops a
 //! duplicate key, does not unescape `\n`, and exposes `pest`'s error type.
 //! The input path to a tool that writes privileged services cannot accept
-//! either. Details, with versions: the knowledge base note on dotenvy and
-//! dotenv-parser.
+//! either.
 //!
 //! # Grammar
 //!

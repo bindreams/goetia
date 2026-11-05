@@ -18,8 +18,7 @@
 //! `bin/frpc`; launchd silently resolves it against the default working
 //! directory; Windows against `System32`). Absolutizing it against the
 //! manifest's directory before any backend sees it gives one rule that does
-//! not depend on where the daemon starts. Measurements: the knowledge base
-//! note on how a relative executable path resolves on each manager.
+//! not depend on where the daemon starts.
 //!
 //! **The dragon is in the default.** A relative path passed as an
 //! *argument* (`command: ["bin/frpc", "-c", "host/frpc.toml"]`) with no
@@ -613,7 +612,7 @@ fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error>
 /// uncanonicalised directory would trade a loud refusal for silent phantom drift on Windows.
 ///
 /// The failure causes (an unreadable path component on Unix; a refused open or a volume with no
-/// DOS path on Windows) are in the knowledge base note on `canonicalize` of the cwd. A
+/// DOS path on Windows) are the ones the message names. A
 /// **deleted** working directory is not among them: it fails earlier, in
 /// `std::env::current_dir`, so do not put it in the message below.
 fn canonicalize_cwd(cwd: &Path) -> Result<PathBuf, Error> {
@@ -770,8 +769,8 @@ pub(crate) fn reject_empty(id: &Id, field: &str, value: &str) -> Result<(), Erro
 /// is deliberate:
 ///
 /// - A whitespace-only `User=` is not rejected by systemd and resets to root, exactly as an
-///   empty one does (knowledge base note: whitespace-only `User=` and `systemd-analyze
-///   verify`), so goetia is the only gate. The value either silently becomes root or names an
+///   empty one does (even `systemd-analyze verify` accepts it), so goetia is the only gate.
+///   The value either silently becomes root or names an
 ///   account that cannot exist.
 /// - A path has no such default: a file named `" "` is legal on Unix, and an all-whitespace
 ///   `cwd`/`logs`/`command[0]` simply fails to resolve.
