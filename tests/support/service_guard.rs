@@ -106,40 +106,11 @@ fn cleanup(id: &str) -> Vec<String> {
     if !stop.ok() && !matches!(stop.code, Some(1060 | 1062 | 1072)) {
         problems.push(stop.to_string());
     }
-    // A stop that took returns at STOP_PENDING while the shim is still writing
-    // its log, which would otherwise be removed under it. Any other query
-    // failure ends the wait and is reported.
-    if stop.ok() {
-        loop {
-            let query = cmd::run("sc.exe", &["query", id]);
-            if query.ok() {
-                if query.stdout.contains("STOPPED") {
-                    break;
-                }
-            } else {
-                if query.code != Some(1060) {
-                    problems.push(query.to_string());
-                }
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-    }
     // 1072: `uninstall` may return while the record is only marked for deletion;
     // SCM drops it once its last handle closes. Nothing is left to delete.
     let delete = cmd::run("sc.exe", &["delete", id]);
     if !delete.ok() && !matches!(delete.code, Some(1060 | 1072)) {
         problems.push(delete.to_string());
     }
-    // The shim's fallback log outlives the service.
-    problems.extend(remove_path(&shim_log_dir().join(format!("{id}.log")), false));
     problems
-}
-
-/// `%ProgramData%\Goetia\logs`, where the shim writes `<id>.log`. Mirrors
-/// `logging::default_log_path`, which the test crate cannot import.
-#[cfg(windows)]
-pub fn shim_log_dir() -> std::path::PathBuf {
-    let program_data = std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into());
-    std::path::PathBuf::from(program_data).join(r"Goetia\logs")
 }

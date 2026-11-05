@@ -51,63 +51,12 @@ fn hand_edit(id: &str) {
 
 // Step 1: conformance =================================================================================================
 
-/// Removes the shim logs of this process's fresh conformance ids on drop. `conformance::run` removes
-/// the services it installs but not their logs, and the ids carry the pid, as `fresh_id` formats
-/// them, so no other run's files are touched.
-struct ConformanceLogs {
-    marker: String,
-}
-
-impl ConformanceLogs {
-    fn new() -> Self {
-        Self {
-            marker: format!("-{:x}-", std::process::id()),
-        }
-    }
-}
-
-impl Drop for ConformanceLogs {
-    fn drop(&mut self) {
-        let dir = support::service_guard::shim_log_dir();
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-            Err(e) => {
-                eprintln!("ConformanceLogs: read {}: {e}", dir.display());
-                return;
-            }
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(e) => {
-                    eprintln!("ConformanceLogs: read {}: {e}", dir.display());
-                    continue;
-                }
-            };
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if !name.starts_with("goetia-conformance-") || !name.contains(&self.marker) {
-                continue;
-            }
-            match std::fs::remove_file(entry.path()) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => eprintln!("ConformanceLogs: remove {}: {e}", entry.path().display()),
-            }
-        }
-    }
-}
-
 /// `UNIT_DIR_EXCLUSIVE`: seeding `UNDETERMINED_ID` denies an elevated reader one service's
 /// `Parameters` for the length of the run, which puts an `Undetermined` entry in every concurrent
 /// `list()` — including the ones `tests/scm_integration/managed.rs` asserts are clean.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn simple_passes_conformance() {
     let mgr = goetia::backend::scm::manager::Scm::new();
-    // Declared first, so it drops last: after `conformance::run`'s own cleanup has uninstalled the
-    // services that were writing these logs.
-    let _logs = ConformanceLogs::new();
 
     let _foreign_guard = ServiceGuard::new(conformance::FOREIGN_ID);
     seed_foreign(conformance::FOREIGN_ID);
