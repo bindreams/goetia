@@ -233,7 +233,8 @@ enum Obtained {
 /// are read: the file step 1 classified need not be the one a later `open` resolves the name to.
 /// No `(st_dev, st_ino)` comparison against step 1 is needed, since an `fstat` on the open
 /// descriptor is stronger than two name lookups agreeing. It does not rule out reading a
-/// different regular file than step 1 stat'd, the benign content race a plain `fs::read` has too.
+/// different regular file than step 1 stat'd, the benign content race a plain `fs::read` has too,
+/// and one no verdict here depends on.
 /// `O_NONBLOCK` covers the window between the steps: a FIFO swapped in after step 1 cannot block
 /// the open, so step 2 rejects it.
 fn obtain(path: &Path) -> Obtained {
@@ -1109,8 +1110,8 @@ impl backend::Backend for Launchd {
                 let target = snapshot.location.path.as_path();
                 // `target` was captured by `read`, before `decide` ran. A concurrent `enable` or
                 // `disable` may have moved it since, and writing here would put a plist in both
-                // directories, which `locate` errors on; a concurrent `uninstall` would have it
-                // recreated. This check only narrows the race to the window between it and
+                // directories, which `locate` errors on; after a concurrent `uninstall` reported
+                // success, it would install the plist again. This check only narrows the race to the window between it and
                 // `write_existing`'s rename onto `target`; it does not close it.
                 if !still_present(target)? {
                     return if changes_job {
