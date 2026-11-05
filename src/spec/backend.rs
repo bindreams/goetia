@@ -4,9 +4,8 @@
 //! this module is the validation machinery it drives.
 //!
 //! Lives under `spec` rather than `crate::backend` because its job is
-//! parsing a manifest key, not artifact generation — `crate::backend` is
-//! the tree that turns a resolved [`crate::spec::DaemonSpec`] into a real
-//! systemd unit, launchd plist, or SCM registration.
+//! parsing a manifest key; `crate::backend` turns a resolved
+//! [`crate::spec::DaemonSpec`] into a unit, plist or registration.
 //!
 //! Also home to the per-backend cross-validation `resolve` runs over every
 //! backend's merged spec: [`ShapedSpec`]/[`Shaped`] (a spec that
@@ -19,21 +18,18 @@
 //! `backend-specific:` key, and warns only about its native backend.
 //!
 //! [`BackendKind::error`] rejects only a field the override actually supplied
-//! (`Supplied`, from `overrides.rs`) — a base value is never a per-backend
+//! (`Supplied`, from `overrides.rs`): a base value is never a per-backend
 //! verdict, since nobody wrote it for that backend. It runs for every
 //! backend on every host, on the override as authored: `scm: {user: {id:
-//! 1000}}` is caught from any host — a uid is never a substituted string —
-//! while `scm: {user: "${ACCT}"}` is not checkable from Linux: substitution
-//! runs for the native backend only. The native backend's override is
-//! substituted too, in `resolve`'s step 5, and is both checked and warned on
-//! there; the example above names `scm` because a non-native override is
-//! never substituted.
+//! 1000}}` is caught from any host, while `scm: {user: "${ACCT}"}` is not
+//! checkable from Linux because only the native backend's override is
+//! substituted. The native override is checked and warned on after
+//! substitution, in `resolve`'s step 5.
 //!
 //! [`BackendKind::warn`] runs for the native backend only, on its substituted
 //! merged spec, base values included: an advisory describes what the native
-//! install does with the value it reads. A backend this host cannot install
-//! gets none, and a base value that backend cannot honour is its generator's
-//! to refuse at install (`restart: always` on `scm`), not resolution's.
+//! install does with the value it reads. A base value the native backend cannot
+//! honour is its generator's to refuse at install (`restart: always` on `scm`).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -51,9 +47,8 @@ use crate::error::Error;
 /// can target.
 ///
 /// Declared in alphabetical order: serde's `unknown_variant` error lists
-/// variants in declaration order, and this order also fixes the order
-/// [`BackendKind::ALL`] iterates in, which in turn fixes the order any warning
-/// keyed off it is emitted in.
+/// variants in declaration order, and [`BackendKind::ALL`] (and so warning
+/// order) follows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendKind {
@@ -63,7 +58,7 @@ pub enum BackendKind {
 }
 
 impl BackendKind {
-    /// Every variant, in the same alphabetical order they are declared in.
+    /// Every variant, in declaration order.
     pub const ALL: [BackendKind; 3] = [BackendKind::Launchd, BackendKind::Scm, BackendKind::Systemd];
 
     /// The backend for the platform this binary is running on, or `None` on
@@ -111,8 +106,8 @@ impl std::fmt::Display for BackendKind {
 // ShapedSpec ==========================================================================================================
 
 /// One of the three fields whose authored text is an enum or a duration
-/// that `resolve` parses. Three states, because a shape pass that runs
-/// before substitution can honestly reach only two of them.
+/// that `resolve` parses. Three states, because the shape pass runs
+/// before substitution.
 #[derive(Debug)]
 pub(crate) enum Shaped<T> {
     /// The authored text carried no `$` and parsed.
@@ -175,9 +170,7 @@ impl BackendKind {
     }
 
     /// Values that are wrong for this backend by construction, on any
-    /// host. Reads **only** the fields `supplied` marks: a rejection is a
-    /// verdict this host is entitled to make about a value written for
-    /// this backend, and about nothing else. See `Supplied`.
+    /// host. Reads **only** the fields `supplied` marks. See `Supplied`.
     pub(crate) fn error(self, spec: &ShapedSpec, supplied: Supplied) -> Result<(), Error> {
         if !supplied.user {
             return Ok(());
@@ -192,8 +185,6 @@ impl BackendKind {
                 _ => Ok(()),
             },
             BackendKind::Systemd | BackendKind::Launchd => match &spec.user {
-                // Neither a SID nor a Windows built-in name is ever a POSIX
-                // account.
                 User::Id(AccountId::Sid(sid)) => Err(invalid(
                     &spec.id,
                     &format!(
@@ -201,10 +192,7 @@ impl BackendKind {
                          write it unquoted, e.g. `user: {{id: 1000}}`"
                     ),
                 )),
-                // A `$`-bearing name cannot be classified as a built-in
-                // from this host, so `error` returns `Ok` rather than
-                // guessing — same predicate, same reasoning as the shape
-                // phase's enum/duration deferral.
+                // A `$`-bearing name cannot be classified before substitution; do not guess.
                 User::Name(name)
                     if !interpolate::would_substitution_change(name) && windows_only_account(name).is_some() =>
                 {
@@ -221,11 +209,7 @@ impl BackendKind {
 
 /// `type: managed` on Windows has no working-directory or stdout-capture
 /// field, so `cwd`/`logs` are accepted, not rejected, but silently
-/// unavailable there. See the design spec's accepted divergence (a).
-///
-/// Reads `kind` through [`Shaped::parsed`]: `None` (absent, or unavailable)
-/// means silence is correct, since an absent `type` defaults to `Simple`,
-/// which warns about nothing.
+/// unavailable there. An absent `type` defaults to `Simple`, which warns about nothing.
 fn warn_on_windows_divergences(spec: &ShapedSpec, out: &mut Vec<Warning>) {
     if spec.kind.parsed() != Some(Kind::Managed) {
         return;
@@ -244,8 +228,7 @@ fn warn_on_windows_divergences(spec: &ShapedSpec, out: &mut Vec<Warning>) {
 /// `restart-delay` is stored as authored so the metadata blob stays
 /// deterministic across platforms, but launchd's `ThrottleInterval` is
 /// integer seconds: `500ms` would truncate to `0`, which *disables*
-/// throttling and yields an unbounded respawn storm. Warn here so the
-/// rounding is not a silent surprise at install time.
+/// throttling and yields an unbounded respawn storm. Warn that it rounds up.
 fn warn_on_sub_second_restart_delay(spec: &ShapedSpec, out: &mut Vec<Warning>) {
     let Some(delay) = spec.restart_delay.parsed() else {
         return;
@@ -263,15 +246,11 @@ fn warn_on_sub_second_restart_delay(spec: &ShapedSpec, out: &mut Vec<Warning>) {
     });
 }
 
-/// `SC_ACTION.Delay` is `dwDelay`, a `DWORD` of milliseconds: `windows-service`'s
-/// `ServiceAction::to_raw` converts a `Duration` into one with
-/// `u32::try_from(delay.as_millis()).expect("Too long delay")`, which
-/// **panics** — not a recoverable `Error` — for anything past this.
-/// `goetia.yaml`'s `restart-delay` has no upper bound of its own, so
-/// `backend::scm::generate::registration` clamps to this rather than
-/// letting that panic reach an install. Defined here, not in `generate.rs`,
-/// so the advisory below and the clamp read one constant instead of two
-/// that can drift; `backend::scm` depends on `spec`, never the reverse.
+/// `SC_ACTION.Delay` is a `DWORD` of milliseconds, and `windows-service`'s
+/// `ServiceAction::to_raw` **panics** on a longer `Duration`. `restart-delay`
+/// has no bound of its own, so `backend::scm::generate::registration` clamps
+/// to this. Defined here so the advisory below and the clamp share one
+/// constant; `backend::scm` depends on `spec`, never the reverse.
 pub(crate) const MAX_SC_ACTION_DELAY: Duration = Duration::from_millis(u32::MAX as u64);
 
 /// What SCM stores for an authored `restart-delay`: whole milliseconds, at most
@@ -290,11 +269,9 @@ pub(crate) fn scm_restart_delay(delay: Duration) -> Duration {
 }
 
 /// The advisories for `generate::registration`'s restart-delay clamp and rounding, fired at
-/// resolve time when scm is the native backend, rather than only when an effectful install
-/// runs the generator. Gated identically to the clamp itself:
-/// `Restart::Never` builds no `FailureActions`, so a `restart-delay` without
-/// `restart: on-failure` warns about nothing. `always` warns about nothing
-/// either: the generator refuses it.
+/// resolve time rather than only when an install runs the generator. Gated like the clamp:
+/// `Restart::Never` builds no `FailureActions`, and the generator refuses `always`, so only
+/// `on-failure` warns.
 fn warn_on_over_long_restart_delay(spec: &ShapedSpec, out: &mut Vec<Warning>) {
     if spec.restart.parsed() != Some(Restart::OnFailure) {
         return;
@@ -352,31 +329,21 @@ impl Builtin {
 
 /// Recognise a Windows built-in account by every spelling Windows accepts:
 /// bare (`LocalSystem`, `LocalService`, `NetworkService`, `SYSTEM`) or
-/// `NT AUTHORITY\`-qualified, case-insensitively. Covers every row
-/// `identity::account_needs_password` had before this table replaced it —
-/// which strips the prefix and so accepts all four names qualified,
-/// `NT AUTHORITY\LocalSystem` included — plus the two spaced spellings
-/// `LookupAccountSidW` returns for the well-known SIDs
-/// (`NT AUTHORITY\LOCAL SERVICE`, `NT AUTHORITY\NETWORK SERVICE`), plus the
-/// empty string, see the note below.
+/// `NT AUTHORITY\`-qualified, case-insensitively, plus the two spaced
+/// spellings `LookupAccountSidW` returns for the well-known SIDs
+/// (`NT AUTHORITY\LOCAL SERVICE`, `NT AUTHORITY\NETWORK SERVICE`) and the
+/// empty string (below).
 ///
-/// Enumerated rather than folded. A fold that stripped spaces after the
-/// prefix would also accept `NT AUTHORITY\S Y S T E M` and
-/// `NT AUTHORITY\LO CAL SERVICE`, silently promoting a typo to a privileged
-/// account instead of failing as the nonexistent account it names. The two
-/// spaced rows are the only spellings the fold existed for, and they are
-/// qualified: an unprefixed `Local Service` never arrives from a SID lookup
-/// — `identity::resolve` passes `User::Name` through without one — and is a
-/// legal name for a genuine local account, so it stays an ordinary one. See
-/// `every_nt_authority_spelling_is_recognised` and
-/// `a_spelling_that_is_not_in_the_table_is_an_ordinary_account`.
+/// Enumerated rather than folded: stripping spaces would also accept
+/// `NT AUTHORITY\S Y S T E M`, silently promoting a typo to a privileged
+/// account. An unprefixed `Local Service` never comes from a SID lookup and
+/// is a legal local account name, so it stays ordinary.
 ///
 /// `windows_builtin("")` is `Some(Builtin::LocalSystem)`: `canonical_account`
 /// maps an empty authored account to `LocalSystem`, and both halves must
-/// agree. `BackendKind::error` never sees an empty name —
-/// `reject_blank` fails first in `resolve_shape` — so this row is
-/// unreachable from that direction; do not "simplify" it away, or
-/// `User::Root`'s behaviour on Windows changes.
+/// agree. `BackendKind::error` never sees an empty name (`reject_blank` fails
+/// first in `resolve_shape`), but do not remove this row, or `User::Root`'s
+/// behaviour on Windows changes.
 pub(crate) fn windows_builtin(name: &str) -> Option<Builtin> {
     match name.to_ascii_lowercase().as_str() {
         "" | "system" | "localsystem" | r"nt authority\system" | r"nt authority\localsystem" => {
@@ -395,16 +362,11 @@ pub(crate) fn windows_builtin(name: &str) -> Option<Builtin> {
 /// Windows built-in under a POSIX backend. Defined in terms of
 /// `windows_builtin`, never as a second table.
 ///
-/// A bare `system` (any case) is carved out: `SYSTEM` is a spelling Windows
-/// resolves to the `LocalSystem` account, but `system` is also a perfectly
-/// ordinary POSIX username (`useradd system` succeeds on Debian, and it is
-/// a real account on Android), so rejecting it under `systemd`/`launchd`
-/// would make that POSIX account inexpressible. `NT AUTHORITY\SYSTEM` is a
-/// different string and is untouched by this filter — no prefix test is
-/// needed or wanted. Likewise unreachable, for the same reason as
-/// `windows_builtin("")`: `windows_only_account("")` is `Some(LocalSystem)`,
-/// since `reject_blank` catches the empty case first. The carve-out is for
-/// `system`, not for the empty string.
+/// A bare `system` (any case) is carved out: Windows resolves it to
+/// `LocalSystem`, but it is also an ordinary POSIX username, so rejecting it
+/// under `systemd`/`launchd` would make that account inexpressible.
+/// `NT AUTHORITY\SYSTEM` is untouched. `windows_only_account("")` is
+/// `Some(LocalSystem)` but unreachable, as for `windows_builtin("")`.
 pub(crate) fn windows_only_account(name: &str) -> Option<Builtin> {
     windows_builtin(name).filter(|_| !name.eq_ignore_ascii_case("system"))
 }

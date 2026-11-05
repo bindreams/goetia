@@ -9,28 +9,20 @@
 //! # This must run before `resolve_shape`, never after
 //!
 //! Substitution has to happen on the typed raw manifest, strictly before
-//! `resolve_shape` runs — never on an already-resolved `DaemonSpec`. This is
-//! not a style preference: `resolve_shape` is what routes every
-//! user-supplied string through `reject_unemittable`/`reject_control_chars`,
-//! the only gate standing between a string and a generated service
-//! artifact. If substitution ran *after* that gate, a `.env` value could
-//! carry a control character (a newline, say) straight into an emitted
-//! systemd unit or launchd plist, having never passed the check that
-//! exists precisely to catch it. No field in the raw manifest is exempt
-//! from this ordering requirement today, and the ordering is the only
-//! thing holding that property up — get the call order right.
+//! `resolve_shape` runs, never on a resolved `DaemonSpec`: `resolve_shape`
+//! routes every user-supplied string through
+//! `reject_unemittable`/`reject_control_chars`, the only gate between a string
+//! and a generated artifact. Substituting after it would let a `.env` value
+//! carry a newline straight into a systemd unit or launchd plist. No field is
+//! exempt, and the call order is all that holds this up.
 //!
 //! # Why hand-written rather than a crate
 //!
-//! The repo otherwise prefers a dependency to a reimplementation, but
-//! neither of the two closest published crates was usable here:
-//! `subst` and `shellexpand` both accept a bare `$VAR` (no braces) as a
-//! reference, silently doing the same thing a brace form does, and
-//! neither names the offending variable in the error when a reference
-//! can't be resolved. This grammar deliberately rejects a bare `$` that
-//! is not immediately followed by `{` or another `$` — a user who typed
-//! `$HOME` meaning a reference gets an error naming the byte, not a
-//! literal `$HOME` written into a unit file.
+//! `subst` and `shellexpand` both accept a bare `$VAR` as a reference, and
+//! neither names the offending variable when a reference cannot be resolved.
+//! This grammar rejects a bare `$` not followed by `{` or `$`, so a user who
+//! typed `$HOME` gets an error naming the byte, not a literal `$HOME` in a
+//! unit file.
 //!
 //! # Grammar
 //!
@@ -44,49 +36,37 @@
 //!   form — no nested substitution, no escape. This is checked
 //!   unconditionally, even when `NAME` is set and `default` is never
 //!   used, since grammar validity does not depend on which branch wins.
-//! - `default` ends at the first `}`, with no escape for a literal `}`
-//!   inside it: `${A:-{x}}` reads as `default = "{x"`, substitutes it,
-//!   and leaves the second `}` to be copied through as ordinary text —
-//!   so a default containing a closing brace cannot be written at all.
-//!   Deliberate: fixing it needs either a seventh error message or new
-//!   escape syntax, and this grammar's contract is exactly six.
+//! - `default` ends at the first `}`, with no escape for a literal `}`:
+//!   `${A:-{x}}` reads as `default = "{x"` followed by ordinary text `}`, so a
+//!   default containing a closing brace cannot be written. Deliberate: fixing
+//!   it needs a seventh error message or new escape syntax, and this
+//!   grammar's contract is exactly six.
 //! - `NAME` matches `^[A-Za-z_][A-Za-z0-9_]*$`, the same charset `.env`
 //!   names must match (see `vars.rs`), so a name that can be assigned can
 //!   always be referenced and vice versa.
-//! - `$$` is a literal `$`, and only in that pairing — a lone `$` not
-//!   immediately followed by `{` or another `$` is an error rather than
-//!   passed through, so a typo like `$HOME` cannot silently become the
-//!   literal text `$HOME` in a generated artifact.
+//! - `$$` is a literal `$`. A lone `$` not followed by `{` or `$` is an
+//!   error, never passed through.
 //! - The result of a substitution is never rescanned: a value that is
 //!   itself the literal text `${OTHER}` is emitted as-is.
 //! - Every other byte is copied through unchanged.
 //!
 //! # `would_substitution_change` deliberately over-approximates
 //!
-//! [`would_substitution_change`] answers "does this string contain any
-//! `$` at all", not "does it contain a reference that will actually
-//! substitute to something else". A string whose only `$` is half of a
-//! `$$` escape still returns `true`, even though the *number* of `$`
-//! characters changes but nothing "resolves" in the reference sense. A
-//! later cross-backend check uses this to decide whether a value is safe
-//! to hand to a parser *before* substitution has run, or must wait until
-//! after. Tightening this to something like "contains `${`" would let
-//! that check hand pre-substitution text (e.g. `a$$b`, which becomes
-//! `a$b`) to a parser that will never see the text as it actually reads
-//! post-substitution. Deferring a value that didn't strictly need
-//! deferring costs one check running slightly later; parsing text that
-//! substitution is about to change parses the wrong string outright. Do
-//! not narrow this function to make that later check fire more often.
+//! [`would_substitution_change`] answers "does this string contain any `$`
+//! at all", so a string whose only `$` is half of a `$$` escape still
+//! returns `true`. A cross-backend check uses it to decide whether a value
+//! can be parsed *before* substitution or must wait. Narrowing it to
+//! "contains `${`" would hand `a$$b` (which becomes `a$b`) to a parser
+//! before substitution, parsing the wrong string; deferring unnecessarily
+//! only runs a check slightly later. Do not narrow it.
 
 use super::raw::RawSpec;
 use super::user::{AccountId, RawUser};
 use super::vars::Vars;
 use crate::error::{Error, Result};
 
-/// Which job [`scan`] is doing. The only place the walk consults `vars` is
-/// [`resolve_name`] — giving the walk a mode and routing both entry points
-/// through it means a second copy of the scanner (a second grammar) never
-/// has the chance to drift from this one.
+/// Which job [`scan`] is doing. Both entry points share one scanner so the
+/// two grammars cannot drift; only [`resolve_name`] consults `vars`.
 #[derive(Clone, Copy)]
 enum Mode<'a> {
     /// Resolve each reference against `.env`.
@@ -97,19 +77,16 @@ enum Mode<'a> {
 }
 
 /// Substitute one scalar. `path` is the manifest field path used in
-/// errors, e.g. `env["LOG"]`. See the module doc comment for
-/// the grammar and for why this must run before `resolve_shape`.
+/// errors, e.g. `env["LOG"]`. See the module doc for the grammar and for why
+/// this must run before `resolve_shape`.
 pub(crate) fn scalar(input: &str, path: &str, vars: &Vars) -> Result<String> {
     scan(input, path, Mode::Substitute(vars))
 }
 
-/// Every `${...}` reference in `input` is well-formed. Grammar only: no
-/// variable is resolved, so an undefined name is *not* an error here — see
-/// [`Mode::CheckOnly`]. Not the same check as `scalar(input, path,
-/// &Vars::empty())`: that would fail on `${VAR}` for a variable this host
-/// is not entitled to require, since it may not be the one substitution
-/// will actually run on. See `resolve.rs`'s "Why the grammar check exists"
-/// for the full argument.
+/// Every `${...}` reference in `input` is well-formed. Grammar only: an undefined name is *not*
+/// an error here (see [`Mode::CheckOnly`]), unlike `scalar(input, path, &Vars::empty())`, which
+/// would demand a variable on a host that may not be the one substitution runs on. See
+/// `resolve.rs`'s "Why the grammar check exists".
 pub(crate) fn check_grammar(input: &str, path: &str) -> Result<()> {
     scan(input, path, Mode::CheckOnly).map(drop)
 }
@@ -146,9 +123,8 @@ fn scan(input: &str, path: &str, mode: Mode<'_>) -> Result<String> {
     Ok(out)
 }
 
-/// Whether substitution would change `s` — that is, whether `s` contains
-/// any `$` at all. See the module doc comment: this is deliberately an
-/// over-approximation and must stay one.
+/// Whether `s` contains any `$` at all. Deliberately an over-approximation of "substitution
+/// would change `s`"; see the module doc.
 pub(crate) fn would_substitution_change(s: &str) -> bool {
     s.contains('$')
 }
@@ -171,9 +147,7 @@ fn scan_braced(
             if c == '}' {
                 return Err(interpolate_error(path, "empty variable name in `${}`".to_string()));
             }
-            // `:` here is legal syntax opening a `:-` default (`${:-fallback}`),
-            // not an invalid character — the real defect is the empty name
-            // that precedes it, so report that, not the `:`.
+            // `${:-x}`: the defect is the empty name, not the `:`.
             if c == ':' && chars.peek().map(|&(_, c)| c) == Some('-') {
                 return Err(interpolate_error(path, "empty variable name in `${}`".to_string()));
             }
@@ -264,35 +238,25 @@ fn interpolate_error(path: &str, message: String) -> Error {
 
 // The per-field walk ==================================================================================================
 
-/// The `user.id` rejection, byte-exact: a test pins it. `pub(super)` (not
-/// private) so `resolve_shape` can raise the identical message when it
-/// carries this same rejection for a non-native backend.
+/// The `user.id` rejection, byte-exact: a test pins it. `pub(super)` so `resolve_shape` raises
+/// the identical message for a non-native backend.
 pub(super) const USER_ID_MESSAGE: &str = "`user.id` cannot be interpolated: a substituted value is always a string, so it \
                                would be read as a Windows SID; write the uid literally, or use `user: <name>`";
 
-/// The `env` name rejection, byte-exact — the `pub(super)` twin of
-/// [`USER_ID_MESSAGE`], for the same reason: `resolve_shape` raises this
-/// same message for every backend, not just the native merged spec `spec`
-/// walks here.
+/// The `env` name rejection, byte-exact; `pub(super)` for the same reason as [`USER_ID_MESSAGE`].
 pub(super) const ENV_NAME_MESSAGE: &str = "an `env` name cannot be interpolated: names are map keys, so an \
                                             interpolated one could silently overwrite another entry; write the \
                                             name literally";
 
-/// The daemon-id rejection, byte-exact — the `pub(super)` twin of
-/// [`USER_ID_MESSAGE`] and [`ENV_NAME_MESSAGE`]. `reject_interpolated_id`
-/// below is the only caller; the constant exists so the message lives in
-/// exactly one place regardless.
+/// The daemon-id rejection, byte-exact.
 const DAEMON_ID_MESSAGE: &str = "a daemon id cannot be interpolated: it names the installed service, so an \
                                   interpolated one could change which service this manifest installs; write the \
                                   id literally";
 
-/// The no-interpolation rule for the daemon id. `id` is the raw `id:` text,
-/// not yet checked against [`super::is_valid_id`]'s pattern — this must run
-/// *before* that check, or the id-pattern rejection (whose charset already
-/// excludes `$`) answers first with its more generic message. `resolve`'s
-/// step 1 is this rule's only caller; the id is never overridable, so there
-/// is no per-backend echo of it the way there is for the `env`-name and
-/// `user.id` rules below.
+/// The no-interpolation rule for the daemon id. `id` is the raw `id:` text; this must run
+/// *before* the [`super::is_valid_id`] check, whose charset excludes `$` and would answer first
+/// with a more generic message. The id is never overridable, so unlike the `env`-name and
+/// `user.id` rules there is no per-backend echo.
 pub(crate) fn reject_interpolated_id(id: &str) -> Result<()> {
     if would_substitution_change(id) {
         return Err(interpolate_error("id", DAEMON_ID_MESSAGE.to_string()));
@@ -304,11 +268,8 @@ pub(crate) fn reject_interpolated_id(id: &str) -> Result<()> {
 /// spec carrying no overrides: `resolve` calls it on the native backend's
 /// `merged_for` result, which becomes the returned spec.
 pub(crate) fn spec(raw: &mut RawSpec, vars: &Vars) -> Result<()> {
-    // Destructured rather than field-accessed on purpose: a field added to
-    // `RawSpec` stops compiling here until someone decides whether it
-    // interpolates. A walk that reads fields by name would silently skip
-    // the new one, and a silently skipped field is a literal `${VAR}` in a
-    // generated service artifact.
+    // Destructured so a field added to `RawSpec` stops compiling here until someone decides
+    // whether it interpolates; a skipped field is a literal `${VAR}` in a generated artifact.
     let RawSpec {
         // Checked by `reject_interpolated_id` before this ever runs.
         id: _,
@@ -350,11 +311,9 @@ pub(crate) fn spec(raw: &mut RawSpec, vars: &Vars) -> Result<()> {
 }
 
 /// Every substitutable `String` leaf of `raw` passes [`check_grammar`].
-/// Same walk [`spec`] does, same field paths, no [`Vars`] — grammar only,
-/// so it can run on a merged spec no `.env` has been loaded for yet.
-/// The daemon id, `env` names, and `user.id` need no grammar check here: a
-/// `$` anywhere in them is rejected outright (`reject_interpolated_id`, and
-/// the two rules moved into `resolve_shape`).
+/// Same walk and field paths as [`spec`], with no [`Vars`], so it can run before any `.env` is
+/// loaded. The daemon id, `env` names and `user.id` need no check here: a `$` in them is
+/// rejected outright (`reject_interpolated_id`, `resolve_shape`).
 pub(crate) fn check_spec_grammar(raw: &RawSpec) -> Result<()> {
     let RawSpec {
         id: _,
@@ -404,29 +363,22 @@ pub(crate) fn check_spec_grammar(raw: &RawSpec) -> Result<()> {
 
 fn check_user_grammar(user: &Option<RawUser>) -> Result<()> {
     match user {
-        // `Id` needs no grammar check: a `Uid` is a number substitution
-        // never touches, and a `$` in a `Sid` is rejected outright by
-        // `resolve_shape`, before this ever runs.
+        // `Id`: a `Uid` is a number, and a `$` in a `Sid` is rejected by `resolve_shape` first.
         None | Some(RawUser::Id(_)) => Ok(()),
         Some(RawUser::Scalar(text)) => check_grammar(text, "user"),
         Some(RawUser::Name(name)) => check_grammar(name, "user.name"),
     }
 }
 
-/// Whether any substitutable leaf of `raw` contains a `$`. Deliberately an
-/// over-approximation of "contains a reference", inherited from
-/// [`would_substitution_change`] — see the module doc comment.
+/// Whether any substitutable leaf of `raw` contains a `$`; an over-approximation inherited from
+/// [`would_substitution_change`].
 ///
-/// A `$` in an `env` name or a `user.id` does *not* count: it is an error
-/// [`spec`] (or `resolve_shape`, for a non-native backend) reports by
-/// itself, with a message naming the reason, and answering `true` here
-/// would make `resolve` read `.env` first and possibly replace that message
-/// with an unrelated IO failure. The daemon id is checked before this is
-/// ever called (`resolve`'s step 1), so it is skipped here.
+/// A `$` in an `env` name or a `user.id` does *not* count: [`spec`] (or `resolve_shape`) reports
+/// it with its own message, and answering `true` would make `resolve` read `.env` first and
+/// possibly replace that message with an unrelated IO failure. The daemon id is checked earlier
+/// (`resolve`'s step 1).
 pub(crate) fn spec_would_change(raw: &RawSpec) -> bool {
-    // Exhaustive for the same reason `spec` is: a new field must be
-    // considered here too, or `resolve` decides whether to read `.env` from
-    // a stale view of the manifest.
+    // Exhaustive for the same reason as `spec`.
     let RawSpec {
         id: _,
         name,
@@ -449,16 +401,12 @@ pub(crate) fn spec_would_change(raw: &RawSpec) -> bool {
         || user_would_change(user)
 }
 
-/// Substitute the authored `user:` text, whichever form it was written
-/// in. No reserved-word mapping happens here: `resolve::resolve_user`
-/// applies the `root` rule to the substituted text exactly as it does to
-/// authored text, so `user: ${U}` with `U=root` means what `user: root`
-/// means, and `{name: ${U}}` means what `{name: root}` means — a literal
-/// account named `root`, which is that form's entire purpose.
+/// Substitute the authored `user:` text, whichever form it was written in. The `root` rule is
+/// left to `resolve::resolve_user`, which applies it to substituted text as to typed text: `user:
+/// ${U}` with `U=root` means `user: root`, and `{name: ${U}}` means `{name: root}`.
 fn substitute_user(user: &mut Option<RawUser>, vars: &Vars) -> Result<()> {
     match user {
-        // A `Uid` is a number the YAML parser already produced — nothing a
-        // string could be substituted into.
+        // A `Uid` is already a number.
         None | Some(RawUser::Id(AccountId::Uid(_))) => Ok(()),
         Some(RawUser::Id(AccountId::Sid(sid))) => {
             if would_substitution_change(sid) {

@@ -2,19 +2,14 @@
 //! or `id`.
 //!
 //! [`RawUser`] is what deserializes; [`User`] is what `resolve` produces
-//! from it. They are separate types because the `root` reserved word
-//! applies to the bare string form *only* — see [`RawUser`] — and once a
-//! bare `root` has become `User::Root`, nothing records which syntax it
-//! came from, so the rule cannot be re-applied to a substituted value
-//! without also mis-applying it to the struct form.
+//! from it. They are separate because the `root` reserved word applies to
+//! the bare string form *only*, and once a bare `root` has become
+//! `User::Root` nothing records which syntax it came from, so the rule
+//! could not be re-applied to an interpolated value.
 //!
-//! `#[derive(Deserialize)]` with `#[serde(untagged)]` was tried and
-//! rejected for the deserialized type: serde's untagged deserializer
-//! buffers the whole value, tries every variant in turn, and on failure
-//! reports every attempt squashed into one message — for a struct with a
-//! typo'd field name, nothing in that message names the offending field.
-//! `RawUser`'s `Deserialize` is hand-written instead, so a bad value still
-//! does.
+//! `RawUser`'s `Deserialize` is hand-written, not `#[serde(untagged)]`: the
+//! untagged deserializer squashes every failed variant into one message
+//! that names no offending field.
 
 use std::fmt;
 
@@ -24,10 +19,8 @@ use serde::{Deserialize, Deserializer};
 use super::no_null::NULL_ACCOUNT_ID;
 
 /// The `user:` field exactly as authored, before the `root` reserved word
-/// is applied. `RawSpec` holds one of these so that interpolation can
-/// substitute the text and `resolve` can then apply that rule to the
-/// result, exactly as it would to text the author typed — see the module
-/// doc comment.
+/// is applied, so `resolve` can apply that rule to interpolated text exactly as to
+/// typed text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RawUser {
     /// A bare string: `user: root` or `user: bindreams`. The only form the
@@ -73,13 +66,9 @@ impl<'de> Deserialize<'de> for AccountId {
     }
 }
 
-/// Hand-written rather than `#[serde(untagged)]` for the reason the module
-/// doc comment gives, and for one more: an untagged enum buffers the value
-/// and reports every failed variant as a single message naming the Rust
-/// type, so an explicit `null` here read `data did not match any variant of
-/// untagged enum AccountId`. This is the position that decides a service's
-/// security principal, and `no_null`'s scan cannot answer it — that scan
-/// only ever runs on a document this parse has already accepted.
+/// Hand-written rather than `#[serde(untagged)]`, which reports an explicit `null` here as
+/// `data did not match any variant of untagged enum AccountId`. `no_null`'s scan cannot give a
+/// better message: it only runs on a document this parse has already accepted.
 struct AccountIdVisitor;
 
 impl<'de> Visitor<'de> for AccountIdVisitor {
