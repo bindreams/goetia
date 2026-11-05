@@ -30,8 +30,9 @@ pub fn daemon_log_path(id: &str, logs: Option<&Path>) -> PathBuf {
 /// The daemon's log, once the spec is decoded. One shim serves one service, so one path.
 static DAEMON_LOG: OnceLock<PathBuf> = OnceLock::new();
 
-/// From now on, failures go to `path` (see [`daemon_log_path`]) instead of the default. Call once,
-/// right after the spec decodes; a later call changes nothing.
+/// From now on, failures go to `path` (see [`daemon_log_path`]) instead of the default. Call right
+/// after the spec decodes. A second call must carry the same path; a different one is a caller bug,
+/// debug-asserted.
 pub fn set_daemon_log(path: PathBuf) {
     if let Err(second) = DAEMON_LOG.set(path) {
         debug_assert_eq!(Some(&second), DAEMON_LOG.get(), "the daemon's log is set once");

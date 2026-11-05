@@ -14,9 +14,8 @@ use windows_sys::Win32::System::Services::{
     SERVICE_NOTIFY_STOP_PENDING, SERVICE_NOTIFY_STOPPED, SERVICE_STOP_PENDING, SERVICE_STOPPED,
 };
 
-use crate::common::{LogDir, ShimGuard, conformance_mk, fixture_command, simple_spec};
+use crate::common::{LogDir, ShimGuard, arm_and_wait, conformance_mk, fixture_command, simple_spec};
 use crate::deny::Denied;
-use crate::support::service_notify::arm_and_wait;
 use crate::support::{self, ELEVATED};
 
 /// The same cross-process lock `tests/scm_integration/managed.rs` declares,

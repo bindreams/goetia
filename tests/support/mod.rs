@@ -18,8 +18,6 @@ pub mod sentinel;
 #[cfg(windows)]
 pub mod service_ctrl;
 pub mod service_guard;
-#[cfg(windows)]
-pub mod service_notify;
 
 use std::fs;
 use std::path::PathBuf;

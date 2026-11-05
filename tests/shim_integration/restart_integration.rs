@@ -326,8 +326,7 @@ fn a_daemon_that_cannot_be_spawned_fails_start_under_every_policy() {
         let line = format!("goetia-shim[{id}]: spawn ");
         assert!(
             log.lines().any(|l| l.starts_with(&line)),
-            "{restart:?}: no spawn failure in:
-{log}"
+            "{restart:?}: no spawn failure in:\n{log}"
         );
     }
 }
