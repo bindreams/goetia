@@ -150,13 +150,14 @@ fn seed_dropin(dir: &Path, root: Option<PathBuf>) -> RmDropin {
 /// PROPERTY=VALUE` writes, and the two highest-precedence entries on the system unit search path,
 /// both above `/etc/systemd/system`.
 ///
-/// The root is removed along with the drop-in. Each test that seeds one takes a *different* root, so
-/// no concurrently running test can be inside the one this removes — and the removal is
-/// `remove_dir`, so a root systemd itself populated for some other unit fails to go and is left as
-/// it was found.
+/// The root is removed along with the drop-in only where this call created it. Each test that seeds
+/// one takes a *different* root, so no concurrently running test can be inside the one this removes
+/// — and the removal is `remove_dir`, so a root systemd itself populated for some other unit fails
+/// to go and is left as it was found.
 fn seed_control_dropin(root: &str, id: &str) -> (PathBuf, RmDropin) {
-    let leaf = PathBuf::from(root).join(format!("{id}.service.d"));
-    let guard = seed_dropin(&leaf, Some(PathBuf::from(root)));
+    let root_path = PathBuf::from(root);
+    let leaf = root_path.join(format!("{id}.service.d"));
+    let guard = seed_dropin(&leaf, (!root_path.exists()).then_some(root_path));
     (leaf, guard)
 }
 
@@ -837,13 +838,17 @@ impl StopHolder {
 impl Drop for StopHolder {
     fn drop(&mut self) {
         self.release();
+        // `start` builds the holder before writing the unit or the lock, so a failed start leaves
+        // either unmade: exit 5 is "unit not loaded", and a missing file is already gone.
         let run = cmd::run("systemctl", &["stop", &self.unit]);
-        if !run.ok() {
+        if !run.ok() && run.code != Some(5) {
             eprintln!("StopHolder[{}]: cleanup failed: {run}", self.unit);
         }
         for path in [&self.path, &self.lock] {
-            if let Err(e) = fs::remove_file(path) {
-                eprintln!("StopHolder[{}]: remove {}: {e}", self.unit, path.display());
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => eprintln!("StopHolder[{}]: remove {}: {e}", self.unit, path.display()),
             }
         }
         let run = cmd::run("systemctl", &["daemon-reload"]);

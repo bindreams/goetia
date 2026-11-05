@@ -771,9 +771,10 @@ struct LocalUserGuard {
 
 impl LocalUserGuard {
     fn create(name: &str, password: &str) -> Self {
-        let guard = Self { name: name.to_string() };
+        // Built after the add, not before: `/add` is atomic, so on failure nothing
+        // was created and a guard would delete an account this test did not make.
         support::cmd::run("net.exe", &["user", name, password, "/add"]).expect_ok();
-        guard
+        Self { name: name.to_string() }
     }
 }
 

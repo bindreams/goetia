@@ -49,9 +49,9 @@ fn remove_path(path: &std::path::Path, dir: bool) -> Option<String> {
     }
 }
 
-/// These probes never `systemctl enable`, so there is no `.wants` symlink to
-/// undo; a drop-in directory is removed anyway because a leftover one would
-/// poison the next install of the same id.
+/// Removes the fragment, its drop-in directory (a leftover one would poison the
+/// next install of the same id) and the `multi-user.target.wants` symlink a
+/// test that enabled the unit leaves.
 #[cfg(target_os = "linux")]
 fn cleanup(id: &str) -> Vec<String> {
     let mut problems = Vec::new();
@@ -65,6 +65,10 @@ fn cleanup(id: &str) -> Vec<String> {
     }
     problems.extend(remove_path(&path, false));
     problems.extend(remove_path(&path.with_file_name(format!("{unit}.d")), true));
+    let wants = std::path::PathBuf::from(SYSTEMD_UNIT_DIR)
+        .join("multi-user.target.wants")
+        .join(&unit);
+    problems.extend(remove_path(&wants, false));
     let reload = cmd::run("systemctl", &["daemon-reload"]);
     if !reload.ok() {
         problems.push(reload.to_string());
@@ -95,24 +99,47 @@ fn cleanup(id: &str) -> Vec<String> {
 fn cleanup(id: &str) -> Vec<String> {
     let mut problems = Vec::new();
 
-    // `sc.exe` exits with the Win32 error: 1060 is ERROR_SERVICE_DOES_NOT_EXIST
-    // and 1062 is ERROR_SERVICE_NOT_ACTIVE.
+    // `sc.exe` exits with the Win32 error: 1060 is ERROR_SERVICE_DOES_NOT_EXIST,
+    // 1062 is ERROR_SERVICE_NOT_ACTIVE and 1072 is ERROR_SERVICE_MARKED_FOR_DELETE
+    // (see below).
     let stop = cmd::run("sc.exe", &["stop", id]);
-    if !stop.ok() && !matches!(stop.code, Some(1060 | 1062)) {
+    if !stop.ok() && !matches!(stop.code, Some(1060 | 1062 | 1072)) {
         problems.push(stop.to_string());
     }
-    // 1072 is ERROR_SERVICE_MARKED_FOR_DELETE, already gone: `uninstall` may return while the record is only
-    // marked for deletion, and SCM drops it once its last handle closes.
+    // A stop that took returns at STOP_PENDING while the shim is still writing
+    // its log, which would otherwise be removed under it. Any other query
+    // failure ends the wait and is reported.
+    if stop.ok() {
+        loop {
+            let query = cmd::run("sc.exe", &["query", id]);
+            if query.ok() {
+                if query.stdout.contains("STOPPED") {
+                    break;
+                }
+            } else {
+                if query.code != Some(1060) {
+                    problems.push(query.to_string());
+                }
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    // 1072: `uninstall` may return while the record is only marked for deletion;
+    // SCM drops it once its last handle closes. Nothing is left to delete.
     let delete = cmd::run("sc.exe", &["delete", id]);
     if !delete.ok() && !matches!(delete.code, Some(1060 | 1072)) {
         problems.push(delete.to_string());
     }
-    // The shim's fallback log, `%ProgramData%\Goetia\logs\<id>.log`, outlives the service.
-    if let Some(program_data) = std::env::var_os("ProgramData") {
-        let log = std::path::PathBuf::from(program_data)
-            .join(r"Goetia\logs")
-            .join(format!("{id}.log"));
-        problems.extend(remove_path(&log, false));
-    }
+    // The shim's fallback log outlives the service.
+    problems.extend(remove_path(&shim_log_dir().join(format!("{id}.log")), false));
     problems
+}
+
+/// `%ProgramData%\Goetia\logs`, where the shim writes `<id>.log`. Mirrors
+/// `logging::default_log_path`, which the test crate cannot import.
+#[cfg(windows)]
+pub fn shim_log_dir() -> std::path::PathBuf {
+    let program_data = std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into());
+    std::path::PathBuf::from(program_data).join(r"Goetia\logs")
 }
