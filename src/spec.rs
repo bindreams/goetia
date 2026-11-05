@@ -32,6 +32,8 @@ pub(crate) use resolve::{
     reject_unemittable,
 };
 // Read by `crate::backend::scm::generate`, which cannot see through the private `mod backend;`.
+// `windows_only_account` stays out of this line: only `BackendKind::error` reads it, inside
+// `spec::backend`.
 pub(crate) use backend::{scm_restart_delay, windows_builtin};
 // Named from `generate_tests.rs` alone.
 #[cfg(test)]

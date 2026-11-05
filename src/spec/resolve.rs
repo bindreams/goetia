@@ -15,8 +15,9 @@
 //! `command[1..]` is the launched program's to resolve, against its working
 //! directory. `command[0]` has a defined role, and systemd, launchd and
 //! Windows services disagree about a relative value (systemd rejects
-//! `bin/frpc`; launchd silently resolves it against the default working
-//! directory; Windows against `System32`). Absolutizing it against the
+//! `bin/frpc`; launchd silently resolves it against the job's working
+//! directory, the default one when `cwd` is unset; Windows against
+//! `System32`). Absolutizing it against the
 //! manifest's directory before any backend sees it gives one rule that does
 //! not depend on where the daemon starts.
 //!
@@ -274,7 +275,8 @@ fn resolve_shape(id: &Id, raw: RawSpec, base_dir: &Path) -> Result<(ShapedSpec, 
     let mut env = BTreeMap::new();
     for (key, value) in raw.env {
         // Checked here so it runs for every backend: `scm: {env: {"${K}": v}}` must be caught
-        // from Linux too.
+        // from Linux too. Deliberately duplicates the check in `interpolate::spec`, which runs
+        // only on the native merged spec: the two have different reach, so do not collapse them.
         if interpolate::would_substitution_change(&key) {
             return Err(invalid(id, interpolate::ENV_NAME_MESSAGE));
         }
@@ -293,7 +295,8 @@ fn resolve_shape(id: &Id, raw: RawSpec, base_dir: &Path) -> Result<(ShapedSpec, 
             reject_blank(id, "user.name", n)?;
         }
         User::Id(AccountId::Sid(s)) => {
-            // Checked here for the same reason as the `env`-name rule above.
+            // Checked here for the same reason, and likewise a deliberate duplicate of the
+            // `interpolate::spec` check, as the `env`-name rule above.
             if interpolate::would_substitution_change(s) {
                 return Err(invalid(id, interpolate::USER_ID_MESSAGE));
             }
@@ -493,9 +496,9 @@ fn resolve_optional_path(
 /// Uses `Path::is_absolute`, not a string prefix check, since POSIX and Windows differ.
 ///
 /// Not a pure function of `(value, base_dir)`: `std::path::absolute`'s drive-relative fallback
-/// reads the per-drive current directory. But every pass `resolve` makes runs in one process, so
-/// identical values get identical verdicts, which makes "the base pass passed, so this failure
-/// is the override's" sound.
+/// reads the per-drive current directory. But every pass `resolve` makes runs in one process
+/// against one unchanging process state, so identical values get identical verdicts, which makes
+/// "the base pass passed, so this failure is the override's" sound.
 fn resolve_path_string(
     id: &Id,
     field: &str,
@@ -608,8 +611,9 @@ fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error>
 /// installing from `C:\App` and diffing from `C:\app` do not report phantom drift.
 ///
 /// When this fails, every subcommand that loads a manifest by a relative `-f` (including the
-/// default `-f .`) fails from that directory. The owner accepted that: a fallback to the
-/// uncanonicalised directory would trade a loud refusal for silent phantom drift on Windows.
+/// default `-f .`) fails from that directory. That is an accepted limitation, decided by the
+/// owner: the reachable causes are narrow, and a fallback to the uncanonicalised directory would
+/// trade a loud refusal for silent phantom drift on Windows. Revisit if one shows up in use.
 ///
 /// The failure causes (an unreadable path component on Unix; a refused open or a volume with no
 /// DOS path on Windows) are the ones the message names. A
@@ -679,7 +683,8 @@ fn normalize(path: &Path) -> PathBuf {
 }
 
 /// Every gate a user-supplied string must pass before it can be emitted into any artifact. One
-/// entry point, so a field added later cannot pick up half the checks; each fails silently.
+/// entry point, so a field added later cannot pick up half the checks. Each defect they catch
+/// would be silent if no gate did.
 ///
 /// systemd's `Description=`/`Environment=`, launchd's `UserName` and every other emitted
 /// directive have no escaping, and a control character (above all a newline) can terminate one
@@ -768,10 +773,10 @@ pub(crate) fn reject_empty(id: &Id, field: &str, value: &str) -> Result<(), Erro
 /// to `user.name` and `user.id` (the `Sid` arm), never to a path or an `env` key. The asymmetry
 /// is deliberate:
 ///
-/// - A whitespace-only `User=` is not rejected by systemd and resets to root, exactly as an
-///   empty one does (even `systemd-analyze verify` accepts it), so goetia is the only gate.
-///   The value either silently becomes root or names an
-///   account that cannot exist.
+/// - systemd rejects neither a whitespace-only `User=` nor an empty one (`systemd-analyze verify`
+///   accepts both alike), so goetia is the only gate. An empty `User=` resets to root; a
+///   whitespace-only value reaching the unit either does the same or names an account that
+///   cannot exist.
 /// - A path has no such default: a file named `" "` is legal on Unix, and an all-whitespace
 ///   `cwd`/`logs`/`command[0]` simply fails to resolve.
 /// - Whether an `env` key may contain a space at all is a separate question; only its

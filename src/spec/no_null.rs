@@ -40,7 +40,9 @@
 //! So the typed parse goes first and owns unknown fields, duplicate keys
 //! and type errors, and only a structurally valid document reaches the scan.
 //! Anything else the scan objects to is something the typed parse already
-//! accepted, and is discarded. Discarding means *keep walking*: each
+//! accepted, and is discarded, not avoided: `yaml_serde` checks the tag
+//! before the visitor is reached, so the scan cannot decline to see it,
+//! only decline to report it. Discarding means *keep walking*: each
 //! container skips the node it could not read and carries on, so a `null`
 //! after a tag the scan could not read is still found.
 //!
