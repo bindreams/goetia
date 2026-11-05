@@ -58,9 +58,10 @@ fn hand_edit(id: &str) {
 fn simple_passes_conformance() {
     let mgr = goetia::backend::scm::manager::Scm::new();
 
-    seed_foreign(conformance::FOREIGN_ID);
     let _foreign_guard = ServiceGuard::new(conformance::FOREIGN_ID);
+    seed_foreign(conformance::FOREIGN_ID);
 
+    let _hand_edited_guard = ServiceGuard::new(conformance::HAND_EDITED_ID);
     mgr.install(&conformance_mk(conformance::HAND_EDITED_ID), false)
         .expect("seed install for the hand-edit scenario");
     hand_edit(conformance::HAND_EDITED_ID);

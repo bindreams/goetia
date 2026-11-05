@@ -346,10 +346,12 @@ fn systemd_passes_conformance() {
     let mgr = Systemd::new();
 
     // The three ids `conformance::run` cannot produce through the trait's own methods - see its
-    // module doc comment. `run` cleans up `HAND_EDITED_ID` itself; the other two are ours.
+    // module doc comment. All three are guarded here before their seed is written; `run` also
+    // removes `HAND_EDITED_ID`, which makes its guard's removal a no-op.
     let foreign_guard = ServiceGuard::new(conformance::FOREIGN_ID);
     seed_foreign(foreign_guard.id());
 
+    let _hand_edited_guard = ServiceGuard::new(conformance::HAND_EDITED_ID);
     mgr.install(&mk(conformance::HAND_EDITED_ID), false)
         .expect("seed hand-edited install");
     hand_edit(conformance::HAND_EDITED_ID);

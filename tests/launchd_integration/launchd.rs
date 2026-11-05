@@ -149,13 +149,15 @@ fn may_account_for(listed: &[Installed], id: &str) -> bool {
 /// Installs `spec` through `mgr` and `uninstall`s it on drop. Covers both
 /// the staging and enabled locations — `uninstall` locates the artifact
 /// wherever it currently lives — so a test that calls `enable` doesn't need
-/// a second guard.
+/// a second guard. The guard exists before the write, so an install that
+/// writes and then fails is still cleaned up.
 struct Guard(Id);
 
 impl Guard {
     fn install(mgr: &Launchd, spec: &DaemonSpec) -> Self {
+        let guard = Self(spec.id.clone());
         mgr.install(spec, false).expect("seed install");
-        Self(spec.id.clone())
+        guard
     }
 }
 
@@ -196,13 +198,15 @@ fn launchd_passes_conformance() {
     // never writes to or removes (see `manager::conformance`'s module doc
     // comment) — cleaned up here, not by `run`.
     let foreign_path = staging_path(manager::conformance::FOREIGN_ID);
+    let _foreign_cleanup = FileGuard(foreign_path.clone());
     write_plist(&foreign_path, &foreign_plist(manager::conformance::FOREIGN_ID));
-    let _foreign_cleanup = FileGuard(foreign_path);
 
     // Seed `HAND_EDITED_ID`: install normally, then hand-edit the result so
     // it no longer matches what regenerating its own embedded spec would
-    // produce. `run` uninstalls this one itself.
+    // produce. Guarded here so a panic before `run` leaves nothing behind;
+    // `run` uninstalls it too, which makes the guard's removal a no-op.
     let spec = sleepy(manager::conformance::HAND_EDITED_ID);
+    let _hand_edited_cleanup = Guard(spec.id.clone());
     mgr.install(&spec, false).expect("seed install");
     let path = staging_path(manager::conformance::HAND_EDITED_ID);
     let mut text = std::fs::read_to_string(&path).expect("read seeded artifact");

@@ -1,5 +1,8 @@
 //! RAII cleanup for the real system services the probes register.
 //!
+//! A guard exists before the write it cleans up: a write that lands and then
+//! fails or panics must still be removed.
+//!
 //! `Drop` cannot return a `Result`, so every failure other than "not found" is
 //! logged to stderr naming the id and the error. A cleanup failure that
 //! reports nothing surfaces later only as a mysterious straggler in
