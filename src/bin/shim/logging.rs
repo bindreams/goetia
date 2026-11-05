@@ -53,13 +53,7 @@ pub fn open_append(path: &Path) -> std::io::Result<File> {
 /// Writes `line` and a newline in one `write`, so output another handle appends in between cannot
 /// split the line.
 pub fn append_line(out: &mut impl std::io::Write, line: &str) -> std::io::Result<()> {
-    out.write_all(
-        format!(
-            "{line}
-"
-        )
-        .as_bytes(),
-    )
+    out.write_all(format!("{line}\n").as_bytes())
 }
 
 // Windows Event Log ===================================================================================================
@@ -195,10 +189,11 @@ fn write_channels(
 }
 
 /// The files to try for a line, in order: the daemon's log, then the default. When they are the
-/// same file, it is tried once.
+/// same file (Windows paths compare case-insensitively), it is tried once.
 fn log_destinations(daemon_log: Option<&Path>, default: PathBuf) -> Vec<PathBuf> {
+    let same = |a: &Path, b: &Path| a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase();
     match daemon_log {
-        Some(path) if path != default => vec![path.to_path_buf(), default],
+        Some(path) if !same(path, &default) => vec![path.to_path_buf(), default],
         Some(_) | None => vec![default],
     }
 }

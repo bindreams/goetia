@@ -202,14 +202,7 @@ fn append_line_is_one_write_so_daemon_output_cannot_land_between_text_and_newlin
 
     append_line(&mut out, "the line").expect("the write succeeds");
 
-    assert_eq!(
-        out.writes,
-        vec![
-            b"the line
-"
-            .to_vec()
-        ]
-    );
+    assert_eq!(out.writes, vec![b"the line\n".to_vec()]);
 }
 
 #[skuld::test]
@@ -257,4 +250,12 @@ fn log_destinations_do_not_retry_the_default_when_it_is_the_daemon_log() {
     let default = PathBuf::from("default.log");
 
     assert_eq!(log_destinations(Some(&default), default.clone()), vec![default]);
+}
+
+#[skuld::test]
+fn log_destinations_compare_paths_case_insensitively() {
+    let default = PathBuf::from(r"C:\ProgramData\Goetia\logs\svc.log");
+    let daemon = PathBuf::from(r"c:\programdata\goetia\LOGS\svc.log");
+
+    assert_eq!(log_destinations(Some(&daemon), default.clone()), vec![default]);
 }
