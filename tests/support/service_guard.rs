@@ -11,15 +11,36 @@
 //! reports nothing surfaces later only as a mysterious straggler in
 //! `systemctl` / `launchctl` / `services.msc`, long after the run that left it.
 
+use std::time::{Duration, Instant};
+
 use super::{LAUNCHD_DAEMON_DIR, SYSTEMD_UNIT_DIR, cmd};
 
 pub struct ServiceGuard {
     id: String,
+    /// A file the service's process may write and nothing else removes; see [`Self::with_leftover`].
+    #[cfg(windows)]
+    leftover: Option<std::path::PathBuf>,
 }
 
 impl ServiceGuard {
     pub fn new(id: impl Into<String>) -> Self {
-        Self { id: id.into() }
+        Self {
+            id: id.into(),
+            #[cfg(windows)]
+            leftover: None,
+        }
+    }
+
+    /// A guard that, after its stop and delete, also removes `leftover`: a file the service's
+    /// process may create, such as the shim's failure log. It waits for the service to be `STOPPED`
+    /// first (a gone service counts), since a process that has reported `STOPPED` writes nothing
+    /// more; if that takes longer than [`CLEANUP_BOUND`] it warns, naming the file, and leaves it.
+    #[cfg(windows)]
+    pub fn with_leftover(id: impl Into<String>, leftover: std::path::PathBuf) -> Self {
+        Self {
+            id: id.into(),
+            leftover: Some(leftover),
+        }
     }
 
     pub fn id(&self) -> &str {
@@ -29,11 +50,19 @@ impl ServiceGuard {
 
 impl Drop for ServiceGuard {
     fn drop(&mut self) {
-        for problem in cleanup(&self.id) {
+        #[cfg(windows)]
+        let leftover = self.leftover.as_ref().and_then(|path| remove_leftover(&self.id, path));
+        #[cfg(not(windows))]
+        let leftover: Option<String> = None;
+        for problem in cleanup(&self.id).into_iter().chain(leftover) {
             eprintln!("ServiceGuard[{}]: cleanup failed: {problem}", self.id);
         }
     }
 }
+
+/// How long a cleanup waits on a transient condition of unknown duration (an antivirus holding a
+/// file, a process still exiting) before it lets go with a warning. The owner's bound.
+pub const CLEANUP_BOUND: Duration = Duration::from_secs(5);
 
 /// Removes a file, or a directory tree when `dir`; "not found" is success, any other failure is
 /// returned as a message for the caller to log.
@@ -47,6 +76,17 @@ pub fn remove_path(path: &std::path::Path, dir: bool) -> Option<String> {
         Ok(()) => None,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => Some(format!("remove {}: {e}", path.display())),
+    }
+}
+
+/// [`remove_path`], retried until it succeeds or [`CLEANUP_BOUND`] passes; then the last problem.
+pub fn remove_path_retrying(path: &std::path::Path, dir: bool) -> Option<String> {
+    let start = Instant::now();
+    loop {
+        match remove_path(path, dir) {
+            Some(_) if start.elapsed() < CLEANUP_BOUND => std::thread::sleep(Duration::from_millis(100)),
+            problem => return problem,
+        }
     }
 }
 
@@ -113,4 +153,38 @@ fn cleanup(id: &str) -> Vec<String> {
         problems.push(delete.to_string());
     }
     problems
+}
+
+/// Removes `leftover` once `id` is `STOPPED` or gone; otherwise the reason it was left.
+#[cfg(windows)]
+fn remove_leftover(id: &str, leftover: &std::path::Path) -> Option<String> {
+    use windows_service::service::ServiceAccess;
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+    use windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
+    use windows_sys::Win32::System::Services::SERVICE_NOTIFY_STOPPED;
+
+    use super::service_notify::arm_and_wait;
+
+    let deadline = Instant::now() + CLEANUP_BOUND;
+    let left = |why: String| Some(format!("left {}: {why}", leftover.display()));
+    let gone = |e: &std::io::Error| e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32);
+
+    let manager = match ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT) {
+        Ok(manager) => manager,
+        Err(e) => return left(format!("connect to the service manager: {e}")),
+    };
+    match manager.open_service(id, ServiceAccess::QUERY_STATUS) {
+        Ok(service) => match arm_and_wait(&service, SERVICE_NOTIFY_STOPPED, Some(deadline)) {
+            Ok(wait) => {
+                if wait().is_none() {
+                    return left(format!("the service was not stopped after {CLEANUP_BOUND:?}"));
+                }
+            }
+            Err(e) if gone(&e) => {}
+            Err(e) => return left(format!("watch the service stop: {e}")),
+        },
+        Err(windows_service::Error::Winapi(e)) if gone(&e) => {}
+        Err(e) => return left(format!("open the service: {e}")),
+    }
+    remove_path_retrying(leftover, false)
 }

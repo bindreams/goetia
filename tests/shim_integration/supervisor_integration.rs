@@ -15,16 +15,16 @@ use goetia::spec::{DaemonSpec, Restart};
 use windows_service::service::{ServiceExitCode, ServiceState};
 use winreg::enums::KEY_WRITE;
 
-use crate::common::{LogDir, fixture_command, recorded_exit, scm_status, simple_spec};
+use crate::common::{LogDir, fixture_command, recorded_exit, scm_status, shim_guard, simple_spec};
 use crate::support::registry::{parameters_key, service_key};
-use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
+use crate::support::{self, ConnectBack, ELEVATED};
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn shim_runs_child_with_cwd_and_env() {
     let id = support::random_test_id();
     let logs = LogDir::new();
     let mgr = Scm::new();
-    let _guard = ServiceGuard::new(&id);
+    let _guard = shim_guard(&id);
     let reported = ConnectBack::listen();
 
     let mut env = BTreeMap::new();
@@ -64,7 +64,7 @@ fn shim_captures_stdout_to_logs_path() {
     let id = support::random_test_id();
     let logs = LogDir::new();
     let mgr = Scm::new();
-    let _guard = ServiceGuard::new(&id);
+    let _guard = shim_guard(&id);
     let reported = ConnectBack::listen();
     let log_path = logs.path_for(&id);
     const MARKER: &str = "goetia-shim-log-capture-probe";
@@ -94,7 +94,7 @@ fn stop_kills_the_whole_process_tree() {
     let id = support::random_test_id();
     let logs = LogDir::new();
     let mgr = Scm::new();
-    let _guard = ServiceGuard::new(&id);
+    let _guard = shim_guard(&id);
     let child_reported = ConnectBack::listen();
     let grandchild_reported = ConnectBack::listen();
 
@@ -159,7 +159,7 @@ fn unreadable_blob_logs_to_fallback_path_and_event_log() {
     let id = support::random_test_id();
     let logs = LogDir::new();
     let mgr = Scm::new();
-    let _guard = ServiceGuard::new(&id);
+    let _guard = shim_guard(&id);
 
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
     mgr.install(&spec, false).expect("install");
@@ -188,7 +188,7 @@ fn unreadable_blob_logs_to_fallback_path_and_event_log() {
         "an undecodable blob is a shim failure: {status:?}"
     );
 
-    let fallback_log = logs.path().join("Goetia").join("logs").join(format!("{id}.log"));
+    let fallback_log = support::shim_default_log(logs.path(), &id);
     let logged = std::fs::read_to_string(&fallback_log)
         .unwrap_or_else(|e| panic!("read the fallback log {}: {e}", fallback_log.display()));
     assert!(

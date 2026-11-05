@@ -1,21 +1,15 @@
 //! Shared helpers for the `type: simple` integration tests.
 
-use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration, Instant};
 
 use goetia::backend::scm::exit_status::RecordedExit;
 use goetia::spec::{DaemonSpec, Kind};
-use windows_service::service::{Service, ServiceAccess, ServiceState, ServiceStatus};
+use windows_service::service::{ServiceAccess, ServiceState, ServiceStatus};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
-use windows_sys::Win32::System::Services::{
-    NotifyServiceStatusChangeW, SERVICE_NOTIFY_2W, SERVICE_NOTIFY_RUNNING, SERVICE_NOTIFY_STATUS_CHANGE,
-    SERVICE_RUNNING,
-};
-use windows_sys::Win32::System::Threading::{INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, SleepEx, WaitForSingleObject};
+use windows_sys::Win32::System::Services::{SERVICE_NOTIFY_RUNNING, SERVICE_RUNNING};
+use windows_sys::Win32::System::Threading::{INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
 
 use crate::fixture;
 use crate::support;
@@ -30,17 +24,19 @@ pub fn fixture_command(mode: &str, args: &[&str]) -> Vec<String> {
     v
 }
 
+/// A [`support::ServiceGuard`] for a shim-hosted service `id` that also removes the file its shim
+/// writes when it fails before it has read the daemon's config (`%ProgramData%\Goetia\logs\<id>.log`).
+pub fn shim_guard(id: &str) -> support::ServiceGuard {
+    support::ServiceGuard::with_leftover(id, support::shim_default_log(&support::program_data(), id))
+}
+
 /// A temp dir the test owns, for everything its daemons write: their logs, which the shims' own
 /// failure lines join once they have read the spec.
 ///
-/// Removed on drop, retried for up to [`REMOVE_BOUND`] and then let go with a warning: a daemon may
-/// still hold its log while its service stops. Declare it before the test's [`support::ServiceGuard`]s,
-/// which then drop first.
+/// Removed on drop, retried for [`support::service_guard::CLEANUP_BOUND`] and then let go with a
+/// warning: a daemon may still hold its log while its service stops. Declare it before the test's
+/// [`support::ServiceGuard`]s, which then drop first.
 pub struct LogDir(PathBuf);
-
-/// How long a failed removal of a [`LogDir`] is retried. The owner's bound for a transient failure of
-/// unknown duration (antivirus, a process still exiting with a file open).
-const REMOVE_BOUND: Duration = Duration::from_secs(5);
 
 impl LogDir {
     pub fn new() -> Self {
@@ -60,13 +56,8 @@ impl LogDir {
 
 impl Drop for LogDir {
     fn drop(&mut self) {
-        let start = Instant::now();
-        loop {
-            match support::service_guard::remove_path(&self.0, true) {
-                None => return,
-                Some(problem) if start.elapsed() >= REMOVE_BOUND => return eprintln!("LogDir: {problem}"),
-                Some(_) => std::thread::sleep(Duration::from_millis(100)),
-            }
+        if let Some(problem) = support::service_guard::remove_path_retrying(&self.0, true) {
+            eprintln!("LogDir: {problem}");
         }
     }
 }
@@ -99,63 +90,6 @@ pub fn scm_status(id: &str) -> ServiceStatus {
         .unwrap_or_else(|e| panic!("open service {id}: {e}"))
         .query_status()
         .unwrap_or_else(|e| panic!("query status of {id}: {e}"))
-}
-
-/// What one `NotifyServiceStatusChangeW` delivery said, written by the APC and read by the waiter
-/// on the same thread.
-struct Delivery {
-    fired: AtomicBool,
-    state: AtomicU32,
-    controls_accepted: AtomicU32,
-}
-
-unsafe extern "system" fn record_delivery(parameter: *const c_void) {
-    let notify = parameter.cast::<SERVICE_NOTIFY_2W>();
-    // SAFETY: SCM hands back the buffer registered in `arm`, whose `pContext` is the leaked
-    // `Delivery`.
-    let (delivery, status) = unsafe { (&*(*notify).pContext.cast::<Delivery>(), &(*notify).ServiceStatus) };
-    delivery.state.store(status.dwCurrentState, Ordering::Release);
-    delivery
-        .controls_accepted
-        .store(status.dwControlsAccepted, Ordering::Release);
-    delivery.fired.store(true, Ordering::Release);
-}
-
-/// Arm `mask` on `service` and block, alertably, until SCM delivers it. Returns
-/// `(state, controls_accepted)` of the delivery. Armed on a state that does not match `mask` yet,
-/// so the delivery is the transition.
-pub fn arm_and_wait(service: &Service, mask: u32) -> impl FnOnce() -> (u32, u32) {
-    // Leaked: SCM may still hold the registration if the test panics before the delivery.
-    let delivery: &'static Delivery = Box::leak(Box::new(Delivery {
-        fired: AtomicBool::new(false),
-        state: AtomicU32::new(0),
-        controls_accepted: AtomicU32::new(0),
-    }));
-    let notify: &'static mut SERVICE_NOTIFY_2W = Box::leak(Box::new(SERVICE_NOTIFY_2W {
-        dwVersion: SERVICE_NOTIFY_STATUS_CHANGE,
-        pfnNotifyCallback: Some(record_delivery),
-        pContext: (delivery as *const Delivery as *mut Delivery).cast(),
-        ..Default::default()
-    }));
-    // SAFETY: the handle has `SERVICE_QUERY_STATUS`; `notify` is leaked and so outlives the
-    // registration.
-    let error = unsafe { NotifyServiceStatusChangeW(service.raw_handle(), mask, notify) };
-    assert_eq!(
-        error,
-        0,
-        "NotifyServiceStatusChangeW: {}",
-        std::io::Error::from_raw_os_error(error as i32)
-    );
-    move || {
-        while !delivery.fired.load(Ordering::Acquire) {
-            // SAFETY: plain FFI call; an alertable wait is what lets the APC run.
-            unsafe { SleepEx(INFINITE, 1) };
-        }
-        (
-            delivery.state.load(Ordering::Acquire),
-            delivery.controls_accepted.load(Ordering::Acquire),
-        )
-    }
 }
 
 /// Both exit codes SCM holds for `id`, from `sc query`. `ServiceStatus::exit_code` cannot show a
@@ -211,7 +145,9 @@ impl ShimProcess {
             .open_service(id, ServiceAccess::QUERY_STATUS)
             .unwrap_or_else(|e| panic!("open service {id}: {e}"));
         // Armed before the read; a service that already runs delivers at once.
-        let (state, _) = arm_and_wait(&service, SERVICE_NOTIFY_RUNNING)();
+        let (state, _) = support::service_notify::arm_and_wait(&service, SERVICE_NOTIFY_RUNNING, None)
+            .expect("arm the RUNNING notification")()
+        .expect("an unbounded wait delivers");
         assert_eq!(state, SERVICE_RUNNING, "the notification for RUNNING");
         let running = service
             .query_status()

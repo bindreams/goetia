@@ -18,6 +18,8 @@ pub mod sentinel;
 #[cfg(windows)]
 pub mod service_ctrl;
 pub mod service_guard;
+#[cfg(windows)]
+pub mod service_notify;
 
 use std::fs;
 use std::path::PathBuf;
@@ -83,6 +85,22 @@ pub fn wide_null(s: &str) -> Vec<u16> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
+}
+
+/// The host's `%ProgramData%`.
+#[cfg(windows)]
+pub fn program_data() -> PathBuf {
+    std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("%ProgramData% is not set on this host"))
+}
+
+/// Where the shim of service `id` writes a failure it reports before it has read the daemon's
+/// config: `<program_data>\Goetia\logs\<id>.log`. `program_data` is the real `%ProgramData%`
+/// ([`program_data`]), or the one a test gave the service through its `Environment` value.
+#[cfg(windows)]
+pub fn shim_default_log(program_data: &std::path::Path, id: &str) -> PathBuf {
+    program_data.join("Goetia").join("logs").join(format!("{id}.log"))
 }
 
 /// Base64 the size of a worst-case spec blob. systemd historically applied a
