@@ -1,16 +1,13 @@
 //! `goetia daemon diff [-f FILE]`
 //!
-//! Read-only: never checks elevation. Always needs a manager (comparing
-//! against installed state is the whole point), `-f` or not.
+//! Read-only: never checks elevation. Always needs a manager, `-f` or not.
 //!
-//! Renders [`ServiceManager::preview_install`] — the exact same
-//! [`crate::decide::decide`] call `install` itself uses — rather than
-//! reimplementing a partial version of that policy against `list()`'s
-//! output. That is deliberate, not merely tidy: `list()` excludes foreign
-//! services and never carries the raw on-disk artifact text, so a
-//! `list()`-based diff could not distinguish "absent" from "occupied by a
-//! stranger's service" or "up to date" from "hand-edited outside Goetia" —
-//! both real defects an earlier version of this module had.
+//! Renders [`ServiceManager::preview_install`] — the same
+//! [`crate::decide::decide`] call `install` uses — rather than reimplementing
+//! that policy against `list()`'s output: `list()` excludes foreign services
+//! and never carries the raw on-disk artifact text, so it could not tell
+//! "absent" from "occupied by a stranger's service" or "up to date" from
+//! "hand-edited outside Goetia".
 
 use std::io::Write;
 use std::path::PathBuf;

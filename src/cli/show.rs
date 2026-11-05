@@ -3,39 +3,30 @@
 //! Read-only: never checks elevation. With `-f`, renders straight from a
 //! manifest and touches no manager at all. Without it, reads the spec back
 //! out of what is actually installed. Four guarantees, declared here as a
-//! contract so a future change to either path is checked against them
-//! rather than merely inherited by accident:
+//! contract so a future change to either path is checked against them rather
+//! than merely inherited by accident:
 //!
 //! 1. **When both paths can see the daemon**, `show <id>` and
-//!    `show -f <file>` render the same resolved spec identically,
-//!    byte for byte, because both go through [`crate::diff::render_yaml`]
-//!    and neither may grow a renderer of its own. Conditional, not
-//!    unconditional agreement: without `-f`, `show` reads
+//!    `show -f <file>` render the same resolved spec byte for byte, because
+//!    both go through [`crate::diff::render_yaml`] and neither may grow a
+//!    renderer of its own. Conditional: without `-f`, `show` reads
 //!    [`ServiceManager::list`], which cannot describe a unit this privilege
 //!    level could not read. Such a unit reaches `show` as
-//!    [`crate::manager::Installed::Undetermined`], so `show <id>` reports
-//!    that it could not determine the id's state and exits `4`, while
-//!    `show -f <file>` still renders it straight from the manifest.
-//!    On a manifest with a `backend-specific:` block, the spec `show`
-//!    renders is the merged, host-effective one — `show -f` is
-//!    deliberately not a transcription of the file, because it renders
-//!    what would be installed *here*. Guarantee 1 survives that
-//!    unchanged: both paths merge for the same host's native backend, so
-//!    `show <id>` and `show -f <file>` still agree byte for byte,
-//!    which is exactly what it claims and all it ever claimed.
+//!    [`crate::manager::Installed::Undetermined`], so `show <id>` exits `4`,
+//!    while `show -f <file>` still renders it from the manifest.
+//!    On a manifest with a `backend-specific:` block, the spec rendered is the
+//!    merged, host-effective one (what would be installed *here*, not a
+//!    transcription of the file); both paths merge for the same host's native
+//!    backend, so they still agree.
 //! 2. Neither path ever checks elevation.
-//! 3. `show -f` touches no manager; `show` without `-f` touches no
-//!    manifest.
-//! 4. Output is YAML, one `# <id>` header per daemon, blank-line
-//!    separated.
+//! 3. `show -f` touches no manager; `show` without `-f` touches no manifest.
+//! 4. Output is YAML, one `# <id>` header per daemon, blank-line separated.
 //!
 //! A daemon this privilege level *can* see, but whose blob will not decode,
-//! is a different case from "not installed": `show` returns `4` for it —
-//! both per id, and, via the no-ids form's escalation, for that form too
-//! — the same "goetia owns this id and could not determine its
-//! state" code `list`/`status`/`diff` use. "Not installed" stays `1`, a
-//! determinate answer, and outranks `4` when a single call names both
-//! kinds of id (see `show_from_installed`).
+//! is not "not installed": `show` returns `4` for it, per id and for the
+//! no-ids form, the same code `list`/`status`/`diff` use. "Not installed"
+//! stays `1`, a determinate answer, and outranks `4` when a single call names
+//! both kinds of id (see `show_from_installed`).
 //!
 //! What `show` may never do is call an id absent on a listing that did not
 //! establish absence. An id `list()` reported as undetermined is `4`, and so
@@ -124,11 +115,10 @@ fn show_from_installed(
     // later unusable id cannot downgrade an already-seen absent one.
     let mut codes: Vec<ExitCode> = Vec::new();
 
-    // With no ids given, neither an unusable nor an undetermined entry
-    // enters `wanted` at all (neither has a spec to show), so the loop below
-    // can't be what flags it — unlike `list`/`status`, which escalate the
-    // same way. Without this, `show` prints a complete-looking dump and
-    // exits `0` on a host where it could not read half the daemons.
+    // With no ids, neither an unusable nor an undetermined entry enters
+    // `wanted` (neither has a spec), so the loop below cannot flag it.
+    // Without this, `show` would exit `0` on a complete-looking dump from a
+    // host where it could not read half the daemons.
     if ids.is_empty() && (!index.unusable.is_empty() || !index.undetermined.is_empty()) {
         codes.push(ExitCode::Indeterminate);
     }
@@ -141,9 +131,8 @@ fn show_from_installed(
             let _ = writeln!(err, "error: daemon `{id}` is installed but unusable");
             codes.push(ExitCode::Indeterminate);
         } else if let Some(entry) = index.undetermined_for(id) {
-            // Either the listing named this id as one it could not classify,
-            // or it carries an aggregate entry that may stand for it. Both
-            // leave absence unestablished, so neither may be reported as it.
+            // Either the listing could not classify this id, or an aggregate
+            // entry may stand for it: absence is unestablished either way.
             let _ = writeln!(
                 err,
                 "error: daemon `{id}`: installation state could not be determined: {}",

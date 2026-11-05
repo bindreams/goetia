@@ -17,7 +17,7 @@ use crate::support::{self, ELEVATED, ServiceGuard};
 
 /// The same cross-process lock `tests/scm_integration/managed.rs` declares,
 /// shared with it by label *name*: both binaries drive the one SCM on the host,
-/// and `list`'s aggregate `undetermined` entry is an answer about all of it. A
+/// and one denied `Parameters` changes `list`'s answer for all of it. A
 /// negative assertion here is unsound while any test anywhere denies a
 /// `Parameters` read, so they take turns rather than race.
 #[skuld::label]
@@ -52,7 +52,7 @@ fn hand_edit(id: &str) {
 // Step 1: conformance =================================================================================================
 
 /// `UNIT_DIR_EXCLUSIVE`: seeding `UNDETERMINED_ID` denies an elevated reader one service's
-/// `Parameters` for the length of the run, which puts an aggregate entry in every concurrent
+/// `Parameters` for the length of the run, which puts an `Undetermined` entry in every concurrent
 /// `list()` — including the ones `tests/scm_integration/managed.rs` asserts are clean.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn simple_passes_conformance() {

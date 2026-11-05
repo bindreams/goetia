@@ -11,8 +11,7 @@ use crate::spec::{DaemonSpec, Id, Warning};
 
 /// Load and resolve a manifest, printing every [`Warning`] it produced to
 /// `err`. Every subcommand that parses a manifest calls this rather than
-/// `spec::load` directly, so a warning is never silently dropped — see the
-/// crate-level design notes on why `Warning`s must reach stderr.
+/// `spec::load`, so a warning is never silently dropped.
 pub(crate) fn load_and_warn(file: &Path, err: &mut dyn Write) -> Result<DaemonSpec> {
     let (spec, warnings) = crate::spec::load(file)?;
     print_warnings(&warnings, err);
@@ -21,9 +20,8 @@ pub(crate) fn load_and_warn(file: &Path, err: &mut dyn Write) -> Result<DaemonSp
 
 /// Renders `warning: <id>: <message>` for a daemon's advisory and
 /// `warning: <message>` for a manifest-level one. Only the drive-relative
-/// `-f` advisory (`spec::resolve`'s `absolutize`) ever takes the second
-/// arm: it belongs to no daemon, so prefixing it with one would name a
-/// daemon the warning is not about.
+/// `-f` advisory (`spec::resolve`'s `absolutize`) takes the second arm: it
+/// belongs to no daemon.
 pub(crate) fn print_warnings(warnings: &[Warning], err: &mut dyn Write) {
     for warning in warnings {
         let _ = match &warning.id {
@@ -39,8 +37,6 @@ pub(crate) fn parse_id(s: &str) -> Result<crate::spec::Id> {
 }
 
 /// One decoded [`Installed::Ours`] entry, as held by [`InstalledIndex`].
-/// Named rather than a tuple: a four-tuple at three call sites is exactly
-/// where a field gets read back in the wrong position.
 pub(crate) struct InstalledEntry {
     pub spec: DaemonSpec,
     pub state: State,
@@ -57,27 +53,22 @@ pub(crate) struct UndeterminedEntry {
     pub reason: String,
 }
 
-/// One [`ServiceManager::list`] entry, indexed by id. `list`, `status`,
-/// `show`, and `diff` all need this same split — spec/state/pid/enabled for
-/// what decoded cleanly, plus which names exist but did not — so it lives
-/// here rather than as four independently-maintained copies of the same
-/// `match`.
+/// [`ServiceManager::list`]'s entries, indexed by id: spec/state/pid/enabled
+/// for what decoded cleanly, plus which names exist but did not. Shared by
+/// `list`, `status`, `show` and `diff`.
 pub(crate) struct InstalledIndex {
     pub ours: BTreeMap<String, InstalledEntry>,
     pub unusable: BTreeMap<String, String>,
     /// What goetia could not classify at all: named entries first, sorted
-    /// by name, then any aggregate. Not a map — an entry may stand for more
-    /// than one id and so carry no name (see [`Installed::Undetermined`]),
-    /// which leaves nothing to key on.
+    /// by name, then any aggregate. Not a map: an aggregate carries no name
+    /// to key on (see [`Installed::Undetermined`]).
     pub undetermined: Vec<UndeterminedEntry>,
 }
 
 impl InstalledIndex {
-    /// The entry that makes "`id` is not installed" an unsound conclusion,
-    /// if there is one: the entry naming `id`, or *any* aggregate — which
-    /// may stand for `id` itself. The null-name rule on
-    /// [`Installed::Undetermined`] applied once, so no caller has to know
-    /// which backend produced the listing.
+    /// The entry that makes "`id` is not installed" unsound, if there is one:
+    /// the entry naming `id`, or *any* aggregate, which may stand for `id`
+    /// itself. Applies the null-name rule on [`Installed::Undetermined`] once.
     pub fn undetermined_for(&self, id: &str) -> Option<&UndeterminedEntry> {
         self.undetermined
             .iter()
@@ -86,11 +77,10 @@ impl InstalledIndex {
     }
 }
 
-/// Partition `installed` into [`InstalledIndex`]. Prints nothing — call
-/// [`print_unusable_warnings`] to report the `unusable` half, which
-/// every caller must do somewhere: an `OursUnusable` entry silently
-/// vanishing is exactly the failure mode that variant exists to prevent
-/// (see [`Installed::OursUnusable`]'s doc comment).
+/// Partition `installed` into [`InstalledIndex`]. Prints nothing; every caller
+/// must report the `unusable` half with [`print_unusable_warnings`], since an
+/// `OursUnusable` entry silently vanishing is what that variant exists to
+/// prevent (see [`Installed::OursUnusable`]).
 pub(crate) fn partition_installed(installed: Vec<Installed>) -> InstalledIndex {
     let mut ours = BTreeMap::new();
     let mut unusable = BTreeMap::new();
@@ -124,16 +114,13 @@ pub(crate) fn partition_installed(installed: Vec<Installed>) -> InstalledIndex {
             }
         }
     }
-    // Named entries by name, then the aggregates. Sorted here rather than in
+    // Named entries by name, then the aggregates. Sorted here, not in
     // `report::write`, because `list`'s text renderer reads this index
-    // directly and never goes through the `Report`: two sort sites could
-    // drift, and the ordering is what makes either output stable.
+    // directly: one sort site keeps both outputs stable.
     undetermined.sort_by(|a, b| (a.name.is_none(), a.name.as_deref()).cmp(&(b.name.is_none(), b.name.as_deref())));
-    // The three classes are mutually exclusive claims about one id —
-    // decoded, ours-but-unusable, unclassifiable — so a backend reporting
-    // an id in two of them has answered its own question twice. Nothing else
-    // checks it, and without this the winner would be whichever branch a
-    // caller happens to test first.
+    // The three classes are mutually exclusive claims about one id, and
+    // nothing else checks it: otherwise the winner would be whichever branch a
+    // caller tests first.
     debug_assert!(
         ours.keys().all(|id| !unusable.contains_key(id))
             && undetermined
@@ -155,9 +142,8 @@ pub(crate) fn print_unusable_warnings(unusable: &BTreeMap<String, String>, err: 
     }
 }
 
-/// Report the `undetermined` half, as [`print_unusable_warnings`] does
-/// the other. An aggregate's `reason` is a complete sentence and stands
-/// alone: there is no name to prefix it with.
+/// Report the `undetermined` half, as [`print_unusable_warnings`] does the
+/// other. An aggregate's `reason` is a complete sentence and stands alone.
 pub(crate) fn print_undetermined_warnings(undetermined: &[UndeterminedEntry], err: &mut dyn Write) {
     for entry in undetermined {
         let _ = match &entry.name {
@@ -200,19 +186,17 @@ pub(crate) fn require_elevation(
     Err(ExitCode::Error)
 }
 
-/// Bundles [`run_id_verb`]'s parameters — it has more of them than clippy's
-/// `too_many_arguments` allows individually, and they belong together as one
-/// call anyway.
+/// [`run_id_verb`]'s parameters, bundled to stay under clippy's
+/// `too_many_arguments`.
 pub(crate) struct IdVerbCall<'a> {
     pub subcommand: &'a str,
     pub ids: &'a [String],
     pub get_manager: &'a dyn Fn() -> Result<Box<dyn ServiceManager>>,
     pub is_elevated: &'a dyn Fn() -> bool,
     pub verb: &'a dyn Fn(&dyn ServiceManager, &Id) -> Result<()>,
-    /// The word printed after an id that succeeded. Supplied by the caller
-    /// because it follows the budget: a verb that waited confirmed something
-    /// and reports `started`, while one that did not reports
-    /// `start requested` — see [`super::wait::reported`].
+    /// The word printed after an id that succeeded. It follows the budget: a
+    /// verb that waited reports `started`, one that did not `start requested`
+    /// (see [`super::wait::reported`]).
     pub verb_past_tense: &'a str,
     /// Whether an absent *artifact* already satisfies this verb's goal.
     /// True for `uninstall` alone; every other id-verb keeps `Error::
@@ -225,39 +209,31 @@ pub(crate) struct IdVerbCall<'a> {
     /// | `disable` | 1 | disabling after the fragment is gone is impossible, leaving a dangling `.wants` symlink: exit 0 while still enabled at boot |
     /// | `start`, `restart`, `enable`, `kill` | 1 | cannot act on what is not there |
     ///
-    /// The table is about an *absent* artifact, so it never reaches an id
-    /// whose absence was not established: an undetermined id is `4` for all
-    /// seven verbs, this flag included.
+    /// The table is about an *absent* artifact: an id whose absence was not
+    /// established is `4` for all seven verbs, this flag included.
     ///
-    /// Lives here, never inside the trait: `restart`'s closure calls
-    /// `mgr.stop(id)?` before `mgr.start(id)`, and tolerating absence
-    /// inside `stop` itself would let `restart` on an absent id fall
-    /// through to `start`.
+    /// Lives here, never inside the trait: tolerating absence inside `stop`
+    /// itself would let `restart` on an absent id fall through to `start`.
     ///
     /// The obligation this places on a [`ServiceManager`]: `Error::
     /// NotInstalled` must mean *nothing goetia-attributable is at this id*,
-    /// not "one particular file is missing". This layer cannot check that —
-    /// it sees an error variant, never the backend's own evidence — so a
-    /// backend reporting it too eagerly makes `uninstall x && echo
-    /// "confirmed gone"` print for an id its own `install` would refuse as
-    /// foreign. See `backend::systemd::manager`'s "absence is about the id" item.
+    /// not "one particular file is missing". This layer sees only the error
+    /// variant and cannot check that; a backend reporting it too eagerly makes
+    /// `uninstall x && echo "confirmed gone"` print for an id its own `install`
+    /// would refuse as foreign. See `backend::systemd::manager`'s "absence is
+    /// about the id" item.
     pub absent_is_success: bool,
 }
 
 /// Shared shape for the id-list mutating verbs (`uninstall`, `start`,
 /// `stop`, `kill`, `enable`, `disable`, `restart`): check elevation once, obtain
 /// the manager once, then call `verb` per id, printing one result line per
-/// id and returning the greatest [`ExitCode`] any id contributed — the same
-/// rule `install` and `show` use — except that when
-/// `call.absent_is_success` and `verb` returns `Error::NotInstalled`, the
-/// id counts as succeeded rather than failed; see
-/// [`IdVerbCall::absent_is_success`].
+/// id and returning the greatest [`ExitCode`] any id contributed, except that
+/// when `call.absent_is_success` and `verb` returns `Error::NotInstalled`, the
+/// id counts as succeeded; see [`IdVerbCall::absent_is_success`].
 ///
-/// Every id is parsed *before* `verb` is called for any of them. Parsing
-/// lazily, inside the loop, would mean a bad id at position N only surfaces
-/// after ids `1..N-1` have already been mutated (e.g. uninstalled): a
-/// partially executed, irreversible operation the caller never asked for and
-/// the nonzero exit code alone does not disclose.
+/// Every id is parsed *before* `verb` is called for any of them, so a bad id
+/// at position N cannot surface after ids `1..N-1` were already mutated.
 pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     let ids: std::result::Result<Vec<Id>, Error> = call.ids.iter().map(|s| parse_id(s)).collect();
     let ids = match ids {
@@ -286,11 +262,9 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
                 let _ = writeln!(out, "{id}: {}", call.verb_past_tense);
                 codes.push(ExitCode::Success);
             }
-            // Absence already satisfies this verb's goal (`uninstall`
-            // alone — see `absent_is_success`'s doc comment). Stdout only,
-            // never the past-tense line: claiming e.g. "uninstalled" for a
-            // daemon that was never there trades one wrong report for
-            // another. Does not affect the aggregated exit code.
+            // Absence already satisfies this verb's goal (see
+            // `absent_is_success`). Not the past-tense line: "uninstalled"
+            // would be false for a daemon that was never there.
             Err(e) if call.absent_is_success && matches!(e.cause(), Error::NotInstalled { .. }) => {
                 let _ = writeln!(out, "{id}: not installed (nothing to do)");
                 codes.push(ExitCode::Success);
