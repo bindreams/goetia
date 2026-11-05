@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 
 use winreg::RegKey;
-use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
+use winreg::enums::{KEY_READ, KEY_WRITE};
 
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard, cmd, registry};
 
@@ -65,11 +65,9 @@ fn scm_parameters_values_survive() {
     .expect_ok();
 
     let services = support::SCM_SERVICES_KEY;
-    let parameters = format!(r"{services}\{id}\Parameters");
-    let service = format!(r"{services}\{id}");
     let expected = written(&blob);
-    write(&parameters, PRIMARY, &expected);
-    write(&service, FALLBACK, &expected);
+    write(&registry::create_parameters_key(&id), PRIMARY, &expected);
+    write(&registry::create_service_key(&id), FALLBACK, &expected);
 
     let mut fallback_survived = BTreeMap::new();
     let mut check = |stage: &str| {
@@ -166,10 +164,7 @@ fn written(blob: &str) -> Metadata {
     }
 }
 
-fn write(path: &str, names: Names, values: &Metadata) {
-    let (key, _) = RegKey::predef(HKEY_LOCAL_MACHINE)
-        .create_subkey(path)
-        .unwrap_or_else(|e| panic!(r"create HKLM\{path}: {e}"));
+fn write(key: &RegKey, names: Names, values: &Metadata) {
     key.set_value(names.marker, values.marker.as_ref().unwrap())
         .expect("write marker");
     key.set_value(names.schema, values.schema.as_ref().unwrap())

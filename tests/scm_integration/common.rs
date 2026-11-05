@@ -66,9 +66,7 @@ pub struct WorldReadableExe {
 
 impl WorldReadableExe {
     pub fn new(id: &str) -> Self {
-        let program_data =
-            std::env::var_os("ProgramData").unwrap_or_else(|| panic!("%ProgramData% is not set on this host"));
-        let path = PathBuf::from(program_data).join(format!("{id}.exe"));
+        let path = support::program_data().join(format!("{id}.exe"));
         let guard = Self { path };
         let exe = std::env::current_exe().expect("locate the test binary");
         std::fs::copy(&exe, &guard.path)
