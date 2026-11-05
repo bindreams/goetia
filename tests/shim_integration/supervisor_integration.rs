@@ -14,13 +14,14 @@ use goetia::manager::{Budget, ServiceManager as _};
 use goetia::spec::{DaemonSpec, Restart};
 use windows_service::service::{ServiceExitCode, ServiceState};
 
-use crate::common::{fallback_log, fixture_command, recorded_exit, scm_status, simple_spec};
+use crate::common::{fallback_log, fixture_command, recorded_exit, remove_fallback_log, scm_status, simple_spec};
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn shim_runs_child_with_cwd_and_env() {
     let mgr = Scm::new();
     let id = support::random_test_id();
+    let logs = tempfile::tempdir().expect("tempdir for the daemon's log");
     let _guard = ServiceGuard::new(&id);
     let reported = ConnectBack::listen();
     let tmp = tempfile::tempdir().expect("tempdir for cwd");
@@ -33,6 +34,7 @@ fn shim_runs_child_with_cwd_and_env() {
         ..simple_spec(
             &id,
             fixture_command("cwd-env", &[&reported.port().to_string(), "GOETIA_SHIM_ENV_PROBE"]),
+            &logs.path().join("daemon.log"),
         )
     };
     mgr.install(&spec, false).expect("install");
@@ -60,19 +62,17 @@ fn shim_runs_child_with_cwd_and_env() {
 fn shim_captures_stdout_to_logs_path() {
     let mgr = Scm::new();
     let id = support::random_test_id();
+    let tmp = tempfile::tempdir().expect("tempdir for logs");
     let _guard = ServiceGuard::new(&id);
     let reported = ConnectBack::listen();
-    let tmp = tempfile::tempdir().expect("tempdir for logs");
     let log_path = tmp.path().join("daemon.log");
     const MARKER: &str = "goetia-shim-log-capture-probe";
 
-    let spec = DaemonSpec {
-        logs: Some(log_path.clone()),
-        ..simple_spec(
-            &id,
-            fixture_command("write-log", &[&reported.port().to_string(), MARKER]),
-        )
-    };
+    let spec = simple_spec(
+        &id,
+        fixture_command("write-log", &[&reported.port().to_string(), MARKER]),
+        &log_path,
+    );
     mgr.install(&spec, false).expect("install");
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     reported.accept("the fixture to finish writing its log lines");
@@ -92,6 +92,7 @@ fn shim_captures_stdout_to_logs_path() {
 fn stop_kills_the_whole_process_tree() {
     let mgr = Scm::new();
     let id = support::random_test_id();
+    let logs = tempfile::tempdir().expect("tempdir for the daemon's log");
     let _guard = ServiceGuard::new(&id);
     let child_reported = ConnectBack::listen();
     let grandchild_reported = ConnectBack::listen();
@@ -107,6 +108,7 @@ fn stop_kills_the_whole_process_tree() {
                     &grandchild_reported.port().to_string(),
                 ],
             ),
+            &logs.path().join("daemon.log"),
         )
     };
     mgr.install(&spec, false).expect("install");
@@ -155,9 +157,10 @@ fn pid_is_alive(pid: &str) -> bool {
 fn unreadable_blob_logs_to_fallback_path_and_event_log() {
     let mgr = Scm::new();
     let id = support::random_test_id();
+    let logs = tempfile::tempdir().expect("tempdir for the daemon's log");
     let _guard = ServiceGuard::new(&id);
 
-    let spec = simple_spec(&id, fixture_command("report", &["1"]));
+    let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs.path().join("daemon.log"));
     mgr.install(&spec, false).expect("install");
 
     corrupt_spec_value(&id);
@@ -184,6 +187,9 @@ fn unreadable_blob_logs_to_fallback_path_and_event_log() {
         logged.contains(&id) && logged.to_lowercase().contains("decode"),
         "fallback log does not look like a decode-failure report naming `{id}`:\n{logged}"
     );
+    // `STOPPED` with `ERROR_INVALID_DATA` is the shim's last report, made after its only log write
+    // (which has closed the file), so nothing writes to it any more.
+    remove_fallback_log(&id);
 
     // Filtered server-side by provider, not by an arbitrary "most recent N"
     // window: an unrelated process's own Application-log entries (of which

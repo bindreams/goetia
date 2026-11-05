@@ -2,7 +2,7 @@
 
 use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use goetia::backend::scm::exit_status::RecordedExit;
@@ -29,20 +29,26 @@ pub fn fixture_command(mode: &str, args: &[&str]) -> Vec<String> {
     v
 }
 
-/// [`support::spec`] with `type: simple`.
-pub fn simple_spec(id: &str, command: Vec<String>) -> DaemonSpec {
+/// [`support::spec`] with `type: simple`, logging to `logs`. Every shim test sets `logs` to a path
+/// in a temp dir it owns, so none writes to the `%ProgramData%\Goetia\logs\` default.
+pub fn simple_spec(id: &str, command: Vec<String>, logs: &Path) -> DaemonSpec {
     DaemonSpec {
         kind: Kind::Simple,
+        logs: Some(logs.to_path_buf()),
         ..support::spec(id, command)
     }
 }
 
-/// The `mk` [`goetia::manager::conformance::run`] needs: a fresh, valid
-/// `type: simple` spec for any `id`. The port is dummy — the fixture
-/// reports in on a best-effort basis regardless of whether anything
-/// listens, and no conformance scenario reads the report.
-pub fn conformance_mk(id: &str) -> DaemonSpec {
-    simple_spec(id, fixture_command("report", &["1"]))
+/// The `mk` [`goetia::manager::conformance::run`] needs, as `&|id| conformance_mk(dir, id)`: a
+/// fresh, valid `type: simple` spec for any `id`, logging to `<id>.log` in `logs_dir`. The port is
+/// dummy — the fixture reports in on a best-effort basis regardless of whether anything listens,
+/// and no conformance scenario reads the report.
+pub fn conformance_mk(logs_dir: &Path, id: &str) -> DaemonSpec {
+    simple_spec(
+        id,
+        fixture_command("report", &["1"]),
+        &logs_dir.join(format!("{id}.log")),
+    )
 }
 
 // SCM records and the shim process ====================================================================================
@@ -144,11 +150,22 @@ pub fn recorded_exit(id: &str) -> RecordedExit {
 /// The shim's fallback log for `id`, `%ProgramData%\Goetia\logs\<id>.log`: where it reports what it
 /// cannot report to the daemon's own log, and the daemon's output when the spec sets no `logs`.
 pub fn fallback_log(id: &str) -> String {
+    let path = fallback_log_path(id);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read fallback log {}: {e}", path.display()))
+}
+
+/// Removes the fallback log of `id`, which no process may be writing any more: a test that read it
+/// calls this once the shim that wrote it is gone, so that the log does not outlive the test.
+pub fn remove_fallback_log(id: &str) {
+    let path = fallback_log_path(id);
+    std::fs::remove_file(&path).unwrap_or_else(|e| panic!("remove fallback log {}: {e}", path.display()));
+}
+
+fn fallback_log_path(id: &str) -> PathBuf {
     let programdata = std::env::var_os("ProgramData")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-    let path = programdata.join("Goetia").join("logs").join(format!("{id}.log"));
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read fallback log {}: {e}", path.display()))
+    programdata.join("Goetia").join("logs").join(format!("{id}.log"))
 }
 
 /// `taskkill /F` on `pid`: the way a test ends a shim or a daemon without telling either.
