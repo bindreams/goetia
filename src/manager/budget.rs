@@ -1,8 +1,7 @@
 //! `Budget`/`Deadline`: the wait vocabulary shared by every backend's
 //! `start`/`stop` wait path. `Budget` is how long a caller is willing to
 //! wait; `Deadline` is the absolute instant [`Budget::start`] derives from
-//! it. Pure Rust, no platform code — see the crate-level design notes on
-//! `daemon start --timeout`.
+//! it. Pure Rust, no platform code.
 
 use std::time::{Duration, Instant};
 
@@ -24,11 +23,9 @@ impl Budget {
     pub const DEFAULT: Budget = Budget::Bounded(Duration::from_secs(10));
 
     /// Whether this budget permits any waiting at all. `false` for
-    /// `Immediate` and for `Bounded(Duration::ZERO)` alike — a zero-length
-    /// bound is not a fourth state, it behaves exactly as `Immediate` does
-    /// everywhere a caller branches on this. See the module's design notes
-    /// on why folding it in here (rather than leaving it to every call
-    /// site) is load-bearing.
+    /// `Immediate` and for `Bounded(Duration::ZERO)` alike: a zero-length
+    /// bound behaves as `Immediate` everywhere a caller branches on this, and
+    /// folding it in here spares every call site from doing so.
     pub fn waits(self) -> bool {
         !matches!(self, Budget::Immediate | Budget::Bounded(Duration::ZERO))
     }
@@ -36,13 +33,11 @@ impl Budget {
     /// Start the clock: the absolute [`Deadline`] this budget resolves to
     /// starting now.
     ///
-    /// `Immediate` yields an already-expired deadline (`Some(Instant::now())`,
-    /// never `now - something` — `Instant` subtraction can panic) so a
-    /// caller that forgets to branch on [`Self::waits`] fails closed rather
-    /// than waiting. `Bounded` uses `checked_add`: `Instant + Duration`
-    /// panics on overflow, and a duration too large for the platform's
-    /// clock to represent is indistinguishable from `Unbounded`, so that is
-    /// what it becomes.
+    /// `Immediate` yields an already-expired deadline (`Instant::now()`, not
+    /// `now - something`, which can panic) so a caller that forgets to branch
+    /// on [`Self::waits`] fails closed. `Bounded` uses `checked_add`, since
+    /// `Instant + Duration` panics on overflow; a duration too large for the
+    /// platform's clock is indistinguishable from `Unbounded`, and becomes it.
     pub fn start(self) -> Deadline {
         self.start_at(Instant::now())
     }
@@ -61,8 +56,7 @@ impl Budget {
 /// the earlier legs have been spending. `Deadline(None)` (unbounded) stays
 /// `Unbounded`; a spent deadline becomes `Immediate`; otherwise
 /// `Bounded(remaining)`. Normalises the zero case at the one place it is
-/// manufactured, so it agrees with [`Budget::waits`] by construction rather
-/// than by coincidence.
+/// manufactured, so it agrees with [`Budget::waits`] by construction.
 ///
 /// `Immediate` means "do not wait", which a bounded budget that ran out is
 /// not: a caller that must tell the two apart compares against the budget it
@@ -83,19 +77,16 @@ fn budget_for_at(deadline: Deadline, now: Instant) -> Budget {
 // timed_out ===========================================================================================================
 
 /// The one [`crate::Error::WaitTimeout`] constructor, so all three backends
-/// word an expiry identically rather than three times — the analogue of
-/// `decide::foreign_recovery`, and for the same reason: one condition, one
-/// remedy, no drift.
+/// word an expiry identically (as `decide::foreign_recovery` does for its
+/// condition).
 ///
 /// `awaited` is `"running"` or `"stopped"`, and nothing else.
 ///
-/// Takes the `Budget` rather than a bare `Duration` because a backend holds
-/// the budget, not the original duration, and because only a **non-zero**
-/// `Bounded` budget can expire at all: `Immediate` and `Bounded(ZERO)` never
-/// waited (see [`Budget::waits`]), and `Unbounded` never ends. Reaching here
-/// with any of those is a backend reporting an expiry that provably cannot
-/// have happened, so it is a `debug_assert!` rather than a silently plausible
-/// message.
+/// Takes the `Budget` because a backend holds that, not the original
+/// duration, and because only a **non-zero** `Bounded` budget can expire:
+/// `Immediate` and `Bounded(ZERO)` never waited (see [`Budget::waits`]), and
+/// `Unbounded` never ends. Reaching here with any of those is a backend
+/// reporting an expiry that cannot have happened, hence the `debug_assert!`.
 pub fn timed_out(id: &str, awaited: &'static str, budget: Budget) -> crate::Error {
     debug_assert!(
         matches!(budget, Budget::Bounded(d) if d > Duration::ZERO),
@@ -124,16 +115,14 @@ pub fn timed_out(id: &str, awaited: &'static str, budget: Budget) -> crate::Erro
 
 /// An absolute instant a [`Budget`] resolves to via [`Budget::start`].
 /// `None` means unbounded — never expires.
-// `PartialEq` is exercised by `scm::wait_tests::a_pending_callback_rearms_under_the_same_deadline`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Deadline(Option<Instant>);
 
 impl Deadline {
     /// The absolute instant this deadline expires at; `None` = unbounded.
-    /// `bounded::wait_bounded` hands it straight to
-    /// `cosca::Child::wait_deadline`, which is deadline-native — so nothing
-    /// on that path converts to a duration and back, and the unbounded case
-    /// is a different call rather than an invented timeout value.
+    /// `bounded::wait_bounded` hands it straight to the deadline-native
+    /// `cosca::Child::wait_deadline`; the unbounded case is a different call,
+    /// not an invented timeout.
     pub fn at(&self) -> Option<Instant> {
         self.0
     }
@@ -198,17 +187,14 @@ impl Deadline {
 }
 
 /// `d` in whole milliseconds, rounded **up**, saturating at `u32::MAX - 1`.
-/// Private; the sibling test module tests it directly, because neither end
-/// of its range can be reached deterministically through a live `Deadline`.
 ///
-/// Divides first and adjusts after — the obvious `(d + 999_999ns) / 1ms`
-/// panics on `Duration::MAX` (`checked_add` is `None` there). This form is
-/// total over the whole `Duration` range and needs no saturating
-/// construction at all.
+/// Divides first and adjusts after: the obvious `(d + 999_999ns) / 1ms`
+/// panics on `Duration::MAX`. This form is total over the whole `Duration`
+/// range.
 fn millis_ceil(d: Duration) -> u32 {
     // `as_millis` truncates; add one back iff anything was truncated. Whole
-    // seconds contribute exact milliseconds, so the remainder is entirely
-    // in the sub-second part.
+    // seconds contribute exact milliseconds, so only the sub-second part can
+    // truncate.
     let ceil = d.as_millis() + u128::from(!d.subsec_nanos().is_multiple_of(1_000_000));
     u32::try_from(ceil).unwrap_or(u32::MAX).min(u32::MAX - 1)
 }

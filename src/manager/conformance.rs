@@ -8,14 +8,11 @@
 //!
 //! ## Cleanup
 //!
-//! `run` installs several services over the course of its scenarios. On a
-//! real backend's integration test, that means real systemd units / launchd
-//! plists / SCM services on whatever host is running it — so `run` tracks
-//! every id it installs and uninstalls each one before returning, via an
-//! RAII guard so a mid-scenario assertion failure still cleans up rather
-//! than leaving stragglers on a persistent runner. Ids are process- and
-//! call-unique (a pid plus a monotonic counter), not cryptographically
-//! random — sufficient given cleanup runs every time, including on panic.
+//! `run` installs several services over the course of its scenarios, which on a
+//! real backend are real units, plists or SCM services on the host running it.
+//! It tracks every id it installs and uninstalls each before returning, via an
+//! RAII guard so a mid-scenario assertion failure still cleans up. Ids are
+//! process- and call-unique (a pid plus a monotonic counter).
 //!
 //! ## The seeded ids
 //!
@@ -24,35 +21,27 @@
 //! [`an_unclassifiable_id_is_never_silently_absent`]) need state that cannot be
 //! produced through [`ServiceManager`]'s own methods: a foreign (unmarked)
 //! service, a hand-edited Goetia artifact, and an artifact no read can obtain.
-//! `run` therefore does *not* create these itself — it requires the **caller**
-//! to have already put `mgr` into that state at three fixed, reserved ids
-//! before calling `run`:
+//! The **caller** must have put `mgr` into that state at three fixed, reserved
+//! ids before calling `run`:
 //!
-//! - [`FOREIGN_ID`]: `mgr` already has *something* installed at this id,
-//!   through means entirely outside Goetia (a hand-written unit file /
-//!   plist / registry key carrying no Goetia marker at all). `run` never
-//!   writes to or removes this id — cleanup is the caller's responsibility,
-//!   the same as the seeding was.
-//! - [`HAND_EDITED_ID`]: `mk(HAND_EDITED_ID)` has already been installed
-//!   through `mgr.install()`, and the resulting artifact has then been
-//!   mutated outside Goetia so it no longer matches what regenerating its
-//!   own embedded spec would produce (e.g. an extra hand-added directive).
-//!   `run`'s own `conflict_requires_force` scenario forces an overwrite
-//!   here, so this one *is* included in `run`'s own cleanup — the caller
-//!   only needs to seed it once per call to `run`.
-//! - [`UNDETERMINED_ID`]: an artifact whose bytes this process cannot
-//!   obtain is already at this id, for
-//!   [`an_unclassifiable_id_is_never_silently_absent`]. That scenario
-//!   asserts every verb *refuses* the id, so `run` never writes to or
-//!   removes it either — cleanup is the caller's, as for [`FOREIGN_ID`].
-//!   Which artifact seeds it is per platform and stated in that scenario's
-//!   own doc comment; every backend can seed it from the same elevated
-//!   context it installs from.
+//! - [`FOREIGN_ID`]: something is installed at this id entirely outside
+//!   Goetia (a hand-written unit file / plist / registry key carrying no
+//!   Goetia marker). `run` never writes to or removes it; cleanup is the
+//!   caller's.
+//! - [`HAND_EDITED_ID`]: `mk(HAND_EDITED_ID)` has been installed through
+//!   `mgr.install()`, and the artifact then mutated outside Goetia so it no
+//!   longer matches its own embedded spec (e.g. an extra directive).
+//!   `conflict_requires_force` forces an overwrite here, so `run`'s cleanup
+//!   includes it; the caller seeds it once per call to `run`.
+//! - [`UNDETERMINED_ID`]: an artifact whose bytes this process cannot obtain
+//!   is at this id, for [`an_unclassifiable_id_is_never_silently_absent`].
+//!   That scenario asserts every verb *refuses* the id, so `run` never writes
+//!   to or removes it; cleanup is the caller's. The per-platform seed is in
+//!   that scenario's doc comment.
 //!
-//! [`fake::Fake`] exposes
-//! `seed_foreign`/`install_then_hand_edit`/`seed_opaque` for exactly this; a
-//! real backend's integration test does the equivalent with direct
-//! filesystem/registry access, which it already has as elevated test code.
+//! [`fake::Fake`] exposes `seed_foreign`/`install_then_hand_edit`/`seed_opaque`
+//! for this; a real backend's integration test uses direct filesystem or
+//! registry access.
 //!
 //! [`ServiceManager`]: super::ServiceManager
 //! [`fake::Fake`]: super::fake::Fake
@@ -63,24 +52,19 @@ use super::{Budget, Installed, ServiceManager, State};
 use crate::error::Error;
 use crate::spec::{DaemonSpec, Id};
 
-/// See the module doc comment. Reserved: no other scenario in `run` uses
-/// this id.
+/// See the module doc comment. Reserved: no other scenario uses this id.
 pub const FOREIGN_ID: &str = "goetia-conformance-foreign";
 
-/// See the module doc comment. Reserved: no other scenario in `run` uses
-/// this id.
+/// See the module doc comment. Reserved: no other scenario uses this id.
 pub const HAND_EDITED_ID: &str = "goetia-conformance-hand-edited";
 
 /// See [`an_unclassifiable_id_is_never_silently_absent`], the one scenario
 /// that reads this id. Reserved: no other scenario uses it.
 pub const UNDETERMINED_ID: &str = "goetia-conformance-undetermined";
 
-/// RAII cleanup for every id `run`'s scenarios install. `Drop` cannot
-/// return a `Result`, so an uninstall failure during cleanup is logged to
-/// stderr rather than propagated — a cleanup failure that reports nothing
-/// would surface later only as a mysterious straggler service, long after
-/// the run that left it (the same reasoning `tests/support/service_guard.rs`
-/// documents for the marker-inertness probes).
+/// RAII cleanup for every id `run`'s scenarios install. `Drop` cannot return
+/// a `Result`, so an uninstall failure is logged to stderr: silence would
+/// surface later only as a mysterious straggler service.
 struct Cleanup<'a> {
     mgr: &'a dyn ServiceManager,
     ids: Vec<Id>,
@@ -99,18 +83,14 @@ impl Drop for Cleanup<'_> {
 /// Run every policy assertion in this module against `mgr`.
 ///
 /// `mk(id)` must build a valid, installable [`DaemonSpec`] with `id` as its
-/// id. Every id `run` uses is either freshly generated (never installed
-/// before) or one of
-/// [`FOREIGN_ID`]/[`HAND_EDITED_ID`]/[`UNDETERMINED_ID`] — see the module
-/// doc comment for what the caller must have already arranged at those
-/// three, and for what `run` cleans up on its own.
+/// id. Every id `run` uses is freshly generated or one of
+/// [`FOREIGN_ID`]/[`HAND_EDITED_ID`]/[`UNDETERMINED_ID`]; the module doc
+/// comment says what the caller must have arranged at those three.
 pub fn run(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
     let mut cleanup = Cleanup { mgr, ids: Vec::new() };
-    // Registered up front, not inside `conflict_requires_force`: the caller
-    // has already installed something at this id before calling `run` (see
-    // the module doc comment), so it needs cleanup regardless of which
-    // scenario panics first — including one that runs before
-    // `conflict_requires_force` ever gets to register it itself.
+    // Registered up front, not inside `conflict_requires_force`: the caller has
+    // already installed something here, so it needs cleanup even if a scenario
+    // that runs earlier panics.
     cleanup
         .ids
         .push(Id::try_from(HAND_EDITED_ID).expect("HAND_EDITED_ID is a valid Id by construction"));
@@ -129,17 +109,13 @@ pub fn run(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
     conflict_requires_force(mgr, mk);
     an_unclassifiable_id_is_never_silently_absent(mgr, mk);
 
-    // `cleanup` drops here, uninstalling everything pushed above — including
-    // on an early return via a panicking assertion, since `Drop` still runs
-    // during unwinding.
+    // `cleanup` drops here, and on unwinding from a failed assertion.
 }
 
-/// This module is compiled into the normal library artifact (not
-/// `#[cfg(test)]`-gated) so that each real backend's own integration test —
-/// a separate crate under `tests/`, linking only against `goetia`'s public
-/// API — can call [`run`]. That rules out a dev-only randomness crate here;
-/// a process-wide counter plus the pid is unique enough, since callers clean
-/// up what they create.
+/// This module is compiled into the library (not `#[cfg(test)]`-gated) so that
+/// each real backend's integration test, a separate crate linking only
+/// `goetia`'s public API, can call [`run`]. That rules out a dev-only
+/// randomness crate; a process-wide counter plus the pid is unique enough.
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn fresh_id(label: &str) -> String {
@@ -203,9 +179,7 @@ fn reinstall_preserves_enablement(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) ->
         spec.id
     );
 
-    // Re-run `install` over an id whose spec has since changed. A routine
-    // config update (this) must not silently undo a deliberate enable, any
-    // more than it should undo a deliberate `disable`.
+    // A routine config update must not undo a deliberate enable (or disable).
     let mut changed = mk(&fresh);
     changed
         .env
@@ -223,9 +197,8 @@ fn reinstall_preserves_enablement(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) ->
     );
 }
 
-/// See the module doc comment: the caller must have already put non-Goetia
-/// content at [`FOREIGN_ID`] before calling [`run`]. Never writes — `mgr`
-/// refuses every attempt — so nothing here needs cleanup.
+/// The caller must have put non-Goetia content at [`FOREIGN_ID`] (see the
+/// module doc comment). Never writes, so nothing here needs cleanup.
 fn refuses_foreign_even_with_force(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
     let spec = mk(FOREIGN_ID);
 
@@ -242,12 +215,10 @@ fn refuses_foreign_even_with_force(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -
     }
 }
 
-/// "Goetia never touches a service it did not create" (§5) is not an
-/// `install`-only rule: every other verb must refuse a foreign id too, or a
-/// real backend could `uninstall`/`start`/`stop`/`enable`/`disable`/`status`
-/// a stranger's service it merely happens to share an id with. See the
-/// module doc comment for what the caller must have arranged at
-/// [`FOREIGN_ID`] before calling [`run`].
+/// "Goetia never touches a service it did not create" is not an `install`-only
+/// rule: every other verb must refuse a foreign id too, or a backend could act
+/// on a stranger's service that merely shares an id. The caller must have
+/// arranged [`FOREIGN_ID`] (see the module doc comment).
 fn foreign_refuses_every_verb(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
     let spec = mk(FOREIGN_ID);
 
@@ -278,10 +249,8 @@ fn foreign_refuses_every_verb(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> Dae
     assert!(mgr.status(&spec.id).is_err(), "status must refuse a foreign id");
 }
 
-/// See the module doc comment: the caller must have already installed
-/// `mk(HAND_EDITED_ID)` through `mgr.install()` and then hand-edited the
-/// resulting artifact before calling [`run`]. Cleanup for this id is
-/// registered by `run` itself, up front — see there.
+/// The caller must have installed `mk(HAND_EDITED_ID)` and hand-edited the
+/// artifact (see the module doc comment). `run` registers its cleanup up front.
 fn conflict_requires_force(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
     let spec = mk(HAND_EDITED_ID);
 
@@ -303,8 +272,7 @@ fn conflict_requires_force(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> Daemon
         "force must resolve the conflict, got {forced:?}"
     );
 
-    // The hand-edit is really gone, not merely papered over: installing the
-    // same spec again, still without force, must now be a clean no-op.
+    // The hand-edit is really gone: the same spec again, without force, is a no-op.
     let after = mgr.install(&spec, false).expect("install after force");
     assert!(
         matches!(after, crate::decide::Outcome::UpToDate),
@@ -312,13 +280,10 @@ fn conflict_requires_force(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> Daemon
     );
 }
 
-/// `daemon restart`'s `stop` then `start` depends on `stop` succeeding on a
-/// service that was never started, and real managers disagree by default
-/// (`launchctl bootout`/`ControlService(STOP)` on an inactive service both
-/// fail; `systemctl stop` does not) — see `ServiceManager::stop`'s doc
-/// comment. Every backend must paper over that difference the same way, or
-/// `restart` works on Linux and errors on macOS/Windows for the exact same
-/// installed-but-never-started daemon.
+/// `daemon restart` depends on `stop` succeeding on a service that was never
+/// started, and real managers differ by default (see `ServiceManager::stop`).
+/// Every backend must paper over that, or `restart` of an installed but
+/// never-started daemon works on Linux and errors on macOS and Windows.
 fn start_and_stop_are_idempotent(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec, cleanup: &mut Vec<Id>) {
     let spec = mk(&fresh_id("idempotent-start-stop"));
     mgr.install(&spec, false).expect("install");
@@ -376,36 +341,28 @@ fn kill_of_a_service_that_is_not_running_says_so(
     );
 }
 
-/// `Budget::Immediate` issues the request and returns, establishing nothing
-/// — so **no assertion about the resulting state follows it here**, and that
-/// omission is the scenario, not a gap in it. The request has been accepted
-/// and the service may be anywhere between not yet forked and already
-/// running; which of those a backend happens to observe is the scheduler's
-/// choice, so asserting either would be asserting a race.
+/// `Budget::Immediate` issues the request and returns, establishing nothing,
+/// so **no assertion about the resulting state follows it here**: the service
+/// may be anywhere between not yet forked and already running, and asserting
+/// either would assert a race.
 ///
-/// What is left assertable, and is asserted: that every backend *accepts*
-/// the budget, and that a subsequent `Budget::DEFAULT` start still reaches
-/// `Running`. The second half catches an `Immediate` that leaves the service
-/// unstartable. It does **not** catch an `Immediate` that is simply a no-op
-/// — the waiting start that follows succeeds either way — and nothing
-/// portable can: where a request that was sent shows up differs per
-/// manager. The systemd suite asserts it where it can be asserted without a
-/// race (`a_start_with_no_budget_reaches_systemd` and its stop mirror).
+/// What is asserted: every backend *accepts* the budget, and a subsequent
+/// `Budget::DEFAULT` start still reaches `Running`, which catches an
+/// `Immediate` that leaves the service unstartable. It does **not** catch an
+/// `Immediate` that is a no-op, and nothing portable can: where a sent request
+/// shows up differs per manager. The systemd suite asserts it where that is
+/// race-free (`a_start_with_no_budget_reaches_systemd` and its stop mirror).
 ///
-/// **No scenario here asserts the expiry rule** — that an expiry is
-/// `Error::WaitTimeout` and never `Ok(())` — against a real backend.
-/// Asserting it portably would need a daemon that provably fails to reach
-/// the awaited state on all three platforms, which no portable `DaemonSpec`
-/// can express; the alternative, a real daemon under a budget small enough
-/// to expire, asserts whichever outcome the scheduler happened to pick,
-/// which is the bet this project forbids. `Fake` carries the rule here,
-/// deriving each expiry from the budget without sleeping (`fake_tests.rs`:
-/// `a_stalled_start_times_out_under_a_bounded_budget` and its stop mirror,
-/// plus the two `Unbounded` refusals). The systemd suite adds the one real
-/// expiry a unit can be built for — a stop that cannot complete
+/// **No scenario here asserts the expiry rule** (an expiry is
+/// `Error::WaitTimeout`, never `Ok(())`) against a real backend. That would
+/// need a daemon that provably fails to reach the awaited state on all three
+/// platforms, which no portable `DaemonSpec` can express; a real daemon under
+/// a budget small enough to expire would assert whichever outcome the
+/// scheduler picked. `Fake` carries the rule (`fake_tests.rs`), and the
+/// systemd suite adds a stop that cannot complete
 /// (`a_stop_that_can_never_complete_times_out_with_the_job_standing`); on
-/// launchd and SCM a real backend that swallowed an expiry as `Ok` would
-/// still pass every scenario.
+/// launchd and SCM a backend that swallowed an expiry as `Ok` would still pass
+/// every scenario.
 fn starting_with_no_budget_is_accepted_and_establishes_nothing(
     mgr: &dyn ServiceManager,
     mk: &dyn Fn(&str) -> DaemonSpec,
@@ -433,10 +390,9 @@ fn starting_with_no_budget_is_accepted_and_establishes_nothing(
 /// that. What every backend must do is accept the start once the stop before
 /// it is confirmed — a refusal there would fail every `restart --timeout 0`
 /// on a backend without `request_restart` — and leave the service startable.
-/// Like the scenario above, nothing is asserted about the state the request
-/// itself leaves. systemd's `restart --timeout 0` is `request_restart`
-/// instead, which its own suite shows restarting the daemon behind a stop
-/// that has to wait (`a_restart_with_no_budget_restarts_behind_a_stop_that_has_to_wait`).
+/// As above, nothing is asserted about the state the request leaves. systemd's
+/// `restart --timeout 0` is `request_restart` instead (see
+/// `a_restart_with_no_budget_restarts_behind_a_stop_that_has_to_wait`).
 fn a_start_request_after_a_confirmed_stop_is_accepted(
     mgr: &dyn ServiceManager,
     mk: &dyn Fn(&str) -> DaemonSpec,
@@ -461,12 +417,10 @@ fn a_start_request_after_a_confirmed_stop_is_accepted(
     );
 }
 
-/// `pid` must mean the same thing in `list` as in `status` — the number
-/// that backend's own `status()` would report for this id at this moment —
-/// on every real backend, not just the fake. Checked while stopped, while
-/// running, and after stopping again, so a backend that only agrees at one
-/// of those three moments (e.g. a `list` that caches a value from install
-/// time) still fails this.
+/// `pid` must mean the same thing in `list` as in `status` — what that
+/// backend's own `status()` reports for this id at this moment — on every
+/// real backend. Checked while stopped, running, and stopped again, so a
+/// `list` that caches a value from install time still fails.
 fn list_and_status_agree_on_pid(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec, cleanup: &mut Vec<Id>) {
     let spec = mk(&fresh_id("pid-agreement"));
     mgr.install(&spec, false).expect("install");
@@ -491,51 +445,39 @@ fn list_and_status_agree_on_pid(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> D
 /// an id goetia could not classify is reported as unclassified — never dropped
 /// from the listing, never claimed as goetia's — and no verb acts on it.
 ///
-/// The caller must have already put an artifact whose bytes this process
-/// cannot obtain at [`UNDETERMINED_ID`]. That every verb refuses — `install
-/// --force` included — is what this asserts rather than assumes, so it
-/// registers no cleanup of its own; the caller's own cleanup for
-/// [`UNDETERMINED_ID`] covers a backend that writes anyway.
+/// The caller must have put an artifact whose bytes this process cannot
+/// obtain at [`UNDETERMINED_ID`]. This asserts that every verb refuses it,
+/// `install --force` included, so it registers no cleanup of its own; the
+/// caller's cleanup covers a backend that writes anyway.
 ///
 /// # The state, and why every caller can seed it
 ///
-/// A read that *did not complete* — which is not the same as a read that was
-/// denied, and the difference is what lets this be one of [`run`]'s scenarios
-/// rather than an assertion each suite restates below its own privilege
-/// boundary. Elevation dissolves a denial: on systemd and launchd every read
-/// is DAC-gated and root holds `CAP_DAC_OVERRIDE`, so a mode seeds nothing in
-/// a suite that has to be root to install anything at all. An errno that is
-/// not about permission dissolves for nobody:
+/// A read that *did not complete*, not one that was denied: elevation
+/// dissolves a denial (root bypasses a file mode), but an errno that is not
+/// about permission dissolves for nobody. Seeds:
 ///
-/// - **systemd** — a regular file where `<id>.service.d` belongs. `read_dir`
-///   answers `ENOTDIR`, and `residue` — the predicate every verb asks — is
-///   left unable to say whether anything occupies the id.
-/// - **launchd** — a self-referential symlink at the plist path. `stat`
-///   answers `ELOOP`, so `obtain` gets no bytes, while `symlink_metadata`
-///   still sees the entry, which is exactly "something is there and nothing
-///   about it was established".
+/// - **systemd** — a regular file where `<id>.service.d` belongs; `read_dir`
+///   answers `ENOTDIR`, leaving `residue` unable to say whether anything
+///   occupies the id.
+/// - **launchd** — a self-referential symlink at the plist path; `stat`
+///   answers `ELOOP`, so `obtain` gets no bytes while `symlink_metadata` still
+///   sees the entry.
 /// - **SCM** — a `Deny`/`ReadKey` ACE over `Parameters`, which stops an
 ///   Administrator too (`tests/scm_integration/deny.rs`).
 ///
-/// A seed whose *bytes arrive* is not this state and never was: a non-UTF-8
-/// fragment or plist is `Foreign` — established, omitted from `list`, refused
-/// by every verb with a different error — so seeding one here asserts the
-/// wrong contract while looking correct.
+/// A seed whose *bytes arrive* is not this state: a non-UTF-8 fragment or
+/// plist is `Foreign` (established, omitted from `list`, refused with a
+/// different error), so seeding one asserts the wrong contract.
 ///
-/// Seeding [`UNDETERMINED_ID`] changes `list`'s answer for the whole host, not
-/// only for that id: it raises `daemon list`'s exit code, and on Windows it
-/// collapses into an aggregate entry. A caller whose suite also asserts a
-/// *clean* host-wide listing has to serialize the two against each other — the
-/// `UNIT_DIR_EXCLUSIVE` label the integration suites share by name.
+/// Seeding [`UNDETERMINED_ID`] changes `list`'s answer for the whole host: it
+/// raises `daemon list`'s exit code, and on Windows collapses into an
+/// aggregate entry. A suite that also asserts a *clean* host-wide listing has
+/// to serialize against it with the `UNIT_DIR_EXCLUSIVE` label.
 ///
 /// A backend satisfies the `list` half by naming the id in an
-/// [`Installed::Undetermined`] entry *or* by emitting any aggregate one. The
-/// aggregate counts because a null name stands for ids the entry could not
-/// separate, so it may stand for this one — the same rule that forbids
-/// concluding absence from it. SCM emits only that form, since a listing can
-/// have hundreds of denied services and one entry cannot carry their names.
-/// The per-id half below is exact on every backend, so accepting the
-/// aggregate does not weaken the scenario to nothing.
+/// [`Installed::Undetermined`] entry *or* by emitting any aggregate one, which
+/// may stand for this id. SCM emits only that form (hundreds of denied
+/// services, one entry). The per-id half below is exact on every backend.
 pub fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
     let spec = mk(UNDETERMINED_ID);
     let id = &spec.id;
@@ -561,9 +503,8 @@ pub fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, m
          established and none may be claimed: {listed:?}"
     );
 
-    // `NotInstalled` would certify absence and `Foreign` a stranger's
-    // presence; this read established neither, and a verb answering either
-    // would write off — or act on — an id goetia cannot classify.
+    // `NotInstalled` would certify absence and `Foreign` a stranger's presence;
+    // this read established neither.
     for (verb, result) in [
         ("status", mgr.status(id).map(drop)),
         ("uninstall", mgr.uninstall(id)),
@@ -585,13 +526,10 @@ pub fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, m
         );
     }
 
-    // The two verbs that *write*, `--force` included.
-    // [`refuses_foreign_even_with_force`] makes this point one epistemic step
-    // further in: refusing to clobber what goetia has *proved* is a
-    // stranger's is worth little if it will clobber what it could not read at
-    // all. `force` must not even be consulted here — the read that would have
-    // supplied `decide`'s inputs never completed, so there is no classified
-    // artifact for it to override.
+    // The verbs that *write*, `--force` included: refusing to clobber what
+    // goetia proved is a stranger's is worth little if it clobbers what it could
+    // not read. `force` must not be consulted: no classified artifact exists
+    // for it to override.
     for (verb, result) in [
         ("install", mgr.install(&spec, false).map(drop)),
         ("install with force", mgr.install(&spec, true).map(drop)),
@@ -608,14 +546,13 @@ pub fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, m
 }
 
 /// Two assertions off one `list()`, which is why they share a function: SCM's
-/// enumerates every service on the host, so a second call to make the split
-/// look tidier would cost a real sweep.
+/// enumerates every service on the host, so a second call would cost a real
+/// sweep.
 ///
 /// `installed` is every id installed through `mgr` so far — `run`'s own, plus
-/// the [`HAND_EDITED_ID`] the *caller* installed before `run` was called.
-/// Each must be in `list()` as `Ours`, not just `id`: an enumeration that
-/// drops one it could read is indistinguishable from one where that daemon
-/// does not exist.
+/// the [`HAND_EDITED_ID`] the *caller* installed. Each must be in `list()` as
+/// `Ours`, not just `id`: an enumeration that drops one it could read is
+/// indistinguishable from one where that daemon does not exist.
 fn assert_list_is_complete_and_pid_agrees(mgr: &dyn ServiceManager, id: &Id, installed: &[Id]) {
     let status_pid = mgr.status(id).expect("status").pid;
     let listed = mgr.list().expect("list");

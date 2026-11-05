@@ -3,12 +3,12 @@
 //! crate runs against instead of a real systemd/launchd/SCM.
 //!
 //! The trait exists so the CLI is written once and tested without touching a
-//! real machine — not for runtime backend swapping. No backend implements it
-//! by hand: each implements the crate-private `Backend` trait, and a blanket impl
-//! makes every `Backend` a `ServiceManager`. `install`, `preview_install`,
-//! `status` and `list` are therefore written once, in `flow`, and
-//! [`crate::decide::decide`] is called only from there. [`conformance::run`]
-//! asserts the contract against any `&dyn ServiceManager`.
+//! real machine, not for runtime backend swapping. Each backend implements
+//! the crate-private `Backend` trait, and a blanket impl makes every
+//! `Backend` a `ServiceManager`, so `install`, `preview_install`, `status`
+//! and `list` are written once, in `flow`, and [`crate::decide::decide`] is
+//! called only from there. [`conformance::run`] asserts the contract against
+//! any `&dyn ServiceManager`.
 
 pub mod budget;
 pub mod conformance;
@@ -29,8 +29,7 @@ use crate::spec::{DaemonSpec, Id};
 /// before calling any mutating verb — backends do not re-check it.
 pub trait ServiceManager {
     /// Install (create or update) the service for `spec`. Never starts and
-    /// never enables it at boot — see the crate-level design notes on
-    /// install-off-by-default. [`crate::decide::decide`] chooses the outcome; see
+    /// never enables it at boot. [`crate::decide::decide`] chooses the outcome; see
     /// that function's doc comment for what each [`crate::decide::Outcome`]
     /// means and when `force` is honored.
     ///
@@ -46,19 +45,14 @@ pub trait ServiceManager {
     /// (exit `4`).
     fn install(&self, spec: &DaemonSpec, force: bool) -> Result<crate::decide::Outcome>;
 
-    /// What [`Self::install`] would do for `spec`, without doing it —
-    /// always as if `force` were `false`, since showing the forced outcome
-    /// would hide the very conflict `--force` exists to let a user decide
-    /// about. Backs `goetia daemon diff`. It is the same flow as `install`,
-    /// minus the write, rather than `diff` reimplementing a partial version
-    /// of that policy against `list()`'s output: that is what keeps the two
-    /// from disagreeing — `diff` saying "up to date" or "would be created"
-    /// about something `install` would actually refuse or conflict on.
+    /// What [`Self::install`] would do for `spec`, without doing it, always
+    /// as if `force` were `false`: the forced outcome would hide the conflict
+    /// `--force` exists to let a user decide about. Backs `goetia daemon diff`.
+    /// The same flow as `install` minus the write, so the two cannot disagree.
     fn preview_install(&self, spec: &DaemonSpec) -> Result<crate::decide::Outcome>;
 
     /// Stop the service if running, remove the artifact, and reload the
-    /// manager. Operates by id alone — no manifest needed, so it still works
-    /// on a machine where the original `goetia.yaml` clone is gone.
+    /// manager. Operates by id alone, so it works without the original manifest.
     fn uninstall(&self, id: &Id) -> Result<()>;
 
     /// Enable the service at boot. Does not start it. `Err(NotInstalled)` if
@@ -72,49 +66,39 @@ pub trait ServiceManager {
     /// change its boot-enablement.
     ///
     /// `Ok(())` means **the platform's service manager reports the service
-    /// as running, as far as it knows** — not that the service is ready to
-    /// serve, which no service manager can tell us. An implementation must
-    /// not fabricate that confirmation: reporting one it did not obtain is
-    /// the failure this whole signature exists to prevent.
+    /// as running, as far as it knows**, not that it is ready to serve. An
+    /// implementation must not fabricate that confirmation.
     ///
     /// **`budget` bounds waiting for that confirmation, never whether the
     /// request is sent.** Every real backend starts the clock when the verb
-    /// itself begins, after the ownership read, and issues the request
-    /// whatever is left of it, cutting short only the wait for the
-    /// manager's answer. A budget that is already spent still reaches the
-    /// manager.
+    /// begins, after the ownership read, and issues the request whatever is
+    /// left of it, cutting short only the wait for the manager's answer. A
+    /// budget that is already spent still reaches the manager.
     ///
     /// [`Budget::Immediate`] issues the request and returns without waiting,
-    /// establishing nothing. `Ok(())` then means only that the request was
-    /// accepted, so a caller must not read any state from it — and neither
-    /// must the implementation, which is why every state assertion a backend
-    /// makes belongs behind [`Budget::waits`].
+    /// establishing nothing: `Ok(())` then means only that the request was
+    /// accepted, so neither a caller nor the implementation may read any state
+    /// from it. Every state assertion a backend makes belongs behind
+    /// [`Budget::waits`].
     ///
     /// **Where a platform offers no request-only form, [`Budget::Immediate`]
-    /// still performs the full blocking call, because issuing the request
-    /// *is* that call.** This is true of launchd's `launchctl
-    /// print`/`bootstrap`, neither of which has a non-blocking spelling: a
-    /// `start` with no budget still probes and, if needed, bootstraps the
-    /// job to completion before the plain `kickstart` that is what actually
-    /// declines to wait. The budget bounds what goetia waits *for*, and
-    /// there is nothing here to wait for separately.
+    /// still performs the full blocking call.** launchd's `launchctl
+    /// print`/`bootstrap` have no non-blocking spelling: a `start` with no
+    /// budget still probes and, if needed, bootstraps the job to completion
+    /// before the plain `kickstart` that declines to wait.
     ///
     /// An answer from the manager that itself establishes the goal is the
     /// confirmation, whatever is left of the budget: launchd's `print` of a
-    /// job already running, read before any request is needed, and SCM's
-    /// `ERROR_SERVICE_ALREADY_RUNNING` reply over a service it reports
-    /// `RUNNING`. systemd's answer to a start is a job,
-    /// never a state, so there a unit already active is confirmed only when
-    /// that job completes — which is where the backends disagree: under a
-    /// budget shorter than the job's round trip (tens of milliseconds), the
-    /// same start of a running daemon expires on systemd and succeeds on the
-    /// other two.
+    /// job already running, and SCM's `ERROR_SERVICE_ALREADY_RUNNING` reply
+    /// over a service it reports `RUNNING`. systemd's answer to a start is a
+    /// job, never a state, so a unit already active is confirmed only when
+    /// that job completes: under a budget shorter than the job's round trip,
+    /// the same start of a running daemon expires on systemd and succeeds on
+    /// the other two.
     ///
-    /// On expiry, [`Error::WaitTimeout`] — never `Ok(())`, and never
+    /// On expiry, [`Error::WaitTimeout`], never `Ok(())` and never
     /// [`Error::Undetermined`], which claims the *installation* is in doubt
-    /// when what actually happened is that a settled id's request was issued
-    /// and not waited out. That the request *was* issued is what the rule
-    /// above guarantees, and what `WaitTimeout`'s wording states.
+    /// when a settled id's request was issued and not waited out.
     ///
     /// Idempotent under every budget: starting an already-running service is
     /// `Ok(())`, not an error.
@@ -136,8 +120,8 @@ pub trait ServiceManager {
     /// under [`Budget::Immediate`] and [`Self::request_start_after_stop`].
     ///
     /// Only a single request is free of the window between two: systemd
-    /// answers a start by replacing a stop job it has not yet run, and on a
-    /// unit still active that start completes at once, restarting nothing.
+    /// replaces a stop job it has not yet run with a start, which on a unit
+    /// still active completes at once, restarting nothing.
     /// `Some(Ok(()))` means the manager accepted the request and nothing more.
     fn request_restart(&self, _id: &Id) -> Option<Result<()>> {
         None
@@ -149,12 +133,12 @@ pub trait ServiceManager {
     ///
     /// **Unlike [`Self::start`], not idempotent over a service that is still
     /// up.** A manager answering "already running" here has refused the
-    /// start, because the instance it sees may be the one the stop is still
-    /// taking down: a Windows `type: simple` service reads `RUNNING` until its
-    /// shim has taken the stop (`goetia-shim` reports `STOP_PENDING` from
-    /// then on), and reading that answer as a start reports a restart that leaves the
-    /// daemon down. `Ok(())` means the manager accepted a start request and
-    /// nothing more. Takes no budget: it never waits.
+    /// start: the instance it sees may be the one the stop is still taking
+    /// down (a Windows `type: simple` service reads `RUNNING` until its shim
+    /// has taken the stop), and reading that answer as a start would report a
+    /// restart that leaves the daemon down. `Ok(())` means the manager
+    /// accepted a start request and nothing more. Takes no budget: it never
+    /// waits.
     fn request_start_after_stop(&self, id: &Id) -> Result<()>;
 
     /// Stop the service now, waiting up to `budget` for it. Does not change
@@ -165,19 +149,15 @@ pub trait ServiceManager {
     /// there; and an expiry is [`Error::WaitTimeout`] on the same terms too.
     ///
     /// **Where a platform offers no request-only form,
-    /// [`Budget::Immediate`] still performs the full blocking call, because
-    /// issuing the request *is* that call.** This is true of `launchctl
-    /// bootout`, which has no non-blocking spelling: a `stop` with no budget
-    /// still boots the job out to completion. The budget bounds what goetia
-    /// waits *for*, and there is nothing here to wait for separately.
+    /// [`Budget::Immediate`] still performs the full blocking call.**
+    /// `launchctl bootout` has no non-blocking spelling: a `stop` with no
+    /// budget still boots the job out to completion.
     ///
     /// Idempotent: stopping an already-stopped service is `Ok(())`, not an
-    /// error — `daemon restart`'s `stop` then `start` depends on this
-    /// holding for a daemon that was never started, and real managers
-    /// disagree by default (`launchctl bootout`/`ControlService(STOP)` on
-    /// an inactive service both fail; `systemctl stop` does not), so an
-    /// implementation must paper over that difference itself, not leave it
-    /// for a caller to rediscover per platform.
+    /// error. `daemon restart` depends on this for a daemon that was never
+    /// started, and `launchctl bootout` and `ControlService(STOP)` on an
+    /// inactive service fail where `systemctl stop` does not, so an
+    /// implementation papers over that difference itself.
     ///
     /// [`Error::WaitTimeout`]: crate::Error::WaitTimeout
     fn stop(&self, id: &Id, budget: Budget) -> Result<()>;
@@ -200,20 +180,19 @@ pub trait ServiceManager {
     /// SCM returns once it has recorded the exit: the service is then stopped, or already restarted
     /// by its restart policy. systemd and launchd return once the signal is sent.
     ///
-    /// Takes no budget: what SCM is waited for is the exit of a process whose termination was
+    /// Takes no budget: what SCM waits for is the exit of a process whose termination was
     /// delivered, which is not a wait to bound.
     ///
     /// [`Error::NotRunning`]: crate::Error::NotRunning
     fn kill(&self, id: &Id) -> Result<()>;
 
     /// The live state of one installed service. `Err` for an id whose blob
-    /// will not decode — this must not fabricate a plausible-looking
-    /// `Status` for state it cannot actually determine (see the crate-level
-    /// design notes on `Installed::OursUnusable`, which exists for the
-    /// same reason on the `list` side) — and [`Error::Undetermined`] for an
-    /// id whose artifact could not be read at all, where not even ownership
-    /// was established. [`Error::NoManager`] where no manager can be asked
-    /// for the state, which the CLI reports as `unavailable` under the id.
+    /// will not decode, never a plausible-looking `Status` for state it
+    /// cannot determine (as `Installed::OursUnusable` does on the `list` side);
+    /// [`Error::Undetermined`] for an id whose artifact could not be read at
+    /// all, where not even ownership was established. [`Error::NoManager`]
+    /// where no manager can be asked, which the CLI reports as `unavailable`
+    /// under the id.
     ///
     /// [`Error::Undetermined`]: crate::Error::Undetermined
     /// [`Error::NoManager`]: crate::Error::NoManager
@@ -229,15 +208,12 @@ pub trait ServiceManager {
     /// not exist.
     ///
     /// **An absent container — no unit directory, no `Services` key — is
-    /// `Ok(vec![])`, never `Err`.** Absence is established there: nothing is
-    /// installed, which is a determinate answer and is reported as one. An
-    /// `Err` reaches the CLI as `Kind::Unavailable`, exit `1` over an empty
-    /// document — the rendering that says goetia could not answer — and
-    /// putting a settled answer behind it is the same conflation
-    /// [`Installed::Undetermined`] exists to end, arrived at from the other
-    /// side. A scan that *started* and did not finish is the opposite case
-    /// and does report (see `Installed::scan_incomplete`). So does an entry
-    /// whose live state could not be queried, as `OursUnusable` — except
+    /// `Ok(vec![])`, never `Err`.** Absence is established there, a
+    /// determinate answer; an `Err` reaches the CLI as `Kind::Unavailable`
+    /// (goetia could not answer), the conflation [`Installed::Undetermined`]
+    /// exists to end. A scan that *started* and did not finish is the opposite
+    /// case and does report (see `Installed::scan_incomplete`), as does an
+    /// entry whose live state could not be queried (`OursUnusable`), except
     /// where no manager can be asked for any entry's: that is
     /// [`Error::NoManager`], for the whole listing.
     ///
@@ -288,48 +264,42 @@ pub enum Installed {
     Ours {
         spec: DaemonSpec,
         state: State,
-        /// The same number [`ServiceManager::status`] would report for
-        /// this id at this moment — not a cached or independently derived
-        /// value. See `Backend::live_status`.
+        /// The number [`ServiceManager::status`] would report for this id
+        /// at this moment; see `Backend::live_status`.
         pid: Option<u32>,
         enabled: bool,
     },
     /// Ours by marker, but goetia cannot report on it. `reason` is why: goetia's own words, the
-    /// error under them, or both. The causes are listed on [`Ownership::OursUnusable`]. Kept
-    /// distinct from a silent omission: one such artifact must not take down `list`/`status` for
-    /// every other daemon.
+    /// error under them, or both. The causes are listed on [`Ownership::OursUnusable`]. One such
+    /// artifact must not take down `list`/`status` for every other daemon.
     ///
     /// [`Ownership::OursUnusable`]: crate::decide::Ownership::OursUnusable
     OursUnusable { name: String, reason: Reason },
     /// Neither proof: the read that would have classified this id did not
     /// complete, so goetia established neither its absence nor its
     /// presence. The `list`-side counterpart of [`Error::Undetermined`],
-    /// and separated from the two variants above by the same rule — what
-    /// goetia *established*, never what went wrong. Reporting
-    /// `OursUnusable` for a unit file an unelevated caller merely could
-    /// not open claims ownership of what may be a stranger's service;
-    /// omitting it claims it does not exist.
+    /// separated from the two variants above by what goetia *established*.
+    /// `OursUnusable` for a unit file an unelevated caller merely could not
+    /// open would claim ownership of what may be a stranger's service;
+    /// omitting it would claim it does not exist.
     ///
-    /// `name` is `None` only for an entry standing for more than one id.
-    /// That happens for either of two reasons, and a caller must not assume
-    /// the first: an enumeration that did not finish knows neither the names
-    /// it never reached nor how many there were (see `Installed::scan_incomplete`),
-    /// *or* one that enumerated fine drops the names because
-    /// one entry cannot usefully carry hundreds — which is what Windows SCM
+    /// `name` is `None` only for an entry standing for more than one id, for
+    /// either of two reasons: an enumeration that did not finish knows neither
+    /// the names it never reached nor how many there were (see
+    /// `Installed::scan_incomplete`), *or* one that enumerated fine drops the
+    /// names because one entry cannot usefully carry hundreds, as Windows SCM
     /// does on an unelevated `list`, where most services deny a `Parameters`
     /// read at once. An entry for exactly one known id always names it.
     ///
     /// What a `None` obliges of every caller: **while such an entry is
-    /// present, no negative conclusion about any id is sound.** It may
-    /// stand for the very id being asked about, so "`x` is absent" does not
-    /// follow from `x` going unnamed in the list — not for rendering, not
-    /// for an exit code, and not for a test assertion, which must fail
-    /// rather than certify what the list cannot establish.
+    /// present, no negative conclusion about any id is sound.** It may stand
+    /// for the very id being asked about, so "`x` is absent" does not follow
+    /// from `x` going unnamed, whether for rendering, an exit code or a test
+    /// assertion.
     ///
     /// Carries no `recovery`: that text belongs to [`Error::Undetermined`],
-    /// which each backend builds through its own constructor, and a second
-    /// independently worded remedy per `list` entry would put two answers
-    /// on one condition.
+    /// and a second independently worded remedy per `list` entry would put
+    /// two answers on one condition.
     ///
     /// [`Error::Undetermined`]: crate::Error::Undetermined
     Undetermined { name: Option<String>, reason: Reason },
@@ -350,9 +320,8 @@ impl Installed {
     /// a scan cut short in a unit directory, a `LaunchDaemons` directory or the SCM registry key
     /// says one thing rather than three.
     ///
-    /// Two rules it exists to keep. Whatever the scan *did* classify stays in the listing —
-    /// dropping it, which is what returning `Err` from `list` amounts to, reports every one of
-    /// those ids as absent. And the wording names no cause: a scan stops on a denial, a corrupt
+    /// Whatever the scan *did* classify stays in the listing; returning `Err` from `list` would
+    /// report those ids as absent. The wording names no cause: a scan stops on a denial, a corrupt
     /// directory or an I/O fault alike, and only the `detail` handed in was established.
     pub(crate) fn scan_incomplete(location: &str, detail: Error) -> Self {
         Installed::Undetermined {
@@ -372,19 +341,17 @@ impl Installed {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Status {
     pub state: State,
-    /// For `type: simple` on Windows this is `goetia-shim.exe`'s pid, not
-    /// the daemon's — SCM knows no other process for that
-    /// service. Documented here rather than left as a surprise.
+    /// For `type: simple` on Windows this is `goetia-shim.exe`'s pid, not the
+    /// daemon's: SCM knows no other process for that service.
     pub pid: Option<u32>,
     /// Whether the service is enabled at boot: systemd's `.wants` symlink,
-    /// the launchd plist's directory, or SCM's `SERVICE_AUTO_START`. Not
-    /// spec data (see the crate-level design notes on boot-enablement) —
-    /// this reports the *installation's* current state, queried fresh each
-    /// call, never cached from `install`. Present specifically so
-    /// `manager::conformance` can assert `install` never enables and that a
-    /// re-install never changes it; every real backend must be able to
-    /// answer this without rebooting (systemd: `systemctl is-enabled`;
-    /// launchd: which directory the plist lives in; SCM: `dwStartType`).
+    /// the launchd plist's directory, or SCM's `SERVICE_AUTO_START`. Not spec
+    /// data: this is the *installation's* current state, queried fresh each
+    /// call, never cached from `install`, so `manager::conformance` can assert
+    /// that `install` never enables and a re-install never changes it. Every
+    /// real backend must answer it without rebooting (systemd: `systemctl
+    /// is-enabled`; launchd: which directory the plist lives in; SCM:
+    /// `dwStartType`).
     pub enabled: bool,
 }
 
@@ -404,8 +371,7 @@ pub enum State {
 /// Linux returns [`Systemd`](crate::backend::systemd::manager::Systemd),
 /// macOS [`Launchd`](crate::backend::launchd::manager::Launchd),
 /// Windows [`Scm`](crate::backend::scm::manager::Scm). Any other
-/// target returns [`Error::UnsupportedPlatform`] rather than panicking, so a
-/// CLI user gets a diagnosable message instead of a crash.
+/// target returns [`Error::UnsupportedPlatform`] rather than panicking.
 pub fn native() -> Result<Box<dyn ServiceManager>> {
     #[cfg(target_os = "linux")]
     {

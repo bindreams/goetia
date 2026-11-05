@@ -129,11 +129,8 @@ pub fn run(
 
 /// Print one outcome and classify it for the exit code. The full text
 /// (including any diff) always goes to `out`; a refusal or conflict
-/// additionally gets a concise one-line diagnostic on `err`, consistent
-/// with every other failure path in the CLI (`run_id_verb`, `list`,
-/// `status`, `diff` all put failures on stderr) — a script that only
-/// captures stderr for errors must still learn that this exit-1/5 run had
-/// one.
+/// additionally gets a one-line diagnostic on `err`, so a script that only
+/// captures stderr for errors still learns that an exit-1/5 run had one.
 fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     match outcome {
         Outcome::Create => {
@@ -157,12 +154,10 @@ fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn
             artifact_diff,
             unclearable_recovery,
         } => {
-            // `--force` is published as the way out of a conflict, so it is
-            // offered only where it is one. When part of the cause is
-            // outside the directory this backend writes, forcing rewrites
-            // the artifact, leaves that part in place, and the next run
-            // reports the identical conflict — `decide` says which case this
-            // is (see `Outcome::Conflict`), and nothing here re-derives it.
+            // `--force` is offered only where it resolves the conflict. When part
+            // of the cause is outside the directory this backend writes, forcing
+            // leaves that part in place and the next run reports the same
+            // conflict; `decide` says which case this is (see `Outcome::Conflict`).
             let line = match unclearable_recovery {
                 None => format!("{id}: conflict (re-run with --force to overwrite)"),
                 Some(recovery) => format!("{id}: conflict. {recovery}"),
@@ -197,17 +192,11 @@ fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn
 
 // --dry-run preview ===================================================================================================
 //
-// Generation is pure and "nearly free" by design (see the CLI spec's §4), so
-// --dry-run deliberately never touches a manager or does any I/O of its
-// own. The one piece real installation needs that generation itself cannot
-// provide — resolving `spec.user` to a platform account name (see
-// `backend::Identity`) — is genuinely effectful for a real install (a
-// Windows SID needs `LookupAccountSid`; a launchd numeric UID needs a
-// lookup too), which a *preview* has no business doing. What follows is
-// therefore a literal, lookup-free rendering: correct for the common
-// `root`/`name`/numeric-`uid` cases, and clearly a preview — never what a
-// real install's own effectful identity resolution would write
-// byte-for-byte in every case.
+// --dry-run never touches a manager or does I/O. A real install resolves
+// `spec.user` to a platform account name (see `backend::Identity`) with an
+// effectful lookup (a Windows SID needs `LookupAccountSid`; a launchd numeric
+// UID needs one too); a preview does not, so this is a literal, lookup-free
+// rendering that may differ from a real install's artifact in some cases.
 
 fn preview_identity(user: &User) -> Identity {
     Identity {
@@ -232,9 +221,8 @@ fn preview_root_account() -> String {
 
 /// The generated artifact for `spec`, or the generator's refusal of it (scm refuses `restart: always`).
 ///
-/// `err` is unused on every platform but Windows today — the systemd and
-/// launchd generators never produce a [`crate::spec::Warning`] — but it is
-/// threaded through unconditionally so a future one cannot be dropped.
+/// `err` is threaded through on every platform so a generator warning cannot
+/// be dropped; no generator produces a [`crate::spec::Warning`] here today.
 fn preview_artifact(spec: &DaemonSpec, err: &mut dyn Write) -> Result<String> {
     let identity = preview_identity(&spec.user);
 
@@ -250,10 +238,8 @@ fn preview_artifact(spec: &DaemonSpec, err: &mut dyn Write) -> Result<String> {
     }
     #[cfg(windows)]
     {
-        // The SCM generator's own warning (a too-large `restart-delay`)
-        // fires at resolve time, from `BackendKind::Scm.warn`, before this ever
-        // runs — see `spec/backend.rs`. `err` stays threaded through and
-        // unused so a future generator warning cannot be dropped silently.
+        // The SCM generator's warning (a too-large `restart-delay`) fires at
+        // resolve time, from `BackendKind::Scm.warn`, before this runs.
         let _ = err;
         // The real shim path is an open packaging question — this placeholder
         // is only ever shown in a preview, never installed.

@@ -206,8 +206,8 @@ pub enum Error {
 
     /// The document is not valid YAML, or fails a shape-level constraint
     /// checked during deserialization: a missing or duplicate `id`, an
-    /// unknown field such as a leftover `daemons:`, or a malformed `user`
-    /// field. `yaml_serde` attaches a line/column to the message.
+    /// unknown field, or a malformed `user` field. `yaml_serde` attaches a
+    /// line/column to the message.
     #[error(transparent)]
     Yaml(#[from] yaml_serde::Error),
 
@@ -242,32 +242,29 @@ pub enum Error {
     },
 
     /// No daemon named `id` is managed by Goetia, per a [`ServiceManager`]
-    /// mutating or querying verb (`uninstall`/`start`/`stop`/`enable`/
-    /// `disable`/`status`/`show`) that needs one to already exist.
+    /// verb (`uninstall`/`start`/`stop`/`enable`/`disable`/`status`/`show`)
+    /// that needs one to already exist.
     ///
-    /// The strong reading, and the only correct one: **nothing
-    /// goetia-attributable is at this id**, not merely that the backend's
-    /// primary artifact file is missing. `cli::uninstall` maps this variant
-    /// — and only this variant — to exit `0` and "nothing to do", so a
-    /// backend that reports it while the platform still applies a leftover
-    /// (systemd's fragmentless `<id>.service.d` drop-in, or its
-    /// `multi-user.target.wants` enablement link) certifies "confirmed
-    /// gone" for a service still loaded, still running and still enrolled at
-    /// boot — and contradicts its own `install`, which refuses that same
-    /// state as [`Foreign`](Error::Foreign).
+    /// The strong reading: **nothing goetia-attributable is at this id**, not
+    /// merely that the backend's primary artifact file is missing.
+    /// `cli::uninstall` maps only this variant to exit `0` and "nothing to
+    /// do", so a backend that reports it while the platform still applies a
+    /// leftover (systemd's fragmentless `<id>.service.d` drop-in, or its
+    /// `multi-user.target.wants` enablement link) certifies "confirmed gone"
+    /// for a service still loaded, running and enrolled at boot, and
+    /// contradicts its own `install`, which refuses that state as
+    /// [`Foreign`](Error::Foreign).
     ///
     /// [`ServiceManager`]: crate::manager::ServiceManager
     #[error("daemon `{id}` is not installed")]
     NotInstalled { id: String },
 
-    /// Something exists at `id`, but it carries no Goetia marker at all —
-    /// distinct from [`NotInstalled`](Error::NotInstalled), which means
-    /// nothing is there. Every [`ServiceManager`] verb other than `install`
-    /// refuses a foreign id with this, never `NotInstalled`: reporting a
-    /// service that demonstrably exists on the machine as merely "not
-    /// installed" sends the user looking for a missing service instead of
-    /// to the actual remedy in `recovery` (identical wording to
-    /// `decide::Outcome::RefuseForeign`'s, via
+    /// Something exists at `id`, but it carries no Goetia marker at all,
+    /// unlike [`NotInstalled`](Error::NotInstalled), where nothing is there.
+    /// Every [`ServiceManager`] verb other than `install` refuses a foreign id
+    /// with this, never `NotInstalled`, which would send the user looking for
+    /// a missing service instead of to the remedy in `recovery` (the wording
+    /// of `decide::Outcome::RefuseForeign`'s, via
     /// [`crate::decide::foreign_recovery`]).
     ///
     /// [`ServiceManager`]: crate::manager::ServiceManager
@@ -279,20 +276,17 @@ pub enum Error {
     /// the chain ends in; `recovery` says what would make that read succeed,
     /// and [`report`](Error::report) prints it last, as [`remedy`](Error::remedy).
     ///
-    /// The distinguishing property is what this variant does **not** claim.
-    /// [`NotInstalled`](Error::NotInstalled) is proof that nothing
-    /// goetia-attributable is at the id; [`Foreign`](Error::Foreign) — and
-    /// `cli::report::Kind::Unusable`, whose published meaning is "goetia
-    /// owns the id but cannot report on it" — is proof that something is.
-    /// A failed read is the absence of both proofs, so reporting either one
-    /// invents evidence: "installed but unusable" over an
-    /// `/etc/systemd/system/<id>.service.d` an unelevated caller merely
-    /// could not open puts goetia's name, and `uninstall`'s recovery
-    /// advice, on what may be a stranger's override. Choose between the
-    /// three by what was established, never by which is closest to hand.
+    /// What this variant does **not** claim is its point.
+    /// [`NotInstalled`](Error::NotInstalled) proves nothing goetia-attributable
+    /// is at the id; [`Foreign`](Error::Foreign), and
+    /// `cli::report::Kind::Unusable` ("goetia owns the id but cannot report on
+    /// it"), prove something is. A failed read proves neither, so reporting
+    /// either invents evidence: "installed but unusable" over an
+    /// `/etc/systemd/system/<id>.service.d` an unelevated caller merely could
+    /// not open puts goetia's name on what may be a stranger's override.
+    /// Choose by what was established.
     ///
-    /// Exit `4` (indeterminate), like `Unusable`: the code is about
-    /// whether the question was answered, and this one was not.
+    /// Exit `4` (indeterminate), like `Unusable`: the question was not answered.
     #[error("cannot determine whether daemon `{id}` is installed")]
     Undetermined {
         id: String,
@@ -305,20 +299,17 @@ pub enum Error {
     /// through [`crate::manager::budget::timed_out`], so all three backends
     /// word one condition identically.
     ///
-    /// What this variant does **not** claim, and what separates it from
-    /// [`Undetermined`](Error::Undetermined): nothing here is in doubt about
-    /// what is *installed* at the id — that question was answered before the
-    /// wait ever began. From a backend, the request was issued — the budget
-    /// never decides that, and on launchd it may still be on its way in a
-    /// `launchctl` goetia left running — and goetia stopped watching for its
-    /// outcome; it was not cancelled, and the service may still arrive.
-    /// `cli::restart` is the one producer that also reports a step it never
-    /// issued: a start leg its budget ran out before, whose message says no
-    /// start was issued and the daemon is left stopped. A backend must never
-    /// report an expiry as `Ok(())`, and never as `Undetermined`.
+    /// Unlike [`Undetermined`](Error::Undetermined), nothing here is in doubt
+    /// about what is *installed* at the id: that was answered before the wait
+    /// began. From a backend, the request was issued (the budget never decides
+    /// that; on launchd it may still be on its way in a `launchctl` goetia left
+    /// running) and goetia stopped watching for its outcome. It was not
+    /// cancelled, and the service may still arrive. `cli::restart` is the one
+    /// producer that also reports a step it never issued: a start leg its
+    /// budget ran out before, whose message says so. A backend must never
+    /// report an expiry as `Ok(())`, nor as `Undetermined`.
     ///
-    /// Exit `4` (indeterminate), like `Undetermined`: the code is about
-    /// whether the question was answered, and this one was not.
+    /// Exit `4` (indeterminate), like `Undetermined`.
     #[error("`{id}` did not report {awaited} within {waited}: {recovery}", waited = humantime::format_duration(*waited))]
     WaitTimeout {
         id: String,
@@ -341,21 +332,18 @@ pub enum Error {
     /// is still taking down, is going down, or never moved, goetia proved
     /// none of the three.
     ///
-    /// The refusal itself may be determinate or not — a launchd `bootstrap`
-    /// that fails outright, where SCM's `ERROR_SERVICE_ALREADY_RUNNING` says
-    /// only that the service is not stopped. Either way the stop was never
-    /// confirmed: it may still be in flight, may have completed, or may have
-    /// had nothing to do, so what is unestablished is where the daemon ended
-    /// up. Not a plain failure, exit `1`: a refusal, even a
-    /// determinate one, answers whether the start went out, not that
-    /// question. (A plain `start --timeout 0` of the same service is exit
-    /// `1`: with no stop before it, the refusal is the whole answer.) Not
-    /// [`WaitTimeout`](Error::WaitTimeout): nothing waited.
-    /// Not [`Undetermined`](Error::Undetermined): what is installed at the
-    /// id was never in doubt.
+    /// The refusal itself may be determinate (a launchd `bootstrap` that fails
+    /// outright) or not (SCM's `ERROR_SERVICE_ALREADY_RUNNING` says only that
+    /// the service is not stopped). Either way the stop was never confirmed,
+    /// so where the daemon ended up is unestablished; the refusal answers
+    /// whether the start went out, not that. Hence not a plain failure, exit
+    /// `1`. (A plain `start --timeout 0` of the same service is exit `1`: with
+    /// no stop before it, the refusal is the whole answer.) Not
+    /// [`WaitTimeout`](Error::WaitTimeout): nothing waited. Not
+    /// [`Undetermined`](Error::Undetermined): what is installed at the id was
+    /// never in doubt.
     ///
-    /// Exit `4` (indeterminate), like the two above: the code is about
-    /// whether the question was answered, and this one was not.
+    /// Exit `4` (indeterminate), like the two above.
     ///
     /// `refused` is the start's refusal, which the chain ends in.
     #[error(
@@ -374,20 +362,17 @@ pub enum Error {
     /// failed, so whatever it sends may already be sent. `request` is the
     /// tool's command line; `source` is how it was lost, and `note` is what a
     /// caller that knows more says before it ([`Error::in_doubt_context`]).
-    /// `reached` is whether goetia knows the request
-    /// reached the manager: systemd says so (`Enqueued anchor job`) once it
-    /// has enqueued the job, which may already be running, and a request lost
-    /// after that had reached it.
+    /// `reached` is whether goetia knows the request reached the manager:
+    /// systemd says so (`Enqueued anchor job`) once it has enqueued the job,
+    /// which may already be running.
     ///
-    /// What it does **not** claim, which separates it from its neighbours: not
-    /// that nothing was sent, as a plain failure would; not that goetia waited
-    /// for the outcome and gave up, as [`WaitTimeout`](Error::WaitTimeout)
-    /// does; and not that what is installed at the id is in doubt, as
+    /// It does **not** claim that nothing was sent, as a plain failure would;
+    /// that goetia waited and gave up, as [`WaitTimeout`](Error::WaitTimeout)
+    /// does; or that what is installed at the id is in doubt, as
     /// [`Undetermined`](Error::Undetermined) does. A failure goetia can place
     /// before the tool ran is never this.
     ///
-    /// Exit `4` (indeterminate), like the three above: whether the manager
-    /// acted is the question, and it was not answered.
+    /// Exit `4` (indeterminate), like the three above.
     #[error("{}", in_doubt(request, *reached, note))]
     RequestInDoubt {
         request: String,
@@ -457,15 +442,13 @@ pub enum Error {
 
     /// A mutating CLI subcommand was invoked without the elevation
     /// (root/Administrator) it requires. Never returned for `list`,
-    /// `status`, `show`, `diff`, or `install --dry-run`, none of which
-    /// mutate anything.
+    /// `status`, `show`, `diff`, or `install --dry-run`.
     #[error("`{subcommand}` requires elevation (root/Administrator): re-run as root or Administrator")]
     ElevationRequired { subcommand: String },
 
     /// [`crate::manager::native`] has no [`ServiceManager`] implementation
-    /// for the running platform — anything but Linux, macOS or Windows. A
-    /// message here, never a panic: a CLI user hitting this gets a
-    /// diagnosable error instead of a crash.
+    /// for the running platform — anything but Linux, macOS or Windows. An
+    /// error, never a panic.
     ///
     /// [`ServiceManager`]: crate::manager::ServiceManager
     #[error("no backend for {platform} yet")]
@@ -496,9 +479,7 @@ pub enum Error {
 
     /// A backend tried to create or move an artifact to `path`, but
     /// something already occupies it — a state none of that backend's own
-    /// operations should be able to produce, so this always carries a
-    /// "this should never happen" flavor rather than being a normal,
-    /// expected outcome.
+    /// operations should produce.
     #[error("{path} already exists (this should never happen)", path = path.display())]
     AlreadyExists { path: PathBuf },
 }

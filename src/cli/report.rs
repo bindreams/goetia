@@ -9,23 +9,21 @@
 //! `daemons`, `errors` and `undetermined` are always present, as arrays,
 //! possibly empty. A `daemons` entry carries no `name`:
 //! [`crate::manager::ServiceManager::status`] returns a [`Status`] with no
-//! spec, so only `list` could supply it, and one field differing between the
-//! two subcommands is worse than sending users to `goetia daemon show`. `pid` is an integer or `null`, and `null` means the
-//! manager reports no main process — never "this command could not find out",
-//! which is an `errors` entry instead.
+//! spec, so only `list` could supply it, and the two subcommands must not
+//! differ in fields. `pid` is an integer or `null`; `null` means the manager
+//! reports no main process, never "this command could not find out" (that is
+//! an `errors` entry).
 //!
-//! `undetermined` carries what `list()` could not classify at all, and an
-//! entry whose `name` is `null` stands for more than one id. It is a third
-//! key rather than an `errors[].kind` because the command did not fail: it
-//! reported everything it could see, and this is a stated limit on the
-//! answer's completeness, which a consumer must be able to read without
-//! parsing `kind` strings. `status <id>`, asked about one named id, reports
-//! the same fact as that id's own `errors[].kind: "undetermined"`.
+//! `undetermined` carries what `list()` could not classify at all; an entry
+//! whose `name` is `null` stands for more than one id. It is a third key
+//! rather than an `errors[].kind` because the command did not fail: it is a
+//! stated limit on the answer's completeness, readable without parsing `kind`
+//! strings. `status <id>`, asked about one id, reports the same fact as that
+//! id's own `errors[].kind: "undetermined"`.
 //!
-//! [`exit_code`] is the *only* exit-code computation `list` and `status` have,
-//! with or without `--json`: both build a [`Report`] first and only then pick
-//! a renderer. A verb whose exit code depends on its output format is exactly
-//! the split this module exists to remove.
+//! [`exit_code`] is the only exit-code computation `list` and `status` have,
+//! with or without `--json`: both build a [`Report`] first and then pick a
+//! renderer, so the exit code cannot depend on the output format.
 
 use std::io::Write;
 
@@ -75,18 +73,14 @@ pub(crate) struct ErrorReport {
 
 /// Every value [`ErrorReport::kind`] can take.
 ///
-/// A `kind` is chosen **at the call site, from which operation failed** —
-/// never by matching on [`Error`]'s variant alone. [`Error::Invalid`] is
-/// produced both by `support::parse_id` and by blob-content validation, so
-/// the variant does not determine the remedy. The constructors below are
-/// therefore named for the operation whose failure they classify, not for
-/// the error they receive.
+/// A `kind` is chosen **at the call site, from which operation failed**,
+/// never by matching on [`Error`]'s variant alone: [`Error::Invalid`] comes
+/// from both `support::parse_id` and blob-content validation, so the variant
+/// does not determine the remedy. The constructors below are named for the
+/// operation whose failure they classify.
 ///
-/// An enum rather than a set of `&'static str` constants so that
-/// [`Kind::code`] is an exhaustive `match`: a kind added without a code
-/// stops compiling. A test that hand-listed the kinds instead could never
-/// be complete, since it would list exactly what it was checking for
-/// completeness.
+/// An enum so that [`Kind::code`] is an exhaustive `match`: a kind added
+/// without a code stops compiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
     /// Nothing is installed at that id. Only from `status(&id)`.
@@ -105,12 +99,11 @@ pub(crate) enum Kind {
     /// [`Installed::OursUnusable`]: crate::manager::Installed::OursUnusable
     Unusable,
     /// Goetia could not determine *whether* anything is installed at that
-    /// id: a read the answer depends on failed. Claims no ownership, which
-    /// is the whole difference from [`Kind::Unusable`] — see
-    /// [`Error::Undetermined`], which is the only thing that produces an
-    /// `errors[]` entry of this kind. The `undetermined[]` key is fed
-    /// separately, from [`Installed::Undetermined`] out of `list()`; both
-    /// exit `4` through [`Kind::code`], which owns that mapping.
+    /// id: a read the answer depends on failed. Claims no ownership, unlike
+    /// [`Kind::Unusable`]. Only [`Error::Undetermined`] produces an `errors[]`
+    /// entry of this kind; the `undetermined[]` key is fed separately, from
+    /// [`Installed::Undetermined`] out of `list()`. Both exit `4` through
+    /// [`Kind::code`].
     ///
     /// [`Installed::Undetermined`]: crate::manager::Installed::Undetermined
     /// Only from `status(&id)`.
@@ -124,8 +117,7 @@ pub(crate) enum Kind {
     /// `--json` was given to a subcommand that does not implement it.
     Unsupported,
     /// Unreachable today; kept so an unclassified failure has a home rather
-    /// than being silently dropped, and never constructed for that reason.
-    /// Not a placeholder for a future concept.
+    /// than being silently dropped.
     #[allow(dead_code)]
     Other,
 }
@@ -149,23 +141,19 @@ impl Kind {
 
     /// The exit code this kind alone would produce.
     ///
-    /// `invalid-id` is `1` rather than `2` deliberately: `2` is anchored to
-    /// "the parser rejected the command line and nothing ran", but
-    /// `goetia daemon status good bad` queries and prints `good` before
-    /// rejecting `bad`, so `2` would mislead exactly the consumer that
-    /// anchor is for. `unsupported` is `2` because there the refusal really
-    /// does happen before anything runs.
+    /// `invalid-id` is `1` rather than `2`: `2` means "the parser rejected the
+    /// command line and nothing ran", but `goetia daemon status good bad`
+    /// prints `good` before rejecting `bad`. `unsupported` is `2` because there
+    /// the refusal does happen before anything runs.
     fn code(self) -> ExitCode {
         match self {
-            // The question was not answered: the partial-answer case `4`
-            // exists for. Whether goetia owns the id (`unusable`) or
-            // could not even find that out (`undetermined`) changes the
-            // remedy, not the code.
+            // The partial-answer case `4` exists for. Whether goetia owns the
+            // id (`unusable`) or could not find that out (`undetermined`)
+            // changes the remedy, not the code.
             Kind::Unusable | Kind::Undetermined => ExitCode::Indeterminate,
             Kind::Unsupported => ExitCode::Usage,
-            // A determinate answer that the command failed, or
-            // (`unavailable`) no answer at all — nothing partial about
-            // either.
+            // A determinate failure, or (`unavailable`) no answer at all;
+            // nothing partial about either.
             Kind::NotInstalled | Kind::Foreign | Kind::Other | Kind::Unavailable | Kind::InvalidId => ExitCode::Error,
         }
     }
@@ -182,9 +170,9 @@ impl serde::Serialize for Kind {
 /// The report for a whole-host listing: every decoded entry a daemon, every
 /// [`Installed::OursUnusable`] an `unusable` error, and everything
 /// goetia could not classify an entry in the third key. `list` and `status`
-/// with no ids both build their report through here, which is what makes the
-/// two emit the identical document for the same machine. Both of
-/// [`InstalledIndex`]'s maps are `BTreeMap`s, so the ordering is by id.
+/// with no ids both build their report here, so they emit the identical
+/// document for the same machine. [`InstalledIndex`]'s maps are `BTreeMap`s,
+/// so the ordering is by id.
 ///
 /// [`Installed::OursUnusable`]: crate::manager::Installed::OursUnusable
 pub(crate) fn from_index(index: &InstalledIndex) -> Report {
@@ -232,24 +220,21 @@ pub(crate) fn daemon(id: &str, status: &Status) -> DaemonReport {
 }
 
 /// Classify a failure of `ServiceManager::status(&id)` — and of nothing
-/// else. `NotInstalled` and `Foreign` are two determinate answers, and
-/// `Undetermined` is the backend saying it established neither; every
-/// remaining error means goetia owns the id and could not report on it,
-/// which is precisely what `list` calls `OursUnusable`. Routing the
-/// remainder to `unusable` is what makes the two subcommands agree about
-/// one machine: a unit that decodes but whose live state cannot be queried
-/// reaches `list` as `Installed::OursUnusable` and `status` as a failure
-/// of its own — an [`Error::Command`] or [`Error::Os`], say.
+/// else. `NotInstalled` and `Foreign` are determinate answers, and
+/// `Undetermined` is the backend establishing neither; every remaining error
+/// means goetia owns the id and could not report on it, which `list` calls
+/// `OursUnusable`. Routing the remainder to `unusable` makes the two
+/// subcommands agree about one machine: a unit that decodes but whose live
+/// state cannot be queried reaches `list` as `Installed::OursUnusable` and
+/// `status` as a failure of its own, an [`Error::Command`] or [`Error::Os`],
+/// say.
 ///
-/// Three of the named arms are still the operation's own vocabulary, not a
-/// classification by error variant: `status(&id)` is the one operation that
-/// answers "what is at this id", so its three answers — absent, present and
-/// foreign, unestablished — are exactly what its failures can mean.
+/// The three named arms are the operation's own vocabulary (absent, foreign,
+/// unestablished), not a classification by error variant.
 ///
-/// The fourth, [`Error::NoManager`], is the one failure that says nothing
-/// about the id: goetia would ask no manager about it, which is
-/// `unavailable` under the id, exit `1` — per id, as every verb given ids
-/// answers each one.
+/// [`Error::NoManager`] says nothing about the id: no manager was available to
+/// ask. It is `unavailable` under the id, exit `1`, per id like every verb
+/// given ids.
 pub(crate) fn status_error(id: &str, e: &Error) -> ErrorReport {
     let kind = match e.cause() {
         Error::NoManager { .. } => Kind::Unavailable,
@@ -269,9 +254,8 @@ pub(crate) fn status_error(id: &str, e: &Error) -> ErrorReport {
 /// was given, even though that id never became an [`crate::spec::Id`].
 ///
 /// Carries [`Error::Invalid`]'s `message` field rather than its `Display`,
-/// which prefixes ``daemon `X`: ``. The `id` field is the attribution, and
-/// the text renderer prefixes the id too, so `Display` would put the same
-/// id on one line three times.
+/// which prefixes ``daemon `X`: ``: the `id` field and the text renderer both
+/// carry the id already.
 pub(crate) fn invalid_id(id: &str, e: &Error) -> ErrorReport {
     let message = match e {
         Error::Invalid { message, .. } => message.clone(),
@@ -286,8 +270,7 @@ pub(crate) fn invalid_id(id: &str, e: &Error) -> ErrorReport {
 
 /// `get_manager()` or `mgr.list()` failed, so no answer was obtained for any
 /// daemon: the whole report is this one error, attributable to no id.
-/// Without it, both subcommands would leave stdout empty on this path and
-/// `json.loads` would raise on the empty string.
+/// Without it, stdout would be empty on this path.
 pub(crate) fn unavailable(e: &Error) -> Report {
     Report {
         daemons: Vec::new(),
@@ -328,10 +311,8 @@ pub(crate) fn write(report: &Report, out: &mut dyn Write) -> std::io::Result<()>
     // and no float that could fail to serialize.
     let json = serde_json::to_string(report).expect("a Report serializes infallibly");
     writeln!(out, "{json}")?;
-    // A buffered `out` reports a broken pipe or a full disk here rather
-    // than at the `writeln!` above; without the flush, "the document was
-    // delivered" would mean only "it was accepted into a buffer nobody has
-    // checked yet".
+    // A buffered `out` reports a broken pipe or a full disk here rather than
+    // at the `writeln!` above.
     out.flush()
 }
 
@@ -339,15 +320,11 @@ pub(crate) fn write(report: &Report, out: &mut dyn Write) -> std::io::Result<()>
 /// for it: [`exit_code`] when the document actually reached `out`, or
 /// [`ExitCode::Error`] — with a diagnostic on `err` — when it did not.
 ///
-/// The single funnel every `--json` call site goes through, so none of them
-/// can render the document and compute the exit code independently. A
-/// consumer told "stdout is exactly one JSON document; parse it, then read
-/// `errors`" would otherwise meet an empty stdout beside exit `0` on a
-/// broken pipe or a full disk, and `json.loads` would raise on the empty
-/// string — the exact failure `--json` exists to remove. The write failure
-/// bypasses the combination entirely rather than joining it as
-/// another kind: the kinds describe daemons, and there is no document left
-/// to carry one.
+/// Every `--json` call site goes through here, so none can render the
+/// document and compute the exit code independently: otherwise a broken pipe
+/// or full disk would leave an empty stdout beside exit `0`. The write failure
+/// is not a kind: kinds describe daemons, and there is no document left to
+/// carry one.
 pub(crate) fn emit(report: &Report, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     match write(report, out) {
         Ok(()) => exit_code(report),
@@ -367,10 +344,8 @@ pub(crate) fn exit_code(report: &Report) -> ExitCode {
         .errors
         .iter()
         .map(|e| e.kind.code())
-        // The third key's code comes from `Kind::code` like every other,
-        // never a literal: that exhaustive match is the only reason a kind
-        // cannot exist without a code (see `Kind`'s doc comment), and a
-        // second assignment site here would quietly retire the guarantee.
+        // From `Kind::code`, never a literal: a second assignment site would
+        // retire the exhaustive-match guarantee (see `Kind`).
         .chain(report.undetermined.iter().map(|_| Kind::Undetermined.code()))
         .max()
         .unwrap_or(ExitCode::Success)

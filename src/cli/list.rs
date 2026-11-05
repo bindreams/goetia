@@ -40,9 +40,8 @@ pub fn run(
     report::exit_code(&report)
 }
 
-/// The human-readable rendering. Reads the [`InstalledIndex`] rather than
-/// the `Report` for one reason: the wire format deliberately omits `name`,
-/// and this is the column that carries it.
+/// The human-readable rendering. Reads the [`InstalledIndex`] rather than the
+/// `Report` because the wire format omits `name`, which this table shows.
 fn print_text(index: &InstalledIndex, out: &mut dyn Write, err: &mut dyn Write) {
     print_unusable_warnings(&index.unusable, err);
     print_undetermined_warnings(&index.undetermined, err);

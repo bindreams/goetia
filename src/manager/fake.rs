@@ -1,11 +1,10 @@
 //! [`Fake`]: an in-memory `Backend` with no real I/O, and so a [`ServiceManager`].
 //!
-//! Every CLI test in this crate runs against `Fake`, never a real backend —
-//! see `manager.rs`'s module doc comment. Its `install`, `status` and `list`
-//! are the shared flows in `crate::manager::flow`, as for every backend:
-//! its own tiny `generate`/`extract` pair below (not any real
-//! systemd/launchd/SCM format) exists only so `decide` has something to
-//! compare, the same role each real backend's own generator plays.
+//! Every CLI test in this crate runs against `Fake`, never a real backend.
+//! Its `install`, `status` and `list` are the shared flows in
+//! `crate::manager::flow`, as for every backend; its tiny `generate`/`extract`
+//! pair below (not any real format) exists only so `decide` has something to
+//! compare.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -22,10 +21,8 @@ use crate::manager::flow;
 use crate::manager::{Budget, Installed, ServiceManager, State, Status, Step};
 use crate::spec::{DaemonSpec, Id, User};
 
-/// The fake's own artifact marker. Deliberately not any of the real
-/// `Marker`/`Schema`/`Version`/`Spec` field names — this is not a format any
-/// real manager reads, so the Global Constraints' byte-exact metadata
-/// naming does not apply to it.
+/// The fake's own artifact marker, deliberately not any real backend's
+/// `Marker`/`Schema`/`Version`/`Spec` field names: no real manager reads it.
 const FAKE_MARKER: &str = "FAKE-GOETIA-ARTIFACT";
 
 /// A fake "PID" reported by [`ServiceManager::status`] while an entry is
@@ -34,7 +31,7 @@ const FAKE_PID: u32 = 1;
 
 /// Why an opaque id could not be classified — see [`Fake::seed_opaque`].
 /// Shared by [`Store::undetermined`] and [`Fake::scan`] so the error and the
-/// `list` entry cannot describe the same condition differently.
+/// `list` entry describe the condition alike.
 fn opaque_reason() -> Error {
     Error::os(
         "read the artifact",
@@ -42,10 +39,8 @@ fn opaque_reason() -> Error {
     )
 }
 
-/// The pid `Fake` reports for a given state. `status` and `list` must never
-/// disagree about the same entry, so they share this rule rather than each
-/// spelling it out — the three real backends get that guarantee from calling
-/// one query function, and nothing but this helper would give it to `Fake`.
+/// The pid `Fake` reports for a given state. `status` and `list` share this
+/// rule so they cannot disagree about the same entry.
 fn pid_for(state: State) -> Option<u32> {
     if state == State::Running { Some(FAKE_PID) } else { None }
 }
@@ -79,11 +74,8 @@ pub(crate) struct Entry {
     /// (ours), or arbitrary seeded text (foreign).
     text: String,
     enabled: bool,
-    /// Not just running/stopped: test-only [`Fake::seed_state`] can force
-    /// `Failed`/`Unknown` too, so CLI rendering code that switches on all
-    /// four [`State`] variants (`support::state_str`) has a way to be
-    /// exercised for the two a normal install/start/stop sequence can never
-    /// produce.
+    /// Not just running/stopped: [`Fake::seed_state`] forces `Failed` and
+    /// `Unknown`, which no install/start/stop sequence produces.
     state: State,
 }
 
@@ -98,21 +90,18 @@ impl std::fmt::Debug for Failure {
 
 /// An in-memory [`ServiceManager`]. See the module doc comment.
 ///
-/// Cheaply `Clone`: every clone shares the same underlying store through an
-/// `Arc`. `dispatch`'s `get_manager` closure returns an owned
-/// `Box<dyn ServiceManager>` on every call, so a CLI test that dispatches
-/// more than once against the same fake (installing, then listing, then
-/// uninstalling) needs a `Fake` clone to observe the same state each time,
-/// not a fresh empty one.
+/// Cheaply `Clone`: every clone shares the same store through an `Arc`.
+/// `dispatch`'s `get_manager` closure returns an owned box on every call, so a
+/// CLI test that dispatches more than once against the same fake needs a
+/// clone to see the same state each time.
 #[derive(Debug, Default, Clone)]
 pub struct Fake {
     state: Arc<Mutex<Store>>,
 }
 
 /// [`Fake`]'s whole world: the artifacts, plus the ids that carry only a
-/// *residual* one. The two are separate maps because a residual artifact is
-/// defined by the primary one being gone — an id cannot be in `entries` and
-/// still be residue-only.
+/// *residual* one. Separate maps: residue is defined by the primary artifact
+/// being gone.
 #[derive(Debug, Default)]
 struct Store {
     entries: BTreeMap<String, Entry>,
@@ -125,8 +114,8 @@ struct Store {
     /// that would have found an entry is the one that failed.
     opaque: BTreeSet<String>,
     /// One reason per seeded aggregate — see
-    /// [`Fake::seed_aggregate_undetermined`]. Not a set of ids: an
-    /// aggregate is precisely the case where the ids are not known.
+    /// [`Fake::seed_aggregate_undetermined`]. Not ids: an aggregate's ids are
+    /// not known.
     aggregates: Vec<String>,
     start_stalls: BTreeSet<String>,
     stop_stalls: BTreeSet<String>,
@@ -169,10 +158,8 @@ impl Store {
         }
         Ok(match self.entries.get(id.as_str()) {
             Some(entry) => Self::classify(entry).named(id, Artifact::new),
-            // Never absent: whatever the platform still applies here is
-            // configuration goetia did not write and cannot show, and
-            // `NotInstalled` is the one error `cli::uninstall` renders as
-            // success.
+            // Never absent: `NotInstalled` is the one error `cli::uninstall`
+            // renders as success, and the platform still applies this residue.
             None => match self.residual.get(id.as_str()) {
                 Some(recovery) => ReadOutcome::Foreign {
                     recovery: recovery.clone(),
@@ -212,10 +199,9 @@ impl Fake {
         Self::default()
     }
 
-    /// Test-only seeding: place `text`, carrying no Goetia marker, at `id`
-    /// — simulating a pre-existing service Goetia did not create. The shared
-    /// flow then classifies it as `ReadOutcome::Foreign`. See
-    /// `manager::conformance`'s module doc comment.
+    /// Test-only seeding: place `text`, carrying no Goetia marker, at `id`,
+    /// simulating a pre-existing service Goetia did not create. The shared
+    /// flow classifies it as `ReadOutcome::Foreign`.
     pub fn seed_foreign(&self, id: &str, text: impl Into<String>) {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.entries.insert(
@@ -237,11 +223,10 @@ impl Fake {
 
     /// Test-only seeding: place a Goetia-marked entry at `id` whose blob will
     /// not decode — simulating a newer-schema artifact or one that bit-rotted.
-    /// `install_then_hand_edit` cannot produce this state: `extract` only
-    /// ever reads the marker and `Spec` line, so appending trailing text
-    /// never breaks decoding. This is the only way to reach
+    /// `install_then_hand_edit` cannot produce this state: `extract` reads only
+    /// the marker and `Spec` line. The only way to reach
     /// `Ownership::OursUnusable`/[`Installed::OursUnusable`] from outside
-    /// the crate — every CLI test that exercises that path needs it.
+    /// the crate.
     ///
     /// [`Installed::OursUnusable`]: crate::manager::Installed::OursUnusable
     pub fn seed_unusable(&self, id: &str) {
@@ -253,16 +238,14 @@ impl Fake {
     /// [`blob::decode`] rejects it with [`Error::Invalid`] rather than
     /// [`Error::Blob`].
     ///
-    /// [`Fake::seed_unusable`] cannot reach this: malformed base64 fails
-    /// at the envelope and yields `Error::Blob`. `Error::Invalid` is the
-    /// variant `spec::Id::try_from` *also* produces, so it is the one a CLI
-    /// classifying failures by error variant instead of by which operation
-    /// failed would misroute to `invalid-id`. Nothing else in the crate can
+    /// [`Fake::seed_unusable`] cannot reach this: malformed base64 fails at the
+    /// envelope and yields `Error::Blob`. `spec::Id::try_from` *also* produces
+    /// `Error::Invalid`, so a CLI classifying failures by variant rather than
+    /// by operation would misroute it to `invalid-id`. Nothing else can
     /// produce it from a manager.
     ///
-    /// The out-of-range value is `restart_delay.nanos == 1_000_000_000`,
-    /// which `blob::duration_from_wire` checks precisely because
-    /// `Duration::new` would otherwise panic on it.
+    /// The out-of-range value is `restart_delay.nanos == 1_000_000_000`, which
+    /// `blob::duration_from_wire` checks because `Duration::new` would panic.
     pub fn seed_invalid_content(&self, id: &str) {
         use base64::Engine as _;
         use base64::engine::general_purpose::STANDARD as BASE64;
@@ -275,8 +258,7 @@ impl Fake {
             env: std::collections::BTreeMap::new(),
             user: crate::spec::User::Root,
             restart: crate::spec::Restart::OnFailure,
-            // Replaced with the out-of-range value below; only its presence
-            // matters here, so that the field is on the wire at all.
+            // Replaced with the out-of-range value below; present so the field is on the wire.
             restart_delay: Some(std::time::Duration::from_secs(1)),
             logs: None,
             kind: crate::spec::Kind::Simple,
@@ -291,9 +273,7 @@ impl Fake {
     }
 
     /// Test-only seeding: install `spec` normally, then append `extra_line`
-    /// to the stored artifact so it no longer matches what regenerating its
-    /// own embedded spec would produce — simulating a hand-edit made
-    /// outside Goetia. See `manager::conformance`'s module doc comment.
+    /// to the stored artifact, simulating a hand-edit made outside Goetia.
     pub fn install_then_hand_edit(&self, spec: &DaemonSpec, extra_line: &str) {
         self.install(spec, false).expect("seed install must succeed");
         let mut state = self.state.lock().expect("Fake mutex poisoned");
@@ -308,13 +288,11 @@ impl Fake {
     }
 
     /// Test-only seeding: place a Goetia-marked entry at `id` whose blob
-    /// decodes cleanly but carries `version` instead of the currently
-    /// running crate's own — simulating an artifact written by a different
-    /// Goetia release, so `decide` reports [`Outcome::Stale`] rather than
-    /// [`Outcome::Conflict`]. Tampers the same way [`Fake::seed_invalid_content`]
-    /// does: encode a real blob, then patch just the field under test,
-    /// since [`blob::encode`] always embeds [`crate::version()`] and has no
-    /// parameter to override it.
+    /// decodes cleanly but carries `version` instead of the running crate's,
+    /// simulating an artifact written by a different Goetia release, so
+    /// `decide` reports [`Outcome::Stale`] rather than [`Outcome::Conflict`].
+    /// Patches a real blob as [`Fake::seed_invalid_content`] does, since
+    /// [`blob::encode`] always embeds [`crate::version()`].
     pub fn seed_stale(&self, spec: &DaemonSpec, version: &str) {
         use base64::Engine as _;
         use base64::engine::general_purpose::STANDARD as BASE64;
@@ -335,15 +313,12 @@ impl Fake {
     /// belong to. Both outlive the unit fragment, and the second keeps the
     /// id enrolled at boot.
     ///
-    /// No other seeder reaches it, because it is defined by what is *not*
-    /// there: an id whose primary artifact is gone looks identical to an
-    /// empty one to any verb that only ever looks the id up. That matters
-    /// because `cli::uninstall` maps [`Error::NotInstalled`] — and only that
-    /// variant — to exit `0` and "nothing to do", so a manager answering
-    /// `NotInstalled` here certifies "confirmed gone" for an id the platform
-    /// is still acting on, while `install` on that same id refuses it as
+    /// No other seeder reaches it: it is defined by what is *not* there.
+    /// `cli::uninstall` maps only [`Error::NotInstalled`] to exit `0` and
+    /// "nothing to do", so answering it here would certify "confirmed gone"
+    /// for an id the platform still acts on, while `install` refuses it as
     /// foreign. `Fake` answers [`Error::Foreign`] instead, and `list` omits
-    /// the id entirely — residue is not a daemon to report on.
+    /// the id: residue is not a daemon to report on.
     pub fn seed_residual_artifact(&self, id: &str) {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.entries.remove(id);
@@ -365,17 +340,13 @@ impl Fake {
     /// reports [`Installed::Undetermined`], because a read that did not
     /// complete establishes neither the id's absence nor its ownership.
     ///
-    /// The only way to reach that state in-crate: the fake's artifacts are
-    /// in-memory strings and are always readable, so the failure has to be
-    /// modelled rather than provoked. It is a dimension of its own and not
-    /// a field on `Entry` because an opaque id must also refuse `install`,
-    /// which never looks an `Entry` up.
+    /// The fake's artifacts are always readable, so the failure is modelled.
+    /// It is not a field on `Entry` because an opaque id must also refuse
+    /// `install`, which never looks an `Entry` up.
     ///
-    /// Independent of whether anything is installed at `id`. Over an
-    /// existing entry it is a permission change on a live artifact; over a
-    /// bare id it is the state `manager::conformance` seeds at
-    /// `UNDETERMINED_ID` — a read that failed before it could establish even
-    /// that much. Both are the same claim, which is the point.
+    /// Independent of whether anything is installed at `id`: over an existing
+    /// entry it is a permission change on a live artifact; over a bare id it is
+    /// the state `manager::conformance` seeds at `UNDETERMINED_ID`.
     ///
     /// [`Installed::Undetermined`]: crate::manager::Installed::Undetermined
     pub fn seed_opaque(&self, id: &str) {
@@ -385,13 +356,10 @@ impl Fake {
 
     /// Test-only seeding: make `list` report one [`Installed::Undetermined`]
     /// entry that names nobody — the shape a backend produces when it cannot
-    /// usefully name what the entry stands for. Windows SCM produces it on an
-    /// unelevated `list` not because enumeration failed (it succeeds, and the
-    /// names are known) but because hundreds of services deny a `Parameters`
-    /// read at once and one entry cannot carry them all.
+    /// usefully name what the entry stands for (Windows SCM on an unelevated
+    /// `list`, where hundreds of services deny a `Parameters` read at once).
     ///
-    /// `reason` is a complete sentence, because that is how it is rendered:
-    /// there is no name to prefix it with.
+    /// `reason` is a complete sentence: there is no name to prefix it with.
     ///
     /// [`Installed::Undetermined`]: crate::manager::Installed::Undetermined
     pub fn seed_aggregate_undetermined(&self, reason: impl Into<String>) {
@@ -404,9 +372,7 @@ impl Fake {
     /// sequence of real verbs can produce.
     ///
     /// The fake **never sleeps** for it: [`stalled`] reads the budget and
-    /// reports the expiry directly. That is what makes a `--timeout 1h` test
-    /// finish instantly and deterministically instead of being a bet on a
-    /// scheduler.
+    /// reports the expiry directly, so a `--timeout 1h` test finishes instantly.
     pub fn seed_start_stalls(&self, id: &str) {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.start_stalls.insert(id.to_string());
@@ -513,13 +479,10 @@ impl Fake {
     /// Every `start`/`stop`/`restart`/`kill` this Fake was asked to perform, in order, recorded
     /// once the ownership gate passed rather than when it succeeded.
     ///
-    /// Exists because some assertions are about the **absence** of a call,
-    /// which no state read can express: the fake's `start` on an
-    /// already-`Running` entry is idempotent and leaves the state
-    /// byte-identical, so "never called" and "called, changed nothing" are
-    /// indistinguishable from the outside.
-    /// `restart_does_not_start_after_a_stop_that_timed_out` is exactly that
-    /// assertion.
+    /// For assertions about the **absence** of a call, which no state read can
+    /// express: `start` on an already-`Running` entry leaves the state
+    /// byte-identical, so "never called" and "called, changed nothing" look
+    /// alike from outside.
     pub fn calls(&self) -> Vec<(&'static str, String)> {
         let state = self.state.lock().expect("Fake mutex poisoned");
         state.calls.clone()
@@ -585,14 +548,12 @@ fn extract(text: &str) -> Result<Option<Blob>> {
 /// | `Bounded(d)`, `d > 0` | [`budget::timed_out`] |
 /// | `Unbounded` | **panic** |
 ///
-/// `Unbounded` has to panic. `waits()` is true for it, so a rule phrased as
-/// "a stalled entry under a waiting budget times out" routes it into
-/// `budget::timed_out`, whose own `debug_assert!` requires a `Bounded`
-/// budget — leaving the fake to either trip that assert or report an expiry
-/// that provably cannot have happened. The honest model is "hang forever",
-/// which is unusable in a test, and a fake that cannot honestly model a case
-/// must refuse it rather than approximate it. Deterministic, loud, and
-/// impossible to mistake for a backend behaviour.
+/// `Unbounded` has to panic. `waits()` is true for it, so "a stalled entry
+/// under a waiting budget times out" would route it into `budget::timed_out`,
+/// whose `debug_assert!` requires a `Bounded` budget, or report an expiry that
+/// cannot have happened. The honest model is "hang forever", unusable in a
+/// test, and a fake that cannot model a case must refuse it. Deterministic,
+/// loud, and impossible to mistake for a backend behaviour.
 fn stalled(id: &Id, awaited: &'static str, budget: Budget) -> Result<()> {
     match budget {
         Budget::Immediate | Budget::Bounded(Duration::ZERO) => Ok(()),
@@ -828,18 +789,16 @@ impl crate::backend::Backend for Fake {
         let id = snapshot.id();
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         // Recorded once the gate has passed, ahead of every check below: `calls` answers "was this
-        // attempted", which is a different question from whether it succeeded or changed anything.
+        // attempted", not whether it succeeded or changed anything.
         state.calls.push(("start", id.as_str().to_string()));
         in_doubt(&state, id)?;
         let stalls = state.start_stalls.contains(id.as_str());
         let entry = state.confirm(&snapshot)?;
         if stalls {
-            // No confirmation is coming, so none is invented: the state is
-            // left exactly as it was on every branch `stalled` can take.
+            // No confirmation is coming, so the state is left as it was on every branch `stalled` takes.
             return stalled(id, "running", budget);
         }
-        // Request-only: no real backend establishes anything here, so
-        // neither does the Fake — see `ServiceManager::start`.
+        // Request-only establishes nothing, here as in every real backend.
         if budget.waits() {
             entry.state = State::Running;
         }
@@ -884,11 +843,9 @@ impl crate::backend::Backend for Fake {
         if stalls {
             return stalled(id, "stopped", budget);
         }
-        // Idempotent: stopping an already-stopped (or failed, or unknown)
-        // service is `Ok(())` — see `ServiceManager::stop`'s doc comment for
-        // why every backend must agree on this. Request-only settles nothing,
-        // as for `start`: the Fake models the contract's minimum, not
-        // launchd's blocking `bootout`.
+        // Idempotent, as `ServiceManager::stop` requires of every backend.
+        // Request-only settles nothing, as for `start`: the Fake models the
+        // contract's minimum, not launchd's blocking `bootout`.
         if budget.waits() {
             entry.state = State::Stopped;
         }
