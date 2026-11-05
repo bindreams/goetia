@@ -50,11 +50,13 @@ impl ServiceGuard {
 
 impl Drop for ServiceGuard {
     fn drop(&mut self) {
-        let mut problems = cleanup(&self.id);
+        let problems = cleanup(&self.id);
         // After `cleanup`: it is the stop the leftover's wait depends on.
         #[cfg(windows)]
-        problems.extend(self.leftover.as_ref().and_then(|path| remove_leftover(&self.id, path)));
-        for problem in problems {
+        let leftover = self.leftover.as_ref().and_then(|path| remove_leftover(&self.id, path));
+        #[cfg(not(windows))]
+        let leftover: Option<String> = None;
+        for problem in problems.into_iter().chain(leftover) {
             eprintln!("ServiceGuard[{}]: cleanup failed: {problem}", self.id);
         }
     }
