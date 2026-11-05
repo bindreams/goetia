@@ -33,7 +33,9 @@ static DAEMON_LOG: OnceLock<PathBuf> = OnceLock::new();
 /// From now on, failures go to `path` (see [`daemon_log_path`]) instead of the default. Call once,
 /// right after the spec decodes; a later call changes nothing.
 pub fn set_daemon_log(path: PathBuf) {
-    let _ = DAEMON_LOG.set(path);
+    if let Err(second) = DAEMON_LOG.set(path) {
+        debug_assert_eq!(Some(&second), DAEMON_LOG.get(), "the daemon's log is set once");
+    }
 }
 
 fn programdata_dir() -> PathBuf {
@@ -140,7 +142,7 @@ pub enum Severity {
 
 /// Write `message` to the log file and the Windows Event Log as an error — both best-effort,
 /// so a decode or spawn failure is never lost just because one of the two channels is itself
-/// unavailable (see the module doc comment for why each can independently fail).
+/// unavailable.
 ///
 /// A test build journals the line instead; see `test_hook`.
 pub fn log_failure(id: &str, message: &str) {
@@ -197,7 +199,7 @@ fn log_destinations(daemon_log: Option<&Path>, default: PathBuf) -> Vec<PathBuf>
     }
 }
 
-/// Whether `line` was written. Best-effort: a failure to open or write is reported, not raised.
+/// Whether `line` was written; open/write failures are reported, not raised.
 fn write_line(path: &Path, line: &str) -> bool {
     open_append(path).and_then(|mut f| append_line(&mut f, line)).is_ok()
 }
