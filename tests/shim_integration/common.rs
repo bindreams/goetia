@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use goetia::backend::scm::exit_status::RecordedExit;
 use goetia::backend::scm::manager::Scm;
-use goetia::manager::Budget;
 use goetia::spec::{DaemonSpec, Kind};
 use windows_service::service::{Service, ServiceAccess, ServiceState, ServiceStatus};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
@@ -32,16 +31,15 @@ pub fn fixture_command(mode: &str, args: &[&str]) -> Vec<String> {
 }
 
 /// Cleanup for a shim-hosted service `id`, in this order:
-/// 1. the product's `stop`, bounded by [`support::service_guard::CLEANUP_BOUND`], so that a shim
-///    that ignores STOP cannot hang cleanup while a failed test unwinds;
-/// 2. once that confirmed the stop, the product's `uninstall`, which disables the service, settles a
-///    restart that has begun, and deletes it;
-/// 3. a [`support::ServiceGuard`]'s `sc stop` and `sc delete`, for what `uninstall` does not own;
-/// 4. [`LeftoverLog`]: the file the shim writes when it fails before it has read the daemon's config.
+/// 1. the product's `uninstall`, which disables the service, waits out a start that has begun,
+///    stops it and deletes it. Its wait has no bound: a shim that never stops is a hung test, which
+///    the CI watchdog reports;
+/// 2. a [`support::ServiceGuard`]'s `sc stop` and `sc delete`, for what `uninstall` does not own;
+/// 3. [`LeftoverLog`]: the file the shim writes when it fails before it has read the daemon's config.
 ///
-/// Steps 1 and 2 are this type's `drop`; steps 3 and 4 are its fields, which drop in declaration
-/// order. A failure prints a line and never panics; one that leaves the stop unconfirmed keeps the
-/// log, which the shim may still hold.
+/// Step 1 is this type's `drop`; steps 2 and 3 are its fields, which drop in declaration order. A
+/// failure prints a line and never panics; one that leaves the stop unconfirmed keeps the log,
+/// which the shim may still hold.
 pub struct ShimGuard {
     id: String,
     _sc: support::ServiceGuard,
@@ -65,8 +63,8 @@ impl ShimGuard {
         &self.id
     }
 
-    /// Steps 1 and 2, and what they decide for the log.
-    fn stop_and_uninstall(&self) -> Fate {
+    /// Step 1, and what it decides for the log.
+    fn uninstall(&self) -> Fate {
         use goetia::error::Error;
         use goetia::manager::ServiceManager as _;
 
@@ -78,17 +76,10 @@ impl ShimGuard {
             Ok(id) => id,
             Err(e) => return fail("parse the id", &e),
         };
-        let scm = Scm::new();
-        match scm.stop(&id, Budget::Bounded(support::service_guard::CLEANUP_BOUND)) {
-            // Stopped, or gone.
-            Ok(()) | Err(Error::NotInstalled { .. }) => {}
-            // Not goetia's: nothing of it is ours to remove; the `sc` guard owns the service.
-            Err(Error::Foreign { .. }) => return Fate::Skip,
-            Err(e) => return fail("stop", &e),
-        }
-        match scm.uninstall(&id) {
+        match Scm::new().uninstall(&id) {
             Ok(()) | Err(Error::NotInstalled { .. }) => Fate::Remove,
-            Err(Error::Foreign { .. }) => Fate::Skip,
+            // Not goetia's, so nothing confirms its shim stopped; the `sc` guard owns the service.
+            Err(Error::Foreign { .. }) => Fate::Keep("the service is not goetia's".to_string()),
             Err(e) => fail("uninstall", &e),
         }
     }
@@ -96,16 +87,14 @@ impl ShimGuard {
 
 impl Drop for ShimGuard {
     fn drop(&mut self) {
-        self.log.fate = self.stop_and_uninstall();
+        self.log.fate = self.uninstall();
     }
 }
 
 /// What [`LeftoverLog`] does with its file.
 enum Fate {
     Remove,
-    /// The service is not goetia's, so the file is not either.
-    Skip,
-    /// The stop was not confirmed, and the shim may still hold the file.
+    /// The stop was not confirmed, and the shim may still write the file.
     Keep(String),
 }
 
@@ -119,7 +108,6 @@ struct LeftoverLog {
 impl Drop for LeftoverLog {
     fn drop(&mut self) {
         let problem = match &self.fate {
-            Fate::Skip => return,
             Fate::Keep(why) => Some(format!("left {}: {why}", self.path.display())),
             Fate::Remove => support::service_guard::remove_path_retrying(&self.path, false),
         };

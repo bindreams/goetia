@@ -35,7 +35,11 @@ static DAEMON_LOG: OnceLock<PathBuf> = OnceLock::new();
 /// debug-asserted.
 pub fn set_daemon_log(path: PathBuf) {
     if let Err(second) = DAEMON_LOG.set(path) {
-        debug_assert_eq!(Some(&second), DAEMON_LOG.get(), "the daemon's log is set once");
+        debug_assert_eq!(
+            Some(&second),
+            DAEMON_LOG.get(),
+            "a second `set_daemon_log` must carry the same path"
+        );
     }
 }
 
