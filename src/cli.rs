@@ -2,21 +2,17 @@
 //! dispatcher.
 //!
 //! [`dispatch`] is wired to `goetia::manager::native()` by [`crate`'s bin
-//! target](../../src/main.rs) — never to [`crate::manager::fake::Fake`]. A
-//! CLI that secretly talked to the fake would pass every test here and do
-//! nothing on a real machine. On a platform without a backend yet (Linux
-//! has one), every mutating and every list/status subcommand therefore
-//! fails on a real host with `no backend
-//! for <platform> yet` — the message [`crate::manager::native`] returns.
-//! `install --dry-run` and `show -f <file>` are the exceptions: they need
-//! no backend at all (pure generation, or a spec read straight from a
-//! file), so they keep working regardless. `diff` always needs a manager,
-//! `-f` or not — comparing against installed state is its entire job.
+//! target](../../src/main.rs), never to [`crate::manager::fake::Fake`]: a CLI
+//! that secretly talked to the fake would pass every test here and do nothing
+//! on a real machine. On a platform without a backend, every subcommand
+//! that needs a manager therefore fails with the `no backend for <platform>
+//! yet` message [`crate::manager::native`] returns. `install --dry-run` and
+//! `show -f <file>` need no backend (pure generation, or a spec read from a
+//! file). `diff` always needs one, `-f` or not.
 //!
-//! `dispatch` takes `get_manager` and `is_elevated` as lazily-invoked
-//! closures for exactly this reason: a subcommand that does not need a
-//! manager, or does not need elevation, must never call either — tests
-//! prove this by handing in a closure that panics if called.
+//! `get_manager` and `is_elevated` are lazily-invoked closures so that a
+//! subcommand that needs neither never calls it; tests hand in a closure that
+//! panics if called.
 
 pub mod diff;
 pub mod disable;
@@ -127,20 +123,17 @@ pub enum DaemonCommand {
 ///   as success — `Error::NotInstalled` says nothing about the *process*,
 ///   only the artifact, which is why every other id-verb keeps that same
 ///   error at `1` instead; see `IdVerbCall::absent_is_success`'s doc
-///   comment for the full seven-verb table. That table is about an absent
-///   artifact, so it never reaches an id whose absence was not established:
-///   that is `4` for all seven verbs, `uninstall` included.
+///   comment for the full seven-verb table. An id whose absence was not
+///   established is `4` for all seven verbs, `uninstall` included.
 /// - `1` error: an operation was attempted and failed, or was refused
 ///   outright. `kill` of a daemon with no process is this
 ///   ([`Error::NotRunning`](crate::error::Error::NotRunning)): nothing was killed.
 /// - `2` usage: clap rejected the command line before `dispatch` ever ran,
 ///   or `dispatch` refused to run anything: `--json` on a subcommand that
 ///   does not implement it, or a wait flag on an `install` with no `--start`
-///   to bound. Anchored to clap's own default for a
-///   rejected command line — the same code bash and argparse both use for
-///   "the parser, not the program, rejected this" — so `main.rs`
-///   deliberately keeps calling `Cli::parse()` un-overridden and lets clap
-///   return `2` on its own; the absence of an override *is* the decision.
+///   to bound. Anchored to clap's default for a rejected command line (also
+///   bash's and argparse's), so `main.rs` keeps calling `Cli::parse()`
+///   un-overridden and lets clap return `2` on its own.
 /// - `3` drift: a determinate "installed state differs from the manifest"
 ///   answer — `diff` returns it when the daemon would change
 ///   (`cli::diff::run`, the only place this code is returned).
@@ -162,12 +155,7 @@ pub enum DaemonCommand {
 /// - `5` conflict: an installed artifact was modified outside Goetia and
 ///   `--force` was not given. Returned by `cli::install::run` and by
 ///   `cli::diff::run` for the identical `Outcome::Conflict` — the two places
-///   this code is returned. App-specific,
-///   anchored to nothing, which is why it is the one that moved: `2` is
-///   anchored to three conventions at once (clap, bash, argparse), so
-///   moving *usage* errors off it instead would have stayed internally
-///   consistent while giving up all three to preserve one number nothing
-///   outside Goetia agrees on.
+///   this code is returned. App-specific and anchored to nothing, unlike `2`.
 ///
 /// When more than one outcome applies at once (several ids, or the steps of
 /// one `install`), the verb returns the greatest [`ExitCode`], which is
@@ -191,7 +179,7 @@ pub enum DaemonCommand {
 /// stdout empty, and exits `2`. Rendering those as JSON would mean
 /// pre-scanning `std::env::args()` before parsing, or intercepting
 /// `try_parse` and re-rendering clap's own diagnostics — both worse than the
-/// carve-out. `tests/cli_binary.rs` pins all three cases.
+/// carve-out.
 pub fn dispatch(
     cli: &Cli,
     get_manager: &dyn Fn() -> Result<Box<dyn ServiceManager>>,
@@ -218,14 +206,12 @@ fn run(
         return report::emit(&report, out, err);
     }
 
-    // The second rule of this shape, and it lives here for the same reason
-    // as the first: a command line goetia will not act on must run
-    // *nothing*, and rules of that shape belong in one place rather than
-    // split between clap and `dispatch`. `install` without `--start` starts
-    // nothing, so a budget named for that start can never be spent.
-    // `requires = "start"` cannot express it: `--dry-run` makes `--start`
-    // and the wait flags alike inert, and must keep accepting all three.
-    // Checked after the `--json` refusal, so that one wins when both apply.
+    // A command line goetia will not act on must run nothing, and these rules
+    // live here rather than split with clap. `install` without `--start`
+    // starts nothing, so a budget named for that start can never be spent.
+    // `requires = "start"` cannot express it: `--dry-run` makes `--start` and
+    // the wait flags alike inert, and must keep accepting all three.
+    // After the `--json` refusal, so that one wins when both apply.
     if matches!(cmd, DaemonCommand::Install(args) if args.wait.was_given() && !args.start && !args.dry_run) {
         let _ = writeln!(
             err,
