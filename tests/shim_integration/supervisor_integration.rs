@@ -9,19 +9,18 @@
 use std::collections::BTreeMap;
 
 use goetia::backend::scm::exit_status::{ERROR_INVALID_DATA, RecordedExit};
-use goetia::backend::scm::manager::Scm;
 use goetia::manager::{Budget, ServiceManager as _};
 use goetia::spec::{DaemonSpec, Restart};
 use windows_service::service::{ServiceExitCode, ServiceState};
 
-use crate::common::{LogDir, fixture_command, parameters_key, recorded_exit, scm_status, simple_spec};
+use crate::common::{LogDir, ShimManager, fixture_command, parameters_key, recorded_exit, scm_status, simple_spec};
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn shim_runs_child_with_cwd_and_env() {
-    let mgr = Scm::new();
     let id = support::random_test_id();
     let logs = LogDir::new();
+    let mgr = ShimManager::new(&logs);
     let _guard = ServiceGuard::new(&id);
     let reported = ConnectBack::listen();
 
@@ -36,7 +35,7 @@ fn shim_runs_child_with_cwd_and_env() {
             &logs,
         )
     };
-    logs.install(&mgr, &spec);
+    mgr.install(&spec, false).expect("install");
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
 
     let line = reported.accept_line("the fixture to report its cwd and env");
@@ -59,9 +58,9 @@ fn shim_runs_child_with_cwd_and_env() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn shim_captures_stdout_to_logs_path() {
-    let mgr = Scm::new();
     let id = support::random_test_id();
     let logs = LogDir::new();
+    let mgr = ShimManager::new(&logs);
     let _guard = ServiceGuard::new(&id);
     let reported = ConnectBack::listen();
     let log_path = logs.path_for(&id);
@@ -72,7 +71,7 @@ fn shim_captures_stdout_to_logs_path() {
         fixture_command("write-log", &[&reported.port().to_string(), MARKER]),
         &logs,
     );
-    logs.install(&mgr, &spec);
+    mgr.install(&spec, false).expect("install");
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     reported.accept("the fixture to finish writing its log lines");
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
@@ -89,9 +88,9 @@ fn shim_captures_stdout_to_logs_path() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn stop_kills_the_whole_process_tree() {
-    let mgr = Scm::new();
     let id = support::random_test_id();
     let logs = LogDir::new();
+    let mgr = ShimManager::new(&logs);
     let _guard = ServiceGuard::new(&id);
     let child_reported = ConnectBack::listen();
     let grandchild_reported = ConnectBack::listen();
@@ -110,7 +109,7 @@ fn stop_kills_the_whole_process_tree() {
             &logs,
         )
     };
-    logs.install(&mgr, &spec);
+    mgr.install(&spec, false).expect("install");
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     let child_pid = child_reported.accept_line("the direct child to start and report its pid");
     let grandchild_pid = grandchild_reported.accept_line("the grandchild to start and report its pid");
@@ -154,13 +153,13 @@ fn pid_is_alive(pid: &str) -> bool {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn unreadable_blob_logs_to_fallback_path_and_event_log() {
-    let mgr = Scm::new();
     let id = support::random_test_id();
     let logs = LogDir::new();
+    let mgr = ShimManager::new(&logs);
     let _guard = ServiceGuard::new(&id);
 
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
-    logs.install(&mgr, &spec);
+    mgr.install(&spec, false).expect("install");
 
     corrupt_spec_value(&id);
 

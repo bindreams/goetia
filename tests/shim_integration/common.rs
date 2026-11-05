@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use goetia::backend::scm::exit_status::RecordedExit;
 use goetia::backend::scm::manager::Scm;
-use goetia::manager::ServiceManager as _;
-use goetia::spec::{DaemonSpec, Kind};
+use goetia::decide::Outcome;
+use goetia::manager::{Budget, Installed, Sequence, Status, Step};
+use goetia::spec::{DaemonSpec, Id, Kind};
 use windows_service::service::{Service, ServiceAccess, ServiceState, ServiceStatus};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
@@ -33,7 +34,7 @@ pub fn fixture_command(mode: &str, args: &[&str]) -> Vec<String> {
 }
 
 /// A temp dir the test owns, for everything the test makes its shims and daemons write: the daemons'
-/// logs, and the shims' fallback logs once [`Self::install`] points them here. Nothing
+/// logs, and the shims' fallback logs once a [`ShimManager`] points them here. Nothing
 /// goes to the `%ProgramData%\Goetia\logs\` default.
 ///
 /// Removed on drop, retried for up to [`REMOVE_BOUND`] and then let go with a warning: a daemon may
@@ -60,21 +61,7 @@ impl LogDir {
         self.0.join(format!("{id}.log"))
     }
 
-    /// Installs `spec`, then makes its shim write its fallback log (the one `logging::default_log_path`
-    /// derives from `%ProgramData%`) under this dir: SCM adds the `Environment` lines of the
-    /// registration to the environment of the process it launches, which for `type: simple` is the
-    /// shim. Every test that starts a shim installs through this.
-    ///
-    /// A later `install` of the same id is a `Conflict`, since the `Environment` edit is a hand-edit to
-    /// goetia. A test that needs one installs with `mgr.install` instead and gives up the redirect.
-    pub fn install(&self, mgr: &Scm, spec: &DaemonSpec) {
-        mgr.install(spec, false).expect("install");
-        service_key(spec.id.as_str())
-            .set_value("Environment", &vec![format!("ProgramData={}", self.0.display())])
-            .unwrap_or_else(|e| panic!("write Environment of {}: {e}", spec.id));
-    }
-
-    /// The fallback log of `id` once [`Self::install`] has run for it.
+    /// The fallback log of `id`, once a [`ShimManager`] has installed it.
     pub fn fallback_log(&self, id: &str) -> String {
         let path = self.0.join("Goetia").join("logs").join(format!("{id}.log"));
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read fallback log {}: {e}", path.display()))
@@ -114,14 +101,113 @@ pub fn conformance_mk(logs: &LogDir, id: &str) -> DaemonSpec {
     simple_spec(id, fixture_command("report", &["1"]), logs)
 }
 
+// ShimManager =========================================================================================================
+
+/// The [`goetia::manager::ServiceManager`] every test in this suite uses, so that the shims it starts
+/// write their fallback log (the one `logging::default_log_path` derives from `%ProgramData%`) under
+/// the test's [`LogDir`] and not under `%ProgramData%\Goetia\logs\`. SCM adds the `Environment`
+/// lines of a registration to the environment of the process it launches, which for `type: simple`
+/// is the shim; goetia writes none for that type.
+///
+/// Only `install` differs from [`Scm`]. It clears the `Environment` the previous `install` left, which
+/// goetia would read as a hand-edit and refuse, runs the real install, and writes
+/// `ProgramData=<LogDir>` again, so the outcome is the one an unedited registration gives. Only a
+/// shim launched after that sees the new value.
+pub struct ShimManager<'a> {
+    logs: &'a LogDir,
+    scm: Scm,
+}
+
+impl<'a> ShimManager<'a> {
+    pub fn new(logs: &'a LogDir) -> Self {
+        Self { logs, scm: Scm::new() }
+    }
+}
+
+impl goetia::manager::ServiceManager for ShimManager<'_> {
+    fn install(&self, spec: &DaemonSpec, force: bool) -> goetia::Result<Outcome> {
+        let id = spec.id.as_str();
+        let cleared = match try_service_key(id).and_then(|key| key.delete_value("Environment")) {
+            Ok(()) => true,
+            // Not installed yet, or installed with no redirect yet.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => panic!("clear Environment of {id}: {e}"),
+        };
+        let outcome = self.scm.install(spec, force);
+        // After a failed install the redirect is restored if it was cleared; the service may be gone.
+        if outcome.is_ok() || cleared {
+            let redirect = vec![format!("ProgramData={}", self.logs.path().display())];
+            match try_service_key(id).and_then(|key| key.set_value("Environment", &redirect)) {
+                Ok(()) => {}
+                Err(e) if outcome.is_err() && e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => panic!("write Environment of {id}: {e}"),
+            }
+        }
+        outcome
+    }
+
+    fn preview_install(&self, spec: &DaemonSpec) -> goetia::Result<Outcome> {
+        self.scm.preview_install(spec)
+    }
+
+    fn uninstall(&self, id: &Id) -> goetia::Result<()> {
+        self.scm.uninstall(id)
+    }
+
+    fn enable(&self, id: &Id) -> goetia::Result<()> {
+        self.scm.enable(id)
+    }
+
+    fn disable(&self, id: &Id) -> goetia::Result<()> {
+        self.scm.disable(id)
+    }
+
+    fn start(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
+        self.scm.start(id, budget)
+    }
+
+    fn prepare(&self, steps: &[Step], budget: Budget) -> goetia::Result<Box<dyn Sequence + '_>> {
+        self.scm.prepare(steps, budget)
+    }
+
+    fn request_restart(&self, id: &Id) -> Option<goetia::Result<()>> {
+        self.scm.request_restart(id)
+    }
+
+    fn request_start_after_stop(&self, id: &Id) -> goetia::Result<()> {
+        self.scm.request_start_after_stop(id)
+    }
+
+    fn stop(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
+        self.scm.stop(id, budget)
+    }
+
+    fn kill(&self, id: &Id) -> goetia::Result<()> {
+        self.scm.kill(id)
+    }
+
+    fn status(&self, id: &Id) -> goetia::Result<Status> {
+        self.scm.status(id)
+    }
+
+    fn list(&self) -> goetia::Result<Vec<Installed>> {
+        self.scm.list()
+    }
+}
+
 // Registry ============================================================================================================
 
 /// `HKLM\SYSTEM\CurrentControlSet\Services\<id>`, open for read and write.
+fn try_service_key(id: &str) -> std::io::Result<winreg::RegKey> {
+    winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE).open_subkey_with_flags(
+        format!(r"SYSTEM\CurrentControlSet\Services\{id}"),
+        winreg::enums::KEY_READ | winreg::enums::KEY_WRITE,
+    )
+}
+
+/// [`try_service_key`] for a service that must exist.
 fn service_key(id: &str) -> winreg::RegKey {
-    let path = format!(r"SYSTEM\CurrentControlSet\Services\{id}");
-    winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
-        .open_subkey_with_flags(&path, winreg::enums::KEY_READ | winreg::enums::KEY_WRITE)
-        .unwrap_or_else(|e| panic!("open {path}: {e}"))
+    try_service_key(id).unwrap_or_else(|e| panic!("open the Services key of {id}: {e}"))
 }
 
 /// `Services\<id>\Parameters`, open for read and write.
