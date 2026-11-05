@@ -2,13 +2,15 @@
 
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use goetia::backend::scm::exit_status::RecordedExit;
+use goetia::backend::scm::manager::Scm;
 use goetia::spec::{DaemonSpec, Kind};
 use windows_service::service::{ServiceAccess, ServiceState, ServiceStatus};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
-use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
-use windows_sys::Win32::System::Services::{SERVICE_NOTIFY_RUNNING, SERVICE_RUNNING};
+use windows_sys::Win32::Foundation::{ERROR_SERVICE_DOES_NOT_EXIST, HANDLE, WAIT_OBJECT_0};
+use windows_sys::Win32::System::Services::{SERVICE_NOTIFY_RUNNING, SERVICE_NOTIFY_STOPPED, SERVICE_RUNNING};
 use windows_sys::Win32::System::Threading::{INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
 
 use crate::fixture;
@@ -24,10 +26,83 @@ pub fn fixture_command(mode: &str, args: &[&str]) -> Vec<String> {
     v
 }
 
-/// A [`support::ServiceGuard`] for a shim-hosted service `id` that also removes the file its shim
-/// writes when it fails before it has read the daemon's config (`%ProgramData%\Goetia\logs\<id>.log`).
-pub fn shim_guard(id: &str) -> support::ServiceGuard {
-    support::ServiceGuard::with_leftover(id, support::shim_default_log(&support::program_data(), id))
+/// Cleanup for a shim-hosted service `id`, in this order:
+/// 1. the product's `uninstall`, which disables, stops, settles a restart that has begun, and deletes;
+/// 2. a [`support::ServiceGuard`]'s `sc stop` and `sc delete`, for what `uninstall` does not own;
+/// 3. [`LeftoverLog`]: the file the shim writes when it fails before it has read the daemon's config.
+///
+/// Step 1 is this type's `drop`; steps 2 and 3 are its fields, which drop in declaration order.
+pub struct ShimGuard {
+    id: String,
+    _sc: support::ServiceGuard,
+    _log: LeftoverLog,
+}
+
+impl ShimGuard {
+    pub fn new(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            _sc: support::ServiceGuard::new(id),
+            _log: LeftoverLog {
+                id: id.to_string(),
+                path: support::shim_default_log(&support::program_data(), id),
+            },
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Drop for ShimGuard {
+    fn drop(&mut self) {
+        use goetia::error::Error;
+        use goetia::manager::ServiceManager as _;
+
+        let result = goetia::spec::Id::try_from(self.id.as_str()).and_then(|id| Scm::new().uninstall(&id));
+        match result {
+            // Not goetia's, or not there: the `sc` guard owns what is left.
+            Ok(()) | Err(Error::NotInstalled { .. } | Error::Foreign { .. }) => {}
+            Err(e) => eprintln!("ShimGuard[{}]: uninstall failed: {}", self.id, e.report()),
+        }
+    }
+}
+
+/// Removes `path`, the default log of the shim of `id`, once `id` is `STOPPED` or gone.
+struct LeftoverLog {
+    id: String,
+    path: PathBuf,
+}
+
+impl Drop for LeftoverLog {
+    fn drop(&mut self) {
+        if let Some(problem) = self.remove() {
+            eprintln!("ShimGuard[{}]: cleanup failed: {problem}", self.id);
+        }
+    }
+}
+
+impl LeftoverLog {
+    /// A stop is waited for by notification, within [`support::service_guard::CLEANUP_BOUND`]: a
+    /// process that has reported `STOPPED` writes nothing more. Any refusal keeps the file: SCM
+    /// accepts a STOPPED arm on a marked-for-deletion service (see `ScmActor::arm`).
+    fn remove(&self) -> Option<String> {
+        use support::service_guard::{CLEANUP_BOUND, remove_path_retrying};
+
+        let left = |why: String| Some(format!("left {}: {why}", self.path.display()));
+        let deadline = Instant::now() + CLEANUP_BOUND;
+        match support::service_notify::arm_and_wait_until(&self.id, SERVICE_NOTIFY_STOPPED, deadline) {
+            Ok(wait) => {
+                if wait().is_none() {
+                    return left(format!("the service was not stopped after {CLEANUP_BOUND:?}"));
+                }
+            }
+            Err(e) if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) => {}
+            Err(e) => return left(format!("watch the service stop: {e}")),
+        }
+        remove_path_retrying(&self.path, false)
+    }
 }
 
 /// A temp dir the test owns, for everything its daemons write: their logs, which the shims' own
@@ -35,7 +110,7 @@ pub fn shim_guard(id: &str) -> support::ServiceGuard {
 ///
 /// Removed on drop, retried for [`support::service_guard::CLEANUP_BOUND`] and then let go with a
 /// warning: a daemon may still hold its log while its service stops. Declare it before the test's
-/// [`support::ServiceGuard`]s, which then drop first.
+/// [`ShimGuard`]s.
 pub struct LogDir(PathBuf);
 
 impl LogDir {
@@ -145,9 +220,8 @@ impl ShimProcess {
             .open_service(id, ServiceAccess::QUERY_STATUS)
             .unwrap_or_else(|e| panic!("open service {id}: {e}"));
         // Armed before the read; a service that already runs delivers at once.
-        let (state, _) = support::service_notify::arm_and_wait(&service, SERVICE_NOTIFY_RUNNING, None)
-            .expect("arm the RUNNING notification")()
-        .expect("an unbounded wait delivers");
+        let (state, _) =
+            support::service_notify::arm_and_wait(id, SERVICE_NOTIFY_RUNNING).expect("arm the RUNNING notification")();
         assert_eq!(state, SERVICE_RUNNING, "the notification for RUNNING");
         let running = service
             .query_status()

@@ -4,7 +4,8 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
-use windows_service::service::Service;
+use windows_service::service::{Service, ServiceAccess};
+use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::System::Services::{
     NotifyServiceStatusChangeW, SERVICE_NOTIFY_2W, SERVICE_NOTIFY_STATUS_CHANGE,
 };
@@ -20,7 +21,7 @@ struct Delivery {
 
 unsafe extern "system" fn record_delivery(parameter: *const c_void) {
     let notify = parameter.cast::<SERVICE_NOTIFY_2W>();
-    // SAFETY: SCM hands back the buffer registered in `arm_and_wait`, whose `pContext` is the leaked
+    // SAFETY: SCM hands back the buffer registered in `arm`, whose `pContext` is the leaked
     // `Delivery`.
     let (delivery, status) = unsafe { (&*(*notify).pContext.cast::<Delivery>(), &(*notify).ServiceStatus) };
     delivery.state.store(status.dwCurrentState, Ordering::Release);
@@ -30,17 +31,43 @@ unsafe extern "system" fn record_delivery(parameter: *const c_void) {
     delivery.fired.store(true, Ordering::Release);
 }
 
-/// Arm `mask` on `service`; the returned closure blocks, alertably, until SCM delivers it and
-/// returns `(state, controls_accepted)` of the delivery. Armed on a state that does not match `mask`
-/// yet, the delivery is the transition; a service already in a matching state delivers at once.
-///
-/// With a `deadline` the wait ends there and returns `None`; without one it has no bound.
-/// Registration can fail (a deleted service reports 1060); the error is returned.
-pub fn arm_and_wait(
-    service: &Service,
-    mask: u32,
-    deadline: Option<Instant>,
-) -> std::io::Result<impl FnOnce() -> Option<(u32, u32)>> {
+/// The SCM connection and the service handle of one registration, closed together when it ends.
+struct Handles {
+    _manager: ServiceManager,
+    service: Service,
+}
+
+impl Handles {
+    fn open(id: &str) -> std::io::Result<Self> {
+        let io_error = |e: windows_service::Error| match e {
+            windows_service::Error::Winapi(e) => e,
+            other => std::io::Error::other(other),
+        };
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).map_err(io_error)?;
+        let service = manager
+            .open_service(id, ServiceAccess::QUERY_STATUS)
+            .map_err(io_error)?;
+        Ok(Self {
+            _manager: manager,
+            service,
+        })
+    }
+}
+
+/// `NotifyServiceStatusChangeW`'s "you are too far behind" return; not among `windows-sys`'s exports.
+const ERROR_SERVICE_NOTIFY_CLIENT_LAGGING: u32 = 1294;
+
+/// A registration made by [`arm`]: it owns the handles it was made on, which cancel it when they
+/// close.
+struct Armed {
+    delivery: &'static Delivery,
+    _handles: Handles,
+}
+
+/// Registers `mask` on a fresh connection to service `id`. On `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING` it reopens the SCM and service handles
+/// and arms again, as the documented remedy and `ScmActor::arm` do. With a `deadline` that loop
+/// ends there, with the lag error; without one it has no cap.
+fn arm(id: &str, mask: u32, deadline: Option<Instant>) -> std::io::Result<Armed> {
     // Leaked: SCM may still hold the registration if the test panics, or the deadline passes,
     // before the delivery.
     let delivery: &'static Delivery = Box::leak(Box::new(Delivery {
@@ -54,34 +81,78 @@ pub fn arm_and_wait(
         pContext: (delivery as *const Delivery as *mut Delivery).cast(),
         ..Default::default()
     }));
-    // SAFETY: the handle has `SERVICE_QUERY_STATUS`; `notify` is leaked and so outlives the
-    // registration.
-    let error = unsafe {
-        use std::os::windows::io::AsRawHandle as _;
-        NotifyServiceStatusChangeW(service.raw_handle(), mask, notify)
-    };
-    if error != 0 {
-        return Err(std::io::Error::from_raw_os_error(error as i32));
+    let mut handles = Handles::open(id)?;
+    loop {
+        // SAFETY: the handle has `SERVICE_QUERY_STATUS`; `notify` is leaked and so outlives the
+        // registration.
+        let error = unsafe {
+            use std::os::windows::io::AsRawHandle as _;
+            NotifyServiceStatusChangeW(handles.service.raw_handle(), mask, notify)
+        };
+        match error {
+            0 => {
+                return Ok(Armed {
+                    delivery,
+                    _handles: handles,
+                });
+            }
+            ERROR_SERVICE_NOTIFY_CLIENT_LAGGING if deadline.is_none_or(|deadline| Instant::now() < deadline) => {
+                handles = Handles::open(id)?;
+            }
+            error => return Err(std::io::Error::from_raw_os_error(error as i32)),
+        }
     }
-    Ok(move || {
-        while !delivery.fired.load(Ordering::Acquire) {
-            let milliseconds = match deadline {
-                None => INFINITE,
-                Some(deadline) => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return None;
-                    }
-                    // Rounded up, and below INFINITE, which would mean no bound.
-                    remaining.as_millis().clamp(1, u128::from(INFINITE - 1)) as u32
-                }
-            };
+}
+
+impl Armed {
+    /// Blocks, alertably, until SCM delivers.
+    fn wait(&self) -> (u32, u32) {
+        while !self.delivery.fired.load(Ordering::Acquire) {
+            // SAFETY: plain FFI call; an alertable wait is what lets the APC run.
+            unsafe { SleepEx(INFINITE, 1) };
+        }
+        self.delivered()
+    }
+
+    /// [`Self::wait`], ending with `None` once `deadline` passes.
+    fn wait_until(&self, deadline: Instant) -> Option<(u32, u32)> {
+        while !self.delivery.fired.load(Ordering::Acquire) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            // Rounded up, and below INFINITE, which would mean no bound.
+            let milliseconds = remaining.as_millis().clamp(1, u128::from(INFINITE - 1)) as u32;
             // SAFETY: plain FFI call; an alertable wait is what lets the APC run.
             unsafe { SleepEx(milliseconds, 1) };
         }
-        Some((
-            delivery.state.load(Ordering::Acquire),
-            delivery.controls_accepted.load(Ordering::Acquire),
-        ))
-    })
+        Some(self.delivered())
+    }
+
+    fn delivered(&self) -> (u32, u32) {
+        (
+            self.delivery.state.load(Ordering::Acquire),
+            self.delivery.controls_accepted.load(Ordering::Acquire),
+        )
+    }
+}
+
+/// Arm `mask` on service `id`; the returned closure blocks, alertably, until SCM delivers it and
+/// returns `(state, controls_accepted)` of the delivery. Armed on a state that does not match `mask`
+/// yet, the delivery is the transition; a service already in a matching state delivers at once.
+///
+/// Registration can fail (a deleted service reports 1060); the error is returned.
+pub fn arm_and_wait(id: &str, mask: u32) -> std::io::Result<impl FnOnce() -> (u32, u32)> {
+    let armed = arm(id, mask, None)?;
+    Ok(move || armed.wait())
+}
+
+/// [`arm_and_wait`] with a `deadline`: arming and the wait end there, the wait with `None`.
+pub fn arm_and_wait_until(
+    id: &str,
+    mask: u32,
+    deadline: Instant,
+) -> std::io::Result<impl FnOnce() -> Option<(u32, u32)>> {
+    let armed = arm(id, mask, Some(deadline))?;
+    Ok(move || armed.wait_until(deadline))
 }

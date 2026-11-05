@@ -19,7 +19,7 @@ use windows_service::service::{ServiceExitCode, ServiceState};
 use winreg::enums::{KEY_READ, KEY_WRITE};
 
 use crate::common::{
-    LogDir, ShimProcess, fixture_command, kill_process, recorded_exit, scm_status, shim_guard, simple_spec,
+    LogDir, ShimGuard, ShimProcess, fixture_command, kill_process, recorded_exit, scm_status, simple_spec,
 };
 use crate::support::registry::parameters_key;
 use crate::support::{self, ConnectBack, ELEVATED};
@@ -45,7 +45,7 @@ fn a_restart_after_an_update_runs_the_updated_spec() {
     let id = support::random_test_id();
     let logs = LogDir::new();
     let mgr = Scm::new();
-    let _guard = shim_guard(&id);
+    let _guard = ShimGuard::new(&id);
     let old = ConnectBack::listen();
     let new = ConnectBack::listen();
 
@@ -79,7 +79,7 @@ fn a_killed_shim_is_restarted_by_scm() {
     let id = support::random_test_id();
     let logs = LogDir::new();
     let mgr = Scm::new();
-    let _guard = shim_guard(&id);
+    let _guard = ShimGuard::new(&id);
     let reported = ConnectBack::listen();
 
     let spec = on_failure(
@@ -110,7 +110,7 @@ fn a_killed_on_failure_simple_daemon_comes_back_with_a_new_pid() {
     let id = support::random_test_id();
     let logs = LogDir::new();
     let mgr = Scm::new();
-    let _guard = shim_guard(&id);
+    let _guard = ShimGuard::new(&id);
     let started = ConnectBack::listen();
     let spec = on_failure(
         &id,
@@ -128,7 +128,7 @@ fn on_failure_restarts_are_paced_new_shims() {
     let id = support::random_test_id();
     let logs = LogDir::new();
     let mgr = Scm::new();
-    let _guard = shim_guard(&id);
+    let _guard = ShimGuard::new(&id);
     let reported = ConnectBack::listen();
 
     // No `restart-delay`: the end-to-end wiring of `generate::DEFAULT_RESTART_DELAY` (1s).
@@ -188,7 +188,7 @@ fn uninstall_leaves_no_restarted_daemon_behind() {
     let id = support::random_test_id();
     let logs = LogDir::new();
     let mgr = Scm::new();
-    let _guard = shim_guard(&id);
+    let _guard = ShimGuard::new(&id);
     let reported = ConnectBack::listen();
 
     let spec = on_failure(
@@ -229,7 +229,7 @@ fn exit_records(child_code: i32) -> (ServiceExitCode, RecordedExit) {
     let id = support::random_test_id();
     let logs = LogDir::new();
     let mgr = Scm::new();
-    let _guard = shim_guard(&id);
+    let _guard = ShimGuard::new(&id);
 
     let spec = simple_spec(
         &id,
@@ -297,7 +297,7 @@ fn a_daemon_that_cannot_be_spawned_fails_start_under_every_policy() {
 
     for (restart, restart_delay) in [(Restart::Never, None), (Restart::OnFailure, hour)] {
         let id = support::random_test_id();
-        let _guard = shim_guard(&id);
+        let _guard = ShimGuard::new(&id);
         let spec = DaemonSpec {
             restart,
             restart_delay,
@@ -319,6 +319,16 @@ fn a_daemon_that_cannot_be_spawned_fails_start_under_every_policy() {
             ),
             other => panic!("{restart:?}: a failed spawn is a shim failure, a Win32 code; got {other:?}"),
         }
+
+        // The shim sets the daemon's log and `build_command` opens it before the spawn, so the
+        // spawn failure is in it by the time SCM reports `STOPPED`. A restarting policy may add more.
+        let log = std::fs::read_to_string(logs.path_for(&id)).expect("read the daemon's log");
+        let line = format!("goetia-shim[{id}]: spawn ");
+        assert!(
+            log.lines().any(|l| l.starts_with(&line)),
+            "{restart:?}: no spawn failure in:
+{log}"
+        );
     }
 }
 
@@ -333,7 +343,7 @@ fn start_confirms_the_launch_of_a_daemon_that_exits_at_once() {
 
     for (restart, code) in [(Restart::Never, 7), (Restart::OnFailure, 7), (Restart::Never, 0)] {
         let id = support::random_test_id();
-        let _guard = shim_guard(&id);
+        let _guard = ShimGuard::new(&id);
         let reported = ConnectBack::listen();
         let spec = DaemonSpec {
             restart,
@@ -357,7 +367,7 @@ fn a_commanded_stop_reports_win32_zero() {
     let id = support::random_test_id();
     let logs = LogDir::new();
     let mgr = Scm::new();
-    let _guard = shim_guard(&id);
+    let _guard = ShimGuard::new(&id);
     let reported = ConnectBack::listen();
 
     // `on-failure`, so a stop wrongly reported as a failure would also queue a restart.
@@ -417,7 +427,7 @@ fn a_new_shim_runs_a_service_registered_by_an_earlier_version() {
     let id = support::random_test_id();
     let logs = LogDir::new();
     let mgr = Scm::new();
-    let _guard = shim_guard(&id);
+    let _guard = ShimGuard::new(&id);
     let reported = ConnectBack::listen();
 
     let spec = on_failure(
@@ -457,7 +467,7 @@ fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled
     let id = support::random_test_id();
     let logs = LogDir::new();
     let mgr = Scm::new();
-    let _guard = shim_guard(&id);
+    let _guard = ShimGuard::new(&id);
     let reported = ConnectBack::listen();
 
     let spec = on_failure(
@@ -518,7 +528,7 @@ fn reinstalling_an_earlier_version_simple_service_applies_the_recovery_actions()
     let id = support::random_test_id();
     let logs = LogDir::new();
     let mgr = Scm::new();
-    let _guard = shim_guard(&id);
+    let _guard = ShimGuard::new(&id);
 
     let spec = on_failure(&id, fixture_command("report", &["1"]), ONE_SECOND, &logs);
     mgr.install(&spec, false).expect("install");

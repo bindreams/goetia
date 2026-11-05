@@ -14,7 +14,7 @@ use windows_sys::Win32::System::Services::{
     SERVICE_NOTIFY_STOP_PENDING, SERVICE_NOTIFY_STOPPED, SERVICE_STOP_PENDING, SERVICE_STOPPED,
 };
 
-use crate::common::{LogDir, conformance_mk, fixture_command, shim_guard, simple_spec};
+use crate::common::{LogDir, ShimGuard, conformance_mk, fixture_command, simple_spec};
 use crate::deny::Denied;
 use crate::support::service_notify::arm_and_wait;
 use crate::support::{self, ELEVATED};
@@ -62,15 +62,14 @@ fn hand_edit(id: &str) {
 fn simple_passes_conformance() {
     let logs = LogDir::new();
     let mgr = Scm::new();
-    // `run`'s own cleanup uninstalls the ids it makes; these guards, which drop after it, also
-    // remove what their shims logged before decode. One guard per id, made before the id's first
-    // write.
+    // These guards drop after `run`'s uninstall and remove the pre-decode logs; make each before
+    // its id's first write.
     let guards = std::cell::RefCell::new(BTreeMap::new());
     let guard = |id: &str| {
         guards
             .borrow_mut()
             .entry(id.to_string())
-            .or_insert_with(|| shim_guard(id));
+            .or_insert_with(|| ShimGuard::new(id));
     };
     let mk = |id: &str| {
         guard(id);
@@ -100,7 +99,7 @@ fn install_then_list_round_trips_without_the_source_file() {
     let id = support::random_test_id();
     let logs = LogDir::new();
     let mgr = Scm::new();
-    let _guard = shim_guard(&id);
+    let _guard = ShimGuard::new(&id);
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
 
     let outcome = mgr.install(&spec, false).expect("install");
@@ -126,7 +125,7 @@ fn start_stop_status_reflect_reality() {
     let id = support::random_test_id();
     let logs = LogDir::new();
     let mgr = Scm::new();
-    let _guard = shim_guard(&id);
+    let _guard = ShimGuard::new(&id);
     let started = support::ConnectBack::listen();
     let spec = simple_spec(&id, fixture_command("report", &[&started.port().to_string()]), &logs);
     mgr.install(&spec, false).expect("install");
@@ -157,7 +156,7 @@ fn uninstall_leaves_nothing() {
     let id = support::random_test_id();
     let logs = LogDir::new();
     let mgr = Scm::new();
-    let _guard = shim_guard(&id);
+    let _guard = ShimGuard::new(&id);
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
     mgr.install(&spec, false).expect("install");
 
@@ -186,7 +185,7 @@ fn uninstall_leaves_nothing() {
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_ignores_foreign_services() {
     let id = support::random_test_id();
-    let guard = shim_guard(&id);
+    let guard = ShimGuard::new(&id);
     seed_foreign(guard.id());
 
     let mgr = Scm::new();
@@ -217,7 +216,7 @@ fn the_shim_reports_stop_pending_then_stopped() {
     let id = support::random_test_id();
     let logs = LogDir::new();
     let mgr = Scm::new();
-    let _guard = shim_guard(&id);
+    let _guard = ShimGuard::new(&id);
     let started = support::ConnectBack::listen();
     let spec = simple_spec(&id, fixture_command("report", &[&started.port().to_string()]), &logs);
     mgr.install(&spec, false).expect("install");
@@ -231,14 +230,13 @@ fn the_shim_reports_stop_pending_then_stopped() {
         .expect("open the service");
 
     // Armed on RUNNING, before the stop, so the first delivery is the stop's own first state.
-    let first = arm_and_wait(&service, SERVICE_NOTIFY_STOP_PENDING | SERVICE_NOTIFY_STOPPED, None)
+    let first = arm_and_wait(&id, SERVICE_NOTIFY_STOP_PENDING | SERVICE_NOTIFY_STOPPED)
         .expect("arm the STOP_PENDING notification");
     service.stop().expect("send stop");
-    let (state, controls_accepted) = first().expect("an unbounded wait delivers");
+    let (state, controls_accepted) = first();
     assert_eq!(state, SERVICE_STOP_PENDING, "the first state after a stop");
     assert_eq!(controls_accepted, 0, "no control is accepted while stopping");
 
-    let (state, _) = arm_and_wait(&service, SERVICE_NOTIFY_STOPPED, None).expect("arm the STOPPED notification")()
-        .expect("an unbounded wait delivers");
+    let (state, _) = arm_and_wait(&id, SERVICE_NOTIFY_STOPPED).expect("arm the STOPPED notification")();
     assert_eq!(state, SERVICE_STOPPED);
 }
