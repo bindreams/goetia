@@ -1,25 +1,16 @@
-//! Pure generation of the plist from a resolved spec, and extraction of
-//! the embedded metadata blob back out of one.
+//! Pure generation of the plist from a resolved spec, and extraction of the embedded metadata blob
+//! back out of one. Not `#[cfg]`-gated: it compiles and its tests run everywhere.
 //!
-//! Not `#[cfg]`-gated: this compiles and its tests run on every platform.
+//! **Enablement is not a plist key.** `KeepAlive` implies `RunAtLoad`, so a job with a restart
+//! policy runs the instant it is loaded, and `launchctl bootstrap` refuses a `Disabled: true`
+//! plist. Enrollment is the plist's *directory*, and this module never emits `Disabled`. The
+//! generated text is therefore byte-identical whether or not the daemon is enabled, and drift
+//! detection needs no macOS special case.
 //!
-//! **Enablement is not a plist key.** `launchd.plist(5)`: "The use of
-//! `KeepAlive` implicitly implies `RunAtLoad`, causing launchd to
-//! speculatively launch the job" — so any job carrying a restart policy
-//! runs the instant it is loaded, and `Disabled: true` fares no better:
-//! `launchctl bootstrap` refuses such a plist outright. Enrollment is
-//! therefore expressed by the plist's *directory*, never by its content,
-//! and this module emits `Disabled` under no circumstance. That is also
-//! why the generated text is byte-identical whether or not the daemon is
-//! enabled, and the drift-detection invariant needs no macOS special case.
-//!
-//! Metadata lives in an XML comment right after the DOCTYPE, delimited by
-//! a `goetia:begin` / `goetia:end` sentinel pair unlikely to appear in any
-//! human-written comment. It is emitted by hand rather than through the
-//! `plist` crate's serializer, which would not preserve a comment at all.
-//! The `Spec` field is base64, whose alphabet (`A-Za-z0-9+/=`) cannot
-//! contain the `--` that would otherwise let a value break out of an XML
-//! comment early.
+//! Metadata lives in an XML comment right after the DOCTYPE, delimited by a `goetia:begin` /
+//! `goetia:end` sentinel pair. It is emitted by hand because the `plist` crate's serializer would
+//! not preserve a comment. The `Spec` field is base64, whose alphabet (`A-Za-z0-9+/=`) cannot
+//! contain the `--` that would end an XML comment early.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -35,9 +26,8 @@ use crate::spec::{DaemonSpec, Restart};
 const COMMENT_BEGIN: &str = "<!-- goetia:begin";
 const COMMENT_END: &str = "goetia:end -->";
 
-/// Render the metadata comment carrying `Marker`, `Schema`, `Version`, and
-/// `Spec` — byte-exact field names, per the crate's global metadata
-/// convention (shared with the systemd `[X-Goetia]` section).
+/// Render the metadata comment carrying `Marker`, `Schema`, `Version`, and `Spec`: byte-exact field
+/// names, per the crate's metadata convention (shared with the systemd `[X-Goetia]` section).
 fn metadata_comment(spec: &DaemonSpec) -> String {
     format!(
         "{COMMENT_BEGIN}\nMarker: {marker}\nSchema: {schema}\nVersion: {version}\nSpec: {encoded}\n{COMMENT_END}\n",
@@ -48,17 +38,12 @@ fn metadata_comment(spec: &DaemonSpec) -> String {
     )
 }
 
-/// Locate every `goetia:begin` / `goetia:end` comment in `text` and return
-/// each one's inner content, with exactly the line break on each side of
-/// the sentinels trimmed. An unterminated `goetia:begin` (a sentinel with
-/// no matching `goetia:end`) is a malformed metadata comment, not a
-/// foreign one, so it errors rather than being silently skipped.
+/// Locate every `goetia:begin` / `goetia:end` comment in `text` and return each one's inner
+/// content, with one line break trimmed on each side of the sentinels. A `goetia:begin` with no
+/// matching `goetia:end` is a malformed metadata comment, not a foreign one, so it errors.
 ///
-/// The sentinel constants deliberately exclude the line break that
-/// follows/precedes them: matching on the literal byte `\n` would miss a
-/// plist whose line endings became `\r\n` (e.g. saved by a Windows
-/// editor), silently reporting a fully intact metadata comment as absent
-/// instead of extracting it.
+/// The sentinel constants exclude the adjacent line break: matching a literal `\n` would miss a plist
+/// whose line endings became `\r\n` (saved by a Windows editor) and report an intact comment absent.
 fn find_metadata_blocks(text: &str) -> Result<Vec<&str>, Error> {
     let mut blocks = Vec::new();
     let mut cursor = 0;
@@ -78,19 +63,15 @@ fn find_metadata_blocks(text: &str) -> Result<Vec<&str>, Error> {
     Ok(blocks)
 }
 
-/// Trim exactly one leading and one trailing line break (`\r\n` or `\n`)
-/// from `s`, leaving any interior line breaks untouched.
+/// Trim one leading and one trailing line break (`\r\n` or `\n`) from `s`.
 fn trim_one_line_break(s: &str) -> &str {
     let s = s.strip_prefix("\r\n").or_else(|| s.strip_prefix('\n')).unwrap_or(s);
     s.strip_suffix("\r\n").or_else(|| s.strip_suffix('\n')).unwrap_or(s)
 }
 
-/// Parse one metadata comment's content (`Marker`/`Schema`/`Version`/`Spec`,
-/// one per line, in that order) and decode the embedded blob. `Schema` and
-/// `Version` are read and discarded here — `blob::decode` re-derives both,
-/// authoritatively, from the `Spec` payload itself; the plain-text copies
-/// exist only so a human reading the artifact does not have to decode
-/// base64 to see them.
+/// Parse one metadata comment's content (`Marker`/`Schema`/`Version`/`Spec`, one per line, in that
+/// order) and decode the embedded blob. `Schema` and `Version` are discarded: `blob::decode`
+/// re-derives both from `Spec`, and the plain-text copies are for a human reading the artifact.
 fn parse_metadata_block(content: &str) -> Result<Blob, Error> {
     let mut lines = content.lines();
 
@@ -100,10 +81,8 @@ fn parse_metadata_block(content: &str) -> Result<Blob, Error> {
     let spec = read_field(&mut lines, "Spec")?;
 
     if lines.next().is_some() {
-        // A `Spec` value can only reach here already broken: ours never
-        // contains whitespace, so an embedded newline (or anything else
-        // that produced a further line) is a hand-edit or bit-rot. Reject
-        // it outright rather than silently decoding a truncated prefix.
+        // Our `Spec` never contains whitespace, so a further line is a hand-edit or bit-rot. Reject
+        // it rather than decode a truncated prefix.
         return Err(Error::blob(
             "goetia metadata comment has content after `Spec`".to_string(),
         ));
@@ -130,13 +109,10 @@ fn read_field<'a>(lines: &mut std::str::Lines<'a>, name: &str) -> Result<&'a str
 
 /// Extract the metadata blob embedded in a generated plist, if any.
 ///
-/// - No `goetia:begin`/`goetia:end` comment at all: `Ok(None)` — a
-///   foreign plist, not one of ours.
-/// - Exactly one, but its `Spec` payload does not decode (or the comment
-///   is otherwise malformed): `Err`. A marker without a usable blob is
-///   never silently treated as absent.
-/// - More than one: `Err`. A forged second comment must not be able to
-///   choose which blob wins.
+/// - No `goetia:begin`/`goetia:end` comment: `Ok(None)`, a foreign plist.
+/// - Exactly one, but its `Spec` does not decode or the comment is otherwise malformed: `Err`. A
+///   marker without a usable blob is never treated as absent.
+/// - More than one: `Err`, so a forged second comment cannot choose which blob wins.
 pub fn extract(plist_text: &str) -> Result<Option<Blob>, Error> {
     let blocks = find_metadata_blocks(plist_text)?;
     match blocks.as_slice() {
@@ -174,17 +150,13 @@ pub(crate) fn without_metadata(text: &str) -> String {
 
 // XML rendering =======================================================================================================
 
-/// Escape the three characters XML element content cannot contain
-/// unescaped. Applied to every emitted value — argv entries, paths,
-/// environment keys and values, and the resolved account name — since
-/// `spec::resolve` only rejects control characters, not `&`/`<`/`>`.
+/// Escape the three characters XML element content cannot contain unescaped. Applied to every
+/// emitted value (argv, paths, environment keys and values, the account name), since
+/// `spec::resolve` rejects only control characters, not `&`/`<`/`>`.
 ///
-/// XML 1.0's `Char` production also excludes the noncharacters U+FFFE and
-/// U+FFFF entirely — no escape can represent them — and `spec::resolve`'s
-/// gate (`char::is_control()`) does not currently reject them. Closing
-/// that gate belongs in `spec::resolve`, out of this module's file scope;
-/// until it is closed, this panics loudly on the two codepoints rather
-/// than silently emit XML no parser can load.
+/// XML 1.0 excludes U+FFFE and U+FFFF entirely, so no escape can represent them, and
+/// `spec::resolve`'s `char::is_control()` gate does not reject them. This panics on them rather
+/// than emit XML no parser can load; the gate belongs in `spec::resolve`.
 fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -203,12 +175,9 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
-/// `DaemonSpec`'s `cwd`/`logs` are only ever constructed from `String`
-/// sources — `spec::resolve` parses YAML text, `blob::decode` parses JSON
-/// text — so a `DaemonSpec` reaching this generator always carries valid
-/// UTF-8 paths. Panic loudly on a violation of that contract rather than
-/// let `to_string_lossy` silently substitute U+FFFD and emit a plist that
-/// names a path that does not exist.
+/// `DaemonSpec`'s `cwd`/`logs` come from YAML or JSON text (`spec::resolve`, `blob::decode`), so
+/// they are valid UTF-8. Panic on a violation rather than let `to_string_lossy` substitute U+FFFD
+/// and emit a path that does not exist.
 fn path_str(p: &Path) -> &str {
     p.to_str()
         .expect("DaemonSpec paths are always valid UTF-8 (see spec::resolve and blob::decode)")
@@ -283,16 +252,10 @@ fn push_run_at_load(out: &mut String, indent: &str) {
     out.push_str("<true/>\n");
 }
 
-/// `restart: never` omits `KeepAlive` (and, with it, `RunAtLoad`) entirely,
-/// so such a job never starts on its own — not at load, not at boot once
-/// enabled. This is deliberate, not an oversight: `launchctl kickstart` is
-/// goetia's settled mechanism for starting "a job with no
-/// `KeepAlive`/`RunAtLoad`", which only makes sense if `restart: never` is
-/// exactly that job shape. `on-failure`
-/// emits a dict with `SuccessfulExit: false`; `always` emits the bare
-/// `true` form. Both non-`never` variants also emit `RunAtLoad: true`
-/// explicitly: harmless alongside the implication `KeepAlive` already
-/// carries, and it keeps the plist self-documenting about a property the
+/// `restart: never` omits `KeepAlive` and `RunAtLoad`, so the job never starts on its own, at load
+/// or at boot. That is deliberate: `start` launches it with `launchctl kickstart`. `on-failure`
+/// emits a dict with `SuccessfulExit: false`; `always` emits the bare `true`. Both also emit
+/// `RunAtLoad: true`, redundant with what `KeepAlive` implies, so the plist states the property the
 /// design leans on.
 fn push_keep_alive(out: &mut String, indent: &str, restart: Restart) {
     match restart {
@@ -321,14 +284,10 @@ fn push_keep_alive(out: &mut String, indent: &str, restart: Restart) {
     }
 }
 
-/// launchd's `ThrottleInterval` is integer seconds. Rounding up (never
-/// down) is mandatory, not cosmetic: `500ms` truncated to `0` would
-/// *disable* throttling and yield an unbounded respawn storm. An exact
-/// `0` the caller authored is left alone — that is a deliberate opt-out,
-/// not a value in need of rounding. `saturating_add`, not `+`: `as_secs()`
-/// can legitimately be `u64::MAX` (e.g. `Duration::MAX`), and a plain add
-/// would overflow — wrapping to `0` in release, which is exactly the
-/// "disables throttling" failure this rounding exists to prevent.
+/// launchd's `ThrottleInterval` is integer seconds. Round up, never down: `500ms` truncated to `0`
+/// would disable throttling and allow an unbounded respawn storm. An authored `0` is left alone, as
+/// a deliberate opt-out. `saturating_add`, not `+`: `as_secs()` can be `u64::MAX`
+/// (`Duration::MAX`), and a plain add would wrap to `0` in release.
 fn round_up_seconds(d: Duration) -> u64 {
     if d.subsec_nanos() == 0 {
         d.as_secs()
@@ -341,13 +300,10 @@ fn round_up_seconds(d: Duration) -> u64 {
 
 /// Render `spec` as a launchd plist for the already-resolved account `id`.
 ///
-/// Never emits `Disabled` — see the module doc comment. Emits `Label`,
-/// `ProgramArguments`, `WorkingDirectory` (if `cwd`), `EnvironmentVariables`
-/// (if `env` is non-empty), `UserName`, `KeepAlive`/`RunAtLoad` (per
-/// `restart`), `ThrottleInterval` (if `restart != never` and
-/// `restart_delay` is set), and `StandardOutPath`/`StandardErrorPath` (if
-/// `logs`, both pointed at the same file — the spec has one log path, not
-/// separate stdout/stderr ones).
+/// Never emits `Disabled`; see the module doc. Emits `Label`, `ProgramArguments`, `WorkingDirectory`
+/// (if `cwd`), `EnvironmentVariables` (if `env` is non-empty), `UserName`, `KeepAlive`/`RunAtLoad`
+/// (per `restart`), `ThrottleInterval` (if `restart != never` and `restart_delay` is set), and
+/// `StandardOutPath`/`StandardErrorPath` (if `logs`; both name the one log file).
 pub fn plist(spec: &DaemonSpec, id: &Identity) -> String {
     const INDENT: &str = "\t";
     let mut dict = String::new();
