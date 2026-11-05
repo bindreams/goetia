@@ -60,7 +60,13 @@ fn hand_edit(id: &str) {
 fn simple_passes_conformance() {
     let logs = LogDir::new();
     let mgr = Scm::new();
-    let mk = |id: &str| conformance_mk(&logs, id);
+    // `run`'s own cleanup uninstalls the ids it makes; these guards, which drop after it, also
+    // remove what their shims logged before decode.
+    let run_guards = std::cell::RefCell::new(Vec::new());
+    let mk = |id: &str| {
+        run_guards.borrow_mut().push(shim_guard(id));
+        conformance_mk(&logs, id)
+    };
 
     let _foreign_guard = shim_guard(conformance::FOREIGN_ID);
     seed_foreign(conformance::FOREIGN_ID);
