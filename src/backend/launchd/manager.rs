@@ -1111,8 +1111,9 @@ impl backend::Backend for Launchd {
                 // `target` was captured by `read`, before `decide` ran. A concurrent `enable` or
                 // `disable` may have moved it since, and writing here would put a plist in both
                 // directories, which `locate` errors on; after a concurrent `uninstall` reported
-                // success, it would install the plist again. This check only narrows the race to the window between it and
-                // `write_existing`'s rename onto `target`; it does not close it.
+                // success, it would install the plist again. This check only narrows the race to
+                // the window between it and `write_existing`'s rename onto `target`; it does not
+                // close it.
                 if !still_present(target)? {
                     return if changes_job {
                         // `is_loaded` has been called.
