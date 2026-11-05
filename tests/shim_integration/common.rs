@@ -38,8 +38,8 @@ pub fn fixture_command(mode: &str, args: &[&str]) -> Vec<String> {
 /// 3. [`LeftoverLog`]: the file the shim writes when it fails before it has read the daemon's config.
 ///
 /// Step 1 is this type's `drop`; steps 2 and 3 are its fields, which drop in declaration order. A
-/// failure prints a line and never panics; one that leaves the stop unconfirmed keeps the log,
-/// which the shim may still hold.
+/// failure prints a line and never panics; when nothing confirmed that no shim still writes the
+/// log, an existing log is kept and named.
 pub struct ShimGuard {
     id: String,
     _sc: support::ServiceGuard,
@@ -94,7 +94,8 @@ impl Drop for ShimGuard {
 /// What [`LeftoverLog`] does with its file.
 enum Fate {
     Remove,
-    /// The stop was not confirmed, and the shim may still write the file.
+    /// Nothing confirmed that no shim still writes the file: `uninstall` failed, or the service is
+    /// not goetia's.
     Keep(String),
 }
 
@@ -108,7 +109,10 @@ struct LeftoverLog {
 impl Drop for LeftoverLog {
     fn drop(&mut self) {
         let problem = match &self.fate {
-            Fate::Keep(why) => Some(format!("left {}: {why}", self.path.display())),
+            Fate::Keep(why) => self
+                .path
+                .exists()
+                .then(|| format!("left {}: {why}", self.path.display())),
             Fate::Remove => support::service_guard::remove_path_retrying(&self.path, false),
         };
         if let Some(problem) = problem {
