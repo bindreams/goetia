@@ -40,11 +40,12 @@
 //! So the typed parse goes first and owns unknown fields, duplicate keys
 //! and type errors, and only a structurally valid document reaches the scan.
 //! Anything else the scan objects to is something the typed parse already
-//! accepted, and is discarded, not avoided: `yaml_serde` checks the tag
-//! before the visitor is reached, so the scan cannot decline to see it,
-//! only decline to report it. Discarding means *keep walking*: each
-//! container skips the node it could not read and carries on, so a `null`
-//! after a tag the scan could not read is still found.
+//! accepted, and is discarded, not avoided: `yaml_serde` checks a standard
+//! tag's content against the tag before the visitor is reached, so the
+//! scan cannot decline to see that kind of complaint, only decline to
+//! report it. Discarding means *keep walking*: each container skips the
+//! node it could not read and carries on, so a `null` after a tag the scan
+//! could not read is still found.
 //!
 //! A `null` in a position the typed parse rejects for its own reasons
 //! reports that reason (`command: null` is `invalid type: unit value,

@@ -211,9 +211,10 @@ impl BackendKind {
 /// field, so `cwd`/`logs` are accepted, not rejected, but silently
 /// unavailable there.
 ///
-/// Reads `kind` through [`Shaped::parsed`], whose `None` covers both an absent value and a
-/// `Deferred` one: silence on an unavailable value is the contract. An absent `type` defaults
-/// to `Simple`, which warns about nothing.
+/// Reads `kind` through [`Shaped::parsed`], whose `None` covers both an
+/// absent value and a `Deferred` one: silence on an unavailable value is
+/// the contract. An absent `type` defaults to `Simple`, which warns about
+/// nothing.
 fn warn_on_windows_divergences(spec: &ShapedSpec, out: &mut Vec<Warning>) {
     if spec.kind.parsed() != Some(Kind::Managed) {
         return;

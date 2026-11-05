@@ -17,9 +17,9 @@
 //! Windows services disagree about a relative value (systemd rejects
 //! `bin/frpc`; launchd silently resolves it against the job's working
 //! directory, the default one when `cwd` is unset; Windows against
-//! `System32`). Absolutizing it against the
-//! manifest's directory before any backend sees it gives one rule that does
-//! not depend on where the daemon starts.
+//! `System32`). Absolutizing it against the manifest's directory before
+//! any backend sees it gives one rule that does not depend on where the
+//! daemon starts.
 //!
 //! **The dragon is in the default.** A relative path passed as an
 //! *argument* (`command: ["bin/frpc", "-c", "host/frpc.toml"]`) with no
@@ -275,8 +275,7 @@ fn resolve_shape(id: &Id, raw: RawSpec, base_dir: &Path) -> Result<(ShapedSpec, 
     let mut env = BTreeMap::new();
     for (key, value) in raw.env {
         // Checked here so it runs for every backend: `scm: {env: {"${K}": v}}` must be caught
-        // from Linux too. Deliberately duplicates the check in `interpolate::spec`, which runs
-        // only on the native merged spec: the two have different reach, so do not collapse them.
+        // from Linux too. Deliberately duplicates the check in `interpolate::spec`.
         if interpolate::would_substitution_change(&key) {
             return Err(invalid(id, interpolate::ENV_NAME_MESSAGE));
         }
@@ -295,8 +294,9 @@ fn resolve_shape(id: &Id, raw: RawSpec, base_dir: &Path) -> Result<(ShapedSpec, 
             reject_blank(id, "user.name", n)?;
         }
         User::Id(AccountId::Sid(s)) => {
-            // Checked here for the same reason, and likewise a deliberate duplicate of the
-            // `interpolate::spec` check, as the `env`-name rule above.
+            // Same reason as the `env`-name rule above, and likewise deliberately duplicates the
+            // check in `interpolate::spec`. Ordering against `reject_blank` below does not matter:
+            // `${S}` trims to `${S}`, never empty.
             if interpolate::would_substitution_change(s) {
                 return Err(invalid(id, interpolate::USER_ID_MESSAGE));
             }
@@ -613,7 +613,7 @@ fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error>
 /// When this fails, every subcommand that loads a manifest by a relative `-f` (including the
 /// default `-f .`) fails from that directory. That is an accepted limitation, decided by the
 /// owner: the reachable causes are narrow, and a fallback to the uncanonicalised directory would
-/// trade a loud refusal for silent phantom drift on Windows. Revisit if one shows up in use.
+/// trade a loud refusal for silent phantom drift on Windows. Revisit if one of them shows up in use.
 ///
 /// The failure causes (an unreadable path component on Unix; a refused open or a volume with no
 /// DOS path on Windows) are the ones the message names. A

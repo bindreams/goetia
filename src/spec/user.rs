@@ -7,7 +7,7 @@
 //! `User::Root` nothing records which syntax it came from, so the rule
 //! could not be re-applied to an interpolated value without also
 //! mis-applying it to the struct form, where `{name: root}` is a literal
-//! account: `{name: ${U}}` with `U=root` would become the superuser.
+//! account: `{name: ${U}}` with `U=root` would become `User::Root`.
 //!
 //! `RawUser`'s `Deserialize` is hand-written, not `#[serde(untagged)]`: the
 //! untagged deserializer squashes every failed variant into one message
