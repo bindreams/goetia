@@ -2,6 +2,8 @@
 //! because they need a built shim. See `tests/scm_integration/managed.rs`
 //! for the `type: managed` analogues these mirror.
 
+use std::collections::BTreeMap;
+
 use goetia::backend::scm::manager::Scm;
 use goetia::decide::Outcome;
 use goetia::manager::conformance;
@@ -61,24 +63,29 @@ fn simple_passes_conformance() {
     let logs = LogDir::new();
     let mgr = Scm::new();
     // `run`'s own cleanup uninstalls the ids it makes; these guards, which drop after it, also
-    // remove what their shims logged before decode.
-    let run_guards = std::cell::RefCell::new(Vec::new());
+    // remove what their shims logged before decode. One guard per id, made before the id's first
+    // write.
+    let guards = std::cell::RefCell::new(BTreeMap::new());
+    let guard = |id: &str| {
+        guards
+            .borrow_mut()
+            .entry(id.to_string())
+            .or_insert_with(|| shim_guard(id));
+    };
     let mk = |id: &str| {
-        run_guards.borrow_mut().push(shim_guard(id));
+        guard(id);
         conformance_mk(&logs, id)
     };
 
-    let _foreign_guard = shim_guard(conformance::FOREIGN_ID);
+    guard(conformance::FOREIGN_ID);
     seed_foreign(conformance::FOREIGN_ID);
 
-    let _hand_edited_guard = shim_guard(conformance::HAND_EDITED_ID);
     mgr.install(&mk(conformance::HAND_EDITED_ID), false)
         .expect("seed install for the hand-edit scenario");
     hand_edit(conformance::HAND_EDITED_ID);
 
     // Seed `UNDETERMINED_ID`, exactly as `tests/scm_integration/managed.rs` does: install
     // normally, then deny reading the one key that carries the marker.
-    let _undetermined_guard = shim_guard(conformance::UNDETERMINED_ID);
     mgr.install(&mk(conformance::UNDETERMINED_ID), false)
         .expect("seed install for the undetermined scenario");
     let _undetermined_denied = Denied::parameters(conformance::UNDETERMINED_ID);
