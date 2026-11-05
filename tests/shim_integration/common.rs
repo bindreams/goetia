@@ -2,17 +2,18 @@
 
 use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use goetia::backend::scm::exit_status::RecordedExit;
 use goetia::spec::{DaemonSpec, Kind};
+use tempfile::TempDir;
 use windows_service::service::{Service, ServiceAccess, ServiceState, ServiceStatus};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
-use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, ERROR_SERVICE_DOES_NOT_EXIST, HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Services::{
     NotifyServiceStatusChangeW, SERVICE_NOTIFY_2W, SERVICE_NOTIFY_RUNNING, SERVICE_NOTIFY_STATUS_CHANGE,
-    SERVICE_RUNNING,
+    SERVICE_NOTIFY_STOPPED, SERVICE_RUNNING,
 };
 use windows_sys::Win32::System::Threading::{INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, SleepEx, WaitForSingleObject};
 
@@ -29,26 +30,37 @@ pub fn fixture_command(mode: &str, args: &[&str]) -> Vec<String> {
     v
 }
 
-/// [`support::spec`] with `type: simple`, logging to `logs`. Every shim test sets `logs` to a path
-/// in a temp dir it owns, so none writes to the `%ProgramData%\Goetia\logs\` default.
-pub fn simple_spec(id: &str, command: Vec<String>, logs: &Path) -> DaemonSpec {
+/// A temp dir the test owns, for its daemons' logs: no shim test writes to the
+/// `%ProgramData%\Goetia\logs\` default. Declared before the test's `ServiceGuard`s, so that it
+/// drops after the services.
+pub struct LogDir(TempDir);
+
+impl LogDir {
+    pub fn new() -> Self {
+        Self(tempfile::tempdir().expect("tempdir for the daemons' logs"))
+    }
+
+    /// Where the daemon `id` logs: `<dir>/<id>.log`.
+    pub fn path_for(&self, id: &str) -> PathBuf {
+        self.0.path().join(format!("{id}.log"))
+    }
+}
+
+/// [`support::spec`] with `type: simple`, logging to a path in `logs` (a dir the test owns) rather
+/// than the `%ProgramData%` default.
+pub fn simple_spec(id: &str, command: Vec<String>, logs: &LogDir) -> DaemonSpec {
     DaemonSpec {
         kind: Kind::Simple,
-        logs: Some(logs.to_path_buf()),
+        logs: Some(logs.path_for(id)),
         ..support::spec(id, command)
     }
 }
 
-/// The `mk` [`goetia::manager::conformance::run`] needs, as `&|id| conformance_mk(dir, id)`: a
-/// fresh, valid `type: simple` spec for any `id`, logging to `<id>.log` in `logs_dir`. The port is
-/// dummy — the fixture reports in on a best-effort basis regardless of whether anything listens,
-/// and no conformance scenario reads the report.
-pub fn conformance_mk(logs_dir: &Path, id: &str) -> DaemonSpec {
-    simple_spec(
-        id,
-        fixture_command("report", &["1"]),
-        &logs_dir.join(format!("{id}.log")),
-    )
+/// The `mk` [`goetia::manager::conformance::run`] needs: a fresh, valid `type: simple` spec for any
+/// `id`, logging to `logs.path_for(id)`. The port is dummy — the fixture reports in on a best-effort
+/// basis regardless of whether anything listens, and no conformance scenario reads the report.
+pub fn conformance_mk(logs: &LogDir, id: &str) -> DaemonSpec {
+    simple_spec(id, fixture_command("report", &["1"]), logs)
 }
 
 // SCM records and the shim process ====================================================================================
@@ -154,22 +166,77 @@ pub fn fallback_log(id: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read fallback log {}: {e}", path.display()))
 }
 
-/// Removes the fallback log of `id`, which no process may be writing any more: a test that read it
-/// calls this once the shim that wrote it is gone, so that the log does not outlive the test.
-pub fn remove_fallback_log(id: &str) {
-    let path = fallback_log_path(id);
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => panic!("remove fallback log {}: {e}", path.display()),
-    }
-}
-
 fn fallback_log_path(id: &str) -> PathBuf {
     let programdata = std::env::var_os("ProgramData")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
     programdata.join("Goetia").join("logs").join(format!("{id}.log"))
+}
+
+/// Removes the fallback log of `id` when dropped, on every path including a panic, and only once no
+/// shim can write it: the drop stops the service if it runs, then waits for the exit of its shim and
+/// of every shim [`Self::adopt`]ed. A never-started service wrote no log, which is not a failure.
+///
+/// Build it as soon as the test knows `id`, after `id`'s `ServiceGuard`: it drops first, while the
+/// service record still names the shim. A problem is printed and the log is left in place.
+pub struct FallbackLog {
+    id: String,
+    shims: Vec<ShimProcess>,
+}
+
+impl FallbackLog {
+    pub fn new(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            shims: Vec::new(),
+        }
+    }
+
+    /// Also waits for `shim`, one the test attached, which the drop would not find if SCM restarted
+    /// the service.
+    pub fn adopt(&mut self, shim: ShimProcess) {
+        self.shims.push(shim);
+    }
+
+    /// Stops the service if it runs and returns once every shim of it is gone. The wait is on the
+    /// process handles, so it needs no bound: a shim that never exits is a hung test.
+    fn reap_shims(&mut self) -> Result<(), String> {
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+            .map_err(|e| format!("connect to the service manager: {e}"))?;
+        match manager.open_service(&self.id, ServiceAccess::QUERY_STATUS | ServiceAccess::STOP) {
+            // Never installed, so no shim of it ever ran.
+            Err(windows_service::Error::Winapi(e)) if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) => {
+            }
+            Err(e) => return Err(format!("open the service: {e}")),
+            Ok(service) => {
+                if let Some(shim) = ShimProcess::running(&service)? {
+                    // A refusal means the service is stopping or stopped; either way the wait below
+                    // is for the process itself.
+                    let _ = service.stop();
+                    self.shims.push(shim);
+                }
+            }
+        }
+        for shim in self.shims.drain(..) {
+            shim.wait_for_exit();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for FallbackLog {
+    fn drop(&mut self) {
+        if let Err(problem) = self.reap_shims() {
+            eprintln!("FallbackLog[{}]: {problem}; its log is left in place", self.id);
+            return;
+        }
+        let path = fallback_log_path(&self.id);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("FallbackLog[{}]: remove {}: {e}", self.id, path.display()),
+        }
+    }
 }
 
 /// `taskkill /F` on `pid`: the way a test ends a shim or a daemon without telling either.
@@ -209,22 +276,56 @@ impl ShimProcess {
             .process_id
             .unwrap_or_else(|| panic!("SCM reports a running service with no process id: {running:?}"));
 
+        Self::hold(&service, pid)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("{id} no longer reports pid {pid} as RUNNING"))
+    }
+
+    /// The shim of `service` while it is `RUNNING`, held, or `None` once it is `STOPPED`. A pending
+    /// state is waited out first, since `windows-service` reports a pid only in `RUNNING`.
+    fn running(service: &Service) -> Result<Option<Self>, String> {
+        loop {
+            let status = service.query_status().map_err(|e| format!("query the service: {e}"))?;
+            match status.current_state {
+                ServiceState::Stopped => return Ok(None),
+                ServiceState::Running => {
+                    let pid = status
+                        .process_id
+                        .ok_or_else(|| format!("SCM reports a running service with no process id: {status:?}"))?;
+                    if let Some(shim) = Self::hold(service, pid)? {
+                        return Ok(Some(shim));
+                    }
+                    // The process exited before SCM recorded it: read again.
+                    std::thread::yield_now();
+                }
+                _ => {
+                    arm_and_wait(service, SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_STOPPED)();
+                }
+            }
+        }
+    }
+
+    /// Holds the process `pid`, which `service` reported as its `RUNNING` process. `None` if there
+    /// is no such process, or SCM no longer reports `pid` as `RUNNING` once it is held.
+    fn hold(service: &Service, pid: u32) -> Result<Option<Self>, String> {
         // SAFETY: plain FFI call; the returned handle is checked and then owned.
         let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
         if raw.is_null() {
-            panic!("OpenProcess({pid}): {}", std::io::Error::last_os_error());
+            let e = std::io::Error::last_os_error();
+            return match e.raw_os_error() {
+                Some(code) if code == ERROR_INVALID_PARAMETER as i32 => Ok(None),
+                _ => Err(format!("OpenProcess({pid}): {e}")),
+            };
         }
         // SAFETY: `raw` is a valid handle we own and nothing else closes.
         let process = unsafe { OwnedHandle::from_raw_handle(raw as _) };
 
         // The handle must name the shim that was running, not a recycled pid.
-        let again = scm_status(id);
-        assert!(
-            matches!(again.current_state, ServiceState::Running | ServiceState::StartPending),
-            "{again:?}"
-        );
-        assert_eq!(again.process_id, Some(pid), "{again:?}");
-        Self { process, pid }
+        let again = service.query_status().map_err(|e| format!("query the service: {e}"))?;
+        Ok(
+            (again.current_state == ServiceState::Running && again.process_id == Some(pid))
+                .then_some(Self { process, pid }),
+        )
     }
 
     pub fn pid(&self) -> u32 {

@@ -11,7 +11,7 @@ use windows_sys::Win32::System::Services::{
     SERVICE_NOTIFY_STOP_PENDING, SERVICE_NOTIFY_STOPPED, SERVICE_STOP_PENDING, SERVICE_STOPPED,
 };
 
-use crate::common::{arm_and_wait, conformance_mk, fixture_command, simple_spec};
+use crate::common::{LogDir, arm_and_wait, conformance_mk, fixture_command, simple_spec};
 use crate::deny::Denied;
 use crate::support::{self, ELEVATED, ServiceGuard};
 
@@ -57,8 +57,8 @@ fn hand_edit(id: &str) {
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn simple_passes_conformance() {
     let mgr = goetia::backend::scm::manager::Scm::new();
-    let logs = tempfile::tempdir().expect("tempdir for the daemons' logs");
-    let mk = |id: &str| conformance_mk(logs.path(), id);
+    let logs = LogDir::new();
+    let mk = |id: &str| conformance_mk(&logs, id);
 
     let _foreign_guard = ServiceGuard::new(conformance::FOREIGN_ID);
     seed_foreign(conformance::FOREIGN_ID);
@@ -84,9 +84,9 @@ fn simple_passes_conformance() {
 fn install_then_list_round_trips_without_the_source_file() {
     let mgr = goetia::backend::scm::manager::Scm::new();
     let id = support::random_test_id();
-    let logs = tempfile::tempdir().expect("tempdir for the daemon's log");
+    let logs = LogDir::new();
     let _guard = ServiceGuard::new(&id);
-    let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs.path().join("daemon.log"));
+    let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
 
     let outcome = mgr.install(&spec, false).expect("install");
     assert!(matches!(outcome, Outcome::Create), "{outcome:?}");
@@ -110,14 +110,10 @@ fn install_then_list_round_trips_without_the_source_file() {
 fn start_stop_status_reflect_reality() {
     let mgr = goetia::backend::scm::manager::Scm::new();
     let id = support::random_test_id();
-    let logs = tempfile::tempdir().expect("tempdir for the daemon's log");
+    let logs = LogDir::new();
     let _guard = ServiceGuard::new(&id);
     let started = support::ConnectBack::listen();
-    let spec = simple_spec(
-        &id,
-        fixture_command("report", &[&started.port().to_string()]),
-        &logs.path().join("daemon.log"),
-    );
+    let spec = simple_spec(&id, fixture_command("report", &[&started.port().to_string()]), &logs);
     mgr.install(&spec, false).expect("install");
 
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
@@ -145,9 +141,9 @@ fn start_stop_status_reflect_reality() {
 fn uninstall_leaves_nothing() {
     let mgr = goetia::backend::scm::manager::Scm::new();
     let id = support::random_test_id();
-    let logs = tempfile::tempdir().expect("tempdir for the daemon's log");
+    let logs = LogDir::new();
     let _guard = ServiceGuard::new(&id);
-    let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs.path().join("daemon.log"));
+    let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
     mgr.install(&spec, false).expect("install");
 
     mgr.uninstall(&spec.id).expect("uninstall");
@@ -205,14 +201,10 @@ fn list_ignores_foreign_services() {
 fn the_shim_reports_stop_pending_then_stopped() {
     let mgr = goetia::backend::scm::manager::Scm::new();
     let id = support::random_test_id();
-    let logs = tempfile::tempdir().expect("tempdir for the daemon's log");
+    let logs = LogDir::new();
     let _guard = ServiceGuard::new(&id);
     let started = support::ConnectBack::listen();
-    let spec = simple_spec(
-        &id,
-        fixture_command("report", &[&started.port().to_string()]),
-        &logs.path().join("daemon.log"),
-    );
+    let spec = simple_spec(&id, fixture_command("report", &[&started.port().to_string()]), &logs);
     mgr.install(&spec, false).expect("install");
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     started.accept("the fixture (spawned by the shim) to report running");
