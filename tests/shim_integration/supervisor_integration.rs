@@ -14,22 +14,21 @@ use goetia::manager::{Budget, ServiceManager as _};
 use goetia::spec::{DaemonSpec, Restart};
 use windows_service::service::{ServiceExitCode, ServiceState};
 
-use crate::common::{LogDir, ShimGuard, fallback_log, fixture_command, recorded_exit, scm_status, simple_spec};
-use crate::support::{self, ConnectBack, ELEVATED};
+use crate::common::{LogDir, fixture_command, parameters_key, recorded_exit, scm_status, simple_spec};
+use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn shim_runs_child_with_cwd_and_env() {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let tmp = tempfile::tempdir().expect("tempdir for cwd");
-    let _guard = ShimGuard::new(&id);
+    let _guard = ServiceGuard::new(&id);
     let reported = ConnectBack::listen();
 
     let mut env = BTreeMap::new();
     env.insert("GOETIA_SHIM_ENV_PROBE".to_string(), "probe-value".to_string());
     let spec = DaemonSpec {
-        cwd: Some(tmp.path().to_path_buf()),
+        cwd: Some(logs.path().to_path_buf()),
         env,
         ..simple_spec(
             &id,
@@ -51,7 +50,7 @@ fn shim_runs_child_with_cwd_and_env() {
 
     // Canonicalize both sides: Windows may report a `\\?\`-prefixed or
     // short/long path differently than the one handed to `cwd:`.
-    let expected = std::fs::canonicalize(tmp.path()).expect("canonicalize expected cwd");
+    let expected = std::fs::canonicalize(logs.path()).expect("canonicalize expected cwd");
     let actual =
         std::fs::canonicalize(reported_cwd).unwrap_or_else(|e| panic!("canonicalize reported cwd {reported_cwd}: {e}"));
     assert_eq!(actual, expected, "child did not run with the configured cwd");
@@ -63,7 +62,7 @@ fn shim_captures_stdout_to_logs_path() {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let _guard = ShimGuard::new(&id);
+    let _guard = ServiceGuard::new(&id);
     let reported = ConnectBack::listen();
     let log_path = logs.path_for(&id);
     const MARKER: &str = "goetia-shim-log-capture-probe";
@@ -93,7 +92,7 @@ fn stop_kills_the_whole_process_tree() {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let _guard = ShimGuard::new(&id);
+    let _guard = ServiceGuard::new(&id);
     let child_reported = ConnectBack::listen();
     let grandchild_reported = ConnectBack::listen();
 
@@ -158,12 +157,13 @@ fn unreadable_blob_logs_to_fallback_path_and_event_log() {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let _guard = ShimGuard::new(&id);
+    let _guard = ServiceGuard::new(&id);
 
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
     mgr.install(&spec, false).expect("install");
 
     corrupt_spec_value(&id);
+    logs.redirect_program_data(&id);
 
     let err = mgr
         .start(&spec.id, Budget::DEFAULT)
@@ -182,7 +182,7 @@ fn unreadable_blob_logs_to_fallback_path_and_event_log() {
         "an undecodable blob is a shim failure: {status:?}"
     );
 
-    let logged = fallback_log(&id);
+    let logged = logs.fallback_log(&id);
     assert!(
         logged.contains(&id) && logged.to_lowercase().contains("decode"),
         "fallback log does not look like a decode-failure report naming `{id}`:\n{logged}"
@@ -226,13 +226,7 @@ fn unreadable_blob_logs_to_fallback_path_and_event_log() {
 /// that is unambiguously ours (so `install`/`start` do not refuse it as
 /// foreign) but whose `Spec` an old shim (or any shim) cannot decode.
 fn corrupt_spec_value(id: &str) {
-    use winreg::RegKey;
-    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_WRITE};
-
-    let path = format!(r"SYSTEM\CurrentControlSet\Services\{id}\Parameters");
-    let key = RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey_with_flags(&path, KEY_WRITE)
-        .unwrap_or_else(|e| panic!("open {path} to corrupt Spec: {e}"));
-    key.set_value("Spec", &"not valid base64 or JSON at all".to_string())
-        .unwrap_or_else(|e| panic!("overwrite Spec under {path}: {e}"));
+    parameters_key(id)
+        .set_value("Spec", &"not valid base64 or JSON at all".to_string())
+        .unwrap_or_else(|e| panic!("overwrite Spec of {id}: {e}"));
 }
