@@ -15,8 +15,8 @@
 //!   10s, just below that, so such a job essentially always reports [`Error::WaitTimeout`]. The
 //!   request stands (the `launchctl` carrying it is left running, never killed), but launchd will
 //!   not report the job running within the budget. The budget bounds that wait and nothing else:
-//!   every `launchctl` call that issues the request runs to completion. The throttle is keyed to the job, so `bootout` plus
-//!   `bootstrap` does not clear it and there is no remedy to apply.
+//!   every `launchctl` call that issues the request runs to completion. The throttle is keyed to
+//!   the job, so `bootout` plus `bootstrap` does not clear it and there is no remedy to apply.
 //! - `stop` `launchctl bootout`s the job, from whichever directory it was loaded.
 //! - `enable` moves the plist from [`STAGING_DIR`] into [`ENABLED_DIR`] (`/Library/LaunchDaemons`).
 //!   Does not start it.
