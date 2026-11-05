@@ -59,10 +59,6 @@ impl ShimGuard {
         }
     }
 
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
     /// Step 1, and what it decides for the log.
     fn uninstall(&self) -> Fate {
         use goetia::error::Error;
