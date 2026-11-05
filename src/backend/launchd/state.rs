@@ -21,7 +21,7 @@ pub(crate) fn classify(print_body: &str) -> (State, Option<u32>) {
         // not yet forked, no pid), `xpcproxy`/`trampoline` without a pid, any `state` a future
         // macOS introduces, and no `state` line at all.
         //
-        // One of three places a `State::Starting` would be produced if goetia grows one: also
+        // One of three places a `State::Starting` would be produced if goetia grows one (routed post-0.1.0): also
         // `map_state` in `src/backend/scm/manager.rs` and `status_from_unit` in
         // `src/backend/systemd/manager/systemctl.rs`.
         _ => State::Unknown,

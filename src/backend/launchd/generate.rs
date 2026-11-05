@@ -152,11 +152,11 @@ pub(crate) fn without_metadata(text: &str) -> String {
 
 /// Escape the three characters XML element content cannot contain unescaped. Applied to every
 /// emitted value (argv, paths, environment keys and values, the account name), since
-/// `spec::resolve` rejects only control characters, not `&`/`<`/`>`.
+/// `spec::resolve` does not reject `&`/`<`/`>`.
 ///
-/// XML 1.0 excludes U+FFFE and U+FFFF entirely, so no escape can represent them, and
-/// `spec::resolve`'s `char::is_control()` gate does not reject them. This panics on them rather
-/// than emit XML no parser can load; the gate belongs in `spec::resolve`.
+/// XML 1.0 excludes U+FFFE and U+FFFF entirely, so no escape can represent them. `spec::resolve`
+/// rejects them (and the other Unicode noncharacters); this panics on them as a backstop rather
+/// than emit XML no parser can load.
 fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
