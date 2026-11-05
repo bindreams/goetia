@@ -234,8 +234,9 @@ enum Obtained {
 /// are read: the file step 1 classified need not be the one a later `open` resolves the name to.
 /// No `(st_dev, st_ino)` comparison against step 1 is needed, since an `fstat` on the open
 /// descriptor is stronger than two name lookups agreeing. It does not rule out reading a
-/// different regular file than step 1 stat'd, the benign content race a plain `fs::read` has too,
-/// and one no verdict here depends on.
+/// different regular file than step 1 stat'd: the benign content race a plain `fs::read` has,
+/// which no verdict depends on.
+///
 /// `O_NONBLOCK` covers the window between the steps: a FIFO swapped in after step 1 cannot block
 /// the open, so step 2 rejects it.
 fn obtain(path: &Path) -> Obtained {
@@ -1229,9 +1230,8 @@ impl backend::Backend for Launchd {
             {
                 // launchd forked the job and named the pid: the confirmation.
                 Kickstarted::Confirmed => {}
-                // `-p` returned no pid this code trusts. launchd named one in every run measured
-                // (250/250), so this case was never observed and is not guessed at: one bounded
-                // read decides it.
+                // `-p` returned no pid this code trusts. Not expected from launchd, and not
+                // guessed at: one bounded read decides it.
                 Kickstarted::NoPid if budget.waits() => {
                     let state = self.launchctl.live_state(id.as_str(), deadline, reservation)?.0;
                     if state != State::Running {
