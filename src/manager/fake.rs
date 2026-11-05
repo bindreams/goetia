@@ -356,11 +356,10 @@ impl Fake {
 
     /// Test-only seeding: make `list` report one [`Installed::Undetermined`]
     /// entry that names nobody — the shape a backend produces when it cannot
-    /// usefully name what the entry stands for. Windows SCM produces it in two
-    /// cases. When more than one service denies a `Parameters` read (routine on
-    /// an unelevated `list`), enumeration succeeded and the names are known, but
-    /// one entry cannot carry them all. And when the scan could not finish, one
-    /// entry stands for the services `registry::scan_services` never reached.
+    /// usefully name what the entry stands for, as Windows SCM does when more
+    /// than one service's `Parameters` cannot be read (routine on an unelevated
+    /// `list`) and when its scan could not finish; see `scm::manager`'s
+    /// `unreadable_aggregate` and `scan`.
     ///
     /// `reason` is a complete sentence, because that is how it is rendered:
     /// there is no name to prefix it with.

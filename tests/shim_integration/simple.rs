@@ -17,7 +17,7 @@ use crate::support::{self, ELEVATED, ServiceGuard};
 
 /// The same cross-process lock `tests/scm_integration/managed.rs` declares,
 /// shared with it by label *name*: both binaries drive the one SCM on the host,
-/// and `list`'s aggregate `undetermined` entry is an answer about all of it. A
+/// and one denied `Parameters` changes `list`'s answer for all of it. A
 /// negative assertion here is unsound while any test anywhere denies a
 /// `Parameters` read, so they take turns rather than race.
 #[skuld::label]

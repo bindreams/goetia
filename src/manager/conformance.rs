@@ -122,7 +122,7 @@ pub fn run(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
 /// randomness crate; a process-wide counter plus the pid is unique enough,
 /// since callers clean up what they create on normal return and on panic. A
 /// straggler the module doc comment describes must be removed by hand before
-/// a later run reuses the pid.
+/// the next run.
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn fresh_id(label: &str) -> String {
@@ -477,16 +477,16 @@ fn list_and_status_agree_on_pid(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> D
 /// different error), so seeding one asserts the wrong contract.
 ///
 /// Seeding [`UNDETERMINED_ID`] changes `list`'s answer for the whole host, not
-/// only for that id: it adds an [`Installed::Undetermined`] entry and raises
-/// `daemon list`'s exit code. A caller whose suite also asserts a *clean*
-/// host-wide listing has to serialize the two against each other, with the
-/// `UNIT_DIR_EXCLUSIVE` label the integration suites share by name.
+/// only for that id. A caller whose suite also asserts a *clean* host-wide
+/// listing has to serialize the two against each other: the integration suites
+/// share `UNIT_DIR_EXCLUSIVE` by name, and each such test both carries it in
+/// `labels` and declares `serial = UNIT_DIR_EXCLUSIVE`.
 ///
 /// A backend satisfies the `list` half by naming the id in an
 /// [`Installed::Undetermined`] entry *or* by emitting any aggregate one. The
 /// aggregate counts because a null name stands for ids the entry could not
-/// separate, so it may stand for this one. SCM names the id only when it is the
-/// sole unreadable service. The per-id half below is exact on every backend,
+/// separate, so it may stand for this one; when SCM emits which is
+/// `scm::manager`'s `unreadable_aggregate` and `scan`. The per-id half below is exact on every backend,
 /// so accepting the aggregate does not weaken the scenario to nothing.
 pub fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
     let spec = mk(UNDETERMINED_ID);
