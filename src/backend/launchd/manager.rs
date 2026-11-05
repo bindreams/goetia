@@ -222,7 +222,7 @@ enum Obtained {
 /// `open(2)` on a FIFO blocks until a writer arrives, and `list` reads every `*.plist` in
 /// `/Library/LaunchDaemons`, so one `mkfifo` there would wedge the listing for the host and
 /// `install`/`status` for that id. Step 1, `fs::metadata`, opens nothing, so it cannot block, and
-/// it keeps a device node from being opened at all.
+/// it keeps a device node present at step 1 from being opened at all.
 ///
 /// Step 1 follows symlinks, unlike `systemd::manager::discover::classify_and_read`'s `O_NOFOLLOW`:
 /// `systemctl mask` points a fragment at `/dev/null`, so there the symlink itself is the artifact.
@@ -1110,8 +1110,8 @@ impl backend::Backend for Launchd {
                 let target = snapshot.location.path.as_path();
                 // `target` was captured by `read`, before `decide` ran. A concurrent `enable` or
                 // `disable` may have moved it since, and writing here would put a plist in both
-                // directories, which `locate` errors on; after a concurrent `uninstall` reported
-                // success, it would install the plist again. This check only narrows the race to
+                // directories, which `locate` errors on; a concurrent `uninstall` would report
+                // success and leave the write's plist installed. This check only narrows the race to
                 // the window between it and `write_existing`'s rename onto `target`; it does not
                 // close it.
                 if !still_present(target)? {
