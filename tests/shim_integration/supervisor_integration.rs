@@ -14,8 +14,8 @@ use goetia::manager::{Budget, ServiceManager as _};
 use goetia::spec::{DaemonSpec, Restart};
 use windows_service::service::{ServiceExitCode, ServiceState};
 
-use crate::common::{FallbackLog, LogDir, fallback_log, fixture_command, recorded_exit, scm_status, simple_spec};
-use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
+use crate::common::{LogDir, ShimGuard, fallback_log, fixture_command, recorded_exit, scm_status, simple_spec};
+use crate::support::{self, ConnectBack, ELEVATED};
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn shim_runs_child_with_cwd_and_env() {
@@ -23,7 +23,7 @@ fn shim_runs_child_with_cwd_and_env() {
     let id = support::random_test_id();
     let logs = LogDir::new();
     let tmp = tempfile::tempdir().expect("tempdir for cwd");
-    let _guard = ServiceGuard::new(&id);
+    let _guard = ShimGuard::new(&id);
     let reported = ConnectBack::listen();
 
     let mut env = BTreeMap::new();
@@ -63,7 +63,7 @@ fn shim_captures_stdout_to_logs_path() {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let _guard = ServiceGuard::new(&id);
+    let _guard = ShimGuard::new(&id);
     let reported = ConnectBack::listen();
     let log_path = logs.path_for(&id);
     const MARKER: &str = "goetia-shim-log-capture-probe";
@@ -93,7 +93,7 @@ fn stop_kills_the_whole_process_tree() {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let _guard = ServiceGuard::new(&id);
+    let _guard = ShimGuard::new(&id);
     let child_reported = ConnectBack::listen();
     let grandchild_reported = ConnectBack::listen();
 
@@ -158,9 +158,7 @@ fn unreadable_blob_logs_to_fallback_path_and_event_log() {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let _guard = ServiceGuard::new(&id);
-    // After the `ServiceGuard`: drops first, while the service record still names the shim.
-    let _fallback = FallbackLog::new(&id);
+    let _guard = ShimGuard::new(&id);
 
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
     mgr.install(&spec, false).expect("install");

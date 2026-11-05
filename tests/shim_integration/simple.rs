@@ -11,9 +11,9 @@ use windows_sys::Win32::System::Services::{
     SERVICE_NOTIFY_STOP_PENDING, SERVICE_NOTIFY_STOPPED, SERVICE_STOP_PENDING, SERVICE_STOPPED,
 };
 
-use crate::common::{LogDir, arm_and_wait, conformance_mk, fixture_command, simple_spec};
+use crate::common::{LogDir, ShimGuard, arm_and_wait, conformance_mk, fixture_command, simple_spec};
 use crate::deny::Denied;
-use crate::support::{self, ELEVATED, ServiceGuard};
+use crate::support::{self, ELEVATED};
 
 /// The same cross-process lock `tests/scm_integration/managed.rs` declares,
 /// shared with it by label *name*: both binaries drive the one SCM on the host,
@@ -60,17 +60,17 @@ fn simple_passes_conformance() {
     let logs = LogDir::new();
     let mk = |id: &str| conformance_mk(&logs, id);
 
-    let _foreign_guard = ServiceGuard::new(conformance::FOREIGN_ID);
+    let _foreign_guard = ShimGuard::new(conformance::FOREIGN_ID);
     seed_foreign(conformance::FOREIGN_ID);
 
-    let _hand_edited_guard = ServiceGuard::new(conformance::HAND_EDITED_ID);
+    let _hand_edited_guard = ShimGuard::new(conformance::HAND_EDITED_ID);
     mgr.install(&mk(conformance::HAND_EDITED_ID), false)
         .expect("seed install for the hand-edit scenario");
     hand_edit(conformance::HAND_EDITED_ID);
 
     // Seed `UNDETERMINED_ID`, exactly as `tests/scm_integration/managed.rs` does: install
     // normally, then deny reading the one key that carries the marker.
-    let _undetermined_guard = ServiceGuard::new(conformance::UNDETERMINED_ID);
+    let _undetermined_guard = ShimGuard::new(conformance::UNDETERMINED_ID);
     mgr.install(&mk(conformance::UNDETERMINED_ID), false)
         .expect("seed install for the undetermined scenario");
     let _undetermined_denied = Denied::parameters(conformance::UNDETERMINED_ID);
@@ -85,7 +85,7 @@ fn install_then_list_round_trips_without_the_source_file() {
     let mgr = goetia::backend::scm::manager::Scm::new();
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let _guard = ServiceGuard::new(&id);
+    let _guard = ShimGuard::new(&id);
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
 
     let outcome = mgr.install(&spec, false).expect("install");
@@ -111,7 +111,7 @@ fn start_stop_status_reflect_reality() {
     let mgr = goetia::backend::scm::manager::Scm::new();
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let _guard = ServiceGuard::new(&id);
+    let _guard = ShimGuard::new(&id);
     let started = support::ConnectBack::listen();
     let spec = simple_spec(&id, fixture_command("report", &[&started.port().to_string()]), &logs);
     mgr.install(&spec, false).expect("install");
@@ -142,7 +142,7 @@ fn uninstall_leaves_nothing() {
     let mgr = goetia::backend::scm::manager::Scm::new();
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let _guard = ServiceGuard::new(&id);
+    let _guard = ShimGuard::new(&id);
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
     mgr.install(&spec, false).expect("install");
 
@@ -171,8 +171,8 @@ fn uninstall_leaves_nothing() {
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_ignores_foreign_services() {
     let id = support::random_test_id();
-    let guard = ServiceGuard::new(&id);
-    seed_foreign(guard.id());
+    let _guard = ShimGuard::new(&id);
+    seed_foreign(&id);
 
     let mgr = goetia::backend::scm::manager::Scm::new();
     let installed = mgr.list().expect("list");
@@ -202,7 +202,7 @@ fn the_shim_reports_stop_pending_then_stopped() {
     let mgr = goetia::backend::scm::manager::Scm::new();
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let _guard = ServiceGuard::new(&id);
+    let _guard = ShimGuard::new(&id);
     let started = support::ConnectBack::listen();
     let spec = simple_spec(&id, fixture_command("report", &[&started.port().to_string()]), &logs);
     mgr.install(&spec, false).expect("install");
