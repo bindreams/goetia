@@ -66,7 +66,7 @@ fn restart(mgr: &dyn ServiceManager, id: &Id, budget: Budget) -> Result<()> {
     restart_until(mgr, id, budget, budget.start())
 }
 
-/// [`restart`] against a `deadline` already started from `budget`.
+/// [`restart`] against a given `deadline`, which may already be spent.
 ///
 /// Under a budget that waits the legs need nothing between them: the stop
 /// leg is only ever handed a budget that waits (see [`stop_leg`]), so a
@@ -105,7 +105,7 @@ fn restart_until(mgr: &dyn ServiceManager, id: &Id, budget: Budget, deadline: De
 
 // the abandonment rule ================================================================================================
 
-/// The budget a leg of [`restart`] runs under, given the budget the user
+/// The budget a leg of [`restart_until`] runs under, given the budget the user
 /// named and what is left of it.
 #[derive(Debug, PartialEq, Eq)]
 enum Leg {
