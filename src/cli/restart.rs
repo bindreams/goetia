@@ -60,13 +60,12 @@ pub fn run(
     )
 }
 
-/// One daemon's restart, spending `budget` across both legs from one
-/// deadline started here.
+/// One daemon's restart, under one deadline started here.
 fn restart(mgr: &dyn ServiceManager, id: &Id, budget: Budget) -> Result<()> {
     restart_until(mgr, id, budget, budget.start())
 }
 
-/// [`restart`] against a given `deadline`, which may already be spent.
+/// [`restart`], under a `deadline` that may already be spent.
 ///
 /// Under a budget that waits the legs need nothing between them: the stop
 /// leg is only ever handed a budget that waits (see [`stop_leg`]), so a

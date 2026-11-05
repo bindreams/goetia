@@ -53,8 +53,8 @@ fn a_stop_leg_whose_bounded_budget_is_spent_still_gets_a_bound() {
 
 // a spent budget ======================================================================================================
 
-/// `frpc`'s restart under `--timeout 30s` with the deadline already spent, so nothing here depends
-/// on how long the run takes. Returns the error's report; the restart must fail as indeterminate.
+/// `frpc`'s restart under a 30s budget whose deadline is already spent, so nothing depends on how
+/// long the run takes.
 fn restart_with_a_spent_deadline(fake: &Fake) -> String {
     let id = Id::try_from("frpc").unwrap();
     let e = restart_until(fake, &id, THIRTY, Budget::Immediate.start()).expect_err("a spent budget is a timeout");
