@@ -1,9 +1,8 @@
 //! The shared install decision.
 //!
-//! One pure function, called by the test fake and by all three real
-//! backends, so the install policy — absent / ours / up-to-date / conflict
-//! / foreign — cannot drift between them. See the design spec's §5
-//! "Install semantics" for the table this implements.
+//! One pure function shared by the test fake and all three real backends, so
+//! the install policy (absent / ours / up-to-date / conflict / foreign)
+//! cannot drift between them.
 
 use crate::blob::Blob;
 use crate::diff;
@@ -14,10 +13,8 @@ use crate::spec::{DaemonSpec, Id};
 
 /// What discovery found at the id an install targets, before any decision
 /// about what to do with it.
-// `Blob` embeds a full `DaemonSpec` (command/env/paths), so `Ours` is much
-// larger than `Foreign`/`Absent`. Boxing it would ripple into every future
-// backend's match arms for no behavioral benefit, since `decide` is called
-// on the order of once per daemon per install, never in a hot loop.
+// `Ours` embeds a full `DaemonSpec`; boxing it would ripple into every backend's match arms, and
+// `decide` runs once per daemon per install.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ownership {
@@ -26,11 +23,10 @@ pub enum Ownership {
     /// A Goetia-marked artifact exists and its blob decoded successfully.
     /// `regenerated` is `generate(blob.spec)` — the caller's own generator
     /// applied to the *embedded* spec, not the new one — and `on_disk` is
-    /// the artifact's raw text. Bundling both into this variant, rather than
-    /// passing them as separate parameters, means a caller cannot forget
-    /// either, and cannot pass `on_disk` for an ownership that never reads
-    /// it: the three-way comparison of `on_disk`, `regenerated` and
-    /// `desired` this module needs is always available.
+    /// the artifact's raw text. Both live in this variant so the three-way
+    /// comparison of `on_disk`, `regenerated` and `desired` is always
+    /// available and `on_disk` cannot be passed for an ownership that never
+    /// reads it.
     Ours {
         blob: Blob,
         regenerated: String,
@@ -66,10 +62,8 @@ pub enum Ownership {
 // ExternalConfig ======================================================================================================
 
 /// Configuration the manager applies to a service from outside the artifact goetia wrote. Systemd's
-/// `<id>.service.d` drop-in directories are the only one that exists today, but this is not
-/// architecturally systemd-specific: any backend that grows an analogous side-channel (a launchd
-/// override, say) needs the same questions answered, and answering them here — once — is what keeps
-/// them from being reinvented per backend.
+/// `<id>.service.d` drop-in directories are the only one today, but the questions are not
+/// systemd-specific; answering them here keeps them from being reinvented per backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalConfig {
     /// None exists.
@@ -81,9 +75,8 @@ pub enum ExternalConfig {
     /// Some exists that a successful write will *not* remove, so `--force` cannot resolve the
     /// conflict. `recovery` is the way out.
     ///
-    /// Rendered by the backend rather than here: only the backend knows which locations it writes,
-    /// and the way out is in its own vocabulary. [`decide`] carries it into [`Outcome::Conflict`]
-    /// without interpreting it.
+    /// Rendered by the backend, which alone knows which locations it writes. [`decide`] carries it
+    /// into [`Outcome::Conflict`] without interpreting it.
     Unclearable { recovery: String },
 }
 
@@ -126,9 +119,8 @@ pub enum Outcome {
     /// — with the text saying what to do instead — when part of what makes the
     /// artifact differ is outside the directory the backend writes, so
     /// overwriting the artifact would leave it in place and the next run
-    /// would report the identical conflict. A caller must not re-derive that
-    /// by re-reading the platform: it belongs where the conflict was
-    /// determined.
+    /// would report the identical conflict. Callers must not re-derive this
+    /// from the platform.
     Conflict {
         artifact_diff: String,
         unclearable_recovery: Option<String>,
@@ -154,11 +146,8 @@ pub enum Outcome {
 
 // decide ==============================================================================================================
 
-/// The recovery text for a foreign (unmarked) id. Its own function, not
-/// inlined into `decide`, so a [`ServiceManager`] can give the identical
-/// wording when refusing a *non*-`install` verb (`uninstall`/`start`/etc.)
-/// against the same foreign id — one string template, not two that can
-/// drift apart.
+/// The recovery text for a foreign (unmarked) id. Shared so a [`ServiceManager`] gives the
+/// identical wording when refusing a non-`install` verb against the same id.
 ///
 /// [`ServiceManager`]: crate::manager::ServiceManager
 pub fn foreign_recovery(id: &str) -> String {
@@ -169,8 +158,8 @@ pub fn foreign_recovery(id: &str) -> String {
     )
 }
 
-/// The recovery text for an id whose blob will not decode. Its own function, like
-/// [`foreign_recovery`], so a backend's discovery and the CLI can give the identical wording.
+/// The recovery text for an id whose blob will not decode. Shared, like [`foreign_recovery`], so
+/// a backend's discovery and the CLI give the identical wording.
 pub fn unusable_recovery(id: &str) -> String {
     format!(
         "run `goetia daemon uninstall {id}` to remove the unusable artifact (uninstall does \
@@ -178,9 +167,8 @@ pub fn unusable_recovery(id: &str) -> String {
     )
 }
 
-/// Why, and what to do, for [`Outcome::RefuseOtherDaemon`]. Its own function, like
-/// [`foreign_recovery`], so `install` and `diff` give the identical wording after their own
-/// `<id>: refused:` / `<id>: would be refused:` prefix.
+/// Why, and what to do, for [`Outcome::RefuseOtherDaemon`]. Shared so `install` and `diff` give
+/// the identical wording after their own `<id>: refused:` / `<id>: would be refused:` prefix.
 pub fn other_daemon_refusal(installed: &str) -> String {
     format!(
         "the service manager finds the installed daemon `{installed}` at this id, and installing \
@@ -241,16 +229,11 @@ pub fn decide(
             regenerated,
             on_disk,
         } => {
-            // A version mismatch always means "stale, regenerate" — checked
-            // before anything else, and never subject to `force` — *unless*
-            // foreign external configuration is present and unforced, in which case it is
-            // exactly as much a conflict as a hand-edited fragment is: the
-            // artifact was not solely goetia's own doing, so silently
-            // regenerating it would destroy something outside goetia without
-            // ever telling anyone. Without the version-mismatch priority at
-            // all, a release that changes generator output by a single byte
-            // would present itself as a hand-edit on every already-installed
-            // service — that half of the rule is unconditional.
+            // A version mismatch is checked first and means "stale, regenerate" — unless external
+            // configuration is present and unforced: then regenerating would silently destroy
+            // something outside goetia, so it is a conflict. Checking it first is unconditional;
+            // otherwise a release that changes generator output by one byte would read as a
+            // hand-edit on every installed service.
             if blob.version != running_version {
                 if *external != ExternalConfig::Absent && !force {
                     return Outcome::Conflict {
@@ -268,34 +251,22 @@ pub fn decide(
             }
 
             if on_disk == regenerated {
-                // The artifact is exactly what the embedded spec itself
-                // would regenerate — no hand-edit — so the only reason it
-                // differs from `desired` is that the spec changed.
+                // No hand-edit: the spec alone changed.
                 return Outcome::Update {
                     spec_diff: diff::spec_diff(&blob.spec, new_spec),
                 };
             }
 
-            // `on_disk` matches neither `desired` nor `regenerated`: a
-            // hand-edit, regardless of whether the spec also changed. A
-            // spec change alone cannot explain this difference — a clean
-            // one would have matched `regenerated` above — so collapsing
-            // this into `Update` would silently discard the hand-edit
-            // riding along with the spec change.
+            // Matches neither `desired` nor `regenerated`: a hand-edit, whether or not the spec
+            // also changed. Collapsing this into `Update` would silently discard it.
             if force {
                 Outcome::Update {
                     spec_diff: diff::spec_diff(&blob.spec, new_spec),
                 }
             } else {
                 Outcome::Conflict {
-                    // `regenerated` -> `on_disk`, deliberately, not
-                    // `on_disk` -> `desired`. The question a conflict must
-                    // answer is "what did you change outside goetia that is
-                    // about to be lost?", and only this direction isolates
-                    // it. Diffing against `desired` would blend the
-                    // hand-edit together with the legitimate spec change,
-                    // which is exactly the conflation the two-level diff
-                    // design exists to avoid.
+                    // `regenerated` -> `on_disk`, not `on_disk` -> `desired`: only this direction
+                    // isolates the hand-edit about to be lost from the legitimate spec change.
                     artifact_diff: diff::artifact_diff(regenerated, on_disk),
                     unclearable_recovery: external.unclearable_recovery(),
                 }

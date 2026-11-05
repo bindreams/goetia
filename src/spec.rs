@@ -2,10 +2,9 @@
 //! gate.
 //!
 //! `RawSpec -> DaemonSpec` (see `resolve`) is the crate's parse-don't-validate
-//! boundary: every `DaemonSpec` that exists has already passed every check
-//! below, so nothing downstream — a generator, the metadata blob — needs to
-//! re-derive them. There is no separate `validate()` function anywhere in
-//! the crate; `resolve` is both parse and validate.
+//! boundary: every `DaemonSpec` that exists has already passed every check,
+//! so nothing downstream needs to re-derive them. There is no separate
+//! `validate()`.
 //!
 //! A daemon may also carry a `backend-specific:` block overriding its
 //! fields per [`BackendKind`]; see `overrides`'s module doc for the
@@ -26,24 +25,20 @@ pub use raw::RawSpec;
 pub use resolve::{load, resolve};
 pub use user::{AccountId, RawUser, User};
 
-// Re-exported so `blob::decode` can re-run the same injection-gate checks
-// `resolve` uses, against a spec deserialized from an untrusted artifact,
-// instead of duplicating the rules.
+// Re-exported so `blob::decode` re-runs the same injection-gate checks `resolve` uses, against a
+// spec deserialized from an untrusted artifact.
 pub(crate) use resolve::{
     reject_blank, reject_empty, reject_empty_command, reject_env_key_with_equals, reject_relative_path,
     reject_unemittable,
 };
-// Read by `crate::backend::scm::generate`, which is not a descendant of
-// `spec` and so cannot see through a private `mod backend;`:
-// `windows_builtin` from `canonical_account` and `account_needs_password`,
-// `scm_restart_delay` from `registration`. `windows_only_account` stays out of
-// this line — only `BackendKind::error` reads it, inside `spec::backend` itself.
+// Read by `crate::backend::scm::generate`, which cannot see through the private `mod backend;`.
+// `windows_only_account` stays out of this line: only `BackendKind::error` reads it, inside
+// `spec::backend`.
 pub(crate) use backend::{scm_restart_delay, windows_builtin};
-// `MAX_SC_ACTION_DELAY` is named through this path from `generate_tests.rs` alone.
+// Named from `generate_tests.rs` alone.
 #[cfg(test)]
 pub(crate) use backend::MAX_SC_ACTION_DELAY;
-// `Builtin` is named through this path from `generate_tests.rs` alone;
-// production code only ever infers it, from `windows_builtin`'s return.
+// Named from `generate_tests.rs` alone; production code only infers it from `windows_builtin`.
 #[allow(unused_imports)]
 pub(crate) use backend::Builtin;
 
@@ -143,9 +138,8 @@ impl DaemonSpec {
     /// else unset. Panics if `id` is not a valid [`Id`]. Mirrors `tests/support/daemon_spec.rs`
     /// (integration tests cannot reach `#[cfg(test)]` code).
     ///
-    /// A test that needs anything else says so with struct-update syntax:
-    /// `DaemonSpec { restart, ..DaemonSpec::for_test("frpc", command) }`. Built literally, never
-    /// through `resolve`, so that paths render the same on every platform.
+    /// Vary fields with struct-update syntax: `DaemonSpec { restart, ..DaemonSpec::for_test("frpc", command) }`.
+    /// Built literally, never through `resolve`, so paths render the same on every platform.
     pub(crate) fn for_test(id: &str, command: Vec<String>) -> DaemonSpec {
         DaemonSpec {
             id: Id::try_from(id).unwrap_or_else(|e| panic!("`{id}` is not a valid Id: {e}")),
@@ -166,10 +160,9 @@ impl DaemonSpec {
 /// `KeepAlive`, and SCM recovery actions.
 ///
 /// Parsed from its authored kebab-case string by `resolve::parse_restart`,
-/// not derived `Deserialize`: `RawSpec::restart` is a `String` so that a
-/// `${VAR}` reference can be interpolated into it before this type is ever
-/// produced — a derived `Deserialize` would fail at YAML-parse time on an
-/// unresolved placeholder, before interpolation gets a chance to run.
+/// not derived `Deserialize`: `RawSpec::restart` is a `String` so a `${VAR}`
+/// reference can be interpolated before this type is produced; a derived
+/// `Deserialize` would fail on the unresolved placeholder at YAML-parse time.
 ///
 /// The scm generator refuses `Always`, whose recovery actions never fire after a clean exit. For
 /// scm it survives only in blobs installed before that refusal.
@@ -181,9 +174,7 @@ pub enum Restart {
 }
 
 /// Whether Goetia runs the command directly (via `goetia-shim` on Windows)
-/// or the command is itself expected to behave as a native service. See
-/// the design spec's §2 mapping table for what each `Kind` can and cannot
-/// express per platform.
+/// or the command is itself expected to behave as a native service.
 ///
 /// Parsed from its authored kebab-case string by `resolve::parse_kind`; see
 /// [`Restart`]'s doc comment for why this is not a derived `Deserialize`.
@@ -200,9 +191,7 @@ pub enum Kind {
 ///
 /// `id` is `None` for a manifest-level advisory that belongs to the file
 /// rather than the daemon — e.g. a drive-relative `-f` argument, resolved
-/// by `resolve::absolutize` before any check of the daemon runs. Prefixing
-/// it with the daemon's id would say the daemon is what the advisory is
-/// about.
+/// by `resolve::absolutize` before any check of the daemon runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Warning {
     pub id: Option<Id>,
