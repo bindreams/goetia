@@ -184,7 +184,8 @@ fn uninstall_leaves_nothing() {
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_ignores_foreign_services() {
     let id = support::random_test_id();
-    let guard = ShimGuard::new(&id);
+    // A foreign service runs no shim, so it needs no `ShimGuard`.
+    let guard = support::ServiceGuard::new(&id);
     seed_foreign(guard.id());
 
     let mgr = Scm::new();

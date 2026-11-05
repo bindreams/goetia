@@ -38,8 +38,8 @@ pub fn fixture_command(mode: &str, args: &[&str]) -> Vec<String> {
 /// 3. [`LeftoverLog`]: the file the shim writes when it fails before it has read the daemon's config.
 ///
 /// Step 1 is this type's `drop`; steps 2 and 3 are its fields, which drop in declaration order. A
-/// failure prints a line and never panics; when nothing confirmed that no shim still writes the
-/// log, an existing log is kept and named.
+/// failure prints a line and never panics; unless `uninstall` confirmed the shim stopped, an
+/// existing log is kept and named.
 pub struct ShimGuard {
     id: String,
     _sc: support::ServiceGuard,
@@ -79,7 +79,13 @@ impl ShimGuard {
         match Scm::new().uninstall(&id) {
             Ok(()) | Err(Error::NotInstalled { .. }) => Fate::Remove,
             // Not goetia's, so nothing confirms its shim stopped; the `sc` guard owns the service.
-            Err(Error::Foreign { .. }) => Fate::Keep("the service is not goetia's".to_string()),
+            // Only the conformance seed is foreign by design; any other id is reported.
+            Err(e @ Error::Foreign { .. }) => {
+                if self.id != goetia::manager::conformance::FOREIGN_ID {
+                    eprintln!("ShimGuard[{}]: uninstall: {}", self.id, e.report());
+                }
+                Fate::Keep("the service is not goetia's".to_string())
+            }
             Err(e) => fail("uninstall", &e),
         }
     }
@@ -94,8 +100,8 @@ impl Drop for ShimGuard {
 /// What [`LeftoverLog`] does with its file.
 enum Fate {
     Remove,
-    /// Nothing confirmed that no shim still writes the file: `uninstall` failed, or the service is
-    /// not goetia's.
+    /// `uninstall` did not confirm the shim stopped: the id did not parse, `uninstall` failed, or
+    /// the service is not goetia's.
     Keep(String),
 }
 
@@ -109,10 +115,11 @@ struct LeftoverLog {
 impl Drop for LeftoverLog {
     fn drop(&mut self) {
         let problem = match &self.fate {
-            Fate::Keep(why) => self
-                .path
-                .exists()
-                .then(|| format!("left {}: {why}", self.path.display())),
+            Fate::Keep(why) => match self.path.try_exists() {
+                Ok(false) => None,
+                Ok(true) => Some(format!("left {}: {why}", self.path.display())),
+                Err(e) => Some(format!("left {}, if it exists ({e}): {why}", self.path.display())),
+            },
             Fate::Remove => support::service_guard::remove_path_retrying(&self.path, false),
         };
         if let Some(problem) = problem {
