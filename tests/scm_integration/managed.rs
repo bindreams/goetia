@@ -80,10 +80,11 @@ fn hand_edit(id: &str) {
 /// very answer this file's host-wide assertions are about.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn scm_passes_conformance() {
-    seed_foreign(conformance::FOREIGN_ID);
     let _foreign_guard = ServiceGuard::new(conformance::FOREIGN_ID);
+    seed_foreign(conformance::FOREIGN_ID);
 
     let mgr = Scm::new();
+    let _hand_edited_guard = ServiceGuard::new(conformance::HAND_EDITED_ID);
     mgr.install(&conformance_mk(conformance::HAND_EDITED_ID), false)
         .expect("seed install for the hand-edit scenario");
     hand_edit(conformance::HAND_EDITED_ID);
@@ -344,14 +345,12 @@ fn killing_a_stopped_service_is_not_running() {
 fn uninstall_leaves_nothing() {
     let mgr = Scm::new();
     let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
     let spec = support::spec(&id, fixture_command(&id, 1, 1, "plain"));
     mgr.install(&spec, false).expect("install");
 
     mgr.uninstall(&spec.id).expect("uninstall");
 
-    // No `ServiceGuard` here on purpose: if `uninstall` genuinely leaves
-    // nothing, there is nothing left to guard; if it does not, the
-    // assertions below fail with the leftover still in place to inspect.
     let query = support::cmd::run("sc.exe", &["query", &id]);
     assert!(!query.ok(), "service should no longer exist:\n{query}");
 
@@ -772,6 +771,8 @@ struct LocalUserGuard {
 
 impl LocalUserGuard {
     fn create(name: &str, password: &str) -> Self {
+        // Built after the add, not before: `/add` is atomic, so on failure nothing
+        // was created and a guard would delete an account this test did not make.
         support::cmd::run("net.exe", &["user", name, password, "/add"]).expect_ok();
         Self { name: name.to_string() }
     }

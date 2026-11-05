@@ -19,6 +19,7 @@ use goetia::decide::Outcome;
 use goetia::manager::{Budget, Installed, ServiceManager, State, conformance};
 use goetia::spec::{AccountId, DaemonSpec, Id, Kind, Restart, User};
 
+use crate::support::service_guard::remove_path;
 use crate::support::{self, ELEVATED, ServiceGuard, cmd};
 
 /// Held by every test whose assertion is about `list`'s answer for the *whole host* — its exit code,
@@ -109,8 +110,9 @@ fn write_unreadable_dropin(id: &str) {
 /// remove a file.
 fn seed_unreadable_dropin_enotdir(id: &str) -> RmPath {
     let path = dropin_dir(id);
+    let guard = RmPath(path.clone());
     fs::write(&path, b"").unwrap_or_else(|e| panic!("seed {}: {e}", path.display()));
-    RmPath(path)
+    guard
 }
 
 /// [`seed_unreadable_dropin_enotdir`] under an arbitrary search root, creating that root where it is
@@ -121,41 +123,42 @@ fn seed_unreadable_dropin_enotdir(id: &str) -> RmPath {
 /// itself populated is left exactly as it was found.
 fn seed_unreadable_dropin_in_root(root: &str, id: &str) -> RmFileInRoot {
     let root_path = PathBuf::from(root);
-    let created_root = !root_path.exists();
-    fs::create_dir_all(&root_path).unwrap_or_else(|e| panic!("mkdir {root}: {e}"));
     let leaf = root_path.join(format!("{id}.service.d"));
+    let guard = RmFileInRoot {
+        leaf: leaf.clone(),
+        root: (!root_path.exists()).then(|| root_path.clone()),
+    };
+    fs::create_dir_all(&root_path).unwrap_or_else(|e| panic!("mkdir {root}: {e}"));
     fs::write(&leaf, b"").unwrap_or_else(|e| panic!("seed {}: {e}", leaf.display()));
-    RmFileInRoot {
-        leaf,
-        root: created_root.then_some(root_path),
-    }
+    guard
 }
 
 /// Seed one `*.conf` into an arbitrary drop-in directory and hand back the RAII removal of it. The
 /// parent search root is left exactly as found: `/etc/systemd/system` is shared with every other
 /// test running concurrently.
-fn seed_dropin(dir: &Path) -> RmDropin {
+fn seed_dropin(dir: &Path, root: Option<PathBuf>) -> RmDropin {
+    let guard = RmDropin {
+        leaf: dir.to_path_buf(),
+        root,
+    };
     fs::create_dir_all(dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
     fs::write(dir.join("50-x.conf"), "[Service]\nMemoryMax=8G\n").expect("write drop-in");
     cmd::run("systemctl", &["daemon-reload"]).expect_ok();
-    RmDropin {
-        leaf: dir.to_path_buf(),
-        root: None,
-    }
+    guard
 }
 
 /// The same, under one of the two `.control` roots — where `systemctl set-property UNIT
 /// PROPERTY=VALUE` writes, and the two highest-precedence entries on the system unit search path,
 /// both above `/etc/systemd/system`.
 ///
-/// The root is removed along with the drop-in. Each test that seeds one takes a *different* root, so
-/// no concurrently running test can be inside the one this removes — and the removal is
-/// `remove_dir`, so a root systemd itself populated for some other unit fails to go and is left as
-/// it was found.
+/// The root is removed along with the drop-in only where this call created it. Each test that seeds
+/// one takes a *different* root, so no concurrently running test can be inside the one this removes
+/// — and the removal is `remove_dir`, so a root systemd itself populated for some other unit fails
+/// to go and is left as it was found.
 fn seed_control_dropin(root: &str, id: &str) -> (PathBuf, RmDropin) {
-    let leaf = PathBuf::from(root).join(format!("{id}.service.d"));
-    let mut guard = seed_dropin(&leaf);
-    guard.root = Some(PathBuf::from(root));
+    let root_path = PathBuf::from(root);
+    let leaf = root_path.join(format!("{id}.service.d"));
+    let guard = seed_dropin(&leaf, (!root_path.exists()).then_some(root_path));
     (leaf, guard)
 }
 
@@ -265,11 +268,36 @@ fn uid_of(account: &str) -> u32 {
         .unwrap_or_else(|e| panic!("parse uid of {account}: {e}"))
 }
 
+/// Logs a failed removal the way `ServiceGuard` does: `Drop` cannot return it, and a leftover that
+/// nothing reported shows up only as a straggler in the next run.
+fn report(guard: &str, problem: Option<String>) {
+    if let Some(problem) = problem {
+        eprintln!("{guard}: cleanup failed: {problem}");
+    }
+}
+
+/// `remove_dir` on a search root a seeding call created. "Not empty" is expected, not a failure: a
+/// root systemd itself populated for some other unit is left as it was found.
+fn remove_created_root(root: &Path) -> Option<String> {
+    match fs::remove_dir(root) {
+        Ok(()) => None,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            None
+        }
+        Err(e) => Some(format!("remove {}: {e}", root.display())),
+    }
+}
+
 struct RmDirAll(PathBuf);
 
 impl Drop for RmDirAll {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        report("RmDirAll", remove_path(&self.0, true));
     }
 }
 
@@ -282,9 +310,9 @@ struct RmDropin {
 
 impl Drop for RmDropin {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.leaf);
+        report("RmDropin", remove_path(&self.leaf, true));
         if let Some(root) = &self.root {
-            let _ = fs::remove_dir(root);
+            report("RmDropin", remove_created_root(root));
         }
         // No `daemon-reload` here: every test that seeds one of these also holds a `ServiceGuard`,
         // whose own cleanup reloads after this one has run.
@@ -300,9 +328,9 @@ struct RmFileInRoot {
 
 impl Drop for RmFileInRoot {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.leaf);
+        report("RmFileInRoot", remove_path(&self.leaf, false));
         if let Some(root) = &self.root {
-            let _ = fs::remove_dir(root);
+            report("RmFileInRoot", remove_created_root(root));
         }
     }
 }
@@ -313,7 +341,7 @@ struct RmPath(PathBuf);
 
 impl Drop for RmPath {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        report("RmPath", remove_path(&self.0, false));
     }
 }
 
@@ -346,10 +374,12 @@ fn systemd_passes_conformance() {
     let mgr = Systemd::new();
 
     // The three ids `conformance::run` cannot produce through the trait's own methods - see its
-    // module doc comment. `run` cleans up `HAND_EDITED_ID` itself; the other two are ours.
+    // module doc comment. All three are guarded here before their seed is written; `run` also
+    // removes `HAND_EDITED_ID`, which makes its guard's removal a no-op.
     let foreign_guard = ServiceGuard::new(conformance::FOREIGN_ID);
     seed_foreign(foreign_guard.id());
 
+    let _hand_edited_guard = ServiceGuard::new(conformance::HAND_EDITED_ID);
     mgr.install(&mk(conformance::HAND_EDITED_ID), false)
         .expect("seed hand-edited install");
     hand_edit(conformance::HAND_EDITED_ID);
@@ -793,24 +823,24 @@ struct StopHolder {
 impl StopHolder {
     fn start(id: &str) -> Self {
         let unit = format!("{id}-holder.service");
-        let lock = PathBuf::from(format!("/run/{id}.lock"));
-        let held = fs::File::create(&lock).unwrap_or_else(|e| panic!("create {}: {e}", lock.display()));
+        let path = PathBuf::from("/run/systemd/system").join(&unit);
+        let mut holder = StopHolder {
+            unit,
+            path,
+            lock: PathBuf::from(format!("/run/{id}.lock")),
+            held: None,
+        };
+        let held = fs::File::create(&holder.lock).unwrap_or_else(|e| panic!("create {}: {e}", holder.lock.display()));
         // SAFETY: `held` owns the descriptor for the duration of the call.
         let locked = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&held), libc::LOCK_EX) };
         assert_eq!(
             locked,
             0,
             "flock {}: {}",
-            lock.display(),
+            holder.lock.display(),
             std::io::Error::last_os_error()
         );
-        let path = PathBuf::from("/run/systemd/system").join(&unit);
-        let holder = StopHolder {
-            unit,
-            path,
-            lock,
-            held: Some(held),
-        };
+        holder.held = Some(held);
         fs::write(
             &holder.path,
             format!(
@@ -834,13 +864,17 @@ impl StopHolder {
 impl Drop for StopHolder {
     fn drop(&mut self) {
         self.release();
+        // `start` builds the holder before writing the unit or the lock, so a failed start leaves
+        // either unmade: exit 5 is "unit not loaded", and a missing file is already gone.
         let run = cmd::run("systemctl", &["stop", &self.unit]);
-        if !run.ok() {
+        if !run.ok() && run.code != Some(5) {
             eprintln!("StopHolder[{}]: cleanup failed: {run}", self.unit);
         }
         for path in [&self.path, &self.lock] {
-            if let Err(e) = fs::remove_file(path) {
-                eprintln!("StopHolder[{}]: remove {}: {e}", self.unit, path.display());
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => eprintln!("StopHolder[{}]: remove {}: {e}", self.unit, path.display()),
             }
         }
         let run = cmd::run("systemctl", &["daemon-reload"]);
@@ -1269,7 +1303,7 @@ fn a_unit_whose_executable_does_not_exist_fails_start() {
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn uninstall_leaves_nothing() {
     let id = support::random_test_id();
-    // No `ServiceGuard`: this test is itself the proof that nothing is left for one to clean up.
+    let _guard = ServiceGuard::new(&id);
     let spec = mk(&id);
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
@@ -1319,9 +1353,10 @@ fn uninstall_refuses_an_id_whose_fragment_is_gone_but_whose_dropin_remains() {
 fn uninstall_refuses_an_id_whose_fragment_is_gone_but_whose_enablement_link_remains() {
     let id = support::random_test_id();
     let link = wants_symlink(&id);
+    // No `ServiceGuard`: the id never gets a fragment, so only the planted link needs removing.
+    let _cleanup = RmPath(link.clone());
     fs::create_dir_all(link.parent().expect("the link has a parent")).expect("mkdir *.target.wants");
     std::os::unix::fs::symlink(unit_path(&id), &link).expect("plant a dangling .wants link");
-    let _cleanup = RmPath(link.clone());
 
     let (code, out, err) = uninstall_via_cli(&id);
 
@@ -1337,7 +1372,6 @@ fn install_refuses_a_stray_enablement_link_with_no_fragment() {
     let link = wants_symlink(guard.id());
     fs::create_dir_all(link.parent().expect("the link has a parent")).expect("mkdir *.target.wants");
     std::os::unix::fs::symlink(unit_path(guard.id()), &link).expect("plant a dangling .wants link");
-    let _cleanup = RmPath(link.clone());
 
     let mgr = Systemd::new();
     let outcome = mgr
@@ -1510,8 +1544,8 @@ fn install_refuses_an_unreadable_dropin_over_our_own_fragment() {
     mgr.install(&mk(guard.id()), false).expect("install");
 
     let blocker = dropin_dir(guard.id());
-    fs::write(&blocker, "").expect("plant a regular file where the drop-in directory would be");
     let _cleanup = RmPath(blocker.clone());
+    fs::write(&blocker, "").expect("plant a regular file where the drop-in directory would be");
 
     let outcome = mgr
         .install(&mk(guard.id()), false)
@@ -1682,7 +1716,7 @@ fn a_dash_truncated_dropin_is_not_this_ids_conflict() {
 
     let truncated = guard.id().rsplit_once('-').expect("the id has a dash").0.to_string();
     let dir = PathBuf::from(support::SYSTEMD_UNIT_DIR).join(format!("{truncated}-.service.d"));
-    let _cleanup = seed_dropin(&dir);
+    let _cleanup = seed_dropin(&dir, None);
 
     let outcome = mgr.preview_install(&mk(guard.id())).expect("preview");
     assert_eq!(
@@ -1694,7 +1728,7 @@ fn a_dash_truncated_dropin_is_not_this_ids_conflict() {
 
     // And the same id's *own* drop-in still is drift, so this is a boundary, not a hole — and one
     // `--force` does resolve, since `/etc/systemd/system/<id>.service.d` is goetia's to clear.
-    let _own = seed_dropin(&dropin_dir(guard.id()));
+    let _own = seed_dropin(&dropin_dir(guard.id()), None);
     let outcome = mgr.preview_install(&mk(guard.id())).expect("preview");
     assert!(
         matches!(
@@ -1730,6 +1764,8 @@ fn a_top_level_service_d_dropin_is_not_this_ids_conflict() {
         dir.display()
     );
     fs::create_dir(&dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
+    // Built after the mkdir, not before: it is atomic, so on failure nothing was created and a guard
+    // would remove a host-wide directory this test did not make.
     let _cleanup = RmDropin {
         leaf: dir.clone(),
         root: None,
@@ -1816,11 +1852,11 @@ fn install_accepts_preexisting_dirs_the_target_account_cannot_write() {
     let base = std::env::temp_dir().join(format!("{}-preexisting", guard.id()));
     let cwd = base.join("work");
     let log_dir = base.join("logs");
+    let _rm = RmDirAll(base.clone());
     for dir in [&cwd, &log_dir] {
         fs::create_dir_all(dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
     }
-    let _rm = RmDirAll(base.clone());
 
     let mut spec = mk(guard.id());
     spec.user = User::Name("nobody".to_string());
@@ -1849,9 +1885,9 @@ fn install_leaves_a_preexisting_ancestor_directory_untouched() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let base = std::env::temp_dir().join(format!("{}-ancestor", guard.id()));
+    let _rm = RmDirAll(base.clone());
     fs::create_dir(&base).unwrap_or_else(|e| panic!("mkdir {}: {e}", base.display()));
     fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).expect("chmod 0755");
-    let _rm = RmDirAll(base.clone());
     let base_meta_before = fs::metadata(&base).expect("stat base before");
 
     let cwd = base.join("work");
@@ -2213,8 +2249,8 @@ fn list_omits_a_non_utf8_unit_as_foreign_instead_of_reporting_it() {
 fn list_does_not_hang_on_a_fifo_in_the_unit_directory() {
     let id = support::random_test_id();
     let path = unit_path(&id);
+    let _cleanup = RmPath(path.clone());
     mkfifo(&path);
-    let _cleanup = RmPath(path);
 
     let listed = without_blocking("Systemd::list", || Systemd::new().list()).expect("list");
 

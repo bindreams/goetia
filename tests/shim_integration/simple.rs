@@ -58,9 +58,10 @@ fn hand_edit(id: &str) {
 fn simple_passes_conformance() {
     let mgr = goetia::backend::scm::manager::Scm::new();
 
-    seed_foreign(conformance::FOREIGN_ID);
     let _foreign_guard = ServiceGuard::new(conformance::FOREIGN_ID);
+    seed_foreign(conformance::FOREIGN_ID);
 
+    let _hand_edited_guard = ServiceGuard::new(conformance::HAND_EDITED_ID);
     mgr.install(&conformance_mk(conformance::HAND_EDITED_ID), false)
         .expect("seed install for the hand-edit scenario");
     hand_edit(conformance::HAND_EDITED_ID);
@@ -136,13 +137,12 @@ fn start_stop_status_reflect_reality() {
 fn uninstall_leaves_nothing() {
     let mgr = goetia::backend::scm::manager::Scm::new();
     let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
     let spec = simple_spec(&id, fixture_command("report", &["1"]));
     mgr.install(&spec, false).expect("install");
 
     mgr.uninstall(&spec.id).expect("uninstall");
 
-    // No `ServiceGuard` here on purpose — see
-    // `tests/scm_integration/managed.rs`'s identical test for why.
     let query = support::cmd::run("sc.exe", &["query", &id]);
     assert!(!query.ok(), "service should no longer exist:\n{query}");
 

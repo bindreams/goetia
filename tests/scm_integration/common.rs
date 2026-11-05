@@ -69,15 +69,15 @@ impl WorldReadableExe {
         let program_data =
             std::env::var_os("ProgramData").unwrap_or_else(|| panic!("%ProgramData% is not set on this host"));
         let path = PathBuf::from(program_data).join(format!("{id}.exe"));
+        let guard = Self { path };
         let exe = std::env::current_exe().expect("locate the test binary");
-        std::fs::copy(&exe, &path).unwrap_or_else(|e| panic!("copy {} to {}: {e}", exe.display(), path.display()));
+        std::fs::copy(&exe, &guard.path)
+            .unwrap_or_else(|e| panic!("copy {} to {}: {e}", exe.display(), guard.path.display()));
 
-        let path_str = path
-            .to_str()
-            .unwrap_or_else(|| panic!("{} is not UTF-8", path.display()));
-        support::cmd::run("icacls", &[path_str, "/grant", "*S-1-1-0:(RX)"]).expect_ok();
+        let path_str = guard.path_str();
+        support::cmd::run("icacls", &[&path_str, "/grant", "*S-1-1-0:(RX)"]).expect_ok();
 
-        Self { path }
+        guard
     }
 
     pub fn path_str(&self) -> String {
