@@ -358,7 +358,8 @@ impl Fake {
     /// entry that names nobody — the shape a backend produces when it cannot
     /// usefully name what the entry stands for, as Windows SCM does when more
     /// than one service's `Parameters` cannot be read (routine on an unelevated
-    /// `list`) and when its scan could not finish; see `scm::manager`'s
+    /// `list`; the names are known, but one entry cannot carry them all) and
+    /// when its scan could not finish; see `scm::manager`'s
     /// `unreadable_aggregate` and `scan`.
     ///
     /// `reason` is a complete sentence, because that is how it is rendered:
