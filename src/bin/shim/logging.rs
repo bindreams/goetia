@@ -189,11 +189,10 @@ fn write_channels(
 }
 
 /// The files to try for a line, in order: the daemon's log, then the default. When they are the
-/// same file (Windows paths compare case-insensitively), it is tried once.
+/// same path, it is tried once.
 fn log_destinations(daemon_log: Option<&Path>, default: PathBuf) -> Vec<PathBuf> {
-    let same = |a: &Path, b: &Path| a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase();
     match daemon_log {
-        Some(path) if !same(path, &default) => vec![path.to_path_buf(), default],
+        Some(path) if path != default => vec![path.to_path_buf(), default],
         Some(_) | None => vec![default],
     }
 }

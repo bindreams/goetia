@@ -251,11 +251,3 @@ fn log_destinations_do_not_retry_the_default_when_it_is_the_daemon_log() {
 
     assert_eq!(log_destinations(Some(&default), default.clone()), vec![default]);
 }
-
-#[skuld::test]
-fn log_destinations_compare_paths_case_insensitively() {
-    let default = PathBuf::from(r"C:\ProgramData\Goetia\logs\svc.log");
-    let daemon = PathBuf::from(r"c:\programdata\goetia\LOGS\svc.log");
-
-    assert_eq!(log_destinations(Some(&daemon), default.clone()), vec![default]);
-}
