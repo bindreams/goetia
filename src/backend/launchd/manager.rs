@@ -12,9 +12,9 @@
 //!   `restart: never` daemon). Under a budget that waits, the kickstart asks for the pid (`-p`)
 //!   and so blocks on launchd's respawn throttle (measured ~10.02s, 10.01-10.03s) whenever the job
 //!   has respawn history, as a crash-looping `restart: always` job does. [`Budget::DEFAULT`] is
-//!   10s, just below that, so such a job essentially always reports [`Error::WaitTimeout`]. The request stands (the `launchctl`
-//!   carrying it is left running, never killed), but launchd will not report the job running
-//!   within the budget. The budget bounds that wait and nothing else: every `launchctl` call that
+//!   10s, just below that, so such a job essentially always reports [`Error::WaitTimeout`]. The
+//!   request stands (the `launchctl` carrying it is left running, never killed), but launchd will
+//!   not report the job running within the budget. The budget bounds that wait and nothing else: every `launchctl` call that
 //!   issues the request runs to completion. The throttle is keyed to the job, so `bootout` plus
 //!   `bootstrap` does not clear it and there is no remedy to apply.
 //! - `stop` `launchctl bootout`s the job, from whichever directory it was loaded.
@@ -232,8 +232,8 @@ enum Obtained {
 /// Step 2 re-checks the descriptor, not the name, so the verdict is about the object whose bytes
 /// are read: the file step 1 classified need not be the one a later `open` resolves the name to.
 /// No `(st_dev, st_ino)` comparison against step 1 is needed, since an `fstat` on the open
-/// descriptor is stronger than two name lookups agreeing. It does not rule out reading a different regular file than step 1 stat'd, the benign
-/// content race a plain `fs::read` has too. `O_NONBLOCK` covers the window between the steps: a FIFO
+/// descriptor is stronger than two name lookups agreeing. It does not rule out reading a
+/// different regular file than step 1 stat'd, the benign content race a plain `fs::read` has too. `O_NONBLOCK` covers the window between the steps: a FIFO
 /// swapped in after step 1 cannot block the open, so step 2 rejects it.
 fn obtain(path: &Path) -> Obtained {
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -1106,11 +1106,11 @@ impl backend::Backend for Launchd {
                 }
                 prepare_parent_dirs(spec, &account)?;
                 let target = snapshot.location.path.as_path();
-                // `target` was captured by `read`, before `decide` ran. A concurrent `enable`,
-                // `disable` or `uninstall` may have moved or removed it since, and writing here
-                // would put a plist in both directories, which `locate` errors on. This check only
-                // narrows the race to the window between it and `write_existing`'s own open; it
-                // does not close it.
+                // `target` was captured by `read`, before `decide` ran. A concurrent `enable` or
+                // `disable` may have moved it since, and writing here would put a plist in both
+                // directories, which `locate` errors on; a concurrent `uninstall` would have it
+                // recreated. This check only narrows the race to the window between it and
+                // `write_existing`'s rename onto `target`; it does not close it.
                 if !still_present(target)? {
                     return if changes_job {
                         // `is_loaded` has been called.
