@@ -14,8 +14,8 @@
 //!   has respawn history, as a crash-looping `restart: always` job does. [`Budget::DEFAULT`] is
 //!   10s, just below that, so such a job essentially always reports [`Error::WaitTimeout`]. The
 //!   request stands (the `launchctl` carrying it is left running, never killed), but launchd will
-//!   not report the job running within the budget. The budget bounds that wait and nothing else: every `launchctl` call that
-//!   issues the request runs to completion. The throttle is keyed to the job, so `bootout` plus
+//!   not report the job running within the budget. The budget bounds that wait and nothing else:
+//!   every `launchctl` call that issues the request runs to completion. The throttle is keyed to the job, so `bootout` plus
 //!   `bootstrap` does not clear it and there is no remedy to apply.
 //! - `stop` `launchctl bootout`s the job, from whichever directory it was loaded.
 //! - `enable` moves the plist from [`STAGING_DIR`] into [`ENABLED_DIR`] (`/Library/LaunchDaemons`).
@@ -233,8 +233,9 @@ enum Obtained {
 /// are read: the file step 1 classified need not be the one a later `open` resolves the name to.
 /// No `(st_dev, st_ino)` comparison against step 1 is needed, since an `fstat` on the open
 /// descriptor is stronger than two name lookups agreeing. It does not rule out reading a
-/// different regular file than step 1 stat'd, the benign content race a plain `fs::read` has too. `O_NONBLOCK` covers the window between the steps: a FIFO
-/// swapped in after step 1 cannot block the open, so step 2 rejects it.
+/// different regular file than step 1 stat'd, the benign content race a plain `fs::read` has too.
+/// `O_NONBLOCK` covers the window between the steps: a FIFO swapped in after step 1 cannot block
+/// the open, so step 2 rejects it.
 fn obtain(path: &Path) -> Obtained {
     use std::os::unix::fs::OpenOptionsExt as _;
 
