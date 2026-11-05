@@ -320,6 +320,9 @@ fn a_daemon_that_cannot_be_spawned_fails_start_under_every_policy() {
             ),
             other => panic!("{restart:?}: a failed spawn is a shim failure, a Win32 code; got {other:?}"),
         }
+        // The spawn failure goes to the fallback log whatever `logs` says. SCM shows `STOPPED` only
+        // once the shim has reported it or exited, so nothing writes the file after this point.
+        remove_fallback_log(&id);
     }
 }
 
