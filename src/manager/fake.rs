@@ -356,12 +356,15 @@ impl Fake {
 
     /// Test-only seeding: make `list` report one [`Installed::Undetermined`]
     /// entry that names nobody — the shape a backend produces when it cannot
-    /// usefully name what the entry stands for. Windows SCM produces it on an
-    /// unelevated `list` not because enumeration failed (it succeeds, and the
-    /// names are known) but because hundreds of services deny a `Parameters`
-    /// read at once and one entry cannot carry them all.
+    /// usefully name what the entry stands for. Windows SCM produces it in two
+    /// cases. On an unelevated `list` several services deny a `Parameters` read
+    /// at once; enumeration succeeded and the names are known, but one entry
+    /// cannot carry them all. And when the enumeration itself stopped partway,
+    /// one entry stands for the services `registry::scan_services` never
+    /// reached.
     ///
-    /// `reason` is a complete sentence: there is no name to prefix it with.
+    /// `reason` is a complete sentence, because that is how it is rendered:
+    /// there is no name to prefix it with.
     ///
     /// [`Installed::Undetermined`]: crate::manager::Installed::Undetermined
     pub fn seed_aggregate_undetermined(&self, reason: impl Into<String>) {

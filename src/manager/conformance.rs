@@ -13,8 +13,10 @@
 //! It tracks every id it installs and uninstalls each before returning, via an
 //! RAII guard so a mid-scenario assertion failure still cleans up. Ids are
 //! process- and call-unique (a pid plus a monotonic counter), not
-//! cryptographically random: sufficient given cleanup runs every time,
-//! including on panic.
+//! cryptographically random: sufficient given cleanup runs on normal return and
+//! on panic. It does not run if the process is killed or aborts, and it does not
+//! cover an `install` that fails after writing, which panics before the id is
+//! tracked. Either leaves a straggler to remove by hand.
 //!
 //! ## The seeded ids
 //!
@@ -118,7 +120,8 @@ pub fn run(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
 /// each real backend's integration test, a separate crate linking only
 /// `goetia`'s public API, can call [`run`]. That rules out a dev-only
 /// randomness crate; a process-wide counter plus the pid is unique enough,
-/// since callers clean up what they create.
+/// since callers clean up what they create on normal return and on panic (see
+/// the module doc comment for what that leaves out).
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn fresh_id(label: &str) -> String {
@@ -473,15 +476,17 @@ fn list_and_status_agree_on_pid(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> D
 /// different error), so seeding one asserts the wrong contract.
 ///
 /// Seeding [`UNDETERMINED_ID`] changes `list`'s answer for the whole host: it
-/// raises `daemon list`'s exit code, and on Windows collapses into an
-/// aggregate entry. A suite that also asserts a *clean* host-wide listing has
-/// to serialize the two against each other with the `UNIT_DIR_EXCLUSIVE` label
-/// the integration suites share by name.
+/// raises `daemon list`'s exit code, and on Windows adds an entry. A suite that
+/// also asserts a *clean* host-wide listing has to serialize the two against
+/// each other: `serial = UNIT_DIR_EXCLUSIVE` does that (the integration suites
+/// share the name), while `labels = [...]` only tags the test.
 ///
 /// A backend satisfies the `list` half by naming the id in an
 /// [`Installed::Undetermined`] entry *or* by emitting any aggregate one, which
-/// may stand for this id. SCM emits only that form (hundreds of denied
-/// services, one entry). The per-id half below is exact on every backend.
+/// may stand for this id. SCM names the id when it is the only unreadable
+/// service, and emits the nameless aggregate when several are unreadable (or
+/// the enumeration stopped partway). The per-id half below is exact on every
+/// backend.
 pub fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
     let spec = mk(UNDETERMINED_ID);
     let id = &spec.id;

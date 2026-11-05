@@ -89,12 +89,13 @@ pub trait ServiceManager {
     ///
     /// An answer from the manager that itself establishes the goal is the
     /// confirmation, whatever is left of the budget: launchd's `print` of a
-    /// job already running, and SCM's `ERROR_SERVICE_ALREADY_RUNNING` reply
-    /// over a service it reports `RUNNING`. systemd's answer to a start is a
-    /// job, never a state, so a unit already active is confirmed only when
-    /// that job completes: under a budget shorter than the job's round trip,
-    /// the same start of a running daemon expires on systemd and succeeds on
-    /// the other two.
+    /// job already running, read before any request is needed, and SCM's
+    /// `ERROR_SERVICE_ALREADY_RUNNING` reply over a service it reports
+    /// `RUNNING`. systemd's answer to a start is a job, never a state, so a
+    /// unit already active is confirmed only when that job completes: under a
+    /// budget shorter than the job's round trip (tens of milliseconds), the
+    /// same start of a running daemon expires on systemd and succeeds on the
+    /// other two.
     ///
     /// On expiry, [`Error::WaitTimeout`], never `Ok(())` and never
     /// [`Error::Undetermined`], which claims the *installation* is in doubt
@@ -215,8 +216,8 @@ pub trait ServiceManager {
     /// a settled answer behind it is the same conflation
     /// [`Installed::Undetermined`] exists to end, arrived at from the other
     /// side. A scan that *started* and did not finish is the opposite case
-    /// and does report (see `Installed::scan_incomplete`), as does an
-    /// entry whose live state could not be queried (`OursUnusable`), except
+    /// and does report (see `Installed::scan_incomplete`). So does an entry
+    /// whose live state could not be queried, as `OursUnusable` — except
     /// where no manager can be asked for any entry's: that is
     /// [`Error::NoManager`], for the whole listing.
     ///
