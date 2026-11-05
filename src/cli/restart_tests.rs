@@ -1,9 +1,8 @@
-use std::cell::Cell;
 use std::time::Duration;
 
-use super::{
-    Args, ExitCode, Leg, SPENT, WaitArgs, abandoned_before_start, after_start_failed, leg, run_with, stop_leg,
-};
+use super::{ExitCode, Leg, SPENT, abandoned_before_start, after_start_failed, leg, restart, stop_leg};
+use crate::cli::support::{IdVerbCall, run_id_verb};
+use crate::cli::wait;
 use crate::error::{Error, Result};
 use crate::manager::fake::Fake;
 use crate::manager::fake::fake_tests::mk;
@@ -54,89 +53,24 @@ fn a_stop_leg_whose_bounded_budget_is_spent_still_gets_a_bound() {
     assert_eq!(stop_leg(Budget::Unbounded, Budget::Unbounded), Budget::Unbounded);
 }
 
-// deadline threading ==================================================================================================
-
-/// How many deadlines `daemon restart --no-timeout <ids>` derives against a
-/// `Fake` where every id is installed and every leg succeeds.
-///
-/// `--no-timeout` rather than a bounded budget on purpose: `Budget::Unbounded`
-/// resolves to `Deadline(None)`, so nothing in the run consults a clock and
-/// nothing about the result depends on how long the process takes. A bounded
-/// budget would make a sufficiently stalled machine abandon the restart and
-/// turn this into a bet on wall-clock time. The count is the same either way —
-/// it is a property of the call graph, not of the budget's kind.
-fn deadlines_derived(ids: &[&str]) -> usize {
-    let fake = Fake::new();
-    for id in ids {
-        fake.install(&mk(id), false).expect("seed an installed daemon");
-    }
-    let args = Args {
-        ids: ids.iter().map(|id| (*id).to_string()).collect(),
-        wait: WaitArgs {
-            timeout: None,
-            no_timeout: true,
-        },
-    };
-
-    let derived = Cell::new(0_usize);
-    let start_clock = |budget: Budget| {
-        derived.set(derived.get() + 1);
-        budget.start()
-    };
-    let mut out: Vec<u8> = Vec::new();
-    let mut err: Vec<u8> = Vec::new();
-    let code = run_with(
-        &args,
-        &|| -> Result<Box<dyn ServiceManager>> { Ok(Box::new(fake.clone())) },
-        &|| true,
-        &start_clock,
-        &mut out,
-        &mut err,
-    );
-
-    assert_eq!(
-        code,
-        ExitCode::Success,
-        "the fixture must restart cleanly, or the count is of a path nobody takes: {}",
-        String::from_utf8_lossy(&err)
-    );
-    derived.get()
-}
-
-/// One budget covers the whole restart, so one deadline is derived for both
-/// legs. A fresh one per leg would let a `--timeout 30s` restart take 60s —
-/// twice what the user named, because the operation happens to have two steps.
-#[skuld::test]
-fn one_restart_derives_one_deadline_for_both_legs() {
-    assert_eq!(deadlines_derived(&["frpc"]), 1);
-}
-
-/// Per id, not per invocation: `restart a b --timeout 30s` promises each of
-/// the two 30s rather than leaving `b` whatever `a` did not spend.
-#[skuld::test]
-fn every_id_derives_a_deadline_of_its_own() {
-    assert_eq!(deadlines_derived(&["frpc", "websocat"]), 2);
-}
-
 // a spent budget ======================================================================================================
 
-/// `daemon restart frpc --timeout 30s` with the clock injected already spent, so nothing here
-/// depends on how long the run takes. Returns the exit code and stderr.
+/// `daemon restart frpc --timeout 30s` with the deadline already spent, so nothing here depends on
+/// how long the run takes. Returns the exit code, stdout and stderr.
 fn restart_on_a_spent_clock(fake: &Fake) -> (ExitCode, String, String) {
-    let args = Args {
-        ids: vec!["frpc".to_string()],
-        wait: WaitArgs {
-            timeout: Some(Duration::from_secs(30)),
-            no_timeout: false,
-        },
-    };
+    let ids = ["frpc".to_string()];
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
-    let code = run_with(
-        &args,
-        &|| -> Result<Box<dyn ServiceManager>> { Ok(Box::new(fake.clone())) },
-        &|| true,
-        &|_| Budget::Immediate.start(),
+    let code = run_id_verb(
+        IdVerbCall {
+            subcommand: "daemon restart",
+            ids: &ids,
+            get_manager: &|| -> Result<Box<dyn ServiceManager>> { Ok(Box::new(fake.clone())) },
+            is_elevated: &|| true,
+            verb: &|mgr, id| restart(mgr, id, THIRTY, Budget::Immediate.start()),
+            verb_past_tense: wait::reported(THIRTY, "restarted", "restart requested"),
+            absent_is_success: false,
+        },
         &mut out,
         &mut err,
     );
