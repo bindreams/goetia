@@ -107,5 +107,12 @@ fn cleanup(id: &str) -> Vec<String> {
     if !delete.ok() && !matches!(delete.code, Some(1060 | 1072)) {
         problems.push(delete.to_string());
     }
+    // The shim's fallback log, `%ProgramData%\Goetia\logs\<id>.log`, outlives the service.
+    if let Some(program_data) = std::env::var_os("ProgramData") {
+        let log = std::path::PathBuf::from(program_data)
+            .join(r"Goetia\logs")
+            .join(format!("{id}.log"));
+        problems.extend(remove_path(&log, false));
+    }
     problems
 }
