@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use goetia::backend::scm::exit_status::RecordedExit;
+use goetia::backend::scm::manager::Scm;
+use goetia::manager::ServiceManager as _;
 use goetia::spec::{DaemonSpec, Kind};
 use windows_service::service::{Service, ServiceAccess, ServiceState, ServiceStatus};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
@@ -31,7 +33,7 @@ pub fn fixture_command(mode: &str, args: &[&str]) -> Vec<String> {
 }
 
 /// A temp dir the test owns, for everything the test makes its shims and daemons write: the daemons'
-/// logs, and the shims' fallback logs once [`Self::redirect_program_data`] points them here. Nothing
+/// logs, and the shims' fallback logs once [`Self::install`] points them here. Nothing
 /// goes to the `%ProgramData%\Goetia\logs\` default.
 ///
 /// Removed on drop, retried for up to [`REMOVE_BOUND`] and then let go with a warning: a daemon may
@@ -58,17 +60,21 @@ impl LogDir {
         self.0.join(format!("{id}.log"))
     }
 
-    /// Makes the shim of the installed service `id` write its fallback log (the one
-    /// `logging::default_log_path` derives from `%ProgramData%`) under this dir. SCM adds the
-    /// `Environment` lines of the service's registration to the environment of the process it
-    /// launches, which for `type: simple` is the shim. Call it after `install` and before `start`.
-    pub fn redirect_program_data(&self, id: &str) {
-        service_key(id)
+    /// Installs `spec`, then makes its shim write its fallback log (the one `logging::default_log_path`
+    /// derives from `%ProgramData%`) under this dir: SCM adds the `Environment` lines of the
+    /// registration to the environment of the process it launches, which for `type: simple` is the
+    /// shim. Every test that starts a shim installs through this.
+    ///
+    /// A later `install` of the same id is a `Conflict`, since the `Environment` edit is a hand-edit to
+    /// goetia. A test that needs one installs with `mgr.install` instead and gives up the redirect.
+    pub fn install(&self, mgr: &Scm, spec: &DaemonSpec) {
+        mgr.install(spec, false).expect("install");
+        service_key(spec.id.as_str())
             .set_value("Environment", &vec![format!("ProgramData={}", self.0.display())])
-            .unwrap_or_else(|e| panic!("write Environment of {id}: {e}"));
+            .unwrap_or_else(|e| panic!("write Environment of {}: {e}", spec.id));
     }
 
-    /// The fallback log of `id` once [`Self::redirect_program_data`] has run for it.
+    /// The fallback log of `id` once [`Self::install`] has run for it.
     pub fn fallback_log(&self, id: &str) -> String {
         let path = self.0.join("Goetia").join("logs").join(format!("{id}.log"));
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read fallback log {}: {e}", path.display()))

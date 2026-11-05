@@ -114,7 +114,7 @@ fn start_stop_status_reflect_reality() {
     let _guard = ServiceGuard::new(&id);
     let started = support::ConnectBack::listen();
     let spec = simple_spec(&id, fixture_command("report", &[&started.port().to_string()]), &logs);
-    mgr.install(&spec, false).expect("install");
+    logs.install(&mgr, &spec);
 
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     started.accept("the fixture (spawned by the shim) to report running");
@@ -205,7 +205,7 @@ fn the_shim_reports_stop_pending_then_stopped() {
     let _guard = ServiceGuard::new(&id);
     let started = support::ConnectBack::listen();
     let spec = simple_spec(&id, fixture_command("report", &[&started.port().to_string()]), &logs);
-    mgr.install(&spec, false).expect("install");
+    logs.install(&mgr, &spec);
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     started.accept("the fixture (spawned by the shim) to report running");
 

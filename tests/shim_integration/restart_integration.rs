@@ -86,7 +86,7 @@ fn a_killed_shim_is_restarted_by_scm() {
         ONE_SECOND,
         &logs,
     );
-    mgr.install(&spec, false).expect("install");
+    logs.install(&mgr, &spec);
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     reported.accept("the first daemon to report in");
     // Held for the rest of the test, so the new shim cannot be given the same pid.
@@ -116,7 +116,7 @@ fn a_killed_on_failure_simple_daemon_comes_back_with_a_new_pid() {
         ONE_SECOND,
         &logs,
     );
-    mgr.install(&spec, false).expect("install");
+    logs.install(&mgr, &spec);
 
     support::kill::a_killed_daemon_comes_back_with_a_new_pid(&mgr, &spec.id, &started);
 }
@@ -136,7 +136,7 @@ fn on_failure_restarts_are_paced_new_shims() {
         None,
         &logs,
     );
-    mgr.install(&spec, false).expect("install");
+    logs.install(&mgr, &spec);
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
 
     // Held until the end, so no shim can be given the pid of an earlier one.
@@ -195,7 +195,7 @@ fn uninstall_leaves_no_restarted_daemon_behind() {
         Some(Duration::ZERO),
         &logs,
     );
-    mgr.install(&spec, false).expect("install");
+    logs.install(&mgr, &spec);
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     reported.accept("the daemon to have run");
 
@@ -237,7 +237,7 @@ fn exit_records(child_code: i32) -> (ServiceExitCode, RecordedExit) {
         ),
         &logs,
     );
-    mgr.install(&spec, false).expect("install");
+    logs.install(&mgr, &spec);
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     let stream = reported.accept_stream("the fixture to connect and wait for the test to close its end");
     let shim = ShimProcess::attach(&id);
@@ -301,9 +301,7 @@ fn a_daemon_that_cannot_be_spawned_fails_start_under_every_policy() {
             restart_delay,
             ..simple_spec(&id, missing.clone(), &logs)
         };
-        mgr.install(&spec, false).expect("install");
-        // The spawn failure goes to the fallback log whatever `logs` says.
-        logs.redirect_program_data(&id);
+        logs.install(&mgr, &spec);
 
         let err = mgr
             .start(&spec.id, Budget::DEFAULT)
@@ -344,7 +342,7 @@ fn start_confirms_the_launch_of_a_daemon_that_exits_at_once() {
                 &logs,
             )
         };
-        mgr.install(&spec, false).expect("install");
+        logs.install(&mgr, &spec);
 
         mgr.start(&spec.id, Budget::DEFAULT)
             .unwrap_or_else(|e| panic!("{restart:?}, exit {code}: a launched daemon must make start succeed: {e}"));
@@ -367,7 +365,7 @@ fn a_commanded_stop_reports_win32_zero() {
         ONE_SECOND,
         &logs,
     );
-    mgr.install(&spec, false).expect("install");
+    logs.install(&mgr, &spec);
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     reported.accept("the daemon to report in");
 
@@ -426,9 +424,8 @@ fn a_new_shim_runs_a_service_registered_by_an_earlier_version() {
         ONE_SECOND,
         &logs,
     );
-    mgr.install(&spec, false).expect("install");
+    logs.install(&mgr, &spec);
     register_as_earlier_version(&id, goetia::version());
-    logs.redirect_program_data(&id);
 
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     reported.accept("the daemon of a service registered by an earlier version to report in");
@@ -461,7 +458,7 @@ fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled
         ONE_SECOND,
         &logs,
     );
-    mgr.install(&spec, false).expect("install");
+    logs.install(&mgr, &spec);
     replace_in_blob(&id, r#""restart":"on-failure""#, r#""restart":"always""#);
 
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");

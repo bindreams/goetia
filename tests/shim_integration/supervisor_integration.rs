@@ -36,7 +36,7 @@ fn shim_runs_child_with_cwd_and_env() {
             &logs,
         )
     };
-    mgr.install(&spec, false).expect("install");
+    logs.install(&mgr, &spec);
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
 
     let line = reported.accept_line("the fixture to report its cwd and env");
@@ -72,7 +72,7 @@ fn shim_captures_stdout_to_logs_path() {
         fixture_command("write-log", &[&reported.port().to_string(), MARKER]),
         &logs,
     );
-    mgr.install(&spec, false).expect("install");
+    logs.install(&mgr, &spec);
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     reported.accept("the fixture to finish writing its log lines");
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
@@ -110,7 +110,7 @@ fn stop_kills_the_whole_process_tree() {
             &logs,
         )
     };
-    mgr.install(&spec, false).expect("install");
+    logs.install(&mgr, &spec);
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     let child_pid = child_reported.accept_line("the direct child to start and report its pid");
     let grandchild_pid = grandchild_reported.accept_line("the grandchild to start and report its pid");
@@ -160,10 +160,9 @@ fn unreadable_blob_logs_to_fallback_path_and_event_log() {
     let _guard = ServiceGuard::new(&id);
 
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
-    mgr.install(&spec, false).expect("install");
+    logs.install(&mgr, &spec);
 
     corrupt_spec_value(&id);
-    logs.redirect_program_data(&id);
 
     let err = mgr
         .start(&spec.id, Budget::DEFAULT)
