@@ -10,7 +10,13 @@
 //! stdout fallback and both truncation messages shipped with no test at all.
 
 use super::*;
+use std::os::unix::process::ExitStatusExt as _;
 use std::time::Duration;
+
+/// A `systemctl` that exited with `code`.
+fn exit(code: i32) -> ExitStatus {
+    ExitStatus::from_raw(code << 8)
+}
 
 fn capture(stdout: &str, stderr: &str, complete: bool) -> Capture {
     Capture {
@@ -24,10 +30,15 @@ fn capture(stdout: &str, stderr: &str, complete: bool) -> Capture {
 
 #[skuld::test]
 fn a_failure_is_reported_with_what_systemctl_wrote_on_stderr() {
-    let e = failed("start", "x.service", &capture("", "Unit x.service not found.\n", true));
+    let e = failed(
+        "start",
+        "x.service",
+        exit(1),
+        &capture("", "Unit x.service not found.\n", true),
+    );
     assert_eq!(
         e.to_string(),
-        "systemctl start x.service failed: Unit x.service not found.\n"
+        "`systemctl start x.service` failed (exit status: 1): Unit x.service not found."
     );
 }
 
@@ -37,8 +48,16 @@ fn a_failure_is_reported_with_what_systemctl_wrote_on_stderr() {
 /// systemd did write one.
 #[skuld::test]
 fn a_failure_that_wrote_only_to_stdout_is_still_reported_with_what_it_wrote() {
-    let e = failed("stop", "x.service", &capture("something on stdout\n", "", true));
-    assert_eq!(e.to_string(), "systemctl stop x.service failed: something on stdout\n");
+    let e = failed(
+        "stop",
+        "x.service",
+        exit(1),
+        &capture("something on stdout\n", "", true),
+    );
+    assert_eq!(
+        e.to_string(),
+        "`systemctl stop x.service` failed (exit status: 1): something on stdout"
+    );
 }
 
 /// stderr wins when both streams carried something: that is where
@@ -46,8 +65,16 @@ fn a_failure_that_wrote_only_to_stdout_is_still_reported_with_what_it_wrote() {
 /// case only.
 #[skuld::test]
 fn stderr_is_preferred_over_stdout_when_both_carry_something() {
-    let e = failed("start", "x.service", &capture("noise\n", "the real diagnostic\n", true));
-    assert_eq!(e.to_string(), "systemctl start x.service failed: the real diagnostic\n");
+    let e = failed(
+        "start",
+        "x.service",
+        exit(1),
+        &capture("noise\n", "the real diagnostic\n", true),
+    );
+    assert_eq!(
+        e.to_string(),
+        "`systemctl start x.service` failed (exit status: 1): the real diagnostic"
+    );
 }
 
 /// A truncated capture must say so: a prefix presented as the whole story
@@ -55,30 +82,31 @@ fn stderr_is_preferred_over_stdout_when_both_carry_something() {
 /// goetia stopped reading.
 #[skuld::test]
 fn a_truncated_diagnostic_says_it_may_be_only_a_prefix() {
-    let e = failed("start", "x.service", &capture("", "Unit x.ser", false));
+    let e = failed("start", "x.service", exit(1), &capture("", "Unit x.ser", false));
     let msg = e.to_string();
     assert!(msg.contains("Unit x.ser"), "{msg}");
     assert!(msg.contains("may be only a prefix"), "{msg}");
     assert!(msg.contains("budget expired"), "{msg}");
 }
 
-/// Both empty, under either `complete`. An empty diagnostic renders
-/// `systemctl start x.service failed: ` with nothing after the colon, which
-/// is the shape the guard exists to prevent — and it must not depend on
-/// *why* both streams are empty. A complete capture that is empty says
-/// "systemd wrote nothing"; a truncated one says "goetia's budget expired
-/// first"; neither may trail off after a colon.
+/// Both empty, under either `complete`. An empty diagnostic must not render a colon with nothing
+/// after it, and a truncated capture says "goetia's budget expired first" rather than nothing.
 #[skuld::test]
 fn an_empty_diagnostic_is_explained_rather_than_trailing_off_after_a_colon() {
     for complete in [true, false] {
-        let msg = failed("start", "x.service", &capture("", "", complete)).to_string();
+        let msg = failed("start", "x.service", exit(1), &capture("", "", complete)).to_string();
         assert!(
             !msg.ends_with(": "),
             "an empty diagnostic must not trail off after a colon (complete={complete}): {msg:?}"
         );
         assert!(
-            msg.contains("systemctl start x.service failed"),
+            msg.contains("`systemctl start x.service` failed"),
             "complete={complete}: {msg}"
+        );
+        assert_eq!(
+            msg.contains("budget expired"),
+            !complete,
+            "only a truncated capture says why it is empty (complete={complete}): {msg}"
         );
     }
 }
@@ -181,7 +209,7 @@ fn enable_and_disable_failures_name_the_verb_the_unit_and_systemd_s_words() {
 
         let msg = run("x").expect_err(verb).to_string();
 
-        assert!(msg.contains(&format!("systemctl {verb} x.service failed")), "{msg}");
+        assert!(msg.contains(&format!("`systemctl {verb} x.service` failed")), "{msg}");
         assert!(msg.contains("Access denied"), "{msg}");
     }
 }
@@ -272,7 +300,7 @@ fn the_bounded_path_issues_the_request_on_a_spent_deadline() {
     );
 }
 
-/// A watched `systemctl` whose stdout or stderr no thread could read is never run: `Error::Other`, which every verb exits `1` for, and no request — never a panic, and
+/// A watched `systemctl` whose stdout or stderr no thread could read is never run: `Error::Spawn`, which every verb exits `1` for, and no request — never a panic, and
 /// never a request out with nothing to watch it.
 #[skuld::test]
 fn a_request_nothing_could_watch_is_never_sent() {
@@ -295,9 +323,9 @@ fn a_request_nothing_could_watch_is_never_sent() {
         )
         .expect_err(what);
 
-        assert!(matches!(e, Error::Other(_)), "{what}: {e:?}");
-        assert!(e.to_string().contains(what), "{e}");
-        assert!(e.to_string().contains("so it was not run"), "{e}");
+        assert!(matches!(e, Error::Spawn { .. }), "{what}: {e:?}");
+        assert!(!e.is_indeterminate(), "{what}: {e:?}");
+        assert!(e.report().to_string().contains(what), "{}", e.report());
         assert_eq!(bounded::test_hook::spawns(), spawns, "{what}: systemctl was spawned");
         assert!(!request.exists(), "{what}: the request was sent");
     }
@@ -330,7 +358,8 @@ fn a_watched_request_that_may_have_run_is_in_doubt() {
 
     bounded::test_hook::spawn_fails(|| std::io::Error::from_raw_os_error(libc::EAGAIN).into());
     let e = spawn().expect_err("injected");
-    assert!(matches!(e, Error::Other(_)), "{e:?}");
+    assert!(matches!(e, Error::Spawn { .. }), "{e:?}");
+    assert!(!e.is_indeterminate(), "{e:?}");
 
     // Past the spawn `systemctl` runs, so a wait that fails leaves its request in doubt too.
     bounded::test_hook::wait_fails(|| std::io::Error::other("the wait failed").into());
@@ -370,8 +399,8 @@ fn a_request_run_to_completion_is_in_doubt_only_once_it_ran() {
         &["enable", "x"],
     )
     .expect_err("no such program");
-    assert!(matches!(e, Error::Other(_)), "{e:?}");
-    assert!(e.to_string().contains("so it was not sent"), "{e}");
+    assert!(matches!(e, Error::Spawn { .. }), "{e:?}");
+    assert!(!e.is_indeterminate(), "{e:?}");
 
     let dir = tempfile::tempdir().unwrap();
     let ran = dir.path().join("ran");
@@ -407,8 +436,9 @@ fn a_reload_in_doubt_after_the_write_stays_in_doubt() {
     drop(_stand_in);
     let _stand_in = stand_in::set(Some(&gate_passes_then("echo 'Access denied' >&2; exit 1")), booted());
     let e = daemon_reload_or_report("x").expect_err("refused");
-    assert!(matches!(e, Error::Other(_)), "{e:?}");
-    let msg = e.to_string();
+    assert!(matches!(e, Error::Step { .. }), "{e:?}");
+    assert!(!e.is_indeterminate(), "{e:?}");
+    let msg = e.report().to_string();
     assert!(msg.contains("wrote the unit for `x`"), "{msg}");
     assert!(msg.contains("Access denied"), "{msg}");
 }
@@ -478,6 +508,7 @@ fn a_failure_is_reported_without_the_transaction_lines() {
     let e = failed(
         "start",
         "x.service",
+        exit(1),
         &capture(
             "",
             "Enqueued anchor job 7 x.service/start.\n\
@@ -489,8 +520,8 @@ fn a_failure_is_reported_without_the_transaction_lines() {
     );
     assert_eq!(
         e.to_string(),
-        "systemctl start x.service failed: Job for x.service failed because the control process \
-         exited with error code.\n"
+        "`systemctl start x.service` failed (exit status: 1): Job for x.service failed because the control process \
+         exited with error code."
     );
 }
 
@@ -501,13 +532,17 @@ fn a_failure_whose_stderr_is_only_protocol_is_reported_with_its_stdout() {
     let e = failed(
         "start",
         "x.service",
+        exit(1),
         &capture(
             "something on stdout\n",
             "Enqueued anchor job 7 x.service/start.\n",
             true,
         ),
     );
-    assert_eq!(e.to_string(), "systemctl start x.service failed: something on stdout\n");
+    assert_eq!(
+        e.to_string(),
+        "`systemctl start x.service` failed (exit status: 1): something on stdout"
+    );
 }
 
 /// `SYSTEMD_LOG_TIME`, `SYSTEMD_LOG_LOCATION` and `SYSTEMD_LOG_TID` each prefix every protocol
@@ -533,12 +568,12 @@ fn a_prefixed_transaction_is_still_protocol() {
              {finished}Job for y.service finished.\n\
              {prefix}Job for x.service failed because the control process exited with error code.\n"
         );
-        let e = failed("start", "x.service", &capture("", &stderr, true));
+        let e = failed("start", "x.service", exit(1), &capture("", &stderr, true));
         assert_eq!(
             e.to_string(),
             format!(
-                "systemctl start x.service failed: {prefix}Job for x.service failed because the control process \
-                 exited with error code.\n"
+                "`systemctl start x.service` failed (exit status: 1): {prefix}Job for x.service failed because the control process \
+                 exited with error code."
             ),
             "{prefix:?}"
         );
@@ -552,6 +587,7 @@ fn a_truncated_capture_of_only_the_transaction_says_nothing_was_captured() {
     let msg = failed(
         "start",
         "x.service",
+        exit(1),
         &capture("", "Enqueued anchor job 7 x.service/start.\n", false),
     )
     .to_string();
@@ -881,7 +917,11 @@ fn a_show_answer_with_every_property_is_read() {
 
 /// The refusal for the version one `source` reported, as [`require_supported`] words it.
 fn verdicted(source: Source, reported: &str) -> Result<()> {
-    refusal(verdict(source, reported).into_iter().collect())
+    let at_floor = VersionReading::Major(SYSTEMD_FLOOR);
+    match source {
+        Source::Manager => refusal(at_floor, reading(source, reported)),
+        Source::Client => refusal(reading(source, reported), at_floor),
+    }
 }
 
 /// The `Version` property as distributions set it, measured with `systemctl --version`, whose
@@ -1030,7 +1070,12 @@ fn nested_scopes_share_one_answer_until_the_last_ends() {
 #[skuld::test]
 fn a_refused_gate_is_asked_again() {
     let _scope = gate_scope();
-    assert!(gated(|| Err(Error::Other("refused".to_string()))).is_err());
+    assert!(
+        gated(|| Err(Error::NoManager {
+            evidence: "refused".to_string()
+        }))
+        .is_err()
+    );
     let asked = std::cell::Cell::new(0);
     gated(counted(&asked)).unwrap();
     assert_eq!(asked.get(), 1);
@@ -1077,6 +1122,7 @@ fn supported_by(script: &str) -> Result<()> {
 fn refused(manager: &str, client: &str) -> String {
     supported_by(&two_versions(manager, client))
         .expect_err(&format!("manager {manager}, client {client}"))
+        .report()
         .to_string()
 }
 
@@ -1413,14 +1459,20 @@ fn every_inherited_systemd_switch_is_removed_from_a_child_and_nothing_else_is() 
 fn any_other_failure_to_ask_the_manager_is_a_refusal() {
     let failing = "[ \"$1\" = show ] && { echo 'Failed to get properties: Connection timed out' >&2; exit 1; }; \
                    echo 'systemd 257 (257)'";
-    let msg = supported_by(failing).unwrap_err().to_string();
-    assert!(msg.contains("`systemctl show --property=Version` failed"), "{msg}");
+    let msg = supported_by(failing).unwrap_err().report().to_string();
+    assert!(
+        msg.contains("`systemctl show --property=Version --value` failed"),
+        "{msg}"
+    );
     assert!(msg.contains("Connection timed out"), "{msg}");
     assert!(msg.contains("cannot tell whether the running systemd is 242+"), "{msg}");
 
     let silent = "[ \"$1\" = show ] && exit 0; echo 'systemd 257 (257)'";
     let msg = supported_by(silent).unwrap_err().to_string();
-    assert!(msg.contains("printed no version"), "{msg}");
+    assert!(
+        msg.contains("cannot read the version the running systemd reports"),
+        "{msg}"
+    );
 }
 
 /// Both probes switch colour off: the stand-in colours whatever it prints unless it sees
@@ -1507,9 +1559,9 @@ fn kill_of_a_unit_with_no_main_process_is_not_running() {
 #[skuld::test]
 fn kill_refused_for_any_other_reason_is_a_plain_failure() {
     let e = kill_with("echo 'Failed to kill unit x.service: Access denied' >&2; exit 1").expect_err("refused");
-    assert!(matches!(&e, Error::Other(_)), "{e:?}");
+    assert!(matches!(&e, Error::Command { .. }), "{e:?}");
     let msg = e.to_string();
-    assert!(msg.contains("systemctl kill x.service failed"), "{msg}");
+    assert!(msg.contains("`systemctl kill x.service` failed"), "{msg}");
     assert!(msg.contains("Access denied"), "{msg}");
 }
 
@@ -1519,7 +1571,7 @@ fn kill_refused_for_any_other_reason_is_a_plain_failure() {
 fn a_not_loaded_answer_about_another_unit_is_a_plain_failure() {
     let e = kill_with("echo 'Failed to kill unit x.service: Unit y.service not loaded.' >&2; exit 1")
         .expect_err("not this unit's absence");
-    assert!(matches!(&e, Error::Other(_)), "{e:?}");
+    assert!(matches!(&e, Error::Command { .. }), "{e:?}");
 }
 
 #[skuld::test]

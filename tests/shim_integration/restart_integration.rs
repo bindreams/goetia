@@ -298,7 +298,7 @@ fn a_daemon_that_cannot_be_spawned_fails_start_under_every_policy() {
         let err = mgr
             .start(&spec.id, Budget::DEFAULT)
             .expect_err("a daemon that cannot be spawned must fail the start");
-        assert!(err.to_string().contains("failed start"), "{restart:?}: {err}");
+        assert!(err.report().to_string().contains("failed start"), "{restart:?}: {err}");
 
         let status = scm_status(&id);
         assert_eq!(status.current_state, ServiceState::Stopped, "{restart:?}: {status:?}");
@@ -463,7 +463,7 @@ fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled
         .status(&spec.id)
         .expect_err("status regenerates the spec, which scm refuses");
     assert!(
-        matches!(&status, goetia::Error::Other(message) if message.contains("restart: always")),
+        matches!(&status, goetia::Error::Step { .. }) && status.report().to_string().contains("restart: always"),
         "{status:?}"
     );
     let listed = mgr.list().expect("list");

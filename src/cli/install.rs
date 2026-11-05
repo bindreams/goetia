@@ -50,7 +50,7 @@ pub fn run(
     let spec = match load_and_warn(&args.file, err) {
         Ok(spec) => spec,
         Err(e) => {
-            let _ = writeln!(err, "error: {e}");
+            let _ = writeln!(err, "error: {}", e.report());
             return ExitCode::Error;
         }
     };
@@ -63,7 +63,7 @@ pub fn run(
                 ExitCode::Success
             }
             Err(e) => {
-                let _ = writeln!(err, "error: {e}");
+                let _ = writeln!(err, "error: {}", e.report());
                 ExitCode::Error
             }
         };
@@ -75,7 +75,7 @@ pub fn run(
     let mgr = match get_manager() {
         Ok(mgr) => mgr,
         Err(e) => {
-            let _ = writeln!(err, "error: {e}");
+            let _ = writeln!(err, "error: {}", e.report());
             return ExitCode::Error;
         }
     };
@@ -88,7 +88,7 @@ pub fn run(
         match mgr.prepare(&[Step::Install, Step::Start], args.wait.budget()) {
             Ok(prepared) => prepared,
             Err(e) => {
-                let _ = writeln!(err, "error: {}: {e}", spec.id);
+                let _ = writeln!(err, "error: {}: {}", spec.id, e.report());
                 return ExitCode::of(&e);
             }
         }
@@ -108,19 +108,19 @@ pub fn run(
             }
             if args.enable {
                 if let Err(e) = mgr.enable(&spec.id) {
-                    let _ = writeln!(err, "error: {}: enable: {e}", spec.id);
+                    let _ = writeln!(err, "error: {}: enable: {}", spec.id, e.report());
                     codes.push(ExitCode::of(&e));
                 }
             }
             if args.start {
                 if let Err(e) = mgr.start(&spec.id, args.wait.budget()) {
-                    let _ = writeln!(err, "error: {}: start: {e}", spec.id);
+                    let _ = writeln!(err, "error: {}: start: {}", spec.id, e.report());
                     codes.push(ExitCode::of(&e));
                 }
             }
         }
         Err(e) => {
-            let _ = writeln!(err, "error: {}: {e}", spec.id);
+            let _ = writeln!(err, "error: {}: {}", spec.id, e.report());
             codes.push(ExitCode::of(&e));
         }
     }

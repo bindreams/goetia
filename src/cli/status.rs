@@ -72,7 +72,7 @@ fn unavailable(e: &Error, json: bool, out: &mut dyn Write, err: &mut dyn Write) 
     if json {
         return report::emit(&report, out, err);
     }
-    let _ = writeln!(err, "error: {e}");
+    let _ = writeln!(err, "error: {}", e.report());
     report::exit_code(&report)
 }
 
@@ -97,7 +97,7 @@ fn status_all(mgr: &dyn ServiceManager, json: bool, out: &mut dyn Write, err: &m
             print_daemons(&report, out);
         }
         Err(e) => {
-            let _ = writeln!(err, "error: {e}");
+            let _ = writeln!(err, "error: {}", e.report());
         }
     }
 

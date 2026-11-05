@@ -275,9 +275,10 @@ fn an_event_message_file_needs_a_system_root() {
         std::env::VarError::NotPresent,
         std::env::VarError::NotUnicode(std::ffi::OsString::new()),
     ] {
-        let Err(Error::Other(message)) = event_message_file(Err(missing)) else {
+        let Err(e @ Error::Os { .. }) = event_message_file(Err(missing)) else {
             panic!("a SystemRoot that cannot be read must be an error");
         };
+        let message = e.to_string();
         assert!(message.contains("SystemRoot"), "{message}");
     }
 }

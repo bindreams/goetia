@@ -48,7 +48,7 @@ fn judge<B: Backend>(b: &B, snapshot: &B::Snapshot) -> (Ownership, ExternalConfi
 
     let blob = match snapshot.blob() {
         Ok(blob) => blob,
-        Err(e) => return unusable(e.to_string(), uninstall_advice()),
+        Err(e) => return unusable(e.report().to_string(), uninstall_advice()),
     };
     // A manager that matches ids case-insensitively finds `frpc`'s service for `FRPC`. Nothing else
     // is read: writing would replace that daemon's service.
@@ -63,12 +63,15 @@ fn judge<B: Backend>(b: &B, snapshot: &B::Snapshot) -> (Ownership, ExternalConfi
     let regenerated = match b.render(&blob.spec) {
         Ok(regenerated) => regenerated.to_string(),
         Err(e) => {
-            return unusable(format!("cannot regenerate the embedded spec: {e}"), uninstall_advice());
+            return unusable(
+                format!("cannot regenerate the embedded spec: {}", e.report()),
+                uninstall_advice(),
+            );
         }
     };
     match b.installed(snapshot) {
         // No goetia action unblocks a comparison that could not be read.
-        Err(e) => unusable(e.to_string(), None),
+        Err(e) => unusable(e.report().to_string(), None),
         Ok(on_disk) => (
             Ownership::Ours {
                 blob: blob.clone(),
@@ -156,10 +159,28 @@ pub(crate) fn preview<B: Backend>(b: &B, spec: &DaemonSpec) -> Result<Outcome> {
 
 pub(crate) fn status<B: Backend>(b: &B, id: &Id) -> Result<Status> {
     let snapshot = owned(b, id)?;
-    let blob = snapshot.blob().map_err(|e| Error::Other(e.to_string()))?;
-    b.render(&blob.spec)
-        .map_err(|e| Error::Other(format!("`{id}`'s embedded spec cannot be regenerated: {e}")))?;
+    let blob = snapshot.blob().map_err(blob_failure)?;
+    b.render(&blob.spec).map_err(|e| Error::Step {
+        what: format!("`{id}`'s embedded spec cannot be regenerated"),
+        source: Box::new(e),
+    })?;
     b.live_status(&snapshot)
+}
+
+/// The failure a snapshot kept of its blob, as an owned error. Only [`Error::Blob`] and
+/// [`Error::Invalid`] are ever kept, and each is its whole text, so it is rebuilt as itself.
+fn blob_failure(e: &Error) -> Error {
+    match e {
+        Error::Blob(message) => Error::Blob(message.clone()),
+        Error::Invalid { daemon, message } => Error::Invalid {
+            daemon: daemon.clone(),
+            message: message.clone(),
+        },
+        other => {
+            debug_assert!(false, "a snapshot keeps only Blob and Invalid, got {other:?}");
+            Error::Blob(other.report().to_string())
+        }
+    }
 }
 
 pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
@@ -180,13 +201,14 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
         let blob = match blob {
             Ok(blob) => blob,
             Err(e) => {
-                out.push(unusable(e.to_string()));
+                out.push(unusable(e.report().to_string()));
                 continue;
             }
         };
         if let Err(e) = b.render(&blob.spec) {
             out.push(unusable(format!(
-                "marked ours, but its embedded spec cannot be regenerated: {e}"
+                "marked ours, but its embedded spec cannot be regenerated: {}",
+                e.report()
             )));
             continue;
         }
@@ -208,12 +230,15 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
                 pid: status.pid,
                 enabled: status.enabled,
             }),
-            Err(e @ Error::NoManager { .. }) => return Err(e),
-            // The query completed and found the service gone: absence is established.
-            Err(Error::NotInstalled { .. }) => {}
-            Err(e) => out.push(unusable(format!(
-                "marked ours, but its live state could not be queried: {e}"
-            ))),
+            Err(e) => match e.cause() {
+                Error::NoManager { .. } => return Err(e),
+                // The query completed and found the service gone: absence is established.
+                Error::NotInstalled { .. } => {}
+                _ => out.push(unusable(format!(
+                    "marked ours, but its live state could not be queried: {}",
+                    e.report()
+                ))),
+            },
         }
     }
     out.extend(scan.reported);

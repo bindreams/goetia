@@ -81,7 +81,7 @@ fn show_from_file(file: &Path, out: &mut dyn Write, err: &mut dyn Write) -> Exit
     let spec = match load_and_warn(file, err) {
         Ok(spec) => spec,
         Err(e) => {
-            let _ = writeln!(err, "error: {e}");
+            let _ = writeln!(err, "error: {}", e.report());
             return ExitCode::Error;
         }
     };
@@ -98,14 +98,14 @@ fn show_from_installed(
     let mgr = match get_manager() {
         Ok(mgr) => mgr,
         Err(e) => {
-            let _ = writeln!(err, "error: {e}");
+            let _ = writeln!(err, "error: {}", e.report());
             return ExitCode::Error;
         }
     };
     let installed = match mgr.list() {
         Ok(v) => v,
         Err(e) => {
-            let _ = writeln!(err, "error: {e}");
+            let _ = writeln!(err, "error: {}", e.report());
             return ExitCode::Error;
         }
     };

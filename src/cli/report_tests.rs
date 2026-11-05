@@ -153,6 +153,24 @@ fn an_undetermined_error_is_not_reported_as_unusable() {
     assert!(!report.message.contains("uninstall"), "{}", report.message);
 }
 
+/// `status` classifies by what a [`Error::Step`] failed on, so a step over `NotInstalled` is
+/// `not-installed`, not `unusable`.
+#[skuld::test]
+fn a_step_over_not_installed_is_reported_as_not_installed() {
+    let e = Error::Step {
+        what: "query the live state".to_string(),
+        source: Box::new(Error::NotInstalled { id: "frpc".to_string() }),
+    };
+
+    let report = status_error("frpc", &e);
+
+    assert_eq!(report.kind, Kind::NotInstalled);
+    assert_eq!(
+        report.message, "query the live state: daemon `frpc` is not installed",
+        "the message is the whole chain"
+    );
+}
+
 // emit ================================================================================================================
 
 /// Refuses every write, the way a broken pipe (`goetia --json daemon list | head -1`) or a full

@@ -231,10 +231,10 @@ impl Backend for Systemd {
         match quarantine_if_still_ours(id, snapshot.text())? {
             Some(backup_path) => remove_file_if_present(&backup_path)?,
             None => {
-                return Err(Error::Other(format!(
-                    "the service at `{id}` changed after being confirmed installed; nothing was \
-                     removed — re-run uninstall"
-                )));
+                return Err(Error::ConcurrentChange {
+                    id: id.to_string(),
+                    path: Some(unit_path(id)),
+                });
             }
         }
 
@@ -247,11 +247,13 @@ impl Backend for Systemd {
             (Ok(()), Ok(())) => Ok(()),
             (Err(e), Ok(())) => Err(e),
             (Ok(()), Err(e)) => Err(e),
-            (Err(e1), Err(e2)) => Err(Error::Other(format!(
-                "uninstall for `{id}` partially failed: removing the drop-in directory failed \
-                 ({e1}), and `systemctl daemon-reload` also failed ({e2}); the unit fragment is \
-                 already gone"
-            ))),
+            (Err(first), Err(then)) => Err(Error::Step {
+                what: format!("uninstall for `{id}` partially failed, and the unit fragment is already gone"),
+                source: Box::new(Error::Both {
+                    first: Box::new(first),
+                    then: Box::new(then),
+                }),
+            }),
         }
     }
 
@@ -284,11 +286,7 @@ impl Backend for Systemd {
             listeners: 2 * watched,
             ..bounded::Needs::default()
         })
-        .map_err(|e| {
-            Error::Other(format!(
-                "no thread could be made to watch a `systemctl` request, so none was sent: {e}"
-            ))
-        })?;
+        .map_err(|source| Error::Reservation { id: None, source })?;
         Ok(Prepared::holding((spares, gate_scope())))
     }
 
@@ -454,9 +452,9 @@ fn identity_for(user: &User) -> Result<Identity> {
         User::Name(name) => name.clone(),
         User::Id(AccountId::Uid(uid)) => uid.to_string(),
         User::Id(AccountId::Sid(_)) => {
-            return Err(Error::Other(
-                "a Windows account id (SID) is not a valid user for the systemd backend".to_string(),
-            ));
+            return Err(Error::AccountLookup {
+                detail: "a Windows account id (SID) is not a valid user for the systemd backend".to_string(),
+            });
         }
     };
     Ok(Identity { user: name })
@@ -482,7 +480,7 @@ fn remove_file_if_present(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(io_err("remove", path, e)),
+        Err(e) => Err(Error::os_at("remove", path, e)),
     }
 }
 
@@ -490,14 +488,8 @@ fn remove_dir_if_present(path: &Path) -> Result<()> {
     match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(io_err("remove", path, e)),
+        Err(e) => Err(Error::os_at("remove", path, e)),
     }
-}
-
-// Errors ==============================================================================================================
-
-fn io_err(op: &str, path: &Path, source: io::Error) -> Error {
-    Error::Other(format!("failed to {op} {}: {source}", path.display()))
 }
 
 #[cfg(test)]
