@@ -9,18 +9,21 @@
 use std::collections::BTreeMap;
 
 use goetia::backend::scm::exit_status::{ERROR_INVALID_DATA, RecordedExit};
+use goetia::backend::scm::manager::Scm;
 use goetia::manager::{Budget, ServiceManager as _};
 use goetia::spec::{DaemonSpec, Restart};
 use windows_service::service::{ServiceExitCode, ServiceState};
+use winreg::enums::KEY_WRITE;
 
-use crate::common::{LogDir, ShimManager, fixture_command, parameters_key, recorded_exit, scm_status, simple_spec};
+use crate::common::{LogDir, fixture_command, recorded_exit, scm_status, simple_spec};
+use crate::support::registry::{parameters_key, service_key};
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn shim_runs_child_with_cwd_and_env() {
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = ShimManager::new(&logs);
+    let mgr = Scm::new();
     let _guard = ServiceGuard::new(&id);
     let reported = ConnectBack::listen();
 
@@ -60,7 +63,7 @@ fn shim_runs_child_with_cwd_and_env() {
 fn shim_captures_stdout_to_logs_path() {
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = ShimManager::new(&logs);
+    let mgr = Scm::new();
     let _guard = ServiceGuard::new(&id);
     let reported = ConnectBack::listen();
     let log_path = logs.path_for(&id);
@@ -90,7 +93,7 @@ fn shim_captures_stdout_to_logs_path() {
 fn stop_kills_the_whole_process_tree() {
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = ShimManager::new(&logs);
+    let mgr = Scm::new();
     let _guard = ServiceGuard::new(&id);
     let child_reported = ConnectBack::listen();
     let grandchild_reported = ConnectBack::listen();
@@ -155,12 +158,17 @@ fn pid_is_alive(pid: &str) -> bool {
 fn unreadable_blob_logs_to_fallback_path_and_event_log() {
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = ShimManager::new(&logs);
+    let mgr = Scm::new();
     let _guard = ServiceGuard::new(&id);
 
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
     mgr.install(&spec, false).expect("install");
 
+    // The only test that redirects `%ProgramData%`: a decode failure is the one report that
+    // cannot reach the daemon's log. The edit follows the test's one install, which it never repeats.
+    service_key(&id, KEY_WRITE)
+        .set_value("Environment", &vec![format!("ProgramData={}", logs.path().display())])
+        .expect("write Environment");
     corrupt_spec_value(&id);
 
     let err = mgr
@@ -180,7 +188,9 @@ fn unreadable_blob_logs_to_fallback_path_and_event_log() {
         "an undecodable blob is a shim failure: {status:?}"
     );
 
-    let logged = logs.fallback_log(&id);
+    let fallback_log = logs.path().join("Goetia").join("logs").join(format!("{id}.log"));
+    let logged = std::fs::read_to_string(&fallback_log)
+        .unwrap_or_else(|e| panic!("read the fallback log {}: {e}", fallback_log.display()));
     assert!(
         logged.contains(&id) && logged.to_lowercase().contains("decode"),
         "fallback log does not look like a decode-failure report naming `{id}`:\n{logged}"
@@ -224,7 +234,7 @@ fn unreadable_blob_logs_to_fallback_path_and_event_log() {
 /// that is unambiguously ours (so `install`/`start` do not refuse it as
 /// foreign) but whose `Spec` an old shim (or any shim) cannot decode.
 fn corrupt_spec_value(id: &str) {
-    parameters_key(id)
+    parameters_key(id, KEY_WRITE)
         .set_value("Spec", &"not valid base64 or JSON at all".to_string())
         .unwrap_or_else(|e| panic!("overwrite Spec of {id}: {e}"));
 }

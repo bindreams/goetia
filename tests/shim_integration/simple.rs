@@ -11,7 +11,7 @@ use windows_sys::Win32::System::Services::{
     SERVICE_NOTIFY_STOP_PENDING, SERVICE_NOTIFY_STOPPED, SERVICE_STOP_PENDING, SERVICE_STOPPED,
 };
 
-use crate::common::{LogDir, ShimManager, arm_and_wait, conformance_mk, fixture_command, simple_spec};
+use crate::common::{LogDir, arm_and_wait, conformance_mk, fixture_command, simple_spec};
 use crate::deny::Denied;
 use crate::support::{self, ELEVATED, ServiceGuard};
 
@@ -57,7 +57,7 @@ fn hand_edit(id: &str) {
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn simple_passes_conformance() {
     let logs = LogDir::new();
-    let mgr = ShimManager::new(&logs);
+    let mgr = goetia::backend::scm::manager::Scm::new();
     let mk = |id: &str| conformance_mk(&logs, id);
 
     let _foreign_guard = ServiceGuard::new(conformance::FOREIGN_ID);
@@ -84,7 +84,7 @@ fn simple_passes_conformance() {
 fn install_then_list_round_trips_without_the_source_file() {
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = ShimManager::new(&logs);
+    let mgr = goetia::backend::scm::manager::Scm::new();
     let _guard = ServiceGuard::new(&id);
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
 
@@ -110,7 +110,7 @@ fn install_then_list_round_trips_without_the_source_file() {
 fn start_stop_status_reflect_reality() {
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = ShimManager::new(&logs);
+    let mgr = goetia::backend::scm::manager::Scm::new();
     let _guard = ServiceGuard::new(&id);
     let started = support::ConnectBack::listen();
     let spec = simple_spec(&id, fixture_command("report", &[&started.port().to_string()]), &logs);
@@ -141,7 +141,7 @@ fn start_stop_status_reflect_reality() {
 fn uninstall_leaves_nothing() {
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = ShimManager::new(&logs);
+    let mgr = goetia::backend::scm::manager::Scm::new();
     let _guard = ServiceGuard::new(&id);
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
     mgr.install(&spec, false).expect("install");
@@ -170,12 +170,11 @@ fn uninstall_leaves_nothing() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_ignores_foreign_services() {
-    let logs = LogDir::new();
-    let mgr = ShimManager::new(&logs);
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     seed_foreign(guard.id());
 
+    let mgr = goetia::backend::scm::manager::Scm::new();
     let installed = mgr.list().expect("list");
     assert!(
         installed.iter().all(|entry| match entry {
@@ -202,7 +201,7 @@ fn list_ignores_foreign_services() {
 fn the_shim_reports_stop_pending_then_stopped() {
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = ShimManager::new(&logs);
+    let mgr = goetia::backend::scm::manager::Scm::new();
     let _guard = ServiceGuard::new(&id);
     let started = support::ConnectBack::listen();
     let spec = simple_spec(&id, fixture_command("report", &[&started.port().to_string()]), &logs);

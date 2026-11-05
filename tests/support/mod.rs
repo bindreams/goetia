@@ -12,6 +12,8 @@ pub mod cmd;
 pub mod connect_back;
 pub mod daemon_spec;
 pub mod kill;
+#[cfg(windows)]
+pub mod registry;
 pub mod sentinel;
 #[cfg(windows)]
 pub mod service_ctrl;
