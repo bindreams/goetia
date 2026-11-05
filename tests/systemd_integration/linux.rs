@@ -796,24 +796,24 @@ struct StopHolder {
 impl StopHolder {
     fn start(id: &str) -> Self {
         let unit = format!("{id}-holder.service");
-        let lock = PathBuf::from(format!("/run/{id}.lock"));
-        let held = fs::File::create(&lock).unwrap_or_else(|e| panic!("create {}: {e}", lock.display()));
+        let path = PathBuf::from("/run/systemd/system").join(&unit);
+        let mut holder = StopHolder {
+            unit,
+            path,
+            lock: PathBuf::from(format!("/run/{id}.lock")),
+            held: None,
+        };
+        let held = fs::File::create(&holder.lock).unwrap_or_else(|e| panic!("create {}: {e}", holder.lock.display()));
         // SAFETY: `held` owns the descriptor for the duration of the call.
         let locked = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&held), libc::LOCK_EX) };
         assert_eq!(
             locked,
             0,
             "flock {}: {}",
-            lock.display(),
+            holder.lock.display(),
             std::io::Error::last_os_error()
         );
-        let path = PathBuf::from("/run/systemd/system").join(&unit);
-        let holder = StopHolder {
-            unit,
-            path,
-            lock,
-            held: Some(held),
-        };
+        holder.held = Some(held);
         fs::write(
             &holder.path,
             format!(
@@ -1272,7 +1272,7 @@ fn a_unit_whose_executable_does_not_exist_fails_start() {
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn uninstall_leaves_nothing() {
     let id = support::random_test_id();
-    // No `ServiceGuard`: this test is itself the proof that nothing is left for one to clean up.
+    let _guard = ServiceGuard::new(&id);
     let spec = mk(&id);
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");

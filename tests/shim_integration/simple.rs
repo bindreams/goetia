@@ -137,13 +137,12 @@ fn start_stop_status_reflect_reality() {
 fn uninstall_leaves_nothing() {
     let mgr = goetia::backend::scm::manager::Scm::new();
     let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
     let spec = simple_spec(&id, fixture_command("report", &["1"]));
     mgr.install(&spec, false).expect("install");
 
     mgr.uninstall(&spec.id).expect("uninstall");
 
-    // No `ServiceGuard` here on purpose — see
-    // `tests/scm_integration/managed.rs`'s identical test for why.
     let query = support::cmd::run("sc.exe", &["query", &id]);
     assert!(!query.ok(), "service should no longer exist:\n{query}");
 

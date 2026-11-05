@@ -98,6 +98,7 @@ fn foreign_plist(label: &str) -> String {
 /// over them.
 fn binary_plist(label: &str) -> Vec<u8> {
     let source = std::env::temp_dir().join(format!("{label}-binary.plist"));
+    let _cleanup = FileGuard(source.clone());
     write_bytes(&source, foreign_plist(label).as_bytes());
     cmd::run(
         "plutil",
@@ -105,7 +106,6 @@ fn binary_plist(label: &str) -> Vec<u8> {
     )
     .expect_ok();
     let bytes = std::fs::read(&source).unwrap_or_else(|e| panic!("read {}: {e}", source.display()));
-    let _ = std::fs::remove_file(&source);
     assert!(
         bytes.starts_with(b"bplist00"),
         "`plutil -convert binary1` must produce a binary plist, got {:?}",
@@ -1362,6 +1362,9 @@ fn start_is_not_fooled_by_a_stale_job_holding_the_label() {
         ),
     )
     .expect("write decoy plist");
+    // Boots out whichever job holds the label, the decoy included, after `_guard` and before
+    // `_decoy_cleanup` removes its plist.
+    let _decoy_job = support::ServiceGuard::new(&id);
     cmd::run("launchctl", &["bootstrap", "system", decoy.to_str().unwrap()]);
 
     let _guard = Guard::install(&mgr, &spec);
@@ -1385,6 +1388,4 @@ fn start_is_not_fooled_by_a_stale_job_holding_the_label() {
         "the running process should be our daemon (`sleep 300`), not the decoy (`sleep 600`):\n{}",
         running.stdout
     );
-
-    let _ = cmd::run("launchctl", &["bootout", &format!("system/{id}")]);
 }

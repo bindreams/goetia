@@ -345,14 +345,12 @@ fn killing_a_stopped_service_is_not_running() {
 fn uninstall_leaves_nothing() {
     let mgr = Scm::new();
     let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
     let spec = support::spec(&id, fixture_command(&id, 1, 1, "plain"));
     mgr.install(&spec, false).expect("install");
 
     mgr.uninstall(&spec.id).expect("uninstall");
 
-    // No `ServiceGuard` here on purpose: if `uninstall` genuinely leaves
-    // nothing, there is nothing left to guard; if it does not, the
-    // assertions below fail with the leftover still in place to inspect.
     let query = support::cmd::run("sc.exe", &["query", &id]);
     assert!(!query.ok(), "service should no longer exist:\n{query}");
 
@@ -773,8 +771,9 @@ struct LocalUserGuard {
 
 impl LocalUserGuard {
     fn create(name: &str, password: &str) -> Self {
+        let guard = Self { name: name.to_string() };
         support::cmd::run("net.exe", &["user", name, password, "/add"]).expect_ok();
-        Self { name: name.to_string() }
+        guard
     }
 }
 
