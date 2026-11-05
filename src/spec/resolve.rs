@@ -5,7 +5,7 @@
 //! separate `validate()`. systemd's `Description=` and `Environment=` have
 //! no escaping and a newline terminates a directive, so an unvalidated
 //! `name` could inject a second `ExecStart=`; XML 1.0 cannot represent
-//! control characters at all, not even as entities. Every user-supplied
+//! most C0 control characters at all, not even as entities. Every user-supplied
 //! string that ends up in a generated artifact — `name`, `command`, `cwd`,
 //! `logs`, every `env` key and value, and `user`'s `name`/`id` — is
 //! rejected here if it contains one.
@@ -689,8 +689,8 @@ fn normalize(path: &Path) -> PathBuf {
 ///
 /// systemd's `Description=`/`Environment=`, launchd's `UserName` and every other emitted
 /// directive have no escaping, and a control character (above all a newline) can terminate one
-/// directive and start another. XML 1.0 cannot represent a control character at all, so this
-/// also keeps the launchd generator from emitting an unparseable plist.
+/// directive and start another. XML 1.0 cannot represent most C0 control characters at all, so
+/// this also keeps the launchd generator from emitting an unparseable plist.
 ///
 /// `pub(crate)`: also called by `blob::decode`, which re-runs these against a spec deserialized
 /// from an untrusted artifact rather than trusting `DaemonSpec`'s `pub` fields.
@@ -786,10 +786,8 @@ pub(crate) fn reject_empty(id: &Id, field: &str, value: &str) -> Result<(), Erro
 /// `pub(crate)`: also called by `blob::decode`. An installed artifact whose blob carries an empty
 /// or whitespace-only `user.name` decodes as `Installed::OursUnusable`, not silently as root.
 ///
-/// A second, independent rejection of an empty `user.name` and `user.id` SID lives in
-/// `resolve_shape`'s per-backend validation, because `canonical_account("")` maps an empty name
-/// to `LocalSystem` on Windows by a different route. Their reachability differs; do not remove
-/// one as a duplicate of the other.
+/// This is the only gate between an authored empty name and `canonical_account("")`, which maps
+/// it to `LocalSystem` on Windows; `windows_builtin`'s `""` row is the other half (see there).
 pub(crate) fn reject_blank(id: &Id, field: &str, value: &str) -> Result<(), Error> {
     if value.trim().is_empty() {
         return Err(invalid(id, &format!("field `{field}` must not be empty")));

@@ -31,7 +31,8 @@ use super::user::RawUser;
 /// `yaml_serde::from_str::<RawSpec>` compiles, and silently accepts every
 /// explicit `null` this module exists to refuse. The type is exported, so a
 /// library consumer can reach that unguarded path; [`load`](super::load) is
-/// always safe.
+/// always safe. Narrowing it means deciding whether [`resolve`](super::resolve)
+/// belongs in the public API beside `load`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawSpec {
