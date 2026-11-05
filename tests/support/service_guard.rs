@@ -1,7 +1,6 @@
 //! RAII cleanup for the real system services the probes register.
 //!
-//! A guard exists before the write it cleans up: a write that lands and then
-//! fails or panics must still be removed.
+//! A guard exists before the write it cleans up.
 //!
 //! On macOS it boots the job out and removes only
 //! `/Library/LaunchDaemons/<id>.plist`, not goetia's staging directory. A
@@ -36,7 +35,9 @@ impl Drop for ServiceGuard {
     }
 }
 
-fn remove_path(path: &std::path::Path, dir: bool) -> Option<String> {
+/// Removes a file, or a directory tree when `dir`; "not found" is success, any other failure is
+/// returned as a message for the caller to log.
+pub fn remove_path(path: &std::path::Path, dir: bool) -> Option<String> {
     let result = if dir {
         std::fs::remove_dir_all(path)
     } else {
@@ -100,8 +101,7 @@ fn cleanup(id: &str) -> Vec<String> {
     let mut problems = Vec::new();
 
     // `sc.exe` exits with the Win32 error: 1060 is ERROR_SERVICE_DOES_NOT_EXIST,
-    // 1062 is ERROR_SERVICE_NOT_ACTIVE and 1072 is ERROR_SERVICE_MARKED_FOR_DELETE
-    // (see below).
+    // 1062 is ERROR_SERVICE_NOT_ACTIVE and 1072 is ERROR_SERVICE_MARKED_FOR_DELETE.
     let stop = cmd::run("sc.exe", &["stop", id]);
     if !stop.ok() && !matches!(stop.code, Some(1060 | 1062 | 1072)) {
         problems.push(stop.to_string());

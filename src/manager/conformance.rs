@@ -14,11 +14,9 @@
 //! RAII guard so a mid-scenario assertion failure still cleans up. Ids are
 //! process- and call-unique (a pid plus a monotonic counter), not
 //! cryptographically random: sufficient given cleanup runs on normal return and
-//! on panic. The guard knows each fresh id before `install` runs, so an
-//! `install` that fails after writing is still cleaned up; the seeded ids the
-//! caller installs before `run` are the caller's to guard. Cleanup does not run
-//! if the process is killed or aborts, which leaves a straggler to remove by
-//! hand.
+//! on panic. The seeded ids the caller installs before `run` are the caller's
+//! to guard. Cleanup does not run if the process is killed or aborts, which
+//! leaves a straggler to remove by hand.
 //!
 //! ## The seeded ids
 //!

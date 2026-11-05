@@ -19,6 +19,7 @@ use goetia::decide::Outcome;
 use goetia::manager::{Budget, Installed, ServiceManager, State, conformance};
 use goetia::spec::{AccountId, DaemonSpec, Id, Kind, Restart, User};
 
+use crate::support::service_guard::remove_path;
 use crate::support::{self, ELEVATED, ServiceGuard, cmd};
 
 /// Held by every test whose assertion is about `list`'s answer for the *whole host* — its exit code,
@@ -267,11 +268,36 @@ fn uid_of(account: &str) -> u32 {
         .unwrap_or_else(|e| panic!("parse uid of {account}: {e}"))
 }
 
+/// Logs a failed removal the way `ServiceGuard` does: `Drop` cannot return it, and a leftover that
+/// nothing reported shows up only as a straggler in the next run.
+fn report(guard: &str, problem: Option<String>) {
+    if let Some(problem) = problem {
+        eprintln!("{guard}: cleanup failed: {problem}");
+    }
+}
+
+/// `remove_dir` on a search root a seeding call created. "Not empty" is expected, not a failure: a
+/// root systemd itself populated for some other unit is left as it was found.
+fn remove_created_root(root: &Path) -> Option<String> {
+    match fs::remove_dir(root) {
+        Ok(()) => None,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            None
+        }
+        Err(e) => Some(format!("remove {}: {e}", root.display())),
+    }
+}
+
 struct RmDirAll(PathBuf);
 
 impl Drop for RmDirAll {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        report("RmDirAll", remove_path(&self.0, true));
     }
 }
 
@@ -284,9 +310,9 @@ struct RmDropin {
 
 impl Drop for RmDropin {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.leaf);
+        report("RmDropin", remove_path(&self.leaf, true));
         if let Some(root) = &self.root {
-            let _ = fs::remove_dir(root);
+            report("RmDropin", remove_created_root(root));
         }
         // No `daemon-reload` here: every test that seeds one of these also holds a `ServiceGuard`,
         // whose own cleanup reloads after this one has run.
@@ -302,9 +328,9 @@ struct RmFileInRoot {
 
 impl Drop for RmFileInRoot {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.leaf);
+        report("RmFileInRoot", remove_path(&self.leaf, false));
         if let Some(root) = &self.root {
-            let _ = fs::remove_dir(root);
+            report("RmFileInRoot", remove_created_root(root));
         }
     }
 }
@@ -315,7 +341,7 @@ struct RmPath(PathBuf);
 
 impl Drop for RmPath {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        report("RmPath", remove_path(&self.0, false));
     }
 }
 
@@ -1327,6 +1353,7 @@ fn uninstall_refuses_an_id_whose_fragment_is_gone_but_whose_dropin_remains() {
 fn uninstall_refuses_an_id_whose_fragment_is_gone_but_whose_enablement_link_remains() {
     let id = support::random_test_id();
     let link = wants_symlink(&id);
+    // No `ServiceGuard`: the id never gets a fragment, so only the planted link needs removing.
     let _cleanup = RmPath(link.clone());
     fs::create_dir_all(link.parent().expect("the link has a parent")).expect("mkdir *.target.wants");
     std::os::unix::fs::symlink(unit_path(&id), &link).expect("plant a dangling .wants link");
@@ -1343,7 +1370,6 @@ fn install_refuses_a_stray_enablement_link_with_no_fragment() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let link = wants_symlink(guard.id());
-    let _cleanup = RmPath(link.clone());
     fs::create_dir_all(link.parent().expect("the link has a parent")).expect("mkdir *.target.wants");
     std::os::unix::fs::symlink(unit_path(guard.id()), &link).expect("plant a dangling .wants link");
 
@@ -1737,11 +1763,13 @@ fn a_top_level_service_d_dropin_is_not_this_ids_conflict() {
         "{} already exists on this host; this test would remove an administrator's directory",
         dir.display()
     );
+    fs::create_dir(&dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
+    // Built after the mkdir, not before: it is atomic, so on failure nothing was created and a guard
+    // would remove a host-wide directory this test did not make.
     let _cleanup = RmDropin {
         leaf: dir.clone(),
         root: None,
     };
-    fs::create_dir(&dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
     fs::write(
         dir.join("50-goetia-test.conf"),
         "[Unit]\nDocumentation=https://example.invalid/goetia-test\n",

@@ -149,8 +149,7 @@ fn may_account_for(listed: &[Installed], id: &str) -> bool {
 /// Installs `spec` through `mgr` and `uninstall`s it on drop. Covers both
 /// the staging and enabled locations — `uninstall` locates the artifact
 /// wherever it currently lives — so a test that calls `enable` doesn't need
-/// a second guard. The guard exists before the write, so an install that
-/// writes and then fails is still cleaned up.
+/// a second guard.
 struct Guard(Id);
 
 impl Guard {
@@ -198,8 +197,7 @@ fn launchd_passes_conformance() {
     // never writes to or removes (see `manager::conformance`'s module doc
     // comment) — cleaned up here, not by `run`. The `ServiceGuard` is the backstop for a regressed
     // scenario that enabled or bootstrapped it: it boots the id out and removes it from
-    // `LaunchDaemons`, where `Guard` would only be refused (`uninstall` does not touch foreign
-    // content) and `FileGuard` only reaches the staging path.
+    // `LaunchDaemons`.
     let _foreign_service = support::ServiceGuard::new(manager::conformance::FOREIGN_ID);
     let foreign_path = staging_path(manager::conformance::FOREIGN_ID);
     let _foreign_cleanup = FileGuard(foreign_path.clone());
