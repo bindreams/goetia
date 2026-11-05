@@ -158,7 +158,11 @@ pub fn fallback_log(id: &str) -> String {
 /// calls this once the shim that wrote it is gone, so that the log does not outlive the test.
 pub fn remove_fallback_log(id: &str) {
     let path = fallback_log_path(id);
-    std::fs::remove_file(&path).unwrap_or_else(|e| panic!("remove fallback log {}: {e}", path.display()));
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("remove fallback log {}: {e}", path.display()),
+    }
 }
 
 fn fallback_log_path(id: &str) -> PathBuf {

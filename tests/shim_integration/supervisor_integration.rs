@@ -22,9 +22,9 @@ fn shim_runs_child_with_cwd_and_env() {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let logs = tempfile::tempdir().expect("tempdir for the daemon's log");
+    let tmp = tempfile::tempdir().expect("tempdir for cwd");
     let _guard = ServiceGuard::new(&id);
     let reported = ConnectBack::listen();
-    let tmp = tempfile::tempdir().expect("tempdir for cwd");
 
     let mut env = BTreeMap::new();
     env.insert("GOETIA_SHIM_ENV_PROBE".to_string(), "probe-value".to_string());
