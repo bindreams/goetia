@@ -275,8 +275,8 @@ fn resolve_shape(id: &Id, raw: RawSpec, base_dir: &Path) -> Result<(ShapedSpec, 
     let mut env = BTreeMap::new();
     for (key, value) in raw.env {
         // Checked here so it runs for every backend: `scm: {env: {"${K}": v}}` must be caught
-        // from Linux too. `interpolate::spec` keeps its own copy so that it does not depend on
-        // this running first.
+        // from Linux too. Steps 3 and 4 run this before `interpolate::spec` sees the spec, which
+        // keeps its own copy so that it does not depend on that order.
         if interpolate::would_substitution_change(&key) {
             return Err(invalid(id, interpolate::ENV_NAME_MESSAGE));
         }
@@ -295,8 +295,8 @@ fn resolve_shape(id: &Id, raw: RawSpec, base_dir: &Path) -> Result<(ShapedSpec, 
             reject_blank(id, "user.name", n)?;
         }
         User::Id(AccountId::Sid(s)) => {
-            // Same reason as the `env`-name rule above, and likewise deliberately duplicates the
-            // check in `interpolate::spec`. Ordering against `reject_blank` below does not matter:
+            // Same reason as the `env`-name rule above, and `interpolate::spec` likewise keeps its
+            // own copy. Ordering against `reject_blank` below does not matter:
             // `${S}` trims to `${S}`, never empty, so the two can never both fire on one value.
             if interpolate::would_substitution_change(s) {
                 return Err(invalid(id, interpolate::USER_ID_MESSAGE));
