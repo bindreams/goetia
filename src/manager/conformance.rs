@@ -14,9 +14,9 @@
 //! RAII guard so a mid-scenario assertion failure still cleans up. Ids are
 //! process- and call-unique (a pid plus a monotonic counter), not
 //! cryptographically random: sufficient given cleanup runs on normal return and
-//! on panic. It does not run if the process is killed or aborts, and it does not
-//! cover an `install` that fails after writing, which panics before the id is
-//! tracked. Either leaves a straggler to remove by hand.
+//! on panic. The guard knows each id before `install` runs, so an `install` that
+//! fails after writing is still cleaned up. Cleanup does not run if the process
+//! is killed or aborts, which leaves a straggler to remove by hand.
 //!
 //! ## The seeded ids
 //!
@@ -128,11 +128,18 @@ pub(crate) fn fresh_id(label: &str) -> String {
     format!("goetia-conformance-{label}-{pid:x}-{n:x}", pid = std::process::id())
 }
 
+/// A spec with a fresh id, registered in `cleanup` before it is returned, so an
+/// `install` that fails after writing is still uninstalled.
+fn fresh_spec(mk: &dyn Fn(&str) -> DaemonSpec, label: &str, cleanup: &mut Vec<Id>) -> DaemonSpec {
+    let spec = mk(&fresh_id(label));
+    cleanup.push(spec.id.clone());
+    spec
+}
+
 fn install_is_idempotent(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec, cleanup: &mut Vec<Id>) {
-    let spec = mk(&fresh_id("idempotent"));
+    let spec = fresh_spec(mk, "idempotent", cleanup);
 
     let first = mgr.install(&spec, false).expect("first install");
-    cleanup.push(spec.id.clone());
     assert!(
         matches!(first, crate::decide::Outcome::Create),
         "a fresh id must Create, got {first:?}"
@@ -146,9 +153,8 @@ fn install_is_idempotent(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSp
 }
 
 fn install_does_not_start(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec, cleanup: &mut Vec<Id>) {
-    let spec = mk(&fresh_id("no-start"));
+    let spec = fresh_spec(mk, "no-start", cleanup);
     mgr.install(&spec, false).expect("install");
-    cleanup.push(spec.id.clone());
 
     let status = mgr.status(&spec.id).expect("status of a just-installed service");
     assert_ne!(
@@ -160,9 +166,8 @@ fn install_does_not_start(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonS
 }
 
 fn install_does_not_enable(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec, cleanup: &mut Vec<Id>) {
-    let spec = mk(&fresh_id("no-enable"));
+    let spec = fresh_spec(mk, "no-enable", cleanup);
     mgr.install(&spec, false).expect("install");
-    cleanup.push(spec.id.clone());
 
     let status = mgr.status(&spec.id).expect("status of a just-installed service");
     assert!(
@@ -173,10 +178,8 @@ fn install_does_not_enable(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> Daemon
 }
 
 fn reinstall_preserves_enablement(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec, cleanup: &mut Vec<Id>) {
-    let fresh = fresh_id("preserve-enable");
-    let spec = mk(&fresh);
+    let spec = fresh_spec(mk, "preserve-enable", cleanup);
     mgr.install(&spec, false).expect("install");
-    cleanup.push(spec.id.clone());
     mgr.enable(&spec.id).expect("enable");
     assert!(
         mgr.status(&spec.id).expect("status after enable").enabled,
@@ -185,7 +188,7 @@ fn reinstall_preserves_enablement(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) ->
     );
 
     // A routine config update must not undo a deliberate enable (or disable).
-    let mut changed = mk(&fresh);
+    let mut changed = mk(spec.id.as_str());
     changed
         .env
         .insert("GOETIA_CONFORMANCE_CHANGED".to_string(), "1".to_string());
@@ -290,9 +293,8 @@ fn conflict_requires_force(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> Daemon
 /// Every backend must paper over that, or `restart` of an installed but
 /// never-started daemon works on Linux and errors on macOS and Windows.
 fn start_and_stop_are_idempotent(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec, cleanup: &mut Vec<Id>) {
-    let spec = mk(&fresh_id("idempotent-start-stop"));
+    let spec = fresh_spec(mk, "idempotent-start-stop", cleanup);
     mgr.install(&spec, false).expect("install");
-    cleanup.push(spec.id.clone());
 
     mgr.stop(&spec.id, Budget::DEFAULT)
         .expect("stop on a never-started service must be Ok, not an error");
@@ -327,9 +329,8 @@ fn kill_of_a_service_that_is_not_running_says_so(
     mk: &dyn Fn(&str) -> DaemonSpec,
     cleanup: &mut Vec<Id>,
 ) {
-    let spec = mk(&fresh_id("kill-not-running"));
+    let spec = fresh_spec(mk, "kill-not-running", cleanup);
     mgr.install(&spec, false).expect("install");
-    cleanup.push(spec.id.clone());
 
     let never_started = mgr.kill(&spec.id);
     assert!(
@@ -373,9 +374,8 @@ fn starting_with_no_budget_is_accepted_and_establishes_nothing(
     mk: &dyn Fn(&str) -> DaemonSpec,
     cleanup: &mut Vec<Id>,
 ) {
-    let spec = mk(&fresh_id("no-budget-start"));
+    let spec = fresh_spec(mk, "no-budget-start", cleanup);
     mgr.install(&spec, false).expect("install");
-    cleanup.push(spec.id.clone());
 
     mgr.start(&spec.id, Budget::Immediate)
         .expect("a start with no budget issues the request and returns Ok");
@@ -403,9 +403,8 @@ fn a_start_request_after_a_confirmed_stop_is_accepted(
     mk: &dyn Fn(&str) -> DaemonSpec,
     cleanup: &mut Vec<Id>,
 ) {
-    let spec = mk(&fresh_id("start-after-stop"));
+    let spec = fresh_spec(mk, "start-after-stop", cleanup);
     mgr.install(&spec, false).expect("install");
-    cleanup.push(spec.id.clone());
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
 
@@ -427,9 +426,8 @@ fn a_start_request_after_a_confirmed_stop_is_accepted(
 /// real backend. Checked while stopped, running, and stopped again, so a
 /// `list` that caches a value from install time still fails.
 fn list_and_status_agree_on_pid(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec, cleanup: &mut Vec<Id>) {
-    let spec = mk(&fresh_id("pid-agreement"));
+    let spec = fresh_spec(mk, "pid-agreement", cleanup);
     mgr.install(&spec, false).expect("install");
-    cleanup.push(spec.id.clone());
 
     assert_list_is_complete_and_pid_agrees(mgr, &spec.id, cleanup);
 
