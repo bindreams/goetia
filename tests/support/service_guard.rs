@@ -159,14 +159,14 @@ fn cleanup(id: &str) -> Vec<String> {
 
 /// Removes `leftover` once `id` is `STOPPED` or gone; otherwise the reason it was left.
 ///
-/// A stop is waited for by notification, within [`CLEANUP_BOUND`]. SCM can refuse to watch a service
-/// that `sc delete` has marked for deletion (`ERROR_SERVICE_MARKED_FOR_DELETE`); the state is then
-/// read once, as the production wait does, and a service not yet `STOPPED` keeps the file.
+/// A stop is waited for by notification, within [`CLEANUP_BOUND`]. SCM accepts an arm whose mask
+/// includes `STOPPED` on a service `sc delete` has marked for deletion, in every state measured
+/// (`src/backend/scm/wait.rs`, `ScmActor::arm`), so any refusal keeps the file.
 #[cfg(windows)]
 fn remove_leftover(id: &str, leftover: &std::path::Path) -> Option<String> {
-    use windows_service::service::{ServiceAccess, ServiceState};
+    use windows_service::service::ServiceAccess;
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
-    use windows_sys::Win32::Foundation::{ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE};
+    use windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
     use windows_sys::Win32::System::Services::SERVICE_NOTIFY_STOPPED;
 
     use super::service_notify::arm_and_wait;
@@ -191,16 +191,6 @@ fn remove_leftover(id: &str, leftover: &std::path::Path) -> Option<String> {
             }
         }
         Err(e) if is(&e, ERROR_SERVICE_DOES_NOT_EXIST) => {}
-        Err(e) if is(&e, ERROR_SERVICE_MARKED_FOR_DELETE) => match service.query_status() {
-            Ok(status) if status.current_state == ServiceState::Stopped => {}
-            Ok(status) => {
-                return left(format!(
-                    "the service is {:?}, marked for deletion",
-                    status.current_state
-                ));
-            }
-            Err(e) => return left(format!("query the service: {e}")),
-        },
         Err(e) => return left(format!("watch the service stop: {e}")),
     }
     remove_path_retrying(leftover, false)

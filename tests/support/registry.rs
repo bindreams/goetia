@@ -5,11 +5,13 @@ use winreg::enums::HKEY_LOCAL_MACHINE;
 
 use super::SCM_SERVICES_KEY;
 
-fn service_path(id: &str) -> String {
+/// `Services\<id>`, relative to `HKLM`.
+pub fn service_path(id: &str) -> String {
     format!(r"{SCM_SERVICES_KEY}\{id}")
 }
 
-fn parameters_path(id: &str) -> String {
+/// `Services\<id>\Parameters`, relative to `HKLM`.
+pub fn parameters_path(id: &str) -> String {
     format!(r"{}\Parameters", service_path(id))
 }
 

@@ -1297,7 +1297,7 @@ fn list_reports_a_denied_parameters_read_with_the_cause_it_established() {
         .unwrap_or_else(|| panic!("a service whose marker was never read is neither claimed nor omitted: {listed:?}"))
         .to_string();
     assert!(
-        reason.contains(&format!(r"{}\{id}\Parameters", support::SCM_SERVICES_KEY)),
+        reason.contains(&support::registry::parameters_path(&id)),
         "the entry must name the key whose read did not complete: {reason}"
     );
     assert!(
