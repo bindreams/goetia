@@ -16,8 +16,9 @@
 //! cryptographically random: sufficient given cleanup runs on normal return and
 //! on panic. The guard knows each fresh id before `install` runs, so an
 //! `install` that fails after writing is still cleaned up; the seeded ids the
-//! caller installs before `run` are the caller's to guard. Cleanup does not run if the process
-//! is killed or aborts, which leaves a straggler to remove by hand.
+//! caller installs before `run` are the caller's to guard. Cleanup does not run
+//! if the process is killed or aborts, which leaves a straggler to remove by
+//! hand.
 //!
 //! ## The seeded ids
 //!
@@ -78,11 +79,8 @@ struct Cleanup<'a> {
 impl Drop for Cleanup<'_> {
     fn drop(&mut self) {
         for id in &self.ids {
-            // `NotInstalled`: an id registered before an `install` that never wrote.
-            match self.mgr.uninstall(id) {
-                Ok(()) => {}
-                Err(e) if matches!(e.cause(), crate::Error::NotInstalled { .. }) => {}
-                Err(e) => eprintln!("manager::conformance cleanup: uninstall({id}) failed: {e}"),
+            if let Err(e) = self.mgr.uninstall(id) {
+                eprintln!("manager::conformance cleanup: uninstall({id}) failed: {e}");
             }
         }
     }

@@ -3,6 +3,10 @@
 //! A guard exists before the write it cleans up: a write that lands and then
 //! fails or panics must still be removed.
 //!
+//! On macOS it boots the job out and removes only
+//! `/Library/LaunchDaemons/<id>.plist`, not goetia's staging directory. A
+//! goetia-installed launchd id is guarded with the launchd suite's `Guard`.
+//!
 //! `Drop` cannot return a `Result`, so every failure other than "not found" is
 //! logged to stderr naming the id and the error. A cleanup failure that
 //! reports nothing surfaces later only as a mysterious straggler in
@@ -97,8 +101,10 @@ fn cleanup(id: &str) -> Vec<String> {
     if !stop.ok() && !matches!(stop.code, Some(1060 | 1062)) {
         problems.push(stop.to_string());
     }
+    // 1072 is ERROR_SERVICE_MARKED_FOR_DELETE, already gone: `uninstall` may return while the record is only
+    // marked for deletion, and SCM drops it once its last handle closes.
     let delete = cmd::run("sc.exe", &["delete", id]);
-    if !delete.ok() && delete.code != Some(1060) {
+    if !delete.ok() && !matches!(delete.code, Some(1060 | 1072)) {
         problems.push(delete.to_string());
     }
     problems
