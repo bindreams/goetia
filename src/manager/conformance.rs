@@ -12,7 +12,9 @@
 //! real backend are real units, plists or SCM services on the host running it.
 //! It tracks every id it installs and uninstalls each before returning, via an
 //! RAII guard so a mid-scenario assertion failure still cleans up. Ids are
-//! process- and call-unique (a pid plus a monotonic counter).
+//! process- and call-unique (a pid plus a monotonic counter), not
+//! cryptographically random: sufficient given cleanup runs every time,
+//! including on panic.
 //!
 //! ## The seeded ids
 //!
@@ -115,7 +117,8 @@ pub fn run(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
 /// This module is compiled into the library (not `#[cfg(test)]`-gated) so that
 /// each real backend's integration test, a separate crate linking only
 /// `goetia`'s public API, can call [`run`]. That rules out a dev-only
-/// randomness crate; a process-wide counter plus the pid is unique enough.
+/// randomness crate; a process-wide counter plus the pid is unique enough,
+/// since callers clean up what they create.
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn fresh_id(label: &str) -> String {
@@ -472,7 +475,8 @@ fn list_and_status_agree_on_pid(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> D
 /// Seeding [`UNDETERMINED_ID`] changes `list`'s answer for the whole host: it
 /// raises `daemon list`'s exit code, and on Windows collapses into an
 /// aggregate entry. A suite that also asserts a *clean* host-wide listing has
-/// to serialize against it with the `UNIT_DIR_EXCLUSIVE` label.
+/// to serialize the two against each other with the `UNIT_DIR_EXCLUSIVE` label
+/// the integration suites share by name.
 ///
 /// A backend satisfies the `list` half by naming the id in an
 /// [`Installed::Undetermined`] entry *or* by emitting any aggregate one, which

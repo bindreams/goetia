@@ -188,11 +188,11 @@ pub trait ServiceManager {
 
     /// The live state of one installed service. `Err` for an id whose blob
     /// will not decode, never a plausible-looking `Status` for state it
-    /// cannot determine (as `Installed::OursUnusable` does on the `list` side);
-    /// [`Error::Undetermined`] for an id whose artifact could not be read at
-    /// all, where not even ownership was established. [`Error::NoManager`]
-    /// where no manager can be asked, which the CLI reports as `unavailable`
-    /// under the id.
+    /// cannot determine (see `Installed::OursUnusable`, which exists for the
+    /// same reason on the `list` side); [`Error::Undetermined`] for an id whose
+    /// artifact could not be read at all, where not even ownership was
+    /// established. [`Error::NoManager`] where no manager can be asked, which
+    /// the CLI reports as `unavailable` under the id.
     ///
     /// [`Error::Undetermined`]: crate::Error::Undetermined
     /// [`Error::NoManager`]: crate::Error::NoManager
@@ -208,11 +208,14 @@ pub trait ServiceManager {
     /// not exist.
     ///
     /// **An absent container — no unit directory, no `Services` key — is
-    /// `Ok(vec![])`, never `Err`.** Absence is established there, a
-    /// determinate answer; an `Err` reaches the CLI as `Kind::Unavailable`
-    /// (goetia could not answer), the conflation [`Installed::Undetermined`]
-    /// exists to end. A scan that *started* and did not finish is the opposite
-    /// case and does report (see `Installed::scan_incomplete`), as does an
+    /// `Ok(vec![])`, never `Err`.** Absence is established there: nothing is
+    /// installed, which is a determinate answer and is reported as one. An
+    /// `Err` reaches the CLI as `Kind::Unavailable`, exit `1` over an empty
+    /// document, the rendering that says goetia could not answer, and putting
+    /// a settled answer behind it is the same conflation
+    /// [`Installed::Undetermined`] exists to end, arrived at from the other
+    /// side. A scan that *started* and did not finish is the opposite case
+    /// and does report (see `Installed::scan_incomplete`), as does an
     /// entry whose live state could not be queried (`OursUnusable`), except
     /// where no manager can be asked for any entry's: that is
     /// [`Error::NoManager`], for the whole listing.
@@ -283,13 +286,14 @@ pub enum Installed {
     /// open would claim ownership of what may be a stranger's service;
     /// omitting it would claim it does not exist.
     ///
-    /// `name` is `None` only for an entry standing for more than one id, for
-    /// either of two reasons: an enumeration that did not finish knows neither
-    /// the names it never reached nor how many there were (see
-    /// `Installed::scan_incomplete`), *or* one that enumerated fine drops the
-    /// names because one entry cannot usefully carry hundreds, as Windows SCM
-    /// does on an unelevated `list`, where most services deny a `Parameters`
-    /// read at once. An entry for exactly one known id always names it.
+    /// `name` is `None` only for an entry standing for more than one id. That
+    /// happens for either of two reasons, and a caller must not assume the
+    /// first: an enumeration that did not finish knows neither the names it
+    /// never reached nor how many there were (see `Installed::scan_incomplete`),
+    /// *or* one that enumerated fine drops the names because one entry cannot
+    /// usefully carry hundreds, as Windows SCM does on an unelevated `list`,
+    /// where most services deny a `Parameters` read at once. An entry for
+    /// exactly one known id always names it.
     ///
     /// What a `None` obliges of every caller: **while such an entry is
     /// present, no negative conclusion about any id is sound.** It may stand

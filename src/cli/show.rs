@@ -2,13 +2,16 @@
 //!
 //! Read-only: never checks elevation. With `-f`, renders straight from a
 //! manifest and touches no manager at all. Without it, reads the spec back
-//! out of what is actually installed. Four guarantees:
+//! out of what is actually installed. Four guarantees, declared here as a
+//! contract so a future change to either path is checked against them rather
+//! than merely inherited by accident:
 //!
 //! 1. **When both paths can see the daemon**, `show <id>` and
 //!    `show -f <file>` render the same resolved spec byte for byte, because
-//!    both go through [`crate::diff::render_yaml`]. Conditional: without `-f`,
-//!    `show` reads [`ServiceManager::list`], which cannot describe a unit this
-//!    privilege level could not read. Such a unit reaches `show` as
+//!    both go through [`crate::diff::render_yaml`] and neither may grow a
+//!    renderer of its own. Conditional: without `-f`, `show` reads
+//!    [`ServiceManager::list`], which cannot describe a unit this privilege
+//!    level could not read. Such a unit reaches `show` as
 //!    [`crate::manager::Installed::Undetermined`], so `show <id>` exits `4`,
 //!    while `show -f <file>` still renders it from the manifest.
 //!    On a manifest with a `backend-specific:` block, the spec rendered is the

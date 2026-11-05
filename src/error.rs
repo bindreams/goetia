@@ -364,7 +364,8 @@ pub enum Error {
     /// caller that knows more says before it ([`Error::in_doubt_context`]).
     /// `reached` is whether goetia knows the request reached the manager:
     /// systemd says so (`Enqueued anchor job`) once it has enqueued the job,
-    /// which may already be running.
+    /// which may already be running, and a request lost after that had
+    /// reached it.
     ///
     /// It does **not** claim that nothing was sent, as a plain failure would;
     /// that goetia waited and gave up, as [`WaitTimeout`](Error::WaitTimeout)

@@ -117,7 +117,8 @@ pub(crate) enum Kind {
     /// `--json` was given to a subcommand that does not implement it.
     Unsupported,
     /// Unreachable today; kept so an unclassified failure has a home rather
-    /// than being silently dropped.
+    /// than being silently dropped, and never constructed for that reason.
+    /// Not a placeholder for a future concept.
     #[allow(dead_code)]
     Other,
 }
