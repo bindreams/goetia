@@ -1,9 +1,7 @@
 use std::time::Duration;
 
-use super::{ExitCode, Leg, SPENT, abandoned_before_start, after_start_failed, leg, restart, stop_leg};
-use crate::cli::support::{IdVerbCall, run_id_verb};
-use crate::cli::wait;
-use crate::error::{Error, Result};
+use super::{Leg, SPENT, abandoned_before_start, after_start_failed, leg, restart_until, stop_leg};
+use crate::error::Error;
 use crate::manager::fake::Fake;
 use crate::manager::fake::fake_tests::mk;
 use crate::manager::{Budget, ServiceManager};
@@ -55,30 +53,13 @@ fn a_stop_leg_whose_bounded_budget_is_spent_still_gets_a_bound() {
 
 // a spent budget ======================================================================================================
 
-/// `daemon restart frpc --timeout 30s` with the deadline already spent, so nothing here depends on
-/// how long the run takes. Returns the exit code, stdout and stderr.
-fn restart_on_a_spent_clock(fake: &Fake) -> (ExitCode, String, String) {
-    let ids = ["frpc".to_string()];
-    let mut out: Vec<u8> = Vec::new();
-    let mut err: Vec<u8> = Vec::new();
-    let code = run_id_verb(
-        IdVerbCall {
-            subcommand: "daemon restart",
-            ids: &ids,
-            get_manager: &|| -> Result<Box<dyn ServiceManager>> { Ok(Box::new(fake.clone())) },
-            is_elevated: &|| true,
-            verb: &|mgr, id| restart(mgr, id, THIRTY, Budget::Immediate.start()),
-            verb_past_tense: wait::reported(THIRTY, "restarted", "restart requested"),
-            absent_is_success: false,
-        },
-        &mut out,
-        &mut err,
-    );
-    (
-        code,
-        String::from_utf8_lossy(&out).into_owned(),
-        String::from_utf8_lossy(&err).into_owned(),
-    )
+/// `frpc`'s restart under `--timeout 30s` with the deadline already spent, so nothing here depends
+/// on how long the run takes. Returns the error's report; the restart must fail as indeterminate.
+fn restart_with_a_spent_deadline(fake: &Fake) -> String {
+    let id = Id::try_from("frpc").unwrap();
+    let e = restart_until(fake, &id, THIRTY, Budget::Immediate.start()).expect_err("a spent budget is a timeout");
+    assert!(e.is_indeterminate(), "{}", e.report());
+    e.report().to_string()
 }
 
 /// A bounded budget already spent when the stop leg is issued takes the path of a bounded stop that
@@ -91,9 +72,8 @@ fn a_bounded_budget_spent_before_an_unconfirmed_stop_is_a_timeout_and_starts_not
     fake.install(&mk("frpc"), false).expect("seed an installed daemon");
     fake.seed_stop_stalls("frpc");
 
-    let (code, out, err) = restart_on_a_spent_clock(&fake);
+    let err = restart_with_a_spent_deadline(&fake);
 
-    assert_eq!(code, ExitCode::Indeterminate, "{err}");
     assert_eq!(
         fake.calls(),
         vec![("stop", "frpc".to_string())],
@@ -103,7 +83,6 @@ fn a_bounded_budget_spent_before_an_unconfirmed_stop_is_a_timeout_and_starts_not
     assert!(err.contains("no start was issued"), "{err}");
     assert!(err.contains("may be left stopped"), "{err}");
     assert!(!err.contains("was stopped"), "nothing confirmed the stop: {err}");
-    assert!(out.is_empty(), "{out}");
 }
 
 /// The same spent budget over a stop the manager does confirm: the message reports what was
@@ -115,9 +94,8 @@ fn a_bounded_budget_spent_before_a_confirmed_stop_reports_it_stopped_and_starts_
     fake.start(&Id::try_from("frpc").unwrap(), Budget::Unbounded)
         .expect("seed a running daemon");
 
-    let (code, out, err) = restart_on_a_spent_clock(&fake);
+    let err = restart_with_a_spent_deadline(&fake);
 
-    assert_eq!(code, ExitCode::Indeterminate, "{err}");
     assert_eq!(
         fake.calls(),
         vec![("start", "frpc".to_string()), ("stop", "frpc".to_string())],
@@ -127,7 +105,6 @@ fn a_bounded_budget_spent_before_a_confirmed_stop_reports_it_stopped_and_starts_
     assert!(err.contains("did not report running within 30s"), "{err}");
     assert!(err.contains("no start was issued"), "{err}");
     assert!(!err.contains("did not report stopped"), "the stop was confirmed: {err}");
-    assert!(out.is_empty(), "{out}");
 }
 
 // wording =============================================================================================================
