@@ -120,9 +120,7 @@ pub fn run(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
 /// each real backend's integration test, a separate crate linking only
 /// `goetia`'s public API, can call [`run`]. That rules out a dev-only
 /// randomness crate; a process-wide counter plus the pid is unique enough,
-/// since callers clean up what they create on normal return and on panic. A
-/// straggler the module doc comment describes must be removed by hand before
-/// the next run.
+/// since callers clean up what they create on normal return and on panic.
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn fresh_id(label: &str) -> String {
@@ -485,9 +483,12 @@ fn list_and_status_agree_on_pid(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> D
 /// A backend satisfies the `list` half by naming the id in an
 /// [`Installed::Undetermined`] entry *or* by emitting any aggregate one. The
 /// aggregate counts because a null name stands for ids the entry could not
-/// separate, so it may stand for this one; when SCM emits which is
-/// `scm::manager`'s `unreadable_aggregate` and `scan`. The per-id half below is exact on every backend,
-/// so accepting the aggregate does not weaken the scenario to nothing.
+/// separate, so it may stand for this one, the same rule that forbids
+/// concluding absence from it. SCM names a single unreadable service, and emits
+/// the nameless form when more than one is unreadable (one entry cannot carry
+/// their names) or its scan could not finish. The per-id half below is exact on
+/// every backend, so accepting the aggregate does not weaken the scenario to
+/// nothing.
 pub fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
     let spec = mk(UNDETERMINED_ID);
     let id = &spec.id;
