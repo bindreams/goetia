@@ -12,7 +12,6 @@
 //! permissive, so it is the more likely of the two to still work exactly when the file is not.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -51,8 +50,16 @@ pub fn open_append(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().create(true).append(true).open(path)
 }
 
-pub fn append_line(file: &mut File, line: &str) {
-    let _ = writeln!(file, "{line}");
+/// Writes `line` and a newline in one `write`, so output another handle appends in between cannot
+/// split the line.
+pub fn append_line(out: &mut impl std::io::Write, line: &str) -> std::io::Result<()> {
+    out.write_all(
+        format!(
+            "{line}
+"
+        )
+        .as_bytes(),
+    )
 }
 
 // Windows Event Log ===================================================================================================
@@ -181,17 +188,24 @@ fn write_channels(
     daemon_log: Option<&Path>,
     event_log: impl FnOnce(&str),
 ) {
-    if !daemon_log.is_some_and(|path| write_line(path, line)) {
-        write_line(&default_log(id), line);
-    }
+    let _ = log_destinations(daemon_log, default_log(id))
+        .iter()
+        .any(|path| write_line(path, line));
     event_log(line);
 }
 
-/// Whether `line` was written. Best-effort: a failure to open or write is ignored.
+/// The files to try for a line, in order: the daemon's log, then the default. When they are the
+/// same file, it is tried once.
+fn log_destinations(daemon_log: Option<&Path>, default: PathBuf) -> Vec<PathBuf> {
+    match daemon_log {
+        Some(path) if path != default => vec![path.to_path_buf(), default],
+        Some(_) | None => vec![default],
+    }
+}
+
+/// Whether `line` was written. Best-effort: a failure to open or write is reported, not raised.
 fn write_line(path: &Path, line: &str) -> bool {
-    let Ok(mut f) = open_append(path) else { return false };
-    append_line(&mut f, line);
-    true
+    open_append(path).and_then(|mut f| append_line(&mut f, line)).is_ok()
 }
 
 // test_hook ===========================================================================================================

@@ -174,3 +174,87 @@ fn daemon_log_path_is_the_spec_s_logs_or_the_default() {
         (set.to_path_buf(), default_log_path("svc"))
     );
 }
+
+/// Records each `write` call; fails them all when `fail` is set.
+#[derive(Default)]
+struct Recorder {
+    writes: Vec<Vec<u8>>,
+    fail: bool,
+}
+
+impl std::io::Write for Recorder {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.fail {
+            return Err(std::io::Error::other("disk full"));
+        }
+        self.writes.push(buf.to_vec());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[skuld::test]
+fn append_line_is_one_write_so_daemon_output_cannot_land_between_text_and_newline() {
+    let mut out = Recorder::default();
+
+    append_line(&mut out, "the line").expect("the write succeeds");
+
+    assert_eq!(
+        out.writes,
+        vec![
+            b"the line
+"
+            .to_vec()
+        ]
+    );
+}
+
+#[skuld::test]
+fn append_line_reports_a_failed_write() {
+    let mut out = Recorder {
+        fail: true,
+        ..Recorder::default()
+    };
+
+    assert!(append_line(&mut out, "the line").is_err());
+}
+
+#[skuld::test]
+fn write_line_says_whether_the_line_was_written() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let file = dir.path().join("a-file");
+    std::fs::write(&file, "x").expect("a regular file to use as a parent");
+
+    assert_eq!(
+        (
+            write_line(&dir.path().join("ok.log"), "the line"),
+            write_line(&file.join("x.log"), "the line")
+        ),
+        (true, false)
+    );
+}
+
+#[skuld::test]
+fn log_destinations_try_the_daemon_log_then_the_default() {
+    let daemon = PathBuf::from("daemon.log");
+    let default = PathBuf::from("default.log");
+
+    assert_eq!(log_destinations(Some(&daemon), default.clone()), vec![daemon, default]);
+}
+
+#[skuld::test]
+fn log_destinations_try_the_default_once_when_there_is_no_daemon_log() {
+    let default = PathBuf::from("default.log");
+
+    assert_eq!(log_destinations(None, default.clone()), vec![default]);
+}
+
+#[skuld::test]
+fn log_destinations_do_not_retry_the_default_when_it_is_the_daemon_log() {
+    let default = PathBuf::from("default.log");
+
+    assert_eq!(log_destinations(Some(&default), default.clone()), vec![default]);
+}
