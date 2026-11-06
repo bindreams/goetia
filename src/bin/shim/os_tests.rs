@@ -12,7 +12,7 @@ use std::os::windows::io::OwnedHandle;
 
 use cosca::identity::{Liveness, Resolved};
 use cosca::{Process, Stdio};
-use goetia::spec::DaemonSpec;
+use goetia::spec::{DaemonFields, DaemonSpec};
 use skuld::temp_dir;
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
 
@@ -231,12 +231,13 @@ fn build_command_makes_a_job_contained_daemon_with_its_cwd_env_and_log(#[fixture
     std::fs::create_dir(&cwd).expect("the daemon's working directory");
     let logs = dir.join("daemon.log");
     let command = ["cmd", "/c", "echo %CD%& echo %GOETIA_TEST_VAR%& echo to-stderr>&2"];
-    let spec = DaemonSpec {
+    let spec = DaemonSpec::new(DaemonFields {
         cwd: Some(cwd.clone()),
         env: BTreeMap::from([("GOETIA_TEST_VAR".to_string(), "from-spec".to_string())]),
         logs: Some(logs.clone()),
         ..daemon_spec::spec(ID, command.map(str::to_string).to_vec())
-    };
+    })
+    .unwrap();
     let fake = FakeGuard::new();
     let mut reap = Reap::default();
 

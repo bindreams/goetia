@@ -8,7 +8,7 @@
 //! most C0 control characters at all, not even as entities. Every user-supplied
 //! string that ends up in a generated artifact — `name`, `command`, `cwd`,
 //! `logs`, every `env` key and value, and `user`'s `name`/`id` — is
-//! rejected here if it contains one.
+//! rejected here if it contains one, by `check_fields`, the one place those rules run.
 //!
 //! **Why `command[0]` is absolutized here and `command[1..]` is not.**
 //! No launcher resolves a path *inside* an argument, so a relative path in
@@ -57,7 +57,7 @@ use super::overrides::Supplied;
 use super::raw::RawSpec;
 use super::user::{AccountId, RawUser, User};
 use super::vars::Vars;
-use super::{DaemonSpec, Id, Kind, Restart, Warning};
+use super::{DaemonFields, DaemonSpec, Id, Kind, Restart, Warning};
 use crate::error::Error;
 
 const MANIFEST_FILE_NAME: &str = "goetia.yaml";
@@ -257,14 +257,10 @@ fn resolve_shape(id: &Id, raw: RawSpec, base_dir: &Path) -> Result<(ShapedSpec, 
     let mut warnings = Vec::new();
 
     let name = raw.name.unwrap_or_else(|| id.as_str().to_string());
-    reject_unemittable(id, "name", &name)?;
 
+    // The empty-path checks run here, before the join: an empty path joined to `base_dir` is
+    // `base_dir`, which `check_fields` would then accept.
     let mut command = raw.command;
-    if let Some(cmd) = &command {
-        for arg in cmd {
-            reject_unemittable(id, "command", arg)?;
-        }
-    }
     if let Some(first) = command.as_mut().and_then(|c| c.first_mut()) {
         reject_empty(id, "command[0]", first)?;
         *first = resolve_path_string(id, "command", first, base_dir, &mut warnings)?;
@@ -281,44 +277,30 @@ fn resolve_shape(id: &Id, raw: RawSpec, base_dir: &Path) -> Result<(ShapedSpec, 
         if interpolate::would_substitution_change(&key) {
             return Err(invalid(id, interpolate::ENV_NAME_MESSAGE));
         }
-        reject_env_key_with_equals(id, &key)?;
-        reject_unemittable(id, "env key", &key)?;
-        reject_empty(id, "env key", &key)?;
-        reject_unemittable(id, &format!("env[{key}]"), &value)?;
         env.insert(key, value);
     }
 
     let user = resolve_user(raw.user);
-    match &user {
-        User::Root => {}
-        User::Name(n) => {
-            reject_unemittable(id, "user.name", n)?;
-            reject_blank(id, "user.name", n)?;
+    if let User::Id(AccountId::Sid(s)) = &user {
+        // Same reason as the `env`-name rule above, and `interpolate::spec` likewise keeps its
+        // own copy. `${S}` trims to `${S}`, never empty, so this and `check_fields`'s blank
+        // check can never both fire on one value.
+        if interpolate::would_substitution_change(s) {
+            return Err(invalid(id, interpolate::USER_ID_MESSAGE));
         }
-        User::Id(AccountId::Sid(s)) => {
-            // Same reason as the `env`-name rule above, and `interpolate::spec` likewise keeps its
-            // own copy. Ordering against `reject_blank` below does not matter:
-            // `${S}` trims to `${S}`, never empty, so the two can never both fire on one value.
-            if interpolate::would_substitution_change(s) {
-                return Err(invalid(id, interpolate::USER_ID_MESSAGE));
-            }
-            reject_unemittable(id, "user.id", s)?;
-            reject_blank(id, "user.id", s)?;
-        }
-        User::Id(AccountId::Uid(_)) => {}
     }
+
+    // Every backend's merged spec runs the field rules, including the non-native ones that never
+    // become a `DaemonSpec`: a newline in `scm`'s env must be caught from Linux too.
+    //
+    // An absent or empty `command` is incomplete, not invalid: a native override may supply it,
+    // and `require_complete` reports the miss with the backend named.
+    let present_command = command.as_deref().filter(|c| !c.is_empty());
+    check_fields(id, &name, present_command, cwd.as_deref(), logs.as_deref(), &env, &user)?;
 
     let restart = shape(id, raw.restart, parse_restart)?;
     let restart_delay = shape(id, raw.restart_delay, parse_restart_delay)?;
     let kind = shape(id, raw.kind, parse_kind)?;
-
-    // `blob::decode` enforces absoluteness only when re-reading an artifact; on the direct
-    // resolve -> generate path of `install`/`show` a regression would be baked into a unit file
-    // unnoticed. `command[0]` is checked in `require_complete`, where a `command` first exists.
-    debug_assert!(
-        cwd.as_deref().is_none_or(Path::is_absolute) && logs.as_deref().is_none_or(Path::is_absolute),
-        "resolve_shape must return absolute paths; got cwd={cwd:?} logs={logs:?}",
-    );
 
     Ok((
         ShapedSpec {
@@ -371,7 +353,8 @@ fn require_complete(shaped: ShapedSpec, backend: Option<BackendKind>) -> Result<
     let command = command.unwrap_or_default();
     reject_empty_command(&id, &command).map_err(|_| missing_command_error(&id, backend))?;
 
-    // See `resolve_shape`'s matching comment.
+    // `command[0]` is absolutized in `resolve_shape`, where a `command` first exists; `check_fields`
+    // does not test it for absoluteness.
     debug_assert!(
         Path::new(&command[0]).is_absolute(),
         "resolve must return an absolute command[0]; got {:?}",
@@ -394,7 +377,9 @@ fn require_complete(shaped: ShapedSpec, backend: Option<BackendKind>) -> Result<
         Shaped::Absent => Kind::Simple,
     };
 
-    Ok(DaemonSpec {
+    // `resolve_shape` already ran the field rules on these values, so this cannot fail on them;
+    // it is what makes the result a `DaemonSpec`.
+    DaemonSpec::new(DaemonFields {
         id,
         name,
         command,
@@ -484,7 +469,6 @@ fn resolve_optional_path(
 ) -> Result<Option<PathBuf>, Error> {
     match raw {
         Some(s) => {
-            reject_unemittable(id, field, &s)?;
             reject_empty(id, field, &s)?;
             Ok(Some(PathBuf::from(resolve_path_string(
                 id, field, &s, base_dir, warnings,
@@ -684,6 +668,61 @@ fn normalize(path: &Path) -> PathBuf {
     }
 }
 
+/// The field rules, over the values of one daemon: the one place they run. Called by
+/// [`DaemonSpec::new`] and by [`resolve_shape`] for every backend's merged spec.
+///
+/// `command` is `None` while a manifest has not supplied one yet; `DaemonSpec::new` always passes
+/// `Some`, so an empty `command` is refused there. Paths are checked as strings through
+/// `to_string_lossy`, which keeps a control character and leaves an empty path empty.
+pub(super) fn check_fields(
+    id: &Id,
+    name: &str,
+    command: Option<&[String]>,
+    cwd: Option<&Path>,
+    logs: Option<&Path>,
+    env: &BTreeMap<String, String>,
+    user: &User,
+) -> Result<(), Error> {
+    reject_unemittable(id, "name", name)?;
+
+    if let Some(command) = command {
+        reject_empty_command(id, command)?;
+        for arg in command {
+            reject_unemittable(id, "command", arg)?;
+        }
+        reject_empty(id, "command[0]", &command[0])?;
+    }
+
+    for (field, path) in [("cwd", cwd), ("logs", logs)] {
+        if let Some(path) = path {
+            let text = path.to_string_lossy();
+            reject_unemittable(id, field, &text)?;
+            reject_empty(id, field, &text)?;
+            reject_relative_path(id, field, path)?;
+        }
+    }
+
+    for (key, value) in env {
+        reject_env_key_with_equals(id, key)?;
+        reject_unemittable(id, "env key", key)?;
+        reject_empty(id, "env key", key)?;
+        reject_unemittable(id, &format!("env[{key}]"), value)?;
+    }
+
+    match user {
+        User::Root | User::Id(AccountId::Uid(_)) => {}
+        User::Name(n) => {
+            reject_unemittable(id, "user.name", n)?;
+            reject_blank(id, "user.name", n)?;
+        }
+        User::Id(AccountId::Sid(s)) => {
+            reject_unemittable(id, "user.id", s)?;
+            reject_blank(id, "user.id", s)?;
+        }
+    }
+    Ok(())
+}
+
 /// Every gate a user-supplied string must pass before it can be emitted into any artifact. One
 /// entry point, so a field added later cannot pick up half the checks. Each defect they catch
 /// would be silent if no gate did.
@@ -692,16 +731,13 @@ fn normalize(path: &Path) -> PathBuf {
 /// directive have no escaping, and a control character (above all a newline) can terminate one
 /// directive and start another. XML 1.0 cannot represent most C0 control characters at all, so
 /// this also keeps the launchd generator from emitting an unparseable plist.
-///
-/// `pub(crate)`: also called by `blob::decode`, which re-runs these against a spec deserialized
-/// from an untrusted artifact rather than trusting `DaemonSpec`'s `pub` fields.
-pub(crate) fn reject_unemittable(id: &Id, field: &str, value: &str) -> Result<(), Error> {
+fn reject_unemittable(id: &Id, field: &str, value: &str) -> Result<(), Error> {
     reject_control_chars(id, field, value)?;
     reject_trailing_backslash(id, field, value)?;
     Ok(())
 }
 
-pub(crate) fn reject_control_chars(id: &Id, field: &str, value: &str) -> Result<(), Error> {
+fn reject_control_chars(id: &Id, field: &str, value: &str) -> Result<(), Error> {
     if value.chars().any(|c| c.is_control()) {
         return Err(invalid(
             id,
@@ -734,9 +770,7 @@ fn is_xml_noncharacter(c: char) -> bool {
 /// boundary: a `name` ending in `\` can swallow the `User=` directive and
 /// silently run the daemon as root. Interior backslashes must stay allowed,
 /// or ordinary Windows paths become unexpressible.
-///
-/// `pub(crate)`: see `reject_control_chars`.
-pub(crate) fn reject_trailing_backslash(id: &Id, field: &str, value: &str) -> Result<(), Error> {
+fn reject_trailing_backslash(id: &Id, field: &str, value: &str) -> Result<(), Error> {
     let trailing = value.len() - value.trim_end_matches('\\').len();
     if trailing % 2 == 1 {
         return Err(invalid(
@@ -747,9 +781,8 @@ pub(crate) fn reject_trailing_backslash(id: &Id, field: &str, value: &str) -> Re
     Ok(())
 }
 
-/// `command` must name at least one argv entry. `pub(crate)`: see
-/// `reject_control_chars`.
-pub(crate) fn reject_empty_command(id: &Id, command: &[String]) -> Result<(), Error> {
+/// `command` must name at least one argv entry.
+fn reject_empty_command(id: &Id, command: &[String]) -> Result<(), Error> {
     if command.is_empty() {
         return Err(invalid(id, "command must not be empty"));
     }
@@ -757,14 +790,14 @@ pub(crate) fn reject_empty_command(id: &Id, command: &[String]) -> Result<(), Er
 }
 
 /// Fields where the empty string is never meaningful and is silently
-/// dangerous. `pub(crate)`: also called by `blob::decode`.
+/// dangerous.
 ///
 /// Applied to `command[0]`, `cwd` and `logs` when present, and every `env` key: an empty one
 /// fails to resolve or, for `command[0]`, would silently resolve to the manifest directory.
 /// `user.name` and `user.id` need the stronger [`reject_blank`]. Deliberately **not** applied
 /// to `name` (an empty `Description=` is harmless), `env` values (`FOO=` is a normal assignment)
 /// or `command[1..]` (an empty argv element is legitimate and every generator quotes it).
-pub(crate) fn reject_empty(id: &Id, field: &str, value: &str) -> Result<(), Error> {
+fn reject_empty(id: &Id, field: &str, value: &str) -> Result<(), Error> {
     if value.is_empty() {
         return Err(invalid(id, &format!("field `{field}` must not be empty")));
     }
@@ -784,12 +817,12 @@ pub(crate) fn reject_empty(id: &Id, field: &str, value: &str) -> Result<(), Erro
 /// - Whether an `env` key may contain a space at all is a separate question; only its
 ///   *emptiness* is checked, via [`reject_empty`].
 ///
-/// `pub(crate)`: also called by `blob::decode`. An installed artifact whose blob carries an empty
-/// or whitespace-only `user.name` decodes as `Installed::OursUnusable`, not silently as root.
+/// An installed artifact whose blob carries an empty or whitespace-only `user.name` decodes as
+/// `Installed::OursUnusable`, not silently as root.
 ///
 /// This is the only gate between an authored empty name and `canonical_account("")`, which maps
 /// it to `LocalSystem` on Windows; `windows_builtin`'s `""` row is the other half (see there).
-pub(crate) fn reject_blank(id: &Id, field: &str, value: &str) -> Result<(), Error> {
+fn reject_blank(id: &Id, field: &str, value: &str) -> Result<(), Error> {
     if value.trim().is_empty() {
         return Err(invalid(id, &format!("field `{field}` must not be empty")));
     }
@@ -798,8 +831,7 @@ pub(crate) fn reject_blank(id: &Id, field: &str, value: &str) -> Result<(), Erro
 
 /// An env key containing `=` would make a `KEY=VALUE` env-file line or a
 /// systemd `Environment=` directive ambiguous about where the key ends.
-/// `pub(crate)`: see `reject_control_chars`.
-pub(crate) fn reject_env_key_with_equals(id: &Id, key: &str) -> Result<(), Error> {
+fn reject_env_key_with_equals(id: &Id, key: &str) -> Result<(), Error> {
     if key.contains('=') {
         return Err(invalid(id, &format!("env key `{key}` must not contain `=`")));
     }
@@ -807,8 +839,8 @@ pub(crate) fn reject_env_key_with_equals(id: &Id, key: &str) -> Result<(), Error
 }
 
 /// `cwd` and `logs` are always resolved to absolute paths here, so a relative one in a
-/// `DaemonSpec` is already corrupt. `pub(crate)`: see `reject_control_chars`.
-pub(crate) fn reject_relative_path(id: &Id, field: &str, path: &Path) -> Result<(), Error> {
+/// `DaemonSpec` is already corrupt.
+fn reject_relative_path(id: &Id, field: &str, path: &Path) -> Result<(), Error> {
     if !path.is_absolute() {
         return Err(invalid(
             id,

@@ -95,7 +95,7 @@ impl WorldReadableExe {
 /// listens (see `fixture.rs`'s `connect`), and no conformance scenario reads
 /// the report.
 pub fn conformance_mk(id: &str) -> DaemonSpec {
-    support::spec(id, fixture_command(id, 1, 1, "plain"))
+    DaemonSpec::new(support::spec(id, fixture_command(id, 1, 1, "plain"))).unwrap()
 }
 
 // Account SID lookup ==================================================================================================

@@ -3,22 +3,22 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::*;
+use crate::spec::DaemonFields;
 use crate::spec::{Kind, Restart};
 
-// `DaemonSpec` is built literally here, never via `resolve()`: a resolved
-// path renders with `\` on Windows and `/` elsewhere, which would make
-// these assertions platform-dependent. Every path below is a single
-// component for the same reason.
+// `DaemonSpec` is built through `DaemonSpec::new`, never `resolve()`. The paths are absolute
+// because `new` requires it; no assertion reads them, so their platform spelling does not matter.
 fn spec_fixture() -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         name: "FRP tunnel client".to_owned(),
-        cwd: Some(PathBuf::from("app")),
+        cwd: Some(std::env::temp_dir().join("app")),
         env: BTreeMap::from([("FRP_LOG_LEVEL".to_owned(), "info".to_owned())]),
         restart: Restart::OnFailure,
-        logs: Some(PathBuf::from("frpc.log")),
+        logs: Some(std::env::temp_dir().join("frpc.log")),
         kind: Kind::Simple,
         ..DaemonSpec::for_test("frpc", vec!["frpc".to_owned(), "-c".to_owned(), "frpc.toml".to_owned()])
-    }
+    })
+    .unwrap()
 }
 
 #[skuld::test]
@@ -61,8 +61,9 @@ WantedBy=multi-user.target
 #[skuld::test]
 fn spec_diff_names_source_keys() {
     let was = spec_fixture();
-    let mut now = spec_fixture();
+    let mut now = spec_fixture().into_fields();
     now.restart_delay = Some(Duration::from_secs(2));
+    let now = DaemonSpec::new(now).unwrap();
 
     let diff = spec_diff(&was, &now);
 
@@ -96,8 +97,9 @@ fn render_yaml_is_key_sorted_and_deterministic() {
 
 #[skuld::test]
 fn render_yaml_uses_source_key_names() {
-    let mut spec = spec_fixture();
+    let mut spec = spec_fixture().into_fields();
     spec.restart_delay = Some(Duration::from_secs(2));
+    let spec = DaemonSpec::new(spec).unwrap();
 
     let rendered = render_yaml(&spec);
 

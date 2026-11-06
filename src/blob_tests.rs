@@ -17,7 +17,7 @@ fn abs(p: &str) -> PathBuf {
 }
 
 fn full_spec() -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         id: Id::try_from("frpc").unwrap(),
         name: "Frpc Tunnel".to_string(),
         command: vec!["frpc".to_string(), "-c".to_string(), "frpc.toml".to_string()],
@@ -31,11 +31,12 @@ fn full_spec() -> DaemonSpec {
         restart_delay: Some(Duration::new(2, 500_000_000)),
         logs: Some(abs("var/log/frpc.log")),
         kind: Kind::Managed,
-    }
+    })
+    .unwrap()
 }
 
 fn minimal_spec() -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         id: Id::try_from("frpc").unwrap(),
         name: "frpc".to_string(),
         command: vec!["frpc".to_string()],
@@ -46,14 +47,15 @@ fn minimal_spec() -> DaemonSpec {
         restart_delay: None,
         logs: None,
         kind: Kind::Simple,
-    }
+    })
+    .unwrap()
 }
 
 /// A spec with no `PathBuf` fields, so its wire bytes render identically
 /// on all three CI platforms (`PathBuf`'s `Display`/`to_string_lossy`
 /// differs by separator). Used only by `blob_wire_names_are_pinned`.
 fn golden_spec() -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         id: Id::try_from("frpc").unwrap(),
         name: "Frpc Tunnel".to_string(),
         command: vec!["frpc".to_string(), "-c".to_string(), "frpc.toml".to_string()],
@@ -67,7 +69,8 @@ fn golden_spec() -> DaemonSpec {
         restart_delay: Some(Duration::new(2, 500_000_000)),
         logs: None,
         kind: Kind::Managed,
-    }
+    })
+    .unwrap()
 }
 
 fn base_wire_spec() -> WireSpec {
@@ -109,8 +112,9 @@ fn encode_decode_round_trips() {
         )),
     ];
     for user in users {
-        let mut spec = minimal_spec();
+        let mut spec = minimal_spec().into_fields();
         spec.user = user.clone();
+        let spec = DaemonSpec::new(spec).unwrap();
         let blob = decode(&encode(&spec)).expect("an encoded valid spec should decode");
         assert_eq!(blob.spec.user, user);
     }
