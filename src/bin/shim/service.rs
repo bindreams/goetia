@@ -23,7 +23,7 @@ use windows_sys::Win32::System::Services::{
 };
 
 use crate::logging::Log;
-use crate::os::{Real, Spawned, spawn_error_code};
+use crate::os::{Os, Real, Spawned, spawn_error_code};
 use crate::stop_bus::{StopBus, Supervisor, Teardown, WaitOutcome, Waiter, kill_for_stop, terminate_exited_tree};
 
 // Entry ===============================================================================================================
@@ -344,7 +344,7 @@ fn launch(spec: &DaemonSpec, supervisor: &Supervisor, id: &str) -> Result<(Arc<d
             return Err(Reported::shim_failure(e.raw_os_error()));
         }
     };
-    match supervisor.os.spawn(build_command(spec, log, id)) {
+    match supervisor.os.spawn(build_command(spec, &*supervisor.os, log, id)) {
         Ok(child) => require_job_object(child, spec, log, id).map(|child| (Arc::from(child), waiter)),
         Err(e) => {
             log.failure(id, &spawn_failed(&spec.command, &e));
@@ -446,8 +446,9 @@ fn stdio_set<T, E: std::fmt::Display>(log: &Log, id: &str, assigned: Result<T, E
 }
 
 /// Build the (unspawned) command for `spec`: argv, cwd, env, Job Object
-/// containment, and stdout+stderr merged into the daemon's log file.
-pub(crate) fn build_command(spec: &DaemonSpec, log: &Log, id: &str) -> cosca::Command {
+/// containment, and stdout+stderr merged into the daemon's log file, which `os` opens. `log` only
+/// reports a failed open.
+pub(crate) fn build_command(spec: &DaemonSpec, os: &dyn Os, log: &Log, id: &str) -> cosca::Command {
     let mut cmd = cosca::run(spec.command.iter().cloned());
     if let Some(cwd) = &spec.cwd {
         cmd.current_dir(cwd.clone());
@@ -456,7 +457,7 @@ pub(crate) fn build_command(spec: &DaemonSpec, log: &Log, id: &str) -> cosca::Co
     cmd.contain();
 
     let log_path = log.daemon_log_path(id, spec.logs.as_deref());
-    match log.open_log(&log_path) {
+    match os.open_log(&log_path) {
         Ok(file) => {
             // Merges are resolved in a second pass at spawn time (`cosca`'s
             // `resolve_stdio`), not by `Command::fd` consulting whatever is

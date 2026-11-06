@@ -1,5 +1,6 @@
-//! A test OS: tables of stated replies, with no process or file system behind them. It models no
-//! operating system; the rules it encodes are that a successful kill ends the process it killed,
+//! A test OS: tables of stated replies, with no process behind them and no named file: `open_log`
+//! returns an anonymous [`tempfile::tempfile`], which is real because a child needs a real handle
+//! to redirect its output into. It models no operating system; the rules it encodes are that a successful kill ends the process it killed,
 //! and that a process keeps the status of its first ending.
 //!
 //! A test states the replies it expects, in the order each operation will be called. A call with no
@@ -31,7 +32,7 @@ pub(crate) const KILL_REFUSED: &str = "the kill was refused (fake)";
 pub(crate) const WAIT_FAILED: &str = "the wait failed (fake)";
 /// The error a failing append fails with.
 pub(crate) const APPEND_FAILED: &str = "the append failed (fake)";
-/// The error a failing [`Channels::open_log`] fails with.
+/// The error a failing [`Os::open_log`] fails with.
 pub(crate) const OPEN_LOG_FAILED: &str = "the log could not be opened (fake)";
 /// The default log directory of [`Fake::log`]. The `Fake` writes no file there.
 const FAKE_LOGS: &str = "fake-logs";
@@ -303,8 +304,8 @@ enum ThreadEnd {
 struct State {
     spawns: VecDeque<SpawnReply>,
     threads: VecDeque<ThreadReply>,
-    append_failures: Vec<PathBuf>,
     open_log_failures: Vec<PathBuf>,
+    append_failures: Vec<PathBuf>,
     calls: BTreeMap<Op, usize>,
     channel_calls: Vec<ChannelCall>,
     processes: Vec<Arc<Proc>>,
@@ -409,15 +410,15 @@ impl Fake {
         lock(&self.shared.state).threads.push_back(ThreadReply::Refuses(error));
     }
 
-    /// The next `append` to `path` fails with [`APPEND_FAILED`].
-    pub(crate) fn will_fail_append(&self, path: &Path) {
-        lock(&self.shared.state).append_failures.push(path.to_path_buf());
-    }
-
     /// The next `open_log` of `path` fails with [`OPEN_LOG_FAILED`]. Any other path opens a
     /// temporary file that is deleted when closed.
     pub(crate) fn will_fail_open_log(&self, path: &Path) {
         lock(&self.shared.state).open_log_failures.push(path.to_path_buf());
+    }
+
+    /// The next `append` to `path` fails with [`APPEND_FAILED`].
+    pub(crate) fn will_fail_append(&self, path: &Path) {
+        lock(&self.shared.state).append_failures.push(path.to_path_buf());
     }
 
     // Records ---------------------------------------------------------------------------------------------------------
@@ -596,6 +597,21 @@ impl Os for Fake {
         }
         spawned
     }
+
+    fn open_log(&self, path: &Path) -> io::Result<File> {
+        let mut state = lock(&self.shared.state);
+        *state.calls.entry(Op::OpenLog).or_default() += 1;
+        match state.open_log_failures.iter().position(|failing| failing == path) {
+            Some(i) => {
+                state.open_log_failures.remove(i);
+                Err(io::Error::other(OPEN_LOG_FAILED))
+            }
+            None => {
+                drop(state);
+                tempfile::tempfile()
+            }
+        }
+    }
 }
 
 /// Held for the whole life of a made thread's closure, so its drop runs after every call the
@@ -636,21 +652,6 @@ impl Channels for Fake {
             Err(io::Error::other(APPEND_FAILED))
         } else {
             Ok(())
-        }
-    }
-
-    fn open_log(&self, path: &Path) -> io::Result<File> {
-        let mut state = lock(&self.shared.state);
-        *state.calls.entry(Op::OpenLog).or_default() += 1;
-        match state.open_log_failures.iter().position(|failing| failing == path) {
-            Some(i) => {
-                state.open_log_failures.remove(i);
-                Err(io::Error::other(OPEN_LOG_FAILED))
-            }
-            None => {
-                drop(state);
-                tempfile::tempfile()
-            }
         }
     }
 

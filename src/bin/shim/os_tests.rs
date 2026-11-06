@@ -7,9 +7,8 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufRead as _, BufReader};
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::windows::io::OwnedHandle;
-use std::sync::Arc;
 
 use cosca::identity::{Liveness, Resolved};
 use cosca::{Process, Stdio};
@@ -18,7 +17,7 @@ use skuld::temp_dir;
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
 
 use super::*;
-use crate::logging::Log;
+use crate::os::fake::FakeGuard;
 use crate::service::build_command;
 use crate::test_support::{daemon_spec, not_found};
 
@@ -101,19 +100,31 @@ fn kill_ends_a_real_daemon() {
     assert!(!status.success(), "a killed daemon exited cleanly");
 }
 
-/// Dropping the `Spawned` would kill the daemon's job and wait for it. A detached one leaves the
-/// daemon running; the test then ends it through the `Reap`.
+/// Dropping the `Spawned` would kill the daemon's job. The daemon echoes its stdin, so a line
+/// written after the detach and read back proves it still ran then: a daemon the job had ended
+/// closes its stdout, and the read sees end of file. The test then ends it through the `Reap`.
 #[skuld::test]
 fn detach_leaves_the_daemon_running_after_its_handle_is_gone() {
     let mut reap = Reap::default();
-    let child = powershell("Start-Sleep -Seconds 300")
-        .spawn()
-        .expect("spawn the daemon");
-    let daemon = reap.hold_detached(Process::from_id(child.id()));
+    let mut cmd = powershell("while (($l = [Console]::In.ReadLine()) -ne $null) { [Console]::Out.WriteLine($l) }");
+    cmd.stdin(Stdio::pipe()).expect("pipe the daemon's stdin");
+    cmd.stdout(Stdio::pipe()).expect("pipe the daemon's stdout");
+    let mut child = cmd.spawn().expect("spawn the daemon");
+    reap.hold_detached(Process::from_id(child.id()));
+    let mut stdin = child.stdin().expect("the daemon's stdin");
+    let mut stdout = BufReader::new(child.stdout().expect("the daemon's stdout"));
 
     Spawned::detach(Box::new(child));
 
-    assert_eq!(daemon.is_alive(), Liveness::Alive);
+    stdin
+        .write_all(
+            b"ping
+",
+        )
+        .expect("write to the daemon after the detach");
+    let mut echo = String::new();
+    stdout.read_line(&mut echo).expect("read the daemon's echo");
+    assert_eq!(echo.trim_end(), "ping", "the daemon did not outlive its handle");
 }
 
 /// The supervisor asks for the status twice: the waiter's wait, then the one that reads the code.
@@ -208,21 +219,6 @@ fn a_refused_spawn_without_a_code_that_is_not_found_is_told_to_scm_as_file_not_f
 
 const ID: &str = "goetia-shim-os-test";
 
-/// `Real`'s files and no Event Log: a unit test never writes the real Event Log.
-struct FilesOnly;
-
-impl Channels for FilesOnly {
-    fn append(&self, path: &Path, line: &str) -> io::Result<()> {
-        Real.append(path, line)
-    }
-
-    fn open_log(&self, path: &Path) -> io::Result<File> {
-        Real.open_log(path)
-    }
-
-    fn event_log(&self, _severity: Severity, _line: &str) {}
-}
-
 /// What `build_command` sets up, observed from a real daemon spawned through `Real`: the Job Object
 /// `StopBus` kills the tree through, stdout and stderr both in `spec.logs`, `cwd` and `env`. The
 /// daemon prints its working directory and the variable, writes a line to stderr and exits. The
@@ -240,15 +236,12 @@ fn build_command_makes_a_job_contained_daemon_with_its_cwd_env_and_log(#[fixture
         logs: Some(logs.clone()),
         ..daemon_spec::spec(ID, command.map(str::to_string).to_vec())
     };
+    let fake = FakeGuard::new();
     let mut reap = Reap::default();
 
     let daemon = reap.hold(
-        Real.spawn(build_command(
-            &spec,
-            &Log::new(Arc::new(FilesOnly), dir.to_path_buf()),
-            ID,
-        ))
-        .expect("spawn the daemon"),
+        Real.spawn(build_command(&spec, &Real, &fake.log(), ID))
+            .expect("spawn the daemon"),
     );
     let contained = daemon.containment();
     daemon.wait().expect("the daemon exits");
@@ -311,6 +304,20 @@ fn append_fails_and_writes_nothing_when_the_path_cannot_be_opened(#[fixture(temp
     let result = Real.append(&file.join("x.log"), "lost");
 
     assert!(result.is_err());
+    assert_eq!(std::fs::read_to_string(&file).expect("the file is untouched"), "x");
+}
+
+#[skuld::test]
+fn open_log_fails_with_the_os_reason_when_the_path_cannot_be_opened(#[fixture(temp_dir)] dir: &Path) {
+    let file = dir.join("a-file");
+    std::fs::write(&file, "x").expect("a regular file to use as a parent");
+
+    // A directory cannot be created under a regular file.
+    let refused = Real
+        .open_log(&file.join("daemon.log"))
+        .expect_err("a log under a regular file");
+
+    assert!(refused.raw_os_error().is_some(), "no OS reason: {refused:?}");
     assert_eq!(std::fs::read_to_string(&file).expect("the file is untouched"), "x");
 }
 

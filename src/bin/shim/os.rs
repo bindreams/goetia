@@ -22,6 +22,10 @@ pub(crate) trait Os: Send + Sync {
 
     /// Run `f` on a new thread named `name`; the OS may refuse.
     fn thread(&self, name: &str, f: Box<dyn FnOnce() + Send>) -> io::Result<JoinHandle<()>>;
+
+    /// Open the file at `path` for appending, creating missing parent directories. It is the
+    /// daemon's log: the daemon's output is redirected into it.
+    fn open_log(&self, path: &Path) -> io::Result<File>;
 }
 
 /// A spawned daemon. Dropping it kills its tree and waits for it, as `cosca::Child` does; see
@@ -58,10 +62,6 @@ pub(crate) trait Channels: Send + Sync {
     /// split it.
     fn append(&self, path: &Path, line: &str) -> io::Result<()>;
 
-    /// Open the file at `path` for appending, creating missing parent directories. It is the
-    /// daemon's log: the daemon's output is redirected into it.
-    fn open_log(&self, path: &Path) -> io::Result<File>;
-
     /// Report `line` to the Windows Event Log as `severity`. Best-effort: this is itself a
     /// failure-reporting path.
     fn event_log(&self, severity: Severity, line: &str);
@@ -77,6 +77,10 @@ impl Os for Real {
 
     fn thread(&self, name: &str, f: Box<dyn FnOnce() + Send>) -> io::Result<JoinHandle<()>> {
         std::thread::Builder::new().name(name.to_string()).spawn(f)
+    }
+
+    fn open_log(&self, path: &Path) -> io::Result<File> {
+        open_append(path)
     }
 }
 
@@ -105,10 +109,6 @@ impl Spawned for cosca::Child {
 impl Channels for Real {
     fn append(&self, path: &Path, line: &str) -> io::Result<()> {
         append_line(&mut open_append(path)?, line)
-    }
-
-    fn open_log(&self, path: &Path) -> io::Result<File> {
-        open_append(path)
     }
 
     fn event_log(&self, severity: Severity, line: &str) {
