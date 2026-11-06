@@ -11,6 +11,8 @@
 //! before it can say why through a file at all; the event log's default ACL is far more
 //! permissive, so it is the more likely of the two to still work exactly when the file is not.
 
+use std::fs::File;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -49,6 +51,11 @@ impl Log {
     /// The daemon's log: `logs` from its spec, or [`Log::default_log_path`] when unset.
     pub(crate) fn daemon_log_path(&self, id: &str, logs: Option<&Path>) -> PathBuf {
         logs.map_or_else(|| self.default_log_path(id), Path::to_path_buf)
+    }
+
+    /// Open the daemon's log at `path` for appending, through the channels.
+    pub(crate) fn open_log(&self, path: &Path) -> io::Result<File> {
+        self.channels.open_log(path)
     }
 
     /// From now on, failures go to `path` (see [`Log::daemon_log_path`]) instead of the default.

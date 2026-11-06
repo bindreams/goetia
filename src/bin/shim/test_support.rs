@@ -10,10 +10,6 @@ use crate::stop_bus::StopBus;
 #[path = "../../../tests/support/daemon_spec.rs"]
 pub(crate) mod daemon_spec;
 
-// The retrying removal the integration suites use for their temporary files.
-#[path = "../../../tests/support/cleanup.rs"]
-pub(crate) mod cleanup;
-
 /// What a spawn of a bare binary name not found on `PATH` fails with: `Io(NotFound)` and no OS
 /// error code (`os_tests` pins it against `Real`, with the absolute-path case, which carries
 /// `ERROR_FILE_NOT_FOUND` from `CreateProcessW`).

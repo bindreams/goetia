@@ -23,7 +23,7 @@ use windows_sys::Win32::System::Services::{
 };
 
 use crate::logging::Log;
-use crate::os::{Real, Spawned, open_append, spawn_error_code};
+use crate::os::{Real, Spawned, spawn_error_code};
 use crate::stop_bus::{StopBus, Teardown, WaitOutcome, Waiter, kill_for_stop, terminate_exited_tree};
 
 // Entry ===============================================================================================================
@@ -456,7 +456,7 @@ pub(crate) fn build_command(spec: &DaemonSpec, log: &Log, id: &str) -> cosca::Co
     cmd.contain();
 
     let log_path = log.daemon_log_path(id, spec.logs.as_deref());
-    match open_append(&log_path) {
+    match log.open_log(&log_path) {
         Ok(file) => {
             // Merges are resolved in a second pass at spawn time (`cosca`'s
             // `resolve_stdio`), not by `Command::fd` consulting whatever is

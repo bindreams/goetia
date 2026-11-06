@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead as _, BufReader};
 use std::os::windows::io::OwnedHandle;
+use std::sync::Arc;
 
 use cosca::identity::{Liveness, Resolved};
 use cosca::{Process, Stdio};
@@ -17,7 +18,7 @@ use skuld::temp_dir;
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
 
 use super::*;
-use crate::os::fake::FakeGuard;
+use crate::logging::Log;
 use crate::service::build_command;
 use crate::test_support::{daemon_spec, not_found};
 
@@ -166,6 +167,21 @@ fn a_refused_spawn_without_a_code_that_is_not_found_is_told_to_scm_as_file_not_f
 
 const ID: &str = "goetia-shim-os-test";
 
+/// `Real`'s files and no Event Log: a unit test never writes the real Event Log.
+struct FilesOnly;
+
+impl Channels for FilesOnly {
+    fn append(&self, path: &Path, line: &str) -> io::Result<()> {
+        Real.append(path, line)
+    }
+
+    fn open_log(&self, path: &Path) -> io::Result<File> {
+        Real.open_log(path)
+    }
+
+    fn event_log(&self, _severity: Severity, _line: &str) {}
+}
+
 /// What `build_command` sets up, observed from a real daemon spawned through `Real`: the Job Object
 /// `StopBus` kills the tree through, stdout and stderr both in `spec.logs`, `cwd` and `env`. The
 /// daemon prints its working directory and the variable, writes a line to stderr and exits. The
@@ -173,7 +189,6 @@ const ID: &str = "goetia-shim-os-test";
 #[skuld::test]
 fn build_command_makes_a_job_contained_daemon_with_its_cwd_env_and_log(#[fixture(temp_dir)] dir: &Path) {
     const CWD_LEAF: &str = "goetia-cwd-probe";
-    let fake = FakeGuard::new();
     let cwd = dir.join(CWD_LEAF);
     std::fs::create_dir(&cwd).expect("the daemon's working directory");
     let logs = dir.join("daemon.log");
@@ -187,8 +202,12 @@ fn build_command_makes_a_job_contained_daemon_with_its_cwd_env_and_log(#[fixture
     let mut reap = Reap::default();
 
     let daemon = reap.hold(
-        Real.spawn(build_command(&spec, &fake.log(), ID))
-            .expect("spawn the daemon"),
+        Real.spawn(build_command(
+            &spec,
+            &Log::new(Arc::new(FilesOnly), dir.to_path_buf()),
+            ID,
+        ))
+        .expect("spawn the daemon"),
     );
     let contained = daemon.containment();
     daemon.wait().expect("the daemon exits");

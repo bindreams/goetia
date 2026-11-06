@@ -9,6 +9,7 @@
 //! still fails the test.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::fs::File;
 use std::io;
 use std::ops::Deref;
 use std::os::windows::process::ExitStatusExt as _;
@@ -21,7 +22,6 @@ use cosca::Containment;
 
 use super::{Channels, Os, Severity, Spawned};
 use crate::logging::Log;
-use crate::test_support::cleanup::DirGuard;
 
 /// The error a refused thread fails with.
 pub(crate) const NO_THREAD: &str = "no thread may be made (fake)";
@@ -31,6 +31,10 @@ pub(crate) const KILL_REFUSED: &str = "the kill was refused (fake)";
 pub(crate) const WAIT_FAILED: &str = "the wait failed (fake)";
 /// The error a failing append fails with.
 pub(crate) const APPEND_FAILED: &str = "the append failed (fake)";
+/// The error a failing [`Channels::open_log`] fails with.
+pub(crate) const OPEN_LOG_FAILED: &str = "the log could not be opened (fake)";
+/// The default log directory of [`Fake::log`]. The `Fake` writes no file there.
+const FAKE_LOGS: &str = "fake-logs";
 
 /// Poison is recovered from: a panicking thread must not make every later call on the `Fake` panic.
 /// Nothing here panics with a lock held.
@@ -43,6 +47,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub(crate) enum Op {
     Spawn,
     KillTree,
+    OpenLog,
 }
 
 /// What a [`Spawned::wait`] does.
@@ -294,6 +299,7 @@ struct State {
     /// `true` allows the thread, `false` refuses it.
     threads: VecDeque<bool>,
     append_failures: Vec<PathBuf>,
+    open_log_failures: Vec<PathBuf>,
     calls: BTreeMap<Op, usize>,
     channel_calls: Vec<ChannelCall>,
     processes: Vec<Arc<Proc>>,
@@ -305,9 +311,6 @@ struct State {
 struct Shared {
     state: Mutex<State>,
     thread_ended: Condvar,
-    /// The default log directory of the `Fake`'s `Log`: inside the `FakeGuard`'s temporary directory,
-    /// because `build_command` really opens `Log::daemon_log_path`.
-    logs_dir: PathBuf,
 }
 
 impl Shared {
@@ -328,26 +331,17 @@ pub(crate) struct Fake {
 /// [`Fake`] says went unstated or unread, unless the test is already panicking.
 pub(crate) struct FakeGuard {
     fake: Fake,
-    /// Removed with the guard, whatever the test did in it.
-    _dir: DirGuard,
 }
 
 impl FakeGuard {
     pub(crate) fn new() -> FakeGuard {
-        let dir = DirGuard::new(
-            tempfile::tempdir()
-                .expect("a temporary directory for the Fake's log files")
-                .keep(),
-        );
         FakeGuard {
             fake: Fake {
                 shared: Arc::new(Shared {
                     state: Mutex::new(State::default()),
                     thread_ended: Condvar::new(),
-                    logs_dir: dir.path().join("logs"),
                 }),
             },
-            _dir: dir,
         }
     }
 }
@@ -381,10 +375,9 @@ impl Fake {
         Arc::new(self.clone())
     }
 
-    /// A `Log` over this `Fake`'s channels, whose default log directory is inside the
-    /// [`FakeGuard`]'s temporary directory. The channels write no file; `build_command` does.
+    /// A `Log` over this `Fake`'s channels.
     pub(crate) fn log(&self) -> Arc<Log> {
-        Arc::new(Log::new(self.channels(), self.shared.logs_dir.clone()))
+        Arc::new(Log::new(self.channels(), PathBuf::from(FAKE_LOGS)))
     }
 
     // Tables ----------------------------------------------------------------------------------------------------------
@@ -413,6 +406,12 @@ impl Fake {
     /// The next `append` to `path` fails with [`APPEND_FAILED`].
     pub(crate) fn will_fail_append(&self, path: &Path) {
         lock(&self.shared.state).append_failures.push(path.to_path_buf());
+    }
+
+    /// The next `open_log` of `path` fails with [`OPEN_LOG_FAILED`]. Any other path opens a
+    /// temporary file that is deleted when closed.
+    pub(crate) fn will_fail_open_log(&self, path: &Path) {
+        lock(&self.shared.state).open_log_failures.push(path.to_path_buf());
     }
 
     // Records ---------------------------------------------------------------------------------------------------------
@@ -498,6 +497,12 @@ impl Fake {
                 problems.push(format!(
                     "stated append failures never used: {:?}",
                     state.append_failures
+                ));
+            }
+            if !state.open_log_failures.is_empty() {
+                problems.push(format!(
+                    "stated open_log failures never used: {:?}",
+                    state.open_log_failures
                 ));
             }
             let unread: Vec<&ChannelCall> = state
@@ -625,6 +630,21 @@ impl Channels for Fake {
             Err(io::Error::other(APPEND_FAILED))
         } else {
             Ok(())
+        }
+    }
+
+    fn open_log(&self, path: &Path) -> io::Result<File> {
+        let mut state = lock(&self.shared.state);
+        *state.calls.entry(Op::OpenLog).or_default() += 1;
+        match state.open_log_failures.iter().position(|failing| failing == path) {
+            Some(i) => {
+                state.open_log_failures.remove(i);
+                Err(io::Error::other(OPEN_LOG_FAILED))
+            }
+            None => {
+                drop(state);
+                tempfile::tempfile()
+            }
         }
     }
 

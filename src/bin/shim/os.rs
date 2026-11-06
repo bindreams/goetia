@@ -59,6 +59,10 @@ pub(crate) trait Channels: Send + Sync {
     /// split it.
     fn append(&self, path: &Path, line: &str) -> io::Result<()>;
 
+    /// Open the file at `path` for appending, creating missing parent directories. It is the
+    /// daemon's log: the daemon's output is redirected into it.
+    fn open_log(&self, path: &Path) -> io::Result<File>;
+
     /// Report `line` to the Windows Event Log as `severity`. Best-effort: this is itself a
     /// failure-reporting path, and it has no failure to report.
     fn event_log(&self, severity: Severity, line: &str);
@@ -104,6 +108,10 @@ impl Channels for Real {
         append_line(&mut open_append(path)?, line)
     }
 
+    fn open_log(&self, path: &Path) -> io::Result<File> {
+        open_append(path)
+    }
+
     fn event_log(&self, severity: Severity, line: &str) {
         eventlog::report(severity, line);
     }
@@ -138,7 +146,7 @@ pub(crate) fn wide_null(s: &str) -> Vec<u16> {
 }
 
 /// Open `path` for append, creating parent directories first.
-pub(crate) fn open_append(path: &Path) -> io::Result<File> {
+fn open_append(path: &Path) -> io::Result<File> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
