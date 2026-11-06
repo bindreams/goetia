@@ -1101,10 +1101,11 @@ fn a_stop_with_no_budget_runs_bootout_to_completion() {
 ///
 /// The history is observed, not assumed. `launchctl bootstrap` returns when the job is loaded, not
 /// when launchd has forked its `RunAtLoad` run, so a `start` straight after it can beat that run:
-/// the kick is then the job's first fork, nothing is throttled, and `start` correctly reports
-/// `StartUnconfirmed`. The test therefore loads the job itself and waits for the job to report its
-/// first run, and then for launchd to show that run gone, before calling `start`: a run still alive
-/// would read `Running` and `start` would succeed.
+/// the kick is then the job's first fork, nothing is throttled, and `start` may report `Ok`,
+/// `WaitTimeout`, `StartUnconfirmed` or `NotStarted`, all correct; that first start has no pinned
+/// outcome. The test therefore loads the job itself and waits for the job to report its first run,
+/// and then for launchd to show that run gone, before calling `start`, so the kick meets a job
+/// with history and no live run for `start` to read.
 ///
 /// Two measured facts, neither of them assumed:
 ///
@@ -1117,12 +1118,13 @@ fn a_stop_with_no_budget_runs_bootout_to_completion() {
 ///    notification mechanism, and re-reading state on a timer is polling, which this project
 ///    forbids — and skipping it would fail a healthy job launchd is merely about to start.
 ///
-/// The budget is **5s, not `DEFAULT`**, and that is deliberate. 5s and the ~10.02s throttle are two
-/// orders of magnitude apart from the outcome's perspective, so `WaitTimeout` is not a race in
-/// either direction; against `DEFAULT` (10s) they would sit ~20ms apart, which is exactly the bet
-/// this project forbids. That closeness is itself the documented consequence for `DEFAULT`: see
-/// this backend's module doc comment. No elapsed-time assertion is made or needed — the error
-/// variant carries the outcome.
+/// The budget is **5s, not `DEFAULT`**, and that is deliberate: the ~10.02s throttle, launchd's own
+/// timer, runs from the first run's fork, and against a 5s budget it leaves about 5s for the fork,
+/// the `accept`, the `print` wait and `start`'s reads before the kick. A run slower than that ends
+/// in `StartUnconfirmed` or `NotStarted`, which is not a product defect. Against `DEFAULT` (10s)
+/// the margin would be ~20ms, a bet this project forbids; that closeness is the documented
+/// consequence for `DEFAULT` (see this backend's module doc comment). No elapsed-time assertion
+/// is made: the error variant carries the outcome.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout() {
     let mgr = Launchd::new();
@@ -1139,8 +1141,7 @@ fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout() {
         ],
     );
     spec.restart = Restart::Always;
-    // Registered before the job is loaded; boots it out after `_guard` uninstalls.
-    let _job = support::ServiceGuard::new(&id);
+    // Registered before the job is loaded: its `uninstall` boots the job out.
     let _guard = Guard::install(&mgr, &spec);
 
     // Load the job without `start`: `RunAtLoad` runs it. Once it has connected, launchd has forked
