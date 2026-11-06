@@ -122,12 +122,26 @@ fn binary_plist(label: &str) -> Vec<u8> {
 /// host a permanent exit `4` for a vendor's service.
 const NON_UTF8_PLIST: [u8; 4] = [b'<', 0xff, 0xfe, b'>'];
 
+/// Asserts that a directory macOS provides (`/Library/LaunchDaemons`, the temp dir) exists; a test
+/// never creates one.
+fn require_system_dir(dir: &Path) {
+    assert!(dir.is_dir(), "macOS's own {} is missing", dir.display());
+}
+
 fn write_plist(path: &Path, content: &str) {
     write_bytes(path, content.as_bytes());
 }
 
+/// Writes `bytes` to `path`. The parent must exist: `/Library/LaunchDaemons` is the system's, shared
+/// by every test running concurrently, so no test creates it. Goetia's own staging directory is the
+/// one exception, since `install` creates it on first use and nothing removes it.
 fn write_bytes(path: &Path, bytes: &[u8]) {
-    std::fs::create_dir_all(path.parent().unwrap()).expect("create parent dir");
+    let parent = path.parent().unwrap();
+    if parent == Path::new(STAGING_DIR) {
+        std::fs::create_dir_all(parent).expect("create the staging directory");
+    } else {
+        require_system_dir(parent);
+    }
     std::fs::write(path, bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).expect("chmod plist");
 }
@@ -1265,7 +1279,7 @@ fn list_does_not_hang_on_a_fifo_in_the_plist_directory() {
 }
 
 fn mkfifo(path: &Path) {
-    std::fs::create_dir_all(path.parent().unwrap()).expect("create parent dir");
+    require_system_dir(path.parent().unwrap());
     let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("a plist path with no NUL");
     // SAFETY: `c_path` is a NUL-terminated pointer valid for the call.
     let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };

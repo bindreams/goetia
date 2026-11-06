@@ -61,6 +61,14 @@ pub(crate) fn wants_symlink(id: &str) -> PathBuf {
         .join(format!("{id}.service"))
 }
 
+/// Asserts that a system directory the image provides (`multi-user.target.wants`) exists; a test
+/// never creates one, since every test running concurrently shares it.
+fn require_system_dir(dir: &Path) {
+    if !dir.is_dir() {
+        missing_system_dir(dir);
+    }
+}
+
 /// A hand-written unit carrying no `[X-Goetia]` marker at all — what a real foreign service looks
 /// like to discovery.
 fn seed_foreign(id: &str) {
@@ -116,15 +124,18 @@ fn seed_unreadable_dropin_enotdir(id: &str) -> FileGuard {
 }
 
 /// [`seed_unreadable_dropin_enotdir`] under an arbitrary search root, creating that root where it is
-/// missing. `scan_host` reaches any root but `UNIT_DIR` through its cross-root pass alone, and only
+/// missing (its parent must exist: see [`create_root`]). `scan_host` reaches any root but `UNIT_DIR` through its cross-root pass alone, and only
 /// for the drop-in half — a *fragment* outside `UNIT_DIR` deliberately names no id (see `HostScan`).
 ///
-/// The root, and any parent made for it, is removed only when this call created it, and with
-/// `remove_dir`, so a root systemd itself populated is left exactly as it was found.
+/// The root is removed only when this call created it, and with `remove_dir`, so a root systemd
+/// itself populated is left exactly as it was found.
 fn seed_unreadable_dropin_in_root(root: &str, id: &str) -> (PathBuf, RmInRoot<FileGuard>) {
     let root_path = PathBuf::from(root);
     let leaf = root_path.join(format!("{id}.service.d"));
-    let guard = RmInRoot::new(FileGuard::new(leaf.clone()), create_root(&root_path));
+    let guard = RmInRoot {
+        _leaf: FileGuard::new(leaf.clone()),
+        _root: create_root(&root_path),
+    };
     fs::write(&leaf, b"").unwrap_or_else(|e| panic!("seed {}: {e}", leaf.display()));
     (leaf, guard)
 }
@@ -133,7 +144,10 @@ fn seed_unreadable_dropin_in_root(root: &str, id: &str) -> (PathBuf, RmInRoot<Fi
 /// parent search root is left exactly as found: `/etc/systemd/system` is shared with every other
 /// test running concurrently.
 fn seed_dropin(dir: &Path, root: CreatedRoot) -> RmInRoot<DirGuard> {
-    let guard = RmInRoot::new(DirGuard::new(dir.to_path_buf()), root);
+    let guard = RmInRoot {
+        _leaf: DirGuard::new(dir.to_path_buf()),
+        _root: root,
+    };
     fs::create_dir_all(dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
     fs::write(dir.join("50-x.conf"), "[Service]\nMemoryMax=8G\n").expect("write drop-in");
     cmd::run("systemctl", &["daemon-reload"]).expect_ok();
@@ -144,8 +158,7 @@ fn seed_dropin(dir: &Path, root: CreatedRoot) -> RmInRoot<DirGuard> {
 /// PROPERTY=VALUE` writes, and the two highest-precedence entries on the system unit search path,
 /// both above `/etc/systemd/system`.
 ///
-/// The root, and any parent made for it, is removed along with the drop-in only where this call
-/// created it. Each test that seeds
+/// The root is removed along with the drop-in only where this call created it. Each test that seeds
 /// one takes a *different* root, so no concurrently running test can be inside the one this removes
 /// — and the removal is `remove_dir`, so a root systemd itself populated for some other unit fails
 /// to go and is left as it was found.
@@ -262,42 +275,44 @@ fn uid_of(account: &str) -> u32 {
         .unwrap_or_else(|e| panic!("parse uid of {account}: {e}"))
 }
 
-/// Creates the search root `root` and any of its parents that are missing, outermost first, and
-/// returns the ones this call created: `create_dir` answers `AlreadyExists` for a directory that
-/// was there first, so ownership is not a check followed by a create. The result is filled as it
-/// goes, so a panic partway still removes what was made.
+/// Creates the search root `root`, which must be the only thing missing: its parent is a system
+/// directory the sandbox image provides (`/etc/systemd`, `/run/systemd`), shared by every test that
+/// runs concurrently, so no test creates it or removes it. `create_dir` answers `AlreadyExists` for
+/// a root that was there first, so ownership is not a check followed by a create.
 fn create_root(root: &Path) -> CreatedRoot {
-    let mut missing: Vec<&Path> = root.ancestors().take_while(|p| !p.exists()).collect();
-    missing.reverse();
-    let mut created = CreatedRoot::default();
-    for dir in missing {
-        match fs::create_dir(dir) {
-            Ok(()) => created.0.push(dir.to_path_buf()),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => panic!("mkdir {}: {e}", dir.display()),
-        }
+    match fs::create_dir(root) {
+        Ok(()) => CreatedRoot(Some(root.to_path_buf())),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => CreatedRoot(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing_system_dir(root.parent().unwrap_or(root)),
+        Err(e) => panic!("mkdir {}: {e}", root.display()),
     }
-    created
 }
 
-/// The search root a seeding call created and the parents it created for it, removed on drop,
-/// innermost first, with `remove_dir`. "Not empty" is expected, not a failure: a directory systemd
-/// itself populated for some other unit is left as it was found.
+/// Fails the test for a system directory it needs but the image lacks.
+fn missing_system_dir(dir: &Path) -> ! {
+    panic!(
+        "systemd's own {} is missing; the sandbox image provides it",
+        dir.display()
+    )
+}
+
+/// The search root a seeding call created, removed on drop with `remove_dir`. "Not empty" is
+/// expected, not a failure: a directory systemd itself populated for some other unit is left as it
+/// was found.
 #[derive(Default)]
-struct CreatedRoot(Vec<PathBuf>);
+struct CreatedRoot(Option<PathBuf>);
 
 impl Drop for CreatedRoot {
     fn drop(&mut self) {
-        for dir in self.0.iter().rev() {
-            match fs::remove_dir(dir) {
-                Ok(()) => {}
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
-                    ) => {}
-                Err(e) => eprintln!("warning: left behind: remove {}: {e}", dir.display()),
-            }
+        let Some(dir) = &self.0 else { return };
+        match fs::remove_dir(dir) {
+            Ok(()) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(e) => eprintln!("warning: left behind: remove {}: {e}", dir.display()),
         }
     }
 }
@@ -312,15 +327,6 @@ impl Drop for CreatedRoot {
 struct RmInRoot<L> {
     _leaf: L,
     _root: CreatedRoot,
-}
-
-impl<L> RmInRoot<L> {
-    fn new(leaf: L, root: CreatedRoot) -> Self {
-        Self {
-            _leaf: leaf,
-            _root: root,
-        }
-    }
 }
 
 /// Drive `daemon uninstall` through the CLI rather than calling `Systemd::uninstall` directly: the
@@ -792,9 +798,8 @@ pub(crate) fn main_pid(id: &str) -> String {
 /// succeeds, so nothing is left `failed` — and removes it; declared after the `ServiceGuard`, so it
 /// drops first.
 ///
-/// The lock file is `/run/{id}.lock`, not in a temp dir. The `ExecStop` `flock` runs under systemd,
-/// which does not see the test's `TMPDIR`, and the path is spliced unquoted into the unit's
-/// `ExecStop=` line, where whitespace or `%` would break it; `/run/{id}.lock` avoids both.
+/// The lock file is `/run/{id}.lock`, not in a temp dir: the path is spliced unquoted into the unit's
+/// `ExecStop=` line, where whitespace or `%` would break it, and `/run/{id}.lock` has neither.
 struct StopHolder {
     unit: String,
     path: PathBuf,
@@ -1333,7 +1338,7 @@ fn uninstall_refuses_an_id_whose_fragment_is_gone_but_whose_enablement_link_rema
     let link = wants_symlink(&id);
     // No `ServiceGuard`: the id never gets a fragment, so only the planted link needs removing.
     let _cleanup = FileGuard::new(link.clone());
-    fs::create_dir_all(link.parent().expect("the link has a parent")).expect("mkdir *.target.wants");
+    require_system_dir(link.parent().expect("the link has a parent"));
     std::os::unix::fs::symlink(unit_path(&id), &link).expect("plant a dangling .wants link");
 
     let (code, out, err) = uninstall_via_cli(&id);
@@ -1348,7 +1353,7 @@ fn install_refuses_a_stray_enablement_link_with_no_fragment() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let link = wants_symlink(guard.id());
-    fs::create_dir_all(link.parent().expect("the link has a parent")).expect("mkdir *.target.wants");
+    require_system_dir(link.parent().expect("the link has a parent"));
     std::os::unix::fs::symlink(unit_path(guard.id()), &link).expect("plant a dangling .wants link");
 
     let mgr = Systemd::new();
