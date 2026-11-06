@@ -19,7 +19,7 @@ fn base_dir() -> PathBuf {
 }
 
 fn parse_manifest(yaml: &str) -> RawSpec {
-    yaml_serde::from_str(yaml).expect("fixture yaml should parse")
+    RawSpec::parse(yaml).expect("fixture yaml should parse")
 }
 
 fn resolve_yaml(yaml: &str) -> Result<(DaemonSpec, Vec<Warning>), Error> {

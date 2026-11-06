@@ -19,52 +19,75 @@ use serde::{Deserialize, Deserializer};
 
 use super::no_null::reject_nulls;
 use super::overrides::BackendOverrides;
-use super::user::RawUser;
+use super::user::{RawUser, deserialize_user};
 
 /// The whole `goetia.yaml` document: one daemon, exactly as written in
 /// YAML. No defaults are materialized and no cross-field or injection-gate
 /// validation runs here — see `resolve`, the parse-don't-validate boundary.
 ///
-/// **Construct one with [`RawSpec::parse`], not with `Deserialize`.**
-/// The null rule is enforced by a second walk that `parse` runs over the
-/// same text, because it needs that text to report a position. So
-/// `yaml_serde::from_str::<RawSpec>` compiles, and silently accepts every
-/// explicit `null` this module exists to refuse. The type is exported, so a
-/// library consumer can reach that unguarded path; [`load`](super::load) is
-/// always safe. Narrowing it means deciding whether [`resolve`](super::resolve)
-/// belongs in the public API beside `load`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RawSpec {
+/// **[`RawSpec::parse`] is the only way to get one from text.** The null
+/// rule is enforced by a second walk that `parse` runs over the same text,
+/// because it needs that text to report a position. So `RawSpec` does not
+/// implement `Deserialize`: the derive sits on the private `Wire`, which
+/// only `parse` deserializes into. The type is module-private to `spec` so
+/// that library consumers reach a spec only through [`load`](super::load).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RawSpec {
     /// The installed service's name. Required, never overridable, and
     /// checked against the id pattern by `resolve`, not here.
     pub id: String,
-    #[serde(default)]
     pub name: Option<String>,
     // `Option`, not `Vec`: a missing `command` is legal at parse time and is caught per backend
     // (see `overrides.rs`, `require_complete`).
-    #[serde(default)]
     pub command: Option<Vec<String>>,
-    #[serde(default)]
     pub cwd: Option<String>,
-    #[serde(default, deserialize_with = "no_duplicate_env")]
     pub env: BTreeMap<String, String>,
-    #[serde(default)]
     pub user: Option<RawUser>,
-    #[serde(default)]
     pub restart: Option<String>,
-    #[serde(rename = "restart-delay", default)]
     pub restart_delay: Option<String>,
-    #[serde(default)]
     pub logs: Option<String>,
-    #[serde(rename = "type", default)]
     pub kind: Option<String>,
+    pub backend_specific: BackendOverrides,
+}
+
+/// `RawSpec`'s serde shape, a remote derive so that `RawSpec` itself has no
+/// `Deserialize` and `parse` is the only reader of YAML into one. Serde
+/// checks the fields against `RawSpec`'s at compile time.
+///
+/// `expecting` words the error for a document that is not a mapping, which
+/// would otherwise name `RawSpec`.
+#[derive(Deserialize)]
+#[serde(
+    remote = "RawSpec",
+    deny_unknown_fields,
+    expecting = "a goetia.yaml mapping (id, command, ...)"
+)]
+struct Wire {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    command: Option<Vec<String>>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default, deserialize_with = "no_duplicate_env")]
+    env: BTreeMap<String, String>,
+    #[serde(default, deserialize_with = "deserialize_user")]
+    user: Option<RawUser>,
+    #[serde(default)]
+    restart: Option<String>,
+    #[serde(rename = "restart-delay", default)]
+    restart_delay: Option<String>,
+    #[serde(default)]
+    logs: Option<String>,
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
     #[serde(
         rename = "backend-specific",
         default,
         deserialize_with = "crate::spec::overrides::deserialize_overrides"
     )]
-    pub backend_specific: BackendOverrides,
+    backend_specific: BackendOverrides,
 }
 
 impl RawSpec {
@@ -73,7 +96,7 @@ impl RawSpec {
     /// duplicate key, wrong type); `reject_nulls` then walks the same text
     /// for explicit `null`s. See `no_null` for the split.
     pub fn parse(yaml: &str) -> Result<Self, yaml_serde::Error> {
-        let spec = yaml_serde::from_str(yaml)?;
+        let spec = Wire::deserialize(yaml_serde::Deserializer::from_str(yaml))?;
         reject_nulls(yaml)?;
         Ok(spec)
     }
