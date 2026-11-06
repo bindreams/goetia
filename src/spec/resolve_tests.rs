@@ -130,7 +130,7 @@ fn rejects_control_characters_in_cwd_and_logs() {
     assert!(logs_err.to_string().contains("logs"));
 }
 
-// The rules check what the user wrote -------------------------------------------------------------------------------
+// The rules check what the user wrote ---------------------------------------------------------------------------------
 
 #[skuld::test]
 fn rejects_a_relative_cwd_and_logs_ending_in_a_backslash_on_every_host() {
