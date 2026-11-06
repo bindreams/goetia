@@ -446,8 +446,8 @@ fn stdio_set<T, E: std::fmt::Display>(log: &Log, id: &str, assigned: Result<T, E
 }
 
 /// Build the (unspawned) command for `spec`: argv, cwd, env, Job Object
-/// containment, and stdout+stderr merged into the daemon's log file, which `os` opens. `log` only
-/// reports a failed open.
+/// containment, and stdout+stderr merged into the daemon's log file, which `os` opens. `log`
+/// names that file when the spec does not, and reports a failed open or redirect.
 pub(crate) fn build_command(spec: &DaemonSpec, os: &dyn Os, log: &Log, id: &str) -> cosca::Command {
     let mut cmd = cosca::run(spec.command.iter().cloned());
     if let Some(cwd) = &spec.cwd {

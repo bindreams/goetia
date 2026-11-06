@@ -49,7 +49,8 @@ struct Gate {
 
 /// The gate between the SCM control handler, the service thread and the waiter thread. It holds
 /// the gate and nothing else, so the control handler needs no [`Os`] and no [`Log`]. Only
-/// [`Supervisor::new`] makes one, so a run's bus is the one its waiters report to.
+/// [`Supervisor::new`] makes one outside this module's tests, so a run's bus is the one its
+/// waiters report to.
 pub(crate) struct StopBus {
     state: Mutex<Gate>,
     cvar: Condvar,

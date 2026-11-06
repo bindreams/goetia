@@ -101,8 +101,8 @@ fn kill_ends_a_real_daemon() {
 }
 
 /// Dropping the `Spawned` would kill the daemon's job. The daemon echoes its stdin, so a line
-/// written after the detach and read back proves it still ran then: a daemon the job had ended
-/// closes its stdout, and the read sees end of file. The test then ends it through the `Reap`.
+/// written after the detach and read back proves it still ran then: for a daemon the job had
+/// ended, the write fails or the read sees end of file. The test then ends it through the `Reap`.
 /// This pins `Real::detach`'s delegation: without it `Child::drop` kills and waits before
 /// returning. Whether cosca's disarm itself holds is cosca's to test.
 #[skuld::test]
@@ -118,15 +118,14 @@ fn detach_leaves_the_daemon_running_after_its_handle_is_gone() {
 
     Spawned::detach(Box::new(child));
 
-    stdin
-        .write_all(
-            b"ping
-",
-        )
-        .expect("write to the daemon after the detach");
+    if let Err(e) = stdin.write_all(b"ping\n") {
+        panic!("the daemon did not outlive its handle: the write to its stdin failed: {e}");
+    }
     let mut echo = String::new();
     stdout.read_line(&mut echo).expect("read the daemon's echo");
     assert_eq!(echo.trim_end(), "ping", "the daemon did not outlive its handle");
+    // Killed before its stdin closes, which would end it on its own and race the kill.
+    drop(reap);
 }
 
 /// The supervisor asks for the status twice: the waiter's wait, then the one that reads the code.
@@ -308,6 +307,8 @@ fn append_fails_and_writes_nothing_when_the_path_cannot_be_opened(#[fixture(temp
     assert!(result.is_err());
     assert_eq!(std::fs::read_to_string(&file).expect("the file is untouched"), "x");
 }
+
+// Os ------------------------------------------------------------------------------------------------------------------
 
 #[skuld::test]
 fn open_log_fails_with_the_os_reason_when_the_path_cannot_be_opened(#[fixture(temp_dir)] dir: &Path) {

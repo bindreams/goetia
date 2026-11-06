@@ -1,7 +1,8 @@
 //! A test OS: tables of stated replies, with no process behind them and no named file: `open_log`
 //! returns an anonymous [`tempfile::tempfile`], which is real because a child needs a real handle
-//! to redirect its output into. It models no operating system; the rules it encodes are that a successful kill ends the process it killed,
-//! and that a process keeps the status of its first ending.
+//! to redirect its output into. It models no operating system; the rules it encodes are that a
+//! successful kill ends the process it killed, and that a process keeps the status of its first
+//! ending.
 //!
 //! A test states the replies it expects, in the order each operation will be called. A call with no
 //! stated reply is recorded and panics; the [`FakeGuard`] then fails the test at its end for that
