@@ -1160,8 +1160,7 @@ fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout() {
                 .find_map(|line| line.trim_start().strip_prefix(key))
         };
         // A job that has not exited yet reads `last exit code = (never exited)`.
-        field("last exit code = ").is_some_and(|code| !code.contains("never exited"))
-            && field("pid = ").is_none()
+        field("last exit code = ").is_some_and(|code| !code.contains("never exited")) && field("pid = ").is_none()
     });
 
     let err = mgr
