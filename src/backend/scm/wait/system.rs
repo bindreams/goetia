@@ -153,11 +153,11 @@ fn queried_state_of_raw(raw: u32) -> io::Result<QueriedState> {
 /// notify buffer. The `LastStatus` slot and the `SERVICE_NOTIFY_2W`
 /// buffer are heap-pinned (`Box`) so their addresses stay stable across
 /// `arm` -> `SleepEx` -> callback. Both handles are `Option`s so
-/// [`Self::close_and_drain`] can close them *before* it drains — see
+/// `Self::close_and_drain` can close them *before* it drains — see
 /// there for why that order is the whole point.
 ///
 /// Owning the SCM connection (rather than borrowing the caller's) is what
-/// makes [`super::NotifyRegistrar::reopen`] able to follow `NotifyServiceStatusChangeW`'s
+/// makes `NotifyRegistrar::reopen` able to follow `NotifyServiceStatusChangeW`'s
 /// documented `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING` remedy exactly: "close
 /// the handle to the SCM, open a new handle, and call this function
 /// again" — the lag condition is tracked against the SCM connection, not
@@ -177,7 +177,7 @@ pub struct SystemScmActor {
 
 impl SystemScmActor {
     /// Open `name` with `QUERY_STATUS | STOP | START` — everything both
-    /// [`super::stop_via_notify`] and [`super::start_via_notify`] need,
+    /// `stop_via_notify` and `start_via_notify` need,
     /// so one actor serves either wait without reopening.
     pub fn open(name: &str) -> io::Result<Self> {
         let scm = open_scm()?;
@@ -274,7 +274,7 @@ impl super::ScmHandles for SystemScmActor {
 }
 
 /// The handles [`super::cancel_registration`] and the lag remedy open.
-pub struct Fresh {
+pub(crate) struct Fresh {
     scm: WinServiceManager,
     service: Service,
 }

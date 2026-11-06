@@ -1,21 +1,17 @@
 //! Shared helpers for the `type: simple` integration tests.
 
-use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use goetia::backend::scm::exit_status::RecordedExit;
 use goetia::backend::scm::manager::Scm;
+use goetia::backend::scm::wait::{Armed, Observed, QueriedState, ScmActor as _, SystemScmActor, WantState};
+use goetia::manager::Budget;
 use goetia::spec::{DaemonSpec, Kind};
-use windows_service::service::{Service, ServiceAccess, ServiceState, ServiceStatus};
+use windows_service::service::{ServiceAccess, ServiceState, ServiceStatus};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
-use windows_sys::Win32::System::Services::{
-    NotifyServiceStatusChangeW, SERVICE_NOTIFY_2W, SERVICE_NOTIFY_RUNNING, SERVICE_NOTIFY_STATUS_CHANGE,
-    SERVICE_RUNNING,
-};
-use windows_sys::Win32::System::Threading::{INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, SleepEx, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::{INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
 
 use crate::fixture;
 use crate::support;
@@ -206,100 +202,6 @@ pub fn kill_process(pid: u32) {
     support::cmd::run("taskkill.exe", &["/F", "/PID", &pid.to_string()]).expect_ok();
 }
 
-// SCM state-change notifications --------------------------------------------------------------------------------------
-
-/// What one `NotifyServiceStatusChangeW` delivery said, written by the APC and read by the waiter
-/// on the same thread.
-struct Delivery {
-    fired: AtomicBool,
-    state: AtomicU32,
-    controls_accepted: AtomicU32,
-}
-
-unsafe extern "system" fn record_delivery(parameter: *const c_void) {
-    let notify = parameter.cast::<SERVICE_NOTIFY_2W>();
-    // SAFETY: SCM hands back the buffer registered in `arm_and_wait`, whose `pContext` is the leaked
-    // `Delivery`.
-    let (delivery, status) = unsafe { (&*(*notify).pContext.cast::<Delivery>(), &(*notify).ServiceStatus) };
-    delivery.state.store(status.dwCurrentState, Ordering::Release);
-    delivery
-        .controls_accepted
-        .store(status.dwControlsAccepted, Ordering::Release);
-    delivery.fired.store(true, Ordering::Release);
-}
-
-/// The SCM connection and the service handle of one registration, closed together when it ends.
-struct Handles {
-    _manager: ServiceManager,
-    service: Service,
-}
-
-impl Handles {
-    fn open(id: &str) -> std::io::Result<Self> {
-        let io_error = |e: windows_service::Error| match e {
-            windows_service::Error::Winapi(e) => e,
-            other => std::io::Error::other(other),
-        };
-        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).map_err(io_error)?;
-        let service = manager
-            .open_service(id, ServiceAccess::QUERY_STATUS)
-            .map_err(io_error)?;
-        Ok(Self {
-            _manager: manager,
-            service,
-        })
-    }
-}
-
-/// `NotifyServiceStatusChangeW`'s "you are too far behind" return; not among `windows-sys`'s exports.
-const ERROR_SERVICE_NOTIFY_CLIENT_LAGGING: u32 = 1294;
-
-/// Arm `mask` on service `id`; the returned closure blocks, alertably, until SCM delivers it and
-/// returns `(state, controls_accepted)` of the delivery. Armed on a state that does not match `mask`
-/// yet, the delivery is the transition; a service already in a matching state delivers at once.
-/// There is no bound: a delivery that never comes is a hung test, which the CI watchdog reports.
-///
-/// On `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING` it reopens the SCM and service handles and arms again,
-/// as the documented remedy and `ScmActor::arm` do. Any other registration failure (a deleted
-/// service reports 1060) is returned.
-pub fn arm_and_wait(id: &str, mask: u32) -> std::io::Result<impl FnOnce() -> (u32, u32)> {
-    // Leaked: SCM may still hold the registration if the test panics before the delivery.
-    let delivery: &'static Delivery = Box::leak(Box::new(Delivery {
-        fired: AtomicBool::new(false),
-        state: AtomicU32::new(0),
-        controls_accepted: AtomicU32::new(0),
-    }));
-    let notify: &'static mut SERVICE_NOTIFY_2W = Box::leak(Box::new(SERVICE_NOTIFY_2W {
-        dwVersion: SERVICE_NOTIFY_STATUS_CHANGE,
-        pfnNotifyCallback: Some(record_delivery),
-        pContext: (delivery as *const Delivery as *mut Delivery).cast(),
-        ..Default::default()
-    }));
-    let mut handles = Handles::open(id)?;
-    loop {
-        // SAFETY: the handle has `SERVICE_QUERY_STATUS`; `notify` is leaked and so outlives the
-        // registration.
-        let error = unsafe { NotifyServiceStatusChangeW(handles.service.raw_handle(), mask, notify) };
-        match error {
-            0 => break,
-            ERROR_SERVICE_NOTIFY_CLIENT_LAGGING => handles = Handles::open(id)?,
-            error => return Err(std::io::Error::from_raw_os_error(error as i32)),
-        }
-    }
-    // The handles cancel the registration when they close, so the closure owns them.
-    Ok(move || {
-        let _handles = handles;
-        while !delivery.fired.load(Ordering::Acquire) {
-            // SAFETY: plain FFI call; an alertable wait is what lets the APC run.
-            unsafe { SleepEx(INFINITE, 1) };
-        }
-        (
-            delivery.state.load(Ordering::Acquire),
-            delivery.controls_accepted.load(Ordering::Acquire),
-        )
-    })
-}
-
 /// A handle on the shim process of a started service, taken while it runs so that the test can
 /// wait for the process to be gone. SCM has the final `STOPPED` record by then: the shim reports it
 /// before it exits.
@@ -321,9 +223,30 @@ impl ShimProcess {
         let service = manager
             .open_service(id, ServiceAccess::QUERY_STATUS)
             .unwrap_or_else(|e| panic!("open service {id}: {e}"));
-        // Armed before the read; a service that already runs delivers at once.
-        let (state, _) = arm_and_wait(id, SERVICE_NOTIFY_RUNNING).expect("arm the RUNNING notification")();
-        assert_eq!(state, SERVICE_RUNNING, "the notification for RUNNING");
+        // The status read with the registration decides first: a registration on a handle that has
+        // delivered does not fire for a state that is already current. A pending state re-arms.
+        let mut actor = SystemScmActor::open(id).unwrap_or_else(|e| panic!("open {id} to wait for RUNNING: {e}"));
+        let mut armed = actor
+            .arm(WantState::Running, Budget::Unbounded.start())
+            .unwrap_or_else(|e| panic!("arm the RUNNING notification of {id}: {e}"));
+        loop {
+            match armed {
+                Armed::Registered(status) if status.state == QueriedState::Running => break,
+                Armed::Registered(_) => match actor
+                    .wait_callback(Budget::Unbounded.start())
+                    .unwrap_or_else(|e| panic!("wait for the RUNNING notification of {id}: {e}"))
+                {
+                    Some(Observed::Running) => break,
+                    Some(Observed::Pending) => {
+                        armed = actor
+                            .arm(WantState::Running, Budget::Unbounded.start())
+                            .unwrap_or_else(|e| panic!("re-arm the RUNNING notification of {id}: {e}"));
+                    }
+                    other => panic!("waiting for {id} to report RUNNING, SCM delivered {other:?}"),
+                },
+                other => panic!("waiting for {id} to report RUNNING, the arm came to {other:?}"),
+            }
+        }
         let running = service
             .query_status()
             .unwrap_or_else(|e| panic!("query status of {id}: {e}"));

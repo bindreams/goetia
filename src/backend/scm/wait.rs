@@ -37,7 +37,7 @@ impl WantState {
     /// A start wait includes `STOPPED`: it is armed after `start()`, when the service has entered
     /// `StartPending`, so a `StartPending -> Stopped` delivers a real `Stopped` that ends the wait with
     /// the failed start it is.
-    pub fn states(self) -> &'static [QueriedState] {
+    pub(crate) fn states(self) -> &'static [QueriedState] {
         use QueriedState::{Paused, Running, StartPending, StopPending, Stopped};
         match self {
             WantState::Stopped => &[Stopped, StopPending],
@@ -70,14 +70,14 @@ pub enum Observed {
 /// `Result` and leaves a bare `Waited` behind.
 #[must_use = "an expired wait did not confirm the state; decide what to report rather than discarding it"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Waited {
+pub(crate) enum Waited {
     Confirmed,
     Expired,
 }
 
 /// What an [`ScmActor::arm`] came to.
 ///
-/// `#[must_use]`, like [`Waited`]: dropping it reads an expiry as a registration.
+/// `#[must_use]`, like `Waited`: dropping it reads an expiry as a registration.
 #[must_use = "an expired arm registered nothing; the status of a registered one is what the caller decides on"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Armed {
@@ -94,7 +94,7 @@ pub enum Armed {
     Gone,
 }
 
-/// The granular SCM operations [`stop_via_notify`]/[`start_via_notify`] need,
+/// The granular SCM operations `stop_via_notify`/`start_via_notify` need,
 /// isolated so the ordering can be unit-tested with a fake rather than a real
 /// service.
 pub trait ScmActor {
@@ -169,7 +169,7 @@ pub trait ScmActor {
 /// fire at once for a `STOPPED` already current, and a service that failed to `STOPPED` just before it
 /// can be running again, by a recovery restart, when the STOP lands; that stale `STOPPED` would confirm
 /// a stop of a running service.
-pub fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
+pub(crate) fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
     // Issued whatever is left of the budget: only the *waiting* is bounded.
     control_stop_or_underway(a)?;
     wait_after_stop(a, deadline, " Run `stop` again.")
@@ -351,7 +351,7 @@ const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
 /// A disable that lands while SCM's restart attempt is in flight does not stop it: the attempt runs
 /// to `RUNNING` and the status read right after the disable shows `START_PENDING` or `RUNNING`
 /// (P23), so the loop sees its `RUNNING` and stops it like any start.
-pub fn settle_and_stop<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
+pub(crate) fn settle_and_stop<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
     // The first arm on a fresh actor fires at once for a current state in its mask (P20, P27), so
     // the status it returns is not needed, unless SCM refused to watch the service.
     if let Err(waited) = decided_or_status(
@@ -547,7 +547,7 @@ const STOPPING: &str = "the service is stopping (STOP_PENDING), so it cannot be 
 /// `Running` is the SCM's own answer that the goal is reached, so it is the
 /// confirmation, whatever is left of the deadline — as launchd's `print` of a
 /// running job is. Nothing is armed for it.
-pub fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Kind) -> io::Result<Waited> {
+pub(crate) fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Kind) -> io::Result<Waited> {
     // Issued whatever is left of the budget: only the *waiting* is bounded, and a service left
     // unstarted because goetia ran out of budget would be the worst of both answers.
     let reply = a.start()?;
@@ -628,14 +628,14 @@ fn stopped_before_running(kind: Kind, joined_a_start: bool, exit: RecordedExit, 
 /// service with. A named function rather than a bare [`ScmActor::start`] at
 /// the call site so that what happens when we do *not* wait is covered by
 /// the same fake-actor tests as everything else.
-pub fn request_start<A: ScmActor>(a: &mut A) -> io::Result<()> {
+pub(crate) fn request_start<A: ScmActor>(a: &mut A) -> io::Result<()> {
     accept_as_started(a.start()?)
 }
 
 /// `daemon restart --timeout 0`'s start: [`request_start`], except `ERROR_SERVICE_ALREADY_RUNNING`
 /// is always a refusal: the queried `Running` may be the instance the unconfirmed stop just before
 /// it is taking down, before the shim has reported `STOP_PENDING`.
-pub fn request_start_after_stop<A: ScmActor>(a: &mut A) -> io::Result<()> {
+pub(crate) fn request_start_after_stop<A: ScmActor>(a: &mut A) -> io::Result<()> {
     match a.start()? {
         StartReply::Accepted => Ok(()),
         StartReply::AlreadyRunning(QueriedState::StopPending) => Err(io::Error::other(STOPPING)),
@@ -647,7 +647,7 @@ pub fn request_start_after_stop<A: ScmActor>(a: &mut A) -> io::Result<()> {
 }
 
 /// [`request_start`]'s mirror: issue the stop control and return.
-pub fn request_stop<A: ScmActor>(a: &mut A) -> io::Result<()> {
+pub(crate) fn request_stop<A: ScmActor>(a: &mut A) -> io::Result<()> {
     control_stop_or_underway(a)
 }
 
@@ -656,7 +656,7 @@ pub fn request_stop<A: ScmActor>(a: &mut A) -> io::Result<()> {
 /// The teardown half of [`system::SystemScmActor`], behind a trait for the
 /// same reason [`ScmActor`] is one: the thing that matters here is an
 /// *order*, and an order is only assertable if a fake can record it.
-pub trait ScmHandles {
+pub(crate) trait ScmHandles {
     /// Close the per-service handle and the SCM connection.
     fn close_handles(&mut self);
     /// Whether an `arm` succeeded that no `wait_callback` has consumed.
@@ -682,7 +682,7 @@ pub trait ScmHandles {
 /// occupies that address by then.
 ///
 /// Close first: draining first leaves a window in which SCM queues a fresh notification.
-pub fn close_then_drain<H: ScmHandles>(h: &mut H) {
+pub(crate) fn close_then_drain<H: ScmHandles>(h: &mut H) {
     h.close_handles();
     if h.registration_outstanding() {
         h.drain_queued_apc();
@@ -690,7 +690,7 @@ pub fn close_then_drain<H: ScmHandles>(h: &mut H) {
 }
 
 /// The fresh handles [`cancel_registration`] opens before it closes the old ones.
-pub trait ReopenHandles: ScmHandles {
+pub(crate) trait ReopenHandles: ScmHandles {
     /// What [`Self::open_fresh`] opens, held until [`Self::install`].
     type Fresh;
     /// Open handles to the service again. The actor's own handles stay open.
@@ -701,7 +701,7 @@ pub trait ReopenHandles: ScmHandles {
 
 /// What [`cancel_registration`] came to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Cancelled {
+pub(crate) enum Cancelled {
     /// The old handles are closed and drained, and the fresh ones installed.
     Reopened,
     /// The service no longer exists. The old handles are closed and drained; nothing is installed.
@@ -715,7 +715,7 @@ pub enum Cancelled {
 /// `ERROR_SERVICE_DOES_NOT_EXIST`. The old handles then close and drain in [`close_then_drain`]'s order.
 /// A 1060 from the open is [`Cancelled::ServiceGone`], after the same close and drain; any other error
 /// leaves the old handles and their registration as they were, for the actor's teardown.
-pub fn cancel_registration<H: ReopenHandles>(h: &mut H) -> io::Result<Cancelled> {
+pub(crate) fn cancel_registration<H: ReopenHandles>(h: &mut H) -> io::Result<Cancelled> {
     let fresh = match h.open_fresh() {
         Ok(fresh) => fresh,
         Err(e) if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) => {
@@ -765,20 +765,20 @@ pub struct QueriedStatus {
 /// would report a start that did not happen. `restart --timeout 0` never consults it
 /// ([`request_start_after_stop`]).
 #[must_use]
-pub fn already_running_is_recoverable(queried: QueriedState) -> bool {
+pub(crate) fn already_running_is_recoverable(queried: QueriedState) -> bool {
     matches!(queried, QueriedState::Running | QueriedState::StartPending)
 }
 
 /// `NotifyServiceStatusChangeW`'s "you are too far behind" return. Not among
 /// `windows-sys`'s `Foundation` exports, so it is spelled out.
-pub const ERROR_SERVICE_NOTIFY_CLIENT_LAGGING: u32 = 1294;
+pub(crate) const ERROR_SERVICE_NOTIFY_CLIENT_LAGGING: u32 = 1294;
 
 /// `ERROR_SERVICE_MARKED_FOR_DELETE`.
-pub const ERROR_SERVICE_MARKED_FOR_DELETE: u32 = 1072;
+pub(crate) const ERROR_SERVICE_MARKED_FOR_DELETE: u32 = 1072;
 
 /// The error for a wait over a service in `state` that SCM refused to watch (1072), when `state` is
 /// not the one the wait is for.
-pub fn marked_for_deletion(state: QueriedState) -> io::Error {
+pub(crate) fn marked_for_deletion(state: QueriedState) -> io::Error {
     io::Error::other(format!(
         "SCM refused to watch the service because it is marked for deletion; it is {state:?}, not the \
          state waited for"
@@ -786,10 +786,10 @@ pub fn marked_for_deletion(state: QueriedState) -> io::Error {
 }
 
 /// `ERROR_SERVICE_DOES_NOT_EXIST`.
-pub const ERROR_SERVICE_DOES_NOT_EXIST: u32 = 1060;
+pub(crate) const ERROR_SERVICE_DOES_NOT_EXIST: u32 = 1060;
 
 /// The error for a wait for a state other than `STOPPED` over a service that was deleted meanwhile.
-pub fn service_gone() -> io::Error {
+pub(crate) fn service_gone() -> io::Error {
     io::Error::other(
         "the service no longer exists (it was deleted while goetia waited), so it cannot reach the state waited for",
     )
@@ -798,7 +798,7 @@ pub fn service_gone() -> io::Error {
 /// The two steps [`register_until_deadline`] drives: one attempt to register
 /// the notification, and the lag remedy. Behind a trait so that the loop's
 /// bound — the thing that is easy to lose — is assertable off Windows.
-pub trait NotifyRegistrar {
+pub(crate) trait NotifyRegistrar {
     /// Register the notification, reporting `NotifyServiceStatusChangeW`'s
     /// raw return code (`0` on success).
     fn register(&mut self) -> io::Result<u32>;
@@ -809,7 +809,7 @@ pub trait NotifyRegistrar {
 
 /// What [`register_until_deadline`] came to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Registration {
+pub(crate) enum Registration {
     Registered,
     /// The deadline ran out while SCM kept answering `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING`.
     Expired,
@@ -826,7 +826,7 @@ pub enum Registration {
 /// the TOP of every iteration, including the first, and is the only thing
 /// that ends the loop: deliberately not a retry counter, which would be a
 /// bound nobody asked for, where this one the caller did ask for.
-pub fn register_until_deadline<R: NotifyRegistrar>(r: &mut R, deadline: Deadline) -> io::Result<Registration> {
+pub(crate) fn register_until_deadline<R: NotifyRegistrar>(r: &mut R, deadline: Deadline) -> io::Result<Registration> {
     loop {
         if deadline.expired() {
             return Ok(Registration::Expired);
@@ -841,7 +841,7 @@ pub fn register_until_deadline<R: NotifyRegistrar>(r: &mut R, deadline: Deadline
 }
 
 #[cfg(windows)]
-pub mod system;
+pub(crate) mod system;
 
 #[cfg(windows)]
 pub use system::SystemScmActor;
