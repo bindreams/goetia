@@ -137,6 +137,31 @@ pub struct DaemonSpec {
     pub kind: Kind,
 }
 
+#[cfg(test)]
+impl DaemonSpec {
+    /// A plain, valid `DaemonSpec` named `id`: root, `restart: never`, `type: managed`, everything
+    /// else unset. Panics if `id` is not a valid [`Id`]. Mirrors `tests/support/daemon_spec.rs`
+    /// (integration tests cannot reach `#[cfg(test)]` code).
+    ///
+    /// A test that needs anything else says so with struct-update syntax:
+    /// `DaemonSpec { restart, ..DaemonSpec::for_test("frpc", command) }`. Built literally, never
+    /// through `resolve`, so that paths render the same on every platform.
+    pub(crate) fn for_test(id: &str, command: Vec<String>) -> DaemonSpec {
+        DaemonSpec {
+            id: Id::try_from(id).unwrap_or_else(|e| panic!("`{id}` is not a valid Id: {e}")),
+            name: id.to_string(),
+            command,
+            cwd: None,
+            env: BTreeMap::new(),
+            user: User::Root,
+            restart: Restart::Never,
+            restart_delay: None,
+            logs: None,
+            kind: Kind::Managed,
+        }
+    }
+}
+
 /// Restart policy. Corresponds to systemd's `Restart=`, launchd's
 /// `KeepAlive`, and SCM recovery actions.
 ///

@@ -1,21 +1,13 @@
-use std::collections::BTreeMap;
-
 use super::*;
 use crate::backend::Identity;
-use crate::spec::{DaemonSpec, Kind, Restart, User};
+use crate::spec::{DaemonSpec, Kind, Restart};
 
 fn spec_fixture() -> DaemonSpec {
     DaemonSpec {
-        id: Id::try_from("frpc").unwrap(),
         name: "FRP tunnel client".to_owned(),
-        command: vec!["frpc".to_owned()],
-        cwd: None,
-        env: BTreeMap::new(),
-        user: User::Root,
         restart: Restart::Always,
-        restart_delay: None,
-        logs: None,
         kind: Kind::Simple,
+        ..DaemonSpec::for_test("frpc", vec!["frpc".to_owned()])
     }
 }
 

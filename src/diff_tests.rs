@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::*;
-use crate::spec::{Id, Kind, Restart, User};
+use crate::spec::{Kind, Restart};
 
 // `DaemonSpec` is built literally here, never via `resolve()`: a resolved
 // path renders with `\` on Windows and `/` elsewhere, which would make
@@ -11,16 +11,13 @@ use crate::spec::{Id, Kind, Restart, User};
 // component for the same reason.
 fn spec_fixture() -> DaemonSpec {
     DaemonSpec {
-        id: Id::try_from("frpc").unwrap(),
         name: "FRP tunnel client".to_owned(),
-        command: vec!["frpc".to_owned(), "-c".to_owned(), "frpc.toml".to_owned()],
         cwd: Some(PathBuf::from("app")),
         env: BTreeMap::from([("FRP_LOG_LEVEL".to_owned(), "info".to_owned())]),
-        user: User::Root,
         restart: Restart::OnFailure,
-        restart_delay: None,
         logs: Some(PathBuf::from("frpc.log")),
         kind: Kind::Simple,
+        ..DaemonSpec::for_test("frpc", vec!["frpc".to_owned(), "-c".to_owned(), "frpc.toml".to_owned()])
     }
 }
 

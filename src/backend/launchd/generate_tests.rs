@@ -63,16 +63,8 @@ fn roundtrip_spec() -> DaemonSpec {
 
 fn minimal_spec() -> DaemonSpec {
     DaemonSpec {
-        id: Id::try_from("frpc").unwrap(),
-        name: "frpc".to_string(),
-        command: vec!["frpc".to_string()],
-        cwd: None,
-        env: BTreeMap::new(),
-        user: User::Root,
-        restart: Restart::Never,
-        restart_delay: None,
-        logs: None,
         kind: Kind::Simple,
+        ..DaemonSpec::for_test("frpc", vec!["frpc".to_string()])
     }
 }
 

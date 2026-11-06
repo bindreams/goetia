@@ -1,5 +1,4 @@
 use std::cell::Cell;
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use super::{
@@ -7,8 +6,9 @@ use super::{
 };
 use crate::error::{Error, Result};
 use crate::manager::fake::Fake;
+use crate::manager::fake::fake_tests::mk;
 use crate::manager::{Budget, ServiceManager};
-use crate::spec::{DaemonSpec, Id, Kind, Restart, User};
+use crate::spec::Id;
 
 const THIRTY: Budget = Budget::Bounded(Duration::from_secs(30));
 
@@ -55,21 +55,6 @@ fn a_stop_leg_whose_bounded_budget_is_spent_still_gets_a_bound() {
 }
 
 // deadline threading ==================================================================================================
-
-fn mk(id: &str) -> DaemonSpec {
-    DaemonSpec {
-        id: Id::try_from(id).unwrap(),
-        name: id.to_string(),
-        command: vec!["daemon".to_owned()],
-        cwd: None,
-        env: BTreeMap::new(),
-        user: User::Root,
-        restart: Restart::OnFailure,
-        restart_delay: None,
-        logs: None,
-        kind: Kind::Simple,
-    }
-}
 
 /// How many deadlines `daemon restart --no-timeout <ids>` derives against a
 /// `Fake` where every id is installed and every leg succeeds.

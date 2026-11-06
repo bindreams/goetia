@@ -4,7 +4,6 @@
 //! nothing waits on. `run_daemon` is one pass: it reports running after the spawn, never after a
 //! failed launch, and turns the daemon's end into what SCM is told.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use cosca::Containment;
@@ -12,7 +11,7 @@ use cosca::identity::Liveness;
 use goetia::backend::scm::exit_status::{
     ERROR_CAN_NOT_COMPLETE, ERROR_GEN_FAILURE, ERROR_SERVICE_SPECIFIC_ERROR, Reported,
 };
-use goetia::spec::{Id, Kind, Restart, User};
+use goetia::spec::{Kind, Restart};
 use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, NO_ERROR};
 use windows_sys::Win32::System::Services::{
     SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_PAUSE, SERVICE_CONTROL_STOP, SERVICE_STOP_PENDING, SERVICE_STOPPED,
@@ -25,6 +24,11 @@ use crate::stop_bus::test_hook::{KILL_REFUSED, Kill, WAIT_FAILED, Wait, WaiterEn
 use crate::test_support::{TestId, assert_failures, assert_one_failure};
 
 const PREFIX: &str = "goetia-shim-launch-test";
+
+// The shim is its own crate and cannot reach `DaemonSpec::for_test`; share the integration suites'
+// constructor.
+#[path = "../../../tests/support/daemon_spec.rs"]
+mod daemon_spec;
 
 /// [`super::run_daemon`] for the tests that do not look at the `STOP_PENDING` report.
 fn run_daemon(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, on_running: impl FnOnce()) -> Reported {
@@ -39,23 +43,19 @@ fn run_daemon(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str, on_running: 
 /// the daemon's own output only: `launch`'s failure reporting goes through `logging::log_failure`,
 /// which never consults `spec.logs`.
 fn spec(dir: &Path, id: &str) -> DaemonSpec {
+    let command = [
+        "powershell",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Start-Sleep -Seconds 300",
+    ];
     DaemonSpec {
-        id: Id::try_from(id).expect("a valid daemon id"),
         name: "goetia-shim launch test".to_string(),
-        command: vec![
-            "powershell".to_string(),
-            "-NoProfile".to_string(),
-            "-NonInteractive".to_string(),
-            "-Command".to_string(),
-            "Start-Sleep -Seconds 300".to_string(),
-        ],
-        cwd: None,
-        env: BTreeMap::new(),
-        user: User::Root,
         restart: Restart::Always,
-        restart_delay: None,
         logs: Some(dir.join("daemon.log")),
         kind: Kind::Simple,
+        ..daemon_spec::spec(id, command.map(str::to_string).to_vec())
     }
 }
 
