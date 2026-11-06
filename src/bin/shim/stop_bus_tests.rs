@@ -1,5 +1,5 @@
-//! The supervisor's decisions over the `Fake`: how the bus waits for a daemon and what it does when
-//! a stop, an exit, a failed wait or a refused kill arrives. What a real kill or wait does to a real
+//! The supervisor's decisions over the `Fake`: how it waits for a daemon and what it does when a
+//! stop, an exit, a failed wait or a refused kill arrives. What a real kill or wait does to a real
 //! process is `os_tests`'s.
 
 use std::sync::mpsc;

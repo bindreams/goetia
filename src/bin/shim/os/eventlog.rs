@@ -13,18 +13,12 @@ const SOURCE: &str = "Goetia";
 /// message without Goetia shipping a compiled message catalogue.
 const EVENT_ID: u32 = 1;
 
-/// Writes `message` as an event of `severity`'s type. Best-effort: nothing here panics or
-/// bubbles an error, because this is itself a failure-reporting path — an event log write that could fail
-/// the caller would just relocate the "cannot report why" problem
-/// rather than solve it.
+/// Writes `message` as an event of `severity`'s type. Best-effort: never panics or returns an error,
+/// since this is itself the failure-reporting path.
 ///
-/// Source registration happens at install time (see the SCM backend's
-/// `register_event_source`), because it writes under `HKLM` and the shim
-/// may be running as an unprivileged account. Without it, `ReportEventW`
-/// still records the insertion string, but Event Viewer renders
-/// "The operation completed successfully." instead of the message — which
-/// defeats the whole purpose of this path, since its only reader is an
-/// administrator asking why a daemon died at boot.
+/// The source is registered at install time (`register_event_source`), since that needs HKLM and
+/// the shim may run unprivileged. Unregistered, Event Viewer shows "The operation completed
+/// successfully." instead of the message.
 pub(super) fn report(severity: Severity, message: &str) {
     let event_type = match severity {
         Severity::Error => EVENTLOG_ERROR_TYPE,

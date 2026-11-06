@@ -1,6 +1,6 @@
-//! A test OS: tables of stated replies, with no process, thread pool or file behind them. It models
-//! no operating system; the one rule it encodes is that a successful kill ends the process it
-//! killed, so a blocked [`WaitReply::Blocks`] returns.
+//! A test OS: tables of stated replies, with no process or file system behind them. It models no
+//! operating system; the rules it encodes are that a successful kill ends the process it killed,
+//! and that a process keeps the status of its first ending.
 //!
 //! A test states the replies it expects, in the order each operation will be called. A call with no
 //! stated reply is recorded and panics; the [`FakeGuard`] then fails the test at its end for that
@@ -42,7 +42,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// An operation the `Fake` counts, whether or not it was given a reply. Only the ones a test reads.
+/// An operation the `Fake` counts, whether or not it was given a reply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Op {
     Spawn,

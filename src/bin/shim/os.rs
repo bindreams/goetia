@@ -1,7 +1,6 @@
-//! What the shim asks the operating system for, as three traits the supervisor and the log call
-//! instead of `cosca`, `std::thread` and the file system: [`Os`] spawns the daemon and makes
-//! threads, [`Spawned`] is the daemon once spawned, [`Channels`] is where the shim's own failure
-//! lines go. [`Real`] implements all three; a test implements them with `fake::Fake`.
+//! The one boundary between the shim and the operating system: the supervisor and the log call
+//! [`Os`], [`Spawned`] and [`Channels`] instead of `cosca`, `std::thread` and the file system.
+//! [`Real`] implements them; tests use `fake::Fake`.
 
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -64,7 +63,7 @@ pub(crate) trait Channels: Send + Sync {
     fn open_log(&self, path: &Path) -> io::Result<File>;
 
     /// Report `line` to the Windows Event Log as `severity`. Best-effort: this is itself a
-    /// failure-reporting path, and it has no failure to report.
+    /// failure-reporting path.
     fn event_log(&self, severity: Severity, line: &str);
 }
 
@@ -153,8 +152,7 @@ fn open_append(path: &Path) -> io::Result<File> {
     OpenOptions::new().create(true).append(true).open(path)
 }
 
-/// Writes `line` and a newline in one `write`, so output another handle appends in between cannot
-/// split the line.
+/// One `write` call, so another handle's appends cannot split the line.
 fn append_line(out: &mut impl Write, line: &str) -> io::Result<()> {
     out.write_all(format!("{line}\n").as_bytes())
 }
