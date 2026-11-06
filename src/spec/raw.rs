@@ -55,7 +55,7 @@ pub(super) struct RawSpec {
 /// checks the fields against `RawSpec`'s at compile time.
 ///
 /// `expecting` words the error for a document that is not a mapping, which
-/// would otherwise name this private type.
+/// would otherwise name `RawSpec`.
 #[derive(Deserialize)]
 #[serde(
     remote = "RawSpec",

@@ -682,6 +682,6 @@ fn a_document_that_is_not_a_mapping_is_refused_in_user_terms() {
             err.contains("expected a goetia.yaml mapping (id, command, ...)"),
             "{yaml:?}: {err}"
         );
-        assert!(!err.contains("Wire"), "{yaml:?}: {err}");
+        assert!(!err.contains("RawSpec") && !err.contains("Wire"), "{yaml:?}: {err}");
     }
 }

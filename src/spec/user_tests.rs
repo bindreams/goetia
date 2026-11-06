@@ -60,6 +60,18 @@ fn an_absent_user_resolves_to_root() {
 }
 
 #[skuld::test]
+fn a_user_that_is_neither_string_nor_mapping_is_refused_in_user_terms() {
+    for yaml in ["[root]\n", "5.5\n", "true\n"] {
+        let err = parse(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("expected a username string, `root`, or a struct with exactly one of `name` or `id`"),
+            "{yaml:?}: {err}"
+        );
+        assert!(!err.contains("RawUser") && !err.contains("UserWire"), "{yaml:?}: {err}");
+    }
+}
+
+#[skuld::test]
 fn user_struct_rejects_both_fields() {
     let err = parse("name: bindreams\nid: 1001").unwrap_err();
     let msg = err.to_string();

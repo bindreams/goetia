@@ -1,15 +1,15 @@
 //! The `user:` field: a bare string, or a struct with exactly one of `name`
 //! or `id`.
 //!
-//! [`RawUser`] is what deserializes; [`User`] is what `resolve` produces
-//! from it. They are separate because the `root` reserved word applies to
-//! the bare string form *only*, and once a bare `root` has become
+//! [`RawUser`] is what is read, by `UserWire` through [`deserialize_user`];
+//! [`User`] is what `resolve` produces from it. They are separate because
+//! the `root` reserved word applies to the bare string form *only*, and once a bare `root` has become
 //! `User::Root` nothing records which syntax it came from, so the rule
 //! could not be re-applied to an interpolated value without also
 //! mis-applying it to the struct form, where `{name: root}` is a literal
 //! account: `{name: ${U}}` with `U=root` would become `User::Root`.
 //!
-//! `RawUser`'s `Deserialize` is hand-written, not `#[serde(untagged)]`: the
+//! `UserWire`'s `Deserialize` is hand-written, not `#[serde(untagged)]`: the
 //! untagged deserializer squashes every failed variant into one message
 //! that names no offending field.
 

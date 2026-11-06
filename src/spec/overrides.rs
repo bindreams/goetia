@@ -55,7 +55,11 @@ pub(super) struct RawOverride {
 /// `RawOverride`'s serde shape, a remote derive for the reason `RawSpec` has one (see `raw.rs`'s
 /// `Wire`): the only reader is [`deserialize_overrides`], under `RawSpec::parse`.
 #[derive(Deserialize)]
-#[serde(remote = "RawOverride", deny_unknown_fields)]
+#[serde(
+    remote = "RawOverride",
+    deny_unknown_fields,
+    expecting = "a mapping of backend-specific overrides"
+)]
 struct OverrideWire {
     #[serde(default)]
     name: Option<String>,
