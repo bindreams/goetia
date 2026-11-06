@@ -456,7 +456,7 @@ fn a_socket_swapped_in_is_classified_not_a_failed_read() {
 fn unit_text() -> String {
     let spec = crate::spec::DaemonSpec::new(crate::spec::DaemonFields {
         kind: crate::spec::Kind::Simple,
-        ..crate::spec::DaemonSpec::for_test("x", vec!["/bin/true".to_string()]).into_fields()
+        ..crate::spec::DaemonSpec::for_test("x", vec!["/bin/true".to_string()])
     })
     .unwrap();
     generate::unit(&spec, &crate::backend::Identity { user: "0".to_string() })
