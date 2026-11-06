@@ -668,7 +668,7 @@ complete_listing_lines=(
     "README.md"
     "src/lib.rs"
     "src/main.rs"
-    "src/bin/shim/main.rs"
+    "src/bin/goetia-shim.rs"
     "src/backend/launchd.rs"
 )
 
@@ -705,17 +705,17 @@ assert_package_list_ok "accepts a well-formed listing" "$listing"
 
 # Positive control: each required-present path missing must be caught on its
 # own terms, not misreported as a leaked exclusion.
-listing="$(write_package_listing missing-cargo-toml Cargo.lock LICENSE.md README.md src/lib.rs src/main.rs src/bin/shim/main.rs)"
+listing="$(write_package_listing missing-cargo-toml Cargo.lock LICENSE.md README.md src/lib.rs src/main.rs src/bin/goetia-shim.rs)"
 assert_package_list_rejects_matching "rejects a listing missing Cargo.toml" "$listing" "Cargo.toml"
 
-listing="$(write_package_listing missing-lib-rs Cargo.toml Cargo.lock LICENSE.md README.md src/main.rs src/bin/shim/main.rs)"
+listing="$(write_package_listing missing-lib-rs Cargo.toml Cargo.lock LICENSE.md README.md src/main.rs src/bin/goetia-shim.rs)"
 assert_package_list_rejects_matching "rejects a listing missing src/lib.rs" "$listing" "src/lib.rs"
 
-listing="$(write_package_listing missing-main-rs Cargo.toml Cargo.lock LICENSE.md README.md src/lib.rs src/bin/shim/main.rs)"
+listing="$(write_package_listing missing-main-rs Cargo.toml Cargo.lock LICENSE.md README.md src/lib.rs src/bin/goetia-shim.rs)"
 assert_package_list_rejects_matching "rejects a listing missing the goetia bin source (src/main.rs)" "$listing" "src/main.rs"
 
 listing="$(write_package_listing missing-shim-main-rs Cargo.toml Cargo.lock LICENSE.md README.md src/lib.rs src/main.rs)"
-assert_package_list_rejects_matching "rejects a listing missing the goetia-shim bin source (src/bin/shim/main.rs)" "$listing" "src/bin/shim/main.rs"
+assert_package_list_rejects_matching "rejects a listing missing the goetia-shim bin source (src/bin/goetia-shim.rs)" "$listing" "src/bin/goetia-shim.rs"
 
 # An empty (or otherwise truncated) listing must be caught by the positive
 # control, never mistaken for "nothing leaked".

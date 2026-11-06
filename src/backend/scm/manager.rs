@@ -1,6 +1,6 @@
 //! The effectful SCM backend (`#[cfg(windows)]`).
 //!
-//! Handles both `Kind::Simple` (via `goetia-shim`, `src/bin/shim/`) and
+//! Handles both `Kind::Simple` (via `goetia-shim`, `shim::run`) and
 //! `Kind::Managed`; `generate::registration` builds the `ImagePath`/blob
 //! for both. `Kind::Simple`'s own integration tests live in
 //! `tests/shim_integration.rs`, not `tests/scm_integration.rs`, because they
@@ -405,13 +405,9 @@ fn read_marker(parameters: BTreeMap<String, String>, service: Option<Service>) -
 // shim support ========================================================================================================
 
 /// Read and decode the metadata blob for `id` directly from
-/// `Services\<id>\Parameters`. `goetia-shim` (`src/bin/shim/`, a separate
-/// `[[bin]]` target and therefore a separate crate that only ever sees this
-/// module's `pub` surface) calls this: it knows only its service id
-/// (`argv[1]`), not a `DaemonSpec` to hand to `render`, and must not
-/// pull in `ServiceManager`'s effectful install path just to read one
-/// value. `registry` itself stays private — this is the one read the shim
-/// needs, not the whole module.
+/// `Services\<id>\Parameters`. The shim calls this: it knows only its service
+/// name, not a `DaemonSpec` to hand to `render`, and must not pull in
+/// `ServiceManager`'s effectful install path just to read one value.
 ///
 /// `Ok(None)` means no `Marker` at all: unreachable in practice (SCM only
 /// ever launches the shim against a service *this backend itself* created
@@ -419,9 +415,9 @@ fn read_marker(parameters: BTreeMap<String, String>, service: Option<Service>) -
 /// immediately after), but returned rather than folded into `Err` so a
 /// caller can still tell "no marker" apart from "a marker that fails to
 /// decode" — the shim's own version-skew handling (see
-/// `src/bin/shim/logging.rs`) needs exactly that distinction to phrase its
+/// `shim::run::logging`) needs exactly that distinction to phrase its
 /// failure message.
-pub fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
+pub(crate) fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
     let params = registry::read_parameters(id)?;
     generate::extract(&params)
 }

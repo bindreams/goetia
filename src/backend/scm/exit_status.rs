@@ -12,7 +12,7 @@
 //! whatever its service-specific code: SCM stores that pair as reported, which is how an incomplete
 //! stop leaves a record without a restart.
 
-/// `argv[1]` (the service id) is missing.
+/// SCM passed the shim no usable service name.
 pub const ERROR_BAD_ARGUMENTS: u32 = 160;
 /// The metadata blob is absent or cannot be decoded.
 pub const ERROR_INVALID_DATA: u32 = 13;

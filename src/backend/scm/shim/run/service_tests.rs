@@ -7,11 +7,11 @@
 
 use std::path::{Path, PathBuf};
 
-use cosca::Containment;
-use goetia::backend::scm::exit_status::{
+use crate::backend::scm::exit_status::{
     ERROR_CAN_NOT_COMPLETE, ERROR_GEN_FAILURE, ERROR_SERVICE_SPECIFIC_ERROR, Reported,
 };
-use goetia::spec::{Kind, Restart};
+use crate::spec::{Kind, Restart};
+use cosca::Containment;
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, ERROR_NOT_ENOUGH_MEMORY, NO_ERROR,
 };
@@ -20,12 +20,11 @@ use windows_sys::Win32::System::Services::{
 };
 
 use super::*;
-use crate::os::fake::{
+use crate::backend::scm::shim::run::os::fake::{
     FakeGuard, FakeProcess, KillReply, NO_THREAD, OPEN_LOG_FAILED, Op, WAIT_FAILED, WaitReply, WaiterEnd,
 };
-use crate::test_support::{
-    assert_failures, assert_one_failure, daemon_spec, fallback_refused_failure, not_found, supervisor,
-    tree_refused_failure,
+use crate::backend::scm::shim::run::test_support::{
+    assert_failures, assert_one_failure, fallback_refused_failure, not_found, supervisor, tree_refused_failure,
 };
 
 const ID: &str = "goetia-shim-launch-test";
@@ -53,7 +52,7 @@ fn spec() -> DaemonSpec {
         restart: Restart::Always,
         logs: Some(PathBuf::from(DAEMON_LOG)),
         kind: Kind::Simple,
-        ..daemon_spec::spec(ID, command.map(str::to_string).to_vec())
+        ..DaemonSpec::for_test(ID, command.map(str::to_string).to_vec())
     }
 }
 
@@ -914,7 +913,7 @@ fn an_earlier_registration_under_always_names_the_override_and_the_reinstall() {
 
 #[skuld::test]
 fn a_registration_by_released_0_1_0_warns_under_this_build() {
-    let notice = version_skew_notice("frpc", &spec_restarting(Restart::OnFailure), "0.1.0", goetia::version());
+    let notice = version_skew_notice("frpc", &spec_restarting(Restart::OnFailure), "0.1.0", crate::version());
 
     assert!(notice.is_some(), "a service registered by 0.1.0 must get the warning");
 }

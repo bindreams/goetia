@@ -17,10 +17,10 @@
 use std::io;
 use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 
-use goetia::backend::scm::exit_status::Reported;
+use crate::backend::scm::exit_status::Reported;
 
-use crate::logging::Log;
-use crate::os::{Os, Spawned, os_error_of};
+use super::logging::Log;
+use super::os::{Os, Spawned, os_error_of};
 
 /// How the run ends, decided once under the [`StopBus`] mutex: a stop accepted before the exit is
 /// decided wins over any failure; an exit decided first is reported whatever stop follows. SCM
@@ -91,12 +91,8 @@ pub enum WaitOutcome {
 /// clean start failure with nothing launched — see `service::launch`, the one caller that
 /// enforces the order.
 ///
-/// Deliberately not `goetia::backend::bounded`'s `Standby`, whose shape and vocabulary this
-/// follows: `spares` is a private module of the library's `pub(crate)` `backend::bounded` and
-/// this is a separate binary crate, and widening it would still not carry the part that matters
-/// most here — its failure-injection seam
-/// is `#[cfg(test)]` *inside the library*, which a binary linking that library never compiles, so
-/// no shim test could make a library `Standby` fail.
+/// Follows `backend::bounded`'s `Standby` in shape and vocabulary, but is a separate
+/// implementation: `Standby` is private to `backend::bounded`'s `spares` module.
 pub struct Waiter {
     hand: mpsc::Sender<Arc<dyn Spawned>>,
     thread: std::thread::JoinHandle<()>,

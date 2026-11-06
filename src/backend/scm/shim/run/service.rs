@@ -8,12 +8,12 @@
 use std::ffi::{OsString, c_void};
 use std::sync::Arc;
 
-use cosca::{Containment, Fd, Stdio};
-use goetia::backend::scm::exit_status::{
+use crate::backend::scm::exit_status::{
     ERROR_BAD_ARGUMENTS, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_INVALID_DATA, Reported,
 };
-use goetia::backend::scm::manager::read_spec_blob;
-use goetia::spec::{DaemonSpec, Restart};
+use crate::backend::scm::manager::read_spec_blob;
+use crate::spec::{DaemonSpec, Restart};
+use cosca::{Containment, Fd, Stdio};
 use windows_service::{define_windows_service, service_dispatcher};
 use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, NO_ERROR};
 use windows_sys::Win32::System::Services::{
@@ -22,24 +22,23 @@ use windows_sys::Win32::System::Services::{
     SERVICE_WIN32_OWN_PROCESS, SetServiceStatus,
 };
 
-use crate::logging::Log;
-use crate::os::{Os, Real, Spawned, spawn_error_code};
-use crate::stop_bus::{StopBus, Supervisor, Teardown, WaitOutcome, Waiter, kill_for_stop, terminate_exited_tree};
+use super::logging::Log;
+use super::os::{Os, Real, Spawned, spawn_error_code};
+use super::stop_bus::{StopBus, Supervisor, Teardown, WaitOutcome, Waiter, kill_for_stop, terminate_exited_tree};
 
 // Entry ===============================================================================================================
 
-/// Called from `main()`. Reads `argv[1]` (the service id), hands control to
-/// SCM, and never returns normally: `run_service` (via `service_main`)
-/// calls `std::process::exit` on every path, including every failure one,
-/// with a code from `goetia::backend::scm::exit_status`.
-pub fn run() -> ! {
-    let args: Vec<String> = std::env::args().collect();
-    let Some(id) = args.get(1) else {
-        eprintln!("goetia-shim: usage: goetia-shim <service-id>");
-        std::process::exit(ERROR_BAD_ARGUMENTS as i32);
-    };
-    if let Err(e) = service_dispatcher::start(id, ffi_service_main) {
-        Log::real().failure(id, &format!("connect to the SCM dispatcher: {e}"));
+/// The name SCM's service table carries. SCM ignores it for `SERVICE_WIN32_OWN_PROCESS`; the
+/// service's real name is `service_main`'s first argument.
+const TABLE_NAME: &str = "goetia-shim";
+
+/// Called from `main()`. Hands control to SCM, and never returns normally: `run_service` (via
+/// `service_main`) calls `std::process::exit` on every path, including every failure one, with a
+/// code from `crate::backend::scm::exit_status`. Reads no process arguments: the service name
+/// comes from SCM.
+pub(crate) fn run() -> ! {
+    if let Err(e) = service_dispatcher::start(TABLE_NAME, ffi_service_main) {
+        Log::real().failure(TABLE_NAME, &format!("connect to the SCM dispatcher: {e}"));
         std::process::exit(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT as i32);
     }
     // `service_main` exits on every path; this covers the dispatcher returning anyway.
@@ -48,12 +47,13 @@ pub fn run() -> ! {
 
 define_windows_service!(ffi_service_main, service_main);
 
-fn service_main(_scm_args: Vec<OsString>) {
-    // SCM's own arguments are not ours to rely on; `run` validated argv[1].
-    let id = std::env::args()
-        .nth(1)
-        .expect("argv[1] was validated present in run() before service_dispatcher::start was ever called");
-    run_service(&id);
+/// SCM's arguments to `ServiceMain`: the first is the service's name.
+fn service_main(scm_args: Vec<OsString>) {
+    let Some(id) = scm_args.first().and_then(|name| name.to_str()) else {
+        Log::real().failure(TABLE_NAME, &format!("SCM passed no usable service name: {scm_args:?}"));
+        std::process::exit(ERROR_BAD_ARGUMENTS as i32);
+    };
+    run_service(id);
 }
 
 fn run_service(id: &str) {
@@ -94,7 +94,7 @@ fn run_service(id: &str) {
     };
 
     log.set_daemon_log(log.daemon_log_path(id, blob.spec.logs.as_deref()));
-    log_version_skew(&log, id, &blob.spec, &blob.version, goetia::version());
+    log_version_skew(&log, id, &blob.spec, &blob.version, crate::version());
     let reported = run_daemon(
         &blob.spec,
         &supervisor,
@@ -154,7 +154,7 @@ struct StatusHandle(SERVICE_STATUS_HANDLE);
 /// while the registration stays live: SCM can deliver a control after that, which would reach freed
 /// memory. No test catches a revert; `clippy.toml` forbids the call.
 fn register_control_handler(id: &str, stop_bus: &Arc<StopBus>) -> std::io::Result<StatusHandle> {
-    let name = crate::os::wide_null(id);
+    let name = super::os::wide_null(id);
     // SAFETY: `name` is NUL-terminated and outlives the call; the context is never freed.
     let handle =
         unsafe { RegisterServiceCtrlHandlerExW(name.as_ptr(), Some(control_handler), leak_handler_context(stop_bus)) };

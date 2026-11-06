@@ -5,8 +5,10 @@
 use std::sync::mpsc;
 
 use super::*;
-use crate::os::fake::{Fake, FakeGuard, FakeProcess, KillReply, WAIT_FAILED, WaitReply, WaiterEnd};
-use crate::test_support::{
+use crate::backend::scm::shim::run::os::fake::{
+    Fake, FakeGuard, FakeProcess, KillReply, WAIT_FAILED, WaitReply, WaiterEnd,
+};
+use crate::backend::scm::shim::run::test_support::{
     assert_failures, assert_one_failure, fallback_refused_failure, supervisor, tree_refused_failure,
 };
 

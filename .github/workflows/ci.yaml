@@ -197,7 +197,7 @@ jobs:
   # only ever compiles for its own host, and `test` builds the *repository*
   # rather than the *tarball*, so nothing else here would catch an
   # `exclude` that breaks a non-Linux build — goetia is more exposed to
-  # this than most crates, since `src/bin/shim` is `#[cfg(windows)]`-gated
+  # this than most crates, since the shim's code is `#[cfg(windows)]`-gated
   # internally and the three backends have disjoint dependency sets.
   package:
     name: Package (${{ matrix.os }})
