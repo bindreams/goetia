@@ -2,12 +2,12 @@
 name = "goetia"
 version = "0.2.0"
 edition = "2024"
-# `cosca` uses `std::io::PipeReader`, stable since 1.87. That is already true
-# on Windows, where cosca has been a dependency all along, and the Unix
-# backends' bounded wait (`backend::bounded`) extends the same requirement to
-# Linux and macOS. Not verified end to end: CI pins `dtolnay/rust-toolchain`
-# at `stable` on every job, so nothing checks this floor.
-rust-version = "1.87"
+# CI builds with exactly this toolchain. The language floor is 1.88, from the
+# let-chain in `backend::launchd::manager`; 1.89 is the lowest on which
+# `cargo clippy --all-targets -- -D warnings` is clean, because 1.88 flags
+# `uninlined_format_args` in `backend::scm::generate_tests` and later
+# releases do not. Dependencies need at most 1.85.
+rust-version = "1.89"
 description = "Install system daemons described in goetia.yaml as native Windows/SCM, macOS/launchd, and Linux/systemd services"
 license = "Apache-2.0"
 readme = "README.md"
