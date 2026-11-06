@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
 use super::{RawOverride, Supplied};
+use crate::spec::BackendKind;
+use crate::spec::raw::RawSpec;
 use crate::spec::user::RawUser;
-use crate::spec::{BackendKind, RawSpec};
 
 fn parse(yaml: &str) -> Result<RawSpec, yaml_serde::Error> {
     RawSpec::parse(yaml)

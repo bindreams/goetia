@@ -54,9 +54,10 @@ use std::time::Duration;
 use super::backend::{BackendKind, Shaped, ShapedSpec};
 use super::interpolate;
 use super::overrides::Supplied;
+use super::raw::RawSpec;
 use super::user::{AccountId, RawUser, User};
 use super::vars::Vars;
-use super::{DaemonSpec, Id, Kind, RawSpec, Restart, Warning};
+use super::{DaemonSpec, Id, Kind, Restart, Warning};
 use crate::error::Error;
 
 const MANIFEST_FILE_NAME: &str = "goetia.yaml";
@@ -76,7 +77,7 @@ const MANIFEST_FILE_NAME: &str = "goetia.yaml";
 /// `base_dir` and written back absolute. A valid manifest may still produce
 /// `Warning`s for properties that are accepted but cannot be faithfully
 /// honored by the native backend.
-pub(crate) fn resolve(raw: RawSpec, base_dir: &Path) -> Result<(DaemonSpec, Vec<Warning>), Error> {
+fn resolve(raw: RawSpec, base_dir: &Path) -> Result<(DaemonSpec, Vec<Warning>), Error> {
     resolve_as(raw, base_dir, BackendKind::native())
 }
 

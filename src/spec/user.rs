@@ -24,7 +24,7 @@ use super::no_null::NULL_ACCOUNT_ID;
 /// is applied, so `resolve` can apply that rule to interpolated text exactly as to
 /// typed text.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RawUser {
+pub(super) enum RawUser {
     /// A bare string: `user: root` or `user: bindreams`. The only form the
     /// `root` reserved word applies to.
     Scalar(String),

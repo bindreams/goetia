@@ -8,8 +8,8 @@ use goetia::spec::{DaemonSpec, Id, Kind, Restart, User};
 /// unset. Panics if `id` is not a valid `Id`.
 ///
 /// A test that needs anything else says so with struct-update syntax:
-/// `DaemonSpec { env, user, ..support::spec(&id, command) }`. Built literally, never through
-/// `spec::resolve`, since the suites construct `command` and paths for this host directly.
+/// `DaemonSpec { env, user, ..support::spec(&id, command) }`. Built literally, since the suites
+/// construct `command` and paths for this host directly.
 pub fn spec(id: &str, command: Vec<String>) -> DaemonSpec {
     DaemonSpec {
         id: Id::try_from(id).unwrap_or_else(|e| panic!("`{id}` is not a valid Id: {e}")),
