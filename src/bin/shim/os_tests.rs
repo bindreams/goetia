@@ -9,12 +9,12 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead as _, BufReader};
 use std::os::windows::io::OwnedHandle;
-use std::path::PathBuf;
 
 use cosca::identity::{Liveness, Resolved};
 use cosca::{Process, Stdio};
 use goetia::spec::DaemonSpec;
 use skuld::temp_dir;
+use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 
 use super::*;
 use crate::os::fake::FakeGuard;
@@ -86,8 +86,10 @@ fn wait_gives_the_same_exit_code_every_time() {
     assert_eq!((first.code(), second.code()), (Some(3), Some(3)));
 }
 
-/// `cosca` searches for the binary itself, bare or absolute, and reports a miss as `Io(NotFound)`
-/// with no OS error code, so `service::os_error_of` has to supply the code SCM is told.
+/// A missing binary reaches SCM as `ERROR_FILE_NOT_FOUND` either way it is named. A bare name is
+/// searched for by `std` before `CreateProcessW` is called, and its miss is `Io(NotFound)` with no
+/// OS error code, so `service::spawn_error_code` supplies it; an absolute path fails in
+/// `CreateProcessW` with the code.
 #[skuld::test]
 fn a_spawn_of_a_missing_binary_is_refused_as_not_found(#[fixture(temp_dir)] dir: &Path) {
     let absolute = dir.join("goetia-shim-test-no-such-binary.exe");
@@ -98,7 +100,12 @@ fn a_spawn_of_a_missing_binary_is_refused_as_not_found(#[fixture(temp_dir)] dir:
             .expect("the binary does not exist");
 
         assert!(
-            matches!(&refused, cosca::error::Error::Io(e) if e.kind() == io::ErrorKind::NotFound && e.raw_os_error().is_none()),
+            matches!(&refused, cosca::error::Error::Io(e) if e.kind() == io::ErrorKind::NotFound),
+            "{missing:?}: {refused:?}"
+        );
+        assert_eq!(
+            crate::service::spawn_error_code(&refused),
+            Some(ERROR_FILE_NOT_FOUND as i32),
             "{missing:?}: {refused:?}"
         );
     }
@@ -108,24 +115,6 @@ fn a_spawn_of_a_missing_binary_is_refused_as_not_found(#[fixture(temp_dir)] dir:
 
 const ID: &str = "goetia-shim-os-test";
 
-/// `dir` without the verbatim prefix `skuld::temp_dir` returns (it canonicalizes): `CreateProcess`
-/// rejects a verbatim working directory. `\?\C:\x` becomes `C:\x` and `\?\UNC\s\x` becomes
-/// `\s\x`; any other form is returned as it is.
-fn plain(dir: &Path) -> PathBuf {
-    let Some(dir_str) = dir.to_str() else {
-        return dir.to_path_buf();
-    };
-    if let Some(unc) = dir_str.strip_prefix(r"\?\UNC\") {
-        return PathBuf::from(format!(r"\{unc}"));
-    }
-    match dir_str.strip_prefix(r"\?\") {
-        Some(drive) if matches!(drive.as_bytes(), [letter, b':', ..] if letter.is_ascii_alphabetic()) => {
-            PathBuf::from(drive)
-        }
-        _ => dir.to_path_buf(),
-    }
-}
-
 /// What `build_command` sets up, observed from a real daemon spawned through `Real`: the Job Object
 /// `StopBus` kills the tree through, stdout and stderr both in `spec.logs`, `cwd` and `env`. The
 /// daemon prints its working directory and the variable, writes a line to stderr and exits. The
@@ -134,7 +123,7 @@ fn plain(dir: &Path) -> PathBuf {
 fn build_command_makes_a_job_contained_daemon_with_its_cwd_env_and_log(#[fixture(temp_dir)] dir: &Path) {
     const CWD_LEAF: &str = "goetia-cwd-probe";
     let fake = FakeGuard::new();
-    let cwd = plain(dir).join(CWD_LEAF);
+    let cwd = dir.join(CWD_LEAF);
     std::fs::create_dir(&cwd).expect("the daemon's working directory");
     let logs = dir.join("daemon.log");
     let command = ["cmd", "/c", "echo %CD%& echo %GOETIA_TEST_VAR%& echo to-stderr>&2"];
@@ -156,6 +145,11 @@ fn build_command_makes_a_job_contained_daemon_with_its_cwd_env_and_log(#[fixture
     assert_eq!(contained, Containment::JobObject);
     let log = std::fs::read_to_string(&logs).expect("the daemon's log");
     let lines: Vec<&str> = log.lines().map(str::trim).collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "the daemon's log is not exactly its three lines: {log:?}"
+    );
     assert!(
         lines.iter().any(|line| line.ends_with(CWD_LEAF)),
         "the daemon ran outside its `cwd`: {log:?}"

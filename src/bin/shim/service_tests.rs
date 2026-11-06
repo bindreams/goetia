@@ -13,7 +13,9 @@ use goetia::backend::scm::exit_status::{
 };
 use goetia::spec::{Kind, Restart};
 use skuld::temp_dir;
-use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, NO_ERROR};
+use windows_sys::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, NO_ERROR,
+};
 use windows_sys::Win32::System::Services::{
     SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_PAUSE, SERVICE_CONTROL_STOP, SERVICE_STOP_PENDING, SERVICE_STOPPED,
 };
@@ -54,10 +56,9 @@ fn spec(dir: &Path) -> DaemonSpec {
     }
 }
 
-/// What `cosca` reports for a binary that does not exist, whether named bare (searched for on
-/// `PATH`) or by absolute path: its own search fails with `Io(NotFound)` and no OS error code
-/// (`os_tests` pins both against `Real`). A binary that exists but cannot be run fails later in
-/// `CreateProcessW`, with that call's code.
+/// What a spawn of a bare binary name not found on `PATH` fails with: `Io(NotFound)` and no OS
+/// error code (`os_tests` pins it against `Real`, with the absolute-path case, which carries
+/// `ERROR_FILE_NOT_FOUND` from `CreateProcessW`).
 fn not_found() -> cosca::error::Error {
     cosca::error::Error::Io(std::io::Error::from(std::io::ErrorKind::NotFound))
 }
@@ -174,7 +175,7 @@ fn a_daemon_that_cannot_be_spawned_is_logged_and_nothing_is_left_running(#[fixtu
 
 #[skuld::test]
 fn the_os_code_of_a_refused_spawn_is_what_launch_reports(#[fixture(temp_dir)] dir: &Path) {
-    const ACCESS_DENIED: i32 = 5;
+    const ACCESS_DENIED: i32 = ERROR_ACCESS_DENIED as i32;
     let fake = FakeGuard::new();
     fake.will_make_thread();
     fake.will_refuse_spawn(cosca::error::Error::Io(std::io::Error::from_raw_os_error(
@@ -884,22 +885,19 @@ fn a_stopped_report_is_stopped_and_accepts_no_control() {
 #[skuld::test]
 fn the_os_error_of_an_io_failure_is_kept_and_other_failures_have_none() {
     assert_eq!(
-        os_error_of(&cosca::error::Error::Io(std::io::Error::from_raw_os_error(5))),
-        Some(5)
+        os_error_of(&cosca::error::Error::Io(std::io::Error::from_raw_os_error(
+            ERROR_ACCESS_DENIED as i32
+        ))),
+        Some(ERROR_ACCESS_DENIED as i32)
     );
-    // A real code wins over the kind's: ERROR_PATH_NOT_FOUND is `NotFound` too.
-    assert_eq!(
-        os_error_of(&cosca::error::Error::Io(std::io::Error::from_raw_os_error(3))),
-        Some(3)
-    );
-    // `cosca`'s own search for a binary fails without a code; SCM is still told the file is missing.
-    assert_eq!(os_error_of(&not_found()), Some(ERROR_FILE_NOT_FOUND as i32));
+    // A failure without a code has none, whatever its kind.
+    assert_eq!(os_error_of(&not_found()), None);
     assert_eq!(
         os_error_of(&cosca::error::Error::Unassessable {
             detail: "query".to_string(),
             source: Some(std::io::Error::from(std::io::ErrorKind::NotFound)),
         }),
-        Some(ERROR_FILE_NOT_FOUND as i32)
+        None
     );
     assert_eq!(
         os_error_of(&cosca::error::Error::Io(std::io::Error::other("no os code"))),
@@ -909,6 +907,22 @@ fn the_os_error_of_an_io_failure_is_kept_and_other_failures_have_none() {
         os_error_of(&cosca::error::Error::Containment {
             detail: "attach".to_string()
         }),
+        None
+    );
+}
+
+#[skuld::test]
+fn a_refused_spawn_without_a_code_that_is_not_found_is_told_to_scm_as_file_not_found() {
+    assert_eq!(spawn_error_code(&not_found()), Some(ERROR_FILE_NOT_FOUND as i32));
+    // A real code wins over the kind's: ERROR_PATH_NOT_FOUND is `NotFound` too.
+    assert_eq!(
+        spawn_error_code(&cosca::error::Error::Io(std::io::Error::from_raw_os_error(
+            ERROR_PATH_NOT_FOUND as i32
+        ))),
+        Some(ERROR_PATH_NOT_FOUND as i32)
+    );
+    assert_eq!(
+        spawn_error_code(&cosca::error::Error::Io(std::io::Error::other("no os code"))),
         None
     );
 }

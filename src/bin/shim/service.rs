@@ -348,7 +348,7 @@ fn launch(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str) -> Result<(Arc<d
         Ok(child) => require_job_object(child, spec, log, id).map(|child| (Arc::from(child), waiter)),
         Err(e) => {
             log.failure(id, &spawn_failed(&spec.command, &e));
-            Err(Reported::shim_failure(os_error_of(&e)))
+            Err(Reported::shim_failure(spawn_error_code(&e)))
         }
     }
 }
@@ -378,18 +378,26 @@ fn require_job_object(
     Err(Reported::incomplete_stop())
 }
 
-/// The OS error code behind a `cosca` failure, if it has one. `cosca` searches for a binary itself
-/// and reports a miss as `NotFound` with no code; SCM is told `ERROR_FILE_NOT_FOUND` for it, the
-/// code `CreateProcess` gives for the same miss.
+/// The OS error code behind a `cosca` failure, if it has one.
 pub(crate) fn os_error_of(e: &cosca::error::Error) -> Option<i32> {
-    let code = |e: &std::io::Error| match e.raw_os_error() {
-        None if e.kind() == std::io::ErrorKind::NotFound => Some(ERROR_FILE_NOT_FOUND as i32),
-        raw => raw,
-    };
     match e {
-        cosca::error::Error::Io(e) => code(e),
-        cosca::error::Error::Unassessable { source, .. } => source.as_ref().and_then(code),
+        cosca::error::Error::Io(e) => e.raw_os_error(),
+        cosca::error::Error::Unassessable { source, .. } => source.as_ref().and_then(std::io::Error::raw_os_error),
         _ => None,
+    }
+}
+
+/// The OS error code SCM is told for a refused spawn: [`os_error_of`], and `ERROR_FILE_NOT_FOUND`
+/// for a `NotFound` without a code. The shim passes only argv, so `std` searches `PATH` for a bare
+/// program name before `CreateProcessW` is called, and its miss is `NotFound` with no code (a
+/// missing absolute path fails in `CreateProcessW`, with the code). Nothing else on the spawn path
+/// makes a code-less `NotFound`.
+pub(crate) fn spawn_error_code(e: &cosca::error::Error) -> Option<i32> {
+    match e {
+        cosca::error::Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound && io.raw_os_error().is_none() => {
+            Some(ERROR_FILE_NOT_FOUND as i32)
+        }
+        _ => os_error_of(e),
     }
 }
 
