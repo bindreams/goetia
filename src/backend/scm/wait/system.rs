@@ -430,14 +430,14 @@ impl super::ScmActor for SystemScmActor {
         }))
     }
 
-    fn stopped_exit(&self) -> RecordedExit {
+    fn delivered_exit(&self) -> RecordedExit {
         RecordedExit {
             win32: self.status.exit_win32.load(Ordering::Acquire),
             specific: self.status.exit_specific.load(Ordering::Acquire),
         }
     }
 
-    fn stopped_wait_hint(&self) -> u32 {
+    fn delivered_wait_hint(&self) -> u32 {
         self.status.wait_hint.load(Ordering::Acquire)
     }
 
