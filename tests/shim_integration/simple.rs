@@ -258,9 +258,9 @@ fn the_shim_reports_stop_pending_then_stopped() {
         WantState::StoppedOnly,
         QueriedState::Stopped,
         Budget::Unbounded.start(),
-        |sighting| match sighting.state {
+        |sighting| match sighting.status.state {
             QueriedState::Running | QueriedState::Paused => {
-                panic!("waiting for Stopped, the service reached {:?}", sighting.state)
+                panic!("waiting for Stopped, the service reached {:?}", sighting.status.state)
             }
             _ => Ok(ControlFlow::Continue(())),
         },

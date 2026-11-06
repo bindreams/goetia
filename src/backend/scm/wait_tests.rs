@@ -1634,7 +1634,7 @@ fn wait_until_tells_the_closure_whether_a_pending_state_was_delivered() {
         QueriedState::Stopped,
         unbounded(),
         |sighting| {
-            seen.push((sighting.state, sighting.pending_delivered));
+            seen.push((sighting.status.state, sighting.pending_delivered));
             Ok(if sighting.pending_delivered {
                 ControlFlow::Break(Waited::Expired)
             } else {
@@ -1651,12 +1651,18 @@ fn wait_until_tells_the_closure_whether_a_pending_state_was_delivered() {
     assert_eq!(fake.log, vec!["arm_stopped", "wait", "got_pending", "arm_stopped_only"]);
 }
 
-/// A `Stopped` notification off the target carries the record and wait hint of that notification.
+/// A `Stopped` notification off the target carries the status of that notification: its record, wait
+/// hint and controls accepted, which the arm's status (`START_PENDING`, no record) does not.
 #[skuld::test]
 fn wait_until_hands_a_notified_stopped_to_the_closure_with_its_record() {
     let mut fake = FakeScm::new([Some(Observed::Stopped)])
         .queried(QueriedState::StartPending, false)
-        .stopped_by_scm_with_wait_hint(2000);
+        .stopped_by_scm_with_wait_hint(2000)
+        .accepting([false]);
+    fake.recorded = RecordedExit {
+        win32: 1066,
+        specific: 42,
+    };
     let mut seen = vec![];
     let waited = wait_until(
         &mut fake,
@@ -1666,7 +1672,7 @@ fn wait_until_hands_a_notified_stopped_to_the_closure_with_its_record() {
         unbounded(),
         |sighting| {
             seen.push(sighting);
-            Ok(match sighting.state {
+            Ok(match sighting.status.state {
                 QueriedState::Stopped => ControlFlow::Break(Waited::Expired),
                 _ => ControlFlow::Continue(()),
             })
@@ -1675,9 +1681,18 @@ fn wait_until_hands_a_notified_stopped_to_the_closure_with_its_record() {
     .unwrap();
     assert_eq!(waited, Waited::Expired);
     let stopped = seen.last().copied().unwrap();
-    assert_eq!(stopped.state, QueriedState::Stopped);
-    assert_eq!(stopped.exit, RecordedExit { win32: 0, specific: 0 });
-    assert_eq!(stopped.wait_hint, 2000);
+    assert_eq!(
+        stopped.status,
+        QueriedStatus {
+            state: QueriedState::Stopped,
+            accepts_stop: false,
+            exit: RecordedExit {
+                win32: 1066,
+                specific: 42,
+            },
+            wait_hint: 2000,
+        }
+    );
     assert!(!stopped.pending_delivered);
 }
 
@@ -1695,7 +1710,7 @@ fn wait_until_rearms_with_its_second_mask_after_a_notification_the_closure_lets_
         QueriedState::Running,
         unbounded(),
         |sighting| {
-            seen.push((sighting.state, sighting.pending_delivered));
+            seen.push((sighting.status.state, sighting.pending_delivered));
             Ok(ControlFlow::Continue(()))
         },
     )

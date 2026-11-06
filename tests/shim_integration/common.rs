@@ -1,12 +1,11 @@
 //! Shared helpers for the `type: simple` integration tests.
 
+use std::ops::ControlFlow;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
 
 use goetia::backend::scm::exit_status::RecordedExit;
 use goetia::backend::scm::manager::Scm;
-use std::ops::ControlFlow;
-
 use goetia::backend::scm::wait::{QueriedState, SystemScmActor, Waited, WantState, wait_until};
 use goetia::manager::Budget;
 use goetia::spec::{DaemonSpec, Kind};
@@ -233,9 +232,9 @@ impl ShimProcess {
             WantState::Running,
             QueriedState::Running,
             Budget::Unbounded.start(),
-            |sighting| match sighting.state {
+            |sighting| match sighting.status.state {
                 QueriedState::Paused | QueriedState::Stopped => {
-                    panic!("waiting for Running, {id} reached {:?}", sighting.state)
+                    panic!("waiting for Running, {id} reached {:?}", sighting.status.state)
                 }
                 _ => Ok(ControlFlow::Continue(())),
             },
