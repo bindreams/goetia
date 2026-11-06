@@ -6,6 +6,8 @@
 use std::fmt;
 use std::process::Command;
 
+use super::cleanup::retrying;
+
 #[derive(Debug)]
 pub struct Run {
     pub program: String,
@@ -59,4 +61,24 @@ pub fn try_run(program: &str, args: &[&str]) -> Result<Run, String> {
 
 pub fn run(program: &str, args: &[&str]) -> Run {
     try_run(program, args).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Cleanup that never panics: runs every command of `argvs` (each an argument list for `program`)
+/// in one [`retrying`] attempt, so a guard spends at most one `CLEANUP_BOUND` however many it has.
+/// A command that exits with a code in `gone` ("already gone": not loaded, does not exist) is done;
+/// any other failure, a spawn error included, retries the whole attempt, so the commands must be
+/// safe to repeat. Returns the first problem of the last attempt, for the caller to log.
+pub fn run_cleanup(program: &str, argvs: &[&[&str]], gone: &[i32]) -> Option<String> {
+    retrying(|| {
+        let mut problem = None;
+        for args in argvs {
+            let this = match try_run(program, args) {
+                Ok(run) if run.ok() || run.code.is_some_and(|code| gone.contains(&code)) => None,
+                Ok(run) => Some(run.to_string()),
+                Err(e) => Some(e),
+            };
+            problem = problem.or(this);
+        }
+        problem
+    })
 }

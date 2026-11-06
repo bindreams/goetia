@@ -19,7 +19,7 @@ use goetia::decide::Outcome;
 use goetia::manager::{Budget, Installed, ServiceManager, State, conformance};
 use goetia::spec::{AccountId, DaemonSpec, Id, Kind, Restart, User};
 
-use crate::support::cleanup::{DirGuard, FileGuard, remove_or_warn, retrying, warn_left_behind};
+use crate::support::cleanup::{DirGuard, FileGuard, remove_or_warn, warn_left_behind};
 use crate::support::{self, ELEVATED, ServiceGuard, cmd};
 
 /// Held by every test whose assertion is about `list`'s answer for the *whole host* — its exit code,
@@ -1180,19 +1180,21 @@ fn the_version_gate_probes_once_per_daemon_per_verb() {
 /// Shell builtins only, so it forks nothing and the scope's task count is unchanged: finds the
 /// scope's cgroup in `/proc/self/cgroup` (the `pids` hierarchy's line on a cgroup v1 or hybrid
 /// host, else the `0::<path>` line of v2), reports that cgroup's `pids.max` and `pids.current` on
-/// stderr, naming the tree it read (or, with no such line, every line it saw), then `exec`s goetia
-/// (`$0 "$@"`) in the same process. `printf`, not `echo`: dash's `echo` interprets the `\x2d` in
-/// systemd's cgroup paths.
+/// stderr, naming the path it read (or, with no such line, every line it saw), then `exec`s goetia
+/// (`$0 "$@"`) in the same process. On v1 the path is under the mount named by the line's
+/// controllers field: a `cpu,pids` line mounts at `/sys/fs/cgroup/cpu,pids`. `printf '%s\n'`, not
+/// `echo`: dash's `echo` interprets `\\`, `\c`, `\0nnn` and others (not `\x`), which alters
+/// evidence that holds them; `printf '%s\n'` prints it verbatim whatever it holds.
 const SCOPE_PIDS_PREAMBLE: &str = r#"
-cg=; v1=; seen=
+cg=; v1=; v1ctl=; seen=
 while read -r line; do
   seen="$seen[$line]"
   rest=${line#*:}; controllers=${rest%%:*}; path=${rest#*:}
   case $line in 0::*) cg=$path;; esac
-  case ",$controllers," in *,pids,*) v1=$path;; esac
+  case ",$controllers," in *,pids,*) v1=$path; v1ctl=$controllers;; esac
 done < /proc/self/cgroup
 tree=; dir=
-if [ -n "$v1" ]; then tree=v1; dir=/sys/fs/cgroup/pids$v1
+if [ -n "$v1" ]; then tree=v1; dir=/sys/fs/cgroup/$v1ctl$v1
 elif [ -n "$cg" ]; then tree=v2; dir=/sys/fs/cgroup$cg; fi
 if [ -n "$dir" ]; then
   max=unreadable; cur=unreadable
@@ -1204,21 +1206,20 @@ fi
 exec "$0" "$@"
 "#;
 
-/// Removes the transient scope `unit` the test made: one still loaded, or left `failed`. `stop`,
-/// then `reset-failed`, each retried for `CLEANUP_BOUND` and then let go with a warning; never
-/// panics, so it also runs while the test unwinds. A scope that never was, or is gone already, is
-/// "not loaded". Names are never reused, so this is cleanup, not what lets the next scope start.
+/// Removes the transient scope `unit` the test made: one still loaded, or left `failed`. `stop`
+/// and `reset-failed` in one attempt, retried for `CLEANUP_BOUND` and then let go with a warning;
+/// never panics, so it also runs while the test unwinds. A scope that never was, or is gone already,
+/// exits 5 ("not loaded"). Names are never reused, so this is cleanup, not what lets the next scope
+/// start.
 struct ScopeGuard(String);
 
 impl Drop for ScopeGuard {
     fn drop(&mut self) {
-        for verb in ["stop", "reset-failed"] {
-            warn_left_behind(retrying(|| match cmd::try_run("systemctl", &[verb, &self.0]) {
-                Ok(run) if run.ok() || run.code == Some(5) || run.stderr.contains("not loaded") => None,
-                Ok(run) => Some(run.to_string()),
-                Err(e) => Some(e),
-            }));
-        }
+        warn_left_behind(cmd::run_cleanup(
+            "systemctl",
+            &[&["stop", &self.0], &["reset-failed", &self.0]],
+            &[5],
+        ));
     }
 }
 

@@ -46,20 +46,14 @@ fn cleanup(id: &str) -> Vec<String> {
     let path = std::path::PathBuf::from(SYSTEMD_UNIT_DIR).join(&unit);
 
     // Exit 5 is "unit not loaded", the one benign outcome.
-    let stop = cmd::run("systemctl", &["stop", &unit]);
-    if !stop.ok() && stop.code != Some(5) {
-        problems.push(stop.to_string());
-    }
+    problems.extend(cmd::run_cleanup("systemctl", &[&["stop", &unit]], &[5]));
     problems.extend(remove_path_retrying(&path, false));
     problems.extend(remove_path_retrying(&path.with_file_name(format!("{unit}.d")), true));
     let wants = std::path::PathBuf::from(SYSTEMD_UNIT_DIR)
         .join("multi-user.target.wants")
         .join(&unit);
     problems.extend(remove_path_retrying(&wants, false));
-    let reload = cmd::run("systemctl", &["daemon-reload"]);
-    if !reload.ok() {
-        problems.push(reload.to_string());
-    }
+    problems.extend(cmd::run_cleanup("systemctl", &[&["daemon-reload"]], &[]));
     problems
 }
 
@@ -69,10 +63,8 @@ fn cleanup(id: &str) -> Vec<String> {
 
     // 3 (no such process) and 113 (could not find specified service) both mean
     // the job was never bootstrapped, which is not a failure to clean up.
-    let bootout = cmd::run("launchctl", &["bootout", &format!("system/{id}")]);
-    if !bootout.ok() && !matches!(bootout.code, Some(3 | 113)) {
-        problems.push(bootout.to_string());
-    }
+    let target = format!("system/{id}");
+    problems.extend(cmd::run_cleanup("launchctl", &[&["bootout", &target]], &[3, 113]));
     let path = std::path::PathBuf::from(LAUNCHD_DAEMON_DIR).join(format!("{id}.plist"));
     problems.extend(remove_path_retrying(&path, false));
 
@@ -88,15 +80,9 @@ fn cleanup(id: &str) -> Vec<String> {
 
     // `sc.exe` exits with the Win32 error: 1060 is ERROR_SERVICE_DOES_NOT_EXIST,
     // 1062 is ERROR_SERVICE_NOT_ACTIVE and 1072 is ERROR_SERVICE_MARKED_FOR_DELETE.
-    let stop = cmd::run("sc.exe", &["stop", id]);
-    if !stop.ok() && !matches!(stop.code, Some(1060 | 1062 | 1072)) {
-        problems.push(stop.to_string());
-    }
+    problems.extend(cmd::run_cleanup("sc.exe", &[&["stop", id]], &[1060, 1062, 1072]));
     // 1072: `uninstall` may return while the record is only marked for deletion;
     // SCM drops it once its last handle closes. Nothing is left to delete.
-    let delete = cmd::run("sc.exe", &["delete", id]);
-    if !delete.ok() && !matches!(delete.code, Some(1060 | 1072)) {
-        problems.push(delete.to_string());
-    }
+    problems.extend(cmd::run_cleanup("sc.exe", &[&["delete", id]], &[1060, 1072]));
     problems
 }
