@@ -29,7 +29,7 @@ pub fn remove_path(path: &std::path::Path, dir: bool) -> Option<String> {
 pub const CLEANUP_BOUND: Duration = Duration::from_secs(5);
 
 /// `attempt`, retried until it succeeds or [`CLEANUP_BOUND`] passes; then the last problem.
-fn retrying(mut attempt: impl FnMut() -> Option<String>) -> Option<String> {
+pub fn retrying(mut attempt: impl FnMut() -> Option<String>) -> Option<String> {
     let start = Instant::now();
     loop {
         match attempt() {

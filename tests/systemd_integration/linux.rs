@@ -119,8 +119,8 @@ fn seed_unreadable_dropin_enotdir(id: &str) -> FileGuard {
 /// missing. `scan_host` reaches any root but `UNIT_DIR` through its cross-root pass alone, and only
 /// for the drop-in half — a *fragment* outside `UNIT_DIR` deliberately names no id (see `HostScan`).
 ///
-/// The root is removed only when this call created it, and with `remove_dir`, so a root systemd
-/// itself populated is left exactly as it was found.
+/// The root, and any parent made for it, is removed only when this call created it, and with
+/// `remove_dir`, so a root systemd itself populated is left exactly as it was found.
 fn seed_unreadable_dropin_in_root(root: &str, id: &str) -> (PathBuf, RmInRoot<FileGuard>) {
     let root_path = PathBuf::from(root);
     let leaf = root_path.join(format!("{id}.service.d"));
@@ -132,7 +132,7 @@ fn seed_unreadable_dropin_in_root(root: &str, id: &str) -> (PathBuf, RmInRoot<Fi
 /// Seed one `*.conf` into an arbitrary drop-in directory and hand back the RAII removal of it. The
 /// parent search root is left exactly as found: `/etc/systemd/system` is shared with every other
 /// test running concurrently.
-fn seed_dropin(dir: &Path, root: Option<PathBuf>) -> RmInRoot<DirGuard> {
+fn seed_dropin(dir: &Path, root: CreatedRoot) -> RmInRoot<DirGuard> {
     let guard = RmInRoot::new(DirGuard::new(dir.to_path_buf()), root);
     fs::create_dir_all(dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
     fs::write(dir.join("50-x.conf"), "[Service]\nMemoryMax=8G\n").expect("write drop-in");
@@ -144,7 +144,8 @@ fn seed_dropin(dir: &Path, root: Option<PathBuf>) -> RmInRoot<DirGuard> {
 /// PROPERTY=VALUE` writes, and the two highest-precedence entries on the system unit search path,
 /// both above `/etc/systemd/system`.
 ///
-/// The root is removed along with the drop-in only where this call created it. Each test that seeds
+/// The root, and any parent made for it, is removed along with the drop-in only where this call
+/// created it. Each test that seeds
 /// one takes a *different* root, so no concurrently running test can be inside the one this removes
 /// — and the removal is `remove_dir`, so a root systemd itself populated for some other unit fails
 /// to go and is left as it was found.
@@ -261,35 +262,42 @@ fn uid_of(account: &str) -> u32 {
         .unwrap_or_else(|e| panic!("parse uid of {account}: {e}"))
 }
 
-/// Creates the search root `root`, with its parents, and returns it only if this call created it:
-/// `create_dir` answers `AlreadyExists` for a root that was there first, so ownership is not a
-/// check followed by a create.
-fn create_root(root: &Path) -> Option<PathBuf> {
-    if let Some(parent) = root.parent() {
-        fs::create_dir_all(parent).unwrap_or_else(|e| panic!("mkdir {}: {e}", parent.display()));
+/// Creates the search root `root` and any of its parents that are missing, outermost first, and
+/// returns the ones this call created: `create_dir` answers `AlreadyExists` for a directory that
+/// was there first, so ownership is not a check followed by a create. The result is filled as it
+/// goes, so a panic partway still removes what was made.
+fn create_root(root: &Path) -> CreatedRoot {
+    let mut missing: Vec<&Path> = root.ancestors().take_while(|p| !p.exists()).collect();
+    missing.reverse();
+    let mut created = CreatedRoot::default();
+    for dir in missing {
+        match fs::create_dir(dir) {
+            Ok(()) => created.0.push(dir.to_path_buf()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => panic!("mkdir {}: {e}", dir.display()),
+        }
     }
-    match fs::create_dir(root) {
-        Ok(()) => Some(root.to_path_buf()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
-        Err(e) => panic!("mkdir {}: {e}", root.display()),
-    }
+    created
 }
 
-/// A search root a seeding call created, removed on drop with `remove_dir`. "Not empty" is
-/// expected, not a failure: a root systemd itself populated for some other unit is left as it was
-/// found.
-struct CreatedRoot(PathBuf);
+/// The search root a seeding call created and the parents it created for it, removed on drop,
+/// innermost first, with `remove_dir`. "Not empty" is expected, not a failure: a directory systemd
+/// itself populated for some other unit is left as it was found.
+#[derive(Default)]
+struct CreatedRoot(Vec<PathBuf>);
 
 impl Drop for CreatedRoot {
     fn drop(&mut self) {
-        match fs::remove_dir(&self.0) {
-            Ok(()) => {}
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
-                ) => {}
-            Err(e) => eprintln!("warning: left behind: remove {}: {e}", self.0.display()),
+        for dir in self.0.iter().rev() {
+            match fs::remove_dir(dir) {
+                Ok(()) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                    ) => {}
+                Err(e) => eprintln!("warning: left behind: remove {}: {e}", dir.display()),
+            }
         }
     }
 }
@@ -298,18 +306,19 @@ impl Drop for CreatedRoot {
 /// standing where one belongs) and, where the seeding call created it, the search root holding it.
 /// The leaf field is declared first, so it is removed before the root; see [`seed_control_dropin`].
 ///
-/// No `daemon-reload` on drop: a test that reloaded holds a `ServiceGuard`, whose cleanup reloads
-/// after this runs.
+/// No `daemon-reload` on drop. A test that seeds and never reloads needs no `ServiceGuard`, because
+/// systemd holds nothing from the seed; one that reloads holds a `ServiceGuard`, whose cleanup
+/// reloads after this runs.
 struct RmInRoot<L> {
     _leaf: L,
-    _root: Option<CreatedRoot>,
+    _root: CreatedRoot,
 }
 
 impl<L> RmInRoot<L> {
-    fn new(leaf: L, root: Option<PathBuf>) -> Self {
+    fn new(leaf: L, root: CreatedRoot) -> Self {
         Self {
             _leaf: leaf,
-            _root: root.map(CreatedRoot),
+            _root: root,
         }
     }
 }
@@ -783,7 +792,9 @@ pub(crate) fn main_pid(id: &str) -> String {
 /// succeeds, so nothing is left `failed` — and removes it; declared after the `ServiceGuard`, so it
 /// drops first.
 ///
-/// The lock file is `/run/{id}.lock`, not in a temp dir: PID 1 must open the same path.
+/// The lock file is `/run/{id}.lock`, not in a temp dir. The `ExecStop` `flock` runs under systemd,
+/// which does not see the test's `TMPDIR`, and the path is spliced unquoted into the unit's
+/// `ExecStop=` line, where whitespace or `%` would break it; `/run/{id}.lock` avoids both.
 struct StopHolder {
     unit: String,
     path: PathBuf,
@@ -1683,7 +1694,7 @@ fn a_dash_truncated_dropin_is_not_this_ids_conflict() {
 
     let truncated = guard.id().rsplit_once('-').expect("the id has a dash").0.to_string();
     let dir = PathBuf::from(support::SYSTEMD_UNIT_DIR).join(format!("{truncated}-.service.d"));
-    let _cleanup = seed_dropin(&dir, None);
+    let _cleanup = seed_dropin(&dir, CreatedRoot::default());
 
     let outcome = mgr.preview_install(&mk(guard.id())).expect("preview");
     assert_eq!(
@@ -1695,7 +1706,7 @@ fn a_dash_truncated_dropin_is_not_this_ids_conflict() {
 
     // And the same id's *own* drop-in still is drift, so this is a boundary, not a hole — and one
     // `--force` does resolve, since `/etc/systemd/system/<id>.service.d` is goetia's to clear.
-    let _own = seed_dropin(&dropin_dir(guard.id()), None);
+    let _own = seed_dropin(&dropin_dir(guard.id()), CreatedRoot::default());
     let outcome = mgr.preview_install(&mk(guard.id())).expect("preview");
     assert!(
         matches!(
