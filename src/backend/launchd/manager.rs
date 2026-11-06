@@ -10,17 +10,19 @@
 //! - `start` `launchctl bootstrap`s the plist from wherever it is (if not already loaded), then
 //!   `launchctl kickstart`s it, which is what launches a job with no `KeepAlive`/`RunAtLoad` (a
 //!   `restart: never` daemon). Under a budget that waits, the kickstart asks for the pid (`-p`)
-//!   and so blocks on launchd's respawn throttle (measured ~10.02s, 10.01-10.03s) whenever the job
-//!   has respawn history, as a crash-looping `restart: always` job has once launchd has run it.
-//!   [`Budget::DEFAULT`] is 10s, just below the throttle, but the throttle runs from the job's last
-//!   fork, not from the kick: `WaitTimeout` occurs only when the kick lands within ~20ms of that
-//!   fork. Otherwise the verify and corrective path can give `Ok`, `WaitTimeout`,
-//!   `StartUnconfirmed` or `NotStarted`. `bootstrap` returns at load, before the `RunAtLoad` run is
-//!   forked, so a `start` straight after it may meet no throttle and give any of those four. The
-//!   request stands (the `launchctl` carrying it is left running, never killed), but launchd will
-//!   not report the job running within the budget. The budget bounds that wait and nothing else:
-//!   every `launchctl` call that issues the request runs to completion. The throttle is keyed to
-//!   the job, so `bootout` plus `bootstrap` does not clear it and there is no remedy to apply.
+//!   and so blocks on launchd's respawn throttle whenever the job has respawn history, as a
+//!   crash-looping `restart: always` job has once launchd has run it. The throttle is launchd's
+//!   `ThrottleInterval`: goetia writes it from `spec.restart_delay` when `restart` is not `never`,
+//!   and launchd's default is about 10s (measured 10.02s, 10.01-10.03s). The throttle runs from the
+//!   job's last fork, not from the kick. `WaitTimeout` occurs when the time from that fork to the
+//!   kick, plus the verb's pre-kick reads, leaves the throttle longer than the remaining budget
+//!   ([`Budget::DEFAULT`] is 10s). Otherwise the verify and corrective path can give `Ok`,
+//!   `WaitTimeout`, `StartUnconfirmed` or `NotStarted`. `bootstrap` returns at load, before the
+//!   `RunAtLoad` run is forked, so a `start` straight after it may meet no throttle and give any of
+//!   those four. On `WaitTimeout` the request stands (the `launchctl` carrying it is left running,
+//!   never killed). The budget bounds that wait and nothing else: every `launchctl` call that issues
+//!   the request runs to completion. The throttle is keyed to the job, so `bootout` plus `bootstrap`
+//!   does not clear it and there is no remedy to apply.
 //! - `stop` `launchctl bootout`s the job, from whichever directory it was loaded.
 //! - `enable` moves the plist from [`STAGING_DIR`] into [`ENABLED_DIR`] (`/Library/LaunchDaemons`).
 //!   Does not start it.
