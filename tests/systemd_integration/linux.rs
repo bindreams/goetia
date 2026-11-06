@@ -19,7 +19,7 @@ use goetia::decide::Outcome;
 use goetia::manager::{Budget, Installed, ServiceManager, State, conformance};
 use goetia::spec::{AccountId, DaemonSpec, Id, Kind, Restart, User};
 
-use crate::support::cleanup::{DirGuard, FileGuard, remove_or_warn};
+use crate::support::cleanup::{DirGuard, FileGuard, remove_or_warn, warn_left_behind};
 use crate::support::{self, ELEVATED, ServiceGuard, cmd};
 
 /// Held by every test whose assertion is about `list`'s answer for the *whole host* — its exit code,
@@ -651,8 +651,8 @@ fn unstoppable(id: &str) -> DaemonSpec {
 
 /// Ends an [`unstoppable`] unit: `SIGKILL` lets the stop job it is stuck in complete, a blocking
 /// `systemctl stop` waits for exactly that, and `reset-failed` clears the `failed` state the kill
-/// leaves — which would otherwise outlive the unit file `ServiceGuard` removes. Declared after the
-/// `ServiceGuard`, so it drops first.
+/// leaves — which would otherwise outlive the unit file `ServiceGuard` removes. Never panics. Declared
+/// after the `ServiceGuard`, so it drops first.
 struct Unstoppable(String);
 
 impl Unstoppable {
@@ -669,16 +669,15 @@ impl Unstoppable {
 impl Drop for Unstoppable {
     fn drop(&mut self) {
         let unit = format!("{}.service", self.0);
-        for args in [
-            &["kill", "--signal=SIGKILL", unit.as_str()][..],
-            &["stop", unit.as_str()],
-            &["reset-failed", unit.as_str()],
-        ] {
-            let run = cmd::run("systemctl", args);
-            if !run.ok() {
-                eprintln!("Unstoppable[{}]: cleanup failed: {run}", self.0);
-            }
-        }
+        warn_left_behind(cmd::run_cleanup_unless(
+            "systemctl",
+            &[
+                &["kill", "--signal=SIGKILL", &unit],
+                &["stop", &unit],
+                &["reset-failed", &unit],
+            ],
+            not_loaded,
+        ));
     }
 }
 
@@ -856,15 +855,9 @@ impl Drop for StopHolder {
         self.release();
         // `start` builds the holder before writing the unit, so a failed start leaves it unmade:
         // exit 5 is "unit not loaded", and a missing file is already gone.
-        let run = cmd::run("systemctl", &["stop", &self.unit]);
-        if !run.ok() && run.code != Some(5) {
-            eprintln!("StopHolder[{}]: cleanup failed: {run}", self.unit);
-        }
+        warn_left_behind(cmd::run_cleanup("systemctl", &[&["stop", &self.unit]], &[5]));
         remove_or_warn(&self.path, false);
-        let run = cmd::run("systemctl", &["daemon-reload"]);
-        if !run.ok() {
-            eprintln!("StopHolder[{}]: cleanup failed: {run}", self.unit);
-        }
+        warn_left_behind(cmd::run_cleanup("systemctl", &[&["daemon-reload"]], &[]));
     }
 }
 
@@ -1177,11 +1170,60 @@ fn the_version_gate_probes_once_per_daemon_per_verb() {
     }
 }
 
-/// `goetia <args>` in a transient scope allowed `tasks` tasks — threads and processes alike — so
-/// that making a thread, or spawning a process, fails once they are spent.
-fn goetia_with_tasks(tasks: u32, args: &[&str]) -> std::process::Output {
+/// Shell builtins only, so it forks nothing and the scope's task count is unchanged: prints the
+/// scope's cgroup path, `pids.max` and `pids.current` on stderr (v1/hybrid `pids` line, else v2 `0::`
+/// line), then `exec`s `$0 "$@"`. `printf '%s\n'`, not `echo`, which would interpret backslash
+/// escapes in the evidence.
+const SCOPE_PIDS_PREAMBLE: &str = r#"
+cg=; v1=; v1ctl=; seen=
+while read -r line; do
+  seen="$seen[$line]"
+  rest=${line#*:}; controllers=${rest%%:*}; path=${rest#*:}
+  case $line in 0::*) cg=$path;; esac
+  case ",$controllers," in *,pids,*) v1=$path; v1ctl=$controllers;; esac
+done < /proc/self/cgroup
+tree=; dir=
+if [ -n "$v1" ]; then tree=v1; dir=/sys/fs/cgroup/$v1ctl$v1
+elif [ -n "$cg" ]; then tree=v2; dir=/sys/fs/cgroup$cg; fi
+if [ -n "$dir" ]; then
+  max=unreadable; cur=unreadable
+  read -r max < "$dir/pids.max"; read -r cur < "$dir/pids.current"
+  printf '%s\n' "scope at start: tree=$tree cgroup=$dir pids.max=$max pids.current=$cur" >&2
+else
+  printf '%s\n' "scope at start: no pids cgroup in /proc/self/cgroup: $seen" >&2
+fi
+exec "$0" "$@"
+"#;
+
+/// Removes the transient scope `unit` the test made: one still loaded, or left `failed` (a scope
+/// that outlives its `TimeoutStopSec` stays loaded in that state until `reset-failed`). `stop`, then
+/// `reset-failed`, each retried for `CLEANUP_BOUND` and then let go with a warning; never panics, so
+/// it also runs while the test unwinds. A scope that never was, or is gone already, is "not loaded".
+struct ScopeGuard(String);
+
+impl Drop for ScopeGuard {
+    fn drop(&mut self) {
+        warn_left_behind(cmd::run_cleanup("systemctl", &[&["stop", &self.0]], &[5]));
+        warn_left_behind(cmd::run_cleanup_unless(
+            "systemctl",
+            &[&["reset-failed", &self.0]],
+            not_loaded,
+        ));
+    }
+}
+
+/// Whether a failed `systemctl` run says its unit is not loaded: `stop` exits 5, while `kill` and
+/// `reset-failed` pass the bus error through as exit 1.
+fn not_loaded(run: &cmd::Run) -> bool {
+    run.code == Some(5) || (run.code == Some(1) && run.stderr.contains("not loaded"))
+}
+
+/// `goetia <args>` in the transient scope `unit` allowed `tasks` tasks — threads and processes
+/// alike — so that making a thread, or spawning a process, fails once they are spent.
+fn goetia_with_tasks(unit: &str, tasks: u32, args: &[&str]) -> std::process::Output {
     Command::new("systemd-run")
-        .args(["--quiet", "--scope", "-p", &format!("TasksMax={tasks}")])
+        .args(["--quiet", "--scope", "--unit", unit, "-p", &format!("TasksMax={tasks}")])
+        .args(["sh", "-c", SCOPE_PIDS_PREAMBLE])
         .arg(env!("CARGO_BIN_EXE_goetia"))
         .args(args)
         .output()
@@ -1197,9 +1239,13 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
     let guard = ServiceGuard::new(&id);
     Systemd::new().install(&mk(guard.id()), false).expect("install");
 
+    let scopes = std::cell::Cell::new(0u32);
     let sweep = |args: &[&str], untouched: &dyn Fn(u32)| {
         for tasks in 1.. {
-            let output = goetia_with_tasks(tasks, args);
+            scopes.set(scopes.get() + 1);
+            let unit = format!("{}-tasks-{}.scope", guard.id(), scopes.get());
+            let _scope = ScopeGuard(unit.clone());
+            let output = goetia_with_tasks(&unit, tasks, args);
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
             assert!(!stderr.contains("panicked"), "{args:?} TasksMax={tasks}: {stderr}");
             match output.status.code() {
@@ -1208,7 +1254,11 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
                     // starved the verb.
                     assert!(
                         tasks > 1,
-                        "{args:?} succeeded with a single task, so the sweep tested nothing"
+                        "{args:?} succeeded with a single task, so the sweep tested nothing\n\
+                         scope: {unit} (TasksMax={tasks})\n\
+                         --- stdout ---\n{}\n\
+                         --- stderr ---\n{stderr}",
+                        String::from_utf8_lossy(&output.stdout),
                     );
                     return;
                 }

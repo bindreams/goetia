@@ -773,10 +773,13 @@ impl LocalUserGuard {
 
 impl Drop for LocalUserGuard {
     fn drop(&mut self) {
-        let del = support::cmd::run("net.exe", &["user", &self.name, "/delete"]);
-        if !del.ok() {
-            eprintln!("LocalUserGuard[{}]: cleanup failed: {del}", self.name);
-        }
+        // `net.exe` exits 2 for every error; the message names the Win32 one, and 2221 is
+        // NERR_UserNotFound ("NET HELPMSG 2221"), the account already gone.
+        support::cleanup::warn_left_behind(support::cmd::run_cleanup_unless(
+            "net.exe",
+            &[&["user", &self.name, "/delete"]],
+            |run| run.stderr.contains("2221"),
+        ));
     }
 }
 
