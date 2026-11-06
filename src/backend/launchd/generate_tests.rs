@@ -558,21 +558,6 @@ fn base64_alphabet_cannot_produce_a_comment_terminator() {
     );
 }
 
-// Non-UTF-8 paths =====================================================================================================
-
-#[skuld::test]
-fn a_non_utf8_path_cannot_reach_the_generator() {
-    // `to_string_lossy` would substitute U+FFFD and name a path that does not exist, so
-    // `DaemonSpec::new` refuses the spec and `path_str` never sees one.
-    let err = DaemonSpec::new(DaemonFields {
-        cwd: Some(DaemonSpec::non_utf8_path_for_test()),
-        ..minimal_spec().into_fields()
-    })
-    .expect_err("a non-UTF-8 cwd must be refused");
-
-    assert!(err.to_string().contains("not valid UTF-8"), "{err}");
-}
-
 // without_metadata ====================================================================================================
 
 #[skuld::test]

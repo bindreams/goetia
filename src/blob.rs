@@ -296,10 +296,6 @@ fn daemon_spec_from_wire(wire: WireSpec) -> Result<DaemonSpec, Error> {
         WireRestart::Always => Restart::Always,
     };
 
-    // Reported after `DaemonSpec::new`'s field rules, so a blob with several defects reports the
-    // same first one as before.
-    let restart_delay = wire.restart_delay.map(|d| duration_from_wire(&id, d));
-
     let kind = match wire.kind {
         WireKind::Simple => Kind::Simple,
         WireKind::Managed => Kind::Managed,
@@ -313,21 +309,29 @@ fn daemon_spec_from_wire(wire: WireSpec) -> Result<DaemonSpec, Error> {
         env: wire.env,
         user,
         restart,
-        restart_delay: restart_delay.as_ref().and_then(|d| d.as_ref().ok().copied()),
+        restart_delay: wire.restart_delay.as_ref().map(duration_from_wire),
         logs: wire.logs.map(PathBuf::from),
         kind,
     })?;
-    restart_delay.transpose()?;
+    // After the field rules, so a blob with several defects reports the same first one as before.
+    if let Some(delay) = &wire.restart_delay {
+        check_nanos(&spec.id, delay)?;
+    }
     Ok(spec)
 }
 
-/// `Duration::new` panics if `nanos >= 1_000_000_000`; a hand-tampered
-/// blob can carry exactly that, so this is checked rather than trusted.
-/// This is a `DaemonSpec`-content invariant on an otherwise cleanly
-/// decoded envelope, so it is `Error::Invalid` like every field rule in
-/// `DaemonSpec::new` — not `Error::Blob`, which is reserved for a
-/// corrupt envelope (see `error.rs`).
-fn duration_from_wire(id: &Id, wire: WireDuration) -> Result<Duration, Error> {
+/// `Duration::new` panics if `secs` plus the carry from `nanos >= 1_000_000_000` overflows, so
+/// this saturates instead. The result of an out-of-range `nanos` is never used: [`check_nanos`]
+/// refuses it right after.
+fn duration_from_wire(wire: &WireDuration) -> Duration {
+    Duration::from_secs(wire.secs).saturating_add(Duration::from_nanos(wire.nanos.into()))
+}
+
+/// A hand-tampered blob can carry `nanos >= 1_000_000_000`, so it is checked rather than
+/// trusted. This is a `DaemonSpec`-content invariant on an otherwise cleanly decoded envelope, so
+/// it is `Error::Invalid` like every field rule in `DaemonSpec::new` — not `Error::Blob`, which is
+/// reserved for a corrupt envelope (see `error.rs`).
+fn check_nanos(id: &Id, wire: &WireDuration) -> Result<(), Error> {
     if wire.nanos >= 1_000_000_000 {
         return Err(Error::Invalid {
             daemon: id.as_str().to_string(),
@@ -338,7 +342,7 @@ fn duration_from_wire(id: &Id, wire: WireDuration) -> Result<Duration, Error> {
             source: None,
         });
     }
-    Ok(Duration::new(wire.secs, wire.nanos))
+    Ok(())
 }
 
 #[cfg(test)]
