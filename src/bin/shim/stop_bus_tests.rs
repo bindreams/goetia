@@ -470,7 +470,7 @@ fn a_failed_wait_whose_tree_kill_was_refused_refuses_a_later_stop() {
 
 #[skuld::test]
 fn a_stop_after_a_failure_was_decided_is_refused() {
-    let bus = StopBus::default();
+    let bus = StopBus::new();
 
     assert_eq!(bus.settle(Reported::DaemonExit(7)), Reported::DaemonExit(7));
 
@@ -482,7 +482,7 @@ fn a_stop_after_a_failure_was_decided_is_refused() {
 
 #[skuld::test]
 fn a_stop_before_a_failure_was_decided_turns_the_failure_into_a_clean_stop() {
-    let bus = StopBus::default();
+    let bus = StopBus::new();
 
     assert!(bus.request_stop());
 
@@ -492,7 +492,7 @@ fn a_stop_before_a_failure_was_decided_turns_the_failure_into_a_clean_stop() {
 
 #[skuld::test]
 fn a_clean_exit_does_not_refuse_a_later_stop() {
-    let bus = StopBus::default();
+    let bus = StopBus::new();
 
     assert_eq!(bus.settle(Reported::Clean), Reported::Clean);
 
@@ -501,7 +501,7 @@ fn a_clean_exit_does_not_refuse_a_later_stop() {
 
 #[skuld::test]
 fn a_repeated_stop_is_accepted_again() {
-    let bus = StopBus::default();
+    let bus = StopBus::new();
 
     assert!(bus.request_stop());
     assert!(bus.request_stop());

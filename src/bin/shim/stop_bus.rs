@@ -48,9 +48,9 @@ struct Gate {
 }
 
 /// The gate between the SCM control handler, the service thread and the waiter thread. It holds
-/// the gate and nothing else, so the control handler needs no [`Os`] and no [`Log`].
-#[derive(Default)]
-pub struct StopBus {
+/// the gate and nothing else, so the control handler needs no [`Os`] and no [`Log`]. Only
+/// [`Supervisor::new`] makes one, so a run's bus is the one its waiters report to.
+pub(crate) struct StopBus {
     state: Mutex<Gate>,
     cvar: Condvar,
 }
@@ -157,6 +157,13 @@ impl Waiter {
 }
 
 impl StopBus {
+    fn new() -> StopBus {
+        StopBus {
+            state: Mutex::new(Gate::default()),
+            cvar: Condvar::new(),
+        }
+    }
+
     /// Called from the SCM control handler (`service::control_handler`), on the dispatcher thread.
     /// Only ever sets a flag and wakes waiters — it never acts on the child
     /// itself. Acting directly from this callback (calling `kill_tree()`
@@ -218,8 +225,9 @@ impl StopBus {
 // Supervisor ==========================================================================================================
 
 /// What one run of the service supervises with: the [`Os`] it asks, the [`Log`] every failure of the
-/// run goes to, and the [`StopBus`] gate the control handler shares. There is one per process run,
-/// so the daemon-log path [`Log::set_daemon_log`] records is the one the waiter thread logs to too.
+/// run goes to, and the [`StopBus`] gate the control handler shares. A run has one [`Log`], shared by
+/// the clones of the supervisor's `Arc<Log>` (the [`Waiter`]'s thread holds one), so the daemon-log
+/// path [`Log::set_daemon_log`] records is the one the waiter thread logs to too.
 pub struct Supervisor {
     pub(crate) os: Arc<dyn Os>,
     pub(crate) log: Arc<Log>,
@@ -233,7 +241,7 @@ impl Supervisor {
         Supervisor {
             os,
             log,
-            bus: Arc::new(StopBus::default()),
+            bus: Arc::new(StopBus::new()),
         }
     }
 
