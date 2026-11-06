@@ -164,10 +164,10 @@ pub(crate) struct ScmSnapshot {
     blob: Decoded,
     /// Its `Parameters` values, which hold the only proof of ownership `type: managed` has.
     parameters: BTreeMap<String, String>,
-    /// The object `read` opened to classify it, so `installed` and `live_status` ask that object:
-    /// a service deleted since then does not turn into an unusable one. `None` for what `scan`
-    /// saw, which opens no service.
-    service: Option<Service>,
+    /// The one object every query of this snapshot asks, so that a service deleted and recreated
+    /// meanwhile cannot answer part of them: the one `read` opened to classify it, or, for what
+    /// `scan` saw (which opens no service), the one [`Self::service`] opens on first use.
+    service: OnceLock<Service>,
     /// The service's configuration, queried by whichever of `installed`, `regenerate` and
     /// `live_status` asks first and kept: a verb that needs it twice (`judge` reads what is
     /// installed, then regenerates against it) cannot fail on the second read.
@@ -178,7 +178,12 @@ pub(crate) struct ScmSnapshot {
 type Opened = (BTreeMap<String, String>, Option<Service>);
 
 impl ScmSnapshot {
-    fn new(id: Id, blob: Decoded, (parameters, service): Opened) -> Self {
+    fn new(id: Id, blob: Decoded, (parameters, opened): Opened) -> Self {
+        let service = OnceLock::new();
+        if let Some(opened) = opened {
+            // A fresh cell takes the first value.
+            let _ = service.set(opened);
+        }
         Self {
             id,
             blob,
@@ -200,26 +205,25 @@ impl InstalledService for ScmSnapshot {
 }
 
 impl ScmSnapshot {
-    /// Runs `ask` on the service `read` opened, or on one opened by name with `access` where the
-    /// snapshot holds none; a service gone by then is [`Error::NotInstalled`].
-    fn ask<T>(&self, access: ServiceAccess, context: &str, ask: impl FnOnce(&Service) -> Result<T>) -> Result<T> {
-        match &self.service {
-            Some(service) => ask(service),
-            None => {
-                let service = open_scm(ServiceManagerAccess::CONNECT)?
-                    .open_service(self.id.as_str(), access)
-                    .map_err(|e| {
-                        if is_not_found(&e) || is_marked_for_delete(&e) {
-                            Error::NotInstalled {
-                                id: self.id.as_str().to_string(),
-                            }
-                        } else {
-                            to_error(context, e)
-                        }
-                    })?;
-                ask(&service)
-            }
+    /// The snapshot's service: the one `read` opened, or one opened by name on first use. A service
+    /// gone by then is [`Error::NotInstalled`].
+    fn service(&self) -> Result<&Service> {
+        if let Some(service) = self.service.get() {
+            return Ok(service);
         }
+        let id = &self.id;
+        let service = open_scm(ServiceManagerAccess::CONNECT)?
+            .open_service(id.as_str(), ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG)
+            .map_err(|e| {
+                if is_not_found(&e) || is_marked_for_delete(&e) {
+                    Error::NotInstalled {
+                        id: id.as_str().to_string(),
+                    }
+                } else {
+                    to_error(&format!("open `{id}` to query it"), e)
+                }
+            })?;
+        Ok(self.service.get_or_init(|| service))
     }
 
     /// The service's configuration, queried on the first call and kept.
@@ -228,12 +232,10 @@ impl ScmSnapshot {
             return Ok(config);
         }
         let id = &self.id;
-        let context = format!("open `{id}` to query its configuration");
-        let config = self.ask(ServiceAccess::QUERY_CONFIG, &context, |service| {
-            service
-                .query_config()
-                .map_err(|e| to_error(&format!("query configuration for `{id}`"), e))
-        })?;
+        let config = self
+            .service()?
+            .query_config()
+            .map_err(|e| to_error(&format!("query configuration for `{id}`"), e))?;
         Ok(self.config.get_or_init(|| config))
     }
 
@@ -321,10 +323,7 @@ impl Backend for Scm {
     fn installed(&self, snapshot: &ScmSnapshot) -> Result<InstalledDefinition<ScmRegistration>> {
         let id = snapshot.id();
         let config = snapshot.config()?;
-        let context = format!("open `{id}` to read its configuration");
-        let definition = snapshot.ask(ServiceAccess::QUERY_CONFIG, &context, |service| {
-            read_live_registration(config, service, id.as_str(), &snapshot.parameters)
-        })?;
+        let definition = read_live_registration(config, snapshot.service()?, id.as_str(), &snapshot.parameters)?;
         Ok(InstalledDefinition {
             definition,
             external: ExternalConfig::Absent,
@@ -347,10 +346,7 @@ impl Backend for Scm {
     fn live_status(&self, snapshot: &ScmSnapshot) -> Result<Status> {
         let id = snapshot.id();
         let enabled = snapshot.config()?.start_type == ServiceStartType::AutoStart;
-        let context = format!("open `{id}` to query its live status");
-        let (state, pid) = snapshot.ask(ServiceAccess::QUERY_STATUS, &context, |service| {
-            query_live(service, id.as_str())
-        })?;
+        let (state, pid) = query_live(snapshot.service()?, id.as_str())?;
         Ok(Status { state, pid, enabled })
     }
 
