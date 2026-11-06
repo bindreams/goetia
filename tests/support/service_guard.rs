@@ -14,6 +14,8 @@
 use super::cleanup::remove_path_retrying;
 use super::{LAUNCHD_DAEMON_DIR, SYSTEMD_UNIT_DIR, cmd};
 
+pub use super::cleanup::{CLEANUP_BOUND, remove_path, remove_path_retrying};
+
 pub struct ServiceGuard {
     id: String,
 }
