@@ -2,12 +2,10 @@
 name = "goetia"
 version = "0.2.0"
 edition = "2024"
-# CI builds with exactly this toolchain. The language floor is 1.88, from the
-# let-chain in `backend::launchd::manager`; 1.89 is the lowest on which
-# `cargo clippy --all-targets -- -D warnings` is clean, because 1.88 flags
-# `uninlined_format_args` in `backend::scm::generate_tests` and later
-# releases do not. Dependencies need at most 1.85.
-rust-version = "1.89"
+# CI builds with exactly this toolchain. Let-chains and `slice::as_chunks`
+# (both stable in 1.88) force the floor; `std::io::PipeReader`, used by goetia
+# and by cosca, needs 1.87.
+rust-version = "1.88"
 description = "Install system daemons described in goetia.yaml as native Windows/SCM, macOS/launchd, and Linux/systemd services"
 license = "Apache-2.0"
 readme = "README.md"
