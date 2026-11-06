@@ -121,3 +121,35 @@ fn log_destinations_do_not_retry_the_default_when_it_is_the_daemon_log() {
 
     assert_eq!(log_destinations(Some(&default), default.clone()), vec![default]);
 }
+
+#[skuld::test]
+fn a_failure_still_reaches_the_event_log_when_neither_file_can_be_opened() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake);
+    let daemon = Path::new("daemon").join("svc.log");
+    let default = Path::new("logs").join("svc.log");
+    log.set_daemon_log(daemon.clone());
+    fake.will_fail_append(&daemon);
+    fake.will_fail_append(&default);
+
+    log.failure("svc", "the line");
+
+    assert_eq!(
+        fake.take_channel_calls(),
+        vec![appended(&daemon, false), appended(&default, false), reported()],
+        "each file is tried once, and the Event Log still gets the line"
+    );
+}
+
+#[skuld::test]
+fn setting_the_daemon_log_again_to_the_same_path_is_accepted() {
+    let fake = FakeGuard::new();
+    let log = log_over(&fake);
+    let daemon = Path::new("daemon").join("svc.log");
+    log.set_daemon_log(daemon.clone());
+    log.set_daemon_log(daemon.clone());
+
+    log.failure("svc", "the line");
+
+    assert_eq!(fake.take_channel_calls(), vec![appended(&daemon, true), reported()]);
+}
