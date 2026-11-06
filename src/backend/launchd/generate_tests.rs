@@ -560,44 +560,17 @@ fn base64_alphabet_cannot_produce_a_comment_terminator() {
 
 // Non-UTF-8 paths =====================================================================================================
 
-#[cfg(windows)]
-fn non_utf8_path() -> PathBuf {
-    // A lone UTF-16 surrogate: a byte sequence `OsString` can hold on
-    // Windows but which is never valid UTF-8. After a drive root, so the path is absolute.
-    use std::os::windows::ffi::OsStringExt as _;
-    PathBuf::from(std::ffi::OsString::from_wide(&[
-        u16::from(b'C'),
-        u16::from(b':'),
-        u16::from(b'\\'),
-        0xD800,
-    ]))
-}
-#[cfg(unix)]
-fn non_utf8_path() -> PathBuf {
-    // After a root, so the path is absolute.
-    use std::os::unix::ffi::OsStringExt as _;
-    PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xFF, 0xFE]))
-}
-
 #[skuld::test]
-fn non_utf8_path_panics_loudly_rather_than_emit_a_corrupted_path() {
-    // `DaemonSpec` is only ever legitimately constructed from `String`
-    // sources (see `spec::resolve`/`blob::decode`), so a non-UTF-8 `cwd`
-    // violates that contract. `to_string_lossy` would silently substitute
-    // U+FFFD and emit a plist naming a path that does not exist; the
-    // generator must panic instead.
-    let spec = DaemonSpec::new(DaemonFields {
-        cwd: Some(non_utf8_path()),
+fn a_non_utf8_path_cannot_reach_the_generator() {
+    // `to_string_lossy` would substitute U+FFFD and name a path that does not exist, so
+    // `DaemonSpec::new` refuses the spec and `path_str` never sees one.
+    let err = DaemonSpec::new(DaemonFields {
+        cwd: Some(DaemonSpec::non_utf8_path_for_test()),
         ..minimal_spec().into_fields()
     })
-    .unwrap();
+    .expect_err("a non-UTF-8 cwd must be refused");
 
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| plist(&spec, &minimal_identity())));
-    std::panic::set_hook(previous_hook);
-
-    assert!(result.is_err(), "plist() must panic on a non-UTF-8 cwd");
+    assert!(err.to_string().contains("not valid UTF-8"), "{err}");
 }
 
 // without_metadata ====================================================================================================

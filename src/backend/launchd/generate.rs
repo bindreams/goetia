@@ -152,9 +152,9 @@ pub(crate) fn without_metadata(text: &str) -> String {
 
 /// Escape the three characters XML element content cannot contain unescaped. Applied to every
 /// emitted value (argv, paths, environment keys and values, the account name), since
-/// `spec::resolve` does not reject `&`/`<`/`>`.
+/// `DaemonSpec::new` does not reject `&`/`<`/`>`.
 ///
-/// XML 1.0 excludes U+FFFE and U+FFFF entirely, so no escape can represent them. `spec::resolve`
+/// XML 1.0 excludes U+FFFE and U+FFFF entirely, so no escape can represent them. `DaemonSpec::new`
 /// rejects them (and the other Unicode noncharacters); this panics on them as a backstop rather
 /// than emit XML no parser can load.
 fn xml_escape(s: &str) -> String {
@@ -163,7 +163,7 @@ fn xml_escape(s: &str) -> String {
         assert!(
             !matches!(c, '\u{FFFE}' | '\u{FFFF}'),
             "value contains {c:?} (U+FFFE/U+FFFF), which XML 1.0 cannot represent at all; \
-             spec::resolve must reject this upstream, before it ever reaches a generator"
+             DaemonSpec::new must reject this upstream, before it ever reaches a generator"
         );
         match c {
             '&' => out.push_str("&amp;"),
@@ -175,12 +175,12 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
-/// `DaemonSpec`'s `cwd`/`logs` come from YAML or JSON text (`spec::resolve`, `blob::decode`), so
-/// they are valid UTF-8. Panic on a violation rather than let `to_string_lossy` substitute U+FFFD
-/// and emit a path that does not exist.
+/// `DaemonSpec::new` refuses a `cwd` or `logs` that is not valid UTF-8, so a `DaemonSpec`'s are
+/// valid. Panic on a violation rather than let `to_string_lossy` substitute U+FFFD and emit a
+/// path that does not exist.
 fn path_str(p: &Path) -> &str {
     p.to_str()
-        .expect("DaemonSpec paths are always valid UTF-8 (see spec::resolve and blob::decode)")
+        .expect("DaemonSpec paths are always valid UTF-8 (see DaemonSpec::new)")
 }
 
 fn push_key_string(out: &mut String, indent: &str, key: &str, value: &str) {

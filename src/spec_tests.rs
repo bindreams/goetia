@@ -85,6 +85,28 @@ fn new_refuses_a_relative_cwd_and_logs() {
 }
 
 #[skuld::test]
+fn new_refuses_a_cwd_and_logs_that_are_not_valid_utf8() {
+    let bad = DaemonSpec::non_utf8_path_for_test();
+    let msg = message(DaemonFields {
+        cwd: Some(bad.clone()),
+        ..fields()
+    });
+    assert!(
+        msg.starts_with("field `cwd`") && msg.ends_with("is not valid UTF-8"),
+        "{msg}"
+    );
+
+    let msg = message(DaemonFields {
+        logs: Some(bad),
+        ..fields()
+    });
+    assert!(
+        msg.starts_with("field `logs`") && msg.ends_with("is not valid UTF-8"),
+        "{msg}"
+    );
+}
+
+#[skuld::test]
 fn new_refuses_an_env_key_with_equals() {
     let msg = message(DaemonFields {
         env: BTreeMap::from([("A=B".to_string(), "v".to_string())]),

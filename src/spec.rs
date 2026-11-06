@@ -142,15 +142,7 @@ impl DaemonSpec {
     /// value that becomes a `DaemonSpec`; `resolve` runs the same rules over every backend's
     /// merged manifest in its shape phase. Fails with [`Error::Invalid`] naming the field.
     pub fn new(fields: DaemonFields) -> Result<DaemonSpec, Error> {
-        resolve::check_fields(
-            &fields.id,
-            &fields.name,
-            Some(&fields.command),
-            fields.cwd.as_deref(),
-            fields.logs.as_deref(),
-            &fields.env,
-            &fields.user,
-        )?;
+        resolve::check_fields(&fields)?;
         Ok(DaemonSpec(fields))
     }
 
@@ -191,6 +183,26 @@ impl DaemonSpec {
             logs: None,
             kind: Kind::Managed,
         }
+    }
+
+    /// An absolute path that is not valid UTF-8, for the rule that refuses one.
+    #[cfg(windows)]
+    pub(crate) fn non_utf8_path_for_test() -> PathBuf {
+        // A lone UTF-16 surrogate, which `OsString` holds on Windows.
+        use std::os::windows::ffi::OsStringExt as _;
+        PathBuf::from(std::ffi::OsString::from_wide(&[
+            u16::from(b'C'),
+            u16::from(b':'),
+            u16::from(b'\\'),
+            0xD800,
+        ]))
+    }
+
+    /// An absolute path that is not valid UTF-8, for the rule that refuses one.
+    #[cfg(unix)]
+    pub(crate) fn non_utf8_path_for_test() -> PathBuf {
+        use std::os::unix::ffi::OsStringExt as _;
+        PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xFF, 0xFE]))
     }
 }
 
