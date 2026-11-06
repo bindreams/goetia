@@ -12,11 +12,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::backend::{
-    InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
+    Decoded, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
 };
 use crate::blob::{self, Blob};
 use crate::decide::{ExternalConfig, Outcome};
-use crate::error::{Error, Result};
+use crate::error::{Error, Reason, Result};
 use crate::manager::budget;
 use crate::manager::flow;
 use crate::manager::{Budget, Installed, ServiceManager, State, Status, Step};
@@ -35,7 +35,12 @@ const FAKE_PID: u32 = 1;
 /// Why an opaque id could not be classified — see [`Fake::seed_opaque`].
 /// Shared by [`Store::undetermined`] and [`Fake::scan`] so the error and the
 /// `list` entry cannot describe the same condition differently.
-const OPAQUE_REASON: &str = "the artifact could not be read (seeded opaque by Fake::seed_opaque)";
+fn opaque_reason() -> Error {
+    Error::os(
+        "read the artifact",
+        std::io::Error::other("seeded opaque by Fake::seed_opaque"),
+    )
+}
 
 /// The pid `Fake` reports for a given state. `status` and `list` must never
 /// disagree about the same entry, so they share this rule rather than each
@@ -48,12 +53,12 @@ fn pid_for(state: State) -> Option<u32> {
 /// What [`Fake`]'s `read` and `scan` saw at a marked id.
 pub(crate) struct Artifact {
     id: Id,
-    blob: Result<Blob>,
+    blob: Decoded,
     entry: Entry,
 }
 
 impl Artifact {
-    fn new(id: Id, blob: Result<Blob>, entry: Entry) -> Self {
+    fn new(id: Id, blob: Decoded, entry: Entry) -> Self {
         Self { id, blob, entry }
     }
 }
@@ -63,7 +68,7 @@ impl InstalledService for Artifact {
         &self.id
     }
 
-    fn blob(&self) -> std::result::Result<&Blob, &Error> {
+    fn blob(&self) -> std::result::Result<&Blob, &Arc<Error>> {
         self.blob.as_ref()
     }
 }
@@ -181,7 +186,7 @@ impl Store {
         let blob = match extract(&entry.text) {
             Ok(None) => return ReadOutcome::Foreign { recovery: None },
             Ok(Some(blob)) => Ok(blob),
-            Err(e) => Err(e),
+            Err(e) => Err(Arc::new(e)),
         };
         ReadOutcome::Marked(Unnamed {
             blob,
@@ -194,7 +199,7 @@ impl Store {
     fn undetermined(id: &Id) -> Error {
         Error::Undetermined {
             id: id.as_str().to_string(),
-            reason: OPAQUE_REASON.to_string(),
+            reason: Box::new(opaque_reason()),
             recovery: "re-run with enough privilege to read the artifact; if it is unreadable at \
                        any privilege level, repair or remove it out of band"
                 .to_string(),
@@ -560,10 +565,10 @@ fn extract(text: &str) -> Result<Option<Blob>> {
     }
     let spec_line = lines
         .next()
-        .ok_or_else(|| Error::Blob("fake artifact has no Spec line".to_string()))?;
+        .ok_or_else(|| Error::blob("fake artifact has no Spec line".to_string()))?;
     let encoded = spec_line
         .strip_prefix("Spec: ")
-        .ok_or_else(|| Error::Blob(format!("fake artifact's second line is not `Spec: ...`: {spec_line}")))?;
+        .ok_or_else(|| Error::blob(format!("fake artifact's second line is not `Spec: ...`: {spec_line}")))?;
     let blob = blob::decode(encoded)?;
     Ok(Some(blob))
 }
@@ -610,7 +615,8 @@ fn lost(ids: &BTreeSet<String>, verb: &str, id: &Id) -> Result<()> {
         return Err(Error::RequestInDoubt {
             request: format!("fake {verb} {id}"),
             reached: false,
-            detail: "lost (seeded)".to_string(),
+            note: None,
+            source: std::io::Error::other("lost (seeded)").into(),
         });
     }
     Ok(())
@@ -682,6 +688,7 @@ impl crate::backend::Backend for Fake {
             if state.unresolvable.contains(user) {
                 return Err(Error::AccountLookup {
                     detail: format!("account `{user}` cannot be resolved (seeded)"),
+                    source: None,
                 });
             }
         }
@@ -781,11 +788,11 @@ impl crate::backend::Backend for Fake {
         let state = self.state.lock().expect("Fake mutex poisoned");
         let aggregates = state.aggregates.iter().map(|reason| Installed::Undetermined {
             name: None,
-            reason: reason.clone(),
+            reason: Reason::said(reason.clone()),
         });
         let opaque = state.opaque.iter().rev().map(|name| Installed::Undetermined {
             name: Some(name.clone()),
-            reason: OPAQUE_REASON.to_string(),
+            reason: Reason::failed(opaque_reason()),
         });
         Scan {
             entries: state

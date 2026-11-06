@@ -247,9 +247,13 @@ fn a_malformed_restart_delay_names_the_daemon_and_shows_an_example() {
     let yaml = "id: frpc\ncommand: [bin/frpc]\nrestart-delay: not-a-duration\n";
     let err = resolve_yaml(yaml).unwrap_err();
     assert_eq!(
-        err.to_string(),
+        err.report().to_string(),
         "daemon `frpc`: field `restart-delay` is `not-a-duration`, which is not a duration \
          (e.g. `30s`, `1m 30s`): expected number at 0"
+    );
+    assert!(
+        std::error::Error::source(&err).is_some(),
+        "the parser's error is the source"
     );
 }
 

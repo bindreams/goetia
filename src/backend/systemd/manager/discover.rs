@@ -30,13 +30,14 @@ use std::io;
 use std::io::Read as _;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, openat};
 use nix::sys::stat::Mode;
 
 use crate::backend::systemd::generate;
-use crate::backend::{InstalledDefinition, InstalledService, ReadOutcome, Unnamed};
+use crate::backend::{Decoded, InstalledDefinition, InstalledService, ReadOutcome, Unnamed};
 use crate::blob::Blob;
 use crate::decide::ExternalConfig;
 use crate::error::{Error, Result};
@@ -74,7 +75,9 @@ impl ReadFailure {
         }
     }
 
-    /// The operation and the path it failed on, with no claim about the id attached.
+    /// The operation and the path it failed on, with no claim about the id attached, as text for
+    /// a test to read. `Systemd::scan` keeps the error itself ([`ReadFailure::into_os_error`]).
+    #[cfg(test)]
     pub(super) fn detail(&self) -> String {
         format!(
             "failed to {op} {path}: {source}",
@@ -85,14 +88,14 @@ impl ReadFailure {
     }
 
     /// The absence-path reading — see [`undetermined`].
-    fn undetermined(&self, id: &str) -> Error {
-        undetermined(id, self.op, &self.path, &self.source)
+    fn undetermined(self, id: &str) -> Error {
+        undetermined(id, self.op, &self.path, self.source)
     }
 
     /// The reading for a caller that already knows goetia owns the id, so "unusable" is a true
     /// statement about it: `super::write::quarantine_if_still_ours`, which reaches this only after
     /// `read` found the fragment marked.
-    pub(super) fn into_io_error(self) -> Error {
+    pub(super) fn into_os_error(self) -> Error {
         Error::os_at(self.op, self.path, self.source)
     }
 }
@@ -308,12 +311,12 @@ pub(super) fn raw_state(id: &str) -> Result<RawState> {
 /// inode number moments after its file is unlinked.
 pub(crate) struct Fragment {
     id: Id,
-    blob: Result<Blob>,
+    blob: Decoded,
     text: String,
 }
 
 impl Fragment {
-    pub(super) fn new(id: Id, blob: Result<Blob>, text: String) -> Self {
+    pub(super) fn new(id: Id, blob: Decoded, text: String) -> Self {
         Self { id, blob, text }
     }
 
@@ -327,7 +330,7 @@ impl InstalledService for Fragment {
         &self.id
     }
 
-    fn blob(&self) -> std::result::Result<&Blob, &Error> {
+    fn blob(&self) -> std::result::Result<&Blob, &Arc<Error>> {
         self.blob.as_ref()
     }
 }
@@ -342,7 +345,7 @@ fn classified(id: &str, raw: RawState) -> ReadResult<ReadOutcome<Unnamed<String>
             let blob = match generate::extract(&text) {
                 Ok(None) => return Ok(ReadOutcome::Foreign { recovery: None }),
                 Ok(Some(blob)) => Ok(blob),
-                Err(e) => Err(e),
+                Err(e) => Err(Arc::new(e)),
             };
             ReadOutcome::Marked(Unnamed { blob, body: text })
         }
@@ -384,7 +387,7 @@ pub(super) fn fragmentless<S>(id: &str) -> ReadResult<ReadOutcome<S>> {
 pub(super) fn installed(id: &str, text: &str) -> Result<InstalledDefinition<String>> {
     let dirs = dropin_dirs(id).map_err(|failure| Error::Step {
         what: "a drop-in directory could not be read, so what systemd applies to it cannot be compared".to_string(),
-        source: Box::new(failure.into_io_error()),
+        source: Box::new(failure.into_os_error()),
     })?;
     let marker: String = dirs.iter().map(|(_, text)| text.as_str()).collect();
     Ok(InstalledDefinition {
@@ -412,7 +415,7 @@ pub(super) fn installed(id: &str, text: &str) -> Result<InstalledDefinition<Stri
 /// errno would restore the false ownership claim for the narrower input while the fix looked
 /// complete. What the errno does choose is `recovery`: re-running elevated is advice only a
 /// permission boundary earns, and offering it for a failing disk sends the user somewhere useless.
-fn undetermined(id: &str, op: &str, path: &Path, source: &io::Error) -> Error {
+fn undetermined(id: &str, op: &str, path: &Path, source: io::Error) -> Error {
     let recovery = if source.kind() == io::ErrorKind::PermissionDenied {
         "re-run as root (or under sudo): that read is what tells goetia whether anything is \
          installed at this id"
@@ -422,7 +425,7 @@ fn undetermined(id: &str, op: &str, path: &Path, source: &io::Error) -> Error {
     };
     Error::Undetermined {
         id: id.to_string(),
-        reason: format!("failed to {op} {}: {source}", path.display()),
+        reason: Box::new(Error::os_at(op, path, source)),
         recovery: recovery.to_string(),
     }
 }

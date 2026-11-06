@@ -96,6 +96,7 @@ impl TryFrom<String> for Id {
             Err(Error::Invalid {
                 daemon: value.clone(),
                 message: format!("id `{value}` does not match the required pattern ^[A-Za-z0-9._-]{{1,80}}$"),
+                source: None,
             })
         }
     }

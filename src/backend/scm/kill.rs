@@ -19,6 +19,8 @@
 
 use std::io;
 
+use crate::error::{Chain, within};
+
 /// What a kill did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Killed {
@@ -116,10 +118,7 @@ pub fn kill_service<T: KillTarget>(target: &mut T) -> io::Result<Killed> {
                 Ok(_) => continue,
                 // Cannot tell a refusal from a stale pid; both errors are the caller's to see.
                 Err(read) => {
-                    return Err(io::Error::new(
-                        read.kind(),
-                        format!("{read} (after the service's process could not be opened: {e})"),
-                    ));
+                    return Err(io::Error::new(read.kind(), ReadAfterRefusedOpen { read, open: e }));
                 }
             },
         };
@@ -141,10 +140,20 @@ pub fn kill_service<T: KillTarget>(target: &mut T) -> io::Result<Killed> {
 /// `e`, an error from the waits after the termination of `pid` was delivered: the process is dead
 /// and only the wait for SCM to record that failed, so the error must not read as a failed kill.
 fn terminated_but(pid: u32, e: io::Error) -> io::Error {
-    io::Error::new(
-        e.kind(),
-        format!("process {pid} was terminated, but waiting for SCM to record the exit failed: {e}"),
+    within(
+        format!("process {pid} was terminated, but waiting for SCM to record the exit failed"),
+        e,
     )
+}
+
+/// The service's pid could not be opened, and the read that would say whether SCM still vouches for
+/// it failed too. Both errors are the caller's to see: `read`'s text, then `open`'s in parentheses.
+/// Neither is the [`source`](std::error::Error::source), which would print it a second time.
+#[derive(Debug, thiserror::Error)]
+#[error("{} (after the service's process could not be opened: {})", Chain(read), Chain(open))]
+struct ReadAfterRefusedOpen {
+    read: io::Error,
+    open: io::Error,
 }
 
 /// Block until SCM no longer reports `pid` as the service's process: it shows none, or a different

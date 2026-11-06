@@ -2,9 +2,24 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+mod reason;
+mod report;
+mod within;
+
+pub use reason::Reason;
+pub(crate) use report::Chain;
+pub(crate) use within::within;
+
+use report::Report;
 
 /// What a variant's `#[source]` holds when the cause is another library's error.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// A foreign source shared rather than owned, so the `Blob` and `Invalid` errors that hold one stay
+/// cheap to share inside the `Arc<Error>` a snapshot keeps.
+pub type SharedError = Arc<dyn std::error::Error + Send + Sync>;
 
 /// Every goetia error. A variant is named for the layer that raised it, and its `Display` is its
 /// own context only, never its source's text: print the whole chain with [`Error::report`].
@@ -44,6 +59,12 @@ pub enum Error {
         #[source]
         source: Box<Error>,
     },
+
+    /// An error a snapshot kept (its blob's failure), handed out again as it was: its text, source,
+    /// remedy and indeterminacy are the kept error's. Neither [`cause`](Error::cause) nor
+    /// [`map_cause`](Error::map_cause) goes into it.
+    #[error(transparent)]
+    Kept(Arc<Error>),
 
     /// A step failed, and so did the one after it. `report()` prints both, `first` then `then`.
     #[error("a step failed, and so did the one after it")]
@@ -196,15 +217,29 @@ pub enum Error {
     /// `restart-delay`. Also produced by `blob::decode`, which re-runs
     /// these same checks against a spec deserialized from an untrusted
     /// artifact.
+    ///
+    /// `source` is the parser's own error when one failed (`humantime`, an
+    /// absolute-path resolution), printed by [`report`](Error::report).
     #[error("daemon `{daemon}`: {message}")]
-    Invalid { daemon: String, message: String },
+    Invalid {
+        daemon: String,
+        message: String,
+        #[source]
+        source: Option<SharedError>,
+    },
 
     /// A metadata blob (`blob::decode`) is not usable: malformed base64,
     /// malformed JSON, or a schema this build does not understand.
     /// Distinct from `Invalid`, which a *structurally valid* blob can
     /// still trigger once its envelope decodes cleanly.
-    #[error("blob: {0}")]
-    Blob(String),
+    ///
+    /// `source` is the decoder's own error when one failed.
+    #[error("blob: {message}")]
+    Blob {
+        message: String,
+        #[source]
+        source: Option<SharedError>,
+    },
 
     /// No daemon named `id` is managed by Goetia, per a [`ServiceManager`]
     /// mutating or querying verb (`uninstall`/`start`/`stop`/`enable`/
@@ -240,8 +275,9 @@ pub enum Error {
     Foreign { id: String, recovery: String },
 
     /// A read that would have said whether anything is installed at `id`
-    /// failed, so goetia does not know. `reason` names the path and the
-    /// failure; `recovery` says what would make that read succeed.
+    /// failed, so goetia does not know. `reason` is the failed read, which
+    /// the chain ends in; `recovery` says what would make that read succeed,
+    /// and [`report`](Error::report) prints it last, as [`remedy`](Error::remedy).
     ///
     /// The distinguishing property is what this variant does **not** claim.
     /// [`NotInstalled`](Error::NotInstalled) is proof that nothing
@@ -257,10 +293,11 @@ pub enum Error {
     ///
     /// Exit `4` (indeterminate), like `Unusable`: the code is about
     /// whether the question was answered, and this one was not.
-    #[error("cannot determine whether daemon `{id}` is installed: {reason}. {recovery}")]
+    #[error("cannot determine whether daemon `{id}` is installed")]
     Undetermined {
         id: String,
-        reason: String,
+        #[source]
+        reason: Box<Error>,
         recovery: String,
     },
 
@@ -319,13 +356,25 @@ pub enum Error {
     ///
     /// Exit `4` (indeterminate), like the two above: the code is about
     /// whether the question was answered, and this one was not.
-    #[error("`{id}` was not restarted, and where it ended up is not established: {detail}")]
-    Unestablished { id: String, detail: String },
+    ///
+    /// `refused` is the start's refusal, which the chain ends in.
+    #[error(
+        "`{id}` was not restarted, and where it ended up is not established: the stop was issued without waiting \
+         for it, and the start that followed was refused (`goetia daemon status {id}` shows the manager's current \
+         view)"
+    )]
+    Unestablished {
+        id: String,
+        #[source]
+        refused: Box<Error>,
+    },
 
     /// A request goetia lost track of before its outcome was established: the
     /// tool carrying it — `systemctl`, `launchctl` — may have started when it
     /// failed, so whatever it sends may already be sent. `request` is the
-    /// tool's command line. `reached` is whether goetia knows the request
+    /// tool's command line; `source` is how it was lost, and `note` is what a
+    /// caller that knows more says before it ([`Error::in_doubt_context`]).
+    /// `reached` is whether goetia knows the request
     /// reached the manager: systemd says so (`Enqueued anchor job`) once it
     /// has enqueued the job, which may already be running, and a request lost
     /// after that had reached it.
@@ -339,11 +388,13 @@ pub enum Error {
     ///
     /// Exit `4` (indeterminate), like the three above: whether the manager
     /// acted is the question, and it was not answered.
-    #[error("{}", in_doubt(request, *reached, detail))]
+    #[error("{}", in_doubt(request, *reached, note))]
     RequestInDoubt {
         request: String,
         reached: bool,
-        detail: String,
+        note: Option<String>,
+        #[source]
+        source: BoxError,
     },
 
     /// `install` rewrote the plist of a daemon whose job launchd now has loaded, though it was not
@@ -365,14 +416,15 @@ pub enum Error {
 
     /// `install` wrote the plist of a daemon and could not read whether launchd has its job loaded
     /// afterwards, so which definition a job loaded meanwhile read is not established either.
-    /// `detail` is the failed read; `restore_failed` is as in
-    /// [`LoadedJobInDoubt`](Error::LoadedJobInDoubt). launchd only.
+    /// `read_failed` is the failed read, printed in the message; `restore_failed` is the
+    /// [`source`](std::error::Error::source), as in [`LoadedJobInDoubt`](Error::LoadedJobInDoubt).
+    /// launchd only.
     ///
     /// Exit `4` (indeterminate).
-    #[error("{}", loaded_in_doubt(id, Some(detail), restore_failed.is_some()))]
+    #[error("{}", loaded_in_doubt(id, Some(read_failed), restore_failed.is_some()))]
     LoadedStateInDoubt {
         id: String,
-        detail: String,
+        read_failed: Box<Error>,
         #[source]
         restore_failed: Option<Box<Error>>,
     },
@@ -387,7 +439,7 @@ pub enum Error {
          could be created, so the daemon is not installed: re-run install, which decides against what is there",
         path = path.display()
     )]
-    StaleJobBootedOut { id: String, path: PathBuf, found: String },
+    StaleJobBootedOut { id: String, path: PathBuf, found: Occupant },
 
     /// goetia will ask no service manager here, on positive evidence: systemd's offline mode, a
     /// chroot, or a system systemd did not boot. `evidence` says which. goetia refuses there
@@ -420,9 +472,27 @@ pub enum Error {
     UnsupportedPlatform { platform: String },
 
     /// Resolving a [`crate::spec::User`] to a real platform account failed:
-    /// no such user/uid, or the lookup itself errored.
+    /// no such user/uid, or the lookup itself errored. `source` is the
+    /// lookup's own error, when it had one.
     #[error("account lookup failed: {detail}")]
-    AccountLookup { detail: String },
+    AccountLookup {
+        detail: String,
+        #[source]
+        source: Option<BoxError>,
+    },
+
+    /// A `start` was judged as a `type: managed` service's, because the service's spec blob could not
+    /// be read, and then failed. `blob` is the unreadable blob's error, printed in the message;
+    /// `source` is the failed start.
+    #[error(
+        "its spec blob could not be read, so the start was judged as a `type: managed` service's ({})",
+        Chain(&**blob)
+    )]
+    StartAsManaged {
+        blob: Arc<Error>,
+        #[source]
+        source: Box<Error>,
+    },
 
     /// A backend tried to create or move an artifact to `path`, but
     /// something already occupies it — a state none of that backend's own
@@ -449,7 +519,8 @@ impl Error {
             | Error::LoadedStateInDoubt { .. }
             | Error::StaleJobBootedOut { .. }
             | Error::StartUnconfirmed { .. } => true,
-            Error::Step { source, .. } => source.is_indeterminate(),
+            Error::Step { source, .. } | Error::StartAsManaged { source, .. } => source.is_indeterminate(),
+            Error::Kept(kept) => kept.is_indeterminate(),
             Error::Both { first, then } => first.is_indeterminate() && then.is_indeterminate(),
             Error::Os { .. }
             | Error::Command { .. }
@@ -472,7 +543,7 @@ impl Error {
             | Error::Interpolate { .. }
             | Error::Yaml(_)
             | Error::Invalid { .. }
-            | Error::Blob(_)
+            | Error::Blob { .. }
             | Error::NotInstalled { .. }
             | Error::Foreign { .. }
             | Error::NotRunning { .. }
@@ -484,21 +555,163 @@ impl Error {
         }
     }
 
-    /// The error a [`Step`](Error::Step) chain ends in, which classification reads: a step over
-    /// [`NotInstalled`](Error::NotInstalled) is still "not installed". Not unwrapped through
-    /// [`Both`](Error::Both), which has two causes.
+    /// The error a chain of [`Step`](Error::Step)s and [`StartAsManaged`](Error::StartAsManaged)s
+    /// ends in, which classification reads: a step over [`NotInstalled`](Error::NotInstalled) is
+    /// still "not installed". [`Both`](Error::Both) has two causes, so it is itself the cause.
+    /// [`map_cause`](Error::map_cause) walks the same chain.
     pub fn cause(&self) -> &Error {
         match self {
-            Error::Step { source, .. } => source.cause(),
+            Error::Step { source, .. } | Error::StartAsManaged { source, .. } => source.cause(),
             e => e,
         }
     }
 
-    /// The error and its causes, joined as `context: cause: cause`; a [`Both`](Error::Both) prints
-    /// as `first; then: then`. What the CLI prints and `--json` carries: [`Display`](fmt::Display)
+    /// This error with `f` applied to its [`cause`](Error::cause), the wrappers kept around the
+    /// result: the operation that failed on the cause stays in the report.
+    pub fn map_cause(self, f: impl FnOnce(Error) -> Error) -> Error {
+        match self {
+            Error::Step { what, source } => Error::Step {
+                what,
+                source: Box::new(source.map_cause(f)),
+            },
+            Error::StartAsManaged { blob, source } => Error::StartAsManaged {
+                blob,
+                source: Box::new(source.map_cause(f)),
+            },
+            cause => f(cause),
+        }
+    }
+
+    /// The failed read and its recovery, when this error's [`cause`](Error::cause) is an
+    /// [`Undetermined`](Error::Undetermined); any other error comes back as it is. The wrappers
+    /// stay around the read. Only the launchd and SCM `list` scans take an `Undetermined` apart.
+    #[cfg(any(target_os = "macos", windows, test))]
+    pub(crate) fn into_undetermined(self) -> std::result::Result<(Box<Error>, String), Error> {
+        let Error::Undetermined { recovery, .. } = self.cause() else {
+            return Err(self);
+        };
+        let recovery = recovery.clone();
+        let read = self.map_cause(|cause| match cause {
+            Error::Undetermined { reason, .. } => *reason,
+            other => other,
+        });
+        Ok((Box::new(read), recovery))
+    }
+
+    /// What would clear this failure, when it is written to follow the failure's cause: a remedy
+    /// says "that read", so it cannot lead. [`report`](Error::report) prints it after the whole
+    /// chain, and this variant's [`Display`](fmt::Display) leaves it out.
+    ///
+    /// A variant with no source keeps its remedy in its `Display`, where nothing follows it.
+    pub fn remedy(&self) -> Option<&str> {
+        match self {
+            Error::Undetermined { recovery, .. } => Some(recovery),
+            Error::Kept(kept) => kept.remedy(),
+            _ => None,
+        }
+    }
+
+    /// The error this one writes into its own `Display`, which is not its
+    /// [`source`](std::error::Error::source). [`report`](Error::report) collects the remedies of
+    /// what it names, so a variant that writes an error with [`Chain`] must name it here.
+    ///
+    /// Exhaustive on purpose, like [`is_indeterminate`](Error::is_indeterminate): a new variant must
+    /// be classified here before it compiles.
+    pub(crate) fn embedded(&self) -> Option<&Error> {
+        match self {
+            Error::LoadedStateInDoubt { read_failed, .. } => Some(read_failed),
+            Error::StartAsManaged { blob, .. } => Some(blob),
+            Error::Kept(kept) => kept.embedded(),
+            Error::Os { .. }
+            | Error::Command { .. }
+            | Error::Spawn { .. }
+            | Error::Step { .. }
+            | Error::Both { .. }
+            | Error::ConcurrentChange { .. }
+            | Error::QuarantineStranded { .. }
+            | Error::AmbiguousInstall { .. }
+            | Error::NotStarted { .. }
+            | Error::StartUnconfirmed { .. }
+            | Error::LoadedJob { .. }
+            | Error::PutBackBlocked { .. }
+            | Error::InvalidPassword { .. }
+            | Error::PasswordRequired { .. }
+            | Error::UnsupportedManager { .. }
+            | Error::NotEnqueued { .. }
+            | Error::IncompleteAnswer { .. }
+            | Error::UnitNotLoaded { .. }
+            | Error::Reservation { .. }
+            | Error::NotADirectory { .. }
+            | Error::EnvFile { .. }
+            | Error::Interpolate { .. }
+            | Error::Yaml(_)
+            | Error::Invalid { .. }
+            | Error::Blob { .. }
+            | Error::NotInstalled { .. }
+            | Error::Foreign { .. }
+            | Error::Undetermined { .. }
+            | Error::WaitTimeout { .. }
+            | Error::NotRunning { .. }
+            | Error::Unestablished { .. }
+            | Error::RequestInDoubt { .. }
+            | Error::LoadedJobInDoubt { .. }
+            | Error::StaleJobBootedOut { .. }
+            | Error::NoManager { .. }
+            | Error::ElevationRequired { .. }
+            | Error::UnsupportedPlatform { .. }
+            | Error::AccountLookup { .. }
+            | Error::AlreadyExists { .. } => None,
+        }
+    }
+
+    /// The error and its causes, joined as `context: cause: cause`, then each [`remedy`](Error::remedy)
+    /// found along the chain, outermost first, as `. remedy`; a [`Both`](Error::Both) prints as
+    /// `first; then: then`. What the CLI prints and `--json` carries: [`Display`](fmt::Display)
     /// alone is the outermost context.
     pub fn report(&self) -> impl fmt::Display + '_ {
         Report(self)
+    }
+
+    /// A [`RequestInDoubt`](Error::RequestInDoubt) with `context` said ahead of any note it
+    /// already has: what the caller that holds it knows of the request. Any other error is returned
+    /// as it is.
+    pub(crate) fn in_doubt_context(self, context: String) -> Self {
+        match self {
+            Error::RequestInDoubt {
+                request,
+                reached,
+                note,
+                source,
+            } => Error::RequestInDoubt {
+                request,
+                reached,
+                note: Some(match note {
+                    Some(note) => format!("{context}: {note}"),
+                    None => context,
+                }),
+                source,
+            },
+            e => e,
+        }
+    }
+
+    /// A metadata blob that is not usable, for a reason that is goetia's own to state.
+    pub(crate) fn blob(message: impl Into<String>) -> Self {
+        Error::Blob {
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// A metadata blob that is not usable because `source` failed to decode it.
+    pub(crate) fn blob_from(
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Error::Blob {
+            message: message.into(),
+            source: Some(Arc::new(source)),
+        }
     }
 
     /// An OS call failed with no path to name.
@@ -537,33 +750,6 @@ impl Error {
     }
 }
 
-/// What [`Error::report`] returns: the chain, formatted on `Display`.
-struct Report<'a>(&'a Error);
-
-impl fmt::Display for Report<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_chain(self.0, f)
-    }
-}
-
-fn write_chain(e: &(dyn std::error::Error + 'static), f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    // A `#[source]` of type `Box<Error>` reaches here as the box.
-    let ours = e
-        .downcast_ref::<Error>()
-        .or_else(|| e.downcast_ref::<Box<Error>>().map(|b| &**b));
-    if let Some(Error::Both { first, then }) = ours {
-        write_chain(first.as_ref(), f)?;
-        f.write_str("; then: ")?;
-        return write_chain(then.as_ref(), f);
-    }
-    write!(f, "{e}")?;
-    if let Some(source) = e.source() {
-        f.write_str(": ")?;
-        write_chain(source, f)?;
-    }
-    Ok(())
-}
-
 /// What `install`'s put-back found at the plist's path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PutBackFound {
@@ -571,6 +757,31 @@ pub enum PutBackFound {
     Gone,
     /// A plist other than the one `install` wrote.
     Replaced,
+}
+
+/// What `install` found where it was about to create a plist ([`Error::StaleJobBootedOut`]).
+#[derive(Debug)]
+pub enum Occupant {
+    File,
+    Directory,
+    Symlink,
+    /// A device, socket or the like.
+    Special,
+    /// The path could not be inspected. The error is part of the message, not the error's
+    /// [`source`](std::error::Error::source), which would print it a second time.
+    Unreadable(std::io::Error),
+}
+
+impl fmt::Display for Occupant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Occupant::File => f.write_str("a file"),
+            Occupant::Directory => f.write_str("a directory"),
+            Occupant::Symlink => f.write_str("a symlink"),
+            Occupant::Special => f.write_str("a special file"),
+            Occupant::Unreadable(e) => write!(f, "something that could not be read ({})", Chain(e)),
+        }
+    }
 }
 
 /// [`Error::PutBackBlocked`]'s predicate.
@@ -672,27 +883,29 @@ fn id_prefix(id: &Option<String>) -> String {
 
 /// [`Error::RequestInDoubt`]'s message: what goetia knows of how far the
 /// request got, and no more.
-fn in_doubt(request: &str, reached: bool, detail: &str) -> String {
+fn in_doubt(request: &str, reached: bool, note: &Option<String>) -> String {
+    let note = note.as_deref().map(|note| format!(": {note}")).unwrap_or_default();
     if reached {
         format!(
-            "`{request}` reached the service manager, but goetia lost track of it before its outcome was confirmed: \
-             {detail}"
+            "`{request}` reached the service manager, but goetia lost track of it before its outcome was confirmed{note}"
         )
     } else {
         format!(
-            "`{request}` may have started before it failed, so it may or may not have reached the service manager: \
-             {detail}"
+            "`{request}` may have started before it failed, so it may or may not have reached the service manager{note}"
         )
     }
 }
 
 /// The message of both in-doubt variants. `read_failed` is the failed read (second variant only);
 /// `restore_failed` is whether the put-back of the plist failed, whose error is the variant's source.
-fn loaded_in_doubt(id: &str, read_failed: Option<&str>, restore_failed: bool) -> String {
+fn loaded_in_doubt(id: &str, read_failed: Option<&Error>, restore_failed: bool) -> String {
     let cause = match read_failed {
         None => format!("`{id}` was loaded in launchd while its plist was written"),
-        Some(detail) => {
-            format!("`{id}`'s plist was written, but whether launchd has its job loaded could not be read ({detail})")
+        Some(read) => {
+            format!(
+                "`{id}`'s plist was written, but whether launchd has its job loaded could not be read ({})",
+                Chain(read)
+            )
         }
     };
     let remedy = if restore_failed {

@@ -47,6 +47,7 @@ pub fn resolve(user: &User) -> Result<Identity> {
                 "user.id `{uid}` is a numeric UID, which Windows SCM has no account mapping for; use `user.name` \
                  (an account name) or `user.id` with a SID string instead"
             ),
+            source: None,
         }),
     }
 }
@@ -143,6 +144,7 @@ fn lookup_account_sid(psid: PSID, sid_str: &str) -> Result<String> {
     if sizing_ok != 0 {
         return Err(Error::AccountLookup {
             detail: format!("LookupAccountSidW for `{sid_str}` unexpectedly succeeded on a zero-sized buffer"),
+            source: None,
         });
     }
     let err = std::io::Error::last_os_error();
@@ -210,6 +212,7 @@ fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
     if sizing_ok != 0 {
         return Err(Error::AccountLookup {
             detail: format!("LookupAccountNameW for `{account_name}` unexpectedly succeeded on a zero-sized buffer"),
+            source: None,
         });
     }
     let err = std::io::Error::last_os_error();

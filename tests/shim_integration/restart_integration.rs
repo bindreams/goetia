@@ -458,8 +458,10 @@ fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled
     assert!(
         matches!(
             entry,
-            Some(Installed::OursUnusable { reason, .. })
-                if reason.contains("cannot be regenerated") && reason.contains("restart: always")
+            Some(entry @ Installed::OursUnusable { .. })
+                if entry.unusable_reason().is_some_and(|reason| {
+                    reason.contains("cannot be regenerated") && reason.contains("restart: always")
+                })
         ),
         "`list` must report the service as unusable, not vouch for it: {listed:?}"
     );

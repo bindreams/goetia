@@ -284,7 +284,7 @@ fn list_reports_an_opaque_entry_as_undetermined() {
             _ => None,
         })
         .unwrap_or_else(|| panic!("an unreadable artifact must appear as Undetermined: {listed:?}"));
-    assert!(!reason.is_empty(), "Undetermined must say why: {listed:?}");
+    assert!(!reason.to_string().is_empty(), "Undetermined must say why: {listed:?}");
     assert!(
         !listed
             .iter()
@@ -320,7 +320,7 @@ fn every_verb_refuses_an_opaque_id_as_undetermined() {
         match result {
             Err(Error::Undetermined { id, reason, .. }) => {
                 assert_eq!(id, "opaque", "{verb} must name the id it could not read");
-                assert!(!reason.is_empty(), "{verb} must say why");
+                assert!(!reason.report().to_string().is_empty(), "{verb} must say why");
             }
             other => panic!("{verb} on an unreadable artifact must be Undetermined, got {other:?}"),
         }

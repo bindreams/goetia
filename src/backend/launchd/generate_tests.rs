@@ -258,7 +258,7 @@ fn extract_errors_on_corrupt_blob() {
     let corrupted = text.replacen("Spec: ", "Spec: !!!not-base64!!!", 1);
 
     let err = extract(&corrupted).expect_err("a corrupt blob must error, not silently decode");
-    assert!(matches!(err, Error::Blob(_)), "expected a Blob error, got {err:?}");
+    assert!(matches!(err, Error::Blob { .. }), "expected a Blob error, got {err:?}");
 }
 
 #[skuld::test]
@@ -274,7 +274,7 @@ fn extract_errors_on_duplicate_metadata_comment() {
     doubled.push_str(&text[comment_end..]);
 
     let err = extract(&doubled).expect_err("more than one metadata comment must error");
-    assert!(matches!(err, Error::Blob(_)), "expected a Blob error, got {err:?}");
+    assert!(matches!(err, Error::Blob { .. }), "expected a Blob error, got {err:?}");
 }
 
 #[skuld::test]
@@ -299,7 +299,7 @@ fn extract_errors_when_spec_value_is_split_across_lines() {
         </plist>\n";
 
     let err = extract(text).expect_err("a split Spec value must error, not silently mis-decode");
-    assert!(matches!(err, Error::Blob(_)), "expected a Blob error, got {err:?}");
+    assert!(matches!(err, Error::Blob { .. }), "expected a Blob error, got {err:?}");
 }
 
 #[skuld::test]
@@ -321,7 +321,7 @@ fn extract_errors_on_metadata_comment_missing_a_field() {
         </plist>\n";
 
     let err = extract(text).expect_err("a metadata comment missing a field must error");
-    assert!(matches!(err, Error::Blob(_)), "expected a Blob error, got {err:?}");
+    assert!(matches!(err, Error::Blob { .. }), "expected a Blob error, got {err:?}");
 }
 
 #[skuld::test]
@@ -331,7 +331,7 @@ fn extract_errors_on_marker_mismatch() {
     let tampered = text.replacen("Marker: goetia", "Marker: not-goetia", 1);
 
     let err = extract(&tampered).expect_err("a metadata comment naming the wrong marker must error");
-    assert!(matches!(err, Error::Blob(_)), "expected a Blob error, got {err:?}");
+    assert!(matches!(err, Error::Blob { .. }), "expected a Blob error, got {err:?}");
 }
 
 #[skuld::test]
@@ -348,7 +348,7 @@ fn extract_errors_on_unterminated_begin_sentinel() {
         </plist>\n";
 
     let err = extract(text).expect_err("an unterminated goetia:begin must error, not be treated as absent");
-    assert!(matches!(err, Error::Blob(_)), "expected a Blob error, got {err:?}");
+    assert!(matches!(err, Error::Blob { .. }), "expected a Blob error, got {err:?}");
 }
 
 #[skuld::test]

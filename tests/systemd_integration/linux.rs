@@ -1413,12 +1413,12 @@ fn list_reports_a_sid_account_as_ours_unusable() {
     let reason = listed
         .iter()
         .find_map(|entry| match entry {
-            Installed::OursUnusable { name, reason } if name == guard.id() => Some(reason),
+            Installed::OursUnusable { name, .. } if name == guard.id() => entry.unusable_reason(),
             _ => None,
         })
         .unwrap_or_else(|| panic!("a marked fragment is ours even when its spec cannot be rendered: {listed:?}"));
     assert_eq!(
-        *reason,
+        reason,
         format!("marked ours, but its embedded spec cannot be regenerated: {cannot_render}")
     );
 
@@ -1519,6 +1519,7 @@ fn install_refuses_an_unreadable_dropin_over_our_own_fragment() {
     let Outcome::RefuseUnusable { reason, .. } = &outcome else {
         panic!("goetia owns this id and cannot report on it, got {outcome:?}");
     };
+    let reason = reason.to_string();
     assert!(
         reason.contains(&blocker.display().to_string()),
         "the refusal must name the path that could not be read: {reason}"
@@ -2051,7 +2052,7 @@ fn undetermined_for(listed: &[Installed], id: &str) -> Vec<String> {
     listed
         .iter()
         .filter_map(|entry| match entry {
-            Installed::Undetermined { name, reason } if name.as_deref() == Some(id) => Some(reason.clone()),
+            Installed::Undetermined { name, reason } if name.as_deref() == Some(id) => Some(reason.to_string()),
             _ => None,
         })
         .collect()

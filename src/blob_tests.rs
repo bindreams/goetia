@@ -339,14 +339,30 @@ fn decode_rejects_an_empty_command_executable() {
 #[skuld::test]
 fn decode_rejects_malformed_base64() {
     let err = decode("not valid base64 !!!").unwrap_err();
-    assert!(matches!(err, Error::Blob(_)), "expected Error::Blob, got {err:?}");
+    assert!(matches!(err, Error::Blob { .. }), "expected Error::Blob, got {err:?}");
+    assert_eq!(err.to_string(), "blob: invalid base64");
+    assert!(
+        std::error::Error::source(&err).is_some(),
+        "the decoder's error is the source"
+    );
+    assert!(
+        err.report().to_string().starts_with("blob: invalid base64: "),
+        "{}",
+        err.report()
+    );
 }
 
 #[skuld::test]
 fn decode_rejects_malformed_json() {
     let encoded = BASE64.encode(b"not json");
     let err = decode(&encoded).unwrap_err();
-    assert!(matches!(err, Error::Blob(_)), "expected Error::Blob, got {err:?}");
+    assert!(matches!(err, Error::Blob { .. }), "expected Error::Blob, got {err:?}");
+    assert_eq!(err.to_string(), "blob: invalid blob JSON");
+    assert!(
+        err.report().to_string().starts_with("blob: invalid blob JSON: "),
+        "{}",
+        err.report()
+    );
 }
 
 // Sortedness checker ==================================================================================================
