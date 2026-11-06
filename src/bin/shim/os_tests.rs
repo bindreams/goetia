@@ -93,14 +93,18 @@ fn wait_gives_the_same_exit_code_every_time() {
 #[skuld::test]
 fn a_spawn_of_a_missing_binary_is_refused_as_not_found(#[fixture(temp_dir)] dir: &Path) {
     let absolute = dir.join("goetia-shim-test-no-such-binary.exe");
-    for missing in [Path::new("goetia-shim-test-no-such-binary"), absolute.as_path()] {
+    let os_code = [
+        (Path::new("goetia-shim-test-no-such-binary"), None),
+        (absolute.as_path(), Some(ERROR_FILE_NOT_FOUND as i32)),
+    ];
+    for (missing, raw) in os_code {
         let refused = Real
             .spawn(cosca::run([missing]))
             .err()
             .expect("the binary does not exist");
 
         assert!(
-            matches!(&refused, cosca::error::Error::Io(e) if e.kind() == io::ErrorKind::NotFound),
+            matches!(&refused, cosca::error::Error::Io(e) if e.kind() == io::ErrorKind::NotFound && e.raw_os_error() == raw),
             "{missing:?}: {refused:?}"
         );
         assert_eq!(

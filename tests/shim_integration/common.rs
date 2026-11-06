@@ -113,7 +113,7 @@ impl Drop for LeftoverLog {
                 Ok(true) => Some(format!("left {}: {why}", self.path.display())),
                 Err(e) => Some(format!("left {}, if it exists ({e}): {why}", self.path.display())),
             },
-            Fate::Remove => support::service_guard::remove_path_retrying(&self.path, false),
+            Fate::Remove => support::cleanup::remove_path_retrying(&self.path, false),
         };
         if let Some(problem) = problem {
             eprintln!("ShimGuard[{}]: {problem}", self.id);
