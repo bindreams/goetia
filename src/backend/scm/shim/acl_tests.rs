@@ -358,6 +358,12 @@ mod windows {
         assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stdout));
     }
 
+    /// A directory symlink at `link`, which takes Developer Mode or an elevated token.
+    fn symlink(target: &Path, link: &Path) {
+        std::os::windows::fs::symlink_dir(target, link)
+            .expect("creating a symlink needs Windows Developer Mode or an elevated token");
+    }
+
     fn labels(chain: &[ObjectSecurity]) -> Vec<PathBuf> {
         chain.iter().map(|o| o.path.clone()).collect()
     }
@@ -418,9 +424,6 @@ mod windows {
 
         // A loop has no final path, so the read fails; what matters is that the walk ended.
         let outcome = read_chain(&a);
-        // Unlinked first: a junction loop must not be left for the directory's cleanup to walk.
-        std::fs::remove_dir(&a).unwrap();
-        std::fs::remove_dir(&b).unwrap();
         assert!(outcome.is_err(), "{:?}", outcome.map(|c| labels(&c)));
     }
 
@@ -431,17 +434,56 @@ mod windows {
         let root = dir.path().canonicalize().unwrap();
         let odd = root.join("x.");
         std::fs::create_dir(&odd).unwrap();
-        // `mklink /J` stores a normalised target (`x`), so this needs a symlink, which takes
-        // Developer Mode or elevation.
+        // `mklink /J` stores a normalised target (`x`), so this needs a symlink.
         let link = root.join("link");
-        std::os::windows::fs::symlink_dir(&odd, &link)
-            .expect("creating a symlink needs Windows Developer Mode or an elevated token");
+        symlink(&odd, &link);
 
-        let outcome = read_chain(&link);
-        std::fs::remove_dir(&link).unwrap();
-        std::fs::remove_dir(&odd).unwrap();
-        let paths = labels(&outcome.unwrap());
+        let paths = labels(&read_chain(&link).unwrap());
         assert!(paths.contains(&display_path(&odd)), "{paths:?}");
+    }
+
+    #[skuld::test]
+    fn a_relative_link_target_is_resolved_where_the_system_resolves_it() {
+        // `outer\sublink\link` -> `..\foo`. `sublink` leads to `elsewhere`, so the system resolves
+        // the `..` there, to `root\foo`; spelled out it would be `outer\foo`, which is not there.
+        // `foo` is itself a link, to `final`.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (outer, elsewhere, last) = (root.join("outer"), root.join("elsewhere"), root.join("final"));
+        for made in [&outer, &elsewhere, &last] {
+            std::fs::create_dir(made).unwrap();
+        }
+        let foo = root.join("foo");
+        let sublink = outer.join("sublink");
+        let link = elsewhere.join("link");
+        symlink(&last, &foo);
+        symlink(&elsewhere, &sublink);
+        symlink(Path::new(r"..\foo"), &link);
+
+        // An object is labelled by the first spelling it was reached by.
+        let given = sublink.join("link");
+        let paths = labels(&read_chain(&given).unwrap());
+        for held in [&given, &sublink, &foo, &last] {
+            assert!(
+                paths.contains(&display_path(held)),
+                "{} missing from {paths:?}",
+                held.display()
+            );
+        }
+    }
+
+    #[skuld::test]
+    fn a_path_spelled_in_another_case_names_each_object_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let lower = PathBuf::from(display_path(&root).to_string_lossy().to_lowercase());
+
+        let paths = labels(&read_chain(&lower).unwrap());
+        let mut folded: Vec<String> = paths.iter().map(|p| p.to_string_lossy().to_lowercase()).collect();
+        folded.sort();
+        let before = folded.len();
+        folded.dedup();
+        assert_eq!(folded.len(), before, "an object twice: {paths:?}");
     }
 
     #[skuld::test]

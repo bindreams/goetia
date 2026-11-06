@@ -246,7 +246,7 @@ mod system {
     use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::os::windows::io::AsRawHandle as _;
-    use std::path::{Path, PathBuf};
+    use std::path::{Component, Path, PathBuf};
 
     use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HANDLE, LocalFree};
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
@@ -255,8 +255,8 @@ mod system {
         OWNER_SECURITY_INFORMATION, PSID,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, GetVolumeInformationByHandleW,
-        READ_CONTROL,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FileIdInfo,
+        GetFileInformationByHandleEx, GetVolumeInformationByHandleW, READ_CONTROL,
     };
 
     use super::{Ace, ObjectSecurity, Sid, Unsafe, everyone};
@@ -282,11 +282,11 @@ mod system {
         let given = std::path::absolute(folder).map_err(|e| Error::os_at("resolve", folder, e))?;
         let start = first_existing(&given)?;
 
-        let mut chain = Vec::new();
-        add_chain(&mut chain, &start)?;
+        let mut walk = Walk::default();
+        walk.add(&start)?;
         let final_path = std::fs::canonicalize(&start).map_err(|e| Error::os_at("resolve", &start, e))?;
-        add_chain(&mut chain, &final_path)?;
-        Ok(chain)
+        walk.add(&final_path)?;
+        Ok(walk.chain)
     }
 
     /// `path` as it is shown and compared: a final path's `\\?\C:\` is `C:\` and its `\\?\UNC\` is
@@ -333,32 +333,88 @@ mod system {
         ))
     }
 
-    /// Adds `path` and each of its ancestors, nearest first, unless the chain holds it. A
-    /// component that is a link also adds its target's chain, and a link already in the chain is
-    /// not followed again, which ends a loop of links. Opens each component by the path it was
-    /// given (a final path is verbatim, and without the prefix Win32 would rewrite some names).
-    fn add_chain(chain: &mut Vec<ObjectSecurity>, path: &Path) -> Result<()> {
-        for component in path.ancestors() {
-            let shown = display_path(component);
-            if chain.iter().any(|object| object.path == shown) {
-                continue;
+    /// Which object a handle is open on: the volume's serial number and the file's ID, which no
+    /// spelling of a path changes.
+    type ObjectId = (u64, [u8; 16]);
+
+    /// The chain being read, and the objects in it.
+    #[derive(Default)]
+    struct Walk {
+        chain: Vec<ObjectSecurity>,
+        seen: Vec<ObjectId>,
+    }
+
+    impl Walk {
+        /// Adds `path` and each of its ancestors, nearest first, unless the walk has the object
+        /// already. A component that is a link also adds its target's chain, and a link already
+        /// seen is not followed again, which ends a loop of links. Opens each component by the
+        /// path it was given (a final path is verbatim, and without the prefix Win32 would
+        /// rewrite some names); the path is only the object's label.
+        fn add(&mut self, path: &Path) -> Result<()> {
+            for component in path.ancestors() {
+                let file = open(component).map_err(|e| Error::os_at("read the permissions of", component, e))?;
+                let id = object_id(&file, component)?;
+                if self.seen.contains(&id) {
+                    continue;
+                }
+                self.seen.push(id);
+                self.chain.push(read_object(&file, display_path(component))?);
+                let is_link = file
+                    .metadata()
+                    .map_err(|e| Error::os_at("read the type of", component, e))?
+                    .file_type()
+                    .is_symlink();
+                if is_link {
+                    let target = link_target(component)?;
+                    self.add(&target)?;
+                }
             }
-            let file = open(component).map_err(|e| Error::os_at("read the permissions of", component, e))?;
-            chain.push(read_object(&file, shown)?);
-            let is_link = file
-                .metadata()
-                .map_err(|e| Error::os_at("read the type of", component, e))?
-                .file_type()
-                .is_symlink();
-            if is_link {
-                let target = std::fs::read_link(component).map_err(|e| Error::os_at("read the link", component, e))?;
-                let parent = component.parent().unwrap_or(component);
-                let target =
-                    std::path::absolute(parent.join(target)).map_err(|e| Error::os_at("resolve", component, e))?;
-                add_chain(chain, &target)?;
+            Ok(())
+        }
+    }
+
+    fn object_id(file: &File, path: &Path) -> Result<ObjectId> {
+        let mut info = FILE_ID_INFO {
+            VolumeSerialNumber: 0,
+            FileId: Default::default(),
+        };
+        // SAFETY: `file` is open with `FILE_READ_ATTRIBUTES`; `info` is a `FILE_ID_INFO` and the
+        // size passed is its own.
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle() as HANDLE,
+                FileIdInfo,
+                std::ptr::addr_of_mut!(info).cast(),
+                size_of::<FILE_ID_INFO>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(Error::os_at("identify", path, io::Error::last_os_error()));
+        }
+        Ok((info.VolumeSerialNumber, info.FileId.Identifier))
+    }
+
+    /// Where the link at `link` leads, as one hop. A relative target is resolved against the final
+    /// path of the link's parent, since a link on the way to `link` can lead the parent
+    /// elsewhere than its spelling suggests, then its `.` and `..` are applied.
+    fn link_target(link: &Path) -> Result<PathBuf> {
+        let target = std::fs::read_link(link).map_err(|e| Error::os_at("read the link", link, e))?;
+        if target.is_absolute() {
+            return Ok(target);
+        }
+        let parent = link.parent().unwrap_or(link);
+        let parent = std::fs::canonicalize(parent).map_err(|e| Error::os_at("resolve", parent, e))?;
+        let mut resolved = PathBuf::new();
+        for component in parent.join(target).components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    resolved.pop();
+                }
+                other => resolved.push(other),
             }
         }
-        Ok(())
+        Ok(resolved)
     }
 
     /// Opens `path` for its security alone. A link is opened as itself, not followed.
