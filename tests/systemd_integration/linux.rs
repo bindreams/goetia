@@ -1193,19 +1193,26 @@ fn the_version_gate_probes_once_per_daemon_per_verb() {
     }
 }
 
+/// Shell builtins only, so it forks nothing even at `TasksMax=1`: reads the scope's own cgroup
+/// from `/proc/self/cgroup` (cgroup v2: `0::<path>`) and reports its `pids.max` and `pids.current`
+/// on stderr, then `exec`s goetia (`$0 "$@"`) in the same process.
+const SCOPE_PIDS_PREAMBLE: &str = r#"read -r line < /proc/self/cgroup; cg=${line#0::}; read -r max < "/sys/fs/cgroup$cg/pids.max"; read -r cur < "/sys/fs/cgroup$cg/pids.current"; echo "scope at start: cgroup=$cg pids.max=$max pids.current=$cur" >&2; exec "$0" "$@""#;
+
 /// `goetia <args>` in the transient scope `unit` allowed `tasks` tasks — threads and processes
-/// alike — so that making a thread, or spawning a process, fails once they are spent.
+/// alike — so that making a thread, or spawning a process, fails once they are spent. The scope
+/// reports its own limit on stderr before goetia starts.
 fn goetia_with_tasks(unit: &str, tasks: u32, args: &[&str]) -> std::process::Output {
     Command::new("systemd-run")
         .args(["--quiet", "--scope", "--unit", unit, "-p", &format!("TasksMax={tasks}")])
+        .args(["sh", "-c", SCOPE_PIDS_PREAMBLE])
         .arg(env!("CARGO_BIN_EXE_goetia"))
         .args(args)
         .output()
         .expect("spawn systemd-run")
 }
 
-/// `pids.max` and `pids.current` of the transient scope `unit`, read now, or the error that read
-/// gave: a scope whose last process has exited is gone, and its cgroup with it.
+/// `pids.max` and `pids.current` of the transient scope `unit`, read after goetia exited, or the
+/// error that read gave: a scope whose last process has exited is gone, and its cgroup with it.
 fn scope_pids(unit: &str) -> String {
     let dir = Path::new("/sys/fs/cgroup/system.slice").join(unit);
     let read = |file: &str| match fs::read_to_string(dir.join(file)) {
@@ -1213,7 +1220,7 @@ fn scope_pids(unit: &str) -> String {
         Err(err) => format!("unreadable: {err}"),
     };
     format!(
-        "{}: pids.max={} pids.current={}",
+        "after exit, {}: pids.max={} pids.current={}",
         dir.display(),
         read("pids.max"),
         read("pids.current")
