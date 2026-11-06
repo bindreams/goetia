@@ -9,7 +9,7 @@ fn parse(yaml: &str) -> Result<RawSpec, yaml_serde::Error> {
     RawSpec::parse(yaml)
 }
 
-/// The nine overridable field names, byte-exact with `RawOverride`'s serde
+/// The nine overridable field names, byte-exact with `OverrideWire`'s serde
 /// names — shared by every table-driven test below so no field can be
 /// added later without a row.
 const OVERRIDABLE_FIELDS: [&str; 9] = [
@@ -158,6 +158,22 @@ backend-specific:
 ";
     let err = parse(yaml).unwrap_err();
     assert!(err.to_string().contains("bogus"), "error should name `bogus`: {err}");
+}
+
+#[skuld::test]
+fn a_backend_override_that_is_not_a_mapping_is_refused_in_user_terms() {
+    for yaml in [
+        "id: frpc\nbackend-specific:\n  scm: 5\n",
+        "id: frpc\nbackend-specific:\n  scm: [a]\n",
+        "id: frpc\nbackend-specific:\n  scm: text\n",
+    ] {
+        let err = parse(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("expected a mapping of backend-specific overrides"),
+            "{yaml:?}: {err}"
+        );
+        assert!(!err.contains("RawOverride") && !err.contains("Wire"), "{yaml:?}: {err}");
+    }
 }
 
 #[skuld::test]

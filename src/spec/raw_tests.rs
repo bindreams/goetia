@@ -672,3 +672,16 @@ fn a_null_user_is_refused_as_a_user() {
         assert!(err.contains("an explicit `null` is not a user"), "`{spelling}`: {err}");
     }
 }
+
+#[skuld::test]
+fn a_document_that_is_not_a_mapping_is_refused_in_user_terms() {
+    for (yaml, found) in [("- id\n- command\n", "sequence"), ("frpc\n", "string")] {
+        let err = parse(yaml).unwrap_err().to_string();
+        assert!(err.contains(&format!("invalid type: {found}")), "{yaml:?}: {err}");
+        assert!(
+            err.contains("expected a goetia.yaml mapping (id, command, ...)"),
+            "{yaml:?}: {err}"
+        );
+        assert!(!err.contains("RawSpec") && !err.contains("Wire"), "{yaml:?}: {err}");
+    }
+}

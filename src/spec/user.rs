@@ -1,15 +1,15 @@
 //! The `user:` field: a bare string, or a struct with exactly one of `name`
 //! or `id`.
 //!
-//! [`RawUser`] is what deserializes; [`User`] is what `resolve` produces
-//! from it. They are separate because the `root` reserved word applies to
-//! the bare string form *only*, and once a bare `root` has become
+//! [`RawUser`] is what is read, by `UserWire` through [`deserialize_user`];
+//! [`User`] is what `resolve` produces from it. They are separate because
+//! the `root` reserved word applies to the bare string form *only*, and once a bare `root` has become
 //! `User::Root` nothing records which syntax it came from, so the rule
 //! could not be re-applied to an interpolated value without also
 //! mis-applying it to the struct form, where `{name: root}` is a literal
 //! account: `{name: ${U}}` with `U=root` would become `User::Root`.
 //!
-//! `RawUser`'s `Deserialize` is hand-written, not `#[serde(untagged)]`: the
+//! `UserWire`'s `Deserialize` is hand-written, not `#[serde(untagged)]`: the
 //! untagged deserializer squashes every failed variant into one message
 //! that names no offending field.
 
@@ -113,13 +113,28 @@ impl<'de> Visitor<'de> for AccountIdVisitor {
     }
 }
 
-impl<'de> Deserialize<'de> for RawUser {
+/// `RawUser` has no `Deserialize` of its own, for the reason `RawSpec` has none: `user: {name:
+/// null}` reads as the text `null`, which only `parse`'s `no_null` walk refuses. So
+/// [`deserialize_user`] is the only reader, and it is wired in by the remote derives of `RawSpec`
+/// and `RawOverride`.
+struct UserWire(RawUser);
+
+impl<'de> Deserialize<'de> for UserWire {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_any(UserVisitor)
+        deserializer.deserialize_any(UserVisitor).map(UserWire)
     }
+}
+
+/// The `deserialize_with` for an `Option<RawUser>` field: absent and `null` are `None`, as for any
+/// `Option`.
+pub(super) fn deserialize_user<'de, D>(d: D) -> Result<Option<RawUser>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<UserWire>::deserialize(d).map(|user| user.map(|UserWire(user)| user))
 }
 
 struct UserVisitor;

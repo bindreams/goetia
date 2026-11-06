@@ -1,8 +1,10 @@
-use super::{AccountId, RawUser, User};
+use serde::Deserialize;
+
+use super::{AccountId, RawUser, User, UserWire};
 use crate::spec::resolve::resolve_user;
 
 fn parse(yaml: &str) -> Result<RawUser, yaml_serde::Error> {
-    yaml_serde::from_str(yaml)
+    UserWire::deserialize(yaml_serde::Deserializer::from_str(yaml)).map(|UserWire(user)| user)
 }
 
 /// Parse and resolve, the way `spec::load` does.
@@ -55,6 +57,18 @@ fn user_struct_id_sid() {
 #[skuld::test]
 fn an_absent_user_resolves_to_root() {
     assert_eq!(resolve_user(None), User::Root);
+}
+
+#[skuld::test]
+fn a_user_that_is_neither_string_nor_mapping_is_refused_in_user_terms() {
+    for yaml in ["[root]\n", "5.5\n", "true\n"] {
+        let err = parse(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("expected a username string, `root`, or a struct with exactly one of `name` or `id`"),
+            "{yaml:?}: {err}"
+        );
+        assert!(!err.contains("RawUser") && !err.contains("UserWire"), "{yaml:?}: {err}");
+    }
 }
 
 #[skuld::test]

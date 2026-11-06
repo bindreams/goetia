@@ -410,7 +410,7 @@ fn missing_command_error(id: &Id, backend: Option<BackendKind>) -> Error {
 /// is the literal account called `root`. Applying it here rather than in `RawUser`'s visitor
 /// makes `user: ${U}` with `U=root` mean what a typed `user: root` means, without `{name: ${U}}`
 /// also collapsing to the superuser; a `User::Name` records no syntax of origin.
-pub(crate) fn resolve_user(raw: Option<RawUser>) -> User {
+pub(super) fn resolve_user(raw: Option<RawUser>) -> User {
     match raw {
         None => User::Root,
         Some(RawUser::Scalar(s)) if s == "root" => User::Root,
