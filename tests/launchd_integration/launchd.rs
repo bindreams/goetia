@@ -186,9 +186,9 @@ impl Drop for FileGuard {
 
 /// Kills the `launchctl kickstart -p system/<id>` that a `start` answering `WaitTimeout` leaves
 /// running on purpose, which a long `ThrottleInterval` would keep alive for an hour. Whether the
-/// `bootout` in `Guard`'s uninstall ends it is unmeasured, so this makes sure. Declare it before
-/// the [`Guard`], so it drops after the uninstall. `id` is the test's random id, so only this
-/// test's process can match.
+/// `bootout` in `Guard`'s uninstall ends it, or waits on it, is unmeasured, so this kills it first.
+/// Declare it after the [`Guard`], so it drops before the uninstall; launchd keeps the request, and
+/// the `bootout` discards it. `id` is the test's random id, so only this test's process can match.
 struct KickstartGuard(Id);
 
 impl Drop for KickstartGuard {
@@ -214,17 +214,20 @@ impl Drop for KickstartGuard {
 /// run's exit.
 const PRINT_FAILURE_BOUND: Duration = Duration::from_secs(5);
 
-/// `launchctl print system/<id>`, retried while it fails; panics with the last failure's output
-/// once [`PRINT_FAILURE_BOUND`] has passed. A success is returned whatever it says.
+/// `launchctl print system/<id>`, retried while it fails; panics with the failure's output on 113
+/// (no such job, which is final) or once [`PRINT_FAILURE_BOUND`] has passed. A success is
+/// returned whatever it says.
 #[track_caller]
 fn print_job(id: &str) -> cmd::Run {
     let target = format!("system/{id}");
     let started = std::time::Instant::now();
     loop {
         let printed = cmd::run("launchctl", &["print", &target]);
-        if printed.ok() || started.elapsed() >= PRINT_FAILURE_BOUND {
+        if printed.ok() || printed.code == Some(113) || started.elapsed() >= PRINT_FAILURE_BOUND {
             return printed.expect_ok();
         }
+        // A pause between attempts, not a synchronization: the loop ends on `print`'s own answer.
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -1148,7 +1151,7 @@ fn a_stop_with_no_budget_runs_bootout_to_completion() {
 /// `WaitTimeout`, `StartUnconfirmed`, `NotStarted` is correct. The test therefore waits for the first
 /// run and for its exit before calling `start`.
 ///
-/// Two measured facts, neither of them assumed:
+/// Three measured facts:
 ///
 /// 1. The throttle is ~10.02s by default and is keyed to the **job**, not to the loaded instance:
 ///    `bootout` + `bootstrap` does not clear it. Measured on macos-latest with a
@@ -1158,12 +1161,13 @@ fn a_stop_with_no_budget_runs_bootout_to_completion() {
 /// 2. `kickstart -p` is kept regardless. It is the only confirmation launchd offers — there is no
 ///    notification mechanism, and re-reading state on a timer is polling, which this project
 ///    forbids — and skipping it would fail a healthy job launchd is merely about to start.
+/// 3. `kickstart -p` honours the plist's `ThrottleInterval`: with 3600 this test reported
+///    `WaitTimeout` after the full 10s budget on macos-latest (goetia CI run 42176044016).
 ///
 /// The budget is `Budget::DEFAULT`, the path users take. The test's `restart_delay` of an hour,
 /// which goetia writes as the plist's `ThrottleInterval`, supplies the margin, not the product's
-/// default: whatever the setup costs, the kick cannot be confirmed inside the budget. The test
-/// relies on `kickstart -p` honouring `ThrottleInterval`. No elapsed-time assertion is made: the
-/// error variant carries the outcome.
+/// default: whatever the setup costs, the kick cannot be confirmed inside the budget. No
+/// elapsed-time assertion is made: the error variant carries the outcome.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout() {
     let mgr = Launchd::new();
@@ -1181,10 +1185,10 @@ fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout() {
     );
     spec.restart = Restart::Always;
     spec.restart_delay = Some(Duration::from_secs(3600));
-    // Declared before `_guard`, so it drops after the uninstall.
-    let _kickstart = KickstartGuard(spec.id.clone());
     // Registered before the job is loaded: its `uninstall` boots the job out.
     let _guard = Guard::install(&mgr, &spec);
+    // Declared after `_guard`, so the leftover kick is killed before the uninstall's `bootout`.
+    let _kickstart = KickstartGuard(spec.id.clone());
 
     // Load the job without `start`: `RunAtLoad` runs it.
     cmd::run(
@@ -1208,15 +1212,14 @@ fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout() {
         field("last exit code = ").is_some_and(|code| !code.contains("never exited")) && field("pid = ").is_none()
     });
 
-    let err = mgr
-        .start(&spec.id, Budget::DEFAULT)
-        .expect_err(
-            "launchd cannot confirm a crash-looping job running, so a bounded start times out; if this is not              WaitTimeout, check whether kickstart -p honoured ThrottleInterval (restart_delay)",
-        );
+    let err = mgr.start(&spec.id, Budget::DEFAULT).expect_err(
+        "start succeeded on a throttled job: check whether kickstart -p honoured ThrottleInterval (restart_delay)",
+    );
 
     assert!(
         matches!(err, goetia::Error::WaitTimeout { awaited: "running", .. }),
-        "an unconfirmed bounded start must be WaitTimeout, not a fabricated success or another error; if this is          not WaitTimeout, check whether kickstart -p honoured ThrottleInterval (restart_delay): {err:?}"
+        "an unconfirmed bounded start must be WaitTimeout; if it is another error, check whether \
+         kickstart -p honoured ThrottleInterval (restart_delay): {err:?}"
     );
 }
 
