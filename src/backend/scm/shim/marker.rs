@@ -69,9 +69,11 @@ const fn marker() -> [u8; MARKER_LEN] {
 }
 
 /// The version of the first marker in `file`, or `None` when it holds none (or one cut off before
-/// its end). One pass over the file, through a fixed buffer that carries the last bytes of a
-/// read into the next, so a marker across two reads is found whatever they return.
-pub(crate) fn scan(mut file: impl Read) -> io::Result<Option<String>> {
+/// its end). At most the first `keep` bytes of the version are returned, however long it is: the
+/// scan still reads to its NUL, so memory stays constant. One pass over the file, through a fixed
+/// buffer that carries the last bytes of a read into the next, so a marker across two reads is
+/// found whatever they return.
+pub(crate) fn scan(mut file: impl Read, keep: usize) -> io::Result<Option<String>> {
     let needle = needle();
     let finder = memmem::Finder::new(&needle);
     let mut buf = vec![0u8; CHUNK];
@@ -83,7 +85,7 @@ pub(crate) fn scan(mut file: impl Read) -> io::Result<Option<String>> {
         }
         let end = held + read;
         if let Some(at) = finder.find(&buf[..end]) {
-            return version_after(&buf[at + needle.len()..end], file);
+            return version_after(&buf[at + needle.len()..end], file, keep);
         }
         // A marker not yet complete ends in at most the last `needle.len() - 1` bytes.
         held = (needle.len() - 1).min(end);
@@ -91,17 +93,20 @@ pub(crate) fn scan(mut file: impl Read) -> io::Result<Option<String>> {
     }
 }
 
-/// The bytes up to the first NUL, starting with `head` and continuing into `file`.
-fn version_after(head: &[u8], mut file: impl Read) -> io::Result<Option<String>> {
+/// The first `keep` bytes up to the first NUL, starting with `head` and continuing into `file`.
+fn version_after(head: &[u8], mut file: impl Read, keep: usize) -> io::Result<Option<String>> {
     let mut version = Vec::new();
     let mut more = vec![0u8; 4096];
     let mut chunk = head;
     loop {
-        if let Some(nul) = memchr(0, chunk) {
-            version.extend_from_slice(&chunk[..nul]);
+        let (text, nul) = match memchr(0, chunk) {
+            Some(nul) => (&chunk[..nul], true),
+            None => (chunk, false),
+        };
+        version.extend_from_slice(&text[..text.len().min(keep - version.len())]);
+        if nul {
             return Ok(Some(String::from_utf8_lossy(&version).into_owned()));
         }
-        version.extend_from_slice(chunk);
         let read = read_retrying(&mut file, &mut more)?;
         if read == 0 {
             return Ok(None);
@@ -119,7 +124,10 @@ fn read_retrying(file: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
-/// Reads `host` and refuses it unless it carries the marker of exactly this library's version.
+/// Reads `host` and refuses it unless it carries the marker of exactly this library's version. Only
+/// the first `version.len() + 1` bytes of a found version are kept, so a longer one is a mismatch
+/// that names its prefix. A file holding more than one marker (a host that embeds another goetia
+/// host's bytes) is judged by the first.
 #[cfg(windows)]
 #[cfg_attr(
     not(test),
@@ -127,7 +135,7 @@ fn read_retrying(file: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
 )]
 pub(crate) fn verify(host: &Path) -> Result<()> {
     let file = File::open(host).map_err(|e| Error::os_at("open", host, e))?;
-    match scan(file).map_err(|e| Error::os_at("read", host, e))? {
+    match scan(file, crate::version().len() + 1).map_err(|e| Error::os_at("read", host, e))? {
         None => Err(Error::ShimMarkerMissing { path: host.into() }),
         Some(found) if found != crate::version() => Err(Error::ShimMarkerVersion {
             path: host.into(),

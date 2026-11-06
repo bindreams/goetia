@@ -633,6 +633,18 @@ fn report_of_a_host_of_another_version_names_both_versions() {
 }
 
 #[skuld::test]
+fn report_of_a_host_version_writes_the_file_supplied_bytes_escaped() {
+    let e = Error::ShimMarkerVersion {
+        path: PathBuf::from("/h.exe"),
+        found: "\u{1b}[31m\n".to_string(),
+        expected: "0.2.0".to_string(),
+    };
+    let report = e.report().to_string();
+    assert!(report.contains("version \\u{1b}[31m\\n,"), "{report}");
+    assert!(!report.contains('\u{1b}') && !report.contains('\n'), "{report:?}");
+}
+
+#[skuld::test]
 fn report_of_an_invalid_password_variable_has_no_source() {
     let e = Error::InvalidPassword {
         variable: "GOETIA_SERVICE_PASSWORD".to_string(),

@@ -6,6 +6,8 @@ use std::io::{self, Cursor, Read};
 use super::*;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Room for any version these tests write.
+const KEEP: usize = 64;
 
 /// A marker as `scan` must read it: the needle, the version, a NUL.
 fn marker_bytes(version: &str) -> Vec<u8> {
@@ -39,29 +41,61 @@ impl<R: Read> Read for Trickle<R> {
 #[skuld::test]
 fn scan_names_the_version() {
     let host = host_with(&marker_bytes(VERSION), 100, 100);
-    assert_eq!(scan(Cursor::new(host)).unwrap().as_deref(), Some(VERSION));
+    assert_eq!(scan(Cursor::new(host), KEEP).unwrap().as_deref(), Some(VERSION));
 }
 
 #[skuld::test]
-fn scan_names_a_version_of_any_length() {
-    for version in ["1", "10.20.30-rc.1+build.5", &"9".repeat(CHUNK * 2)] {
-        let host = host_with(&marker_bytes(version), 7, 7);
-        assert_eq!(scan(Cursor::new(host)).unwrap().as_deref(), Some(version));
+fn scan_keeps_only_the_first_bytes_of_a_longer_version() {
+    for keep in [1, 5, 10] {
+        let host = host_with(&marker_bytes("1234567890"), 7, 7);
+        let found = scan(Cursor::new(host), keep).unwrap().unwrap();
+        assert_eq!(found, "1234567890"[..keep], "keep {keep}");
     }
+}
+
+#[skuld::test]
+fn scan_keeps_the_first_bytes_of_a_version_longer_than_a_read() {
+    let long = "9".repeat(CHUNK * 2);
+    let host = host_with(&marker_bytes(&long), CHUNK - 3, 7);
+    assert_eq!(scan(Cursor::new(host), 4).unwrap().as_deref(), Some("9999"));
+}
+
+#[skuld::test]
+fn scan_of_a_needle_without_a_terminator_reads_it_all_and_finds_nothing() {
+    struct Counting<R> {
+        inner: R,
+        read: usize,
+    }
+    impl<R: Read> Read for Counting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read += n;
+            Ok(n)
+        }
+    }
+    let mut bytes = needle().to_vec();
+    bytes.extend(std::iter::repeat_n(b'9', CHUNK * 8));
+    let total = bytes.len();
+    let mut reader = Counting {
+        inner: Cursor::new(bytes),
+        read: 0,
+    };
+    assert_eq!(scan(&mut reader, 4).unwrap(), None);
+    assert_eq!(reader.read, total);
 }
 
 #[skuld::test]
 fn scan_reports_missing() {
     let bytes: Vec<u8> = (0..CHUNK * 3).map(|i| (i.wrapping_mul(31) >> 3) as u8).collect();
-    assert_eq!(scan(Cursor::new(bytes)).unwrap(), None);
-    assert_eq!(scan(Cursor::new(Vec::new())).unwrap(), None);
+    assert_eq!(scan(Cursor::new(bytes), KEEP).unwrap(), None);
+    assert_eq!(scan(Cursor::new(Vec::new()), KEEP).unwrap(), None);
 }
 
 #[skuld::test]
 fn scan_reports_a_marker_cut_off_before_its_version_ends_as_missing() {
     let mut bytes = marker_bytes(VERSION);
     bytes.pop();
-    assert_eq!(scan(Cursor::new(bytes)).unwrap(), None);
+    assert_eq!(scan(Cursor::new(bytes), KEEP).unwrap(), None);
 }
 
 #[skuld::test]
@@ -72,7 +106,7 @@ fn scan_finds_a_marker_across_the_buffer_boundary() {
     for start in CHUNK - marker.len() - 1..=CHUNK + 1 {
         let host = host_with(&marker, start, 50);
         assert_eq!(
-            scan(Cursor::new(host)).unwrap().as_deref(),
+            scan(Cursor::new(host), KEEP).unwrap().as_deref(),
             Some(VERSION),
             "marker at {start}"
         );
@@ -88,7 +122,7 @@ fn scan_finds_a_marker_whatever_sizes_the_reader_returns() {
             inner: Cursor::new(host),
             step,
         };
-        assert_eq!(scan(reader).unwrap().as_deref(), Some(VERSION), "step {step}");
+        assert_eq!(scan(reader, KEEP).unwrap().as_deref(), Some(VERSION), "step {step}");
     }
 }
 
@@ -100,7 +134,7 @@ fn scan_returns_a_read_error() {
             Err(io::Error::other("disk gone"))
         }
     }
-    assert_eq!(scan(Broken).unwrap_err().to_string(), "disk gone");
+    assert_eq!(scan(Broken, KEEP).unwrap_err().to_string(), "disk gone");
 }
 
 #[cfg(windows)]
@@ -132,7 +166,7 @@ mod windows {
 
     #[skuld::test]
     fn marker_is_what_scan_reads() {
-        assert_eq!(scan(&MARKER[..]).unwrap().as_deref(), Some(VERSION));
+        assert_eq!(scan(&MARKER[..], VERSION.len() + 1).unwrap().as_deref(), Some(VERSION));
     }
 
     #[skuld::test]
@@ -149,6 +183,27 @@ mod windows {
             panic!("expected ShimMarkerVersion");
         };
         assert_eq!((at, got, expected), (path, found, VERSION.to_string()));
+    }
+
+    #[skuld::test]
+    fn verify_names_the_prefix_of_a_longer_version_and_never_accepts_it() {
+        // This version followed by more: the kept `VERSION.len() + 1` bytes can never equal it.
+        let longer = format!("{VERSION}0");
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_file(&dir, &host_with(&marker_bytes(&format!("{longer}999")), 10, 10));
+        let Err(Error::ShimMarkerVersion { found, .. }) = verify(&path) else {
+            panic!("expected ShimMarkerVersion");
+        };
+        assert_eq!(found, longer);
+    }
+
+    #[skuld::test]
+    fn verify_names_a_needle_without_a_terminator_as_no_marker() {
+        let mut bytes = needle().to_vec();
+        bytes.extend_from_slice(VERSION.as_bytes());
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_file(&dir, &bytes);
+        assert!(matches!(verify(&path), Err(Error::ShimMarkerMissing { .. })));
     }
 
     #[skuld::test]
