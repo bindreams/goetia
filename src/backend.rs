@@ -21,7 +21,8 @@ pub mod systemd;
 
 /// The integration suites' removal of what a test created, shared with the library's unit tests;
 /// they reach `tests/` only by path, and each module that included it itself would load it twice.
-#[cfg(all(test, unix))]
+/// Only the systemd and launchd manager tests use it, so only their targets compile it.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[path = "../tests/support/cleanup.rs"]
 pub(crate) mod test_cleanup;
 

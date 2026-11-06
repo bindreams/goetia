@@ -9,7 +9,7 @@ use super::*;
 use crate::manager::budget::Budget;
 
 #[cfg(target_os = "linux")]
-use crate::backend::test_cleanup::remove_empty_dir_or_warn;
+use crate::backend::test_cleanup::{removal_problem, retrying, warn_left_behind};
 
 /// A reservation holding the temp files one child's streams draw.
 fn files() -> Reservation {
@@ -277,8 +277,9 @@ fn contained_leaf(pid: u32) -> Option<std::path::PathBuf> {
 /// Removes the cgroup leaf cosca placed a child in, on drop. cosca's own `Drop` removes it when the
 /// killed tree has already drained by then, and leaves it behind when a member is still dying — half
 /// the runs of the test above, measured — so the test removes what it made. An `rmdir` that meets a
-/// member still exiting is retried, then warned about. Created before the spawn, so a failing test
-/// removes the leaf too; [`DrainedLeaf::set`] names the leaf once the child is in it.
+/// member still exiting is retried, then warned about. Declared before the spawn, so it drops after
+/// `child`: cosca's `Drop` has killed the tree by then, and the `rmdir` does not run beside a live
+/// member. A failing test removes the leaf too; [`DrainedLeaf::set`] names it once the child is in it.
 #[cfg(target_os = "linux")]
 #[derive(Default)]
 struct DrainedLeaf(Option<std::path::PathBuf>);
@@ -294,7 +295,7 @@ impl DrainedLeaf {
 impl Drop for DrainedLeaf {
     fn drop(&mut self) {
         if let Some(leaf) = &self.0 {
-            remove_empty_dir_or_warn(leaf);
+            warn_left_behind(retrying(|| removal_problem(leaf, std::fs::remove_dir(leaf))));
         }
     }
 }

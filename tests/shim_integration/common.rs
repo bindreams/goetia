@@ -116,7 +116,11 @@ impl Drop for LeftoverLog {
                 };
                 eprintln!("ShimGuard[{}]: {problem}", self.id);
             }
-            Fate::Remove => support::cleanup::remove_or_warn(&self.path, false),
+            Fate::Remove => {
+                if let Some(problem) = support::cleanup::remove_path_retrying(&self.path, false) {
+                    eprintln!("ShimGuard[{}]: left behind: {problem}", self.id);
+                }
+            }
         }
     }
 }

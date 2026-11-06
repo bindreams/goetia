@@ -288,10 +288,10 @@ impl Drop for CreatedRoot {
 /// standing where one belongs) and, where the seeding call created it, the search root holding it.
 /// The leaf field is declared first, so it is removed before the root; see [`seed_control_dropin`].
 ///
-/// No `daemon-reload` on drop. A test that seeds a drop-in for a unit systemd loads (`seed_dropin`
-/// reloads at the seed) also holds a `ServiceGuard`, whose own cleanup reloads after this one has
-/// run. The unreadable-drop-in seeds (`seed_unreadable_dropin_*`) need none: no unit is ever loaded
-/// for their id, so systemd holds nothing from them to forget, and their tests run no reload.
+/// No `daemon-reload` on drop. A test that reloads while a seed exists holds a `ServiceGuard` for
+/// the id, whose own cleanup reloads after this one has run: `seed_dropin`'s tests, which reload at
+/// the seed, and the conformance test, which seeds `UNDETERMINED_ID` and then installs and reloads.
+/// A test that seeds and never reloads needs no guard: systemd holds nothing from the seed to forget.
 struct RmInRoot<L> {
     _leaf: L,
     _root: Option<CreatedRoot>,
@@ -834,8 +834,9 @@ impl StopHolder {
 impl Drop for StopHolder {
     fn drop(&mut self) {
         self.release();
-        // `start` builds the holder before writing the unit or the lock, so a failed start leaves
-        // either unmade: exit 5 is "unit not loaded", and a missing file is already gone.
+        // `start` builds the holder before writing the unit, so a failed start leaves it unmade:
+        // exit 5 is "unit not loaded", and a missing file is already gone. The lock directory goes
+        // with `_lock_dir`, after this.
         let run = cmd::run("systemctl", &["stop", &self.unit]);
         if !run.ok() && run.code != Some(5) {
             eprintln!("StopHolder[{}]: cleanup failed: {run}", self.unit);
