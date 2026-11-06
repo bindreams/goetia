@@ -89,6 +89,7 @@ fn run_service(id: &str) {
         }
     };
 
+    logging::set_daemon_log(logging::daemon_log_path(id, blob.spec.logs.as_deref()));
     log_version_skew(id, &blob.spec, &blob.version, goetia::version());
     let reported = run_daemon(
         &blob.spec,
@@ -480,7 +481,7 @@ fn build_command(spec: &DaemonSpec, id: &str) -> cosca::Command {
     cmd.envs(spec.env.clone());
     cmd.contain();
 
-    let log_path = spec.logs.clone().unwrap_or_else(|| logging::default_log_path(id));
+    let log_path = logging::daemon_log_path(id, spec.logs.as_deref());
     match logging::open_append(&log_path) {
         Ok(file) => {
             // Merges are resolved in a second pass at spawn time (`cosca`'s

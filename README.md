@@ -789,10 +789,15 @@ service because it is marked for deletion. A service deleted while a `stop` or
 After upgrading goetia, run `goetia daemon install` again for every daemon
 installed by an older version. `type: simple` services registered before this
 shim existed have no recovery actions until then, so the new shim runs them but
-SCM does not restart them. On every start, the shim logs one warning (in
-`%ProgramData%\Goetia\logs\<id>.log` and as a warning in the Windows Event
-Log) when it starts under a service that a different goetia version registered
-and `restart` is not `never`.
+SCM does not restart them. On every start, the shim logs one warning when it
+starts under a service that a different goetia version registered and
+`restart` is not `never`.
+
+The shim writes its own failures and warnings to the daemon's log once it has
+read the daemon's config, so they appear among the daemon's output. Before
+that, or if the daemon's log cannot be opened, it writes to
+`%ProgramData%\Goetia\logs\<id>.log`. It also writes each to the Windows Event
+Log.
 
 `sc query` shows the difference between your command failing and the shim
 failing:

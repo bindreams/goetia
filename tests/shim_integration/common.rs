@@ -2,10 +2,11 @@
 
 use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use goetia::backend::scm::exit_status::RecordedExit;
+use goetia::backend::scm::manager::Scm;
 use goetia::spec::{DaemonSpec, Kind};
 use windows_service::service::{Service, ServiceAccess, ServiceState, ServiceStatus};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
@@ -29,20 +30,144 @@ pub fn fixture_command(mode: &str, args: &[&str]) -> Vec<String> {
     v
 }
 
-/// [`support::spec`] with `type: simple`.
-pub fn simple_spec(id: &str, command: Vec<String>) -> DaemonSpec {
+/// Cleanup for a shim-hosted service `id`, in this order:
+/// 1. the product's `uninstall`, which disables the service, waits out a start that has begun,
+///    stops it and deletes it. Its wait has no bound: a shim that never stops is a hung test, which
+///    the CI watchdog reports;
+/// 2. a [`support::ServiceGuard`]'s `sc stop` and `sc delete`, for what `uninstall` does not own;
+/// 3. [`LeftoverLog`]: the file the shim writes when it fails before it has read the daemon's config.
+///
+/// Step 1 is this type's `drop`; steps 2 and 3 are its fields, which drop in declaration order. A
+/// failure prints a line and never panics; unless `uninstall` confirmed the shim stopped, an
+/// existing log is kept and named.
+pub struct ShimGuard {
+    id: String,
+    _sc: support::ServiceGuard,
+    log: LeftoverLog,
+}
+
+impl ShimGuard {
+    pub fn new(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            _sc: support::ServiceGuard::new(id),
+            log: LeftoverLog {
+                id: id.to_string(),
+                path: support::shim_default_log(&support::program_data(), id),
+                fate: Fate::Remove,
+            },
+        }
+    }
+
+    /// Step 1, and what it decides for the log.
+    fn uninstall(&self) -> Fate {
+        use goetia::error::Error;
+        use goetia::manager::ServiceManager as _;
+
+        let fail = |step: &str, e: &Error| {
+            eprintln!("ShimGuard[{}]: {step}: {}", self.id, e.report());
+            Fate::Keep(format!("{step} failed"))
+        };
+        let id = match goetia::spec::Id::try_from(self.id.as_str()) {
+            Ok(id) => id,
+            Err(e) => return fail("parse the id", &e),
+        };
+        match Scm::new().uninstall(&id) {
+            Ok(()) | Err(Error::NotInstalled { .. }) => Fate::Remove,
+            // Not goetia's, so nothing confirms its shim stopped; the `sc` guard owns the service.
+            Err(e @ Error::Foreign { .. }) => {
+                eprintln!("ShimGuard[{}]: uninstall: {}", self.id, e.report());
+                Fate::Keep("the service is not goetia's".to_string())
+            }
+            Err(e) => fail("uninstall", &e),
+        }
+    }
+}
+
+impl Drop for ShimGuard {
+    fn drop(&mut self) {
+        self.log.fate = self.uninstall();
+    }
+}
+
+/// What [`LeftoverLog`] does with its file.
+enum Fate {
+    Remove,
+    /// `uninstall` did not confirm the shim stopped: the id did not parse, `uninstall` failed, or
+    /// the service is not goetia's.
+    Keep(String),
+}
+
+/// The default log of the shim of `id`, which [`ShimGuard`]'s `drop` decides the [`Fate`] of.
+struct LeftoverLog {
+    id: String,
+    path: PathBuf,
+    fate: Fate,
+}
+
+impl Drop for LeftoverLog {
+    fn drop(&mut self) {
+        let problem = match &self.fate {
+            Fate::Keep(why) => match self.path.try_exists() {
+                Ok(false) => None,
+                Ok(true) => Some(format!("left {}: {why}", self.path.display())),
+                Err(e) => Some(format!("left {}, if it exists ({e}): {why}", self.path.display())),
+            },
+            Fate::Remove => support::service_guard::remove_path_retrying(&self.path, false),
+        };
+        if let Some(problem) = problem {
+            eprintln!("ShimGuard[{}]: {problem}", self.id);
+        }
+    }
+}
+
+/// A temp dir the test owns, for everything its daemons write: their logs, which the shims' own
+/// failure lines join once they have read the spec.
+///
+/// Removed on drop, retried for [`support::service_guard::CLEANUP_BOUND`] and then let go with a
+/// warning: a daemon may still hold its log while its service stops. Declare it before the test's
+/// [`ShimGuard`]s.
+pub struct LogDir(PathBuf);
+
+impl LogDir {
+    pub fn new() -> Self {
+        // `keep` hands the removal to the `Drop` below, which does not ignore a failure.
+        Self(tempfile::tempdir().expect("tempdir for the daemons' logs").keep())
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+
+    /// Where the daemon `id` logs: `<dir>/<id>.log`.
+    pub fn path_for(&self, id: &str) -> PathBuf {
+        self.0.join(format!("{id}.log"))
+    }
+}
+
+impl Drop for LogDir {
+    fn drop(&mut self) {
+        if let Some(problem) = support::service_guard::remove_path_retrying(&self.0, true) {
+            eprintln!("LogDir: {problem}");
+        }
+    }
+}
+
+/// [`support::spec`] with `type: simple`, logging to a path in `logs` (a dir the test owns) rather
+/// than the `%ProgramData%` default.
+pub fn simple_spec(id: &str, command: Vec<String>, logs: &LogDir) -> DaemonSpec {
     DaemonSpec {
         kind: Kind::Simple,
+        logs: Some(logs.path_for(id)),
         ..support::spec(id, command)
     }
 }
 
-/// The `mk` [`goetia::manager::conformance::run`] needs: a fresh, valid
-/// `type: simple` spec for any `id`. The port is dummy — the fixture
-/// reports in on a best-effort basis regardless of whether anything
-/// listens, and no conformance scenario reads the report.
-pub fn conformance_mk(id: &str) -> DaemonSpec {
-    simple_spec(id, fixture_command("report", &["1"]))
+/// The `mk` [`goetia::manager::conformance::run`] needs: a fresh, valid `type: simple` spec for any
+/// `id`, logging to `logs.path_for(id)`. The port is dummy — the fixture reports in on a best-effort
+/// basis regardless of whether anything listens, and no conformance scenario reads the report.
+pub fn conformance_mk(logs: &LogDir, id: &str) -> DaemonSpec {
+    simple_spec(id, fixture_command("report", &["1"]), logs)
 }
 
 // SCM records and the shim process ====================================================================================
@@ -58,63 +183,6 @@ pub fn scm_status(id: &str) -> ServiceStatus {
         .unwrap_or_else(|e| panic!("query status of {id}: {e}"))
 }
 
-/// What one `NotifyServiceStatusChangeW` delivery said, written by the APC and read by the waiter
-/// on the same thread.
-struct Delivery {
-    fired: AtomicBool,
-    state: AtomicU32,
-    controls_accepted: AtomicU32,
-}
-
-unsafe extern "system" fn record_delivery(parameter: *const c_void) {
-    let notify = parameter.cast::<SERVICE_NOTIFY_2W>();
-    // SAFETY: SCM hands back the buffer registered in `arm`, whose `pContext` is the leaked
-    // `Delivery`.
-    let (delivery, status) = unsafe { (&*(*notify).pContext.cast::<Delivery>(), &(*notify).ServiceStatus) };
-    delivery.state.store(status.dwCurrentState, Ordering::Release);
-    delivery
-        .controls_accepted
-        .store(status.dwControlsAccepted, Ordering::Release);
-    delivery.fired.store(true, Ordering::Release);
-}
-
-/// Arm `mask` on `service` and block, alertably, until SCM delivers it. Returns
-/// `(state, controls_accepted)` of the delivery. Armed on a state that does not match `mask` yet,
-/// so the delivery is the transition.
-pub fn arm_and_wait(service: &Service, mask: u32) -> impl FnOnce() -> (u32, u32) {
-    // Leaked: SCM may still hold the registration if the test panics before the delivery.
-    let delivery: &'static Delivery = Box::leak(Box::new(Delivery {
-        fired: AtomicBool::new(false),
-        state: AtomicU32::new(0),
-        controls_accepted: AtomicU32::new(0),
-    }));
-    let notify: &'static mut SERVICE_NOTIFY_2W = Box::leak(Box::new(SERVICE_NOTIFY_2W {
-        dwVersion: SERVICE_NOTIFY_STATUS_CHANGE,
-        pfnNotifyCallback: Some(record_delivery),
-        pContext: (delivery as *const Delivery as *mut Delivery).cast(),
-        ..Default::default()
-    }));
-    // SAFETY: the handle has `SERVICE_QUERY_STATUS`; `notify` is leaked and so outlives the
-    // registration.
-    let error = unsafe { NotifyServiceStatusChangeW(service.raw_handle(), mask, notify) };
-    assert_eq!(
-        error,
-        0,
-        "NotifyServiceStatusChangeW: {}",
-        std::io::Error::from_raw_os_error(error as i32)
-    );
-    move || {
-        while !delivery.fired.load(Ordering::Acquire) {
-            // SAFETY: plain FFI call; an alertable wait is what lets the APC run.
-            unsafe { SleepEx(INFINITE, 1) };
-        }
-        (
-            delivery.state.load(Ordering::Acquire),
-            delivery.controls_accepted.load(Ordering::Acquire),
-        )
-    }
-}
-
 /// Both exit codes SCM holds for `id`, from `sc query`. `ServiceStatus::exit_code` cannot show a
 /// service-specific code beside Win32 0, which is exactly what tells a clean stop from an
 /// incomplete one.
@@ -128,12 +196,7 @@ pub fn recorded_exit(id: &str) -> RecordedExit {
                 let (key, value) = line.split_once(':')?;
                 (key.trim() == name).then(|| value.split_whitespace().next()?.parse().ok())?
             })
-            .unwrap_or_else(|| {
-                panic!(
-                    "no numeric `{name}` in:
-{query}"
-                )
-            })
+            .unwrap_or_else(|| panic!("no numeric `{name}` in:\n{query}"))
     };
     RecordedExit {
         win32: field("WIN32_EXIT_CODE"),
@@ -141,19 +204,103 @@ pub fn recorded_exit(id: &str) -> RecordedExit {
     }
 }
 
-/// The shim's fallback log for `id`, `%ProgramData%\Goetia\logs\<id>.log`: where it reports what it
-/// cannot report to the daemon's own log, and the daemon's output when the spec sets no `logs`.
-pub fn fallback_log(id: &str) -> String {
-    let programdata = std::env::var_os("ProgramData")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-    let path = programdata.join("Goetia").join("logs").join(format!("{id}.log"));
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read fallback log {}: {e}", path.display()))
-}
-
 /// `taskkill /F` on `pid`: the way a test ends a shim or a daemon without telling either.
 pub fn kill_process(pid: u32) {
     support::cmd::run("taskkill.exe", &["/F", "/PID", &pid.to_string()]).expect_ok();
+}
+
+// SCM state-change notifications --------------------------------------------------------------------------------------
+
+/// What one `NotifyServiceStatusChangeW` delivery said, written by the APC and read by the waiter
+/// on the same thread.
+struct Delivery {
+    fired: AtomicBool,
+    state: AtomicU32,
+    controls_accepted: AtomicU32,
+}
+
+unsafe extern "system" fn record_delivery(parameter: *const c_void) {
+    let notify = parameter.cast::<SERVICE_NOTIFY_2W>();
+    // SAFETY: SCM hands back the buffer registered in `arm_and_wait`, whose `pContext` is the leaked
+    // `Delivery`.
+    let (delivery, status) = unsafe { (&*(*notify).pContext.cast::<Delivery>(), &(*notify).ServiceStatus) };
+    delivery.state.store(status.dwCurrentState, Ordering::Release);
+    delivery
+        .controls_accepted
+        .store(status.dwControlsAccepted, Ordering::Release);
+    delivery.fired.store(true, Ordering::Release);
+}
+
+/// The SCM connection and the service handle of one registration, closed together when it ends.
+struct Handles {
+    _manager: ServiceManager,
+    service: Service,
+}
+
+impl Handles {
+    fn open(id: &str) -> std::io::Result<Self> {
+        let io_error = |e: windows_service::Error| match e {
+            windows_service::Error::Winapi(e) => e,
+            other => std::io::Error::other(other),
+        };
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).map_err(io_error)?;
+        let service = manager
+            .open_service(id, ServiceAccess::QUERY_STATUS)
+            .map_err(io_error)?;
+        Ok(Self {
+            _manager: manager,
+            service,
+        })
+    }
+}
+
+/// `NotifyServiceStatusChangeW`'s "you are too far behind" return; not among `windows-sys`'s exports.
+const ERROR_SERVICE_NOTIFY_CLIENT_LAGGING: u32 = 1294;
+
+/// Arm `mask` on service `id`; the returned closure blocks, alertably, until SCM delivers it and
+/// returns `(state, controls_accepted)` of the delivery. Armed on a state that does not match `mask`
+/// yet, the delivery is the transition; a service already in a matching state delivers at once.
+/// There is no bound: a delivery that never comes is a hung test, which the CI watchdog reports.
+///
+/// On `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING` it reopens the SCM and service handles and arms again,
+/// as the documented remedy and `ScmActor::arm` do. Any other registration failure (a deleted
+/// service reports 1060) is returned.
+pub fn arm_and_wait(id: &str, mask: u32) -> std::io::Result<impl FnOnce() -> (u32, u32)> {
+    // Leaked: SCM may still hold the registration if the test panics before the delivery.
+    let delivery: &'static Delivery = Box::leak(Box::new(Delivery {
+        fired: AtomicBool::new(false),
+        state: AtomicU32::new(0),
+        controls_accepted: AtomicU32::new(0),
+    }));
+    let notify: &'static mut SERVICE_NOTIFY_2W = Box::leak(Box::new(SERVICE_NOTIFY_2W {
+        dwVersion: SERVICE_NOTIFY_STATUS_CHANGE,
+        pfnNotifyCallback: Some(record_delivery),
+        pContext: (delivery as *const Delivery as *mut Delivery).cast(),
+        ..Default::default()
+    }));
+    let mut handles = Handles::open(id)?;
+    loop {
+        // SAFETY: the handle has `SERVICE_QUERY_STATUS`; `notify` is leaked and so outlives the
+        // registration.
+        let error = unsafe { NotifyServiceStatusChangeW(handles.service.raw_handle(), mask, notify) };
+        match error {
+            0 => break,
+            ERROR_SERVICE_NOTIFY_CLIENT_LAGGING => handles = Handles::open(id)?,
+            error => return Err(std::io::Error::from_raw_os_error(error as i32)),
+        }
+    }
+    // The handles cancel the registration when they close, so the closure owns them.
+    Ok(move || {
+        let _handles = handles;
+        while !delivery.fired.load(Ordering::Acquire) {
+            // SAFETY: plain FFI call; an alertable wait is what lets the APC run.
+            unsafe { SleepEx(INFINITE, 1) };
+        }
+        (
+            delivery.state.load(Ordering::Acquire),
+            delivery.controls_accepted.load(Ordering::Acquire),
+        )
+    })
 }
 
 /// A handle on the shim process of a started service, taken while it runs so that the test can
@@ -178,7 +325,7 @@ impl ShimProcess {
             .open_service(id, ServiceAccess::QUERY_STATUS)
             .unwrap_or_else(|e| panic!("open service {id}: {e}"));
         // Armed before the read; a service that already runs delivers at once.
-        let (state, _) = arm_and_wait(&service, SERVICE_NOTIFY_RUNNING)();
+        let (state, _) = arm_and_wait(id, SERVICE_NOTIFY_RUNNING).expect("arm the RUNNING notification")();
         assert_eq!(state, SERVICE_RUNNING, "the notification for RUNNING");
         let running = service
             .query_status()

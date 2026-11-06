@@ -11,6 +11,8 @@
 //! reports nothing surfaces later only as a mysterious straggler in
 //! `systemctl` / `launchctl` / `services.msc`, long after the run that left it.
 
+use std::time::{Duration, Instant};
+
 use super::{LAUNCHD_DAEMON_DIR, SYSTEMD_UNIT_DIR, cmd};
 
 pub struct ServiceGuard {
@@ -47,6 +49,21 @@ pub fn remove_path(path: &std::path::Path, dir: bool) -> Option<String> {
         Ok(()) => None,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => Some(format!("remove {}: {e}", path.display())),
+    }
+}
+
+/// How long a cleanup waits on a transient condition of unknown duration (an antivirus holding a
+/// file, a process still exiting) before it lets go with a warning.
+pub const CLEANUP_BOUND: Duration = Duration::from_secs(5);
+
+/// [`remove_path`], retried until it succeeds or [`CLEANUP_BOUND`] passes; then the last problem.
+pub fn remove_path_retrying(path: &std::path::Path, dir: bool) -> Option<String> {
+    let start = Instant::now();
+    loop {
+        match remove_path(path, dir) {
+            Some(_) if start.elapsed() < CLEANUP_BOUND => std::thread::sleep(Duration::from_millis(100)),
+            problem => return problem,
+        }
     }
 }
 

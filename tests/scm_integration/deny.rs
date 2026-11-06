@@ -171,7 +171,7 @@ impl Denied {
     /// metadata blob, and the only proof of ownership a `type: managed`
     /// service has.
     pub fn parameters(id: &str) -> Self {
-        let object = format!(r"MACHINE\{}\{id}\Parameters", support::SCM_SERVICES_KEY);
+        let object = format!(r"MACHINE\{}", support::registry::parameters_path(id));
         Self::seal(object, SE_REGISTRY_KEY, key_dacl(Some("KR")), key_dacl(None))
     }
 
