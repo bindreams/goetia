@@ -296,17 +296,16 @@ fn daemon_spec_from_wire(wire: WireSpec) -> Result<DaemonSpec, Error> {
         WireRestart::Always => Restart::Always,
     };
 
-    let restart_delay = match wire.restart_delay {
-        Some(d) => Some(duration_from_wire(&id, d)?),
-        None => None,
-    };
+    // Reported after `DaemonSpec::new`'s field rules, so a blob with several defects reports the
+    // same first one as before.
+    let restart_delay = wire.restart_delay.map(|d| duration_from_wire(&id, d));
 
     let kind = match wire.kind {
         WireKind::Simple => Kind::Simple,
         WireKind::Managed => Kind::Managed,
     };
 
-    DaemonSpec::new(DaemonFields {
+    let spec = DaemonSpec::new(DaemonFields {
         id,
         name: wire.name,
         command: wire.command,
@@ -314,10 +313,12 @@ fn daemon_spec_from_wire(wire: WireSpec) -> Result<DaemonSpec, Error> {
         env: wire.env,
         user,
         restart,
-        restart_delay,
+        restart_delay: restart_delay.as_ref().and_then(|d| d.as_ref().ok().copied()),
         logs: wire.logs.map(PathBuf::from),
         kind,
-    })
+    })?;
+    restart_delay.transpose()?;
+    Ok(spec)
 }
 
 /// `Duration::new` panics if `nanos >= 1_000_000_000`; a hand-tampered

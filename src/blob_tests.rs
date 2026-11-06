@@ -273,6 +273,25 @@ fn decode_rejects_invariant_violations() {
 }
 
 #[skuld::test]
+fn decode_reports_a_field_defect_before_a_bad_restart_delay() {
+    let mut wire = base_wire_spec();
+    wire.name = "bad
+name"
+        .to_string();
+    wire.restart_delay = Some(WireDuration {
+        secs: 1,
+        nanos: 2_000_000_000,
+    });
+    let envelope = WireEnvelope {
+        schema: SCHEMA,
+        version: "0.1.0".to_string(),
+        spec: wire,
+    };
+    let message = decode(&encode_wire_envelope(&envelope)).unwrap_err().to_string();
+    assert!(message.contains("field `name`"), "{message}");
+}
+
+#[skuld::test]
 fn decode_rejects_an_empty_user_name() {
     // A tampered blob carrying an empty `user.name` must not decode into
     // a spec whose backend generators would emit an empty `User=`/
