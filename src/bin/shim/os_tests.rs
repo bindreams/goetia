@@ -86,36 +86,50 @@ fn wait_gives_the_same_exit_code_every_time() {
     assert_eq!((first.code(), second.code()), (Some(3), Some(3)));
 }
 
-/// `cosca` reports it as `Io(NotFound)` with no OS error code, which `service::os_error_of` reads
-/// as none.
+/// `cosca` searches for the binary itself, bare or absolute, and reports a miss as `Io(NotFound)`
+/// with no OS error code, so `service::os_error_of` has to supply the code SCM is told.
 #[skuld::test]
-fn a_spawn_of_a_missing_binary_is_refused_as_not_found() {
-    let refused = Real
-        .spawn(cosca::run(["goetia-shim-test-no-such-binary"]))
-        .err()
-        .expect("the binary does not exist");
+fn a_spawn_of_a_missing_binary_is_refused_as_not_found(#[fixture(temp_dir)] dir: &Path) {
+    let absolute = dir.join("goetia-shim-test-no-such-binary.exe");
+    for missing in [Path::new("goetia-shim-test-no-such-binary"), absolute.as_path()] {
+        let refused = Real
+            .spawn(cosca::run([missing]))
+            .err()
+            .expect("the binary does not exist");
 
-    assert!(
-        matches!(&refused, cosca::error::Error::Io(e) if e.kind() == io::ErrorKind::NotFound && e.raw_os_error().is_none()),
-        "{refused:?}"
-    );
+        assert!(
+            matches!(&refused, cosca::error::Error::Io(e) if e.kind() == io::ErrorKind::NotFound && e.raw_os_error().is_none()),
+            "{missing:?}: {refused:?}"
+        );
+    }
 }
 
 // build_command -------------------------------------------------------------------------------------------------------
 
 const ID: &str = "goetia-shim-os-test";
 
-/// `dir` without the `\\?\` prefix `skuld::temp_dir` returns (it canonicalizes): `CreateProcess`
-/// rejects a verbatim working directory.
+/// `dir` without the verbatim prefix `skuld::temp_dir` returns (it canonicalizes): `CreateProcess`
+/// rejects a verbatim working directory. `\?\C:\x` becomes `C:\x` and `\?\UNC\s\x` becomes
+/// `\s\x`; any other form is returned as it is.
 fn plain(dir: &Path) -> PathBuf {
-    dir.to_str()
-        .and_then(|dir| dir.strip_prefix(r"\\?\"))
-        .map_or_else(|| dir.to_path_buf(), PathBuf::from)
+    let Some(dir_str) = dir.to_str() else {
+        return dir.to_path_buf();
+    };
+    if let Some(unc) = dir_str.strip_prefix(r"\?\UNC\") {
+        return PathBuf::from(format!(r"\{unc}"));
+    }
+    match dir_str.strip_prefix(r"\?\") {
+        Some(drive) if matches!(drive.as_bytes(), [letter, b':', ..] if letter.is_ascii_alphabetic()) => {
+            PathBuf::from(drive)
+        }
+        _ => dir.to_path_buf(),
+    }
 }
 
 /// What `build_command` sets up, observed from a real daemon spawned through `Real`: the Job Object
 /// `StopBus` kills the tree through, stdout and stderr both in `spec.logs`, `cwd` and `env`. The
-/// daemon prints its working directory and the variable, writes a line to stderr and exits.
+/// daemon prints its working directory and the variable, writes a line to stderr and exits. The
+/// log is read as a set of lines: the order across the two streams is not fixed.
 #[skuld::test]
 fn build_command_makes_a_job_contained_daemon_with_its_cwd_env_and_log(#[fixture(temp_dir)] dir: &Path) {
     const CWD_LEAF: &str = "goetia-cwd-probe";
@@ -123,13 +137,7 @@ fn build_command_makes_a_job_contained_daemon_with_its_cwd_env_and_log(#[fixture
     let cwd = plain(dir).join(CWD_LEAF);
     std::fs::create_dir(&cwd).expect("the daemon's working directory");
     let logs = dir.join("daemon.log");
-    let command = [
-        "powershell",
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "(Get-Location).Path; $env:GOETIA_TEST_VAR; [Console]::Error.WriteLine('to-stderr')",
-    ];
+    let command = ["cmd", "/c", "echo %CD%& echo %GOETIA_TEST_VAR%& echo to-stderr>&2"];
     let spec = DaemonSpec {
         cwd: Some(cwd.clone()),
         env: BTreeMap::from([("GOETIA_TEST_VAR".to_string(), "from-spec".to_string())]),
@@ -147,14 +155,19 @@ fn build_command_makes_a_job_contained_daemon_with_its_cwd_env_and_log(#[fixture
 
     assert_eq!(contained, Containment::JobObject);
     let log = std::fs::read_to_string(&logs).expect("the daemon's log");
-    let lines: Vec<&str> = log.lines().collect();
-    assert_eq!(lines.len(), 3, "stdout then stderr, nothing else: {log:?}");
+    let lines: Vec<&str> = log.lines().map(str::trim).collect();
     assert!(
-        lines[0].ends_with(CWD_LEAF),
+        lines.iter().any(|line| line.ends_with(CWD_LEAF)),
         "the daemon ran outside its `cwd`: {log:?}"
     );
-    assert_eq!(lines[1], "from-spec", "the daemon did not get its `env`: {log:?}");
-    assert_eq!(lines[2], "to-stderr", "stderr is not in the daemon's log: {log:?}");
+    assert!(
+        lines.contains(&"from-spec"),
+        "the daemon did not get its `env`: {log:?}"
+    );
+    assert!(
+        lines.contains(&"to-stderr"),
+        "stderr is not in the daemon's log: {log:?}"
+    );
 }
 
 // Channels ------------------------------------------------------------------------------------------------------------

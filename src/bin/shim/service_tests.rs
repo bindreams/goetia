@@ -13,7 +13,7 @@ use goetia::backend::scm::exit_status::{
 };
 use goetia::spec::{Kind, Restart};
 use skuld::temp_dir;
-use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, NO_ERROR};
+use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, NO_ERROR};
 use windows_sys::Win32::System::Services::{
     SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_PAUSE, SERVICE_CONTROL_STOP, SERVICE_STOP_PENDING, SERVICE_STOPPED,
 };
@@ -54,8 +54,10 @@ fn spec(dir: &Path) -> DaemonSpec {
     }
 }
 
-/// What `cosca` reports for a binary that does not exist: `Io(NotFound)` with no OS error code
-/// (`os_tests` pins it against `Real`), so the failure carries no code to report.
+/// What `cosca` reports for a binary that does not exist, whether named bare (searched for on
+/// `PATH`) or by absolute path: its own search fails with `Io(NotFound)` and no OS error code
+/// (`os_tests` pins both against `Real`). A binary that exists but cannot be run fails later in
+/// `CreateProcessW`, with that call's code.
 fn not_found() -> cosca::error::Error {
     cosca::error::Error::Io(std::io::Error::from(std::io::ErrorKind::NotFound))
 }
@@ -162,11 +164,31 @@ fn a_daemon_that_cannot_be_spawned_is_logged_and_nothing_is_left_running(#[fixtu
 
     assert_eq!(
         launched.as_ref().err(),
-        Some(&Reported::shim_failure(None)),
-        "launch reported a daemon whose spawn failed"
+        Some(&Reported::shim_failure(Some(ERROR_FILE_NOT_FOUND as i32))),
+        "launch did not report the missing binary to SCM as ERROR_FILE_NOT_FOUND"
     );
     assert_one_failure(&fake.take_failures(), ID, &spawn_failure());
     // The un-handed waiter ends on drop; consume its end.
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+}
+
+#[skuld::test]
+fn the_os_code_of_a_refused_spawn_is_what_launch_reports(#[fixture(temp_dir)] dir: &Path) {
+    const ACCESS_DENIED: i32 = 5;
+    let fake = FakeGuard::new();
+    fake.will_make_thread();
+    fake.will_refuse_spawn(cosca::error::Error::Io(std::io::Error::from_raw_os_error(
+        ACCESS_DENIED,
+    )));
+
+    let launched = launch(&spec(dir), &bus(&fake), ID);
+
+    assert_eq!(
+        launched.as_ref().err(),
+        Some(&Reported::shim_failure(Some(ACCESS_DENIED)))
+    );
+    // The refusal's text is not the point here; consume the one failure line and the waiter.
+    assert_eq!(fake.take_failures().len(), 1);
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
 
@@ -241,7 +263,7 @@ fn no_running_report_when_the_spawn_fails(#[fixture(temp_dir)] dir: &Path) {
         running_reports, 0,
         "RUNNING was reported for a daemon that never started"
     );
-    assert_eq!(reported, Reported::shim_failure(None));
+    assert_eq!(reported, Reported::shim_failure(Some(ERROR_FILE_NOT_FOUND as i32)));
     assert_one_failure(&fake.take_failures(), ID, &spawn_failure());
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
@@ -864,6 +886,20 @@ fn the_os_error_of_an_io_failure_is_kept_and_other_failures_have_none() {
     assert_eq!(
         os_error_of(&cosca::error::Error::Io(std::io::Error::from_raw_os_error(5))),
         Some(5)
+    );
+    // A real code wins over the kind's: ERROR_PATH_NOT_FOUND is `NotFound` too.
+    assert_eq!(
+        os_error_of(&cosca::error::Error::Io(std::io::Error::from_raw_os_error(3))),
+        Some(3)
+    );
+    // `cosca`'s own search for a binary fails without a code; SCM is still told the file is missing.
+    assert_eq!(os_error_of(&not_found()), Some(ERROR_FILE_NOT_FOUND as i32));
+    assert_eq!(
+        os_error_of(&cosca::error::Error::Unassessable {
+            detail: "query".to_string(),
+            source: Some(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        }),
+        Some(ERROR_FILE_NOT_FOUND as i32)
     );
     assert_eq!(
         os_error_of(&cosca::error::Error::Io(std::io::Error::other("no os code"))),

@@ -15,7 +15,7 @@ use goetia::backend::scm::exit_status::{
 use goetia::backend::scm::manager::read_spec_blob;
 use goetia::spec::{DaemonSpec, Restart};
 use windows_service::{define_windows_service, service_dispatcher};
-use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, NO_ERROR};
+use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, NO_ERROR};
 use windows_sys::Win32::System::Services::{
     RegisterServiceCtrlHandlerExW, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_STOP,
     SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOP_PENDING, SERVICE_STOPPED,
@@ -378,11 +378,17 @@ fn require_job_object(
     Err(Reported::incomplete_stop())
 }
 
-/// The OS error code behind a `cosca` failure, if it has one.
+/// The OS error code behind a `cosca` failure, if it has one. `cosca` searches for a binary itself
+/// and reports a miss as `NotFound` with no code; SCM is told `ERROR_FILE_NOT_FOUND` for it, the
+/// code `CreateProcess` gives for the same miss.
 pub(crate) fn os_error_of(e: &cosca::error::Error) -> Option<i32> {
+    let code = |e: &std::io::Error| match e.raw_os_error() {
+        None if e.kind() == std::io::ErrorKind::NotFound => Some(ERROR_FILE_NOT_FOUND as i32),
+        raw => raw,
+    };
     match e {
-        cosca::error::Error::Io(e) => e.raw_os_error(),
-        cosca::error::Error::Unassessable { source, .. } => source.as_ref().and_then(std::io::Error::raw_os_error),
+        cosca::error::Error::Io(e) => code(e),
+        cosca::error::Error::Unassessable { source, .. } => source.as_ref().and_then(code),
         _ => None,
     }
 }
