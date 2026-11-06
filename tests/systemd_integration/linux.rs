@@ -2014,7 +2014,8 @@ fn list_names_an_id_whose_only_dropin_is_under_another_search_root() {
         "the id must start out unaccounted for, or the assertion below proves nothing"
     );
 
-    let elsewhere = seed_unreadable_dropin_in_root("/etc/systemd/system.attached", &id);
+    let _elsewhere = seed_unreadable_dropin_in_root("/etc/systemd/system.attached", &id);
+    let elsewhere_leaf = PathBuf::from("/etc/systemd/system.attached").join(format!("{id}.service.d"));
     assert!(!unit_path(&id).exists(), "the fragment must really be absent");
     assert!(
         !dropin_dir(&id).exists(),
@@ -2024,7 +2025,7 @@ fn list_names_an_id_whose_only_dropin_is_under_another_search_root() {
     let entries = undetermined_for(&mgr.list().expect("list"), &id);
     match entries.as_slice() {
         [reason] => assert!(
-            reason.contains(&elsewhere.leaf.display().to_string()),
+            reason.contains(&elsewhere_leaf.display().to_string()),
             "the entry must name the read that did not complete: {reason}"
         ),
         other => panic!("an id named only outside `UNIT_DIR` is one undetermined entry, not {other:?}"),
