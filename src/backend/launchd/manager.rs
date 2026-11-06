@@ -1211,17 +1211,16 @@ impl backend::Backend for Launchd {
         // whether the request is sent, so a spent budget still reaches launchd.
         let issuing = Budget::Unbounded.start();
 
-        if !never_expires(self.launchctl.is_loaded(id.as_str(), issuing, reservation)?) {
-            if let Err(e) = self
+        if !never_expires(self.launchctl.is_loaded(id.as_str(), issuing, reservation)?)
+            && let Err(e) = self
                 .launchctl
                 .bootstrap(&location.path, issuing, reservation)
                 .map(never_expires)
-            {
-                // A concurrent `start` may have loaded it since the check; propagate the error only
-                // if the job is not loaded now either.
-                if !never_expires(self.launchctl.is_loaded(id.as_str(), issuing, reservation)?) {
-                    return Err(e);
-                }
+        {
+            // A concurrent `start` may have loaded it since the check; propagate the error only
+            // if the job is not loaded now either.
+            if !never_expires(self.launchctl.is_loaded(id.as_str(), issuing, reservation)?) {
+                return Err(e);
             }
         }
         // `kickstart` launches a job with no `KeepAlive`/`RunAtLoad` (`restart: never`); `bootstrap`
