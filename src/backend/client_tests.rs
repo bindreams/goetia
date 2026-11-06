@@ -15,6 +15,11 @@ fn sh_with(script: &str, environment: fn(&mut cosca::Command)) -> Real {
     )
 }
 
+/// A reservation holding the temp files one call's streams draw.
+fn files() -> Reservation {
+    Reservation::make(0, bounded::STREAMS).unwrap()
+}
+
 fn under_deadline() -> Wait {
     Wait::Bounded {
         role: Role::Query,
@@ -25,7 +30,7 @@ fn under_deadline() -> Wait {
 #[skuld::test]
 fn real_runs_and_captures() {
     let finished = sh("echo out; echo err >&2; exit 3")
-        .run(&[], under_deadline())
+        .run(&[], under_deadline(), &mut files())
         .expect("sh runs");
     let Finished::Exited { status, capture } = finished else {
         panic!("an unbounded run never expires: {finished:?}");
@@ -39,14 +44,16 @@ fn real_runs_and_captures() {
 #[skuld::test]
 fn real_reports_a_missing_program_as_not_run() {
     let real = Real::new(vec!["/nonexistent/client".to_string()], |_| {});
-    let e = real.run(&["x"], under_deadline()).expect_err("no such program");
+    let e = real
+        .run(&["x"], under_deadline(), &mut files())
+        .expect_err("no such program");
     assert!(matches!(e, ClientError::NotRun(_)), "{e:?}");
 }
 
 #[skuld::test]
 fn real_puts_the_args_after_the_program() {
     let finished = Real::new(vec!["/bin/echo".to_string(), "first".to_string()], |_| {})
-        .run(&["second", "third"], under_deadline())
+        .run(&["second", "third"], under_deadline(), &mut files())
         .expect("echo runs");
     let Finished::Exited { capture, .. } = finished else {
         panic!("{finished:?}");
@@ -59,7 +66,7 @@ fn real_applies_its_environment_to_the_child() {
     let real = sh_with("echo \"$CLIENT_MARK\"", |cmd| {
         cmd.env("CLIENT_MARK", "set");
     });
-    let Finished::Exited { capture, .. } = real.run(&[], under_deadline()).expect("sh runs") else {
+    let Finished::Exited { capture, .. } = real.run(&[], under_deadline(), &mut files()).expect("sh runs") else {
         panic!("expired");
     };
     assert_eq!(capture.stdout, b"set\n");
@@ -71,7 +78,9 @@ fn real_expires_on_a_spent_deadline() {
         role: Role::Query,
         deadline: Budget::Bounded(Duration::ZERO).start(),
     };
-    let finished = sh("exec sleep 2147483647").run(&[], wait).expect("sh runs");
+    let finished = sh("exec sleep 2147483647")
+        .run(&[], wait, &mut files())
+        .expect("sh runs");
     assert!(matches!(finished, Finished::Expired), "{finished:?}");
 }
 
@@ -113,7 +122,7 @@ fn real_tells_a_spawn_that_failed_before_exec_from_one_that_may_have_run() {
     ];
     for (case, error, may_have_run) in cases {
         bounded::test_hook::spawn_fails(error);
-        match sh("true").run(&[], under_deadline()) {
+        match sh("true").run(&[], under_deadline(), &mut files()) {
             Err(ClientError::MayHaveRun(_)) => assert!(may_have_run, "{case}: placed after exec"),
             Err(ClientError::NotRun(_)) => assert!(!may_have_run, "{case}: placed before exec"),
             other => panic!("{case}: the injected failure was not mapped to a spawn error: {other:?}"),
@@ -139,7 +148,7 @@ fn real_loses_a_child_and_says_whether_it_announced() {
             role,
             deadline: Budget::Unbounded.start(),
         };
-        match sh(script).run(&[], wait) {
+        match sh(script).run(&[], wait, &mut files()) {
             Err(ClientError::Lost { error, announced }) => {
                 assert_eq!(announced, expected, "{script}");
                 assert!(error.to_string().contains("the wait failed"), "{script}: {error:?}");
@@ -147,4 +156,40 @@ fn real_loses_a_child_and_says_whether_it_announced() {
             other => panic!("{script}: expected the child to be lost: {other:?}"),
         }
     }
+}
+
+// fake::Fake ==========================================================================================================
+
+/// The test client draws what the real one draws, from the reservation it is handed: a call leaves
+/// the reservation shorter by its streams' files, and one handed too few is a miscount, which fails
+/// a debug assertion in every test that drives it.
+#[skuld::test]
+fn the_fake_draws_a_calls_files_from_the_reservation() {
+    use fake::{Fake, exited, reply};
+
+    let query = || Wait::Bounded {
+        role: Role::Query,
+        deadline: Budget::Unbounded.start(),
+    };
+    let mut reservation = Reservation::make(0, 2 * bounded::STREAMS).unwrap();
+
+    let table = Fake::new([
+        reply(&["print"], exited(0, "", "")),
+        reply(&["print"], exited(0, "", "")),
+    ]);
+    table
+        .run(&["print"], query(), &mut reservation)
+        .expect("a scripted reply");
+    assert_eq!(bounded::test_hook::left(&reservation), (0, bounded::STREAMS));
+
+    table
+        .run(&["print"], query(), &mut reservation)
+        .expect("a scripted reply");
+    assert_eq!(bounded::test_hook::left(&reservation), (0, 0));
+
+    let short = Fake::new([reply(&["print"], exited(0, "", ""))]);
+    let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(short.run(&["print"], query(), &mut reservation));
+    }));
+    assert!(drawn.is_err(), "a call past the reservation went unnoticed");
 }
