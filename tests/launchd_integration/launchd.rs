@@ -1103,7 +1103,8 @@ fn a_stop_with_no_budget_runs_bootout_to_completion() {
 /// when launchd has forked its `RunAtLoad` run, so a `start` straight after it can beat that run:
 /// the kick is then the job's first fork, nothing is throttled, and `start` correctly reports
 /// `StartUnconfirmed`. The test therefore loads the job itself and waits for the job to report its
-/// first run before calling `start`.
+/// first run, and then for launchd to show that run gone, before calling `start`: a run still alive
+/// would read `Running` and `start` would succeed.
 ///
 /// Two measured facts, neither of them assumed:
 ///
@@ -1144,14 +1145,19 @@ fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout() {
 
     // Load the job without `start`: `RunAtLoad` runs it. Once it has connected, launchd has forked
     // the run, so the respawn history exists and the `kickstart -p` inside `start` meets the
-    // throttle on this very first `start`. The job exits right after connecting; the few
-    // milliseconds before it is gone are shorter than the `launchctl` calls `start` makes first.
+    // throttle on this very first `start`. The process is still exiting when `accept` returns,
+    // though, and `start` reads `Running` from one that has a pid. So wait, re-reading the
+    // job as `status` does, until launchd shows no process: the run's exit is then recorded.
     cmd::run(
         "launchctl",
         &["bootstrap", "system", staging_path(&id).to_str().unwrap()],
     )
     .expect_ok();
     listener.accept("the crash-looping job's first run");
+    support::kill::until(|| {
+        let status = mgr.status(&spec.id).expect("status");
+        status.state != State::Running && status.pid.is_none()
+    });
 
     let err = mgr
         .start(&spec.id, Budget::Bounded(Duration::from_secs(5)))
