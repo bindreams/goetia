@@ -11,8 +11,10 @@
 //!   `launchctl kickstart`s it, which is what launches a job with no `KeepAlive`/`RunAtLoad` (a
 //!   `restart: never` daemon). Under a budget that waits, the kickstart asks for the pid (`-p`)
 //!   and so blocks on launchd's respawn throttle (measured ~10.02s, 10.01-10.03s) whenever the job
-//!   has respawn history, as a crash-looping `restart: always` job does. [`Budget::DEFAULT`] is
-//!   10s, just below that, so such a job essentially always reports [`Error::WaitTimeout`]. The
+//!   has respawn history, as a crash-looping `restart: always` job has once launchd has run it.
+//!   `bootstrap` returns at load, before the `RunAtLoad` run is forked, so a `start` straight after
+//!   it can be the job's first run and meet no throttle. [`Budget::DEFAULT`] is 10s, just below
+//!   that, so a job with history essentially always reports [`Error::WaitTimeout`]. The
 //!   request stands (the `launchctl` carrying it is left running, never killed), but launchd will
 //!   not report the job running within the budget. The budget bounds that wait and nothing else:
 //!   every `launchctl` call that issues the request runs to completion. The throttle is keyed to

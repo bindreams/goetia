@@ -1094,10 +1094,16 @@ fn a_stop_with_no_budget_runs_bootout_to_completion() {
     );
 }
 
-/// launchd will not report a crash-looping `restart: always` job running, so a bounded `start`
-/// reports [`goetia::Error::WaitTimeout`] — bounded by the budget, not by launchd's respawn
-/// throttle. Saying so is the contract (`ServiceManager::start`: `Ok(())` means the manager
-/// reports it running), not a defect.
+/// launchd will not report a crash-looping `restart: always` job running once the job has respawn
+/// history, so a bounded `start` of such a job reports [`goetia::Error::WaitTimeout`] — bounded by
+/// the budget, not by launchd's respawn throttle. Saying so is the contract
+/// (`ServiceManager::start`: `Ok(())` means the manager reports it running), not a defect.
+///
+/// The history is observed, not assumed. `launchctl bootstrap` returns when the job is loaded, not
+/// when launchd has forked its `RunAtLoad` run, so a `start` straight after it can beat that run:
+/// the kick is then the job's first fork, nothing is throttled, and `start` correctly reports
+/// `StartUnconfirmed`. The test therefore loads the job itself and waits for the job to report its
+/// first run before calling `start`.
 ///
 /// Two measured facts, neither of them assumed:
 ///
@@ -1120,15 +1126,33 @@ fn a_stop_with_no_budget_runs_bootout_to_completion() {
 fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout() {
     let mgr = Launchd::new();
     let id = support::random_test_id();
-    // Exits immediately, so `restart: always` puts launchd into the respawn loop it throttles.
-    let mut spec = base_spec(&id, vec!["/usr/bin/true".to_string()]);
+    // Reports each run and exits at once, so `restart: always` puts launchd into the respawn loop it
+    // throttles.
+    let listener = ConnectBack::listen();
+    let mut spec = base_spec(
+        &id,
+        vec![
+            support::current_exe_str(),
+            support::sentinel::CONNECT_BACK.to_string(),
+            listener.port().to_string(),
+        ],
+    );
     spec.restart = Restart::Always;
+    // Registered before the job is loaded; boots it out after `_guard` uninstalls.
+    let _job = support::ServiceGuard::new(&id);
     let _guard = Guard::install(&mgr, &spec);
 
-    // One start, not two. `install` leaves the job unloaded, so this bootstraps it — and for a
-    // `restart: always` spec whose command exits at once, the bootstrap itself starts the job via
-    // `RunAtLoad`, the process dies, and *that* creates the respawn history. The `kickstart -p`
-    // that follows therefore already meets a throttled job on this very first start.
+    // Load the job without `start`: `RunAtLoad` runs it. Once it has connected, launchd has forked
+    // the run, so the respawn history exists and the `kickstart -p` inside `start` meets the
+    // throttle on this very first `start`. The job exits right after connecting; the few
+    // milliseconds before it is gone are shorter than the `launchctl` calls `start` makes first.
+    cmd::run(
+        "launchctl",
+        &["bootstrap", "system", staging_path(&id).to_str().unwrap()],
+    )
+    .expect_ok();
+    listener.accept("the crash-looping job's first run");
+
     let err = mgr
         .start(&spec.id, Budget::Bounded(Duration::from_secs(5)))
         .expect_err("launchd cannot confirm a crash-looping job running, so a bounded start times out");
