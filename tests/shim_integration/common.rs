@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 
 use goetia::backend::scm::exit_status::RecordedExit;
 use goetia::backend::scm::manager::Scm;
-use goetia::backend::scm::wait::{Armed, Observed, QueriedState, ScmActor as _, SystemScmActor, WantState};
+use std::ops::ControlFlow;
+
+use goetia::backend::scm::wait::{QueriedState, SystemScmActor, Waited, WantState, wait_until};
 use goetia::manager::Budget;
 use goetia::spec::{DaemonSpec, Kind};
 use windows_service::service::{ServiceAccess, ServiceState, ServiceStatus};
@@ -202,48 +204,6 @@ pub fn kill_process(pid: u32) {
     support::cmd::run("taskkill.exe", &["/F", "/PID", &pid.to_string()]).expect_ok();
 }
 
-/// Waits until `actor`'s service is in `done`, arming for `want`, and panics on any other terminal
-/// state, so a service that stopped fails the test and does not hang it. `ScmActor::arm`'s contract
-/// is the reason for the shape: a re-arm on an unchanged state does not fire, so the status each arm
-/// returns is decided on before the wait, and only a pending state waits and re-arms.
-pub fn wait_for(actor: &mut SystemScmActor, want: WantState, done: QueriedState) -> QueriedState {
-    fn check(reached: QueriedState, done: QueriedState) -> Option<QueriedState> {
-        match reached {
-            r if r == done => Some(r),
-            QueriedState::Running | QueriedState::Paused | QueriedState::Stopped => {
-                panic!("waiting for {done:?}, the service reached {reached:?}")
-            }
-            _ => None,
-        }
-    }
-    loop {
-        match actor
-            .arm(want, Budget::Unbounded.start())
-            .unwrap_or_else(|e| panic!("arm the {want:?} notification: {e}"))
-        {
-            Armed::Registered(status) => {
-                if let Some(reached) = check(status.state, done) {
-                    return reached;
-                }
-            }
-            other => panic!("waiting for {done:?}, the arm came to {other:?}"),
-        }
-        let reached = match actor
-            .wait_callback(Budget::Unbounded.start())
-            .unwrap_or_else(|e| panic!("wait for {done:?}: {e}"))
-        {
-            Some(Observed::Pending) => continue,
-            Some(Observed::Running) => QueriedState::Running,
-            Some(Observed::Paused) => QueriedState::Paused,
-            Some(Observed::Stopped) => QueriedState::Stopped,
-            None => panic!("an unbounded wait for {done:?} expired"),
-        };
-        if let Some(reached) = check(reached, done) {
-            return reached;
-        }
-    }
-}
-
 /// A handle on the shim process of a started service, taken while it runs so that the test can
 /// wait for the process to be gone. SCM has the final `STOPPED` record by then: the shim reports it
 /// before it exits.
@@ -266,7 +226,26 @@ impl ShimProcess {
             .open_service(id, ServiceAccess::QUERY_STATUS)
             .unwrap_or_else(|e| panic!("open service {id}: {e}"));
         let mut actor = SystemScmActor::open(id).unwrap_or_else(|e| panic!("open {id} to wait for RUNNING: {e}"));
-        wait_for(&mut actor, WantState::Running, QueriedState::Running);
+        // Settled states other than `RUNNING` fail the test instead of hanging it; pending ones wait.
+        let waited = wait_until(
+            &mut actor,
+            WantState::Running,
+            WantState::Running,
+            QueriedState::Running,
+            Budget::Unbounded.start(),
+            |sighting| match sighting.state {
+                QueriedState::Paused | QueriedState::Stopped => {
+                    panic!("waiting for Running, {id} reached {:?}", sighting.state)
+                }
+                _ => Ok(ControlFlow::Continue(())),
+            },
+        )
+        .unwrap_or_else(|e| panic!("wait for {id} to report RUNNING: {e}"));
+        assert_eq!(
+            waited,
+            Waited::Confirmed,
+            "an unbounded wait for {id} to report RUNNING expired"
+        );
         let running = service
             .query_status()
             .unwrap_or_else(|e| panic!("query status of {id}: {e}"));

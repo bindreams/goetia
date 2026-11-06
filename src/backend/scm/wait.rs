@@ -470,13 +470,13 @@ pub struct Sighting {
 ///
 /// `target`, in a status or a notification, is [`Waited::Confirmed`]. An arm that expired and a wait
 /// that ran out of `deadline` are [`Waited::Expired`]. A service marked for deletion or gone is decided
-/// as [`decided_or_status`] says. A notification of a pending state re-arms without asking `other`.
+/// as `decided_or_status` says. A notification of a pending state re-arms without asking `other`.
 /// Every other state, from a status or a notification, goes to `other` as a [`Sighting`]: `Break` ends
 /// the wait with that answer, an error ends it with the error, and `Continue` keeps waiting (after a
 /// notification, by re-arming).
 ///
 /// `rearm` is separate from `first` because a mask that suits the first arm can wake a re-arm for a
-/// state already seen: [`wait_after_stop`]'s re-arm is [`WantState::StoppedOnly`], as a new handle
+/// state already seen: the stop wait's re-arm is [`WantState::StoppedOnly`], as a new handle
 /// delivers the current state at once (P27 c, f). A wait with no such state passes `first` twice.
 pub fn wait_until<A: ScmActor>(
     a: &mut A,

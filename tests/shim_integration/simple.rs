@@ -3,16 +3,19 @@
 //! for the `type: managed` analogues these mirror.
 
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 
 use goetia::backend::scm::manager::Scm;
-use goetia::backend::scm::wait::{Armed, Observed, QueriedState, ScmActor as _, SystemScmActor, WantState};
+use goetia::backend::scm::wait::{
+    Armed, Observed, QueriedState, ScmActor as _, SystemScmActor, Waited, WantState, wait_until,
+};
 use goetia::decide::Outcome;
 use goetia::manager::conformance;
 use goetia::manager::{Budget, Installed, ServiceManager as _, State};
 use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-use crate::common::{LogDir, ShimGuard, conformance_mk, fixture_command, simple_spec, wait_for};
+use crate::common::{LogDir, ShimGuard, conformance_mk, fixture_command, simple_spec};
 use crate::deny::Denied;
 use crate::support::{self, ELEVATED};
 
@@ -248,5 +251,20 @@ fn the_shim_reports_stop_pending_then_stopped() {
     // The shim reports `SERVICE_ACCEPT_STOP` or nothing, so not accepting STOP is `controls_accepted == 0`.
     assert!(!actor.accepts_stop(), "no control is accepted while stopping");
 
-    wait_for(&mut actor, WantState::StoppedOnly, QueriedState::Stopped);
+    // A settled state other than `STOPPED` fails the test instead of hanging it; `STOP_PENDING` waits.
+    let waited = wait_until(
+        &mut actor,
+        WantState::StoppedOnly,
+        WantState::StoppedOnly,
+        QueriedState::Stopped,
+        Budget::Unbounded.start(),
+        |sighting| match sighting.state {
+            QueriedState::Running | QueriedState::Paused => {
+                panic!("waiting for Stopped, the service reached {:?}", sighting.state)
+            }
+            _ => Ok(ControlFlow::Continue(())),
+        },
+    )
+    .expect("wait for STOPPED");
+    assert_eq!(waited, Waited::Confirmed, "an unbounded wait for STOPPED expired");
 }
