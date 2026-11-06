@@ -379,7 +379,7 @@ impl Fake {
         Arc::new(Log::new(self.channels(), PathBuf::from("default-logs")))
     }
 
-    // Tables -----------------------------------------------------------------------------------------------------
+    // Tables ----------------------------------------------------------------------------------------------------------
 
     /// The next `spawn` succeeds with `process`.
     pub(crate) fn will_spawn(&self, process: FakeProcess) {
@@ -407,7 +407,7 @@ impl Fake {
         lock(&self.shared.state).append_failures.push(path.to_path_buf());
     }
 
-    // Records ----------------------------------------------------------------------------------------------------
+    // Records ---------------------------------------------------------------------------------------------------------
 
     /// How many times `op` was called, replied to or not. Readable from inside a callback of the
     /// code under test.
