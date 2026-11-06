@@ -11,7 +11,7 @@ use windows_sys::Win32::System::Services::{
     SERVICE_NOTIFY_STOP_PENDING, SERVICE_NOTIFY_STOPPED, SERVICE_STOP_PENDING, SERVICE_STOPPED,
 };
 
-use crate::common::{arm_and_wait, conformance_mk, fixture_command, mk_spec};
+use crate::common::{arm_and_wait, conformance_mk, fixture_command, simple_spec};
 use crate::deny::Denied;
 use crate::support::{self, ELEVATED, ServiceGuard};
 
@@ -82,7 +82,7 @@ fn install_then_list_round_trips_without_the_source_file() {
     let mgr = goetia::backend::scm::manager::Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
-    let spec = mk_spec(&id, fixture_command("report", &["1"]));
+    let spec = simple_spec(&id, fixture_command("report", &["1"]));
 
     let outcome = mgr.install(&spec, false).expect("install");
     assert!(matches!(outcome, Outcome::Create), "{outcome:?}");
@@ -108,7 +108,7 @@ fn start_stop_status_reflect_reality() {
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let started = support::ConnectBack::listen();
-    let spec = mk_spec(&id, fixture_command("report", &[&started.port().to_string()]));
+    let spec = simple_spec(&id, fixture_command("report", &[&started.port().to_string()]));
     mgr.install(&spec, false).expect("install");
 
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
@@ -136,7 +136,7 @@ fn start_stop_status_reflect_reality() {
 fn uninstall_leaves_nothing() {
     let mgr = goetia::backend::scm::manager::Scm::new();
     let id = support::random_test_id();
-    let spec = mk_spec(&id, fixture_command("report", &["1"]));
+    let spec = simple_spec(&id, fixture_command("report", &["1"]));
     mgr.install(&spec, false).expect("install");
 
     mgr.uninstall(&spec.id).expect("uninstall");
@@ -198,7 +198,7 @@ fn the_shim_reports_stop_pending_then_stopped() {
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let started = support::ConnectBack::listen();
-    let spec = mk_spec(&id, fixture_command("report", &[&started.port().to_string()]));
+    let spec = simple_spec(&id, fixture_command("report", &[&started.port().to_string()]));
     mgr.install(&spec, false).expect("install");
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     started.accept("the fixture (spawned by the shim) to report running");
