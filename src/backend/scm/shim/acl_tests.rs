@@ -347,6 +347,21 @@ mod windows {
         assert_eq!(chain[0].path, display_path(&existing));
     }
 
+    /// A junction (no privilege needed, unlike a symlink) at `link` to the existing `target`.
+    fn junction(link: &Path, target: &Path) {
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stdout));
+    }
+
+    fn labels(chain: &[ObjectSecurity]) -> Vec<PathBuf> {
+        chain.iter().map(|o| o.path.clone()).collect()
+    }
+
     #[skuld::test]
     fn the_chain_holds_the_links_and_the_final_path() {
         let dir = tempfile::tempdir().unwrap();
@@ -354,23 +369,87 @@ mod windows {
         let real = root.join("real");
         std::fs::create_dir(&real).unwrap();
         let link = root.join("link");
-        // A junction needs no privilege; a symlink does.
-        let made = std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(&link)
-            .arg(&real)
-            .output()
-            .unwrap();
-        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stdout));
+        junction(&link, &real);
 
-        let chain = read_chain(&link).unwrap();
-        let paths: Vec<PathBuf> = chain.iter().map(|o| o.path.clone()).collect();
+        let paths = labels(&read_chain(&link).unwrap());
         assert!(paths.contains(&display_path(&link)), "{paths:?}");
         assert!(paths.contains(&display_path(&real)), "{paths:?}");
         let mut unique = paths.clone();
         unique.sort();
         unique.dedup();
         assert_eq!(unique.len(), paths.len(), "no object twice: {paths:?}");
+    }
+
+    #[skuld::test]
+    fn a_link_reached_through_another_is_judged_with_its_parent() {
+        // `outer` -> `inner\middle` -> `real`: whoever can retarget `middle` redirects the folder,
+        // though neither the given path nor the final path names it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let real = root.join("real");
+        let inner = root.join("inner");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(&inner).unwrap();
+        let middle = inner.join("middle");
+        junction(&middle, &real);
+        let outer = root.join("outer");
+        junction(&outer, &middle);
+
+        let paths = labels(&read_chain(&outer).unwrap());
+        for held in [&outer, &middle, &inner, &real, &root] {
+            assert!(
+                paths.contains(&display_path(held)),
+                "{} missing from {paths:?}",
+                held.display()
+            );
+        }
+    }
+
+    #[skuld::test]
+    fn a_loop_of_links_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (a, b) = (root.join("a"), root.join("b"));
+        // `b` -> `a`, then `a` is replaced by a junction to `b`: a -> b -> a.
+        std::fs::create_dir(&a).unwrap();
+        junction(&b, &a);
+        std::fs::remove_dir(&a).unwrap();
+        junction(&a, &b);
+
+        // A loop has no final path, so the read fails; what matters is that the walk ended.
+        let outcome = read_chain(&a);
+        // Unlinked first: a junction loop must not be left for the directory's cleanup to walk.
+        std::fs::remove_dir(&a).unwrap();
+        std::fs::remove_dir(&b).unwrap();
+        assert!(outcome.is_err(), "{:?}", outcome.map(|c| labels(&c)));
+    }
+
+    #[skuld::test]
+    fn a_final_path_is_opened_as_it_is_not_as_win32_would_rewrite_it() {
+        // `x.` exists only through a verbatim path; opened as `x` it is another object or none.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let odd = root.join("x.");
+        std::fs::create_dir(&odd).unwrap();
+        // `mklink /J` stores a normalised target (`x`), so this needs a symlink, which takes
+        // Developer Mode or elevation.
+        let link = root.join("link");
+        std::os::windows::fs::symlink_dir(&odd, &link)
+            .expect("creating a symlink needs Windows Developer Mode or an elevated token");
+
+        let outcome = read_chain(&link);
+        std::fs::remove_dir(&link).unwrap();
+        std::fs::remove_dir(&odd).unwrap();
+        let paths = labels(&outcome.unwrap());
+        assert!(paths.contains(&display_path(&odd)), "{paths:?}");
+    }
+
+    #[skuld::test]
+    fn a_path_is_shown_without_its_verbatim_prefix_only_when_that_leaves_a_path() {
+        let guid = Path::new(r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\");
+        assert_eq!(display_path(guid), guid);
+        assert_eq!(display_path(Path::new(r"\\?\C:\a")), Path::new(r"C:\a"));
+        assert_eq!(display_path(Path::new(r"\\?\UNC\h\s\a")), Path::new(r"\\h\s\a"));
     }
 
     #[skuld::test]

@@ -272,49 +272,56 @@ mod system {
     /// A volume flag: it keeps ACLs. Without it no access control exists to check.
     const FILE_PERSISTENT_ACLS: u32 = 0x8;
 
-    /// The security of `folder` and of everything above it: the target first, then outward to the
-    /// volume root. Holds each component of `folder` as given (a link is read as itself) and each
-    /// of its final path, once. A `folder` that does not exist is represented by its first
-    /// existing ancestor, since a provider creates it with its own permissions.
+    /// The security of `folder` and of everything it is reached through: the target first, then
+    /// outward to the volume root. Holds each component of `folder` as given, each link among
+    /// them read as itself, the components of every such link's target and of that target's own
+    /// links in turn, and each component of the final path, once. A `folder` that does not exist
+    /// is represented by its first existing ancestor, since a provider creates it with its own
+    /// permissions.
     pub(super) fn read_chain(folder: &Path) -> Result<Vec<ObjectSecurity>> {
         let given = std::path::absolute(folder).map_err(|e| Error::os_at("resolve", folder, e))?;
-        let (start, start_file) = first_existing(&given)?;
+        let start = first_existing(&given)?;
 
-        let mut chain = vec![read_object(&start_file, display_path(&start))?];
-        for ancestor in start.ancestors().skip(1) {
-            push(&mut chain, ancestor)?;
-        }
+        let mut chain = Vec::new();
+        add_chain(&mut chain, &start)?;
         let final_path = std::fs::canonicalize(&start).map_err(|e| Error::os_at("resolve", &start, e))?;
-        for ancestor in display_path(&final_path).ancestors() {
-            push(&mut chain, ancestor)?;
-        }
+        add_chain(&mut chain, &final_path)?;
         Ok(chain)
     }
 
-    /// `path` without the `\\?\` that a final path carries, so a path compares equal to the one it
-    /// was given as.
+    /// `path` as it is shown and compared: a final path's `\\?\C:\` is `C:\` and its `\\?\UNC\` is
+    /// `\\`, so it equals the path it was given as. Any other verbatim path (`\\?\Volume{..}\`) is
+    /// kept, since without its prefix it would name something else. Only a label: open the path.
     pub(super) fn display_path(path: &Path) -> PathBuf {
         const VERBATIM: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
         const UNC: [u16; 4] = [b'U' as u16, b'N' as u16, b'C' as u16, b'\\' as u16];
         let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-        match wide.strip_prefix(&VERBATIM) {
-            Some(rest) => match rest.strip_prefix(&UNC) {
-                Some(share) => {
-                    let mut unc = vec![b'\\' as u16, b'\\' as u16];
-                    unc.extend_from_slice(share);
-                    PathBuf::from(OsString::from_wide(&unc))
-                }
-                None => PathBuf::from(OsString::from_wide(rest)),
-            },
-            None => path.to_path_buf(),
+        let Some(rest) = wide.strip_prefix(&VERBATIM) else {
+            return path.to_path_buf();
+        };
+        if let Some(share) = rest.strip_prefix(&UNC) {
+            let mut unc = vec![b'\\' as u16, b'\\' as u16];
+            unc.extend_from_slice(share);
+            return PathBuf::from(OsString::from_wide(&unc));
+        }
+        let drive = match rest {
+            [letter, colon, ..] => {
+                *colon == b':' as u16 && u8::try_from(*letter).is_ok_and(|b| b.is_ascii_alphabetic())
+            }
+            _ => false,
+        };
+        if drive {
+            PathBuf::from(OsString::from_wide(rest))
+        } else {
+            path.to_path_buf()
         }
     }
 
-    /// The first of `path` and its ancestors that exists, opened.
-    fn first_existing(path: &Path) -> Result<(PathBuf, File)> {
+    /// The first of `path` and its ancestors that exists.
+    fn first_existing(path: &Path) -> Result<PathBuf> {
         for candidate in path.ancestors() {
             match open(candidate) {
-                Ok(file) => return Ok((candidate.to_path_buf(), file)),
+                Ok(_) => return Ok(candidate.to_path_buf()),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(Error::os_at("read the permissions of", candidate, e)),
             }
@@ -326,14 +333,31 @@ mod system {
         ))
     }
 
-    /// Adds `path` unless the chain holds it.
-    fn push(chain: &mut Vec<ObjectSecurity>, path: &Path) -> Result<()> {
-        let shown = display_path(path);
-        if chain.iter().any(|object| object.path == shown) {
-            return Ok(());
+    /// Adds `path` and each of its ancestors, nearest first, unless the chain holds it. A
+    /// component that is a link also adds its target's chain, and a link already in the chain is
+    /// not followed again, which ends a loop of links. Opens each component by the path it was
+    /// given (a final path is verbatim, and without the prefix Win32 would rewrite some names).
+    fn add_chain(chain: &mut Vec<ObjectSecurity>, path: &Path) -> Result<()> {
+        for component in path.ancestors() {
+            let shown = display_path(component);
+            if chain.iter().any(|object| object.path == shown) {
+                continue;
+            }
+            let file = open(component).map_err(|e| Error::os_at("read the permissions of", component, e))?;
+            chain.push(read_object(&file, shown)?);
+            let is_link = file
+                .metadata()
+                .map_err(|e| Error::os_at("read the type of", component, e))?
+                .file_type()
+                .is_symlink();
+            if is_link {
+                let target = std::fs::read_link(component).map_err(|e| Error::os_at("read the link", component, e))?;
+                let parent = component.parent().unwrap_or(component);
+                let target =
+                    std::path::absolute(parent.join(target)).map_err(|e| Error::os_at("resolve", component, e))?;
+                add_chain(chain, &target)?;
+            }
         }
-        let file = open(path).map_err(|e| Error::os_at("read the permissions of", path, e))?;
-        chain.push(read_object(&file, shown)?);
         Ok(())
     }
 
