@@ -75,6 +75,9 @@ struct FakeScm {
     refusing: &'static [QueriedState],
     /// The n-th `arm` (1-based) meets a service that is gone: opening its fresh handle failed with 1060.
     gone_at_arm: Option<usize>,
+    /// Whether the script may deliver a state the armed mask excludes, which SCM never does: it
+    /// pins what a wait does with one, where the lost-wake-up check would panic.
+    off_mask: bool,
 }
 
 /// What a scripted `control_stop` answers.
@@ -114,6 +117,7 @@ impl FakeScm {
             shifts: vec![],
             refusing: &[],
             gone_at_arm: None,
+            off_mask: false,
         }
     }
 
@@ -146,6 +150,12 @@ impl FakeScm {
     /// could not open a fresh handle (1060).
     fn gone_at_arm(mut self, n: usize) -> Self {
         self.gone_at_arm = Some(n);
+        self
+    }
+
+    /// The script may deliver a state outside the armed mask.
+    fn delivering_off_mask(mut self) -> Self {
+        self.off_mask = true;
         self
     }
 
@@ -417,7 +427,9 @@ impl ScmActor for FakeScm {
                 Some(queued)
             }
             None => {
-                self.assert_something_can_fire();
+                if !self.off_mask {
+                    self.assert_something_can_fire();
+                }
                 let observed = self.waits.pop_front().expect("script ran dry");
                 if let Some(observed) = observed {
                     self.state = Some(self.state_of(observed));
@@ -1696,6 +1708,36 @@ fn wait_until_hands_a_notified_stopped_to_the_closure_with_its_record() {
     assert!(!stopped.pending_delivered);
 }
 
+/// A notification of a state the armed mask excludes cannot come from SCM, and counts as a pending
+/// one: the wait re-arms, and the status of the re-arm decides. A `Running` after the `StoppedOnly`
+/// re-arm does not fail the stop; the `Stopped` after it confirms.
+#[skuld::test]
+fn a_stop_wait_re_arms_on_a_notification_outside_its_mask() {
+    let mut fake = FakeScm::new([
+        Some(Observed::Pending),
+        Some(Observed::Running),
+        Some(Observed::Stopped),
+    ])
+    .delivering_off_mask()
+    .drifting_after(2, QueriedState::StopPending);
+    assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(
+        fake.log,
+        vec![
+            "control_stop",
+            "arm_stopped",
+            "wait",
+            "got_pending",
+            "arm_stopped_only",
+            "wait",
+            "got_running",
+            "arm_stopped_only",
+            "wait",
+            "got_stopped",
+        ]
+    );
+}
+
 /// A settled state off the target that the closure lets pass is waited out like a pending one: the
 /// wait re-arms with `rearm`, and the arm's status is decided before the wait.
 #[skuld::test]
@@ -1705,8 +1747,8 @@ fn wait_until_rearms_with_its_second_mask_after_a_notification_the_closure_lets_
     let mut seen = vec![];
     let waited = wait_until(
         &mut fake,
-        WantState::Running,
         WantState::RunningPausedOrStopped,
+        WantState::Running,
         QueriedState::Running,
         unbounded(),
         |sighting| {
@@ -1726,7 +1768,7 @@ fn wait_until_rearms_with_its_second_mask_after_a_notification_the_closure_lets_
     );
     assert_eq!(
         fake.log,
-        vec!["arm_running", "wait", "got_paused", "arm_settle", "wait", "got_running"]
+        vec!["arm_settle", "wait", "got_paused", "arm_running", "wait", "got_running"]
     );
 }
 

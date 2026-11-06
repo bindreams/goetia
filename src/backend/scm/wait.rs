@@ -305,6 +305,9 @@ const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
 /// A disable that lands while SCM's restart attempt is in flight does not stop it: the attempt runs
 /// to `RUNNING` and the status read right after the disable shows `START_PENDING` or `RUNNING`
 /// (P23), so the loop sees its `RUNNING` and stops it like any start.
+///
+/// It does not use [`wait_until`]: that decides on its first arm's status, which this loop ignores on purpose,
+/// and its `RUNNING`/`PAUSED` action needs the actor, which `wait_until` holds.
 pub(crate) fn settle_and_stop<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
     // The first arm on a fresh actor fires at once for a current state in its mask (P20, P27), so
     // the status it returns is not needed, unless SCM refused to watch the service.
@@ -469,10 +472,11 @@ pub struct Sighting {
 ///
 /// `target`, in a status or a notification, is [`Waited::Confirmed`]. An arm that expired and a wait
 /// that ran out of `deadline` are [`Waited::Expired`]. A service marked for deletion or gone is decided
-/// as [`decided_or_status`] says. A notification of a pending state re-arms without asking `other`.
-/// Every other state, from a status or a notification, goes to `other` as a [`Sighting`]: `Break` ends
-/// the wait with that answer, an error ends it with the error, and `Continue` keeps waiting (after a
-/// notification, by re-arming).
+/// as [`decided_or_status`] says. A notification of a pending state re-arms without asking `other`, and
+/// so does one of a state the armed mask excludes: SCM cannot send it, and it counts as pending, as
+/// the stop wait has always read it. Every other state, from a status or a notification, goes to
+/// `other` as a [`Sighting`]: `Break` ends the wait with that answer, an error ends it with the error,
+/// and `Continue` keeps waiting (after a notification, by re-arming).
 ///
 /// `rearm` is separate from `first` because a mask that suits the first arm can wake a re-arm for a
 /// state already seen: the stop wait's re-arm is [`WantState::StoppedOnly`], as a new handle
@@ -486,6 +490,8 @@ pub fn wait_until<A: ScmActor>(
     mut other: impl FnMut(Sighting) -> io::Result<ControlFlow<Waited>>,
 ) -> io::Result<Waited> {
     let mut armed = Some(a.arm(first, deadline)?);
+    // The states the latest arm registered for.
+    let mut mask = first;
     let mut pending_delivered = false;
     loop {
         // An arm's status and a notification's are the same value from here on.
@@ -497,7 +503,7 @@ pub fn wait_until<A: ScmActor>(
             },
             None => match a.wait_callback(deadline)? {
                 None => return Ok(Waited::Expired),
-                Some(observed) => delivered_status(a, observed),
+                Some(observed) => delivered_status(a, observed, mask),
             },
         };
         if let Some(status) = status {
@@ -513,21 +519,22 @@ pub fn wait_until<A: ScmActor>(
         }
         if after_callback {
             pending_delivered = true;
+            mask = rearm;
             armed = Some(a.arm(rearm, deadline)?);
         }
     }
 }
 
 /// The status a notification delivered, from what the actor buffered for it; `None` for one that
-/// names no state to decide on: a pending state.
-fn delivered_status<A: ScmActor>(a: &A, observed: Observed) -> Option<QueriedStatus> {
+/// names no state to decide on: a pending state, and a state `mask` excludes.
+fn delivered_status<A: ScmActor>(a: &A, observed: Observed, mask: WantState) -> Option<QueriedStatus> {
     let state = match observed {
         Observed::Pending => return None,
         Observed::Running => QueriedState::Running,
         Observed::Paused => QueriedState::Paused,
         Observed::Stopped => QueriedState::Stopped,
     };
-    Some(QueriedStatus {
+    mask.states().contains(&state).then(|| QueriedStatus {
         state,
         accepts_stop: a.accepts_stop(),
         exit: a.stopped_exit(),
