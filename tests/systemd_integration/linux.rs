@@ -1193,15 +1193,31 @@ fn the_version_gate_probes_once_per_daemon_per_verb() {
     }
 }
 
-/// `goetia <args>` in a transient scope allowed `tasks` tasks — threads and processes alike — so
-/// that making a thread, or spawning a process, fails once they are spent.
-fn goetia_with_tasks(tasks: u32, args: &[&str]) -> std::process::Output {
+/// `goetia <args>` in the transient scope `unit` allowed `tasks` tasks — threads and processes
+/// alike — so that making a thread, or spawning a process, fails once they are spent.
+fn goetia_with_tasks(unit: &str, tasks: u32, args: &[&str]) -> std::process::Output {
     Command::new("systemd-run")
-        .args(["--quiet", "--scope", "-p", &format!("TasksMax={tasks}")])
+        .args(["--quiet", "--scope", "--unit", unit, "-p", &format!("TasksMax={tasks}")])
         .arg(env!("CARGO_BIN_EXE_goetia"))
         .args(args)
         .output()
         .expect("spawn systemd-run")
+}
+
+/// `pids.max` and `pids.current` of the transient scope `unit`, read now, or the error that read
+/// gave: a scope whose last process has exited is gone, and its cgroup with it.
+fn scope_pids(unit: &str) -> String {
+    let dir = Path::new("/sys/fs/cgroup/system.slice").join(unit);
+    let read = |file: &str| match fs::read_to_string(dir.join(file)) {
+        Ok(value) => value.trim().to_string(),
+        Err(err) => format!("unreadable: {err}"),
+    };
+    format!(
+        "{}: pids.max={} pids.current={}",
+        dir.display(),
+        read("pids.max"),
+        read("pids.current")
+    )
 }
 
 /// goetia never panics for want of a task; a verb that cannot get what its request needs exits `1`,
@@ -1215,7 +1231,8 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
 
     let sweep = |args: &[&str], untouched: &dyn Fn(u32)| {
         for tasks in 1.. {
-            let output = goetia_with_tasks(tasks, args);
+            let unit = format!("{}-tasks-{tasks}.scope", guard.id());
+            let output = goetia_with_tasks(&unit, tasks, args);
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
             assert!(!stderr.contains("panicked"), "{args:?} TasksMax={tasks}: {stderr}");
             match output.status.code() {
@@ -1224,7 +1241,15 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
                     // starved the verb.
                     assert!(
                         tasks > 1,
-                        "{args:?} succeeded with a single task, so the sweep tested nothing"
+                        "{args:?} succeeded with a single task, so the sweep tested nothing
+                         scope: {unit}
+{}
+--- stdout ---
+{}
+--- stderr ---
+{stderr}",
+                        scope_pids(&unit),
+                        String::from_utf8_lossy(&output.stdout),
                     );
                     return;
                 }
