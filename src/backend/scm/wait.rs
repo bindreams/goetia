@@ -13,6 +13,7 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use std::io;
+use std::ops::ControlFlow;
 
 use crate::backend::scm::exit_status::RecordedExit;
 use crate::manager::budget::Deadline;
@@ -70,7 +71,7 @@ pub enum Observed {
 /// `Result` and leaves a bare `Waited` behind.
 #[must_use = "an expired wait did not confirm the state; decide what to report rather than discarding it"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Waited {
+pub enum Waited {
     Confirmed,
     Expired,
 }
@@ -245,53 +246,6 @@ const STOP_NOT_DELIVERED: &str = "the STOP was not delivered: the service was no
 /// new shim reports `RUNNING`. SCM drops that STOP: nothing queues it (P13c, with 1052).
 const STARTING: &str = "SCM is starting the service (for example a restart after a failure), so the STOP was not delivered and is not queued; run `stop` again once the service is running";
 
-/// The wait half of a stop: the `Stopped` arm (`STOPPED` and `STOP_PENDING`) is already in place, made
-/// after the STOP.
-///
-/// After a non-terminal callback, which is `STOP_PENDING`, it re-arms for `STOPPED` alone and decides
-/// on the status [`ScmActor::arm`] returns: a service that moved on between the callback and the
-/// re-arm would never wake the wait. A failure that races the stop goes `STOPPED (1066)` and SCM
-/// restarts the service under its restart policy (P18a), which can reach `RUNNING` before the
-/// re-arm. The read decides:
-/// - `STOPPED`: confirmed. The re-arm's registration stays outstanding, which the actor's teardown
-///   drains ([`close_then_drain`]); nothing arms it again.
-/// - `STOP_PENDING`: wait on the registration, which fires on the `STOPPED` that ends it, even if a
-///   restart follows at once.
-/// - SCM refused the arm because the service is marked for deletion ([`Armed::Unwatchable`]): the
-///   status it returned decides, `STOPPED` as confirmed and any other state as an error.
-/// - the service is gone ([`Armed::Gone`]): confirmed.
-/// - any other state: the service was running or starting again after it began to stop, so the stop
-///   did not leave it stopped; an error says so, ending in `advice`. It does not wait for the
-///   restart and does not send a second STOP.
-///
-/// `STOPPED` alone, not the first arm's mask again. A re-arm with the same context and buffer on the
-/// same handle is not delivered on an unchanged state (P20, P27 a); with a new context and buffer, or
-/// on a new handle, it is delivered at once (P27 b, c, f). `arm` rewrites `self.notify` in place with
-/// the same `self.status` context, so it is the first shape, except after a `reopen`
-/// (`ERROR_SERVICE_NOTIFY_CLIENT_LAGGING`), which is a new handle. Over a `STOP_PENDING` already
-/// reported, the first mask would therefore stay silent until the next change; nothing here depends
-/// on a delivery at arm time, because the status returned by the arm decides.
-fn await_stopped<A: ScmActor>(a: &mut A, deadline: Deadline, advice: &str) -> io::Result<Waited> {
-    loop {
-        match a.wait_callback(deadline)? {
-            None => return Ok(Waited::Expired),
-            Some(Observed::Stopped) => return Ok(Waited::Confirmed),
-            // Running/Paused cannot arrive under the stop mask; they are treated as pending.
-            Some(Observed::Running | Observed::Paused | Observed::Pending) => {
-                let status = match decided_or_status(a.arm(WantState::StoppedOnly, deadline)?, QueriedState::Stopped)? {
-                    Ok(status) => status,
-                    Err(waited) => return Ok(waited),
-                };
-                match status.state {
-                    QueriedState::Stopped => return Ok(Waited::Confirmed),
-                    QueriedState::StopPending => {}
-                    state => return Err(io::Error::other(not_left_stopped(state, advice))),
-                }
-            }
-        }
-    }
-}
-
 /// What a stop is told when the service is `state` again after it began to stop, as when SCM restarts
 /// it after a failure under its restart policy.
 fn not_left_stopped(state: QueriedState, advice: &str) -> String {
@@ -459,21 +413,123 @@ fn seen_in(status: QueriedStatus) -> Option<Seen> {
     }
 }
 
-/// The wait of a stop once the STOP is accepted or known to be under way: arm for `STOPPED`, which
-/// cancels the settle registration if [`settle_and_stop`] acted on a read and left it unfired. The
-/// status the arm returns confirms a service already `STOPPED`; any other waits, and `advice` ends the
-/// error of a service that is running again.
+/// The wait of a stop once the STOP is accepted or known to be under way: arm for `STOPPED` (and
+/// `STOP_PENDING`), which cancels the settle registration if [`settle_and_stop`] acted on a read and left
+/// it unfired. [`wait_until`] confirms `STOPPED`, whether the status of an arm or a notification shows
+/// it, and re-arms on `STOP_PENDING`. The arm follows the STOP, so only the arm's status and the
+/// notifications after it decide.
 ///
-/// Decided on the arm's status and the notifications after it only: this arm follows the STOP.
+/// What the first arm reads other than `STOPPED` waits: the STOP may not have taken yet, and a `simple`
+/// service reads `RUNNING` until its shim takes it. Once a notification was delivered, the service had
+/// begun to stop, and a re-arm that reads anything but `STOP_PENDING` means it did not stay stopped: a
+/// failure that races the stop goes `STOPPED (1066)` and SCM restarts the service under its restart
+/// policy (P18a), which can reach `RUNNING` before the re-arm. An error says so, ending in `advice`; it
+/// does not wait for the restart and does not send a second STOP.
+///
+/// The re-arm is `STOPPED` alone, not the first mask again. A re-arm with the same context and buffer on
+/// the same handle is not delivered on an unchanged state (P20, P27 a), and `arm` is that shape, except
+/// after a `reopen` (`ERROR_SERVICE_NOTIFY_CLIENT_LAGGING`), which is a new handle: there the
+/// registration is delivered at once for the state already current (P27 c, f). Over a `STOP_PENDING`
+/// already reported, the first mask would therefore wake the wait with a state it has seen. Nothing
+/// depends on a delivery at arm time: the status returned by the arm decides.
 fn wait_after_stop<A: ScmActor>(a: &mut A, deadline: Deadline, advice: &str) -> io::Result<Waited> {
-    let status = match decided_or_status(a.arm(WantState::Stopped, deadline)?, QueriedState::Stopped)? {
-        Ok(status) => status,
-        Err(waited) => return Ok(waited),
-    };
-    if status.state == QueriedState::Stopped {
-        return Ok(Waited::Confirmed);
+    wait_until(
+        a,
+        WantState::Stopped,
+        WantState::StoppedOnly,
+        QueriedState::Stopped,
+        deadline,
+        |sighting| match sighting.state {
+            _ if !sighting.pending_delivered => Ok(ControlFlow::Continue(())),
+            QueriedState::StopPending => Ok(ControlFlow::Continue(())),
+            state => Err(io::Error::other(not_left_stopped(state, advice))),
+        },
+    )
+}
+
+/// A state off the target that [`wait_until`] found, and what the wait knew of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sighting {
+    pub state: QueriedState,
+    /// The exit record of the arm's status, or of the notification: as [`ScmActor::stopped_exit`]
+    /// reads it for `Stopped`, and zeros for the other states, which carry none.
+    pub exit: RecordedExit,
+    /// `dwWaitHint` of the same status or notification, in milliseconds.
+    pub wait_hint: u32,
+    /// Whether a notification of this wait was already delivered, and the wait re-armed after it.
+    /// The first arm reads whatever state the service was in; after a delivery the service is on its
+    /// way, and a re-arm that reads anything else says it moved on. `Running` or `Paused` under a mask
+    /// that excludes them cannot arrive, and count as a pending state.
+    pub pending_delivered: bool,
+}
+
+/// Wait for the service to be `target`: arm for `first`, decide on the status the arm returns, wait
+/// for a notification, and on one that is not the target arm for `rearm` and decide again, under the
+/// same `deadline` throughout and with no iteration limit. [`ScmActor::arm`] says why the status is
+/// decided on before every wait: a registration is not delivered for a state already current.
+///
+/// `target`, in a status or a notification, is [`Waited::Confirmed`]. An arm that expired and a wait
+/// that ran out of `deadline` are [`Waited::Expired`]. A service marked for deletion or gone is decided
+/// as [`decided_or_status`] says. A notification of a pending state re-arms without asking `other`.
+/// Every other state, from a status or a notification, goes to `other` as a [`Sighting`]: `Break` ends
+/// the wait with that answer, an error ends it with the error, and `Continue` keeps waiting (after a
+/// notification, by re-arming).
+///
+/// `rearm` is separate from `first` because a mask that suits the first arm can wake a re-arm for a
+/// state already seen: [`wait_after_stop`]'s re-arm is [`WantState::StoppedOnly`], as a new handle
+/// delivers the current state at once (P27 c, f). A wait with no such state passes `first` twice.
+pub fn wait_until<A: ScmActor>(
+    a: &mut A,
+    first: WantState,
+    rearm: WantState,
+    target: QueriedState,
+    deadline: Deadline,
+    mut other: impl FnMut(Sighting) -> io::Result<ControlFlow<Waited>>,
+) -> io::Result<Waited> {
+    const NO_RECORD: RecordedExit = RecordedExit { win32: 0, specific: 0 };
+    let mut armed = a.arm(first, deadline)?;
+    let mut pending_delivered = false;
+    loop {
+        let status = match decided_or_status(armed, target)? {
+            Ok(status) => status,
+            Err(waited) => return Ok(waited),
+        };
+        if status.state == target {
+            return Ok(Waited::Confirmed);
+        }
+        let sighting = Sighting {
+            state: status.state,
+            exit: status.exit,
+            wait_hint: status.wait_hint,
+            pending_delivered,
+        };
+        if let ControlFlow::Break(waited) = other(sighting)? {
+            return Ok(waited);
+        }
+        let (state, exit, wait_hint) = match a.wait_callback(deadline)? {
+            None => return Ok(Waited::Expired),
+            Some(Observed::Pending) => (None, NO_RECORD, 0),
+            Some(Observed::Running) => (Some(QueriedState::Running), NO_RECORD, 0),
+            Some(Observed::Paused) => (Some(QueriedState::Paused), NO_RECORD, 0),
+            Some(Observed::Stopped) => (Some(QueriedState::Stopped), a.stopped_exit(), a.stopped_wait_hint()),
+        };
+        if let Some(state) = state {
+            if state == target {
+                return Ok(Waited::Confirmed);
+            }
+            let sighting = Sighting {
+                state,
+                exit,
+                wait_hint,
+                pending_delivered,
+            };
+            if let ControlFlow::Break(waited) = other(sighting)? {
+                return Ok(waited);
+            }
+        }
+        pending_delivered = true;
+        armed = a.arm(rearm, deadline)?;
     }
-    await_stopped(a, deadline, advice)
 }
 
 /// What a wait makes of an [`ScmActor::arm`] before it looks at any status: the registered arm's
@@ -556,31 +612,21 @@ pub(crate) fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind:
     }
     accept_as_started(reply)?;
     let joined_a_start = matches!(reply, StartReply::AlreadyRunning(_));
-    let mut armed = a.arm(WantState::Running, deadline)?;
-    loop {
-        let status = match decided_or_status(armed, QueriedState::Running)? {
-            Ok(status) => status,
-            Err(waited) => return Ok(waited),
-        };
-        match status.state {
-            QueriedState::Running => return Ok(Waited::Confirmed),
+    wait_until(
+        a,
+        WantState::Running,
+        WantState::Running,
+        QueriedState::Running,
+        deadline,
+        |sighting| match sighting.state {
             QueriedState::Stopped => {
-                return stopped_before_running(kind, joined_a_start, status.exit, status.wait_hint);
+                stopped_before_running(kind, joined_a_start, sighting.exit, sighting.wait_hint).map(ControlFlow::Break)
             }
-            _ => {}
-        }
-        match a.wait_callback(deadline)? {
-            None => return Ok(Waited::Expired),
-            Some(Observed::Running) => return Ok(Waited::Confirmed),
-            Some(Observed::Stopped) => {
-                return stopped_before_running(kind, joined_a_start, a.stopped_exit(), a.stopped_wait_hint());
-            }
-            // `Paused` cannot arrive under the start mask; it is treated as pending. The re-arm is
-            // not delivered for a state already current, so its status decides: the service may be
-            // `RUNNING`, or have stopped, since the notification.
-            Some(Observed::Paused | Observed::Pending) => armed = a.arm(WantState::Running, deadline)?,
-        }
-    }
+            // Any other state waits: `Paused` cannot arrive under the start mask, and a pending one
+            // is what the wait is for.
+            _ => Ok(ControlFlow::Continue(())),
+        },
+    )
 }
 
 /// What a terminal `Stopped` before `Running` means, from the `exit` record and `wait_hint` it carried:
