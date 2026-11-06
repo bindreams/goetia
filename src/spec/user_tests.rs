@@ -1,8 +1,10 @@
-use super::{AccountId, RawUser, User};
+use serde::Deserialize;
+
+use super::{AccountId, RawUser, User, UserWire};
 use crate::spec::resolve::resolve_user;
 
 fn parse(yaml: &str) -> Result<RawUser, yaml_serde::Error> {
-    yaml_serde::from_str(yaml)
+    UserWire::deserialize(yaml_serde::Deserializer::from_str(yaml)).map(|UserWire(user)| user)
 }
 
 /// Parse and resolve, the way `spec::load` does.

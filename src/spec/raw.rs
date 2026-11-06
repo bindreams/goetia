@@ -19,7 +19,7 @@ use serde::{Deserialize, Deserializer};
 
 use super::no_null::reject_nulls;
 use super::overrides::BackendOverrides;
-use super::user::RawUser;
+use super::user::{RawUser, deserialize_user};
 
 /// The whole `goetia.yaml` document: one daemon, exactly as written in
 /// YAML. No defaults are materialized and no cross-field or injection-gate
@@ -50,11 +50,18 @@ pub(super) struct RawSpec {
     pub backend_specific: BackendOverrides,
 }
 
-/// `RawSpec`'s serde shape, private so that `parse` is the only reader of
-/// YAML into a `RawSpec`. A field added here must be added to `RawSpec`: the
-/// `From` impl destructures it.
+/// `RawSpec`'s serde shape, a remote derive so that `RawSpec` itself has no
+/// `Deserialize` and `parse` is the only reader of YAML into one. Serde
+/// checks the fields against `RawSpec`'s at compile time.
+///
+/// `expecting` words the error for a document that is not a mapping, which
+/// would otherwise name this private type.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(
+    remote = "RawSpec",
+    deny_unknown_fields,
+    expecting = "a goetia.yaml mapping (id, command, ...)"
+)]
 struct Wire {
     id: String,
     #[serde(default)]
@@ -65,7 +72,7 @@ struct Wire {
     cwd: Option<String>,
     #[serde(default, deserialize_with = "no_duplicate_env")]
     env: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_user")]
     user: Option<RawUser>,
     #[serde(default)]
     restart: Option<String>,
@@ -83,46 +90,15 @@ struct Wire {
     backend_specific: BackendOverrides,
 }
 
-impl From<Wire> for RawSpec {
-    fn from(wire: Wire) -> Self {
-        let Wire {
-            id,
-            name,
-            command,
-            cwd,
-            env,
-            user,
-            restart,
-            restart_delay,
-            logs,
-            kind,
-            backend_specific,
-        } = wire;
-        RawSpec {
-            id,
-            name,
-            command,
-            cwd,
-            env,
-            user,
-            restart,
-            restart_delay,
-            logs,
-            kind,
-            backend_specific,
-        }
-    }
-}
-
 impl RawSpec {
     /// A manifest's parse entry point, and the only one. The typed parse
     /// runs first and owns every structural diagnostic (unknown field,
     /// duplicate key, wrong type); `reject_nulls` then walks the same text
     /// for explicit `null`s. See `no_null` for the split.
     pub fn parse(yaml: &str) -> Result<Self, yaml_serde::Error> {
-        let wire: Wire = yaml_serde::from_str(yaml)?;
+        let spec = Wire::deserialize(yaml_serde::Deserializer::from_str(yaml))?;
         reject_nulls(yaml)?;
-        Ok(wire.into())
+        Ok(spec)
     }
 }
 
