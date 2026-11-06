@@ -20,10 +20,11 @@ mod user;
 mod vars;
 
 pub use backend::BackendKind;
-pub use overrides::{BackendOverrides, RawOverride, Supplied};
-pub use raw::RawSpec;
-pub use resolve::{load, resolve};
-pub use user::{AccountId, RawUser, User};
+// `RawSpec`, the unvalidated manifest, is crate-private: outside code reaches a spec only through
+// `load`, which validates.
+pub(crate) use raw::RawSpec;
+pub use resolve::load;
+pub use user::{AccountId, User};
 
 // Re-exported so `blob::decode` re-runs the same injection-gate checks `resolve` uses, against a
 // spec deserialized from an untrusted artifact.

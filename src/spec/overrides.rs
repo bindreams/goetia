@@ -34,14 +34,14 @@ use super::BackendKind;
 use super::raw::{EnvVisitor, RawSpec};
 use super::user::RawUser;
 
-pub type BackendOverrides = BTreeMap<BackendKind, RawOverride>;
+pub(crate) type BackendOverrides = BTreeMap<BackendKind, RawOverride>;
 
 /// One `backend-specific.<backend>` entry: every field optional, since an
 /// override only needs to name the fields it actually overrides. Merging
 /// an override into a base `RawSpec` is [`RawSpec::merged_for`]'s job.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RawOverride {
+pub(crate) struct RawOverride {
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -66,7 +66,7 @@ pub struct RawOverride {
 /// carry, so `BackendKind::error` does not reject a base value for a backend the author never
 /// wrote a line for. Only `user` is read today.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Supplied {
+pub(crate) struct Supplied {
     pub user: bool,
 }
 

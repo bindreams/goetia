@@ -1,8 +1,9 @@
 use super::{check_spec_grammar, reject_interpolated_id, scalar, spec, spec_would_change, would_substitution_change};
 use crate::error::Error;
 use crate::spec::resolve::resolve_user;
+use crate::spec::user::RawUser;
 use crate::spec::vars::Vars;
-use crate::spec::{AccountId, RawSpec, RawUser, User};
+use crate::spec::{AccountId, RawSpec, User};
 
 /// Substitute `input` against `vars` at a fixed test path.
 fn sub(input: &str, vars: &Vars) -> Result<String, Error> {

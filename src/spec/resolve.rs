@@ -76,7 +76,7 @@ const MANIFEST_FILE_NAME: &str = "goetia.yaml";
 /// `base_dir` and written back absolute. A valid manifest may still produce
 /// `Warning`s for properties that are accepted but cannot be faithfully
 /// honored by the native backend.
-pub fn resolve(raw: RawSpec, base_dir: &Path) -> Result<(DaemonSpec, Vec<Warning>), Error> {
+pub(crate) fn resolve(raw: RawSpec, base_dir: &Path) -> Result<(DaemonSpec, Vec<Warning>), Error> {
     resolve_as(raw, base_dir, BackendKind::native())
 }
 

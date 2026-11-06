@@ -29,13 +29,12 @@ use super::user::RawUser;
 /// The null rule is enforced by a second walk that `parse` runs over the
 /// same text, because it needs that text to report a position. So
 /// `yaml_serde::from_str::<RawSpec>` compiles, and silently accepts every
-/// explicit `null` this module exists to refuse. The type is exported, so a
-/// library consumer can reach that unguarded path; [`load`](super::load) is
-/// always safe. Narrowing it means deciding whether [`resolve`](super::resolve)
-/// belongs in the public API beside `load`.
+/// explicit `null` this module exists to refuse. The type is crate-private so
+/// that library consumers cannot reach that unguarded path; they go through
+/// [`load`](super::load).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RawSpec {
+pub(crate) struct RawSpec {
     /// The installed service's name. Required, never overridable, and
     /// checked against the id pattern by `resolve`, not here.
     pub id: String,
