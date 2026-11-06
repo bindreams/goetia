@@ -23,8 +23,28 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # Every job builds with `Cargo.toml`'s `rust-version`, so the declared floor
+  # is the one that is checked. The version is read here once, with `tomllib`,
+  # not with `cargo metadata` from the runner image's preinstalled Rust: that
+  # toolchain is whichever release the image carries, and the toolchain install
+  # below needs the version as an input before it exists.
+  rust-version:
+    name: Rust version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.rust.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Read the Rust version
+        id: rust
+        run: python3 -I -c 'import tomllib; print("version=" + tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"])' >> "$GITHUB_OUTPUT"
+
   test:
     name: Test (${{ matrix.os }})
+    needs: rust-version
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -59,18 +79,10 @@ jobs:
         shell: bash
         run: python3 .github/scripts/run-with-timeout-windows-tests.py
 
-      # Every job builds with `Cargo.toml`'s `rust-version`, so the declared
-      # floor is the one that is checked. `tomllib` needs no Rust toolchain,
-      # which does not exist yet.
-      - name: Read the Rust version
-        id: rust
-        shell: bash
-        run: python3 -I -c 'import tomllib; print("version=" + tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"])' >> "$GITHUB_OUTPUT"
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: ${{ steps.rust.outputs.version }}
+          toolchain: ${{ needs.rust-version.outputs.version }}
           components: clippy
 
       - name: Cache cargo artifacts
@@ -166,21 +178,17 @@ jobs:
 
   lint:
     name: Lint
+    needs: rust-version
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - name: Read the Rust version
-        id: rust
-        shell: bash
-        run: python3 -I -c 'import tomllib; print("version=" + tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"])' >> "$GITHUB_OUTPUT"
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: ${{ steps.rust.outputs.version }}
+          toolchain: ${{ needs.rust-version.outputs.version }}
           components: rustfmt
 
       - name: Cache cargo artifacts
@@ -216,6 +224,7 @@ jobs:
   # internally and the three backends have disjoint dependency sets.
   package:
     name: Package (${{ matrix.os }})
+    needs: rust-version
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     permissions:
@@ -229,15 +238,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - name: Read the Rust version
-        id: rust
-        shell: bash
-        run: python3 -I -c 'import tomllib; print("version=" + tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"])' >> "$GITHUB_OUTPUT"
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: ${{ steps.rust.outputs.version }}
+          toolchain: ${{ needs.rust-version.outputs.version }}
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
