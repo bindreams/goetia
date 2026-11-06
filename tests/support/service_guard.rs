@@ -11,9 +11,9 @@
 //! reports nothing surfaces later only as a mysterious straggler in
 //! `systemctl` / `launchctl` / `services.msc`, long after the run that left it.
 
-use std::time::{Duration, Instant};
-
 use super::{LAUNCHD_DAEMON_DIR, SYSTEMD_UNIT_DIR, cmd};
+
+pub use super::cleanup::{CLEANUP_BOUND, remove_path, remove_path_retrying};
 
 pub struct ServiceGuard {
     id: String,
@@ -33,36 +33,6 @@ impl Drop for ServiceGuard {
     fn drop(&mut self) {
         for problem in cleanup(&self.id) {
             eprintln!("ServiceGuard[{}]: cleanup failed: {problem}", self.id);
-        }
-    }
-}
-
-/// Removes a file, or a directory tree when `dir`; "not found" is success, any other failure is
-/// returned as a message for the caller to log.
-pub fn remove_path(path: &std::path::Path, dir: bool) -> Option<String> {
-    let result = if dir {
-        std::fs::remove_dir_all(path)
-    } else {
-        std::fs::remove_file(path)
-    };
-    match result {
-        Ok(()) => None,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => Some(format!("remove {}: {e}", path.display())),
-    }
-}
-
-/// How long a cleanup waits on a transient condition of unknown duration (an antivirus holding a
-/// file, a process still exiting) before it lets go with a warning.
-pub const CLEANUP_BOUND: Duration = Duration::from_secs(5);
-
-/// [`remove_path`], retried until it succeeds or [`CLEANUP_BOUND`] passes; then the last problem.
-pub fn remove_path_retrying(path: &std::path::Path, dir: bool) -> Option<String> {
-    let start = Instant::now();
-    loop {
-        match remove_path(path, dir) {
-            Some(_) if start.elapsed() < CLEANUP_BOUND => std::thread::sleep(Duration::from_millis(100)),
-            problem => return problem,
         }
     }
 }
