@@ -1099,13 +1099,10 @@ fn a_stop_with_no_budget_runs_bootout_to_completion() {
 /// the budget, not by launchd's respawn throttle. Saying so is the contract
 /// (`ServiceManager::start`: `Ok(())` means the manager reports it running), not a defect.
 ///
-/// The history is observed, not assumed. `launchctl bootstrap` returns when the job is loaded, not
-/// when launchd has forked its `RunAtLoad` run, so a `start` straight after it can beat that run:
-/// the kick is then the job's first fork, nothing is throttled, and `start` may report `Ok`,
-/// `WaitTimeout`, `StartUnconfirmed` or `NotStarted`, all correct; that first start has no pinned
-/// outcome. The test therefore loads the job itself and waits for the job to report its first run,
-/// and then for launchd to show that run gone, before calling `start`, so the kick meets a job
-/// with history and no live run for `start` to read.
+/// `launchctl bootstrap` returns at load, before launchd forks the `RunAtLoad` run, so a `start`
+/// straight after it can be the job's first fork: nothing is throttled and any of `Ok`,
+/// `WaitTimeout`, `StartUnconfirmed`, `NotStarted` is correct. The test therefore waits for the first
+/// run and for its exit before calling `start`.
 ///
 /// Two measured facts, neither of them assumed:
 ///
@@ -1118,13 +1115,12 @@ fn a_stop_with_no_budget_runs_bootout_to_completion() {
 ///    notification mechanism, and re-reading state on a timer is polling, which this project
 ///    forbids — and skipping it would fail a healthy job launchd is merely about to start.
 ///
-/// The budget is **5s, not `DEFAULT`**, and that is deliberate: the ~10.02s throttle, launchd's own
-/// timer, runs from the first run's fork, and against a 5s budget it leaves about 5s for the fork,
-/// the `accept`, the `print` wait and `start`'s reads before the kick. A run slower than that ends
-/// in `StartUnconfirmed` or `NotStarted`, which is not a product defect. Against `DEFAULT` (10s)
-/// the margin would be ~20ms, a bet this project forbids; that closeness is the documented
-/// consequence for `DEFAULT` (see this backend's module doc comment). No elapsed-time assertion
-/// is made: the error variant carries the outcome.
+/// The budget is `Budget::DEFAULT`, the path users take. The test's `restart_delay` of an hour,
+/// which goetia writes as the plist's `ThrottleInterval`, supplies the margin, not the product's
+/// default: whatever the setup costs, the kick cannot be confirmed inside the budget. If that
+/// premise did not hold, `start` could return `Ok`, `WaitTimeout`, `StartUnconfirmed` or
+/// `NotStarted`. Whether `kickstart -p` honours `ThrottleInterval` is pending: the first macOS CI
+/// run measures it. No elapsed-time assertion is made: the error variant carries the outcome.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout() {
     let mgr = Launchd::new();
@@ -1141,23 +1137,22 @@ fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout() {
         ],
     );
     spec.restart = Restart::Always;
+    spec.restart_delay = Some(Duration::from_secs(3600));
     // Registered before the job is loaded: its `uninstall` boots the job out.
     let _guard = Guard::install(&mgr, &spec);
 
-    // Load the job without `start`: `RunAtLoad` runs it. Once it has connected, launchd has forked
-    // the run, so the respawn history exists and the `kickstart -p` inside `start` meets the
-    // throttle on this very first `start`. The process is still exiting when `accept` returns,
-    // though, and `start` reads `Running` from one that has a pid. So wait until a whole
-    // `launchctl print` shows the run's exit recorded and no process. Not `status`: it reads a
-    // failed `print` as `Unknown` with no pid, which would end the wait before the run is gone.
+    // Load the job without `start`: `RunAtLoad` runs it.
     cmd::run(
         "launchctl",
         &["bootstrap", "system", staging_path(&id).to_str().unwrap()],
     )
     .expect_ok();
     listener.accept("the crash-looping job's first run");
+    // `accept` returns while the run is still exiting, and `start` reads `Running` from a process
+    // with a pid, so wait for a whole `launchctl print` showing the exit and no pid. Not `status`: it
+    // reads a failed `print` as `Unknown` with no pid, which would end the wait early.
     support::kill::until(|| {
-        let printed = cmd::run("launchctl", &["print", &format!("system/{id}")]);
+        let printed = cmd::run("launchctl", &["print", &format!("system/{id}")]).expect_ok();
         let field = |key: &str| {
             printed
                 .stdout
@@ -1165,13 +1160,12 @@ fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout() {
                 .find_map(|line| line.trim_start().strip_prefix(key))
         };
         // A job that has not exited yet reads `last exit code = (never exited)`.
-        printed.ok()
-            && field("last exit code = ").is_some_and(|code| !code.contains("never exited"))
+        field("last exit code = ").is_some_and(|code| !code.contains("never exited"))
             && field("pid = ").is_none()
     });
 
     let err = mgr
-        .start(&spec.id, Budget::Bounded(Duration::from_secs(5)))
+        .start(&spec.id, Budget::DEFAULT)
         .expect_err("launchd cannot confirm a crash-looping job running, so a bounded start times out");
 
     assert!(
