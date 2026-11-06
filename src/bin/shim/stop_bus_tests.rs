@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use super::test_hook::{KILL_REFUSED, WAIT_FAILED, Wait, WaiterEnd, waiter_end};
 use super::*;
-use crate::logging::test_hook::take;
+use crate::os::fake::FakeGuard;
 use crate::test_support::{TestId, assert_failures, assert_one_failure};
 
 const PREFIX: &str = "goetia-shim-stop-bus-test";
@@ -24,7 +24,8 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
         "Start-Sleep -Seconds 300",
     ]);
     cmd.contain();
-    let bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let bus = Arc::new(StopBus::new(fake.log()));
     // Made before the spawn, as `service::launch` makes it — see `Waiter`.
     let waiter = bus.waiter(id.as_str()).expect("make the waiter thread");
     let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
@@ -60,7 +61,7 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
         .expect("the thread running wait_for_child_or_stop ended without a result");
     assert!(matches!(outcome, WaitOutcome::Stopping));
     assert_eq!(
-        take(id.as_str()),
+        fake.take_failures(),
         Vec::<String>::new(),
         "a clean stop reported a failure"
     );
@@ -107,7 +108,8 @@ fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_k
         "Start-Sleep -Seconds 300",
     ]);
     cmd.contain();
-    let bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let bus = Arc::new(StopBus::new(fake.log()));
     let waiter = bus.waiter(id.as_str()).expect("make the waiter thread");
     let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
 
@@ -156,7 +158,7 @@ fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_k
         "the detached waiter thread panicked"
     );
 
-    let lines = take(id.as_str());
+    let lines = fake.take_failures();
     assert_eq!(lines.len(), 2, "both refused kills must be journalled: {lines:?}");
     // kill_tree's first.
     assert_one_failure(
@@ -201,7 +203,8 @@ fn a_panic_on_the_stop_path_leaves_the_waiter_detached_and_the_daemon_untorn_dow
         "Start-Sleep -Seconds 300",
     ]);
     cmd.contain();
-    let bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let bus = Arc::new(StopBus::new(fake.log()));
     let waiter = bus.waiter(id.as_str()).expect("make the waiter thread");
     let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
 
@@ -260,7 +263,7 @@ fn a_panic_on_the_stop_path_leaves_the_waiter_detached_and_the_daemon_untorn_dow
         "the detached waiter thread panicked"
     );
     assert_eq!(
-        take(id.as_str()),
+        fake.take_failures(),
         Vec::<String>::new(),
         "the stop path logged around the injected panic"
     );
@@ -272,7 +275,8 @@ fn wait_for_child_or_stop_returns_child_exited_when_the_child_exits_on_its_own()
     let id = TestId::new(PREFIX);
     let mut cmd = cosca::run(["powershell", "-NoProfile", "-NonInteractive", "-Command", "exit 0"]);
     cmd.contain();
-    let bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let bus = Arc::new(StopBus::new(fake.log()));
     let waiter = bus.waiter(id.as_str()).expect("make the waiter thread");
     let child = Arc::new(cmd.spawn().expect("spawn a short-lived child"));
 
@@ -282,7 +286,7 @@ fn wait_for_child_or_stop_returns_child_exited_when_the_child_exits_on_its_own()
     let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str(), || {});
     assert!(matches!(outcome, WaitOutcome::ChildExited));
     assert_eq!(
-        take(id.as_str()),
+        fake.take_failures(),
         Vec::<String>::new(),
         "a child that exited on its own reported a failure"
     );
@@ -297,7 +301,8 @@ fn wait_for_child_or_stop_returns_child_exited_when_the_child_exits_on_its_own()
 #[skuld::test]
 fn a_waiter_that_is_never_handed_a_child_ends_on_its_own() {
     let id = TestId::new(PREFIX);
-    let bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let bus = Arc::new(StopBus::new(fake.log()));
     let waiter = bus.waiter(id.as_str()).expect("make the waiter thread");
 
     // Closing the only `Sender` is the whole mechanism: the thread's first act is `rx.recv()`,
@@ -324,7 +329,8 @@ fn a_failed_background_wait_kills_the_daemon_and_is_reported_as_a_wait_failure()
         "Start-Sleep -Seconds 300",
     ]);
     cmd.contain();
-    let bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let bus = Arc::new(StopBus::new(fake.log()));
     // Armed on this thread, which makes the waiter: the hook is read when it is made.
     let waiter = {
         let _failing = test_hook::waits(Wait::Fail(None));
@@ -344,7 +350,7 @@ fn a_failed_background_wait_kills_the_daemon_and_is_reported_as_a_wait_failure()
         .wait()
         .expect("the daemon ends once its failed wait has killed it");
     assert_one_failure(
-        &take(id.as_str()),
+        &fake.take_failures(),
         id.as_str(),
         &format!("background wait on child: {WAIT_FAILED}"),
     );
@@ -364,7 +370,8 @@ fn a_failed_background_wait_over_an_unkillable_daemon_is_the_unkillable_outcome(
         "Start-Sleep -Seconds 300",
     ]);
     cmd.contain();
-    let bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let bus = Arc::new(StopBus::new(fake.log()));
     let waiter = {
         let _failing = test_hook::waits(Wait::Fail(None));
         bus.waiter(id.as_str()).expect("make the waiter thread")
@@ -379,7 +386,7 @@ fn a_failed_background_wait_over_an_unkillable_daemon_is_the_unkillable_outcome(
     assert!(matches!(outcome, WaitOutcome::DaemonMayRun));
     child.kill_tree().expect("kill the daemon the call left running");
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
-    assert_failures(&take(id.as_str()), id.as_str(), &unkillable_failures());
+    assert_failures(&fake.take_failures(), id.as_str(), &unkillable_failures());
 }
 
 /// A waiter that panics is reported by the join, and a stop over it is still a stop.
@@ -394,7 +401,8 @@ fn a_panicked_waiter_is_logged_when_the_stop_path_joins_it() {
         "Start-Sleep -Seconds 300",
     ]);
     cmd.contain();
-    let bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let bus = Arc::new(StopBus::new(fake.log()));
     let waiter = {
         let _panicking = test_hook::waits(Wait::Panic);
         bus.waiter(id.as_str()).expect("make the waiter thread")
@@ -409,7 +417,7 @@ fn a_panicked_waiter_is_logged_when_the_stop_path_joins_it() {
         "the stop's kill is real and reaches the child"
     );
     assert_one_failure(
-        &take(id.as_str()),
+        &fake.take_failures(),
         id.as_str(),
         "the thread waiting on the child panicked",
     );
@@ -429,7 +437,8 @@ fn a_stop_whose_kill_tree_fails_kills_the_child_and_reports_the_daemon_possibly_
         "Start-Sleep -Seconds 300",
     ]);
     cmd.contain();
-    let bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let bus = Arc::new(StopBus::new(fake.log()));
     let waiter = bus.waiter(id.as_str()).expect("make the waiter thread");
     let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
     bus.request_stop();
@@ -450,7 +459,7 @@ fn a_stop_whose_kill_tree_fails_kills_the_child_and_reports_the_daemon_possibly_
         "the fallback kill did not end the child"
     );
     assert_failures(
-        &take(id.as_str()),
+        &fake.take_failures(),
         id.as_str(),
         &[tree_refused_failure(), TREE_UNKILLED.to_string()],
     );
@@ -464,7 +473,8 @@ fn a_stop_whose_kill_tree_fails_kills_the_child_and_reports_the_daemon_possibly_
 fn a_panicked_waiter_is_a_wait_failure_with_no_stop_requested() {
     let id = TestId::new(PREFIX);
     let mut cmd = sleeper();
-    let bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let bus = Arc::new(StopBus::new(fake.log()));
     let waiter = {
         let _panicking = test_hook::waits(Wait::Panic);
         bus.waiter(id.as_str()).expect("make the waiter thread")
@@ -479,7 +489,7 @@ fn a_panicked_waiter_is_a_wait_failure_with_no_stop_requested() {
     );
     assert_dead(&child);
     assert_one_failure(
-        &take(id.as_str()),
+        &fake.take_failures(),
         id.as_str(),
         "the thread waiting on the child panicked",
     );
@@ -491,7 +501,8 @@ fn a_panicked_waiter_is_a_wait_failure_with_no_stop_requested() {
 fn a_failed_background_wait_carries_its_os_error() {
     let id = TestId::new(PREFIX);
     let mut cmd = sleeper();
-    let bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let bus = Arc::new(StopBus::new(fake.log()));
     let waiter = {
         let _failing = test_hook::waits(Wait::Fail(Some(5)));
         bus.waiter(id.as_str()).expect("make the waiter thread")
@@ -507,7 +518,7 @@ fn a_failed_background_wait_carries_its_os_error() {
     assert_dead(&child);
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
     assert_one_failure(
-        &take(id.as_str()),
+        &fake.take_failures(),
         id.as_str(),
         &format!("background wait on child: {}", io::Error::from_raw_os_error(5)),
     );
@@ -518,7 +529,8 @@ fn a_failed_background_wait_carries_its_os_error() {
 fn a_stop_wins_over_a_failed_background_wait() {
     let id = TestId::new(PREFIX);
     let mut cmd = sleeper();
-    let bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let bus = Arc::new(StopBus::new(fake.log()));
     let waiter = {
         let _failing = test_hook::waits(Wait::Fail(None));
         bus.waiter(id.as_str()).expect("make the waiter thread")
@@ -532,7 +544,7 @@ fn a_stop_wins_over_a_failed_background_wait() {
     assert_dead(&child);
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
     assert_one_failure(
-        &take(id.as_str()),
+        &fake.take_failures(),
         id.as_str(),
         &format!("background wait on child: {WAIT_FAILED}"),
     );
@@ -544,7 +556,8 @@ fn a_stop_wins_over_a_failed_background_wait() {
 fn a_failed_background_wait_whose_tree_kill_failed_is_not_a_restartable_failure() {
     let id = TestId::new(PREFIX);
     let mut cmd = sleeper();
-    let bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let bus = Arc::new(StopBus::new(fake.log()));
     let waiter = {
         let _failing = test_hook::waits(Wait::Fail(None));
         bus.waiter(id.as_str()).expect("make the waiter thread")
@@ -559,7 +572,7 @@ fn a_failed_background_wait_whose_tree_kill_failed_is_not_a_restartable_failure(
     assert!(matches!(outcome, WaitOutcome::DaemonMayRun));
     assert_dead(&child);
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
-    assert_failures(&take(id.as_str()), id.as_str(), &tree_unkilled_failures());
+    assert_failures(&fake.take_failures(), id.as_str(), &tree_unkilled_failures());
 }
 
 /// A failed wait that ends in `DaemonMayRun` is a decided failure: a stop arriving afterwards must be
@@ -568,7 +581,8 @@ fn a_failed_background_wait_whose_tree_kill_failed_is_not_a_restartable_failure(
 fn a_failed_wait_over_an_unkillable_daemon_refuses_a_later_stop() {
     let id = TestId::new(PREFIX);
     let mut cmd = sleeper();
-    let bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let bus = Arc::new(StopBus::new(fake.log()));
     let waiter = {
         let _failing = test_hook::waits(Wait::Fail(None));
         bus.waiter(id.as_str()).expect("make the waiter thread")
@@ -587,7 +601,7 @@ fn a_failed_wait_over_an_unkillable_daemon_refuses_a_later_stop() {
     );
     child.kill_tree().expect("kill the daemon the call left running");
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
-    assert_failures(&take(id.as_str()), id.as_str(), &unkillable_failures());
+    assert_failures(&fake.take_failures(), id.as_str(), &unkillable_failures());
 }
 
 /// The same when only the tree kill is refused and the direct child's kill works.
@@ -595,7 +609,8 @@ fn a_failed_wait_over_an_unkillable_daemon_refuses_a_later_stop() {
 fn a_failed_wait_whose_tree_kill_was_refused_refuses_a_later_stop() {
     let id = TestId::new(PREFIX);
     let mut cmd = sleeper();
-    let bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let bus = Arc::new(StopBus::new(fake.log()));
     let waiter = {
         let _failing = test_hook::waits(Wait::Fail(None));
         bus.waiter(id.as_str()).expect("make the waiter thread")
@@ -614,14 +629,15 @@ fn a_failed_wait_whose_tree_kill_was_refused_refuses_a_later_stop() {
     );
     assert_dead(&child);
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
-    assert_failures(&take(id.as_str()), id.as_str(), &tree_unkilled_failures());
+    assert_failures(&fake.take_failures(), id.as_str(), &tree_unkilled_failures());
 }
 
 // Fate ----------------------------------------------------------------------------------------------------------------
 
 #[skuld::test]
 fn a_stop_after_a_failure_was_decided_is_refused() {
-    let bus = StopBus::new();
+    let fake = FakeGuard::new();
+    let bus = StopBus::new(fake.log());
 
     assert_eq!(bus.settle(Reported::DaemonExit(7)), Reported::DaemonExit(7));
 
@@ -633,7 +649,8 @@ fn a_stop_after_a_failure_was_decided_is_refused() {
 
 #[skuld::test]
 fn a_stop_before_a_failure_was_decided_turns_the_failure_into_a_clean_stop() {
-    let bus = StopBus::new();
+    let fake = FakeGuard::new();
+    let bus = StopBus::new(fake.log());
 
     assert!(bus.request_stop());
 
@@ -643,7 +660,8 @@ fn a_stop_before_a_failure_was_decided_turns_the_failure_into_a_clean_stop() {
 
 #[skuld::test]
 fn a_clean_exit_does_not_refuse_a_later_stop() {
-    let bus = StopBus::new();
+    let fake = FakeGuard::new();
+    let bus = StopBus::new(fake.log());
 
     assert_eq!(bus.settle(Reported::Clean), Reported::Clean);
 
@@ -652,7 +670,8 @@ fn a_clean_exit_does_not_refuse_a_later_stop() {
 
 #[skuld::test]
 fn a_repeated_stop_is_accepted_again() {
-    let bus = StopBus::new();
+    let fake = FakeGuard::new();
+    let bus = StopBus::new(fake.log());
 
     assert!(bus.request_stop());
     assert!(bus.request_stop());

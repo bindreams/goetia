@@ -22,7 +22,8 @@ use windows_sys::Win32::System::Services::{
     SERVICE_WIN32_OWN_PROCESS, SetServiceStatus,
 };
 
-use crate::logging;
+use crate::logging::Log;
+use crate::os::open_append;
 use crate::stop_bus::{StopBus, Teardown, WaitOutcome, Waiter, kill_for_stop, terminate_exited_tree};
 
 // Entry ===============================================================================================================
@@ -38,7 +39,7 @@ pub fn run() -> ! {
         std::process::exit(ERROR_BAD_ARGUMENTS as i32);
     };
     if let Err(e) = service_dispatcher::start(id, ffi_service_main) {
-        logging::log_failure(id, &format!("connect to the SCM dispatcher: {e}"));
+        Log::real().failure(id, &format!("connect to the SCM dispatcher: {e}"));
         std::process::exit(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT as i32);
     }
     // `service_main` exits on every path; this covers the dispatcher returning anyway.
@@ -56,11 +57,12 @@ fn service_main(_scm_args: Vec<OsString>) {
 }
 
 fn run_service(id: &str) {
-    let stop_bus = Arc::new(StopBus::new());
+    let log = Arc::new(Log::real());
+    let stop_bus = Arc::new(StopBus::new(Arc::clone(&log)));
     let status_handle = match register_control_handler(id, &stop_bus) {
         Ok(h) => h,
         Err(e) => {
-            logging::log_failure(id, &format!("register SCM control handler: {e}"));
+            log.failure(id, &format!("register SCM control handler: {e}"));
             std::process::exit(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT as i32);
         }
     };
@@ -68,20 +70,22 @@ fn run_service(id: &str) {
     let blob = match read_spec_blob(id) {
         Ok(Some(b)) => b,
         Ok(None) => {
-            logging::log_failure(
+            log.failure(
                 id,
                 "no Goetia metadata found under Services\\<id>\\Parameters (Marker absent) — this service was \
                  not created by `goetia daemon install`",
             );
             finish(
+                &log,
                 id,
                 status_handle,
                 Reported::shim_failure(Some(ERROR_INVALID_DATA as i32)),
             );
         }
         Err(e) => {
-            logging::log_failure(id, &format!("decode metadata blob: {}", e.report()));
+            log.failure(id, &format!("decode metadata blob: {}", e.report()));
             finish(
+                &log,
                 id,
                 status_handle,
                 Reported::shim_failure(Some(ERROR_INVALID_DATA as i32)),
@@ -89,22 +93,22 @@ fn run_service(id: &str) {
         }
     };
 
-    logging::set_daemon_log(logging::daemon_log_path(id, blob.spec.logs.as_deref()));
-    log_version_skew(id, &blob.spec, &blob.version, goetia::version());
+    log.set_daemon_log(log.daemon_log_path(id, blob.spec.logs.as_deref()));
+    log_version_skew(&log, id, &blob.spec, &blob.version, goetia::version());
     let reported = run_daemon(
         &blob.spec,
         &stop_bus,
         id,
-        || report_running(id, status_handle),
-        || report_stopping(id, status_handle),
+        || report_running(&log, id, status_handle),
+        || report_stopping(&log, id, status_handle),
     );
-    finish(id, status_handle, reported);
+    finish(&log, id, status_handle, reported);
 }
 
 /// Tell SCM the service stopped, then end the process. SCM restarts the service or not from
 /// the status reported here, never from the process exit code.
-fn finish(id: &str, status_handle: StatusHandle, reported: Reported) -> ! {
-    report_stopped(id, status_handle, reported);
+fn finish(log: &Log, id: &str, status_handle: StatusHandle, reported: Reported) -> ! {
+    report_stopped(log, id, status_handle, reported);
     std::process::exit(reported.process_exit_code());
 }
 
@@ -195,7 +199,7 @@ fn handle_control(stop_bus: &StopBus, control: u32) -> u32 {
 }
 
 /// Report `RUNNING`. A failure is logged: SCM keeps the last state it confirmed.
-fn report_running(id: &str, handle: StatusHandle) {
+fn report_running(log: &Log, id: &str, handle: StatusHandle) {
     let status = SERVICE_STATUS {
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
         dwCurrentState: SERVICE_RUNNING,
@@ -208,27 +212,27 @@ fn report_running(id: &str, handle: StatusHandle) {
     // SAFETY: `handle` is live for the life of the process, and `status` outlives the call.
     if unsafe { SetServiceStatus(handle.0, &status) } == 0 {
         let e = std::io::Error::last_os_error();
-        logging::log_failure(id, &format!("report SERVICE_RUNNING to SCM: {e}"));
+        log.failure(id, &format!("report SERVICE_RUNNING to SCM: {e}"));
     }
 }
 
 /// Report `STOP_PENDING`. A failure is logged: the teardown goes on and `STOPPED` is still reported.
-fn report_stopping(id: &str, handle: StatusHandle) {
+fn report_stopping(log: &Log, id: &str, handle: StatusHandle) {
     let status = stopping_status();
     // SAFETY: `handle` is live for the life of the process, and `status` outlives the call.
     if unsafe { SetServiceStatus(handle.0, &status) } == 0 {
         let e = std::io::Error::last_os_error();
-        logging::log_failure(id, &format!("report SERVICE_STOP_PENDING to SCM: {e}"));
+        log.failure(id, &format!("report SERVICE_STOP_PENDING to SCM: {e}"));
     }
 }
 
-fn report_stopped(id: &str, handle: StatusHandle, reported: Reported) {
+fn report_stopped(log: &Log, id: &str, handle: StatusHandle, reported: Reported) {
     let status = stopped_status(reported);
     // SAFETY: `handle` is live for the life of the process, and `status` outlives the call.
     let ok = unsafe { SetServiceStatus(handle.0, &status) };
     if ok == 0 {
         let e = std::io::Error::last_os_error();
-        logging::log_failure(id, &stopped_report_failure(&e));
+        log.failure(id, &stopped_report_failure(&e));
     }
 }
 
@@ -262,6 +266,7 @@ fn run_daemon(
     on_running: impl FnOnce(),
     on_stopping: impl FnOnce(),
 ) -> Reported {
+    let log = stop_bus.log();
     let (child, waiter) = match launch(spec, stop_bus, id) {
         Ok(launched) => launched,
         Err(reported) => return reported,
@@ -276,16 +281,16 @@ fn run_daemon(
                 Ok(status) => {
                     let code = status.code();
                     if code.is_none() {
-                        logging::log_failure(id, NO_EXIT_CODE);
+                        log.failure(id, NO_EXIT_CODE);
                     }
                     code
                 }
                 Err(e) => {
-                    logging::log_failure(id, &exit_status_unavailable(&e));
+                    log.failure(id, &exit_status_unavailable(&e));
                     None
                 }
             };
-            end_tree_before_report(stop_bus.settle(exit_report(code)), &child, id)
+            end_tree_before_report(stop_bus.settle(exit_report(code)), &child, log, id)
         }
         // The failure is already logged; the daemon's tree was terminated, so it is the shim that
         // failed.
@@ -306,8 +311,8 @@ fn run_daemon(
 /// `TerminateJobObject` succeeded. Windows does not document that as synchronous with the members'
 /// teardown, so they may still be exiting when STOPPED is reported, and a restarted daemon can
 /// briefly overlap them or find a resource they held (a port) and fail like any other start.
-fn end_tree_before_report(settled: Reported, child: &Child, id: &str) -> Reported {
-    if terminate_exited_tree(child, id) {
+fn end_tree_before_report(settled: Reported, child: &Child, log: &Log, id: &str) -> Reported {
+    if terminate_exited_tree(child, log, id) {
         settled
     } else {
         Reported::incomplete_stop()
@@ -338,18 +343,19 @@ fn exit_status(child: &Child) -> Result<std::process::ExitStatus, cosca::error::
 /// The `Err` is what the service reports: the OS error of the failure, `ERROR_GEN_FAILURE`, or the
 /// incomplete stop for a daemon no Job Object contains.
 fn launch(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str) -> Result<(Arc<Child>, Waiter), Reported> {
+    let log = stop_bus.log();
     let waiter = match stop_bus.waiter(id) {
         Ok(waiter) => waiter,
         Err(e) => {
-            logging::log_failure(id, &thread_refused(&spec.command, &e));
+            log.failure(id, &thread_refused(&spec.command, &e));
             return Err(Reported::shim_failure(e.raw_os_error()));
         }
     };
-    let mut cmd = build_command(spec, id);
+    let mut cmd = build_command(spec, log, id);
     match start(&mut cmd) {
-        Ok(child) => require_job_object(child, spec, id).map(|child| (Arc::new(child), waiter)),
+        Ok(child) => require_job_object(child, spec, log, id).map(|child| (Arc::new(child), waiter)),
         Err(e) => {
-            logging::log_failure(id, &spawn_failed(&spec.command, &e));
+            log.failure(id, &spawn_failed(&spec.command, &e));
             Err(Reported::shim_failure(os_error_of(&e)))
         }
     }
@@ -361,15 +367,15 @@ fn launch(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str) -> Result<(Arc<C
 /// descendant was killed. Any other containment is a start failure: the daemon is killed, but
 /// that kill proves nothing about its descendants, so the record is the incomplete stop whatever
 /// the kill returned. SCM never restarts over it, and `start` reads it as a failed start.
-fn require_job_object(child: Child, spec: &DaemonSpec, id: &str) -> Result<Child, Reported> {
+fn require_job_object(child: Child, spec: &DaemonSpec, log: &Log, id: &str) -> Result<Child, Reported> {
     let containment = containment_of(&child);
     if containment == Containment::JobObject {
         return Ok(child);
     }
-    logging::log_failure(id, &not_job_contained(&spec.command, containment));
+    log.failure(id, &not_job_contained(&spec.command, containment));
     // Dropping the child kills it again and waits for it, with no bound when the kill is refused,
     // so a child that could not be killed is let go: the record must still be reported.
-    if kill_for_stop(&child, id) == Teardown::Failed {
+    if kill_for_stop(&child, log, id) == Teardown::Failed {
         child.detach();
     }
     Err(Reported::incomplete_stop())
@@ -417,9 +423,9 @@ fn spawn_failed(command: &[String], e: &cosca::error::Error) -> String {
 
 /// Log [`version_skew_notice`] as a warning: the daemon runs, and each start is a new shim that
 /// sees the same condition until `goetia daemon install` is run again.
-fn log_version_skew(id: &str, spec: &DaemonSpec, registered_by: &str, running: &str) {
+fn log_version_skew(log: &Log, id: &str, spec: &DaemonSpec, registered_by: &str, running: &str) {
     if let Some(notice) = version_skew_notice(id, spec, registered_by, running) {
-        logging::log_warning(id, &notice);
+        log.warning(id, &notice);
     }
 }
 
@@ -464,16 +470,16 @@ fn start(cmd: &mut cosca::Command) -> Result<Child, cosca::error::Error> {
 
 /// A stdio assignment `build_command` expects never to fail: asserted in debug builds, logged in
 /// release, where the daemon then runs with that stream unredirected.
-fn stdio_set<T, E: std::fmt::Display>(id: &str, assigned: Result<T, E>) {
+fn stdio_set<T, E: std::fmt::Display>(log: &Log, id: &str, assigned: Result<T, E>) {
     if let Err(e) = assigned {
         debug_assert!(false, "a stdio assignment build_command expects to succeed failed: {e}");
-        logging::log_failure(id, &format!("redirect the daemon's output: {e}"));
+        log.failure(id, &format!("redirect the daemon's output: {e}"));
     }
 }
 
 /// Build the (unspawned) command for `spec`: argv, cwd, env, Job Object
 /// containment, and stdout+stderr merged into the daemon's log file.
-fn build_command(spec: &DaemonSpec, id: &str) -> cosca::Command {
+fn build_command(spec: &DaemonSpec, log: &Log, id: &str) -> cosca::Command {
     let mut cmd = cosca::run(spec.command.iter().cloned());
     if let Some(cwd) = &spec.cwd {
         cmd.current_dir(cwd.clone());
@@ -481,8 +487,8 @@ fn build_command(spec: &DaemonSpec, id: &str) -> cosca::Command {
     cmd.envs(spec.env.clone());
     cmd.contain();
 
-    let log_path = logging::daemon_log_path(id, spec.logs.as_deref());
-    match logging::open_append(&log_path) {
+    let log_path = log.daemon_log_path(id, spec.logs.as_deref());
+    match open_append(&log_path) {
         Ok(file) => {
             // Merges are resolved in a second pass at spawn time (`cosca`'s
             // `resolve_stdio`), not by `Command::fd` consulting whatever is
@@ -493,14 +499,14 @@ fn build_command(spec: &DaemonSpec, id: &str) -> cosca::Command {
             // `Stdio::from_file`/`Stdio::merge(Fd::STDOUT)` pair on
             // stdout/stderr, so these are expected never to fail; `stdio_set`
             // asserts that in debug builds and logs it in release.
-            stdio_set(id, cmd.stdout(Stdio::from_file(file)));
-            stdio_set(id, cmd.stderr(Stdio::merge(Fd::STDOUT)));
+            stdio_set(log, id, cmd.stdout(Stdio::from_file(file)));
+            stdio_set(log, id, cmd.stderr(Stdio::merge(Fd::STDOUT)));
         }
         Err(e) => {
-            logging::log_failure(id, &log_open_failed(&log_path, &e));
+            log.failure(id, &log_open_failed(&log_path, &e));
             // Same reasoning as above, for `Stdio::null()`.
-            stdio_set(id, cmd.stdout(Stdio::null()));
-            stdio_set(id, cmd.stderr(Stdio::null()));
+            stdio_set(log, id, cmd.stdout(Stdio::null()));
+            stdio_set(log, id, cmd.stderr(Stdio::null()));
         }
     }
     cmd

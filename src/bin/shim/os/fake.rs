@@ -20,7 +20,7 @@ use std::thread::JoinHandle;
 use cosca::Containment;
 
 use super::{Channels, Os, Spawned};
-use crate::logging::Severity;
+use crate::logging::{Log, Severity};
 
 /// The error a refused thread fails with.
 pub(crate) const NO_THREAD: &str = "no thread may be made (fake)";
@@ -362,6 +362,16 @@ impl Drop for FakeGuard {
 impl Fake {
     pub(crate) fn os(&self) -> Arc<dyn Os> {
         Arc::new(self.clone())
+    }
+
+    pub(crate) fn channels(&self) -> Arc<dyn Channels> {
+        Arc::new(self.clone())
+    }
+
+    /// A `Log` over this `Fake`'s channels. Nothing is written to a file, so its default log
+    /// directory is a name only.
+    pub(crate) fn log(&self) -> Arc<Log> {
+        Arc::new(Log::new(self.channels(), PathBuf::from("default-logs")))
     }
 
     // Tables -----------------------------------------------------------------------------------------------------

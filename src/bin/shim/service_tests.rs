@@ -18,7 +18,7 @@ use windows_sys::Win32::System::Services::{
 };
 
 use super::*;
-use crate::logging::test_hook::{take, take_warnings};
+use crate::os::fake::FakeGuard;
 use crate::stop_bus::test_hook as waiter_threads;
 use crate::stop_bus::test_hook::{KILL_REFUSED, Kill, WAIT_FAILED, Wait, WaiterEnd, kills, waiter_end, waits};
 use crate::test_support::{TestId, assert_failures, assert_one_failure};
@@ -63,7 +63,8 @@ fn spec(dir: &Path, id: &str) -> DaemonSpec {
 fn no_daemon_is_spawned_when_no_thread_can_be_made_to_wait_on_it() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
     let spawned_before = test_hook::spawns();
     let _no_thread = waiter_threads::threads(0);
 
@@ -79,7 +80,7 @@ fn no_daemon_is_spawned_when_no_thread_can_be_made_to_wait_on_it() {
     );
     // The failure `launch` reports, journalled rather than written.
     assert_one_failure(
-        &take(id.as_str()),
+        &fake.take_failures(),
         id.as_str(),
         &format!(
             r#"make the thread that waits on ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"]: {}; it was not spawned, so nothing of this daemon is running"#,
@@ -112,14 +113,15 @@ fn a_daemon_is_spawned_once_the_thread_that_waits_on_it_exists() {
     // first can be made.
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
     let spawned_before = test_hook::spawns();
 
     let launched = launch(&spec(dir.path(), id.as_str()), &stop_bus, id.as_str());
 
     assert!(launched.is_ok(), "launch failed with every thread available");
     assert_eq!(
-        take(id.as_str()),
+        fake.take_failures(),
         Vec::<String>::new(),
         "a launch that succeeded reported a failure"
     );
@@ -168,7 +170,8 @@ fn a_daemon_is_spawned_once_the_thread_that_waits_on_it_exists() {
 fn a_daemon_that_cannot_be_spawned_is_logged_and_nothing_is_left_running() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
     let missing = DaemonSpec {
         command: vec!["goetia-shim-test-no-such-binary".to_string()],
         ..spec(dir.path(), id.as_str())
@@ -177,14 +180,14 @@ fn a_daemon_that_cannot_be_spawned_is_logged_and_nothing_is_left_running() {
     let launched = launch(&missing, &stop_bus, id.as_str());
 
     // The OS's own refusal, asked for independently of the log line under test.
-    let refusal = start(&mut build_command(&missing, id.as_str())).expect_err("the binary does not exist");
+    let refusal = start(&mut build_command(&missing, &fake.log(), id.as_str())).expect_err("the binary does not exist");
     assert_eq!(
         launched.as_ref().err(),
         Some(&Reported::shim_failure(os_error_of(&refusal))),
         "launch reported a daemon whose spawn failed, or lost the OS error"
     );
     assert_one_failure(
-        &take(id.as_str()),
+        &fake.take_failures(),
         id.as_str(),
         &format!("spawn [\"goetia-shim-test-no-such-binary\"]: {refusal}"),
     );
@@ -199,7 +202,8 @@ fn a_daemon_that_cannot_be_spawned_is_logged_and_nothing_is_left_running() {
 fn a_log_file_that_cannot_be_opened_is_logged_and_the_daemon_still_runs() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
     // A directory cannot be created under a regular file.
     let file = dir.path().join("a-file");
     std::fs::write(&file, "x").expect("a regular file to use as a parent");
@@ -215,9 +219,9 @@ fn a_log_file_that_cannot_be_opened_is_logged_and_the_daemon_still_runs() {
         launched.is_ok(),
         "an unopenable log file stopped the daemon from running"
     );
-    let refusal = logging::open_append(&unopenable).expect_err("the path cannot be opened");
+    let refusal = open_append(&unopenable).expect_err("the path cannot be opened");
     assert_one_failure(
-        &take(id.as_str()),
+        &fake.take_failures(),
         id.as_str(),
         &format!(
             "open log file {}: {refusal} (this daemon's output will not be captured; it is still being run)",
@@ -263,7 +267,8 @@ fn powershell(dir: &Path, id: &str, script: &str) -> DaemonSpec {
 fn no_running_report_when_no_thread_can_be_made() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
     let spawned_before = test_hook::spawns();
     let _no_thread = waiter_threads::threads(0);
     let mut running_reports = 0;
@@ -278,7 +283,7 @@ fn no_running_report_when_no_thread_can_be_made() {
     );
     assert_eq!(reported, Reported::shim_failure(None));
     assert_one_failure(
-        &take(id.as_str()),
+        &fake.take_failures(),
         id.as_str(),
         &format!(
             r#"make the thread that waits on ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"]: {}; it was not spawned, so nothing of this daemon is running"#,
@@ -292,7 +297,8 @@ fn no_running_report_when_no_thread_can_be_made() {
 fn no_running_report_when_the_spawn_fails() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
     let missing = DaemonSpec {
         command: vec!["goetia-shim-test-no-such-binary".to_string()],
         ..spec(dir.path(), id.as_str())
@@ -305,10 +311,10 @@ fn no_running_report_when_the_spawn_fails() {
         running_reports, 0,
         "RUNNING was reported for a daemon that never started"
     );
-    let refusal = start(&mut build_command(&missing, id.as_str())).expect_err("the binary does not exist");
+    let refusal = start(&mut build_command(&missing, &fake.log(), id.as_str())).expect_err("the binary does not exist");
     assert_eq!(reported, Reported::shim_failure(os_error_of(&refusal)));
     assert_one_failure(
-        &take(id.as_str()),
+        &fake.take_failures(),
         id.as_str(),
         &format!(r#"spawn ["goetia-shim-test-no-such-binary"]: {refusal}"#),
     );
@@ -319,7 +325,8 @@ fn no_running_report_when_the_spawn_fails() {
 fn running_is_reported_once_and_after_the_spawn() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
     let spawned_before = test_hook::spawns();
     let mut running_reports = Vec::new();
 
@@ -346,7 +353,8 @@ fn running_is_reported_once_and_after_the_spawn() {
 fn a_daemon_that_exits_nonzero_is_one_pass() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
     let spawned_before = test_hook::spawns();
     // The shim ignores the restart policy: no respawn.
     let daemon = DaemonSpec {
@@ -366,7 +374,8 @@ fn a_daemon_that_exits_nonzero_is_one_pass() {
 fn a_daemon_that_exits_zero_is_clean() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
 
     let reported = run_daemon(
         &powershell(dir.path(), id.as_str(), "exit 0"),
@@ -383,7 +392,8 @@ fn a_daemon_that_exits_zero_is_clean() {
 fn an_unkillable_daemon_reports_the_incomplete_stop_failure() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
     // Both kills are refused, so the daemon outlives `run_daemon`: it ends when the test creates
     // this file, which is what lets the detached waiter thread be consumed.
     let release = dir.path().join("release");
@@ -407,7 +417,7 @@ fn an_unkillable_daemon_reports_the_incomplete_stop_failure() {
     std::fs::write(&release, "").expect("release the daemon");
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
     assert_failures(
-        &take(id.as_str()),
+        &fake.take_failures(),
         id.as_str(),
         &[tree_refused_failure(), fallback_refused_failure()],
     );
@@ -419,7 +429,8 @@ fn an_unkillable_daemon_reports_the_incomplete_stop_failure() {
 fn a_failed_wait_is_a_shim_failure_with_the_os_error_and_the_daemon_is_dead() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
 
     let reported = {
         let _failing = waits(Wait::Fail(Some(5)));
@@ -433,7 +444,7 @@ fn a_failed_wait_is_a_shim_failure_with_the_os_error_and_the_daemon_is_dead() {
         "a restartable failure was reported over a daemon still running"
     );
     assert_one_failure(
-        &take(id.as_str()),
+        &fake.take_failures(),
         id.as_str(),
         &format!("background wait on child: {}", std::io::Error::from_raw_os_error(5)),
     );
@@ -444,7 +455,8 @@ fn a_failed_wait_is_a_shim_failure_with_the_os_error_and_the_daemon_is_dead() {
 fn a_failed_wait_with_no_os_error_is_the_generic_shim_failure() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
 
     let reported = {
         let _failing = waits(Wait::Fail(None));
@@ -453,7 +465,7 @@ fn a_failed_wait_with_no_os_error_is_the_generic_shim_failure() {
 
     assert_eq!(reported, Reported::ShimFailure(ERROR_GEN_FAILURE));
     assert_one_failure(
-        &take(id.as_str()),
+        &fake.take_failures(),
         id.as_str(),
         &format!("background wait on child: {WAIT_FAILED}"),
     );
@@ -467,7 +479,8 @@ fn a_failed_wait_with_no_os_error_is_the_generic_shim_failure() {
 fn a_failed_wait_over_an_unkillable_daemon_is_the_incomplete_stop_record() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
 
     let reported = {
         let _failing = waits(Wait::Fail(None));
@@ -482,7 +495,7 @@ fn a_failed_wait_over_an_unkillable_daemon_is_the_incomplete_stop_record() {
     );
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
     assert_failures(
-        &take(id.as_str()),
+        &fake.take_failures(),
         id.as_str(),
         &[
             format!("background wait on child: {WAIT_FAILED}"),
@@ -499,7 +512,8 @@ fn a_failed_wait_over_an_unkillable_daemon_is_the_incomplete_stop_record() {
 fn a_failing_daemon_whose_tree_cannot_be_terminated_is_the_incomplete_stop_record() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
 
     let reported = {
         let _refused = kills(Kill::Refuse);
@@ -517,7 +531,7 @@ fn a_failing_daemon_whose_tree_cannot_be_terminated_is_the_incomplete_stop_recor
         "the bus accepted a stop over a daemon whose tree may still be running"
     );
     assert_one_failure(
-        &take(id.as_str()),
+        &fake.take_failures(),
         id.as_str(),
         &format!(
             "kill_tree after the daemon ended: {KILL_REFUSED}; its descendants may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure"
@@ -533,7 +547,8 @@ fn a_failing_daemon_whose_tree_cannot_be_terminated_is_the_incomplete_stop_recor
 fn a_clean_exit_whose_tree_cannot_be_terminated_is_the_incomplete_stop_record() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
 
     let reported = {
         let _refused = kills(Kill::Refuse);
@@ -547,7 +562,7 @@ fn a_clean_exit_whose_tree_cannot_be_terminated_is_the_incomplete_stop_record() 
 
     assert_eq!(reported, Reported::incomplete_stop());
     assert_one_failure(
-        &take(id.as_str()),
+        &fake.take_failures(),
         id.as_str(),
         &format!(
             "kill_tree after the daemon ended: {KILL_REFUSED}; its descendants may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure"
@@ -561,7 +576,8 @@ fn a_clean_exit_whose_tree_cannot_be_terminated_is_the_incomplete_stop_record() 
 fn a_clean_exit_whose_tree_is_terminated_is_clean() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
 
     let reported = run_daemon(
         &powershell(dir.path(), id.as_str(), "exit 0"),
@@ -571,7 +587,7 @@ fn a_clean_exit_whose_tree_is_terminated_is_clean() {
     );
 
     assert_eq!(reported, Reported::Clean);
-    assert_eq!(take(id.as_str()), Vec::<String>::new());
+    assert_eq!(fake.take_failures(), Vec::<String>::new());
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }
 
@@ -623,7 +639,8 @@ fn the_stopping_status_accepts_no_control_and_records_no_exit() {
 fn a_commanded_stop_reports_stopping_once_while_the_daemon_is_still_alive() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
     let before = waiter_threads::tree_kills();
     let mut alive_when_stopping = Vec::new();
 
@@ -656,7 +673,8 @@ fn a_commanded_stop_reports_stopping_once_while_the_daemon_is_still_alive() {
 fn a_daemon_that_exits_reports_stopping_before_its_tree_is_terminated() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
     let before = waiter_threads::tree_kills();
 
     let (reported, stopping) = run_recording_stopping(
@@ -680,7 +698,8 @@ fn a_daemon_that_exits_reports_stopping_before_its_tree_is_terminated() {
 fn a_daemon_that_exits_cleanly_reports_stopping_before_its_tree_is_terminated() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
 
     let (reported, stopping) = run_recording_stopping(
         &powershell(dir.path(), id.as_str(), "exit 0"),
@@ -698,7 +717,8 @@ fn a_daemon_that_exits_cleanly_reports_stopping_before_its_tree_is_terminated() 
 fn a_failed_wait_reports_stopping_before_the_daemon_is_killed() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
 
     let (reported, stopping) = {
         let _failing = waits(Wait::Fail(Some(5)));
@@ -708,7 +728,7 @@ fn a_failed_wait_reports_stopping_before_the_daemon_is_killed() {
     assert_eq!(reported, Reported::shim_failure(Some(5)));
     assert_eq!(stopping, [0]);
     assert_one_failure(
-        &take(id.as_str()),
+        &fake.take_failures(),
         id.as_str(),
         &format!("background wait on child: {}", std::io::Error::from_raw_os_error(5)),
     );
@@ -721,7 +741,8 @@ fn a_failed_wait_reports_stopping_before_the_daemon_is_killed() {
 fn a_teardown_that_fails_still_reports_stopping_first() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
 
     let (reported, stopping) = {
         let _refused = kills(Kill::Refuse);
@@ -735,7 +756,7 @@ fn a_teardown_that_fails_still_reports_stopping_first() {
 
     assert_eq!(reported, Reported::incomplete_stop());
     assert_eq!(stopping, [0]);
-    assert_eq!(take(id.as_str()).len(), 1);
+    assert_eq!(fake.take_failures().len(), 1);
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }
 
@@ -743,7 +764,8 @@ fn a_teardown_that_fails_still_reports_stopping_first() {
 fn no_stopping_report_when_the_daemon_never_ran() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
     let missing = DaemonSpec {
         command: vec!["goetia-shim-test-no-such-binary".to_string()],
         ..spec(dir.path(), id.as_str())
@@ -756,7 +778,7 @@ fn no_stopping_report_when_the_daemon_never_ran() {
         Vec::<usize>::new(),
         "STOP_PENDING over a service never RUNNING"
     );
-    assert_eq!(take(id.as_str()).len(), 1);
+    assert_eq!(fake.take_failures().len(), 1);
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }
 
@@ -764,7 +786,8 @@ fn no_stopping_report_when_the_daemon_never_ran() {
 fn no_stopping_report_over_an_uncontained_daemon() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
 
     let (_, stopping) = {
         let _degraded = test_hook::containment_is(Containment::TreeWalk);
@@ -776,7 +799,7 @@ fn no_stopping_report_over_an_uncontained_daemon() {
         Vec::<usize>::new(),
         "STOP_PENDING over a service never RUNNING"
     );
-    assert_eq!(take(id.as_str()).len(), 1);
+    assert_eq!(fake.take_failures().len(), 1);
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }
 
@@ -791,7 +814,8 @@ const NOT_JOB_CONTAINED: &str = r#"the daemon ["powershell", "-NoProfile", "-Non
 fn a_daemon_without_job_object_containment_is_killed_and_reported_possibly_running() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
     let mut running_reports = 0;
 
     let reported = {
@@ -808,7 +832,7 @@ fn a_daemon_without_job_object_containment_is_killed_and_reported_possibly_runni
         Liveness::Dead,
         "the uncontained daemon was left running"
     );
-    assert_one_failure(&take(id.as_str()), id.as_str(), NOT_JOB_CONTAINED);
+    assert_one_failure(&fake.take_failures(), id.as_str(), NOT_JOB_CONTAINED);
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
 }
 
@@ -818,7 +842,8 @@ fn a_daemon_without_job_object_containment_is_killed_and_reported_possibly_runni
 fn an_uncontained_daemon_whose_tree_kill_failed_is_reported_possibly_running() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
 
     let reported = {
         let _degraded = test_hook::containment_is(Containment::TreeWalk);
@@ -829,7 +854,7 @@ fn an_uncontained_daemon_whose_tree_kill_failed_is_reported_possibly_running() {
     assert_eq!(reported, Reported::incomplete_stop());
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
     assert_failures(
-        &take(id.as_str()),
+        &fake.take_failures(),
         id.as_str(),
         &[NOT_JOB_CONTAINED.to_string(), tree_refused_failure()],
     );
@@ -840,7 +865,8 @@ fn an_uncontained_daemon_whose_tree_kill_failed_is_reported_possibly_running() {
 fn an_uncontained_daemon_that_cannot_be_killed_is_the_incomplete_stop_record() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
 
     let reported = {
         let _degraded = test_hook::containment_is(Containment::TreeWalk);
@@ -851,7 +877,7 @@ fn an_uncontained_daemon_that_cannot_be_killed_is_the_incomplete_stop_record() {
     assert_eq!(reported, Reported::incomplete_stop());
     assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
     assert_failures(
-        &take(id.as_str()),
+        &fake.take_failures(),
         id.as_str(),
         &[
             NOT_JOB_CONTAINED.to_string(),
@@ -877,7 +903,8 @@ fn an_uncontained_daemon_that_cannot_be_killed_is_the_incomplete_stop_record() {
 fn an_exit_status_that_cannot_be_read_is_a_shim_failure() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
 
     let reported = {
         let _unreadable = test_hook::exit_status_fails();
@@ -891,7 +918,7 @@ fn an_exit_status_that_cannot_be_read_is_a_shim_failure() {
 
     assert_eq!(reported, Reported::ShimFailure(ERROR_GEN_FAILURE));
     assert_one_failure(
-        &take(id.as_str()),
+        &fake.take_failures(),
         id.as_str(),
         &format!("query child exit status: {}", test_hook::EXIT_STATUS_UNREADABLE),
     );
@@ -905,7 +932,8 @@ fn an_exit_status_that_cannot_be_read_is_a_shim_failure() {
 fn a_stop_after_a_daemon_failure_was_decided_leaves_the_failure() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
 
     let reported = run_daemon(
         &powershell(dir.path(), id.as_str(), "exit 7"),
@@ -931,7 +959,8 @@ fn a_stop_after_a_daemon_failure_was_decided_leaves_the_failure() {
 /// registration stays live, and only a real SCM shows that. `clippy.toml` forbids the call.
 #[skuld::test]
 fn a_control_after_a_stop_still_reaches_the_bus() {
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
     let context = leak_handler_context(&stop_bus);
     let control = |code| {
         // SAFETY: `context` came from `leak_handler_context` and is never freed.
@@ -955,7 +984,8 @@ fn a_control_after_a_stop_still_reaches_the_bus() {
 fn a_stop_accepted_before_a_daemon_failure_was_decided_is_clean() {
     let dir = tempfile::tempdir().expect("a temp dir for the daemon's log");
     let id = TestId::new(PREFIX);
-    let stop_bus = Arc::new(StopBus::new());
+    let fake = FakeGuard::new();
+    let stop_bus = Arc::new(StopBus::new(fake.log()));
 
     let reported = run_daemon(
         &powershell(dir.path(), id.as_str(), "exit 7"),
@@ -1105,11 +1135,18 @@ fn no_notice_when_the_shim_is_the_version_that_registered_the_service() {
 #[skuld::test]
 fn the_version_skew_notice_is_logged_as_a_warning_and_not_as_a_failure() {
     let id = TestId::new(PREFIX);
+    let fake = FakeGuard::new();
 
-    log_version_skew(id.as_str(), &spec_restarting(Restart::OnFailure), "0.1.0", "0.2.0");
+    log_version_skew(
+        &fake.log(),
+        id.as_str(),
+        &spec_restarting(Restart::OnFailure),
+        "0.1.0",
+        "0.2.0",
+    );
 
-    assert!(take(id.as_str()).is_empty(), "the notice was logged as a failure");
-    let warnings = take_warnings(id.as_str());
+    assert!(fake.take_failures().is_empty(), "the notice was logged as a failure");
+    let warnings = fake.take_warnings();
     let [line] = warnings.as_slice() else {
         panic!("expected exactly one warning, got {warnings:?}");
     };
@@ -1119,12 +1156,20 @@ fn the_version_skew_notice_is_logged_as_a_warning_and_not_as_a_failure() {
 #[skuld::test]
 fn nothing_is_logged_for_a_service_the_shim_has_no_notice_about() {
     let id = TestId::new(PREFIX);
+    let fake = FakeGuard::new();
+    let log = fake.log();
 
-    log_version_skew(id.as_str(), &spec_restarting(Restart::Never), "0.1.0", "0.2.0");
-    log_version_skew(id.as_str(), &spec_restarting(Restart::OnFailure), "0.2.0", "0.2.0");
+    log_version_skew(&log, id.as_str(), &spec_restarting(Restart::Never), "0.1.0", "0.2.0");
+    log_version_skew(
+        &log,
+        id.as_str(),
+        &spec_restarting(Restart::OnFailure),
+        "0.2.0",
+        "0.2.0",
+    );
 
-    assert!(take(id.as_str()).is_empty());
-    assert!(take_warnings(id.as_str()).is_empty());
+    assert!(fake.take_failures().is_empty());
+    assert!(fake.take_warnings().is_empty());
 }
 
 /// A `STOPPED` the shim could not report is expected to read as a crash to SCM (1067), with the

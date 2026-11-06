@@ -18,7 +18,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use cosca::Child;
 use goetia::backend::scm::exit_status::Reported;
 
-use crate::logging;
+use crate::logging::Log;
 use crate::service::os_error_of;
 
 /// How the run ends, decided once under the [`StopBus`] mutex: a stop accepted before the exit is
@@ -49,6 +49,7 @@ struct Gate {
 pub struct StopBus {
     state: Mutex<Gate>,
     cvar: Condvar,
+    log: Arc<Log>,
 }
 
 pub enum WaitOutcome {
@@ -132,7 +133,7 @@ impl Waiter {
                 #[cfg(not(test))]
                 let waited = child.wait();
                 let failure = waited.err().map(|e| {
-                    logging::log_failure(&id, &wait_failed(&e));
+                    bus.log.failure(&id, &wait_failed(&e));
                     os_error_of(&e)
                 });
                 bus.report_done(failure);
@@ -162,11 +163,18 @@ impl Waiter {
 }
 
 impl StopBus {
-    pub fn new() -> Self {
+    /// A bus whose supervisor, and the waiter threads it makes, report failures to `log`.
+    pub fn new(log: Arc<Log>) -> Self {
         Self {
             state: Mutex::new(Gate::default()),
             cvar: Condvar::new(),
+            log,
         }
+    }
+
+    /// The log every failure of this run goes to.
+    pub fn log(&self) -> &Log {
+        &self.log
     }
 
     /// Called from the SCM control handler (`service::control_handler`), on the dispatcher thread.
@@ -369,7 +377,7 @@ impl StopBus {
         let outcome = if !stopping && wait_failure.is_none() {
             WaitOutcome::ChildExited
         } else {
-            let teardown = kill_for_stop(child, id);
+            let teardown = kill_for_stop(child, &self.log, id);
             match (teardown, wait_failure) {
                 // Returning here is what leaves `waiting` unjoined: nothing
                 // can make the wait it holds return, so joining it would
@@ -383,7 +391,7 @@ impl StopBus {
                     return WaitOutcome::DaemonMayRun;
                 }
                 (Teardown::ChildOnly, _) => {
-                    logging::log_failure(id, &tree_unkilled());
+                    self.log.failure(id, &tree_unkilled());
                     if !stopping {
                         self.refuse_stops();
                     }
@@ -400,7 +408,7 @@ impl StopBus {
         // reached it; the arm where neither is true returned above rather
         // than joining.
         if waiting.join().is_err() {
-            logging::log_failure(id, WAITER_PANICKED);
+            self.log.failure(id, WAITER_PANICKED);
         }
         outcome
     }
@@ -441,24 +449,24 @@ pub(crate) enum Teardown {
 /// so that a restart or `start` never runs beside a tree nobody told to end. `true` is `kill_tree`
 /// succeeding, which is not proof the members have finished exiting. `false` (logged) means the
 /// tree may still be running and the stop must be reported as incomplete.
-pub(crate) fn terminate_exited_tree(child: &Child, id: &str) -> bool {
+pub(crate) fn terminate_exited_tree(child: &Child, log: &Log, id: &str) -> bool {
     let Err(e) = kill_tree(child) else { return true };
-    logging::log_failure(id, &exited_tree_unkilled(&e));
+    log.failure(id, &exited_tree_unkilled(&e));
     false
 }
 
 /// Kill the daemon for a commanded stop: the whole contained tree, or failing that the direct
 /// child alone. See [`StopBus::wait_for_child_or_stop`], the only caller, for what it does with
 /// [`Teardown::Failed`]. Each failure is logged as it happens.
-pub(crate) fn kill_for_stop(child: &Child, id: &str) -> Teardown {
+pub(crate) fn kill_for_stop(child: &Child, log: &Log, id: &str) -> Teardown {
     let Err(e) = kill_tree(child) else {
         return Teardown::Tree;
     };
-    logging::log_failure(id, &kill_tree_failed(&e));
+    log.failure(id, &kill_tree_failed(&e));
     let Err(e2) = kill_child(child) else {
         return Teardown::ChildOnly;
     };
-    logging::log_failure(id, &fallback_kill_failed(&e2));
+    log.failure(id, &fallback_kill_failed(&e2));
     Teardown::Failed
 }
 

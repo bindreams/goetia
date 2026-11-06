@@ -5,11 +5,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // rand 0.10 moved `random` off `Rng` onto `RngExt`.
 use rand::RngExt as _;
 
-use crate::{logging, stop_bus};
+use crate::stop_bus;
 
-/// A per-test daemon id, unique in the process (the journals are keyed by id), whose drop checks
-/// that `log_failure` wrote no fallback file, and that the test consumed its id's journalled lines
-/// and its waiter's end. The random part avoids ids left by a killed run or a real daemon.
+/// A per-test daemon id, unique in the process (the waiter-end record is keyed by id), whose drop
+/// checks that the test consumed its waiter's end. The random part avoids ids left by a killed run
+/// or a real daemon.
 pub(crate) struct TestId(String);
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -35,19 +35,6 @@ impl Drop for TestId {
         if std::thread::panicking() {
             return;
         }
-        let path = logging::default_log_path(&self.0);
-        assert!(
-            !path.exists(),
-            "`log_failure` wrote the fallback log {} for {}: the test-build journal seam regressed",
-            path.display(),
-            self.0
-        );
-        let unconsumed = logging::test_hook::peek(&self.0);
-        assert!(
-            unconsumed.is_empty(),
-            "{} ended with `log_failure` lines it never asserted on: {unconsumed:?}",
-            self.0
-        );
         assert!(
             !stop_bus::test_hook::has_waiter_end(&self.0),
             "{} ended without consuming its waiter's end (`waiter_end`)",
