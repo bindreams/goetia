@@ -110,3 +110,20 @@ fn new_refuses_a_blank_user_name() {
     });
     assert_eq!(msg, "field `user.name` must not be empty");
 }
+
+#[skuld::test]
+fn new_refuses_xml_noncharacters() {
+    for c in ['\u{FFFF}', '\u{FDD0}'] {
+        let msg = message(DaemonFields {
+            command: vec!["frpc".to_string(), format!("bad{c}arg")],
+            ..fields()
+        });
+        assert_eq!(
+            msg,
+            format!(
+                "field `command` contains U+{:04X}, a Unicode noncharacter that XML cannot represent",
+                c as u32
+            )
+        );
+    }
+}

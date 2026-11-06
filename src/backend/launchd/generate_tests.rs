@@ -135,7 +135,7 @@ fn plist_snapshot_full() {
          \t\t<string>frpc.toml</string>\n\
          \t</array>\n\
          \t<key>WorkingDirectory</key>\n\
-         \t<string>/opt/frpc</string>\n\
+         \t<string>{cwd}</string>\n\
          \t<key>EnvironmentVariables</key>\n\
          \t<dict>\n\
          \t\t<key>RUST_LOG</key>\n\
@@ -152,13 +152,15 @@ fn plist_snapshot_full() {
          \t<key>ThrottleInterval</key>\n\
          \t<integer>3</integer>\n\
          \t<key>StandardOutPath</key>\n\
-         \t<string>/var/log/frpc.log</string>\n\
+         \t<string>{logs}</string>\n\
          \t<key>StandardErrorPath</key>\n\
-         \t<string>/var/log/frpc.log</string>\n\
+         \t<string>{logs}</string>\n\
          </dict>\n\
          </plist>\n",
         version = crate::version(),
         blob = blob::encode(&spec),
+        cwd = abs("opt/frpc").display(),
+        logs = abs("var/log/frpc.log").display(),
     );
 
     assert_eq!(text, expected);
@@ -354,8 +356,8 @@ fn xml_special_characters_are_escaped() {
     let mut spec = minimal_spec().into_fields();
     spec.command = vec!["frpc".to_string(), "a&b<c>d".to_string()];
     spec.env = BTreeMap::from([("K&L<M>N".to_string(), "x&y<z>w".to_string())]);
-    spec.cwd = Some(PathBuf::from("/opt/a&b<c>d"));
-    spec.logs = Some(PathBuf::from("/var/log/a&b<c>d"));
+    spec.cwd = Some(abs("opt/a&b<c>d"));
+    spec.logs = Some(abs("var/log/a&b<c>d"));
     let spec = DaemonSpec::new(spec).unwrap();
 
     let text = plist(
@@ -382,11 +384,17 @@ fn xml_special_characters_are_escaped() {
         "UserName was not escaped:\n{text}"
     );
     assert!(
-        text.contains("<key>WorkingDirectory</key>\n\t<string>/opt/a&amp;b&lt;c&gt;d</string>"),
+        text.contains(&format!(
+            "<key>WorkingDirectory</key>\n\t<string>{}</string>",
+            abs("opt/a&amp;b&lt;c&gt;d").display()
+        )),
         "cwd was not escaped:\n{text}"
     );
     assert!(
-        text.contains("<key>StandardOutPath</key>\n\t<string>/var/log/a&amp;b&lt;c&gt;d</string>"),
+        text.contains(&format!(
+            "<key>StandardOutPath</key>\n\t<string>{}</string>",
+            abs("var/log/a&amp;b&lt;c&gt;d").display()
+        )),
         "logs was not escaped:\n{text}"
     );
     assert!(
@@ -400,28 +408,6 @@ fn xml_special_characters_are_escaped() {
     assert!(
         !text.contains("svc&name<x>y"),
         "raw unescaped UserName must not appear in the output"
-    );
-}
-
-#[skuld::test]
-fn xml_noncharacters_panic_loudly_rather_than_emit_invalid_xml() {
-    // XML 1.0's `Char` production excludes U+FFFE/U+FFFF entirely — no
-    // escape can represent them, and `spec::resolve`'s control-character
-    // gate does not reject them (`char::is_control()` doesn't cover
-    // noncharacters). Until that upstream gate closes, this generator must
-    // fail loudly rather than silently emit a plist no XML parser can load.
-    let mut spec = minimal_spec().into_fields();
-    spec.command = vec!["frpc".to_string(), format!("bad{}arg", '\u{FFFF}')];
-    let spec = DaemonSpec::new(spec).unwrap();
-
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| plist(&spec, &minimal_identity())));
-    std::panic::set_hook(previous_hook);
-
-    assert!(
-        result.is_err(),
-        "plist() must panic rather than emit unrepresentable XML"
     );
 }
 
