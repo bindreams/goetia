@@ -6,25 +6,21 @@ use std::collections::BTreeMap;
 
 use goetia::backend::scm::manager::Scm;
 use goetia::decide::Outcome;
+use goetia::error::Error;
 use goetia::manager::conformance;
 use goetia::manager::{Budget, Installed, ServiceManager as _, State};
+use goetia::shim::{CheckPermissions, StandaloneShim};
 use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::System::Services::{
     SERVICE_NOTIFY_STOP_PENDING, SERVICE_NOTIFY_STOPPED, SERVICE_STOP_PENDING, SERVICE_STOPPED,
 };
 
-use crate::common::{LogDir, ShimGuard, arm_and_wait, conformance_mk, fixture_command, simple_spec};
+use crate::common::{
+    LogDir, ShimGuard, UNIT_DIR_EXCLUSIVE, arm_and_wait, conformance_mk, fixture_command, manager, simple_spec,
+};
 use crate::deny::Denied;
 use crate::support::{self, ELEVATED};
-
-/// The same cross-process lock `tests/scm_integration/managed.rs` declares,
-/// shared with it by label *name*: both binaries drive the one SCM on the host,
-/// and one denied `Parameters` changes `list`'s answer for all of it. A
-/// negative assertion here is unsound while any test anywhere denies a
-/// `Parameters` read, so they take turns rather than race.
-#[skuld::label]
-const UNIT_DIR_EXCLUSIVE: skuld::Label;
 
 fn seed_foreign(id: &str) {
     support::cmd::run(
@@ -41,15 +37,12 @@ fn seed_foreign(id: &str) {
     .expect_ok();
 }
 
-/// A hand-edit `sc config` can make without touching `Parameters`: append an
-/// argument to the shim's own command line. For `type: simple` this changes
-/// `render()`'s `Arguments` line (normally just `[<id>]`) the same way it
-/// does for `type: managed`'s own command — the embedded blob cannot
-/// explain it either way.
+/// A hand-edit `sc config` can make without touching `Parameters`: change the display name. The
+/// host command is not a candidate: `regenerate` keeps the installed one, so changing it is never a
+/// conflict, while `DisplayName` is in the registration's `Display` and the blob cannot explain it.
 fn hand_edit(id: &str) {
-    let shim = std::env::var("GOETIA_SHIM_PATH").expect("set by tests/shim_integration.rs's own main()");
-    let mutated = format!("\"{shim}\" {id} --hand-edited");
-    support::cmd::run("sc.exe", &["config", id, "binPath=", &mutated]).expect_ok();
+    let name = format!("{id} (hand-edited)");
+    support::cmd::run("sc.exe", &["config", id, "DisplayName=", &name]).expect_ok();
 }
 
 // Step 1: conformance =================================================================================================
@@ -60,7 +53,7 @@ fn hand_edit(id: &str) {
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn simple_passes_conformance() {
     let logs = LogDir::new();
-    let mgr = Scm::new();
+    let mgr = manager();
     // A foreign service runs no shim, so it needs no `ShimGuard`.
     let _foreign = support::ServiceGuard::new(conformance::FOREIGN_ID);
     // These guards drop after `run`'s uninstall and remove the pre-decode logs; make each before
@@ -101,7 +94,7 @@ fn simple_passes_conformance() {
 fn install_then_list_round_trips_without_the_source_file() {
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = Scm::new();
+    let mgr = manager();
     let _guard = ShimGuard::new(&id);
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
 
@@ -127,7 +120,7 @@ fn install_then_list_round_trips_without_the_source_file() {
 fn start_stop_status_reflect_reality() {
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = Scm::new();
+    let mgr = manager();
     let _guard = ShimGuard::new(&id);
     let started = support::ConnectBack::listen();
     let spec = simple_spec(&id, fixture_command("report", &[&started.port().to_string()]), &logs);
@@ -158,7 +151,7 @@ fn start_stop_status_reflect_reality() {
 fn uninstall_leaves_nothing() {
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = Scm::new();
+    let mgr = manager();
     let _guard = ShimGuard::new(&id);
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
     mgr.install(&spec, false).expect("install");
@@ -192,7 +185,7 @@ fn list_ignores_foreign_services() {
     let guard = support::ServiceGuard::new(&id);
     seed_foreign(guard.id());
 
-    let mgr = Scm::new();
+    let mgr = manager();
     let installed = mgr.list().expect("list");
     assert!(
         installed.iter().all(|entry| match entry {
@@ -210,6 +203,90 @@ fn list_ignores_foreign_services() {
     );
 }
 
+// The host the manager registers ======================================================================================
+
+/// A host of another version is refused before anything is registered: the copy of the shim has
+/// every occurrence of this crate's version in it replaced by a different one of the same length.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn install_refuses_host_of_another_version() {
+    let id = support::random_test_id();
+    let logs = LogDir::new();
+    let dir = support::cleanup::DirGuard::new(tempfile::tempdir().expect("tempdir for the host copy").keep());
+    let copy = dir.path().join("goetia-shim.exe");
+    let _copy = support::cleanup::FileGuard::new(copy.clone());
+    let _guard = ShimGuard::new(&id);
+
+    let version = env!("CARGO_PKG_VERSION");
+    let other: String = version
+        .chars()
+        .map(|c| {
+            c.to_digit(10)
+                .map_or(c, |d| char::from_digit((d + 1) % 10, 10).unwrap())
+        })
+        .collect();
+    assert_ne!(other, version);
+    let mut patched = std::fs::read(env!("CARGO_BIN_EXE_goetia-shim")).expect("read the shim");
+    let mut replaced = 0;
+    let mut at = 0;
+    while at + version.len() <= patched.len() {
+        if patched[at..at + version.len()] == *version.as_bytes() {
+            patched[at..at + version.len()].copy_from_slice(other.as_bytes());
+            replaced += 1;
+            at += version.len();
+        } else {
+            at += 1;
+        }
+    }
+    assert!(replaced > 0, "the shim holds its own version");
+    std::fs::write(&copy, patched).expect("write the patched copy");
+
+    let mgr = Scm::with_shim(StandaloneShim::new(copy, vec![]), CheckPermissions::Disable);
+    let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
+
+    match mgr.install(&spec, false) {
+        Err(Error::ShimMarkerVersion { found, expected, .. }) => {
+            assert_eq!((found, expected), (other, version.to_string()))
+        }
+        other => panic!("a host of another version must be refused, got {other:?}"),
+    }
+    let query = support::cmd::run("sc.exe", &["query", &id]);
+    assert!(!query.ok(), "no service may be created:\n{query}");
+}
+
+/// A manager with no provider judges a service another provider's host runs: `status` and `list`
+/// regenerate from the installed registration, whose host and arguments stay as they were.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn status_through_new_keeps_a_standalone_host() {
+    let id = support::random_test_id();
+    let logs = LogDir::new();
+    let _guard = ShimGuard::new(&id);
+    let with_args = Scm::with_shim(
+        StandaloneShim::new(
+            std::path::PathBuf::from(env!("CARGO_BIN_EXE_goetia-shim")),
+            vec!["--probe".to_string()],
+        ),
+        CheckPermissions::Disable,
+    );
+    let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
+    with_args.install(&spec, false).expect("install");
+    let installed = support::cmd::run("sc.exe", &["qc", &id]).expect_ok().stdout;
+    assert!(installed.contains("--probe"), "{installed}");
+
+    let bare = Scm::new();
+    bare.status(&spec.id)
+        .expect("status through a manager with no provider");
+    let listed = bare.list().expect("list through a manager with no provider");
+
+    assert!(
+        listed
+            .iter()
+            .any(|entry| matches!(entry, Installed::Ours { spec: s, .. } if s.id.as_str() == id)),
+        "{id} must be listed as ours: {listed:?}"
+    );
+    let after = support::cmd::run("sc.exe", &["qc", &id]).expect_ok().stdout;
+    assert_eq!(after, installed, "status and list change nothing");
+}
+
 // Step 3: STOP_PENDING through teardown ===============================================================================
 
 /// The shim reports `STOP_PENDING`, accepting no controls, from the moment it takes a stop until it
@@ -219,7 +296,7 @@ fn list_ignores_foreign_services() {
 fn the_shim_reports_stop_pending_then_stopped() {
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = Scm::new();
+    let mgr = manager();
     let _guard = ShimGuard::new(&id);
     let started = support::ConnectBack::listen();
     let spec = simple_spec(&id, fixture_command("report", &[&started.port().to_string()]), &logs);

@@ -206,7 +206,6 @@ pub struct FolderCheck {
 
 #[cfg(windows)]
 impl FolderCheck {
-    #[expect(dead_code, reason = "the manager holds a check from the shim-provider wiring on")]
     pub(crate) fn new(mode: CheckPermissions) -> Self {
         Self { mode }
     }

@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use goetia::backend::scm::exit_status::{ERROR_SERVICE_SPECIFIC_ERROR, RecordedExit};
-use goetia::backend::scm::manager::Scm;
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, Installed, ServiceManager as _, Step};
 use goetia::spec::{DaemonSpec, Restart};
@@ -19,7 +18,7 @@ use windows_service::service::{ServiceExitCode, ServiceState};
 use winreg::enums::{KEY_READ, KEY_WRITE};
 
 use crate::common::{
-    LogDir, ShimGuard, ShimProcess, fixture_command, kill_process, recorded_exit, scm_status, simple_spec,
+    LogDir, ShimGuard, ShimProcess, fixture_command, kill_process, manager, recorded_exit, scm_status, simple_spec,
 };
 use crate::support::registry::parameters_key;
 use crate::support::{self, ConnectBack, ELEVATED};
@@ -44,7 +43,7 @@ fn on_failure(id: &str, command: Vec<String>, restart_delay: Option<Duration>, l
 fn a_restart_after_an_update_runs_the_updated_spec() {
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = Scm::new();
+    let mgr = manager();
     let _guard = ShimGuard::new(&id);
     let old = ConnectBack::listen();
     let new = ConnectBack::listen();
@@ -78,7 +77,7 @@ fn a_restart_after_an_update_runs_the_updated_spec() {
 fn a_killed_shim_is_restarted_by_scm() {
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = Scm::new();
+    let mgr = manager();
     let _guard = ShimGuard::new(&id);
     let reported = ConnectBack::listen();
 
@@ -109,7 +108,7 @@ fn a_killed_shim_is_restarted_by_scm() {
 fn a_killed_on_failure_simple_daemon_comes_back_with_a_new_pid() {
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = Scm::new();
+    let mgr = manager();
     let _guard = ShimGuard::new(&id);
     let started = ConnectBack::listen();
     let spec = on_failure(
@@ -127,7 +126,7 @@ fn a_killed_on_failure_simple_daemon_comes_back_with_a_new_pid() {
 fn on_failure_restarts_are_paced_new_shims() {
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = Scm::new();
+    let mgr = manager();
     let _guard = ShimGuard::new(&id);
     let reported = ConnectBack::listen();
 
@@ -187,7 +186,7 @@ fn uninstall_leaves_no_restarted_daemon_behind() {
 
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = Scm::new();
+    let mgr = manager();
     let _guard = ShimGuard::new(&id);
     let reported = ConnectBack::listen();
 
@@ -228,7 +227,7 @@ fn exit_records(child_code: i32) -> (ServiceExitCode, RecordedExit) {
     let reported = ConnectBack::listen();
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = Scm::new();
+    let mgr = manager();
     let _guard = ShimGuard::new(&id);
 
     let spec = simple_spec(
@@ -293,7 +292,7 @@ fn a_daemon_that_cannot_be_spawned_fails_start_under_every_policy() {
     // failure's and not a restarted run's.
     let hour = Some(Duration::from_secs(3600));
     let logs = LogDir::new();
-    let mgr = Scm::new();
+    let mgr = manager();
 
     for (restart, restart_delay) in [(Restart::Never, None), (Restart::OnFailure, hour)] {
         let id = support::random_test_id();
@@ -338,7 +337,7 @@ fn start_confirms_the_launch_of_a_daemon_that_exits_at_once() {
     // A delay that cannot elapse during the test, so `on-failure` does not restart the daemon.
     let hour = Some(Duration::from_secs(3600));
     let logs = LogDir::new();
-    let mgr = Scm::new();
+    let mgr = manager();
 
     for (restart, code) in [(Restart::Never, 7), (Restart::OnFailure, 7), (Restart::Never, 0)] {
         let id = support::random_test_id();
@@ -365,7 +364,7 @@ fn start_confirms_the_launch_of_a_daemon_that_exits_at_once() {
 fn a_commanded_stop_reports_win32_zero() {
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = Scm::new();
+    let mgr = manager();
     let _guard = ShimGuard::new(&id);
     let reported = ConnectBack::listen();
 
@@ -425,7 +424,7 @@ fn register_as_earlier_version(id: &str, current_version: &str) {
 fn a_new_shim_runs_a_service_registered_by_an_earlier_version() {
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = Scm::new();
+    let mgr = manager();
     let _guard = ShimGuard::new(&id);
     let reported = ConnectBack::listen();
 
@@ -465,7 +464,7 @@ fn a_new_shim_runs_a_service_registered_by_an_earlier_version() {
 fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled() {
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = Scm::new();
+    let mgr = manager();
     let _guard = ShimGuard::new(&id);
     let reported = ConnectBack::listen();
 
@@ -526,7 +525,7 @@ fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled
 fn reinstalling_an_earlier_version_simple_service_applies_the_recovery_actions() {
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = Scm::new();
+    let mgr = manager();
     let _guard = ShimGuard::new(&id);
 
     let spec = on_failure(&id, fixture_command("report", &["1"]), ONE_SECOND, &logs);

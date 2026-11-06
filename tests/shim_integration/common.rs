@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use goetia::backend::scm::exit_status::RecordedExit;
 use goetia::backend::scm::manager::Scm;
+use goetia::shim::{CheckPermissions, StandaloneShim};
 use goetia::spec::{DaemonSpec, Kind};
 use windows_service::service::{Service, ServiceAccess, ServiceState, ServiceStatus};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
@@ -19,6 +20,22 @@ use windows_sys::Win32::System::Threading::{INFINITE, OpenProcess, PROCESS_SYNCH
 
 use crate::fixture;
 use crate::support;
+
+/// The same cross-process lock `tests/scm_integration/managed.rs` declares, shared with it by label
+/// *name*: both binaries drive the one SCM on the host, and one denied `Parameters` changes `list`'s
+/// answer for all of it. A negative assertion is unsound while any test anywhere denies a
+/// `Parameters` read, so they take turns rather than race.
+#[skuld::label]
+pub const UNIT_DIR_EXCLUSIVE: skuld::Label;
+
+/// A manager whose `type: simple` services run the shim this crate builds, wherever cargo put it.
+/// The folder check is off: the build directory is the user's, not a protected one.
+pub fn manager() -> Scm {
+    Scm::with_shim(
+        StandaloneShim::new(PathBuf::from(env!("CARGO_BIN_EXE_goetia-shim")), vec![]),
+        CheckPermissions::Disable,
+    )
+}
 
 pub fn fixture_command(mode: &str, args: &[&str]) -> Vec<String> {
     let mut v = vec![

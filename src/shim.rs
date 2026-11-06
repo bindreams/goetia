@@ -2,6 +2,11 @@
 
 #[cfg(windows)]
 pub use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
+pub use crate::backend::scm::shim::provider::HostCommand;
+#[cfg(windows)]
+pub use crate::backend::scm::shim::provider::ShimProvider;
+#[cfg(windows)]
+pub use crate::backend::scm::shim::standalone::StandaloneShim;
 
 /// The shim's entry point: hands control to SCM and never returns. On every other platform it
 /// prints that the shim is Windows-only and exits 1.

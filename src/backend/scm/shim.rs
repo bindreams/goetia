@@ -2,5 +2,8 @@
 
 pub(crate) mod acl;
 pub(crate) mod marker;
+pub(crate) mod provider;
 #[cfg(windows)]
 pub(crate) mod run;
+#[cfg(windows)]
+pub(crate) mod standalone;

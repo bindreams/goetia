@@ -229,6 +229,31 @@ pub enum Error {
         expected: String,
     },
 
+    /// A `type: simple` service needs a service host and the manager was built without a shim
+    /// provider. No OS call failed.
+    #[error("no shim provider configured")]
+    NoShimProvider,
+
+    /// A shim provider's `provide` returned a command other than the one its `preview` named, so
+    /// what `--dry-run` and `render` show is not what an install registers. No OS call failed.
+    #[error(
+        "the shim provider's `provide` returned {} {:?}, but its `preview` named {} {:?}",
+        provided.exe.display(),
+        provided.args,
+        previewed.exe.display(),
+        previewed.args
+    )]
+    ShimProviderDisagrees {
+        previewed: crate::shim::HostCommand,
+        provided: crate::shim::HostCommand,
+    },
+
+    /// A shim provider named its host, or the folder it keeps it in, by a path that is not
+    /// absolute, which SCM would resolve against a directory goetia does not control. No OS call
+    /// failed.
+    #[error("the shim provider named {}, which is not an absolute path", path.display())]
+    ShimPathRelative { path: PathBuf },
+
     /// A `.env` file beside the manifest could not be parsed. Distinct from
     /// [`Os`](Error::Os), which means the file could not be read at all.
     #[error("{path}:{line}: {message}", path = path.display())]
@@ -563,6 +588,9 @@ impl Error {
             | Error::ShimFolderUnsafe { .. }
             | Error::ShimMarkerMissing { .. }
             | Error::ShimMarkerVersion { .. }
+            | Error::NoShimProvider
+            | Error::ShimProviderDisagrees { .. }
+            | Error::ShimPathRelative { .. }
             | Error::EnvFile { .. }
             | Error::Interpolate { .. }
             | Error::Yaml(_)
@@ -669,6 +697,9 @@ impl Error {
             | Error::ShimFolderUnsafe { .. }
             | Error::ShimMarkerMissing { .. }
             | Error::ShimMarkerVersion { .. }
+            | Error::NoShimProvider
+            | Error::ShimProviderDisagrees { .. }
+            | Error::ShimPathRelative { .. }
             | Error::EnvFile { .. }
             | Error::Interpolate { .. }
             | Error::Yaml(_)

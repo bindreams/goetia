@@ -309,14 +309,10 @@ mod windows {
     use std::io;
 
     fn disabled() -> FolderCheck {
-        FolderCheck {
-            mode: CheckPermissions::Disable,
-        }
+        FolderCheck::new(CheckPermissions::Disable)
     }
     fn enabled() -> FolderCheck {
-        FolderCheck {
-            mode: CheckPermissions::Enable,
-        }
+        FolderCheck::new(CheckPermissions::Enable)
     }
 
     #[skuld::test]

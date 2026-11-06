@@ -9,13 +9,12 @@
 use std::collections::BTreeMap;
 
 use goetia::backend::scm::exit_status::{ERROR_INVALID_DATA, RecordedExit};
-use goetia::backend::scm::manager::Scm;
 use goetia::manager::{Budget, ServiceManager as _};
 use goetia::spec::{DaemonSpec, Restart};
 use windows_service::service::{ServiceExitCode, ServiceState};
 use winreg::enums::KEY_WRITE;
 
-use crate::common::{LogDir, ShimGuard, fixture_command, recorded_exit, scm_status, simple_spec};
+use crate::common::{LogDir, ShimGuard, fixture_command, manager, recorded_exit, scm_status, simple_spec};
 use crate::support::registry::{parameters_key, service_key};
 use crate::support::{self, ConnectBack, ELEVATED};
 
@@ -23,7 +22,7 @@ use crate::support::{self, ConnectBack, ELEVATED};
 fn shim_runs_child_with_cwd_and_env() {
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = Scm::new();
+    let mgr = manager();
     let _guard = ShimGuard::new(&id);
     let reported = ConnectBack::listen();
 
@@ -63,7 +62,7 @@ fn shim_runs_child_with_cwd_and_env() {
 fn shim_captures_stdout_to_logs_path() {
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = Scm::new();
+    let mgr = manager();
     let _guard = ShimGuard::new(&id);
     let reported = ConnectBack::listen();
     let log_path = logs.path_for(&id);
@@ -93,7 +92,7 @@ fn shim_captures_stdout_to_logs_path() {
 fn stop_kills_the_whole_process_tree() {
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = Scm::new();
+    let mgr = manager();
     let _guard = ShimGuard::new(&id);
     let child_reported = ConnectBack::listen();
     let grandchild_reported = ConnectBack::listen();
@@ -158,7 +157,7 @@ fn pid_is_alive(pid: &str) -> bool {
 fn unreadable_blob_logs_to_fallback_path_and_event_log() {
     let id = support::random_test_id();
     let logs = LogDir::new();
-    let mgr = Scm::new();
+    let mgr = manager();
     let _guard = ShimGuard::new(&id);
 
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);

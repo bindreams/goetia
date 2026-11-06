@@ -50,8 +50,15 @@ fn shim_path() -> PathBuf {
     abs("Program Files/Goetia/goetia-shim.exe")
 }
 
+fn host() -> HostCommand {
+    HostCommand {
+        exe: shim_path(),
+        args: vec!["--service-host".to_string()],
+    }
+}
+
 fn build(spec: &DaemonSpec) -> ScmRegistration {
-    registration(spec, &identity(), &shim_path()).unwrap()
+    registration(spec, &identity(), Some(&host())).unwrap()
 }
 
 // executable/arguments per Kind =======================================================================================
@@ -62,11 +69,47 @@ fn simple_kind_executable_is_shim() {
     let reg = build(&spec);
 
     assert_eq!(reg.executable, shim_path());
-    assert_eq!(reg.arguments, vec![spec.id.as_str().to_string()]);
+    assert_eq!(
+        reg.arguments,
+        host().args,
+        "the host's arguments, verbatim: no id is appended"
+    );
     assert!(
         !reg.arguments.contains(&spec.command[0]),
         "the spec's own command must not appear in arguments: {:?}",
         reg.arguments
+    );
+}
+
+#[skuld::test]
+fn simple_kind_without_a_host_has_no_provider() {
+    let err = registration(&simple_spec(), &identity(), None).expect_err("a simple service needs a host");
+    assert!(matches!(err, Error::NoShimProvider), "{err:?}");
+}
+
+#[skuld::test]
+fn managed_kind_ignores_the_host() {
+    let spec = managed_spec();
+    assert_eq!(
+        registration(&spec, &identity(), None).unwrap().to_string(),
+        registration(&spec, &identity(), Some(&host())).unwrap().to_string()
+    );
+}
+
+#[skuld::test]
+fn host_from_installed_keeps_arguments() {
+    let installed = ScmRegistration {
+        executable: PathBuf::from(r"C:\app\app.exe"),
+        arguments: vec!["--service-host".to_string()],
+        ..build(&simple_spec())
+    };
+
+    assert_eq!(
+        host_from_installed(&installed),
+        HostCommand {
+            exe: PathBuf::from(r"C:\app\app.exe"),
+            args: vec!["--service-host".to_string()],
+        }
     );
 }
 
@@ -153,7 +196,7 @@ fn named_user_account_uses_resolved_identity() {
     let mut spec = managed_spec();
     spec.user = User::Name("bindreams".to_string());
     let id = identity();
-    let reg = registration(&spec, &id, &shim_path()).unwrap();
+    let reg = registration(&spec, &id, Some(&host())).unwrap();
 
     assert_eq!(
         reg.account,
@@ -267,7 +310,7 @@ fn registration_canonicalizes_a_builtin_account() {
     let id = Identity {
         user: "LocalService".to_string(),
     };
-    let reg = registration(&spec, &id, &shim_path()).unwrap();
+    let reg = registration(&spec, &id, Some(&host())).unwrap();
 
     assert_eq!(reg.account, Some(r"NT AUTHORITY\LocalService".to_string()));
 }
@@ -282,7 +325,7 @@ fn registration_for_root_uses_the_default_account_with_an_empty_identity() {
     // the empty-string path an unguarded `canonical_account` would map to
     // `Some("")` (see `windows_builtin("")`'s doc comment).
     let id = Identity { user: String::new() };
-    let reg = registration(&spec, &id, &shim_path()).unwrap();
+    let reg = registration(&spec, &id, Some(&host())).unwrap();
 
     assert_eq!(reg.account, None);
 }
@@ -829,7 +872,7 @@ fn registration_refuses_restart_always() {
             restart: Restart::Always,
             ..spec
         };
-        let err = registration(&spec, &identity(), &shim_path()).expect_err("`restart: always` must be refused");
+        let err = registration(&spec, &identity(), Some(&host())).expect_err("`restart: always` must be refused");
 
         assert!(
             matches!(&err, Error::Invalid { daemon, .. } if daemon.as_str() == "frpc"),
@@ -846,7 +889,7 @@ fn registration_accepts_never_and_on_failure() {
     for restart in [Restart::Never, Restart::OnFailure] {
         for spec in [managed_spec(), simple_spec()] {
             let spec = DaemonSpec { restart, ..spec };
-            registration(&spec, &identity(), &shim_path()).unwrap_or_else(|e| panic!("{restart:?}: {e}"));
+            registration(&spec, &identity(), Some(&host())).unwrap_or_else(|e| panic!("{restart:?}: {e}"));
         }
     }
 }
@@ -857,7 +900,7 @@ fn managed_kind_clamps_absurdly_long_restart_delay() {
     // One millisecond past what a DWORD of milliseconds (SC_ACTION.Delay)
     // can express.
     spec.restart_delay = Some(MAX_SC_ACTION_DELAY + Duration::from_millis(1));
-    let reg = registration(&spec, &identity(), &shim_path()).unwrap();
+    let reg = registration(&spec, &identity(), Some(&host())).unwrap();
 
     let fa = reg
         .failure_actions
@@ -919,7 +962,7 @@ fn rounding_a_restart_delay_up_never_passes_the_scm_maximum() {
 fn managed_kind_restart_delay_within_bound_does_not_clamp() {
     let mut spec = managed_spec();
     spec.restart_delay = Some(Duration::from_secs(42));
-    let reg = registration(&spec, &identity(), &shim_path()).unwrap();
+    let reg = registration(&spec, &identity(), Some(&host())).unwrap();
 
     let fa = reg
         .failure_actions
@@ -950,11 +993,11 @@ fn parameters_round_trip_through_extract() {
 fn display_is_the_generation_invariant() {
     let spec = managed_spec();
     let id = identity();
-    let shim = shim_path();
+    let host = host();
 
-    let original = registration(&spec, &id, &shim).unwrap();
+    let original = registration(&spec, &id, Some(&host)).unwrap();
     let recovered_spec = extract(&original.parameters).unwrap().unwrap().spec;
-    let regenerated = registration(&recovered_spec, &id, &shim).unwrap();
+    let regenerated = registration(&recovered_spec, &id, Some(&host)).unwrap();
 
     assert_eq!(
         original.to_string(),

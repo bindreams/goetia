@@ -4,9 +4,11 @@
 //! `tests/scm_integration.rs` instead.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use super::*;
 use crate::manager::ServiceManager;
+use crate::shim::{CheckPermissions, FolderCheck, HostCommand, ShimProvider};
 use crate::spec::Restart;
 
 fn dummy_reg(account: Option<&str>) -> ScmRegistration {
@@ -561,6 +563,144 @@ fn install_and_preview_install_refuse_restart_always() {
         let err = result.expect_err("`restart: always` must be refused for scm");
         assert!(matches!(err, Error::Invalid { .. }), "{err:?}");
         assert!(err.to_string().contains("restart: always"), "{err}");
+    }
+}
+
+// The shim provider ---------------------------------------------------------------------------------------------------
+
+fn simple_daemon() -> DaemonSpec {
+    DaemonSpec {
+        kind: Kind::Simple,
+        ..DaemonSpec::for_test("frpc", vec![r"C:\bin\frpc.exe".to_string()])
+    }
+}
+
+/// A provider that records the calls it gets and answers with the commands it was given.
+struct Recording {
+    calls: Arc<Mutex<Vec<&'static str>>>,
+    preview: HostCommand,
+    provide: HostCommand,
+}
+
+impl Recording {
+    fn new(preview: HostCommand, provide: HostCommand) -> (Self, Arc<Mutex<Vec<&'static str>>>) {
+        let calls = Arc::default();
+        let provider = Self {
+            calls: Arc::clone(&calls),
+            preview,
+            provide,
+        };
+        (provider, calls)
+    }
+}
+
+impl ShimProvider for Recording {
+    fn preview(&self) -> Result<HostCommand> {
+        self.calls.lock().unwrap().push("preview");
+        Ok(self.preview.clone())
+    }
+
+    fn provide(&self, _folders: &FolderCheck) -> Result<HostCommand> {
+        self.calls.lock().unwrap().push("provide");
+        Ok(self.provide.clone())
+    }
+
+    fn sweep(&self, _referenced: &[PathBuf]) -> Result<()> {
+        self.calls.lock().unwrap().push("sweep");
+        Ok(())
+    }
+}
+
+fn command(exe: impl Into<PathBuf>) -> HostCommand {
+    HostCommand {
+        exe: exe.into(),
+        args: vec![],
+    }
+}
+
+#[skuld::test]
+fn new_has_no_provider() {
+    let mgr = Scm::new();
+
+    let err = mgr.render(&simple_daemon()).expect_err("a simple service needs a host");
+    assert!(matches!(err, Error::NoShimProvider), "{err:?}");
+    mgr.render(&daemon_spec(Restart::Never))
+        .expect("a managed service needs none");
+}
+
+#[skuld::test]
+fn render_names_the_previewed_host_verbatim() {
+    let host = HostCommand {
+        exe: PathBuf::from(r"C:\app\app.exe"),
+        args: vec!["--service-host".to_string()],
+    };
+    let (provider, _) = Recording::new(host.clone(), host.clone());
+    let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
+
+    let reg = mgr.render(&simple_daemon()).unwrap();
+
+    assert_eq!((reg.executable, reg.arguments), (host.exe, host.args));
+}
+
+#[skuld::test]
+fn managed_render_never_touches_the_provider() {
+    let (provider, calls) = Recording::new(command(r"C:\app\app.exe"), command(r"C:\app\app.exe"));
+    let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
+
+    mgr.render(&daemon_spec(Restart::Never)).unwrap();
+
+    assert_eq!(*calls.lock().unwrap(), Vec::<&str>::new());
+}
+
+#[skuld::test]
+fn managed_begin_install_takes_no_lock_and_calls_no_provider() {
+    let (provider, calls) = Recording::new(command(r"C:\app\app.exe"), command(r"C:\app\app.exe"));
+    let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
+
+    mgr.begin_install(&daemon_spec(Restart::Never)).unwrap();
+
+    assert_eq!(*calls.lock().unwrap(), Vec::<&str>::new());
+}
+
+#[skuld::test]
+fn begin_install_refuses_a_provider_that_disagrees() {
+    let dir = tempfile::tempdir().unwrap();
+    let (previewed, provided) = (dir.path().join("previewed.exe"), dir.path().join("provided.exe"));
+    let (provider, _) = Recording::new(command(&previewed), command(&provided));
+    let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
+
+    match mgr.begin_install(&simple_daemon()) {
+        Err(Error::ShimProviderDisagrees {
+            previewed: said,
+            provided: gave,
+        }) => assert_eq!((said, gave), (command(previewed), command(provided))),
+        other => panic!("a provider that provides what it did not preview must be refused, got {other:?}"),
+    }
+}
+
+#[skuld::test]
+fn begin_install_refuses_a_host_with_no_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("host.exe");
+    std::fs::write(&exe, b"not a goetia host").unwrap();
+    let (provider, calls) = Recording::new(command(&exe), command(&exe));
+    let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
+
+    match mgr.begin_install(&simple_daemon()) {
+        Err(Error::ShimMarkerMissing { path }) => assert_eq!(path, exe),
+        other => panic!("a file without the marker is no host, got {other:?}"),
+    }
+    assert_eq!(*calls.lock().unwrap(), ["provide", "preview"]);
+}
+
+#[skuld::test]
+fn begin_install_refuses_a_host_named_by_a_relative_path() {
+    let (provider, _) = Recording::new(command(r"bin\host.exe"), command(r"bin\host.exe"));
+    let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
+
+    match mgr.begin_install(&simple_daemon()) {
+        Err(Error::ShimPathRelative { path }) => assert_eq!(path, PathBuf::from(r"bin\host.exe")),
+        other => panic!("a relative host must be refused, got {other:?}"),
     }
 }
 

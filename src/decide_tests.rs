@@ -407,7 +407,10 @@ fn a_version_difference_wins_over_a_difference_in_recovery_actions() {
     let reg_now = registration(
         &spec,
         &Identity { user: "svc".to_owned() },
-        &PathBuf::from("goetia-shim.exe"),
+        Some(&crate::shim::HostCommand {
+            exe: PathBuf::from("goetia-shim.exe"),
+            args: vec![],
+        }),
     )
     .unwrap();
     assert!(

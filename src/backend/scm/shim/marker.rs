@@ -129,10 +129,6 @@ fn read_retrying(file: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
 /// that names its prefix. A file holding more than one marker (a host that embeds another goetia
 /// host's bytes) is judged by the first.
 #[cfg(windows)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the install path calls it from the shim-provider wiring on")
-)]
 pub(crate) fn verify(host: &Path) -> Result<()> {
     let file = File::open(host).map_err(|e| Error::os_at("open", host, e))?;
     match scan(file, crate::version().len() + 1).map_err(|e| Error::os_at("read", host, e))? {

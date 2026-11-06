@@ -204,6 +204,63 @@ fn external_configuration_is_carried_into_the_outcome() {
     assert!(matches!(forced, Outcome::Stale { .. }), "{forced:?}");
 }
 
+// regenerate ==========================================================================================================
+
+/// A service whose host the provider now names elsewhere is the spec's own, unchanged: judged by
+/// the installed host, it is an `Update` to the new one, never a hand-edit's `Conflict`.
+#[skuld::test]
+fn moved_shim_reads_as_update() {
+    let fake = Fake::new();
+    fake.seed_host("old");
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_host("new");
+
+    let previewed = fake.preview_install(&mk("frpc")).unwrap();
+    let installed = fake.install(&mk("frpc"), false).unwrap();
+
+    assert!(matches!(previewed, Outcome::Update { .. }), "{previewed:?}");
+    assert!(matches!(installed, Outcome::Update { .. }), "{installed:?}");
+}
+
+/// `status` and `list` only check that the stored spec still regenerates, which needs no provider.
+#[skuld::test]
+fn status_and_list_use_regenerate() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_no_provider();
+
+    fake.status(&Id::try_from("frpc").unwrap())
+        .expect("status regenerates, which needs no provider");
+    let listed = fake.list().unwrap();
+
+    assert!(
+        matches!(listed.as_slice(), [Installed::Ours { spec, .. }] if spec.id.as_str() == "frpc"),
+        "{listed:?}"
+    );
+}
+
+/// A name that is no id has no snapshot, so it is reported by that name alone, whatever its spec
+/// would do when regenerated.
+#[skuld::test]
+fn misnamed_entry_is_reported_without_regenerating() {
+    let fake = Fake::new();
+    let name = "not a valid id";
+    fake.seed_foreign(name, generate(&mk_as("frpc", "gone")));
+    fake.seed_unresolvable_account("gone");
+    let invalid = Id::try_from(name).unwrap_err();
+
+    let listed = fake.list().unwrap();
+
+    let [entry @ Installed::OursUnusable { name: got, .. }] = listed.as_slice() else {
+        panic!("one unusable entry expected, got {listed:?}");
+    };
+    assert_eq!(got, name);
+    assert_eq!(
+        entry.unusable_reason(),
+        Some(format!("marked ours, but its name is not a valid daemon id: {invalid}"))
+    );
+}
+
 // status and list =====================================================================================================
 
 #[skuld::test]

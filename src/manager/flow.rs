@@ -40,8 +40,8 @@ fn classify<B: Backend>(b: &B, read: ReadOutcome<B::Snapshot>) -> Found<B::Snaps
     }
 }
 
-/// A marked service's ownership: its embedded spec must name the requested id, and is rendered and
-/// compared with what is installed.
+/// A marked service's ownership: its embedded spec must name the requested id, and is regenerated
+/// against the snapshot and compared with what is installed.
 fn judge<B: Backend>(b: &B, snapshot: &B::Snapshot) -> (Ownership, ExternalConfig) {
     let id = snapshot.id();
     let unusable = |reason, recovery| (Ownership::OursUnusable { reason, recovery }, ExternalConfig::Absent);
@@ -61,7 +61,7 @@ fn judge<B: Backend>(b: &B, snapshot: &B::Snapshot) -> (Ownership, ExternalConfi
             ExternalConfig::Absent,
         );
     }
-    let regenerated = match b.render(&blob.spec) {
+    let regenerated = match b.regenerate(&blob.spec, snapshot) {
         Ok(regenerated) => regenerated.to_string(),
         Err(e) => {
             return unusable(
@@ -183,7 +183,7 @@ pub(crate) fn preview<B: Backend>(b: &B, spec: &DaemonSpec) -> Result<Outcome> {
 pub(crate) fn status<B: Backend>(b: &B, id: &Id) -> Result<Status> {
     let snapshot = owned(b, id)?;
     let blob = snapshot.blob().map_err(|e| Error::Kept(Arc::clone(e)))?;
-    b.render(&blob.spec).map_err(|e| Error::Step {
+    b.regenerate(&blob.spec, &snapshot).map_err(|e| Error::Step {
         what: format!("`{id}`'s embedded spec cannot be regenerated"),
         source: Box::new(e),
     })?;
@@ -212,15 +212,8 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
                 continue;
             }
         };
-        if let Err(e) = b.render(&blob.spec) {
-            out.push(unusable(Reason::because(
-                "marked ours, but its embedded spec cannot be regenerated",
-                e,
-            )));
-            continue;
-        }
-        // One entry's failure must not take down the listing of every other daemon, except that
-        // no manager to ask is every entry's.
+        // A name that is no id has no snapshot to regenerate against, so it is reported by its name
+        // alone.
         let snapshot = match snapshot {
             Ok(snapshot) => snapshot,
             Err(e) => {
@@ -232,6 +225,19 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
                 continue;
             }
         };
+        if let Err(e) = b.regenerate(&blob.spec, snapshot) {
+            // A backend that reads what is installed to regenerate can find the service gone: as
+            // for `live_status`, absence is established and the entry is omitted.
+            if !matches!(e.cause(), Error::NotInstalled { .. }) {
+                out.push(unusable(Reason::because(
+                    "marked ours, but its embedded spec cannot be regenerated",
+                    e,
+                )));
+            }
+            continue;
+        }
+        // One entry's failure must not take down the listing of every other daemon, except that
+        // no manager to ask is every entry's.
         match b.live_status(snapshot) {
             Ok(status) => out.push(Installed::Ours {
                 spec: blob.spec.clone(),

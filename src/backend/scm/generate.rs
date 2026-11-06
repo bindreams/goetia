@@ -36,18 +36,19 @@
 //! argv[0] rule against the real Win32 API) and
 //! `executable_trailing_backslash_does_not_round_trip_through_argv0` (which
 //! documents the residual gap rather than hiding it). In practice this can only
-//! reach `executable` via `shim_path` — `goetia.yaml`'s `command[0]` cannot end
+//! reach `executable` via a `HostCommand` — `goetia.yaml`'s `command[0]` cannot end
 //! in a backslash at all as of the injection gate's odd-trailing-backslash
 //! rejection (systemd reads a trailing `\` as a line continuation).
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::backend::Identity;
 use crate::blob::{self, Blob};
 use crate::error::Error;
+use crate::shim::HostCommand;
 use crate::spec::{DaemonSpec, Kind, Restart, User, scm_restart_delay, windows_builtin};
 
 // Metadata field names ================================================================================================
@@ -134,18 +135,21 @@ pub struct FailureActions {
 /// fire at resolve time, from `BackendKind::Scm.warn`, when scm is the native backend.
 ///
 /// `id` is the account already resolved by the effectful install path (see
-/// [`Identity`]) — this function does no lookup of its own. `shim_path` is
-/// only used for `Kind::Simple`, where the shim (not the spec's own command)
-/// is what SCM launches.
+/// [`Identity`]) — this function does no lookup of its own. `host` is
+/// only used for `Kind::Simple`, where the host (not the spec's own command)
+/// is what SCM launches, with the host's own arguments. `None` for a simple
+/// spec is [`Error::NoShimProvider`].
 ///
 /// Refuses `restart: always` with [`Error::Invalid`]: SCM recovery actions never fire after a
 /// clean exit, so the registration could only run on-failure semantics.
-pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> Result<ScmRegistration, Error> {
+pub fn registration(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>) -> Result<ScmRegistration, Error> {
     let (executable, arguments) = match spec.kind {
-        // SCM only ever launches the shim, with the daemon id as its sole
-        // argument; the shim spawns the daemon once. The spec's own command
-        // never appears here.
-        Kind::Simple => (shim_path.to_path_buf(), vec![spec.id.as_str().to_string()]),
+        // SCM only ever launches the host, which learns the service's name from SCM and spawns the
+        // daemon once. The spec's own command never appears here.
+        Kind::Simple => {
+            let host = host.ok_or(Error::NoShimProvider)?;
+            (host.exe.clone(), host.args.clone())
+        }
         Kind::Managed => {
             let mut argv = spec.command.iter();
             let executable = PathBuf::from(
@@ -222,6 +226,16 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> Resul
         environment,
         parameters,
     })
+}
+
+/// The host command a `Kind::Simple` registration as installed names, which a regeneration keeps so
+/// that a host moved, replaced or provided by another program is not a difference of the spec.
+#[cfg_attr(not(windows), allow(dead_code, reason = "only the Windows manager regenerates"))]
+pub(crate) fn host_from_installed(installed: &ScmRegistration) -> HostCommand {
+    HostCommand {
+        exe: installed.executable.clone(),
+        args: installed.arguments.clone(),
+    }
 }
 
 /// `env` as the `REG_MULTI_SZ` lines `Services\<name>\Environment` needs: the format SCM reads

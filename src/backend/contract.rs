@@ -64,6 +64,15 @@ pub(crate) trait Backend {
     /// does not resolve).
     fn render(&self, spec: &DaemonSpec) -> Result<Self::Definition>;
 
+    /// `spec` as `render` would write it, judged against `snapshot`: what `judge`, `status` and
+    /// `list` regenerate from a stored spec. A backend whose rendering depends on something that
+    /// outlives the install (SCM's service host, which a provider may place elsewhere later) keeps
+    /// that part from what is installed, so the comparison is of the spec alone. `install` and
+    /// `preview_install` still `render` the desired definition.
+    fn regenerate(&self, spec: &DaemonSpec, _snapshot: &Self::Snapshot) -> Result<Self::Definition> {
+        self.render(spec)
+    }
+
     /// What is at `id`. `Err` where the read did not complete: neither absence nor ownership is
     /// established.
     fn read(&self, id: &Id) -> Result<ReadOutcome<Self::Snapshot>>;

@@ -7,11 +7,9 @@
 //! that do every restart (`restart_integration`).
 //!
 //! Every test here registers and removes real Windows services and needs
-//! `CARGO_BIN_EXE_goetia-shim` — see `main` below for how `GOETIA_SHIM_PATH`
-//! is set once, before any test runs, so
-//! `goetia::backend::scm::manager::shim_path` resolves the real shim binary
-//! rather than guessing from this test binary's own (wrong, for a shim)
-//! `current_exe`.
+//! `CARGO_BIN_EXE_goetia-shim`: `common::manager()` hands it to the manager as a `StandaloneShim`,
+//! since `current_exe()` from inside this test binary is `target/<profile>/deps/<...>.exe`, whose
+//! sibling directory never holds a shim.
 
 #[path = "support/mod.rs"]
 mod support;
@@ -41,18 +39,6 @@ mod supervisor_integration;
 fn main() {
     #[cfg(windows)]
     {
-        // Set once, here, strictly before `skuld::run_all()` spawns any test
-        // thread — a single write with a happens-before edge to every
-        // reader, not the per-test mutation `identity::service_password`'s
-        // doc comment (and `tests/scm_integration/install_helper.rs`'s)
-        // explains `std::env::set_var` cannot safely do. See
-        // `backend::scm::manager::shim_path`'s own doc comment for why this
-        // env var exists at all: `current_exe()` from inside this test
-        // binary resolves to `target/<profile>/deps/<...>.exe`, whose
-        // sibling directory never contains `goetia-shim.exe`.
-        unsafe {
-            std::env::set_var("GOETIA_SHIM_PATH", env!("CARGO_BIN_EXE_goetia-shim"));
-        }
         if fixture::run_if_requested() {
             return;
         }

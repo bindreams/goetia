@@ -9,7 +9,7 @@
 //! ## The five traps this module addresses
 //!
 //! **1. Ownership has only one proof for `type: managed`.** `type: simple`'s
-//! `ImagePath` (`goetia-shim.exe <id>`, written atomically by `CreateServiceW`)
+//! `ImagePath` (the service host's command, written atomically by `CreateServiceW`)
 //! is a second proof of ownership independent of `Parameters`; `type: managed`'s
 //! `ImagePath` is just the daemon's own command, indistinguishable from any
 //! other service that happens to run the same executable, so it cannot serve
@@ -110,6 +110,9 @@ use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use super::wait::Waited;
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
+use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
+use crate::backend::scm::shim::marker;
+use crate::backend::scm::shim::provider::{NoShim, ShimProvider};
 use crate::backend::{
     Backend, Decoded, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
 };
@@ -121,15 +124,36 @@ use crate::spec::{DaemonSpec, Id, Kind};
 
 // Scm =================================================================================================================
 
-/// The Windows service manager. Holds no state of its own —
-/// every operation opens exactly the SCM/registry handles it needs and
-/// closes them again.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct Scm;
+/// The Windows service manager. Holds no state of its own — every operation opens exactly the
+/// SCM/registry handles it needs and closes them again — only the source of `type: simple`
+/// services' host and the check on the folder it lives in.
+pub struct Scm {
+    shim: Box<dyn ShimProvider>,
+    folders: FolderCheck,
+}
 
 impl Scm {
+    /// A manager with no shim provider: `type: managed` services work, a `type: simple` one cannot
+    /// be installed or previewed ([`Error::NoShimProvider`]), and `status` and `list` judge what is
+    /// installed without one.
     pub fn new() -> Self {
-        Self
+        Self::with_shim(NoShim, CheckPermissions::Enable)
+    }
+
+    /// A manager whose `type: simple` services run the host `provider` supplies. `check` says
+    /// whether the folder of what `provider` returns is checked for permissions that would let
+    /// another account replace it.
+    pub fn with_shim(provider: impl ShimProvider + 'static, check: CheckPermissions) -> Self {
+        Self {
+            shim: Box::new(provider),
+            folders: FolderCheck::new(check),
+        }
+    }
+}
+
+impl Default for Scm {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -192,6 +216,15 @@ impl ScmSnapshot {
         }
     }
 
+    /// The registration the service has now, and its start type.
+    fn live_registration(&self) -> Result<(ScmRegistration, ServiceStartType)> {
+        let id = &self.id;
+        let context = format!("open `{id}` to read its configuration");
+        self.ask(ServiceAccess::QUERY_CONFIG, &context, |service| {
+            read_live_registration(service, id.as_str(), &self.parameters)
+        })
+    }
+
     /// The id, with the service `read` opened closed: a verb that deletes the service, or waits on
     /// it through a handle of its own, must not leave this one open.
     fn into_id(self) -> Id {
@@ -205,8 +238,28 @@ impl Backend for Scm {
     type InstallScope = ();
     type Reservation = ();
 
-    /// SCM has nothing to hold across an install: its preconditions are `apply`'s, before any write.
-    fn begin_install(&self, _spec: &DaemonSpec) -> Result<()> {
+    /// For `type: simple`, the host is provided and checked before anything is read: `provide`
+    /// must return what `preview` names (which is what `render` registers), an absolute path whose
+    /// folder passes the folder check, to a file carrying this library's marker. `type: managed`
+    /// has no host, so nothing is held or checked: its preconditions are `apply`'s, before any
+    /// write.
+    fn begin_install(&self, spec: &DaemonSpec) -> Result<()> {
+        if spec.kind == Kind::Simple {
+            let provided = self.shim.provide(&self.folders)?;
+            let previewed = self.shim.preview()?;
+            if provided != previewed {
+                return Err(Error::ShimProviderDisagrees { previewed, provided });
+            }
+            let folder = provided
+                .exe
+                .parent()
+                .filter(|folder| folder.is_absolute())
+                .ok_or_else(|| Error::ShimPathRelative {
+                    path: provided.exe.clone(),
+                })?;
+            self.folders.check(folder)?;
+            marker::verify(&provided.exe)?;
+        }
         Ok(())
     }
 
@@ -217,7 +270,23 @@ impl Backend for Scm {
 
     fn render(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
         let identity = identity::resolve(&spec.user)?;
-        generate::registration(spec, &identity, &shim_path())
+        let host = match spec.kind {
+            Kind::Simple => Some(self.shim.preview()?),
+            Kind::Managed => None,
+        };
+        generate::registration(spec, &identity, host.as_ref())
+    }
+
+    /// Keeps the host command a `type: simple` service is installed with, so that a host another
+    /// provider (a moved folder, another goetia version, a standalone host) put there is the same
+    /// spec, and no provider is consulted. `type: managed` has no host.
+    fn regenerate(&self, spec: &DaemonSpec, snapshot: &ScmSnapshot) -> Result<ScmRegistration> {
+        if spec.kind == Kind::Managed {
+            return self.render(spec);
+        }
+        let identity = identity::resolve(&spec.user)?;
+        let (installed, _) = snapshot.live_registration()?;
+        generate::registration(spec, &identity, Some(&generate::host_from_installed(&installed)))
     }
 
     /// Upstream of the marker, so a service that will not open leaves `id` undetermined: neither
@@ -234,11 +303,7 @@ impl Backend for Scm {
 
     /// SCM has no drop-in mechanism: everything goetia writes lives under the service's own key.
     fn installed(&self, snapshot: &ScmSnapshot) -> Result<InstalledDefinition<ScmRegistration>> {
-        let id = snapshot.id();
-        let context = format!("open `{id}` to read its configuration");
-        let (definition, _) = snapshot.ask(ServiceAccess::QUERY_CONFIG, &context, |service| {
-            read_live_registration(service, id.as_str(), &snapshot.parameters)
-        })?;
+        let (definition, _) = snapshot.live_registration()?;
         Ok(InstalledDefinition {
             definition,
             external: ExternalConfig::Absent,
@@ -445,30 +510,6 @@ fn failed_start(id: &Id, e: std::io::Error, unreadable: Option<Arc<Error>>) -> E
             source: Box::new(failed),
         },
     }
-}
-
-// shim path ===========================================================================================================
-
-/// The shim's expected location: a sibling of the currently running
-/// `goetia` binary. Only consulted for `Kind::Simple` — `generate::registration`
-/// ignores it entirely for `Kind::Managed`.
-///
-/// `GOETIA_SHIM_PATH` overrides this, read fresh on every call rather than
-/// cached. Production `goetia.exe` never sets it, so it always falls
-/// through to the sibling-of-`current_exe` heuristic below — appropriate
-/// for the `cargo install`-style layout the design's "Windows shim path"
-/// open item describes, where both binaries land in the same directory.
-/// `tests/shim_integration.rs`'s own `main` sets it once, before any test
-/// runs — see that file's doc comment for why a plain `current_exe()`-based
-/// guess cannot find the shim binary from inside a test crate.
-fn shim_path() -> PathBuf {
-    if let Some(overridden) = std::env::var_os("GOETIA_SHIM_PATH") {
-        return PathBuf::from(overridden);
-    }
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|dir| dir.join("goetia-shim.exe")))
-        .unwrap_or_else(|| PathBuf::from("goetia-shim.exe"))
 }
 
 /// Read back everything `ScmRegistration`'s `Display` text needs from the service actually
