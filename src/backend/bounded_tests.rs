@@ -8,14 +8,8 @@ use std::time::Duration;
 use super::*;
 use crate::manager::budget::Budget;
 
-// The integration suites' removal of what a test created; a library test reaches `tests/` only by path.
 #[cfg(target_os = "linux")]
-#[expect(
-    dead_code,
-    reason = "this file uses only `remove_empty_dir_or_warn`; the rest serves the integration suites"
-)]
-#[path = "../../tests/support/cleanup.rs"]
-mod cleanup;
+use super::test_cleanup::remove_empty_dir_or_warn;
 
 /// A reservation holding the temp files one child's streams draw.
 fn files() -> Reservation {
@@ -300,7 +294,7 @@ impl DrainedLeaf {
 impl Drop for DrainedLeaf {
     fn drop(&mut self) {
         if let Some(leaf) = &self.0 {
-            cleanup::remove_empty_dir_or_warn(leaf);
+            remove_empty_dir_or_warn(leaf);
         }
     }
 }

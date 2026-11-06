@@ -13,14 +13,7 @@ use crate::backend::client::{Client, ClientError, Real};
 use crate::manager::ServiceManager;
 use crate::spec::{Id, Kind, Restart, User};
 
-// The integration suites' removal of what a test created; a library test reaches `tests/` only by path.
-#[expect(
-    dead_code,
-    reason = "this file uses `FileGuard` and `remove_or_warn`; `DirGuard` serves the other suites"
-)]
-#[path = "../../../tests/support/cleanup.rs"]
-mod cleanup;
-use cleanup::{FileGuard, remove_or_warn};
+use crate::backend::test_cleanup::{FileGuard, remove_or_warn};
 
 fn sample_plist(id: &str) -> String {
     sample_plist_restarting(id, Restart::Never)

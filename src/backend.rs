@@ -19,6 +19,12 @@ pub mod launchd;
 pub mod scm;
 pub mod systemd;
 
+/// The integration suites' removal of what a test created, shared with the library's unit tests;
+/// they reach `tests/` only by path, and each module that included it itself would load it twice.
+#[cfg(all(test, unix))]
+#[path = "../tests/support/cleanup.rs"]
+pub(crate) mod test_cleanup;
+
 pub(crate) use contract::{
     Backend, Decoded, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, Unnamed,
     WriteOutcome,

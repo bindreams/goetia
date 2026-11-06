@@ -6,7 +6,7 @@
 //!
 //! Most of these are elevated (they write real files under `/etc/systemd/system`), so they opt into
 //! the same `elevated` precondition/label convention `tests/support/mod.rs` uses. Only
-//! `tests/support/cleanup.rs` is shared, included through `#[path]`: it is self-contained. The
+//! `tests/support/cleanup.rs` is shared, as `backend::test_cleanup`: it is self-contained. The
 //! `elevated` convention stays a local copy, because `tests/support/mod.rs` is a module of the
 //! integration-test crate and pulls in the rest of it (`cmd`, `service_guard`, ...).
 
@@ -21,10 +21,7 @@ use crate::manager::ServiceManager;
 use crate::manager::conformance::fresh_id;
 use crate::spec::Kind;
 
-// The integration suites' removal of what a test created; a library test reaches `tests/` only by path.
-#[path = "../../../tests/support/cleanup.rs"]
-mod cleanup;
-use cleanup::{DirGuard, FileGuard, remove_or_warn};
+use crate::backend::test_cleanup::{DirGuard, FileGuard, remove_or_warn};
 
 #[skuld::label]
 const ELEVATED: skuld::Label;
