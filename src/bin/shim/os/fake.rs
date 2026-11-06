@@ -37,18 +37,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// An operation the `Fake` counts, whether or not it was given a reply.
+/// An operation the `Fake` counts, whether or not it was given a reply. Only the ones a test reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Op {
     Spawn,
-    Thread,
-    Append,
-    EventLog,
-    Containment,
-    Wait,
-    Kill,
     KillTree,
-    Detach,
 }
 
 /// What a [`Spawned::wait`] does.
@@ -236,12 +229,10 @@ impl Instance {
 
 impl Spawned for Instance {
     fn containment(&self) -> Containment {
-        self.fake.count(Op::Containment);
         lock(&self.proc.state).containment
     }
 
     fn wait(&self) -> Result<ExitStatus, cosca::error::Error> {
-        self.fake.count(Op::Wait);
         let reply = lock(&self.proc.state).waits.pop_front();
         match reply {
             None => self.unstated("wait"),
@@ -257,7 +248,6 @@ impl Spawned for Instance {
     }
 
     fn kill(&self) -> Result<(), cosca::error::Error> {
-        self.fake.count(Op::Kill);
         let reply = lock(&self.proc.state).kills.pop_front();
         self.kill_with("kill", reply)
     }
@@ -269,7 +259,6 @@ impl Spawned for Instance {
     }
 
     fn detach(mut self: Box<Self>) {
-        self.fake.count(Op::Detach);
         self.detached = true;
         lock(&self.proc.state).detached = true;
     }
@@ -294,6 +283,8 @@ enum ThreadEnd {
     Running,
     Ended(WaiterEnd),
     Read,
+    /// The OS refused the thread after the `Fake` allowed it: it has no end to read.
+    NeverSpawned,
 }
 
 #[derive(Default)]
@@ -313,6 +304,9 @@ struct State {
 struct Shared {
     state: Mutex<State>,
     thread_ended: Condvar,
+    /// The default log directory of the `Fake`'s `Log`: inside the `FakeGuard`'s temporary directory,
+    /// because `build_command` really opens `Log::daemon_log_path`.
+    logs_dir: PathBuf,
 }
 
 impl Shared {
@@ -331,16 +325,25 @@ pub(crate) struct Fake {
 /// The test's owner of a [`Fake`]: not `Clone`, so its drop is the end of the test. It ends every
 /// process, so a waiter thread the supervisor detached returns, and fails the test on whatever
 /// [`Fake`] says went unstated or unread, unless the test is already panicking.
-pub(crate) struct FakeGuard(Fake);
+pub(crate) struct FakeGuard {
+    fake: Fake,
+    /// Removed with the guard, whatever the test did in it.
+    _dir: tempfile::TempDir,
+}
 
 impl FakeGuard {
     pub(crate) fn new() -> FakeGuard {
-        FakeGuard(Fake {
-            shared: Arc::new(Shared {
-                state: Mutex::new(State::default()),
-                thread_ended: Condvar::new(),
-            }),
-        })
+        let dir = tempfile::tempdir().expect("a temporary directory for the Fake's log files");
+        FakeGuard {
+            fake: Fake {
+                shared: Arc::new(Shared {
+                    state: Mutex::new(State::default()),
+                    thread_ended: Condvar::new(),
+                    logs_dir: dir.path().join("logs"),
+                }),
+            },
+            _dir: dir,
+        }
     }
 }
 
@@ -348,18 +351,18 @@ impl Deref for FakeGuard {
     type Target = Fake;
 
     fn deref(&self) -> &Fake {
-        &self.0
+        &self.fake
     }
 }
 
 impl Drop for FakeGuard {
     fn drop(&mut self) {
-        let processes = lock(&self.0.shared.state).processes.clone();
+        let processes = lock(&self.fake.shared.state).processes.clone();
         for process in &processes {
             process.end(status(1));
         }
         if !std::thread::panicking() {
-            self.0.assert_spent(&processes);
+            self.fake.assert_spent(&processes);
         }
     }
 }
@@ -373,10 +376,10 @@ impl Fake {
         Arc::new(self.clone())
     }
 
-    /// A `Log` over this `Fake`'s channels. Nothing is written to a file, so its default log
-    /// directory is a name only.
+    /// A `Log` over this `Fake`'s channels, whose default log directory is inside the
+    /// [`FakeGuard`]'s temporary directory. The channels write no file; `build_command` does.
     pub(crate) fn log(&self) -> Arc<Log> {
-        Arc::new(Log::new(self.channels(), PathBuf::from("default-logs")))
+        Arc::new(Log::new(self.channels(), self.shared.logs_dir.clone()))
     }
 
     // Tables ----------------------------------------------------------------------------------------------------------
@@ -427,6 +430,10 @@ impl Fake {
             .unwrap_or_else(PoisonError::into_inner);
         let end = match state.thread_ends.get_mut(n) {
             Some(end @ ThreadEnd::Ended(_)) => std::mem::replace(end, ThreadEnd::Read),
+            Some(ThreadEnd::NeverSpawned) => {
+                drop(state);
+                panic!("thread {n} was never spawned: the OS refused it");
+            }
             Some(_) => {
                 drop(state);
                 panic!("thread {n}'s end was already read");
@@ -497,7 +504,7 @@ impl Fake {
                 problems.push(format!("Event Log lines never read: {unread:?}"));
             }
             let unread_ends: Vec<usize> = (0..state.thread_ends.len())
-                .filter(|&n| !matches!(state.thread_ends[n], ThreadEnd::Read))
+                .filter(|&n| !matches!(state.thread_ends[n], ThreadEnd::Read | ThreadEnd::NeverSpawned))
                 .collect();
             if !unread_ends.is_empty() {
                 problems.push(format!("waiter threads whose end was never read: {unread_ends:?}"));
@@ -547,7 +554,6 @@ impl Os for Fake {
     fn thread(&self, name: &str, f: Box<dyn FnOnce() + Send>) -> io::Result<JoinHandle<()>> {
         let index = {
             let mut state = lock(&self.shared.state);
-            *state.calls.entry(Op::Thread).or_default() += 1;
             match state.threads.pop_front() {
                 None => {
                     state.unstated.push("thread".to_string());
@@ -564,10 +570,15 @@ impl Os for Fake {
             panic!("unstated call: thread")
         };
         let shared = Arc::clone(&self.shared);
-        std::thread::Builder::new().name(name.to_string()).spawn(move || {
+        let spawned = std::thread::Builder::new().name(name.to_string()).spawn(move || {
             let _end = ThreadExit { shared, index };
             f();
-        })
+        });
+        if spawned.is_err() {
+            lock(&self.shared.state).thread_ends[index] = ThreadEnd::NeverSpawned;
+            self.shared.thread_ended.notify_all();
+        }
+        spawned
     }
 }
 
@@ -593,7 +604,6 @@ impl Drop for ThreadExit {
 impl Channels for Fake {
     fn append(&self, path: &Path, line: &str) -> io::Result<()> {
         let mut state = lock(&self.shared.state);
-        *state.calls.entry(Op::Append).or_default() += 1;
         let failing = match state.append_failures.iter().position(|failing| failing == path) {
             Some(i) => {
                 state.append_failures.remove(i);
@@ -615,7 +625,6 @@ impl Channels for Fake {
 
     fn event_log(&self, severity: Severity, line: &str) {
         let mut state = lock(&self.shared.state);
-        *state.calls.entry(Op::EventLog).or_default() += 1;
         state.channel_calls.push(ChannelCall::EventLog {
             severity,
             line: line.to_string(),

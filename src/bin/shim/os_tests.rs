@@ -5,14 +5,21 @@
 //! The Event Log half of `Real` is covered by the shim integration tests: a unit test never writes
 //! the real Event Log.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead as _, BufReader};
 use std::os::windows::io::OwnedHandle;
+use std::path::PathBuf;
 
 use cosca::identity::{Liveness, Resolved};
 use cosca::{Process, Stdio};
+use goetia::spec::DaemonSpec;
+use skuld::temp_dir;
 
 use super::*;
+use crate::os::fake::FakeGuard;
+use crate::service::build_command;
+use crate::test_support::daemon_spec;
 
 /// Holds a real daemon and ends its tree when dropped, so a failing test leaves no sleeper behind.
 /// Made before the spawn it will hold.
@@ -89,17 +96,72 @@ fn a_spawn_of_a_missing_binary_is_refused_as_not_found() {
         .expect("the binary does not exist");
 
     assert!(
-        matches!(&refused, cosca::error::Error::Io(e) if e.kind() == io::ErrorKind::NotFound),
+        matches!(&refused, cosca::error::Error::Io(e) if e.kind() == io::ErrorKind::NotFound && e.raw_os_error().is_none()),
         "{refused:?}"
     );
+}
+
+// build_command -------------------------------------------------------------------------------------------------------
+
+const ID: &str = "goetia-shim-os-test";
+
+/// `dir` without the `\\?\` prefix `skuld::temp_dir` returns (it canonicalizes): `CreateProcess`
+/// rejects a verbatim working directory.
+fn plain(dir: &Path) -> PathBuf {
+    dir.to_str()
+        .and_then(|dir| dir.strip_prefix(r"\\?\"))
+        .map_or_else(|| dir.to_path_buf(), PathBuf::from)
+}
+
+/// What `build_command` sets up, observed from a real daemon spawned through `Real`: the Job Object
+/// `StopBus` kills the tree through, stdout and stderr both in `spec.logs`, `cwd` and `env`. The
+/// daemon prints its working directory and the variable, writes a line to stderr and exits.
+#[skuld::test]
+fn build_command_makes_a_job_contained_daemon_with_its_cwd_env_and_log(#[fixture(temp_dir)] dir: &Path) {
+    const CWD_LEAF: &str = "goetia-cwd-probe";
+    let fake = FakeGuard::new();
+    let cwd = plain(dir).join(CWD_LEAF);
+    std::fs::create_dir(&cwd).expect("the daemon's working directory");
+    let logs = dir.join("daemon.log");
+    let command = [
+        "powershell",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "(Get-Location).Path; $env:GOETIA_TEST_VAR; [Console]::Error.WriteLine('to-stderr')",
+    ];
+    let spec = DaemonSpec {
+        cwd: Some(cwd.clone()),
+        env: BTreeMap::from([("GOETIA_TEST_VAR".to_string(), "from-spec".to_string())]),
+        logs: Some(logs.clone()),
+        ..daemon_spec::spec(ID, command.map(str::to_string).to_vec())
+    };
+    let mut reap = Reap::default();
+
+    let daemon = reap.hold(
+        Real.spawn(build_command(&spec, &fake.log(), ID))
+            .expect("spawn the daemon"),
+    );
+    let contained = daemon.containment();
+    daemon.wait().expect("the daemon exits");
+
+    assert_eq!(contained, Containment::JobObject);
+    let log = std::fs::read_to_string(&logs).expect("the daemon's log");
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 3, "stdout then stderr, nothing else: {log:?}");
+    assert!(
+        lines[0].ends_with(CWD_LEAF),
+        "the daemon ran outside its `cwd`: {log:?}"
+    );
+    assert_eq!(lines[1], "from-spec", "the daemon did not get its `env`: {log:?}");
+    assert_eq!(lines[2], "to-stderr", "stderr is not in the daemon's log: {log:?}");
 }
 
 // Channels ------------------------------------------------------------------------------------------------------------
 
 #[skuld::test]
-fn append_creates_missing_directories_and_writes_the_line() {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    let path = dir.path().join("Goetia").join("logs").join("x.log");
+fn append_creates_missing_directories_and_writes_the_line(#[fixture(temp_dir)] dir: &Path) {
+    let path = dir.join("Goetia").join("logs").join("x.log");
 
     Real.append(&path, "the line").expect("append");
 
@@ -110,9 +172,8 @@ fn append_creates_missing_directories_and_writes_the_line() {
 }
 
 #[skuld::test]
-fn append_appends_rather_than_truncates() {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    let path = dir.path().join("x.log");
+fn append_appends_rather_than_truncates(#[fixture(temp_dir)] dir: &Path) {
+    let path = dir.join("x.log");
 
     Real.append(&path, "first").expect("append");
     Real.append(&path, "second").expect("append");
@@ -124,9 +185,8 @@ fn append_appends_rather_than_truncates() {
 }
 
 #[skuld::test]
-fn append_fails_and_writes_nothing_when_the_path_cannot_be_opened() {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    let file = dir.path().join("a-file");
+fn append_fails_and_writes_nothing_when_the_path_cannot_be_opened(#[fixture(temp_dir)] dir: &Path) {
+    let file = dir.join("a-file");
     std::fs::write(&file, "x").expect("a regular file to use as a parent");
 
     // A directory cannot be created under a regular file.

@@ -5,6 +5,11 @@ use std::sync::Arc;
 use crate::os::fake::{Fake, KILL_REFUSED};
 use crate::stop_bus::StopBus;
 
+// The shim is its own crate and cannot reach `DaemonSpec::for_test`; share the integration suites'
+// constructor.
+#[path = "../../../tests/support/daemon_spec.rs"]
+pub(crate) mod daemon_spec;
+
 /// A bus over `fake`'s `Os` and `Log`: the supervisor under test.
 pub(crate) fn bus(fake: &Fake) -> Arc<StopBus> {
     Arc::new(StopBus::new(fake.os(), fake.log()))
