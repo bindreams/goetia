@@ -193,13 +193,10 @@ fn environment_lines(value: Option<RawValue>) -> Vec<String> {
         return vec![format!("(value of type {}, not REG_MULTI_SZ)", type_name(value.vtype))];
     }
 
-    let units: Vec<u16> = value
-        .bytes
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-        .collect();
+    let (pairs, remainder) = value.bytes.as_chunks::<2>();
+    let units: Vec<u16> = pairs.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
     let mut problems = Vec::new();
-    if let [last] = value.bytes.chunks_exact(2).remainder() {
+    if let [last] = remainder {
         problems.push(format!("a trailing odd byte 0x{last:02X}"));
     }
     let body = match units.as_slice() {
