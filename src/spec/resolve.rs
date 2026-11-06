@@ -94,6 +94,7 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
     // place that makes the guarantee.
     let base_dir = absolutize(base_dir, &mut warnings)?;
     let base_dir = base_dir.as_path();
+    check_base_dir(&raw.id, base_dir)?;
 
     // Step 1: the id. Before `Id::try_from`, whose charset excludes `$` and would answer first
     // with a generic message.
@@ -256,52 +257,35 @@ fn resolve_shape(id: &Id, raw: RawSpec, base_dir: &Path) -> Result<(ShapedSpec, 
 
     let mut warnings = Vec::new();
 
-    // The field rules run here on the authored values, before any join or resolution, in the
-    // order a manifest's defects have always been reported; `check_fields` runs the same rules
-    // again, in `DaemonSpec::new`, on the final values. Every backend's merged spec passes
-    // through this, including the non-native ones that never become a `DaemonSpec`: a newline in
-    // `scm`'s env must be caught from Linux too.
     let name = raw.name.unwrap_or_else(|| id.as_str().to_string());
-    check_name(id, &name)?;
+    let user = resolve_user(raw.user);
 
-    // An absent or empty `command` is incomplete, not invalid: a native override may supply it,
-    // and `require_complete` reports the miss with the backend named.
+    // The field rules run first, on the authored values, before any join or resolution: the
+    // same function `DaemonSpec::new` runs on the final ones. Every backend's merged spec passes
+    // through this, including the non-native ones that never become a `DaemonSpec`: a newline in
+    // `scm`'s env must be caught from Linux too. An absent or empty `command` is incomplete, not
+    // invalid: a native override may supply it, and `require_complete` reports the miss with the
+    // backend named.
+    check_field_values(
+        id,
+        &FieldValues {
+            name: &name,
+            command: raw.command.as_deref(),
+            cwd: raw.cwd.as_deref().map(Path::new),
+            logs: raw.logs.as_deref().map(Path::new),
+            env: &raw.env,
+            user: &user,
+        },
+        Phase::Authored,
+    )?;
+
     let mut command = raw.command;
-    if let Some(command) = &command {
-        check_command_args(id, command)?;
-    }
-    // The empty-path checks run before the join: an empty path joined to `base_dir` is
-    // `base_dir`.
     if let Some(first) = command.as_mut().and_then(|c| c.first_mut()) {
-        reject_empty(id, "command[0]", first)?;
         *first = resolve_path_string(id, "command", first, base_dir, &mut warnings)?;
     }
-
     let cwd = resolve_optional_path(id, "cwd", raw.cwd, base_dir, &mut warnings)?;
     let logs = resolve_optional_path(id, "logs", raw.logs, base_dir, &mut warnings)?;
-
-    let mut env = BTreeMap::new();
-    for (key, value) in raw.env {
-        // Checked here so it runs for every backend: `scm: {env: {"${K}": v}}` must be caught
-        // from Linux too. Steps 3 and 4 run this before `interpolate::spec` sees the spec, which
-        // keeps its own copy so that it does not depend on that order.
-        if interpolate::would_substitution_change(&key) {
-            return Err(invalid(id, interpolate::ENV_NAME_MESSAGE));
-        }
-        check_env_entry(id, &key, &value)?;
-        env.insert(key, value);
-    }
-
-    let user = resolve_user(raw.user);
-    if let User::Id(AccountId::Sid(s)) = &user {
-        // Same reason as the `env`-name rule above, and `interpolate::spec` likewise keeps its
-        // own copy. `${S}` trims to `${S}`, never empty, so this and `check_user`'s blank check
-        // can never both fire on one value.
-        if interpolate::would_substitution_change(s) {
-            return Err(invalid(id, interpolate::USER_ID_MESSAGE));
-        }
-    }
-    check_user(id, &user)?;
+    let env = raw.env;
 
     let restart = shape(id, raw.restart, parse_restart)?;
     let restart_delay = shape(id, raw.restart_delay, parse_restart_delay)?;
@@ -382,9 +366,9 @@ fn require_complete(shaped: ShapedSpec, backend: Option<BackendKind>) -> Result<
         Shaped::Absent => Kind::Simple,
     };
 
-    // `resolve_shape` ran the field rules on the authored values, so this refuses only what
-    // joining to the manifest directory introduced (a control character, a trailing backslash or
-    // invalid UTF-8 in that directory); it is what makes the result a `DaemonSpec`.
+    // `resolve_shape` ran the field rules on the authored values and `resolve_as` checked the
+    // manifest directory, so this refuses nothing a manifest can cause; it is what makes the
+    // result a `DaemonSpec`.
     DaemonSpec::new(DaemonFields {
         id,
         name,
@@ -473,15 +457,8 @@ fn resolve_optional_path(
     base_dir: &Path,
     warnings: &mut Vec<Warning>,
 ) -> Result<Option<PathBuf>, Error> {
-    match raw {
-        Some(s) => {
-            check_path_text(id, field, &s)?;
-            Ok(Some(PathBuf::from(resolve_path_string(
-                id, field, &s, base_dir, warnings,
-            )?)))
-        }
-        None => Ok(None),
-    }
+    raw.map(|s| resolve_path_string(id, field, &s, base_dir, warnings).map(PathBuf::from))
+        .transpose()
 }
 
 /// Join a relative path against `base_dir`; leave an absolute path as-is.
@@ -536,7 +513,17 @@ fn resolve_path_string(
         resolved
     };
     debug_assert!(joined.is_absolute(), "`std::path::absolute` returned a relative path");
-    Ok(joined.to_string_lossy().into_owned())
+    // `base_dir` and `raw` are UTF-8, so this fails only for a drive-relative path anchored to
+    // a per-drive current directory that is not.
+    joined.to_str().map(str::to_string).ok_or_else(|| {
+        invalid(
+            id,
+            &format!(
+                "field `{field}` is `{raw}`, which resolves to `{}`, which is not valid UTF-8",
+                joined.display()
+            ),
+        )
+    })
 }
 
 /// Make `dir` absolute against the process's working directory.
@@ -594,6 +581,31 @@ fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error>
     };
     debug_assert!(joined.is_absolute(), "`std::path::absolute` returned a relative path");
     Ok(joined)
+}
+
+/// The manifest directory, once, so a path joined to it cannot carry a defect the field rules
+/// would blame on a field the manifest wrote cleanly: it must be valid UTF-8, hold no control
+/// character, and not end in a backslash.
+///
+/// The backslash rule is the field rule unchanged, which is an open owner question: it refuses a
+/// Windows drive or UNC root (`C:\`, `\\srv\share\`), the only form `normalize` leaves ending
+/// in one. `daemon` is the authored `id`, unvalidated, used only to label the error.
+fn check_base_dir(daemon: &str, dir: &Path) -> Result<(), Error> {
+    let invalid = |defect: &str| Error::Invalid {
+        daemon: daemon.to_string(),
+        message: format!("the manifest directory {dir:?} {defect}"),
+        source: None,
+    };
+    let Some(text) = dir.to_str() else {
+        return Err(invalid("is not valid UTF-8"));
+    };
+    if let Some(defect) = control_defect(text) {
+        return Err(invalid(&defect));
+    }
+    if let Some(defect) = trailing_backslash_defect(text) {
+        return Err(invalid(defect));
+    }
+    Ok(())
 }
 
 /// Canonicalise the process's current working directory; see [`absolutize`] for why this value,
@@ -675,22 +687,69 @@ fn normalize(path: &Path) -> PathBuf {
 }
 
 /// The field rules over a finished daemon: the one place they run for a value that becomes a
-/// `DaemonSpec`, called by [`DaemonSpec::new`]. [`resolve_shape`] runs the same `check_*` rules
-/// on the authored values, interleaved with path resolution to keep the order in which defects
-/// are reported.
-///
-/// Beyond the shape-phase rules, this refuses an empty `command`, a relative or non-UTF-8 `cwd`
-/// or `logs`. Paths are checked as strings; a non-UTF-8 one is refused first, so the text is
-/// exact.
+/// `DaemonSpec`, called by [`DaemonSpec::new`]. [`resolve_shape`] runs the same rules, through
+/// [`check_field_values`], on the authored values.
 pub(super) fn check_fields(fields: &DaemonFields) -> Result<(), Error> {
-    let id = &fields.id;
-    check_name(id, &fields.name)?;
+    check_field_values(
+        &fields.id,
+        &FieldValues {
+            name: &fields.name,
+            command: Some(&fields.command),
+            cwd: fields.cwd.as_deref(),
+            logs: fields.logs.as_deref(),
+            env: &fields.env,
+            user: &fields.user,
+        },
+        Phase::Final,
+    )
+}
 
-    reject_empty_command(id, &fields.command)?;
-    check_command_args(id, &fields.command)?;
-    reject_empty(id, "command[0]", &fields.command[0])?;
+/// The values the field rules read, as the caller holds them: authored text, or a finished
+/// daemon's fields. Paths are [`Path`]s so one function takes both.
+struct FieldValues<'a> {
+    name: &'a str,
+    /// `None` only while authored: the manifest may leave `command` to a native override.
+    command: Option<&'a [String]>,
+    cwd: Option<&'a Path>,
+    logs: Option<&'a Path>,
+    env: &'a BTreeMap<String, String>,
+    user: &'a User,
+}
 
-    for (field, path) in [("cwd", &fields.cwd), ("logs", &fields.logs)] {
+/// Which values [`check_field_values`] is reading. Three rules depend on it, each because the
+/// other phase cannot hold the value it tests.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// What the manifest wrote, before any substitution, join or resolution. May carry `${...}`
+    /// references, a relative path, or no `command`.
+    Authored,
+    /// A finished daemon's fields, after substitution and resolution: `command` is non-empty and
+    /// the paths are absolute, and `$` is ordinary text.
+    Final,
+}
+
+/// Every field rule, in the order a manifest's defects are reported: `name`, `command`, `cwd`,
+/// `logs`, each `env` entry, `user`. The one list; [`resolve_shape`] runs it on the authored
+/// values and [`DaemonSpec::new`] on the final ones.
+///
+/// Beyond the rules both phases share, [`Phase::Authored`] refuses a `${...}` reference where
+/// substitution must not produce one (an `env` key, a `user.id`), and [`Phase::Final`] refuses an
+/// empty `command` and a relative `cwd` or `logs`. A path is checked as text; a non-UTF-8 one is
+/// refused first, so the message is exact.
+fn check_field_values(id: &Id, values: &FieldValues, phase: Phase) -> Result<(), Error> {
+    check_name(id, values.name)?;
+
+    if let Some(command) = values.command {
+        if phase == Phase::Final {
+            reject_empty_command(id, command)?;
+        }
+        check_command_args(id, command)?;
+        if let Some(first) = command.first() {
+            reject_empty(id, "command[0]", first)?;
+        }
+    }
+
+    for (field, path) in [("cwd", values.cwd), ("logs", values.logs)] {
         if let Some(path) = path {
             let Some(text) = path.to_str() else {
                 return Err(invalid(
@@ -702,14 +761,31 @@ pub(super) fn check_fields(fields: &DaemonFields) -> Result<(), Error> {
                 ));
             };
             check_path_text(id, field, text)?;
-            reject_relative_path(id, field, path)?;
+            if phase == Phase::Final {
+                reject_relative_path(id, field, path)?;
+            }
         }
     }
 
-    for (key, value) in &fields.env {
+    for (key, value) in values.env {
+        // Checked for every backend: `scm: {env: {"${K}": v}}` must be caught from Linux too.
+        // `interpolate::spec` keeps its own copy, so it does not depend on this running first.
+        if phase == Phase::Authored && interpolate::would_substitution_change(key) {
+            return Err(invalid(id, interpolate::ENV_NAME_MESSAGE));
+        }
         check_env_entry(id, key, value)?;
     }
-    check_user(id, &fields.user)
+
+    if phase == Phase::Authored {
+        if let User::Id(AccountId::Sid(s)) = values.user {
+            // Same reason as the `env`-name rule above. `${S}` trims to `${S}`, never empty, so
+            // this and `check_user`'s blank check can never both fire on one value.
+            if interpolate::would_substitution_change(s) {
+                return Err(invalid(id, interpolate::USER_ID_MESSAGE));
+            }
+        }
+    }
+    check_user(id, values.user)
 }
 
 fn check_name(id: &Id, name: &str) -> Result<(), Error> {
@@ -766,24 +842,26 @@ fn reject_unemittable(id: &Id, field: &str, value: &str) -> Result<(), Error> {
 }
 
 fn reject_control_chars(id: &Id, field: &str, value: &str) -> Result<(), Error> {
+    match control_defect(value) {
+        Some(defect) => Err(invalid(id, &format!("field `{field}` {defect}"))),
+        None => Ok(()),
+    }
+}
+
+/// How `value` breaks the control-character rule, as a predicate to follow the name of what was
+/// checked; `None` if it does not.
+fn control_defect(value: &str) -> Option<String> {
     if value.chars().any(|c| c.is_control()) {
-        return Err(invalid(
-            id,
-            &format!("field `{field}` contains a control character, which is forbidden"),
-        ));
+        return Some("contains a control character, which is forbidden".to_string());
     }
-    if let Some(c) = value.chars().find(|c| is_xml_noncharacter(*c)) {
-        // `char::is_control()` misses these, but XML 1.0 cannot represent a noncharacter even as
-        // a numeric entity, so one would make the launchd plist unparseable.
-        return Err(invalid(
-            id,
-            &format!(
-                "field `{field}` contains U+{:04X}, a Unicode noncharacter that XML cannot represent",
-                c as u32
-            ),
-        ));
-    }
-    Ok(())
+    // `char::is_control()` misses these, but XML 1.0 cannot represent a noncharacter even as a
+    // numeric entity, so one would make the launchd plist unparseable.
+    value.chars().find(|c| is_xml_noncharacter(*c)).map(|c| {
+        format!(
+            "contains U+{:04X}, a Unicode noncharacter that XML cannot represent",
+            c as u32
+        )
+    })
 }
 
 /// The Unicode noncharacters: `U+FDD0..=U+FDEF`, and the last two code
@@ -799,14 +877,17 @@ fn is_xml_noncharacter(c: char) -> bool {
 /// silently run the daemon as root. Interior backslashes must stay allowed,
 /// or ordinary Windows paths become unexpressible.
 fn reject_trailing_backslash(id: &Id, field: &str, value: &str) -> Result<(), Error> {
-    let trailing = value.len() - value.trim_end_matches('\\').len();
-    if trailing % 2 == 1 {
-        return Err(invalid(
-            id,
-            &format!("field `{field}` ends in a backslash, which systemd reads as a line continuation"),
-        ));
+    match trailing_backslash_defect(value) {
+        Some(defect) => Err(invalid(id, &format!("field `{field}` {defect}"))),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// How `value` breaks the trailing-backslash rule, as a predicate to follow the name of what was
+/// checked; `None` if it does not.
+fn trailing_backslash_defect(value: &str) -> Option<&'static str> {
+    let trailing = value.len() - value.trim_end_matches('\\').len();
+    (trailing % 2 == 1).then_some("ends in a backslash, which systemd reads as a line continuation")
 }
 
 /// `command` must name at least one argv entry.

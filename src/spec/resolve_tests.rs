@@ -181,6 +181,32 @@ fn a_manifest_with_two_defects_reports_the_earlier_field_first() {
     }
 }
 
+#[cfg(unix)]
+#[skuld::test]
+fn a_manifest_directory_that_is_not_valid_utf8_is_refused_by_name() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = PathBuf::from(OsStr::from_bytes(b"/base/\xff"));
+    let msg = resolve(parse_manifest("id: frpc\ncommand: [bin/frpc]\n"), &dir)
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("manifest directory"), "{msg}");
+    assert!(msg.contains("not valid UTF-8"), "{msg}");
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn a_manifest_directory_with_a_newline_is_refused_by_name() {
+    let dir = PathBuf::from("/base/a\nb");
+    let msg = resolve(parse_manifest("id: frpc\ncommand: [bin/frpc]\n"), &dir)
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("manifest directory"), "{msg}");
+    assert!(msg.contains("control character"), "{msg}");
+    assert!(!msg.contains("field `"), "{msg}");
+}
+
 // Resolution ==========================================================================================================
 
 #[skuld::test]
