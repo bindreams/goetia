@@ -119,7 +119,8 @@ winreg = "0.56"
 # (`manager::identity`), `CommandLineToArgvW` for readback (SCM stores
 # `executable`+`arguments` pre-joined into one command line), and
 # `RegQueryValueExW`, which reads an `Environment` value of any type where
-# `winreg` fails on one above `REG_QWORD` (`manager::registry`).
+# `winreg` fails on one above `REG_QWORD` (`manager::registry`), and the owner
+# and DACL reads of the shim folder check (`scm::shim::acl`).
 #
 # The shim (`src/bin/shim/`, same crate/dependency graph — see the
 # `goetia-shim` `[[bin]]` above) adds `Win32_System_EventLog`, the
@@ -133,6 +134,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Authentication_Identity",
+    "Win32_Storage_FileSystem",
     "Win32_System_EventLog",
     "Win32_System_Registry",
     "Win32_System_Services",

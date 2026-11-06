@@ -9,6 +9,7 @@ pub mod decide;
 pub mod diff;
 pub mod error;
 pub mod manager;
+pub mod shim;
 pub mod spec;
 
 #[cfg(test)]

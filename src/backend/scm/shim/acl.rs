@@ -1,0 +1,495 @@
+//! The shim folder check: refuses a folder an account other than SYSTEM, Administrators or
+//! TrustedInstaller could tamper with, since the shim runs as `LocalSystem` and whoever can replace
+//! its file owns the machine.
+//!
+//! The check is a static scan of the owner and DACL of the folder and of every ancestor up to the
+//! volume root, over the folder as given and over its final path (links resolved). [`verdict`]
+//! judges plain data (SIDs as bytes, masks as `u32`) and is unit-tested on every host; reading the
+//! data and [`FolderCheck`] are Windows-only.
+//!
+//! What is judged, per object, nearest the target first:
+//! - an untrusted owner refuses (an owner can always change the DACL);
+//! - a NULL DACL refuses (everyone has every right);
+//! - an allow ACE that applies to the object, granting an untrusted account `WRITE_DAC`,
+//!   `WRITE_OWNER`, `DELETE` or `FILE_DELETE_CHILD`, after generic rights are mapped, refuses.
+//!   Accounts that may only add files are accepted, and inherit-only ACEs grant nothing here;
+//! - deny ACEs are not credited, wherever they stand.
+#![cfg_attr(not(windows), allow(dead_code))]
+
+use std::path::PathBuf;
+
+#[cfg(windows)]
+use std::path::Path;
+
+#[cfg(windows)]
+use crate::backend::scm::manager::identity;
+#[cfg(windows)]
+use crate::error::{Error, Result};
+
+/// A security identifier in its binary form, as `LookupAccountNameW` and `GetAce` return it.
+pub(crate) type Sid = Vec<u8>;
+
+/// The owner and DACL of one filesystem object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObjectSecurity {
+    pub(crate) path: PathBuf,
+    pub(crate) owner: Sid,
+    /// `None` is a NULL DACL, which grants everyone every right.
+    pub(crate) dacl: Option<Vec<Ace>>,
+}
+
+/// An access-control entry that grants or denies a trustee a mask of rights.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Ace {
+    pub(crate) trustee: Sid,
+    pub(crate) mask: u32,
+    /// The ACE header's flags, of which only `INHERIT_ONLY_ACE` is read.
+    pub(crate) flags: u8,
+    pub(crate) allow: bool,
+}
+
+/// The first reason found to refuse a folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Unsafe {
+    pub(crate) path: PathBuf,
+    /// Who holds the right. A SID, not a name: naming it is a lookup, which `verdict` does not make.
+    pub(crate) account: Sid,
+    /// A verb phrase that `{account} can {right} it` completes.
+    pub(crate) right: &'static str,
+}
+
+const INHERIT_ONLY_ACE: u8 = 0x08;
+
+const DELETE: u32 = 0x1_0000;
+const WRITE_DAC: u32 = 0x4_0000;
+const WRITE_OWNER: u32 = 0x8_0000;
+const FILE_DELETE_CHILD: u32 = 0x40;
+
+// `FILE_GENERIC_MAPPING`'s generic rights, and what each maps to on a file or directory.
+const GENERIC_READ: u32 = 0x8000_0000;
+const GENERIC_WRITE: u32 = 0x4000_0000;
+const GENERIC_EXECUTE: u32 = 0x2000_0000;
+const GENERIC_ALL: u32 = 0x1000_0000;
+const FILE_GENERIC_READ: u32 = 0x12_0089;
+const FILE_GENERIC_WRITE: u32 = 0x12_0116;
+const FILE_GENERIC_EXECUTE: u32 = 0x12_00A0;
+const FILE_ALL_ACCESS: u32 = 0x1F_01FF;
+
+/// The rights that let an account replace what is in a folder, in the order they are reported.
+const TAMPERING: [(u32, &str); 4] = [
+    (WRITE_DAC, "change permissions of"),
+    (WRITE_OWNER, "take ownership of"),
+    (DELETE, "delete or rename"),
+    (FILE_DELETE_CHILD, "delete or rename entries in"),
+];
+
+// SIDs ================================================================================================================
+
+/// The binary SID with `authority` as its identifier authority and `subauthorities` after it.
+pub(crate) fn sid_from_parts(authority: u8, subauthorities: &[u32]) -> Sid {
+    let mut sid = vec![1, subauthorities.len() as u8, 0, 0, 0, 0, 0, authority];
+    for sub in subauthorities {
+        sid.extend_from_slice(&sub.to_le_bytes());
+    }
+    sid
+}
+
+fn system() -> Sid {
+    sid_from_parts(5, &[18])
+}
+
+fn administrators() -> Sid {
+    sid_from_parts(5, &[32, 544])
+}
+
+fn trusted_installer() -> Sid {
+    sid_from_parts(5, &[80, 956008885, 3418522649, 1831038044, 1853292631, 2271478464])
+}
+
+fn everyone() -> Sid {
+    sid_from_parts(1, &[0])
+}
+
+/// `S-1-5-32-544`, or `None` when the bytes are not a SID.
+pub(crate) fn sid_text(sid: &[u8]) -> Option<String> {
+    let (&1, &count) = (sid.first()?, sid.get(1)?) else {
+        return None;
+    };
+    let count = usize::from(count);
+    if count > 15 || sid.len() != 8 + 4 * count {
+        return None;
+    }
+    let authority = sid[2..8].iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b));
+    let mut text = if authority < 1 << 32 {
+        format!("S-1-{authority}")
+    } else {
+        format!("S-1-{authority:#x}")
+    };
+    for sub in sid[8..].chunks_exact(4) {
+        text.push('-');
+        text.push_str(&u32::from_le_bytes([sub[0], sub[1], sub[2], sub[3]]).to_string());
+    }
+    Some(text)
+}
+
+/// [`sid_text`], or a description of bytes that are not a SID. What an error names an account by
+/// when `LookupAccountSidW` has no name for it.
+pub(crate) fn sid_string(sid: &[u8]) -> String {
+    sid_text(sid).unwrap_or_else(|| "an invalid SID".to_string())
+}
+
+// verdict =============================================================================================================
+
+/// Judges `chain` (the target first, then outward to the volume root) by the rules in the module
+/// documentation.
+pub(crate) fn verdict(chain: &[ObjectSecurity]) -> std::result::Result<(), Unsafe> {
+    let trusted = [system(), administrators(), trusted_installer()];
+    let is_trusted = |sid: &Sid| trusted.contains(sid);
+    for object in chain {
+        let refuse = |account: &Sid, right: &'static str| Unsafe {
+            path: object.path.clone(),
+            account: account.clone(),
+            right,
+        };
+        if !is_trusted(&object.owner) {
+            return Err(refuse(&object.owner, "own"));
+        }
+        let Some(dacl) = &object.dacl else {
+            return Err(refuse(&everyone(), "do anything to"));
+        };
+        let applying = dacl
+            .iter()
+            .filter(|ace| ace.allow && ace.flags & INHERIT_ONLY_ACE == 0 && !is_trusted(&ace.trustee));
+        for ace in applying {
+            let mask = map_generic(ace.mask);
+            if let Some((_, right)) = TAMPERING.iter().find(|(bit, _)| mask & bit != 0) {
+                return Err(refuse(&ace.trustee, right));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `mask` with each generic right replaced by the file rights it stands for.
+fn map_generic(mask: u32) -> u32 {
+    let mut mapped = mask & !(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL);
+    for (generic, specific) in [
+        (GENERIC_READ, FILE_GENERIC_READ),
+        (GENERIC_WRITE, FILE_GENERIC_WRITE),
+        (GENERIC_EXECUTE, FILE_GENERIC_EXECUTE),
+        (GENERIC_ALL, FILE_ALL_ACCESS),
+    ] {
+        if mask & generic != 0 {
+            mapped |= specific;
+        }
+    }
+    mapped
+}
+
+// FolderCheck =========================================================================================================
+
+/// Whether the manager checks the shim folder's permissions.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckPermissions {
+    Enable,
+    /// For a folder whose protection the caller guarantees some other way. Skips only this check.
+    Disable,
+}
+
+/// Refuses a folder that an account other than SYSTEM, Administrators or TrustedInstaller could
+/// tamper with. See the module documentation for what is judged.
+#[cfg(windows)]
+pub struct FolderCheck {
+    mode: CheckPermissions,
+}
+
+#[cfg(windows)]
+impl FolderCheck {
+    #[expect(dead_code, reason = "the manager holds a check from the shim-provider wiring on")]
+    pub(crate) fn new(mode: CheckPermissions) -> Self {
+        Self { mode }
+    }
+
+    /// `Ok` under [`Disable`](CheckPermissions::Disable), without reading anything. Otherwise
+    /// reads `dir`, which need not exist (its first existing ancestor stands for it), and every
+    /// ancestor, and refuses with [`Error::ShimFolderUnsafe`] naming the first object and account
+    /// found to be unsafe. An object that cannot be read is an error, never a pass.
+    pub fn check(&self, dir: &Path) -> Result<()> {
+        if self.mode == CheckPermissions::Disable {
+            return Ok(());
+        }
+        verdict(&system::read_chain(dir)?).map_err(Unsafe::into_error)
+    }
+}
+
+#[cfg(windows)]
+impl Unsafe {
+    /// The error for this refusal. An account with no name (a deleted one) is written as its SID.
+    fn into_error(self) -> Error {
+        let account = identity::account_name_of_sid(&self.account).unwrap_or_else(|_| sid_string(&self.account));
+        Error::ShimFolderUnsafe {
+            path: self.path,
+            account,
+            right: self.right,
+        }
+    }
+}
+
+// The filesystem ======================================================================================================
+
+#[cfg(windows)]
+mod system {
+    use std::ffi::{OsString, c_void};
+    use std::fs::{File, OpenOptions};
+    use std::io;
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use std::path::{Path, PathBuf};
+
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HANDLE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetLengthSid, IsValidSid,
+        OWNER_SECURITY_INFORMATION, PSID,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, GetVolumeInformationByHandleW,
+        READ_CONTROL,
+    };
+
+    use super::{Ace, ObjectSecurity, Sid, Unsafe, everyone};
+    use crate::error::{Error, Result};
+
+    // The ACE types a file's DACL can hold: allow and deny, plain or conditional. A conditional ACE
+    // has an expression after its SID, which is not read: it is treated as if it always applies.
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+    const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u8 = 9;
+    const ACCESS_DENIED_CALLBACK_ACE_TYPE: u8 = 10;
+
+    /// A volume flag: it keeps ACLs. Without it no access control exists to check.
+    const FILE_PERSISTENT_ACLS: u32 = 0x8;
+
+    /// The security of `folder` and of everything above it: the target first, then outward to the
+    /// volume root. Holds each component of `folder` as given (a link is read as itself) and each
+    /// of its final path, once. A `folder` that does not exist is represented by its first
+    /// existing ancestor, since a provider creates it with its own permissions.
+    pub(super) fn read_chain(folder: &Path) -> Result<Vec<ObjectSecurity>> {
+        let given = std::path::absolute(folder).map_err(|e| Error::os_at("resolve", folder, e))?;
+        let (start, start_file) = first_existing(&given)?;
+
+        let mut chain = vec![read_object(&start_file, display_path(&start))?];
+        for ancestor in start.ancestors().skip(1) {
+            push(&mut chain, ancestor)?;
+        }
+        let final_path = std::fs::canonicalize(&start).map_err(|e| Error::os_at("resolve", &start, e))?;
+        for ancestor in display_path(&final_path).ancestors() {
+            push(&mut chain, ancestor)?;
+        }
+        Ok(chain)
+    }
+
+    /// `path` without the `\\?\` that a final path carries, so a path compares equal to the one it
+    /// was given as.
+    pub(super) fn display_path(path: &Path) -> PathBuf {
+        const VERBATIM: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+        const UNC: [u16; 4] = [b'U' as u16, b'N' as u16, b'C' as u16, b'\\' as u16];
+        let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        match wide.strip_prefix(&VERBATIM) {
+            Some(rest) => match rest.strip_prefix(&UNC) {
+                Some(share) => {
+                    let mut unc = vec![b'\\' as u16, b'\\' as u16];
+                    unc.extend_from_slice(share);
+                    PathBuf::from(OsString::from_wide(&unc))
+                }
+                None => PathBuf::from(OsString::from_wide(rest)),
+            },
+            None => path.to_path_buf(),
+        }
+    }
+
+    /// The first of `path` and its ancestors that exists, opened.
+    fn first_existing(path: &Path) -> Result<(PathBuf, File)> {
+        for candidate in path.ancestors() {
+            match open(candidate) {
+                Ok(file) => return Ok((candidate.to_path_buf(), file)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(Error::os_at("read the permissions of", candidate, e)),
+            }
+        }
+        Err(Error::os_at(
+            "find an existing ancestor of",
+            path,
+            io::Error::from(io::ErrorKind::NotFound),
+        ))
+    }
+
+    /// Adds `path` unless the chain holds it.
+    fn push(chain: &mut Vec<ObjectSecurity>, path: &Path) -> Result<()> {
+        let shown = display_path(path);
+        if chain.iter().any(|object| object.path == shown) {
+            return Ok(());
+        }
+        let file = open(path).map_err(|e| Error::os_at("read the permissions of", path, e))?;
+        chain.push(read_object(&file, shown)?);
+        Ok(())
+    }
+
+    /// Opens `path` for its security alone. A link is opened as itself, not followed.
+    fn open(path: &Path) -> io::Result<File> {
+        OpenOptions::new()
+            .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    }
+
+    fn read_object(file: &File, path: PathBuf) -> Result<ObjectSecurity> {
+        let handle = file.as_raw_handle() as HANDLE;
+        require_acls(handle, &path)?;
+
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `handle` is open, with `READ_CONTROL`, for as long as `file` is borrowed; the
+        // out-pointers are valid lvalues. On success `descriptor` owns the memory `owner` and
+        // `dacl` point into, and is freed below.
+        let status = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(Error::os_at(
+                "read the permissions of",
+                path,
+                io::Error::from_raw_os_error(status as i32),
+            ));
+        }
+        // SAFETY: `owner` and `dacl` point into `descriptor`, which is live until the free below.
+        let parsed = unsafe { parse(owner, dacl, &path) };
+        // SAFETY: `descriptor` was allocated by `GetSecurityInfo` and is freed once, after the
+        // last read of what points into it.
+        unsafe {
+            LocalFree(descriptor);
+        }
+        let (owner, dacl) = parsed?;
+        Ok(ObjectSecurity { path, owner, dacl })
+    }
+
+    /// Refuses a volume that keeps no ACLs, where every account can do anything.
+    fn require_acls(handle: HANDLE, path: &Path) -> Result<()> {
+        let mut flags: u32 = 0;
+        // SAFETY: `handle` is open; the one out-pointer asked for is a valid `u32`, and the rest
+        // are null with zero lengths.
+        let ok = unsafe {
+            GetVolumeInformationByHandleW(
+                handle,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut flags,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if ok == 0 {
+            return Err(Error::os_at("read the volume of", path, io::Error::last_os_error()));
+        }
+        if flags & FILE_PERSISTENT_ACLS == 0 {
+            return Err(Unsafe {
+                path: path.to_path_buf(),
+                account: everyone(),
+                right: "bypass access control on",
+            }
+            .into_error());
+        }
+        Ok(())
+    }
+
+    /// Copies the owner and the entries out of a security descriptor.
+    ///
+    /// # Safety
+    /// `owner` and `dacl` are what `GetSecurityInfo` returned, and the descriptor they point into
+    /// is live.
+    unsafe fn parse(owner: PSID, dacl: *mut ACL, path: &Path) -> Result<(Sid, Option<Vec<Ace>>)> {
+        // SAFETY: the caller's contract covers `owner`.
+        let owner = unsafe { copy_sid(owner, path)? };
+        if dacl.is_null() {
+            return Ok((owner, None));
+        }
+        // SAFETY: `dacl` is non-null and live, so its header is readable.
+        let count = unsafe { (*dacl).AceCount };
+        let mut aces = Vec::with_capacity(usize::from(count));
+        for index in 0..u32::from(count) {
+            let mut ace: *mut c_void = std::ptr::null_mut();
+            // SAFETY: `dacl` is live and `index` is below its entry count; `ace` is a valid out-pointer.
+            if unsafe { GetAce(dacl, index, &mut ace) } == 0 {
+                return Err(Error::os_at(
+                    "read the permissions of",
+                    path,
+                    io::Error::last_os_error(),
+                ));
+            }
+            // SAFETY: `GetAce` returned a pointer to an entry inside `dacl`, whose every type read
+            // here begins with the header, the mask and then the trustee's SID.
+            let (header, mask, trustee) = unsafe {
+                let body = ace as *const ACCESS_ALLOWED_ACE;
+                (
+                    *(ace as *const ACE_HEADER),
+                    (*body).Mask,
+                    std::ptr::addr_of!((*body).SidStart) as PSID,
+                )
+            };
+            let allow = match header.AceType {
+                ACCESS_ALLOWED_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_ACE_TYPE => true,
+                ACCESS_DENIED_ACE_TYPE | ACCESS_DENIED_CALLBACK_ACE_TYPE => false,
+                other => {
+                    return Err(Error::os_at(
+                        "read the permissions of",
+                        path,
+                        io::Error::other(format!("an entry of type {other}, which goetia cannot read")),
+                    ));
+                }
+            };
+            aces.push(Ace {
+                // SAFETY: `trustee` points at the SID inside the entry just read.
+                trustee: unsafe { copy_sid(trustee, path)? },
+                mask,
+                flags: header.AceFlags,
+                allow,
+            });
+        }
+        Ok((owner, Some(aces)))
+    }
+
+    /// # Safety
+    /// `sid` is null or points at readable memory.
+    unsafe fn copy_sid(sid: PSID, path: &Path) -> Result<Sid> {
+        // SAFETY: `IsValidSid` checks the structure before `GetLengthSid` reads it; a null pointer
+        // is rejected first.
+        if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
+            return Err(Error::os_at(
+                "read the permissions of",
+                path,
+                io::Error::other("an account that is not a valid SID"),
+            ));
+        }
+        // SAFETY: valid per the check above, so `GetLengthSid` bytes are readable from `sid`.
+        let bytes = unsafe { std::slice::from_raw_parts(sid as *const u8, GetLengthSid(sid) as usize) };
+        Ok(bytes.to_vec())
+    }
+}
+
+#[cfg(test)]
+#[path = "acl_tests.rs"]
+mod acl_tests;

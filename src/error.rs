@@ -190,6 +190,20 @@ pub enum Error {
     )]
     NotADirectory { path: PathBuf },
 
+    /// A folder the shim would be written to, or one of its ancestors, can be modified by an
+    /// account goetia does not trust, so that account could replace the shim, which runs as
+    /// `LocalSystem`. No OS call failed.
+    #[error(
+        "refusing to use {} for the shim: {account} can {right} it, so it could replace the shim; fix the folder's \
+         permissions",
+        path.display()
+    )]
+    ShimFolderUnsafe {
+        path: PathBuf,
+        account: String,
+        right: &'static str,
+    },
+
     /// A `.env` file beside the manifest could not be parsed. Distinct from
     /// [`Os`](Error::Os), which means the file could not be read at all.
     #[error("{path}:{line}: {message}", path = path.display())]
@@ -521,6 +535,7 @@ impl Error {
             | Error::UnitNotLoaded { .. }
             | Error::Reservation { .. }
             | Error::NotADirectory { .. }
+            | Error::ShimFolderUnsafe { .. }
             | Error::EnvFile { .. }
             | Error::Interpolate { .. }
             | Error::Yaml(_)
@@ -624,6 +639,7 @@ impl Error {
             | Error::UnitNotLoaded { .. }
             | Error::Reservation { .. }
             | Error::NotADirectory { .. }
+            | Error::ShimFolderUnsafe { .. }
             | Error::EnvFile { .. }
             | Error::Interpolate { .. }
             | Error::Yaml(_)

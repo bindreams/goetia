@@ -138,6 +138,11 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             source: std::io::Error::other("x"),
         },
         Error::NotADirectory { path: PathBuf::new() },
+        Error::ShimFolderUnsafe {
+            path: PathBuf::new(),
+            account: String::new(),
+            right: "own",
+        },
         Error::InvalidPassword { variable: id() },
         Error::PutBackBlocked {
             path: PathBuf::new(),
@@ -577,6 +582,20 @@ fn report_of_a_path_that_is_not_a_directory() {
         .to_string(),
         "/p already exists and is not a directory; goetia cannot use it as a daemon's cwd or as its log directory"
     );
+}
+
+#[skuld::test]
+fn report_of_an_unsafe_shim_folder_names_the_path_the_account_and_the_right() {
+    let e = Error::ShimFolderUnsafe {
+        path: PathBuf::from("/p"),
+        account: "Users".to_string(),
+        right: "change permissions of",
+    };
+    assert_eq!(
+        e.report().to_string(),
+        "refusing to use /p for the shim: Users can change permissions of it, so it could replace the shim; fix the folder's permissions"
+    );
+    assert!(std::error::Error::source(&e).is_none());
 }
 
 #[skuld::test]
