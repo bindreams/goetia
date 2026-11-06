@@ -13,6 +13,15 @@ use crate::backend::client::{Client, ClientError, Real};
 use crate::manager::ServiceManager;
 use crate::spec::{Id, Kind, Restart, User};
 
+// The integration suites' removal of what a test created; a library test reaches `tests/` only by path.
+#[allow(
+    dead_code,
+    reason = "this file uses only `FileGuard`; the systemd tests use `DirGuard` too"
+)]
+#[path = "../../../tests/support/cleanup.rs"]
+mod cleanup;
+use cleanup::FileGuard;
+
 fn sample_plist(id: &str) -> String {
     sample_plist_restarting(id, Restart::Never)
 }
@@ -1444,13 +1453,18 @@ impl OverSh {
     }
 }
 
-/// Removes the plists a test's install wrote, if a failure left them.
-struct Plists(String);
+/// Removes the plists a test's install wrote, if a failure left them. Register it before the install.
+struct Plists {
+    _staging: FileGuard,
+    _enabled: FileGuard,
+}
 
-impl Drop for Plists {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(staging_path(&self.0));
-        let _ = std::fs::remove_file(enabled_path(&self.0));
+impl Plists {
+    fn new(name: &str) -> Self {
+        Self {
+            _staging: FileGuard::new(staging_path(name)),
+            _enabled: FileGuard::new(enabled_path(name)),
+        }
     }
 }
 
@@ -1463,7 +1477,7 @@ impl Drop for Plists {
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn every_launchd_verb_path_stays_inside_its_reservation() {
     let name = format!("goetia-reservation-{:x}", std::process::id());
-    let _plists = Plists(name.clone());
+    let _plists = Plists::new(&name);
     let id = Id::try_from(name.as_str()).unwrap();
     let mut spec = DaemonSpec {
         restart: Restart::Always,
@@ -1704,7 +1718,7 @@ fn kill_refused_for_any_other_reason_is_a_plain_failure() {
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_changed_spec_is_refused_while_the_job_is_loaded() {
     let name = format!("goetia-refuse-{:x}", std::process::id());
-    let _plists = Plists(name.clone());
+    let _plists = Plists::new(&name);
     let mut spec = spec_named(&name);
 
     let (mgr, script) = scripted(&CREATED);
@@ -1750,7 +1764,7 @@ fn spec_named(name: &str) -> DaemonSpec {
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_print_that_fails_otherwise_is_an_error_not_a_job_that_is_not_loaded() {
     let name = format!("goetia-unreadable-{:x}", std::process::id());
-    let _plists = Plists(name.clone());
+    let _plists = Plists::new(&name);
     let mut spec = spec_named(&name);
     let names_print = |e: &Error| matches!(e, Error::Command { command, .. } if command.starts_with("launchctl print"));
 
@@ -1826,7 +1840,7 @@ fn failed_start(name: &str, restart: Restart, calls: &[(&str, Answer)]) -> Error
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_kickstart_that_names_no_pid_and_reads_back_unknown_is_unconfirmed() {
     let name = format!("goetia-nopid-unknown-{:x}", std::process::id());
-    let _plists = Plists(name.clone());
+    let _plists = Plists::new(&name);
 
     let e = failed_start(
         &name,
@@ -1846,7 +1860,7 @@ fn a_kickstart_that_names_no_pid_and_reads_back_unknown_is_unconfirmed() {
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_kickstart_that_names_no_pid_and_reads_back_stopped_did_not_start() {
     let name = format!("goetia-nopid-stopped-{:x}", std::process::id());
-    let _plists = Plists(name.clone());
+    let _plists = Plists::new(&name);
 
     let e = failed_start(
         &name,
@@ -1879,7 +1893,7 @@ const CORRECTIVE_CYCLE: [(&str, Answer); 8] = [
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_corrective_cycle_that_reads_back_unknown_is_unconfirmed() {
     let name = format!("goetia-cycle-unknown-{:x}", std::process::id());
-    let _plists = Plists(name.clone());
+    let _plists = Plists::new(&name);
 
     let e = failed_start(
         &name,
@@ -1894,7 +1908,7 @@ fn a_corrective_cycle_that_reads_back_unknown_is_unconfirmed() {
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_corrective_cycle_that_reads_back_stopped_did_not_start() {
     let name = format!("goetia-cycle-stopped-{:x}", std::process::id());
-    let _plists = Plists(name.clone());
+    let _plists = Plists::new(&name);
 
     let e = failed_start(
         &name,
@@ -1929,7 +1943,7 @@ fn assert_restored_and_rerun_refused(spec: &DaemonSpec, name: &str, installed: &
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_job_loaded_between_the_check_and_the_write_leaves_the_install_in_doubt() {
     let name = format!("goetia-indoubt-{:x}", std::process::id());
-    let _plists = Plists(name.clone());
+    let _plists = Plists::new(&name);
     let mut spec = spec_named(&name);
 
     let (mgr, script) = scripted(&CREATED);
@@ -1961,7 +1975,7 @@ fn a_job_loaded_between_the_check_and_the_write_leaves_the_install_in_doubt() {
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn an_unreadable_recheck_after_the_write_leaves_the_install_in_doubt() {
     let name = format!("goetia-recheck-{:x}", std::process::id());
-    let _plists = Plists(name.clone());
+    let _plists = Plists::new(&name);
     let mut spec = spec_named(&name);
 
     let (mgr, script) = scripted(&CREATED);
@@ -1994,7 +2008,7 @@ fn an_unreadable_recheck_after_the_write_leaves_the_install_in_doubt() {
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_spec_change_the_plist_does_not_render_is_written_over_a_loaded_job() {
     let name = format!("goetia-samerender-{:x}", std::process::id());
-    let _plists = Plists(name.clone());
+    let _plists = Plists::new(&name);
     let mut spec = spec_named(&name);
 
     let (mgr, script) = scripted(&CREATED);
@@ -2054,7 +2068,7 @@ fn restore_failure_of(e: &Error) -> &Error {
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_put_back_does_not_overwrite_a_plist_that_is_no_longer_ours() {
     let name = format!("goetia-putback-{:x}", std::process::id());
-    let _plists = Plists(name.clone());
+    let _plists = Plists::new(&name);
     let target = staging_path(&name);
 
     let taken = target.clone();
@@ -2080,7 +2094,7 @@ fn a_put_back_does_not_overwrite_a_plist_that_is_no_longer_ours() {
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_put_back_does_not_recreate_a_plist_that_was_enabled_meanwhile() {
     let name = format!("goetia-putback-enabled-{:x}", std::process::id());
-    let _plists = Plists(name.clone());
+    let _plists = Plists::new(&name);
 
     let (staging, enabled) = (staging_path(&name), enabled_path(&name));
     let (e, changed) = install_loaded_after_write(&name, move || std::fs::rename(staging, enabled).unwrap());
@@ -2104,7 +2118,7 @@ fn a_put_back_does_not_recreate_a_plist_that_was_enabled_meanwhile() {
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_put_back_does_not_resurrect_a_plist_that_was_uninstalled_meanwhile() {
     let name = format!("goetia-putback-removed-{:x}", std::process::id());
-    let _plists = Plists(name.clone());
+    let _plists = Plists::new(&name);
 
     let staged = staging_path(&name);
     let (e, _) = install_loaded_after_write(&name, move || std::fs::remove_file(staged).unwrap());
@@ -2128,7 +2142,7 @@ fn a_put_back_does_not_resurrect_a_plist_that_was_uninstalled_meanwhile() {
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_stale_plist_is_refused_over_a_loaded_job_only_when_its_rendering_differs() {
     let name = format!("goetia-stale-{:x}", std::process::id());
-    let _plists = Plists(name.clone());
+    let _plists = Plists::new(&name);
     let spec = spec_named(&name);
 
     let (mgr, script) = scripted(&CREATED);
@@ -2178,7 +2192,7 @@ fn a_stale_plist_is_refused_over_a_loaded_job_only_when_its_rendering_differs() 
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_create_that_cannot_stage_its_plist_boots_nothing_out() {
     let name = format!("goetia-unstaged-{:x}", std::process::id());
-    let _plists = Plists(name.clone());
+    let _plists = Plists::new(&name);
     let dir = tempfile::tempdir().unwrap();
     let blocker = dir.path().join("not-a-directory");
     std::fs::write(&blocker, "").unwrap();
@@ -2198,7 +2212,7 @@ fn a_create_that_cannot_stage_its_plist_boots_nothing_out() {
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_job_loaded_after_a_create_leaves_the_install_in_doubt_with_no_plist() {
     let name = format!("goetia-create-indoubt-{:x}", std::process::id());
-    let _plists = Plists(name.clone());
+    let _plists = Plists::new(&name);
     let spec = spec_named(&name);
 
     for (calls, what) in [
@@ -2253,7 +2267,7 @@ fn a_job_loaded_after_a_create_leaves_the_install_in_doubt_with_no_plist() {
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_plist_taken_after_the_bootout_is_reported_without_further_launchctl_calls() {
     let name = format!("goetia-taken-{:x}", std::process::id());
-    let _plists = Plists(name.clone());
+    let _plists = Plists::new(&name);
     let spec = spec_named(&name);
     let target = staging_path(&name);
 
@@ -2279,7 +2293,7 @@ fn a_plist_taken_after_the_bootout_is_reported_without_further_launchctl_calls()
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_plist_taken_after_a_read_fails_the_install_without_further_launchctl_calls() {
     let name = format!("goetia-taken-early-{:x}", std::process::id());
-    let _plists = Plists(name.clone());
+    let _plists = Plists::new(&name);
     let spec = spec_named(&name);
     let target = staging_path(&name);
 
@@ -2302,7 +2316,7 @@ fn a_plist_taken_after_a_read_fails_the_install_without_further_launchctl_calls(
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_plist_removed_after_a_read_fails_the_install_without_further_launchctl_calls() {
     let name = format!("goetia-vanished-{:x}", std::process::id());
-    let _plists = Plists(name.clone());
+    let _plists = Plists::new(&name);
     let mut spec = spec_named(&name);
     let target = staging_path(&name);
 
@@ -2332,7 +2346,7 @@ fn dry_run_and_diff_ask_launchd_nothing_and_install_start_is_refused_before_it_s
     use crate::cli::{ExitCode, diff, install};
 
     let name = format!("goetia-cli-{:x}", std::process::id());
-    let _plists = Plists(name.clone());
+    let _plists = Plists::new(&name);
     let dir = tempfile::tempdir().unwrap();
     let manifest = |seconds: &str| {
         std::fs::write(

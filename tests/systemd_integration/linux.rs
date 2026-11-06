@@ -121,13 +121,13 @@ fn seed_unreadable_dropin_enotdir(id: &str) -> FileGuard {
 ///
 /// The root is removed only when this call created it, and with `remove_dir`, so a root systemd
 /// itself populated is left exactly as it was found.
-fn seed_unreadable_dropin_in_root(root: &str, id: &str) -> RmFileInRoot {
+fn seed_unreadable_dropin_in_root(root: &str, id: &str) -> RmInRoot<FileGuard> {
     let root_path = PathBuf::from(root);
     let leaf = root_path.join(format!("{id}.service.d"));
-    let guard = RmFileInRoot {
-        leaf: leaf.clone(),
-        root: (!root_path.exists()).then(|| root_path.clone()),
-    };
+    let guard = RmInRoot::new(
+        FileGuard::new(leaf.clone()),
+        (!root_path.exists()).then(|| root_path.clone()),
+    );
     fs::create_dir_all(&root_path).unwrap_or_else(|e| panic!("mkdir {root}: {e}"));
     fs::write(&leaf, b"").unwrap_or_else(|e| panic!("seed {}: {e}", leaf.display()));
     guard
@@ -136,11 +136,8 @@ fn seed_unreadable_dropin_in_root(root: &str, id: &str) -> RmFileInRoot {
 /// Seed one `*.conf` into an arbitrary drop-in directory and hand back the RAII removal of it. The
 /// parent search root is left exactly as found: `/etc/systemd/system` is shared with every other
 /// test running concurrently.
-fn seed_dropin(dir: &Path, root: Option<PathBuf>) -> RmDropin {
-    let guard = RmDropin {
-        leaf: dir.to_path_buf(),
-        root,
-    };
+fn seed_dropin(dir: &Path, root: Option<PathBuf>) -> RmInRoot<DirGuard> {
+    let guard = RmInRoot::new(DirGuard::new(dir.to_path_buf()), root);
     fs::create_dir_all(dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
     fs::write(dir.join("50-x.conf"), "[Service]\nMemoryMax=8G\n").expect("write drop-in");
     cmd::run("systemctl", &["daemon-reload"]).expect_ok();
@@ -155,7 +152,7 @@ fn seed_dropin(dir: &Path, root: Option<PathBuf>) -> RmDropin {
 /// one takes a *different* root, so no concurrently running test can be inside the one this removes
 /// — and the removal is `remove_dir`, so a root systemd itself populated for some other unit fails
 /// to go and is left as it was found.
-fn seed_control_dropin(root: &str, id: &str) -> (PathBuf, RmDropin) {
+fn seed_control_dropin(root: &str, id: &str) -> (PathBuf, RmInRoot<DirGuard>) {
     let root_path = PathBuf::from(root);
     let leaf = root_path.join(format!("{id}.service.d"));
     let guard = seed_dropin(&leaf, (!root_path.exists()).then_some(root_path));
@@ -268,61 +265,41 @@ fn uid_of(account: &str) -> u32 {
         .unwrap_or_else(|e| panic!("parse uid of {account}: {e}"))
 }
 
-/// Logs a failed removal the way `ServiceGuard` does: `Drop` cannot return it, and a leftover that
-/// nothing reported shows up only as a straggler in the next run.
-fn report(guard: &str, problem: Option<String>) {
-    if let Some(problem) = problem {
-        eprintln!("{guard}: cleanup failed: {problem}");
-    }
-}
+/// A search root a seeding call created, removed on drop with `remove_dir`. "Not empty" is
+/// expected, not a failure: a root systemd itself populated for some other unit is left as it was
+/// found.
+struct CreatedRoot(PathBuf);
 
-/// `remove_dir` on a search root a seeding call created. "Not empty" is expected, not a failure: a
-/// root systemd itself populated for some other unit is left as it was found.
-fn remove_created_root(root: &Path) -> Option<String> {
-    match fs::remove_dir(root) {
-        Ok(()) => None,
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
-            ) =>
-        {
-            None
-        }
-        Err(e) => Some(format!("remove {}: {e}", root.display())),
-    }
-}
-
-/// RAII removal of a seeded drop-in directory, and of the search root itself where the test created
-/// that root — see [`seed_control_dropin`].
-struct RmDropin {
-    leaf: PathBuf,
-    root: Option<PathBuf>,
-}
-
-impl Drop for RmDropin {
+impl Drop for CreatedRoot {
     fn drop(&mut self) {
-        report("RmDropin", remove_path_retrying(&self.leaf, true));
-        if let Some(root) = &self.root {
-            report("RmDropin", remove_created_root(root));
+        match fs::remove_dir(&self.0) {
+            Ok(()) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(e) => eprintln!("warning: left behind: remove {}: {e}", self.0.display()),
         }
-        // No `daemon-reload` here: every test that seeds one of these also holds a `ServiceGuard`,
-        // whose own cleanup reloads after this one has run.
     }
 }
 
-/// RAII removal of a seeded regular file and, where the seeding call created it, the search root
-/// holding it — [`RmDropin`]'s twin for a leaf that is a file rather than a directory.
-struct RmFileInRoot {
-    leaf: PathBuf,
-    root: Option<PathBuf>,
+/// RAII removal of a seeded leaf (a `DirGuard` for a drop-in directory, a `FileGuard` for a file
+/// standing where one belongs) and, where the seeding call created it, the search root holding it.
+/// The leaf field is declared first, so it is removed before the root; see [`seed_control_dropin`].
+///
+/// No `daemon-reload` on drop: every test that seeds a drop-in also holds a `ServiceGuard`, whose
+/// own cleanup reloads after this one has run.
+struct RmInRoot<L> {
+    _leaf: L,
+    _root: Option<CreatedRoot>,
 }
 
-impl Drop for RmFileInRoot {
-    fn drop(&mut self) {
-        report("RmFileInRoot", remove_path_retrying(&self.leaf, false));
-        if let Some(root) = &self.root {
-            report("RmFileInRoot", remove_created_root(root));
+impl<L> RmInRoot<L> {
+    fn new(leaf: L, root: Option<PathBuf>) -> Self {
+        Self {
+            _leaf: leaf,
+            _root: root.map(CreatedRoot),
         }
     }
 }
@@ -853,10 +830,8 @@ impl Drop for StopHolder {
             eprintln!("StopHolder[{}]: cleanup failed: {run}", self.unit);
         }
         for path in [&self.path, &self.lock] {
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => eprintln!("StopHolder[{}]: remove {}: {e}", self.unit, path.display()),
+            if let Some(problem) = remove_path_retrying(path, false) {
+                eprintln!("warning: left behind: {problem}");
             }
         }
         let run = cmd::run("systemctl", &["daemon-reload"]);
@@ -1748,10 +1723,7 @@ fn a_top_level_service_d_dropin_is_not_this_ids_conflict() {
     fs::create_dir(&dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
     // Built after the mkdir, not before: it is atomic, so on failure nothing was created and a guard
     // would remove a host-wide directory this test did not make.
-    let _cleanup = RmDropin {
-        leaf: dir.clone(),
-        root: None,
-    };
+    let _cleanup = RmInRoot::new(DirGuard::new(dir.clone()), None);
     fs::write(
         dir.join("50-goetia-test.conf"),
         "[Unit]\nDocumentation=https://example.invalid/goetia-test\n",
@@ -2259,6 +2231,7 @@ fn run_unelevated(args: &[&str]) -> std::process::Output {
     // two sharing one path would have each `remove_file` the copy the other was still executing.
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let staged = std::env::temp_dir().join(format!("goetia-unelevated-{}-{n}", std::process::id()));
+    let _staged = FileGuard::new(staged.clone());
     fs::copy(env!("CARGO_BIN_EXE_goetia"), &staged).expect("stage the binary somewhere traversable");
     fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).expect("chmod 0755");
 
@@ -2268,6 +2241,5 @@ fn run_unelevated(args: &[&str]) -> std::process::Output {
         .args(&argv)
         .output()
         .expect("spawn runuser -u nobody");
-    let _ = fs::remove_file(&staged);
     output
 }
