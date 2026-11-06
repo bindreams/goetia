@@ -8,6 +8,7 @@
 // Each probe module is `#[cfg]`-gated to one platform, so most of this is
 // unused in any single build.
 
+pub mod cleanup;
 pub mod cmd;
 pub mod connect_back;
 pub mod daemon_spec;
