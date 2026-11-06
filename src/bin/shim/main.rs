@@ -18,7 +18,6 @@
 #[cfg(windows)]
 mod logging;
 #[cfg(windows)]
-#[allow(dead_code)]
 mod os;
 #[cfg(windows)]
 mod service;

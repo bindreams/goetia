@@ -148,6 +148,11 @@ impl FakeProcess {
         }))
     }
 
+    /// A daemon that runs until a tree kill ends it: the common case of a stop.
+    pub(crate) fn running() -> FakeProcess {
+        FakeProcess::new().wait(WaitReply::Blocks).kill_tree(KillReply::Ends)
+    }
+
     fn with(self, change: impl FnOnce(&mut ProcState)) -> FakeProcess {
         change(&mut lock(&self.0.state));
         self

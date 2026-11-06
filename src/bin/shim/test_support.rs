@@ -1,62 +1,43 @@
 //! Fixtures shared by the shim's unit tests.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
-// rand 0.10 moved `random` off `Rng` onto `RngExt`.
-use rand::RngExt as _;
+use crate::os::fake::{Fake, KILL_REFUSED};
+use crate::stop_bus::StopBus;
 
-use crate::stop_bus;
-
-/// A per-test daemon id, unique in the process (the waiter-end record is keyed by id), whose drop
-/// checks that the test consumed its waiter's end. The random part avoids ids left by a killed run
-/// or a real daemon.
-pub(crate) struct TestId(String);
-
-static NEXT: AtomicU64 = AtomicU64::new(0);
-
-impl TestId {
-    pub(crate) fn new(prefix: &str) -> Self {
-        Self(format!(
-            "{prefix}-{:016x}-{}",
-            rand::rng().random::<u64>(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ))
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
+/// A bus over `fake`'s `Os` and `Log`: the supervisor under test.
+pub(crate) fn bus(fake: &Fake) -> Arc<StopBus> {
+    Arc::new(StopBus::new(fake.os(), fake.log()))
 }
 
-impl Drop for TestId {
-    /// Skipped while panicking: a failed test leaves its state behind and the original panic is the
-    /// useful one.
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            return;
-        }
-        assert!(
-            !stop_bus::test_hook::has_waiter_end(&self.0),
-            "{} ended without consuming its waiter's end (`waiter_end`)",
-            self.0
-        );
-    }
-}
-
-/// Asserts `lines` is exactly one `log_failure` line for `id`: `goetia-shim[<id>]: ` then
-/// `expected`, with nothing before, between or after. The caller writes `expected` out in full
-/// (splicing in only the injected error it chose), not rebuilt from production's formatters, so a
-/// change to any part of the text fails the test.
+/// Asserts `lines` is exactly one failure line for `id`: `goetia-shim[<id>]: ` then `expected`, with
+/// nothing before, between or after. The caller writes `expected` out in full (splicing in only the
+/// injected error it chose), not rebuilt from production's formatters, so a change to any part of
+/// the text fails the test.
 pub(crate) fn assert_one_failure(lines: &[String], id: &str, expected: &str) {
     let [line] = lines else {
-        panic!("expected exactly one `log_failure` line for {id}, got {lines:?}");
+        panic!("expected exactly one failure line for {id}, got {lines:?}");
     };
     assert_eq!(line, &format!("goetia-shim[{id}]: {expected}"));
 }
 
-/// Asserts `lines` is exactly `expected`, in order: each one `log_failure` line for `id`, as
+/// Asserts `lines` is exactly `expected`, in order: each one failure line for `id`, as
 /// [`assert_one_failure`] checks it.
 pub(crate) fn assert_failures(lines: &[String], id: &str, expected: &[String]) {
     let expected: Vec<String> = expected.iter().map(|e| format!("goetia-shim[{id}]: {e}")).collect();
     assert_eq!(lines, expected);
+}
+
+/// The line logged when `kill_tree` is refused and the direct child's kill is tried next.
+pub(crate) fn tree_refused_failure() -> String {
+    format!(
+        "kill_tree: {KILL_REFUSED}; falling back to killing the direct child only (its own descendants, if any, cannot be reached without a containment mechanism)"
+    )
+}
+
+/// The line logged when the direct child's kill is refused too.
+pub(crate) fn fallback_refused_failure() -> String {
+    format!(
+        "fallback kill: {KILL_REFUSED}; the daemon was neither killed nor reaped and may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure"
+    )
 }

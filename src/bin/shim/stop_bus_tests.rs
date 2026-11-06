@@ -1,59 +1,56 @@
-//! Needs no elevation: creating a Job Object and assigning this process's
-//! own children to it is an ordinary, unprivileged operation.
+//! The supervisor's decisions over the `Fake`: how the bus waits for a daemon and what it does when
+//! a stop, an exit, a failed wait or a refused kill arrives. What a real kill or wait does to a real
+//! process is `os_tests`'s.
 
-use std::sync::Arc;
 use std::sync::mpsc;
-use std::time::Duration;
 
-use super::test_hook::{KILL_REFUSED, WAIT_FAILED, Wait, WaiterEnd, waiter_end};
 use super::*;
-use crate::os::fake::FakeGuard;
-use crate::test_support::{TestId, assert_failures, assert_one_failure};
+use crate::os::fake::{Fake, FakeGuard, FakeProcess, KillReply, WAIT_FAILED, WaitReply, WaiterEnd};
+use crate::test_support::{assert_failures, assert_one_failure, bus, fallback_refused_failure, tree_refused_failure};
 
-const PREFIX: &str = "goetia-shim-stop-bus-test";
+const ID: &str = "goetia-shim-stop-bus-test";
+
+/// A daemon spawned through the `Fake`, as `service::launch` holds it.
+fn spawn_child(fake: &Fake) -> Arc<dyn Spawned> {
+    Arc::from(fake.os().spawn(cosca::run(["daemon"])).expect("spawn the daemon"))
+}
+
+/// A bus, then the waiter, then the daemon: the order `service::launch` makes them in. See
+/// [`Waiter`].
+fn launched(fake: &FakeGuard, daemon: &FakeProcess) -> (Arc<StopBus>, Waiter, Arc<dyn Spawned>) {
+    let bus = bus(fake);
+    fake.will_make_thread();
+    fake.will_spawn(daemon.clone());
+    let waiter = bus.waiter(ID).expect("make the waiter thread");
+    (bus, waiter, spawn_child(fake))
+}
 
 /// The waiter is joined inside the call, so no later log can arrive.
 #[skuld::test]
 fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
-    let id = TestId::new(PREFIX);
-    let mut cmd = cosca::run([
-        "powershell",
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "Start-Sleep -Seconds 300",
-    ]);
-    cmd.contain();
     let fake = FakeGuard::new();
-    let bus = Arc::new(StopBus::new(fake.log()));
-    // Made before the spawn, as `service::launch` makes it — see `Waiter`.
-    let waiter = bus.waiter(id.as_str()).expect("make the waiter thread");
-    let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
+    let daemon = FakeProcess::running();
+    let (bus, waiter, child) = launched(&fake, &daemon);
 
-    // `wait_for_child_or_stop` runs on its own, un-scoped `'static` thread
-    // (not `std::thread::scope`, which this test itself would then also
-    // have to join, defeating the timeout below on exactly the regression
-    // it exists to catch): if the teardown inside it ever again happens
-    // *after* the call would need to return rather than before — the join
-    // deadlock this module's own doc comment on `wait_for_child_or_stop`
-    // describes — this thread simply never sends, and `recv` below blocks
-    // forever. Both ends are this crate's code; CI's per-binary watchdog is the external bound.
+    // `wait_for_child_or_stop` runs on its own, un-scoped `'static` thread (not
+    // `std::thread::scope`, which this test itself would then also have to join): if the teardown
+    // inside it ever again happens *after* the call would need to return rather than before — the
+    // join deadlock this module's own doc comment on `wait_for_child_or_stop` describes — this
+    // thread simply never sends, and `recv` below blocks forever. CI's per-binary watchdog is the
+    // external bound.
     let (tx, rx) = mpsc::channel();
     {
         let child = Arc::clone(&child);
         let bus = Arc::clone(&bus);
-        let id = id.as_str().to_string();
         std::thread::spawn(move || {
-            let outcome = bus.wait_for_child_or_stop(waiter, &child, &id, || {});
+            let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
             let _ = tx.send(outcome);
         });
     }
 
-    // No wait needed before this: `wait_for_child_or_stop`'s internal
-    // `Condvar::wait_while` checks its predicate before ever blocking, so a
-    // stop requested before the waiter thread has even started its own
-    // wait is not missed (see `StopBus::wait_for_child_or_stop`'s own doc
-    // comment).
+    // No wait needed before this: `wait_for_child_or_stop`'s internal `Condvar::wait_while` checks
+    // its predicate before ever blocking, so a stop requested before the waiter thread has even
+    // started its own wait is not missed.
     bus.request_stop();
 
     let outcome = rx
@@ -65,17 +62,12 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
         Vec::<String>::new(),
         "a clean stop reported a failure"
     );
-    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
-
-    // The child must actually be dead by now (the whole point of the call
-    // returning `Stopping` only after `kill_tree` confirms it), not merely
-    // have unblocked the wait.
-    let status = child
-        .wait_timeout(Duration::ZERO)
-        .expect("query the child's exit status");
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    // The daemon must actually be dead by now (the whole point of the call returning `Stopping`
+    // only after `kill_tree` confirms it), not merely have unblocked the wait.
     assert!(
-        status.is_some(),
-        "child is still alive after wait_for_child_or_stop returned Stopping"
+        daemon.killed(),
+        "the daemon was not killed though wait_for_child_or_stop returned Stopping"
     );
 }
 
@@ -87,42 +79,22 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
 /// `Stopping` under another name.
 ///
 /// It also pins that both refused kills are logged, `kill_tree`'s first. The detached waiter must
-/// have finished logging before the journal is read, hence the wait on its end.
-///
-/// Both failures are injected ([`test_hook::kills`]) because neither can be asked of the OS here:
-/// `kill_tree` fails for real only on a child holding no actionable containment mechanism or on a
-/// refused kill (see `wait_for_child_or_stop`), and Windows fixes a child handle's access rights at
-/// creation, so `TerminateProcess` on a child this process spawned itself does not get refused on
-/// demand. The child is contained anyway, so a failure of *this test* does not leave a five-minute
-/// sleep behind on the runner: the job object's `KILL_ON_JOB_CLOSE` reaps it where containment
-/// reached that mechanism, and `Child::drop`'s own kill covers it where it degraded to TreeWalk.
+/// have finished logging before the lines are read, hence the wait on its end.
 #[skuld::test]
 fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_kill() {
-    let id = TestId::new(PREFIX);
-
-    let mut cmd = cosca::run([
-        "powershell",
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "Start-Sleep -Seconds 300",
-    ]);
-    cmd.contain();
     let fake = FakeGuard::new();
-    let bus = Arc::new(StopBus::new(fake.log()));
-    let waiter = bus.waiter(id.as_str()).expect("make the waiter thread");
-    let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::Blocks)
+        .kill_tree(KillReply::Refuses)
+        .kill(KillReply::Refuses);
+    let (bus, waiter, child) = launched(&fake, &daemon);
 
     let (tx, rx) = mpsc::channel();
     {
         let child = Arc::clone(&child);
         let bus = Arc::clone(&bus);
-        let id = id.as_str().to_string();
         std::thread::spawn(move || {
-            // Armed on the thread the kills happen on, which is not this test's — the hook is
-            // thread-local, so the cleanup kill at the end of this test is unaffected by it.
-            let _refused = test_hook::kills(test_hook::Kill::Refuse);
-            let outcome = bus.wait_for_child_or_stop(waiter, &child, &id, || {});
+            let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
             let _ = tx.send(outcome);
         });
     }
@@ -140,73 +112,44 @@ fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_k
 
     // Still running, which is the whole content of that outcome: an assertion that could not tell
     // it from an ordinary `Stopping` would leave the reduced guarantee unproven.
-    let status = child
-        .wait_timeout(Duration::ZERO)
-        .expect("query the child's exit status");
     assert!(
-        status.is_none(),
-        "the child exited even though both kills were refused, so this test says nothing about the \
+        !daemon.ended() && !daemon.killed(),
+        "the daemon ended even though both kills were refused, so this test says nothing about the \
          unkillable case"
     );
 
-    // What the call deliberately did not do. The detached waiter thread is parked in `child.wait()`
-    // and ends once this lands.
-    child.kill_tree().expect("kill the daemon the call left running");
+    // What the call deliberately did not do. The detached waiter thread is parked in `wait` and ends
+    // once this lands.
+    daemon.end(1);
     assert_eq!(
-        waiter_end(id.as_str()),
+        fake.waiter_end(0),
         WaiterEnd::Returned,
         "the detached waiter thread panicked"
     );
-
-    let lines = fake.take_failures();
-    assert_eq!(lines.len(), 2, "both refused kills must be journalled: {lines:?}");
-    // kill_tree's first.
-    assert_one_failure(
-        &lines[..1],
-        id.as_str(),
-        &format!(
-            "kill_tree: {KILL_REFUSED}; falling back to killing the direct child only (its own descendants, if any, cannot be reached without a containment mechanism)"
-        ),
-    );
-    assert_one_failure(
-        &lines[1..],
-        id.as_str(),
-        &format!(
-            "fallback kill: {KILL_REFUSED}; the daemon was neither killed nor reaped and may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure"
-        ),
+    assert_failures(
+        &fake.take_failures(),
+        ID,
+        &[tree_refused_failure(), fallback_refused_failure()],
     );
 }
 
 /// A panic between the hand-off and the join detaches the waiter, which still holds an
-/// `Arc<Child>` clone — so the caller's own `Arc` going out of scope during the unwind is not the
-/// last reference and `cosca::Child::drop`'s kill-tree teardown does not run.
+/// `Arc<dyn Spawned>` clone — so the caller's own `Arc` going out of scope during the unwind is not
+/// the last reference and the daemon's drop, which kills its tree, does not run.
 /// [`StopBus::wait_for_child_or_stop`]'s doc comment states this; this is what will notice when
 /// someone makes one of its `expect`s recoverable, reorders the kill and the join, or adds the
 /// `Drop`-guard join that would turn this unwind into a block.
 ///
 /// The other half of that paragraph — `KILL_ON_JOB_CLOSE` reaping the tree once the shim process
 /// exits — is not asserted here and cannot be from inside the process whose exit is the event; it
-/// is `cosca`'s guarantee about its own job object, and its tests are where it is proven. It is
-/// also only available where containment reached that mechanism: a failed Job Object assignment
-/// degrades to TreeWalk, where there is no job object to close and so no such backstop.
+/// is `cosca`'s guarantee about its own job object, and its tests are where it is proven.
 ///
-/// The injected panic precedes any log; waiting for the detached waiter's end settles the journal.
+/// The injected panic precedes any log; waiting for the detached waiter's end settles the lines.
 #[skuld::test]
 fn a_panic_on_the_stop_path_leaves_the_waiter_detached_and_the_daemon_untorn_down() {
-    let id = TestId::new(PREFIX);
-
-    let mut cmd = cosca::run([
-        "powershell",
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "Start-Sleep -Seconds 300",
-    ]);
-    cmd.contain();
     let fake = FakeGuard::new();
-    let bus = Arc::new(StopBus::new(fake.log()));
-    let waiter = bus.waiter(id.as_str()).expect("make the waiter thread");
-    let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
+    let daemon = FakeProcess::new().wait(WaitReply::Blocks).kill_tree(KillReply::Panics);
+    let (bus, waiter, child) = launched(&fake, &daemon);
 
     // Requested before the call, so it reaches the kill — and the panic — without blocking first:
     // `wait_while` checks its predicate before ever waiting.
@@ -216,11 +159,9 @@ fn a_panic_on_the_stop_path_leaves_the_waiter_detached_and_the_daemon_untorn_dow
     {
         let child = Arc::clone(&child);
         let bus = Arc::clone(&bus);
-        let id = id.as_str().to_string();
         std::thread::spawn(move || {
-            let _panicking = test_hook::kills(test_hook::Kill::Panic);
             let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                bus.wait_for_child_or_stop(waiter, &child, &id, || {});
+                bus.wait_for_child_or_stop(waiter, &child, ID, || {});
             }))
             .is_err();
             // Dropped before the send, so the reference count asserted below is not a race against
@@ -236,29 +177,23 @@ fn a_panic_on_the_stop_path_leaves_the_waiter_detached_and_the_daemon_untorn_dow
         .expect("the thread running the panicking call ended without a result");
     assert!(panicked, "the kill did not panic, so nothing below is about an unwind");
 
-    // Two `Arc`s: this test's, and the detached thread's, parked in `child.wait()`. The unwind
-    // therefore could not have dropped the last one, which is the only thing that runs
-    // `Child::drop`'s teardown.
+    // Two `Arc`s: this test's, and the detached thread's, parked in `wait`. The unwind therefore
+    // could not have dropped the last one, which is the only thing that drops the daemon.
     assert_eq!(
         Arc::strong_count(&child),
         2,
         "the waiter's clone is gone, so the unwind joined or ended it after all and this test no longer \
          describes the detached case"
     );
-    let status = child
-        .wait_timeout(Duration::ZERO)
-        .expect("query the child's exit status");
     assert!(
-        status.is_none(),
+        !daemon.ended() && !daemon.dropped(),
         "the daemon was torn down during the unwind — which is better, but it is not what this module's \
          doc comment tells the next reader"
     );
 
-    child
-        .kill_tree()
-        .expect("kill the daemon the panicking call left running");
+    daemon.end(1);
     assert_eq!(
-        waiter_end(id.as_str()),
+        fake.waiter_end(0),
         WaiterEnd::Returned,
         "the detached waiter thread panicked"
     );
@@ -272,25 +207,20 @@ fn a_panic_on_the_stop_path_leaves_the_waiter_detached_and_the_daemon_untorn_dow
 /// The waiter is joined inside the call, so no later log can arrive.
 #[skuld::test]
 fn wait_for_child_or_stop_returns_child_exited_when_the_child_exits_on_its_own() {
-    let id = TestId::new(PREFIX);
-    let mut cmd = cosca::run(["powershell", "-NoProfile", "-NonInteractive", "-Command", "exit 0"]);
-    cmd.contain();
     let fake = FakeGuard::new();
-    let bus = Arc::new(StopBus::new(fake.log()));
-    let waiter = bus.waiter(id.as_str()).expect("make the waiter thread");
-    let child = Arc::new(cmd.spawn().expect("spawn a short-lived child"));
+    let daemon = FakeProcess::new().wait(WaitReply::Exits(0));
+    let (bus, waiter, child) = launched(&fake, &daemon);
 
-    // No stop requested: the child exiting on its own is the only wakeup
-    // source, so this blocks only as long as the child itself takes to
-    // start and exit.
-    let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str(), || {});
+    // No stop requested: the child exiting on its own is the only wakeup source.
+    let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
+
     assert!(matches!(outcome, WaitOutcome::ChildExited));
     assert_eq!(
         fake.take_failures(),
         Vec::<String>::new(),
         "a child that exited on its own reported a failure"
     );
-    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
 
 /// [`Waiter`]'s "handed nothing — it ends", the one lifetime claim in this module with no other
@@ -300,10 +230,10 @@ fn wait_for_child_or_stop_returns_child_exited_when_the_child_exits_on_its_own()
 /// than failing it: a thread that never ends leaves no event to bound.
 #[skuld::test]
 fn a_waiter_that_is_never_handed_a_child_ends_on_its_own() {
-    let id = TestId::new(PREFIX);
     let fake = FakeGuard::new();
-    let bus = Arc::new(StopBus::new(fake.log()));
-    let waiter = bus.waiter(id.as_str()).expect("make the waiter thread");
+    let bus = bus(&fake);
+    fake.will_make_thread();
+    let waiter = bus.waiter(ID).expect("make the waiter thread");
 
     // Closing the only `Sender` is the whole mechanism: the thread's first act is `rx.recv()`,
     // which returns `Err` and returns.
@@ -311,7 +241,7 @@ fn a_waiter_that_is_never_handed_a_child_ends_on_its_own() {
     drop(hand);
 
     thread.join().expect("the waiter thread panicked instead of ending");
-    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
 
 /// A failed `child.wait()` says nothing about the child, and a second blocking wait on it would sit
@@ -320,150 +250,89 @@ fn a_waiter_that_is_never_handed_a_child_ends_on_its_own() {
 /// lives.
 #[skuld::test]
 fn a_failed_background_wait_kills_the_daemon_and_is_reported_as_a_wait_failure() {
-    let id = TestId::new(PREFIX);
-    let mut cmd = cosca::run([
-        "powershell",
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "Start-Sleep -Seconds 300",
-    ]);
-    cmd.contain();
     let fake = FakeGuard::new();
-    let bus = Arc::new(StopBus::new(fake.log()));
-    // Armed on this thread, which makes the waiter: the hook is read when it is made.
-    let waiter = {
-        let _failing = test_hook::waits(Wait::Fail(None));
-        bus.waiter(id.as_str()).expect("make the waiter thread")
-    };
-    let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::Fails(None))
+        .kill_tree(KillReply::Ends);
+    let (bus, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str(), || {});
+    let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
 
     assert!(
         matches!(outcome, WaitOutcome::WaitFailed { os_error: None }),
         "a failed wait was not reported as one"
     );
-    // Termination is asynchronous: wait for the exit rather than polling for it. A daemon left
-    // running hangs here, for CI's watchdog to report.
-    child
-        .wait()
-        .expect("the daemon ends once its failed wait has killed it");
+    assert!(daemon.killed(), "the daemon was left running after its failed wait");
     assert_one_failure(
         &fake.take_failures(),
-        id.as_str(),
+        ID,
         &format!("background wait on child: {WAIT_FAILED}"),
     );
-    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
 
 /// The same failed wait over a daemon neither kill reaches: nothing is known to have ended it, so it
 /// is the unkillable outcome, which reports a stop SCM does not restart.
 #[skuld::test]
 fn a_failed_background_wait_over_an_unkillable_daemon_is_the_unkillable_outcome() {
-    let id = TestId::new(PREFIX);
-    let mut cmd = cosca::run([
-        "powershell",
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "Start-Sleep -Seconds 300",
-    ]);
-    cmd.contain();
     let fake = FakeGuard::new();
-    let bus = Arc::new(StopBus::new(fake.log()));
-    let waiter = {
-        let _failing = test_hook::waits(Wait::Fail(None));
-        bus.waiter(id.as_str()).expect("make the waiter thread")
-    };
-    let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::Fails(None))
+        .kill_tree(KillReply::Refuses)
+        .kill(KillReply::Refuses);
+    let (bus, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = {
-        let _refused = test_hook::kills(test_hook::Kill::Refuse);
-        bus.wait_for_child_or_stop(waiter, &child, id.as_str(), || {})
-    };
+    let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
 
     assert!(matches!(outcome, WaitOutcome::DaemonMayRun));
-    child.kill_tree().expect("kill the daemon the call left running");
-    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
-    assert_failures(&fake.take_failures(), id.as_str(), &unkillable_failures());
+    assert!(!daemon.ended(), "the daemon ended though neither kill worked");
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    assert_failures(&fake.take_failures(), ID, &unkillable_failures());
 }
 
 /// A waiter that panics is reported by the join, and a stop over it is still a stop.
 #[skuld::test]
 fn a_panicked_waiter_is_logged_when_the_stop_path_joins_it() {
-    let id = TestId::new(PREFIX);
-    let mut cmd = cosca::run([
-        "powershell",
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "Start-Sleep -Seconds 300",
-    ]);
-    cmd.contain();
     let fake = FakeGuard::new();
-    let bus = Arc::new(StopBus::new(fake.log()));
-    let waiter = {
-        let _panicking = test_hook::waits(Wait::Panic);
-        bus.waiter(id.as_str()).expect("make the waiter thread")
-    };
-    let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
+    let daemon = FakeProcess::new().wait(WaitReply::Panics).kill_tree(KillReply::Ends);
+    let (bus, waiter, child) = launched(&fake, &daemon);
     bus.request_stop();
 
-    let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str(), || {});
+    let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
 
     assert!(
         matches!(outcome, WaitOutcome::Stopping),
-        "the stop's kill is real and reaches the child"
+        "the stop's kill reaches the child"
     );
-    assert_one_failure(
-        &fake.take_failures(),
-        id.as_str(),
-        "the thread waiting on the child panicked",
-    );
-    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Panicked);
+    assert_one_failure(&fake.take_failures(), ID, "the thread waiting on the child panicked");
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Panicked);
 }
 
 /// `kill_tree` fails but the direct-child fallback works: the child is dead and reaped, so the call
 /// joins the waiter, but its descendants may run, as after a failed wait whose tree kill failed.
 #[skuld::test]
 fn a_stop_whose_kill_tree_fails_kills_the_child_and_reports_the_daemon_possibly_running() {
-    let id = TestId::new(PREFIX);
-    let mut cmd = cosca::run([
-        "powershell",
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "Start-Sleep -Seconds 300",
-    ]);
-    cmd.contain();
     let fake = FakeGuard::new();
-    let bus = Arc::new(StopBus::new(fake.log()));
-    let waiter = bus.waiter(id.as_str()).expect("make the waiter thread");
-    let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::Blocks)
+        .kill_tree(KillReply::Refuses)
+        .kill(KillReply::Ends);
+    let (bus, waiter, child) = launched(&fake, &daemon);
     bus.request_stop();
 
-    // The call runs on this thread, so the hook is armed on it; the guard drops with the test.
-    let _refused = test_hook::kills(test_hook::Kill::RefuseTree);
-    let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str(), || {});
+    let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
 
     assert!(
         matches!(outcome, WaitOutcome::DaemonMayRun),
         "the tree kill failed, so the daemon's descendants may still run"
     );
-    assert!(
-        child
-            .wait_timeout(Duration::ZERO)
-            .expect("query the child's exit status")
-            .is_some(),
-        "the fallback kill did not end the child"
-    );
+    assert!(daemon.killed(), "the fallback kill did not end the child");
     assert_failures(
         &fake.take_failures(),
-        id.as_str(),
+        ID,
         &[tree_refused_failure(), TREE_UNKILLED.to_string()],
     );
-    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
 
 /// A waiter that panics before it reports must still wake the call: with no stop requested nothing
@@ -471,55 +340,41 @@ fn a_stop_whose_kill_tree_fails_kills_the_child_and_reports_the_daemon_possibly_
 /// daemon is torn down and confirmed gone, and the panic is logged by the join.
 #[skuld::test]
 fn a_panicked_waiter_is_a_wait_failure_with_no_stop_requested() {
-    let id = TestId::new(PREFIX);
-    let mut cmd = sleeper();
     let fake = FakeGuard::new();
-    let bus = Arc::new(StopBus::new(fake.log()));
-    let waiter = {
-        let _panicking = test_hook::waits(Wait::Panic);
-        bus.waiter(id.as_str()).expect("make the waiter thread")
-    };
-    let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
+    let daemon = FakeProcess::new().wait(WaitReply::Panics).kill_tree(KillReply::Ends);
+    let (bus, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str(), || {});
+    let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
 
     assert!(
         matches!(outcome, WaitOutcome::WaitFailed { os_error: None }),
         "a waiter that panicked was not reported as a failed wait"
     );
-    assert_dead(&child);
-    assert_one_failure(
-        &fake.take_failures(),
-        id.as_str(),
-        "the thread waiting on the child panicked",
-    );
-    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Panicked);
+    assert!(daemon.killed());
+    assert_one_failure(&fake.take_failures(), ID, "the thread waiting on the child panicked");
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Panicked);
 }
 
 /// The OS error of a failed wait reaches the outcome, which `service` reports as the shim failure.
 #[skuld::test]
 fn a_failed_background_wait_carries_its_os_error() {
-    let id = TestId::new(PREFIX);
-    let mut cmd = sleeper();
     let fake = FakeGuard::new();
-    let bus = Arc::new(StopBus::new(fake.log()));
-    let waiter = {
-        let _failing = test_hook::waits(Wait::Fail(Some(5)));
-        bus.waiter(id.as_str()).expect("make the waiter thread")
-    };
-    let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::Fails(Some(5)))
+        .kill_tree(KillReply::Ends);
+    let (bus, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str(), || {});
+    let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
 
     assert!(
         matches!(outcome, WaitOutcome::WaitFailed { os_error: Some(5) }),
         "the OS error of the failed wait was lost"
     );
-    assert_dead(&child);
-    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+    assert!(daemon.killed());
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     assert_one_failure(
         &fake.take_failures(),
-        id.as_str(),
+        ID,
         &format!("background wait on child: {}", io::Error::from_raw_os_error(5)),
     );
 }
@@ -527,25 +382,21 @@ fn a_failed_background_wait_carries_its_os_error() {
 /// A stop requested over a failed wait wins, as it does over an exit.
 #[skuld::test]
 fn a_stop_wins_over_a_failed_background_wait() {
-    let id = TestId::new(PREFIX);
-    let mut cmd = sleeper();
     let fake = FakeGuard::new();
-    let bus = Arc::new(StopBus::new(fake.log()));
-    let waiter = {
-        let _failing = test_hook::waits(Wait::Fail(None));
-        bus.waiter(id.as_str()).expect("make the waiter thread")
-    };
-    let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::Fails(None))
+        .kill_tree(KillReply::Ends);
+    let (bus, waiter, child) = launched(&fake, &daemon);
     bus.request_stop();
 
-    let outcome = bus.wait_for_child_or_stop(waiter, &child, id.as_str(), || {});
+    let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
 
     assert!(matches!(outcome, WaitOutcome::Stopping));
-    assert_dead(&child);
-    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
+    assert!(daemon.killed());
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     assert_one_failure(
         &fake.take_failures(),
-        id.as_str(),
+        ID,
         &format!("background wait on child: {WAIT_FAILED}"),
     );
 }
@@ -554,82 +405,63 @@ fn a_stop_wins_over_a_failed_background_wait() {
 /// is not a restartable failure.
 #[skuld::test]
 fn a_failed_background_wait_whose_tree_kill_failed_is_not_a_restartable_failure() {
-    let id = TestId::new(PREFIX);
-    let mut cmd = sleeper();
     let fake = FakeGuard::new();
-    let bus = Arc::new(StopBus::new(fake.log()));
-    let waiter = {
-        let _failing = test_hook::waits(Wait::Fail(None));
-        bus.waiter(id.as_str()).expect("make the waiter thread")
-    };
-    let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::Fails(None))
+        .kill_tree(KillReply::Refuses)
+        .kill(KillReply::Ends);
+    let (bus, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = {
-        let _refused = test_hook::kills(test_hook::Kill::RefuseTree);
-        bus.wait_for_child_or_stop(waiter, &child, id.as_str(), || {})
-    };
+    let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
 
     assert!(matches!(outcome, WaitOutcome::DaemonMayRun));
-    assert_dead(&child);
-    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
-    assert_failures(&fake.take_failures(), id.as_str(), &tree_unkilled_failures());
+    assert!(daemon.killed());
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    assert_failures(&fake.take_failures(), ID, &tree_unkilled_failures());
 }
 
 /// A failed wait that ends in `DaemonMayRun` is a decided failure: a stop arriving afterwards must be
 /// refused, not acknowledged over a daemon that may be running.
 #[skuld::test]
 fn a_failed_wait_over_an_unkillable_daemon_refuses_a_later_stop() {
-    let id = TestId::new(PREFIX);
-    let mut cmd = sleeper();
     let fake = FakeGuard::new();
-    let bus = Arc::new(StopBus::new(fake.log()));
-    let waiter = {
-        let _failing = test_hook::waits(Wait::Fail(None));
-        bus.waiter(id.as_str()).expect("make the waiter thread")
-    };
-    let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::Fails(None))
+        .kill_tree(KillReply::Refuses)
+        .kill(KillReply::Refuses);
+    let (bus, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = {
-        let _refused = test_hook::kills(test_hook::Kill::Refuse);
-        bus.wait_for_child_or_stop(waiter, &child, id.as_str(), || {})
-    };
+    let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
 
     assert!(matches!(outcome, WaitOutcome::DaemonMayRun));
     assert!(
         !bus.request_stop(),
         "a stop was acknowledged over a daemon that may still be running"
     );
-    child.kill_tree().expect("kill the daemon the call left running");
-    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
-    assert_failures(&fake.take_failures(), id.as_str(), &unkillable_failures());
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    assert_failures(&fake.take_failures(), ID, &unkillable_failures());
 }
 
 /// The same when only the tree kill is refused and the direct child's kill works.
 #[skuld::test]
 fn a_failed_wait_whose_tree_kill_was_refused_refuses_a_later_stop() {
-    let id = TestId::new(PREFIX);
-    let mut cmd = sleeper();
     let fake = FakeGuard::new();
-    let bus = Arc::new(StopBus::new(fake.log()));
-    let waiter = {
-        let _failing = test_hook::waits(Wait::Fail(None));
-        bus.waiter(id.as_str()).expect("make the waiter thread")
-    };
-    let child = Arc::new(cmd.spawn().expect("spawn a long-running child"));
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::Fails(None))
+        .kill_tree(KillReply::Refuses)
+        .kill(KillReply::Ends);
+    let (bus, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = {
-        let _refused = test_hook::kills(test_hook::Kill::RefuseTree);
-        bus.wait_for_child_or_stop(waiter, &child, id.as_str(), || {})
-    };
+    let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
 
     assert!(matches!(outcome, WaitOutcome::DaemonMayRun));
     assert!(
         !bus.request_stop(),
         "a stop was acknowledged over a daemon whose tree may still be running"
     );
-    assert_dead(&child);
-    assert_eq!(waiter_end(id.as_str()), WaiterEnd::Returned);
-    assert_failures(&fake.take_failures(), id.as_str(), &tree_unkilled_failures());
+    assert!(daemon.killed());
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    assert_failures(&fake.take_failures(), ID, &tree_unkilled_failures());
 }
 
 // Fate ----------------------------------------------------------------------------------------------------------------
@@ -637,7 +469,7 @@ fn a_failed_wait_whose_tree_kill_was_refused_refuses_a_later_stop() {
 #[skuld::test]
 fn a_stop_after_a_failure_was_decided_is_refused() {
     let fake = FakeGuard::new();
-    let bus = StopBus::new(fake.log());
+    let bus = bus(&fake);
 
     assert_eq!(bus.settle(Reported::DaemonExit(7)), Reported::DaemonExit(7));
 
@@ -650,7 +482,7 @@ fn a_stop_after_a_failure_was_decided_is_refused() {
 #[skuld::test]
 fn a_stop_before_a_failure_was_decided_turns_the_failure_into_a_clean_stop() {
     let fake = FakeGuard::new();
-    let bus = StopBus::new(fake.log());
+    let bus = bus(&fake);
 
     assert!(bus.request_stop());
 
@@ -661,7 +493,7 @@ fn a_stop_before_a_failure_was_decided_turns_the_failure_into_a_clean_stop() {
 #[skuld::test]
 fn a_clean_exit_does_not_refuse_a_later_stop() {
     let fake = FakeGuard::new();
-    let bus = StopBus::new(fake.log());
+    let bus = bus(&fake);
 
     assert_eq!(bus.settle(Reported::Clean), Reported::Clean);
 
@@ -671,7 +503,7 @@ fn a_clean_exit_does_not_refuse_a_later_stop() {
 #[skuld::test]
 fn a_repeated_stop_is_accepted_again() {
     let fake = FakeGuard::new();
-    let bus = StopBus::new(fake.log());
+    let bus = bus(&fake);
 
     assert!(bus.request_stop());
     assert!(bus.request_stop());
@@ -694,32 +526,6 @@ fn unkillable_failures() -> [String; 3] {
     [
         format!("background wait on child: {WAIT_FAILED}"),
         tree_refused_failure(),
-        format!(
-            "fallback kill: {KILL_REFUSED}; the daemon was neither killed nor reaped and may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure"
-        ),
+        fallback_refused_failure(),
     ]
-}
-
-fn tree_refused_failure() -> String {
-    format!(
-        "kill_tree: {KILL_REFUSED}; falling back to killing the direct child only (its own descendants, if any, cannot be reached without a containment mechanism)"
-    )
-}
-
-fn sleeper() -> cosca::Command {
-    let mut cmd = cosca::run([
-        "powershell",
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "Start-Sleep -Seconds 300",
-    ]);
-    cmd.contain();
-    cmd
-}
-
-/// Termination is asynchronous, so this waits for the exit rather than polling for it; a daemon left
-/// running hangs here, for CI's watchdog to report.
-fn assert_dead(child: &Child) {
-    child.wait().expect("the daemon ends once the call has killed it");
 }
