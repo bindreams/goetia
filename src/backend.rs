@@ -19,6 +19,14 @@ pub mod launchd;
 pub mod scm;
 pub mod systemd;
 
+/// The integration suites' removal of what a test created, shared with the library's unit tests;
+/// they reach `tests/` only by path, and each module that included it itself would load it twice.
+/// Only Linux and macOS compile it: its library users are the systemd and launchd tests, and on
+/// other targets everything in it would be dead code.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[path = "../tests/support/cleanup.rs"]
+pub(crate) mod test_cleanup;
+
 pub(crate) use contract::{
     Backend, Decoded, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, Unnamed,
     WriteOutcome,

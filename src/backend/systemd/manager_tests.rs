@@ -5,12 +5,11 @@
 //! something no interleaving of `install` calls alone can force deterministically.
 //!
 //! Most of these are elevated (they write real files under `/etc/systemd/system`), so they opt into
-//! the same `elevated` precondition/label convention `tests/support/mod.rs` uses, duplicated locally
-//! rather than shared: a plain library unit test cannot depend on the `tests/` integration-test
-//! support crate.
+//! the `elevated` precondition/label convention `tests/support/mod.rs` uses, as a local copy: that
+//! module pulls in the rest of the integration-test crate (`cmd`, `service_guard`, ...). Only
+//! `tests/support/cleanup.rs` is shared, as `backend::test_cleanup`.
 
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::dirs::ensure_dir;
@@ -20,6 +19,8 @@ use super::*;
 use crate::manager::ServiceManager;
 use crate::manager::conformance::fresh_id;
 use crate::spec::Kind;
+
+use crate::backend::test_cleanup::{DirGuard, FileGuard, remove_or_warn};
 
 #[skuld::label]
 const ELEVATED: skuld::Label;
@@ -32,26 +33,42 @@ fn elevated() -> std::result::Result<(), String> {
     }
 }
 
-/// RAII cleanup so a failed assertion still removes the file it wrote.
-struct Cleanup(PathBuf);
+/// On drop, removes every `unique_quarantine_path(id)` file the test's scenario left behind.
+/// Production deliberately leaves one on an unrecoverable double-race so a human can find it, and a
+/// failed assertion can strand the backup of a test that restores it. Register it before the call
+/// that can create one.
+struct QuarantineSweep(String);
 
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+impl QuarantineSweep {
+    fn new(id: &str) -> Self {
+        Self(id.to_string())
     }
 }
 
-/// Removes any `unique_quarantine_path(id)` file left behind — production deliberately leaves one on
-/// an unrecoverable double-race so a human can find it, but a test that engineered that exact
-/// scenario on purpose doesn't need the evidence kept around afterward.
-fn sweep_quarantine_files(id: &str) {
-    let Ok(entries) = std::fs::read_dir(UNIT_DIR) else {
-        return;
-    };
-    let prefix = format!(".{id}.service.goetia-quarantine");
-    for entry in entries.flatten() {
-        if entry.file_name().to_string_lossy().starts_with(&prefix) {
-            let _ = std::fs::remove_file(entry.path());
+impl Drop for QuarantineSweep {
+    fn drop(&mut self) {
+        let entries = match std::fs::read_dir(UNIT_DIR) {
+            Ok(entries) => entries,
+            Err(e) => {
+                eprintln!(
+                    "warning: left behind: list {UNIT_DIR} for the quarantine files of {}: {e}",
+                    self.0
+                );
+                return;
+            }
+        };
+        let prefix = format!(".{}.service.goetia-quarantine", self.0);
+        for entry in entries {
+            match entry {
+                Ok(entry) if entry.file_name().to_string_lossy().starts_with(&prefix) => {
+                    remove_or_warn(&entry.path(), false);
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!(
+                    "warning: left behind: read {UNIT_DIR} for the quarantine files of {}: {e}",
+                    self.0
+                ),
+            }
         }
     }
 }
@@ -69,7 +86,7 @@ fn mk(id: &str) -> DaemonSpec {
 fn create_does_not_clobber_a_unit_that_appears_after_classification() {
     let id = fresh_id("systemd");
     let path = unit_path(&id);
-    let _cleanup = Cleanup(path.clone());
+    let _cleanup = FileGuard::new(path.clone());
 
     // "Classification" (what `install`'s `read` does) sees nothing here yet.
     assert!(matches!(raw_state(&id).expect("raw_state"), RawState::Absent));
@@ -101,7 +118,8 @@ fn create_does_not_clobber_a_unit_that_appears_after_classification() {
 fn quarantine_detects_a_swap_that_happened_after_classification() {
     let id = fresh_id("systemd");
     let path = unit_path(&id);
-    let _cleanup = Cleanup(path.clone());
+    let _cleanup = FileGuard::new(path.clone());
+    let _sweep = QuarantineSweep::new(&id);
 
     let original_text = "[Unit]\nDescription=goetia original\n";
     std::fs::write(&path, original_text).expect("write original");
@@ -126,7 +144,8 @@ fn quarantine_detects_a_swap_that_happened_after_classification() {
 fn quarantine_succeeds_when_nothing_raced() {
     let id = fresh_id("systemd");
     let path = unit_path(&id);
-    let _cleanup = Cleanup(path.clone());
+    let _cleanup = FileGuard::new(path.clone());
+    let _sweep = QuarantineSweep::new(&id);
 
     let text = "[Unit]\nDescription=goetia unraced\n";
     std::fs::write(&path, text).expect("write");
@@ -138,7 +157,7 @@ fn quarantine_succeeds_when_nothing_raced() {
     let quarantined_text = std::fs::read_to_string(&backup).expect("read quarantined file");
     assert_eq!(quarantined_text, text);
 
-    // Restore, so `Cleanup` (which only knows `path`) still cleans up correctly.
+    // Restore the backup: part of what this checks, and `FileGuard` only knows `path`.
     std::fs::rename(&backup, &path).expect("restore for cleanup");
 }
 
@@ -163,7 +182,7 @@ fn quarantine_succeeds_when_nothing_raced() {
 fn install_never_corrupts_state_when_something_races_the_first_create() {
     let id = fresh_id("systemd");
     let path = unit_path(&id);
-    let _cleanup = Cleanup(path.clone());
+    let _cleanup = FileGuard::new(path.clone());
 
     let done = AtomicBool::new(false);
     let foreign_text = "[Unit]\nDescription=raced in\n";
@@ -207,21 +226,12 @@ fn install_never_corrupts_state_when_something_races_the_first_create() {
 
 // ensure_dir: parent directories ======================================================================================
 
-/// RAII cleanup for a directory tree.
-struct RmDir(PathBuf);
-
-impl Drop for RmDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn ensure_dir_leaves_a_preexisting_directory_untouched() {
     let dir = std::env::temp_dir().join(format!("{}-preexisting", fresh_id("systemd")));
     std::fs::create_dir(&dir).expect("create pre-existing dir");
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
-    let _cleanup = RmDir(dir.clone());
+    let _cleanup = DirGuard::new(dir.clone());
 
     ensure_dir(&dir, &User::Root).expect("ensure_dir on a pre-existing dir");
 
@@ -240,7 +250,7 @@ fn ensure_dir_accepts_a_preexisting_directory_the_account_cannot_write() {
     let dir = std::env::temp_dir().join(format!("{}-unwritable", fresh_id("systemd")));
     std::fs::create_dir(&dir).expect("create pre-existing dir");
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
-    let _cleanup = RmDir(dir.clone());
+    let _cleanup = DirGuard::new(dir.clone());
 
     ensure_dir(&dir, &User::Name("nobody".to_string())).expect("ensure_dir");
 
@@ -253,7 +263,7 @@ fn ensure_dir_accepts_a_preexisting_directory_the_account_cannot_write() {
 fn ensure_dir_refuses_a_preexisting_file() {
     let path = std::env::temp_dir().join(format!("{}-a-file", fresh_id("systemd")));
     std::fs::write(&path, b"").expect("create file");
-    let _cleanup = Cleanup(path.clone());
+    let _cleanup = FileGuard::new(path.clone());
 
     let err = ensure_dir(&path, &User::Root).expect_err("a file cannot be a directory");
     assert!(err.to_string().contains("not a directory"), "{err}");
@@ -269,7 +279,8 @@ fn ensure_dir_refuses_a_preexisting_file() {
 fn replace_reports_raced_twice_rather_than_guessing_which_file_wins() {
     let id = fresh_id("systemd");
     let path = unit_path(&id);
-    let _cleanup = Cleanup(path.clone());
+    let _cleanup = FileGuard::new(path.clone());
+    let _sweep = QuarantineSweep::new(&id);
 
     let original_text = "[Unit]\nDescription=goetia original\n";
     std::fs::write(&path, original_text).expect("write original");
@@ -309,10 +320,6 @@ fn replace_reports_raced_twice_rather_than_guessing_which_file_wins() {
                     on_disk, intruder_text,
                     "the intruder's file must survive the reported race untouched"
                 );
-                // Production deliberately leaves the quarantine file behind here for a human to
-                // recover — see the error message this asserts above — but this test controlled the
-                // whole scenario and doesn't need it kept around.
-                sweep_quarantine_files(&id);
             }
         }
     });
@@ -326,7 +333,8 @@ fn replace_reports_raced_twice_rather_than_guessing_which_file_wins() {
 fn quarantine_used_by_uninstall_reports_a_race_instead_of_removing_the_wrong_file() {
     let id = fresh_id("systemd");
     let path = unit_path(&id);
-    let _cleanup = Cleanup(path.clone());
+    let _cleanup = FileGuard::new(path.clone());
+    let _sweep = QuarantineSweep::new(&id);
 
     let classified_text = "[Unit]\nDescription=goetia, as read saw it\n";
     std::fs::write(&path, classified_text).expect("write");

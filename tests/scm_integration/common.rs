@@ -62,12 +62,16 @@ pub fn query_account_name(id: &str) -> Option<String> {
 /// either, hence the explicit `icacls` grant.
 pub struct WorldReadableExe {
     path: PathBuf,
+    _remove: support::cleanup::FileGuard,
 }
 
 impl WorldReadableExe {
     pub fn new(id: &str) -> Self {
         let path = support::program_data().join(format!("{id}.exe"));
-        let guard = Self { path };
+        let guard = Self {
+            _remove: support::cleanup::FileGuard::new(path.clone()),
+            path,
+        };
         let exe = std::env::current_exe().expect("locate the test binary");
         std::fs::copy(&exe, &guard.path)
             .unwrap_or_else(|e| panic!("copy {} to {}: {e}", exe.display(), guard.path.display()));
@@ -83,16 +87,6 @@ impl WorldReadableExe {
             .to_str()
             .unwrap_or_else(|| panic!("{} is not UTF-8", self.path.display()))
             .to_string()
-    }
-}
-
-impl Drop for WorldReadableExe {
-    fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_file(&self.path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("WorldReadableExe[{}]: cleanup failed: {e}", self.path.display());
-            }
-        }
     }
 }
 
