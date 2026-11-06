@@ -86,8 +86,13 @@ impl DebugPrivilegeDisabled {
 
 impl Drop for DebugPrivilegeDisabled {
     fn drop(&mut self) {
-        // SAFETY: no arguments; ends the impersonation begun in `new`.
-        assert_ne!(unsafe { RevertToSelf() }, 0, "RevertToSelf");
+        // SAFETY: no arguments; ends the impersonation begun in `new`. Never panics: this also runs
+        // while the test unwinds.
+        if unsafe { RevertToSelf() } == 0 {
+            // SAFETY: no arguments; reads this thread's last error, set by the call above.
+            let code = unsafe { GetLastError() };
+            eprintln!("warning: RevertToSelf failed ({code}); this thread still impersonates");
+        }
     }
 }
 
