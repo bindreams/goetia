@@ -22,21 +22,32 @@ use crate::logging::Log;
 use crate::service::build_command;
 use crate::test_support::{daemon_spec, not_found};
 
-/// Holds a real daemon and ends its tree when dropped, so a failing test leaves no sleeper behind.
-/// Made before the spawn it will hold.
+/// Holds a real daemon and ends it when dropped, so a failing test leaves no sleeper behind. Made
+/// before the spawn it will hold.
 #[derive(Default)]
-struct Reap(Option<Box<dyn Spawned>>);
+struct Reap {
+    child: Option<Box<dyn Spawned>>,
+    /// A daemon whose `Spawned` was detached: held by identity.
+    detached: Option<Process>,
+}
 
 impl Reap {
     fn hold(&mut self, child: Box<dyn Spawned>) -> &dyn Spawned {
-        &**self.0.insert(child)
+        &**self.child.insert(child)
+    }
+
+    fn hold_detached(&mut self, process: Process) -> &Process {
+        self.detached.insert(process)
     }
 }
 
 impl Drop for Reap {
     fn drop(&mut self) {
-        if let Some(child) = &self.0 {
-            let _ = child.kill_tree();
+        if let Some(Err(e)) = self.child.as_ref().map(|child| child.kill_tree()) {
+            eprintln!("Reap: left a daemon running: {e}");
+        }
+        if let Some(Err(e)) = self.detached.as_ref().map(Process::kill) {
+            eprintln!("Reap: left a daemon running: {e}");
         }
     }
 }
@@ -73,6 +84,36 @@ fn kill_tree_ends_a_job_contained_daemon_and_its_grandchild() {
 
     grandchild.wait().expect("the grandchild ends once the tree is killed");
     daemon.wait().expect("the daemon ends once the tree is killed");
+}
+
+/// The direct-child kill, which `kill_tree` ends in: the daemon ends, and `wait` returns.
+#[skuld::test]
+fn kill_ends_a_real_daemon() {
+    let mut reap = Reap::default();
+    let daemon = reap.hold(
+        Real.spawn(powershell("Start-Sleep -Seconds 300"))
+            .expect("spawn the daemon"),
+    );
+
+    daemon.kill().expect("kill the daemon");
+
+    let status = daemon.wait().expect("the daemon ends once it is killed");
+    assert!(!status.success(), "a killed daemon exited cleanly");
+}
+
+/// Dropping the `Spawned` would kill the daemon's job and wait for it. A detached one leaves the
+/// daemon running; the test then ends it through the `Reap`.
+#[skuld::test]
+fn detach_leaves_the_daemon_running_after_its_handle_is_gone() {
+    let mut reap = Reap::default();
+    let child = powershell("Start-Sleep -Seconds 300")
+        .spawn()
+        .expect("spawn the daemon");
+    let daemon = reap.hold_detached(Process::from_id(child.id()));
+
+    Spawned::detach(Box::new(child));
+
+    assert_eq!(daemon.is_alive(), Liveness::Alive);
 }
 
 /// The supervisor asks for the status twice: the waiter's wait, then the one that reads the code.
