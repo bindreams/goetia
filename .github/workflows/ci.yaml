@@ -23,11 +23,8 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Every job builds with `Cargo.toml`'s `rust-version`, so the declared floor
-  # is the one that is checked. The version is read here once, with `tomllib`,
-  # not with `cargo metadata` from the runner image's preinstalled Rust: that
-  # toolchain is whichever release the image carries, and the toolchain install
-  # below needs the version as an input before it exists.
+  # Every job builds with `Cargo.toml`'s `rust-version`, so the declared floor is the one checked.
+  # Read with `tomllib`: the toolchain install needs the version before that toolchain exists.
   rust-version:
     name: Rust version
     runs-on: ubuntu-latest

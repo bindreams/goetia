@@ -2,9 +2,7 @@
 name = "goetia"
 version = "0.2.0"
 edition = "2024"
-# CI builds with exactly this toolchain. Let-chains and `slice::as_chunks`
-# (both stable in 1.88) force the floor; `std::io::PipeReader`, used by goetia
-# and by cosca, needs 1.87.
+# Let-chains and `slice::as_chunks` (both stable in 1.88) force the floor.
 rust-version = "1.88"
 description = "Install system daemons described in goetia.yaml as native Windows/SCM, macOS/launchd, and Linux/systemd services"
 license = "Apache-2.0"
