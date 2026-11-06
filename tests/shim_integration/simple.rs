@@ -248,14 +248,12 @@ fn the_shim_reports_stop_pending_then_stopped() {
         .wait_callback(Budget::Unbounded.start())
         .expect("wait for the first state after a stop");
     assert_eq!(observed, Some(Observed::Pending), "the first state after a stop");
-    // The shim reports `SERVICE_ACCEPT_STOP` or nothing, so not accepting STOP is `controls_accepted == 0`.
-    assert!(!actor.accepts_stop(), "no control is accepted while stopping");
-    // STOP_PENDING and STOPPED both accept nothing, so this read is race-free in either state.
-    let status = service.query_status().expect("query the status after a stop");
-    assert!(
-        status.controls_accepted.is_empty(),
-        "no control is accepted while stopping: {:?}",
-        status.controls_accepted
+    // The shim reports STOP_PENDING with no control accepted; read from the notification, not queried,
+    // as a fresh query can land on STOPPED, which also accepts nothing.
+    assert_eq!(
+        actor.delivered_controls_accepted(),
+        0,
+        "no control is accepted while stopping"
     );
 
     // A settled state other than `STOPPED` fails the test instead of hanging it; `STOP_PENDING` waits.

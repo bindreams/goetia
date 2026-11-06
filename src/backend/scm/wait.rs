@@ -149,9 +149,13 @@ pub trait ScmActor {
     /// afterwards: a recovery action may have restarted the service by then.
     fn delivered_exit(&self) -> RecordedExit;
     /// The `dwWaitHint` of the same notification, in milliseconds, for any state; the one that
-    /// matters is a `Stopped`'s. Read from that notification, as [`Self::delivered_exit`] is. A shim reports `STOPPED` with 0; SCM's own failed recovery start
-    /// leaves 2000 on its `STOPPED` (measured).
+    /// matters is a `Stopped`'s. Read from that notification, as [`Self::delivered_exit`] is. A shim
+    /// reports `STOPPED` with 0; SCM's own failed recovery start leaves 2000 on its `STOPPED`
+    /// (measured).
     fn delivered_wait_hint(&self) -> u32;
+    /// The whole `dwControlsAccepted` of the notification the last [`Self::wait_callback`] returned.
+    /// Read from that notification, as [`Self::delivered_exit`] is.
+    fn delivered_controls_accepted(&self) -> u32;
     /// Whether the notification the last [`Self::wait_callback`] returned had
     /// `SERVICE_ACCEPT_STOP` in its `dwControlsAccepted`. Read from that notification, not queried
     /// afterwards, for the reason [`Self::delivered_exit`] is.
@@ -329,16 +333,9 @@ pub(crate) fn settle_and_stop<A: ScmActor>(a: &mut A, deadline: Deadline) -> io:
                 refused = None;
                 match a.wait_callback(deadline)? {
                     None => return Ok(Waited::Expired),
-                    Some(Observed::Stopped) => Seen::Stopped,
-                    Some(Observed::Pending) => Seen::Pending,
-                    Some(Observed::Running) => Seen::Settled {
-                        state: "RUNNING",
-                        accepts_stop: a.accepts_stop(),
-                    },
-                    Some(Observed::Paused) => Seen::Settled {
-                        state: "PAUSED",
-                        accepts_stop: a.accepts_stop(),
-                    },
+                    Some(observed) => notified_state(observed)
+                        .and_then(|state| seen_in(delivered_status(a, state)))
+                        .unwrap_or(Seen::Pending),
                 }
             }
         };
@@ -465,8 +462,9 @@ pub struct Sighting {
 /// `target`, in a status or a notification, is [`Waited::Confirmed`]. An arm that expired and a wait
 /// that ran out of `deadline` are [`Waited::Expired`]. A service marked for deletion or gone is decided
 /// as `decided_or_status` says. A notification of a pending state re-arms without asking `other`, and
-/// so does one of a state the armed mask excludes: SCM never sends one, so a debug build asserts,
-/// and a release build waits on as for a pending state. Every other state, from a status or a notification, goes to
+/// so does one the armed mask excludes, a pending state under a mask with none included: SCM never
+/// sends one, so a debug build asserts, and a release build re-arms as for a pending state. Every
+/// other state, from a status or a notification, goes to
 /// `other` as a [`Sighting`]: `Break` ends the wait with that answer, an error ends it with the error,
 /// and `Continue` keeps waiting (after a notification, by re-arming).
 ///
@@ -495,14 +493,15 @@ pub fn wait_until<A: ScmActor>(
             },
             None => match a.wait_callback(deadline)? {
                 None => return Ok(Waited::Expired),
-                Some(observed) => match notified_state(observed) {
-                    None => None,
-                    Some(state) if mask.states().contains(&state) => Some(delivered_status(a, state)),
-                    Some(state) => {
-                        debug_assert!(false, "SCM delivered {state:?} outside the armed mask {mask:?}");
-                        None
+                Some(observed) => {
+                    let state = notified_state(observed);
+                    if !delivered_in(mask, state) {
+                        debug_assert!(false, "SCM delivered {observed:?} outside the armed mask {mask:?}");
                     }
-                },
+                    state
+                        .filter(|state| mask.states().contains(state))
+                        .map(|state| delivered_status(a, state))
+                }
             },
         };
         if let Some(status) = status {
@@ -531,6 +530,18 @@ fn notified_state(observed: Observed) -> Option<QueriedState> {
         Observed::Running => Some(QueriedState::Running),
         Observed::Paused => Some(QueriedState::Paused),
         Observed::Stopped => Some(QueriedState::Stopped),
+    }
+}
+
+/// Whether SCM may deliver a notification of `state` (`None` for a pending one) to a registration
+/// for `mask`.
+fn delivered_in(mask: WantState, state: Option<QueriedState>) -> bool {
+    match state {
+        Some(state) => mask.states().contains(&state),
+        None => mask
+            .states()
+            .iter()
+            .any(|state| matches!(state, QueriedState::StartPending | QueriedState::StopPending)),
     }
 }
 

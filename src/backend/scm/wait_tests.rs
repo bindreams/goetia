@@ -459,6 +459,10 @@ impl ScmActor for FakeScm {
     fn delivered_wait_hint(&self) -> u32 {
         self.wait_hint
     }
+    fn delivered_controls_accepted(&self) -> u32 {
+        // Bit 0 is `SERVICE_ACCEPT_STOP`, the only control the fake models.
+        u32::from(self.last_accepts)
+    }
 }
 
 /// The record of a service whose shim failed before launching the daemon.

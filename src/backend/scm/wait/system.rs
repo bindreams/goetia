@@ -459,7 +459,11 @@ impl super::ScmActor for SystemScmActor {
         })
     }
 
+    fn delivered_controls_accepted(&self) -> u32 {
+        self.status.controls_accepted.load(Ordering::Acquire)
+    }
+
     fn accepts_stop(&self) -> bool {
-        self.status.controls_accepted.load(Ordering::Acquire) & SERVICE_ACCEPT_STOP != 0
+        self.delivered_controls_accepted() & SERVICE_ACCEPT_STOP != 0
     }
 }
