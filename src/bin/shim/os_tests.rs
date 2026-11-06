@@ -103,6 +103,8 @@ fn kill_ends_a_real_daemon() {
 /// Dropping the `Spawned` would kill the daemon's job. The daemon echoes its stdin, so a line
 /// written after the detach and read back proves it still ran then: a daemon the job had ended
 /// closes its stdout, and the read sees end of file. The test then ends it through the `Reap`.
+/// This pins `Real::detach`'s delegation: without it `Child::drop` kills and waits before
+/// returning. Whether cosca's disarm itself holds is cosca's to test.
 #[skuld::test]
 fn detach_leaves_the_daemon_running_after_its_handle_is_gone() {
     let mut reap = Reap::default();
