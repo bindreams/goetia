@@ -1177,38 +1177,42 @@ fn the_version_gate_probes_once_per_daemon_per_verb() {
     }
 }
 
-/// Shell builtins only, so it forks nothing even at `TasksMax=1`: reads the scope's own cgroup
-/// from `/proc/self/cgroup` (cgroup v2: `0::<path>`) and reports its `pids.max` and `pids.current`
-/// on stderr, then `exec`s goetia (`$0 "$@"`) in the same process.
-const SCOPE_PIDS_PREAMBLE: &str = r#"read -r line < /proc/self/cgroup; cg=${line#0::}; read -r max < "/sys/fs/cgroup$cg/pids.max"; read -r cur < "/sys/fs/cgroup$cg/pids.current"; echo "scope at start: cgroup=$cg pids.max=$max pids.current=$cur" >&2; exec "$0" "$@""#;
+/// Shell builtins only, so it forks nothing even at `TasksMax=1`: finds the `0::<path>` line of
+/// `/proc/self/cgroup` (cgroup v2), reports that cgroup's `pids.max` and `pids.current` on stderr
+/// (or, with no such line, every line it saw), then `exec`s goetia (`$0 "$@"`) in the same process.
+const SCOPE_PIDS_PREAMBLE: &str = r#"cg=; seen=; while read -r line; do seen="$seen[$line]"; case $line in 0::*) cg=${line#0::};; esac; done < /proc/self/cgroup; if [ -n "$cg" ]; then max=unreadable; cur=unreadable; read -r max < "/sys/fs/cgroup$cg/pids.max"; read -r cur < "/sys/fs/cgroup$cg/pids.current"; echo "scope at start: cgroup=$cg pids.max=$max pids.current=$cur" >&2; else echo "scope at start: no cgroup v2 path in /proc/self/cgroup: $seen" >&2; fi; exec "$0" "$@""#;
+
+/// Ends the transient scope `unit` and clears the `failed` state a scope can be left in, which
+/// would make the next `systemd-run --unit` of the same name fail. Registered before the scope is
+/// made; a scope that never was, or is gone already, is "not loaded".
+struct ScopeGuard(String);
+
+impl Drop for ScopeGuard {
+    fn drop(&mut self) {
+        for verb in ["stop", "reset-failed"] {
+            let run = cmd::run("systemctl", &[verb, &self.0]);
+            if !run.ok() && run.code != Some(5) && !run.stderr.contains("not loaded") {
+                eprintln!("ScopeGuard[{}]: cleanup failed: {run}", self.0);
+            }
+        }
+    }
+}
 
 /// `goetia <args>` in the transient scope `unit` allowed `tasks` tasks — threads and processes
-/// alike — so that making a thread, or spawning a process, fails once they are spent. The scope
-/// reports its own limit on stderr before goetia starts.
+/// alike — so that making a thread, or spawning a process, fails once they are spent. At
+/// `tasks == 1`, where a success means the sweep tested nothing, the scope reports its own limit on
+/// stderr before goetia starts; every other count runs goetia directly.
 fn goetia_with_tasks(unit: &str, tasks: u32, args: &[&str]) -> std::process::Output {
-    Command::new("systemd-run")
-        .args(["--quiet", "--scope", "--unit", unit, "-p", &format!("TasksMax={tasks}")])
-        .args(["sh", "-c", SCOPE_PIDS_PREAMBLE])
+    let mut command = Command::new("systemd-run");
+    command.args(["--quiet", "--scope", "--unit", unit, "-p", &format!("TasksMax={tasks}")]);
+    if tasks == 1 {
+        command.args(["sh", "-c", SCOPE_PIDS_PREAMBLE]);
+    }
+    command
         .arg(env!("CARGO_BIN_EXE_goetia"))
         .args(args)
         .output()
         .expect("spawn systemd-run")
-}
-
-/// `pids.max` and `pids.current` of the transient scope `unit`, read after goetia exited, or the
-/// error that read gave: a scope whose last process has exited is gone, and its cgroup with it.
-fn scope_pids(unit: &str) -> String {
-    let dir = Path::new("/sys/fs/cgroup/system.slice").join(unit);
-    let read = |file: &str| match fs::read_to_string(dir.join(file)) {
-        Ok(value) => value.trim().to_string(),
-        Err(err) => format!("unreadable: {err}"),
-    };
-    format!(
-        "after exit, {}: pids.max={} pids.current={}",
-        dir.display(),
-        read("pids.max"),
-        read("pids.current")
-    )
 }
 
 /// goetia never panics for want of a task; a verb that cannot get what its request needs exits `1`,
@@ -1220,9 +1224,13 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
     let guard = ServiceGuard::new(&id);
     Systemd::new().install(&mk(guard.id()), false).expect("install");
 
+    // Every scope gets a name no earlier one had, so one still loaded cannot fail `systemd-run`.
+    let scopes = std::cell::Cell::new(0u32);
     let sweep = |args: &[&str], untouched: &dyn Fn(u32)| {
         for tasks in 1.. {
-            let unit = format!("{}-tasks-{tasks}.scope", guard.id());
+            scopes.set(scopes.get() + 1);
+            let unit = format!("{}-tasks-{}.scope", guard.id(), scopes.get());
+            let _scope = ScopeGuard(unit.clone());
             let output = goetia_with_tasks(&unit, tasks, args);
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
             assert!(!stderr.contains("panicked"), "{args:?} TasksMax={tasks}: {stderr}");
@@ -1232,14 +1240,10 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
                     // starved the verb.
                     assert!(
                         tasks > 1,
-                        "{args:?} succeeded with a single task, so the sweep tested nothing
-                         scope: {unit}
-{}
---- stdout ---
-{}
---- stderr ---
-{stderr}",
-                        scope_pids(&unit),
+                        "{args:?} succeeded with a single task, so the sweep tested nothing\n\
+                         scope: {unit} (TasksMax={tasks})\n\
+                         --- stdout ---\n{}\n\
+                         --- stderr ---\n{stderr}",
                         String::from_utf8_lossy(&output.stdout),
                     );
                     return;
