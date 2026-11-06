@@ -11,7 +11,7 @@
 //! reports nothing surfaces later only as a mysterious straggler in
 //! `systemctl` / `launchctl` / `services.msc`, long after the run that left it.
 
-use super::cleanup::remove_path;
+use super::cleanup::remove_path_retrying;
 use super::{LAUNCHD_DAEMON_DIR, SYSTEMD_UNIT_DIR, cmd};
 
 pub struct ServiceGuard {
@@ -50,12 +50,12 @@ fn cleanup(id: &str) -> Vec<String> {
     if !stop.ok() && stop.code != Some(5) {
         problems.push(stop.to_string());
     }
-    problems.extend(remove_path(&path, false));
-    problems.extend(remove_path(&path.with_file_name(format!("{unit}.d")), true));
+    problems.extend(remove_path_retrying(&path, false));
+    problems.extend(remove_path_retrying(&path.with_file_name(format!("{unit}.d")), true));
     let wants = std::path::PathBuf::from(SYSTEMD_UNIT_DIR)
         .join("multi-user.target.wants")
         .join(&unit);
-    problems.extend(remove_path(&wants, false));
+    problems.extend(remove_path_retrying(&wants, false));
     let reload = cmd::run("systemctl", &["daemon-reload"]);
     if !reload.ok() {
         problems.push(reload.to_string());
@@ -74,7 +74,7 @@ fn cleanup(id: &str) -> Vec<String> {
         problems.push(bootout.to_string());
     }
     let path = std::path::PathBuf::from(LAUNCHD_DAEMON_DIR).join(format!("{id}.plist"));
-    problems.extend(remove_path(&path, false));
+    problems.extend(remove_path_retrying(&path, false));
 
     // launchd exposes no way to delete an override-database entry, so a label
     // the disabled-key probe called `launchctl enable` on keeps one. It refers

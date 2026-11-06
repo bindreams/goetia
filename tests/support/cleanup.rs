@@ -43,6 +43,10 @@ impl DirGuard {
         Self(path)
     }
 
+    #[allow(
+        dead_code,
+        reason = "the library's unit tests include this file and never read the path"
+    )]
     pub fn path(&self) -> &std::path::Path {
         &self.0
     }
