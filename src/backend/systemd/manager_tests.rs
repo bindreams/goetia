@@ -21,6 +21,12 @@ use crate::manager::ServiceManager;
 use crate::manager::conformance::fresh_id;
 use crate::spec::Kind;
 
+// The integration suites' removal of what a test created; a library test reaches `tests/` only by path.
+#[allow(dead_code)]
+#[path = "../../../tests/support/cleanup.rs"]
+mod cleanup;
+use cleanup::DirGuard;
+
 #[skuld::label]
 const ELEVATED: skuld::Label;
 
@@ -207,21 +213,12 @@ fn install_never_corrupts_state_when_something_races_the_first_create() {
 
 // ensure_dir: parent directories ======================================================================================
 
-/// RAII cleanup for a directory tree.
-struct RmDir(PathBuf);
-
-impl Drop for RmDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn ensure_dir_leaves_a_preexisting_directory_untouched() {
     let dir = std::env::temp_dir().join(format!("{}-preexisting", fresh_id("systemd")));
     std::fs::create_dir(&dir).expect("create pre-existing dir");
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
-    let _cleanup = RmDir(dir.clone());
+    let _cleanup = DirGuard::new(dir.clone());
 
     ensure_dir(&dir, &User::Root).expect("ensure_dir on a pre-existing dir");
 
@@ -240,7 +237,7 @@ fn ensure_dir_accepts_a_preexisting_directory_the_account_cannot_write() {
     let dir = std::env::temp_dir().join(format!("{}-unwritable", fresh_id("systemd")));
     std::fs::create_dir(&dir).expect("create pre-existing dir");
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
-    let _cleanup = RmDir(dir.clone());
+    let _cleanup = DirGuard::new(dir.clone());
 
     ensure_dir(&dir, &User::Name("nobody".to_string())).expect("ensure_dir");
 
