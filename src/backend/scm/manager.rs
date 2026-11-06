@@ -95,11 +95,11 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt as _;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use windows_service::service::{
-    Service, ServiceAccess, ServiceActionType, ServiceErrorControl, ServiceFailureResetPeriod, ServiceInfo,
-    ServiceStartType, ServiceState as WinState, ServiceType,
+    Service, ServiceAccess, ServiceActionType, ServiceConfig, ServiceErrorControl, ServiceFailureResetPeriod,
+    ServiceInfo, ServiceStartType, ServiceState as WinState, ServiceType,
 };
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{
@@ -120,6 +120,7 @@ use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Reason, Result};
 use crate::manager::{Budget, Installed, State, Status, Step, budget};
+use crate::shim::HostCommand;
 use crate::spec::{DaemonSpec, Id, Kind};
 
 // Scm =================================================================================================================
@@ -167,6 +168,10 @@ pub(crate) struct ScmSnapshot {
     /// a service deleted since then does not turn into an unusable one. `None` for what `scan`
     /// saw, which opens no service.
     service: Option<Service>,
+    /// The service's configuration, queried by whichever of `installed`, `regenerate` and
+    /// `live_status` asks first and kept: a verb that needs it twice (`judge` reads what is
+    /// installed, then regenerates against it) cannot fail on the second read.
+    config: OnceLock<ServiceConfig>,
 }
 
 /// What `read_marker` hands on of a service: its `Parameters` and the object `read` opened.
@@ -179,6 +184,7 @@ impl ScmSnapshot {
             blob,
             parameters,
             service,
+            config: OnceLock::new(),
         }
     }
 }
@@ -216,13 +222,19 @@ impl ScmSnapshot {
         }
     }
 
-    /// The registration the service has now, and its start type.
-    fn live_registration(&self) -> Result<(ScmRegistration, ServiceStartType)> {
+    /// The service's configuration, queried on the first call and kept.
+    fn config(&self) -> Result<&ServiceConfig> {
+        if let Some(config) = self.config.get() {
+            return Ok(config);
+        }
         let id = &self.id;
-        let context = format!("open `{id}` to read its configuration");
-        self.ask(ServiceAccess::QUERY_CONFIG, &context, |service| {
-            read_live_registration(service, id.as_str(), &self.parameters)
-        })
+        let context = format!("open `{id}` to query its configuration");
+        let config = self.ask(ServiceAccess::QUERY_CONFIG, &context, |service| {
+            service
+                .query_config()
+                .map_err(|e| to_error(&format!("query configuration for `{id}`"), e))
+        })?;
+        Ok(self.config.get_or_init(|| config))
     }
 
     /// The id, with the service `read` opened closed: a verb that deletes the service, or waits on
@@ -285,8 +297,12 @@ impl Backend for Scm {
             return self.render(spec);
         }
         let identity = identity::resolve(&spec.user)?;
-        let (installed, _) = snapshot.live_registration()?;
-        generate::registration(spec, &identity, Some(&generate::host_from_installed(&installed)))
+        let config = snapshot.config().map_err(|e| Error::Step {
+            what: format!("read `{}`'s installed host", snapshot.id()),
+            source: Box::new(e),
+        })?;
+        let (exe, args) = split_command_line(&config.executable_path.to_string_lossy());
+        generate::registration(spec, &identity, Some(&HostCommand { exe, args }))
     }
 
     /// Upstream of the marker, so a service that will not open leaves `id` undetermined: neither
@@ -303,7 +319,12 @@ impl Backend for Scm {
 
     /// SCM has no drop-in mechanism: everything goetia writes lives under the service's own key.
     fn installed(&self, snapshot: &ScmSnapshot) -> Result<InstalledDefinition<ScmRegistration>> {
-        let (definition, _) = snapshot.live_registration()?;
+        let id = snapshot.id();
+        let config = snapshot.config()?;
+        let context = format!("open `{id}` to read its configuration");
+        let definition = snapshot.ask(ServiceAccess::QUERY_CONFIG, &context, |service| {
+            read_live_registration(config, service, id.as_str(), &snapshot.parameters)
+        })?;
         Ok(InstalledDefinition {
             definition,
             external: ExternalConfig::Absent,
@@ -325,12 +346,11 @@ impl Backend for Scm {
 
     fn live_status(&self, snapshot: &ScmSnapshot) -> Result<Status> {
         let id = snapshot.id();
+        let enabled = snapshot.config()?.start_type == ServiceStartType::AutoStart;
         let context = format!("open `{id}` to query its live status");
-        let (state, pid, enabled) = snapshot.ask(
-            ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG,
-            &context,
-            |service| query_live(service, id.as_str()),
-        )?;
+        let (state, pid) = snapshot.ask(ServiceAccess::QUERY_STATUS, &context, |service| {
+            query_live(service, id.as_str())
+        })?;
         Ok(Status { state, pid, enabled })
     }
 
@@ -517,17 +537,16 @@ fn failed_start(id: &Id, e: std::io::Error, unreadable: Option<Arc<Error>>) -> E
 /// SCM's "artifact" for diffing, since there is no file (see the
 /// crate-level design notes on this).
 fn read_live_registration(
+    cfg: &ServiceConfig,
     service: &Service,
     name: &str,
     live_params: &BTreeMap<String, String>,
-) -> Result<(ScmRegistration, ServiceStartType)> {
-    let cfg = service
-        .query_config()
-        .map_err(|e| to_error(&format!("query configuration for `{name}`"), e))?;
+) -> Result<ScmRegistration> {
     let cmdline = cfg.executable_path.to_string_lossy().into_owned();
     let (executable, arguments) = split_command_line(&cmdline);
     let account = cfg
         .account_name
+        .as_ref()
         .map(|a| a.to_string_lossy().into_owned())
         // `ChangeServiceConfigW`'s NULL-means-"unchanged" quirk (see `apply`'s
         // doc comment) forces a live `LocalSystem` account to be written back
@@ -541,19 +560,16 @@ fn read_live_registration(
     let failure_actions = read_failure_actions(service, name)?;
     let environment = registry::read_environment(name)?;
 
-    Ok((
-        ScmRegistration {
-            name: name.to_string(),
-            display_name: cfg.display_name.to_string_lossy().into_owned(),
-            executable,
-            arguments,
-            account,
-            failure_actions,
-            environment,
-            parameters: live_params.clone(),
-        },
-        cfg.start_type,
-    ))
+    Ok(ScmRegistration {
+        name: name.to_string(),
+        display_name: cfg.display_name.to_string_lossy().into_owned(),
+        executable,
+        arguments,
+        account,
+        failure_actions,
+        environment,
+        parameters: live_params.clone(),
+    })
 }
 
 fn read_failure_actions(service: &Service, name: &str) -> Result<Option<GenFailureActions>> {
@@ -1161,18 +1177,11 @@ fn map_state(s: WinState) -> State {
     }
 }
 
-fn query_live(service: &Service, name: &str) -> Result<(State, Option<u32>, bool)> {
+fn query_live(service: &Service, name: &str) -> Result<(State, Option<u32>)> {
     let status = service
         .query_status()
         .map_err(|e| to_error(&format!("query status for `{name}`"), e))?;
-    let cfg = service
-        .query_config()
-        .map_err(|e| to_error(&format!("query configuration for `{name}`"), e))?;
-    Ok((
-        map_state(status.current_state),
-        status.process_id,
-        cfg.start_type == ServiceStartType::AutoStart,
-    ))
+    Ok((map_state(status.current_state), status.process_id))
 }
 
 /// Flip `dwStartType` alone, via a raw `ChangeServiceConfigW` with

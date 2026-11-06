@@ -61,25 +61,25 @@ fn judge<B: Backend>(b: &B, snapshot: &B::Snapshot) -> (Ownership, ExternalConfi
             ExternalConfig::Absent,
         );
     }
-    let regenerated = match b.regenerate(&blob.spec, snapshot) {
-        Ok(regenerated) => regenerated.to_string(),
-        Err(e) => {
-            return unusable(
-                Reason::because("cannot regenerate the embedded spec", e),
-                uninstall_advice(),
-            );
-        }
+    // Read first: a backend that reads what is installed to regenerate (SCM) would otherwise report
+    // a failed read as a spec that cannot be regenerated, with advice to uninstall a healthy service.
+    // No goetia action unblocks a comparison that could not be read.
+    let on_disk = match b.installed(snapshot) {
+        Ok(on_disk) => on_disk,
+        Err(e) => return unusable(Reason::failed(e), None),
     };
-    match b.installed(snapshot) {
-        // No goetia action unblocks a comparison that could not be read.
-        Err(e) => unusable(Reason::failed(e), None),
-        Ok(on_disk) => (
+    match b.regenerate(&blob.spec, snapshot) {
+        Ok(regenerated) => (
             Ownership::Ours {
                 blob: blob.clone(),
-                regenerated,
+                regenerated: regenerated.to_string(),
                 on_disk: on_disk.definition.to_string(),
             },
             on_disk.external,
+        ),
+        Err(e) => unusable(
+            Reason::because("cannot regenerate the embedded spec", e),
+            uninstall_advice(),
         ),
     }
 }

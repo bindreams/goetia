@@ -228,16 +228,6 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>
     })
 }
 
-/// The host command a `Kind::Simple` registration as installed names, which a regeneration keeps so
-/// that a host moved, replaced or provided by another program is not a difference of the spec.
-#[cfg_attr(not(windows), allow(dead_code, reason = "only the Windows manager regenerates"))]
-pub(crate) fn host_from_installed(installed: &ScmRegistration) -> HostCommand {
-    HostCommand {
-        exe: installed.executable.clone(),
-        args: installed.arguments.clone(),
-    }
-}
-
 /// `env` as the `REG_MULTI_SZ` lines `Services\<name>\Environment` needs: the format SCM reads
 /// when it starts the service process, `NAME=value` per entry in key order.
 pub fn format_environment_lines(env: &BTreeMap<String, String>) -> Vec<String> {

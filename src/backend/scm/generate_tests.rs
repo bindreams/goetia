@@ -97,23 +97,6 @@ fn managed_kind_ignores_the_host() {
 }
 
 #[skuld::test]
-fn host_from_installed_keeps_arguments() {
-    let installed = ScmRegistration {
-        executable: PathBuf::from(r"C:\app\app.exe"),
-        arguments: vec!["--service-host".to_string()],
-        ..build(&simple_spec())
-    };
-
-    assert_eq!(
-        host_from_installed(&installed),
-        HostCommand {
-            exe: PathBuf::from(r"C:\app\app.exe"),
-            args: vec!["--service-host".to_string()],
-        }
-    );
-}
-
-#[skuld::test]
 fn managed_kind_executable_is_own_command() {
     let spec = managed_spec();
     let reg = build(&spec);

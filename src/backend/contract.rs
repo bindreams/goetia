@@ -68,7 +68,9 @@ pub(crate) trait Backend {
     /// `list` regenerate from a stored spec. A backend whose rendering depends on something that
     /// outlives the install (SCM's service host, which a provider may place elsewhere later) keeps
     /// that part from what is installed, so the comparison is of the spec alone. `install` and
-    /// `preview_install` still `render` the desired definition.
+    /// `preview_install` still `render` the desired definition. What it reads of the installed
+    /// service must be no more than `live_status` reads, so `status` and `list` gain no failure
+    /// mode; `judge` calls [`Self::installed`] first, so a failed read is never taken for a bad spec.
     fn regenerate(&self, spec: &DaemonSpec, _snapshot: &Self::Snapshot) -> Result<Self::Definition> {
         self.render(spec)
     }

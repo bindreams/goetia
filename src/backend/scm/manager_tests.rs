@@ -704,6 +704,44 @@ fn begin_install_refuses_a_host_named_by_a_relative_path() {
     }
 }
 
+/// A snapshot that has never opened a service, with `config` already queried: any further SCM
+/// access would fail or find no such service, so a test that gets an answer shows there was none.
+fn snapshot_with_config(spec: &DaemonSpec, command_line: &str) -> ScmSnapshot {
+    let blob = Blob {
+        schema: 1,
+        version: crate::version().to_string(),
+        spec: spec.clone(),
+    };
+    let snapshot = ScmSnapshot::new(spec.id.clone(), Ok(blob), (BTreeMap::new(), None));
+    let config = windows_service::service::ServiceConfig {
+        service_type: ServiceType::OWN_PROCESS,
+        start_type: ServiceStartType::OnDemand,
+        error_control: ServiceErrorControl::Normal,
+        executable_path: PathBuf::from(command_line),
+        load_order_group: None,
+        tag_id: 0,
+        dependencies: vec![],
+        account_name: None,
+        display_name: "frpc".into(),
+    };
+    assert!(snapshot.config.set(config).is_ok());
+    snapshot
+}
+
+#[skuld::test]
+fn regenerate_keeps_the_installed_host_from_the_configuration_queried_once() {
+    let spec = simple_daemon();
+    let snapshot = snapshot_with_config(&spec, r#""C:\Program Files\App\app.exe" --service-host"#);
+    let (provider, calls) = Recording::new(command(r"C:\elsewhere\host.exe"), command(r"C:\elsewhere\host.exe"));
+    let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
+
+    let reg = mgr.regenerate(&spec, &snapshot).unwrap();
+
+    assert_eq!(reg.executable, PathBuf::from(r"C:\Program Files\App\app.exe"));
+    assert_eq!(reg.arguments, ["--service-host"]);
+    assert_eq!(*calls.lock().unwrap(), Vec::<&str>::new(), "no provider is consulted");
+}
+
 // uninstall's failures ================================================================================================
 
 fn uninstall_failure(state: &UninstallFailure) -> String {

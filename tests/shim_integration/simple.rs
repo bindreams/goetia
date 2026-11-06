@@ -207,6 +207,7 @@ fn list_ignores_foreign_services() {
 
 /// A host of another version is refused before anything is registered: the copy of the shim has
 /// every occurrence of this crate's version in it replaced by a different one of the same length.
+// No `UNIT_DIR_EXCLUSIVE`: it creates no service and no `Parameters` key, so it changes no `list`.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn install_refuses_host_of_another_version() {
     let id = support::random_test_id();

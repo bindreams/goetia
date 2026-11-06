@@ -694,12 +694,17 @@ impl crate::backend::Backend for Fake {
     }
 
     /// `spec` with the host the installed text names, if any, whatever the provider names now.
+    /// Reads what is installed to find it, as SCM's does, so it fails where [`Fake::seed_installed_fails`]
+    /// makes that read fail.
     fn regenerate(&self, spec: &DaemonSpec, snapshot: &Artifact) -> Result<String> {
         let state = self.state.lock().expect("Fake mutex poisoned");
         if state.live_status_gone.contains(snapshot.id().as_str()) {
             return Err(Error::NotInstalled {
                 id: snapshot.id().as_str().to_string(),
             });
+        }
+        if let Some(failure) = state.installed_fails.get(snapshot.id().as_str()) {
+            return Err(failure.0());
         }
         state.resolve_account(spec)?;
         let mut text = generate(spec);
