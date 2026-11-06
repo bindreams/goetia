@@ -437,9 +437,6 @@ impl ScmActor for FakeScm {
         self.unanswered = observed.map(|o| (o, self.last_accepts));
         Ok(observed)
     }
-    fn accepts_stop(&self) -> bool {
-        self.last_accepts
-    }
     fn query_status(&mut self) -> std::io::Result<QueriedStatus> {
         self.log.push("query_status");
         // The service's state once a notification has told it, else the scripted answer.
@@ -460,8 +457,8 @@ impl ScmActor for FakeScm {
         self.wait_hint
     }
     fn delivered_controls_accepted(&self) -> u32 {
-        // Bit 0 is `SERVICE_ACCEPT_STOP`, the only control the fake models.
-        u32::from(self.last_accepts)
+        // `SERVICE_ACCEPT_STOP` is the only control the fake models.
+        if self.last_accepts { SERVICE_ACCEPT_STOP } else { 0 }
     }
 }
 

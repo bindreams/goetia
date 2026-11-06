@@ -159,7 +159,9 @@ pub trait ScmActor {
     /// Whether the notification the last [`Self::wait_callback`] returned had
     /// `SERVICE_ACCEPT_STOP` in its `dwControlsAccepted`. Read from that notification, not queried
     /// afterwards, for the reason [`Self::delivered_exit`] is.
-    fn accepts_stop(&self) -> bool;
+    fn accepts_stop(&self) -> bool {
+        self.delivered_controls_accepted() & SERVICE_ACCEPT_STOP != 0
+    }
     /// A fresh `QueryServiceStatus`: the state, controls accepted, exit record and wait hint now.
     /// Used by [`Self::arm`] for its status, and for deciding what a refused STOP (1052 or 1061)
     /// meant. Not a wait and not read from a notification.
@@ -462,9 +464,8 @@ pub struct Sighting {
 /// `target`, in a status or a notification, is [`Waited::Confirmed`]. An arm that expired and a wait
 /// that ran out of `deadline` are [`Waited::Expired`]. A service marked for deletion or gone is decided
 /// as `decided_or_status` says. A notification of a pending state re-arms without asking `other`, and
-/// so does one the armed mask excludes, a pending state under a mask with none included: SCM never
-/// sends one, so a debug build asserts, and a release build re-arms as for a pending state. Every
-/// other state, from a status or a notification, goes to
+/// so does one the armed mask excludes: SCM does not deliver a state its mask excludes; if one arrives
+/// it is treated as pending. Every other state, from a status or a notification, goes to
 /// `other` as a [`Sighting`]: `Break` ends the wait with that answer, an error ends it with the error,
 /// and `Continue` keeps waiting (after a notification, by re-arming).
 ///
@@ -493,15 +494,9 @@ pub fn wait_until<A: ScmActor>(
             },
             None => match a.wait_callback(deadline)? {
                 None => return Ok(Waited::Expired),
-                Some(observed) => {
-                    let state = notified_state(observed);
-                    if !delivered_in(mask, state) {
-                        debug_assert!(false, "SCM delivered {observed:?} outside the armed mask {mask:?}");
-                    }
-                    state
-                        .filter(|state| mask.states().contains(state))
-                        .map(|state| delivered_status(a, state))
-                }
+                Some(observed) => notified_state(observed)
+                    .filter(|state| mask.states().contains(state))
+                    .map(|state| delivered_status(a, state)),
             },
         };
         if let Some(status) = status {
@@ -530,18 +525,6 @@ fn notified_state(observed: Observed) -> Option<QueriedState> {
         Observed::Running => Some(QueriedState::Running),
         Observed::Paused => Some(QueriedState::Paused),
         Observed::Stopped => Some(QueriedState::Stopped),
-    }
-}
-
-/// Whether SCM may deliver a notification of `state` (`None` for a pending one) to a registration
-/// for `mask`.
-fn delivered_in(mask: WantState, state: Option<QueriedState>) -> bool {
-    match state {
-        Some(state) => mask.states().contains(&state),
-        None => mask
-            .states()
-            .iter()
-            .any(|state| matches!(state, QueriedState::StartPending | QueriedState::StopPending)),
     }
 }
 
@@ -844,6 +827,10 @@ pub(crate) fn already_running_is_recoverable(queried: QueriedState) -> bool {
 /// `NotifyServiceStatusChangeW`'s "you are too far behind" return. Not among
 /// `windows-sys`'s `Foundation` exports, so it is spelled out.
 pub(crate) const ERROR_SERVICE_NOTIFY_CLIENT_LAGGING: u32 = 1294;
+
+/// `SERVICE_ACCEPT_STOP`, the `dwControlsAccepted` bit for STOP; spelled out as this module is built
+/// off Windows too.
+pub(crate) const SERVICE_ACCEPT_STOP: u32 = 0x1;
 
 /// `ERROR_SERVICE_MARKED_FOR_DELETE`.
 pub(crate) const ERROR_SERVICE_MARKED_FOR_DELETE: u32 = 1072;

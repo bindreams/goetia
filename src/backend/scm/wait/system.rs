@@ -11,17 +11,20 @@ use windows_service::service::{Service, ServiceAccess, ServiceState};
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_NOT_ACTIVE, WAIT_IO_COMPLETION};
 use windows_sys::Win32::System::Services::{
-    ControlService, NotifyServiceStatusChangeW, QueryServiceStatus, SERVICE_ACCEPT_STOP, SERVICE_CONTINUE_PENDING,
-    SERVICE_CONTROL_STOP, SERVICE_NOTIFY, SERVICE_NOTIFY_2W, SERVICE_NOTIFY_CONTINUE_PENDING,
-    SERVICE_NOTIFY_PAUSE_PENDING, SERVICE_NOTIFY_PAUSED, SERVICE_NOTIFY_RUNNING, SERVICE_NOTIFY_START_PENDING,
-    SERVICE_NOTIFY_STATUS_CHANGE, SERVICE_NOTIFY_STOP_PENDING, SERVICE_NOTIFY_STOPPED, SERVICE_PAUSE_PENDING,
-    SERVICE_PAUSED, SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STOP_PENDING, SERVICE_STOPPED,
+    ControlService, NotifyServiceStatusChangeW, QueryServiceStatus, SERVICE_CONTINUE_PENDING, SERVICE_CONTROL_STOP,
+    SERVICE_NOTIFY, SERVICE_NOTIFY_2W, SERVICE_NOTIFY_CONTINUE_PENDING, SERVICE_NOTIFY_PAUSE_PENDING,
+    SERVICE_NOTIFY_PAUSED, SERVICE_NOTIFY_RUNNING, SERVICE_NOTIFY_START_PENDING, SERVICE_NOTIFY_STATUS_CHANGE,
+    SERVICE_NOTIFY_STOP_PENDING, SERVICE_NOTIFY_STOPPED, SERVICE_PAUSE_PENDING, SERVICE_PAUSED, SERVICE_RUNNING,
+    SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STOP_PENDING, SERVICE_STOPPED,
 };
 use windows_sys::Win32::System::Threading::{INFINITE, SleepEx};
 
 use crate::backend::scm::exit_status::RecordedExit;
 
-use super::{Armed, Cancelled, Deadline, Observed, QueriedState, QueriedStatus, Registration, StartReply, WantState};
+use super::{
+    Armed, Cancelled, Deadline, Observed, QueriedState, QueriedStatus, Registration, SERVICE_ACCEPT_STOP, StartReply,
+    WantState,
+};
 
 /// `windows-service`'s `Error` does not implement `Into<io::Error>` for
 /// every variant (it also carries parse errors this module never
@@ -461,9 +464,5 @@ impl super::ScmActor for SystemScmActor {
 
     fn delivered_controls_accepted(&self) -> u32 {
         self.status.controls_accepted.load(Ordering::Acquire)
-    }
-
-    fn accepts_stop(&self) -> bool {
-        self.delivered_controls_accepted() & SERVICE_ACCEPT_STOP != 0
     }
 }
