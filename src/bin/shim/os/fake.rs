@@ -19,8 +19,8 @@ use std::thread::JoinHandle;
 
 use cosca::Containment;
 
-use super::{Channels, Os, Spawned};
-use crate::logging::{Log, Severity};
+use super::{Channels, Os, Severity, Spawned};
+use crate::logging::Log;
 
 /// The error a refused thread fails with.
 pub(crate) const NO_THREAD: &str = "no thread may be made (fake)";

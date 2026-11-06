@@ -154,7 +154,7 @@ struct StatusHandle(SERVICE_STATUS_HANDLE);
 /// while the registration stays live: SCM can deliver a control after that, which would reach freed
 /// memory. No test catches a revert; `clippy.toml` forbids the call.
 fn register_control_handler(id: &str, stop_bus: &Arc<StopBus>) -> std::io::Result<StatusHandle> {
-    let name = crate::logging::eventlog::wide_null(id);
+    let name = crate::os::wide_null(id);
     // SAFETY: `name` is NUL-terminated and outlives the call; the context is never freed.
     let handle =
         unsafe { RegisterServiceCtrlHandlerExW(name.as_ptr(), Some(control_handler), leak_handler_context(stop_bus)) };
@@ -456,7 +456,7 @@ fn stdio_set<T, E: std::fmt::Display>(log: &Log, id: &str, assigned: Result<T, E
 
 /// Build the (unspawned) command for `spec`: argv, cwd, env, Job Object
 /// containment, and stdout+stderr merged into the daemon's log file.
-fn build_command(spec: &DaemonSpec, log: &Log, id: &str) -> cosca::Command {
+pub(crate) fn build_command(spec: &DaemonSpec, log: &Log, id: &str) -> cosca::Command {
     let mut cmd = cosca::run(spec.command.iter().cloned());
     if let Some(cwd) = &spec.cwd {
         cmd.current_dir(cwd.clone());

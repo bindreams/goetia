@@ -3,15 +3,17 @@
 //! threads, [`Spawned`] is the daemon once spawned, [`Channels`] is where the shim's own failure
 //! lines go. [`Real`] implements all three; a test implements them with `fake::Fake`.
 
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::os::windows::ffi::OsStrExt as _;
 use std::path::Path;
 use std::process::ExitStatus;
 use std::thread::JoinHandle;
 
 use cosca::Containment;
 
-use crate::logging::{Severity, eventlog};
+mod eventlog;
 
 /// What the supervisor asks the OS for.
 pub(crate) trait Os: Send + Sync {
@@ -39,6 +41,14 @@ pub(crate) trait Spawned: Send + Sync {
 
     /// Let the daemon go: dropping it no longer kills it.
     fn detach(self: Box<Self>);
+}
+
+/// How a line is reported to the Event Log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Severity {
+    Error,
+    /// The daemon runs, but something about its registration needs the administrator.
+    Warning,
 }
 
 /// Where the shim's failure and warning lines go.
@@ -96,6 +106,11 @@ impl Channels for Real {
     fn event_log(&self, severity: Severity, line: &str) {
         eventlog::report(severity, line);
     }
+}
+
+/// `s` as the null-terminated UTF-16 string the Win32 wide-character APIs take.
+pub(crate) fn wide_null(s: &str) -> Vec<u16> {
+    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
 }
 
 /// Open `path` for append, creating parent directories first.
