@@ -12,7 +12,9 @@ use goetia::backend::scm::exit_status::{
     ERROR_CAN_NOT_COMPLETE, ERROR_GEN_FAILURE, ERROR_SERVICE_SPECIFIC_ERROR, Reported,
 };
 use goetia::spec::{Kind, Restart};
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, NO_ERROR};
+use windows_sys::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, ERROR_NOT_ENOUGH_MEMORY, NO_ERROR,
+};
 use windows_sys::Win32::System::Services::{
     SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_PAUSE, SERVICE_CONTROL_STOP, SERVICE_STOP_PENDING, SERVICE_STOPPED,
 };
@@ -79,7 +81,7 @@ const EXITED_TREE_UNKILLED: &str = "kill_tree after the daemon ended: the kill w
 #[skuld::test]
 fn no_daemon_is_spawned_when_no_thread_can_be_made_to_wait_on_it() {
     let fake = FakeGuard::new();
-    fake.will_refuse_thread();
+    fake.will_refuse_thread(std::io::Error::other(NO_THREAD));
 
     // Reported, not panicked: a refused thread here surfaces as an `io::Result`, not a
     // `Scope::spawn` panic that would take the whole service process down with the daemon already
@@ -187,6 +189,20 @@ fn the_os_code_of_a_refused_spawn_is_what_launch_reports() {
 }
 
 #[skuld::test]
+fn the_os_code_of_a_refused_thread_is_what_launch_reports() {
+    const NO_MEMORY: i32 = ERROR_NOT_ENOUGH_MEMORY as i32;
+    let fake = FakeGuard::new();
+    fake.will_refuse_thread(std::io::Error::from_raw_os_error(NO_MEMORY));
+
+    let launched = launch(&spec(), &supervisor(&fake), ID);
+
+    assert_eq!(launched.as_ref().err(), Some(&Reported::shim_failure(Some(NO_MEMORY))));
+    // The refusal's text is not the point here; consume the one failure line.
+    assert_eq!(fake.take_failures().len(), 1);
+    assert_eq!(fake.calls(Op::Spawn), 0);
+}
+
+#[skuld::test]
 fn a_log_file_that_cannot_be_opened_is_logged_and_the_daemon_still_runs() {
     let fake = FakeGuard::new();
     let daemon = FakeProcess::new();
@@ -221,7 +237,7 @@ fn a_log_file_that_cannot_be_opened_is_logged_and_the_daemon_still_runs() {
 #[skuld::test]
 fn no_running_report_when_no_thread_can_be_made() {
     let fake = FakeGuard::new();
-    fake.will_refuse_thread();
+    fake.will_refuse_thread(std::io::Error::other(NO_THREAD));
     let mut running_reports = 0;
 
     let reported = run_daemon(&spec(), &supervisor(&fake), || running_reports += 1);

@@ -23,7 +23,7 @@ use cosca::Containment;
 use super::{Channels, Os, Severity, Spawned};
 use crate::logging::Log;
 
-/// The error a refused thread fails with.
+/// The message of the usual refused thread: `io::Error::other(NO_THREAD)`.
 pub(crate) const NO_THREAD: &str = "no thread may be made (fake)";
 /// The error a refused kill fails with.
 pub(crate) const KILL_REFUSED: &str = "the kill was refused (fake)";
@@ -285,6 +285,11 @@ enum SpawnReply {
     Refuses(cosca::error::Error),
 }
 
+enum ThreadReply {
+    Makes,
+    Refuses(io::Error),
+}
+
 enum ThreadEnd {
     Running,
     Ended(WaiterEnd),
@@ -296,8 +301,7 @@ enum ThreadEnd {
 #[derive(Default)]
 struct State {
     spawns: VecDeque<SpawnReply>,
-    /// `true` allows the thread, `false` refuses it.
-    threads: VecDeque<bool>,
+    threads: VecDeque<ThreadReply>,
     append_failures: Vec<PathBuf>,
     open_log_failures: Vec<PathBuf>,
     calls: BTreeMap<Op, usize>,
@@ -395,12 +399,13 @@ impl Fake {
     /// The next `thread` runs its closure on a real thread. Its end is read with [`Fake::waiter_end`],
     /// numbered in the order threads are made.
     pub(crate) fn will_make_thread(&self) {
-        lock(&self.shared.state).threads.push_back(true);
+        lock(&self.shared.state).threads.push_back(ThreadReply::Makes);
     }
 
-    /// The next `thread` fails with [`NO_THREAD`]. A refused thread has no end to read.
-    pub(crate) fn will_refuse_thread(&self) {
-        lock(&self.shared.state).threads.push_back(false);
+    /// The next `thread` fails with `error`, [`NO_THREAD`] being the usual one. A refused thread has
+    /// no end to read.
+    pub(crate) fn will_refuse_thread(&self, error: io::Error) {
+        lock(&self.shared.state).threads.push_back(ThreadReply::Refuses(error));
     }
 
     /// The next `append` to `path` fails with [`APPEND_FAILED`].
@@ -569,8 +574,8 @@ impl Os for Fake {
                     state.unstated.push("thread".to_string());
                     None
                 }
-                Some(false) => return Err(io::Error::other(NO_THREAD)),
-                Some(true) => {
+                Some(ThreadReply::Refuses(error)) => return Err(error),
+                Some(ThreadReply::Makes) => {
                     state.thread_ends.push(ThreadEnd::Running);
                     Some(state.thread_ends.len() - 1)
                 }
