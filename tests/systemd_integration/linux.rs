@@ -273,15 +273,11 @@ fn uid_of(account: &str) -> u32 {
 /// test creates it or removes it. `create_dir` answers `AlreadyExists` for
 /// a root that was there first, so ownership is not a check followed by a create.
 fn create_root(root: &Path) -> CreatedRoot {
+    support::require_system_dir(root.parent().expect("a search root has a parent"));
     match fs::create_dir(root) {
         Ok(()) => CreatedRoot(Some(root.to_path_buf())),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => CreatedRoot(None),
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                support::require_system_dir(root.parent().unwrap_or(root));
-            }
-            panic!("mkdir {}: {e}", root.display())
-        }
+        Err(e) => panic!("mkdir {}: {e}", root.display()),
     }
 }
 
@@ -788,8 +784,10 @@ pub(crate) fn main_pid(id: &str) -> String {
 /// drops first.
 ///
 /// The lock file lives in a temp dir, held in the last field so it is removed after `Drop` has
-/// stopped the holder, whose `ExecStop=` still opens it. The path is double-quoted in that line, with
-/// backslash, double quote, `%` and `$` escaped, so any `TMPDIR` works.
+/// stopped the holder, whose `ExecStop=` still opens it. The temp dir is canonicalized, so a relative
+/// `TMPDIR` cannot resolve against the unit's working directory `/`. The path is double-quoted in
+/// that line, with backslash, double quote, `%` and `$` escaped; a path with a control character
+/// (a newline would end the line) panics.
 struct StopHolder {
     unit: String,
     path: PathBuf,
@@ -802,7 +800,11 @@ impl StopHolder {
         let unit = format!("{id}-holder.service");
         let path = PathBuf::from("/run/systemd/system").join(&unit);
         let lock_dir = tempfile::tempdir().expect("tempdir for the holder's lock");
-        let lock = lock_dir.path().join("lock");
+        let lock = lock_dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|e| panic!("canonicalize {}: {e}", lock_dir.path().display()))
+            .join("lock");
         let mut holder = StopHolder {
             unit,
             path,
@@ -820,9 +822,12 @@ impl StopHolder {
             std::io::Error::last_os_error()
         );
         holder.held = Some(held);
-        let quoted = lock
-            .to_str()
-            .expect("a UTF-8 temp path")
+        let lock_str = lock.to_str().expect("a UTF-8 temp path");
+        assert!(
+            !lock_str.chars().any(char::is_control),
+            "the lock path {lock_str:?} has a control character; set TMPDIR to a plain path"
+        );
+        let quoted = lock_str
             .replace('\\', "\\\\")
             .replace('"', "\\\"")
             .replace('%', "%%")

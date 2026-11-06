@@ -136,9 +136,11 @@ fn write_plist(path: &Path, content: &str) {
     write_bytes(path, content.as_bytes());
 }
 
-/// Writes `bytes` to `path` and makes it `0644`. The parent must exist: a seed into [`STAGING_DIR`]
-/// calls [`ensure_staging_dir`] first, and the system's own directories are never created by a test.
+/// Writes `bytes` to `path` and makes it `0644`. The parent must exist, and fails the test if not: a
+/// seed into [`STAGING_DIR`] calls [`ensure_staging_dir`] first, and the system's own directories
+/// are never created by a test.
 fn write_bytes(path: &Path, bytes: &[u8]) {
+    support::require_system_dir(path.parent().expect("a plist path has a parent"));
     std::fs::write(path, bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).expect("chmod plist");
 }
