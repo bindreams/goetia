@@ -10,6 +10,10 @@ use crate::stop_bus::StopBus;
 #[path = "../../../tests/support/daemon_spec.rs"]
 pub(crate) mod daemon_spec;
 
+// The retrying removal the integration suites use for their temporary files.
+#[path = "../../../tests/support/cleanup.rs"]
+pub(crate) mod cleanup;
+
 /// A bus over `fake`'s `Os` and `Log`: the supervisor under test.
 pub(crate) fn bus(fake: &Fake) -> Arc<StopBus> {
     Arc::new(StopBus::new(fake.os(), fake.log()))

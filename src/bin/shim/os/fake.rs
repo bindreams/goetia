@@ -21,6 +21,7 @@ use cosca::Containment;
 
 use super::{Channels, Os, Severity, Spawned};
 use crate::logging::Log;
+use crate::test_support::cleanup::remove_path_retrying;
 
 /// The error a refused thread fails with.
 pub(crate) const NO_THREAD: &str = "no thread may be made (fake)";
@@ -328,21 +329,36 @@ pub(crate) struct Fake {
 pub(crate) struct FakeGuard {
     fake: Fake,
     /// Removed with the guard, whatever the test did in it.
-    _dir: tempfile::TempDir,
+    _dir: RemoveOnDrop,
+}
+
+/// A directory removed on drop, retried for the bound a test's cleanup allows and then let go with
+/// a warning: a failed removal never panics, and a drop that runs while the test unwinds still
+/// removes it.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        if let Some(problem) = remove_path_retrying(&self.0, true) {
+            eprintln!("warning: the Fake's temporary directory was left behind: {problem}");
+        }
+    }
 }
 
 impl FakeGuard {
     pub(crate) fn new() -> FakeGuard {
-        let dir = tempfile::tempdir().expect("a temporary directory for the Fake's log files");
+        let dir = tempfile::tempdir()
+            .expect("a temporary directory for the Fake's log files")
+            .keep();
         FakeGuard {
             fake: Fake {
                 shared: Arc::new(Shared {
                     state: Mutex::new(State::default()),
                     thread_ended: Condvar::new(),
-                    logs_dir: dir.path().join("logs"),
+                    logs_dir: dir.join("logs"),
                 }),
             },
-            _dir: dir,
+            _dir: RemoveOnDrop(dir),
         }
     }
 }
