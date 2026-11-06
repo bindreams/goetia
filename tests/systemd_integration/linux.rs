@@ -288,10 +288,10 @@ impl Drop for CreatedRoot {
 /// standing where one belongs) and, where the seeding call created it, the search root holding it.
 /// The leaf field is declared first, so it is removed before the root; see [`seed_control_dropin`].
 ///
-/// No `daemon-reload` on drop. A test that reloads while a seed exists holds a `ServiceGuard` for
-/// the id, whose own cleanup reloads after this one has run: `seed_dropin`'s tests, which reload at
-/// the seed, and the conformance test, which seeds `UNDETERMINED_ID` and then installs and reloads.
-/// A test that seeds and never reloads needs no guard: systemd holds nothing from the seed to forget.
+/// No `daemon-reload` on drop. A test that reloads while a seed exists holds a `ServiceGuard`,
+/// whose own cleanup runs a (global) `daemon-reload` after this one has run; `seed_dropin`'s tests
+/// reload at the seed and hold one. A test that seeds and never reloads needs none: systemd holds
+/// nothing from the seed to forget.
 struct RmInRoot<L> {
     _leaf: L,
     _root: Option<CreatedRoot>,

@@ -52,8 +52,9 @@ pub fn warn_left_behind(problem: Option<String>) {
 }
 
 /// [`remove_path_retrying`], then a warning naming what it could not remove. Never panics, so a
-/// cleanup that runs while the test unwinds still goes on. Every cleanup that has no use for the
-/// problem itself goes through this one function.
+/// cleanup that runs while the test unwinds still goes on. A cleanup that has no use for the
+/// problem itself goes through this function; one that reports it with its own context (a guard's
+/// id) calls [`remove_path_retrying`].
 pub fn remove_or_warn(path: &std::path::Path, dir: bool) {
     warn_left_behind(remove_path_retrying(path, dir));
 }

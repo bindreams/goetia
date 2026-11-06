@@ -277,9 +277,10 @@ fn contained_leaf(pid: u32) -> Option<std::path::PathBuf> {
 /// Removes the cgroup leaf cosca placed a child in, on drop. cosca's own `Drop` removes it when the
 /// killed tree has already drained by then, and leaves it behind when a member is still dying — half
 /// the runs of the test above, measured — so the test removes what it made. An `rmdir` that meets a
-/// member still exiting is retried, then warned about. Declared before the spawn, so it drops after
-/// `child`: cosca's `Drop` has killed the tree by then, and the `rmdir` does not run beside a live
-/// member. A failing test removes the leaf too; [`DrainedLeaf::set`] names it once the child is in it.
+/// member still exiting is retried, then warned about. On a pass the tree is already torn down by
+/// `wait_bounded` and the descendant wait; declared before the spawn, it also drops after `child`
+/// when a panic lands between the spawn and `wait_bounded`, so the `rmdir` follows cosca's kill.
+/// [`DrainedLeaf::set`] names the leaf once the child is in it.
 #[cfg(target_os = "linux")]
 #[derive(Default)]
 struct DrainedLeaf(Option<std::path::PathBuf>);
