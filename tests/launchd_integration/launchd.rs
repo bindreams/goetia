@@ -210,8 +210,7 @@ fn launchd_passes_conformance() {
     let _undetermined_service = support::ServiceGuard::new(manager::conformance::UNDETERMINED_ID);
     let undetermined_path = staging_path(manager::conformance::UNDETERMINED_ID);
     let _undetermined_cleanup = FileGuard::new(undetermined_path.clone());
-    // A leftover from an abrupt stop would make the symlink below fail; the guard above removes it
-    // at the end.
+    // A leftover from an abrupt stop would make the symlink below fail.
     support::cleanup::remove_or_warn(&undetermined_path, false);
     std::os::unix::fs::symlink(
         format!("{}.plist", manager::conformance::UNDETERMINED_ID),

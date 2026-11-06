@@ -29,7 +29,7 @@ pub fn remove_path(path: &std::path::Path, dir: bool) -> Option<String> {
 pub const CLEANUP_BOUND: Duration = Duration::from_secs(5);
 
 /// `attempt`, retried until it succeeds or [`CLEANUP_BOUND`] passes; then the last problem.
-pub fn retrying(mut attempt: impl FnMut() -> Option<String>) -> Option<String> {
+fn retrying(mut attempt: impl FnMut() -> Option<String>) -> Option<String> {
     let start = Instant::now();
     loop {
         match attempt() {
@@ -44,7 +44,7 @@ pub fn remove_path_retrying(path: &std::path::Path, dir: bool) -> Option<String>
     retrying(|| remove_path(path, dir))
 }
 
-/// Prints the shared warning for the `problem` a cleanup gave up on, if any.
+/// The one warning format for a cleanup that gave up.
 pub fn warn_left_behind(problem: Option<String>) {
     if let Some(problem) = problem {
         eprintln!("warning: left behind: {problem}");
@@ -52,9 +52,7 @@ pub fn warn_left_behind(problem: Option<String>) {
 }
 
 /// [`remove_path_retrying`], then a warning naming what it could not remove. Never panics, so a
-/// cleanup that runs while the test unwinds still goes on. A cleanup that has no use for the
-/// problem itself goes through this function; one that reports it with its own context (a guard's
-/// id) calls [`remove_path_retrying`].
+/// cleanup that runs while the test unwinds still goes on.
 pub fn remove_or_warn(path: &std::path::Path, dir: bool) {
     warn_left_behind(remove_path_retrying(path, dir));
 }
@@ -84,7 +82,7 @@ impl Drop for DirGuard {
     }
 }
 
-/// A file removed on drop like [`DirGuard`]'s tree. A symlink is unlinked, not followed.
+/// A file removed on drop with [`remove_or_warn`]; a symlink is unlinked, not followed.
 pub struct FileGuard(std::path::PathBuf);
 
 impl FileGuard {

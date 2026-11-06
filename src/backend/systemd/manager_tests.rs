@@ -5,10 +5,9 @@
 //! something no interleaving of `install` calls alone can force deterministically.
 //!
 //! Most of these are elevated (they write real files under `/etc/systemd/system`), so they opt into
-//! the same `elevated` precondition/label convention `tests/support/mod.rs` uses. Only
-//! `tests/support/cleanup.rs` is shared, as `backend::test_cleanup`: it is self-contained. The
-//! `elevated` convention stays a local copy, because `tests/support/mod.rs` is a module of the
-//! integration-test crate and pulls in the rest of it (`cmd`, `service_guard`, ...).
+//! the `elevated` precondition/label convention `tests/support/mod.rs` uses, as a local copy: that
+//! module pulls in the rest of the integration-test crate (`cmd`, `service_guard`, ...). Only
+//! `tests/support/cleanup.rs` is shared, as `backend::test_cleanup`.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,7 +36,7 @@ fn elevated() -> std::result::Result<(), String> {
 /// On drop, removes every `unique_quarantine_path(id)` file the test's scenario left behind.
 /// Production deliberately leaves one on an unrecoverable double-race so a human can find it, and a
 /// failed assertion can strand the backup of a test that restores it. Register it before the call
-/// that can create one. Retried and warned like the other guards; never panics.
+/// that can create one.
 struct QuarantineSweep(String);
 
 impl QuarantineSweep {

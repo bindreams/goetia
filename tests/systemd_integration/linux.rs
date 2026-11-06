@@ -119,16 +119,12 @@ fn seed_unreadable_dropin_enotdir(id: &str) -> FileGuard {
 /// missing. `scan_host` reaches any root but `UNIT_DIR` through its cross-root pass alone, and only
 /// for the drop-in half — a *fragment* outside `UNIT_DIR` deliberately names no id (see `HostScan`).
 ///
-/// Returns the leaf's path with the removal. The root is removed only when this call created it, and
-/// with `remove_dir`, so a root systemd itself populated is left exactly as it was found.
+/// The root is removed only when this call created it, and with `remove_dir`, so a root systemd
+/// itself populated is left exactly as it was found.
 fn seed_unreadable_dropin_in_root(root: &str, id: &str) -> (PathBuf, RmInRoot<FileGuard>) {
     let root_path = PathBuf::from(root);
     let leaf = root_path.join(format!("{id}.service.d"));
-    let guard = RmInRoot::new(
-        FileGuard::new(leaf.clone()),
-        (!root_path.exists()).then(|| root_path.clone()),
-    );
-    fs::create_dir_all(&root_path).unwrap_or_else(|e| panic!("mkdir {root}: {e}"));
+    let guard = RmInRoot::new(FileGuard::new(leaf.clone()), create_root(&root_path));
     fs::write(&leaf, b"").unwrap_or_else(|e| panic!("seed {}: {e}", leaf.display()));
     (leaf, guard)
 }
@@ -155,7 +151,7 @@ fn seed_dropin(dir: &Path, root: Option<PathBuf>) -> RmInRoot<DirGuard> {
 fn seed_control_dropin(root: &str, id: &str) -> (PathBuf, RmInRoot<DirGuard>) {
     let root_path = PathBuf::from(root);
     let leaf = root_path.join(format!("{id}.service.d"));
-    let guard = seed_dropin(&leaf, (!root_path.exists()).then_some(root_path));
+    let guard = seed_dropin(&leaf, create_root(&root_path));
     (leaf, guard)
 }
 
@@ -265,6 +261,20 @@ fn uid_of(account: &str) -> u32 {
         .unwrap_or_else(|e| panic!("parse uid of {account}: {e}"))
 }
 
+/// Creates the search root `root`, with its parents, and returns it only if this call created it:
+/// `create_dir` answers `AlreadyExists` for a root that was there first, so ownership is not a
+/// check followed by a create.
+fn create_root(root: &Path) -> Option<PathBuf> {
+    if let Some(parent) = root.parent() {
+        fs::create_dir_all(parent).unwrap_or_else(|e| panic!("mkdir {}: {e}", parent.display()));
+    }
+    match fs::create_dir(root) {
+        Ok(()) => Some(root.to_path_buf()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
+        Err(e) => panic!("mkdir {}: {e}", root.display()),
+    }
+}
+
 /// A search root a seeding call created, removed on drop with `remove_dir`. "Not empty" is
 /// expected, not a failure: a root systemd itself populated for some other unit is left as it was
 /// found.
@@ -288,10 +298,8 @@ impl Drop for CreatedRoot {
 /// standing where one belongs) and, where the seeding call created it, the search root holding it.
 /// The leaf field is declared first, so it is removed before the root; see [`seed_control_dropin`].
 ///
-/// No `daemon-reload` on drop. A test that reloads while a seed exists holds a `ServiceGuard`,
-/// whose own cleanup runs a (global) `daemon-reload` after this one has run; `seed_dropin`'s tests
-/// reload at the seed and hold one. A test that seeds and never reloads needs none: systemd holds
-/// nothing from the seed to forget.
+/// No `daemon-reload` on drop: a test that reloaded holds a `ServiceGuard`, whose cleanup reloads
+/// after this runs.
 struct RmInRoot<L> {
     _leaf: L,
     _root: Option<CreatedRoot>,
@@ -775,39 +783,34 @@ pub(crate) fn main_pid(id: &str) -> String {
 /// succeeds, so nothing is left `failed` — and removes it; declared after the `ServiceGuard`, so it
 /// drops first.
 ///
-/// The lock file lives in a temporary directory the guard owns: the holder unit sets no
-/// `PrivateTmp`, so its `ExecStop` sees the same path. Only the unit file has to be in
-/// `/run/systemd/system`.
+/// The lock file is `/run/{id}.lock`, not in a temp dir: PID 1 must open the same path.
 struct StopHolder {
     unit: String,
     path: PathBuf,
-    lock: PathBuf,
     held: Option<fs::File>,
-    /// Declared last, so the directory goes after the holder has stopped and released the lock.
-    _lock_dir: DirGuard,
+    /// Declared last, so the lock goes after `Drop` has stopped the holder.
+    _lock: FileGuard,
 }
 
 impl StopHolder {
     fn start(id: &str) -> Self {
         let unit = format!("{id}-holder.service");
         let path = PathBuf::from("/run/systemd/system").join(&unit);
-        // `keep` hands the removal to the `DirGuard`, which retries and warns.
-        let lock_dir = tempfile::tempdir().expect("tempdir for the holder's lock").keep();
+        let lock = PathBuf::from(format!("/run/{id}.lock"));
         let mut holder = StopHolder {
             unit,
             path,
-            lock: lock_dir.join("holder.lock"),
             held: None,
-            _lock_dir: DirGuard::new(lock_dir),
+            _lock: FileGuard::new(lock.clone()),
         };
-        let held = fs::File::create(&holder.lock).unwrap_or_else(|e| panic!("create {}: {e}", holder.lock.display()));
+        let held = fs::File::create(&lock).unwrap_or_else(|e| panic!("create {}: {e}", lock.display()));
         // SAFETY: `held` owns the descriptor for the duration of the call.
         let locked = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&held), libc::LOCK_EX) };
         assert_eq!(
             locked,
             0,
             "flock {}: {}",
-            holder.lock.display(),
+            lock.display(),
             std::io::Error::last_os_error()
         );
         holder.held = Some(held);
@@ -817,7 +820,7 @@ impl StopHolder {
                 "[Unit]\nRequires={id}.service\nAfter={id}.service\n\
                  [Service]\nExecStart=/bin/sleep infinity\nExecStop=/usr/bin/flock {} true\n\
                  TimeoutStopSec=infinity\n",
-                holder.lock.display()
+                lock.display()
             ),
         )
         .expect("write the holder unit");
@@ -835,8 +838,7 @@ impl Drop for StopHolder {
     fn drop(&mut self) {
         self.release();
         // `start` builds the holder before writing the unit, so a failed start leaves it unmade:
-        // exit 5 is "unit not loaded", and a missing file is already gone. The lock directory goes
-        // with `_lock_dir`, after this.
+        // exit 5 is "unit not loaded", and a missing file is already gone.
         let run = cmd::run("systemctl", &["stop", &self.unit]);
         if !run.ok() && run.code != Some(5) {
             eprintln!("StopHolder[{}]: cleanup failed: {run}", self.unit);

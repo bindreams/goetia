@@ -9,7 +9,7 @@ use super::*;
 use crate::manager::budget::Budget;
 
 #[cfg(target_os = "linux")]
-use crate::backend::test_cleanup::{removal_problem, retrying, warn_left_behind};
+use crate::backend::test_cleanup::{removal_problem, warn_left_behind};
 
 /// A reservation holding the temp files one child's streams draw.
 fn files() -> Reservation {
@@ -274,13 +274,10 @@ fn contained_leaf(pid: u32) -> Option<std::path::PathBuf> {
     leaf.file_name()?.to_str()?.starts_with("cosca-").then_some(leaf)
 }
 
-/// Removes the cgroup leaf cosca placed a child in, on drop. cosca's own `Drop` removes it when the
-/// killed tree has already drained by then, and leaves it behind when a member is still dying — half
-/// the runs of the test above, measured — so the test removes what it made. An `rmdir` that meets a
-/// member still exiting is retried, then warned about. On a pass the tree is already torn down by
-/// `wait_bounded` and the descendant wait; declared before the spawn, it also drops after `child`
-/// when a panic lands between the spawn and `wait_bounded`, so the `rmdir` follows cosca's kill.
-/// [`DrainedLeaf::set`] names the leaf once the child is in it.
+/// Removes the cgroup leaf cosca placed a child in, on drop: cosca's own `Drop` leaves it behind
+/// when a member is still dying. Declare it before the spawn so it drops after `child`. It waits,
+/// without a cap, until `cgroup.events` reads `populated 0`, then calls `remove_dir` once and warns
+/// if that fails. [`DrainedLeaf::set`] names the leaf once the child is in it.
 #[cfg(target_os = "linux")]
 #[derive(Default)]
 struct DrainedLeaf(Option<std::path::PathBuf>);
@@ -296,7 +293,41 @@ impl DrainedLeaf {
 impl Drop for DrainedLeaf {
     fn drop(&mut self) {
         if let Some(leaf) = &self.0 {
-            warn_left_behind(retrying(|| removal_problem(leaf, std::fs::remove_dir(leaf))));
+            wait_until_drained(leaf);
+            warn_left_behind(removal_problem(leaf, std::fs::remove_dir(leaf)));
+        }
+    }
+}
+
+/// Blocks until `<leaf>/cgroup.events` reads `populated 0`, the way cosca waits: re-read before
+/// every `poll(POLLPRI)`, which fires on each change. A leaf already removed, or an events file
+/// that cannot be read, ends the wait: the `remove_dir` after it reports what is left.
+#[cfg(target_os = "linux")]
+fn wait_until_drained(leaf: &std::path::Path) {
+    use std::io::{Seek, SeekFrom};
+    use std::os::fd::AsRawFd;
+
+    let Ok(mut events) = std::fs::File::open(leaf.join("cgroup.events")) else {
+        return;
+    };
+    let mut text = String::new();
+    loop {
+        text.clear();
+        if events.seek(SeekFrom::Start(0)).is_err() || events.read_to_string(&mut text).is_err() {
+            return;
+        }
+        if text.lines().any(|line| line == "populated 0") {
+            return;
+        }
+        let mut fd = libc::pollfd {
+            fd: events.as_raw_fd(),
+            events: libc::POLLPRI,
+            revents: 0,
+        };
+        // SAFETY: `fd` is one valid `pollfd`, and `events` outlives the call.
+        let ready = unsafe { libc::poll(&mut fd, 1, -1) };
+        if ready < 0 && io::Error::last_os_error().kind() != ErrorKind::Interrupted {
+            return;
         }
     }
 }
