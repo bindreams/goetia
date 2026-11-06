@@ -33,3 +33,25 @@ pub fn remove_path_retrying(path: &std::path::Path, dir: bool) -> Option<String>
         }
     }
 }
+
+/// A directory tree removed on drop with [`remove_path_retrying`], then let go with a warning
+/// naming it. Never panics, so a drop that runs while the test unwinds still removes the tree.
+pub struct DirGuard(std::path::PathBuf);
+
+impl DirGuard {
+    pub fn new(path: std::path::PathBuf) -> Self {
+        Self(path)
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for DirGuard {
+    fn drop(&mut self) {
+        if let Some(problem) = remove_path_retrying(&self.0, true) {
+            eprintln!("warning: left behind: {problem}");
+        }
+    }
+}
