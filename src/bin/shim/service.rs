@@ -15,7 +15,7 @@ use goetia::backend::scm::exit_status::{
 use goetia::backend::scm::manager::read_spec_blob;
 use goetia::spec::{DaemonSpec, Restart};
 use windows_service::{define_windows_service, service_dispatcher};
-use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, NO_ERROR};
+use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, NO_ERROR};
 use windows_sys::Win32::System::Services::{
     RegisterServiceCtrlHandlerExW, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_STOP,
     SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOP_PENDING, SERVICE_STOPPED,
@@ -23,7 +23,7 @@ use windows_sys::Win32::System::Services::{
 };
 
 use crate::logging::Log;
-use crate::os::{Real, Spawned, open_append};
+use crate::os::{Real, Spawned, open_append, spawn_error_code};
 use crate::stop_bus::{StopBus, Teardown, WaitOutcome, Waiter, kill_for_stop, terminate_exited_tree};
 
 // Entry ===============================================================================================================
@@ -376,29 +376,6 @@ fn require_job_object(
         child.detach();
     }
     Err(Reported::incomplete_stop())
-}
-
-/// The OS error code behind a `cosca` failure, if it has one.
-pub(crate) fn os_error_of(e: &cosca::error::Error) -> Option<i32> {
-    match e {
-        cosca::error::Error::Io(e) => e.raw_os_error(),
-        cosca::error::Error::Unassessable { source, .. } => source.as_ref().and_then(std::io::Error::raw_os_error),
-        _ => None,
-    }
-}
-
-/// The OS error code SCM is told for a refused spawn: [`os_error_of`], and `ERROR_FILE_NOT_FOUND`
-/// for a `NotFound` without a code. The shim passes only argv, so `std` searches `PATH` for a bare
-/// program name before `CreateProcessW` is called, and its miss is `NotFound` with no code (a
-/// missing absolute path fails in `CreateProcessW`, with the code). Nothing else on the spawn path
-/// makes a code-less `NotFound`.
-pub(crate) fn spawn_error_code(e: &cosca::error::Error) -> Option<i32> {
-    match e {
-        cosca::error::Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound && io.raw_os_error().is_none() => {
-            Some(ERROR_FILE_NOT_FOUND as i32)
-        }
-        _ => os_error_of(e),
-    }
 }
 
 // Failure reports -----------------------------------------------------------------------------------------------------

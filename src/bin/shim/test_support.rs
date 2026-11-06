@@ -14,6 +14,13 @@ pub(crate) mod daemon_spec;
 #[path = "../../../tests/support/cleanup.rs"]
 pub(crate) mod cleanup;
 
+/// What a spawn of a bare binary name not found on `PATH` fails with: `Io(NotFound)` and no OS
+/// error code (`os_tests` pins it against `Real`, with the absolute-path case, which carries
+/// `ERROR_FILE_NOT_FOUND` from `CreateProcessW`).
+pub(crate) fn not_found() -> cosca::error::Error {
+    cosca::error::Error::Io(std::io::Error::from(std::io::ErrorKind::NotFound))
+}
+
 /// A bus over `fake`'s `Os` and `Log`: the supervisor under test.
 pub(crate) fn bus(fake: &Fake) -> Arc<StopBus> {
     Arc::new(StopBus::new(fake.os(), fake.log()))

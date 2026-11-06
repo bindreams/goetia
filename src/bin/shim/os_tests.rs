@@ -14,12 +14,12 @@ use cosca::identity::{Liveness, Resolved};
 use cosca::{Process, Stdio};
 use goetia::spec::DaemonSpec;
 use skuld::temp_dir;
-use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
 
 use super::*;
 use crate::os::fake::FakeGuard;
 use crate::service::build_command;
-use crate::test_support::daemon_spec;
+use crate::test_support::{daemon_spec, not_found};
 
 /// Holds a real daemon and ends its tree when dropped, so a failing test leaves no sleeper behind.
 /// Made before the spawn it will hold.
@@ -88,7 +88,7 @@ fn wait_gives_the_same_exit_code_every_time() {
 
 /// A missing binary reaches SCM as `ERROR_FILE_NOT_FOUND` either way it is named. A bare name is
 /// searched for by `std` before `CreateProcessW` is called, and its miss is `Io(NotFound)` with no
-/// OS error code, so `service::spawn_error_code` supplies it; an absolute path fails in
+/// OS error code, so `spawn_error_code` supplies it; an absolute path fails in
 /// `CreateProcessW` with the code.
 #[skuld::test]
 fn a_spawn_of_a_missing_binary_is_refused_as_not_found(#[fixture(temp_dir)] dir: &Path) {
@@ -108,11 +108,58 @@ fn a_spawn_of_a_missing_binary_is_refused_as_not_found(#[fixture(temp_dir)] dir:
             "{missing:?}: {refused:?}"
         );
         assert_eq!(
-            crate::service::spawn_error_code(&refused),
+            spawn_error_code(&refused),
             Some(ERROR_FILE_NOT_FOUND as i32),
             "{missing:?}: {refused:?}"
         );
     }
+}
+
+// Error codes ---------------------------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn the_os_error_of_an_io_failure_is_kept_and_other_failures_have_none() {
+    assert_eq!(
+        os_error_of(&cosca::error::Error::Io(std::io::Error::from_raw_os_error(
+            ERROR_ACCESS_DENIED as i32
+        ))),
+        Some(ERROR_ACCESS_DENIED as i32)
+    );
+    // A failure without a code has none, whatever its kind.
+    assert_eq!(os_error_of(&not_found()), None);
+    assert_eq!(
+        os_error_of(&cosca::error::Error::Unassessable {
+            detail: "query".to_string(),
+            source: Some(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        }),
+        None
+    );
+    assert_eq!(
+        os_error_of(&cosca::error::Error::Io(std::io::Error::other("no os code"))),
+        None
+    );
+    assert_eq!(
+        os_error_of(&cosca::error::Error::Containment {
+            detail: "attach".to_string()
+        }),
+        None
+    );
+}
+
+#[skuld::test]
+fn a_refused_spawn_without_a_code_that_is_not_found_is_told_to_scm_as_file_not_found() {
+    assert_eq!(spawn_error_code(&not_found()), Some(ERROR_FILE_NOT_FOUND as i32));
+    // A real code wins over the kind's: ERROR_PATH_NOT_FOUND is `NotFound` too.
+    assert_eq!(
+        spawn_error_code(&cosca::error::Error::Io(std::io::Error::from_raw_os_error(
+            ERROR_PATH_NOT_FOUND as i32
+        ))),
+        Some(ERROR_PATH_NOT_FOUND as i32)
+    );
+    assert_eq!(
+        spawn_error_code(&cosca::error::Error::Io(std::io::Error::other("no os code"))),
+        None
+    );
 }
 
 // build_command -------------------------------------------------------------------------------------------------------

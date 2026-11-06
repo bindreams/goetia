@@ -18,8 +18,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use goetia::backend::scm::exit_status::Reported;
 
 use crate::logging::Log;
-use crate::os::{Os, Spawned};
-use crate::service::os_error_of;
+use crate::os::{Os, Spawned, os_error_of};
 
 /// How the run ends, decided once under the [`StopBus`] mutex: a stop accepted before the exit is
 /// decided wins over any failure; an exit decided first is reported whatever stop follows. SCM

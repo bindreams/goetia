@@ -12,6 +12,7 @@ use std::process::ExitStatus;
 use std::thread::JoinHandle;
 
 use cosca::Containment;
+use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 
 mod eventlog;
 
@@ -105,6 +106,29 @@ impl Channels for Real {
 
     fn event_log(&self, severity: Severity, line: &str) {
         eventlog::report(severity, line);
+    }
+}
+
+/// The OS error code behind a `cosca` failure, if it has one.
+pub(crate) fn os_error_of(e: &cosca::error::Error) -> Option<i32> {
+    match e {
+        cosca::error::Error::Io(e) => e.raw_os_error(),
+        cosca::error::Error::Unassessable { source, .. } => source.as_ref().and_then(std::io::Error::raw_os_error),
+        _ => None,
+    }
+}
+
+/// The OS error code SCM is told for a refused spawn: [`os_error_of`], and `ERROR_FILE_NOT_FOUND`
+/// for a `NotFound` without a code. The shim passes only argv, so `std` searches `PATH` for a bare
+/// program name before `CreateProcessW` is called, and its miss is `NotFound` with no code (a
+/// missing absolute path fails in `CreateProcessW`, with the code). Nothing else on the spawn path
+/// makes a code-less `NotFound`.
+pub(crate) fn spawn_error_code(e: &cosca::error::Error) -> Option<i32> {
+    match e {
+        cosca::error::Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound && io.raw_os_error().is_none() => {
+            Some(ERROR_FILE_NOT_FOUND as i32)
+        }
+        _ => os_error_of(e),
     }
 }
 

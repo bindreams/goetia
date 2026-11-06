@@ -13,9 +13,7 @@ use goetia::backend::scm::exit_status::{
 };
 use goetia::spec::{Kind, Restart};
 use skuld::temp_dir;
-use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, NO_ERROR,
-};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, NO_ERROR};
 use windows_sys::Win32::System::Services::{
     SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_PAUSE, SERVICE_CONTROL_STOP, SERVICE_STOP_PENDING, SERVICE_STOPPED,
 };
@@ -23,7 +21,7 @@ use windows_sys::Win32::System::Services::{
 use super::*;
 use crate::os::fake::{FakeGuard, FakeProcess, KillReply, NO_THREAD, Op, WAIT_FAILED, WaitReply, WaiterEnd};
 use crate::test_support::{
-    assert_failures, assert_one_failure, bus, daemon_spec, fallback_refused_failure, tree_refused_failure,
+    assert_failures, assert_one_failure, bus, daemon_spec, fallback_refused_failure, not_found, tree_refused_failure,
 };
 
 const ID: &str = "goetia-shim-launch-test";
@@ -54,13 +52,6 @@ fn spec(dir: &Path) -> DaemonSpec {
         kind: Kind::Simple,
         ..daemon_spec::spec(ID, command.map(str::to_string).to_vec())
     }
-}
-
-/// What a spawn of a bare binary name not found on `PATH` fails with: `Io(NotFound)` and no OS
-/// error code (`os_tests` pins it against `Real`, with the absolute-path case, which carries
-/// `ERROR_FILE_NOT_FOUND` from `CreateProcessW`).
-fn not_found() -> cosca::error::Error {
-    cosca::error::Error::Io(std::io::Error::from(std::io::ErrorKind::NotFound))
 }
 
 /// The line logged when no thread can be made to wait on the daemon.
@@ -880,51 +871,6 @@ fn a_stopped_report_is_stopped_and_accepts_no_control() {
 
     assert_eq!(status.dwCurrentState, SERVICE_STOPPED);
     assert_eq!(status.dwControlsAccepted, 0);
-}
-
-#[skuld::test]
-fn the_os_error_of_an_io_failure_is_kept_and_other_failures_have_none() {
-    assert_eq!(
-        os_error_of(&cosca::error::Error::Io(std::io::Error::from_raw_os_error(
-            ERROR_ACCESS_DENIED as i32
-        ))),
-        Some(ERROR_ACCESS_DENIED as i32)
-    );
-    // A failure without a code has none, whatever its kind.
-    assert_eq!(os_error_of(&not_found()), None);
-    assert_eq!(
-        os_error_of(&cosca::error::Error::Unassessable {
-            detail: "query".to_string(),
-            source: Some(std::io::Error::from(std::io::ErrorKind::NotFound)),
-        }),
-        None
-    );
-    assert_eq!(
-        os_error_of(&cosca::error::Error::Io(std::io::Error::other("no os code"))),
-        None
-    );
-    assert_eq!(
-        os_error_of(&cosca::error::Error::Containment {
-            detail: "attach".to_string()
-        }),
-        None
-    );
-}
-
-#[skuld::test]
-fn a_refused_spawn_without_a_code_that_is_not_found_is_told_to_scm_as_file_not_found() {
-    assert_eq!(spawn_error_code(&not_found()), Some(ERROR_FILE_NOT_FOUND as i32));
-    // A real code wins over the kind's: ERROR_PATH_NOT_FOUND is `NotFound` too.
-    assert_eq!(
-        spawn_error_code(&cosca::error::Error::Io(std::io::Error::from_raw_os_error(
-            ERROR_PATH_NOT_FOUND as i32
-        ))),
-        Some(ERROR_PATH_NOT_FOUND as i32)
-    );
-    assert_eq!(
-        spawn_error_code(&cosca::error::Error::Io(std::io::Error::other("no os code"))),
-        None
-    );
 }
 
 // Services registered by an earlier version ---------------------------------------------------------------------------
