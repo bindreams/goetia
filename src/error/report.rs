@@ -47,10 +47,10 @@ pub(super) fn write_chain<'a>(
         out.write_str("; then: ")?;
         return write_chain(then.as_ref(), out, remedies);
     }
-    if let Some(remedy) = ours.and_then(Error::remedy) {
-        if !remedies.contains(&remedy) {
-            remedies.push(remedy);
-        }
+    if let Some(remedy) = ours.and_then(Error::remedy)
+        && !remedies.contains(&remedy)
+    {
+        remedies.push(remedy);
     }
     write!(out, "{e}")?;
     if let Some(inner) = ours.and_then(Error::embedded) {
