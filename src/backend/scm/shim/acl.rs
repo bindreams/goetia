@@ -255,8 +255,9 @@ mod system {
         OWNER_SECURITY_INFORMATION, PSID,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FileIdInfo,
-        GetFileInformationByHandleEx, GetVolumeInformationByHandleW, READ_CONTROL,
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
+        FILE_READ_ATTRIBUTES, FileIdInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+        GetVolumeInformationByHandleW, READ_CONTROL,
     };
 
     use super::{Ace, ObjectSecurity, Sid, Unsafe, everyone};
@@ -353,12 +354,15 @@ mod system {
         fn add(&mut self, path: &Path) -> Result<()> {
             for component in path.ancestors() {
                 let file = open(component).map_err(|e| Error::os_at("read the permissions of", component, e))?;
+                let shown = display_path(component);
+                // First: a volume without ACLs may not answer for identity either.
+                require_acls(file.as_raw_handle() as HANDLE, &shown)?;
                 let id = object_id(&file, component)?;
                 if self.seen.contains(&id) {
                     continue;
                 }
                 self.seen.push(id);
-                self.chain.push(read_object(&file, display_path(component))?);
+                self.chain.push(read_object(&file, shown)?);
                 let is_link = file
                     .metadata()
                     .map_err(|e| Error::os_at("read the type of", component, e))?
@@ -373,7 +377,21 @@ mod system {
         }
     }
 
+    /// The object `file` is open on. A volume or server that has no file ID (FAT, some SMB
+    /// shares) is identified by the older volume serial and file index.
     fn object_id(file: &File, path: &Path) -> Result<ObjectId> {
+        identity_of(file_id(file), || file_index(file)).map_err(|e| Error::os_at("identify", path, e))
+    }
+
+    /// `by_id`, or when it failed, `by_index`; an error only when both did.
+    pub(super) fn identity_of(
+        by_id: io::Result<ObjectId>,
+        by_index: impl FnOnce() -> io::Result<ObjectId>,
+    ) -> io::Result<ObjectId> {
+        by_id.or_else(|_| by_index())
+    }
+
+    fn file_id(file: &File) -> io::Result<ObjectId> {
         let mut info = FILE_ID_INFO {
             VolumeSerialNumber: 0,
             FileId: Default::default(),
@@ -389,23 +407,69 @@ mod system {
             )
         };
         if ok == 0 {
-            return Err(Error::os_at("identify", path, io::Error::last_os_error()));
+            return Err(io::Error::last_os_error());
         }
         Ok((info.VolumeSerialNumber, info.FileId.Identifier))
     }
 
-    /// Where the link at `link` leads, as one hop. A relative target is resolved against the final
-    /// path of the link's parent, since a link on the way to `link` can lead the parent
-    /// elsewhere than its spelling suggests, then its `.` and `..` are applied.
+    /// The 64-bit file index, widened to an [`ObjectId`] with the volume's 32-bit serial.
+    fn file_index(file: &File) -> io::Result<ObjectId> {
+        // SAFETY: an all-zero `BY_HANDLE_FILE_INFORMATION` is a valid value of plain integers.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `file` is open with `FILE_READ_ATTRIBUTES`; `info` is a valid out-pointer.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+        let mut id = [0u8; 16];
+        id[..8].copy_from_slice(&index.to_le_bytes());
+        Ok((u64::from(info.dwVolumeSerialNumber), id))
+    }
+
+    /// Where the link at `link` leads, as one hop, with `.` and `..` applied lexically. A relative
+    /// target is resolved against the final path of the link's parent, since a link on the way to
+    /// `link` can lead the parent elsewhere than its spelling suggests. A target with a drive and
+    /// no root (`C:foo`) is refused: it means the current directory of that drive in the process
+    /// that follows the link, which is not this one. A verbatim target is kept as it is, since
+    /// the system does not interpret `..` in one.
     fn link_target(link: &Path) -> Result<PathBuf> {
         let target = std::fs::read_link(link).map_err(|e| Error::os_at("read the link", link, e))?;
+        resolve_target(link, target, || {
+            let parent = link.parent().unwrap_or(link);
+            std::fs::canonicalize(parent).map_err(|e| Error::os_at("resolve", parent, e))
+        })
+    }
+
+    /// [`link_target`] over the target as read; `parent_final` gives the final path of the link's
+    /// parent, and is asked for only when the target is relative.
+    pub(super) fn resolve_target(
+        link: &Path,
+        target: PathBuf,
+        parent_final: impl FnOnce() -> Result<PathBuf>,
+    ) -> Result<PathBuf> {
         if target.is_absolute() {
-            return Ok(target);
+            return Ok(match target.components().next() {
+                Some(Component::Prefix(prefix)) if prefix.kind().is_verbatim() => target,
+                _ => normalise(&target),
+            });
         }
-        let parent = link.parent().unwrap_or(link);
-        let parent = std::fs::canonicalize(parent).map_err(|e| Error::os_at("resolve", parent, e))?;
+        if !target.has_root() && matches!(target.components().next(), Some(Component::Prefix(_))) {
+            return Err(Error::os_at(
+                "follow the link",
+                link,
+                io::Error::other(format!(
+                    "its target {} is relative to the current directory of a drive, which the process that follows it decides",
+                    target.display()
+                )),
+            ));
+        }
+        Ok(normalise(&parent_final()?.join(target)))
+    }
+
+    /// `path` with its `.` and `..` components applied lexically.
+    fn normalise(path: &Path) -> PathBuf {
         let mut resolved = PathBuf::new();
-        for component in parent.join(target).components() {
+        for component in path.components() {
             match component {
                 Component::CurDir => {}
                 Component::ParentDir => {
@@ -414,7 +478,7 @@ mod system {
                 other => resolved.push(other),
             }
         }
-        Ok(resolved)
+        resolved
     }
 
     /// Opens `path` for its security alone. A link is opened as itself, not followed.
@@ -425,9 +489,9 @@ mod system {
             .open(path)
     }
 
+    /// The owner and DACL of an object on a volume that keeps ACLs ([`require_acls`]).
     fn read_object(file: &File, path: PathBuf) -> Result<ObjectSecurity> {
         let handle = file.as_raw_handle() as HANDLE;
-        require_acls(handle, &path)?;
 
         let mut owner: PSID = std::ptr::null_mut();
         let mut dacl: *mut ACL = std::ptr::null_mut();

@@ -303,9 +303,10 @@ fn bytes_that_are_not_a_sid_are_written_as_such_not_panicked_on() {
 
 #[cfg(windows)]
 mod windows {
-    use super::system::{display_path, read_chain};
+    use super::system::{display_path, identity_of, read_chain, resolve_target};
     use super::*;
     use crate::error::Error;
+    use std::io;
 
     fn disabled() -> FolderCheck {
         FolderCheck {
@@ -470,6 +471,57 @@ mod windows {
                 held.display()
             );
         }
+    }
+
+    #[skuld::test]
+    fn a_drive_relative_link_target_is_refused() {
+        // `CreateSymbolicLink` resolves `C:foo` itself and stores an absolute target, so no link
+        // made through the API holds one; the target is read as the system would hand it over.
+        let link = PathBuf::from(r"C:\d\link");
+        let outcome = resolve_target(&link, PathBuf::from("C:foo"), || panic!("not needed"));
+        let Err(Error::Os { what, path, .. }) = outcome else {
+            panic!("a drive-relative target must be refused: {outcome:?}");
+        };
+        assert_eq!(what, "follow the link");
+        assert_eq!(path, Some(link));
+    }
+
+    #[skuld::test]
+    fn link_targets_are_resolved_lexically() {
+        let link = PathBuf::from(r"C:\d\link");
+        let parent = || Ok(PathBuf::from(r"C:\real\parent"));
+        let resolve = |target: &str| resolve_target(&link, PathBuf::from(target), parent).unwrap();
+        assert_eq!(resolve(r"..\foo"), PathBuf::from(r"C:\real\foo"));
+        assert_eq!(resolve(r"sub\.\foo"), PathBuf::from(r"C:\real\parent\sub\foo"));
+        assert_eq!(resolve(r"\foo"), PathBuf::from(r"C:\foo"));
+        assert_eq!(resolve(r"D:\a\..\b"), PathBuf::from(r"D:\b"));
+        // The system does not interpret `..` in a verbatim path.
+        assert_eq!(resolve(r"\\?\D:\a\..\b"), PathBuf::from(r"\\?\D:\a\..\b"));
+    }
+
+    #[skuld::test]
+    fn an_absolute_link_target_has_its_dot_dot_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (real, link) = (root.join("real"), root.join("link"));
+        std::fs::create_dir(&real).unwrap();
+        // `gone` does not exist: only a lexical `..` lands on `real`.
+        symlink(&display_path(&root).join("gone").join("..").join("real"), &link);
+
+        let paths = labels(&read_chain(&link).unwrap());
+        assert!(paths.contains(&display_path(&real)), "{paths:?}");
+    }
+
+    #[skuld::test]
+    fn the_file_index_stands_in_when_the_file_id_is_unsupported() {
+        let unsupported = || Err(io::Error::from_raw_os_error(87));
+        let index = || Ok((7, [1; 16]));
+        assert_eq!(
+            identity_of(Ok((1, [2; 16])), || panic!("not needed")).unwrap(),
+            (1, [2; 16])
+        );
+        assert_eq!(identity_of(unsupported(), index).unwrap(), (7, [1; 16]));
+        assert!(identity_of(unsupported(), unsupported).is_err());
     }
 
     #[skuld::test]
