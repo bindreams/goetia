@@ -70,6 +70,16 @@ fn staging_path(id: &str) -> PathBuf {
     staging_dir().join(format!("{id}.plist"))
 }
 
+/// Creates [`STAGING_DIR`] (and `/Library/Application Support/Goetia` above it) if missing, as
+/// `install` does on first use, and restates `0755` on the leaf as `ensure_dir` does. Nothing removes
+/// the directory, so a test that seeds a file into it calls this first.
+fn ensure_staging_dir() {
+    let dir = staging_dir();
+    std::fs::create_dir_all(&dir).expect("create the staging directory");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|e| panic!("chmod 0755 {}: {e}", dir.display()));
+}
+
 fn enabled_path(id: &str) -> PathBuf {
     enabled_dir().join(format!("{id}.plist"))
 }
@@ -122,26 +132,13 @@ fn binary_plist(label: &str) -> Vec<u8> {
 /// host a permanent exit `4` for a vendor's service.
 const NON_UTF8_PLIST: [u8; 4] = [b'<', 0xff, 0xfe, b'>'];
 
-/// Asserts that a directory macOS provides (`/Library/LaunchDaemons`, the temp dir) exists; a test
-/// never creates one.
-fn require_system_dir(dir: &Path) {
-    assert!(dir.is_dir(), "macOS's own {} is missing", dir.display());
-}
-
 fn write_plist(path: &Path, content: &str) {
     write_bytes(path, content.as_bytes());
 }
 
-/// Writes `bytes` to `path`. The parent must exist: `/Library/LaunchDaemons` is the system's, shared
-/// by every test running concurrently, so no test creates it. Goetia's own staging directory is the
-/// one exception, since `install` creates it on first use and nothing removes it.
+/// Writes `bytes` to `path` and makes it `0644`. The parent must exist: a seed into [`STAGING_DIR`]
+/// calls [`ensure_staging_dir`] first, and the system's own directories are never created by a test.
 fn write_bytes(path: &Path, bytes: &[u8]) {
-    let parent = path.parent().unwrap();
-    if parent == Path::new(STAGING_DIR) {
-        std::fs::create_dir_all(parent).expect("create the staging directory");
-    } else {
-        require_system_dir(parent);
-    }
     std::fs::write(path, bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).expect("chmod plist");
 }
@@ -201,6 +198,7 @@ fn launchd_passes_conformance() {
     let _foreign_service = support::ServiceGuard::new(manager::conformance::FOREIGN_ID);
     let foreign_path = staging_path(manager::conformance::FOREIGN_ID);
     let _foreign_cleanup = FileGuard::new(foreign_path.clone());
+    ensure_staging_dir();
     write_plist(&foreign_path, &foreign_plist(manager::conformance::FOREIGN_ID));
 
     // Seed `HAND_EDITED_ID`: install normally, then hand-edit the result so
@@ -341,6 +339,7 @@ fn create_does_not_clobber_a_unit_that_appears_after_classification() {
     let path = staging_path(&id);
     let foreign_content = "not a goetia artifact, seeded directly\n";
     let _cleanup = FileGuard::new(path.clone());
+    ensure_staging_dir();
     write_plist(&path, foreign_content);
 
     let spec = sleepy(&id);
@@ -633,6 +632,7 @@ fn list_ignores_foreign_plists() {
     let id = support::random_test_id();
     let path = staging_path(&id);
     let _cleanup = FileGuard::new(path.clone());
+    ensure_staging_dir();
     write_plist(&path, &foreign_plist(&id));
 
     let listed = mgr.list().expect("list");
@@ -662,6 +662,7 @@ fn list_reports_a_deleted_user_as_ours_unusable() {
     spec.user = User::Name(user.to_string());
     let path = staging_path(&id);
     let _cleanup = FileGuard::new(path.clone());
+    ensure_staging_dir();
     write_plist(&path, &generate::plist(&spec, &Identity { user: user.to_string() }));
     let cannot_render = mgr
         .preview_install(&spec)
@@ -849,6 +850,7 @@ fn preview_install_over_a_non_utf8_plist_refuses_it_as_foreign() {
     let id = support::random_test_id();
     let path = staging_path(&id);
     let _cleanup = FileGuard::new(path.clone());
+    ensure_staging_dir();
     write_bytes(&path, &NON_UTF8_PLIST);
 
     let spec = sleepy(&id);
@@ -889,18 +891,15 @@ fn preview_install_over_a_non_utf8_plist_refuses_it_as_foreign() {
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn an_unsearchable_plist_directory_is_undetermined_rather_than_absent() {
     let id = support::random_test_id();
-    // `install` creates these on first use; nothing guarantees this host has installed anything yet.
-    // The modes are restated rather than left to the umask, since the baseline below is exactly the
-    // claim that an unprivileged reader can traverse them — `ensure_dir` restates `0755` too.
-    std::fs::create_dir_all(staging_dir()).expect("create the staging directory");
+    // The baseline below claims an unprivileged reader can traverse both directories, so the
+    // parent's mode is restated too rather than left to the umask.
+    ensure_staging_dir();
     let staging_parent = staging_dir()
         .parent()
         .expect("the staging directory is not a filesystem root")
         .to_path_buf();
-    for dir in [&staging_parent, &staging_dir()] {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
-            .unwrap_or_else(|e| panic!("chmod 0755 {}: {e}", dir.display()));
-    }
+    std::fs::set_permissions(&staging_parent, std::fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|e| panic!("chmod 0755 {}: {e}", staging_parent.display()));
 
     // Non-vacuity: with both directories searchable, this id is *determinately* absent — exit `1`,
     // the answer the assertions below reject.
@@ -1241,7 +1240,8 @@ fn install_over_a_directory_refuses_instead_of_recursing() {
     let id = support::random_test_id();
     let path = staging_path(&id);
     let _cleanup = DirGuard::new(path.clone());
-    std::fs::create_dir_all(&path).expect("seed a directory at the staging path");
+    ensure_staging_dir();
+    std::fs::create_dir(&path).expect("seed a directory at the staging path");
 
     let spec = sleepy(&id);
     // The mere fact this returns at all (rather than stack-overflowing) is
@@ -1279,7 +1279,7 @@ fn list_does_not_hang_on_a_fifo_in_the_plist_directory() {
 }
 
 fn mkfifo(path: &Path) {
-    require_system_dir(path.parent().unwrap());
+    support::require_system_dir(path.parent().unwrap());
     let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("a plist path with no NUL");
     // SAFETY: `c_path` is a NUL-terminated pointer valid for the call.
     let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };

@@ -61,14 +61,6 @@ pub(crate) fn wants_symlink(id: &str) -> PathBuf {
         .join(format!("{id}.service"))
 }
 
-/// Asserts that a system directory the image provides (`multi-user.target.wants`) exists; a test
-/// never creates one, since every test running concurrently shares it.
-fn require_system_dir(dir: &Path) {
-    if !dir.is_dir() {
-        missing_system_dir(dir);
-    }
-}
-
 /// A hand-written unit carrying no `[X-Goetia]` marker at all — what a real foreign service looks
 /// like to discovery.
 fn seed_foreign(id: &str) {
@@ -124,8 +116,9 @@ fn seed_unreadable_dropin_enotdir(id: &str) -> FileGuard {
 }
 
 /// [`seed_unreadable_dropin_enotdir`] under an arbitrary search root, creating that root where it is
-/// missing (its parent must exist: see [`create_root`]). `scan_host` reaches any root but `UNIT_DIR` through its cross-root pass alone, and only
-/// for the drop-in half — a *fragment* outside `UNIT_DIR` deliberately names no id (see `HostScan`).
+/// missing (its parent must exist: see [`create_root`]). `scan_host` reaches any root but `UNIT_DIR`
+/// through its cross-root pass alone, and only for the drop-in half — a *fragment* outside
+/// `UNIT_DIR` deliberately names no id (see `HostScan`).
 ///
 /// The root is removed only when this call created it, and with `remove_dir`, so a root systemd
 /// itself populated is left exactly as it was found.
@@ -140,15 +133,15 @@ fn seed_unreadable_dropin_in_root(root: &str, id: &str) -> (PathBuf, RmInRoot<Fi
     (leaf, guard)
 }
 
-/// Seed one `*.conf` into an arbitrary drop-in directory and hand back the RAII removal of it. The
-/// parent search root is left exactly as found: `/etc/systemd/system` is shared with every other
-/// test running concurrently.
+/// Seed one `*.conf` into the drop-in directory `dir`, creating only that leaf, and hand back the RAII
+/// removal of it. Its parent search root is guaranteed or was made by [`create_root`], and is left
+/// exactly as found: `/etc/systemd/system` is shared with every other test running concurrently.
 fn seed_dropin(dir: &Path, root: CreatedRoot) -> RmInRoot<DirGuard> {
     let guard = RmInRoot {
         _leaf: DirGuard::new(dir.to_path_buf()),
         _root: root,
     };
-    fs::create_dir_all(dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
+    fs::create_dir(dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
     fs::write(dir.join("50-x.conf"), "[Service]\nMemoryMax=8G\n").expect("write drop-in");
     cmd::run("systemctl", &["daemon-reload"]).expect_ok();
     guard
@@ -276,24 +269,20 @@ fn uid_of(account: &str) -> u32 {
 }
 
 /// Creates the search root `root`, which must be the only thing missing: its parent is a system
-/// directory the sandbox image provides (`/etc/systemd`, `/run/systemd`), shared by every test that
-/// runs concurrently, so no test creates it or removes it. `create_dir` answers `AlreadyExists` for
+/// directory (`/etc/systemd`, `/run/systemd`), shared by every test that runs concurrently, so no
+/// test creates it or removes it. `create_dir` answers `AlreadyExists` for
 /// a root that was there first, so ownership is not a check followed by a create.
 fn create_root(root: &Path) -> CreatedRoot {
     match fs::create_dir(root) {
         Ok(()) => CreatedRoot(Some(root.to_path_buf())),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => CreatedRoot(None),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing_system_dir(root.parent().unwrap_or(root)),
-        Err(e) => panic!("mkdir {}: {e}", root.display()),
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                support::require_system_dir(root.parent().unwrap_or(root));
+            }
+            panic!("mkdir {}: {e}", root.display())
+        }
     }
-}
-
-/// Fails the test for a system directory it needs but the image lacks.
-fn missing_system_dir(dir: &Path) -> ! {
-    panic!(
-        "systemd's own {} is missing; the sandbox image provides it",
-        dir.display()
-    )
 }
 
 /// The search root a seeding call created, removed on drop with `remove_dir`. "Not empty" is
@@ -798,26 +787,27 @@ pub(crate) fn main_pid(id: &str) -> String {
 /// succeeds, so nothing is left `failed` — and removes it; declared after the `ServiceGuard`, so it
 /// drops first.
 ///
-/// The lock file is `/run/{id}.lock`, not in a temp dir: the path is spliced unquoted into the unit's
-/// `ExecStop=` line, where whitespace or `%` would break it, and `/run/{id}.lock` has neither.
+/// The lock file lives in a temp dir, held in the last field so it is removed after `Drop` has
+/// stopped the holder, whose `ExecStop=` still opens it. The path is double-quoted in that line, with
+/// backslash, double quote, `%` and `$` escaped, so any `TMPDIR` works.
 struct StopHolder {
     unit: String,
     path: PathBuf,
     held: Option<fs::File>,
-    /// Declared last, so the lock goes after `Drop` has stopped the holder.
-    _lock: FileGuard,
+    _lock_dir: tempfile::TempDir,
 }
 
 impl StopHolder {
     fn start(id: &str) -> Self {
         let unit = format!("{id}-holder.service");
         let path = PathBuf::from("/run/systemd/system").join(&unit);
-        let lock = PathBuf::from(format!("/run/{id}.lock"));
+        let lock_dir = tempfile::tempdir().expect("tempdir for the holder's lock");
+        let lock = lock_dir.path().join("lock");
         let mut holder = StopHolder {
             unit,
             path,
             held: None,
-            _lock: FileGuard::new(lock.clone()),
+            _lock_dir: lock_dir,
         };
         let held = fs::File::create(&lock).unwrap_or_else(|e| panic!("create {}: {e}", lock.display()));
         // SAFETY: `held` owns the descriptor for the duration of the call.
@@ -830,13 +820,19 @@ impl StopHolder {
             std::io::Error::last_os_error()
         );
         holder.held = Some(held);
+        let quoted = lock
+            .to_str()
+            .expect("a UTF-8 temp path")
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('%', "%%")
+            .replace('$', "$$");
         fs::write(
             &holder.path,
             format!(
                 "[Unit]\nRequires={id}.service\nAfter={id}.service\n\
-                 [Service]\nExecStart=/bin/sleep infinity\nExecStop=/usr/bin/flock {} true\n\
+                 [Service]\nExecStart=/bin/sleep infinity\nExecStop=/usr/bin/flock \"{quoted}\" true\n\
                  TimeoutStopSec=infinity\n",
-                lock.display()
             ),
         )
         .expect("write the holder unit");
@@ -1338,7 +1334,8 @@ fn uninstall_refuses_an_id_whose_fragment_is_gone_but_whose_enablement_link_rema
     let link = wants_symlink(&id);
     // No `ServiceGuard`: the id never gets a fragment, so only the planted link needs removing.
     let _cleanup = FileGuard::new(link.clone());
-    require_system_dir(link.parent().expect("the link has a parent"));
+    // Like `systemctl enable`, create `multi-user.target.wants` if missing and leave it behind.
+    fs::create_dir_all(link.parent().expect("the link has a parent")).expect("create the wants directory");
     std::os::unix::fs::symlink(unit_path(&id), &link).expect("plant a dangling .wants link");
 
     let (code, out, err) = uninstall_via_cli(&id);
@@ -1353,7 +1350,8 @@ fn install_refuses_a_stray_enablement_link_with_no_fragment() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let link = wants_symlink(guard.id());
-    require_system_dir(link.parent().expect("the link has a parent"));
+    // Like `systemctl enable`, create `multi-user.target.wants` if missing and leave it behind.
+    fs::create_dir_all(link.parent().expect("the link has a parent")).expect("create the wants directory");
     std::os::unix::fs::symlink(unit_path(guard.id()), &link).expect("plant a dangling .wants link");
 
     let mgr = Systemd::new();
