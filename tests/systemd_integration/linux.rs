@@ -19,7 +19,7 @@ use goetia::decide::Outcome;
 use goetia::manager::{Budget, Installed, ServiceManager, State, conformance};
 use goetia::spec::{AccountId, DaemonSpec, Id, Kind, Restart, User};
 
-use crate::support::cleanup::{DirGuard, FileGuard, remove_path_retrying};
+use crate::support::cleanup::{DirGuard, FileGuard, remove_or_warn};
 use crate::support::{self, ELEVATED, ServiceGuard, cmd};
 
 /// Held by every test whose assertion is about `list`'s answer for the *whole host* — its exit code,
@@ -119,9 +119,9 @@ fn seed_unreadable_dropin_enotdir(id: &str) -> FileGuard {
 /// missing. `scan_host` reaches any root but `UNIT_DIR` through its cross-root pass alone, and only
 /// for the drop-in half — a *fragment* outside `UNIT_DIR` deliberately names no id (see `HostScan`).
 ///
-/// The root is removed only when this call created it, and with `remove_dir`, so a root systemd
-/// itself populated is left exactly as it was found.
-fn seed_unreadable_dropin_in_root(root: &str, id: &str) -> RmInRoot<FileGuard> {
+/// Returns the leaf's path with the removal. The root is removed only when this call created it, and
+/// with `remove_dir`, so a root systemd itself populated is left exactly as it was found.
+fn seed_unreadable_dropin_in_root(root: &str, id: &str) -> (PathBuf, RmInRoot<FileGuard>) {
     let root_path = PathBuf::from(root);
     let leaf = root_path.join(format!("{id}.service.d"));
     let guard = RmInRoot::new(
@@ -130,7 +130,7 @@ fn seed_unreadable_dropin_in_root(root: &str, id: &str) -> RmInRoot<FileGuard> {
     );
     fs::create_dir_all(&root_path).unwrap_or_else(|e| panic!("mkdir {root}: {e}"));
     fs::write(&leaf, b"").unwrap_or_else(|e| panic!("seed {}: {e}", leaf.display()));
-    guard
+    (leaf, guard)
 }
 
 /// Seed one `*.conf` into an arbitrary drop-in directory and hand back the RAII removal of it. The
@@ -288,8 +288,10 @@ impl Drop for CreatedRoot {
 /// standing where one belongs) and, where the seeding call created it, the search root holding it.
 /// The leaf field is declared first, so it is removed before the root; see [`seed_control_dropin`].
 ///
-/// No `daemon-reload` on drop: every test that seeds a drop-in also holds a `ServiceGuard`, whose
-/// own cleanup reloads after this one has run.
+/// No `daemon-reload` on drop. A test that seeds a drop-in for a unit systemd loads (`seed_dropin`
+/// reloads at the seed) also holds a `ServiceGuard`, whose own cleanup reloads after this one has
+/// run. The unreadable-drop-in seeds (`seed_unreadable_dropin_*`) need none: no unit is ever loaded
+/// for their id, so systemd holds nothing from them to forget, and their tests run no reload.
 struct RmInRoot<L> {
     _leaf: L,
     _root: Option<CreatedRoot>,
@@ -772,22 +774,31 @@ pub(crate) fn main_pid(id: &str) -> String {
 /// stop instead of queuing behind it. `Drop` releases the lock, stops the holder — its stop then
 /// succeeds, so nothing is left `failed` — and removes it; declared after the `ServiceGuard`, so it
 /// drops first.
+///
+/// The lock file lives in a temporary directory the guard owns: the holder unit sets no
+/// `PrivateTmp`, so its `ExecStop` sees the same path. Only the unit file has to be in
+/// `/run/systemd/system`.
 struct StopHolder {
     unit: String,
     path: PathBuf,
     lock: PathBuf,
     held: Option<fs::File>,
+    /// Declared last, so the directory goes after the holder has stopped and released the lock.
+    _lock_dir: DirGuard,
 }
 
 impl StopHolder {
     fn start(id: &str) -> Self {
         let unit = format!("{id}-holder.service");
         let path = PathBuf::from("/run/systemd/system").join(&unit);
+        // `keep` hands the removal to the `DirGuard`, which retries and warns.
+        let lock_dir = tempfile::tempdir().expect("tempdir for the holder's lock").keep();
         let mut holder = StopHolder {
             unit,
             path,
-            lock: PathBuf::from(format!("/run/{id}.lock")),
+            lock: lock_dir.join("holder.lock"),
             held: None,
+            _lock_dir: DirGuard::new(lock_dir),
         };
         let held = fs::File::create(&holder.lock).unwrap_or_else(|e| panic!("create {}: {e}", holder.lock.display()));
         // SAFETY: `held` owns the descriptor for the duration of the call.
@@ -829,11 +840,7 @@ impl Drop for StopHolder {
         if !run.ok() && run.code != Some(5) {
             eprintln!("StopHolder[{}]: cleanup failed: {run}", self.unit);
         }
-        for path in [&self.path, &self.lock] {
-            if let Some(problem) = remove_path_retrying(path, false) {
-                eprintln!("warning: left behind: {problem}");
-            }
-        }
+        remove_or_warn(&self.path, false);
         let run = cmd::run("systemctl", &["daemon-reload"]);
         if !run.ok() {
             eprintln!("StopHolder[{}]: cleanup failed: {run}", self.unit);
@@ -1723,7 +1730,7 @@ fn a_top_level_service_d_dropin_is_not_this_ids_conflict() {
     fs::create_dir(&dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
     // Built after the mkdir, not before: it is atomic, so on failure nothing was created and a guard
     // would remove a host-wide directory this test did not make.
-    let _cleanup = RmInRoot::new(DirGuard::new(dir.clone()), None);
+    let _cleanup = DirGuard::new(dir.clone());
     fs::write(
         dir.join("50-goetia-test.conf"),
         "[Unit]\nDocumentation=https://example.invalid/goetia-test\n",
@@ -2014,8 +2021,7 @@ fn list_names_an_id_whose_only_dropin_is_under_another_search_root() {
         "the id must start out unaccounted for, or the assertion below proves nothing"
     );
 
-    let _elsewhere = seed_unreadable_dropin_in_root("/etc/systemd/system.attached", &id);
-    let elsewhere_leaf = PathBuf::from("/etc/systemd/system.attached").join(format!("{id}.service.d"));
+    let (elsewhere_leaf, _elsewhere) = seed_unreadable_dropin_in_root("/etc/systemd/system.attached", &id);
     assert!(!unit_path(&id).exists(), "the fragment must really be absent");
     assert!(
         !dropin_dir(&id).exists(),

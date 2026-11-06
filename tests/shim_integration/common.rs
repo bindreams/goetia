@@ -107,16 +107,16 @@ struct LeftoverLog {
 
 impl Drop for LeftoverLog {
     fn drop(&mut self) {
-        let problem = match &self.fate {
-            Fate::Keep(why) => match self.path.try_exists() {
-                Ok(false) => None,
-                Ok(true) => Some(format!("left {}: {why}", self.path.display())),
-                Err(e) => Some(format!("left {}, if it exists ({e}): {why}", self.path.display())),
-            },
-            Fate::Remove => support::cleanup::remove_path_retrying(&self.path, false),
-        };
-        if let Some(problem) = problem {
-            eprintln!("ShimGuard[{}]: {problem}", self.id);
+        match &self.fate {
+            Fate::Keep(why) => {
+                let problem = match self.path.try_exists() {
+                    Ok(false) => return,
+                    Ok(true) => format!("left {}: {why}", self.path.display()),
+                    Err(e) => format!("left {}, if it exists ({e}): {why}", self.path.display()),
+                };
+                eprintln!("ShimGuard[{}]: {problem}", self.id);
+            }
+            Fate::Remove => support::cleanup::remove_or_warn(&self.path, false),
         }
     }
 }

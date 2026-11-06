@@ -24,7 +24,7 @@ use crate::spec::Kind;
 // The integration suites' removal of what a test created; a library test reaches `tests/` only by path.
 #[path = "../../../tests/support/cleanup.rs"]
 mod cleanup;
-use cleanup::{DirGuard, FileGuard, remove_path_retrying};
+use cleanup::{DirGuard, FileGuard, remove_or_warn};
 
 #[skuld::label]
 const ELEVATED: skuld::Label;
@@ -51,15 +51,27 @@ impl QuarantineSweep {
 
 impl Drop for QuarantineSweep {
     fn drop(&mut self) {
-        let Ok(entries) = std::fs::read_dir(UNIT_DIR) else {
-            return;
+        let entries = match std::fs::read_dir(UNIT_DIR) {
+            Ok(entries) => entries,
+            Err(e) => {
+                eprintln!(
+                    "warning: left behind: list {UNIT_DIR} for the quarantine files of {}: {e}",
+                    self.0
+                );
+                return;
+            }
         };
         let prefix = format!(".{}.service.goetia-quarantine", self.0);
-        for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().starts_with(&prefix) {
-                if let Some(problem) = remove_path_retrying(&entry.path(), false) {
-                    eprintln!("warning: left behind: {problem}");
+        for entry in entries {
+            match entry {
+                Ok(entry) if entry.file_name().to_string_lossy().starts_with(&prefix) => {
+                    remove_or_warn(&entry.path(), false);
                 }
+                Ok(_) => {}
+                Err(e) => eprintln!(
+                    "warning: left behind: read {UNIT_DIR} for the quarantine files of {}: {e}",
+                    self.0
+                ),
             }
         }
     }

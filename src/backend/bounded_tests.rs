@@ -8,6 +8,15 @@ use std::time::Duration;
 use super::*;
 use crate::manager::budget::Budget;
 
+// The integration suites' removal of what a test created; a library test reaches `tests/` only by path.
+#[cfg(target_os = "linux")]
+#[expect(
+    dead_code,
+    reason = "this file uses only `remove_empty_dir_or_warn`; the rest serves the integration suites"
+)]
+#[path = "../../tests/support/cleanup.rs"]
+mod cleanup;
+
 /// A reservation holding the temp files one child's streams draw.
 fn files() -> Reservation {
     Reservation::make(0, STREAMS).unwrap()
@@ -232,11 +241,13 @@ fn a_heard_stream_is_read_only_until_a_spent_deadline_even_at_its_end() {
 fn a_contained_childs_descendant_dies_with_it() {
     // Same script, same fd-3 handshake, but spawned through `bounded::command`
     // so the tree IS contained.
+    #[cfg(target_os = "linux")]
+    let mut leaf = DrainedLeaf::default();
     let mut cmd = sh("sleep 2147483647 & echo $! >&3; exec sleep 2147483647");
     cmd.fd(3, cosca::Stdio::pipe_out()).unwrap();
     let mut child = spawned(cmd, Role::Query);
     #[cfg(target_os = "linux")]
-    let leaf = contained_leaf(child.child.id().pid());
+    leaf.set(contained_leaf(child.child.id().pid()));
 
     let fd3 = child.child.fd_read_end(3.into()).unwrap();
     let mut line = String::new();
@@ -257,8 +268,6 @@ fn a_contained_childs_descendant_dies_with_it() {
         cosca::identity::Resolved::Gone => {}
         cosca::identity::Resolved::Unknown => panic!("could not resolve the descendant's identity"),
     }
-    #[cfg(target_os = "linux")]
-    remove_drained_leaf(leaf);
 }
 
 /// The cgroup leaf cosca placed `pid` in, or `None` where containment fell back to a process
@@ -271,16 +280,28 @@ fn contained_leaf(pid: u32) -> Option<std::path::PathBuf> {
     leaf.file_name()?.to_str()?.starts_with("cosca-").then_some(leaf)
 }
 
-/// Remove a leaf every member of which has exited. cosca's own `Drop` removes it when the killed
-/// tree has already drained by then, and leaves it behind when a member is still dying — half the
-/// runs of the test above, measured — so the test removes what it made.
+/// Removes the cgroup leaf cosca placed a child in, on drop. cosca's own `Drop` removes it when the
+/// killed tree has already drained by then, and leaves it behind when a member is still dying — half
+/// the runs of the test above, measured — so the test removes what it made. An `rmdir` that meets a
+/// member still exiting is retried, then warned about. Created before the spawn, so a failing test
+/// removes the leaf too; [`DrainedLeaf::set`] names the leaf once the child is in it.
 #[cfg(target_os = "linux")]
-fn remove_drained_leaf(leaf: Option<std::path::PathBuf>) {
-    let Some(leaf) = leaf else { return };
-    match std::fs::remove_dir(&leaf) {
-        Ok(()) => {}
-        Err(e) if e.kind() == ErrorKind::NotFound => {}
-        Err(e) => panic!("remove the drained leaf {}: {e}", leaf.display()),
+#[derive(Default)]
+struct DrainedLeaf(Option<std::path::PathBuf>);
+
+#[cfg(target_os = "linux")]
+impl DrainedLeaf {
+    fn set(&mut self, leaf: Option<std::path::PathBuf>) {
+        self.0 = leaf;
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for DrainedLeaf {
+    fn drop(&mut self) {
+        if let Some(leaf) = &self.0 {
+            cleanup::remove_empty_dir_or_warn(leaf);
+        }
     }
 }
 

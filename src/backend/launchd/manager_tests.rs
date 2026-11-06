@@ -14,13 +14,13 @@ use crate::manager::ServiceManager;
 use crate::spec::{Id, Kind, Restart, User};
 
 // The integration suites' removal of what a test created; a library test reaches `tests/` only by path.
-#[allow(
+#[expect(
     dead_code,
-    reason = "this file uses only `FileGuard`; the systemd tests use `DirGuard` too"
+    reason = "this file uses `FileGuard` and `remove_or_warn`; `DirGuard` serves the other suites"
 )]
 #[path = "../../../tests/support/cleanup.rs"]
 mod cleanup;
-use cleanup::FileGuard;
+use cleanup::{FileGuard, remove_or_warn};
 
 fn sample_plist(id: &str) -> String {
     sample_plist_restarting(id, Restart::Never)
@@ -1454,6 +1454,7 @@ impl OverSh {
 }
 
 /// Removes the plists a test's install wrote, if a failure left them. Register it before the install.
+/// `new` first removes what a killed run left, which would fail the next install.
 struct Plists {
     _staging: FileGuard,
     _enabled: FileGuard,
@@ -1461,9 +1462,12 @@ struct Plists {
 
 impl Plists {
     fn new(name: &str) -> Self {
+        let (staging, enabled) = (staging_path(name), enabled_path(name));
+        remove_or_warn(&staging, false);
+        remove_or_warn(&enabled, false);
         Self {
-            _staging: FileGuard::new(staging_path(name)),
-            _enabled: FileGuard::new(enabled_path(name)),
+            _staging: FileGuard::new(staging),
+            _enabled: FileGuard::new(enabled),
         }
     }
 }
