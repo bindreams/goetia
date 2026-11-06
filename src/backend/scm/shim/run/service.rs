@@ -22,6 +22,7 @@ use windows_sys::Win32::System::Services::{
     SERVICE_WIN32_OWN_PROCESS, SetServiceStatus,
 };
 
+use super::super::marker;
 use super::logging::Log;
 use super::os::{Os, Real, Spawned, spawn_error_code};
 use super::stop_bus::{StopBus, Supervisor, Teardown, WaitOutcome, Waiter, kill_for_stop, terminate_exited_tree};
@@ -37,6 +38,8 @@ const TABLE_NAME: &str = "goetia-shim";
 /// code from `crate::backend::scm::exit_status`. Reads no process arguments: the service name
 /// comes from SCM.
 pub(crate) fn run() -> ! {
+    // Every host reaches here, and this read is what keeps its version marker in the linked binary.
+    std::hint::black_box(&marker::MARKER);
     if let Err(e) = service_dispatcher::start(TABLE_NAME, ffi_service_main) {
         Log::real().failure(TABLE_NAME, &format!("connect to the SCM dispatcher: {e}"));
         std::process::exit(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT as i32);

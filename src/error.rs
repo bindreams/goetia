@@ -204,6 +204,29 @@ pub enum Error {
         right: &'static str,
     },
 
+    /// A file that is to be the shim host has no goetia version marker: it is not a service host
+    /// built from this library. No OS call failed.
+    #[error(
+        "{} is not a goetia service host: it carries no version marker, so it was not built with \
+         `goetia::shim::main()`",
+        path.display()
+    )]
+    ShimMarkerMissing { path: PathBuf },
+
+    /// A file that is to be the shim host carries the marker of another goetia version. Hosts and
+    /// the program that installs them are built from one checkout, so this is a stale file. No OS
+    /// call failed.
+    #[error(
+        "{} is a goetia service host of version {found}, and this goetia is version {expected}: rebuild the host \
+         with this version",
+        path.display()
+    )]
+    ShimMarkerVersion {
+        path: PathBuf,
+        found: String,
+        expected: String,
+    },
+
     /// A `.env` file beside the manifest could not be parsed. Distinct from
     /// [`Os`](Error::Os), which means the file could not be read at all.
     #[error("{path}:{line}: {message}", path = path.display())]
@@ -536,6 +559,8 @@ impl Error {
             | Error::Reservation { .. }
             | Error::NotADirectory { .. }
             | Error::ShimFolderUnsafe { .. }
+            | Error::ShimMarkerMissing { .. }
+            | Error::ShimMarkerVersion { .. }
             | Error::EnvFile { .. }
             | Error::Interpolate { .. }
             | Error::Yaml(_)
@@ -640,6 +665,8 @@ impl Error {
             | Error::Reservation { .. }
             | Error::NotADirectory { .. }
             | Error::ShimFolderUnsafe { .. }
+            | Error::ShimMarkerMissing { .. }
+            | Error::ShimMarkerVersion { .. }
             | Error::EnvFile { .. }
             | Error::Interpolate { .. }
             | Error::Yaml(_)

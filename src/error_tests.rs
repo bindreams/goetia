@@ -143,6 +143,12 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             account: String::new(),
             right: "own",
         },
+        Error::ShimMarkerMissing { path: PathBuf::new() },
+        Error::ShimMarkerVersion {
+            path: PathBuf::new(),
+            found: String::new(),
+            expected: String::new(),
+        },
         Error::InvalidPassword { variable: id() },
         Error::PutBackBlocked {
             path: PathBuf::new(),
@@ -594,6 +600,34 @@ fn report_of_an_unsafe_shim_folder_names_the_path_the_account_and_the_right() {
     assert_eq!(
         e.report().to_string(),
         "refusing to use /p for the shim: Users can change permissions of it, so it could replace the shim; fix the folder's permissions"
+    );
+    assert!(std::error::Error::source(&e).is_none());
+}
+
+#[skuld::test]
+fn report_of_a_host_without_a_marker_names_the_path() {
+    let e = Error::ShimMarkerMissing {
+        path: PathBuf::from("/h.exe"),
+    };
+    assert_eq!(
+        e.report().to_string(),
+        "/h.exe is not a goetia service host: it carries no version marker, so it was not built with \
+         `goetia::shim::main()`"
+    );
+    assert!(std::error::Error::source(&e).is_none());
+}
+
+#[skuld::test]
+fn report_of_a_host_of_another_version_names_both_versions() {
+    let e = Error::ShimMarkerVersion {
+        path: PathBuf::from("/h.exe"),
+        found: "0.1.0".to_string(),
+        expected: "0.2.0".to_string(),
+    };
+    assert_eq!(
+        e.report().to_string(),
+        "/h.exe is a goetia service host of version 0.1.0, and this goetia is version 0.2.0: rebuild the host with \
+         this version"
     );
     assert!(std::error::Error::source(&e).is_none());
 }
