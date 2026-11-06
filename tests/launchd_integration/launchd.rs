@@ -1146,8 +1146,9 @@ fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout() {
     // Load the job without `start`: `RunAtLoad` runs it. Once it has connected, launchd has forked
     // the run, so the respawn history exists and the `kickstart -p` inside `start` meets the
     // throttle on this very first `start`. The process is still exiting when `accept` returns,
-    // though, and `start` reads `Running` from one that has a pid. So wait, re-reading the
-    // job as `status` does, until launchd shows no process: the run's exit is then recorded.
+    // though, and `start` reads `Running` from one that has a pid. So wait until a whole
+    // `launchctl print` shows the run's exit recorded and no process. Not `status`: it reads a
+    // failed `print` as `Unknown` with no pid, which would end the wait before the run is gone.
     cmd::run(
         "launchctl",
         &["bootstrap", "system", staging_path(&id).to_str().unwrap()],
@@ -1155,8 +1156,17 @@ fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout() {
     .expect_ok();
     listener.accept("the crash-looping job's first run");
     support::kill::until(|| {
-        let status = mgr.status(&spec.id).expect("status");
-        status.state != State::Running && status.pid.is_none()
+        let printed = cmd::run("launchctl", &["print", &format!("system/{id}")]);
+        let field = |key: &str| {
+            printed
+                .stdout
+                .lines()
+                .find_map(|line| line.trim_start().strip_prefix(key))
+        };
+        // A job that has not exited yet reads `last exit code = (never exited)`.
+        printed.ok()
+            && field("last exit code = ").is_some_and(|code| !code.contains("never exited"))
+            && field("pid = ").is_none()
     });
 
     let err = mgr
